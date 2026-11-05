@@ -35,11 +35,12 @@ pub mod keep;
 pub mod shim;
 // (0.27.0: the rust edition's region variables)
 pub mod regions;
+pub mod borrowck;
 
-use crate::base::{STDERR, STDOUT, buf_int, buf_new, buf_str, buf_write_fd, die};
+use crate::base::{STDERR, STDOUT, buf_int, buf_new, buf_str, buf_write_fd, die, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
-use crate::base::diag::error_count;
+use crate::base::diag::{err_begin, err_fmt, err_help, error_count};
 use crate::base::timer::{T_CHECK, T_PLACES_BUILD, timer_now, timer_sub};
 use crate::front::ast::{FN_BODY_FAILED, FN_SIG_FAILED, NodeKind};
 use crate::front::check::has_error_type;
@@ -49,7 +50,10 @@ use crate::places::build::build_body;
 use crate::places::diff::{diff_begin, record_body, report_count, report_moves};
 use crate::places::elab::elaborate;
 use crate::places::front::{fn_generic, fn_is_extern, fn_module, fn_node};
-use crate::places::ir::{Body, DS_FLAG, DS_KEPT, SK_DROP, full_place_type};
+use crate::places::ir::{
+    Body, DS_FLAG, DS_KEPT, LF_PARAM, LF_USER, OK_MOVE, SK_ASSIGN, SK_DROP, block_count, block_len,
+    block_start, full_place_type, op_a, op_kind,
+};
 use crate::places::keep::{keep_body, load_body};
 use crate::places::print::{buf_fn_name, buf_pos, print_body};
 use crate::places::shim::{
@@ -67,6 +71,10 @@ pub fn places_option(arg: str, pcx: inout Ctx<Comp>) -> bool {
         pcx.emit_places = 1;
     } else if arg == "--emit-places=all" {
         pcx.emit_places = 2;
+    } else if arg == "--emit-places=regions" {
+        // (0.27.1: the bodies and the borrow checker's dump, borrowck/dump.vl)
+        pcx.emit_places = 1;
+        crate::places::borrowck::set_emit_regions(true);
     } else if arg == "--verify-places" {
         pcx.verify_places = true;
     } else if arg == "--places-diff" {
@@ -172,6 +180,7 @@ pub fn run_places(pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     }
     let t = timer_now(pcx);
     let out = buf_new();
+    var bck = crate::places::borrowck::state_new();
     pcx.fallbacks = 0;
     pcx.built = 0;
     pcx.no_glue = 0;
@@ -179,6 +188,10 @@ pub fn run_places(pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     pcx.all_storage = (pcx.verify_places || pcx.emit_places > 0) && !pcx.lean;
     pcx.ran = true;
     diff_begin(&pcx);
+    if pcx.edition != 0 {
+        // (0.27.1: the variance of every user type, before the bodies)
+        crate::places::regions::variance_table(&pcx);
+    }
     // (FN_COUNT grows: a `Drop::drop` instance a drop needs is made here,
     // shim.vl: drop_fn, and built in turn; 0.26.2: a std `drop` that
     // nothing called, checked only now, is built before the functions
@@ -187,11 +200,11 @@ pub fn run_places(pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     var late = 0;
     while f < pcx.fns.len() as i64 || late < late_drop_count(pcx) {
         if late < late_drop_count(pcx) {
-            place_body(late_drop(late, pcx), out, &pbody, &pcx);
+            place_body(late_drop(late, pcx), out, &bck, &pbody, &pcx);
             late += 1;
         } else {
             pcx.next_fn = f + 1;
-            place_body(f, out, &pbody, &pcx);
+            place_body(f, out, &bck, &pbody, &pcx);
             f += 1;
         }
     }
@@ -216,6 +229,9 @@ pub fn run_places(pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     if pcx.emit_shims && pcx.emit_places > 0 {
         print_shims(out, &pbody, &pcx);
     }
+    if crate::places::borrowck::emit_regions() {
+        crate::places::borrowck::dump::print_solved(out, bck);
+    }
     buf_write_fd(out, STDOUT);
     pcx.t_places_bodies[0] = pcx.built;
     pcx.t_places_bodies[1] = pcx.fallbacks;
@@ -234,7 +250,8 @@ pub fn run_places(pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
 
 // Function f's body (run_places), when it has one to build: built,
 // elaborated, recorded, verified, then kept or printed.
-fn place_body(f: i64, out: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+fn place_body(f: i64, out: i64, bck: inout crate::places::borrowck::Bck<Comp>,
+    pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     if !wanted(f, pcx) {
         return;
     }
@@ -253,8 +270,14 @@ fn place_body(f: i64, out: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     }
     let all_storage = pcx.all_storage;
     pcx.all_storage = all_storage || rust;
+    pcx.rust_body = rust && crate::places::regions::rust_operands(f, &pcx);
+    let errors = error_count(pcx);
     let built = build_body(f, fn_node(f, pcx), &pbody, &pcx);
     pcx.all_storage = all_storage;
+    pcx.rust_body = false;
+    if built && rust {
+        contract_moves(f, pbody, &pcx);
+    }
     if !built {
         pcx.fallbacks += 1;
         if pcx.verify_places {
@@ -266,8 +289,18 @@ fn place_body(f: i64, out: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     // some 30k instructions, as much as a small body costs)
     elaborate(&pbody, &pcx);
     if rust {
-        crate::places::regions::assign_regions(&pbody, pcx);
-        crate::places::regions::unchecked_warning(f, &pcx);
+        crate::places::regions::assign_regions(&pbody, &pcx);
+        // (0.27.1) NLL: liveness, constraints, the solve (borrowck/mod.vl);
+        // not on a body the builder or the elision rules rejected (D4.2,
+        // D6.2.5)
+        if error_count(pcx) == errors {
+            let verdict = crate::places::borrowck::check_body(f, &bck, &pbody, &pcx);
+            crate::places::borrowck::set_verdict(f, verdict, &pcx);
+            if verdict == crate::places::borrowck::VERDICT_DEFERRED {
+                // (D10.4: a closure body reaches its captures through the raw env)
+                crate::places::regions::unchecked_warning(f, &pcx);
+            }
+        }
     }
     if drops_on(pcx) {
         record_body(pcx.places_diff, pbody, &pcx);
@@ -286,7 +319,83 @@ fn place_body(f: i64, out: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
         keep_body(pbody, &pcx);
     } else if printed(f, pcx) {
         print_body(out, pbody, &pcx);
+        if crate::places::borrowck::emit_regions() {
+            crate::places::borrowck::dump::print_regions(out, bck, pbody, &pcx);
+        }
     }
+}
+
+// RULE: C3.2 (0.27.1) A rust-edition clause reads in place: a move of a
+// parameter (or of a part of one) in a `requires`, f$pre's body, or of
+// `result` in an ensures, the wrapper's but for its return (C3.3), is
+// contract.move; reported once per function.
+fn contract_moves(f: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    let pre = crate::front::contracts::expand::is_pre_fn(f, pcx);
+    if !pre && !has_ensures(f, pcx) {
+        return;
+    }
+    for b in 0..block_count(pbody) {
+        let start = block_start(b, pbody);
+        if start < 0 {
+            continue;
+        }
+        for s in start..start + block_len(b, pbody) + 1 {
+            let st = pbody.stmts[s];
+            for i in 0..st.nops {
+                if op_kind(st.ops, i, pbody) != OK_MOVE {
+                    continue;
+                }
+                let lc = pbody.locals[op_a(st.ops, i, pbody)];
+                if lc.src < 0 {
+                    continue;
+                }
+                let name = sym_text(pcx.locals[lc.src].name, pcx);
+                let bad = if pre { (lc.flags & LF_PARAM) != 0 }
+                    else {
+                        (lc.flags & LF_USER) != 0 && name == "result"
+                            && !(st.kind == SK_ASSIGN && st.a == 0)
+                    };
+                if bad && st.node > 0 {
+                    err_begin(pcx.nodes[st.node].start, &pcx);
+                    err_fmt(format_args("a clause moves '{name}': a `requires` or an `ensures` reads its parameters and `result` in place, and the function still has them"), pcx);
+                    err_help(c"read it or a part of it, or borrow it: `&x`, `x.len()`, `x.clone()`",
+                        pcx);
+                    crate::front::contracts::diag::end_with_code(c"contract.move", &pcx);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+// Whether function f (an instance's template) has an ensures clause: it
+// is the wrapper that calls f$body and checks the result.
+pub fn has_ensures(f: i64, pcx: Ctx<Comp>) -> bool {
+    let t = if pcx.fns[f].tmpl > 0 { pcx.fns[f].tmpl - 1 } else { f };
+    let node = pcx.fns[t].node;
+    for k in 0..pcx.clause_owner.count {
+        if pcx.clause_owner.get(k) == node
+            && (pcx.clause_kind.get(k) & ~crate::front::contracts::CLAUSE_DEBUG)
+            == crate::front::contracts::CLAUSE_ENSURES {
+            return true;
+        }
+    }
+    false
+}
+
+// RULE: C3.3 (0.27.1, for the borrow checker's use_borrowed) The help of
+// an error whose place, rooted at `root`, is borrowed by `result` in
+// function f's ensures (the wrapper holds `result`'s loan until it
+// returns): added when f has an ensures; returns whether it was.
+pub fn result_borrow_help(f: i64, root: [u8], pcx: inout Ctx<Comp>) -> bool {
+    if f < 0 || !has_ensures(f, pcx) {
+        return false;
+    }
+    crate::base::diag::err_help_fmt(
+        format_args(
+            "'{root}' is borrowed by 'result'; state the promise on '*result' or on 'old(..)'"),
+        pcx);
+    true
 }
 
 // Whether --emit-places prints function f's body.

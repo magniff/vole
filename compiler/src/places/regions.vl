@@ -1,126 +1,1596 @@
 // (0.27.0) The rust edition's region variables (docs/design/places-ir.md,
-// "Regions, the side tables"). A body of a rust-edition function gets, in
-// pbody.regions, a variable for each borrow (RO_LOAN: its statement), for
-// each reference in a parameter's type (RO_UNIVERSAL: the parameter's
-// local) and in another local's (RO_LOCAL: the local), and for each call
-// whose result holds a reference (RO_CALL: its statement, the callee's
-// regions instantiated there). A borrow's region word (PStmt.e of an
-// RV_REF or RV_SLICE) names its variable, counted from 1 (0: none). Two
-// words a variable: its origin and what it is of. 0.27.0 fills the table
-// and checks nothing (borrowck.unchecked, from run_places); 0.27.1's NLL
-// solves it.
+// "Regions, the side tables"; docs/design/borrowck.md §3-§5, the rules
+// cited D3.3 ...). A body of a rust-edition function gets, in
+// pbody.regions, a variable for each universal region of its signature
+// (RO_UNIVERSAL, D4.1: 'static first, then its named lifetimes, its
+// elided input regions, its type parameters' substitutions' regions),
+// for each region slot of a local that is not a parameter (RO_LOCAL,
+// D3.3), for each borrow (RO_LOAN: its statement) and for each region of
+// a callee's signature at each call (RO_CALL, n rows a call). A borrow's
+// region word (PStmt.e of an RV_REF or RV_SLICE) names its variable,
+// counted from 1 (0: none); so does a call's (PStmt.e of an SK_CALL: its
+// first call region; 0: the callee has none). Four words a variable: its
+// origin and three words of what it is of.
+//
+// (0.27.1) The slots (D3.3), the signatures read with their lifetimes
+// (D4.1, D4.2: Sig, sig_of), the places' regions (place_regions), the
+// variance of each user type (D5.3: variance_table) and of each slot of a
+// type (D5.4: slot_variances): what places/borrowck reads.
 
-use crate::base::{buf_new, buf_slice, buf_str, sym_text};
+use crate::base::{buf_int, buf_new, buf_slice, buf_str, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
-use crate::front::types::{REF_MUT, REF_SHARED, TyKind, type_elem};
-use crate::places::ir::{BK_RAW, Body, LF_PARAM, RV_REF, RV_SLICE, SK_ASSIGN, SK_CALL};
+use crate::front::ast::{NODE_REF, NODE_REF_MUT, NodeKind, child};
+use crate::front::parser::rust::lifetimes_of;
+use crate::front::types::{REF_MUT, REF_SHARED, TyKind, fn_param, type_elem, variant_field};
+use crate::places::front::{enum_info, fn_node, fn_param_count, fn_ret, tlist_at};
+use crate::places::ir::{
+    BK_RAW, BK_RAW_MUT, Body, PJ_CONST, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT, RV_REF,
+    RV_SLICE, SK_ASSIGN, SK_CALL, block_count, block_len, block_start, full_place_type, op_a, op_b,
+    op_is_place, op_kind, struct_field_count, struct_field_ty,
+};
 
 pub const RO_LOAN: i64 = 1;
 pub const RO_LOCAL: i64 = 2;
 pub const RO_UNIVERSAL: i64 = 3;
 pub const RO_CALL: i64 = 4;
 
+// The kinds of universal regions (D4.1): 'static (always the body's
+// variable 1), a named lifetime (x: its symbol), an elided input region
+// (x: its parameter's local, y: the slot), a region of a type parameter's
+// substitution (x: the parameter's symbol, y: the slot of it, D4.4).
+pub const U_STATIC: i64 = 1;
+pub const U_NAMED: i64 = 2;
+pub const U_ELIDED: i64 = 3;
+pub const U_SUBST: i64 = 4;
+
+// Variances (D5.1), as bits: the meet is their union, `*` (bivariant)
+// the identity.
+pub const V_BI: i64 = 0;
+pub const V_CO: i64 = 1;
+pub const V_CONTRA: i64 = 2;
+pub const V_INV: i64 = 3;
+
+// What the binding walk says of a slot: its region elided, 'static, a
+// named lifetime (x: its symbol), a slot of a type parameter's
+// substitution (x: the parameter's index in its list, y: the slot).
+const B_ELIDED: i64 = 0;
+const B_STATIC: i64 = 1;
+const B_NAMED: i64 = 2;
+const B_PARAM: i64 = 3;
+
+// A field map's entries other than an index of the owner's slots: the
+// slot is 'static's; it has no owner slot (an MVS std struct's view, R2).
+pub const MAP_STATIC: i64 = -1;
+pub const MAP_NONE: i64 = -2;
+
 // Whether function f is the rust edition's (its node in a file read so).
 pub fn rust_fn(f: i64, pcx: inout Ctx<Comp>) -> bool {
-    let node = crate::places::front::fn_node(f, pcx);
+    let node = fn_node(f, pcx);
     node > 0 && crate::front::rust::rust_at(pcx.nodes[node].start, &pcx)
 }
 
-// (0.27.0) borrowck.unchecked at function f, built: its borrows are not
-// checked (0.27.1's NLL checks them). Once a function: its instances share
-// its position.
-pub fn unchecked_warning(f: i64, pcx: inout Ctx<Comp>) {
-    let node = crate::places::front::fn_node(f, pcx);
-    let m = buf_new();
-    buf_str(m, c"the borrows of '");
-    crate::base::buf_bytes(m, sym_text(pcx.nodes[node].a, pcx));
-    buf_str(m, c"' are not checked in 0.27.0: the rust edition's borrow checker comes in 0.27.1");
-    crate::base::diag::report_warning(pcx.nodes[node].start, 0, c"borrowck.unchecked",
-        buf_slice(m).ptr,
-        c"its regions are built (`volec check --emit-places` shows them); `--allow=borrowck.unchecked` hides this warning",
-        &pcx);
+// Whether function f's operands follow the rust edition's rules (D8.3):
+// a rust-edition function the program wrote, not one the compiler made
+// from it (a derive's, a contract's companion, a multiversion copy:
+// FN_DERIVED, MVS's rules, checked through what they are made from).
+pub fn rust_operands(f: i64, pcx: inout Ctx<Comp>) -> bool {
+    let node = fn_node(f, pcx);
+    rust_fn(f, &pcx) && ((pcx.nodes[node].p & crate::front::ast::FN_DERIVED) == 0
+        || crate::front::contracts::expand::is_pre_fn(f, pcx))
 }
 
-// The body held, a rust-edition function's: its region variables made.
-pub fn assign_regions(pbody: inout Body<Comp>, pcx: Ctx<Comp>) {
+// (0.27.1) borrowck.unchecked at closure body f (docs/design/borrowck.md
+// D10.4): its captured places are reached through the raw environment,
+// so its borrows are checked against each other and its own locals only;
+// the enclosing body keeps the captures borrowed. Once a function.
+pub fn unchecked_warning(f: i64, pcx: inout Ctx<Comp>) {
+    let node = fn_node(f, pcx);
+    let m = buf_new();
+    buf_str(m, c"the borrows inside this closure are checked against each other only: it reaches what it captures through the raw environment, which 0.27.2 types (its captures stay borrowed outside it)");
+    crate::base::diag::report_warning(pcx.nodes[node].start, 0, c"borrowck.unchecked",
+        buf_slice(m).ptr,
+        c"nothing to change; `--allow=borrowck.unchecked` hides this warning", &pcx);
+    let _ = sym_text(pcx.nodes[node].a, pcx);
+}
+
+// ---- The region variables of a body ----
+
+// The body held, a rust-edition function's: its region variables made,
+// its locals' slots bound to them (D3.2).
+pub fn assign_regions(pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     pbody.regions.clear();
+    pbody.slot_at.clear();
+    pbody.slot_var.clear();
+    pbody.ret_var.clear();
+    pbody.ubounds.clear();
+    var sig = sig_new();
+    sig_of(pbody.fn_, &sig, &pcx);
+    if sig.elision > 0 {
+        elision_error(pbody.fn_, sig.elision, &pcx);
+    }
+    // RULE: D4.1 (the universals first: 'static is variable 1)
+    for u in 0..universal_count(sig) {
+        push_row(RO_UNIVERSAL, sig.univ[3 * u], sig.univ[3 * u + 1], sig.univ[3 * u + 2], &pbody);
+    }
+    var i = 0;
+    while i + 1 < sig.bounds.len() as i64 {
+        pbody.ubounds.push(sig.bounds[i] + 1);
+        pbody.ubounds.push(sig.bounds[i + 1] + 1);
+        i += 2;
+    }
+    // RULE: D3.2 (a parameter's slots are its signature's universals; any
+    // other local's, variables of their own)
     for l in 0..pbody.locals.len() as i64 {
-        let origin = if (pbody.locals[l].flags & LF_PARAM) != 0 { RO_UNIVERSAL } else { RO_LOCAL };
-        for _ in 0..references_in(pbody.locals[l].ty, 0, pcx) {
-            pbody.regions.push(origin);
-            pbody.regions.push(l);
+        pbody.slot_at.push(pbody.slot_var.len() as i64);
+        let n = slot_count(pbody.locals[l].ty, pcx);
+        let param = l >= 1 && l <= pbody.params && l < sig.param_at.len() as i64;
+        let base = if param { sig.param_at[l - 1] } else { 0 };
+        let bound = if param { sig.param_at[l] - base } else { 0 };
+        for j in 0..n {
+            if j < bound {
+                pbody.slot_var.push(sig.params[base + j] + 1);
+            } else {
+                push_row(RO_LOCAL, l, j, 0, &pbody);
+                pbody.slot_var.push(region_count(pbody));
+            }
         }
     }
+    pbody.slot_at.push(pbody.slot_var.len() as i64);
+    for j in 0..sig.ret.len() as i64 {
+        pbody.ret_var.push(sig.ret[j] + 1);
+    }
+    // RULE: D3.2 (a loan per borrow; n call regions per call, D3.6)
+    var csig = sig_new();
     for s in 0..pbody.stmts.len() as i64 {
         let st = pbody.stmts[s];
-        if st.kind == SK_ASSIGN && (st.c == RV_REF && st.d != BK_RAW || st.c == RV_SLICE) {
-            pbody.regions.push(RO_LOAN);
-            pbody.regions.push(s);
+        if st.kind == SK_ASSIGN
+            && (st.c == RV_REF && st.d != BK_RAW && st.d != BK_RAW_MUT || st.c == RV_SLICE) {
+            push_row(RO_LOAN, s, 0, 0, &pbody);
             pbody.stmts[s].e = region_count(pbody);
-        } else if st.kind == SK_CALL && st.a >= 0 && st.a < pbody.locals.len() as i64
-            && references_in(pbody.locals[st.a].ty, 0, pcx) > 0 {
-            pbody.regions.push(RO_CALL);
-            pbody.regions.push(s);
+        } else if st.kind == SK_CALL && st.c >= 0 {
+            // (a closure value's call, c = -1, gets its signature's in
+            // 0.27.1's M2: D10.3)
+            sig_of(st.c, &csig, &pcx);
+            let n = universal_count(csig) - 1;
+            pbody.stmts[s].e = if n > 0 { region_count(pbody) + 1 } else { 0 };
+            for j in 0..n {
+                push_row(RO_CALL, s, j, 0, &pbody);
+            }
         }
     }
+}
+
+fn push_row(origin: i64, a: i64, b: i64, c: i64, pbody: inout Body<Comp>) {
+    pbody.regions.push(origin);
+    pbody.regions.push(a);
+    pbody.regions.push(b);
+    pbody.regions.push(c);
 }
 
 // The number of region variables of the body held.
 pub fn region_count(pbody: Body<Comp>) -> i64 {
-    pbody.regions.len() as i64 / 2
+    pbody.regions.len() as i64 / 4
+}
+
+// Region variable r's origin (RO_*; r counted from 1).
+pub fn region_origin(r: i64, pbody: Body<Comp>) -> i64 {
+    pbody.regions[4 * (r - 1)]
+}
+
+// Region variable r's words: a universal's kind, x and y (U_*); a local's
+// local and slot; a loan's statement; a call's statement and the callee's
+// region (counted from 0, 'static left out).
+pub fn region_word(r: i64, i: i64, pbody: Body<Comp>) -> i64 {
+    pbody.regions[4 * (r - 1) + 1 + i]
 }
 
 // The text of region variable r's origin (counted from 1).
 pub fn origin_text(r: i64, pbody: Body<Comp>) -> *u8 {
-    let o = pbody.regions[2 * (r - 1)];
+    let o = region_origin(r, pbody);
     if o == RO_LOAN { c"loan" } else if o == RO_LOCAL { c"local" }
     else if o == RO_UNIVERSAL { c"universal" } else { c"call" }
 }
 
-// What region variable r is of: a statement (a loan, a call) or a local.
-pub fn region_of(r: i64, pbody: Body<Comp>) -> i64 {
-    pbody.regions[2 * (r - 1) + 1]
+// The variable of slot i of local l (counted from 1; 0: none).
+pub fn slot_var(l: i64, i: i64, pbody: Body<Comp>) -> i64 {
+    if l < 0 || l + 1 >= pbody.slot_at.len() as i64 {
+        return 0;
+    }
+    let at = pbody.slot_at[l] + i;
+    if i < 0 || at >= pbody.slot_at[l + 1] { 0 } else { pbody.slot_var[at] }
 }
 
-// Whether region variable r is of a local (else of a statement).
-pub fn of_local(r: i64, pbody: Body<Comp>) -> bool {
-    let o = pbody.regions[2 * (r - 1)];
-    o == RO_LOCAL || o == RO_UNIVERSAL
+// The number of slots bound to local l.
+pub fn slots_bound(l: i64, pbody: Body<Comp>) -> i64 {
+    if l < 0 || l + 1 >= pbody.slot_at.len() as i64 { 0 }
+    else { pbody.slot_at[l + 1] - pbody.slot_at[l] }
 }
 
-// The references (a region each) in type t: `&T`, `&mut T`, a slice or a
-// str (a view), and those in what they point to, in a tuple's elements, in
-// an array's element; a struct's or an enum's regions are its parameters'
-// (0.27.1, with variance): not counted here.
-fn references_in(t: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
-    if t <= 0 || depth > 8 {
+// Region variable r's line of the dump (docs/design/borrowck.md §16):
+// `region 'r2: universal 'a (_1.0, return.0)`, `region 'r5: local _3.0`,
+// `region 'r7: loan bb0[4]`, `region 'r9: call bb0[12].1`.
+pub fn buf_region(out: i64, r: i64, pbody: Body<Comp>, pcx: Ctx<Comp>) {
+    buf_str(out, c"    region 'r");
+    buf_int(out, r);
+    buf_str(out, c": ");
+    buf_str(out, origin_text(r, pbody));
+    let o = region_origin(r, pbody);
+    let a = region_word(r, 0, pbody);
+    let b = region_word(r, 1, pbody);
+    let c = region_word(r, 2, pbody);
+    if o == RO_UNIVERSAL {
+        buf_str(out, c" ");
+        if a == U_STATIC {
+            buf_str(out, c"'static");
+        } else if a == U_NAMED {
+            buf_str(out, c"'");
+            crate::base::buf_bytes(out, sym_text(b, pcx));
+        } else if a == U_SUBST {
+            buf_str(out, c"'");
+            crate::base::buf_bytes(out, sym_text(b, pcx));
+            buf_str(out, c".");
+            buf_int(out, c);
+        } else {
+            buf_str(out, c"'_");
+            buf_int(out, b);
+            if c > 0 {
+                buf_str(out, c".");
+                buf_int(out, c);
+            }
+        }
+        var first = true;
+        for l in 0..pbody.locals.len() as i64 {
+            for i in 0..slots_bound(l, pbody) {
+                if slot_var(l, i, pbody) == r {
+                    buf_str(out, if first { c" (_" } else { c", _" });
+                    buf_int(out, l);
+                    buf_str(out, c".");
+                    buf_int(out, i);
+                    first = false;
+                }
+            }
+        }
+        for j in 0..pbody.ret_var.len() as i64 {
+            if pbody.ret_var[j] == r {
+                buf_str(out, if first { c" (return." } else { c", return." });
+                buf_int(out, j);
+                first = false;
+            }
+        }
+        if !first {
+            buf_str(out, c")");
+        }
+    } else if o == RO_LOCAL {
+        buf_str(out, c" _");
+        buf_int(out, a);
+        buf_str(out, c".");
+        buf_int(out, b);
+    } else {
+        buf_str(out, c" ");
+        buf_location(out, a, pbody);
+        if o == RO_CALL {
+            buf_str(out, c".");
+            buf_int(out, b);
+        }
+    }
+    buf_str(out, c"\n");
+}
+
+// The universals' bounds of the dump, `bound 'r2: 'r3` ('r2 outlives
+// 'r3).
+pub fn buf_bounds(out: i64, pbody: Body<Comp>) {
+    var i = 0;
+    while i + 1 < pbody.ubounds.len() as i64 {
+        buf_str(out, c"    bound 'r");
+        buf_int(out, pbody.ubounds[i]);
+        buf_str(out, c": 'r");
+        buf_int(out, pbody.ubounds[i + 1]);
+        buf_str(out, c"\n");
+        i += 2;
+    }
+}
+
+// Statement s's location, `bb2[3]`.
+fn buf_location(out: i64, s: i64, pbody: Body<Comp>) {
+    for b in 0..block_count(pbody) {
+        let start = block_start(b, pbody);
+        if start >= 0 && s >= start && s <= start + block_len(b, pbody) {
+            buf_str(out, c"bb");
+            buf_int(out, b);
+            buf_str(out, c"[");
+            buf_int(out, s - start);
+            buf_str(out, c"]");
+            return;
+        }
+    }
+}
+
+// (--verify-places) The body held, a rust-edition one: each local has as
+// many variables bound as its type has slots, each a variable of the
+// body (D3.3). The problems found, reported to out.
+pub fn verify_slots(out: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+    if pbody.regions.len() == 0 {
+        return 0;
+    }
+    var bad = 0;
+    if pbody.slot_at.len() as i64 != pbody.locals.len() as i64 + 1 {
+        buf_str(out, c"  the slot table does not cover the locals\n");
+        return 1;
+    }
+    for l in 0..pbody.locals.len() as i64 {
+        let want = slot_count(pbody.locals[l].ty, pcx);
+        if slots_bound(l, pbody) != want {
+            crate::base::buf_fmt(out,
+                format_args("  _{l} has {} region slots bound, its type {want}\n",
+                    slots_bound(l, pbody)));
+            bad += 1;
+        }
+        for i in 0..slots_bound(l, pbody) {
+            let v = slot_var(l, i, pbody);
+            if v < 1 || v > region_count(pbody) {
+                crate::base::buf_fmt(out,
+                    format_args("  _{l}'s slot {i} names no region variable\n"));
+                bad += 1;
+            }
+        }
+    }
+    // RULE: D3.3 (|regions(P)| = |slots(type(P))|, every place the body
+    // names)
+    for s in 0..pbody.stmts.len() as i64 {
+        let st = pbody.stmts[s];
+        if (st.kind == SK_ASSIGN || st.kind == SK_CALL) && st.a >= 0 {
+            bad += verify_place(st.a, st.b, out, pbody, &pcx);
+        }
+        for i in 0..st.nops {
+            if op_is_place(op_kind(st.ops, i, pbody)) {
+                bad += verify_place(op_a(st.ops, i, pbody), op_b(st.ops, i, pbody), out, pbody,
+                    &pcx);
+            }
+        }
+    }
+    bad
+}
+
+// (--verify-places) Place (l, p) of the body held: its regions
+// (place_regions) as many as its type's slots, each a variable of the
+// body or none; the problems, reported to out.
+fn verify_place(l: i64, p: i64, out: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+    if l < 0 || l >= pbody.locals.len() as i64 {
+        return 0;
+    }
+    var regs: Vec<i64, Comp> = Vec::new_in(Comp {});
+    place_regions(l, p, pbody, &regs, &pcx);
+    let want = slot_count(full_place_type(l, p, pbody, &pcx), pcx);
+    if regs.len() as i64 != want {
+        crate::base::buf_fmt(out, format_args("  a place of _{l} has {} regions, its type {want}\n",
+            regs.len()));
+        return 1;
+    }
+    0
+}
+
+// ---- Slots (D3.3) ----
+
+// The number of region slots of type t (D3.3): `&T`, `&mut T`, a view
+// (`[T]`, `str`) one each and the pointee's; a raw pointer, an array the
+// pointee's, the element's; a tuple its elements'; a struct or an enum
+// its declared lifetimes and its type arguments'; a closure its captures'
+// (as its env's fields; by-reference captures are raw until M2: D10.2).
+pub fn slot_count(t: i64, pcx: Ctx<Comp>) -> i64 {
+    slots_in(t, 0, pcx)
+}
+
+// RULE: D8.3 Whether a value of type t is copied, not moved, by a
+// rust-edition operand (Rust's Copy): a scalar, a fn, `&T`, a raw
+// pointer, a shared view; an array or a tuple of Copy; a closure whose
+// captures are; a rust-edition struct or enum with `#[derive(Copy)]`
+// (its type arguments Copy) or an `impl Copy`; another one (std's) when
+// it has no drop glue and its type arguments are Copy.
+pub fn rust_copy(t: i64, pcx: inout Ctx<Comp>) -> bool {
+    copy_in(t, 0, &pcx)
+}
+
+fn copy_in(t: i64, depth: i64, pcx: inout Ctx<Comp>) -> bool {
+    if t <= 0 || depth > 16 {
+        return true;
+    }
+    let k = pcx.types[t].kind;
+    if k == TyKind::Ptr || k == TyKind::Slice {
+        return pcx.types[t].b != REF_MUT;
+    }
+    if k == TyKind::Array || k == TyKind::Distinct {
+        return copy_in(pcx.types[t].a, depth + 1, &pcx);
+    }
+    if k == TyKind::Tuple {
+        for i in 0..pcx.types[t].count {
+            if !copy_in(type_elem(t, i, pcx), depth + 1, &pcx) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if k == TyKind::Struct && pcx.structs[pcx.types[t].a].closure != 0 {
+        let s = pcx.types[t].a;
+        for i in 0..struct_field_count(s, pcx) {
+            // (a by-`&mut` capture is not Copy, though its field is a raw
+            // pointer)
+            if capture_mode(s, i, pcx) == 2
+                || !copy_in(struct_field_ty(s, i, pcx), depth + 1, &pcx) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if k != TyKind::Struct && k != TyKind::Enum {
+        return true;
+    }
+    let node = adt_node(t, pcx);
+    var derived = false;
+    if node > 0 && crate::front::rust::rust_at(pcx.nodes[node].start, &pcx) {
+        for i in 0..pcx.rust_copy.count {
+            derived = derived || pcx.rust_copy.get(i) == node;
+        }
+        if !derived {
+            // (an `impl Copy`, its own bounds checked by has_impl)
+            let copy = crate::front::traits::std_trait(c"Copy", &pcx);
+            return copy >= 0 && crate::front::traits::has_impl(copy, t, &pcx);
+        }
+    } else if crate::places::front::type_glue(t, &pcx) {
+        return false;
+    }
+    // (a derive's `T: Copy` bounds; std's own types' arguments)
+    for i in 0..adt_targ_count(t, pcx) {
+        if !copy_in(adt_targ(t, i, pcx), depth + 1, &pcx) {
+            return false;
+        }
+    }
+    true
+}
+
+// RULE: C5 Whether type t holds a raw pointer, itself or in a part (an
+// `old(e)` of such a type is refused).
+pub fn holds_raw(t: i64, pcx: Ctx<Comp>) -> bool {
+    raw_in(t, 0, pcx)
+}
+
+fn raw_in(t: i64, depth: i64, pcx: Ctx<Comp>) -> bool {
+    if t <= 0 || depth > 16 {
+        return false;
+    }
+    let k = pcx.types[t].kind;
+    if k == TyKind::Ptr {
+        return pcx.types[t].b == 0 || raw_in(pcx.types[t].a, depth + 1, pcx);
+    }
+    if k == TyKind::Slice || k == TyKind::Array || k == TyKind::Distinct {
+        return raw_in(pcx.types[t].a, depth + 1, pcx);
+    }
+    if k == TyKind::Tuple {
+        for i in 0..pcx.types[t].count {
+            if raw_in(type_elem(t, i, pcx), depth + 1, pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if k == TyKind::Struct {
+        let s = pcx.types[t].a;
+        for i in 0..struct_field_count(s, pcx) {
+            if raw_in(struct_field_ty(s, i, pcx), depth + 1, pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if k == TyKind::Enum {
+        for i in 0..adt_targ_count(t, pcx) {
+            if raw_in(adt_targ(t, i, pcx), depth + 1, pcx) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// RULE: C5 Whether an `old(e)` of type t is accepted in the rust edition:
+// t is Copy, holds no region slot and no raw pointer.
+pub fn old_plain(t: i64, pcx: inout Ctx<Comp>) -> bool {
+    rust_copy(t, &pcx) && slot_count(t, pcx) == 0 && !holds_raw(t, pcx)
+}
+
+fn slots_in(t: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
+    if t <= 0 || depth > 16 {
         return 0;
     }
     let k = pcx.types[t].kind;
     if k == TyKind::Ptr {
-        let b = pcx.types[t].b;
-        if b != REF_SHARED && b != REF_MUT {
-            return 0;
-        }
-        return 1 + references_in(pcx.types[t].a, depth + 1, pcx);
+        let own = if is_ref_kind(pcx.types[t].b) { 1 } else { 0 };
+        return own + slots_in(pcx.types[t].a, depth + 1, pcx);
     }
     if k == TyKind::Slice {
-        return 1 + references_in(pcx.types[t].a, depth + 1, pcx);
+        return 1 + slots_in(pcx.types[t].a, depth + 1, pcx);
     }
-    if k == TyKind::Array {
-        return references_in(pcx.types[t].a, depth + 1, pcx);
+    if k == TyKind::Array || k == TyKind::Distinct {
+        return slots_in(pcx.types[t].a, depth + 1, pcx);
     }
     if k == TyKind::Tuple {
         var n = 0;
         for i in 0..pcx.types[t].count {
-            n += references_in(type_elem(t, i, pcx), depth + 1, pcx);
+            n += slots_in(type_elem(t, i, pcx), depth + 1, pcx);
         }
         return n;
     }
-    if k == TyKind::Distinct {
-        // (`str`, a view of bytes)
-        return references_in(pcx.types[t].a, depth + 1, pcx);
+    if k == TyKind::Struct && pcx.structs[pcx.types[t].a].closure != 0 {
+        let s = pcx.types[t].a;
+        var n = 0;
+        for i in 0..struct_field_count(s, pcx) {
+            n += capture_slots(s, i, depth, pcx);
+        }
+        return n;
+    }
+    if k == TyKind::Struct || k == TyKind::Enum {
+        var n = decl_lifetimes(adt_node(t, pcx), pcx);
+        for i in 0..adt_targ_count(t, pcx) {
+            n += slots_in(adt_targ(t, i, pcx), depth + 1, pcx);
+        }
+        return n;
     }
     0
+}
+
+// RULE: D10.2 Capture i of closure struct s: 0 by value, 1 by `&`, 2 by
+// `&mut` (front::closures' capture list); a field after the captures (a
+// drop flag): 0.
+pub fn capture_mode(s: i64, i: i64, pcx: Ctx<Comp>) -> i64 {
+    let c = pcx.structs[s].closure - 1;
+    if c < 0 || i >= pcx.closures[c].capture_count {
+        return 0;
+    }
+    pcx.capture_list.get(pcx.closures[c].captures + 2 * i + 1)
+}
+
+// The slots field i of closure struct s holds (D3.3, D10.2): a
+// by-reference capture's field is a raw pointer, which holds its loan's
+// slot and its pointee's (`&'c T`'s), another field its type's.
+fn capture_slots(s: i64, i: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
+    let ft = struct_field_ty(s, i, pcx);
+    if capture_ref(s, i, pcx) {
+        return 1 + slots_in(pcx.types[ft].a, depth + 1, pcx);
+    }
+    slots_in(ft, depth + 1, pcx)
+}
+
+// Whether field i of closure struct s is a by-reference capture (its raw
+// pointer holds a loan's slot).
+fn capture_ref(s: i64, i: i64, pcx: Ctx<Comp>) -> bool {
+    let ft = struct_field_ty(s, i, pcx);
+    capture_mode(s, i, pcx) > 0 && ft > 0 && pcx.types[ft].kind == TyKind::Ptr
+}
+
+// RULE: D10.2 Where field k's slots begin among those of closure type t:
+// the aggregate's operand k (`&'c x` for a by-reference capture, its loan
+// slot first) fills the closure's slots from there.
+pub fn capture_offset(t: i64, k: i64, pcx: Ctx<Comp>) -> i64 {
+    let s = pcx.types[t].a;
+    var off = 0;
+    for i in 0..k {
+        off += capture_slots(s, i, 0, pcx);
+    }
+    off
+}
+
+// RULE: D10.3 Whether closure type t is `FnMut`: it writes a capture (or
+// takes a `&mut` of one), a by-`&mut` capture; else `Fn` (`FnOnce` is
+// 0.27.2's).
+pub fn closure_writes(t: i64, pcx: Ctx<Comp>) -> bool {
+    let s = pcx.types[t].a;
+    for i in 0..struct_field_count(s, pcx) {
+        if capture_mode(s, i, pcx) == 2 {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_ref_kind(b: i64) -> bool {
+    b == REF_SHARED || b == REF_MUT
+}
+
+// A struct or enum type's declaration node (its template's), type
+// arguments.
+fn adt_node(t: i64, pcx: Ctx<Comp>) -> i64 {
+    if pcx.types[t].kind == TyKind::Struct { pcx.structs[pcx.types[t].a].node }
+    else { enum_info(pcx.types[t].a, pcx).node }
+}
+
+fn adt_targ_count(t: i64, pcx: Ctx<Comp>) -> i64 {
+    if pcx.types[t].kind == TyKind::Struct { pcx.structs[pcx.types[t].a].targ_count }
+    else { enum_info(pcx.types[t].a, pcx).targ_count }
+}
+
+fn adt_targ(t: i64, i: i64, pcx: Ctx<Comp>) -> i64 {
+    let at = if pcx.types[t].kind == TyKind::Struct { pcx.structs[pcx.types[t].a].targs }
+        else { enum_info(pcx.types[t].a, pcx).targs };
+    tlist_at(at + i, pcx)
+}
+
+// The number of lifetimes item node n declares (`struct S<'a, 'b>`).
+fn decl_lifetimes(n: i64, pcx: Ctx<Comp>) -> i64 {
+    if n <= 0 {
+        return 0;
+    }
+    let h = lifetimes_of(n, pcx);
+    if h > 0 { pcx.nodes[h].count } else { 0 }
+}
+
+// The number of type parameters of item node n.
+fn decl_type_params(n: i64, pcx: Ctx<Comp>) -> i64 {
+    if n <= 0 || pcx.nodes[n].g <= 0 { 0 } else { pcx.nodes[pcx.nodes[n].g].count }
+}
+
+fn is_node(n: i64, k: NodeKind, pcx: Ctx<Comp>) -> bool {
+    n > 0 && pcx.nodes[n].kind == k
+}
+
+// The index of the type parameter named sym in generics node g (-1).
+fn param_index(g: i64, sym: i64, pcx: Ctx<Comp>) -> i64 {
+    if g <= 0 {
+        return -1;
+    }
+    for i in 0..pcx.nodes[g].count {
+        if pcx.nodes[child(g, i, pcx)].a == sym {
+            return i;
+        }
+    }
+    -1
+}
+
+// The index of the lifetime named sym among the lifetimes holder h's (-1).
+fn lifetime_index(h: i64, sym: i64, pcx: Ctx<Comp>) -> i64 {
+    if h <= 0 || sym == 0 {
+        return -1;
+    }
+    for i in 0..pcx.nodes[h].count {
+        if pcx.nodes[child(h, i, pcx)].a == sym {
+            return i;
+        }
+    }
+    -1
+}
+
+// What a lifetime written as sym binds: elided (none written, `'_`),
+// 'static, or the lifetime named.
+fn lifetime_binding(sym: i64, pcx: Ctx<Comp>) -> i64 {
+    if sym == 0 {
+        return B_ELIDED;
+    }
+    let text = sym_text(sym, pcx);
+    if text == "'_" || text == "_" {
+        B_ELIDED
+    } else if text == "'static" || text == "static" {
+        B_STATIC
+    } else {
+        B_NAMED
+    }
+}
+
+fn push_entry(kind: i64, x: i64, y: i64, up: i64, out: inout Vec<i64, Comp>) {
+    out.push(kind);
+    out.push(x);
+    out.push(y);
+    out.push(up);
+}
+
+fn push_lifetime(sym: i64, up: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Comp>) {
+    let b = lifetime_binding(sym, pcx);
+    push_entry(b, if b == B_NAMED { sym } else { 0 }, 0, up, &out);
+}
+
+// RULE: D4.2 (the parallel walk) The slots of type t read with the AST
+// type node n (0: none, or a node of another shape: every slot elided),
+// four words each pushed to out: the binding (B_*), its x and y, and the
+// entry (index of out's) of the reference or view whose pointee holds it
+// (-1: none; D4.5's implied bounds). tps is the generics node of the type
+// parameters in scope; self_node the type `Self` names (0: none).
+fn bind_walk(n0: i64, t: i64, tps: i64, self_node: i64, up: i64, out: inout Vec<i64, Comp>,
+    depth: i64, pcx: Ctx<Comp>) {
+    if t <= 0 || depth > 16 {
+        return;
+    }
+    var n = n0;
+    if is_node(n, NodeKind::TyName, pcx) && pcx.nodes[n].list == 0 && pcx.nodes[n].g == 0 {
+        let k = param_index(tps, pcx.nodes[n].a, pcx);
+        if k >= 0 {
+            // RULE: D4.4 (a type parameter's substitution: its slots)
+            for j in 0..slot_count(t, pcx) {
+                push_entry(B_PARAM, k, j, up, &out);
+            }
+            return;
+        }
+        if self_node > 0 && sym_text(pcx.nodes[n].a, pcx) == "Self" {
+            n = self_node;
+        }
+    }
+    let k = pcx.types[t].kind;
+    if k == TyKind::Ptr {
+        let ast = if is_node(n, NodeKind::TyPtr, pcx) { pcx.nodes[n].a } else { 0 };
+        if is_ref_kind(pcx.types[t].b) {
+            let me = out.len() as i64 / 4;
+            let lt = if is_node(n, NodeKind::TyPtr, pcx) && (pcx.nodes[n].p & NODE_REF) != 0 {
+                pcx.nodes[n].c
+            } else { 0 };
+            push_lifetime(lt, up, &out, pcx);
+            bind_walk(ast, pcx.types[t].a, tps, self_node, me, &out, depth + 1, pcx);
+        } else {
+            bind_walk(ast, pcx.types[t].a, tps, self_node, up, &out, depth + 1, pcx);
+        }
+        return;
+    }
+    if k == TyKind::Slice {
+        let me = out.len() as i64 / 4;
+        let slice = is_node(n, NodeKind::TySlice, pcx);
+        push_lifetime(if slice { pcx.nodes[n].c } else { 0 }, up, &out, pcx);
+        bind_walk(if slice { pcx.nodes[n].a } else { 0 }, pcx.types[t].a, tps, self_node, me,
+            &out, depth + 1, pcx);
+        return;
+    }
+    if k == TyKind::Distinct {
+        // (`str`: a view of bytes; its lifetime is its TyName's c, the
+        // parser's for `&'a str`)
+        let u = pcx.types[t].a;
+        if u > 0 && pcx.types[u].kind == TyKind::Slice {
+            let named = is_node(n, NodeKind::TyName, pcx) && sym_text(pcx.nodes[n].a, pcx) == "str";
+            let me = out.len() as i64 / 4;
+            push_lifetime(if named { pcx.nodes[n].c } else { 0 }, up, &out, pcx);
+            bind_walk(0, pcx.types[u].a, tps, self_node, me, &out, depth + 1, pcx);
+        } else {
+            bind_walk(0, u, tps, self_node, up, &out, depth + 1, pcx);
+        }
+        return;
+    }
+    if k == TyKind::Array {
+        let ast = if is_node(n, NodeKind::TyArray, pcx) { pcx.nodes[n].a } else { 0 };
+        bind_walk(ast, pcx.types[t].a, tps, self_node, up, &out, depth + 1, pcx);
+        return;
+    }
+    if k == TyKind::Tuple {
+        let tuple = is_node(n, NodeKind::TyTuple, pcx);
+        for i in 0..pcx.types[t].count {
+            let ast = if tuple && i < pcx.nodes[n].count { child(n, i, pcx) } else { 0 };
+            bind_walk(ast, type_elem(t, i, pcx), tps, self_node, up, &out, depth + 1, pcx);
+        }
+        return;
+    }
+    if k == TyKind::Struct && pcx.structs[pcx.types[t].a].closure != 0 {
+        let s = pcx.types[t].a;
+        for i in 0..struct_field_count(s, pcx) {
+            if capture_ref(s, i, pcx) {
+                // (a by-reference capture: its loan's slot, elided, D10.2)
+                let me = out.len() as i64 / 4;
+                push_lifetime(0, up, &out, pcx);
+                bind_walk(0, pcx.types[struct_field_ty(s, i, pcx)].a, tps, self_node, me, &out,
+                    depth + 1, pcx);
+                continue;
+            }
+            bind_walk(0, struct_field_ty(s, i, pcx), tps, self_node, up, &out, depth + 1, pcx);
+        }
+        return;
+    }
+    if k == TyKind::Struct || k == TyKind::Enum {
+        let name = is_node(n, NodeKind::TyName, pcx);
+        let lts = if name { lifetimes_of(n, pcx) } else { 0 };
+        for i in 0..decl_lifetimes(adt_node(t, pcx), pcx) {
+            let sym = if lts > 0 && i < pcx.nodes[lts].count { pcx.nodes[child(lts, i, pcx)].a }
+                else { 0 };
+            push_lifetime(sym, up, &out, pcx);
+        }
+        let args = if name { pcx.nodes[n].g } else { 0 };
+        for i in 0..adt_targ_count(t, pcx) {
+            let ast = if args > 0 && i < pcx.nodes[args].count { child(args, i, pcx) } else { 0 };
+            bind_walk(ast, adt_targ(t, i, pcx), tps, self_node, up, &out, depth + 1, pcx);
+        }
+    }
+}
+
+// ---- Signatures (D4.1, D4.2) ----
+
+// A function's signature regions, Σ_f: its universals, three words each
+// (U_*, x, y), universal 0 being 'static; each parameter's slots bound to
+// them (parameter i's are params[param_at[i] .. param_at[i + 1]]), the
+// result's (ret); bounds, pairs (a, b): a outlives b (declared, implied:
+// D4.5); elision, the position of an output region E1-E3 give none (E4;
+// 0: none).
+pub struct Sig<A: Allocator> {
+    pub univ: Vec<i64, A>,
+    pub param_at: Vec<i64, A>,
+    pub params: Vec<i64, A>,
+    pub ret: Vec<i64, A>,
+    pub bounds: Vec<i64, A>,
+    pub elision: i64,
+    walk: Vec<i64, A>,
+}
+
+pub fn sig_new() -> Sig<Comp> {
+    Sig {
+        univ: Vec::new_in(Comp {}),
+        param_at: Vec::new_in(Comp {}),
+        params: Vec::new_in(Comp {}),
+        ret: Vec::new_in(Comp {}),
+        bounds: Vec::new_in(Comp {}),
+        elision: 0,
+        walk: Vec::new_in(Comp {}),
+    }
+}
+
+// The number of universals of sig ('static counted).
+pub fn universal_count(sig: Sig<Comp>) -> i64 {
+    sig.univ.len() as i64 / 3
+}
+
+fn add_universal(kind: i64, x: i64, y: i64, sig: inout Sig<Comp>) -> i64 {
+    if kind == U_NAMED || kind == U_SUBST {
+        for u in 0..universal_count(sig) {
+            if sig.univ[3 * u] == kind && sig.univ[3 * u + 1] == x && sig.univ[3 * u + 2] == y {
+                return u;
+            }
+        }
+    }
+    sig.univ.push(kind);
+    sig.univ.push(x);
+    sig.univ.push(y);
+    universal_count(sig) - 1
+}
+
+// RULE: D4.1 Function f's signature regions, into sig. A rust-edition
+// function's are read from its signature's lifetimes (the parallel walk,
+// D4.2); any other's (std's, a closure body's: D10.5) are a universal
+// per slot (E1; §12's bridge relates a std result's).
+pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
+    sig.univ.clear();
+    sig.param_at.clear();
+    sig.params.clear();
+    sig.ret.clear();
+    sig.bounds.clear();
+    sig.elision = 0;
+    let _ = add_universal(U_STATIC, 0, 0, &sig);
+    // (an instance's node is a clone without its generics and lifetimes:
+    // its template's is read, with the instance's types)
+    let tf = crate::places::front::fn_template(f, pcx);
+    let node = fn_node(tf, pcx);
+    let np = fn_param_count(f, pcx);
+    if !(is_node(node, NodeKind::Fn, pcx)
+        && crate::front::rust::rust_at(pcx.nodes[node].start, &pcx)) {
+        for i in 0..np {
+            sig.param_at.push(sig.params.len() as i64);
+            for j in 0..slot_count(fn_param(f, i, pcx), pcx) {
+                let u = add_universal(U_ELIDED, i + 1, j, &sig);
+                sig.params.push(u);
+            }
+        }
+        sig.param_at.push(sig.params.len() as i64);
+        for j in 0..slot_count(fn_ret(f, pcx), pcx) {
+            let u = add_universal(U_ELIDED, 0, j, &sig);
+            sig.ret.push(u);
+        }
+        return;
+    }
+    // (the declared lifetimes, the impl's then the function's, in order;
+    // their bounds `'b: 'a` declared)
+    let holders = [lifetimes_of(-node, pcx), lifetimes_of(node, pcx),
+        lifetimes_of(crate::front::parser::rust::where_key(node), pcx)];
+    for h in holders {
+        if h > 0 {
+            for i in 0..pcx.nodes[h].count {
+                let sym = pcx.nodes[child(h, i, pcx)].a;
+                if lifetime_binding(sym, pcx) == B_NAMED {
+                    let _ = add_universal(U_NAMED, sym, 0, &sig);
+                }
+            }
+        }
+    }
+    let tps = pcx.nodes[node].g;
+    let self_node = pcx.nodes[node].h;
+    var inputs = 0;
+    var only = -1;
+    var self_u = -1;
+    for i in 0..np {
+        let base = sig.params.len() as i64;
+        sig.param_at.push(base);
+        let pn = if i < pcx.nodes[node].count { child(node, i, pcx) } else { 0 };
+        let tn = if is_node(pn, NodeKind::Param, pcx) { pcx.nodes[pn].b } else { 0 };
+        let t = fn_param(f, i, pcx);
+        sig.walk.clear();
+        bind_walk(tn, t, tps, self_node, -1, &sig.walk, 0, pcx);
+        bind_entries(i + 1, tps, &sig, pcx);
+        let count = sig.params.len() as i64 - base;
+        for e in 0..count {
+            let up = sig.walk[4 * e + 3];
+            if up >= 0 {
+                // RULE: D4.5 (`&'a τ`: every region of τ outlives 'a)
+                sig.bounds.push(sig.params[base + e]);
+                sig.bounds.push(sig.params[base + up]);
+            }
+        }
+        if count > 0 && only < 0 {
+            only = sig.params[base];
+        }
+        inputs += count;
+        // RULE: D4.2 (E3: `&self`'s, `&mut self`'s reference region)
+        if pn > 0 && self_u < 0 && count > 0 && sym_text(pcx.nodes[pn].a, pcx) == "self"
+            && pcx.types[t].kind == TyKind::Ptr && is_ref_kind(pcx.types[t].b) {
+            self_u = sig.params[base];
+        }
+    }
+    sig.param_at.push(sig.params.len() as i64);
+    // the result: an elided region is E2's, E3's, else E4's error
+    sig.walk.clear();
+    bind_walk(pcx.nodes[node].b, fn_ret(f, pcx), tps, self_node, -1, &sig.walk, 0, pcx);
+    let n = sig.walk.len() as i64 / 4;
+    for e in 0..n {
+        let b = sig.walk[4 * e];
+        var u = 0;
+        if b == B_ELIDED {
+            // RULE: D4.2 (E2, E3, E4)
+            if inputs == 1 {
+                u = only;
+            } else if self_u >= 0 {
+                u = self_u;
+            } else {
+                if sig.elision == 0 {
+                    sig.elision = if pcx.nodes[node].b > 0 { pcx.nodes[pcx.nodes[node].b].start }
+                        else { pcx.nodes[node].start };
+                }
+                u = add_universal(U_ELIDED, 0, e, &sig);
+            }
+        } else {
+            u = entry_universal(e, -1, tps, &sig, pcx);
+        }
+        sig.ret.push(u);
+    }
+    for e in 0..n {
+        let up = sig.walk[4 * e + 3];
+        if up >= 0 {
+            sig.bounds.push(sig.ret[e]);
+            sig.bounds.push(sig.ret[up]);
+        }
+    }
+    // RULE: D4.5 (declared: `'b: 'a` in the generics, the impl's and the
+    // function's)
+    for h in holders {
+        if h > 0 {
+            for i in 0..pcx.nodes[h].count {
+                let ln = child(h, i, pcx);
+                let bounds = pcx.nodes[ln].h;
+                if bounds > 0 && lifetime_binding(pcx.nodes[ln].a, pcx) == B_NAMED {
+                    let a = add_universal(U_NAMED, pcx.nodes[ln].a, 0, &sig);
+                    for j in 0..pcx.nodes[bounds].count {
+                        let bs = pcx.nodes[child(bounds, j, pcx)].a;
+                        let kind = lifetime_binding(bs, pcx);
+                        if kind != B_ELIDED {
+                            let b = if kind == B_STATIC { 0 }
+                                else { add_universal(U_NAMED, bs, 0, &sig) };
+                            sig.bounds.push(a);
+                            sig.bounds.push(b);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The walk's entries (sig.walk) of parameter `param` (its local), bound
+// to universals, pushed to sig.params: an elided one a fresh universal
+// (E1).
+fn bind_entries(param: i64, tps: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
+    let n = sig.walk.len() as i64 / 4;
+    for e in 0..n {
+        let u = entry_universal(e, param, tps, &sig, pcx);
+        sig.params.push(u);
+    }
+}
+
+// The universal walk entry e binds (elided: a fresh one of parameter
+// `param`'s; -1: of the result, never asked so).
+fn entry_universal(e: i64, param: i64, tps: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) -> i64 {
+    let b = sig.walk[4 * e];
+    if b == B_STATIC {
+        return 0;
+    }
+    if b == B_NAMED {
+        return add_universal(U_NAMED, sig.walk[4 * e + 1], 0, &sig);
+    }
+    if b == B_PARAM {
+        let sym = pcx.nodes[child(tps, sig.walk[4 * e + 1], pcx)].a;
+        return add_universal(U_SUBST, sym, sig.walk[4 * e + 2], &sig);
+    }
+    add_universal(U_ELIDED, if param >= 0 { param } else { 0 }, e, &sig)
+}
+
+// RULE: D4.2 (E4) error borrowck.elision at function f's result (at pos):
+// an elided output region with no input region to take.
+fn elision_error(f: i64, pos: i64, pcx: inout Ctx<Comp>) {
+    let node = fn_node(crate::places::front::fn_template(f, pcx), pcx);
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"borrowck.elision";
+    crate::base::diag::err_begin(pos, &pcx);
+    crate::base::diag::err_fmt(
+        format_args("the result of '{}' borrows, but from which parameter is not said: it has no single reference parameter and no `&self`",
+            sym_text(pcx.nodes[node].a, pcx)),
+        pcx);
+    crate::base::diag::err_help(c"name the lifetime the result borrows from: `fn f<'a>(x: &'a T, y: &U) -> &'a T` (rustc E0106)", pcx);
+    crate::base::diag::err_end_soft(&pcx);
+    pcx.err_kind = saved;
+}
+
+// ---- The regions of a place (D3.3) ----
+
+// RULE: D3.3 The regions of place (l, p): the variables of the slots of
+// its type, positionally, pushed to out (0 for a slot with no variable:
+// an MVS std struct's view, R2). From l's slots, by its projections: a
+// deref (through a reference: its region dropped) and an index of a view
+// (D1.4: its region dropped) keep the pointee's, the element's; an index
+// of an array or a raw pointer's buffer the element's (all of them); a
+// field the field's, mapped from the parent's (field_map).
+pub fn place_regions(l: i64, p: i64, pbody: Body<Comp>, out: inout Vec<i64, Comp>,
+    pcx: inout Ctx<Comp>) {
+    var path: Vec<i64, Comp> = Vec::new_in(Comp {});
+    var q = p;
+    while q > 0 {
+        path.push(q);
+        q = pbody.projs[q].parent;
+    }
+    var cur: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for i in 0..slots_bound(l, pbody) {
+        cur.push(slot_var(l, i, pbody));
+    }
+    var next: Vec<i64, Comp> = Vec::new_in(Comp {});
+    var map: Vec<i64, Comp> = Vec::new_in(Comp {});
+    var parent = 0;
+    var i = path.len() as i64 - 1;
+    while i >= 0 {
+        let pj = path[i];
+        let kind = pbody.projs[pj].kind;
+        let val = pbody.projs[pj].val;
+        let bt = full_place_type(l, parent, pbody, &pcx);
+        let st = full_place_type(l, pj, pbody, &pcx);
+        next.clear();
+        if kind == PJ_DEREF || kind == PJ_INDEX || kind == PJ_CONST {
+            // (the pointee's, the element's: the last of them)
+            let keep = slot_count(st, pcx);
+            let from = cur.len() as i64 - keep;
+            for j in 0..keep {
+                next.push(if from + j >= 0 { cur[from + j] } else { 0 });
+            }
+        } else if kind == PJ_FIELD || kind == PJ_UNION {
+            let variant = if parent > 0 && pbody.projs[parent].kind == PJ_VARIANT {
+                pbody.projs[parent].val
+            } else { -1 };
+            map.clear();
+            field_map(bt, val, variant, &map, pcx);
+            for j in 0..map.len() as i64 {
+                let m = map[j];
+                next.push(if m == MAP_STATIC { 1 } else if m >= 0 && m < cur.len() as i64 { cur[m] }
+                    else { 0 });
+            }
+        } else {
+            // (PJ_VARIANT: the enum's, for the field after it)
+            for j in 0..cur.len() as i64 {
+                next.push(cur[j]);
+            }
+        }
+        cur.clear();
+        for j in 0..next.len() as i64 {
+            cur.push(next[j]);
+        }
+        parent = pj;
+        i -= 1;
+    }
+    for j in 0..cur.len() as i64 {
+        out.push(cur[j]);
+    }
+}
+
+// RULE: D3.3 Field k of a value of type t (of variant v's payload when v
+// >= 0): for each slot of the field's type, the index of the owner's slot
+// it is (a declared lifetime 'aᵢ: i; a slot of a type parameter's
+// argument: its place among the arguments'), MAP_STATIC or MAP_NONE,
+// pushed to out. A tuple's or a closure's field: its range of the owner's
+// slots.
+pub fn field_map(t0: i64, k: i64, v: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Comp>) {
+    var t = t0;
+    while t > 0 && pcx.types[t].kind == TyKind::Distinct {
+        t = pcx.types[t].a;
+    }
+    if t <= 0 {
+        return;
+    }
+    let tk = pcx.types[t].kind;
+    if tk == TyKind::Tuple || tk == TyKind::Struct && pcx.structs[pcx.types[t].a].closure != 0 {
+        let count = if tk == TyKind::Tuple { pcx.types[t].count }
+            else { struct_field_count(pcx.types[t].a, pcx) };
+        var off = 0;
+        for i in 0..count {
+            let ft = if tk == TyKind::Tuple { type_elem(t, i, pcx) }
+                else { struct_field_ty(pcx.types[t].a, i, pcx) };
+            // (a by-reference capture: its loan's slot first, which the
+            // field's raw pointer type does not hold, D10.2)
+            let n = if tk == TyKind::Tuple { slot_count(ft, pcx) }
+                else { capture_slots(pcx.types[t].a, i, 0, pcx) };
+            let skip = n - slot_count(ft, pcx);
+            if i == k {
+                for j in skip..n {
+                    out.push(off + j);
+                }
+            }
+            off += n;
+        }
+        return;
+    }
+    if tk == TyKind::Slice {
+        // (a view's parts: its data pointer, the element's slots; its length)
+        if k == 0 {
+            for j in 0..slot_count(pcx.types[t].a, pcx) {
+                out.push(1 + j);
+            }
+        }
+        return;
+    }
+    if tk != TyKind::Struct && tk != TyKind::Enum {
+        return;
+    }
+    let node = adt_node(t, pcx);
+    var fty = 0;
+    var fast = 0;
+    if tk == TyKind::Struct {
+        let s = pcx.types[t].a;
+        if k < 0 || k >= struct_field_count(s, pcx) {
+            return;
+        }
+        fty = struct_field_ty(s, k, pcx);
+        if is_node(node, NodeKind::Struct, pcx) && k < pcx.nodes[node].count {
+            fast = pcx.nodes[child(node, k, pcx)].b;
+        }
+    } else {
+        if v < 0 || k < 0 || k >= crate::places::ir::variant_field_count(v, pcx) {
+            return;
+        }
+        fty = variant_field(v, k, pcx);
+        let vn = pcx.variants[v].node;
+        if is_node(vn, NodeKind::Variant, pcx) && k < pcx.nodes[vn].count {
+            let f = child(vn, k, pcx);
+            fast = if is_node(f, NodeKind::Field, pcx) { pcx.nodes[f].b } else { f };
+        }
+    }
+    let lts = if node > 0 { lifetimes_of(node, pcx) } else { 0 };
+    let m = decl_lifetimes(node, pcx);
+    var walk: Vec<i64, Comp> = Vec::new_in(Comp {});
+    bind_walk(fast, fty, if node > 0 { pcx.nodes[node].g } else { 0 }, 0, -1, &walk, 0, pcx);
+    for e in 0..walk.len() as i64 / 4 {
+        let b = walk[4 * e];
+        if b == B_STATIC {
+            out.push(MAP_STATIC);
+        } else if b == B_NAMED {
+            let i = lifetime_index(lts, walk[4 * e + 1], pcx);
+            out.push(if i >= 0 { i } else { MAP_NONE });
+        } else if b == B_PARAM {
+            var off = m;
+            let a = walk[4 * e + 1];
+            for i in 0..a {
+                if i < adt_targ_count(t, pcx) {
+                    off += slot_count(adt_targ(t, i, pcx), pcx);
+                }
+            }
+            out.push(off + walk[4 * e + 2]);
+        } else {
+            out.push(MAP_NONE);
+        }
+    }
+}
+
+// ---- Variance (D5) ----
+
+// RULE: D5.1 xform(c, w): the variance of a position of variance w under
+// a context c.
+pub fn xform(c: i64, w: i64) -> i64 {
+    if c == V_BI || w == V_BI {
+        V_BI
+    } else if c == V_CO {
+        w
+    } else if c == V_INV {
+        V_INV
+    } else if w == V_CO {
+        V_CONTRA
+    } else if w == V_CONTRA {
+        V_CO
+    } else {
+        V_INV
+    }
+}
+
+// The variance table's index of the declaration of struct or enum type t
+// (its template's), or -1.
+fn decl_index(t: i64, pcx: Ctx<Comp>) -> i64 {
+    if pcx.types[t].kind == TyKind::Struct {
+        let s = pcx.types[t].a;
+        if pcx.structs[s].closure != 0 {
+            return -1;
+        }
+        return if pcx.structs[s].tmpl != 0 { pcx.structs[s].tmpl - 1 } else { s };
+    }
+    if pcx.types[t].kind == TyKind::Enum {
+        let e = enum_info(pcx.types[t].a, pcx);
+        return pcx.structs.len() as i64 + if e.tmpl != 0 { e.tmpl - 1 } else { pcx.types[t].a };
+    }
+    -1
+}
+
+// The variance of declared parameter i (lifetimes first, then the type
+// parameters) of declaration d (decl_index's): invariant when it has no
+// entry (made after the table, or not walked).
+pub fn decl_variance(d: i64, i: i64, pcx: Ctx<Comp>) -> i64 {
+    if d < 0 || d >= pcx.variance_at.count {
+        return V_INV;
+    }
+    let at = pcx.variance_at.get(d);
+    if at < 0 { V_INV } else { pcx.variances.get(at + i) }
+}
+
+// RULE: D5.4 The variance of each slot of type t under context c, pushed
+// to out (parallel to t's slots).
+pub fn slot_variances(t: i64, c: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Comp>) {
+    slot_variances_in(t, c, 0, &out, pcx);
+}
+
+fn slot_variances_in(t: i64, c: i64, depth: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Comp>) {
+    if t <= 0 || depth > 16 {
+        return;
+    }
+    let k = pcx.types[t].kind;
+    if k == TyKind::Ptr {
+        // RULE: D5.2 (`&'a T`: 'a +, T +; `&'a mut T`: T o; the one raw
+        // `*T` of v0.27.0: o)
+        if is_ref_kind(pcx.types[t].b) {
+            out.push(c);
+            let inner = if pcx.types[t].b == REF_MUT { xform(c, V_INV) } else { c };
+            slot_variances_in(pcx.types[t].a, inner, depth + 1, &out, pcx);
+        } else {
+            slot_variances_in(pcx.types[t].a, xform(c, V_INV), depth + 1, &out, pcx);
+        }
+        return;
+    }
+    if k == TyKind::Slice {
+        out.push(c);
+        let inner = if pcx.types[t].b == REF_MUT { xform(c, V_INV) } else { c };
+        slot_variances_in(pcx.types[t].a, inner, depth + 1, &out, pcx);
+        return;
+    }
+    if k == TyKind::Array || k == TyKind::Distinct {
+        slot_variances_in(pcx.types[t].a, c, depth + 1, &out, pcx);
+        return;
+    }
+    if k == TyKind::Tuple {
+        for i in 0..pcx.types[t].count {
+            slot_variances_in(type_elem(t, i, pcx), c, depth + 1, &out, pcx);
+        }
+        return;
+    }
+    if k == TyKind::Struct && pcx.structs[pcx.types[t].a].closure != 0 {
+        let s = pcx.types[t].a;
+        for i in 0..struct_field_count(s, pcx) {
+            if capture_ref(s, i, pcx) {
+                // (a by-reference capture: `&'c T` or `&'c mut T`, D10.2)
+                out.push(c);
+                let inner = if capture_mode(s, i, pcx) == 2 { xform(c, V_INV) } else { c };
+                slot_variances_in(pcx.types[struct_field_ty(s, i, pcx)].a, inner, depth + 1, &out,
+                    pcx);
+                continue;
+            }
+            slot_variances_in(struct_field_ty(s, i, pcx), c, depth + 1, &out, pcx);
+        }
+        return;
+    }
+    if k == TyKind::Struct || k == TyKind::Enum {
+        let d = decl_index(t, pcx);
+        let m = decl_lifetimes(adt_node(t, pcx), pcx);
+        for i in 0..m {
+            out.push(xform(c, decl_variance(d, i, pcx)));
+        }
+        for i in 0..adt_targ_count(t, pcx) {
+            slot_variances_in(adt_targ(t, i, pcx), xform(c, decl_variance(d, m + i, pcx)),
+                depth + 1, &out, pcx);
+        }
+    }
+}
+
+// RULE: D5.3 The variance table: every struct's and enum's declared
+// parameters' variance, by walking their fields' types to a fixpoint
+// (each starts bivariant); a parameter of a rust-edition type left
+// bivariant is error borrowck.unused_param. Once a program, before its
+// bodies (run_places, a rust-edition program's).
+pub fn variance_table(pcx: inout Ctx<Comp>) {
+    let ns = pcx.structs.len() as i64;
+    let total = ns + pcx.enum_count;
+    pcx.variance_at.count = 0;
+    pcx.variances.count = 0;
+    // (a generic declaration is walked with an instance's field types, the
+    // first one's: they resolve the names of its fields' types)
+    var inst: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for d in 0..total {
+        let (node, tmpl, closure) = decl_record(d, pcx);
+        inst.push(-1);
+        if tmpl != 0 || closure || node <= 0 {
+            pcx.variance_at.push(-1);
+            continue;
+        }
+        let np = decl_lifetimes(node, pcx) + decl_type_params(node, pcx);
+        if np == 0 {
+            pcx.variance_at.push(-1);
+            continue;
+        }
+        pcx.variance_at.push(pcx.variances.count);
+        for _ in 0..np {
+            pcx.variances.push(V_BI);
+        }
+    }
+    for d in 0..total {
+        let (_, tmpl, closure) = decl_record(d, pcx);
+        if tmpl != 0 && !closure {
+            let td = if d < ns { tmpl - 1 } else { ns + tmpl - 1 };
+            if td >= 0 && td < total && inst[td] < 0 {
+                inst[td] = d;
+            }
+        }
+    }
+    var changed = true;
+    var rounds = 0;
+    while changed && rounds < 64 {
+        changed = false;
+        rounds += 1;
+        for d in 0..total {
+            if pcx.variance_at.get(d) >= 0 {
+                let typed = if decl_type_params(decl_record(d, pcx).0, pcx) > 0 { inst[d] }
+                    else { d };
+                if walk_decl(d, typed, &pcx) {
+                    changed = true;
+                }
+            }
+        }
+    }
+    let out = buf_new();
+    for d in 0..total {
+        if pcx.variance_at.get(d) >= 0 {
+            unused_params(d, &pcx);
+            if pcx.emit_places > 0 {
+                buf_variance(out, d, &pcx);
+            }
+        }
+    }
+    crate::base::buf_write_fd(out, crate::base::STDOUT);
+}
+
+// (--emit-places) Declaration d's variances, a rust-edition one's: `variance
+// W: 'a +, T o` (D5.1's signs, `*` bivariant).
+fn buf_variance(out: i64, d: i64, pcx: inout Ctx<Comp>) {
+    let node = decl_record(d, pcx).0;
+    if !crate::front::rust::rust_at(pcx.nodes[node].start, &pcx) {
+        return;
+    }
+    buf_str(out, c"variance ");
+    crate::base::buf_bytes(out, sym_text(pcx.nodes[node].a, pcx));
+    buf_str(out, c":");
+    let lts = lifetimes_of(node, pcx);
+    let m = decl_lifetimes(node, pcx);
+    for i in 0..m + decl_type_params(node, pcx) {
+        let pn = if i < m { child(lts, i, pcx) } else { child(pcx.nodes[node].g, i - m, pcx) };
+        buf_str(out, if i == 0 { c" " } else { c", " });
+        if i < m {
+            buf_str(out, c"'");
+        }
+        crate::base::buf_bytes(out, sym_text(pcx.nodes[pn].a, pcx));
+        let v = decl_variance(d, i, pcx);
+        buf_str(out, if v == V_CO { c" +" } else if v == V_CONTRA { c" -" }
+            else if v == V_INV { c" o" } else { c" *" });
+    }
+    buf_str(out, c"\n");
+}
+
+// Declaration d's (variance table index) node, template (+1) and whether
+// it is a closure's env.
+fn decl_record(d: i64, pcx: Ctx<Comp>) -> (i64, i64, bool) {
+    let ns = pcx.structs.len() as i64;
+    if d < ns {
+        return (pcx.structs[d].node, pcx.structs[d].tmpl, pcx.structs[d].closure != 0);
+    }
+    let e = enum_info(d - ns, pcx);
+    (e.node, e.tmpl, false)
+}
+
+// One round of D5.3 over declaration d's fields (their types read with
+// declaration `typed`'s, an instance's, -1: none): whether a variance
+// changed.
+fn walk_decl(d: i64, typed: i64, pcx: inout Ctx<Comp>) -> bool {
+    let ns = pcx.structs.len() as i64;
+    let node = decl_record(d, pcx).0;
+    var changed = false;
+    if d < ns {
+        for k in 0..pcx.nodes[node].count {
+            let field = child(node, k, pcx);
+            let ft = if typed >= 0
+                && k < struct_field_count(typed, pcx) { struct_field_ty(typed, k, pcx) }
+                else { 0 };
+            if var_walk(pcx.nodes[field].b, ft, V_CO, d, node, 0, &pcx) {
+                changed = true;
+            }
+        }
+        return changed;
+    }
+    // (an enum: every variant's fields; the typed instance's variants are
+    // in the same order)
+    let first = if typed >= 0 { enum_info(typed - ns, pcx).variants } else { -1 };
+    for i in 0..pcx.nodes[node].count {
+        let vn = child(node, i, pcx);
+        for k in 0..pcx.nodes[vn].count {
+            let f = child(vn, k, pcx);
+            let fast = if is_node(f, NodeKind::Field, pcx) { pcx.nodes[f].b } else { f };
+            let ft = if first >= 0 && k < crate::places::ir::variant_field_count(first + i, pcx) {
+                variant_field(first + i, k, pcx)
+            } else { 0 };
+            if var_walk(fast, ft, V_CO, d, node, 0, &pcx) {
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+// Parameter i of declaration d (node dn) occurs at context c: its
+// variance met with c; whether it changed.
+fn meet(d: i64, i: i64, c: i64, pcx: inout Ctx<Comp>) -> bool {
+    let at = pcx.variance_at.get(d) + i;
+    let old = pcx.variances.get(at);
+    if (old | c) == old {
+        return false;
+    }
+    // UNSAFE: IntVec's words are its raw data (it has no setter)
+    // SAFETY: at is below variances.count: d's entry has its parameters'
+    // count of words, and i is one of them
+    unsafe { pcx.variances.data[at] = old | c; }
+    true
+}
+
+// A lifetime written as sym at context c, in declaration d's (node dn)
+// fields.
+fn lifetime_at(sym: i64, c: i64, d: i64, dn: i64, pcx: inout Ctx<Comp>) -> bool {
+    let i = lifetime_index(lifetimes_of(dn, pcx), sym, pcx);
+    i >= 0 && meet(d, i, c, &pcx)
+}
+
+// The walk of a field's type node n (with its checker type t, 0: unknown)
+// at context c, for declaration d (node dn): D5.2's constructors, D5.3's
+// user types (their variance as it is so far).
+fn var_walk(n: i64, t: i64, c: i64, d: i64, dn: i64, depth: i64, pcx: inout Ctx<Comp>) -> bool {
+    if n <= 0 || c == V_BI || depth > 16 {
+        return false;
+    }
+    let k = pcx.nodes[n].kind;
+    let tk = if t > 0 { pcx.types[t].kind } else { TyKind::None };
+    var changed = false;
+    if k == NodeKind::TyPtr {
+        let inner_t = if tk == TyKind::Ptr { pcx.types[t].a } else { 0 };
+        var inner = c;
+        if (pcx.nodes[n].p & NODE_REF) != 0 {
+            changed = lifetime_at(pcx.nodes[n].c, c, d, dn, &pcx);
+            if (pcx.nodes[n].p & NODE_REF_MUT) != 0 {
+                inner = xform(c, V_INV);
+            }
+        } else if pcx.nodes[n].c == 2 {
+            // (`*mut T`: o; `*const T`, and MVS's `*T`, an owner's pointer
+            // in std's containers: +)
+            inner = xform(c, V_INV);
+        }
+        return var_walk(pcx.nodes[n].a, inner_t, inner, d, dn, depth + 1, &pcx) || changed;
+    }
+    if k == NodeKind::TySlice {
+        changed = lifetime_at(pcx.nodes[n].c, c, d, dn, &pcx);
+        let inner = if (pcx.nodes[n].p & NODE_REF_MUT) != 0 { xform(c, V_INV) } else { c };
+        let inner_t = if tk == TyKind::Slice { pcx.types[t].a } else { 0 };
+        return var_walk(pcx.nodes[n].a, inner_t, inner, d, dn, depth + 1, &pcx) || changed;
+    }
+    if k == NodeKind::TyArray {
+        let inner_t = if tk == TyKind::Array { pcx.types[t].a } else { 0 };
+        return var_walk(pcx.nodes[n].a, inner_t, c, d, dn, depth + 1, &pcx);
+    }
+    if k == NodeKind::TyTuple {
+        for i in 0..pcx.nodes[n].count {
+            let et = if tk == TyKind::Tuple && i < pcx.types[t].count { type_elem(t, i, pcx) }
+                else { 0 };
+            if var_walk(child(n, i, pcx), et, c, d, dn, depth + 1, &pcx) {
+                changed = true;
+            }
+        }
+        return changed;
+    }
+    if k == NodeKind::TyFn {
+        for i in 0..pcx.nodes[n].count {
+            if var_walk(child(n, i, pcx), 0, xform(c, V_CONTRA), d, dn, depth + 1, &pcx) {
+                changed = true;
+            }
+        }
+        return var_walk(pcx.nodes[n].a, 0, c, d, dn, depth + 1, &pcx) || changed;
+    }
+    if k != NodeKind::TyName {
+        return false;
+    }
+    let sym = pcx.nodes[n].a;
+    let m = decl_lifetimes(dn, pcx);
+    if pcx.nodes[n].list == 0 && pcx.nodes[n].g == 0 {
+        let i = param_index(pcx.nodes[dn].g, sym, pcx);
+        if i >= 0 {
+            return meet(d, m + i, c, &pcx);
+        }
+        if sym_text(sym, pcx) == "str" {
+            return lifetime_at(pcx.nodes[n].c, c, d, dn, &pcx);
+        }
+    }
+    // a constructor applied: its parameters' variance, D5.2's or as its
+    // declaration's is so far; unknown (no checker type): invariant
+    let name = sym_text(sym, pcx);
+    let cell = name == "Cell" || name == "UnsafeCell" || name == "RefCell";
+    let phantom = name == "PhantomData";
+    let dd = if t > 0 && (tk == TyKind::Struct || tk == TyKind::Enum) { decl_index(t, pcx) }
+        else { -1 };
+    let dm = if dd >= 0 { decl_lifetimes(adt_node(t, pcx), pcx) } else { 0 };
+    let lts = lifetimes_of(n, pcx);
+    if lts > 0 {
+        for i in 0..pcx.nodes[lts].count {
+            let w = if dd >= 0 { decl_variance(dd, i, pcx) } else { V_INV };
+            if lifetime_at(pcx.nodes[child(lts, i, pcx)].a, xform(c, w), d, dn, &pcx) {
+                changed = true;
+            }
+        }
+    }
+    let args = pcx.nodes[n].g;
+    if args > 0 {
+        for i in 0..pcx.nodes[args].count {
+            let w = if phantom { V_CO } else if cell { V_INV }
+                else if dd >= 0 { decl_variance(dd, dm + i, pcx) } else { V_INV };
+            let at = if dd >= 0 && i < adt_targ_count(t, pcx) { adt_targ(t, i, pcx) } else { 0 };
+            if var_walk(child(args, i, pcx), at, xform(c, w), d, dn, depth + 1, &pcx) {
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+// RULE: D5.3 error borrowck.unused_param for each parameter of
+// declaration d, a rust-edition one, its fields never name (rustc E0392).
+fn unused_params(d: i64, pcx: inout Ctx<Comp>) {
+    let node = decl_record(d, pcx).0;
+    if !crate::front::rust::rust_at(pcx.nodes[node].start, &pcx) {
+        return;
+    }
+    let lts = lifetimes_of(node, pcx);
+    let m = decl_lifetimes(node, pcx);
+    for i in 0..m + decl_type_params(node, pcx) {
+        if decl_variance(d, i, pcx) != V_BI {
+            continue;
+        }
+        let pn = if i < m { child(lts, i, pcx) } else { child(pcx.nodes[node].g, i - m, pcx) };
+        let saved = pcx.err_kind;
+        pcx.err_kind = c"borrowck.unused_param";
+        crate::base::diag::err_begin(pcx.nodes[pn].start, &pcx);
+        crate::base::diag::err_fmt(
+            format_args("the parameter '{}' of '{}' is never used in its fields",
+                sym_text(pcx.nodes[pn].a, pcx), sym_text(pcx.nodes[node].a, pcx)),
+            pcx);
+        crate::base::diag::err_help(if i < m {
+            c"use it in a field, or add a field `PhantomData<&'a ()>` (rustc E0392)"
+        } else {
+            c"use it in a field, or add a field `PhantomData<T>` (rustc E0392)"
+        }, pcx);
+        crate::base::diag::err_end_soft(&pcx);
+        pcx.err_kind = saved;
+    }
 }

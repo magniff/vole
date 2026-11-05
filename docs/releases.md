@@ -78,7 +78,157 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.26.4 | `v0.26.4` | 0.26.3 | aarch64-macos | the compiler on Rust's overflow checks (its wrap sites `wrapping_*`, the bootstrap with the checks on); its raw-pointer parameters decided (`fix --only rawptr`: 1,416 of 2,583 `inout`); its statics in context structs, phases 1-3 (`fix --only statics`: the places IR's body, the tools' `Tcx`, front's pass contexts; 2,138 statics to 1,234); `Comp` an `unsafe impl Allocator` |
 | 0.26.5 | `v0.26.5` | 0.26.4 | aarch64-macos | the compiler's statics in context structs, phases 4-6 (`base::ctx::Ctx<Comp>` passed as `pcx`, the tables code generation's tasks read through a let view per task, `WgslCx<Arena>`; 1,234 statics to 188); `fix --only statics` doing the by-hand steps and `--prune`; the alloc exemption down to `SYMS` and `TYPES` |
 | 0.27.0 | `v0.27.0` | 0.26.5 | aarch64-macos | the rust edition begins (`// EDITION: rust`: references, `Deref`/`Index`, reference patterns, lifetimes and regions in side tables, `borrowck.unchecked`; 56 hand-translated cases); `compiler/std2`, the new std's API (1,414 items, 1,070 typechecking) and the translator's std rewrite table; SYMS/TYPES read-only in tasks and the alloc exemption deleted; Ctx's tables `Vec`s (unjustified unsafe 3,057 to 2,775) |
+| 0.27.1 | `v0.27.1` | 0.27.0 | aarch64-macos | the rust edition's borrow checker: NLL on the places IR (docs/design/borrowck.md), 18 `borrowck.*` codes with `explain`, 193 programs checked against rustc; Rust's `Copy` rule, reborrows, captures as loans, deferred `let`; contracts typed by the shared rule; 0.27.0's -O2 aliasing miscompile fixed; docs/design/contracts-effects.md |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.27.1
+
+The rust edition's borrows are checked: NLL on the places IR, as rustc's, with the semantics written down as rules (docs/design/borrowck.md) and checked against rustc on 193 programs (0 disagreements but the named ones). A rust-edition program now gets Rust's errors for conflicting borrows, references that outlive what they borrow, use after a move, assignment twice and drop order, each with `explain`; closure bodies' inner borrows wait for 0.27.2 (`borrowck.unchecked` names them). Rust's `Copy` rule, reborrows, captures as loans and deferred `let x;` come with it. It fixes 0.27.0's -O2 miscompile of aliasing references in unchecked rust-edition code. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
+
+The borrow checker (bc271):
+
+- `docs/design/borrowck.md`: the semantics as definitions and rules with
+  stable ids (D1.1 .. D17.7, M1 .. M6, I1 .. I7, R1 .. R11, L1 .. L8),
+  each anchored to the IR construct it reads; the decisions (per-instance
+  checking with a dedupe key, the container table, Rust's capture
+  modes, both positions); the divergences from rustc, more permissive
+  (raw pointers, MVS std's hidden views, per-instance checking, closure
+  bodies, constant indexes, `Copy` MVS std types) and stricter (dropck
+  without `may_dangle`, no rvalue promotion, vole's temporaries, NLL
+  only, whole-variable captures, a guard that moves the scrutinee); the
+  contracts' rules (the shared context, `old`, the disjoint-parameters
+  axiom, the optimizer's gate); the regions dump's grammar.
+- `compiler/src/places/borrowck/`: liveness (use- and drop-liveness per
+  point), the constraints (subtyping by variance over a place's region
+  slots, the supporting prefixes of a borrow, a `&mut` passed on read as
+  a reborrow, a call's regions from the callee's signature, `return`
+  against the signature's), the solve (bitsets, a worklist, the
+  universals fixed by the signature's order), the loans in scope and
+  every access checked in order against the conflict table (two-phase
+  receivers, kills, the code by the loan's kind), the universal
+  violations, the moves on the IR (elaboration's paths and dataflows
+  re-run: use after move, in a loop, a partial move, a move out of a
+  reference, an index, a static, a value with `impl Drop`), dropck with
+  the container table, the per-instance dedupe, the verdict per body
+  that gates the optimizer's parameter alias facts and the code cache's
+  key; `volec check --emit-places=regions`, the `borrowck` row of
+  `--time-passes`; 18 codes with `explain`.
+- The own pass's move findings and `own.drop_view` are off for a
+  rust-edition position: the IR reports them. A rust-edition body gets
+  the optimizer's reference-parameter facts only with a clean verdict
+  (0.27.0 miscompiled `f(&mut x, &mut x)` at -O2 with them on).
+- Known holes, each counted: closure bodies through the raw env
+  (`warning borrowck.unchecked`, one per closure body: 106 in 32 of the
+  284 rust_ cases, every one a closure body; the runner's
+  `--allow=borrowck.unchecked` for rust-edition cases stays until 0.27.2
+  types the environment), MVS std's hidden views (0.27.2 with std2), a
+  by-`&` capture of a shared view copied until Z9 (R12). The budget:
+  borrowck 4.4 ms against typeck 339.4 ms over the corpus (0.013, the
+  bound 0.25; the largest case 0.065); compiler/src (MVS) gets no
+  `borrowck` row.
+
+The borrow checker's corpus and its rustc twin (corpus271):
+
+- `tests/run/rust_b_ok_*.vl` and `tests/run/rust_b_err_*.vl`: 76
+  programs the checker accepts and 113 it rejects, written from the
+  spec's rule ids (each case's `// RULE: Dn.m`): the conflict table cell
+  by cell, kills and reassigned references, reborrows through `&`,
+  `&mut` and raw pointers, two-phase borrows, returns and elision,
+  structs with lifetimes and variance, dropck and the container table,
+  moves, closures' captures, MVS std's bridge, calls with the callee's
+  regions, views, match guards' fake borrows, statics and contracts. A
+  rejected case names the code, its position and the error count; until
+  the checker's milestone that reports it lands, it is `XFAIL` with the
+  milestone named.
+- `tools/borrowck-twin.sh CASE...`: rustc as the oracle of accept and
+  reject. Each case, its directives blanked and `println(` spelled
+  `println!(`, is compiled by rustc; its verdict and its first error's
+  code (mapped by the spec's table of codes) must be the case's, unless
+  the case names the divergence's class (`// RUSTC: accepts|rejects
+  CLASS`, from the spec's R1-R10 and L1-L8) or is outside the common
+  subset (`// RUSTC: none`: MVS std's `Vec` takes an allocator,
+  contracts are not Rust). The gate's `borrowck-twin` row runs it on
+  every `rust_b_` case (a SKIP without rustc).
+- `tests/borrowck-try/`: a case per code with a `try:` line, run by the
+  own pass's try-test runner (`tests/own-try/run.sh -d DIR`, `// CODE:`).
+- `tools/borrowck-budget.sh`: the `borrowck` pass's time over the rust
+  corpus against typeck's, and their ratio (at most 0.25);
+  `tests/compile_cost.sh`'s fourth row, `rust`, the check of the
+  corpus's biggest case against the previous release (at most 1.5x).
+- `rust_b_err_alias_params`: the program 0.27.0 miscompiled at -O2 (two
+  `&mut` of one place to one call, and `&v, &mut v`: the parameters'
+  alias facts taken for a body nobody checked), now `mut_twice` and
+  `conflict`; `tests/same_output.sh`: every running `rust_t_`/`rust_b_ok_`
+  case prints the same at -O0, at -O2 and at -O2 with `--no-noalias`.
+- `rust_t_contract_*`: contracts in the rust edition, one case per rule
+  of the contracts design's C3, C5 and C7.1 (a clause reads `&mut`
+  parameters as `&`, `old(e)` only of a `Copy` value without regions, an
+  impl's added `requires` checked per instance).
+- `tools/checks-survey.sh`: `--print-checks` over bench/ and the
+  examples at -O2, the checks left and removed (by ranges or otherwise),
+  in user code and in std, by kind: the first survey since 0.18.1's.
+
+The places IR carries what the borrow checker reads (ir271):
+
+- Region slots for every type (docs/design/borrowck.md D3.3): a
+  struct's and an enum's declared lifetimes and its type arguments', a
+  closure's captures', a raw pointer's pointee's; each local gets a
+  variable per slot, a parameter's are its signature's universals.
+  `--verify-places` checks that every local and every place the body
+  names has as many regions as its type has slots.
+- Signatures read with their lifetimes (D4.1, D4.2): one universal per
+  named lifetime (the impl's and the function's), `'static`, one per
+  elided input region, one per slot of a type parameter's substitution
+  shared by its occurrences; the elision rules E1-E3, and `error
+  borrowck.elision` (E4, rustc E0106) at the signature; declared
+  `'b: 'a` and the implied bounds of `&'a T`.
+- A call gets one region per region of its callee's signature, its
+  first in the call's region word (D3.2).
+- The variance of every struct's and enum's parameters (D5.3), and
+  `error borrowck.unused_param` for one no field uses (rustc E0392).
+- The regions dump of `--emit-places` in the format of borrowck.md §16:
+  `region 'r2: universal 'a (_1.0, return.0)`, `local _3.1`, `call
+  bb0[12].1`, `bound 'r3: 'r2`, and a `variance S: 'a +, T o` line per
+  rust-edition type.
+- `&&'a T` and `&&mut T` parse (the lexer's `&&`), and `&'a str` keeps
+  its lifetime.
+- R5 closed: a reference given where its value goes, or a place where a
+  reference goes, to a rust-edition function or a `let`'s written type
+  is `error edition.lenient` with Rust's spelling as its `try:`.
+- Operands follow Rust's Copy rule (D8.3): a value moves unless its
+  type is Copy (scalars, `&T`, raw pointers, shared views, arrays and
+  tuples of Copy, a `#[derive(Copy)]` or `impl Copy` type), glue or
+  not; `let s = *r;` and `let s = v[0];` of a type not Copy move that
+  place (the checker's `move_out`); a place moved into a call is a
+  statement of its own at the argument. A derive's code keeps MVS's
+  rules.
+- A `&mut` given to a call is reborrowed (D3.6): `&mut2 (*r)` for a
+  `&mut` parameter, `&(*r)` for a `&T` one; `--verify-places` refuses a
+  copy of a whole `&mut` (I7).
+- A match with a guard fake-borrows its scrutinee and every place its
+  patterns test (`&'r fake`, D2.6), mentioned at each arm; a `ref mut`
+  binding is a shared borrow in the guard.
+- A closure's by-reference captures are loans, `&'c x` and `&'c mut x`,
+  held in the closure's type (D10.2); a call of a closure value
+  reborrows it, `&'e` or `&'e mut2` for one that writes a capture
+  (D10.3).
+- `&raw mut` loans (`BK_RAW_MUT`) for a `&mut x` given as a `*mut T`;
+  `where 'a: 'b` predicates; `error borrowck.static_mut_ref` for a
+  reference to a `static mut` (D6.2.5); a check's decision slot on
+  asserts and contract conjuncts, printed `; L1:`.
+- `Vec<&i64, Gpa>` keeps its element a reference, and `volec test` lends
+  a contract's `&T` and `&mut T` parameters a generated value.
+- Contracts in the rust edition: a clause reads its parameters shared
+  (C3: a `&mut T` or `&mut [T]` is `&T` in a `requires` and an
+  `ensures`, so a write through it is refused); `old(e)` takes a Copy
+  value with no reference and no raw pointer (C5), and contract.old is
+  reported before the borrow checker runs; a clause that moves a
+  parameter or `result` is `error contract.move` (C3.2).
+- A closure captures what it reads by `&`, an immutable variable too
+  (Rust's rule, D10.2); a `move` closure copies or moves.
+- Deferred initialization: `let x: T;` and `let x;` (typed by its first
+  assignment), assigned without `mut`; one never assigned is an error
+  (rustc E0282).
 
 ### What's new in 0.27.0
 

@@ -1,0 +1,401 @@
+// (0.27.1) The solve (docs/design/borrowck.md D6.1): the least assignment
+// of point sets to the regions with the liveness facts (a local's slot
+// region holds every point its local is use-live at, and drop-live at
+// when a drop needs it: D3.7, D9.1), the universals fixed (every point
+// and the `end` bits of the universals they outlive: D4.5), and the
+// outlives constraints propagated along `'sub -> 'sup` edges to a
+// fixpoint, by a worklist over bitsets. Nothing is propagated into a
+// universal: a constraint into one is checked after the fixpoint
+// (D6.2.1: borrowck.outlives).
+
+use crate::base::{buf_new, buf_slice, buf_str, sym_text};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::base::diag::report_error_tries;
+use crate::front::own::glue::has_glue;
+use crate::front::types::{TyKind, type_elem};
+use crate::places::borrowck::{Bck, LOAN_WORDS, bit_on};
+use crate::places::ir::{Body, LF_STATIC, has_flag, local_ty, undistinct};
+use crate::places::regions::{
+    RO_LOAN, RO_LOCAL, RO_UNIVERSAL, U_ELIDED, U_NAMED, U_STATIC, region_word, slot_count, slot_var,
+};
+
+// RULE: D6.1
+pub fn solve(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    let nbits = bck.npts + bck.nuniv;
+    bck.nw_p = (nbits + 63) / 64;
+    if bck.nw_p < 1 {
+        bck.nw_p = 1;
+    }
+    let nw = bck.nw_p;
+    bck.val.clear();
+    for _ in 0..(bck.nreg + 1) * nw {
+        bck.val.push(0);
+    }
+    universal_order(&bck, pbody);
+    dropck_slots(&bck, pbody, &pcx);
+    // (Liveness) and (Universal)
+    for r in 1..bck.nreg + 1 {
+        let o = bck.origin[r - 1];
+        if o == RO_UNIVERSAL {
+            for p in 0..bck.npts {
+                set_bit(r, p, &bck);
+            }
+            let u = bck.univ[r - 1];
+            for v in 0..bck.nuniv {
+                if outlives(u, v, bck) {
+                    set_bit(r, bck.npts + v, &bck);
+                }
+            }
+        } else if o == RO_LOAN && static_loan(r, bck, pbody) {
+            // RULE: D6.2.5 (a loan of a static: every point and every end)
+            for p in 0..bck.npts + bck.nuniv {
+                set_bit(r, p, &bck);
+            }
+        } else if o == RO_LOCAL {
+            let l = bck.of[r - 1];
+            let needed = bck.dropck[r - 1] != 0;
+            for p in 0..bck.npts {
+                if bit_on(bck.live, p * bck.nw_l, l)
+                    || needed && bit_on(bck.dlive, p * bck.nw_l, l) {
+                    set_bit(r, p, &bck);
+                }
+            }
+        }
+    }
+    // (Outlives): the adjacency sub -> sups, then the worklist
+    adjacency(&bck);
+    bck.queue.clear();
+    bck.inq.clear();
+    for _ in 0..bck.nreg + 1 {
+        bck.queue.push(0);
+        bck.inq.push(0);
+    }
+    var head = 0;
+    var tail = 0;
+    let cap = bck.nreg + 1;
+    for r in 1..bck.nreg + 1 {
+        bck.queue[tail] = r;
+        tail = (tail + 1) % cap;
+        bck.inq[r] = 1;
+    }
+    while head != tail {
+        let r = bck.queue[head];
+        head = (head + 1) % cap;
+        bck.inq[r] = 0;
+        for i in bck.adj_at[r]..bck.adj_at[r + 1] {
+            let sup = bck.adj[i];
+            if bck.origin[sup - 1] == RO_UNIVERSAL {
+                continue;
+            }
+            var grew = false;
+            for w in 0..nw {
+                let nv = bck.val[sup * nw + w] | bck.val[r * nw + w];
+                if nv != bck.val[sup * nw + w] {
+                    bck.val[sup * nw + w] = nv;
+                    grew = true;
+                }
+            }
+            if grew && bck.inq[sup] == 0 {
+                bck.queue[tail] = sup;
+                tail = (tail + 1) % cap;
+                bck.inq[sup] = 1;
+            }
+        }
+    }
+    universal_violations(&bck, pbody, &pcx);
+}
+
+fn set_bit(r: i64, bit: i64, bck: inout Bck<Comp>) {
+    let w = r * bck.nw_p + (bit >> 6);
+    bck.val[w] = bck.val[w] | (1 << (bit & 63));
+}
+
+// Whether region r is the loan of a static's place (an LF_STATIC root).
+fn static_loan(r: i64, bck: Bck<Comp>, pbody: Body<Comp>) -> bool {
+    for j in 0..bck.loans.len() as i64 / LOAN_WORDS {
+        if bck.loans[LOAN_WORDS * j + 1] == r {
+            return has_flag(bck.loans[LOAN_WORDS * j + 3], LF_STATIC, pbody);
+        }
+    }
+    false
+}
+
+// The words a universal's row of the order takes.
+fn nwu(bck: Bck<Comp>) -> i64 {
+    let n = (bck.nuniv + 63) / 64;
+    if n < 1 { 1 } else { n }
+}
+
+// RULE: D4.5 (the order: 'static outlives every universal, each itself,
+// the body's bounds, closed transitively)
+fn universal_order(bck: inout Bck<Comp>, pbody: Body<Comp>) {
+    let n = bck.nuniv;
+    let w = nwu(bck);
+    bck.outlives.clear();
+    for _ in 0..n * w {
+        bck.outlives.push(0);
+    }
+    for u in 0..n {
+        set_outlives(u, u, &bck);
+        if u == 0 {
+            for v in 0..n {
+                set_outlives(0, v, &bck);
+            }
+        }
+    }
+    var i = 0;
+    while i + 1 < pbody.ubounds.len() as i64 {
+        let a = pbody.ubounds[i] - 1;
+        let b = pbody.ubounds[i + 1] - 1;
+        if a >= 0 && a < n && b >= 0 && b < n {
+            set_outlives(a, b, &bck);
+        }
+        i += 2;
+    }
+    for k in 0..n {
+        for a in 0..n {
+            if outlives(a, k, bck) {
+                for b in 0..n {
+                    if outlives(k, b, bck) {
+                        set_outlives(a, b, &bck);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn set_outlives(u: i64, v: i64, bck: inout Bck<Comp>) {
+    let w = u * nwu(bck) + (v >> 6);
+    bck.outlives[w] = bck.outlives[w] | (1 << (v & 63));
+}
+
+// Whether universal u outlives universal v (indexes from 0, 'static 0).
+pub fn outlives(u: i64, v: i64, bck: Bck<Comp>) -> bool {
+    u >= 0 && v >= 0 && u < bck.nuniv && v < bck.nuniv
+        && (bck.outlives[u * nwu(bck) + (v >> 6)] >> (v & 63)) & 1 != 0
+}
+
+// RULE: D6.2.1 (a constraint into a universal that holds an `end` the
+// universal does not outlive: borrowck.outlives, once per pair)
+fn universal_violations(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    let ne = bck.edges.len() as i64 / 3;
+    bck.reported.clear();
+    for e in 0..ne {
+        let sup = bck.edges[3 * e];
+        let sub = bck.edges[3 * e + 1];
+        let loc = bck.edges[3 * e + 2];
+        if bck.origin[sup - 1] != RO_UNIVERSAL {
+            continue;
+        }
+        let u = bck.univ[sup - 1];
+        for v in 0..bck.nuniv {
+            if !bit_on(bck.val, sub * bck.nw_p, bck.npts + v) || outlives(u, v, bck) {
+                continue;
+            }
+            var seen = false;
+            var i = 0;
+            while i < bck.reported.len() as i64 {
+                if bck.reported[i] == u && bck.reported[i + 1] == v {
+                    seen = true;
+                }
+                i += 2;
+            }
+            if seen {
+                continue;
+            }
+            bck.reported.push(u);
+            bck.reported.push(v);
+            report_outlives(u, v, loc, bck, pbody, &pcx);
+        }
+    }
+}
+
+// The region variable of universal u.
+fn universal_var(u: i64, bck: Bck<Comp>) -> i64 {
+    for r in 1..bck.nreg + 1 {
+        if bck.origin[r - 1] == RO_UNIVERSAL && bck.univ[r - 1] == u {
+            return r;
+        }
+    }
+    0
+}
+
+// Universal u as the user names it: `'static`, `'a`, the lifetime of a
+// parameter's reference, the lifetime in a type parameter.
+fn buf_universal(m: i64, u: i64, bck: Bck<Comp>, pbody: Body<Comp>, pcx: Ctx<Comp>) {
+    let r = universal_var(u, bck);
+    if r == 0 {
+        buf_str(m, c"a region");
+        return;
+    }
+    let kind = region_word(r, 0, pbody);
+    let x = region_word(r, 1, pbody);
+    if kind == U_STATIC {
+        buf_str(m, c"'static");
+    } else if kind == U_NAMED {
+        buf_str(m, c"'");
+        crate::base::buf_bytes(m, sym_text(x, pcx));
+    } else if kind == U_ELIDED {
+        buf_str(m, c"the lifetime of '");
+        crate::places::borrowck::diag::buf_place(m, x, 0, 0, pbody, pcx);
+        buf_str(m, c"'");
+    } else {
+        buf_str(m, c"the lifetime in '");
+        crate::base::buf_bytes(m, sym_text(x, pcx));
+        buf_str(m, c"'");
+    }
+}
+
+fn report_outlives(u: i64, v: i64, loc: i64, bck: Bck<Comp>, pbody: Body<Comp>,
+    pcx: inout Ctx<Comp>) {
+    var node = pbody.stmts[loc].node;
+    if node == 0 {
+        node = pbody.node;
+    }
+    let m = buf_new();
+    buf_universal(m, v, bck, pbody, pcx);
+    buf_str(m, c" must outlive ");
+    buf_universal(m, u, bck, pbody, pcx);
+    buf_str(m, c": a reference of the first flows where the second is required, and the signature does not say it lasts as long");
+    // RULE: section 14.1 (the try: names one lifetime on the signature when
+    // both regions are elided parameters')
+    var tr = -1;
+    let ru = universal_var(u, bck);
+    let rv = universal_var(v, bck);
+    if ru > 0 && rv > 0 && region_word(ru, 0, pbody) == U_ELIDED
+        && region_word(rv, 0, pbody) == U_ELIDED {
+        tr = crate::places::borrowck::diag::try_name_lifetime(pbody.node, pcx);
+    }
+    report_error_tries(pcx.nodes[node].start, 3000 + u * 64 + v, c"borrowck.outlives",
+        buf_slice(m).ptr,
+        c"name one lifetime on both (`fn f<'a>(x: &'a T, y: &'a T) -> &'a T`), or add the bound (`'b: 'a`)",
+        if tr >= 0 { buf_slice(tr) } else { "" }, false, &pcx);
+}
+
+// The edges as adjacency lists: adj[adj_at[sub] .. adj_at[sub + 1]] the
+// sups of sub.
+fn adjacency(bck: inout Bck<Comp>) {
+    let n = bck.nreg + 2;
+    bck.adj_at.clear();
+    for _ in 0..n + 1 {
+        bck.adj_at.push(0);
+    }
+    let ne = bck.edges.len() as i64 / 3;
+    for e in 0..ne {
+        let sub = bck.edges[3 * e + 1];
+        bck.adj_at[sub + 1] += 1;
+    }
+    for i in 0..n {
+        bck.adj_at[i + 1] += bck.adj_at[i];
+    }
+    bck.adj.clear();
+    for _ in 0..ne {
+        bck.adj.push(0);
+    }
+    bck.tmp.clear();
+    for i in 0..n + 1 {
+        bck.tmp.push(bck.adj_at[i]);
+    }
+    for e in 0..ne {
+        let sub = bck.edges[3 * e + 1];
+        bck.adj[bck.tmp[sub]] = bck.edges[3 * e];
+        bck.tmp[sub] += 1;
+    }
+}
+
+// Per region, whether a drop of its local requires it live (D9.1): a
+// reference, a view, a raw pointer and a scalar have no glue; an array's
+// and a tuple's elements each by this rule; a struct or enum with glue
+// every slot of its, except the compiler-known containers (Q3: the
+// table), whose requirement is their type arguments' each.
+// RULE: D9.1
+fn dropck_slots(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    bck.dropck.clear();
+    for _ in 0..bck.nreg {
+        bck.dropck.push(0);
+    }
+    for l in 0..bck.nlocal {
+        if bck.nslots[l] == 0 {
+            continue;
+        }
+        let t = local_ty(l, pbody);
+        if has_glue(t, &pcx) {
+            mark_dropck(t, l, 0, &bck, pbody, &pcx);
+        }
+    }
+}
+
+// Type t's dropck slots marked, t's slots being local l's from off.
+fn mark_dropck(t0: i64, l: i64, off: i64, bck: inout Bck<Comp>, pbody: Body<Comp>,
+    pcx: inout Ctx<Comp>) {
+    let t = undistinct(t0, pcx);
+    if t <= 0 || !has_glue(t, &pcx) {
+        return;
+    }
+    let k = pcx.types[t].kind;
+    if k == TyKind::Ptr || k == TyKind::Slice {
+        return;
+    }
+    if k == TyKind::Array {
+        mark_dropck(pcx.types[t].a, l, off, &bck, pbody, &pcx);
+        return;
+    }
+    if k == TyKind::Tuple {
+        var o = off;
+        for i in 0..pcx.types[t].count {
+            let e = type_elem(t, i, pcx);
+            mark_dropck(e, l, o, &bck, pbody, &pcx);
+            o += slot_count(e, pcx);
+        }
+        return;
+    }
+    if (k == TyKind::Struct || k == TyKind::Enum) && container(t, pcx) {
+        // (the type arguments' slots come after the declared lifetimes')
+        let n = targ_count(t, pcx);
+        var args = 0;
+        for i in 0..n {
+            args += slot_count(targ(t, i, pcx), pcx);
+        }
+        var o = off + slot_count(t, pcx) - args;
+        for i in 0..n {
+            let a = targ(t, i, pcx);
+            mark_dropck(a, l, o, &bck, pbody, &pcx);
+            o += slot_count(a, pcx);
+        }
+        return;
+    }
+    // (a struct, an enum, a closure with glue: every slot of its)
+    for i in 0..slot_count(t, pcx) {
+        let r = slot_var(l, off + i, pbody);
+        if r > 0 {
+            bck.dropck[r - 1] = 1;
+        }
+    }
+}
+
+// RULE: D9.1 (Q3: the containers whose drop reaches only their elements
+// and their allocator: std's, by name)
+fn container(t: i64, pcx: Ctx<Comp>) -> bool {
+    if pcx.types[t].kind != TyKind::Struct {
+        return false;
+    }
+    let s = pcx.types[t].a;
+    if !crate::front::modules::within_std(pcx.structs[s].module, pcx) {
+        return false;
+    }
+    let tmpl = if pcx.structs[s].tmpl > 0 { pcx.structs[s].tmpl } else { s };
+    let name = sym_text(pcx.structs[tmpl].name, pcx);
+    name == "Vec" || name == "String" || name == "HashMap" || name == "HashSet"
+        || name == "BTreeMap" || name == "BTreeSet" || name == "BinaryHeap" || name == "MinHeap"
+        || name == "VecDeque" || name == "Box"
+}
+
+fn targ_count(t: i64, pcx: Ctx<Comp>) -> i64 {
+    if pcx.types[t].kind == TyKind::Struct { pcx.structs[pcx.types[t].a].targ_count } else { 0 }
+}
+
+fn targ(t: i64, i: i64, pcx: Ctx<Comp>) -> i64 {
+    crate::places::front::tlist_at(pcx.structs[pcx.types[t].a].targs + i, pcx)
+}

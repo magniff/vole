@@ -1,0 +1,398 @@
+// (0.27.1) The borrow checker's diagnostics (docs/design/borrowck.md
+// section 14): one error per (loan, access place, code) in a body, at the
+// access's statement node, naming the loan's position; the codes'
+// `explain` rows are tools/explain/borrowck_table.vl.
+
+use crate::base::{SRC, buf_new, buf_slice, buf_str, sym_text};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::base::diag::{buf_position, report_error_tries};
+use crate::places::borrowck::{Bck, LOAN_WORDS};
+use crate::places::borrowck::access::{
+    A_RB, C_ASSIGN_BORROWED, C_CONFLICT, C_DROPPED_BORROWED, C_GUARD_WRITE, C_MOVE_BORROWED,
+    C_MUT_TWICE, C_RETURN_LOCAL, C_USE_BORROWED,
+};
+use crate::places::ir::{BK_MUT, BK_MUT2, Body, LF_PARAM, LF_USER, SK_DEAD};
+
+// A write through a shared reference at location loc (D2.6, L6: a guard's
+// `ref mut` binding), once per place.
+pub fn report_shared_write(loc: i64, l: i64, p: i64, bck: inout Bck<Comp>, pbody: Body<Comp>,
+    pcx: inout Ctx<Comp>) {
+    var i = 0;
+    while i < bck.reported.len() as i64 {
+        if bck.reported[i] == -1 && bck.reported[i + 1] == l && bck.reported[i + 2] == p
+            && bck.reported[i + 3] == C_GUARD_WRITE {
+            return;
+        }
+        i += 4;
+    }
+    bck.reported.push(-1);
+    bck.reported.push(l);
+    bck.reported.push(p);
+    bck.reported.push(C_GUARD_WRITE);
+    var node = pbody.stmts[loc].node;
+    if node == 0 {
+        node = pbody.node;
+    }
+    let m = buf_new();
+    buf_str(m, c"cannot write to '");
+    buf_place(m, l, p, 0, pbody, pcx);
+    buf_str(m, c"' in a match guard: a `ref mut` binding is shared there");
+    report_error_tries(pcx.nodes[node].start, 1000 + C_GUARD_WRITE, c"borrowck.guard_write",
+        buf_slice(m).ptr, c"write it in the arm, after the match has decided", "", false, &pcx);
+}
+
+// A `try:` line that rewrites node n's text t as `pre t post` on its line
+// (as the own pass's: `volec edit patch FILE:LINE --old 'LINE' --new 'LINE'`,
+// the line without its indentation); the command in a buffer, or -1 for a
+// node over several lines or in std.
+pub fn try_wrap(n: i64, pre: *u8, post: *u8, pcx: Ctx<Comp>) -> i64 {
+    if n <= 0 {
+        return -1;
+    }
+    let start = pcx.nodes[n].start;
+    let end = pcx.nodes[n].end;
+    let f = src_file(start, pcx);
+    // UNSAFE: FILES' paths and SRC are the lexer's raw text.
+    // SAFETY: f is a file index below FILES' count; every position read is
+    // within the file's [start, end), which the lexer filled.
+    unsafe {
+        let path = pcx.files[f].path;
+        if path[0] == '<' || end <= start {
+            return -1;
+        }
+        var ls = start;
+        while ls > pcx.files[f].start && SRC[ls - 1] != '\n' {
+            ls -= 1;
+        }
+        while ls < start && (SRC[ls] == ' ' || SRC[ls] == '\t') {
+            ls += 1;
+        }
+        var le = start;
+        while le < pcx.files[f].end && SRC[le] != '\n' {
+            le += 1;
+        }
+        if end > le {
+            return -1;
+        }
+        while le > end && (SRC[le - 1] == ' ' || SRC[le - 1] == '\t') {
+            le -= 1;
+        }
+        let args = buf_new();
+        buf_str(args, c"edit patch ");
+        buf_str(args, if path[0] == '.' && path[1] == '/' { &path[2] } else { path });
+        crate::base::buf_byte(args, ':');
+        crate::base::buf_int(args, src_line(start, pcx));
+        buf_str(args, c" --old ");
+        quoted(args, ls, le, -1, -1, c"", c"");
+        buf_str(args, c" --new ");
+        quoted(args, ls, le, start, end, pre, post);
+        let out = buf_new();
+        crate::base::diag::buf_tool_command(out, buf_slice(args), false, pcx);
+        out
+    }
+}
+
+// A `try:` line that names one lifetime `'a` on function node n's
+// signature line (D6.2.1's and D4.2's try: `fn f<'a>(x: &'a T, y: &'a T) ->
+// &'a T`): `<'a>` after the name when it has no generics, `'a` after each
+// `&` not named yet; the command in a buffer, or -1 when the signature
+// is not on one line or in std.
+pub fn try_name_lifetime(n: i64, pcx: Ctx<Comp>) -> i64 {
+    if n <= 0 {
+        return -1;
+    }
+    let start = pcx.nodes[n].start;
+    let f = src_file(start, pcx);
+    // UNSAFE: FILES' paths and SRC are the lexer's raw text.
+    // SAFETY: f is a file index below FILES' count; every position read is
+    // within the file's [start, end), which the lexer filled.
+    unsafe {
+        let path = pcx.files[f].path;
+        if path[0] == '<' {
+            return -1;
+        }
+        var ls = start;
+        while ls > pcx.files[f].start && SRC[ls - 1] != '\n' {
+            ls -= 1;
+        }
+        while ls < start && (SRC[ls] == ' ' || SRC[ls] == '\t') {
+            ls += 1;
+        }
+        var le = start;
+        while le < pcx.files[f].end && SRC[le] != '\n' {
+            le += 1;
+        }
+        // (the signature: up to the body's `{`; the line must hold it)
+        var brace = ls;
+        while brace < le && SRC[brace] != '{' {
+            brace += 1;
+        }
+        if brace == le {
+            return -1;
+        }
+        while brace > ls && SRC[brace - 1] == ' ' {
+            brace -= 1;
+        }
+        let new = buf_new();
+        var i = ls;
+        var named = false;
+        var in_params = false;
+        while i < brace {
+            let c = SRC[i];
+            if !named && !in_params && (c == '(' || c == '<') {
+                if c == '<' {
+                    return -1;
+                }
+                buf_str(new, c"<'a>");
+                named = true;
+                in_params = true;
+            }
+            crate::base::buf_byte(new, c);
+            if c == '&' && (i + 1 >= brace || SRC[i + 1] != '\'') {
+                buf_str(new, c"'a ");
+            }
+            i += 1;
+        }
+        if !named {
+            return -1;
+        }
+        let args = buf_new();
+        buf_str(args, c"edit patch ");
+        buf_str(args, if path[0] == '.' && path[1] == '/' { &path[2] } else { path });
+        crate::base::buf_byte(args, ':');
+        crate::base::buf_int(args, src_line(start, pcx));
+        buf_str(args, c" --old ");
+        quoted(args, ls, brace, -1, -1, c"", c"");
+        buf_str(args, c" --new ");
+        quote_slice(args, buf_slice(new));
+        let out = buf_new();
+        crate::base::diag::buf_tool_command(out, buf_slice(args), false, pcx);
+        out
+    }
+}
+
+// s single-quoted for a shell.
+fn quote_slice(out: i64, s: [u8]) {
+    crate::base::buf_byte(out, '\'');
+    for i in 0..s.len {
+        if s[i] == '\'' {
+            buf_str(out, c"'\\''");
+        } else {
+            crate::base::buf_byte(out, s[i]);
+        }
+    }
+    crate::base::buf_byte(out, '\'');
+}
+
+// SRC[from..to) single-quoted for a shell, `pre` put at `at` and `post` at
+// `end` (-1: none).
+fn quoted(out: i64, from: i64, to: i64, at: i64, end: i64, pre: *u8, post: *u8) {
+    crate::base::buf_byte(out, '\'');
+    var i = from;
+    while i <= to {
+        if i == at {
+            buf_str(out, pre);
+        }
+        if i == end && at >= 0 {
+            buf_str(out, post);
+        }
+        if i < to {
+            // UNSAFE: SRC is the lexer's raw text.
+            // SAFETY: i is within a line of a file the lexer read.
+            let c = unsafe { SRC[i] };
+            if c == '\'' {
+                buf_str(out, c"'\\''");
+            } else {
+                crate::base::buf_byte(out, c);
+            }
+        }
+        i += 1;
+    }
+    crate::base::buf_byte(out, '\'');
+}
+
+// The file of position pos (an index in FILES), and its line from 1.
+fn src_file(pos: i64, pcx: Ctx<Comp>) -> i64 {
+    var f = 0;
+    while f + 1 < pcx.files.len() as i64 && pos >= pcx.files[f + 1].start {
+        f += 1;
+    }
+    f
+}
+
+pub fn src_line(pos: i64, pcx: Ctx<Comp>) -> i64 {
+    var line = 1;
+    var i = pcx.files[src_file(pos, pcx)].start;
+    while i < pos {
+        // UNSAFE: SRC is the lexer's raw text.
+        // SAFETY: i is below pos, a position in a file the lexer read.
+        if unsafe { SRC[i] } == '\n' {
+            line += 1;
+        }
+        i += 1;
+    }
+    line
+}
+
+// The code's name.
+pub fn code_name(code: i64) -> *u8 {
+    if code == C_MUT_TWICE { c"borrowck.mut_twice" }
+    else if code == C_CONFLICT { c"borrowck.conflict" }
+    else if code == C_USE_BORROWED { c"borrowck.use_borrowed" }
+    else if code == C_ASSIGN_BORROWED { c"borrowck.assign_borrowed" }
+    else if code == C_MOVE_BORROWED { c"borrowck.move_borrowed" }
+    else if code == C_DROPPED_BORROWED { c"borrowck.dropped_borrowed" }
+    else if code == C_RETURN_LOCAL { c"borrowck.return_local" }
+    else if code == C_GUARD_WRITE { c"borrowck.guard_write" }
+    else if code == C_OUTLIVES { c"borrowck.outlives" }
+    else if code == C_ELISION { c"borrowck.elision" }
+    else if code == C_UNUSED_PARAM { c"borrowck.unused_param" }
+    else { c"borrowck.static_mut_ref" }
+}
+
+// The codes the front reports at the signature (ir271: D4.2, D5.3,
+// D6.2.5) and the solve's universal violation (D6.2.1), named here with
+// the others: the checker's codes are this file's list.
+pub const C_OUTLIVES: i64 = 9;
+pub const C_ELISION: i64 = 10;
+pub const C_UNUSED_PARAM: i64 = 11;
+pub const C_STATIC_MUT_REF: i64 = 12;
+
+// A conflict of the access (kind, of place (l, p), `*` of it when deref)
+// at location loc with loan j, reported once.
+// RULE: section 14.2, 14.3
+pub fn report(code: i64, kind: i64, loc: i64, j: i64, l: i64, p: i64, deref: i64,
+    bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    var i = 0;
+    while i < bck.reported.len() as i64 {
+        if bck.reported[i] == j && bck.reported[i + 1] == l && bck.reported[i + 2] == p
+            && bck.reported[i + 3] == code {
+            return;
+        }
+        i += 4;
+    }
+    bck.reported.push(j);
+    bck.reported.push(l);
+    bck.reported.push(p);
+    bck.reported.push(code);
+    let st = pbody.stmts[loc];
+    let ls = bck.loans[LOAN_WORDS * j];
+    let lk = bck.loans[LOAN_WORDS * j + 2];
+    var node = st.node;
+    if node == 0 {
+        node = pbody.stmts[ls].node;
+    }
+    if node == 0 {
+        node = pbody.node;
+    }
+    let pos = pcx.nodes[node].start;
+    let m = buf_new();
+    let mutable = lk == BK_MUT || lk == BK_MUT2;
+    if code == C_MUT_TWICE {
+        buf_str(m, c"cannot borrow '");
+        buf_place(m, l, p, deref, pbody, pcx);
+        buf_str(m, c"' as mutable more than once at a time");
+    } else if code == C_CONFLICT {
+        buf_str(m, c"cannot borrow '");
+        buf_place(m, l, p, deref, pbody, pcx);
+        buf_str(m, if kind == A_RB { c"' as immutable because it is also borrowed as mutable" }
+            else { c"' as mutable because it is also borrowed as immutable" });
+    } else if code == C_USE_BORROWED {
+        buf_str(m, c"cannot use '");
+        buf_place(m, l, p, deref, pbody, pcx);
+        buf_str(m, c"' because it is mutably borrowed");
+    } else if code == C_ASSIGN_BORROWED {
+        buf_str(m, c"cannot assign to '");
+        buf_place(m, l, p, deref, pbody, pcx);
+        buf_str(m, c"' because it is borrowed");
+    } else if code == C_MOVE_BORROWED {
+        buf_str(m, c"cannot move out of '");
+        buf_place(m, l, p, deref, pbody, pcx);
+        buf_str(m, c"' because it is borrowed");
+    } else if code == C_DROPPED_BORROWED {
+        buf_str(m, c"'");
+        buf_place(m, l, p, deref, pbody, pcx);
+        buf_str(m,
+            if st.kind
+                == SK_DEAD {
+                c"' does not live long enough: its scope ends here while it is still borrowed"
+            }
+            else { c"' is dropped here while it is still borrowed" });
+    } else if code == C_RETURN_LOCAL {
+        buf_str(m, c"a reference to '");
+        buf_place(m, l, p, deref, pbody, pcx);
+        buf_str(m, c"', a local of this function, escapes it");
+    } else {
+        buf_str(m, c"cannot write to '");
+        buf_place(m, l, p, deref, pbody, pcx);
+        buf_str(m, c"' in a match guard: the match tests it");
+    }
+    buf_str(m, if mutable { c" (mutably borrowed at " } else { c" (borrowed at " });
+    let lnode = pbody.stmts[ls].node;
+    if lnode != 0 {
+        buf_position(m, pcx.nodes[lnode].start, &pcx);
+    } else {
+        buf_str(m, c"a borrow the compiler made");
+    }
+    buf_str(m, c")");
+    let help = if code == C_MUT_TWICE {
+        c"finish the first borrow's uses before the second, or reborrow once and pass it on"
+    } else if code == C_CONFLICT {
+        c"use the shared borrow before the mutable one, or take it again after"
+    } else if code == C_USE_BORROWED {
+        c"use it after the mutable borrow's last use"
+    } else if code == C_ASSIGN_BORROWED {
+        c"assign after the borrow's last use, or shadow the reference (`let r = ..`) instead of reassigning it"
+    } else if code == C_MOVE_BORROWED {
+        c"move it after the borrow's last use, or clone it"
+    } else if code == C_DROPPED_BORROWED {
+        c"declare it before what borrows it, so it is dropped after"
+    } else if code == C_RETURN_LOCAL {
+        c"return an owned value, or borrow from a parameter"
+    } else {
+        c"write it in the arm, after the match has decided"
+    };
+    // RULE: C3.3 (the wrapper's `result` holds the loan until the return:
+    // the contract's help, places::result_borrow_help's words)
+    if (code == C_USE_BORROWED || code == C_CONFLICT) && pbody.fn_ >= 0
+        && crate::places::has_ensures(pbody.fn_, pcx) {
+        let h = buf_new();
+        buf_str(h, c"'");
+        buf_place(h, l, 0, 0, pbody, pcx);
+        buf_str(h, c"' is borrowed by 'result'; state the promise on '*result' or on 'old(..)'");
+        report_error_tries(pos, 1000 + j * 16 + code, code_name(code), buf_slice(m).ptr,
+            buf_slice(h).ptr, "", false, &pcx);
+        return;
+    }
+    // RULE: section 14.1 (move_borrowed's try: `.clone()` where it moves)
+    let tr = if code == C_MOVE_BORROWED { try_wrap(st.node, c"", c".clone()", pcx) } else { -1 };
+    report_error_tries(pos, 1000 + j * 16 + code, code_name(code), buf_slice(m).ptr, help,
+        if tr >= 0 { buf_slice(tr) } else { "" }, false, &pcx);
+}
+
+// The place as the user names it: the root's source name when it has one
+// (a user local, a parameter), the IR's form otherwise or beside it when
+// the place is projected.
+pub fn buf_place(m: i64, l: i64, p: i64, deref: i64, pbody: Body<Comp>, pcx: Ctx<Comp>) {
+    if deref != 0 {
+        buf_str(m, c"*");
+    }
+    let lc = pbody.locals[l];
+    let named = (lc.flags & (LF_USER | LF_PARAM)) != 0 && lc.src >= 0;
+    if named {
+        // UNSAFE: LOCALS is the checker's raw table of locals.
+        // SAFETY: lc.src is a local the checker defined (a body's src),
+        // below LOCAL_COUNT.
+        let name = unsafe { pcx.locals[lc.src].name };
+        crate::base::buf_bytes(m, sym_text(name, pcx));
+        if p == 0 {
+            return;
+        }
+        buf_str(m, c" (");
+    }
+    crate::places::print::buf_place(m, l, p, pbody, pcx);
+    if named {
+        buf_str(m, c")");
+    }
+}
