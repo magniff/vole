@@ -87,7 +87,7 @@ The rust edition's borrow checker: NLL on the places IR (docs/design/borrowck.md
 The borrow checker's corpus and its rustc twin (corpus271):
 
 - `tests/run/rust_b_ok_*.vl` and `tests/run/rust_b_err_*.vl`: 76
-  programs the checker accepts and 111 it rejects, written from the
+  programs the checker accepts and 112 it rejects, written from the
   spec's rule ids (each case's `// RULE: Dn.m`): the conflict table cell
   by cell, kills and reassigned references, reborrows through `&`,
   `&mut` and raw pointers, two-phase borrows, returns and elision,
@@ -102,7 +102,7 @@ The borrow checker's corpus and its rustc twin (corpus271):
   `println!(`, is compiled by rustc; its verdict and its first error's
   code (mapped by the spec's table of codes) must be the case's, unless
   the case names the divergence's class (`// RUSTC: accepts|rejects
-  CLASS`, from the spec's R1-R10 and L1-L7) or is outside the common
+  CLASS`, from the spec's R1-R10 and L1-L8) or is outside the common
   subset (`// RUSTC: none`: MVS std's `Vec` takes an allocator,
   contracts are not Rust). The gate's `borrowck-twin` row runs it on
   every `rust_b_` case (a SKIP without rustc).
