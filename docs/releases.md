@@ -81,6 +81,41 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.1 | `v0.27.1` | 0.27.0 | aarch64-macos | the rust edition's borrow checker: NLL on the places IR (docs/design/borrowck.md), 18 `borrowck.*` codes with `explain`, 193 programs checked against rustc; Rust's `Copy` rule, reborrows, captures as loans, deferred `let`; contracts typed by the shared rule; 0.27.0's -O2 aliasing miscompile fixed; docs/design/contracts-effects.md |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.27.2
+
+The rust edition gets std2 as its std, the front's gaps filled and closures in full; the front's rules are docs/design/front-rust.md.
+
+The front (front272):
+
+- `docs/design/front-rust.md`: the typing rules of the rust edition's
+  front end with stable ids (F0.1 .. F32.1, Z1 .. Z9's front side, the
+  bound-only rule D22.3), each anchored to the front item it changes;
+  the codes with their rustc twins; the divergences from rustc (FR1 ..
+  FR3, FL1 .. FL8); a map from every gap std2's bodies hit to its rule.
+- Pattern impls (F4.1, F5.1, F6.1, F13.1, F14.1): an impl whose header
+  is any type pattern, a blanket `impl<T: Tr> U for T`, one on an
+  instance `impl<'a, T> Option<&'a T>`, for a reference `impl<'a, T>
+  IntoIterator for &'a mut [T]`, or with a parameter only the trait's
+  arguments fix `impl<T> SliceIndex<[T]> for usize`, is matched by a
+  strict unifier that binds its parameters; its methods are found for
+  the receiver's own type first, as Rust's probe does; `Self::A` inside
+  an impl is that impl's own associated type, and a blanket impl's
+  definition yields to a direct impl's.
+- Supertraits (F2): `trait A: B + C`; a `T: A` bound gives T the
+  supertraits' functions; an impl of A is checked to implement them
+  (`error trait.unmet`).
+- `where` predicates on any subject (F10, F21.3): `where Self:
+  DoubleEndedIterator` on a trait method, `where I::Item: Clone` on a
+  function, checked with the instance's parameters, or at the call for
+  a method of one type, which is not the type's when they fail.
+- A generic trait's default bodies (F12): `fn ne(&self, o: &Rhs) ->
+  bool { !self.eq(o) }`, copied into each impl with the trait's
+  arguments substituted; two traits' methods of one name on one type
+  (F9.1); `Tr::m(x, args)` as the method call `x.m(args)` (F8.2).
+- Corpus: `tests/run/rust_f_*`, one case per rule, positive and
+  negative. std2's root check: edition.later 254 -> 123 on the tree's
+  std2.
+
 ### What's new in 0.27.1
 
 The rust edition's borrows are checked: NLL on the places IR, as rustc's, with the semantics written down as rules (docs/design/borrowck.md) and checked against rustc on 193 programs (0 disagreements but the named ones). A rust-edition program now gets Rust's errors for conflicting borrows, references that outlive what they borrow, use after a move, assignment twice and drop order, each with `explain`; closure bodies' inner borrows wait for 0.27.2 (`borrowck.unchecked` names them). Rust's `Copy` rule, reborrows, captures as loans and deferred `let x;` come with it. It fixes 0.27.0's -O2 miscompile of aliasing references in unchecked rust-edition code. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
