@@ -87,6 +87,10 @@ echo "compile cost against $P:"
 measure hello 1.5 hello.vl -c -o hello.o
 measure std 1.5 std_heavy.vl -c -o std_heavy.o
 measure check 1.15 check src/main.vl
+# (0.27.2) the case is written against MVS's std (its `// ENV: VOLE_STD2=0`)
+# until it migrates to std2; a std2 row comes with the migration
+VOLE_STD2=0
+export VOLE_STD2
 measure rust 1.5 check rust_heavy.vl
 if [ $FAILED -ne 0 ]; then
     echo "compile-cost: a compilation is dearer than the previous release allows (see above; --time-passes splits it by phase, and std's sections: tests/std/core_sections.sh)"
