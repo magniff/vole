@@ -34,7 +34,7 @@
 # so, with a class of docs/design/borrowck.md's divergences:
 #   // RUSTC: accepts CLASS why    (the case is rejected, rustc accepts it)
 #   // RUSTC: rejects CLASS why    (the case is accepted, rustc rejects it)
-# CLASS one of R1-R10 (vole more permissive, or R8's Box) and L1-L6 (vole
+# CLASS one of R1-R19 (vole more permissive, or R8's Box) and L1-L19 (vole
 # stricter).
 #   // RUSTC: none why              (outside the common subset: not run)
 # A marked divergence where rustc agrees with the case is a mismatch too
@@ -117,8 +117,8 @@ for case_ in "$@"; do
     fi
     if [ -n "$mark" ]; then
         case "$mverb $mclass" in
-            "accepts "[LR][1-9]|"rejects "[LR][1-9]|"accepts R10"|"rejects R10") ;;
-            *) echo "FAIL $name: bad marker '// RUSTC: $mark' (accepts|rejects R1-R10|L1-L6, or none)"
+            "accepts "[LR][1-9]|"rejects "[LR][1-9]|"accepts "[LR]1[0-9]|"rejects "[LR]1[0-9]) ;;
+            *) echo "FAIL $name: bad marker '// RUSTC: $mark' (accepts|rejects R1-R19|L1-L19, or none)"
                FAILN=$((FAILN + 1)); continue ;;
         esac
     fi
