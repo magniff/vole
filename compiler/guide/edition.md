@@ -103,11 +103,12 @@ What the edition reads but 0.27.0 does not have is one soft error,
 `edition.later`, naming the feature and its release; the rest of the
 program is checked, and an impl or a function the feature is in is left
 out (`#[array_builtin(N)]`, a blanket impl, an impl on an instance).
-`volec explain edition.later`.
+`volec explain edition.later`. Deferred initialization, `let x: T;` and
+`let x;` (typed by its first assignment), is the edition's from 0.27.1.
 
 | feature | release |
 |---|---|
-| `const_ptr_write` (a write through `*const T`), `deferred_init` (`let x;`) | 0.27.1 |
+| `const_ptr_write` (a write through `*const T`) | 0.27.1 |
 | `char`, `fn_once`, `impl_trait_return`, `where_bound`, `tuple_struct`, `supertrait`, `assoc_bounds`, `impl_for_ref`, `assoc_const`, `array_builtin`, `blanket_impl`, `impl_on_instance`, `return_inference`, `qualified_path` (`<T as Tr>::X`), `auto_trait` (`Send`, `Sync`), `primitive_builtin` (`#[builtin_impls(..)]`) | 0.27.2 |
 
 ```vole
