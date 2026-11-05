@@ -82,6 +82,8 @@ map_code() {
         E0384) echo assign_twice ;;
         E0507|E0508) echo move_out ;;
         E0509) echo move_from_drop ;;
+        E0525) echo closure.kind ;;  # (0.27.2, D19.6: the front's code)
+        E0631) echo closure.sig ;;
         E0510|E0594|E0596) echo guard_write ;;  # (E0594: in a guard, a `ref mut` binding is read-only)
         E0796|static_mut) echo static_mut_ref ;;
         *) echo "?$1" ;;
@@ -95,7 +97,7 @@ for case_ in "$@"; do
     name=$(basename "$case_" .vl)
     [ -f "$case_" ] || { echo "FAIL $name: no such file $case_"; FAILN=$((FAILN + 1)); continue; }
     # the expectation and the marker
-    want=$(awk '/^[ \t]*\/\/ ERROR:/ { if (match($0, /borrowck\.[a-z_0-9]+/)) { print substr($0, RSTART + 9, RLENGTH - 9); found = 1; exit } else other = 1 }
+    want=$(awk '/^[ \t]*\/\/ ERROR:/ { if (match($0, /borrowck\.[a-z_0-9]+/)) { print substr($0, RSTART + 9, RLENGTH - 9); found = 1; exit } else if (match($0, /closure\.[a-z_0-9]+/)) { print substr($0, RSTART, RLENGTH); found = 1; exit } else other = 1 }
         END { if (!found && other) print "?other" }' "$case_")
     mark=$(awk '/^[ \t]*\/\/ RUSTC:/ { sub(/^[ \t]*\/\/ RUSTC:[ \t]*/, ""); print; exit }' "$case_")
     mverb=$(echo "$mark" | awk '{ print $1 }')

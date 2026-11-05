@@ -127,12 +127,12 @@ out (`#[array_builtin(N)]`, a blanket impl, an impl on an instance).
 | feature | release |
 |---|---|
 | `const_ptr_write` (a write through `*const T`) | 0.27.1 |
-| `char`, `fn_once`, `impl_trait_return`, `where_bound`, `tuple_struct`, `supertrait`, `assoc_bounds`, `impl_for_ref`, `assoc_const`, `array_builtin`, `blanket_impl`, `impl_on_instance`, `return_inference`, `qualified_path` (`<T as Tr>::X`), `auto_trait` (`Send`, `Sync`), `primitive_builtin` (`#[builtin_impls(..)]`) | 0.27.2 |
+| `char`, `impl_trait_return`, `where_bound`, `tuple_struct`, `supertrait`, `assoc_bounds`, `impl_for_ref`, `assoc_const`, `array_builtin`, `blanket_impl`, `impl_on_instance`, `return_inference`, `qualified_path` (`<T as Tr>::X`), `auto_trait` (`Send`, `Sync`), `primitive_builtin` (`#[builtin_impls(..)]`) | 0.27.2 |
 
 ```vole
 // EDITION: rust
-fn call<F: FnOnce() -> i64>(f: F) -> i64 {
-    f()
+fn adder(k: i64) -> impl Fn(i64) -> i64 {
+    move |x| x + k
 }
 
 fn main() -> i32 {
@@ -141,7 +141,7 @@ fn main() -> i32 {
 ```
 
 ```err
-error[edition.later] 'FnOnce' (fn_once) comes with the rust edition in 0.27.2
+error[edition.later] 'impl Fn(i64) -> i64' (impl_trait_return) comes with the rust edition in 0.27.2
 ```
 
 ## Options
