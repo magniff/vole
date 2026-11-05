@@ -116,6 +116,26 @@ The front (front272):
   negative. std2's root check: edition.later 254 -> 123 on the tree's
   std2.
 
+Closures in full (clos272):
+
+- A rust-edition closure has a kind, `Fn`, `FnMut` or `FnOnce`
+  (docs/design/borrowck.md §19, D19.3): the expected bound's, or else
+  inferred from its body. A closure that moves a capture captures it by
+  value, `move` or not (D19.2), and is `FnOnce`: its call moves it, so a
+  second call is `borrowck.use_moved`. A capture that is only read is
+  borrowed, a `Copy` one too.
+- The closure's environment is `&Env`, `&mut Env` or `Env` by its kind
+  (D19.4), in both code generators, so its body is checked like any
+  other: `borrowck.unchecked` fires on no body. Moving a capture out of an
+  `Fn`/`FnMut` closure is `borrowck.move_out` ("a captured variable in an
+  `FnMut` closure", rustc E0507).
+- `FnOnce` bounds; `closure.kind` (rustc E0525) for an `FnOnce` closure
+  where `Fn` or `FnMut` is asked. A closure with no `&mut` capture and
+  `Copy` captures is `Copy` (D19.7).
+- Reslicing a slice local, `v = &v[a..]`, is accepted (rustc accepts):
+  the slice's loan is of what `v` points to, which the assignment kills
+  (D1.4, Z9.5).
+
 ### What's new in 0.27.1
 
 The rust edition's borrows are checked: NLL on the places IR, as rustc's, with the semantics written down as rules (docs/design/borrowck.md) and checked against rustc on 193 programs (0 disagreements but the named ones). A rust-edition program now gets Rust's errors for conflicting borrows, references that outlive what they borrow, use after a move, assignment twice and drop order, each with `explain`; closure bodies' inner borrows wait for 0.27.2 (`borrowck.unchecked` names them). Rust's `Copy` rule, reborrows, captures as loans and deferred `let x;` come with it. It fixes 0.27.0's -O2 miscompile of aliasing references in unchecked rust-edition code. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
