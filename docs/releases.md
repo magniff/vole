@@ -77,11 +77,58 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.26.3 | `v0.26.3` | 0.26.2 | aarch64-macos | allocation as a capability (no default allocator type: `alloc.default`, `alloc.field`, `alloc.static`, `alloc.last`; `unsafe trait`/`unsafe impl`, `AllocFree`; `fix --only alloc`); f-strings removed; `wrapping_*`, `checked_*`, `Wrapping<T>` and overflow checks at -O0 (`--overflow-checks`), shifts and `/ 0` as Rust's; std's text on `String<A>`, its bytes on `Vec<u8, A>`, `#[deprecated]` and `Buf` deprecated (`fix --only buf`); compiler/src on format literals and `usize` |
 | 0.26.4 | `v0.26.4` | 0.26.3 | aarch64-macos | the compiler on Rust's overflow checks (its wrap sites `wrapping_*`, the bootstrap with the checks on); its raw-pointer parameters decided (`fix --only rawptr`: 1,416 of 2,583 `inout`); its statics in context structs, phases 1-3 (`fix --only statics`: the places IR's body, the tools' `Tcx`, front's pass contexts; 2,138 statics to 1,234); `Comp` an `unsafe impl Allocator` |
 | 0.26.5 | `v0.26.5` | 0.26.4 | aarch64-macos | the compiler's statics in context structs, phases 4-6 (`base::ctx::Ctx<Comp>` passed as `pcx`, the tables code generation's tasks read through a let view per task, `WgslCx<Arena>`; 1,234 statics to 188); `fix --only statics` doing the by-hand steps and `--prune`; the alloc exemption down to `SYMS` and `TYPES` |
+| 0.27.0 | `v0.27.0` | 0.26.5 | aarch64-macos | the rust edition begins (`// EDITION: rust`: references, `Deref`/`Index`, reference patterns, lifetimes and regions in side tables, `borrowck.unchecked`; 56 hand-translated cases); `compiler/std2`, the new std's API (1,414 items, 1,070 typechecking) and the translator's std rewrite table; SYMS/TYPES read-only in tasks and the alloc exemption deleted; Ctx's tables `Vec`s (unjustified unsafe 3,057 to 2,775) |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.27.0
 
-The rust edition begins. Built and tested on aarch64-macos only.
+The rust edition begins: `// EDITION: rust` (or `--edition rust`) compiles a program with Rust's references, `let mut`, `Deref`/`Index`, reference patterns and lifetimes, on today's std, without a borrow checker yet (`warning borrowck.unchecked`; NLL is 0.27.1). The new std's API is written in full as `compiler/std2`, the std rust-edition programs get in 0.27.2. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
+
+The rust edition's front (ed270):
+
+- A program whose root file's first line is `// EDITION: rust` (or
+  compiled with `--edition rust`) is read with Rust's meanings, by the
+  same front: `&T` and `&mut T` as values, `&x`, `&mut x`, `*r`, `let
+  mut`, receivers `&self`, `&mut self`, `self`; lifetimes in generics,
+  types, bounds and `where` (kept, not checked); `*const T` and `*mut T`;
+  quoted labels. MVS's `var`, `inout`, `sink` and `defer` are names there.
+  Every MVS program compiles as before (the compile cost of an MVS check
+  is 1.00x of 0.27.0's base).
+- Type checking: std's new `Deref`, `DerefMut`, `Index` and `IndexMut`
+  (std::ops) on a program's types; `for` over `&v`, `&mut v` or a slice
+  yields `&T` (`&mut T`), over a Vec or an array the values; patterns
+  `&x`, `&(a, b)`, `&Some(k)`, `ref` and `ref mut`, match ergonomics;
+  `#[derive(Clone, Copy, PartialEq, ...)]`; `where Self: Sized`,
+  `?Sized`; a trait's defaulted parameter left out of an impl header
+  (`impl PartialEq for P`); `union` a name but before a name; `&f(x)` of
+  a value a temporary of its statement, as Rust's (of the block for `let
+  r = &f(x);`): a second one in a statement no longer an error; a trait's
+  `&Self` in an impl for str or a slice is the view (`other: &str`).
+- The edition runs on MVS's std in 0.27.0, and two places differ from
+  Rust's std, each its own error: `edition.std_copy` (`*x` of a getter's
+  copy) and `edition.std_by_value` (`&x` where std takes the value).
+- `edition.later`: what the edition reads but 0.27.0 does not have is one
+  soft error naming the feature and its release (char, FnOnce, `impl
+  Trait` returns, tuple structs, supertraits, associated constants,
+  blanket impls and impls on an instance, `#[array_builtin(N)]`, `let
+  x;`, a write through `*const T`, qualified paths `<T as Tr>::X`, auto
+  traits `Send` and `Sync`, `#[builtin_impls(..)]`, ...); the item it is
+  in is left out. std2 checked (`--max-errors=0`): 254 edition.later, 98
+  plain errors left, of which 61 are two traits' methods of one name on a
+  type (`fmt` of Display and Debug: method_name_clash, 0.27.2).
+- Fixed for MVS too: a method's `where` on its impl's parameter bounded
+  every method of the block (`get` needed `reset`'s `T: Zero`); two
+  conflicting impls on a slice named a random symbol for the type.
+- Regions: each rust-edition function's places body gets its region
+  variables (a loan per borrow, one per reference in a parameter's or a
+  local's type, one per call whose result holds one; `check
+  --emit-places` prints them), every local's storage markers, and every
+  body is built at check. Nothing is solved yet: one warning a function,
+  `borrowck.unchecked`; 0.27.1's NLL solves them.
+- `--allow=CODE` (repeatable; a family, `--allow=borrowck`) leaves a
+  warning out, as rustc's `-A`; `--max-errors=N` (0: every error);
+  `--edition rust`. `volec guide edition`,
+  and `volec explain` for the four codes.
 
 The rust edition's std, its API as a spec tree (std270):
 
@@ -133,52 +180,6 @@ The rust edition's std, its API as a spec tree (std270):
   it would add about 0.26 MB to the binary. MVS's stdsrc.vl is unchanged.
 - (fmt reads the rust edition since ed270, so compiler/std2 is formatted
   and checked by pre-commit, premerge and `fmt --all` like any file.)
-
-The rust edition's front (ed270):
-
-- A program whose root file's first line is `// EDITION: rust` (or
-  compiled with `--edition rust`) is read with Rust's meanings, by the
-  same front: `&T` and `&mut T` as values, `&x`, `&mut x`, `*r`, `let
-  mut`, receivers `&self`, `&mut self`, `self`; lifetimes in generics,
-  types, bounds and `where` (kept, not checked); `*const T` and `*mut T`;
-  quoted labels. MVS's `var`, `inout`, `sink` and `defer` are names there.
-  Every MVS program compiles as before (the compile cost of an MVS check
-  is 1.00x of 0.27.0's base).
-- Type checking: std's new `Deref`, `DerefMut`, `Index` and `IndexMut`
-  (std::ops) on a program's types; `for` over `&v`, `&mut v` or a slice
-  yields `&T` (`&mut T`), over a Vec or an array the values; patterns
-  `&x`, `&(a, b)`, `&Some(k)`, `ref` and `ref mut`, match ergonomics;
-  `#[derive(Clone, Copy, PartialEq, ...)]`; `where Self: Sized`,
-  `?Sized`; a trait's defaulted parameter left out of an impl header
-  (`impl PartialEq for P`); `union` a name but before a name; `&f(x)` of
-  a value a temporary of its statement, as Rust's (of the block for `let
-  r = &f(x);`): a second one in a statement no longer an error; a trait's
-  `&Self` in an impl for str or a slice is the view (`other: &str`).
-- The edition runs on MVS's std in 0.27.0, and two places differ from
-  Rust's std, each its own error: `edition.std_copy` (`*x` of a getter's
-  copy) and `edition.std_by_value` (`&x` where std takes the value).
-- `edition.later`: what the edition reads but 0.27.0 does not have is one
-  soft error naming the feature and its release (char, FnOnce, `impl
-  Trait` returns, tuple structs, supertraits, associated constants,
-  blanket impls and impls on an instance, `#[array_builtin(N)]`, `let
-  x;`, a write through `*const T`, qualified paths `<T as Tr>::X`, auto
-  traits `Send` and `Sync`, `#[builtin_impls(..)]`, ...); the item it is
-  in is left out. std2 checked (`--max-errors=0`): 254 edition.later, 98
-  plain errors left, of which 61 are two traits' methods of one name on a
-  type (`fmt` of Display and Debug: method_name_clash, 0.27.2).
-- Fixed for MVS too: a method's `where` on its impl's parameter bounded
-  every method of the block (`get` needed `reset`'s `T: Zero`); two
-  conflicting impls on a slice named a random symbol for the type.
-- Regions: each rust-edition function's places body gets its region
-  variables (a loan per borrow, one per reference in a parameter's or a
-  local's type, one per call whose result holds one; `check
-  --emit-places` prints them), every local's storage markers, and every
-  body is built at check. Nothing is solved yet: one warning a function,
-  `borrowck.unchecked`; 0.27.1's NLL solves them.
-- `--allow=CODE` (repeatable; a family, `--allow=borrowck`) leaves a
-  warning out, as rustc's `-A`; `--max-errors=N` (0: every error);
-  `--edition rust`. `volec guide edition`,
-  and `volec explain` for the four codes.
 
 The compiler's last exempt statics, Ctx's raw tables and its task contexts (left270):
 
