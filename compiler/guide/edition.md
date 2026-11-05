@@ -22,8 +22,9 @@ before; the edition is per program, from its root file.
   std::ops::{Deref, Index}`): `*w`, `w.f`, `w.m()`, `g[i]`;
 - `&impl Trait` and `impl Trait` arguments, `#[derive(Clone, Copy,
   PartialEq, ...)]` (Copy is what a plain type is already);
-- `*const T` and `*mut T`, quoted labels `'outer:`; MVS's `var`, `inout`,
-  `sink` and `defer` are names.
+- `where Self: Sized` (it says nothing); `*const T` and `*mut T`;
+  quoted labels `'outer:`; MVS's `var`, `inout`, `sink` and `defer` are
+  names.
 
 ```vole
 // EDITION: rust
@@ -77,21 +78,33 @@ each with its own code; 0.27.2's std removes both:
 A generic `let` parameter of std's is `&T` or `T` per instance (a copy
 for a plain T); a `&x` given to one is lent, as Rust's `v.contains(&3)`.
 
-The edition is lenient where MVS's 0.19 meanings are: a `&T` of a plain
-value (a number, a struct of numbers) is read where the value goes, and
-a place is lent where `&T` goes. A program Rust accepts means the same;
-some that Rust rejects compile.
+The edition is lenient where MVS's 0.19 meanings are (`edition.lenient`,
+closed in 0.27.1): a `&T` of a plain value (a number, a struct of
+numbers) is read where the value goes, and a place is lent where `&T`
+goes. A program Rust accepts means the same; some that Rust rejects
+compile.
+
+## Regions, not solved yet
+
+0.27.0 builds each rust-edition function's region variables (a loan per
+`&x`, one per reference in a parameter's or a local's type, one per call
+whose result holds a reference: `volec check --emit-places` prints them,
+`&'r3 _1`), and solves none yet: every such function is one warning,
+`borrowck.unchecked` (`--allow=borrowck.unchecked` leaves it out).
+0.27.1's NLL solves them.
 
 ## What comes later: edition.later
 
 What the edition reads but 0.27.0 does not have is one soft error,
 `edition.later`, naming the feature and its release; the rest of the
-program is checked. `volec explain edition.later`.
+program is checked, and an impl or a function the feature is in is left
+out (`#[array_builtin(N)]`, a blanket impl, an impl on an instance).
+`volec explain edition.later`.
 
 | feature | release |
 |---|---|
 | `const_ptr_write` (a write through `*const T`), `deferred_init` (`let x;`) | 0.27.1 |
-| `char`, `fn_once`, `impl_trait_return`, `where_bound`, `tuple_struct`, `supertrait`, `assoc_bounds`, `impl_for_ref`, `assoc_const`, `array_builtin` | 0.27.2 |
+| `char`, `fn_once`, `impl_trait_return`, `where_bound`, `tuple_struct`, `supertrait`, `assoc_bounds`, `impl_for_ref`, `assoc_const`, `array_builtin`, `blanket_impl`, `impl_on_instance`, `return_inference` | 0.27.2 |
 
 ```vole
 // EDITION: rust
