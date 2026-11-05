@@ -961,8 +961,8 @@ outside the holes named below.
 - R9 `&v[i]` on an MVS `Vec`: closed by D1.4 (§0.1); kept as a name so
   a case that pins the shape can cite it.
 - R10 Fake borrows (D2.6) conflict only with `WA`, `WB` and `WD` (as
-  rustc); a move of the scrutinee in a guard is the move dataflow's
-  (M1 at the next arm's test).
+  rustc); a move of the scrutinee in a guard is not theirs: it is the
+  move dataflow's at the next arm's test, which is L8.
 
 **Deliberate strictness (less than rustc).**
 - L1 Dropck without `may_dangle` for user `impl Drop` types (as rustc
@@ -987,6 +987,12 @@ outside the holes named below.
   `move || nn.v` captures `nn`, not the field, so a use of `nn.w` while
   the closure is live conflicts; Rust 2021's disjoint-field capture is
   0.29's.
+- L8 A guard that moves the scrutinee (or a tested place) and then
+  fails makes the next arm's test a read of a moved place, which M1
+  rejects (`borrowck.use_moved`); rustc accepts, since it decides every
+  discriminant before any guard runs. `lower_match` tests arm by arm
+  and re-tests after a failed guard; the fix would be a decision-tree
+  lowering, not planned. Case `rust_b_err_guard_move_then_test`.
 
 ## 12. The MVS std boundary (S12, 0.27.1 only)
 
@@ -1115,20 +1121,28 @@ capped by indexing loans per root local.
 `check --emit-places=regions` prints, per body after `--emit-places`'s
 locals and `region 'rN: origin` lines (ir271's format for the tables:
 `region 'r3: universal 'a (_1.0, _2.0)`, `region 'r9: call bb0[12].1`),
-the solve's sections, each line pinnable by a `PLACES:` directive:
+the solve's sections after the body's text, each line pinnable by a
+`PLACES:` directive (`// FLAGS: --emit-places=regions` in the case; M1's
+form, `rust_b_regions_view_first`):
 
 ```
-live 'r5: bb0[3..7] bb1[0..2]        // points as location ranges per block, mid points by +
-constraint 'r11: 'r2 @ bb0[5]        // one per edge, in generation order
-value 'r11: bb0[5+..9] bb1[0..2] end('a)
-loan L1: &mut _2 @ bb0[5] 'r11 scope bb0[5+..9]
-solved: 12 bodies, 3 reused (key)
+region 'r17: reborrow bb0[9]         // the regions the checker adds (D3.6's reading)
+live _5: bb0[3..7+] bb1[0..2]        // use-liveness, per local with a slot
+drop-live _5: bb0[3..7+]             // drop-liveness, when not empty
+constraint 'r11: 'r2 @ bb0[5]        // one per edge `'r11 : 'r2`, in generation order
+value 'r11: bb0[5+..9] bb1[0..2] end('r3)
+loan L1: &mut _2 @ bb0[5] 'r11       // M2 adds `scope bb0[5+..9]`
+solved: 12 bodies, 3 reused (key)    // once, at the end of the run
 ```
 
-A location range `bbK[i..j]` covers points `2·i .. 2·j+1`; `i+` is the
-mid point alone. Universals print as `'a`, `'_1` (elided, by
-parameter), `'static`; `end('a)` as written. The format is extensible
-with a `reach` section for 0.27.4.
+A point set prints as runs per block, `bbK[x..y]` (inclusive) or
+`bbK[x]`, an end a *half-name*: `i` is the start point of location `i`
+of the block, `i+` its mid point; `bb0[3..7+]` is every point of
+locations 3 to 7, `bb0[3+..7]` from the mid point of 3 to the start
+point of 7. An empty set prints `-`. An `end` bit prints by its
+universal's region (`end('r3)`; ir271 M1's named form `end('a)`,
+`'_1` for an elided one, `'static`). The format is extensible with a
+`reach` section for 0.27.4.
 
 ## 17. Contracts in the rust edition
 
