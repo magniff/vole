@@ -84,6 +84,42 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 The rust edition's borrow checker: NLL on the places IR (docs/design/borrowck.md).
 
+The borrow checker (bc271):
+
+- `docs/design/borrowck.md`: the semantics as definitions and rules with
+  stable ids (D1.1 .. D17.7, M1 .. M6, I1 .. I7, R1 .. R11, L1 .. L8),
+  each anchored to the IR construct it reads; the decisions (per-instance
+  checking with a dedupe key, the container table, Rust's capture
+  modes, both positions); the divergences from rustc, more permissive
+  (raw pointers, MVS std's hidden views, per-instance checking, closure
+  bodies, constant indexes, `Copy` MVS std types) and stricter (dropck
+  without `may_dangle`, no rvalue promotion, vole's temporaries, NLL
+  only, whole-variable captures, a guard that moves the scrutinee); the
+  contracts' rules (the shared context, `old`, the disjoint-parameters
+  axiom, the optimizer's gate); the regions dump's grammar.
+- `compiler/src/places/borrowck/`: liveness (use- and drop-liveness per
+  point), the constraints (subtyping by variance over a place's region
+  slots, the supporting prefixes of a borrow, a `&mut` passed on read as
+  a reborrow, a call's regions from the callee's signature, `return`
+  against the signature's), the solve (bitsets, a worklist, the
+  universals fixed by the signature's order), the loans in scope and
+  every access checked in order against the conflict table (two-phase
+  receivers, kills, the code by the loan's kind), the universal
+  violations, the moves on the IR (elaboration's paths and dataflows
+  re-run: use after move, in a loop, a partial move, a move out of a
+  reference, an index, a static, a value with `impl Drop`), dropck with
+  the container table, the per-instance dedupe, the verdict per body
+  that gates the optimizer's parameter alias facts and the code cache's
+  key; `volec check --emit-places=regions`, the `borrowck` row of
+  `--time-passes`; 18 codes with `explain`.
+- The own pass's move findings and `own.drop_view` are off for a
+  rust-edition position: the IR reports them. A rust-edition body gets
+  the optimizer's reference-parameter facts only with a clean verdict
+  (0.27.0 miscompiled `f(&mut x, &mut x)` at -O2 with them on).
+- Known holes, each counted: closure bodies through the raw env
+  (`borrowck.unchecked`, 0.27.2), MVS std's hidden views (0.27.2 with
+  std2), the guard's fake borrows (with ir271's `BK_FAKE`).
+
 The borrow checker's corpus and its rustc twin (corpus271):
 
 - `tests/run/rust_b_ok_*.vl` and `tests/run/rust_b_err_*.vl`: 76

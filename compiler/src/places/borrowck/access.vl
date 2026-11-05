@@ -1,0 +1,746 @@
+// (0.27.1) The accesses against the loans in scope (docs/design/borrowck.md
+// D2.2-D2.5, D2.4a, D7): the loans in scope by a forward dataflow over
+// the points (D2.4: a loan enters at the mid point of its statement,
+// leaves at a point its region's value lacks, and at a kill, D2.3), then
+// each statement's accesses in D2.4a's order checked against the set at
+// its start point by D2.5's relation of places (D1.5), its overlap rules
+// and its table; a conflict's code by the loan's kind, D6.2.2 for a drop
+// or storage end (return_local when the loan escapes the frame). A
+// two-phase loan (D7) is shared until the first use of its temporary in
+// its block, mutable from it; the activation is an access of its own.
+
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::types::TyKind;
+use crate::places::borrowck::{Bck, LOAN_WORDS, MODE_MUT, MODE_RAW, MODE_SHARED, bit_on};
+use crate::places::borrowck::constraints::mode_of;
+use crate::places::borrowck::diag::report;
+use crate::places::cfg::{pred, pred_count};
+use crate::places::ir::{
+    BK_FAKE, BK_MUT, BK_MUT2, BK_RAW, BK_RAW_MUT, BK_SHARED, Body, DS_REMOVED, LF_PARAM, LF_STATIC,
+    OK_COPY, OK_INT, OK_MOVE, PJ_CONST, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT,
+    RV_DISCR, RV_LEN, RV_REF, RV_SLICE, RV_USE, SK_ASSERT, SK_ASSIGN, SK_CALL, SK_DEAD, SK_DROP,
+    SK_INTRINSIC, SK_LIVE, SK_MENTION, TK_RETURN, TK_SWITCH, block_count, block_start, block_term,
+    has_flag, local_ty, op_a, op_b, op_kind, proj_kind, proj_parent, proj_val, step_type,
+    undistinct,
+};
+
+// Access kinds (D2.2).
+pub const A_RC: i64 = 1;
+pub const A_RB: i64 = 2;
+pub const A_RESERVE: i64 = 3;
+pub const A_ACTIVATE: i64 = 4;
+pub const A_WB: i64 = 5;
+pub const A_WA: i64 = 6;
+pub const A_WM: i64 = 7;
+pub const A_WD: i64 = 8;
+
+// The codes (section 14.1), as diag.vl names them.
+pub const C_MUT_TWICE: i64 = 1;
+pub const C_CONFLICT: i64 = 2;
+pub const C_USE_BORROWED: i64 = 3;
+pub const C_ASSIGN_BORROWED: i64 = 4;
+pub const C_MOVE_BORROWED: i64 = 5;
+pub const C_DROPPED_BORROWED: i64 = 6;
+pub const C_RETURN_LOCAL: i64 = 7;
+pub const C_GUARD_WRITE: i64 = 8;
+
+// rel's results (D1.5).
+const R_DISJOINT: i64 = 0;
+const R_EQUAL: i64 = 1;
+const R_PREFIX_OF: i64 = 2;
+const R_EXTENDS: i64 = 3;
+
+// RULE: D6.2.2 (the premise, checked under --verify-places: every local
+// other than the return place and the parameters has a StorageDead on
+// every path from its StorageLive to a return; a forward dataflow of the
+// locals whose storage is live, read at each return)
+pub fn verify_exits(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    let nw = bck.nw_l;
+    let nb = block_count(pbody);
+    bck.bin.clear();
+    bck.bout.clear();
+    bck.tmp.clear();
+    for _ in 0..nb * nw {
+        bck.bin.push(0);
+        bck.bout.push(0);
+    }
+    for _ in 0..nw {
+        bck.tmp.push(0);
+    }
+    var changed = true;
+    while changed {
+        changed = false;
+        for i in 0..pbody.rpo.len() as i64 {
+            let b = pbody.rpo[i];
+            for w in 0..nw {
+                bck.tmp[w] = 0;
+            }
+            for j in 0..pred_count(b, pbody) {
+                let pb = pred(b, j, pbody);
+                for w in 0..nw {
+                    bck.tmp[w] = bck.tmp[w] | bck.bout[pb * nw + w];
+                }
+            }
+            for w in 0..nw {
+                bck.bin[b * nw + w] = bck.tmp[w];
+            }
+            let start = block_start(b, pbody);
+            for loc in start..block_term(b, pbody) {
+                let st = pbody.stmts[loc];
+                if st.kind == SK_LIVE {
+                    bck.tmp[st.a >> 6] = bck.tmp[st.a >> 6] | (1 << (st.a & 63));
+                } else if st.kind == SK_DEAD {
+                    bck.tmp[st.a >> 6] = bck.tmp[st.a >> 6] & ~(1 << (st.a & 63));
+                }
+            }
+            for w in 0..nw {
+                if bck.bout[b * nw + w] != bck.tmp[w] {
+                    bck.bout[b * nw + w] = bck.tmp[w];
+                    changed = true;
+                }
+            }
+        }
+    }
+    for b in 0..nb {
+        if pbody.rpo_index[b] < 0 || pbody.stmts[block_term(b, pbody)].kind != TK_RETURN {
+            continue;
+        }
+        for l in 1..bck.nlocal {
+            // (the lemma needs it of a loan's root: a temporary made live
+            // before its initialization may leave by an early return)
+            if !has_flag(l, LF_PARAM, pbody) && bit_on(bck.bout, b * nw, l)
+                && loan_rooted(l, b, bck) {
+                pcx.verify_errors += 1;
+                let out = crate::base::buf_new();
+                crate::base::buf_str(out, c"places.verify: ");
+                crate::places::print::buf_body_name(out, pbody, pcx);
+                crate::base::buf_str(out, c" bb");
+                crate::base::buf_int(out, b);
+                crate::base::buf_str(out, c": local _");
+                crate::base::buf_int(out, l);
+                crate::base::buf_str(out,
+                    c" reaches the return with its storage live (no StorageDead on the path: borrowck.md D6.2.2)\n");
+                crate::base::buf_write_fd(out, crate::base::STDERR);
+            }
+        }
+    }
+}
+
+// Whether a loan rooted at local l is in scope at the exit of block b
+// (the scope dataflow's sout): then a missing StorageDead would let
+// the loan escape unreported.
+fn loan_rooted(l: i64, b: i64, bck: Bck<Comp>) -> bool {
+    for j in 0..loan_count(bck) {
+        if loan_local(j, bck) == l && bit_on(bck.sout, b * bck.nw_n, j) {
+            return true;
+        }
+    }
+    false
+}
+
+// RULE: D2.4
+pub fn check(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    let nl = loan_count(bck);
+    bck.nw_n = (nl + 63) / 64;
+    if bck.nw_n < 1 {
+        bck.nw_n = 1;
+    }
+    let nw = bck.nw_n;
+    bck.reported.clear();
+    bck.bad_moves.clear();
+    activations(&bck, pbody);
+    constant_indexes(&bck, pbody);
+    let nb = block_count(pbody);
+    bck.sin.clear();
+    bck.sout.clear();
+    bck.cur.clear();
+    for _ in 0..nb * nw {
+        bck.sin.push(0);
+        bck.sout.push(0);
+    }
+    for _ in 0..nw {
+        bck.cur.push(0);
+    }
+    var changed = true;
+    while changed {
+        changed = false;
+        for i in 0..pbody.rpo.len() as i64 {
+            let b = pbody.rpo[i];
+            for w in 0..nw {
+                bck.cur[w] = 0;
+            }
+            for j in 0..pred_count(b, pbody) {
+                let pb = pred(b, j, pbody);
+                if pbody.rpo_index[pb] >= 0 {
+                    for w in 0..nw {
+                        bck.cur[w] = bck.cur[w] | bck.sout[pb * nw + w];
+                    }
+                }
+            }
+            for w in 0..nw {
+                bck.sin[b * nw + w] = bck.cur[w];
+            }
+            let start = block_start(b, pbody);
+            for loc in start..block_term(b, pbody) + 1 {
+                transfer(loc, false, &bck, pbody, &pcx);
+            }
+            for w in 0..nw {
+                if bck.sout[b * nw + w] != bck.cur[w] {
+                    bck.sout[b * nw + w] = bck.cur[w];
+                    changed = true;
+                }
+            }
+        }
+    }
+    // The checks, each block from its entry set.
+    for i in 0..pbody.rpo.len() as i64 {
+        let b = pbody.rpo[i];
+        for w in 0..nw {
+            bck.cur[w] = bck.sin[b * nw + w];
+        }
+        let start = block_start(b, pbody);
+        for loc in start..block_term(b, pbody) + 1 {
+            transfer(loc, true, &bck, pbody, &pcx);
+        }
+    }
+}
+
+pub fn loan_count(bck: Bck<Comp>) -> i64 {
+    bck.loans.len() as i64 / LOAN_WORDS
+}
+
+fn loan_stmt(j: i64, bck: Bck<Comp>) -> i64 {
+    bck.loans[LOAN_WORDS * j]
+}
+
+pub fn loan_region(j: i64, bck: Bck<Comp>) -> i64 {
+    bck.loans[LOAN_WORDS * j + 1]
+}
+
+pub fn loan_kind(j: i64, bck: Bck<Comp>) -> i64 {
+    bck.loans[LOAN_WORDS * j + 2]
+}
+
+pub fn loan_local(j: i64, bck: Bck<Comp>) -> i64 {
+    bck.loans[LOAN_WORDS * j + 3]
+}
+
+pub fn loan_proj(j: i64, bck: Bck<Comp>) -> i64 {
+    bck.loans[LOAN_WORDS * j + 4]
+}
+
+pub fn loan_deref(j: i64, bck: Bck<Comp>) -> i64 {
+    bck.loans[LOAN_WORDS * j + 5]
+}
+
+fn in_cur(j: i64, bck: Bck<Comp>) -> bool {
+    bit_on(bck.cur, 0, j)
+}
+
+fn cur_remove(j: i64, bck: inout Bck<Comp>) {
+    bck.cur[j >> 6] = bck.cur[j >> 6] & ~(1 << (j & 63));
+}
+
+fn cur_add(j: i64, bck: inout Bck<Comp>) {
+    bck.cur[j >> 6] = bck.cur[j >> 6] | (1 << (j & 63));
+}
+
+fn val_has(r: i64, p: i64, bck: Bck<Comp>) -> bool {
+    bit_on(bck.val, r * bck.nw_p, p)
+}
+
+// RULE: D7.1 (the activation location of each two-phase loan: the first
+// location after it in its block whose operands mention its temporary)
+fn activations(bck: inout Bck<Comp>, pbody: Body<Comp>) {
+    bck.act.clear();
+    for j in 0..loan_count(bck) {
+        bck.act.push(-1);
+        if loan_kind(j, bck) != BK_MUT2 {
+            continue;
+        }
+        let s = loan_stmt(j, bck);
+        let st = pbody.stmts[s];
+        if st.b != 0 {
+            continue;
+        }
+        let t = st.a;
+        let b = crate::places::borrowck::loc_block(s, pbody);
+        if b < 0 {
+            continue;
+        }
+        for loc in s + 1..block_term(b, pbody) + 1 {
+            let u = pbody.stmts[loc];
+            for i in 0..u.nops {
+                let k = op_kind(u.ops, i, pbody);
+                if (k == OK_COPY || k == OK_MOVE) && op_a(u.ops, i, pbody) == t
+                    && op_b(u.ops, i, pbody) == 0 {
+                    bck.act[j] = loc;
+                }
+            }
+            if bck.act[j] >= 0 {
+                break;
+            }
+        }
+    }
+}
+
+// Per local, the constant it holds: assigned exactly once, an integer
+// constant (the temporary of a constant index into a view, R7).
+fn constant_indexes(bck: inout Bck<Comp>, pbody: Body<Comp>) {
+    bck.cidx.clear();
+    bck.tmp.clear();
+    for _ in 0..bck.nlocal {
+        bck.cidx.push(-1);
+        bck.tmp.push(0);
+    }
+    for loc in 0..bck.nloc {
+        let st = pbody.stmts[loc];
+        let k = st.kind;
+        if (k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC) && st.a >= 0 && st.b == 0 {
+            bck.tmp[st.a] += 1;
+            if k == SK_ASSIGN && st.c == RV_USE && op_kind(st.ops, 0, pbody) == OK_INT {
+                bck.cidx[st.a] = op_a(st.ops, 0, pbody);
+            }
+        }
+    }
+    for l in 0..bck.nlocal {
+        if bck.tmp[l] != 1 {
+            bck.cidx[l] = -1;
+        }
+    }
+}
+
+// The set through location loc (D2.4, D2.4a): the start-point filter,
+// the accesses (when checking), the kills, the mid-point filter, the gen.
+fn transfer(loc: i64, checking: bool, bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    let nl = loan_count(bck);
+    for j in 0..nl {
+        if in_cur(j, bck) && !val_has(loan_region(j, bck), 2 * loc, bck) {
+            cur_remove(j, &bck);
+        }
+    }
+    if checking {
+        accesses(loc, &bck, pbody, &pcx);
+    }
+    kills(loc, &bck, pbody, &pcx);
+    for j in 0..nl {
+        if in_cur(j, bck) && !val_has(loan_region(j, bck), 2 * loc + 1, bck) {
+            cur_remove(j, &bck);
+        }
+    }
+    for j in 0..nl {
+        if loan_stmt(j, bck) == loc && val_has(loan_region(j, bck), 2 * loc + 1, bck) {
+            cur_add(j, &bck);
+        }
+    }
+}
+
+// RULE: D2.3
+fn kills(loc: i64, bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    let st = pbody.stmts[loc];
+    let k = st.kind;
+    var l = -1;
+    var p = 0;
+    if (k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC) && st.a >= 0 {
+        l = st.a;
+        p = st.b;
+    } else if k == SK_DEAD {
+        l = st.a;
+    }
+    if l < 0 {
+        return;
+    }
+    for j in 0..loan_count(bck) {
+        if !in_cur(j, bck) {
+            continue;
+        }
+        let r = rel(l, p, 0, loan_local(j, bck), loan_proj(j, bck), loan_deref(j, bck), true, &bck,
+            pbody, &pcx);
+        if (r == R_EQUAL || r == R_PREFIX_OF) && bck.w_count != 0 {
+            cur_remove(j, &bck);
+        }
+    }
+}
+
+// The accesses of the statement at loc, in D2.4a's order.
+// RULE: D2.2, D2.4a
+fn accesses(loc: i64, bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    let st = pbody.stmts[loc];
+    let k = st.kind;
+    if k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC || k == SK_ASSERT || k == TK_SWITCH {
+        for i in 0..st.nops {
+            let ok = op_kind(st.ops, i, pbody);
+            if ok != OK_COPY && ok != OK_MOVE {
+                continue;
+            }
+            let l = op_a(st.ops, i, pbody);
+            let p = op_b(st.ops, i, pbody);
+            if ok == OK_COPY {
+                access(true, A_RC, -1, l, p, 0, loc, &bck, pbody, &pcx);
+            } else {
+                access(true, A_WM, -1, l, p, 0, loc, &bck, pbody, &pcx);
+            }
+        }
+        // RULE: D7.3 (the activations of the reservations this location
+        // uses, after the operands' own accesses: the arguments are read
+        // before the call activates its receiver)
+        for j in 0..loan_count(bck) {
+            if bck.act[j] == loc {
+                access(true, A_ACTIVATE, j, loan_local(j, bck), loan_proj(j, bck),
+                    loan_deref(j, bck), loc, &bck, pbody, &pcx);
+            }
+        }
+        if k == SK_ASSIGN {
+            let rv = st.c;
+            if rv == RV_REF || rv == RV_SLICE {
+                let l = op_a(st.ops, 0, pbody);
+                let p = op_b(st.ops, 0, pbody);
+                var bk = st.d;
+                if rv == RV_SLICE {
+                    bk = BK_SHARED;
+                    for j in 0..loan_count(bck) {
+                        if loan_stmt(j, bck) == loc {
+                            bk = loan_kind(j, bck);
+                        }
+                    }
+                }
+                if bk == BK_SHARED {
+                    access(true, A_RB, -1, l, p, 0, loc, &bck, pbody, &pcx);
+                } else if bk == BK_MUT {
+                    shared_write(loc, l, p, &bck, pbody, &pcx);
+                    access(true, A_WB, -1, l, p, 0, loc, &bck, pbody, &pcx);
+                } else if bk == BK_MUT2 {
+                    access(true, A_RESERVE, -1, l, p, 0, loc, &bck, pbody, &pcx);
+                } else if bk == BK_RAW {
+                    // RULE: R1, D2.2 (`&raw const`: a read; `&raw mut`: a write;
+                    // no loan either way)
+                    access(true, A_RC, -1, l, p, 0, loc, &bck, pbody, &pcx);
+                } else if bk == BK_RAW_MUT {
+                    access(true, A_WB, -1, l, p, 0, loc, &bck, pbody, &pcx);
+                }
+            } else if rv == RV_LEN || rv == RV_DISCR {
+                access(false, A_RC, -1, op_a(st.ops, 0, pbody), op_b(st.ops, 0, pbody), 0, loc,
+                    &bck, pbody, &pcx);
+            }
+        }
+        if k != SK_ASSERT && k != TK_SWITCH && st.a >= 0 {
+            shared_write(loc, st.a, st.b, &bck, pbody, &pcx);
+            access(false, A_WA, -1, st.a, st.b, 0, loc, &bck, pbody, &pcx);
+        }
+    } else if k == SK_DROP {
+        if st.c != DS_REMOVED {
+            access(true, A_WD, -1, st.a, st.b, 0, loc, &bck, pbody, &pcx);
+        }
+    } else if k == SK_DEAD {
+        access(false, A_WD, -1, st.a, 0, 0, loc, &bck, pbody, &pcx);
+    } else if k == SK_MENTION {
+        access(true, A_RC, -1, st.a, st.b, 0, loc, &bck, pbody, &pcx);
+    } else if k == TK_RETURN {
+        // (the implicit exit accesses: the parameters have no StorageDead)
+        for l in 1..bck.nlocal {
+            if has_flag(l, LF_PARAM, pbody) {
+                access(false, A_WD, -1, l, 0, 0, loc, &bck, pbody, &pcx);
+            }
+        }
+        access(true, A_RC, -1, 0, 0, 0, loc, &bck, pbody, &pcx);
+    }
+}
+
+// One access (deep or shallow, of kind `kind`, of place (l, p) or of
+// `*(l, p)` when deref) at location loc against every loan in scope;
+// target is the loan an activation is of (-1 otherwise).
+// RULE: D2.5
+fn access(deep: bool, kind: i64, target: i64, l: i64, p: i64, deref: i64, loc: i64,
+    bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    for j in 0..loan_count(bck) {
+        if !in_cur(j, bck) || j == target {
+            continue;
+        }
+        let lk = loan_kind(j, bck);
+        let r = rel(loan_local(j, bck), loan_proj(j, bck), loan_deref(j, bck), l, p, deref, false,
+            &bck, pbody, &pcx);
+        if r == R_DISJOINT {
+            continue;
+        }
+        var overlap = false;
+        if r == R_EXTENDS {
+            // (the first projection of the loan's place beyond the access's)
+            let e_deref = bck.w_first != 0;
+            let mode = bck.w_type;
+            if !e_deref {
+                overlap = true;
+            } else if !deep || mode == MODE_SHARED {
+                overlap = false;
+            } else {
+                overlap = true;
+            }
+        } else {
+            overlap = true;
+        }
+        if lk == BK_FAKE {
+            // RULE: D2.5 step 4, R10 (shallow: the place or a prefix, by a write)
+            let write = kind == A_WA || kind == A_WB || kind == A_WD;
+            overlap = write && (r == R_EQUAL || r == R_EXTENDS && bck.w_first == 0);
+        }
+        if !overlap {
+            continue;
+        }
+        // The table (step 5): class S or M at this point.
+        let mutable = lk == BK_MUT
+            || lk == BK_MUT2 && bck.act[j] >= 0 && loc > bck.act[j];
+        let conflict = if kind == A_RC || kind == A_RB || kind == A_RESERVE { mutable }
+            else { true };
+        if !conflict {
+            continue;
+        }
+        // The code (step 6), by the loan's kind.
+        let mut_kind = lk == BK_MUT || lk == BK_MUT2;
+        var code = C_CONFLICT;
+        if lk == BK_FAKE {
+            code = C_GUARD_WRITE;
+        } else if kind == A_RC {
+            code = C_USE_BORROWED;
+        } else if kind == A_RB {
+            code = C_CONFLICT;
+        } else if kind == A_RESERVE || kind == A_ACTIVATE || kind == A_WB {
+            code = if mut_kind { C_MUT_TWICE } else { C_CONFLICT };
+        } else if kind == A_WA {
+            code = C_ASSIGN_BORROWED;
+        } else if kind == A_WM {
+            code = C_MOVE_BORROWED;
+        } else if kind == A_WD {
+            // RULE: D6.2.2
+            code = if escapes(j, &bck, pbody, &pcx) { C_RETURN_LOCAL } else { C_DROPPED_BORROWED };
+        }
+        if code == C_MOVE_BORROWED {
+            bck.bad_moves.push(loc);
+        }
+        report(code, kind, loc, j, l, p, deref, &bck, pbody, &pcx);
+    }
+}
+
+// RULE: D2.6, L6 (a write through a shared reference: a guard's `ref mut`
+// binding, which the guard sees as `&T`; elsewhere the front rejects it)
+fn shared_write(loc: i64, l: i64, p: i64, bck: inout Bck<Comp>, pbody: Body<Comp>,
+    pcx: inout Ctx<Comp>) {
+    if p == 0 {
+        return;
+    }
+    crate::places::borrowck::constraints::walk_place(l, p, &bck, pbody, &pcx);
+    if bck.steps.len() < 2 {
+        return;
+    }
+    // (the guard's binding keeps its `&mut` type but is initialized by a
+    // shared borrow: a holder of shared references only)
+    if bck.steps[1] == MODE_SHARED || shared_holder(l, pbody) {
+        crate::places::borrowck::diag::report_shared_write(loc, l, p, &bck, pbody, &pcx);
+    }
+}
+
+// Whether every initialization of local l is a shared borrow (and there
+// is one).
+fn shared_holder(l: i64, pbody: Body<Comp>) -> bool {
+    var any = false;
+    for s in 0..pbody.stmts.len() as i64 {
+        let st = pbody.stmts[s];
+        if (st.kind == SK_ASSIGN || st.kind == SK_CALL || st.kind == SK_INTRINSIC) && st.a == l
+            && st.b == 0 {
+            if st.kind != SK_ASSIGN || st.c != RV_REF || st.d != BK_SHARED {
+                return false;
+            }
+            any = true;
+        }
+    }
+    any
+}
+
+// Whether D6.2.2 applies to loan j: its place is frame-owned (D1.6) and
+// its region's value holds an `end`.
+fn escapes(j: i64, bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> bool {
+    let l = loan_local(j, bck);
+    if has_flag(l, LF_STATIC, pbody) || loan_deref(j, bck) != 0 {
+        return false;
+    }
+    // (any deref-like projection: the place is reached through a pointer)
+    var t = local_ty(l, pbody);
+    var q = loan_proj(j, bck);
+    var n = 0;
+    while q > 0 {
+        n += 1;
+        q = proj_parent(q, pbody);
+    }
+    q = loan_proj(j, bck);
+    // (the list leaf-first is enough: a deref-like step anywhere)
+    while q > 0 {
+        let k = proj_kind(q, pbody);
+        if k == PJ_DEREF {
+            return false;
+        }
+        q = proj_parent(q, pbody);
+    }
+    // (an index on a view: walked root-first with the types)
+    if n > 0 && view_indexed(l, loan_proj(j, bck), &bck, pbody, &pcx) {
+        return false;
+    }
+    let _ = t;
+    let r = loan_region(j, bck);
+    for u in 0..bck.nuniv {
+        if bit_on(bck.val, r * bck.nw_p, bck.npts + u) {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether place (l, p) has an index step on a view (D1.4).
+fn view_indexed(l: i64, p: i64, bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> bool {
+    list_into(p, true, &bck, pbody);
+    var t = local_ty(l, pbody);
+    for i in 0..bck.pa.len() as i64 {
+        let q = bck.pa[i];
+        let k = proj_kind(q, pbody);
+        let tu = undistinct(t, pcx);
+        if (k == PJ_INDEX || k == PJ_CONST) && tu > 0 && pcx.types[tu].kind == TyKind::Slice {
+            return true;
+        }
+        t = step_type(t, k, proj_val(q, pbody), &pcx);
+    }
+    false
+}
+
+// The projection list p root-first into pa (first) or pb.
+fn list_into(p: i64, first: bool, bck: inout Bck<Comp>, pbody: Body<Comp>) {
+    if first {
+        bck.pa.clear();
+    } else {
+        bck.pb.clear();
+    }
+    var q = p;
+    var n = 0;
+    while q > 0 {
+        if first {
+            bck.pa.push(q);
+        } else {
+            bck.pb.push(q);
+        }
+        n += 1;
+        q = proj_parent(q, pbody);
+    }
+    for i in 0..n / 2 {
+        if first {
+            let a = bck.pa[i];
+            bck.pa[i] = bck.pa[n - 1 - i];
+            bck.pa[n - 1 - i] = a;
+        } else {
+            let a = bck.pb[i];
+            bck.pb[i] = bck.pb[n - 1 - i];
+            bck.pb[n - 1 - i] = a;
+        }
+    }
+}
+
+// Whether step (kind on a place of type t) is deref-like (D1.2), and its
+// mode in w_type when it is.
+fn deref_like(k: i64, t: i64, bck: inout Bck<Comp>, pcx: Ctx<Comp>) -> bool {
+    if k == PJ_DEREF {
+        bck.w_type = mode_of(t, pcx);
+        return true;
+    }
+    if k == PJ_INDEX || k == PJ_CONST {
+        let tu = undistinct(t, pcx);
+        if tu > 0 && pcx.types[tu].kind == TyKind::Slice {
+            bck.w_type = mode_of(t, pcx);
+            return true;
+        }
+    }
+    false
+}
+
+// RULE: D1.5
+// rel(P, Q) for P = (la, pa [, *]) and Q = (lb, pb [, *]): R_DISJOINT,
+// R_EQUAL, R_PREFIX_OF (P a strict prefix of Q) or R_EXTENDS (Q a strict
+// prefix of P). With definite, an index step against anything is
+// disjoint (rel_def). On R_EXTENDS, w_first says whether P's first
+// projection beyond Q is deref-like (1) and w_type its mode; on
+// R_PREFIX_OF, w_count says whether Q's projections beyond P pass a
+// deref-like step (1).
+fn rel(la: i64, pa: i64, da: i64, lb: i64, pb: i64, db: i64, definite: bool, bck: inout Bck<Comp>,
+    pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+    bck.w_first = 0;
+    bck.w_count = 0;
+    bck.w_type = MODE_RAW;
+    if la != lb {
+        return R_DISJOINT;
+    }
+    list_into(pa, true, &bck, pbody);
+    list_into(pb, false, &bck, pbody);
+    // (a virtual deref at the end: id 0)
+    if da != 0 {
+        bck.pa.push(0);
+    }
+    if db != 0 {
+        bck.pb.push(0);
+    }
+    let na = bck.pa.len() as i64;
+    let nb = bck.pb.len() as i64;
+    var t = local_ty(la, pbody);
+    var i = 0;
+    while i < na && i < nb {
+        let qa = bck.pa[i];
+        let qb = bck.pb[i];
+        let ka = if qa == 0 { PJ_DEREF } else { proj_kind(qa, pbody) };
+        let kb = if qb == 0 { PJ_DEREF } else { proj_kind(qb, pbody) };
+        let va = if qa == 0 { 0 } else { proj_val(qa, pbody) };
+        let vb = if qb == 0 { 0 } else { proj_val(qb, pbody) };
+        if ka == PJ_FIELD || ka == PJ_CONST || ka == PJ_VARIANT {
+            if kb == ka && va != vb {
+                return R_DISJOINT;
+            }
+            if kb == PJ_INDEX && definite {
+                return R_DISJOINT;
+            }
+        } else if ka == PJ_INDEX {
+            if definite {
+                return R_DISJOINT;
+            }
+            // RULE: R7 (two indexes by locals that hold distinct constants,
+            // a constant index into a view: disjoint)
+            if kb == PJ_INDEX && va != vb {
+                let ca = bck.cidx[va];
+                let cb = bck.cidx[vb];
+                if ca >= 0 && cb >= 0 && ca != cb {
+                    return R_DISJOINT;
+                }
+            }
+        } else if ka == PJ_UNION || ka == PJ_DEREF {
+            // (a union's fields overlap; a deref against a deref continues)
+        }
+        t = step_type(t, ka, va, &pcx);
+        i += 1;
+    }
+    if na == nb {
+        return R_EQUAL;
+    }
+    if na < nb {
+        // (P a prefix of Q: do Q's remaining steps pass a deref-like one?)
+        var j = na;
+        while j < nb {
+            let qb = bck.pb[j];
+            let kb = if qb == 0 { PJ_DEREF } else { proj_kind(qb, pbody) };
+            if deref_like(kb, t, &bck, pcx) {
+                bck.w_count = 1;
+            }
+            t = step_type(t, kb, if qb == 0 { 0 } else { proj_val(qb, pbody) }, &pcx);
+            j += 1;
+        }
+        return R_PREFIX_OF;
+    }
+    let qa = bck.pa[nb];
+    let ka = if qa == 0 { PJ_DEREF } else { proj_kind(qa, pbody) };
+    if deref_like(ka, t, &bck, pcx) {
+        bck.w_first = 1;
+    }
+    let _ = MODE_MUT;
+    R_EXTENDS
+}

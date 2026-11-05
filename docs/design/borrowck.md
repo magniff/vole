@@ -221,9 +221,12 @@ own access (D2.2), excluding the loan being created; (3) the
 destination's `(Shallow, WA, (a,b))`; (4) the kills of D2.3 for the
 destination; (5) the gen: a created loan enters `scope(2·loc+1)`. A
 terminator's accesses are checked against `scope(2·loc)` in the order
-D2.2 lists. A two-phase activation (D7.1) is performed at step (1),
-immediately before the access of the operand that mentions the
-reservation's temporary. Consequences: `x = &mut *x` (`x: &'x mut T`):
+D2.2 lists. A two-phase activation (D7.1) is performed after step (1),
+once every operand's own access is done: a call's arguments are read
+before the call activates its receiver (`s.add(s.x)` reads `s.x` while
+the reservation is still shared; the IR has `copy _1.0` as an operand
+of the call, not a statement before it). Consequences: `x = &mut *x`
+(`x: &'x mut T`):
 (2) borrows `*x` with the supporting-prefix constraint `'x : 'new`; (3)
 the shallow write to `x` meets other loans of `*x…` as `Extends` through
 a deref at depth `Shallow` → no conflict; (4) kills every in-scope loan
@@ -401,17 +404,12 @@ with `v = var(T_src, i)` the variance of that slot in the type (D5.4):
 exist). Types are read by `full_place_type` and the slot layout, never
 re-inferred.
 - `SK_ASSIGN (a,b) = RV_USE op`, `op = copy Q` or `move Q`: `sub(type(Q)
-  ≤ type((a,b)))` over the places' regions. **Reborrow reading (the
-  stopgap for Q4):** if `type(Q)` is `&mut T`, `op = copy` and `Q` is
-  the whole reference value, the statement is read as `(a,b) = &'new
-  mut (*Q)`: a fresh loan of `*Q` (D2.1, with the accesses of D2.2 and
-  the supporting-prefix constraint `'q : 'new` for `Q`'s own slot
-  `'q`), and `sub(&'new mut T ≤ type((a,b)))`. Verified: the only such
-  copies at v0.27.0 are call arguments (`call f(copy _1)`). *IR change
-  (ir271 M2):* the builder emits `_t = &'new mut (*Q)` there; after it,
-  a `copy` of a whole `&mut` place is a verifier error
-  (`--verify-places`: "copy of an exclusive reference") and the reading
-  is retired.
+  ≤ type((a,b)))` over the places' regions. A `copy` of a whole `&mut`
+  place does not occur: the builder emits the reborrow `_t = &'new mut2
+  (*Q)` (or `&(*Q)`) for a `&mut` passed on (ir271 M2, Q4), an ordinary
+  `RV_REF` with the supporting-prefix constraint `'q : 'new` below, and
+  the verifier (`--verify-places`, I7) rejects such a `copy`. (M1's
+  reading of it as that reborrow was the stopgap until then; retired.)
 - `SK_ASSIGN (a,b) = RV_REF P` (`e = 'ℓ`, `d ≠ BK_RAW`): loan `ℓ`
   created; `sub(&'ℓ [mut] type(P) ≤ type((a,b)))` (a `BK_FAKE` loan:
   `type((a,b))` is `&type(P)`); **the supporting-prefix rule:** for
@@ -648,19 +646,21 @@ project's rule: every error of a compilation), deduped by §14.3.
    `drop` of `root(P)`, or the implicit exit access of a parameter: a
    by-value parameter returned by reference is caught only by that
    rule). Such a conflict exists whenever D6.2.2 applies and `ℓ` is not
-   killed, by the lemma: **(premise) every frame-owned root has a `WD`
-   access on every exit path** — an explicit `StorageDead` or `drop`
-   for every non-parameter local (the builder's `all_storage`, verified
-   on `return` inside `for`, on `?`'s `None` path and on the normal
-   path) and the implicit exit access of D2.2 for a parameter — and
-   `'ℓ : .. : 'u` gives `val('ℓ) ⊇ val('u) ⊇ Pts`, so `ℓ` is in scope
-   at every point reachable from its creation, including that `WD`; if
-   `ℓ` is killed on a path, the reference was overwritten there and
-   nothing escapes on that path. The premise is a checked invariant:
-   `--verify-places` on a rust-edition body reports a non-parameter
-   local (other than `_0`) with a path from its `StorageLive` to a
-   `return` that has no `StorageDead` of it (bc271 M2 adds the check;
-   its count on the corpus is 0). A loan that is
+   killed, by the lemma: **(premise) the frame-owned root of a loan in
+   scope at an exit has a `WD` access on the path to it** — an explicit
+   `StorageDead` or `drop` for a non-parameter local (the builder's
+   `all_storage`; a temporary made live before a `?` and left by its
+   early return has none there, but is uninitialized and unborrowed
+   there, so no loan of it is in scope) and the implicit exit access of
+   D2.2 for a parameter — and `'ℓ : .. : 'u` gives `val('ℓ) ⊇ val('u)
+   ⊇ Pts`, so `ℓ` is in scope at every point reachable from its
+   creation, including that `WD`; if `ℓ` is killed on a path, the
+   reference was overwritten there and nothing escapes on that path.
+   The premise is a checked invariant: `--verify-places` on a
+   rust-edition body reports a loan in scope at a `return` whose root
+   is a non-parameter local with its storage still live there (no
+   `StorageDead` on the path; `access.vl` `verify_exits`; its count on
+   the corpus is 0). A loan that is
    not frame-owned (`&*x`, `&x.f`, `&s[i]` through `x: &'a T`, `s:
    &'a [T]`) carries `'a : 'ℓ` (supporting prefix), so `fn f(x: &T) ->
    &T { &*x }` yields `'a : 'ℓ : '0 : 'ret = 'a`: no `end` beyond
@@ -690,8 +690,9 @@ loan is never activated and stays class `S`. The builder guarantees
 `loc₀` dominates `loc_a` within one block (`lower_arg`). Its access
 `(Deep, Activate ℓ, P)` is performed at `loc_a` as D2.4a says.
 
-**D7.2 (the reservation window).** For points `p` with `2·loc₀+1 ≤ p <
-2·loc_a`, `ℓ` has class `S` in D2.5. Allowed in the window: `Read` of
+**D7.2 (the reservation window).** For points `p` with `2·loc₀+1 ≤ p ≤
+2·loc_a` (through the start point of the activation's location: its
+operands are read in the window, D2.4a), `ℓ` has class `S` in D2.5. Allowed in the window: `Read` of
 overlapping places, `BK_SHARED` borrows and `Reserve` of them
 (`v.push(v.len())`), and reads through them; forbidden: `WA`, `WM`,
 `WB`, `WD` of an overlapping place (`assign_borrowed`, `move_borrowed`,
@@ -703,9 +704,9 @@ an overlapping place (`v.push(v.pop().unwrap())`'s inner activation →
 checked against every `ℓ' ≠ ℓ` in `scope(2·loc_a)`: an overlapping
 shared or reserved loan conflicts (`v.push(v.last().unwrap())` when
 `last` returns `&T` whose loan is still live: it is, since the
-argument's region reaches the call); from `2·loc_a` on, `ℓ` has class
-`M`. The loan's region starts at `loc₀` (it is in scope from its
-creation), as rustc's.
+argument's region reaches the call); from `2·loc_a+1` on (the mid point
+of the activation's location), `ℓ` has class `M`. The loan's region
+starts at `loc₀` (it is in scope from its creation), as rustc's.
 
 **D7.4 (which borrows are two-phase).** Autoref'd receivers
 (`lower_arg`: `i == 0 && arg.start == operand.start`), the `IndexMut`
@@ -743,7 +744,12 @@ unless named, at the access's statement.
   an `SK_MENTION` of `Q` at `p` with `path(Q) = m` requires `DefInit(m',
   2·loc(p))` for `m` and every descendant `m'` (deep); when `Q` has no
   path (through `*`, an index, a union), it requires `DefInit` of
-  `base(Q)`; with no base, no check.
+  `base(Q)`; with no base, no check. A discriminant read (`RV_DISCR`)
+  is not checked: elaboration's opened drops read the tag of a
+  partially moved enum, and a `match` on a moved enum is caught at its
+  payload's read; a length read (`RV_LEN`) requires `DefInit(m)` of
+  the path alone (shallow, as D2.2 says). A place reached through a raw
+  pointer (a deferred closure body's env, D10.4) is not checked (R1).
 - (M2) `SK_ASSIGN`/`SK_CALL`/`SK_INTRINSIC` with destination `Q =
   L.π`, `π ≠ ∅`: requires `DefInit` of every strict-prefix path of `Q`;
   a prefix that was initialized and then moved (`MaybeUninit` by a move,
@@ -763,6 +769,14 @@ unless named, at the access's statement.
   (`MaybeUninit` at the loop head by the back edge); the message adds
   "in a previous iteration of the loop" when the move's location is
   reachable from the use's.
+- (M7) An assignment (`WA`) to a whole local `L` (`(L, 0)`) that is
+  not `mut` (no `LF_MUT`) requires `¬MaybeInit(path(L), 2·loc)`: a
+  deferred `let x;` / `let x: T;` is assigned once on every path
+  (`borrowck.assign_twice`, rustc E0384 "cannot assign twice to
+  immutable variable"); an assignment inside a loop fails it by the
+  back edge, one on each branch of an `if` passes. The plain `let x =
+  1; x = 2;` is the front's ("cannot assign to immutable variable"), so
+  only a deferred local reaches this rule.
 - (M6) A move of a `Copy`-typed place is a copy: the builder emits
   `OK_COPY`, so no rule applies.
 
@@ -977,6 +991,11 @@ outside the holes named below.
 - R10 Fake borrows (D2.6) conflict only with `WA`, `WB` and `WD` (as
   rustc); a move of the scrutinee in a guard is not theirs: it is the
   move dataflow's at the next arm's test, which is L8.
+- R11 An MVS std type is `Copy` in the rust edition when it has no drop
+  glue and `Copy` type arguments (`places::regions::rust_copy`), so
+  `Range<i64>` is `Copy` here and a range used twice is a copy, not a
+  use after a move as in rustc. Reason: MVS std declares no `Copy`;
+  ends in 0.27.2 with std2's types.
 
 **Deliberate strictness (less than rustc).**
 - L1 Dropck without `may_dangle` for user `impl Drop` types (as rustc
@@ -1093,13 +1112,15 @@ where a `try:` is named, a case in `tests/borrowck-try/NAME/main.vl`
 | `borrowck.unused_param` | D5.3 (ir271) | E0392 | adds a `PhantomData<&'a ()>` field |
 | `borrowck.use_moved` | M1, M5 | E0382 | `.clone()` when `Clone` (as `own.moved`'s) |
 | `borrowck.assign_moved_part` | M2 | E0381 | none |
+| `borrowck.assign_twice` | M7 | E0384 | `let mut x;` on the deferred declaration |
 | `borrowck.move_out` | M3 | E0507, E0508 | `.clone()`, or `&` the place (as `own.move_out`'s) |
 | `borrowck.move_from_drop` | M4 | E0509 | none; the help names `mem::take`/`Option::take` |
 | `borrowck.guard_write` | D2.5 vs a `fake` loan; L6 | E0510, E0594 | none; the help says to write after the match |
 | `borrowck.static_mut_ref` | D6.2.5 (ir271) | the `static_mut_refs` lint (no E-code in 1.98) | `&raw mut S` |
 | `borrowck.unchecked` (warning) | D10.4 only | — | kept from 0.27.0; the message names the closure |
 
-Seventeen codes. The rustc column is the twin's map
+Eighteen codes (`assign_twice` from M3's rest, with ir271's deferred
+`let`). The rustc column is the twin's map
 (`tools/borrowck-twin.sh`): a rejecting case's first `error[E0xxx]` must
 map to the case's expected code, or the case carries `// RUSTC:`.
 
@@ -1122,8 +1143,10 @@ messages point at AST nodes because `fix` edits by node (0.27.3).
 One error per `(loan, access place, code)` in a body (a loop reports
 one conflict, not one per iteration path); one `borrowck.outlives` per
 `('a, 'v)` pair; one `return_local` per loan; one `use_moved` per
-`(path, use statement)`; the per-instance dedupe of D4.4(b). A body's
-errors are reported in location order.
+path (its first use in location order, as the own pass reports once
+per local), none for a use after a move reported `move_borrowed`; the
+per-instance dedupe of D4.4(b). A body's errors are reported in
+location order.
 
 ## 15. Timing and the budget
 

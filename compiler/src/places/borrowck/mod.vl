@@ -18,14 +18,20 @@ use crate::base::ctx::Ctx;
 use crate::base::timer::{T_BORROWCK, T_PLACES_BUILD, timer_now, timer_sub};
 use crate::places::ir::Body;
 use crate::places::regions::{
-    RO_CALL, RO_LOCAL, RO_UNIVERSAL, region_count, region_origin, region_word, slot_var,
+    RO_CALL, RO_UNIVERSAL, Sig, region_count, region_origin, region_word, sig_new, slot_var,
     slots_bound,
 };
 
 pub mod liveness;
 pub mod constraints;
 pub mod solve;
+pub mod access;
+pub mod moves;
+pub mod diag;
 pub mod dump;
+
+// A loan record's words (Bck.loans).
+pub const LOAN_WORDS: i64 = 6;
 
 // The origin of a region variable the checker adds: an implicit reborrow
 // (D3.6's reading of `copy Q` for a `&mut` Q), of the statement.
@@ -85,9 +91,46 @@ pub struct Bck<A: Allocator> {
     pub val: Vec<i64, A>,
     pub queue: Vec<i64, A>,
     pub inq: Vec<i64, A>,
-    // The loans (D2.1): five words each, the statement, the region, the
-    // kind (BK_*), the place's local and projection.
+    // The loans (D2.1): LOAN_WORDS each, the statement, the region, the
+    // kind (BK_*), the place's local and projection, and whether the loan
+    // is of `*place` (D3.6's reborrow reading: 1) or of the place (0).
     pub loans: Vec<i64, A>,
+    // Per loan: its activation location (D7.1; -1: none). The loans in
+    // scope (D2.4): per block the set at its entry and exit, the walk's
+    // current set, nw_n words each; the conflicts reported (dedupe,
+    // section 14.3: loan, place local, projection, code).
+    pub act: Vec<i64, A>,
+    pub sin: Vec<i64, A>,
+    pub sout: Vec<i64, A>,
+    pub cur: Vec<i64, A>,
+    pub nw_n: i64,
+    pub reported: Vec<i64, A>,
+    // Two places' projection lists root-first (access.vl rel); per local,
+    // the constant it holds when it is assigned once, a constant (an index
+    // temporary; -1: none).
+    pub pa: Vec<i64, A>,
+    pub pb: Vec<i64, A>,
+    pub cidx: Vec<i64, A>,
+    // A place's regions (regions.vl place_regions: the walk's, a source's
+    // kept, a destination's kept, a prefix's), a type's slot variances, a
+    // field's map (field_map), a callee's signature (sig_of); the
+    // universals' order (D4.5: nuniv words a universal, bit v set when it
+    // outlives universal v).
+    pub regs: Vec<i64, A>,
+    pub regs_a: Vec<i64, A>,
+    pub regs_b: Vec<i64, A>,
+    pub regs2: Vec<i64, A>,
+    pub vars: Vec<i64, A>,
+    pub fmap: Vec<i64, A>,
+    pub sig: Sig<A>,
+    pub outlives: Vec<i64, A>,
+    // The instances' dedupe keys (D4.4(b)), with each one's verdict;
+    // whether the last body reused one (the dump prints that alone).
+    pub keys: Vec<i64, A>,
+    pub last_reused: bool,
+    // The locations of the moves reported move_borrowed (access.vl): a use
+    // after one of them is not reported again (moves.vl).
+    pub bad_moves: Vec<i64, A>,
     // A place walk's results (constraints.vl walk_place): the projection
     // list root-first, the slot range reached, the type there, and the
     // deref-like steps passed (a region and a mode each, root-first), then
@@ -140,6 +183,26 @@ pub fn state_new() -> Bck<Comp> {
         queue: Vec::new_in(Comp {}),
         inq: Vec::new_in(Comp {}),
         loans: Vec::new_in(Comp {}),
+        act: Vec::new_in(Comp {}),
+        sin: Vec::new_in(Comp {}),
+        sout: Vec::new_in(Comp {}),
+        cur: Vec::new_in(Comp {}),
+        nw_n: 1,
+        reported: Vec::new_in(Comp {}),
+        pa: Vec::new_in(Comp {}),
+        pb: Vec::new_in(Comp {}),
+        cidx: Vec::new_in(Comp {}),
+        regs: Vec::new_in(Comp {}),
+        regs_a: Vec::new_in(Comp {}),
+        regs_b: Vec::new_in(Comp {}),
+        regs2: Vec::new_in(Comp {}),
+        vars: Vec::new_in(Comp {}),
+        fmap: Vec::new_in(Comp {}),
+        sig: sig_new(),
+        outlives: Vec::new_in(Comp {}),
+        keys: Vec::new_in(Comp {}),
+        last_reused: false,
+        bad_moves: Vec::new_in(Comp {}),
         pscratch: Vec::new_in(Comp {}),
         vscratch: Vec::new_in(Comp {}),
         steps: Vec::new_in(Comp {}),
@@ -152,8 +215,18 @@ pub fn state_new() -> Bck<Comp> {
 // The body held, a rust-edition function's with its regions assigned:
 // its liveness, constraints and solution computed (M1: no error yet).
 // Timed apart from the places build, as `borrowck`.
-pub fn check_body(f: i64, bck: inout Bck<Comp>, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+pub fn check_body(f: i64, bck: inout Bck<Comp>, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     let t = timer_now(pcx);
+    // RULE: D4.4 (an instance whose key was seen reuses the verdict: its
+    // errors were reported at the template's position by the first)
+    let key = instance_key(f, &bck, &pcx);
+    bck.last_reused = key >= 0 && bck.keys[key] != 0;
+    if bck.last_reused {
+        bck.reused += 1;
+        timer_sub(T_PLACES_BUILD, T_BORROWCK, t, pcx);
+        return bck.keys[key];
+    }
+    let e0 = crate::base::diag::error_count(pcx);
     // (the graph: elaboration's fast path leaves the last body's)
     crate::places::cfg::compute_preds(&pbody);
     crate::places::cfg::compute_rpo(&pbody);
@@ -161,9 +234,60 @@ pub fn check_body(f: i64, bck: inout Bck<Comp>, pbody: inout Body<Comp>, pcx: in
     crate::places::borrowck::liveness::compute(&bck, pbody, &pcx);
     crate::places::borrowck::constraints::generate(&bck, pbody, &pcx);
     crate::places::borrowck::solve::solve(&bck, pbody, &pcx);
+    crate::places::borrowck::access::check(&bck, pbody, &pcx);
+    crate::places::borrowck::moves::check(&bck, &pbody, &pcx);
+    if pcx.verify_places {
+        crate::places::borrowck::access::verify_exits(&bck, pbody, &pcx);
+    }
     bck.bodies += 1;
     timer_sub(T_PLACES_BUILD, T_BORROWCK, t, pcx);
-    let _ = f;
+    let node = crate::places::front::fn_node(f, pcx);
+    let closure = node > 0 && pcx.nodes[node].kind == crate::front::ast::NodeKind::Closure;
+    let verdict = if crate::base::diag::error_count(pcx) > e0 { VERDICT_ERRORS }
+        else if closure { VERDICT_DEFERRED } else { VERDICT_CLEAN };
+    if key >= 0 {
+        bck.keys[key] = verdict;
+    }
+    verdict
+}
+
+// The dedupe key of instance f (D4.4(b)): its template and, per type
+// argument, its slots' count and whether it has drop glue; the index of
+// its verdict word in keys (0: not solved yet), or -1 for a function
+// that is not an instance.
+fn instance_key(f: i64, bck: inout Bck<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+    let n = pcx.fns[f].targ_count;
+    if n <= 0 || pcx.fns[f].tmpl < 0 {
+        return -1;
+    }
+    bck.vscratch.clear();
+    bck.vscratch.push(pcx.fns[f].tmpl);
+    bck.vscratch.push(n);
+    for i in 0..n {
+        let t = crate::places::front::tlist_at(pcx.fns[f].targs + i, pcx);
+        bck.vscratch.push(crate::places::regions::slot_count(t, pcx));
+        bck.vscratch.push(if crate::front::own::glue::has_glue(t, &pcx) { 1 } else { 0 });
+    }
+    let w = bck.vscratch.len() as i64;
+    // (entries: the key's words, then the verdict word)
+    var i = 0;
+    while i + w < bck.keys.len() as i64 {
+        var same = true;
+        for j in 0..w {
+            if bck.keys[i + j] != bck.vscratch[j] {
+                same = false;
+            }
+        }
+        if same {
+            return i + w;
+        }
+        i += bck.keys[i + 1] * 2 + 3;
+    }
+    for j in 0..w {
+        bck.keys.push(bck.vscratch[j]);
+    }
+    bck.keys.push(0);
+    bck.keys.len() as i64 - 1
 }
 
 // The sizes and the region tables of the body held, from regions.vl's
@@ -209,39 +333,38 @@ fn begin_body(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: Ctx<Comp>) {
             bck.call_region[of] = r;
         }
     }
-    // (ir271 M1: a local's slots are regions.vl's slot_var; a parameter's
-    // are its signature's universals, shared and not consecutive: the
-    // contiguous range this checker walks is made of variables of its
-    // own, each equal to the universal it is bound to)
+    // (a local's slots are regions.vl's slot_var, a place's regions
+    // place_regions: first names the first slot's variable, nslots the
+    // slots bound)
     bck.loans.clear();
     bck.edges.clear();
     for l in 0..bck.nlocal {
         let n = slots_bound(l, pbody);
-        if n == 0 {
-            continue;
-        }
-        var contiguous = true;
-        for i in 0..n {
-            let v = slot_var(l, i, pbody);
-            if v <= 0 || v != slot_var(l, 0, pbody) + i {
-                contiguous = false;
-            }
-        }
-        if contiguous {
-            bck.first[l] = slot_var(l, 0, pbody);
-        } else {
-            for i in 0..n {
-                let r = new_region(RO_LOCAL, l, &bck);
-                if i == 0 {
-                    bck.first[l] = r;
-                }
-                let u = slot_var(l, i, pbody);
-                edge(r, u, 0, &bck);
-                edge(u, r, 0, &bck);
-            }
-        }
         bck.nslots[l] = n;
+        if n > 0 {
+            bck.first[l] = slot_var(l, 0, pbody);
+        }
     }
+}
+
+// The verdict per function (D17.7): 0 not checked, 1 clean, 2 errors, 3
+// deferred (a closure body: its captured places are reached through the
+// raw env, D10.4).
+pub const VERDICT_CLEAN: i64 = 1;
+pub const VERDICT_ERRORS: i64 = 2;
+pub const VERDICT_DEFERRED: i64 = 3;
+
+// RULE: D17.7
+pub fn set_verdict(f: i64, verdict: i64, pcx: inout Ctx<Comp>) {
+    while pcx.borrowck_verdict.len() as i64 <= f {
+        pcx.borrowck_verdict.push(0);
+    }
+    pcx.borrowck_verdict[f] = verdict;
+}
+
+// Whether function f's body was checked and found clean (D17.7).
+pub fn borrowck_clean(f: i64, pcx: Ctx<Comp>) -> bool {
+    f >= 0 && f < pcx.borrowck_verdict.len() as i64 && pcx.borrowck_verdict[f] == VERDICT_CLEAN
 }
 
 // A region variable the checker adds (RO_REBORROW of statement s): its
