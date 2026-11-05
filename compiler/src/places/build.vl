@@ -49,7 +49,7 @@ use crate::front::patterns::{binding_count, binds_ref, is_irrefutable, pattern_r
 use crate::front::patterns::usefulness::int_key;
 use crate::front::types::{
     REF_MUT, REF_SHARED, TY_BOOL, TY_I64, TY_NEVER, TY_UNIT, TyKind, fn_param, is_compound,
-    is_integer, is_void, type_elem, variant_field,
+    is_integer, is_void, ref_to, type_elem, variant_field,
 };
 use crate::places::front::{
     ast_local_mutable, ast_local_ty, enum_tag_ty, fn_is_extern, fn_module, fn_param_count, fn_ret,
@@ -66,9 +66,9 @@ use crate::places::ir::{
     RV_SLICE, RV_UNARY, RV_USE, SK_ASSERT, SK_ASSIGN, SK_CALL, SK_DEAD, SK_DROP, SK_INTRINSIC,
     SK_LIVE, SK_MENTION, TK_GOTO, TK_RETURN, TK_SWITCH, TK_UNREACHABLE, UO_BITNOT, UO_NEG, UO_NOT,
     block_count, block_len, block_start, block_term, body_begin, emit, enter_block, has_flag,
-    is_union_type, local_count, new_block, new_local, op_a, op_b, op_kind, ops_mark, proj,
-    proj_indirect, proj_kind, proj_parent, proj_val, push_op, reachable, struct_closure, terminate,
-    undistinct,
+    is_union_type, local_count, new_block, new_local, op_a, op_b, op_kind, ops_mark, place_type,
+    proj, proj_indirect, proj_kind, proj_parent, proj_val, push_op, reachable, struct_closure,
+    terminate, undistinct,
 };
 
 // ---- State ----
@@ -1389,6 +1389,26 @@ fn lower_arg(i: i64, arg: i64, mode: i64, c_callee: bool, pbody: inout Body<Comp
     // only reads it: a raw or C parameter, a view)
     let moving = mode == P_VALUE && !c_callee;
     arg_operand(arg, moving, &pbody, &pcx);
+    // (the place's own type: the argument's is the parameter's after a
+    // coercion, `&T` of a `&mut T`)
+    let place = pcx.rust_body && !c_callee && is_place_expr(arg, pcx)
+        && (pcx.opk == OK_MOVE || pcx.opk == OK_COPY);
+    let arg_ty = if place { undistinct(place_type(pcx.opa, pcx.opb, pbody, &pcx), pcx) } else { 0 };
+    if place && arg_ty > 0
+        && pcx.types[arg_ty].kind == TyKind::Ptr && pcx.types[arg_ty].b == REF_MUT {
+        // RULE: D3.6 (0.27.1) a `&mut T` place given to a call is
+        // reborrowed, `_t = &mut2 (*r)`: two-phase as rustc's implicit
+        // reborrow (D7.4); `_t = &(*r)` for a `&T` parameter (the
+        // coercion); the place is neither moved nor copied (I7)
+        let exclusive = mode == P_MUT || mode == P_VALUE;
+        let t = new_temp(if exclusive { arg_ty }
+            else { ref_to(pcx.types[arg_ty].a, REF_SHARED, &pcx) },
+            arg, false, &pbody, &pcx);
+        let p = proj(pcx.opb, PJ_DEREF, 0, &pbody);
+        emit_ref(t, 0, pcx.opa, p, if exclusive { BK_MUT2 } else { BK_SHARED }, arg, &pbody, &pcx);
+        set_op(OK_MOVE, t, 0, &pcx);
+        return;
+    }
     if pcx.rust_body && pcx.opk == OK_MOVE && is_place_expr(arg, pcx) {
         // (0.27.1: a place moved into the call gets its own statement at
         // the argument, `_t = move v`, as rustc's MIR: the borrow
@@ -1717,6 +1737,12 @@ fn lower_match(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx
         return;
     }
     let join = new_block(&pbody);
+    // (0.27.1) a rust-edition match with a guard: its fake loans, made
+    // before the first test, mentioned at each arm body's entry (D2.6)
+    var fakes: Vec<i64, Comp> = Vec::new_in(Comp {});
+    if pcx.rust_body && (0..pcx.nodes[n].count).any(|i| pcx.nodes[child(n, i, pcx)].b != 0) {
+        fake_borrows(n, sl, sp, st, &fakes, &pbody, &pcx);
+    }
     for i in 0..pcx.nodes[n].count {
         let arm = child(n, i, pcx);
         let pat = pcx.nodes[arm].a;
@@ -1743,6 +1769,9 @@ fn lower_match(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx
             pop_scope_at(g, &pbody, &pcx);
         }
         if reachable(pbody) {
+            for f in fakes.iter() {
+                emit(SK_MENTION, f, 0, 0, 0, 0, 0, 0, arm, &pbody);
+            }
             phase_begin(-1, &pcx);
             bind_pattern(pat, sl, sp, st, false, &pbody, &pcx);
             expr_into(pcx.nodes[arm].c, dl, dp, &pbody, &pcx);
@@ -1755,6 +1784,76 @@ fn lower_match(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx
     }
     terminate(TK_UNREACHABLE, 0, 0, 0, 0, 0, n, &pbody);
     enter_block(join, &pbody);
+}
+
+// RULE: D2.6 The fake loans of a rust-edition match n with a guard, its
+// scrutinee at (sl, sp) of type st: `_t = &fake S` for the scrutinee's
+// place and for every place a pattern tests, before the first test; the
+// temporaries in fakes (mentioned at each arm body's entry).
+fn fake_borrows(n: i64, sl: i64, sp: i64, st: i64, fakes: inout Vec<i64, Comp>,
+    pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    var places: Vec<i64, Comp> = Vec::new_in(Comp {});
+    places.push(sp);
+    places.push(st);
+    for i in 0..pcx.nodes[n].count {
+        tested_places(pcx.nodes[child(n, i, pcx)].a, sp, st, &places, &pbody, &pcx);
+    }
+    var i = 0;
+    while i < places.len() as i64 {
+        let p = places[i];
+        var seen = false;
+        var j = 0;
+        while j < i {
+            seen = seen || places[j] == p;
+            j += 2;
+        }
+        if !seen {
+            let f = new_temp(ref_to(places[i + 1], REF_SHARED, &pcx), n, false, &pbody, &pcx);
+            emit_ref(f, 0, sl, p, BK_FAKE, n, &pbody, &pcx);
+            fakes.push(f);
+        }
+        i += 2;
+    }
+}
+
+// The places pattern pat tests, given a place p of type ty, as
+// test_pattern reads them: a literal's or a range's, a variant's (its
+// discriminant); pairs (projection, type) pushed to out.
+fn tested_places(pat: i64, p: i64, ty: i64, out: inout Vec<i64, Comp>, pbody: inout Body<Comp>,
+    pcx: inout Ctx<Comp>) {
+    if ty == TY_NEVER {
+        return;
+    }
+    var pp = p;
+    var t = ty;
+    let inner = pattern_referent(pat, t, pcx);
+    if inner != 0 {
+        pp = proj(pp, PJ_DEREF, 0, &pbody);
+        t = inner;
+    }
+    let k = pcx.nodes[pat].kind;
+    if k == NodeKind::PatLit || k == NodeKind::PatRange || k == NodeKind::PatVariant {
+        out.push(pp);
+        out.push(t);
+    }
+    if k == NodeKind::PatOr {
+        for i in 0..pcx.nodes[pat].count {
+            tested_places(child(pat, i, pcx), pp, t, &out, &pbody, &pcx);
+        }
+    } else if k == NodeKind::PatTuple {
+        let tt = undistinct(t, pcx);
+        for i in 0..pcx.nodes[pat].count {
+            tested_places(child(pat, i, pcx), proj(pp, PJ_FIELD, i, &pbody), type_elem(tt, i, pcx),
+                &out, &pbody, &pcx);
+        }
+    } else if k == NodeKind::PatVariant {
+        let v = pcx.nodes[pat].x;
+        let vp = proj(pp, PJ_VARIANT, v, &pbody);
+        for i in 0..pcx.nodes[pat].count {
+            tested_places(child(pat, i, pcx), proj(vp, PJ_FIELD, i, &pbody),
+                variant_field(v, i, pcx), &out, &pbody, &pcx);
+        }
+    }
 }
 
 // Whether match n on a value of type st is one switch (R4, as
@@ -2140,14 +2239,20 @@ fn bind_one(pat: i64, l: i64, p: i64, ty: i64, guard: bool, pbody: inout Body<Co
     }
     if by_ref {
         let rt = undistinct(ast_local_ty(al, pcx), pcx);
+        // (0.27.1: a rust-edition guard sees a `ref mut` binding as `&T`, a
+        // shared reborrow, D2.6)
         let kind = if rt > 0 && pcx.types[rt].kind == TyKind::Ptr
-            && pcx.types[rt].b == REF_MUT { BK_MUT }
+            && pcx.types[rt].b == REF_MUT && !(guard && pcx.rust_body) { BK_MUT }
             else { BK_SHARED };
         emit_ref(ir, 0, l, p, kind, pat, &pbody, &pcx);
     } else {
         // (0.27.1: a rust-edition read of a referent or an element that is
-        // not Copy moves it, the borrow checker's move_out, D8.3)
-        let moving = !borrowed || pcx.rust_body && proj_indirect(p, pbody);
+        // not Copy moves it, the borrow checker's move_out, D8.3; so does
+        // a `&mut` the own pass would lend, `for x in self`'s, I7)
+        let ut = undistinct(ty, pcx);
+        let exclusive = ut > 0 && pcx.types[ut].b == REF_MUT
+            && (pcx.types[ut].kind == TyKind::Ptr || pcx.types[ut].kind == TyKind::Slice);
+        let moving = !borrowed || pcx.rust_body && (proj_indirect(p, pbody) || exclusive);
         place_operand(l, p, ty, moving, pbody, &pcx);
         emit_use(ir, 0, pat, &pbody, pcx);
     }
@@ -2348,7 +2453,11 @@ fn lower_let(st: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
                 let saved = pcx.lent_home;
                 pcx.lent_home = if !pcx.stmt_home && lent_branch(init, pcx) { temp_home(pcx) }
                     else { -1 };
-                expr_into(init, ir, 0, &pbody, &pcx);
+                if borrowed && pcx.rust_body && is_place_expr(init, pcx) {
+                    rust_let_place(pat, init, ir, &pbody, &pcx);
+                } else {
+                    expr_into(init, ir, 0, &pbody, &pcx);
+                }
                 pcx.lent_home = saved;
             }
             if !has_flag(ir, LF_BORROWED, pbody) && needs_drop(pbody.locals[ir].ty, &pcx) {
@@ -2360,6 +2469,29 @@ fn lower_let(st: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     }
     if s >= 0 {
         pop_scope_at(s, &pbody, &pcx);
+    }
+}
+
+// (0.27.1) `let pat = init` of a place into a borrowed copy, in a rust
+// body: a user binding takes a referent or an element that is not Copy
+// (`let s = *r;`, `let s = v[0];`: the borrow checker's move_out, D8.3),
+// a `for` loop's sequence a whole `&mut` (`for x in self`, I7); the
+// checker's hidden bindings (`=fN`, an f-string's holes) copy.
+fn rust_let_place(pat: i64, init: i64, ir: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    if !place_of(init, &pbody, &pcx) {
+        return;
+    }
+    let ty = pcx.nodes[init].ty;
+    let name = pcx.nodes[pat].a;
+    let text = sym_text(name, pcx);
+    let ut = undistinct(ty, pcx);
+    let exclusive = ut > 0 && pcx.types[ut].b == REF_MUT
+        && (pcx.types[ut].kind == TyKind::Ptr || pcx.types[ut].kind == TyKind::Slice);
+    let take = if name == pcx.sym_for_seq { exclusive }
+        else { (text.len == 0 || text[0] != '=') && proj_indirect(pcx.pl_p, pbody) };
+    place_operand(pcx.pl_l, pcx.pl_p, ty, take, pbody, &pcx);
+    if reachable(pbody) {
+        emit_use(ir, 0, init, &pbody, pcx);
     }
 }
 
