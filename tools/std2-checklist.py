@@ -83,9 +83,9 @@ def strip_generics(t):
     rest = t[m.end():].strip()
     if rest.startswith("<"):
         inner = rest[1:skip_angle(rest, 0) - 1]
-        args = [a.strip() for a in split_top(inner)]
+        args = [a.strip() for a in split_top(inner) if a.strip()]
         # generic only when every argument is a bare parameter name
-        if any(not re.match(r"[A-Z]\w*$", a) for a in args):
+        if args and any(not re.match(r"[A-Z]\w*$", a) for a in args):
             return f"{base}<{', '.join(args)}>"
     return base
 
