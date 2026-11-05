@@ -87,7 +87,7 @@ The rust edition's borrow checker: NLL on the places IR (docs/design/borrowck.md
 The borrow checker's corpus and its rustc twin (corpus271):
 
 - `tests/run/rust_b_ok_*.vl` and `tests/run/rust_b_err_*.vl`: 76
-  programs the checker accepts and 112 it rejects, written from the
+  programs the checker accepts and 113 it rejects, written from the
   spec's rule ids (each case's `// RULE: Dn.m`): the conflict table cell
   by cell, kills and reassigned references, reborrows through `&`,
   `&mut` and raw pointers, two-phase borrows, returns and elision,
@@ -112,6 +112,18 @@ The borrow checker's corpus and its rustc twin (corpus271):
   corpus against typeck's, and their ratio (at most 0.25);
   `tests/compile_cost.sh`'s fourth row, `rust`, the check of the
   corpus's biggest case against the previous release (at most 1.5x).
+- `rust_b_err_alias_params`: the program 0.27.0 miscompiled at -O2 (two
+  `&mut` of one place to one call, and `&v, &mut v`: the parameters'
+  alias facts taken for a body nobody checked), now `mut_twice` and
+  `conflict`; `tests/same_output.sh`: every running `rust_t_`/`rust_b_ok_`
+  case prints the same at -O0, at -O2 and at -O2 with `--no-noalias`.
+- `rust_t_contract_*`: contracts in the rust edition, one case per rule
+  of the contracts design's C3, C5 and C7.1 (a clause reads `&mut`
+  parameters as `&`, `old(e)` only of a `Copy` value without regions, an
+  impl's added `requires` checked per instance).
+- `tools/checks-survey.sh`: `--print-checks` over bench/ and the
+  examples at -O2, the checks left and removed (by ranges or otherwise),
+  in user code and in std, by kind: the first survey since 0.18.1's.
 
 ### What's new in 0.27.0
 
