@@ -1,10 +1,10 @@
 ## 0.25.4: `volec refactor table X` (tests/refactor/table254/): a table
 ## kept as a raw pointer, a count and a capacity becomes a Vec<T, Comp>;
 ## every use is placed, or the refactor is refused and changes nothing.
-## (0.26.5) A static may not hold Comp any more (the alloc exemption names
-## two of the compiler's own statics only, base::SYMS and
-## front::types::TYPES): each rewrite's dry run shows its diff, and the
-## rewrite is refused (alloc.static) and changes nothing. A table in a
+## (0.26.5) A static may not hold Comp any more (0.27.0: no static is
+## exempt, the compiler's own symbols and types included): each rewrite's
+## dry run shows its diff, and the rewrite is refused (alloc.static) and
+## changes nothing. A table in a
 ## context's field is the next form the refactor takes.
 % "$COMPILER" main.vl -o a >/dev/null 2>&1 && ./a
 4 10 36 40

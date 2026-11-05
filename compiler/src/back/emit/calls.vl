@@ -22,7 +22,7 @@ use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::target::{ELF, X86};
 use crate::front::types::{
-    TYPES, TY_BOOL, TY_U64, TY_U8, align_to, fn_param, in_fregs, int_bits, is_compound, is_float,
+    TY_BOOL, TY_U64, TY_U8, align_to, fn_param, in_fregs, int_bits, is_compound, is_float,
     is_integer, is_void, scalar_type, type_elem, type_size,
 };
 use crate::gen0::arm64::a64_call_indirect;
@@ -45,7 +45,7 @@ pub fn callee_param_count(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         let op = cx.insts[v].op;
         if op == Call { return pcx.fns[cx.insts[v].imm].param_count; }
-        if op == CallI { return TYPES[cx.insts[v].imm].count; }
+        if op == CallI { return pcx.types[cx.insts[v].imm].count; }
         0
     }
 }
@@ -53,7 +53,7 @@ pub fn callee_param_count(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) -> i64 {
 pub fn callee_param(cx: sink *FnCtx, v: i64, i: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         if cx.insts[v].op == Call { fn_param(cx.insts[v].imm, i, pcx) }
-        else { type_elem(cx.insts[v].imm, i) }
+        else { type_elem(cx.insts[v].imm, i, pcx) }
     }
 }
 
@@ -61,7 +61,7 @@ pub fn callee_result(cx: sink *FnCtx, v: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         let op = cx.insts[v].op;
         if op == Call { return pcx.fns[cx.insts[v].imm].ret; }
-        if op == CallI { return TYPES[cx.insts[v].imm].a; }
+        if op == CallI { return pcx.types[cx.insts[v].imm].a; }
         0
     }
 }
@@ -96,7 +96,7 @@ pub fn call_locations(cx: inout FnCtx, v: i64, locations: *i64, copies: *i64, fl
                 j += 1;
             } else {
                 locations[j] = arg_location(if kind == AbiClass::Ref { TY_U64 }
-                    else { scalar_type(ty) }, &state as *i64, pcx);
+                    else { scalar_type(ty, pcx) }, &state as *i64, pcx);
                 copies[j] = 0;
                 j += 1;
             }
@@ -105,7 +105,7 @@ pub fn call_locations(cx: inout FnCtx, v: i64, locations: *i64, copies: *i64, fl
         while j < cx.insts[v].nargs {
             let ty = cx.argty.data[cx.insts[v].args + j];
             copies[j] = 0;
-            if ty < 0 && is_compound(0 - ty) {
+            if ty < 0 && is_compound(0 - ty, pcx) {
                 let t = 0 - ty;
                 let kind = variadic_kind(&cx, t, pcx);
                 if kind == AbiClass::Pieces {
@@ -163,7 +163,7 @@ fn t_call_locations(cx: inout FnCtx, v: i64, locations: *i64, copies: *i64,
                 }
             } else {
                 locations[j] = t_arg_location(if kind == AbiClass::Ref { TY_U64 }
-                    else { scalar_type(ty) }, &state as *i64, pcx);
+                    else { scalar_type(ty, pcx) }, &state as *i64, pcx);
                 copies[j] = 0;
                 j += 1;
             }
@@ -204,7 +204,8 @@ fn is_tail_call(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) -> bool {
         }
         let f = IRFUNCS[cx.irf].f;
         let ret = pcx.fns[f].ret;
-        if pcx.fns[f].is_extern || pcx.fns[f].export || fn_is_global(f, pcx) || is_compound(ret)
+        if pcx.fns[f].is_extern || pcx.fns[f].export || fn_is_global(f, pcx)
+            || is_compound(ret, pcx)
             || returns_through_pointer(&cx, ret, pcx) {
             return false;
         }
@@ -235,7 +236,7 @@ fn is_tail_call(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) -> bool {
             return false;
         }
         let value = cx.blocks[returning].cond;
-        if value != 0 && (value != result || cx.insts[v].ty != ir_type(ret)) {
+        if value != 0 && (value != result || cx.insts[v].ty != ir_type(ret, pcx)) {
             return false;
         }
         if value == 0 && !is_void(ret) {
@@ -253,7 +254,7 @@ fn is_tail_call(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) -> bool {
 fn emit_call_pieces(cx: inout FnCtx, v: i64, c: bool, ret: i64, pcx: Ctx<Comp>) {
     unsafe {
         // (0.17: only a call returning an aggregate has pieces)
-        if !is_compound(ret) {
+        if !is_compound(ret, pcx) {
             return;
         }
         var w = cx.insts[v].next;
@@ -265,7 +266,7 @@ fn emit_call_pieces(cx: inout FnCtx, v: i64, c: bool, ret: i64, pcx: Ctx<Comp>) 
                     any = true;
                 }
                 let ty = cx.insts[w].ty;
-                let reg = conv_return_piece_reg(&cx, c, cx.insts[w].imm);
+                let reg = conv_return_piece_reg(&cx, c, cx.insts[w].imm, pcx);
                 if ty == TY_BOOL || (is_integer(ty) && int_bits(ty) < 64) {
                     m_normalize(&cx, reg, if ty == TY_BOOL { TY_U8 } else { ty });
                 }
@@ -321,13 +322,14 @@ pub fn emit_call_inst(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) {
             let variadic = declared < 0;
             let ty = if variadic { 0 - declared } else { declared };
             let value_ty = cx.insts[arg].ty;
-            let r = use_any(&cx, arg, cx.cur_pos, reg_move_temp(in_fregs(value_ty)), pcx);
+            let r = use_any(&cx, arg, cx.cur_pos, reg_move_temp(in_fregs(value_ty, pcx)), pcx);
             var store_ty = value_ty;
-            if !in_fregs(value_ty) {
+            if !in_fregs(value_ty, pcx) {
                 // Apple's arm64 ABI packs fixed stack arguments at their size;
                 // everything else takes 8 bytes.
                 store_ty = TY_U64;
-                if c && pcx.apple_a64 && !variadic && !is_compound(ty) && type_size(ty, pcx) < 8 {
+                if c && pcx.apple_a64 && !variadic && !is_compound(ty, pcx)
+                    && type_size(ty, pcx) < 8 {
                     store_ty = ty;
                 }
             }
@@ -376,7 +378,7 @@ pub fn emit_call_inst(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) {
                 pcx.fns[f].is_extern || pcx.fns[f].export, pcx.fns[f].variadic, float_regs, pcx);
         }
         else if op == CallC
-            && (cx.insts[v].imm == rt_panic_sym() || cx.insts[v].imm == rt_note_sym()) {
+            && (cx.insts[v].imm == rt_panic_sym(pcx) || cx.insts[v].imm == rt_note_sym(pcx)) {
             emit_call(&cx, function_prefix(), cx.insts[v].imm, false, false, 0, pcx);
         } else if op == CallC {
             emit_call(&cx, global_prefix(), cx.insts[v].imm, true, false, 0, pcx);
@@ -392,7 +394,7 @@ pub fn emit_call_inst(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) {
             var offset = 0;
             let base = mem_base_any(&cx, cx.insts[v].c, 0, cx.cur_pos + 2, &offset, pcx);
             for k in 0..cx.abi_piece_count {
-                m_store(&cx, cx.abi_piece_ty[k], conv_return_piece_reg(&cx, c, k), base,
+                m_store(&cx, cx.abi_piece_ty[k], conv_return_piece_reg(&cx, c, k, pcx), base,
                     offset + cx.abi_piece_offset[k], pcx);
             }
             return;
