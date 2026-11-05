@@ -23,7 +23,8 @@ Without a marker, an item whose owner and name MVS's std has is kept, and
 any other is new. Some features are seen in the signature itself (char,
 FnOnce, SliceIndex, `<X as T>::N`, an impl for `&T`, an assoc const, a
 bound on an assoc type). An in-scope MVS item that no line accounts for is
-reported, so the diff stays complete.
+reported, so the diff stays complete. It also checks compiler/std2/rewrite.tsv
+(the translator's std table): each row names an MVS item, in four columns.
 
 usage: tools/std2-checklist.py [--volec PATH] [--check]
   --check: exit 1 when checklist.tsv is not what the tree makes
@@ -83,9 +84,9 @@ def strip_generics(t):
     rest = t[m.end():].strip()
     if rest.startswith("<"):
         inner = rest[1:skip_angle(rest, 0) - 1]
-        args = [a.strip() for a in split_top(inner)]
+        args = [a.strip() for a in split_top(inner) if a.strip()]
         # generic only when every argument is a bare parameter name
-        if any(not re.match(r"[A-Z]\w*$", a) for a in args):
+        if args and any(not re.match(r"[A-Z]\w*$", a) for a in args):
             return f"{base}<{', '.join(args)}>"
     return base
 
@@ -417,6 +418,13 @@ def main():
         for k in keys:
             used.add(k)
             rows.append([g[0], "-", "-", "gone", (f"{k[0]}::" if k[0] else "") + k[1], "", "", "", g[2], ""])
+    # rewrite.tsv: every row's MVS item exists, and its four columns
+    rewrites = [r for r in read_tsv("rewrite.tsv") if r[0] != "mvs"]
+    for r in rewrites:
+        if len(r) != 4:
+            die(f"rewrite.tsv: a row needs mvs, when, rust and note: {r}")
+        if key_of(r[0]) not in mvs:
+            die(f"rewrite.tsv: {r[0]} is no MVS item")
     # completeness: in-scope MVS items no line accounts for
     missing = sorted(f"{o + '::' if o else ''}{n} ({m})" for (o, n), (m, k) in mvs.items()
                      if (o in SCOPE_OWNERS or (o is None and m in SCOPE_MODULES and k == "fn"))
@@ -448,6 +456,7 @@ def main():
     for r in rows:
         for t in filter(None, r[5].split(",")):
             per[t] = per.get(t, 0) + 1
+    print(f"rewrite.tsv: {len(rewrites)} rows, for {len({r[0] for r in rewrites})} MVS items")
     later = sum(1 for r in rows if r[5])
     print(f"items with no later feature (0.27.0's typeck): {len(items) - later}; waiting: {later}")
     for t in sorted(per, key=lambda t: (-per[t], t)):

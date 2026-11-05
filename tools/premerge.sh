@@ -84,6 +84,8 @@ if [ -z "$VOLEC" ]; then
 else
     : > "$TMP/fmt"
     for f in $(printf '%s\n' "$CHANGED" | grep '\.vl$' | grep -v -e '^tests/' -e '^evals/' | grep -v 'front/stdsrc\.vl$'); do
+        # (0.27.0: compiler/std2, as the pre-commit hook says)
+        case "$f" in compiler/std2/*) continue ;; esac
         "$VOLEC" fmt --check "$f" > /dev/null 2>&1 \
             || { [ -x target/volec ] && target/volec fmt --check "$f" > /dev/null 2>&1; } || echo "  $f: not formatted (try: volec fmt $f)" >> "$TMP/fmt"
     done

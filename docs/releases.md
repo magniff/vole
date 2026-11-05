@@ -79,6 +79,52 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.26.5 | `v0.26.5` | 0.26.4 | aarch64-macos | the compiler's statics in context structs, phases 4-6 (`base::ctx::Ctx<Comp>` passed as `pcx`, the tables code generation's tasks read through a let view per task, `WgslCx<Arena>`; 1,234 statics to 188); `fix --only statics` doing the by-hand steps and `--prune`; the alloc exemption down to `SYMS` and `TYPES` |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.27.0
+
+The rust edition begins. Built and tested on aarch64-macos only.
+
+The rust edition's std, its API as a spec tree (std270):
+
+- `compiler/std2` is the std that rust-edition programs get from 0.27.2:
+  every item's signature in its final form and its doc, with a body where
+  one is trivial and `todo()` otherwise, checked as its own root (`volec
+  check --edition rust compiler/std2/std.vl`). It is a redesign of
+  compiler/std, not a port: `v.get(i)` is `Option<&T>`, iterators yield
+  `&T` and `iter_mut` `&mut T`, maps have `entry`, `Option` has `take`,
+  `as_ref` and `as_mut`; allocation stays a capability (`Vec<T, A>`,
+  `Box::new_in(x, a)`, `_in` forms, `clone_in(a)`), every iterator has a
+  named type, and std's paths are Rust's (std::vec, std::collections,
+  std::alloc). In 0.27.0 rust-edition programs still run on MVS's std;
+  std2 is not built into the compiler before 0.27.2.
+- Its modules: Option, Result and Box; the traits (PartialEq to Ord with
+  Ordering, the operators with Rhs and Output, Deref, Index, DefaultIn
+  beside Default, ToOwnedIn, ToStringIn, FromIteratorIn); Vec, the slices
+  (MVS's free functions as methods, SliceIndex), str and char (Pattern
+  over char, &str and closures), String; Hash, Hasher and BuildHasher,
+  HashMap<K, V, A, S = FixedState> with Entry, HashSet; Iterator and its
+  adapters; fmt over one Formatter<'a> type (no dyn); io; thread::scope
+  with elided regions (no `for<>`); and the allocators: Allocator in
+  Rust's shape with `FREES`, Gpa, Arena<P> with a safe `reset(&mut
+  self)`, ArenaScope, TypedArena<T, P>, FixedBuf<'b>, AnyAlloc<'a>.
+- `compiler/std2/checklist.tsv` (tools/std2-checklist.py) lists every item
+  against MVS's std: 1,376 items, of which 297 kept, 15 renamed, 162
+  changed and 902 new, and 70 MVS items gone, each with its replacement;
+  every MVS item of the modules in scope is accounted for. Each item names
+  the rust-front features it waits for (`edition.later: NAME`, from
+  `features.tsv`): 245 wait for 0.27.2 (derives in Rust's shape, char,
+  FnOnce, SliceIndex, impls for references, ...), and the gate-1 test that
+  will cover it.
+- `compiler/std2/rewrite.tsv` is the std part of `fix --edition rust`'s
+  table (0.27.3): 248 rows for 233 MVS items, each call, type name or
+  impl shape that changes, chosen by type (`v.get(i)` is `v[i]` for a
+  Copy T; MVS's unstable `sort` is `sort_unstable`; `m.reserve(n)` keeps
+  its meaning as `m.reserve(n.saturating_sub(m.len()))`).
+- `compiler/std/embed.sh --edition rust` embeds compiler/std2 as
+  front/stdsrc_rust.vl (std2_source and its index), for 0.27.2; run now
+  it would add about 0.26 MB to the binary. MVS's stdsrc.vl is unchanged.
+- pre-commit and premerge leave a rust-edition file (its first line `//
+  EDITION: rust`) out of their fmt check until fmt reads the edition.
+
 ### What's new in 0.26.5
 
 The compiler's statics in context structs, the rest: 1,234 statics to 188, the tables code generation's threads read included, and the alloc exemption down to two statics. Built and tested on aarch64-macos only.

@@ -1,3 +1,566 @@
 // EDITION: rust
-// std::alloc: Allocator, Layout, Gpa, and the arenas (plan §2.1): Arena<P>,
-// ArenaScope, TypedArena<T, P>, FixedBuf<'b>, AnyAlloc<'a>.
+// std::alloc: Allocator, Layout, Gpa, and the arenas (plan §2, §2.1,
+// §9.1). Allocation is a capability: a function allocates only through an
+// allocator reachable from its parameters, a type that holds one has it
+// among its parameters (`Vec<T, A>`, `Parser<'s, A>`), and nothing makes
+// one from nothing: Gpa has no public constructor (main receives it),
+// every arena is made from a parent allocator or over memory it is lent,
+// and a static's type may not hold an allocator (the compiler's
+// AllocFree marker). Allocators compose as Zig's do: an Arena over a
+// FixedBuf allocates no heap at all, an arena over an arena frees per
+// request, a scope gives back what it took while older containers stay.
+// AnyAlloc<'a> erases an allocator's type (no dyn: a struct of function
+// pointers), so a library taking `a: AnyAlloc<'_>` is compiled once.
+
+use crate::cell::Cell;
+use crate::clone::Clone;
+use crate::convert::From;
+use crate::fmt::{Debug, Display, Formatter};
+use crate::iter::IntoIterator;
+use crate::marker::{Copy, PhantomData};
+use crate::ops::Drop;
+use crate::ptr::NonNull;
+use crate::result::Result;
+
+// A block's size and alignment (a power of two), in bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Layout {
+    size: usize,
+    align: usize,
+}
+
+impl Layout {
+    // A T's layout.
+    pub fn new<T>() -> Layout {
+        Layout { size: crate::mem::size_of::<T>(), align: crate::mem::align_of::<T>() }
+    }
+
+    // n T's; LayoutError when the size overflows.
+    pub fn array<T>(n: usize) -> Result<Layout, LayoutError> {
+        crate::panic::todo()
+    }
+
+    // LayoutError when align is not a power of two or size overflows
+    // when rounded up to it.
+    pub fn from_size_align(size: usize, align: usize) -> Result<Layout, LayoutError> {
+        crate::panic::todo()
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    pub fn align(&self) -> usize {
+        self.align
+    }
+}
+
+// A layout that cannot be.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct LayoutError;
+
+// An allocator out of memory (or over its limit).
+// mvs: AllocError, AllocError::impl Debug
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AllocError;
+
+// mvs: AllocError::impl Display
+impl Display for AllocError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        f.write_str("memory allocation failed")
+    }
+}
+
+// Why try_reserve failed: the capacity overflowed, or the allocator.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum TryReserveError {
+    CapacityOverflow,
+    AllocError { layout: Layout },
+}
+
+// What gives out blocks of memory: Rust's allocator_api shape, `&self`
+// (so `&'a Arena<P>` is one, through the impl for &A), with a thin
+// pointer (`NonNull<u8>`, not `NonNull<[u8]>`: no fat raw pointers) and
+// FREES. An `unsafe trait`: every impl is `unsafe impl` with a SAFETY
+// comment naming where its memory comes from (plan §2.0 rule 1).
+// std2: changed: Rust's shape over &self and a Layout (MVS: try_alloc,
+// try_resize, free over *Self and i64 sizes)
+// UNSAFE: an impl promises its blocks are valid, aligned and its own,
+// which no type checks.
+// SAFETY: each impl states where its memory comes from (rule 1).
+pub unsafe trait Allocator {
+    // Whether deallocate gives memory back. False for the arenas and
+    // FixedBuf, whose memory comes back all at once; a container on such
+    // an allocator needs dropping only if its elements do (plan §9.1:
+    // `needs_drop::<Vec<T, A>>() == needs_drop::<T>()` when !A::FREES).
+    const FREES: bool = true;
+
+    // A block for layout, or AllocError.
+    // mvs: Allocator::try_alloc, Allocator::alloc
+    // std2: changed: a Layout, a Result (MVS: a size and align, null or a panic)
+    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError>;
+
+    // The same, its bytes zero.
+    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        crate::panic::todo()
+    }
+
+    // Gives a block back.
+    // UNSAFE: p must be a block of this allocator's, with this layout.
+    // SAFETY: a contract on the caller, as Rust's Allocator::deallocate.
+    // mvs: Allocator::free
+    // std2: changed: a NonNull and a Layout (MVS: free(p, size, align))
+    unsafe fn deallocate(&self, p: NonNull<u8>, layout: Layout);
+
+    // The block made larger (moved if it must), its contents kept.
+    // UNSAFE: p must be a block of this allocator's, with layout old;
+    // new.size() >= old.size().
+    // SAFETY: a contract on the caller, as Rust's Allocator::grow.
+    // mvs: Allocator::try_resize, Allocator::resize
+    // std2: changed: two Layouts, a Result
+    unsafe fn grow(&self, p: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<u8>, AllocError> {
+        crate::panic::todo()
+    }
+
+    // grow, the new bytes zero.
+    // UNSAFE: as grow.
+    // SAFETY: a contract on the caller, as grow's.
+    unsafe fn grow_zeroed(&self, p: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<u8>, AllocError> {
+        crate::panic::todo()
+    }
+
+    // The block made smaller.
+    // UNSAFE: p must be a block of this allocator's, with layout old;
+    // new.size() <= old.size().
+    // SAFETY: a contract on the caller, as Rust's Allocator::shrink.
+    unsafe fn shrink(&self, p: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<u8>, AllocError> {
+        crate::panic::todo()
+    }
+
+    // The allocator borrowed (a container on `&A` instead of moving A in).
+    fn by_ref(&self) -> &Self
+    where
+        Self: Sized,
+    {
+        self
+    }
+
+    // The allocator with its type erased: an AnyAlloc of it (plan §2.1).
+    fn erase(&self) -> AnyAlloc<'_>
+    where
+        Self: Sized,
+    {
+        AnyAlloc::new(self)
+    }
+}
+
+// A reference to an allocator is one: containers hold `&'a Arena<P>`.
+// UNSAFE: an Allocator impl.
+// SAFETY: every block comes from *self, the referenced allocator, and goes
+// back to it; FREES is its FREES.
+unsafe impl<A: Allocator + ?Sized> Allocator for &A {
+    const FREES: bool = A::FREES;
+
+    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        (**self).allocate(layout)
+    }
+
+    unsafe fn deallocate(&self, p: NonNull<u8>, layout: Layout) {
+        // UNSAFE: deallocate's own contract.
+        // SAFETY: passed through: the caller's p and layout are A's.
+        unsafe { (**self).deallocate(p, layout) }
+    }
+}
+
+// The general-purpose heap (C's malloc): zero-sized and Copy, with no
+// public constructor. The runtime makes one and `main` receives it
+// (`fn main(gpa: Gpa)`), so a function can allocate from it only when
+// it is handed one (plan §2.0 rule 1). With --check-alloc it is the
+// checking allocator (leaks, double frees, use after free).
+#[derive(Clone, Copy)]
+pub struct Gpa {
+    sealed: (),
+}
+
+impl Gpa {
+    // Blocks given out and not freed yet (with --check-alloc; else 0).
+    // std2: changed: usize
+    pub fn live_blocks(&self) -> usize {
+        crate::panic::todo()
+    }
+
+    // Whether every block was freed (with --check-alloc; else true).
+    pub fn check_leaks(&self) -> bool {
+        crate::panic::todo()
+    }
+}
+
+// UNSAFE: an Allocator impl over C's heap.
+// SAFETY: blocks come from malloc (aligned by posix_memalign above 16)
+// and go back to free; FREES true.
+unsafe impl Allocator for Gpa {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        crate::panic::todo()
+    }
+
+    unsafe fn deallocate(&self, p: NonNull<u8>, layout: Layout) {
+        crate::panic::todo()
+    }
+}
+
+// ---- Arenas ----
+
+// A bump allocator over chunks taken from its parent P (Zig's
+// ArenaAllocator.init(child)): allocation is a pointer bump, and nothing
+// is freed one block at a time. Containers allocate through
+// `&'a Arena<P>`, which ties them to the arena; `reset(&mut self)` gives
+// every chunk's room back for reuse, safe because the exclusive borrow
+// proves nothing in the arena is live; dropping the arena gives the
+// chunks back to P. Its bump pointer is a Cell: Allocator::allocate takes
+// &self (plan §2.1).
+// mvs: Arena
+// std2: changed: generic over its parent P, which it owns (MVS: a copyable handle over a Gpa)
+pub struct Arena<P: Allocator> {
+    parent: P,
+    chunk: Cell<*mut u8>,
+    at: Cell<usize>,
+    end: Cell<usize>,
+    used: Cell<usize>,
+    allocated: Cell<usize>,
+}
+
+impl<P: Allocator> Arena<P> {
+    // An empty arena over parent; its first chunk comes with its first
+    // allocation.
+    // std2: changed: any parent P (MVS: a Gpa)
+    pub fn new_in(parent: P) -> Arena<P> {
+        crate::panic::todo()
+    }
+
+    // An arena whose first chunk holds bytes.
+    // std2: changed: usize, any parent P
+    pub fn with_capacity_in(bytes: usize, parent: P) -> Arena<P> {
+        crate::panic::todo()
+    }
+
+    // The bytes given out since it was made or reset.
+    // std2: changed: usize
+    pub fn used(&self) -> usize {
+        self.used.get()
+    }
+
+    // The bytes it holds from its parent, used or not.
+    // mvs: Arena::chunk_bytes
+    // std2: renamed
+    pub fn allocated_bytes(&self) -> usize {
+        self.allocated.get()
+    }
+
+    pub fn parent(&self) -> &P {
+        &self.parent
+    }
+
+    // Every chunk's room back for reuse (the first chunk kept, the others
+    // given back to P). Safe: `&mut self` proves no container, &T or &str
+    // in the arena is live.
+    // std2: changed: safe, &mut self (MVS: unsafe, through a raw pointer)
+    pub fn reset(&mut self) {
+        crate::panic::todo()
+    }
+
+    // x moved into the arena; a &mut to it for as long as the arena is
+    // borrowed. T must have no drop glue (`needs_drop::<T>()` false,
+    // checked at compile time): the arena never runs drops. A T holding a
+    // Vec on this arena qualifies (FREES false: plan §9.1); for drops, a
+    // TypedArena.
+    pub fn alloc<T>(&self, x: T) -> &mut T {
+        crate::panic::todo()
+    }
+
+    // A copy of s in the arena.
+    pub fn alloc_slice_copy<T: Copy>(&self, s: &[T]) -> &mut [T] {
+        crate::panic::todo()
+    }
+
+    // n values f(0), f(1), ... in the arena (no drop glue, as alloc).
+    pub fn alloc_slice_fill_with<T, F: FnMut(usize) -> T>(&self, n: usize, f: F) -> &mut [T] {
+        crate::panic::todo()
+    }
+
+    // A copy of s in the arena.
+    pub fn alloc_str(&self, s: &str) -> &mut str {
+        crate::panic::todo()
+    }
+
+    // Runs f with a scope of the arena: what f allocates in the scope is
+    // given back when f returns, while containers made before stay live
+    // (the scratch checkpoint). The scope's region is late-bound, so
+    // nothing allocated in it can leave f (`#[scoped]` is no longer
+    // needed); R cannot name it.
+    // std2: changed: FnOnce(&ArenaScope<'_, P>) (MVS: FnMut(ScopedArena))
+    pub fn scope<R, F: FnOnce(&ArenaScope<'_, P>) -> R>(&self, f: F) -> R {
+        crate::panic::todo()
+    }
+}
+
+// UNSAFE: an Allocator impl over the arena's chunks.
+// SAFETY: blocks are bumped from chunks taken from P and live until the
+// arena is reset (which needs &mut, so no block is borrowed) or dropped;
+// deallocate does nothing (FREES false).
+// mvs: Arena::impl Allocator
+unsafe impl<P: Allocator> Allocator for Arena<P> {
+    const FREES: bool = false;
+
+    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        crate::panic::todo()
+    }
+
+    unsafe fn deallocate(&self, p: NonNull<u8>, layout: Layout) {}
+}
+
+// Gives every chunk back to P (MVS's free_all).
+impl<P: Allocator> Drop for Arena<P> {
+    fn drop(&mut self) {
+        crate::panic::todo()
+    }
+}
+
+// A scope of an arena (Arena::scope) or of any parent (arena_scope): an
+// allocator whose blocks are all given back when the scope ends. 's is
+// the scope's region, invariant, so a container on `&'s ArenaScope<'s,
+// P>` cannot outlive it.
+// mvs: ScopedArena
+// std2: renamed
+pub struct ArenaScope<'s, P: Allocator> {
+    home: &'s Arena<P>,
+    chunk: Cell<*mut u8>,
+    at: Cell<usize>,
+    end: Cell<usize>,
+    used: Cell<usize>,
+    region: PhantomData<Cell<&'s ()>>,
+}
+
+impl<'s, P: Allocator> ArenaScope<'s, P> {
+    // The bytes given out in this scope.
+    // mvs: ScopedArena::used
+    // std2: changed: usize
+    pub fn used(&self) -> usize {
+        self.used.get()
+    }
+
+    // As Arena::alloc, in the scope.
+    pub fn alloc<T>(&self, x: T) -> &mut T {
+        crate::panic::todo()
+    }
+
+    pub fn alloc_slice_copy<T: Copy>(&self, s: &[T]) -> &mut [T] {
+        crate::panic::todo()
+    }
+
+    pub fn alloc_str(&self, s: &str) -> &mut str {
+        crate::panic::todo()
+    }
+
+    // A scope inside this one.
+    // mvs: ScopedArena::scope
+    // std2: changed: FnOnce(&ArenaScope<'_, P>)
+    pub fn scope<R, F: FnOnce(&ArenaScope<'_, P>) -> R>(&self, f: F) -> R {
+        crate::panic::todo()
+    }
+}
+
+// UNSAFE: an Allocator impl over the scope's chunks.
+// SAFETY: blocks are bumped from chunks the scope took from its arena's
+// spare chunks or parent; they are given back when the scope ends, and
+// the scope's region keeps every block's borrow inside it; FREES false.
+// mvs: ScopedArena::impl Allocator
+unsafe impl<'s, P: Allocator> Allocator for ArenaScope<'s, P> {
+    const FREES: bool = false;
+
+    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        crate::panic::todo()
+    }
+
+    unsafe fn deallocate(&self, p: NonNull<u8>, layout: Layout) {}
+}
+
+impl<'s, P: Allocator> Drop for ArenaScope<'s, P> {
+    fn drop(&mut self) {
+        crate::panic::todo()
+    }
+}
+
+// Runs f with a scope over parent (an arena made for the call): what f
+// allocates is freed when it returns. Over any allocator, a Gpa as much
+// as an arena or a FixedBuf.
+// std2: changed: any parent, by reference; FnOnce(&ArenaScope<'_, &P>) (MVS: a Gpa, FnMut(ScopedArena))
+pub fn arena_scope<'p, P: Allocator, R, F: FnOnce(&ArenaScope<'_, &'p P>) -> R>(parent: &'p P, f: F) -> R {
+    crate::panic::todo()
+}
+
+// An arena of T's that runs their drops at its own drop: for T's with
+// drop glue (Arena::alloc refuses those). Its chunks come from P.
+pub struct TypedArena<T, P: Allocator> {
+    parent: P,
+    chunks: Cell<*mut u8>,
+    at: Cell<*mut T>,
+    end: Cell<*mut T>,
+    len: Cell<usize>,
+    marker: PhantomData<T>,
+}
+
+impl<T, P: Allocator> TypedArena<T, P> {
+    pub fn new_in(parent: P) -> TypedArena<T, P> {
+        crate::panic::todo()
+    }
+
+    // x moved in; a &mut to it for as long as the arena is borrowed.
+    pub fn alloc(&self, x: T) -> &mut T {
+        crate::panic::todo()
+    }
+
+    // The items moved in, side by side.
+    pub fn alloc_extend<I: IntoIterator<Item = T>>(&self, iter: I) -> &mut [T] {
+        crate::panic::todo()
+    }
+
+    // How many T's it holds.
+    pub fn len(&self) -> usize {
+        self.len.get()
+    }
+}
+
+// Drops every T, then gives the chunks back to P.
+impl<T, P: Allocator> Drop for TypedArena<T, P> {
+    fn drop(&mut self) {
+        crate::panic::todo()
+    }
+}
+
+// A bump allocator over memory it is lent (`FixedBuf::new(&mut buf)`, buf
+// a local array): no heap at all; out of room is an AllocError. Its
+// counters are Cells (allocate takes &self). An arena over one
+// (`Arena<&FixedBuf<'b>>`) allocates on the stack.
+// mvs: FixedBuf
+// std2: changed: a region 'b, the lent memory's (MVS: #[views(mem)])
+pub struct FixedBuf<'b> {
+    start: *mut u8,
+    len: usize,
+    at: Cell<usize>,
+    mem: PhantomData<&'b mut [u8]>,
+}
+
+impl<'b> FixedBuf<'b> {
+    // An allocator over mem, for as long as mem is lent.
+    // std2: changed: takes &'b mut [u8]
+    pub fn new(mem: &'b mut [u8]) -> FixedBuf<'b> {
+        crate::panic::todo()
+    }
+
+    // The bytes given out since it was made or reset.
+    // std2: changed: usize
+    pub fn used(&self) -> usize {
+        self.at.get()
+    }
+
+    // The bytes it can give out in all.
+    pub fn capacity(&self) -> usize {
+        self.len
+    }
+
+    // All its room back. Safe: `&mut self` proves no block is borrowed.
+    // std2: changed: safe, &mut self (MVS: unsafe, through a raw pointer)
+    pub fn reset(&mut self) {
+        self.at.set(0)
+    }
+}
+
+// UNSAFE: an Allocator impl over lent memory.
+// SAFETY: blocks are bumped from mem, which outlives 'b and every
+// borrow of the FixedBuf; deallocate does nothing (FREES false).
+// mvs: FixedBuf::impl Allocator
+unsafe impl<'b> Allocator for FixedBuf<'b> {
+    const FREES: bool = false;
+
+    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        crate::panic::todo()
+    }
+
+    unsafe fn deallocate(&self, p: NonNull<u8>, layout: Layout) {}
+}
+
+// Any allocator, its type erased: a data pointer and the allocator's
+// functions, Copy, five words. Made from any &'a A (`a.erase()`,
+// `AnyAlloc::new(&a)`); itself an Allocator, so `Vec<T, AnyAlloc<'a>>`
+// and a library taking `a: AnyAlloc<'_>` are compiled once for every
+// allocator (decision 9; Device<AnyAlloc<'a>>, decision 17). FREES is
+// true: it cannot know what it erased.
+pub struct AnyAlloc<'a> {
+    data: *const u8,
+    allocate_fn: fn(*const u8, Layout) -> Result<NonNull<u8>, AllocError>,
+    // UNSAFE: the erased allocator's deallocate, unsafe as the trait's.
+    // SAFETY: called only from AnyAlloc's own deallocate, with its contract.
+    deallocate_fn: unsafe fn(*const u8, NonNull<u8>, Layout),
+    // UNSAFE: the erased allocator's grow, unsafe as the trait's.
+    // SAFETY: called only from AnyAlloc's own grow, with its contract.
+    grow_fn: unsafe fn(*const u8, NonNull<u8>, Layout, Layout) -> Result<NonNull<u8>, AllocError>,
+    // UNSAFE: the erased allocator's shrink, unsafe as the trait's.
+    // SAFETY: called only from AnyAlloc's own shrink, with its contract.
+    shrink_fn: unsafe fn(*const u8, NonNull<u8>, Layout, Layout) -> Result<NonNull<u8>, AllocError>,
+    marker: PhantomData<&'a ()>,
+}
+
+impl<'a> AnyAlloc<'a> {
+    // a, erased: valid for as long as a is borrowed.
+    pub fn new<A: Allocator>(a: &'a A) -> AnyAlloc<'a> {
+        crate::panic::todo()
+    }
+}
+
+impl<'a> Clone for AnyAlloc<'a> {
+    fn clone(&self) -> AnyAlloc<'a> {
+        *self
+    }
+}
+
+impl<'a> Copy for AnyAlloc<'a> {}
+
+impl<'a, A: Allocator> From<&'a A> for AnyAlloc<'a> {
+    fn from(a: &'a A) -> AnyAlloc<'a> {
+        AnyAlloc::new(a)
+    }
+}
+
+// UNSAFE: an Allocator impl through the erased functions.
+// SAFETY: each call goes to the erased allocator's own function with its
+// data pointer, valid for 'a; that allocator's impl is sound by its own
+// SAFETY comment.
+unsafe impl<'a> Allocator for AnyAlloc<'a> {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        (self.allocate_fn)(self.data, layout)
+    }
+
+    unsafe fn deallocate(&self, p: NonNull<u8>, layout: Layout) {
+        // UNSAFE: the erased allocator's deallocate.
+        // SAFETY: passed through: the caller's p and layout are its.
+        unsafe { (self.deallocate_fn)(self.data, p, layout) }
+    }
+
+    unsafe fn grow(&self, p: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<u8>, AllocError> {
+        // UNSAFE: the erased allocator's grow.
+        // SAFETY: passed through, as deallocate.
+        unsafe { (self.grow_fn)(self.data, p, old, new) }
+    }
+
+    unsafe fn shrink(&self, p: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<u8>, AllocError> {
+        // UNSAFE: the erased allocator's shrink.
+        // SAFETY: passed through, as deallocate.
+        unsafe { (self.shrink_fn)(self.data, p, old, new) }
+    }
+}
+
+impl<'a> Debug for AnyAlloc<'a> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        f.write_str("AnyAlloc")
+    }
+}
