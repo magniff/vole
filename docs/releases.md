@@ -154,6 +154,13 @@ The front's side stream (front272b):
   instantiated for each length the program uses (`impl<T: Clone>
   Clone for [T; N]`, `Vec::from_in([1, 2, 3], gpa)`), with N a `usize`
   constant inside it; std2's root check has no `edition.later` left.
+- M2's gaps: a character literal is no longer accepted where a `u32`
+  goes (`error distinct.mix`, rustc E0308; `'a' as u32` converts, and
+  a `char` pattern still matches by scalar); the probe's autoref is one
+  `&`, so a `&self` method of an `impl Tr for &S` is not found on an
+  `S` (rustc E0599); an inherent constant of a generic impl (`impl<T>
+  W<T> { const N: .. }`) is read, `W::<i64>::N` and `Self::N`, its
+  type and value with the impl's parameters bound.
 
 Closures in full (clos272):
 
