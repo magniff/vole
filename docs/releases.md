@@ -141,6 +141,15 @@ The front (front272):
   negative. std2's root check: edition.later 254 -> 123 after the traits,
   -> 7 after the types (5 of them `auto_trait`).
 
+The front's side stream (front272b):
+
+- `unsafe fn` types carry their unsafety (F19.3): in the rust edition an
+  `unsafe fn` (or a C function) named as a value has the type `unsafe
+  fn(..)` without `unsafe` around it, a call through one outside an
+  `unsafe` block is `error unsafe` (rustc E0133), and a safe fn coerces
+  to the unsafe type, not the reverse (E0308). The fn type's ABI bit is
+  as before.
+
 Closures in full (clos272):
 
 - A rust-edition closure has a kind, `Fn`, `FnMut` or `FnOnce`
