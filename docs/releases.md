@@ -106,19 +106,22 @@ The rust edition's std, its API as a spec tree (std270):
   with elided regions (no `for<>`); and the allocators: Allocator in
   Rust's shape with `FREES`, Gpa, Arena<P> with a safe `reset(&mut
   self)`, ArenaScope, TypedArena<T, P>, FixedBuf<'b>, AnyAlloc<'a>.
+- A trait's impls for the primitive types are the compiler's, as MVS's
+  are: `#[builtin_impls(i8, ..., bool)]` on the trait (42 traits), as
+  `#[array_builtin(N)]` is for arrays; both wait for 0.27.2.
 - `compiler/std2/checklist.tsv` (tools/std2-checklist.py) lists every item
-  against MVS's std: 1,376 items, of which 297 kept, 15 renamed, 162
-  changed and 902 new, and 70 MVS items gone, each with its replacement;
+  against MVS's std: 1,414 items, of which 297 kept, 15 renamed, 162
+  changed and 940 new, and 70 MVS items gone, each with its replacement;
   every MVS item of the modules in scope is accounted for. Each item says
-  what the real check makes of it (`typecheck.txt`, the front's 440
-  errors on the tree, mapped to their items): 1,012 typecheck, 142 have
-  only `edition.later` errors and 222 a plain one. It names the features
+  what the real check makes of it (`typecheck.txt`, the front's 480
+  errors on the tree, mapped to their items): 1,010 typecheck, 184 have
+  only `edition.later` errors and 220 a plain one. It names the features
   it waits for, the `edition.later` codes (where_bound, char, FnOnce,
-  supertraits, impls for references, ...: 0.27.2) and, for a plain error,
-  the front gap it shows (an impl parameter fixed only by the trait, std2
-  checked beside MVS's std, a trait parameter's default in an impl
-  header, ...: in `features.tsv`, no release yet), and the gate-1 test
-  that will cover it.
+  supertraits, impls for references, the primitives' impls, ...:
+  0.27.2) and, for a plain error, the front gap it shows (an impl
+  parameter fixed only by the trait, std2 checked beside MVS's std, a
+  trait parameter's default in an impl header, ...: in `features.tsv`,
+  no release yet), and the gate-1 test that will cover it.
 - `compiler/std2/rewrite.tsv` is the std part of `fix --edition rust`'s
   table (0.27.3): 248 rows for 233 MVS items, each call, type name or
   impl shape that changes, chosen by type (`v.get(i)` is `v[i]` for a
@@ -158,7 +161,7 @@ The rust edition's front (ed270):
   blanket impls and impls on an instance, `#[array_builtin(N)]`, `let
   x;`, a write through `*const T`, qualified paths `<T as Tr>::X`, auto
   traits `Send` and `Sync`, `#[builtin_impls(..)]`, ...); the item it is
-  in is left out. std2 checked (`--max-errors=0`): 212 edition.later, 126
+  in is left out. std2 checked (`--max-errors=0`): 254 edition.later, 126
   plain errors left, of which 61 are two traits' methods of one name on a
   type (`fmt` of Display and Debug: method_name_clash, 0.27.2).
 - Fixed for MVS too: a method's `where` on its impl's parameter bounded
@@ -174,6 +177,35 @@ The rust edition's front (ed270):
   warning out, as rustc's `-A`; `--max-errors=N` (0: every error);
   `--edition rust`. `volec guide edition`,
   and `volec explain` for the four codes.
+
+The compiler's last exempt statics, Ctx's raw tables and its task contexts (left270):
+
+- SYMS and TYPES (the symbols, their hash tables, the types, their lists
+  and hash) are fields of `base::ctx::Ctx`. Each is read through a lookup
+  that writes nothing: find_type, a symbol's find_sym, layouts made on the
+  main thread by `lay_out_types` before code generation, the halves of
+  256-bit vectors, and the runtime's symbols made in prepare_tasks. The
+  tasks only read them. A symbol's text is a pointer and a length, read by
+  `base::sym_text`. The alloc exemption (`is_exempt_static`) is deleted:
+  no static is exempt. The compiler's statics went from 188 to 177.
+- `volec refactor table Ctx.x` takes a struct's field `x: *T`, with its
+  count and capacity fields, to `Vec<T, A>`, A being the struct's last
+  type parameter (tests/refactor/table270.t). Ctx's structs, fns, statics,
+  variants, modules, locals, relocs and consts are Vecs, and `fix --only
+  unneeded-unsafe` took away the 267 unsafe blocks their indexing needed.
+  The compiler's unjustified unsafe sites went from 3,054 to 2,788.
+- `fix --only rawptr` takes a call into a let before its statement when
+  it is nested in the arguments of another call given the same local
+  (`ir_make(cx, ir_val(cx, ..))`, where both inout would be own.conflict).
+  It does the same for an argument nesting such calls, an if's condition,
+  an operator's operands (the left of `&&` and `||`) and a place's index.
+  A run that takes some says so and decides no parameter; the next run
+  decides them. rawptr-list names the call that keeps a parameter raw
+  (`at FILE:LINE`) (tests/refactor/rawptr0270.t). Run over compiler/src,
+  it made 121 task contexts `inout FnCtx`: `cx: *FnCtx` went from 143 to
+  24. The 17 left for nested-call (ir_val, ir_arg and ir_operand among
+  them) are called on the right of `&&` or `||`, or beside a borrowed part
+  of the context. Unjustified unsafe went from 2,788 to 2,776.
 
 ### What's new in 0.26.5
 
