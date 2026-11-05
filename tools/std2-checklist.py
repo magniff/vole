@@ -14,8 +14,8 @@ items wait for it.
 What feeds it, in an item's comment (and an impl's or trait's, for all its
 items):
   // later: NAME, NAME     features (compiler/std2/features.tsv) it waits for
-  // mvs: PATH             the MVS item it replaces (Owner::name or name), when
-                           its owner or name differs
+  // mvs: PATH, PATH       the MVS items it replaces (Owner::name or name), when
+                           an owner or a name differs (a Vec method now [T]'s)
   // std2: renamed         its name changed (with `// mvs:`)
   // std2: changed: WHY    its meaning or types changed beyond the mapping of
                            std.vl's header (receivers, views, i64 -> usize)
@@ -128,14 +128,14 @@ def parse_impl_header(h):
 
 
 def markers(comment):
-    later, mvs, status, why = [], None, None, ""
+    later, mvs, status, why = [], [], None, ""
     for line in comment:
         m = re.match(r"\s*//\s*later:\s*(.*)$", line)
         if m:
             later += [x.strip() for x in m.group(1).split(",") if x.strip()]
-        m = re.match(r"\s*//\s*mvs:\s*(\S+)", line)
+        m = re.match(r"\s*//\s*mvs:\s*(.*)$", line)
         if m:
-            mvs = m.group(1)
+            mvs += [x.strip() for x in m.group(1).split(",") if x.strip()]
         m = re.match(r"\s*//\s*std2:\s*(renamed|changed)(?::\s*(.*))?$", line)
         if m:
             status = m.group(1)
@@ -144,6 +144,7 @@ def markers(comment):
 
 
 def auto_later(sig, in_trait, kind):
+    """in_trait: an item of a trait or impl block (an assoc const or type)."""
     t = []
     if re.search(r"\bchar\b", sig):
         t.append("char")
@@ -155,7 +156,7 @@ def auto_later(sig, in_trait, kind):
         t.append("qualified_path")
     if kind == "const" and in_trait:
         t.append("assoc_const")
-    if kind == "type" and in_trait and re.match(r"\s*type\s+\w+\s*:", sig):
+    if kind == "type" and in_trait and re.match(r"\s*type\s+\w+\s*:(?!\s*\?Sized\s*(;|$))", sig):
         t.append("assoc_bounds")
     return t
 
@@ -204,6 +205,7 @@ def read_file(path, module, rel):
         lines = fh.read().split("\n")
     items = []
     comment = []
+    derive = False
     block = None  # dict(kind=trait|impl|traitimpl, owner, trait, later, ...)
     order = 0
     for i, line in enumerate(lines):
@@ -211,6 +213,8 @@ def read_file(path, module, rel):
             comment.append(line)
             continue
         if line.strip().startswith("#["):
+            if line.strip().startswith("#[derive("):
+                derive = True
             continue
         if block is not None and line.startswith("}"):
             block = None
@@ -224,6 +228,7 @@ def read_file(path, module, rel):
                 bl, bm, bs, bw = markers(comment)
                 if owner_text.startswith("&"):
                     bl.append("impl_for_ref")
+                bl += auto_later(header, False, "impl")
                 block = dict(kind="traitimpl" if trait else "impl", owner=owner, trait=trait, later=bl)
                 if trait:
                     order += 1
@@ -239,6 +244,8 @@ def read_file(path, module, rel):
                 kind, name = m.group(1), m.group(2)
                 sig = signature(lines, i)
                 bl, bm, bs, bw = markers(comment)
+                if derive:
+                    bl.append("rust_derives")
                 order += 1
                 items.append(dict(module=module, owner=None, name=name, kind=kind, sig=sig,
                                   later=sorted(set(bl + auto_later(sig, False, kind))), mvs=bm, status=bs, why=bw,
@@ -256,13 +263,14 @@ def read_file(path, module, rel):
                 order += 1
                 items.append(dict(module=module, owner=block["owner"], name=name, kind=kind, sig=sig,
                                   later=sorted(set(bl + block["later"] +
-                                                   auto_later(sig, block["kind"] == "trait", kind))),
+                                                   auto_later(sig, True, kind))),
                                   mvs=bm, status=bs, why=bw, order=order, file=rel, line=i + 1))
         comment = []
+        derive = False
     return items
 
 
-def mvs_items(volec):
+def mvs_items(volec, wanted_traits):
     """{(owner, name)} of MVS's std and {key: (module, kind)}."""
     try:
         r = subprocess.run([volec, "query", "items", "std", "--budget", "10000000"], capture_output=True,
@@ -304,11 +312,14 @@ def mvs_items(volec):
                 keys.setdefault((owner, m.group(1)), (module, "method"))
     # a trait's methods (not items of their own in `query items`)
     for module, t in traits:
+        if t not in wanted_traits:
+            continue
         r = subprocess.run([volec, "query", "show", f"{module}::{t}"], capture_output=True, text=True, cwd=TOP,
                            timeout=60)
         for line in r.stdout.split("\n"):
-            m = re.match(r"\s+(?:unsafe\s+)?fn\s+(\w+)", line)
-            if m:
+            if line.lstrip().startswith("//"):
+                continue
+            for m in re.finditer(r"\bfn\s+(\w+)", line):
                 keys.setdefault((t, m.group(1)), (module, "trait method"))
     return keys
 
@@ -360,20 +371,21 @@ def main():
             die(f"unknown argument {a}")
     feats = {r[0]: r[1] for r in read_tsv("features.tsv")}
     items = read_tree()
-    mvs = mvs_items(volec)
+    mvs = mvs_items(volec, SCOPE_OWNERS | {it["name"] for it in items if it["kind"] == "trait"})
     used = set()
     rows = []
     for it in items:
         own = it["owner"]
         auto = (OWNER_ALIASES.get(own, own) if own else None, it["name"])
-        mk = key_of(it["mvs"]) if it["mvs"] else None
         status = it["status"]
         src = ""
-        if mk:
-            if mk not in mvs:
-                die(f"{it['file']}:{it['line']}: `// mvs: {it['mvs']}` names no MVS item")
-            used.add(mk)
-            src = it["mvs"]
+        if it["mvs"]:
+            for p in it["mvs"]:
+                mk = key_of(p)
+                if mk not in mvs:
+                    die(f"{it['file']}:{it['line']}: `// mvs: {p}` names no MVS item")
+                used.add(mk)
+            src = ",".join(it["mvs"])
             status = status or "kept"
         elif auto in mvs:
             used.add(auto)
@@ -392,10 +404,19 @@ def main():
         if len(g) < 3:
             die(f"gone.tsv: a line needs MODULE, MVS item and replacement: {g}")
         k = key_of(g[1])
-        if k not in mvs:
+        if k[1] == "*":
+            # Owner::* : the type and every item of it that no std2 item names
+            keys = sorted(x for x in mvs if x[0] == k[0] and x not in used) + \
+                ([(None, k[0])] if (None, k[0]) in mvs and (None, k[0]) not in used else [])
+            if not keys:
+                die(f"gone.tsv: {g[1]} names no MVS item")
+        elif k not in mvs:
             die(f"gone.tsv: {g[1]} is no MVS item")
-        used.add(k)
-        rows.append([g[0], "-", "-", "gone", g[1], "", "", "", g[2], ""])
+        else:
+            keys = [k]
+        for k in keys:
+            used.add(k)
+            rows.append([g[0], "-", "-", "gone", (f"{k[0]}::" if k[0] else "") + k[1], "", "", "", g[2], ""])
     # completeness: in-scope MVS items no line accounts for
     missing = sorted(f"{o + '::' if o else ''}{n} ({m})" for (o, n), (m, k) in mvs.items()
                      if (o in SCOPE_OWNERS or (o is None and m in SCOPE_MODULES and k == "fn"))
