@@ -176,6 +176,9 @@ Closures in full (clos272):
   X {}` and the new `impl !Send for X {}` vouch for a type; a bound `T:
   Send` that fails is `sync.not_send` (`sync.not_sync`), naming the
   chain to the part that fails. 0.27.1 reported `edition.later`.
+- A move through a pattern's binding (`let (a, n) = t;`, then `t.0`)
+  gets `try: ... 'let (ref a, n) = t;'`, a borrow of the part, where it
+  got `.clone()` inside the pattern, which does not parse.
 - `--print-effects` leaves out the drop shims, which it printed as
   `(unknown)` (K-I7: nothing targets them, so nothing was masked).
 
