@@ -1847,9 +1847,14 @@ structurally by `front/threads.vl` with Rust's rules:
   `Send`); `X_C` adds nothing.
 std2's own types follow from these and from std2's vouches (AT2):
 `UnsafeCell<T>` and `Cell<T>` are `Send` iff `T: Send` and never
-`Sync`; `Mutex<T>` is `Send` and `Sync` iff `T: Send`; `MutexGuard<'a,
-T>` is never `Send`; the atomics are both; the containers by their
-type and allocator arguments; `&'a Arena<P>` is not `Sync`.
+`Sync`; the containers by their type and allocator arguments; `&'a
+Arena<P>` is not `Sync`. std2 has no `sync` module in 0.27.2 (front-rust.md
+Z3.1: its atomics are private `thread` functions lowered by key, and
+`std::sync` is 0.27.3's); when it lands, its vouches are Rust's:
+`Mutex<T>` `Send` and `Sync` iff `T: Send`, `MutexGuard<'a, T>` never
+`Send`, the atomic types both. No AT rule reads a compiler-known item
+(Z3.1's keys): `Send`, `Sync` and `Fn*` are the compiler's own names
+(Z2), and AT6 works by std2's signatures.
 `threads.vl`'s name list (`vouched_container`) and 0.21's view
 exclusion (`&T` never `Send`) are MVS's: in the rust edition how long a
 reference lasts is a region bound (`'static`, `'scope`), not a `Send`
