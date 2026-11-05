@@ -10,6 +10,7 @@
 | one autoref | F6.2 | fd114bcd | rust_f_f6_autoref_self_err |
 | generic impls' consts | F3.2 | fd114bcd | rust_f_f3_generic_const_ok/_err |
 | attr.builtin outside std2 | F15.1 | left for the switch | — |
+| the probe is rustc's | F0.5, F6.2 | 52698d14 | rust_f_f6_probe_ok, rust_f_f6_probe_ref_ok, rust_f_f6_probe_err; rust_f_f6_ref_ok flipped to 1 |
 
 Each passed `premerge: ok` and `tests/affected.sh`. std2's root check:
 edition.later 2 -> 0 after F15.3.
@@ -28,10 +29,15 @@ edition.later 2 -> 0 after F15.3.
   lengths unify), which is right for a template.
 - A char literal is read as its u32 scalar only while CHAR_SCALAR is
   set (a `char` pattern's literals).
-- Open: F6.2's probe matches by "methods of τᵢ", not rustc's receiver
-  type, so `r.tag()` on `r: &S` picks `<&S as Tag>::tag` (`&self`) over
-  `S::tag(&self)`; rustc picks the latter (rust_f_f6_ref_ok encodes
-  vole's answer). Reported for the spec.
+- The probe (F6.2) asks `probe_first` / `autoref_first` only where a
+  method of S and one of `&S` / `&mut S` meet; the steps are measured
+  from the receiver's type as written (before synth_method strips
+  `&&S` to `&S`). `probe_step` reads only reference derefs: a `Deref`
+  target or a view gets -1 and the old order. If a later probe change
+  reaches `Deref` steps, extend probe_step's chain rather than add
+  another special case to synth_method. Every case in
+  rust_f_f6_probe_* was checked with rustc; rerun them against rustc
+  when the probe changes.
 - Open: attr.builtin outside std2 needs std2 loaded to keep a positive
   case; do it with the switch and move rust_f_f15_builtin_ok into std2.
 
