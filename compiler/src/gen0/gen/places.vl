@@ -34,8 +34,7 @@ use crate::front::types::{
     tuple_offset, type_elem, type_size, variant_field, variant_field_offset,
 };
 use crate::gen0::gen::{
-    CUR_FN, FRAME_SIZE, OVERALIGNED, RESULT_SLOT, RETURN_LABEL, STMT_POS, alloc_slot,
-    alloc_slot_for, fn_is_global, fn_symbol_prefix, gen_main_arch_init, gen_params,
+    alloc_slot, alloc_slot_for, fn_is_global, fn_symbol_prefix, gen_main_arch_init, gen_params,
     gen_return_value, load_from_x0, pop_second_operand, stmt_loc, store_reg_to_frame,
     store_to_frame,
 };
@@ -49,7 +48,7 @@ use crate::gen0::gen::vector::{
     gen_vecop, gen_vector_binary, gen_vector_negate, vector_assign_lanes, vector_value_to_slot,
 };
 use crate::gen0::target::{
-    DEPTH, R_ACC, R_ADDR, R_RESULT, R_SECOND, arith_panic_kind, emit_add_imm, emit_check_imm,
+    R_ACC, R_ADDR, R_RESULT, R_SECOND, arith_panic_kind, emit_add_imm, emit_check_imm,
     emit_checked_binary, emit_compare, emit_compare_jump, emit_copy, emit_epilogue, emit_frame_addr,
     emit_frame_reserve, emit_function_start, emit_index_addr, emit_int_binary, emit_jump,
     emit_jump_if_zero, emit_label, emit_load, emit_load_float, emit_load_imm, emit_load_reg,
@@ -75,42 +74,6 @@ use crate::places::ir::{
 use crate::places::keep::free_body;
 use crate::places::shim::drop_shim_fn;
 
-// The AST nodes bound to IR operands, as triples (node, operand list,
-// index): gen_expr of such a node generates the operand (gen_bound).
-pub static var G_BOUND: Vec<i64, Comp> = Vec::new_in(Comp {});
-
-// Per local of the body held: its frame slot (-1: none: void, or a
-// static). Per block: its label, and the block it forwards to.
-static var SLOT: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var LABEL: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var FWD: Vec<i64, Comp> = Vec::new_in(Comp {});
-// The block emitted after the current one (-1: none), so that a jump to
-// it is left out.
-static var NEXT: i64 = -1;
-// The emitted blocks in order (gen_blocks); the slots share_slots hands
-// out, by size and alignment, and the last mention of their last user.
-static var ORDER: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var POOL_SLOT: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var POOL_SIZE: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var POOL_ALIGN: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var POOL_LAST: Vec<i64, Comp> = Vec::new_in(Comp {});
-
-// Per local: its mentions in the body (count_mentions).
-static var MENTIONS: Vec<i64, Comp> = Vec::new_in(Comp {});
-// Per local: whether the accumulator carries it (find_acc_only): no slot,
-// written and read in the accumulator (write_place, gen_place_value).
-static var ACC_ONLY: Vec<bool, Comp> = Vec::new_in(Comp {});
-// Per emitted block: its predecessors, a list (P_HEAD, then P_NEXT) of
-// the blocks in P_FROM.
-static var P_HEAD: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var P_NEXT: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var P_FROM: Vec<i64, Comp> = Vec::new_in(Comp {});
-// Per block: whether it has nothing but a return (return_block), and the
-// local the accumulator holds at its start (-1: none known; every
-// predecessor's last statement wrote it, or each one's switch read it).
-static var RET_BLOCK: Vec<bool, Comp> = Vec::new_in(Comp {});
-static var START_HOLD: Vec<i64, Comp> = Vec::new_in(Comp {});
-
 // Function f (its Fn node: item) generated from its kept body: false
 // when it has none (or one take_body leaves to the AST walk), or is an
 // atomic intrinsic.
@@ -130,9 +93,9 @@ pub fn gen_places_function(cx: inout FnCtx, item: i64, f: i64, pbody: inout Body
 // Generates the operand node n is bound to; false when it is not bound.
 pub fn gen_bound(cx: inout FnCtx, n: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> bool {
     var k = 0;
-    while k < G_BOUND.len() as i64 {
-        if G_BOUND[k] == n {
-            gen_op(&cx, G_BOUND[k + 1], G_BOUND[k + 2], pbody, &pcx);
+    while k < pcx.g_bound.len() as i64 {
+        if pcx.g_bound[k] == n {
+            gen_op(&cx, pcx.g_bound[k + 1], pcx.g_bound[k + 2], pbody, &pcx);
             return true;
         }
         k += 3;
@@ -144,17 +107,17 @@ pub fn gen_bound(cx: inout FnCtx, n: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp
 // constant, or a unit (nothing: its expression, a call, ran in the
 // statement before; generating it again would run it twice). A check's
 // site is left to the AST's constant (gen_expr).
-fn bind(e: i64, ops: i64, i: i64) {
+fn bind(e: i64, ops: i64, i: i64, pcx: inout Ctx<Comp>) {
     if crate::middle::lower::places::is_site(e) {
         return;
     }
-    G_BOUND.push(e);
-    G_BOUND.push(ops);
-    G_BOUND.push(i);
+    pcx.g_bound.push(e);
+    pcx.g_bound.push(ops);
+    pcx.g_bound.push(i);
 }
 
-fn unbind() {
-    G_BOUND.clear();
+fn unbind(pcx: inout Ctx<Comp>) {
+    pcx.g_bound.clear();
 }
 
 // ---- The function ----
@@ -168,60 +131,60 @@ fn gen_body(cx: inout FnCtx, item: i64, f: i64, pbody: Body<Comp>, pcx: inout Ct
     // LOCAL_COUNT before LOCALS is written; cx points at compile_program's live
     // FnCtx; code generation is single-threaded.
     unsafe {
-        CUR_FN = f;
+        pcx.gen_cur_fn = f;
         buf_clear(cx.code);
-        DEPTH = 0;
-        FRAME_SIZE = 0;
-        OVERALIGNED.count = 0;
-        RETURN_LABEL = new_label(&cx);
-        STMT_POS = -1;
+        pcx.depth = 0;
+        pcx.frame_size = 0;
+        pcx.overaligned.count = 0;
+        pcx.return_label = new_label(&cx);
+        pcx.stmt_pos = -1;
         dbg_function_begin(&cx, f, fn_symbol_prefix(f), NODES[item].start);
         emit_function_start(&cx, fn_symbol_prefix(f), FNS[f].name, fn_is_global(f));
         let ret = FNS[f].ret;
-        RESULT_SLOT = 0;
+        pcx.result_slot = 0;
         if returns_through_pointer(&cx, ret) {
-            RESULT_SLOT = alloc_slot(8, 8);
-            emit_frame_addr(&cx, R_ADDR, RESULT_SLOT);
+            pcx.result_slot = alloc_slot(8, 8, &pcx);
+            emit_frame_addr(&cx, R_ADDR, pcx.result_slot, pcx);
             emit_store(&cx, TY_U64, R_RESULT, R_ADDR);
         }
-        gen_params(&cx, item, f, pcx);
+        gen_params(&cx, item, f, &pcx);
         gen_main_arch_init(&cx, f, pcx);
         let n = local_count(pbody);
-        SLOT.clear();
+        pcx.slot.clear();
         for _ in 0..n {
-            SLOT.push(-1);
+            pcx.slot.push(-1);
         }
         for i in 0..FNS[f].param_count {
             let ast = NODES[child(item, i, pcx)].x;
             if i + 1 < n && ast >= 0 && !is_void(fn_param(f, i)) {
-                SLOT[i + 1] = LOCALS[ast].offset;
+                pcx.slot[i + 1] = LOCALS[ast].offset;
             }
         }
         forward_blocks(pbody, &pcx);
         scan_locals(pbody, &pcx);
         for l in 0..n {
-            let ty = local_type(l);
-            if has_flag(l, LF_STATIC, pbody) || is_void(ty) || ty == TY_NEVER || ACC_ONLY[l] {
+            let ty = local_type(l, pcx);
+            if has_flag(l, LF_STATIC, pbody) || is_void(ty) || ty == TY_NEVER || pcx.acc_only[l] {
                 continue;
             }
-            if SLOT[l] < 0 && !shares_slot(l, pbody)
-                && (MENTIONS[l] > 0 || pbody.locals[l].src >= 0) {
-                SLOT[l] = alloc_slot_for(ty);
+            if pcx.slot[l] < 0 && !shares_slot(l, pbody, pcx)
+                && (pcx.mentions[l] > 0 || pbody.locals[l].src >= 0) {
+                pcx.slot[l] = alloc_slot_for(ty, &pcx);
             }
             let ast = pbody.locals[l].src;
             if ast >= 0 && ast < LOCAL_COUNT {
-                LOCALS[ast].offset = SLOT[l];
+                LOCALS[ast].offset = pcx.slot[l];
             }
         }
-        share_slots(pbody);
+        share_slots(pbody, &pcx);
         gen_blocks(&cx, pbody, &pcx);
-        emit_label(&cx, RETURN_LABEL);
+        emit_label(&cx, pcx.return_label);
         if is_void(ret) && FNS[f].name == crate::gen0::gen::MAIN_SYM {
             // `main` without a result exits with 0.
             emit_load_imm(&cx, R_ACC, 0);
         }
         emit_epilogue(&cx);
-        emit_frame_reserve(&cx, FRAME_SIZE);
+        emit_frame_reserve(&cx, pcx.frame_size);
         buf_bytes(cx.asm, buf_slice(cx.code));
         dbg_function_end(&cx);
     }
@@ -230,34 +193,34 @@ fn gen_body(cx: inout FnCtx, item: i64, f: i64, pbody: Body<Comp>, pcx: inout Ct
 // The blocks in reverse postorder, each its label, its statements and
 // its terminator.
 fn gen_blocks(cx: inout FnCtx, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
-    LABEL.clear();
+    pcx.label.clear();
     for _ in 0..block_count(pbody) {
-        LABEL.push(0);
+        pcx.label.push(0);
     }
     for i in 0..pbody.rpo.len() {
         let b = pbody.rpo[i];
-        if FWD[b] == b {
-            LABEL[b] = new_label(&cx);
+        if pcx.gen0_fwd[b] == b {
+            pcx.label[b] = new_label(&cx);
         }
     }
     // (the emitted blocks, in order: not a block only an inlined return
     // reached)
-    let first = FWD[pbody.rpo[0]];
-    ORDER.clear();
+    let first = pcx.gen0_fwd[pbody.rpo[0]];
+    pcx.order.clear();
     for i in 0..pbody.rpo.len() {
         let b = pbody.rpo[i];
-        if FWD[b] == b && (P_HEAD[b] >= 0 || b == first) {
-            ORDER.push(b);
+        if pcx.gen0_fwd[b] == b && (pcx.p_head[b] >= 0 || b == first) {
+            pcx.order.push(b);
         }
     }
-    if ORDER.len() == 0 || ORDER[0] != first {
-        emit_jump(&cx, LABEL[first]);
+    if pcx.order.len() == 0 || pcx.order[0] != first {
+        emit_jump(&cx, pcx.label[first]);
     }
-    for i in 0..ORDER.len() as i64 {
-        let b = ORDER[i];
-        NEXT = if i + 1 < ORDER.len() as i64 { ORDER[i + 1] } else { -1 };
-        if jumped_to(b, if i > 0 { ORDER[i - 1] } else { -1 }, pbody) {
-            emit_label(&cx, LABEL[b]);
+    for i in 0..pcx.order.len() as i64 {
+        let b = pcx.order[i];
+        pcx.next = if i + 1 < pcx.order.len() as i64 { pcx.order[i + 1] } else { -1 };
+        if jumped_to(b, if i > 0 { pcx.order[i - 1] } else { -1 }, pbody, pcx) {
+            emit_label(&cx, pcx.label[b]);
         }
         let start = block_start(b, pbody);
         let len = block_len(b, pbody);
@@ -266,7 +229,7 @@ fn gen_blocks(cx: inout FnCtx, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
         }
         gen_term(&cx, block_term(b, pbody), pbody, &pcx);
     }
-    NEXT = -1;
+    pcx.next = -1;
 }
 
 // Each block's forward (FWD: itself, or for an empty block that jumps on,
@@ -276,21 +239,21 @@ fn gen_blocks(cx: inout FnCtx, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
 // holds at each block's start (START_HOLD).
 fn forward_blocks(pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     let nb = block_count(pbody);
-    FWD.clear();
-    P_HEAD.clear();
-    P_NEXT.clear();
-    P_FROM.clear();
-    RET_BLOCK.clear();
-    START_HOLD.clear();
+    pcx.gen0_fwd.clear();
+    pcx.p_head.clear();
+    pcx.p_next.clear();
+    pcx.p_from.clear();
+    pcx.places_ret_block.clear();
+    pcx.start_hold.clear();
     for b in 0..nb {
-        FWD.push(b);
-        P_HEAD.push(-1);
-        RET_BLOCK.push(false);
-        START_HOLD.push(-1);
+        pcx.gen0_fwd.push(b);
+        pcx.p_head.push(-1);
+        pcx.places_ret_block.push(false);
+        pcx.start_hold.push(-1);
     }
     for i in 0..pbody.rpo.len() {
         let b = pbody.rpo[i];
-        RET_BLOCK[b] = return_block(b, pbody);
+        pcx.places_ret_block[b] = return_block(b, pbody);
         var t = b;
         var steps = 0;
         while steps < 64 && is_forward(t, pbody) {
@@ -298,33 +261,33 @@ fn forward_blocks(pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
             steps += 1;
         }
         if steps < 64 {
-            FWD[b] = t;
+            pcx.gen0_fwd[b] = t;
         }
     }
     for i in 0..pbody.rpo.len() {
         let b = pbody.rpo[i];
-        if FWD[b] != b {
+        if pcx.gen0_fwd[b] != b {
             continue;
         }
         let t = pbody.stmts[block_term(b, pbody)];
-        if t.kind == TK_GOTO && RET_BLOCK[t.a] {
+        if t.kind == TK_GOTO && pcx.places_ret_block[t.a] {
             continue;
         }
         let holds = end_hold(b, pbody, &pcx);
         for k in 0..crate::places::ir::succ_count(b, pbody) {
-            let to = FWD[crate::places::ir::succ(b, k, pbody)];
+            let to = pcx.gen0_fwd[crate::places::ir::succ(b, k, pbody)];
             // (its first predecessor's, then -1 when another's differs)
-            if P_HEAD[to] < 0 {
-                START_HOLD[to] = holds;
-            } else if START_HOLD[to] != holds {
-                START_HOLD[to] = -1;
+            if pcx.p_head[to] < 0 {
+                pcx.start_hold[to] = holds;
+            } else if pcx.start_hold[to] != holds {
+                pcx.start_hold[to] = -1;
             }
-            P_FROM.push(b);
-            P_NEXT.push(P_HEAD[to]);
-            P_HEAD[to] = P_FROM.len() as i64 - 1;
+            pcx.p_from.push(b);
+            pcx.p_next.push(pcx.p_head[to]);
+            pcx.p_head[to] = pcx.p_from.len() as i64 - 1;
         }
     }
-    START_HOLD[FWD[pbody.rpo[0]]] = -1;
+    pcx.start_hold[pcx.gen0_fwd[pbody.rpo[0]]] = -1;
 }
 
 // The local the accumulator holds at the end of block b (-1: none): its
@@ -366,32 +329,32 @@ fn end_hold(b: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
 //   across `&&`, `||` and an `if`'s arms.
 fn scan_locals(pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     let n = local_count(pbody);
-    MENTIONS.clear();
-    M_FIRST.clear();
-    M_LAST.clear();
-    M_BLOCK.clear();
-    M_WRITTEN.clear();
-    M_ORDER.clear();
-    ACC_ONLY.clear();
+    pcx.mentions.clear();
+    pcx.m_first.clear();
+    pcx.m_last.clear();
+    pcx.m_block.clear();
+    pcx.m_written.clear();
+    pcx.m_order.clear();
+    pcx.acc_only.clear();
     for l in 0..n {
-        MENTIONS.push(0);
-        M_FIRST.push(0);
-        M_LAST.push(0);
-        M_BLOCK.push(-1);
-        M_WRITTEN.push(false);
-        let ty = local_type(l);
-        ACC_ONLY.push((l == 0 || l > pbody.params && pbody.locals[l].src < 0
+        pcx.mentions.push(0);
+        pcx.m_first.push(0);
+        pcx.m_last.push(0);
+        pcx.m_block.push(-1);
+        pcx.m_written.push(false);
+        let ty = local_type(l, pcx);
+        pcx.acc_only.push((l == 0 || l > pbody.params && pbody.locals[l].src < 0
             && !is_compound(ty)) && !has_flag(l, LF_STATIC, pbody) && !is_void(ty) && ty != TY_NEVER
             && !has_flag(l, crate::places::ir::LF_BORROWED, pbody));
     }
-    let first = FWD[pbody.rpo[0]];
+    let first = pcx.gen0_fwd[pbody.rpo[0]];
     for i in 0..pbody.rpo.len() {
         let b = pbody.rpo[i];
         // (an emitted block: not one only an inlined return reached)
-        let emitted = FWD[b] == b && (P_HEAD[b] >= 0 || b == first);
+        let emitted = pcx.gen0_fwd[b] == b && (pcx.p_head[b] >= 0 || b == first);
         let start = block_start(b, pbody);
         // (the local the accumulator holds before the statement)
-        var held = START_HOLD[b];
+        var held = pcx.start_hold[b];
         for j in 0..block_len(b, pbody) + 1 {
             let at = start + j;
             let s = pbody.stmts[at];
@@ -408,43 +371,43 @@ fn scan_locals(pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
                 }
                 let l = op_a(s.ops, o, pbody);
                 let p = op_b(s.ops, o, pbody);
-                mention_place(l, p, at, b, ok == OK_PLACE, pbody);
-                if ACC_ONLY[l] && !(emitted && l == held && ok != OK_PLACE && p == 0
+                mention_place(l, p, at, b, ok == OK_PLACE, pbody, &pcx);
+                if pcx.acc_only[l] && !(emitted && l == held && ok != OK_PLACE && p == 0
                     && (o == 0 && reads_first(at, l, pbody, &pcx)
                         || o == 1 && reads_second(at, l, pbody, &pcx))) {
-                    ACC_ONLY[l] = false;
+                    pcx.acc_only[l] = false;
                 }
             }
             // (the result, read by a return)
-            if emitted && held != 0 && ACC_ONLY[0]
-                && (k == TK_RETURN || k == TK_GOTO && RET_BLOCK[s.a]) {
-                ACC_ONLY[0] = false;
+            if emitted && held != 0 && pcx.acc_only[0]
+                && (k == TK_RETURN || k == TK_GOTO && pcx.places_ret_block[s.a]) {
+                pcx.acc_only[0] = false;
             }
             var writes = false;
             if k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC {
                 if s.b == 0 {
                     // (a whole write)
-                    let w = MENTIONS[s.a] == 0;
-                    mention(s.a, at, b, false);
+                    let w = pcx.mentions[s.a] == 0;
+                    mention(s.a, at, b, false, &pcx);
                     if w {
-                        M_WRITTEN[s.a] = true;
+                        pcx.m_written[s.a] = true;
                     }
-                    if ACC_ONLY[s.a] {
+                    if pcx.acc_only[s.a] {
                         writes = leaves_in_acc(s, pbody, &pcx);
                         if emitted && !writes {
-                            ACC_ONLY[s.a] = false;
+                            pcx.acc_only[s.a] = false;
                         }
                     }
                 } else {
-                    mention_place(s.a, s.b, at, b, false, pbody);
-                    ACC_ONLY[s.a] = false;
+                    mention_place(s.a, s.b, at, b, false, pbody, &pcx);
+                    pcx.acc_only[s.a] = false;
                 }
             } else if k == SK_DROP || k == crate::places::ir::SK_MENTION {
-                mention_place(s.a, s.b, at, b, true, pbody);
-                ACC_ONLY[s.a] = false;
+                mention_place(s.a, s.b, at, b, true, pbody, &pcx);
+                pcx.acc_only[s.a] = false;
                 if k == SK_DROP && s.c == DS_FLAG {
-                    mention(s.d, at, b, false);
-                    ACC_ONLY[s.d] = false;
+                    mention(s.d, at, b, false, &pcx);
+                    pcx.acc_only[s.d] = false;
                 }
             }
             if k != crate::places::ir::SK_MENTION {
@@ -456,35 +419,36 @@ fn scan_locals(pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
 
 // Local l mentioned by statement `at` of block b (`placed`: its address
 // taken, or a part of it).
-fn mention(l: i64, at: i64, b: i64, placed: bool) {
-    if MENTIONS[l] == 0 {
-        M_FIRST[l] = at;
-        M_BLOCK[l] = b;
-        M_ORDER.push(l);
-    } else if M_BLOCK[l] != b {
-        M_BLOCK[l] = -2;
+fn mention(l: i64, at: i64, b: i64, placed: bool, pcx: inout Ctx<Comp>) {
+    if pcx.mentions[l] == 0 {
+        pcx.m_first[l] = at;
+        pcx.m_block[l] = b;
+        pcx.m_order.push(l);
+    } else if pcx.m_block[l] != b {
+        pcx.m_block[l] = -2;
     }
-    M_LAST[l] = at;
-    MENTIONS[l] += 1;
+    pcx.m_last[l] = at;
+    pcx.mentions[l] += 1;
     if placed {
         // (its storage named: not shared)
-        M_BLOCK[l] = -2;
+        pcx.m_block[l] = -2;
     }
 }
 
 // Place (l, p) mentioned (its index locals too, which are not carried).
-fn mention_place(l: i64, p: i64, at: i64, b: i64, placed: bool, pbody: Body<Comp>) {
+fn mention_place(l: i64, p: i64, at: i64, b: i64, placed: bool, pbody: Body<Comp>,
+    pcx: inout Ctx<Comp>) {
     if p == 0 {
-        mention(l, at, b, placed);
+        mention(l, at, b, placed, &pcx);
         return;
     }
-    mention(l, at, b, placed || !const_chain(p, pbody));
+    mention(l, at, b, placed || !const_chain(p, pbody), &pcx);
     var q = p;
     while q > 0 {
         if proj_kind(q, pbody) == PJ_INDEX {
             let v = proj_val(q, pbody);
-            mention(v, at, b, false);
-            ACC_ONLY[v] = false;
+            mention(v, at, b, false, &pcx);
+            pcx.acc_only[v] = false;
         }
         q = proj_parent(q, pbody);
     }
@@ -510,23 +474,13 @@ fn writes_held(s: PStmt, l: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> boo
         && leaves_in_acc(s, pbody, &pcx)
 }
 
-// Per local: its first and last mention (statement indices), its block
-// (-1: none, -2: several, or its storage named), whether its first
-// mention writes it whole; the locals in the order of their first
-// mention (in reverse postorder).
-static var M_FIRST: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var M_LAST: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var M_BLOCK: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var M_WRITTEN: Vec<bool, Comp> = Vec::new_in(Comp {});
-static var M_ORDER: Vec<i64, Comp> = Vec::new_in(Comp {});
-
 // Whether local l is a statement temporary that may share its slot with
 // another: not the AST's, not a parameter or the result, mentioned in
 // one block only, written whole first, its storage not named (no
 // address taken of it: a reference, a slice of it, a drop).
-fn shares_slot(l: i64, pbody: Body<Comp>) -> bool {
-    l > pbody.params && pbody.locals[l].src < 0 && M_BLOCK[l] >= 0 && M_WRITTEN[l]
-        && !has_flag(l, crate::places::ir::LF_BORROWED, pbody) && !ACC_ONLY[l]
+fn shares_slot(l: i64, pbody: Body<Comp>, pcx: Ctx<Comp>) -> bool {
+    l > pbody.params && pbody.locals[l].src < 0 && pcx.m_block[l] >= 0 && pcx.m_written[l]
+        && !has_flag(l, crate::places::ir::LF_BORROWED, pbody) && !pcx.acc_only[l]
 }
 
 // The slots of the statement temporaries (shares_slot), each one's
@@ -535,46 +489,47 @@ fn shares_slot(l: i64, pbody: Body<Comp>) -> bool {
 // its block). Shared slots keep the frame small, its offsets in reach of
 // one instruction.
 
-fn share_slots(pbody: Body<Comp>) {
-    POOL_SLOT.clear();
-    POOL_SIZE.clear();
-    POOL_ALIGN.clear();
-    POOL_LAST.clear();
+fn share_slots(pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    pcx.pool_slot.clear();
+    pcx.pool_size.clear();
+    pcx.pool_align.clear();
+    pcx.pool_last.clear();
     var block = -1;
-    for i in 0..M_ORDER.len() {
-        let l = M_ORDER[i];
-        if SLOT[l] >= 0 || !shares_slot(l, pbody) {
+    for i in 0..pcx.m_order.len() {
+        let l = pcx.m_order[i];
+        if pcx.slot[l] >= 0 || !shares_slot(l, pbody, pcx) {
             continue;
         }
-        let ty = local_type(l);
+        let ty = local_type(l, pcx);
         if has_flag(l, LF_STATIC, pbody) || is_void(ty) || ty == TY_NEVER {
             continue;
         }
-        if M_BLOCK[l] != block {
-            block = M_BLOCK[l];
-            for k in 0..POOL_LAST.len() {
-                POOL_LAST[k] = -1;
+        if pcx.m_block[l] != block {
+            block = pcx.m_block[l];
+            for k in 0..pcx.pool_last.len() {
+                pcx.pool_last[k] = -1;
             }
         }
         let size = if is_compound(ty) { crate::front::types::align_to(type_size(ty), 8) }
             else { type_size(ty) };
         let align = crate::front::types::type_align(ty);
         var found = -1;
-        for k in 0..POOL_SLOT.len() as i64 {
-            if POOL_SIZE[k] == size && POOL_ALIGN[k] == align && POOL_LAST[k] < M_FIRST[l] {
+        for k in 0..pcx.pool_slot.len() as i64 {
+            if pcx.pool_size[k] == size && pcx.pool_align[k] == align
+                && pcx.pool_last[k] < pcx.m_first[l] {
                 found = k;
                 break;
             }
         }
         if found >= 0 {
-            SLOT[l] = POOL_SLOT[found];
-            POOL_LAST[found] = M_LAST[l];
+            pcx.slot[l] = pcx.pool_slot[found];
+            pcx.pool_last[found] = pcx.m_last[l];
         } else {
-            SLOT[l] = alloc_slot_for(ty);
-            POOL_SLOT.push(SLOT[l]);
-            POOL_SIZE.push(size);
-            POOL_ALIGN.push(align);
-            POOL_LAST.push(M_LAST[l]);
+            pcx.slot[l] = alloc_slot_for(ty, &pcx);
+            pcx.pool_slot.push(pcx.slot[l]);
+            pcx.pool_size.push(size);
+            pcx.pool_align.push(align);
+            pcx.pool_last.push(pcx.m_last[l]);
         }
     }
 }
@@ -603,7 +558,7 @@ fn return_block(b: i64, pbody: Body<Comp>) -> bool {
 fn reads_first(at: i64, l: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> bool {
     let s = pbody.stmts[at];
     let k = s.kind;
-    if k == TK_RETURN || k == TK_GOTO && RET_BLOCK[s.a] {
+    if k == TK_RETURN || k == TK_GOTO && pcx.places_ret_block[s.a] {
         return l == 0;
     }
     if s.nops == 0 || op_b(s.ops, 0, pbody) != 0 || op_a(s.ops, 0, pbody) != l {
@@ -654,11 +609,11 @@ fn gen_second(cx: inout FnCtx, ops: i64, i: i64, pbody: Body<Comp>, pcx: inout C
     let l = op_a(ops, i, pbody);
     let p = op_b(ops, i, pbody);
     let ty = place_ty(l, p, pbody, &pcx);
-    if p == 0 && ACC_ONLY[l] || !in_frame(l, p, pbody) || is_float(ty) || is_compound(ty)
+    if p == 0 && pcx.acc_only[l] || !in_frame(l, p, pbody, pcx) || is_float(ty) || is_compound(ty)
         || type_size(ty) != 8 {
         return false;
     }
-    emit_frame_addr(&cx, R_SECOND, SLOT[l] - chain_offset(l, p, pbody, &pcx));
+    emit_frame_addr(&cx, R_SECOND, pcx.slot[l] - chain_offset(l, p, pbody, &pcx), pcx);
     emit_load_reg(&cx, R_SECOND, R_SECOND);
     true
 }
@@ -681,9 +636,9 @@ fn simple_first(ops: i64, i: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> bo
 }
 
 // Whether operand i at `ops` is a local the accumulator carries.
-fn is_carried(ops: i64, i: i64, pbody: Body<Comp>) -> bool {
+fn is_carried(ops: i64, i: i64, pbody: Body<Comp>, pcx: Ctx<Comp>) -> bool {
     let k = op_kind(ops, i, pbody);
-    (k == OK_COPY || k == OK_MOVE) && op_b(ops, i, pbody) == 0 && ACC_ONLY[op_a(ops, i, pbody)]
+    (k == OK_COPY || k == OK_MOVE) && op_b(ops, i, pbody) == 0 && pcx.acc_only[op_a(ops, i, pbody)]
 }
 
 // Whether operand i at `ops` is local l's whole value.
@@ -723,26 +678,26 @@ fn reads_second(at: i64, l: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> boo
 // Whether a jump lands at block b, emitted after block `prev` (-1: first):
 // a predecessor other than prev, or prev's switch (its jumps name their
 // targets); the function's jump to its first block.
-fn jumped_to(b: i64, prev: i64, pbody: Body<Comp>) -> bool {
-    if prev < 0 && b != FWD[pbody.rpo[0]] || prev >= 0 && b == FWD[pbody.rpo[0]] {
+fn jumped_to(b: i64, prev: i64, pbody: Body<Comp>, pcx: Ctx<Comp>) -> bool {
+    if prev < 0 && b != pcx.gen0_fwd[pbody.rpo[0]] || prev >= 0 && b == pcx.gen0_fwd[pbody.rpo[0]] {
         return true;
     }
-    var e = P_HEAD[b];
+    var e = pcx.p_head[b];
     while e >= 0 {
-        let from = P_FROM[e];
+        let from = pcx.p_from[e];
         if from != prev || pbody.stmts[block_term(from, pbody)].kind != TK_GOTO {
             return true;
         }
-        e = P_NEXT[e];
+        e = pcx.p_next[e];
     }
     false
 }
 
 // A jump to block b (forwarded), unless it is the next one emitted.
-fn jump_to(cx: inout FnCtx, b: i64) {
-    let t = FWD[b];
-    if t != NEXT {
-        emit_jump(&cx, LABEL[t]);
+fn jump_to(cx: inout FnCtx, b: i64, pcx: Ctx<Comp>) {
+    let t = pcx.gen0_fwd[b];
+    if t != pcx.next {
+        emit_jump(&cx, pcx.label[t]);
     }
 }
 
@@ -805,8 +760,8 @@ fn chain_offset(l: i64, p: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 
 }
 
 // Whether place (l, p) is in l's frame slot at a constant offset.
-fn in_frame(l: i64, p: i64, pbody: Body<Comp>) -> bool {
-    !has_flag(l, LF_STATIC, pbody) && SLOT[l] >= 0 && const_chain(p, pbody)
+fn in_frame(l: i64, p: i64, pbody: Body<Comp>, pcx: Ctx<Comp>) -> bool {
+    !has_flag(l, LF_STATIC, pbody) && pcx.slot[l] >= 0 && const_chain(p, pbody)
 }
 
 // Accumulator = the address of place (l, p).
@@ -815,8 +770,8 @@ fn gen_place_addr(cx: inout FnCtx, l: i64, p: i64, pbody: Body<Comp>, pcx: inout
     // SAFETY: l is a local of the body held (below local_count), pt the checked
     // type of p's parent.
     unsafe {
-        if in_frame(l, p, pbody) {
-            emit_frame_addr(&cx, R_ACC, SLOT[l] - chain_offset(l, p, pbody, &pcx));
+        if in_frame(l, p, pbody, pcx) {
+            emit_frame_addr(&cx, R_ACC, pcx.slot[l] - chain_offset(l, p, pbody, &pcx), pcx);
             return;
         }
         if p == 0 {
@@ -854,16 +809,16 @@ fn gen_place_addr(cx: inout FnCtx, l: i64, p: i64, pbody: Body<Comp>, pcx: inout
         } else {
             gen_place_addr(&cx, l, parent, pbody, &pcx);
         }
-        push_x0(&cx);
+        push_x0(&cx, &pcx);
         gen_place_value(&cx, proj_val(p, pbody), 0, pbody, &pcx);
-        pop_x(&cx, R_SECOND);
+        pop_x(&cx, R_SECOND, &pcx);
         emit_index_addr(&cx, elem_size);
     }
 }
 
 // Accumulator = the value of place (l, p) (a compound one's address).
 fn gen_place_value(cx: inout FnCtx, l: i64, p: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
-    if p == 0 && ACC_ONLY[l] {
+    if p == 0 && pcx.acc_only[l] {
         return;
     }
     let ty = place_ty(l, p, pbody, &pcx);
@@ -881,22 +836,22 @@ fn write_place(cx: inout FnCtx, l: i64, p: i64, pbody: Body<Comp>, pcx: inout Ct
     if is_void(ty) || ty == TY_NEVER {
         return;
     }
-    if p == 0 && ACC_ONLY[l] {
+    if p == 0 && pcx.acc_only[l] {
         return;
     }
-    if in_frame(l, p, pbody) {
-        store_to_frame(&cx, ty, SLOT[l] - chain_offset(l, p, pbody, &pcx));
+    if in_frame(l, p, pbody, pcx) {
+        store_to_frame(&cx, ty, pcx.slot[l] - chain_offset(l, p, pbody, &pcx), pcx);
         return;
     }
     // (the value waits on the stack while the address is made, as
     // expr.vl's gen_assign)
-    push_value(&cx, ty);
+    push_value(&cx, ty, &pcx);
     gen_place_addr(&cx, l, p, pbody, &pcx);
     emit_move_to_second(&cx, TY_U64);
     if is_float(ty) {
-        pop_d(&cx, 0);
+        pop_d(&cx, 0, &pcx);
     } else {
-        pop_x(&cx, R_ACC);
+        pop_x(&cx, R_ACC, &pcx);
     }
     if is_compound(ty) {
         emit_copy(&cx, type_size(ty));
@@ -920,7 +875,7 @@ fn gen_op(cx: inout FnCtx, ops: i64, i: i64, pbody: Body<Comp>, pcx: inout Ctx<C
         let t = erase_type(b, &pcx);
         emit_load_float(&cx, float_const(f64_of_bits(a), t), t);
     } else if k == OK_STR {
-        gen_string_id(&cx, a);
+        gen_string_id(&cx, a, &pcx);
     } else if k == OK_CSTR {
         emit_string_addr(&cx, a);
     } else if k == OK_FN {
@@ -945,7 +900,7 @@ fn gen_stmt(cx: inout FnCtx, at: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
         return;
     }
     if DEBUG_INFO && s.node > 0 {
-        stmt_loc(&cx, NODES[s.node].start);
+        stmt_loc(&cx, NODES[s.node].start, &pcx);
     }
     if k == SK_ASSIGN {
         gen_assign(&cx, s, pbody, &pcx);
@@ -958,7 +913,7 @@ fn gen_stmt(cx: inout FnCtx, at: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     } else {
         // AK_BOUNDS: the index, as unsigned, below the length (the
         // helper is given both, as expr.vl's gen_index_addr)
-        if is_carried(s.ops, 1, pbody) {
+        if is_carried(s.ops, 1, pbody, pcx) {
             // (the length in the accumulator; the index read without
             // R_SECOND: simple_first)
             emit_move_to_second(&cx, TY_U64);
@@ -966,15 +921,17 @@ fn gen_stmt(cx: inout FnCtx, at: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
         } else {
             gen_op(&cx, s.ops, 0, pbody, &pcx);
             if !gen_second(&cx, s.ops, 1, pbody, &pcx) {
-                push_x0(&cx);
+                push_x0(&cx, &pcx);
                 gen_op(&cx, s.ops, 1, pbody, &pcx);
                 emit_move_to_second(&cx, TY_U64);
-                pop_x(&cx, R_ACC);
+                pop_x(&cx, R_ACC, &pcx);
             }
         }
         let ok = new_label(&cx);
         emit_compare_jump(&cx, Cond::Lt, false, ok);
-        emit_panic(&cx, panic_kind(op_type(s.ops, 0, pbody, &pcx), false), site_of(s.d, 0, &pcx));
+        let pcx_site1 = site_of(s.d, 0, &pcx);
+        emit_panic(&cx, panic_kind(op_type(s.ops, 0, pbody, &pcx), false), &pcx,
+            pcx_site1);
         emit_label(&cx, ok);
     }
 }
@@ -1000,13 +957,13 @@ fn gen_drop(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout Ctx<Comp>) 
         }
         if s.node > 0 {
             crate::gen0::gen::checkalloc::site_before_drop(&cx,
-                crate::places::print::drop_pos(s.node), pcx);
+                crate::places::print::drop_pos(s.node), &pcx);
         }
         gen_place_addr(&cx, s.a, s.b, pbody, &pcx);
         var arg_types: [i64; 1] = [fn_param(f, 0)];
-        gen_pass_arg(&cx, arg_types[0], false);
+        gen_pass_arg(&cx, arg_types[0], false, &pcx);
         gen_call_sequence(&cx, f, &arg_types as *i64, 1, FNS[f].param_count, false, 1,
-            FNS[f].ret);
+            FNS[f].ret, &pcx);
         if skip != 0 {
             emit_label(&cx, skip);
         }
@@ -1032,12 +989,12 @@ fn gen_assign(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout Ctx<Comp>
             }
             // (the second operand first, the operator swapped, when the
             // accumulator holds it: find_acc_only)
-            let swap = is_carried(s.ops, 1, pbody);
+            let swap = is_carried(s.ops, 1, pbody, pcx);
             gen_op(&cx, s.ops, if swap { 1 } else { 0 }, pbody, &pcx);
             if is_float(ot) || !gen_second(&cx, s.ops, if swap { 0 } else { 1 }, pbody, &pcx) {
-                push_value(&cx, ot);
+                push_value(&cx, ot, &pcx);
                 gen_op(&cx, s.ops, if swap { 0 } else { 1 }, pbody, &pcx);
-                pop_second_operand(&cx, ot);
+                pop_second_operand(&cx, ot, &pcx);
             }
             let tok = if swap { swapped(s.d) } else { token_of(s.d) };
             if rv == RV_CHECKED {
@@ -1046,10 +1003,10 @@ fn gen_assign(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout Ctx<Comp>
                 let kind = arith_panic_kind(s.d, false, false, &pcx);
                 let site = site_of(s.e, 0, &pcx);
                 if s.d == BO_SHL || s.d == BO_SHR {
-                    emit_check_imm(&cx, true, int_bits(ot), true, kind, site);
+                    emit_check_imm(&cx, true, int_bits(ot), true, kind, site, &pcx);
                     gen_operator(&cx, tok, ot, dt);
                 } else {
-                    emit_checked_binary(&cx, tok, ot, kind, site);
+                    emit_checked_binary(&cx, tok, ot, kind, site, &pcx);
                 }
             } else {
                 if (s.d == BO_DIV || s.d == BO_REM) && is_integer(ot) {
@@ -1059,9 +1016,9 @@ fn gen_assign(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout Ctx<Comp>
             }
         } else if rv == RV_UNARY || rv == RV_CHECKED {
             if is_vector(dt) {
-                bind(NODES[s.e].b, s.ops, 0);
+                bind(NODES[s.e].b, s.ops, 0, &pcx);
                 gen_vector_negate(&cx, NODES[s.e].b, dt, pbody, &pcx);
-                unbind();
+                unbind(&pcx);
             } else {
                 gen_op(&cx, s.ops, 0, pbody, &pcx);
                 if rv == RV_CHECKED {
@@ -1070,9 +1027,9 @@ fn gen_assign(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout Ctx<Comp>
                     let kind = arith_panic_kind(UO_NEG, true, false, &pcx);
                     if is_signed(dt) {
                         emit_check_imm(&cx, false, (0 - 1) << (int_bits(dt) - 1) as u64, false,
-                            kind, site_of(s.e, 0, &pcx));
+                            kind, site_of(s.e, 0, &pcx), &pcx);
                     } else {
-                        emit_check_imm(&cx, false, 1, true, kind, site_of(s.e, 0, &pcx));
+                        emit_check_imm(&cx, false, 1, true, kind, site_of(s.e, 0, &pcx), &pcx);
                     }
                 }
                 let tok = if s.d == UO_NEG { Tok::Minus } else if s.d == UO_NOT { Tok::Bang }
@@ -1097,10 +1054,10 @@ fn gen_assign(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout Ctx<Comp>
             gen_aggregate(&cx, s, dt, pbody, &pcx);
             return;
         } else if rv == RV_REPEAT {
-            let slot = alloc_slot_for(dt);
+            let slot = alloc_slot_for(dt, &pcx);
             gen_op(&cx, s.ops, 0, pbody, &pcx);
-            gen_repeat_fill(&cx, dt, slot);
-            emit_frame_addr(&cx, R_ACC, slot);
+            gen_repeat_fill(&cx, dt, slot, &pcx);
+            emit_frame_addr(&cx, R_ACC, slot, pcx);
         } else if rv == RV_SLICE {
             gen_slice(&cx, s, pbody, &pcx);
         } else {
@@ -1122,10 +1079,10 @@ fn gen_division_checks(cx: inout FnCtx, s: PStmt, ot: i64, pbody: Body<Comp>, pc
         == OK_INT { wrap_int(op_a(s.ops, 1, pbody), erase_type(op_b(s.ops, 1, pbody), &pcx)) }
         else if k == OK_CONST { const_value(op_a(s.ops, 1, pbody), &pcx) } else { 0 };
     if !known || value == 0 {
-        emit_check_imm(&cx, true, 0, false, arith_panic_kind(s.d, false, true, &pcx), site);
+        emit_check_imm(&cx, true, 0, false, arith_panic_kind(s.d, false, true, &pcx), site, &pcx);
     }
     if is_signed(ot) && (!known || value == 0 - 1) {
-        emit_min_check(&cx, ot, arith_panic_kind(s.d, false, false, &pcx), site);
+        emit_min_check(&cx, ot, arith_panic_kind(s.d, false, false, &pcx), site, &pcx);
     }
 }
 
@@ -1139,17 +1096,17 @@ fn gen_vector_assign(cx: inout FnCtx, s: PStmt, dt: i64, pbody: Body<Comp>, pcx:
         let n = s.e;
         if NODES[n].kind == NodeKind::Assign {
             gen_op(&cx, s.ops, 1, pbody, &pcx);
-            let b = vector_value_to_slot(&cx, dt);
-            let addr = alloc_slot(8, 8);
+            let b = vector_value_to_slot(&cx, dt, &pcx);
+            let addr = alloc_slot(8, 8, &pcx);
             gen_place_addr(&cx, s.a, s.b, pbody, &pcx);
-            store_reg_to_frame(&cx, R_ACC, addr);
-            vector_assign_lanes(&cx, token_of(s.d), dt, b, addr);
+            store_reg_to_frame(&cx, R_ACC, addr, pcx);
+            vector_assign_lanes(&cx, token_of(s.d), dt, b, addr, &pcx);
             return;
         }
-        bind(NODES[n].b, s.ops, 0);
-        bind(NODES[n].c, s.ops, 1);
+        bind(NODES[n].b, s.ops, 0, &pcx);
+        bind(NODES[n].c, s.ops, 1, &pcx);
         gen_vector_binary(&cx, NODES[n].op, NODES[n].b, NODES[n].c, dt, pbody, &pcx);
-        unbind();
+        unbind(&pcx);
         write_place(&cx, s.a, s.b, pbody, &pcx);
     }
 }
@@ -1214,15 +1171,15 @@ fn gen_aggregate(cx: inout FnCtx, s: PStmt, dt: i64, pbody: Body<Comp>, pcx: ino
             write_place(&cx, s.a, s.b, pbody, &pcx);
             return;
         }
-        var in_place = in_frame(s.a, s.b, pbody);
+        var in_place = in_frame(s.a, s.b, pbody, pcx);
         for i in 0..s.nops {
             let k = op_kind(s.ops, i, pbody);
             if (k == OK_COPY || k == OK_MOVE || k == OK_PLACE) && op_a(s.ops, i, pbody) == s.a {
                 in_place = false;
             }
         }
-        let base = if in_place { SLOT[s.a] - chain_offset(s.a, s.b, pbody, &pcx) }
-            else { alloc_slot_for(dt) };
+        let base = if in_place { pcx.slot[s.a] - chain_offset(s.a, s.b, pbody, &pcx) }
+            else { alloc_slot_for(dt, &pcx) };
         if ak == AK_VARIANT {
             let v = s.e;
             let tag = ENUMS[TYPES[dt].a].tag;
@@ -1232,15 +1189,15 @@ fn gen_aggregate(cx: inout FnCtx, s: PStmt, dt: i64, pbody: Body<Comp>, pcx: ino
                 } else {
                     emit_load_imm(&cx, R_ACC, 0);
                 }
-                store_to_frame(&cx, TY_U64, base);
+                store_to_frame(&cx, TY_U64, base, pcx);
             } else {
                 for i in 0..s.nops {
                     gen_op(&cx, s.ops, i, pbody, &pcx);
                     store_to_frame(&cx, erase_type(variant_field(v, i), &pcx),
-                        base - variant_field_offset(v, i));
+                        base - variant_field_offset(v, i), pcx);
                 }
                 emit_load_imm(&cx, R_ACC, wrap_int(VARIANTS[v].discr, tag) as u64);
-                store_to_frame(&cx, tag, base);
+                store_to_frame(&cx, tag, base, pcx);
             }
         } else {
             for i in 0..s.nops {
@@ -1262,11 +1219,11 @@ fn gen_aggregate(cx: inout FnCtx, s: PStmt, dt: i64, pbody: Body<Comp>, pcx: ino
                     continue;
                 }
                 gen_op(&cx, s.ops, i, pbody, &pcx);
-                store_to_frame(&cx, elem_ty, base - offset);
+                store_to_frame(&cx, elem_ty, base - offset, pcx);
             }
         }
         if !in_place {
-            emit_frame_addr(&cx, R_ACC, base);
+            emit_frame_addr(&cx, R_ACC, base, pcx);
             write_place(&cx, s.a, s.b, pbody, &pcx);
         }
     }
@@ -1280,16 +1237,16 @@ fn gen_slice(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout Ctx<Comp>)
     // SAFETY: bt is operand 0's checked type.
     unsafe {
         let bt = op_type(s.ops, 0, pbody, &pcx);
-        let slot = alloc_slot(16, 8);
-        let length = alloc_slot(8, 8);
-        let low_slot = alloc_slot(8, 8);
-        let high_slot = alloc_slot(8, 8);
+        let slot = alloc_slot(16, 8, &pcx);
+        let length = alloc_slot(8, 8, &pcx);
+        let low_slot = alloc_slot(8, 8, &pcx);
+        let high_slot = alloc_slot(8, 8, &pcx);
         if TYPES[bt].kind == TyKind::Ptr {
             gen_place_value(&cx, op_a(s.ops, 0, pbody), op_b(s.ops, 0, pbody), pbody, &pcx);
         } else {
             gen_op(&cx, s.ops, 0, pbody, &pcx);
         }
-        store_reg_to_frame(&cx, R_ACC, slot);
+        store_reg_to_frame(&cx, R_ACC, slot, pcx);
         var bound_ty = TY_U64;
         if op_kind(s.ops, 1, pbody) != OK_UNIT {
             gen_op(&cx, s.ops, 1, pbody, &pcx);
@@ -1297,12 +1254,12 @@ fn gen_slice(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout Ctx<Comp>)
         } else {
             emit_load_imm(&cx, R_ACC, 0);
         }
-        store_reg_to_frame(&cx, R_ACC, low_slot);
+        store_reg_to_frame(&cx, R_ACC, low_slot, pcx);
         let has_high = op_kind(s.ops, 2, pbody) != OK_UNIT;
         if has_high {
             gen_op(&cx, s.ops, 2, pbody, &pcx);
             bound_ty = op_type(s.ops, 2, pbody, &pcx);
-            store_reg_to_frame(&cx, R_ACC, high_slot);
+            store_reg_to_frame(&cx, R_ACC, high_slot, pcx);
         }
         gen_slice_tail(&cx, s.d, bt, false, has_high, bound_ty, slot, length, low_slot, high_slot,
             &pcx);
@@ -1328,17 +1285,17 @@ fn gen_call_stmt(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout Ctx<Co
         let into = into_dest(s, pbody, pcx);
         if bound_call(s) {
             if f < 0 {
-                bind(NODES[n].a, s.ops, 0);
+                bind(NODES[n].a, s.ops, 0, &pcx);
             }
             for i in 0..NODES[n].count {
-                bind(child(n, i, pcx), s.ops, i + skip);
+                bind(child(n, i, pcx), s.ops, i + skip, &pcx);
             }
             if into != 0 {
-                crate::gen0::gen::call::RESULT_INTO = into;
+                pcx.result_into = into;
             }
             gen_call(&cx, n, pbody, &pcx);
-            crate::gen0::gen::call::RESULT_INTO = 0;
-            unbind();
+            pcx.result_into = 0;
+            unbind(&pcx);
             if into == 0 {
                 write_place(&cx, s.a, s.b, pbody, &pcx);
             }
@@ -1369,21 +1326,22 @@ fn gen_call_stmt(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout Ctx<Co
                 ty = if f >= 0 { fn_param(f, i) } else { type_elem(callee_ty, i) };
             }
             gen_op(&cx, s.ops, i + skip, pbody, &pcx);
-            if gen_pass_arg(&cx, ty, op_fresh(s.ops, i + skip, pbody)) {
+            if gen_pass_arg(&cx, ty, op_fresh(s.ops, i + skip, pbody), &pcx) {
                 arg_types[i] = ty;
                 pushed += 1;
             }
         }
         if f < 0 {
             gen_op(&cx, s.ops, 0, pbody, &pcx);
-            push_x0(&cx);
+            push_x0(&cx, &pcx);
             pushed += 1;
         }
         if n > 0 && NODES[n].kind == NodeKind::Call {
-            site_before_call(&cx, n, pcx);
+            site_before_call(&cx, n, &pcx);
         }
-        crate::gen0::gen::call::RESULT_INTO = into;
-        gen_call_sequence(&cx, f, &arg_types as *i64, count, param_count, variadic, pushed, ret);
+        pcx.result_into = into;
+        gen_call_sequence(&cx, f, &arg_types as *i64, count, param_count, variadic, pushed, ret,
+            &pcx);
         if into == 0 {
             write_place(&cx, s.a, s.b, pbody, &pcx);
         }
@@ -1397,8 +1355,8 @@ fn gen_call_stmt(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout Ctx<Co
 // intrinsic's).
 fn into_dest(s: PStmt, pbody: Body<Comp>, pcx: Ctx<Comp>) -> i64 {
     let l = s.a;
-    if s.b != 0 || s.c < 0 || SLOT[l] <= 0 || has_flag(l, LF_STATIC, pbody) || ACC_ONLY[l]
-        || has_flag(l, crate::places::ir::LF_BORROWED, pbody) || !is_compound(local_type(l))
+    if s.b != 0 || s.c < 0 || pcx.slot[l] <= 0 || has_flag(l, LF_STATIC, pbody) || pcx.acc_only[l]
+        || has_flag(l, crate::places::ir::LF_BORROWED, pbody) || !is_compound(local_type(l, pcx))
         || l <= pbody.params || bound_call(s) && !plain_call(s, pcx) {
         return 0;
     }
@@ -1408,7 +1366,7 @@ fn into_dest(s: PStmt, pbody: Body<Comp>, pcx: Ctx<Comp>) -> i64 {
             return 0;
         }
     }
-    SLOT[l]
+    pcx.slot[l]
 }
 
 // Whether call s, of function s.c through gen_call, is an ordinary one: no
@@ -1416,7 +1374,7 @@ fn into_dest(s: PStmt, pbody: Body<Comp>, pcx: Ctx<Comp>) -> i64 {
 // their arguments first nor make a result by the call sequence).
 fn plain_call(s: PStmt, pcx: Ctx<Comp>) -> bool {
     s.c >= 0 && s.c != pcx.check_fn
-        && crate::arch::intrinsic_of_fn(s.c) < 0
+        && crate::arch::intrinsic_of_fn(s.c, pcx) < 0
 }
 
 // Whether call s is generated by gen_call of its node, its operands bound.
@@ -1450,26 +1408,26 @@ fn gen_contract_failure(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout
         } else {
             gen_expr(&cx, child(n, 1, pcx), pbody, &pcx);
         }
-        push_x0(&cx);
+        push_x0(&cx, &pcx);
         let count = s.nops - 2;
         for i in 0..count {
             let ty = op_type(s.ops, i + 2, pbody, &pcx);
             gen_op(&cx, s.ops, i + 2, pbody, &pcx);
             gen_cast(&cx, ty, if is_signed(ty) { TY_I64 } else { TY_U64 });
-            push_x0(&cx);
+            push_x0(&cx, &pcx);
         }
         if count > 2 {
-            pop_x(&cx, R_ADDR);
+            pop_x(&cx, R_ADDR, &pcx);
         }
         if count > 1 {
-            pop_x(&cx, R_SECOND);
+            pop_x(&cx, R_SECOND, &pcx);
         }
         if count > 0 {
-            pop_x(&cx, R_ACC);
+            pop_x(&cx, R_ACC, &pcx);
         }
         let kind = message_kind(crate::front::contracts::checks::check_message(check, s.e, shown,
-            CUR_FN, &pcx));
-        emit_panic_site_popped(&cx, kind);
+            pcx.gen_cur_fn, &pcx), &pcx);
+        emit_panic_site_popped(&cx, kind, &pcx);
         free(shown.data as *u8);
     }
 }
@@ -1483,7 +1441,8 @@ fn gen_intrinsic_stmt(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout C
         if s.c == IK_PANIC {
             gen_op(&cx, s.ops, 0, pbody, &pcx);
             gen_cast(&cx, op_type(s.ops, 0, pbody, &pcx), TY_I64);
-            emit_panic(&cx, NODES[n].x, site_of(n, 0, &pcx));
+            let pcx_site2 = site_of(n, 0, &pcx);
+            emit_panic(&cx, NODES[n].x, &pcx, pcx_site2);
             return;
         }
         if s.c == IK_CONTRACT {
@@ -1493,22 +1452,22 @@ fn gen_intrinsic_stmt(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout C
         if s.c == IK_VECTOR {
             var j = 0;
             if NODES[n].a != 0 {
-                bind(NODES[n].a, s.ops, 0);
+                bind(NODES[n].a, s.ops, 0, &pcx);
                 j = 1;
             }
             for i in 0..NODES[n].count {
-                bind(child(n, i, pcx), s.ops, i + j);
+                bind(child(n, i, pcx), s.ops, i + j, &pcx);
             }
             gen_vecop(&cx, n, pbody, &pcx);
         } else if s.c == IK_ARCH {
             for i in 0..NODES[n].count {
-                bind(child(n, i, pcx), s.ops, i);
+                bind(child(n, i, pcx), s.ops, i, &pcx);
             }
             gen_call(&cx, n, pbody, &pcx);
         } else {
             return;
         }
-        unbind();
+        unbind(&pcx);
         write_place(&cx, s.a, s.b, pbody, &pcx);
     }
 }
@@ -1518,8 +1477,8 @@ fn gen_intrinsic_stmt(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout C
 fn gen_term(cx: inout FnCtx, at: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     let s = pbody.stmts[at];
     let k = s.kind;
-    if k == TK_GOTO && !RET_BLOCK[s.a] {
-        jump_to(&cx, s.a);
+    if k == TK_GOTO && !pcx.places_ret_block[s.a] {
+        jump_to(&cx, s.a, pcx);
     } else if k == TK_SWITCH {
         gen_switch(&cx, s, pbody, &pcx);
     } else if k == TK_RETURN || k == TK_GOTO {
@@ -1527,13 +1486,13 @@ fn gen_term(cx: inout FnCtx, at: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
         // itself)
         // UNSAFE: FNS is the checker's raw table of functions.
         // SAFETY: CUR_FN is the function being generated.
-        let ret = unsafe { FNS[CUR_FN].ret };
+        let ret = unsafe { FNS[pcx.gen_cur_fn].ret };
         if !is_void(ret) && ret != TY_NEVER {
             gen_place_value(&cx, 0, 0, pbody, &pcx);
-            gen_return_value(&cx, ret);
+            gen_return_value(&cx, ret, &pcx);
         }
-        if NEXT >= 0 {
-            emit_jump(&cx, RETURN_LABEL);
+        if pcx.next >= 0 {
+            emit_jump(&cx, pcx.return_label);
         }
     }
 }
@@ -1544,21 +1503,22 @@ fn gen_switch(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout Ctx<Comp>
     let ty = op_type(s.ops, 0, pbody, &pcx);
     gen_op(&cx, s.ops, 0, pbody, &pcx);
     if s.b == 1 && pbody.targets[s.a] == 0 && ty == TY_BOOL {
-        let when_false = FWD[pbody.targets[s.a + 1]];
-        let otherwise = FWD[s.c];
+        let when_false = pcx.gen0_fwd[pbody.targets[s.a + 1]];
+        let otherwise = pcx.gen0_fwd[s.c];
         if when_false != otherwise {
-            if when_false == NEXT {
-                crate::gen0::target::emit_jump_if_nonzero(&cx, LABEL[otherwise]);
+            if when_false == pcx.next {
+                crate::gen0::target::emit_jump_if_nonzero(&cx, pcx.label[otherwise]);
                 return;
             }
-            emit_jump_if_zero(&cx, LABEL[when_false]);
+            emit_jump_if_zero(&cx, pcx.label[when_false]);
         }
-        jump_to(&cx, otherwise);
+        jump_to(&cx, otherwise, pcx);
         return;
     }
     for i in 0..s.b {
         emit_load_imm(&cx, R_SECOND, wrap_int(pbody.targets[s.a + 2 * i], ty) as u64);
-        emit_compare_jump(&cx, Cond::Eq, false, LABEL[FWD[pbody.targets[s.a + 2 * i + 1]]]);
+        emit_compare_jump(&cx, Cond::Eq, false,
+            pcx.label[pcx.gen0_fwd[pbody.targets[s.a + 2 * i + 1]]]);
     }
-    jump_to(&cx, s.c);
+    jump_to(&cx, s.c, pcx);
 }

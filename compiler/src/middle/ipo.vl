@@ -12,6 +12,8 @@ use crate::base::{
     IntVec, STDERR, alloc_array, buf_byte, buf_int, buf_new, buf_str, buf_write_fd, free, intern_c,
     sym_name,
 };
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::front::effects::{
     EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC, EFF_RAW_DIVERGE, EFF_RAW_PANIC,
     EFF_SYNC, EFF_THREAD, EFF_TLS, EFF_UNKNOWN, Effects, fn_effects,
@@ -70,9 +72,6 @@ pub static var FN_ATTRS: *i64 = 0 as *i64;
 pub static var FN_NOCAPTURE: *i64 = 0 as *i64;
 pub static var FN_ATTRS_DONE: *i64 = 0 as *i64;
 pub static var ATTRS_READY: bool = false;
-
-// --print-attrs: print every function's attributes (stderr).
-pub static var PRINT_ATTRS: bool = false;
 
 pub fn init_attrs() {
     FN_ATTRS = alloc_array::<i64>(IRFUNC_COUNT + 1);
@@ -528,13 +527,6 @@ pub fn print_attrs() {
 
 // ---- Interprocedural constant propagation ----
 
-// The direct call sites of each IR function: CALL_SITES[CALL_START[g]..
-// CALL_START[g + 1]] (instructions).
-static var CALL_START: *i64 = 0 as *i64;
-static var CALL_SITES: *i64 = 0 as *i64;
-
-static var CALL_FNS: *i64 = 0 as *i64;
-
 // A constant (or function address) passed at a call site, by value: the
 // instruction is the caller's (0.17).
 struct ConstArg { op: Op, ty: i64, imm: i64 }
@@ -542,13 +534,13 @@ struct ConstArg { op: Op, ty: i64, imm: i64 }
 // The direct call sites of every function g: CALL_SITES[CALL_START[g] ..
 // CALL_START[g + 1]], each an instruction of function CALL_FNS[..] (0.17:
 // instruction ids are the caller's own).
-fn collect_call_sites(cx: inout FnCtx) {
+fn collect_call_sites(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
     unsafe {
         let n = IRFUNC_COUNT;
-        free(CALL_START as *u8);
-        free(CALL_SITES as *u8);
-        free(CALL_FNS as *u8);
-        CALL_START = alloc_array::<i64>(n + 2);
+        free(pcx.call_start as *u8);
+        free(pcx.call_sites as *u8);
+        free(pcx.call_fns as *u8);
+        pcx.call_start = alloc_array::<i64>(n + 2);
         var total = 0;
         for pass in 0..2 {
             let fill = alloc_array::<i64>(n + 1);
@@ -567,10 +559,10 @@ fn collect_call_sites(cx: inout FnCtx) {
                         let g = ir_callee(&cx, v);
                         if g >= 0 {
                             if pass == 0 {
-                                CALL_START[g] += 1;
+                                pcx.call_start[g] += 1;
                             } else {
-                                CALL_SITES[CALL_START[g] + fill[g]] = v;
-                                CALL_FNS[CALL_START[g] + fill[g]] = fi;
+                                pcx.call_sites[pcx.call_start[g] + fill[g]] = v;
+                                pcx.call_fns[pcx.call_start[g] + fill[g]] = fi;
                                 fill[g] += 1;
                             }
                         }
@@ -581,12 +573,12 @@ fn collect_call_sites(cx: inout FnCtx) {
             free(fill as *u8);
             if pass == 0 {
                 for g in 0..n + 1 {
-                    let count = CALL_START[g];
-                    CALL_START[g] = total;
+                    let count = pcx.call_start[g];
+                    pcx.call_start[g] = total;
                     total += count;
                 }
-                CALL_SITES = alloc_array::<i64>(total + 1);
-                CALL_FNS = alloc_array::<i64>(total + 1);
+                pcx.call_sites = alloc_array::<i64>(total + 1);
+                pcx.call_fns = alloc_array::<i64>(total + 1);
             }
         }
     }
@@ -602,16 +594,16 @@ fn is_internal(g: i64) -> bool {
 
 // The constant every call site passes as operand k (found: false when
 // they do not agree, or one passes no constant).
-fn common_constant_arg(cx: inout FnCtx, g: i64, k: i64, found: inout ConstArg) -> bool {
+fn common_constant_arg(cx: inout FnCtx, g: i64, k: i64, found: inout ConstArg, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        let start = CALL_START[g];
-        let end = CALL_START[g + 1];
+        let start = pcx.call_start[g];
+        let end = pcx.call_start[g + 1];
         if end == start {
             return false;
         }
         for i in start..end {
-            let call = CALL_SITES[i];
-            ir_enter(&cx, CALL_FNS[i]);
+            let call = pcx.call_sites[i];
+            ir_enter(&cx, pcx.call_fns[i]);
             if cx.insts[call].block == 0 || k >= cx.insts[call].nargs {
                 return false;
             }
@@ -719,15 +711,15 @@ fn common_constant_result(cx: inout FnCtx, g: i64) -> i64 {
 // functions, top-down (callers first, so constants reaching a function
 // can flow on to its callees), and constant results out of them. Returns
 // whether anything changed.
-pub fn propagate_constants(cx: inout FnCtx) -> bool {
+pub fn propagate_constants(cx: inout FnCtx, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        collect_call_sites(&cx);
+        collect_call_sites(&cx, &pcx);
         var any = false;
         var i = SCC_ORDER.count;
         while i > 0 {
             i -= 1;
             let g = SCC_ORDER.data[i];
-            if !is_internal(g) || CALL_START[g + 1] == CALL_START[g] {
+            if !is_internal(g) || pcx.call_start[g + 1] == pcx.call_start[g] {
                 continue;
             }
             ir_enter(&cx, g);
@@ -740,7 +732,7 @@ pub fn propagate_constants(cx: inout FnCtx) -> bool {
                 let k = param_operand(&cx, g, p);
                 if k >= 0 {
                     var c = ConstArg { op: Const, ty: 0, imm: 0 };
-                    let agree = common_constant_arg(&cx, g, k, &c);
+                    let agree = common_constant_arg(&cx, g, k, &c, pcx);
                     ir_enter(&cx, g);
                     if agree && c.ty == cx.insts[p].ty {
                         let k2 = ir_make(&cx, c.op, c.ty, 0, 0, c.imm);
@@ -770,9 +762,9 @@ pub fn propagate_constants(cx: inout FnCtx) -> bool {
             }
             let r_ty = cx.insts[r].ty;
             let r_imm = cx.insts[r].imm;
-            for s in CALL_START[g]..CALL_START[g + 1] {
-                let call = CALL_SITES[s];
-                let fi = CALL_FNS[s];
+            for s in pcx.call_start[g]..pcx.call_start[g + 1] {
+                let call = pcx.call_sites[s];
+                let fi = pcx.call_fns[s];
                 ir_enter(&cx, fi);
                 if cx.insts[call].block == 0 || cx.insts[call].ty == 0
                     || cx.insts[call].ty != r_ty {
