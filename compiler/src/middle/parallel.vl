@@ -40,7 +40,7 @@ use crate::back::dwarf::DEBUG_INFO;
 use crate::back::emit::function::emit_task;
 use crate::back::emit::machine::m_load_imm;
 use crate::back::emit::stats::STATS;
-use crate::back::objfile::{ASM_STREAM, asm_flush};
+use crate::back::objfile::asm_flush;
 use crate::back::regalloc::{PRINT_REGALLOC, VERIFY_REGALLOC};
 use crate::base::{
     IntVec, alloc_array, alloc_zeroed, buf_bytes, buf_clear, buf_int, buf_slice, cstr, die, free,
@@ -53,7 +53,7 @@ use crate::base::timer::TIME_PASSES;
 use crate::front::distinct::enum_niche;
 use crate::front::lexer::{STR_COUNT, str_at};
 use crate::front::types::{TYPES, compute_layout};
-use crate::gen0::target::{RT_RENUMBERED, add_const_data, rt_output};
+use crate::gen0::target::{add_const_data, rt_output};
 use crate::middle::ctx::{FnCtx, main_cx};
 use crate::middle::inline::{
     FN_CALLS, FN_LIVE, FN_SCC, SCC_ORDER, add_program_size, finish_component_function, ir_callee,
@@ -67,8 +67,7 @@ use crate::middle::opt::{
     OPT_LEVEL, PER_FUNCTION, cleanup_function, optimize_component_function, simplify_function,
 };
 use crate::middle::threads::{
-    POOL_CONTEXTS, POOL_CTX, POOL_THREADS, pool_run, pool_run_joined, pool_start, pool_stop,
-    processors,
+    POOL_CTX, pool_run, pool_run_joined, pool_start, pool_stop, processors,
 };
 use crate::tools::query::checks::PRINT_CHECKS;
 
@@ -79,8 +78,6 @@ extern "C" {
 
 // ---- Options ----
 
-// -j N: the threads code generation may use (0: the default, below).
-pub static var JOBS: i64 = 0;
 // (testing) Each task in a context of its own, made for it: a task that
 // read what an earlier task left in its context would make output
 // depend on which thread ran it (VOLE_FRESH_CONTEXTS=1).
@@ -118,13 +115,13 @@ fn serial_only() -> bool {
 // The threads for a program of `functions` functions to compile: -j's;
 // by default fewer for a small program (a thread costs about as much as
 // compiling a few small functions to start).
-fn threads_for(functions: i64) -> i64 {
-    var n = if JOBS > 0 { JOBS } else { default_jobs() };
+fn threads_for(functions: i64, pcx: Ctx<Comp>) -> i64 {
+    var n = if pcx.jobs > 0 { pcx.jobs } else { default_jobs() };
     if serial_only() {
         n = 1;
     }
     let most = functions / 16 + 1;
-    if JOBS == 0 && n > most {
+    if pcx.jobs == 0 && n > most {
         n = most;
     }
     if n < 1 { 1 } else { n }
@@ -133,51 +130,49 @@ fn threads_for(functions: i64) -> i64 {
 // (0.18.1) Whether -O0 assembles on a thread of its own, beside code
 // generation: when streaming (no -g, not -S) and more than one thread may
 // be used.
-pub fn assembler_thread_wanted() -> bool {
-    ASM_STREAM && !serial_only() && (if JOBS > 0 { JOBS > 1 } else { default_jobs() > 1 })
+pub fn assembler_thread_wanted(pcx: Ctx<Comp>) -> bool {
+    pcx.asm_stream && !serial_only()
+        && (if pcx.jobs > 0 { pcx.jobs > 1 } else { default_jobs() > 1 })
 }
 
 // Starts the pool for the program's functions (main thread, before the
 // first phase): the program's state the tasks only read is made first
 // (prepare_tasks).
-pub fn parallel_begin(cx: inout FnCtx, pcx: Ctx<Comp>) {
+pub fn parallel_begin(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
     unsafe {
-        prepare_tasks(&cx, pcx);
+        prepare_tasks(&cx, &pcx);
         FN_CONSTS = alloc_zeroed((IRFUNC_COUNT + 1) * size_of(ConstList)) as *ConstList;
         FN_TEXT = alloc_zeroed((IRFUNC_COUNT + 1) * size_of(FnText)) as *FnText;
         let fresh = crate::base::getenv(c"VOLE_FRESH_CONTEXTS");
         FRESH_CONTEXTS = fresh != 0 as *u8 && *fresh == '1';
-        pool_start(threads_for(IRFUNC_COUNT));
+        pool_start(threads_for(IRFUNC_COUNT, pcx), &pcx);
     }
 }
 
 // The end of code generation: the workers stop.
-pub fn parallel_end() {
-    pool_stop();
+pub fn parallel_end(pcx: inout Ctx<Comp>) {
+    pool_stop(&pcx);
 }
 
 // (VOLE_PHASE_TIMES=1) The wall time since the last mark, on stderr,
 // for phase `name`: --time-passes runs on one thread (its clock is the
 // process's), this measures the threads' phases as they run.
-pub fn phase_time(name: *u8) {
+pub fn phase_time(name: *u8, pcx: inout Ctx<Comp>) {
     unsafe {
-        if PHASE_TIMES == 0 {
+        if pcx.phase_times == 0 {
             let on = crate::base::getenv(c"VOLE_PHASE_TIMES");
-            PHASE_TIMES = if on != 0 as *u8 && *on == '1' { 1 } else { -1 };
-            PHASE_MARK = monotonic_ns();
+            pcx.phase_times = if on != 0 as *u8 && *on == '1' { 1 } else { -1 };
+            pcx.phase_mark = monotonic_ns();
         }
-        if PHASE_TIMES < 0 || name == 0 as *u8 {
+        if pcx.phase_times < 0 || name == 0 as *u8 {
             return;
         }
         let now = monotonic_ns();
-        let ms = (now - PHASE_MARK) / 100000;
-        PHASE_MARK = now;
+        let ms = (now - pcx.phase_mark) / 100000;
+        pcx.phase_mark = now;
         eprintln("{}.{} ms\t{}", ms / 10, ms % 10, cstr(name));
     }
 }
-
-static var PHASE_TIMES: i64 = 0;
-static var PHASE_MARK: i64 = 0;
 
 // Nanoseconds of the monotonic clock.
 fn monotonic_ns() -> i64 {
@@ -192,11 +187,11 @@ fn monotonic_ns() -> i64 {
 
 // (0.18.1) --vec-stats's counts (0 vector loops, 1 overlap tests, 2 tests
 // the facts dropped), summed over the contexts that made them.
-pub fn vec_stat(k: i64) -> i64 {
+pub fn vec_stat(k: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        var n = vec_stat_of(&*main_cx(), k);
+        var n = vec_stat_of(&*main_cx(&pcx), k);
         if POOL_CTX != 0 as **FnCtx {
-            for i in 0..POOL_CONTEXTS {
+            for i in 0..pcx.pool_contexts {
                 n += vec_stat_of(&*POOL_CTX[i], k);
             }
         }
@@ -312,7 +307,7 @@ pub fn const_data_entry(fi: i64, k: i64, phase: inout i64, rank: inout i64, alig
 // Numbers the constant data the phase's tasks made (main thread, between
 // phases): in the order of (phase, rank, then each function's order),
 // which is the order one thread makes them in.
-fn resolve_consts() {
+fn resolve_consts(pcx: inout Ctx<Comp>) {
     unsafe {
         var found = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for fi in 0..IRFUNC_COUNT {
@@ -334,42 +329,35 @@ fn resolve_consts() {
             }
         }
         for i in 0..found.count {
-            give_id(pending(found.data[i]));
+            give_id(pending(found.data[i]), &pcx);
         }
         free(found.data as *u8);
-        register_consts();
+        register_consts(&pcx);
     }
 }
 
-// The constants given ids and not yet added to the program's strings (in
-// id order), and the next id. Ids are given as the join goes, while the
-// tasks run and read the strings (str_at): the strings grow only between
-// phases (register_consts), with these ids.
-static var TO_REGISTER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var NEXT_CONST_ID: i64 = 0;
-
-fn give_id(p: *PendingConst) {
+fn give_id(p: *PendingConst, pcx: inout Ctx<Comp>) {
     unsafe {
-        if TO_REGISTER.count == 0 {
-            NEXT_CONST_ID = STR_COUNT;
+        if pcx.to_register.count == 0 {
+            pcx.next_const_id = STR_COUNT;
         }
-        (*p).id = NEXT_CONST_ID;
-        NEXT_CONST_ID += 1;
-        TO_REGISTER.push(p as i64);
+        (*p).id = pcx.next_const_id;
+        pcx.next_const_id += 1;
+        pcx.to_register.push(p as i64);
     }
 }
 
 // Adds the constants given ids to the program's strings (main thread,
 // between phases).
-fn register_consts() {
+fn register_consts(pcx: inout Ctx<Comp>) {
     unsafe {
-        for i in 0..TO_REGISTER.count {
-            let p = TO_REGISTER.data[i] as *PendingConst;
+        for i in 0..pcx.to_register.count {
+            let p = pcx.to_register.data[i] as *PendingConst;
             if add_const_data((*p).data[0..(*p).len], (*p).align) != (*p).id {
                 die(c"internal error: constant data numbered out of order");
             }
         }
-        TO_REGISTER.count = 0;
+        pcx.to_register.count = 0;
     }
 }
 
@@ -494,10 +482,10 @@ fn fresh_context(cx: inout FnCtx) -> *FnCtx {
 }
 
 // Runs tasks first..end of ITEMS (a phase, or a level of one).
-fn run_tasks(cx: inout FnCtx, kind: i64, first: i64, end: i64, pcx: Ctx<Comp>) {
+fn run_tasks(cx: inout FnCtx, kind: i64, first: i64, end: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        var tasks = task_list(&cx, kind, first, end, pcx);
-        pool_run(kind, tasks);
+        var tasks = task_list(&cx, kind, first, end, &pcx);
+        pool_run(kind, tasks, pcx);
         free(tasks.data as *u8);
     }
 }
@@ -508,17 +496,17 @@ fn run_tasks(cx: inout FnCtx, kind: i64, first: i64, end: i64, pcx: Ctx<Comp>) {
 // function started last would keep the others waiting), but emission's in
 // order (its texts are joined in order as they are done). What the tasks
 // read is made first (ir_release, prepare_layouts).
-fn task_list(cx: inout FnCtx, kind: i64, first: i64, end: i64, pcx: Ctx<Comp>) -> IntVec {
+fn task_list(cx: inout FnCtx, kind: i64, first: i64, end: i64, pcx: inout Ctx<Comp>) -> IntVec {
     unsafe {
         ir_release(&cx);
-        prepare_layouts(pcx);
+        prepare_layouts(&pcx);
         var tasks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var i = end;
         while i > first {
             i -= 1;
             tasks.push(i);
         }
-        if POOL_THREADS > 1 && kind != K_EMIT {
+        if pcx.pool_threads > 1 && kind != K_EMIT {
             let weight = alloc_array::<i64>(end + 1);
             for k in first..end {
                 weight[k] = task_weight(kind, ITEMS.data[k]);
@@ -583,28 +571,28 @@ fn sort_tasks(tasks: IntVec, weight: *i64) {
 
 // A per-function phase over ITEMS[first..end], then its constant data
 // numbered.
-fn run_functions(cx: inout FnCtx, kind: i64, first: i64, end: i64, pcx: Ctx<Comp>) {
-    run_tasks(&cx, kind, first, end, pcx);
-    resolve_consts();
+fn run_functions(cx: inout FnCtx, kind: i64, first: i64, end: i64, pcx: inout Ctx<Comp>) {
+    run_tasks(&cx, kind, first, end, &pcx);
+    resolve_consts(&pcx);
 }
 
 // Every live function's cleanup (-O1, -O2).
-pub fn cleanup_all(cx: inout FnCtx, pcx: Ctx<Comp>) {
+pub fn cleanup_all(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
     unsafe {
-        cc_phase(K_CLEANUP, pcx);
+        cc_phase(K_CLEANUP, &pcx);
         ITEMS.count = 0;
         for fi in 0..IRFUNC_COUNT {
             if FN_LIVE[fi] != 0 {
                 ITEMS.push(fi);
             }
         }
-        run_functions(&cx, K_CLEANUP, 0, ITEMS.count, pcx);
+        run_functions(&cx, K_CLEANUP, 0, ITEMS.count, &pcx);
     }
 }
 
 // Every live function's scalar pipeline (-O2, before interprocedural
 // constants).
-pub fn simplify_all(cx: inout FnCtx, pcx: Ctx<Comp>) {
+pub fn simplify_all(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
     unsafe {
         ITEMS.count = 0;
         for fi in 0..IRFUNC_COUNT {
@@ -612,39 +600,23 @@ pub fn simplify_all(cx: inout FnCtx, pcx: Ctx<Comp>) {
                 ITEMS.push(fi);
             }
         }
-        run_functions(&cx, K_SIMPLIFY, 0, ITEMS.count, pcx);
+        run_functions(&cx, K_SIMPLIFY, 0, ITEMS.count, &pcx);
     }
 }
 
 // ---- -O2: the components, bottom up ----
 
-// The components of SCC_ORDER (consecutive runs of one FN_SCC), the live
-// ones: COMP_START/COMP_END in SCC_ORDER; per IR function its component
-// (COMP_OF, -1: none); each component's level (COMP_LEVEL: 0 for one
-// calling no other, else 1 + the highest of the components it calls).
-//
-// The components of one level run at once, those of the next after them
-// (a barrier): a component reads only components of lower levels (the
-// ones it calls, and the ones a call made direct may reach), done by
-// then. Between levels the program's inlining budget and call counts take
-// what the level's components did (COMP_GROWTH, COMP_INLINED): a
-// component sees the program as the lower levels left it, and its own
-// changes. (0.17 ran the components one by one in SCC_ORDER, each seeing
-// every earlier one's; one thread now runs the levels' components in
-// that order, with the same views.)
-static var COMP_COUNT: i64 = 0;
 static var COMP_START: *i64 = 0 as *i64;
 static var COMP_END: *i64 = 0 as *i64;
 static var COMP_OF: *i64 = 0 as *i64;
 static var COMP_LEVEL: *i64 = 0 as *i64;
-static var LEVEL_COUNT: i64 = 0;
 // Per component: what its inlining added to the program's size, and the
 // callees it inlined (one entry per call); its task writes them.
 pub static var COMP_GROWTH: *i64 = 0 as *i64;
 pub static var COMP_INLINED: *IntVec = 0 as *IntVec;
 
 // Builds the components and their levels (main thread).
-fn build_components(cx: inout FnCtx) {
+fn build_components(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
     unsafe {
         let n = SCC_ORDER.count;
         COMP_START = alloc_array::<i64>(n + 1);
@@ -653,7 +625,7 @@ fn build_components(cx: inout FnCtx) {
         for fi in 0..IRFUNC_COUNT {
             COMP_OF[fi] = -1;
         }
-        COMP_COUNT = 0;
+        pcx.comp_count = 0;
         var i = 0;
         while i < n {
             var j = i + 1;
@@ -662,12 +634,12 @@ fn build_components(cx: inout FnCtx) {
             }
             // (a component's functions reach each other: all live or none)
             if FN_LIVE[SCC_ORDER.data[i]] != 0 {
-                COMP_START[COMP_COUNT] = i;
-                COMP_END[COMP_COUNT] = j;
+                COMP_START[pcx.comp_count] = i;
+                COMP_END[pcx.comp_count] = j;
                 for k in i..j {
-                    COMP_OF[SCC_ORDER.data[k]] = COMP_COUNT;
+                    COMP_OF[SCC_ORDER.data[k]] = pcx.comp_count;
                 }
-                COMP_COUNT += 1;
+                pcx.comp_count += 1;
             }
             i = j;
         }
@@ -675,12 +647,12 @@ fn build_components(cx: inout FnCtx) {
         // A function whose address it takes counts as one it calls (a call
         // through the address may be made direct, and the function inlined)
         // when it comes before it in SCC_ORDER (0.17 had it done then).
-        COMP_LEVEL = alloc_array::<i64>(COMP_COUNT + 1);
-        COMP_GROWTH = alloc_array::<i64>(COMP_COUNT + 1);
-        COMP_INLINED = alloc_zeroed((COMP_COUNT + 1) * size_of(IntVec)) as *IntVec;
-        LEVEL_COUNT = 0;
+        COMP_LEVEL = alloc_array::<i64>(pcx.comp_count + 1);
+        COMP_GROWTH = alloc_array::<i64>(pcx.comp_count + 1);
+        COMP_INLINED = alloc_zeroed((pcx.comp_count + 1) * size_of(IntVec)) as *IntVec;
+        pcx.level_count = 0;
         var calls = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for c in 0..COMP_COUNT {
+        for c in 0..pcx.comp_count {
             var level = 0;
             for k in COMP_START[c]..COMP_END[c] {
                 callees_and_addresses(&cx, SCC_ORDER.data[k], &calls);
@@ -692,8 +664,8 @@ fn build_components(cx: inout FnCtx) {
                 }
             }
             COMP_LEVEL[c] = level;
-            if level + 1 > LEVEL_COUNT {
-                LEVEL_COUNT = level + 1;
+            if level + 1 > pcx.level_count {
+                pcx.level_count = level + 1;
             }
         }
         ir_release(&cx);
@@ -727,34 +699,34 @@ fn callees_and_addresses(cx: inout FnCtx, fi: i64, out: inout IntVec) {
 }
 
 // Runs the -O2 bottom-up phase, a level at a time.
-pub fn optimize_components(cx: inout FnCtx, pcx: Ctx<Comp>) {
+pub fn optimize_components(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
     unsafe {
-        build_components(&cx);
-        cc_phase(K_COMPONENT, pcx);
+        build_components(&cx, &pcx);
+        cc_phase(K_COMPONENT, &pcx);
         // The components of each level, in SCC_ORDER.
         var by_level = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let start = alloc_array::<i64>(LEVEL_COUNT + 2);
-        for c in 0..COMP_COUNT {
+        let start = alloc_array::<i64>(pcx.level_count + 2);
+        for c in 0..pcx.comp_count {
             start[COMP_LEVEL[c] + 1] += 1;
         }
-        for l in 0..LEVEL_COUNT {
+        for l in 0..pcx.level_count {
             start[l + 1] += start[l];
         }
-        let fill = alloc_array::<i64>(LEVEL_COUNT + 1);
-        for c in 0..COMP_COUNT {
+        let fill = alloc_array::<i64>(pcx.level_count + 1);
+        for c in 0..pcx.comp_count {
             by_level.push(0);
         }
-        for c in 0..COMP_COUNT {
+        for c in 0..pcx.comp_count {
             let l = COMP_LEVEL[c];
             by_level.data[start[l] + fill[l]] = c;
             fill[l] += 1;
         }
-        for l in 0..LEVEL_COUNT {
+        for l in 0..pcx.level_count {
             ITEMS.count = 0;
             for k in start[l]..start[l + 1] {
                 ITEMS.push(by_level.data[k]);
             }
-            run_tasks(&cx, K_COMPONENT, 0, ITEMS.count, pcx);
+            run_tasks(&cx, K_COMPONENT, 0, ITEMS.count, &pcx);
             // The barrier: the level's growth and inlined calls, for the
             // next levels.
             for k in start[l]..start[l + 1] {
@@ -768,7 +740,7 @@ pub fn optimize_components(cx: inout FnCtx, pcx: Ctx<Comp>) {
         free(start as *u8);
         free(fill as *u8);
         free(by_level.data as *u8);
-        resolve_consts();
+        resolve_consts(&pcx);
     }
 }
 
@@ -842,8 +814,6 @@ pub struct FnText {
     pub rtids: *i64, pub nrtids: i64,
 }
 
-// (0.18.1) The join's scratch for the loads of RTID values (main thread).
-static var RT_CX: *FnCtx = 0 as *FnCtx;
 pub static var FN_TEXT: *FnText = 0 as *FnText;
 
 // Emits the functions in `order` (IR functions, program order): those
@@ -851,40 +821,37 @@ pub static var FN_TEXT: *FnText = 0 as *FnText;
 // others inline as the middle end left them), and joins their texts into
 // cx's (the program's) in that order: as they are done, beside the
 // emission (pool_run_joined); with one thread, after it.
-pub fn emit_functions(cx: sink *FnCtx, order: IntVec, split: i64, pcx: Ctx<Comp>) {
+pub fn emit_functions(cx: sink *FnCtx, order: IntVec, split: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         ITEMS.count = 0;
         for i in 0..order.count {
             ITEMS.push(order.data[i]);
         }
-        JOIN_CX = cx;
-        RT_RENUMBERED = true;
-        if RT_CX == 0 as *FnCtx {
-            RT_CX = crate::middle::ctx::fnctx_new();
+        pcx.join_cx = cx;
+        pcx.rt_renumbered = true;
+        if pcx.rt_cx == 0 as *FnCtx {
+            pcx.rt_cx = crate::middle::ctx::fnctx_new();
         }
-        cc_phase(K_EMIT, pcx);
-        emit_range(&*cx, 0, split, pcx);
-        emit_range(&*cx, split, ITEMS.count, pcx);
-        phase_time(c"emission, join and assembly");
+        cc_phase(K_EMIT, &pcx);
+        emit_range(&*cx, 0, split, &pcx);
+        emit_range(&*cx, split, ITEMS.count, &pcx);
+        phase_time(c"emission, join and assembly", &pcx);
     }
 }
 
-// The program's context, which the join appends to (main thread).
-static var JOIN_CX: *FnCtx = 0 as *FnCtx;
-
-fn emit_range(cx: inout FnCtx, first: i64, end: i64, pcx: Ctx<Comp>) {
+fn emit_range(cx: inout FnCtx, first: i64, end: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        var tasks = task_list(&cx, K_EMIT, first, end, pcx);
+        var tasks = task_list(&cx, K_EMIT, first, end, &pcx);
         var next = first;
-        if POOL_THREADS > 1 {
-            next = pool_run_joined(K_EMIT, tasks, first, end, pcx);
+        if pcx.pool_threads > 1 {
+            next = pool_run_joined(K_EMIT, tasks, first, end, &pcx);
         } else {
-            pool_run(K_EMIT, tasks);
+            pool_run(K_EMIT, tasks, pcx);
         }
         free(tasks.data as *u8);
-        resolve_consts();
+        resolve_consts(&pcx);
         while next < end {
-            join_task(next, pcx);
+            join_task(next, &pcx);
             next += 1;
         }
     }
@@ -893,7 +860,7 @@ fn emit_range(cx: inout FnCtx, first: i64, end: i64, pcx: Ctx<Comp>) {
 // Joins the text of task i (ITEMS' position i) to the program's (main
 // thread): false when it names constant data its phase has not numbered
 // yet (that waits for the phase's end, resolve_consts).
-pub fn join_task(i: i64, pcx: Ctx<Comp>) -> bool {
+pub fn join_task(i: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
         let fi = ITEMS.data[i];
         let t = &FN_TEXT[fi] as *FnText;
@@ -901,15 +868,15 @@ pub fn join_task(i: i64, pcx: Ctx<Comp>) -> bool {
         // constant data made then: one thread numbers it in the emission's
         // order, which is the join's, so it is numbered here.
         if PER_FUNCTION {
-            number_consts(fi);
+            number_consts(fi, &pcx);
         }
         if (*t).len > 0 {
             if !consts_numbered(*t) {
                 return false;
             }
-            join_text(&*JOIN_CX, *t);
-            JOIN_CX.label_count += (*t).labels;
-            asm_flush(&*JOIN_CX, pcx);
+            join_text(&*pcx.join_cx, *t, &pcx);
+            pcx.join_cx.label_count += (*t).labels;
+            asm_flush(&*pcx.join_cx, pcx);
         }
         free((*t).data);
         free((*t).relocs as *u8);
@@ -925,12 +892,12 @@ pub fn join_task(i: i64, pcx: Ctx<Comp>) -> bool {
 }
 
 // Numbers function fi's constant data not numbered yet, in its order.
-fn number_consts(fi: i64) {
+fn number_consts(fi: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         for k in 0..FN_CONSTS[fi].count {
             let p = pending(-(1 + (fi << OWNER_SHIFT) + k));
             if (*p).id < 0 {
-                give_id(p);
+                give_id(p, &pcx);
             }
         }
     }
@@ -969,7 +936,7 @@ fn consts_numbered(t: FnText) -> bool {
 // code cache) the id of the text's string or constant i, the line
 // \x04<r>,<i> (0.18.1) the load into register r of the program's number
 // for the text's RTID value i (gen0::target::rt_output).
-fn join_text(cx: inout FnCtx, t: FnText) {
+fn join_text(cx: inout FnCtx, t: FnText, pcx: inout Ctx<Comp>) {
     unsafe {
         let text = t.data;
         let len = t.len;
@@ -1014,9 +981,9 @@ fn join_text(cx: inout FnCtx, t: FnText) {
                 }
                 j += 1;
                 let v = t.rtids[k];
-                m_load_imm(&*RT_CX, n, rt_output(rtid_class(v), rtid_value(v)) as u64);
-                buf_bytes(cx.asm, buf_slice(RT_CX.code));
-                buf_clear(RT_CX.code);
+                m_load_imm(&*pcx.rt_cx, n, rt_output(rtid_class(v), rtid_value(v), &pcx) as u64);
+                buf_bytes(cx.asm, buf_slice(pcx.rt_cx.code));
+                buf_clear(pcx.rt_cx.code);
                 four = next_marker(text, j, len, 4);
             } else if text[at] == 3 {
                 if n >= t.nrelocs {
@@ -1057,7 +1024,7 @@ fn next_marker(text: *u8, from: i64, len: i64, byte: i32) -> i64 {
 // what the passes would otherwise make the first time they need it, on
 // whichever thread (the symbols they compare with, the e-graph's rules,
 // the C library's table, every type's layout, the growth mode).
-fn prepare_tasks(cx: inout FnCtx, pcx: Ctx<Comp>) {
+fn prepare_tasks(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
     crate::base::stress_grow();
     crate::gen0::target::rt_panic_sym();
     // (emission compares a CallC with both: interned here, as a task
@@ -1067,22 +1034,19 @@ fn prepare_tasks(cx: inout FnCtx, pcx: Ctx<Comp>) {
     crate::middle::ipo::init_syms();
     crate::front::effects::builtin::c_class(0);
     crate::middle::egraph::init_rules();
-    prepare_layouts(pcx);
+    prepare_layouts(&pcx);
 }
-
-// The types laid out for the tasks: TYPES[..LAID_OUT].
-static var LAID_OUT: i64 = 0;
 
 // Every type's layout, Freeze fact and every enum's niche, made before
 // a phase's tasks run: compute_layout, is_freeze and enum_niche make one
 // the first time it is asked (is_freeze in a shared map), and a task may
 // ask: GVN asks is_freeze of a parameter's type (the types a serial phase
 // made since the last are prepared here too).
-fn prepare_layouts(pcx: Ctx<Comp>) {
-    while LAID_OUT < TYPES.len() as i64 {
-        compute_layout(LAID_OUT);
-        crate::front::cells::is_freeze(LAID_OUT);
-        LAID_OUT += 1;
+fn prepare_layouts(pcx: inout Ctx<Comp>) {
+    while pcx.laid_out < TYPES.len() as i64 {
+        compute_layout(pcx.laid_out);
+        crate::front::cells::is_freeze(pcx.laid_out);
+        pcx.laid_out += 1;
     }
     for e in 0..pcx.enum_count {
         enum_niche(e);

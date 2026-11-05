@@ -15,7 +15,7 @@ use crate::base::timer::{
 };
 use crate::front::modules::{STD_MODULE, module_of, within_std};
 use crate::front::types::FNS;
-use crate::gen0::gen::{EMIT_IR, EMIT_MIR, fn_is_global};
+use crate::gen0::gen::fn_is_global;
 use crate::middle::adce::aggressive_dce;
 use crate::middle::copies::elide_copies;
 use crate::middle::ctx::FnCtx;
@@ -31,9 +31,7 @@ use crate::middle::inline::{
     forget_fn_caches, func_size, init_fn_caches, inline_rounds, inlined_everywhere, ir_callee,
     optimize_with_leaves, simplify_inlining_leaves, start_inlining_budget,
 };
-use crate::middle::ipo::{
-    PRINT_ATTRS, has_effect, heap_to_stack, init_attrs, print_attrs, propagate_constants,
-};
+use crate::middle::ipo::{has_effect, heap_to_stack, init_attrs, print_attrs, propagate_constants};
 use crate::middle::ir::{
     FN_IR, IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_arg, ir_enter, ir_operand,
     ir_operand_count, ir_replace, ir_resolve_operands, ir_shrink, ir_unlink, ir_val,
@@ -60,15 +58,6 @@ use crate::middle::vectorize::{VECTORIZE, vectorize_loops};
 use crate::middle::vectorize::unroll::unroll_runtime_loops;
 
 pub static var OPT_LEVEL: i64 = 2;
-
-// (0.26.3, decision 6) Rust's overflow checks: `+ - *`, unary `-` and the
-// shifts checked (places IR: RV_CHECKED), on at -O0 and off at -O1 and up,
-// `--overflow-checks=on|off` (OVERFLOW_FLAG: 1, 0, -1 none) over the
-// level. Set once from the level the line gives (build, before --trace
-// and the test build raise it); std is built with the program's setting.
-// `/` and `%` check a zero divisor and MIN / -1 at every level.
-pub static var OVERFLOW_FLAG: i64 = -1;
-pub static var OVERFLOW_CHECKS: bool = false;
 
 // Resolves every operand of every instruction of function `fi` (after
 // replacements).
@@ -633,15 +622,15 @@ pub fn optimize_program(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
             FN_LIVE[fi] = 1;
         }
         // (0.18.1) No entry facts in a function an indirect call may enter.
-        strip_taken(&cx);
+        strip_taken(&cx, pcx);
         drop_unreachable_std(&cx, &pcx);
         // (0.18.1) The code cache (back::codecache).
         cc_begin(&pcx);
         // (0.18.1) The tasks' threads (middle::parallel), and each function's
         // cleanup on them.
-        parallel_begin(&cx, pcx);
-        cleanup_all(&cx, pcx);
-        phase_time(c"cleanup");
+        parallel_begin(&cx, &pcx);
+        cleanup_all(&cx, &pcx);
+        phase_time(c"cleanup", &pcx);
         if OPT_LEVEL == 0 {
             return;
         }
@@ -650,12 +639,12 @@ pub fn optimize_program(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
         if OPT_LEVEL == 1 {
             simplify_inlining_leaves(&cx);
             timer_add(T_SCALAR, t);
-            phase_time(c"small leaves");
+            phase_time(c"small leaves", &pcx);
             return;
         }
-        simplify_all(&cx, pcx);
+        simplify_all(&cx, &pcx);
         timer_add(T_SCALAR, t);
-        phase_time(c"scalar pipeline");
+        phase_time(c"scalar pipeline", &pcx);
         if OPT_LEVEL < 2 {
             return;
         }
@@ -674,32 +663,32 @@ pub fn optimize_program(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
         // The functions whose address the program takes stay in it, even when
         // every call through the address is made direct (see
         // remove_dead_functions).
-        FN_TAKEN = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        pcx.fn_taken = alloc_array::<i64>(IRFUNC_COUNT + 1);
         DEFERRED = alloc_array::<i64>(IRFUNC_COUNT + 1);
         for fi in 0..IRFUNC_COUNT {
-            FN_TAKEN[fi] = FN_ADDRESS[fi];
+            pcx.fn_taken[fi] = FN_ADDRESS[fi];
         }
         compute_sccs(&cx);
-        propagate_constants(&cx);
+        propagate_constants(&cx, &pcx);
         for fi in 0..IRFUNC_COUNT {
             ir_enter(&cx, fi);
             FN_SIZE[fi] = func_size(&cx, fi);
         }
         start_inlining_budget();
         timer_add(T_IPCP, t);
-        phase_time(c"interprocedural constants, components");
+        phase_time(c"interprocedural constants, components", &pcx);
         // (0.18.1: each component once the components it calls are done,
         // middle::parallel; one thread takes them in SCC_ORDER, as 0.17 did)
-        optimize_components(&cx, pcx);
-        phase_time(c"components, bottom up");
+        optimize_components(&cx, &pcx);
+        phase_time(c"components, bottom up", &pcx);
         t = timer_now();
-        remove_dead_functions(&cx);
+        remove_dead_functions(&cx, pcx);
         timer_add(T_GLOBAL_DCE, t);
-        phase_time(c"dead functions");
+        phase_time(c"dead functions", &pcx);
         // The functions whose loop passes waited for their callers, and that
         // are still called somewhere, then SLP (finish_function): when each
         // is emitted (0.18.1), or here for the IR printers.
-        if EMIT_IR || EMIT_MIR {
+        if pcx.emit_ir || pcx.emit_mir {
             for fi in 0..IRFUNC_COUNT {
                 deferred_loops(&cx, fi);
             }
@@ -707,7 +696,7 @@ pub fn optimize_program(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
                 slp_function(&cx, fi);
             }
         }
-        if PRINT_ATTRS {
+        if pcx.print_attrs {
             print_attrs();
         }
     }
@@ -898,17 +887,13 @@ fn light_cleanup(cx: inout FnCtx, fi: i64) {
     verify_func(&cx, fi, c"cleanup");
 }
 
-// Per IR function: whether the program took its address (before
-// optimization).
-static var FN_TAKEN: *i64 = 0 as *i64;
-
 // Global dead code elimination: functions nobody calls or takes the
 // address of (other than main and the extern "C" definitions) are not
 // emitted, transitively. A function whose address the program took is
 // kept even when every call through it was made direct and inlined: a
 // function used as a value is part of what the program is (and of what
 // the tests look at).
-fn remove_dead_functions(cx: inout FnCtx) {
+fn remove_dead_functions(cx: inout FnCtx, pcx: Ctx<Comp>) {
     unsafe {
         var changed = true;
         while changed {
@@ -916,7 +901,7 @@ fn remove_dead_functions(cx: inout FnCtx) {
             count_call_sites(&cx);
             for fi in 0..IRFUNC_COUNT {
                 if FN_LIVE[fi] != 0 && FN_CALLS[fi] == 0 && FN_ADDRESS[fi] == 0
-                    && FN_TAKEN[fi] == 0 && !fn_is_global(IRFUNCS[fi].f) {
+                    && pcx.fn_taken[fi] == 0 && !fn_is_global(IRFUNCS[fi].f) {
                     FN_LIVE[fi] = 0;
                     changed = true;
                 }

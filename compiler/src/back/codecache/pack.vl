@@ -21,6 +21,8 @@ use crate::host_target;
 use crate::back::codecache::hash::hash_bytes;
 use crate::back::codecache::snapshot::Reader;
 use crate::base::{alloc_array, alloc_zeroed, free, getenv, memcpy, strlen};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::target::{T_AARCH64_MACOS, T_X86_64_MACOS};
 
 extern "C" {
@@ -55,9 +57,7 @@ const LIMIT: i64 = 1024 * 1024 * 1024;
 // The pack read: its words, its entries' offsets (words) and keys, the
 // index by key (open addressing: entry + 1).
 static var PACK: *i64 = 0 as *i64;
-static var PACK_WORDS: i64 = 0;
 static var ENTRY_AT: *i64 = 0 as *i64;
-static var ENTRY_COUNT: i64 = 0;
 static var INDEX: *i64 = 0 as *i64;
 static var INDEX_SIZE: i64 = 0;
 // Per entry read: whether this build used it (its own task writes it).
@@ -69,19 +69,15 @@ pub struct NewEntry { body: *u8, len: i64, a: u64, b: u64 }
 static var NEW: *NewEntry = 0 as *NewEntry;
 static var NEW_SLOTS: i64 = 0;
 
-pub static var PACK_PATH: *u8 = 0 as *u8;
-static var IDENT: i64 = 0;
-static var OPTIONS: i64 = 0;
-
 // ---- Reading ----
 
 // Reads the pack at `path` (made by compiler `ident` for options
 // `options`), if there is a whole one; `slots` entries may be made.
-pub fn pack_load(path: *u8, ident: i64, options: i64, slots: i64) {
+pub fn pack_load(path: *u8, ident: i64, options: i64, slots: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        PACK_PATH = path;
-        IDENT = ident;
-        OPTIONS = options;
+        pcx.pack_path = path;
+        pcx.pack_ident = ident;
+        pcx.options = options;
         NEW_SLOTS = slots;
         NEW = alloc_zeroed((slots + 1) * size_of(NewEntry)) as *NewEntry;
         let fd = open(path, 0);
@@ -124,9 +120,9 @@ pub fn pack_load(path: *u8, ident: i64, options: i64, slots: i64) {
             k += ENTRY_WORDS + (len + 7) / 8;
         }
         PACK = w;
-        PACK_WORDS = words;
+        pcx.pack_words = words;
         ENTRY_AT = at;
-        ENTRY_COUNT = n;
+        pcx.entry_count = n;
         USED = alloc_array::<bool>(n + 1);
         INDEX_SIZE = 64;
         while INDEX_SIZE < 2 * n + 2 {
@@ -211,14 +207,14 @@ pub fn pack_new(s: i64, a: u64, b: u64, body: *u8, len: i64) {
 
 // What the build would write: whether anything changed (new entries, or
 // read ones not used).
-pub fn pack_changed() -> bool {
+pub fn pack_changed(pcx: Ctx<Comp>) -> bool {
     unsafe {
         for s in 0..NEW_SLOTS {
             if NEW[s].body != 0 as *u8 {
                 return true;
             }
         }
-        for e in 0..ENTRY_COUNT {
+        for e in 0..pcx.entry_count {
             if !USED[e] {
                 return true;
             }
@@ -259,7 +255,7 @@ fn entry_bytes(len: i64) -> i64 {
 // Writes the new pack (main thread, or the copy of the process that
 // writes it): the entries used and made, then the others young enough
 // while the pack stays under twice the used ones.
-pub fn pack_save() {
+pub fn pack_save(pcx: Ctx<Comp>) {
     unsafe {
         var used_bytes = 0;
         var count = 0;
@@ -269,7 +265,7 @@ pub fn pack_save() {
                 count += 1;
             }
         }
-        for e in 0..ENTRY_COUNT {
+        for e in 0..pcx.entry_count {
             if USED[e] {
                 used_bytes += entry_bytes(PACK[ENTRY_AT[e]]);
                 count += 1;
@@ -277,10 +273,10 @@ pub fn pack_save() {
         }
         // The others, youngest first, while they fit.
         let room = if used_bytes < 16 * 1024 * 1024 { 32 * 1024 * 1024 } else { 2 * used_bytes };
-        let keep = alloc_array::<bool>(ENTRY_COUNT + 1);
+        let keep = alloc_array::<bool>(pcx.entry_count + 1);
         var total = used_bytes;
         for age in 0..MAX_AGE {
-            for e in 0..ENTRY_COUNT {
+            for e in 0..pcx.entry_count {
                 let k = ENTRY_AT[e];
                 if !USED[e] && PACK[k + 3] == age && total + entry_bytes(PACK[k]) <= room {
                     keep[e] = true;
@@ -289,15 +285,15 @@ pub fn pack_save() {
                 }
             }
         }
-        let tmp = tmp_path(PACK_PATH);
+        let tmp = tmp_path(pcx.pack_path);
         let f = fopen(tmp, c"wb");
         if f == 0 as *u8 {
             return;
         }
         put_word(f, MAGIC);
         put_word(f, VERSION);
-        put_word(f, IDENT);
-        put_word(f, OPTIONS);
+        put_word(f, pcx.pack_ident);
+        put_word(f, pcx.options);
         put_word(f, HEADER_WORDS * 8 + total);
         put_word(f, count);
         put_word(f, time(0 as *i64));
@@ -308,28 +304,28 @@ pub fn pack_save() {
                 put_entry(f, n.body, n.len, n.a, n.b, 0, hash_bytes(n.body, n.len) as i64);
             }
         }
-        for e in 0..ENTRY_COUNT {
+        for e in 0..pcx.entry_count {
             let k = ENTRY_AT[e];
             if USED[e] || keep[e] {
                 put_entry(f, (&PACK[k + ENTRY_WORDS]) as *u8, PACK[k], PACK[k + 1] as u64,
                     PACK[k + 2] as u64, if USED[e] { 0 } else { PACK[k + 3] + 1 }, PACK[k + 4]);
             }
         }
-        if fclose(f) != 0 || rename(tmp, PACK_PATH) != 0 {
+        if fclose(f) != 0 || rename(tmp, pcx.pack_path) != 0 {
             unlink(tmp);
             return;
         }
-        evict();
+        evict(pcx);
     }
 }
 
 // The pack was all used and nothing was made: its time of last use.
-pub fn pack_touch() {
+pub fn pack_touch(pcx: Ctx<Comp>) {
     unsafe {
         if PACK == 0 as *i64 {
             return;
         }
-        let fd = open(PACK_PATH, 1);
+        let fd = open(pcx.pack_path, 1);
         if fd >= 0 {
             var now: [i64; 1] = [time(0 as *i64)];
             pwrite(fd, (&now[0]) as *u8, 8, 48);
@@ -370,9 +366,9 @@ fn tmp_path(path: *u8) -> *u8 {
 
 // The directory's packs (g-*.pack): when they pass the limit, the least
 // recently used go.
-fn evict() {
+fn evict(pcx: Ctx<Comp>) {
     unsafe {
-        let dir = dir_of(PACK_PATH);
+        let dir = dir_of(pcx.pack_path);
         var limit = LIMIT;
         let env = getenv(c"VOLE_CACHE_LIMIT");
         if env != 0 as *u8 {
@@ -446,7 +442,7 @@ fn evict() {
                     old = i;
                 }
             }
-            if !same_path(names[old], PACK_PATH) {
+            if !same_path(names[old], pcx.pack_path) {
                 unlink(names[old]);
             }
             total -= sizes[old];
