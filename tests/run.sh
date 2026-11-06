@@ -65,8 +65,7 @@
 #   // STDIN: text       stdin, one directive per line, joined with '\n'
 #   // ENV: NAME=VALUE   (0.25.4) a variable of the program's environment,
 #                        one directive each; @ROOT@ in VALUE is the root
-#                        (`// ENV: VOLE_WINDOW_SCRIPT=frames 2; key q`); (0.27.2)
-#                        VOLE_STD2 is the compiler's too (check_case)
+#                        (`// ENV: VOLE_WINDOW_SCRIPT=frames 2; key q`)
 #   // EXPECT: text      expected stdout, one directive per line; (0.25.2)
 #                        holes for what changes from run to run: {num} a
 #                        number (12, -3, 0.25, 1.5e-3), {int} an integer,
@@ -544,12 +543,6 @@ check_case() {
         1) fix_case "$source" "$dir" --fix-imports || return 1 ;;
         2) fix_case "$source" "$dir" --fix-unsafe || return 1 ;;
     esac
-    # (0.27.2) A case's `// ENV: VOLE_STD2=0` is the compiler's too: a rust
-    # case written against MVS's std reads it until it migrates to std2
-    # (each case runs in its own subshell: the export ends with it)
-    if [ -s "$dir/env" ] && grep -q '^VOLE_STD2=' "$dir/env"; then
-        export "$(grep '^VOLE_STD2=' "$dir/env" | tail -1)"
-    fi
     # The compiler's options for the case (0.9).
     FLAGS="--deny-warnings $DIAG_FLAG $(sed "s|@ROOT@|$ROOT|g" "$dir/flags")"
     # (--check-unsafe needs the IR: such a case runs at -O1 when -O0 is
