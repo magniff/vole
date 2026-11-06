@@ -643,6 +643,19 @@ try:
     del os.environ["VOLE_TEST_DEBOUNCE"]
     shutil.rmtree(os.path.join(prog, "tests"))
 
+    # (0.27.2) A test case's options, as tests/run.sh gives them: its
+    # FLAGS' edition and its ENV's VOLE_STD2 (the compiler's too); none
+    # for a file without them, or check's default.
+    rc = os.path.join(tmp, "rcase.vl")
+    write(rc, "fn main() {}\n// FLAGS: --edition rust\n// ENV: VOLE_STD2=0\n// ENV: OTHER=1\n")
+    case("case options: FLAGS and ENV", hook.case_options(rc), (["--edition", "rust"], {"VOLE_STD2": "0"}))
+    write(rc, "fn main() {}\n// FLAGS: --deny-warnings --edition=rust\n")
+    case("case options: --edition=rust", hook.case_options(rc), (["--edition", "rust"], {}))
+    write(rc, "// EDITION: rust\nfn main() {}\n")
+    case("case options: the root line is the compiler's", hook.case_options(rc), ([], {}))
+    case("case options: no root", hook.case_options(None), ([], {}))
+    os.remove(rc)
+
     # The real compiler, when it has --json (0.15): a clean program is
     # silent, an error is reported; and the latency on a cache hit.
     # (0.25.2.1) The compiler under test when tests/run.sh says which
@@ -671,6 +684,16 @@ try:
              (["changed main.vl:3: let mut y = 1 + \"a\"; -> var y = 1 + \"a\";",
                "fixed main.vl:3:5: 'let mut' is Rust's spelling; a mutable binding is 'var x' | its exact fix",
                "  main.vl:2: prinln(\"x\"); -> println(\"x\");"], True, False))
+        # (0.27.2) A rust case whose edition is its `// FLAGS:` line is
+        # checked in it: its Rust spellings are not "fixed" into MVS's.
+        rust = ("fn incr(r: &mut i64) {\n    *r += 1;\n}\n\nfn main() {\n    let mut n = 41;\n"
+                "    incr(&mut n);\n}\n// FLAGS: --edition rust\n")
+        write(os.path.join(prog, "main.vl"), rust)
+        got = ctx_of(run(ev2, real)[1])
+        with open(os.path.join(prog, "main.vl")) as fh:
+            now = fh.read()
+        case("real: a rust case's FLAGS, kept", (now == rust, "conv.rust" in got, "changed main.vl" in got),
+             (True, False, False))
         # (0.25.2.2) A file the call left unformatted: said once, until
         # it is formatted; the hook formats nothing.
         write(os.path.join(prog, "main.vl"), "fn main() {\n    let x: i64 =   1;\n    let y = x + 1;\n}\n")
