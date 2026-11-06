@@ -579,9 +579,10 @@ check_case() {
     # name's cksum: the places IR's form checked where the suite builds
     # it, now that both code generators read it and -O0 is no independent
     # lowering; every case would add 8% to the cases' time, every other
-    # one 4%)
+    # one 4%; 0.27.2: the cksum of the file's name, not its path, so that
+    # every worktree and the gate check the same cases)
     if [ "$VERIFY_EVERY" -gt 0 ] && [ "$(cat "$dir/noextra")" != 1 ] \
-        && [ $(($(printf '%s' "$file" | cksum | cut -d' ' -f1) % VERIFY_EVERY)) = 0 ]; then
+        && [ $(($(printf '%s' "${file##*/}" | cksum | cut -d' ' -f1) % VERIFY_EVERY)) = 0 ]; then
         FLAGS="$FLAGS --verify-places"
     fi
     if [ -s "$dir/errors" ]; then
