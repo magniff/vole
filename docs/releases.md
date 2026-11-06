@@ -153,6 +153,14 @@ The front (front272):
   whose parameters its self type does not all fix (`impl<T:
   PartialEq<U>, U> PartialEq<[U]> for [T]`) is bound by unification,
   not by position.
+- `&mut str` keeps its mutability (F0.1): a `&mut self` method of str
+  on a `&str` is `own.readonly` (rustc E0596) and a `&str` where a
+  `&mut str` goes a mismatch (E0308), where both were accepted; a
+  `&mut str` coerces to `&str`, `&mut s` of a String to `&mut str`, and
+  a String's `&mut self` str methods go through `as_mut_str`.
+- `Vec<&str>` and `Vec<&[T]>` on std2 hold their views: a `*const T`
+  with T a view stays thin; only a pointee written `[T]` or `str` makes
+  a fat raw pointer (Z9.3).
 - The tools' cache is keyed by which std a rust program reads
   (VOLE_STD2=0 or std2), so a check no longer restores the other's
   errors.

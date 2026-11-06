@@ -41,6 +41,7 @@ pub fn check(bck: inout Bck<Comp>, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>
     dataflow(pbody, &pcx);
     bck.reported.clear();
     assign_twice(&bck, pbody, &pcx);
+    mutability(&bck, pbody, &pcx);
     for i in 0..pbody.rpo.len() as i64 {
         let b = pbody.rpo[i];
         for w in 0..3 * pcx.nw {
@@ -182,6 +183,175 @@ fn through_raw(l: i64, p: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> bool 
         t = step_type(t, kind, proj_val(q, pbody), &pcx);
     }
     false
+}
+
+// RULE: D2.7 (every write to a projected place and every exclusive loan,
+// a two-phase autoref's included: the place must be mutable; a whole
+// local's write is M7's)
+fn mutability(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    for i in 0..pbody.rpo.len() as i64 {
+        let b = pbody.rpo[i];
+        let start = block_start(b, pbody);
+        for loc in start..block_term(b, pbody) + 1 {
+            let st = pbody.stmts[loc];
+            let k = st.kind;
+            if (k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC) && st.a >= 0 && st.b != 0 {
+                let why = immutable_why(st.a, st.b, pbody, &pcx);
+                if why == 1 {
+                    report_immutable(loc, st.a, st.b, why, false, &bck, pbody, &pcx);
+                }
+            }
+            // (a `&T` or shared view passed where the callee takes `&mut T`:
+            // the front's autoref of a receiver, `s.bump()` with `s: &S`)
+            if k == SK_CALL && st.c >= 0 {
+                let np = pcx.fns[st.c].param_count;
+                for i in 0..st.nops {
+                    if i >= np || !crate::places::ir::op_is_place(op_kind(st.ops, i, pbody)) {
+                        continue;
+                    }
+                    let l = op_a(st.ops, i, pbody);
+                    let p = op_b(st.ops, i, pbody);
+                    // (a user's local: a temporary the lowering made, a
+                    // reslice `self[..mid]` of a `&mut [T]`, is typed by
+                    // the front as a shared view)
+                    if l >= 0 && (pbody.locals[l].flags
+                        & (crate::places::ir::LF_USER | crate::places::ir::LF_PARAM)) != 0
+                        && exclusive_ty(crate::front::types::fn_param(st.c, i, pcx), pcx)
+                        && shared_ty(crate::places::ir::full_place_type(l, p, pbody, &pcx), pcx) {
+                        report_immutable(loc, l, p, 1, true, &bck, pbody, &pcx);
+                    }
+                }
+            }
+            if k == SK_ASSIGN && st.c == crate::places::ir::RV_REF
+                && (st.d == crate::places::ir::BK_MUT || st.d == crate::places::ir::BK_MUT2)
+                && st.nops > 0 && crate::places::ir::op_is_place(op_kind(st.ops, 0, pbody)) {
+                let l = op_a(st.ops, 0, pbody);
+                let p = op_b(st.ops, 0, pbody);
+                let why = immutable_why(l, p, pbody, &pcx);
+                // (a local not declared `mut`: an explicit `&mut a` only; a
+                // write to its part and a two-phase autoref, `a.bump()`, are
+                // the front's, which also knows a pattern's `ref mut`
+                // binding)
+                if why == 1 || why == 2 && st.d == crate::places::ir::BK_MUT
+                    && !capture_loan(loc, st.a, block_term(b, pbody), pbody) {
+                    report_immutable(loc, l, p, why, true, &bck, pbody, &pcx);
+                }
+            }
+        }
+    }
+}
+
+// RULE: D19.2 Whether the `&mut` loan at loc, into temporary dest, is a
+// closure's capture (moved into its env literal before the block's end at
+// term): rustc's unique borrow of a variable the closure writes through
+// (its own `&mut`), which needs no `let mut` (LocalMutationIsAllowed::Yes).
+fn capture_loan(loc: i64, dest: i64, term: i64, pbody: Body<Comp>) -> bool {
+    if dest < 0 {
+        return false;
+    }
+    for s in loc + 1..term {
+        let st = pbody.stmts[s];
+        if st.kind == SK_ASSIGN && st.c == crate::places::ir::RV_AGG
+            && st.d == crate::places::ir::AK_CLOSURE {
+            for i in 0..st.nops {
+                if op_kind(st.ops, i, pbody) == OK_MOVE && op_a(st.ops, i, pbody) == dest
+                    && op_b(st.ops, i, pbody) == 0 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+// Whether type t is an exclusive reference or view (`&mut T`, `&mut [T]`).
+fn exclusive_ty(t0: i64, pcx: Ctx<Comp>) -> bool {
+    let t = undistinct(t0, pcx);
+    t > 0 && (pcx.types[t].kind == TyKind::Ptr || pcx.types[t].kind == TyKind::Slice)
+        && pcx.types[t].b == crate::front::types::REF_MUT
+}
+
+// Whether type t is a shared reference or view (`&T`, `&[T]`, `&str`).
+fn shared_ty(t0: i64, pcx: Ctx<Comp>) -> bool {
+    let t = undistinct(t0, pcx);
+    t > 0 && (pcx.types[t].kind == TyKind::Ptr && pcx.types[t].b == crate::front::types::REF_SHARED
+        || pcx.types[t].kind == TyKind::Slice && pcx.types[t].b != crate::front::types::REF_MUT
+        && pcx.types[t].b != crate::front::types::REF_RAW)
+}
+
+// RULE: D2.7 (rustc's is_mutable, innermost projection first) Why place
+// (l, p) is not mutable: 0 it is; 1 it is behind a shared reference or
+// view; 2 its root is a user's local not declared `mut`.
+fn immutable_why(l: i64, p: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+    if l < 0 {
+        return 0;
+    }
+    // (a closure body's env: its captures' modes are D19.6's, the front's
+    // closure.kind; a unique borrow of a `&mut` capture is typed `&`)
+    let lt = undistinct(local_ty(l, pbody), pcx);
+    let et = if lt > 0 && pcx.types[lt].kind == TyKind::Ptr { undistinct(pcx.types[lt].a, pcx) }
+        else { lt };
+    if et > 0 && pcx.types[et].kind == TyKind::Struct && pcx.structs[pcx.types[et].a].closure != 0 {
+        return 0;
+    }
+    var q = p;
+    while q > 0 {
+        let k = proj_kind(q, pbody);
+        let parent = proj_parent(q, pbody);
+        if k == PJ_DEREF || k == PJ_INDEX || k == crate::places::ir::PJ_CONST {
+            let bt = undistinct(crate::places::ir::full_place_type(l, parent, pbody, &pcx), pcx);
+            if bt > 0 && pcx.types[bt].kind == TyKind::Ptr && k == PJ_DEREF {
+                // (`&mut T`, a raw pointer: mutable, the base need not be
+                // `mut`; `&T`: not)
+                return if pcx.types[bt].b == crate::front::types::REF_SHARED { 1 } else { 0 };
+            }
+            if bt > 0 && pcx.types[bt].kind == TyKind::Ptr && pcx.types[bt].b == 0 {
+                // (a raw pointer's index, std2's ptr module: R1)
+                return 0;
+            }
+            if bt > 0 && pcx.types[bt].kind == TyKind::Slice {
+                let rb = pcx.types[bt].b;
+                return if rb == crate::front::types::REF_MUT
+                    || rb == crate::front::types::REF_RAW { 0 } else { 1 };
+            }
+        }
+        q = parent;
+    }
+    let f = pbody.locals[l].flags;
+    if (f & crate::places::ir::LF_USER) != 0 && (f & crate::places::ir::LF_MUT) == 0
+        && (f & LF_BORROWED) == 0 && (f & LF_STATIC) == 0 {
+        2
+    } else { 0 }
+}
+
+fn report_immutable(loc: i64, l: i64, p: i64, why: i64, borrow: bool, bck: inout Bck<Comp>,
+    pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    var i = 0;
+    while i < bck.reported.len() as i64 {
+        if bck.reported[i] == -3 && bck.reported[i + 1] == loc {
+            return;
+        }
+        i += 4;
+    }
+    bck.reported.push(-3);
+    bck.reported.push(loc);
+    bck.reported.push(p);
+    bck.reported.push(l);
+    var node = pbody.stmts[loc].node;
+    if node == 0 {
+        node = pbody.node;
+    }
+    let m = buf_new();
+    buf_str(m, if borrow { c"cannot borrow '" } else { c"cannot assign to '" });
+    crate::places::borrowck::diag::buf_place(m, l, p, 0, pbody, pcx);
+    buf_str(m, if borrow { c"' as mutable" } else { c"'" });
+    buf_str(m, if why == 1 { c", which is behind a `&` reference" }
+        else { c", as it is not declared as mutable" });
+    let help = if why == 1 { c"take it by `&mut` where it is lent, or change it through a `Cell`" }
+        else { c"declare it `let mut`" };
+    report_error_tries(pcx.nodes[node].start, 5000 + loc,
+        if borrow { c"borrowck.borrow_immutable" } else { c"borrowck.assign_immutable" },
+        buf_slice(m).ptr, help, "", false, &pcx);
 }
 
 // RULE: M7 (a whole non-`mut` user local is assigned once on every

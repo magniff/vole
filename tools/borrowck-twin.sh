@@ -76,7 +76,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
 map_code() {
     case "$1" in
         E0499) echo mut_twice ;;
-        E0502) echo conflict ;;
+        E0501|E0502) echo conflict ;;  # (E0501: a closure's unique capture, D19.2)
         E0503) echo use_borrowed ;;
         E0506) echo assign_borrowed ;;
         E0505) echo move_borrowed ;;
@@ -93,7 +93,9 @@ map_code() {
         E0525) echo closure.kind ;;  # (0.27.2, D19.6: the front's code)
         E0631) echo closure.sig ;;
         auto) echo sync.auto ;;  # (0.27.2, AT3: E0277's Send and Sync, sync.not_send and sync.not_sync)
-        E0510|E0594|E0596) echo guard_write ;;  # (E0594: in a guard, a `ref mut` binding is read-only)
+        E0594) echo assign_immutable ;;  # (0.27.2, D2.7; in a guard: guard_write, below)
+        E0596) echo borrow_immutable ;;
+        E0510) echo guard_write ;;
         E0796|static_mut) echo static_mut_ref ;;
         *) echo "?$1" ;;
     esac
@@ -148,6 +150,10 @@ for case_ in "$@"; do
             /^error: creating a (shared|mutable) reference to mutable static/ { print "static_mut"; exit }
             /^error: / && !/^error: aborting/ { print "other"; exit }' "$WORK/out")
         gotcode=$(map_code "$first")
+        # (E0594, E0596 in a match guard: a `ref mut` binding is read-only, L6)
+        if [ "$want" = guard_write ] && { [ "$first" = E0594 ] || [ "$first" = E0596 ]; }; then
+            gotcode=guard_write
+        fi
     fi
     msg=$(awk '/^error/ && !/^error: aborting/ { print; exit }' "$WORK/out" | cut -c1-120)
     if [ -z "$want" ]; then wantv=accept; else wantv=reject; fi
