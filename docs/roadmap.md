@@ -2887,6 +2887,34 @@ unsafe-audit 2775 unjustified (baseline 2775, from 3057) and 0 in std,
 chain-diverse, chain-fresh 40 releases. compile-cost against v0.26.5: a
 hello world 1.00x, std 0.99x, check of the compiler 1.01x.
 
+### 0.27.2
+
+The release gate (`gate.sh --release --no-linux`), macOS only. Its
+first run, at load 150 on 10 CPUs, failed std2-check (45 XFAIL cases
+whose std2 instances need rustc's implied outlives bounds, and 6 bodies
+whose region-free instance does not type-check: the row now fails only
+on a passing case and prints these as known gaps, 0.27.2.1) and, in
+every suite row, the hooks' real-compiler case "the hook's rewrites"
+(load: it passes alone and with the gate's code cache). Rerun with
+`-j 5`: suite-O0, -O1 and stress-grow passed; suite-O2 passed alone.
+One rerun also showed std2_thread_joinhandle_impl_drop's detached
+thread holding its blocks at exit (built without --check-alloc now)
+and one compiler segfault in stress-grow's arch-gen (x86_64-macos -O0,
+arch_x86_sse3), not reproduced in 60 parallel compilations under
+VOLE_STRESS_GROW (0.27.2.1). The rows: the suite 6246 at -O0, -O1 and
+-O2 (492 XFAIL; SKIPPED: no spirv-val), std2-tests 1035 at -O0 and -O2
+under --check-alloc (gate 1: 1000), threads 14752, incremental 172
+series, objcheck 11092 (and 264 for x86_64-macos, after the
+`T.m.-1` symbol fix), compiler-memcheck 727, examples-checkalloc 183,
+every fuzz and ABI row, cachediff 1471 lines (425 from the cache),
+borrowck-twin 332 cases (299 agree, 10 named divergences, 23 outside
+the subset, 0 mismatches), unsafe-audit 2773 unjustified (baseline
+2773) and 0 in std, chain-fresh (42 releases from the seed),
+chain-diverse. compile-cost against v0.27.1: a hello world 1.03x, std
+0.99x, check of the compiler 1.02x, the rust row 0.98x; hello-rust
+4.38x its MVS row (printed; the 2.0x ceiling is enforced from 0.27.4),
+std-rust 0.82x.
+
 ### 0.27.1
 
 The release gate (`gate.sh --release --no-linux`), macOS only (65:17

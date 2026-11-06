@@ -17,8 +17,8 @@
 # (the previous release has no std2), against its own MVS rows above:
 #
 #   hello-rust  a rust hello world built, at most 2.0x hello's (target 1.5x;
-#               printed, not failing: the ceiling 2.0x is enforced at the
-#               0.27.2 cut)
+#               printed, not failing: the ceiling 2.0x is enforced from
+#               0.27.4; 0.27.2 shipped at about 4.4x)
 #   std-rust    tests/cost/std2_heavy.vl built, at most 2.0x std's (target 1.5x)
 #
 # Instructions, not time: they hardly move with the machine's load. They
@@ -110,7 +110,7 @@ measure_edition() {
     awk -v n="$name" -v a="$base" -v b="$new" -v l="$limit" -v t="$target" -v e="$enforced" 'BEGIN {
         r = b / a
         bad = (r > l)
-        printf "  %-10s %8.1f M instructions, its MVS row %8.1f M: %.2fx (at most %.2fx%s, target %.2fx)%s\n", n, b / 1e6, a / 1e6, r, l, (e ? "" : ", enforced at the 0.27.2 cut"), t, (bad ? (e ? "  TOO DEAR" : "  over the ceiling") : "")
+        printf "  %-10s %8.1f M instructions, its MVS row %8.1f M: %.2fx (at most %.2fx%s, target %.2fx)%s\n", n, b / 1e6, a / 1e6, r, l, (e ? "" : ", enforced from 0.27.4"), t, (bad ? (e ? "  TOO DEAR" : "  over the ceiling") : "")
         exit (bad ? (e ? 1 : 2) : 0)
     }'
     case $? in 0) ;; 2) OVER="$OVER $name" ;; *) FAILED=1 ;; esac
@@ -138,7 +138,7 @@ if [ $FAILED -ne 0 ]; then
     exit 1
 fi
 if [ -n "$OVER" ]; then
-    echo "compile-cost: within the bounds enforced now; over the ceiling enforced at the 0.27.2 cut:$OVER"
+    echo "compile-cost: within the bounds enforced now; over the ceiling enforced from 0.27.4:$OVER"
 else
     echo "compile-cost: hello, std, check, rust, hello-rust and std-rust within the bounds"
 fi
