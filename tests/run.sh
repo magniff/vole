@@ -168,6 +168,10 @@
 # step: --check-alloc). Every other case is built with --verify-places
 # (0.26.2; $VOLE_VERIFY_EVERY=N: every N-th, 0: none), but those with
 # NO-EXTRA-FLAGS.
+# (0.27.2) std2's cases (std2_*) are built with --check-alloc, and fail
+# when blocks of Gpa are left at exit (and it exits 0) unless a STDERR
+# line expects the list ($VOLE_TEST_STD2_PLAIN=1: without it); $VOLE_TEST_XFAIL_WHY=FILE
+# gets each XFAIL case's name and the start of its failure, for a triage.
 
 set -u
 LC_ALL=C
@@ -559,6 +563,18 @@ check_case() {
     if [ -n "${VOLE_TEST_FLAGS:-}" ] && [ "$(cat "$dir/noextra")" != 1 ]; then
         FLAGS="$FLAGS $VOLE_TEST_FLAGS"
     fi
+    # (0.27.2) std2's cases (gate 1's std2-tests row) are built with
+    # --check-alloc, std2's checking Gpa, and one fails when blocks of Gpa
+    # are left at exit, unless a STDERR line expects the list
+    # (VOLE_TEST_STD2_PLAIN=1: built without it)
+    STD2_LEAKS=0
+    case "${file##*/}" in
+        std2_*)
+            if [ "${VOLE_TEST_STD2_PLAIN:-0}" != 1 ] && [ "$(cat "$dir/noextra")" != 1 ]; then
+                STD2_LEAKS=1
+                case " $FLAGS " in *" --check-alloc "*) ;; *) FLAGS="$FLAGS --check-alloc" ;; esac
+            fi ;;
+    esac
     # (0.26.2: --verify-places on every VERIFY_EVERY-th case, chosen by its
     # name's cksum: the places IR's form checked where the suite builds
     # it, now that both code generators read it and -O0 is no independent
@@ -682,6 +698,13 @@ check_case() {
             return 1
         fi
     done <"$dir/stderrs"
+    # (a case that panics, EXIT: 101, ends with its blocks: no unwinding)
+    if [ $STD2_LEAKS = 1 ] && [ "$expected_exit" = 0 ] \
+        && grep -q '^check-alloc: .* of Gpa not freed' "$dir/stderr" \
+        && ! grep -q 'not freed' "$dir/stderrs"; then
+        { echo "blocks of Gpa left at exit (--check-alloc):"; cat "$dir/stderr"; } >"$dir/why"
+        return 1
+    fi
     if [ -s "$dir/ppms" ] && ! check_ppms "$dir"; then
         return 1
     fi
@@ -1120,6 +1143,12 @@ while read -r name file; do
         echo "$name" >>"$WORK/failed-cases"
     else
         echo "$category $status" >>"$TALLY"
+        # (0.27.2) VOLE_TEST_XFAIL_WHY=FILE: each XFAIL case's failure,
+        # its name, the first line of why and its first error, for a triage
+        if [ "$status" = xfail ] && [ -n "${VOLE_TEST_XFAIL_WHY:-}" ]; then
+            printf '%s\t%s\t%s\n' "$name" "$(head -1 "$dir/why" 2>/dev/null | tr '\t' ' ')" \
+                "$(grep -m1 'error' "$dir/why" 2>/dev/null | tr '\t' ' ')" >>"$VOLE_TEST_XFAIL_WHY"
+        fi
     fi
     count=$((count + 1))
 done <"$CASES"

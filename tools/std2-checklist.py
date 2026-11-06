@@ -186,6 +186,10 @@ def module_of(rel):
 def read_tree():
     items = []
     for d, _, fs in os.walk(TREE):
+        # (rt/: Gpa's implementations, the compiler's tail's std::__gpa,
+        # not std2 items)
+        if os.path.relpath(d, TREE).split(os.sep)[0] == "rt":
+            continue
         for f in sorted(fs):
             if f.endswith(".vl"):
                 rel = os.path.relpath(os.path.join(d, f), TREE)
