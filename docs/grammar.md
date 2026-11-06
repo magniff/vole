@@ -1720,6 +1720,9 @@ allocate from is in its signature. The rules, each an error with its
 - `alloc.field`: a struct or enum that holds an allocator names it in
   its parameters, `struct P<A: Allocator> { v: Vec<u8, A> }`, used as
   `P<Gpa>`; a literal infers it from its fields.
+  (0.27.2) In the rust edition a raw pointer is not looked through: a
+  field `*mut Node<Gpa>` holds no allocator, as a raw pointer carries no
+  ownership (front-rust.md F33.1).
 - `alloc.static`: a static's type holds no allocator (it is `AllocFree`,
   an auto trait like `Copy`, which looks through structs, enums, tuples,
   arrays and pointers): an allocator inside a function came in through a

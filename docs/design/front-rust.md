@@ -347,6 +347,19 @@ parameter's inference (`f(&[1, 2])` with `f<T>(x: T)` gives `T = &[i64;
 check_call_arg`, `front/check/mod.vl: mismatch_error`, `front/check/
 widen.vl`.
 
+### F33 Raw pointers hold no allocator
+
+**F33.1 (alloc.field through a raw pointer).** In a rust-edition
+position the allocator rules (grammar.md "Allocators": `alloc.field`)
+do not look through a raw pointer: a field `*mut Out<T, CHeap>` or
+`*const Node<Gpa>` holds no allocator, so its struct need not name one
+(std2's `thread::ScopedJoinHandle { out: *mut Out<T, CHeap> }`). A raw
+pointer carries no ownership: what it points to is freed by whoever
+made it, through the allocator that code names. References (`&'a
+Arena<P>`), `Box<T, A>`, arrays, tuples and the other parts are looked
+through as before; MVS is unchanged. *Anchor:* `front/check/
+alloc_rules.vl: field_allocator`.
+
 ## 2. Traits
 
 ### F2 Supertraits
@@ -649,27 +662,34 @@ attribute. *Anchor:* `front/parser/rust.vl: take_builtin_impls` (today
 primitives; `&T`, `[T]`, `str`, tuples are not (their impls are written,
 F4.1, F6.1).
 
-**F15.4 (the primitives' inherent intrinsics).** std2's inherent impls
-on the integer and float primitives (`impl u32 { pub fn
-wrapping_add(self, o: u32) -> u32 { .. } }`) may declare, with any
-body, the methods of the compiler's intrinsic list, which the compiler
-supplies as F21.4 does (the written body is not checked): `wrapping_
-{add,sub,mul,neg,shl,shr}`, `saturating_{add,sub,mul}`, `checked_
-{add,sub,mul,div,rem,neg,shl,shr}`, `overflowing_{add,sub,mul}`,
-`leading_zeros`, `trailing_zeros`, `count_ones`, `count_zeros`,
-`rotate_left`, `rotate_right`, `swap_bytes`, `to_be`, `to_le`,
-`from_be`, `from_le`, `pow`, `abs`, `signum`, `is_power_of_two`,
-`next_power_of_two`, `min`, `max`, `clamp`, the float `sqrt`, `abs`,
-`floor`, `ceil`, `round`, `trunc`, `powi`, `powf`, `is_nan`, `is_finite`,
-`to_bits`, `from_bits`, and the consts `MIN`, `MAX`, `BITS`, `EPSILON`,
-`INFINITY`, `NAN` (F3.1's inherent consts). A method of such an impl
-whose name is not in the list and whose body is a placeholder (a bare
-`todo()`, or a body the "built in" comment marks) is `error
-attr.builtin` ("no intrinsic named .."); a method with a real body is
-an ordinary method, and a listed name with a real body is the
-intrinsic still (the body is not checked). The list is Z3.1's key
-`prim_intrinsics` and the gate counts it. *Anchor:* `front/traits.vl:
-intrinsic`, `front/derive/intrinsic.vl`, `arch/mod.vl: intrinsic`.
+**F15.4 (the integers' inherent methods).** The integer primitives'
+inherent methods are the compiler's, made from its list (decided: supplied by
+the compiler, not written in std2): `#[builtin_methods(P₁, .., Pₙ)]`
+on an item of a std2 module (std2 writes it once, in `num::wrapping`)
+makes, for each listed integer `Pᵢ`, `impl Pᵢ { .. }` with Rust's
+signatures and bodies in rust-edition text (F15.1's way: parsed as
+`<builtin>`, given the attribute's span, the module's items, flagged
+made), as MVS's `std::num::wrapping` (tools/intops) has them:
+`wrapping_{add,sub,mul,neg,shl,shr,div,rem,pow}`,
+`checked_{add,sub,mul,neg,shl,shr,div,rem,pow}`,
+`overflowing_{add,sub,mul,neg,shl,shr,div,rem,pow}`,
+`saturating_{add,sub,mul,div,pow}`, for the signed ones also
+`wrapping_abs`, `checked_abs`, `overflowing_abs`, `saturating_abs`,
+`saturating_neg`, `signum`, `is_negative`, `is_positive`,
+`unsigned_abs`, for the unsigned `is_power_of_two`; and `count_ones`,
+`count_zeros`, `leading_zeros`, `trailing_zeros`, `rotate_left`,
+`rotate_right`. The module's arithmetic never checks overflow (MVS's
+`std_wraps` rule, which reads `num::wrapping` under std's root in either
+std), so a body's `self + rhs` is the wrapping add. `min`, `max` and
+`clamp` are `Ord`'s (F15.1); the consts `MIN`, `MAX`, `BITS` are the
+compiler's as in MVS. A listed name that is not an integer is `error
+attr.builtin` ("no builtin methods for .."); the attribute outside std2
+is `error attr.builtin` (F15.1). Not in 0.27.2: `pow`, `abs` (they panic
+on overflow in Rust's debug builds), `swap_bytes`, `to_be`/`to_le`/
+`from_be`/`from_le`, `next_power_of_two`, the float methods (`sqrt`,
+`floor`, .., `to_bits`) come in 0.27.3.
+*Anchor:* `front/parser/rust.vl: take_builtin_impls`,
+`front/builtin_impls.vl: write_int_methods`, `front/modules: std_wraps`.
 
 **F15.5 (written impls with a primitive self type).** `impl TryFrom<i64>
 for u8`, `impl From<u8> for u32`, `impl From<char> for u32`, `impl
