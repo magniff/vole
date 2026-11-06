@@ -25,7 +25,7 @@ use crate::base::diag::{
 };
 use crate::front::assoc::{ensure_checked, trait_projection};
 use crate::front::ast::{FN_SIG_FAILED, NodeKind, child, list_begin, list_end, list_push, new_node};
-use crate::front::check::{has_error_type, resolve_type_or_error};
+use crate::front::check::{Res, has_error_type, resolve_type_or_error};
 use crate::front::check::calls::{method_of, synthetic_unary};
 use crate::front::check::calls::paths::check_direct_call;
 use crate::front::check::check_mode::check_expr;
@@ -731,6 +731,95 @@ pub fn template_trait_call(n: i64, tpl: i64, member: i64, pcx: inout Ctx<Comp>) 
     dispatch(n, hint, member, 0, &pcx)
 }
 
+// Among the candidates of call n that take its arguments, the one whose
+// result type is the expected type `hint`, or -1 when not exactly one is
+// (a candidate whose result type is not known yet counts as one).
+fn by_expected(n: i64, t: i64, mark: i64, tys: *i64, kinds: *i64, skip: i64, hint: i64,
+    pcx: inout Ctx<Comp>)
+    -> i64 {
+    // RULE: F13.2 (`let r: &i64 = w.borrow()` picks Borrow<i64>)
+    // UNSAFE: CANDS is a raw IntVec (base/comp.vl), as every table.
+    // SAFETY: mark <= c < count, pairs dispatch pushed; tys and kinds
+    // hold the call's count arguments (dispatch).
+    unsafe {
+        var chosen = -1;
+        var matches = 0;
+        var c = mark;
+        while c < pcx.cands.count {
+            if takes(c, n, t, tys, kinds, skip, &pcx) {
+                let i = pcx.cands.data[c];
+                let tr = pcx.traits_impls[i].tr;
+                let decl = trait_fn(tr, pcx.nodes[pcx.fns[pcx.cands.data[c + 1]].node].a, pcx);
+                let targs = impl_targs(i, t, &pcx);
+                let r = if targs < 0 || pcx.nodes[decl].b == 0 {
+                    pcx.ty_error
+                } else {
+                    decl_type(tr, decl, targs, t, pcx.nodes[decl].b, &pcx)
+                };
+                if r == hint || has_error_type(r, pcx) {
+                    matches += 1;
+                    chosen = c;
+                }
+            }
+            c += 2;
+        }
+        if matches == 1 { chosen } else { -1 }
+    }
+}
+
+// Among the candidates of method call n that take its arguments, in an
+// instance whose receiver is a parameter of a bounded type parameter, the
+// one whose trait arguments a bound names (`s.as_ref()` with `S:
+// AsRef<str>`, S = String: AsRef<str>, as the generic body read it), or
+// -1 when not exactly one is.
+fn by_param_bound(n: i64, t: i64, mark: i64, tys: *i64, kinds: *i64, pcx: inout Ctx<Comp>)
+    -> i64 {
+    // RULE: D22.3, F13.4 (the bound in the generic body picks the impl)
+    // UNSAFE: CANDS and TLISTS are raw tables (base/comp.vl), as every one.
+    // SAFETY: mark <= c < count, pairs dispatch pushed; bt and targs are
+    // TLISTS lists of tr's count arguments (resolve_args, impl_targs).
+    unsafe {
+        var recv = pcx.nodes[n].a;
+        while pcx.nodes[recv].kind == NodeKind::Unary && pcx.nodes[recv].op == Tok::Star {
+            recv = pcx.nodes[recv].b;
+        }
+        if pcx.nodes[recv].kind != NodeKind::Ident || pcx.nodes[recv].res != Res::Local
+            || pcx.nodes[recv].y < 0 || pcx.locals[pcx.nodes[recv].y].tparam == 0 {
+            return -1;
+        }
+        let bounds = pcx.nodes[pcx.locals[pcx.nodes[recv].y].tparam].h;
+        var chosen = -1;
+        var matches = 0;
+        var c = mark;
+        while c < pcx.cands.count {
+            if takes(c, n, t, tys, kinds, 1, &pcx) {
+                let i = pcx.cands.data[c];
+                let tr = pcx.traits_impls[i].tr;
+                let targs = impl_targs(i, t, &pcx);
+                let count = trait_param_count(tr, pcx);
+                var hit = false;
+                for k in 0..pcx.nodes[bounds].count {
+                    let b = child(bounds, k, pcx);
+                    if hit || targs < 0 || pcx.nodes[b].kind != NodeKind::TyName
+                        || pcx.nodes[b].g == 0 || bound_trait(b, &pcx) != tr {
+                        continue;
+                    }
+                    let bt = resolve_args(pcx.nodes[b].g, pcx.cur_mod, &pcx);
+                    hit = bt >= 0
+                        && (0..count).all(|j| pcx.tlists.data[bt + j]
+                            == pcx.tlists.data[targs + j]);
+                }
+                if hit {
+                    matches += 1;
+                    chosen = c;
+                }
+            }
+            c += 2;
+        }
+        if matches == 1 { chosen } else { -1 }
+    }
+}
+
 // generic_trait_call, the first `pre` arguments synthesized already.
 fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
@@ -749,6 +838,7 @@ fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: inout Ctx<Comp>) -> i64 
             err_help(c"write the type: 'let y: T = x.into();', or call 'T::from(x)'", pcx);
             err_end(&pcx);
         }
+        let hint = hint_for(n, pcx);
         let mark = pcx.cands.count;
         for i in 0..pcx.traits_impls.len() as i64 {
             if trait_param_count(pcx.traits_impls[i].tr, pcx) == 0 || !impl_covers(i, t, &pcx) {
@@ -798,6 +888,20 @@ fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: inout Ctx<Comp>) -> i64 
                 chosen = c;
             }
             c += 2;
+        }
+        if matches > 1 && hint > 0 {
+            let e = by_expected(n, t, mark, tys, kinds, skip, hint, &pcx);
+            if e >= 0 {
+                matches = 1;
+                chosen = e;
+            }
+        }
+        if matches > 1 && method {
+            let e = by_param_bound(n, t, mark, tys, kinds, &pcx);
+            if e >= 0 {
+                matches = 1;
+                chosen = e;
+            }
         }
         if matches > 1 {
             ambiguous_call(n, t, member, mark, tys, kinds, skip, &pcx);

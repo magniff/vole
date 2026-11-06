@@ -638,6 +638,15 @@ i64`, which `Extend<i64>` takes and `Extend<&i64>` does not. A
 projection the checker cannot compute (no impl defines it) rejects no
 candidate. *Anchor:* `front/convert/mod.vl: own_bound_misses, takes`.
 
+**F13.4 (selection by the generic body's bound).** In an instance of a
+generic function (checked per instance, D22.3), a method call whose
+receiver is a parameter of a bounded type parameter `S: Tr<a..>` and
+which more than one impl of `Tr` takes picks the impl whose trait
+arguments are the bound's: `s.as_ref()` with `S: AsRef<str>`, S =
+`String`, is `AsRef<str>`'s, as the generic body read it. F13.2's
+expected type is tried first. *Anchor:* `front/convert/mod.vl:
+by_expected, by_param_bound, dispatch`.
+
 ### F14 Impl parameters fixed by the trait's arguments
 
 **F14.1.** An impl parameter `Q` must be *constrained*: it occurs in the
