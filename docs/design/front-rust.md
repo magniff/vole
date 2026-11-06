@@ -1305,7 +1305,8 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   it alone fails 206 of the 1,962 rust_/std2_/error cases, because a
   literal is typed where it is met: `let a = [1, 2, 3]` is `[i32; 3]`
   before `f(&a)` with `&[i64]`. It waits for integer inference
-  variables, resolved at the first constraining use.)
+  variables, resolved at the first constraining use, with the `i32`
+  fallback at the end of the function: 0.27.3.)
 - **FL7 (const evaluation).** F3.2's consts fold with `consteval.vl`'s
   language, smaller than rustc's const eval (no loops, no `if` over
   consts until 0.29).
