@@ -251,6 +251,22 @@ Closures in full (clos272):
 - `--print-effects` leaves out the drop shims, which it printed as
   `(unknown)` (K-I7: nothing targets them, so nothing was masked).
 
+std2's tests under `--check-alloc` (std272b):
+
+- `--check-alloc` works on std2 (Z5): Gpa's implementation is the
+  compiler's tail, `std::__gpa` (compiler/std2/rt/), C's malloc or, with
+  the flag, MVS's checking allocator in std2's spellings: every block on
+  pages of its own, a double, invalid or wrong-size free and a use after
+  free stop the program with exit 101 naming where the block was
+  allocated and freed, `Gpa::live_blocks`/`check_leaks` count and list
+  the live blocks, and the ones left at exit are listed as MVS lists
+  them (`check-alloc: N blocks of Gpa not freed`); a program's
+  allocating calls store their sites as in MVS.
+- The runner builds every `std2_` case with `--check-alloc` and fails
+  one whose blocks are left at exit (a panicking one, or one whose
+  STDERR expects the list, excepted); the gate's `std2-tests` row runs
+  them at -O0 and -O2 and prints the count against gate 1's 1,000.
+
 ### What's new in 0.27.1
 
 The rust edition's borrows are checked: NLL on the places IR, as rustc's, with the semantics written down as rules (docs/design/borrowck.md) and checked against rustc on 193 programs (0 disagreements but the named ones). A rust-edition program now gets Rust's errors for conflicting borrows, references that outlive what they borrow, use after a move, assignment twice and drop order, each with `explain`; closure bodies' inner borrows wait for 0.27.2 (`borrowck.unchecked` names them). Rust's `Copy` rule, reborrows, captures as loans and deferred `let x;` come with it. It fixes 0.27.0's -O2 miscompile of aliasing references in unchecked rust-edition code. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
