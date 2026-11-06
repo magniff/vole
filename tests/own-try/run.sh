@@ -14,6 +14,8 @@
 #                    be rejected); (0.27.1) `// CODE: CODE` the same
 #   // TRY: text     one of the first diagnostic's try: lines contains text
 #                    (§2.9's exact commands), one directive per line
+#   // ENV: K=V      (0.27.2) the compiler runs with K=V in its
+#                    environment (VOLE_STD2=0: on MVS's std), one per line
 #   // XFAIL: why    the checker task that reports CODE has not landed:
 #                    the case is expected to fail, and reported as a
 #                    failure (XPASS) once it passes
@@ -67,7 +69,8 @@ directive() {
 # The first diagnostic of `check --values=error` in directory $1 (one
 # line, short form), into $1/../diag; its exit code is the function's.
 first_diag() {
-    (cd "$1" && "$COMPILER" check --values=error main.vl) >"$WORK/out" 2>&1
+    # shellcheck disable=SC2086
+    (cd "$1" && env $ENVS "$COMPILER" check --values=error main.vl) >"$WORK/out" 2>&1
     st=$?
     grep -m 1 'error' "$WORK/out" >"$WORK/diag" || : >"$WORK/diag"
     return $st
@@ -91,6 +94,7 @@ for dir in "$HERE"/*/; do
     [ -f "$main" ] || continue
     code=$( (directive OWN "$main"; directive CODE "$main") | head -n 1)
     xfail=$(directive XFAIL "$main" | head -n 1)
+    ENVS=$(directive ENV "$main" | tr '\n' ' ')
     why=""
     rm -rf "$WORK/case"
     cp -R "$dir" "$WORK/case"
@@ -127,7 +131,7 @@ for dir in "$HERE"/*/; do
             (cd "$WORK/run" && git init -q . 2>/dev/null \
                 && git -c user.name=t -c user.email=t@t add -A >/dev/null 2>&1 \
                 && git -c user.name=t -c user.email=t@t commit -q -m case >/dev/null 2>&1)
-            (cd "$WORK/run" && eval "\"\$COMPILER\" $rest") >"$WORK/tryout" 2>&1
+            (cd "$WORK/run" && eval "env $ENVS \"\$COMPILER\" $rest") >"$WORK/tryout" 2>&1
             st=$?
             case "$rest" in
                 " query "*)
