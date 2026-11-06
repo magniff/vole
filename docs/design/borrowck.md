@@ -1108,6 +1108,10 @@ outside the holes named below.
   temporary of its statement here (vole's temporaries, places-ir.md
   §3.7) → `borrowck.dropped_borrowed` at the temporary's `StorageDead`
   (rustc's E0716 for a temporary); rustc promotes. Q7: 0.27.3.
+  The same for `&CONST` (`fn k() -> &'static i64 { &N }` is
+  `borrowck.return_local`), `&[]` and `&mut []` (rustc promotes the
+  empty array): std2 writes an empty `&mut [T]` from a dangling pointer
+  (slice.vl's `empty_mut`). Case `rust_b_err_promote_const`.
 - L3 Temporaries' scopes are vole's (the statement; the block for `let
   r = &f(x)`), not Rust 2024's tail-expression rule: a difference only
   in `match`/block tail temporaries.
