@@ -1271,7 +1271,11 @@ An error's primary position is the access's statement node
 (`PStmt.node`) — for a conflict the later access, for a move rule the
 use, for a universal violation the constraint's statement; its
 secondary position is the loan's statement node ("borrowed here"), and
-for a move the move's. An error of an instance is reported at the
+for a move the move's. *(0.27.2)* `borrowck.dropped_borrowed` is the
+exception, as rustc's E0597, E0713 and E0716: its primary position is
+the loan's (a `StorageDead` has no node of its own; a `drop` of a value
+with glue is its block's or its scope's, which rustc gives as the
+secondary "dropped here"), and the drop's is named in the message. An error of an instance is reported at the
 template's position. When the instance is the region-free one (D4.4(c))
 or the body is not generic, nothing more is said; when it is found only
 in a region-carrying instance, the message adds the instance (`in
