@@ -628,6 +628,25 @@ header unifies, it is chosen; none is `error trait.unmet`; several is
 `front/check/calls/paths.vl: synth_path_call, sole_instance_with`,
 `front/generics/instantiate.vl: infer_from`.
 
+**F13.3 (selection by an own parameter's bound).** When the parameter a
+candidate's function takes an argument at is one of the function's own
+type parameters (`fn extend<I: IntoIterator<Item = T>>(&mut self, iter:
+I)`), the argument's type is checked against that parameter's bounds'
+associated-type equalities, with the impl's trait arguments for the
+trait's: `v.extend(s.iter().copied())` on a `Vec<i64>` gives `Item =
+i64`, which `Extend<i64>` takes and `Extend<&i64>` does not. A
+projection the checker cannot compute (no impl defines it) rejects no
+candidate. *Anchor:* `front/convert/mod.vl: own_bound_misses, takes`.
+
+**F13.4 (selection by the generic body's bound).** In an instance of a
+generic function (checked per instance, D22.3), a method call whose
+receiver is a parameter of a bounded type parameter `S: Tr<a..>` and
+which more than one impl of `Tr` takes picks the impl whose trait
+arguments are the bound's: `s.as_ref()` with `S: AsRef<str>`, S =
+`String`, is `AsRef<str>`'s, as the generic body read it. F13.2's
+expected type is tried first. *Anchor:* `front/convert/mod.vl:
+by_expected, by_param_bound, dispatch`.
+
 ### F14 Impl parameters fixed by the trait's arguments
 
 **F14.1.** An impl parameter `Q` must be *constrained*: it occurs in the
