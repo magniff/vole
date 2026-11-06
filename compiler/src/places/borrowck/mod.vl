@@ -30,6 +30,9 @@ pub mod moves;
 pub mod diag;
 pub mod dump;
 
+pub mod std2;
+pub mod cache;
+
 // A loan record's words (Bck.loans).
 pub const LOAN_WORDS: i64 = 6;
 
@@ -131,6 +134,10 @@ pub struct Bck<A: Allocator> {
     // The locations of the moves reported move_borrowed (access.vl): a use
     // after one of them is not reported again (moves.vl).
     pub bad_moves: Vec<i64, A>,
+    // (0.27.2, D19.10) a closure body's requirements: (closure, i, j)
+    // triples, slot i of C outlives slot j (-1: 'static), kept with the
+    // closure after its solve (solve.vl)
+    pub reqs: Vec<i64, A>,
     // A place walk's results (constraints.vl walk_place): the projection
     // list root-first, the slot range reached, the type there, and the
     // deref-like steps passed (a region and a mode each, root-first), then
@@ -145,6 +152,14 @@ pub struct Bck<A: Allocator> {
     // The run's counts, for `solved: N bodies, M reused (key)`.
     pub bodies: i64,
     pub reused: i64,
+    // (0.27.2, Z7) the verdict cache (cache.vl): 0 not read yet, 1 on, -1
+    // off; the clean keys read, sorted; the run's new ones; the file's
+    // path (a buffer); how many bodies it answered
+    pub vc_state: i64,
+    pub vc_keys: Vec<i64, A>,
+    pub vc_new: Vec<i64, A>,
+    pub vc_path: i64,
+    pub cached: i64,
 }
 
 static var EMIT_REGIONS: bool = false;
@@ -203,12 +218,15 @@ pub fn state_new() -> Bck<Comp> {
         keys: Vec::new_in(Comp {}),
         last_reused: false,
         bad_moves: Vec::new_in(Comp {}),
+        reqs: Vec::new_in(Comp {}),
         pscratch: Vec::new_in(Comp {}),
         vscratch: Vec::new_in(Comp {}),
         steps: Vec::new_in(Comp {}),
         supports: Vec::new_in(Comp {}),
         w_first: 0, w_count: 0, w_type: 0,
         bodies: 0, reused: 0,
+        vc_state: 0, vc_keys: Vec::new_in(Comp {}), vc_new: Vec::new_in(Comp {}), vc_path: 0,
+        cached: 0,
     }
 }
 
@@ -226,6 +244,16 @@ pub fn check_body(f: i64, bck: inout Bck<Comp>, pbody: inout Body<Comp>, pcx: in
         timer_sub(T_PLACES_BUILD, T_BORROWCK, t, pcx);
         return bck.keys[key];
     }
+    // RULE: Z7 (a std body whose key the verdict cache holds clean)
+    let ck = crate::places::borrowck::cache::body_key(f, &bck, &pcx);
+    if ck >= 0 && crate::places::borrowck::cache::clean(ck, bck) {
+        bck.cached += 1;
+        timer_sub(T_PLACES_BUILD, T_BORROWCK, t, pcx);
+        if key >= 0 {
+            bck.keys[key] = VERDICT_CLEAN;
+        }
+        return VERDICT_CLEAN;
+    }
     let e0 = crate::base::diag::error_count(pcx);
     // (the graph: elaboration's fast path leaves the last body's)
     crate::places::cfg::compute_preds(&pbody);
@@ -241,12 +269,15 @@ pub fn check_body(f: i64, bck: inout Bck<Comp>, pbody: inout Body<Comp>, pcx: in
     }
     bck.bodies += 1;
     timer_sub(T_PLACES_BUILD, T_BORROWCK, t, pcx);
-    let node = crate::places::front::fn_node(f, pcx);
-    let closure = node > 0 && (pcx.nodes[node].p & crate::front::ast::FN_CLOSURE) != 0;
+    // (0.27.2: a closure body is checked like any other, D19.4; D10.4's
+    // deferred verdict and borrowck.unchecked are retired)
     let verdict = if crate::base::diag::error_count(pcx) > e0 { VERDICT_ERRORS }
-        else if closure { VERDICT_DEFERRED } else { VERDICT_CLEAN };
+        else { VERDICT_CLEAN };
     if key >= 0 {
         bck.keys[key] = verdict;
+    }
+    if ck >= 0 && verdict == VERDICT_CLEAN {
+        bck.vc_new.push(ck);
     }
     verdict
 }
@@ -257,7 +288,8 @@ pub fn check_body(f: i64, bck: inout Bck<Comp>, pbody: inout Body<Comp>, pcx: in
 // that is not an instance.
 fn instance_key(f: i64, bck: inout Bck<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     let n = pcx.fns[f].targ_count;
-    if n <= 0 || pcx.fns[f].tmpl < 0 {
+    // (D19.10: not a closure body, whose requirements are its own)
+    if n <= 0 || pcx.fns[f].tmpl < 0 || crate::places::regions::closure_of_fn(f, pcx) >= 0 {
         return -1;
     }
     bck.vscratch.clear();
@@ -347,12 +379,11 @@ fn begin_body(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: Ctx<Comp>) {
     }
 }
 
-// The verdict per function (D17.7): 0 not checked, 1 clean, 2 errors, 3
-// deferred (a closure body: its captured places are reached through the
-// raw env, D10.4).
+// The verdict per function (D17.7): 0 not checked, 1 clean, 2 errors
+// (0.27.1's 3, deferred, a closure body through the raw env, is retired:
+// D19.4).
 pub const VERDICT_CLEAN: i64 = 1;
 pub const VERDICT_ERRORS: i64 = 2;
-pub const VERDICT_DEFERRED: i64 = 3;
 
 // RULE: D17.7
 pub fn set_verdict(f: i64, verdict: i64, pcx: inout Ctx<Comp>) {

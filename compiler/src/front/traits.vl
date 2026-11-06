@@ -25,7 +25,9 @@
 // everything with ==: Eq; numbers, pointers and fieldless enums: Ord).
 // There are no trait objects (`dyn`): dispatch is static.
 
-use crate::base::{SRC, buf_byte, buf_new, buf_slice, intern, intern_c, sym_table, sym_text};
+use crate::base::{
+    SRC, alloc_array, buf_byte, buf_new, buf_slice, free, intern, intern_c, sym_table, sym_text,
+};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{
@@ -36,8 +38,8 @@ use crate::front::assoc::{
     assoc_constraints_hold, collect_impl_assoc, collect_trait_assoc, constraint_error,
 };
 use crate::front::ast::{
-    FN_DEFAULT_COPY, FN_LAZY, FN_SIG_FAILED, NODE_IMPLICIT, NodeKind, child, list_begin, list_end,
-    list_push, new_node,
+    FN_BODY_FAILED, FN_DEFAULT_COPY, FN_LAZY, FN_SIG_FAILED, NODE_ASSOC_CONST, NODE_IMPLICIT,
+    NodeKind, child, list_begin, list_end, list_push, new_node,
 };
 use crate::front::check::{
     Try, attempt, has_error_type, pop_scope, push_scope, resolve_type_or_error,
@@ -57,7 +59,7 @@ use crate::front::derive::intrinsic::{copy_aggregate, is_plain, tuple_implements
 use crate::front::distinct::is_distinct_type;
 use crate::front::effects::check::note_effect_bound;
 use crate::front::generics::{
-    TPL_NONE, env_enter, env_leave, instance_of, instance_targs, mangle_type,
+    TPL_NONE, TPL_PATTERN, env_enter, env_leave, instance_of, instance_targs, mangle_type,
 };
 use crate::front::generics::instantiate::clone_node;
 use crate::front::lexer::{SUF_NONE, Tok};
@@ -66,7 +68,7 @@ use crate::front::modules::lookup::std_item_key;
 use crate::front::own::kinds::is_plain_type;
 use crate::front::patterns::check_pattern;
 use crate::front::types::{
-    TY_BOOL, TY_NEVER, TY_UNIT, TyKind, err_type, fn_param, is_fieldless_enum, is_integer,
+    ENUMS, TY_BOOL, TY_NEVER, TY_UNIT, TyKind, err_type, fn_param, is_fieldless_enum, is_integer,
     is_numeric, is_pointer, is_ref, make_type,
 };
 
@@ -81,6 +83,14 @@ pub struct TraitInfo { pub name: i64, pub node: i64, pub module: i64, pub params
 pub struct ImplInfo {
     pub node: i64, pub tr: i64, pub ty: i64, pub tpl: i64, pub module: i64, pub targs: i64,
 }
+
+// (0.27.2) A `where` predicate of the rust edition whose subject is not a
+// type parameter (`where Self: DoubleEndedIterator`, `where I::Item:
+// Clone`): on item `owner` (a Fn node; 0: an impl's, not checked yet),
+// its subject type node and its bounds (a Generics holder of bound
+// nodes). Checked where the item is used (traits::where_preds_hold).
+// RULE: F10.1
+pub struct WherePred { pub owner: i64, pub subject: i64, pub bounds: i64 }
 
 pub fn init_traits(pcx: inout Ctx<Comp>) {
     sym_table(&pcx.sym_trait, &pcx);
@@ -126,7 +136,12 @@ pub fn trait_named(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         let key = if pcx.nodes[n].kind == NodeKind::TyName { type_name_key(n, &pcx) } else { -1 };
         if key < 0 || pcx.sym_trait[key] == 0 {
             if key < 0 && auto_trait(n, &pcx) {
-                // (0.27.0: `T: Send`, Rust's auto traits)
+                // RULE: AT1 (0.27.2: `Send`, `Sync`, compiler-known)
+                let at = crate::front::auto_traits::auto_trait_id(n, &pcx);
+                if at >= 0 {
+                    return at;
+                }
+                // (0.27.0: `T: Unpin`, Rust's other auto traits)
                 crate::front::rust::later(pcx.nodes[n].start, pcx.nodes[n].end, "auto_trait",
                     "0.27.2", &pcx);
                 crate::base::diag::err_jump(&pcx);
@@ -199,6 +214,171 @@ pub fn trait_declares(tr: i64, name: i64, pcx: Ctx<Comp>) -> bool {
     tr < 0 || trait_fn(tr, name, pcx) != 0
 }
 
+// (0.27.2) The supertraits of trait tr: a Generics holder of bound nodes
+// (parser::rust::parse_item_bounds), or 0. RULE: F2.1
+pub fn trait_supers(tr: i64, pcx: Ctx<Comp>) -> i64 {
+    pcx.nodes[pcx.traits[tr].node].h
+}
+
+// (0.27.2) Whether trait tr or one of its supertraits, to any depth
+// (bounded by MAX_ASSOC_DEPTH), declares function `name`. RULE: F2.2
+pub fn trait_declares_closure(tr: i64, name: i64, pcx: inout Ctx<Comp>) -> bool {
+    if trait_declares(tr, name, pcx) {
+        return true;
+    }
+    let supers = trait_supers(tr, pcx);
+    if supers == 0 || pcx.assoc_depth >= crate::front::assoc::MAX_ASSOC_DEPTH {
+        return false;
+    }
+    pcx.assoc_depth += 1;
+    var found = false;
+    for i in 0..pcx.nodes[supers].count {
+        let s = bound_trait(child(supers, i, pcx), &pcx);
+        if s >= 0 && trait_declares_closure(s, name, &pcx) {
+            found = true;
+        }
+    }
+    pcx.assoc_depth -= 1;
+    found
+}
+
+// (0.27.2) Whether the `where` predicates of item (a Fn node) hold for
+// the self type `self_ty` (`Self` in the subjects; the type parameters
+// in scope are the env's): each subject resolved, each of its bounds
+// checked as a parameter's is. When `report`, a failing one is `error
+// trait.unmet` at pos, soft. RULE: F10.2, F21.3
+pub fn where_preds_hold(item: i64, self_ty: i64, pos: i64, report: bool,
+    pcx: inout Ctx<Comp>) -> bool {
+    var ok = true;
+    for k in 0..pcx.where_preds.len() as i64 {
+        if pcx.where_preds[k].owner != item {
+            continue;
+        }
+        let subject = pcx.where_preds[k].subject;
+        let bounds = pcx.where_preds[k].bounds;
+        let saved_self = pcx.self_type;
+        let saved_mod = pcx.cur_mod;
+        pcx.self_type = self_ty;
+        pcx.cur_mod = module_of(subject, &pcx);
+        let t = resolve_type_or_error(subject, &pcx);
+        pcx.self_type = saved_self;
+        pcx.cur_mod = saved_mod;
+        if has_error_type(t, pcx) {
+            continue;
+        }
+        for i in 0..pcx.nodes[bounds].count {
+            let b = child(bounds, i, pcx);
+            let tr = bound_trait(b, &pcx);
+            var holds = if pcx.nodes[b].kind == NodeKind::TyFn { fn_bound_satisfied(b, t, &pcx) }
+                else if pcx.nodes[b].g != 0 {
+                    crate::front::convert::implements_with(tr, t, bound_args(b, &pcx), &pcx)
+                }
+                else { implements(tr, t, &pcx) };
+            if holds && pcx.nodes[b].h != 0 && !assoc_constraints_hold(b, t, &pcx) {
+                holds = false;
+            }
+            if holds {
+                continue;
+            }
+            ok = false;
+            if report {
+                let saved_kind = pcx.err_kind;
+                pcx.err_kind = c"trait.unmet";
+                err_begin(pos, &pcx);
+                err_fmt(format_args("the bound '{}: {}' of '{}' is not met: '",
+                    SRC[pcx.nodes[subject].start..pcx.nodes[subject].end],
+                    SRC[pcx.nodes[b].start..pcx.nodes[b].end],
+                    sym_text(pcx.nodes[item].a, pcx)), pcx);
+                err_type(t, pcx);
+                err_str(c"' does not implement it", pcx);
+                err_end_soft(&pcx);
+                pcx.err_kind = saved_kind;
+            }
+        }
+    }
+    ok
+}
+
+// (0.27.2) The `where` predicates of item `from` (a trait function's
+// declaration) are item `to`'s too (its default body copied into an
+// impl, collect_impl). RULE: F10.1
+pub fn copy_where_preds(from: i64, to: i64, pcx: inout Ctx<Comp>) {
+    let n = pcx.where_preds.len() as i64;
+    for k in 0..n {
+        if pcx.where_preds[k].owner == from {
+            let subject = pcx.where_preds[k].subject;
+            let bounds = pcx.where_preds[k].bounds;
+            pcx.where_preds.push(WherePred { owner: to, subject: subject, bounds: bounds });
+        }
+    }
+}
+
+// (0.27.2) Whether one of a trait function's own parameters `own` has the
+// name of one of the impl's `outer` (collect_impl renames it in the copy).
+fn own_param_clash(outer: i64, own: i64, pcx: Ctx<Comp>) -> bool {
+    if own == 0 {
+        return false;
+    }
+    for i in 0..pcx.nodes[own].count {
+        if crate::front::generics::instantiate::tparam_index(outer, pcx.nodes[child(own, i, pcx)].a,
+            pcx).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+// (0.27.2) In f (a default copied into an impl, its body its own), each
+// own parameter named as one of the impl's `outer` gets a name of its
+// own, `B__own`, in its signature, body and `where` predicates. RULE: F12.2
+fn rename_own_params(f: i64, outer: i64, pcx: inout Ctx<Comp>) {
+    let own = pcx.nodes[f].g;
+    let args = new_node(NodeKind::Generics, pcx.nodes[own].start, pcx.nodes[own].end, &pcx);
+    let mark = list_begin(pcx);
+    for i in 0..pcx.nodes[own].count {
+        let p = child(own, i, pcx);
+        let name = pcx.nodes[p].a;
+        let t = new_node(NodeKind::TyName, pcx.nodes[p].start, pcx.nodes[p].end, &pcx);
+        pcx.nodes[t].a = name;
+        if crate::front::generics::instantiate::tparam_index(outer, name, pcx).is_some() {
+            let b = buf_new();
+            crate::base::buf_bytes(b, sym_text(name, pcx));
+            crate::base::buf_bytes(b, "__own");
+            pcx.nodes[t].a = intern(buf_slice(b), &pcx);
+        }
+        list_push(t, &pcx);
+    }
+    list_end(args, mark, &pcx);
+    let n = pcx.where_preds.len() as i64;
+    for k in 0..n {
+        if pcx.where_preds[k].owner == f {
+            let subject = clone_node(pcx.where_preds[k].subject, &pcx);
+            let bounds = clone_node(pcx.where_preds[k].bounds, &pcx);
+            subst_trait_args(subject, own, args, &pcx);
+            subst_trait_args(bounds, own, args, &pcx);
+            pcx.where_preds[k].subject = subject;
+            pcx.where_preds[k].bounds = bounds;
+        }
+    }
+    // (own's own names are params of the substitution: f's g is left out
+    // of the walk, which would rename them first, and each one's bounds
+    // walked alone)
+    pcx.nodes[f].g = 0;
+    subst_trait_args(f, own, args, &pcx);
+    pcx.nodes[f].g = own;
+    for i in 0..pcx.nodes[own].count {
+        let p = child(own, i, pcx);
+        subst_trait_args(pcx.nodes[p].g, own, args, &pcx);
+        subst_trait_args(pcx.nodes[p].h, own, args, &pcx);
+        for j in 0..pcx.nodes[p].count {
+            subst_trait_args(child(p, j, pcx), own, args, &pcx);
+        }
+    }
+    for i in 0..pcx.nodes[own].count {
+        pcx.nodes[child(own, i, pcx)].a = pcx.nodes[child(args, i, pcx)].a;
+    }
+}
+
 // `impl<A> Tr for T<A>`: the impl's parameters, then f's own.
 fn merged_generics(outer: i64, own: i64, pcx: inout Ctx<Comp>) -> i64 {
     let n = new_node(NodeKind::Generics, pcx.nodes[outer].start, pcx.nodes[outer].end, &pcx);
@@ -214,6 +394,84 @@ fn merged_generics(outer: i64, own: i64, pcx: inout Ctx<Comp>) -> i64 {
     list_end(n, mark, &pcx);
     pcx.nodes[n].a = pcx.nodes[outer].count;
     n
+}
+
+// (0.27.2) The trait arguments `args` (a Generics node) with the impl's
+// own type node `self_node` (default_trait_args' `Rhs = Self`) written
+// `Self`: the copied default body is read in the trait's module, where
+// the impl's type may have no name (`impl PartialEq for RangeFull` read
+// in std::cmp), and `Self` is the impl's type there. RULE: F12.1
+fn self_for_impl_type(args: i64, self_node: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if args == 0 || !(0..pcx.nodes[args].count).any(|k| child(args, k, pcx) == self_node) {
+        return args;
+    }
+    let n = crate::front::ast::new_node(NodeKind::Generics, pcx.nodes[args].start,
+        pcx.nodes[args].end, &pcx);
+    let mark = list_begin(pcx);
+    for k in 0..pcx.nodes[args].count {
+        let a = child(args, k, pcx);
+        if a == self_node {
+            let s = crate::front::ast::new_node(NodeKind::TyName, pcx.nodes[a].start,
+                pcx.nodes[a].end, &pcx);
+            pcx.nodes[s].a = crate::base::intern_c(c"Self", &pcx);
+            list_push(s, &pcx);
+        } else {
+            list_push(a, &pcx);
+        }
+    }
+    list_end(n, mark, &pcx);
+    n
+}
+
+// (0.27.2) In the tree at n (a default body cloned from a generic
+// trait's declaration), every bare name of one of the trait's parameters
+// `params` becomes a copy of the trait argument an impl wrote for it,
+// `args` (its Generics node; `Rhs` becomes `Self` for `impl PartialEq
+// for T`), keeping the name's position. The fields walked are
+// clone_node's. RULE: F12.1
+pub fn subst_trait_args(n: i64, params: i64, args: i64, pcx: inout Ctx<Comp>) {
+    if n == 0 || args == 0 {
+        return;
+    }
+    let kind = pcx.nodes[n].kind;
+    if kind == NodeKind::TyName && pcx.nodes[n].count == 0 && pcx.nodes[n].g == 0 {
+        match crate::front::generics::instantiate::tparam_index(params, pcx.nodes[n].a, pcx) {
+            Option::Some(k) => {
+                if k < pcx.nodes[args].count {
+                    let c = clone_node(child(args, k, pcx), &pcx);
+                    let start = pcx.nodes[n].start;
+                    let end = pcx.nodes[n].end;
+                    pcx.nodes[n] = pcx.nodes[c];
+                    pcx.nodes[n].start = start;
+                    pcx.nodes[n].end = end;
+                }
+                return;
+            }
+            Option::None => {}
+        }
+    }
+    if kind == NodeKind::Fn {
+        subst_trait_args(pcx.nodes[n].b, params, args, &pcx);
+        subst_trait_args(pcx.nodes[n].c, params, args, &pcx);
+    } else {
+        if crate::front::generics::instantiate::node_field_a(kind) {
+            subst_trait_args(pcx.nodes[n].a, params, args, &pcx);
+        }
+        if crate::front::generics::instantiate::node_field_b(kind) {
+            subst_trait_args(pcx.nodes[n].b, params, args, &pcx);
+        }
+        if crate::front::generics::instantiate::node_field_c(kind) {
+            subst_trait_args(pcx.nodes[n].c, params, args, &pcx);
+        }
+        if kind == NodeKind::For || kind == NodeKind::Param {
+            subst_trait_args(pcx.nodes[n].d, params, args, &pcx);
+        }
+        subst_trait_args(pcx.nodes[n].h, params, args, &pcx);
+    }
+    subst_trait_args(pcx.nodes[n].g, params, args, &pcx);
+    for i in 0..pcx.nodes[n].count {
+        subst_trait_args(child(n, i, pcx), params, args, &pcx);
+    }
 }
 
 fn impl_is_generic(node: i64, pcx: Ctx<Comp>) -> bool {
@@ -243,6 +501,53 @@ fn impl_type_error(node: i64, before: *u8, tr: i64, after: *u8, pcx: inout Ctx<C
     err_end_soft(&pcx);
 }
 
+// (0.27.2) The methods the compiler's lowerings call by name, with no
+// token of a source naming them (op_method and unary_call, check/iterate,
+// check/interp, check/rust, check/check_mode, calls' view methods,
+// places/shim): a trait's default of one of these names is copied into
+// every impl, as one a program names is (default_names).
+const LOWERED_METHODS: [[u8]; 49] = [
+    "eq", "ne", "cmp", "partial_cmp", "lt", "le", "gt", "ge", "add", "sub", "mul", "div", "rem",
+    "neg", "not", "bitand", "bitor", "bitxor", "shl", "shr", "add_assign", "sub_assign",
+    "mul_assign", "div_assign", "rem_assign", "deref", "deref_mut", "index", "index_mut",
+    "into_iter", "iter", "next", "drop", "clone", "fmt", "write_str", "write_char", "write_fmt",
+    "spec", "panic", "as_slice", "as_mut_slice", "as_str", "as_path", "from", "into", "hash",
+    "display", "debug",
+];
+
+// (0.27.2) The names that ask for a trait's default (DEFAULT_NAMES): every
+// name the tokens use but right after `fn` (the program's files, std2's,
+// the derived and builtin impls' text), and LOWERED_METHODS. A default no
+// name asks for is never called, so collect_impl copies only the others
+// into an impl (std2's traits leave thousands out, and a hello world calls
+// a few), and the builtin integer methods made are only those
+// (builtin_impls::keep_named_methods): for a rust program on std2 that is compiled, not for a query,
+// `--std2-check`, `fix --only buf` or std read from its files, which read
+// every body. RULE: Z7 (std2 whole under --std2-check)
+pub fn default_names(pcx: inout Ctx<Comp>) {
+    pcx.default_filter = crate::front::known::on_std2(pcx) && !pcx.query && !pcx.record
+        && pcx.std_tree == 0 as *u8 && !crate::places::borrowck::std2::std2_check(pcx);
+    if !pcx.default_filter {
+        return;
+    }
+    // (from the first token not read yet: the builtin impls' names are
+    // read first, before their text is, expand_builtin_impls)
+    let first = pcx.default_scanned;
+    for i in first..pcx.toks.len() as i64 {
+        if pcx.toks[i].kind == Tok::Ident && (i == 0 || pcx.toks[i - 1].kind != Tok::Fn) {
+            pcx.default_names.put(pcx.toks[i].value as i64 + 1, 1);
+        }
+    }
+    pcx.default_scanned = pcx.toks.len() as i64;
+    if first > 0 {
+        return;
+    }
+    for k in 0..LOWERED_METHODS.len() {
+        let sym = intern(LOWERED_METHODS[k], &pcx);
+        pcx.default_names.put(sym + 1, 1);
+    }
+}
+
 // The impl blocks of traits (a phase of the declarations, before the
 // methods): their traits and types, coherence, and the default functions
 // they leave out, copied into them.
@@ -266,6 +571,7 @@ pub fn collect_impls(pcx: inout Ctx<Comp>) {
                 }
             }
         }
+        default_names(&pcx);
         pcx.impl_extra.count = 0;
         for k in 0..pcx.nodes[pcx.program].count {
             let node = child(pcx.program, k, pcx);
@@ -292,6 +598,8 @@ pub fn collect_impls(pcx: inout Ctx<Comp>) {
             }
             list_end(pcx.program, mark, &pcx);
         }
+        // RULE: D9.1 (a kind asked before the impls were known: forgotten)
+        crate::front::own::kinds::forget_kinds(&pcx);
     }
 }
 
@@ -308,6 +616,11 @@ pub fn collect_impl(node: i64, pcx: inout Ctx<Comp>) {
         if tpl == TPL_NONE {
             tpl = slice_template(pcx.nodes[node].b, pcx.nodes[node].g, &pcx);
         }
+        // RULE: F4.1, F5.1, F6.1, F14.1 (the rust edition: any other header
+        // is a pattern impl, matched by match_type)
+        if tpl == TPL_NONE && crate::front::rust::rust_at(pcx.nodes[node].start, &pcx) {
+            tpl = TPL_PATTERN;
+        }
         if tpl == TPL_NONE {
             err_begin(pcx.nodes[pcx.nodes[node].b].start, &pcx);
             err_str(c"a generic impl is for a generic struct or enum, with the impl's parameters as its arguments: 'impl<T> Hash for Vec<T>'", pcx);
@@ -317,7 +630,10 @@ pub fn collect_impl(node: i64, pcx: inout Ctx<Comp>) {
         ty = resolve_type(pcx.nodes[node].b, &pcx);
     }
     // (0.26.3: an unsafe trait's impl is `unsafe impl`)
-    crate::front::check::alloc_rules::check_impl_safety(node, tr, ty, &pcx);
+    // RULE: AT2 (a negative impl, `impl !Send for X {}`, is not unsafe)
+    if !crate::front::auto_traits::negative_impl(node, tr, &pcx) {
+        crate::front::check::alloc_rules::check_impl_safety(node, tr, ty, &pcx);
+    }
     pcx.traits_impls.push(ImplInfo {
         node: node, tr: tr, ty: ty, tpl: tpl, module: m, targs: 0,
     });
@@ -331,7 +647,7 @@ pub fn collect_impl(node: i64, pcx: inout Ctx<Comp>) {
             continue;
         }
         let same = (ty != 0 && pcx.traits_impls[j].ty == ty)
-            || (tpl != TPL_NONE && pcx.traits_impls[j].tpl == tpl)
+            || (tpl != TPL_NONE && tpl != TPL_PATTERN && pcx.traits_impls[j].tpl == tpl)
             || (ty != 0 && pcx.traits_impls[j].tpl != TPL_NONE
                 && instance_of(ty, pcx.traits_impls[j].tpl, pcx))
             || (tpl != TPL_NONE && pcx.traits_impls[j].ty != 0
@@ -374,7 +690,11 @@ pub fn collect_impl(node: i64, pcx: inout Ctx<Comp>) {
         }
         // (0.15: a generic trait's function without a body was
         // reported by collect_trait_params)
-        if found || trait_param_count(tr, pcx) != 0 && pcx.nodes[decl].c != 0 {
+        // RULE: F12.1 (0.27.2: a generic trait's default is copied with the
+        // trait's arguments substituted, subst_trait_args)
+        let generic_default = trait_param_count(tr, pcx) != 0 && pcx.nodes[decl].c != 0;
+        if found
+            || generic_default && !crate::front::rust::rust_at(pcx.nodes[node].start, &pcx) {
             continue;
         }
         if pcx.nodes[decl].c == 0 {
@@ -388,7 +708,42 @@ pub fn collect_impl(node: i64, pcx: inout Ctx<Comp>) {
             err_end_soft(&pcx);
             continue;
         }
+        // (0.27.2: a default no name asks for is never called: not copied,
+        // default_names)
+        if pcx.default_filter && pcx.default_names.get(pcx.nodes[decl].a + 1) == 0 {
+            continue;
+        }
+        // (0.27.2: its body stays the trait's until it is checked,
+        // own_default_body: std2's traits leave thousands of defaults out,
+        // and a program uses few; a generic trait's, substituted below, and
+        // one that failed to parse, checked in place for a query, are copied)
+        // RULE: F12.2 (0.27.2: a default's own parameter named as one of
+        // the impl's, fold's B and F in `impl<B, I, F> Iterator for Map<I,
+        // F>`, is renamed in the copy, whose body is its own: in the merged
+        // parameters the impl's would take its place)
+        let clash = impl_is_generic(node, pcx)
+            && own_param_clash(pcx.nodes[node].g, pcx.nodes[decl].g, pcx)
+            && crate::front::rust::rust_at(pcx.nodes[node].start, &pcx);
+        let share = !generic_default && !clash && (pcx.nodes[decl].p & FN_BODY_FAILED) == 0;
+        let body = pcx.nodes[decl].c;
+        if share {
+            pcx.nodes[decl].c = 0;
+        }
         let f = clone_node(decl, &pcx);
+        if share {
+            pcx.nodes[decl].c = body;
+            pcx.nodes[f].c = body;
+            pcx.shared_bodies.put(f + 1, 1);
+        }
+        if generic_default {
+            subst_trait_args(f, pcx.traits[tr].params,
+                self_for_impl_type(pcx.nodes[pcx.nodes[node].a].g, pcx.nodes[node].b, &pcx),
+                &pcx);
+        }
+        copy_where_preds(decl, f, &pcx);
+        if clash {
+            rename_own_params(f, pcx.nodes[node].g, &pcx);
+        }
         pcx.nodes[f].d = if pcx.nodes[pcx.nodes[node].b].kind
             == NodeKind::TyName { pcx.nodes[pcx.nodes[node].b].a }
             else { intern_c(c"_", &pcx) };
@@ -411,10 +766,120 @@ pub fn collect_impl(node: i64, pcx: inout Ctx<Comp>) {
     }
 }
 
+// (0.27.2) A trait default copied into an impl keeps the trait's body
+// (collect_impl) until it is to be checked: then it gets its own copy, as
+// every copy had before. An instance of a generic one copies its
+// template's body anyway (fn_instance).
+pub fn own_default_body(node: i64, pcx: inout Ctx<Comp>) {
+    if pcx.shared_bodies.get(node + 1) != 0 {
+        pcx.shared_bodies.put(node + 1, 0);
+        pcx.nodes[node].c = clone_node(pcx.nodes[node].c, &pcx);
+    }
+}
+
 // After the signatures are resolved: each function of a (non-generic)
 // impl has its trait's signature, with Self the impl's type.
 pub fn check_impl_signatures(pcx: inout Ctx<Comp>) {
+    // RULE: F4.2 (the overlap check of pattern impls, after collection)
+    crate::front::coherence::check_overlap(&pcx);
     unsafe {
+        // RULE: F2.3 (an impl of a trait with supertraits: the type
+        // implements each; a generic impl's, of the rust edition, with its
+        // parameters as declared: coherence::check_generic_obligations)
+        for i in 0..pcx.traits_impls.len() as i64 {
+            let ty = pcx.traits_impls[i].ty;
+            let tr = pcx.traits_impls[i].tr;
+            if crate::front::rust::rust_at(pcx.nodes[pcx.traits_impls[i].node].start, &pcx) {
+                crate::front::coherence::check_constrained(i, &pcx);
+            }
+            if ty == 0 && pcx.traits_impls[i].tpl != TPL_NONE
+                && crate::front::rust::rust_at(pcx.nodes[pcx.traits_impls[i].node].start, &pcx) {
+                crate::front::coherence::check_generic_obligations(i, &pcx);
+            }
+            if ty == 0 {
+                continue;
+            }
+            // (a generic trait's parameters are the impl's arguments here,
+            // `PartialOrd<Rhs>: PartialEq<Rhs>`, `type A: Tr<Rhs>`; unknown
+            // for a generic impl: its checks come per instance, not yet)
+            let tcount = trait_param_count(tr, pcx);
+            let targs = pcx.traits_impls[i].targs;
+            if tcount != 0 && targs < 0 {
+                continue;
+            }
+            let saved_tenv = if tcount != 0 {
+                env_enter(pcx.traits[tr].params, targs, tcount, &pcx)
+            } else { env_enter(0, 0, 0, &pcx) };
+            pcx.self_impl = i;
+            pcx.assoc_trait = tr;
+            pcx.assoc_targs = targs;
+            // RULE: F11.1 (`type A: B;`: the impl's definition implements B)
+            let declared = pcx.nodes[pcx.traits[tr].node].b;
+            if declared != 0 {
+                for k in 0..pcx.nodes[declared].count {
+                    let d = child(declared, k, pcx);
+                    let bounds = pcx.nodes[d].h;
+                    if bounds == 0 || (pcx.nodes[d].p & NODE_ASSOC_CONST) != 0 {
+                        continue;
+                    }
+                    let pos = pcx.nodes[pcx.traits_impls[i].node].start;
+                    let ta = crate::front::assoc::trait_projection(tr, ty, pcx.nodes[d].a, pos,
+                        &pcx);
+                    if ta == 0 || has_error_type(ta, pcx) {
+                        continue;
+                    }
+                    for m in 0..pcx.nodes[bounds].count {
+                        let b = child(bounds, m, pcx);
+                        let s = bound_trait(b, &pcx);
+                        let holds = if pcx.nodes[b].g != 0 {
+                            crate::front::convert::implements_with(s, ta, bound_args(b, &pcx),
+                                &pcx)
+                        } else { implements(s, ta, &pcx) };
+                        if !holds {
+                            let saved_kind = pcx.err_kind;
+                            pcx.err_kind = c"trait.unmet";
+                            err_begin(pos, &pcx);
+                            err_fmt(format_args("'{}::{} = ", sym_text(pcx.traits[tr].name, pcx),
+                                sym_text(pcx.nodes[d].a, pcx)), pcx);
+                            err_type(ta, pcx);
+                            err_fmt(format_args("' must implement '{}', as the trait declares",
+                                SRC[pcx.nodes[b].start..pcx.nodes[b].end]), pcx);
+                            err_end_soft(&pcx);
+                            pcx.err_kind = saved_kind;
+                        }
+                    }
+                }
+            }
+            let supers = trait_supers(tr, pcx);
+            // (`PartialEq<Self>`: Self is the impl's type)
+            let saved_self = pcx.self_type;
+            pcx.self_type = ty;
+            for k in 0..(if supers == 0 { 0 } else { pcx.nodes[supers].count }) {
+                let b = child(supers, k, pcx);
+                let s = bound_trait(b, &pcx);
+                let holds = if pcx.nodes[b].g != 0 {
+                    crate::front::convert::implements_with(s, ty, bound_args(b, &pcx), &pcx)
+                } else { implements(s, ty, &pcx) };
+                if !holds {
+                    let saved_kind = pcx.err_kind;
+                    pcx.err_kind = c"trait.unmet";
+                    err_begin(pcx.nodes[pcx.traits_impls[i].node].start, &pcx);
+                    err_fmt(format_args("'{}' requires '", sym_text(pcx.traits[tr].name, pcx)),
+                        pcx);
+                    err_type(ty, pcx);
+                    err_fmt(format_args(": {}', which is not implemented",
+                        SRC[pcx.nodes[b].start..pcx.nodes[b].end]), pcx);
+                    err_help(c"implement the supertrait for the type first", pcx);
+                    err_end_soft(&pcx);
+                    pcx.err_kind = saved_kind;
+                }
+            }
+            pcx.self_type = saved_self;
+            pcx.self_impl = -1;
+            pcx.assoc_trait = -1;
+            pcx.assoc_targs = -1;
+            env_leave(saved_tenv, &pcx);
+        }
         for f in 0..pcx.fns.len() as i64 {
             let i = impl_of_fn(f, pcx);
             if i < 0 || pcx.fns[f].generic > 0 || pcx.fns[f].tmpl != 0
@@ -430,6 +895,10 @@ pub fn check_impl_signatures(pcx: inout Ctx<Comp>) {
             let saved_self = pcx.self_type;
             pcx.cur_mod = pcx.traits[tr].module;
             pcx.self_type = pcx.fns[f].self_ty;
+            // (0.27.2: the declaration's `Self::Output` is this impl's, F13.1)
+            pcx.self_impl = i;
+            pcx.assoc_trait = tr;
+            pcx.assoc_targs = pcx.traits_impls[i].targs;
             // (0.15: a generic trait's parameters are the impl's arguments)
             let count = trait_param_count(tr, pcx);
             if count != 0 && pcx.traits_impls[i].targs < 0 {
@@ -461,6 +930,9 @@ pub fn check_impl_signatures(pcx: inout Ctx<Comp>) {
             }
             pcx.cur_mod = saved_mod;
             pcx.self_type = saved_self;
+            pcx.self_impl = -1;
+            pcx.assoc_trait = -1;
+            pcx.assoc_targs = -1;
             let count = pcx.tscratch.count - mark;
             var same = count == pcx.fns[f].param_count && ret == pcx.fns[f].ret
                 && ((pcx.nodes[decl].p & 64) == (pcx.nodes[pcx.fns[f].node].p & 64));
@@ -583,34 +1055,243 @@ pub fn std_trait(name: *u8, pcx: inout Ctx<Comp>) -> i64 {
     }
 }
 
-// Whether t implements tr through an impl block.
-pub fn has_impl(tr: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
+// (0.27.2) The bindings of impl i's type parameters for type t: a TLISTS
+// index of as many types as the impl has parameters (0 for one the
+// header leaves unbound, F14.1), or -1 when the impl is not for t. A
+// concrete impl is for its type (no parameters); a template impl for
+// the template's instances, bound by position; a pattern impl
+// (TPL_PATTERN) by match_type over its header. The bounds are not
+// checked here (impl_applies). RULE: F0.3
+pub fn impl_bindings(i: i64, t: i64, pcx: inout Ctx<Comp>) -> i64 {
+    // UNSAFE: alloc_array/free for the bindings, as instantiate_call's.
+    // SAFETY: bound has `count` slots, written for k < count only, and is
+    // freed on every path before returning.
     unsafe {
-        for i in 0..pcx.traits_impls.len() as i64 {
-            if pcx.traits_impls[i].tr != tr {
-                continue;
+        let ty = pcx.traits_impls[i].ty;
+        let tpl = pcx.traits_impls[i].tpl;
+        if ty != 0 {
+            return if ty == t { crate::front::generics::take_targs(pcx.tscratch.count, &pcx) }
+                else { -1 };
+        }
+        if tpl == TPL_NONE {
+            return -1;
+        }
+        if tpl != TPL_PATTERN {
+            if !instance_of(t, tpl, pcx) {
+                return -1;
             }
-            if pcx.traits_impls[i].ty != 0 && pcx.traits_impls[i].ty == t {
-                return true;
-            }
-            if pcx.traits_impls[i].tpl != TPL_NONE && instance_of(t, pcx.traits_impls[i].tpl, pcx) {
-                // ... when its arguments satisfy the impl's bounds.
-                let params = pcx.nodes[pcx.traits_impls[i].node].g;
-                let targs = instance_targs(t, &pcx);
-                // (0.14: the parameters bound, for the constraints)
-                let saved = env_enter(params, targs, pcx.nodes[params].count, &pcx);
-                var ok = true;
-                for k in 0..pcx.nodes[params].count {
-                    if !satisfies(child(params, k, pcx), pcx.tlists.data[targs + k], &pcx) {
-                        ok = false;
-                    }
-                }
-                env_leave(saved, &pcx);
-                return ok;
+            // (an impl with more parameters than the type's arguments,
+            // `impl<T: PartialEq<U>, U> PartialEq<W<U>> for W<T>`: bound by
+            // match_type, the rest left 0, F14.1)
+            let g = pcx.nodes[pcx.traits_impls[i].node].g;
+            let targ_count = if pcx.types[t].kind == TyKind::Struct {
+                pcx.structs[pcx.types[t].a].targ_count
+            } else if pcx.types[t].kind == TyKind::Enum {
+                ENUMS[pcx.types[t].a].targ_count
+            } else {
+                -1
+            };
+            if g == 0 || targ_count < 0 || pcx.nodes[g].count == targ_count {
+                return instance_targs(t, &pcx);
             }
         }
-        false
+        let node = pcx.traits_impls[i].node;
+        let params = pcx.nodes[node].g;
+        let count = pcx.nodes[params].count;
+        let bound = alloc_array::<i64>(count);
+        for k in 0..count {
+            bound[k] = 0;
+        }
+        let ok = crate::front::generics::instantiate::match_type(params, bound,
+            pcx.traits_impls[i].module, pcx.nodes[node].b, t, &pcx);
+        var r = -1;
+        var free_param = false;
+        for k in 0..count {
+            if bound[k] == 0 {
+                free_param = true;
+            }
+        }
+        if ok && free_param && crate::front::rust::rust_at(pcx.nodes[node].start, &pcx)
+            && pcx.assoc_depth < crate::front::assoc::MAX_ASSOC_DEPTH {
+            // RULE: F14.1 (0.27.2: a parameter the header leaves free that a
+            // bound's constraint fixes, Copied's T from I's Item, as
+            // fn_pattern_bindings does: `type Item = T` resolves)
+            pcx.assoc_depth += 1;
+            let saved_mod = pcx.cur_mod;
+            pcx.cur_mod = pcx.traits_impls[i].module;
+            for k in 0..count {
+                if bound[k] != 0 {
+                    crate::front::assoc::infer_from_assoc(params, bound, pcx.traits_impls[i].module,
+                        k, &pcx);
+                    // (Map's B, from F's `FnMut(I::Item) -> B` and the closure
+                    // F is)
+                    crate::front::closures::fn_bounds::infer_output_from_fn_bound(params, bound,
+                        pcx.traits_impls[i].module, k, &pcx);
+                }
+            }
+            pcx.cur_mod = saved_mod;
+            pcx.assoc_depth -= 1;
+        }
+        if ok {
+            let mark = pcx.tscratch.count;
+            for k in 0..count {
+                pcx.tscratch.push(bound[k]);
+            }
+            r = crate::front::generics::take_targs(mark, &pcx);
+        }
+        free(bound as *u8);
+        r
     }
+}
+
+// (0.27.2) impl_bindings when the impl's bounds hold for them too (an
+// unbound parameter's are not checked: they hold for what fixes it
+// later); -1 otherwise. The depth of nested impl searches is bounded
+// by MAX_ASSOC_DEPTH (F0.3), as the associated types' is. RULE: F0.3, F0.4(c)
+pub fn impl_applies(i: i64, t: i64, pcx: inout Ctx<Comp>) -> i64 {
+    // UNSAFE: TLISTS is a raw table (base/comp.vl); every table read is.
+    // SAFETY: b..b + count was written by impl_bindings for these params.
+    unsafe {
+        let b = impl_bindings(i, t, &pcx);
+        if b < 0 || pcx.traits_impls[i].ty != 0 {
+            return b;
+        }
+        if pcx.assoc_depth >= crate::front::assoc::MAX_ASSOC_DEPTH {
+            return -1;
+        }
+        let params = pcx.nodes[pcx.traits_impls[i].node].g;
+        let count = pcx.nodes[params].count;
+        pcx.assoc_depth += 1;
+        let saved = env_enter(params, b, count, &pcx);
+        var ok = true;
+        // (a bound with arguments, `T: PartialEq<U>`, while another
+        // parameter is unbound may name it: it is checked where the call
+        // fixes them all)
+        var all_bound = true;
+        for k in 0..count {
+            if pcx.tlists.data[b + k] == 0 {
+                all_bound = false;
+            }
+        }
+        for k in 0..count {
+            let arg = pcx.tlists.data[b + k];
+            if arg != 0 && (all_bound || !generic_bounds(child(params, k, pcx), pcx))
+                && !satisfies(child(params, k, pcx), arg, &pcx) {
+                ok = false;
+            }
+        }
+        env_leave(saved, &pcx);
+        pcx.assoc_depth -= 1;
+        if ok { b } else { -1 }
+    }
+}
+
+// Whether parameter node p has a bound with type arguments or
+// constraints (`From<U>`, `Iterator<Item = U>`), which may name another
+// parameter.
+fn generic_bounds(p: i64, pcx: Ctx<Comp>) -> bool {
+    let bounds = pcx.nodes[p].h;
+    if bounds == 0 {
+        return false;
+    }
+    for i in 0..pcx.nodes[bounds].count {
+        let b = child(bounds, i, pcx);
+        if pcx.nodes[b].g != 0 || pcx.nodes[b].h != 0 || pcx.nodes[b].kind == NodeKind::TyFn {
+            return true;
+        }
+    }
+    false
+}
+
+// (0.27.2) Whether impl i is a blanket impl: a pattern impl whose self
+// type is one of its own parameters (`impl<T: ?Sized> Borrow<T> for T`,
+// `impl<I: Iterator> IntoIterator for I`). RULE: F4.1, F11.4
+pub fn blanket_impl(i: i64, pcx: Ctx<Comp>) -> bool {
+    if pcx.traits_impls[i].tpl != TPL_PATTERN {
+        return false;
+    }
+    let node = pcx.traits_impls[i].node;
+    let b = pcx.nodes[node].b;
+    pcx.nodes[b].kind == NodeKind::TyName && pcx.nodes[b].g == 0 && pcx.nodes[b].count == 0
+        && crate::front::generics::instantiate::tparam_index(pcx.nodes[node].g, pcx.nodes[b].a,
+            pcx).is_some()
+}
+
+// (0.27.2) Whether impl i (of a generic trait) is for the trait
+// arguments a declaration is being read with (pcx.assoc_trait,
+// pcx.assoc_targs: convert::decl_param, check_impl_signatures); true
+// when none are, or the impl's are unknown for t. RULE: F13.1
+pub fn trait_args_agree(i: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
+    let tr = pcx.traits_impls[i].tr;
+    if pcx.assoc_trait != tr || pcx.assoc_targs < 0 {
+        return true;
+    }
+    let count = crate::front::convert::trait_param_count(tr, pcx);
+    if count == 0 {
+        return true;
+    }
+    let a = crate::front::convert::impl_targs(i, t, &pcx);
+    a < 0 || crate::front::convert::same_list(a, pcx.assoc_targs, count, pcx)
+}
+
+// (0.27.2) The bindings of the impl parameters of f, a method of a
+// pattern impl (TPL_PATTERN in GMETHODS), for receiver type t: a TLISTS
+// index of every parameter of f's merged generics (the impl's first,
+// its own 0), with the impl's bounds holding for what the header
+// bound; -1 when the header does not match t. RULE: F0.3, F0.5(i)
+pub fn fn_pattern_bindings(f: i64, t: i64, pcx: inout Ctx<Comp>) -> i64 {
+    // UNSAFE: alloc_array/free for the bindings, as impl_bindings'.
+    // SAFETY: bound has `count` slots (the merged generics' count), read and
+    // written for k < count only, and is freed before returning.
+    unsafe {
+        let item = pcx.fns[f].node;
+        let params = pcx.nodes[item].g;
+        let count = pcx.nodes[params].count;
+        let impl_count = pcx.nodes[params].a;
+        let bound = alloc_array::<i64>(count);
+        for k in 0..count {
+            bound[k] = 0;
+        }
+        let ok = crate::front::generics::instantiate::match_type(params, bound,
+            pcx.fns[f].module, pcx.nodes[item].h, t, &pcx);
+        var r = -1;
+        if ok && pcx.assoc_depth < crate::front::assoc::MAX_ASSOC_DEPTH {
+            // RULE: F14.1 (0.27.2: a parameter the header leaves free and a
+            // bound's constraint fixes, `impl<'a, T, I: Iterator<Item = &'a T>>
+            // Iterator for Copied<I>`: T from I's Item, before the bounds)
+            for k in 0..impl_count {
+                crate::front::assoc::infer_from_assoc(params, bound, pcx.fns[f].module, k, &pcx);
+            }
+            let mark = pcx.tscratch.count;
+            for k in 0..count {
+                pcx.tscratch.push(bound[k]);
+            }
+            r = crate::front::generics::take_targs(mark, &pcx);
+            pcx.assoc_depth += 1;
+            let saved = env_enter(params, r, impl_count, &pcx);
+            for k in 0..impl_count {
+                if bound[k] != 0 && !satisfies(child(params, k, pcx), bound[k], &pcx) {
+                    r = -1;
+                }
+            }
+            env_leave(saved, &pcx);
+            pcx.assoc_depth -= 1;
+        }
+        free(bound as *u8);
+        r
+    }
+}
+
+// Whether t implements tr through an impl block.
+pub fn has_impl(tr: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
+    // RULE: F0.4(c), F4.3 (every impl of tr is tried: the one whose header
+    // matches and whose bounds hold; 0.14: a template's bounds too)
+    for i in 0..pcx.traits_impls.len() as i64 {
+        if pcx.traits_impls[i].tr == tr && impl_applies(i, t, &pcx) >= 0 {
+            return true;
+        }
+    }
+    false
 }
 
 // (0.15) For t an instance of a generic type with an impl of tr: 0 when
@@ -621,6 +1302,7 @@ pub fn unmet_impl_arg(tr: i64, t: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         for i in 0..pcx.traits_impls.len() as i64 {
             if pcx.traits_impls[i].tr != tr || pcx.traits_impls[i].tpl == TPL_NONE
+                || pcx.traits_impls[i].tpl == TPL_PATTERN
                 || !instance_of(t, pcx.traits_impls[i].tpl, pcx) {
                 continue;
             }
@@ -712,6 +1394,11 @@ fn atomic_bound(tr: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
 }
 
 pub fn implements(tr: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
+    // RULE: AT1, AT2 (Send and Sync: front/auto_traits.vl)
+    if crate::front::auto_traits::is_auto(tr, pcx) {
+        return has_error_type(t, pcx) || t == TY_NEVER
+            || crate::front::auto_traits::holds_auto(tr, t, &pcx);
+    }
     tr < 0 || has_error_type(t, pcx) || t == TY_NEVER || has_impl(tr, t, &pcx)
         || intrinsic(tr, t, &pcx)
 }
@@ -802,6 +1489,11 @@ pub fn check_bounds(params: i64, targs: i64, count: i64, what: i64, pos: i64, pc
                     continue;
                 }
                 let tr = bound_trait(b, &pcx);
+                // RULE: AT3 (`T: Send`: sync.not_send, with the failing part)
+                if crate::front::auto_traits::is_auto(tr, pcx) {
+                    crate::front::auto_traits::check_bound(tr, t, p, what, pos, &pcx);
+                    continue;
+                }
                 // (0.15: `From<U>`, a generic trait's bound)
                 let bargs = if pcx.nodes[b].g != 0 { bound_args(b, &pcx) } else { -1 };
                 let holds = if bargs >= 0 { implements_with(tr, t, bargs, &pcx) }
@@ -879,7 +1571,8 @@ pub fn bounded_param_of_type(n: i64, pcx: Ctx<Comp>) -> i64 {
 pub fn require_in_bounds(p: i64, name: i64, pos: i64, pcx: inout Ctx<Comp>) {
     let bounds = pcx.nodes[p].h;
     for i in 0..pcx.nodes[bounds].count {
-        if trait_declares(bound_trait(child(bounds, i, pcx), &pcx), name, pcx) {
+        // RULE: F2.2 (a bound's supertraits' functions too)
+        if trait_declares_closure(bound_trait(child(bounds, i, pcx), &pcx), name, &pcx) {
             return;
         }
     }
@@ -959,13 +1652,87 @@ pub fn binary_op_trait(op: Tok, t: i64, pcx: inout Ctx<Comp>) -> i64 {
     if tr >= 0 && (has_impl(tr, t, &pcx) || tuple_operator(tr, t, &pcx)) { tr } else { -1 }
 }
 
+// RULE: F26.1 (0.27.2) The std2 ops trait of binary operator op (an `op=`
+// form's with assign), or 0: Rust's reference "Operator expressions".
+pub fn rust_op_trait_name(op: Tok, assign: bool) -> *u8 {
+    if assign {
+        return if op == Tok::PlusEq { c"AddAssign" } else if op == Tok::MinusEq { c"SubAssign" }
+            else if op == Tok::StarEq { c"MulAssign" } else if op == Tok::SlashEq { c"DivAssign" }
+            else if op == Tok::PercentEq { c"RemAssign" }
+            else if op == Tok::AmpEq { c"BitAndAssign" }
+            else if op == Tok::PipeEq { c"BitOrAssign" }
+            else if op == Tok::CaretEq { c"BitXorAssign" } else if op == Tok::ShlEq { c"ShlAssign" }
+            else if op == Tok::ShrEq { c"ShrAssign" } else { 0 as *u8 };
+    }
+    if op == Tok::Plus { c"Add" } else if op == Tok::Minus { c"Sub" }
+    else if op == Tok::Star { c"Mul" } else if op == Tok::Slash { c"Div" }
+    else if op == Tok::Percent { c"Rem" } else if op == Tok::Amp { c"BitAnd" }
+    else if op == Tok::Pipe { c"BitOr" } else if op == Tok::Caret { c"BitXor" }
+    else if op == Tok::Shl { c"Shl" } else if op == Tok::Shr { c"Shr" }
+    else if op == Tok::EqEq || op == Tok::BangEq { c"PartialEq" }
+    else if op == Tok::Lt || op == Tok::Gt || op == Tok::LtEq || op == Tok::GtEq { c"PartialOrd" }
+    else { 0 as *u8 }
+}
+
+// RULE: F26.1 (0.27.2) The method of std2's ops trait operator op calls
+// (`add` for `+`, `add_assign` for `+=`, `lt` for `<`).
+pub fn rust_op_method(op: Tok) -> *u8 {
+    if op == Tok::Plus { c"add" } else if op == Tok::Minus { c"sub" }
+    else if op == Tok::Star { c"mul" } else if op == Tok::Slash { c"div" }
+    else if op == Tok::Percent { c"rem" } else if op == Tok::Amp { c"bitand" }
+    else if op == Tok::Pipe { c"bitor" } else if op == Tok::Caret { c"bitxor" }
+    else if op == Tok::Shl { c"shl" } else if op == Tok::Shr { c"shr" }
+    else if op == Tok::PlusEq { c"add_assign" } else if op == Tok::MinusEq { c"sub_assign" }
+    else if op == Tok::StarEq { c"mul_assign" } else if op == Tok::SlashEq { c"div_assign" }
+    else if op == Tok::PercentEq { c"rem_assign" } else if op == Tok::AmpEq { c"bitand_assign" }
+    else if op == Tok::PipeEq { c"bitor_assign" } else if op == Tok::CaretEq { c"bitxor_assign" }
+    else if op == Tok::ShlEq { c"shl_assign" } else if op == Tok::ShrEq { c"shr_assign" }
+    else if op == Tok::EqEq { c"eq" } else if op == Tok::BangEq { c"ne" }
+    else if op == Tok::Lt { c"lt" } else if op == Tok::LtEq { c"le" }
+    else if op == Tok::Gt { c"gt" } else { c"ge" }
+}
+
+// RULE: F26.1 (0.27.2, a rust program on std2) The ops trait binary
+// operator op (or its `op=` form) on a value of type t calls, when t has
+// an impl of it: -1 for the builtin scalars (their operators are the
+// machine's, F15.1) and for a type with none.
+pub fn rust_op_trait(op: Tok, t: i64, assign: bool, pcx: inout Ctx<Comp>) -> i64 {
+    if t <= 0 || is_numeric(t) || t == TY_BOOL || is_pointer(t, pcx)
+        || pcx.types[t].kind == TyKind::Fn || t == TY_NEVER || t == pcx.ty_error
+        || t == pcx.char_type && pcx.char_type != 0 {
+        return -1;
+    }
+    let name = rust_op_trait_name(op, assign);
+    if name == 0 as *u8 {
+        return -1;
+    }
+    let tr = std_trait(name, &pcx);
+    if tr >= 0 && has_impl(tr, t, &pcx) { tr } else { -1 }
+}
+
+// The spelling of binary operator op, for messages.
+pub fn rust_op_sign(op: Tok) -> *u8 {
+    if op == Tok::Plus { c"+" } else if op == Tok::Minus { c"-" } else if op == Tok::Star { c"*" }
+    else if op == Tok::Slash { c"/" } else if op == Tok::Percent { c"%" }
+    else if op == Tok::Amp { c"&" } else if op == Tok::Pipe { c"|" }
+    else if op == Tok::Caret { c"^" } else if op == Tok::Shl { c"<<" }
+    else if op == Tok::Shr { c">>" } else if op == Tok::EqEq { c"==" }
+    else if op == Tok::BangEq { c"!=" } else if op == Tok::Lt { c"<" }
+    else if op == Tok::LtEq { c"<=" } else if op == Tok::Gt { c">" }
+    else if op == Tok::GtEq { c">=" } else if op == Tok::PlusEq { c"+=" }
+    else if op == Tok::MinusEq { c"-=" } else if op == Tok::StarEq { c"*=" }
+    else if op == Tok::SlashEq { c"/=" } else if op == Tok::PercentEq { c"%=" }
+    else if op == Tok::AmpEq { c"&=" } else if op == Tok::PipeEq { c"|=" }
+    else if op == Tok::CaretEq { c"^=" } else if op == Tok::ShlEq { c"<<=" } else { c">>=" }
+}
+
 // Rewrites binary node n (its operands checked, of type t) into a call of
 // its trait's function:
 //     { let ==l = a; let ==r = b; ==l.add(==r) }      (+ - * /)
 //     { let ==l = a; let ==r = b; ==l.eq(&==r) }      (==; != negates)
 //     { let ==l = a; let ==r = b; ==l.cmp(&==r) < 0 } (< > <= >=)
 // and returns its type.
-pub fn operator_call(n: i64, t: i64, pcx: inout Ctx<Comp>) -> i64 {
+pub fn operator_call(n: i64, t: i64, rust_ops: bool, pcx: inout Ctx<Comp>) -> i64 {
     let op = pcx.nodes[n].op;
     let pos = pcx.nodes[n].start;
     // (0.17: an arithmetic operator's operands move into its by-value
@@ -988,7 +1755,21 @@ pub fn operator_call(n: i64, t: i64, pcx: inout Ctx<Comp>) -> i64 {
         let addr = new_node(NodeKind::Unary, pos, pos, &pcx);
         pcx.nodes[addr].op = Tok::Amp;
         pcx.nodes[addr].b = op_ident(r, pos, &pcx);
-        if op == Tok::EqEq || op == Tok::BangEq {
+        // RULE: Z9.2 (0.27.2: in the rust edition a slice or a str is its
+        // own reference, `&[T]` the view: `a == b` of two is `a.eq(b)`)
+        let rt = pcx.nodes[pcx.nodes[n].c].ty;
+        var addr = addr;
+        if rt > 0 && pcx.edition != 0
+            && (pcx.types[rt].kind == TyKind::Slice && pcx.types[rt].b == 0
+                || crate::front::distinct::is_view_distinct(rt, pcx))
+            && crate::front::rust::rust_at(pos, &pcx) {
+            addr = op_ident(r, pos, &pcx);
+        }
+        if rust_ops {
+            // RULE: F26.1 (`a < b` is `PartialOrd::lt(&a, &b)`, `a != b`
+            // `PartialEq::ne(&a, &b)`)
+            tail = op_method(op_ident(l, pos, &pcx), rust_op_method(op), addr, pos, &pcx);
+        } else if op == Tok::EqEq || op == Tok::BangEq {
             tail = op_method(op_ident(l, pos, &pcx), c"eq", addr, pos, &pcx);
             if op == Tok::BangEq {
                 let not = new_node(NodeKind::Unary, pos, pos, &pcx);
@@ -1006,9 +1787,21 @@ pub fn operator_call(n: i64, t: i64, pcx: inout Ctx<Comp>) -> i64 {
             tail = cmp;
         }
     } else {
-        let name = if op == Tok::Plus { c"add" } else if op == Tok::Minus { c"sub" }
+        let name = if rust_ops { rust_op_method(op) } else if op == Tok::Plus { c"add" }
+            else if op == Tok::Minus { c"sub" }
             else if op == Tok::Star { c"mul" } else { c"div" };
-        tail = op_method(op_ident(l, pos, &pcx), name, op_ident(r, pos, &pcx), pos, &pcx);
+        // RULE: F18.3 (0.27.2: an unsuffixed integer literal operand takes
+        // the impl's Rhs, `v << 2` with `impl Shl<u32> for V`: the call gets
+        // the literal itself, typed by the parameter)
+        let rhs = pcx.nodes[n].c;
+        var arg = op_ident(r, pos, &pcx);
+        if rust_ops && pcx.nodes[rhs].kind == NodeKind::Int
+            && pcx.nodes[rhs].b == crate::front::lexer::SUF_NONE {
+            arg = new_node(NodeKind::Int, pcx.nodes[rhs].start, pcx.nodes[rhs].end, &pcx);
+            pcx.nodes[arg] = pcx.nodes[rhs];
+            pcx.nodes[arg].ty = 0;
+        }
+        tail = op_method(op_ident(l, pos, &pcx), name, arg, pos, &pcx);
     }
     pcx.nodes[block].a = tail;
     // The operands are checked already: only their bindings are made.
@@ -1036,6 +1829,12 @@ pub fn operator_call(n: i64, t: i64, pcx: inout Ctx<Comp>) -> i64 {
 // `-a` on a type implementing std's Neg through an impl block: `{ let
 // ==l = a; ==l.neg() }` (its operand checked, of type t).
 pub fn negation_call(n: i64, t: i64, pcx: inout Ctx<Comp>) -> i64 {
+    unary_call(n, t, c"neg", &pcx)
+}
+
+// `-a` or (0.27.2, the rust edition's, F26.1) `!a` through the impl of Neg
+// or Not, method `name`: `{ let ==l = a; ==l.name() }`.
+pub fn unary_call(n: i64, t: i64, name: *u8, pcx: inout Ctx<Comp>) -> i64 {
     let pos = pcx.nodes[n].start;
     // (0.17: the operand moves into `neg(self)`, as operator_call's)
     let l = intern_c(c"=+l", &pcx);
@@ -1044,7 +1843,7 @@ pub fn negation_call(n: i64, t: i64, pcx: inout Ctx<Comp>) -> i64 {
     let let_l = op_let(l, pcx.nodes[n].b, pos, &pcx);
     list_push(let_l, &pcx);
     list_end(block, mark, &pcx);
-    let tail = op_method(op_ident(l, pos, &pcx), c"neg", 0, pos, &pcx);
+    let tail = op_method(op_ident(l, pos, &pcx), name, 0, pos, &pcx);
     pcx.nodes[block].a = tail;
     push_scope(&pcx);
     check_pattern(pcx.nodes[let_l].a, t, &pcx);

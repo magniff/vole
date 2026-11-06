@@ -8,22 +8,26 @@ use crate::base::diag::{
     err_sym, err_try_tool, error_at,
 };
 use crate::front::assoc::ensure_checked;
-use crate::front::ast::{CALL_FIELDS, FN_INTRINSIC, VK_NEW, child};
+use crate::front::ast::{
+    CALL_FIELDS, FN_INTRINSIC, NodeKind, VK_NEW, child, list_begin, list_end, list_push,
+};
 use crate::front::ast::NodeKind::{Ident, Path, VariantLit};
-use crate::front::check::{Res, lookup_local, name_error};
+use crate::front::check::{Res, has_error_type, lookup_local, name_error};
 use crate::front::check::arch::{check_intrinsic_call, check_raw_form};
 use crate::front::check::args::{arity_help, normalize_args};
 use crate::front::check::calls::{method_of, offer_template_methods, path_member_error};
 use crate::front::check::check_mode::check_expr;
-use crate::front::check::collect::{find_generic_method, template_variant_named};
+use crate::front::check::collect::{
+    find_generic_method, gm_after, gm_start, template_of_type_node, template_variant_named,
+};
 use crate::front::check::format::format_call;
 use crate::front::check::interp::{direct_call, direct_kind};
 use crate::front::check::names::{
     NODE_RESOLVED, fn_value_type, help_near_item, help_nearest, near_to, unknown_name_error,
 };
-use crate::front::check::resolve::{resolve_key, resolve_named};
+use crate::front::check::resolve::{resolve_key, resolve_named, type_name_key};
 use crate::front::check::synth_mode::synth_expr;
-use crate::front::check::unsafety::{U_C_CALL, check_call_safety, unsafe_op};
+use crate::front::check::unsafety::{U_C_CALL, U_UNSAFE_CALL, check_call_safety, unsafe_op};
 use crate::front::check::variant_fields::{has_named_fields, positional_error};
 use crate::front::check::vectors::{make_vecop, sym_is_c, vector_assoc_call};
 use crate::front::check::widen::{float_const, float_const_bits, float_const_error, int_limit};
@@ -31,12 +35,14 @@ use crate::front::closures::{closure_call, closure_of_type};
 use crate::front::contracts::is_distinct;
 use crate::front::convert::{generic_trait_call, template_trait_call};
 use crate::front::generics::{
-    TPL_DISTINCT, TPL_NONE, check_arg, check_call_arg, env_lookup, hint_for, instance_of,
-    instance_targs, targ_count_error, template_instance, template_name, template_of_key,
+    TPL_DISTINCT, TPL_NONE, TPL_PATTERN, check_arg, check_call_arg, env_lookup, hint_for,
+    instance_of, instance_targs, targ_count_error, template_instance, template_name,
+    template_of_key,
 };
 use crate::front::generics::instantiate::{
     fn_instance, infer_enum, instantiate_call, push_written_targs,
 };
+use crate::front::lexer::Tok;
 use crate::front::modules::lookup::{
     B_ITEM, B_MODULE, B_NONE, B_PRIVATE, B_TVARIANT, B_VARIANT, access_error, binding, binding_kind,
     binding_value, lookup_item, lookup_name, module_as_path_error, note_c_use, path_module,
@@ -76,6 +82,17 @@ pub fn synth_call(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             let name = pcx.nodes[callee].a;
             let b = lookup_item(pcx.cur_mod, name, pcx.cur_mod, &pcx);
             note_c_use(pcx.nodes[callee].start, name, b, &pcx);
+            // RULE: F7.2, F5.4 (the rust edition: `S(a, b)` of a tuple
+            // struct, `Self(a, b)` in its impls)
+            if name == pcx.self_type_sym && pcx.edition != 0
+                && crate::front::check::rust::tuple_struct_call(n,
+                    crate::front::check::rust::SELF_KEY, &pcx) {
+                return synth_expr(n, &pcx);
+            }
+            if binding_kind(b) == B_ITEM && pcx.edition != 0
+                && crate::front::check::rust::tuple_struct_call(n, binding_value(b), &pcx) {
+                return synth_expr(n, &pcx);
+            }
             if binding_kind(b) == B_VARIANT {
                 // `V(a, b)` for a variant brought into scope by `use`.
                 let v = binding_value(b);
@@ -104,8 +121,9 @@ pub fn synth_call(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             return call_function(n, pcx.sym_fn[pcx.nodes[callee].a] - 1, pcx.nodes[callee].g, &pcx);
         }
         pcx.callee_pos = pcx.nodes[callee].start;
-        let callee_ty = synth_expr(callee, &pcx);
-        if closure_of_type(callee_ty, pcx) != 0 {
+        let callee_ty = crate::front::closures::fn_through_ref(n, synth_expr(callee, &pcx), &pcx);
+        if closure_of_type(callee_ty, pcx) != 0
+            || crate::front::closures::closure_through_ref(callee_ty, pcx) {
             return closure_call(n, callee_ty, &pcx);
         }
         if !is_fn_type(callee_ty, pcx) {
@@ -123,7 +141,11 @@ pub fn synth_call(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             err_int(pcx.nodes[n].count, pcx);
             err_end(&pcx);
         }
-        if pcx.types[callee_ty].b != 0 {
+        // RULE: F19.3 (a call through an `unsafe fn` pointer needs `unsafe`,
+        // as rustc's E0133; a C function pointer's, as in MVS: FL)
+        if crate::front::types::fn_ty_unsafe(callee_ty, pcx) {
+            unsafe_op(n, U_UNSAFE_CALL, c"calling an `unsafe fn` pointer is unsafe", &pcx);
+        } else if crate::front::types::fn_ty_c(callee_ty, pcx) {
             unsafe_op(n, U_C_CALL, c"calling an extern \"C\" function pointer is unsafe", &pcx);
         }
         for i in 0..pcx.nodes[n].count {
@@ -148,6 +170,17 @@ fn call_function(n: i64, f0: i64, written: i64, pcx: inout Ctx<Comp>) -> i64 {
     // written in place)
     if written == 0 {
         let direct = direct_kind(n, f, false, pcx);
+        if direct == crate::front::check::interp::D_WRITE
+            || direct == crate::front::check::interp::D_WRITELN {
+            // (the destination apart, as push_fmt's receiver: `__r`)
+            let w = child(n, 0, pcx);
+            synth_expr(w, &pcx);
+            let fs = child(n, 1, pcx);
+            let mark = list_begin(pcx);
+            list_push(fs, &pcx);
+            list_end(n, mark, &pcx);
+            return direct_call(n, f, direct, w, &pcx);
+        }
         if direct != 0 {
             return direct_call(n, f, direct, 0, &pcx);
         }
@@ -248,7 +281,12 @@ fn path_target(n: i64, pcx: inout Ctx<Comp>) -> i64 {
                 return resolve_named(name, pcx.nodes[n].start, &pcx);
             }
             if name == pcx.sym_crate || name == pcx.self_sym || name == pcx.sym_super {
-                m = if name == pcx.sym_crate { 0 } else if name == pcx.self_sym { pcx.cur_mod }
+                m = if name == pcx.sym_crate {
+                    // RULE: Z1.1 (0.27.2: in std2, `crate` is std2's root)
+                    if pcx.std2 && pcx.edition != 0
+                        && crate::front::modules::within_std(pcx.cur_mod, pcx) { pcx.std_module }
+                    else { 0 }
+                } else if name == pcx.self_sym { pcx.cur_mod }
                     else { pcx.modules[pcx.cur_mod].parent };
                 if m < 0 {
                     error_at(pcx.nodes[n].start, c"the root module has no 'super'", &pcx);
@@ -457,6 +495,16 @@ pub fn synth_path(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             float_const_error(pcx.nodes[n].start, t, member, false, &pcx);
         }
     }
+    // RULE: F3.2 (0.27.2: `t::N`, an associated constant)
+    if f < 0 && crate::front::check::rust::rust_node(n, &pcx) {
+        var r = crate::front::assoc::inherent_const_value(n, t, member, &pcx);
+        if r < 0 {
+            r = crate::front::assoc::assoc_const_value(n, t, member, &pcx);
+        }
+        if r >= 0 {
+            return r;
+        }
+    }
     if f < 0 {
         path_member_error(n, t, member, &pcx);
     }
@@ -486,7 +534,7 @@ pub fn synth_path(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     pcx.nodes[n].y = f;
     pcx.nodes[n].count = 0;
     ensure_checked(f, n, &pcx);
-    fn_value_type(f, &pcx)
+    fn_value_type(f, n, &pcx)
 }
 
 // The number of a method template's parameters that are its impl's.
@@ -503,10 +551,77 @@ fn bind_impl_params(f: i64, t: i64, pcx: inout Ctx<Comp>) {
     if count == 0 {
         return;
     }
-    let targs = instance_targs(t, &pcx);
+    // (0.27.2: a pattern impl's, by its header; RULE: F0.3)
+    var targs = -1;
+    for i in 0..pcx.gmethods.len() as i64 {
+        if pcx.gmethods[i].f == f && pcx.gmethods[i].ty == TPL_PATTERN {
+            targs = crate::front::traits::fn_pattern_bindings(f, t, &pcx);
+        }
+    }
+    if targs < 0 {
+        targs = instance_targs(t, &pcx);
+    }
     for i in 0..count {
         unsafe { pcx.tscratch.push(pcx.tlists.data[targs + i]); }
     }
+}
+
+// (0.27.2) The trait a path callee names (`Tr::f`, `a::b::Tr::f`), its
+// index + 1, or 0: neither a local nor a primitive, an item that is a
+// trait. RULE: F8.2
+fn trait_path_key(callee: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let segments = pcx.nodes[callee].count;
+    var key = -1;
+    if segments == 0 {
+        if env_lookup(pcx.nodes[callee].a, pcx) != 0
+            || is_primitive_name(pcx.nodes[callee].a, pcx) {
+            return 0;
+        }
+        key = type_name_key(callee, &pcx);
+    } else {
+        // (`a::b::Tr::m`: Tr in the module of the parts before it)
+        let m = path_module(callee, segments - 2, &pcx);
+        let b = lookup_name(m, pcx.nodes[callee].a, pcx.cur_mod, &pcx);
+        if binding_kind(b) == B_ITEM {
+            key = binding_value(b);
+        }
+    }
+    if key < 0 {
+        return 0;
+    }
+    // UNSAFE: sym_trait is a raw table indexed by item key (sym_table)
+    // SAFETY: key is an item's key from type_name_key or lookup_name, so
+    // within the table, which has a slot for every key
+    unsafe { pcx.sym_trait[key] }
+}
+
+// Whether sym names a primitive type.
+fn is_primitive_name(sym: i64, pcx: Ctx<Comp>) -> bool {
+    // UNSAFE: sym_primitive is a raw table indexed by symbol (sym_table)
+    // SAFETY: sym is an interned symbol, and the table has a slot for each
+    unsafe { pcx.sym_primitive[sym] != 0 }
+}
+
+// (0.27.2) `Tr::f(args)` where a `T` is expected, f an associated function
+// of trait Tr without a receiver (`Default::default()`, `From::from(x)`):
+// Self is the expected type, as `<T as Tr>::f(args)`; call n's callee
+// then names it (y, the type path_target reads). RULE: F8.2
+pub fn trait_assoc_self(n: i64, expected: i64, pcx: inout Ctx<Comp>) {
+    let callee = pcx.nodes[n].a;
+    if callee <= 0 || pcx.nodes[callee].kind != NodeKind::Path || pcx.nodes[callee].y != 0
+        || pcx.nodes[callee].b == 0 || expected <= 0 || has_error_type(expected, pcx)
+        || pcx.types[expected].kind == TyKind::None {
+        return;
+    }
+    let tr = trait_path_key(callee, &pcx);
+    if tr == 0 {
+        return;
+    }
+    let f = crate::front::traits::trait_fn(tr - 1, pcx.nodes[callee].b, pcx);
+    if f == 0 || pcx.nodes[f].count > 0 && pcx.nodes[child(f, 0, pcx)].a == pcx.self_sym {
+        return;
+    }
+    pcx.nodes[callee].y = expected;
 }
 
 // `T::m(args)`: a variant with fields, or a call of an associated function
@@ -518,6 +633,34 @@ fn synth_path_call(n: i64, callee: i64, pcx: inout Ctx<Comp>) -> i64 {
             && is_vector(pcx.sym_primitive[pcx.nodes[callee].a], pcx) {
             // `v4f32::splat(x)`, `v4f32::load(s, i)` (0.10).
             return vector_assoc_call(n, callee, pcx.sym_primitive[pcx.nodes[callee].a], &pcx);
+        }
+        // RULE: F8.2 (0.27.2: `Tr::m(x, args)`, a trait's method with its
+        // receiver explicit, is `x.m(args)`, probed as a method call is;
+        // 0.27.2 M3: by its path too, `std::clone::Clone::clone(x)`, as
+        // the derives write it, F17.1)
+        if pcx.nodes[callee].y == 0 && pcx.nodes[n].count > 0
+            && crate::front::check::rust::rust_node(n, &pcx) {
+            let tr = trait_path_key(callee, &pcx);
+            if tr != 0 {
+                var first = child(n, 0, pcx);
+                // (`Display::fmt(&x, f)`: the receiver x, the method's
+                // `&self` borrows it again)
+                if pcx.nodes[first].kind == NodeKind::Unary && pcx.nodes[first].op == Tok::Amp {
+                    first = pcx.nodes[first].b;
+                }
+                let mark = list_begin(pcx);
+                for k in 1..pcx.nodes[n].count {
+                    list_push(child(n, k, pcx), &pcx);
+                }
+                list_end(n, mark, &pcx);
+                pcx.nodes[n].kind = NodeKind::MethodCall;
+                pcx.nodes[n].a = first;
+                pcx.nodes[n].b = pcx.nodes[callee].b;
+                pcx.nodes[n].g = pcx.nodes[callee].h;
+                pcx.via_node = n;
+                pcx.via_trait = tr - 1;
+                return synth_expr(n, &pcx);
+            }
         }
         var t = path_target(callee, &pcx);
         if t > 0 && is_vector(t, pcx) {
@@ -540,7 +683,12 @@ fn synth_path_call(n: i64, callee: i64, pcx: inout Ctx<Comp>) -> i64 {
             if tpl < 0 && template_variant_named(-tpl - 1, member, pcx) {
                 t = infer_enum(tpl, 0, member, n, pcx.nodes[callee].start, &pcx);
             } else {
-                let f = find_generic_method(tpl, member, pcx);
+                var f = find_generic_method(tpl, member, pcx);
+                if f < 0 {
+                    // RULE: F5.1 (`HashMap::new_in(a)` of `impl<K, V, A>
+                    // HashMap<K, V, A, FixedState>`: a pattern impl on tpl)
+                    f = pattern_fn_of_template(tpl, member, &pcx);
+                }
                 // (0.26.3: `W::scalar(x)`, which only `impl W<ScopedArena>`
                 // has: that instance's, below)
                 let inst = if f < 0 { sole_instance_with(tpl, member, pcx) } else { 0 };
@@ -670,4 +818,35 @@ fn sole_instance_with(tpl: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
         }
     }
     found
+}
+
+// (0.27.2) The function `name` of a rust-edition pattern impl (TPL_PATTERN)
+// whose header names template tpl (`impl<K, V, A> HashMap<K, V, A,
+// FixedState>`, for `HashMap::new_in(a)`), or -1: its header's arguments
+// are inferred as the call's. RULE: F5.1
+fn pattern_fn_of_template(tpl: i64, name: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if tpl == TPL_NONE || tpl == TPL_PATTERN {
+        return -1;
+    }
+    var i = gm_start(TPL_PATTERN, name, pcx);
+    while i >= 0 {
+        let at = i;
+        i = gm_after(i, pcx);
+        if pcx.gmethods[at].ty != TPL_PATTERN || pcx.gmethods[at].name != name {
+            continue;
+        }
+        let f = pcx.gmethods[at].f;
+        let header = pcx.nodes[pcx.fns[f].node].h;
+        if header == 0 || pcx.nodes[header].kind != crate::front::ast::NodeKind::TyName {
+            continue;
+        }
+        let saved = pcx.cur_mod;
+        pcx.cur_mod = pcx.fns[f].module;
+        let t = template_of_type_node(header, &pcx);
+        pcx.cur_mod = saved;
+        if t == tpl {
+            return f;
+        }
+    }
+    -1
 }

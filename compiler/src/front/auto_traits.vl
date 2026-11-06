@@ -1,0 +1,498 @@
+// (0.27.2) The rust edition's auto traits, `Send` and `Sync`
+// (docs/design/borrowck.md §24): traits whose impls the compiler decides.
+//
+// - AT1: `τ: Send` and `τ: Sync` structurally, with Rust's rules: the
+//   scalars, `str`, fieldless enums and `fn` types both; arrays, slices,
+//   tuples, structs and enums by their parts; `&T` Send and Sync iff `T:
+//   Sync`, `&mut T` Send iff `T: Send` and Sync iff `T: Sync`; raw
+//   pointers neither; a closure per capture (by `&`: `τ: Sync` for Send,
+//   by `&mut` or by value: `τ: Send`; Sync: `τ: Sync`).
+// - AT2: vouches, `unsafe impl Send for X {}` and `impl !Send for X {}`:
+//   any vouch of the trait for `X` replaces AT1's rule for every instance
+//   of `X`, which then holds iff a positive vouch applies.
+// - AT3: a bound `T: Send` is checked at instantiation, the failure
+//   `sync.not_send` (`sync.not_sync`) with the chain to the failing part.
+//
+// The traits are made on their first use (auto_trait_id): a Trait node
+// with no items, `unsafe` (a positive vouch is `unsafe impl`), marked
+// TRAIT_AUTO, so no std declares them (Z2) and a program's own `Send`
+// shadows them. traits.vl calls in at trait_named, implements,
+// check_bounds and collect_impl; the parser marks `impl !Trait`
+// (IMPL_NEGATIVE).
+
+use crate::base::{buf_bytes, buf_str, intern_c, sym_text};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::base::diag::{err_begin, err_end_soft, err_help, err_help_sym, err_str, err_sym};
+use crate::front::ast::{IMPL_NEGATIVE, ITEM_UNSAFE, NodeKind, TRAIT_AUTO, new_node};
+use crate::front::generics::{TPL_NONE, TPL_PATTERN, instance_of};
+use crate::front::traits::{TraitInfo, impl_applies, impl_bindings};
+use crate::front::types::{ENUMS, REF_MUT, REF_SHARED, TyKind, buf_type, enum_variant, struct_field};
+
+// The facts: SEND, SYNC.
+const SEND: i64 = 0;
+const SYNC: i64 = 1;
+
+// A step of the chain to the failing part (AutoCx.path, four words each:
+// the kind, two operands, the fact that failed), innermost first.
+// S_FIELD (field symbol, field type); S_PART (0, part type); S_REF (the
+// reference type, the fact its referent needs); S_CAPTURE (local, the
+// fact its type needs); the leaves L_RAW, L_CELL and L_VOUCH (type, 0).
+const S_FIELD: i64 = 1;
+const S_PART: i64 = 2;
+const S_REF: i64 = 3;
+const S_CAPTURE: i64 = 4;
+const L_RAW: i64 = 5;
+const L_CELL: i64 = 6;
+const L_VOUCH: i64 = 7;
+
+struct AutoCx<A: Allocator> {
+    // (type, fact) pairs being decided: a recursive type holds
+    // coinductively, as rustc's auto traits do
+    stack: Vec<i64, A>,
+    path: Vec<i64, A>,
+}
+
+fn auto_cx() -> AutoCx<Comp> {
+    AutoCx { stack: Vec::new_in(Comp {}), path: Vec::new_in(Comp {}) }
+}
+
+// RULE: AT1 The auto trait type node n names (`Send`, `Sync`, in the rust
+// edition, with no trait of that name in scope: traits::trait_named's
+// caller checked), made on its first use; -1 for any other name.
+pub fn auto_trait_id(n: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let name = sym_text(pcx.nodes[n].a, pcx);
+    if name != "Send" && name != "Sync" {
+        return -1;
+    }
+    for tr in 0..pcx.traits.len() as i64 {
+        if is_auto(tr, pcx) && pcx.traits[tr].name == pcx.nodes[n].a {
+            return tr;
+        }
+    }
+    let node = new_node(NodeKind::Trait, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+    pcx.nodes[node].a = pcx.nodes[n].a;
+    pcx.nodes[node].p |= ITEM_UNSAFE | TRAIT_AUTO;
+    pcx.traits.push(TraitInfo { name: pcx.nodes[n].a, node: node, module: pcx.cur_mod, params: 0 });
+    pcx.traits.len() as i64 - 1
+}
+
+// Whether trait tr is one of the auto traits.
+pub fn is_auto(tr: i64, pcx: Ctx<Comp>) -> bool {
+    tr >= 0 && (pcx.nodes[pcx.traits[tr].node].p & TRAIT_AUTO) != 0
+}
+
+fn fact_of(tr: i64, pcx: Ctx<Comp>) -> i64 {
+    if sym_text(pcx.traits[tr].name, pcx) == "Sync" { SYNC } else { SEND }
+}
+
+// RULE: AT1, AT2 Whether type t implements auto trait tr.
+pub fn holds_auto(tr: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
+    var acx = auto_cx();
+    holds(fact_of(tr, pcx), t, &acx, &pcx)
+}
+
+fn fail(kind: i64, a: i64, b: i64, f: i64, acx: inout AutoCx<Comp>) -> bool {
+    acx.path.push(kind);
+    acx.path.push(a);
+    acx.path.push(b);
+    acx.path.push(f);
+    false
+}
+
+// The trait of fact f, found among the auto traits (made by their use).
+fn trait_of(f: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let name = intern_c(if f == SYNC { c"Sync" } else { c"Send" }, &pcx);
+    for tr in 0..pcx.traits.len() as i64 {
+        if is_auto(tr, pcx) && pcx.traits[tr].name == name {
+            return tr;
+        }
+    }
+    -1
+}
+
+fn holds(f: i64, t: i64, acx: inout AutoCx<Comp>, pcx: inout Ctx<Comp>) -> bool {
+    if t <= 0 {
+        return true;
+    }
+    var i = 0;
+    while i < acx.stack.len() as i64 {
+        if acx.stack[i] == t && acx.stack[i + 1] == f {
+            return true;
+        }
+        i += 2;
+    }
+    acx.stack.push(t);
+    acx.stack.push(f);
+    let ok = decide(f, t, &acx, &pcx);
+    let _ = acx.stack.pop();
+    let _ = acx.stack.pop();
+    ok
+}
+
+// RULE: AT1 (the structural rule), AT2 (a vouched type by its impls)
+fn decide(f: i64, t: i64, acx: inout AutoCx<Comp>, pcx: inout Ctx<Comp>) -> bool {
+    // UNSAFE: TLISTS and ENUMS are the checker's raw tables (as threads.vl's
+    // decide reads them).
+    // SAFETY: t is a type id; a tuple's list..list + count, an enum's
+    // variants and a variant's fields are within the tables they index.
+    unsafe {
+        let kind = pcx.types[t].kind;
+        if kind == TyKind::Prim || kind == TyKind::Vector || kind == TyKind::None
+            || kind == TyKind::Fn {
+            return true;
+        }
+        if kind == TyKind::Ptr {
+            let r = pcx.types[t].b;
+            if r != REF_SHARED && r != REF_MUT {
+                return fail(L_RAW, t, 0, f, &acx);
+            }
+            // (`&T`: Sync data; `&mut T`: Send for Send, Sync for Sync)
+            let need = if r == REF_SHARED { SYNC } else { f };
+            if !holds(need, pcx.types[t].a, &acx, &pcx) {
+                return fail(S_REF, t, need, f, &acx);
+            }
+            return true;
+        }
+        if kind == TyKind::Slice {
+            // (a view `&[T]`, `&mut [T]`, as a reference's)
+            let need = if pcx.types[t].b == REF_MUT { f } else { SYNC };
+            if !holds(need, pcx.types[t].a, &acx, &pcx) {
+                return fail(S_REF, t, need, f, &acx);
+            }
+            return true;
+        }
+        if kind == TyKind::Array || kind == TyKind::Distinct {
+            if !holds(f, pcx.types[t].a, &acx, &pcx) {
+                return fail(S_PART, 0, pcx.types[t].a, f, &acx);
+            }
+            return true;
+        }
+        if kind == TyKind::Tuple {
+            for k in 0..pcx.types[t].count {
+                let p = pcx.tlists.data[pcx.types[t].list + k];
+                if !holds(f, p, &acx, &pcx) {
+                    return fail(S_PART, 0, p, f, &acx);
+                }
+            }
+            return true;
+        }
+        let v = vouched(f, t, &pcx);
+        if v >= 0 {
+            return v == 1 || fail(L_VOUCH, t, v, f, &acx);
+        }
+        if kind == TyKind::Enum {
+            let e = pcx.types[t].a;
+            for k in 0..ENUMS[e].variant_count {
+                let var_ = enum_variant(e, k);
+                for j in 0..pcx.variants[var_].field_count {
+                    let p = pcx.tlists.data[pcx.variants[var_].fields + j];
+                    if !holds(f, p, &acx, &pcx) {
+                        return fail(S_PART, 0, p, f, &acx);
+                    }
+                }
+            }
+            return true;
+        }
+        if kind != TyKind::Struct {
+            return true;
+        }
+        let s = pcx.types[t].a;
+        let c = pcx.structs[s].closure;
+        if c != 0 {
+            return closure_holds(f, t, c - 1, &acx, &pcx);
+        }
+        if crate::front::cells::is_unsafe_cell_struct(s, pcx) {
+            // (Send when its T is, never Sync)
+            if f == SYNC {
+                return fail(L_CELL, t, 0, f, &acx);
+            }
+            return targs_hold(f, s, t, &acx, &pcx);
+        }
+        // (MVS std's containers and sync types, by threads.vl's names: a
+        // rust program on MVS std, VOLE_STD2=0; std2 states its own vouches,
+        // AT2)
+        let name = if crate::front::known::on_std2(pcx) { "" }
+            else { crate::front::threads::std_name(s, pcx) };
+        if name == "Atomic" || name == "RawLock" || name == "JoinHandle" || name == "PrintCell" {
+            return true;
+        }
+        if name == "Mutex" {
+            return targs_hold(SEND, s, t, &acx, &pcx);
+        }
+        if crate::front::threads::vouched_container(name) {
+            return targs_hold(f, s, t, &acx, &pcx);
+        }
+        for k in 0..pcx.structs[s].field_count {
+            let fi = struct_field(s, k, pcx);
+            if !holds(f, (*fi).ty, &acx, &pcx) {
+                return fail(S_FIELD, (*fi).name, (*fi).ty, f, &acx);
+            }
+        }
+        true
+    }
+}
+
+fn targs_hold(f: i64, s: i64, t: i64, acx: inout AutoCx<Comp>, pcx: inout Ctx<Comp>) -> bool {
+    // UNSAFE: TLISTS is the checker's raw table of type lists.
+    // SAFETY: targs..targs + targ_count are struct s's type arguments.
+    unsafe {
+        for k in 0..pcx.structs[s].targ_count {
+            let a = pcx.tlists.data[pcx.structs[s].targs + k];
+            if !holds(f, a, &acx, &pcx) {
+                return fail(S_PART, 0, a, f, &acx);
+            }
+        }
+        true
+    }
+}
+
+// RULE: AT1 (a closure by its environment: per capture, by `&` the
+// captured type's Sync for Send, else its Send; Sync: its Sync)
+fn closure_holds(f: i64, t: i64, c: i64, acx: inout AutoCx<Comp>, pcx: inout Ctx<Comp>) -> bool {
+    for k in 0..pcx.closures[c].capture_count {
+        let l = pcx.capture_list.get(pcx.closures[c].captures + 2 * k);
+        let mode = pcx.capture_list.get(pcx.closures[c].captures + 2 * k + 1);
+        let need = if f == SEND && mode == 1 { SYNC } else { f };
+        if !holds(need, pcx.locals[l].ty, &acx, &pcx) {
+            return fail(S_CAPTURE, l, need, f, &acx);
+        }
+    }
+    true
+}
+
+// RULE: AT2 Whether some vouch (an impl) of fact f's trait is for t's
+// type: -1 none (AT1's rule decides), 1 a positive one applies to t, 2
+// one is for t but its bounds do not hold, 0 none is (a negative one).
+fn vouched(f: i64, t: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let tr = trait_of(f, &pcx);
+    if tr < 0 {
+        return -1;
+    }
+    var r = -1;
+    for i in 0..pcx.traits_impls.len() as i64 {
+        if pcx.traits_impls[i].tr != tr || !for_type_of(i, t, &pcx) {
+            continue;
+        }
+        if r < 0 {
+            r = 0;
+        }
+        let negative = (pcx.nodes[pcx.traits_impls[i].node].p & IMPL_NEGATIVE) != 0;
+        if !negative && impl_applies(i, t, &pcx) >= 0 {
+            return 1;
+        }
+        if !negative && impl_bindings(i, t, &pcx) >= 0 {
+            r = 2;
+        }
+    }
+    r
+}
+
+// Whether impl i is for t's type (any instance of it: its header, the
+// bounds aside).
+fn for_type_of(i: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
+    let ty = pcx.traits_impls[i].ty;
+    let tpl = pcx.traits_impls[i].tpl;
+    if ty != 0 {
+        return ty == t || same_nominal(ty, t, pcx);
+    }
+    if tpl == TPL_NONE {
+        return false;
+    }
+    if tpl != TPL_PATTERN {
+        return instance_of(t, tpl, pcx);
+    }
+    impl_bindings(i, t, &pcx) >= 0
+}
+
+// Whether types a and b are instances of one struct or enum.
+fn same_nominal(a: i64, b: i64, pcx: Ctx<Comp>) -> bool {
+    let k = pcx.types[a].kind;
+    if k != pcx.types[b].kind {
+        return false;
+    }
+    if k == TyKind::Enum {
+        return pcx.types[a].a == pcx.types[b].a;
+    }
+    if k != TyKind::Struct {
+        return false;
+    }
+    let sa = pcx.types[a].a;
+    let sb = pcx.types[b].a;
+    let ta = if pcx.structs[sa].tmpl != 0 { pcx.structs[sa].tmpl - 1 } else { sa };
+    let tb = if pcx.structs[sb].tmpl != 0 { pcx.structs[sb].tmpl - 1 } else { sb };
+    ta == tb
+}
+
+// RULE: AT3 The bound `T: Send` (tr, of parameter node p of item `what`)
+// on type argument t, at pos: `sync.not_send` / `sync.not_sync` (rustc
+// E0277) with the chain to the failing part.
+pub fn check_bound(tr: i64, t: i64, p: i64, what: i64, pos: i64, pcx: inout Ctx<Comp>) {
+    var acx = auto_cx();
+    let f = fact_of(tr, pcx);
+    if holds(f, t, &acx, &pcx) {
+        return;
+    }
+    let saved = pcx.err_kind;
+    pcx.err_kind = if f == SYNC { c"sync.not_sync" } else { c"sync.not_send" };
+    err_begin(pos, &pcx);
+    // (a closure by its place, which the error's position is)
+    if crate::front::closures::closure_of_type(t, pcx) != 0 {
+        err_str(c"the closure", pcx);
+    } else {
+        err_str(c"'", pcx);
+        buf_rust_type(pcx.err, t, pcx);
+        err_str(c"'", pcx);
+    }
+    err_str(if f == SYNC { c" cannot be shared between threads (it is not Sync)" }
+        else { c" cannot be sent between threads (it is not Send)" }, pcx);
+    var k = acx.path.len() as i64 - 4;
+    while k >= 0 {
+        err_str(if k == acx.path.len() as i64 - 4 { c": " } else { c"; " }, pcx);
+        step_text(acx.path[k], acx.path[k + 1], acx.path[k + 2], acx.path[k + 3], &pcx);
+        k -= 4;
+    }
+    err_help(c"required by the bound '", pcx);
+    err_help_sym(pcx.nodes[p].a, pcx);
+    err_help(c": ", pcx);
+    err_help_sym(pcx.traits[tr].name, pcx);
+    err_help(c"' of '", pcx);
+    err_help_sym(what, pcx);
+    err_help(c"'", pcx);
+    err_end_soft(&pcx);
+    pcx.err_kind = saved;
+}
+
+fn fact_name(f: i64) -> *u8 {
+    if f == SYNC { c"Sync" } else { c"Send" }
+}
+
+fn step_text(kind: i64, a: i64, b: i64, f: i64, pcx: inout Ctx<Comp>) {
+    let out = pcx.err;
+    if kind == S_FIELD || kind == S_PART {
+        if kind == S_FIELD {
+            buf_str(out, c"its field '");
+            err_sym(a, pcx);
+            buf_str(out, c"', '");
+        } else {
+            buf_str(out, c"its part '");
+        }
+        buf_rust_type(out, b, pcx);
+        buf_str(out, if kind == S_FIELD { c"', is not " } else { c"' is not " });
+        buf_str(out, fact_name(f));
+    } else if kind == S_REF {
+        buf_str(out, c"'");
+        buf_rust_type(out, a, pcx);
+        buf_str(out, c"' is ");
+        buf_str(out, fact_name(f));
+        buf_str(out, c" only if its referent is ");
+        buf_str(out, fact_name(b));
+        buf_str(out, c", and it is not");
+    } else if kind == S_CAPTURE {
+        buf_str(out, c"it captures '");
+        buf_bytes(out, sym_text(pcx.locals[a].name, pcx));
+        buf_str(out, c"', '");
+        buf_rust_type(out, pcx.locals[a].ty, pcx);
+        buf_str(out, if b == f { c"', which is not " } else { c"', by reference, which is not " });
+        buf_str(out, fact_name(b));
+    } else if kind == L_RAW {
+        buf_str(out, c"'");
+        buf_rust_type(out, a, pcx);
+        buf_str(out, c"' is a raw pointer, neither Send nor Sync");
+    } else if kind == L_CELL {
+        buf_str(out, c"'");
+        buf_rust_type(out, a, pcx);
+        buf_str(out, c"' is never Sync");
+    } else if b == 2 {
+        buf_str(out, c"the bounds of its `unsafe impl ");
+        buf_str(out, fact_name(f));
+        buf_str(out, c"` do not hold for '");
+        buf_rust_type(out, a, pcx);
+        buf_str(out, c"'");
+    } else {
+        buf_str(out, c"'");
+        buf_rust_type(out, a, pcx);
+        buf_str(out, c"' has `impl !");
+        buf_str(out, fact_name(f));
+        buf_str(out, c"`");
+    }
+}
+
+// Type t in the rust edition's spelling where it differs (`&T`, `&mut T`,
+// `&[T]`, `*const T`), buf_type's otherwise.
+fn buf_rust_type(out: i64, t: i64, pcx: Ctx<Comp>) {
+    // UNSAFE: TLISTS is the checker's raw table of type lists.
+    // SAFETY: a tuple's elements are list..list + count.
+    unsafe {
+        let kind = if t > 0 { pcx.types[t].kind } else { TyKind::None };
+        if kind == TyKind::Ptr || kind == TyKind::Slice {
+            let r = pcx.types[t].b;
+            if r == REF_SHARED || r == REF_MUT {
+                buf_str(out, if r == REF_MUT { c"&mut " } else { c"&" });
+            } else if kind == TyKind::Ptr {
+                buf_str(out, c"*const ");
+            }
+            if kind == TyKind::Slice {
+                buf_str(out, c"[");
+            }
+            buf_rust_type(out, pcx.types[t].a, pcx);
+            if kind == TyKind::Slice {
+                buf_str(out, c"]");
+            }
+            return;
+        }
+        if kind == TyKind::Tuple {
+            buf_str(out, c"(");
+            for k in 0..pcx.types[t].count {
+                if k > 0 {
+                    buf_str(out, c", ");
+                }
+                buf_rust_type(out, pcx.tlists.data[pcx.types[t].list + k], pcx);
+            }
+            buf_str(out, c")");
+            return;
+        }
+        // (a generic struct's arguments, `W<&T>`)
+        if kind == TyKind::Struct && pcx.structs[pcx.types[t].a].tmpl != 0
+            && pcx.structs[pcx.types[t].a].closure == 0 {
+            let s = pcx.types[t].a;
+            buf_bytes(out, sym_text(pcx.structs[pcx.structs[s].tmpl - 1].name, pcx));
+            buf_str(out, c"<");
+            for k in 0..pcx.structs[s].targ_count {
+                if k > 0 {
+                    buf_str(out, c", ");
+                }
+                buf_rust_type(out, pcx.tlists.data[pcx.structs[s].targs + k], pcx);
+            }
+            buf_str(out, c">");
+            return;
+        }
+        buf_type(out, t, pcx);
+    }
+}
+
+// RULE: AT2 Impl block node, of trait tr: whether it is a negative impl
+// (`impl !Send for X {}`), checked: of an auto trait, not `unsafe`, with
+// no items. collect_impl leaves check_impl_safety to the others.
+pub fn negative_impl(node: i64, tr: i64, pcx: inout Ctx<Comp>) -> bool {
+    if (pcx.nodes[node].p & IMPL_NEGATIVE) == 0 {
+        return false;
+    }
+    if tr >= 0 && !is_auto(tr, pcx) {
+        err_begin(pcx.nodes[node].start, &pcx);
+        err_str(c"a negative impl is of an auto trait (`impl !Send for T {}`, `impl !Sync for T {}`), not of '", pcx);
+        err_sym(pcx.traits[tr].name, pcx);
+        err_str(c"'", pcx);
+        err_end_soft(&pcx);
+    } else if (pcx.nodes[node].p & ITEM_UNSAFE) != 0 {
+        err_begin(pcx.nodes[node].start, &pcx);
+        err_str(c"a negative impl is not unsafe: it promises nothing (rustc E0198)", pcx);
+        err_help(c"take the `unsafe` out", pcx);
+        err_end_soft(&pcx);
+    } else if pcx.nodes[node].count != 0 || pcx.nodes[node].c != 0 {
+        err_begin(pcx.nodes[node].start, &pcx);
+        err_str(c"a negative impl has no items: `impl !Send for T {}`", pcx);
+        err_end_soft(&pcx);
+    }
+    true
+}

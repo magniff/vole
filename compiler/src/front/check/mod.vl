@@ -40,7 +40,7 @@ mod interp;
 pub mod format;
 pub mod widen;
 pub mod args;
-mod sealed;
+pub mod sealed;
 // (0.26.3: #[deprecated])
 pub mod deprecated;
 pub mod variant_fields;
@@ -163,7 +163,10 @@ pub fn mismatch_error(n: i64, expected: i64, actual: i64, pcx: inout Ctx<Comp>) 
     // (0.27.0: `&x` where MVS std takes x by value, the rust edition's seam)
     if pcx.types[actual].kind == TyKind::Ptr && pcx.types[actual].b != 0
         && pcx.types[actual].a == expected
-        && pcx.nodes[n].start > 0 && crate::front::check::rust::rust_node(n, &pcx) {
+        && pcx.nodes[n].start > 0 && crate::front::check::rust::rust_node(n, &pcx)
+        && !crate::front::known::on_std2(pcx) {
+        // RULE: Z4.1 (not on std2, whose functions take references where
+        // Rust's do: the plain mismatch, E0308)
         crate::front::check::rust::std_by_value_error(n, expected, &pcx);
     }
     // (0.25.2: a literal's default type as the cause, reported once)
@@ -541,6 +544,8 @@ pub fn check_program(program: i64, pcx: inout Ctx<Comp>, wgx: inout WgslCx<Arena
         // (0.26.0: `embed wgsl K { .. }`: its struct and static, front/embed)
         crate::front::embed::wgsl::expand_embeds(&wcx, &pcx, &wgx);
         expand_derives(&pcx);
+        // (0.27.2: `#[builtin_impls(P, ..)]`, impls added to the program, F15.1)
+        crate::front::builtin_impls::expand_builtin_impls(&pcx);
         // (0.18: clauses made into functions, front/contracts/expand.vl)
         // (0.19: #[multiversion]'s versions and dispatchers)
         crate::front::features::multiversion::expand_multiversion(&fcx, &pcx);
@@ -551,6 +556,10 @@ pub fn check_program(program: i64, pcx: inout Ctx<Comp>, wgx: inout WgslCx<Arena
         }
         // (0.15: the fields of a derived impl have its trait)
         check_derives(&pcx);
+        // RULE: Z3.1 (--verify-places: every known item std2 has)
+        if pcx.verify_places {
+            crate::front::known::known_items_check(&pcx);
+        }
         // (0.15: `fn main() -> Result<(), E>`)
         // (0.16: `fn main(gpa: Gpa)`)
         main_gpa(&pcx);
@@ -574,7 +583,7 @@ pub fn check_program(program: i64, pcx: inout Ctx<Comp>, wgx: inout WgslCx<Arena
             q += 1;
         }
         // (0.17: std from its files, to be edited: its generic functions too)
-        if pcx.std_tree != 0 as *u8 {
+        if pcx.std_tree != 0 as *u8 || crate::places::borrowck::std2::std2_check(pcx) {
             check_std_generics(program, &pcx);
             while q < pcx.inst_queue.count {
                 check_function_recovering(pcx.fns[pcx.inst_queue.data[q]].node, &pcx);
@@ -728,6 +737,12 @@ fn check_unchecked(program: i64, pcx: inout Ctx<Comp>) {
         let queued = pcx.inst_queue.count;
         let closures = pcx.closure_fns.count;
         pcx.check_unchecked = true;
+        // (0.27.2: what it finds wrong is forgotten, so no limit stops the
+        // run inside it: std2 has templates whose error-typed instances do
+        // not check, and the 50th error exited with them all, at a query or
+        // a check that keeps the cache, before the program's own were read)
+        let max_errors = pcx.max_errors;
+        pcx.max_errors = 9223372036854775807;
         let fns = pcx.fns.len() as i64;
         // (0.25) The templates with an instance, marked in one pass: each
         // generic function looked through every function for one.
@@ -781,6 +796,19 @@ fn check_unchecked(program: i64, pcx: inout Ctx<Comp>) {
             q += 1;
         }
         pcx.check_unchecked = false;
+        pcx.max_errors = max_errors;
+        // (0.27.2: what it checked is not the program's: on std2, its
+        // functions are not built, and their borrowck errors, std2's own
+        // bugs, not shown; std2's root check and --std2-check show them)
+        if crate::front::known::on_std2(pcx) {
+            for f in fns..pcx.fns.len() as i64 {
+                pcx.fns[f].attrs |= crate::front::ast::FN_QUERY_ONLY;
+            }
+            for k in queued..pcx.inst_queue.count {
+                let f = pcx.inst_queue.data[k];
+                pcx.fns[f].attrs |= crate::front::ast::FN_QUERY_ONLY;
+            }
+        }
         pcx.inst_queue.count = queued;
         pcx.closure_fns.count = closures;
         errors_forget(mark, &pcx);
@@ -874,7 +902,8 @@ fn simple_targ(p: i64, gpa: i64, pcx: inout Ctx<Comp>) -> i64 {
 // What the checker must put back after an error (see err_end): its
 // scopes, stacks and context.
 struct CheckState {
-    env: i64, scopes: i64, loops: i64, module: i64, self_ty: i64, tp_base: i64, tp_count: i64,
+    env: i64, scopes: i64, loops: i64, module: i64, self_ty: i64, self_impl: i64, tp_base: i64,
+    tp_count: i64,
     inst: i64, ret: i64, tscratch: i64, scratch: i64, const_context: bool,
     unsafe_depth: i64, wrap: i64, loop_base: i64, cur_fn: i64, closures: i64,
 }
@@ -883,7 +912,8 @@ fn save_check_state(pcx: Ctx<Comp>) -> CheckState {
     CheckState {
         env: pcx.env.count, scopes: pcx.check_scopes.count, loops: pcx.loop_stack.count,
         module: pcx.cur_mod,
-        self_ty: pcx.self_type, tp_base: pcx.tp_base, tp_count: pcx.tp_names.count,
+        self_ty: pcx.self_type, self_impl: pcx.self_impl, tp_base: pcx.tp_base,
+        tp_count: pcx.tp_names.count,
         inst: pcx.cur_inst,
         ret: pcx.return_type, tscratch: pcx.tscratch.count, scratch: pcx.scratch.count,
         const_context: pcx.const_context, unsafe_depth: pcx.unsafe_depth,
@@ -898,6 +928,7 @@ fn restore_check_state(s: CheckState, pcx: inout Ctx<Comp>) {
     pcx.loop_stack.count = s.loops;
     pcx.cur_mod = s.module;
     pcx.self_type = s.self_ty;
+    pcx.self_impl = s.self_impl;
     pcx.tp_base = s.tp_base;
     pcx.tp_names.count = s.tp_count;
     pcx.tp_types.count = s.tp_count;

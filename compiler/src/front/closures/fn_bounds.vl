@@ -80,6 +80,28 @@ pub fn fn_bound_satisfied(bound: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
     if t == pcx.ty_error {
         return true;
     }
+    // RULE: F33.1 (the rust edition: `&mut F` is FnMut and FnOnce when F
+    // is FnMut, `&F` every kind when F is Fn: `.map(&mut self.f)`)
+    if t > 0 && pcx.types[t].kind == TyKind::Ptr && pcx.types[t].b != 0
+        && closure_of_type(pcx.types[t].a, pcx) != 0
+        && crate::front::rust::rust_at(pcx.nodes[bound].start, &pcx) {
+        let c = closure_of_type(pcx.types[t].a, pcx);
+        let mutable = pcx.types[t].b == crate::front::types::REF_MUT;
+        if mutable && pcx.nodes[bound].d == 2 || !mutable && pcx.closures[c - 1].writes {
+            return false;
+        }
+        let need = if mutable { 3 } else { 2 };
+        if pcx.closures[c - 1].bound_kind == 0 || need < pcx.closures[c - 1].bound_kind {
+            pcx.closures[c - 1].bound_kind = need;
+            pcx.closures[c - 1].bound_node = bound;
+        }
+        let inner = pcx.closures[c - 1].sig;
+        if pcx.types[inner].count != pcx.nodes[bound].count {
+            return false;
+        }
+        let wanted = bound_sig(bound, &pcx);
+        return wanted == 0 || wanted == inner || legacy_sig(wanted, inner, pcx);
+    }
     let sig = callable_sig(t, pcx);
     if sig == 0 || pcx.types[sig].count != pcx.nodes[bound].count {
         return false;
@@ -87,6 +109,15 @@ pub fn fn_bound_satisfied(bound: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
     let c = closure_of_type(t, pcx);
     if pcx.nodes[bound].d == 2 && c != 0 && pcx.closures[c - 1].writes {
         return false;
+    }
+    // RULE: D19.6 (whether a closure that moves a capture, `FnOnce`, meets an
+    // `Fn`/`FnMut` bound is decided once its kind is: kinds.vl; the
+    // strictest bound is kept)
+    let d = pcx.nodes[bound].d;
+    if c != 0 && d < 4
+        && (pcx.closures[c - 1].bound_kind == 0 || d < pcx.closures[c - 1].bound_kind) {
+        pcx.closures[c - 1].bound_kind = d;
+        pcx.closures[c - 1].bound_node = bound;
     }
     let wanted = bound_sig(bound, &pcx);
     wanted == 0 || wanted == sig || legacy_sig(wanted, sig, pcx)
@@ -143,7 +174,8 @@ pub fn fn_bound_error(bound: i64, t: i64, param: i64, what: i64, pos: i64, pcx: 
     err_type(t, pcx);
     err_str(c"' does not satisfy the bound '", pcx);
     err_sym(param, pcx);
-    err_str(if pcx.nodes[bound].d == 2 { c": Fn" } else { c": FnMut" }, pcx);
+    err_str(if pcx.nodes[bound].d == 2 { c": Fn" } else if pcx.nodes[bound].d == 4 { c": FnOnce" }
+        else { c": FnMut" }, pcx);
     if wanted != 0 {
         err_str(c"(", pcx);
         for i in 0..pcx.types[wanted].count {
@@ -227,7 +259,8 @@ pub fn closure_param_conv_error(bound: i64, name: i64, param: i64, i: i64, wante
     }
     let tn = pcx.nodes[param].b;
     let from = conv_start(tn, pcx);
-    let kind: [u8] = if pcx.nodes[bound].d == 2 { "Fn" } else { "FnMut" };
+    let kind: [u8] = if pcx.nodes[bound].d == 2 { "Fn" }
+        else if pcx.nodes[bound].d == 4 { "FnOnce" } else { "FnMut" };
     err_begin(from, &pcx);
     err_fmt(
         format_args("the closure does not satisfy the bound '{}: {kind}({})': its parameter '{}' is '{}', the bound gives '{}'", sym_text(name, pcx), buf_slice(given), sym_text(pcx.nodes[param].a, pcx), SRC[from..pcx.nodes[tn].end], buf_slice(gives)), pcx);
@@ -237,7 +270,7 @@ pub fn closure_param_conv_error(bound: i64, name: i64, param: i64, i: i64, wante
 }
 
 // The Fn or FnMut bound of type parameter k of `params` (0: none).
-fn fn_bound_of(params: i64, k: i64, pcx: Ctx<Comp>) -> i64 {
+pub fn fn_bound_of(params: i64, k: i64, pcx: Ctx<Comp>) -> i64 {
     let bounds = pcx.nodes[child(params, k, pcx)].h;
     if bounds == 0 {
         return 0;
@@ -246,6 +279,52 @@ fn fn_bound_of(params: i64, k: i64, pcx: Ctx<Comp>) -> i64 {
         let b = child(bounds, i, pcx);
         if pcx.nodes[b].kind == NodeKind::TyFn && pcx.nodes[b].d >= 2 {
             return b;
+        }
+    }
+    0
+}
+
+// RULE: D19.5 The call kind of a call of parameter `local` of function f, an
+// instance: the least `Fn*` bound (2 `Fn`, 3 `FnMut`, 4 `FnOnce`) of the
+// type parameter its template declares the parameter with; 0 when it is
+// not one (the closure's own kind is the call's).
+pub fn param_call_kind(f: i64, local: i64, pcx: Ctx<Comp>) -> i64 {
+    // (tmpl: the template + 1, 0 for a function that is not an instance)
+    let tf = pcx.fns[f].tmpl - 1;
+    if tf < 0 || local < 0 {
+        return 0;
+    }
+    let node = pcx.fns[f].node;
+    let tnode = pcx.fns[tf].node;
+    let g = pcx.nodes[tnode].g;
+    if node <= 0 || tnode <= 0 || g <= 0 {
+        return 0;
+    }
+    for i in 0..pcx.nodes[node].count {
+        let p = child(node, i, pcx);
+        if pcx.nodes[p].kind != NodeKind::Param || pcx.nodes[p].x != local
+            || i >= pcx.nodes[tnode].count {
+            continue;
+        }
+        let tn = pcx.nodes[child(tnode, i, pcx)].b;
+        if tn <= 0 || pcx.nodes[tn].kind != NodeKind::TyName || pcx.nodes[tn].count != 0
+            || pcx.nodes[tn].g != 0 {
+            return 0;
+        }
+        match tparam_index(g, pcx.nodes[tn].a, pcx) {
+            Option::Some(k) => {
+                let bounds = pcx.nodes[child(g, k, pcx)].h;
+                var least = 0;
+                for j in 0..(if bounds > 0 { pcx.nodes[bounds].count } else { 0 }) {
+                    let b = child(bounds, j, pcx);
+                    if pcx.nodes[b].kind == NodeKind::TyFn && pcx.nodes[b].d >= 2
+                        && (least == 0 || pcx.nodes[b].d < least) {
+                        least = pcx.nodes[b].d;
+                    }
+                }
+                return least;
+            }
+            Option::None => return 0,
         }
     }
     0
@@ -292,6 +371,12 @@ pub fn infer_closure_arg(params: i64, bound: *i64, tmod: i64, arg: i64, p: i64,
             let saved_base = pcx.tp_base;
             let saved_mod = pcx.cur_mod;
             let saved_self = pcx.self_type;
+            let saved_impl = pcx.self_impl;
+            // RULE: F5.4 (0.27.2: `Self::Item` here is the callee's Self's,
+            // not the impl being checked's)
+            if crate::front::rust::rust_at(pcx.nodes[fnb].start, &pcx) {
+                pcx.self_impl = -1;
+            }
             pcx.tp_base = pcx.tp_names.count;
             for k in 0..pcx.nodes[params].count {
                 if bound[k] != 0 {
@@ -323,6 +408,7 @@ pub fn infer_closure_arg(params: i64, bound: *i64, tmod: i64, arg: i64, p: i64,
             env_leave(saved_base, &pcx);
             pcx.cur_mod = saved_mod;
             pcx.self_type = saved_self;
+            pcx.self_impl = saved_impl;
         } else {
             for _ in 0..count {
                 pcx.tscratch.push(0);
@@ -332,6 +418,10 @@ pub fn infer_closure_arg(params: i64, bound: *i64, tmod: i64, arg: i64, p: i64,
         pcx.closure_bound_name = pcx.nodes[p].a;
         let sig = check_closure_sig(arg, mark, ret, &pcx);
         pcx.closure_bound = 0;
+        // RULE: D20.3 (the bound's types are written in the template's generics)
+        if fnb != 0 && pcx.nodes[arg].x > 0 {
+            pcx.closures[pcx.nodes[arg].x - 1].exp_tps = params;
+        }
         let t = pcx.nodes[arg].ty;
         if !unify(params, bound, tmod, p, t, &pcx) {
             err_begin(pcx.nodes[arg].start, &pcx);
@@ -372,6 +462,42 @@ pub fn infer_from_fn_bound(params: i64, bound: *i64, tmod: i64, k: i64, pcx: ino
         let sig = callable_sig(bound[k], pcx);
         if sig != 0 {
             unify_bound(params, bound, tmod, fnb, sig, &pcx);
+        }
+    }
+}
+
+// (0.27.2) An impl's free type parameter named by the result of
+// parameter k's Fn bound, bound to that of the closure or fn type k is:
+// Map's B, from `F: FnMut(I::Item) -> B` (traits::impl_bindings). Only a
+// bare name: the bound's other types are not resolved here, outside the
+// impl's frame. RULE: F14.1
+pub fn infer_output_from_fn_bound(params: i64, bound: *i64, tmod: i64, k: i64,
+    pcx: inout Ctx<Comp>) {
+    // UNSAFE: bound is the caller's raw array of bindings (impl_bindings'
+    // alloc_array), read and written through a pointer.
+    // SAFETY: k and the index tparam_index gives are < the count of
+    // params, the array's length, and it lives until the caller frees it.
+    unsafe {
+        if bound[k] == 0 {
+            return;
+        }
+        let fnb = fn_bound_of(params, k, pcx);
+        let sig = callable_sig(bound[k], pcx);
+        if fnb == 0 || sig == 0 {
+            return;
+        }
+        let out = pcx.nodes[fnb].a;
+        if out == 0 || pcx.nodes[out].kind != NodeKind::TyName || pcx.nodes[out].count != 0
+            || pcx.nodes[out].g != 0 {
+            return;
+        }
+        match tparam_index(params, pcx.nodes[out].a, pcx) {
+            Option::Some(j) => {
+                if bound[j] == 0 {
+                    unify(params, bound, tmod, out, pcx.types[sig].a, &pcx);
+                }
+            }
+            Option::None => {}
         }
     }
 }

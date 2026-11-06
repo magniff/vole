@@ -1,0 +1,867 @@
+// (0.27.2) The overlap check of the rust edition's impls (F4.2): two
+// impls of one trait whose headers unify, and whose bounds can hold
+// together for the unified parameters, are `error trait.overlap`
+// (rustc E0119). The headers are unified as type nodes, each with its
+// own impl's parameters (disjoint): a term is a node of impl A (side 0),
+// a node of impl B (side 1), or a type (side 2), and a parameter is
+// bound to a term. Where the check cannot decide (a projection, a bound
+// with arguments, a `where` predicate, two bounds on one free
+// parameter), the pair overlaps: strict (FL2). MVS has no pattern impls,
+// and the pass looks at a pair only when one of its impls is a pattern
+// impl (the others' coherence is collect_impl's).
+
+use std::Option;
+
+use crate::base::{SRC, buf_new, buf_slice, intern_c, sym_text};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::base::diag::{
+    buf_file_line, err_begin, err_end_soft, err_fmt, err_help, err_help_fmt, err_str, err_sym,
+};
+use crate::front::assoc::is_projection_node;
+use crate::front::ast::{NODE_ASSOC_CONST, NODE_REF, NODE_REF_MUT, NodeKind, child};
+use crate::front::ast::NodeKind::{TyArray, TyFn, TyName, TyPtr, TySlice, TyTuple};
+use crate::front::check::has_error_type;
+use crate::front::check::collect::template_of_type_node;
+use crate::front::check::resolve::resolve_type;
+use crate::front::closures::fn_bounds::fn_bound_satisfied;
+use crate::front::generics::{TPL_NONE, TPL_PATTERN, instance_of, instance_targs};
+use crate::front::generics::instantiate::tparam_index;
+use crate::front::traits::{bound_trait, implements, trait_supers};
+use crate::front::types::{
+    REF_MUT, REF_SHARED, TY_NEVER, TY_UNIT, TyKind, decay_ref, is_mut_slice, type_elem,
+};
+
+// The bound of a unification depth: past it, terms unify (strict).
+const MAX_UNIFY_DEPTH: i64 = 48;
+
+// The bound of nested impl searches for a bound's satisfiability.
+const MAX_BOUND_DEPTH: i64 = 8;
+
+// Two impls being unified: impl a's header nodes are side 0, impl b's
+// side 1; their parameters' bindings are in TSCRATCH from `base` (a's,
+// then b's: 0 unbound, else a term + 1). The parameters of side `rigid`
+// (-1: none) are not bound: each is a type of its own (an impl's
+// parameters while its own obligations are proved, F2.3).
+struct Pair { a: i64, b: i64, base: i64, na: i64, rigid: i64 }
+
+fn term(x: i64, side: i64) -> i64 {
+    x * 4 + side
+}
+
+fn term_x(t: i64) -> i64 {
+    t / 4
+}
+
+fn term_side(t: i64) -> i64 {
+    t % 4
+}
+
+fn side_impl(cx: Pair, side: i64) -> i64 {
+    if side == 0 { cx.a } else { cx.b }
+}
+
+fn side_params(cx: Pair, side: i64, pcx: Ctx<Comp>) -> i64 {
+    pcx.nodes[pcx.traits_impls[side_impl(cx, side)].node].g
+}
+
+fn side_mod(cx: Pair, side: i64, pcx: Ctx<Comp>) -> i64 {
+    pcx.traits_impls[side_impl(cx, side)].module
+}
+
+fn slot(cx: Pair, side: i64, k: i64) -> i64 {
+    if side == 0 { cx.base + k } else { cx.base + cx.na + k }
+}
+
+// The index of the parameter node n names (on its side), or -1.
+fn param_of(cx: Pair, n: i64, side: i64, pcx: Ctx<Comp>) -> i64 {
+    if pcx.nodes[n].kind != TyName || pcx.nodes[n].count != 0 || pcx.nodes[n].g != 0 {
+        return -1;
+    }
+    match tparam_index(side_params(cx, side, pcx), pcx.nodes[n].a, pcx) {
+        Option::Some(k) => k,
+        Option::None => -1,
+    }
+}
+
+fn is_self_name(n: i64, pcx: inout Ctx<Comp>) -> bool {
+    pcx.nodes[n].kind == TyName && pcx.nodes[n].count == 0 && pcx.nodes[n].g == 0
+        && pcx.nodes[n].a == intern_c(c"Self", &pcx)
+}
+
+// Whether node n (of its side) mentions a parameter, `Self` or a
+// projection: whether it is not a type by itself.
+fn open_node(cx: Pair, n: i64, side: i64, pcx: inout Ctx<Comp>) -> bool {
+    if n == 0 {
+        return false;
+    }
+    let kind = pcx.nodes[n].kind;
+    if kind == TyName {
+        if param_of(cx, n, side, pcx) >= 0 || is_self_name(n, &pcx) || is_projection_node(n, pcx) {
+            return true;
+        }
+        let g = pcx.nodes[n].g;
+        if g != 0 {
+            for i in 0..pcx.nodes[g].count {
+                if open_node(cx, child(g, i, pcx), side, &pcx) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    if kind == TyPtr || kind == TySlice || kind == TyArray {
+        return open_node(cx, pcx.nodes[n].a, side, &pcx);
+    }
+    if kind == TyTuple || kind == TyFn {
+        for i in 0..pcx.nodes[n].count {
+            if open_node(cx, child(n, i, pcx), side, &pcx) {
+                return true;
+            }
+        }
+        return kind == TyFn && open_node(cx, pcx.nodes[n].a, side, &pcx);
+    }
+    false
+}
+
+// The type of a closed node, resolved in its impl's module (0 if it has
+// none).
+fn closed_type(cx: Pair, n: i64, side: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let saved = pcx.cur_mod;
+    pcx.cur_mod = side_mod(cx, side, pcx);
+    let t = resolve_type(n, &pcx);
+    pcx.cur_mod = saved;
+    if has_error_type(t, pcx) { 0 } else { t }
+}
+
+// A term as a type when it is one: a closed node becomes its type.
+fn normal(cx: Pair, t: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let side = term_side(t);
+    if side == 2 || open_node(cx, term_x(t), side, &pcx) {
+        return t;
+    }
+    let ty = closed_type(cx, term_x(t), side, &pcx);
+    if ty == 0 { t } else { term(ty, 2) }
+}
+
+// Whether terms x and y unify, binding the parameters they mention.
+fn unify(cx: Pair, x0: i64, y0: i64, depth: i64, pcx: inout Ctx<Comp>) -> bool {
+    if depth > MAX_UNIFY_DEPTH {
+        return true;
+    }
+    let x = normal(cx, x0, &pcx);
+    let y = normal(cx, y0, &pcx);
+    let xs = term_side(x);
+    let ys = term_side(y);
+    if xs == 2 && ys == 2 {
+        return term_x(x) == term_x(y);
+    }
+    if xs != 2 {
+        let n = term_x(x);
+        // (`Self` in a header: the impl's own self type)
+        if is_self_name(n, &pcx) {
+            let own = pcx.nodes[pcx.traits_impls[side_impl(cx, xs)].node].b;
+            return n == own || unify(cx, term(own, xs), y, depth + 1, &pcx);
+        }
+        let k = param_of(cx, n, xs, pcx);
+        if k >= 0 && xs == cx.rigid {
+            // (a rigid parameter is only itself; a bindable one binds to it)
+            if ys != 2 && ys != xs && param_of(cx, term_x(y), ys, pcx) >= 0 {
+                return unify(cx, y, x, depth + 1, &pcx);
+            }
+            return ys == xs && param_of(cx, term_x(y), ys, pcx) == k;
+        }
+        if k >= 0 {
+            let s = slot(cx, xs, k);
+            let bound = pcx.tscratch.get(s);
+            if bound != 0 {
+                return unify(cx, bound - 1, y, depth + 1, &pcx);
+            }
+            if ys != 2 && ys == xs && param_of(cx, term_x(y), ys, pcx) == k {
+                return true;
+            }
+            // (the occurs check: `T` against `Box<T, A>` has no finite
+            // solution)
+            if occurs(cx, k, xs, y, depth, &pcx) {
+                return false;
+            }
+            pcx.tscratch.set(s, y + 1);
+            return true;
+        }
+        if is_projection_node(n, pcx) {
+            return true;
+        }
+    }
+    if ys != 2 {
+        let n = term_x(y);
+        if is_self_name(n, &pcx) || param_of(cx, n, ys, pcx) >= 0 || is_projection_node(n, pcx) {
+            return unify(cx, y, x, depth + 1, &pcx);
+        }
+    }
+    if xs == 2 {
+        return node_type(cx, term_x(y), ys, term_x(x), depth, &pcx);
+    }
+    if ys == 2 {
+        return node_type(cx, term_x(x), xs, term_x(y), depth, &pcx);
+    }
+    node_node(cx, term_x(x), xs, term_x(y), ys, depth, &pcx)
+}
+
+// Whether parameter k of side s occurs in term y, through the bindings.
+fn occurs(cx: Pair, k: i64, s: i64, y: i64, depth: i64, pcx: inout Ctx<Comp>) -> bool {
+    let side = term_side(y);
+    if side == 2 || depth > MAX_UNIFY_DEPTH {
+        return false;
+    }
+    let n = term_x(y);
+    if n == 0 {
+        return false;
+    }
+    let kind = pcx.nodes[n].kind;
+    if kind == TyName {
+        let j = param_of(cx, n, side, pcx);
+        if j >= 0 {
+            if side == s && j == k {
+                return true;
+            }
+            let bound = pcx.tscratch.get(slot(cx, side, j));
+            return bound != 0 && occurs(cx, k, s, bound - 1, depth + 1, &pcx);
+        }
+        let g = pcx.nodes[n].g;
+        if g != 0 {
+            for i in 0..pcx.nodes[g].count {
+                if occurs(cx, k, s, term(child(g, i, pcx), side), depth + 1, &pcx) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    if kind == TyPtr || kind == TySlice || kind == TyArray {
+        return occurs(cx, k, s, term(pcx.nodes[n].a, side), depth + 1, &pcx);
+    }
+    if kind == TyTuple || kind == TyFn {
+        for i in 0..pcx.nodes[n].count {
+            if occurs(cx, k, s, term(child(n, i, pcx), side), depth + 1, &pcx) {
+                return true;
+            }
+        }
+        return kind == TyFn && occurs(cx, k, s, term(pcx.nodes[n].a, side), depth + 1, &pcx);
+    }
+    false
+}
+
+// Node n (side s, neither a parameter nor closed) against type t, by
+// match_type's shapes.
+fn node_type(cx: Pair, n: i64, s: i64, t: i64, depth: i64, pcx: inout Ctx<Comp>) -> bool {
+    let kind = pcx.nodes[n].kind;
+    let tk = pcx.types[t].kind;
+    if kind == TyName {
+        let g = pcx.nodes[n].g;
+        if g == 0 {
+            return false;
+        }
+        let saved = pcx.cur_mod;
+        pcx.cur_mod = side_mod(cx, s, pcx);
+        let tpl = template_of_type_node(n, &pcx);
+        pcx.cur_mod = saved;
+        if tpl == TPL_NONE || !instance_of(t, tpl, pcx) {
+            return false;
+        }
+        let targs = instance_targs(t, &pcx);
+        for i in 0..pcx.nodes[g].count {
+            if !unify(cx, term(child(g, i, pcx), s), term(pcx.tlists.get(targs + i), 2), depth + 1,
+                &pcx) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if kind == TyPtr {
+        let is_ref = (pcx.nodes[n].p & NODE_REF) != 0;
+        let is_mut = (pcx.nodes[n].p & NODE_REF_MUT) != 0;
+        let a = term(pcx.nodes[n].a, s);
+        if is_ref && !is_mut && tk == TyKind::Slice && pcx.types[t].b == 0 {
+            return unify(cx, a, term(t, 2), depth + 1, &pcx);
+        }
+        if is_mut && is_mut_slice(t, pcx) {
+            return unify(cx, a, term(decay_ref(t, &pcx), 2), depth + 1, &pcx);
+        }
+        let want = if is_mut { REF_MUT } else if is_ref { REF_SHARED } else { 0 };
+        if tk != TyKind::Ptr || pcx.types[t].b != want {
+            return false;
+        }
+        return unify(cx, a, term(pcx.types[t].a, 2), depth + 1, &pcx);
+    }
+    if kind == TySlice {
+        if tk != TyKind::Slice
+            || ((pcx.nodes[n].p & NODE_REF_MUT) != 0) != is_mut_slice(t, pcx) {
+            return false;
+        }
+        return unify(cx, term(pcx.nodes[n].a, s), term(pcx.types[t].a, 2), depth + 1, &pcx);
+    }
+    if kind == TyArray {
+        return tk == TyKind::Array
+            && unify(cx, term(pcx.nodes[n].a, s), term(pcx.types[t].a, 2), depth + 1, &pcx);
+    }
+    if kind == TyTuple || kind == TyFn {
+        if !(kind == TyTuple && tk == TyKind::Tuple || kind == TyFn && tk == TyKind::Fn)
+            || pcx.nodes[n].count != pcx.types[t].count {
+            return false;
+        }
+        for i in 0..pcx.nodes[n].count {
+            if !unify(cx, term(child(n, i, pcx), s), term(type_elem(t, i, pcx), 2), depth + 1,
+                &pcx) {
+                return false;
+            }
+        }
+        return kind == TyTuple
+            || unify(cx, term(pcx.nodes[n].a, s), term(pcx.types[t].a, 2), depth + 1, &pcx);
+    }
+    if kind == NodeKind::TyUnit {
+        return t == TY_UNIT;
+    }
+    if kind == NodeKind::TyNever {
+        return t == TY_NEVER;
+    }
+    // (a shape the check does not know: strict)
+    true
+}
+
+// Two open nodes, neither a parameter, by shape.
+fn node_node(cx: Pair, n: i64, s: i64, m: i64, r: i64, depth: i64, pcx: inout Ctx<Comp>) -> bool {
+    let kind = pcx.nodes[n].kind;
+    if kind != pcx.nodes[m].kind {
+        return false;
+    }
+    if kind == TyName {
+        let g = pcx.nodes[n].g;
+        let h = pcx.nodes[m].g;
+        if g == 0 || h == 0 || pcx.nodes[g].count != pcx.nodes[h].count {
+            return false;
+        }
+        let saved = pcx.cur_mod;
+        pcx.cur_mod = side_mod(cx, s, pcx);
+        let tn = template_of_type_node(n, &pcx);
+        pcx.cur_mod = side_mod(cx, r, pcx);
+        let tm = template_of_type_node(m, &pcx);
+        pcx.cur_mod = saved;
+        if tn != tm {
+            return false;
+        }
+        for i in 0..pcx.nodes[g].count {
+            if !unify(cx, term(child(g, i, pcx), s), term(child(h, i, pcx), r), depth + 1, &pcx) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if kind == TyPtr || kind == TySlice {
+        let flags = NODE_REF | NODE_REF_MUT;
+        return (pcx.nodes[n].p & flags) == (pcx.nodes[m].p & flags)
+            && unify(cx, term(pcx.nodes[n].a, s), term(pcx.nodes[m].a, r), depth + 1, &pcx);
+    }
+    if kind == TyArray {
+        return unify(cx, term(pcx.nodes[n].a, s), term(pcx.nodes[m].a, r), depth + 1, &pcx);
+    }
+    if kind == TyTuple || kind == TyFn {
+        if pcx.nodes[n].count != pcx.nodes[m].count {
+            return false;
+        }
+        for i in 0..pcx.nodes[n].count {
+            if !unify(cx, term(child(n, i, pcx), s), term(child(m, i, pcx), r), depth + 1, &pcx) {
+                return false;
+            }
+        }
+        return kind == TyTuple
+            || unify(cx, term(pcx.nodes[n].a, s), term(pcx.nodes[m].a, r), depth + 1, &pcx);
+    }
+    true
+}
+
+// A Pair of impls a and b with fresh bindings (TSCRATCH from its count;
+// the caller pops them, release).
+fn pair_begin(a: i64, b: i64, pcx: inout Ctx<Comp>) -> Pair {
+    let pa = pcx.nodes[pcx.traits_impls[a].node].g;
+    let pb = pcx.nodes[pcx.traits_impls[b].node].g;
+    let na = if pa == 0 { 0 } else { pcx.nodes[pa].count };
+    let nb = if pb == 0 { 0 } else { pcx.nodes[pb].count };
+    let base = pcx.tscratch.count;
+    for _ in 0..na + nb {
+        pcx.tscratch.push(0);
+    }
+    Pair { a: a, b: b, base: base, na: na, rigid: -1 }
+}
+
+fn release(cx: Pair, pcx: inout Ctx<Comp>) {
+    pcx.tscratch.count = cx.base;
+}
+
+// Whether the headers of impls cx.a and cx.b unify: the self types, and
+// the trait's arguments when both write them.
+fn headers_unify(cx: Pair, pcx: inout Ctx<Comp>) -> bool {
+    let na = pcx.traits_impls[cx.a].node;
+    let nb = pcx.traits_impls[cx.b].node;
+    let ga = pcx.nodes[pcx.nodes[na].a].g;
+    let gb = pcx.nodes[pcx.nodes[nb].a].g;
+    if ga != 0 && gb != 0 && pcx.nodes[ga].count == pcx.nodes[gb].count {
+        for i in 0..pcx.nodes[ga].count {
+            if !unify(cx, term(child(ga, i, pcx), 0), term(child(gb, i, pcx), 1), 0, &pcx) {
+                return false;
+            }
+        }
+    }
+    unify(cx, term(pcx.nodes[na].b, 0), term(pcx.nodes[nb].b, 1), 0, &pcx)
+}
+
+// Whether some impl of trait tr could apply to the open term x (of a
+// side of cx): its header unifies with x, with x's parameters free
+// again, and its own bounds can hold, to a depth (past it: they can,
+// strict).
+fn could_hold(cx: Pair, tr: i64, x: i64, depth: i64, pcx: inout Ctx<Comp>) -> bool {
+    if depth > MAX_BOUND_DEPTH {
+        return true;
+    }
+    let side = term_side(x);
+    let owner = side_impl(cx, side);
+    for k in 0..pcx.traits_impls.len() as i64 {
+        if pcx.traits_impls[k].tr != tr || pcx.traits_impls[k].tpl == TPL_NONE
+            && pcx.traits_impls[k].ty == 0 {
+            continue;
+        }
+        let c2 = pair_begin(k, owner, &pcx);
+        let ok = unify(c2, term(pcx.nodes[pcx.traits_impls[k].node].b, 0), term(term_x(x), 1), 0,
+            &pcx) && side_satisfiable(c2, 0, depth + 1, &pcx);
+        release(c2, &pcx);
+        if ok {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether the open term x could be callable (an `Fn` bound): a fn type,
+// a parameter or a reference (`&F` is callable when F is).
+fn could_call(x: i64, pcx: Ctx<Comp>) -> bool {
+    let n = term_x(x);
+    let kind = pcx.nodes[n].kind;
+    if kind == TyPtr {
+        return could_call(term(pcx.nodes[n].a, term_side(x)), pcx);
+    }
+    kind == TyFn || kind == TyName && pcx.nodes[n].g == 0
+}
+
+// Whether the bounds of side s's parameters can hold under cx's
+// bindings.
+fn side_satisfiable(cx: Pair, side: i64, depth: i64, pcx: inout Ctx<Comp>) -> bool {
+    let params = side_params(cx, side, pcx);
+    if params == 0 {
+        return true;
+    }
+    for k in 0..pcx.nodes[params].count {
+        let p = child(params, k, pcx);
+        let bounds = pcx.nodes[p].h;
+        let bound = pcx.tscratch.get(slot(cx, side, k));
+        if bounds == 0 || bound == 0 {
+            continue;
+        }
+        let x = normal(cx, bound - 1, &pcx);
+        let ground = term_side(x) == 2;
+        for i in 0..pcx.nodes[bounds].count {
+            let b = child(bounds, i, pcx);
+            if pcx.nodes[b].kind == TyFn {
+                if ground && !fn_bound_satisfied(b, term_x(x), &pcx)
+                    || !ground && !could_call(x, pcx) {
+                    return false;
+                }
+                continue;
+            }
+            let tr = bound_trait(b, &pcx);
+            // (an effects bound, a generic trait's: undecided, so it may
+            // hold)
+            if tr < 0 || pcx.nodes[b].g != 0 {
+                continue;
+            }
+            let holds = if ground { implements(tr, term_x(x), &pcx) }
+                else { could_hold(cx, tr, x, depth, &pcx) };
+            if !holds {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// RULE: F4.2 (after collection: every pair of impls of one trait, one of
+// them a pattern impl, whose headers unify and whose bounds can hold
+// together, is error trait.overlap at the later one)
+pub fn check_overlap(pcx: inout Ctx<Comp>) {
+    let n = pcx.traits_impls.len() as i64;
+    var any = false;
+    for i in 0..n {
+        if pcx.traits_impls[i].tpl == TPL_PATTERN {
+            any = true;
+        }
+    }
+    if !any {
+        return;
+    }
+    for i in 0..n {
+        let tr = pcx.traits_impls[i].tr;
+        if tr < 0 || pcx.traits_impls[i].tpl == TPL_NONE && pcx.traits_impls[i].ty == 0 {
+            continue;
+        }
+        for j in 0..i {
+            if pcx.traits_impls[j].tr != tr
+                || pcx.traits_impls[i].tpl != TPL_PATTERN && pcx.traits_impls[j].tpl != TPL_PATTERN
+                || pcx.traits_impls[j].tpl == TPL_NONE && pcx.traits_impls[j].ty == 0 {
+                continue;
+            }
+            let cx = pair_begin(j, i, &pcx);
+            let overlap = headers_unify(cx, &pcx) && side_satisfiable(cx, 0, 0, &pcx)
+                && side_satisfiable(cx, 1, 0, &pcx);
+            release(cx, &pcx);
+            if overlap {
+                overlap_error(j, i, &pcx);
+                break;
+            }
+        }
+    }
+}
+
+fn overlap_error(first: i64, second: i64, pcx: inout Ctx<Comp>) {
+    let saved_kind = pcx.err_kind;
+    pcx.err_kind = c"trait.overlap";
+    let node = pcx.traits_impls[second].node;
+    let other = pcx.traits_impls[first].node;
+    err_begin(pcx.nodes[node].start, &pcx);
+    err_str(c"conflicting impls of trait '", pcx);
+    err_sym(pcx.traits[pcx.traits_impls[second].tr].name, pcx);
+    err_str(c"': this impl and an earlier one apply to the same type", pcx);
+    let there = buf_new();
+    buf_file_line(there, pcx.nodes[other].start, &pcx);
+    err_help_fmt(format_args("the other impl is at {}: no specialization, so keep one, or bound \
+        them apart", buf_slice(there)), pcx);
+    err_end_soft(&pcx);
+    pcx.err_kind = saved_kind;
+}
+
+// ---- What an impl must prove (F2.3, F11.1, for a generic impl) ----
+
+// Whether trait `have` is `want` or has it among its supertraits, to a
+// depth.
+fn trait_implies(have: i64, want: i64, depth: i64, pcx: inout Ctx<Comp>) -> bool {
+    if have == want {
+        return true;
+    }
+    let supers = trait_supers(have, pcx);
+    if have < 0 || supers == 0 || depth > MAX_BOUND_DEPTH {
+        return false;
+    }
+    for k in 0..pcx.nodes[supers].count {
+        let b = child(supers, k, pcx);
+        if pcx.nodes[b].kind != TyFn && trait_implies(bound_trait(b, &pcx), want, depth + 1, &pcx) {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether term x of pair cx (impl cx.a's nodes bindable, impl cx.b's
+// rigid) satisfies trait tr.
+fn entails_term(cx: Pair, x0: i64, tr: i64, depth: i64, pcx: inout Ctx<Comp>) -> bool {
+    let x = normal(cx, x0, &pcx);
+    let side = term_side(x);
+    if side == 2 {
+        return implements(tr, term_x(x), &pcx);
+    }
+    if side == 1 {
+        return entails(cx.b, term_x(x), tr, depth, &pcx);
+    }
+    // (a part of the other impl's header no binding reached: it holds for
+    // what fixes it)
+    true
+}
+
+// Whether type node n of impl i's header or items, its parameters as
+// declared (rigid, with their bounds), satisfies trait tr (F0.4): a
+// parameter by its bounds and their supertraits (F2.2), a closed type by
+// its impls, an open one by an impl whose header unifies with it and
+// whose bounds hold in turn. A projection, a depth past the bound, a
+// bound with arguments: it holds (the per-instance checks see them).
+// RULE: F0.4, F2.3, F11.1
+pub fn entails(i: i64, n: i64, tr: i64, depth: i64, pcx: inout Ctx<Comp>) -> bool {
+    if tr < 0 || n == 0 || depth > MAX_BOUND_DEPTH || is_projection_node(n, pcx) {
+        return true;
+    }
+    let params = pcx.nodes[pcx.traits_impls[i].node].g;
+    if pcx.nodes[n].kind == TyName && pcx.nodes[n].count == 0 && pcx.nodes[n].g == 0 {
+        match tparam_index(params, pcx.nodes[n].a, pcx) {
+            Option::Some(k) => {
+                let bounds = pcx.nodes[child(params, k, pcx)].h;
+                if bounds != 0 {
+                    for j in 0..pcx.nodes[bounds].count {
+                        let b = child(bounds, j, pcx);
+                        if pcx.nodes[b].kind != TyFn
+                            && trait_implies(bound_trait(b, &pcx), tr, 0, &pcx) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            Option::None => {}
+        }
+    }
+    let probe = pair_begin(i, i, &pcx);
+    let closed = !open_node(probe, n, 1, &pcx);
+    let t = if closed { closed_type(probe, n, 1, &pcx) } else { 0 };
+    release(probe, &pcx);
+    if closed {
+        return t == 0 || implements(tr, t, &pcx);
+    }
+    for k in 0..pcx.traits_impls.len() as i64 {
+        if pcx.traits_impls[k].tr != tr || pcx.traits_impls[k].tpl == TPL_NONE
+            && pcx.traits_impls[k].ty == 0 {
+            continue;
+        }
+        var c2 = pair_begin(k, i, &pcx);
+        c2.rigid = 1;
+        var ok = unify(c2, term(pcx.nodes[pcx.traits_impls[k].node].b, 0), term(n, 1), 0, &pcx);
+        let kp = pcx.nodes[pcx.traits_impls[k].node].g;
+        for m in 0..(if ok && kp != 0 { pcx.nodes[kp].count } else { 0 }) {
+            let bounds = pcx.nodes[child(kp, m, pcx)].h;
+            let bound = pcx.tscratch.get(slot(c2, 0, m));
+            for j in 0..(if bounds == 0 || bound == 0 { 0 } else { pcx.nodes[bounds].count }) {
+                let b = child(bounds, j, pcx);
+                if ok && pcx.nodes[b].kind != TyFn && pcx.nodes[b].g == 0
+                    && !entails_term(c2, bound - 1, bound_trait(b, &pcx), depth + 1, &pcx) {
+                    ok = false;
+                }
+            }
+        }
+        release(c2, &pcx);
+        if ok {
+            return true;
+        }
+    }
+    false
+}
+
+// RULE: F2.3, F11.1 (a generic impl of the rust edition: its self type
+// implements each supertrait, and each associated type's definition each
+// bound the trait declares, with the impl's parameters as declared)
+pub fn check_generic_obligations(i: i64, pcx: inout Ctx<Comp>) {
+    let node = pcx.traits_impls[i].node;
+    let tr = pcx.traits_impls[i].tr;
+    if tr < 0 {
+        return;
+    }
+    let self_node = pcx.nodes[node].b;
+    let supers = trait_supers(tr, pcx);
+    for k in 0..(if supers == 0 { 0 } else { pcx.nodes[supers].count }) {
+        let b = child(supers, k, pcx);
+        if pcx.nodes[b].kind == TyFn || pcx.nodes[b].g != 0 {
+            continue;
+        }
+        if !entails(i, self_node, bound_trait(b, &pcx), 0, &pcx) {
+            unmet_error(pcx.nodes[node].start, format_args("'{}' requires '{}: {}', which is not \
+                implemented", sym_text(pcx.traits[tr].name, pcx),
+                SRC[pcx.nodes[self_node].start..pcx.nodes[self_node].end],
+                SRC[pcx.nodes[b].start..pcx.nodes[b].end]), &pcx);
+        }
+    }
+    let declared = pcx.nodes[pcx.traits[tr].node].b;
+    let holder = pcx.nodes[node].c;
+    for k in 0..(if declared == 0 || holder == 0 { 0 } else { pcx.nodes[declared].count }) {
+        let d = child(declared, k, pcx);
+        let bounds = pcx.nodes[d].h;
+        if bounds == 0 || (pcx.nodes[d].p & NODE_ASSOC_CONST) != 0 {
+            continue;
+        }
+        var def = 0;
+        for j in 0..pcx.nodes[holder].count {
+            if pcx.nodes[child(holder, j, pcx)].a == pcx.nodes[d].a {
+                def = child(holder, j, pcx);
+            }
+        }
+        let tn = if def == 0 { 0 } else { pcx.nodes[def].b };
+        for m in 0..(if tn == 0 { 0 } else { pcx.nodes[bounds].count }) {
+            let b = child(bounds, m, pcx);
+            if pcx.nodes[b].kind == TyFn || pcx.nodes[b].g != 0 {
+                continue;
+            }
+            if !entails(i, tn, bound_trait(b, &pcx), 0, &pcx) {
+                unmet_error(pcx.nodes[def].start, format_args("'{}::{} = {}' must implement '{}', \
+                    as the trait declares", sym_text(pcx.traits[tr].name, pcx),
+                    sym_text(pcx.nodes[d].a, pcx), SRC[pcx.nodes[tn].start..pcx.nodes[tn].end],
+                    SRC[pcx.nodes[b].start..pcx.nodes[b].end]), &pcx);
+            }
+        }
+    }
+}
+
+// RULE: F14.1 (an impl's type parameter is constrained: it occurs in the
+// self type or the trait's arguments, or in a bound of a parameter that
+// is; else error trait.unconstrained, rustc E0207)
+pub fn check_constrained(i: i64, pcx: inout Ctx<Comp>) {
+    let node = pcx.traits_impls[i].node;
+    let params = pcx.nodes[node].g;
+    if params == 0 || pcx.nodes[params].count == 0 {
+        return;
+    }
+    let count = pcx.nodes[params].count;
+    let mark = pcx.tscratch.count;
+    let targs = pcx.nodes[pcx.nodes[node].a].g;
+    for k in 0..count {
+        let sym = pcx.nodes[child(params, k, pcx)].a;
+        var fixed = names_sym(pcx.nodes[node].b, sym, pcx) || sym_text(sym, pcx).len() > 0
+            && sym_text(sym, pcx)[0] == '\'';
+        for j in 0..(if targs == 0 { 0 } else { pcx.nodes[targs].count }) {
+            fixed = fixed || names_sym(child(targs, j, pcx), sym, pcx);
+        }
+        pcx.tscratch.push(fixed as i64);
+    }
+    // (through the bounds of the parameters fixed so far, to a fixpoint)
+    var changed = true;
+    while changed {
+        changed = false;
+        for k in 0..count {
+            if pcx.tscratch.get(mark + k) != 0 {
+                continue;
+            }
+            let sym = pcx.nodes[child(params, k, pcx)].a;
+            for j in 0..count {
+                let bounds = pcx.nodes[child(params, j, pcx)].h;
+                if pcx.tscratch.get(mark + j) == 0 || bounds == 0 {
+                    continue;
+                }
+                for m in 0..pcx.nodes[bounds].count {
+                    if pcx.tscratch.get(mark + k) == 0
+                        && names_sym(child(bounds, m, pcx), sym, pcx) {
+                        pcx.tscratch.set(mark + k, 1);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    for k in 0..count {
+        if pcx.tscratch.get(mark + k) == 0 {
+            let p = child(params, k, pcx);
+            let saved_kind = pcx.err_kind;
+            pcx.err_kind = c"trait.unconstrained";
+            err_begin(pcx.nodes[p].start, &pcx);
+            err_fmt(format_args("the type parameter '{}' is not constrained by the impl's trait, \
+                self type or bounds", sym_text(pcx.nodes[p].a, pcx)), pcx);
+            err_help(c"use it in the self type or the trait's arguments, or drop it", pcx);
+            err_end_soft(&pcx);
+            pcx.err_kind = saved_kind;
+        }
+    }
+    pcx.tscratch.count = mark;
+}
+
+// Whether type node n names the type parameter `sym` anywhere in it
+// (`T`, `T::Item`, `Vec<T>`, `&T`, `fn(T) -> U`, `<T as Tr>::A`).
+fn names_sym(n: i64, sym: i64, pcx: Ctx<Comp>) -> bool {
+    if n == 0 {
+        return false;
+    }
+    let kind = pcx.nodes[n].kind;
+    if kind == TyName {
+        let first = if pcx.nodes[n].count > 0 { pcx.nodes[child(n, 0, pcx)].a }
+            else { pcx.nodes[n].a };
+        if first == sym {
+            return true;
+        }
+        if (pcx.nodes[n].p & crate::front::ast::NODE_QPATH) != 0
+            && names_sym(child(n, 0, pcx), sym, pcx) {
+            return true;
+        }
+        let g = pcx.nodes[n].g;
+        for i in 0..(if g == 0 { 0 } else { pcx.nodes[g].count }) {
+            if names_sym(child(g, i, pcx), sym, pcx) {
+                return true;
+            }
+        }
+        // (a bound's associated-type constraints, `Iterator<Item = &'a T>`:
+        // AssocType nodes in its holder h, parse_bound's)
+        let h = pcx.nodes[n].h;
+        for i in 0..(if h == 0 { 0 } else { pcx.nodes[h].count }) {
+            let c = child(h, i, pcx);
+            if pcx.nodes[c].kind == crate::front::ast::NodeKind::AssocType
+                && names_sym(pcx.nodes[c].b, sym, pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    // RULE: F15.3 (`[T; N]` names its length parameter N)
+    if kind == TyArray && crate::front::generics::instantiate::array_len_name(n, pcx) == sym {
+        return true;
+    }
+    if kind == TyPtr || kind == TySlice || kind == TyArray {
+        return names_sym(pcx.nodes[n].a, sym, pcx);
+    }
+    if kind == TyTuple || kind == TyFn {
+        for i in 0..pcx.nodes[n].count {
+            if names_sym(child(n, i, pcx), sym, pcx) {
+                return true;
+            }
+        }
+        return kind == TyFn && names_sym(pcx.nodes[n].a, sym, pcx);
+    }
+    false
+}
+
+fn unmet_error<T: std::Display>(pos: i64, msg: sink T, pcx: inout Ctx<Comp>) {
+    let saved_kind = pcx.err_kind;
+    pcx.err_kind = c"trait.unmet";
+    err_begin(pos, &pcx);
+    err_fmt(msg, pcx);
+    err_help(c"bound the impl's parameter by it, or implement it for the type", pcx);
+    err_end_soft(&pcx);
+    pcx.err_kind = saved_kind;
+}
+
+// (0.27.2) Whether type node n names a type parameter in scope (the
+// environment's) or `Self`, anywhere in it: a type that differs per
+// instance.
+pub fn mentions_param(n: i64, pcx: Ctx<Comp>) -> bool {
+    if n == 0 {
+        return false;
+    }
+    let kind = pcx.nodes[n].kind;
+    if kind == TyName {
+        let first = if pcx.nodes[n].count > 0 { pcx.nodes[child(n, 0, pcx)].a }
+            else { pcx.nodes[n].a };
+        if crate::front::generics::env_lookup(first, pcx) != 0
+            || first == pcx.self_type_sym && pcx.self_type != 0 {
+            return true;
+        }
+        if (pcx.nodes[n].p & crate::front::ast::NODE_QPATH) != 0 {
+            return mentions_param(child(n, 0, pcx), pcx);
+        }
+        let g = pcx.nodes[n].g;
+        if g != 0 {
+            for i in 0..pcx.nodes[g].count {
+                if mentions_param(child(g, i, pcx), pcx) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    if kind == TyPtr || kind == TySlice || kind == TyArray {
+        return mentions_param(pcx.nodes[n].a, pcx);
+    }
+    if kind == TyTuple || kind == TyFn {
+        for i in 0..pcx.nodes[n].count {
+            if mentions_param(child(n, i, pcx), pcx) {
+                return true;
+            }
+        }
+        return kind == TyFn && mentions_param(pcx.nodes[n].a, pcx);
+    }
+    false
+}

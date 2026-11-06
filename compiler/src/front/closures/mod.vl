@@ -25,6 +25,7 @@
 pub mod fn_bounds;
 pub mod escape;
 pub mod scoped;
+pub mod kinds;
 
 use crate::base::{
     SRC, alloc_array, buf_byte, buf_bytes, buf_fmt, buf_int, buf_new, buf_slice, buf_str, free,
@@ -50,8 +51,8 @@ use crate::front::closures::escape::{check_scope_exit, type_borrow};
 use crate::front::closures::fn_bounds::legacy_ref_param;
 use crate::front::lexer::Tok;
 use crate::front::types::{
-    FIELDS, FieldInfo, REF_MUT, TY_BOOL, TY_NEVER, TY_UNIT, TyKind, buf_type, err_type, is_pointer,
-    is_ref, make_type, ptr_to, struct_type, type_elem, type_size,
+    FIELDS, FN_TY_C, FN_TY_UNSAFE, FieldInfo, REF_MUT, TY_BOOL, TY_NEVER, TY_UNIT, TyKind, buf_type,
+    err_type, is_pointer, is_ref, make_type, ptr_to, struct_type, type_elem, type_size,
 };
 
 // A closure: its Closure node, its function (FNS index), its env struct
@@ -69,8 +70,32 @@ pub struct ClosureInfo {
     pub node: i64, pub f: i64, pub env_struct: i64, pub encl_fn: i64, pub captures: i64,
     pub capture_count: i64,
     writes: bool, pub borrow_depth: i64, write_local: i64, pub mark: i64, uses: i64, caps: i64,
-    ty: i64,
+    pub ty: i64,
     sig: i64,
+    // (0.27.2, rust edition) the kind, 2 `Fn`, 3 `FnMut`, 4 `FnOnce` (0:
+    // not inferred yet, kinds.vl); the expected bound's kind (0: none,
+    // D19.3(a)); the strictest `Fn`/`FnMut` bound it was checked against
+    // and that bound's node (D19.6, decided once the kind is known); its
+    // rewritten uses, (node, local) pairs in CAPTURE_LIST after its captures
+    pub kind: i64,
+    expected: i64,
+    bound_kind: i64,
+    bound_node: i64,
+    use_at: i64,
+    use_count: i64,
+    // (0.27.2, D20.3) the expected bound (a TyFn node; 0: none) and the
+    // generics node its types are written in (0: none); the closure's
+    // external signature regions X_C: how many, and their variances in
+    // CAPTURE_LIST from xc_at (places/regions.vl, closure_sig_slots)
+    pub exp_node: i64,
+    pub exp_tps: i64,
+    pub xc_at: i64,
+    pub xc_n: i64,
+    // (D19.10) its requirements, once its body is solved: req_n pairs (i,
+    // j) in CAPTURE_LIST from req_at, slot i of its type outlives slot j
+    // (-1: 'static)
+    pub req_at: i64,
+    pub req_n: i64,
 }
 
 // What 0.14 parses but does not check yet: `error ... (check.unimplemented)`.
@@ -93,10 +118,8 @@ pub fn check_closure(n: i64, expected: i64, pcx: inout Ctx<Comp>) -> i64 {
         let mark = pcx.tscratch.count;
         let count = pcx.nodes[n].count;
         var ret = 0;
-        var sig = 0;
-        if expected != 0 && pcx.types[expected].kind == TyKind::Fn && pcx.types[expected].b == 0 {
-            sig = expected;
-        } else if expected != 0 && closure_of_type(expected, pcx) != 0 {
+        var sig = closure_fn_target(expected, &pcx);
+        if sig == 0 && expected != 0 && closure_of_type(expected, pcx) != 0 {
             sig = pcx.closures[closure_of_type(expected, pcx) - 1].sig;
         }
         if sig != 0 && pcx.types[sig].count != count {
@@ -179,6 +202,26 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64, pcx: inout Ctx<Comp>) -> i
                     raw_closure_param(pcx.nodes[param].b, wanted, t, &pcx);
                     t = wanted;
                 }
+                if wanted != 0 && wanted != t && wanted != pcx.ty_error && t != pcx.ty_error
+                    && bound != 0 && crate::front::rust::rust_at(pcx.nodes[param].start, &pcx) {
+                    // RULE: D20.3 (an annotation the expected bound's type does
+                    // not unify with: closure.sig, rustc E0631)
+                    let saved = pcx.err_kind;
+                    pcx.err_kind = c"closure.sig";
+                    err_begin(pcx.nodes[pcx.nodes[param].b].start, &pcx);
+                    err_str(c"type mismatch in closure arguments: this parameter is written '",
+                        pcx);
+                    err_type(t, pcx);
+                    err_str(c"', but the bound of '", pcx);
+                    err_sym(bound_name, pcx);
+                    err_str(c"' gives it '", pcx);
+                    err_type(wanted, pcx);
+                    err_str(c"' (rustc E0631)", pcx);
+                    err_help(c"write the bound's type, or leave the parameter's type out", pcx);
+                    crate::base::diag::err_end_soft(&pcx);
+                    pcx.err_kind = saved;
+                    t = wanted;
+                }
                 if bound != 0
                     && crate::front::closures::fn_bounds::same_but_convention(wanted, t, pcx) {
                     crate::front::closures::fn_bounds::closure_param_conv_error(bound, bound_name,
@@ -214,6 +257,9 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64, pcx: inout Ctx<Comp>) -> i
             }
         }
         let id = new_closure(n, &pcx);
+        // RULE: D19.3 (a): the expected bound's kind
+        pcx.closures[id].expected = if bound != 0 { pcx.nodes[bound].d } else { 0 };
+        pcx.closures[id].exp_node = bound;
         let f = pcx.closures[id].f;
         // The body, as the closure's function: its own result type, and no
         // loop or deferred statement around it to leave.
@@ -419,7 +465,9 @@ fn new_closure(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             node: n, f: f, env_struct: -1, encl_fn: encl, captures: 0, capture_count: 0,
             writes: false, borrow_depth: -1, write_local: -1, mark: pcx.locals.len() as i64,
             uses: pcx.uses.count,
-            caps: pcx.caps.count, ty: 0, sig: 0,
+            caps: pcx.caps.count, ty: 0, sig: 0, kind: 0, expected: 0, bound_kind: 0, bound_node: 0,
+            use_at: 0,
+            use_count: 0, exp_node: 0, exp_tps: 0, xc_at: 0, xc_n: 0, req_at: 0, req_n: 0,
         });
         id
     }
@@ -478,7 +526,10 @@ fn finish_closure(id: i64, fn_body: i64, params: *i64, tys: *i64, result: i64, p
         // (0.20) A sink closure's owned capture has a flag, true while the
         // closure holds it: its body may move it out once (then its drop
         // skips it, and a second move is a run-time failure), front/own.
-        if is_move {
+        // (0.27.2: not in the rust edition, where a closure that moves what it
+        // owns is `FnOnce`, D19.3, and its env a value, D19.4)
+        let rust = pcx.edition != 0 && crate::front::rust::rust_at(pcx.nodes[n].start, &pcx);
+        if is_move && !rust {
             for j in 0..capture_count {
                 let local = pcx.capture_list.data[pcx.closures[id].captures + 2 * j];
                 if pcx.capture_list.data[pcx.closures[id].captures + 2 * j + 1] == 0
@@ -504,11 +555,18 @@ fn finish_closure(id: i64, fn_body: i64, params: *i64, tys: *i64, result: i64, p
         let env_ty = ptr_to(ty, &pcx);
         pcx.locals[env].ty = env_ty;
         // The uses, rewritten to the env's fields.
+        // (0.27.2: kept after the captures, for kinds.vl's D19.2 mode changes)
+        pcx.closures[id].use_at = pcx.capture_list.count;
         var u = pcx.closures[id].uses;
         while u < pcx.uses.count {
-            rewrite_use(id, pcx.uses.data[u], pcx.uses.data[u + 1], env, env_ty, &pcx);
+            let done = rewrite_use(id, pcx.uses.data[u], pcx.uses.data[u + 1], env, env_ty, &pcx);
+            if done != 0 {
+                pcx.capture_list.push(done);
+                pcx.capture_list.push(pcx.uses.data[u + 1]);
+            }
             u += 2;
         }
+        pcx.closures[id].use_count = (pcx.capture_list.count - pcx.closures[id].use_at) / 2;
         // Done with the body: what is left on the stacks is the enclosing
         // closure's.
         pcx.uses.count = pcx.closures[id].uses;
@@ -630,8 +688,8 @@ fn closure_name(n: i64, sig: i64, pcx: inout Ctx<Comp>) -> i64 {
 }
 
 // A use of a captured local, Ident node `node`, becomes `(*env).x` (by
-// value) or `*(*env).x` (by reference).
-fn rewrite_use(id: i64, used: i64, local: i64, env: i64, env_ty: i64, pcx: inout Ctx<Comp>) {
+// value) or `*(*env).x` (by reference); the node rewritten (0: none).
+fn rewrite_use(id: i64, used: i64, local: i64, env: i64, env_ty: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         // (0.20: the checker may have wrapped the Ident since, its content
         // moved to a node under it: `&x` for a let argument that borrows
@@ -657,7 +715,7 @@ fn rewrite_use(id: i64, used: i64, local: i64, env: i64, env_ty: i64, pcx: inout
         }
         if pcx.nodes[node].kind != NodeKind::Ident || pcx.nodes[node].res != Res::Local
             || pcx.nodes[node].y != local {
-            return;
+            return 0;
         }
         var j = 0;
         while j < pcx.closures[id].capture_count
@@ -691,6 +749,7 @@ fn rewrite_use(id: i64, used: i64, local: i64, env: i64, env_ty: i64, pcx: inout
         pcx.nodes[node].res = Res::None;
         pcx.nodes[node].p |= NODE_CAPTURE;
         pcx.nodes[node].d = local + 1;
+        node
     }
 }
 
@@ -727,17 +786,14 @@ fn captured_by_ref(id: i64, local: i64, pcx: inout Ctx<Comp>) -> bool {
     if (pcx.nodes[pcx.closures[id].node].c & CLOSURE_MOVE) != 0 {
         return false;
     }
-    // RULE: D10.2 (0.27.1) a rust-edition closure captures what it does not
+    // RULE: D10.2, Z9.6 a rust-edition closure captures what it does not
     // move by reference, an immutable variable too (Rust's rule; a moved
-    // capture would be FnOnce's, 0.27.2); an f-string's holes are copies
-    // (a shared view, `[T]` or `str`, is copied instead until a reference
-    // to a view is one of its own, Z9 in 0.27.2: `&'c [T]` collapses to the
-    // view, whose one slot would mix the capture's loan with the view's
-    // region; the view is Copy and immutable, so the copy reads the same)
+    // capture is FnOnce's, D19.2), a shared view `&[T]` or `&str` too (a
+    // loan `&'c &'a [T]` with two slots: R12's copy is gone); an
+    // f-string's holes are copies
     let node = pcx.closures[id].node;
     if (pcx.nodes[node].c & crate::front::ast::CLOSURE_HOLES) == 0 && pcx.edition != 0
-        && crate::front::rust::rust_at(pcx.nodes[node].start, &pcx)
-        && !shared_view(pcx.locals[local].ty, pcx) {
+        && crate::front::rust::rust_at(pcx.nodes[node].start, &pcx) {
         return true;
     }
     // (0.20: a sink parameter is mutable, but captured as a let is, by
@@ -748,16 +804,6 @@ fn captured_by_ref(id: i64, local: i64, pcx: inout Ctx<Comp>) -> bool {
     }
     let t = pcx.locals[local].ty;
     t != 0 && t != pcx.ty_error && type_size(t, pcx) > 32
-}
-
-// Whether type t is a shared view, `[T]` or `str` (over `[u8]`), not a
-// mutable one.
-fn shared_view(t0: i64, pcx: Ctx<Comp>) -> bool {
-    var t = t0;
-    while t > 0 && pcx.types[t].kind == TyKind::Distinct {
-        t = pcx.types[t].a;
-    }
-    t > 0 && pcx.types[t].kind == TyKind::Slice && pcx.types[t].b != crate::front::types::REF_MUT
 }
 
 // An assignment to local `local` or to a part of it (check_assign): the
@@ -932,6 +978,35 @@ pub fn closure_of_type(t: i64, pcx: Ctx<Comp>) -> i64 {
     pcx.structs[pcx.types[t].a].closure
 }
 
+// (0.27.2) Whether t is `&C` or `&mut C` of a closure type C, in the rust
+// edition: a callee closure_call calls through (D19.5).
+pub fn closure_through_ref(t: i64, pcx: Ctx<Comp>) -> bool {
+    pcx.edition != 0 && t > 0 && pcx.types[t].kind == TyKind::Ptr
+        && (pcx.types[t].b == crate::front::types::REF_SHARED
+            || pcx.types[t].b == crate::front::types::REF_MUT)
+        && closure_of_type(pcx.types[t].a, pcx) != 0
+}
+
+// (0.27.2, D19.5) Call n's callee of type t, a `&F` or `&mut F` of a fn
+// pointer in the rust edition (`pat(c)` with `pat: &mut fn(char) ->
+// bool`, rustc's blanket impls): the callee becomes `*callee` and its
+// type the fn pointer's; any other t is returned as it is.
+pub fn fn_through_ref(n: i64, t: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if pcx.edition == 0 || t <= 0 || pcx.types[t].kind != TyKind::Ptr
+        || pcx.types[t].b != crate::front::types::REF_SHARED
+        && pcx.types[t].b != crate::front::types::REF_MUT
+        || !crate::front::types::is_fn_type(pcx.types[t].a, pcx) {
+        return t;
+    }
+    let callee = pcx.nodes[n].a;
+    let u = new_node(NodeKind::Unary, pcx.nodes[callee].start, pcx.nodes[callee].end, &pcx);
+    pcx.nodes[u].op = Tok::Star;
+    pcx.nodes[u].b = callee;
+    pcx.nodes[u].ty = pcx.types[t].a;
+    pcx.nodes[n].a = u;
+    pcx.types[t].a
+}
+
 // (0.25) Whether closure type t holds an inout access: a capture by
 // reference it writes (conventions.md §5.4: held from the closure's
 // creation to its last use; the closure is a move-only view).
@@ -959,7 +1034,12 @@ pub fn closure_sig(c: i64, pcx: Ctx<Comp>) -> i64 {
 // Call n of a value of closure type `ty` (synth_call): a direct call of
 // the closure's function, with `&callee` first when it captures; its
 // result type.
-pub fn closure_call(n: i64, ty: i64, pcx: inout Ctx<Comp>) -> i64 {
+pub fn closure_call(n: i64, ty0: i64, pcx: inout Ctx<Comp>) -> i64 {
+    // RULE: D19.5 (a call through `&F` or `&mut F` of a closure, the rust
+    // edition's `compare(a, b)` with `compare: &mut F`: rustc's blanket
+    // impls, the call of `*compare`, its env `&*compare`)
+    let through = closure_of_type(ty0, pcx) == 0 && closure_through_ref(ty0, pcx);
+    let ty = if through { pcx.types[ty0].a } else { ty0 };
     let c = closure_of_type(ty, pcx) - 1;
     let sig = pcx.closures[c].sig;
     let f = pcx.closures[c].f;
@@ -972,7 +1052,14 @@ pub fn closure_call(n: i64, ty: i64, pcx: inout Ctx<Comp>) -> i64 {
         err_int(count, pcx);
         err_end(&pcx);
     }
-    let callee = pcx.nodes[n].a;
+    var callee = pcx.nodes[n].a;
+    if through {
+        let u = new_node(NodeKind::Unary, pcx.nodes[callee].start, pcx.nodes[callee].end, &pcx);
+        pcx.nodes[u].op = Tok::Star;
+        pcx.nodes[u].b = callee;
+        pcx.nodes[u].ty = ty;
+        callee = u;
+    }
     if (pcx.nodes[pcx.closures[c].node].c & CLOSURE_MOVE) != 0 && pcx.closures[c].writes {
         // (0.25) a sink closure that changes what it owns (FnMut): a
         // call changes the closure, which must be mutable: a var, an
@@ -1004,16 +1091,36 @@ pub fn closure_call(n: i64, ty: i64, pcx: inout Ctx<Comp>) -> i64 {
     pcx.types[sig].a
 }
 
+// RULE: F19.3 The fn type a non-capturing closure becomes where fn type
+// `expected` is wanted: `expected` itself for a vole `fn(..)`, its safe
+// twin for an `unsafe fn(..)` (the closure's function is safe; the value
+// then coerces, as a fn item does); 0 for no fn type or a C one.
+fn closure_fn_target(expected: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if expected <= 0 || pcx.types[expected].kind != TyKind::Fn
+        || (pcx.types[expected].b & FN_TY_C) != 0 {
+        return 0;
+    }
+    if (pcx.types[expected].b & FN_TY_UNSAFE) == 0 {
+        return expected;
+    }
+    let mark = pcx.tscratch.count;
+    for i in 0..pcx.types[expected].count {
+        pcx.tscratch.push(type_elem(expected, i, pcx));
+    }
+    make_type(TyKind::Fn, pcx.types[expected].a, pcx.types[expected].b & ~FN_TY_UNSAFE, mark, &pcx)
+}
+
 // Expression n, of a closure type, where fn type `expected` is wanted:
 // whether it coerces (a non-capturing closure becomes its function). A
 // capturing closure is an error.
 pub fn coerce_closure(n: i64, expected: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        if expected <= 0 || pcx.types[expected].kind != TyKind::Fn || pcx.types[expected].b != 0 {
+        let target = closure_fn_target(expected, &pcx);
+        if target == 0 {
             return false;
         }
         let c = closure_of_type(pcx.nodes[n].ty, pcx) - 1;
-        if c < 0 || pcx.closures[c].sig != expected {
+        if c < 0 || pcx.closures[c].sig != target {
             return false;
         }
         if pcx.closures[c].capture_count > 0 {

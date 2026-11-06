@@ -7,13 +7,16 @@
 // where it is written). Each rewrites the node in place, as the checker's
 // other desugarings do, and the caller checks it again.
 
-use crate::base::intern_c;
+use crate::base::{SRC, cstr, intern_c, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
-use crate::front::ast::{NodeKind, list_begin, list_end, list_push, new_node};
+use crate::base::diag::{
+    err_begin, err_end, err_end_soft, err_fmt, err_help, err_help_fmt, err_str, err_try_fmt,
+};
+use crate::front::ast::{NodeKind, child, list_begin, list_end, list_push, new_node};
 use crate::front::check::calls::method_of;
 use crate::front::lexer::Tok;
-use crate::front::types::{REF_MUT, TyKind, fn_param};
+use crate::front::types::{REF_MUT, REF_SHARED, TY_U8, TyKind, err_type, fn_param, ref_to};
 
 // Whether node n is read in the rust edition.
 pub fn rust_node(n: i64, pcx: inout Ctx<Comp>) -> bool {
@@ -109,16 +112,209 @@ pub fn deref_receiver(n: i64, t: i64, name: i64, pcx: inout Ctx<Comp>) -> bool {
     }
     let m = method_of(target, name, pcx);
     let mutable = m >= 0 && pcx.fns.len() as i64 > m && fn_param_count(m, pcx) > 0
-        && pcx.types[fn_param(m, 0, pcx)].kind == TyKind::Ptr
-        && pcx.types[fn_param(m, 0, pcx)].b == REF_MUT;
+        && (pcx.types[fn_param(m, 0, pcx)].kind == TyKind::Ptr
+            && pcx.types[fn_param(m, 0, pcx)].b == REF_MUT
+            // (0.27.2: `&mut self` of str, `&mut str`; RULE: F0.1)
+            || crate::front::types::is_mut_slice(fn_param(m, 0, pcx), pcx))
+        // (a template's signature is not resolved: its written `&mut self`)
+        || m >= 0 && pcx.fns[m].generic > 0 && pcx.fns[m].node > 0
+        && pcx.nodes[pcx.fns[m].node].count > 0
+        && (pcx.nodes[pcx.nodes[child(pcx.fns[m].node, 0, pcx)].b].p
+            & crate::front::ast::NODE_REF_MUT) != 0;
     let e = pcx.nodes[n].a;
     let call = method_call(e, if mutable && has_method(t, c"deref_mut", &pcx) { c"deref_mut" }
         else { c"deref" }, 0, &pcx);
+    // (a view target: `e.deref()` is the view, no `*`)
+    if pcx.types[target].kind == TyKind::Slice
+        || crate::front::distinct::is_view_distinct(target, pcx) {
+        pcx.nodes[n].a = call;
+        return true;
+    }
     let u = new_node(NodeKind::Unary, pcx.nodes[e].start, pcx.nodes[e].end, &pcx);
     pcx.nodes[u].op = Tok::Star;
     pcx.nodes[u].b = call;
     pcx.nodes[n].a = u;
     true
+}
+
+// RULE: F6.2 (the probe's `&` and `&mut` steps) A method `name` that the
+// receiver's type t does not have, at method call n, which `&t` or
+// `&mut t` has (`impl Tr for &S` with `fn m(self)`): the receiver
+// becomes `&e` (`&mut e`); true when rewritten.
+pub fn autoref_receiver(n: i64, t: i64, name: i64, pcx: inout Ctx<Comp>) -> bool {
+    if t <= 0 || pcx.types[t].kind == TyKind::Ptr {
+        return false;
+    }
+    for mode in [REF_SHARED, REF_MUT] {
+        let r = ref_to(t, mode, &pcx);
+        let f = method_of(r, name, pcx);
+        // (a method of `&t`'s that takes `&self` or `&mut self` has the
+        // receiver `&&t`, which one autoref does not reach: rustc E0599)
+        if f >= 0 && !self_behind(f, r, pcx) {
+            let e = pcx.nodes[n].a;
+            let u = new_node(NodeKind::Unary, pcx.nodes[e].start, pcx.nodes[e].end, &pcx);
+            pcx.nodes[u].op = Tok::Amp;
+            pcx.nodes[u].b = e;
+            if mode == REF_MUT {
+                pcx.nodes[u].p |= crate::front::ast::NODE_REF_MUT;
+            }
+            pcx.nodes[n].a = u;
+            return true;
+        }
+    }
+    false
+}
+
+// RULE: F6.2 Whether method f of type r takes its receiver behind a
+// reference (`&self`, `&mut self`: of type `&r`, `&mut r`).
+fn self_behind(f: i64, r: i64, pcx: Ctx<Comp>) -> bool {
+    if pcx.fns[f].param_count == 0 {
+        return false;
+    }
+    let p = fn_param(f, 0, pcx);
+    p > 0 && pcx.types[p].kind == TyKind::Ptr && pcx.types[p].a == r
+}
+
+// RULE: F6.2 The step of rustc's method probe at which method f of type x
+// is found for a receiver of type t0: with τ₀ = t0 and τₖ₊₁ the referent
+// of τₖ, 3k when f's receiver type (its `self` parameter's: x, `&x` or
+// `&mut x`) is τₖ, 3k + 1 when it is `&τₖ`, 3k + 2 when `&mut τₖ`. -1 when
+// it is none of them through references (a `Deref` target, a view: the
+// probe's other steps, which decide nothing here).
+pub fn probe_step(f: i64, x: i64, t0: i64, pcx: Ctx<Comp>) -> i64 {
+    if f < 0 || x <= 0 || pcx.fns[f].param_count == 0 {
+        return -1;
+    }
+    let p = fn_param(f, 0, pcx);
+    if !(p == x || crate::front::types::is_ref(p, pcx) && pcx.types[p].a == x) {
+        return -1;
+    }
+    var tau = t0;
+    for k in 0..MAX_PROBE_DEREFS {
+        if p == tau {
+            return 3 * k;
+        }
+        if crate::front::types::is_ref(p, pcx) && pcx.types[p].a == tau {
+            return 3 * k + if pcx.types[p].b == REF_MUT { 2 } else { 1 };
+        }
+        if !crate::front::types::is_ref(tau, pcx) {
+            return -1;
+        }
+        tau = pcx.types[tau].a;
+    }
+    -1
+}
+
+// The references probe_step reads through.
+const MAX_PROBE_DEREFS: i64 = 16;
+
+// RULE: F6.2 Of method a of type xa and method b of type xb (both named
+// `name`, for call n whose receiver has type t0), the one rustc's probe
+// finds first: the earlier step (probe_step), and at one step the
+// inherent one; two trait methods at one step are error method.ambiguous
+// (rustc E0034), and a is kept. -1 when either step is unknown: the
+// caller's order stands.
+pub fn probe_first(n: i64, a: i64, xa: i64, b: i64, xb: i64, t0: i64, name: i64,
+    pcx: inout Ctx<Comp>) -> i64 {
+    let sa = probe_step(a, xa, t0, pcx);
+    let sb = probe_step(b, xb, t0, pcx);
+    if sa < 0 || sb < 0 {
+        return -1;
+    }
+    if sa != sb {
+        return if sa < sb { a } else { b };
+    }
+    let a_inherent = crate::front::traits::impl_of_fn(a, pcx) < 0;
+    let b_inherent = crate::front::traits::impl_of_fn(b, pcx) < 0;
+    if a_inherent != b_inherent {
+        return if a_inherent { a } else { b };
+    }
+    let saved_kind = pcx.err_kind;
+    pcx.err_kind = c"method.ambiguous";
+    err_begin(pcx.nodes[n].start, &pcx);
+    let ta = pcx.traits[pcx.traits_impls[crate::front::traits::impl_of_fn(a, pcx)].tr].name;
+    let tb = pcx.traits[pcx.traits_impls[crate::front::traits::impl_of_fn(b, pcx)].tr].name;
+    err_fmt(format_args("multiple applicable items: '{}' of trait '{}' and of trait '{}' take \
+        one receiver type", sym_text(name, pcx), sym_text(ta, pcx), sym_text(tb, pcx)), pcx);
+    err_help_fmt(format_args("call it through its trait to say which: `{}::{}(..)` or `{}::{}(..)`",
+        sym_text(ta, pcx), sym_text(name, pcx), sym_text(tb, pcx), sym_text(name, pcx)), pcx);
+    err_end(&pcx);
+    pcx.err_kind = saved_kind;
+    a
+}
+
+// RULE: F6.2 Method f0 of type t, for call n whose receiver (of type
+// t0) is a t by value: when a by-value method of `&t` or `&mut t` comes
+// before it in rustc's probe (`s.c()` with `fn c(&mut self)` on S and
+// `impl C for &S { fn c(self) }`: the `&S` step is earlier), the receiver
+// becomes `&e` (`&mut e`); true when rewritten.
+pub fn autoref_first(n: i64, f0: i64, t: i64, t0: i64, name: i64, pcx: inout Ctx<Comp>) -> bool {
+    for mode in [REF_SHARED, REF_MUT] {
+        let r = ref_to(t, mode, &pcx);
+        let g = method_of(r, name, pcx);
+        if g >= 0 && !self_behind(g, r, pcx) && probe_first(n, f0, t, g, r, t0, name, &pcx) == g {
+            let e = pcx.nodes[n].a;
+            let u = new_node(NodeKind::Unary, pcx.nodes[e].start, pcx.nodes[e].end, &pcx);
+            pcx.nodes[u].op = Tok::Amp;
+            pcx.nodes[u].b = e;
+            if mode == REF_MUT {
+                pcx.nodes[u].p |= crate::front::ast::NODE_REF_MUT;
+            }
+            pcx.nodes[n].a = u;
+            return true;
+        }
+    }
+    false
+}
+
+// RULE: F21.2 (Z9's type side) A value of an unsized type, `[T]` or
+// `str` written bare (not behind `&`, `*const`, `*mut` or as a generic
+// argument), at type node t of a rust-edition position where a value
+// goes (`what`: a parameter, a result, a field, a `let`), also as a
+// tuple's or an array's element: error type.unsized (rustc E0277).
+pub fn check_sized(t: i64, what: *u8, pcx: inout Ctx<Comp>) {
+    if t == 0 || !crate::front::rust::rust_at(pcx.nodes[t].start, &pcx) {
+        return;
+    }
+    let k = pcx.nodes[t].kind;
+    if k == NodeKind::TyTuple {
+        for i in 0..pcx.nodes[t].count {
+            check_sized(crate::front::ast::child(t, i, pcx), c"a tuple's element", &pcx);
+        }
+        return;
+    }
+    if k == NodeKind::TyArray {
+        check_sized(pcx.nodes[t].a, c"an array's element", &pcx);
+        return;
+    }
+    // (as written: a generated item's nodes, spanning its attribute, are not)
+    let written = SRC[pcx.nodes[t].start..pcx.nodes[t].end];
+    let slice = k == NodeKind::TySlice && written.len() > 0 && written[0] == '[';
+    let text = k == NodeKind::TyName && written == "str";
+    if !slice && !text {
+        return;
+    }
+    let saved_kind = pcx.err_kind;
+    pcx.err_kind = c"type.unsized";
+    err_begin(pcx.nodes[t].start, &pcx);
+    err_fmt(format_args("the size of '{written}' cannot be known: {} holds its value",
+        cstr(what)), pcx);
+    err_help(c"a slice or a str is used behind a reference or a pointer", pcx);
+    err_try_fmt(format_args("&{written}"), pcx);
+    err_end_soft(&pcx);
+    pcx.err_kind = saved_kind;
+}
+
+// RULE: F19.3 Whether a value of fn type `actual` where `expected` is
+// wanted is a safe fn where the same `unsafe fn` type is (`fn(A) -> R` to
+// `unsafe fn(A) -> R`): it coerces, the pointer as it is. The reverse is
+// a mismatch.
+pub fn coerce_unsafe_fn(actual: i64, expected: i64, pcx: inout Ctx<Comp>) -> bool {
+    actual > 0 && expected > 0 && pcx.types[actual].kind == TyKind::Fn
+        && pcx.types[expected].kind == TyKind::Fn
+        && crate::front::types::fn_ty_unsafe(expected, pcx)
+        && !crate::front::types::fn_ty_unsafe(actual, pcx)
+        && crate::front::types::fn_ty_with_unsafe(actual, &pcx) == expected
 }
 
 // The number of parameters of function f (0 <= f < the table's length).
@@ -135,6 +331,27 @@ fn deref_target(t: i64, pcx: inout Ctx<Comp>) -> i64 {
     let r = pcx.fns[f].ret;
     if r > 0 && pcx.types[r].kind == TyKind::Ptr {
         return pcx.types[r].a;
+    }
+    // RULE: F6.2, F20.2 (0.27.2: `Deref<Target = [T]>`'s `&[T]`, `&str`: the
+    // view, its own reference until Z9.1)
+    if r > 0
+        && (pcx.types[r].kind == TyKind::Slice || crate::front::distinct::is_view_distinct(r, pcx)) {
+        return r;
+    }
+    // (a generic impl's template, `impl<T, A> Deref for Vec<T, A>`, has no
+    // signature resolved: its written result, `&[T]` or `&str`, says which
+    // view; a view's methods do not depend on its element type)
+    let fnode = pcx.fns[f].node;
+    var rn = if fnode > 0 { pcx.nodes[fnode].b } else { 0 };
+    // (`&[T]` is parsed as the view itself, a TySlice node)
+    if rn > 0 && pcx.nodes[rn].kind == NodeKind::TyPtr {
+        rn = pcx.nodes[rn].a;
+    }
+    if crate::front::check::resolve::written_unsized(rn, pcx) {
+        if pcx.nodes[rn].kind == NodeKind::TySlice {
+            return crate::front::types::slice_of(TY_U8, &pcx);
+        }
+        return pcx.str_type;
     }
     0
 }
@@ -271,4 +488,99 @@ pub fn std_by_value_error(n: i64, t: i64, pcx: inout Ctx<Comp>) -> ! {
     crate::base::diag::err_end_soft(&pcx);
     pcx.err_kind = saved;
     crate::base::diag::err_jump(&pcx)
+}
+
+// ---- Tuple structs and unit structs (0.27.2) ----
+
+// The key tuple_struct_call and unit_struct_value read as `Self`.
+pub const SELF_KEY: i64 = -2;
+
+// The struct node of `Self` in an impl whose self type is a struct, or 0.
+// RULE: F5.4
+pub fn self_struct_node(pcx: Ctx<Comp>) -> i64 {
+    let t = pcx.self_type;
+    if t <= 0 || pcx.types[t].kind != TyKind::Struct {
+        return 0;
+    }
+    pcx.structs[pcx.types[t].a].node
+}
+
+// The struct node the item key names (SELF_KEY: `Self`'s), or 0.
+pub fn struct_node_of_key(key: i64, pcx: Ctx<Comp>) -> i64 {
+    if key == SELF_KEY {
+        return self_struct_node(pcx);
+    }
+    if key < 0 {
+        return 0;
+    }
+    // UNSAFE: SYM_STRUCT is a raw table indexed by item key (base/ctx.vl),
+    // as every reader of it.
+    // SAFETY: key is an item key (type_name_key's, >= 0), within the table
+    // sym_table sized for every symbol.
+    let s = unsafe { pcx.sym_struct[key] };
+    if s == 0 { 0 } else { pcx.structs[s - 1].node }
+}
+
+// Whether struct node s is a tuple struct (its fields named 0, 1, ..).
+pub fn is_tuple_struct(s: i64, pcx: inout Ctx<Comp>) -> bool {
+    s != 0 && pcx.nodes[s].count > 0
+        && pcx.nodes[crate::front::ast::child(s, 0, pcx)].a == intern_c(c"0", &pcx)
+}
+
+// Node n becomes the literal `name { 0: e0, 1: e1, .. }` of its
+// expressions SCRATCH[mark..] (popped), with type arguments g.
+fn become_struct_lit(n: i64, name: i64, g: i64, mark: i64, pcx: inout Ctx<Comp>) {
+    let count = pcx.scratch.count - mark;
+    let inits = list_begin(pcx);
+    for k in 0..count {
+        let e = pcx.scratch.get(mark + k);
+        let init = new_node(NodeKind::FieldInit, pcx.nodes[e].start, pcx.nodes[e].end, &pcx);
+        let field = crate::base::buf_new();
+        crate::base::buf_fmt(field, format_args("{k}"));
+        pcx.nodes[init].a = crate::base::intern(crate::base::buf_slice(field), &pcx);
+        pcx.nodes[init].b = e;
+        list_push(init, &pcx);
+    }
+    // (the inits after the expressions in SCRATCH: moved down over them)
+    for k in 0..count {
+        pcx.scratch.set(mark + k, pcx.scratch.get(inits + k));
+    }
+    pcx.scratch.count = mark + count;
+    let start = pcx.nodes[n].start;
+    let end = pcx.nodes[n].end;
+    pcx.nodes[n] = pcx.nodes[0];
+    pcx.nodes[n].kind = NodeKind::StructLit;
+    pcx.nodes[n].start = start;
+    pcx.nodes[n].end = end;
+    pcx.nodes[n].a = name;
+    pcx.nodes[n].g = g;
+    list_end(n, mark, &pcx);
+}
+
+// `S(a, b)` of the rust edition, S a tuple struct (callee an Ident naming
+// it): call n becomes the literal `S { 0: a, 1: b }`; true. RULE: F7.2
+pub fn tuple_struct_call(n: i64, key: i64, pcx: inout Ctx<Comp>) -> bool {
+    let s = struct_node_of_key(key, pcx);
+    if !is_tuple_struct(s, &pcx) || !rust_node(n, &pcx) {
+        return false;
+    }
+    let callee = pcx.nodes[n].a;
+    let mark = list_begin(pcx);
+    for k in 0..pcx.nodes[n].count {
+        list_push(crate::front::ast::child(n, k, pcx), &pcx);
+    }
+    become_struct_lit(n, pcx.nodes[callee].a, pcx.nodes[callee].g, mark, &pcx);
+    true
+}
+
+// `U` of the rust edition, U a struct with no fields (Ident n): n becomes
+// the literal `U {}`; true. RULE: F7.3
+pub fn unit_struct_value(n: i64, key: i64, pcx: inout Ctx<Comp>) -> bool {
+    let s = struct_node_of_key(key, pcx);
+    if s == 0 || pcx.nodes[s].count != 0 || !rust_node(n, &pcx) {
+        return false;
+    }
+    let mark = list_begin(pcx);
+    become_struct_lit(n, pcx.nodes[n].a, pcx.nodes[n].g, mark, &pcx);
+    true
 }

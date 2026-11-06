@@ -11,11 +11,11 @@ use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{
     buf_file_line, err_begin, err_end, err_end_soft, err_fix, err_help, err_help_fmt, err_help_sym,
-    err_int, err_str, err_sym, err_try_tool, error_at, error_at_soft,
+    err_int, err_jump, err_str, err_sym, err_try_tool, error_at, error_at_soft,
 };
 use crate::front::ast::{
-    FN_COLD, FN_EFFECT_DECL, FN_INLINE, FN_NO_INLINE, FN_SIG_FAILED, FN_UNSAFE, NodeKind, REPR_C,
-    REPR_INT, child,
+    FN_COLD, FN_EFFECT_DECL, FN_INLINE, FN_NO_INLINE, FN_SIG_FAILED, FN_UNSAFE, NODE_REF_MUT,
+    NodeKind, REPR_C, REPR_INT, child,
 };
 use crate::front::ast::NodeKind::{
     CStr, Const, Enum, ExternFn, Fn, Impl, Mod, Static, Str, Struct, Trait, TyArray, TyName,
@@ -32,7 +32,7 @@ use crate::front::contracts::is_distinct;
 use crate::front::convert::{generic_trait_impl, impl_fn_symbol};
 use crate::front::distinct::is_view_distinct;
 use crate::front::generics::{
-    TPL_DISTINCT, TPL_NONE, TPL_SLICE, env_lookup, template_name, template_of_key,
+    TPL_DISTINCT, TPL_NONE, TPL_PATTERN, TPL_SLICE, env_lookup, template_name, template_of_key,
 };
 use crate::front::modules::{child_module, file_of_pos, item_symbol, join_sym, module_of, qualify};
 use crate::front::parser::items::ITEM_PUBLIC;
@@ -153,7 +153,9 @@ pub fn collect_name(item: i64, pcx: inout Ctx<Comp>) {
         if child_module(m, name, pcx) >= 0 {
             duplicate_error(item, c"name (a module has it)", &pcx);
         }
-        if name == intern_c(c"size_of", &pcx) || name == intern_c(c"align_of", &pcx) {
+        // (0.27.2: the rust edition's are std2's mem functions, F19.4)
+        if (name == intern_c(c"size_of", &pcx) || name == intern_c(c"align_of", &pcx))
+            && !(pcx.edition != 0 && crate::front::rust::rust_at(pcx.nodes[item].start, &pcx)) {
             name_error(pcx.nodes[item].start, c"'", name,
                 c"' is a builtin (size_of(T) and align_of(T)); choose another name", &pcx);
         }
@@ -368,6 +370,11 @@ pub fn collect_struct_fields(s: i64, pcx: inout Ctx<Comp>) {
                 }
             }
             let ty = resolve_type_or_error(pcx.nodes[field].b, &pcx);
+            // RULE: F21.2 (the rust edition: no field of an unsized type;
+            // an unsized last field is 0.29's)
+            if pcx.edition != 0 {
+                crate::front::check::rust::check_sized(pcx.nodes[field].b, c"a field", &pcx);
+            }
             pcx.tscratch.push(ty);
         }
         // Instances made while resolving the types added fields of their own:
@@ -593,6 +600,22 @@ pub fn collect_method(f: i64, pcx: inout Ctx<Comp>) {
         // From<i64> for T`, has no name in the type: generic_trait_call
         // finds it; its symbol is its impl's)
         let gt = generic_trait_impl(impl_of_fn(f, pcx), pcx);
+        if tpl == TPL_PATTERN {
+            // RULE: F5.1, F4.1 (a pattern impl's method: pattern_method_of
+            // finds it by its header; its symbol is its header's node)
+            let out = buf_new();
+            buf_fmt(out, format_args("P{self_node}"));
+            pcx.fns[f].name = method_symbol(intern(buf_slice(out), &pcx), name, &pcx);
+            let shown = buf_new();
+            buf_bytes(shown, SRC[pcx.nodes[self_node].start..pcx.nodes[self_node].end]);
+            pcx.fns[f].display = join_sym(intern(buf_slice(shown), &pcx), c"::", name, &pcx);
+            if gt >= 0 {
+                pcx.fns[f].name = impl_fn_symbol(pcx.fns[f].name, gt, &pcx);
+                return;
+            }
+            gm_push(MethodInfo { ty: TPL_PATTERN, name: name, f: f }, &pcx);
+            return;
+        }
         if tpl != TPL_NONE && gt >= 0 {
             let base = if tpl == TPL_SLICE { intern_c(c"TS", &pcx) }
                 else if tpl >= TPL_DISTINCT { distinct_tpl_symbol(tpl, &pcx) }
@@ -602,25 +625,49 @@ pub fn collect_method(f: i64, pcx: inout Ctx<Comp>) {
             return;
         }
         if tpl != TPL_NONE {
-            for i in 0..pcx.gmethods.len() as i64 {
-                if pcx.gmethods[i].ty == tpl && pcx.gmethods[i].name == name {
+            var clash = false;
+            var i = gm_start(tpl, name, pcx);
+            while i >= 0 {
+                let at = i;
+                i = gm_after(i, pcx);
+                // RULE: F9.1 (0.27.2: two traits' methods of one name, or a
+                // trait's and an inherent one, on one template: a symbol of
+                // its own, below; the call site chooses)
+                if pcx.gmethods[at].ty == tpl && pcx.gmethods[at].name == name
+                    && crate::front::rust::rust_at(pcx.nodes[item].start, &pcx)
+                    && (impl_of_fn(f, pcx) >= 0 || impl_of_fn(pcx.gmethods[at].f, pcx) >= 0)
+                    && impl_of_fn(f, pcx) != impl_of_fn(pcx.gmethods[at].f, pcx) {
+                    clash = true;
+                    continue;
+                }
+                if pcx.gmethods[at].ty == tpl && pcx.gmethods[at].name == name {
+                    let saved_kind = pcx.err_kind;
+                    // RULE: F5.3 (the rust edition: rustc E0592)
+                    if crate::front::rust::rust_at(pcx.nodes[item].start, &pcx) {
+                        pcx.err_kind = c"impl.duplicate";
+                    }
                     err_begin(pcx.nodes[item].start, &pcx);
                     err_str(c"duplicate method '", pcx);
                     err_sym(name, pcx);
                     err_str(c"' for type '", pcx);
                     err_sym(template_name(tpl, &pcx), pcx);
                     err_str(c"'", pcx);
-                    err_end(&pcx);
+                    err_end_soft(&pcx);
+                    pcx.err_kind = saved_kind;
+                    err_jump(&pcx);
                 }
             }
             if tpl < 0 && template_variant_named(-tpl - 1, name, pcx) {
                 variant_and_method_error(item, template_name(tpl, &pcx), &pcx);
             }
-            pcx.gmethods.push(MethodInfo { ty: tpl, name: name, f: f });
+            gm_push(MethodInfo { ty: tpl, name: name, f: f }, &pcx);
             let base = if tpl == TPL_SLICE { intern_c(c"TS", &pcx) }
                 else if tpl >= TPL_DISTINCT { distinct_tpl_symbol(tpl, &pcx) }
                 else if tpl > 0 { pcx.structs[tpl - 1].sym } else { ENUMS[-tpl - 1].sym };
             pcx.fns[f].name = method_symbol(base, name, &pcx);
+            if clash {
+                pcx.fns[f].name = impl_fn_symbol(pcx.fns[f].name, impl_of_fn(f, pcx), &pcx);
+            }
             pcx.fns[f].display = join_sym(template_name(tpl, &pcx), c"::", name, &pcx);
             return;
         }
@@ -634,14 +681,27 @@ pub fn collect_method(f: i64, pcx: inout Ctx<Comp>) {
         let t = resolve_type(self_node, &pcx);
         let kind = pcx.types[t].kind;
         if kind != TyKind::Struct && kind != TyKind::Enum && kind != TyKind::Distinct
-            && impl_of_fn(f, pcx) < 0 {
+            && impl_of_fn(f, pcx) < 0
+            && !crate::front::rust::rust_at(pcx.nodes[item].start, &pcx) {
             err_begin(pcx.nodes[item].start, &pcx);
             err_str(c"impl blocks are only allowed for structs and enums, not '", pcx);
             err_type(t, pcx);
             err_str(c"'", pcx);
             err_end(&pcx);
         }
-        if find_method(t, name, pcx) >= 0 && gt < 0 {
+        let first_f = find_method(t, name, pcx);
+        // RULE: F9.1 (0.27.2: two traits' methods of one name, or a trait's
+        // and an inherent one, on one type: find_method prefers the inherent
+        // one, the call site chooses among the traits')
+        let clash_ok = first_f >= 0 && crate::front::rust::rust_at(pcx.nodes[item].start, &pcx)
+            && (impl_of_fn(f, pcx) >= 0 || impl_of_fn(first_f, pcx) >= 0)
+            && impl_of_fn(f, pcx) != impl_of_fn(first_f, pcx);
+        if first_f >= 0 && gt < 0 && !clash_ok {
+            let saved_kind = pcx.err_kind;
+            // RULE: F5.3 (the rust edition: rustc E0592)
+            if crate::front::rust::rust_at(pcx.nodes[item].start, &pcx) {
+                pcx.err_kind = c"impl.duplicate";
+            }
             err_begin(pcx.nodes[item].start, &pcx);
             err_str(c"duplicate method '", pcx);
             err_sym(name, pcx);
@@ -659,7 +719,9 @@ pub fn collect_method(f: i64, pcx: inout Ctx<Comp>) {
                 buf_file_line(a, pcx.nodes[item].start, &pcx);
                 err_try_tool(buf_slice(a), true, pcx);
             }
-            err_end(&pcx);
+            err_end_soft(&pcx);
+            pcx.err_kind = saved_kind;
+            err_jump(&pcx);
         }
         if kind == TyKind::Enum && find_variant(pcx.types[t].a, name, pcx) >= 0 && gt < 0 {
             let out = buf_new();
@@ -678,6 +740,11 @@ pub fn collect_method(f: i64, pcx: inout Ctx<Comp>) {
         if gt >= 0 {
             pcx.fns[f].name = impl_fn_symbol(pcx.fns[f].name, gt, &pcx);
             return;
+        }
+        // RULE: F9.1 (a second method of the name, of another impl: a
+        // symbol of its own, by its impl)
+        if clash_ok {
+            pcx.fns[f].name = impl_fn_symbol(pcx.fns[f].name, impl_of_fn(f, pcx), &pcx);
         }
         pcx.methods.push(MethodInfo { ty: t, name: name, f: f });
     }
@@ -712,12 +779,16 @@ fn impl_template(item: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         let self_node = pcx.nodes[item].h;
         let tpl = template_of_type_node(self_node, &pcx);
-        if tpl == TPL_NONE {
-            // (0.14: `impl<T> [T]`)
-            return slice_template(self_node, pcx.nodes[item].g, &pcx);
-        }
         let params = pcx.nodes[item].g;
         let impl_count = if params == 0 { 0 } else { pcx.nodes[params].a };
+        // RULE: F5.1 (0.27.2: the rust edition's impl on any other header is
+        // a pattern impl: `impl<'a, T> Option<&'a T>`, `impl<T> *const T`)
+        let pattern = impl_count > 0 && crate::front::rust::rust_at(pcx.nodes[item].start, &pcx);
+        if tpl == TPL_NONE {
+            // (0.14: `impl<T> [T]`)
+            let s = slice_template(self_node, params, &pcx);
+            return if s == TPL_NONE && pattern { TPL_PATTERN } else { s };
+        }
         if impl_count == 0 {
             // `impl Vec<i64>`: methods of one instance.
             return TPL_NONE;
@@ -729,6 +800,9 @@ fn impl_template(item: i64, pcx: inout Ctx<Comp>) -> i64 {
         if g != 0 && pcx.nodes[g].count < full && pcx.nodes[g].count == impl_count {
             impl_args_error(item, self_node, tpl, params, &pcx);
         }
+        if pattern && (g == 0 || pcx.nodes[g].count != impl_count) {
+            return TPL_PATTERN;
+        }
         if g == 0 || pcx.nodes[g].count != impl_count {
             error_at(pcx.nodes[self_node].start, c"a generic impl block is for its type with its parameters as arguments: 'impl<T> Vec<T>'", &pcx);
         }
@@ -737,6 +811,9 @@ fn impl_template(item: i64, pcx: inout Ctx<Comp>) -> i64 {
             if pcx.nodes[arg].kind != TyName
                 || pcx.nodes[arg].a != pcx.nodes[child(params, i, pcx)].a
                 || pcx.nodes[arg].g != 0 {
+                if pattern {
+                    return TPL_PATTERN;
+                }
                 error_at(pcx.nodes[arg].start, c"a generic impl block is for its type with its parameters as arguments, in order: 'impl<T> Vec<T>'", &pcx);
             }
         }
@@ -802,10 +879,21 @@ pub fn slice_template(n: i64, params: i64, pcx: inout Ctx<Comp>) -> i64 {
         return TPL_NONE;
     }
     let elem = pcx.nodes[n].a;
+    // (0.27.2: the rust edition's `impl<'a, T> Tr for &'a mut [T]` is a
+    // pattern impl, apart from `&'a [T]`'s, F6.1)
+    if (pcx.nodes[n].p & NODE_REF_MUT) != 0
+        && crate::front::rust::rust_at(pcx.nodes[n].start, &pcx) {
+        return TPL_NONE;
+    }
     let impl_count = if pcx.nodes[params].a != 0 { pcx.nodes[params].a }
         else { pcx.nodes[params].count };
     if impl_count != 1 || pcx.nodes[elem].kind != TyName || pcx.nodes[elem].count != 0
         || pcx.nodes[elem].g != 0 || pcx.nodes[elem].a != pcx.nodes[child(params, 0, pcx)].a {
+        // (0.27.2: the rust edition's `impl<T, I> Index<I> for [T]` is a
+        // pattern impl, F4.1)
+        if crate::front::rust::rust_at(pcx.nodes[n].start, &pcx) {
+            return TPL_NONE;
+        }
         error_at(pcx.nodes[n].start,
             c"a generic impl for slices is for '[T]', T its only parameter: 'impl<T> [T]'", &pcx);
     }
@@ -830,14 +918,58 @@ pub fn template_of_type_node(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     tpl
 }
 
-// The method template `name` of template tpl, or -1.
+// The method template `name` of template tpl, or -1. (0.27.2: of several,
+// an inherent one first, else the first; a second one exists in the rust
+// edition only, F9.1)
 pub fn find_generic_method(tpl: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
-    for i in 0..pcx.gmethods.len() as i64 {
+    var first = -1;
+    var i = gm_start(tpl, name, pcx);
+    while i >= 0 {
         if pcx.gmethods[i].ty == tpl && pcx.gmethods[i].name == name {
-            return pcx.gmethods[i].f;
+            if first < 0 {
+                first = pcx.gmethods[i].f;
+            }
+            if crate::front::traits::impl_of_fn(pcx.gmethods[i].f, pcx) < 0 {
+                return pcx.gmethods[i].f;
+            }
         }
+        i = gm_after(i, pcx);
     }
-    -1
+    first
+}
+
+// (0.27.2) GMETHODS by (template, name): std2's thousands of method
+// templates (its traits' defaults copied into every impl) made each
+// method's duplicate scan, and each call's lookup, linear in all of them.
+// A key may be two pairs' (gm_key mixes them): its readers compare both.
+fn gm_key(tpl: i64, name: i64) -> i64 {
+    let k = tpl ^ ((name & 1048575) << 43);
+    if k == 0 { 1 } else { k }
+}
+
+// Pushes a method template onto GMETHODS, indexed.
+pub fn gm_push(info: MethodInfo, pcx: inout Ctx<Comp>) {
+    let i = pcx.gmethods.len() as i64;
+    let key = gm_key(info.ty, info.name);
+    pcx.gmethods.push(info);
+    pcx.gm_next.push(0);
+    let last = pcx.gm_last.get(key);
+    if last == 0 {
+        pcx.gm_first.put(key, i + 1);
+    } else {
+        pcx.gm_next.set(last - 1, i + 1);
+    }
+    pcx.gm_last.put(key, i + 1);
+}
+
+// The first GMETHODS index whose key is (tpl, name)'s, or -1; then
+// gm_after's, in GMETHODS' order.
+pub fn gm_start(tpl: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
+    pcx.gm_first.get(gm_key(tpl, name)) - 1
+}
+
+pub fn gm_after(i: i64, pcx: Ctx<Comp>) -> i64 {
+    pcx.gm_next.get(i) - 1
 }
 
 pub fn collect_aliases(pcx: inout Ctx<Comp>) {

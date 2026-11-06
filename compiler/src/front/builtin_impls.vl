@@ -1,0 +1,806 @@
+// (0.27.2) `#[builtin_impls(P, ..)]` on a trait of the rust edition
+// (std2's): the impls of the trait for the primitives listed, made by the
+// compiler as if written (docs/design/front-rust.md F15.1). Each is
+// rust-edition text in the trait's shape, its body the machine operation
+// (`self + rhs`, `*self == *other`, a copy, a zero, the digits of a
+// number into the Formatter), parsed as one source `<builtin>` and given
+// the attribute's span: the impls are the trait's module's, read in the
+// rust edition, and an error in them points at the attribute. They are
+// keyed and overlap-checked as written ones (F4.2). A body the compiler
+// cannot write yet (a float's digits, a float's or a bool's FromStr) is
+// std2's placeholder `crate::panic::todo()`, which F16.3 replaces.
+// Parsed after the modules are loaded, before collect_names, as the
+// derives' (front/derive).
+
+use crate::base::{
+    BUFS, SRC, _setjmp, add_source, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, intern,
+    sym_text,
+};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::base::diag::{err_begin, err_end_soft, err_fmt, err_help, recover_enter, recover_leave};
+use crate::front::ast::{FN_DERIVED, NodeKind, child, list_begin, list_end, list_push};
+use crate::front::lexer::lex_range;
+use crate::front::parser::parse_items_fragment;
+use crate::middle::lower::ssa::HMap;
+
+// Text `t` into out with "`1".."`4" replaced by a1..a4.
+fn emit(out: i64, t: [u8], a1: [u8], a2: [u8], a3: [u8], a4: [u8]) {
+    var i = 0;
+    while i < t.len() as i64 {
+        let c = t[i];
+        if c == '`' && i + 1 < t.len() as i64 {
+            let k = t[i + 1];
+            if k == '1' {
+                buf_bytes(out, a1);
+            } else if k == '2' {
+                buf_bytes(out, a2);
+            } else if k == '3' {
+                buf_bytes(out, a3);
+            } else {
+                buf_bytes(out, a4);
+            }
+            i += 2;
+            continue;
+        }
+        buf_byte(out, c);
+        i += 1;
+    }
+}
+
+// The primitive's class: 1 a signed integer, 2 an unsigned one, 3 a
+// float, 4 bool, 0 another name.
+fn prim_class(p: [u8]) -> i64 {
+    if p == "i8" || p == "i16" || p == "i32" || p == "i64" || p == "isize" {
+        return 1;
+    }
+    if p == "u8" || p == "u16" || p == "u32" || p == "u64" || p == "usize" {
+        return 2;
+    }
+    if p == "f32" || p == "f64" {
+        return 3;
+    }
+    if p == "bool" { 4 } else { 0 }
+}
+
+// An integer's width in bits.
+fn prim_bits(p: [u8]) -> i64 {
+    if p == "i8" || p == "u8" {
+        8
+    } else if p == "i16" || p == "u16" {
+        16
+    } else if p == "i32" || p == "u32" {
+        32
+    } else {
+        64
+    }
+}
+
+// The unsigned integer of a signed one's width.
+fn unsigned_twin(p: [u8]) -> [u8] {
+    if p == "i8" {
+        "u8"
+    } else if p == "i16" {
+        "u16"
+    } else if p == "i32" {
+        "u32"
+    } else if p == "i64" {
+        "u64"
+    } else if p == "isize" {
+        "usize"
+    } else {
+        p
+    }
+}
+
+// 2^bits - 1 as a u64 expression (no step overflows).
+fn ones_text(out: i64, bits: i64) {
+    if bits >= 64 {
+        buf_bytes(out, "((1u64 << 63) + ((1u64 << 63) - 1))");
+    } else {
+        buf_fmt(out, format_args("((1u64 << {bits}) - 1)"));
+    }
+}
+
+const BIN_OPS: [[u8]; 10] = ["Add", "Sub", "Mul", "Div", "Rem", "BitAnd", "BitOr", "BitXor", "Shl",
+    "Shr"];
+const BIN_METHODS: [[u8]; 10] = ["add", "sub", "mul", "div", "rem", "bitand", "bitor", "bitxor",
+    "shl", "shr"];
+const BIN_SIGNS: [[u8]; 10] = ["+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>"];
+const BOOL_SIGNS: [[u8]; 10] = ["+", "-", "*", "/", "%", "&&", "||", "!=", "<<", ">>"];
+
+// The index of an operator trait (`Add`, or `AddAssign` when assign), or -1.
+fn op_index(name: [u8], assign: bool) -> i64 {
+    for i in 0..10 {
+        let op = BIN_OPS[i];
+        if !assign && name == op {
+            return i;
+        }
+        if assign && name.len() == op.len() + 6 && name[0..op.len()] == op
+            && name[op.len()..name.len()] == "Assign" {
+            return i;
+        }
+    }
+    -1
+}
+
+// The impl of trait `t` for primitive `p` into out; false when the
+// compiler has no builtin impl of the trait.
+fn write_impl(out: i64, t: [u8], p: [u8]) -> bool {
+    let class = prim_class(p);
+    let zero = if class == 3 { "0.0" } else if class == 4 { "false" } else { "0" };
+    let one = if class == 3 { "1.0" } else { "1" };
+    let a = if class == 4 { "(*self as u8)" } else { "*self" };
+    let b = if class == 4 { "(*other as u8)" } else { "*other" };
+    if t == "Copy" || t == "Eq" {
+        emit(out, "impl `1 for `2 {}\n", t, p, "", "");
+        return true;
+    }
+    if t == "Clone" {
+        emit(out, "impl Clone for `1 {\n    fn clone(&self) -> `1 {\n        *self\n    }\n}\n", p,
+            "", "", "");
+        return true;
+    }
+    if t == "Default" {
+        emit(out, "impl Default for `1 {\n    fn default() -> `1 {\n        `2\n    }\n}\n", p,
+            zero, "", "");
+        return true;
+    }
+    if t == "PartialEq" {
+        emit(out, "impl PartialEq for `1 {\n    fn eq(&self, other: &`1) -> bool {\n        \
+            *self == *other\n    }\n}\n", p, "", "", "");
+        return true;
+    }
+    if t == "PartialOrd" || t == "Ord" {
+        let o = "crate::cmp::Ordering";
+        if t == "Ord" {
+            emit(out, "impl Ord for `1 {\n    fn cmp(&self, other: &`1) -> `4 {\n        \
+                if `2 < `3 { `4::Less } else if `2 > `3 { `4::Greater } else { `4::Equal }\n    \
+                }\n}\n", p, a, b, o);
+            return true;
+        }
+        emit(out, "impl PartialOrd for `1 {\n    fn partial_cmp(&self, other: &`1) -> \
+            crate::option::Option<`4> {\n        if `2 < `3 {\n            \
+            crate::option::Option::Some(`4::Less)\n        } else if `2 > `3 {\n            \
+            crate::option::Option::Some(`4::Greater)\n        } else if `2 == `3 {\n            \
+            crate::option::Option::Some(`4::Equal)\n        } else {\n            \
+            crate::option::Option::None\n        }\n    }\n}\n", p, a, b, o);
+        return true;
+    }
+    if t == "Hash" {
+        let w = if class == 4 { "u8" } else { p };
+        emit(out, "impl Hash for `1 {\n    fn hash<H: crate::hash::Hasher>(&self, state: &mut H) \
+            {\n        state.write_`2(`3);\n    }\n}\n", p, w,
+            if class == 4 { "*self as u8" } else { "*self" }, "");
+        return true;
+    }
+    let bin = op_index(t, false);
+    if bin >= 0 {
+        let sign = if class == 4 { BOOL_SIGNS[bin] } else { BIN_SIGNS[bin] };
+        emit(out, "impl `1 for `2 {\n    type Output = `2;\n    fn `3(self, rhs: `2) -> `2 {\n        \
+            self ", t, p, BIN_METHODS[bin], "");
+        emit(out, "`1 rhs\n    }\n}\n", sign, "", "", "");
+        return true;
+    }
+    let asg = op_index(t, true);
+    if asg >= 0 {
+        let sign = if class == 4 { BOOL_SIGNS[asg] } else { BIN_SIGNS[asg] };
+        emit(out,
+            "impl `1 for `2 {\n    fn `3_assign(&mut self, rhs: `2) {\n        *self = *self ", t,
+            p, BIN_METHODS[asg], "");
+        emit(out, "`1 rhs;\n    }\n}\n", sign, "", "", "");
+        return true;
+    }
+    if t == "Neg" {
+        emit(out, "impl Neg for `1 {\n    type Output = `1;\n    fn neg(self) -> `1 {\n        \
+            -self\n    }\n}\n", p, "", "", "");
+        return true;
+    }
+    if t == "Not" {
+        // (`!` on an integer is not bitwise in vole: a xor with all ones)
+        let body = if class == 4 { "!self" } else { "self ^ (-1i64 as `1)" };
+        emit(out, "impl Not for `1 {\n    type Output = `1;\n    fn not(self) -> `1 {\n        ", p,
+            "", "", "");
+        emit(out, body, p, "", "", "");
+        buf_bytes(out, "\n    }\n}\n");
+        return true;
+    }
+    if t == "Sum" || t == "Product" {
+        let m = if t == "Sum" { "sum" } else { "product" };
+        emit(out, "impl `1 for `2 {\n    fn `3<I: crate::iter::Iterator<Item = `2>>(iter: I) -> `2 \
+            {\n        let mut it = iter;\n        let mut acc: `2 = ", t, p, m, "");
+        emit(out, "`1;\n        while let crate::option::Option::Some(x) = it.next() {\n            \
+            acc = acc `2 x;\n        }\n        acc\n    }\n}\n",
+            if t == "Sum" { zero } else { one }, if t == "Sum" { "+" } else { "*" }, "", "");
+        return true;
+    }
+    if t == "Step" {
+        write_step(out, p);
+        return true;
+    }
+    if t == "FromStr" {
+        write_from_str(out, p);
+        return true;
+    }
+    if t == "Display" || t == "Debug" || t == "LowerHex" || t == "UpperHex" || t == "Octal"
+        || t == "Binary" || t == "LowerExp" || t == "UpperExp" {
+        write_fmt(out, t, p);
+        return true;
+    }
+    false
+}
+
+// A u64 that orders as the integer x of type p does: the integer itself
+// for an unsigned one, its bits with the sign flipped for a signed one.
+fn key_text(out: i64, x: [u8], p: [u8]) {
+    if prim_class(p) == 1 {
+        emit(out, "((`1 as i64 as u64) ^ (1u64 << 63))", x, "", "", "");
+    } else {
+        emit(out, "(`1 as u64)", x, "", "", "");
+    }
+}
+
+fn write_step(out: i64, p: [u8]) {
+    let signed = prim_class(p) == 1;
+    let bits = prim_bits(p);
+    emit(out, "impl Step for `1 {\n    fn steps_between(start: &`1, end: &`1) -> (usize, \
+        crate::option::Option<usize>) {\n        if *start <= *end {\n            let d = (", p,
+        "", "", "");
+    key_text(out, "*end", p);
+    buf_bytes(out, " - ");
+    key_text(out, "*start", p);
+    emit(out, ") as usize;\n            (d, crate::option::Option::Some(d))\n        } else {\n            \
+        (0, crate::option::Option::None)\n        }\n    }\n    fn forward_checked(start: `1, \
+        count: usize) -> crate::option::Option<`1> {\n        let k = ", p, "", "", "");
+    key_text(out, "start", p);
+    buf_bytes(out, ";\n        let max: u64 = ");
+    if signed {
+        buf_fmt(out, format_args("((1u64 << 63) + ((1u64 << {}) - 1))", bits - 1));
+    } else {
+        ones_text(out, bits);
+    }
+    buf_bytes(out, ";\n        if count as u64 > max - k {\n            crate::option::Option::None\n        \
+        } else {\n            crate::option::Option::Some(");
+    unkey_text(out, "k + count as u64", p);
+    emit(out, ")\n        }\n    }\n    fn backward_checked(start: `1, count: usize) -> \
+        crate::option::Option<`1> {\n        let k = ", p, "", "", "");
+    key_text(out, "start", p);
+    buf_bytes(out, ";\n        let min: u64 = ");
+    if signed {
+        buf_fmt(out, format_args("((1u64 << 63) - (1u64 << {}))", bits - 1));
+    } else {
+        buf_bytes(out, "0");
+    }
+    buf_bytes(out, ";\n        if count as u64 > k - min {\n            crate::option::Option::None\n        \
+        } else {\n            crate::option::Option::Some(");
+    unkey_text(out, "k - count as u64", p);
+    buf_bytes(out, ")\n        }\n    }\n}\n");
+}
+
+// The integer of type p whose key (key_text) is the u64 expression k.
+fn unkey_text(out: i64, k: [u8], p: [u8]) {
+    if prim_class(p) == 1 {
+        emit(out, "(((`1) ^ (1u64 << 63)) as i64 as `2)", k, p, "", "");
+    } else {
+        emit(out, "((`1) as `2)", k, p, "", "");
+    }
+}
+
+fn write_from_str(out: i64, p: [u8]) {
+    let class = prim_class(p);
+    if class == 3 || class == 4 {
+        let err = if class == 3 { "crate::str::ParseFloatError" }
+            else { "crate::str::ParseBoolError" };
+        emit(out, "impl FromStr for `1 {\n    type Err = `2;\n    fn from_str(s: &str) -> \
+            crate::result::Result<`1, `2> {\n        crate::panic::todo()\n    }\n}\n", p, err, "",
+            "");
+        return;
+    }
+    let bits = prim_bits(p);
+    emit(out, "impl FromStr for `1 {\n    type Err = crate::str::ParseIntError;\n    fn from_str(s: \
+        &str) -> crate::result::Result<`1, crate::str::ParseIntError> {\n        let b = \
+        s.as_bytes();\n        let n = b.len();\n        if n == 0 {\n            return \
+        crate::result::Result::Err(crate::str::ParseIntError { kind: \
+        crate::str::IntErrorKind::Empty });\n        }\n        let mut i: usize = 0;\n        let \
+        mut neg = false;\n        if b[0] == 43 || b[0] == 45 {\n            neg = b[0] == 45;\n            \
+        i = 1;\n        }\n", p, "", "", "");
+    let unsigned_neg = if class == 2 { " || neg" } else { "" };
+    emit(out, "        if i == n`1 {\n            return crate::result::Result::Err(\
+        crate::str::ParseIntError { kind: crate::str::IntErrorKind::InvalidDigit });\n        }\n        \
+        let lim: u64 = if neg { ", unsigned_neg, "", "", "");
+    if class == 1 {
+        buf_fmt(out, format_args("(1u64 << {})", bits - 1));
+        buf_fmt(out, format_args(" }} else {{ ((1u64 << {}) - 1) }};\n", bits - 1));
+    } else {
+        buf_bytes(out, "0 } else { ");
+        ones_text(out, bits);
+        buf_bytes(out, " };\n");
+    }
+    buf_bytes(out, "        let mut v: u64 = 0;\n        while i < n {\n            let c = b[i];\n            \
+        if c < 48 || c > 57 {\n                return crate::result::Result::Err(\
+        crate::str::ParseIntError { kind: crate::str::IntErrorKind::InvalidDigit });\n            }\n            \
+        let d = (c - 48) as u64;\n            if v > (lim - d) / 10 {\n                return \
+        crate::result::Result::Err(crate::str::ParseIntError { kind: if neg { \
+        crate::str::IntErrorKind::NegOverflow } else { crate::str::IntErrorKind::PosOverflow } \
+        });\n            }\n            v = v * 10 + d;\n            i += 1;\n        }\n        ");
+    if class == 1 {
+        buf_bytes(out, "if neg && v != 0 {\n            crate::result::Result::Ok(((v ^ ");
+        ones_text(out, 64);
+        emit(out, ") + 1) as i64 as `1)\n        } else {\n            crate::result::Result::Ok(v as \
+            i64 as `1)\n        }\n    }\n}\n", p, "", "", "");
+    } else {
+        emit(out, "crate::result::Result::Ok(v as `1)\n    }\n}\n", p, "", "", "");
+    }
+}
+
+fn write_fmt(out: i64, t: [u8], p: [u8]) {
+    let class = prim_class(p);
+    emit(out, "impl `1 for `2 {\n    fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> \
+        crate::fmt::Result {\n        ", t, p, "", "");
+    if class == 4 {
+        buf_bytes(out, "f.pad(if *self { \"true\" } else { \"false\" })\n    }\n}\n");
+        return;
+    }
+    if class == 3 || t == "LowerExp" || t == "UpperExp" {
+        // (a float's digits, an exponent form: F16.3's, not written yet)
+        buf_bytes(out, "crate::panic::todo()\n    }\n}\n");
+        return;
+    }
+    let decimal = t == "Display" || t == "Debug";
+    let radix = if decimal { "10" } else if t == "Octal" { "8" } else if t == "Binary" { "2" }
+        else { "16" };
+    let letters = if t == "UpperHex" { "55" } else { "87" };
+    let prefix = if decimal { "" } else if t == "Octal" { "0o" } else if t == "Binary" { "0b" }
+        else { "0x" };
+    if decimal && class == 1 {
+        buf_bytes(out,
+            "let neg = *self < 0;\n        let mut v: u64 = if neg { ((*self as i64 as u64) ^ ");
+        ones_text(out, 64);
+        buf_bytes(out, ") + 1 } else { *self as u64 };\n");
+    } else {
+        // (a radix shows a signed integer's two's complement, as Rust's)
+        emit(out, "let neg = false;\n        let mut v: u64 = *self as `1 as u64;\n",
+            unsigned_twin(p), "", "", "");
+    }
+    emit(out, "        let mut buf = [0u8; 72];\n        let mut i: usize = 72;\n        loop {\n            \
+        i -= 1;\n            let d = (v % `1) as u8;\n            buf[i] = if d < 10 { 48 + d } else \
+        { `2 + d };\n            v = v / `1;\n            if v == 0 {\n                break;\n            \
+        }\n        }\n        f.pad_integral(!neg, \"`3\", unsafe { \
+        crate::str::from_utf8_unchecked(&buf[i..]) })\n    }\n}\n", radix, letters, prefix, "");
+}
+
+// One method of an integer's inherent impl: `pub fn name(self params) ->
+// ret { body }`, with "`1".."`4" in params, ret and body the integer p, its
+// width less one m, its 64-bit kin w (i64 or u64) and its unsigned twin u.
+fn int_method(out: i64, p: [u8], m: [u8], w: [u8], u: [u8], name: [u8], params: [u8], ret: [u8],
+    body: [u8]) {
+    buf_bytes(out, "    pub fn ");
+    buf_bytes(out, name);
+    buf_bytes(out, "(self");
+    emit(out, params, p, m, w, u);
+    buf_bytes(out, ") -> ");
+    emit(out, ret, p, m, w, u);
+    buf_bytes(out, " {\n        ");
+    emit(out, body, p, m, w, u);
+    buf_bytes(out, "\n    }\n");
+}
+
+fn ident_byte(c: u8) -> bool {
+    c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'
+}
+
+// (0.27.2) Of one integer's inherent methods made in `made`
+// (write_int_methods: `impl p {`, then each `    pub fn NAME(..` at a
+// line's start, then `}`), those some name asks for, appended to out:
+// the names of the sources' tokens (traits::default_names) and, from
+// there, the methods their bodies call (`.NAME(`, `::NAME(`). A program
+// that names no `checked_mul` reads none of the twelve; a query,
+// `--std2-check` and the like read every one (default_names).
+fn keep_named_methods(made: i64, out: i64, pcx: inout Ctx<Comp>) {
+    let t = buf_slice(made);
+    let len = t.len() as i64;
+    if !pcx.default_filter || len < 2 {
+        buf_bytes(out, t);
+        return;
+    }
+    let lead = "    pub fn ";
+    var starts = Vec::<i64, Comp>::new_in(Comp {});
+    var at = 0;
+    while at < len {
+        if at + lead.len() as i64 <= len && t[at..at + lead.len() as i64] == lead {
+            starts.push(at);
+        }
+        while at < len && t[at] != '\n' {
+            at += 1;
+        }
+        at += 1;
+    }
+    let count = starts.len() as i64;
+    if count == 0 {
+        buf_bytes(out, t);
+        return;
+    }
+    // (the trailer: the impl's closing `}` line)
+    let tail = len - 2;
+    var by_name = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    var wanted = Vec::<bool, Comp>::new_in(Comp {});
+    var work = Vec::<i64, Comp>::new_in(Comp {});
+    for k in 0..count {
+        let from = starts[k] + lead.len() as i64;
+        var to = from;
+        while to < len && ident_byte(t[to]) {
+            to += 1;
+        }
+        let sym = intern(t[from..to], &pcx);
+        by_name.put(sym + 1, k + 1);
+        let named = pcx.default_names.get(sym + 1) != 0;
+        wanted.push(named);
+        if named {
+            work.push(k);
+        }
+    }
+    loop {
+        let k = match work.pop() {
+            Some(k) => k,
+            None => break,
+        };
+        let end = if k + 1 < count { starts[k + 1] } else { tail };
+        var i = starts[k] + lead.len() as i64;
+        while i < end {
+            if (t[i] == '.' || t[i] == ':') && i + 1 < end && ident_byte(t[i + 1]) {
+                var j = i + 1;
+                while j < end && ident_byte(t[j]) {
+                    j += 1;
+                }
+                let m = by_name.get(intern(t[i + 1..j], &pcx) + 1) - 1;
+                if m >= 0 && !wanted[m] {
+                    wanted[m] = true;
+                    work.push(m);
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    buf_bytes(out, t[0..starts[0]]);
+    for k in 0..count {
+        if wanted[k] {
+            let end = if k + 1 < count { starts[k + 1] } else { tail };
+            buf_bytes(out, t[starts[k]..end]);
+        }
+    }
+    buf_bytes(out, t[tail..len]);
+}
+
+// `impl p { .. }`: the integer p's inherent methods of F15.4's list, as
+// Rust's (wrapping_*, checked_*, overflowing_*, saturating_*, the bit
+// counts and rotations). The text is std2's `num::wrapping`'s, whose
+// arithmetic never checks overflow (front/modules: std_wraps): `self +
+// rhs` here is wrapping_add, as MVS's std::num::wrapping (tools/intops)
+// has it. RULE: F15.4
+fn write_int_methods(out: i64, p: [u8]) {
+    let signed = prim_class(p) == 1;
+    let bits = prim_bits(p);
+    let narrow = bits < 64;
+    let m = if bits == 8 { "7" } else if bits == 16 { "15" } else if bits == 32 { "31" }
+        else { "63" };
+    let w = if signed { "i64" } else { "u64" };
+    let u = unsigned_twin(p);
+    let o = "crate::option::Option";
+    let rhs = ", rhs: `1";
+    let sh = ", rhs: u32";
+    let pair = "(`1, bool)";
+    let opt = "crate::option::Option<`1>";
+    emit(out, "impl `1 {\n", p, "", "", "");
+    int_method(out, p, m, w, u, "wrapping_add", rhs, "`1", "self + rhs");
+    int_method(out, p, m, w, u, "wrapping_sub", rhs, "`1", "self - rhs");
+    int_method(out, p, m, w, u, "wrapping_mul", rhs, "`1", "self * rhs");
+    int_method(out, p, m, w, u, "wrapping_neg", "", "`1", "0 - self");
+    int_method(out, p, m, w, u, "wrapping_shl", sh, "`1", "self << ((rhs & `2) as `1)");
+    int_method(out, p, m, w, u, "wrapping_shr", sh, "`1", "self >> ((rhs & `2) as `1)");
+    if signed {
+        int_method(out, p, m, w, u, "wrapping_div", rhs, "`1",
+            "if rhs == -1 { 0 - self } else { self / rhs }");
+        int_method(out, p, m, w, u, "wrapping_rem", rhs, "`1",
+            "if rhs == -1 { 0 } else { self % rhs }");
+    } else {
+        int_method(out, p, m, w, u, "wrapping_div", rhs, "`1", "self / rhs");
+        int_method(out, p, m, w, u, "wrapping_rem", rhs, "`1", "self % rhs");
+    }
+    if signed {
+        // (0.27.2: abs; of MIN it wraps, as Rust's release
+        // build's)
+        int_method(out, p, m, w, u, "abs", "", "`1", "if self < 0 { 0 - self } else { self }");
+    }
+    let pow_head = "let mut base = self;\n        let mut e = exp;\n        let mut out: `1 = 1;\n        \
+        while e > 0 {\n            if e & 1 != 0 {\n                ";
+    let pow_mid = "\n            }\n            e = e >> 1;\n            if e > 0 {\n                ";
+    buf_bytes(out, "    pub fn wrapping_pow(self, exp: u32) -> ");
+    emit(out, "`1 {\n        ", p, "", "", "");
+    emit(out, pow_head, p, "", "", "");
+    buf_bytes(out, "out = out * base;");
+    buf_bytes(out, pow_mid);
+    buf_bytes(out, "base = base * base;\n            }\n        }\n        out\n    }\n");
+    // (0.27.2: pow, wrapping here as Rust's release build's)
+    buf_bytes(out, "    pub fn pow(self, exp: u32) -> ");
+    emit(out, "`1 {\n        ", p, "", "", "");
+    emit(out, pow_head, p, "", "", "");
+    buf_bytes(out, "out = out * base;");
+    buf_bytes(out, pow_mid);
+    buf_bytes(out, "base = base * base;\n            }\n        }\n        out\n    }\n");
+    if narrow {
+        int_method(out, p, m, w, u, "overflowing_add", rhs, pair,
+            "let v = self as `3 + rhs as `3;\n        let r = v as `1;\n        (r, r as `3 != v)");
+        int_method(out, p, m, w, u, "overflowing_sub", rhs, pair,
+            "let v = self as `3 - rhs as `3;\n        let r = v as `1;\n        (r, r as `3 != v)");
+        int_method(out, p, m, w, u, "overflowing_mul", rhs, pair,
+            "let v = self as `3 * rhs as `3;\n        let r = v as `1;\n        (r, r as `3 != v)");
+    } else if signed {
+        int_method(out, p, m, w, u, "overflowing_add", rhs, pair,
+            "let r = self + rhs;\n        (r, (self ^ r) & (rhs ^ r) < 0)");
+        int_method(out, p, m, w, u, "overflowing_sub", rhs, pair,
+            "let r = self - rhs;\n        (r, (self ^ rhs) & (self ^ r) < 0)");
+        // (the signed high half from the unsigned one)
+        int_method(out, p, m, w, u, "overflowing_mul", rhs, pair,
+            "let lo = self * rhs;\n        let mut hi = mul_hi(self as u64, rhs as u64) as i64;\n        \
+            if self < 0 {\n            hi = hi - rhs as i64;\n        }\n        if rhs < 0 {\n            \
+            hi = hi - self as i64;\n        }\n        (lo, hi != (lo as i64) >> 63)");
+    } else {
+        int_method(out, p, m, w, u, "overflowing_add", rhs, pair,
+            "let r = self + rhs;\n        (r, r < self)");
+        int_method(out, p, m, w, u, "overflowing_sub", rhs, pair, "(self - rhs, self < rhs)");
+        int_method(out, p, m, w, u, "overflowing_mul", rhs, pair,
+            "(self * rhs, mul_hi(self as u64, rhs as u64) != 0)");
+    }
+    if signed {
+        int_method(out, p, m, w, u, "overflowing_neg", "", pair, "(0 - self, self == `1::MIN)");
+        int_method(out, p, m, w, u, "overflowing_div", rhs, pair,
+            "if self == `1::MIN && rhs == -1 { (self, true) } else { (self / rhs, false) }");
+        int_method(out, p, m, w, u, "overflowing_rem", rhs, pair,
+            "if self == `1::MIN && rhs == -1 { (0, true) } else { (self % rhs, false) }");
+    } else {
+        int_method(out, p, m, w, u, "overflowing_neg", "", pair, "(0 - self, self != 0)");
+        int_method(out, p, m, w, u, "overflowing_div", rhs, pair, "(self / rhs, false)");
+        int_method(out, p, m, w, u, "overflowing_rem", rhs, pair, "(self % rhs, false)");
+    }
+    int_method(out, p, m, w, u, "overflowing_shl", sh, pair,
+        "(self << ((rhs & `2) as `1), rhs > `2)");
+    int_method(out, p, m, w, u, "overflowing_shr", sh, pair,
+        "(self >> ((rhs & `2) as `1), rhs > `2)");
+    buf_bytes(out, "    pub fn overflowing_pow(self, exp: u32) -> ");
+    emit(out, "(`1, bool) {\n        let mut ovf = false;\n        ", p, "", "", "");
+    emit(out, pow_head, p, "", "", "");
+    buf_bytes(out, "let (r, o) = out.overflowing_mul(base);\n                out = r;\n                \
+        ovf = ovf || o;");
+    buf_bytes(out, pow_mid);
+    buf_bytes(out, "let (r, o) = base.overflowing_mul(base);\n                base = r;\n                \
+        ovf = ovf || o;\n            }\n        }\n        (out, ovf)\n    }\n");
+    let checked = "let (r, o) = self.overflowing_`4;\n        if o { \
+        crate::option::Option::None } else { crate::option::Option::Some(r) }";
+    emit(out, "    pub fn checked_add(self, rhs: `1) -> `2<`1> {\n        ", p, o, "", "");
+    emit(out, checked, p, "", "", "add(rhs)");
+    emit(out, "\n    }\n    pub fn checked_sub(self, rhs: `1) -> `2<`1> {\n        ", p, o, "", "");
+    emit(out, checked, p, "", "", "sub(rhs)");
+    emit(out, "\n    }\n    pub fn checked_mul(self, rhs: `1) -> `2<`1> {\n        ", p, o, "", "");
+    emit(out, checked, p, "", "", "mul(rhs)");
+    emit(out, "\n    }\n    pub fn checked_neg(self) -> `2<`1> {\n        ", p, o, "", "");
+    emit(out, checked, p, "", "", "neg()");
+    emit(out, "\n    }\n    pub fn checked_pow(self, exp: u32) -> `2<`1> {\n        ", p, o, "",
+        "");
+    emit(out, checked, p, "", "", "pow(exp)");
+    buf_bytes(out, "\n    }\n");
+    int_method(out, p, m, w, u, "checked_shl", sh, opt,
+        "if rhs > `2 { crate::option::Option::None } else { crate::option::Option::Some(self << \
+        (rhs as `1)) }");
+    int_method(out, p, m, w, u, "checked_shr", sh, opt,
+        "if rhs > `2 { crate::option::Option::None } else { crate::option::Option::Some(self >> \
+        (rhs as `1)) }");
+    if signed {
+        int_method(out, p, m, w, u, "checked_div", rhs, opt,
+            "if rhs == 0 || self == `1::MIN && rhs == -1 { crate::option::Option::None } else { \
+            crate::option::Option::Some(self / rhs) }");
+        int_method(out, p, m, w, u, "checked_rem", rhs, opt,
+            "if rhs == 0 || self == `1::MIN && rhs == -1 { crate::option::Option::None } else { \
+            crate::option::Option::Some(self % rhs) }");
+        int_method(out, p, m, w, u, "saturating_add", rhs, "`1",
+            "let (r, o) = self.overflowing_add(rhs);\n        \
+            if !o { r } else if rhs < 0 { `1::MIN } else { `1::MAX }");
+        int_method(out, p, m, w, u, "saturating_sub", rhs, "`1",
+            "let (r, o) = self.overflowing_sub(rhs);\n        \
+            if !o { r } else if rhs > 0 { `1::MIN } else { `1::MAX }");
+        int_method(out, p, m, w, u, "saturating_mul", rhs, "`1",
+            "let (r, o) = self.overflowing_mul(rhs);\n        \
+            if !o { r } else if (self < 0) != (rhs < 0) { `1::MIN } else { `1::MAX }");
+        int_method(out, p, m, w, u, "saturating_div", rhs, "`1",
+            "if self == `1::MIN && rhs == -1 { `1::MAX } else { self / rhs }");
+        int_method(out, p, m, w, u, "wrapping_abs", "", "`1",
+            "if self < 0 { 0 - self } else { self }");
+        int_method(out, p, m, w, u, "checked_abs", "", opt,
+            "if self == `1::MIN { crate::option::Option::None } else { \
+            crate::option::Option::Some(self.wrapping_abs()) }");
+        int_method(out, p, m, w, u, "overflowing_abs", "", pair,
+            "(self.wrapping_abs(), self == `1::MIN)");
+        int_method(out, p, m, w, u, "saturating_abs", "", "`1",
+            "if self == `1::MIN { `1::MAX } else { self.wrapping_abs() }");
+        int_method(out, p, m, w, u, "saturating_neg", "", "`1",
+            "if self == `1::MIN { `1::MAX } else { 0 - self }");
+        int_method(out, p, m, w, u, "signum", "", "`1",
+            "if self < 0 { -1 } else if self > 0 { 1 } else { 0 }");
+        int_method(out, p, m, w, u, "is_negative", "", "bool", "self < 0");
+        int_method(out, p, m, w, u, "is_positive", "", "bool", "self > 0");
+        int_method(out, p, m, w, u, "unsigned_abs", "", "`4",
+            "self.wrapping_abs() as `4");
+    } else {
+        int_method(out, p, m, w, u, "checked_div", rhs, opt,
+            "if rhs == 0 { crate::option::Option::None } else { crate::option::Option::Some(self \
+            / rhs) }");
+        int_method(out, p, m, w, u, "checked_rem", rhs, opt,
+            "if rhs == 0 { crate::option::Option::None } else { crate::option::Option::Some(self \
+            % rhs) }");
+        int_method(out, p, m, w, u, "saturating_add", rhs, "`1",
+            "let (r, o) = self.overflowing_add(rhs);\n        if o { `1::MAX } else { r }");
+        int_method(out, p, m, w, u, "saturating_sub", rhs, "`1",
+            "let (r, o) = self.overflowing_sub(rhs);\n        if o { 0 } else { r }");
+        int_method(out, p, m, w, u, "saturating_mul", rhs, "`1",
+            "let (r, o) = self.overflowing_mul(rhs);\n        if o { `1::MAX } else { r }");
+        int_method(out, p, m, w, u, "saturating_div", rhs, "`1", "self / rhs");
+        int_method(out, p, m, w, u, "is_power_of_two", "", "bool",
+            "self != 0 && self & (self - 1) == 0");
+    }
+    int_method(out, p, m, w, u, "saturating_pow", ", exp: u32", "`1",
+        if signed {
+            "let (r, o) = self.overflowing_pow(exp);\n        \
+            if !o { r } else if self < 0 && exp % 2 == 1 { `1::MIN } else { `1::MAX }"
+        } else {
+            "let (r, o) = self.overflowing_pow(exp);\n        if o { `1::MAX } else { r }"
+        });
+    // The bits, of the unsigned twin's value (no sign extension).
+    int_method(out, p, m, w, u, "count_ones", "", "u32",
+        "let mut x = self as `4 as u64;\n        let mut n: u32 = 0;\n        while x != 0 {\n            \
+        n = n + (x & 1) as u32;\n            x = x >> 1;\n        }\n        n");
+    int_method(out, p, m, w, u, "count_zeros", "", "u32", "(`2 + 1) - self.count_ones()");
+    int_method(out, p, m, w, u, "leading_zeros", "", "u32",
+        "let x = self as `4 as u64;\n        let mut n: u32 = 0;\n        let mut b: u64 = `2 + 1;\n        \
+        while b > 0 && (x >> (b - 1)) & 1 == 0 {\n            n = n + 1;\n            b = b - 1;\n        \
+        }\n        n");
+    int_method(out, p, m, w, u, "trailing_zeros", "", "u32",
+        "let mut x = self as `4 as u64;\n        if x == 0 {\n            return `2 + 1;\n        }\n        \
+        let mut n: u32 = 0;\n        while x & 1 == 0 {\n            n = n + 1;\n            \
+        x = x >> 1;\n        }\n        n");
+    int_method(out, p, m, w, u, "rotate_left", ", n: u32", "`1",
+        "let x = self as `4;\n        let k = (n & `2) as `4;\n        \
+        ((x << k) | (x >> (((`2 + 1) - k) & `2))) as `1");
+    int_method(out, p, m, w, u, "rotate_right", ", n: u32", "`1",
+        "let x = self as `4;\n        let k = (n & `2) as `4;\n        \
+        ((x >> k) | (x << (((`2 + 1) - k) & `2))) as `1");
+    buf_bytes(out, "}\n");
+}
+
+// The impls of the recorded traits' lists (pcx.builtin_traits), parsed and
+// appended to the program; and a `#[builtin_methods(..)]` record's
+// integers' inherent methods (F15.4). RULE: F15.1
+pub fn expand_builtin_impls(pcx: inout Ctx<Comp>) {
+    let n = pcx.builtin_traits.count / 4;
+    if n == 0 {
+        return;
+    }
+    // (0.27.2: the names that ask for an integer method, keep_named_methods)
+    crate::front::traits::default_names(&pcx);
+    let out = buf_new();
+    for r in 0..n {
+        let item = pcx.builtin_traits.get(4 * r);
+        let start = pcx.builtin_traits.get(4 * r + 1);
+        let end = pcx.builtin_traits.get(4 * r + 2);
+        pcx.builtin_traits.set(4 * r + 3, buf_slice(out).len() as i64);
+        if item == 0 {
+            continue;
+        }
+        let t = if item < 0 { "" } else { sym_text(pcx.nodes[item].a, pcx) };
+        // The names between the attribute's parentheses.
+        let text = SRC[start..end];
+        var i = 0;
+        while i < text.len() as i64 && text[i] != '(' {
+            i += 1;
+        }
+        i += 1;
+        while i < text.len() as i64 && text[i] != ')' {
+            while i < text.len() as i64 && (text[i] == ' ' || text[i] == ',' || text[i] == '\n') {
+                i += 1;
+            }
+            let from = i;
+            while i < text.len() as i64 && text[i] != ',' && text[i] != ')' && text[i] != ' '
+                && text[i] != '\n' {
+                i += 1;
+            }
+            if i == from {
+                continue;
+            }
+            let p = text[from..i];
+            if item < 0 && (prim_class(p) == 1 || prim_class(p) == 2) {
+                let made = buf_new();
+                write_int_methods(made, p);
+                keep_named_methods(made, out, &pcx);
+            } else if item < 0 {
+                let saved = pcx.err_kind;
+                pcx.err_kind = c"attr.builtin";
+                err_begin(start, &pcx);
+                err_fmt(format_args("no builtin methods for '{}'", p), pcx);
+                err_help(c"the compiler makes the integers' inherent methods (wrapping_add, checked_mul, ..): list i8 .. usize", pcx);
+                err_end_soft(&pcx);
+                pcx.err_kind = saved;
+            } else if prim_class(p) == 0 || !write_impl(out, t, p) {
+                let saved = pcx.err_kind;
+                pcx.err_kind = c"attr.builtin";
+                err_begin(start, &pcx);
+                err_fmt(format_args("no builtin impl of '{}' for '{}'", t, p), pcx);
+                err_help(c"the compiler makes the impls of std's operator, comparison, copy, default, hash, iteration and formatting traits for the numbers and bool: write this one as an impl", pcx);
+                err_end_soft(&pcx);
+                pcx.err_kind = saved;
+            }
+        }
+    }
+    if buf_slice(out).len() == 0 {
+        return;
+    }
+    parse_builtin(out, &pcx);
+}
+
+// Parses the made text as a source `<builtin>`, gives each node the span
+// of its trait's attribute, flags it FN_DERIVED (made, not written: the
+// tools do not edit it) and appends the impls to the program.
+fn parse_builtin(out: i64, pcx: inout Ctx<Comp>) {
+    // UNSAFE: the recovery point is setjmp's (parse_derived's), and BUFS a
+    // raw table.
+    // SAFETY: recover_enter/recover_leave bracket the parse on this frame;
+    // out is a live buffer index.
+    unsafe {
+        let base = add_source(c"<builtin>", out, &pcx);
+        let first = pcx.toks.len() as i64;
+        let node_mark = pcx.nodes.len() as i64;
+        let mark = list_begin(pcx);
+        let depth = pcx.recover_depth;
+        if _setjmp(recover_enter(&pcx)) == 0 {
+            lex_range(base, base + BUFS[out].len, last: true, pcx: &pcx);
+            parse_items_fragment(first, &pcx);
+        } else {
+            // (a syntax error in the made text: a compiler bug, reported)
+            pcx.scratch.count = mark;
+        }
+        recover_leave(depth, &pcx);
+        let n = pcx.builtin_traits.count / 4;
+        for k in node_mark..pcx.nodes.len() as i64 {
+            let off = pcx.nodes[k].start - base;
+            // (the last record that starts at or before off: their starts
+            // grow, so a binary search, not a scan of the records for each
+            // of std2's thousands of made nodes)
+            var r = 0;
+            var lo = 0;
+            var hi = n;
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if pcx.builtin_traits.get(4 * mid + 3) <= off {
+                    r = mid;
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            pcx.nodes[k].start = pcx.builtin_traits.get(4 * r + 1);
+            pcx.nodes[k].end = pcx.builtin_traits.get(4 * r + 2);
+            if pcx.nodes[k].kind == NodeKind::Fn || pcx.nodes[k].kind == NodeKind::Impl {
+                pcx.nodes[k].p |= FN_DERIVED;
+            }
+        }
+        let count = pcx.scratch.count - mark;
+        let all = list_begin(pcx);
+        for i in 0..pcx.nodes[pcx.program].count {
+            list_push(child(pcx.program, i, pcx), &pcx);
+        }
+        for i in 0..count {
+            list_push(pcx.scratch.get(mark + i), &pcx);
+        }
+        list_end(pcx.program, all, &pcx);
+        pcx.scratch.count = mark;
+    }
+}

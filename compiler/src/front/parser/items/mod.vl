@@ -9,7 +9,7 @@ pub mod attrs;
 pub mod embed;
 
 use crate::arch::note_intrinsic_node;
-use crate::base::{buf_new, buf_slice, intern_c, sym_text};
+use crate::base::{buf_fmt, buf_new, buf_slice, intern, intern_c, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{
@@ -17,9 +17,9 @@ use crate::base::diag::{
     report_error_tries,
 };
 use crate::front::ast::{
-    FN_BODY_FAILED, FN_EFFECT_DECL, FN_UNSAFE, ITEM_UNSAFE, NodeKind, REPR_C, REPR_INT, REPR_PACKED,
-    REPR_UNION, REPR_WGSL, STRUCT_SCOPED, STRUCT_SEALED, child, list_begin, list_end, list_push,
-    new_node,
+    FN_BODY_FAILED, FN_EFFECT_DECL, FN_UNSAFE, ITEM_UNSAFE, NODE_ASSOC_CONST, NodeKind, REPR_C,
+    REPR_INT, REPR_PACKED, REPR_UNION, REPR_WGSL, STRUCT_SCOPED, STRUCT_SEALED, child, list_begin,
+    list_end, list_push, new_node,
 };
 use crate::front::check::name_error;
 use crate::front::features::take_feature_attrs;
@@ -122,13 +122,20 @@ pub fn parse_top_item(pcx: inout Ctx<Comp>) {
             mark_public(item, public, &pcx);
             list_push(item, &pcx);
         } else if crate::front::parser::rust::take_array_builtin(&pcx) {
-            // (0.27.0: the item is parsed and dropped)
-            let mark = pcx.scratch.count;
+            // (0.27.2: the item, over its length parameter. RULE: F15.3)
             parse_top_item(&pcx);
-            pcx.scratch.count = mark;
+            pcx.array_len_name = 0;
         } else if crate::front::parser::rust::take_builtin_impls(&pcx) {
-            // (0.27.0: the trait is parsed and kept)
+            // (0.27.0: the trait is parsed and kept; 0.27.2: and recorded
+            // for its builtin impls, F15.1)
+            let rec = pcx.builtin_traits.count - 4;
             parse_top_item(&pcx);
+            if pcx.scratch.count > 0 {
+                let item = pcx.scratch.get(pcx.scratch.count - 1);
+                if pcx.nodes[item].kind == NodeKind::Trait {
+                    pcx.builtin_traits.set(rec, item);
+                }
+            }
         } else if at(Hash, pcx) {
             let item = parse_attributed_item(public, &pcx);
             list_push(item, &pcx);
@@ -202,6 +209,8 @@ fn parse_impl(public: bool, unsafe_at: i64, pcx: inout Ctx<Comp>) {
         // (0.27.0: the impl's lifetimes, bound to each function as -f)
         let impl_lifetimes = pcx.lt_last;
         pcx.lt_last = 0;
+        // RULE: AT2 (the rust edition's negative impl, `impl !Send for X {}`)
+        let negative = crate::front::parser::rust::rust_here(&pcx) && eat(Tok::Bang, &pcx);
         var self_type = parse_type(&pcx);
         // `impl Trait for Type` (0.9): any type.
         var trait_name = 0;
@@ -212,21 +221,22 @@ fn parse_impl(public: bool, unsafe_at: i64, pcx: inout Ctx<Comp>) {
                     &pcx);
             }
             self_type = parse_type(&pcx);
-            if crate::front::parser::rust::ref_type(self_type, pcx)
-                && pcx.edition != 0 && crate::front::rust::rust_at(impl_start, &pcx) {
-                // (0.27.0: an impl for `&T`, the rust edition's from 0.27.2)
-                crate::front::rust::later(pcx.nodes[self_type].start, pcx.nodes[self_type].end,
-                    "impl_for_ref", "0.27.2", &pcx);
-            }
+            // (0.27.2: an impl for `&T` is a pattern impl, F6.1)
         } else if pcx.nodes[self_type].kind != NodeKind::TyName
-            && !(pcx.nodes[self_type].kind == NodeKind::TySlice && params != 0) {
+            && !(pcx.nodes[self_type].kind == NodeKind::TySlice && params != 0)
+            && !(pcx.edition != 0 && crate::front::rust::rust_at(impl_start, &pcx)) {
             error_at(pcx.nodes[self_type].start,
                 c"impl blocks are for named types (structs and enums)", &pcx);
+        }
+        if negative && trait_name == 0 {
+            error_at(impl_start, c"`!` is before a trait: a negative impl is `impl !Send for T {}`",
+                &pcx);
         }
         if unsafe_at >= 0 && trait_name == 0 {
             error_at(unsafe_at,
                 c"an inherent impl is not unsafe: `unsafe impl` is an unsafe trait's impl (`unsafe impl Allocator for T`)", &pcx);
         }
+        pcx.where_owner = 0;
         parse_where(params, 0, &pcx);
         // (0.27.0: an impl the rust edition has from 0.27.2, parsed and
         // dropped with its functions)
@@ -237,7 +247,21 @@ fn parse_impl(public: bool, unsafe_at: i64, pcx: inout Ctx<Comp>) {
         let fns = pcx.scratch.count;
         expect(LBrace, &pcx);
         while !at(RBrace, pcx) && !at(Eof, pcx) {
-            if crate::front::parser::rust::skip_assoc_const(&pcx) {
+            if (at(Const, pcx) || at(Pub, pcx) && tok_kind(1, pcx) == Const)
+                && crate::front::parser::rust::rust_here(&pcx) {
+                // RULE: F3.1 (an inherent impl's constant, `impl char { const
+                // MAX .. }`, is recorded with its self type: assoc::
+                // inherent_const_value)
+                let c = parse_assoc_const(true, &pcx);
+                if trait_name == 0 {
+                    if !dropped {
+                        pcx.inherent_consts.push(c);
+                        pcx.inherent_consts.push(self_type);
+                        pcx.inherent_consts.push(params);
+                    }
+                    continue;
+                }
+                list_push(c, &pcx);
                 continue;
             }
             if at(Type, pcx) {
@@ -248,8 +272,8 @@ fn parse_impl(public: bool, unsafe_at: i64, pcx: inout Ctx<Comp>) {
                 list_push(parse_assoc_type(true, &pcx), &pcx);
                 continue;
             }
-            // (0.27.0: a function parsed and dropped)
-            let dropped = crate::front::parser::rust::take_array_builtin(&pcx);
+            // (0.27.2: a function over its length parameter. RULE: F15.3)
+            let _ = crate::front::parser::rust::take_array_builtin(&pcx);
             let attrs_start = cur_start(pcx);
             let flags = parse_fn_attributes(&pcx);
             pcx.vis_tok = -1;
@@ -266,10 +290,7 @@ fn parse_impl(public: bool, unsafe_at: i64, pcx: inout Ctx<Comp>) {
             // (0.27.0: a `where` of the function on the impl's parameter is
             // the function's, not every function's of the block)
             let own = take_method_bounds(params, before, &pcx);
-            if dropped {
-                take_effect_decls(f, &pcx);
-                continue;
-            }
+            pcx.array_len_name = 0;
             if trait_name != 0 {
                 no_param_defaults(f, c"a trait's function", &pcx);
             }
@@ -307,6 +328,9 @@ fn parse_impl(public: bool, unsafe_at: i64, pcx: inout Ctx<Comp>) {
             if unsafe_at >= 0 {
                 pcx.nodes[n].p |= ITEM_UNSAFE;
             }
+            if negative {
+                pcx.nodes[n].p |= crate::front::ast::IMPL_NEGATIVE;
+            }
             let end = pcx.scratch.count;
             let mark = list_begin(pcx);
             for i in fns..end {
@@ -333,10 +357,35 @@ fn parse_assoc_type(in_impl: bool, pcx: inout Ctx<Comp>) -> i64 {
         pcx.nodes[n].b = parse_type(&pcx);
     } else if at(Eq, pcx) {
         error_at(cur_start(pcx), c"an associated type has no default: write 'type Name;'", &pcx);
-    } else if crate::front::parser::rust::skip_item_bounds("assoc_bounds", &pcx) {
-        // (0.27.0: `type Item: Bound;`, the rust edition's from 0.27.2)
+    } else if at(Colon, pcx) && crate::front::parser::rust::rust_here(&pcx) {
+        // RULE: F11.1 (`type Item: Bound;`: the bounds, the node's h)
+        pcx.nodes[n].h = crate::front::parser::rust::parse_item_bounds(&pcx);
     } else if at(Colon, pcx) {
         error_at(cur_start(pcx), c"an associated type has no bounds: write 'type Name;'", &pcx);
+    }
+    expect(Semi, &pcx);
+    pcx.nodes[n].end = prev_end(pcx);
+    n
+}
+
+// (0.27.2) `[pub] const NAME: T [= v];` in a trait or an impl of the rust
+// edition: an associated constant, an AssocType node flagged
+// NODE_ASSOC_CONST, b its type, c its value (0: a trait's without a
+// default). RULE: F3.1
+fn parse_assoc_const(in_impl: bool, pcx: inout Ctx<Comp>) -> i64 {
+    let start = cur_start(pcx);
+    eat(Pub, &pcx);
+    expect(Const, &pcx);
+    let n = new_node(NodeKind::AssocType, start, 0, &pcx);
+    pcx.nodes[n].p |= NODE_ASSOC_CONST;
+    pcx.nodes[n].a = expect_binding_name(&pcx);
+    expect(Colon, &pcx);
+    pcx.nodes[n].b = parse_type(&pcx);
+    if eat(Eq, &pcx) {
+        pcx.nodes[n].c = crate::front::parser::exprs::parse_expr(&pcx);
+    } else if in_impl {
+        error_at(cur_start(pcx),
+            c"an impl's associated constant has a value: 'const NAME: T = v;'", &pcx);
     }
     expect(Semi, &pcx);
     pcx.nodes[n].end = prev_end(pcx);
@@ -388,8 +437,9 @@ fn parse_trait(pcx: inout Ctx<Comp>) -> i64 {
     // (0.15: `trait From<T>`)
     pcx.nodes[n].g = parse_generic_params(false, &pcx);
     crate::front::parser::rust::bind_lifetimes(n, &pcx);
-    // (0.27.0: `trait A: B`, the rust edition's supertraits, from 0.27.2)
-    crate::front::parser::rust::skip_item_bounds("supertrait", &pcx);
+    // RULE: F2.1 (`trait A: B + C`, the rust edition's supertraits: the
+    // trait's h, traits::trait_supers)
+    pcx.nodes[n].h = crate::front::parser::rust::parse_item_bounds(&pcx);
     parse_where(pcx.nodes[n].g, 0, &pcx);
     expect(LBrace, &pcx);
     let mark = list_begin(pcx);
@@ -398,7 +448,10 @@ fn parse_trait(pcx: inout Ctx<Comp>) -> i64 {
             list_push(parse_assoc_type(false, &pcx), &pcx);
             continue;
         }
-        if crate::front::parser::rust::skip_assoc_const(&pcx) {
+        if (at(Const, pcx) || at(Pub, pcx) && tok_kind(1, pcx) == Const)
+            && crate::front::parser::rust::rust_here(&pcx) {
+            // RULE: F3.1
+            list_push(parse_assoc_const(false, &pcx), &pcx);
             continue;
         }
         let attrs_start = cur_start(pcx);
@@ -432,6 +485,7 @@ fn parse_trait(pcx: inout Ctx<Comp>) -> i64 {
         no_param_defaults(f, c"a trait function", &pcx);
         expect(RParen, &pcx);
         pcx.nodes[f].b = parse_return_type(&pcx);
+        pcx.where_owner = f;
         parse_where(pcx.nodes[f].g, pcx.nodes[n].g, &pcx);
         // (0.18: requires/ensures)
         parse_clauses(f, &pcx);
@@ -502,8 +556,18 @@ fn merge_generics(outer: i64, own: i64, pcx: inout Ctx<Comp>) -> i64 {
 // a struct or an enum (`defaults`), after those without one.
 fn parse_generic_params(defaults: bool, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
+        // RULE: F15.3 (`#[array_builtin(N)]`'s N: the item's last parameter)
+        let len_name = pcx.array_len_name;
+        pcx.array_len_name = 0;
         if !at(Lt, pcx) {
-            return 0;
+            if len_name == 0 {
+                return 0;
+            }
+            let n = new_node(NodeKind::Generics, cur_start(pcx), cur_start(pcx), &pcx);
+            let mark = list_begin(pcx);
+            list_push(length_param(len_name, &pcx), &pcx);
+            list_end(n, mark, &pcx);
+            return n;
         }
         let n = new_node(NodeKind::Generics, cur_start(pcx), 0, &pcx);
         advance(&pcx);
@@ -526,13 +590,15 @@ fn parse_generic_params(defaults: bool, pcx: inout Ctx<Comp>) -> i64 {
                 let bounds = new_node(NodeKind::Generics, cur_start(pcx), 0, &pcx);
                 let bmark = list_begin(pcx);
                 loop {
-                    if !crate::front::parser::rust::skip_lifetime_bound(&pcx) {
+                    if !crate::front::parser::rust::take_outlives_bound(param, &pcx) {
                         list_push(parse_bound(&pcx), &pcx);
                     }
                     if !eat(Plus, &pcx) {
                         break;
                     }
                 }
+                // RULE: F21.1 (the rust edition: `T: Sized` says nothing)
+                let _ = crate::front::parser::rust::drop_sized(bmark, pcx.nodes[param].start, &pcx);
                 list_end(bounds, bmark, &pcx);
                 pcx.nodes[bounds].end = prev_end(pcx);
                 pcx.nodes[param].h = bounds;
@@ -564,6 +630,9 @@ fn parse_generic_params(defaults: bool, pcx: inout Ctx<Comp>) -> i64 {
                 break;
             }
         }
+        if len_name != 0 {
+            list_push(length_param(len_name, &pcx), &pcx);
+        }
         list_end(n, mark, &pcx);
         let only_lifetimes = pcx.nodes[n].count == 0 && pcx.lt_scratch.count > lifetimes;
         crate::front::parser::rust::lifetimes_end(lifetimes, &pcx);
@@ -574,6 +643,15 @@ fn parse_generic_params(defaults: bool, pcx: inout Ctx<Comp>) -> i64 {
         pcx.nodes[n].end = prev_end(pcx);
         if only_lifetimes { 0 } else { n }
     }
+}
+
+// RULE: F15.3 The length parameter `name` of an `#[array_builtin(name)]`
+// item: a type parameter, bound to `[(); n]` for the length n
+// (generics::length_type), at the attribute's position.
+fn length_param(name: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let param = new_node(NodeKind::TyName, cur_start(pcx), cur_start(pcx), &pcx);
+    pcx.nodes[param].a = name;
+    param
 }
 
 // `enum E { A, B(T, ...), C { x: T, ... }, D = expr, ... }`
@@ -588,7 +666,23 @@ fn parse_enum(pcx: inout Ctx<Comp>) -> i64 {
     expect(LBrace, &pcx);
     let mark = list_begin(pcx);
     while !at(RBrace, pcx) && !at(Eof, pcx) {
+        // RULE: F17.1 (the rust edition: `#[default]` marks the variant a
+        // derived Default makes)
+        var marked = false;
+        if at(Hash, pcx) && crate::front::parser::rust::rust_here(&pcx) {
+            advance(&pcx);
+            expect(LBracket, &pcx);
+            let name = expect_ident(&pcx);
+            if sym_text(name, pcx) != "default" {
+                error_at(prev_end(pcx), c"a variant takes no attribute but #[default]", &pcx);
+            }
+            expect(RBracket, &pcx);
+            marked = true;
+        }
         let variant = new_node(NodeKind::Variant, cur_start(pcx), 0, &pcx);
+        if marked {
+            pcx.nodes[variant].p |= crate::front::ast::VARIANT_DEFAULT;
+        }
         pcx.nodes[variant].a = expect_binding_name(&pcx);
         if at(LBrace, pcx) {
             // (0.17) `V { a: A, b: B }`
@@ -675,6 +769,7 @@ pub fn parse_function(pcx: inout Ctx<Comp>) -> i64 {
     pcx.nodes[n].b = parse_return_type(&pcx);
     // (0.26.2) `where T: Display` (an impl's function: also the impl's
     // parameters, WHERE_OUTER)
+    pcx.where_owner = n;
     parse_where(pcx.nodes[n].g, pcx.where_outer, &pcx);
     if pcx.lt_where != 0 {
         // (0.27.1: its `where 'a: 'b`, the region checker's, D4.5)
@@ -1100,13 +1195,32 @@ fn parse_struct(pcx: inout Ctx<Comp>) -> i64 {
         return n;
     }
     if at(LParen, pcx) && crate::front::parser::rust::rust_here(&pcx) {
-        // (0.27.0: `struct P(T, U);`, the rust edition's from 0.27.2)
-        let at_paren = cur_start(pcx);
-        crate::front::parser::rust::skip_parens(&pcx);
-        eat(Semi, &pcx);
-        crate::front::rust::later(at_paren, prev_end(pcx), "tuple_struct", "0.27.2", &pcx);
-        let none = list_begin(pcx);
-        list_end(n, none, &pcx);
+        // RULE: F7.1 (`struct P<T>(pub T, U);`: fields named 0, 1, ..,
+        // each private unless `pub`)
+        advance(&pcx);
+        let mark = list_begin(pcx);
+        var k = 0;
+        while !at(RParen, pcx) && !at(Eof, pcx) {
+            let field_start = cur_start(pcx);
+            pcx.vis_tok = -1;
+            let public = parse_vis(&pcx);
+            let field = new_node(NodeKind::Field, field_start, 0, &pcx);
+            mark_public(field, public, &pcx);
+            let name = buf_new();
+            buf_fmt(name, format_args("{k}"));
+            pcx.nodes[field].a = intern(buf_slice(name), &pcx);
+            pcx.nodes[field].b = parse_type(&pcx);
+            pcx.nodes[field].end = prev_end(pcx);
+            list_push(field, &pcx);
+            k += 1;
+            if !eat(Comma, &pcx) {
+                break;
+            }
+        }
+        expect(RParen, &pcx);
+        list_end(n, mark, &pcx);
+        parse_where(pcx.nodes[n].g, 0, &pcx);
+        expect(Semi, &pcx);
         pcx.nodes[n].end = prev_end(pcx);
         return n;
     }

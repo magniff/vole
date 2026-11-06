@@ -45,12 +45,16 @@ impl Error {
 
     // The error errno says.
     pub fn from_raw_os_error(code: i32) -> Error {
-        crate::panic::todo()
+        Error { kind: kind_of_errno(code), code: code, msg: "" }
     }
 
     // The error of the last failed OS call (errno).
     pub fn last_os_error() -> Error {
-        crate::panic::todo()
+        // UNSAFE: errno, read through libc's pointer to this thread's copy.
+        // SAFETY: __error returns a valid pointer to the calling thread's
+        // errno, an i32.
+        let code = unsafe { *__error() };
+        Error::from_raw_os_error(code)
     }
 
     pub fn kind(&self) -> ErrorKind {
@@ -65,20 +69,148 @@ impl Error {
 // mvs: Error::impl Display, IoError::impl Display
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
-        crate::panic::todo()
+        if self.code != 0 {
+            f.write_str(os_message(self.code))?;
+            f.write_str(" (os error ")?;
+            f.write_fmt(self.code)?;
+            f.write_str(")")
+        } else if !self.msg.is_empty() {
+            f.write_str(self.msg)
+        } else {
+            crate::fmt::Display::fmt(&self.kind, f)
+        }
     }
 }
 
 // mvs: Error::impl Debug, IoError::impl Debug
 impl Debug for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
-        crate::panic::todo()
+        if self.code != 0 {
+            f.debug_struct("Os")
+                .field("code", &self.code)
+                .field("kind", &self.kind)
+                .field("message", &os_message(self.code))
+                .finish()
+        } else if !self.msg.is_empty() {
+            f.debug_struct("Custom").field("kind", &self.kind).field("error", &self.msg).finish()
+        } else {
+            f.debug_tuple("Kind").field(&self.kind).finish()
+        }
     }
 }
 
 impl From<ErrorKind> for Error {
     fn from(k: ErrorKind) -> Error {
         Error::new(k, "")
+    }
+}
+
+// The ErrorKind of an errno (macOS's numbers; Linux's differ above 34 and
+// come with the sys tail).
+fn kind_of_errno(code: i32) -> ErrorKind {
+    match code {
+        1 | 13 => ErrorKind::PermissionDenied,
+        2 => ErrorKind::NotFound,
+        4 => ErrorKind::Interrupted,
+        12 => ErrorKind::OutOfMemory,
+        17 => ErrorKind::AlreadyExists,
+        20 => ErrorKind::NotADirectory,
+        21 => ErrorKind::IsADirectory,
+        22 => ErrorKind::InvalidInput,
+        32 => ErrorKind::BrokenPipe,
+        35 => ErrorKind::WouldBlock,
+        45 | 78 => ErrorKind::Unsupported,
+        60 => ErrorKind::TimedOut,
+        66 => ErrorKind::DirectoryNotEmpty,
+        _ => ErrorKind::Other,
+    }
+}
+
+// The OS's text for an errno (C's strerror), or "" when it is not UTF-8.
+fn os_message(code: i32) -> &'static str {
+    // UNSAFE: strerror's C string, read through its raw pointer.
+    // SAFETY: strerror returns a NUL-terminated string that lives as long
+    // as the process (macOS's table; the bytes up to the NUL are read, no
+    // further).
+    unsafe {
+        let p = strerror(code);
+        let mut n: usize = 0;
+        while *p.add(n) != 0 {
+            n += 1;
+        }
+        match crate::str::from_utf8(crate::slice::from_raw_parts(p, n)) {
+            crate::result::Result::Ok(s) => s,
+            crate::result::Result::Err(_) => "",
+        }
+    }
+}
+
+// What a read appended to v from start: kept when it is UTF-8, cut off
+// with InvalidData when not (read_to_string's and read_line's check).
+fn append_utf8<A: Allocator>(v: &mut Vec<u8, A>, start: usize, r: Result<usize>) -> Result<usize> {
+    if crate::str::from_utf8(&v.as_slice()[start..]).is_err() {
+        v.truncate(start);
+        return crate::result::Result::Err(Error::new(ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8"));
+    }
+    r
+}
+
+// Write::write_fmt's sink: a fmt::Write over an io::Write that keeps the
+// io::Error a write gave (fmt::Error carries nothing).
+struct Adapter<'a, W: ?Sized> {
+    inner: &'a mut W,
+    error: Result<()>,
+}
+
+impl<'a, W: Write + ?Sized> crate::fmt::Write for Adapter<'a, W> {
+    fn write_str(&mut self, s: &str) -> crate::fmt::Result {
+        match self.inner.write_all(s.as_bytes()) {
+            crate::result::Result::Ok(()) => crate::result::Result::Ok(()),
+            crate::result::Result::Err(e) => {
+                self.error = crate::result::Result::Err(e);
+                crate::result::Result::Err(crate::fmt::Error {})
+            }
+        }
+    }
+}
+
+// UNSAFE: the OS's calls under the standard streams and io::Error.
+// SAFETY: read and write take a buffer of n bytes they may read or fill;
+// __error returns this thread's errno; strerror a static C string. The
+// callers below pass slices' pointers and lengths.
+extern "C" {
+    #[link_name = "read"]
+    fn c_read(fd: i32, buf: *mut u8, n: usize) -> isize;
+    #[link_name = "write"]
+    fn c_write(fd: i32, buf: *const u8, n: usize) -> isize;
+    fn __error() -> *mut i32;
+    fn strerror(code: i32) -> *const u8;
+}
+
+// Up to buf.len() bytes from fd.
+fn sys_read(fd: i32, buf: &mut [u8]) -> Result<usize> {
+    // UNSAFE: the OS's read.
+    // SAFETY: buf's pointer and length are a writable region of buf.len()
+    // bytes, borrowed for the call.
+    let n = unsafe { c_read(fd, buf.as_mut_ptr(), buf.len()) };
+    if n < 0 {
+        crate::result::Result::Err(Error::last_os_error())
+    } else {
+        crate::result::Result::Ok(n as usize)
+    }
+}
+
+// Some of buf to fd.
+fn sys_write(fd: i32, buf: &[u8]) -> Result<usize> {
+    // UNSAFE: the OS's write.
+    // SAFETY: buf's pointer and length are a readable region of buf.len()
+    // bytes, borrowed for the call.
+    let n = unsafe { c_write(fd, buf.as_ptr(), buf.len()) };
+    if n < 0 {
+        crate::result::Result::Err(Error::last_os_error())
+    } else {
+        crate::result::Result::Ok(n as usize)
     }
 }
 
@@ -106,7 +238,25 @@ pub enum ErrorKind {
 
 impl Display for ErrorKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
-        crate::panic::todo()
+        f.write_str(match *self {
+            ErrorKind::NotFound => "entity not found",
+            ErrorKind::PermissionDenied => "permission denied",
+            ErrorKind::AlreadyExists => "entity already exists",
+            ErrorKind::WouldBlock => "operation would block",
+            ErrorKind::InvalidInput => "invalid input parameter",
+            ErrorKind::InvalidData => "invalid data",
+            ErrorKind::TimedOut => "timed out",
+            ErrorKind::WriteZero => "write zero",
+            ErrorKind::Interrupted => "operation interrupted",
+            ErrorKind::UnexpectedEof => "unexpected end of file",
+            ErrorKind::BrokenPipe => "broken pipe",
+            ErrorKind::NotADirectory => "not a directory",
+            ErrorKind::IsADirectory => "is a directory",
+            ErrorKind::DirectoryNotEmpty => "directory not empty",
+            ErrorKind::Unsupported => "unsupported",
+            ErrorKind::OutOfMemory => "out of memory",
+            ErrorKind::Other => "other error",
+        })
     }
 }
 
@@ -118,19 +268,56 @@ pub trait Read {
 
     // Exactly buf.len() bytes, or UnexpectedEof.
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
-        crate::panic::todo()
+        let mut buf = buf;
+        while !buf.is_empty() {
+            match self.read(buf) {
+                crate::result::Result::Ok(0) => {
+                    return crate::result::Result::Err(Error::new(ErrorKind::UnexpectedEof,
+                        "failed to fill whole buffer"));
+                }
+                crate::result::Result::Ok(n) => {
+                    let rest = buf;
+                    buf = &mut rest[n..];
+                }
+                crate::result::Result::Err(e) => {
+                    if e.kind() != ErrorKind::Interrupted {
+                        return crate::result::Result::Err(e);
+                    }
+                }
+            }
+        }
+        crate::result::Result::Ok(())
     }
 
     // Everything left, appended to buf (grown from buf's allocator).
     // std2: changed: a usize
     fn read_to_end<A: Allocator>(&mut self, buf: &mut Vec<u8, A>) -> Result<usize> {
-        crate::panic::todo()
+        let start = buf.len();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match self.read(&mut chunk) {
+                crate::result::Result::Ok(0) => break,
+                crate::result::Result::Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                crate::result::Result::Err(e) => {
+                    if e.kind() != ErrorKind::Interrupted {
+                        return crate::result::Result::Err(e);
+                    }
+                }
+            }
+        }
+        crate::result::Result::Ok(buf.len() - start)
     }
 
     // Everything left, appended to buf; InvalidData when it is not UTF-8.
     // std2: changed: a usize
     fn read_to_string<A: Allocator>(&mut self, buf: &mut String<A>) -> Result<usize> {
-        crate::panic::todo()
+        // UNSAFE: the bytes are appended to the String's Vec unchecked.
+        // SAFETY: they are checked right after, and cut off again when they
+        // are not UTF-8, so the String is UTF-8 whenever it is used.
+        let v = unsafe { buf.as_mut_vec() };
+        let start = v.len();
+        let r = self.read_to_end(v);
+        append_utf8(v, start, r)
     }
 
     // The reader borrowed: adapters on it leave it usable after.
@@ -153,12 +340,40 @@ pub trait Write {
 
     // All of buf (write until it is written, or an error).
     fn write_all(&mut self, buf: &[u8]) -> Result<()> {
-        crate::panic::todo()
+        let mut buf = buf;
+        while !buf.is_empty() {
+            match self.write(buf) {
+                crate::result::Result::Ok(0) => {
+                    return crate::result::Result::Err(Error::new(ErrorKind::WriteZero,
+                        "failed to write whole buffer"));
+                }
+                crate::result::Result::Ok(n) => buf = &buf[n..],
+                crate::result::Result::Err(e) => {
+                    if e.kind() != ErrorKind::Interrupted {
+                        return crate::result::Result::Err(e);
+                    }
+                }
+            }
+        }
+        crate::result::Result::Ok(())
     }
 
     // x as its Display shows it (the compiler's `write(w, "..")`).
     fn write_fmt<T: Display>(&mut self, x: T) -> Result<()> {
-        crate::panic::todo()
+        let mut out = Adapter { inner: self, error: crate::result::Result::Ok(()) };
+        let r = {
+            let mut f = Formatter::new(&mut out);
+            crate::fmt::Display::fmt(&x, &mut f)
+        };
+        match r {
+            crate::result::Result::Ok(()) => crate::result::Result::Ok(()),
+            crate::result::Result::Err(_) => match out.error {
+                crate::result::Result::Err(e) => crate::result::Result::Err(e),
+                crate::result::Result::Ok(()) => {
+                    crate::result::Result::Err(Error::new(ErrorKind::Other, "formatter error"))
+                }
+            },
+        }
     }
 
     fn by_ref(&mut self) -> &mut Self
@@ -182,14 +397,49 @@ pub trait BufRead: Read {
     // The bytes up to and including delim (or the end), appended to buf.
     // mvs: BufReader::read_until
     fn read_until<A: Allocator>(&mut self, delim: u8, buf: &mut Vec<u8, A>) -> Result<usize> {
-        crate::panic::todo()
+        let mut read: usize = 0;
+        loop {
+            let (done, used) = {
+                let available = match self.fill_buf() {
+                    crate::result::Result::Ok(b) => b,
+                    crate::result::Result::Err(e) => {
+                        if e.kind() == ErrorKind::Interrupted {
+                            continue;
+                        }
+                        return crate::result::Result::Err(e);
+                    }
+                };
+                let mut i: usize = 0;
+                while i < available.len() && available[i] != delim {
+                    i += 1;
+                }
+                if i < available.len() {
+                    buf.extend_from_slice(&available[..i + 1]);
+                    (true, i + 1)
+                } else {
+                    buf.extend_from_slice(available);
+                    (false, available.len())
+                }
+            };
+            self.consume(used);
+            read += used;
+            if done || used == 0 {
+                return crate::result::Result::Ok(read);
+            }
+        }
     }
 
     // A line, its "\n" included, appended to buf; 0 at the end.
     // mvs: BufReader::read_line, read_line
     // std2: changed: BufRead's, a usize (MVS: a free function's bool, BufReader's i64)
     fn read_line<A: Allocator>(&mut self, buf: &mut String<A>) -> Result<usize> {
-        crate::panic::todo()
+        // UNSAFE: the bytes are appended to the String's Vec unchecked.
+        // SAFETY: they are checked right after, and cut off again when they
+        // are not UTF-8.
+        let v = unsafe { buf.as_mut_vec() };
+        let start = v.len();
+        let r = self.read_until(10, v);
+        append_utf8(v, start, r)
     }
 
     // Its lines, each a String on a clone of a, without its "\n".
@@ -214,7 +464,22 @@ impl<B: BufRead, A: Allocator + Clone> Iterator for Lines<B, A> {
     type Item = Result<String<A>>;
 
     fn next(&mut self) -> Option<Result<String<A>>> {
-        crate::panic::todo()
+        let mut s = String::new_in(self.alloc.clone());
+        match self.buf.read_line(&mut s) {
+            crate::result::Result::Ok(0) => Option::None,
+            crate::result::Result::Ok(_) => {
+                let nl: &str = "\n";
+                let cr: &str = "\r";
+                if s.ends_with(nl) {
+                    s.pop();
+                    if s.ends_with(cr) {
+                        s.pop();
+                    }
+                }
+                Option::Some(crate::result::Result::Ok(s))
+            }
+            crate::result::Result::Err(e) => Option::Some(crate::result::Result::Err(e)),
+        }
     }
 }
 
@@ -258,13 +523,29 @@ impl<R> BufReader<R> {
 
 impl<R: Read> Read for BufReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        crate::panic::todo()
+        // A read as large as the buffer, with nothing buffered, skips it.
+        if self.pos == self.filled && buf.len() >= 8192 {
+            return self.inner.read(buf);
+        }
+        let n = {
+            let rem = self.fill_buf()?;
+            let n = crate::cmp::min(rem.len(), buf.len());
+            buf[..n].copy_from_slice(&rem[..n]);
+            n
+        };
+        self.consume(n);
+        crate::result::Result::Ok(n)
     }
 }
 
 impl<R: Read> BufRead for BufReader<R> {
     fn fill_buf(&mut self) -> Result<&[u8]> {
-        crate::panic::todo()
+        if self.pos >= self.filled {
+            let n = self.inner.read(&mut self.buf)?;
+            self.filled = n;
+            self.pos = 0;
+        }
+        crate::result::Result::Ok(&self.buf[self.pos..self.filled])
     }
 
     fn consume(&mut self, n: usize) {
@@ -305,17 +586,52 @@ impl<W: Write> BufWriter<W> {
     // The writer, after a flush; the error and the BufWriter if it failed.
     // std2: changed: a Result (Rust's)
     pub fn into_inner(self) -> crate::result::Result<W, IntoInnerError<BufWriter<W>>> {
-        crate::panic::todo()
+        let mut me = self;
+        match me.flush_buf() {
+            crate::result::Result::Err(e) => {
+                crate::result::Result::Err(IntoInnerError { writer: me, error: e })
+            }
+            crate::result::Result::Ok(()) => {
+                // UNSAFE: the writer is moved out of a type with a Drop,
+                // which is then forgotten (Rust's into_inner does the same).
+                // SAFETY: me is forgotten right after, so its inner is not
+                // dropped twice, and its buffer is empty (flushed): its drop
+                // would only flush nothing.
+                let inner = unsafe { crate::ptr::read(&me.inner) };
+                crate::mem::forget(me);
+                crate::result::Result::Ok(inner)
+            }
+        }
+    }
+}
+
+impl<W: Write> BufWriter<W> {
+    // The buffer written out to the inner writer, then emptied.
+    fn flush_buf(&mut self) -> Result<()> {
+        let n = self.len;
+        self.inner.write_all(&self.buf[..n])?;
+        self.len = 0;
+        crate::result::Result::Ok(())
     }
 }
 
 impl<W: Write> Write for BufWriter<W> {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        crate::panic::todo()
+        if self.len + buf.len() > 8192 {
+            self.flush_buf()?;
+        }
+        if buf.len() >= 8192 {
+            return self.inner.write(buf);
+        }
+        let n = buf.len();
+        self.buf[self.len..self.len + n].copy_from_slice(buf);
+        self.len += n;
+        crate::result::Result::Ok(n)
     }
 
     fn flush(&mut self) -> Result<()> {
-        crate::panic::todo()
+        self.flush_buf()?;
+        self.inner.flush()
     }
 }
 
@@ -357,7 +673,37 @@ impl Stdin {
     // mvs: read_line
     // std2: changed: Stdin's, returns the bytes read (MVS: a free function, a bool)
     pub fn read_line<A: Allocator>(&self, buf: &mut String<A>) -> Result<usize> {
-        crate::panic::todo()
+        // A byte at a time up to "\n": Stdin keeps no buffer, so nothing
+        // after the line is taken from fd 0.
+        // UNSAFE: the bytes are appended to the String's Vec unchecked.
+        // SAFETY: they are checked right after, and cut off again when they
+        // are not UTF-8.
+        let v = unsafe { buf.as_mut_vec() };
+        let start = v.len();
+        let mut b = [0u8; 1];
+        let mut r: Result<usize> = crate::result::Result::Ok(0);
+        loop {
+            match sys_read(self.fd, &mut b) {
+                crate::result::Result::Ok(0) => break,
+                crate::result::Result::Ok(_) => {
+                    v.push(b[0]);
+                    if b[0] == 10 {
+                        break;
+                    }
+                }
+                crate::result::Result::Err(e) => {
+                    if e.kind() != ErrorKind::Interrupted {
+                        r = crate::result::Result::Err(e);
+                        break;
+                    }
+                }
+            }
+        }
+        let r = match r {
+            crate::result::Result::Ok(_) => crate::result::Result::Ok(v.len() - start),
+            crate::result::Result::Err(e) => crate::result::Result::Err(e),
+        };
+        append_utf8(v, start, r)
     }
 
     // Its lines, each a String on a clone of a.
@@ -368,7 +714,7 @@ impl Stdin {
 
 impl Read for Stdin {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        crate::panic::todo()
+        sys_read(self.fd, buf)
     }
 }
 
@@ -384,11 +730,13 @@ pub fn stdout() -> Stdout {
 
 impl Write for Stdout {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        crate::panic::todo()
+        // Written through (no buffer yet: the sys tail's line buffering
+        // comes with the embedded std, 0.27.2's M3).
+        sys_write(self.fd, buf)
     }
 
     fn flush(&mut self) -> Result<()> {
-        crate::panic::todo()
+        crate::result::Result::Ok(())
     }
 }
 
@@ -403,7 +751,7 @@ pub fn stderr() -> Stderr {
 
 impl Write for Stderr {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        crate::panic::todo()
+        sys_write(self.fd, buf)
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -423,7 +771,22 @@ pub fn read_to_string_in<R: Read, A: Allocator>(r: R, a: A) -> Result<String<A>>
 
 // Everything from r, written to w; how many bytes.
 pub fn copy<R: Read + ?Sized, W: Write + ?Sized>(r: &mut R, w: &mut W) -> Result<u64> {
-    crate::panic::todo()
+    let mut buf = [0u8; 8192];
+    let mut total: u64 = 0;
+    loop {
+        let n = match r.read(&mut buf) {
+            crate::result::Result::Ok(0) => return crate::result::Result::Ok(total),
+            crate::result::Result::Ok(n) => n,
+            crate::result::Result::Err(e) => {
+                if e.kind() == ErrorKind::Interrupted {
+                    continue;
+                }
+                return crate::result::Result::Err(e);
+            }
+        };
+        w.write_all(&buf[..n])?;
+        total += n as u64;
+    }
 }
 
 // A reader with nothing in it.
@@ -476,7 +839,11 @@ impl<W: Write + ?Sized> Write for &mut W {
 // Bytes in memory as a reader (`Read for &[u8]`).
 impl Read for &[u8] {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        crate::panic::todo()
+        let n = crate::cmp::min(buf.len(), self.len());
+        let (a, b) = self.split_at(n);
+        buf[..n].copy_from_slice(a);
+        *self = b;
+        crate::result::Result::Ok(n)
     }
 }
 

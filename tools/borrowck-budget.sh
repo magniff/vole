@@ -39,7 +39,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
 pass_times() {
     i=0
     while [ $i -lt "$RUNS" ]; do
-        VOLE_CACHE=off "$COMPILER" check --time-passes --allow=borrowck.unchecked "$1" 2>&1
+        VOLE_CACHE=off "$COMPILER" check --time-passes "$1" 2>&1
         i=$((i + 1))
     done | awk '
         $2 == "ms" && $3 == "check" && NF == 3 { if (c == "" || $1 < c) c = $1 }

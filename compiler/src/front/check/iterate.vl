@@ -81,6 +81,20 @@ pub fn check_for_iter(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         seq = view;
         seq_ty = pcx.nodes[view].ty;
     }
+    // RULE: F22.1 (0.27.2: on std2, `for` is IntoIterator::into_iter and
+    // Iterator::next, whatever the sequence)
+    // (an array by value, `for x in [a, b]`, its elements by value: an
+    // index loop, as IntoIterator for [T; N] would give; RULE: F22.1. Of
+    // plain elements only: an owned element moved out by its index is not
+    // a move the places IR follows, and the array's drop would free it
+    // again; such an array is iterated as before, by reference, until std2
+    // has array::IntoIter)
+    let array_value = seq_ty > 0 && pcx.types[seq_ty].kind == TyKind::Array
+        && crate::front::own::kinds::is_plain_type(pcx.types[seq_ty].a, &pcx);
+    if crate::front::known::on_std2(pcx) && seq_ty != pcx.ty_error && !array_value
+        && crate::front::rust::rust_at(pcx.nodes[n].start, &pcx) {
+        return rust_for(n, seq, seq_ty, &pcx);
+    }
     var t = seq_ty;
     let through = is_pointer(t, pcx) && pcx.types[t].a != 0
         && is_iterable_kind(pcx.types[pcx.types[t].a].kind);
@@ -162,7 +176,7 @@ pub fn check_for_iter(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             pcx.nodes[rest].b = then;
         }
     } else if is_iterator {
-        rest = next_loop(n, ident(seq_sym, n, &pcx), &pcx);
+        rest = next_loop(n, ident(seq_sym, n, &pcx), false, &pcx);
     } else {
         rest = for_copy(n, pattern,
             method_call(ident(seq_sym, n, &pcx), intern_c(c"iter", &pcx), &pcx), body, &pcx);
@@ -192,6 +206,62 @@ pub fn check_for_iter(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     check_pattern(bind, seq_ty, &pcx);
     if through && is_borrow(seq, pcx) {
         // (`for x in &v`: a borrow, as `&v` passed directly is)
+        pcx.locals[pcx.nodes[bind].x].borrow = true;
+    }
+    after_stmt(drops, let_stmt, &pcx);
+    synth_expr(rest, &pcx);
+    pop_scope(&pcx);
+    pcx.nodes[n].ty = TY_UNIT;
+    TY_UNIT
+}
+
+// (0.27.2) `for pat in e body` of a rust program on std2, rewritten in
+// place as
+//     { let __for_seq = e;
+//       { let mut __for_it = __for_seq.into_iter();
+//         loop { match __for_it.next() { Some(pat) => body, _ => break } } } }
+// (e is checked already; `into_iter` is IntoIterator's, by the probe:
+// `impl<I: Iterator> IntoIterator for I` for an iterator, `for &'a
+// Vec<T, A>` for `&v`). Its type. RULE: F22.1
+fn rust_for(n: i64, seq: i64, seq_ty: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let start = pcx.nodes[n].start;
+    let end = pcx.nodes[n].end;
+    let seq_sym = intern_c(c"__for_seq", &pcx);
+    let it_sym = intern_c(c"__for_it", &pcx);
+    let bind = new_node(PatBind, start, end, &pcx);
+    pcx.nodes[bind].a = seq_sym;
+    let let_stmt = new_node(Let, start, end, &pcx);
+    pcx.nodes[let_stmt].a = bind;
+    pcx.nodes[let_stmt].c = seq;
+    let it_bind = new_node(PatBind, start, end, &pcx);
+    pcx.nodes[it_bind].a = it_sym;
+    pcx.nodes[it_bind].b = 1;
+    let it_let = new_node(Let, start, end, &pcx);
+    pcx.nodes[it_let].a = it_bind;
+    pcx.nodes[it_let].c = method_call(ident(seq_sym, n, &pcx), intern_c(c"into_iter", &pcx),
+        &pcx);
+    let lp = next_loop(n, ident(it_sym, n, &pcx), true, &pcx);
+    let lp_stmt = new_node(ExprStmt, start, end, &pcx);
+    pcx.nodes[lp_stmt].a = lp;
+    pcx.nodes[lp_stmt].b = 1;
+    let rest = new_node(Block, start, end, &pcx);
+    let rmark = list_begin(pcx);
+    list_push(it_let, &pcx);
+    list_push(lp_stmt, &pcx);
+    list_end(rest, rmark, &pcx);
+    let rest_stmt = new_node(ExprStmt, start, end, &pcx);
+    pcx.nodes[rest_stmt].a = rest;
+    pcx.nodes[rest_stmt].b = 1;
+    let outer = new_node(Block, start, end, &pcx);
+    let mark = list_begin(pcx);
+    list_push(let_stmt, &pcx);
+    list_push(rest_stmt, &pcx);
+    list_end(outer, mark, &pcx);
+    pcx.nodes[n] = pcx.nodes[outer];
+    push_scope(&pcx);
+    let drops = block_begin(n, &pcx);
+    check_pattern(bind, seq_ty, &pcx);
+    if is_borrow(seq, pcx) {
         pcx.locals[pcx.nodes[bind].x].borrow = true;
     }
     after_stmt(drops, let_stmt, &pcx);
@@ -298,7 +368,7 @@ fn index_loop(n: i64, t: i64, refs: i64, pcx: inout Ctx<Comp>) -> i64 {
 
 // label: loop { match it.next() { std::Option::Some(p) => body, _ => break } }
 // for `for` loop n (its label, pattern and body).
-fn next_loop(n: i64, it: i64, pcx: inout Ctx<Comp>) -> i64 {
+fn next_loop(n: i64, it: i64, std2: bool, pcx: inout Ctx<Comp>) -> i64 {
     let start = pcx.nodes[n].start;
     let end = pcx.nodes[n].end;
     let m = new_node(Match, start, end, &pcx);
@@ -308,6 +378,10 @@ fn next_loop(n: i64, it: i64, pcx: inout Ctx<Comp>) -> i64 {
     let prefix = new_node(Path, start, end, &pcx);
     let pmark = list_begin(pcx);
     list_push(std_seg, &pcx);
+    if std2 {
+        // (std2's Option is std::option::Option)
+        list_push(ident(intern_c(c"option", &pcx), n, &pcx), &pcx);
+    }
     list_end(prefix, pmark, &pcx);
     pcx.nodes[some].h = prefix;
     pcx.nodes[some].a = intern_c(c"Option", &pcx);
@@ -412,6 +486,9 @@ fn block_of_tail(e: i64, n: i64, pcx: inout Ctx<Comp>) -> i64 {
 // { start: a, end: b, done: false }`) in its place. Its type.
 pub fn range_value(n: i64, expected: i64, pcx: inout Ctx<Comp>) -> i64 {
     let inclusive = pcx.nodes[n].c != 0;
+    if crate::front::known::on_std2(pcx) && crate::front::rust::rust_at(pcx.nodes[n].start, &pcx) {
+        return std2_range_value(n, expected, &pcx);
+    }
     if pcx.nodes[n].a == 0 || pcx.nodes[n].b == 0 {
         type_error(n, c"a range used as a value needs both ends: 'a..b'", &pcx);
     }
@@ -436,6 +513,64 @@ pub fn range_value(n: i64, expected: i64, pcx: inout Ctx<Comp>) -> i64 {
     }
     list_end(lit, mark, &pcx);
     pcx.nodes[n] = pcx.nodes[lit];
+    if expected != 0 { check_expr(n, expected, &pcx) } else { synth_expr(n, &pcx) }
+}
+
+// RULE: Z3.1 (0.27.2) Range n as a value on std2: std2's ops types,
+// `std::ops::Range { start: a, end: b }`, `RangeFrom { start }`,
+// `RangeTo { end }`, `RangeToInclusive { end }`, `RangeFull {}`, and
+// `std::ops::RangeInclusive::new(a, b)` (its fields are private, as
+// Rust's), in its place. Its type.
+fn std2_range_value(n: i64, expected: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let inclusive = pcx.nodes[n].c != 0;
+    let lo = pcx.nodes[n].a;
+    let hi = pcx.nodes[n].b;
+    let start = pcx.nodes[n].start;
+    let end = pcx.nodes[n].end;
+    let name = if lo != 0 && hi != 0 && inclusive { c"RangeInclusive" }
+        else if lo != 0 && hi != 0 { c"Range" }
+        else if lo != 0 { c"RangeFrom" }
+        else if hi != 0 && inclusive { c"RangeToInclusive" }
+        else if hi != 0 { c"RangeTo" }
+        else { c"RangeFull" };
+    let type_sym = intern_c(name, &pcx);
+    var e = 0;
+    if lo != 0 && hi != 0 && inclusive {
+        // std::ops::RangeInclusive::new(a, b)
+        let callee = new_node(Path, start, end, &pcx);
+        let pmark = list_begin(pcx);
+        list_push(ident(intern_c(c"std", &pcx), n, &pcx), &pcx);
+        list_push(ident(intern_c(c"ops", &pcx), n, &pcx), &pcx);
+        list_push(ident(type_sym, n, &pcx), &pcx);
+        list_push(ident(intern_c(c"new", &pcx), n, &pcx), &pcx);
+        list_end(callee, pmark, &pcx);
+        pcx.nodes[callee].a = type_sym;
+        pcx.nodes[callee].b = intern_c(c"new", &pcx);
+        e = new_node(crate::front::ast::NodeKind::Call, start, end, &pcx);
+        pcx.nodes[e].a = callee;
+        let amark = list_begin(pcx);
+        list_push(lo, &pcx);
+        list_push(hi, &pcx);
+        list_end(e, amark, &pcx);
+    } else {
+        e = new_node(StructLit, start, end, &pcx);
+        pcx.nodes[e].a = type_sym;
+        let prefix = new_node(Path, start, end, &pcx);
+        let pmark = list_begin(pcx);
+        list_push(ident(intern_c(c"std", &pcx), n, &pcx), &pcx);
+        list_push(ident(intern_c(c"ops", &pcx), n, &pcx), &pcx);
+        list_end(prefix, pmark, &pcx);
+        pcx.nodes[e].h = prefix;
+        let mark = list_begin(pcx);
+        if lo != 0 {
+            list_push(field_init(intern_c(c"start", &pcx), lo, &pcx), &pcx);
+        }
+        if hi != 0 {
+            list_push(field_init(intern_c(c"end", &pcx), hi, &pcx), &pcx);
+        }
+        list_end(e, mark, &pcx);
+    }
+    pcx.nodes[n] = pcx.nodes[e];
     if expected != 0 { check_expr(n, expected, &pcx) } else { synth_expr(n, &pcx) }
 }
 

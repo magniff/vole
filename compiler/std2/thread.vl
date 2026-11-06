@@ -2,24 +2,289 @@
 // std::thread: scoped threads, spawned threads, and the thread's own
 // queries. `thread::scope` is the safe way to share a borrow with
 // threads: every thread spawned in the scope is joined before it returns,
-// so they may borrow what outlives the scope ('env). It allocates
-// nothing of its own. `spawn_in(f, a)` runs a 'static closure on a thread
+// so they may borrow what outlives the scope ('env). It takes no
+// allocator: its threads' records come from C's heap, as Rust's from the
+// global one. `spawn_in(f, a)` runs a 'static closure on a thread
 // of its own, its closure and result kept on a (plan §2: MVS's spawn
 // allocated through C, unnamed). A panic in any thread ends the process
 // with 101 (decision 18), so `join` never returns an Err; it returns a
 // Result anyway, so that `.join().unwrap()` reads as in Rust.
 
-use crate::alloc::Allocator;
+use crate::alloc::{AllocError, Allocator, Layout};
+use crate::cell::Cell;
 use crate::fmt::{Debug, Formatter};
 use crate::marker::PhantomData;
+use crate::option::Option;
+use crate::ptr::NonNull;
+
+// UNSAFE: C's heap and POSIX threads, which take raw pointers.
+// SAFETY: the prototypes are stdlib.h's, pthread.h's, sched.h's and
+// unistd.h's (pthread_t as u64, as on macOS and Linux), as MVS's thread.
+extern "C" {
+    #[link_name = "malloc"]
+    fn thread_c_malloc(n: usize) -> *mut u8;
+    #[link_name = "free"]
+    fn thread_c_free(p: *mut u8);
+    #[link_name = "pthread_create"]
+    fn thread_c_create(t: *mut u64, attr: *const u8, f: extern "C" fn(*mut u8) -> *mut u8,
+        arg: *mut u8) -> i32;
+    #[link_name = "pthread_join"]
+    fn thread_c_join(t: u64, ret: *mut u64) -> i32;
+    #[link_name = "pthread_detach"]
+    fn thread_c_detach(t: u64) -> i32;
+    #[link_name = "pthread_attr_init"]
+    fn thread_c_attr_init(a: *mut u8) -> i32;
+    #[link_name = "pthread_attr_setstacksize"]
+    fn thread_c_attr_setstacksize(a: *mut u8, size: usize) -> i32;
+    #[link_name = "pthread_attr_destroy"]
+    fn thread_c_attr_destroy(a: *mut u8) -> i32;
+    #[link_name = "sched_yield"]
+    fn thread_c_yield() -> i32;
+    #[link_name = "sysconf"]
+    fn thread_c_sysconf(name: i32) -> i64;
+}
+
+// Built in: the compiler lowers a std function named atomic_* to the
+// instruction, as MVS's std::sync::atomic (order: 1 Acquire, 2 Release,
+// 3 AcqRel); the bodies never run.
+// UNSAFE: p is read or written atomically through a raw pointer.
+// SAFETY: a contract on the caller: p valid, aligned, shared only through
+// atomics.
+unsafe fn atomic_load<T>(p: *const T, order: i64) -> T {
+    crate::panic::unreachable()
+}
+
+// UNSAFE: as atomic_load.
+// SAFETY: as atomic_load.
+unsafe fn atomic_store<T>(p: *mut T, v: T, order: i64) {
+    crate::panic::unreachable()
+}
+
+// UNSAFE: as atomic_load.
+// SAFETY: as atomic_load.
+unsafe fn atomic_sub<T>(p: *mut T, v: T, order: i64) -> T {
+    crate::panic::unreachable()
+}
+
+const ACQUIRE: i64 = 1;
+const RELEASE: i64 = 2;
+const ACQ_REL: i64 = 3;
+
+// _SC_NPROCESSORS_ONLN (macOS's number; 84 on Linux).
+const SC_NPROCESSORS_ONLN: i32 = 58;
+
+// The stack of a new thread: 8 MiB (macOS's default past the first
+// thread is 512 KiB), as MVS's.
+const THREAD_STACK: usize = 8388608;
+
+// C's heap, for a scope's records: a scope takes no allocator (Rust's
+// takes its records from the global heap the same way).
+#[derive(Clone, Copy)]
+struct CHeap {
+    sealed: (),
+}
+
+// UNSAFE: an Allocator impl over C's heap.
+// SAFETY: blocks come from malloc (16-aligned: enough for the records of
+// words, an Option and a closure it holds) and go back to free.
+unsafe impl Allocator for CHeap {
+    fn allocate(&self, layout: Layout) -> crate::result::Result<NonNull<u8>, AllocError> {
+        if layout.align() > 16 {
+            return crate::result::Result::Err(AllocError {});
+        }
+        // UNSAFE: C's malloc.
+        // SAFETY: it takes a size and returns a block or null.
+        let p = unsafe { thread_c_malloc(layout.size()) };
+        match NonNull::new(p) {
+            Option::Some(q) => crate::result::Result::Ok(q),
+            Option::None => crate::result::Result::Err(AllocError {}),
+        }
+    }
+
+    // UNSAFE: gives a block back to C's free.
+    // SAFETY: a contract on the caller (Allocator's): p is a block this
+    // allocator gave, so malloc's.
+    unsafe fn deallocate(&self, p: NonNull<u8>, layout: Layout) {
+        thread_c_free(p.as_ptr());
+    }
+}
+
+// What a thread shares with its handle: its result once done (done is
+// 1 then), and refs, the thread's and the handle's: the last of the two
+// frees it into alloc.
+struct Out<T, A: Allocator> {
+    result: Option<T>,
+    done: u32,
+    refs: u32,
+    alloc: A,
+}
+
+// The closure, moved to the thread, and where its result goes.
+struct Packet<F, T, A: Allocator> {
+    f: F,
+    out: *mut Out<T, A>,
+}
+
+// What the thread starts from (C's heap): run(data, this record).
+struct Start {
+    run: fn(*mut u8, *mut u8),
+    data: *mut u8,
+}
+
+// The thread's first frame (C's convention, what pthread_create takes).
+extern "C" fn thread_start(arg: *mut u8) -> *mut u8 {
+    // UNSAFE: the start record through its raw pointer.
+    // SAFETY: arg is the Start start_thread wrote for this thread only;
+    // it is read here and freed by run.
+    unsafe {
+        let s = arg as *mut Start;
+        let run = (*s).run;
+        let data = (*s).data;
+        run(data, arg);
+    }
+    crate::ptr::null_mut::<u8>()
+}
+
+// A record of T's layout from a; out of memory panics.
+fn new_record<T, A: Allocator>(a: &A, x: T) -> *mut T {
+    let p = match a.allocate(Layout::new::<T>()) {
+        crate::result::Result::Ok(p) => p.as_ptr() as *mut T,
+        crate::result::Result::Err(_) => {
+            let msg: &str = "memory allocation failed";
+            crate::panic::panic(msg)
+        }
+    };
+    // UNSAFE: x moved into the fresh block.
+    // SAFETY: p is a block of T's layout from a; the write drops nothing.
+    unsafe { crate::ptr::write(p, x) };
+    p
+}
+
+// Gives a record of T's layout back to a (its value moved out already).
+// UNSAFE: deallocates through the allocator.
+// SAFETY: a contract on the caller: p is new_record's block from a.
+unsafe fn free_record<T, A: Allocator>(a: &A, p: *mut T) {
+    match NonNull::new(p as *mut u8) {
+        Option::Some(q) => a.deallocate(q, Layout::new::<T>()),
+        Option::None => {}
+    }
+}
+
+// Drops the result (if any) and frees out into its own allocator.
+// UNSAFE: moves the record out through its raw pointer.
+// SAFETY: a contract on the caller: out is live and nobody uses it after.
+unsafe fn release_out<T, A: Allocator>(out: *mut Out<T, A>) {
+    let o = crate::ptr::read(out as *const Out<T, A>);
+    free_record(&o.alloc, out);
+    crate::mem::drop(o);
+}
+
+// The thread's work: the packet taken and freed, the closure called, its
+// result published, the thread's ref given up.
+fn thread_run<F: FnOnce() -> T, T, A: Allocator>(data: *mut u8, start: *mut u8) {
+    // UNSAFE: the packet, the start record and the result's place through
+    // raw pointers.
+    // SAFETY: data is the Packet start_thread wrote for this thread only:
+    // moved out and freed once; start is freed once into C's heap; out is
+    // live while refs > 0, and this thread holds one ref until its
+    // atomic_sub (AcqRel: the handle's side is ordered before the free).
+    unsafe {
+        let q = data as *mut Packet<F, T, A>;
+        let p = crate::ptr::read(q as *const Packet<F, T, A>);
+        let out = p.out;
+        free_record(&*(&(*out).alloc), q);
+        thread_c_free(start);
+        let r = (p.f)();
+        (*out).result = Option::Some(r);
+        atomic_store(&mut (*out).done as *mut u32, 1, RELEASE);
+        if atomic_sub(&mut (*out).refs as *mut u32, 1, ACQ_REL) == 1 {
+            release_out(out);
+        }
+    }
+}
+
+// Starts a thread running f, its records on a: its pthread_t and its
+// result's place.
+fn start_thread<F: FnOnce() -> T, T, A: Allocator>(f: F, a: A) -> (u64, *mut Out<T, A>) {
+    let out = new_record(&a, Out::<T, A> { result: Option::<T>::None, done: 0, refs: 2, alloc: a });
+    // UNSAFE: the records reached through raw pointers, and pthread_create.
+    // SAFETY: out is live (refs 2); the Packet and the Start go to the new
+    // thread only; attr is 128 bytes, more than a pthread_attr_t.
+    unsafe {
+        let q = new_record(&*(&(*out).alloc), Packet { f: f, out: out });
+        let s = thread_c_malloc(Layout::new::<Start>().size()) as *mut Start;
+        if s.is_null() {
+            let msg: &str = "memory allocation failed";
+            crate::panic::panic(msg);
+        }
+        crate::ptr::write(s, Start { run: thread_run::<F, T, A>, data: q as *mut u8 });
+        let mut attr: [u64; 16] = [0; 16];
+        let ap = &mut attr[0] as *mut u64 as *mut u8;
+        thread_c_attr_init(ap);
+        thread_c_attr_setstacksize(ap, THREAD_STACK);
+        let mut t: u64 = 0;
+        let rc = thread_c_create(&mut t as *mut u64, ap as *const u8, thread_start, s as *mut u8);
+        thread_c_attr_destroy(ap);
+        if rc != 0 {
+            let msg: &str = "failed to spawn thread";
+            crate::panic::panic(msg);
+        }
+        (t, out)
+    }
+}
+
+// Waits for thread t and takes its result, freeing its place.
+// UNSAFE: pthread_join and the result's place through its raw pointer.
+// SAFETY: a contract on the caller: t is out's thread, not joined or
+// detached yet, and out is not used after.
+unsafe fn join_thread<T, A: Allocator>(t: u64, out: *mut Out<T, A>) -> T {
+    thread_c_join(t, crate::ptr::null_mut::<u64>());
+    let r = crate::mem::replace(&mut *(&mut (*out).result), Option::None);
+    release_out(out);
+    match r {
+        Option::Some(x) => x,
+        Option::None => crate::panic::unreachable(),
+    }
+}
+
+// Whether out's thread has published its result.
+// UNSAFE: an atomic read through the raw pointer.
+// SAFETY: a contract on the caller: out is live.
+unsafe fn finished<T, A: Allocator>(out: *mut Out<T, A>) -> bool {
+    atomic_load(&(*out).done as *const u32, ACQUIRE) == 1
+}
+
+// A thread of a scope, in its list: joined when the scope ends unless its
+// handle joined it.
+struct ScopeNode {
+    native: u64,
+    joined: bool,
+    out: *mut u8,
+    join: fn(u64, *mut u8),
+    next: *mut ScopeNode,
+}
+
+// A scope node's join, erased: the thread joined and its result dropped.
+// Private, and called only by scope's end with its own node's pair.
+fn scope_join<T>(t: u64, out: *mut u8) {
+    // UNSAFE: the result's place through an erased pointer.
+    // SAFETY: the pair is one node's: out is the Out<T, CHeap> of thread
+    // t, not joined yet (the node is not marked joined).
+    crate::mem::drop(unsafe { join_thread(t, out as *mut Out<T, CHeap>) });
+}
 
 // join's result: never an Err in vole (a panic exits the process).
 pub type Result<T> = crate::result::Result<T, JoinError>;
 
 // A thread's panic, as join would report it: no value is ever made.
-#[derive(Debug)]
 pub struct JoinError {
     never: crate::convert::Infallible,
+}
+
+impl Debug for JoinError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        match self.never {}
+    }
 }
 
 // Runs f with a Scope, joins every thread spawned in it, and returns f's
@@ -32,14 +297,34 @@ pub fn scope<'env, F, T>(f: F) -> T
     where
         F: FnOnce(&Scope<'_, 'env>) -> T,
 {
-    crate::panic::todo()
+    let s = Scope {
+        first: Cell::new(crate::ptr::null_mut::<ScopeNode>()),
+        scope: PhantomData {},
+        env: PhantomData {},
+    };
+    let r = f(&s);
+    // UNSAFE: walks the scope's list through raw pointers.
+    // SAFETY: every node is one Scope::spawn made for s and freed here
+    // only, once; a node its handle joined is skipped.
+    unsafe {
+        let mut n = s.first.get();
+        while !n.is_null() {
+            let next = (*n).next;
+            if !(*n).joined {
+                ((*n).join)((*n).native, (*n).out);
+            }
+            free_record(&CHeap { sealed: () }, n);
+            n = next;
+        }
+    }
+    r
 }
 
 // The scope threads are spawned in. 'scope is the scope's own region
 // ('env outlives it); invariant in both, as Rust's.
 // std2: changed: two regions, invariant
 pub struct Scope<'scope, 'env: 'scope> {
-    threads: crate::cell::Cell<usize>,
+    first: Cell<*mut ScopeNode>,
     scope: PhantomData<&'scope mut &'scope ()>,
     env: PhantomData<&'env mut &'env ()>,
 }
@@ -57,7 +342,16 @@ impl<'scope, 'env> Scope<'scope, 'env> {
             F: FnOnce() -> T + Send + 'scope,
             T: Send + 'scope,
     {
-        crate::panic::todo()
+        let (t, out) = start_thread(f, CHeap { sealed: () });
+        let node = new_record(&CHeap { sealed: () }, ScopeNode {
+            native: t,
+            joined: false,
+            out: out as *mut u8,
+            join: scope_join::<T>,
+            next: self.first.get(),
+        });
+        self.first.set(node);
+        ScopedJoinHandle { native: t, out: out, node: node, scope: PhantomData {} }
     }
 }
 
@@ -65,20 +359,41 @@ impl<'scope, 'env> Scope<'scope, 'env> {
 // std2: changed: a region 'scope
 pub struct ScopedJoinHandle<'scope, T> {
     native: u64,
-    result: *mut crate::option::Option<T>,
+    out: *mut Out<T, CHeap>,
+    node: *mut ScopeNode,
     scope: PhantomData<&'scope ()>,
 }
+
+// UNSAFE: the handle reaches its result and its scope node through raw
+// pointers: stated, as Rust's (Send and Sync for every T).
+// SAFETY: as JoinHandle's; Scope::spawn asks T: Send, and the scope's node
+// is written only by join, which takes the handle.
+unsafe impl<'scope, T> Send for ScopedJoinHandle<'scope, T> {}
+// UNSAFE: as Send's, above.
+// SAFETY: `&ScopedJoinHandle` only reads the done flag, atomically.
+unsafe impl<'scope, T> Sync for ScopedJoinHandle<'scope, T> {}
 
 impl<'scope, T> ScopedJoinHandle<'scope, T> {
     // Waits for the thread and returns its value (always Ok).
     // std2: changed: a thread::Result
     pub fn join(self) -> Result<T> {
-        crate::panic::todo()
+        // UNSAFE: the scope's node and the thread's result through raw
+        // pointers.
+        // SAFETY: the node lives until the scope ends, which 'scope
+        // outlives; marked joined, the scope's end skips the thread, so it
+        // is joined once.
+        unsafe {
+            (*self.node).joined = true;
+            crate::result::Result::Ok(join_thread(self.native, self.out))
+        }
     }
 
     // Whether the thread has finished (join would not wait).
     pub fn is_finished(&self) -> bool {
-        crate::panic::todo()
+        // UNSAFE: an atomic read of the result's place.
+        // SAFETY: out lives until the thread is joined, by this handle's
+        // join (which takes it) or the scope's end ('scope outlives self).
+        unsafe { finished(self.out) }
     }
 }
 
@@ -93,44 +408,75 @@ pub fn spawn_in<F, T, A>(f: F, a: A) -> JoinHandle<T, A>
         T: Send + 'static,
         A: Allocator + Send + 'static,
 {
-    crate::panic::todo()
+    let (t, out) = start_thread(f, a);
+    JoinHandle { native: t, out: out }
 }
 
 // A spawned thread.
 // std2: changed: an allocator parameter
 pub struct JoinHandle<T, A: Allocator> {
     native: u64,
-    result: *mut crate::option::Option<T>,
-    alloc: A,
+    out: *mut Out<T, A>,
 }
+
+// UNSAFE: the handle reaches the thread's result through a raw pointer:
+// stated, as Rust's (Send and Sync for every T).
+// SAFETY: the result's place is shared with the thread by its refs count,
+// atomically (AcqRel), and read only by join, which takes the handle;
+// spawn_in asks T: Send and A: Send.
+unsafe impl<T, A: Allocator> Send for JoinHandle<T, A> {}
+// UNSAFE: as Send's, above.
+// SAFETY: `&JoinHandle` only reads the done flag, atomically (is_finished).
+unsafe impl<T, A: Allocator> Sync for JoinHandle<T, A> {}
 
 impl<T, A: Allocator> JoinHandle<T, A> {
     // Waits for the thread and returns its value (always Ok).
     // std2: changed: a thread::Result
     pub fn join(self) -> Result<T> {
-        crate::panic::todo()
+        let t = self.native;
+        let out = self.out;
+        crate::mem::forget(self);
+        // UNSAFE: pthread_join and the result's place.
+        // SAFETY: the handle held a ref, so out is live; it is forgotten, so
+        // its drop does not detach or free; the thread is joined once.
+        crate::result::Result::Ok(unsafe { join_thread(t, out) })
     }
 
     pub fn is_finished(&self) -> bool {
-        crate::panic::todo()
+        // UNSAFE: an atomic read of the result's place.
+        // SAFETY: the handle holds a ref, so out is live.
+        unsafe { finished(self.out) }
     }
 }
 
 // Detaches the thread: it runs on, its result dropped when it ends.
 impl<T, A: Allocator> crate::ops::Drop for JoinHandle<T, A> {
     fn drop(&mut self) {
-        crate::panic::todo()
+        // UNSAFE: pthread_detach and the result's place.
+        // SAFETY: out is live (the handle's ref); the last of the thread and
+        // the handle (refs, AcqRel) frees it, once.
+        unsafe {
+            thread_c_detach(self.native);
+            if atomic_sub(&mut (*self.out).refs as *mut u32, 1, ACQ_REL) == 1 {
+                release_out(self.out);
+            }
+        }
     }
 }
 
 // Lets the OS run another thread.
 pub fn yield_now() {
-    crate::panic::todo()
+    // UNSAFE: C's sched_yield.
+    // SAFETY: it takes nothing.
+    unsafe { thread_c_yield() };
 }
 
 // How many threads can run at once (the CPUs online); 1 when unknown.
 // (Rust's returns io::Result<NonZero<usize>>; vole's, a usize.)
 // std2: changed: usize
 pub fn available_parallelism() -> usize {
-    crate::panic::todo()
+    // UNSAFE: C's sysconf.
+    // SAFETY: it takes an int.
+    let n = unsafe { thread_c_sysconf(SC_NPROCESSORS_ONLN) };
+    if n < 1 { 1 } else { n as usize }
 }

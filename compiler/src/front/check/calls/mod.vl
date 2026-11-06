@@ -12,8 +12,8 @@ use crate::base::{
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{
-    err_begin, err_end, err_failed_name, err_fix, err_help, err_help_fmt, err_help_sym, err_int,
-    err_str, err_sym, err_try_fmt, err_try_tool,
+    err_begin, err_end, err_end_soft, err_failed_name, err_fix, err_help, err_help_fmt,
+    err_help_sym, err_int, err_str, err_sym, err_try_fmt, err_try_tool,
 };
 use crate::front::ambient::has_local_gpa;
 use crate::front::assoc::ensure_checked;
@@ -24,7 +24,7 @@ use crate::front::ast::NodeKind::{Call, Ident, Index, Range, Unary};
 use crate::front::check::{Res, is_std_named, name_error};
 use crate::front::check::args::{arity_help, int_limit_help, normalize_args};
 use crate::front::check::assign::is_place;
-use crate::front::check::collect::find_generic_method;
+use crate::front::check::collect::{find_generic_method, gm_after, gm_start};
 use crate::front::check::distinct::{distinct_method_error, is_utf8_text, null_test};
 use crate::front::check::interp::{direct_call, direct_kind};
 use crate::front::check::names::{Near, help_nearest, near_to, std_has};
@@ -33,7 +33,7 @@ use crate::front::check::unsafety::{U_METHOD, check_call_safety, is_borrow, unsa
 use crate::front::check::vectors::{sym_is_c, vector_method};
 use crate::front::convert::generic_trait_call;
 use crate::front::derive::intrinsic::{has_intrinsic_method, intrinsic_method};
-use crate::front::generics::{TPL_DISTINCT, TPL_SLICE, check_call_arg};
+use crate::front::generics::{TPL_DISTINCT, TPL_PATTERN, TPL_SLICE, check_call_arg};
 use crate::front::generics::instantiate::instantiate_call;
 use crate::front::lexer::{SUF_USIZE, Tok};
 use crate::front::modules::within_std;
@@ -45,6 +45,7 @@ use crate::front::types::{
     find_field, find_method, fn_param, is_compound, is_float, is_mut_slice, is_pointer, is_ref,
     is_vector, ptr_to, slice_of,
 };
+use crate::places::front::fn_param_count;
 
 // ---- Paths, variants and methods ----
 
@@ -73,6 +74,159 @@ pub fn method_of(t: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
         }
         -1
     }
+}
+
+// (0.27.2) The method or associated function `name` of type t from the
+// pattern impls (TPL_PATTERN, the rust edition's `impl<'a, T> Option<&'a
+// T>`, `impl<T> Tr for &T`): the first whose header matches t with its
+// bounds holding, or -1. RULE: F0.5(i), F5.1, F6.1
+pub fn pattern_method_of(t: i64, name: i64, pcx: inout Ctx<Comp>) -> i64 {
+    pattern_method_via(t, name, -1, &pcx)
+}
+
+// (0.27.2) pattern_method_of of trait `via`'s impls only (-1: any):
+// `Debug::fmt(&r, f)` is Debug's `impl<T> Debug for &T`, not Display's
+// of the same shape. RULE: F8.2
+pub fn pattern_method_via(t: i64, name: i64, via: i64, pcx: inout Ctx<Comp>) -> i64 {
+    var i = gm_start(TPL_PATTERN, name, pcx);
+    while i >= 0 {
+        let at = i;
+        i = gm_after(i, pcx);
+        if pcx.gmethods[at].ty != TPL_PATTERN || pcx.gmethods[at].name != name {
+            continue;
+        }
+        let f = pcx.gmethods[at].f;
+        if via >= 0 {
+            let im = crate::front::traits::impl_of_fn(f, pcx);
+            if im < 0 || pcx.traits_impls[im].tr != via {
+                continue;
+            }
+        }
+        if crate::front::traits::fn_pattern_bindings(f, t, &pcx) >= 0 {
+            return f;
+        }
+    }
+    -1
+}
+
+// (0.27.2) Of the methods `name` of type t (its own, or its template's:
+// tpl, 0 for none), the one a call `x.m()` of the rust edition
+// means, f0 being method_of's: an inherent one first; of the traits'
+// (none inherent), the one of trait `via` for `Tr::m(x)` (F8.2), else the
+// only one, and more than one is error method.ambiguous (rustc E0034),
+// with a qualified call per candidate. RULE: F9.1, F9.3
+fn trait_method_choice(n: i64, t: i64, tpl: i64, name: i64, f0: i64, via: i64,
+    pcx: inout Ctx<Comp>) -> i64 {
+    if via < 0 && crate::front::traits::impl_of_fn(f0, pcx) < 0 {
+        return f0;
+    }
+    // (the candidates, in TSCRATCH from mark)
+    let mark = pcx.tscratch.count;
+    let own = find_method(t, name, pcx) >= 0;
+    if own {
+        for i in 0..pcx.methods.len() as i64 {
+            if pcx.methods[i].ty == t && pcx.methods[i].name == name {
+                pcx.tscratch.push(pcx.methods[i].f);
+            }
+        }
+    } else if tpl != 0 {
+        var i = gm_start(tpl, name, pcx);
+        while i >= 0 {
+            if pcx.gmethods[i].ty == tpl && pcx.gmethods[i].name == name {
+                pcx.tscratch.push(pcx.gmethods[i].f);
+            }
+            i = gm_after(i, pcx);
+        }
+    }
+    var found = -1;
+    var count = 0;
+    for k in mark..pcx.tscratch.count {
+        let f = pcx.tscratch.get(k);
+        let imp = crate::front::traits::impl_of_fn(f, pcx);
+        if imp < 0 || via >= 0 && pcx.traits_impls[imp].tr != via {
+            continue;
+        }
+        count += 1;
+        if found < 0 {
+            found = f;
+        }
+    }
+    // RULE: D22.3, F9.3 (0.27.2: `x.m()` with x of a bounded parameter`s
+    // type, in an instance: the method of the bound that declares it, as
+    // the generic body read it, `msg.fmt(f)` with `M: Display`)
+    if count > 1 && via < 0 {
+        // (through the derefs the probe made: `value.fmt(f)` with `value:
+        // &T`, T = `&i32`, reads `*value`)
+        var recv = pcx.nodes[n].a;
+        while pcx.nodes[recv].kind == NodeKind::Unary && pcx.nodes[recv].op == Tok::Star {
+            recv = pcx.nodes[recv].b;
+        }
+        if pcx.nodes[recv].kind == NodeKind::Ident && pcx.nodes[recv].res == Res::Local
+            && pcx.nodes[recv].y >= 0 && pcx.locals[pcx.nodes[recv].y].tparam != 0 {
+            let p = pcx.locals[pcx.nodes[recv].y].tparam;
+            let bounds = pcx.nodes[p].h;
+            var chosen = -1;
+            var hits = 0;
+            for k in mark..pcx.tscratch.count {
+                let f = pcx.tscratch.get(k);
+                let imp = crate::front::traits::impl_of_fn(f, pcx);
+                if imp >= 0 && bounds != 0 && (0..pcx.nodes[bounds].count).any(|b|
+                    crate::front::traits::bound_trait(child(bounds, b, pcx), &pcx)
+                    == pcx.traits_impls[imp].tr) {
+                    chosen = f;
+                    hits += 1;
+                }
+            }
+            if hits == 1 {
+                pcx.tscratch.count = mark;
+                return chosen;
+            }
+        }
+    }
+    if count > 1 && via < 0 {
+        let saved_kind = pcx.err_kind;
+        pcx.err_kind = c"method.ambiguous";
+        err_begin(pcx.nodes[n].start, &pcx);
+        err_str(c"multiple applicable items: '", pcx);
+        err_sym(name, pcx);
+        err_str(c"' is a method of more than one trait for '", pcx);
+        err_type(t, pcx);
+        err_str(c"'", pcx);
+        err_help(c"call it through its trait to say which", pcx);
+        let recv = pcx.nodes[n].a;
+        for k in mark..pcx.tscratch.count {
+            let imp = crate::front::traits::impl_of_fn(pcx.tscratch.get(k), pcx);
+            if imp >= 0 {
+                let rest = if pcx.nodes[n].count > 0 { ", .." } else { "" };
+                err_try_fmt(format_args("{}::{}(&{}{})",
+                    sym_text(pcx.traits[pcx.traits_impls[imp].tr].name, pcx), sym_text(name, pcx),
+                    SRC[pcx.nodes[recv].start..pcx.nodes[recv].end], rest), pcx);
+            }
+        }
+        err_end_soft(&pcx);
+        pcx.err_kind = saved_kind;
+    }
+    pcx.tscratch.count = mark;
+    if found >= 0 { found } else { f0 }
+}
+
+// (0.27.2) The template whose method templates are t's, in method_of's
+// order, or 0 for none.
+fn method_template(t: i64, pcx: Ctx<Comp>) -> i64 {
+    let kind = pcx.types[t].kind;
+    if kind == TyKind::Struct {
+        return pcx.structs[pcx.types[t].a].tmpl;
+    }
+    if kind == TyKind::Enum {
+        // UNSAFE: ENUMS is the checker's global enum table, read as method_of reads it.
+        // SAFETY: t is an enum type, so its a is an index of ENUMS.
+        let tmpl = unsafe { ENUMS[pcx.types[t].a].tmpl };
+        return -tmpl;
+    }
+    if kind == TyKind::Distinct && pcx.types[t].count > 0 {
+        return TPL_DISTINCT + pcx.types[t].b;
+    }
+    if kind == TyKind::Slice { TPL_SLICE } else { 0 }
 }
 
 // Offers near the names of type t's methods (with `self`; with
@@ -347,13 +501,66 @@ pub fn whole_slice(place: i64, ty: i64, pcx: inout Ctx<Comp>) -> i64 {
     s
 }
 
+// RULE: F0.1, F6.3 (0.27.2) A `&mut self` method of a view (`impl str`'s
+// `make_ascii_uppercase`) called on a shared one, a `&str`: a write
+// through a shared reference, own.readonly (rustc E0596, "cannot borrow
+// `*s` as mutable, as it is behind a `&` reference").
+fn mut_view_receiver_error(n: i64, name: i64, t: i64, pcx: inout Ctx<Comp>) {
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"own.readonly";
+    err_begin(pcx.nodes[n].start, &pcx);
+    err_str(c"method '", pcx);
+    err_sym(name, pcx);
+    err_str(c"' takes '&mut self', but the receiver is a shared '", pcx);
+    err_type(t, pcx);
+    err_str(c"': it is read-only", pcx);
+    err_help(c"take the receiver as `&mut`, from a place declared `let mut`", pcx);
+    err_end_soft(&pcx);
+    pcx.err_kind = saved;
+}
+
+// RULE: F0.5, F22.1 (0.27.2) The method `name` of a pattern impl whose self
+// type is written `&mut [T]` (`impl<'a, T> IntoIterator for &'a mut [T]`)
+// for `&mut [T]` receiver type t, or -1 (a blanket impl's does not count).
+fn mut_slice_impl_method(t: i64, name: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let f = pattern_method_of(t, name, &pcx);
+    let im = if f >= 0 { crate::front::traits::impl_of_fn(f, pcx) } else { -1 };
+    if im < 0 {
+        return -1;
+    }
+    let h = pcx.nodes[pcx.traits_impls[im].node].b;
+    if h > 0 && pcx.nodes[h].kind == NodeKind::TySlice
+        && (pcx.nodes[h].p & crate::front::ast::NODE_REF_MUT) != 0 { f } else { -1 }
+}
+
 // `x.m(args)`: a call of method m of x's type (or of the type x points
 // to), with `&x` or `*x` as needed for its `self`; becomes an NodeKind::Call.
 pub fn synth_method(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         var receiver = pcx.nodes[n].a;
         let name = pcx.nodes[n].b;
+        // RULE: F8.2 (`Tr::m(x)`: the method of trait Tr, read before the
+        // receiver, which may be another such call)
+        let via = if pcx.via_node == n { pcx.via_trait } else { -1 };
+        // RULE: F18.1 (0.27.2: the expected type of the call, which the
+        // receiver's own checking overwrites, `(1..4).sum()` in a `let s:
+        // i64`: back for instantiate_call)
+        let hint = crate::front::generics::hint_for(n, pcx);
         var receiver_ty = synth_expr(receiver, &pcx);
+        if hint != 0 && crate::front::check::rust::rust_node(n, &pcx) {
+            pcx.hint_node = n;
+            pcx.hint_ty = hint;
+        }
+        // RULE: F0.5 (0.27.2: a receiver whose type is the error type has
+        // no candidates: the probe would offer any trait's method, an
+        // iterator adapter's `len`; its arguments are checked)
+        if receiver_ty == pcx.ty_error && pcx.ty_error != 0
+            && crate::front::check::rust::rust_node(n, &pcx) {
+            for i in 0..pcx.nodes[n].count {
+                synth_expr(child(n, i, pcx), &pcx);
+            }
+            return pcx.ty_error;
+        }
         // (0.20) a string literal has `str`'s methods, as Rust's `&str`:
         // `"a,b".split(',')`, `" 7 ".trim()`; and the ones std has only as
         // `_in` (0.26.3: `"a".to_uppercase()` is alloc.no_in, as on a `str`)
@@ -367,6 +574,9 @@ pub fn synth_method(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             receiver_ty = pcx.str_type;
             pcx.nodes[receiver].ty = pcx.str_type;
         }
+        // RULE: F6.2 (the receiver's type as written: the probe's steps
+        // start from it)
+        let probe_ty = receiver_ty;
         // (0.18.1) `tr.cell(i)` of a `tr: &&Table`, `s.len()` of an `s:
         // &[u8]`: read through to the reference (the slice) that has the
         // methods, as Rust does
@@ -377,7 +587,14 @@ pub fn synth_method(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             pcx.nodes[n].a = receiver;
         }
         // (0.17: a `&mut [T]` has `[T]`'s methods)
-        if is_mut_slice(receiver_ty, pcx) {
+        var recv_mut = is_mut_slice(receiver_ty, pcx);
+        // RULE: F0.5, F22.1 (0.27.2: a `&mut [T]` receiver has `impl .. for
+        // &'a mut [T]`'s methods first, `for x in s`'s IterMut, before
+        // `&[T]`'s)
+        let own_mut = recv_mut && crate::front::check::rust::rust_node(n, &pcx)
+            && pcx.types[receiver_ty].kind == TyKind::Slice
+            && mut_slice_impl_method(receiver_ty, name, &pcx) >= 0;
+        if recv_mut && !own_mut {
             receiver_ty = decay_ref(receiver_ty, &pcx);
         }
         // (0.16: an array place has its slice's methods: `a.iter()` is
@@ -412,7 +629,13 @@ pub fn synth_method(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             && (pcx.types[pcx.types[t].a].kind == TyKind::Struct
                 || pcx.types[pcx.types[t].a].kind == TyKind::Enum
                 || (method_of(t, name, pcx) < 0 && (method_of(pcx.types[t].a, name, pcx) >= 0
-                    || has_intrinsic_method(pcx.types[t].a, name, &pcx)))) {
+                    || has_intrinsic_method(pcx.types[t].a, name, &pcx)
+                    // RULE: F6.2 (0.27.2: `r.eq(&x)` with `r: &i32`: the
+                    // pointee's impl, a primitive's or a pattern impl's)
+                    || crate::front::check::rust::rust_node(n, &pcx)
+                    && (pattern_method_of(pcx.types[t].a, name, &pcx) >= 0
+                        || crate::front::convert::has_generic_trait_fn(pcx.types[t].a, name,
+                            &pcx))))) {
             t = pcx.types[t].a;
             through_pointer = true;
         }
@@ -426,7 +649,43 @@ pub fn synth_method(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             require_in_bounds(pcx.locals[pcx.nodes[receiver].y].tparam, name, pcx.nodes[n].start,
                 &pcx);
         }
-        var f0 = method_of(t, name, pcx);
+        var f0 = if own_mut { mut_slice_impl_method(t, name, &pcx) }
+            else { method_of(t, name, pcx) };
+        if f0 >= 0 && !own_mut && crate::front::check::rust::rust_node(n, &pcx) {
+            f0 = trait_method_choice(n, t, method_template(t, pcx), name, f0, via, &pcx);
+        }
+        // RULE: F0.5 (0.27.2: a pattern impl's method, first for the
+        // receiver's own type by value, `impl<'a, T> IntoIterator for &'a
+        // Vec<T, A>`, then for the type it points to)
+        if crate::front::check::rust::rust_node(n, &pcx) {
+            var pf = pattern_method_via(receiver_ty, name, via, &pcx);
+            if pf < 0 && receiver_ty != t {
+                // (`impl<'a> Tr for &'a S`: a concrete impl for a reference)
+                pf = method_of(receiver_ty, name, pcx);
+            }
+            // RULE: F6.2 (of t's method and the reference type's, the one
+            // rustc's probe finds first; the reference's when that says
+            // nothing and t is behind it)
+            let first = if pf >= 0 && f0 >= 0 && receiver_ty != t {
+                crate::front::check::rust::probe_first(n, f0, t, pf, receiver_ty, probe_ty, name,
+                    &pcx)
+            } else {
+                -1
+            };
+            if pf >= 0 && (f0 < 0 || first == pf || first < 0 && through_pointer) {
+                f0 = pf;
+                t = receiver_ty;
+                through_pointer = false;
+            } else if f0 < 0 {
+                f0 = pattern_method_via(t, name, via, &pcx);
+            }
+            // RULE: F6.2 (a by-value method of `&t` or `&mut t` before t's
+            // own: the receiver autoref'd)
+            if f0 >= 0 && !through_pointer && receiver_ty == t && via < 0
+                && crate::front::check::rust::autoref_first(n, f0, t, probe_ty, name, &pcx) {
+                return synth_expr(n, &pcx);
+            }
+        }
         // (0.20) a String has its `str`'s methods (Rust's Deref): `s.trim()`
         // is `s.as_str().trim()`; a PathBuf its Path's (`p.as_path()`)
         let string = pcx.types[t].kind == TyKind::Struct && is_std_named(t, c"String", pcx);
@@ -438,12 +697,23 @@ pub fn synth_method(n: i64, pcx: inout Ctx<Comp>) -> i64 {
                 let call = new_node(NodeKind::MethodCall, pcx.nodes[receiver].start,
                     pcx.nodes[receiver].end, &pcx);
                 pcx.nodes[call].a = receiver;
-                pcx.nodes[call].b = intern_c(if string { c"as_str" } else { c"as_path" }, &pcx);
+                // RULE: F0.1, F6.2 (0.27.2: a `&mut self` method of str on a
+                // String: its `as_mut_str`, DerefMut's)
+                let vm = method_of(view, name, pcx);
+                let as_mut = string && crate::front::check::rust::rust_node(n, &pcx)
+                    && fn_param_count(vm, pcx) > 0 && is_mut_slice(fn_param(vm, 0, pcx), pcx)
+                    && method_of(t, intern_c(c"as_mut_str", &pcx), pcx) >= 0;
+                pcx.nodes[call].b = intern_c(if as_mut { c"as_mut_str" }
+                    else if string { c"as_str" } else { c"as_path" }, &pcx);
                 let mark = list_begin(pcx);
                 list_end(call, mark, &pcx);
                 pcx.nodes[n].a = call;
                 receiver = call;
                 receiver_ty = synth_expr(call, &pcx);
+                if as_mut && is_mut_slice(receiver_ty, pcx) {
+                    recv_mut = true;
+                    receiver_ty = decay_ref(receiver_ty, &pcx);
+                }
                 t = receiver_ty;
                 through_pointer = false;
                 f0 = method_of(t, name, pcx);
@@ -474,6 +744,10 @@ pub fn synth_method(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         if f < 0 && crate::front::check::rust::rust_node(n, &pcx)
             && crate::front::check::rust::deref_receiver(n, t, name, &pcx) {
             // (0.27.0: a method of Deref's target, the rust edition's)
+            return synth_expr(n, &pcx);
+        }
+        if f < 0 && crate::front::check::rust::rust_node(n, &pcx)
+            && crate::front::check::rust::autoref_receiver(n, t, name, &pcx) {
             return synth_expr(n, &pcx);
         }
         if f < 0 {
@@ -511,7 +785,10 @@ pub fn synth_method(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             type_items_try(t, pcx);
             err_end(&pcx);
         }
-        if !is_method(f, pcx) {
+        // RULE: F8.2 (0.27.2: `Step::forward_checked(x, 1)`, a trait's
+        // function with no `self`, called by the trait's path: x is its first
+        // argument, and the impl is the one of its type, as a receiver's)
+        if !is_method(f, pcx) && !(via >= 0 && pcx.fns[f].param_count > 0) {
             err_begin(pcx.nodes[n].start, &pcx);
             err_str(c"'", pcx);
             err_type(t, pcx);
@@ -527,6 +804,14 @@ pub fn synth_method(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         }
         // (0.26.2: `b.push_fmt("{} {x}", a.b)`, `f.write("..", ..)`: a format
         // literal and its arguments made one Interp)
+        // RULE: F10.2, F21.3 (a method's `where Self: Tr` must hold for the
+        // receiver's type; a template's is checked with its instance)
+        if pcx.fns[f].generic == 0 && crate::front::check::rust::rust_node(n, &pcx)
+            && !crate::front::traits::where_preds_hold(pcx.fns[f].node, t, pcx.nodes[n].start,
+                true, &pcx) {
+            // (the method is not the type's: its body is not checked for it)
+            return pcx.ty_error;
+        }
         f = crate::front::check::format::format_call(n, f, true, &pcx);
         // (0.15: named arguments, defaults)
         normalize_args(n, f, 1, &pcx);
@@ -583,7 +868,11 @@ pub fn synth_method(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         } else if pcx.types[self_ty].kind == TyKind::Ptr && pcx.types[self_ty].a == t {
             // (`self: *T`, `self: &T`, `self: &mut T`)
             if !through_pointer {
-                if !is_place(receiver, pcx) && !is_compound(t, pcx) {
+                // RULE: F15.1 (0.27.2: the rust edition borrows a temporary
+                // receiver, `5i64.hash(&mut h)`, `a.len().cmp(&b.len())`,
+                // as `&5` borrows one)
+                if !is_place(receiver, pcx) && !is_compound(t, pcx)
+                    && !crate::front::check::rust::rust_node(n, &pcx) {
                     err_begin(pcx.nodes[n].start, &pcx);
                     err_str(c"method '", pcx);
                     err_sym(name, pcx);
@@ -617,6 +906,13 @@ pub fn synth_method(n: i64, pcx: inout Ctx<Comp>) -> i64 {
                 // (any other view: the own pass takes the call as a change
                 // of what it views, `s.sort()` of `let s = v.as_slice()`;
                 // threads::capture_write as a thread's write)
+            }
+        } else if is_mut_slice(self_ty, pcx) && decay_ref(self_ty, &pcx) == t {
+            // RULE: F0.1, F6.3 (0.27.2: `&mut self` of `impl str` on a str:
+            // the receiver must be a `&mut str`, a write through a `&str`
+            // is refused, rustc E0596)
+            if !recv_mut && !through_pointer && crate::front::check::rust::rust_node(n, &pcx) {
+                mut_view_receiver_error(n, name, t, &pcx);
             }
         } else {
             err_begin(pcx.nodes[n].start, &pcx);

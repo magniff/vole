@@ -17,12 +17,12 @@
 // variance of each user type (D5.3: variance_table) and of each slot of a
 // type (D5.4: slot_variances): what places/borrowck reads.
 
-use crate::base::{buf_int, buf_new, buf_slice, buf_str, sym_text};
+use crate::base::{buf_int, buf_new, buf_str, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::{NODE_REF, NODE_REF_MUT, NodeKind, child};
 use crate::front::parser::rust::lifetimes_of;
-use crate::front::types::{REF_MUT, REF_SHARED, TyKind, fn_param, type_elem, variant_field};
+use crate::front::types::{REF_MUT, REF_RAW, REF_SHARED, TyKind, fn_param, type_elem, variant_field};
 use crate::places::front::{enum_info, fn_node, fn_param_count, fn_ret, tlist_at};
 use crate::places::ir::{
     BK_RAW, BK_RAW_MUT, Body, PJ_CONST, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT, RV_REF,
@@ -43,6 +43,13 @@ pub const U_STATIC: i64 = 1;
 pub const U_NAMED: i64 = 2;
 pub const U_ELIDED: i64 = 3;
 pub const U_SUBST: i64 = 4;
+// (0.27.2) A closure body's (D19.4, D20.3): a bound region of its
+// signature (local; x: the parameter's local that introduces it, y: its
+// number), its env reference's 'e (local; x: the closure), a slot of its
+// type C (external; x: the closure, y: the position in slots(C)).
+pub const U_BOUND: i64 = 5;
+pub const U_ENV: i64 = 6;
+pub const U_CSLOT: i64 = 7;
 
 // Variances (D5.1), as bits: the meet is their union, `*` (bivariant)
 // the identity.
@@ -58,6 +65,11 @@ const B_ELIDED: i64 = 0;
 const B_STATIC: i64 = 1;
 const B_NAMED: i64 = 2;
 const B_PARAM: i64 = 3;
+// (0.27.2, D20.3) a slot of a projection read with no instance (bind_walk
+// with f = F_MARK: a closure's bound `F: FnMut(B, Self::Item) -> B`), an
+// X_C position subst_requirements ties to the instance's resolution
+const B_PROJ: i64 = 4;
+const F_MARK: i64 = -2;
 
 // A field map's entries other than an index of the owner's slots: the
 // slot is 'static's; it has no owner slot (an MVS std struct's view, R2).
@@ -78,20 +90,6 @@ pub fn rust_operands(f: i64, pcx: inout Ctx<Comp>) -> bool {
     let node = fn_node(f, pcx);
     rust_fn(f, &pcx) && ((pcx.nodes[node].p & crate::front::ast::FN_DERIVED) == 0
         || crate::front::contracts::expand::is_pre_fn(f, pcx))
-}
-
-// (0.27.1) borrowck.unchecked at closure body f (docs/design/borrowck.md
-// D10.4): its captured places are reached through the raw environment,
-// so its borrows are checked against each other and its own locals only;
-// the enclosing body keeps the captures borrowed. Once a function.
-pub fn unchecked_warning(f: i64, pcx: inout Ctx<Comp>) {
-    let node = fn_node(f, pcx);
-    let m = buf_new();
-    buf_str(m, c"the borrows inside this closure are checked against each other only: it reaches what it captures through the raw environment, which 0.27.2 types (its captures stay borrowed outside it)");
-    crate::base::diag::report_warning(pcx.nodes[node].start, 0, c"borrowck.unchecked",
-        buf_slice(m).ptr,
-        c"nothing to change; `--allow=borrowck.unchecked` hides this warning", &pcx);
-    let _ = sym_text(pcx.nodes[node].a, pcx);
 }
 
 // ---- The region variables of a body ----
@@ -508,7 +506,10 @@ fn slots_in(t: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
         return own + slots_in(pcx.types[t].a, depth + 1, pcx);
     }
     if k == TyKind::Slice {
-        return 1 + slots_in(pcx.types[t].a, depth + 1, pcx);
+        // RULE: Z9.1 (a fat raw pointer, `*const [T]`, has no region of its
+        // own, as a thin one: its pointee's slots)
+        let own = if pcx.types[t].b == REF_RAW { 0 } else { 1 };
+        return own + slots_in(pcx.types[t].a, depth + 1, pcx);
     }
     if k == TyKind::Array || k == TyKind::Distinct {
         return slots_in(pcx.types[t].a, depth + 1, pcx);
@@ -526,7 +527,8 @@ fn slots_in(t: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
         for i in 0..struct_field_count(s, pcx) {
             n += capture_slots(s, i, depth, pcx);
         }
-        return n;
+        // RULE: D19.1 (then X_C, the external signature regions)
+        return n + xc_count(s, pcx);
     }
     if k == TyKind::Struct || k == TyKind::Enum {
         var n = decl_lifetimes(adt_node(t, pcx), pcx);
@@ -579,17 +581,329 @@ pub fn capture_offset(t: i64, k: i64, pcx: Ctx<Comp>) -> i64 {
     off
 }
 
-// RULE: D10.3 Whether closure type t is `FnMut`: it writes a capture (or
-// takes a `&mut` of one), a by-`&mut` capture; else `Fn` (`FnOnce` is
-// 0.27.2's).
+// RULE: D19.3 Whether closure type t is `FnMut`: its kind (front/closures/
+// kinds.vl), or, before the kinds are known, a by-`&mut` capture (D10.3).
 pub fn closure_writes(t: i64, pcx: Ctx<Comp>) -> bool {
     let s = pcx.types[t].a;
+    let c = pcx.structs[s].closure - 1;
+    if c >= 0 && pcx.closures[c].kind != 0 {
+        return pcx.closures[c].kind == crate::front::closures::kinds::KIND_FN_MUT;
+    }
     for i in 0..struct_field_count(s, pcx) {
         if capture_mode(s, i, pcx) == 2 {
             return true;
         }
     }
     false
+}
+
+// RULE: D19.5 Whether closure type t is `FnOnce` (its env a value).
+pub fn closure_once(t: i64, pcx: Ctx<Comp>) -> bool {
+    let c = pcx.structs[pcx.types[t].a].closure - 1;
+    c >= 0 && pcx.closures[c].kind == crate::front::closures::kinds::KIND_FN_ONCE
+}
+
+// ---- A closure's signature regions (D19.1, D19.4, D20.3) ----
+
+// The number of X_C positions of closure struct s (0 before
+// closure_sig_slots, and for an MVS closure).
+fn xc_count(s: i64, pcx: Ctx<Comp>) -> i64 {
+    let id = pcx.structs[s].closure - 1;
+    if id < 0 { 0 } else { pcx.closures[id].xc_n }
+}
+
+// The closure whose body is function f (its CLOSURES index), or -1.
+pub fn closure_of_fn(f: i64, pcx: Ctx<Comp>) -> i64 {
+    let node = fn_node(f, pcx);
+    if node <= 0 || (pcx.nodes[node].p & crate::front::ast::FN_CLOSURE) == 0 {
+        return -1;
+    }
+    for id in 0..pcx.closures.len() as i64 {
+        if pcx.closures[id].f == f {
+            return id;
+        }
+    }
+    -1
+}
+
+// RULE: D20.3 The region positions of closure id's signature (its
+// parameters but the env, left to right, then its result; each type's
+// slots in D3.3's order): the parallel walk's entries into walk (four
+// words each, bind_walk's), read with bound bnode's types (generics btps)
+// when it is one, else with the annotations (instance inst and its Self
+// node resolving a projection, F_MARK marking one, B_PROJ), and each entry's class into codes:
+// an index of X_C (external: an inferred region, a named one, one of the
+// bound's instantiation), -1 'static, or -2 - g for bound region g (an
+// elided region of an input written, the bound's or the annotation's;
+// the result's elided region is the bound's input region when the bound
+// has one input region, E2, and else external: a closure's own signature
+// has no elision rule). at[i]: where parameter i's entries begin, at[n]
+// the result's, at[n + 1] the end. Returns |X_C|.
+fn closure_sig_walk(id: i64, bnode: i64, btps: i64, walk: inout Vec<i64, Comp>,
+    at: inout Vec<i64, Comp>, codes: inout Vec<i64, Comp>, inst: i64, self_node: i64,
+    pcx: Ctx<Comp>) -> i64 {
+    walk.clear();
+    at.clear();
+    codes.clear();
+    let f = pcx.closures[id].f;
+    let n = pcx.closures[id].node;
+    let e0 = if pcx.closures[id].capture_count > 0 { 1 } else { 0 };
+    let tps = if bnode > 0 { btps } else { 0 };
+    let np = fn_param_count(f, pcx);
+    var xc = 0;
+    var groups = 0;
+    for i in e0..np {
+        let start = walk.len() as i64 / 4;
+        at.push(start);
+        let k = i - e0;
+        var an = 0;
+        if bnode > 0 {
+            an = if k < pcx.nodes[bnode].count { child(bnode, k, pcx) } else { 0 };
+        } else if k < pcx.nodes[n].count {
+            an = pcx.nodes[child(n, k, pcx)].b;
+        }
+        bind_walk(an, fn_param(f, i, pcx), tps, self_node, -1, &walk, 0, pcx, inst);
+        for e in start..walk.len() as i64 / 4 {
+            let b = walk[4 * e];
+            if b == B_STATIC {
+                codes.push(-1);
+            } else if b == B_ELIDED && an > 0 {
+                codes.push(-2 - groups);
+                groups += 1;
+            } else {
+                codes.push(xc);
+                xc += 1;
+            }
+        }
+    }
+    let inputs = walk.len() as i64 / 4;
+    at.push(inputs);
+    let rn = if bnode > 0 { pcx.nodes[bnode].a } else { pcx.nodes[n].b };
+    bind_walk(rn, fn_ret(f, pcx), tps, self_node, -1, &walk, 0, pcx, inst);
+    for e in inputs..walk.len() as i64 / 4 {
+        let b = walk[4 * e];
+        if b == B_STATIC {
+            codes.push(-1);
+        } else if b == B_ELIDED && bnode > 0 && rn > 0 && inputs == 1 {
+            codes.push(codes[0]);
+        } else {
+            codes.push(xc);
+            xc += 1;
+        }
+    }
+    at.push(walk.len() as i64 / 4);
+    xc
+}
+
+// RULE: D19.1 Closure id's X_C, made once before the bodies (kinds.vl): its
+// count, and each position's variance (D5.2 through `fn(A..) -> R`: a
+// parameter's slot −, the result's +; one position at both: o), kept in
+// CAPTURE_LIST from xc_at.
+pub fn closure_sig_slots(id: i64, pcx: inout Ctx<Comp>) {
+    var walk = Vec::<i64, Comp>::new_in(Comp {});
+    var at = Vec::<i64, Comp>::new_in(Comp {});
+    var codes = Vec::<i64, Comp>::new_in(Comp {});
+    let xc = closure_sig_walk(id, pcx.closures[id].exp_node, pcx.closures[id].exp_tps, &walk, &at,
+        &codes, F_MARK, 0, pcx);
+    let f = pcx.closures[id].f;
+    let e0 = if pcx.closures[id].capture_count > 0 { 1 } else { 0 };
+    var vars = Vec::<i64, Comp>::new_in(Comp {});
+    for i in e0..fn_param_count(f, pcx) {
+        slot_variances(fn_param(f, i, pcx), V_CONTRA, &vars, pcx);
+    }
+    slot_variances(fn_ret(f, pcx), V_CO, &vars, pcx);
+    var vx = Vec::<i64, Comp>::new_in(Comp {});
+    for _ in 0..xc {
+        vx.push(V_BI);
+    }
+    for e in 0..codes.len() as i64 {
+        let q = codes[e];
+        if q >= 0 {
+            vx[q] = vx[q] | (if e < vars.len() as i64 { vars[e] } else { V_INV });
+        }
+    }
+    pcx.closures[id].xc_at = pcx.capture_list.count;
+    for q in 0..xc {
+        pcx.capture_list.push(vx[q]);
+    }
+    pcx.closures[id].xc_n = xc;
+}
+
+// RULE: D19.4, D20.3 Σ_β of closure id's body f: 'static; for a reference
+// env its 'e (U_ENV, local); one external universal per slot of C
+// (U_CSLOT), bound to the env's slots after 'e and to X_C's positions of
+// the signature; a local one per bound region (U_BOUND); the implied
+// bounds (D4.5) of the env's and the signature's types. No elision rule
+// and no elision error (D20.3).
+fn closure_sig(id: i64, f: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
+    sig.closure = id;
+    let nc = slot_count(pcx.closures[id].ty, pcx);
+    let nenv = nc - pcx.closures[id].xc_n;
+    for j in 0..nc {
+        let u = add_universal(U_CSLOT, id, j, &sig);
+        sig.cslots.push(u);
+    }
+    let e0 = if pcx.closures[id].capture_count > 0 { 1 } else { 0 };
+    if e0 == 1 {
+        let t = fn_param(f, 0, pcx);
+        sig.param_at.push(0);
+        sig.walk.clear();
+        bind_walk(0, t, 0, 0, -1, &sig.walk, 0, pcx, -1);
+        let base = if pcx.types[t].kind == TyKind::Ptr { 1 } else { 0 };
+        let n = sig.walk.len() as i64 / 4;
+        for e in 0..n {
+            var u = 0;
+            if e < base {
+                u = add_universal(U_ENV, id, 0, &sig);
+            } else if e - base < nc {
+                u = sig.cslots[e - base];
+            } else {
+                u = add_universal(U_ELIDED, 1, e, &sig);
+            }
+            sig.params.push(u);
+        }
+        for e in 0..n {
+            let up = sig.walk[4 * e + 3];
+            if up >= 0 {
+                sig.bounds.push(sig.params[e]);
+                sig.bounds.push(sig.params[up]);
+            }
+        }
+    }
+    var walk = Vec::<i64, Comp>::new_in(Comp {});
+    var at = Vec::<i64, Comp>::new_in(Comp {});
+    var codes = Vec::<i64, Comp>::new_in(Comp {});
+    let _ = closure_sig_walk(id, pcx.closures[id].exp_node, pcx.closures[id].exp_tps, &walk, &at,
+        &codes, F_MARK, 0, pcx);
+    let np = fn_param_count(f, pcx);
+    for i in e0..np {
+        let k = i - e0;
+        let base = sig.params.len() as i64;
+        sig.param_at.push(base);
+        for e in at[k]..at[k + 1] {
+            let u = code_universal(codes[e], i + 1, nenv, &sig);
+            sig.params.push(u);
+        }
+        push_decl_bounds(fn_param(f, i, pcx), false, base, &sig, pcx);
+        for e in at[k]..at[k + 1] {
+            let up = walk[4 * e + 3];
+            if up >= 0 {
+                sig.bounds.push(sig.params[base + e - at[k]]);
+                sig.bounds.push(sig.params[base + up - at[k]]);
+            }
+        }
+    }
+    sig.param_at.push(sig.params.len() as i64);
+    let r0 = at[np - e0];
+    let r1 = at[np - e0 + 1];
+    for e in r0..r1 {
+        let u = code_universal(codes[e], 0, nenv, &sig);
+        sig.ret.push(u);
+    }
+    push_decl_bounds(fn_ret(f, pcx), true, 0, &sig, pcx);
+    for e in r0..r1 {
+        let up = walk[4 * e + 3];
+        if up >= 0 {
+            sig.bounds.push(sig.ret[e - r0]);
+            sig.bounds.push(sig.ret[up - r0]);
+        }
+    }
+}
+
+// RULE: D4.5 The declared bounds of the structs and enums in type t
+// (`Scope<'scope, 'env: 'scope>`: 'env outlives 'scope), as pairs of t's
+// slot positions from off (a outlives b; b = -1: 'static), pushed to out.
+fn decl_pairs(t: i64, off: i64, depth: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Comp>) {
+    if t <= 0 || depth > 16 {
+        return;
+    }
+    let k = pcx.types[t].kind;
+    if k == TyKind::Ptr {
+        let own = if is_ref_kind(pcx.types[t].b) { 1 } else { 0 };
+        decl_pairs(pcx.types[t].a, off + own, depth + 1, &out, pcx);
+        return;
+    }
+    if k == TyKind::Slice {
+        let own = if pcx.types[t].b == REF_RAW { 0 } else { 1 };
+        decl_pairs(pcx.types[t].a, off + own, depth + 1, &out, pcx);
+        return;
+    }
+    if k == TyKind::Array || k == TyKind::Distinct {
+        decl_pairs(pcx.types[t].a, off, depth + 1, &out, pcx);
+        return;
+    }
+    if k == TyKind::Tuple {
+        var o = off;
+        for i in 0..pcx.types[t].count {
+            let e = type_elem(t, i, pcx);
+            decl_pairs(e, o, depth + 1, &out, pcx);
+            o += slot_count(e, pcx);
+        }
+        return;
+    }
+    if k != TyKind::Struct && k != TyKind::Enum
+        || k == TyKind::Struct && pcx.structs[pcx.types[t].a].closure != 0 {
+        return;
+    }
+    let node = adt_node(t, pcx);
+    let lts = if node > 0 { lifetimes_of(node, pcx) } else { 0 };
+    let nl = if lts > 0 { pcx.nodes[lts].count } else { 0 };
+    for i in 0..nl {
+        let bounds = pcx.nodes[child(lts, i, pcx)].h;
+        for j in 0..(if bounds > 0 { pcx.nodes[bounds].count } else { 0 }) {
+            let bs = pcx.nodes[child(bounds, j, pcx)].a;
+            if lifetime_binding(bs, pcx) == B_STATIC {
+                out.push(off + i);
+                out.push(-1);
+                continue;
+            }
+            for m in 0..nl {
+                if pcx.nodes[child(lts, m, pcx)].a == bs {
+                    out.push(off + i);
+                    out.push(off + m);
+                }
+            }
+        }
+    }
+    var o = off + nl;
+    for i in 0..adt_targ_count(t, pcx) {
+        let a = adt_targ(t, i, pcx);
+        decl_pairs(a, o, depth + 1, &out, pcx);
+        o += slot_count(a, pcx);
+    }
+}
+
+// The declared bounds of type t (decl_pairs), whose slots are the
+// universals sig.params[base..] (sig.ret[base..] when ret), as bounds of
+// sig.
+fn push_decl_bounds(t: i64, ret: bool, base: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
+    var pairs = Vec::<i64, Comp>::new_in(Comp {});
+    decl_pairs(t, 0, 0, &pairs, pcx);
+    let n = if ret { sig.ret.len() as i64 } else { sig.params.len() as i64 };
+    var i = 0;
+    while i + 1 < pairs.len() as i64 {
+        let a = base + pairs[i];
+        let b = if pairs[i + 1] < 0 { -1 } else { base + pairs[i + 1] };
+        if a < n && b < n {
+            let ua = if ret { sig.ret[a] } else { sig.params[a] };
+            let ub = if b < 0 { 0 } else if ret { sig.ret[b] } else { sig.params[b] };
+            sig.bounds.push(ua);
+            sig.bounds.push(ub);
+        }
+        i += 2;
+    }
+}
+
+// The universal of a closure signature position of class q
+// (closure_sig_walk's), in parameter local `param` (0: the result).
+fn code_universal(q: i64, param: i64, nenv: i64, sig: inout Sig<Comp>) -> i64 {
+    if q >= 0 {
+        return sig.cslots[nenv + q];
+    }
+    if q == -1 {
+        return 0;
+    }
+    add_universal(U_BOUND, param, -2 - q, &sig)
 }
 
 fn is_ref_kind(b: i64) -> bool {
@@ -693,8 +1007,17 @@ fn push_lifetime(sym: i64, up: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Comp>) {
 // (-1: none; D4.5's implied bounds). tps is the generics node of the type
 // parameters in scope; self_node the type `Self` names (0: none).
 fn bind_walk(n0: i64, t: i64, tps: i64, self_node: i64, up: i64, out: inout Vec<i64, Comp>,
-    depth: i64, pcx: Ctx<Comp>) {
+    depth: i64, pcx: Ctx<Comp>, f: i64) {
     if t <= 0 || depth > 16 {
+        return;
+    }
+    if proj_walk(n0, t, tps, self_node, up, &out, depth, f, pcx) {
+        return;
+    }
+    if f == F_MARK && proj_shape(n0, pcx) {
+        for j in 0..slot_count(t, pcx) {
+            push_entry(B_PROJ, 0, j, up, &out);
+        }
         return;
     }
     var n = n0;
@@ -709,6 +1032,17 @@ fn bind_walk(n0: i64, t: i64, tps: i64, self_node: i64, up: i64, out: inout Vec<
         }
         if self_node > 0 && sym_text(pcx.nodes[n].a, pcx) == "Self" {
             n = self_node;
+            // RULE: D4.4 (`Self` a type parameter, `impl<I: Iterator>
+            // IntoIterator for I`: its substitution's slots, as `I`'s)
+            if is_node(n, NodeKind::TyName, pcx) && pcx.nodes[n].list == 0 && pcx.nodes[n].g == 0 {
+                let ks = param_index(tps, pcx.nodes[n].a, pcx);
+                if ks >= 0 {
+                    for j in 0..slot_count(t, pcx) {
+                        push_entry(B_PARAM, ks, j, up, &out);
+                    }
+                    return;
+                }
+            }
         }
     }
     let k = pcx.types[t].kind;
@@ -720,10 +1054,18 @@ fn bind_walk(n0: i64, t: i64, tps: i64, self_node: i64, up: i64, out: inout Vec<
                 pcx.nodes[n].c
             } else { 0 };
             push_lifetime(lt, up, &out, pcx);
-            bind_walk(ast, pcx.types[t].a, tps, self_node, me, &out, depth + 1, pcx);
+            bind_walk(ast, pcx.types[t].a, tps, self_node, me, &out, depth + 1, pcx, f);
         } else {
-            bind_walk(ast, pcx.types[t].a, tps, self_node, up, &out, depth + 1, pcx);
+            bind_walk(ast, pcx.types[t].a, tps, self_node, up, &out, depth + 1, pcx, f);
         }
+        return;
+    }
+    if k == TyKind::Slice && pcx.types[t].b == REF_RAW {
+        // RULE: Z9.1 (a fat raw pointer: no region of its own)
+        // (written `*const [T]`: a TyPtr over the TySlice)
+        let sn = if is_node(n, NodeKind::TyPtr, pcx) { pcx.nodes[n].a } else { n };
+        let ast = if is_node(sn, NodeKind::TySlice, pcx) { pcx.nodes[sn].a } else { 0 };
+        bind_walk(ast, pcx.types[t].a, tps, self_node, up, &out, depth + 1, pcx, f);
         return;
     }
     if k == TyKind::Slice {
@@ -731,33 +1073,33 @@ fn bind_walk(n0: i64, t: i64, tps: i64, self_node: i64, up: i64, out: inout Vec<
         let slice = is_node(n, NodeKind::TySlice, pcx);
         push_lifetime(if slice { pcx.nodes[n].c } else { 0 }, up, &out, pcx);
         bind_walk(if slice { pcx.nodes[n].a } else { 0 }, pcx.types[t].a, tps, self_node, me,
-            &out, depth + 1, pcx);
+            &out, depth + 1, pcx, f);
         return;
     }
     if k == TyKind::Distinct {
         // (`str`: a view of bytes; its lifetime is its TyName's c, the
         // parser's for `&'a str`)
         let u = pcx.types[t].a;
-        if u > 0 && pcx.types[u].kind == TyKind::Slice {
+        if u > 0 && pcx.types[u].kind == TyKind::Slice && pcx.types[u].b != REF_RAW {
             let named = is_node(n, NodeKind::TyName, pcx) && sym_text(pcx.nodes[n].a, pcx) == "str";
             let me = out.len() as i64 / 4;
             push_lifetime(if named { pcx.nodes[n].c } else { 0 }, up, &out, pcx);
-            bind_walk(0, pcx.types[u].a, tps, self_node, me, &out, depth + 1, pcx);
+            bind_walk(0, pcx.types[u].a, tps, self_node, me, &out, depth + 1, pcx, f);
         } else {
-            bind_walk(0, u, tps, self_node, up, &out, depth + 1, pcx);
+            bind_walk(0, u, tps, self_node, up, &out, depth + 1, pcx, f);
         }
         return;
     }
     if k == TyKind::Array {
         let ast = if is_node(n, NodeKind::TyArray, pcx) { pcx.nodes[n].a } else { 0 };
-        bind_walk(ast, pcx.types[t].a, tps, self_node, up, &out, depth + 1, pcx);
+        bind_walk(ast, pcx.types[t].a, tps, self_node, up, &out, depth + 1, pcx, f);
         return;
     }
     if k == TyKind::Tuple {
         let tuple = is_node(n, NodeKind::TyTuple, pcx);
         for i in 0..pcx.types[t].count {
             let ast = if tuple && i < pcx.nodes[n].count { child(n, i, pcx) } else { 0 };
-            bind_walk(ast, type_elem(t, i, pcx), tps, self_node, up, &out, depth + 1, pcx);
+            bind_walk(ast, type_elem(t, i, pcx), tps, self_node, up, &out, depth + 1, pcx, f);
         }
         return;
     }
@@ -769,10 +1111,14 @@ fn bind_walk(n0: i64, t: i64, tps: i64, self_node: i64, up: i64, out: inout Vec<
                 let me = out.len() as i64 / 4;
                 push_lifetime(0, up, &out, pcx);
                 bind_walk(0, pcx.types[struct_field_ty(s, i, pcx)].a, tps, self_node, me, &out,
-                    depth + 1, pcx);
+                    depth + 1, pcx, f);
                 continue;
             }
-            bind_walk(0, struct_field_ty(s, i, pcx), tps, self_node, up, &out, depth + 1, pcx);
+            bind_walk(0, struct_field_ty(s, i, pcx), tps, self_node, up, &out, depth + 1, pcx, f);
+        }
+        // RULE: D19.1 (X_C: no AST; under `&'e C` each outlives 'e, D19.4)
+        for _ in 0..xc_count(s, pcx) {
+            push_entry(B_ELIDED, 0, 0, up, &out);
         }
         return;
     }
@@ -787,9 +1133,127 @@ fn bind_walk(n0: i64, t: i64, tps: i64, self_node: i64, up: i64, out: inout Vec<
         let args = if name { pcx.nodes[n].g } else { 0 };
         for i in 0..adt_targ_count(t, pcx) {
             let ast = if args > 0 && i < pcx.nodes[args].count { child(args, i, pcx) } else { 0 };
-            bind_walk(ast, adt_targ(t, i, pcx), tps, self_node, up, &out, depth + 1, pcx);
+            bind_walk(ast, adt_targ(t, i, pcx), tps, self_node, up, &out, depth + 1, pcx, f);
         }
     }
+}
+
+// RULE: D4.4 (a projection `I::Item`, `Self::Item` of instance f's
+// signature: the associated type the impl for the base's substitution S
+// defines, read with that impl's lifetimes and parameters, each of its
+// slots the slot of S it names, as rustc's normalization does; true when
+// written to out, false (no impl found: the walk reads it as elided) else)
+fn proj_walk(n: i64, t: i64, tps: i64, self_node: i64, up: i64, out: inout Vec<i64, Comp>,
+    depth: i64, f: i64, pcx: Ctx<Comp>) -> bool {
+    if f < 0 || !proj_shape(n, pcx) {
+        return false;
+    }
+    let first = child(n, 0, pcx);
+    let is_self = sym_text(pcx.nodes[first].a, pcx) == "Self";
+    // (S, and the bindings of S's slots in this signature)
+    var base = Vec::<i64, Comp>::new_in(Comp {});
+    var s = 0;
+    if is_self {
+        if self_node <= 0 {
+            return false;
+        }
+        s = pcx.fns[f].self_ty;
+        bind_walk(self_node, s, tps, 0, -1, &base, depth + 1, pcx, f);
+    } else {
+        let k = param_index(tps, pcx.nodes[first].a, pcx);
+        if k < 0 || k >= pcx.fns[f].targ_count {
+            return false;
+        }
+        s = tlist_at(pcx.fns[f].targs + k, pcx);
+        for j in 0..slot_count(s, pcx) {
+            push_entry(B_PARAM, k, j, -1, &base);
+        }
+    }
+    if s <= 0 {
+        return false;
+    }
+    for i in 0..pcx.traits_impls.len() as i64 {
+        let inode = pcx.traits_impls[i].node;
+        // (`Self::A` in the impl the function is in: its own definition,
+        // read in this signature's terms)
+        let own = is_self && pcx.nodes[inode].b == self_node;
+        if !own && !impl_for(i, s, pcx) {
+            continue;
+        }
+        let c = assoc_named(pcx.nodes[inode].c, pcx.nodes[n].a, pcx);
+        if c == 0 {
+            continue;
+        }
+        if own {
+            bind_walk(pcx.nodes[c].b, t, tps, self_node, up, &out, depth + 1, pcx, f);
+            return true;
+        }
+        let itps = pcx.nodes[inode].g;
+        var head = Vec::<i64, Comp>::new_in(Comp {});
+        bind_walk(pcx.nodes[inode].b, s, itps, 0, -1, &head, depth + 1, pcx, -1);
+        var val = Vec::<i64, Comp>::new_in(Comp {});
+        bind_walk(pcx.nodes[c].b, t, itps, pcx.nodes[inode].b, -1, &val, depth + 1, pcx, -1);
+        let at = out.len() as i64 / 4;
+        for e in 0..val.len() as i64 / 4 {
+            let b = val[4 * e];
+            let u = val[4 * e + 3];
+            let up2 = if u >= 0 { at + u } else { up };
+            var j = -1;
+            if b == B_NAMED || b == B_PARAM {
+                for h in 0..head.len() as i64 / 4 {
+                    if j < 0 && head[4 * h] == b && head[4 * h + 1] == val[4 * e + 1]
+                        && head[4 * h + 2] == val[4 * e + 2] {
+                        j = h;
+                    }
+                }
+            }
+            if b == B_STATIC {
+                push_entry(B_STATIC, 0, 0, up2, &out);
+            } else if j >= 0 && j < base.len() as i64 / 4 {
+                push_entry(base[4 * j], base[4 * j + 1], base[4 * j + 2], up2, &out);
+            } else {
+                push_entry(B_ELIDED, 0, 0, up2, &out);
+            }
+        }
+        return true;
+    }
+    false
+}
+
+// Whether type node n is a projection's, `Self::Item` or `I::Item` (one
+// segment before the name, no arguments, not `<T as Tr>::A`).
+fn proj_shape(n: i64, pcx: Ctx<Comp>) -> bool {
+    is_node(n, NodeKind::TyName, pcx) && pcx.nodes[n].count == 1 && pcx.nodes[n].g == 0
+        && (pcx.nodes[n].p & crate::front::ast::NODE_QPATH) == 0
+        && is_node(child(n, 0, pcx), NodeKind::Ident, pcx)
+}
+
+// Whether impl i is a direct impl for type s: s itself, or an instance
+// of the impl's template (a pattern impl, a blanket one, is not).
+fn impl_for(i: i64, s: i64, pcx: Ctx<Comp>) -> bool {
+    let ty = pcx.traits_impls[i].ty;
+    if ty != 0 {
+        return ty == s;
+    }
+    let tpl = pcx.traits_impls[i].tpl;
+    tpl != crate::front::generics::TPL_NONE && tpl != crate::front::generics::TPL_PATTERN
+        && crate::front::generics::instance_of(s, tpl, pcx)
+}
+
+// The associated type `name` (an AssocType node with a type) in impl
+// items holder h, or 0.
+fn assoc_named(h: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
+    if h == 0 {
+        return 0;
+    }
+    for i in 0..pcx.nodes[h].count {
+        let c = child(h, i, pcx);
+        if is_node(c, NodeKind::AssocType, pcx) && pcx.nodes[c].a == name
+            && pcx.nodes[c].b != 0 && (pcx.nodes[c].p & crate::front::ast::NODE_ASSOC_CONST) == 0 {
+            return c;
+        }
+    }
+    0
 }
 
 // ---- Signatures (D4.1, D4.2) ----
@@ -807,6 +1271,10 @@ pub struct Sig<A: Allocator> {
     pub ret: Vec<i64, A>,
     pub bounds: Vec<i64, A>,
     pub elision: i64,
+    // (0.27.2) a closure body's: its closure (-1: not one), the universal
+    // of each position of slots(C) (D19.4)
+    pub closure: i64,
+    pub cslots: Vec<i64, A>,
     walk: Vec<i64, A>,
 }
 
@@ -818,6 +1286,8 @@ pub fn sig_new() -> Sig<Comp> {
         ret: Vec::new_in(Comp {}),
         bounds: Vec::new_in(Comp {}),
         elision: 0,
+        closure: -1,
+        cslots: Vec::new_in(Comp {}),
         walk: Vec::new_in(Comp {}),
     }
 }
@@ -828,6 +1298,14 @@ pub fn universal_count(sig: Sig<Comp>) -> i64 {
 }
 
 fn add_universal(kind: i64, x: i64, y: i64, sig: inout Sig<Comp>) -> i64 {
+    if kind == U_BOUND {
+        // (one per bound region, whatever position names it first)
+        for u in 0..universal_count(sig) {
+            if sig.univ[3 * u] == U_BOUND && sig.univ[3 * u + 2] == y {
+                return u;
+            }
+        }
+    }
     if kind == U_NAMED || kind == U_SUBST {
         for u in 0..universal_count(sig) {
             if sig.univ[3 * u] == kind && sig.univ[3 * u + 1] == x && sig.univ[3 * u + 2] == y {
@@ -852,12 +1330,20 @@ pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
     sig.ret.clear();
     sig.bounds.clear();
     sig.elision = 0;
+    sig.closure = -1;
+    sig.cslots.clear();
     let _ = add_universal(U_STATIC, 0, 0, &sig);
     // (an instance's node is a clone without its generics and lifetimes:
     // its template's is read, with the instance's types)
     let tf = crate::places::front::fn_template(f, pcx);
     let node = fn_node(tf, pcx);
     let np = fn_param_count(f, pcx);
+    let cid = closure_of_fn(f, pcx);
+    if cid >= 0 && pcx.closures[cid].env_struct >= 0
+        && crate::front::rust::rust_at(pcx.nodes[node].start, &pcx) {
+        closure_sig(cid, f, &sig, pcx);
+        return;
+    }
     if !(is_node(node, NodeKind::Fn, pcx)
         && crate::front::rust::rust_at(pcx.nodes[node].start, &pcx)) {
         for i in 0..np {
@@ -900,8 +1386,9 @@ pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
         let tn = if is_node(pn, NodeKind::Param, pcx) { pcx.nodes[pn].b } else { 0 };
         let t = fn_param(f, i, pcx);
         sig.walk.clear();
-        bind_walk(tn, t, tps, self_node, -1, &sig.walk, 0, pcx);
+        bind_walk(tn, t, tps, self_node, -1, &sig.walk, 0, pcx, f);
         bind_entries(i + 1, tps, &sig, pcx);
+        push_decl_bounds(t, false, base, &sig, pcx);
         let count = sig.params.len() as i64 - base;
         for e in 0..count {
             let up = sig.walk[4 * e + 3];
@@ -911,20 +1398,28 @@ pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
                 sig.bounds.push(sig.params[base + up]);
             }
         }
-        if count > 0 && only < 0 {
-            only = sig.params[base];
+        // RULE: D4.2 (E2 counts the lifetimes written in the inputs, elided
+        // or not; a type parameter's slots are not one: `fn f<T>(a: &A, x:
+        // T) -> &T` borrows from a)
+        for e in 0..count {
+            if sig.walk[4 * e] != B_PARAM {
+                if only < 0 {
+                    only = sig.params[base + e];
+                }
+                inputs += 1;
+            }
         }
-        inputs += count;
         // RULE: D4.2 (E3: `&self`'s, `&mut self`'s reference region)
         if pn > 0 && self_u < 0 && count > 0 && sym_text(pcx.nodes[pn].a, pcx) == "self"
-            && pcx.types[t].kind == TyKind::Ptr && is_ref_kind(pcx.types[t].b) {
+            && (pcx.types[t].kind == TyKind::Ptr && is_ref_kind(pcx.types[t].b)
+                || pcx.types[t].kind == TyKind::Slice && pcx.types[t].b != REF_RAW) {
             self_u = sig.params[base];
         }
     }
     sig.param_at.push(sig.params.len() as i64);
     // the result: an elided region is E2's, E3's, else E4's error
     sig.walk.clear();
-    bind_walk(pcx.nodes[node].b, fn_ret(f, pcx), tps, self_node, -1, &sig.walk, 0, pcx);
+    bind_walk(pcx.nodes[node].b, fn_ret(f, pcx), tps, self_node, -1, &sig.walk, 0, pcx, f);
     let n = sig.walk.len() as i64 / 4;
     for e in 0..n {
         let b = sig.walk[4 * e];
@@ -954,6 +1449,7 @@ pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
             sig.bounds.push(sig.ret[up]);
         }
     }
+    push_decl_bounds(fn_ret(f, pcx), true, 0, &sig, pcx);
     // RULE: D4.5 (declared: `'b: 'a` in the generics, the impl's and the
     // function's)
     for h in holders {
@@ -977,6 +1473,135 @@ pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
             }
         }
     }
+    // RULE: D4.5, D20.6 (declared `T: 'a`, in the generics or a `where`:
+    // every slot of T's substitution outlives 'a; `F: 'scope` of a closure
+    // type, each capture's and X_C's)
+    for k in 0..(if tps > 0 { pcx.nodes[tps].count } else { 0 }) {
+        let p = child(tps, k, pcx);
+        let sym = pcx.nodes[p].a;
+        var i = 0;
+        loop {
+            let lt = crate::front::parser::rust::outlives_of(p, i, pcx);
+            if lt == 0 {
+                break;
+            }
+            i += 1;
+            let kind = lifetime_binding(lt, pcx);
+            if kind == B_ELIDED {
+                continue;
+            }
+            let b = if kind == B_STATIC { 0 } else { add_universal(U_NAMED, lt, 0, &sig) };
+            for e in 0..universal_count(sig) {
+                if sig.univ[3 * e] == U_SUBST && sig.univ[3 * e + 1] == sym {
+                    sig.bounds.push(e);
+                    sig.bounds.push(b);
+                }
+            }
+        }
+    }
+    subst_requirements(f, tps, &sig, pcx);
+}
+
+// RULE: D19.10 (4) In an instance whose type parameter is a closure type C,
+// C's requirements are bounds of the universals of its substitution
+// (as a declared `'b: 'a` of a struct's would be).
+fn subst_requirements(f: i64, tps: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
+    let nt = pcx.fns[f].targ_count;
+    if nt <= 0 || pcx.fns[f].tmpl < 0 || tps <= 0 {
+        return;
+    }
+    for k in 0..nt {
+        let t = tlist_at(pcx.fns[f].targs + k, pcx);
+        if t <= 0 || pcx.types[t].kind != TyKind::Struct || k >= pcx.nodes[tps].count {
+            continue;
+        }
+        let id = pcx.structs[pcx.types[t].a].closure - 1;
+        if id < 0 {
+            continue;
+        }
+        let sym = pcx.nodes[child(tps, k, pcx)].a;
+        // RULE: D4.5 (and C's implied bounds: a capture's `&'c τ` gives
+        // `'t ⊒ 'c` for τ's slots, as in the closure's own body)
+        sig.walk.clear();
+        bind_walk(0, t, 0, 0, -1, &sig.walk, 0, pcx, -1);
+        for e in 0..sig.walk.len() as i64 / 4 {
+            let up = sig.walk[4 * e + 3];
+            let a = find_universal(U_SUBST, sym, e, sig);
+            let b = if up >= 0 { find_universal(U_SUBST, sym, up, sig) } else { -1 };
+            if a >= 0 && b >= 0 {
+                sig.bounds.push(a);
+                sig.bounds.push(b);
+            }
+        }
+        // RULE: D19.10 (4), D20.3 (C's signature read with this template's
+        // bound of the parameter, `F: FnOnce(T) -> U` or `F: FnMut(B,
+        // Self::Item) -> B`, whichever bound C was checked against: an X_C
+        // position of C the bound gives a type parameter's slot, a named
+        // lifetime or 'static, a projection's as this instance resolves it
+        // (proj_walk), is that universal, both ways, so a requirement
+        // between them, `|x| x`'s, is one between T and U, assumed here and
+        // checked at the call)
+        let bnode = crate::front::closures::fn_bounds::fn_bound_of(tps, k, pcx);
+        if bnode > 0 {
+            var walk = Vec::<i64, Comp>::new_in(Comp {});
+            var at = Vec::<i64, Comp>::new_in(Comp {});
+            var codes = Vec::<i64, Comp>::new_in(Comp {});
+            let _ = closure_sig_walk(id, pcx.closures[id].exp_node, pcx.closures[id].exp_tps,
+                &walk, &at, &codes, F_MARK, 0, pcx);
+            var read = Vec::<i64, Comp>::new_in(Comp {});
+            var at2 = Vec::<i64, Comp>::new_in(Comp {});
+            var codes2 = Vec::<i64, Comp>::new_in(Comp {});
+            let self_node = pcx.nodes[fn_node(crate::places::front::fn_template(f, pcx), pcx)].h;
+            let _ = closure_sig_walk(id, bnode, tps, &read, &at2, &codes2, f, self_node, pcx);
+            let nenv = slot_count(t, pcx) - pcx.closures[id].xc_n;
+            if read.len() == walk.len() {
+                for e in 0..codes.len() as i64 {
+                    let q = codes[e];
+                    if q < 0 {
+                        continue;
+                    }
+                    let rb = read[4 * e];
+                    let b = if rb == B_STATIC { 0 }
+                        else if rb == B_NAMED { find_universal(U_NAMED, read[4 * e + 1], 0, sig) }
+                        else if rb == B_PARAM && read[4 * e + 1] < pcx.nodes[tps].count {
+                            find_universal(U_SUBST, pcx.nodes[child(tps, read[4 * e + 1], pcx)].a,
+                                read[4 * e + 2], sig)
+                        } else { -1 };
+                    tie_universals(find_universal(U_SUBST, sym, nenv + q, sig), b, &sig);
+                }
+            }
+        }
+        for q in 0..pcx.closures[id].req_n {
+            let i = pcx.capture_list.get(pcx.closures[id].req_at + 2 * q);
+            let j = pcx.capture_list.get(pcx.closures[id].req_at + 2 * q + 1);
+            let a = find_universal(U_SUBST, sym, i, sig);
+            let b = if j < 0 { 0 } else { find_universal(U_SUBST, sym, j, sig) };
+            if a >= 0 && b >= 0 {
+                sig.bounds.push(a);
+                sig.bounds.push(b);
+            }
+        }
+    }
+}
+
+// Universals a and b of sig outlive each other (-1: none, nothing added).
+fn tie_universals(a: i64, b: i64, sig: inout Sig<Comp>) {
+    if a >= 0 && b >= 0 {
+        sig.bounds.push(a);
+        sig.bounds.push(b);
+        sig.bounds.push(b);
+        sig.bounds.push(a);
+    }
+}
+
+// Universal (kind, x, y) of sig, or -1.
+fn find_universal(kind: i64, x: i64, y: i64, sig: Sig<Comp>) -> i64 {
+    for u in 0..universal_count(sig) {
+        if sig.univ[3 * u] == kind && sig.univ[3 * u + 1] == x && sig.univ[3 * u + 2] == y {
+            return u;
+        }
+    }
+    -1
 }
 
 // The walk's entries (sig.walk) of parameter `param` (its local), bound
@@ -1129,9 +1754,11 @@ pub fn field_map(t0: i64, k: i64, v: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Co
     }
     if tk == TyKind::Slice {
         // (a view's parts: its data pointer, the element's slots; its length)
+        // (Z9.1: a fat raw pointer has no region of its own)
+        let own = if pcx.types[t].b == REF_RAW { 0 } else { 1 };
         if k == 0 {
             for j in 0..slot_count(pcx.types[t].a, pcx) {
-                out.push(1 + j);
+                out.push(own + j);
             }
         }
         return;
@@ -1165,7 +1792,7 @@ pub fn field_map(t0: i64, k: i64, v: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Co
     let lts = if node > 0 { lifetimes_of(node, pcx) } else { 0 };
     let m = decl_lifetimes(node, pcx);
     var walk: Vec<i64, Comp> = Vec::new_in(Comp {});
-    bind_walk(fast, fty, if node > 0 { pcx.nodes[node].g } else { 0 }, 0, -1, &walk, 0, pcx);
+    bind_walk(fast, fty, if node > 0 { pcx.nodes[node].g } else { 0 }, 0, -1, &walk, 0, pcx, -1);
     for e in 0..walk.len() as i64 / 4 {
         let b = walk[4 * e];
         if b == B_STATIC {
@@ -1184,6 +1811,37 @@ pub fn field_map(t0: i64, k: i64, v: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Co
             out.push(off + walk[4 * e + 2]);
         } else {
             out.push(MAP_NONE);
+        }
+    }
+}
+
+// RULE: D3.6 (a `let` type annotation, rustc's user type annotation) The
+// regions the annotation tn of local l writes: pairs (l's slot variable,
+// the variable it must contain: 'static's, 1, or a named lifetime's
+// universal) pushed to out. An elided region writes nothing.
+pub fn annot_regions(l: i64, tn: i64, pbody: Body<Comp>, out: inout Vec<i64, Comp>, pcx: Ctx<Comp>) {
+    var walk = Vec::<i64, Comp>::new_in(Comp {});
+    bind_walk(tn, pbody.locals[l].ty, 0, 0, -1, &walk, 0, pcx, -1);
+    let n = walk.len() as i64 / 4;
+    if n != slots_bound(l, pbody) {
+        return;
+    }
+    for j in 0..n {
+        let b = walk[4 * j];
+        var target = 0;
+        if b == B_STATIC {
+            target = 1;
+        } else if b == B_NAMED {
+            for r in 1..region_count(pbody) + 1 {
+                if region_origin(r, pbody) == RO_UNIVERSAL && region_word(r, 0, pbody) == U_NAMED
+                    && region_word(r, 1, pbody) == walk[4 * j + 1] {
+                    target = r;
+                }
+            }
+        }
+        if target > 0 {
+            out.push(slot_var(l, j, pbody));
+            out.push(target);
         }
     }
 }
@@ -1259,6 +1917,12 @@ fn slot_variances_in(t: i64, c: i64, depth: i64, out: inout Vec<i64, Comp>, pcx:
         }
         return;
     }
+    if k == TyKind::Slice && pcx.types[t].b == REF_RAW {
+        // RULE: Z9.1, D5.2 (a fat raw pointer: no region of its own; its
+        // pointee o, as a thin raw pointer's)
+        slot_variances_in(pcx.types[t].a, xform(c, V_INV), depth + 1, &out, pcx);
+        return;
+    }
     if k == TyKind::Slice {
         out.push(c);
         let inner = if pcx.types[t].b == REF_MUT { xform(c, V_INV) } else { c };
@@ -1288,6 +1952,11 @@ fn slot_variances_in(t: i64, c: i64, depth: i64, out: inout Vec<i64, Comp>, pcx:
             }
             slot_variances_in(struct_field_ty(s, i, pcx), c, depth + 1, &out, pcx);
         }
+        // RULE: D19.1 (X_C: its variance in `fn(A..) -> R`)
+        let id = pcx.structs[s].closure - 1;
+        for q in 0..xc_count(s, pcx) {
+            out.push(xform(c, pcx.capture_list.get(pcx.closures[id].xc_at + q)));
+        }
         return;
     }
     if k == TyKind::Struct || k == TyKind::Enum {
@@ -1316,10 +1985,29 @@ pub fn variance_table(pcx: inout Ctx<Comp>) {
     // (a generic declaration is walked with an instance's field types, the
     // first one's: they resolve the names of its fields' types)
     var inst: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for _ in 0..total {
+        inst.push(-1);
+    }
+    for d in 0..total {
+        let (_, tmpl, closure) = decl_record(d, pcx);
+        if tmpl != 0 && !closure {
+            let td = if d < ns { tmpl - 1 } else { ns + tmpl - 1 };
+            if td >= 0 && td < total && inst[td] < 0 {
+                inst[td] = d;
+            }
+        }
+    }
+    // (0.27.2: a generic declaration of std with no instance is no type of
+    // any body: not walked, as one made after the table (decl_variance:
+    // invariant); a program's own is, for borrowck.unused_param, and every
+    // one under --std2-check and --emit-places. std2 has hundreds; a
+    // program uses few.)
+    let whole = crate::places::borrowck::std2::std2_check(pcx) || pcx.emit_places > 0;
     for d in 0..total {
         let (node, tmpl, closure) = decl_record(d, pcx);
-        inst.push(-1);
-        if tmpl != 0 || closure || node <= 0 {
+        if tmpl != 0 || closure || node <= 0
+            || !whole && inst[d] < 0 && decl_type_params(node, pcx) > 0
+            && !crate::front::conv::user_at(pcx.nodes[node].start, &pcx) {
             pcx.variance_at.push(-1);
             continue;
         }
@@ -1331,15 +2019,6 @@ pub fn variance_table(pcx: inout Ctx<Comp>) {
         pcx.variance_at.push(pcx.variances.count);
         for _ in 0..np {
             pcx.variances.push(V_BI);
-        }
-    }
-    for d in 0..total {
-        let (_, tmpl, closure) = decl_record(d, pcx);
-        if tmpl != 0 && !closure {
-            let td = if d < ns { tmpl - 1 } else { ns + tmpl - 1 };
-            if td >= 0 && td < total && inst[td] < 0 {
-                inst[td] = d;
-            }
         }
     }
     var changed = true;
@@ -1533,6 +2212,17 @@ fn var_walk(n: i64, t: i64, c: i64, d: i64, dn: i64, depth: i64, pcx: inout Ctx<
             return lifetime_at(pcx.nodes[n].c, c, d, dn, &pcx);
         }
     }
+    // RULE: D5.3 (a projection of a parameter, `U::IntoIter`: U is used,
+    // invariant there, as rustc reads it)
+    if pcx.nodes[n].list != 0 && pcx.nodes[n].count > 0 {
+        let first = child(n, 0, pcx);
+        let i = if pcx.nodes[first].kind == NodeKind::Ident {
+            param_index(pcx.nodes[dn].g, pcx.nodes[first].a, pcx)
+        } else { -1 };
+        if i >= 0 {
+            return meet(d, m + i, xform(c, V_INV), &pcx);
+        }
+    }
     // a constructor applied: its parameters' variance, D5.2's or as its
     // declaration's is so far; unknown (no checker type): invariant
     let name = sym_text(sym, pcx);
@@ -1570,6 +2260,14 @@ fn unused_params(d: i64, pcx: inout Ctx<Comp>) {
     let node = decl_record(d, pcx).0;
     if !crate::front::rust::rust_at(pcx.nodes[node].start, &pcx) {
         return;
+    }
+    // (the known item phantom_data, std2's PhantomData: built in, its
+    // parameter the marker's; rustc's is a lang item)
+    if sym_text(pcx.nodes[node].a, pcx) == "PhantomData" {
+        let key = crate::front::known::std2_key(pcx.nodes[node].a, &pcx);
+        if key >= 0 && crate::front::types::item_node_of(key, pcx) == node {
+            return;
+        }
     }
     let lts = lifetimes_of(node, pcx);
     let m = decl_lifetimes(node, pcx);

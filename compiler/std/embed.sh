@@ -39,8 +39,12 @@
 # (0.27.0) --edition rust: the rust edition's std instead, compiler/std2
 # (its root std2/std.vl and its modules, found as above), written to
 # compiler/src/front/stdsrc_rust.vl as std2_source, std2_index, std2_files
-# and std2_line_marks; it has no Gpa, check-alloc or system tail yet. Not
-# built into the compiler before 0.27.2: run it for the size it would add.
+# and std2_line_marks; and Gpa's implementation, std2/rt/gpa.vl and (for
+# --check-alloc) std2/rt/alloc_check.vl, as std2_gpa_source and
+# std2_check_gpa_source (Z5: front/stdalloc.vl's std2_tail picks one).
+# (0.27.2) Built into the compiler: a rust-edition program reads it with
+# VOLE_STD2=1 until the switch makes it the edition's std (front/modules:
+# load_std2); the commit hook remakes it when compiler/std2 changes.
 set -eu
 cd "$(dirname "$0")/../.."
 edition=mvs
@@ -162,6 +166,16 @@ if [ "$edition" = rust ]; then
         echo ""
         echo "pub fn std2_line_marks(out: i64) {"
         LC_ALL=C awk '(NR - 1) % 64 == 0 { print at + 0 } { at += length($0) + 1 }' "$text" | lines
+        echo "}"
+        echo ""
+        echo "// (Z5) Gpa's implementation, std::__gpa (front/stdalloc.vl: std2_tail)"
+        echo "pub fn std2_gpa_source(out: i64) {"
+        lines <compiler/std2/rt/gpa.vl
+        echo "}"
+        echo ""
+        echo "// (Z5) the same with --check-alloc: the checking allocator"
+        echo "pub fn std2_check_gpa_source(out: i64) {"
+        lines <compiler/std2/rt/alloc_check.vl
         echo "}"
     } >"$tmp"
 else {

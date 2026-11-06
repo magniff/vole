@@ -66,13 +66,59 @@ pub fn env_enter(params: i64, targs: i64, count: i64, pcx: inout Ctx<Comp>) -> i
             pcx.tp_types.push(pcx.tlists.data[targs + i]);
         }
     }
+    if params > 0 && count > 0 {
+        pcx.tp_scopes.push(pcx.tp_base);
+        pcx.tp_scopes.push(params);
+    }
     saved
 }
 
 pub fn env_leave(saved: i64, pcx: inout Ctx<Comp>) {
+    // UNSAFE: IntVec is a raw table (base/comp.vl); every read is.
+    // SAFETY: count >= 2 before data[count - 2] is read.
+    while pcx.tp_scopes.count >= 2 && unsafe { pcx.tp_scopes.data[pcx.tp_scopes.count - 2] }
+    >= pcx.tp_base {
+        pcx.tp_scopes.count -= 2;
+    }
     pcx.tp_names.count = pcx.tp_base;
     pcx.tp_types.count = pcx.tp_base;
     pcx.tp_base = saved;
+}
+
+// (0.27.2) The parameter node (of a Generics node, its bounds in .h) the
+// type parameter `name` in scope was bound from by env_enter, or 0. RULE:
+// F11.3 (`I::Output` through I's bounds)
+pub fn env_param_node(name: i64, pcx: Ctx<Comp>) -> i64 {
+    // UNSAFE: IntVec is a raw table (base/comp.vl); every read is.
+    // SAFETY: k + 1 < count, and base + j < tp_names.count are checked
+    // before each read.
+    unsafe {
+        var k = pcx.tp_scopes.count - 2;
+        while k >= 0 {
+            let base = pcx.tp_scopes.data[k];
+            let params = pcx.tp_scopes.data[k + 1];
+            k -= 2;
+            if base != pcx.tp_base {
+                continue;
+            }
+            // (an entry another scope left behind: its names must be these)
+            var p = 0;
+            for j in 0..pcx.nodes[params].count {
+                let c = child(params, j, pcx);
+                if base + j >= pcx.tp_names.count || pcx.tp_names.data[base + j] != pcx.nodes[c].a {
+                    p = -1;
+                    break;
+                }
+                if pcx.nodes[c].a == name && p == 0 {
+                    p = c;
+                }
+            }
+            if p > 0 {
+                return p;
+            }
+        }
+        0
+    }
 }
 
 // The type a type parameter in scope stands for, or 0.
@@ -243,7 +289,7 @@ fn generic_symbol(base: i64, targs: i64, count: i64, pcx: inout Ctx<Comp>) -> i6
 // A code for type t, made of letters, digits, `_` and `.`, from which t
 // can be read back: primitives by a letter (as in C++'s mangling), then
 // P<t> pointer, S<t> slice, A<n>_<t> array, T<n>_<ts> tuple, F<n>_<ts><t>
-// (C<n>_... for extern "C") function, and N<length><symbol> for a struct
+// (C<n>_... for extern "C"; U before either for `unsafe fn`) function, and N<length><symbol> for a struct
 // or an enum.
 pub fn mangle_type(out: i64, t: i64, pcx: inout Ctx<Comp>) {
     unsafe {
@@ -283,7 +329,11 @@ pub fn mangle_type(out: i64, t: i64, pcx: inout Ctx<Comp>) {
                 }
             }
             TyKind::Fn => {
-                buf_byte(out, if pcx.types[t].b != 0 { 'C' } else { 'F' });
+                // (RULE: F19.3: an `unsafe fn` type is another type)
+                if crate::front::types::fn_ty_unsafe(t, pcx) {
+                    buf_byte(out, 'U');
+                }
+                buf_byte(out, if crate::front::types::fn_ty_c(t, pcx) { 'C' } else { 'F' });
                 buf_int(out, pcx.types[t].count);
                 buf_byte(out, '_');
                 for i in 0..pcx.types[t].count {
@@ -363,7 +413,7 @@ fn type_tree_size(t: i64, pcx: inout Ctx<Comp>) -> i64 {
 }
 
 // The type arguments TSCRATCH[mark..] (popped) as a new TLISTS range.
-fn take_targs(mark: i64, pcx: inout Ctx<Comp>) -> i64 {
+pub fn take_targs(mark: i64, pcx: inout Ctx<Comp>) -> i64 {
     let targs = pcx.tlists.count;
     for i in mark..pcx.tscratch.count {
         unsafe { pcx.tlists.push(pcx.tscratch.data[i]); }
@@ -708,6 +758,13 @@ pub const TPL_SLICE: i64 = 1099511627776;
 // TPL_DISTINCT + its alias's node.
 pub const TPL_DISTINCT: i64 = 2199023255552;
 
+// (0.27.2) A pattern impl of the rust edition (docs/design/front-rust.md
+// F0.3, F4.1, F5.1): its header is any type pattern (`impl<T> Tr for &T`,
+// `impl<T> SliceIndex<[T]> for usize`, `impl<K, V> HashMap<K, V, Gpa>`),
+// matched against a type by instantiate::match_type, which binds the
+// impl's parameters; no type is its instance by template.
+pub const TPL_PATTERN: i64 = 3298534883328;
+
 pub fn template_of_key(key: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         if pcx.sym_struct[key] != 0 && pcx.structs[pcx.sym_struct[key] - 1].generic > 0 {
@@ -725,6 +782,10 @@ pub fn instance_of(t: i64, tpl: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         if tpl == TPL_SLICE {
             return pcx.types[t].kind == TyKind::Slice;
+        }
+        // RULE: F0.3 (a pattern impl covers a type by match_type, not by template)
+        if tpl == TPL_PATTERN {
+            return false;
         }
         if tpl >= TPL_DISTINCT {
             return pcx.types[t].kind == TyKind::Distinct && pcx.types[t].b == tpl - TPL_DISTINCT;

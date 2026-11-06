@@ -49,7 +49,7 @@ use crate::front::patterns::{binding_count, binds_ref, is_irrefutable, pattern_r
 use crate::front::patterns::usefulness::int_key;
 use crate::front::types::{
     REF_MUT, REF_SHARED, TY_BOOL, TY_I64, TY_NEVER, TY_UNIT, TyKind, fn_param, is_compound,
-    is_integer, is_void, ref_to, type_elem, variant_field,
+    is_integer, is_void, ref_to, variant_field,
 };
 use crate::places::front::{
     ast_local_mutable, ast_local_ty, enum_tag_ty, fn_is_extern, fn_module, fn_param_count, fn_ret,
@@ -428,7 +428,13 @@ fn ops_add(at: i64, n: i64, pbody: inout Body<Comp>, pcx: Ctx<Comp>) -> i64 {
 fn place_operand(l: i64, p: i64, ty: i64, moving: bool, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     // (0.27.1: in the rust edition a value moves unless its type is Copy,
     // glue or not, D8.3)
-    let moves = if pcx.rust_body { !crate::places::regions::rust_copy(ty, &pcx) }
+    // RULE: Z9.6 (`&*p`, `&mut *p` of a fat raw pointer p: the front gives
+    // p itself, typed `&[T]` or `&mut [T]`; p is Copy, so it is copied)
+    let pt = if pcx.rust_body && l >= 0 {
+        crate::places::ir::full_place_type(l, p, pbody, &pcx)
+    } else { 0 };
+    let raw_fat = pt > 0 && crate::front::types::is_raw_view(pt, pcx);
+    let moves = if pcx.rust_body { !raw_fat && !crate::places::regions::rust_copy(ty, &pcx) }
         else { type_glue(ty, &pcx) };
     // (and in the rust edition out of a borrowed copy's referent or element
     // too: the borrow checker's move_out, which reports what the backstop
@@ -818,8 +824,13 @@ fn expr_into(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<C
         // values are borrowed copies, the owner keeps them; an f-string's
         // holes too)
         let saved = pcx.agg_borrow;
+        // (RULE: D19.2 not a rust-edition closure's, whose by-value
+        // captures are moved in, `move` or not)
+        let kinded = pcx.rust_body && pcx.nodes[e].x > 0
+            && pcx.closures[pcx.nodes[e].x - 1].kind != 0
+            && (pcx.nodes[e].c & crate::front::ast::CLOSURE_HOLES) == 0;
         pcx.agg_borrow = (pcx.nodes[e].c & CLOSURE_MOVE) == 0
-            && pcx.nodes[pcx.nodes[e].y].kind == NodeKind::StructLit;
+            && pcx.nodes[pcx.nodes[e].y].kind == NodeKind::StructLit && !kinded;
         expr_into(pcx.nodes[e].y, dl, dp, &pbody, &pcx);
         pcx.agg_borrow = saved;
         return;
@@ -973,20 +984,34 @@ fn lower_binary(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ct
         // `a && b`: dest = a; if a (or !a) then dest = b, both made in
         // the destination itself (no destination is a place the operands
         // can read: an assignment's value goes to a temporary first,
-        // lower_assign)
-        expr_into(pcx.nodes[e].b, dl, dp, &pbody, &pcx);
+        // lower_assign). RULE: D8.1 (a rust body: `a` in a temporary, the
+        // destination assigned once on each path, `dest = copy t` where
+        // `a` decides, as rustc builds it: a `let ok = a && b;` is
+        // initialized once, not borrowck.assign_twice)
+        let once = pcx.rust_body;
+        let tl = if once { new_temp(pcx.nodes[pcx.nodes[e].b].ty, e, false, &pbody, &pcx) }
+            else { dl };
+        let tp = if once { 0 } else { dp };
+        expr_into(pcx.nodes[e].b, tl, tp, &pbody, &pcx);
         if !reachable(pbody) {
             return;
         }
         let rhs = new_block(&pbody);
         let done = new_block(&pbody);
+        let short = if once { new_block(&pbody) } else { done };
         let at = ops_mark(pbody);
-        set_op(OK_COPY, dl, dp, &pcx);
+        set_op(OK_COPY, tl, tp, &pcx);
         push_now(&pbody, pcx);
         if op == Tok::AmpAmp {
-            switch_bool(at, done, rhs, e, &pbody);
+            switch_bool(at, short, rhs, e, &pbody);
         } else {
-            switch_bool(at, rhs, done, e, &pbody);
+            switch_bool(at, rhs, short, e, &pbody);
+        }
+        if once {
+            enter_block(short, &pbody);
+            set_op(OK_COPY, tl, 0, &pcx);
+            emit_use(dl, dp, e, &pbody, pcx);
+            goto(done, &pbody);
         }
         enter_block(rhs, &pbody);
         expr_into(pcx.nodes[e].c, dl, dp, &pbody, &pcx);
@@ -1407,6 +1432,29 @@ fn lower_arg(i: i64, arg: i64, mode: i64, c_callee: bool, pbody: inout Body<Comp
             && pcx.types[at_ty].kind == TyKind::Ptr && pcx.types[at_ty].b == 0
             && struct_closure(pcx.types[at_ty].a, pcx);
         var t_ty = at_ty;
+        var pl = pl;
+        var pp = pp;
+        if env && !crate::places::regions::closure_once(pcx.types[at_ty].a, pcx)
+            && pcx.nodes[operand_e].kind == NodeKind::Ident
+            && pcx.nodes[operand_e].res == Res::Local
+            && crate::front::closures::fn_bounds::param_call_kind(pbody.fn_,
+                pcx.nodes[operand_e].y, pcx) == crate::front::closures::kinds::KIND_FN_ONCE {
+            // RULE: D19.5 (an `Fn`/`FnMut` closure called as the `FnOnce` its
+            // parameter is bound by: moved into a temporary of the call,
+            // `_t = move Q`, which the env borrows and the statement drops)
+            let c_ty = pcx.types[at_ty].a;
+            place_operand(pl, pp, c_ty, true, pbody, &pcx);
+            let tc = new_temp(c_ty, arg, false, &pbody, &pcx);
+            emit_use(tc, 0, arg, &pbody, pcx);
+            pl = tc;
+            pp = 0;
+        }
+        if env && crate::places::regions::closure_once(pcx.types[at_ty].a, pcx) {
+            // RULE: D19.5, D19.7 an `FnOnce` closure's env is the closure
+            // itself, moved (copied when it is Copy)
+            place_operand(pl, pp, pcx.types[at_ty].a, true, pbody, &pcx);
+            return;
+        }
         if env {
             let fnmut = crate::places::regions::closure_writes(pcx.types[at_ty].a, pcx);
             kind = if fnmut { BK_MUT2 } else { BK_SHARED };
@@ -1885,8 +1933,8 @@ fn tested_places(pat: i64, p: i64, ty: i64, out: inout Vec<i64, Comp>, pbody: in
     } else if k == NodeKind::PatTuple {
         let tt = undistinct(t, pcx);
         for i in 0..pcx.nodes[pat].count {
-            tested_places(child(pat, i, pcx), proj(pp, PJ_FIELD, i, &pbody), type_elem(tt, i, pcx),
-                &out, &pbody, &pcx);
+            tested_places(child(pat, i, pcx), proj(pp, PJ_FIELD, i, &pbody),
+                crate::front::types::part_type(tt, i, pcx), &out, &pbody, &pcx);
         }
     } else if k == NodeKind::PatVariant {
         let v = pcx.nodes[pat].x;
@@ -2142,7 +2190,7 @@ fn test_pattern(pat: i64, l: i64, p: i64, ty: i64, fail: i64, pbody: inout Body<
         let tt = undistinct(t, pcx);
         for i in 0..pcx.nodes[pat].count {
             test_pattern(child(pat, i, pcx), l, proj(pp, PJ_FIELD, i, &pbody),
-                type_elem(tt, i, pcx), fail, &pbody, &pcx);
+                crate::front::types::part_type(tt, i, pcx), fail, &pbody, &pcx);
         }
     } else if k == NodeKind::PatVariant {
         let v = pcx.nodes[pat].x;
@@ -2223,7 +2271,7 @@ fn bind_pattern(pat: i64, l: i64, p: i64, ty: i64, guard: bool, pbody: inout Bod
         let tt = undistinct(t, pcx);
         for i in 0..pcx.nodes[pat].count {
             bind_pattern(child(pat, i, pcx), l, proj(pp, PJ_FIELD, i, &pbody),
-                type_elem(tt, i, pcx), guard, &pbody, &pcx);
+                crate::front::types::part_type(tt, i, pcx), guard, &pbody, &pcx);
         }
     } else if k == NodeKind::PatVariant {
         let v = pcx.nodes[pat].x;
@@ -2490,8 +2538,17 @@ fn lower_let(st: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
                 expr_into(init, -1, 0, &pbody, &pcx);
             }
         } else {
-            let borrowed = let_borrows(pat, init, pcx);
+            // (0.27.2: a hidden binding of a value, not a place, in a rust
+            // body: `=f0` of `println("{}", String::from_in(..))` owns it
+            // and drops it with the statement, as rustc's temporaries;
+            // places-ir.md §3.7)
+            let owns = pcx.rust_body && init != 0 && !is_place_expr(init, pcx)
+                && hidden_name(pcx.nodes[pat].a, pcx);
+            let borrowed = !owns && let_borrows(pat, init, pcx);
             let ir = user_local(l, pat, borrowed, &pbody, &pcx);
+            if owns && has_flag(ir, LF_BORROWED, pbody) {
+                pbody.locals[ir].flags -= LF_BORROWED;
+            }
             // (its storage begins first; its drop is registered once it
             // holds its value, in the block's scope)
             live(ir, &pbody, &pcx);
@@ -2508,6 +2565,12 @@ fn lower_let(st: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
                     expr_into(init, ir, 0, &pbody, &pcx);
                 }
                 pcx.lent_home = saved;
+                // RULE: D3.6 (a user type annotation: kept for the constraints)
+                if pcx.rust_body && pcx.nodes[st].b > 0 && pbody.stmts.len() > 0 {
+                    pbody.annots.push(ir);
+                    pbody.annots.push(pcx.nodes[st].b);
+                    pbody.annots.push(pbody.stmts.len() as i64 - 1);
+                }
             }
             if !has_flag(ir, LF_BORROWED, pbody) && needs_drop(pbody.locals[ir].ty, &pcx) {
                 schedule_outer(s, EN_DROP, ir, pbody, &pcx);
@@ -2525,7 +2588,8 @@ fn lower_let(st: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
 // body: a user binding takes a referent or an element that is not Copy
 // (`let s = *r;`, `let s = v[0];`: the borrow checker's move_out, D8.3),
 // a `for` loop's sequence a whole `&mut` (`for x in self`, I7); the
-// checker's hidden bindings (`=fN`, an f-string's holes) copy.
+// checker's hidden bindings (`=fN`, an f-string's holes) copy, a whole
+// `&mut T` reborrowed shared.
 fn rust_let_place(pat: i64, init: i64, ir: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     if !place_of(init, &pbody, &pcx) {
         return;
@@ -2538,6 +2602,21 @@ fn rust_let_place(pat: i64, init: i64, ir: i64, pbody: inout Body<Comp>, pcx: in
         && (pcx.types[ut].kind == TyKind::Ptr || pcx.types[ut].kind == TyKind::Slice);
     let take = if name == pcx.sym_for_seq { exclusive }
         else { (text.len == 0 || text[0] != '=') && proj_indirect(pcx.pl_p, pbody) };
+    // RULE: D3.6 (a hidden binding of a whole `&mut T`, `=f0` of
+    // `println("{}", r)`: its shared reborrow `&*r`, as rustc's
+    // format_args takes `&r`; the reference is neither copied, I7, nor
+    // moved)
+    if !take && exclusive && pcx.types[ut].kind == TyKind::Ptr && text.len > 0
+        && text[0] == '=' {
+        let p = proj(pcx.pl_p, PJ_DEREF, 0, &pbody);
+        emit_ref(ir, 0, pcx.pl_l, p, BK_SHARED, init, &pbody, &pcx);
+        return;
+    }
+    // (a `&mut [T]`'s: the binding is typed `&[T]` and copies it, the
+    // mutable view's shared reborrow, D3.6, until `*s` of a slice view, Z9.1)
+    if !take && exclusive && text.len > 0 && text[0] == '=' {
+        pbody.locals[ir].ty = crate::front::types::slice_of(pcx.types[ut].a, &pcx);
+    }
     place_operand(pcx.pl_l, pcx.pl_p, ty, take, pbody, &pcx);
     if reachable(pbody) {
         emit_use(ir, 0, init, &pbody, pcx);
@@ -2592,6 +2671,13 @@ fn let_borrows(pat: i64, init: i64, pcx: Ctx<Comp>) -> bool {
     }
     // (a hidden binding of the checker's, `=fN` an f-string's hole, `==`
     // an operator's operand: a borrowed copy, as the own pass's let_drops)
+    let text = sym_text(name, pcx);
+    text.len > 0 && text[0] == '='
+}
+
+// Whether symbol name is one of the checker's hidden bindings (`=fN` an
+// f-string's hole, `==` an operator's operand).
+fn hidden_name(name: i64, pcx: Ctx<Comp>) -> bool {
     let text = sym_text(name, pcx);
     text.len > 0 && text[0] == '='
 }

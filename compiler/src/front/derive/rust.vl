@@ -1,0 +1,719 @@
+// (0.27.2) The rust edition's derives, in std2's shapes (F17): a rust
+// program reads std2, and each `#[derive(..)]` of its structs and enums
+// (its own and std2's) becomes an impl of std2's trait, named by path
+// (`std::cmp::PartialEq` from a program, `crate::cmp::PartialEq` inside
+// std2), never by the names in scope. The text goes to `<derive>` as
+// MVS's derives do (mod.vl), and that text is a rust-edition position
+// (Z1.2). Every type parameter but an allocator is bounded by the derived
+// trait, as rustc derives. A field without the trait is the trait
+// checker's error in the generated body, at the field.
+// RULE: F17.1, F17.3, F17.4
+
+use crate::base::sym_text;
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::base::diag::{err_begin, err_end_soft, err_fmt, err_help};
+use crate::front::ast::{NODE_REF, NodeKind, child};
+
+use super::{span_from, w, w_int, w_sym, w_type_args, w_variant_pattern};
+
+// What a rust derive names (codes apart from mod.vl's D_*, so that
+// check_derives leaves them to the trait checker).
+pub const R_PARTIAL_EQ: i64 = 11;
+pub const R_EQ: i64 = 12;
+pub const R_PARTIAL_ORD: i64 = 13;
+pub const R_ORD: i64 = 14;
+pub const R_HASH: i64 = 15;
+pub const R_DEBUG: i64 = 16;
+pub const R_CLONE: i64 = 17;
+pub const R_COPY: i64 = 18;
+pub const R_DEFAULT: i64 = 19;
+
+// Whether the program's derives are written in std2's shapes: a rust
+// program on std2.
+pub fn rust_derives(pcx: Ctx<Comp>) -> bool {
+    pcx.std2 && pcx.edition != 0
+}
+
+// The R_* code of derive `d` (a TyName: `Clone`, or `std::clone::Clone`,
+// `core::..`), or 0.
+pub fn rust_code_quiet(d: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if pcx.nodes[d].kind != NodeKind::TyName || pcx.nodes[d].g != 0 {
+        return 0;
+    }
+    if pcx.nodes[d].count > 0 {
+        let root = sym_text(pcx.nodes[child(d, 0, pcx)].a, pcx);
+        if root != "std" && root != "core" && root != "crate" {
+            return 0;
+        }
+    }
+    let text = sym_text(pcx.nodes[d].a, pcx);
+    if text == "PartialEq" {
+        R_PARTIAL_EQ
+    } else if text == "Eq" {
+        R_EQ
+    } else if text == "PartialOrd" {
+        R_PARTIAL_ORD
+    } else if text == "Ord" {
+        R_ORD
+    } else if text == "Hash" {
+        R_HASH
+    } else if text == "Debug" {
+        R_DEBUG
+    } else if text == "Clone" {
+        R_CLONE
+    } else if text == "Copy" {
+        R_COPY
+    } else if text == "Default" {
+        R_DEFAULT
+    } else {
+        0
+    }
+}
+
+// The R_* code of derive `d`, or 0 after an error.
+pub fn rust_code(d: i64, item: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let code = rust_code_quiet(d, &pcx);
+    if code != 0 {
+        return code;
+    }
+    err_begin(pcx.nodes[d].start, &pcx);
+    if pcx.nodes[d].kind != NodeKind::TyName || pcx.nodes[d].g != 0 {
+        err_fmt(format_args("#[derive] takes trait names: {}", DERIVABLE), pcx);
+        err_end_soft(&pcx);
+        return 0;
+    }
+    err_fmt(format_args("cannot derive '{}' (derivable: {})", sym_text(pcx.nodes[d].a, pcx),
+        DERIVABLE), pcx);
+    if sym_text(pcx.nodes[d].a, pcx) == "Display" {
+        err_help(c"Display has no derive: write `impl std::fmt::Display for T { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { .. } }`", pcx);
+    }
+    let _ = item;
+    err_end_soft(&pcx);
+    0
+}
+
+const DERIVABLE: &str = "PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy, Default";
+
+// The path's root for a derive of `item`: `crate` inside std2, `std` in
+// a program.
+fn root(item: i64, pcx: inout Ctx<Comp>) -> *u8 {
+    let m = crate::front::modules::module_at(pcx.nodes[item].start, &pcx);
+    if crate::front::modules::within_std(m, pcx) { c"crate" } else { c"std" }
+}
+
+// `std::cmp::PartialEq`: `rest` after the item's root.
+fn wp(item: i64, rest: *u8, pcx: inout Ctx<Comp>) {
+    w(root(item, &pcx), pcx);
+    w(rest, pcx);
+}
+
+// RULE: F17.1 (0.27.2) The item's lifetimes, `'a, 'b`, as its header
+// writes them (no bounds), each followed by `, ` when `more`; their count.
+// `impl<'a> Clone for Chars<'a>`: the derived impl's own, so its methods'
+// `&Self` is the item's type with them, not with fresh ones.
+fn w_lifetimes(item: i64, more: bool, pcx: Ctx<Comp>) -> i64 {
+    let lts = crate::front::parser::rust::lifetimes_of(item, pcx);
+    if lts == 0 {
+        return 0;
+    }
+    let n = pcx.nodes[lts].count;
+    for i in 0..n {
+        let l = child(lts, i, pcx);
+        if i > 0 {
+            w(c", ", pcx);
+        }
+        crate::base::buf_bytes(pcx.derive_gen,
+            crate::base::SRC[pcx.nodes[l].start..pcx.nodes[l].end]);
+    }
+    if n > 0 && more {
+        w(c", ", pcx);
+    }
+    n
+}
+
+// The type `item` declares, `S`, `S<T, A>` or `S<'a, T>`.
+fn w_self(item: i64, pcx: Ctx<Comp>) {
+    w_sym(pcx.nodes[item].a, pcx);
+    let g = pcx.nodes[item].g;
+    let types = g != 0 && pcx.nodes[g].count > 0;
+    if crate::front::parser::rust::lifetimes_of(item, pcx) == 0 {
+        w_type_args(item, pcx);
+        return;
+    }
+    w(c"<", pcx);
+    let _ = w_lifetimes(item, types, pcx);
+    if types {
+        for i in 0..pcx.nodes[g].count {
+            if i > 0 {
+                w(c", ", pcx);
+            }
+            w_sym(pcx.nodes[child(g, i, pcx)].a, pcx);
+        }
+    }
+    w(c">", pcx);
+}
+
+// `impl<T: B + Tr, A: Allocator> Tr for S<T, A> {` (`trait_rest` after
+// the root): each parameter with its bounds as written and the trait,
+// but an allocator parameter, which takes none (std2's containers derive
+// over an allocator that has not the trait: Gpa has no Debug).
+fn w_head(item: i64, trait_rest: *u8, pcx: inout Ctx<Comp>) {
+    w(c"impl", pcx);
+    let g = pcx.nodes[item].g;
+    let types = g != 0 && pcx.nodes[g].count > 0;
+    let lts = crate::front::parser::rust::lifetimes_of(item, pcx) != 0;
+    if types || lts {
+        w(c"<", pcx);
+        let _ = w_lifetimes(item, types, pcx);
+    }
+    if types {
+        for i in 0..pcx.nodes[g].count {
+            let p = child(g, i, pcx);
+            if i > 0 {
+                w(c", ", pcx);
+            }
+            w_sym(pcx.nodes[p].a, pcx);
+            w(c": ", pcx);
+            let bounds = pcx.nodes[p].h;
+            let text = if bounds != 0 {
+                crate::base::SRC[pcx.nodes[bounds].start..pcx.nodes[bounds].end] } else { "" };
+            if text == "Allocator" || text.ends_with("::Allocator") {
+                crate::base::buf_bytes(pcx.derive_gen, text);
+                continue;
+            }
+            if bounds != 0 {
+                crate::base::buf_bytes(pcx.derive_gen, text);
+                w(c" + ", pcx);
+            }
+            wp(item, trait_rest, &pcx);
+        }
+    }
+    if types || lts {
+        w(c">", pcx);
+    }
+    w(c" ", pcx);
+    wp(item, trait_rest, &pcx);
+    w(c" for ", pcx);
+    w_self(item, pcx);
+    w(c" {\n", pcx);
+}
+
+// Whether struct `item` is a tuple struct (its fields named 0, 1, ..).
+fn tuple_struct(item: i64, pcx: Ctx<Comp>) -> bool {
+    pcx.nodes[item].count > 0 && {
+        let name = sym_text(pcx.nodes[child(item, 0, pcx)].a, pcx);
+        name.len() > 0 && name[0] >= '0' && name[0] <= '9'
+    }
+}
+
+// Whether field node `field`'s type is written as a raw pointer.
+fn raw_pointer_field(field: i64, pcx: Ctx<Comp>) -> bool {
+    let tn = pcx.nodes[field].b;
+    tn > 0 && pcx.nodes[tn].kind == NodeKind::TyPtr && (pcx.nodes[tn].p & NODE_REF) == 0
+        && crate::base::SRC[pcx.nodes[tn].start] == '*'
+}
+
+// RULE: F17.1 (0.27.2) Whether field node `field`'s type is written as a
+// shared reference, `&'a T`, `&'a str`, `&'a [T]`: the derived bodies pass
+// it as it is (`self.f`, the reference) where another field is passed as
+// `&self.f`, and its clone is a copy, as Rust's `impl Clone for &T` and
+// `PartialEq<&B> for &A` give (std2 has neither impl yet).
+fn shared_ref_field(field: i64, pcx: Ctx<Comp>) -> bool {
+    let tn = pcx.nodes[field].b;
+    if tn <= 0 || pcx.nodes[tn].end <= pcx.nodes[tn].start
+        || crate::base::SRC[pcx.nodes[tn].start] != '&' {
+        return false;
+    }
+    // (`&str` is the str view's node, its `&` in the source only: the
+    // text says which; `&'a mut T` is not shared)
+    let text = crate::base::SRC[pcx.nodes[tn].start + 1..pcx.nodes[tn].end];
+    var i = 0;
+    let n = text.len() as i64;
+    if n > 0 && text[0] == '\'' {
+        while i < n && text[i] != ' ' {
+            i += 1;
+        }
+    }
+    while i < n && text[i] == ' ' {
+        i += 1;
+    }
+    !(n - i >= 4 && text[i..i + 4] == "mut ")
+}
+
+// `&self.f`, or `self.f` of a shared reference field (`owner`: "self",
+// "other").
+fn w_field_arg(field: i64, owner: *u8, pcx: Ctx<Comp>) {
+    if !shared_ref_field(field, pcx) {
+        w(c"&", pcx);
+    }
+    w(owner, pcx);
+    w(c".", pcx);
+    w_sym(pcx.nodes[field].a, pcx);
+}
+
+// The impl of rust derive `d` (R_* `code`) of `item`.
+pub fn write_rust_impl(item: i64, d: i64, code: i64, pcx: inout Ctx<Comp>) {
+    span_from(d, &pcx);
+    let is_struct = pcx.nodes[item].kind == NodeKind::Struct;
+    if code == R_EQ {
+        w_head(item, c"::cmp::Eq", &pcx);
+        w(c"}\n", pcx);
+        return;
+    }
+    if code == R_COPY {
+        w_head(item, c"::marker::Copy", &pcx);
+        w(c"}\n", pcx);
+        return;
+    }
+    if code == R_PARTIAL_EQ {
+        w_head(item, c"::cmp::PartialEq", &pcx);
+        w(c"    #[inline]\n    fn eq(&self, other: &", pcx);
+        w_self(item, pcx);
+        w(c") -> bool {\n", pcx);
+        if is_struct { struct_eq(item, d, &pcx); } else { enum_eq(item, d, &pcx); }
+    } else if code == R_PARTIAL_ORD || code == R_ORD {
+        let ord = code == R_ORD;
+        w_head(item, if ord { c"::cmp::Ord" } else { c"::cmp::PartialOrd" }, &pcx);
+        w(if ord { c"    #[inline]\n    fn cmp(&self, other: &" }
+            else { c"    #[inline]\n    fn partial_cmp(&self, other: &" }, pcx);
+        w_self(item, pcx);
+        w(c") -> ", pcx);
+        if ord {
+            wp(item, c"::cmp::Ordering", &pcx);
+        } else {
+            wp(item, c"::option::Option<", &pcx);
+            wp(item, c"::cmp::Ordering>", &pcx);
+        }
+        w(c" {\n", pcx);
+        if is_struct { struct_cmp(item, d, ord, &pcx); } else { enum_cmp(item, d, ord, &pcx); }
+    } else if code == R_HASH {
+        w_head(item, c"::hash::Hash", &pcx);
+        w(c"    fn hash<__H: ", pcx);
+        wp(item, c"::hash::Hasher>(&self, state: &mut __H) {\n", &pcx);
+        if is_struct { struct_hash(item, d, &pcx); } else { enum_hash(item, d, &pcx); }
+    } else if code == R_DEBUG {
+        w_head(item, c"::fmt::Debug", &pcx);
+        w(c"    fn fmt(&self, f: &mut ", pcx);
+        wp(item, c"::fmt::Formatter<'_>) -> ", &pcx);
+        wp(item, c"::fmt::Result {\n", &pcx);
+        if is_struct { struct_debug(item, d, &pcx); } else { enum_debug(item, d, &pcx); }
+    } else if code == R_CLONE {
+        w_head(item, c"::clone::Clone", &pcx);
+        w(c"    #[inline]\n    fn clone(&self) -> ", pcx);
+        w_self(item, pcx);
+        w(c" {\n", pcx);
+        if is_struct { struct_clone(item, d, &pcx); } else { enum_clone(item, d, &pcx); }
+    } else {
+        w_head(item, c"::default::Default", &pcx);
+        w(c"    fn default() -> ", pcx);
+        w_self(item, pcx);
+        w(c" {\n", pcx);
+        if is_struct { struct_default(item, d, &pcx); } else { enum_default(item, d, &pcx); }
+    }
+    w(c"    }\n}\n", pcx);
+}
+
+// `self.a == other.a && ..`, through PartialEq::eq.
+fn struct_eq(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    w(c"        ", pcx);
+    for i in 0..pcx.nodes[item].count {
+        let field = child(item, i, pcx);
+        if i > 0 {
+            w(c"\n            && ", pcx);
+        }
+        span_from(field, &pcx);
+        wp(item, c"::cmp::PartialEq::eq(", &pcx);
+        w_field_arg(field, c"self", pcx);
+        w(c", ", pcx);
+        w_field_arg(field, c"other", pcx);
+        w(c")", pcx);
+        span_from(d, &pcx);
+    }
+    if pcx.nodes[item].count == 0 {
+        w(c"true", pcx);
+    }
+    w(c"\n", pcx);
+}
+
+// The pairs of the same variant, fieldwise; any other pair is unequal.
+fn enum_eq(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    if pcx.nodes[item].count == 0 {
+        w(c"        match *self {}\n", pcx);
+        return;
+    }
+    w(c"        match (self, other) {\n", pcx);
+    for i in 0..pcx.nodes[item].count {
+        let v = child(item, i, pcx);
+        w(c"            (", pcx);
+        w_variant_pattern(item, v, c"__a", pcx);
+        w(c", ", pcx);
+        w_variant_pattern(item, v, c"__b", pcx);
+        w(c") => ", pcx);
+        for k in 0..pcx.nodes[v].count {
+            if k > 0 {
+                w(c" && ", pcx);
+            }
+            span_from(child(v, k, pcx), &pcx);
+            wp(item, c"::cmp::PartialEq::eq(__a", &pcx);
+            w_int(k, pcx);
+            w(c", __b", pcx);
+            w_int(k, pcx);
+            w(c")", pcx);
+            span_from(d, &pcx);
+        }
+        if pcx.nodes[v].count == 0 {
+            w(c"true", pcx);
+        }
+        w(c",\n", pcx);
+    }
+    if pcx.nodes[item].count > 1 {
+        w(c"            _ => false,\n", pcx);
+    }
+    w(c"        }\n", pcx);
+}
+
+// `Equal` of the comparison (`Some(Equal)` for partial_cmp).
+fn w_equal(item: i64, ord: bool, pcx: inout Ctx<Comp>) {
+    if ord {
+        wp(item, c"::cmp::Ordering::Equal", &pcx);
+    } else {
+        wp(item, c"::option::Option::Some(", &pcx);
+        wp(item, c"::cmp::Ordering::Equal)", &pcx);
+    }
+}
+
+// One step of a lexicographic comparison: of `&self.F, &other.F` (`field`
+// the field node; a shared reference passed as it is) or of `__aK, __bK` (`field` 0): the last returns its
+// result, another returns it unless it is Equal.
+fn w_cmp_step(item: i64, field: i64, k: i64, ord: bool, last: bool, pad: *u8,
+    pcx: inout Ctx<Comp>) {
+    w(pad, pcx);
+    if !last {
+        w(c"match ", pcx);
+    }
+    wp(item, if ord { c"::cmp::Ord::cmp(" } else { c"::cmp::PartialOrd::partial_cmp(" }, &pcx);
+    if field != 0 {
+        w_field_arg(field, c"self", pcx);
+        w(c", ", pcx);
+        w_field_arg(field, c"other", pcx);
+    } else {
+        w(c"__a", pcx);
+        w_int(k, pcx);
+        w(c", __b", pcx);
+        w_int(k, pcx);
+    }
+    w(c")", pcx);
+    if last {
+        w(c"\n", pcx);
+        return;
+    }
+    w(c" {\n", pcx);
+    w(pad, pcx);
+    w(c"    ", pcx);
+    w_equal(item, ord, &pcx);
+    w(c" => {}\n", pcx);
+    w(pad, pcx);
+    w(c"    __c => { return __c; }\n", pcx);
+    w(pad, pcx);
+    w(c"}\n", pcx);
+}
+
+// Lexicographic over the fields, in their order.
+fn struct_cmp(item: i64, d: i64, ord: bool, pcx: inout Ctx<Comp>) {
+    let count = pcx.nodes[item].count;
+    for i in 0..count {
+        let field = child(item, i, pcx);
+        span_from(field, &pcx);
+        w_cmp_step(item, field, 0, ord, i + 1 == count, c"        ", &pcx);
+        span_from(d, &pcx);
+    }
+    if count == 0 {
+        w(c"        ", pcx);
+        w_equal(item, ord, &pcx);
+        w(c"\n", pcx);
+    }
+}
+
+// `let __i: isize = match self { E::A(..) => 0, .. };`: the index of the
+// variant `value` (text) holds.
+fn w_index(item: i64, binder: *u8, value: *u8, pcx: inout Ctx<Comp>) {
+    w(c"        let ", pcx);
+    w(binder, pcx);
+    w(c": isize = match ", pcx);
+    w(value, pcx);
+    w(c" {", pcx);
+    for i in 0..pcx.nodes[item].count {
+        w(c" ", pcx);
+        w_variant_pattern(item, child(item, i, pcx), 0 as *u8, pcx);
+        w(c" => ", pcx);
+        w_int(i, pcx);
+        w(c",", pcx);
+    }
+    w(c" };\n", pcx);
+}
+
+// The variants' order first, then the fields, lexicographic.
+fn enum_cmp(item: i64, d: i64, ord: bool, pcx: inout Ctx<Comp>) {
+    if pcx.nodes[item].count == 0 {
+        w(c"        match *self {}\n", pcx);
+        return;
+    }
+    w_index(item, c"__i", c"self", &pcx);
+    w_index(item, c"__j", c"other", &pcx);
+    w(c"        if __i != __j {\n            return ", pcx);
+    wp(item, if ord { c"::cmp::Ord::cmp(&__i, &__j);\n" }
+        else { c"::cmp::PartialOrd::partial_cmp(&__i, &__j);\n" }, &pcx);
+    w(c"        }\n        match (self, other) {\n", pcx);
+    for i in 0..pcx.nodes[item].count {
+        let v = child(item, i, pcx);
+        let count = pcx.nodes[v].count;
+        if count == 0 {
+            continue;
+        }
+        w(c"            (", pcx);
+        w_variant_pattern(item, v, c"__a", pcx);
+        w(c", ", pcx);
+        w_variant_pattern(item, v, c"__b", pcx);
+        w(c") => {\n", pcx);
+        for k in 0..count {
+            span_from(child(v, k, pcx), &pcx);
+            w_cmp_step(item, 0, k, ord, k + 1 == count, c"                ", &pcx);
+            span_from(d, &pcx);
+        }
+        w(c"            }\n", pcx);
+    }
+    w(c"            _ => ", pcx);
+    w_equal(item, ord, &pcx);
+    w(c",\n        }\n", pcx);
+}
+
+fn struct_hash(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    for i in 0..pcx.nodes[item].count {
+        let field = child(item, i, pcx);
+        span_from(field, &pcx);
+        w(c"        ", pcx);
+        wp(item, c"::hash::Hash::hash(", &pcx);
+        w_field_arg(field, c"self", pcx);
+        w(c", state);\n", pcx);
+        span_from(d, &pcx);
+    }
+}
+
+// The variant's index as an isize, then its fields.
+fn enum_hash(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    if pcx.nodes[item].count == 0 {
+        w(c"        match *self {}\n", pcx);
+        return;
+    }
+    w_index(item, c"__i", c"self", &pcx);
+    w(c"        ", pcx);
+    wp(item, c"::hash::Hash::hash(&__i, state);\n", &pcx);
+    w(c"        match self {\n", pcx);
+    for i in 0..pcx.nodes[item].count {
+        let v = child(item, i, pcx);
+        w(c"            ", pcx);
+        w_variant_pattern(item, v, c"__a", pcx);
+        w(c" => {\n", pcx);
+        for k in 0..pcx.nodes[v].count {
+            span_from(child(v, k, pcx), &pcx);
+            w(c"                ", pcx);
+            wp(item, c"::hash::Hash::hash(__a", &pcx);
+            w_int(k, pcx);
+            w(c", state);\n", pcx);
+            span_from(d, &pcx);
+        }
+        w(c"            }\n", pcx);
+    }
+    w(c"        }\n", pcx);
+}
+
+// `f.debug_struct("P").field("x", &self.x).finish()`, `debug_tuple`, or
+// the name of a unit struct, as Rust prints them.
+fn struct_debug(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    let count = pcx.nodes[item].count;
+    w(c"        f.", pcx);
+    if count == 0 {
+        w(c"write_str(\"", pcx);
+        w_sym(pcx.nodes[item].a, pcx);
+        w(c"\")\n", pcx);
+        return;
+    }
+    let tuple = tuple_struct(item, pcx);
+    w(if tuple { c"debug_tuple(\"" } else { c"debug_struct(\"" }, pcx);
+    w_sym(pcx.nodes[item].a, pcx);
+    w(c"\")", pcx);
+    for i in 0..count {
+        let field = child(item, i, pcx);
+        span_from(field, &pcx);
+        w(c"\n            .field(", pcx);
+        if !tuple {
+            w(c"\"", pcx);
+            w_sym(pcx.nodes[field].a, pcx);
+            w(c"\", ", pcx);
+        }
+        w_field_arg(field, c"self", pcx);
+        w(c")", pcx);
+        span_from(d, &pcx);
+    }
+    w(c"\n            .finish()\n", pcx);
+}
+
+fn enum_debug(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    if pcx.nodes[item].count == 0 {
+        w(c"        match *self {}\n", pcx);
+        return;
+    }
+    w(c"        match self {\n", pcx);
+    for i in 0..pcx.nodes[item].count {
+        let v = child(item, i, pcx);
+        let names = pcx.nodes[v].d;
+        w(c"            ", pcx);
+        w_variant_pattern(item, v, c"__a", pcx);
+        w(c" => f.", pcx);
+        if pcx.nodes[v].count == 0 {
+            w(c"write_str(\"", pcx);
+            w_sym(pcx.nodes[v].a, pcx);
+            w(c"\"),\n", pcx);
+            continue;
+        }
+        w(if names != 0 { c"debug_struct(\"" } else { c"debug_tuple(\"" }, pcx);
+        w_sym(pcx.nodes[v].a, pcx);
+        w(c"\")", pcx);
+        for k in 0..pcx.nodes[v].count {
+            span_from(child(v, k, pcx), &pcx);
+            w(c".field(", pcx);
+            if names != 0 {
+                w(c"\"", pcx);
+                w_sym(pcx.nodes[child(names, k, pcx)].a, pcx);
+                w(c"\", ", pcx);
+            }
+            w(c"__a", pcx);
+            w_int(k, pcx);
+            w(c")", pcx);
+            span_from(d, &pcx);
+        }
+        w(c".finish(),\n", pcx);
+    }
+    w(c"        }\n", pcx);
+}
+
+// `S { a: Clone::clone(&self.a), .. }` (a raw pointer field copied).
+fn struct_clone(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    w(c"        ", pcx);
+    w_sym(pcx.nodes[item].a, pcx);
+    w(c" {", pcx);
+    for i in 0..pcx.nodes[item].count {
+        let field = child(item, i, pcx);
+        if i > 0 {
+            w(c",", pcx);
+        }
+        span_from(field, &pcx);
+        w(c" ", pcx);
+        w_sym(pcx.nodes[field].a, pcx);
+        if raw_pointer_field(field, pcx) || shared_ref_field(field, pcx) {
+            w(c": self.", pcx);
+        } else {
+            w(c": ", pcx);
+            wp(item, c"::clone::Clone::clone(&self.", &pcx);
+        }
+        w_sym(pcx.nodes[field].a, pcx);
+        if !raw_pointer_field(field, pcx) && !shared_ref_field(field, pcx) {
+            w(c")", pcx);
+        }
+        span_from(d, &pcx);
+    }
+    w(c" }\n", pcx);
+}
+
+// `E::V(a, ..)` or `E::V { x: a, .. }` of variant v, each field's value
+// written by `field` (0: Clone::clone(__aK), 1: Default::default()).
+fn w_variant_value(item: i64, v: i64, field: i64, pcx: inout Ctx<Comp>) {
+    w_sym(pcx.nodes[item].a, pcx);
+    w(c"::", pcx);
+    w_sym(pcx.nodes[v].a, pcx);
+    let names = pcx.nodes[v].d;
+    if pcx.nodes[v].count == 0 && pcx.nodes[v].c == 0 {
+        return;
+    }
+    w(if names != 0 { c" { " } else { c"(" }, pcx);
+    for k in 0..pcx.nodes[v].count {
+        if k > 0 {
+            w(c", ", pcx);
+        }
+        if names != 0 {
+            w_sym(pcx.nodes[child(names, k, pcx)].a, pcx);
+            w(c": ", pcx);
+        }
+        if field == 0 {
+            wp(item, c"::clone::Clone::clone(__a", &pcx);
+            w_int(k, pcx);
+            w(c")", pcx);
+        } else {
+            wp(item, c"::default::Default::default()", &pcx);
+        }
+    }
+    w(if names != 0 { c" }" } else { c")" }, pcx);
+}
+
+fn enum_clone(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    if pcx.nodes[item].count == 0 {
+        w(c"        match *self {}\n", pcx);
+        return;
+    }
+    w(c"        match self {\n", pcx);
+    for i in 0..pcx.nodes[item].count {
+        let v = child(item, i, pcx);
+        w(c"            ", pcx);
+        w_variant_pattern(item, v, c"__a", pcx);
+        w(c" => ", pcx);
+        w_variant_value(item, v, 0, &pcx);
+        w(c",\n", pcx);
+    }
+    let _ = d;
+    w(c"        }\n", pcx);
+}
+
+// `S { a: Default::default(), .. }`.
+fn struct_default(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    w(c"        ", pcx);
+    w_sym(pcx.nodes[item].a, pcx);
+    w(c" {", pcx);
+    for i in 0..pcx.nodes[item].count {
+        let field = child(item, i, pcx);
+        if i > 0 {
+            w(c",", pcx);
+        }
+        span_from(field, &pcx);
+        w(c" ", pcx);
+        w_sym(pcx.nodes[field].a, pcx);
+        w(c": ", pcx);
+        wp(item, c"::default::Default::default()", &pcx);
+        span_from(d, &pcx);
+    }
+    w(c" }\n", pcx);
+}
+
+// The `#[default]` variant (F17.1); without one, `error derive.default`.
+fn enum_default(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    var chosen = -1;
+    for i in 0..pcx.nodes[item].count {
+        if (pcx.nodes[child(item, i, pcx)].p & crate::front::ast::VARIANT_DEFAULT) != 0 {
+            chosen = i;
+        }
+    }
+    if chosen < 0 {
+        err_begin(pcx.nodes[d].start, &pcx);
+        pcx.err_kind = c"derive.default";
+        err_fmt(format_args("cannot derive Default for '{}': no variant is marked #[default]",
+            sym_text(pcx.nodes[item].a, pcx)), pcx);
+        err_help(
+            c"mark the default variant `#[default]` (a variant without fields), or write the impl", pcx);
+        err_end_soft(&pcx);
+        w(c"        loop {}\n", pcx);
+        return;
+    }
+    w(c"        ", pcx);
+    w_variant_value(item, child(item, chosen, pcx), 1, &pcx);
+    w(c"\n", pcx);
+}

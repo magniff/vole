@@ -21,9 +21,9 @@ use crate::base::diag::{
     err_begin, err_end, err_end_soft, err_help, err_help_sym, err_str, err_try_fmt,
 };
 use crate::front::ast::{
-    CLOSURE_HOLES, CLOSURE_MOVE, FMT_BIN, FMT_CHAR, FMT_EXP, FMT_HEX, FMT_LEFT, FMT_RIGHT, FMT_ZERO,
-    NODE_IMPLICIT, NODE_REF, NODE_REF_MUT, NodeKind, child, list_begin, list_end, list_push,
-    new_node,
+    CLOSURE_HOLES, CLOSURE_MOVE, FMT_BIN, FMT_CHAR, FMT_EXP, FMT_HEX, FMT_LEFT, FMT_RIGHT,
+    FMT_UPPER, FMT_ZERO, NODE_IMPLICIT, NODE_REF, NODE_REF_MUT, NodeKind, child, list_begin,
+    list_end, list_push, new_node,
 };
 use crate::front::check::{mismatch_error, pop_scope, push_scope, type_error};
 use crate::front::check::format::{
@@ -392,6 +392,14 @@ const D_EPRINT: i64 = 3;
 const D_EPRINTLN: i64 = 4;
 const D_FORMAT_IN: i64 = 5;
 const D_PUSH_FMT: i64 = 6;
+// (0.27.2: std2's panic, F16.3)
+const D_PANIC: i64 = 7;
+
+// (0.27.2) std2's fmt::write and writeln (F16.1): the destination is the
+// call's first argument, bound as `__r` (a `&mut W`), the f-string its
+// second.
+pub const D_WRITE: i64 = 8;
+pub const D_WRITELN: i64 = 9;
 
 // (0.17) Whether call n of function f (a template; n's named arguments
 // normalized; `method`: a method call, its receiver not among them) is
@@ -399,16 +407,28 @@ const D_PUSH_FMT: i64 = 6;
 // Buf::push_fmt with an f-string as its Display argument, outside std:
 // which one (D_*), else 0.
 pub fn direct_kind(n: i64, f: i64, method: bool, pcx: Ctx<Comp>) -> i64 {
-    if pcx.std_module < 0 || !within_std(pcx.fns[f].module, pcx) || within_std(pcx.cur_mod, pcx)
+    if pcx.std_module < 0 || !within_std(pcx.fns[f].module, pcx)
+        || within_std(pcx.cur_mod, pcx) && !crate::front::known::on_std2(pcx)
         || pcx.const_context
         || pcx.nodes[n].count == 0 {
         return 0;
+    }
+    let name = sym_text(pcx.nodes[pcx.fns[f].node].a, pcx);
+    // RULE: F16.3 (std2's `write(w, "..")`, `writeln`: the f-string second)
+    if !method && (name == "write" || name == "writeln") && crate::front::known::on_std2(pcx) {
+        if pcx.nodes[n].count != 2 {
+            return 0;
+        }
+        let fs = child(n, 1, pcx);
+        if pcx.nodes[fs].kind != NodeKind::Interp || pcx.nodes[fs].y != 0 {
+            return 0;
+        }
+        return if name == "write" { D_WRITE } else { D_WRITELN };
     }
     let fs = child(n, 0, pcx);
     if pcx.nodes[fs].kind != NodeKind::Interp || pcx.nodes[fs].y != 0 {
         return 0;
     }
-    let name = sym_text(pcx.nodes[pcx.fns[f].node].a, pcx);
     let k = if method {
         // (0.20: Buf's; String's is an ordinary call)
         if name == "push_fmt"
@@ -424,6 +444,8 @@ pub fn direct_kind(n: i64, f: i64, method: bool, pcx: Ctx<Comp>) -> i64 {
         D_EPRINTLN
     } else if name == "format_in" {
         D_FORMAT_IN
+    } else if name == "panic" && crate::front::known::on_std2(pcx) {
+        D_PANIC
     } else {
         0
     };
@@ -542,6 +564,9 @@ fn allocator_ok(t: i64, f: i64, pos: i64, pcx: inout Ctx<Comp>) -> bool {
 //
 // (WRITES: push_writes; std's helpers: compiler/std/fmt.vl.)
 fn direct_body(fs: i64, k: i64, n: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if crate::front::known::on_std2(pcx) && k != D_PUSH_FMT {
+        return direct_body_std2(fs, k, n, &pcx);
+    }
     let out = intern_c(c"__out", &pcx);
     let none = 0 as *u8;
     let stmts = list_begin(pcx);
@@ -596,6 +621,223 @@ fn direct_body(fs: i64, k: i64, n: i64, pcx: inout Ctx<Comp>) -> i64 {
     list_end(body, stmts, &pcx);
     pcx.nodes[body].a = tail;
     body
+}
+
+// (0.27.2) direct_body on std2 (a rust program's std): the f-string written
+// through std2's Formatter, Rust's shape:
+//
+//   print, println, eprint, eprintln:
+//     { let mut __o = std::io::stdout(); (stderr)
+//       { let mut __out = std::fmt::Formatter::new(&mut __o);
+//         WRITES; [__out.write_str("\n");] } }
+//   format_in:
+//     { let mut __b = std::string::String::new_in(__a);
+//       { let mut __out = std::fmt::Formatter::new(&mut __b); WRITES } __b }
+//
+// WRITES: each text `__out.write_str("..")`, each hole
+// `std::fmt::Display::fmt(&__fN, &mut __out)` (Debug for `{:?}`, LowerHex,
+// UpperHex, Octal, Binary, LowerExp for theirs), a hole's spec (width,
+// precision, fill, alignment, `+`, `#`, `0`) set before it by
+// `__out.__spec(..)` and cleared after (spec_call). write and writeln
+// write through their destination, `__r`, the last write their value.
+// RULE: F16.3
+fn direct_body_std2(fs: i64, k: i64, n: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let out = intern_c(c"__out", &pcx);
+    let stmts = list_begin(pcx);
+    var tail = 0;
+    let write = k == D_WRITE || k == D_WRITELN;
+    let dst = if k == D_FORMAT_IN { intern_c(c"__b", &pcx) } else if k == D_PANIC {
+        intern_c(c"__p", &pcx) } else if write { intern_c(c"__r", &pcx) }
+        else { intern_c(c"__o", &pcx) };
+    if write {
+        // (`__r`, the `&mut W` direct_call bound: written through as it is)
+    } else if k == D_FORMAT_IN {
+        let new_in = string_new_in(ident(intern_c(c"__a", &pcx), n, &pcx), n, &pcx);
+        let lb = let_node(dst, new_in, n, true, &pcx);
+        pcx.nodes[lb].p |= NO_DROP;
+        list_push(lb, &pcx);
+    } else if k == D_PANIC {
+        let open = std_path_call(c"__rt", c"PanicOut", c"new", 0, 0, n, &pcx);
+        list_push(let_node(dst, open, n, true, &pcx), &pcx);
+        tail = method_call(ident(dst, n, &pcx), c"panic", &pcx);
+        let none = list_begin(pcx);
+        list_end(tail, none, &pcx);
+    } else {
+        // (`let mut __s = std::io::stdout(); let mut __o = std::__rt::io_out(&mut __s);`)
+        let err = k == D_EPRINT || k == D_EPRINTLN;
+        let which = if err { c"stderr" } else { c"stdout" };
+        let s = intern_c(c"__s", &pcx);
+        let open = std_path_call(c"io", which, 0 as *u8, 0, 0, n, &pcx);
+        list_push(let_node(s, open, n, true, &pcx), &pcx);
+        let wrap = std_path_call(c"__rt", c"io_out", 0 as *u8, amp_mut(ident(s, n, &pcx), &pcx), 0,
+            n, &pcx);
+        list_push(let_node(dst, wrap, n, true, &pcx), &pcx);
+    }
+    let inner = list_begin(pcx);
+    let made = std_path_call(c"fmt", c"Formatter", c"new",
+        if write { ident(dst, n, &pcx) } else { amp_mut(ident(dst, n, &pcx), &pcx) }, 0, n, &pcx);
+    list_push(let_node(out, made, n, true, &pcx), &pcx);
+    var holes = 0;
+    for i in 0..pcx.nodes[fs].count {
+        let item = child(fs, i, pcx);
+        if pcx.nodes[item].kind == NodeKind::Str {
+            list_push(stmt(call1(ident(out, item, &pcx), c"write_str", item, &pcx), &pcx), &pcx);
+            continue;
+        }
+        if hole_eval_only(item, pcx) {
+            holes += 1;
+            continue;
+        }
+        let alias = hole_alias(item, pcx);
+        let name = hidden(c"=f", if alias >= 0 { alias } else { holes }, &pcx);
+        let flags = pcx.nodes[item].p;
+        var tr = c"Display";
+        if hole_debug(item, pcx) {
+            tr = c"Debug";
+        } else if (flags & FMT_HEX) != 0 {
+            tr = if (flags & FMT_UPPER) != 0 { c"UpperHex" } else { c"LowerHex" };
+        } else if (flags & FMT_OCT) != 0 {
+            tr = c"Octal";
+        } else if (flags & FMT_BIN) != 0 {
+            tr = c"Binary";
+        } else if (flags & FMT_EXP) != 0 {
+            tr = c"LowerExp";
+        }
+        var value = unary(Tok::Amp, ident(name, item, &pcx), &pcx);
+        if (flags & crate::front::check::format::FMT_AS_SLICE) != 0 {
+            // (`&__fN[..]`, `&(*__fN)[..]` for a reference to an array)
+            let full = new_node(NodeKind::Range, pcx.nodes[item].start, pcx.nodes[item].end, &pcx);
+            let ix = new_node(NodeKind::Index, pcx.nodes[item].start, pcx.nodes[item].end, &pcx);
+            let ht = pcx.nodes[item].ty;
+            pcx.nodes[ix].a = if ht > 0 && pcx.types[ht].kind == TyKind::Ptr {
+                unary(Tok::Star, ident(name, item, &pcx), &pcx)
+            } else {
+                ident(name, item, &pcx)
+            };
+            pcx.nodes[ix].b = full;
+            value = unary(Tok::Amp, ix, &pcx);
+        }
+        let write = std_path_call(c"fmt", tr, c"fmt", value, amp_mut(ident(out, item, &pcx), &pcx),
+            item, &pcx);
+        // (the hole's spec on the Formatter for its value, then cleared)
+        let spec = hole_has_spec(item, pcx);
+        if spec {
+            list_push(stmt(spec_call(out, item, false, &pcx), &pcx), &pcx);
+        }
+        list_push(stmt(write, &pcx), &pcx);
+        if spec {
+            list_push(stmt(spec_call(out, item, true, &pcx), &pcx), &pcx);
+        }
+        holes += 1;
+    }
+    if k == D_PRINTLN || k == D_EPRINTLN {
+        let nl = new_node(NodeKind::Str, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+        pcx.nodes[nl].a = crate::front::lexer::add_string("\n");
+        list_push(stmt(call1(ident(out, n, &pcx), c"write_str", nl, &pcx), &pcx), &pcx);
+    }
+    let writes = new_node(NodeKind::Block, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+    list_end(writes, inner, &pcx);
+    if write {
+        // (its fmt::Result: the last write's, `\n` for writeln, the block's
+        // value; the writes before are a String's or a Formatter's, which
+        // do not fail; 0.27.3 carries each one's error)
+        let last = new_node(NodeKind::Str, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+        pcx.nodes[last].a = crate::front::lexer::add_string(if k == D_WRITELN { "\n" } else { "" });
+        pcx.nodes[writes].a = call1(ident(out, n, &pcx), c"write_str", last, &pcx);
+        tail = writes;
+    } else {
+        list_push(stmt(writes, &pcx), &pcx);
+    }
+    if k == D_FORMAT_IN {
+        tail = ident(dst, n, &pcx);
+    }
+    let body = new_node(NodeKind::Block, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+    list_end(body, stmts, &pcx);
+    pcx.nodes[body].a = tail;
+    body
+}
+
+// (0.27.2) Whether hole item has a spec std2's Formatter carries: a
+// width, a precision, a fill, an alignment, `+`, `#` or `0`.
+fn hole_has_spec(item: i64, pcx: Ctx<Comp>) -> bool {
+    let f = pcx.nodes[item].p;
+    pcx.nodes[item].c >= 0 || pcx.nodes[item].d >= 0 || hole_fill(item, pcx) != 0
+        || (f & (crate::front::ast::FMT_LEFT | crate::front::ast::FMT_RIGHT
+            | crate::front::check::format::FMT_CENTER | crate::front::check::format::FMT_PLUS
+            | crate::front::check::format::FMT_ALT | crate::front::ast::FMT_ZERO)) != 0
+}
+
+// `__out.__spec(width, precision, fill, align, flags)` for hole item, or
+// the empty spec's when `clear`. RULE: F16.3
+fn spec_call(out: i64, item: i64, clear: bool, pcx: inout Ctx<Comp>) -> i64 {
+    let f = pcx.nodes[item].p;
+    let width = if clear { -1 } else { pcx.nodes[item].c };
+    let precision = if clear { -1 } else { pcx.nodes[item].d };
+    let fill = if clear || hole_fill(item, pcx) == 0 { 32 } else { hole_fill(item, pcx) };
+    let align = if clear { 0 }
+        else if (f & crate::front::ast::FMT_LEFT) != 0 { 1 }
+        else if (f & crate::front::ast::FMT_RIGHT) != 0 { 2 }
+        else if (f & crate::front::check::format::FMT_CENTER) != 0 { 3 }
+        else { 0 };
+    var flags = 0;
+    if !clear {
+        if (f & crate::front::check::format::FMT_PLUS) != 0 {
+            flags |= 1;
+        }
+        if (f & crate::front::check::format::FMT_ALT) != 0 {
+            flags |= 4;
+        }
+        if (f & crate::front::ast::FMT_ZERO) != 0 {
+            flags |= 8;
+        }
+    }
+    let c = method_call(ident(out, item, &pcx), c"__spec", &pcx);
+    let mark = list_begin(pcx);
+    list_push(int_node(width, item, &pcx), &pcx);
+    list_push(int_node(precision, item, &pcx), &pcx);
+    list_push(spec_int(fill, item, &pcx), &pcx);
+    list_push(int_node(align, item, &pcx), &pcx);
+    list_push(spec_int(flags, item, &pcx), &pcx);
+    list_end(c, mark, &pcx);
+    c
+}
+
+// A u32 literal of value v (>= 0), at node at.
+fn spec_int(v: i64, at: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let lit = new_node(NodeKind::Int, pcx.nodes[at].start, pcx.nodes[at].end, &pcx);
+    pcx.nodes[lit].a = v;
+    pcx.nodes[lit].b = crate::front::lexer::SUF_U32;
+    lit
+}
+
+// `std::m::name(a0, a1)` (t the name, `name` none) or `std::m::t::name(a0,
+// a1)`, at node at: a path whose list holds every segment.
+fn std_path_call(m: *u8, t: *u8, name: *u8, a0: i64, a1: i64, at: i64,
+    pcx: inout Ctx<Comp>) -> i64 {
+    let two = name == 0 as *u8;
+    let last = if two { t } else { name };
+    let path = new_node(NodeKind::Path, pcx.nodes[at].start, pcx.nodes[at].end, &pcx);
+    pcx.nodes[path].a = intern_c(if two { m } else { t }, &pcx);
+    pcx.nodes[path].b = intern_c(last, &pcx);
+    let pmark = list_begin(pcx);
+    list_push(std_ident(at, &pcx), &pcx);
+    list_push(ident(intern_c(m, &pcx), at, &pcx), &pcx);
+    if !two {
+        list_push(ident(intern_c(t, &pcx), at, &pcx), &pcx);
+    }
+    list_push(ident(intern_c(last, &pcx), at, &pcx), &pcx);
+    list_end(path, pmark, &pcx);
+    let call = new_node(NodeKind::Call, pcx.nodes[at].start, pcx.nodes[at].end, &pcx);
+    pcx.nodes[call].a = path;
+    let amark = list_begin(pcx);
+    if a0 != 0 {
+        list_push(a0, &pcx);
+        if a1 != 0 {
+            list_push(a1, &pcx);
+        }
+    }
+    list_end(call, amark, &pcx);
+    call
 }
 
 // `loop { WRITES; if done { break; } }`: f-string fs written to `out`
@@ -690,6 +932,16 @@ fn check_hole(h: i64, t: i64, pcx: inout Ctx<Comp>) {
     }
     let shown = if takes_pointer(h, &pcx) { pcx.types[t].a } else { t };
     if !implements(tr, shown, &pcx) && !(debug && debug_slice(shown, &pcx)) {
+        // RULE: F16.4 (std2: an array's `{:?}` is its slice's)
+        // (or a reference to one, `&a`)
+        let arr = if shown > 0 && pcx.types[shown].kind == TyKind::Ptr { pcx.types[shown].a }
+            else { shown };
+        if debug && crate::front::known::on_std2(pcx) && arr > 0
+            && pcx.types[arr].kind == TyKind::Array
+            && implements(tr, crate::front::types::slice_of(pcx.types[arr].a, &pcx), &pcx) {
+            pcx.nodes[h].p |= crate::front::check::format::FMT_AS_SLICE;
+            return;
+        }
         missing_trait(h, shown, debug, &pcx);
     }
     if (flags & FMT_CHAR) != 0 && shown != TY_U8 {

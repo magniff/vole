@@ -49,7 +49,7 @@ i=0
 for mode in "-O0" "-O2" "-O2 --no-noalias"; do
     i=$((i + 1))
     # shellcheck disable=SC2086
-    if ! "$C" $mode --allow=borrowck.unchecked $flags "$f" -o "$d/p$i" >"$d/c$i" 2>&1; then
+    if ! "$C" $mode $flags "$f" -o "$d/p$i" >"$d/c$i" 2>&1; then
         echo "FAIL $n: does not build with $mode: $(grep -m 1 error "$d/c$i")"; exit 0
     fi
     (cd "$d" && ./p$i >"$d/o$i" 2>/dev/null; echo "exit $?" >>"$d/o$i")

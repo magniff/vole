@@ -7,12 +7,16 @@ use crate::base::{SRC, buf_new, buf_slice, buf_str, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{buf_position, report_error_tries};
+use crate::front::types::TyKind;
 use crate::places::borrowck::{Bck, LOAN_WORDS};
 use crate::places::borrowck::access::{
     A_RB, C_ASSIGN_BORROWED, C_CONFLICT, C_DROPPED_BORROWED, C_GUARD_WRITE, C_MOVE_BORROWED,
     C_MUT_TWICE, C_RETURN_LOCAL, C_USE_BORROWED,
 };
-use crate::places::ir::{BK_MUT, BK_MUT2, Body, LF_PARAM, LF_USER, SK_DEAD};
+use crate::places::ir::{
+    BK_MUT, BK_MUT2, Body, LF_PARAM, LF_USER, PJ_CONST, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION,
+    PJ_VARIANT, SK_DEAD, proj_kind, proj_parent, proj_val, struct_field_count,
+};
 
 // A write through a shared reference at location loc (D2.6, L6: a guard's
 // `ref mut` binding), once per place.
@@ -280,7 +284,9 @@ pub fn report(code: i64, kind: i64, loc: i64, j: i64, l: i64, p: i64, deref: i64
     let ls = bck.loans[LOAN_WORDS * j];
     let lk = bck.loans[LOAN_WORDS * j + 2];
     var node = st.node;
-    if node == 0 {
+    // RULE: 14.2 (dropped_borrowed at the borrow, as rustc's E0597, E0713)
+    let drop_node = if code == C_DROPPED_BORROWED && st.kind != SK_DEAD { st.node } else { 0 };
+    if node == 0 || code == C_DROPPED_BORROWED && pbody.stmts[ls].node != 0 {
         node = pbody.stmts[ls].node;
     }
     if node == 0 {
@@ -318,7 +324,12 @@ pub fn report(code: i64, kind: i64, loc: i64, j: i64, l: i64, p: i64, deref: i64
                 == SK_DEAD {
                 c"' does not live long enough: its scope ends here while it is still borrowed"
             }
-            else { c"' is dropped here while it is still borrowed" });
+            else { c"' is dropped while it is still borrowed" });
+        if drop_node != 0 {
+            buf_str(m, c" (dropped at ");
+            buf_position(m, pcx.nodes[drop_node].start, &pcx);
+            buf_str(m, c")");
+        }
     } else if code == C_RETURN_LOCAL {
         buf_str(m, c"a reference to '");
         buf_place(m, l, p, deref, pbody, pcx);
@@ -371,28 +382,174 @@ pub fn report(code: i64, kind: i64, loc: i64, j: i64, l: i64, p: i64, deref: i64
         if tr >= 0 { buf_slice(tr) } else { "" }, false, &pcx);
 }
 
-// The place as the user names it: the root's source name when it has one
-// (a user local, a parameter), the IR's form otherwise or beside it when
-// the place is projected.
+// The place as the user names it, as rustc's messages do: the root's
+// source name when it has one (a user local, a parameter) and the path in
+// source form (`s.n`, `*r`, `v[_]`, `(o as Some).0`: a deref before a
+// field or an index is the auto-deref and not written); the IR's form for
+// a temporary's place.
 pub fn buf_place(m: i64, l: i64, p: i64, deref: i64, pbody: Body<Comp>, pcx: Ctx<Comp>) {
     if deref != 0 {
         buf_str(m, c"*");
     }
     let lc = pbody.locals[l];
-    let named = (lc.flags & (LF_USER | LF_PARAM)) != 0 && lc.src >= 0;
-    if named {
-        // UNSAFE: LOCALS is the checker's raw table of locals.
-        // SAFETY: lc.src is a local the checker defined (a body's src),
-        // below LOCAL_COUNT.
-        let name = unsafe { pcx.locals[lc.src].name };
-        crate::base::buf_bytes(m, sym_text(name, pcx));
-        if p == 0 {
-            return;
-        }
-        buf_str(m, c" (");
+    if (lc.flags & (LF_USER | LF_PARAM)) != 0 && lc.src >= 0 {
+        buf_src_place(m, l, p, false, pbody, pcx);
+        return;
     }
     crate::places::print::buf_place(m, l, p, pbody, pcx);
-    if named {
-        buf_str(m, c")");
+}
+
+// Place (l, p) of a named root in source form; `auto` when the step
+// outside it is a field or an index (a deref there is not written).
+fn buf_src_place(m: i64, l: i64, p: i64, auto: bool, pbody: Body<Comp>, pcx: Ctx<Comp>) {
+    if p == 0 {
+        // UNSAFE: LOCALS is the checker's raw table of locals.
+        // SAFETY: buf_place checked pbody.locals[l].src is a local the
+        // checker defined (a body's src), below LOCAL_COUNT.
+        let name = unsafe { pcx.locals[pbody.locals[l].src].name };
+        crate::base::buf_bytes(m, sym_text(name, pcx));
+        return;
     }
+    let k = proj_kind(p, pbody);
+    let parent = proj_parent(p, pbody);
+    // (a capture in a closure body is named as the captured variable,
+    // rustc's `b.n` for `(*(*_1).0).0`; a by-reference capture's own deref
+    // is not written)
+    let cap = env_capture(l, p, pbody, pcx);
+    if cap >= 0 {
+        // UNSAFE: LOCALS is the checker's raw table of locals.
+        // SAFETY: a capture's local is one the checker defined, below
+        // LOCAL_COUNT.
+        let name = unsafe { pcx.locals[pcx.capture_list.get(cap)].name };
+        crate::base::buf_bytes(m, sym_text(name, pcx));
+        return;
+    }
+    if k == PJ_DEREF && env_capture(l, parent, pbody, pcx) >= 0
+        && pcx.capture_list.get(env_capture(l, parent, pbody, pcx) + 1) != 0 {
+        buf_src_place(m, l, parent, auto, pbody, pcx);
+        return;
+    }
+    if k == PJ_DEREF {
+        if !auto {
+            buf_str(m, c"*");
+        }
+        buf_src_place(m, l, parent, auto, pbody, pcx);
+        return;
+    }
+    if k == PJ_VARIANT {
+        buf_str(m, c"(");
+        buf_src_place(m, l, parent, false, pbody, pcx);
+        buf_str(m, c" as ");
+        // UNSAFE: VARIANTS is the checker's raw table of variants.
+        // SAFETY: the projection's value is a variant the checker resolved.
+        let name = unsafe { pcx.variants[proj_val(p, pbody)].name };
+        crate::base::buf_bytes(m, sym_text(name, pcx));
+        buf_str(m, c")");
+        return;
+    }
+    buf_src_place(m, l, parent, true, pbody, pcx);
+    let v = proj_val(p, pbody);
+    if k == PJ_FIELD || k == PJ_UNION {
+        buf_str(m, c".");
+        let s = named_struct(l, parent, pbody, pcx);
+        if s >= 0 && v >= 0 && v < struct_field_count(s, pcx) {
+            crate::base::buf_bytes(m,
+                sym_text(crate::places::front::struct_field_name(s, v, pcx), pcx));
+        } else {
+            crate::base::buf_int(m, v);
+        }
+    } else if k == PJ_INDEX {
+        buf_str(m, c"[_]");
+    } else if k == PJ_CONST {
+        buf_str(m, c"[");
+        crate::base::buf_int(m, v);
+        buf_str(m, c"]");
+    }
+}
+
+// The struct (STRUCTS) place (l, p) is, through its derefs; -1 for any
+// other type or one the walk cannot name without making a type.
+fn named_struct(l: i64, p: i64, pbody: Body<Comp>, pcx: Ctx<Comp>) -> i64 {
+    var t = named_place_ty(l, p, pbody, pcx);
+    while t > 0 && (pcx.types[t].kind == TyKind::Distinct || pcx.types[t].kind == TyKind::Ptr) {
+        t = pcx.types[t].a;
+    }
+    if t > 0 && pcx.types[t].kind == TyKind::Struct { pcx.types[t].a } else { -1 }
+}
+
+// full_place_type's walk for naming, by value: 0 where a step would need
+// a new type (a slice's parts) or does not apply.
+fn named_place_ty(l: i64, p: i64, pbody: Body<Comp>, pcx: Ctx<Comp>) -> i64 {
+    if p == 0 {
+        return pbody.locals[l].ty;
+    }
+    let k = proj_kind(p, pbody);
+    let parent = proj_parent(p, pbody);
+    let v = proj_val(p, pbody);
+    if k == PJ_FIELD && parent > 0 && proj_kind(parent, pbody) == PJ_VARIANT {
+        return crate::places::ir::variant_part_type(proj_val(parent, pbody), v, pcx);
+    }
+    var t = named_place_ty(l, parent, pbody, pcx);
+    while t > 0 && pcx.types[t].kind == TyKind::Distinct {
+        t = pcx.types[t].a;
+    }
+    if t <= 0 {
+        return 0;
+    }
+    let tk = pcx.types[t].kind;
+    if k == PJ_DEREF || k == PJ_INDEX || k == PJ_CONST {
+        return if tk == TyKind::Ptr || tk == TyKind::Array || tk == TyKind::Slice {
+            pcx.types[t].a
+        } else {
+            0
+        };
+    }
+    if k == PJ_VARIANT {
+        return t;
+    }
+    if tk == TyKind::Struct {
+        let s = pcx.types[t].a;
+        return if v >= 0 && v < struct_field_count(s, pcx) {
+            crate::places::ir::struct_field_ty(s, v, pcx)
+        } else {
+            0
+        };
+    }
+    if tk == TyKind::Tuple && v >= 0 && v < pcx.types[t].count {
+        return crate::front::types::type_elem(t, v, pcx);
+    }
+    0
+}
+
+// The CAPTURE_LIST index of the (local, by_ref) pair that place (l, p) of
+// a closure body is the env's field for, `(*_1).k` or `_1.k` (a by-value
+// env), the env the `{env}` parameter; -1 for any other place.
+fn env_capture(l: i64, p: i64, pbody: Body<Comp>, pcx: Ctx<Comp>) -> i64 {
+    if p == 0 || proj_kind(p, pbody) != PJ_FIELD || pbody.locals[l].src < 0 {
+        return -1;
+    }
+    // UNSAFE: LOCALS is the checker's raw table of locals.
+    // SAFETY: src was checked >= 0 above; it is a local the checker
+    // defined (a body's src), below LOCAL_COUNT.
+    if unsafe { pcx.locals[pbody.locals[l].src].name } != pcx.env_sym {
+        return -1;
+    }
+    var t = pbody.locals[l].ty;
+    let q = proj_parent(p, pbody);
+    if q != 0 {
+        if proj_kind(q, pbody) != PJ_DEREF || proj_parent(q, pbody) != 0 || t <= 0
+            || pcx.types[t].kind != TyKind::Ptr {
+            return -1;
+        }
+        t = pcx.types[t].a;
+    }
+    if t <= 0 || pcx.types[t].kind != TyKind::Struct || !crate::places::ir::struct_closure(t, pcx) {
+        return -1;
+    }
+    let c = pcx.structs[pcx.types[t].a].closure - 1;
+    let k = proj_val(p, pbody);
+    if c < 0 || k < 0 || k >= pcx.closures[c].capture_count {
+        return -1;
+    }
+    pcx.closures[c].captures + 2 * k
 }

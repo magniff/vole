@@ -17,7 +17,8 @@ use crate::front::types::{TyKind, type_elem};
 use crate::places::borrowck::{Bck, LOAN_WORDS, bit_on};
 use crate::places::ir::{Body, LF_STATIC, has_flag, local_ty, undistinct};
 use crate::places::regions::{
-    RO_LOAN, RO_LOCAL, RO_UNIVERSAL, U_ELIDED, U_NAMED, U_STATIC, region_word, slot_count, slot_var,
+    RO_LOAN, RO_LOCAL, RO_UNIVERSAL, U_BOUND, U_CSLOT, U_ELIDED, U_ENV, U_NAMED, U_STATIC,
+    region_word, slot_count, slot_var,
 };
 
 // RULE: D6.1
@@ -182,6 +183,8 @@ pub fn outlives(u: i64, v: i64, bck: Bck<Comp>) -> bool {
 fn universal_violations(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     let ne = bck.edges.len() as i64 / 3;
     bck.reported.clear();
+    bck.reqs.clear();
+    var locals = Vec::<i64, Comp>::new_in(Comp {});
     for e in 0..ne {
         let sup = bck.edges[3 * e];
         let sub = bck.edges[3 * e + 1];
@@ -207,9 +210,139 @@ fn universal_violations(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<
             }
             bck.reported.push(u);
             bck.reported.push(v);
-            report_outlives(u, v, loc, bck, pbody, &pcx);
+            if local_universal(u, bck, pbody) {
+                locals.push(u);
+                locals.push(v);
+                locals.push(loc);
+            } else if !requirement(u, v, &bck, pbody) {
+                report_outlives(u, v, loc, bck, pbody, &pcx);
+            }
         }
     }
+    // RULE: D19.10 (1) (a local universal of a closure body: one error for
+    // it, the one naming a capture first, then the signature, rustc's)
+    var i = 0;
+    while i + 2 < locals.len() as i64 {
+        let u = locals[i];
+        var best = i;
+        var first = true;
+        var j = 0;
+        while j + 2 < locals.len() as i64 {
+            if locals[j] == u {
+                if j < i {
+                    first = false;
+                }
+                if rank(locals[j + 1], bck, pbody, pcx) > rank(locals[best + 1], bck, pbody, pcx) {
+                    best = j;
+                }
+            }
+            j += 3;
+        }
+        if first {
+            report_outlives(u, locals[best + 1], locals[best + 2], bck, pbody, &pcx);
+        }
+        i += 3;
+    }
+    // RULE: D19.10 (2) (kept with the closure, for its creator and its calls)
+    var k = 0;
+    while k + 2 < bck.reqs.len() as i64 {
+        let id = bck.reqs[k];
+        if pcx.closures[id].req_n == 0 {
+            pcx.closures[id].req_at = pcx.capture_list.count;
+        }
+        pcx.capture_list.push(bck.reqs[k + 1]);
+        pcx.capture_list.push(bck.reqs[k + 2]);
+        pcx.closures[id].req_n += 1;
+        k += 3;
+    }
+}
+
+// Whether universal u of a closure body is local (D19.4: a bound region,
+// the env's 'e).
+fn local_universal(u: i64, bck: Bck<Comp>, pbody: Body<Comp>) -> bool {
+    let r = universal_var(u, bck);
+    r > 0 && (region_word(r, 0, pbody) == U_BOUND || region_word(r, 0, pbody) == U_ENV)
+}
+
+// What a violation of a local universal names, by preference: 2 a
+// capture's slot, 1 a slot of the signature (X_C), 0 another.
+fn rank(v: i64, bck: Bck<Comp>, pbody: Body<Comp>, pcx: Ctx<Comp>) -> i64 {
+    let r = universal_var(v, bck);
+    if r == 0 || region_word(r, 0, pbody) != U_CSLOT {
+        return 0;
+    }
+    let id = region_word(r, 1, pbody);
+    if region_word(r, 2, pbody) < slot_count(pcx.closures[id].ty, pcx) - pcx.closures[id].xc_n {
+        2
+    } else {
+        1
+    }
+}
+
+// RULE: D19.10 (2) In a closure body, universal u must outlive v: when u is
+// a slot of the closure's type C (external, U_CSLOT), it is not an error
+// here but the closure's requirements `u ⊒ z` for every z of ub(v), kept
+// for the creator (constraints.vl, at the closure's aggregate): v itself
+// when it is external, else the ⊒-minimal external universals that
+// outlive v (never none: 'static). True when recorded.
+fn requirement(u: i64, v: i64, bck: inout Bck<Comp>, pbody: Body<Comp>) -> bool {
+    let ru = universal_var(u, bck);
+    if ru == 0 || region_word(ru, 0, pbody) != U_CSLOT {
+        return false;
+    }
+    let id = region_word(ru, 1, pbody);
+    let i = region_word(ru, 2, pbody);
+    if external(v, bck, pbody) {
+        push_req(id, i, slot_pos(v, bck, pbody), &bck);
+        return true;
+    }
+    for z in 0..bck.nuniv {
+        if !external(z, bck, pbody) || !outlives(z, v, bck) {
+            continue;
+        }
+        var minimal = true;
+        for z2 in 0..bck.nuniv {
+            if z2 != z && external(z2, bck, pbody) && outlives(z2, v, bck) && outlives(z, z2, bck)
+                && !outlives(z2, z, bck) {
+                minimal = false;
+            }
+        }
+        if minimal {
+            push_req(id, i, slot_pos(z, bck, pbody), &bck);
+        }
+    }
+    true
+}
+
+// Whether universal u of a closure body is external (D19.4: 'static or a
+// slot of C).
+fn external(u: i64, bck: Bck<Comp>, pbody: Body<Comp>) -> bool {
+    if u == 0 {
+        return true;
+    }
+    let r = universal_var(u, bck);
+    r > 0 && region_word(r, 0, pbody) == U_CSLOT
+}
+
+// The position in slots(C) of external universal u (-1: 'static).
+fn slot_pos(u: i64, bck: Bck<Comp>, pbody: Body<Comp>) -> i64 {
+    if u == 0 {
+        return -1;
+    }
+    region_word(universal_var(u, bck), 2, pbody)
+}
+
+fn push_req(id: i64, i: i64, j: i64, bck: inout Bck<Comp>) {
+    var k = 0;
+    while k + 2 < bck.reqs.len() as i64 {
+        if bck.reqs[k] == id && bck.reqs[k + 1] == i && bck.reqs[k + 2] == j {
+            return;
+        }
+        k += 3;
+    }
+    bck.reqs.push(id);
+    bck.reqs.push(i);
+    bck.reqs.push(j);
 }
 
 // The region variable of universal u.
@@ -241,6 +374,31 @@ fn buf_universal(m: i64, u: i64, bck: Bck<Comp>, pbody: Body<Comp>, pcx: Ctx<Com
         buf_str(m, c"the lifetime of '");
         crate::places::borrowck::diag::buf_place(m, x, 0, 0, pbody, pcx);
         buf_str(m, c"'");
+    } else if kind == U_BOUND {
+        buf_str(m, c"the lifetime of the closure's parameter '");
+        crate::places::borrowck::diag::buf_place(m, x, 0, 0, pbody, pcx);
+        buf_str(m, c"'");
+    } else if kind == U_ENV {
+        buf_str(m, c"the lifetime of the closure's environment");
+    } else if kind == U_CSLOT {
+        // (a capture's: the variable captured; X_C's: the signature)
+        let id = x;
+        let y = region_word(r, 2, pbody);
+        var k = 0;
+        let t = pcx.closures[id].ty;
+        while k + 1 < pcx.closures[id].capture_count
+            && crate::places::regions::capture_offset(t, k + 1, pcx) <= y {
+            k += 1;
+        }
+        if pcx.closures[id].capture_count > 0
+            && y < slot_count(t, pcx) - pcx.closures[id].xc_n {
+            let local = pcx.capture_list.get(pcx.closures[id].captures + 2 * k);
+            buf_str(m, c"the lifetime in captured '");
+            crate::base::buf_bytes(m, sym_text(pcx.locals[local].name, pcx));
+            buf_str(m, c"'");
+        } else {
+            buf_str(m, c"a lifetime of the closure's signature, from outside it");
+        }
     } else {
         buf_str(m, c"the lifetime in '");
         crate::base::buf_bytes(m, sym_text(x, pcx));
@@ -255,15 +413,41 @@ fn report_outlives(u: i64, v: i64, loc: i64, bck: Bck<Comp>, pbody: Body<Comp>,
         node = pbody.node;
     }
     let m = buf_new();
-    buf_universal(m, v, bck, pbody, pcx);
-    buf_str(m, c" must outlive ");
+    let ru = universal_var(u, bck);
+    let rv = universal_var(v, bck);
+    let ku = if ru > 0 { region_word(ru, 0, pbody) } else { 0 };
+    let kv = if rv > 0 { region_word(rv, 0, pbody) } else { 0 };
+    if ku == U_BOUND || ku == U_ENV {
+        // RULE: D19.10 (1) (a local universal of a closure body: rustc's
+        // words, E0521 for a parameter stored into a capture)
+        if ku == U_ENV {
+            buf_str(m, c"captured variable cannot escape `FnMut` closure body: ");
+        } else if rank(v, bck, pbody, pcx) == 2 {
+            buf_str(m, c"borrowed data escapes outside of closure: ");
+        } else {
+            buf_str(m, c"lifetime may not live long enough: ");
+        }
+        buf_universal(m, u, bck, pbody, pcx);
+        buf_str(m, c" is only the call's, but it flows where ");
+        buf_universal(m, v, bck, pbody, pcx);
+        buf_str(m, c" is required, which lasts longer");
+        if rank(v, bck, pbody, pcx) == 2 && ku == U_BOUND {
+            buf_str(m, c" (rustc E0521)");
+        }
+        report_error_tries(pcx.nodes[node].start, 3000 + u * 64 + v, c"borrowck.outlives",
+            buf_slice(m).ptr,
+            c"keep a copy of the value instead of the reference (`*p`, `.clone()`); a closure's result borrows from its parameter only when the bound it is passed for says so (`Fn(&T) -> &T`)",
+            "", false, &pcx);
+        return;
+    }
+    // (u is the constraint's 'sup: it must outlive v, D6.2.1)
     buf_universal(m, u, bck, pbody, pcx);
+    buf_str(m, c" must outlive ");
+    buf_universal(m, v, bck, pbody, pcx);
     buf_str(m, c": a reference of the first flows where the second is required, and the signature does not say it lasts as long");
     // RULE: section 14.1 (the try: names one lifetime on the signature when
     // both regions are elided parameters')
     var tr = -1;
-    let ru = universal_var(u, bck);
-    let rv = universal_var(v, bck);
     if ru > 0 && rv > 0 && region_word(ru, 0, pbody) == U_ELIDED
         && region_word(rv, 0, pbody) == U_ELIDED {
         tr = crate::places::borrowck::diag::try_name_lifetime(pbody.node, pcx);
@@ -385,7 +569,8 @@ fn container(t: i64, pcx: Ctx<Comp>) -> bool {
     if !crate::front::modules::within_std(pcx.structs[s].module, pcx) {
         return false;
     }
-    let tmpl = if pcx.structs[s].tmpl > 0 { pcx.structs[s].tmpl } else { s };
+    // (an instance's `tmpl` is its template + 1)
+    let tmpl = if pcx.structs[s].tmpl > 0 { pcx.structs[s].tmpl - 1 } else { s };
     let name = sym_text(pcx.structs[tmpl].name, pcx);
     name == "Vec" || name == "String" || name == "HashMap" || name == "HashSet"
         || name == "BTreeMap" || name == "BTreeSet" || name == "BinaryHeap" || name == "MinHeap"
