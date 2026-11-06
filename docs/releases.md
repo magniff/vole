@@ -184,6 +184,38 @@ The front (front272):
 - The tools' cache is keyed by which std a rust program reads
   (VOLE_STD2=0 or std2), so a check no longer restores the other's
   errors.
+- Gate 1: std2's 1,413 cases, built with --check-alloc, pass 1,032 at
+  -O0 and -O2 (552 when the round began). The fixes, with their rules:
+  - Range literals are std2's ops types (`a..b` a `Range`, `..=b` a
+    `RangeToInclusive`, `..` a `RangeFull`; Z3.1).
+  - `write(w, "..")` and `writeln`. A hole's spec works on std2
+    (width, fill, alignment, precision, `+`, `#`, `0`), and so do
+    `{:#?}`, char's Display and Debug, and `{:?}` of an array as its
+    slice (F16).
+  - Deref coercion through several references, `&&&str` as a `&str`
+    (F32.1).
+  - `&mut F` is FnMut and FnOnce when F is FnMut, so std2's Map
+    adapter works (F33.1).
+  - A trait default's own parameter named as one of the impl's is
+    renamed in its copy: fold's B inside `impl<B, I, F> Iterator for
+    Map<I, F>` (F12.2).
+  - An impl's free parameter comes from its bounds' constraints and
+    from a closure's result (F14.1).
+  - `Tr::m(&r, ..)` keeps Tr through a reference (F8.2).
+  - A trait method's own generics see the trait's parameters.
+- Z4.1: on std2, `edition.std_copy` and `edition.std_by_value` are not
+  raised. `*s` of a shared view reads the view; `*x` of a value is
+  rustc's E0614 and `&x` where a value goes is E0308. The two codes
+  remain only with VOLE_STD2=0.
+- A user program's check shows no std errors from templates it never
+  instantiates (they stay visible with `--std2-check`). The derives
+  write the item's lifetimes (F17).
+- Known gaps: F18.3's `i32` default for an unsuffixed literal (the
+  edition still falls back to `i64`; it needs integer inference
+  variables). Z9.1's unsized representation (`&mut &[u8]` reads as
+  `&mut [u8]`). An array's by-value `into_iter` (it needs const
+  generics). `for x in arr` over non-Copy elements reads them by
+  reference, until moves out of an index are tracked.
 
 The front's side stream (front272b):
 
