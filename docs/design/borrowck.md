@@ -978,7 +978,16 @@ outside the holes named below.
 **Deliberate permissiveness (more than rustc), each with its reason.**
 - R1 `BK_RAW` (`&raw`, `as *const`) creates no loan and is a read (a
   write for `*mut` after ir271 M2); what happens through the raw
-  pointer is `unsafe`'s. Reason: Rust's rule is the same.
+  pointer is `unsafe`'s. Reason: Rust's rule is the same. *(0.27.2)* A
+  place `p[i]` of a raw pointer `p` (MVS's raw indexing, which F30.3
+  leaves to std2's `ptr` module alone: `read`, `write`, `copy`,
+  `copy_nonoverlapping`, `slice_parts`) is through the raw pointer as
+  `*p` is: it has no move path (D8.1), so reading a `T` with drop glue
+  out of it is a bitwise copy that leaves the source as it was, not
+  `borrowck.move_out`, and a store into it drops nothing. rustc's
+  `ptr::read` is an intrinsic; in std2 it is this rule, stated in one
+  module that the front confines it to, and the caller's `unsafe`
+  contract (only one of the two copies is dropped) is `ptr::read`'s.
 - R2 MVS std types holding hidden views (`SliceIter<T>`, `Scanner`, …)
   have no slots, so a loan feeding them ends at the call; and the own
   pass's view findings are muted on rust bodies at v0.27.0 (§0.1), so
