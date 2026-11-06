@@ -70,6 +70,8 @@
 # borrowck-twin (tools/borrowck-twin.sh, 0.27.1: every rust_b_ case's
 # verdict against rustc's, accept or reject, and its code; a divergence
 # only when the case names its class; skipped without rustc; --quick too);
+# std2-check (tests/std2/check.sh, 0.27.2, borrowck.md Z7: every std2 body
+# type-checked and solved by the borrow checker, 0 errors);
 # cachediff (tests/cachediff/run.sh, 0.25.3: every command line of the
 # tools' transcripts and walkthroughs without the tools' cache, with a
 # fresh one and from it, the same output, status and files; the suite
@@ -238,7 +240,7 @@ esac
 
 FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-guard fuzz-seed fuzz-sem"
 ABI_STEPS="abi-plain abi-import abi-header"
-HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost unsafe-audit borrowck-twin cachediff"
+HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost unsafe-audit borrowck-twin std2-check cachediff"
 # (0.25) the chain's integrity, by --release (or --only): slow, and they
 # rebuild compilers rather than test one
 RELEASE_STEPS="chain-diverse chain-fresh"
@@ -636,6 +638,8 @@ run_step() {
         cachediff) sh "$ROOT/tests/cachediff/run.sh" -c "$C" -j 4 ;;
         # (0.27.1) the borrow checker's corpus against rustc's verdicts
         borrowck-twin) sh "$ROOT/tools/borrowck-twin.sh" "$ROOT"/tests/run/rust_b_*.vl ;;
+        # (0.27.2) std2's bodies through the borrow checker (Z7)
+        std2-check) sh "$ROOT/tests/std2/check.sh" -c "$C" ;;
         voltty-fuzz) sh "$ROOT/tests/voltty/run.sh" -c "$C" -s 60 -k "$k" ;;
         stress-grow)
             # (0.14) The compiler with VOLE_STRESS_GROW=1 (base::grow):
@@ -1086,8 +1090,8 @@ note_of() {
     case "$1" in
         chain) awk '/^  head / { sub(/^  head +/, ""); print; exit }' "$l" ;;
         suite-*|smoke-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed%s\n", $2, $3, $4, ($5 > 0 ? ", " $5 " SKIPPED" : "") }' "$l" ;;
-        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*|unsafe-audit|borrowck-twin|cachediff)
-            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh|unsafe-audit|borrowck-twin|cachediff):' "$l" | tail -1 ;;
+        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*|unsafe-audit|borrowck-twin|std2-check|cachediff)
+            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh|unsafe-audit|borrowck-twin|std2-check|cachediff):' "$l" | tail -1 ;;
         voltty-fuzz) grep -E '^(pass|FAIL|skip) oracle' "$l" | tail -1 ;;
         compile-cost) awk '$2 ~ /^[0-9.]+$/ && $3 == "M" { printf "%s%s %s M %s", sep, $1, $2, $8; sep = ", " } END { print "" }' "$l" ;;
         # (no rows: it failed before the container's steps, e.g. docker)
