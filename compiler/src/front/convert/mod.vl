@@ -23,7 +23,7 @@ use crate::base::diag::{
     err_begin, err_end, err_end_soft, err_fmt, err_help, err_help_fmt, err_help_sym, err_int,
     err_str, err_sym,
 };
-use crate::front::assoc::ensure_checked;
+use crate::front::assoc::{ensure_checked, trait_projection};
 use crate::front::ast::{FN_SIG_FAILED, NodeKind, child, list_begin, list_end, list_push, new_node};
 use crate::front::check::{has_error_type, resolve_type_or_error};
 use crate::front::check::calls::{method_of, synthetic_unary};
@@ -40,7 +40,7 @@ use crate::front::generics::{
 use crate::front::generics::instantiate::instantiate_call;
 use crate::front::lexer::{SUF_NONE, Tok};
 use crate::front::modules::module_of;
-use crate::front::traits::{implements, std_trait, trait_fn};
+use crate::front::traits::{bound_trait, implements, std_trait, trait_fn};
 use crate::front::types::{
     ENUMS, TY_NEVER, TyKind, buf_type, enum_variant, err_type, fn_param, is_float, is_integer,
     is_pointer, primitive_name, variant_field,
@@ -546,6 +546,11 @@ fn literal_kind(a: i64, pcx: Ctx<Comp>) -> i64 {
 // Parameter k of trait function decl (of trait tr) for impl i of type t:
 // with the trait's parameters its arguments there and Self t.
 fn decl_param(tr: i64, decl: i64, targs: i64, t: i64, k: i64, pcx: inout Ctx<Comp>) -> i64 {
+    decl_type(tr, decl, targs, t, pcx.nodes[child(decl, k, pcx)].b, &pcx)
+}
+
+// The type node tn of trait function decl, resolved as decl_param does.
+fn decl_type(tr: i64, decl: i64, targs: i64, t: i64, tn: i64, pcx: inout Ctx<Comp>) -> i64 {
     let saved_mod = pcx.cur_mod;
     let saved_self = pcx.self_type;
     let (saved_impl, saved_tr, saved_targs) = (pcx.self_impl, pcx.assoc_trait, pcx.assoc_targs);
@@ -567,7 +572,7 @@ fn decl_param(tr: i64, decl: i64, targs: i64, t: i64, k: i64, pcx: inout Ctx<Com
         pcx.tp_names.push(pcx.nodes[child(own, i, pcx)].a);
         pcx.tp_types.push(pcx.ty_error);
     }
-    let ty = resolve_type_or_error(pcx.nodes[child(decl, k, pcx)].b, &pcx);
+    let ty = resolve_type_or_error(tn, &pcx);
     pcx.tp_names.count = frame_end;
     pcx.tp_types.count = frame_end;
     env_leave(saved, &pcx);
@@ -577,6 +582,57 @@ fn decl_param(tr: i64, decl: i64, targs: i64, t: i64, k: i64, pcx: inout Ctx<Com
     pcx.assoc_trait = saved_tr;
     pcx.assoc_targs = saved_targs;
     ty
+}
+
+// Whether argument type a misses a bound of parameter k of trait function
+// decl when that parameter's type is one of decl's own parameters: a bound
+// `I: IntoIterator<Item = T>` with T this impl's trait argument, and a's
+// Item another type (Extend<T> and Extend<&T> for Vec<T>: the item type
+// picks the impl). An unknown projection misses nothing.
+fn own_bound_misses(tr: i64, decl: i64, targs: i64, t: i64, k: i64, a: i64,
+    pcx: inout Ctx<Comp>)
+    -> bool {
+    // RULE: F13.3 (an own parameter's bound picks among the impls)
+    let own = pcx.nodes[decl].g;
+    let tn = pcx.nodes[child(decl, k, pcx)].b;
+    if own == 0 || pcx.nodes[tn].kind != NodeKind::TyName || pcx.nodes[tn].count != 0
+        || pcx.nodes[tn].g != 0 {
+        return false;
+    }
+    for i in 0..pcx.nodes[own].count {
+        let p = child(own, i, pcx);
+        if pcx.nodes[p].a != pcx.nodes[tn].a || pcx.nodes[p].h == 0 {
+            continue;
+        }
+        let bounds = pcx.nodes[p].h;
+        for j in 0..pcx.nodes[bounds].count {
+            let b = child(bounds, j, pcx);
+            if pcx.nodes[b].kind != NodeKind::TyName || pcx.nodes[b].h == 0 {
+                continue;
+            }
+            let saved_mod = pcx.cur_mod;
+            pcx.cur_mod = pcx.traits[tr].module;
+            let btr = bound_trait(b, &pcx);
+            pcx.cur_mod = saved_mod;
+            if btr < 0 {
+                continue;
+            }
+            let holder = pcx.nodes[b].h;
+            for m in 0..pcx.nodes[holder].count {
+                let c = child(holder, m, pcx);
+                let got = trait_projection(btr, a, pcx.nodes[c].a, pcx.nodes[c].start, &pcx);
+                if got == 0 || has_error_type(got, pcx) {
+                    continue;
+                }
+                let want = decl_type(tr, decl, targs, t, pcx.nodes[c].b, &pcx);
+                if want != got && !has_error_type(want, pcx) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    false
 }
 
 // Whether candidate c (an index of CANDS, a pair) takes the arguments of
@@ -615,6 +671,8 @@ fn takes(c: i64, n: i64, t: i64, tys: *i64, kinds: *i64, skip: i64, pcx: inout C
                     return false;
                 }
             } else if a != p && a != TY_NEVER && !has_error_type(p, pcx) {
+                return false;
+            } else if a != TY_NEVER && own_bound_misses(tr, decl, targs, t, k + skip, a, &pcx) {
                 return false;
             }
         }
