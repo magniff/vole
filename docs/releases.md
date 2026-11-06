@@ -79,11 +79,12 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.26.5 | `v0.26.5` | 0.26.4 | aarch64-macos | the compiler's statics in context structs, phases 4-6 (`base::ctx::Ctx<Comp>` passed as `pcx`, the tables code generation's tasks read through a let view per task, `WgslCx<Arena>`; 1,234 statics to 188); `fix --only statics` doing the by-hand steps and `--prune`; the alloc exemption down to `SYMS` and `TYPES` |
 | 0.27.0 | `v0.27.0` | 0.26.5 | aarch64-macos | the rust edition begins (`// EDITION: rust`: references, `Deref`/`Index`, reference patterns, lifetimes and regions in side tables, `borrowck.unchecked`; 56 hand-translated cases); `compiler/std2`, the new std's API (1,414 items, 1,070 typechecking) and the translator's std rewrite table; SYMS/TYPES read-only in tasks and the alloc exemption deleted; Ctx's tables `Vec`s (unjustified unsafe 3,057 to 2,775) |
 | 0.27.1 | `v0.27.1` | 0.27.0 | aarch64-macos | the rust edition's borrow checker: NLL on the places IR (docs/design/borrowck.md), 18 `borrowck.*` codes with `explain`, 193 programs checked against rustc; Rust's `Copy` rule, reborrows, captures as loans, deferred `let`; contracts typed by the shared rule; 0.27.0's -O2 aliasing miscompile fixed; docs/design/contracts-effects.md |
+| 0.27.2 | `v0.27.2` | 0.27.1 | aarch64-macos | std2 the rust edition's std (1,032 of 1,413 std2 tests at -O0/-O2 under `--check-alloc`, gate 1); the front's rules (docs/design/front-rust.md: pattern and blanket impls, coherence, deref coercion, ranges, format specs); closures in full (kinds, captures, `Send`/`Sync`, bodies borrow-checked, `borrowck.unchecked` retired, E0594/E0596); `[T]`/`str` unsized; the borrow checker's verdict cache; every rust case on std2 |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.27.2
 
-The rust edition gets std2 as its std, the front's gaps filled and closures in full; the front's rules are docs/design/front-rust.md.
+The rust edition's std is std2, Rust's std with explicit allocators: a rust-edition program now reads `std::vec::Vec`, `String`, `HashMap`, the iterator adapters, `fmt`, `io` and `thread` as Rust's, and 1,032 of std2's 1,413 tests pass at -O0 and -O2 under `--check-alloc` (gate 1). The front end fills the gaps std2's bodies hit (pattern and blanket impls, coherence, deref coercion, ranges, format specs; the rules are docs/design/front-rust.md). Closures are checked in full: their kinds, captures and signatures, `Send` and `Sync`, and the borrow checker reads their bodies (`borrowck.unchecked` is gone), with Rust's mutability errors E0594 and E0596. `[T]` and `str` are unsized types; their full representation, `impl Trait` in return position and the rest of std2 are 0.27.2.1's. MVS programs compile exactly as before; a rust hello-world's `check` costs about 4.2x MVS's (printed, not enforced; 2.0x is 0.27.4's target). Built and tested on aarch64-macos only.
 
 The front (front272):
 
@@ -375,6 +376,21 @@ std2's tests under `--check-alloc` (std272b):
   one whose blocks are left at exit (a panicking one, or one whose
   STDERR expects the list, excepted); the gate's `std2-tests` row runs
   them at -O0 and -O2 and prints the count against gate 1's 1,000.
+
+The rust corpus and the compile cost (mig272, lazy272):
+
+- Every rust-edition case runs on std2: about 370 cases moved off
+  `VOLE_STD2=0`, which remains only for the guide's runner and two
+  cost and transcript rows. The editor hooks read a case's edition, so
+  a rust case is no longer checked, or rewritten, as MVS.
+- std2's declarations are checked lazily by name: trait defaults and
+  integer methods are instantiated when used, the generic methods are
+  indexed by template and name, and the variance table is built per
+  instance. A rust hello-world's check went from 887M to 414M
+  instructions; the compile-cost rows print hello-rust and std-rust.
+- An inherent method that shares its name with a trait impl's method
+  gets the symbol `T.m.n1`, not `T.m.-1`, which the system assembler
+  rejected (x86_64-macos objcheck on std2's Formatter::write_str).
 
 ### What's new in 0.27.1
 
