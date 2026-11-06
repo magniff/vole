@@ -140,6 +140,22 @@ The front (front272):
 - Corpus: `tests/run/rust_f_*`, one case per rule, positive and
   negative. std2's root check: edition.later 254 -> 123 after the traits,
   -> 7 after the types (5 of them `auto_trait`).
+- On std2 (front272, M3's rest): the integers' inherent methods
+  (`wrapping_add`, `checked_mul`, `overflowing_sub`, `saturating_sub`,
+  the bit counts and rotations) are the compiler's, from its list
+  (F15.4, `#[builtin_methods]` in std2's `num::wrapping`);
+  `size_of::<T>()` is a `usize`; fat raw pointers, `*const [T]` and
+  `*mut str`, keep both words through casts and `&*p` (Z9.3); a raw
+  pointer is not indexed, `*p.add(i)` and `slice::from_raw_parts`
+  instead (F30.3, rustc E0608), with Rust's raw-pointer methods in
+  std2; `for` is `IntoIterator::into_iter` and `Iterator::next` (F22.1);
+  `alloc.field` does not look through a raw pointer (F33.1); an impl
+  whose parameters its self type does not all fix (`impl<T:
+  PartialEq<U>, U> PartialEq<[U]> for [T]`) is bound by unification,
+  not by position.
+- The tools' cache is keyed by which std a rust program reads
+  (VOLE_STD2=0 or std2), so a check no longer restores the other's
+  errors.
 
 The front's side stream (front272b):
 
