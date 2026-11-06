@@ -515,14 +515,57 @@ def current_std(compiler, where, st=None):
     return use, line
 
 
-def run_typed(compiler, cwd, args):
+# (0.27.2) A test case's directives that are the compiler's too
+# (tests/run.sh): `// FLAGS: --edition rust` (or `--edition=rust`) and
+# `// ENV: VOLE_STD2=...`; a root line `// EDITION: rust` the compiler
+# reads itself.
+CASE_FLAGS = re.compile(r"^// FLAGS:(.*)$")
+CASE_ENV = re.compile(r"^// ENV: (VOLE_STD2)=(\S*)\s*$")
+EDITION_FLAG = re.compile(r"(?:^|\s)--edition(?:=|\s+)(\S+)")
+
+
+def case_options(root):
+    """(0.27.2) The compiler's options of the test case root, as
+    tests/run.sh gives them: ([`--edition E`], {VOLE_STD2: V}); a root
+    that is no file (check's default, the compiler) has none. Without
+    them a rust case is checked as MVS, and its Rust spellings "fixed"
+    into MVS ones."""
+    args, env = [], {}
+    if not root or not root.endswith(".vl"):
+        return args, env
+    try:
+        with open(root, errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return args, env
+    for line in lines:
+        m = CASE_FLAGS.match(line)
+        if m:
+            e = EDITION_FLAG.search(m.group(1))
+            if e:
+                args = ["--edition", e.group(1)]
+            continue
+        m = CASE_ENV.match(line)
+        if m:
+            env[m.group(1)] = m.group(2)
+    return args, env
+
+
+def run_typed(compiler, cwd, args, root=None):
     """compiler with args, run in cwd under the name the agent types (its
-    try: lines say so), with the tree's std named (std_env); None when it
-    could not run."""
+    try: lines say so), with the tree's std named (std_env); with root,
+    (0.27.2) the options of the test case it is (case_options), after the
+    command's name; None when it could not run."""
     import subprocess  # (here: the hook's no-op path stays cheaper)
+    env = std_env(cwd)
+    if root:
+        extra, case_env = case_options(root if os.path.isabs(root) else os.path.join(cwd, root))
+        args = args[:1] + extra + args[1:]
+        if case_env:
+            env = dict(env if env is not None else os.environ, **case_env)
     try:
         return subprocess.run([typed_name(compiler, cwd)] + args, executable=compiler, cwd=cwd,
-                              capture_output=True, text=True, timeout=TIMEOUT, env=std_env(cwd))
+                              capture_output=True, text=True, timeout=TIMEOUT, env=env)
     except (OSError, subprocess.TimeoutExpired):
         return None
 
@@ -536,7 +579,7 @@ def run_check(compiler, root, cwd):
     """The diagnostics of `check` on root (None: check's default), as
     dicts with the keys of --json; None when check could not run."""
     def run(args):
-        return run_typed(args[0], cwd, args[1:])
+        return run_typed(args[0], cwd, args[1:], root)
     tail = root_args(root, cwd)
     r = run([compiler, "check", "--json"] + tail)
     if r is None:
@@ -591,10 +634,11 @@ def mechanical(d):
     return (d.get("code") or "") in MECHANICAL
 
 
-def fix_output(compiler, cwd, args):
+def fix_output(compiler, cwd, args, root=None):
     """`volec fix ARGS --json`: (the `fixed` summaries [(file, what)], the
-    diff's lines, the refusals' messages), or None when it could not run."""
-    r = run_typed(compiler, cwd, ["fix"] + args + ["--json"])
+    diff's lines, the refusals' messages), or None when it could not run;
+    root (0.27.2): the test case's options (case_options)."""
+    r = run_typed(compiler, cwd, ["fix"] + args + ["--json"], root)
     if r is None:
         return None
     changed, diff, refused = [], [], []
@@ -664,7 +708,7 @@ def apply_exact(compiler, root, cwd, unused_in=(), suggested=True):
     runs = [["--suggested", "--codes", ",".join(MECHANICAL), "--diff"]] if suggested else []
     runs += [["--only", "unused", "--in", f, "--diff"] for f in unused_in]
     for args in runs:
-        got = fix_output(compiler, cwd, args + root_args(root, cwd))
+        got = fix_output(compiler, cwd, args + root_args(root, cwd), root)
         if got is None or not got[0]:
             continue
         changed += got[0]
@@ -675,7 +719,7 @@ def apply_exact(compiler, root, cwd, unused_in=(), suggested=True):
 def shown_exact(compiler, root, cwd):
     """(0.25.2.1) The other exact fixes, not made: `volec fix --suggested
     --dry-run ROOT`'s changes and refusals (lines), or []."""
-    got = fix_output(compiler, cwd, ["--suggested", "--dry-run"] + root_args(root, cwd))
+    got = fix_output(compiler, cwd, ["--suggested", "--dry-run"] + root_args(root, cwd), root)
     if got is None:
         return []
     return diff_changes(got[1]) + [f"refused: {m}" for m in got[2]]
@@ -1175,9 +1219,13 @@ def run_tests(compiler, root, cwd):
     TEST_TIMEOUT."""
     import subprocess
     t0 = time.time()
+    extra, case_env = case_options(root)
+    env = std_env(cwd)
+    if case_env:
+        env = dict(env if env is not None else os.environ, **case_env)
     try:
-        r = subprocess.run([compiler, "test", root, "--full", "--timeout", str(CASE_TIMEOUT)], cwd=cwd,
-                           capture_output=True, text=True, timeout=TEST_TIMEOUT, env=std_env(cwd))
+        r = subprocess.run([compiler, "test"] + extra + [root, "--full", "--timeout", str(CASE_TIMEOUT)], cwd=cwd,
+                           capture_output=True, text=True, timeout=TEST_TIMEOUT, env=env)
     except subprocess.TimeoutExpired:
         return {"slow": True, "ms": int((time.time() - t0) * 1000)}
     except OSError:
