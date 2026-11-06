@@ -707,6 +707,16 @@ and range checks; nothing is synthesized for them, and F4.2 checks them
 against F15.1's lists (so a trait with a `#[builtin_impls]` list may not
 also be written for a listed primitive).
 
+**F15.6 (the floats' digits).** F15.1's `Display`, `Debug`, `LowerExp`
+and `UpperExp` for `f32` and `f64`, `LowerExp`/`UpperExp` for the
+integers, and `FromStr` for `f32`, `f64` and `bool` are bodies that call
+std2's private module `flt` (`fmt_float`, `fmt_int_exp`, `parse_float`,
+`parse_bool`), with Rust's output: the shortest digits that read back as
+the same float (`{}`; `{:?}` with `.0`, exponent form below 1e-4 and
+from 1e16), the exact value rounded half to even at a precision, and a
+parse rounded to the nearest float. *Anchor:* `front/builtin_impls.vl:
+write_fmt, write_from_str`, `compiler/std2/flt.vl`.
+
 **F15.3 (`#[array_builtin(N)]`).** On an impl or free function whose
 header mentions `[T; N]` with `N` a declared name: a template over the
 length, instantiated for each `N` the program uses (`impl<T: Clone, N>
