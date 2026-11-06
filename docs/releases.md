@@ -217,6 +217,11 @@ The front (front272):
   `&mut [u8]`). An array's by-value `into_iter` (it needs const
   generics). `for x in arr` over non-Copy elements reads them by
   reference, until moves out of an index are tracked.
+- The gate's std2-check row fails on a borrowck error in a std2 body or
+  in a passing case's std2 instances; it prints as known gaps the
+  6 bodies whose region-free instance does not type-check and the 45
+  XFAIL cases whose std2 instances need rustc's implied outlives bounds
+  (`&'a T` giving `T: 'a`; 0.27.2.1).
 
 The front's side stream (front272b):
 
