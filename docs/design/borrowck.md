@@ -337,6 +337,35 @@ as `&T` (a shared reborrow), so a write through it in the guard is a
 *inferred*: no corpus case has `ref mut` with a guard; ir271 confirms
 `bind_pattern(.., true)`'s shape for it).
 
+**D2.7 (mutability; 0.27.2).** A place is written (an assignment's
+`WA`/`WB` to it, a `drop`'s excepted) or lent exclusively (`RV_REF` of
+kind `BK_MUT`, a two-phase autoref `&mut self` included) only if it is
+*mutable*, rustc's `is_mutable` over its projections, innermost first:
+- `(L, ∅)`, a whole local: mutable iff `L` is declared `mut`
+  (`LF_MUT`), or the access comes through a `&mut` deref below (rustc's
+  `LocalMutationIsAllowed::Yes`: `let r = &mut x; *r = 1;` needs no
+  `mut r`); a deferred `let x;`'s first assignment is M7's, not this
+  rule's;
+- `P.f`, `P[i]`, `P[k]` of an array, a variant's field: as `P`;
+- `*P` with `P: &mut T` (or an exclusive view `&mut [T]`): mutable
+  (it needs `P` uniquely reachable, which D2.5's loans check, not `P`
+  declared `mut`);
+- `*P` with `P: &T` (or a shared view `[T]`, `&str`): **not** mutable;
+- `*P` with `P: *mut T`: mutable; with `P: *const T`: not (R1: what
+  happens through it is `unsafe`'s, but rustc refuses the write to a
+  `*const` place too);
+- a place whose type is or lies inside `UnsafeCell<T>` (`Cell`,
+  `RefCell`, the atomics) is changed through `&self` methods only,
+  never by a write here, so it needs no exception: its methods write
+  through a raw pointer (`UnsafeCell::get`).
+The `static mut` and `static` cases are D6.2.5's. A write to a place
+that is not mutable is `borrowck.assign_immutable` (rustc E0594,
+"cannot assign to `*s`, which is behind a `&` reference"); an exclusive
+loan of one is `borrowck.borrow_immutable` (E0596, "cannot borrow
+`*s` as mutable"). An MVS program's `own.readonly` is the same rule's
+MVS spelling; with the own pass off on std2 (Z8) it is this one, for
+std2's bodies too.
+
 ## 3. Regions (S3)
 
 **D3.1 (denotation).** A region variable `'r` denotes a set `val('r) ⊆
@@ -1211,6 +1240,8 @@ where a `try:` is named, a case in `tests/borrowck-try/NAME/main.vl`
 | `borrowck.use_moved` | M1, M5 | E0382 | `.clone()` when `Clone` (as `own.moved`'s) |
 | `borrowck.assign_moved_part` | M2 | E0381 | none |
 | `borrowck.assign_twice` | M7 | E0384 | `let mut x;` on the deferred declaration |
+| `borrowck.assign_immutable` | D2.7 | E0594 | `let mut x` on the local; `&mut` in the reference's type |
+| `borrowck.borrow_immutable` | D2.7 | E0596 | as `assign_immutable`'s |
 | `borrowck.move_out` | M3 | E0507, E0508 | `.clone()`, or `&` the place (as `own.move_out`'s) |
 | `borrowck.move_from_drop` | M4 | E0509 | none; the help names `mem::take`/`Option::take` |
 | `borrowck.guard_write` | D2.5 vs a `fake` loan; L6 | E0510, E0594 | none; the help says to write after the match |

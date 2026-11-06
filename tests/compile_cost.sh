@@ -46,7 +46,7 @@ W=$(mktemp -d "${TMPDIR:-/tmp}/vole-cost.XXXXXX")
 trap 'rm -rf "$W"' EXIT
 printf 'fn main() {\n    println("hello");\n}\n' >"$W/hello.vl"
 cp "$ROOT/tests/cost/std_heavy.vl" "$W/std_heavy.vl"
-cp "$ROOT/tests/run/rust_t_iter_for_sources.vl" "$W/rust_heavy.vl"
+cp "$ROOT/tests/cost/rust_heavy.vl" "$W/rust_heavy.vl"
 mkdir -p "$W/src"
 cp -R "$ROOT/compiler/src/." "$W/src/"
 VOLE_CACHE=off
@@ -87,8 +87,8 @@ echo "compile cost against $P:"
 measure hello 1.5 hello.vl -c -o hello.o
 measure std 1.5 std_heavy.vl -c -o std_heavy.o
 measure check 1.15 check src/main.vl
-# (0.27.2) the case is written against MVS's std (its `// ENV: VOLE_STD2=0`)
-# until it migrates to std2; a std2 row comes with the migration
+# (0.27.2) tests/cost/rust_heavy.vl is written against MVS's std: read with
+# it until std2's check is lazy (then hello-rust and std-rust rows on std2)
 VOLE_STD2=0
 export VOLE_STD2
 measure rust 1.5 check rust_heavy.vl

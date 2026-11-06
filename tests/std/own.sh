@@ -12,10 +12,6 @@
 
 set -u
 LC_ALL=C
-# (0.27.2) MVS's std is what this checks: a rust case reads it as before
-# the switch (Z4: the own pass is off for std2), until the cases migrate
-VOLE_STD2=0
-export VOLE_STD2
 export LC_ALL
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -31,9 +27,13 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/std-own.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 cd "$ROOT" || exit 2
 
-# The programs: no ERROR directive, no mixed reading, no --values=off.
+# The programs: no ERROR directive, no mixed reading, no --values=off;
+# (0.27.2) no rust-edition one: its std is std2, which the own pass does
+# not read (Z4).
 for f in tests/run/*.vl; do
     grep -q '^// ERROR' "$f" && continue
+    head -1 "$f" | grep -q '^// EDITION: rust' && continue
+    grep -q '^// FLAGS:.*--edition[= ]rust' "$f" && continue
     grep -q '^// FLAGS:.*\(--syntax=mixed\|--values=off\)' "$f" && continue
     echo "$f"
 done >"$WORK/programs"
