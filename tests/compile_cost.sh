@@ -13,6 +13,14 @@
 #           checker's whole cost on it, against 0.27.0's unchecked
 #           regions), at most 1.5x
 #
+# and (0.27.2) two of the rust edition on std2, with this compiler only
+# (the previous release has no std2), against its own MVS rows above:
+#
+#   hello-rust  a rust hello world built, at most 2.0x hello's (target 1.5x;
+#               printed, not failing: the ceiling 2.0x is enforced at the
+#               0.27.2 cut)
+#   std-rust    tests/cost/std2_heavy.vl built, at most 2.0x std's (target 1.5x)
+#
 # Instructions, not time: they hardly move with the machine's load. They
 # are read from /usr/bin/time -l (macOS); a host without it skips (77).
 #
@@ -47,6 +55,8 @@ trap 'rm -rf "$W"' EXIT
 printf 'fn main() {\n    println("hello");\n}\n' >"$W/hello.vl"
 cp "$ROOT/tests/cost/std_heavy.vl" "$W/std_heavy.vl"
 cp "$ROOT/tests/cost/rust_heavy.vl" "$W/rust_heavy.vl"
+printf '// EDITION: rust\nfn main() {\n    println("hello");\n}\n' >"$W/hello_rust.vl"
+cp "$ROOT/tests/cost/std2_heavy.vl" "$W/std2_heavy.vl"
 mkdir -p "$W/src"
 cp -R "$ROOT/compiler/src/." "$W/src/"
 VOLE_CACHE=off
@@ -69,12 +79,14 @@ count() {
 }
 
 FAILED=0
+OVER=""
 # <name> <limit> <command args...> (the compiler's place: COMPILER)
 measure() {
     name=$1
     limit=$2
     shift 2
     new=$(count "$C" "$@") || { echo "compile-cost: $name fails with $C"; FAILED=1; return; }
+    last_new=$new
     old=$(count "$P" "$@") || { echo "compile-cost: $name: skipped, the previous release cannot do it ($P $*)"; return; }
     awk -v n="$name" -v a="$old" -v b="$new" -v l="$limit" 'BEGIN {
         r = b / a
@@ -83,17 +95,50 @@ measure() {
         exit bad
     }' || FAILED=1
 }
+# (0.27.2) <name> <limit> <target> <enforced: 1, or 0: printed only>
+# <MVS row's count> <command args...>: this compiler's count against its
+# own MVS row's
+measure_edition() {
+    name=$1
+    limit=$2
+    target=$3
+    enforced=$4
+    base=$5
+    shift 5
+    [ -n "$base" ] || { echo "compile-cost: $name: skipped, its MVS row failed"; return; }
+    new=$(count "$C" "$@") || { echo "compile-cost: $name fails with $C"; FAILED=1; return; }
+    awk -v n="$name" -v a="$base" -v b="$new" -v l="$limit" -v t="$target" -v e="$enforced" 'BEGIN {
+        r = b / a
+        bad = (r > l)
+        printf "  %-10s %8.1f M instructions, its MVS row %8.1f M: %.2fx (at most %.2fx%s, target %.2fx)%s\n", n, b / 1e6, a / 1e6, r, l, (e ? "" : ", enforced at the 0.27.2 cut"), t, (bad ? (e ? "  TOO DEAR" : "  over the ceiling") : "")
+        exit (bad ? (e ? 1 : 2) : 0)
+    }'
+    case $? in 0) ;; 2) OVER="$OVER $name" ;; *) FAILED=1 ;; esac
+}
 echo "compile cost against $P:"
+echo "  binary: $(wc -c <"$C" | tr -d ' ') bytes ($C), was $(wc -c <"$P" | tr -d ' ')"
+last_new=""
 measure hello 1.5 hello.vl -c -o hello.o
+hello_new=$last_new
+last_new=""
 measure std 1.5 std_heavy.vl -c -o std_heavy.o
+std_new=$last_new
 measure check 1.15 check src/main.vl
 # (0.27.2) tests/cost/rust_heavy.vl is written against MVS's std: read with
-# it until std2's check is lazy (then hello-rust and std-rust rows on std2)
+# it (rust_t_iter_for_sources, its std2 spelling, does not check on std2
+# yet); the rows on std2 are hello-rust and std-rust below
 VOLE_STD2=0
 export VOLE_STD2
 measure rust 1.5 check rust_heavy.vl
+unset VOLE_STD2
+measure_edition hello-rust 2.0 1.5 0 "$hello_new" hello_rust.vl -c -o hello_rust.o
+measure_edition std-rust 2.0 1.5 1 "$std_new" std2_heavy.vl -c -o std2_heavy.o
 if [ $FAILED -ne 0 ]; then
     echo "compile-cost: a compilation is dearer than the previous release allows (see above; --time-passes splits it by phase, and std's sections: tests/std/core_sections.sh)"
     exit 1
 fi
-echo "compile-cost: hello, std, check and rust within the bounds"
+if [ -n "$OVER" ]; then
+    echo "compile-cost: within the bounds enforced now; over the ceiling enforced at the 0.27.2 cut:$OVER"
+else
+    echo "compile-cost: hello, std, check, rust, hello-rust and std-rust within the bounds"
+fi
