@@ -305,6 +305,28 @@ Closures in full (clos272):
   dropped.
 - The rustc twin runs `--std2` in tests/affected.sh and the gate: 325
   `rust_b_` cases, 293 agreeing, 9 named divergences, 0 mismatches.
+- borrowck's messages name a place as rustc's do: `s.n` through a
+  reference, `*s` for a receiver's autoref, `v[_]` for an index, a
+  closure's capture as the captured variable (`b.n`, `a.v`), where they
+  printed the IR's `s ((*_1).0)`.
+- `println("{}", r)` with `r: &mut T` reborrows r shared (rustc's
+  format_args takes `&r`; the IR copied a `&mut`, I7), and an argument
+  that is a value, `println("{}", String::from_in("abc", gpa))`, is
+  dropped at the end of the statement (it leaked).
+- A closure or a fn pointer is called through `&F` or `&mut F`
+  (`compare(a, b)` with `compare: &mut F`, std2's sort and select); an
+  `FnMut` called through `&F` is `borrowck.borrow_immutable` (E0596).
+- A closure checked against a bound that names a projection, `F:
+  FnMut(B, Self::Item) -> B`, gets the projection's regions from the
+  instance (D20.3): std2's `Iterator::last`, `min_by` and `fold` under
+  `reduce` check clean.
+- The borrow checker's verdict cache (Z7): a std body's clean verdict
+  is kept in the tools' cache directory (target/volec-cache,
+  `$VOLE_CACHE`), keyed by D4.4(b)'s key, the compiler and std's text,
+  and a later run does not solve it again (tests/std2/cache.sh).
+- `tests/run.sh` picks the cases it gives `--verify-places` by their
+  file name, not their path: every worktree and the gate verify the
+  same ones.
 
 std2's tests under `--check-alloc` (std272b):
 
