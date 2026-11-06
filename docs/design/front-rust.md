@@ -329,6 +329,15 @@ what std2 writes where it wants the address (`&raw const (*p).field`).
 Rust's reference "Borrow expressions" (raw borrows). *Anchor:* the
 parser's unary `&` (`front/parser/exprs.vl`), `synth_unary`.
 
+**F30.3 (no indexing of a raw pointer).** In a rust-edition position
+`p[i]` and `p[a..b]` with `p: *const T` or `*mut T` are `error type`
+("cannot index into a value of type `*mut T`", rustc E0608), as Rust's:
+an element is `*p.add(i)` (`<*const T>::add`, unsafe, and `offset`,
+`read`, `write`), a run of them `slice::from_raw_parts(p, n)` (F21.4).
+A reference to an indexable type (`&[T]`, `&Vec<T, A>`, `&[T; N]`) is
+indexed through, as before. MVS keeps its raw-pointer indexing.
+*Anchor:* `front/check/synth_mode.vl: synth_index`.
+
 ### F32 Unsize coercion
 
 **F32.1 (the one coercion).** At a *coercion site* — a `let` with an
@@ -1262,6 +1271,13 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   trait for any type is accepted where rustc would say E0117/E0210.
 - **FR3 (any `?Sized` self types for inherent impls).** `impl<T> *const
   T`, `impl str` in a program, which rustc reserves to core (E0390).
+- **FR4 (`*const T` and `*mut T` are one type).** vole has one raw
+  pointer type: a `*const T` converts to a `*mut T` with no cast, is
+  passed where a `*mut T` is wanted, and has `*mut T`'s methods
+  (`p.write(x)`, F30.3); rustc keeps the two apart (E0308, and no
+  `write` on `*const T`). Only a write through a local declared `*const`
+  is refused (F30.1's const_write). Whether to split the types is a
+  later decision. Case `rust_f_f30_const_mut_ok`.
 
 **Strict (vole rejects what rustc accepts).**
 - **FL1 (no deferred inference; later, 0.27.4).** F18.2: a parameter
