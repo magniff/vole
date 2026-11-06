@@ -161,6 +161,10 @@ The front (front272):
 - `Vec<&str>` and `Vec<&[T]>` on std2 hold their views: a `*const T`
   with T a view stays thin; only a pointee written `[T]` or `str` makes
   a fat raw pointer (Z9.3).
+- `for x in s` with `s: &mut [T]` iterates with IterMut (`impl
+  IntoIterator for &'a mut [T]`), so `*x += 1` writes the element; a
+  `&mut T` whose T is a `&mut [T]` is a reference to it, not the view
+  (`mem::replace(&mut self.v, ..)` in IterMut::next).
 - The tools' cache is keyed by which std a rust program reads
   (VOLE_STD2=0 or std2), so a check no longer restores the other's
   errors.
