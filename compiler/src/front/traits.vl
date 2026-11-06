@@ -38,8 +38,8 @@ use crate::front::assoc::{
     assoc_constraints_hold, collect_impl_assoc, collect_trait_assoc, constraint_error,
 };
 use crate::front::ast::{
-    FN_DEFAULT_COPY, FN_LAZY, FN_SIG_FAILED, NODE_ASSOC_CONST, NODE_IMPLICIT, NodeKind, child,
-    list_begin, list_end, list_push, new_node,
+    FN_BODY_FAILED, FN_DEFAULT_COPY, FN_LAZY, FN_SIG_FAILED, NODE_ASSOC_CONST, NODE_IMPLICIT,
+    NodeKind, child, list_begin, list_end, list_push, new_node,
 };
 use crate::front::check::{
     Try, attempt, has_error_type, pop_scope, push_scope, resolve_type_or_error,
@@ -435,6 +435,53 @@ fn impl_type_error(node: i64, before: *u8, tr: i64, after: *u8, pcx: inout Ctx<C
     err_end_soft(&pcx);
 }
 
+// (0.27.2) The methods the compiler's lowerings call by name, with no
+// token of a source naming them (op_method and unary_call, check/iterate,
+// check/interp, check/rust, check/check_mode, calls' view methods,
+// places/shim): a trait's default of one of these names is copied into
+// every impl, as one a program names is (default_names).
+const LOWERED_METHODS: [[u8]; 49] = [
+    "eq", "ne", "cmp", "partial_cmp", "lt", "le", "gt", "ge", "add", "sub", "mul", "div", "rem",
+    "neg", "not", "bitand", "bitor", "bitxor", "shl", "shr", "add_assign", "sub_assign",
+    "mul_assign", "div_assign", "rem_assign", "deref", "deref_mut", "index", "index_mut",
+    "into_iter", "iter", "next", "drop", "clone", "fmt", "write_str", "write_char", "write_fmt",
+    "spec", "panic", "as_slice", "as_mut_slice", "as_str", "as_path", "from", "into", "hash",
+    "display", "debug",
+];
+
+// (0.27.2) The names that ask for a trait's default (DEFAULT_NAMES): every
+// name the tokens use but right after `fn` (the program's files, std2's,
+// the derived and builtin impls' text), and LOWERED_METHODS. A default no
+// name asks for is never called, so collect_impl copies only the others
+// into an impl (std2's traits leave thousands out, and a hello world calls
+// a few), and the builtin integer methods made are only those
+// (builtin_impls::keep_named_methods): for a rust program on std2 that is compiled, not for a query,
+// `--std2-check`, `fix --only buf` or std read from its files, which read
+// every body. RULE: Z7 (std2 whole under --std2-check)
+pub fn default_names(pcx: inout Ctx<Comp>) {
+    pcx.default_filter = crate::front::known::on_std2(pcx) && !pcx.query && !pcx.record
+        && pcx.std_tree == 0 as *u8 && !crate::places::borrowck::std2::std2_check(pcx);
+    if !pcx.default_filter {
+        return;
+    }
+    // (from the first token not read yet: the builtin impls' names are
+    // read first, before their text is, expand_builtin_impls)
+    let first = pcx.default_scanned;
+    for i in first..pcx.toks.len() as i64 {
+        if pcx.toks[i].kind == Tok::Ident && (i == 0 || pcx.toks[i - 1].kind != Tok::Fn) {
+            pcx.default_names.put(pcx.toks[i].value as i64 + 1, 1);
+        }
+    }
+    pcx.default_scanned = pcx.toks.len() as i64;
+    if first > 0 {
+        return;
+    }
+    for k in 0..LOWERED_METHODS.len() {
+        let sym = intern(LOWERED_METHODS[k], &pcx);
+        pcx.default_names.put(sym + 1, 1);
+    }
+}
+
 // The impl blocks of traits (a phase of the declarations, before the
 // methods): their traits and types, coherence, and the default functions
 // they leave out, copied into them.
@@ -458,6 +505,7 @@ pub fn collect_impls(pcx: inout Ctx<Comp>) {
                 }
             }
         }
+        default_names(&pcx);
         pcx.impl_extra.count = 0;
         for k in 0..pcx.nodes[pcx.program].count {
             let node = child(pcx.program, k, pcx);
@@ -594,7 +642,26 @@ pub fn collect_impl(node: i64, pcx: inout Ctx<Comp>) {
             err_end_soft(&pcx);
             continue;
         }
+        // (0.27.2: a default no name asks for is never called: not copied,
+        // default_names)
+        if pcx.default_filter && pcx.default_names.get(pcx.nodes[decl].a + 1) == 0 {
+            continue;
+        }
+        // (0.27.2: its body stays the trait's until it is checked,
+        // own_default_body: std2's traits leave thousands of defaults out,
+        // and a program uses few; a generic trait's, substituted below, and
+        // one that failed to parse, checked in place for a query, are copied)
+        let share = !generic_default && (pcx.nodes[decl].p & FN_BODY_FAILED) == 0;
+        let body = pcx.nodes[decl].c;
+        if share {
+            pcx.nodes[decl].c = 0;
+        }
         let f = clone_node(decl, &pcx);
+        if share {
+            pcx.nodes[decl].c = body;
+            pcx.nodes[f].c = body;
+            pcx.shared_bodies.put(f + 1, 1);
+        }
         if generic_default {
             subst_trait_args(f, pcx.traits[tr].params,
                 self_for_impl_type(pcx.nodes[pcx.nodes[node].a].g, pcx.nodes[node].b, &pcx),
@@ -620,6 +687,17 @@ pub fn collect_impl(node: i64, pcx: inout Ctx<Comp>) {
         pcx.fns[pcx.fns.len() as i64 - 1].module = pcx.traits[tr].module;
         set_fn_impl(pcx.fns.len() as i64 - 1, me, &pcx);
         pcx.impl_extra.push(f);
+    }
+}
+
+// (0.27.2) A trait default copied into an impl keeps the trait's body
+// (collect_impl) until it is to be checked: then it gets its own copy, as
+// every copy had before. An instance of a generic one copies its
+// template's body anyway (fn_instance).
+pub fn own_default_body(node: i64, pcx: inout Ctx<Comp>) {
+    if pcx.shared_bodies.get(node + 1) != 0 {
+        pcx.shared_bodies.put(node + 1, 0);
+        pcx.nodes[node].c = clone_node(pcx.nodes[node].c, &pcx);
     }
 }
 

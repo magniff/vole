@@ -13,7 +13,8 @@
 // derives' (front/derive).
 
 use crate::base::{
-    BUFS, SRC, _setjmp, add_source, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, sym_text,
+    BUFS, SRC, _setjmp, add_source, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, intern,
+    sym_text,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -21,6 +22,7 @@ use crate::base::diag::{err_begin, err_end_soft, err_fmt, err_help, recover_ente
 use crate::front::ast::{FN_DERIVED, NodeKind, child, list_begin, list_end, list_push};
 use crate::front::lexer::lex_range;
 use crate::front::parser::parse_items_fragment;
+use crate::middle::lower::ssa::HMap;
 
 // Text `t` into out with "`1".."`4" replaced by a1..a4.
 fn emit(out: i64, t: [u8], a1: [u8], a2: [u8], a3: [u8], a4: [u8]) {
@@ -383,6 +385,94 @@ fn int_method(out: i64, p: [u8], m: [u8], w: [u8], u: [u8], name: [u8], params: 
     buf_bytes(out, "\n    }\n");
 }
 
+fn ident_byte(c: u8) -> bool {
+    c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'
+}
+
+// (0.27.2) Of one integer's inherent methods made in `made`
+// (write_int_methods: `impl p {`, then each `    pub fn NAME(..` at a
+// line's start, then `}`), those some name asks for, appended to out:
+// the names of the sources' tokens (traits::default_names) and, from
+// there, the methods their bodies call (`.NAME(`, `::NAME(`). A program
+// that names no `checked_mul` reads none of the twelve; a query,
+// `--std2-check` and the like read every one (default_names).
+fn keep_named_methods(made: i64, out: i64, pcx: inout Ctx<Comp>) {
+    let t = buf_slice(made);
+    let len = t.len() as i64;
+    if !pcx.default_filter || len < 2 {
+        buf_bytes(out, t);
+        return;
+    }
+    let lead = "    pub fn ";
+    var starts = Vec::<i64, Comp>::new_in(Comp {});
+    var at = 0;
+    while at < len {
+        if at + lead.len() as i64 <= len && t[at..at + lead.len() as i64] == lead {
+            starts.push(at);
+        }
+        while at < len && t[at] != '\n' {
+            at += 1;
+        }
+        at += 1;
+    }
+    let count = starts.len() as i64;
+    if count == 0 {
+        buf_bytes(out, t);
+        return;
+    }
+    // (the trailer: the impl's closing `}` line)
+    let tail = len - 2;
+    var by_name = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    var wanted = Vec::<bool, Comp>::new_in(Comp {});
+    var work = Vec::<i64, Comp>::new_in(Comp {});
+    for k in 0..count {
+        let from = starts[k] + lead.len() as i64;
+        var to = from;
+        while to < len && ident_byte(t[to]) {
+            to += 1;
+        }
+        let sym = intern(t[from..to], &pcx);
+        by_name.put(sym + 1, k + 1);
+        let named = pcx.default_names.get(sym + 1) != 0;
+        wanted.push(named);
+        if named {
+            work.push(k);
+        }
+    }
+    loop {
+        let k = match work.pop() {
+            Some(k) => k,
+            None => break,
+        };
+        let end = if k + 1 < count { starts[k + 1] } else { tail };
+        var i = starts[k] + lead.len() as i64;
+        while i < end {
+            if (t[i] == '.' || t[i] == ':') && i + 1 < end && ident_byte(t[i + 1]) {
+                var j = i + 1;
+                while j < end && ident_byte(t[j]) {
+                    j += 1;
+                }
+                let m = by_name.get(intern(t[i + 1..j], &pcx) + 1) - 1;
+                if m >= 0 && !wanted[m] {
+                    wanted[m] = true;
+                    work.push(m);
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    buf_bytes(out, t[0..starts[0]]);
+    for k in 0..count {
+        if wanted[k] {
+            let end = if k + 1 < count { starts[k + 1] } else { tail };
+            buf_bytes(out, t[starts[k]..end]);
+        }
+    }
+    buf_bytes(out, t[tail..len]);
+}
+
 // `impl p { .. }`: the integer p's inherent methods of F15.4's list, as
 // Rust's (wrapping_*, checked_*, overflowing_*, saturating_*, the bit
 // counts and rotations). The text is std2's `num::wrapping`'s, whose
@@ -583,6 +673,8 @@ pub fn expand_builtin_impls(pcx: inout Ctx<Comp>) {
     if n == 0 {
         return;
     }
+    // (0.27.2: the names that ask for an integer method, keep_named_methods)
+    crate::front::traits::default_names(&pcx);
     let out = buf_new();
     for r in 0..n {
         let item = pcx.builtin_traits.get(4 * r);
@@ -614,7 +706,9 @@ pub fn expand_builtin_impls(pcx: inout Ctx<Comp>) {
             }
             let p = text[from..i];
             if item < 0 && (prim_class(p) == 1 || prim_class(p) == 2) {
-                write_int_methods(out, p);
+                let made = buf_new();
+                write_int_methods(made, p);
+                keep_named_methods(made, out, &pcx);
             } else if item < 0 {
                 let saved = pcx.err_kind;
                 pcx.err_kind = c"attr.builtin";
@@ -665,10 +759,19 @@ fn parse_builtin(out: i64, pcx: inout Ctx<Comp>) {
         let n = pcx.builtin_traits.count / 4;
         for k in node_mark..pcx.nodes.len() as i64 {
             let off = pcx.nodes[k].start - base;
+            // (the last record that starts at or before off: their starts
+            // grow, so a binary search, not a scan of the records for each
+            // of std2's thousands of made nodes)
             var r = 0;
-            for j in 0..n {
-                if pcx.builtin_traits.get(4 * j + 3) <= off {
-                    r = j;
+            var lo = 0;
+            var hi = n;
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if pcx.builtin_traits.get(4 * mid + 3) <= off {
+                    r = mid;
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
                 }
             }
             pcx.nodes[k].start = pcx.builtin_traits.get(4 * r + 1);
