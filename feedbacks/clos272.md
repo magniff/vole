@@ -6,9 +6,12 @@ M0-M2 done as specified (borrowck.md §19, §20, §24's AT1-AT3, D10.4 and
 D10.5 superseded); M3's IR side mostly: Z7's std2-check row, Z8 (the own
 pass off), Z9's IR (unsized places behind a pointer, a fat raw pointer
 without a region of its own, R12 deleted), AT2's std2 vouches and AT6
-(`thread::scope` by bounds and the borrow checker). Left: Z7's on-disk
-verdict cache and std2's remaining borrowck errors (most wait on
-front272's Z9.1), the twin's subset at 150 with `--std2`.
+(`thread::scope` by bounds and the borrow checker), and Z7's on-disk
+verdict cache. The last round: borrowck's messages in rustc's place
+names, println's `&mut` and value arguments (I7, a leak), calls through
+`&F`/`&mut F`, a projection in a closure's bound (D20.3). Left: std2's
+remaining borrowck errors, most from `T = str` instances (front272's
+Z9.1); the twin's subset at 150 with `--std2`.
 
 ## What to fix, with a tag
 
@@ -47,3 +50,14 @@ front272's Z9.1), the twin's subset at 150 with `--std2`.
   Graphemes is outlives. Treating them as external is not enough: the
   instance must tie the X_C position to the projection's resolved slot,
   as subst_requirements does for a type parameter's.
+- [tool] tests/run.sh sampled `--verify-places` by the case's whole path,
+  so each worktree verified a different half: an I7 failure showed in
+  one tree and not in the integrator's. Now by the file name.
+- [tool] `git stash` is shared by every worktree and session; a check of
+  "does the base fail too" is a WIP commit, not a stash.
+- [front] `v.iter().map(|x| x + 1).last()` on std2 is type.infer: "cannot
+  infer type parameter 'B' of 'Map<I, F>::fold'" (<std>:11080, the default
+  `last` through Map's own `fold`).
+- [borrowck] D20.3's tie was made only in the template whose bound the
+  closure was checked against; a closure passed on (`reduce`'s to `fold`)
+  must be read with each template's bound of the parameter it fills.
