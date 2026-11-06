@@ -341,6 +341,8 @@ GAPS = [
     (r"impl for unknown type 'char'|^char\.vl:.*cannot infer type parameter 'T' of 'Option'", "char"),
     (r"impl for unknown type 'AnyAlloc'|expected type, got 'unsafe'", "unsafe_fn_ptr"),
     (r"'(Send|Sync)' is not a trait in scope", "auto_trait"),
+    # (0.27.2: `impl !Sync for X {}`, a negative vouch, which 0.27.1 does not parse)
+    (r"impl blocks are for named types", "auto_trait"),
     (r"required by the bound 'M: Display' of 'panic::panic'", "impl_for_ref"),
     (r"'\?' needs an Option or a Result", "try_std2"),
     (r"cannot cast '(inout )?\[u8\]' to '\*\[u8\]'", "unsized_cast"),

@@ -278,6 +278,33 @@ Closures in full (clos272):
   got `.clone()` inside the pattern, which does not parse.
 - `--print-effects` leaves out the drop shims, which it printed as
   `(unknown)` (K-I7: nothing targets them, so nothing was masked).
+- `thread::scope` is std2's signatures and the borrow checker (AT6):
+  a thread may borrow from the caller and change what it borrows
+  mutably when that is Send; borrowing a local of the scope's closure
+  is `borrowck.dropped_borrowed` (rustc E0373), changing in the body
+  what a thread borrows is a conflict, two threads writing one value
+  `mut_twice`, a handle leaving the scope `outlives`. 0.21's
+  `sync.scope_*` checks stay for MVS programs only; the shared-static
+  rule stays for both. A declared `T: 'a` and a struct's declared
+  `'b: 'a` are now constraints (D4.5): the parser kept neither.
+- std2 states its Send and Sync as Rust's (AT2): `unsafe impl` vouches
+  for Vec, Box, the iterators and drains, the hash table, the join
+  handles; `impl !Sync` for Cell and the arenas (`&Arena` is neither).
+  threads.vl's list of std names is MVS std's only.
+- A closure that writes through a captured `&mut` binding not declared
+  `mut` captures it uniquely (rustc's unique borrow): a shared use of
+  it while the closure lives is `borrowck.conflict` (E0501).
+- A fat raw pointer (`*const [T]`, `*mut str`) has no region of its own
+  (Z9): `fn f(p: *const [u8], r: &T) -> &T` elides as Rust's. A
+  closure captures a `&[T]` or `&str` variable by reference (R12's copy
+  is gone; Rust 2021 copies it, L7).
+- A shallow write or a scope's end does not conflict with a loan past a
+  deref beyond a field (`h = H { r: &mut y }` while `*h.r` is borrowed,
+  rustc accepts; D2.5 amended), and `borrowck.dropped_borrowed` points
+  at the borrow, as rustc's E0597 and E0713, naming where the value is
+  dropped.
+- The rustc twin runs `--std2` in tests/affected.sh and the gate: 325
+  `rust_b_` cases, 293 agreeing, 9 named divergences, 0 mismatches.
 
 std2's tests under `--check-alloc` (std272b):
 

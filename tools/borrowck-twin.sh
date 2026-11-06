@@ -80,7 +80,7 @@ map_code() {
         E0503) echo use_borrowed ;;
         E0506) echo assign_borrowed ;;
         E0505) echo move_borrowed ;;
-        E0597|E0713|E0716) echo dropped_borrowed ;;
+        E0597|E0713|E0716|E0373) echo dropped_borrowed ;;  # (E0373: a scoped thread borrows a local of the scope's closure, AT6)
         E0515) echo return_local ;;
         E0621|E0623|E0521|lifetime|captured) echo outlives ;;  # (0.27.2: E0521, D20.3; "captured variable cannot escape", D19.10)
         E0106) echo elision ;;

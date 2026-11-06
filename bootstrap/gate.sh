@@ -640,7 +640,7 @@ run_step() {
         # (0.25.3) the tools' answers from their cache, every transcript
         cachediff) sh "$ROOT/tests/cachediff/run.sh" -c "$C" -j 4 ;;
         # (0.27.1) the borrow checker's corpus against rustc's verdicts
-        borrowck-twin) sh "$ROOT/tools/borrowck-twin.sh" "$ROOT"/tests/run/rust_b_*.vl ;;
+        borrowck-twin) sh "$ROOT/tools/borrowck-twin.sh" --std2 "$ROOT"/tests/run/rust_b_*.vl ;;
         # (0.27.2) std2's bodies through the borrow checker (Z7)
         std2-check) sh "$ROOT/tests/std2/check.sh" -c "$C" ;;
         std2-tests)

@@ -260,14 +260,20 @@ loan (the one step (2) excludes) nor the `ℓ'` of an `Activate ℓ'`:
 1. `r = rel(P, Q)` (D1.5); `Disjoint` → no conflict.
 2. `r = Extends` (`Q` is a strict prefix of `P`), with `e` the first
    projection of `P` beyond `Q` and `m` its pointee mode when `e` is
-   deref-like on `Q`: if `e` is deref-like and `depth = Shallow` → no
-   conflict (overwriting `Q` does not touch what it points to; D2.3's
-   kill handles the loan); if `e` is deref-like and `m = shared` → no
+   deref-like on `Q`: if `depth = Shallow` and *some* projection of `P`
+   beyond `Q` is deref-like → no conflict (overwriting or ending `Q`
+   does not touch what a pointer in it points to, past its fields too:
+   `h = H { r: &mut y }` while `*h.r` is borrowed, or a by-value
+   closure env's exit while a loan of `*(_1.k)` lives; rustc's
+   `Shallow(None)`; D2.3's kill handles the loan. 0.27.2: before, only
+   a deref-like `e` counted, stricter than rustc); if `e` is deref-like
+   and `m = shared` → no
    conflict (copying or overwriting a shared reference or view while
    its referent is borrowed is fine); if `e` is deref-like, `m ∈ {mut,
    raw}` and `depth = Deep` → *overlap*; if `e` is not deref-like (a
    field, a constant or variable index on an array, a variant, a union
-   field) → *overlap* at any depth (a write to `Q` overwrites `P`).
+   field) → *overlap* at any depth unless the first clause applies (a
+   write to `Q` overwrites `P`).
 3. `r ∈ {Equal, PrefixOf}` → *overlap*.
 4. For a `fake` loan (D2.6) *overlap* is *shallow*: it holds only when
    `kind ∈ {WA, WB, WD}` and `r = Equal`, or `r = Extends` (`Q` a
@@ -1269,7 +1275,11 @@ An error's primary position is the access's statement node
 (`PStmt.node`) — for a conflict the later access, for a move rule the
 use, for a universal violation the constraint's statement; its
 secondary position is the loan's statement node ("borrowed here"), and
-for a move the move's. An error of an instance is reported at the
+for a move the move's. *(0.27.2)* `borrowck.dropped_borrowed` is the
+exception, as rustc's E0597, E0713 and E0716: its primary position is
+the loan's (a `StorageDead` has no node of its own; a `drop` of a value
+with glue is its block's or its scope's, which rustc gives as the
+secondary "dropped here"), and the drop's is named in the message. An error of an instance is reported at the
 template's position. When the instance is the region-free one (D4.4(c))
 or the body is not generic, nothing more is said; when it is found only
 in a region-carrying instance, the message adds the instance (`in
