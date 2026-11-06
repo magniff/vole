@@ -819,8 +819,11 @@ lookup.vl` (the `use` list reader; `features.tsv: use_self`).
 extern "C" fn(..)` are function-pointer types distinct from the safe
 ones: a safe `fn` value coerces to the unsafe type, not the reverse; a
 call through an unsafe pointer needs `unsafe`. A field, a parameter and
-a `let` may have the type. *Anchor:* `front/parser/types.vl` (the `fn`
-type reader; `features.tsv: unsafe_fn_ptr`), `front/check/unsafety.vl`.
+a `let` may have the type. A closure that captures nothing coerces to
+either, `fn(..)` or `unsafe fn(..)` (not to an `extern "C"` one), as in
+rustc. *Anchor:* `front/parser/types.vl` (the `fn` type reader;
+`features.tsv: unsafe_fn_ptr`), `front/check/unsafety.vl`,
+`front/closures/mod.vl: closure_fn_target`.
 
 **F19.4 (`size_of`, `align_of` by name).** In a rust-edition position
 `size_of::<T>()`, `align_of::<T>()`, `mem::size_of::<T>()`,
@@ -1293,10 +1296,6 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   a safe `extern "C" fn(..)` pointer needs `unsafe`, as in MVS (the
   pointer may come from C; the fn type's ABI bit keeps its meaning);
   rustc calls one safely. Case `rust_f_f19_c_ptr_err`.
-- **FL10 (no closure-to-`unsafe fn` coercion yet).** F19.3: a closure
-  that captures nothing coerces to a `fn(..)` type, not to an `unsafe
-  fn(..)` type; rustc coerces it to either. Case
-  `rust_f_f19_closure_err` (the closures' side, clos272).
 
 ## 10. The gap map
 

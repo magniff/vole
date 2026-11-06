@@ -810,17 +810,14 @@ dataflow (bc271 M3) reports `borrowck.use_moved`, `assign_moved_part`,
 `move_out` and `move_from_drop`; the own pass's `own.moved`,
 `own.partial` and `own.move_out` are suppressed for it (today they
 fire: §0.1), so no body gets both. The own pass's view findings
-(summaries, `own.conflict`, escapes) are muted on rust bodies at
-v0.27.0 (`ocx.quiet`): **M3 task:** unmute them for rust bodies on the
-corpus; if they agree with borrowck or only add true positives, keep
-them (Q2(b) as intended); if they add false positives, leave them muted
-and count the hole (R2). Also M3's: `own.drop_view` (an `impl Drop` on
-a type holding a reference, MVS's rule) is suppressed for rust-edition
-types, where dropck (§9) is the rule: `let x = 1; let d = D { r: &x };`
-with `impl Drop for D` is accepted when `x` outlives `d`'s drop and
-`borrowck.dropped_borrowed` when it does not. R2 closes in 0.27.2 with
-std2 (every type
-declares its regions; the own pass is off for the rust edition).
+(summaries, `own.conflict`, escapes) were muted on rust bodies at
+v0.27.0 (`ocx.quiet`). From 0.27.2 the own pass does not run on a rust
+program (Z8), so none of its findings reach one; `own.drop_view` (an
+`impl Drop` on a type holding a reference, MVS's rule) does not run
+either, dropck (§9) is the rule: `let x = 1; let d = D { r: &x };` with
+`impl Drop for D` is accepted when `x` outlives `d`'s drop and
+`borrowck.dropped_borrowed` when it does not. R2 is closed with std2
+(every type declares its regions).
 
 ## 9. Drops and dropck (S9)
 
@@ -1826,13 +1823,19 @@ callbacks) is deleted; D17.7's verdict applies to std2's bodies.
 (`places::regions::rust_copy`: no glue and `Copy` arguments) is
 deleted; `Range<i64>` moves, as in rustc.
 
-**Z8 (the own pass off).** For a rust program `own_mode = MODE_OFF` for
-every body, std2's included: Q2 and D8.4's suppression are vacuous,
-§0.1's muted view half and §8.4's M3 task are deleted, `own.drop_view`
-does not run (dropck, §9, is the rule), and R2 is closed. `query own`,
+**Z8 (the own pass off).** For a rust program on std2 the own pass
+walks no body, std2's included (`front/own/mod.vl: own_off`, checked
+first in `check_own`): Q2 and D8.4's suppression are vacuous, §0.1's
+muted view half and §8.4's M3 task are deleted, `own.drop_view` does
+not run (dropck, §9, is the rule), and R2 is closed. `own_mode` itself
+is not set to `MODE_OFF`: the mode also says that the places IR
+decides the drops (`drops_on`) and that the optimizer may use a clean
+body's reference facts (D17.7), and both stay as they are. `query own`,
 `query views` and `--print-views` on a rust program say that the own
 pass does not run in the rust edition. MVS programs are unchanged:
-`tests/std/own.sh` and D17.7's MVS half stay as they are.
+`tests/std/own.sh` and D17.7's MVS half stay as they are. (Until the
+cases written against MVS std migrate, a rust program on MVS std,
+`VOLE_STD2=0`, keeps the pass and §12's reading of std's summaries.)
 
 **Z9 (unsized `[T]` and `str`; IR change, clos272 M3; the type side
 front272 M2).** In a rust program `[T]` and `str` are unsized types,
