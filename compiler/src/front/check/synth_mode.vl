@@ -275,6 +275,17 @@ fn synth_cast(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         pcx.nodes[n] = pcx.nodes[operand];
         return to_ty;
     }
+    // RULE: Z9.3 (0.27.2: a cast between fat pointers of one element type,
+    // `&[T] as *const [T]`, `&mut [u8] as *mut [u8]`, `*mut [u8] as *mut
+    // str`, keeps both words: the cast is its operand)
+    if from > 0 && to > 0 && pcx.types[from].kind == TyKind::Slice
+        && pcx.types[to].kind == TyKind::Slice && pcx.types[from].a == pcx.types[to].a
+        && (crate::front::types::is_raw_view(from, pcx)
+            || crate::front::types::is_raw_view(to, pcx))
+        && crate::front::check::rust::rust_node(n, &pcx) {
+        pcx.nodes[n] = pcx.nodes[operand];
+        return to_ty;
+    }
     if !is_valid_cast(from, to, pcx) {
         err_begin(pcx.nodes[operand].start, &pcx);
         err_str(c"cannot cast '", pcx);
@@ -425,6 +436,22 @@ fn synth_index(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         base_kind = pcx.types[base_ty].kind;
     }
     let index = pcx.nodes[n].b;
+    // RULE: F30.3 (0.27.2: the rust edition does not index a raw pointer,
+    // as Rust's: `*p.add(i)`, `slice::from_raw_parts(p, n)`; rustc E0608)
+    if base_kind == TyKind::Ptr && pcx.types[base_ty].b == 0
+        && crate::front::check::rust::rust_node(n, &pcx) && !in_std_ptr(pcx.nodes[n].start, pcx) {
+        err_begin(pcx.nodes[base].start, &pcx);
+        err_str(c"cannot index into a value of type '", pcx);
+        err_type(base_ty, pcx);
+        err_str(c"'", pcx);
+        if pcx.nodes[index].kind == Range {
+            err_help(c"a raw pointer is not indexed: make the slice, `unsafe { std::slice::from_raw_parts(p, n) }`, and index that (rustc E0608)", pcx);
+        } else {
+            err_help(c"a raw pointer is not indexed: offset it and read, `unsafe { *p.add(i) }` (rustc E0608)", pcx);
+        }
+        err_end(&pcx);
+        return pcx.ty_error;
+    }
     // (0.17) through a pointer to a Vec, a Buf or a slice: the one it
     // points to, checked; through a raw pointer, unsafe
     // (decided 2026-10-16) unless it points, as written, to a type
@@ -532,6 +559,42 @@ fn synth_index(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     }
     check_index_type(index, &pcx);
     pcx.types[base_ty].a
+}
+
+// (0.27.2) Whether position pos is in std2's `ptr` module, where the raw
+// pointers' own primitives (`read`, `write`, `slice_parts`) are written
+// with MVS's raw indexing: std::ptr of a program on std2, or the file
+// compiler/std2/ptr.vl of std2's own check. RULE: F30.3
+fn in_std_ptr(pos: i64, pcx: Ctx<Comp>) -> bool {
+    let m = pcx.cur_mod;
+    // UNSAFE: the module and file tables are the compiler's raw-pointer
+    // globals; a file's path is a C string.
+    // SAFETY: m is a module of the table (cur_mod, set by the checker); f
+    // is the file pos is in (file_of_pos), its path NUL-terminated, read
+    // only below its length.
+    unsafe {
+        if m >= 0 && pcx.std_module >= 0 && pcx.modules[m].parent == pcx.std_module
+            && crate::base::sym_text(pcx.modules[m].name, pcx) == "ptr" {
+            return true;
+        }
+        let f = crate::front::modules::file_of_pos(pos, pcx);
+        if f < 0 {
+            return false;
+        }
+        let path = pcx.files[f].path;
+        let n = crate::base::strlen(path) as i64;
+        let tail = "std2/ptr.vl";
+        let k = tail.len() as i64;
+        if n < k {
+            return false;
+        }
+        for i in 0..k {
+            if path[n - k + i] != tail[i] {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 // (0.17) Whether a value of type t (a struct) is indexed through its
@@ -1154,6 +1217,15 @@ fn synth_unary(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             fn_value_error(n, operand, c"deref", &pcx);
             return ty;
         }
+        // RULE: Z9.3, F30.1 (0.27.2: `*p` of a fat raw pointer is the view
+        // it points to, both words: unsafe, and its value is p's, until Z9's
+        // unsized places)
+        if crate::front::types::is_raw_view(ty, pcx)
+            && crate::front::check::rust::rust_node(n, &pcx) {
+            unsafe_through(n, operand, U_DEREF, c"dereference of a raw pointer is unsafe", &pcx);
+            pcx.nodes[n] = pcx.nodes[operand];
+            return crate::front::types::raw_view_target(ty, &pcx);
+        }
         if pcx.edition != 0 && !is_pointer(ty, pcx) && crate::front::check::rust::rust_node(n, &pcx)
             && crate::front::check::rust::deref_operand(n, operand, ty, &pcx) {
             // (0.27.0: `*x` through Deref, the rust edition's)
@@ -1196,8 +1268,19 @@ fn synth_unary(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     if mutable {
         pcx.mut_place = operand;
     }
+    let star = pcx.nodes[operand].kind == Unary && pcx.nodes[operand].op == Tok::Star;
     let ty = synth_expr(operand, &pcx);
     pcx.mut_place = outer_place;
+    // RULE: Z9.3 (0.27.2: `&*p`, `&mut *p` of a fat raw pointer: the view,
+    // its two words; the deref was made the pointer's value)
+    if star && pcx.nodes[operand].kind != Unary && crate::front::check::rust::rust_node(n, &pcx)
+        && (pcx.types[ty].kind == TyKind::Slice && pcx.types[ty].b == 0
+            || is_view_distinct(ty, pcx)) {
+        pcx.nodes[n] = pcx.nodes[operand];
+        return if mutable
+            && pcx.types[ty].kind == TyKind::Slice { mut_slice_of(pcx.types[ty].a, &pcx) }
+            else { ty };
+    }
     // (0.25) an inout access needs the place mutable
     if mutable && (pcx.nodes[operand].p & NODE_TEMP) == 0 && is_place(operand, pcx) {
         crate::front::check::assign::defer_inout_place(operand, n, &pcx);
@@ -1484,7 +1567,8 @@ pub fn fold_layout_query(n: i64, pcx: inout Ctx<Comp>) {
 
 // (0.27.2) `size_of::<T>()` of the rust edition (call n, no arguments):
 // the callee `size_of` or `align_of`, or a path ending in one, with one
-// type argument; n becomes the constant, typed like an integer literal.
+// type argument; n becomes the constant, a `usize` (`1usize`), as std2's
+// signature says.
 // RULE: F19.4
 fn rust_layout_query(n: i64, pcx: inout Ctx<Comp>) {
     let callee = pcx.nodes[n].a;
@@ -1510,7 +1594,7 @@ fn rust_layout_query(n: i64, pcx: inout Ctx<Comp>) {
     let value = if is_size { type_size(t, pcx) } else { type_align(t, pcx) };
     pcx.nodes[n].kind = Int;
     pcx.nodes[n].a = value;
-    pcx.nodes[n].b = SUF_NONE;
+    pcx.nodes[n].b = SUF_USIZE;
     pcx.nodes[n].count = 0;
 }
 
