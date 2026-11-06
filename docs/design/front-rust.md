@@ -663,6 +663,14 @@ trait.unconstrained` (E0207) at the impl. *Anchor:* `collect_impl`
 `later_impl`), `front/check/calls/paths.vl: impl_param_count,
 bind_impl_params`.
 
+**F14.2 (positional binding).** An instance's arguments bind a template
+impl's parameters by position only when the header names them in order
+(`impl<T> Tr for W<T>`); `impl<T> SliceIndex<[T]> for Range<usize>` is
+matched (F0.3), does not cover `Range<i64>`, and its `T` is fixed by
+the trait arguments a projection is read with (`trait_args_agree`).
+*Anchor:* `front/traits.vl: header_in_order, impl_bindings,
+trait_args_agree`.
+
 ### F15 Builtin impls
 
 **F15.1 (`#[builtin_impls(P₁, .., Pₙ)]`).** On a trait declaration in a
@@ -829,6 +837,18 @@ that does not fit is `arith.overflow`). An unsuffixed float literal is
 `front/generics/mod.vl: is_untyped_literal_expr`, `front/check/
 literals.vl: defaulted_apart`, `synth_mode.vl: is_untyped_literal`
 (the default kind).
+(0.27.2.1: a range of unsuffixed integer literals at a bare bounded
+parameter, `s.get(1..3)`, is checked as the one `Range<N>` the bounds
+admit before the call's arguments are inferred:
+`generics/instantiate.vl: range_literal_by_bounds`.)
+
+**F18.4 (a hoisted literal takes the let's annotation).** `let r: &U = &e;`
+with `e` a literal (an array, an integer, a float, a tuple) makes its
+temporary (lifetime extension) with the annotation's type: `let d: &[u8]
+= &[1, 2, 3];` is `let t: [u8; 3] = [1, 2, 3]; let d: &[u8] = &t;`, so
+the literals are `u8`, not the default. *Anchor:* `front/check/temps.vl:
+annotate_temp`. Integer inference variables (a literal typed by a later
+statement, `let a = [1, 2]; f(&a)` with `f(&[u8])`) stay FL6's, 0.27.3.
 
 ### F19 Small syntax
 
