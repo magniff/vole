@@ -1,11 +1,14 @@
-# The rust edition (0.27.0)
+# The rust edition (0.27.0; its std, std2, since 0.27.2)
 
 A file whose first line is `// EDITION: rust` (or a program compiled
 with `--edition rust`) is read with Rust's meanings. It is the same
-compiler and the same std: the MVS conventions (`let`, `inout`, `sink`)
-are still what a std function's parameters are, and a rust-edition
-program calls std as any program does. MVS files are read exactly as
-before; the edition is per program, from its root file.
+compiler; since 0.27.2 its std is the edition's own, std2
+(compiler/std2): Rust's std, its names, modules and signatures, with
+the allocator written (`Vec<T, A>`, `Vec::new_in(gpa)`, `String<A>`,
+`HashMap<K, V, A>`). Its prelude is Rust's plus `Gpa`; `Allocator` is
+`use std::alloc::Allocator`. The print functions are functions, not
+macros: `println("{} {x}", a)`. MVS files, and MVS's std, are read
+exactly as before; the edition is per program, from its root file.
 
 ## What 0.27.0 reads
 
@@ -69,24 +72,18 @@ fn main(gpa: Gpa) -> i32 {
 2 7 26
 ```
 
-## The seams of 0.27.0 (MVS std)
+## The seams of 0.27.0 and 0.27.1 (MVS std), gone
 
-0.27.0's edition runs on MVS's std. Two places differ from Rust's std,
-each with its own code; 0.27.2's std removes both:
-
-| code | where | fix |
-|---|---|---|
-| `edition.std_copy` | `*x` of what a std getter gives (`v.get(i)`, `v.last()`, a map's `get`): a copy, where Rust's give `&T` | the value as it is (`try:`) |
-| `edition.std_by_value` | `&x` given to a std function that takes the value (`v.contains(&t)` of Strings, `m.insert(k, v)`) | `x.clone()`, `x`, or `*x` |
-
-A generic `let` parameter of std's is `&T` or `T` per instance (a copy
-for a plain T); a `&x` given to one is lent, as Rust's `v.contains(&3)`.
-
-0.27.0 was lenient where MVS's 0.19 meanings are; 0.27.1 closes it
-(`edition.lenient`): a `&T` given where its value goes, or a place where
-`&T` goes, to a rust-edition function or a `let`'s written type, is an
-error whose `try:` is Rust's spelling (`*r`, `&x`). MVS std's
-parameters keep 0.19's meanings until 0.27.2's std.
+Until 0.27.2 the edition ran on MVS's std, and two places differed from
+Rust's std, each with its own code: `edition.std_copy` (`*x` of what a
+std getter gave, `v.last()`, a copy where Rust's gives `&T`) and
+`edition.std_by_value` (`&x` given to a std function taking the value,
+`v.contains(&t)`). With std2 both are gone, and so is `edition.lenient`'s
+std half: `*v.last().unwrap()` and `v.contains(&t)` are right, as in
+Rust. `edition.lenient` stays for a rust-edition function's own
+parameters and a `let`'s written type: a `&T` given where its value
+goes, or a place where `&T` goes, is an error whose `try:` is Rust's
+spelling (`*r`, `&x`).
 
 ## NLL, the regions solved (0.27.1)
 
@@ -109,7 +106,8 @@ each with its rustc code; `volec check --emit-places=regions` prints
 each body's liveness, constraints, region values and loans.
 
 What is not checked (each a named divergence in the rule book): MVS
-std's types holding hidden views; a `&raw` pointer's uses (unsafe's);
+std's types holding hidden views (0.27.0 to 0.27.1: std2's types carry
+their lifetimes, `Iter<'a, T>`); a `&raw` pointer's uses (unsafe's);
 rvalue promotion (`&5` is a temporary, not `'static`). Since 0.27.2 a
 closure body is checked like any other (its environment is `&Env`,
 `&mut Env` or `Env` by its kind, and what it stores or returns from
