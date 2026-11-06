@@ -165,6 +165,22 @@ The front (front272):
   IntoIterator for &'a mut [T]`), so `*x += 1` writes the element; a
   `&mut T` whose T is a `&mut [T]` is a reference to it, not the view
   (`mem::replace(&mut self.v, ..)` in IterMut::next).
+- Operators through std2's ops traits (F26): `==`/`!=` are
+  `PartialEq::eq`/`ne` (not structural), `<` and the rest
+  `PartialOrd::lt`.. (not `Ord::cmp`), `%`, `& | ^`, `<< >>` (with an
+  Rhs the literal takes, `v << 2` for `Shl<u32>`) and every `op=` form
+  (`AddAssign::add_assign(&mut a, b)`) on a type with the impl; on a
+  type parameter's value the bound must give the operator:
+  `generic.unbounded_use` (rustc E0369) with the bound to add.
+- Deref to a slice (F20): a Vec has its slice's methods (`v.iter()`,
+  `v.last()`, `v.contains(&x)`, `v.reverse()` through `deref_mut`, so
+  the borrow checker sees the `&mut v`). `&a` of an array or a Vec where
+  `&[T]` is expected is the slice, and `&[]`, `&[4, 5]` take the
+  expected element type (Z9.2). `s.get(0)` and `first`/`last` work: an
+  unsuffixed literal for a parameter whose bound only usize meets is a
+  usize; an impl parameter only the trait's arguments fix (`impl<T>
+  SliceIndex<[T]> for usize`) is taken from the bound's (F14.1); `I::Output`
+  under `I: SliceIndex<[T]>` is SliceIndex's, not Add's (F11.3).
 - The tools' cache is keyed by which std a rust program reads
   (VOLE_STD2=0 or std2), so a check no longer restores the other's
   errors.
