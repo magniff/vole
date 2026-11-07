@@ -12,6 +12,7 @@ use crate::base::{IntVec, SRC, buf_byte, buf_bytes, buf_new, buf_slice, sym_text
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::{NodeKind, child};
+use crate::front::lexer::Tok;
 use crate::front::types::{TyKind, buf_type};
 use crate::tools::edit::edit_replace;
 use crate::tools::translate::{
@@ -22,7 +23,7 @@ use crate::tools::translate::{
 
 // SRC[a..b) with the edits made inside it applied (an insertion at a only
 // when with_start).
-fn render(a: i64, b: i64, with_start: bool, out: i64, pcx: Ctx<Comp>) {
+pub fn render(a: i64, b: i64, with_start: bool, out: i64, pcx: Ctx<Comp>) {
     var idx = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     for i in 0..pcx.e_start.count {
         let s = pcx.e_start.get(i);
@@ -71,7 +72,7 @@ fn before(x: i64, y: i64, pcx: Ctx<Comp>) -> bool {
 }
 
 // The edits strictly inside [a, b) taken back (the call's edit holds them).
-fn drop_inside(a: i64, b: i64, pcx: inout Ctx<Comp>) {
+pub fn drop_inside(a: i64, b: i64, pcx: inout Ctx<Comp>) {
     var w: i64 = 0;
     for i in 0..pcx.e_start.count {
         let s = pcx.e_start.get(i);
@@ -477,6 +478,28 @@ fn expand(t: [u8], c: i64, recv: i64, args: IntVec, alloc: i64, out: i64, pcx: C
                 if node <= 0 {
                     return false;
                 }
+                // (`&mut $1` of an argument written `&x`, MVS's inout marker:
+                // the row's borrow, of x)
+                let o = buf_slice(out);
+                if (o.len >= 5 && o[o.len - 5..o.len] == "&mut "
+                    || o.len >= 1 && o[o.len - 1] == '&')
+                    && pcx.nodes[node].kind == NodeKind::Unary && pcx.nodes[node].op == Tok::Amp
+                    && SRC[pcx.nodes[node].start] == '&' && pcx.nodes[node].b > 0 {
+                    // (without what was put where x starts: `&x`'s `mut `)
+                    let x = pcx.nodes[node].b;
+                    let k = pcx.nodes[x].kind;
+                    let term = k == NodeKind::Ident || k == NodeKind::FieldAccess
+                        || k == NodeKind::Index || k == NodeKind::TupleField;
+                    if !term {
+                        buf_byte(out, '(');
+                    }
+                    render(pcx.nodes[x].start, pcx.nodes[x].end, false, out, pcx);
+                    if !term {
+                        buf_byte(out, ')');
+                    }
+                    i += 2;
+                    continue;
+                }
                 if in_str {
                     trailing.push(node);
                 } else if nx == '1' && pcx.nodes[node].kind == NodeKind::Interp
@@ -694,22 +717,25 @@ fn put_call(a: i64, b: i64, text: [u8], tr: inout Tr, pcx: inout Ctx<Comp>) {
 }
 
 // The capitalized names a row's text brings at position at (`Layout`,
-// `NonNull`): Tr.row_names, (symbol, position) pairs, for the imports
+// `NonNull`) and the modules its paths start with (`mem::`): Tr.row_names, (symbol, position) pairs, for the imports
 // (paths.vl). A path's later segment or a method is not one.
 fn note_row_names(at: i64, text: [u8], tr: inout Tr, pcx: inout Ctx<Comp>) {
     var i: usize = 0;
     while i < text.len {
         let c = text[i];
-        let starts = c >= 'A' && c <= 'Z'
-            && (i == 0 || !crate::tools::translate::ident_char(text[i - 1]) && text[i - 1] != '.'
-                && text[i - 1] != ':');
-        if !starts {
-            i += 1;
-            continue;
-        }
+        let first = i == 0
+            || !crate::tools::translate::ident_char(text[i - 1]) && text[i - 1] != '.'
+            && text[i - 1] != ':';
         var j = i;
         while j < text.len && crate::tools::translate::ident_char(text[j]) {
             j += 1;
+        }
+        // (a module a path starts with, `mem::replace`: row_imports' module)
+        let module = c >= 'a' && c <= 'z' && j + 1 < text.len && text[j] == ':'
+            && text[j + 1] == ':';
+        if !first || !(c >= 'A' && c <= 'Z' || module) {
+            i = if j > i { j } else { i + 1 };
+            continue;
         }
         tr.row_names.push(crate::base::intern(text[i..j], &pcx));
         tr.row_names.push(at);
@@ -775,7 +801,28 @@ pub fn type_row_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
             continue;
         }
         let row = buf_slice(tr.rows.get(r + 2));
-        let t = row[5..row.len];
+        var t = row[5..row.len];
+        // (a renamed type written by its MVS name is that name, which the
+        // path pass imports as an alias, `use std::fmt::Formatter as Fmt;`:
+        // `Fmt<'_>`, not `Formatter<'_>`)
+        if name.len as i64 == ne - s {
+            var b: usize = 0;
+            while b < t.len && (t[b] == '&' || t[b] == ' ') {
+                b += 1;
+            }
+            var be = b;
+            while be < t.len && (crate::tools::translate::ident_char(t[be])
+                || t[be] == ':' && be + 1 < t.len && t[be + 1] == ':') {
+                be += if t[be] == ':' { 2 } else { 1 };
+            }
+            if t[b..be] != name {
+                let w = buf_new();
+                buf_bytes(w, t[0..b]);
+                buf_bytes(w, name);
+                buf_bytes(w, t[be..t.len]);
+                t = buf_slice(w);
+            }
+        }
         // (the row's text cut at its `$k`s: pieces[k] before `$k+1`)
         var cuts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var ok = true;

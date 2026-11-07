@@ -396,47 +396,111 @@ fn edit_view(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     put(s, s, if mut_slice(t, pcx) { "&mut " } else { "&" }, TC_VIEW, &tr, &pcx);
 }
 
-// A raw pointer's part, `p[a..b]` (MVS slices a `*T`), is
-// `std::slice::from_raw_parts(p.add(a), b - a)` (`_mut` for an inout one,
-// `&p[a..b]`, whose `&` it replaces); whether it was rewritten.
-fn edit_ptr_slice(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) -> bool {
+// Whether Index node n is a raw pointer's part, `p[a..b]` (MVS slices a
+// `*T`): ptr_slice_edits rewrites it once the passes inside it are done.
+fn ptr_slice_node(n: i64, pcx: Ctx<Comp>) -> bool {
     let a = pcx.nodes[n].a;
     let r = pcx.nodes[n].b;
-    if a <= 0 || r <= 0 || pcx.nodes[r].kind != NodeKind::Range
+    if a <= 0 || r <= 0 || pcx.nodes[r].kind != NodeKind::Range || pcx.nodes[r].b <= 0
         || token_at(pcx.nodes[n].start, pcx) < 0 {
         return false;
     }
     let t = pcx.nodes[a].ty;
-    if t <= 0 || pcx.types[t].kind != TyKind::Ptr || pcx.types[t].b != 0 {
-        return false;
+    t > 0 && pcx.types[t].kind == TyKind::Ptr && pcx.types[t].b == 0
+}
+
+// (after the statics, mod.vl) A raw pointer's part, `p[a..b]`, is
+// `std::slice::from_raw_parts(p.add(a), b - a)` (`_mut` for an inout one,
+// `&p[a..b]`, whose `&` it replaces), made of its operands' rewritten text:
+// the edits inside it (a `(*q.add(i))`, an `unsafe { }` of a static) are
+// folded into the one edit. The innermost first.
+pub fn ptr_slice_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    var todo = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind == NodeKind::Index && own_node(n, tr, &pcx) && ptr_slice_node(n, pcx) {
+            todo.push(n);
+        }
     }
-    let lo = pcx.nodes[r].a;
-    let hi = pcx.nodes[r].b;
-    if hi <= 0 {
-        return false;
+    var k: i64 = 1;
+    while k < todo.count {
+        var j = k;
+        while j > 0 && pcx.nodes[todo.get(j)].end - pcx.nodes[todo.get(j)].start
+            < pcx.nodes[todo.get(j - 1)].end - pcx.nodes[todo.get(j - 1)].start {
+            let t = todo.get(j);
+            todo.set(j, todo.get(j - 1));
+            todo.set(j - 1, t);
+            j -= 1;
+        }
+        k += 1;
     }
-    var s = pcx.nodes[n].start;
-    var q = s - 1;
-    while q > 0 && is_ws(SRC[q]) {
-        q -= 1;
+    for i in 0..todo.count {
+        let n = todo.get(i);
+        let a = pcx.nodes[n].a;
+        let r = pcx.nodes[n].b;
+        let lo = pcx.nodes[r].a;
+        let hi = pcx.nodes[r].b;
+        var s = pcx.nodes[n].start;
+        var q = s - 1;
+        while q > 0 && is_ws(SRC[q]) {
+            q -= 1;
+        }
+        let lent = SRC[q] == '&';
+        if lent {
+            s = q;
+        }
+        let lo_text = buf_new();
+        if lo > 0 {
+            crate::tools::translate::rows::render(pcx.nodes[lo].start, pcx.nodes[lo].end, true,
+                lo_text, pcx);
+        } else {
+            buf_bytes(lo_text, "0");
+        }
+        let text = buf_new();
+        buf_bytes(text, if lent { "std::slice::from_raw_parts_mut(" }
+            else { "std::slice::from_raw_parts(" });
+        // (of the insertions where p starts, edit_ptr_index's `(*` are p's,
+        // moved inside; the others, an `unsafe { ` or a printed view's
+        // `str::from_utf8(`, are the context's)
+        var opens = 0;
+        if pcx.nodes[a].start == s {
+            var w: i64 = 0;
+            for e in 0..pcx.e_start.count {
+                let at = pcx.e_start.get(e) == s && pcx.e_end.get(e) == s
+                    && buf_slice(pcx.e_text.get(e)) == "(*";
+                if at && editable(s, &pcx) {
+                    opens += 1;
+                } else {
+                    pcx.e_start.set(w, pcx.e_start.get(e));
+                    pcx.e_end.set(w, pcx.e_end.get(e));
+                    pcx.e_text.set(w, pcx.e_text.get(e));
+                    w += 1;
+                }
+            }
+            pcx.e_start.count = w;
+            pcx.e_end.count = w;
+            pcx.e_text.count = w;
+        }
+        for _ in 0..opens {
+            buf_bytes(text, "(*");
+        }
+        crate::tools::translate::rows::render(pcx.nodes[a].start, pcx.nodes[a].end,
+            pcx.nodes[a].start != s, text, pcx);
+        buf_bytes(text, ".add((");
+        buf_bytes(text, buf_slice(lo_text));
+        buf_bytes(text, ") as usize), (");
+        crate::tools::translate::rows::render(pcx.nodes[hi].start, pcx.nodes[hi].end, true, text,
+            pcx);
+        buf_bytes(text, " - (");
+        buf_bytes(text, buf_slice(lo_text));
+        buf_bytes(text, ")) as usize)");
+        if !editable(s, &pcx) {
+            continue;
+        }
+        crate::tools::translate::rows::drop_inside(s, pcx.nodes[n].end, &pcx);
+        if crate::tools::edit::edit_replace(s, pcx.nodes[n].end, text, &pcx) {
+            tr.counts[TC_USIZE] += 1;
+        }
     }
-    let lent = SRC[q] == '&';
-    if lent {
-        s = q;
-    }
-    let text = crate::base::buf_new();
-    crate::base::buf_bytes(text, if lent { "std::slice::from_raw_parts_mut(" }
-        else { "std::slice::from_raw_parts(" });
-    crate::base::buf_bytes(text, SRC[pcx.nodes[a].start..pcx.nodes[a].end]);
-    let lo_text = if lo > 0 { SRC[pcx.nodes[lo].start..pcx.nodes[lo].end] } else { "0" };
-    crate::base::buf_bytes(text, ".add((");
-    crate::base::buf_bytes(text, lo_text);
-    crate::base::buf_bytes(text, ") as usize), (");
-    crate::base::buf_bytes(text, SRC[pcx.nodes[hi].start..pcx.nodes[hi].end]);
-    crate::base::buf_bytes(text, " - (");
-    crate::base::buf_bytes(text, lo_text);
-    crate::base::buf_bytes(text, ")) as usize)");
-    put(s, pcx.nodes[n].end, crate::base::buf_slice(text), TC_USIZE, &tr, &pcx)
 }
 
 // A raw pointer's element, `p[i]` (MVS indexes a `*T`), is `(*p.add(i))`
@@ -699,7 +763,8 @@ fn edit_str(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
 }
 
 // A character literal MVS types as a byte, `'a'`, is `b'a'`; as a code
-// point (u32) `'a' as u32` (a char in the rust edition).
+// point (u32) `'a' as u32` (a char in the rust edition); as another
+// integer `b'a' as i64`.
 fn edit_char(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     let s = pcx.nodes[n].start;
     let t = pcx.nodes[n].ty;
@@ -710,6 +775,16 @@ fn edit_char(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
         put(s, s, "b", TC_BYTES, &tr, &pcx);
     } else if t == crate::front::types::TY_U32 {
         put(pcx.nodes[n].end, pcx.nodes[n].end, " as u32", TC_BYTES, &tr, &pcx);
+    } else if t >= TY_I8 && t <= TY_U64 || t == TY_ISIZE || t == crate::front::types::TY_USIZE {
+        // (another integer's, `c == 'a'` of an i64: the byte, cast)
+        let w = buf_new();
+        buf_bytes(w, " as ");
+        crate::front::types::buf_type(w, t, pcx);
+        // (a code point past ASCII, `'é'`, or `\u{..}`: the char, cast)
+        let ascii = SRC[s + 1] < 128 && !(SRC[s + 1] == '\\' && SRC[s + 2] == 'u');
+        if !ascii || put(s, s, "b", TC_BYTES, &tr, &pcx) {
+            put(pcx.nodes[n].end, pcx.nodes[n].end, buf_slice(w), TC_BYTES, &tr, &pcx);
+        }
     }
 }
 
@@ -1244,7 +1319,8 @@ pub fn body_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
             edit_len(n, &tr, &pcx);
             edit_call_args(n, &tr, &pcx);
         } else if k == NodeKind::Index {
-            if !edit_ptr_slice(n, &tr, &pcx) {
+            // (a raw pointer's part: ptr_slice_edits, after the statics)
+            if !ptr_slice_node(n, pcx) {
                 edit_view(n, &tr, &pcx);
                 edit_index(n, &tr, &pcx);
                 edit_ptr_index(n, &tr, &pcx);
