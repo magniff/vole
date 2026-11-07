@@ -262,6 +262,13 @@ words; one from an unsized to a sized pointee (`*const [T] as *const
 T`) keeps the address and drops the length; sized to unsized is
 `error type.cast` (rustc E0606; use `from_raw_parts`). F29.2.
 
+
+**Z9.1a (a reference impl over an unsized self, 0.27.2.1).** While `&[T]`
+is represented as `[T]`, a pattern impl for `&A` (`impl<A: PartialEq<B>,
+B> PartialEq<&B> for &A`) matches a slice too; when it and the slice's
+own impl both take a call, the slice's own is chosen (rustc reaches it
+through the reference impl). *Anchor:* `front/convert/mod.vl:
+by_unsized_self`. Case `rust_f_z91_ref_impl_ok`.
 ### F23 Literals
 
 **F23.1 (string literals).** `"…"` has type `&'static str` in a
@@ -355,6 +362,18 @@ parameter's inference (`f(&[1, 2])` with `f<T>(x: T)` gives `T = &[i64;
 2]`, as rustc). *Anchor:* `front/generics/mod.vl: check_arg,
 check_call_arg`, `front/check/mod.vl: mismatch_error`, `front/check/
 widen.vl`.
+
+**F32.2 (deref coercion through Deref, 0.27.2.1).** At a coercion site a
+shared reference `&S` where `&U` (or the view `&[T]`, `&str`) is
+expected, with `U` reached from `S` by `<_ as Deref>::Target` steps (at
+most 4), is `n.deref()` that many times: `f(&b)` with `b: Box<i64, A>`
+and `f(x: &i64)`. At a generic call, a parameter `&P` whose own
+parameters the argument `&S` does not bind is unified with the first
+`&D` of the chain that binds them (`sum(rest)` with `rest: &Box<List<A>,
+A>` and `sum<A>(l: &List<A>)`), as rustc's coercion of an argument
+against `&List<?A>`. *Anchor:* `front/check/rust.vl: deref_coerce,
+deref_projection`, `front/generics/instantiate.vl: deref_unify`. Case
+`rust_f_f32_deref_coerce_ok`.
 
 ### F33 Raw pointers hold no allocator
 
@@ -591,6 +610,14 @@ kept as a projection type, equal only to itself (and to its `= X`
 constraint when `Γ` has `T: Tr<A = X>`). *Anchor:* `front/assoc.vl:
 projection, trait_projection, constraint_type`.
 
+
+**F11.5 (a bound's equality through a supertrait, 0.27.2.1).** A bound
+`I: Tr<Name = τ>` whose `Name` a supertrait of `Tr` declares
+(`DoubleEndedIterator<Item = &'a T>`, Item Iterator's) is read through
+that supertrait's impl for the bound's type, so it binds the parameters
+τ names as `Iterator<Item = &'a T>` would (`Copied<I>`'s
+`DoubleEndedIterator` impl). *Anchor:* `front/assoc.vl:
+super_projection, infer_from_assoc`. Case `rust_f_f11_super_projection_ok`.
 ### F12 Default bodies in generic traits
 
 **F12.1.** A method of a generic trait `Tr<P..>` may have a default
@@ -603,6 +630,14 @@ only `Tr`'s and the supertraits' items on `self`, and `P`'s declared
 bounds on values of type `P`). *Anchor:* `collect_trait_params` (today:
 "a function of a generic trait has no default body"),
 `front/traits.vl: collect_impl` (the default copy).
+
+**F12.2 (a default's own parameters).** The copy's own generic
+parameters are the default's, whatever the impl's are named: one named
+as an impl's parameter (`collect_in<B, A>` in `impl<B, I, F> Iterator
+for Map<I, F>`) is renamed in the copy, in its signature, its `where`
+predicates and its body, a path's head included (`B::from_iter_in(..)`,
+0.27.2.1). *Anchor:* `front/traits.vl: rename_own_params,
+subst_trait_args`. Case `rust_f_f12_own_param_path_ok`.
 
 ### F13 Several impls of one generic trait for one type
 
@@ -628,13 +663,34 @@ header unifies, it is chosen; none is `error trait.unmet`; several is
 `front/check/calls/paths.vl: synth_path_call, sole_instance_with`,
 `front/generics/instantiate.vl: infer_from`.
 
+**F13.3 (selection by an own parameter's bound).** When the parameter a
+candidate's function takes an argument at is one of the function's own
+type parameters (`fn extend<I: IntoIterator<Item = T>>(&mut self, iter:
+I)`), the argument's type is checked against that parameter's bounds'
+associated-type equalities, with the impl's trait arguments for the
+trait's: `v.extend(s.iter().copied())` on a `Vec<i64>` gives `Item =
+i64`, which `Extend<i64>` takes and `Extend<&i64>` does not. A
+projection the checker cannot compute (no impl defines it) rejects no
+candidate. *Anchor:* `front/convert/mod.vl: own_bound_misses, takes`.
+
+**F13.4 (selection by the generic body's bound).** In an instance of a
+generic function (checked per instance, D22.3), a method call whose
+receiver is a parameter of a bounded type parameter `S: Tr<a..>` and
+which more than one impl of `Tr` takes picks the impl whose trait
+arguments are the bound's: `s.as_ref()` with `S: AsRef<str>`, S =
+`String`, is `AsRef<str>`'s, as the generic body read it. F13.2's
+expected type is tried first. *Anchor:* `front/convert/mod.vl:
+by_expected, by_param_bound, dispatch`.
+
 ### F14 Impl parameters fixed by the trait's arguments
 
 **F14.1.** An impl parameter `Q` must be *constrained*: it occurs in the
 self type `σ`, or in a trait argument `aᵢ`, or is determined by a
 projection of a constrained parameter through a bound in `W` (`impl<B,
 I: Iterator, F: FnMut(I::Item) -> B> Iterator for Map<I, F>`: `B` is
-fixed by `F`'s bound's result position, `I` by `σ`). Unification at a
+fixed by `F`'s bound's result position, `I` by `σ`; the result may be
+a type with arguments, `P: FnMut(I::Item) -> Option<B>` for MapWhile and
+Scan, 0.27.2.1). Unification at a
 goal runs over the whole header and, for a parameter constrained only
 through a bound, over the bound's projection after the rest is bound
 (so `impl<T> SliceIndex<[T]> for usize` binds `T` from the goal's
@@ -643,6 +699,14 @@ trait.unconstrained` (E0207) at the impl. *Anchor:* `collect_impl`
 (today: parameters must be the self type's arguments in order:
 `later_impl`), `front/check/calls/paths.vl: impl_param_count,
 bind_impl_params`.
+
+**F14.2 (positional binding).** An instance's arguments bind a template
+impl's parameters by position only when the header names them in order
+(`impl<T> Tr for W<T>`); `impl<T> SliceIndex<[T]> for Range<usize>` is
+matched (F0.3), does not cover `Range<i64>`, and its `T` is fixed by
+the trait arguments a projection is read with (`trait_args_agree`).
+*Anchor:* `front/traits.vl: header_in_order, impl_bindings,
+trait_args_agree`.
 
 ### F15 Builtin impls
 
@@ -658,7 +722,8 @@ by copy, `Default` by zero/`false`/`'\0'`, `Display`/`Debug`/`LowerHex`/
 `Formatter` (F16.3), `Hash` by hashing the bytes, `Ord`/`PartialOrd` by
 the machine comparison (floats: `PartialOrd` only, `partial_cmp` giving
 `None` on NaN), `Step` by `+1`/`-1` on integers, `Sum`/`Product` by the
-operator. A listed trait that has no intrinsic (a method the compiler
+operator (each as `Sum for P` and, as Rust's core has, `Sum<&'a P> for
+P`, 0.27.2.1). A listed trait that has no intrinsic (a method the compiler
 does not know) is a compiler-build error reported by `known_items_check`
 (Z3). The attribute on a non-std2 trait is `error attr.builtin`. The
 synthesized impls are keyed like written ones (F13.1) and take part in
@@ -707,6 +772,16 @@ and range checks; nothing is synthesized for them, and F4.2 checks them
 against F15.1's lists (so a trait with a `#[builtin_impls]` list may not
 also be written for a listed primitive).
 
+**F15.6 (the floats' digits).** F15.1's `Display`, `Debug`, `LowerExp`
+and `UpperExp` for `f32` and `f64`, `LowerExp`/`UpperExp` for the
+integers, and `FromStr` for `f32`, `f64` and `bool` are bodies that call
+std2's private module `flt` (`fmt_float`, `fmt_int_exp`, `parse_float`,
+`parse_bool`), with Rust's output: the shortest digits that read back as
+the same float (`{}`; `{:?}` with `.0`, exponent form below 1e-4 and
+from 1e16), the exact value rounded half to even at a precision, and a
+parse rounded to the nearest float. *Anchor:* `front/builtin_impls.vl:
+write_fmt, write_from_str`, `compiler/std2/flt.vl`.
+
 **F15.3 (`#[array_builtin(N)]`).** On an impl or free function whose
 header mentions `[T; N]` with `N` a declared name: a template over the
 length, instantiated for each `N` the program uses (`impl<T: Clone, N>
@@ -741,6 +816,14 @@ and that declare `name`; with `τ` a parameter, its bounds (F0.4a).
 Ambiguity is F9.3's. `<τ>::name` with an explicit type is what
 disambiguates a primitive (`<i64>::MAX`, `<[T]>::len`).
 
+**F8.4 (`<τ as Tr>::name` in an expression).** With `τ` a name
+(`<i32 as FromStr>::from_str("-7")`, `<W as Make>::make()`), the path
+`τ::name` (F8.3). In 0.27.2.1 the trait is parsed and not kept, so two
+traits in scope that both declare `name` for `τ` are F9.3's ambiguity,
+where rustc takes `Tr`'s; a `τ` that is not a name (`<Vec<T> as
+Tr>::f`) is a parser error. *Anchor:* `front/parser/exprs.vl:
+parse_primary`. Case `rust_f_f8_qualified_call_ok`.
+
 ### F9 Method name clash
 
 **F9.1 (order).** F0.5: at each probe step inherent candidates first;
@@ -755,7 +838,10 @@ or `use path::Tr as _`), or in the edition's prelude (Z2). A method of
 a trait not in scope is not a candidate: `error method.unknown` with
 `try: use path::Tr;` (rustc E0599's "items from traits can only be used
 if the trait is in scope"). *Anchor:* `method_of` (today: every impl of
-the program), `front/modules/lookup.vl`.
+the program), `front/modules/lookup.vl`; of several trait candidates the
+one of a trait in scope is taken (0.27.2.1, `self.v.fmt(f)` with only
+`Binary` imported: `front/check/calls: trait_method_choice,
+trait_in_scope`). Case `rust_f_f9_trait_in_scope_ok`.
 
 **F9.3 (ambiguity).** More than one candidate at the deciding step is
 `error method.ambiguous` (E0034), listing each as `try: Tr::m(&x, ..)`
@@ -810,6 +896,18 @@ that does not fit is `arith.overflow`). An unsuffixed float literal is
 `front/generics/mod.vl: is_untyped_literal_expr`, `front/check/
 literals.vl: defaulted_apart`, `synth_mode.vl: is_untyped_literal`
 (the default kind).
+(0.27.2.1: a range of unsuffixed integer literals at a bare bounded
+parameter, `s.get(1..3)`, is checked as the one `Range<N>` the bounds
+admit before the call's arguments are inferred:
+`generics/instantiate.vl: range_literal_by_bounds`.)
+
+**F18.4 (a hoisted literal takes the let's annotation).** `let r: &U = &e;`
+with `e` a literal (an array, an integer, a float, a tuple) makes its
+temporary (lifetime extension) with the annotation's type: `let d: &[u8]
+= &[1, 2, 3];` is `let t: [u8; 3] = [1, 2, 3]; let d: &[u8] = &t;`, so
+the literals are `u8`, not the default. *Anchor:* `front/check/temps.vl:
+annotate_temp`. Integer inference variables (a literal typed by a later
+statement, `let a = [1, 2]; f(&a)` with `f(&[u8])`) stay FL6's, 0.27.3.
 
 ### F19 Small syntax
 
@@ -913,6 +1011,19 @@ PartialOrd>::lt(&a, &b)`, resolved per instance; without the bound,
 applied to type `T`") with `try: T: PartialOrd`. `==` needs
 `PartialEq`; `+` needs `Add<Output = ..>`.
 
+**F26.3 (an operator's right operand of another type).** On std2, a
+binary operator (`a == b`, `a < b`, `a + b`, ..) with `a` of a struct or
+enum type and `b` of another (not a literal that takes its type from
+context; an array literal does, for a comparison) checks `b` alone: the
+impl of the operator's trait for `b`'s type decides (`s == "x"` with
+`impl PartialEq<str> for String`, `v == [1, 2]`, `s + "bar"` with `impl
+Add<&str> for String`).
+When the operand is a view (`[T]`, `str`, Z9.1, where `&str` is the view
+too), an impl whose argument is written `&..` yields to one that is not:
+`PartialEq<str>` and `PartialEq<&'a str>` compare alike (0.27.2.1).
+*Anchor:* `front/check/synth_mode.vl: synth_operands`,
+`front/convert: by_view_rhs`. Case `rust_f_f26_cmp_rhs_ok`.
+
 ### F27 Patterns in `let` and parameters
 
 **F27.1 (irrefutable patterns).** `let PAT = e;`, `let PAT: τ = e;`,
@@ -1008,6 +1119,16 @@ impls for primitives (the number formatting MVS has). *Anchor:*
 `front/check/interp.vl: direct_body` (today: MVS's `__print_begin`,
 `Fmt::display`), `format.vl: panic_call`.
 
+**F16.5 (the spec's traits and flags).** A hole's trait is the spec's: `x`
+LowerHex, `X` UpperHex, `o` Octal, `b` Binary, `e` LowerExp, `E`
+UpperExp, `p` Pointer (0.27.2.1; a pointer's `{:p}` stays its address),
+`?` Debug, else Display. A struct's or an enum's impl of the spec's trait
+writes the hole (`impl Binary for W`, `{:b}`), not only a number's
+(0.27.2.1). `+` sets the Formatter's
+`sign_plus` (bit 0), `-` its `sign_minus` (bit 1), `#` `alternate`, `0`
+`sign_aware_zero_pad`. *Anchor:* `front/check/interp.vl:
+direct_body_std2, spec_call`, `format.vl: parse_spec`.
+
 ### F17 Derives
 
 **F17.1 (Rust's shapes).** `#[derive(Tr, ..)]` on a struct or enum in a
@@ -1095,6 +1216,13 @@ for usize { type Output = T; .. }`, `for Range<usize> { type Output =
 `&mut c[i]`, `c[i].m()` with `m` taking `&mut self` (F6.2's `&mut`
 autoref) use `index_mut`; a `τ` with `Index` but no `IndexMut` is
 `error trait.unmet` naming `IndexMut` (E0594's shape).
+
+**F20.5 (a tuple index of literals).** `g[(0, 1)]` with `G:
+Index<(usize, usize)>`: a tuple of unsuffixed literals takes its
+elements' types from the impl's index type, as one literal does
+(`(i64, i64)` only when no impl takes an integer tuple; 0.27.2.1).
+*Anchor:* `front/convert: literal_kind, literal_tuple_fits`. Case
+`rust_f_f20_tuple_index_ok`.
 
 ## 6. The bound-only rule (D22.3's front side; U1)
 
@@ -1317,6 +1445,36 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   a safe `extern "C" fn(..)` pointer needs `unsafe`, as in MVS (the
   pointer may come from C; the fn type's ABI bit keeps its meaning);
   rustc calls one safely. Case `rust_f_f19_c_ptr_err`.
+- **FL10 (Z9.1's representation; later, 0.27.3).** In the rust edition
+  `[T]` and `&[T]` (`str` and `&str`) are still one type, MVS's view:
+  `resolve_type` makes `&` of a view the view. So `&mut &[u8]` is `&mut
+  [u8]` (`*self = &self[n..]` cannot be written in `impl Read for
+  &[u8]`), `&mut self` of an impl for a view type is `inout [u8]`, `impl
+  Tr for [T]` and `impl Tr for &[T]` cannot both be written, a `T: ?Sized`
+  parameter is not told from a sized one (`?Sized` is not recorded), and
+  `NonNull<[u8]>`/`Box<[u8], A>` are 8 bytes (the field `*const T` with T
+  a view is thin; rustc: 16). The change is a type form of its own for
+  the unsized place behind a reference, read by `resolve_type`, method
+  lookup on slices and `str`, indexing, `len`, the coercions, the places
+  IR, layout and the borrow checker's slots: about a week of wide front
+  work, near MVS's shared type code. It blocks 6 std2 cases: the five
+  `std2_io_` cases of `impl Read for &[u8]` and `std2_str_pattern`
+  (`impl Pattern for &str`). 0.27.2.1 has the parts that do not need it:
+  `size_of_val` of a view (its length times the element's size) and
+  `size_of::<[T]>()`/`size_of::<str>()` as `type.unsized`.
+- **FL11 (the opaque instance's type errors; later, 0.27.3).**
+  borrowck.md D22.2: in 0.27.2.1 an opaque instance reports only the
+  bound-only rule's error (D22.3) on a parameter's own Ω, with no `where`
+  predicate in the template, and the borrow checker's; any other type
+  error leaves the instance out, unreported. rustc reports them all. The
+  gaps: an operator on an Ω through its `Add`/`PartialEq`/`PartialOrd`/
+  `Neg`/`Not`/`Shl` bound (an Ω is a type over `()`, and the operators
+  check the type), a bound's type arguments (`T: AsRef<str>`,
+  `Make<S::Item>`), associated functions and consts (`T::default()`,
+  `A::FREES`), `where` predicates on a projection (`X::Item: Show`), a
+  method of a generic impl over the impl's own parameters, and `*x` with
+  a `Deref` bound. A template that meets one is not counted in `opaque:
+  N templates`.
 
 ## 10. The gap map
 

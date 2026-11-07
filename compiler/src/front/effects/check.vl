@@ -51,7 +51,8 @@ fn effect_bit(sym: i64, pcx: Ctx<Comp>) -> i64 {
     if text == "alloc" {
         return -1;
     }
-    if text == "io" { EFF_IO } else if text == "global" { EFF_GLOBAL }
+    // (0.27.2.1, E1.2: `static`; `global` its alias through 0.27.x)
+    if text == "io" { EFF_IO } else if text == "static" || text == "global" { EFF_GLOBAL }
     else if text == "panic" { EFF_PANIC } else if text == "diverge" { EFF_DIVERGE }
     else if text == "unsafe" { EFF_UNSAFE } else if text == "tls" { EFF_TLS }
     else if text == "thread" { EFF_THREAD } else if text == "sync" { EFF_SYNC } else { 0 }
@@ -141,6 +142,104 @@ fn chain_bound(set: i64, quiet: bool, pcx: inout Ctx<Comp>) -> Effects {
     e
 }
 
+// (0.27.2.1) The type parameter that EffectItem item names in the context
+// set (enter_context), or 0: a parametric item (E3.3a). RULE: E3.3a
+fn param_item(item: i64, pcx: Ctx<Comp>) -> i64 {
+    if pcx.nodes[item].count != 0 || pcx.nodes[item].b != 0
+        || effect_bit(pcx.nodes[item].a, pcx) != 0 {
+        return 0;
+    }
+    // UNSAFE: TP_NAMES and TP_TYPES, the checker's type-parameter stack, by index.
+    // SAFETY: i runs from its top down to TP_BASE, the frame enter_context made.
+    unsafe {
+        var i = pcx.tp_names.count - 1;
+        while i >= pcx.tp_base {
+            if pcx.tp_names.data[i] == pcx.nodes[item].a {
+                return pcx.tp_types.data[i];
+            }
+            i -= 1;
+        }
+    }
+    0
+}
+
+// (0.27.2.1) Before the solve: each declared function of the rust edition
+// with a body (an item or an instance) gets its list resolved (FX_DECL_E)
+// and its parametric items' types (FX_DECL_TPS), which infer.vl's
+// signature_of makes its S(f) once its callees' are known. RULE: E3.1a
+pub fn note_declarations(n: i64, pcx: inout Ctx<Comp>) {
+    // UNSAFE: the declaration tables, made here with n + 1 words, by index.
+    // SAFETY: f < n; FX_DECL_TPS' words are written at `at`, its own push.
+    unsafe {
+        pcx.fx_decl = crate::base::alloc_array::<i64>(n + 1);
+        pcx.fx_decl_e = crate::base::alloc_array::<Effects>(n + 1);
+        pcx.fx_decl_px = crate::base::alloc_array::<Effects>(n + 1);
+        pcx.fx_inferred = crate::base::alloc_array::<Effects>(n + 1);
+        pcx.fx_decl_tps.count = 0;
+        for f in 0..n {
+            let decl = pcx.fns[f].effect_decl;
+            if decl == 0 || pcx.fns[f].generic > 0 || pcx.fns[f].node == 0 || pcx.fns[f].is_extern
+                || pcx.failed[f] != 0 || crate::front::effects::infer::error_instance(f, pcx)
+                || !crate::places::regions::rust_fn(f, &pcx) {
+                continue;
+            }
+            let at = pcx.fx_decl_tps.count;
+            pcx.fx_decl[f] = at + 1;
+            pcx.fx_decl_tps.push(0);
+            let saved = enter_context(f, pcx.fns[f].module, &pcx);
+            pcx.fx_decl_e[f] = chain_bound(decl, true, &pcx);
+            var s = decl;
+            while s != 0 {
+                if pcx.nodes[s].c == EFFECTS_DECL {
+                    for i in 0..pcx.nodes[s].count {
+                        let t = param_item(child(s, i, pcx), pcx);
+                        if t > 0 {
+                            pcx.fx_decl_tps.push(t);
+                            pcx.fx_decl_tps.data[at] += 1;
+                        }
+                    }
+                }
+                s = pcx.nodes[s].b;
+            }
+            leave_context(saved, &pcx);
+        }
+    }
+}
+
+// (0.27.2.1) Whether function f (an item or a template) is one `fix --only
+// effects` declares and `query items --undeclared` counts: a `pub`
+// function or inherent `pub` method of the rust edition with a body; not
+// a trait impl's (E3.4: its trait binds it), not a closure, not one the
+// compiler made (a derive's, a contract's companion). RULE: E3.6
+pub fn declarable(f: i64, pcx: inout Ctx<Comp>) -> bool {
+    let node = pcx.fns[f].node;
+    if node <= 0 || pcx.fns[f].tmpl != 0 || pcx.fns[f].is_extern
+        || pcx.nodes[node].kind != NodeKind::Fn || pcx.nodes[node].c == 0
+        || (pcx.nodes[node].p & crate::front::parser::items::ITEM_PUBLIC) == 0
+        || (pcx.nodes[node].p & (crate::front::ast::FN_DERIVED | crate::front::ast::FN_CLOSURE))
+        != 0 {
+        return false;
+    }
+    let i = impl_of_fn(f, pcx);
+    if i >= 0 && pcx.traits_impls[i].tr >= 0 {
+        return false;
+    }
+    // (a trait's default method, made for an impl: its trait's, E3.4)
+    let at = pcx.nodes[node].start;
+    for tr in 0..pcx.traits.len() as i64 {
+        let tn = pcx.traits[tr].node;
+        if tn > 0 && at >= pcx.nodes[tn].start && at < pcx.nodes[tn].end {
+            return false;
+        }
+    }
+    for c in sym_text(pcx.fns[f].name, pcx) {
+        if c == '$' {
+            return false;
+        }
+    }
+    crate::places::regions::rust_fn(f, &pcx)
+}
+
 // Sets the context of function f's declarations (its module, its type
 // arguments, its Self); what leave_context restores.
 fn enter_context(f: i64, module: i64, pcx: inout Ctx<Comp>) -> i64 {
@@ -222,17 +321,20 @@ pub fn check_effects(pcx: inout Ctx<Comp>) {
         }
         validate_traits(&pcx);
         for f in 0..pcx.fns.len() as i64 {
-            if !body_walked(f, pcx) {
+            // (0.27.2.1: an instance of the error type never runs)
+            if !body_walked(f, pcx) || crate::front::effects::infer::error_instance(f, pcx) {
                 continue;
             }
-            let e = fn_effects(f, pcx);
+            // (E3.1a: what the body does, not its signature)
+            let e = crate::front::effects::inferred_effects(f, pcx);
             if (e.bits & EFF_UNKNOWN) != 0 {
                 continue;
             }
             let decl = pcx.fns[f].effect_decl;
             if decl != 0 {
                 let saved = enter_context(f, pcx.fns[f].module, &pcx);
-                let bound = chain_bound(decl, true, &pcx);
+                let bound = crate::front::effects::effects_union(chain_bound(decl, true, &pcx),
+                    crate::front::effects::declared_through(f, pcx));
                 leave_context(saved, &pcx);
                 if !effects_subset(e, bound) {
                     declared_error(f, e, bound, decl, -1, &pcx);
@@ -319,7 +421,7 @@ fn validate_fn(f: i64, allocator: i64, pcx: inout Ctx<Comp>) {
     validate_bounds(node, &pcx);
     var s = pcx.fns[f].effect_decl;
     while s != 0 {
-        validate_names(s, &pcx);
+        validate_names(f, s, &pcx);
         validate_allocators(f, node, s, allocator, &pcx);
         s = pcx.nodes[s].b;
     }
@@ -340,7 +442,7 @@ fn validate_bounds(node: i64, pcx: inout Ctx<Comp>) {
         for k in 0..pcx.nodes[bounds].count {
             let b = child(bounds, k, pcx);
             if pcx.nodes[b].kind == NodeKind::EffectSet {
-                validate_names(b, &pcx);
+                validate_names(-1, b, &pcx);
             }
         }
     }
@@ -359,7 +461,7 @@ fn validate_traits(pcx: inout Ctx<Comp>) {
             validate_bounds(tf, &pcx);
             var s = pcx.nodes[tf].z;
             while s != 0 {
-                validate_names(s, &pcx);
+                validate_names(-1, s, &pcx);
                 validate_allocators(-1, tf, s, -1, &pcx);
                 s = pcx.nodes[s].b;
             }
@@ -367,18 +469,56 @@ fn validate_traits(pcx: inout Ctx<Comp>) {
     }
 }
 
+// (0.27.2.1) Whether sym names a type parameter of function f or of its
+// impl: an item of f's list that is a parametric one (E3.3a).
+fn names_type_param(f: i64, sym: i64, pcx: Ctx<Comp>) -> bool {
+    let g = pcx.nodes[pcx.fns[f].node].g;
+    if g > 0 {
+        for i in 0..pcx.nodes[g].count {
+            if pcx.nodes[child(g, i, pcx)].a == sym {
+                return true;
+            }
+        }
+    }
+    let i = impl_of_fn(f, pcx);
+    if i >= 0 {
+        let ig = pcx.nodes[pcx.traits_impls[i].node].g;
+        if ig > 0 {
+            for k in 0..pcx.nodes[ig].count {
+                if pcx.nodes[child(ig, k, pcx)].a == sym {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+// (0.27.2.1) Whether name starts with a capital: a type's, never an
+// effect's (a parametric item whose parameter the generics do not show
+// here, `T: ?Sized` of an impl for `[T]`, resolves per instance).
+fn capitalized(name: [u8]) -> bool {
+    name.len > 0 && name[0] >= 'A' && name[0] <= 'Z'
+}
+
 // The names of EffectSet s's effects are effects; only alloc takes
 // allocators.
-fn validate_names(s: i64, pcx: inout Ctx<Comp>) {
+fn validate_names(f: i64, s: i64, pcx: inout Ctx<Comp>) {
     for i in 0..pcx.nodes[s].count {
         let item = child(s, i, pcx);
         let bit = effect_bit(pcx.nodes[item].a, pcx);
+        if bit == 0 && f >= 0 && pcx.nodes[item].count == 0 && pcx.nodes[item].b == 0
+            && (names_type_param(f, pcx.nodes[item].a, pcx)
+                || capitalized(sym_text(pcx.nodes[item].a, pcx))) {
+            // (E3.3a: a parametric item)
+            continue;
+        }
         if bit == 0 {
             let name = sym_text(pcx.nodes[item].a, pcx);
             err_begin(pcx.nodes[item].start, &pcx);
             err_str(c"unknown effect '", pcx);
             buf_bytes(pcx.err, name);
-            err_str(c"' (effects: alloc, io, global, panic, diverge, unsafe)", pcx);
+            err_str(c"' (effects: alloc, io, static, panic, diverge, unsafe)", pcx);
             let near = nearest_effect(name);
             if near != 0 as *u8 {
                 err_help(c"did you mean '", pcx);
@@ -398,9 +538,9 @@ fn validate_names(s: i64, pcx: inout Ctx<Comp>) {
 
 // The effect name nearest to `name` (a typo or a longer word), or null.
 fn nearest_effect(name: [u8]) -> *u8 {
-    let names: [*u8; 9] = [c"alloc", c"io", c"global", c"panic", c"diverge", c"unsafe", c"tls",
+    let names: [*u8; 9] = [c"alloc", c"io", c"static", c"panic", c"diverge", c"unsafe", c"tls",
         c"thread", c"sync"];
-    let texts: [[u8]; 9] = ["alloc", "io", "global", "panic", "diverge", "unsafe", "tls",
+    let texts: [[u8]; 9] = ["alloc", "io", "static", "panic", "diverge", "unsafe", "tls",
         "thread", "sync"];
     var best = -1;
     var best_d = 3;

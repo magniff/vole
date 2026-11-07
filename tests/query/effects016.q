@@ -8,14 +8,14 @@ crate::putchar	io
 crate::malloc	alloc(extern)
 std::malloc	alloc(extern)
 crate::labs	none
-crate::qsort	alloc(Gpa, extern) io global panic diverge
+crate::qsort	alloc(Gpa, extern) io panic diverge
 crate::mystery	io
 crate::ext_pure	none
 $ effects add bump address at part whole color sum same spin forever fact even odd
 crate::add	none
 std::gpu::Unwritten::add	panic
-crate::bump	global
-crate::address	global
+crate::bump	none
+crate::address	none
 crate::at	panic
 crate::part	panic
 crate::whole	none
@@ -37,9 +37,9 @@ crate::calls_c	unsafe
 crate::declared	io unsafe
 crate::heap	alloc(extern) unsafe
 crate::out	io unsafe
-crate::by_c	global
-crate::sorter	alloc(Gpa, extern) io global panic diverge unsafe
-crate::main	alloc(Gpa, extern) io global panic diverge unsafe
+crate::by_c	none
+crate::sorter	alloc(Gpa, extern) io panic diverge unsafe
+crate::main	alloc(Gpa, extern) io panic diverge unsafe
 crate::t0	none
 $ effects Bump::try_alloc Bump::try_resize fill in_scope apply double shout hof allocators
 <crate::Bump as Allocator>::try_alloc	unsafe

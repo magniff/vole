@@ -16,7 +16,9 @@
 // The functions made are flagged FN_DERIVED (the tools leave them out).
 // `debug` clauses are made only with --debug-contracts.
 
-use crate::base::{buf_bytes, buf_clear, buf_new, buf_slice, buf_str, intern, intern_c, sym_text};
+use crate::base::{
+    IntVec, buf_bytes, buf_clear, buf_new, buf_slice, buf_str, intern, intern_c, sym_text,
+};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{err_begin, err_help, err_str};
@@ -182,6 +184,145 @@ pub fn message_hole_error(n: i64, actual: i64, pcx: inout Ctx<Comp>) -> ! {
     crate::base::diag::err_jump(&pcx)
 }
 
+// (0.27.2.1, C7.6) The ident nodes named `from` in the tree at n (not inside
+// closures) renamed `to`: a trait's clause read with an impl's parameter
+// names.
+fn rename_idents(n: i64, from: i64, to: i64, pcx: inout Ctx<Comp>) {
+    if n <= 0 {
+        return;
+    }
+    let kind = pcx.nodes[n].kind;
+    if kind == NodeKind::Ident {
+        if pcx.nodes[n].a == from {
+            pcx.nodes[n].a = to;
+        }
+        return;
+    }
+    if kind == NodeKind::Closure || kind == NodeKind::Fn {
+        return;
+    }
+    for k in 0..3 {
+        let e = subtree(n, k, pcx);
+        if e > 0 {
+            rename_idents(e, from, to, &pcx);
+        }
+    }
+    for i in 0..pcx.nodes[n].count {
+        rename_idents(child(n, i, pcx), from, to, &pcx);
+    }
+}
+
+// (0.27.2.1, C7.6) The clauses of a trait's method declarations copied into
+// each method of an impl of that trait in the program, before the
+// method's own (req_eff = req(Tr::m) ++ req(I::m), C7.1, C7.2): each a
+// clone with the trait's parameter names renamed to the impl's by
+// position. The trait is the program's trait of the impl's name (its
+// path's last segment). RULE: C7.6
+fn copy_trait_clauses(pcx: inout Ctx<Comp>) {
+    // UNSAFE: the clause tables' words (IntVecs), by index.
+    // SAFETY: c < count, their length when the copy began; pushes only grow them.
+    unsafe {
+        let program = pcx.program;
+        let count = pcx.clause_owner.count;
+        // (the traits with a clause on a method, first: most programs have
+        // none, and the impls are looked up among these few)
+        var traits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for j in 0..pcx.nodes[program].count {
+            let t = child(program, j, pcx);
+            if pcx.nodes[t].kind != NodeKind::Trait {
+                continue;
+            }
+            var owns = false;
+            for c in 0..count {
+                let o = pcx.clause_owner.data[c];
+                if o > 0 && pcx.nodes[o].start >= pcx.nodes[t].start
+                    && pcx.nodes[o].end <= pcx.nodes[t].end {
+                    owns = true;
+                }
+            }
+            if owns {
+                traits.push(t);
+            }
+        }
+        if traits.count == 0 {
+            return;
+        }
+        for i in 0..pcx.nodes[program].count {
+            let im = child(program, i, pcx);
+            if pcx.nodes[im].kind != NodeKind::Impl || pcx.nodes[im].a <= 0 {
+                continue;
+            }
+            let name = pcx.nodes[pcx.nodes[im].a].a;
+            var tr = 0;
+            for j in 0..traits.count {
+                if pcx.nodes[traits.data[j]].a == name {
+                    tr = traits.data[j];
+                }
+            }
+            if tr == 0 {
+                continue;
+            }
+            for k in 0..pcx.nodes[im].count {
+                let f = child(im, k, pcx);
+                if pcx.nodes[f].kind != NodeKind::Fn || pcx.nodes[f].c == 0 {
+                    continue;
+                }
+                var decl = 0;
+                for j in 0..pcx.nodes[tr].count {
+                    let d = child(tr, j, pcx);
+                    if pcx.nodes[d].kind == NodeKind::Fn && pcx.nodes[d].a == pcx.nodes[f].a {
+                        decl = d;
+                    }
+                }
+                var any = false;
+                for c in 0..count {
+                    if decl != 0 && pcx.clause_owner.data[c] == decl {
+                        any = true;
+                    }
+                }
+                if !any {
+                    continue;
+                }
+                for c in 0..count {
+                    if pcx.clause_owner.data[c] != decl {
+                        continue;
+                    }
+                    let cond = clone_node(pcx.clause_cond.data[c], &pcx);
+                    let params = if pcx.nodes[decl].count < pcx.nodes[f].count {
+                        pcx.nodes[decl].count
+                    } else {
+                        pcx.nodes[f].count
+                    };
+                    for p in 0..params {
+                        let from = pcx.nodes[child(decl, p, pcx)].a;
+                        let to = pcx.nodes[child(f, p, pcx)].a;
+                        if from != to {
+                            rename_idents(cond, from, to, &pcx);
+                        }
+                    }
+                    pcx.clause_owner.push(f);
+                    pcx.clause_kind.push(pcx.clause_kind.data[c]);
+                    pcx.clause_cond.push(cond);
+                    pcx.clause_message.push(pcx.clause_message.data[c]);
+                    pcx.clause_pos.push(pcx.clause_pos.data[c]);
+                }
+                // (then the impl's own, after the trait's)
+                for c in 0..count {
+                    if pcx.clause_owner.data[c] != f {
+                        continue;
+                    }
+                    pcx.clause_owner.data[c] = -1;
+                    pcx.clause_owner.push(f);
+                    pcx.clause_kind.push(pcx.clause_kind.data[c]);
+                    pcx.clause_cond.push(pcx.clause_cond.data[c]);
+                    pcx.clause_message.push(pcx.clause_message.data[c]);
+                    pcx.clause_pos.push(pcx.clause_pos.data[c]);
+                }
+            }
+        }
+    }
+}
+
 // The clauses expanded, before the names are collected (check_program).
 pub fn expand_contracts(kcx: inout ContractsCx, pcx: inout Ctx<Comp>) {
     unsafe {
@@ -189,6 +330,7 @@ pub fn expand_contracts(kcx: inout ContractsCx, pcx: inout Ctx<Comp>) {
             return;
         }
         words(&kcx, &pcx);
+        copy_trait_clauses(&pcx);
         // (the conditions' purity is checked on the inferred effects)
         pcx.effects_wanted = true;
         let program = pcx.program;

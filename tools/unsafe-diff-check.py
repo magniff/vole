@@ -49,7 +49,11 @@ def git(*args):
 
 
 def code_part(line):
-    """The line without a // comment or string literals (roughly)."""
+    """The line without a // comment or string literals (roughly); nothing
+    for an effect declaration, `#[effects(.., unsafe)]`, which names the
+    effect and is no unsafe site."""
+    if re.match(r'\s*#\[effects\(', line):
+        return ""
     line = re.sub(r'"(\\.|[^"\\])*"', '""', line)
     return line.split("//", 1)[0]
 

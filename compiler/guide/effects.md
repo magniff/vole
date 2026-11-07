@@ -11,13 +11,13 @@ them:
 |---|---|
 | `alloc(Gpa)`, `alloc(Arena)`, `alloc(extern)` | allocating from that allocator type (`extern`: C's malloc) |
 | `io` | a C function that reads or writes: `write`, `read`, stdio |
-| `global` | reading or writing a `static var`, taking its address |
+| `static` | reading or writing a `static var`, taking its address (not shown in a set: `--why static`; `global` its old name, an alias) |
 | `panic` | a checked index or slice, `unwrap`, `as E`, std's panic, an `assert` (but `assert(true)`), a requires (in the caller), an ensures |
 | `diverge` | `while`, `loop`, recursion: it may not return (a counted `for` returns) |
 | `unsafe` | unsafe operations in its own body (not its callers') |
 
 A set is written in that order, `none` for the empty one. Allocation is
-explicit (`guide allocators`), so `alloc(Gpa)` without `global` means
+explicit (`guide allocators`), so `alloc(Gpa)` without `static` means
 "from a Gpa it was given". Running out of memory is `alloc`, not `panic`.
 
 ## Asking
@@ -40,7 +40,7 @@ A declaration is an upper bound the compiler checks against the
 inferred set; callers still see the inferred one, which may be smaller.
 
 ```vole
-#[pure]                                   // no alloc, io or global
+#[pure]                                   // no alloc, io or static
 fn mid(a: i64, b: i64) -> i64 { a + (b - a) / 2 }
 
 #[no_alloc]
@@ -61,7 +61,7 @@ fn main() -> i32 {
 9
 ```
 
-- `#[pure]`: no `alloc`, `io`, `global` (it may panic, loop and write
+- `#[pure]`: no `alloc`, `io`, `static` (it may panic, loop and write
   through its `inout` parameters: they are in the signature, the call
   marks them `&x`); `#[no_alloc]`, `#[no_io]`,
   `#[no_panic]` forbid one; `#[effects(...)]` lists what is allowed,

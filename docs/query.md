@@ -567,8 +567,9 @@ $ volec query callees main --writes TABLE
 
 `effects NAME...` prints the effect set the front end inferred for each
 function NAME names (docs/design/effects-allocation.md §2.1; `guide
-effects`): `PATH \t SET`, the set written `alloc(Gpa, Arena) io global
-panic diverge unsafe` (that order; `alloc` alone for any allocator,
+effects`): `PATH \t SET`, the set written `alloc(Gpa, Arena) io
+panic diverge unsafe` (that order; `static` is left out, `--why
+static` shows it; `alloc` alone for any allocator,
 `alloc(extern)` for C's; `none` for the empty set; ` (unknown)` after a
 set the front end could not infer, a body that failed to check). A
 generic function's line is each of its instances' (`apply<closure(i64)

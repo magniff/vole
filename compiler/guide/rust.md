@@ -167,7 +167,7 @@ too big: 500
 | `for x in v.iter_mut() { *x += 1 }` | `for i in 0..v.len() { v[i] += 1; }` |
 | `.map()`, `.filter()`, `.sum()`, `.collect()` | the same (0.14); `collect_in(gpa)` makes a `Vec` only (`guide iterators`) |
 | `\|x\| x + 1`, `move \|\|` | `\|x\| x + 1`, `sink \|\|` (takes what it captures); a `var` is captured inout, the rest by let access or copy (`guide closures`) |
-| `impl Fn(i64) -> i64`, `Box<dyn Fn>` | a generic parameter `F: Fn(i64) -> i64`; none as a result |
+| `impl Fn(i64) -> i64`, `Box<dyn Fn>` | a generic parameter `F: Fn(i64) -> i64`; as a result, `-> impl Fn(i64) -> i64` in the rust edition (0.27.2.1) |
 | `(0..n).rev()` | the same (0.18.1) |
 | `.step_by(2)` | `while` with `i += 2` |
 | `sort()`, `sort_by(\|a, b\| ...)` | `std::sort(s)` (`T: Ord`; not stable); `v.sort_by(\|a, b\| b.cmp(a))` (0.14; `a`, `b`: let `T`) |

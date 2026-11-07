@@ -621,8 +621,59 @@ parameter type and of the return type, walked structurally: `&'a τ` and
 `&'a mut τ` imply `'b ⊒ 'a` for every `'b ∈ slots(τ)`; a view `[τ]`
 with slot `'v` likewise; `S<'a.., τ..>` implies `S`'s own declared
 bounds instantiated (`Scope<'scope, 'env: 'scope>` gives `'env ⊒
-'scope`) and recurses into `τ`. Values: `val('u) = Pts ∪ {end('v) |
+'scope`) and its inferred requirements (D4.6), and recurses into `τ`. Values: `val('u) = Pts ∪ {end('v) |
 'u ⊒ 'v}`; in particular `val('static) = Pts ∪ Ends`.
+
+**D4.6 (implied bounds, as rustc's well-formedness; 0.27.2.1).** D4.5's
+walk is completed by four readings, each rustc's (a type in a signature
+or an impl header is assumed well-formed, so what its well-formedness
+needs is assumed in the body and required of the caller at the call,
+D3.6).
+- (a) *A declaration's inferred outlives requirements* (rustc's RFC
+  2093). For a struct or enum `S<'a₁.., T₁..>`, `Req(S)` is the least
+  set of `x: 'b` (`x` one of its lifetimes or type parameters, `'b` one
+  of its lifetimes or `'static`) read from its fields' types, each
+  walked under an enclosing lifetime `'r` (none at a field's top):
+  `&'b τ`, `&'b mut τ`, a view `[τ]` or `str` with lifetime `'b` give
+  `'b: 'r` and walk `τ` under `'b`; a type parameter `T` gives `T: 'r`;
+  a raw pointer, an array, a tuple walk their parts under `'r`; a
+  struct or enum `U<'c.., σ..>` gives `'c: 'r` for each `'c`, walks
+  each `σ` under `'r`, and adds `Req(U)` instantiated (`'x: 'y` of
+  `U`'s as the lifetimes written for them; `T: 'y` of `U`'s as the `σ`
+  written for `T` walked under the `'y` written). Not read: projections
+  (rustc's `<U as Tr>::A: 'a`), `fn` pointers. (`struct Iter<'a, T> {
+  v: &'a [T] }` has `T: 'a`; `PhantomData<&'a T>` gives the same.)
+  Wherever `S<..>` appears in a parameter or result type, `Req(S)`
+  instantiated joins `⊒`: `T: 'b` as `'s ⊒ 'b` for every `'s ∈
+  slots(τ_T)`, with `τ_T` the type at `T`'s position.
+- (b) *The impl header's lifetimes.* An elided lifetime in an impl's
+  self type (`impl Ord for str`, `impl<T> Tr for &[T]`) is a lifetime
+  parameter of the impl (rustc's `impl<'_>`): every `Self` of a
+  method's signature names the same universal for it (slot `j` of
+  `Self` is the universal of `Self`'s slot `j`), not a fresh elided one
+  per occurrence (E1), and it is not an input of E2. `&self` (`&mut
+  self`) on an impl for a view `[T]` or `str` is the view whose region
+  is the reference's, its element read as the header writes it (T's
+  slots, D4.4), so `&'s [T]` gives `'t ⊒ 's` for T's slots as written.
+- (c) *`Self` of a trait's default method* is a type parameter: its
+  slots are its substitution's (D4.4), the same at every occurrence.
+- (d) *A bound's equalities.* A bound `P: Tr<A = X>` says `P::A` is
+  `X`: each slot of `P::A` normalized (D4.4's projection reading, in
+  `P`'s slots) and the same slot of `X` are one region (`⊒` both ways);
+  `Extend<T>::extend<I: IntoIterator<Item = T>>` pushes an `I::Item`
+  where a `T` is required. A bound's trait arguments `P: Tr<X₁..>`,
+  when one impl of `Tr` is for `P`'s substitution (`impl<T, A>
+  FromIteratorIn<T, A> for Vec<T, A>`), say each `Xᵢ` is that impl's
+  argument `i`, read in `P`'s slots through the impl's header: the same
+  equality. A projection is normalized by the direct impl for its base
+  (D4.4), or else by a blanket impl `impl<I: ..> Tr for I` when it is
+  the one impl that defines the name (`U::IntoIter` of an iterator `U`
+  is `U`, its slots `U`'s).
+- (e) *A substitution is well-formed.* In an instance, the type `τ`
+  substituted for a type parameter `T` is assumed well-formed, as the
+  caller checked it: D4.5's walk of `τ` alone (`&'m mut Copied<Iter<'x,
+  i64>>` gives `'x ⊒ 'm`) and the requirements of its declarations
+  ((a)) join `⊒`, each slot the universal of `T`'s slot (D4.4).
 
 ## 5. Variance (S5)
 
@@ -774,6 +825,13 @@ receiver; ir271 confirms), and the implicit reborrow of a `&mut` local
 at an argument position once the builder emits it (D3.6, ir271 M2).
 Explicit `&mut x` arguments are not two-phase (rustc rejects
 `f(&mut v, v.len())`).
+(0.27.2.1) The writer of std2's `write(w, "..", args)` and `writeln`
+(Rust's `write!(w, ..)`, which is `w.write_fmt(format_args!(..))`, an
+autoref'd receiver) is one too: when `w` is a `&mut` place, the
+desugaring's receiver binding `__r` is the two-phase reborrow `__r =
+&'r mut2 *w`, not a move of `w`, so the arguments read `w` in its
+reservation window (`write(f, "{}", f.width())`) and `w` is usable after
+the call, as rustc's.
 
 ## 8. Moves and initialization (S8)
 
@@ -853,6 +911,42 @@ either, dropck (§9) is the rule: `let x = 1; let d = D { r: &x };` with
 `impl Drop for D` is accepted when `x` outlives `d`'s drop and
 `borrowck.dropped_borrowed` when it does not. R2 is closed with std2
 (every type declares its regions).
+
+**D8.5 (`for`'s sequence; 0.27.2.1).** In the rust edition `for p in e`
+is `IntoIterator::into_iter(e)` (F22.1): when `e` is a place, the loop's
+sequence local takes it by an `OK_MOVE` (M1 applies to `e` after the
+loop, rustc E0382) and owns it; `into_iter` moves it on into the
+iterator, which drops what it holds; `e` is not dropped again. The exception is the counted
+loop over an array value (F22.1's plain elements, which reads each
+element in place by its index): its sequence is a borrowed copy, as in
+MVS. MVS's `for` over a place is a borrowed copy (unchanged).
+The same holds for an arithmetic operator's operands (F26: `a + b` is
+`Add::add(a, b)`, its desugaring's `let =+l = a; let =+r = b;`): each
+binding takes its place by an `OK_MOVE`, so `a` and `b` are moved by
+`a + b` (E0382 after it) and dropped once, by `add`; a compound `a +=
+b` moves `b` into `add_assign(&mut a, b)`. A comparison's operands
+(`==l`, `==r`: `PartialEq::eq(&a, &b)`) stay borrowed copies.
+A statement's operands are read in order (rustc's evaluation order):
+an operand that reads or moves a place an earlier operand of the same
+statement moved, the same place, a part of it or a place it is part of,
+is M1's `borrowck.use_moved` (E0382), as if the move were its own
+statement: `(t, t)`, `[t, t]`, `S { a: t, b: t }`, `(t, t.n)` and, for a
+non-Copy `t.n`, `(t.n, t)` (t partially moved) are errors; `(t.n, t)`
+for a Copy `t.n` (a copy, then the move) and `(t.a, t.b)` (disjoint
+parts) are not.
+
+**D8.6 (moves out of an index; 0.27.2.1).** In a rust body an index
+`a[k]` of an array or slice whose element type is not `Copy` is a place
+with no move path even for a constant `k` (rustc indexes through a
+temporary): an `OK_MOVE` of it is M3's `borrowck.move_out`, rustc E0508
+("cannot move out of a non-copy array/slice"), the message naming an
+element of an array or a slice; through `Vec`'s `index` it is E0507 as
+before. What stays allowed: a move of the whole array; a borrow of an
+element (`&a[0]`, `&mut a[i]`); a read of a `Copy` part (`a[0].v`); a
+constant index of a `Copy` element, which keeps its path (R7, D1.5).
+A by-value `for x in a` over an array of non-`Copy` elements stays
+F22.1's by-reference reading until std2 has an array `IntoIter` (one
+that drops what a `break` leaves): an index loop cannot move them out.
 
 ## 9. Drops and dropck (S9)
 
@@ -1154,6 +1248,25 @@ outside the holes named below.
   signature relates at most these regions); ends with `for<'a>` `fn`
   types (0.29). Case `rust_b_err_fn_value_arg_flow_strict`
   (`// RUSTC: accepts L13`).
+- L14 (0.27.2.1) An instance's type argument whose trait impl has an
+  equality bound is not read with it (D4.6 (d) reads the bounds of the
+  function's own parameters only): in `Copied<Chain<Iter<'x, T>,
+  Iter<'y, T>>>::next`, `'x` and `'y` are one region only by Chain's
+  `impl<A: Iterator, B: Iterator<Item = A::Item>> Iterator`, so the call
+  of Chain's `next`, whose instance ties them, is
+  `borrowck.outlives` in Copied's body; rustc checks the generic body,
+  where no such pair of regions exists. Sound (stricter). It closes when
+  a substitution's impl bounds join `⊒` (the impl's own D4.6 (d) for
+  the impl chosen for each type argument). std2's cases:
+  `std2_iter_iterator_chain`, `std2_iter_adapters_chain`,
+  `std2_iter_adapters_chain_impl_doubleendediterator`. The same class
+  with an `Fn*` bound: `Vec::extend<I = Map<Iter<'x, i64>, C>>`'s `for
+  x in iter` calls `Map`'s `next`, whose instance ties `C`'s X_C slots
+  to `I::Item`'s (D19.10 (4), from `impl<B, I: Iterator, F: FnMut(I::Item)
+  -> B> Iterator for Map<I, F>`), while in `extend` the two are slots
+  of one substitution with nothing between them; rustc's closure
+  signature is higher-ranked there (`for<'p> FnMut(&'p i64)`). Cases:
+  `std2_iter_adapters_map`, `_inspect`, `_map_while`, `_scan`.
 
 ## 12. The MVS std boundary (S12, 0.27.1 only)
 
@@ -1689,9 +1802,8 @@ of a frame-owned place is `borrowck.return_local` (D6.2.2: the
 returned value's slots carry `end('u)`); storing it in a longer-lived
 place is `borrowck.dropped_borrowed` at the captured local's
 `StorageDead` (D2.5); a `move` closure of owned values escapes freely.
-Until §21, a closure leaves a function only as a value of a generic
-parameter's type; `-> impl Fn*(..)` is `edition.later:
-impl_trait_return (0.27.2.1)`.
+A closure leaves a function as a value of a generic parameter's type,
+or (0.27.2.1, §21) by `-> impl Fn*(..)`.
 
 **D19.9 (drops).** `dropck(C) = ⋃ dropck(τₖ)` over the `val` captures
 (D9.1), mapped into `C`'s slots; a `ref`/`mut` field and `X_C`
@@ -1844,6 +1956,113 @@ follows from `'cₖ`'s by the field's implied bound.) `Scope::spawn`'s `F:
 ## 21–22. `impl Trait` in return position; the opaque instance (0.27.2.1)
 
 Appended with 0.27.2.1 (D21, D22; L10–L12 are reserved for them).
+
+### §21 `impl Trait` in return position
+
+**D21.1 (the opaque type).** `fn f<P..>(..) -> impl Tr₁ + .. + Trₘ`, a free
+function or an inherent method of a rust-edition file with the `impl` at the
+top of its result (L10), declares `O_f`, a nominal type per function and per
+instance: `front/opaque.vl`, a distinct type whose underlying type is the
+hidden type `H_f` once `f`'s body is checked. `slots(O_f) = slots(H_f)`;
+`needs_drop(O_f) = needs_drop(H_f)`; the code generators see `H_f`
+(distinct types are erased). A trait method's `-> impl Tr`, `Option<impl
+Tr>` and an `impl Tr` anywhere else are `edition.later: impl_trait_nested
+(0.29)`.
+
+**D21.2 (the hidden type and the member choice).** `H_f` is the type of
+the first value that leaves `f` (a `return`'s, else the tail's); every
+other must be `H_f` (`opaque.mismatch`, E0308), and `H_f` satisfies every
+bound (E0277). A closure value takes its parameter types from an `Fn*`
+bound (D20.3). Regions: each slot `e` of the result is a universal `'oₑ`
+(`U_OPAQUE`) that every input universal of `f` outlives (D21.3's capture
+of them all), the slots related among themselves (one region to the
+universals' order). After the solve, the *reaching* inputs of `'oₑ` are
+the input universals `'v` with a path `'v : .. : 'oₑ` of the body's
+constraints (a loan of `'v` flows into the slot); they must all outlive one
+member, an input universal or `'static`, which `'oₑ` is. No member is
+`opaque.ambiguous` (rustc E0700: `if c { x } else { y }` of `x: &'a T, y:
+&'b T` into one slot); a frame-local loan reaching the result is
+`borrowck.return_local`. Each slot chooses alone: a closure capturing `x:
+&'a` and `y: &'b` into two slots is accepted, as rustc does. (This replaces
+the plan's `low('r)` reading, which made `fn f<'a, 'b>(x: &'a T, y: &'b T)
+-> impl Tr { x }` ambiguous where rustc accepts it.)
+
+**D21.3 (the caller side).** At a call the result's slots are the call
+regions of the `'oₑ`, which every argument's call region outlives: a loan
+in any argument stays live while the result is (Rust 2024's capture
+rule). The caller never sees `H_f`: `O_f`'s methods are its bounds' and
+their supertraits' (F2.2) and the blanket impls' its bounds entail
+(`impl<I: Iterator> IntoIterator for I`); another is E0599; `O_f`
+implements the bounds' traits and no other; `O_f: Copy` only if `Copy` is
+a bound; `O_f` converts to nothing (`let x: H = f()` is E0308). Auto
+traits leak: `O_f: Send` iff `H_f: Send` (AT4). A method or a call of
+`O_f` is `H_f`'s; a caller checked before `f`'s body has it checked first
+(`check::check_nested`).
+
+**D21.4 (restrictions).** `f`'s hidden type is `O_f` itself, or `f`'s
+body needs `H_f` while it is being found (a recursive call's method): 
+`opaque.cycle` (E0720). No `use<..>`: every input lifetime is captured.
+`-> impl Fn*(A..) -> R` is the returned-closure case (D19.8).
+
+- **L10** (0.27.2.1) One opaque type per function, at the top of its
+  result; the hidden type's associated types are seen by the caller
+  (`Iterator<Item = X>`'s `next` gives `H_f`'s item type, which the bound
+  equates; with a bare `Iterator` bound rustc keeps it opaque).
+
+### §22 The opaque type-parameter instance
+
+**D22.1 (Ω).** For a template `g<T₁..Tₙ>` with a body, of a rust-edition
+program's own files, the *opaque instance* `g⟨Ω₁..Ωₙ⟩` substitutes for
+each `Tᵢ` a synthesized nominal type `Ωᵢ` (`front/opaque.vl`: a distinct
+type over `()`, its node a copy of `Tᵢ`'s with its bounds `Bᵢ`, named
+`Tᵢ` in messages). `slots(Ωᵢ) = []`; `needs_drop(Ωᵢ) = false`; `Ωᵢ:
+Copy` iff `Copy ∈ Bᵢ`; `Ωᵢ: Tr` iff a bound entails `Tr` (its
+supertraits, F2.2); `Ωᵢ: Send/Sync` iff declared (AT5); its `Fn*` bound
+is its only callable signature. An impl's method's template has the
+impl's parameters among its own and gets theirs too.
+
+**D22.1a (virtual calls).** In the opaque instance `x.m(..)` with `x:
+Ωᵢ` (or `&Ωᵢ`, `&mut Ωᵢ`), `Ωᵢ::m(..)` and `Tr::m(x, ..)`, with `m`
+declared by a trait `Tr` a bound of `Ωᵢ` entails, call the *virtual
+function* `Tr::m⟨Self := Ωᵢ⟩`: a function made once per (Tr, m, Ωᵢ)
+from the trait's declaration of `m`, its signature resolved with `Self
+= Ωᵢ` and the trait's parameters from the bound (`Tr<A>`: `A`); it has
+no body, is never checked as one and never lowered; the borrow checker
+reads its signature as any callee's (D4.1). A call of `x(..)` with an
+`Fn*(A..) -> R` bound is a virtual call of that signature. `Ωᵢ::Item`
+(`<Ωᵢ as Tr>::Item`) is the bound's equality when it has one
+(`Iterator<Item = X>`: `X`), else a fresh `Ω'` with the declaration's
+bounds (F11.2).
+
+**D22.2 (what runs on it).** The opaque instances are built after the
+concrete ones and type-checked and borrow-checked; they, and every
+instance with an Ω among its type arguments (or a virtual function's,
+its `Self` an Ω) and the closures in them, are left out of code
+generation (finish_program) and effects; an instance without one that
+their checking makes first (`println::<&str>`) is lowered as any. An
+instance of a std template with an Ω is type-checked only: std's bodies
+are borrow-checked as std's (Z7). An error in one is reported at the
+template's position, without an instance note, and not when an error
+is already reported at that position (a concrete instance's: D4.4's
+dedupe). std2's templates get theirs under `--std2-check` only (the
+`std2-check` row), as their bodies' borrow checking is (Z7).
+
+In 0.27.2.1 the type check reports only D22.3's error, and only for a
+parameter's own Ω in a template without a `where` predicate; every
+other type error in an opaque instance leaves it out, unreported and
+not counted, as it may be the model's gap and not the program's:
+operators on an Ω (`a + b` with `T: Add<Output = T>`, `==` with
+`PartialEq`), a bound's type arguments (`T: AsRef<str>`), `T::f()` and
+`T::CONST`, `where` predicates on projections (`X::Item: Show`). The
+borrow checker's errors are reported in full. Each gap closes in
+0.27.3 (front-rust.md FL11).
+
+**D22.3 (the bound-only rule)** is front-rust.md §6's: it is what the
+opaque instance checks for every template, used or not; the concrete
+instances keep their own checks (D22.4: the two agree).
+
+`--emit-places=regions` prints `opaque: N templates` (the instances
+built).
 
 ## 23. std2 as the edition's std: the IR's rules (Z7–Z9)
 

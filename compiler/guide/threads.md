@@ -61,7 +61,7 @@ or use a Mutex or an atomic; two threads cannot yet each write their own
 part of one slice, there is no `split_at_mut`). Neither the scope nor a
 scoped thread's handle leaves `thread::scope` (`sync.scope_escape`): join
 inside and return the results. No thread may reach a `static var` (`sync.global`; `query
-effects FILE:LINE --why global` shows the chain); printing is fine.
+effects FILE:LINE --why static` shows the chain); printing is fine.
 
 ```vole
 use std::thread;
