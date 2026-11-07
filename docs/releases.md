@@ -117,16 +117,20 @@ std2 (std273):
   `current_dir_in(a)`, a `String<A>`, since std2 has no PathBuf yet;
   `set_current_dir`. The target's `environ` is in `std::__sys`.
 - char is PartialEq, Eq, PartialOrd, Ord, Hash and Default; `()` is
-  PartialEq, Eq, PartialOrd and Ord; `[T; N]` is Debug (through
-  `#[array_builtin]`). `&[u8]`'s `read_exact` leaves buf untouched at
+  PartialEq, Eq, PartialOrd and Ord. Through `#[array_builtin]`,
+  `[T; N]` is Clone, PartialEq, Eq, PartialOrd, Ord, Hash and Debug,
+  and `&[T; N]` and `&mut [T; N]` are IntoIterator (`for x in &arr`,
+  `derive(Clone)` on a struct with an array field). An array's Hash
+  waits for FL10, as a slice's does. `&[u8]`'s `read_exact` leaves buf untouched at
   the end, as Rust's does. Fixed std2 bodies: Drain's and Cycle's
   `size_hint`, and Range's `size_hint`, now `A::steps_between`.
-- rewrite.tsv gains 50 rows for the translator: MVS's math functions
+- rewrite.tsv gains 55 rows for the translator: MVS's math functions
   become methods, the unicode code-point tests become char's,
-  `f64_to_bits` becomes `to_bits`, and the env items.
+  `f64_to_bits` becomes `to_bits`, `parse_int` and `parse_f64` become
+  `str::parse`, and the env items.
 - std2's cases at -O0 and -O2 under `--check-alloc`: 1,361 of 1,468
   pass (1,309 of 1,454 in 0.27.2.1, with the other streams' merged
-  fixes counted). There are 14 new cases, each agreeing with rustc (tools/std2-twin.sh), and 9
+  fixes counted). There are 15 new cases, each agreeing with rustc (tools/std2-twin.sh), and 10
   XFAIL cases now pass on std2's fixes. The 107 XFAIL cases left, by
   what they wait for: inference from a later statement or the expected
   type (FL1, 0.27.4) 48; arrays' by-value IntoIterator, which needs
