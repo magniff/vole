@@ -414,6 +414,12 @@ rust-edition position, with these readings:
   type (a parameter's, a `let`'s annotation), `Self` read as the impl's
   self type as written, and `*e` as e's pointee; any other receiver is
   resolved in the instance as before. Case `rust_f_z91c_template_choice`.
+  (0.27.6) The same holds for the path forms: `Clone::clone(&a)`, and
+  `A::clone(&a)` of a bounded parameter A whose bound declares the method
+  with a receiver, which is read as `Clone::clone(&a)`. With `A = &Gpa`
+  all three are `<&Gpa as Clone>::clone` (0.27.5 took Gpa's, "expected
+  &Gpa, got Gpa", or found no `clone` in `&Gpa`). Cases
+  `rust_f_z91c_template_choice_clone` and `_alloc`.
 - *`&'a T` of an unsized argument in a signature* (0.27.5, D4.6). With
   `T = Unsized(v)`, `&'a T` is the view `v` whose region is the
   reference's (`'a`, or the elided one, E2/E3's), with T's slots (the
