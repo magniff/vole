@@ -1,0 +1,253 @@
+// (0.27.3) The translator's struct regions (mod.vl, pass 2b): a struct or
+// enum that holds a view (`[T]`, `str`, a `let T` or `inout T` field, or
+// another such type) is generic over the region of what it views, as Rust
+// writes it: `struct Tok<'a> { text: &'a str }`. Each use of it elsewhere
+// is `Tok<'_>`, the region Rust's elision gives (one reference parameter,
+// `&self`), and `Tok<'static>` for the result of a function that takes no
+// reference. Where elision does not decide (two reference parameters),
+// `'_` stays and the rust check's error names the line, for a hand fix.
+
+use crate::base::{IntVec, SRC, sym_text};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::ast::{NodeKind, child};
+use crate::tools::translate::{TC_VIEW, Tr, editable, ident_char, own_node, put, skip_ws, word_here};
+
+// The type nodes of item n's fields: a struct's, a variant's.
+fn field_types(n: i64, out: inout IntVec, pcx: Ctx<Comp>) {
+    out.count = 0;
+    for i in 0..pcx.nodes[n].count {
+        let f = child(n, i, pcx);
+        let k = pcx.nodes[f].kind;
+        if k == NodeKind::Field && pcx.nodes[f].b > 0 {
+            out.push(pcx.nodes[f].b);
+        } else if k == NodeKind::Variant {
+            for j in 0..pcx.nodes[f].count {
+                let t = child(f, j, pcx);
+                if pcx.nodes[t].kind == NodeKind::Field {
+                    if pcx.nodes[t].b > 0 {
+                        out.push(pcx.nodes[t].b);
+                    }
+                } else {
+                    out.push(t);
+                }
+            }
+        }
+    }
+}
+
+// Whether type node t is written as its name (not a node the checker or a
+// derive made at another place).
+fn written_type(t: i64, pcx: Ctx<Comp>) -> bool {
+    let a = pcx.nodes[t].a;
+    a > 0 && word_here(pcx.nodes[t].start, sym_text(a, pcx))
+}
+
+// What type node t is as a view: 1 `[T]`, 2 `str`, 3 `let T`, 4 `inout T`,
+// 5 a type that holds one, 0 none.
+fn view_kind(t: i64, tr: Tr, pcx: Ctx<Comp>) -> i64 {
+    let k = pcx.nodes[t].kind;
+    let s = pcx.nodes[t].start;
+    if k == NodeKind::TySlice && SRC[s] == '[' && (s == 0 || SRC[s - 1] != '*') {
+        return 1;
+    }
+    if k == NodeKind::TyName && word_here(s, "str") && pcx.nodes[t].end == s + 3 {
+        return 2;
+    }
+    if k == NodeKind::TyPtr && word_here(s, "let") {
+        return 3;
+    }
+    if k == NodeKind::TyPtr && word_here(s, "inout") {
+        return 4;
+    }
+    if k == NodeKind::TyName && tr.view_items.get(pcx.nodes[t].a + 1) != 0 && written_type(t, pcx) {
+        return 5;
+    }
+    0
+}
+
+// The written type nodes of the program, in position order.
+fn type_nodes(out: inout IntVec, tr: Tr, pcx: inout Ctx<Comp>) {
+    for n in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[n].kind;
+        if (k == NodeKind::TySlice || k == NodeKind::TyName || k == NodeKind::TyPtr)
+            && own_node(n, tr, &pcx) {
+            out.push(n);
+        }
+    }
+}
+
+// The type nodes inside [a, b).
+fn inside(a: i64, b: i64, types: IntVec, out: inout IntVec, pcx: Ctx<Comp>) {
+    out.count = 0;
+    for i in 0..types.count {
+        let t = types.get(i);
+        if a <= pcx.nodes[t].start && pcx.nodes[t].start < b {
+            out.push(t);
+        }
+    }
+}
+
+// The items that hold a view (Tr.view_items: name + 1 -> item node), to a
+// fixpoint (a struct holding a Tok holds a view).
+pub fn find_view_items(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    var items = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for n in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[n].kind;
+        if (k == NodeKind::Struct || k == NodeKind::Enum) && own_node(n, tr, &pcx) {
+            items.push(n);
+        }
+    }
+    var types = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    type_nodes(&types, tr, &pcx);
+    var fields = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    var within = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    var changed = true;
+    while changed {
+        changed = false;
+        for i in 0..items.count {
+            let n = items.get(i);
+            let name = pcx.nodes[n].a;
+            if tr.view_items.get(name + 1) != 0 {
+                continue;
+            }
+            field_types(n, &fields, pcx);
+            var holds = false;
+            for j in 0..fields.count {
+                let f = fields.get(j);
+                inside(pcx.nodes[f].start, pcx.nodes[f].end, types, &within, pcx);
+                for q in 0..within.count {
+                    if view_kind(within.get(q), tr, pcx) != 0 {
+                        holds = true;
+                    }
+                }
+            }
+            if holds {
+                tr.view_items.put(name + 1, n);
+                changed = true;
+            }
+        }
+    }
+}
+
+// `'r` given to type node t (a TyName): `T<'r>`, or `'r, ` first in its
+// arguments.
+fn give_region(t: i64, region: [u8], tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let g = pcx.nodes[t].g;
+    let text = crate::base::buf_new();
+    if g > 0 && SRC[pcx.nodes[g].start] == '<' {
+        crate::base::buf_bytes(text, region);
+        crate::base::buf_bytes(text, ", ");
+        let at = pcx.nodes[g].start + 1;
+        put(at, at, crate::base::buf_slice(text), TC_VIEW, &tr, &pcx);
+    } else {
+        crate::base::buf_bytes(text, "<");
+        crate::base::buf_bytes(text, region);
+        crate::base::buf_bytes(text, ">");
+        var e = pcx.nodes[t].start;
+        while e < pcx.nodes[t].end && (ident_char(SRC[e]) || SRC[e] == ':') {
+            e += 1;
+        }
+        put(e, e, crate::base::buf_slice(text), TC_VIEW, &tr, &pcx);
+    }
+}
+
+// A view type node t inside a view item's field: `&'a [T]`, `&'a str`,
+// `&'a T`, `&'a mut T`, `Tok<'a>`.
+fn field_view(t: i64, kind: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let s = pcx.nodes[t].start;
+    if kind == 1 {
+        let e = pcx.nodes[t].a;
+        if tr.text_mode && e > 0 && pcx.nodes[e].kind == NodeKind::TyName
+            && SRC[pcx.nodes[e].start..pcx.nodes[e].end] == "u8" {
+            put(s, pcx.nodes[t].end, "&'a str", TC_VIEW, &tr, &pcx);
+            tr.typed.put(e + 1, 1);
+        } else {
+            put(s, s, "&'a ", TC_VIEW, &tr, &pcx);
+        }
+    } else if kind == 2 {
+        put(s, s, "&'a ", TC_VIEW, &tr, &pcx);
+    } else if kind == 3 {
+        put(s, skip_ws(s + 3), "&'a ", TC_VIEW, &tr, &pcx);
+    } else if kind == 4 {
+        put(s, skip_ws(s + 5), "&'a mut ", TC_VIEW, &tr, &pcx);
+    } else if kind == 5 {
+        give_region(t, "'a", &tr, &pcx);
+    }
+    tr.typed.put(t + 1, 1);
+}
+
+pub fn region_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    if tr.view_items.count == 0 {
+        return;
+    }
+    var types = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    type_nodes(&types, tr, &pcx);
+    var fields = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    var within = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    // (the spans of the view items' fields: their types are the item's)
+    var spans = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for n in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[n].kind;
+        if k != NodeKind::Struct && k != NodeKind::Enum || !own_node(n, tr, &pcx)
+            || tr.view_items.get(pcx.nodes[n].a + 1) != n {
+            continue;
+        }
+        // (the item's header: `struct Tok<'a>`, `enum E<'a, T>`)
+        let g = pcx.nodes[n].g;
+        if g > 0 && SRC[pcx.nodes[g].start] == '<' {
+            let at = pcx.nodes[g].start + 1;
+            put(at, at, "'a, ", TC_VIEW, &tr, &pcx);
+        } else {
+            var q = pcx.nodes[n].start;
+            let kw = if k == NodeKind::Struct { "struct" } else { "enum" };
+            while q < pcx.nodes[n].end && !word_here(q, kw) {
+                q += 1;
+            }
+            q = skip_ws(q + kw.len as i64);
+            while q < pcx.nodes[n].end && ident_char(SRC[q]) {
+                q += 1;
+            }
+            put(q, q, "<'a>", TC_VIEW, &tr, &pcx);
+        }
+        field_types(n, &fields, pcx);
+        for j in 0..fields.count {
+            let f = fields.get(j);
+            spans.push(pcx.nodes[f].start);
+            spans.push(pcx.nodes[f].end);
+            inside(pcx.nodes[f].start, pcx.nodes[f].end, types, &within, pcx);
+            for q in 0..within.count {
+                let t = within.get(q);
+                let vk = view_kind(t, tr, pcx);
+                if vk != 0 {
+                    field_view(t, vk, &tr, &pcx);
+                }
+            }
+        }
+    }
+    // (every other use: `Tok<'_>`, a result of no reference `Tok<'static>`)
+    for i in 0..types.count {
+        let t = types.get(i);
+        if pcx.nodes[t].kind != NodeKind::TyName || view_kind(t, tr, pcx) != 5
+            || !editable(pcx.nodes[t].start, &pcx) {
+            continue;
+        }
+        let s = pcx.nodes[t].start;
+        var in_item = false;
+        var q: i64 = 0;
+        while q + 1 < spans.count && !in_item {
+            in_item = spans.get(q) <= s && s < spans.get(q + 1);
+            q += 2;
+        }
+        if in_item {
+            continue;
+        }
+        give_region(t, if tr.static_res.get(t + 1) != 0 { "'static" } else { "'_" }, &tr, &pcx);
+    }
+}
+
+// Whether type node t names an item that holds a view (a parameter of
+// it carries a region: sig.vl's elision).
+pub fn names_view_item(t: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
+    pcx.nodes[t].kind == NodeKind::TyName && tr.view_items.get(pcx.nodes[t].a + 1) != 0
+}

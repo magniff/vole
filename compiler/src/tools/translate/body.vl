@@ -279,6 +279,49 @@ fn edit_view(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     put(s, s, if mut_slice(t, pcx) { "&mut " } else { "&" }, TC_VIEW, &tr, &pcx);
 }
 
+// A raw pointer's part, `p[a..b]` (MVS slices a `*T`), is
+// `std::slice::from_raw_parts(p.add(a), b - a)` (`_mut` for an inout one,
+// `&p[a..b]`, whose `&` it replaces); whether it was rewritten.
+fn edit_ptr_slice(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) -> bool {
+    let a = pcx.nodes[n].a;
+    let r = pcx.nodes[n].b;
+    if a <= 0 || r <= 0 || pcx.nodes[r].kind != NodeKind::Range
+        || token_at(pcx.nodes[n].start, pcx) < 0 {
+        return false;
+    }
+    let t = pcx.nodes[a].ty;
+    if t <= 0 || pcx.types[t].kind != TyKind::Ptr || pcx.types[t].b != 0 {
+        return false;
+    }
+    let lo = pcx.nodes[r].a;
+    let hi = pcx.nodes[r].b;
+    if hi <= 0 {
+        return false;
+    }
+    var s = pcx.nodes[n].start;
+    var q = s - 1;
+    while q > 0 && is_ws(SRC[q]) {
+        q -= 1;
+    }
+    let lent = SRC[q] == '&';
+    if lent {
+        s = q;
+    }
+    let text = crate::base::buf_new();
+    crate::base::buf_bytes(text, if lent { "std::slice::from_raw_parts_mut(" }
+        else { "std::slice::from_raw_parts(" });
+    crate::base::buf_bytes(text, SRC[pcx.nodes[a].start..pcx.nodes[a].end]);
+    let lo_text = if lo > 0 { SRC[pcx.nodes[lo].start..pcx.nodes[lo].end] } else { "0" };
+    crate::base::buf_bytes(text, ".add((");
+    crate::base::buf_bytes(text, lo_text);
+    crate::base::buf_bytes(text, ") as usize), (");
+    crate::base::buf_bytes(text, SRC[pcx.nodes[hi].start..pcx.nodes[hi].end]);
+    crate::base::buf_bytes(text, " - (");
+    crate::base::buf_bytes(text, lo_text);
+    crate::base::buf_bytes(text, ")) as usize)");
+    put(s, pcx.nodes[n].end, crate::base::buf_slice(text), TC_USIZE, &tr, &pcx)
+}
+
 // A raw pointer's element, `p[i]` (MVS indexes a `*T`), is `(*p.add(i))`
 // (rustc E0608: a raw pointer is not indexed), a place as well as a value.
 fn edit_ptr_index(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
@@ -422,7 +465,7 @@ fn edit_static(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
 
 // A text literal MVS types as bytes, `[u8]`, given where the program
 // takes bytes (a parameter, a let's annotation, a result of `[u8]`) is
-// `"..".as_bytes()` (a literal is a str in the rust edition).
+// `b".."` (a literal is a str in the rust edition).
 fn edit_str(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     if tr.text_mode {
         return;
@@ -455,7 +498,19 @@ fn edit_str(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
         let r = if f > 0 { pcx.nodes[f].b } else { 0 };
         bytes = r > 0 && pcx.nodes[r].kind == NodeKind::TySlice;
     }
-    if bytes {
+    if !bytes {
+        return;
+    }
+    // (0.27.3, FL12: `b".."`, a literal of ASCII; else `"..".as_bytes()`)
+    var ascii = true;
+    for q in pcx.nodes[n].start..pcx.nodes[n].end {
+        if SRC[q] >= 128 || SRC[q] == '\\' && q + 1 < pcx.nodes[n].end && SRC[q + 1] == 'u' {
+            ascii = false;
+        }
+    }
+    if ascii {
+        put(pcx.nodes[n].start, pcx.nodes[n].start, "b", TC_BYTES, &tr, &pcx);
+    } else {
         put(pcx.nodes[n].end, pcx.nodes[n].end, ".as_bytes()", TC_BYTES, &tr, &pcx);
     }
 }
@@ -503,6 +558,102 @@ fn edit_int(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     let b = crate::base::buf_new();
     crate::front::types::buf_type(b, t, pcx);
     put(pcx.nodes[n].end, pcx.nodes[n].end, crate::base::buf_slice(b), TC_INT, &tr, &pcx);
+}
+
+// (FL6) An i64 literal at a generic position, which the rust edition
+// would type by its own default or a later use, gets MVS's i64 as a
+// suffix, `1i64`: a value given to a type parameter (`Some(4)`,
+// `fold(0, ..)`, `Vec::from_in([1, 2], a)`), a generic struct's field
+// (`W { x: 7 }`), a range or literal receiver (`(0..n).map(..)`).
+fn edit_int_generic(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    if pcx.nodes[n].b != 0 || pcx.nodes[n].ty != TY_I64 {
+        return;
+    }
+    let k = token_at(pcx.nodes[n].start, pcx);
+    if k < 0 || pcx.toks[k].kind != Tok::Int || pcx.toks[k].end != pcx.nodes[n].end {
+        return;
+    }
+    // (through a sign, an array, a tuple or a range to what takes them)
+    var c = n;
+    var p = parent_of(n, tr);
+    while p > 0 && (pcx.nodes[p].kind == NodeKind::Unary && SRC[pcx.nodes[p].start] == '-'
+        || pcx.nodes[p].kind == NodeKind::Array || pcx.nodes[p].kind == NodeKind::Tuple
+        || pcx.nodes[p].kind == NodeKind::Range) {
+        c = p;
+        p = parent_of(p, tr);
+    }
+    if p <= 0 || !generic_place(c, p, tr, pcx) {
+        return;
+    }
+    put(pcx.nodes[n].end, pcx.nodes[n].end, "i64", TC_INT, &tr, &pcx);
+}
+
+// Whether field `name` of the generic struct type t is declared with one
+// of its type parameters (`struct W<T> { x: T }`: x), which a literal
+// there would fix.
+fn generic_field(t: i64, name: i64, pcx: Ctx<Comp>) -> bool {
+    let si = pcx.types[t].a;
+    if pcx.structs[si].tmpl <= 0 {
+        return false;
+    }
+    let sn = pcx.structs[pcx.structs[si].tmpl - 1].node;
+    let g = if sn > 0 { pcx.nodes[sn].g } else { 0 };
+    if g <= 0 {
+        return false;
+    }
+    for i in 0..pcx.nodes[sn].count {
+        let f = child(sn, i, pcx);
+        if pcx.nodes[f].kind == NodeKind::Field && pcx.nodes[f].a == name && pcx.nodes[f].b > 0 {
+            let ft = pcx.nodes[f].b;
+            for j in 0..pcx.nodes[g].count {
+                if pcx.nodes[ft].kind == NodeKind::TyName
+                    && pcx.nodes[child(g, j, pcx)].a == pcx.nodes[ft].a {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+// Whether c, a part of p, is at a generic position of p.
+fn generic_place(c: i64, p: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
+    let k = pcx.nodes[p].kind;
+    if k == NodeKind::VariantLit {
+        return true;
+    }
+    if k == NodeKind::FieldInit {
+        let s = parent_of(p, tr);
+        let t = if s > 0 { pcx.nodes[s].ty } else { 0 };
+        return t > 0 && pcx.types[t].kind == TyKind::Struct
+            && generic_field(t, pcx.nodes[p].a, pcx);
+    }
+    if k != NodeKind::Call || pcx.nodes[p].a == c {
+        return false;
+    }
+    // (a receiver: `(0..n).map(..)`, `5.max(x)`)
+    if pcx.nodes[p].a == 0 && pcx.nodes[p].count > 0 && child(p, 0, pcx) == c {
+        return true;
+    }
+    let f = pcx.nodes[p].x - 1;
+    if f < 0 {
+        // (a variant's constructor, `Some(4)`)
+        return true;
+    }
+    if f >= pcx.fns.len() as i64 || pcx.fns[f].tmpl <= 0 {
+        return false;
+    }
+    let tn = pcx.fns[pcx.fns[f].tmpl - 1].node;
+    if tn <= 0 {
+        return false;
+    }
+    // (type parameters of its own, or an impl's that no receiver fixes)
+    let g = pcx.nodes[tn].g;
+    let own = if g > 0 { pcx.nodes[g].count - pcx.nodes[g].a } else { 0 };
+    let first = if pcx.nodes[tn].count > 0 { child(tn, 0, pcx) } else { 0 };
+    let receiver = first > 0 && pcx.nodes[first].kind == NodeKind::Param
+        && pcx.nodes[first].a == tr.sym_self;
+    own > 0 || !receiver && g > 0
 }
 
 // ---- Text or bytes ----
@@ -622,15 +773,18 @@ pub fn body_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
             edit_len(n, &tr, &pcx);
             edit_call_args(n, &tr, &pcx);
         } else if k == NodeKind::Index {
-            edit_view(n, &tr, &pcx);
-            edit_index(n, &tr, &pcx);
-            edit_ptr_index(n, &tr, &pcx);
+            if !edit_ptr_slice(n, &tr, &pcx) {
+                edit_view(n, &tr, &pcx);
+                edit_index(n, &tr, &pcx);
+                edit_ptr_index(n, &tr, &pcx);
+            }
         } else if k == NodeKind::Str {
             edit_str(n, &tr, &pcx);
         } else if k == NodeKind::Char {
             edit_char(n, &tr, &pcx);
         } else if k == NodeKind::Int {
             edit_int(n, &tr, &pcx);
+            edit_int_generic(n, &tr, &pcx);
         } else if k == NodeKind::Closure {
             let s = pcx.nodes[n].start;
             if (pcx.nodes[n].p & CONV_NEW) != 0 && word_here(s, "sink") {
