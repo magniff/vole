@@ -94,12 +94,31 @@ The borrow checker (bc2721):
   for `[T]` or `str`; `Self` of a trait's default method as a type
   parameter; a bound's `Item = T` and trait arguments
   (`B: FromIteratorIn<Self::Item, A>`) as equalities; a blanket impl's
-  projection (`U::IntoIter` of an iterator). 28 std2 tests and 3
+  projection (`U::IntoIter` of an iterator); a substitution's own
+  implied bounds (`&'m mut I` gives I's slots `: 'm`). 30 std2 tests and 3
   `rust_t_` cases that failed on `borrowck.outlives` or
   `borrowck.elision` now pass; `tests/std2/check.sh`'s known-gap XFAIL
-  cases with borrowck errors in std2 fall from 45 to 6 (each a front
-  gap: `&mut self` on an impl for a view type reads as `inout [u8]`).
-  10 `rust_b_implied_` cases, each agreeing with rustc.
+  cases with borrowck errors in std2 fall from 45 to 9 (6 a front
+  gap: `&mut self` on an impl for a view type reads as `inout [u8]`;
+  three Chain cases are L14, an impl's equality bound on a type
+  argument). 11 `rust_b_implied_` cases, each agreeing with rustc.
+- `for x in v` over a place moves v in the rust edition (D8.5): the
+  loop's sequence owns it and `into_iter` takes it, where it was a
+  borrowed copy, so v was dropped again after the iterator had freed it
+  (a double free under `--check-alloc` for `for` over a Vec, a HashSet
+  or a generic sequence, `extend`, `into_keys`, `into_values`,
+  `flatten`). 9 cases that failed on it pass.
+- Moves out of an index (D8.6, rustc E0508): an index of a non-Copy array
+  or slice element is a place with no move path, a constant index too,
+  so `let x = a[0]` is `borrowck.move_out`, named as "an element of an
+  array (a slice) whose type is not Copy". A whole-array move, a borrow
+  of an element, a Copy part or a Copy element's constant index stay
+  allowed. By-value `for` over an array of non-Copy elements still
+  reads them by reference (F22.1) until std2 has an array `IntoIter`.
+- `write(w, ..)`'s writer is a two-phase reborrow, as Rust's `write!`
+  receiver (D7.4): `write(f, "{}", f.width())` reads f while the
+  reborrow is reserved, and f is usable after the call, where the
+  desugaring moved f (`borrowck.use_moved`). 6 Formatter cases pass.
 
 ### What's new in 0.27.2
 
