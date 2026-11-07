@@ -156,6 +156,12 @@ The front (front273):
 - A `&mut self` method of str on a String's index borrows it through
   IndexMut (`s[1..].make_ascii_uppercase()`, `&mut s[1..]`), and needs
   the String mutable (own.readonly, rustc E0596).
+- A `&mut self` method of a generic trait called on a `let` binding,
+  `s.index_mut(r)`, is own.readonly as any other `&mut self` method
+  (F6.3, rustc E0596); 0.27.2.1 accepted it.
+- Known gap: `index_mut` on a `&mut [T]` receiver (`(&mut a[..])
+  .index_mut(r)`, and so `&mut v[r]` with a range value r) is refused as
+  "calling a method through a raw pointer is unsafe".
 
 std2 (std273):
 
