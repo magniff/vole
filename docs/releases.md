@@ -121,6 +121,28 @@ The front (front274):
   An untyped literal fixes `i32` at once (`v.push(1)`: `Vec<i32>`, where
   rustc may infer from a later use; FL1, case `rust_f_fl1_literal_i32`).
   std2 at -O0: 1,430 pass, 39 xfail (1,400 and 69).
+- FL1, stage 2 (F18.6 (d)-(f)). A `_` written in a type is a variable
+  (`let f: FromFn<_> = from_fn(..)`, `let v: Vec<_, Gpa> = ..`); one
+  never fixed is `type.infer` at the `_`, with one error for a `_` and
+  the parameter it was bound to. A projection of a variable is solved
+  with it: `let a: u32 = "4".parse().unwrap();`. A closure whose bound
+  mentions a variable infers its own parameter. `e?` checked against a
+  type checks its value first (`let n: u8 = s.parse().map_err(..)?`). A
+  variant pattern of a variable's enum (the `?`'s match) names the
+  solution's variant, which fixes a `FromStr` impl that read `0` fields.
+  std2 at -O0: 1,438 pass, 31 xfail.
+- An `if` with an `else`, a `match` or a block whose values are literal
+  trees makes its `let` open (F18.5), as a literal does: `let e0 = if c
+  { 1 } else { 0 };` takes `i64` from a later `for i in e0..np`, and
+  `let b = if c { 0xf8000000 } else { 0 }; let x: i64 = b;` is no longer
+  out of range for i32. A `for` range's open start takes the end's type.
+- A spawned closure may reach a rust-edition `static mut`, directly or
+  through what it calls, and so may a C function declared in the rust
+  edition (F19.6). Every such use is in `unsafe`, as in rustc, so it is
+  no longer `sync.global`. It keeps the `global` effect. An MVS `static
+  var` stays for the main thread only. std2's checking allocator
+  (`--check-alloc`) no longer makes every allocating thread
+  `sync.global`.
 - F30.2, `&raw const P` and `&raw mut P`, in the rust edition: a place's
   address, a raw pointer, with no reference made. `&raw mut S` of a
   `static mut` needs no `unsafe`; a field of one, `&raw const S.n`, does
