@@ -354,6 +354,46 @@ of a partial step, seen in 0.27.3 (making the str view Copy alone):
 collapsing to one, and `Copied<Iter<str>>::next` reads `Option<&&str>`
 as `Option<str>` (`no method 'copied' on type 'Option<str>'`): both are
 `&T` with `T = &str` collapsed to the view.
+*As landed (0.27.4, step B).* The rules above hold in every
+rust-edition position, with these readings:
+- *The probe on a view* (F6.2). The place's `&self` method, inherent or
+  of a trait, is at the by-value step on the view; the view's own impls'
+  `&self` methods (`impl<T: ?Sized + Ord> Ord for &T`) are at the `&` step.
+  So `a.cmp(b)` of two `&str`s is `<str as Ord>::cmp`, `b.as_ref()` of a
+  `&str` is `<str as AsRef<[u8]>>`, and `rr.tag()` of a `&&S` is still the
+  `&S` impl's (the step is read from the receiver's written type). In
+  `Tr::m(x)` (F8.2), x is the `&self` itself, with no autoref, so a view x
+  takes the place's. In an instance, a receiver of a parameter's type
+  (`k: K`, or a field of type `K`) takes the bound's method, the one the
+  generic body named: `<&str as Borrow<&str>>` for `K = &str`. A receiver
+  `x: &P` takes P's.
+- *Associated functions* of the place are its view's path too
+  (`str::from_utf8(b)`).
+- *A default body's trait argument.* `PartialEq<[U]>`'s `[U]`,
+  substituted for `Rhs` in `ne`'s default, stays the place: its written
+  text is kept (`traits.vl: subst_trait_args`).
+- *Sized* (F21.1). A parameter without `?Sized` bound to `Unsized(v)` is
+  `type.unsized` (E0277), checked with the bounds of every struct, enum
+  and function instance (`traits.vl: check_bounds`).
+- *`&e` of a view value.* `&e`/`&mut e` of a call's view
+  (`&mut "ab".as_bytes()`) is a reference to a temporary view,
+  `&mut &[u8]`; `&v[..]` stays the place's view.
+- *Slots.* `slots_in` and `slot_variances_in` read `Unsized(v)` as its
+  element.
+- *std2* gains rustc's forwarding impls that the distinct `&&str` now
+  needs: `Borrow<T>` for `&T`/`&mut T`, `AsRef<U>` for `&T`/`&mut T`,
+  `AsMut<U>` for `&mut T`, `Eq`/`Ord` for `&A`.
+Not closed (0.27.5): an iterator whose Item is a view, in std2's
+generic instances (`[&str; 2].into_iter().collect_in(a)`, `Extend::extend`'s
+`I: IntoIterator<Item = T>`), is a `borrowck.outlives` between the
+parameters' regions (D4.6's ties do not reach a view's slot). It also
+fails without step B. Case `rust_b_view_item_collect`.
+Not closed either: `Box<[T], A>` and `Box<str, A>`. std2's `Box<T, A>` has
+a Sized T, so they are `type.unsized`; an unsized Box needs `T: ?Sized` on
+the Box and its impls (0.27.5). A `NonNull<[u8]>` is two words.
+*Cases:* `rust_f_z91c_ref_of_view`, `rust_f_z91c_impl_place_and_ref`,
+`rust_f_z91c_unsized_param`, `rust_f_z91c_vec_unsized_err`,
+`rust_f_z91c_fat_nonnull`.
 ### F23 Literals
 
 **F23.1 (string literals).** `"…"` has type `&'static str` in a
