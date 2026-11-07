@@ -621,8 +621,54 @@ parameter type and of the return type, walked structurally: `&'a τ` and
 `&'a mut τ` imply `'b ⊒ 'a` for every `'b ∈ slots(τ)`; a view `[τ]`
 with slot `'v` likewise; `S<'a.., τ..>` implies `S`'s own declared
 bounds instantiated (`Scope<'scope, 'env: 'scope>` gives `'env ⊒
-'scope`) and recurses into `τ`. Values: `val('u) = Pts ∪ {end('v) |
+'scope`) and its inferred requirements (D4.6), and recurses into `τ`. Values: `val('u) = Pts ∪ {end('v) |
 'u ⊒ 'v}`; in particular `val('static) = Pts ∪ Ends`.
+
+**D4.6 (implied bounds, as rustc's well-formedness; 0.27.2.1).** D4.5's
+walk is completed by four readings, each rustc's (a type in a signature
+or an impl header is assumed well-formed, so what its well-formedness
+needs is assumed in the body and required of the caller at the call,
+D3.6).
+- (a) *A declaration's inferred outlives requirements* (rustc's RFC
+  2093). For a struct or enum `S<'a₁.., T₁..>`, `Req(S)` is the least
+  set of `x: 'b` (`x` one of its lifetimes or type parameters, `'b` one
+  of its lifetimes or `'static`) read from its fields' types, each
+  walked under an enclosing lifetime `'r` (none at a field's top):
+  `&'b τ`, `&'b mut τ`, a view `[τ]` or `str` with lifetime `'b` give
+  `'b: 'r` and walk `τ` under `'b`; a type parameter `T` gives `T: 'r`;
+  a raw pointer, an array, a tuple walk their parts under `'r`; a
+  struct or enum `U<'c.., σ..>` gives `'c: 'r` for each `'c`, walks
+  each `σ` under `'r`, and adds `Req(U)` instantiated (`'x: 'y` of
+  `U`'s as the lifetimes written for them; `T: 'y` of `U`'s as the `σ`
+  written for `T` walked under the `'y` written). Not read: projections
+  (rustc's `<U as Tr>::A: 'a`), `fn` pointers. (`struct Iter<'a, T> {
+  v: &'a [T] }` has `T: 'a`; `PhantomData<&'a T>` gives the same.)
+  Wherever `S<..>` appears in a parameter or result type, `Req(S)`
+  instantiated joins `⊒`: `T: 'b` as `'s ⊒ 'b` for every `'s ∈
+  slots(τ_T)`, with `τ_T` the type at `T`'s position.
+- (b) *The impl header's lifetimes.* An elided lifetime in an impl's
+  self type (`impl Ord for str`, `impl<T> Tr for &[T]`) is a lifetime
+  parameter of the impl (rustc's `impl<'_>`): every `Self` of a
+  method's signature names the same universal for it (slot `j` of
+  `Self` is the universal of `Self`'s slot `j`), not a fresh elided one
+  per occurrence (E1), and it is not an input of E2. `&self` (`&mut
+  self`) on an impl for a view `[T]` or `str` is the view whose region
+  is the reference's, its element read as the header writes it (T's
+  slots, D4.4), so `&'s [T]` gives `'t ⊒ 's` for T's slots as written.
+- (c) *`Self` of a trait's default method* is a type parameter: its
+  slots are its substitution's (D4.4), the same at every occurrence.
+- (d) *A bound's equalities.* A bound `P: Tr<A = X>` says `P::A` is
+  `X`: each slot of `P::A` normalized (D4.4's projection reading, in
+  `P`'s slots) and the same slot of `X` are one region (`⊒` both ways);
+  `Extend<T>::extend<I: IntoIterator<Item = T>>` pushes an `I::Item`
+  where a `T` is required. A bound's trait arguments `P: Tr<X₁..>`,
+  when one impl of `Tr` is for `P`'s substitution (`impl<T, A>
+  FromIteratorIn<T, A> for Vec<T, A>`), say each `Xᵢ` is that impl's
+  argument `i`, read in `P`'s slots through the impl's header: the same
+  equality. A projection is normalized by the direct impl for its base
+  (D4.4), or else by a blanket impl `impl<I: ..> Tr for I` when it is
+  the one impl that defines the name (`U::IntoIter` of an iterator `U`
+  is `U`, its slots `U`'s).
 
 ## 5. Variance (S5)
 

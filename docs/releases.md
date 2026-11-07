@@ -84,6 +84,23 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.27.2.1
 
+The borrow checker (bc2721):
+
+- Implied outlives bounds as rustc's well-formedness (borrowck.md
+  D4.6): a struct's or enum's inferred outlives requirements (RFC 2093,
+  `struct Iter<'a, T> { v: &'a [T] }` gives `T: 'a`), carried through
+  nested fields; an elided lifetime of an impl's header (`impl Ord for
+  str`) is the impl's own, the same at every `Self`; `&self` on an impl
+  for `[T]` or `str`; `Self` of a trait's default method as a type
+  parameter; a bound's `Item = T` and trait arguments
+  (`B: FromIteratorIn<Self::Item, A>`) as equalities; a blanket impl's
+  projection (`U::IntoIter` of an iterator). 28 std2 tests and 3
+  `rust_t_` cases that failed on `borrowck.outlives` or
+  `borrowck.elision` now pass; `tests/std2/check.sh`'s known-gap XFAIL
+  cases with borrowck errors in std2 fall from 45 to 6 (each a front
+  gap: `&mut self` on an impl for a view type reads as `inout [u8]`).
+  10 `rust_b_implied_` cases, each agreeing with rustc.
+
 std2 (std2721):
 
 - Floats print and parse as Rust's (front-rust.md F15.6): std2's `flt`
