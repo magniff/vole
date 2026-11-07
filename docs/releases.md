@@ -120,6 +120,37 @@ The translator (tr273):
   - std: each call with a rewrite.tsv row is written as the row says, chosen by type (`T: Copy`, `use=read`), with the row's `!` cases left to hand; std's paths become std2's, and the imports std2 needs are added. A closure literal that a row calls in place is inlined, its parameters bound to the arguments, and the `sort_by` rows dereference a Copy element.
 - Gate 2's counts, round-tripping through the translator: run 734 of 1,347, bench 15 of 44, examples 4 of 83. In 0.27.2.1 they were 598, 5 and 3. tests/translate/causes.tsv classifies the rest: std2 175 (`std::cli`, `std::gpu`, `Scanner`, `sync::Mutex`, `fs`, which are 0.27.4's), front 17 (`embed` blocks), borrowck 63, translator 454. The run corpus (tests/translate/corpus1.txt): 40 of 50.
 
+The front (front273):
+
+- FL6, the i32 literal default (front-rust.md F18.5): in the rust
+  edition an unsuffixed integer literal with no context is an `i32`, as
+  Rust's, and an unannotated `let` of literals is an integer inference
+  variable, solved by its first use that gives it a type: an expected
+  type (an argument, an annotation, the return, a field, `&x` where
+  `&[u8]` goes, `a[0]`, `&a[..]`), the other operand of an operator, an
+  assignment's value (`s += m.v`), a generic call's argument. `x += 1`,
+  `x = 0` and `x < 10` keep it open; `let r = &x;` links r to x; a
+  closure closes what it captures when it is checked. Around it, as
+  rustc's: `&1` where `&T` goes is a T (`m.get(&1)`, `x.total_cmp(&0.0)`),
+  a parameter's bound picks a literal's type through another
+  parameter's bound (`K: Borrow<Q>`), an array of literals at a generic
+  call takes the expected type's element (`Vec::from_in([1, 2], gpa)`),
+  a closure argument is typed before the literal arguments when it can
+  be (`map_or(0, |x| x + 1)`), `S(7)` of a tuple struct takes the
+  expected type's arguments, and `-1` where an unsigned type goes is an
+  error (E0600). The early closes that diverge from rustc are FL6's,
+  by name; the corpus writes `1i64` where it meets one (31 cases). MVS
+  is unchanged: its fallback stays `i64`, and no local is open.
+- `b"..."` byte strings parse and are `&[u8]` (F23.2, FL12).
+- `Tr::f(args)` takes Self from the expected type only when f returns
+  `Self` (`Step::steps_between(&a, &b)` inside an impl, F8.2).
+- `&T as *const U` with U not T is an error, rustc E0606 (F29.1); it
+  read a T as a U.
+- A bound that names no trait in scope no longer crashes a derived
+  impl's supertrait check (`derive_generic.vl` read in the rust edition).
+- front-rust.md names FR5 (integer widening) and FR6 (an index of any
+  integer type), the rust edition's lenient MVS rules.
+
 std2 (std273):
 
 - f64's and f32's methods, Rust's names and meanings (front-rust.md
