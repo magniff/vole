@@ -103,6 +103,47 @@ The front's gaps behind std2's XFAILs (front2721b):
   reference impls; an ambiguity message for a pattern impl no longer
   reads past TLISTS (the crash at types.vl:608).
 - `{:E}` is UpperExp, and `{:-}` sets Formatter's sign_minus.
+The borrow checker (bc2721):
+
+- Implied outlives bounds as rustc's well-formedness (borrowck.md
+  D4.6): a struct's or enum's inferred outlives requirements (RFC 2093,
+  `struct Iter<'a, T> { v: &'a [T] }` gives `T: 'a`), carried through
+  nested fields; an elided lifetime of an impl's header (`impl Ord for
+  str`) is the impl's own, the same at every `Self`; `&self` on an impl
+  for `[T]` or `str`; `Self` of a trait's default method as a type
+  parameter; a bound's `Item = T` and trait arguments
+  (`B: FromIteratorIn<Self::Item, A>`) as equalities; a blanket impl's
+  projection (`U::IntoIter` of an iterator). 28 std2 tests and 3
+  `rust_t_` cases that failed on `borrowck.outlives` or
+  `borrowck.elision` now pass; `tests/std2/check.sh`'s known-gap XFAIL
+  cases with borrowck errors in std2 fall from 45 to 6 (each a front
+  gap: `&mut self` on an impl for a view type reads as `inout [u8]`).
+  10 `rust_b_implied_` cases, each agreeing with rustc.
+
+std2 (std2721):
+
+- Floats print and parse as Rust's (front-rust.md F15.6): std2's `flt`
+  module finds a float's digits with big integers, the shortest that
+  read back as the same float for `{}`, `{:?}` (with `.0`; the exponent
+  form below 1e-4 and from 1e16) and `{:e}`, the exact value rounded
+  half to even for `{:.N}` and `{:.Ne}`; `str::parse` rounds to the
+  nearest float, subnormals included. f32 keeps its own shortest digits
+  (`1.1f32` is `1.1`). The integers' `{:e}` is exact. Checked against
+  rustc on the edge values (0.1, 1e21, 5e-324, NaN, -0.0, inf, f32's
+  1.1 and MAX, the subnormal boundary); bool's FromStr too.
+- `std::env`: `args()` and `args_os()` (views of argv, no allocator),
+  `var_in`, `var_os_in`, the unsafe `set_var` and `remove_var`,
+  `VarError`. argv is the target's: std2/rt/sys_macos.vl or
+  sys_linux.vl, in `std::__sys` (the Linux file is built, not run).
+  `vars_in` and the working directory are 0.27.3's.
+- Tuples of 1 to 6 fields are `PartialEq`, `Eq`, `PartialOrd`, `Ord`
+  and `Hash`; `std::hash::DefaultHasher`; `Debug` for `BufWriter`; the
+  ExactSizeIterator lengths of chunks, windows, hash_map's iterators,
+  `Empty` and `RepeatN`; char's Debug escapes combining marks.
+- `write(w, ..)` stops at the first failed write and returns its error,
+  as Rust's `write!` (a Formatter's failed write fails the later ones).
+- The XFAIL std2 cases grouped by cause and owner; the cases that failed
+  only on their own unused imports or test shapes are fixed.
 
 ### What's new in 0.27.2
 
