@@ -109,6 +109,21 @@ The front's gaps behind std2's XFAILs (front2721b):
   DoubleEndedIterator impl, F11.5). Group 3's other `type.infer` cases
   (a later statement's type, a later match arm's) wait for FL1's deferred
   inference (0.27.4).
+
+The front's smaller gaps (front2721c):
+
+- A method call counts only the traits in scope: `self.v.fmt(f)` with
+  only `Binary` imported is Binary's, not ambiguous with Display and
+  Debug (F9.2).
+- A trait default's own parameter, renamed where an impl has one of its
+  name, is renamed in a path's head too: `B::from_iter_in(..)` in
+  `collect_in` on a `Map`, `Zip` or `Enumerate` (F12.2).
+- A struct's impl of a spec's trait writes the hole: `{:b}` with `impl
+  Binary for W`, `{:x}`, `{:o}`, `{:e}` and `{:p}` likewise (F16.5).
+- The primitives' builtin `Sum<&'a P>` and `Product<&'a P>`
+  (`v.iter().sum()`, F15.1); char is Clone and Copy.
+- std2's `Stdin::read_line` annotates its result, so the stdin cases run.
+
 The borrow checker (bc2721):
 
 - Implied outlives bounds as rustc's well-formedness (borrowck.md

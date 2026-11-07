@@ -631,6 +631,14 @@ bounds on values of type `P`). *Anchor:* `collect_trait_params` (today:
 "a function of a generic trait has no default body"),
 `front/traits.vl: collect_impl` (the default copy).
 
+**F12.2 (a default's own parameters).** The copy's own generic
+parameters are the default's, whatever the impl's are named: one named
+as an impl's parameter (`collect_in<B, A>` in `impl<B, I, F> Iterator
+for Map<I, F>`) is renamed in the copy, in its signature, its `where`
+predicates and its body, a path's head included (`B::from_iter_in(..)`,
+0.27.2.1). *Anchor:* `front/traits.vl: rename_own_params,
+subst_trait_args`. Case `rust_f_f12_own_param_path_ok`.
+
 ### F13 Several impls of one generic trait for one type
 
 **F13.1 (the key).** An impl's key is its whole header `(Tr, a..,
@@ -712,7 +720,8 @@ by copy, `Default` by zero/`false`/`'\0'`, `Display`/`Debug`/`LowerHex`/
 `Formatter` (F16.3), `Hash` by hashing the bytes, `Ord`/`PartialOrd` by
 the machine comparison (floats: `PartialOrd` only, `partial_cmp` giving
 `None` on NaN), `Step` by `+1`/`-1` on integers, `Sum`/`Product` by the
-operator. A listed trait that has no intrinsic (a method the compiler
+operator (each as `Sum for P` and, as Rust's core has, `Sum<&'a P> for
+P`, 0.27.2.1). A listed trait that has no intrinsic (a method the compiler
 does not know) is a compiler-build error reported by `known_items_check`
 (Z3). The attribute on a non-std2 trait is `error attr.builtin`. The
 synthesized impls are keyed like written ones (F13.1) and take part in
@@ -819,7 +828,10 @@ or `use path::Tr as _`), or in the edition's prelude (Z2). A method of
 a trait not in scope is not a candidate: `error method.unknown` with
 `try: use path::Tr;` (rustc E0599's "items from traits can only be used
 if the trait is in scope"). *Anchor:* `method_of` (today: every impl of
-the program), `front/modules/lookup.vl`.
+the program), `front/modules/lookup.vl`; of several trait candidates the
+one of a trait in scope is taken (0.27.2.1, `self.v.fmt(f)` with only
+`Binary` imported: `front/check/calls: trait_method_choice,
+trait_in_scope`). Case `rust_f_f9_trait_in_scope_ok`.
 
 **F9.3 (ambiguity).** More than one candidate at the deciding step is
 `error method.ambiguous` (E0034), listing each as `try: Tr::m(&x, ..)`
@@ -1086,7 +1098,10 @@ impls for primitives (the number formatting MVS has). *Anchor:*
 
 **F16.5 (the spec's traits and flags).** A hole's trait is the spec's: `x`
 LowerHex, `X` UpperHex, `o` Octal, `b` Binary, `e` LowerExp, `E`
-UpperExp, `?` Debug, else Display; `+` sets the Formatter's
+UpperExp, `p` Pointer (0.27.2.1; a pointer's `{:p}` stays its address),
+`?` Debug, else Display. A struct's or an enum's impl of the spec's trait
+writes the hole (`impl Binary for W`, `{:b}`), not only a number's
+(0.27.2.1). `+` sets the Formatter's
 `sign_plus` (bit 0), `-` its `sign_minus` (bit 1), `#` `alternate`, `0`
 `sign_aware_zero_pad`. *Anchor:* `front/check/interp.vl:
 direct_body_std2, spec_call`, `format.vl: parse_spec`.
