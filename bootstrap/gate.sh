@@ -100,8 +100,9 @@
 # translate (tests/translate.sh, 0.27.3, gate 2: the examples, bench and
 # tests/run's MVS run cases translated by `volec fix --edition rust`,
 # built in the rust edition and run, against the MVS output; one count per
-# set and the total; informational until 0.27.4: it prints N and never
-# fails; --release);
+# set and the total, and the rustc twin of what round-trips (the stable
+# shim, tools/rustc-twin/); informational until 0.27.4: it prints both
+# N's and never fails; --release);
 # linux-x86_64 (bootstrap/linux-check.sh); linux-aarch64
 # (bootstrap/aarch64-linux-check.sh: in the container, the fixpoint,
 # the suite at -O0 and -O2 (0.25.2: not -O1; the optimizer is the same
@@ -749,8 +750,9 @@ run_step() {
         chain-fresh) sh "$ROOT/bootstrap/chain-fresh.sh" -w "$RUN/chain-fresh" --history "$HISTORY" ;;
         translate)
             # (0.27.3, gate 2) informational until 0.27.4: the count, never
-            # a failure
-            sh "$ROOT/tests/translate.sh" -c "$C" -j 4 || true ;;
+            # a failure; with the stable shim's rustc twin of what round-trips
+            # (tools/rustc-twin/; --alloc-api is a manual mode)
+            sh "$ROOT/tests/translate.sh" -c "$C" -j 4 --twin || true ;;
         compile-cost)
             previous=$(find_previous_release)
             sh "$ROOT/tests/compile_cost.sh" -c "$C" ${previous:+-p "$previous"} ;;
