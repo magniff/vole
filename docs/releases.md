@@ -120,6 +120,31 @@ The borrow checker (bc2721):
   reborrow is reserved, and f is usable after the call, where the
   desugaring moved f (`borrowck.use_moved`). 6 Formatter cases pass.
 
+std2 (std2721):
+
+- Floats print and parse as Rust's (front-rust.md F15.6): std2's `flt`
+  module finds a float's digits with big integers, the shortest that
+  read back as the same float for `{}`, `{:?}` (with `.0`; the exponent
+  form below 1e-4 and from 1e16) and `{:e}`, the exact value rounded
+  half to even for `{:.N}` and `{:.Ne}`; `str::parse` rounds to the
+  nearest float, subnormals included. f32 keeps its own shortest digits
+  (`1.1f32` is `1.1`). The integers' `{:e}` is exact. Checked against
+  rustc on the edge values (0.1, 1e21, 5e-324, NaN, -0.0, inf, f32's
+  1.1 and MAX, the subnormal boundary); bool's FromStr too.
+- `std::env`: `args()` and `args_os()` (views of argv, no allocator),
+  `var_in`, `var_os_in`, the unsafe `set_var` and `remove_var`,
+  `VarError`. argv is the target's: std2/rt/sys_macos.vl or
+  sys_linux.vl, in `std::__sys` (the Linux file is built, not run).
+  `vars_in` and the working directory are 0.27.3's.
+- Tuples of 1 to 6 fields are `PartialEq`, `Eq`, `PartialOrd`, `Ord`
+  and `Hash`; `std::hash::DefaultHasher`; `Debug` for `BufWriter`; the
+  ExactSizeIterator lengths of chunks, windows, hash_map's iterators,
+  `Empty` and `RepeatN`; char's Debug escapes combining marks.
+- `write(w, ..)` stops at the first failed write and returns its error,
+  as Rust's `write!` (a Formatter's failed write fails the later ones).
+- The XFAIL std2 cases grouped by cause and owner; the cases that failed
+  only on their own unused imports or test shapes are fixed.
+
 ### What's new in 0.27.2
 
 The rust edition's std is std2, Rust's std with explicit allocators: a rust-edition program now reads `std::vec::Vec`, `String`, `HashMap`, the iterator adapters, `fmt`, `io` and `thread` as Rust's, and 1,032 of std2's 1,413 tests pass at -O0 and -O2 under `--check-alloc` (gate 1). The front end fills the gaps std2's bodies hit (pattern and blanket impls, coherence, deref coercion, ranges, format specs; the rules are docs/design/front-rust.md). Closures are checked in full: their kinds, captures and signatures, `Send` and `Sync`, and the borrow checker reads their bodies (`borrowck.unchecked` is gone), with Rust's mutability errors E0594 and E0596. `[T]` and `str` are unsized types; their full representation, `impl Trait` in return position and the rest of std2 are 0.27.2.1's. MVS programs compile exactly as before; a rust hello-world's `check` costs about 4.2x MVS's (printed, not enforced; 2.0x is 0.27.4's target). Built and tested on aarch64-macos only.
