@@ -141,6 +141,14 @@ The front (front275):
   - The commit hook and the merge driver remake the index, like the rest
     of stdsrc_rust.vl. It adds about 150 KB to that file and 0.5% to the
     compiler's own compile.
+- A method call in a generic body takes the method the body names, as
+  rustc does (Z9.1c). The receiver must be a value of a bounded type
+  parameter, like `(**self)` of `self: &&T` or `c` of `c: C`. It gets
+  the bound's method for the type the parameter stands for, never one
+  found again through that type's references. `via(r)` of `fn via<C:
+  Tag>(c: C) { c.tag() }` with `C = &&str` now runs the reference impl
+  twice and prints 21; 0.27.4 took str's impl for `(**self)` and
+  printed 11.
 
 The translator (g3274):
 
