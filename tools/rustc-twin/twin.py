@@ -217,6 +217,10 @@ def inverse_in(s, gpas):
 
 def macros(s):
     """println( -> println!(, a first argument that is no literal printed."""
+    # (std2's free `std::fmt::write(w, x)`, which the translator writes
+    # qualified (a program's own `write` shadows the prelude's): Rust's is
+    # the macro, as for the bare `write(`)
+    s = re.sub(r"(?<![\w:])std::fmt::write\(", "write(", s)
     out, pos = [], 0
     pat = re.compile(r"(?<![\w.:!])(" + "|".join(MACROS) + r")\(")
     for m in pat.finditer(s):
