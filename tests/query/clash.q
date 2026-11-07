@@ -159,10 +159,10 @@ std::BinaryHeap::push	../../compiler/std/flat/collections.vl:234:12	method	pub f
 std::MinHeap::push	../../compiler/std/flat/collections.vl:332:12	method	pub fn push(inout self, x: sink T)
 std::unicode::GraphemeState::push	../../compiler/std/unicode/mod.vl:167:12	method	pub fn push(inout self, cp: u32) -> bool	effects: panic
 std::unicode::ClusterWidth::push	../../compiler/std/unicode/mod.vl:396:12	method	pub fn push(inout self, cp: u32, p: u16)	effects: none
-std::objc::Pool::push	../../compiler/std/objc/mod.vl:248:12	method	pub fn push() -> Pool	effects: alloc(Gpa, extern) io global panic diverge unsafe
+std::objc::Pool::push	../../compiler/std/objc/mod.vl:248:12	method	pub fn push() -> Pool	effects: alloc(Gpa, extern) io panic diverge unsafe
 std::string::String::push	../../compiler/std/string.vl:1207:12	method	pub fn push(inout self, cp: u32)
 std::path::PathBuf::push	../../compiler/std/path.vl:249:12	method	pub fn push(inout self, p: [u8])
-std::window::cocoa::push	../../compiler/std/window/cocoa.vl:250:4	fn	fn push(e: Event)	effects: alloc(Gpa, extern) io global panic diverge unsafe
+std::window::cocoa::push	../../compiler/std/window/cocoa.vl:250:4	fn	fn push(e: Event)	effects: alloc(Gpa, extern) io panic diverge unsafe
 std::cli::Matches::push	../../compiler/std/cli.vl:1241:8	method	fn push(inout self, s: i64, text: str, at: i64)
 $ refs Vec::push --count
 2	crate::myvec::Vec::push

@@ -21,7 +21,7 @@ $ effects grow --why 'alloc(Arena)' syntax016/main.vl
 crate::grow	alloc(Gpa) panic
   (not: alloc(Arena))
 $ effects grow --has allocates syntax016/main.vl
-error query.usage: unknown effect 'allocates' (effects: alloc, alloc(T), io, global, panic, diverge, unsafe, none)
+error query.usage: unknown effect 'allocates' (effects: alloc, alloc(T), io, static, panic, diverge, unsafe, none)
 [exit 2]
 $ effects Pair syntax016/main.vl
 note query.empty: no function among the names
