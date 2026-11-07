@@ -982,16 +982,13 @@ char`). *Anchor:* `infer_from` (today: arguments and one hint),
 `front/generics/mod.vl: hint_for`, `front/closures/mod.vl:
 infer_param_error`.
 
-**F18.2 (no expected type).** `let x = Vec::new_in(a);` with `T` fixed
-by a later `x.push(1)` is **not** inferred in 0.27.2 (vole has no
-deferred unification variables; FL1, `edition.later: deferred_infer
-(0.27.4)`, with the compiler's own move to the edition, where it will
-matter; the translator of 0.27.3 writes the annotation from MVS's known
-types). The error is `type.infer` at the `let`; its `try:` gives the
-annotation the first later use determines when the checker can see one
-(`try: let x: Vec<i64, Gpa> = Vec::new_in(a)`: the first method call,
-assignment or argument of `x` in the body whose parameter type binds
-`T`), else the turbofish. std2 and the corpus annotate.
+**F18.2 (no expected type).** In MVS a parameter the steps of F18.1
+leave free is `type.infer` at the call, with the `try:` of the turbofish
+(`try: Vec::<T>::new_in(...)`). In the rust edition it is an inference
+variable (F18.6, 0.27.4: FL1's deferred inference): `let x =
+Vec::new_in(a);` with `T` fixed by a later `x.push(1)` is inferred; a
+variable still free at the end of its function is the same `type.infer`,
+at the call that made it.
 
 **F18.3 (integer and float literals).** An unsuffixed integer literal
 has no type of its own: it takes the type of the context it unifies
@@ -1065,6 +1062,40 @@ literal arguments, so that its result binds their parameter
 (`map_or(0, |x| x + 1)`), and one whose value is itself a literal
 after; a negated literal where an unsigned type goes is an error, rustc
 E0600.)
+
+**F18.6 (type variables: deferred inference; 0.27.4).** In the rust
+edition a type parameter of a generic call (a function, a method, a path
+`Vec::new_in(..)`), of an enum's variant (`Ok(x)`) or of a struct
+literal that F18.1's steps (1)-(5) leave free is not an error: it
+becomes an **inference variable** `?ᵢ`, and the call's type mentions it
+(`Vec<?T, Gpa>`). A variable is solved by the first check, in the order
+the function is checked, that unifies a type mentioning it with a
+definite type:
+(a) a value checked against an expected type, either side mentioning
+the variable: an argument and its parameter's type, a `let`'s
+annotation, the return or the tail, a struct field, a later arm of an
+`if` or `match` against the first's type (`if c { Ok(1) } else
+{ Err("neg") }` fixes `E`), so a value passed where its type goes
+(`mem::replace(&mut x, fresh)`);
+(b) a method call's receiver against the instance's `Self`, after the
+arguments bound the parameters (`v.push(2)`: `T` from `2`);
+(c) the target of `x = e` with `e` of a definite type.
+These uses keep it free: a method call whose instance names the
+variable only through `Self` (`v.len()`, `v.is_empty()`,
+`v.capacity()`): the instance waits for the variable, and is made again
+with its solution. Any other use is `type.infer` (rustc E0282) at the
+call that made the variable: a method call or a field on a bare
+variable, `x as τ`, a by-value use whose `Copy` depends on the
+variable, a capture by a closure, a format hole. Solving retypes in
+place the function's locals, nodes and closure signatures that mention
+the variable, and makes again each instance made with it; a variable
+free at the function's end is F18.2's `type.infer`. After the function
+is checked no variable is left: none reaches code generation, effects,
+the caches or another function. An untyped literal or an open local
+(F18.5) checked where a variable goes gives it its provisional type at
+once (`v.push(1)`: `Vec<i32>`), and closes the local (FL6). MVS has no
+variables. *Anchor:* `front/check/infer.vl`, `generics/instantiate.vl:
+require_bound, infer_from`, `check_mode.vl: check_expr_inner`.
 
 ### F19 Small syntax
 
@@ -1594,11 +1625,19 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   `rust_t_iter_for_control` writes `names[k as usize]`.
 
 **Strict (vole rejects what rustc accepts).**
-- **FL1 (no deferred inference; later, 0.27.4).** F18.2: a parameter
-  fixed only by a later statement is `type.infer` (its `try:` the
-  annotation the first use determines); rustc's unification variables
-  infer it. Deferred inference comes with 0.27.4, when the compiler's
-  own source moves to the edition.
+- **FL1 (deferred inference by the first constraining use; 0.27.4).**
+  F18.6's variables are solved in the order the function is checked, by
+  the first use that meets a definite type; rustc unifies over the whole
+  function. So a use F18.6 does not let wait, before the one that fixes
+  the variable, rejects where rustc accepts (`let v = Vec::new_in(a);
+  let w = v; w.push(1)`: the move, as `Copy` is not known; `x[0]` of a
+  pending `Vec`), and a variable fixed by an untyped literal takes `i32`
+  at once where rustc keeps an `{integer}` that a later use may fix:
+  `v.push(1); let b: u8 = v[0];` is rustc's `Vec<u8>` and vole's error
+  (`Vec<i32>`, FL6). No projection on a variable (`"4".parse().unwrap()`
+  with `F` from the expected type, `x.try_into()` from the arms) until
+  F18.6's stage 2. Cases `rust_f_f18_deferred_ok`,
+  `rust_f_f18_deferred_err`, `rust_f_fl1_literal_i32` (`// RUSTC-DIFFERS: FL1`).
 - **FL2 (overlap by satisfiability, strict when undecidable).** F4.2
   errs on the side of `trait.overlap` where rustc's coherence (with
   negative reasoning on fundamental types and the orphan rule) would
@@ -1634,7 +1673,9 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   `f64`, but `&0.0` and a context take theirs, F18.3). A generic
   constructor's parameter fixed by a later statement (`let v =
   Vec::from_in([1, 2], gpa);` then `v` as a `Vec<i64>`, `W { x: 7 }`
-  then `&W<i64>`) is FL1's, 0.27.4. The corpus writes the suffix
+  then `&W<i64>`) is not F18.6's either: the literals bind `T` at the
+  call, to `i32` (a variable is made only for a parameter left free;
+  FL1). The corpus writes the suffix
   (`1i64`) where it meets one. (Lenient: a method call on an open local,
   `x.pow(2)`, is `i32`'s method, where rustc says E0689.)
 - **FL7 (const evaluation).** F3.2's consts fold with `consteval.vl`'s
