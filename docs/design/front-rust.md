@@ -337,6 +337,23 @@ Closes: `io::copy` with `R = &[u8]` (a `?Sized` parameter), `&T` with
 resolve_type`, `generics/instantiate.vl: unify`, `check/calls/mod.vl:
 synth_method` (the autoderef step), `traits.vl` (impl keys), `types.vl:
 layout_of`, `places/regions.vl: slots_in`.
+*Staging (0.27.3, 0.27.4).* Step A (0.27.3): the kind, `unsized_of`,
+its printing (its view's spelling) and mangling (`Z<v>`); nothing makes
+one. Step B (0.27.4) is one commit: while the view stands for both `[T]`
+and `&[T]`, no part of the rule above closes a gap alone. Its scope:
+`resolve_type`'s `&X` (the view when X is written `[T]`/`str` or is
+`Unsized(v)`, else `Ptr(view)`); `match_type`'s `&T` against a view
+(`T := Unsized(v)`); `str`/`[T]` as an impl's self type or a type
+argument (`Unsized`), so the impl keys; implements/has_impl over
+`Unsized(v)`; synth_method's step from a view to `Unsized(v)`; Z9.1a
+retired. Each iteration runs the std2 and rust categories. Failure modes
+of a partial step, seen in 0.27.3 (making the str view Copy alone):
+`need::<&str>` with `T: Copy` passes, but `words.iter().copied()
+.collect_in(..)` on `[&str; 2]` is `'Vec<str, Gpa>::extend' is ambiguous
+(Extend<str>, Extend<str>)`, Vec's `Extend<T>` and `Extend<&'a T>`
+collapsing to one, and `Copied<Iter<str>>::next` reads `Option<&&str>`
+as `Option<str>` (`no method 'copied' on type 'Option<str>'`): both are
+`&T` with `T = &str` collapsed to the view.
 ### F23 Literals
 
 **F23.1 (string literals).** `"…"` has type `&'static str` in a
