@@ -392,6 +392,21 @@ rust-edition position, with these readings:
 - *Sized* (F21.1). A parameter without `?Sized` bound to `Unsized(v)` is
   `type.unsized` (E0277), checked with the bounds of every struct, enum
   and function instance (`traits.vl: check_bounds`).
+- *A receiver written `*v` of a view* (0.27.5). `*v` is read as the view
+  (Z4.1's reading), but as a receiver it is the place `Unsized(v)`, as
+  rustc's probe starts from `str`: only the place's methods take it
+  (their `&self` the view), never an impl for `&T`. So `(**self).as_ref()`
+  in `impl<T: ?Sized + AsRef<U>, U: ?Sized> AsRef<U> for &T` with `T =
+  str` is `<str as AsRef<[u8]>>`, in an instance too, with or without an
+  expected type (before, with `let b: &[u8] = ..` the reference impl took
+  it, called itself, and the program overflowed its stack).
+- *`&'a T` of an unsized argument in a signature* (0.27.5, D4.6). With
+  `T = Unsized(v)`, `&'a T` is the view `v` whose region is the
+  reference's (`'a`, or the elided one, E2/E3's), with T's slots (the
+  elements') under it, not a region of T's: the result `&U` of `fn
+  as_ref(&self) -> &U` with `U = [u8]` is `&self`'s region, so
+  `AsRef::as_ref(*self)` in the impl for `&T` is no
+  `borrowck.outlives` (rustc accepts it).
 - *`&e` of a view value.* `&e`/`&mut e` of a call's view
   (`&mut "ab".as_bytes()`) is a reference to a temporary view,
   `&mut &[u8]`; `&v[..]` stays the place's view.
@@ -1117,6 +1132,18 @@ temporary (lifetime extension) with the annotation's type: `let d: &[u8]
 the literals are `u8`, not the default. *Anchor:* `front/check/temps.vl:
 annotate_temp`. Integer inference variables (a literal typed by a later
 statement, `let a = [1, 2]; f(&a)` with `f(&[u8])`) are F18.5's.
+(0.27.5) Where no `let` hoists it (a block's tail, an `if`'s or a
+`match`'s branch, an argument, a field), a shared `&e` checked where
+`&U` goes, with `e` an array, a repeat or a tuple, checks `e` against
+`U` when `U` is of its kind (an array type for an array or a repeat, a
+tuple type of as many elements for a tuple): `let b: &[i64; 2] = if c {
+&[1, 2] } else { &[3, 4] };` and `if c { &(7, true) } else { &(8, false)
+}` where `&(i64, bool)` goes type their literals from `U`, as rustc's
+expectation does. So does a sliced array literal where `&[U]` goes,
+`if c { &[1, 2, 3][1..] } else { &[0][..] }`: the array is a `[U; N]`.
+Not yet the same slicing as a `let`'s whole initializer, `let s: &[i64]
+= &[1, 2, 3][1..];`, which F18.4's hoisting takes first (the fallback,
+`i32`: a type error). *Anchor:* `check_mode.vl: check_expr_inner`.
 
 **F18.5 (integer inference variables: an open local).** In the rust
 edition an unannotated `let x = e;` binding one name, with `e` a literal
