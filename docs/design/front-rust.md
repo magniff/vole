@@ -125,11 +125,13 @@ MVS's view model (0.20, `coerce_text`) made a `str` its bytes for free.
 In the rust edition the bytes are `s.as_bytes()`, and a literal's are
 `b".."`. The error's `try:` gives that conversion. A string literal
 where a `&str` goes is that `&str` as it is: it is not checked as its
-bytes. The compiler's own writes of a format literal's text, in a
-direct `print`/`write` (F16.3), take its bytes as before. A generic
+bytes. Two places take a literal's bytes as before, the compiler's own
+reads: its writes of a format literal's text in a direct `print`/`write`
+(F16.3), and an intrinsic's feature name (`std::arch::has("neon")`). A generic
 `&[T]` does not bind `T = u8` from a `&str`. *Anchor:*
 `front/check/check_mode.vl: coerce_text`, `check/distinct.vl:
-distinct_literal, distinct_mismatch`, `check/interp.vl: direct_call`.
+distinct_literal, distinct_mismatch`, `check/interp.vl: direct_call`,
+`check/calls/paths.vl: check_direct_call`.
 Cases `rust_f_f0_str_not_bytes_err`, `rust_f_f0_string_not_bytes_err`,
 `rust_f_f0_str_bytes_ok`.
 
