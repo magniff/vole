@@ -50,6 +50,9 @@ pub const U_SUBST: i64 = 4;
 pub const U_BOUND: i64 = 5;
 pub const U_ENV: i64 = 6;
 pub const U_CSLOT: i64 = 7;
+// (0.27.2.1) An `impl Tr` result's one region (D21.2, D21.3; external):
+// every input region outlives it, and the body chooses which it is.
+pub const U_OPAQUE: i64 = 8;
 
 // Variances (D5.1), as bits: the meet is their union, `*` (bivariant)
 // the identity.
@@ -408,6 +411,11 @@ fn copy_in(t: i64, depth: i64, pcx: inout Ctx<Comp>) -> bool {
     let k = pcx.types[t].kind;
     if k == TyKind::Ptr || k == TyKind::Slice {
         return pcx.types[t].b != REF_MUT;
+    }
+    // RULE: D21.3 (0.27.2.1: an `impl Tr` result is Copy iff a bound says so)
+    if crate::front::opaque::is_opaque(t, pcx) {
+        let copy = crate::front::traits::std_trait(c"Copy", &pcx);
+        return copy >= 0 && crate::front::opaque::implements(copy, t, &pcx);
     }
     if k == TyKind::Array || k == TyKind::Distinct {
         return copy_in(pcx.types[t].a, depth + 1, &pcx);
@@ -1746,39 +1754,67 @@ pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
         }
     }
     sig.param_at.push(sig.params.len() as i64);
-    // the result: an elided region is E2's, E3's, else E4's error
-    sig.walk.clear();
-    bind_walk(pcx.nodes[node].b, fn_ret(f, pcx), tps, self_node, -1, &sig.walk, 0, pcx, f);
-    let n = sig.walk.len() as i64 / 4;
-    for e in 0..n {
-        let b = sig.walk[4 * e];
-        var u = 0;
-        if b == B_ELIDED {
-            // RULE: D4.2 (E2, E3, E4)
-            if inputs == 1 {
-                u = only;
-            } else if self_u >= 0 {
-                u = self_u;
-            } else {
-                if sig.elision == 0 {
-                    sig.elision = if pcx.nodes[node].b > 0 { pcx.nodes[pcx.nodes[node].b].start }
-                        else { pcx.nodes[node].start };
-                }
-                u = add_universal(U_ELIDED, 0, e, &sig);
+    // RULE: D21.3 (0.27.2.1: an `impl Tr` result, front/opaque.vl: each
+    // slot a universal that every input region outlives, Rust 2024's
+    // capture of them all; no elision)
+    if crate::front::opaque::is_opaque_node(pcx.nodes[node].b, pcx) {
+        let inputs_end = universal_count(sig);
+        let n = slot_count(fn_ret(f, pcx), pcx);
+        for e in 0..n {
+            let u = add_universal(U_OPAQUE, 0, e, &sig);
+            sig.ret.push(u);
+            for v in 1..inputs_end {
+                sig.bounds.push(v);
+                sig.bounds.push(u);
             }
-        } else {
-            u = entry_universal(e, -1, tps, &sig, pcx);
         }
-        sig.ret.push(u);
-    }
-    for e in 0..n {
-        let up = sig.walk[4 * e + 3];
-        if up >= 0 {
-            sig.bounds.push(sig.ret[e]);
-            sig.bounds.push(sig.ret[up]);
+        // (the slots one region to the order: a relation between the hidden
+        // type's slots, `Filter<Iter<'a, T>, F>`'s, holds; each its own
+        // member choice, opaque_choice)
+        for i in 0..n {
+            for j in 0..n {
+                if i != j {
+                    sig.bounds.push(sig.ret[i]);
+                    sig.bounds.push(sig.ret[j]);
+                }
+            }
         }
+    } else {
+        // the result: an elided region is E2's, E3's, else E4's error
+        sig.walk.clear();
+        bind_walk(pcx.nodes[node].b, fn_ret(f, pcx), tps, self_node, -1, &sig.walk, 0, pcx, f);
+        let n = sig.walk.len() as i64 / 4;
+        for e in 0..n {
+            let b = sig.walk[4 * e];
+            var u = 0;
+            if b == B_ELIDED {
+                // RULE: D4.2 (E2, E3, E4)
+                if inputs == 1 {
+                    u = only;
+                } else if self_u >= 0 {
+                    u = self_u;
+                } else {
+                    if sig.elision == 0 {
+                        sig.elision = if pcx.nodes[node].b
+                            > 0 { pcx.nodes[pcx.nodes[node].b].start }
+                            else { pcx.nodes[node].start };
+                    }
+                    u = add_universal(U_ELIDED, 0, e, &sig);
+                }
+            } else {
+                u = entry_universal(e, -1, tps, &sig, pcx);
+            }
+            sig.ret.push(u);
+        }
+        for e in 0..n {
+            let up = sig.walk[4 * e + 3];
+            if up >= 0 {
+                sig.bounds.push(sig.ret[e]);
+                sig.bounds.push(sig.ret[up]);
+            }
+        }
+        push_decl_bounds(fn_ret(f, pcx), true, 0, &sig, pcx);
     }
-    push_decl_bounds(fn_ret(f, pcx), true, 0, &sig, pcx);
     // RULE: D4.5 (declared: `'b: 'a` in the generics, the impl's and the
     // function's)
     for h in holders {
@@ -1915,6 +1951,38 @@ fn subst_requirements(f: i64, tps: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
     }
 }
 
+// RULE: D4.6 (e) Type parameter k's substitution s is well-formed, so its
+// own implied bounds hold of its slots: `&'m mut Copied<Iter<'x, T>>`
+// gives `'x ⊒ 'm`, and its declarations' requirements (D4.6 (a)), each
+// slot the U_SUBST of k's.
+fn subst_wf(k: i64, s: i64, tps: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
+    if s <= 0 {
+        return;
+    }
+    let sym = pcx.nodes[child(tps, k, pcx)].a;
+    var w = Vec::<i64, Comp>::new_in(Comp {});
+    bind_walk(0, s, 0, 0, -1, &w, 0, pcx, -1);
+    for e in 0..w.len() as i64 / 4 {
+        let up = w[4 * e + 3];
+        if up >= 0 {
+            let a = add_universal(U_SUBST, sym, e, &sig);
+            let b = add_universal(U_SUBST, sym, up, &sig);
+            sig.bounds.push(a);
+            sig.bounds.push(b);
+        }
+    }
+    var pairs = Vec::<i64, Comp>::new_in(Comp {});
+    decl_pairs(s, 0, 0, &pairs, pcx);
+    var i = 0;
+    while i + 1 < pairs.len() as i64 {
+        let a = add_universal(U_SUBST, sym, pairs[i], &sig);
+        let b = if pairs[i + 1] < 0 { 0 } else { add_universal(U_SUBST, sym, pairs[i + 1], &sig) };
+        sig.bounds.push(a);
+        sig.bounds.push(b);
+        i += 2;
+    }
+}
+
 // RULE: D4.6 (d) In instance f, a bound's associated-type constraint `P:
 // Tr<A = X>` (generics tps) says P::A is X: each slot of P::A, normalized
 // (proj_map, in P's slots), and the same slot of X are one region, both
@@ -1928,6 +1996,7 @@ fn bound_ties(f: i64, tps: i64, self_node: i64, sig: inout Sig<Comp>, pcx: inout
         if k >= pcx.fns[f].targ_count {
             break;
         }
+        subst_wf(k, tlist_at(pcx.fns[f].targs + k, pcx), tps, &sig, pcx);
         let bounds = pcx.nodes[child(tps, k, pcx)].h;
         if bounds <= 0 {
             continue;

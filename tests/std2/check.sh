@@ -16,9 +16,14 @@
 # the XFAIL cases with borrowck errors in std2 (rustc's implied outlives
 # bounds, 0.27.2.1), as known gaps, without failing on them.
 #
-# usage: tests/std2/check.sh [-c COMPILER] [-n] [-v]
+# usage: tests/std2/check.sh [-c COMPILER] [-n] [-r RESULTS] [-v]
 #   -c COMPILER   the volec to run (default: target/volec)
 #   -n            the region-free run only, not the cases
+#   -r RESULTS    (0.27.2.1) a suite run's case results (tests/run.sh's
+#                 VOLE_TEST_RESULTS, the gate's suite-O0 row): the cases it
+#                 passed are not compiled again (that compile had no error,
+#                 and solved every body it reached, std2's too); only the
+#                 others are, the XFAIL ones
 #   -v            print each failing case's tally and borrowck errors
 set -u
 LC_ALL=C
@@ -26,13 +31,15 @@ export LC_ALL
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 C="$ROOT/target/volec"
 CASES=1
+RESULTS=""
 VERBOSE=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -c) [ $# -ge 2 ] || exit 2; C=$2; shift ;;
         -n) CASES=0 ;;
+        -r) [ $# -ge 2 ] || exit 2; RESULTS=$2; shift ;;
         -v) VERBOSE=1 ;;
-        *) echo "usage: tests/std2/check.sh [-c COMPILER] [-n] [-v]" >&2; exit 2 ;;
+        *) echo "usage: tests/std2/check.sh [-c COMPILER] [-n] [-r RESULTS] [-v]" >&2; exit 2 ;;
     esac
     shift
 done
@@ -60,7 +67,19 @@ if [ $CASES -eq 1 ]; then
     # (4 at a time: each case's run writes the borrowck errors at std2
     # positions, `<std>:L:C`, to its own file)
     mkdir -p "$T/cases"
-    ls "$ROOT"/tests/run/std2_*.vl 2>/dev/null | awk '{ print NR " " $0 }' | xargs -P 4 -n 2 sh -c '
+    if [ -n "$RESULTS" ]; then
+        # (0.27.2.1) the cases the suite passed: each compiled without an
+        # error, and a compile with no type error solves every body it
+        # reaches, std2's included; the others (XFAIL ones: a type error
+        # stops a compile before the borrow checker) as below
+        set -- $(awk '$1 ~ /^std2_/ && $2 == "pass" { k++; if ($3 > 0) b++ } END { print k + 0, b + 0 }' "$RESULTS")
+        K=$1 B=$2
+        awk '$1 ~ /^std2_/ && $2 != "pass" { print $1 }' "$RESULTS" |
+            while read -r n; do echo "$ROOT/tests/run/$n.vl"; done >"$T/list"
+    else
+        ls "$ROOT"/tests/run/std2_*.vl >"$T/list" 2>/dev/null
+    fi
+    awk '{ print NR " " $0 }' "$T/list" | xargs -P 4 -n 2 sh -c '
         # ($0 the work directory, $1 the compiler, $2 the number, $3 the case)
         out=$(cd "$0" && VOLE_STD2=1 "$1" --edition rust --std2-check --max-errors=0 "$3" -c -o "$0/cases/$2.o" 2>&1)
         echo "$out" | grep "^<std>:[0-9]*:[0-9]*: error\[borrowck" > "$0/cases/$2.bck"

@@ -103,6 +103,36 @@ The front's gaps behind std2's XFAILs (front2721b):
   reference impls; an ambiguity message for a pattern impl no longer
   reads past TLISTS (the crash at types.vl:608).
 - `{:E}` is UpperExp, and `{:-}` sets Formatter's sign_minus.
+- Deref coercion at an argument: `&Box<T, A>` where `&T` goes, and in a
+  generic call through the Deref chain (`sum(rest)` binds A, F32.2).
+- A bound's `Item = &T` through a supertrait binds T (`Copied<I>`'s
+  DoubleEndedIterator impl, F11.5). Group 3's other `type.infer` cases
+  (a later statement's type, a later match arm's) wait for FL1's deferred
+  inference (0.27.4).
+
+The front's smaller gaps (front2721c):
+
+- A method call counts only the traits in scope: `self.v.fmt(f)` with
+  only `Binary` imported is Binary's, not ambiguous with Display and
+  Debug (F9.2).
+- A trait default's own parameter, renamed where an impl has one of its
+  name, is renamed in a path's head too: `B::from_iter_in(..)` in
+  `collect_in` on a `Map`, `Zip` or `Enumerate` (F12.2).
+- A struct's impl of a spec's trait writes the hole: `{:b}` with `impl
+  Binary for W`, `{:x}`, `{:o}`, `{:e}` and `{:p}` likewise (F16.5).
+- The primitives' builtin `Sum<&'a P>` and `Product<&'a P>`
+  (`v.iter().sum()`, F15.1); char is Clone and Copy.
+- std2's `Stdin::read_line` annotates its result, so the stdin cases run.
+- An impl parameter fixed by a closure bound's result with arguments
+  binds (`P: FnMut(I::Item) -> Option<B>`: MapWhile, Scan, FromFn, Fuse;
+  F14.1), and a tuple of literals indexes as the impl's index type
+  (`g[(0, 1)]` with `Index<(usize, usize)>`, F20.5).
+- An operator's right operand of another type picks the impl for it:
+  `s == "x"` for a String, `v == *slice`, a Vec against one on another
+  allocator, `s + "bar"` (F26.3).
+- `<T as Tr>::f(..)` in an expression, T a name: `<i32 as
+  FromStr>::from_str("-7")` (F8.4).
+
 The borrow checker (bc2721):
 
 - Implied outlives bounds as rustc's well-formedness (borrowck.md
@@ -113,12 +143,42 @@ The borrow checker (bc2721):
   for `[T]` or `str`; `Self` of a trait's default method as a type
   parameter; a bound's `Item = T` and trait arguments
   (`B: FromIteratorIn<Self::Item, A>`) as equalities; a blanket impl's
-  projection (`U::IntoIter` of an iterator). 28 std2 tests and 3
+  projection (`U::IntoIter` of an iterator); a substitution's own
+  implied bounds (`&'m mut I` gives I's slots `: 'm`). 30 std2 tests and 3
   `rust_t_` cases that failed on `borrowck.outlives` or
   `borrowck.elision` now pass; `tests/std2/check.sh`'s known-gap XFAIL
-  cases with borrowck errors in std2 fall from 45 to 6 (each a front
-  gap: `&mut self` on an impl for a view type reads as `inout [u8]`).
-  10 `rust_b_implied_` cases, each agreeing with rustc.
+  cases with borrowck errors in std2 fall from 45 to 9 (17 with
+  std2's later tests: 14 a front
+  gap: `&mut self` on an impl for a view type reads as `inout [u8]`;
+  three Chain cases are L14, an impl's equality bound on a type
+  argument). 11 `rust_b_implied_` cases, each agreeing with rustc.
+- `for x in v` over a place moves v in the rust edition (D8.5): the
+  loop's sequence owns it and `into_iter` takes it, where it was a
+  borrowed copy, so v was dropped again after the iterator had freed it
+  (a double free under `--check-alloc` for `for` over a Vec, a HashSet
+  or a generic sequence, `extend`, `into_keys`, `into_values`,
+  `flatten`). 9 cases that failed on it pass.
+- Moves out of an index (D8.6, rustc E0508): an index of a non-Copy array
+  or slice element is a place with no move path, a constant index too,
+  so `let x = a[0]` is `borrowck.move_out`, named as "an element of an
+  array (a slice) whose type is not Copy". A whole-array move, a borrow
+  of an element, a Copy part or a Copy element's constant index stay
+  allowed. By-value `for` over an array of non-Copy elements still
+  reads them by reference (F22.1) until std2 has an array `IntoIter`.
+- `write(w, ..)`'s writer is a two-phase reborrow, as Rust's `write!`
+  receiver (D7.4): `write(f, "{}", f.width())` reads f while the
+  reborrow is reserved, and f is usable after the call, where the
+  desugaring moved f (`borrowck.use_moved`). 6 Formatter cases pass.
+- An arithmetic operator moves its operands in the rust edition (D8.5):
+  `a + b` is `Add::add(a, b)`, where the operands' bindings were
+  borrowed copies, so an operand with a drop was dropped again at the
+  end of its scope (a double free, already in 0.27.2); a comparison's
+  stay borrowed. `rust_b_ops_` cases for `+`, `+=`, `==` and a use after
+  the move.
+- A statement's operands are read in order (D8.5): `(t, t)`, `[t, t]`
+  and `S { a: t, b: t }` of a non-Copy t are a use after move (E0382),
+  in generic bodies too, where the second move went unseen. 6
+  `rust_b_moves_` cases.
 
 std2 (std2721):
 
@@ -176,6 +236,40 @@ Contracts and effects R2 (eff2721, docs/design/contracts-effects.md):
   `len() <= capacity()`; String's push and clear), each with a
   `std2_contract_*` case. A query in query mode no longer reaches ⊤
   through an error-typed instance's fn value.
+
+Compile cost and the machine's load (cost2721):
+
+- hello-rust from 4.38x its MVS row to 3.35x (`tests/compile_cost.sh`,
+  434M to 327M instructions); MVS's rows are not dearer: hello 0.99x,
+  std 0.99x, check 0.91x, rust 0.97x of 0.27.2. std2's declaration
+  tables are walked by key, not scanned whole: the lifetimes by node,
+  the `where` predicates by owner, METHODS by type and name, the impls
+  by trait. gm_key keeps a method's name in the bits HMap hashes.
+  std2's impls are not checked against their traits in every compile;
+  the gate's `--std2-check` row checks them whole.
+- What is left of hello-rust's cost over MVS's is structural: std2 is
+  lexed and parsed whole (+47M), its 489 builtin impls are made and
+  parsed (33M), and its println costs the back end +40M. A pass that
+  left out the impls of traits nothing reaches was measured and dropped:
+  println reaches nearly every trait, and the pass cost more than the 95
+  impls it left out. 0.27.3 takes lazy std2 parsing, in sections as MVS's
+  std is read, with a lighter std2 println.
+- The gate builds std2's cases three times, not six. The std2-tests row
+  reads its counts from the suite rows' case results ($VOLE_TEST_RESULTS),
+  and std2-check compiles only the cases suite-O0 did not pass (283 of
+  1,413), with the same tally.
+- The check hook reports its rewrites when the check after them times
+  out, and its compiler runs' limits grow with the load average (at most
+  8 times): the hooks test "the hook's rewrites, each a changed line"
+  failed under the gate's load.
+- The stress-grow row's one-time segfault (arch_x86_sse3.vl at -O0 for
+  x86_64-macos) did not recur in 42,400 compilations under load.
+
+The front (front2721):
+
+- `impl Trait` in return position (docs/design/borrowck.md §21): `fn f(..) -> impl Tr + ..` at the top of a free function's or an inherent method's result is an opaque type, one per function and instance (`front/opaque.vl`). Its hidden type is the body's type: every `return` and the tail must be that one type (`opaque.mismatch`), and it must meet each bound. A closure leaves its function by `-> impl Fn*(..)`, its parameters typed by the bound. The caller sees only the bounds' methods (rustc E0599 for any other), the bounds' traits and the blanket impls they entail. The type is `Copy` only when a bound says so, it converts to nothing, and `Send`/`Sync` leak from the hidden type. A caller checked before the function gets the function's body checked first. A hidden type that holds the result itself is `opaque.cycle` (E0720). `Option<impl Tr>`, a trait method's `-> impl Tr` and `let x: impl Tr` are `edition.later: impl_trait_nested (0.29)`.
+- Regions of an `impl Trait` result follow Rust 2024: every input lifetime is captured. While the result is live, every argument's loan is too. Each slot of the hidden type is one of the inputs or `'static`, and a slot that holds loans of two unrelated inputs is `opaque.ambiguous` (rustc E0700). 24 `rust_b_rpit_*` cases, checked against rustc 2024 by `tools/borrowck-twin.sh`, which now reads a case's `// RUSTC-EDITION: 2024`. `volec explain opaque.mismatch|opaque.ambiguous|opaque.cycle`.
+- `&T: Copy` on std2: a `T: Copy` bound holds for a shared reference (it failed for `&u8`).
 
 ### What's new in 0.27.2
 
