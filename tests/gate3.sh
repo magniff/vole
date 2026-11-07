@@ -20,6 +20,13 @@
 # errors in the bodies that type-checked (`check --borrowck-partial`:
 # borrowck runs only on a program without type errors otherwise, so N
 # hides them; DIR/borrowck.log keeps them).
+# A known gap (0.27.5's notes, a design item of its own): MVS's
+# `static var SRC: [u8]` is translated `static mut SRC: &'static [u8]`,
+# which is unsound: add_source appends to SRC's buffer (a realloc) and
+# resets SRC, so a view of it does not live for 'static. A clean N does
+# not make that sound; SRC's rust-edition form (an owned buffer with
+# offsets, or accessors over (ptr, len)) is planned apart.
+#
 # Exits 1 only when the translator or the check could not run (a crash,
 # no output); errors left are the measurement, not a failure.
 

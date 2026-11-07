@@ -104,6 +104,69 @@ The front (fl10274):
   (which keeps it). This hid 348 of gate 2's bad translations, most of
   them `str::from_utf8("..")` around a literal.
 
+The front (front275):
+
+- A rust body reads each operand where it is evaluated, as Rust does
+  (borrowck.md D2.4a). A Copy place given as an argument, a literal's
+  element or an assignment's right side is copied out at that point.
+  - The view or reference it reads through ends there, so rustc's
+    accepted shapes now pass the borrow checker:
+    `err_begin(pcx.nodes[p].start, pcx)`, `pcx.nodes[p].b =
+    pcx.nodes[q].a`, `v.push(v[0])`, `f(s.x, &mut s)`, `g(y, &mut y)`.
+    Gate 3's `check --borrowck-partial` goes from 3,049 errors to 313
+    (conflicts from 2,951 to 215).
+  - It is also a run-time fix: `f(x, { x += 1; x })` now passes the old
+    `x` first, and `v[{ y += 1; 0 }] = y` stores the old `y`, as in Rust.
+  - MVS is unchanged.
+  - The same goes for the left side of a primitive binary operator when
+    its right side may run a statement: `pcx.nodes[n].a ==
+    intern(c"Self", pcx)` is accepted, and `x + f(&mut x)` adds the old
+    `x`.
+- A shared borrow of a literal, or of an array, tuple or repeat of
+  literals, lives for the whole body (borrowck.md D2.8, rustc's
+  promotion), so `if sub { &["sub", "checked_sub"] } else { &["add"] }`
+  can be used after its branch. `&[x, 1]` and `&[f()]` stay their
+  branch's temporaries, as in rustc. A promoted borrow still cannot
+  leave the function (L2).
+- With both, gate 3's borrowck errors go from 307 to 286: conflicts from
+  215 to 201, dropped_borrowed from 7 to 0. All 286 are the translator's
+  to fix; for each shape rustc rejects the same code.
+
+The translator (g3274):
+
+- A result's views where elision cannot tie them: with no parameter to
+  borrow from, every view in the result is `'static`, inside it too
+  (`Vec<Opt<'static>, Gpa>`); with two or more and no `self`, the
+  function's `'a`, on the result and on each parameter taken by a shared
+  reference (`&mut` ones keep their own). Gate 3's borrowck.elision: 40
+  to 4.
+- No move out of an index: an `if` of two places given to a reference
+  parameter borrows each branch (`if c { &a.x } else { &a.y }`), and
+  rewrite.tsv's `Vec::free`/`String::free` on an element (`$r=index`, a
+  new condition) is `{ $r.clear(); $r.shrink_to_fit(); }`.
+- `'static` results by an explicit list in sig.vl's static_result, each
+  with its evidence: base::sym_text (intern's copies and the cache's
+  buffer, never freed), tools::patch::target (argv),
+  tools::testrun::build_key (a fresh buffer). A view of SRC is not
+  `'static` (add_source reallocates it): tools/probe keeps two offsets
+  in place of its view, and lex_text_block reads `SRC[0..lex_end]`
+  itself. MVS's `static var SRC: [u8]` stays a known gap (its
+  translation `static mut SRC: &'static [u8]` is unsound), a design item
+  of 0.27.5's.
+- `str::from_utf8(..).unwrap()` only for a printed value that is bytes
+  where it is declared: a binding, parameter, field, static or constant
+  written `[u8]` (or an element of one written `[[u8]; N]`), a call whose
+  result is, a part, a borrow, a block or an `if` of such values. A
+  literal, an `if` of literals, a `str` binding and an element of a
+  `[str; N]` stay text: 0.27.4's twin agreed on 305 of the 911
+  round-tripped programs, 230 of its rejections `str::from_utf8("..")`;
+  the same programs now agree on 522 of 559. A literal that is a
+  static's or a constant's `[u8]` value, or an `if` branch beside
+  declared bytes, is `b".."`.
+- Gate 3 so far: 121 errors (117 type error, 2 edition.lenient, 1
+  distinct.mix, 1 item.private); borrowck (partial), with front275's
+  D2.4a: 161.
+
 ### What's new in 0.27.4
 
 Gate 3 opens. `volec fix --edition rust` run on a copy of compiler/src leaves N errors, printed by the gate's `gate3` row every release; 0.28 starts at N = 0. Its first full measurement was 1,414 (after 0.27.3's three parse shapes); 0.27.4 leaves 122 type errors, most of them std2 modules the compiler uses that std2 does not have yet (`std::cli`, `fs`, `process`, `gpu`), and `volec check --borrowck-partial` counts the 3,048 borrowck errors behind them, about 2,750 of one shape that 0.27.5's first item fixes (an operand read where it is evaluated, D2.4a). In the rust edition: a type is inferred from a later statement (FL1, F18.6: `Vec::new_in(a)` then a push, a later arm, `"4".parse().unwrap()`, `_` in a type); `[T]` and `str` are unsized places that `&[T]` and `&str` refer to (Z9.1c step B: impls keyed by them, method lookup through a view, `NonNull<[u8]>` 16 bytes); `&raw const`/`&raw mut` (F30.2), and a reference to a `static mut` refused as Rust 2024 does (D6.2.5); `format_args(..)` a Display value (F16.4); indexing through `&mut [T; N]` (F20.1). std2 passes 1,445 of its 1,473 tests at -O0 (1,402 of 1,472 in 0.27.3). A rust hello world's check is 2.03x MVS's (2.32x): builtin impls only for the primitives a program brings in (F15.1), and std2's own settled bodies are not borrow-checked again (Z7.2); the 2.0x ceiling is printed, enforced from 0.27.5. A crash on a closure capturing a widened integer, in MVS too, is fixed. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
