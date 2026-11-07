@@ -1155,6 +1155,13 @@ tuple type of as many elements for a tuple): `let b: &[i64; 2] = if c {
 }` where `&(i64, bool)` goes type their literals from `U`, as rustc's
 expectation does. So does a sliced array literal where `&[U]` goes,
 `if c { &[1, 2, 3][1..] } else { &[0][..] }`: the array is a `[U; N]`.
+Where `&mut [U]` goes (0.27.6), the slice is checked as `[U]` and the
+reference is the exclusive one, so `&mut [1, 2, 3][..]` passed to a `&mut
+[i64]` is accepted, as rustc accepts it (0.27.5 checked the slice against
+`&mut [U]` and refused it). A shared `&` there becomes exclusive, as any
+`&e` where `&mut` goes does (check_mode: check_expr, the inout marker):
+rustc refuses `&[1, 2, 3][..]` there (E0308), a known gap of the rust
+edition's `&`, which a translation must not rely on.
 Not yet the same slicing as a `let`'s whole initializer, `let s: &[i64]
 = &[1, 2, 3][1..];`, which F18.4's hoisting takes first (the fallback,
 `i32`: a type error). *Anchor:* `check_mode.vl: check_expr_inner`.
