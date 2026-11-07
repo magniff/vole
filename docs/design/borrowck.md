@@ -783,11 +783,15 @@ project's rule: every error of a compilation), deduped by §14.3.
    Ends`), never killed (a static has no `StorageDead` and is never
    assigned); it takes part in conflicts like any shared loan (writes to
    an immutable static do not exist). `&S` and `&mut S` of a `static
-   mut`: `error borrowck.static_mut_ref` (Rust 2024's rule: no
-   references to a `static mut`), inside or outside `unsafe`, `try:`
-   the raw address `&raw mut S` (`BK_RAW`, R1: no loan); ir271
-   implements it at the front (the borrow expression's operand is a
-   `static mut` item), so no loan of a `static mut` reaches the solve.
+   mut`, or of a part of it, are `error borrowck.static_mut_ref` (Rust
+   2024's rule: no references to a `static mut`), inside or outside
+   `unsafe`, and so is one coerced where a raw pointer goes (`let p:
+   *mut T = &mut S;`: rustc "creating a mutable reference to mutable
+   static"); the help is the raw address `&raw mut S`. Only `&raw const
+   S` and `&raw mut S` (front-rust.md F30.2: `BK_RAW`, R1, no loan) take
+   it. ir271 implements it at the front (the borrow expression's operand
+   is a `static mut` item, and the `&` is not a raw borrow), so no loan
+   of a `static mut` reaches the solve.
 
 ## 7. Two-phase borrows (S7)
 

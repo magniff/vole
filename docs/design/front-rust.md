@@ -395,7 +395,10 @@ gap 13, where MVS makes the cast itself unsafe). Everything else is
 `error type.cast` (E0605/E0606). *Anchor:* `synth_cast` ("cannot cast
 ..", today requiring `unsafe` for int→ptr), `front/check/unsafety.vl`. (0.27.3:
 `&T as *const U` with `U` not `T` is an error, rustc E0606; it read a
-`T` as a `U`.)
+`T` as a `U`.) (0.27.4: `e as *const _` and `e as *mut _` take the
+pointee from the operand, `T` of a `&T`, `&mut T`, `*const T` or `*mut
+T`; of any other operand, an integer, the pointee is not known: `error
+type.cast`, rustc E0641 "cannot cast to a pointer of an unknown kind".)
 
 **F29.2 (fat pointers).** Z9.3.
 
@@ -417,12 +420,20 @@ raw pointer (today: `&(*p).f` of a raw pointee is a raw pointer, M3a's
 gap 1). *Anchor:* `front/check/synth_mode.vl: synth_unary` (the `&` of
 a raw deref), `front/check/rust.vl: note_const_ptr, const_write`.
 
-**F30.2 (`&raw`).** `&raw const place` and `&raw mut place` are the
-raw-pointer forms (`*const T`, `*mut T`), with no reference made and no
-`unsafe` needed for a place through `*p` beyond the deref's; they are
-what std2 writes where it wants the address (`&raw const (*p).field`).
-Rust's reference "Borrow expressions" (raw borrows). *Anchor:* the
-parser's unary `&` (`front/parser/exprs.vl`), `synth_unary`.
+**F30.2 (`&raw`).** In the rust edition `&raw const P` and `&raw mut P`
+(P a place) are the raw-pointer forms, `*const T` and `*mut T` for P of
+type T: the address, with no reference made and no loan (borrowck.md
+R1, `BK_RAW`); `raw` is a contextual word, an identifier elsewhere. `&raw
+mut P` needs P mutable as `&mut P` does (a `let` without `mut`: rustc
+E0596). A value that is not a place is an error (rustc: "cannot take
+address of a temporary", E0745). No `unsafe` is needed beyond P's own:
+the deref in `&raw const (*p).field`, a `static mut` S's use in `&raw
+const S.n` (F19.6, E0133); the bare `&raw mut S` of a `static mut` is
+safe, as rustc's. It is how a `static mut` is reached (borrowck.md
+D6.2.5): `let p: *mut T = &raw mut S;`. *Anchor:*
+`front/parser/exprs.vl: parse_prefix` (NODE_RAW_BORROW on the `&`),
+`front/check/rust.vl: raw_borrow` (from `synth_unary`),
+`places/build.vl: ref_kind, emit_ref`.
 
 **F30.3 (no indexing of a raw pointer).** In a rust-edition position
 `p[i]` and `p[a..b]` with `p: *const T` or `*mut T` are `error type`
