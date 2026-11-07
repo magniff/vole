@@ -234,7 +234,25 @@ D2.2 lists. A two-phase activation (D7.1) is performed after step (1),
 once every operand's own access is done: a call's arguments are read
 before the call activates its receiver (`s.add(s.x)` reads `s.x` while
 the reservation is still shared; the IR has `copy _1.0` as an operand
-of the call, not a statement before it). Consequences: `x = &mut *x`
+of the call, not a statement before it). (0.27.5) In a rust body an
+operand is read where it is evaluated, as rustc's `as_operand`: a Copy
+place operand of a call argument (or a callee value), of an array,
+tuple, struct or variant literal's element, or of an assignment's right
+side (`=` and `op=`) is copied into a fresh temporary at that point,
+`_t = copy P`, and the statement reads `copy _t`. So a view or a
+reference it reads through is dead after the copy (D3.7) and its loan
+ends there: `f(pcx.nodes[p].start, pcx)` (the slice view of
+`pcx.nodes` is dead before `pcx`'s reborrow is activated), `pcx.nodes[p].b
+= pcx.nodes[q].a`, `v.push(v[0])`; and what is evaluated after it sees
+the old value, as Rust's left-to-right order says: `f(x, { x += 1; x })`
+passes the old `x` first, `f(s.x, &mut s)` and `g(y, &mut y)` are
+accepted. Exempt (read in place, as before): a whole temporary of the
+builder's (no later operand names it), and the last operand of its
+statement when nothing it reads holds a loan, a place of a local whose
+type has no region slot reached by field and constant-index steps only
+(no deref, no index). Moves are unchanged (D8.5's in-order rule; a
+rust-edition argument moved out of a place already gets its own `_t =
+move P`). MVS keeps the deferred read. Consequences: `x = &mut *x`
 (`x: &'x mut T`):
 (2) borrows `*x` with the supporting-prefix constraint `'x : 'new`; (3)
 the shallow write to `x` meets other loans of `*x…` as `Extends` through
