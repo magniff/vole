@@ -72,6 +72,103 @@ fn main(gpa: Gpa) -> i32 {
 2 7 26
 ```
 
+## Translating an MVS program: fix --edition rust (0.27.3)
+
+`volec fix --edition rust FILE|DIR` rewrites an MVS program, in place,
+into the rust edition (`--dry-run`: the diff only). It reads the program
+as MVS checks it, so each rewrite follows the types:
+
+- parameters: a let parameter MVS borrows is `&T` (a copy stays `T`),
+  `inout T` is `&mut T`, `sink T` is `T`, a view `[T]` is `&[T]` (`[u8]`
+  is `&str` when the program uses its bytes as text only); receivers
+  `&self`, `&mut self`, `self`;
+- calls: the inout marker `&x` is `&mut x`, a value a let parameter
+  borrows is given as `&x`, a reference read as a copy or assigned is
+  `*r`; std's calls by compiler/std2/rewrite.tsv's rows, chosen by type
+  (`v.get(i)` is `v[i]` for a Copy element);
+- locals: `var` is `let mut`, `inout r = &e` is `let r = &mut e`, an
+  integer literal MVS types as i64 by default gets `: i64`;
+- items: a copy type derives Clone and Copy, std's paths are std2's,
+  `println(x)` is `println("{}", x)`.
+
+No line moves (the `// EDITION: rust` line ends the root file), so a
+position the program prints stays. What it cannot decide is left as
+written and counted (`note fix.edition_left`; `--list-left` names each
+place); the rust check's errors follow. The MVS program:
+
+```vole
+struct Point { x: i64, y: i64 }
+
+fn total(v: Vec<i64, Gpa>) -> i64 {
+    var t = 0;
+    for i in 0..v.len() {
+        t += v.get(i);
+    }
+    t
+}
+
+fn shift(p: inout Point, d: i64) {
+    p.x += d;
+    p.y += d;
+}
+
+fn keep(v: sink Vec<i64, Gpa>) -> usize { v.len() }
+
+fn main(gpa: Gpa) {
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
+    v.push(3);
+    v.push(4);
+    var p = Point { x: 1, y: 2 };
+    shift(&p, 10);
+    let q = p;
+    println(total(v));
+    println("{} {} {}", q.x, q.y, keep(v));
+}
+```
+
+```out
+7
+11 12 2
+```
+
+and what `fix --edition rust` makes of it, which prints the same:
+
+```vole
+#[derive(Clone, Copy)] struct Point { x: i64, y: i64 }
+
+fn total(v: &Vec<i64, Gpa>) -> i64 {
+    let mut t: i64 = 0;
+    for i in 0..v.len() {
+        t += v[i];
+    }
+    t
+}
+
+fn shift(p: &mut Point, d: i64) {
+    p.x += d;
+    p.y += d;
+}
+
+fn keep(v: Vec<i64, Gpa>) -> usize { v.len() }
+
+fn main(gpa: Gpa) {
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
+    v.push(3);
+    v.push(4);
+    let mut p = Point { x: 1, y: 2 };
+    shift(&mut p, 10);
+    let q = p;
+    println("{}", total(&v));
+    println("{} {} {}", q.x, q.y, keep(v));
+}
+// EDITION: rust
+```
+
+```out
+7
+11 12 2
+```
+
 ## The seams of 0.27.0 and 0.27.1 (MVS std), gone
 
 Until 0.27.2 the edition ran on MVS's std, and two places differed from

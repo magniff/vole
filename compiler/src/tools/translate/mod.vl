@@ -27,8 +27,11 @@
 // lines: the translation is written as a step (`--dry-run`: the diff).
 
 pub mod body;
+pub mod mutable;
 pub mod paths;
+pub mod rows;
 pub mod sig;
+pub mod statics;
 pub mod table;
 
 use crate::base::{
@@ -64,7 +67,13 @@ pub const TC_IMPORT: i64 = 14;
 pub const TC_BYTES: i64 = 15;
 pub const TC_TYPE: i64 = 16;
 pub const TC_DERIVE: i64 = 17;
-pub const TC_COUNT: i64 = 18;
+pub const TC_STD: i64 = 18;
+pub const TC_TEXT: i64 = 19;
+// (0.27.3) a static mut use put in unsafe { } (statics.vl)
+pub const TC_UNSAFE: i64 = 20;
+// (0.27.3) an i64 index cast to usize (body.vl)
+pub const TC_USIZE: i64 = 21;
+pub const TC_COUNT: i64 = 22;
 
 // How a parameter is taken (Tr.decided).
 pub const D_VALUE: i64 = 1;
@@ -75,7 +84,9 @@ pub const D_MUT: i64 = 3;
 pub const TL_AMPAMP: i64 = 0;
 pub const TL_SHARED_LOCAL: i64 = 1;
 pub const TL_PRINT: i64 = 2;
-pub const TL_COUNT: i64 = 3;
+pub const TL_ROW: i64 = 3;
+pub const TL_BYTES: i64 = 4;
+pub const TL_COUNT: i64 = 5;
 
 // The translator's state, for one run.
 pub struct Tr {
@@ -97,18 +108,23 @@ pub struct Tr {
     // (sig.vl: an impl of PartialEq's or Ord's method, whose operand is
     // `&Self` in Rust)
     pub force_ref: bool,
+    // (body.vl: text_program) `[u8]` is `&str`: the program's bytes are text
+    pub text_mode: bool,
     // node + 1 -> its parent (the checked tree)
     pub parent: HMap,
     // the reference bindings: (from, to, name) triples, a name that is a
     // reference (`&T`, `&mut T`) in the rust edition within [from, to)
     pub refs: IntVec,
-    pub counts: [i64; 18],
-    pub left: [i64; 3],
-    // (pos, reason) pairs
+    pub counts: [i64; 22],
+    pub left: [i64; 5],
+    // (pos, reason, note) triples
     pub left_at: IntVec,
     pub sym_self: i64,
     pub sym_len: i64,
     pub sym_allocator: i64,
+    // (sig.vl) the result types, views, of the functions that take no
+    // reference: `&'static` (node + 1 -> 1)
+    pub static_res: HMap,
 }
 
 fn tr_new() -> Tr {
@@ -122,14 +138,16 @@ fn tr_new() -> Tr {
         rows: IntVec { data: 0 as *i64, count: 0, cap: 0 },
         row_free: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
         force_ref: false,
+        text_mode: false,
         parent: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
         refs: IntVec { data: 0 as *i64, count: 0, cap: 0 },
-        counts: [0; 18],
-        left: [0; 3],
+        counts: [0; 22],
+        left: [0; 5],
         left_at: IntVec { data: 0 as *i64, count: 0, cap: 0 },
         sym_self: 0,
         sym_len: 0,
         sym_allocator: 0,
+        static_res: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
     }
 }
 
@@ -191,8 +209,43 @@ pub fn put(a: i64, b: i64, text: [u8], what: i64, tr: inout Tr, pcx: inout Ctx<C
     true
 }
 
+// Text inserted at pos before the insertions made there already (put's
+// come after them): the closing of what wraps an expression, inside
+// what was put after it (`unsafe { Z }) as usize`), or an import before
+// an item's new attribute. Whether it was made.
+pub fn put_first(pos: i64, text: [u8], tr: inout Tr, pcx: inout Ctx<Comp>) -> bool {
+    let t = buf_new();
+    buf_bytes(t, text);
+    if !editable(pos, &pcx) || !edit_replace(pos, pos, t, &pcx) {
+        return false;
+    }
+    let last = pcx.e_start.count - 1;
+    var i: i64 = 0;
+    while i < last && !(pcx.e_start.get(i) == pos && pcx.e_end.get(i) == pos) {
+        i += 1;
+    }
+    var j = last;
+    while j > i {
+        pcx.e_start.set(j, pcx.e_start.get(j - 1));
+        pcx.e_end.set(j, pcx.e_end.get(j - 1));
+        pcx.e_text.set(j, pcx.e_text.get(j - 1));
+        j -= 1;
+    }
+    if i < last {
+        pcx.e_start.set(i, pos);
+        pcx.e_end.set(i, pos);
+        pcx.e_text.set(i, t);
+    }
+    true
+}
+
 // A place left to hand, once.
 pub fn left(pos: i64, why: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    left_note(pos, why, 0, &tr, &pcx);
+}
+
+// A place left to hand, once, with a note (a buffer; 0: none).
+pub fn left_note(pos: i64, why: i64, note: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     let key = pos * 64 + 63 + 2;
     if !editable(pos, &pcx) || tr.done.get(key) != 0 {
         return;
@@ -201,6 +254,7 @@ pub fn left(pos: i64, why: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     tr.left[why] += 1;
     tr.left_at.push(pos);
     tr.left_at.push(why);
+    tr.left_at.push(note);
 }
 
 // The token that starts at pos, or -1 (pos inside a token, a string's
@@ -321,9 +375,23 @@ fn build_parents(tr: inout Tr, pcx: Ctx<Comp>) {
 fn mark_clones(tr: inout Tr, pcx: Ctx<Comp>) {
     var stack = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     var kids = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    // (a template no instance is checked in place of, as one with a
+    // closure's type argument: its first instance's copy is the one read)
+    var in_place = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    for f in 0..pcx.fns.len() as i64 {
+        let t = pcx.fns[f].tmpl;
+        if t > 0 && pcx.fns[f].node > 0 && pcx.fns[f].node == pcx.fns[t - 1].node {
+            in_place.put(t, 1);
+        }
+    }
     for f in 0..pcx.fns.len() as i64 {
         let node = pcx.fns[f].node;
-        if pcx.fns[f].tmpl > 0 && node > 0 && node != pcx.fns[pcx.fns[f].tmpl - 1].node {
+        let t = pcx.fns[f].tmpl;
+        if t > 0 && node > 0 && node != pcx.fns[t - 1].node {
+            if in_place.get(t) == 0 {
+                in_place.put(t, 2);
+                continue;
+            }
             stack.push(node);
         }
     }
@@ -514,8 +582,12 @@ fn left_reason(why: i64) -> [u8] {
         "a reference to a reference ('&&'): by hand"
     } else if why == TL_SHARED_LOCAL {
         "a shared reference local ('let r = &e;'): check the borrow"
-    } else {
+    } else if why == TL_PRINT {
         "a print of a value that is not a format literal's: by hand"
+    } else if why == TL_ROW {
+        "a std call rewrite.tsv leaves to hand (its note says how)"
+    } else {
+        "bytes used both as text and as bytes: [u8] kept as &[u8] (str::from_utf8 where it prints)"
     }
 }
 
@@ -529,14 +601,18 @@ fn report_left(tr: Tr, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     }
     if tcx.conv_list_left {
         var i: i64 = 0;
-        while i + 1 < tr.left_at.count {
+        while i + 2 < tr.left_at.count {
             let pos = tr.left_at.get(i);
             let d = diag(c"note", c"fix.edition_left", &tcx);
             put_pos(d, pos, pcx);
             buf_bytes(d, ": ");
             buf_bytes(d, left_reason(tr.left_at.get(i + 1)));
+            if tr.left_at.get(i + 2) != 0 {
+                buf_bytes(d, ": ");
+                buf_bytes(d, buf_slice(tr.left_at.get(i + 2)));
+            }
             buf_bytes(d, "\n");
-            i += 2;
+            i += 3;
         }
     }
     let d = diag(c"note", c"fix.edition_left", &tcx);
@@ -571,10 +647,17 @@ pub fn translate_edits(tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     crate::tools::translate::paths::load_tables(&tr, &pcx);
     build_parents(&tr, pcx);
     mark_clones(&tr, pcx);
+    tr.text_mode = crate::tools::translate::body::text_program(tr, &pcx);
+    if !tr.text_mode && crate::tools::translate::body::prints_bytes(tr, &pcx) {
+        left(if pcx.files.len() > 0 { pcx.files[0].start } else { 0 }, TL_BYTES, &tr, &pcx);
+    }
     crate::tools::translate::sig::signature_edits(&tr, &pcx);
     crate::tools::translate::body::body_edits(&tr, &pcx);
+    crate::tools::translate::statics::static_edits(&tr, &pcx);
+    crate::tools::translate::mutable::mutable_edits(&tr, &pcx);
     file_edits(&tr, &pcx);
     crate::tools::translate::paths::path_edits(&tr, &pcx);
+    crate::tools::translate::rows::row_edits(&tr, &pcx);
     report_left(tr, &tcx, pcx);
     var total = 0;
     for i in 0..TC_COUNT {
@@ -599,6 +682,11 @@ pub fn translate_edits(tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     put_count(out, tr.counts[TC_IMPORT], "import", "imports");
     put_count(out, tr.counts[TC_BYTES], "text literal to bytes", "text literals to bytes");
     put_count(out, tr.counts[TC_TYPE], "type", "types");
+    put_count(out, tr.counts[TC_STD], "std call by rewrite.tsv", "std calls by rewrite.tsv");
+    put_count(out, tr.counts[TC_TEXT], "text view to &str", "text views to &str");
+    put_count(out, tr.counts[TC_UNSAFE], "static mut use put in unsafe",
+        "static mut uses put in unsafe");
+    put_count(out, tr.counts[TC_USIZE], "index cast to usize", "indexes cast to usize");
     put_count(out, tr.counts[TC_DERIVE], "copy type derived Clone, Copy",
         "copy types derived Clone, Copy");
     tcx.tr_summary = out;

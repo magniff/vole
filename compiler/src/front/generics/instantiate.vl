@@ -41,6 +41,7 @@ use crate::front::generics::{
     instance_of, instance_targs, is_untyped_literal_expr, mangle_type, mark_synthed, param_default,
     same_targs, shown_targs, take_targs, targ_count_error, template_instance,
 };
+use crate::front::lexer::Tok;
 use crate::front::modules::module_of;
 use crate::front::traits::check_bounds;
 use crate::front::types::{
@@ -556,7 +557,26 @@ fn infer_from(params: i64, bound: *i64, tmod: i64, args: i64, first: i64, types:
         }
         // (0.14: pass 2, the closures, typed from their parameters' bounds;
         // then what the bounds' constraints bind)
-        for pass in 0..3 {
+        // (0.27.3, rust edition: pass 3, the literals pass 1 left for a
+        // closure, whose result may bind their parameter: `map_or(0, |x| x
+        // + 1)` with x an i64 binds U to i64, rustc's order. RULE: F18.1)
+        var closures = false;
+        if pcx.edition != 0 && crate::front::rust::rust_at(pcx.nodes[args].start, &pcx) {
+            for i in first..pcx.nodes[args].count {
+                if is_deferred_arg(child(args, i, pcx), pcx) {
+                    closures = true;
+                }
+            }
+        }
+        for pass in 0..(if closures { 5 } else { 3 }) {
+            // (0.27.3, rust edition: before the literals, what a bound `Fn`
+            // argument binds, `map_one(4, double)` with `double: fn(i64)`)
+            if pass == 1 && pcx.edition != 0
+                && crate::front::rust::rust_at(pcx.nodes[args].start, &pcx) {
+                for k in 0..count {
+                    infer_from_fn_bound(params, bound, tmod, k, &pcx);
+                }
+            }
             for i in first..pcx.nodes[args].count {
                 let k = first_type + i - first;
                 if k >= pcx.nodes[types].count {
@@ -575,13 +595,28 @@ fn infer_from(params: i64, bound: *i64, tmod: i64, args: i64, first: i64, types:
                     continue;
                 }
                 if is_deferred_arg(arg, pcx) {
-                    if pass == 2 {
+                    // (0.27.3: with the literals waiting, a closure whose
+                    // parameters are not all known waits for them, pass 4)
+                    // (and one whose value is a literal, `|| -1`, which takes
+                    // the result type the others give)
+                    if pass == 2 && (!closures
+                        || crate::front::closures::fn_bounds::closure_ready(params, bound, p, pcx)
+                        && !crate::front::check::synth_mode::is_context_value(pcx.nodes[arg].a,
+                            pcx))
+                        || pass == 4 {
                         infer_closure_arg(params, bound, tmod, arg, p, &pcx);
                         mark_synthed(arg, &pcx);
                     }
                     continue;
                 }
-                if pass == 0 && is_untyped_literal_expr(arg, pcx) || pass == 2 {
+                // (0.27.3: an array of untyped literals, rust edition, goes
+                // with them: `Vec::from_in([1, 2], gpa)` takes T from the
+                // expected type. RULE: F18.3)
+                let lit = is_untyped_literal_expr(arg, pcx) || pcx.edition != 0
+                    && crate::front::check::synth_mode::is_context_value(arg, pcx)
+                    && crate::front::rust::rust_at(pcx.nodes[arg].start, &pcx);
+                if pass == 0 && lit || pass == 2 || pass == 1 && lit && closures
+                    || pass == 3 && !lit || pass == 4 {
                     continue;
                 }
                 var t = pcx.nodes[arg].ty;
@@ -591,7 +626,21 @@ fn infer_from(params: i64, bound: *i64, tmod: i64, args: i64, first: i64, types:
                         pcx.hint_node = arg;
                         pcx.hint_ty = bound[bare_param(params, p, pcx)];
                     }
-                    t = synth_expr(arg, &pcx);
+                    // (0.27.3: an array of untyped literals for `[T; N]` with T
+                    // bound, rust edition: checked as T's, N bound from it)
+                    let ek = if lit && pcx.nodes[arg].kind == NodeKind::Array
+                        && pcx.nodes[p].kind == NodeKind::TyArray {
+                        bare_param(params, pcx.nodes[p].a, pcx) } else { -1 };
+                    var et = if ek >= 0 { bound[ek] } else { 0 };
+                    if et == 0 && lit && pcx.nodes[arg].kind == NodeKind::Array
+                        && pcx.nodes[p].kind == NodeKind::TyArray {
+                        // (`[i64; N]`: a primitive element type, as written)
+                        et = written_primitive(pcx.nodes[p].a, &pcx);
+                    }
+                    t = if et != 0 {
+                        check_expr(arg, crate::front::types::array_of(et, pcx.nodes[arg].count,
+                            &pcx), &pcx)
+                    } else { synth_expr(arg, &pcx) };
                     mark_synthed(arg, &pcx);
                 }
                 if t != TY_NEVER && join_arg(params, bound, loose, p, t, pcx) {
@@ -631,6 +680,21 @@ fn bare_param(params: i64, p: i64, pcx: Ctx<Comp>) -> i64 {
         Option::Some(k) => k,
         Option::None => -1,
     }
+}
+
+// (0.27.3) The primitive number type type node e names (`i64`, `f32`), or 0.
+fn written_primitive(e: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if e <= 0 || pcx.nodes[e].kind != NodeKind::TyName || pcx.nodes[e].count != 0
+        || pcx.nodes[e].g != 0 {
+        return 0;
+    }
+    for c in [TY_I8, TY_I16, TY_I32, TY_I64, TY_ISIZE, TY_U8, TY_U16, TY_U32, TY_U64, TY_USIZE,
+        crate::front::types::TY_F32, crate::front::types::TY_F64] {
+        if crate::base::intern_c(crate::front::types::primitive_name(c), &pcx) == pcx.nodes[e].a {
+            return c;
+        }
+    }
+    0
 }
 
 // (0.15) Whether an argument of type node p must be synthesized although
@@ -1122,7 +1186,9 @@ fn range_literal_by_bounds(params: i64, bound: *i64, count: i64, n: i64, templat
             let tpl = pcx.structs[pcx.types[dt].a].tmpl;
             var found = 0;
             var several = false;
-            for c in [TY_USIZE, TY_I32, TY_U32, TY_U64, TY_ISIZE, TY_U8, TY_I8, TY_U16, TY_I16] {
+            // (0.27.3: i64 too, the rust edition's default being i32)
+            for c in [TY_USIZE, TY_I32, TY_I64, TY_U32, TY_U64, TY_ISIZE, TY_U8, TY_I8, TY_U16,
+                TY_I16] {
                 let mark = pcx.tscratch.count;
                 pcx.tscratch.push(c);
                 let rt = template_instance(tpl, mark, pcx.nodes[a].start, &pcx);
@@ -1167,9 +1233,14 @@ fn int_literal_by_bounds(params: i64, bound: *i64, count: i64, n: i64, template:
             }
             var found = 0;
             var several = false;
+            // (a negated literal, `&-9`, takes no unsigned type)
+            let inner = if pcx.nodes[lit].kind == NodeKind::Unary && pcx.nodes[lit].op == Tok::Amp {
+                pcx.nodes[lit].b } else { lit };
+            let negated = pcx.nodes[inner].kind == NodeKind::Unary;
             for c in [TY_USIZE, TY_I32, TY_U32, TY_I64, TY_U64, TY_ISIZE, TY_U8, TY_I8, TY_U16,
                 TY_I16] {
-                if c != bound[k] && int_meets_bounds(params, bound, count, k, c, &pcx) {
+                if c != bound[k] && !(negated && !crate::front::types::is_signed(c))
+                    && int_meets_bounds(params, bound, count, k, c, &pcx) {
                     if found != 0 {
                         several = true;
                     }
@@ -1178,8 +1249,19 @@ fn int_literal_by_bounds(params: i64, bound: *i64, count: i64, n: i64, template:
             }
             if found != 0 && !several {
                 bound[k] = found;
-                // (the literal, synthesized as the default, is of that type)
-                pcx.nodes[lit].ty = found;
+                // (the literal, synthesized as the default, is of that type;
+                // `&1`, a reference to one)
+                var x = lit;
+                if pcx.nodes[x].kind == NodeKind::Unary && pcx.nodes[x].op == Tok::Amp {
+                    pcx.nodes[x].ty = crate::front::types::ref_to(found,
+                        crate::front::types::REF_SHARED, &pcx);
+                    x = pcx.nodes[x].b;
+                }
+                if pcx.nodes[x].kind == NodeKind::Unary {
+                    pcx.nodes[x].ty = found;
+                    x = pcx.nodes[x].b;
+                }
+                pcx.nodes[x].ty = found;
             }
         }
     }
@@ -1189,15 +1271,30 @@ fn int_literal_by_bounds(params: i64, bound: *i64, count: i64, n: i64, template:
 // parameter is declared with type parameter p itself, or 0.
 fn literal_binds(p: i64, n: i64, template: i64, first_param: i64, pcx: Ctx<Comp>) -> i64 {
     for j in 0..pcx.nodes[n].count {
-        let a = child(n, j, pcx);
+        var a = child(n, j, pcx);
+        // (0.27.3: `&1` for a parameter `&Q`, `m.get(&1)`, F18.3)
+        let amp = pcx.nodes[a].kind == NodeKind::Unary && pcx.nodes[a].op == Tok::Amp
+            && (pcx.nodes[a].p & crate::front::ast::NODE_REF_MUT) == 0 && pcx.edition != 0;
+        if amp {
+            a = pcx.nodes[a].b;
+        }
+        if pcx.edition != 0 && pcx.nodes[a].kind == NodeKind::Unary
+            && pcx.nodes[a].op == Tok::Minus {
+            a = pcx.nodes[a].b;
+        }
         if pcx.nodes[a].kind != NodeKind::Int || pcx.nodes[a].b != crate::front::lexer::SUF_NONE
             || j + first_param >= pcx.nodes[template].count {
             continue;
         }
-        let tn = pcx.nodes[child(template, j + first_param, pcx)].b;
+        var tn = pcx.nodes[child(template, j + first_param, pcx)].b;
+        if amp {
+            tn = if tn > 0 && pcx.nodes[tn].kind == NodeKind::TyPtr
+                && (pcx.nodes[tn].p & crate::front::ast::NODE_REF) != 0 { pcx.nodes[tn].a }
+                else { 0 };
+        }
         if tn > 0 && pcx.nodes[tn].kind == NodeKind::TyName && pcx.nodes[tn].count == 0
             && pcx.nodes[tn].g == 0 && pcx.nodes[tn].a == pcx.nodes[p].a {
-            return a;
+            return child(n, j, pcx);
         }
     }
     0
@@ -1236,6 +1333,25 @@ fn int_meets_bounds(params: i64, bound: *i64, count: i64, k: i64, t: i64,
             if !holds {
                 ok = false;
                 break;
+            }
+        }
+        // (0.27.3: and another parameter's bound with arguments, which may
+        // name it: `K: Borrow<Q>` for `m.get(&1)`, F18.3)
+        for j in 0..(if ok && pcx.edition != 0 { count } else { 0 }) {
+            let jb = pcx.nodes[child(params, j, pcx)].h;
+            if j == k || bound[j] <= 0 || jb == 0 {
+                continue;
+            }
+            for i in 0..pcx.nodes[jb].count {
+                let b = child(jb, i, pcx);
+                if pcx.nodes[b].kind != NodeKind::TyName || pcx.nodes[b].g == 0 {
+                    continue;
+                }
+                let tr = crate::front::traits::bound_trait(b, &pcx);
+                if tr >= 0 && !crate::front::convert::implements_with(tr, bound[j],
+                    crate::front::convert::bound_args(b, &pcx), &pcx) {
+                    ok = false;
+                }
             }
         }
         env_leave(saved, &pcx);

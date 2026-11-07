@@ -350,7 +350,8 @@ rust-edition position (MVS: the `str` view). It unifies with an expected
 \0 \xHH`; `\u{..}` is an error); `b"…"` is `&'static [u8; n]` (and
 unsizes to `&[u8]` at a `&[u8]` expected type, F0.5's one unsize step
 applied to coercion sites: a `let` with an annotation, an argument, a
-return). `volec fmt` keeps `b'x'` and `b"…"` as one token. *Anchor:*
+return). (0.27.3: `b"…"` parses, typed `&[u8]`, FL12.) `volec fmt` keeps
+`b'x'` and `b"…"` as one token. *Anchor:*
 `front/lexer/mod.vl: lex_number` (the `b` prefix), `front/lexer/
 strings.vl`, `tools/fmt`.
 
@@ -375,7 +376,9 @@ pointer or `usize`, **integer ↔ raw pointer (`usize as *mut T`, `p as
 usize`): safe**, as Rust's (the deref is what is unsafe; closes M2's
 gap 13, where MVS makes the cast itself unsafe). Everything else is
 `error type.cast` (E0605/E0606). *Anchor:* `synth_cast` ("cannot cast
-..", today requiring `unsafe` for int→ptr), `front/check/unsafety.vl`.
+..", today requiring `unsafe` for int→ptr), `front/check/unsafety.vl`. (0.27.3:
+`&T as *const U` with `U` not `T` is an error, rustc E0606; it read a
+`T` as a `U`.)
 
 **F29.2 (fat pointers).** Z9.3.
 
@@ -998,7 +1001,53 @@ temporary (lifetime extension) with the annotation's type: `let d: &[u8]
 = &[1, 2, 3];` is `let t: [u8; 3] = [1, 2, 3]; let d: &[u8] = &t;`, so
 the literals are `u8`, not the default. *Anchor:* `front/check/temps.vl:
 annotate_temp`. Integer inference variables (a literal typed by a later
-statement, `let a = [1, 2]; f(&a)` with `f(&[u8])`) stay FL6's, 0.27.3.
+statement, `let a = [1, 2]; f(&a)` with `f(&[u8])`) are F18.5's.
+
+**F18.5 (integer inference variables: an open local).** In the rust
+edition an unannotated `let x = e;` binding one name, with `e` a literal
+tree (an unsuffixed integer literal, its negation, an array, a repeat or
+a tuple of literal trees, where a tuple's other elements are any
+value, an arithmetic operator of two literal trees), makes `x` **open**:
+its integer positions are inference variables. So does `let r = &x;` (or
+`&mut x`) of an open `x`: `r` is a **link**, its type `&` of `x`'s;
+solving one solves the other, closing one closes both. Until it is
+solved the local reads as its provisional type, the tree with `i32` at
+each variable. It is solved by its first use, in the order the function
+is checked, that gives its positions a type:
+(a) a check against an expected type (an argument, an annotation, the
+return or tail, a struct field, an assignment's target type, `&x` where
+`&τ`, `*const τ` or `&[τ]` goes, `a[i]` and `&a[..]` of an open array
+where `τ` or `&[τ]` goes), matched with the provisional type where the
+variables are; (b) an operand of a binary operator whose other operand
+has a definite integer type (`i < v.len()`: `usize`); (c) the target of
+`x = e` or `x op= e` with `e` of a definite type (`s += m.v`, `kv =
+e.remove_entry()`; `s += x` of an `x: &i64` reads through it); (d) a
+generic call's argument, placed with the untyped literals (F18.1 step
+(2)), so that it takes the type the other arguments or the expected type
+bind. These uses keep it open and are retyped when it is solved: `x op=
+lit`, `x = lit` and a comparison with a literal (`x < 10`). A closure
+that captures an open local closes it when the closure is checked (its
+environment holds the type). Any other use closes it at its provisional
+type (the `i32` fallback, F18.3): a method receiver, `x as τ`, `let y =
+x`, a pattern's scrutinee, a format hole (FL6 names each). A local still
+open at the function's end has the fallback. Solving retypes the local
+and the nodes typed through it in place, and a literal that does not fit
+its type is an error (rustc: literal out of range); after the function
+is checked nothing is open. *Anchor:* `front/check/literals.vl: open_let,
+open_solve, open_expected`, `check_mode.vl: check_expr_inner`,
+`assign.vl: check_assign`. MVS is unchanged: no local is open, its
+fallback is `i64`.
+(0.27.3, the literals around it, F18.3: `&1` where `&τ` of a number
+goes is a `τ` (`m.get(&1)`, `x.total_cmp(&0.0)`); a literal bound only
+by a parameter's bound picks the one integer type an impl gives, also
+behind `&` or negated, and through another parameter's bound that names
+it (`K: Borrow<Q>`); an array of literals at a generic call takes its
+element type from the expected type or the written `[i64; N]`; a
+closure argument whose parameter types are known is typed before the
+literal arguments, so that its result binds their parameter
+(`map_or(0, |x| x + 1)`), and one whose value is itself a literal
+after; a negated literal where an unsigned type goes is an error, rustc
+E0600.)
 
 ### F19 Small syntax
 
@@ -1516,6 +1565,17 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   is refused (F30.1's const_write). Whether to split the types is a
   later decision. Case `rust_f_f30_const_mut_ok`.
 
+- **FR5 (integer widening).** F29.3: MVS's lossless widening is kept
+  in the rust edition: an `i32` where an `i64` goes, a `u8` where a
+  `u32` goes, and two integer operands of different widths join to the
+  wider (`x + n` with `x: i64`, `n: i32`); rustc says E0308. The
+  translator's output never needs it; a hand-written program may lean on
+  it.
+- **FR6 (an index of any integer type).** `a[i]` takes an `i`
+  of any integer type, as MVS's; rustc indexes by `usize` only (E0277,
+  `the type [T] cannot be indexed by i64`). Case
+  `rust_t_iter_for_control` writes `names[k as usize]`.
+
 **Strict (vole rejects what rustc accepts).**
 - **FL1 (no deferred inference; later, 0.27.4).** F18.2: a parameter
   fixed only by a later statement is `type.infer` (its `try:` the
@@ -1534,16 +1594,32 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   through an unbounded `Deref` (D22.3).
 - **FL5 (no HR regions in bounds beyond D20.1's implicit binder).**
   `for<'a>` is 0.29.
-- **FL6 (integer literal default).** F18.3's context rule is rustc's;
-  the fallback `i32` is too, but vole does not run rustc's full
-  fallback after unification (a literal reaching no context through a
-  chain of generic calls is `i32` at once). Also, no float-literal
-  fallback interplay. (0.27.2: the fallback is still `i64`. Switching
-  it alone fails 206 of the 1,962 rust_/std2_/error cases, because a
-  literal is typed where it is met: `let a = [1, 2, 3]` is `[i32; 3]`
-  before `f(&a)` with `&[i64]`. It waits for integer inference
-  variables, resolved at the first constraining use, with the `i32`
-  fallback at the end of the function: 0.27.3.)
+- **FL6 (integer inference variables, F18.5; 0.27.3).** F18.3's context
+  rule and the `i32` fallback are rustc's, but vole's variables are
+  F18.5's open locals, solved by their first constraining use; rustc
+  unifies every `{integer}` of the function and falls back after. Each
+  early close rejects where rustc accepts, or picks `i32` where rustc
+  infers from a later use: a method receiver (`a.iter_mut()` then
+  `zero(it)` with `IterMut<i64>`; `Some(4).and_then(half)` with `half:
+  fn(i64)`), `x as τ`, `let y = x;` (no unification between two locals,
+  but `let r = &x;` links), a capture by a closure (closed when the
+  closure is checked), a pattern's scrutinee (`match x {..}`), a format
+  hole (`println("{n}")` then `f(n)` with `f(usize)`: the hole's
+  `Display` impl is picked where it is checked; a later `i64` use still
+  widens, F29.3), a closure whose body is a literal (`|| 1`, then `twice(c)`
+  with `FnMut() -> i64`), a literal that fixes a closure's parameter type
+  (`fold(0, |a, x| a + x)` with `x: &i64`, `scan(0, ..)`), a range of
+  literals as a receiver or behind `&` (`(1..4).sum()` into an `i64`), a
+  literal at a `where` predicate on a projection (`next_if_eq(&0)`), and
+  an array literal behind `&` at a generic parameter (`same_len(&[7, 8])`).
+  A literal reaching no context through a chain of generic calls is `i32`
+  at once. No float-literal variables (an unsuffixed float literal is
+  `f64`, but `&0.0` and a context take theirs, F18.3). A generic
+  constructor's parameter fixed by a later statement (`let v =
+  Vec::from_in([1, 2], gpa);` then `v` as a `Vec<i64>`, `W { x: 7 }`
+  then `&W<i64>`) is FL1's, 0.27.4. The corpus writes the suffix
+  (`1i64`) where it meets one. (Lenient: a method call on an open local,
+  `x.pow(2)`, is `i32`'s method, where rustc says E0689.)
 - **FL7 (const evaluation).** F3.2's consts fold with `consteval.vl`'s
   language, smaller than rustc's const eval (no loops, no `if` over
   consts until 0.29).
@@ -1603,6 +1679,11 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   is Rust's. Const generics retire it: std2's type becomes Rust's.
   Cases `rust_f_fl13_array_iter_partial_drop`,
   `rust_f_fl13_array_iter_break`, `rust_f_fl13_array_iter_by_value`.
+
+- **FL12 (a byte string is `&[u8]`; 0.27.3).** F23.2: `b"…"` is typed
+  `&[u8]`, not `&'static [u8; n]`: `let a: &[u8; 2] = b"ab";` and
+  `*b"ab"` are rejected where rustc accepts them; where `&[u8]` goes (the
+  usual use) the two agree. Case `rust_f_f23_byte_string_ok`.
 
 ## 10. The gap map
 
