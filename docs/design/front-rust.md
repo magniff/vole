@@ -472,6 +472,17 @@ of an empty array").
 
 **F23.4 (character literals).** F1.2.
 
+**F23.5 (octal literals).** (0.27.6) In a rust-edition file an integer
+literal may be written `0o` then octal digits and `_` (`0o644`,
+`0o7_55`, `0o17u8`): its value in base 8, typed like any integer
+literal (F18.3) and suffixed like one. A digit `8` or `9` among its
+digits is rustc's error, "invalid digit for a base 8 literal" (`0o8`,
+`0o78`); `0o` with no digit after it, "expected octal digit after
+'0o'" (rustc E0768). Only the lower-case `o` (rustc refuses `0O`). `{:o}` formats an integer in base
+8 (`{:#o}`: `0o` first). MVS files keep refusing `0o` (an invalid
+suffix on `0`). *Anchor:* `front/lexer/mod.vl: lex_number`,
+`lex_radix_digits`. *Cases:* `rust_f_f23_octal`.
+
 ### F29 Casts
 
 **F29.1 (what `as` does, by kinds).** In a rust-edition position
