@@ -82,9 +82,12 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.2 | `v0.27.2` | 0.27.1 | aarch64-macos | std2 the rust edition's std (1,032 of 1,413 std2 tests at -O0/-O2 under `--check-alloc`, gate 1); the front's rules (docs/design/front-rust.md: pattern and blanket impls, coherence, deref coercion, ranges, format specs); closures in full (kinds, captures, `Send`/`Sync`, bodies borrow-checked, `borrowck.unchecked` retired, E0594/E0596); `[T]`/`str` unsized; the borrow checker's verdict cache; every rust case on std2 |
 | 0.27.2.1 | `v0.27.2.1` | 0.27.2 | aarch64-macos | std2 1,306 of 1,454 tests at -O0/-O2 under `--check-alloc`; `impl Trait` returns (§21) and the opaque instance (§22, narrowed: FL11); implied outlives bounds (D4.6); three consumed-value miscompiles fixed (D8.5), E0508, two-phase `write`; the front's std2 gaps (F13, F14.2, F18.4, F9.2, F26.3); floats, `std::env`; contracts and effects R2 (std2 declared, 27 `requires`, 11 `ensures`); hello-rust 3.48x; the gate's std2 builds halved |
 | 0.27.3 | `v0.27.3` | 0.27.2.1 | aarch64-macos | the translator `fix --edition rust` and gate 2 (`tests/translate.sh`, the rustc twin); the i32 literal default (FL6); std2 1,402 of 1,472 tests at -O0; lazy std2 parsing (a rust hello world 2.32x MVS's); arrays' by-value IntoIterator |
+| 0.27.4 | `v0.27.4` | 0.27.3 | aarch64-macos | gate 3 opens (`fix --edition rust` on compiler/src: 122 type errors, 3,048 borrowck behind them); inference from a later statement (FL1); `[T]`/`str` unsized places (Z9.1c); `&raw` and Rust 2024's `static mut` rule; `format_args` a value; std2 1,445 of 1,473 tests at -O0; a rust hello world 2.03x MVS's |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.27.4
+
+Gate 3 opens. `volec fix --edition rust` run on a copy of compiler/src leaves N errors, printed by the gate's `gate3` row every release; 0.28 starts at N = 0. Its first full measurement was 1,414 (after 0.27.3's three parse shapes); 0.27.4 leaves 122 type errors, most of them std2 modules the compiler uses that std2 does not have yet (`std::cli`, `fs`, `process`, `gpu`), and `volec check --borrowck-partial` counts the 3,048 borrowck errors behind them, about 2,750 of one shape that 0.27.5's first item fixes (an operand read where it is evaluated, D2.4a). In the rust edition: a type is inferred from a later statement (FL1, F18.6: `Vec::new_in(a)` then a push, a later arm, `"4".parse().unwrap()`, `_` in a type); `[T]` and `str` are unsized places that `&[T]` and `&str` refer to (Z9.1c step B: impls keyed by them, method lookup through a view, `NonNull<[u8]>` 16 bytes); `&raw const`/`&raw mut` (F30.2), and a reference to a `static mut` refused as Rust 2024 does (D6.2.5); `format_args(..)` a Display value (F16.4); indexing through `&mut [T; N]` (F20.1). std2 passes 1,445 of its 1,473 tests at -O0 (1,402 of 1,472 in 0.27.3). A rust hello world's check is 2.03x MVS's (2.32x): builtin impls only for the primitives a program brings in (F15.1), and std2's own settled bodies are not borrow-checked again (Z7.2); the 2.0x ceiling is printed, enforced from 0.27.5. A crash on a closure capturing a widened integer, in MVS too, is fixed. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
 
 The front (integrator):
 
@@ -255,6 +258,17 @@ The front (fl10274):
   read it as a raw pointer's arithmetic, `unsafe` (about 32 of gate 3's
   errors). `<I as SliceIndex<[i64]>>::Output` takes the impl its trait
   arguments name (F8.1).
+- A rust hello world's build costs about 2.0x MVS's (2.34x in 0.27.3);
+  the 2.0x ceiling is enforced from 0.27.5, with std2 lexed lazily
+  (tests/compile_cost.sh prints it). A build makes
+  std2's builtin impls only for the primitives the program brings in
+  (F15.1: it names them, a literal's suffix, or a word such as `chars`
+  or `HashMap` that brings them through std2's types); i32, usize, u8
+  and bool always. A build whose check fails without one is made again
+  with every impl, so no other impl is chosen and the errors are the
+  eager build's. A build does not borrow-check std2's own non-generic
+  bodies, which the std2-check row checks clean (Z7.2); every instance
+  of a std2 template a program reaches still is.
 
 ### What's new in 0.27.3
 
