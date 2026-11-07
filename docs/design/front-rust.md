@@ -1462,6 +1462,19 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   (`impl Pattern for &str`). 0.27.2.1 has the parts that do not need it:
   `size_of_val` of a view (its length times the element's size) and
   `size_of::<[T]>()`/`size_of::<str>()` as `type.unsized`.
+- **FL11 (the opaque instance's type errors; later, 0.27.3).**
+  borrowck.md D22.2: in 0.27.2.1 an opaque instance reports only the
+  bound-only rule's error (D22.3) on a parameter's own Ω, with no `where`
+  predicate in the template, and the borrow checker's; any other type
+  error leaves the instance out, unreported. rustc reports them all. The
+  gaps: an operator on an Ω through its `Add`/`PartialEq`/`PartialOrd`/
+  `Neg`/`Not`/`Shl` bound (an Ω is a type over `()`, and the operators
+  check the type), a bound's type arguments (`T: AsRef<str>`,
+  `Make<S::Item>`), associated functions and consts (`T::default()`,
+  `A::FREES`), `where` predicates on a projection (`X::Item: Show`), a
+  method of a generic impl over the impl's own parameters, and `*x` with
+  a `Deref` bound. A template that meets one is not counted in `opaque:
+  N templates`.
 
 ## 10. The gap map
 
