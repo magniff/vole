@@ -97,6 +97,12 @@ The front (fl10274):
   0.27.4 these read the index through Index and were
   borrowck.borrow_immutable where rustc compiles them. A type with Index
   and no IndexMut keeps `index`, and the write is borrowck's (E0596).
+- A `&str` where a `&[u8]` goes is rustc's E0308 in the rust edition
+  (F0.6): `str::from_utf8("Hello")`, a `&str` value, and a `&String`, which
+  derefs to `str` only. The error's `try:` gives `b"Hello"` or
+  `s.as_bytes()`. 0.27.4 took the text as its bytes, the view model of MVS
+  (which keeps it). This hid 348 of gate 2's bad translations, most of
+  them `str::from_utf8("..")` around a literal.
 
 The front (front275):
 
@@ -160,6 +166,36 @@ The translator (g3274):
 - Gate 3 so far: 121 errors (117 type error, 2 edition.lenient, 1
   distinct.mix, 1 item.private); borrowck (partial), with front275's
   D2.4a: 161.
+
+std2 (std2275), for the modules compiler/src uses:
+
+- `std::time`: `Duration` (`new`, `from_secs`..`from_nanos`,
+  `from_secs_f64`/`f32` and their `try_`, `as_*`, `subsec_*`, `checked_*`,
+  `saturating_*`, `mul_f64`, `div_f64`, `div_duration_f64`, the operators
+  and Debug as Rust prints it: `1.5s`, `2ms`, `{:.2?}`), `Instant`,
+  `SystemTime` with `UNIX_EPOCH` and `SystemTimeError`; and
+  `std::thread::sleep`. Changed from Rust's: `as_millis`, `as_micros` and
+  `as_nanos` are u64 (saturating), `UNIX_EPOCH` is a static, and there are
+  no `Duration::ZERO`/`MAX` constants (a constant of a struct type waits
+  for const evaluation). Seven std2_time cases, six of them twinned with
+  rustc.
+- `std::fs`: `File` (`open`, `create`, `create_new`, `options`,
+  `metadata`, `set_len`, `sync_all`; Read, Write and Seek, and Read and
+  Write for `&File`), `OpenOptions` (Rust's `&mut self` builder and its
+  EINVAL rules), `Metadata` (`len`, `file_type`, `is_dir`, `is_file`,
+  `is_symlink`, `permissions`, `modified` as a SystemTime), `FileType`,
+  `Permissions`, `read_dir` with `DirEntry` (`path`, `file_name`,
+  `file_type`, `metadata`), and `read_in`, `read_to_string_in`, `write`,
+  `copy` (the permission bits too), `metadata`, `symlink_metadata`,
+  `exists` (an `io::Result<bool>`), `remove_file`, `remove_dir`, `rename`,
+  `create_dir`, `create_dir_all`, `remove_dir_all`. `std::io` gains
+  `Seek` and `SeekFrom` (Rust's place), and `ErrorKind::InvalidFilename`;
+  `[T]` and `[T; N]` are `AsRef<[T]>`. Changed from Rust's: a path is a
+  `&str` until std::path, and a DirEntry's `path()` and `file_name()` are
+  `&str` views of the entry (a name that is not UTF-8 is read_dir's
+  InvalidData); `mode` and `as_raw_fd` are inherent until std::os. MVS's
+  `fs::append` is gone: `OpenOptions::new().append(true).create(true)`.
+  Four std2_fs cases, three twinned with rustc.
 
 ### What's new in 0.27.4
 

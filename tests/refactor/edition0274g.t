@@ -9,7 +9,7 @@ ok: built mvs
 % ./mvs
 106 6 true
 $ fix --edition rust --list-left main.vl
-fixed, 6 views to &[T], 3 '&x's to '&mut x', 1 var to 'let mut', 1 integer annotated, 1 static var to 'static mut', 1 text literal to bytes, 7 types, 2 indexes cast to usize	main.vl	+9 -8 lines
+fixed, 6 views to &[T], 3 '&x's to '&mut x', 1 var to 'let mut', 1 integer annotated, 1 static var to 'static mut', 3 text literals to bytes, 7 types, 2 indexes cast to usize	main.vl	+10 -9 lines
 % cat main.vl
 // fix --edition rust (0.27.4, gate 3): a raw pointer to views, `*[u8]`
 // (a table of views, an out parameter), is `*mut &[u8]` (`&'static` but
@@ -19,7 +19,7 @@ static mut STRS: *mut &'static [u8] = 0 as *mut &'static [u8];
 
 fn set_msg(message: *mut &[u8], long: bool) {
     // UNSAFE: a test. SAFETY: message points to one view.
-    unsafe { *message = if long { "hello" } else { "hi" }; }
+    unsafe { *message = if long { b"hello" } else { b"hi" }; }
 }
 
 fn main() {
