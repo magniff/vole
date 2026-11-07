@@ -900,6 +900,28 @@ either, dropck (§9) is the rule: `let x = 1; let d = D { r: &x };` with
 `borrowck.dropped_borrowed` when it does not. R2 is closed with std2
 (every type declares its regions).
 
+**D8.5 (`for`'s sequence; 0.27.2.1).** In the rust edition `for p in e`
+is `IntoIterator::into_iter(e)` (F22.1): when `e` is a place, the loop's
+sequence local takes it by an `OK_MOVE` (M1 applies to `e` after the
+loop, rustc E0382) and owns it; `into_iter` moves it on into the
+iterator, which drops what it holds; `e` is not dropped again. The exception is the counted
+loop over an array value (F22.1's plain elements, which reads each
+element in place by its index): its sequence is a borrowed copy, as in
+MVS. MVS's `for` over a place is a borrowed copy (unchanged).
+
+**D8.6 (moves out of an index; 0.27.2.1).** In a rust body an index
+`a[k]` of an array or slice whose element type is not `Copy` is a place
+with no move path even for a constant `k` (rustc indexes through a
+temporary): an `OK_MOVE` of it is M3's `borrowck.move_out`, rustc E0508
+("cannot move out of a non-copy array/slice"), the message naming an
+element of an array or a slice; through `Vec`'s `index` it is E0507 as
+before. What stays allowed: a move of the whole array; a borrow of an
+element (`&a[0]`, `&mut a[i]`); a read of a `Copy` part (`a[0].v`); a
+constant index of a `Copy` element, which keeps its path (R7, D1.5).
+A by-value `for x in a` over an array of non-`Copy` elements stays
+F22.1's by-reference reading until std2 has an array `IntoIter` (one
+that drops what a `break` leaves): an index loop cannot move them out.
+
 ## 9. Drops and dropck (S9)
 
 **D9.1 (dropck regions).** `dropck(T)` is the set of `T`'s slots that
