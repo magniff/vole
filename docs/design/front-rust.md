@@ -118,6 +118,21 @@ not the rule: a receiver `r: &S` finds `S::m(&self)` at its first step,
 deref_receiver` (today: inherent and impl methods of `τ₀`'s template,
 then one `Deref`).
 
+**F0.6 (text is not its bytes, 0.27.5).** In a rust-edition position a
+`&str` where a `&[u8]` goes is a mismatch, as rustc's E0308: a string
+literal, a `&str` value, or a `&String` (which derefs to `str` only).
+MVS's view model (0.20, `coerce_text`) made a `str` its bytes for free.
+In the rust edition the bytes are `s.as_bytes()`, and a literal's are
+`b".."`. The error's `try:` gives that conversion. A string literal
+where a `&str` goes is that `&str` as it is: it is not checked as its
+bytes. The compiler's own writes of a format literal's text, in a
+direct `print`/`write` (F16.3), take its bytes as before. A generic
+`&[T]` does not bind `T = u8` from a `&str`. *Anchor:*
+`front/check/check_mode.vl: coerce_text`, `check/distinct.vl:
+distinct_literal, distinct_mismatch`, `check/interp.vl: direct_call`.
+Cases `rust_f_f0_str_not_bytes_err`, `rust_f_f0_string_not_bytes_err`,
+`rust_f_f0_str_bytes_ok`.
+
 ## 1. Types
 
 ### F1 `char`
