@@ -8,17 +8,20 @@
 // the same `let` are not reported again while that error stands: one
 // error per cause.
 
-use crate::base::{IntVec, SourceFile, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str};
+use crate::base::{IntVec, SourceFile, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, buf_uint};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{
-    buf_file_line, err_fix, err_help_fmt, err_note_at, err_try_tool, error_recorded_at,
+    buf_file_line, err_begin, err_end_soft, err_fix, err_help_fmt, err_note_at, err_str,
+    err_try_tool, error_recorded_at,
 };
-use crate::front::ast::{Node, NodeKind};
+use crate::front::ast::{Node, NodeKind, child};
 use crate::front::check::Res;
+use crate::front::lexer::{SUF_NONE, Tok};
 use crate::front::modules::file_of_pos;
 use crate::front::types::{
-    TY_F64, TY_I64, TY_USIZE, TyKind, Type, array_of, buf_type, is_float, is_integer, type_elem,
+    TY_F64, TY_I32, TY_I64, TY_NEVER, TY_USIZE, TyKind, Type, array_of, buf_type, err_type, int_max,
+    is_float, is_integer, is_signed, type_elem,
 };
 
 // For the mismatch at node n (a value of type actual where expected goes):
@@ -335,4 +338,520 @@ fn int_at(v: IntVec, k: i64) -> i64 {
     // UNSAFE: an IntVec's data is a raw buffer (base::IntVec).
     // SAFETY: 0 <= k < v.count (the caller's loop).
     unsafe { v.data[k] }
+}
+
+// ---- (0.27.3) F18.5: open locals, the integer inference variables ----
+//
+// In the rust edition an unannotated `let x = e;` of a literal tree makes x
+// open: its integer positions are variables, read meanwhile at the
+// fallback, i32. OPEN_LETS holds pairs (local, init), OPEN_USES pairs
+// (local, node) of the nodes typed through an open local by the uses that
+// keep it open (`x += 1`, `x = 1`, `x < 10`). The first use that gives the
+// positions a type solves it (open_solve: the local, its init and those
+// nodes retyped in place); any other use closes it at the fallback
+// (open_close). After a function is checked nothing is open (open_end).
+
+fn arith_op(op: Tok) -> bool {
+    op == Tok::Plus || op == Tok::Minus || op == Tok::Star || op == Tok::Slash
+        || op == Tok::Percent || op == Tok::Amp || op == Tok::Pipe || op == Tok::Caret
+}
+
+// Whether checked expression e is a literal tree whose integer positions
+// are untyped literals at the fallback (F18.5).
+fn open_tree(e: i64, pcx: Ctx<Comp>) -> bool {
+    let x = node(e, pcx);
+    if x.kind == NodeKind::Int {
+        return x.b == SUF_NONE && x.ty == TY_I32;
+    }
+    if x.kind == NodeKind::Unary {
+        return x.op == Tok::Minus && x.ty == TY_I32 && open_tree(x.b, pcx);
+    }
+    if x.kind == NodeKind::Binary {
+        return arith_op(x.op) && x.ty == TY_I32 && open_tree(x.b, pcx) && open_tree(x.c, pcx);
+    }
+    if x.kind == NodeKind::Repeat {
+        return open_tree(x.a, pcx);
+    }
+    if x.kind == NodeKind::Array && x.count > 0 {
+        for i in 0..x.count {
+            if !open_tree(child(e, i, pcx), pcx) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if x.kind == NodeKind::Tuple {
+        for i in 0..x.count {
+            if open_tree(child(e, i, pcx), pcx) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// Whether open tree e can take type t: an integer at each literal (a
+// signed one under a negation), the shape of t elsewhere.
+fn open_fit(e: i64, t: i64, pcx: Ctx<Comp>) -> bool {
+    if t <= 0 {
+        return false;
+    }
+    let x = node(e, pcx);
+    let tt = type_info(t, pcx);
+    if x.kind == NodeKind::Int {
+        return is_integer(t) && t != pcx.char_type;
+    }
+    if x.kind == NodeKind::Unary {
+        return is_signed(t) && open_fit(x.b, t, pcx);
+    }
+    if x.kind == NodeKind::Binary {
+        return is_integer(t) && t != pcx.char_type && open_fit(x.b, t, pcx)
+            && open_fit(x.c, t, pcx);
+    }
+    if x.kind == NodeKind::Repeat {
+        return tt.kind == TyKind::Array && x.ty > 0 && tt.b == type_info(x.ty, pcx).b
+            && open_fit(x.a, tt.a, pcx);
+    }
+    if x.kind == NodeKind::Array {
+        if tt.kind != TyKind::Array || tt.b != x.count {
+            return false;
+        }
+        for i in 0..x.count {
+            if !open_fit(child(e, i, pcx), tt.a, pcx) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if x.kind == NodeKind::Tuple {
+        if tt.kind != TyKind::Tuple || tt.count != x.count {
+            return false;
+        }
+        for i in 0..x.count {
+            let c = child(e, i, pcx);
+            let want = type_elem(t, i, pcx);
+            if open_tree(c, pcx) && !open_fit(c, want, pcx)
+                || !open_tree(c, pcx) && node(c, pcx).ty != want {
+                return false;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+// Literal n's value where type t goes, negated or not: an error (soft)
+// when it does not fit.
+fn open_fits(n: i64, negated: bool, t: i64, pcx: inout Ctx<Comp>) {
+    let value = node(n, pcx).a as u64;
+    let magnitude: u64 = if negated && value > 0 { value - 1 } else { value };
+    if magnitude > int_max(t) {
+        err_begin(node(n, pcx).start, &pcx);
+        err_str(if negated { c"integer literal -" } else { c"integer literal " }, pcx);
+        buf_uint(pcx.err, value);
+        err_str(c" does not fit in type '", pcx);
+        err_type(t, pcx);
+        err_str(c"'", pcx);
+        err_end_soft(&pcx);
+    }
+}
+
+// Node e, an open tree or an identifier typed through an open local,
+// takes type t (open_fit said it can), its literals checked to fit.
+fn open_set(e: i64, t: i64, pcx: inout Ctx<Comp>) {
+    let x = node(e, pcx);
+    let tt = type_info(t, pcx);
+    pcx.nodes[e].ty = t;
+    if x.kind == NodeKind::Int {
+        open_fits(e, false, t, &pcx);
+    } else if x.kind == NodeKind::Unary && node(x.b, pcx).kind == NodeKind::Int {
+        pcx.nodes[x.b].ty = t;
+        open_fits(x.b, true, t, &pcx);
+    } else if x.kind == NodeKind::Unary {
+        open_set(x.b, t, &pcx);
+    } else if x.kind == NodeKind::Binary {
+        open_set(x.b, t, &pcx);
+        open_set(x.c, t, &pcx);
+    } else if x.kind == NodeKind::Repeat {
+        open_set(x.a, tt.a, &pcx);
+    } else if x.kind == NodeKind::Array {
+        for i in 0..x.count {
+            open_set(child(e, i, pcx), tt.a, &pcx);
+        }
+    } else if x.kind == NodeKind::Tuple {
+        for i in 0..x.count {
+            let c = child(e, i, pcx);
+            if open_tree(c, pcx) {
+                open_set(c, type_elem(t, i, pcx), &pcx);
+            }
+        }
+    }
+}
+
+fn open_index(l: i64, pcx: Ctx<Comp>) -> i64 {
+    var i = 0;
+    while i + 1 < pcx.open_lets.count {
+        if pcx.open_lets.get(i) == l {
+            return i;
+        }
+        i += 2;
+    }
+    -1
+}
+
+// (0.27.3) The open local a `let r = &x;` (or `&mut x`) init borrows,
+// x's local, when x is open: r is open with it, its type `&` of x's
+// (a link: solving one solves the other, closing one closes both); -1
+// otherwise.
+fn open_link(init: i64, pcx: Ctx<Comp>) -> i64 {
+    let x = node(init, pcx);
+    if x.kind != NodeKind::Unary || x.op != Tok::Amp || node(x.b, pcx).kind != NodeKind::Ident
+        || node(x.b, pcx).res != Res::Local {
+        return -1;
+    }
+    let l = node(x.b, pcx).y;
+    if open_index(l, pcx) >= 0 { l } else { -1 }
+}
+
+// The pairs linked to local l (open_link) leave the table; with t > 0
+// their locals and inits take `&` of t first.
+fn open_dependents(l: i64, t: i64, pcx: inout Ctx<Comp>) {
+    var i = 0;
+    while i + 1 < pcx.open_lets.count {
+        let init = pcx.open_lets.get(i + 1);
+        if open_link(init, pcx) != l {
+            i += 2;
+            continue;
+        }
+        if t > 0 {
+            let d = pcx.open_lets.get(i);
+            let r = crate::front::types::ref_to(t, type_info(pcx.locals[d].ty, pcx).b, &pcx);
+            pcx.locals[d].ty = r;
+            pcx.nodes[init].ty = r;
+        }
+        open_drop(i, &pcx);
+    }
+}
+
+// (check_let) Whether `let x = init;` (unannotated, the rust edition) may
+// make x a link (open_link): init is `&y` of a local y; its use keeps y
+// open (OPEN_KEEP) until open_let decides.
+pub fn open_borrow_init(init: i64, pcx: Ctx<Comp>) -> bool {
+    pcx.open_lets.count > 0 && node(init, pcx).kind == NodeKind::Unary
+        && node(init, pcx).op == Tok::Amp && node(node(init, pcx).b, pcx).kind == NodeKind::Ident
+        && open_local(node(init, pcx).b, pcx) >= 0
+}
+
+// (check_let) An unannotated `let` of the rust edition bound local l to
+// init: l is open when init is a literal tree or a link (open_link); a
+// borrowed open local that does not make one is closed. RULE: F18.5
+pub fn open_let(l: i64, init: i64, pcx: inout Ctx<Comp>) {
+    let root = open_link(init, pcx);
+    if l >= 0 && (root >= 0 || open_tree(init, pcx)) {
+        pcx.open_lets.push(l);
+        pcx.open_lets.push(init);
+    } else if root >= 0 {
+        open_close(open_index(root, pcx), &pcx);
+    }
+}
+
+// The pair of the open local identifier n names (its index in
+// OPEN_LETS), or -1.
+pub fn open_local(n: i64, pcx: Ctx<Comp>) -> i64 {
+    if pcx.open_lets.count == 0 || node(n, pcx).kind != NodeKind::Ident {
+        return -1;
+    }
+    match crate::front::check::lookup_local(node(n, pcx).a, pcx) {
+        Option::Some(l) => open_index(l, pcx),
+        Option::None => -1,
+    }
+}
+
+// Pair k leaves the table, with its uses.
+fn open_drop(k: i64, pcx: inout Ctx<Comp>) {
+    let l = pcx.open_lets.get(k);
+    let last = pcx.open_lets.count - 2;
+    pcx.open_lets.set(k, pcx.open_lets.get(last));
+    pcx.open_lets.set(k + 1, pcx.open_lets.get(last + 1));
+    pcx.open_lets.count = last;
+    var w = 0;
+    var i = 0;
+    while i + 1 < pcx.open_uses.count {
+        if pcx.open_uses.get(i) != l {
+            pcx.open_uses.set(w, pcx.open_uses.get(i));
+            pcx.open_uses.set(w + 1, pcx.open_uses.get(i + 1));
+            w += 2;
+        }
+        i += 2;
+    }
+    pcx.open_uses.count = w;
+}
+
+// Pair k is closed at its provisional type, the fallback: its literals
+// are checked to fit it. A link closes its root, a root its links.
+fn open_close(k: i64, pcx: inout Ctx<Comp>) {
+    let l = pcx.open_lets.get(k);
+    let init = pcx.open_lets.get(k + 1);
+    let root = open_link(init, pcx);
+    if root >= 0 {
+        open_close(open_index(root, pcx), &pcx);
+        return;
+    }
+    open_dependents(l, 0, &pcx);
+    let t = pcx.locals[l].ty;
+    open_drop(open_index(l, pcx), &pcx);
+    open_set(init, t, &pcx);
+}
+
+// Pair k is solved to type t when its literals, and those of the uses
+// that kept it open, can take it: the local, its init and those nodes
+// retyped in place. Whether it was. RULE: F18.5
+pub fn open_solve(k: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
+    let l = pcx.open_lets.get(k);
+    let init = pcx.open_lets.get(k + 1);
+    // (a link, `&x`: x solved to what the reference points to)
+    let root = open_link(init, pcx);
+    if root >= 0 {
+        let rt = type_info(t, pcx);
+        if t > 0 && rt.kind != TyKind::Ptr {
+            // (`let b: i64 = r;`: the referent takes the type, for the
+            // error that follows, a reference where its value goes)
+            open_solve(open_index(root, pcx), t, &pcx);
+            return false;
+        }
+        if t <= 0 || rt.kind != TyKind::Ptr || rt.b != type_info(pcx.locals[l].ty, pcx).b {
+            return false;
+        }
+        return open_solve(open_index(root, pcx), rt.a, &pcx);
+    }
+    if t == pcx.locals[l].ty {
+        open_close(k, &pcx);
+        return true;
+    }
+    if !open_fit(init, t, pcx) {
+        return false;
+    }
+    var i = 0;
+    while i + 1 < pcx.open_uses.count {
+        let u = pcx.open_uses.get(i + 1);
+        if pcx.open_uses.get(i) == l && node(u, pcx).kind != NodeKind::Ident
+            && !open_fit(u, t, pcx) {
+            return false;
+        }
+        i += 2;
+    }
+    pcx.locals[l].ty = t;
+    i = 0;
+    while i + 1 < pcx.open_uses.count {
+        if pcx.open_uses.get(i) == l {
+            open_set(pcx.open_uses.get(i + 1), t, &pcx);
+        }
+        i += 2;
+    }
+    open_dependents(l, t, &pcx);
+    open_drop(open_index(l, pcx), &pcx);
+    open_set(init, t, &pcx);
+    true
+}
+
+// (synth_name) Identifier n uses local l: when l is open, the use is
+// recorded where it keeps it open (OPEN_KEEP), and closes it otherwise
+// (a closure that captures it closes it when it is checked,
+// open_captured). RULE: F18.5
+pub fn open_use(n: i64, l: i64, pcx: inout Ctx<Comp>) {
+    let k = open_index(l, pcx);
+    if k < 0 {
+        return;
+    }
+    if pcx.open_keep {
+        pcx.open_uses.push(l);
+        pcx.open_uses.push(n);
+        return;
+    }
+    open_close(k, &pcx);
+}
+
+// Literal tree n is typed through the open local of pair k (`x += 1`,
+// `x < 10`): retyped with it.
+pub fn open_record(k: i64, n: i64, pcx: inout Ctx<Comp>) {
+    if k >= 0 && k < pcx.open_lets.count {
+        pcx.open_uses.push(pcx.open_lets.get(k));
+        pcx.open_uses.push(n);
+    }
+}
+
+// (check_expr) Expression n is checked against `expected`: an open local,
+// `&x` of one where `&T` or `&[T]` goes, or an element or a range of an
+// open array (`a[0]`, `&a[..]`), takes the type when its literals can
+// (F18.5 (a)).
+pub fn open_expected(n: i64, expected: i64, pcx: inout Ctx<Comp>) {
+    if expected <= 0 || expected == pcx.ty_error {
+        return;
+    }
+    let x = node(n, pcx);
+    if x.kind == NodeKind::Ident {
+        let k = open_local(n, pcx);
+        if k >= 0 {
+            open_solve(k, expected, &pcx);
+        }
+        return;
+    }
+    let te = type_info(expected, pcx);
+    var e = n;
+    var want = expected;
+    if x.kind == NodeKind::Unary && x.op == Tok::Amp {
+        e = x.b;
+        // (a reference or a raw pointer: `let q: *const i64 = &n;`)
+        want = if te.kind == TyKind::Ptr { te.a } else { 0 };
+    }
+    if node(e, pcx).kind == NodeKind::Index {
+        // (an element: `a[0]` where T goes; a range: `&a[..]` where `&[T]`)
+        let base = node(e, pcx).a;
+        let k = open_local(base, pcx);
+        if k < 0 {
+            return;
+        }
+        let had = pcx.locals[pcx.open_lets.get(k)].ty;
+        if had <= 0 || type_info(had, pcx).kind != TyKind::Array {
+            return;
+        }
+        let range = node(node(e, pcx).b, pcx).kind == NodeKind::Range;
+        let elem = if range && te.kind == TyKind::Slice { te.a } else if range { 0 } else { want };
+        if elem > 0 {
+            open_solve(k, array_of(elem, type_info(had, pcx).b, &pcx), &pcx);
+        }
+        return;
+    }
+    if e == n {
+        return;
+    }
+    let k = open_local(e, pcx);
+    if k < 0 {
+        return;
+    }
+    let had = pcx.locals[pcx.open_lets.get(k)].ty;
+    if want > 0 {
+        open_solve(k, want, &pcx);
+    } else if te.kind == TyKind::Slice && had > 0 && type_info(had, pcx).kind == TyKind::Array {
+        open_solve(k, array_of(te.a, type_info(had, pcx).b, &pcx), &pcx);
+    }
+}
+
+// The pair of an open local whose type is an integer, for a use that may
+// keep it open: identifier n names it; -1 otherwise.
+pub fn open_scalar(n: i64, pcx: Ctx<Comp>) -> i64 {
+    let k = open_local(n, pcx);
+    if k < 0 {
+        return -1;
+    }
+    let l = pcx.open_lets.get(k);
+    if !is_integer(pcx.locals[l].ty) {
+        return -1;
+    }
+    k
+}
+
+// Whether e is an untyped integer literal, maybe negated.
+pub fn open_literal(e: i64, pcx: Ctx<Comp>) -> bool {
+    let x = node(e, pcx);
+    if x.kind == NodeKind::Unary && x.op == Tok::Minus {
+        return open_literal(x.b, pcx);
+    }
+    x.kind == NodeKind::Int && x.b == SUF_NONE
+}
+
+// (check_expr) Whether e, behind a `&` where `&t` goes, is an untyped
+// literal that takes t: an integer literal for an integer t, a float one
+// for a float t, maybe negated (`&1`, `&-9`, `&0.0`). RULE: F18.3
+pub fn ref_literal_takes(e: i64, t: i64, pcx: Ctx<Comp>) -> bool {
+    var x = node(e, pcx);
+    if x.kind == NodeKind::Unary && x.op == Tok::Minus {
+        x = node(x.b, pcx);
+    }
+    x.b == SUF_NONE && (x.kind == NodeKind::Int && is_integer(t) && t != pcx.char_type
+        || x.kind == NodeKind::Float && is_float(t))
+}
+
+// Whether node n is in the literal tree of root, as written.
+fn in_tree(root: i64, n: i64, pcx: Ctx<Comp>) -> bool {
+    if root == n {
+        return true;
+    }
+    if root <= 0 {
+        return false;
+    }
+    let x = node(root, pcx);
+    if x.kind == NodeKind::Unary || x.kind == NodeKind::Repeat {
+        return in_tree(if x.kind == NodeKind::Unary { x.b } else { x.a }, n, pcx);
+    }
+    if x.kind == NodeKind::Binary {
+        return in_tree(x.b, n, pcx) || in_tree(x.c, n, pcx);
+    }
+    if x.kind == NodeKind::Array || x.kind == NodeKind::Tuple {
+        for i in 0..x.count {
+            if in_tree(child(root, i, pcx), n, pcx) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// (synth_expr) The type of untyped integer literal n with no context in
+// the rust edition: the fallback, i32 (F18.3). One that does not fit is an
+// error, but in the literal tree of a `let` being checked (OPEN_INIT),
+// whose local may take a wider type (checked when it is solved or closed).
+pub fn literal_fallback(n: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if node(n, pcx).a as u64 > int_max(TY_I32) && !in_tree(pcx.open_init, n, pcx) {
+        open_fits(n, false, TY_I32, &pcx);
+    }
+    TY_I32
+}
+
+// (check_function) The function's open locals, from mark on, take the
+// fallback at its end.
+pub fn open_end(mark: i64, pcx: inout Ctx<Comp>) {
+    while pcx.open_lets.count > mark {
+        open_close(pcx.open_lets.count - 2, &pcx);
+    }
+}
+
+// (check_assign) Identifier n, an assignment's target kept open, is
+// assigned a value of type t: its local takes t when its literals can,
+// else it is closed. Its type now.
+pub fn open_settle(n: i64, t: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let k = open_local(n, pcx);
+    if k >= 0 && !(t > 0 && t != TY_NEVER && t != pcx.ty_error && open_solve(k, t, &pcx)) {
+        open_close(k, &pcx);
+    }
+    pcx.nodes[n].ty
+}
+
+// (check_let) The hoisted temporary `let` stmt of `let s: &[T] = &a[..];`
+// (temps::annotate_temp's OPEN_HINTS): its range of an open array takes
+// the annotation's slice type before it is synthesized (F18.5 (a)).
+pub fn open_hint(stmt: i64, init: i64, pcx: inout Ctx<Comp>) {
+    var i = 0;
+    while i + 1 < pcx.open_hints.count {
+        if pcx.open_hints.get(i) == stmt {
+            let t = crate::front::check::resolve::resolve_type(pcx.open_hints.get(i + 1), &pcx);
+            open_expected(init, t, &pcx);
+            return;
+        }
+        i += 2;
+    }
+}
+
+// (check_closure_sig) The closure whose captures are CAPS' pairs from `from`
+// on is checked: an open local it captures is closed, its type the one its
+// environment holds. RULE: F18.5
+pub fn open_captured(from: i64, pcx: inout Ctx<Comp>) {
+    var i = from;
+    while i + 1 < pcx.caps.count && pcx.open_lets.count > 0 {
+        let k = open_index(pcx.caps.get(i), pcx);
+        if k >= 0 {
+            open_close(k, &pcx);
+        }
+        i += 2;
+    }
 }
