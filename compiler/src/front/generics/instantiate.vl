@@ -17,7 +17,8 @@ use crate::base::diag::{
 };
 use crate::front::assoc::{infer_from_assoc, is_projection_node};
 use crate::front::ast::{
-    NODE_REF, NODE_REF_MUT, NodeKind, child, list_begin, list_end, list_push, new_node,
+    NODE_CHECKED, NODE_REF, NODE_REF_MUT, NodeKind, child, list_begin, list_end, list_push,
+    new_node,
 };
 use crate::front::ast::NodeKind::{
     Arm, Assign, AssocType, Binary, Block, Break, Call, Cast, Closure, Defer, EnumPanic, ExprStmt,
@@ -27,6 +28,7 @@ use crate::front::ast::NodeKind::{
 };
 use crate::front::check::{Res, has_error_type};
 use crate::front::check::args::is_default_arg;
+use crate::front::check::check_mode::check_expr;
 use crate::front::check::collect::{add_fn, template_of_type_node};
 use crate::front::check::resolve::{resolve_signature, resolve_type, type_name_key};
 use crate::front::check::synth_mode::synth_expr;
@@ -490,6 +492,36 @@ fn slice_elem_of(t: i64, pcx: inout Ctx<Comp>) -> i64 {
     0
 }
 
+// (0.27.2.1) An argument `&S` at a parameter `&P` that does not unify
+// with it: through S's Deref chain, the first `&D` that does (`sum(rest)`
+// with `rest: &Box<List<A>, A>` at `l: &List<A>` binds A), as rustc's
+// coercion of a reference argument; true when one did. The argument is
+// coerced where it is checked (check_mode::coerce_ref). RULE: F32.2
+fn deref_unify(params: i64, bound: *i64, tmod: i64, p: i64, t: i64, pcx: inout Ctx<Comp>)
+    -> bool {
+    if p <= 0 || pcx.nodes[p].kind != NodeKind::TyPtr || t <= 0
+        || pcx.types[t].kind != TyKind::Ptr || pcx.types[t].b != crate::front::types::REF_SHARED
+        || !crate::front::rust::rust_at(pcx.nodes[p].start, &pcx) {
+        return false;
+    }
+    var s = pcx.types[t].a;
+    for _ in 0..4 {
+        if s <= 0 || pcx.types[s].kind != TyKind::Struct && pcx.types[s].kind != TyKind::Enum {
+            return false;
+        }
+        let d = crate::front::check::rust::deref_projection(s, &pcx);
+        if d <= 0 {
+            return false;
+        }
+        let r = crate::front::types::ref_to(d, crate::front::types::REF_SHARED, &pcx);
+        if unify(params, bound, tmod, p, r, &pcx) {
+            return true;
+        }
+        s = d;
+    }
+    false
+}
+
 // Infers the parameters of `params` from the expressions `args` (a node
 // whose list they are, from list index `first`) against the type nodes
 // `types` (a node whose list they are, from `first_type`; for a function
@@ -565,12 +597,18 @@ fn infer_from(params: i64, bound: *i64, tmod: i64, args: i64, first: i64, types:
                 if t != TY_NEVER && join_arg(params, bound, loose, p, t, pcx) {
                     continue;
                 }
-                if t != TY_NEVER && !unify(params, bound, tmod, p, t, &pcx) {
+                if t != TY_NEVER && !unify(params, bound, tmod, p, t, &pcx)
+                    && !deref_unify(params, bound, tmod, p, t, &pcx) {
                     err_begin(pcx.nodes[arg].start, &pcx);
                     err_str(c"mismatched types: this is '", pcx);
                     err_type(t, pcx);
                     err_str(c"', which does not fit the type parameters inferred so far", pcx);
                     err_end(&pcx);
+                }
+                // (0.27.2.1: a unify that left the parameter's own unbound,
+                // `&List<A>` against `&Box<List<Gpa>, Gpa>`: through Deref, F32.2)
+                if t != TY_NEVER && mentions_unbound(params, bound, p, pcx) {
+                    deref_unify(params, bound, tmod, p, t, &pcx);
                 }
             }
         }
@@ -992,6 +1030,7 @@ pub fn instantiate_call(tf: i64, n: i64, first_param: i64, self_ty: i64, written
                 bound[impl_count + i] = resolve_type(w, &pcx);
             }
         }
+        range_literal_by_bounds(params, bound, count, n, template, first_param, &pcx);
         infer_from(params, bound, tmod, n, 0, template, first_param, true, pcx.nodes[template].b,
             hint_for(n, pcx), &pcx);
         if self_ty != 0
@@ -1010,6 +1049,95 @@ pub fn instantiate_call(tf: i64, n: i64, first_param: i64, self_ty: i64, written
         }
         free(bound as *u8);
         fn_instance(tf, mark, n, &pcx)
+    }
+}
+
+// (0.27.2.1) Whether n is a range of unsuffixed integer literals, not
+// checked yet (`1..3`, `2..`, `..=4`).
+fn untyped_int_range(n: i64, pcx: Ctx<Comp>) -> bool {
+    if pcx.nodes[n].kind != NodeKind::Range || (pcx.nodes[n].p & NODE_CHECKED) != 0
+        || pcx.nodes[n].a == 0 && pcx.nodes[n].b == 0 {
+        return false;
+    }
+    for e in [pcx.nodes[n].a, pcx.nodes[n].b] {
+        if e != 0 && (pcx.nodes[e].kind != NodeKind::Int
+            || pcx.nodes[e].b != crate::front::lexer::SUF_NONE) {
+            return false;
+        }
+    }
+    true
+}
+
+// (0.27.2.1) A type parameter that only a range of unsuffixed integer
+// literals binds (`s.get(1..3)` for `fn get<I: SliceIndex<[T]>>(&self,
+// index: I)`), whose bounds its default `Range<i64>` fails: the range is
+// checked as the one `Range<N>` of an integer type N that meets them
+// (`Range<usize>`), before the arguments are inferred. A copy of the range
+// gives its template. RULE: F18.3
+fn range_literal_by_bounds(params: i64, bound: *i64, count: i64, n: i64, template: i64,
+    first_param: i64, pcx: inout Ctx<Comp>) {
+    // UNSAFE: bound has `count` slots (instantiate_call's).
+    // SAFETY: every read and write is for an index below count.
+    unsafe {
+        if pcx.edition == 0 || pcx.nodes[n].kind != NodeKind::Call
+            && pcx.nodes[n].kind != NodeKind::MethodCall {
+            return;
+        }
+        for j in 0..pcx.nodes[n].count {
+            let a = child(n, j, pcx);
+            if !untyped_int_range(a, pcx) || j + first_param >= pcx.nodes[template].count {
+                continue;
+            }
+            let tn = pcx.nodes[child(template, j + first_param, pcx)].b;
+            if tn <= 0 || pcx.nodes[tn].kind != NodeKind::TyName || pcx.nodes[tn].count != 0
+                || pcx.nodes[tn].g != 0 {
+                continue;
+            }
+            var k = -1;
+            for i in 0..count {
+                if pcx.nodes[child(params, i, pcx)].a == pcx.nodes[tn].a {
+                    k = i;
+                }
+            }
+            if k < 0 || bound[k] != 0 || pcx.nodes[child(params, k, pcx)].h == 0
+                || (0..count).any(|i| i != k && bound[i] == 0) {
+                continue;
+            }
+            // (the template, from a copy of the range typed by the default)
+            let copy = new_node(NodeKind::Range, pcx.nodes[a].start, pcx.nodes[a].end, &pcx);
+            pcx.nodes[copy].c = pcx.nodes[a].c;
+            for side in 0..2 {
+                let e = if side == 0 { pcx.nodes[a].a } else { pcx.nodes[a].b };
+                if e != 0 {
+                    let d = new_node(NodeKind::Int, pcx.nodes[e].start, pcx.nodes[e].end, &pcx);
+                    pcx.nodes[d].a = pcx.nodes[e].a;
+                    if side == 0 { pcx.nodes[copy].a = d; } else { pcx.nodes[copy].b = d; }
+                }
+            }
+            let dt = synth_expr(copy, &pcx);
+            if pcx.types[dt].kind != TyKind::Struct || pcx.structs[pcx.types[dt].a].tmpl == 0
+                || int_meets_bounds(params, bound, count, k, dt, &pcx) {
+                continue;
+            }
+            let tpl = pcx.structs[pcx.types[dt].a].tmpl;
+            var found = 0;
+            var several = false;
+            for c in [TY_USIZE, TY_I32, TY_U32, TY_U64, TY_ISIZE, TY_U8, TY_I8, TY_U16, TY_I16] {
+                let mark = pcx.tscratch.count;
+                pcx.tscratch.push(c);
+                let rt = template_instance(tpl, mark, pcx.nodes[a].start, &pcx);
+                if int_meets_bounds(params, bound, count, k, rt, &pcx) {
+                    if found != 0 {
+                        several = true;
+                    }
+                    found = rt;
+                }
+            }
+            if found != 0 && !several {
+                check_expr(a, found, &pcx);
+                mark_synthed(a, &pcx);
+            }
+        }
     }
 }
 

@@ -84,6 +84,46 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.27.2.1
 
+The front's gaps behind std2's XFAILs (front2721b):
+
+- A generic trait's impl is picked by an own type parameter's bound
+  (`extend<I: IntoIterator<Item = T>>`: Extend<T> over Extend<&T>,
+  F13.3), by the expected type (`let r: &i64 = w.borrow()`, F13.2) and,
+  in an instance, by the receiver's type parameter bound (`s.as_ref()`
+  with `S: AsRef<str>`, F13.4).
+- Literals take their context: `let d: &[u8] = &[1, 2, 3]` is an array
+  of u8 (F18.4), `s.get(1..3)` a `Range<usize>` (F18.3). Integer
+  inference variables (a later statement's type) and the i32 fallback
+  stay 0.27.3's (FL6).
+- A template impl binds an instance's arguments by position only when
+  its header names its parameters in order: `impl<T> SliceIndex<[T]> for
+  Range<usize>` no longer covers `Range<i64>` (F14.2).
+- A reference impl (`impl<A: PartialEq<B>, B> PartialEq<&B> for &A`)
+  yields to a slice's own impl under Z9.1, so std2 can have Rust's
+  reference impls; an ambiguity message for a pattern impl no longer
+  reads past TLISTS (the crash at types.vl:608).
+- `{:E}` is UpperExp, and `{:-}` sets Formatter's sign_minus.
+- Deref coercion at an argument: `&Box<T, A>` where `&T` goes, and in a
+  generic call through the Deref chain (`sum(rest)` binds A, F32.2).
+- A bound's `Item = &T` through a supertrait binds T (`Copied<I>`'s
+  DoubleEndedIterator impl, F11.5). Group 3's other `type.infer` cases
+  (a later statement's type, a later match arm's) wait for FL1's deferred
+  inference (0.27.4).
+
+The front's smaller gaps (front2721c):
+
+- A method call counts only the traits in scope: `self.v.fmt(f)` with
+  only `Binary` imported is Binary's, not ambiguous with Display and
+  Debug (F9.2).
+- A trait default's own parameter, renamed where an impl has one of its
+  name, is renamed in a path's head too: `B::from_iter_in(..)` in
+  `collect_in` on a `Map`, `Zip` or `Enumerate` (F12.2).
+- A struct's impl of a spec's trait writes the hole: `{:b}` with `impl
+  Binary for W`, `{:x}`, `{:o}`, `{:e}` and `{:p}` likewise (F16.5).
+- The primitives' builtin `Sum<&'a P>` and `Product<&'a P>`
+  (`v.iter().sum()`, F15.1); char is Clone and Copy.
+- std2's `Stdin::read_line` annotates its result, so the stdin cases run.
+
 The borrow checker (bc2721):
 
 - Implied outlives bounds as rustc's well-formedness (borrowck.md
@@ -94,12 +134,32 @@ The borrow checker (bc2721):
   for `[T]` or `str`; `Self` of a trait's default method as a type
   parameter; a bound's `Item = T` and trait arguments
   (`B: FromIteratorIn<Self::Item, A>`) as equalities; a blanket impl's
-  projection (`U::IntoIter` of an iterator). 28 std2 tests and 3
+  projection (`U::IntoIter` of an iterator); a substitution's own
+  implied bounds (`&'m mut I` gives I's slots `: 'm`). 30 std2 tests and 3
   `rust_t_` cases that failed on `borrowck.outlives` or
   `borrowck.elision` now pass; `tests/std2/check.sh`'s known-gap XFAIL
-  cases with borrowck errors in std2 fall from 45 to 6 (each a front
-  gap: `&mut self` on an impl for a view type reads as `inout [u8]`).
-  10 `rust_b_implied_` cases, each agreeing with rustc.
+  cases with borrowck errors in std2 fall from 45 to 9 (17 with
+  std2's later tests: 14 a front
+  gap: `&mut self` on an impl for a view type reads as `inout [u8]`;
+  three Chain cases are L14, an impl's equality bound on a type
+  argument). 11 `rust_b_implied_` cases, each agreeing with rustc.
+- `for x in v` over a place moves v in the rust edition (D8.5): the
+  loop's sequence owns it and `into_iter` takes it, where it was a
+  borrowed copy, so v was dropped again after the iterator had freed it
+  (a double free under `--check-alloc` for `for` over a Vec, a HashSet
+  or a generic sequence, `extend`, `into_keys`, `into_values`,
+  `flatten`). 9 cases that failed on it pass.
+- Moves out of an index (D8.6, rustc E0508): an index of a non-Copy array
+  or slice element is a place with no move path, a constant index too,
+  so `let x = a[0]` is `borrowck.move_out`, named as "an element of an
+  array (a slice) whose type is not Copy". A whole-array move, a borrow
+  of an element, a Copy part or a Copy element's constant index stay
+  allowed. By-value `for` over an array of non-Copy elements still
+  reads them by reference (F22.1) until std2 has an array `IntoIter`.
+- `write(w, ..)`'s writer is a two-phase reborrow, as Rust's `write!`
+  receiver (D7.4): `write(f, "{}", f.width())` reads f while the
+  reborrow is reserved, and f is usable after the call, where the
+  desugaring moved f (`borrowck.use_moved`). 6 Formatter cases pass.
 
 std2 (std2721):
 
@@ -125,6 +185,34 @@ std2 (std2721):
   as Rust's `write!` (a Formatter's failed write fails the later ones).
 - The XFAIL std2 cases grouped by cause and owner; the cases that failed
   only on their own unused imports or test shapes are fixed.
+
+Compile cost and the machine's load (cost2721):
+
+- hello-rust from 4.38x its MVS row to 3.35x (`tests/compile_cost.sh`,
+  434M to 327M instructions); MVS's rows are not dearer: hello 0.99x,
+  std 0.99x, check 0.91x, rust 0.97x of 0.27.2. std2's declaration
+  tables are walked by key, not scanned whole: the lifetimes by node,
+  the `where` predicates by owner, METHODS by type and name, the impls
+  by trait. gm_key keeps a method's name in the bits HMap hashes.
+  std2's impls are not checked against their traits in every compile;
+  the gate's `--std2-check` row checks them whole.
+- What is left of hello-rust's cost over MVS's is structural: std2 is
+  lexed and parsed whole (+47M), its 489 builtin impls are made and
+  parsed (33M), and its println costs the back end +40M. A pass that
+  left out the impls of traits nothing reaches was measured and dropped:
+  println reaches nearly every trait, and the pass cost more than the 95
+  impls it left out. 0.27.3 takes lazy std2 parsing, in sections as MVS's
+  std is read, with a lighter std2 println.
+- The gate builds std2's cases three times, not six. The std2-tests row
+  reads its counts from the suite rows' case results ($VOLE_TEST_RESULTS),
+  and std2-check compiles only the cases suite-O0 did not pass (283 of
+  1,413), with the same tally.
+- The check hook reports its rewrites when the check after them times
+  out, and its compiler runs' limits grow with the load average (at most
+  8 times): the hooks test "the hook's rewrites, each a changed line"
+  failed under the gate's load.
+- The stress-grow row's one-time segfault (arch_x86_sse3.vl at -O0 for
+  x86_64-macos) did not recur in 42,400 compilations under load.
 
 The front (front2721):
 
