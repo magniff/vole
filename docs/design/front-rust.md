@@ -595,6 +595,13 @@ reference (`&'a T: IntoIterator`), a closure bound (`F: FnMut(I::Item)
 -> B`, D20.1). *Anchor:* `front/parser/items/params.vl: parse_where`
 (today `edition.later: where_bound` for a non-parameter subject),
 `front/parser/rust.vl: where_key`.
+A clause is its own item's: a function's is checked for that function
+(F10.2), a struct's, an enum's, a trait's and an impl's are none
+function's (0.27.3: a struct's predicate was the function's parsed
+before it, `struct Flatten<I> where I::Item: IntoIterator` read as a
+bound of Cloned's `next_back` when the whole std2 was loaded; which
+impls a program loads does not change which predicates a function has).
+Case `std2_iter_adapters_cloned_impl_doubleendediterator`.
 
 **F10.2 (at instantiation).** For an instance with substitution `θ`,
 every clause `σ: Tr<b..>` is checked as `θ(σ): Tr<θ(b)..>` by F0.4 at
