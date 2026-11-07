@@ -688,7 +688,9 @@ by_expected, by_param_bound, dispatch`.
 self type `σ`, or in a trait argument `aᵢ`, or is determined by a
 projection of a constrained parameter through a bound in `W` (`impl<B,
 I: Iterator, F: FnMut(I::Item) -> B> Iterator for Map<I, F>`: `B` is
-fixed by `F`'s bound's result position, `I` by `σ`). Unification at a
+fixed by `F`'s bound's result position, `I` by `σ`; the result may be
+a type with arguments, `P: FnMut(I::Item) -> Option<B>` for MapWhile and
+Scan, 0.27.2.1). Unification at a
 goal runs over the whole header and, for a parameter constrained only
 through a bound, over the bound's projection after the rest is bound
 (so `impl<T> SliceIndex<[T]> for usize` binds `T` from the goal's
@@ -1193,6 +1195,13 @@ for usize { type Output = T; .. }`, `for Range<usize> { type Output =
 `&mut c[i]`, `c[i].m()` with `m` taking `&mut self` (F6.2's `&mut`
 autoref) use `index_mut`; a `τ` with `Index` but no `IndexMut` is
 `error trait.unmet` naming `IndexMut` (E0594's shape).
+
+**F20.5 (a tuple index of literals).** `g[(0, 1)]` with `G:
+Index<(usize, usize)>`: a tuple of unsuffixed literals takes its
+elements' types from the impl's index type, as one literal does
+(`(i64, i64)` only when no impl takes an integer tuple; 0.27.2.1).
+*Anchor:* `front/convert: literal_kind, literal_tuple_fits`. Case
+`rust_f_f20_tuple_index_ok`.
 
 ## 6. The bound-only rule (D22.3's front side; U1)
 
