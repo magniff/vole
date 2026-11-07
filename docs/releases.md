@@ -98,6 +98,21 @@ The front (fl10274):
   borrowck.borrow_immutable where rustc compiles them. A type with Index
   and no IndexMut keeps `index`, and the write is borrowck's (E0596).
 
+The front (front275):
+
+- A rust body reads each operand where it is evaluated, as Rust does
+  (borrowck.md D2.4a). A Copy place given as an argument, a literal's
+  element or an assignment's right side is copied out at that point.
+  - The view or reference it reads through ends there, so rustc's
+    accepted shapes now pass the borrow checker:
+    `err_begin(pcx.nodes[p].start, pcx)`, `pcx.nodes[p].b =
+    pcx.nodes[q].a`, `v.push(v[0])`, `f(s.x, &mut s)`, `g(y, &mut y)`.
+    Gate 3's `check --borrowck-partial` goes from 3,049 errors to 313
+    (conflicts from 2,951 to 215).
+  - It is also a run-time fix: `f(x, { x += 1; x })` now passes the old
+    `x` first, and `v[{ y += 1; 0 }] = y` stores the old `y`, as in Rust.
+  - MVS is unchanged.
+
 ### What's new in 0.27.4
 
 Gate 3 opens. `volec fix --edition rust` run on a copy of compiler/src leaves N errors, printed by the gate's `gate3` row every release; 0.28 starts at N = 0. Its first full measurement was 1,414 (after 0.27.3's three parse shapes); 0.27.4 leaves 122 type errors, most of them std2 modules the compiler uses that std2 does not have yet (`std::cli`, `fs`, `process`, `gpu`), and `volec check --borrowck-partial` counts the 3,048 borrowck errors behind them, about 2,750 of one shape that 0.27.5's first item fixes (an operand read where it is evaluated, D2.4a). In the rust edition: a type is inferred from a later statement (FL1, F18.6: `Vec::new_in(a)` then a push, a later arm, `"4".parse().unwrap()`, `_` in a type); `[T]` and `str` are unsized places that `&[T]` and `&str` refer to (Z9.1c step B: impls keyed by them, method lookup through a view, `NonNull<[u8]>` 16 bytes); `&raw const`/`&raw mut` (F30.2), and a reference to a `static mut` refused as Rust 2024 does (D6.2.5); `format_args(..)` a Display value (F16.4); indexing through `&mut [T; N]` (F20.1). std2 passes 1,445 of its 1,473 tests at -O0 (1,402 of 1,472 in 0.27.3). A rust hello world's check is 2.03x MVS's (2.32x): builtin impls only for the primitives a program brings in (F15.1), and std2's own settled bodies are not borrow-checked again (Z7.2); the 2.0x ceiling is printed, enforced from 0.27.5. A crash on a closure capturing a widened integer, in MVS too, is fixed. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
