@@ -83,6 +83,28 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.2.1 | `v0.27.2.1` | 0.27.2 | aarch64-macos | std2 1,306 of 1,454 tests at -O0/-O2 under `--check-alloc`; `impl Trait` returns (§21) and the opaque instance (§22, narrowed: FL11); implied outlives bounds (D4.6); three consumed-value miscompiles fixed (D8.5), E0508, two-phase `write`; the front's std2 gaps (F13, F14.2, F18.4, F9.2, F26.3); floats, `std::env`; contracts and effects R2 (std2 declared, 27 `requires`, 11 `ensures`); hello-rust 3.48x; the gate's std2 builds halved |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.27.3
+
+Gate 2's harness (twin273):
+
+- `tests/translate.sh`: the round trip. Each MVS program of a set is copied into `target/translate`, translated in place (default `volec fix --edition rust`; `--translator CMD`, `--identity`), built with `--edition rust`, run, and compared with the reference. The reference is the case's EXPECT, EXIT and STDERR lines, or the MVS build's output (bench, `--ref build`). The sets:
+  - `examples`: the tests/examples cases;
+  - `bench`: bench/, bench/std, bench/vecloop;
+  - `run`: tests/run's MVS cases that run;
+  - `guide`: the guide's MVS programs;
+  - `rust`: the rust corpus, the runner's own check.
+
+  It prints one count per set, a cause per failure (`no-translation`, `type CODE`, `borrowck CODE`, `link`, `crash`, `output`, `exit`, `stderr`, `timeout`), the codes by frequency and the failures that look like Q7's (a borrowck error on a line that borrows a literal or a constant). `-f LIST` selects the programs a list names, and `-j N` sets the jobs. tests/translate/causes.tsv, the translator's record of why, is grouped by cause; a cause for a program that now round-trips is reported as stale (`--triage` appends the new failures as `?`). The release gate's `translate` row runs it, informational until 0.27.4: it prints the count and never fails. The identity translator round-trips all 339 of the rust corpus's run cases.
+- The rustc twin's shim, `tools/rustc-twin/` (plan-0271 §2.2). prelude.rs is the part of `allocator_api` that stable rustc lacks: one global allocator `Gpa`, with the `_in` functions as extension traits over it (`new_in`, `with_capacity_in`, `from_in`, `Box::new_in`, `collect_in`, `to_string_in`, `clone_in`, `to_owned_in`, `default_in`, `from_iter_in`, a slice's and a str's `_in` methods, `lines_in`). twin.py makes a rust-edition program Rust and keeps its line numbers:
+  - main is wrapped;
+  - a type loses its allocator argument, and a generic `A: Allocator` becomes Gpa;
+  - the format functions become macros, and `format_in` and the free `X_in(.., gpa)` functions become their Rust names;
+  - the check attributes are dropped.
+
+  `tools/rustc-twin.sh CASE... [--guide]` runs a program under rustc and compares its stdout and exit code with the case's. A difference is named by `// RUSTC-DIFFERS: WHY` in the case, or in tools/rustc-twin/divergences.tsv for a program without a case. The rust corpus's run cases and the guide's rust-edition program: 304 of 341 agree, 5 named, 0 differ. `tests/translate.sh --twin` twins every program that round-trips, one count per set.
+- `tools/borrowck-twin.sh --shim`: the verdicts through the shim. The gate row uses it: 365 of 400 agree (358 with `--std2`), 10 divergences, 0 mismatches. Seven `// RUSTC: none` markers ("no allocator until 0.27.3") are gone.
+- `tests/translate.sh --record query|refactor`: the migration surface's record mode. Each transcript's program is translated in a copy, the suite's runner re-records the transcripts (`-u`), and the result is a diff to review (target/translate/record/SUITE.diff). With the identity translator, 0 of 42 query transcripts change. `tests/guide/run.sh --split DIR` writes the guide's blocks out for the runners.
+
 ### What's new in 0.27.2.1
 
 The rust edition grows toward Rust: 1,306 of std2's 1,454 tests pass at -O0 and -O2 under `--check-alloc` (1,035 of 1,413 in 0.27.2). `impl Trait` in return position (borrowck.md §21) and the opaque type-parameter instance (§22: an uncalled template's borrows are checked, and a parameter used beyond its bounds is `generic.unbounded_use`; its other type errors are 0.27.3's, FL11). The borrow checker takes rustc's implied outlives bounds (D4.6), and fixes three miscompiles of consumed values that 0.27.2 had: a collection consumed by value (`for x in v`, `extend`, `into_iter`), an arithmetic operator's by-value operands, and `(t, t)` not caught as a use after move (D8.5); a non-Copy element moved out of an array is E0508, and `write(f, .., f.width())` is a two-phase reborrow. The front fills std2's largest gaps (Extend and Borrow chosen by bounds and the expected type, literal temporaries typed by their annotation, traits in scope for methods, operators chosen by the right operand), with an impl-binding soundness fix (F14.2). std2 gains floats printed and parsed as Rust's, `std::env`, tuples' comparisons and Hash; contracts and effects R2 declare every std2 `pub` item's effects, with 27 `requires` and 11 `ensures`. A rust hello world's check costs 3.48x MVS's (4.38x in 0.27.2); the gate builds std2's tests half as often. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
