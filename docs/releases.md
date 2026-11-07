@@ -87,6 +87,17 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.27.5
 
+The front (fl10274):
+
+- A place used mutably once its use is known takes IndexMut and
+  DerefMut, as rustc's autoref does (F20.6): `vs[0].push(x)`,
+  `ps[0].x.push(x)`, `m[i][j].push(x)`, `r[0].push(x)` through a
+  `&mut Vec`, `v[0].iter_mut()`, the same in a closure, `match vs[0] {
+  ref mut w => .. }`, and `w.x.push(x)` through a user DerefMut. In
+  0.27.4 these read the index through Index and were
+  borrowck.borrow_immutable where rustc compiles them. A type with Index
+  and no IndexMut keeps `index`, and the write is borrowck's (E0596).
+
 The front (front275):
 
 - A rust body reads each operand where it is evaluated, as Rust does
@@ -96,7 +107,8 @@ The front (front275):
     accepted shapes now pass the borrow checker:
     `err_begin(pcx.nodes[p].start, pcx)`, `pcx.nodes[p].b =
     pcx.nodes[q].a`, `v.push(v[0])`, `f(s.x, &mut s)`, `g(y, &mut y)`.
-    These were about 2,750 of gate 3's 3,042 borrowck errors.
+    Gate 3's `check --borrowck-partial` goes from 3,049 errors to 313
+    (conflicts from 2,951 to 215).
   - It is also a run-time fix: `f(x, { x += 1; x })` now passes the old
     `x` first, and `v[{ y += 1; 0 }] = y` stores the old `y`, as in Rust.
   - MVS is unchanged.
