@@ -120,8 +120,15 @@ The translator (g3274):
 - An inout slice parameter given an array or a part of one, whose `&` the
   checker takes into its view, is `&mut` (`first(&mut a)`,
   `first(&mut [1i64, 2, 3][..])`; rustc E0308 otherwise).
+- A function whose body only calls one with a `'static` result
+  (static_result's list) has a `'static` result too: the forwarders
+  `fn sym_text(sym, pcx) -> [u8] { crate::base::sym_text(sym, pcx) }` of
+  tools/refactor_shape, guide/stdapi and front/own/infer.
+- A guarded match on a copy value read from a place matches the value,
+  `match { pcx.nodes[n].kind } { .. }`: Rust keeps the scrutinee's place
+  borrowed through the guards (rustc E0502 against a guard's `&mut`).
 - Gate 3, with std2's cli: 14 type errors, none of them the translator's;
-  borrowck (partial) 152 to 109. A borrowck case for the class it leaves,
+  borrowck (partial) 152 to 96. A borrowck case for the class it leaves,
   a `&mut` coerced to a raw pointer held through the call:
   `rust_b_raw_coerce_ends_borrow` (XFAIL).
 
