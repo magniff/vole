@@ -84,6 +84,23 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.3 | `v0.27.3` | 0.27.2.1 | aarch64-macos | the translator `fix --edition rust` and gate 2 (`tests/translate.sh`, the rustc twin); the i32 literal default (FL6); std2 1,402 of 1,472 tests at -O0; lazy std2 parsing (a rust hello world 2.32x MVS's); arrays' by-value IntoIterator |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.27.4
+
+The front (front274):
+
+- FL11: a template's opaque instance (borrowck.md §22) reports its type
+  errors as rustc does (`x + x` of `T: Add<Output = T>` returned as an
+  i64, E0308), where 0.27.2.1 reported only the bound-only rule's. The
+  model gained what that needs: operators on a type parameter through
+  its bounds, a bound's type arguments (`S: AsRef<str>`) and a trait
+  parameter's default (`Rhs = Self`), `T::default()` and `T::CONST`,
+  `*d` with `Deref`, `g[i]` with `Index`. An instance that meets a gap
+  left (a generic method of a generic trait, a `where` predicate, a
+  bound unresolved while it is made) is unsure, and its errors are
+  forgotten; std2-check stays at 0.
+- `g[i]` of a `g: &G`, G a struct with Index, reads through the reference
+  (F26.3).
+
 ### What's new in 0.27.3
 
 The translator and gate 2. `volec fix --edition rust FILE|DIR` rewrites an MVS program into the rust edition, directed by its types: parameter modes become `&T`, `&mut T` or `T`, `&x` at a call becomes the borrow the parameter takes, `var` becomes `let mut`, a view becomes a slice, a struct holding a view gets a lifetime, std calls follow `compiler/std2/rewrite.tsv`'s rows by type, contracts are carried, and an integer literal MVS typed i64 is annotated where the rust edition's i32 default would change it. `tests/translate.sh` measures the round trip (translated, built in the rust edition, the same output), and the rustc twin runs what round-trips under rustc; the release gate's `translate` row prints both, informational until 0.27.4 (the counts are in docs/roadmap.md's 0.27.3 gate record). In the rust edition an unsuffixed integer literal now takes its type from its first use, and is i32 when nothing fixes it (FL6, F18.5). 1,402 of std2's 1,472 tests pass at -O0 (1,306 of 1,454 in 0.27.2.1). std2 is parsed lazily, by the items a program reaches, and a `println` with no holes writes its literal directly: a rust hello world's check costs 2.32x MVS's (3.48x). Arrays iterate by value (`std::array::IntoIter` over `ManuallyDrop`), a rust-edition union drops none of its fields, an `if` condition's temporaries drop before its branch (L3), and std2 gains floats' methods, Unicode's tables, `std::sync::atomic` and more of `std::env`. Gate 3's first run: `fix --edition rust compiler/src` stops at 50 parse and import errors, all three translator shapes (an `unsafe { }` operand, a raw-pointer `self`, an import its file already binds); 0.27.4 prints its count. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
@@ -176,18 +193,6 @@ The front (front273):
 - A `&mut self` method of a generic trait called on a `let` binding,
   `s.index_mut(r)`, is own.readonly as any other `&mut self` method
   (F6.3, rustc E0596); 0.27.2.1 accepted it.
-- FL11: a template's opaque instance (borrowck.md §22) reports its type
-  errors as rustc does (`x + x` of `T: Add<Output = T>` returned as an
-  i64, E0308), where 0.27.2.1 reported only the bound-only rule's. The
-  model gained what that needs: operators on a type parameter through
-  its bounds, a bound's type arguments (`S: AsRef<str>`) and a trait
-  parameter's default (`Rhs = Self`), `T::default()` and `T::CONST`,
-  `*d` with `Deref`, `g[i]` with `Index`. An instance that meets a gap
-  left (a generic method of a generic trait, a `where` predicate, a
-  bound unresolved while it is made) is unsure, and its errors are
-  forgotten; std2-check stays at 0.
-- `g[i]` of a `g: &G`, G a struct with Index, reads through the reference
-  (F26.3).
 - Known gap: `index_mut` on a `&mut [T]` receiver (`(&mut a[..])
   .index_mut(r)`, and so `&mut v[r]` with a range value r) is refused as
   "calling a method through a raw pointer is unsafe".
