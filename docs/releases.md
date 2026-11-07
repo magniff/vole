@@ -162,6 +162,36 @@ std2 (std273):
   bound, and an Index bound on a type parameter. None waits for a
   std2 body.
 
+Compile cost and the machine's load (cost273):
+
+- **std2 is parsed lazily** (front/modules/std2lazy.vl). Its text is still
+  lexed whole, then split into units: each item, each method of an inherent
+  impl, and each default method of a trait (with its trait's header and
+  required items). A build keeps only the units the program reaches by name:
+  its own words, the known items and the names the compiler's lowerings and
+  made code use; an item by its name, a trait by any of its items' names, a
+  method once its type or trait is reached, a trait impl once both are. The
+  rest is never parsed, derived, expanded (`#[builtin_impls]`) or collected.
+  A lazy build with errors is made again with std2 whole, so its
+  diagnostics are the whole std2's. Queries, `--std2-check` and
+  `VOLE_STD2_EAGER=1` read std2 whole. The rust and std2 cases at -O0 give
+  the same verdicts lazy and eager (2,095), and a sample's code is the same
+  (85 of 85, after renumbering).
+- **A lighter println**: on std2, `println("hello")` (`print`, `eprint`,
+  `eprintln`) with a literal that has no hole is written as a format
+  literal: its text through the Formatter's `write_str`, as Rust's. It no
+  longer goes through str's Display and `Formatter::pad`, whose padding,
+  char counting and UTF-8 encoding every hello world compiled.
+- hello-rust from 371M instructions (3.76x its MVS row) to 231M (2.32x),
+  `tests/compile_cost.sh`; std-rust from 729M to 637M; MVS's rows not
+  dearer (hello 1.01x, std 1.00x, check 1.00x, rust 1.00x of 0.27.2.1).
+  What is left over the 2.0x ceiling: std2 is still lexed whole, its builtin
+  impls are made for every primitive, and its big modules are few units
+  (0.27.4).
+- The hooks' case "the check after the fixes timed out" gives the two real
+  calls before it 8 s (scaled by the load up to 64 s), not 3 s: at 3 s
+  (24 s under load) it failed in every suite row of 0.27.2.1's gate.
+
 ### What's new in 0.27.2.1
 
 The rust edition grows toward Rust: 1,306 of std2's 1,454 tests pass at -O0 and -O2 under `--check-alloc` (1,035 of 1,413 in 0.27.2). `impl Trait` in return position (borrowck.md §21) and the opaque type-parameter instance (§22: an uncalled template's borrows are checked, and a parameter used beyond its bounds is `generic.unbounded_use`; its other type errors are 0.27.3's, FL11). The borrow checker takes rustc's implied outlives bounds (D4.6), and fixes three miscompiles of consumed values that 0.27.2 had: a collection consumed by value (`for x in v`, `extend`, `into_iter`), an arithmetic operator's by-value operands, and `(t, t)` not caught as a use after move (D8.5); a non-Copy element moved out of an array is E0508, and `write(f, .., f.width())` is a two-phase reborrow. The front fills std2's largest gaps (Extend and Borrow chosen by bounds and the expected type, literal temporaries typed by their annotation, traits in scope for methods, operators chosen by the right operand), with an impl-binding soundness fix (F14.2). std2 gains floats printed and parsed as Rust's, `std::env`, tuples' comparisons and Hash; contracts and effects R2 declare every std2 `pub` item's effects, with 27 `requires` and 11 `ensures`. A rust hello world's check costs 3.48x MVS's (4.38x in 0.27.2); the gate builds std2's tests half as often. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
