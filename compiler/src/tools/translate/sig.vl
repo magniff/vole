@@ -11,7 +11,8 @@ use crate::front::types::fn_param;
 use crate::middle::lower::ssa::HMap;
 use crate::tools::translate::{
     D_MUT, D_REF, D_VALUE, TC_DERIVE, TC_INOUT, TC_LET, TC_RECEIVER, TC_SINK, TC_TEXT, TC_TYPE,
-    TC_VIEW, Tr, add_ref, editable, ident_char, is_ref, is_ws, put, skip_ws, word_here,
+    TC_VIEW, Tr, add_ref, editable, ident_char, is_ref, is_ws, own_node, parent_of, put, skip_ws,
+    word_here,
 };
 
 // The operator traits, whose methods take self and their operand by value
@@ -897,6 +898,108 @@ fn has_eq(n: i64, self_ty: [u8], pcx: Ctx<Comp>) -> bool {
     false
 }
 
+// (0.27.5) Whether fn node f writes through a Fmt parameter and returns
+// nothing: a Display or Debug impl's fmt, or MVS's helper of one, `fn
+// put_name(f: inout Fmt, o: Opt)`, whose writes rewrite.tsv's rows `?`.
+fn fmt_fn(f: i64, pcx: Ctx<Comp>) -> bool {
+    if f <= 0 || pcx.nodes[f].kind != NodeKind::Fn || pcx.nodes[f].b != 0 || pcx.nodes[f].c <= 0 {
+        return false;
+    }
+    for i in 0..pcx.nodes[f].count {
+        let p = child(f, i, pcx);
+        var t = if p > 0 && pcx.nodes[p].kind == NodeKind::Param { pcx.nodes[p].b } else { 0 };
+        // (`inout Fmt` is the parser's TyPtr of it)
+        if t > 0 && pcx.nodes[t].kind == NodeKind::TyPtr {
+            t = pcx.nodes[t].a;
+        }
+        if t > 0 && pcx.nodes[t].kind == NodeKind::TyName
+            && SRC[pcx.nodes[t].start..pcx.nodes[t].end] == "Fmt" {
+            return true;
+        }
+    }
+    false
+}
+
+// (0.27.5) fn node f's result `-> std::fmt::Result` and its body's end
+// `Ok(())`: an impl's fmt (fmt_impl), a helper of one (fmt_helpers).
+fn fmt_result(f: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let body = pcx.nodes[f].c;
+    if pcx.nodes[f].b == 0 {
+        // (the result, after the parameters' `)`)
+        var q = pcx.nodes[body].start - 1;
+        while q > pcx.nodes[f].start && SRC[q] != ')' {
+            q -= 1;
+        }
+        put(q + 1, q + 1, " -> std::fmt::Result", TC_TYPE, &tr, &pcx);
+    }
+    let tail = pcx.nodes[body].a;
+    if tail > 0 {
+        put(pcx.nodes[tail].end, pcx.nodes[tail].end, "; Ok(())", -1, &tr, &pcx);
+    } else {
+        var q = pcx.nodes[body].end - 1;
+        while q > pcx.nodes[body].start && SRC[q] != '}' {
+            q -= 1;
+        }
+        put(q, q, " Ok(()) ", -1, &tr, &pcx);
+    }
+}
+
+// (0.27.5) The Fn node node n is in, by the tree (enclosing_fn's search
+// by position may find a copy the checker made at the same place), or 0.
+fn parent_fn(n: i64, tr: Tr, pcx: Ctx<Comp>) -> i64 {
+    var p = parent_of(n, tr);
+    var steps = 0;
+    while p > 0 && pcx.nodes[p].kind != NodeKind::Fn && steps < 10000 {
+        p = parent_of(p, tr);
+        steps += 1;
+    }
+    p
+}
+
+// (0.27.5) In the rust edition a Display body's writes are `?`'d, so a
+// function that writes through a Fmt and returns nothing returns
+// std::fmt::Result: MVS's helpers of a fmt get the result and `Ok(())`
+// (an impl's fmt has them from fmt_impl), a call of one its `?` (in a
+// function that returns no Result, `.unwrap()`), and an empty `return;`
+// in either is `return Ok(());`.
+fn fmt_helpers(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    for n in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[n].kind;
+        if !own_node(n, tr, &pcx) {
+            continue;
+        }
+        if k == NodeKind::Fn && fmt_fn(n, pcx) {
+            let nm = crate::base::sym_text(pcx.nodes[n].a, pcx);
+            if nm != "fmt" && nm != "fmt_debug" {
+                fmt_result(n, &tr, &pcx);
+            }
+        }
+        else if k == NodeKind::Return && pcx.nodes[n].a <= 0
+            && word_here(pcx.nodes[n].start, "return")
+            && fmt_fn(parent_fn(n, tr, pcx), pcx) {
+            put(pcx.nodes[n].start + 6, pcx.nodes[n].start + 6, " Ok(())", -1, &tr, &pcx);
+        } else if k == NodeKind::Call && pcx.nodes[n].end > pcx.nodes[n].start {
+            let f = pcx.nodes[n].x - 1;
+            if f < 0 || f >= pcx.fns.len() as i64 {
+                continue;
+            }
+            let g = if pcx.fns[f].tmpl > 0 { pcx.fns[f].tmpl - 1 } else { f };
+            let fnode = pcx.fns[g].node;
+            if !fmt_fn(fnode, pcx) || !editable(pcx.nodes[fnode].start, &pcx) {
+                continue;
+            }
+            let nm = crate::base::sym_text(pcx.nodes[fnode].a, pcx);
+            if nm == "fmt" || nm == "fmt_debug" {
+                continue;
+            }
+            let e = pcx.nodes[n].end;
+            put(e, e,
+                if fmt_fn(parent_fn(n, tr, pcx), pcx) { "?" } else { ".unwrap()" },
+                -1, &tr, &pcx);
+        }
+    }
+}
+
 // An impl of Display or Debug (rewrite.tsv's Display::fmt, Debug::fmt_debug
 // rows): `fn fmt(&self, f: &mut Fmt) -> std::fmt::Result`, its body ending
 // in `Ok(())` (its writes are `?`'d by their rows).
@@ -917,25 +1020,7 @@ fn fmt_impl(n: i64, debug: bool, tr: inout Tr, pcx: inout Ctx<Comp>) {
             }
             put(q, q + 9, "fmt", TC_TYPE, &tr, &pcx);
         }
-        let body = pcx.nodes[f].c;
-        if pcx.nodes[f].b == 0 {
-            // (the result, after the parameters' `)`)
-            var q = pcx.nodes[body].start - 1;
-            while q > pcx.nodes[f].start && SRC[q] != ')' {
-                q -= 1;
-            }
-            put(q + 1, q + 1, " -> std::fmt::Result", TC_TYPE, &tr, &pcx);
-        }
-        let tail = pcx.nodes[body].a;
-        if tail > 0 {
-            put(pcx.nodes[tail].end, pcx.nodes[tail].end, "; Ok(())", -1, &tr, &pcx);
-        } else {
-            var q = pcx.nodes[body].end - 1;
-            while q > pcx.nodes[body].start && SRC[q] != '}' {
-                q -= 1;
-            }
-            put(q, q, " Ok(()) ", -1, &tr, &pcx);
-        }
+        fmt_result(f, &tr, &pcx);
     }
 }
 
@@ -1018,7 +1103,6 @@ fn derive_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
         if q < pcx.nodes[n].end && SRC[q] != '{' {
             continue;
         }
-        let copy = copied.get(n + 1) == 1;
         var fieldless = k == NodeKind::Enum;
         if k == NodeKind::Enum {
             for j in 0..pcx.nodes[n].count {
@@ -1027,6 +1111,9 @@ fn derive_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
                 }
             }
         }
+        // (0.27.5: an enum without fields too, which MVS copies even with
+        // its own `#[derive(Clone)]`, as a struct of it that is Copy needs)
+        let copy = copied.get(n + 1) == 1 || fieldless;
         let h = pcx.nodes[n].h;
         var has_clone = false;
         var has_copy = false;
@@ -1069,8 +1156,14 @@ fn derive_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
             continue;
         }
         if h > 0 && pcx.nodes[h].count > 0 {
-            let at = pcx.nodes[child(h, 0, pcx)].start;
-            put(at, at, text, TC_DERIVE, &tr, &pcx);
+            // (after the last name: the first may have its `PartialEq, `
+            // already, `#[derive(Eq, Clone)]`, which a second insertion
+            // there would not join)
+            let at = pcx.nodes[child(h, pcx.nodes[h].count - 1, pcx)].end;
+            let more = crate::base::buf_new();
+            crate::base::buf_bytes(more, ", ");
+            crate::base::buf_bytes(more, text[0..text.len - 2]);
+            put(at, at, crate::base::buf_slice(more), TC_DERIVE, &tr, &pcx);
         } else {
             // (a new attribute on the item's line)
             // (before the item's `pub`)
@@ -1146,5 +1239,6 @@ pub fn signature_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
     edit_types(&tr, &pcx);
     derive_edits(&tr, &pcx);
     impl_edits(&tr, &pcx);
+    fmt_helpers(&tr, &pcx);
     crate::tools::translate::rows::type_row_edits(&tr, &pcx);
 }
