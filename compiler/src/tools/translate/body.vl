@@ -69,7 +69,7 @@ fn edit_let(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
 }
 
 // Whether expression n is made of integer literals alone (its type comes
-// from them).
+// from them), or an `if` with a branch that is.
 fn literal_only(n: i64, depth: i64, pcx: Ctx<Comp>) -> bool {
     if n <= 0 || depth > 8 {
         return false;
@@ -84,6 +84,15 @@ fn literal_only(n: i64, depth: i64, pcx: Ctx<Comp>) -> bool {
     if k == NodeKind::Binary {
         return literal_only(pcx.nodes[n].b, depth + 1, pcx)
             && literal_only(pcx.nodes[n].c, depth + 1, pcx);
+    }
+    // (an `if` one branch of which is, `if c { 1 } else { n }`: the rust
+    // edition does not yet take its type from a later use, as rustc does)
+    if k == NodeKind::If {
+        return pcx.nodes[n].c > 0 && (literal_only(pcx.nodes[n].b, depth + 1, pcx)
+            || literal_only(pcx.nodes[n].c, depth + 1, pcx));
+    }
+    if k == NodeKind::Block {
+        return pcx.nodes[n].a > 0 && literal_only(pcx.nodes[n].a, depth + 1, pcx);
     }
     false
 }
@@ -220,6 +229,31 @@ fn let_root(e: i64, pcx: Ctx<Comp>) -> bool {
         && pcx.nodes[pcx.nodes[best].a].b == 0 && !word_here(pcx.nodes[best].start, "var")
 }
 
+// Whether place e's root is a parameter of its function (immutable in
+// Rust unless written `mut`).
+fn root_is_param(e: i64, pcx: Ctx<Comp>) -> bool {
+    var r = e;
+    while r > 0 && (pcx.nodes[r].kind == NodeKind::FieldAccess
+        || pcx.nodes[r].kind == NodeKind::TupleField) {
+        r = pcx.nodes[r].a;
+    }
+    if r <= 0 || pcx.nodes[r].kind != NodeKind::Ident {
+        return false;
+    }
+    let f = enclosing_fn(pcx.nodes[r].start, pcx);
+    if f <= 0 {
+        return false;
+    }
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind == NodeKind::Param && pcx.nodes[n].a == pcx.nodes[r].a
+            && pcx.nodes[n].start > pcx.nodes[f].start && pcx.nodes[n].start < pcx.nodes[r].start
+            && enclosing_fn(pcx.nodes[n].start, pcx) == f {
+            return true;
+        }
+    }
+    false
+}
+
 // A written Unary `&` (`&x`, MVS's inout marker): `&mut x`, or `x` when x
 // is a reference already (lent on: a reborrow); `x` too when it is given
 // to a raw pointer.
@@ -242,6 +276,22 @@ fn edit_amp(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
                 if let_root(operand, pcx) { ".as_ptr()" } else { ".as_mut_ptr()" }, TC_MUT_MARKER,
                 &tr, &pcx);
         }
+        return;
+    }
+    // (a local's address cast to another pointee, `&x as *f64` of an i64:
+    // `&raw const x as *mut f64`, `&raw mut` for a `var`; Rust casts no
+    // `&mut i64` to a `*mut f64`)
+    if SRC[s] == '&' && SRC[s + 1] != '&' && c > 0 && pcx.nodes[c].kind == NodeKind::Cast
+        && pcx.nodes[c].a == n && operand > 0 && pcx.nodes[operand].ty > 0
+        && (pcx.nodes[operand].kind == NodeKind::Ident
+            || pcx.nodes[operand].kind == NodeKind::FieldAccess)
+        && pcx.nodes[c].ty > 0 && pcx.types[pcx.nodes[c].ty].kind == TyKind::Ptr
+        && pcx.types[pcx.nodes[c].ty].b == 0
+        && pcx.types[pcx.nodes[c].ty].a != pcx.nodes[operand].ty
+        && !access_to_ref(operand, tr, pcx) {
+        let after = if word_here(inner, "mut") { skip_ws(inner + 3) } else { inner };
+        let shared = let_root(operand, pcx) || root_is_param(operand, pcx);
+        put(s, after, if shared { "&raw const " } else { "&raw mut " }, TC_MUT_MARKER, &tr, &pcx);
         return;
     }
     // (the address of a reference's referent, MVS's `&cx` given to a `*T`
@@ -522,6 +572,19 @@ fn edit_ptr_index(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     }
     let e = pcx.nodes[n].end - 1;
     if q >= pcx.nodes[b].start || SRC[e] != ']' {
+        return;
+    }
+    // (its address, MVS's `&p[i]` of type `*T`: `p.add(i)`, not a reference)
+    let u = parent_of(n, tr);
+    if u > 0 && pcx.nodes[u].kind == NodeKind::Unary && pcx.nodes[u].op == Tok::Amp
+        && pcx.nodes[u].b == n && SRC[pcx.nodes[u].start] == '&'
+        && SRC[pcx.nodes[u].start + 1] != '&' && pcx.nodes[u].ty > 0
+        && pcx.types[pcx.nodes[u].ty].kind == TyKind::Ptr && pcx.types[pcx.nodes[u].ty].b == 0
+        && skip_ws(pcx.nodes[u].start + 1) == pcx.nodes[n].start {
+        if put(pcx.nodes[u].start, pcx.nodes[n].start, "", TC_USIZE, &tr, &pcx) {
+            put(q, q + 1, ".add(", TC_USIZE, &tr, &pcx);
+            put(e, e + 1, ")", -1, &tr, &pcx);
+        }
         return;
     }
     if put(q, q + 1, ".add(", TC_USIZE, &tr, &pcx) {
@@ -816,6 +879,30 @@ fn edit_int(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     let b = crate::base::buf_new();
     crate::front::types::buf_type(b, t, pcx);
     put(pcx.nodes[n].end, pcx.nodes[n].end, crate::base::buf_slice(b), TC_INT, &tr, &pcx);
+}
+
+// An i64 literal outside i32 cast to another type, `0xffffffffffffffff as
+// u64`: the rust edition's literal is i32 under a cast (rustc's
+// overflowing_literals), so it gets a suffix, `i64`, or `u64` when it is
+// written above i64::MAX (MVS's bits, -1 here, which the cast keeps).
+fn edit_int_cast(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    if pcx.nodes[n].b != 0 || pcx.nodes[n].ty != TY_I64 || token_at(pcx.nodes[n].start, pcx) < 0 {
+        return;
+    }
+    let v = pcx.nodes[n].a;
+    if v >= 0 && v <= 2147483647 {
+        return;
+    }
+    let p = parent_of(n, tr);
+    if p <= 0 || pcx.nodes[p].kind != NodeKind::Cast || pcx.nodes[p].a != n {
+        return;
+    }
+    let k = token_at(pcx.nodes[n].start, pcx);
+    if pcx.toks[k].kind != Tok::Int || pcx.toks[k].end != pcx.nodes[n].end {
+        return;
+    }
+    put(pcx.nodes[n].end, pcx.nodes[n].end, if v < 0 { "u64" } else { "i64" }, TC_INT, &tr,
+        &pcx);
 }
 
 // (FL6) An i64 literal at a generic position, which the rust edition
@@ -1332,6 +1419,7 @@ pub fn body_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
         } else if k == NodeKind::Int {
             edit_int(n, &tr, &pcx);
             edit_int_generic(n, &tr, &pcx);
+            edit_int_cast(n, &tr, &pcx);
         } else if k == NodeKind::Array || k == NodeKind::Repeat {
             edit_int_array(n, &tr, &pcx);
         } else if k == NodeKind::Closure {
