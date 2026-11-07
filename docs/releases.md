@@ -97,6 +97,12 @@ The front (fl10274):
   0.27.4 these read the index through Index and were
   borrowck.borrow_immutable where rustc compiles them. A type with Index
   and no IndexMut keeps `index`, and the write is borrowck's (E0596).
+- A `&str` where a `&[u8]` goes is rustc's E0308 in the rust edition
+  (F0.6): `str::from_utf8("Hello")`, a `&str` value, and a `&String`, which
+  derefs to `str` only. The error's `try:` gives `b"Hello"` or
+  `s.as_bytes()`. 0.27.4 took the text as its bytes, the view model of MVS
+  (which keeps it). This hid 348 of gate 2's bad translations, most of
+  them `str::from_utf8("..")` around a literal.
 
 ### What's new in 0.27.4
 
