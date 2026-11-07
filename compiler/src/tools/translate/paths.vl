@@ -1,0 +1,388 @@
+// (0.27.3) The translator's paths (mod.vl, pass 4): MVS's std is flat
+// (`std::HashMap`, `std::Fmt`), std2 is Rust's tree (`std::collections::
+// HashMap`, `std::fmt::Formatter`). Each `use std::...` of the program is
+// written with std2's paths (table.vl's path_rows, from checklist.tsv),
+// an item std2's prelude holds is not imported, an item renamed is
+// imported under its MVS name (`use std::fmt::Formatter as Fmt;`: the
+// type rows rename its uses), and a type or trait MVS's prelude gave that
+// std2's does not (Display, HashMap, Add) is imported where it is used.
+
+use crate::base::{IntVec, SRC, buf_bytes, buf_new, buf_slice, intern};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::ast::NodeKind;
+use crate::front::lexer::Tok;
+use crate::middle::lower::ssa::HMap;
+use crate::tools::translate::{TC_IMPORT, Tr, editable, put};
+
+// The rows of a table function's buffer, each split at its tabs into
+// buffers: cols buffers per row, pushed to out.
+fn split_rows(b: i64, cols: i64, out: inout IntVec) {
+    let t = buf_slice(b);
+    var i: usize = 0;
+    while i < t.len {
+        var e = i;
+        while e < t.len && t[e] != '\n' {
+            e += 1;
+        }
+        var c = i;
+        var k = 0;
+        while k < cols {
+            var ce = c;
+            while ce < e && t[ce] != '\t' {
+                ce += 1;
+            }
+            let cb = buf_new();
+            buf_bytes(cb, t[c..ce]);
+            out.push(cb);
+            c = if ce < e { ce + 1 } else { e };
+            k += 1;
+        }
+        i = e + 1;
+    }
+}
+
+// The tables, read once: Tr.paths (mvs name's symbol, std2 path buffer)
+// pairs, Tr.prelude (symbol + 1 -> 1), Tr.rows (rewrite.tsv: mvs, when,
+// rust, note buffers) and Tr.row_free (a free function with a row: symbol
+// -> 1).
+pub fn load_tables(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let pb = buf_new();
+    crate::tools::translate::table::path_rows(pb);
+    var cells = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    split_rows(pb, 2, &cells);
+    var i: i64 = 0;
+    while i + 1 < cells.count {
+        tr.paths.push(intern(buf_slice(cells.get(i)), &pcx));
+        tr.paths.push(cells.get(i + 1));
+        i += 2;
+    }
+    let lb = buf_new();
+    crate::tools::translate::table::prelude_rows(lb);
+    var names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    split_rows(lb, 1, &names);
+    for j in 0..names.count {
+        tr.prelude.put(intern(buf_slice(names.get(j)), &pcx) + 1, 1);
+    }
+    let rb = buf_new();
+    crate::tools::translate::table::rewrite_rows(rb);
+    split_rows(rb, 4, &tr.rows);
+    var r: i64 = 0;
+    while r + 3 < tr.rows.count {
+        let m = buf_slice(tr.rows.get(r));
+        var colon = false;
+        for q in 0..m.len {
+            if m[q] == ':' {
+                colon = true;
+            }
+        }
+        if !colon {
+            tr.row_free.put(intern(m, &pcx) + 1, 1);
+        }
+        r += 4;
+    }
+}
+
+// The last segment of path p's text.
+fn last_segment(p: [u8]) -> [u8] {
+    var k = p.len;
+    while k > 0 && p[k - 1] != ':' {
+        k -= 1;
+    }
+    p[k..p.len]
+}
+
+// The module part of path p's text (`std::fmt` of `std::fmt::Formatter`).
+fn module_part(p: [u8]) -> [u8] {
+    var k = p.len;
+    while k > 0 && p[k - 1] != ':' {
+        k -= 1;
+    }
+    if k >= 2 { p[0..k - 2] } else { p[0..0] }
+}
+
+// The std2 path of MVS item `name` imported from MVS module `module` (its
+// text, `std` or `std::io`): the candidate in that module, else the first;
+// 0 for none.
+pub fn std2_path(name: i64, module: [u8], tr: Tr) -> i64 {
+    var first = 0;
+    var i: i64 = 0;
+    while i + 1 < tr.paths.count {
+        if tr.paths.get(i) == name {
+            let p = buf_slice(tr.paths.get(i + 1));
+            if module.len > 3 && module_part(p) == module {
+                return tr.paths.get(i + 1);
+            }
+            if first == 0 {
+                first = tr.paths.get(i + 1);
+            }
+        }
+        i += 2;
+    }
+    first
+}
+
+// The path a use writes for std2's item at path p (a buffer): Rust's
+// short path for the collections (`std::collections::HashMap`).
+fn written_path(p: i64, out: i64) {
+    let t = buf_slice(p);
+    let m = module_part(t);
+    if m == "std::collections::hash_map" || m == "std::collections::hash_set"
+        || m == "std::collections::btree_map" {
+        let last = last_segment(t);
+        if last == "HashMap" || last == "HashSet" || last == "BTreeMap" {
+            buf_bytes(out, "std::collections::");
+            buf_bytes(out, last);
+            return;
+        }
+    }
+    buf_bytes(out, t);
+}
+
+// One imported item, `use` of MVS path text mvs (its last segment
+// name): its std2 `use` into out (nothing: the prelude has it, or a row
+// rewrites its calls); whether it was decided.
+fn import_one(mvs: [u8], alias: [u8], out: i64, tr: Tr, pcx: inout Ctx<Comp>) -> bool {
+    let name = last_segment(mvs);
+    let sym = intern(name, &pcx);
+    let module = module_part(mvs);
+    let p = std2_path(sym, module, tr);
+    if p == 0 {
+        if tr.row_free.get(sym + 1) != 0 {
+            // (a free function whose calls a row rewrites)
+            return true;
+        }
+        // (a module, or an item std2 has under the same path)
+        buf_bytes(out, "use ");
+        buf_bytes(out, mvs);
+        if alias.len > 0 {
+            buf_bytes(out, " as ");
+            buf_bytes(out, alias);
+        }
+        buf_bytes(out, "; ");
+        return true;
+    }
+    let std2 = buf_slice(p);
+    let last = last_segment(std2);
+    if tr.prelude.get(intern(last, &pcx) + 1) != 0 && last == name && alias.len == 0 {
+        return true;
+    }
+    buf_bytes(out, "use ");
+    written_path(p, out);
+    if alias.len > 0 {
+        buf_bytes(out, " as ");
+        buf_bytes(out, alias);
+    } else if last != name {
+        buf_bytes(out, " as ");
+        buf_bytes(out, name);
+    }
+    buf_bytes(out, "; ");
+    true
+}
+
+// A `use std::...;` at token k (the `use`) to its `;`: rewritten with
+// std2's paths, on its line. A use of nested braces, a glob or `self` is
+// left as written.
+fn edit_use(k: i64, names: inout HMap, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let n = pcx.toks.len() as i64;
+    if k + 2 >= n || pcx.toks[k + 1].kind != Tok::Ident
+        || SRC[pcx.toks[k + 1].start..pcx.toks[k + 1].end] != "std" {
+        return;
+    }
+    var semi = k + 1;
+    var braces = 0;
+    var nested = false;
+    var open = -1;
+    while semi < n && pcx.toks[semi].kind != Tok::Semi {
+        let tk = pcx.toks[semi].kind;
+        if tk == Tok::LBrace {
+            braces += 1;
+            if braces > 1 {
+                nested = true;
+            }
+            open = semi;
+        } else if tk == Tok::RBrace {
+            braces -= 1;
+        } else if tk == Tok::Star {
+            nested = true;
+        } else if tk == Tok::Ident && SRC[pcx.toks[semi].start..pcx.toks[semi].end] == "self" {
+            nested = true;
+        }
+        semi += 1;
+    }
+    if semi >= n || nested {
+        return;
+    }
+    let out = buf_new();
+    if open < 0 {
+        // (one item: `use std::a::b;`, `use std::a::b as c;`)
+        var end = semi;
+        var alias = SRC[0..0];
+        if semi - 2 > k && pcx.toks[semi - 2].kind == Tok::As {
+            end = semi - 2;
+            alias = SRC[pcx.toks[semi - 1].start..pcx.toks[semi - 1].end];
+        }
+        let mvs = SRC[pcx.toks[k + 1].start..pcx.toks[end - 1].end];
+        import_one(mvs, alias, out, tr, &pcx);
+        note_name(pcx.toks[end - 1].value as i64, alias, &names, &pcx);
+    } else {
+        // (`use std::a::{x, y as z, m::w};`)
+        let prefix = SRC[pcx.toks[k + 1].start..pcx.toks[open].start];
+        var j = open + 1;
+        while j < semi && pcx.toks[j].kind != Tok::RBrace {
+            var e = j;
+            while e < semi && pcx.toks[e].kind != Tok::Comma && pcx.toks[e].kind != Tok::RBrace {
+                e += 1;
+            }
+            if e > j {
+                var end = e;
+                var alias = SRC[0..0];
+                if e - 2 >= j && pcx.toks[e - 2].kind == Tok::As {
+                    end = e - 2;
+                    alias = SRC[pcx.toks[e - 1].start..pcx.toks[e - 1].end];
+                }
+                let path = buf_new();
+                buf_bytes(path, prefix);
+                buf_bytes(path, SRC[pcx.toks[j].start..pcx.toks[end - 1].end]);
+                import_one(buf_slice(path), alias, out, tr, &pcx);
+                note_name(pcx.toks[end - 1].value as i64, alias, &names, &pcx);
+            }
+            j = if e < semi && pcx.toks[e].kind == Tok::Comma { e + 1 } else { e };
+        }
+    }
+    var text = buf_slice(out);
+    // (the trailing blank of the last)
+    if text.len > 0 {
+        text = text[0..text.len - 1];
+    }
+    let whole = SRC[pcx.toks[k].start..pcx.toks[semi].end];
+    if text != whole {
+        put(pcx.toks[k].start, pcx.toks[semi].end, text, TC_IMPORT, &tr, &pcx);
+    }
+}
+
+// A path `std::a::b::X` in the program's code (not a use's) at token k:
+// std2's path of X.
+fn edit_path(k: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let n = pcx.toks.len() as i64;
+    var j = k;
+    while j + 2 < n && pcx.toks[j + 1].kind == Tok::ColonColon
+        && pcx.toks[j + 2].kind == Tok::Ident {
+        j += 2;
+    }
+    if j == k {
+        return;
+    }
+    let text = SRC[pcx.toks[k].start..pcx.toks[j].end];
+    let p = std2_path(pcx.toks[j].value as i64, module_part(text), tr);
+    if p == 0 {
+        return;
+    }
+    let out = buf_new();
+    written_path(p, out);
+    if buf_slice(out) != text {
+        put(pcx.toks[k].start, pcx.toks[j].end, buf_slice(out), TC_IMPORT, &tr, &pcx);
+    }
+}
+
+// A name a use of the file brings (the alias's, else the item's).
+fn note_name(item: i64, alias: [u8], names: inout HMap, pcx: inout Ctx<Comp>) {
+    let s = if alias.len > 0 { intern(alias, &pcx) } else { item };
+    names.put(s + 1, 1);
+}
+
+// The program's own item names (symbol + 1 -> 1): they are not std's.
+fn own_names(out: inout HMap, pcx: inout Ctx<Comp>) {
+    for n in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[n].kind;
+        if (k == NodeKind::Struct || k == NodeKind::Enum || k == NodeKind::Trait
+            || k == NodeKind::TypeAlias || k == NodeKind::Const || k == NodeKind::Static
+            || k == NodeKind::Fn) && editable(pcx.nodes[n].start, &pcx) {
+            out.put(pcx.nodes[n].a + 1, 1);
+        }
+    }
+}
+
+// The uses of every file of the program, and the imports a file needs.
+pub fn path_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    var own = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    own_names(&own, &pcx);
+    for f in 0..pcx.files.len() as i64 {
+        let s = pcx.files[f].start;
+        let e = pcx.files[f].end;
+        if !editable(s, &pcx) {
+            continue;
+        }
+        var names = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        var first = -1;
+        var last = -1;
+        var in_use = false;
+        for k in 0..pcx.toks.len() as i64 {
+            let t = pcx.toks[k];
+            if t.start < s || t.start >= e {
+                continue;
+            }
+            if first < 0 {
+                first = k;
+            }
+            last = k;
+            if t.kind == Tok::Use {
+                edit_use(k, &names, &tr, &pcx);
+                in_use = true;
+            } else if t.kind == Tok::Semi {
+                in_use = false;
+            } else if !in_use && t.kind == Tok::Ident && SRC[t.start..t.end] == "std"
+                && (k == 0 || pcx.toks[k - 1].kind != Tok::ColonColon) {
+                edit_path(k, &tr, &pcx);
+            }
+        }
+        if first < 0 {
+            continue;
+        }
+        // (the types and traits MVS's prelude gave: a capitalized name std2
+        // has outside its prelude, not the program's, not imported, not a
+        // path's segment or a field)
+        let add = buf_new();
+        var added = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for k in first..last + 1 {
+            let t = pcx.toks[k];
+            if t.kind != Tok::Ident || SRC[t.start] < 'A' || SRC[t.start] > 'Z' {
+                continue;
+            }
+            let sym = t.value as i64;
+            if names.get(sym + 1) != 0 || own.get(sym + 1) != 0 || added.get(sym + 1) != 0
+                || tr.prelude.get(sym + 1) != 0 {
+                continue;
+            }
+            if k > 0
+                && (pcx.toks[k - 1].kind == Tok::ColonColon || pcx.toks[k - 1].kind == Tok::Dot) {
+                continue;
+            }
+            let p = std2_path(sym, SRC[0..0], tr);
+            if p == 0 {
+                continue;
+            }
+            added.put(sym + 1, 1);
+            let std2 = buf_slice(p);
+            let last_seg = last_segment(std2);
+            if tr.prelude.get(intern(last_seg, &pcx) + 1) != 0 && last_seg == SRC[t.start..t.end] {
+                continue;
+            }
+            buf_bytes(add, "use ");
+            written_path(p, add);
+            if last_seg != SRC[t.start..t.end] {
+                buf_bytes(add, " as ");
+                buf_bytes(add, SRC[t.start..t.end]);
+            }
+            buf_bytes(add, "; ");
+        }
+        if buf_slice(add).len > 0 {
+            // (on the line of the file's first item, after its leading
+            // comments: no line moves)
+            let at = pcx.toks[first].start;
+            if put(at, at, buf_slice(add), -1, &tr, &pcx) {
+                tr.counts[TC_IMPORT] += 1;
+            }
+        }
+    }
+}

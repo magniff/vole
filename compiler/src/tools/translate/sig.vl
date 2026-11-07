@@ -1,0 +1,558 @@
+// (0.27.3) The translator's signatures and types (mod.vl, pass 2): a
+// parameter's convention written as Rust's type, a receiver as Rust's
+// self, a view `[T]` as `&[T]`.
+
+use crate::base::SRC;
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::ast::{NodeKind, child};
+use crate::front::conv::{CONV_IN_OUT, CONV_LET, CONV_SINK_K, param_conv};
+use crate::front::types::fn_param;
+use crate::middle::lower::ssa::HMap;
+use crate::tools::translate::{
+    D_MUT, D_REF, D_VALUE, TC_DERIVE, TC_INOUT, TC_LET, TC_RECEIVER, TC_SINK, TC_TYPE, TC_VIEW, Tr,
+    add_ref, editable, is_ref, put, skip_ws, word_here,
+};
+
+// The operator traits, whose methods take self and their operand by value
+// in Rust (table rows `impl ... fn add(self, rhs: Self)`).
+fn by_value_trait(name: [u8]) -> bool {
+    name == "Add" || name == "Sub" || name == "Mul" || name == "Div" || name == "Rem"
+        || name == "Neg" || name == "Not" || name == "BitAnd" || name == "BitOr"
+        || name == "BitXor" || name == "Shl" || name == "Shr"
+}
+
+// Whether a type written as the node tn is a primitive's name (taken by
+// value by a let parameter: a copy).
+fn primitive_name(tn: i64, pcx: Ctx<Comp>) -> bool {
+    if tn <= 0 || pcx.nodes[tn].kind != NodeKind::TyName {
+        return false;
+    }
+    let w = SRC[pcx.nodes[tn].start..pcx.nodes[tn].end];
+    w == "i8" || w == "i16" || w == "i32" || w == "i64" || w == "u8" || w == "u16"
+        || w == "u32" || w == "u64" || w == "usize" || w == "isize" || w == "f32"
+        || w == "f64" || w == "bool" || w == "char"
+}
+
+// The trait name of the impl that function node n is in ("" for none).
+fn impl_trait(n: i64, impls: HMap, pcx: Ctx<Comp>) -> [u8] {
+    let im = impls.get(n + 1);
+    if im <= 0 {
+        return "";
+    }
+    let t = pcx.nodes[im].a;
+    if t <= 0 {
+        return "";
+    }
+    crate::base::sym_text(pcx.nodes[t].a, pcx)
+}
+
+// A receiver: `self` is `&self` (`self` in an operator trait's impl),
+// `inout self` `&mut self`, `sink self` `self`.
+fn edit_receiver(p: i64, by_value: bool, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let s = pcx.nodes[p].start;
+    let c = param_conv(p, pcx);
+    if c == CONV_IN_OUT && word_here(s, "inout") {
+        put(s, skip_ws(s + 5), "&mut ", TC_RECEIVER, &tr, &pcx);
+    } else if c == CONV_SINK_K && word_here(s, "sink") {
+        put(s, skip_ws(s + 4), "", TC_RECEIVER, &tr, &pcx);
+    } else if c == CONV_LET && word_here(s, "self") && !by_value {
+        put(s, s, "&", TC_RECEIVER, &tr, &pcx);
+    }
+}
+
+// Parameter i (node p) of function node n (function f; -1: a trait's
+// declaration, which has no checked signature).
+fn edit_param(n: i64, f: i64, i: i64, p: i64, by_value: bool, gen: i64, tr: inout Tr,
+    pcx: inout Ctx<Comp>) {
+    let tn = pcx.nodes[p].b;
+    let name = pcx.nodes[p].a;
+    if name == tr.sym_self {
+        edit_receiver(p, by_value, &tr, &pcx);
+        if param_conv(p, pcx) == CONV_IN_OUT {
+            tr.decided.put(p + 1, D_MUT);
+            add_ref(pcx.nodes[n].start, pcx.nodes[n].end, name, &tr);
+        } else if param_conv(p, pcx) == CONV_LET && !by_value {
+            tr.decided.put(p + 1, D_REF);
+            add_ref(pcx.nodes[n].start, pcx.nodes[n].end, name, &tr);
+        } else {
+            tr.decided.put(p + 1, D_VALUE);
+        }
+        return;
+    }
+    if tn <= 0 {
+        return;
+    }
+    let ts = pcx.nodes[tn].start;
+    let c = param_conv(p, pcx);
+    if c == CONV_IN_OUT {
+        if word_here(ts, "inout") {
+            put(ts, skip_ws(ts + 5), "&mut ", TC_INOUT, &tr, &pcx);
+            tr.typed.put(tn + 1, 1);
+        }
+        tr.decided.put(p + 1, D_MUT);
+        add_ref(pcx.nodes[n].start, pcx.nodes[n].end, name, &tr);
+        return;
+    }
+    if c == CONV_SINK_K {
+        tr.decided.put(p + 1, D_VALUE);
+        if word_here(ts, "sink") {
+            put(ts, skip_ws(ts + 4), "", TC_SINK, &tr, &pcx);
+        } else {
+            // (the word before the type node: `d: sink D`)
+            var q = ts - 1;
+            while q > pcx.nodes[p].start && (SRC[q] == ' ' || SRC[q] == '\t') {
+                q -= 1;
+            }
+            if q >= 3 && SRC[q - 3..q + 1] == "sink" {
+                put(q - 3, ts, "", TC_SINK, &tr, &pcx);
+            }
+        }
+        return;
+    }
+    if c != CONV_LET {
+        return;
+    }
+    // (a written `let T`: the word goes, the reference decides below)
+    var at = ts;
+    if word_here(ts, "let") {
+        at = skip_ws(ts + 3);
+        put(ts, at, "", -1, &tr, &pcx);
+    }
+    let tk = pcx.nodes[tn].kind;
+    if tk == NodeKind::TySlice && SRC[at] == '[' {
+        put(at, at, "&", TC_VIEW, &tr, &pcx);
+        tr.typed.put(tn + 1, 1);
+        tr.decided.put(p + 1, D_VALUE);
+        return;
+    }
+    tr.decided.put(p + 1, D_VALUE);
+    if by_value {
+        return;
+    }
+    // (a type parameter: by value, as Rust takes `f: F` and `x: T`; `mut f`
+    // for a closure it calls through FnMut)
+    let bound = type_param_bound(n, tn, gen, pcx);
+    if bound >= 2 {
+        if bound == 3 {
+            put(pcx.nodes[p].start, pcx.nodes[p].start, "mut ", -1, &tr, &pcx);
+        }
+        return;
+    }
+    if bound == 0 {
+        // (a type parameter T: `&T`, MVS's borrow, unless the function
+        // gives the parameter back, which a reference could not)
+        if !returns_name(pcx.nodes[n].c, name, pcx) {
+            put(at, at, "&", TC_LET, &tr, &pcx);
+            tr.decided.put(p + 1, D_REF);
+        }
+        return;
+    }
+    let borrows = if tr.force_ref && !is_ref_type_node(tn, pcx) { true }
+        else if f >= 0 && i < pcx.fns[f].param_count { is_ref(fn_param(f, i, pcx), pcx) }
+        else { !primitive_name(tn, pcx) && tk != NodeKind::TyPtr && tk != NodeKind::TyFn };
+    if borrows {
+        put(at, at, "&", TC_LET, &tr, &pcx);
+        tr.decided.put(p + 1, D_REF);
+        add_ref(pcx.nodes[n].start, pcx.nodes[n].end, name, &tr);
+    }
+}
+
+// Whether type node t (and its arguments) names symbol s.
+fn names_in(t: i64, s: i64, pcx: Ctx<Comp>) -> bool {
+    if t <= 0 {
+        return false;
+    }
+    for q in pcx.nodes[t].start..pcx.nodes[t].end {
+        if (q == pcx.nodes[t].start || !crate::tools::translate::ident_char(SRC[q - 1]))
+            && SRC[q] >= 'A' && SRC[q] <= 'Z' {
+            var e = q;
+            while e < pcx.nodes[t].end && crate::tools::translate::ident_char(SRC[e]) {
+                e += 1;
+            }
+            if SRC[q..e] == crate::base::sym_text(s, pcx) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// Whether the body b gives back the name s: its tail, a `return s`, the
+// tail of an if's or a match's branch.
+fn returns_name(b: i64, s: i64, pcx: Ctx<Comp>) -> bool {
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind != NodeKind::Ident || pcx.nodes[n].a != s
+            || pcx.nodes[n].start < pcx.nodes[b].start || pcx.nodes[n].end > pcx.nodes[b].end {
+            continue;
+        }
+        // (followed by `}` or `;` after a `return`, or `}` alone: a tail)
+        let after = crate::tools::translate::skip_ws(pcx.nodes[n].end);
+        var q = pcx.nodes[n].start - 1;
+        while q > 0 && crate::tools::translate::is_ws(SRC[q]) {
+            q -= 1;
+        }
+        let before_ok = SRC[q] == '{' || SRC[q] == ';' || SRC[q] == '>' && SRC[q - 1] == '='
+            || q >= 5 && SRC[q - 5..q + 1] == "return";
+        if before_ok && (SRC[after] == '}' || SRC[after] == ';' || SRC[after] == ',') {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_ref_type_node(tn: i64, pcx: Ctx<Comp>) -> bool {
+    pcx.nodes[tn].kind == NodeKind::TyPtr || pcx.nodes[tn].kind == NodeKind::TySlice
+}
+
+// Whether type node tn names a type parameter of function node n or of
+// its impl (gen, the impl's generics): -1 when it does not, else its Fn
+// bound's kind (0: none, 2: Fn, 3: FnMut).
+fn type_param_bound(n: i64, tn: i64, gen: i64, pcx: Ctx<Comp>) -> i64 {
+    if tn <= 0 || pcx.nodes[tn].kind != NodeKind::TyName || pcx.nodes[tn].count > 0 {
+        return -1;
+    }
+    let name = pcx.nodes[tn].a;
+    for w in 0..2 {
+        let g = if w == 0 { pcx.nodes[n].g } else { gen };
+        if g <= 0 || pcx.nodes[g].kind != NodeKind::Generics {
+            continue;
+        }
+        for i in 0..pcx.nodes[g].count {
+            let tp = child(g, i, pcx);
+            if pcx.nodes[tp].a != name {
+                continue;
+            }
+            let h = pcx.nodes[tp].h;
+            if h > 0 && pcx.nodes[h].kind == NodeKind::Generics {
+                for j in 0..pcx.nodes[h].count {
+                    let b = child(h, j, pcx);
+                    if pcx.nodes[b].kind == NodeKind::TyFn && pcx.nodes[b].d >= 2 {
+                        return pcx.nodes[b].d;
+                    }
+                }
+            }
+            return 0;
+        }
+    }
+    -1
+}
+
+// Function node n's parameters and result.
+fn edit_signature(n: i64, impls: HMap, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let f = pcx.nodes[n].x - 1;
+    let fi = if f >= 0 && f < pcx.fns.len() as i64 && pcx.fns[f].node == n { f } else { -1 };
+    let by_value = by_value_trait(impl_trait(n, impls, pcx));
+    let tname = impl_trait(n, impls, pcx);
+    tr.force_ref = tname == "Eq" || tname == "Ord" || tname == "PartialEq" || tname == "PartialOrd";
+    let im = impls.get(n + 1);
+    let gen = if im > 0 { pcx.nodes[im].g } else { 0 };
+    var i: i64 = 0;
+    for j in 0..pcx.nodes[n].count {
+        let p = child(n, j, pcx);
+        if pcx.nodes[p].kind != NodeKind::Param {
+            continue;
+        }
+        edit_param(n, fi, i, p, by_value, gen, &tr, &pcx);
+        i += 1;
+    }
+    // (a result that is a view: `-> &[T]`)
+    let r = pcx.nodes[n].b;
+    if r > 0 && pcx.nodes[r].kind == NodeKind::TySlice && SRC[pcx.nodes[r].start] == '[' {
+        put(pcx.nodes[r].start, pcx.nodes[r].start, "&", TC_VIEW, &tr, &pcx);
+        tr.typed.put(r + 1, 1);
+    }
+}
+
+// A closure's parameters: as a function's, without a checked signature
+// (their types come from where the closure goes).
+fn edit_closure(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    for j in 0..pcx.nodes[n].count {
+        let p = child(n, j, pcx);
+        if pcx.nodes[p].kind != NodeKind::Param || pcx.nodes[p].b <= 0 {
+            continue;
+        }
+        edit_param(n, -1, j, p, false, 0, &tr, &pcx);
+    }
+}
+
+// Every other view type `[T]` (a let's, a type argument's) is `&[T]`, an
+// `inout [T]` `&mut [T]`. (A struct's field: its region, sig's regions.)
+fn edit_types(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    var fields = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind == NodeKind::Field && pcx.nodes[n].b > 0 {
+            fields.put(pcx.nodes[n].b + 1, 1);
+        }
+    }
+    for n in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[n].kind;
+        if k != NodeKind::TySlice && k != NodeKind::TyPtr || tr.typed.get(n + 1) != 0
+            || fields.get(n + 1) != 0 || !editable(pcx.nodes[n].start, &pcx) {
+            continue;
+        }
+        let s = pcx.nodes[n].start;
+        if word_here(s, "inout") {
+            put(s, skip_ws(s + 5), "&mut ", TC_TYPE, &tr, &pcx);
+        } else if word_here(s, "let") {
+            put(s, skip_ws(s + 3), "&", TC_TYPE, &tr, &pcx);
+        } else if k == NodeKind::TySlice && SRC[s] == '[' && (s == 0 || SRC[s - 1] != '*') {
+            put(s, s, "&", TC_VIEW, &tr, &pcx);
+        }
+    }
+    // (`str`, a view of text, is `&str`; a function type's let parameter
+    // of a type it does not copy `&T`)
+    for n in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[n].kind;
+        let s = pcx.nodes[n].start;
+        if k == NodeKind::TyName && fields.get(n + 1) == 0 && editable(s, &pcx)
+            && word_here(s, "str") && SRC[pcx.nodes[n].end - 1] == 'r' && !after_amp(s) {
+            put(s, s, "&", TC_VIEW, &tr, &pcx);
+        } else if k == NodeKind::TyFn && editable(s, &pcx) {
+            for i in 0..pcx.nodes[n].count {
+                let tn = child(n, i, pcx);
+                let tk = pcx.nodes[tn].kind;
+                let ts = pcx.nodes[tn].start;
+                if tk == NodeKind::TyName && !primitive_name(tn, pcx) && !word_here(ts, "str")
+                    && !after_amp(ts) && SRC[ts] >= 'A' && SRC[ts] <= 'Z' {
+                    put(ts, ts, "&", TC_LET, &tr, &pcx);
+                }
+            }
+        }
+    }
+}
+
+// Whether the type at s follows a `&` or a `*` (a reference or a raw
+// pointer's pointee already).
+fn after_amp(s: i64) -> bool {
+    var q = s - 1;
+    while q > 0 && (SRC[q] == ' ' || SRC[q] == '\t') {
+        q -= 1;
+    }
+    SRC[q] == '&' || SRC[q] == '*' || word_here_back(q, "mut")
+}
+
+fn word_here_back(q: i64, w: [u8]) -> bool {
+    let n = w.len as i64;
+    q - n + 1 >= 0 && SRC[q - n + 1..q + 1] == w
+}
+
+fn has_array_field(n: i64, pcx: Ctx<Comp>) -> bool {
+    for j in 0..pcx.nodes[n].count {
+        let f = child(n, j, pcx);
+        if pcx.nodes[f].kind == NodeKind::Field && pcx.nodes[f].b > 0
+            && pcx.nodes[pcx.nodes[f].b].kind == NodeKind::TyArray {
+            return true;
+        }
+    }
+    false
+}
+
+// ---- Impls ----
+
+// An impl of an operator trait gets its `type Output = Self;` (MVS's had
+// none); an impl of MVS's Eq is Rust's PartialEq, and Eq's empty impl
+// after it.
+fn impl_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind != NodeKind::Impl || !editable(pcx.nodes[n].start, &pcx)
+            || pcx.nodes[n].a <= 0 || pcx.nodes[n].b <= 0 {
+            continue;
+        }
+        let t = pcx.nodes[n].a;
+        let name = crate::base::sym_text(pcx.nodes[t].a, pcx);
+        let self_ty = SRC[pcx.nodes[pcx.nodes[n].b].start..pcx.nodes[pcx.nodes[n].b].end];
+        if by_value_trait(name) && !has_output(n, pcx) {
+            var q = pcx.nodes[pcx.nodes[n].b].end;
+            while q < pcx.nodes[n].end && SRC[q] != '{' {
+                q += 1;
+            }
+            if q < pcx.nodes[n].end {
+                let b = crate::base::buf_new();
+                crate::base::buf_bytes(b, " type Output = ");
+                crate::base::buf_bytes(b, self_ty);
+                crate::base::buf_bytes(b, ";");
+                put(q + 1, q + 1, crate::base::buf_slice(b), TC_TYPE, &tr, &pcx);
+            }
+        } else if name == "Eq" && word_here(pcx.nodes[t].start, "Eq") {
+            put(pcx.nodes[t].start, pcx.nodes[t].start + 2, "PartialEq", TC_TYPE, &tr, &pcx);
+            let b = crate::base::buf_new();
+            crate::base::buf_bytes(b, " ");
+            crate::base::buf_bytes(b, SRC[pcx.nodes[n].start..pcx.nodes[t].start]);
+            crate::base::buf_bytes(b, "Eq for ");
+            crate::base::buf_bytes(b, self_ty);
+            crate::base::buf_bytes(b, " {}");
+            put(pcx.nodes[n].end, pcx.nodes[n].end, crate::base::buf_slice(b), -1, &tr, &pcx);
+        }
+    }
+}
+
+// Whether impl n has `type Output`.
+fn has_output(n: i64, pcx: Ctx<Comp>) -> bool {
+    let h = pcx.nodes[n].c;
+    if h <= 0 {
+        return false;
+    }
+    for j in 0..pcx.nodes[h].count {
+        let at = child(h, j, pcx);
+        if crate::base::sym_text(pcx.nodes[at].a, pcx) == "Output" {
+            return true;
+        }
+    }
+    false
+}
+
+// ---- Copy types ----
+
+// (MVS copies a value that owns nothing; Rust copies a type that derives
+// Copy) Each struct and enum of the program every instance of which MVS
+// copies derives Clone and Copy (an enum without fields PartialEq and Eq
+// too, as MVS compares them); MVS's derive names are Rust's (`Eq`:
+// PartialEq and Eq, `Ord`: PartialOrd and Ord).
+fn derive_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    // node + 1 -> 1: every instance copied, 2: one is not
+    var copied = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    for t in 1..pcx.types.len() as i64 {
+        let k = pcx.types[t].kind;
+        var node = 0;
+        if k == crate::front::types::TyKind::Struct {
+            let si = pcx.types[t].a;
+            if pcx.structs[si].closure != 0 {
+                continue;
+            }
+            node = pcx.structs[si].node;
+            if pcx.structs[si].tmpl > 0 {
+                node = pcx.structs[pcx.structs[si].tmpl - 1].node;
+            } else if pcx.structs[si].generic > 0 {
+                continue;
+            }
+        } else if k == crate::front::types::TyKind::Enum {
+            let ei = pcx.types[t].a;
+            // UNSAFE: ENUMS is the checker's table, a raw pointer (front/types.vl)
+            // SAFETY: ei is an Enum type's index, below pcx.enum_count; a
+            // template's index (tmpl - 1) is one too
+            unsafe {
+                let e = crate::front::types::ENUMS[ei];
+                node = e.node;
+                if e.tmpl > 0 {
+                    node = crate::front::types::ENUMS[e.tmpl - 1].node;
+                } else if e.generic > 0 {
+                    continue;
+                }
+            }
+        } else {
+            continue;
+        }
+        if node <= 0 || !editable(pcx.nodes[node].start, &pcx) {
+            continue;
+        }
+        let was = copied.get(node + 1);
+        if !crate::front::conv::copyable(t, &pcx) {
+            copied.put(node + 1, 2);
+        } else if was == 0 {
+            copied.put(node + 1, 1);
+        }
+    }
+    for n in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[n].kind;
+        if k != NodeKind::Struct && k != NodeKind::Enum || !editable(pcx.nodes[n].start, &pcx) {
+            continue;
+        }
+        let copy = copied.get(n + 1) == 1;
+        var fieldless = k == NodeKind::Enum;
+        if k == NodeKind::Enum {
+            for j in 0..pcx.nodes[n].count {
+                if pcx.nodes[child(n, j, pcx)].count > 0 {
+                    fieldless = false;
+                }
+            }
+        }
+        let h = pcx.nodes[n].h;
+        var has_clone = false;
+        var has_copy = false;
+        var has_eq = false;
+        if h > 0 {
+            for j in 0..pcx.nodes[h].count {
+                let d = child(h, j, pcx);
+                let ds = pcx.nodes[d].start;
+                if word_here(ds, "Eq") {
+                    put(ds, ds, "PartialEq, ", TC_DERIVE, &tr, &pcx);
+                    has_eq = true;
+                } else if word_here(ds, "Ord") {
+                    put(ds, ds, "PartialOrd, ", TC_DERIVE, &tr, &pcx);
+                } else if word_here(ds, "Clone") {
+                    has_clone = true;
+                } else if word_here(ds, "Copy") {
+                    has_copy = true;
+                }
+            }
+        }
+        let add = crate::base::buf_new();
+        // (a struct of arrays: Clone written, `*self`, as derive's clones
+        // each field and an array's Clone is not the edition's yet)
+        let arrays = copy && k == NodeKind::Struct && pcx.nodes[n].g <= 0
+            && has_array_field(n, pcx);
+        if copy && !has_clone && !arrays {
+            crate::base::buf_bytes(add, "Clone, ");
+        }
+        if arrays && !has_clone {
+            let name = crate::base::sym_text(pcx.nodes[n].a, pcx);
+            let im = crate::base::buf_new();
+            crate::base::buf_bytes(im, " impl Clone for ");
+            crate::base::buf_bytes(im, name);
+            crate::base::buf_bytes(im, " { fn clone(&self) -> ");
+            crate::base::buf_bytes(im, name);
+            crate::base::buf_bytes(im, " { *self } }");
+            let e = pcx.nodes[n].end;
+            put(e, e, crate::base::buf_slice(im), TC_DERIVE, &tr, &pcx);
+        }
+        if copy && !has_copy {
+            crate::base::buf_bytes(add, "Copy, ");
+        }
+        if fieldless && !has_eq {
+            crate::base::buf_bytes(add, "PartialEq, Eq, ");
+        }
+        let text = crate::base::buf_slice(add);
+        if text.len == 0 {
+            continue;
+        }
+        if h > 0 && pcx.nodes[h].count > 0 {
+            let at = pcx.nodes[child(h, 0, pcx)].start;
+            put(at, at, text, TC_DERIVE, &tr, &pcx);
+        } else {
+            // (a new attribute on the item's line)
+            let at = pcx.nodes[n].start;
+            let line = crate::base::buf_new();
+            crate::base::buf_bytes(line, "#[derive(");
+            crate::base::buf_bytes(line, text[0..text.len - 2]);
+            crate::base::buf_bytes(line, ")] ");
+            put(at, at, crate::base::buf_slice(line), TC_DERIVE, &tr, &pcx);
+        }
+    }
+}
+
+pub fn signature_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    var impls = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind == NodeKind::Impl {
+            for j in 0..pcx.nodes[n].count {
+                impls.put(child(n, j, pcx) + 1, n);
+            }
+        }
+    }
+    for n in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[n].kind;
+        if !crate::tools::translate::own_node(n, tr, &pcx) {
+            continue;
+        }
+        if k == NodeKind::Fn && pcx.nodes[n].y == 0 {
+            edit_signature(n, impls, &tr, &pcx);
+        } else if k == NodeKind::Closure {
+            edit_closure(n, &tr, &pcx);
+        }
+    }
+    tr.force_ref = false;
+    edit_types(&tr, &pcx);
+    derive_edits(&tr, &pcx);
+    impl_edits(&tr, &pcx);
+}
