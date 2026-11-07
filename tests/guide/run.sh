@@ -4,12 +4,16 @@
 # guide stays in its token budget, and the topics answer. POSIX sh and
 # awk only.
 #
-# usage: tests/guide/run.sh [-c COMPILER] [-j JOBS] [-f FILE]
+# usage: tests/guide/run.sh [-c COMPILER] [-j JOBS] [-f FILE] [--split DIR]
 #
 #   -c COMPILER   the volec binary (default: target/volec)
 #   -j JOBS       examples compiled at once (default 2)
 #   -f FILE       check only the code blocks of FILE (a topic's source,
 #                 compiler/guide/NAME.md), not the embedded guide
+#   --split DIR   (0.27.3) check nothing: write the blocks of every
+#                 compiler/guide/*.md to DIR/blocks/TOPIC-LINE/ (prog.vl
+#                 as compiled, and its in, out, exit or err), for
+#                 tests/translate.sh and tools/rustc-twin.sh
 #
 # The code blocks of every topic (`volec guide NAME`), by the fence's
 # language:
@@ -51,11 +55,13 @@ ROOT=$(cd "$HERE/../.." && pwd)
 COMPILER="$ROOT/target/volec"
 JOBS=2
 ONLY=""
+SPLIT=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -c) [ $# -ge 2 ] || exit 2; COMPILER=$2; shift 2 ;;
         -j) [ $# -ge 2 ] || exit 2; JOBS=$2; shift 2 ;;
         -f) [ $# -ge 2 ] || exit 2; ONLY=$2; shift 2 ;;
+        --split) [ $# -ge 2 ] || exit 2; SPLIT=$2; shift 2 ;;
         *) echo "usage: tests/guide/run.sh [-c COMPILER] [-j JOBS] [-f FILE]" >&2; exit 2 ;;
     esac
 done
@@ -63,7 +69,7 @@ case "$COMPILER" in
     /*) ;;
     *) COMPILER="$(pwd)/$COMPILER" ;;
 esac
-[ -x "$COMPILER" ] || { echo "guide/run.sh: no compiler at $COMPILER" >&2; exit 2; }
+[ -n "$SPLIT" ] || [ -x "$COMPILER" ] || { echo "guide/run.sh: no compiler at $COMPILER" >&2; exit 2; }
 
 HOST="$(uname -s)-$(uname -m)"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-guide.XXXXXX")
@@ -290,6 +296,13 @@ result() { # <pass|FAIL> <name> [why...]
 }
 
 mkdir -p "$WORK/blocks"
+if [ -n "$SPLIT" ]; then
+    for f in "$ROOT"/compiler/guide/*.md; do
+        split_blocks "$f" "$(basename "$f" .md)"
+    done
+    mkdir -p "$SPLIT" && rm -rf "$SPLIT/blocks" && cp -R "$WORK/blocks" "$SPLIT/blocks"
+    exit $?
+fi
 if [ -n "$ONLY" ]; then
     split_blocks "$ONLY" "$(basename "$ONLY" .md)"
     check_blocks
