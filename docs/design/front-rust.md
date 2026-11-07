@@ -595,6 +595,13 @@ reference (`&'a T: IntoIterator`), a closure bound (`F: FnMut(I::Item)
 -> B`, D20.1). *Anchor:* `front/parser/items/params.vl: parse_where`
 (today `edition.later: where_bound` for a non-parameter subject),
 `front/parser/rust.vl: where_key`.
+A clause is its own item's: a function's is checked for that function
+(F10.2), a struct's, an enum's, a trait's and an impl's are none
+function's (0.27.3: a struct's predicate was the function's parsed
+before it, `struct Flatten<I> where I::Item: IntoIterator` read as a
+bound of Cloned's `next_back` when the whole std2 was loaded; which
+impls a program loads does not change which predicates a function has).
+Case `std2_iter_adapters_cloned_impl_doubleendediterator`.
 
 **F10.2 (at instantiation).** For an instance with substitution `θ`,
 every clause `σ: Tr<b..>` is checked as `θ(σ): Tr<θ(b)..>` by F0.4 at
@@ -1138,7 +1145,9 @@ writer `w` for `write(w, ..)`/`writeln` (calling `w.write_fmt`-free:
 the pieces go to `w.write_str` through `fmt::Write` or `io::Write`,
 whichever `w` implements, F13.2), a 256-byte stack buffer for
 `panic`/`assert*` (0.26.2's decision 5). `write`/`writeln` return
-`fmt::Result` (or `io::Result<()>` for an `io::Write` writer); the
+`fmt::Result` (or `io::Result<()>` for an `io::Write` writer: 0.27.3,
+through the tail's `std::__rt::io_fmt`, the first io error kept, its
+`finish` the value; a writer whose referent is no `fmt::Write`); the
 print functions return `()`. The lowering is rust-edition generated
 code (Z1): the trait calls are F0.5's and go through F15.1's intrinsic
 impls for primitives (the number formatting MVS has). *Anchor:*

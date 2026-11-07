@@ -520,7 +520,7 @@ pub fn direct_call(n: i64, f: i64, k: i64, recv: i64, pcx: inout Ctx<Comp>) -> i
             list_push(let_node(intern_c(c"__a", &pcx), alloc, n, false, &pcx), &pcx);
         }
         list_end(block, lets, &pcx);
-        let body = direct_body(fs, k, n, &pcx);
+        let body = direct_body(fs, k, n, recv != 0 && io_destination(recv, &pcx), &pcx);
         pcx.nodes[block].a = body;
         push_scope(&pcx);
         bind_lets(block, &pcx);
@@ -539,6 +539,28 @@ pub fn direct_call(n: i64, f: i64, k: i64, recv: i64, pcx: inout Ctx<Comp>) -> i
     pcx.nodes[n].y = block;
     pcx.nodes[n].ty = t;
     t
+}
+
+// RULE: F16.3 (0.27.3) Whether write's destination recv (checked: `&mut W`
+// or `W`) is an io::Write's rather than a fmt::Write's: on std2, its
+// referent does not implement std::fmt::Write (Vec<u8>, Stdout, a File).
+fn io_destination(recv: i64, pcx: inout Ctx<Comp>) -> bool {
+    if !crate::front::known::on_std2(pcx) {
+        return false;
+    }
+    let key = crate::base::find_sym("std::fmt::Write", pcx);
+    if key < 0 {
+        return false;
+    }
+    // UNSAFE: SYM_TRAIT is a raw table indexed by symbol key (base/comp.vl).
+    // SAFETY: key is a symbol find_sym returned, below the table's length.
+    let tr = unsafe { pcx.sym_trait[key] } - 1;
+    let t = pcx.nodes[recv].ty;
+    if tr < 0 || t <= 0 || t == pcx.ty_error {
+        return false;
+    }
+    let p = if pcx.types[t].kind == TyKind::Ptr && pcx.types[t].a > 0 { pcx.types[t].a } else { t };
+    !implements(tr, p, &pcx)
 }
 
 // (0.17) Whether t, format_in's allocator, is an Allocator; else the error
@@ -576,9 +598,9 @@ fn allocator_ok(t: i64, f: i64, pos: i64, pcx: inout Ctx<Comp>) -> bool {
 //   (0.26.3: a String, as std's format_in makes; a Buf before)
 //
 // (WRITES: push_writes; std's helpers: compiler/std/fmt.vl.)
-fn direct_body(fs: i64, k: i64, n: i64, pcx: inout Ctx<Comp>) -> i64 {
+fn direct_body(fs: i64, k: i64, n: i64, io: bool, pcx: inout Ctx<Comp>) -> i64 {
     if crate::front::known::on_std2(pcx) && k != D_PUSH_FMT {
-        return direct_body_std2(fs, k, n, &pcx);
+        return direct_body_std2(fs, k, n, io, &pcx);
     }
     let out = intern_c(c"__out", &pcx);
     let none = 0 as *u8;
@@ -654,7 +676,7 @@ fn direct_body(fs: i64, k: i64, n: i64, pcx: inout Ctx<Comp>) -> i64 {
 // `__out.__spec(..)` and cleared after (spec_call). write and writeln
 // write through their destination, `__r`, the last write their value.
 // RULE: F16.3
-fn direct_body_std2(fs: i64, k: i64, n: i64, pcx: inout Ctx<Comp>) -> i64 {
+fn direct_body_std2(fs: i64, k: i64, n: i64, io: bool, pcx: inout Ctx<Comp>) -> i64 {
     let out = intern_c(c"__out", &pcx);
     let stmts = list_begin(pcx);
     var tail = 0;
@@ -662,7 +684,13 @@ fn direct_body_std2(fs: i64, k: i64, n: i64, pcx: inout Ctx<Comp>) -> i64 {
     let dst = if k == D_FORMAT_IN { intern_c(c"__b", &pcx) } else if k == D_PANIC {
         intern_c(c"__p", &pcx) } else if write { intern_c(c"__r", &pcx) }
         else { intern_c(c"__o", &pcx) };
-    if write {
+    if write && io {
+        // RULE: F16.3 (0.27.3: an io::Write's, `let mut __o =
+        // std::__rt::io_fmt(__r);`, its io::Result made by `__o.finish(..)`)
+        let wrap = std_path_call(c"__rt", c"io_fmt", 0 as *u8,
+            ident(intern_c(c"__r", &pcx), n, &pcx), 0, n, &pcx);
+        list_push(let_node(intern_c(c"__o", &pcx), wrap, n, true, &pcx), &pcx);
+    } else if write {
         // (`__r`, the `&mut W` direct_call bound: written through as it is)
     } else if k == D_FORMAT_IN {
         let new_in = string_new_in(ident(intern_c(c"__a", &pcx), n, &pcx), n, &pcx);
@@ -687,8 +715,10 @@ fn direct_body_std2(fs: i64, k: i64, n: i64, pcx: inout Ctx<Comp>) -> i64 {
         list_push(let_node(dst, wrap, n, true, &pcx), &pcx);
     }
     let inner = list_begin(pcx);
+    let to = if write && io { intern_c(c"__o", &pcx) } else { dst };
     let made = std_path_call(c"fmt", c"Formatter", c"new",
-        if write { ident(dst, n, &pcx) } else { amp_mut(ident(dst, n, &pcx), &pcx) }, 0, n, &pcx);
+        if write && !io { ident(dst, n, &pcx) } else { amp_mut(ident(to, n, &pcx), &pcx) }, 0, n,
+        &pcx);
     list_push(let_node(out, made, n, true, &pcx), &pcx);
     var holes = 0;
     for i in 0..pcx.nodes[fs].count {
@@ -752,6 +782,13 @@ fn direct_body_std2(fs: i64, k: i64, n: i64, pcx: inout Ctx<Comp>) -> i64 {
         pcx.nodes[last].a = crate::front::lexer::add_string(if k == D_WRITELN { "\n" } else { "" });
         pcx.nodes[writes].a = call1(ident(out, n, &pcx), c"write_str", last, &pcx);
         tail = writes;
+        if io {
+            // (`let __w = { WRITES }; __o.finish(__w)`)
+            let w = intern_c(c"__w", &pcx);
+            list_push(let_node(w, writes, n, false, &pcx), &pcx);
+            tail = call1(ident(intern_c(c"__o", &pcx), n, &pcx), c"finish", ident(w, n, &pcx),
+                &pcx);
+        }
     } else {
         list_push(stmt(writes, &pcx), &pcx);
     }
