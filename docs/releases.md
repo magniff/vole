@@ -121,6 +121,16 @@ The front (front274):
   An untyped literal fixes `i32` at once (`v.push(1)`: `Vec<i32>`, where
   rustc may infer from a later use; FL1, case `rust_f_fl1_literal_i32`).
   std2 at -O0: 1,430 pass, 39 xfail (1,400 and 69).
+- FL1, stage 2 (F18.6 (d)-(f)). A `_` written in a type is a variable
+  (`let f: FromFn<_> = from_fn(..)`, `let v: Vec<_, Gpa> = ..`); one
+  never fixed is `type.infer` at the `_`, with one error for a `_` and
+  the parameter it was bound to. A projection of a variable is solved
+  with it: `let a: u32 = "4".parse().unwrap();`. A closure whose bound
+  mentions a variable infers its own parameter. `e?` checked against a
+  type checks its value first (`let n: u8 = s.parse().map_err(..)?`). A
+  variant pattern of a variable's enum (the `?`'s match) names the
+  solution's variant, which fixes a `FromStr` impl that read `0` fields.
+  std2 at -O0: 1,438 pass, 31 xfail.
 - F30.2, `&raw const P` and `&raw mut P`, in the rust edition: a place's
   address, a raw pointer, with no reference made. `&raw mut S` of a
   `static mut` needs no `unsafe`; a field of one, `&raw const S.n`, does
