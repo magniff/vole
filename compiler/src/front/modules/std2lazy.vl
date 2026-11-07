@@ -1,0 +1,822 @@
+// (0.27.3) std2 parsed lazily (cost273): std2's text is lexed whole, as
+// before, and then only the units a build can reach are kept for the
+// parser; the other units' tokens are dropped, so they are never parsed,
+// derived, expanded (`#[builtin_impls]`) or collected. A unit is a
+// top-level item of a module of std2; an inherent impl is split into its
+// header, each method (or associated const) and its closing brace; a
+// trait into its header with its required items, each default method and
+// its closing brace.
+//
+// What is reached, by name (a word is an identifier token):
+// - the words of the program's files, the known items (front/known.vl)
+//   and SEEDS (the names the compiler's lowerings and made text use);
+// - an item whose name is a word of a reached unit, and every trait that
+//   has an item of that name (`v.extend(..)` names Extend by its method);
+// - an inherent method or a trait's default method whose name is such a
+//   word, once its type or trait is reached (a type that is no item of
+//   std2, `str`, `[T]`, a number, is always reached);
+// - a trait impl once its trait and its type are reached (a blanket
+//   `impl<T: Display> ToString for T`, of a type that is no item of std2,
+//   with its trait; an impl of a trait no std2 item is, Send's, with its
+//   type);
+// - a `use` line's leaf asks for the capitalized segments before it
+//   (`Some` asks for `Option`) and, under `as`, for the name it renames.
+// `use` and `mod` lines, extern blocks and the tail's modules (`__rt`,
+// `__gpa`, `__sys`, which the lowerings name) are always kept, the last
+// two read.
+//
+// Names are matched without their modules: two items of one name are
+// both reached, which keeps more than needed. A lazy build with errors is
+// made again with every unit (rerun_eager), so that its diagnostics are
+// the whole std2's; one that needed a unit not kept has errors so. A build
+// is lazy only (BUILD); VOLE_STD2_EAGER=1 keeps every unit, and so do
+// queries, `--std2-check`, `fix --only buf` and std2 read from its files.
+
+use crate::base::{intern, sym_text};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::lexer::Tok;
+use crate::middle::lower::ssa::HMap;
+
+static var STD2_FIRST: i64 = -1;
+static var STD2_END: i64 = -1;
+static var EAGER: bool = false;
+static var BUILD: bool = false;
+static var DROPPED: i64 = 0;
+// (VOLE_STD2_NORERUN=1, front/stdtree.vl: no rerun_eager, for the twin)
+pub static var NORERUN: bool = false;
+
+// std2's tokens, first..end, as load_std2 lexed them.
+pub fn std2_lexed(first: i64, end: i64) {
+    STD2_FIRST = first;
+    STD2_END = end;
+}
+
+// $VOLE_STD2_EAGER=1 (front/stdtree.vl: std_tree_env).
+pub fn set_eager(on: bool) {
+    EAGER = on;
+}
+
+// The compilation is a build (main.vl: build), the only one read lazily.
+pub fn set_build() {
+    BUILD = true;
+}
+
+// How many of std2's tokens were dropped (0: std2 whole).
+pub fn dropped() -> i64 {
+    if NORERUN { 0 } else { DROPPED }
+}
+
+// A lazy build that has errors made again with std2 whole: this command
+// line, with VOLE_STD2_EAGER=1, its output and exit status this run's
+// (base/diag: exit_if_errors, before any error is written). The errors,
+// their order, help and nearest names are then those of std2 read whole.
+pub fn rerun_eager() -> ! {
+    var words = Vec::<[u8], Comp>::new_in(Comp {});
+    for a in std::env::args_os() {
+        words.push(a);
+    }
+    var cmd = std::process::Command::new(words[0]);
+    for k in 1..words.len() {
+        cmd.arg(words[k]);
+    }
+    // UNSAFE: the environment changed (std::env::set_var, Rust 2024's
+    // unsafe fn), for the run made next to inherit it.
+    // SAFETY: the checking that reports the errors is serial: no other
+    // thread reads the environment now, and no view of it is used after.
+    unsafe {
+        std::env::set_var("VOLE_STD2_EAGER", "1");
+    }
+    match cmd.status() {
+        Ok(st) => std::process::exit(match st.code() {
+            Some(c) => c,
+            None => 1,
+        }),
+        Err(_) => std::process::exit(1),
+    }
+}
+
+const K_CORE: i64 = 0;
+const K_ITEM: i64 = 1;
+const K_IMPL: i64 = 2;
+const K_HEADER: i64 = 3;
+const K_MEMBER: i64 = 4;
+const K_USE: i64 = 5;
+// an inherent impl's closing brace, kept with its header (parent)
+const K_CLOSE: i64 = 6;
+// a trait's required item (no default: a method without a body, an
+// associated type or const), kept and read with its trait (parent)
+const K_TREQ: i64 = 7;
+// always kept, and read: an item of the tail's modules, an extern block,
+// what is no item this split knows
+const K_KEEP: i64 = 8;
+
+// The units and their indexes.
+struct Units<A: Allocator> {
+    kind: Vec<i64, A>,
+    start: Vec<i64, A>,
+    end: Vec<i64, A>,
+    // an item's or member's name, a header's closing brace; -1
+    name: Vec<i64, A>,
+    // a trait impl's trait; -1
+    trait_of: Vec<i64, A>,
+    // an impl's, header's or member's type head, -1 for any
+    type_of: Vec<i64, A>,
+    // a member's header
+    parent: Vec<i64, A>,
+    loaded: Vec<bool, A>,
+    // the next unit in the list of its name (by_name, member_by_name), of
+    // its trait (by_trait), of its type (by_type, member_by_type)
+    next_name: Vec<i64, A>,
+    next_type: Vec<i64, A>,
+    next_trait: Vec<i64, A>,
+    by_name: HMap,
+    member_by_name: HMap,
+    by_trait: HMap,
+    by_type: HMap,
+    member_by_type: HMap,
+    // a std2 item's name
+    item_name: HMap,
+    // the names asked for, the items reached
+    used: HMap,
+    defined: HMap,
+    // a `use` leaf's asks: (sym, next) pairs, listed by alias_head
+    alias_head: HMap,
+    alias_sym: Vec<i64, A>,
+    alias_next: Vec<i64, A>,
+    // a trait's item names: (trait, next) pairs, listed by method_head
+    method_head: HMap,
+    method_trait: Vec<i64, A>,
+    method_next: Vec<i64, A>,
+    words: Vec<i64, A>,
+    todo: Vec<i64, A>,
+}
+
+fn units_new() -> Units<Comp> {
+    Units {
+        kind: Vec::new_in(Comp {}), start: Vec::new_in(Comp {}), end: Vec::new_in(Comp {}),
+        name: Vec::new_in(Comp {}), trait_of: Vec::new_in(Comp {}),
+        type_of: Vec::new_in(Comp {}), parent: Vec::new_in(Comp {}),
+        loaded: Vec::new_in(Comp {}), next_name: Vec::new_in(Comp {}),
+        next_type: Vec::new_in(Comp {}), next_trait: Vec::new_in(Comp {}),
+        by_name: hmap(), member_by_name: hmap(), by_trait: hmap(), by_type: hmap(),
+        member_by_type: hmap(), item_name: hmap(), used: hmap(), defined: hmap(),
+        alias_head: hmap(), alias_sym: Vec::new_in(Comp {}), alias_next: Vec::new_in(Comp {}),
+        method_head: hmap(), method_trait: Vec::new_in(Comp {}), method_next: Vec::new_in(Comp {}),
+        words: Vec::new_in(Comp {}), todo: Vec::new_in(Comp {}),
+    }
+}
+
+fn hmap() -> HMap {
+    HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 }
+}
+
+fn add_unit(u: inout Units<Comp>, kind: i64, start: i64, end: i64, name: i64, tr: i64, ty: i64,
+    parent: i64) -> i64 {
+    let k = u.kind.len() as i64;
+    u.kind.push(kind);
+    u.start.push(start);
+    u.end.push(end);
+    u.name.push(name);
+    u.trait_of.push(tr);
+    u.type_of.push(ty);
+    u.parent.push(parent);
+    u.loaded.push(false);
+    u.next_name.push(-1);
+    u.next_type.push(-1);
+    u.next_trait.push(-1);
+    if kind == K_ITEM && name >= 0 {
+        u.next_name[k] = u.by_name.get(name + 1) - 1;
+        u.by_name.put(name + 1, k + 1);
+        u.item_name.put(name + 1, 1);
+    } else if kind == K_MEMBER && name >= 0 {
+        u.next_name[k] = u.member_by_name.get(name + 1) - 1;
+        u.member_by_name.put(name + 1, k + 1);
+        if ty >= 0 {
+            u.next_type[k] = u.member_by_type.get(ty + 1) - 1;
+            u.member_by_type.put(ty + 1, k + 1);
+        }
+    } else if kind == K_IMPL {
+        if tr >= 0 {
+            u.next_trait[k] = u.by_trait.get(tr + 1) - 1;
+            u.by_trait.put(tr + 1, k + 1);
+        }
+        if ty >= 0 {
+            u.next_type[k] = u.by_type.get(ty + 1) - 1;
+            u.by_type.put(ty + 1, k + 1);
+        }
+    }
+    k
+}
+
+// Whether the read keeps every unit of std2.
+fn eager(pcx: Ctx<Comp>) -> bool {
+    EAGER || !BUILD || STD2_FIRST < 0 || !crate::front::known::on_std2(pcx) || pcx.query
+        || pcx.record || pcx.std_tree != 0 as *u8 || pcx.std_always
+        || crate::places::borrowck::std2::std2_check(pcx)
+}
+
+// After the program's files are lexed (front/modules: load_modules): std2's
+// tokens that no reached unit has, dropped.
+pub fn filter_std2(pcx: inout Ctx<Comp>) {
+    if eager(pcx) || DROPPED != 0 {
+        return;
+    }
+    var u = units_new();
+    SYM_ASYNC = intern("async", &pcx);
+    SYM_DEFAULT = intern("default", &pcx);
+    SYM_DYN = intern("dyn", &pcx);
+    split_units(&u, pcx);
+    // the program's words, then the seeds
+    for i in 0..pcx.toks.len() as i64 {
+        if (i < STD2_FIRST || i >= STD2_END) && pcx.toks[i].kind == Tok::Ident {
+            ask(&u, pcx.toks[i].value as i64);
+        }
+    }
+    for k in 0..SEEDS.len() {
+        ask(&u, intern(SEEDS[k], &pcx));
+    }
+    for k in 0..crate::front::known::known_count() {
+        ask(&u, intern(crate::front::known::known_name(k), &pcx));
+    }
+    let n = u.kind.len() as i64;
+    for k in 0..n {
+        if u.kind[k] == K_CORE || u.kind[k] == K_USE || u.kind[k] == K_KEEP {
+            load(&u, k);
+        } else if u.kind[k] == K_IMPL && !trait_reachable(u, k) && type_reached(u, k) {
+            // (a trait std2 does not define)
+            load(&u, k);
+        }
+    }
+    reach(&u, pcx);
+    // the tokens kept, in their order (the units are)
+    var w = STD2_FIRST;
+    for k in 0..n {
+        if !u.loaded[k] && !(u.kind[k] == K_CLOSE && u.loaded[u.parent[k]]) {
+            continue;
+        }
+        for r in u.start[k]..u.end[k] {
+            if w != r {
+                pcx.toks[w] = pcx.toks[r];
+            }
+            w += 1;
+        }
+    }
+    let total = pcx.toks.len() as i64;
+    for r in STD2_END..total {
+        pcx.toks[w] = pcx.toks[r];
+        w += 1;
+    }
+    DROPPED = total - w;
+    pcx.toks.truncate(w as usize);
+    STD2_END -= DROPPED;
+}
+
+// Name s asked for.
+fn ask(u: inout Units<Comp>, s: i64) {
+    if u.used.get(s + 1) != 0 {
+        return;
+    }
+    u.used.put(s + 1, 1);
+    u.words.push(s);
+}
+
+fn load(u: inout Units<Comp>, k: i64) {
+    if u.loaded[k] {
+        return;
+    }
+    u.loaded[k] = true;
+    u.todo.push(k);
+}
+
+// Whether a unit's type is reached, or is no item of std2 (any type).
+fn type_reached(u: Units<Comp>, k: i64) -> bool {
+    let ty = u.type_of[k];
+    ty < 0 || u.item_name.get(ty + 1) == 0 || u.defined.get(ty + 1) != 0
+}
+
+// Whether a trait impl's trait is one of std2's items.
+fn trait_reachable(u: Units<Comp>, k: i64) -> bool {
+    u.trait_of[k] >= 0 && u.item_name.get(u.trait_of[k] + 1) != 0
+}
+
+fn trait_reached(u: Units<Comp>, k: i64) -> bool {
+    !trait_reachable(u, k) || u.defined.get(u.trait_of[k] + 1) != 0
+}
+
+// The names asked for and the units loaded, until neither grows.
+fn reach(u: inout Units<Comp>, pcx: Ctx<Comp>) {
+    loop {
+        if u.words.len() > 0 {
+            let s = u.words.pop().unwrap();
+            var k = u.by_name.get(s + 1) - 1;
+            while k >= 0 {
+                load(&u, k);
+                k = u.next_name[k];
+            }
+            k = u.member_by_name.get(s + 1) - 1;
+            while k >= 0 {
+                if type_reached(u, k) {
+                    load(&u, k);
+                }
+                k = u.next_name[k];
+            }
+            // (a method call names its trait by the method alone)
+            var m = u.method_head.get(s + 1) - 1;
+            while m >= 0 {
+                load(&u, u.method_trait[m]);
+                m = u.method_next[m];
+            }
+            var a = u.alias_head.get(s + 1) - 1;
+            while a >= 0 {
+                ask(&u, u.alias_sym[a]);
+                a = u.alias_next[a];
+            }
+        } else if u.todo.len() > 0 {
+            let k = u.todo.pop().unwrap();
+            let kind = u.kind[k];
+            if kind == K_MEMBER {
+                load(&u, u.parent[k]);
+            }
+            if kind == K_ITEM {
+                // (a trait's required items, after it)
+                var j = k + 1;
+                while j < u.kind.len() as i64 && u.parent[j] == k {
+                    if u.kind[j] == K_TREQ {
+                        load(&u, j);
+                    }
+                    j += 1;
+                }
+            }
+            if kind == K_ITEM || kind == K_IMPL || kind == K_HEADER || kind == K_MEMBER
+                || kind == K_TREQ || kind == K_KEEP {
+                for t in u.start[k]..u.end[k] {
+                    if pcx.toks[t].kind == Tok::Ident {
+                        ask(&u, pcx.toks[t].value as i64);
+                    }
+                }
+            }
+            if kind == K_ITEM && u.name[k] >= 0 {
+                define(&u, u.name[k]);
+            }
+        } else {
+            return;
+        }
+    }
+}
+
+// Item name n reached: the impls and methods that waited on it.
+fn define(u: inout Units<Comp>, n: i64) {
+    if u.defined.get(n + 1) != 0 {
+        return;
+    }
+    u.defined.put(n + 1, 1);
+    var k = u.by_trait.get(n + 1) - 1;
+    while k >= 0 {
+        if type_reached(u, k) {
+            load(&u, k);
+        }
+        k = u.next_trait[k];
+    }
+    k = u.by_type.get(n + 1) - 1;
+    while k >= 0 {
+        if trait_reached(u, k) {
+            load(&u, k);
+        }
+        k = u.next_type[k];
+    }
+    k = u.member_by_type.get(n + 1) - 1;
+    while k >= 0 {
+        if u.used.get(u.name[k] + 1) != 0 {
+            load(&u, k);
+        }
+        k = u.next_type[k];
+    }
+}
+
+// ---- Splitting std2's tokens into units ----
+
+fn kind_at(t: i64, pcx: Ctx<Comp>) -> Tok {
+    if t < STD2_END { pcx.toks[t].kind } else { Tok::Eof }
+}
+
+// The symbols of `async`, `default` and `dyn` (filter_std2 interns them).
+static var SYM_ASYNC: i64 = -1;
+static var SYM_DEFAULT: i64 = -1;
+static var SYM_DYN: i64 = -1;
+
+fn is_word(t: i64, sym: i64, pcx: Ctx<Comp>) -> bool {
+    kind_at(t, pcx) == Tok::Ident && pcx.toks[t].value as i64 == sym
+}
+
+// The token after the bracketed group opening at t (`(..)`, `[..]`, `{..}`).
+fn after_group(t: i64, pcx: Ctx<Comp>) -> i64 {
+    var depth = 0;
+    var i = t;
+    while i < STD2_END {
+        let k = pcx.toks[i].kind;
+        if k == Tok::LParen || k == Tok::LBracket || k == Tok::LBrace {
+            depth += 1;
+        } else if k == Tok::RParen || k == Tok::RBracket || k == Tok::RBrace {
+            depth -= 1;
+            if depth == 0 {
+                return i + 1;
+            }
+        }
+        i += 1;
+    }
+    STD2_END
+}
+
+// The token after an item's attributes, visibility and qualifiers.
+fn item_keyword(t: i64, pcx: Ctx<Comp>) -> i64 {
+    var i = t;
+    loop {
+        let k = kind_at(i, pcx);
+        if k == Tok::Hash && kind_at(i + 1, pcx) == Tok::LBracket {
+            i = after_group(i + 1, pcx);
+        } else if k == Tok::Hash && kind_at(i + 1, pcx) == Tok::Bang
+            && kind_at(i + 2, pcx) == Tok::LBracket {
+            i = after_group(i + 2, pcx);
+        } else if k == Tok::Pub {
+            i += 1;
+            if kind_at(i, pcx) == Tok::LParen {
+                i = after_group(i, pcx);
+            }
+        } else if k == Tok::Unsafe || (k == Tok::Const && kind_at(i + 1, pcx) == Tok::Fn)
+            || (k == Tok::Const && kind_at(i + 1, pcx) == Tok::Unsafe)
+            || is_word(i, SYM_ASYNC, pcx) || is_word(i, SYM_DEFAULT, pcx)
+            && kind_at(i + 1, pcx) == Tok::Fn {
+            i += 1;
+        } else if k == Tok::Extern && kind_at(i + 1, pcx) == Tok::Str
+            && kind_at(i + 2, pcx) != Tok::LBrace {
+            i += 2;
+        } else {
+            return i;
+        }
+    }
+}
+
+// The end of the item whose keyword is at t: after its `;` (one that ends
+// it at its own depth) or its body's `}`.
+fn item_end(t: i64, semi_only: bool, pcx: Ctx<Comp>) -> i64 {
+    var depth = 0;
+    var i = t;
+    while i < STD2_END {
+        let k = pcx.toks[i].kind;
+        if k == Tok::LParen || k == Tok::LBracket || k == Tok::LBrace {
+            depth += 1;
+        } else if k == Tok::RParen || k == Tok::RBracket || k == Tok::RBrace {
+            depth -= 1;
+            if depth == 0 && k == Tok::RBrace && !semi_only {
+                return i + 1;
+            }
+            if depth < 0 {
+                return i;
+            }
+        } else if k == Tok::Semi && depth == 0 {
+            return i + 1;
+        }
+        i += 1;
+    }
+    STD2_END
+}
+
+// The next identifier at or after t (an item's name), or -1.
+fn name_at(t: i64, pcx: Ctx<Comp>) -> i64 {
+    var i = t;
+    if kind_at(i, pcx) == Tok::Mut {
+        i += 1;
+    }
+    if kind_at(i, pcx) == Tok::Ident { pcx.toks[i].value as i64 } else { -1 }
+}
+
+// The token after a generic list `<..>` opening at t (or t).
+fn after_generics(t: i64, pcx: Ctx<Comp>) -> i64 {
+    if kind_at(t, pcx) != Tok::Lt {
+        return t;
+    }
+    var depth = 0;
+    var i = t;
+    while i < STD2_END {
+        let k = pcx.toks[i].kind;
+        if k == Tok::Lt {
+            depth += 1;
+        } else if k == Tok::Gt {
+            depth -= 1;
+        } else if k == Tok::Shr {
+            depth -= 2;
+        }
+        i += 1;
+        if depth <= 0 {
+            return i;
+        }
+    }
+    STD2_END
+}
+
+// The head of the type or trait path at t (`crate::vec::Vec<T>`: Vec), or
+// -1 for a type that names no item (`&T` is T's head; `[T]`, `(A, B)`,
+// `*const T`, `dyn Tr`, `fn(..)`: -1).
+fn head_at(t: i64, pcx: Ctx<Comp>) -> i64 {
+    var i = t;
+    while kind_at(i, pcx) == Tok::Amp || kind_at(i, pcx) == Tok::AmpAmp
+        || kind_at(i, pcx) == Tok::Lifetime || kind_at(i, pcx) == Tok::Mut
+        || kind_at(i, pcx) == Tok::Bang {
+        i += 1;
+    }
+    if kind_at(i, pcx) != Tok::Ident || is_word(i, SYM_DYN, pcx) {
+        return -1;
+    }
+    var head = pcx.toks[i].value as i64;
+    while kind_at(i + 1, pcx) == Tok::ColonColon && kind_at(i + 2, pcx) == Tok::Ident {
+        i += 2;
+        head = pcx.toks[i].value as i64;
+    }
+    head
+}
+
+// An impl at keyword t, ending at end: a trait impl (its unit), or an
+// inherent one split into its header, its members and its closing brace.
+fn split_impl(u: inout Units<Comp>, s: i64, t: i64, end: i64, pcx: Ctx<Comp>) {
+    let after = after_generics(t + 1, pcx);
+    // ` for ` outside brackets and generics, before the body
+    var depth = 0;
+    var angles = 0;
+    var i = after;
+    var body = -1;
+    var for_at = -1;
+    while i < end {
+        let k = pcx.toks[i].kind;
+        if k == Tok::LBrace && depth == 0 && angles <= 0 {
+            body = i;
+            break;
+        }
+        if k == Tok::LParen || k == Tok::LBracket {
+            depth += 1;
+        } else if k == Tok::RParen || k == Tok::RBracket {
+            depth -= 1;
+        } else if k == Tok::Lt {
+            angles += 1;
+        } else if k == Tok::Gt {
+            angles -= 1;
+        } else if k == Tok::Shr {
+            angles -= 2;
+        } else if k == Tok::For && depth == 0 && angles <= 0 && kind_at(i + 1, pcx) != Tok::Lt
+            && for_at < 0 {
+            for_at = i;
+        }
+        i += 1;
+    }
+    if body < 0 {
+        add_unit(&u, K_ITEM, s, end, -1, -1, -1, -1);
+        return;
+    }
+    if for_at >= 0 {
+        // the trait's head: the last identifier at depth 0 before ` for `
+        var tr = -1;
+        var j = after;
+        var a = 0;
+        while j < for_at {
+            let k = pcx.toks[j].kind;
+            if k == Tok::Lt {
+                a += 1;
+            } else if k == Tok::Gt {
+                a -= 1;
+            } else if k == Tok::Shr {
+                a -= 2;
+            } else if k == Tok::Ident && a <= 0 {
+                tr = pcx.toks[j].value as i64;
+            }
+            j += 1;
+        }
+        add_unit(&u, K_IMPL, s, end, -1, tr, head_at(for_at + 1, pcx), -1);
+        return;
+    }
+    let ty = head_at(after, pcx);
+    // the members: each a unit, unless one is no fn, const or type
+    var members = Vec::<i64, Comp>::new_in(Comp {});
+    var m = body + 1;
+    while m < end - 1 {
+        let kw = item_keyword(m, pcx);
+        let k = kind_at(kw, pcx);
+        if k != Tok::Fn && k != Tok::Const && k != Tok::Type {
+            add_unit(&u, K_ITEM, s, end, -1, -1, -1, -1);
+            return;
+        }
+        let e = item_end(kw, k != Tok::Fn, pcx);
+        members.push(m);
+        members.push(e);
+        members.push(name_at(kw + 1, pcx));
+        m = e;
+    }
+    let header = add_unit(&u, K_HEADER, s, body + 1, -1, -1, ty, -1);
+    var j = 0;
+    while j < members.len() as i64 {
+        add_unit(&u, K_MEMBER, members[j], members[j + 1], members[j + 2], -1, ty, header);
+        j += 3;
+    }
+    add_unit(&u, K_CLOSE, end - 1, end, -1, -1, -1, header);
+}
+
+// A trait at keyword t, ending at end: its header (the item: its name,
+// supertraits, `where` and the brace) with its required items, each
+// default method a member of the trait's name, and its closing brace.
+fn split_trait(u: inout Units<Comp>, s: i64, t: i64, end: i64, pcx: Ctx<Comp>) {
+    let name = name_at(t + 1, pcx);
+    var depth = 0;
+    var i = t;
+    var body = -1;
+    while i < end {
+        let k = pcx.toks[i].kind;
+        if k == Tok::LBrace && depth == 0 {
+            body = i;
+            break;
+        }
+        if k == Tok::LParen || k == Tok::LBracket {
+            depth += 1;
+        } else if k == Tok::RParen || k == Tok::RBracket {
+            depth -= 1;
+        }
+        i += 1;
+    }
+    if body < 0 || name < 0 {
+        add_unit(&u, K_ITEM, s, end, name, -1, -1, -1);
+        return;
+    }
+    // the members: (start, end, kind) each, or the trait whole
+    var members = Vec::<i64, Comp>::new_in(Comp {});
+    var m = body + 1;
+    while m < end - 1 {
+        let kw = item_keyword(m, pcx);
+        let k = kind_at(kw, pcx);
+        if k != Tok::Fn && k != Tok::Const && k != Tok::Type {
+            add_unit(&u, K_ITEM, s, end, name, -1, -1, -1);
+            return;
+        }
+        let e = item_end(kw, k != Tok::Fn, pcx);
+        let has_body = k == Tok::Fn && e > kw && pcx.toks[e - 1].kind == Tok::RBrace;
+        members.push(m);
+        members.push(e);
+        members.push(name_at(kw + 1, pcx));
+        members.push(if has_body { 1 } else { 0 });
+        m = e;
+    }
+    let header = add_unit(&u, K_ITEM, s, body + 1, name, -1, -1, -1);
+    var j = 0;
+    while j < members.len() as i64 {
+        if members[j + 3] != 0 {
+            add_unit(&u, K_MEMBER, members[j], members[j + 1], members[j + 2], -1, name, header);
+        } else {
+            add_unit(&u, K_TREQ, members[j], members[j + 1], -1, -1, -1, header);
+        }
+        if members[j + 2] >= 0 {
+            let k = u.method_trait.len() as i64;
+            u.method_trait.push(header);
+            u.method_next.push(u.method_head.get(members[j + 2] + 1) - 1);
+            u.method_head.put(members[j + 2] + 1, k + 1);
+        }
+        j += 4;
+    }
+    add_unit(&u, K_CLOSE, end - 1, end, -1, -1, -1, header);
+}
+
+// A `use` item s..end: each leaf asks for the capitalized segments before
+// it, and an `as` rename for what it renames.
+fn split_use(u: inout Units<Comp>, s: i64, end: i64, pcx: Ctx<Comp>) {
+    add_unit(&u, K_USE, s, end, -1, -1, -1, -1);
+    // the capitalized prefix segments, by brace depth
+    var prefix = Vec::<i64, Comp>::new_in(Comp {});
+    var marks = Vec::<i64, Comp>::new_in(Comp {});
+    var i = s;
+    while i < end {
+        let k = pcx.toks[i].kind;
+        if k == Tok::LBrace {
+            marks.push(prefix.len() as i64);
+        } else if k == Tok::RBrace || k == Tok::Comma {
+            // a leaf's own segments end with it
+            let keep = if marks.len() > 0 { marks[marks.len() - 1] } else { 0 };
+            if k == Tok::RBrace && marks.len() > 0 {
+                marks.pop();
+            }
+            while prefix.len() as i64 > keep {
+                prefix.pop();
+            }
+        } else if k == Tok::Ident {
+            let sym = pcx.toks[i].value as i64;
+            let next = kind_at(i + 1, pcx);
+            if next == Tok::ColonColon {
+                let text = sym_text(sym, pcx);
+                if text.len() > 0 && text[0] >= 'A' && text[0] <= 'Z' {
+                    prefix.push(sym);
+                }
+            } else if next == Tok::As && kind_at(i + 2, pcx) == Tok::Ident {
+                let alias = pcx.toks[i + 2].value as i64;
+                add_ask(&u, alias, sym);
+                for p in 0..prefix.len() as i64 {
+                    add_ask(&u, alias, prefix[p]);
+                }
+                i += 2;
+            } else {
+                for p in 0..prefix.len() as i64 {
+                    add_ask(&u, sym, prefix[p]);
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
+// Name a asks for name b.
+fn add_ask(u: inout Units<Comp>, a: i64, b: i64) {
+    let k = u.alias_sym.len() as i64;
+    u.alias_sym.push(b);
+    u.alias_next.push(u.alias_head.get(a + 1) - 1);
+    u.alias_head.put(a + 1, k + 1);
+}
+
+// std2's tokens as units: modules' lines and closing braces, then items.
+fn split_units(u: inout Units<Comp>, pcx: Ctx<Comp>) {
+    // (the module stack's tail flags: inside a `__` module, every unit kept)
+    var tails = Vec::<bool, Comp>::new_in(Comp {});
+    var t = STD2_FIRST;
+    while t < STD2_END {
+        let k0 = pcx.toks[t].kind;
+        if k0 == Tok::RBrace {
+            add_unit(&u, K_CORE, t, t + 1, -1, -1, -1, -1);
+            if tails.len() > 0 {
+                tails.pop();
+            }
+            t += 1;
+            continue;
+        }
+        if k0 == Tok::Semi {
+            add_unit(&u, K_CORE, t, t + 1, -1, -1, -1, -1);
+            t += 1;
+            continue;
+        }
+        let kw = item_keyword(t, pcx);
+        let k = kind_at(kw, pcx);
+        let in_tail = tails.len() > 0 && tails[tails.len() - 1];
+        if k == Tok::Mod && kind_at(kw + 1, pcx) == Tok::Ident
+            && kind_at(kw + 2, pcx) == Tok::LBrace {
+            let name = sym_text(pcx.toks[kw + 1].value as i64, pcx);
+            tails.push(in_tail || name.len() >= 2 && name[0] == '_' && name[1] == '_');
+            add_unit(&u, K_CORE, t, kw + 3, -1, -1, -1, -1);
+            t = kw + 3;
+            continue;
+        }
+        let semi = k == Tok::Use || k == Tok::Const || k == Tok::Static || k == Tok::Type;
+        let end = item_end(kw, semi, pcx);
+        if end <= t {
+            // (no item here: the rest kept)
+            add_unit(&u, K_CORE, t, STD2_END, -1, -1, -1, -1);
+            return;
+        }
+        if k == Tok::Mod {
+            add_unit(&u, K_CORE, t, end, -1, -1, -1, -1);
+        } else if in_tail || k == Tok::Extern {
+            add_unit(&u, K_KEEP, t, end, -1, -1, -1, -1);
+        } else if k == Tok::Use {
+            split_use(&u, t, end, pcx);
+        } else if k == Tok::Impl {
+            split_impl(&u, t, kw, end, pcx);
+        } else if k == Tok::Trait {
+            split_trait(&u, t, kw, end, pcx);
+        } else if k == Tok::Fn || k == Tok::Struct || k == Tok::Enum || k == Tok::Union
+            || k == Tok::Trait || k == Tok::Type || k == Tok::Const || k == Tok::Static {
+            add_unit(&u, K_ITEM, t, end, name_at(kw + 1, pcx), -1, -1, -1);
+        } else {
+            add_unit(&u, K_KEEP, t, end, -1, -1, -1, -1);
+        }
+        t = end;
+    }
+}
+
+// The names the compiler itself names in std2 with no token of a source
+// naming them, besides the known items (front/known.vl, Z3.1): the
+// methods its lowerings call (front/traits.vl's LOWERED_METHODS) and the
+// names the text it makes calls or names (front/builtin_impls.vl, the
+// derives, check/interp.vl and format.vl, stdalloc.vl, check/iterate.vl,
+// try_op.vl, rust.vl, convert/try_main.vl, places/shim.vl,
+// contracts/desugar.vl). One missed is an error, and the build is made
+// again with std2 whole (rerun_eager): slower, not wrong.
+const SEEDS: [[u8]; 130] = [
+    "Error", "FromStr", "IntErrorKind", "Item", "MAX", "Output", "ParseBoolError",
+    "ParseFloatError", "ParseIntError", "Product", "Target", "Write", "__spec", "add", "add_assign",
+    "bitand", "bitand_assign", "bitor", "bitor_assign", "bitxor", "bitxor_assign", "div",
+    "div_assign", "mul", "mul_assign", "neg", "not", "rem", "rem_assign", "shl", "shl_assign",
+    "shr", "shr_assign", "sub", "sub_assign", "eq", "ne", "lt", "le", "gt", "ge", "cmp",
+    "partial_cmp", "clone", "default", "hash", "fmt", "display", "debug", "pad", "pad_integral",
+    "fmt_float", "fmt_int_exp", "parse_float", "parse_bool", "from_str", "from_utf8",
+    "from_utf8_unchecked", "forward_checked", "backward_checked", "steps_between", "sum", "product",
+    "write_str", "write_char", "write_u8", "write_u16", "write_u32", "write_u64", "write_u128",
+    "write_usize", "write_i8", "write_i16", "write_i32", "write_i64", "write_i128", "write_isize",
+    "write_fmt", "write_all", "mul_hi", "rotate_left", "rotate_right", "is_char_boundary",
+    "as_bytes", "as_str", "as_slice", "as_mut_slice", "as_path", "len", "debug_struct",
+    "debug_tuple", "field", "finish", "new", "new_in", "spec", "width", "precision", "fill",
+    "stdout", "stderr", "print", "println", "eprint", "eprintln", "format_in", "format_args",
+    "write", "writeln", "into_iter", "next", "iter", "ok_or", "map_err", "from", "into", "deref",
+    "deref_mut", "index", "index_mut", "borrow", "drop", "drop_in_place", "assert", "assert_eq",
+    "assert_ne", "debug_assert", "contract_check", "unreachable", "panic",
+];

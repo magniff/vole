@@ -49,7 +49,7 @@ use crate::front::check::unsafety::{
     pointee_is_param, unsafe_index_zero, unsafe_op, unsafe_through, unsafe_view_index,
 };
 use crate::front::check::variant_fields::{enum_field_help, variant_literal};
-use crate::front::check::vectors::{synth_vecop, vector_binary};
+use crate::front::check::vectors::{sym_is_c, synth_vecop, vector_binary};
 use crate::front::check::widen::{join_operands, takes_context};
 use crate::front::closures::check_closure;
 use crate::front::consteval::eval_array_len;
@@ -96,7 +96,11 @@ fn synth_expr_inner(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             if pcx.nodes[n].b != SUF_NONE {
                 return suffixed_literal(n, false, &pcx);
             }
-            if pcx.nodes[n].kind == Int { TY_I64 } else { TY_F64 }
+            // RULE: F18.3 (0.27.3: the rust edition's fallback, i32)
+            if pcx.nodes[n].kind != Int { TY_F64 }
+            else if crate::front::check::rust::rust_node(n, &pcx) {
+                crate::front::check::literals::literal_fallback(n, &pcx)
+            } else { TY_I64 }
         }
         // RULE: F1.2 (0.27.2: a rust-edition character literal is a `char`,
         // b == 1; a byte literal, 2, and MVS's are u8)
@@ -106,7 +110,8 @@ fn synth_expr_inner(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         // RULE: F23.1 (0.27.2: on std2 a rust-edition string literal is a
         // `&'static str`, std2's str, not the bytes: `panic("..")` finds
         // `str: Display`)
-        Str => if pcx.std2 && pcx.edition != 0 && pcx.str_type > 0
+        // (0.27.3: `b"..."`, b 2, is its bytes, `&[u8]`)
+        Str => if pcx.std2 && pcx.edition != 0 && pcx.str_type > 0 && pcx.nodes[n].b != 2
             && crate::front::check::rust::rust_node(n, &pcx) { pcx.str_type }
             else { pcx.ty_string },
         CStr => pcx.ty_u8_ptr,
@@ -286,7 +291,13 @@ fn synth_cast(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         pcx.nodes[n] = pcx.nodes[operand];
         return to_ty;
     }
-    if !is_valid_cast(from, to, pcx) {
+    // RULE: F29.1 (0.27.3: a reference casts to a raw pointer of its own
+    // pointee only, `&x as *const T` with x a T; rustc E0606)
+    let ref_to_raw = from > 0 && to > 0 && pcx.types[from].kind == TyKind::Ptr
+        && pcx.types[from].b != 0 && pcx.types[to].kind == TyKind::Ptr && pcx.types[to].b == 0
+        && pcx.types[from].a != pcx.types[to].a;
+    if !is_valid_cast(from, to, pcx)
+        || ref_to_raw && crate::front::check::rust::rust_node(n, &pcx) {
         err_begin(pcx.nodes[operand].start, &pcx);
         err_str(c"cannot cast '", pcx);
         err_type(from_ty, pcx);
@@ -456,7 +467,12 @@ fn synth_index(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     // points to, checked; through a raw pointer, unsafe
     // (decided 2026-10-16) unless it points, as written, to a type
     // parameter (`p: *T`): arithmetic then, whatever T is
-    if base_kind == TyKind::Ptr && indexes_through(pcx.types[base_ty].a, pcx)
+    // RULE: Z9.1b (0.27.3: through a reference to a str, `&self[n..]` with
+    // `self: &mut &str`)
+    let str_ref = base_kind == TyKind::Ptr && crate::front::types::is_ref(base_ty, pcx)
+        && is_view_distinct(pcx.types[base_ty].a, pcx)
+        && crate::front::check::rust::rust_node(n, &pcx);
+    if base_kind == TyKind::Ptr && (indexes_through(pcx.types[base_ty].a, pcx) || str_ref)
         && !pointee_is_param(base, &pcx) {
         let pointee = pcx.types[base_ty].a;
         let raw = !is_borrow(base, pcx);
@@ -465,13 +481,13 @@ fn synth_index(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             // (reported: the method called through p below is not)
             pcx.unsafe_depth += 1;
         }
-        if pcx.types[pointee].kind == TyKind::Slice {
+        if pcx.types[pointee].kind == TyKind::Slice || str_ref {
             // a borrow: `p[i]` is `(*p)[i]`
             let deref = synthetic_unary(Tok::Star, base, pointee, &pcx);
             pcx.nodes[n].a = deref;
             base = deref;
             base_ty = pointee;
-            base_kind = TyKind::Slice;
+            base_kind = pcx.types[pointee].kind;
         } else {
             // a borrow of a Vec or a Buf: `p.as_slice()[i]`, the
             // method called through the borrow, safely
@@ -503,6 +519,13 @@ fn synth_index(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         && text == 0 && crate::front::check::rust::rust_node(n, &pcx)
         && crate::front::check::rust::index_through_trait(n, base_ty, &pcx) {
         // (0.27.0: `c[i]` through Index, the rust edition's)
+        return synth_expr(n, &pcx);
+    }
+    if (base_kind == TyKind::Array || base_kind == TyKind::Slice)
+        && crate::front::check::rust::rust_node(n, &pcx) && crate::front::known::on_std2(pcx)
+        && crate::front::check::rust::index_range_value(n,
+            if base_kind == TyKind::Array { base_ty } else { 0 }, &pcx) {
+        // (0.27.3: `a[r]` of a range value, F26.3)
         return synth_expr(n, &pcx);
     }
     if base_kind != TyKind::Array && base_kind != TyKind::Ptr && base_kind != TyKind::Slice {
@@ -906,6 +929,31 @@ pub fn is_context_value(e: i64, pcx: Ctx<Comp>) -> bool {
 // (a pattern's binding on a reference, `n + 1`; a closure's `&i64`) is
 // read through, as Rust's operators on `&i64` do.
 fn synth_operands(lhs: i64, rhs: i64, pcx: inout Ctx<Comp>) -> i64 {
+    // RULE: F18.5 (a comparison of an open local with an untyped literal
+    // keeps it open: the literal is typed with it)
+    if pcx.open_lets.count > 0 && pcx.binary_node > 0
+        && comparison_op(pcx.nodes[pcx.binary_node].op) {
+        var o = 0;
+        var lit = 0;
+        if crate::front::check::literals::open_scalar(lhs, pcx) >= 0
+            && crate::front::check::literals::open_literal(rhs, pcx) {
+            o = lhs;
+            lit = rhs;
+        } else if crate::front::check::literals::open_scalar(rhs, pcx) >= 0
+            && crate::front::check::literals::open_literal(lhs, pcx) {
+            o = rhs;
+            lit = lhs;
+        }
+        if o != 0 {
+            pcx.open_keep = true;
+            let t = synth_expr(o, &pcx);
+            pcx.open_keep = false;
+            check_expr(lit, t, &pcx);
+            crate::front::check::literals::open_record(
+                crate::front::check::literals::open_local(o, pcx), lit, &pcx);
+            return t;
+        }
+    }
     if literal_takes_rhs_type(lhs, rhs, pcx)
         || takes_context(lhs, &pcx) && !takes_context(rhs, &pcx) {
         let rhs_ty = read_through(rhs, synth_expr(rhs, &pcx), &pcx);
@@ -1298,6 +1346,11 @@ fn synth_unary(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         if star_on_access(n, operand, &pcx) {
             return synth_expr(n, &pcx);
         }
+        // (0.27.3: an exclusive view that IndexMut gives, `&mut s[1..]` of a
+        // String as `&mut *s.index_mut(1..)`, is read as the view, F26.3;
+        // asked before the call is checked into a Call)
+        let index_mut = pcx.nodes[operand].kind == NodeKind::MethodCall
+            && sym_is_c(pcx.nodes[operand].b, c"index_mut", &pcx);
         let ty = synth_expr(operand, &pcx);
         // (0.17, issue #1: `(*f)(10)` on a fn value, C's habit: the
         // value is called as it is)
@@ -1324,7 +1377,8 @@ fn synth_unary(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         // for &T with T = str; an exclusive one stays an error until Z9.1)
         let view = if ty > 0 && pcx.types[ty].kind == TyKind::Distinct { pcx.types[ty].a }
             else { ty };
-        if view > 0 && pcx.types[view].kind == TyKind::Slice && pcx.types[view].b == 0
+        if view > 0 && pcx.types[view].kind == TyKind::Slice
+            && (pcx.types[view].b == 0 || index_mut)
             && crate::front::known::on_std2(pcx) && crate::front::check::rust::rust_node(n, &pcx) {
             pcx.nodes[n] = pcx.nodes[operand];
             return ty;

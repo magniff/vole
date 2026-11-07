@@ -81,7 +81,225 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.1 | `v0.27.1` | 0.27.0 | aarch64-macos | the rust edition's borrow checker: NLL on the places IR (docs/design/borrowck.md), 18 `borrowck.*` codes with `explain`, 193 programs checked against rustc; Rust's `Copy` rule, reborrows, captures as loans, deferred `let`; contracts typed by the shared rule; 0.27.0's -O2 aliasing miscompile fixed; docs/design/contracts-effects.md |
 | 0.27.2 | `v0.27.2` | 0.27.1 | aarch64-macos | std2 the rust edition's std (1,032 of 1,413 std2 tests at -O0/-O2 under `--check-alloc`, gate 1); the front's rules (docs/design/front-rust.md: pattern and blanket impls, coherence, deref coercion, ranges, format specs); closures in full (kinds, captures, `Send`/`Sync`, bodies borrow-checked, `borrowck.unchecked` retired, E0594/E0596); `[T]`/`str` unsized; the borrow checker's verdict cache; every rust case on std2 |
 | 0.27.2.1 | `v0.27.2.1` | 0.27.2 | aarch64-macos | std2 1,306 of 1,454 tests at -O0/-O2 under `--check-alloc`; `impl Trait` returns (§21) and the opaque instance (§22, narrowed: FL11); implied outlives bounds (D4.6); three consumed-value miscompiles fixed (D8.5), E0508, two-phase `write`; the front's std2 gaps (F13, F14.2, F18.4, F9.2, F26.3); floats, `std::env`; contracts and effects R2 (std2 declared, 27 `requires`, 11 `ensures`); hello-rust 3.48x; the gate's std2 builds halved |
+| 0.27.3 | `v0.27.3` | 0.27.2.1 | aarch64-macos | the translator `fix --edition rust` and gate 2 (`tests/translate.sh`, the rustc twin); the i32 literal default (FL6); std2 1,402 of 1,472 tests at -O0; lazy std2 parsing (a rust hello world 2.32x MVS's); arrays' by-value IntoIterator |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.27.3
+
+The translator and gate 2. `volec fix --edition rust FILE|DIR` rewrites an MVS program into the rust edition, directed by its types: parameter modes become `&T`, `&mut T` or `T`, `&x` at a call becomes the borrow the parameter takes, `var` becomes `let mut`, a view becomes a slice, a struct holding a view gets a lifetime, std calls follow `compiler/std2/rewrite.tsv`'s rows by type, contracts are carried, and an integer literal MVS typed i64 is annotated where the rust edition's i32 default would change it. `tests/translate.sh` measures the round trip (translated, built in the rust edition, the same output), and the rustc twin runs what round-trips under rustc; the release gate's `translate` row prints both, informational until 0.27.4 (the counts are in docs/roadmap.md's 0.27.3 gate record). In the rust edition an unsuffixed integer literal now takes its type from its first use, and is i32 when nothing fixes it (FL6, F18.5). 1,402 of std2's 1,472 tests pass at -O0 (1,306 of 1,454 in 0.27.2.1). std2 is parsed lazily, by the items a program reaches, and a `println` with no holes writes its literal directly: a rust hello world's check costs 2.32x MVS's (3.48x). Arrays iterate by value (`std::array::IntoIter` over `ManuallyDrop`), a rust-edition union drops none of its fields, an `if` condition's temporaries drop before its branch (L3), and std2 gains floats' methods, Unicode's tables, `std::sync::atomic` and more of `std::env`. Gate 3's first run: `fix --edition rust compiler/src` stops at 50 parse and import errors, all three translator shapes (an `unsafe { }` operand, a raw-pointer `self`, an import its file already binds); 0.27.4 prints its count. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
+
+Not in 0.27.3, by name: inference from a later statement (FL1), `[T]` and `str` as their own types (FL10's second stage, Z9.1c step B) and the opaque instance's other type errors (FL11), all 0.27.4; a rust hello world within 2.0x of MVS's (enforced from 0.27.4); std2's `std::cli`, `std::gpu`, `fs`, `Mutex` and `mpsc`, and `embed` blocks in the rust edition.
+
+Gate 2's harness (twin273):
+
+- `tests/translate.sh`: the round trip. Each MVS program of a set is copied into `target/translate`, translated in place (default `volec fix --edition rust`; `--translator CMD`, `--identity`), built with `--edition rust`, run, and compared with the reference. The reference is the case's EXPECT, EXIT and STDERR lines, or the MVS build's output (bench, `--ref build`). The sets:
+  - `examples`: the tests/examples cases;
+  - `bench`: bench/, bench/std, bench/vecloop;
+  - `run`: tests/run's MVS cases that run;
+  - `guide`: the guide's MVS programs;
+  - `rust`: the rust corpus, the runner's own check.
+
+  It prints one count per set, a cause per failure (`no-translation`, `type CODE`, `borrowck CODE`, `link`, `crash`, `output`, `exit`, `stderr`, `timeout`), the codes by frequency and the failures that look like Q7's (a borrowck error on a line that borrows a literal or a constant). `-f LIST` selects the programs a list names, and `-j N` sets the jobs. tests/translate/causes.tsv, the translator's record of why, is grouped by cause; a cause for a program that now round-trips is reported as stale (`--triage` appends the new failures as `?`). The release gate's `translate` row runs it with `--twin` (below). It is informational until 0.27.4: it prints both counts and never fails. Results:
+  - the identity translator round-trips all 339 of the rust corpus's run cases;
+  - the translator at its first merge round-trips 600 of 1,575 programs: run 575 of 1,347, examples 3 of 83, bench 1 of 44 (at -O2), guide 22 of 104;
+  - Q7 (L2, rvalue static promotion): 0 failures borrow a literal or a constant, so L2 waits for a count that needs it.
+- The rustc twin's shim, `tools/rustc-twin/` (plan-0271 §2.2). prelude.rs is the part of `allocator_api` that stable rustc lacks: one global allocator `Gpa`, with the `_in` functions as extension traits over it (`new_in`, `with_capacity_in`, `from_in`, `Box::new_in`, `collect_in`, `to_string_in`, `clone_in`, `to_owned_in`, `default_in`, `from_iter_in`, a slice's and a str's `_in` methods, `lines_in`). twin.py makes a rust-edition program Rust and keeps its line numbers:
+  - main is wrapped;
+  - a type loses its allocator argument, and a generic `A: Allocator` becomes Gpa;
+  - the format functions become macros, and `format_in` and the free `X_in(.., gpa)` functions become their Rust names;
+  - the check attributes are dropped.
+
+  `tools/rustc-twin.sh CASE... [--guide]` runs a program under rustc and compares its stdout and exit code with the case's. A difference is named by `// RUSTC-DIFFERS: WHY` in the case, or in tools/rustc-twin/divergences.tsv for a program without a case. The rust corpus's run cases and the guide's rust-edition program: 304 of 341 agree, 5 named, 0 differ. `tests/translate.sh --twin` twins every program that round-trips, with one count per set: 366 of 598 agree at the translator's first merge. The differences are named in tools/rustc-twin/divergences.tsv: L7's field captures, and arrays' by-value IntoIterator. `--alloc-api` (in both tools, a manual mode) runs rustc as nightly (RUSTC_BOOTSTRAP=1) with Rust's own allocator_api (prelude_alloc.rs): `Vec<T, A>` and `Box<T, A>` are std's own, a String<A> wraps a Vec<u8, A>, and HashMap and HashSet hold their allocator. So a borrow of an allocator (`format_in(.., b.allocator())`, a String<&A>) is checked as rustc checks it: 305 of 348 agree on the rust corpus and the guide. Its summaries say `allocator_api, RUSTC_BOOTSTRAP=1`.
+- In the rust edition an `if`'s condition and a match guard are terminating scopes, as a `while`'s condition was (borrowck.md L3, the Rust reference's "Temporary scopes"): their temporaries drop before the branch or the arm runs. MVS's order is unchanged. Case `rust_b_ok_temp_if_cond_scope`, which twins with rustc.
+- Two cases agree with rustc on a temporary that holds a shared loan across a two-phase activation (D7.3): rejected when its type has a Drop impl, accepted otherwise. That is why `b.extend_from_slice(format_in(.., b.allocator()).as_bytes())` is rejected by both rustc and vole; `*b.allocator()` is accepted by both.
+- `tools/borrowck-twin.sh --shim`: the verdicts through the shim. The gate row uses it: 365 of 400 agree (358 with `--std2`), 10 divergences, 0 mismatches. Seven `// RUSTC: none` markers ("no allocator until 0.27.3") are gone.
+- `tests/translate.sh --record query|refactor`: the migration surface's record mode. Each transcript's program is translated in a copy, the suite's runner re-records the transcripts (`-u`), and the result is a diff to review (target/translate/record/SUITE.diff). With the identity translator, 0 of 42 query transcripts change. With the translator's first merge, 35 of 42 change (2,198 lines to review; 34 programs translated, 1 not). `tests/guide/run.sh --split DIR` writes the guide's blocks out for the runners.
+
+The translator (tr273):
+
+- `volec fix --edition rust FILE|DIR` translates an MVS program into the rust edition, in place (`--dry-run`: the diff only; `--list-left`: each place left to hand, `note fix.edition_left`). It is type-directed: the MVS front checks the program, and what it resolved decides each rewrite (`guide fix#edition`, `explain fix.edition_left`):
+  - parameters: a let `x: T` is `x: &T` where MVS borrows and `T` for a copy, `inout T` is `&mut T`, `sink T` is `T` (`mut` when the body changes it), a view `[T]` is `&[T]` (`&str` in a program that uses its bytes only as text); receivers are `&self`, `&mut self` and `self`;
+  - bodies: `var` is `let mut`, `inout r = &v` is `let r = &mut v`, the inout marker `&x` is `&mut x`, a borrow MVS makes is written `&x`, an access Rust does not dereference by itself is `*r`, `v.len` is `v.len()`, `println(x)` is `println("{}", x)`, a literal MVS types as i64 by default is annotated, an i64 index is cast `as usize`;
+  - statics and pointers: `static var` is `static mut`, and each use outside unsafe code is put in `unsafe { }`; a raw pointer `*T` is `*mut T`, and its element `p[i]` is `(*p.add(i))`;
+  - items: the derives get Rust's names (`Eq` with `PartialEq`, `Ord` with `PartialOrd`), the copy types derive Clone and Copy, Display's `fmt` returns its Result, an operator impl gets its `Output`, and a view result of a function that takes no reference is `&'static`;
+  - std: each call with a rewrite.tsv row is written as the row says, chosen by type (`T: Copy`, `use=read`), with the row's `!` cases left to hand; std's paths become std2's, and the imports std2 needs are added. A closure literal that a row calls in place is inlined, its parameters bound to the arguments, and the `sort_by` rows dereference a Copy element.
+- Struct regions: a struct or enum holding a view (`[T]`, `str`, a `let T` or `inout T` field, or another such type) is generic over its region, `struct Tok<'a> { text: &'a str }`, used as `Tok<'_>` elsewhere, or `Tok<'static>` as the result of a function that takes no reference; where elision does not decide, `'_` stays for a hand fix. Contracts carry over: their clauses are translated as the body is (`*v`, `old(v.len())`).
+- FL6 (front273): an i64 literal at a generic position gets `i64` (`fold(0i64, ..)`, `Some(4i64)`, `(0i64..n).map(..)`), and a literal-only `let` its `: i64`; a text literal given as bytes is `b".."`; a raw pointer's part is `std::slice::from_raw_parts(..)`.
+- Gate 2's counts, round-tripping through the translator: run 734 of 1,347, bench 15 of 44, examples 4 of 83. In 0.27.2.1 they were 598, 5 and 3. tests/translate/causes.tsv classifies the rest: std2 175 (`std::cli`, `std::gpu`, `Scanner`, `sync::Mutex`, `fs`, which are 0.27.4's), front 17 (`embed` blocks), borrowck 63, translator 454. The run corpus (tests/translate/corpus1.txt): 41 of 50.
+
+The front (front273):
+
+- FL6, the i32 literal default (front-rust.md F18.5): in the rust
+  edition an unsuffixed integer literal with no context is an `i32`, as
+  Rust's, and an unannotated `let` of literals is an integer inference
+  variable, solved by its first use that gives it a type: an expected
+  type (an argument, an annotation, the return, a field, `&x` where
+  `&[u8]` goes, `a[0]`, `&a[..]`), the other operand of an operator, an
+  assignment's value (`s += m.v`), a generic call's argument. `x += 1`,
+  `x = 0` and `x < 10` keep it open; `let r = &x;` links r to x; a
+  closure closes what it captures when it is checked. Around it, as
+  rustc's: `&1` where `&T` goes is a T (`m.get(&1)`, `x.total_cmp(&0.0)`),
+  a parameter's bound picks a literal's type through another
+  parameter's bound (`K: Borrow<Q>`), an array of literals at a generic
+  call takes the expected type's element (`Vec::from_in([1, 2], gpa)`),
+  a closure argument is typed before the literal arguments when it can
+  be (`map_or(0, |x| x + 1)`), `S(7)` of a tuple struct takes the
+  expected type's arguments, and `-1` where an unsigned type goes is an
+  error (E0600). The early closes that diverge from rustc are FL6's,
+  by name; the corpus writes `1i64` where it meets one (31 cases). MVS
+  is unchanged: its fallback stays `i64`, and no local is open.
+- `b"..."` byte strings parse and are `&[u8]` (F23.2, FL12).
+- `Tr::f(args)` takes Self from the expected type only when f returns
+  `Self` (`Step::steps_between(&a, &b)` inside an impl, F8.2).
+- `&T as *const U` with U not T is an error, rustc E0606 (F29.1); it
+  read a T as a U.
+- A bound that names no trait in scope no longer crashes a derived
+  impl's supertrait check (`derive_generic.vl` read in the rust edition).
+- front-rust.md names FR5 (integer widening) and FR6 (an index of any
+  integer type), the rust edition's lenient MVS rules.
+- On std2 a `&str` is Copy and clones by copying (F0.4): `parts.iter()
+  .copied()` over a `[&str]`, `Option<&&str>::copied`, `r.clone()` of a
+  `&&str`, `repeat_n("a", 2)`; of two impls a `&str` makes alike
+  (`Extend<T>`, `Extend<&'a T>` of a `Vec<&str>`) the by-value one is
+  taken (F26.3).
+- `TryFrom::try_from(x)` takes Self from an expected `Result<Self, _>`
+  (F8.2), and `x.try_into()` against an expected `Result<U, _>` is
+  `U::try_from(x)`; without an expected type (a match's scrutinee, a
+  generic instance) U waits for FL1 (0.27.4).
+- A range value indexes a slice, an array or a str through Index (`a[r]`
+  with `r: Range<usize>`, a RangeFull; a read, F26.3); a RangeFull's
+  RangeBounds parameter comes from the expected type
+  (`r.start_bound()` as a `Bound<&i64>`, F14.1).
+- A `&mut self` method of str on a String's index borrows it through
+  IndexMut (`s[1..].make_ascii_uppercase()`, `&mut s[1..]`), and needs
+  the String mutable (own.readonly, rustc E0596).
+- A `&mut self` method of a generic trait called on a `let` binding,
+  `s.index_mut(r)`, is own.readonly as any other `&mut self` method
+  (F6.3, rustc E0596); 0.27.2.1 accepted it.
+- Known gap: `index_mut` on a `&mut [T]` receiver (`(&mut a[..])
+  .index_mut(r)`, and so `&mut v[r]` with a range value r) is refused as
+  "calling a method through a raw pointer is unsafe".
+
+std2 (std273):
+
+- f64's and f32's methods, Rust's names and meanings (front-rust.md
+  F15.4's "come in 0.27.3"): `floor`, `ceil`, `round`,
+  `round_ties_even`, `trunc`, `fract`, `abs`, `signum`, `copysign`,
+  `is_nan` and the other tests, `min`, `max`, `clamp` (which panics on
+  min > max), `recip`, `to_radians`, `to_degrees`, `sqrt`, `cbrt`,
+  `hypot`, the trigonometric functions, `exp`, `exp2`, `ln`, `log2`,
+  `log10`, `log`, `powi`, `powf`, `next_up`, `next_down`, `div_euclid`,
+  `rem_euclid`, `total_cmp`, `to_bits`, `from_bits`. They live in
+  std2's private `fmath` module, which uses MVS's std::math algorithms
+  (fdlibm's, no libm). The transcendental functions are within an ulp
+  or two of the libm Rust calls: their cases print 12 digits. `mul_add`
+  is not in.
+- char's classification and case use Unicode's tables (18.0.0, MVS's),
+  in a private `unicode` module, in place of std2's approximations:
+  `is_alphabetic`, `is_numeric`, `is_whitespace`, `is_lowercase`,
+  `is_uppercase`, `to_uppercase` (`ß` gives `SS`), `to_lowercase`.
+  `str::to_lowercase_in` applies Final_Sigma (`ΟΔΟΣ` gives `οδος`).
+  The tables are str literals, because the front has no `b"..."` yet.
+  char's and str's Debug escape the controls and every white space
+  but `' '`, as Rust's do.
+- `std::sync::atomic`, std::sync's first part: `Atomic<T>`, plus Rust's
+  `AtomicBool`, `AtomicI8` .. `AtomicUsize` and `AtomicPtr` as its
+  aliases, `Ordering`, `fence` and `compiler_fence`. The intrinsics are
+  lowered by name, as MVS's are (Z3.1). A `static` atomic works. A
+  load with Release, or a store with Acquire, panics, where rustc
+  rejects it at compile time.
+- `std::env`: `vars_in(a)`, an iterator of `(String<A>, String<A>)`;
+  `current_dir_in(a)`, a `String<A>`, since std2 has no PathBuf yet;
+  `set_current_dir`. The target's `environ` is in `std::__sys`.
+- char is PartialEq, Eq, PartialOrd, Ord, Hash and Default; `()` is
+  PartialEq, Eq, PartialOrd and Ord. Through `#[array_builtin]`,
+  `[T; N]` is Clone, PartialEq, Eq, PartialOrd, Ord, Hash and Debug,
+  and `&[T; N]` and `&mut [T; N]` are IntoIterator (`for x in &arr`,
+  `derive(Clone)` on a struct with an array field). An array's Hash
+  waits for FL10, as a slice's does. `&[u8]`'s `read_exact` leaves buf untouched at
+  the end, as Rust's does. Fixed std2 bodies: Drain's and Cycle's
+  `size_hint`, and Range's `size_hint`, now `A::steps_between`.
+- rewrite.tsv gains 55 rows for the translator: MVS's math functions
+  become methods, the unicode code-point tests become char's,
+  `f64_to_bits` becomes `to_bits`, `parse_int` and `parse_f64` become
+  `str::parse`, and the env items.
+- std2's cases at -O0 and -O2 under `--check-alloc`: 1,361 of 1,468
+  pass (1,309 of 1,454 in 0.27.2.1, with the other streams' merged
+  fixes counted). There are 15 new cases, each agreeing with rustc
+  (tools/std2-twin.sh), and 10 XFAIL cases now pass on std2's fixes. The 107 XFAIL cases left, by
+  what they wait for: inference from a later statement or the expected
+  type (FL1, 0.27.4) 48; arrays' by-value IntoIterator, which needs
+  const generics or a ManuallyDrop (a union's field is dropped today)
+  27; the integer literal's type from its use (FL6) 12; `[T]`/`&[T]`
+  and the view receivers (FL10) 11; `format_args` 4; `write(w, ..)` on
+  an io::Write 1; and 4 front singles: an empty enum's match, a
+  supertrait default through a bound, Cloned's DoubleEndedIterator
+  bound, and an Index bound on a type parameter. None waits for a
+  std2 body.
+
+The front's views, contracts and borrowck singles (front273b):
+
+- Z9.1's second part, stage 1 (front-rust.md Z9.1b, FL10): in the rust
+  edition `&mut X` of a reference-written view (`&mut &[u8]`, `&mut
+  &str`), of Self in an impl for `&[T]` or `&str`, and of a Sized type
+  parameter is a pointer to the view, not the exclusive view; `?Sized`
+  is recorded on the parameter. 23 std2 cases pass (io's `Read for
+  &[u8]`, patterns). Stage 2, `[T]` its own type (Z9.1c), is specified.
+- A `requires` call's implicit `&mut` receiver of a view (a temporary
+  `&mut` receiver) is bound exclusive (T3), not checked as a shared
+  borrow.
+- A trait default body's `requires` and `ensures` clauses are written
+  into each impl that uses the default (C7.6), as a declaration's are.
+- The borrow checker reads a substitution's impl bounds (borrowck.md
+  L14): an equality bound through a supertrait, an Fn bound's
+  signature, recursively and through blanket impls. 10 std2 cases pass.
+- A `static mut` is unsafe to read or write in the rust edition
+  (F19.6, rustc E0133).
+- `write(w, ..)` on an io::Write goes through std2's IoFmt (F16.3).
+- A struct's, enum's or trait's `where` predicate is no function's
+  (F10.1): the parser made Flatten's a bound of the function before it,
+  Cloned's `next_back`, so Cloned's DoubleEndedIterator now resolves.
+- A rust-edition union drops none of its fields (F19.7); rustc's E0740
+  for a field that needs a drop is FL12, a named divergence.
+- Arrays' by-value IntoIterator (FL13): std2's `std::array::IntoIter<T,
+  [T; N]>` over a `ManuallyDrop<[T; N]>` (a union), `#[array_builtin]`
+  until const generics (0.29), where Rust has `IntoIter<T, N>`.
+  `a.into_iter()` and `for x in a` move the elements out, by rustc's
+  probe order (by value before `&[T; N]` and the slice); what is not
+  yielded drops with the iterator. A pattern impl's trait defaults
+  (F12.3) and its drop are found by its header. 24 std2 cases pass, and
+  4 new rust cases twin with rustc (a partly consumed `[String; 3]`
+  under `--check-alloc`, an early `break`).
+
+Compile cost and the machine's load (cost273):
+
+- **std2 is parsed lazily** (front/modules/std2lazy.vl). Its text is still
+  lexed whole, then split into units: each item, each method of an inherent
+  impl, and each default method of a trait (with its trait's header and
+  required items). A build keeps only the units the program reaches by name:
+  its own words, the known items and the names the compiler's lowerings and
+  made code use; an item by its name, a trait by any of its items' names, a
+  method once its type or trait is reached, a trait impl once both are. The
+  rest is never parsed, derived, expanded (`#[builtin_impls]`) or collected.
+  A lazy build with errors is made again with std2 whole, so its
+  diagnostics are the whole std2's. Queries, `--std2-check` and
+  `VOLE_STD2_EAGER=1` read std2 whole. The rust and std2 cases at -O0 give
+  the same verdicts lazy and eager (2,095), and a sample's code is the same
+  (85 of 85, after renumbering).
+- **A lighter println**: on std2, `println("hello")` (`print`, `eprint`,
+  `eprintln`) with a literal that has no hole is written as a format
+  literal: its text through the Formatter's `write_str`, as Rust's. It no
+  longer goes through str's Display and `Formatter::pad`, whose padding,
+  char counting and UTF-8 encoding every hello world compiled.
+- hello-rust from 371M instructions (3.76x its MVS row) to 231M (2.32x),
+  `tests/compile_cost.sh`; std-rust from 729M to 637M; MVS's rows not
+  dearer (hello 1.01x, std 1.00x, check 1.00x, rust 1.00x of 0.27.2.1).
+  What is left over the 2.0x ceiling: std2 is still lexed whole, its builtin
+  impls are made for every primitive, and its big modules are few units
+  (0.27.4).
+- The hooks' case "the check after the fixes timed out" gives the two real
+  calls before it 8 s (scaled by the load up to 64 s), not 3 s: at 3 s
+  (24 s under load) it failed in every suite row of 0.27.2.1's gate.
 
 ### What's new in 0.27.2.1
 

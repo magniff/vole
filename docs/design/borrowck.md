@@ -1214,7 +1214,15 @@ outside the holes named below.
   (slice.vl's `empty_mut`). Case `rust_b_err_promote_const`.
 - L3 Temporaries' scopes are vole's (the statement; the block for `let
   r = &f(x)`), not Rust 2024's tail-expression rule: a difference only
-  in `match`/block tail temporaries.
+  in `match`/block tail temporaries. (0.27.3) In the rust edition the
+  condition of an `if` and a match arm's guard are terminating scopes,
+  as a `while`'s condition already was (the Rust reference, "Temporary
+  scopes"): their temporaries drop once the condition or the guard is
+  evaluated, before a branch or the arm runs (`if mk().id == 1 { .. }`
+  drops `mk()`'s value before the block). MVS keeps them to the end of
+  the statement. Still the statement's in both editions: a match arm's
+  body and a lazy `&&`/`||`'s right operand, which Rust also ends at
+  their own evaluation.
 - L4 NLL only: problem case 3 (a conditional return of a borrow) is
   rejected as rustc's NLL does; the location-sensitive solve is
   0.27.4's. Also rustc's NLL limitations shared on purpose: one region
@@ -1267,6 +1275,23 @@ outside the holes named below.
   of one substitution with nothing between them; rustc's closure
   signature is higher-ranked there (`for<'p> FnMut(&'p i64)`). Cases:
   `std2_iter_adapters_map`, `_inspect`, `_map_while`, `_scan`.
+  *Closed in 0.27.3:* for a type parameter's substitution `s` and each
+  trait `Tr` of its bounds, the one impl of `Tr` for `s` (a direct impl,
+  else the one blanket impl, `impl<I: Iterator> IntoIterator for I`) has
+  its own D4.6 (d) read in `s`'s slots, as its instance assumes it: an
+  equality bound `Q: Tr2<A = P::B>` of the impl ties `Q::A`'s slots and
+  `P::B`'s (each normalized through `Q`'s and `P`'s substitutions inside
+  `s`, through supertraits: `B: DoubleEndedIterator<Item = A::Item>`
+  names Iterator's Item); an Fn bound `F: FnMut(I::Item) -> B` (or
+  `FnMut(&I::Item)`) of a closure substitution `C` ties each X_C
+  position to the bound's slot there (D19.10 (4)); and so on for the
+  impls the impl's parameters meet their own bounds by (`Copied<Rev<Chain<..>>>`).
+  Sound: each tie is an equality the impl's instance assumes and the
+  caller's call of it requires. *Anchor:* `places/regions.vl:
+  impl_bound_ties, impl_fn_ties`. Case `rust_b_ok_l14_impl_bound_ties`;
+  std2's 10: `std2_iter_iterator_chain`, `_map`, `_map_while`, `_scan`,
+  `_inspect` and `std2_iter_adapters_chain`, `_chain_impl_doubleendediterator`,
+  `_map`, `_mapwhile`, `_scan`.
 
 ## 12. The MVS std boundary (S12, 0.27.1 only)
 
