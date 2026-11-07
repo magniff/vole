@@ -146,12 +146,12 @@ The translator (g3274):
   edition; it prints `gate3: N errors (by code: ...)`. The release
   gate's `gate3` row (--release) runs it, informational: it fails only
   when the translator or the check cannot run. N went 309 (33 parse
-  errors hiding the rest) -> 1,414 (the real first wall) -> 160 (by
-  code: 134 type error, 21 unsafe, 2 distinct.mix, 2 edition.lenient,
-  1 item.private). Of the 160, 110 are std2's missing modules and items
+  errors hiding the rest) -> 1,414 (the real first wall) -> 122 (by
+  code: 117 type error, 2 distinct.mix, 2 edition.lenient,
+  1 item.private). Of the 122, 110 are std2's missing modules and items
   (`std::cli`'s `Matches` above all, `fs`, `process`, `gpu`,
-  `env::get_in`, `count_ones`) and 38 an index through `&mut [T; N]`
-  (the front's); borrowck's errors come after the type errors.
+  `env::get_in`, `count_ones`); borrowck's errors come after the type
+  errors.
 - The first wall's three shapes: a static's `unsafe { }` that starts a
   statement and is an operand there is `(unsafe { .. })`, and a method
   on a static through the receiver's borrow wraps the call, not a copy;
