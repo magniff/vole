@@ -789,9 +789,14 @@ project's rule: every error of a compilation), deduped by §14.3.
    *mut T = &mut S;`: rustc "creating a mutable reference to mutable
    static"); the help is the raw address `&raw mut S`. Only `&raw const
    S` and `&raw mut S` (front-rust.md F30.2: `BK_RAW`, R1, no loan) take
-   it. ir271 implements it at the front (the borrow expression's operand
-   is a `static mut` item, and the `&` is not a raw borrow), so no loan
-   of a `static mut` reaches the solve.
+   it. A place under the deref of a raw borrow (`*&raw mut S`,
+   `(*&raw const S).f`) is a place through that raw pointer, not a part
+   of `S`: a reference to it (a method's autoref, `(*&raw mut S).push(2)`;
+   `&mut *&raw mut S`) is no reference to the static, as in rustc (0.27.4;
+   the builder does not fold `*&raw mut S` back to `S`, as it folds
+   `*&x`). ir271 implements it at the front (the borrow expression's
+   operand is a `static mut` item, and the `&` is not a raw borrow), so no
+   loan of a `static mut` reaches the solve.
 
 ## 7. Two-phase borrows (S7)
 
