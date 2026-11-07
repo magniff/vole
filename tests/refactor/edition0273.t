@@ -9,7 +9,7 @@
 ## `fmt` result, an operator's `Output`, std's paths; written, then built
 ## and run in the rust edition with the MVS program's output.
 $ fix --edition rust --list-left main.vl
-fixed, 1 parameter to &T, 2 parameters to &mut T, 3 receivers, 6 views to &[T], 2 '&x's to '&mut x', 1 borrow written '&x', 2 accesses written '*r', 5 vars to 'let mut', 1 inout local, 1 print given its format, 4 integers annotated, 1 static var to 'static mut', 2 imports, 5 types, 4 std calls by rewrite.tsv, 2 text views to &str, 4 static mut uses put in unsafe, 1 index cast to usize, 2 copy types derived Clone, Copy	main.vl	+31 -30 lines
+fixed, 1 parameter to &T, 2 parameters to &mut T, 3 receivers, 6 views to &[T], 2 '&x's to '&mut x', 2 borrows written '&x', 2 accesses written '*r', 5 vars to 'let mut', 1 inout local, 1 print given its format, 6 integers annotated, 1 static var to 'static mut', 2 imports, 5 types, 4 std calls by rewrite.tsv, 2 text views to &str, 4 static mut uses put in unsafe, 1 index cast to usize, 2 copy types derived Clone, Copy	main.vl	+34 -33 lines
 % cat main.vl
 // fix --edition rust (0.27.3): an MVS program of each rewrite kind.
 use std::fmt::Debug; use std::ops::Add; use std::fmt::Display; use std::fmt::Formatter as Fmt; use std::alloc::Allocator; use std::collections::HashMap;
@@ -38,7 +38,7 @@ fn label(n: i64) -> &'static str { if n > 10 { "big" } else { "small" } }
 
 fn sum(v: &[i64]) -> i64 {
     let mut t: i64 = 0;
-    for x in v {
+    for &x in v {
         t += x;
     }
     t
@@ -66,7 +66,7 @@ fn main(gpa: Gpa) {
     let r = &mut k;
     *r += 10;
     let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
-    for x in [4, 1, 3] {
+    for x in [4i64, 1, 3] {
         v.push(x);
     }
     v.sort_unstable();
@@ -77,7 +77,7 @@ fn main(gpa: Gpa) {
     println("{}", label(total(&l)));
     println("{} {} {} {}", l.count(), k, v[0usize], sum(&v[1..]));
     println("{} {} {}", a + b, seen.contains_key(&1), unsafe { CALLS });
-    let arr = [7, 8, 9];
+    let arr = [7i64, 8, 9];
     let i: i64 = 1;
     let calls_now = unsafe { CALLS }; println("{} {calls_now} {}", arr[(i + 1) as usize], none() == 0 as *mut u8);
     let w = first_word("hello");
