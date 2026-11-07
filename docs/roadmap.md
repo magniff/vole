@@ -2887,6 +2887,29 @@ unsafe-audit 2775 unjustified (baseline 2775, from 3057) and 0 in std,
 chain-diverse, chain-fresh 40 releases. compile-cost against v0.26.5: a
 hello world 1.00x, std 0.99x, check of the compiler 1.01x.
 
+### 0.27.3
+
+The release gate (`gate.sh --release --no-linux -j 4`), macOS only, at
+load 7 to 11 on 10 CPUs: every row passed on its first run. The rows:
+the suite 6746 at -O0, -O1 and -O2 (174 XFAIL; SKIPPED: no spirv-val),
+std2-tests 1402 at -O0 and -O2 under --check-alloc (70 XFAIL, gate 1:
+1000), std2-check 1381 bodies (1378 clean, 0 with borrowck errors, 3
+not solved; 0 XFAIL cases with borrowck errors in std2), threads
+15277, incremental 172 series, objcheck 12896 (and 264 for
+x86_64-macos), compiler-memcheck 727, examples-checkalloc 183, every
+fuzz and ABI row, stress-grow, cachediff 1476 lines (425 from the
+cache), borrowck-twin 404 cases (369 agree, 10 named divergences, 25
+outside the subset, 0 mismatches), unsafe-audit 2773 unjustified
+(baseline 2773) and 0 in std, chain-fresh (44 releases from the seed),
+chain-diverse, and the new translate row: 840 of 1474 programs
+round-trip through `fix --edition rust`, and the rustc twin agrees on
+493 of the 840. compile-cost against v0.27.2.1: a hello world 1.01x,
+std 1.00x, check of the compiler 1.01x, the rust row 1.00x; hello-rust
+2.32x its MVS row (printed; the 2.0x ceiling is enforced from 0.27.4),
+std-rust 0.57x. Gate 3, `fix --edition rust` on a copy of
+compiler/src, first measured at 50 errors, all from three translator
+shapes at the parse and import stage (the gate3 row comes in 0.27.4).
+
 ### 0.27.2.1
 
 The release gate (`gate.sh --release --no-linux -j 5`), macOS only. Its
