@@ -176,6 +176,18 @@ The front (front273):
 - A `&mut self` method of a generic trait called on a `let` binding,
   `s.index_mut(r)`, is own.readonly as any other `&mut self` method
   (F6.3, rustc E0596); 0.27.2.1 accepted it.
+- FL11: a template's opaque instance (borrowck.md §22) reports its type
+  errors as rustc does (`x + x` of `T: Add<Output = T>` returned as an
+  i64, E0308), where 0.27.2.1 reported only the bound-only rule's. The
+  model gained what that needs: operators on a type parameter through
+  its bounds, a bound's type arguments (`S: AsRef<str>`) and a trait
+  parameter's default (`Rhs = Self`), `T::default()` and `T::CONST`,
+  `*d` with `Deref`, `g[i]` with `Index`. An instance that meets a gap
+  left (a generic method of a generic trait, a `where` predicate, a
+  bound unresolved while it is made) is unsure, and its errors are
+  forgotten; std2-check stays at 0.
+- `g[i]` of a `g: &G`, G a struct with Index, reads through the reference
+  (F26.3).
 - Known gap: `index_mut` on a `&mut [T]` receiver (`(&mut a[..])
   .index_mut(r)`, and so `&mut v[r]` with a range value r) is refused as
   "calling a method through a raw pointer is unsafe".
