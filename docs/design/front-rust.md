@@ -969,6 +969,13 @@ rustc E0512) and the bits are reinterpreted (a move, no drop of `x`).
 `char::from_u32_unchecked` is written with it (M3a's gap 11; the
 `*const u32 as *const char` spelling is Z9.3-legal too).
 
+**F19.6 (`static mut`).** In a rust-edition position a read or a write of
+a `static mut` item is an unsafe operation (`error unsafe`, rustc E0133):
+inside `unsafe { }` or an `unsafe fn`'s body only. A reference to one is
+D6.2.5's error either way. An MVS `static var` is unchanged (safe).
+*Anchor:* `front/check/names.vl: synth_name` (`U_STATIC_MUT`). Case
+`rust_f_f19_static_mut_err`.
+
 ### F22 `for` loops
 
 **F22.1 (desugaring).** In a rust-edition position
@@ -1481,6 +1488,10 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   (`impl Pattern for &str`). 0.27.2.1 has the parts that do not need it:
   `size_of_val` of a view (its length times the element's size) and
   `size_of::<[T]>()`/`size_of::<str>()` as `type.unsized`.
+  (0.27.3) Stage 1 is Z9.1b. Until stage 2, a view written as an
+  element or argument, `Vec<[i64]>`, is the view (`Vec<&[i64]>`) and is
+  accepted; rustc rejects it (E0277), F21.2's `type.unsized` under stage
+  2 (rust_capture_view_copy writes `Vec<&[i64]>`).
 - **FL11 (the opaque instance's type errors; later, 0.27.3).**
   borrowck.md D22.2: in 0.27.2.1 an opaque instance reports only the
   bound-only rule's error (D22.3) on a parameter's own Ω, with no `where`
