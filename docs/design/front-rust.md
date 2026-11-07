@@ -1032,7 +1032,10 @@ statement, `let a = [1, 2]; f(&a)` with `f(&[u8])`) are F18.5's.
 edition an unannotated `let x = e;` binding one name, with `e` a literal
 tree (an unsuffixed integer literal, its negation, an array, a repeat or
 a tuple of literal trees, where a tuple's other elements are any
-value, an arithmetic operator of two literal trees), makes `x` **open**:
+value, an arithmetic operator of two literal trees; 0.27.4: an `if`
+with an `else`, or a `match`, whose every branch's value, its block's
+tail, is a literal tree, `let e0 = if c { 1 } else { 0 };`, and a block
+whose tail is one), makes `x` **open**:
 its integer positions are inference variables. So does `let r = &x;` (or
 `&mut x`) of an open `x`: `r` is a **link**, its type `&` of `x`'s;
 solving one solves the other, closing one closes both. Until it is
@@ -1044,9 +1047,10 @@ return or tail, a struct field, an assignment's target type, `&x` where
 `&τ`, `*const τ` or `&[τ]` goes, `a[i]` and `&a[..]` of an open array
 where `τ` or `&[τ]` goes), matched with the provisional type where the
 variables are; (b) an operand of a binary operator whose other operand
-has a definite integer type (`i < v.len()`: `usize`); (c) the target of
-`x = e` or `x op= e` with `e` of a definite type (`s += m.v`, `kv =
-e.remove_entry()`; `s += x` of an `x: &i64` reads through it); (d) a
+has a definite integer type (`i < v.len()`: `usize`), so a `for`
+range's start whose end has one (`for i in e0..np`, 0.27.4); (c) the
+target of `x = e` or `x op= e` with `e` of a definite type (`s += m.v`,
+`kv = e.remove_entry()`; `s += x` of an `x: &i64` reads through it); (d) a
 generic call's argument, placed with the untyped literals (F18.1 step
 (2)), so that it takes the type the other arguments or the expected type
 bind. These uses keep it open and are retyped when it is solved: `x op=
