@@ -14,7 +14,8 @@
 #   -c COMPILER     the volec to build with (default: target/volec, else
 #                   target/tools/volec)
 #   -j N            programs at once (default 4)
-#   -O LEVEL        the level every program is built at (default 0)
+#   -O LEVEL        the level every program is built at (default 0, and 2
+#                   for bench, whose programs are sized for it)
 #   -s SETS         the sets, comma separated (default examples,bench,run):
 #                     examples  tests/examples/*.test, each its SOURCE's
 #                               directory, with the case's directives
@@ -40,8 +41,9 @@
 #                   expansion) is run with the copy's root file as its last
 #                   argument, or in place of a `{}` word, in the copy's
 #                   directory, and rewrites the copy in place (default:
-#                   COMPILER fix --edition rust). Its exit code 1 with the
-#                   root's first line `// EDITION: rust` is a translation
+#                   COMPILER fix --edition rust). Its exit code 1 with a
+#                   line `// EDITION: rust` in the root (the translator puts
+#                   it last, every other line kept where it is) is a translation
 #                   that leaves errors (the build then names them); any
 #                   other non-zero exit is the cause `no-translation`
 #   --identity      no translator: the copy is compiled as it is (on the
@@ -64,6 +66,10 @@
 #                   tools/rustc-twin/divergences.tsv) or outside (the shim
 #                   cannot make it Rust, or rustc rejects it); one count
 #                   per set
+#   --alloc-api     the twin with Rust's own allocator_api (rustc as nightly,
+#                   RUSTC_BOOTSTRAP=1: tools/rustc-twin.sh --alloc-api), so
+#                   that a borrow of an allocator is checked as rustc's; its
+#                   lines say `rustc twin (allocator_api)`
 #   -f LIST         only the programs LIST names, one per line (# comments):
 #                   NAME, SET/NAME or a path (tests/run/NAME.vl,
 #                   tests/run/NAME/main.vl, tests/examples/NAME.test,
@@ -126,7 +132,7 @@ export VOLE_CODE_CACHE
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 COMPILER=""
 JOBS=4
-OPT=0
+OPT=""
 SETS=examples,bench,run
 TRANSLATOR=""
 IDENTITY=0
@@ -135,6 +141,7 @@ CLASSES="$ROOT/tests/translate/causes.tsv"
 LISTS=""
 TRIAGE=0
 TWIN=0
+ALLOC=0
 RECORD=""
 LIST=0
 VERBOSE=0
@@ -155,6 +162,7 @@ while [ $# -gt 0 ]; do
 "; shift 2 ;;
         --triage) TRIAGE=1; shift ;;
         --twin) TWIN=1; shift ;;
+        --alloc-api) ALLOC=1; shift ;;
         --record) [ $# -ge 2 ] || usage; RECORD=$2; shift 2 ;;
         -l) LIST=1; shift ;;
         -v) VERBOSE=1; shift ;;
@@ -199,7 +207,7 @@ if [ -n "$RECORD" ]; then
         # shellcheck disable=SC2086
         (cd "$d" && $TRANSLATOR "$d/main.vl") >"$R/logs-$RECORD/$name.out" 2>&1
         rc=$?
-        if [ $rc -eq 0 ] || { [ $rc -eq 1 ] && [ "$(head -1 "$d/main.vl")" = "// EDITION: rust" ]; }; then
+        if [ $rc -eq 0 ] || { [ $rc -eq 1 ] && grep -q '^// EDITION: rust *$' "$d/main.vl"; }; then
             ntr=$((ntr + 1))
         else
             nbad=$((nbad + 1))
@@ -227,7 +235,7 @@ case ",$SETS," in
     *,guide,*) sh "$ROOT/tests/guide/run.sh" --split "$ROOT/target/translate/guide-blocks" || exit 2 ;;
 esac
 exec python3 -I - "$ROOT" "$COMPILER" "$JOBS" "$OPT" "$SETS" "$TRANSLATOR" "$REF" \
-    "$CLASSES" "$TRIAGE" "$LIST" "$VERBOSE" "$LISTS" "$TWIN" "$@" <<'PY'
+    "$CLASSES" "$TRIAGE" "$LIST" "$VERBOSE" "$LISTS" "$TWIN" "$ALLOC" "$@" <<'PY'
 import os
 import re
 import shlex
@@ -237,8 +245,12 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 (ROOT, COMPILER, JOBS, OPT, SETS, TRANSLATOR, REF, CLASSES, TRIAGE, LIST,
- VERBOSE, LISTS, TWIN) = sys.argv[1:14]
-FILTERS = sys.argv[14:]
+ VERBOSE, LISTS, TWIN, ALLOC) = sys.argv[1:15]
+FILTERS = sys.argv[15:]
+ALLOC = ALLOC == "1"
+OPT_GIVEN = OPT != ""
+OPT = OPT or "0"
+TWIN_NAME = "rustc twin (allocator_api, RUSTC_BOOTSTRAP=1)" if ALLOC else "rustc twin"
 sys.path.insert(0, os.path.join(ROOT, "tools", "rustc-twin"))
 from twin import directives, trimmed, stdout_differs, to_rust, rustc_build, rust_edition, find_rustc  # noqa: E402
 TWIN = TWIN == "1"
@@ -304,7 +316,10 @@ def programs():
                 if "// bench-std: data" in src or not re.search(r"^fn main\(", src, re.M):
                     continue  # (reads a file bench/std/run.sh makes; a module)
                 name = (sub[len("bench"):].lstrip("/") + "/" if sub != "bench" else "") + f[:-3]
-                out.append(("bench", name, p, None, directives(p), False))
+                d = directives(p)
+                if not OPT_GIVEN:
+                    d["level"] = "2"  # (sized for -O2, as bench/run.sh builds them)
+                out.append(("bench", name, p, None, d, False))
     if "guide" in SETS:
         gdir = os.path.join(WORK, "guide-blocks", "blocks")
         for b in sorted(os.listdir(gdir)):
@@ -375,7 +390,8 @@ def build(entry, cwd, d, out, rust, log):
     flags = [f.replace("@ROOT@", ROOT) for f in d["flags"]]
     cs = [os.path.join(ROOT, c) for c in d["csource"]]
     # (as tests/run.sh: --check-unsafe needs the IR, -O1 for -O0)
-    level = "1" if OPT == "0" and "--check-unsafe" in flags else OPT
+    opt = d.get("level", OPT)
+    level = "1" if opt == "0" and "--check-unsafe" in flags else opt
     cmd = [COMPILER, f"-O{level}"] + (["--edition", "rust"] if rust else []) + flags
     if d.get("cheader"):
         r = subprocess.run(cmd + ["--emit-header", entry, "-o", os.path.join(cwd, d["cheader"])],
@@ -461,14 +477,18 @@ def twin(key, w, mine, src, d, want):
     text = open(mine, encoding="utf-8", errors="replace").read()
     m = re.search(r"^\s*// RUSTC-DIFFERS:\s*(.*)$", text, re.M)
     named = (m.group(1).strip() or "(no reason)") if m else SIDE.get(key)
-    rs, why = to_rust(text)
+    rs, why = to_rust(text, alloc_api=ALLOC)
     tw = os.path.join(w, "rustc")
     os.makedirs(tw, exist_ok=True)
     with open(os.path.join(tw, "main.rs"), "w") as f:
         f.write(rs)
     if why:
         return "outside", why
-    bad = rustc_build(RUSTC, os.path.join(tw, "main.rs"), os.path.join(tw, "prog"), rust_edition(text))
+    level = next((f[2:] for f in d["flags"] if re.fullmatch(r"-O[0-2]", f)), d.get("level", OPT))
+    checks = next((f.split("=", 1)[1] == "on" for f in d["flags"] if f.startswith("--overflow-checks=")),
+                  level == "0")
+    bad = rustc_build(RUSTC, os.path.join(tw, "main.rs"), os.path.join(tw, "prog"), rust_edition(text),
+                      overflow=checks, alloc_api=ALLOC)
     if bad:
         # (a borrowck divergence the program names, tools/borrowck-twin.sh's)
         mk = re.search(r"^\s*// RUSTC: rejects\s+(\S+)\s*(.*)$", text, re.M)
@@ -476,7 +496,8 @@ def twin(key, w, mine, src, d, want):
             return "named", f"rustc rejects, named {mk.group(1)}: {mk.group(2)[:80]}"
         return "outside", "rustc rejects: " + bad
     r = run_prog(os.path.join(tw, "prog"), tw, d)
-    diff = ("timeout", "ran out of time") if r is None else compare(want, r, d)
+    # (stdout and the exit code: a message on stderr is vole's, not Rust's)
+    diff = ("timeout", "ran out of time") if r is None else compare(want[:2] + ([],), r, d)
     if diff:
         return ("named" if named else "differ"), f"{diff[0]}: {diff[1]}" + (f" (named: {named})" if named else "")
     if named:
@@ -531,10 +552,10 @@ def one(prog):
         with open(os.path.join(w, "translate.out"), "w") as f:
             f.write(r.stdout + r.stderr)
         try:
-            first = open(mine, encoding="utf-8", errors="replace").readline().strip()
+            marked = re.search(r"^// EDITION: rust\s*$", open(mine, encoding="utf-8", errors="replace").read(), re.M)
         except OSError:
-            first = ""
-        if r.returncode != 0 and not (r.returncode == 1 and first == "// EDITION: rust"):
+            marked = None
+        if r.returncode != 0 and not (r.returncode == 1 and marked):
             last = [l for l in (r.stdout + r.stderr).split("\n") if l.strip()]
             return key, "no-translation", f"exit {r.returncode}: " + (last[-1] if last else "")[:160]
     bad = build(mine, w, d, os.path.join(w, "prog"), True, os.path.join(w, "compile.out"))
@@ -593,7 +614,7 @@ tot_ok = tot = 0
 twin_tot = [0, 0]
 for s in SETS:
     rs = [r for r in results if r[0].startswith(s + "/")]
-    if not rs and FILTERS:
+    if not rs and (FILTERS or NAMES):
         continue
     ok = sum(1 for r in rs if r[1] == "ok")
     refs = sum(1 for r in rs if r[1] == "ref")
@@ -610,7 +631,7 @@ for s in SETS:
     if TWIN:
         tws = [r[3] for r in rs if r[3]]
         tc = {v: sum(1 for t in tws if t[0] == v) for v in ("agree", "differ", "named", "stale", "outside")}
-        print(f"translate: {s}: rustc twin: {tc['agree']} of {len(tws)} agree ({tc['differ']} differ, "
+        print(f"translate: {s}: {TWIN_NAME}: {tc['agree']} of {len(tws)} agree ({tc['differ']} differ, "
               f"{tc['named']} named, {tc['stale']} stale, {tc['outside']} outside)")
         twin_tot[0] += tc["agree"]
         twin_tot[1] += len(tws)
@@ -662,6 +683,6 @@ if TWIN:
             reasons[k] = reasons.get(k, 0) + 1
     for k, n in sorted(reasons.items(), key=lambda x: -x[1])[:10]:
         print(f"  twin outside {n}: {k}")
-    print(f"translate: rustc twin: {twin_tot[0]} of {twin_tot[1]} round-tripped programs agree")
+    print(f"translate: {TWIN_NAME}: {twin_tot[0]} of {twin_tot[1]} round-tripped programs agree")
 print(f"translate: {tot_ok} of {tot} round-trip (translator: {TRANSLATOR or 'identity'})")
 PY
