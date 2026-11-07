@@ -163,9 +163,20 @@ The translator (g3274):
   the same programs now agree on 522 of 559. A literal that is a
   static's or a constant's `[u8]` value, or an `if` branch beside
   declared bytes, is `b".."`.
-- Gate 3 so far: 121 errors (117 type error, 2 edition.lenient, 1
-  distinct.mix, 1 item.private); borrowck (partial), with front275's
-  D2.4a: 161.
+- std2's fs, process and env by rewrite.tsv's rows: `fs::exists`,
+  `fs::append`, `fs::copy`, `Metadata::modified`, `DirEntry::is_*`,
+  `Command::new` to `Command::new_in($1, $a)` (`$a`, when the function
+  has no Gpa, a program allocator it makes before the call), `process::id`
+  and `Child::id` as i32, `env::get_in` to `var_in`. A free function's
+  row may name its module (`fs::copy`, not io::copy). Bytes given as a
+  path, a program or an argument are `str::from_utf8(p).unwrap()`.
+- A result's `'a` by flow: with MVS's view summary, only on the
+  parameters the result's views come from, and on an item's region for
+  an item with views taken by reference (`leaf: &Leaf<'a, Gpa>`), so a
+  temporary given to another parameter need not outlive the result
+  (cli/tree.vl's two borrowck.return_local).
+- Gate 3: 127 (at std2's process) to 17 errors; 12 wait for std2's cli,
+  2 for std::gpu, 1 for std::num; borrowck (partial) 142 to 139.
 
 The borrow checker (bc275):
 

@@ -7,6 +7,7 @@ use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::{NodeKind, child};
 use crate::front::conv::{CONV_IN_OUT, CONV_LET, CONV_SINK_K, param_conv};
+use crate::front::own::summary::{S_L1_P, S_L1_STAR, S_L2_P, S_L2_STAR, summary_of};
 use crate::front::types::fn_param;
 use crate::middle::lower::ssa::HMap;
 use crate::tools::translate::{
@@ -414,11 +415,45 @@ fn ends_with_text(s: [u8], t: [u8]) -> bool {
     s.len >= t.len && s[s.len - t.len..s.len] == t
 }
 
+// (0.27.5) Whether function node n takes an item with views by a shared
+// reference, `line: &Line<'_>`: two lifetimes, which elision does not
+// choose between.
+fn ref_view_item(n: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
+    for j in 0..pcx.nodes[n].count {
+        let p = child(n, j, pcx);
+        if pcx.nodes[p].kind == NodeKind::Param && pcx.nodes[p].a != tr.sym_self
+            && tr.decided.get(p + 1) == D_REF && pcx.nodes[p].b > 0
+            && pcx.nodes[pcx.nodes[p].b].kind == NodeKind::TyName
+            && crate::tools::translate::regions::names_view_item(pcx.nodes[p].b, tr, pcx) {
+            return true;
+        }
+    }
+    false
+}
+
 // (a result with a view that elision cannot tie: two or more parameters
-// it could borrow from and no `self`) The function's `'a`: on the result's
+// it could borrow from, or one item with views by reference, and no
+// `self`) The function's `'a`: on the result's
 // views and on each parameter taken by a shared reference, `fn f<'a>(t:
 // &'a [u8], pcx: &'a Ctx) -> &'a [u8]`; an exclusive one keeps its own.
-fn name_region(n: i64, r: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+// (0.27.5) With MVS's view summary of function fi (inferred or declared,
+// not assumed), only on the parameters the result's views come from: a
+// parameter by its `&'a`, an item with views (`views(leaf)`, `*leaf`) by
+// the item's own region, `&Leaf<'a>`; the rest keep elision, so a
+// temporary given to one (`&leaf_of(..)`) need not live as long as the
+// result.
+fn name_region(n: i64, fi: i64, r: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    var known = false;
+    var own_mask: i64 = 0;
+    var through_mask: i64 = 0;
+    if fi >= 0 {
+        let s = summary_of(fi, &pcx);
+        // (a summary with no parameter in it, a view made from a raw
+        // pointer, says nothing: every parameter, as before)
+        known = !s.top && (s.ret[0] | s.ret[1] | s.ret[2] | s.ret[3]) != 0;
+        own_mask = s.ret[S_L1_P] | s.ret[S_L2_P];
+        through_mask = s.ret[S_L1_STAR] | s.ret[S_L2_STAR];
+    }
     var named: i64 = 0;
     for j in 0..pcx.nodes[n].count {
         let p = child(n, j, pcx);
@@ -429,10 +464,23 @@ fn name_region(n: i64, r: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
         if tn <= 0 || tr.decided.get(p + 1) == D_MUT {
             continue;
         }
+        let bit = if j >= 63 { -1 } else { 1 << j };
+        if known && (own_mask & bit) == 0 && (through_mask & bit) == 0 {
+            continue;
+        }
         let ts = pcx.nodes[tn].start;
         let at = if word_here(ts, "let") { skip_ws(ts + 3) } else { ts };
         let k = pcx.nodes[tn].kind;
+        let item = k == NodeKind::TyName
+            && crate::tools::translate::regions::names_view_item(tn, tr, pcx);
         if tr.decided.get(p + 1) == D_REF && !primitive_name(tn, pcx) {
+            if known && item {
+                // (a view item's views are its region's, `leaf.last` of a
+                // `&Leaf<'a>`, whatever the reference's)
+                tr.static_res.put(tn + 1, 2);
+                named += 1;
+                continue;
+            }
             // (after the `&` edit_param put at the same place; no rule's
             // key: view_put's is TC_VIEW's at this place)
             put(at, at, "'a ", -1, &tr, &pcx);
@@ -440,8 +488,7 @@ fn name_region(n: i64, r: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
         } else if k == NodeKind::TySlice && SRC[at] == '[' {
             put(at, at, "'a ", -1, &tr, &pcx);
             named += 1;
-        } else if k == NodeKind::TyName && (word_here(ts, "str")
-            || crate::tools::translate::regions::names_view_item(tn, tr, pcx)) {
+        } else if k == NodeKind::TyName && word_here(ts, "str") || item {
             tr.static_res.put(tn + 1, 2);
             named += 1;
         }
@@ -517,8 +564,9 @@ fn edit_signature(n: i64, impls: HMap, tr: inout Tr, pcx: inout Ctx<Comp>) {
     } else if r > 0 && borrowed == 0 && !receiver {
         // (every view in it: `[&'static str; 21]`, `Vec<Opt<'static>>`)
         mark_region(r, 1, 0, &tr, pcx);
-    } else if r > 0 && borrowed >= 2 && !receiver && has_view(r, 0, tr, pcx) {
-        name_region(n, r, &tr, &pcx);
+    } else if r > 0 && (borrowed >= 2 || borrowed == 1 && ref_view_item(n, tr, pcx)) && !receiver
+        && has_view(r, 0, tr, pcx) {
+        name_region(n, fi, r, &tr, &pcx);
     }
     if r > 0 && pcx.nodes[r].kind == NodeKind::TySlice && SRC[pcx.nodes[r].start] == '[' {
         view_put(r, pcx.nodes[r].start, &tr, &pcx);

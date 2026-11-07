@@ -162,6 +162,13 @@ fn edit_for_copy(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     while ident_char(SRC[ve]) {
         ve += 1;
     }
+    // (0.27.5) or a Vec's view of its items, `for t in omegas.as_slice()`
+    let ik = if ve + 11 <= SRC.len() as i64 && ve > vs && SRC[ve..ve + 11] == ".as_slice()" {
+        ve += 11;
+        NodeKind::Call
+    } else {
+        NodeKind::Ident
+    };
     if ve == vs || SRC[skip_ws(ve)] != '{' {
         return;
     }
@@ -173,7 +180,7 @@ fn edit_for_copy(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
             && pcx.nodes[m].end == pe {
             pat = m;
         }
-        if it == 0 && k == NodeKind::Ident && pcx.nodes[m].start == vs && pcx.nodes[m].end == ve {
+        if it == 0 && k == ik && pcx.nodes[m].start == vs && pcx.nodes[m].end == ve {
             it = m;
         }
         if pat > 0 && it > 0 || pcx.nodes[m].start > pcx.nodes[n].end && m > n + 64 {
@@ -969,6 +976,43 @@ fn field_type_node(s: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
     0
 }
 
+// (0.27.5) Whether e is an argument of std's Vec method given as its
+// element T (`words.push("-c")` of a Vec<[u8]>), checked as `[u8]`: the
+// element is bytes where the Vec is declared.
+fn vec_element_bytes(e: i64, tr: Tr, pcx: inout Ctx<Comp>) -> bool {
+    let c = parent_of(e, tr);
+    let t = if e > 0 { pcx.nodes[e].ty } else { 0 };
+    if c <= 0 || pcx.nodes[c].kind != NodeKind::Call || pcx.nodes[c].end <= pcx.nodes[c].start
+        || pcx.nodes[c].count < 2 || t <= 0 || pcx.types[t].kind != TyKind::Slice
+        || pcx.types[t].a != TY_U8 {
+        return false;
+    }
+    var f = pcx.nodes[c].x - 1;
+    if f < 0 || f >= pcx.fns.len() as i64 {
+        return false;
+    }
+    if pcx.fns[f].tmpl > 0 {
+        f = pcx.fns[f].tmpl - 1;
+    }
+    let fnode = pcx.fns[f].node;
+    let q = if fnode > 0 { param_of(fnode, c, e, pcx) } else { 0 };
+    let r = child(c, 0, pcx);
+    if q <= 0 || r == e || pcx.nodes[q].b <= 0 || pcx.nodes[pcx.nodes[q].b].kind != NodeKind::TyName
+        || SRC[pcx.nodes[pcx.nodes[q].b].start..pcx.nodes[pcx.nodes[q].b].end] != "T" {
+        return false;
+    }
+    var rt = pcx.nodes[r].ty;
+    if rt > 0 && pcx.types[rt].kind == TyKind::Ptr {
+        rt = pcx.types[rt].a;
+    }
+    // (the Vec's element `[u8]`, not `str`, which the argument's erased
+    // type does not tell)
+    let el = if rt > 0 { crate::tools::translate::rows::type_arg(rt, 0, pcx) } else { 0 };
+    rt > 0 && is_std_named(rt, c"Vec", pcx) && pcx.nodes[r].start == pcx.nodes[c].start
+        && pcx.nodes[r].end < pcx.nodes[c].end && SRC[pcx.nodes[r].end] == '.'
+        && el > 0 && pcx.types[el].kind == TyKind::Slice && pcx.types[el].a == TY_U8
+}
+
 // (0.27.5) Whether the value of expression e goes where bytes are
 // declared: a place whose type is written `[u8]` (ctx_type), an
 // assignment to declared bytes, the other side of `==` or `!=` from them,
@@ -977,7 +1021,7 @@ fn field_type_node(s: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
 // `&[u8]` in the rust edition (rustc E0308). up: e's place was asked
 // already, below.
 fn bytes_go(e: i64, up: i64, depth: i64, d: TextDecls, tr: Tr, pcx: inout Ctx<Comp>) -> bool {
-    if up == 0 && bytes_type(ctx_type(e, 0, d, tr, &pcx), pcx) {
+    if up == 0 && (bytes_type(ctx_type(e, 0, d, tr, &pcx), pcx) || vec_element_bytes(e, tr, &pcx)) {
         return true;
     }
     if e <= 0 || depth > 32 {
@@ -1037,6 +1081,40 @@ fn bytes_go(e: i64, up: i64, depth: i64, d: TextDecls, tr: Tr, pcx: inout Ctx<Co
     false
 }
 
+// (0.27.5) Whether pattern binding b is the payload of `Some(spec)` (or
+// `Ok(spec)`) in an arm of a match on a call whose result is written
+// `Option<str>` (`Result<str, ..>`): `w.strip_prefix("--")` of std's str.
+fn arm_str_binding(b: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
+    let p = parent_of(b, tr);
+    if p <= 0 || pcx.nodes[p].kind != NodeKind::PatVariant || pcx.nodes[p].count != 1 {
+        return false;
+    }
+    let arm = parent_of(p, tr);
+    if arm <= 0 || pcx.nodes[arm].kind != NodeKind::Arm || pcx.nodes[arm].a != p {
+        return false;
+    }
+    let m = parent_of(arm, tr);
+    if m <= 0 || pcx.nodes[m].kind != NodeKind::Match {
+        return false;
+    }
+    let s = pcx.nodes[m].a;
+    if s <= 0 || pcx.nodes[s].kind != NodeKind::Call {
+        return false;
+    }
+    let f = pcx.nodes[s].x - 1;
+    if f < 0 || f >= pcx.fns.len() as i64 {
+        return false;
+    }
+    let g = if pcx.fns[f].tmpl > 0 { pcx.fns[f].tmpl - 1 } else { f };
+    let fnode = pcx.fns[g].node;
+    let r = if fnode > 0 { pcx.nodes[fnode].b } else { 0 };
+    if r <= 0 {
+        return false;
+    }
+    let t = SRC[pcx.nodes[r].start..pcx.nodes[r].end];
+    t == "Option<str>" || t.len > 11 && t[0..11] == "Result<str,"
+}
+
 // (0.27.5) Whether expression e is text where it is declared, positively:
 // a binding or parameter written `str` (or initialized from such a
 // value), a field declared `str` alone, a call of a function whose result
@@ -1055,7 +1133,7 @@ fn declared_str(e: i64, depth: i64, d: TextDecls, tr: Tr, pcx: inout Ctx<Comp>) 
         }
         let b = d.binds.get(best + 3);
         if pcx.nodes[b].kind == NodeKind::PatBind {
-            return d.tuples.get(b + 1) == 2;
+            return d.tuples.get(b + 1) == 2 || arm_str_binding(b, tr, pcx);
         }
         if pcx.nodes[b].kind == NodeKind::Param || pcx.nodes[b].b > 0 {
             return str_type_node(pcx.nodes[b].b, pcx);
@@ -1118,35 +1196,57 @@ fn declared_str(e: i64, depth: i64, d: TextDecls, tr: Tr, pcx: inout Ctx<Comp>) 
         }
         // (an element of a local array of text, `let kws = ["fn ", ..];`
         // then `kws[k]`, or of one written `[str; N]`)
-        let a = pcx.nodes[e].a;
-        let best = if a > 0 && pcx.nodes[a].kind == NodeKind::Ident { bound_at(a, d, pcx) }
-            else { -1 };
-        if best < 0 {
+        return elements_str(pcx.nodes[e].a, depth + 1, d, tr, &pcx);
+    }
+    false
+}
+
+// (0.27.5) Whether expression a is an array or a slice whose elements are
+// text where it is declared: a binding written `[str; N]` or `[str]`, or
+// initialized with an array literal of text (`let kws = ["fn ", ..];`), a
+// part or a borrow of one (`let names = all[..];`).
+fn elements_str(a: i64, depth: i64, d: TextDecls, tr: Tr, pcx: inout Ctx<Comp>) -> bool {
+    if a <= 0 || depth > 8 {
+        return false;
+    }
+    let k = pcx.nodes[a].kind;
+    if k == NodeKind::Unary && SRC[pcx.nodes[a].start] == '&' {
+        return elements_str(pcx.nodes[a].b, depth + 1, d, tr, &pcx);
+    }
+    if k == NodeKind::Index {
+        let r = pcx.nodes[a].b;
+        return r > 0 && pcx.nodes[r].kind == NodeKind::Range
+            && elements_str(pcx.nodes[a].a, depth + 1, d, tr, &pcx);
+    }
+    if k == NodeKind::Array {
+        if pcx.nodes[a].count == 0 {
             return false;
         }
-        let b = d.binds.get(best + 3);
-        if pcx.nodes[b].kind == NodeKind::PatBind {
-            return false;
-        }
-        let t = pcx.nodes[b].b;
-        if pcx.nodes[b].kind == NodeKind::Param || t > 0 {
-            return t > 0
-                && (pcx.nodes[t].kind == NodeKind::TyArray
-                    || pcx.nodes[t].kind == NodeKind::TySlice)
-                && str_type_node(pcx.nodes[t].a, pcx);
-        }
-        let init = pcx.nodes[b].c;
-        if init <= 0 || pcx.nodes[init].kind != NodeKind::Array || pcx.nodes[init].count == 0 {
-            return false;
-        }
-        for i in 0..pcx.nodes[init].count {
-            if !declared_str(child(init, i, pcx), depth + 1, d, tr, &pcx) {
+        for i in 0..pcx.nodes[a].count {
+            if !declared_str(child(a, i, pcx), depth + 1, d, tr, &pcx) {
                 return false;
             }
         }
         return true;
     }
-    false
+    if k != NodeKind::Ident {
+        return false;
+    }
+    let best = bound_at(a, d, pcx);
+    if best < 0 {
+        return false;
+    }
+    let b = d.binds.get(best + 3);
+    if pcx.nodes[b].kind == NodeKind::PatBind {
+        return false;
+    }
+    let t = pcx.nodes[b].b;
+    if pcx.nodes[b].kind == NodeKind::Param || t > 0 {
+        return t > 0
+            && (pcx.nodes[t].kind == NodeKind::TyArray || pcx.nodes[t].kind == NodeKind::TySlice)
+            && str_type_node(pcx.nodes[t].a, pcx);
+    }
+    elements_str(pcx.nodes[b].c, depth + 1, d, tr, &pcx)
 }
 
 // (0.27.5) Whether fn node f's module is std's `name` (`std::fs`).
@@ -1157,7 +1257,8 @@ fn in_std_module(g: i64, name: [u8], pcx: Ctx<Comp>) -> bool {
 
 // (0.27.5) A path given to std::fs as bytes, a value declared `[u8]`
 // (MVS's fs takes `path: [u8]`): std2's takes a `&str` until std::path,
-// so it is `str::from_utf8(p).unwrap()`. A literal is text already.
+// so it is `str::from_utf8(p).unwrap()`. A literal is text already. The
+// same for std::process's program and arguments (std2's are &str).
 fn edit_std_path(c: i64, d: TextDecls, tr: inout Tr, pcx: inout Ctx<Comp>) {
     if tr.text_mode || pcx.nodes[c].end <= pcx.nodes[c].start {
         return;
@@ -1168,7 +1269,8 @@ fn edit_std_path(c: i64, d: TextDecls, tr: inout Tr, pcx: inout Ctx<Comp>) {
     }
     let g = if pcx.fns[f].tmpl > 0 { pcx.fns[f].tmpl - 1 } else { f };
     let fnode = pcx.fns[g].node;
-    if fnode <= 0 || editable(pcx.nodes[fnode].start, &pcx) || !in_std_module(g, "std::fs", pcx) {
+    if fnode <= 0 || editable(pcx.nodes[fnode].start, &pcx) || !in_std_module(g, "std::fs", pcx)
+        && !in_std_module(g, "std::process", pcx) {
         return;
     }
     for i in 0..pcx.nodes[c].count {
@@ -1178,10 +1280,15 @@ fn edit_std_path(c: i64, d: TextDecls, tr: inout Tr, pcx: inout Ctx<Comp>) {
             continue;
         }
         let nm = crate::base::sym_text(pcx.nodes[p].a, pcx);
-        if nm != "path" && nm != "from" && nm != "to" && nm != "dir" {
+        let fs = in_std_module(g, "std::fs", pcx);
+        if fs && nm != "path" && nm != "from" && nm != "to" && nm != "dir"
+            || !fs && nm != "prog" && nm != "a" && nm != "name" {
             continue;
         }
-        if declared_bytes(a, 0, d, pcx) {
+        // (std::process: Command::new, arg and env_remove, whose bytes are
+        // any value not written as text: a Vec<[u8]> element, an args_os item)
+        if fs && declared_bytes(a, 0, d, pcx)
+            || !fs && pcx.nodes[a].kind != NodeKind::Str && !declared_str(a, 0, d, tr, &pcx) {
             put(pcx.nodes[a].start, pcx.nodes[a].start, "str::from_utf8(", TC_UTF8, &tr, &pcx);
             put(pcx.nodes[a].end, pcx.nodes[a].end, ").unwrap()", TC_UTF8, &tr, &pcx);
         }
@@ -1572,6 +1679,12 @@ pub fn text_program(tr: Tr, pcx: inout Ctx<Comp>) -> bool {
                 return false;
             }
         }
+        // (0.27.5) bytes std2 gives as bytes: args_os's items (`&[u8]`),
+        // which no `&str` takes
+        if k == NodeKind::Call && pcx.nodes[n].x > 0 && pcx.nodes[n].x <= pcx.fns.len() as i64
+            && crate::base::sym_text(pcx.fns[pcx.nodes[n].x - 1].name, pcx) == "std.env.args_os" {
+            return false;
+        }
     }
     any
 }
@@ -1698,6 +1811,19 @@ fn text_decls(tr: Tr, pcx: inout Ctx<Comp>) -> TextDecls {
             } else if pat > 0 && pcx.nodes[pat].kind == NodeKind::PatTuple {
                 tuple_decls(n, pat, &d, tr, &pcx);
             }
+        } else if k == NodeKind::Arm {
+            // (`Some(spec) =>` of a match on an Option<str>: text, in the arm)
+            let p = pcx.nodes[n].a;
+            let b = if p > 0 && pcx.nodes[p].kind == NodeKind::PatVariant
+                && pcx.nodes[p].count == 1 { child(p, 0, pcx) } else { 0 };
+            if b > 0 && pcx.nodes[b].kind == NodeKind::PatBind && arm_str_binding(b, tr, pcx) {
+                d.binds.push(pcx.nodes[n].start);
+                d.binds.push(pcx.nodes[n].end);
+                d.binds.push(pcx.nodes[b].a);
+                d.binds.push(b);
+                d.tuples.put(b + 1, 2);
+            }
+            continue;
         }
         let scope = parent_of(n, tr);
         if name < 0 || scope <= 0 {
@@ -2008,6 +2134,44 @@ fn printed_value(a: i64, b: i64) -> bool {
     len > 0 && (s < 0 || !ident_char(SRC[s]) && SRC[s] != '.')
 }
 
+// (0.27.5) Whether hole n is an argument only evaluated (HOLE_EVAL, a
+// call with named arguments: `format_args("{} {lv}", name(), lv = 2)`)
+// that a Display hole of the same literal reads (its alias). The checker
+// makes the evaluated arguments' holes in order, then the literal's
+// (front/check/format.vl's build), so they are found by node number.
+fn eval_hole_display(n: i64, pcx: Ctx<Comp>) -> bool {
+    let eval = crate::front::check::format::HOLE_EVAL;
+    if pcx.nodes[n].kind != NodeKind::InterpHole || pcx.nodes[n].b != eval {
+        return false;
+    }
+    var v: i64 = 0;
+    while n - v - 1 > 0 && pcx.nodes[n - v - 1].kind == NodeKind::InterpHole
+        && pcx.nodes[n - v - 1].b == eval {
+        v += 1;
+    }
+    var aliases = false;
+    var j = n + 1;
+    while j < pcx.nodes.len() as i64 && j < n + 256 {
+        if pcx.nodes[j].kind == NodeKind::InterpHole {
+            let b = pcx.nodes[j].b;
+            if b == eval {
+                if aliases {
+                    return false;
+                }
+            } else if b >= 1024 {
+                aliases = true;
+                if b / 1024 - 1 == v && (b & 1) == 0 {
+                    return true;
+                }
+            } else {
+                return false;
+            }
+        }
+        j += 1;
+    }
+    false
+}
+
 // (0.27.4) A `[u8]` value a program that uses bytes as bytes too prints
 // as text (a Display hole, `{x}` or `{}`): Rust's [u8] has no Display, so
 // the hole is given `str::from_utf8(x).unwrap()` (MVS's text is UTF-8;
@@ -2023,7 +2187,8 @@ fn edit_byte_holes(decls: TextDecls, tr: inout Tr, pcx: inout Ctx<Comp>) {
     var named = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
     for n in 1..pcx.nodes.len() as i64 {
         // (a hole, or the value of `println(x)`, which is `println("{}", x)`)
-        let hole = pcx.nodes[n].kind == NodeKind::InterpHole && pcx.nodes[n].b == 0;
+        let hole = pcx.nodes[n].kind == NodeKind::InterpHole && pcx.nodes[n].b == 0
+            || eval_hole_display(n, pcx);
         if !hole && !(pcx.nodes[n].ty > 0 && SRC[pcx.nodes[n].start] != '"'
             && token_at(pcx.nodes[n].start, pcx) >= 0
             && printed_value(pcx.nodes[n].start, pcx.nodes[n].end)) || !own_node(n, tr, &pcx) {
