@@ -11,7 +11,7 @@ use crate::front::types::fn_param;
 use crate::middle::lower::ssa::HMap;
 use crate::tools::translate::{
     D_MUT, D_REF, D_VALUE, TC_DERIVE, TC_INOUT, TC_LET, TC_RECEIVER, TC_SINK, TC_TEXT, TC_TYPE,
-    TC_VIEW, Tr, add_ref, editable, is_ref, is_ws, put, skip_ws, word_here,
+    TC_VIEW, Tr, add_ref, editable, ident_char, is_ref, is_ws, put, skip_ws, word_here,
 };
 
 // The operator traits, whose methods take self and their operand by value
@@ -160,17 +160,25 @@ fn edit_param(n: i64, f: i64, i: i64, p: i64, by_value: bool, gen: i64, tr: inou
     }
 }
 
+// A view's `&` for region v of Tr.static_res (0: elided, 1: `'static`, 2:
+// the function's `'a`).
+fn region_amp(v: i64) -> [u8] {
+    if v == 1 { "&'static " } else if v == 2 { "&'a " } else { "&" }
+}
+
 // A view type node tn, `[T]` at `at`: `&[T]`; `&str` for `[u8]` in a
 // program that uses its bytes as text only (body.vl: text_program).
 fn view_put(tn: i64, at: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     let e = pcx.nodes[tn].a;
-    let st = tr.static_res.get(tn + 1) != 0;
+    let st = tr.static_res.get(tn + 1);
     if tr.text_mode && e > 0 && pcx.nodes[e].kind == NodeKind::TyName
         && SRC[pcx.nodes[e].start..pcx.nodes[e].end] == "u8" {
-        put(at, pcx.nodes[tn].end, if st { "&'static str" } else { "&str" }, TC_TEXT, &tr, &pcx);
+        put(at, pcx.nodes[tn].end,
+            if st == 1 { "&'static str" } else if st == 2 { "&'a str" } else { "&str" }, TC_TEXT,
+            &tr, &pcx);
         tr.typed.put(e + 1, 1);
     } else {
-        put(at, at, if st { "&'static " } else { "&" }, TC_VIEW, &tr, &pcx);
+        put(at, at, region_amp(st), TC_VIEW, &tr, &pcx);
     }
 }
 
@@ -286,6 +294,148 @@ fn borrows_param(n: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
     false
 }
 
+// The parameters of function node n the rust edition takes by a shared
+// or exclusive reference to more than a primitive (an `&mut i64` out
+// parameter is none a result could borrow from), and whether it has a
+// `self` receiver (elision's own case).
+fn borrowing_params(n: i64, tr: Tr, pcx: Ctx<Comp>) -> (i64, bool) {
+    var count: i64 = 0;
+    var receiver = false;
+    for j in 0..pcx.nodes[n].count {
+        let p = child(n, j, pcx);
+        if pcx.nodes[p].kind != NodeKind::Param {
+            continue;
+        }
+        let tn = pcx.nodes[p].b;
+        if pcx.nodes[p].a == tr.sym_self {
+            receiver = receiver || tr.decided.get(p + 1) != D_VALUE;
+            continue;
+        }
+        let d = tr.decided.get(p + 1);
+        // (`inout i64`: its referent's name)
+        let named = if tn > 0 && pcx.nodes[tn].kind == NodeKind::TyPtr
+            && SRC[pcx.nodes[tn].start] != '*' {
+            pcx.nodes[tn].a
+        } else {
+            tn
+        };
+        if (d == D_REF || d == D_MUT) && (named <= 0 || !primitive_name(named, pcx)) {
+            count += 1;
+        } else if tn > 0 && d != D_REF && d != D_MUT {
+            let k = pcx.nodes[tn].kind;
+            let s = pcx.nodes[tn].start;
+            if k == NodeKind::TySlice || k == NodeKind::TyName && word_here(s, "str")
+                || k == NodeKind::TyPtr && SRC[s] != '*'
+                || crate::tools::translate::regions::names_view_item(tn, tr, pcx) {
+                count += 1;
+            }
+        }
+    }
+    (count, receiver)
+}
+
+// Type node t and the types inside it marked region v in Tr.static_res
+// (1: `'static`, 2: the function's `'a`).
+fn mark_region(t: i64, v: i64, depth: i64, tr: inout Tr, pcx: Ctx<Comp>) {
+    if t <= 0 || depth > 8 {
+        return;
+    }
+    tr.static_res.put(t + 1, v);
+    let k = pcx.nodes[t].kind;
+    if k == NodeKind::TyName {
+        let g = pcx.nodes[t].g;
+        for i in 0..if g > 0 { pcx.nodes[g].count } else { 0 } {
+            mark_region(child(g, i, pcx), v, depth + 1, &tr, pcx);
+        }
+    } else if k == NodeKind::TySlice || k == NodeKind::TyPtr || k == NodeKind::TyArray {
+        mark_region(pcx.nodes[t].a, v, depth + 1, &tr, pcx);
+    } else {
+        for i in 0..pcx.nodes[t].count {
+            mark_region(child(t, i, pcx), v, depth + 1, &tr, pcx);
+        }
+    }
+}
+
+// Whether type node t has a view in it (a slice, `str`, an item that holds
+// one).
+fn has_view(t: i64, depth: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
+    if t <= 0 || depth > 8 {
+        return false;
+    }
+    let k = pcx.nodes[t].kind;
+    let s = pcx.nodes[t].start;
+    if k == NodeKind::TySlice && SRC[s] == '[' || k == NodeKind::TyName && word_here(s, "str")
+        && SRC[pcx.nodes[t].end - 1] == 'r'
+        || k == NodeKind::TyName && crate::tools::translate::regions::names_view_item(t, tr, pcx) {
+        return true;
+    }
+    if k == NodeKind::TyName {
+        let g = pcx.nodes[t].g;
+        for i in 0..if g > 0 { pcx.nodes[g].count } else { 0 } {
+            if has_view(child(g, i, pcx), depth + 1, tr, pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if k == NodeKind::TyArray || k == NodeKind::TyPtr && SRC[s] == '*' {
+        return has_view(pcx.nodes[t].a, depth + 1, tr, pcx);
+    }
+    false
+}
+
+// (a result with a view that elision cannot tie: two or more parameters
+// it could borrow from and no `self`) The function's `'a`: on the result's
+// views and on each parameter taken by a shared reference, `fn f<'a>(t:
+// &'a [u8], pcx: &'a Ctx) -> &'a [u8]`; an exclusive one keeps its own.
+fn name_region(n: i64, r: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    var named: i64 = 0;
+    for j in 0..pcx.nodes[n].count {
+        let p = child(n, j, pcx);
+        if pcx.nodes[p].kind != NodeKind::Param || pcx.nodes[p].a == tr.sym_self {
+            continue;
+        }
+        let tn = pcx.nodes[p].b;
+        if tn <= 0 || tr.decided.get(p + 1) == D_MUT {
+            continue;
+        }
+        let ts = pcx.nodes[tn].start;
+        let at = if word_here(ts, "let") { skip_ws(ts + 3) } else { ts };
+        let k = pcx.nodes[tn].kind;
+        if tr.decided.get(p + 1) == D_REF && !primitive_name(tn, pcx) {
+            // (after the `&` edit_param put at the same place; no rule's
+            // key: view_put's is TC_VIEW's at this place)
+            put(at, at, "'a ", -1, &tr, &pcx);
+            named += 1;
+        } else if k == NodeKind::TySlice && SRC[at] == '[' {
+            put(at, at, "'a ", -1, &tr, &pcx);
+            named += 1;
+        } else if k == NodeKind::TyName && (word_here(ts, "str")
+            || crate::tools::translate::regions::names_view_item(tn, tr, pcx)) {
+            tr.static_res.put(tn + 1, 2);
+            named += 1;
+        }
+    }
+    if named == 0 {
+        return;
+    }
+    mark_region(r, 2, 0, &tr, pcx);
+    let g = pcx.nodes[n].g;
+    if g > 0 && SRC[pcx.nodes[g].start] == '<' {
+        put(pcx.nodes[g].start + 1, pcx.nodes[g].start + 1, "'a, ", TC_VIEW, &tr, &pcx);
+        return;
+    }
+    var q = pcx.nodes[n].start;
+    while q < pcx.nodes[n].end && !word_here(q, "fn") {
+        q += 1;
+    }
+    q = skip_ws(q + 2);
+    while q < pcx.nodes[n].end && ident_char(SRC[q]) {
+        q += 1;
+    }
+    put(q, q, "<'a>", TC_VIEW, &tr, &pcx);
+}
+
 // Function node n's parameters and result.
 fn edit_signature(n: i64, impls: HMap, tr: inout Tr, pcx: inout Ctx<Comp>) {
     let f = pcx.nodes[n].x - 1;
@@ -331,8 +481,12 @@ fn edit_signature(n: i64, impls: HMap, tr: inout Tr, pcx: inout Ctx<Comp>) {
     // (a result that is a view: `-> &[T]`; `&'static [T]` when no
     // parameter is a reference, which Rust's elision would name)
     let r = pcx.nodes[n].b;
-    if r > 0 && !borrows_param(n, tr, pcx) {
-        tr.static_res.put(r + 1, 1);
+    let (borrowed, receiver) = borrowing_params(n, tr, pcx);
+    if r > 0 && borrowed == 0 && !receiver {
+        // (every view in it: `[&'static str; 21]`, `Vec<Opt<'static>>`)
+        mark_region(r, 1, 0, &tr, pcx);
+    } else if r > 0 && borrowed >= 2 && !receiver && has_view(r, 0, tr, pcx) {
+        name_region(n, r, &tr, &pcx);
     }
     if r > 0 && pcx.nodes[r].kind == NodeKind::TySlice && SRC[pcx.nodes[r].start] == '[' {
         view_put(r, pcx.nodes[r].start, &tr, &pcx);
@@ -404,8 +558,7 @@ fn edit_types(tr: inout Tr, pcx: inout Ctx<Comp>) {
         if k == NodeKind::TyName && fields.get(n + 1) == 0 && tr.typed.get(n + 1) == 0
             && editable(s, &pcx)
             && word_here(s, "str") && SRC[pcx.nodes[n].end - 1] == 'r' && !after_amp(s) {
-            put(s, s, if tr.static_res.get(n + 1) != 0 { "&'static " } else { "&" }, TC_VIEW, &tr,
-                &pcx);
+            put(s, s, region_amp(tr.static_res.get(n + 1)), TC_VIEW, &tr, &pcx);
         } else if k == NodeKind::TyFn && editable(s, &pcx) {
             for i in 0..pcx.nodes[n].count {
                 let tn = child(n, i, pcx);
