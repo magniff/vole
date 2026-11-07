@@ -105,6 +105,10 @@ The front's gaps behind std2's XFAILs (front2721b):
 - `{:E}` is UpperExp, and `{:-}` sets Formatter's sign_minus.
 - Deref coercion at an argument: `&Box<T, A>` where `&T` goes, and in a
   generic call through the Deref chain (`sum(rest)` binds A, F32.2).
+- A bound's `Item = &T` through a supertrait binds T (`Copied<I>`'s
+  DoubleEndedIterator impl, F11.5). Group 3's other `type.infer` cases
+  (a later statement's type, a later match arm's) wait for FL1's deferred
+  inference (0.27.4).
 The borrow checker (bc2721):
 
 - Implied outlives bounds as rustc's well-formedness (borrowck.md

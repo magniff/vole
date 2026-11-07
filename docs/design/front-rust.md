@@ -610,6 +610,14 @@ kept as a projection type, equal only to itself (and to its `= X`
 constraint when `Γ` has `T: Tr<A = X>`). *Anchor:* `front/assoc.vl:
 projection, trait_projection, constraint_type`.
 
+
+**F11.5 (a bound's equality through a supertrait, 0.27.2.1).** A bound
+`I: Tr<Name = τ>` whose `Name` a supertrait of `Tr` declares
+(`DoubleEndedIterator<Item = &'a T>`, Item Iterator's) is read through
+that supertrait's impl for the bound's type, so it binds the parameters
+τ names as `Iterator<Item = &'a T>` would (`Copied<I>`'s
+`DoubleEndedIterator` impl). *Anchor:* `front/assoc.vl:
+super_projection, infer_from_assoc`. Case `rust_f_f11_super_projection_ok`.
 ### F12 Default bodies in generic traits
 
 **F12.1.** A method of a generic trait `Tr<P..>` may have a default
