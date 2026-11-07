@@ -188,6 +188,26 @@ The translator (g3274):
   sweep cases); the corpus round-trips 43 of 50 (41 at 0.27.3's
   end). causes.tsv reclassified for every case the walls moved.
 
+The front (fl10274):
+
+- `[T]` and `str` are types of their own in the rust edition (Z9.1c,
+  FL10's second stage): the unsized place, which `&[T]` and `&str`
+  reference. `&T` with `T = &str` is a reference to the view, `&&str`,
+  so `Iter<&str>` yields `&&str`, `copied` makes it `&str` again, and
+  Vec<&str>'s `Extend<T>` and `Extend<&T>` are two impls. An impl for
+  `[T]` and one for `&[T]` can both be written. A `?Sized` parameter
+  binds the place: `io::copy` reads a `&[u8]`, and `&mut "ab".as_bytes()`
+  is a `&mut &[u8]`. A Sized one bound to the place is `type.unsized`,
+  rustc's E0277, so `Vec<[i64]>` is rejected. A method on a view probes
+  as rustc's does: the place's `&self` method first, then the view's
+  own impls. A `NonNull<[u8]>` is two words. Z9.1a's special case for
+  reference impls over a slice is retired. std2 gains rustc's
+  forwarding impls for references (`Borrow`, `AsRef`, `AsMut`, `Eq`,
+  `Ord`). Not yet: an iterator of views collected in std2's generic
+  instances (`[&str; 2].into_iter().collect_in(a)`, borrowck, D4.6,
+  which also failed before) and `Box<[T]>`/`Box<str>` (std2's Box has
+  a Sized T), both 0.27.5.
+
 ### What's new in 0.27.3
 
 The translator and gate 2. `volec fix --edition rust FILE|DIR` rewrites an MVS program into the rust edition, directed by its types: parameter modes become `&T`, `&mut T` or `T`, `&x` at a call becomes the borrow the parameter takes, `var` becomes `let mut`, a view becomes a slice, a struct holding a view gets a lifetime, std calls follow `compiler/std2/rewrite.tsv`'s rows by type, contracts are carried, and an integer literal MVS typed i64 is annotated where the rust edition's i32 default would change it. `tests/translate.sh` measures the round trip (translated, built in the rust edition, the same output), and the rustc twin runs what round-trips under rustc; the release gate's `translate` row prints both, informational until 0.27.4 (the counts are in docs/roadmap.md's 0.27.3 gate record). In the rust edition an unsuffixed integer literal now takes its type from its first use, and is i32 when nothing fixes it (FL6, F18.5). 1,402 of std2's 1,472 tests pass at -O0 (1,306 of 1,454 in 0.27.2.1). std2 is parsed lazily, by the items a program reaches, and a `println` with no holes writes its literal directly: a rust hello world's check costs 2.32x MVS's (3.48x). Arrays iterate by value (`std::array::IntoIter` over `ManuallyDrop`), a rust-edition union drops none of its fields, an `if` condition's temporaries drop before its branch (L3), and std2 gains floats' methods, Unicode's tables, `std::sync::atomic` and more of `std::env`. Gate 3's first run: `fix --edition rust compiler/src` stops at 50 parse and import errors, all three translator shapes (an `unsafe { }` operand, a raw-pointer `self`, an import its file already binds); 0.27.4 prints its count. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
