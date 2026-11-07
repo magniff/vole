@@ -49,7 +49,14 @@ lit() {
                     print m[i] "\t" $1 "::" $2
                 }
             }
-        }' "$std2/checklist.tsv" | lit
+        }
+        # (0.27.3) then every capitalized item std2 has, as itself: a name
+        # a row writes (`Layout`, `NonNull`), which MVS had in its prelude
+        $2 !~ /::/ && $2 ~ /^[A-Z]/ && ($3 == "struct" || $3 == "enum" || $3 == "trait") \
+            && $1 !~ /__/ {
+            later[n_later++] = $2 "\t" $1 "::" $2
+        }
+        END { for (i = 0; i < n_later; i++) print later[i] }' "$std2/checklist.tsv" | lit
     echo "}"
     echo ""
     echo "// The names std2's prelude holds."

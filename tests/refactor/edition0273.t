@@ -9,11 +9,10 @@
 ## `fmt` result, an operator's `Output`, std's paths; written, then built
 ## and run in the rust edition with the MVS program's output.
 $ fix --edition rust --list-left main.vl
-fixed, 1 parameter to &T, 2 parameters to &mut T, 3 receivers, 6 views to &[T], 2 '&x's to '&mut x', 1 borrow written '&x', 2 accesses written '*r', 5 vars to 'let mut', 1 inout local, 1 print given its format, 4 integers annotated, 1 static var to 'static mut', 2 imports, 5 types, 4 std calls by rewrite.tsv, 2 text views to &str, 4 static mut uses put in unsafe, 1 index cast to usize, 2 copy types derived Clone, Copy	main.vl	+35 -30 lines
+fixed, 1 parameter to &T, 2 parameters to &mut T, 3 receivers, 6 views to &[T], 2 '&x's to '&mut x', 1 borrow written '&x', 2 accesses written '*r', 5 vars to 'let mut', 1 inout local, 1 print given its format, 4 integers annotated, 1 static var to 'static mut', 2 imports, 5 types, 4 std calls by rewrite.tsv, 2 text views to &str, 4 static mut uses put in unsafe, 1 index cast to usize, 2 copy types derived Clone, Copy	main.vl	+31 -30 lines
 % cat main.vl
 // fix --edition rust (0.27.3): an MVS program of each rewrite kind.
-use std::fmt::Debug; use std::ops::Add; use std::fmt::Display; use std::fmt::Formatter as Fmt;
-use std::alloc::Allocator; use std::collections::HashMap;
+use std::fmt::Debug; use std::ops::Add; use std::fmt::Display; use std::fmt::Formatter as Fmt; use std::alloc::Allocator; use std::collections::HashMap;
 
 static mut CALLS: i64 = 0;
 
@@ -25,9 +24,7 @@ impl Add for Money { type Output = Money;
 }
 
 impl Display for Money {
-    fn fmt(&self, f: &mut Fmt) -> std::fmt::Result {
-        write(f, "${}.{}", self.cents / 100, self.cents % 100)?; Ok(())
-    }
+    fn fmt(&self, f: &mut Fmt) -> std::fmt::Result { write(f, "${}.{}", self.cents / 100, self.cents % 100)?;  Ok(()) }
 }
 
 struct Ledger<A: Allocator> { names: Vec<i64, A>, total: i64 }
@@ -82,8 +79,7 @@ fn main(gpa: Gpa) {
     println("{} {} {}", a + b, seen.contains_key(&1), unsafe { CALLS });
     let arr = [7, 8, 9];
     let i: i64 = 1;
-    let calls_now = unsafe { CALLS };
-    println("{} {calls_now} {}", arr[(i + 1) as usize], none() == 0 as *mut u8);
+    let calls_now = unsafe { CALLS }; println("{} {calls_now} {}", arr[(i + 1) as usize], none() == 0 as *mut u8);
     let w = first_word("hello");
     println("{} {}", w.text, w.at);
 }
