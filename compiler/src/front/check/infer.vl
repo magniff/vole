@@ -36,16 +36,21 @@ pub struct InferMark {
     locals: i64,
     fns: i64,
     count: i64,
+    dbase: i64,
+    deps: i64,
+    closures: i64,
 }
 
 // (check_function) A function's check starts: its records from here on.
 pub fn begin(pcx: inout Ctx<Comp>) -> InferMark {
     let m = save(pcx);
     pcx.infer_base = pcx.infer_recs.count;
+    pcx.infer_dbase = pcx.infer_deps.count;
     pcx.infer_live = false;
     pcx.infer_nodes = pcx.nodes.len() as i64;
     pcx.infer_locals = pcx.locals.len() as i64;
     pcx.infer_fns = pcx.fns.len() as i64;
+    pcx.infer_closures = pcx.closures.len() as i64;
     m
 }
 
@@ -53,17 +58,21 @@ pub fn save(pcx: Ctx<Comp>) -> InferMark {
     InferMark {
         base: pcx.infer_base, live: pcx.infer_live, nodes: pcx.infer_nodes,
         locals: pcx.infer_locals, fns: pcx.infer_fns, count: pcx.infer_recs.count,
+        dbase: pcx.infer_dbase, deps: pcx.infer_deps.count, closures: pcx.infer_closures,
     }
 }
 
 // (check_function_recovering) The state before a check an error left.
 pub fn restore(m: InferMark, pcx: inout Ctx<Comp>) {
     pcx.infer_recs.count = m.count;
+    pcx.infer_deps.count = m.deps;
     pcx.infer_base = m.base;
+    pcx.infer_dbase = m.dbase;
     pcx.infer_live = m.live;
     pcx.infer_nodes = m.nodes;
     pcx.infer_locals = m.locals;
     pcx.infer_fns = m.fns;
+    pcx.infer_closures = m.closures;
 }
 
 // Whether type t is a variable.
@@ -93,15 +102,7 @@ pub fn make_vars(params: i64, bound: *i64, pos: i64, what: i64, shape: i64, oute
     // SAFETY: it has one slot per parameter of `params` (count), as require_bound's caller allocated it; i < count.
     unsafe {
         let count = pcx.nodes[params].count;
-        if !pcx.infer_live {
-            pcx.infer_live = true;
-            // (the sweep's nodes: the function's tree, and those made since)
-            let item = pcx.fns[pcx.cur_fn].node;
-            let lo = tree_min(item, item, 0, pcx);
-            if lo < pcx.infer_nodes {
-                pcx.infer_nodes = lo;
-            }
-        }
+        go_live(&pcx);
         let rec = pcx.infer_recs.count;
         for i in 0..count {
             if bound[i] == 0 {
@@ -293,6 +294,7 @@ pub fn unify(a: i64, b: i64, pcx: inout Ctx<Comp>) -> bool {
     let x = resolve(a, &pcx);
     let y = resolve(b, &pcx);
     unify_at(x, y, 0, &pcx);
+    settle_deps(&pcx);
     let s = resolve(x, &pcx) == resolve(y, &pcx);
     if s {
         sweep(&pcx);
@@ -414,6 +416,7 @@ pub fn sweep(pcx: inout Ctx<Comp>) {
             crate::front::own::fast::note_type(r, &pcx);
         }
     }
+    crate::front::closures::resolve_sigs(pcx.infer_closures, &pcx);
     for f in pcx.infer_fns..pcx.fns.len() as i64 {
         if pcx.fns[f].tmpl != 0 {
             continue;
@@ -453,6 +456,24 @@ fn remap_variant(n: i64, r: i64, pcx: inout Ctx<Comp>) {
     }
 }
 
+// (end) A variant pattern names its variant in x, of the enum it was
+// checked against (check_variant_pattern); one checked against a variable's
+// enum names it again in the solution's, once the function's check is done
+// (the match's usefulness, checked before, read the ids it had).
+fn remap_patterns(pcx: inout Ctx<Comp>) {
+    for n in pcx.infer_nodes..pcx.nodes.len() as i64 {
+        let r = pcx.nodes[n].ty;
+        if pcx.nodes[n].kind == NodeKind::PatVariant && r > 0 && pcx.types[r].kind == TyKind::Enum
+            && pcx.nodes[n].x >= 0 {
+            let v = crate::front::types::find_variant(pcx.types[r].a,
+                pcx.variants[pcx.nodes[n].x].name, pcx);
+            if v >= 0 {
+                pcx.nodes[n].x = v;
+            }
+        }
+    }
+}
+
 // Whether the type arguments TSCRATCH[mark..] hold a variable.
 pub fn targs_mention(mark: i64, pcx: Ctx<Comp>) -> bool {
     if !pcx.infer_live {
@@ -485,35 +506,17 @@ fn var_instance(f: i64, pcx: Ctx<Comp>) -> bool {
 // of an instance made with a variable calls the instance of the solutions.
 pub fn end(m: InferMark, pcx: inout Ctx<Comp>) {
     if pcx.infer_live {
-        // UNSAFE: report_unbound reads the bound types through a raw array, require_bound's.
-        // SAFETY: bound has one slot per parameter of the record's Generics node (count), each written before it is read; freed once, after the call.
-        unsafe {
-            var r = pcx.infer_base;
-            while r < pcx.infer_recs.count {
-                let len = pcx.infer_recs.get(r);
-                let count = pcx.infer_recs.get(r + 7);
-                let bound = crate::base::alloc_array::<i64>(count);
-                var free = false;
-                for i in 0..count {
-                    let t = resolve(pcx.infer_recs.get(r + REC_HEAD + i), &pcx);
-                    if mentions(t, false, pcx) {
-                        free = true;
-                        bound[i] = 0;
-                    } else {
-                        bound[i] = t;
-                    }
-                }
-                if free {
-                    crate::front::generics::instantiate::report_unbound(
-                        pcx.infer_recs.get(r + 6), bound, pcx.infer_recs.get(r + 1),
-                        pcx.infer_recs.get(r + 2), pcx.infer_recs.get(r + 3),
-                        pcx.infer_recs.get(r + 4), pcx.infer_recs.get(r + 5), &pcx);
-                }
-                crate::base::free(bound as *u8);
-                r += len;
+        settle_deps(&pcx);
+        var r = pcx.infer_base;
+        var seen: Vec<i64, Comp> = Vec::new_in(Comp {});
+        while r < pcx.infer_recs.count {
+            if !named_before(r, &seen, &pcx) {
+                report_rec(r, &pcx);
             }
+            r += pcx.infer_recs.get(r);
         }
         sweep(&pcx);
+        remap_patterns(&pcx);
         remake_calls(&pcx);
         // (an instance made with a variable is dead: its type arguments the
         // error type, as query mode's instances, which effects, the tools
@@ -527,11 +530,14 @@ pub fn end(m: InferMark, pcx: inout Ctx<Comp>) {
         }
     }
     pcx.infer_recs.count = if pcx.infer_base >= 0 { pcx.infer_base } else { 0 };
+    pcx.infer_deps.count = pcx.infer_dbase;
     pcx.infer_base = m.base;
+    pcx.infer_dbase = m.dbase;
     pcx.infer_live = m.live;
     pcx.infer_nodes = m.nodes;
     pcx.infer_locals = m.locals;
     pcx.infer_fns = m.fns;
+    pcx.infer_closures = m.closures;
 }
 
 // Each Call node of the sweep's range whose callee is an instance made with
@@ -567,11 +573,64 @@ fn remake_calls(pcx: inout Ctx<Comp>) {
 // RULE: F18.6 (a method call or a field on a bare variable) The type is not
 // known: the `type.infer` of the call that made variable v.
 pub fn unknown_error(v: i64, pcx: inout Ctx<Comp>) -> ! {
+    report_rec(pcx.nodes[pcx.types[v].b].x - 1, &pcx);
+    crate::base::diag::err_jump(&pcx)
+}
+
+// (end) Whether each variable record r leaves free is one an earlier
+// record's error named: a `_` and the parameter it was bound to are one
+// variable, one error (rustc's one E0282). The new ones join seen.
+fn named_before(r: i64, seen: inout Vec<i64, Comp>, pcx: inout Ctx<Comp>) -> bool {
+    let count = pcx.infer_recs.get(r + 7);
+    var any = false;
+    var all = true;
+    for i in 0..count {
+        let v = first_free(resolve(pcx.infer_recs.get(r + REC_HEAD + i), &pcx), 0, pcx);
+        if v > 0 {
+            any = true;
+            var found = false;
+            for j in 0..seen.len() {
+                if seen[j] == v {
+                    found = true;
+                }
+            }
+            if !found {
+                all = false;
+                seen.push(v);
+            }
+        }
+    }
+    any && all
+}
+
+// The `type.infer` of the call recorded at r (or of a `_` written in a
+// type, shape -1) when one of its variables is still free; whether it was.
+fn report_rec(r: i64, pcx: inout Ctx<Comp>) -> bool {
+    let count = pcx.infer_recs.get(r + 7);
+    var free = false;
+    for i in 0..count {
+        if mentions(resolve(pcx.infer_recs.get(r + REC_HEAD + i), &pcx), false, pcx) {
+            free = true;
+        }
+    }
+    if !free {
+        return false;
+    }
+    if pcx.infer_recs.get(r + 3) == -1 {
+        let saved = pcx.err_kind;
+        pcx.err_kind = c"type.infer";
+        crate::base::diag::err_begin(pcx.infer_recs.get(r + 1), &pcx);
+        crate::base::diag::err_str(c"cannot infer the type written `_` here (rustc E0282)", pcx);
+        crate::base::diag::err_help(c"nothing in the function says what it is: write the type",
+            pcx);
+        crate::base::diag::err_end_soft(&pcx);
+        pcx.err_kind = saved;
+        return true;
+    }
     // UNSAFE: report_unbound reads the bound types through a raw array, require_bound's.
-    // SAFETY: bound has one slot per parameter of the record's Generics node (count), each written before the call, freed after.
+    // SAFETY: bound has one slot per parameter of the record's Generics node (count), each
+    // written before it is read; freed once, after the call.
     unsafe {
-        let r = pcx.nodes[pcx.types[v].b].x - 1;
-        let count = pcx.infer_recs.get(r + 7);
         let bound = crate::base::alloc_array::<i64>(count);
         for i in 0..count {
             let t = resolve(pcx.infer_recs.get(r + REC_HEAD + i), &pcx);
@@ -580,7 +639,39 @@ pub fn unknown_error(v: i64, pcx: inout Ctx<Comp>) -> ! {
         crate::front::generics::instantiate::report_unbound(pcx.infer_recs.get(r + 6), bound,
             pcx.infer_recs.get(r + 1), pcx.infer_recs.get(r + 2), pcx.infer_recs.get(r + 3),
             pcx.infer_recs.get(r + 4), pcx.infer_recs.get(r + 5), &pcx);
-        crate::base::diag::err_jump(&pcx)
+        crate::base::free(bound as *u8);
+    }
+    true
+}
+
+// RULE: F18.6 (resolve_type) `_` written in a type (`let f: FromFn<_> =
+// ..`), TyName n: a fresh variable, its record shape -1.
+pub fn hole(n: i64, pcx: inout Ctx<Comp>) -> i64 {
+    go_live(&pcx);
+    let rec = pcx.infer_recs.count;
+    let v = fresh(n, rec, &pcx);
+    pcx.infer_recs.push(REC_HEAD + 1);
+    pcx.infer_recs.push(pcx.nodes[n].start);
+    pcx.infer_recs.push(0);
+    pcx.infer_recs.push(-1);
+    pcx.infer_recs.push(0);
+    pcx.infer_recs.push(0);
+    pcx.infer_recs.push(0);
+    pcx.infer_recs.push(1);
+    pcx.infer_recs.push(v);
+    v
+}
+
+// The function being checked makes its first variable: the sweep's nodes
+// are its tree's and those made since.
+fn go_live(pcx: inout Ctx<Comp>) {
+    if !pcx.infer_live {
+        pcx.infer_live = true;
+        let item = pcx.fns[pcx.cur_fn].node;
+        let lo = tree_min(item, item, 0, pcx);
+        if lo < pcx.infer_nodes {
+            pcx.infer_nodes = lo;
+        }
     }
 }
 
@@ -643,5 +734,46 @@ pub fn captured(from: i64, pcx: inout Ctx<Comp>) {
             unknown_in(pcx.locals[l].ty, &pcx);
         }
         i += 2;
+    }
+}
+
+// RULE: F18.6 (assoc::projection) `v::name` of a free variable v: a
+// variable standing for it, solved when v is (settle_deps).
+pub fn dependent(v: i64, name: i64, pos: i64, pcx: inout Ctx<Comp>) -> i64 {
+    var i = pcx.infer_dbase;
+    while i + 3 < pcx.infer_deps.count {
+        if pcx.infer_deps.get(i + 1) == v && pcx.infer_deps.get(i + 2) == name {
+            return pcx.infer_deps.get(i);
+        }
+        i += 4;
+    }
+    let rec = pcx.nodes[pcx.types[v].b].x - 1;
+    let d = fresh(pcx.types[v].b, rec, &pcx);
+    pcx.infer_deps.push(d);
+    pcx.infer_deps.push(v);
+    pcx.infer_deps.push(name);
+    pcx.infer_deps.push(pos);
+    d
+}
+
+// Each variable standing for a projection whose variable is solved to a
+// type with no free one takes the projection's type.
+fn settle_deps(pcx: inout Ctx<Comp>) {
+    var changed = true;
+    while changed {
+        changed = false;
+        var i = pcx.infer_dbase;
+        while i + 3 < pcx.infer_deps.count {
+            let d = pcx.infer_deps.get(i);
+            let base = resolve(pcx.infer_deps.get(i + 1), &pcx);
+            if is_free_var(d, pcx) && !mentions(base, false, pcx) {
+                let t = crate::front::assoc::projection(base, pcx.infer_deps.get(i + 2),
+                    pcx.infer_deps.get(i + 3), &pcx);
+                if t > 0 && t != pcx.ty_error && bind(d, t, &pcx) {
+                    changed = true;
+                }
+            }
+            i += 4;
+        }
     }
 }
