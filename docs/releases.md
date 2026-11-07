@@ -234,8 +234,9 @@ The front (fl10274):
   read it as a raw pointer's arithmetic, `unsafe` (about 32 of gate 3's
   errors). `<I as SliceIndex<[i64]>>::Output` takes the impl its trait
   arguments name (F8.1).
-- A rust hello world's build costs 1.98x MVS's (2.34x in 0.27.3), and
-  the 2.0x ceiling is enforced (tests/compile_cost.sh). A build makes
+- A rust hello world's build costs about 2.0x MVS's (2.34x in 0.27.3);
+  the 2.0x ceiling is enforced from 0.27.5, with std2 lexed lazily
+  (tests/compile_cost.sh prints it). A build makes
   std2's builtin impls only for the primitives the program brings in
   (F15.1: it names them, a literal's suffix, or a word such as `chars`
   or `HashMap` that brings them through std2's types); i32, usize, u8
