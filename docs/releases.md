@@ -130,8 +130,8 @@ std2 (std273):
   `str::parse`, and the env items.
 - std2's cases at -O0 and -O2 under `--check-alloc`: 1,361 of 1,468
   pass (1,309 of 1,454 in 0.27.2.1, with the other streams' merged
-  fixes counted). There are 15 new cases, each agreeing with rustc (tools/std2-twin.sh), and 10
-  XFAIL cases now pass on std2's fixes. The 107 XFAIL cases left, by
+  fixes counted). There are 15 new cases, each agreeing with rustc
+  (tools/std2-twin.sh), and 10 XFAIL cases now pass on std2's fixes. The 107 XFAIL cases left, by
   what they wait for: inference from a later statement or the expected
   type (FL1, 0.27.4) 48; arrays' by-value IntoIterator, which needs
   const generics or a ManuallyDrop (a union's field is dropped today)
