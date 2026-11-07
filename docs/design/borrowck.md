@@ -237,8 +237,14 @@ the reservation is still shared; the IR has `copy _1.0` as an operand
 of the call, not a statement before it). (0.27.5) In a rust body an
 operand is read where it is evaluated, as rustc's `as_operand`: a Copy
 place operand of a call argument (or a callee value), of an array,
-tuple, struct or variant literal's element, or of an assignment's right
-side (`=` and `op=`) is copied into a fresh temporary at that point,
+tuple, struct or variant literal's element, of an assignment's right
+side (`=` and `op=`), or of a primitive binary operator's left side when
+its right side may evaluate a statement of its own (anything but a
+literal, a constant, a place evaluated with no statement as below, or a
+unary, binary or cast operator of those: `pcx.nodes[n].a ==
+intern(c"Self", pcx)` is accepted, `x + f(&mut x)` adds the old `x`;
+rustc's `as_operand` of a binary operator's operands, 0.27.5 front
+gate 3) is copied into a fresh temporary at that point,
 `_t = copy P`, and the statement reads `copy _t`. So a view or a
 reference it reads through is dead after the copy (D3.7) and its loan
 ends there: `f(pcx.nodes[p].start, pcx)` (the slice view of
