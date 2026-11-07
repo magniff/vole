@@ -126,12 +126,14 @@ out (`#[array_builtin(N)]`, a blanket impl, an impl on an instance).
 | feature | release |
 |---|---|
 | `const_ptr_write` (a write through `*const T`) | 0.27.1 |
-| `impl_trait_return`, `where_bound` (a bound on a type that is not a parameter), `array_builtin`, `qualified_path` (a longer path than `<T as Tr>::X`), `auto_trait` (`Send`, `Sync`) | 0.27.2 |
+| `where_bound` (a bound on a type that is not a parameter), `array_builtin`, `qualified_path` (a longer path than `<T as Tr>::X`), `auto_trait` (`Send`, `Sync`) | 0.27.2 |
+| `impl_trait_return` (`-> impl Tr` at the top of a function's result) | 0.27.2.1 |
+| `impl_trait_nested` (`-> Option<impl Tr>`, a trait method's `-> impl Tr`, `let x: impl Tr`) | 0.29 |
 
 ```vole
 // EDITION: rust
-fn adder(k: i64) -> impl Fn(i64) -> i64 {
-    move |x| x + k
+fn adder(k: i64) -> Option<impl Fn(i64) -> i64> {
+    None
 }
 
 fn main() -> i32 {
@@ -140,7 +142,7 @@ fn main() -> i32 {
 ```
 
 ```err
-error[edition.later] 'impl Fn(i64) -> i64' (impl_trait_return) comes with the rust edition in 0.27.2
+error[edition.later] 'impl Fn(i64) -> i64' (impl_trait_nested) comes with the rust edition in 0.29
 ```
 
 ## Options
