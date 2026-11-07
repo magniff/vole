@@ -44,7 +44,8 @@
 #   stale     it is named and agrees: the marker is wrong
 #   outside   the shim cannot make it Rust: a vole-only item is left, or
 #             rustc rejects the text (its first error), or the case says
-#             `// RUSTC: none WHY`
+#             `// RUSTC: none WHY`, or its ERROR is vole's alone (an effect
+#             declaration's: `#[pure]`, `#[effects(..)]`, `#[no_alloc]`)
 # Prints `rustc-twin: N programs: A agree, D differ, K named, S stale, O
 # outside` and the outside's reasons by frequency; exit 1 when one differs
 # or is stale. Scratch: target/rustc-twin/NAME/ (main.rs, the binary, the
@@ -133,6 +134,9 @@ def overflow_checks(src):
     return re.search(r"(^|\s)-O0\b", flags) is not None
 
 
+VOLE_ONLY_ERROR = re.compile(r"error\[effect[\w.]*\]|' is #\[(effects\([^)]*\)|pure|no_alloc|no_io|no_panic)\], but ")
+
+
 def run(prog):
     name, src, want, wexit, stdin, args, merged = prog
     m = re.search(r"^\s*// RUSTC-DIFFERS:\s*(.*)$", src, re.M)
@@ -144,6 +148,11 @@ def run(prog):
         f.write(rs)
     if why:
         return name, "outside", why
+    # (an ERROR case whose error is vole's alone, an effect declaration's
+    # (#[effects(..)], #[pure], #[no_alloc]), has no rustc counterpart:
+    # rustc builds and runs it; a borrowck or type error stays compared)
+    if any(VOLE_ONLY_ERROR.search(e) for e in re.findall(r"^\s*// ERROR:\s*(.*)$", src, re.M)):
+        return name, "outside", "vole-only error: an effect declaration's"
     exe = os.path.join(d, "main")
     # (Rust's overflow checks where vole's are: a case built at -O0)
     bad = rustc_build(RUSTC, os.path.join(d, "main.rs"), exe, rust_edition(src),
