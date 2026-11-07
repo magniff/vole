@@ -84,6 +84,25 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.27.2.1
 
+The front's gaps behind std2's XFAILs (front2721b):
+
+- A generic trait's impl is picked by an own type parameter's bound
+  (`extend<I: IntoIterator<Item = T>>`: Extend<T> over Extend<&T>,
+  F13.3), by the expected type (`let r: &i64 = w.borrow()`, F13.2) and,
+  in an instance, by the receiver's type parameter bound (`s.as_ref()`
+  with `S: AsRef<str>`, F13.4).
+- Literals take their context: `let d: &[u8] = &[1, 2, 3]` is an array
+  of u8 (F18.4), `s.get(1..3)` a `Range<usize>` (F18.3). Integer
+  inference variables (a later statement's type) and the i32 fallback
+  stay 0.27.3's (FL6).
+- A template impl binds an instance's arguments by position only when
+  its header names its parameters in order: `impl<T> SliceIndex<[T]> for
+  Range<usize>` no longer covers `Range<i64>` (F14.2).
+- A reference impl (`impl<A: PartialEq<B>, B> PartialEq<&B> for &A`)
+  yields to a slice's own impl under Z9.1, so std2 can have Rust's
+  reference impls; an ambiguity message for a pattern impl no longer
+  reads past TLISTS (the crash at types.vl:608).
+- `{:E}` is UpperExp, and `{:-}` sets Formatter's sign_minus.
 The borrow checker (bc2721):
 
 - Implied outlives bounds as rustc's well-formedness (borrowck.md
