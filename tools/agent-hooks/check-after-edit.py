@@ -162,6 +162,24 @@ import types
 HERE = os.path.dirname(os.path.abspath(__file__))
 MAX_SHOWN = 10
 TIMEOUT = 30
+
+
+def limit(base):
+    """(0.27.2.1) A compiler run's time limit: base seconds, longer while
+    the machine is loaded, by the load average over the CPUs up to 8 times
+    (tests/watchdog.sh's rule; a release gate at load 150 on 10 CPUs timed
+    the hook's check and fix out, and its rewrites went unreported);
+    $VOLE_HOOK_TIMEOUT: that many seconds instead of base."""
+    try:
+        base = float(os.environ.get("VOLE_HOOK_TIMEOUT") or base)
+    except ValueError:
+        pass
+    try:
+        load = os.getloadavg()[0] / (os.cpu_count() or 1)
+    except (OSError, AttributeError):
+        load = 1.0
+    return base * min(max(load, 1.0), 8.0)
+
 # (0.17) The tests: each case at most CASE_TIMEOUT s, all of them
 # TEST_TIMEOUT s; slower than SLOW_MS, not run after each edit again; not
 # again within DEBOUNCE_S of the last run (the turn-end hook runs them).
@@ -304,7 +322,7 @@ def compiler_version(compiler):
     """(0.25.4) The release compiler says it is (`--version`), or None."""
     import subprocess
     try:
-        r = subprocess.run([compiler, "--version"], capture_output=True, text=True, timeout=10)
+        r = subprocess.run([compiler, "--version"], capture_output=True, text=True, timeout=limit(10))
     except (OSError, subprocess.TimeoutExpired):
         return None
     m = VERSION_OUT.search(r.stdout) if r.returncode == 0 else None
@@ -565,7 +583,7 @@ def run_typed(compiler, cwd, args, root=None):
             env = dict(env if env is not None else os.environ, **case_env)
     try:
         return subprocess.run([typed_name(compiler, cwd)] + args, executable=compiler, cwd=cwd,
-                              capture_output=True, text=True, timeout=TIMEOUT, env=env)
+                              capture_output=True, text=True, timeout=limit(TIMEOUT), env=env)
     except (OSError, subprocess.TimeoutExpired):
         return None
 
@@ -1139,7 +1157,7 @@ def guide_embed(event):
         return got
     before = snapshot()
     try:
-        r = subprocess.run(["sh", script], cwd=top, capture_output=True, text=True, timeout=TIMEOUT)
+        r = subprocess.run(["sh", script], cwd=top, capture_output=True, text=True, timeout=limit(TIMEOUT))
     except (OSError, subprocess.TimeoutExpired):
         return "note hook.guide-embed: compiler/guide/embed.sh did not run\ntry: sh compiler/guide/embed.sh"
     if r.returncode != 0:
@@ -1369,6 +1387,11 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
     if mech or stale:
         done = apply_exact(compiler, root, run_dir, stale, bool(mech))
         again = run_check(compiler, root, run_dir) if done else None
+        if done and again is None:
+            # (0.27.2.1) the check after the fixes could not run (timed
+            # out): what the hook wrote is said all the same, each change
+            hook_fixed = len(mech)
+            fixed_text = fixed_report(mech, done[0], shown, done[1])
         if again is not None:
             diags = again
             errors = [d for d in again if d.get("severity") == "error"]
