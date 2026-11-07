@@ -1277,7 +1277,12 @@ outside the holes named below.
   accepted; one that escapes the function is still refused.
 - L3 Temporaries' scopes are vole's (the statement; the block for `let
   r = &f(x)`), not Rust 2024's tail-expression rule: a difference only
-  in `match`/block tail temporaries. (0.27.3) In the rust edition the
+  in `match`/block tail temporaries. (0.27.5) Nor rustc's extension of a `let`
+  initializer's temporaries through the tails of an `if`'s and a
+  `match`'s branches (Rust 1.79): `let l: &[i64] = if c { &[x, 1] }
+  else { &[2] }; l.len()` is accepted by rustc and refused here
+  (`borrowck.dropped_borrowed`) unless every operand is promotable
+  (D2.8). (0.27.3) In the rust edition the
   condition of an `if` and a match arm's guard are terminating scopes,
   as a `while`'s condition already was (the Rust reference, "Temporary
   scopes"): their temporaries drop once the condition or the guard is
