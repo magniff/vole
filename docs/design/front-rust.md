@@ -1107,7 +1107,11 @@ statement, `let a = [1, 2]; f(&a)` with `f(&[u8])`) are F18.5's.
 tuple type of as many elements for a tuple): `let b: &[i64; 2] = if c {
 &[1, 2] } else { &[3, 4] };` and `if c { &(7, true) } else { &(8, false)
 }` where `&(i64, bool)` goes type their literals from `U`, as rustc's
-expectation does. *Anchor:* `check_mode.vl: check_expr_inner`.
+expectation does. So does a sliced array literal where `&[U]` goes,
+`if c { &[1, 2, 3][1..] } else { &[0][..] }`: the array is a `[U; N]`.
+Not yet the same slicing as a `let`'s whole initializer, `let s: &[i64]
+= &[1, 2, 3][1..];`, which F18.4's hoisting takes first (the fallback,
+`i32`: a type error). *Anchor:* `check_mode.vl: check_expr_inner`.
 
 **F18.5 (integer inference variables: an open local).** In the rust
 edition an unannotated `let x = e;` binding one name, with `e` a literal
