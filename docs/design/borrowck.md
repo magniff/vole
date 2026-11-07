@@ -2156,6 +2156,22 @@ quarter holds over std2's bodies, and the `std-rust` compile-cost row
 stays within 2.0x of MVS's `std`. D17.6's exception (b) (MVS std
 callbacks) is deleted; D17.7's verdict applies to std2's bodies.
 
+**Z7.2 (a build does not solve std2's non-generic bodies again, 0.27.4).**
+In a build (not a query, `check`'s tools, or `--std2-check`) whose std2
+is the embedded text, a std2 body that is not an instance of a template
+(no type parameter, its own or its impl's) is not solved: its verdict is
+clean. The reason: the gate's `std2-check` row solves those same bodies,
+of those same bytes, when the compiler is built (0 errors). Nothing a
+program writes reaches them, so solving them again in every build only
+repeats a verdict already known. This is rustc's model too: core and std
+are not borrow-checked again in each crate. An instance of a std2
+template is still solved per D4.4 in every build, since the program's
+types reach it, and its errors are reported as Z7 says. An std2 read
+from files (`VOLE_STD_TREE`, `--std-tree`) is solved whole, as is every
+body under `--std2-check`. *Anchor:* `places/mod.vl: place_body`,
+`places/borrowck/cache.vl: std_body`. Case
+`rust_b_z72_std2_instance_err`.
+
 **Z7.1 (`Copy` in a rust program).** `τ: Copy` iff `τ` is a number,
 `bool`, `char`, `&T`, a raw pointer, a `fn` type, a tuple or array of
 `Copy` parts, a closure by D19.7, or a type with an impl of std2's
