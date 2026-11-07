@@ -87,6 +87,23 @@ binary is invoked, where its test runner is and which hosts it supports.
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.27.6
+
+The front (front273):
+
+- A method call in a generic body takes the method the body names, as
+  rustc does (Z9.1c). The receiver must be a value of a bounded type
+  parameter, like `(**self)` of `self: &&T` or `c` of `c: C`. It gets
+  the bound's method for the type the parameter stands for, never one
+  found again through that type's references. `via(r)` of `fn via<C:
+  Tag>(c: C) { c.tag() }` with `C = &&str` now runs the reference impl
+  twice and prints 21; 0.27.4 took str's impl for `(**self)` and
+  printed 11.
+- `&mut [1, 2, 3][..]` passed where a `&mut [i64]` goes is accepted, as
+  rustc accepts it (F18.4). 0.27.5 checked the sliced literal against
+  the `&mut` type and refused it with "expected 'inout [i64]', got
+  '[i64]'".
+
 ### What's new in 0.27.5
 
 Gate 3 at 37. std2 has the modules compiler/src uses: `std::time`, `std::fs`, `std::process` and `std::cli`, Rust-shaped, with the translator's rows bending MVS's calls onto them. `fix --edition rust` on a copy of compiler/src now leaves 37 errors (122 in 0.27.4), and `check --borrowck-partial` counts 154 borrowck errors behind them (3,048 in 0.27.4): a rust body reads each operand where it is evaluated (D2.4a), and borrowed literals are promoted (D2.8). In the rust edition, text is not its bytes (F0.6: a `&str` where a `&[u8]` goes is E0308), and the translator writes `b".."` or `.as_bytes()` where bytes are declared; a generic iterator's item is its bound's region, not a borrow of the iterator (D4.6 f); `AsRef` for `&T` with T = `str` no longer calls itself (a stack overflow at run time) nor gives a false outlives (Z9.1c); a borrowed array or tuple literal takes the expected type (F18.4). std2 is lexed by its units from an index made when it is embedded (Z5.2): a rust hello world's check is 1.78x MVS's (2.03x), and the 2.0x ceiling is enforced. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
@@ -145,14 +162,6 @@ The front (front275):
   - The commit hook and the merge driver remake the index, like the rest
     of stdsrc_rust.vl. It adds about 150 KB to that file and 0.5% to the
     compiler's own compile.
-- A method call in a generic body takes the method the body names, as
-  rustc does (Z9.1c). The receiver must be a value of a bounded type
-  parameter, like `(**self)` of `self: &&T` or `c` of `c: C`. It gets
-  the bound's method for the type the parameter stands for, never one
-  found again through that type's references. `via(r)` of `fn via<C:
-  Tag>(c: C) { c.tag() }` with `C = &&str` now runs the reference impl
-  twice and prints 21; 0.27.4 took str's impl for `(**self)` and
-  printed 11.
 
 The translator (g3274):
 
