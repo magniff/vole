@@ -115,6 +115,15 @@ The front (front273):
   - 0.27.5 made such a `&` exclusive, MVS's inout marker, and accepted
     it. MVS keeps the marker.
   - No std2 or rust case relied on it.
+- Octal literals: `0o644`, `0o7_55` and `0o17u8` are read in the rust
+  edition (F23.5). An 8 or 9 among the digits is rustc's "invalid digit
+  for a base 8 literal". MVS still refuses `0o`.
+- A rust-edition generic function with a local whose type names its
+  parameter, like `let v: Vec<i64, A>` in `fn two<A: Allocator>`, now
+  links at -O0 and -O1 (D22.2). In 0.27.4 and 0.27.5, the borrow check's
+  opaque instance made a drop shim for `Vec<i64, Ω>`. Shims are lowered,
+  and that one called a `Vec::drop` that had no instance, so the link
+  failed with an undefined symbol. -O2 was not affected.
 
 ### What's new in 0.27.5
 
