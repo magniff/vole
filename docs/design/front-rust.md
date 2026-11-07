@@ -1651,19 +1651,21 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   element or argument, `Vec<[i64]>`, is the view (`Vec<&[i64]>`) and is
   accepted; rustc rejects it (E0277), F21.2's `type.unsized` under stage
   2 (rust_capture_view_copy writes `Vec<&[i64]>`).
-- **FL11 (the opaque instance's type errors; later, 0.27.3).**
-  borrowck.md D22.2: in 0.27.2.1 an opaque instance reports only the
-  bound-only rule's error (D22.3) on a parameter's own Ω, with no `where`
-  predicate in the template, and the borrow checker's; any other type
-  error leaves the instance out, unreported. rustc reports them all. The
-  gaps: an operator on an Ω through its `Add`/`PartialEq`/`PartialOrd`/
-  `Neg`/`Not`/`Shl` bound (an Ω is a type over `()`, and the operators
-  check the type), a bound's type arguments (`T: AsRef<str>`,
-  `Make<S::Item>`), associated functions and consts (`T::default()`,
-  `A::FREES`), `where` predicates on a projection (`X::Item: Show`), a
-  method of a generic impl over the impl's own parameters, and `*x` with
-  a `Deref` bound. A template that meets one is not counted in `opaque:
-  N templates`.
+- **FL11 (the opaque instance's type errors; 0.27.3).** borrowck.md
+  D22.2: an opaque instance reports its type errors as rustc does
+  (`x + x` of `T: Add<Output = T>` returned as an i64 is E0308), unless
+  it is *unsure*: it meets a gap of the model, and its errors are
+  forgotten. The model now covers operators on an Ω through its bounds,
+  a bound's type arguments and a trait parameter's default, `T::f()` and
+  `T::CONST` of a bound's trait, `*x` with `Deref`, `g[i]` with `Index`.
+  The gaps left, each an unsure instance, so reporting nothing where
+  rustc may: a generic method of a generic trait (`contains<U>` of
+  `RangeBounds<T>`), a `where` predicate in the template, a bound an Ω
+  does not resolve while the instance is made (an impl parameter fixed
+  only by another's bound, F14.1). An `#[array_builtin(N)]` template has
+  no opaque instance. Cases `rust_b_opaque_err_type_mismatch`,
+  `rust_b_opaque_err_bound_args`, `rust_b_opaque_ok_model`.
+
 - **FL12 (a union's field that needs a drop; 0.27.3).** rustc rejects a
   union field that is neither `Copy` nor `ManuallyDrop<_>` (E0740, a
   generic `T` too); vole accepts it and drops no field (F19.7), so std2

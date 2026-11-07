@@ -2072,15 +2072,30 @@ is already reported at that position (a concrete instance's: D4.4's
 dedupe). std2's templates get theirs under `--std2-check` only (the
 `std2-check` row), as their bodies' borrow checking is (Z7).
 
-In 0.27.2.1 the type check reports only D22.3's error, and only for a
-parameter's own Ω in a template without a `where` predicate; every
-other type error in an opaque instance leaves it out, unreported and
-not counted, as it may be the model's gap and not the program's:
-operators on an Ω (`a + b` with `T: Add<Output = T>`, `==` with
-`PartialEq`), a bound's type arguments (`T: AsRef<str>`), `T::f()` and
-`T::CONST`, `where` predicates on projections (`X::Item: Show`). The
-borrow checker's errors are reported in full. Each gap closes in
-0.27.3 (front-rust.md FL11).
+In 0.27.2.1 the type check reported only D22.3's error. From 0.27.3
+(front-rust.md FL11) it reports an opaque instance's type errors as
+rustc does, unless the instance meets a gap of the model, which makes it
+*unsure*: its errors, and those of the instances its check makes, are
+forgotten (`opaque_unsure`, front/opaque.vl build_opaque_instances). The
+model covers operators on an Ω through its bound (`a + b` with `T:
+Add<Output = T>`, `==`, `<`, `-a`, `!a`, `a << b`, `+=`: has_impl, an Ω
+having its bounds' traits), a bound's type arguments and a trait
+parameter's default in a virtual signature (`T: AsRef<str>`'s `as_ref`
+is `fn(&Ω) -> &str`, `Add`'s `Rhs = Self`), `Ω::f()` and `Ω::CONST` of a
+bound's trait (`T::default()`, `A::FREES`: a constant is a literal of its
+type, the instance never lowered), `*d` with `Deref`, `g[i]` with
+`Index`. The gaps that make an instance unsure:
+
+- a generic method of a generic trait (`contains<U>` of
+  `RangeBounds<T>`): its instance lacks the trait's arguments;
+- a `where` predicate in the template (one on a projection, `X::Item:
+  Show`, gives an Ω what the model does not);
+- an error while the instance is made (a bound an Ω does not resolve: an
+  impl parameter fixed only by another's bound, `impl<B, F: Fn(i64) ->
+  Option<B>>`).
+
+An `#[array_builtin(N)]` template (a length parameter) gets no opaque
+instance. The borrow checker's errors are reported in full.
 
 **D22.3 (the bound-only rule)** is front-rust.md §6's: it is what the
 opaque instance checks for every template, used or not; the concrete
