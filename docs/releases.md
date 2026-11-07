@@ -82,6 +82,50 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.2 | `v0.27.2` | 0.27.1 | aarch64-macos | std2 the rust edition's std (1,032 of 1,413 std2 tests at -O0/-O2 under `--check-alloc`, gate 1); the front's rules (docs/design/front-rust.md: pattern and blanket impls, coherence, deref coercion, ranges, format specs); closures in full (kinds, captures, `Send`/`Sync`, bodies borrow-checked, `borrowck.unchecked` retired, E0594/E0596); `[T]`/`str` unsized; the borrow checker's verdict cache; every rust case on std2 |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.27.2.1
+
+The borrow checker (bc2721):
+
+- Implied outlives bounds as rustc's well-formedness (borrowck.md
+  D4.6): a struct's or enum's inferred outlives requirements (RFC 2093,
+  `struct Iter<'a, T> { v: &'a [T] }` gives `T: 'a`), carried through
+  nested fields; an elided lifetime of an impl's header (`impl Ord for
+  str`) is the impl's own, the same at every `Self`; `&self` on an impl
+  for `[T]` or `str`; `Self` of a trait's default method as a type
+  parameter; a bound's `Item = T` and trait arguments
+  (`B: FromIteratorIn<Self::Item, A>`) as equalities; a blanket impl's
+  projection (`U::IntoIter` of an iterator). 28 std2 tests and 3
+  `rust_t_` cases that failed on `borrowck.outlives` or
+  `borrowck.elision` now pass; `tests/std2/check.sh`'s known-gap XFAIL
+  cases with borrowck errors in std2 fall from 45 to 6 (each a front
+  gap: `&mut self` on an impl for a view type reads as `inout [u8]`).
+  10 `rust_b_implied_` cases, each agreeing with rustc.
+
+std2 (std2721):
+
+- Floats print and parse as Rust's (front-rust.md F15.6): std2's `flt`
+  module finds a float's digits with big integers, the shortest that
+  read back as the same float for `{}`, `{:?}` (with `.0`; the exponent
+  form below 1e-4 and from 1e16) and `{:e}`, the exact value rounded
+  half to even for `{:.N}` and `{:.Ne}`; `str::parse` rounds to the
+  nearest float, subnormals included. f32 keeps its own shortest digits
+  (`1.1f32` is `1.1`). The integers' `{:e}` is exact. Checked against
+  rustc on the edge values (0.1, 1e21, 5e-324, NaN, -0.0, inf, f32's
+  1.1 and MAX, the subnormal boundary); bool's FromStr too.
+- `std::env`: `args()` and `args_os()` (views of argv, no allocator),
+  `var_in`, `var_os_in`, the unsafe `set_var` and `remove_var`,
+  `VarError`. argv is the target's: std2/rt/sys_macos.vl or
+  sys_linux.vl, in `std::__sys` (the Linux file is built, not run).
+  `vars_in` and the working directory are 0.27.3's.
+- Tuples of 1 to 6 fields are `PartialEq`, `Eq`, `PartialOrd`, `Ord`
+  and `Hash`; `std::hash::DefaultHasher`; `Debug` for `BufWriter`; the
+  ExactSizeIterator lengths of chunks, windows, hash_map's iterators,
+  `Empty` and `RepeatN`; char's Debug escapes combining marks.
+- `write(w, ..)` stops at the first failed write and returns its error,
+  as Rust's `write!` (a Formatter's failed write fails the later ones).
+- The XFAIL std2 cases grouped by cause and owner; the cases that failed
+  only on their own unused imports or test shapes are fixed.
+
 ### What's new in 0.27.2
 
 The rust edition's std is std2, Rust's std with explicit allocators: a rust-edition program now reads `std::vec::Vec`, `String`, `HashMap`, the iterator adapters, `fmt`, `io` and `thread` as Rust's, and 1,032 of std2's 1,413 tests pass at -O0 and -O2 under `--check-alloc` (gate 1). The front end fills the gaps std2's bodies hit (pattern and blanket impls, coherence, deref coercion, ranges, format specs; the rules are docs/design/front-rust.md). Closures are checked in full: their kinds, captures and signatures, `Send` and `Sync`, and the borrow checker reads their bodies (`borrowck.unchecked` is gone), with Rust's mutability errors E0594 and E0596. `[T]` and `str` are unsized types; their full representation, `impl Trait` in return position and the rest of std2 are 0.27.2.1's. MVS programs compile exactly as before; a rust hello-world's `check` costs about 4.2x MVS's (printed, not enforced; 2.0x is 0.27.4's target). Built and tested on aarch64-macos only.
