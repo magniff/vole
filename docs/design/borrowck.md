@@ -1267,6 +1267,23 @@ outside the holes named below.
   of one substitution with nothing between them; rustc's closure
   signature is higher-ranked there (`for<'p> FnMut(&'p i64)`). Cases:
   `std2_iter_adapters_map`, `_inspect`, `_map_while`, `_scan`.
+  *Closed in 0.27.3:* for a type parameter's substitution `s` and each
+  trait `Tr` of its bounds, the one impl of `Tr` for `s` (a direct impl,
+  else the one blanket impl, `impl<I: Iterator> IntoIterator for I`) has
+  its own D4.6 (d) read in `s`'s slots, as its instance assumes it: an
+  equality bound `Q: Tr2<A = P::B>` of the impl ties `Q::A`'s slots and
+  `P::B`'s (each normalized through `Q`'s and `P`'s substitutions inside
+  `s`, through supertraits: `B: DoubleEndedIterator<Item = A::Item>`
+  names Iterator's Item); an Fn bound `F: FnMut(I::Item) -> B` (or
+  `FnMut(&I::Item)`) of a closure substitution `C` ties each X_C
+  position to the bound's slot there (D19.10 (4)); and so on for the
+  impls the impl's parameters meet their own bounds by (`Copied<Rev<Chain<..>>>`).
+  Sound: each tie is an equality the impl's instance assumes and the
+  caller's call of it requires. *Anchor:* `places/regions.vl:
+  impl_bound_ties, impl_fn_ties`. Case `rust_b_ok_l14_impl_bound_ties`;
+  std2's 10: `std2_iter_iterator_chain`, `_map`, `_map_while`, `_scan`,
+  `_inspect` and `std2_iter_adapters_chain`, `_chain_impl_doubleendediterator`,
+  `_map`, `_mapwhile`, `_scan`.
 
 ## 12. The MVS std boundary (S12, 0.27.1 only)
 

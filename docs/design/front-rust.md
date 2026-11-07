@@ -269,6 +269,25 @@ B> PartialEq<&B> for &A`) matches a slice too; when it and the slice's
 own impl both take a call, the slice's own is chosen (rustc reaches it
 through the reference impl). *Anchor:* `front/convert/mod.vl:
 by_unsized_self`. Case `rust_f_z91_ref_impl_ok`.
+
+**Z9.1b (a reference to a view's place, 0.27.3, FL10's first stage).**
+While `&[T]` is represented as `[T]`, `&mut X` in a rust-edition position
+is a reference to the view (a thin pointer to its two words, the place
+`*self = &self[n..]` writes), not the exclusive view `&mut [T]`, when X
+stands for a view (`&[T]`, `&str`) and:
+(a) X is written as a reference: `&mut &[u8]`, `&mut &'a str`;
+(b) X is `Self` of an impl whose self type is written as one, `impl Read
+for &[u8]`, `impl Pattern for &'b str`: its `&mut self`;
+(c) X is a type parameter without `?Sized` (F21.1: the parser records
+`?Sized` on the parameter, in its list or a `where`), as `R` of `fn
+fill<R: Read>(r: &mut R)` with R = `&[u8]`: a Sized parameter is never
+`[T]`, so a view it stands for is a reference.
+A `?Sized` parameter bound to a view keeps the exclusive view (it may be
+`[T]`; telling `R = &[u8]` from `R = [u8]` is Z9.1c's, the second stage). *Anchor:*
+`front/check/resolve.vl: view_ref_node, sized_param_node`, `front/parser/types.vl:
+parse_ref_rest` (`&mut &[u8]` a TyPtr around the view), `synth_mode.vl:
+synth_index` (`self[n..]` through a `&mut &str`). Cases
+`rust_f_z91b_mut_ref_view`, `rust_f_z91b_sized_param`.
 ### F23 Literals
 
 **F23.1 (string literals).** `"…"` has type `&'static str` in a
