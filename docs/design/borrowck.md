@@ -825,6 +825,13 @@ receiver; ir271 confirms), and the implicit reborrow of a `&mut` local
 at an argument position once the builder emits it (D3.6, ir271 M2).
 Explicit `&mut x` arguments are not two-phase (rustc rejects
 `f(&mut v, v.len())`).
+(0.27.2.1) The writer of std2's `write(w, "..", args)` and `writeln`
+(Rust's `write!(w, ..)`, which is `w.write_fmt(format_args!(..))`, an
+autoref'd receiver) is one too: when `w` is a `&mut` place, the
+desugaring's receiver binding `__r` is the two-phase reborrow `__r =
+&'r mut2 *w`, not a move of `w`, so the arguments read `w` in its
+reservation window (`write(f, "{}", f.width())`) and `w` is usable after
+the call, as rustc's.
 
 ## 8. Moves and initialization (S8)
 
