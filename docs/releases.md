@@ -109,6 +109,18 @@ The front (front274):
   forgotten; std2-check stays at 0.
 - `g[i]` of a `g: &G`, G a struct with Index, reads through the reference
   (F26.3).
+- FL1, stage 1: inference from a later statement (F18.6). In the rust
+  edition a type parameter that a call, a variant or a struct literal
+  leaves free is a type variable. It is solved by the first check that
+  meets a definite type: `let mut v = Vec::new_in(a);` and then
+  `v.push(2i64)` (also after a `v.len()`), a map by its insert, a value
+  passed where its type goes, the tail, an `Err(..)` in a later arm.
+  Solving retypes the function in place and makes its instances again.
+  A variable still free at the function's end is the old `type.infer`,
+  and so is a format hole, `as`, a capture or a method on it before then.
+  An untyped literal fixes `i32` at once (`v.push(1)`: `Vec<i32>`, where
+  rustc may infer from a later use; FL1, case `rust_f_fl1_literal_i32`).
+  std2 at -O0: 1,430 pass, 39 xfail (1,400 and 69).
 
 ### What's new in 0.27.3
 
