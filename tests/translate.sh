@@ -8,6 +8,8 @@
 #            [--translator CMD | --identity] [--ref expect|build]
 #            [--causes FILE] [--triage] [--twin] [-f LIST] [-l] [-v]
 #            [FILTER...]
+#        tests/translate.sh --record query|refactor [-c COMPILER]
+#            [--translator CMD | --identity] [NAME...]
 #
 #   -c COMPILER     the volec to build with (default: target/volec, else
 #                   target/tools/volec)
@@ -95,6 +97,19 @@
 # and the total, `translate: N of M round-trip`. Informational until 0.27.4:
 # the exit code is 0 unless the usage is wrong.
 #
+# --record SUITE (0.27.3, the migration surface): the transcripts of
+# tests/query (SUITE query, NAME.q) or tests/refactor (refactor, NAME.t)
+# regenerated under the rust edition, for review as a diff. A copy of the
+# suite goes to target/translate/record/tests/SUITE (with the root's
+# tests/stdpos.awk, tests/stdkeep.sh and compiler/); each transcript's program
+# (SUITE/NAME/main.vl) is translated in place by the translator; the
+# suite's runner then rewrites every transcript that differs (its -u: the
+# record mode). Prints one line per transcript that changed, with its
+# diff's size, the programs the translator failed on, and
+# `translate: record SUITE: C of N transcripts change (T programs
+# translated, F not)`; the diff is target/translate/record/SUITE.diff.
+# NAME...: only these transcripts.
+#
 # The classification, tests/translate/causes.tsv, is the translator's
 # owners' record of why a program does not round-trip yet: lines
 # `CASE<TAB>CAUSE<TAB>NOTE` (# comments), CASE a NAME or SET/NAME, CAUSE
@@ -120,6 +135,7 @@ CLASSES="$ROOT/tests/translate/causes.tsv"
 LISTS=""
 TRIAGE=0
 TWIN=0
+RECORD=""
 LIST=0
 VERBOSE=0
 usage() { sed -n '2,/^# then one line/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2; exit 2; }
@@ -139,6 +155,7 @@ while [ $# -gt 0 ]; do
 "; shift 2 ;;
         --triage) TRIAGE=1; shift ;;
         --twin) TWIN=1; shift ;;
+        --record) [ $# -ge 2 ] || usage; RECORD=$2; shift 2 ;;
         -l) LIST=1; shift ;;
         -v) VERBOSE=1; shift ;;
         -h|--help) usage ;;
@@ -156,6 +173,56 @@ case "$COMPILER" in /*) ;; *) COMPILER="$(pwd)/$COMPILER" ;; esac
 [ -x "$COMPILER" ] || { echo "tests/translate.sh: no compiler $COMPILER" >&2; exit 2; }
 [ -n "$TRANSLATOR" ] || TRANSLATOR="$COMPILER fix --edition rust"
 [ $IDENTITY = 1 ] && TRANSLATOR=""
+if [ -n "$RECORD" ]; then
+    case "$RECORD" in
+        query) EXT=q ;;
+        refactor) EXT=t ;;
+        *) echo "tests/translate.sh: --record query or refactor" >&2; exit 2 ;;
+    esac
+    R="$ROOT/target/translate/record"
+    rm -rf "$R/tests/$RECORD" "$R/logs-$RECORD"
+    mkdir -p "$R/tests" "$R/logs-$RECORD"
+    cp -R "$ROOT/tests/$RECORD" "$R/tests/" || exit 2
+    for f in stdpos.awk stdkeep.sh; do ln -sf "$ROOT/tests/$f" "$R/tests/$f"; done
+    # (std's files where the transcripts' relative paths find them)
+    [ -e "$R/compiler" ] || ln -s "$ROOT/compiler" "$R/compiler"
+    names="" n=0 ntr=0 nbad=0
+    for t in "$R/tests/$RECORD"/*.$EXT; do
+        name=$(basename "$t" .$EXT)
+        if [ $# -gt 0 ]; then
+            case " $* " in *" $name "*) ;; *) continue ;; esac
+        fi
+        names="$names $name"
+        n=$((n + 1))
+        d="$R/tests/$RECORD/$name"
+        [ -f "$d/main.vl" ] && [ -n "$TRANSLATOR" ] || continue
+        # shellcheck disable=SC2086
+        (cd "$d" && $TRANSLATOR "$d/main.vl") >"$R/logs-$RECORD/$name.out" 2>&1
+        rc=$?
+        if [ $rc -eq 0 ] || { [ $rc -eq 1 ] && [ "$(head -1 "$d/main.vl")" = "// EDITION: rust" ]; }; then
+            ntr=$((ntr + 1))
+        else
+            nbad=$((nbad + 1))
+            echo "no-translation $RECORD/$name: exit $rc: $(grep . "$R/logs-$RECORD/$name.out" | tail -1 | cut -c1-160)"
+        fi
+    done
+    # (the suite's own record mode: every transcript that differs rewritten)
+    # shellcheck disable=SC2086
+    sh "$R/tests/$RECORD/run.sh" -c "$COMPILER" -u $names >"$R/$RECORD.run" 2>&1
+    : >"$R/$RECORD.diff"
+    changed=0
+    for name in $names; do
+        if ! diff -u "$ROOT/tests/$RECORD/$name.$EXT" "$R/tests/$RECORD/$name.$EXT" \
+            >"$R/logs-$RECORD/$name.diff" 2>&1; then
+            changed=$((changed + 1))
+            cat "$R/logs-$RECORD/$name.diff" >>"$R/$RECORD.diff"
+            echo "changed $RECORD/$name.$EXT: $(grep -c '^[-+][^-+]' "$R/logs-$RECORD/$name.diff") lines"
+        fi
+    done
+    echo "translate: record $RECORD: $changed of $n transcripts change ($ntr programs translated, $nbad not; translator: ${TRANSLATOR:-identity})"
+    echo "translate: the diff: ${R#"$ROOT"/}/$RECORD.diff"
+    exit 0
+fi
 case ",$SETS," in
     *,guide,*) sh "$ROOT/tests/guide/run.sh" --split "$ROOT/target/translate/guide-blocks" || exit 2 ;;
 esac
@@ -366,6 +433,27 @@ def compare(want, r, d):
     return None
 
 
+Q7_RX = re.compile(r"(?<!&)&(?!&)\s*(mut\s+)?(-?[0-9]|\"|\[|\(|true\b|false\b|[A-Z][A-Z0-9_]+\b)")
+
+
+def q7(cause, log):
+    """Whether a borrowck failure is L2/Q7's (borrowck.md: rvalue static
+    promotion, `let r: &'static i64 = &3;`): a temporary's region error at
+    a line that borrows a literal or a constant."""
+    if cause not in ("borrowck dropped_borrowed", "borrowck return_local", "borrowck outlives"):
+        return False
+    try:
+        out = open(log).read()
+    except OSError:
+        return False
+    m = re.search(r"^(.*?):(\d+):\d+: error\[borrowck\.", out, re.M)
+    if not m or not os.path.isfile(m.group(1)):
+        return False
+    lines = open(m.group(1), encoding="utf-8", errors="replace").read().split("\n")
+    k = int(m.group(2)) - 1
+    return 0 <= k < len(lines) and Q7_RX.search(lines[k]) is not None
+
+
 def twin(key, w, mine, src, d, want):
     """The rustc twin of a translation that round-trips: (verdict, why)."""
     if len([f for f in os.listdir(os.path.dirname(mine)) if f.endswith(".vl")]) > 1:
@@ -451,7 +539,7 @@ def one(prog):
             return key, "no-translation", f"exit {r.returncode}: " + (last[-1] if last else "")[:160]
     bad = build(mine, w, d, os.path.join(w, "prog"), True, os.path.join(w, "compile.out"))
     if bad:
-        return key, bad[0], bad[1][:200]
+        return key, bad[0], bad[1][:200] + (" [Q7?]" if q7(bad[0], os.path.join(w, "compile.out")) else "")
     if "BUILD" in d["has"]:
         return key, "ok", ""
     r = run_prog(os.path.join(w, "prog"), w, d)
@@ -533,6 +621,9 @@ codes = {}
 for r in results:
     if r[1].startswith(("type ", "borrowck ")):
         codes[r[1]] = codes.get(r[1], 0) + 1
+nq7 = sum(1 for r in results if r[2].endswith("[Q7?]"))
+if nq7:
+    print(f"translate: Q7 (rvalue static promotion, L2): {nq7} failures borrow a literal or a constant")
 if codes:
     print("translate: codes: " + ", ".join(f"{c} {n}" for c, n in sorted(codes.items(), key=lambda x: (-x[1], x[0]))[:12]))
 # the classification
