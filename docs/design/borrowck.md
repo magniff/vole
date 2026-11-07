@@ -1794,9 +1794,8 @@ of a frame-owned place is `borrowck.return_local` (D6.2.2: the
 returned value's slots carry `end('u)`); storing it in a longer-lived
 place is `borrowck.dropped_borrowed` at the captured local's
 `StorageDead` (D2.5); a `move` closure of owned values escapes freely.
-Until §21, a closure leaves a function only as a value of a generic
-parameter's type; `-> impl Fn*(..)` is `edition.later:
-impl_trait_return (0.27.2.1)`.
+A closure leaves a function as a value of a generic parameter's type,
+or (0.27.2.1, §21) by `-> impl Fn*(..)`.
 
 **D19.9 (drops).** `dropck(C) = ⋃ dropck(τₖ)` over the `val` captures
 (D9.1), mapped into `C`'s slots; a `ref`/`mut` field and `X_C`
@@ -1949,6 +1948,58 @@ follows from `'cₖ`'s by the field's implied bound.) `Scope::spawn`'s `F:
 ## 21–22. `impl Trait` in return position; the opaque instance (0.27.2.1)
 
 Appended with 0.27.2.1 (D21, D22; L10–L12 are reserved for them).
+
+### §21 `impl Trait` in return position
+
+**D21.1 (the opaque type).** `fn f<P..>(..) -> impl Tr₁ + .. + Trₘ`, a free
+function or an inherent method of a rust-edition file with the `impl` at the
+top of its result (L10), declares `O_f`, a nominal type per function and per
+instance: `front/opaque.vl`, a distinct type whose underlying type is the
+hidden type `H_f` once `f`'s body is checked. `slots(O_f) = slots(H_f)`;
+`needs_drop(O_f) = needs_drop(H_f)`; the code generators see `H_f`
+(distinct types are erased). A trait method's `-> impl Tr`, `Option<impl
+Tr>` and an `impl Tr` anywhere else are `edition.later: impl_trait_nested
+(0.29)`.
+
+**D21.2 (the hidden type and the member choice).** `H_f` is the type of
+the first value that leaves `f` (a `return`'s, else the tail's); every
+other must be `H_f` (`opaque.mismatch`, E0308), and `H_f` satisfies every
+bound (E0277). A closure value takes its parameter types from an `Fn*`
+bound (D20.3). Regions: each slot `e` of the result is a universal `'oₑ`
+(`U_OPAQUE`) that every input universal of `f` outlives (D21.3's capture
+of them all), the slots related among themselves (one region to the
+universals' order). After the solve, the *reaching* inputs of `'oₑ` are
+the input universals `'v` with a path `'v : .. : 'oₑ` of the body's
+constraints (a loan of `'v` flows into the slot); they must all outlive one
+member, an input universal or `'static`, which `'oₑ` is. No member is
+`opaque.ambiguous` (rustc E0700: `if c { x } else { y }` of `x: &'a T, y:
+&'b T` into one slot); a frame-local loan reaching the result is
+`borrowck.return_local`. Each slot chooses alone: a closure capturing `x:
+&'a` and `y: &'b` into two slots is accepted, as rustc does. (This replaces
+the plan's `low('r)` reading, which made `fn f<'a, 'b>(x: &'a T, y: &'b T)
+-> impl Tr { x }` ambiguous where rustc accepts it.)
+
+**D21.3 (the caller side).** At a call the result's slots are the call
+regions of the `'oₑ`, which every argument's call region outlives: a loan
+in any argument stays live while the result is (Rust 2024's capture
+rule). The caller never sees `H_f`: `O_f`'s methods are its bounds' and
+their supertraits' (F2.2) and the blanket impls' its bounds entail
+(`impl<I: Iterator> IntoIterator for I`); another is E0599; `O_f`
+implements the bounds' traits and no other; `O_f: Copy` only if `Copy` is
+a bound; `O_f` converts to nothing (`let x: H = f()` is E0308). Auto
+traits leak: `O_f: Send` iff `H_f: Send` (AT4). A method or a call of
+`O_f` is `H_f`'s; a caller checked before `f`'s body has it checked first
+(`check::check_nested`).
+
+**D21.4 (restrictions).** `f`'s hidden type is `O_f` itself, or `f`'s
+body needs `H_f` while it is being found (a recursive call's method): 
+`opaque.cycle` (E0720). No `use<..>`: every input lifetime is captured.
+`-> impl Fn*(A..) -> R` is the returned-closure case (D19.8).
+
+- **L10** (0.27.2.1) One opaque type per function, at the top of its
+  result; the hidden type's associated types are seen by the caller
+  (`Iterator<Item = X>`'s `next` gives `H_f`'s item type, which the bound
+  equates; with a bare `Iterator` bound rustc keeps it opaque).
 
 ## 23. std2 as the edition's std: the IR's rules (Z7–Z9)
 

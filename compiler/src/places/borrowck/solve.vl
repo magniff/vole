@@ -17,7 +17,7 @@ use crate::front::types::{TyKind, type_elem};
 use crate::places::borrowck::{Bck, LOAN_WORDS, bit_on};
 use crate::places::ir::{Body, LF_STATIC, has_flag, local_ty, undistinct};
 use crate::places::regions::{
-    RO_LOAN, RO_LOCAL, RO_UNIVERSAL, U_BOUND, U_CSLOT, U_ELIDED, U_ENV, U_NAMED, U_STATIC,
+    RO_LOAN, RO_LOCAL, RO_UNIVERSAL, U_BOUND, U_CSLOT, U_ELIDED, U_ENV, U_NAMED, U_OPAQUE, U_STATIC,
     region_word, slot_count, slot_var,
 };
 
@@ -105,6 +105,7 @@ pub fn solve(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
         }
     }
     universal_violations(&bck, pbody, &pcx);
+    opaque_choice(bck, pbody, &pcx);
 }
 
 fn set_bit(r: i64, bit: i64, bck: inout Bck<Comp>) {
@@ -176,6 +177,91 @@ fn set_outlives(u: i64, v: i64, bck: inout Bck<Comp>) {
 pub fn outlives(u: i64, v: i64, bck: Bck<Comp>) -> bool {
     u >= 0 && v >= 0 && u < bck.nuniv && v < bck.nuniv
         && (bck.outlives[u * nwu(bck) + (v >> 6)] >> (v & 63)) & 1 != 0
+}
+
+// RULE: D21.2 (0.27.2.1) The member choice of each slot 'o of an `impl Tr`
+// result (U_OPAQUE, places/regions.vl sig_of): the inputs that reach 'o by
+// the body's constraints (`'v: .. : 'o`, a loan of theirs in the slot)
+// must all outlive one input or 'static, which 'o is. None is
+// opaque.ambiguous (rustc E0700: the hidden type captures a lifetime that
+// is none of them). A local's loan reaching the result is
+// borrowck.return_local.
+fn opaque_choice(bck: Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    let ne = bck.edges.len() as i64 / 3;
+    var reached = Vec::<i64, Comp>::new_in(Comp {});
+    var seen = Vec::<i64, Comp>::new_in(Comp {});
+    var stack = Vec::<i64, Comp>::new_in(Comp {});
+    for o in 0..bck.nuniv {
+        let ro = universal_var(o, bck);
+        if ro <= 0 || region_word(ro, 0, pbody) != U_OPAQUE {
+            continue;
+        }
+        reached.clear();
+        for v in 1..bck.nuniv {
+            let r = universal_var(v, bck);
+            if r <= 0 || region_word(r, 0, pbody) == U_OPAQUE {
+                continue;
+            }
+            seen.clear();
+            for _ in 0..bck.nreg + 1 {
+                seen.push(0);
+            }
+            stack.clear();
+            stack.push(r);
+            seen[r] = 1;
+            var hit = false;
+            while stack.len() > 0 && !hit {
+                let x = stack.pop().unwrap();
+                for e in 0..ne {
+                    let sub = bck.edges[3 * e + 1];
+                    if bck.edges[3 * e] == x && seen[sub] == 0 {
+                        seen[sub] = 1;
+                        hit = hit || sub == ro;
+                        stack.push(sub);
+                    }
+                }
+            }
+            if hit {
+                reached.push(v);
+            }
+        }
+        if reached.len() < 2 || has_member(reached, bck, pbody) {
+            continue;
+        }
+        let m = buf_new();
+        buf_str(m, c"the `impl Trait` result captures ");
+        buf_universal(m, reached[0], bck, pbody, pcx);
+        buf_str(m, c" and ");
+        buf_universal(m, reached[1], bck, pbody, pcx);
+        buf_str(m, c" in one place, and neither outlives the other: its hidden type's lifetime is ambiguous (rustc E0700)");
+        let node = pcx.nodes[pbody.node].b;
+        report_error_tries(pcx.nodes[if node > 0 { node } else { pbody.node }].start,
+            3000 + 63 * 64, c"opaque.ambiguous", buf_slice(m).ptr,
+            c"name one lifetime on the references it returns (`x: &'a T, y: &'a T`), or add the bound `'b: 'a`",
+            "", false, &pcx);
+        return;
+    }
+}
+
+// Whether one input universal (or 'static) is outlived by every universal
+// of `reached`.
+fn has_member(reached: Vec<i64, Comp>, bck: Bck<Comp>, pbody: Body<Comp>) -> bool {
+    for m in 0..bck.nuniv {
+        let r = universal_var(m, bck);
+        if m > 0 && (r <= 0 || region_word(r, 0, pbody) == U_OPAQUE) {
+            continue;
+        }
+        var all = true;
+        for v in reached.as_slice() {
+            if !outlives(v, m, bck) {
+                all = false;
+            }
+        }
+        if all {
+            return true;
+        }
+    }
+    false
 }
 
 // RULE: D6.2.1 (a constraint into a universal that holds an `end` the
@@ -378,6 +464,8 @@ fn buf_universal(m: i64, u: i64, bck: Bck<Comp>, pbody: Body<Comp>, pcx: Ctx<Com
         buf_str(m, c"the lifetime of the closure's parameter '");
         crate::places::borrowck::diag::buf_place(m, x, 0, 0, pbody, pcx);
         buf_str(m, c"'");
+    } else if kind == U_OPAQUE {
+        buf_str(m, c"the lifetime of the `impl Trait` result");
     } else if kind == U_ENV {
         buf_str(m, c"the lifetime of the closure's environment");
     } else if kind == U_CSLOT {
