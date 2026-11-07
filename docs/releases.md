@@ -205,6 +205,38 @@ std2 (std2721):
 - The XFAIL std2 cases grouped by cause and owner; the cases that failed
   only on their own unused imports or test shapes are fixed.
 
+Contracts and effects R2 (eff2721, docs/design/contracts-effects.md):
+
+- A declared function's set is its signature (E3.1a): a rust-edition
+  caller sees `#[effects(..)]`, not the body; the hidden bits the
+  optimizer reads stay the body's. A list may name a type parameter
+  (`#[effects(panic, T, A)]`, E3.3a): what the edges made for it do
+  passes through, checked per instance; so does what a call through a
+  fn value reaches (closed world), kept apart from the rest by the
+  solve (`fixed ∪ dyn`, cycles split per member).
+- Every std2 `pub` function and inherent method is declared: 626 of
+  626 (`query items std --undeclared`), written by the new `volec fix
+  --only effects` (`effects-std` prints std's lines, which
+  tools/std2-effects.py writes into compiler/std2 as the union over
+  the std2 cases).
+- `global` is `static` (E1.2): left out of a set's display, shown by
+  `--why static` and named so in messages (`touches a static mut or a
+  C static`); `#[effects(global)]` and `--why global` stay as aliases.
+- `Allocator::FREES` (E4.4a): `deallocate` of an allocator whose
+  `FREES` is false (an arena, a scope, a FixedBuf, through `&A`) adds
+  no `alloc(A)`: dropping a Vec on an arena is `#[no_alloc]`.
+- A trait method's `requires`/`ensures` bind every impl in the program
+  (C7.6), checked before the impl's own; `volec query contracts
+  Tr::m` lists them and what each impl adds (`(trait)` marks a copy).
+- std2's clauses: 27 `requires` (Vec's insert, remove, swap_remove,
+  split_off; the slices' split_at, chunks, windows, swap,
+  copy_from_slice...; String's char boundaries; Option's and Result's
+  unwrap and expect; char::from_digit) and 11 `ensures` (Vec's push,
+  pop, insert, remove, truncate, clear, reserve, with_capacity_in,
+  `len() <= capacity()`; String's push and clear), each with a
+  `std2_contract_*` case. A query in query mode no longer reaches ⊤
+  through an error-typed instance's fn value.
+
 Compile cost and the machine's load (cost2721):
 
 - hello-rust from 4.38x its MVS row to 3.35x (`tests/compile_cost.sh`,
