@@ -131,6 +131,11 @@ The front (front274):
   variant pattern of a variable's enum (the `?`'s match) names the
   solution's variant, which fixes a `FromStr` impl that read `0` fields.
   std2 at -O0: 1,438 pass, 31 xfail.
+- An `if` with an `else`, a `match` or a block whose values are literal
+  trees makes its `let` open (F18.5), as a literal does: `let e0 = if c
+  { 1 } else { 0 };` takes `i64` from a later `for i in e0..np`, and
+  `let b = if c { 0xf8000000 } else { 0 }; let x: i64 = b;` is no longer
+  out of range for i32. A `for` range's open start takes the end's type.
 - F30.2, `&raw const P` and `&raw mut P`, in the rust edition: a place's
   address, a raw pointer, with no reference made. `&raw mut S` of a
   `static mut` needs no `unsafe`; a field of one, `&raw const S.n`, does
