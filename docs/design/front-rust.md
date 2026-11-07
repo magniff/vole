@@ -688,7 +688,9 @@ by_expected, by_param_bound, dispatch`.
 self type `σ`, or in a trait argument `aᵢ`, or is determined by a
 projection of a constrained parameter through a bound in `W` (`impl<B,
 I: Iterator, F: FnMut(I::Item) -> B> Iterator for Map<I, F>`: `B` is
-fixed by `F`'s bound's result position, `I` by `σ`). Unification at a
+fixed by `F`'s bound's result position, `I` by `σ`; the result may be
+a type with arguments, `P: FnMut(I::Item) -> Option<B>` for MapWhile and
+Scan, 0.27.2.1). Unification at a
 goal runs over the whole header and, for a parameter constrained only
 through a bound, over the bound's projection after the rest is bound
 (so `impl<T> SliceIndex<[T]> for usize` binds `T` from the goal's
@@ -813,6 +815,14 @@ then, with `τ` concrete, the traits in scope (F9.2) that `τ` implements
 and that declare `name`; with `τ` a parameter, its bounds (F0.4a).
 Ambiguity is F9.3's. `<τ>::name` with an explicit type is what
 disambiguates a primitive (`<i64>::MAX`, `<[T]>::len`).
+
+**F8.4 (`<τ as Tr>::name` in an expression).** With `τ` a name
+(`<i32 as FromStr>::from_str("-7")`, `<W as Make>::make()`), the path
+`τ::name` (F8.3). In 0.27.2.1 the trait is parsed and not kept, so two
+traits in scope that both declare `name` for `τ` are F9.3's ambiguity,
+where rustc takes `Tr`'s; a `τ` that is not a name (`<Vec<T> as
+Tr>::f`) is a parser error. *Anchor:* `front/parser/exprs.vl:
+parse_primary`. Case `rust_f_f8_qualified_call_ok`.
 
 ### F9 Method name clash
 
@@ -1000,6 +1010,20 @@ PartialOrd>::lt(&a, &b)`, resolved per instance; without the bound,
 `error generic.unbounded_use` (E0369, "binary operation `<` cannot be
 applied to type `T`") with `try: T: PartialOrd`. `==` needs
 `PartialEq`; `+` needs `Add<Output = ..>`.
+
+**F26.3 (a comparison's right operand of another type).** On std2, `a
+== b`, `a < b` and the others with `a` of a struct or enum type and `b`
+of another (not a literal that takes its type from context; an array
+literal does not) check `b` alone: the impl of `PartialEq<Rhs>` or
+`PartialOrd<Rhs>` its type picks decides (`s == "x"` with `impl
+PartialEq<str> for String`, `v == [1, 2]`, `v == other_vec_in_arena`).
+When the operand is a view (`[T]`, `str`, Z9.1, where `&str` is the view
+too), an impl whose argument is written `&..` yields to one that is not:
+`PartialEq<str>` and `PartialEq<&'a str>` compare alike (0.27.2.1). An
+arithmetic operator's right operand stays checked against `a`'s type in
+0.27.2.1: the operator call frees a by-value operand that drops twice.
+*Anchor:* `front/check/synth_mode.vl: synth_operands`,
+`front/convert: by_view_rhs`. Case `rust_f_f26_cmp_rhs_ok`.
 
 ### F27 Patterns in `let` and parameters
 
@@ -1193,6 +1217,13 @@ for usize { type Output = T; .. }`, `for Range<usize> { type Output =
 `&mut c[i]`, `c[i].m()` with `m` taking `&mut self` (F6.2's `&mut`
 autoref) use `index_mut`; a `τ` with `Index` but no `IndexMut` is
 `error trait.unmet` naming `IndexMut` (E0594's shape).
+
+**F20.5 (a tuple index of literals).** `g[(0, 1)]` with `G:
+Index<(usize, usize)>`: a tuple of unsuffixed literals takes its
+elements' types from the impl's index type, as one literal does
+(`(i64, i64)` only when no impl takes an integer tuple; 0.27.2.1).
+*Anchor:* `front/convert: literal_kind, literal_tuple_fits`. Case
+`rust_f_f20_tuple_index_ok`.
 
 ## 6. The bound-only rule (D22.3's front side; U1)
 
