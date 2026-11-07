@@ -375,6 +375,21 @@ rust-edition position, with these readings:
 - *Sized* (F21.1). A parameter without `?Sized` bound to `Unsized(v)` is
   `type.unsized` (E0277), checked with the bounds of every struct, enum
   and function instance (`traits.vl: check_bounds`).
+- *A receiver written `*v` of a view* (0.27.5). `*v` is read as the view
+  (Z4.1's reading), but as a receiver it is the place `Unsized(v)`, as
+  rustc's probe starts from `str`: only the place's methods take it
+  (their `&self` the view), never an impl for `&T`. So `(**self).as_ref()`
+  in `impl<T: ?Sized + AsRef<U>, U: ?Sized> AsRef<U> for &T` with `T =
+  str` is `<str as AsRef<[u8]>>`, in an instance too, with or without an
+  expected type (before, with `let b: &[u8] = ..` the reference impl took
+  it, called itself, and the program overflowed its stack).
+- *`&'a T` of an unsized argument in a signature* (0.27.5, D4.6). With
+  `T = Unsized(v)`, `&'a T` is the view `v` whose region is the
+  reference's (`'a`, or the elided one, E2/E3's), with T's slots (the
+  elements') under it, not a region of T's: the result `&U` of `fn
+  as_ref(&self) -> &U` with `U = [u8]` is `&self`'s region, so
+  `AsRef::as_ref(*self)` in the impl for `&T` is no
+  `borrowck.outlives` (rustc accepts it).
 - *`&e` of a view value.* `&e`/`&mut e` of a call's view
   (`&mut "ab".as_bytes()`) is a reference to a temporary view,
   `&mut &[u8]`; `&v[..]` stays the place's view.
