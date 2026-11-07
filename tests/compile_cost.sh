@@ -17,11 +17,11 @@
 # (the previous release has no std2), against its own MVS rows above:
 #
 #   hello-rust  a rust hello world built, at most 2.0x hello's (target 1.5x;
-#               printed, not failing: the ceiling 2.0x is enforced from
-#               0.27.4; 0.27.2 shipped at about 4.4x, 0.27.2.1 at 3.35x:
-#               the rest is std2 lexed and parsed whole, +47M, its builtin
-#               impls, 33M, and println's back end, +40M; lazy std2
-#               sections and a lighter println are 0.27.3's)
+#               enforced from 0.27.4, which ships at 1.98x: a build makes
+#               the builtin impls of the primitives the program names
+#               only, F15.1; 0.27.2 shipped at about 4.4x, 0.27.2.1 at
+#               3.35x, 0.27.3 at 2.32x; the rest is std2 lexed whole,
+#               the lazy lex is 0.27.5's)
 #   std-rust    tests/cost/std2_heavy.vl built, at most 2.0x std's (target 1.5x)
 #
 # Instructions, not time: they hardly move with the machine's load. They
@@ -134,7 +134,7 @@ VOLE_STD2=0
 export VOLE_STD2
 measure rust 1.5 check rust_heavy.vl
 unset VOLE_STD2
-measure_edition hello-rust 2.0 1.5 0 "$hello_new" hello_rust.vl -c -o hello_rust.o
+measure_edition hello-rust 2.0 1.5 1 "$hello_new" hello_rust.vl -c -o hello_rust.o
 measure_edition std-rust 2.0 1.5 1 "$std_new" std2_heavy.vl -c -o std2_heavy.o
 if [ $FAILED -ne 0 ]; then
     echo "compile-cost: a compilation is dearer than the previous release allows (see above; --time-passes splits it by phase, and std's sections: tests/std/core_sections.sh)"
