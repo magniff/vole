@@ -131,6 +131,11 @@ The front (front274):
   lock's address that way.
 - `e as *const _` and `e as *mut _` take the pointee from the operand
   (F29.1). An integer cast to one is E0641.
+- A closure whose body is a captured integer widened to its bound's
+  result type (`move || k` with `FnOnce() -> i64` and `k` an i32, as a
+  loop's `thread::spawn_in(move || k, gpa)`) failed the build ("places: a
+  function not lowered from its body", MVS too): the capture is found
+  under the widening cast now.
 
 ### What's new in 0.27.3
 
