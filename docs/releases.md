@@ -161,7 +161,7 @@ The translator (g3274):
   distinct.mix, 1 item.private); borrowck (partial), with front275's
   D2.4a: 161.
 
-std2 (fl10274), for the modules compiler/src uses:
+std2 (std2275), for the modules compiler/src uses:
 
 - `std::time`: `Duration` (`new`, `from_secs`..`from_nanos`,
   `from_secs_f64`/`f32` and their `try_`, `as_*`, `subsec_*`, `checked_*`,
