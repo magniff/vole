@@ -395,7 +395,10 @@ gap 13, where MVS makes the cast itself unsafe). Everything else is
 `error type.cast` (E0605/E0606). *Anchor:* `synth_cast` ("cannot cast
 ..", today requiring `unsafe` for int→ptr), `front/check/unsafety.vl`. (0.27.3:
 `&T as *const U` with `U` not `T` is an error, rustc E0606; it read a
-`T` as a `U`.)
+`T` as a `U`.) (0.27.4: `e as *const _` and `e as *mut _` take the
+pointee from the operand, `T` of a `&T`, `&mut T`, `*const T` or `*mut
+T`; of any other operand, an integer, the pointee is not known: `error
+type.cast`, rustc E0641 "cannot cast to a pointer of an unknown kind".)
 
 **F29.2 (fat pointers).** Z9.3.
 
