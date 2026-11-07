@@ -2887,6 +2887,28 @@ unsafe-audit 2775 unjustified (baseline 2775, from 3057) and 0 in std,
 chain-diverse, chain-fresh 40 releases. compile-cost against v0.26.5: a
 hello world 1.00x, std 0.99x, check of the compiler 1.01x.
 
+### 0.27.2.1
+
+The release gate (`gate.sh --release --no-linux -j 5`), macOS only. Its
+first run, at load 116 to 136 on 10 CPUs, passed every row but the
+three suite rows, each failing only the hooks' real-compiler case "the
+hook's rewrites" (its check timed out under the load); the three rows
+rerun alone with `--only` passed. The rows: the suite 6620 at -O0, -O1
+and -O2 (253 XFAIL; SKIPPED: no spirv-val, and the voltty encode
+budget under load), std2-tests 1309 at -O0 and -O2 under --check-alloc
+(148 XFAIL, gate 1: 1000), std2-check 1314 bodies (1311 clean, 0 with
+borrowck errors, 3 not solved; 25 XFAIL cases with borrowck errors in
+std2), threads 15151, incremental 172 series, objcheck 12440 (and 264
+for x86_64-macos), compiler-memcheck 727, examples-checkalloc 183,
+every fuzz and ABI row, stress-grow, cachediff 1474 lines (425 from
+the cache), borrowck-twin 400 cases (358 agree, 10 named divergences,
+32 outside the subset, 0 mismatches), unsafe-audit 2773 unjustified
+(baseline 2773) and 0 in std, chain-fresh (43 releases from the seed),
+chain-diverse. compile-cost against v0.27.2: a hello world 1.01x, std
+0.99x, check of the compiler 0.93x, the rust row 0.96x; hello-rust
+3.57x its MVS row (printed; the 2.0x ceiling is enforced from 0.27.4),
+std-rust 0.61x.
+
 ### 0.27.2
 
 The release gate (`gate.sh --release --no-linux`), macOS only. Its
