@@ -84,6 +84,22 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.3 | `v0.27.3` | 0.27.2.1 | aarch64-macos | the translator `fix --edition rust` and gate 2 (`tests/translate.sh`, the rustc twin); the i32 literal default (FL6); std2 1,402 of 1,472 tests at -O0; lazy std2 parsing (a rust hello world 2.32x MVS's); arrays' by-value IntoIterator |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.27.5
+
+The front (front275):
+
+- A rust body reads each operand where it is evaluated, as Rust does
+  (borrowck.md D2.4a). A Copy place given as an argument, a literal's
+  element or an assignment's right side is copied out at that point.
+  - The view or reference it reads through ends there, so rustc's
+    accepted shapes now pass the borrow checker:
+    `err_begin(pcx.nodes[p].start, pcx)`, `pcx.nodes[p].b =
+    pcx.nodes[q].a`, `v.push(v[0])`, `f(s.x, &mut s)`, `g(y, &mut y)`.
+    These were about 2,750 of gate 3's 3,042 borrowck errors.
+  - It is also a run-time fix: `f(x, { x += 1; x })` now passes the old
+    `x` first, and `v[{ y += 1; 0 }] = y` stores the old `y`, as in Rust.
+  - MVS is unchanged.
+
 ### What's new in 0.27.4
 
 The front (integrator):
