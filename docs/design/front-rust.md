@@ -288,6 +288,55 @@ A `?Sized` parameter bound to a view keeps the exclusive view (it may be
 parse_ref_rest` (`&mut &[u8]` a TyPtr around the view), `synth_mode.vl:
 synth_index` (`self[n..]` through a `&mut &str`). Cases
 `rust_f_z91b_mut_ref_view`, `rust_f_z91b_sized_param`.
+
+**Z9.1c (the unsized place type, FL10's second stage; 0.27.3, after
+front273's FL6).** Z9.1's meaning gets a type of its own.
+- *The type.* `TyKind::Unsized` (a = the view: `Slice(T)` with b = 0,
+  or std's str) is the unsized place `[T]`/`str`. It is made only in a
+  rust-edition position: `[T]` or `str` written anywhere but directly
+  under `&`, `&mut`, `*const`, `*mut` (an impl's self type, a type
+  argument `Box<[T], A>`, `NonNull<[u8]>`, `PhantomData<[T]>`, a
+  turbofish `size_of_val::<[T]>`), and `Self` of an impl for one.
+- *References.* `&U`, `&mut U`, `*const U`/`*mut U` of `U = Unsized(v)`
+  are today's view forms (`v`, the exclusive view, the fat raw pointer):
+  what codegen sees is unchanged. `&V`/`&mut V` of a view `V` is
+  `Ptr(V, kind)`, a thin pointer to the two words, in every position
+  (Z9.1b's three cases become one rule).
+- *Expressions.* `*r` of a view `r` is a place of type `Unsized(v)`;
+  `&*r`, `&r[a..b]`, `&mut *r` give the view forms back (the IR never
+  holds an Unsized value: a `let`, a parameter, a result, a field, an
+  element of type Unsized is F21.2's `type.unsized`); `&x` of a local
+  `x: &[T]` is `Ptr(view)` (`&&[T]`).
+- *Inference.* Unifying `&T` with a view binds `T := Unsized(v)`;
+  `&mut T` with an exclusive view, `T := Unsized(v)`; `&T`/`&mut T` with
+  `Ptr(view, k)`, `T := view`; a by-value `T` with a view, `T := view`.
+  A Sized parameter (no `?Sized`, F21.1) bound to `Unsized` is
+  `type.unsized` (rustc E0277), so `Vec<[i64]>` is rejected.
+- *Impl keys and lookup.* An impl for `[T]`/`str` is keyed by
+  `Unsized(v)`, one for `&[T]`/`&str` by the view: both may be written
+  (`impl Tr for [T]` and `impl Tr for &[T]`). Method lookup's autoderef
+  steps from a view (shared or exclusive) to `Unsized(v)`, whose `&self`
+  (`&mut self`) methods take the receiver as it is (the autoref of `*r`
+  is `r`). A bound `T: Tr` with `T = Unsized(v)` is met by the impl for
+  `[T]`; with `T = view`, by the one for `&[T]` (or a reference pattern
+  impl `impl<A: ..> Tr for &A`). Z9.1a's `by_unsized_self` retires: the
+  reference impl matches `&&[T]`, not the slice.
+- *Layout.* `Unsized` has no size (`size_of::<[T]>()` is
+  `type.unsized`, as now); a struct field `*const T`/`*mut T`/`&T` with
+  `T = Unsized(v)` is the two-word fat form, so `NonNull<[u8]>` and
+  `Box<[u8], A>` are 16 bytes, as rustc's (FL10's last gap).
+- *Slots.* `slots(Unsized(v)) = slots(elem)` (no region of its own;
+  the reference to it supplies one); `slots(Ptr(view, k))` is the
+  general `&'a τ` rule: its own slot, then the view's two.
+- *MVS.* Nothing above is made in an MVS position; an MVS program has
+  the same type ids, IR and code (the fixpoint proves it).
+Closes: `io::copy` with `R = &[u8]` (a `?Sized` parameter), `&T` with
+`T = &str` (`Iter<&str>::copied`, `Option<&str>::clone`, `Cell<&str>`),
+`impl Tr for [T]` beside `impl Tr for &[T]`, the fat `NonNull`/`Box`.
+*Anchor:* `front/types.vl` (the kind, its printing), `check/resolve.vl:
+resolve_type`, `generics/instantiate.vl: unify`, `check/calls/mod.vl:
+synth_method` (the autoderef step), `traits.vl` (impl keys), `types.vl:
+layout_of`, `places/regions.vl: slots_in`.
 ### F23 Literals
 
 **F23.1 (string literals).** `"…"` has type `&'static str` in a
@@ -1032,6 +1081,15 @@ D6.2.5's error either way. An MVS `static var` is unchanged (safe).
 *Anchor:* `front/check/names.vl: synth_name` (`U_STATIC_MUT`). Case
 `rust_f_f19_static_mut_err`.
 
+**F19.7 (unions drop nothing).** A union declared in a rust-edition
+position has no drop glue of its own fields (an `impl Drop for U` of its
+own runs): which field holds a value is the program's to know, as in
+Rust. A field read out by value (in `unsafe`) moves the union: a union's
+field has the union's own move path (borrowck.md D8.3). Not yet: rustc's
+E0740 for a field that is neither `Copy` nor `ManuallyDrop` (FL12).
+*Anchor:* `front/own/glue.vl: glue_of`, `places/elab.vl: path_of,
+rust_union`. Case `rust_f_f19_union_no_drop`.
+
 ### F22 `for` loops
 
 **F22.1 (desugaring).** In a rust-edition position
@@ -1573,7 +1631,7 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   (`impl Pattern for &str`). 0.27.2.1 has the parts that do not need it:
   `size_of_val` of a view (its length times the element's size) and
   `size_of::<[T]>()`/`size_of::<str>()` as `type.unsized`.
-  (0.27.3) Stage 1 is Z9.1b. Until stage 2, a view written as an
+  (0.27.3) Stage 1 is Z9.1b; stage 2, the change above, is Z9.1c. Until stage 2, a view written as an
   element or argument, `Vec<[i64]>`, is the view (`Vec<&[i64]>`) and is
   accepted; rustc rejects it (E0277), F21.2's `type.unsized` under stage
   2 (rust_capture_view_copy writes `Vec<&[i64]>`).
@@ -1590,6 +1648,11 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   method of a generic impl over the impl's own parameters, and `*x` with
   a `Deref` bound. A template that meets one is not counted in `opaque:
   N templates`.
+- **FL12 (a union's field that needs a drop; 0.27.3).** rustc rejects a
+  union field that is neither `Copy` nor `ManuallyDrop<_>` (E0740, a
+  generic `T` too); vole accepts it and drops no field (F19.7), so std2
+  can write `ManuallyDrop<T>` as a union over a `T`. Case
+  `rust_f_f19_union_no_drop` (`// RUSTC: none FL12`).
 
 - **FL12 (a byte string is `&[u8]`; 0.27.3).** F23.2: `b"…"` is typed
   `&[u8]`, not `&'static [u8; n]`: `let a: &[u8; 2] = b"ab";` and

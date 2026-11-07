@@ -684,5 +684,7 @@ if TWIN:
     for k, n in sorted(reasons.items(), key=lambda x: -x[1])[:10]:
         print(f"  twin outside {n}: {k}")
     print(f"translate: {TWIN_NAME}: {twin_tot[0]} of {twin_tot[1]} round-tripped programs agree")
-print(f"translate: {tot_ok} of {tot} round-trip (translator: {TRANSLATOR or 'identity'})")
+print(f"translate: {tot_ok} of {tot} round-trip"
+      + (f"; {TWIN_NAME}: {twin_tot[0]} of {twin_tot[1]} agree" if TWIN else "")
+      + f" (translator: {TRANSLATOR or 'identity'})")
 PY

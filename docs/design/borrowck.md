@@ -1214,7 +1214,15 @@ outside the holes named below.
   (slice.vl's `empty_mut`). Case `rust_b_err_promote_const`.
 - L3 Temporaries' scopes are vole's (the statement; the block for `let
   r = &f(x)`), not Rust 2024's tail-expression rule: a difference only
-  in `match`/block tail temporaries.
+  in `match`/block tail temporaries. (0.27.3) In the rust edition the
+  condition of an `if` and a match arm's guard are terminating scopes,
+  as a `while`'s condition already was (the Rust reference, "Temporary
+  scopes"): their temporaries drop once the condition or the guard is
+  evaluated, before a branch or the arm runs (`if mk().id == 1 { .. }`
+  drops `mk()`'s value before the block). MVS keeps them to the end of
+  the statement. Still the statement's in both editions: a match arm's
+  body and a lazy `&&`/`||`'s right operand, which Rust also ends at
+  their own evaluation.
 - L4 NLL only: problem case 3 (a conditional return of a borrow) is
   rejected as rustc's NLL does; the location-sensitive solve is
   0.27.4's. Also rustc's NLL limitations shared on purpose: one region
