@@ -117,7 +117,8 @@ The borrow checker (bc2721):
   implied bounds (`&'m mut I` gives I's slots `: 'm`). 30 std2 tests and 3
   `rust_t_` cases that failed on `borrowck.outlives` or
   `borrowck.elision` now pass; `tests/std2/check.sh`'s known-gap XFAIL
-  cases with borrowck errors in std2 fall from 45 to 9 (6 a front
+  cases with borrowck errors in std2 fall from 45 to 9 (17 with
+  std2's later tests: 14 a front
   gap: `&mut self` on an impl for a view type reads as `inout [u8]`;
   three Chain cases are L14, an impl's equality bound on a type
   argument). 11 `rust_b_implied_` cases, each agreeing with rustc.
