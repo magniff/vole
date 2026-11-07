@@ -960,8 +960,14 @@ take_array_builtin`; `places/shim.vl: drop_fn` (a pattern impl's drop).
 hold (F0.4, else `trait.unmet`). For a method the result is the
 function value of the impl's (or builtin's, or default's) method; its
 call passes the receiver explicitly. In type position
-`<τ as Tr>::A` is F11.3's projection. *Anchor:* `front/parser/rust.vl:
-qualified_path` (today `edition.later`), `split_shl`, `synth_path`.
+`<τ as Tr>::A` is F11.3's projection. (0.27.4) In type position the
+trait's arguments pick the impl: `<I as SliceIndex<[i64]>>::Output`
+with I = `RangeFrom<usize>` is the impl for `[T]` (T := i64 from the
+arguments, F14.1), not the one for `str`; without arguments, or when
+none matches, it is t's impl of Tr, as before. Case
+`std2_slice_sliceindex_output`. *Anchor:* `front/parser/rust.vl:
+qualified_path` (today `edition.later`), `split_shl`, `synth_path`,
+`check/resolve.vl: qualified_projection`.
 
 **F8.2 (`Tr::name`).** A trait name used as a path head (`Debug::fmt(v,
 f)`, `Iterator::next(&mut it)`, `Default::default()`) is `<_ as
@@ -1466,6 +1472,12 @@ returned reference (Z9), so `&c[a..b]` is `&*index(&c, a..b)`, a
 reborrow, and `c[a..b]` by value is `type.unsized`. *Anchor:*
 `front/check/rust.vl: index_through_trait`, `synth_mode.vl:
 synth_index` (today: a view's index is MVS's).
+(0.27.4) Through references: `h[i]` of an `h: &[T; N]`, `&mut [T; N]`
+or `&&[T; N]` is `(*h)[i]` (each reference dereferenced, as rustc's
+autoderef of the indexed expression), read, written through `&mut` and
+sliced (`&h[a..b]`). A write through `&` is borrowck.assign_immutable
+(E0594). 0.27.3 read it as a raw pointer's arithmetic (unsafe). Cases
+`rust_f_f20_index_array_ref_ok`, `rust_f_f20_index_array_ref_err`.
 
 **F20.2 (std2's impls).** `impl<T, I: SliceIndex<[T]>> Index<I> for [T]
 { type Output = I::Output; fn index(&self, i: I) -> &I::Output {

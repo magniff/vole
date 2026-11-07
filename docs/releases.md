@@ -224,6 +224,11 @@ The front (fl10274):
   instances (`[&str; 2].into_iter().collect_in(a)`, borrowck, D4.6,
   which also failed before) and `Box<[T]>`/`Box<str>` (std2's Box has
   a Sized T), both 0.27.5.
+- `h[i]` of an `h: &mut [T; N]` (or `&[T; N]`, `&&[T; N]`) indexes the
+  array through the reference, as rustc's autoderef does (F20.1); 0.27.3
+  read it as a raw pointer's arithmetic, `unsafe` (about 32 of gate 3's
+  errors). `<I as SliceIndex<[i64]>>::Output` takes the impl its trait
+  arguments name (F8.1).
 
 ### What's new in 0.27.3
 
