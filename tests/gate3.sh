@@ -16,7 +16,10 @@
 #   -v            print the check's errors too
 #
 # Prints `gate3: N errors (by code: COUNT CODE, ...)`, the largest first,
-# last.
+# last; before it `gate3: borrowck (partial): ...`, the borrow checker's
+# errors in the bodies that type-checked (`check --borrowck-partial`:
+# borrowck runs only on a program without type errors otherwise, so N
+# hides them; DIR/borrowck.log keeps them).
 # Exits 1 only when the translator or the check could not run (a crash,
 # no output); errors left are the measurement, not a failure.
 
@@ -72,9 +75,15 @@ if [ $check_rc -ne 0 ] && ! grep -q ': error\[' "$W/check.log"; then
     tail -5 "$W/check.log"
     exit 1
 fi
+(cd "$W" && "$COMPILER" check --edition rust --max-errors=0 --borrowck-partial src/main.vl) \
+    >"$W/borrowck.log" 2>&1
 [ $VERBOSE -eq 0 ] || grep ': error\[' "$W/check.log"
 grep '^fixed' "$W/fix.log" | cut -f1 | sed 's/^/gate3: translator: /'
 [ -z "$KEEP" ] || echo "gate3: the translation and its logs: $W"
+grep -o ': error\[borrowck[^]]*\]' "$W/borrowck.log" \
+    | sed 's/^: error\[borrowck\.//; s/\]$//' | sort | uniq -c | sort -k1,1nr -k2 \
+    | awk '{ n += $1; c = $1; $1 = ""; sub(/^ /, ""); by = by sep c " " $0; sep = ", " }
+        END { printf "gate3: borrowck (partial): %d errors%s\n", n, (n > 0 ? " (by code: " by ")" : "") }'
 grep -o ': error\[[^]]*\]' "$W/check.log" \
     | sed 's/^: error\[//; s/\]$//' | sort | uniq -c | sort -k1,1nr -k2 \
     | awk -v secs="$secs" '{ n += $1; c = $1; $1 = ""; sub(/^ /, ""); by = by sep c " " $0; sep = ", " }

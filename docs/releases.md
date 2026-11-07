@@ -168,8 +168,16 @@ The translator (g3274):
   edition; it prints `gate3: N errors (by code: ...)`. The release
   gate's `gate3` row (--release) runs it, informational: it fails only
   when the translator or the check cannot run. N went 309 (33 parse
-  errors hiding the rest) -> 1,414 (the real first wall) -> 253 (by code: 210 type error, 23 unsafe, 8 distinct.mix,
-  8 type.infer, 2 edition.lenient, 1 alloc.no_in, 1 item.private).
+  errors hiding the rest) -> 1,414 (the real first wall) -> 122 (by
+  code: 117 type error, 2 distinct.mix, 2 edition.lenient,
+  1 item.private). Of the 122, 110 are std2's missing modules and items
+  (`std::cli`'s `Matches` above all, `fs`, `process`, `gpu`,
+  `env::get_in`, `count_ones`). borrowck runs only on a program with no
+  type errors, so `check --borrowck-partial` (informational) checks the
+  bodies that type-checked, and gate 3 prints that count too: 3,048
+  (2,950 conflict, nearly all a Vec index's copy beside a `&mut` of its
+  root, which rustc accepts: three XFAIL rust_b_ok_index_temp_ cases for
+  0.27.5's fix).
 - The first wall's three shapes: a static's `unsafe { }` that starts a
   statement and is an operand there is `(unsafe { .. })`, and a method
   on a static through the receiver's borrow wraps the call, not a copy;
@@ -206,6 +214,19 @@ The translator (g3274):
   impl's MVS-only `exact_len` and `at` are dropped: no std2 method is
   either (`at(k)` reads without advancing, so it is not `nth`, and
   `ExactSizeIterator::len` needs an exact size_hint).
+- More shapes the rust edition reads otherwise: a local's or an array
+  element's address cast to another pointee is `&raw const x as *mut U`
+  (`&raw mut` for a `var`); `&p[i]` of a raw pointer is `p.add(i)`; a
+  raw pointer to views `*[u8]` is `*mut &[u8]`; an inherent method's
+  receiver of a type MVS copies is `self`; a `let` of an `if` with a
+  literal branch is `: i64`, an i64 literal outside i32 under a cast
+  gets a suffix (`u64` above i64::MAX); a literal branch of an `if`
+  whose other branch is bytes is `b".."`; a row whose receiver is a
+  row's call at the same place is applied; `push_fmt` is
+  `std::fmt::write` (a program's own `write` shadows the prelude's);
+  `memchr` is an iterator's position. compiler/src's `base::len_arg`,
+  0.26.2's bridge to usize parameters, is gone (`e as usize` at its 19
+  sites).
 - Gate 2: tests/translate.sh translates with `--force` (the generated
   sweep cases); the corpus round-trips 43 of 50 (41 at 0.27.3's
   end). causes.tsv reclassified for every case the walls moved.
