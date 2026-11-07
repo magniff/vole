@@ -1346,6 +1346,23 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   a safe `extern "C" fn(..)` pointer needs `unsafe`, as in MVS (the
   pointer may come from C; the fn type's ABI bit keeps its meaning);
   rustc calls one safely. Case `rust_f_f19_c_ptr_err`.
+- **FL10 (Z9.1's representation; later, 0.27.3).** In the rust edition
+  `[T]` and `&[T]` (`str` and `&str`) are still one type, MVS's view:
+  `resolve_type` makes `&` of a view the view. So `&mut &[u8]` is `&mut
+  [u8]` (`*self = &self[n..]` cannot be written in `impl Read for
+  &[u8]`), `&mut self` of an impl for a view type is `inout [u8]`, `impl
+  Tr for [T]` and `impl Tr for &[T]` cannot both be written, a `T: ?Sized`
+  parameter is not told from a sized one (`?Sized` is not recorded), and
+  `NonNull<[u8]>`/`Box<[u8], A>` are 8 bytes (the field `*const T` with T
+  a view is thin; rustc: 16). The change is a type form of its own for
+  the unsized place behind a reference, read by `resolve_type`, method
+  lookup on slices and `str`, indexing, `len`, the coercions, the places
+  IR, layout and the borrow checker's slots: about a week of wide front
+  work, near MVS's shared type code. It blocks 6 std2 cases: the five
+  `std2_io_` cases of `impl Read for &[u8]` and `std2_str_pattern`
+  (`impl Pattern for &str`). 0.27.2.1 has the parts that do not need it:
+  `size_of_val` of a view (its length times the element's size) and
+  `size_of::<[T]>()`/`size_of::<str>()` as `type.unsized`.
 
 ## 10. The gap map
 
