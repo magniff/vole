@@ -30,6 +30,8 @@ import subprocess
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PRELUDE = open(os.path.join(HERE, "prelude.rs")).read()
+# (--alloc-api: Rust's own allocator_api, rustc as nightly)
+PRELUDE_ALLOC = open(os.path.join(HERE, "prelude_alloc.rs")).read()
 
 MACROS = ["println", "print", "eprintln", "eprint", "format_args", "write", "writeln",
           "panic", "assert", "assert_eq", "assert_ne", "debug_assert", "todo",
@@ -47,7 +49,7 @@ PRELUDE_NAMES = {"Gpa", "Allocator", "ToStringIn", "CollectIn", "DefaultIn", "Cl
                  "FromIteratorIn", "ToOwnedIn", "FromIn", "NewIn", "WithCapacityIn"}
 # left after the changes: the program is outside
 VOLE_ONLY = [r"\bArena\b", r"\bAnyAlloc\b", r"\bFixedBuf\b", r"Formatter::new\b",
-             r"\ballocator\(\)", r"\blive_blocks\b", r"\bcheck_leaks\b", r"\bFixedState\b",
+             r"(?<![.\w])allocator\(\)", r"\blive_blocks\b", r"\bcheck_leaks\b", r"\bFixedState\b",
              r"\bFoldHasher\b", r"#\[array_builtin", r"\bTypedArena\b", r"\bArenaScope\b",
              r"\barena_scope\b", r"\bAllocator for\b", r"\bAllocator\b", r"\bdetect\(", r"#\[multiversion",
              r"\bstd::(gpu|window|objc|arch|term)\b", r"\bextern \"C\"", r"\bimport\s+\"",
@@ -171,6 +173,24 @@ def gpa_names(s):
     return {"gpa"} | set(re.findall(r"\b([a-z_][a-z0-9_]*)\s*:\s*Gpa\b", s))
 
 
+def format_in_alloc(s):
+    """--alloc-api: `format_in(.., a)` -> `vole_format_in(a, format_args!(..))`."""
+    out, pos = [], 0
+    for m in re.finditer(r"(?<![\w.:])format_in\(", s):
+        if m.start() < pos:
+            continue
+        args, end = scan_args(s, m.end() - 1)
+        if not args or len(args) < 2:
+            continue
+        kept = [s[a:b].strip() for a, b in args[:-1]]
+        alloc = s[args[-1][0]:args[-1][1]].strip()
+        out.append(s[pos:m.start()])
+        out.append(f"vole_format_in({alloc}, format_args!(" + ", ".join(kept) + "))")
+        pos = end
+    out.append(s[pos:])
+    return "".join(out)
+
+
 def inverse_in(s, gpas):
     """`format_in(.., gpa)` -> `format!(..)`; an unserved `X_in(.., gpa)` -> `X(..)`."""
     out, pos = [], 0
@@ -274,26 +294,29 @@ def allocator_generics(s):
     return s
 
 
-def to_rust(src):
-    """(the Rust text, None) or (the text so far, why it is outside)."""
+def to_rust(src, alloc_api=False):
+    """(the Rust text, None) or (the text so far, why it is outside).
+    alloc_api: for Rust's own allocator_api (prelude_alloc.rs): the types
+    keep their allocator, and format_in keeps its allocator argument."""
     m = re.search(r"^\s*// RUSTC: none(.*)$", src, re.M)
     if m:
         return src, "RUSTC: none " + (m.group(1).strip() or "(no reason)")
-    lines = []
-    for line in src.split("\n"):
-        if re.match(r"\s*(pub\s+)?use\s", line):
-            line = drop_uses(line)
-            if line is None:
-                lines.append("")
-                continue
-        lines.append(line)
-    s = "\n".join(lines)
+    # (a `use` anywhere in a line: the translator keeps a line's items on it)
+    s = re.sub(r"(?<![\w:])(pub\s+)?use\s+[^;{}]*(\{[^{}]*\})?[^;{}]*;",
+               lambda m: drop_uses(m.group(0)) or "", src)
     s = re.sub(CHECK_ATTRS, "", s)
-    s = allocator_generics(s)
     gpas = gpa_names(s)
-    s = re.sub(r"::<Gpa>", "", s)
-    s = re.sub(r",\s*Gpa\s*>", ">", s)
-    s = re.sub(r"<Gpa>", "", s)
+    if alloc_api:
+        while True:
+            t = format_in_alloc(s)
+            if t == s:
+                break
+            s = t
+    else:
+        s = allocator_generics(s)
+        s = re.sub(r"::<Gpa>", "", s)
+        s = re.sub(r",\s*Gpa\s*>", ">", s)
+        s = re.sub(r"<Gpa>", "", s)
     while True:
         t = inverse_in(s, gpas)  # nested calls: the outer one first
         if t == s:
@@ -304,12 +327,13 @@ def to_rust(src):
     code = re.sub(r"//[^\n]*", "", s)  # (not in a comment, nor a name of its own)
     own = set(re.findall(r"\b(?:struct|enum|union|trait|type|fn)\s+(\w+)", code))
     left = [p for p in VOLE_ONLY if re.search(p, code)
-            and not (re.fullmatch(r"\\b(\w+)\\b", p) and p[2:-2] in own)]
+            and not (re.fullmatch(r"\\b(\w+)\\b", p) and p[2:-2] in own)
+            and not (alloc_api and p == r"\bAllocator\b")]
     if left:
         return s, "vole-only: " + re.sub(r"\\b|\\", "", left[0])
     if wrapper is None:
         return s, "no fn main"
-    return s + "\n" + wrapper + "\n\n" + PRELUDE, None
+    return s + "\n" + wrapper + "\n\n" + (PRELUDE_ALLOC if alloc_api else PRELUDE), None
 
 
 def rust_edition(src):
@@ -318,11 +342,19 @@ def rust_edition(src):
     return m.group(1) if m else "2021"
 
 
-def rustc_build(rustc, rs, exe, edition="2021"):
-    """None, or the first error line of rustc's."""
+def rustc_build(rustc, rs, exe, edition="2021", overflow=False, alloc_api=False):
+    """None, or the first error line of rustc's. overflow: Rust's overflow
+    checks, vole's at -O0 (0.26.3: on at -O0, off at -O1 and -O2).
+    alloc_api: rustc as nightly (RUSTC_BOOTSTRAP=1) with
+    feature(allocator_api), for prelude_alloc.rs."""
+    env = dict(os.environ)
+    extra = []
+    if alloc_api:
+        env["RUSTC_BOOTSTRAP"] = "1"
+        extra = ["-Zcrate-attr=feature(allocator_api)"]
     r = subprocess.run([rustc, "--edition", edition, "-A", "warnings", "-C", "opt-level=1",
-                        "-C", "overflow-checks=off", "-o", exe, rs],
-                       capture_output=True, text=True)
+                        "-C", "overflow-checks=" + ("on" if overflow else "off")] + extra + ["-o", exe, rs],
+                       capture_output=True, text=True, env=env)
     if r.returncode == 0:
         return None
     err = r.stderr.split("\n")
@@ -348,7 +380,8 @@ if __name__ == "__main__":
     # reason on stderr when the program is outside (tools/borrowck-twin.sh
     # --shim)
     import sys
-    rs, why = to_rust(open(sys.argv[1], encoding="utf-8", errors="replace").read())
+    rs, why = to_rust(open(sys.argv[-1], encoding="utf-8", errors="replace").read(),
+                      alloc_api="--alloc-api" in sys.argv[1:-1])
     if why:
         sys.stderr.write(why + "\n")
         sys.exit(3)

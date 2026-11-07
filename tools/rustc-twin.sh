@@ -6,7 +6,8 @@
 # EXIT lines. The generalization of tools/std2-twin.sh: the program keeps
 # its allocator calls, which resolve to the prelude's.
 #
-# usage: tools/rustc-twin.sh [-v] [-j N] [-r RUSTC] [--guide] [CASE...]
+# usage: tools/rustc-twin.sh [-v] [-j N] [-r RUSTC] [--guide] [--alloc-api]
+#            [CASE...]
 #
 #   -v        print every case's line (default: differ, stale and the
 #             summary; -v also each outside's reason)
@@ -16,6 +17,14 @@
 #   --guide   also the guide's rust-edition programs: the blocks of
 #             compiler/guide/*.md whose first line is `// EDITION: rust`
 #             and that have an out block (tests/guide/run.sh --split)
+#   --alloc-api
+#             Rust's own allocator_api instead of the stable shim: rustc run
+#             as nightly (RUSTC_BOOTSTRAP=1, -Zcrate-attr=feature(
+#             allocator_api)) with tools/rustc-twin/prelude_alloc.rs; the
+#             types keep their allocator (`Vec<T, Gpa>`, a `String<&A>`
+#             holding a borrow of what `allocator()` returned), so a borrow
+#             of the allocator is checked as rustc checks it. The summary
+#             says so: `rustc-twin (allocator_api, RUSTC_BOOTSTRAP=1): ..`
 #   CASE...   rust-edition programs with EXPECT (STDIN, ARGS, EXIT) lines,
 #             tests/run/rust_*.vl for instance
 #
@@ -45,12 +54,14 @@ V=0
 J=4
 RUSTC=
 GUIDE=0
+ALLOC=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -v) V=1; shift ;;
         -j) J="$2"; shift 2 ;;
         -r) RUSTC="$2"; shift 2 ;;
         --guide) GUIDE=1; shift ;;
+        --alloc-api) ALLOC=1; shift ;;
         -h|--help) sed -n '2,/^# output)/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         --) shift; break ;;
         -*) echo "rustc-twin: unknown option $1" >&2; exit 2 ;;
@@ -70,7 +81,7 @@ if [ $GUIDE = 1 ]; then
     rm -rf "$WORK/guide-blocks"
     sh "$ROOT/tests/guide/run.sh" --split "$WORK/guide-blocks" || exit 2
 fi
-exec python3 -I - "$ROOT" "$RUSTC" "$V" "$J" "$GUIDE" "$@" <<'PY'
+exec python3 -I - "$ROOT" "$RUSTC" "$V" "$J" "$GUIDE" "$ALLOC" "$@" <<'PY'
 import os
 import re
 import subprocess
@@ -78,7 +89,8 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 ROOT, RUSTC, VERBOSE, JOBS, GUIDE = sys.argv[1], sys.argv[2], sys.argv[3] == "1", int(sys.argv[4]), sys.argv[5] == "1"
-CASES = sys.argv[6:]
+ALLOC = sys.argv[6] == "1"
+CASES = sys.argv[7:]
 sys.path.insert(0, os.path.join(ROOT, "tools", "rustc-twin"))
 from twin import directives, to_rust, rustc_build, rust_edition, stdout_differs, trimmed  # noqa: E402
 
@@ -111,11 +123,21 @@ if GUIDE:
         progs.append(("guide-" + b, src, rd("out"), int(rd("exit", "0") or 0), rd("stdin"), [], True))
 
 
+def overflow_checks(src):
+    """vole's: on at -O0 (a case's FLAGS level, else the suite's -O2-safe
+    default, off), or as its --overflow-checks= says."""
+    flags = " ".join(re.findall(r"^\s*// FLAGS:(.*)$", src, re.M))
+    m = re.search(r"--overflow-checks=(on|off)", flags)
+    if m:
+        return m.group(1) == "on"
+    return re.search(r"(^|\s)-O0\b", flags) is not None
+
+
 def run(prog):
     name, src, want, wexit, stdin, args, merged = prog
     m = re.search(r"^\s*// RUSTC-DIFFERS:\s*(.*)$", src, re.M)
     named = (m.group(1).strip() or "(no reason)") if m else SIDE.get(name)
-    rs, why = to_rust(src)
+    rs, why = to_rust(src, alloc_api=ALLOC)
     d = os.path.join(WORK, name)
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "main.rs"), "w") as f:
@@ -123,7 +145,9 @@ def run(prog):
     if why:
         return name, "outside", why
     exe = os.path.join(d, "main")
-    bad = rustc_build(RUSTC, os.path.join(d, "main.rs"), exe, rust_edition(src))
+    # (Rust's overflow checks where vole's are: a case built at -O0)
+    bad = rustc_build(RUSTC, os.path.join(d, "main.rs"), exe, rust_edition(src),
+                      overflow=overflow_checks(src), alloc_api=ALLOC)
     if bad:
         # (a borrowck divergence the case names, tools/borrowck-twin.sh's)
         mk = re.search(r"^\s*// RUSTC: rejects\s+(\S+)\s*(.*)$", src, re.M)
@@ -161,7 +185,7 @@ for name, verdict, why in sorted(results):
         reasons[r] = reasons.get(r, 0) + 1
     if verdict in ("differ", "stale") or VERBOSE:
         print(f"{verdict:8} {name}: {why}" if why else f"{verdict:8} {name}")
-print(f"rustc-twin: {len(results)} programs: {counts['agree']} agree, {counts['differ']} differ, "
+print(f"rustc-twin{' (allocator_api, RUSTC_BOOTSTRAP=1)' if ALLOC else ''}: {len(results)} programs: {counts['agree']} agree, {counts['differ']} differ, "
       f"{counts['named']} named, {counts['stale']} stale, {counts['outside']} outside")
 for r, n in sorted(reasons.items(), key=lambda x: -x[1])[:12]:
     print(f"  outside {n}: {r}")
