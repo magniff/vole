@@ -1,0 +1,451 @@
+// (0.27.3) The translator's bodies (mod.vl, pass 3): locals, the borrows
+// and accesses MVS makes of names written as Rust's `&x`, `&mut x`, `*r`,
+// and the spellings that differ (`v.len`, `println(x)`, `static var`, an
+// i64 literal's annotation).
+
+use crate::base::{IntVec, SRC};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::ast::{CONV_NEW, NodeKind, child};
+use crate::front::lexer::Tok;
+use crate::front::types::{TY_I64, TY_U8, TyKind};
+use crate::tools::translate::{
+    D_REF, TC_BORROW, TC_BYTES, TC_DEREF, TC_INOUT_LOCAL, TC_INT, TC_LEN, TC_MUT_MARKER, TC_PRINT,
+    TC_STATIC, TC_VAR, TC_VIEW, Tr, add_ref, editable, enclosing_fn, ident_char, is_mut_ref, is_ref,
+    is_ws, own_node, parent_of, put, ref_binding, skip_ws, token_at, word_here, written_name,
+};
+
+// The symbol of the name node n is written as (its token's), or 0.
+fn name_sym(n: i64, pcx: Ctx<Comp>) -> i64 {
+    let k = token_at(pcx.nodes[n].start, pcx);
+    if k < 0 || pcx.toks[k].kind != Tok::Ident || pcx.toks[k].end != pcx.nodes[n].end {
+        return 0;
+    }
+    pcx.toks[k].value as i64
+}
+
+// Whether node n is a name that is a reference binding where it is.
+fn names_ref(n: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
+    let s = name_sym(n, pcx);
+    s != 0 && ref_binding(s, pcx.nodes[n].start, tr)
+}
+
+// Whether node n is argument 0 of a call that starts where it does (the
+// receiver of a method call: Rust borrows and dereferences it itself).
+fn receiver_of(n: i64, p: i64, pcx: Ctx<Comp>) -> bool {
+    let k = pcx.nodes[p].kind;
+    (k == NodeKind::Call || k == NodeKind::MethodCall) && pcx.nodes[p].count > 0
+        && child(p, 0, pcx) == n && pcx.nodes[p].start == pcx.nodes[n].start
+}
+
+// ---- Locals ----
+
+// `var x = e;` is `let mut x = e;`, `inout r = &e;` is `let r = &mut e;`
+// (r a reference binding for the rest of its function); an unannotated
+// binding of an i64 literal gets `: i64` (the rust edition's literal
+// default is i32, FL6).
+fn edit_let(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let s = pcx.nodes[n].start;
+    let pat = pcx.nodes[n].a;
+    if word_here(s, "var") {
+        put(s, s + 3, "let mut", TC_VAR, &tr, &pcx);
+    } else if word_here(s, "inout") {
+        put(s, s + 5, "let", TC_INOUT_LOCAL, &tr, &pcx);
+        if pat > 0 && pcx.nodes[pat].kind == NodeKind::PatBind {
+            let f = enclosing_fn(s, pcx);
+            let to = if f > 0 { pcx.nodes[f].end } else { pcx.nodes[n].end };
+            add_ref(pcx.nodes[n].end, to, pcx.nodes[pat].a, &tr);
+        }
+    } else if !word_here(s, "let") {
+        return;
+    }
+    let init = pcx.nodes[n].c;
+    if pat > 0 && pcx.nodes[pat].kind == NodeKind::PatBind && pcx.nodes[n].b == 0 && init > 0
+        && pcx.nodes[init].ty == TY_I64 && literal_only(init, 0, pcx) {
+        put(pcx.nodes[pat].end, pcx.nodes[pat].end, ": i64", TC_INT, &tr, &pcx);
+    }
+}
+
+// Whether expression n is made of integer literals alone (its type comes
+// from them).
+fn literal_only(n: i64, depth: i64, pcx: Ctx<Comp>) -> bool {
+    if n <= 0 || depth > 8 {
+        return false;
+    }
+    let k = pcx.nodes[n].kind;
+    if k == NodeKind::Int {
+        return pcx.nodes[n].b == 0;
+    }
+    if k == NodeKind::Unary && pcx.nodes[n].op == Tok::Minus {
+        return literal_only(pcx.nodes[n].b, depth + 1, pcx);
+    }
+    if k == NodeKind::Binary {
+        return literal_only(pcx.nodes[n].b, depth + 1, pcx)
+            && literal_only(pcx.nodes[n].c, depth + 1, pcx);
+    }
+    false
+}
+
+// `var x` in a pattern is `mut x`.
+fn edit_pat_bind(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let s = pcx.nodes[n].start;
+    if pcx.nodes[n].b != 0 && word_here(s, "var") {
+        put(s, s + 3, "mut", TC_VAR, &tr, &pcx);
+    }
+}
+
+// `for inout x in e` is `for x in &mut e`: x a reference binding in the
+// loop.
+fn edit_for(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let s = pcx.nodes[n].start;
+    if !word_here(s, "for") {
+        return;
+    }
+    let w = skip_ws(s + 3);
+    if !word_here(w, "inout") {
+        return;
+    }
+    let pat = pcx.nodes[n].b;
+    let p = skip_ws(w + 5);
+    // (the `in` after the pattern)
+    var q = if pat > 0 { pcx.nodes[pat].end } else { p };
+    while q < pcx.nodes[n].end && !(word_here(q, "in") && !ident_char(SRC[q - 1])) {
+        q += 1;
+    }
+    if q >= pcx.nodes[n].end {
+        return;
+    }
+    let e = skip_ws(q + 2);
+    if put(w, p, "", TC_INOUT_LOCAL, &tr, &pcx) {
+        put(e, e, "&mut ", -1, &tr, &pcx);
+        if pat > 0 && pcx.nodes[pat].kind == NodeKind::PatBind {
+            add_ref(pcx.nodes[n].start, pcx.nodes[n].end, pcx.nodes[pat].a, &tr);
+        }
+    }
+}
+
+// ---- Borrows and accesses ----
+
+// A written Unary `&` (`&x`, MVS's inout marker): `&mut x`, or `x` when x
+// is a reference already (lent on: a reborrow).
+fn edit_amp(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let s = pcx.nodes[n].start;
+    let t = pcx.nodes[n].ty;
+    let operand = pcx.nodes[n].b;
+    if SRC[s] != '&' || SRC[s + 1] == '&' || !is_mut_ref(t, pcx) && !mut_slice(t, pcx) {
+        return;
+    }
+    let inner = skip_ws(s + 1);
+    if operand > 0 && access_to_ref(operand, tr, pcx) {
+        put(s, inner, "", TC_MUT_MARKER, &tr, &pcx);
+    } else if !word_here(inner, "mut") {
+        put(s + 1, s + 1, "mut ", TC_MUT_MARKER, &tr, &pcx);
+    }
+}
+
+fn mut_slice(t: i64, pcx: Ctx<Comp>) -> bool {
+    t > 0 && pcx.types[t].kind == TyKind::Slice && pcx.types[t].b == crate::front::types::REF_MUT
+}
+
+// Whether n is a reference in the rust edition already: the checker's
+// access to a reference (a name: a let parameter that borrows, an inout
+// parameter or local, a closure's reference parameter, a binding of a
+// pattern on a reference), or an expression of a view type.
+fn access_to_ref(n: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
+    if n <= 0 {
+        return false;
+    }
+    let k = pcx.nodes[n].kind;
+    if k == NodeKind::Unary && pcx.nodes[n].op == Tok::Star && SRC[pcx.nodes[n].start] != '*' {
+        let o = pcx.nodes[n].b;
+        if names_ref(n, tr, pcx) {
+            return true;
+        }
+        return o > 0 && pcx.nodes[o].kind == NodeKind::Ident && is_ref(pcx.nodes[o].ty, pcx)
+            && written_name(n, pcx);
+    }
+    if k == NodeKind::Ident {
+        return is_ref(pcx.nodes[n].ty, pcx) || names_ref(n, tr, pcx);
+    }
+    false
+}
+
+// A call of the program's function: each argument its parameter takes by
+// reference (D_REF: a let parameter of a type MVS does not copy) is
+// written `&e`, unless it is one already.
+fn edit_call_args(c: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    var f = pcx.nodes[c].x - 1;
+    if f < 0 || f >= pcx.fns.len() as i64 {
+        return;
+    }
+    if pcx.fns[f].tmpl > 0 {
+        f = pcx.fns[f].tmpl - 1;
+    }
+    let fnode = pcx.fns[f].node;
+    if fnode <= 0 || !editable(pcx.nodes[fnode].start, &pcx) {
+        return;
+    }
+    var params = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for j in 0..pcx.nodes[fnode].count {
+        let p = child(fnode, j, pcx);
+        if pcx.nodes[p].kind == NodeKind::Param {
+            params.push(p);
+        }
+    }
+    for i in 0..pcx.nodes[c].count {
+        if i >= params.count {
+            break;
+        }
+        var arg = child(c, i, pcx);
+        if pcx.nodes[arg].kind == NodeKind::NamedArg {
+            arg = pcx.nodes[arg].b;
+        }
+        if arg <= 0 || tr.decided.get(params.get(i) + 1) != D_REF {
+            continue;
+        }
+        // (a method's receiver: Rust borrows it itself; an argument the
+        // checker made, a contract's check's, at the call)
+        if pcx.nodes[arg].start <= pcx.nodes[c].start || pcx.nodes[arg].end > pcx.nodes[c].end {
+            continue;
+        }
+        // (the checker's borrow: what it borrows)
+        var e = arg;
+        if pcx.nodes[e].kind == NodeKind::Unary && pcx.nodes[e].op == Tok::Amp
+            && SRC[pcx.nodes[e].start] != '&' {
+            e = pcx.nodes[e].b;
+        }
+        if e <= 0 || access_to_ref(e, tr, pcx) || pcx.nodes[e].kind == NodeKind::Closure
+            || is_ref(pcx.nodes[e].ty, pcx) && SRC[pcx.nodes[e].start] == '&'
+            || token_at(pcx.nodes[arg].start, pcx) < 0 {
+            continue;
+        }
+        put(pcx.nodes[arg].start, pcx.nodes[arg].start, "&", TC_BORROW, &tr, &pcx);
+    }
+}
+
+// The checker's access to a reference r, used as its value: `*r` where
+// Rust does not dereference it itself (an assignment's target, a copy's
+// read), as it is in a field, an index, a method's receiver.
+fn edit_deref(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let s = pcx.nodes[n].start;
+    if SRC[s] == '*' || !written_name(n, pcx) || !access_to_ref(n, tr, pcx) {
+        return;
+    }
+    let p = parent_of(n, tr);
+    if p > 0 {
+        let pk = pcx.nodes[p].kind;
+        if pk == NodeKind::FieldAccess && pcx.nodes[p].a == n
+            || pk == NodeKind::TupleField && pcx.nodes[p].a == n
+            || pk == NodeKind::Index && pcx.nodes[p].a == n || receiver_of(n, p, pcx)
+            || pk == NodeKind::Unary && pcx.nodes[p].op == Tok::Amp {
+            return;
+        }
+        if pk == NodeKind::Assign && pcx.nodes[p].b == n {
+            put(s, s, "*", TC_DEREF, &tr, &pcx);
+            return;
+        }
+    }
+    let t = pcx.nodes[n].ty;
+    if t > 0 && crate::front::conv::copyable(t, &pcx) && !is_ref(t, pcx)
+        && pcx.types[t].kind != TyKind::Slice {
+        put(s, s, "*", TC_DEREF, &tr, &pcx);
+    }
+}
+
+// A view of a part, `v[a..b]` (MVS: a `[T]` of v's elements), is `&v[a..b]`
+// (`&mut` for an inout one), unless written so.
+fn edit_view(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let t = pcx.nodes[n].ty;
+    let b = pcx.nodes[n].b;
+    if t <= 0 || pcx.types[t].kind != TyKind::Slice || b <= 0
+        || pcx.nodes[b].kind != NodeKind::Range || token_at(pcx.nodes[n].start, pcx) < 0 {
+        return;
+    }
+    let s = pcx.nodes[n].start;
+    var q = s - 1;
+    while q > 0 && is_ws(SRC[q]) {
+        q -= 1;
+    }
+    if SRC[q] == '&' || word_back(q, "mut") {
+        return;
+    }
+    let p = parent_of(n, tr);
+    if p > 0 && (receiver_of(n, p, pcx) || pcx.nodes[p].kind == NodeKind::Index
+        && pcx.nodes[p].a == n) {
+        return;
+    }
+    put(s, s, if mut_slice(t, pcx) { "&mut " } else { "&" }, TC_VIEW, &tr, &pcx);
+}
+
+fn word_back(q: i64, w: [u8]) -> bool {
+    let n = w.len as i64;
+    q - n + 1 >= 0 && SRC[q - n + 1..q + 1] == w
+}
+
+// ---- Spellings ----
+
+// `v.len` (a read of std's len, which MVS lets be written without its
+// parentheses) is `v.len()`.
+fn edit_len(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let e = pcx.nodes[n].end;
+    if e < 4 || SRC[e - 3] != 'l' || SRC[e - 2] != 'e' || SRC[e - 1] != 'n' || SRC[e - 4] != '.'
+        || SRC[skip_ws(e)] == '(' {
+        return;
+    }
+    if pcx.nodes[n].kind == NodeKind::Call {
+        // (std's len, not a field of the program's struct)
+        let f = pcx.nodes[n].x - 1;
+        if f < 0 || f >= pcx.fns.len() as i64 || pcx.fns[f].node > 0
+            && editable(pcx.nodes[pcx.fns[f].node].start, &pcx) {
+            return;
+        }
+    } else {
+        // (a slice's or a str's `.len`, MVS's field)
+        let b = pcx.nodes[n].a;
+        var t = if b > 0 { pcx.nodes[b].ty } else { 0 };
+        if t > 0 && pcx.types[t].kind == TyKind::Ptr {
+            t = pcx.types[t].a;
+        }
+        if t <= 0 || pcx.nodes[n].b != tr.sym_len || pcx.types[t].kind != TyKind::Slice
+            && pcx.types[t].kind != TyKind::Distinct && pcx.types[t].kind != TyKind::Array {
+            return;
+        }
+    }
+    put(e, e, "()", TC_LEN, &tr, &pcx);
+}
+
+// `println(x)` of a value is `println("{}", x)` (print, eprint, eprintln
+// too): the rust edition's prints take a format literal first.
+fn edit_prints(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    for k in 0..pcx.toks.len() as i64 - 2 {
+        let t = pcx.toks[k];
+        if t.kind != Tok::Ident || pcx.toks[k + 1].kind != Tok::LParen
+            || !editable(t.start, &pcx) {
+            continue;
+        }
+        let w = SRC[t.start..t.end];
+        if w != "println" && w != "print" && w != "eprintln" && w != "eprint" {
+            continue;
+        }
+        if k > 0 && (pcx.toks[k - 1].kind == Tok::Dot || pcx.toks[k - 1].kind == Tok::Fn) {
+            continue;
+        }
+        let next = pcx.toks[k + 2].kind;
+        if next == Tok::Str || next == Tok::RParen {
+            continue;
+        }
+        put(pcx.toks[k + 2].start, pcx.toks[k + 2].start, "\"{}\", ", TC_PRINT, &tr, &pcx);
+    }
+}
+
+// `static var` is `static mut`.
+fn edit_static(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    if (pcx.nodes[n].p & CONV_NEW) == 0 {
+        return;
+    }
+    var q = pcx.nodes[n].start;
+    while q < pcx.nodes[n].end && !word_here(q, "static") {
+        q += 1;
+    }
+    let m = skip_ws(q + 6);
+    if q < pcx.nodes[n].end && word_here(m, "var") {
+        put(m, m + 3, "mut", TC_STATIC, &tr, &pcx);
+    }
+}
+
+// A text literal MVS types as bytes, `[u8]`, given where the program
+// takes bytes (a parameter, a let's annotation, a result of `[u8]`) is
+// `"..".as_bytes()` (a literal is a str in the rust edition).
+fn edit_str(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let t = pcx.nodes[n].ty;
+    if t <= 0 || pcx.types[t].kind != TyKind::Slice || pcx.types[t].a != TY_U8
+        || SRC[pcx.nodes[n].start] != '"' {
+        return;
+    }
+    let p = parent_of(n, tr);
+    if p <= 0 {
+        return;
+    }
+    let pk = pcx.nodes[p].kind;
+    var bytes = false;
+    if pk == NodeKind::Call {
+        var f = pcx.nodes[p].x - 1;
+        if f >= 0 && f < pcx.fns.len() as i64 {
+            if pcx.fns[f].tmpl > 0 {
+                f = pcx.fns[f].tmpl - 1;
+            }
+            let fnode = pcx.fns[f].node;
+            bytes = fnode > 0 && editable(pcx.nodes[fnode].start, &pcx);
+        }
+    } else if pk == NodeKind::Let {
+        let ann = pcx.nodes[p].b;
+        bytes = ann > 0 && pcx.nodes[ann].kind == NodeKind::TySlice;
+    } else if pk == NodeKind::Block && pcx.nodes[p].a == n || pk == NodeKind::Return {
+        let f = enclosing_fn(pcx.nodes[n].start, pcx);
+        let r = if f > 0 { pcx.nodes[f].b } else { 0 };
+        bytes = r > 0 && pcx.nodes[r].kind == NodeKind::TySlice;
+    }
+    if bytes {
+        put(pcx.nodes[n].end, pcx.nodes[n].end, ".as_bytes()", TC_BYTES, &tr, &pcx);
+    }
+}
+
+// A character literal MVS types as a byte, `'a'`, is `b'a'`; as a code
+// point (u32) `'a' as u32` (a char in the rust edition).
+fn edit_char(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let s = pcx.nodes[n].start;
+    let t = pcx.nodes[n].ty;
+    if SRC[s] != '\'' || token_at(s, pcx) < 0 {
+        return;
+    }
+    if t == TY_U8 {
+        put(s, s, "b", TC_BYTES, &tr, &pcx);
+    } else if t == crate::front::types::TY_U32 {
+        put(pcx.nodes[n].end, pcx.nodes[n].end, " as u32", TC_BYTES, &tr, &pcx);
+    }
+}
+
+pub fn body_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    // (first the bindings, which the accesses read)
+    for n in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[n].kind;
+        if !own_node(n, tr, &pcx) {
+            continue;
+        }
+        if k == NodeKind::Let {
+            edit_let(n, &tr, &pcx);
+        } else if k == NodeKind::For {
+            edit_for(n, &tr, &pcx);
+        } else if k == NodeKind::PatBind {
+            edit_pat_bind(n, &tr, &pcx);
+        } else if k == NodeKind::Static {
+            edit_static(n, &tr, &pcx);
+        }
+    }
+    for n in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[n].kind;
+        if !own_node(n, tr, &pcx) {
+            continue;
+        }
+        if k == NodeKind::Unary && pcx.nodes[n].op == Tok::Amp {
+            edit_amp(n, &tr, &pcx);
+        } else if k == NodeKind::Unary && pcx.nodes[n].op == Tok::Star {
+            edit_deref(n, &tr, &pcx);
+        } else if k == NodeKind::Call || k == NodeKind::FieldAccess {
+            edit_len(n, &tr, &pcx);
+            edit_call_args(n, &tr, &pcx);
+        } else if k == NodeKind::Index {
+            edit_view(n, &tr, &pcx);
+        } else if k == NodeKind::Str {
+            edit_str(n, &tr, &pcx);
+        } else if k == NodeKind::Char {
+            edit_char(n, &tr, &pcx);
+        } else if k == NodeKind::Closure {
+            let s = pcx.nodes[n].start;
+            if (pcx.nodes[n].p & CONV_NEW) != 0 && word_here(s, "sink") {
+                put(s, s + 4, "move", TC_VAR, &tr, &pcx);
+            }
+        }
+    }
+    edit_prints(&tr, &pcx);
+}
