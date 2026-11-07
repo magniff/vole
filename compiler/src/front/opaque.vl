@@ -322,6 +322,40 @@ pub fn implements(tr: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
     false
 }
 
+// RULE: D22.1 (0.27.3, FL11) Whether opaque type t implements generic trait
+// tr with arguments targs (a TLISTS index): a bound of t names tr with
+// those arguments (`S: AsRef<str>`, resolved in the template's scope; one
+// it cannot resolve, or with fewer written, holds), or a bound's trait
+// has tr among its supertraits.
+pub fn implements_with(tr: i64, t: i64, targs: i64, pcx: inout Ctx<Comp>) -> bool {
+    let bounds = pcx.nodes[pcx.types[t].b].h;
+    for i in 0..(if bounds > 0 { pcx.nodes[bounds].count } else { 0 }) {
+        let b = child(bounds, i, pcx);
+        let bt = bound_trait(b, &pcx);
+        if bt != tr {
+            if bt >= 0 && entails(bt, tr, 0, &pcx) {
+                return true;
+            }
+            continue;
+        }
+        let g = pcx.nodes[b].g;
+        var same = true;
+        for k in 0..(if g > 0 { pcx.nodes[g].count } else { 0 }) {
+            let saved = pcx.cur_mod;
+            pcx.cur_mod = crate::front::modules::module_of(b, &pcx);
+            let a = resolve_quietly(child(g, k, pcx), &pcx);
+            pcx.cur_mod = saved;
+            if a > 0 && a != pcx.ty_error && a != pcx.tlists.get(targs + k) {
+                same = false;
+            }
+        }
+        if same {
+            return true;
+        }
+    }
+    false
+}
+
 // Whether a bound of opaque type t declares method `name` (F2.2).
 fn bound_method(t: i64, name: i64, pcx: inout Ctx<Comp>) -> bool {
     let bounds = pcx.nodes[pcx.types[t].b].h;
@@ -455,6 +489,10 @@ fn fn_bound_sig(t: i64, pcx: inout Ctx<Comp>) -> i64 {
 // RULE: D22.3 Method `name` on Ω type o that no bound gives: rustc's
 // E0599, with the bound to add when one trait in scope declares it.
 fn unbounded_method_error(n: i64, o: i64, name: i64, pcx: inout Ctx<Comp>) -> ! {
+    // RULE: F18.6 (a method on a bare type variable: its type is not known)
+    if crate::front::check::infer::is_var(o, pcx) {
+        crate::front::check::infer::unknown_error(o, &pcx);
+    }
     let saved = pcx.err_kind;
     pcx.err_kind = c"generic.unbounded_use";
     err_begin(pcx.nodes[n].start, &pcx);
@@ -580,14 +618,26 @@ fn declaring(tr: i64, name: i64, depth: i64, pcx: inout Ctx<Comp>) -> i64 {
 // a body, its signature resolved with Self = t; -1 when no bound of t
 // declares it.
 pub fn virtual_fn(t: i64, name: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let (tr, b) = bound_declaring(t, name, &pcx);
+    // (0.27.3, FL11: a generic method of a generic trait, `contains<U>` of
+    // RangeBounds<T>, is instantiated without the trait's arguments: a gap
+    // of the model, its instance unsure)
+    if tr >= 0 {
+        let tg = pcx.nodes[pcx.traits[tr].node].g;
+        let decl = crate::front::traits::trait_fn(tr, name, pcx);
+        if tg > 0 && pcx.nodes[tg].count > 0 && decl != 0 && pcx.nodes[decl].g != 0
+            && pcx.nodes[pcx.nodes[decl].g].count > 0 {
+            pcx.opaque_unsure = true;
+        }
+    }
     let had = crate::front::types::find_method(t, name, pcx);
     if had >= 0 {
         return had;
     }
-    let (tr, _) = bound_declaring(t, name, &pcx);
     if tr < 0 {
         return -1;
     }
+    let targs = trait_args_of(tr, b, t, &pcx);
     let decl = crate::front::traits::trait_fn(tr, name, pcx);
     let item = crate::front::generics::instantiate::clone_node(decl, &pcx);
     pcx.nodes[item].c = 0;
@@ -605,7 +655,11 @@ pub fn virtual_fn(t: i64, name: i64, pcx: inout Ctx<Comp>) -> i64 {
         pcx.cur_mod = pcx.traits[tr].module;
         pcx.self_type = t;
         pcx.self_impl = -1;
+        let tg = pcx.nodes[pcx.traits[tr].node].g;
+        let count = if tg > 0 { pcx.nodes[tg].count } else { 0 };
+        let env = crate::front::generics::env_enter(tg, targs, count, &pcx);
         crate::front::check::resolve::resolve_signature(f, &pcx);
+        crate::front::generics::env_leave(env, &pcx);
         pcx.cur_mod = saved_mod;
         pcx.self_type = saved_self;
         pcx.self_impl = saved_impl;
@@ -614,6 +668,77 @@ pub fn virtual_fn(t: i64, name: i64, pcx: inout Ctx<Comp>) -> i64 {
         ty: t, name: name, f: f,
     }, &pcx);
     f
+}
+
+// RULE: D22.1 (0.27.3, FL11) Path n is `Ω::NAME` (t an Ω), NAME an
+// associated constant a bound's trait declares (`A::FREES` with `A:
+// Allocator`): its type, from the declaration with Self = t; n a literal
+// of it (the opaque instance is never lowered: only its type counts), or
+// of the error type when the constant is no integer or bool (what uses it
+// is not checked). -1 when no bound declares NAME.
+pub fn omega_const(n: i64, t: i64, name: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let bounds = pcx.nodes[pcx.types[t].b].h;
+    var decl = 0;
+    for i in 0..(if bounds > 0 { pcx.nodes[bounds].count } else { 0 }) {
+        let bt = bound_trait(child(bounds, i, pcx), &pcx);
+        let d = assoc_decl(bt, name, 0, &pcx);
+        if d != 0 && (pcx.nodes[d].p & crate::front::ast::NODE_ASSOC_CONST) != 0 {
+            decl = d;
+            break;
+        }
+    }
+    if decl == 0 {
+        return -1;
+    }
+    let (saved_mod, saved_self) = (pcx.cur_mod, pcx.self_type);
+    pcx.cur_mod = crate::front::modules::module_of(decl, &pcx);
+    pcx.self_type = t;
+    let ty = resolve_quietly(pcx.nodes[decl].b, &pcx);
+    pcx.cur_mod = saved_mod;
+    pcx.self_type = saved_self;
+    let (start, end) = (pcx.nodes[n].start, pcx.nodes[n].end);
+    pcx.nodes[n] = pcx.nodes[0];
+    pcx.nodes[n].start = start;
+    pcx.nodes[n].end = end;
+    if ty == crate::front::types::TY_BOOL {
+        pcx.nodes[n].kind = NodeKind::Bool;
+    } else {
+        pcx.nodes[n].kind = NodeKind::Int;
+    }
+    let r = if ty > 0 && (ty == crate::front::types::TY_BOOL || crate::front::types::is_integer(ty))
+        { ty } else { pcx.ty_error };
+    pcx.nodes[n].ty = r;
+    pcx.nodes[n].p |= crate::front::ast::NODE_CHECKED;
+    r
+}
+
+// RULE: D22.1a (0.27.3, FL11) The arguments of trait tr in the virtual
+// signature of a method bound b of Ω t declares: b's own when b names tr
+// (`T: Add<U>`: U's Ω, resolved in the template's scope), else each
+// parameter's default with Self = t (`Rhs = Self`), else the error type,
+// which reports nothing; a TLISTS index.
+fn trait_args_of(tr: i64, b: i64, t: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let tg = pcx.nodes[pcx.traits[tr].node].g;
+    let count = if tg > 0 { pcx.nodes[tg].count } else { 0 };
+    let written = if b > 0 && bound_trait(b, &pcx) == tr { pcx.nodes[b].g } else { 0 };
+    let mark = pcx.tscratch.count;
+    for k in 0..count {
+        var a = 0;
+        if written > 0 && k < pcx.nodes[written].count {
+            a = resolve_quietly(child(written, k, pcx), &pcx);
+        }
+        let default = pcx.nodes[child(tg, k, pcx)].b;
+        if a == 0 && default != 0 {
+            let (saved_mod, saved_self) = (pcx.cur_mod, pcx.self_type);
+            pcx.cur_mod = pcx.traits[tr].module;
+            pcx.self_type = t;
+            a = resolve_quietly(default, &pcx);
+            pcx.cur_mod = saved_mod;
+            pcx.self_type = saved_self;
+        }
+        pcx.tscratch.push(if a == 0 { pcx.ty_error } else { a });
+    }
+    crate::front::generics::take_targs(mark, &pcx)
 }
 
 // RULE: D22.1 `Ω::name` (`<Ω as Tr>::name`): the bound's equality when one
@@ -738,6 +863,7 @@ pub fn build_opaque_instances(program: i64, pcx: inout Ctx<Comp>) {
     pcx.opaque_q0 = pcx.inst_queue.count;
     pcx.opaque_phase = true;
     var made_fns = Vec::<i64, Comp>::new_in(Comp {});
+    var unsure_fns = Vec::<i64, Comp>::new_in(Comp {});
     for i in 0..pcx.nodes[program].count {
         let item = child(program, i, pcx);
         if pcx.nodes[item].kind != NodeKind::Fn || pcx.nodes[item].x == 0
@@ -756,18 +882,60 @@ pub fn build_opaque_instances(program: i64, pcx: inout Ctx<Comp>) {
         var plain = true;
         for k in 0..pcx.nodes[g].count {
             let p = child(g, k, pcx);
+            // (0.27.3: not an `#[array_builtin(N)]` length parameter, a
+            // value inside, which parse_generic_params makes zero-wide at
+            // the attribute, length_param: F15.3)
             plain = plain && pcx.nodes[p].kind == NodeKind::TyName
-                && crate::front::generics::instantiate::array_len_name(p, pcx) == 0;
+                && crate::front::generics::instantiate::array_len_name(p, pcx) == 0
+                && pcx.nodes[p].end > pcx.nodes[p].start;
         }
         if !plain {
             continue;
         }
+        pcx.opaque_unsure = false;
         let made = crate::front::check::opaque_instance(f, item, &pcx);
         if made >= 0 {
             made_fns.push(made);
+            // (a `where` predicate, one on a projection, may give an Ω what
+            // the model does not: `X::Item: Show`)
+            unsure_fns.push(if pcx.opaque_unsure || crate::front::traits::wp_start(item, pcx) >= 0 {
+                1
+            } else {
+                0
+            });
         }
     }
-    crate::front::check::check_queued_instances(pcx.opaque_q0, &pcx);
+    // RULE: D22.2 (0.27.3, FL11) Each queued instance checked, as
+    // check_queued_instances does; the errors of one that meets a gap of the
+    // model (opaque_unsure: made so, or met while checked) are forgotten,
+    // and so are those of the instances it makes.
+    var unsure_at = Vec::<i64, Comp>::new_in(Comp {});
+    var q = pcx.opaque_q0;
+    while q < pcx.inst_queue.count {
+        let inst = pcx.inst_queue.get(q);
+        var unsure = q - pcx.opaque_q0 < unsure_at.len() as i64
+            && unsure_at[(q - pcx.opaque_q0) as usize] != 0;
+        for k in 0..made_fns.len() {
+            if made_fns[k] == inst && unsure_fns[k] != 0 {
+                unsure = true;
+            }
+        }
+        pcx.opaque_unsure = unsure;
+        let mark = crate::base::diag::errors_mark(pcx);
+        let (s_mark, k_mark) = (pcx.suggested.count, pcx.suggested_kind.count);
+        crate::front::check::check_function_recovering(pcx.fns[inst].node, &pcx);
+        if pcx.opaque_unsure {
+            crate::base::diag::errors_forget(mark, &pcx);
+            pcx.suggested.count = s_mark;
+            pcx.suggested_kind.count = k_mark;
+        }
+        let flag = if pcx.opaque_unsure { 1 } else { 0 };
+        while (unsure_at.len() as i64) < pcx.inst_queue.count - pcx.opaque_q0 {
+            unsure_at.push(if (unsure_at.len() as i64) > q - pcx.opaque_q0 { flag } else { 0 });
+        }
+        q += 1;
+    }
+    pcx.opaque_unsure = false;
     // (the templates whose instance checked: not one the model left out)
     for made in made_fns.as_slice() {
         if (pcx.nodes[pcx.fns[made].node].p & FN_BODY_FAILED) == 0 {

@@ -148,7 +148,8 @@ fn import_one(mvs: [u8], alias: [u8], out: i64, tr: Tr, pcx: inout Ctx<Comp>) ->
     let module = module_part(mvs);
     let p = std2_path(sym, module, tr);
     if p == 0 {
-        if tr.row_free.get(sym + 1) != 0 {
+        // (MVS's `str`, std::string's: the primitive, no use)
+        if name == "str" && alias.len == 0 || tr.row_free.get(sym + 1) != 0 {
             // (a free function whose calls a row rewrites)
             return true;
         }
@@ -305,6 +306,46 @@ fn own_names(out: inout HMap, pcx: inout Ctx<Comp>) {
     }
 }
 
+// Whether the use at token k (the `use`) is MVS's `str` alone, `use
+// std::string::str;` (or `std::str`, `crate::std::..`): the rust edition's
+// `str` is the primitive, std2 has no such item, and the use goes; so does
+// `use std::str::memchr;`.
+fn drop_str_use(k: i64, tr: inout Tr, pcx: inout Ctx<Comp>) -> bool {
+    let n = pcx.toks.len() as i64;
+    var j = k + 1;
+    if j + 1 < n && pcx.toks[j].kind == Tok::Ident
+        && SRC[pcx.toks[j].start..pcx.toks[j].end] == "crate"
+        && pcx.toks[j + 1].kind == Tok::ColonColon {
+        j += 2;
+    }
+    if j + 2 >= n || pcx.toks[j].kind != Tok::Ident
+        || SRC[pcx.toks[j].start..pcx.toks[j].end] != "std"
+        || pcx.toks[j + 1].kind != Tok::ColonColon {
+        return false;
+    }
+    j += 2;
+    if j + 2 < n && pcx.toks[j].kind == Tok::Ident
+        && SRC[pcx.toks[j].start..pcx.toks[j].end] == "string"
+        && pcx.toks[j + 1].kind == Tok::ColonColon {
+        j += 2;
+    }
+    if j + 1 >= n || pcx.toks[j].kind != Tok::Ident
+        || SRC[pcx.toks[j].start..pcx.toks[j].end] != "str" {
+        return false;
+    }
+    // (`std::str::memchr`, which rewrite.tsv writes as an iterator's
+    // position: std2 has no such function either)
+    if j + 3 < n && pcx.toks[j + 1].kind == Tok::ColonColon && pcx.toks[j + 2].kind == Tok::Ident
+        && SRC[pcx.toks[j + 2].start..pcx.toks[j + 2].end] == "memchr"
+        && pcx.toks[j + 3].kind == Tok::Semi {
+        return put(pcx.toks[k].start, pcx.toks[j + 3].end, "", TC_IMPORT, &tr, &pcx);
+    }
+    if pcx.toks[j + 1].kind != Tok::Semi {
+        return false;
+    }
+    put(pcx.toks[k].start, pcx.toks[j + 1].end, "", TC_IMPORT, &tr, &pcx)
+}
+
 // The uses of every file of the program, and the imports a file needs.
 pub fn path_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
     var own = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
@@ -329,10 +370,18 @@ pub fn path_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
             }
             last = k;
             if t.kind == Tok::Use {
-                edit_use(k, &names, &tr, &pcx);
+                if !drop_str_use(k, &tr, &pcx) {
+                    edit_use(k, &names, &tr, &pcx);
+                }
                 in_use = true;
             } else if t.kind == Tok::Semi {
                 in_use = false;
+            } else if in_use && t.kind == Tok::Ident && k + 1 < pcx.toks.len() as i64
+                && (pcx.toks[k + 1].kind == Tok::Comma || pcx.toks[k + 1].kind == Tok::RBrace
+                    || pcx.toks[k + 1].kind == Tok::Semi) {
+                // (a name any use of the file binds, `use crate::lexer::Tok::{Hash}`
+                // too: std2's item of that name is not imported beside it)
+                names.put(t.value as i64 + 1, 1);
             } else if !in_use && t.kind == Tok::Ident && SRC[t.start..t.end] == "std"
                 && (k == 0 || pcx.toks[k - 1].kind != Tok::ColonColon) {
                 edit_path(k, &tr, &pcx);
@@ -390,12 +439,39 @@ pub fn path_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
     }
 }
 
+// The std2 module a row's path names by its first segment (`mem` in
+// `mem::replace`), its path to import, or "": a module that needs a `use`
+// (`str::`, a primitive's, needs none).
+fn std2_module(name: [u8]) -> [u8] {
+    if name == "mem" {
+        "std::mem"
+    } else if name == "slice" {
+        "std::slice"
+    } else if name == "ptr" {
+        "std::ptr"
+    } else if name == "fmt" {
+        "std::fmt"
+    } else if name == "io" {
+        "std::io"
+    } else if name == "thread" {
+        "std::thread"
+    } else if name == "cmp" {
+        "std::cmp"
+    } else if name == "hash_map" {
+        "std::collections::hash_map"
+    } else if name == "hash_set" {
+        "std::collections::hash_set"
+    } else {
+        ""
+    }
+}
+
 // (after the rows) The imports of the names the rows wrote (`Layout`,
 // `NonNull`: Tr.row_names), each file's: one std2 has outside its
 // prelude, that the file does not name itself (then path_edits saw it).
+// An item of the program elsewhere with the same name (compiler/src's
+// own `Layout`) does not count: only what the file writes binds a name.
 pub fn row_imports(tr: inout Tr, pcx: inout Ctx<Comp>) {
-    var own = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-    own_names(&own, &pcx);
     for f in 0..pcx.files.len() as i64 {
         let s = pcx.files[f].start;
         let e = pcx.files[f].end;
@@ -410,7 +486,10 @@ pub fn row_imports(tr: inout Tr, pcx: inout Ctx<Comp>) {
                 if first < 0 {
                     first = k;
                 }
-                if t.kind == Tok::Ident {
+                // (a path's later segment, `thread::JoinHandle`, names no item here)
+                if t.kind == Tok::Ident
+                    && (k == 0 || pcx.toks[k - 1].kind != Tok::ColonColon
+                        || pcx.toks[k - 1].start < s) {
                     written.put(t.value as i64 + 1, 1);
                 }
             }
@@ -424,8 +503,17 @@ pub fn row_imports(tr: inout Tr, pcx: inout Ctx<Comp>) {
             let sym = tr.row_names.get(r);
             let at = tr.row_names.get(r + 1);
             r += 2;
-            if at < s || at >= e || written.get(sym + 1) != 0 || own.get(sym + 1) != 0
+            if at < s || at >= e || written.get(sym + 1) != 0
                 || tr.prelude.get(sym + 1) != 0 {
+                continue;
+            }
+            let m = std2_module(sym_text(sym, pcx));
+            if m.len > 0 {
+                // (a module a row's path starts with: `use std::mem;`)
+                written.put(sym + 1, 1);
+                buf_bytes(add, "use ");
+                buf_bytes(add, m);
+                buf_bytes(add, "; ");
                 continue;
             }
             let p = std2_path(sym, SRC[0..0], tr);

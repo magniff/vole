@@ -783,11 +783,20 @@ project's rule: every error of a compilation), deduped by §14.3.
    Ends`), never killed (a static has no `StorageDead` and is never
    assigned); it takes part in conflicts like any shared loan (writes to
    an immutable static do not exist). `&S` and `&mut S` of a `static
-   mut`: `error borrowck.static_mut_ref` (Rust 2024's rule: no
-   references to a `static mut`), inside or outside `unsafe`, `try:`
-   the raw address `&raw mut S` (`BK_RAW`, R1: no loan); ir271
-   implements it at the front (the borrow expression's operand is a
-   `static mut` item), so no loan of a `static mut` reaches the solve.
+   mut`, or of a part of it, are `error borrowck.static_mut_ref` (Rust
+   2024's rule: no references to a `static mut`), inside or outside
+   `unsafe`, and so is one coerced where a raw pointer goes (`let p:
+   *mut T = &mut S;`: rustc "creating a mutable reference to mutable
+   static"); the help is the raw address `&raw mut S`. Only `&raw const
+   S` and `&raw mut S` (front-rust.md F30.2: `BK_RAW`, R1, no loan) take
+   it. A place under the deref of a raw borrow (`*&raw mut S`,
+   `(*&raw const S).f`) is a place through that raw pointer, not a part
+   of `S`: a reference to it (a method's autoref, `(*&raw mut S).push(2)`;
+   `&mut *&raw mut S`) is no reference to the static, as in rustc (0.27.4;
+   the builder does not fold `*&raw mut S` back to `S`, as it folds
+   `*&x`). ir271 implements it at the front (the borrow expression's
+   operand is a `static mut` item, and the `&` is not a raw borrow), so no
+   loan of a `static mut` reaches the solve.
 
 ## 7. Two-phase borrows (S7)
 
@@ -2072,15 +2081,30 @@ is already reported at that position (a concrete instance's: D4.4's
 dedupe). std2's templates get theirs under `--std2-check` only (the
 `std2-check` row), as their bodies' borrow checking is (Z7).
 
-In 0.27.2.1 the type check reports only D22.3's error, and only for a
-parameter's own Ω in a template without a `where` predicate; every
-other type error in an opaque instance leaves it out, unreported and
-not counted, as it may be the model's gap and not the program's:
-operators on an Ω (`a + b` with `T: Add<Output = T>`, `==` with
-`PartialEq`), a bound's type arguments (`T: AsRef<str>`), `T::f()` and
-`T::CONST`, `where` predicates on projections (`X::Item: Show`). The
-borrow checker's errors are reported in full. Each gap closes in
-0.27.3 (front-rust.md FL11).
+In 0.27.2.1 the type check reported only D22.3's error. From 0.27.3
+(front-rust.md FL11) it reports an opaque instance's type errors as
+rustc does, unless the instance meets a gap of the model, which makes it
+*unsure*: its errors, and those of the instances its check makes, are
+forgotten (`opaque_unsure`, front/opaque.vl build_opaque_instances). The
+model covers operators on an Ω through its bound (`a + b` with `T:
+Add<Output = T>`, `==`, `<`, `-a`, `!a`, `a << b`, `+=`: has_impl, an Ω
+having its bounds' traits), a bound's type arguments and a trait
+parameter's default in a virtual signature (`T: AsRef<str>`'s `as_ref`
+is `fn(&Ω) -> &str`, `Add`'s `Rhs = Self`), `Ω::f()` and `Ω::CONST` of a
+bound's trait (`T::default()`, `A::FREES`: a constant is a literal of its
+type, the instance never lowered), `*d` with `Deref`, `g[i]` with
+`Index`. The gaps that make an instance unsure:
+
+- a generic method of a generic trait (`contains<U>` of
+  `RangeBounds<T>`): its instance lacks the trait's arguments;
+- a `where` predicate in the template (one on a projection, `X::Item:
+  Show`, gives an Ω what the model does not);
+- an error while the instance is made (a bound an Ω does not resolve: an
+  impl parameter fixed only by another's bound, `impl<B, F: Fn(i64) ->
+  Option<B>>`).
+
+An `#[array_builtin(N)]` template (a length parameter) gets no opaque
+instance. The borrow checker's errors are reported in full.
 
 **D22.3 (the bound-only rule)** is front-rust.md §6's: it is what the
 opaque instance checks for every template, used or not; the concrete
@@ -2113,6 +2137,22 @@ instance stays R3's until D4.4(d)), 0 errors. *The cost:* §15's
 quarter holds over std2's bodies, and the `std-rust` compile-cost row
 stays within 2.0x of MVS's `std`. D17.6's exception (b) (MVS std
 callbacks) is deleted; D17.7's verdict applies to std2's bodies.
+
+**Z7.2 (a build does not solve std2's non-generic bodies again, 0.27.4).**
+In a build (not a query, `check`'s tools, or `--std2-check`) whose std2
+is the embedded text, a std2 body that is not an instance of a template
+(no type parameter, its own or its impl's) is not solved: its verdict is
+clean. The reason: the gate's `std2-check` row solves those same bodies,
+of those same bytes, when the compiler is built (0 errors). Nothing a
+program writes reaches them, so solving them again in every build only
+repeats a verdict already known. This is rustc's model too: core and std
+are not borrow-checked again in each crate. An instance of a std2
+template is still solved per D4.4 in every build, since the program's
+types reach it, and its errors are reported as Z7 says. An std2 read
+from files (`VOLE_STD_TREE`, `--std-tree`) is solved whole, as is every
+body under `--std2-check`. *Anchor:* `places/mod.vl: place_body`,
+`places/borrowck/cache.vl: std_body`. Case
+`rust_b_z72_std2_instance_err`.
 
 **Z7.1 (`Copy` in a rust program).** `τ: Copy` iff `τ` is a number,
 `bool`, `char`, `&T`, a raw pointer, a `fn` type, a tuple or array of

@@ -354,6 +354,46 @@ of a partial step, seen in 0.27.3 (making the str view Copy alone):
 collapsing to one, and `Copied<Iter<str>>::next` reads `Option<&&str>`
 as `Option<str>` (`no method 'copied' on type 'Option<str>'`): both are
 `&T` with `T = &str` collapsed to the view.
+*As landed (0.27.4, step B).* The rules above hold in every
+rust-edition position, with these readings:
+- *The probe on a view* (F6.2). The place's `&self` method, inherent or
+  of a trait, is at the by-value step on the view; the view's own impls'
+  `&self` methods (`impl<T: ?Sized + Ord> Ord for &T`) are at the `&` step.
+  So `a.cmp(b)` of two `&str`s is `<str as Ord>::cmp`, `b.as_ref()` of a
+  `&str` is `<str as AsRef<[u8]>>`, and `rr.tag()` of a `&&S` is still the
+  `&S` impl's (the step is read from the receiver's written type). In
+  `Tr::m(x)` (F8.2), x is the `&self` itself, with no autoref, so a view x
+  takes the place's. In an instance, a receiver of a parameter's type
+  (`k: K`, or a field of type `K`) takes the bound's method, the one the
+  generic body named: `<&str as Borrow<&str>>` for `K = &str`. A receiver
+  `x: &P` takes P's.
+- *Associated functions* of the place are its view's path too
+  (`str::from_utf8(b)`).
+- *A default body's trait argument.* `PartialEq<[U]>`'s `[U]`,
+  substituted for `Rhs` in `ne`'s default, stays the place: its written
+  text is kept (`traits.vl: subst_trait_args`).
+- *Sized* (F21.1). A parameter without `?Sized` bound to `Unsized(v)` is
+  `type.unsized` (E0277), checked with the bounds of every struct, enum
+  and function instance (`traits.vl: check_bounds`).
+- *`&e` of a view value.* `&e`/`&mut e` of a call's view
+  (`&mut "ab".as_bytes()`) is a reference to a temporary view,
+  `&mut &[u8]`; `&v[..]` stays the place's view.
+- *Slots.* `slots_in` and `slot_variances_in` read `Unsized(v)` as its
+  element.
+- *std2* gains rustc's forwarding impls that the distinct `&&str` now
+  needs: `Borrow<T>` for `&T`/`&mut T`, `AsRef<U>` for `&T`/`&mut T`,
+  `AsMut<U>` for `&mut T`, `Eq`/`Ord` for `&A`.
+Not closed (0.27.5): an iterator whose Item is a view, in std2's
+generic instances (`[&str; 2].into_iter().collect_in(a)`, `Extend::extend`'s
+`I: IntoIterator<Item = T>`), is a `borrowck.outlives` between the
+parameters' regions (D4.6's ties do not reach a view's slot). It also
+fails without step B. Case `rust_b_view_item_collect`.
+Not closed either: `Box<[T], A>` and `Box<str, A>`. std2's `Box<T, A>` has
+a Sized T, so they are `type.unsized`; an unsized Box needs `T: ?Sized` on
+the Box and its impls (0.27.5). A `NonNull<[u8]>` is two words.
+*Cases:* `rust_f_z91c_ref_of_view`, `rust_f_z91c_impl_place_and_ref`,
+`rust_f_z91c_unsized_param`, `rust_f_z91c_vec_unsized_err`,
+`rust_f_z91c_fat_nonnull`.
 ### F23 Literals
 
 **F23.1 (string literals).** `"…"` has type `&'static str` in a
@@ -395,7 +435,10 @@ gap 13, where MVS makes the cast itself unsafe). Everything else is
 `error type.cast` (E0605/E0606). *Anchor:* `synth_cast` ("cannot cast
 ..", today requiring `unsafe` for int→ptr), `front/check/unsafety.vl`. (0.27.3:
 `&T as *const U` with `U` not `T` is an error, rustc E0606; it read a
-`T` as a `U`.)
+`T` as a `U`.) (0.27.4: `e as *const _` and `e as *mut _` take the
+pointee from the operand, `T` of a `&T`, `&mut T`, `*const T` or `*mut
+T`; of any other operand, an integer, the pointee is not known: `error
+type.cast`, rustc E0641 "cannot cast to a pointer of an unknown kind".)
 
 **F29.2 (fat pointers).** Z9.3.
 
@@ -417,12 +460,20 @@ raw pointer (today: `&(*p).f` of a raw pointee is a raw pointer, M3a's
 gap 1). *Anchor:* `front/check/synth_mode.vl: synth_unary` (the `&` of
 a raw deref), `front/check/rust.vl: note_const_ptr, const_write`.
 
-**F30.2 (`&raw`).** `&raw const place` and `&raw mut place` are the
-raw-pointer forms (`*const T`, `*mut T`), with no reference made and no
-`unsafe` needed for a place through `*p` beyond the deref's; they are
-what std2 writes where it wants the address (`&raw const (*p).field`).
-Rust's reference "Borrow expressions" (raw borrows). *Anchor:* the
-parser's unary `&` (`front/parser/exprs.vl`), `synth_unary`.
+**F30.2 (`&raw`).** In the rust edition `&raw const P` and `&raw mut P`
+(P a place) are the raw-pointer forms, `*const T` and `*mut T` for P of
+type T: the address, with no reference made and no loan (borrowck.md
+R1, `BK_RAW`); `raw` is a contextual word, an identifier elsewhere. `&raw
+mut P` needs P mutable as `&mut P` does (a `let` without `mut`: rustc
+E0596). A value that is not a place is an error (rustc: "cannot take
+address of a temporary", E0745). No `unsafe` is needed beyond P's own:
+the deref in `&raw const (*p).field`, a `static mut` S's use in `&raw
+const S.n` (F19.6, E0133); the bare `&raw mut S` of a `static mut` is
+safe, as rustc's. It is how a `static mut` is reached (borrowck.md
+D6.2.5): `let p: *mut T = &raw mut S;`. *Anchor:*
+`front/parser/exprs.vl: parse_prefix` (NODE_RAW_BORROW on the `&`),
+`front/check/rust.vl: raw_borrow` (from `synth_unary`),
+`places/build.vl: ref_kind, emit_ref`.
 
 **F30.3 (no indexing of a raw pointer).** In a rust-edition position
 `p[i]` and `p[a..b]` with `p: *const T` or `*mut T` are `error type`
@@ -838,6 +889,33 @@ F4.2 (a written `impl Tr for i64` beside the list is an overlap). An
 impl so synthesized has no position: its errors are reported at the
 attribute. *Anchor:* `front/parser/rust.vl: take_builtin_impls` (today
 `edition.later: primitive_builtin`), `intrinsic`.
+(0.27.4) *Which primitives a build makes them for.* A lazy build
+(std2lazy) makes the impls, and the integers' inherent methods (F15.4),
+only for the primitives a program brings in. A program brings in a
+primitive when one of these holds:
+- one of its files names it as a word;
+- a literal's suffix names it (`5u16`);
+- an unsuffixed float (f64) or a char literal (u32) appears;
+- a float is brought in (f32 or f64): then u64, i64 and u32 are too, the
+  types its formatting and bit methods work in;
+- a word in std2lazy's PRIM_WORDS table brings it through std2's types.
+  For example `chars` and `to_digit` bring u32, `Hash`, `HashMap`, `copy`
+  and `to_bits` bring u64, `PartialOrd` and `Ord` bring a derived
+  order's isize, `floor`, `pop` and `drain` bring u32, and `AtomicU16`
+  brings u16.
+The impls for i32, usize, u8 and bool are always made. They come without
+a name: the literal default, a length, a str's bytes, a condition.
+A dropped impl counts as dropped std2 text, so a build whose check then
+fails is made again with std2 whole (rerun_eager). Its diagnostics are
+then the eager build's, and a missing impl is an error before it is
+anything else: no impl is ever chosen in its place. An open literal
+closed by a bound keeps its default (FL6: i32 and f64, whose impls are
+always there when the literal is), and a type variable solved through an
+impl (FL1) is solved among the impls of the named types, which are all
+made. Queries,
+`--std2-check`, `fix` and an on-disk std2 make every impl. Cases
+`rust_f_f15_prim_impl_literal_ok`, `rust_f_f15_prim_impl_unnamed_ok`,
+`rust_f_f15_prim_impl_bound_ok`, `rust_f_f15_prim_impl_solved_ok`.
 
 **F15.2 (what counts as a primitive here).** The listed names are the
 primitives; `&T`, `[T]`, `str`, tuples are not (their impls are written,
@@ -909,8 +987,14 @@ take_array_builtin`; `places/shim.vl: drop_fn` (a pattern impl's drop).
 hold (F0.4, else `trait.unmet`). For a method the result is the
 function value of the impl's (or builtin's, or default's) method; its
 call passes the receiver explicitly. In type position
-`<τ as Tr>::A` is F11.3's projection. *Anchor:* `front/parser/rust.vl:
-qualified_path` (today `edition.later`), `split_shl`, `synth_path`.
+`<τ as Tr>::A` is F11.3's projection. (0.27.4) In type position the
+trait's arguments pick the impl: `<I as SliceIndex<[i64]>>::Output`
+with I = `RangeFrom<usize>` is the impl for `[T]` (T := i64 from the
+arguments, F14.1), not the one for `str`; without arguments, or when
+none matches, it is t's impl of Tr, as before. Case
+`std2_slice_sliceindex_output`. *Anchor:* `front/parser/rust.vl:
+qualified_path` (today `edition.later`), `split_shl`, `synth_path`,
+`check/resolve.vl: qualified_projection`.
 
 **F8.2 (`Tr::name`).** A trait name used as a path head (`Debug::fmt(v,
 f)`, `Iterator::next(&mut it)`, `Default::default()`) is `<_ as
@@ -982,16 +1066,13 @@ char`). *Anchor:* `infer_from` (today: arguments and one hint),
 `front/generics/mod.vl: hint_for`, `front/closures/mod.vl:
 infer_param_error`.
 
-**F18.2 (no expected type).** `let x = Vec::new_in(a);` with `T` fixed
-by a later `x.push(1)` is **not** inferred in 0.27.2 (vole has no
-deferred unification variables; FL1, `edition.later: deferred_infer
-(0.27.4)`, with the compiler's own move to the edition, where it will
-matter; the translator of 0.27.3 writes the annotation from MVS's known
-types). The error is `type.infer` at the `let`; its `try:` gives the
-annotation the first later use determines when the checker can see one
-(`try: let x: Vec<i64, Gpa> = Vec::new_in(a)`: the first method call,
-assignment or argument of `x` in the body whose parameter type binds
-`T`), else the turbofish. std2 and the corpus annotate.
+**F18.2 (no expected type).** In MVS a parameter the steps of F18.1
+leave free is `type.infer` at the call, with the `try:` of the turbofish
+(`try: Vec::<T>::new_in(...)`). In the rust edition it is an inference
+variable (F18.6, 0.27.4: FL1's deferred inference): `let x =
+Vec::new_in(a);` with `T` fixed by a later `x.push(1)` is inferred; a
+variable still free at the end of its function is the same `type.infer`,
+at the call that made it.
 
 **F18.3 (integer and float literals).** An unsuffixed integer literal
 has no type of its own: it takes the type of the context it unifies
@@ -1024,7 +1105,10 @@ statement, `let a = [1, 2]; f(&a)` with `f(&[u8])`) are F18.5's.
 edition an unannotated `let x = e;` binding one name, with `e` a literal
 tree (an unsuffixed integer literal, its negation, an array, a repeat or
 a tuple of literal trees, where a tuple's other elements are any
-value, an arithmetic operator of two literal trees), makes `x` **open**:
+value, an arithmetic operator of two literal trees; 0.27.4: an `if`
+with an `else`, or a `match`, whose every branch's value, its block's
+tail, is a literal tree, `let e0 = if c { 1 } else { 0 };`, and a block
+whose tail is one), makes `x` **open**:
 its integer positions are inference variables. So does `let r = &x;` (or
 `&mut x`) of an open `x`: `r` is a **link**, its type `&` of `x`'s;
 solving one solves the other, closing one closes both. Until it is
@@ -1036,9 +1120,10 @@ return or tail, a struct field, an assignment's target type, `&x` where
 `&τ`, `*const τ` or `&[τ]` goes, `a[i]` and `&a[..]` of an open array
 where `τ` or `&[τ]` goes), matched with the provisional type where the
 variables are; (b) an operand of a binary operator whose other operand
-has a definite integer type (`i < v.len()`: `usize`); (c) the target of
-`x = e` or `x op= e` with `e` of a definite type (`s += m.v`, `kv =
-e.remove_entry()`; `s += x` of an `x: &i64` reads through it); (d) a
+has a definite integer type (`i < v.len()`: `usize`), so a `for`
+range's start whose end has one (`for i in e0..np`, 0.27.4); (c) the
+target of `x = e` or `x op= e` with `e` of a definite type (`s += m.v`,
+`kv = e.remove_entry()`; `s += x` of an `x: &i64` reads through it); (d) a
 generic call's argument, placed with the untyped literals (F18.1 step
 (2)), so that it takes the type the other arguments or the expected type
 bind. These uses keep it open and are retyped when it is solved: `x op=
@@ -1065,6 +1150,60 @@ literal arguments, so that its result binds their parameter
 (`map_or(0, |x| x + 1)`), and one whose value is itself a literal
 after; a negated literal where an unsigned type goes is an error, rustc
 E0600.)
+
+**F18.6 (type variables: deferred inference; 0.27.4).** In the rust
+edition a type parameter of a generic call (a function, a method, a path
+`Vec::new_in(..)`), of an enum's variant (`Ok(x)`) or of a struct
+literal that F18.1's steps (1)-(5) leave free is not an error: it
+becomes an **inference variable** `?ᵢ`, and the call's type mentions it
+(`Vec<?T, Gpa>`). A variable is solved by the first check, in the order
+the function is checked, that unifies a type mentioning it with a
+definite type:
+(a) a value checked against an expected type, either side mentioning
+the variable: an argument and its parameter's type, a `let`'s
+annotation, the return or the tail, a struct field, a later arm of an
+`if` or `match` against the first's type (`if c { Ok(1) } else
+{ Err("neg") }` fixes `E`), so a value passed where its type goes
+(`mem::replace(&mut x, fresh)`);
+(b) a method call's receiver against the instance's `Self`, after the
+arguments bound the parameters (`v.push(2)`: `T` from `2`);
+(c) the target of `x = e` with `e` of a definite type.
+These uses keep it free: a method call whose instance names the
+variable only through `Self` (`v.len()`, `v.is_empty()`,
+`v.capacity()`): the instance waits for the variable, and is made again
+with its solution. Any other use is `type.infer` (rustc E0282) at the
+call that made the variable: a method call on a bare variable, `x as
+τ`, a capture by a closure, a format hole (`println("{:?}", v)` before
+the push). Solving retypes in
+place the function's locals, nodes and closure signatures that mention
+the variable, and makes again each instance made with it; a variable
+free at the function's end is F18.2's `type.infer`. After the function
+is checked no variable is left: none reaches code generation, effects,
+the caches or another function. An untyped literal or an open local
+(F18.5) checked where a variable goes gives it its provisional type at
+once (`v.push(1)`: `Vec<i32>`), and closes the local (FL6). MVS has no
+variables.
+Stage 2 (0.27.4) adds three sources and one use. (d) A `_` written in a
+type in a function's body (`let f: FromFn<_> = from_fn(..)`, `let v:
+Vec<_, Gpa> = Vec::new_in(gpa)`, `let t: (i64, _) = (1, 2u8)`) is a
+fresh variable, solved as the others; one still free at the end is
+`type.infer` at the `_` ("cannot infer the type written `_` here", rustc
+E0282). (e) A projection of a variable, `<?ᵢ as Tr>::A` (the `Err` of
+`"4".parse()`'s `Result<F, F::Err>`), is a variable that depends on
+`?ᵢ`: when `?ᵢ` is solved it is the projection of the solution, so
+`let a: u32 = "4".parse().unwrap()` is inferred (`F` from the `let`, its
+`Err` then `ParseIntError`); it is free while `?ᵢ` is. (f) A closure
+argument whose parameter's bound mentions a free variable (`from_fn(||
+..)` where the hint is `FromFn<?ᵢ>`) is not bound by the hint: the
+closure's own inference fixes the parameter. And `e?` checked against
+an expected type checks the value it gives (the `Ok`'s or `Some`'s
+payload) against it first, by (a), before its error's conversion
+(`let n: u8 = s.parse()?`). A variant pattern checked against a
+variable's enum names its variant of the solution's when the function's
+check ends. *Anchor:* `front/check/infer.vl`, `generics/instantiate.vl:
+require_bound, infer_from`, `check_mode.vl: check_expr_inner`,
+`assoc.vl: projection`, `resolve.vl: resolve_type` (the `_`),
+`try_op.vl: check_try`.
 
 ### F19 Small syntax
 
@@ -1111,8 +1250,18 @@ rustc E0512) and the bits are reinterpreted (a move, no drop of `x`).
 a `static mut` item is an unsafe operation (`error unsafe`, rustc E0133):
 inside `unsafe { }` or an `unsafe fn`'s body only. A reference to one is
 D6.2.5's error either way. An MVS `static var` is unchanged (safe).
-*Anchor:* `front/check/names.vl: synth_name` (`U_STATIC_MUT`). Case
-`rust_f_f19_static_mut_err`.
+(0.27.4) Since every such use is unsafe, the program vouches for it, and a
+thread may reach it, as in rustc: a rust-edition `static mut` (or an
+`extern` static) used by a spawned closure, or by what it calls, is not
+`sync.global`, and neither is a C function declared in the rust edition
+(its call is unsafe too; `--check-alloc`'s allocator, std2's, calls
+`mmap` and `sigaction` from any thread). Each keeps the `global` effect,
+the memory the optimizer keeps other threads' view of
+(contracts-effects.md E1). An MVS `static var` stays for the main thread
+only. *Anchor:* `front/check/names.vl: synth_name` (`U_STATIC_MUT`),
+`front/effects/infer.vl: walk_ident`, `effects/check.vl:
+extern_effects` (no `raw_global`). Cases `rust_f_f19_static_mut_err`,
+`rust_f_f19_static_mut_thread`.
 
 **F19.7 (unions drop nothing).** A union declared in a rust-edition
 position has no drop glue of its own fields (an `impl Drop for U` of its
@@ -1294,6 +1443,20 @@ impls for primitives (the number formatting MVS has). *Anchor:*
 `front/check/interp.vl: direct_body` (today: MVS's `__print_begin`,
 `Fmt::display`), `format.vl: panic_call`.
 
+**F16.4 (format_args's value).** `format_args(lit, ..)` outside a
+compiler-known call (F16.1) is a value: its holes' arguments are
+evaluated once, where it stands, into the hole lets, and it is
+`std::__rt::Interp { f: move |__out: &mut std::fmt::Formatter| WRITES }`,
+WRITES F16.3's for the literal through `__out`. `Interp<F>` is std2's
+(the compiler's tail, Z5.1) with `impl<F: Fn(&mut Formatter<'_>)>
+Display`, so the value goes wherever a `T: Display` goes (a parameter,
+`to_string_in`, `write(f, "{}", v)`), as Rust's `fmt::Arguments` does.
+Divergences, named: the value's type is its own per literal, not one
+`Arguments<'a>`; a write's error inside the closure is not carried out of
+`fmt` (0.27.4: it returns `Ok(())`; the sinks keep an io error for their
+own `finish`). *Anchor:* `front/check/interp.vl: expand,
+push_writes_std2`, `front/stdalloc.vl: std2_tail`.
+
 **F16.5 (the spec's traits and flags).** A hole's trait is the spec's: `x`
 LowerHex, `X` UpperHex, `o` Octal, `b` Binary, `e` LowerExp, `E`
 UpperExp, `p` Pointer (0.27.2.1; a pointer's `{:p}` stays its address),
@@ -1370,6 +1533,12 @@ returned reference (Z9), so `&c[a..b]` is `&*index(&c, a..b)`, a
 reborrow, and `c[a..b]` by value is `type.unsized`. *Anchor:*
 `front/check/rust.vl: index_through_trait`, `synth_mode.vl:
 synth_index` (today: a view's index is MVS's).
+(0.27.4) Through references: `h[i]` of an `h: &[T; N]`, `&mut [T; N]`
+or `&&[T; N]` is `(*h)[i]` (each reference dereferenced, as rustc's
+autoderef of the indexed expression), read, written through `&mut` and
+sliced (`&h[a..b]`). A write through `&` is borrowck.assign_immutable
+(E0594). 0.27.3 read it as a raw pointer's arithmetic (unsafe). Cases
+`rust_f_f20_index_array_ref_ok`, `rust_f_f20_index_array_ref_err`.
 
 **F20.2 (std2's impls).** `impl<T, I: SliceIndex<[T]>> Index<I> for [T]
 { type Output = I::Output; fn index(&self, i: I) -> &I::Output {
@@ -1594,11 +1763,25 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   `rust_t_iter_for_control` writes `names[k as usize]`.
 
 **Strict (vole rejects what rustc accepts).**
-- **FL1 (no deferred inference; later, 0.27.4).** F18.2: a parameter
-  fixed only by a later statement is `type.infer` (its `try:` the
-  annotation the first use determines); rustc's unification variables
-  infer it. Deferred inference comes with 0.27.4, when the compiler's
-  own source moves to the edition.
+- **FL1 (deferred inference by the first constraining use; 0.27.4).**
+  F18.6's variables are solved in the order the function is checked, by
+  the first use that meets a definite type; rustc unifies over the whole
+  function. So a use F18.6 does not let wait, before the one that fixes
+  the variable, rejects where rustc accepts (`println("{:?}", v)`, then
+  `v.push(1)`; a closure capturing `v`, then the push; a deref through
+  a type that holds a variable, `Box::new_in(Vec::new_in(a), a)` then
+  `b.push(1)`), and a variable fixed by an untyped literal takes `i32`
+  at once where rustc keeps an `{integer}` that a later use may fix:
+  `v.push(1); let b: u8 = v[0];` is rustc's `Vec<u8>` and vole's error
+  (`Vec<i32>`, FL6). A projection of a variable is solved with it
+  (F18.6 (e)), but a method of a generic trait called on a variable's
+  value is a use that needs its type (`let r = x.try_into(); match r {
+  Ok(v) => .., }` with the target from the arms, rustc's; vole's
+  `type.infer`), and so is a `?` whose value is not checked against a
+  type (`let n = s.parse()?; Ok(n * 2)`: rustc's E0282 too, at the `*`).
+  Cases `rust_f_f18_deferred_ok`, `rust_f_f18_deferred_err`,
+  `rust_f_f18_stage2_ok`, `rust_f_f18_stage2_err`,
+  `rust_f_fl1_literal_i32` (`// RUSTC-DIFFERS: FL1`).
 - **FL2 (overlap by satisfiability, strict when undecidable).** F4.2
   errs on the side of `trait.overlap` where rustc's coherence (with
   negative reasoning on fundamental types and the orphan rule) would
@@ -1634,7 +1817,9 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   `f64`, but `&0.0` and a context take theirs, F18.3). A generic
   constructor's parameter fixed by a later statement (`let v =
   Vec::from_in([1, 2], gpa);` then `v` as a `Vec<i64>`, `W { x: 7 }`
-  then `&W<i64>`) is FL1's, 0.27.4. The corpus writes the suffix
+  then `&W<i64>`) is not F18.6's either: the literals bind `T` at the
+  call, to `i32` (a variable is made only for a parameter left free;
+  FL1). The corpus writes the suffix
   (`1i64`) where it meets one. (Lenient: a method call on an open local,
   `x.pow(2)`, is `i32`'s method, where rustc says E0689.)
 - **FL7 (const evaluation).** F3.2's consts fold with `consteval.vl`'s
@@ -1668,19 +1853,21 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   element or argument, `Vec<[i64]>`, is the view (`Vec<&[i64]>`) and is
   accepted; rustc rejects it (E0277), F21.2's `type.unsized` under stage
   2 (rust_capture_view_copy writes `Vec<&[i64]>`).
-- **FL11 (the opaque instance's type errors; later, 0.27.3).**
-  borrowck.md D22.2: in 0.27.2.1 an opaque instance reports only the
-  bound-only rule's error (D22.3) on a parameter's own Ω, with no `where`
-  predicate in the template, and the borrow checker's; any other type
-  error leaves the instance out, unreported. rustc reports them all. The
-  gaps: an operator on an Ω through its `Add`/`PartialEq`/`PartialOrd`/
-  `Neg`/`Not`/`Shl` bound (an Ω is a type over `()`, and the operators
-  check the type), a bound's type arguments (`T: AsRef<str>`,
-  `Make<S::Item>`), associated functions and consts (`T::default()`,
-  `A::FREES`), `where` predicates on a projection (`X::Item: Show`), a
-  method of a generic impl over the impl's own parameters, and `*x` with
-  a `Deref` bound. A template that meets one is not counted in `opaque:
-  N templates`.
+- **FL11 (the opaque instance's type errors; 0.27.3).** borrowck.md
+  D22.2: an opaque instance reports its type errors as rustc does
+  (`x + x` of `T: Add<Output = T>` returned as an i64 is E0308), unless
+  it is *unsure*: it meets a gap of the model, and its errors are
+  forgotten. The model now covers operators on an Ω through its bounds,
+  a bound's type arguments and a trait parameter's default, `T::f()` and
+  `T::CONST` of a bound's trait, `*x` with `Deref`, `g[i]` with `Index`.
+  The gaps left, each an unsure instance, so reporting nothing where
+  rustc may: a generic method of a generic trait (`contains<U>` of
+  `RangeBounds<T>`), a `where` predicate in the template, a bound an Ω
+  does not resolve while the instance is made (an impl parameter fixed
+  only by another's bound, F14.1). An `#[array_builtin(N)]` template has
+  no opaque instance. Cases `rust_b_opaque_err_type_mismatch`,
+  `rust_b_opaque_err_bound_args`, `rust_b_opaque_ok_model`.
+
 - **FL12 (a union's field that needs a drop; 0.27.3).** rustc rejects a
   union field that is neither `Copy` nor `ManuallyDrop<_>` (E0740, a
   generic `T` too); vole accepts it and drops no field (F19.7), so std2

@@ -7,7 +7,8 @@
 use std::Option;
 
 use crate::base::{
-    alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, free, intern, sym_text,
+    SRC, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, free, intern,
+    sym_text,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -307,6 +308,20 @@ pub fn unify(params: i64, bound: *i64, tmod: i64, p: i64, t: i64, pcx: inout Ctx
             }
             return ok;
         }
+        // RULE: Z9.1c (0.27.4: `&T` given a view binds T to its unsized
+        // place, `&mut T` given an exclusive one likewise; a bare `[T]` given
+        // the place binds T to its element)
+        if kind == TyPtr && (pcx.nodes[p].p & NODE_REF) != 0
+            && ((pcx.nodes[p].p & NODE_REF_MUT) != 0) == is_mut_slice(t, pcx)
+            && crate::front::types::place_of_view(t, &pcx) > 0 {
+            let place = crate::front::types::place_of_view(t, &pcx);
+            return unify(params, bound, tmod, pcx.nodes[p].a, place, &pcx);
+        }
+        if kind == TySlice
+            && crate::front::types::is_unsized_place(t, pcx)
+            && pcx.types[pcx.types[t].a].kind == TyKind::Slice {
+            return unify(params, bound, tmod, pcx.nodes[p].a, pcx.types[pcx.types[t].a].a, &pcx);
+        }
         if kind == TyPtr && (pcx.nodes[p].p & NODE_REF) != 0
             && (tk == TyKind::Slice && pcx.types[t].b == 0
                 || tk != TyKind::Slice && tk != TyKind::Ptr) {
@@ -412,6 +427,14 @@ pub fn match_type(params: i64, bound: *i64, tmod: i64, p: i64, t: i64, pcx: inou
             // (the rust edition's `&[T]` and `&str` are views until Z9: a
             // `&T` header matches T to the view, as resolve_type reads it)
             // (0.27.3: a `&str` too, `Option<&&str>` of `Option<&T>::copied`)
+            // RULE: Z9.1c (0.27.4: `&T` of a view binds T to the unsized
+            // place, `&mut T` of an exclusive one likewise)
+            if is_ref
+                && (is_mut == is_mut_slice(t, pcx))
+                && crate::front::types::place_of_view(t, &pcx) > 0 {
+                let place = crate::front::types::place_of_view(t, &pcx);
+                return match_type(params, bound, tmod, pcx.nodes[p].a, place, &pcx);
+            }
             if is_ref && !is_mut && (tk == TyKind::Slice && pcx.types[t].b == 0
                 || crate::front::distinct::is_view_distinct(t, pcx) && !is_mut_slice(t, pcx)) {
                 return match_type(params, bound, tmod, pcx.nodes[p].a, t, &pcx);
@@ -429,6 +452,16 @@ pub fn match_type(params: i64, bound: *i64, tmod: i64, p: i64, t: i64, pcx: inou
             return match_type(params, bound, tmod, pcx.nodes[p].a, pcx.types[t].a, &pcx);
         }
         if kind == TySlice {
+            // RULE: Z9.1c (0.27.4: a bare `[T]` header, the unsized place)
+            if SRC[pcx.nodes[p].start] == '['
+                && crate::front::rust::rust_at(pcx.nodes[p].start, &pcx) {
+                if !crate::front::types::is_unsized_place(t, pcx)
+                    || pcx.types[pcx.types[t].a].kind != TyKind::Slice {
+                    return false;
+                }
+                return match_type(params, bound, tmod, pcx.nodes[p].a, pcx.types[pcx.types[t].a].a,
+                    &pcx);
+            }
             if tk != TyKind::Slice
                 || ((pcx.nodes[p].p & NODE_REF_MUT) != 0) != is_mut_slice(t, pcx) {
                 return false;
@@ -549,6 +582,12 @@ fn infer_from(params: i64, bound: *i64, tmod: i64, args: i64, first: i64, types:
             }
             if unify(params, trial, tmod, result, hint, &pcx) {
                 for i in 0..count {
+                    // RULE: F18.6 (a free type variable of the expected type
+                    // binds nothing: the arguments may)
+                    if bound[i] == 0 && pcx.infer_live
+                        && crate::front::check::infer::is_free_var(trial[i], pcx) {
+                        continue;
+                    }
                     bound[i] = trial[i];
                 }
             }
@@ -746,9 +785,36 @@ fn join_arg(params: i64, bound: *i64, loose: *i64, p: i64, t: i64, pcx: Ctx<Comp
 // type arguments written (those inferred, the others by their names):
 // `shape` 0 a call of `what` (a function, or `Type::f` whose first
 // `outer` parameters are the type's), 1 a variant `member` of enum
-// `what` (3: with fields), 2 a literal of struct `what`.
+// `what` (3: with fields), 2 a literal of struct `what`. (0.27.4, the rust
+// edition: the free ones are type variables, F18.6, and the error is
+// reported at the function's end if one is still free: check/infer.vl.)
 fn require_bound(params: i64, bound: *i64, pos: i64, what: i64, shape: i64, outer: i64,
     member: i64, pcx: inout Ctx<Comp>) {
+    // UNSAFE: bound is the caller's raw array (alloc_array) of the bound types.
+    // SAFETY: it has one slot per parameter of `params`; i < its count.
+    unsafe {
+        for i in 0..pcx.nodes[params].count {
+            if bound[i] == 0 {
+                // RULE: F18.6 (a parameter left free is a type variable)
+                if crate::front::check::infer::can_defer(pos, &pcx) {
+                    crate::front::check::infer::make_vars(params, bound, pos, what, shape, outer,
+                        member, &pcx);
+                    return;
+                }
+                report_unbound(params, bound, pos, what, shape, outer, member, &pcx);
+                err_jump(&pcx);
+            }
+        }
+    }
+}
+
+// (require_bound, check/infer.vl) The error of the first parameter of
+// `params` that `bound` leaves free (0), reported soft.
+pub fn report_unbound(params: i64, bound: *i64, pos: i64, what: i64, shape: i64, outer: i64,
+    member: i64, pcx: inout Ctx<Comp>) {
+    // UNSAFE: bound is the caller's raw array (alloc_array) of the bound types.
+    // SAFETY: it has one slot per parameter of `params`; i < its count, and
+    // put_targs reads the same slots.
     unsafe {
         for i in 0..pcx.nodes[params].count {
             if bound[i] == 0 {
@@ -799,7 +865,7 @@ fn require_bound(params: i64, bound: *i64, pos: i64, what: i64, shape: i64, oute
                 err_try_fmt(buf_slice(t), pcx);
                 err_end_soft(&pcx);
                 pcx.err_kind = saved_kind;
-                err_jump(&pcx);
+                return;
             }
         }
     }
@@ -932,6 +998,10 @@ pub fn fn_instance(tf: i64, mark: i64, origin: i64, pcx: inout Ctx<Comp>) -> i64
             pcx);
         err_end(&pcx);
     }
+    // RULE: F18.6 (an instance made with a type variable: its signature
+    // only, made again with the solutions; never queued, so never checked,
+    // lowered or given effects)
+    let vars = pcx.infer_live && crate::front::check::infer::targs_mention(mark, pcx);
     let targs = take_targs(mark, &pcx);
     let template = pcx.fns[tf].node;
     let item = clone_node(template, &pcx);
@@ -965,12 +1035,14 @@ pub fn fn_instance(tf: i64, mark: i64, origin: i64, pcx: inout Ctx<Comp>) -> i64
     pcx.fns[f].self_ty = pcx.self_type;
     // (0.14: checked with the parameters and `Self` of the instance in
     // scope, which an `Fn(Self::Item)` bound names)
-    check_bounds(pcx.nodes[template].g, targs, count, pcx.fns[tf].display,
-        pcx.nodes[origin].start, &pcx);
-    // RULE: F10.2 (the `where` predicates on other subjects, under the
-    // instance's parameters and Self)
-    crate::front::traits::where_preds_hold(template, pcx.self_type, pcx.nodes[origin].start,
-        true, &pcx);
+    if !vars {
+        check_bounds(pcx.nodes[template].g, targs, count, pcx.fns[tf].display,
+            pcx.nodes[origin].start, &pcx);
+        // RULE: F10.2 (the `where` predicates on other subjects, under the
+        // instance's parameters and Self)
+        crate::front::traits::where_preds_hold(template, pcx.self_type, pcx.nodes[origin].start,
+            true, &pcx);
+    }
     pcx.fns[f].display = instance_display(f, tf, &pcx);
     resolve_signature(f, &pcx);
     // Found from now on (not when its signature failed to resolve).
@@ -979,7 +1051,11 @@ pub fn fn_instance(tf: i64, mark: i64, origin: i64, pcx: inout Ctx<Comp>) -> i64
     env_leave(saved, &pcx);
     pcx.cur_mod = saved_mod;
     pcx.self_type = saved_self;
-    pcx.inst_queue.push(f);
+    if vars {
+        pcx.fns[f].attrs |= crate::front::ast::FN_QUERY_ONLY;
+    } else {
+        pcx.inst_queue.push(f);
+    }
     f
 }
 

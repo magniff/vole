@@ -34,8 +34,8 @@ use crate::front::check::synth_mode::synth_expr;
 use crate::front::check::unsafety::{U_METHOD, check_call_safety, is_borrow, unsafe_through};
 use crate::front::check::widen::widens;
 use crate::front::generics::{
-    TPL_NONE, TPL_PATTERN, check_call_arg, env_enter, env_leave, hint_for, instance_of,
-    mark_synthed, template_name,
+    TPL_NONE, check_call_arg, env_enter, env_leave, hint_for, instance_of, mark_synthed,
+    template_name,
 };
 use crate::front::generics::instantiate::instantiate_call;
 use crate::front::lexer::{SUF_NONE, Tok};
@@ -453,6 +453,10 @@ pub fn implements_with(tr: i64, t: i64, targs: i64, pcx: inout Ctx<Comp>) -> boo
         if count == 0 {
             return implements(tr, t, &pcx);
         }
+        // RULE: D22.1 (0.27.3: an Ω, by its bounds, FL11)
+        if crate::front::opaque::is_opaque(t, pcx) && crate::front::opaque::is_omega(t, pcx) {
+            return crate::front::opaque::implements_with(tr, t, targs, &pcx);
+        }
         for k in 0..count {
             if has_error_type(pcx.tlists.data[targs + k], pcx) {
                 return true;
@@ -867,39 +871,6 @@ fn by_param_bound(n: i64, t: i64, mark: i64, tys: *i64, kinds: *i64, pcx: inout 
     }
 }
 
-// (0.27.2.1) Among the candidates of call n that take its arguments, for
-// t a slice or str (Z9.1: `&[T]` is `[T]`, so a reference impl `impl<A:
-// PartialEq<B>, B> PartialEq<&B> for &A` matches it too, with A the
-// slice), the one candidate that is not such a reference impl, as rustc
-// reaches the slice's own impl through it; -1 when not exactly one is.
-fn by_unsized_self(n: i64, t: i64, mark: i64, tys: *i64, kinds: *i64, skip: i64,
-    pcx: inout Ctx<Comp>)
-    -> i64 {
-    // RULE: Z9.1a (the reference impl over an unsized self forwards to its own)
-    if pcx.types[t].kind != TyKind::Slice {
-        return -1;
-    }
-    // UNSAFE: CANDS is a raw IntVec (base/comp.vl), as every table.
-    // SAFETY: mark <= c < count, pairs dispatch pushed.
-    unsafe {
-        var chosen = -1;
-        var matches = 0;
-        var c = mark;
-        while c < pcx.cands.count {
-            let i = pcx.cands.data[c];
-            let head = pcx.nodes[pcx.traits_impls[i].node].b;
-            let by_ref = pcx.traits_impls[i].tpl == TPL_PATTERN
-                && pcx.nodes[head].kind == NodeKind::TyPtr;
-            if !by_ref && takes(c, n, t, tys, kinds, skip, &pcx) {
-                matches += 1;
-                chosen = c;
-            }
-            c += 2;
-        }
-        if matches == 1 { chosen } else { -1 }
-    }
-}
-
 // (0.27.2.1) Among the candidates of call n that take its one argument, a
 // view (`[T]`, str: Z9.1, where `&[U]` and `&str` are the view too), the
 // one candidate whose trait argument is not a reference, as `PartialEq<str>`
@@ -940,6 +911,55 @@ fn by_view_rhs(n: i64, t: i64, mark: i64, tys: *i64, kinds: *i64, skip: i64,
     }
 }
 
+// RULE: Z9.1c (0.27.4) Whether an impl of a generic trait covering t has
+// a function `member` (dispatch's candidates, before the arguments).
+fn covers_member(t: i64, member: i64, pcx: inout Ctx<Comp>) -> bool {
+    for i in 0..pcx.traits_impls.len() as i64 {
+        if trait_param_count(pcx.traits_impls[i].tr, pcx) != 0 && impl_covers(i, t, &pcx)
+            && impl_fn(i, member, pcx) >= 0 {
+            return true;
+        }
+    }
+    false
+}
+
+// RULE: Z9.1c, F6.2 (0.27.4) Whether an impl of a generic trait covering
+// the place `place` has a `&self` function `member` that takes call n's
+// arguments (of types tys, kinds): at the by-value step on its view.
+fn place_takes(n: i64, place: i64, member: i64, tys: *i64, kinds: *i64,
+    pcx: inout Ctx<Comp>) -> bool {
+    let mark = pcx.cands.count;
+    for i in 0..pcx.traits_impls.len() as i64 {
+        if trait_param_count(pcx.traits_impls[i].tr, pcx) == 0 || !impl_covers(i, place, &pcx) {
+            continue;
+        }
+        let f = impl_fn(i, member, pcx);
+        if f < 0 {
+            continue;
+        }
+        let item = pcx.fns[f].node;
+        let tn = if item > 0 && pcx.nodes[item].count > 0 {
+            pcx.nodes[child(item, 0, pcx)].b
+        } else {
+            0
+        };
+        if tn > 0 && pcx.nodes[child(item, 0, pcx)].a == pcx.self_sym
+            && pcx.nodes[tn].kind == NodeKind::TyPtr
+            && (pcx.nodes[tn].p & crate::front::ast::NODE_REF) != 0 {
+            pcx.cands.push(i);
+            pcx.cands.push(f);
+        }
+    }
+    var c = mark;
+    var found = false;
+    while c < pcx.cands.count && !found {
+        found = takes(c, n, place, tys, kinds, 1, &pcx);
+        c += 2;
+    }
+    pcx.cands.count = mark;
+    found
+}
+
 // generic_trait_call, the first `pre` arguments synthesized already.
 fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
@@ -971,6 +991,21 @@ fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: inout Ctx<Comp>) -> i64 
             }
         }
         if pcx.cands.count == mark && !is_from {
+            // RULE: Z9.1c (0.27.4: a view with no impl of its own: its place's,
+            // `s.to_owned_in(a)`, `s.index(r)` of a `&[T]`)
+            if method
+                && crate::front::rust::rust_at(pcx.nodes[n].start, &pcx) {
+                let vt = if pcx.types[t].kind == TyKind::Ptr
+                    && crate::front::types::place_of_view(pcx.types[t].a, &pcx) > 0 {
+                    pcx.types[t].a
+                } else {
+                    t
+                };
+                let place = crate::front::types::place_of_view(vt, &pcx);
+                if place > 0 && place != t && covers_member(place, member, &pcx) {
+                    return dispatch(n, place, member, pre, &pcx);
+                }
+            }
             return -1;
         }
         // The arguments' types; literals without a suffix are left for
@@ -1002,6 +1037,28 @@ fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: inout Ctx<Comp>) -> i64 
             pcx.cands.count = mark;
             return pcx.ty_error;
         }
+        // RULE: Z9.1c, F6.2 (0.27.4: on a view the place's `&self` method is
+        // at the by-value step, before the view's own `&self` ones at the `&`
+        // step: `b.as_ref()` of a `&str` `<str as AsRef<[u8]>>`, not `impl
+        // AsRef<U> for &T`; not a receiver of a parameter's type `k: K`, an
+        // instance's, whose method is the bound's, K's)
+        if method && !is_from
+            && crate::front::rust::rust_at(pcx.nodes[n].start, &pcx) {
+            let place = crate::front::types::place_of_view(t, &pcx);
+            let recv = pcx.nodes[n].a;
+            // (`Tr::m(x)`: x is the `&self` itself, no autoref; in an instance
+            // a receiver `x: &P` is P's, `x: P` or a field of type P the bound's)
+            let param_local = recv > 0 && pcx.nodes[recv].kind == NodeKind::Ident
+                && pcx.nodes[recv].res == Res::Local && pcx.nodes[recv].y >= 0
+                && pcx.locals[pcx.nodes[recv].y].tparam != 0;
+            let place_first = pcx.via_node == n
+                || (if param_local { pcx.locals[pcx.nodes[recv].y].borrow }
+                    else { pcx.cur_fn < 0 || pcx.fns[pcx.cur_fn].tmpl == 0 });
+            if place > 0 && place_first && place_takes(n, place, member, tys, kinds, &pcx) {
+                pcx.cands.count = mark;
+                return dispatch(n, place, member, count, &pcx);
+            }
+        }
         let skip = if method { 1 } else { 0 };
         var chosen = -1;
         var matches = 0;
@@ -1015,13 +1072,6 @@ fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: inout Ctx<Comp>) -> i64 
         }
         if matches > 1 && hint > 0 {
             let e = by_expected(n, t, mark, tys, kinds, skip, hint, &pcx);
-            if e >= 0 {
-                matches = 1;
-                chosen = e;
-            }
-        }
-        if matches > 1 {
-            let e = by_unsized_self(n, t, mark, tys, kinds, skip, &pcx);
             if e >= 0 {
                 matches = 1;
                 chosen = e;
@@ -1078,6 +1128,25 @@ fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: inout Ctx<Comp>) -> i64 
                 return t;
             }
         }
+        // RULE: Z9.1c, F6.2 (0.27.4: on a view no impl of its own takes the
+        // call: its place's, whose `&self` methods take the view, `a.eq(b)` of
+        // two `&[u8]` `<[u8] as PartialEq>::eq`; a `let` binding's view is
+        // the view. After the view's own: an instance's `k.borrow()` with K =
+        // &str is `<&str as Borrow<&str>>`, as the bound `K: Borrow<Q>` says)
+        if method && !is_from
+            && crate::front::rust::rust_at(pcx.nodes[n].start, &pcx) {
+            let vt = if pcx.types[t].kind == TyKind::Ptr
+                && crate::front::types::place_of_view(pcx.types[t].a, &pcx) > 0 {
+                pcx.types[t].a
+            } else {
+                t
+            };
+            let place = crate::front::types::place_of_view(vt, &pcx);
+            if place > 0 && place != t && covers_member(place, member, &pcx) {
+                pcx.cands.count = mark;
+                return dispatch(n, place, member, count, &pcx);
+            }
+        }
         no_impl_error(n, t, member, mark, tys, kinds, is_from, from, &pcx);
     }
 }
@@ -1105,6 +1174,30 @@ fn method_call(n: i64, t: i64, f0: i64, pcx: inout Ctx<Comp>) -> i64 {
         f = instantiate_call(f, n, 1, t, pcx.nodes[n].g, &pcx);
     }
     let receiver = pcx.nodes[n].a;
+    // RULE: Z9.1c (0.27.4: a method of the place `[T]`/`str` on its view:
+    // the view is its `&self`, passed as it is)
+    let rt = pcx.nodes[receiver].ty;
+    let place_receiver = crate::front::types::is_unsized_place(t, pcx)
+        && (crate::front::types::place_of_view(rt, &pcx) == t
+            || pcx.types[rt].kind == TyKind::Ptr
+            && crate::front::types::place_of_view(pcx.types[rt].a, &pcx) == t);
+    if place_receiver {
+        let mark = list_begin(pcx);
+        list_push(receiver, &pcx);
+        for k in 0..pcx.nodes[n].count {
+            list_push(child(n, k, pcx), &pcx);
+        }
+        list_end(n, mark, &pcx);
+        pcx.nodes[n].kind = NodeKind::Call;
+        pcx.nodes[n].a = 0;
+        pcx.nodes[n].x = f + 1;
+        ensure_checked(f, n, &pcx);
+        for k in 0..pcx.nodes[n].count {
+            check_call_arg(child(n, k, pcx), f, k, &pcx);
+        }
+        check_call_safety(n, f, 1, &pcx);
+        return pcx.fns[f].ret;
+    }
     let through = pcx.nodes[receiver].ty != t;
     let self_ty = fn_param(f, 0, pcx);
     var arg = receiver;

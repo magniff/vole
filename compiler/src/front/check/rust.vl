@@ -52,7 +52,10 @@ fn on_mut_path(n: i64, pcx: Ctx<Comp>) -> bool {
 // impl's among them).
 fn has_method(t: i64, name: *u8, pcx: inout Ctx<Comp>) -> bool {
     t > 0 && (method_of(t, intern_c(name, &pcx), pcx) >= 0
-        || crate::front::convert::has_generic_trait_fn(t, intern_c(name, &pcx), &pcx))
+        || crate::front::convert::has_generic_trait_fn(t, intern_c(name, &pcx), &pcx)
+        // (0.27.3: an Ω's bounds' methods, `*d` with `D: Deref`, FL11)
+        || crate::front::opaque::is_omega(t, pcx)
+        && crate::front::opaque::virtual_fn(t, intern_c(name, &pcx), &pcx) >= 0)
 }
 
 // `e.name(args)`: a MethodCall node at e's span (args: a list made with
@@ -436,7 +439,7 @@ pub fn deref_levels(s: i64, expected: i64, want_ptr: bool, pcx: inout Ctx<Comp>)
 // that Unary. True when rewritten.
 pub fn index_through_trait(n: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
     if pcx.types[t].kind != TyKind::Struct && pcx.types[t].kind != TyKind::Enum
-        || !has_method(t, c"index", &pcx) {
+        && !crate::front::opaque::is_omega(t, pcx) || !has_method(t, c"index", &pcx) {
         return false;
     }
     let name = if on_mut_path(n, pcx) && has_method(t, c"index_mut", &pcx) { c"index_mut" }
@@ -723,4 +726,75 @@ pub fn unit_struct_value(n: i64, key: i64, pcx: inout Ctx<Comp>) -> bool {
     let mark = list_begin(pcx);
     become_struct_lit(n, pcx.nodes[n].a, pcx.nodes[n].g, mark, &pcx);
     true
+}
+
+// RULE: F30.2 (synth_unary) The raw borrow n, `&raw const P` or `&raw mut P`
+// of operand P: the address of the place, a raw pointer to its type, no
+// reference. `mut` needs the place mutable (the borrow checker's
+// borrowck.borrow_immutable of the raw loan, rustc E0596); a
+// value that is not a place is an error (rustc E0745). The bare `&raw mut
+// S` of a `static mut` needs no unsafe (rustc's), its projections do.
+pub fn raw_borrow(n: i64, operand: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let mutable = (pcx.nodes[n].p & crate::front::ast::NODE_REF_MUT) != 0;
+    crate::front::check::unsafety::mark_no_read(operand, &pcx);
+    let outer_place = pcx.mut_place;
+    if mutable {
+        pcx.mut_place = operand;
+    }
+    let bare = pcx.nodes[operand].kind == NodeKind::Ident;
+    let saved_audit = pcx.audit_unsafe;
+    if bare {
+        pcx.audit_unsafe = false;
+        pcx.unsafe_depth += 1;
+    }
+    let ty = crate::front::check::synth_mode::synth_expr(operand, &pcx);
+    if bare {
+        pcx.unsafe_depth -= 1;
+        pcx.audit_unsafe = saved_audit;
+    }
+    pcx.mut_place = outer_place;
+    // (a temporary check/temps.vl hoisted, `&raw const f()`, is no place)
+    if !crate::front::check::assign::is_place(operand, pcx)
+        || (pcx.nodes[operand].p & crate::front::check::temps::NODE_TEMP) != 0 {
+        err_begin(pcx.nodes[n].start, &pcx);
+        err_str(c"cannot take the address of a temporary: `&raw` needs a place (rustc E0745)",
+            pcx);
+        err_help(c"bind the value to a variable first, then take its address", pcx);
+        err_end_soft(&pcx);
+    }
+    crate::front::types::ptr_to(ty, &pcx)
+}
+
+// RULE: F29.1 Whether cast n is the rust edition's `e as *const _` or `e as
+// *mut _`: a raw pointer type whose pointee is written `_`.
+pub fn raw_hole_cast(n: i64, pcx: Ctx<Comp>) -> bool {
+    let t = pcx.nodes[n].b;
+    if t <= 0 || pcx.nodes[t].kind != NodeKind::TyPtr || pcx.edition == 0
+        || (pcx.nodes[t].p & (crate::front::ast::NODE_REF | crate::front::ast::NODE_REF_MUT)) != 0 {
+        return false;
+    }
+    let a = pcx.nodes[t].a;
+    a > 0 && pcx.nodes[a].kind == NodeKind::TyName && pcx.nodes[a].count == 0
+        && pcx.nodes[a].g == 0 && pcx.nodes[a].a == pcx.underscore
+}
+
+// RULE: F29.1 The type of cast n, `e as *const _` (raw_hole_cast), of an
+// operand of type from: a raw pointer to its pointee; an operand that is no
+// reference or pointer gives none (rustc E0641).
+pub fn raw_hole_target(n: i64, from: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if from > 0 && pcx.types[from].kind == TyKind::Ptr {
+        return crate::front::types::ptr_to(pcx.types[from].a, &pcx);
+    }
+    if from > 0 && from != pcx.ty_error {
+        let saved = pcx.err_kind;
+        pcx.err_kind = c"type.cast";
+        err_begin(pcx.nodes[n].start, &pcx);
+        err_str(c"cannot cast '", pcx);
+        err_type(from, pcx);
+        err_str(c"' to a pointer of an unknown kind (rustc E0641)", pcx);
+        err_help(c"write the pointee: `as *const T`", pcx);
+        err_end_soft(&pcx);
+        pcx.err_kind = saved;
+    }
+    pcx.ty_error
 }

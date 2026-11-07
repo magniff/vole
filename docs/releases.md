@@ -82,7 +82,193 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.2 | `v0.27.2` | 0.27.1 | aarch64-macos | std2 the rust edition's std (1,032 of 1,413 std2 tests at -O0/-O2 under `--check-alloc`, gate 1); the front's rules (docs/design/front-rust.md: pattern and blanket impls, coherence, deref coercion, ranges, format specs); closures in full (kinds, captures, `Send`/`Sync`, bodies borrow-checked, `borrowck.unchecked` retired, E0594/E0596); `[T]`/`str` unsized; the borrow checker's verdict cache; every rust case on std2 |
 | 0.27.2.1 | `v0.27.2.1` | 0.27.2 | aarch64-macos | std2 1,306 of 1,454 tests at -O0/-O2 under `--check-alloc`; `impl Trait` returns (§21) and the opaque instance (§22, narrowed: FL11); implied outlives bounds (D4.6); three consumed-value miscompiles fixed (D8.5), E0508, two-phase `write`; the front's std2 gaps (F13, F14.2, F18.4, F9.2, F26.3); floats, `std::env`; contracts and effects R2 (std2 declared, 27 `requires`, 11 `ensures`); hello-rust 3.48x; the gate's std2 builds halved |
 | 0.27.3 | `v0.27.3` | 0.27.2.1 | aarch64-macos | the translator `fix --edition rust` and gate 2 (`tests/translate.sh`, the rustc twin); the i32 literal default (FL6); std2 1,402 of 1,472 tests at -O0; lazy std2 parsing (a rust hello world 2.32x MVS's); arrays' by-value IntoIterator |
+| 0.27.4 | `v0.27.4` | 0.27.3 | aarch64-macos | gate 3 opens (`fix --edition rust` on compiler/src: 122 type errors, 3,048 borrowck behind them); inference from a later statement (FL1); `[T]`/`str` unsized places (Z9.1c); `&raw` and Rust 2024's `static mut` rule; `format_args` a value; std2 1,445 of 1,473 tests at -O0; a rust hello world 2.03x MVS's |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.27.4
+
+Gate 3 opens. `volec fix --edition rust` run on a copy of compiler/src leaves N errors, printed by the gate's `gate3` row every release; 0.28 starts at N = 0. Its first full measurement was 1,414 (after 0.27.3's three parse shapes); 0.27.4 leaves 122 type errors, most of them std2 modules the compiler uses that std2 does not have yet (`std::cli`, `fs`, `process`, `gpu`), and `volec check --borrowck-partial` counts the 3,048 borrowck errors behind them, about 2,750 of one shape that 0.27.5's first item fixes (an operand read where it is evaluated, D2.4a). In the rust edition: a type is inferred from a later statement (FL1, F18.6: `Vec::new_in(a)` then a push, a later arm, `"4".parse().unwrap()`, `_` in a type); `[T]` and `str` are unsized places that `&[T]` and `&str` refer to (Z9.1c step B: impls keyed by them, method lookup through a view, `NonNull<[u8]>` 16 bytes); `&raw const`/`&raw mut` (F30.2), and a reference to a `static mut` refused as Rust 2024 does (D6.2.5); `format_args(..)` a Display value (F16.4); indexing through `&mut [T; N]` (F20.1). std2 passes 1,445 of its 1,473 tests at -O0 (1,402 of 1,472 in 0.27.3). A rust hello world's check is 2.03x MVS's (2.32x): builtin impls only for the primitives a program brings in (F15.1), and std2's own settled bodies are not borrow-checked again (Z7.2); the 2.0x ceiling is printed, enforced from 0.27.5. A crash on a closure capturing a widened integer, in MVS too, is fixed. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
+
+The front (integrator):
+
+- `format_args(..)` is a value in the rust edition (F16.4): std2's
+  `std::__rt::Interp`, a Display that writes the literal through the
+  Formatter it is given, so it goes to a `T: Display` parameter,
+  `to_string_in` or `write`. In 0.27.3 any such use was "unknown struct
+  'Interp'" (102 of gate 3's errors). std2_fmt_format_args,
+  std2_fmt_formatter_write_fmt and std2_fmt_write_write_fmt pass.
+
+The front (front274):
+
+- FL11: a template's opaque instance (borrowck.md §22) reports its type
+  errors as rustc does (`x + x` of `T: Add<Output = T>` returned as an
+  i64, E0308), where 0.27.2.1 reported only the bound-only rule's. The
+  model gained what that needs: operators on a type parameter through
+  its bounds, a bound's type arguments (`S: AsRef<str>`) and a trait
+  parameter's default (`Rhs = Self`), `T::default()` and `T::CONST`,
+  `*d` with `Deref`, `g[i]` with `Index`. An instance that meets a gap
+  left (a generic method of a generic trait, a `where` predicate, a
+  bound unresolved while it is made) is unsure, and its errors are
+  forgotten; std2-check stays at 0.
+- `g[i]` of a `g: &G`, G a struct with Index, reads through the reference
+  (F26.3).
+- FL1, stage 1: inference from a later statement (F18.6). In the rust
+  edition a type parameter that a call, a variant or a struct literal
+  leaves free is a type variable. It is solved by the first check that
+  meets a definite type: `let mut v = Vec::new_in(a);` and then
+  `v.push(2i64)` (also after a `v.len()`), a map by its insert, a value
+  passed where its type goes, the tail, an `Err(..)` in a later arm.
+  Solving retypes the function in place and makes its instances again.
+  A variable still free at the function's end is the old `type.infer`,
+  and so is a format hole, `as`, a capture or a method on it before then.
+  An untyped literal fixes `i32` at once (`v.push(1)`: `Vec<i32>`, where
+  rustc may infer from a later use; FL1, case `rust_f_fl1_literal_i32`).
+  std2 at -O0: 1,430 pass, 39 xfail (1,400 and 69).
+- FL1, stage 2 (F18.6 (d)-(f)). A `_` written in a type is a variable
+  (`let f: FromFn<_> = from_fn(..)`, `let v: Vec<_, Gpa> = ..`); one
+  never fixed is `type.infer` at the `_`, with one error for a `_` and
+  the parameter it was bound to. A projection of a variable is solved
+  with it: `let a: u32 = "4".parse().unwrap();`. A closure whose bound
+  mentions a variable infers its own parameter. `e?` checked against a
+  type checks its value first (`let n: u8 = s.parse().map_err(..)?`). A
+  variant pattern of a variable's enum (the `?`'s match) names the
+  solution's variant, which fixes a `FromStr` impl that read `0` fields.
+  std2 at -O0: 1,438 pass, 31 xfail.
+- An `if` with an `else`, a `match` or a block whose values are literal
+  trees makes its `let` open (F18.5), as a literal does: `let e0 = if c
+  { 1 } else { 0 };` takes `i64` from a later `for i in e0..np`, and
+  `let b = if c { 0xf8000000 } else { 0 }; let x: i64 = b;` is no longer
+  out of range for i32. A `for` range's open start takes the end's type.
+- A spawned closure may reach a rust-edition `static mut`, directly or
+  through what it calls, and so may a C function declared in the rust
+  edition (F19.6). Every such use is in `unsafe`, as in rustc, so it is
+  no longer `sync.global`. It keeps the `global` effect. An MVS `static
+  var` stays for the main thread only. std2's checking allocator
+  (`--check-alloc`) no longer makes every allocating thread
+  `sync.global`.
+- F30.2, `&raw const P` and `&raw mut P`, in the rust edition: a place's
+  address, a raw pointer, with no reference made. `&raw mut S` of a
+  `static mut` needs no `unsafe`; a field of one, `&raw const S.n`, does
+  (E0133). `&raw mut` needs a `mut` place (E0596), and a temporary is an
+  error (E0745). D6.2.5 is tightened: `&mut S` of a `static mut` is a
+  reference even where a `*mut T` goes (`let p: *mut T = &mut S;`), and
+  its help now gives `&raw mut S`. std2's checking allocator takes its
+  lock's address that way. A place under the deref of a raw borrow is a
+  place through the raw pointer: `(*&raw mut S).push(2)` and `&mut
+  *&raw mut S` make no reference to the static (D6.2.5), as in rustc.
+- `e as *const _` and `e as *mut _` take the pointee from the operand
+  (F29.1). An integer cast to one is E0641.
+- A closure whose body is a captured integer widened to its bound's
+  result type (`move || k` with `FnOnce() -> i64` and `k` an i32, as a
+  loop's `thread::spawn_in(move || k, gpa)`) failed the build ("places: a
+  function not lowered from its body", MVS too): the capture is found
+  under the widening cast now.
+
+The translator (g3274):
+
+- Gate 3 is measured: `tests/gate3.sh` translates a copy of compiler/src
+  with `volec fix --edition rust --force` and checks it in the rust
+  edition; it prints `gate3: N errors (by code: ...)`. The release
+  gate's `gate3` row (--release) runs it, informational: it fails only
+  when the translator or the check cannot run. N went 309 (33 parse
+  errors hiding the rest) -> 1,414 (the real first wall) -> 122 (by
+  code: 117 type error, 2 distinct.mix, 2 edition.lenient,
+  1 item.private). Of the 122, 110 are std2's missing modules and items
+  (`std::cli`'s `Matches` above all, `fs`, `process`, `gpu`,
+  `env::get_in`, `count_ones`). borrowck runs only on a program with no
+  type errors, so `check --borrowck-partial` (informational) checks the
+  bodies that type-checked, and gate 3 prints that count too: 3,048
+  (2,950 conflict, nearly all a Vec index's copy beside a `&mut` of its
+  root, which rustc accepts: three XFAIL rust_b_ok_index_temp_ cases for
+  0.27.5's fix).
+- The first wall's three shapes: a static's `unsafe { }` that starts a
+  statement and is an operand there is `(unsafe { .. })`, and a method
+  on a static through the receiver's borrow wraps the call, not a copy;
+  a typed receiver `self: *T` is `self: *mut T`; a name a file's use
+  binds (`Tok::{Hash}`) gets no std import beside it. `&cx` of an inout
+  parameter given to a `*T` is `cx` (the `&mut`, coerced).
+- `[u8]` printed as text in a program that also reads its bytes is given
+  `str::from_utf8(x).unwrap()`: a hole naming it (the named argument), an
+  argument after the literal, `println(x)`'s value, an argument of a
+  `T: Display` parameter; only what was written `[u8]` where it is
+  declared. A text literal given to a `str` parameter stays text.
+- rewrite.tsv's type rows are applied where the type is written (`Arena`
+  -> `Arena<Gpa>`, `thread::JoinHandle<T>` -> `JoinHandle<T, Gpa>`,
+  `ScopedArena`, `Fmt`, ...), their arguments kept, the names they write
+  imported (a module a row's path starts with too: `use std::mem;`). A
+  row's `$a` with no allocator argument is the enclosing `Gpa`
+  parameter (`thread::spawn(f)` -> `thread::spawn_in(f, gpa)`); MVS's
+  `to_string_in(x, a)` is std2's `format_in(x, a)`.
+- An array's address cast to a raw pointer is `a.as_mut_ptr() as *mut U`
+  (`as_ptr` for a `let`); a static's `.len()` stays inside its `unsafe
+  { }`; an index of any integer type is cast to usize; a raw pointer's
+  part `p[a..b]` is rewritten after the statics, its operands' edits
+  folded in; a char literal MVS types as an integer is `b'a' as i64`;
+  `&mut $1` of an argument written `&x` borrows x once.
+- A `static mut`'s borrow is its raw address (F30.2, Rust 2024's
+  static_mut_refs): a method on it is `(*(&raw mut V)).push(x)` (`&raw
+  const` for a `&self` method), `&V` given to a `*T` is `&raw mut V`.
+  `use std::string::str;` is dropped (std2 has no such module: `str` is
+  the type). An impl of MVS's `Allocator` is std2's: `try_alloc` is
+  `allocate` (the null pointer `Err(AllocError)`), `try_resize` is
+  `grow` and `shrink`, which calls it (MVS's try_resize keeps
+  min(old, new) bytes, as realloc does), `free` is `deallocate`; each
+  body is kept, its parameters bound from the layouts. An `Iterator`
+  impl's MVS-only `exact_len` and `at` are dropped: no std2 method is
+  either (`at(k)` reads without advancing, so it is not `nth`, and
+  `ExactSizeIterator::len` needs an exact size_hint).
+- More shapes the rust edition reads otherwise: a local's or an array
+  element's address cast to another pointee is `&raw const x as *mut U`
+  (`&raw mut` for a `var`); `&p[i]` of a raw pointer is `p.add(i)`; a
+  raw pointer to views `*[u8]` is `*mut &[u8]`; an inherent method's
+  receiver of a type MVS copies is `self`; a `let` of an `if` with a
+  literal branch is `: i64`, an i64 literal outside i32 under a cast
+  gets a suffix (`u64` above i64::MAX); a literal branch of an `if`
+  whose other branch is bytes is `b".."`; a row whose receiver is a
+  row's call at the same place is applied; `push_fmt` is
+  `std::fmt::write` (a program's own `write` shadows the prelude's);
+  `memchr` is an iterator's position. compiler/src's `base::len_arg`,
+  0.26.2's bridge to usize parameters, is gone (`e as usize` at its 19
+  sites).
+- Gate 2: tests/translate.sh translates with `--force` (the generated
+  sweep cases); the corpus round-trips 43 of 50 (41 at 0.27.3's
+  end). causes.tsv reclassified for every case the walls moved.
+
+The front (fl10274):
+
+- `[T]` and `str` are types of their own in the rust edition (Z9.1c,
+  FL10's second stage): the unsized place, which `&[T]` and `&str`
+  reference. `&T` with `T = &str` is a reference to the view, `&&str`,
+  so `Iter<&str>` yields `&&str`, `copied` makes it `&str` again, and
+  Vec<&str>'s `Extend<T>` and `Extend<&T>` are two impls. An impl for
+  `[T]` and one for `&[T]` can both be written. A `?Sized` parameter
+  binds the place: `io::copy` reads a `&[u8]`, and `&mut "ab".as_bytes()`
+  is a `&mut &[u8]`. A Sized one bound to the place is `type.unsized`,
+  rustc's E0277, so `Vec<[i64]>` is rejected. A method on a view probes
+  as rustc's does: the place's `&self` method first, then the view's
+  own impls. A `NonNull<[u8]>` is two words. Z9.1a's special case for
+  reference impls over a slice is retired. std2 gains rustc's
+  forwarding impls for references (`Borrow`, `AsRef`, `AsMut`, `Eq`,
+  `Ord`). Not yet: an iterator of views collected in std2's generic
+  instances (`[&str; 2].into_iter().collect_in(a)`, borrowck, D4.6,
+  which also failed before) and `Box<[T]>`/`Box<str>` (std2's Box has
+  a Sized T), both 0.27.5.
+- `h[i]` of an `h: &mut [T; N]` (or `&[T; N]`, `&&[T; N]`) indexes the
+  array through the reference, as rustc's autoderef does (F20.1); 0.27.3
+  read it as a raw pointer's arithmetic, `unsafe` (about 32 of gate 3's
+  errors). `<I as SliceIndex<[i64]>>::Output` takes the impl its trait
+  arguments name (F8.1).
+- A rust hello world's build costs about 2.0x MVS's (2.34x in 0.27.3);
+  the 2.0x ceiling is enforced from 0.27.5, with std2 lexed lazily
+  (tests/compile_cost.sh prints it). A build makes
+  std2's builtin impls only for the primitives the program brings in
+  (F15.1: it names them, a literal's suffix, or a word such as `chars`
+  or `HashMap` that brings them through std2's types); i32, usize, u8
+  and bool always. A build whose check fails without one is made again
+  with every impl, so no other impl is chosen and the errors are the
+  eager build's. A build does not borrow-check std2's own non-generic
+  bodies, which the std2-check row checks clean (Z7.2); every instance
+  of a std2 template a program reaches still is.
 
 ### What's new in 0.27.3
 
