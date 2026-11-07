@@ -32,7 +32,7 @@
 // is lazy only (BUILD); VOLE_STD2_EAGER=1 keeps every unit, and so do
 // queries, `--std2-check`, `fix --only buf` and std2 read from its files.
 
-use crate::base::{intern, sym_text};
+use crate::base::{buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_uint, intern, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::lexer::Tok;
@@ -45,6 +45,21 @@ static var BUILD: bool = false;
 static var DROPPED: i64 = 0;
 // (VOLE_STD2_NORERUN=1, front/stdtree.vl: no rerun_eager, for the twin)
 pub static var NORERUN: bool = false;
+
+// RULE: Z5.2 (0.27.5) std2 lexed by its units, from the index embed.sh
+// writes (stdsrc_rust.vl: std2_units, made by `volec __std2-index`).
+// INDEX_FORMAT is the index's format: embed.sh asks for this number
+// (STD2_UNITS_FORMAT there), and an index of another is not read.
+const INDEX_FORMAT: i64 = 1;
+// (VOLE_STD2_INDEX=0, front/stdtree.vl: the text lexed whole, as in 0.27.4)
+pub static var INDEX_OFF: bool = false;
+// (VOLE_STD2_DUMP=FILE: the tokens kept, written there, dump_std2)
+pub static var DUMP: *u8 = 0 as *u8;
+// The index's text (a buffer), when load_std2 lexed only the tail.
+static var INDEX_BUF: i64 = -1;
+// Then: where std2's text starts in SRC and where the std file ends.
+static var TEXT_START: i64 = -1;
+static var TEXT_END: i64 = -1;
 
 // RULE: F15.1 (0.27.4) The primitives whose builtin impls a lazy build makes
 // (front/builtin_impls.vl): those the program's files name, by a word or a
@@ -96,6 +111,241 @@ pub fn impl_dropped() {
 pub fn std2_lexed(first: i64, end: i64) {
     STD2_FIRST = first;
     STD2_END = end;
+}
+
+// RULE: Z5.2 Whether load_std2 may lex only the tail of std2's text, whose
+// first body_len bytes are the built-in text (not a tree's): a lazy build
+// whose index (std2_units) is of INDEX_FORMAT and of this text's length.
+pub fn index_ready(body_len: i64, from_tree: bool, pcx: Ctx<Comp>) -> bool {
+    if INDEX_OFF || from_tree || EAGER || !BUILD || !crate::front::known::on_std2(pcx)
+        || pcx.query || pcx.record || pcx.std_always
+        || crate::places::borrowck::std2::std2_check(pcx) {
+        return false;
+    }
+    let b = buf_new();
+    crate::front::stdsrc_rust::std2_units(b);
+    let s = buf_slice(b);
+    var at = 0;
+    let w = next_word(s, &at);
+    if w < 0 || s[w..at] != "std2-units" || next_num(s, &at) != INDEX_FORMAT
+        || next_num(s, &at) != body_len {
+        return false;
+    }
+    INDEX_BUF = b;
+    true
+}
+
+// load_std2 lexed only the tail (index_ready): its tokens first..end;
+// std2's text at text_start in SRC, the std file ending at text_end.
+pub fn std2_tail_lexed(first: i64, end: i64, text_start: i64, text_end: i64) {
+    std2_lexed(first, end);
+    TEXT_START = text_start;
+    TEXT_END = text_end;
+    DEFERRED = true;
+}
+
+// Whether token i is the tail's, whose inline modules front/modules:
+// scan_modules leaves to filter_std2, so that std2's modules are made in
+// their text's order, the tail's last, as when std2 is lexed whole.
+pub fn deferred(i: i64) -> bool {
+    DEFERRED && i >= STD2_FIRST && i < STD2_END
+}
+
+static var DEFERRED: bool = false;
+
+// The index's units, methods and asks (index_command writes them).
+fn read_index(u: inout Units<Comp>, pcx: inout Ctx<Comp>) {
+    let s = buf_slice(INDEX_BUF);
+    var at = 0;
+    next_word(s, &at);
+    next_num(s, &at);
+    next_num(s, &at);
+    let nwords = next_num(s, &at);
+    let nunits = next_num(s, &at);
+    let nmethods = next_num(s, &at);
+    let nasks = next_num(s, &at);
+    var syms = Vec::<i64, Comp>::new_in(Comp {});
+    for _ in 0..nwords {
+        let w = next_word(s, &at);
+        syms.push(intern(s[w..at], &pcx));
+    }
+    var end = 0;
+    for k in 0..nunits {
+        let kind = next_num(s, &at);
+        let start = end + next_num(s, &at);
+        end = start + next_num(s, &at);
+        let name = next_num(s, &at);
+        let tr = next_num(s, &at);
+        let ty = next_num(s, &at);
+        let back = next_num(s, &at);
+        let nw = next_num(s, &at);
+        add_unit(&u, kind, TEXT_START + start, TEXT_START + end,
+            if name > 0 { syms[name - 1] } else { -1 }, if tr > 0 { syms[tr - 1] } else { -1 },
+            if ty > 0 { syms[ty - 1] } else { -1 }, if back > 0 { k - back } else { -1 });
+        u.wstart[k] = u.wlist.len() as i64;
+        for _ in 0..nw {
+            u.wlist.push(syms[next_num(s, &at)]);
+        }
+        u.wend[k] = u.wlist.len() as i64;
+    }
+    for _ in 0..nmethods {
+        let m = next_num(s, &at);
+        add_method(&u, syms[m], next_num(s, &at));
+    }
+    for _ in 0..nasks {
+        let a = next_num(s, &at);
+        add_ask(&u, syms[a], syms[next_num(s, &at)]);
+    }
+    u.nbytes = nunits;
+}
+
+// The next word of s at or after at (its start; at after it), or -1.
+fn next_word(s: [u8], at: inout i64) -> i64 {
+    let n = s.len() as i64;
+    while at < n && (s[at] == ' ' || s[at] == '\n') {
+        at += 1;
+    }
+    if at >= n {
+        return -1;
+    }
+    let w = at;
+    while at < n && s[at] != ' ' && s[at] != '\n' {
+        at += 1;
+    }
+    w
+}
+
+// The next number of s (a word of decimal digits), -1 when there is none.
+fn next_num(s: [u8], at: inout i64) -> i64 {
+    let w = next_word(s, &at);
+    if w < 0 {
+        return -1;
+    }
+    var v = 0;
+    for i in w..at {
+        if s[i] < '0' || s[i] > '9' {
+            return -1;
+        }
+        v = v * 10 + (s[i] - '0') as i64;
+    }
+    v
+}
+
+// RULE: Z5.2 `volec --edition rust __std2-index FILE`: the index of
+// std2's text in FILE (embed.sh's, without the tail), std2_units's text,
+// on stdout: `std2-units FORMAT LENGTH WORDS UNITS METHODS ASKS`, the
+// words (each an identifier's text), then each unit (its kind, its start
+// after the last's end and its length in bytes, its name, trait and type
+// head as a word's number from 1, 0 for none, how many units back its
+// parent is, 0 for none, and the numbers of the words it asks for, how
+// many first), each trait item name (its word, its trait's unit) and each
+// `use` leaf's ask (the word asking, the word asked).
+pub fn index_command(path: str, pcx: inout Ctx<Comp>) -> i64 {
+    let text = buf_new();
+    if !crate::tools::proc::read_file_if(crate::cli::c_of(path), text) {
+        crate::base::die2(c"cannot read ", crate::cli::c_of(path));
+    }
+    let len = buf_slice(text).len() as i64;
+    // (std's module and file, as load_std2 makes them: the text is read in
+    // the rust edition, front/rust: rust_at)
+    pcx.std2 = true;
+    pcx.err_kind = c"tokenizer error";
+    crate::front::lexer::init_lexer(&pcx);
+    crate::front::modules::init_modules(&pcx);
+    let start = crate::base::add_source(c"<std>", text, &pcx);
+    pcx.std_module = crate::front::modules::add_module(intern("std", &pcx), 0, public: true,
+        pcx: &pcx);
+    pcx.std_file = pcx.files.len() as i64 - 1;
+    pcx.files[pcx.std_file].module = pcx.std_module;
+    let first = pcx.toks.len() as i64;
+    crate::front::lexer::lex_range(start, start + len, last: false, pcx: &pcx);
+    std2_lexed(first, pcx.toks.len() as i64);
+    SYM_ASYNC = intern("async", &pcx);
+    SYM_DEFAULT = intern("default", &pcx);
+    SYM_DYN = intern("dyn", &pcx);
+    var u = units_new();
+    split_units(&u, pcx);
+    // the words, numbered from 0 as they come
+    var number = hmap();
+    var words = Vec::<i64, Comp>::new_in(Comp {});
+    let n = u.kind.len() as i64;
+    let body = buf_new();
+    var last_end = 0;
+    var seen = hmap();
+    for k in 0..n {
+        let bstart = pcx.toks[u.start[k]].start - start;
+        let bend = pcx.toks[u.end[k] - 1].end - start;
+        buf_int(body, u.kind[k]);
+        buf_byte(body, ' ');
+        buf_int(body, bstart - last_end);
+        buf_byte(body, ' ');
+        buf_int(body, bend - bstart);
+        last_end = bend;
+        for f in 0..3 {
+            let s = if f == 0 { u.name[k] } else if f == 1 { u.trait_of[k] } else { u.type_of[k] };
+            buf_byte(body, ' ');
+            buf_int(body, if s >= 0 { word_number(s, &number, &words) + 1 } else { 0 });
+        }
+        buf_byte(body, ' ');
+        buf_int(body, if u.parent[k] >= 0 { k - u.parent[k] } else { 0 });
+        var asked = Vec::<i64, Comp>::new_in(Comp {});
+        if asks_words(u.kind[k]) {
+            for t in u.start[k]..u.end[k] {
+                if pcx.toks[t].kind == Tok::Ident {
+                    let s = pcx.toks[t].value as i64;
+                    if seen.get(s + 1) != k + 1 {
+                        seen.put(s + 1, k + 1);
+                        asked.push(word_number(s, &number, &words));
+                    }
+                }
+            }
+        }
+        buf_byte(body, ' ');
+        buf_int(body, asked.len() as i64);
+        for j in 0..asked.len() {
+            buf_byte(body, ' ');
+            buf_int(body, asked[j]);
+        }
+        buf_byte(body, '\n');
+    }
+    for m in 0..u.method_name.len() as i64 {
+        buf_int(body, word_number(u.method_name[m], &number, &words));
+        buf_byte(body, ' ');
+        buf_int(body, u.method_trait[m]);
+        buf_byte(body, '\n');
+    }
+    for a in 0..u.alias_sym.len() as i64 {
+        buf_int(body, word_number(u.alias_from[a], &number, &words));
+        buf_byte(body, ' ');
+        buf_int(body, word_number(u.alias_sym[a], &number, &words));
+        buf_byte(body, '\n');
+    }
+    let out = buf_new();
+    buf_bytes(out, "std2-units ");
+    buf_int(out, INDEX_FORMAT);
+    for v in [len, words.len() as i64, n, u.method_name.len() as i64, u.alias_sym.len() as i64] {
+        buf_byte(out, ' ');
+        buf_int(out, v);
+    }
+    buf_byte(out, '\n');
+    for j in 0..words.len() as i64 {
+        buf_bytes(out, sym_text(words[j], pcx));
+        buf_byte(out, if j % 16 == 15 || j + 1 == words.len() as i64 { '\n' } else { ' ' });
+    }
+    buf_bytes(out, buf_slice(body));
+    crate::base::buf_write_fd(out, crate::base::STDOUT);
+    if pcx.error_count > 0 { 1 } else { 0 }
+}
+
+// Symbol s's number among the index's words (the next, when it is new).
+fn word_number(s: i64, number: inout HMap, words: inout Vec<i64, Comp>) -> i64 {
+    let k = number.get(s + 1);
+    if k > 0 {
+        return k - 1;
+    }
+    words.push(s);
+    number.put(s + 1, words.len() as i64);
+    words.len() as i64 - 1
 }
 
 // $VOLE_STD2_EAGER=1 (front/stdtree.vl: std_tree_env).
@@ -201,6 +451,16 @@ struct Units<A: Allocator> {
     method_next: Vec<i64, A>,
     words: Vec<i64, A>,
     todo: Vec<i64, A>,
+    // RULE: Z5.2 (0.27.5) the units from the index (std2_units): the first
+    // `nbytes`, their start and end SRC's bytes, not tokens; a unit's words
+    // wlist[wstart..wend] (-1: its tokens are read); for the index's own
+    // writing, each method_trait's name and each alias_sym's asker
+    nbytes: i64,
+    wstart: Vec<i64, A>,
+    wend: Vec<i64, A>,
+    wlist: Vec<i64, A>,
+    method_name: Vec<i64, A>,
+    alias_from: Vec<i64, A>,
 }
 
 fn units_new() -> Units<Comp> {
@@ -214,7 +474,9 @@ fn units_new() -> Units<Comp> {
         member_by_type: hmap(), item_name: hmap(), used: hmap(), defined: hmap(),
         alias_head: hmap(), alias_sym: Vec::new_in(Comp {}), alias_next: Vec::new_in(Comp {}),
         method_head: hmap(), method_trait: Vec::new_in(Comp {}), method_next: Vec::new_in(Comp {}),
-        words: Vec::new_in(Comp {}), todo: Vec::new_in(Comp {}),
+        words: Vec::new_in(Comp {}), todo: Vec::new_in(Comp {}), nbytes: 0,
+        wstart: Vec::new_in(Comp {}), wend: Vec::new_in(Comp {}), wlist: Vec::new_in(Comp {}),
+        method_name: Vec::new_in(Comp {}), alias_from: Vec::new_in(Comp {}),
     }
 }
 
@@ -236,6 +498,8 @@ fn add_unit(u: inout Units<Comp>, kind: i64, start: i64, end: i64, name: i64, tr
     u.next_name.push(-1);
     u.next_type.push(-1);
     u.next_trait.push(-1);
+    u.wstart.push(-1);
+    u.wend.push(-1);
     if kind == K_ITEM && name >= 0 {
         u.next_name[k] = u.by_name.get(name + 1) - 1;
         u.by_name.put(name + 1, k + 1);
@@ -270,13 +534,19 @@ fn eager(pcx: Ctx<Comp>) -> bool {
 // After the program's files are lexed (front/modules: load_modules): std2's
 // tokens that no reached unit has, dropped.
 pub fn filter_std2(pcx: inout Ctx<Comp>) {
-    if eager(pcx) || DROPPED != 0 {
+    let by_index = TEXT_START >= 0;
+    if !by_index && (eager(pcx) || DROPPED != 0) {
         return;
     }
     var u = units_new();
     SYM_ASYNC = intern("async", &pcx);
     SYM_DEFAULT = intern("default", &pcx);
     SYM_DYN = intern("dyn", &pcx);
+    // RULE: Z5.2 (the text's units from the index, the tail's from its
+    // tokens, STD2_FIRST..STD2_END)
+    if by_index {
+        read_index(&u, &pcx);
+    }
     split_units(&u, pcx);
     // the program's words, then the seeds; the primitives it names
     var prim_syms = Vec::<i64, Comp>::new_in(Comp {});
@@ -338,6 +608,18 @@ pub fn filter_std2(pcx: inout Ctx<Comp>) {
         }
     }
     reach(&u, pcx);
+    if by_index {
+        if eager(pcx) {
+            for k in 0..n {
+                u.loaded[k] = true;
+            }
+        }
+        lex_units(u, &pcx);
+        DEFERRED = false;
+        crate::front::modules::std2_inline_modules(STD2_FIRST, STD2_END, &pcx);
+        dump_std2(pcx);
+        return;
+    }
     // the tokens kept, in their order (the units are)
     var w = STD2_FIRST;
     for k in 0..n {
@@ -359,6 +641,90 @@ pub fn filter_std2(pcx: inout Ctx<Comp>) {
     DROPPED = total - w;
     pcx.toks.truncate(w as usize);
     STD2_END -= DROPPED;
+    dump_std2(pcx);
+}
+
+// Whether unit k is kept: reached, or the closing brace of a header that is.
+fn kept(u: Units<Comp>, k: i64) -> bool {
+    u.loaded[k] || u.kind[k] == K_CLOSE && u.loaded[u.parent[k]]
+}
+
+// RULE: Z5.2 The kept units of the index lexed, each run of them in one
+// lex_span, then the tail's kept tokens: appended after the tokens, with
+// the other files' tokens after them, and the whole moved to STD2_FIRST.
+fn lex_units(u: Units<Comp>, pcx: inout Ctx<Comp>) {
+    let total = pcx.toks.len() as i64;
+    let n = u.kind.len() as i64;
+    var dropped = 0;
+    var k = 0;
+    while k < u.nbytes {
+        if !kept(u, k) {
+            dropped += 1;
+            k += 1;
+            continue;
+        }
+        var j = k;
+        while j + 1 < u.nbytes && kept(u, j + 1) {
+            j += 1;
+        }
+        crate::front::lexer::lex_span(u.start[k], u.end[j], TEXT_END, &pcx);
+        k = j + 1;
+    }
+    for t in u.nbytes..n {
+        if !kept(u, t) {
+            dropped += u.end[t] - u.start[t];
+            continue;
+        }
+        for r in u.start[t]..u.end[t] {
+            let tok = pcx.toks[r];
+            pcx.toks.push(tok);
+        }
+    }
+    let std2_end = pcx.toks.len() as i64;
+    for r in STD2_END..total {
+        let tok = pcx.toks[r];
+        pcx.toks.push(tok);
+    }
+    let made = pcx.toks.len() as i64 - total;
+    for i in 0..made {
+        pcx.toks[STD2_FIRST + i] = pcx.toks[total + i];
+    }
+    pcx.toks.truncate((STD2_FIRST + made) as usize);
+    STD2_END = STD2_FIRST + std2_end - total;
+    DROPPED = dropped;
+}
+
+// RULE: Z5.2 $VOLE_STD2_DUMP=FILE: std2's tokens as the read keeps them, a
+// line each (its kind, bytes, joint and suffix, and an identifier's or a
+// lifetime's name or a number's value), for the test that compares the
+// index's read with the tokens' (tests/std2/units.sh).
+fn dump_std2(pcx: Ctx<Comp>) {
+    if DUMP == 0 as *u8 {
+        return;
+    }
+    let b = buf_new();
+    buf_bytes(b, if TEXT_START >= 0 { "by-index\n" } else { "by-tokens\n" });
+    for i in STD2_FIRST..STD2_END {
+        let t = pcx.toks[i];
+        buf_int(b, t.kind as i64);
+        buf_byte(b, ' ');
+        buf_int(b, t.start);
+        buf_byte(b, ' ');
+        buf_int(b, t.end);
+        buf_byte(b, ' ');
+        buf_int(b, if t.joint { 1 } else { 0 });
+        if t.kind == Tok::Ident || t.kind == Tok::Reserved || t.kind == Tok::Lifetime {
+            buf_byte(b, ' ');
+            buf_bytes(b, sym_text(t.value as i64, pcx));
+        } else if t.kind == Tok::Int || t.kind == Tok::Float || t.kind == Tok::Char {
+            buf_byte(b, ' ');
+            buf_uint(b, t.value);
+            buf_byte(b, ' ');
+            buf_int(b, t.suffix);
+        }
+        buf_byte(b, '\n');
+    }
+    crate::base::buf_write_file(b, DUMP);
 }
 
 // Name s asked for.
@@ -437,8 +803,11 @@ fn reach(u: inout Units<Comp>, pcx: Ctx<Comp>) {
                     j += 1;
                 }
             }
-            if kind == K_ITEM || kind == K_IMPL || kind == K_HEADER || kind == K_MEMBER
-                || kind == K_TREQ || kind == K_KEEP {
+            if u.wstart[k] >= 0 {
+                for w in u.wstart[k]..u.wend[k] {
+                    ask(&u, u.wlist[w]);
+                }
+            } else if asks_words(kind) {
                 for t in u.start[k]..u.end[k] {
                     if pcx.toks[t].kind == Tok::Ident {
                         ask(&u, pcx.toks[t].value as i64);
@@ -452,6 +821,12 @@ fn reach(u: inout Units<Comp>, pcx: Ctx<Comp>) {
             return;
         }
     }
+}
+
+// Whether a unit of this kind asks for the words it holds.
+fn asks_words(kind: i64) -> bool {
+    kind == K_ITEM || kind == K_IMPL || kind == K_HEADER || kind == K_MEMBER || kind == K_TREQ
+        || kind == K_KEEP
 }
 
 // Item name n reached: the impls and methods that waited on it.
@@ -760,10 +1135,7 @@ fn split_trait(u: inout Units<Comp>, s: i64, t: i64, end: i64, pcx: Ctx<Comp>) {
             add_unit(&u, K_TREQ, members[j], members[j + 1], -1, -1, -1, header);
         }
         if members[j + 2] >= 0 {
-            let k = u.method_trait.len() as i64;
-            u.method_trait.push(header);
-            u.method_next.push(u.method_head.get(members[j + 2] + 1) - 1);
-            u.method_head.put(members[j + 2] + 1, k + 1);
+            add_method(&u, members[j + 2], header);
         }
         j += 4;
     }
@@ -816,10 +1188,20 @@ fn split_use(u: inout Units<Comp>, s: i64, end: i64, pcx: Ctx<Comp>) {
     }
 }
 
+// Trait item name m of the trait whose header is unit header.
+fn add_method(u: inout Units<Comp>, m: i64, header: i64) {
+    let k = u.method_trait.len() as i64;
+    u.method_trait.push(header);
+    u.method_name.push(m);
+    u.method_next.push(u.method_head.get(m + 1) - 1);
+    u.method_head.put(m + 1, k + 1);
+}
+
 // Name a asks for name b.
 fn add_ask(u: inout Units<Comp>, a: i64, b: i64) {
     let k = u.alias_sym.len() as i64;
     u.alias_sym.push(b);
+    u.alias_from.push(a);
     u.alias_next.push(u.alias_head.get(a + 1) - 1);
     u.alias_head.put(a + 1, k + 1);
 }

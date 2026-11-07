@@ -131,6 +131,16 @@ The front (front275):
 - With both, gate 3's borrowck errors go from 307 to 286: conflicts from
   215 to 201, dropped_borrowed from 7 to 0. All 286 are the translator's
   to fix; for each shape rustc rejects the same code.
+- std2 is lexed by its units (front-rust.md Z5.2). `embed.sh` writes an
+  index of std2's units, made by the compiler (`volec __std2-index`).
+  A build reads the index and lexes only the units it reaches, about
+  half of std2's text. The tokens it keeps are the same as from lexing
+  the whole text (tests/std2/units.sh).
+  - A rust hello world's build is 1.78x MVS's, down from 2.08x. The 2.0x
+    ceiling in tests/compile_cost.sh is now enforced.
+  - The commit hook and the merge driver remake the index, like the rest
+    of stdsrc_rust.vl. It adds about 150 KB to that file and 0.5% to the
+    compiler's own compile.
 
 The translator (g3274):
 
