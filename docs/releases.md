@@ -94,16 +94,21 @@ Gate 2's harness (twin273):
   - `guide`: the guide's MVS programs;
   - `rust`: the rust corpus, the runner's own check.
 
-  It prints one count per set, a cause per failure (`no-translation`, `type CODE`, `borrowck CODE`, `link`, `crash`, `output`, `exit`, `stderr`, `timeout`), the codes by frequency and the failures that look like Q7's (a borrowck error on a line that borrows a literal or a constant). `-f LIST` selects the programs a list names, and `-j N` sets the jobs. tests/translate/causes.tsv, the translator's record of why, is grouped by cause; a cause for a program that now round-trips is reported as stale (`--triage` appends the new failures as `?`). The release gate's `translate` row runs it, informational until 0.27.4: it prints the count and never fails. The identity translator round-trips all 339 of the rust corpus's run cases.
+  It prints one count per set, a cause per failure (`no-translation`, `type CODE`, `borrowck CODE`, `link`, `crash`, `output`, `exit`, `stderr`, `timeout`), the codes by frequency and the failures that look like Q7's (a borrowck error on a line that borrows a literal or a constant). `-f LIST` selects the programs a list names, and `-j N` sets the jobs. tests/translate/causes.tsv, the translator's record of why, is grouped by cause; a cause for a program that now round-trips is reported as stale (`--triage` appends the new failures as `?`). The release gate's `translate` row runs it with `--twin` (below). It is informational until 0.27.4: it prints both counts and never fails. Results:
+  - the identity translator round-trips all 339 of the rust corpus's run cases;
+  - the translator at its first merge round-trips 600 of 1,575 programs: run 575 of 1,347, examples 3 of 83, bench 1 of 44 (at -O2), guide 22 of 104;
+  - Q7 (L2, rvalue static promotion): 0 failures borrow a literal or a constant, so L2 waits for a count that needs it.
 - The rustc twin's shim, `tools/rustc-twin/` (plan-0271 §2.2). prelude.rs is the part of `allocator_api` that stable rustc lacks: one global allocator `Gpa`, with the `_in` functions as extension traits over it (`new_in`, `with_capacity_in`, `from_in`, `Box::new_in`, `collect_in`, `to_string_in`, `clone_in`, `to_owned_in`, `default_in`, `from_iter_in`, a slice's and a str's `_in` methods, `lines_in`). twin.py makes a rust-edition program Rust and keeps its line numbers:
   - main is wrapped;
   - a type loses its allocator argument, and a generic `A: Allocator` becomes Gpa;
   - the format functions become macros, and `format_in` and the free `X_in(.., gpa)` functions become their Rust names;
   - the check attributes are dropped.
 
-  `tools/rustc-twin.sh CASE... [--guide]` runs a program under rustc and compares its stdout and exit code with the case's. A difference is named by `// RUSTC-DIFFERS: WHY` in the case, or in tools/rustc-twin/divergences.tsv for a program without a case. The rust corpus's run cases and the guide's rust-edition program: 304 of 341 agree, 5 named, 0 differ. `tests/translate.sh --twin` twins every program that round-trips, one count per set.
+  `tools/rustc-twin.sh CASE... [--guide]` runs a program under rustc and compares its stdout and exit code with the case's. A difference is named by `// RUSTC-DIFFERS: WHY` in the case, or in tools/rustc-twin/divergences.tsv for a program without a case. The rust corpus's run cases and the guide's rust-edition program: 304 of 341 agree, 5 named, 0 differ. `tests/translate.sh --twin` twins every program that round-trips, with one count per set: 366 of 598 agree at the translator's first merge. The differences are named in tools/rustc-twin/divergences.tsv: L7's field captures, and arrays' by-value IntoIterator. `--alloc-api` (in both tools, a manual mode) runs rustc as nightly (RUSTC_BOOTSTRAP=1) with Rust's own allocator_api (prelude_alloc.rs): `Vec<T, A>` and `Box<T, A>` are std's own, a String<A> wraps a Vec<u8, A>, and HashMap and HashSet hold their allocator. So a borrow of an allocator (`format_in(.., b.allocator())`, a String<&A>) is checked as rustc checks it: 305 of 348 agree on the rust corpus and the guide. Its summaries say `allocator_api, RUSTC_BOOTSTRAP=1`.
+- In the rust edition an `if`'s condition and a match guard are terminating scopes, as a `while`'s condition was (borrowck.md L3, the Rust reference's "Temporary scopes"): their temporaries drop before the branch or the arm runs. MVS's order is unchanged. Case `rust_b_ok_temp_if_cond_scope`, which twins with rustc.
+- Two cases agree with rustc on a temporary that holds a shared loan across a two-phase activation (D7.3): rejected when its type has a Drop impl, accepted otherwise. That is why `b.extend_from_slice(format_in(.., b.allocator()).as_bytes())` is rejected by both rustc and vole; `*b.allocator()` is accepted by both.
 - `tools/borrowck-twin.sh --shim`: the verdicts through the shim. The gate row uses it: 365 of 400 agree (358 with `--std2`), 10 divergences, 0 mismatches. Seven `// RUSTC: none` markers ("no allocator until 0.27.3") are gone.
-- `tests/translate.sh --record query|refactor`: the migration surface's record mode. Each transcript's program is translated in a copy, the suite's runner re-records the transcripts (`-u`), and the result is a diff to review (target/translate/record/SUITE.diff). With the identity translator, 0 of 42 query transcripts change. `tests/guide/run.sh --split DIR` writes the guide's blocks out for the runners.
+- `tests/translate.sh --record query|refactor`: the migration surface's record mode. Each transcript's program is translated in a copy, the suite's runner re-records the transcripts (`-u`), and the result is a diff to review (target/translate/record/SUITE.diff). With the identity translator, 0 of 42 query transcripts change. With the translator's first merge, 35 of 42 change (2,198 lines to review; 34 programs translated, 1 not). `tests/guide/run.sh --split DIR` writes the guide's blocks out for the runners.
 
 std2 (std273):
 
@@ -161,6 +166,36 @@ std2 (std273):
   supertrait default through a bound, Cloned's DoubleEndedIterator
   bound, and an Index bound on a type parameter. None waits for a
   std2 body.
+
+Compile cost and the machine's load (cost273):
+
+- **std2 is parsed lazily** (front/modules/std2lazy.vl). Its text is still
+  lexed whole, then split into units: each item, each method of an inherent
+  impl, and each default method of a trait (with its trait's header and
+  required items). A build keeps only the units the program reaches by name:
+  its own words, the known items and the names the compiler's lowerings and
+  made code use; an item by its name, a trait by any of its items' names, a
+  method once its type or trait is reached, a trait impl once both are. The
+  rest is never parsed, derived, expanded (`#[builtin_impls]`) or collected.
+  A lazy build with errors is made again with std2 whole, so its
+  diagnostics are the whole std2's. Queries, `--std2-check` and
+  `VOLE_STD2_EAGER=1` read std2 whole. The rust and std2 cases at -O0 give
+  the same verdicts lazy and eager (2,095), and a sample's code is the same
+  (85 of 85, after renumbering).
+- **A lighter println**: on std2, `println("hello")` (`print`, `eprint`,
+  `eprintln`) with a literal that has no hole is written as a format
+  literal: its text through the Formatter's `write_str`, as Rust's. It no
+  longer goes through str's Display and `Formatter::pad`, whose padding,
+  char counting and UTF-8 encoding every hello world compiled.
+- hello-rust from 371M instructions (3.76x its MVS row) to 231M (2.32x),
+  `tests/compile_cost.sh`; std-rust from 729M to 637M; MVS's rows not
+  dearer (hello 1.01x, std 1.00x, check 1.00x, rust 1.00x of 0.27.2.1).
+  What is left over the 2.0x ceiling: std2 is still lexed whole, its builtin
+  impls are made for every primitive, and its big modules are few units
+  (0.27.4).
+- The hooks' case "the check after the fixes timed out" gives the two real
+  calls before it 8 s (scaled by the load up to 64 s), not 3 s: at 3 s
+  (24 s under load) it failed in every suite row of 0.27.2.1's gate.
 
 ### What's new in 0.27.2.1
 
