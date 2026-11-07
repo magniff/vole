@@ -161,6 +161,19 @@ The translator (g3274):
   distinct.mix, 1 item.private); borrowck (partial), with front275's
   D2.4a: 161.
 
+std2 (fl10274), for the modules compiler/src uses:
+
+- `std::time`: `Duration` (`new`, `from_secs`..`from_nanos`,
+  `from_secs_f64`/`f32` and their `try_`, `as_*`, `subsec_*`, `checked_*`,
+  `saturating_*`, `mul_f64`, `div_f64`, `div_duration_f64`, the operators
+  and Debug as Rust prints it: `1.5s`, `2ms`, `{:.2?}`), `Instant`,
+  `SystemTime` with `UNIX_EPOCH` and `SystemTimeError`; and
+  `std::thread::sleep`. Changed from Rust's: `as_millis`, `as_micros` and
+  `as_nanos` are u64 (saturating), `UNIX_EPOCH` is a static, and there are
+  no `Duration::ZERO`/`MAX` constants (a constant of a struct type waits
+  for const evaluation). Seven std2_time cases, six of them twinned with
+  rustc.
+
 ### What's new in 0.27.4
 
 Gate 3 opens. `volec fix --edition rust` run on a copy of compiler/src leaves N errors, printed by the gate's `gate3` row every release; 0.28 starts at N = 0. Its first full measurement was 1,414 (after 0.27.3's three parse shapes); 0.27.4 leaves 122 type errors, most of them std2 modules the compiler uses that std2 does not have yet (`std::cli`, `fs`, `process`, `gpu`), and `volec check --borrowck-partial` counts the 3,048 borrowck errors behind them, about 2,750 of one shape that 0.27.5's first item fixes (an operand read where it is evaluated, D2.4a). In the rust edition: a type is inferred from a later statement (FL1, F18.6: `Vec::new_in(a)` then a push, a later arm, `"4".parse().unwrap()`, `_` in a type); `[T]` and `str` are unsized places that `&[T]` and `&str` refer to (Z9.1c step B: impls keyed by them, method lookup through a view, `NonNull<[u8]>` 16 bytes); `&raw const`/`&raw mut` (F30.2), and a reference to a `static mut` refused as Rust 2024 does (D6.2.5); `format_args(..)` a Display value (F16.4); indexing through `&mut [T; N]` (F20.1). std2 passes 1,445 of its 1,473 tests at -O0 (1,402 of 1,472 in 0.27.3). A rust hello world's check is 2.03x MVS's (2.32x): builtin impls only for the primitives a program brings in (F15.1), and std2's own settled bodies are not borrow-checked again (Z7.2); the 2.0x ceiling is printed, enforced from 0.27.5. A crash on a closure capturing a widened integer, in MVS too, is fixed. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
