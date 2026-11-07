@@ -400,6 +400,15 @@ rust-edition position, with these readings:
   str` is `<str as AsRef<[u8]>>`, in an instance too, with or without an
   expected type (before, with `let b: &[u8] = ..` the reference impl took
   it, called itself, and the program overflowed its stack).
+- *Not yet: an instance's call is resolved again, not the template's
+  choice substituted* (0.27.5, a wrong output). rustc resolves a method
+  call once, on the generic body: `(**self).tag()` in `impl<T: ?Sized +
+  Tag> Tag for &T` is `<T as Tag>` for every T, so with `C = &&str`,
+  `via(r)` of `fn via<C: Tag>(c: C) { c.tag() }` is the reference impl
+  twice (21). Vole checks the instance's body with T = `&str` and takes
+  the place's impl for `(**self)`, a view (11). The fix: an instance's
+  call takes the template's resolution with the instance's types. Case
+  `rust_f_z91c_template_choice` (XFAIL).
 - *`&'a T` of an unsized argument in a signature* (0.27.5, D4.6). With
   `T = Unsized(v)`, `&'a T` is the view `v` whose region is the
   reference's (`'a`, or the elided one, E2/E3's), with T's slots (the
