@@ -139,6 +139,55 @@ The front (front274):
   function not lowered from its body", MVS too): the capture is found
   under the widening cast now.
 
+The translator (g3274):
+
+- Gate 3 is measured: `tests/gate3.sh` translates a copy of compiler/src
+  with `volec fix --edition rust --force` and checks it in the rust
+  edition; it prints `gate3: N errors (by code: ...)`. The release
+  gate's `gate3` row (--release) runs it, informational: it fails only
+  when the translator or the check cannot run. N went 309 (33 parse
+  errors hiding the rest) -> 1,414 (the real first wall) -> 253 (by code: 210 type error, 23 unsafe, 8 distinct.mix,
+  8 type.infer, 2 edition.lenient, 1 alloc.no_in, 1 item.private).
+- The first wall's three shapes: a static's `unsafe { }` that starts a
+  statement and is an operand there is `(unsafe { .. })`, and a method
+  on a static through the receiver's borrow wraps the call, not a copy;
+  a typed receiver `self: *T` is `self: *mut T`; a name a file's use
+  binds (`Tok::{Hash}`) gets no std import beside it. `&cx` of an inout
+  parameter given to a `*T` is `cx` (the `&mut`, coerced).
+- `[u8]` printed as text in a program that also reads its bytes is given
+  `str::from_utf8(x).unwrap()`: a hole naming it (the named argument), an
+  argument after the literal, `println(x)`'s value, an argument of a
+  `T: Display` parameter; only what was written `[u8]` where it is
+  declared. A text literal given to a `str` parameter stays text.
+- rewrite.tsv's type rows are applied where the type is written (`Arena`
+  -> `Arena<Gpa>`, `thread::JoinHandle<T>` -> `JoinHandle<T, Gpa>`,
+  `ScopedArena`, `Fmt`, ...), their arguments kept, the names they write
+  imported (a module a row's path starts with too: `use std::mem;`). A
+  row's `$a` with no allocator argument is the enclosing `Gpa`
+  parameter (`thread::spawn(f)` -> `thread::spawn_in(f, gpa)`); MVS's
+  `to_string_in(x, a)` is std2's `format_in(x, a)`.
+- An array's address cast to a raw pointer is `a.as_mut_ptr() as *mut U`
+  (`as_ptr` for a `let`); a static's `.len()` stays inside its `unsafe
+  { }`; an index of any integer type is cast to usize; a raw pointer's
+  part `p[a..b]` is rewritten after the statics, its operands' edits
+  folded in; a char literal MVS types as an integer is `b'a' as i64`;
+  `&mut $1` of an argument written `&x` borrows x once.
+- A `static mut`'s borrow is its raw address (F30.2, Rust 2024's
+  static_mut_refs): a method on it is `(*(&raw mut V)).push(x)` (`&raw
+  const` for a `&self` method), `&V` given to a `*T` is `&raw mut V`.
+  `use std::string::str;` is dropped (std2 has no such module: `str` is
+  the type). An impl of MVS's `Allocator` is std2's: `try_alloc` is
+  `allocate` (the null pointer `Err(AllocError)`), `try_resize` is
+  `grow` and `shrink`, which calls it (MVS's try_resize keeps
+  min(old, new) bytes, as realloc does), `free` is `deallocate`; each
+  body is kept, its parameters bound from the layouts. An `Iterator`
+  impl's MVS-only `exact_len` and `at` are dropped: no std2 method is
+  either (`at(k)` reads without advancing, so it is not `nth`, and
+  `ExactSizeIterator::len` needs an exact size_hint).
+- Gate 2: tests/translate.sh translates with `--force` (the generated
+  sweep cases); the corpus round-trips 43 of 50 (41 at 0.27.3's
+  end). causes.tsv reclassified for every case the walls moved.
+
 ### What's new in 0.27.3
 
 The translator and gate 2. `volec fix --edition rust FILE|DIR` rewrites an MVS program into the rust edition, directed by its types: parameter modes become `&T`, `&mut T` or `T`, `&x` at a call becomes the borrow the parameter takes, `var` becomes `let mut`, a view becomes a slice, a struct holding a view gets a lifetime, std calls follow `compiler/std2/rewrite.tsv`'s rows by type, contracts are carried, and an integer literal MVS typed i64 is annotated where the rust edition's i32 default would change it. `tests/translate.sh` measures the round trip (translated, built in the rust edition, the same output), and the rustc twin runs what round-trips under rustc; the release gate's `translate` row prints both, informational until 0.27.4 (the counts are in docs/roadmap.md's 0.27.3 gate record). In the rust edition an unsuffixed integer literal now takes its type from its first use, and is i32 when nothing fixes it (FL6, F18.5). 1,402 of std2's 1,472 tests pass at -O0 (1,306 of 1,454 in 0.27.2.1). std2 is parsed lazily, by the items a program reaches, and a `println` with no holes writes its literal directly: a rust hello world's check costs 2.32x MVS's (3.48x). Arrays iterate by value (`std::array::IntoIter` over `ManuallyDrop`), a rust-edition union drops none of its fields, an `if` condition's temporaries drop before its branch (L3), and std2 gains floats' methods, Unicode's tables, `std::sync::atomic` and more of `std::env`. Gate 3's first run: `fix --edition rust compiler/src` stops at 50 parse and import errors, all three translator shapes (an `unsafe { }` operand, a raw-pointer `self`, an import its file already binds); 0.27.4 prints its count. MVS programs compile exactly as before. Built and tested on aarch64-macos only.

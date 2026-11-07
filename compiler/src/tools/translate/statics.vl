@@ -11,6 +11,8 @@ use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::{BLOCK_UNSAFE, NodeKind, child};
 use crate::front::check::Res;
+use crate::front::lexer::Tok;
+use crate::front::types::TyKind;
 use crate::middle::lower::ssa::HMap;
 use crate::tools::edit::edit_replace;
 use crate::tools::translate::{
@@ -158,6 +160,45 @@ fn operand_at_statement_start(t: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
     }
 }
 
+// How the place rooted at static use n is borrowed: 0 not, 1 shared
+// (`&V`, a `&self` receiver), 2 exclusive (`&mut V`, `V.push(x)`'s
+// receiver), 3 its raw address written `&V` (given to a `*T`). Rust 2024 makes no reference to a `static mut` (D6.2.5):
+// such a root is read through its raw address, `(*(&raw mut V))`.
+fn borrowed_root(n: i64, tr: Tr, pcx: Ctx<Comp>) -> i64 {
+    var p = n;
+    loop {
+        let q = parent_of(p, tr);
+        let k = if q > 0 { pcx.nodes[q].kind } else { NodeKind::None };
+        if q > 0 && pcx.nodes[q].a == p
+            && (k == NodeKind::FieldAccess || k == NodeKind::TupleField) {
+            p = q;
+        } else {
+            break;
+        }
+    }
+    let q = parent_of(p, tr);
+    // (a method called on the place, `V.total()`: Rust borrows its
+    // receiver; a shared borrow reads a copy's receiver as well)
+    if q > 0 && (pcx.nodes[q].kind == NodeKind::Call || pcx.nodes[q].kind == NodeKind::MethodCall)
+        && pcx.nodes[q].count > 0 && child(q, 0, pcx) == p
+        && pcx.nodes[q].start == pcx.nodes[p].start {
+        // (a primitive's method takes it by value: `N.max(3)` copies)
+        let pt = pcx.nodes[p].ty;
+        return if pt >= crate::front::types::TY_I8 && pt <= crate::front::types::TY_ISIZE { 0 }
+            else { 1 };
+    }
+    if q <= 0 || pcx.nodes[q].kind != NodeKind::Unary || pcx.nodes[q].op != Tok::Amp
+        || pcx.nodes[q].b != p {
+        return 0;
+    }
+    let t = pcx.nodes[q].ty;
+    if t > 0 && pcx.types[t].kind == TyKind::Ptr && pcx.types[t].b == 0 {
+        // (a raw address MVS takes, `&V` given to a `*T`: `&raw mut V`)
+        return if SRC[pcx.nodes[q].start] == '&' && p == n { 3 } else { 0 };
+    }
+    if crate::tools::translate::is_mut_ref(t, pcx) { 2 } else { 1 }
+}
+
 pub fn static_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
     var blocks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     for n in 1..pcx.nodes.len() as i64 {
@@ -176,12 +217,30 @@ pub fn static_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
             continue;
         }
         let y = pcx.nodes[n].y;
-        if y < 0 || y >= pcx.statics.len() as i64 || !pcx.statics[y].mutable
-            || in_unsafe(pcx.nodes[n].start, blocks, pcx) {
+        if y < 0 || y >= pcx.statics.len() as i64 || !pcx.statics[y].mutable {
             continue;
         }
         let a = pcx.nodes[n].start;
         let b = pcx.nodes[n].end;
+        if token_at(a, pcx) >= 0 {
+            // (a borrowed root: read through its raw address, D6.2.5)
+            let how = borrowed_root(n, tr, pcx);
+            if how == 3 {
+                let q = parent_of(n, tr);
+                let w = buf_new();
+                buf_bytes(w, "&raw mut ");
+                edit_replace(pcx.nodes[q].start, a, w, &pcx);
+            } else if how > 0 {
+                let w = buf_new();
+                buf_bytes(w, if how == 2 { "(*(&raw mut " } else { "(*(&raw const " });
+                buf_bytes(w, SRC[a..b]);
+                buf_bytes(w, "))");
+                edit_replace(a, b, w, &pcx);
+            }
+        }
+        if in_unsafe(pcx.nodes[n].start, blocks, pcx) {
+            continue;
+        }
         if token_at(a, pcx) < 0 {
             // (a hole of a format literal: the local, read before)
             let at = statement_at(a, pcx);
