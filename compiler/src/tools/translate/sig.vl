@@ -2,7 +2,7 @@
 // parameter's convention written as Rust's type, a receiver as Rust's
 // self, a view `[T]` as `&[T]`.
 
-use crate::base::SRC;
+use crate::base::{IntVec, SRC};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::{NodeKind, child};
@@ -11,7 +11,7 @@ use crate::front::types::fn_param;
 use crate::middle::lower::ssa::HMap;
 use crate::tools::translate::{
     D_MUT, D_REF, D_VALUE, TC_DERIVE, TC_INOUT, TC_LET, TC_RECEIVER, TC_SINK, TC_TEXT, TC_TYPE,
-    TC_VIEW, Tr, add_ref, editable, is_ref, put, skip_ws, word_here,
+    TC_VIEW, Tr, add_ref, editable, is_ref, is_ws, put, skip_ws, word_here,
 };
 
 // The operator traits, whose methods take self and their operand by value
@@ -414,6 +414,139 @@ fn word_here_back(q: i64, w: [u8]) -> bool {
 
 // ---- Impls ----
 
+// (0.27.4) An impl of MVS's Allocator is std2's: `try_alloc(size, align)
+// -> *u8` (null: none) is `allocate(&self, layout) -> Result<NonNull<u8>,
+// AllocError>`, `try_resize(p, old_size, new_size, align)` is `grow` (and
+// `shrink`, which calls it: realloc does both), `free(p, size, align)` is
+// `deallocate(&self, p, layout)`. Each body is kept: its parameters are
+// bound from the layouts first, and a pointer it gives is the Result.
+fn allocator_impl_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind != NodeKind::Impl || !editable(pcx.nodes[n].start, &pcx)
+            || pcx.nodes[n].a <= 0 || pcx.nodes[n].b <= 0
+            || crate::base::sym_text(pcx.nodes[pcx.nodes[n].a].a, pcx) != "Allocator" {
+            continue;
+        }
+        for i in 0..pcx.nodes[n].count {
+            let f = child(n, i, pcx);
+            if pcx.nodes[f].kind != NodeKind::Fn || pcx.nodes[f].c <= 0 {
+                continue;
+            }
+            let m = crate::base::sym_text(pcx.nodes[f].a, pcx);
+            var ps = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            for j in 0..pcx.nodes[f].count {
+                let p = child(f, j, pcx);
+                if pcx.nodes[p].kind == NodeKind::Param {
+                    ps.push(pcx.nodes[p].a);
+                }
+            }
+            let want = if m == "try_alloc" { 3 } else if m == "try_resize" { 5 }
+                else if m == "free" { 4 } else { 0 };
+            if want == 0 || ps.count != want {
+                continue;
+            }
+            let body = pcx.nodes[f].c;
+            var q = pcx.nodes[f].start;
+            while q < pcx.nodes[body].start && !word_here(q, "fn") {
+                q += 1;
+            }
+            let bs = pcx.nodes[body].start;
+            let be = pcx.nodes[body].end - 1;
+            if q >= bs || SRC[bs] != '{' || SRC[be] != '}' {
+                continue;
+            }
+            let sig = crate::base::buf_new();
+            let open = crate::base::buf_new();
+            let close = crate::base::buf_new();
+            if m == "try_alloc" {
+                crate::base::buf_bytes(sig,
+                    "fn allocate(&self, __layout: Layout) -> Result<NonNull<u8>, AllocError> ");
+                bind(open, crate::base::sym_text(ps.get(1), pcx), "__layout.size() as i64");
+                bind(open, crate::base::sym_text(ps.get(2), pcx), "__layout.align() as i64");
+            } else if m == "try_resize" {
+                crate::base::buf_bytes(sig, "unsafe fn grow(&self, __p: NonNull<u8>, __old: Layout, __new: Layout) -> Result<NonNull<u8>, AllocError> ");
+                bind(open, crate::base::sym_text(ps.get(1), pcx), "__p.as_ptr()");
+                bind(open, crate::base::sym_text(ps.get(2), pcx), "__old.size() as i64");
+                bind(open, crate::base::sym_text(ps.get(3), pcx), "__new.size() as i64");
+                bind(open, crate::base::sym_text(ps.get(4), pcx), "__new.align() as i64");
+            } else {
+                crate::base::buf_bytes(sig,
+                    "unsafe fn deallocate(&self, __p: NonNull<u8>, __layout: Layout) ");
+                bind(open, crate::base::sym_text(ps.get(1), pcx), "__p.as_ptr()");
+                bind(open, crate::base::sym_text(ps.get(2), pcx), "__layout.size() as i64");
+                bind(open, crate::base::sym_text(ps.get(3), pcx), "__layout.align() as i64");
+            }
+            if m != "free" {
+                crate::base::buf_bytes(open, " NonNull::new({");
+                crate::base::buf_bytes(close, "}).ok_or(AllocError) ");
+            }
+            crate::tools::translate::rows::drop_inside(q, bs, &pcx);
+            if !crate::tools::edit::edit_replace(q, bs, sig, &pcx) {
+                continue;
+            }
+            tr.counts[TC_TYPE] += 1;
+            crate::tools::translate::rows::note_row_names(q, crate::base::buf_slice(sig), &tr,
+                &pcx);
+            crate::tools::edit::edit_replace(bs + 1, bs + 1, open, &pcx);
+            if m != "free" {
+                crate::tools::edit::edit_replace(be, be, close, &pcx);
+            }
+            if m == "try_resize" {
+                let sh = crate::base::buf_new();
+                crate::base::buf_bytes(sh, " unsafe fn shrink(&self, p: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<u8>, AllocError> { unsafe { self.grow(p, old, new) } }");
+                crate::tools::edit::edit_replace(pcx.nodes[f].end, pcx.nodes[f].end, sh, &pcx);
+            }
+        }
+    }
+}
+
+// ` let NAME = VALUE;` into out.
+fn bind(out: i64, name: [u8], value: [u8]) {
+    crate::base::buf_bytes(out, " let ");
+    crate::base::buf_bytes(out, name);
+    crate::base::buf_bytes(out, " = ");
+    crate::base::buf_bytes(out, value);
+    crate::base::buf_bytes(out, ";");
+}
+
+// (0.27.4) An impl of Iterator drops MVS's loop hints, `exact_len` (the
+// items left) and `at(k)` (the k-th left, read without advancing): Rust's
+// Iterator has neither (`nth` advances; ExactSizeIterator's `len` needs
+// an exact size_hint), and a `for` reads `next` alone. With an
+// `#[inline]` before one.
+fn iterator_impl_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind != NodeKind::Impl || !editable(pcx.nodes[n].start, &pcx)
+            || pcx.nodes[n].a <= 0 || pcx.nodes[n].b <= 0
+            || crate::base::sym_text(pcx.nodes[pcx.nodes[n].a].a, pcx) != "Iterator" {
+            continue;
+        }
+        for i in 0..pcx.nodes[n].count {
+            let f = child(n, i, pcx);
+            if pcx.nodes[f].kind != NodeKind::Fn {
+                continue;
+            }
+            let m = crate::base::sym_text(pcx.nodes[f].a, pcx);
+            if m != "exact_len" && m != "at" {
+                continue;
+            }
+            var s = pcx.nodes[f].start;
+            var q = s - 1;
+            while q > 0 && is_ws(SRC[q]) {
+                q -= 1;
+            }
+            if q >= 8 && SRC[q - 8..q + 1] == "#[inline]" {
+                s = q - 8;
+            }
+            crate::tools::translate::rows::drop_inside(s, pcx.nodes[f].end, &pcx);
+            let t = crate::base::buf_new();
+            if crate::tools::edit::edit_replace(s, pcx.nodes[f].end, t, &pcx) {
+                tr.counts[TC_TYPE] += 1;
+            }
+        }
+    }
+}
+
 // An impl of an operator trait gets its `type Output = Self;` (MVS's had
 // none); an impl of MVS's Eq is Rust's PartialEq, and Eq's empty impl
 // after it.
@@ -455,6 +588,8 @@ fn impl_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
             put(pcx.nodes[n].end, pcx.nodes[n].end, crate::base::buf_slice(b), -1, &tr, &pcx);
         }
     }
+    allocator_impl_edits(&tr, &pcx);
+    iterator_impl_edits(&tr, &pcx);
 }
 
 // An impl of MVS's Ord, whose `cmp` gives an i64 (negative, zero,
