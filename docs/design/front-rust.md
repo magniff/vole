@@ -1558,8 +1558,44 @@ for usize { type Output = T; .. }`, `for Range<usize> { type Output =
 
 **F20.4 (`IndexMut` and assignment).** `c[i] = e`, `c[i] += e`,
 `&mut c[i]`, `c[i].m()` with `m` taking `&mut self` (F6.2's `&mut`
-autoref) use `index_mut`; a `τ` with `Index` but no `IndexMut` is
-`error trait.unmet` naming `IndexMut` (E0594's shape).
+autoref) use `index_mut`; a `τ` with `Index` but no `IndexMut` keeps
+`index`, and the write through its `&` is borrowck.assign_immutable or
+borrow_immutable (rustc E0594, E0596). The same holds of `Deref` and
+`DerefMut` on the path (`w.x.push(..)` of a `w: W`, `W: DerefMut`), and
+of a Vec's `as_slice` and `as_mut_slice` (`v[i]`, 0.17).
+
+**F20.6 (where a place is used mutably, 0.27.5).** A place is used
+mutably when it is:
+- an assignment's target, `+=`'s included;
+- the operand of `&mut` or `&raw mut`;
+- the receiver of a method whose `self` is `&mut Self`, autoref'd
+  (F6.2), the method found either way (`v[0].push(x)`, `v[0].iter_mut()`,
+  in a closure's body too);
+- the scrutinee of a match, `if let` or `let else` with a `ref mut`
+  binding.
+
+On such a place every index and deref of its path, through fields and
+tuple fields, is IndexMut's, DerefMut's or `as_mut_slice`, each level
+(`m[i][j].push(x)`, `ps[0].x.push(x)`). The first two contexts are known
+before the place is checked (`Ctx.mut_place`, check::rust::on_mut_path).
+The last two are known only after it is, once the method is found or the
+pattern checked. The place is then made mutable after the fact, as
+rustc's `convert_place_derefs_to_mutable` does. Each index or deref read
+through Index or Deref keeps the IndexMut or DerefMut call it would be
+(`Ctx.mut_alt`, with its receiver's type as checked, keep_alt).
+place_to_mut puts that call in place and checks it as any other: its
+instance is the one made and called, and the superseded `index` is no
+longer called (its effects are not the caller's). The kept call takes its receiver by
+`&mut`, so the places under it are made mutable in turn. A container
+whose type still holds an unsolved type variable (FL1) is made mutable
+the same way. F26.3's `s[1..].make_ascii_uppercase()` on str is decided
+before the place is checked, as before. *Anchor:* `front/check/rust.vl:
+place_to_mut, keep_alt`, `synth_mode.vl: keep_mut_slice`,
+`calls/mod.vl: synth_method`, `convert/mod.vl: method_call`,
+`patterns/mod.vl: check_match`. Cases `rust_f_f20_index_mut_method_ok`,
+`rust_f_f20_deref_mut_method_ok`, `rust_f_f20_index_mut_ref_mut_pat_ok`,
+`rust_f_f20_index_mut_infer_ok`, `rust_f_f20_index_mut_method_err`,
+`rust_f_f20_index_mut_readonly_err`.
 
 **F20.5 (a tuple index of literals).** `g[(0, 1)]` with `G:
 Index<(usize, usize)>`: a tuple of unsuffixed literals takes its
