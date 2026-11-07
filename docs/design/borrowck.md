@@ -1942,6 +1942,47 @@ body needs `H_f` while it is being found (a recursive call's method):
   (`Iterator<Item = X>`'s `next` gives `H_f`'s item type, which the bound
   equates; with a bare `Iterator` bound rustc keeps it opaque).
 
+### §22 The opaque type-parameter instance
+
+**D22.1 (Ω).** For a template `g<T₁..Tₙ>` with a body, of a rust-edition
+program's own files, the *opaque instance* `g⟨Ω₁..Ωₙ⟩` substitutes for
+each `Tᵢ` a synthesized nominal type `Ωᵢ` (`front/opaque.vl`: a distinct
+type over `()`, its node a copy of `Tᵢ`'s with its bounds `Bᵢ`, named
+`Tᵢ` in messages). `slots(Ωᵢ) = []`; `needs_drop(Ωᵢ) = false`; `Ωᵢ:
+Copy` iff `Copy ∈ Bᵢ`; `Ωᵢ: Tr` iff a bound entails `Tr` (its
+supertraits, F2.2); `Ωᵢ: Send/Sync` iff declared (AT5); its `Fn*` bound
+is its only callable signature. An impl's method's template has the
+impl's parameters among its own and gets theirs too.
+
+**D22.1a (virtual calls).** In the opaque instance `x.m(..)` with `x:
+Ωᵢ` (or `&Ωᵢ`, `&mut Ωᵢ`), `Ωᵢ::m(..)` and `Tr::m(x, ..)`, with `m`
+declared by a trait `Tr` a bound of `Ωᵢ` entails, call the *virtual
+function* `Tr::m⟨Self := Ωᵢ⟩`: a function made once per (Tr, m, Ωᵢ)
+from the trait's declaration of `m`, its signature resolved with `Self
+= Ωᵢ` and the trait's parameters from the bound (`Tr<A>`: `A`); it has
+no body, is never checked as one and never lowered; the borrow checker
+reads its signature as any callee's (D4.1). A call of `x(..)` with an
+`Fn*(A..) -> R` bound is a virtual call of that signature. `Ωᵢ::Item`
+(`<Ωᵢ as Tr>::Item`) is the bound's equality when it has one
+(`Iterator<Item = X>`: `X`), else a fresh `Ω'` with the declaration's
+bounds (F11.2).
+
+**D22.2 (what runs on it).** The opaque instances are built after the
+concrete ones and type-checked and borrow-checked; they, and every
+instance and closure their checking makes, are left out of code
+generation (finish_program) and effects. An error in one is reported at
+the template's position, without an instance note, and not when an error
+is already reported at that position (a concrete instance's: D4.4's
+dedupe). std2's templates get theirs under `--std2-check` only (the
+`std2-check` row), as their bodies' borrow checking is (Z7).
+
+**D22.3 (the bound-only rule)** is front-rust.md §6's: it is what the
+opaque instance checks for every template, used or not; the concrete
+instances keep their own checks (D22.4: the two agree).
+
+`--emit-places=regions` prints `opaque: N templates` (the instances
+built).
+
 ## 23. std2 as the edition's std: the IR's rules (Z7–Z9)
 
 Z1–Z6 (one std per edition, the prelude, the compiler-known items, no
