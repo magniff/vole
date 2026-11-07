@@ -907,7 +907,37 @@ temporary (lifetime extension) with the annotation's type: `let d: &[u8]
 = &[1, 2, 3];` is `let t: [u8; 3] = [1, 2, 3]; let d: &[u8] = &t;`, so
 the literals are `u8`, not the default. *Anchor:* `front/check/temps.vl:
 annotate_temp`. Integer inference variables (a literal typed by a later
-statement, `let a = [1, 2]; f(&a)` with `f(&[u8])`) stay FL6's, 0.27.3.
+statement, `let a = [1, 2]; f(&a)` with `f(&[u8])`) are F18.5's.
+
+**F18.5 (integer inference variables: an open local).** In the rust
+edition an unannotated `let x = e;` binding one name, with `e` a literal
+tree (an unsuffixed integer literal, its negation, an array, a repeat or
+a tuple of literal trees, where a tuple's other elements are any
+value, an arithmetic operator of two literal trees), makes `x` **open**:
+its integer positions are inference variables. Until it is solved the
+local reads as its provisional type, the tree with `i32` at each
+variable. It is solved by its first use, in the order the function is
+checked, that gives its positions a type:
+(a) a check against an expected type (an argument, an annotation, the
+return or tail, a struct field, an assignment's target type, `&x` where
+`&τ` or `&[τ]` goes), matched with the provisional type where the
+variables are; (b) an operand of a binary operator whose other operand
+has a definite integer type (`i < v.len()`: `usize`); (c) the target of
+`x = e` or `x op= e` with `e` of a definite integer type (`s += m.v`);
+(d) a generic call's argument, placed with the untyped literals
+(F18.1 step (2)), so that it takes the type the other arguments or the
+expected type bind. These uses keep it open and are retyped when it is
+solved: `x op= lit`, `x = lit`, a comparison with a literal (`x < 10`)
+and a format hole (`println!("{x}")`, `{}` with `x`). Any other use
+closes it at its provisional type (the `i32` fallback, F18.3): a method
+receiver, `x as τ`, `let y = x`, a capture by a closure, a pattern's
+scrutinee (FL6 names each). A local still open at the function's end
+has the fallback. Solving retypes the local and the nodes typed through
+it in place, and a literal that does not fit its type is
+`arith.overflow`; after the function is checked nothing is open.
+*Anchor:* `front/check/literals.vl: open_let, solve_open`,
+`check_mode.vl: check_expr_inner`. MVS is unchanged: no local is open,
+its fallback is `i64`.
 
 ### F19 Small syntax
 
@@ -1425,16 +1455,20 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   through an unbounded `Deref` (D22.3).
 - **FL5 (no HR regions in bounds beyond D20.1's implicit binder).**
   `for<'a>` is 0.29.
-- **FL6 (integer literal default).** F18.3's context rule is rustc's;
-  the fallback `i32` is too, but vole does not run rustc's full
-  fallback after unification (a literal reaching no context through a
-  chain of generic calls is `i32` at once). Also, no float-literal
-  fallback interplay. (0.27.2: the fallback is still `i64`. Switching
-  it alone fails 206 of the 1,962 rust_/std2_/error cases, because a
-  literal is typed where it is met: `let a = [1, 2, 3]` is `[i32; 3]`
-  before `f(&a)` with `&[i64]`. It waits for integer inference
-  variables, resolved at the first constraining use, with the `i32`
-  fallback at the end of the function: 0.27.3.)
+- **FL6 (integer inference variables, F18.5; 0.27.3).** F18.3's context
+  rule and the `i32` fallback are rustc's, but vole's variables are
+  F18.5's open locals, solved by their first constraining use; rustc
+  unifies every `{integer}` of the function and falls back after. Each
+  early close rejects where rustc accepts, or picks `i32` where rustc
+  infers from a later use: a method receiver (`x.max(y)` then `f(x)`
+  with `f(u8)`), `x as τ`, `let y = x;` (no unification between two
+  locals: `x` is `i32` at once), a capture by a closure, a pattern's
+  scrutinee (`match x {..}`). A literal reaching no context through a
+  chain of generic calls is `i32` at once. No float-literal variables
+  (an unsuffixed float literal is `f64`). The general type variables
+  (a parameter fixed by a later statement, F18.2) are FL1's, 0.27.4.
+  (Lenient: a method call on an open local, `x.pow(2)`, is `i32`'s
+  method, where rustc says E0689, ambiguous numeric type.)
 - **FL7 (const evaluation).** F3.2's consts fold with `consteval.vl`'s
   language, smaller than rustc's const eval (no loops, no `if` over
   consts until 0.29).
