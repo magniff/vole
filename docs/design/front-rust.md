@@ -1105,8 +1105,28 @@ is checked no variable is left: none reaches code generation, effects,
 the caches or another function. An untyped literal or an open local
 (F18.5) checked where a variable goes gives it its provisional type at
 once (`v.push(1)`: `Vec<i32>`), and closes the local (FL6). MVS has no
-variables. *Anchor:* `front/check/infer.vl`, `generics/instantiate.vl:
-require_bound, infer_from`, `check_mode.vl: check_expr_inner`.
+variables.
+Stage 2 (0.27.4) adds three sources and one use. (d) A `_` written in a
+type in a function's body (`let f: FromFn<_> = from_fn(..)`, `let v:
+Vec<_, Gpa> = Vec::new_in(gpa)`, `let t: (i64, _) = (1, 2u8)`) is a
+fresh variable, solved as the others; one still free at the end is
+`type.infer` at the `_` ("cannot infer the type written `_` here", rustc
+E0282). (e) A projection of a variable, `<?ᵢ as Tr>::A` (the `Err` of
+`"4".parse()`'s `Result<F, F::Err>`), is a variable that depends on
+`?ᵢ`: when `?ᵢ` is solved it is the projection of the solution, so
+`let a: u32 = "4".parse().unwrap()` is inferred (`F` from the `let`, its
+`Err` then `ParseIntError`); it is free while `?ᵢ` is. (f) A closure
+argument whose parameter's bound mentions a free variable (`from_fn(||
+..)` where the hint is `FromFn<?ᵢ>`) is not bound by the hint: the
+closure's own inference fixes the parameter. And `e?` checked against
+an expected type checks the value it gives (the `Ok`'s or `Some`'s
+payload) against it first, by (a), before its error's conversion
+(`let n: u8 = s.parse()?`). A variant pattern checked against a
+variable's enum names its variant of the solution's when the function's
+check ends. *Anchor:* `front/check/infer.vl`, `generics/instantiate.vl:
+require_bound, infer_from`, `check_mode.vl: check_expr_inner`,
+`assoc.vl: projection`, `resolve.vl: resolve_type` (the `_`),
+`try_op.vl: check_try`.
 
 ### F19 Small syntax
 
@@ -1660,10 +1680,15 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   `b.push(1)`), and a variable fixed by an untyped literal takes `i32`
   at once where rustc keeps an `{integer}` that a later use may fix:
   `v.push(1); let b: u8 = v[0];` is rustc's `Vec<u8>` and vole's error
-  (`Vec<i32>`, FL6). No projection on a variable (`"4".parse().unwrap()`
-  with `F` from the expected type, `x.try_into()` from the arms) until
-  F18.6's stage 2. Cases `rust_f_f18_deferred_ok`,
-  `rust_f_f18_deferred_err`, `rust_f_fl1_literal_i32` (`// RUSTC-DIFFERS: FL1`).
+  (`Vec<i32>`, FL6). A projection of a variable is solved with it
+  (F18.6 (e)), but a method of a generic trait called on a variable's
+  value is a use that needs its type (`let r = x.try_into(); match r {
+  Ok(v) => .., }` with the target from the arms, rustc's; vole's
+  `type.infer`), and so is a `?` whose value is not checked against a
+  type (`let n = s.parse()?; Ok(n * 2)`: rustc's E0282 too, at the `*`).
+  Cases `rust_f_f18_deferred_ok`, `rust_f_f18_deferred_err`,
+  `rust_f_f18_stage2_ok`, `rust_f_f18_stage2_err`,
+  `rust_f_fl1_literal_i32` (`// RUSTC-DIFFERS: FL1`).
 - **FL2 (overlap by satisfiability, strict when undecidable).** F4.2
   errs on the side of `trait.overlap` where rustc's coherence (with
   negative reasoning on fundamental types and the orphan rule) would
