@@ -542,7 +542,7 @@ compiler works out what each function may do, and it will tell you:
 
 ```console
 $ volec query effects main guess.vl
-crate::main	alloc(Gpa) io global panic diverge
+crate::main	alloc(Gpa) io panic diverge
 ```
 
 That one line says `main` allocates memory from a `Gpa`, does

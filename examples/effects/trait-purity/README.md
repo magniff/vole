@@ -79,8 +79,8 @@ $ volec edit apply <<'EOF'
 >         h
 >     }
 > EOF
-main.vl:23:5: error[effect] 'Word::hash' implements 'Hash::hash', which is #[pure], but it uses a static (global): 'HASHES' at main.vl:24:9 is a static's (global) | help: pass the state in as a parameter, or remove #[pure] (the trait's) | try: volec query effects Word::hash --why global  [edited: <crate::Word as Hash>::hash]
-error edit.breaks: 1 new error; nothing written; the error: main.vl:23:5: 'Word::hash' implements 'Hash::hash', which is #[pure], but it uses a static (global): 'HASHES' at main.vl:24:9 is a static's (global)
+main.vl:23:5: error[effect] 'Word::hash' implements 'Hash::hash', which is #[pure], but it touches a static mut or a C static (static): 'HASHES' at main.vl:24:9 is a static's (static) | help: pass the state in as a parameter, or remove #[pure] (the trait's) | try: volec query effects Word::hash --why static  [edited: <crate::Word as Hash>::hash]
+error edit.breaks: 1 new error; nothing written; the error: main.vl:23:5: 'Word::hash' implements 'Hash::hash', which is #[pure], but it touches a static mut or a C static (static): 'HASHES' at main.vl:24:9 is a static's (static)
 try: volec edit apply --no-check
 [exit 1]
 ```

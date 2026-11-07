@@ -82,7 +82,7 @@ crate::parse_orders	alloc(Gpa) io panic diverge
 crate::total	none
 crate::by_customer	alloc(Gpa) panic
 count_items<Gpa>	alloc(Gpa) panic
-crate::main	alloc(Gpa) io global panic diverge
+crate::main	alloc(Gpa) io panic diverge
 ```
 
 `total` is `none`: no allocation, no I/O, no statics, and not even a

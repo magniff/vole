@@ -117,7 +117,7 @@ $ volec query effects crate
 crate::intern	alloc(Arena) panic unsafe
 lower_in<ScopedArena>	alloc(ScopedArena) panic
 answer<ScopedArena>	alloc(Gpa, Arena, ScopedArena) io panic diverge
-crate::main	alloc(Gpa, Arena) io global panic diverge
+crate::main	alloc(Gpa, Arena) io panic diverge
 ```
 
 (The guard's drop gives the keys' arena back to `Gpa`, in its own

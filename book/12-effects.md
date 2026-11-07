@@ -20,7 +20,7 @@ changing its `inout` arguments. The compiler knows six of them:
 |---|---|---|
 | `alloc(Gpa)` | allocates memory, from a `Gpa` | `Vec::push`, `String::from_in`, anything `_in` |
 | `io` | reads or writes outside the program | printing, files, stdin |
-| `global` | uses a global variable | a `static var`, std's stdin buffer |
+| `static` | touches a `static mut` or a C static (not shown in a set: `--why static`) | a `static var`, std's stdin buffer |
 | `panic` | may stop the program | a checked index, `unwrap`, `assert` |
 | `diverge` | may never return | `loop`, `while`, recursion |
 | `unsafe` | does unsafe operations itself | chapter 15 |
@@ -108,7 +108,7 @@ $ volec query effects crate stats.vl
 crate::mean	none
 crate::bucket	none
 crate::histogram	panic
-crate::main	alloc(Gpa) io global panic diverge
+crate::main	alloc(Gpa) io panic diverge
 ```
 
 Each line is a function and its effects. Let's read them.
@@ -119,15 +119,15 @@ Each line is a function and its effects. Let's read them.
   the program if `i` is out of range. (`bucket` keeps `i` in range, but
   the compiler doesn't follow the arithmetic that far.)
 - `main` does everything: it allocates (the `Vec`, the `String`), does
-  I/O (stdin and printing), uses a global (std keeps its stdin buffer
-  in one), may panic (the `unwrap`s), and may not return.
+  I/O (stdin and printing), touches a static (std keeps its stdin buffer
+  in one: `--why static` shows it), may panic (the `unwrap`s), and may not return.
 
 That last one is surprising: `main` has no loop that could run forever.
 When an effect surprises you, ask *why*:
 
 ```console
 $ volec query effects main --why diverge stats.vl
-crate::main	alloc(Gpa) io global panic diverge
+crate::main	alloc(Gpa) io panic diverge
   'read_stdin_in(gpa)' at stats.vl:24:17 calls 'std::io::read_stdin_in'
 ...
 ```
@@ -142,7 +142,7 @@ stdin may not return.
 
 ```console
 $ volec query effects main --why io stats.vl | head -2
-crate::main	alloc(Gpa) io global panic diverge
+crate::main	alloc(Gpa) io panic diverge
   'read_stdin_in(gpa)' at stats.vl:24:17 calls 'std::io::read_stdin_in'
 ```
 
@@ -151,7 +151,7 @@ module that have an effect:
 
 ```console
 $ volec query effects crate --has 'alloc(Gpa)' stats.vl
-crate::main	alloc(Gpa) io global panic diverge
+crate::main	alloc(Gpa) io panic diverge
 ```
 
 If you use the editor extension from chapter 1, hovering over a
@@ -226,7 +226,7 @@ mean: 4.17
 The attributes above a function are its *declared* effects, and the
 compiler checks them on every build:
 
-- `#[pure]` means no `alloc`, no `io`, no `global`. A pure function may
+- `#[pure]` means no `alloc`, no `io`, no `static`. A pure function may
   still panic, loop, and change its `inout` parameters: those are in its
   signature, and every call marks them with `&`. That's why `histogram`
   can be pure while it fills in `buckets`.
@@ -428,7 +428,7 @@ isn't used.
 ## Summary
 
 - An effect is what a call may do beyond its result and its `inout`
-  arguments: `alloc(A)`, `io`, `global`, `panic`, `diverge`, `unsafe`,
+  arguments: `alloc(A)`, `io`, `static`, `panic`, `diverge`, `unsafe`,
   and the thread effects `sync`, `thread` and `tls`.
 - The compiler infers every function's effects. `volec query effects`
   prints them, `--why` shows the chain of calls behind one, and `--has`

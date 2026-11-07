@@ -214,7 +214,7 @@ fix it, and an example:
 $ volec explain effect
 effect: error (compiler)
 (0.16) A function does more than its effect declaration allows (`#[pure]`, `#[no_alloc]`, `#[no_io]`, `#[no_panic]`, `#[effects(...)]`, or its trait method's), a closure more than its parameter's `effects(...)` bound, or a declaration names an unknown effect or a value instead of an allocator type.
-fix: Follow the chain (`volec query effects NAME --why EFFECT`) to the source and remove it, or widen the declaration; effects are alloc(A), io, global, panic, diverge, unsafe.
+fix: Follow the chain (`volec query effects NAME --why EFFECT`) to the source and remove it, or widen the declaration; effects are alloc(A), io, static, panic, diverge, unsafe.
 example:
     sum.vl:3:1: error[effect] 'total' is #[no_alloc], but it allocates from Gpa: 'v.push(x)' at sum.vl:7:9 grows a Vec<i64>
 ```
