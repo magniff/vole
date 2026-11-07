@@ -352,6 +352,26 @@ fn access_to_ref(n: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
     false
 }
 
+// The place block b of an `if` gives, `{ bck.live }` (a name, a field or
+// an element): 0 for another.
+fn if_branch_place(b: i64, pcx: Ctx<Comp>) -> i64 {
+    if b <= 0 || pcx.nodes[b].kind != NodeKind::Block || pcx.nodes[b].count != 0 {
+        return 0;
+    }
+    // (the checker's borrow of it: what it borrows)
+    var t = pcx.nodes[b].a;
+    if t > 0 && pcx.nodes[t].kind == NodeKind::Unary && SRC[pcx.nodes[t].start] != '&' {
+        t = pcx.nodes[t].b;
+    }
+    if t > 0
+        && (pcx.nodes[t].kind == NodeKind::Ident || pcx.nodes[t].kind == NodeKind::FieldAccess
+            || pcx.nodes[t].kind == NodeKind::Index) {
+        t
+    } else {
+        0
+    }
+}
+
 // A call of the program's function: each argument its parameter takes by
 // reference (D_REF: a let parameter of a type MVS does not copy) is
 // written `&e`, unless it is one already.
@@ -399,6 +419,16 @@ fn edit_call_args(c: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
         if e <= 0 || access_to_ref(e, tr, pcx) || pcx.nodes[e].kind == NodeKind::Closure
             || is_ref(pcx.nodes[e].ty, pcx) && SRC[pcx.nodes[e].start] == '&'
             || token_at(pcx.nodes[arg].start, pcx) < 0 {
+            continue;
+        }
+        // (an `if` of two places, `if c { bck.dlive } else { bck.live }`:
+        // each branch borrowed, `&if ..` would move out of them)
+        if pcx.nodes[e].kind == NodeKind::If && if_branch_place(pcx.nodes[e].b, pcx) > 0
+            && if_branch_place(pcx.nodes[e].c, pcx) > 0 {
+            let x = if_branch_place(pcx.nodes[e].b, pcx);
+            let y = if_branch_place(pcx.nodes[e].c, pcx);
+            put(pcx.nodes[x].start, pcx.nodes[x].start, "&", TC_BORROW, &tr, &pcx);
+            put(pcx.nodes[y].start, pcx.nodes[y].start, "&", TC_BORROW, &tr, &pcx);
             continue;
         }
         put(pcx.nodes[arg].start, pcx.nodes[arg].start, "&", TC_BORROW, &tr, &pcx);
@@ -801,10 +831,11 @@ fn param_is_display(fnode: i64, c: i64, n: i64, pcx: Ctx<Comp>) -> bool {
 }
 
 // A text literal MVS types as bytes, `[u8]`, given where the program
-// takes bytes (a parameter, a let's annotation, a result of `[u8]`) is
+// takes bytes (a parameter, the type written for a let, a static or a
+// constant, or for its array's elements, a result of `[u8]`) is
 // `b".."` (a literal is a str in the rust edition); so is a branch of an
-// `if` whose other branch is written bytes.
-fn edit_str(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+// `if` whose other branch is written or declared bytes.
+fn edit_str(n: i64, d: TextDecls, tr: inout Tr, pcx: inout Ctx<Comp>) {
     if tr.text_mode {
         return;
     }
@@ -829,15 +860,22 @@ fn edit_str(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
             bytes = fnode > 0 && editable(pcx.nodes[fnode].start, &pcx)
                 && param_is_slice(fnode, p, n, pcx);
         }
-    } else if pk == NodeKind::Let {
+    } else if pk == NodeKind::Let || pk == NodeKind::Static || pk == NodeKind::Const {
         let ann = pcx.nodes[p].b;
         bytes = ann > 0 && pcx.nodes[ann].kind == NodeKind::TySlice;
+    } else if pk == NodeKind::Array {
+        // (an element of a static or constant written `[[u8]; N]`)
+        let q = parent_of(p, tr);
+        let ann = if q > 0 && (pcx.nodes[q].kind == NodeKind::Static
+            || pcx.nodes[q].kind == NodeKind::Const) { pcx.nodes[q].b } else { 0 };
+        bytes = ann > 0 && pcx.nodes[ann].kind == NodeKind::TyArray && pcx.nodes[ann].a > 0
+            && pcx.nodes[pcx.nodes[ann].a].kind == NodeKind::TySlice;
     } else if pk == NodeKind::Block && pcx.nodes[p].a == n && if_other(p, tr, pcx) > 0 {
         // (a branch of an `if` the other branch of which is bytes,
         // `if c { "" } else { sym_text(s) }`)
         let o = if_other(p, tr, pcx);
         bytes = written_bytes(if pcx.nodes[o].kind == NodeKind::Block { pcx.nodes[o].a } else { o },
-            pcx);
+            pcx) || declared_bytes(o, 0, d, pcx);
         if !bytes {
             let f = enclosing_fn(pcx.nodes[n].start, pcx);
             let r = if f > 0 { pcx.nodes[f].b } else { 0 };
@@ -1148,13 +1186,15 @@ fn str_type_node(tn: i64, pcx: Ctx<Comp>) -> bool {
 // expression's erased `[u8]` type was written as): binds holds from, to,
 // name and the Param or Let node of each binding, in [from, to) its
 // scope (its block or function); fields the field names declared `str`
-// (1), `[u8]` (2) or both (3).
-struct TextDecls { binds: IntVec, fields: HMap }
+// (1), `[u8]` (2) or both (3); statics the statics and constants written
+// `[u8]` (1) or `[[u8]; N]` (2).
+struct TextDecls { binds: IntVec, fields: HMap, statics: HMap }
 
 fn text_decls(tr: Tr, pcx: inout Ctx<Comp>) -> TextDecls {
     var d = TextDecls {
         binds: IntVec { data: 0 as *i64, count: 0, cap: 0 },
         fields: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
+        statics: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
     };
     for n in 1..pcx.nodes.len() as i64 {
         let k = pcx.nodes[n].kind;
@@ -1166,6 +1206,17 @@ fn text_decls(tr: Tr, pcx: inout Ctx<Comp>) -> TextDecls {
             if w > 0 {
                 let key = pcx.nodes[n].a + 1;
                 d.fields.put(key, d.fields.get(key) | w);
+            }
+            continue;
+        }
+        if k == NodeKind::Static || k == NodeKind::Const {
+            // (`SRC[a..b]`, `KNOWN[i]`)
+            let t = pcx.nodes[n].b;
+            if t > 0 && pcx.nodes[t].kind == NodeKind::TySlice {
+                d.statics.put(pcx.nodes[n].a + 1, 1);
+            } else if t > 0 && pcx.nodes[t].kind == NodeKind::TyArray && pcx.nodes[t].a > 0
+                && pcx.nodes[pcx.nodes[t].a].kind == NodeKind::TySlice {
+                d.statics.put(pcx.nodes[n].a + 1, 2);
             }
             continue;
         }
@@ -1256,6 +1307,111 @@ fn declared_text(e: i64, depth: i64, d: TextDecls, pcx: Ctx<Comp>) -> bool {
             let t = if fnode > 0 { pcx.nodes[fnode].b } else { 0 };
             return t > 0 && pcx.nodes[t].kind != NodeKind::TySlice;
         }
+    }
+    false
+}
+
+// (0.27.5) The binding in d that Ident e names, its index in d.binds
+// (the innermost one whose scope holds e), or -1: a static, a function.
+fn bound_at(e: i64, d: TextDecls, pcx: Ctx<Comp>) -> i64 {
+    let pos = pcx.nodes[e].start;
+    var best: i64 = -1;
+    var i: i64 = 0;
+    while i + 3 < d.binds.count {
+        if d.binds.get(i + 2) == pcx.nodes[e].a && d.binds.get(i) <= pos
+            && pos < d.binds.get(i + 1) && (best < 0 || d.binds.get(i) > d.binds.get(best)) {
+            best = i;
+        }
+        i += 4;
+    }
+    best
+}
+
+// (0.27.5) Whether branch b of an `if` is a text literal edit_str writes
+// `b".."`: its other branch o is a call written `[u8]`
+// (`if c { "" } else { sym_text(s) }`) or declared bytes.
+fn byte_literal_branch(b: i64, o: i64, depth: i64, d: TextDecls, pcx: Ctx<Comp>) -> bool {
+    if b <= 0 || o <= 0 || pcx.nodes[b].kind != NodeKind::Block {
+        return false;
+    }
+    let t = pcx.nodes[b].a;
+    if t <= 0 || SRC[pcx.nodes[t].start] != '"' {
+        return false;
+    }
+    written_bytes(if pcx.nodes[o].kind == NodeKind::Block { pcx.nodes[o].a } else { o }, pcx)
+        || declared_bytes(o, depth + 1, d, pcx)
+}
+
+// (0.27.5) Whether expression e of the erased type `[u8]` is bytes where
+// it is declared, positively: a binding written `[u8]` (or initialized
+// so), a field declared `[u8]`, a call of a function whose result is
+// written `[u8]` (or of a function value), a part of such a value or of a
+// Vec or a buffer, a block's value that is, a static or constant written
+// `[u8]` or an element of one written `[[u8]; N]`, a borrow of such a
+// value, an `if` both of whose branches are (or one is and the other a
+// literal edit_str writes `b".."`). Not a literal, a pattern's binding
+// or an element of a local array of views: they may be text, and `str::from_utf8("..")` is no Rust (0.27.4's gate 2: 230 of
+// the rustc twin's rejections).
+fn declared_bytes(e: i64, depth: i64, d: TextDecls, pcx: Ctx<Comp>) -> bool {
+    if e <= 0 || depth > 8 {
+        return false;
+    }
+    let k = pcx.nodes[e].kind;
+    if k == NodeKind::Ident {
+        let best = bound_at(e, d, pcx);
+        if best < 0 {
+            return d.statics.get(pcx.nodes[e].a + 1) == 1;
+        }
+        let b = d.binds.get(best + 3);
+        if pcx.nodes[b].kind == NodeKind::Param || pcx.nodes[b].b > 0 {
+            let t = pcx.nodes[b].b;
+            return t > 0 && pcx.nodes[t].kind == NodeKind::TySlice;
+        }
+        return declared_bytes(pcx.nodes[b].c, depth + 1, d, pcx);
+    }
+    if k == NodeKind::FieldAccess {
+        let w = d.fields.get(pcx.nodes[e].b + 1);
+        if w == 2 {
+            return true;
+        }
+        return w == 3 && !declared_text(e, depth, d, pcx);
+    }
+    if k == NodeKind::Call {
+        // (a function value's call, `h(e)`: no declaration to read, bytes as
+        // its type says)
+        let f = pcx.nodes[e].x - 1;
+        return f < 0 || f >= pcx.fns.len() as i64 || written_bytes(e, pcx);
+    }
+    if k == NodeKind::Block {
+        // (the checker's form of a call such as `nm(e).unwrap()`: its tail)
+        return pcx.nodes[e].a > 0 && declared_bytes(pcx.nodes[e].a, depth + 1, d, pcx);
+    }
+    if k == NodeKind::Unary && pcx.nodes[e].op == Tok::Amp {
+        return declared_bytes(pcx.nodes[e].b, depth + 1, d, pcx);
+    }
+    if k == NodeKind::If {
+        // (both branches, `if c { &s[1..] } else { s }`, a literal one only
+        // where edit_str writes it `b".."`)
+        let b = pcx.nodes[e].b;
+        let c = pcx.nodes[e].c;
+        return c > 0
+            && (declared_bytes(b, depth + 1, d, pcx) || byte_literal_branch(b, c, depth, d, pcx))
+            && (declared_bytes(c, depth + 1, d, pcx) || byte_literal_branch(c, b, depth, d, pcx));
+    }
+    if k == NodeKind::Index {
+        let a = pcx.nodes[e].a;
+        let r = pcx.nodes[e].b;
+        if a > 0 && r > 0 && pcx.nodes[r].kind != NodeKind::Range {
+            // (an element of a static or constant written `[[u8]; N]`)
+            return pcx.nodes[a].kind == NodeKind::Ident && bound_at(a, d, pcx) < 0
+                && d.statics.get(pcx.nodes[a].a + 1) == 2;
+        }
+        if a <= 0 || r <= 0 {
+            return false;
+        }
+        let at = pcx.nodes[a].ty;
+        return at > 0 && pcx.types[at].kind != TyKind::Slice
+            || declared_bytes(a, depth + 1, d, pcx);
     }
     false
 }
@@ -1372,15 +1528,15 @@ fn printed_value(a: i64, b: i64) -> bool {
 // (0.27.4) A `[u8]` value a program that uses bytes as bytes too prints
 // as text (a Display hole, `{x}` or `{}`): Rust's [u8] has no Display, so
 // the hole is given `str::from_utf8(x).unwrap()` (MVS's text is UTF-8;
-// a byte sequence that is not panics where MVS wrote it). A name in the
+// a byte sequence that is not panics where MVS wrote it), when it is
+// bytes where it is declared (declared_bytes: not a literal). A name in the
 // literal gets the named argument `x = ..` at the end of the literal's
 // call; an argument after the literal is wrapped. One declared `str` is
 // a `&str` already; any other is left to hand (TL_BYTES).
-fn edit_byte_holes(tr: inout Tr, pcx: inout Ctx<Comp>) {
+fn edit_byte_holes(decls: TextDecls, tr: inout Tr, pcx: inout Ctx<Comp>) {
     if tr.text_mode {
         return;
     }
-    let decls = text_decls(tr, &pcx);
     var named = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
     for n in 1..pcx.nodes.len() as i64 {
         // (a hole, or the value of `println(x)`, which is `println("{}", x)`)
@@ -1392,7 +1548,7 @@ fn edit_byte_holes(tr: inout Tr, pcx: inout Ctx<Comp>) {
         }
         let e = if hole { pcx.nodes[n].a } else { n };
         if e <= 0 || !byte_slice(pcx.nodes[e].ty, pcx) || !editable(pcx.nodes[e].start, &pcx)
-            || declared_text(e, 0, decls, pcx) {
+            || !declared_bytes(e, 0, decls, pcx) {
             continue;
         }
         let a = pcx.nodes[e].start;
@@ -1450,7 +1606,7 @@ fn edit_byte_holes(tr: inout Tr, pcx: inout Ctx<Comp>) {
             let e = if arg > 0 && pcx.nodes[arg].kind == NodeKind::NamedArg { pcx.nodes[arg].b }
                 else { arg };
             if e <= 0 || !byte_slice(pcx.nodes[e].ty, pcx) || token_at(pcx.nodes[e].start, pcx) < 0
-                || pcx.nodes[e].start <= pcx.nodes[c].start || declared_text(e, 0, decls, pcx)
+                || pcx.nodes[e].start <= pcx.nodes[c].start || !declared_bytes(e, 0, decls, pcx)
                 || !param_is_display(fnode, c, e, pcx) {
                 continue;
             }
@@ -1482,6 +1638,7 @@ pub fn body_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
             edit_static(n, &tr, &pcx);
         }
     }
+    let decls = text_decls(tr, &pcx);
     for n in 1..pcx.nodes.len() as i64 {
         let k = pcx.nodes[n].kind;
         if !own_node(n, tr, &pcx) {
@@ -1502,7 +1659,7 @@ pub fn body_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
                 edit_ptr_index(n, &tr, &pcx);
             }
         } else if k == NodeKind::Str {
-            edit_str(n, &tr, &pcx);
+            edit_str(n, decls, &tr, &pcx);
         } else if k == NodeKind::Char {
             edit_char(n, &tr, &pcx);
         } else if k == NodeKind::Int {
@@ -1519,5 +1676,5 @@ pub fn body_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
         }
     }
     edit_prints(&tr, &pcx);
-    edit_byte_holes(&tr, &pcx);
+    edit_byte_holes(decls, &tr, &pcx);
 }
