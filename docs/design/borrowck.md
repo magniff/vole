@@ -247,10 +247,14 @@ ends there: `f(pcx.nodes[p].start, pcx)` (the slice view of
 the old value, as Rust's left-to-right order says: `f(x, { x += 1; x })`
 passes the old `x` first, `f(s.x, &mut s)` and `g(y, &mut y)` are
 accepted. Exempt (read in place, as before): a whole temporary of the
-builder's (no later operand names it), and the last operand of its
-statement when nothing it reads holds a loan, a place of a local whose
-type has no region slot reached by field and constant-index steps only
-(no deref, no index). Moves are unchanged (D8.5's in-order rule; a
+builder's (no later operand names it); a whole local whose type has a
+region slot (a reference: the callee holds its loan anyway, and D2.7
+reads the receiver it names); the last operand of its statement when it
+is a whole local or reads no loan (a place of a local whose type has no
+region slot, reached by field and constant-index steps only: no deref,
+no index); and an assignment's right side when the assigned place
+evaluates with no statement of its own (a name, and `*`, `.f`, `.0` of
+one: `*b += *a`). Moves are unchanged (D8.5's in-order rule; a
 rust-edition argument moved out of a place already gets its own `_t =
 move P`). MVS keeps the deferred read. Consequences: `x = &mut *x`
 (`x: &'x mut T`):
