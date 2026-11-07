@@ -15,7 +15,7 @@ use crate::front::ast::{NodeKind, child};
 use crate::front::types::{TyKind, buf_type};
 use crate::tools::edit::edit_replace;
 use crate::tools::translate::{
-    TC_STD, TL_ROW, Tr, editable, is_ref, own_node, parent_of, token_at, word_here,
+    TC_STD, TL_ROW, Tr, editable, is_ref, left, own_node, parent_of, token_at, word_here,
 };
 
 // ---- The text so far ----
@@ -395,10 +395,36 @@ fn inline_closure(k: i64, t: [u8], open: usize, out: i64, pcx: Ctx<Comp>) -> i64
     (q + 1) as i64
 }
 
+// The allocator in scope at call c, for a row's `$a` when the call has
+// none (MVS's `thread::spawn(f)` allocated from C): the `Gpa` parameter
+// of the innermost function around it that has one, by position (main's
+// is not in its list once checked), or "".
+fn scope_allocator(c: i64, pcx: Ctx<Comp>) -> [u8] {
+    let pos = pcx.nodes[c].start;
+    var outer = SRC.len() as i64;
+    for f in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[f].kind == NodeKind::Fn && pcx.nodes[f].start <= pos && pos < pcx.nodes[f].end
+            && pcx.nodes[f].start < outer {
+            outer = pcx.nodes[f].start;
+        }
+    }
+    var best = -1;
+    for p in 1..pcx.nodes.len() as i64 {
+        let t = pcx.nodes[p].b;
+        if pcx.nodes[p].kind == NodeKind::Param && pcx.nodes[p].start >= outer
+            && pcx.nodes[p].start < pos && (best < 0 || pcx.nodes[p].start > pcx.nodes[best].start)
+            && t > 0 && pcx.nodes[t].kind == NodeKind::TyName
+            && SRC[pcx.nodes[t].start..pcx.nodes[t].end] == "Gpa" && pcx.nodes[p].a > 0 {
+            best = p;
+        }
+    }
+    if best > 0 { sym_text(pcx.nodes[best].a, pcx) } else { "" }
+}
+
 // The text of a row's rust column t with the call's operands: recv the
 // receiver's (-1: none), args the arguments' nodes (the receiver not among
-// them), alloc the allocator's index in args (-1: none). Empty when an
-// operand it names is missing.
+// them), alloc the allocator's index in args (-1: none: `$a` is the
+// allocator in scope). Empty when an operand it names is missing.
 fn expand(t: [u8], c: i64, recv: i64, args: IntVec, alloc: i64, out: i64, pcx: Ctx<Comp>) -> bool {
     var trailing = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     var in_str = false;
@@ -427,6 +453,13 @@ fn expand(t: [u8], c: i64, recv: i64, args: IntVec, alloc: i64, out: i64, pcx: C
                 node = recv;
             } else if nx == 'a' {
                 node = if alloc >= 0 { args.get(alloc) } else { -1 };
+                // (none given: the allocator in scope, by its name)
+                let s = if node < 0 { scope_allocator(c, pcx) } else { "" };
+                if s.len > 0 {
+                    buf_bytes(out, s);
+                    i += 2;
+                    continue;
+                }
             } else if nx == 'T' {
                 if pcx.nodes[c].ty <= 0 {
                     return false;
@@ -681,6 +714,114 @@ fn note_row_names(at: i64, text: [u8], tr: inout Tr, pcx: inout Ctx<Comp>) {
         tr.row_names.push(crate::base::intern(text[i..j], &pcx));
         tr.row_names.push(at);
         i = j;
+    }
+}
+
+// (0.27.4) The type rows (rewrite.tsv's `type ..`): an MVS std type's name
+// written in a type, `Arena`, `Fmt`, `Buf<A>`, is the row's type (`Arena<Gpa>`,
+// `Formatter<'_>`, `Vec<u8, A>`). Its arguments keep their text (and the
+// edits in it): the row's text between its `$1`, `$2`, ... replaces the
+// name, the separators and the end, which a row with its arguments in
+// order and each once allows; another row is left to hand. A name the
+// program declares itself is its own.
+pub fn type_row_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    var own = crate::middle::lower::ssa::HMap {
+        keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0,
+    };
+    for n in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[n].kind;
+        if (k == NodeKind::Struct || k == NodeKind::Enum || k == NodeKind::TypeAlias
+            || k == NodeKind::Trait) && editable(pcx.nodes[n].start, &pcx) {
+            own.put(pcx.nodes[n].a + 1, 1);
+        }
+    }
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind != NodeKind::TyName || !own_node(n, tr, &pcx)
+            || own.get(pcx.nodes[n].a + 1) != 0 {
+            continue;
+        }
+        let s = pcx.nodes[n].start;
+        let e = pcx.nodes[n].end;
+        // (its name, up to its arguments)
+        var ne = s;
+        while ne < e && SRC[ne] != '<' {
+            ne += 1;
+        }
+        // (a std path, `std::Arena`, `thread::JoinHandle`: its last
+        // segment; the row's names are imported)
+        var name = SRC[s as usize..ne as usize];
+        if word_here(s, "crate") || word_here(s, "super") || word_here(s, "self") {
+            continue;
+        }
+        var q0: usize = 0;
+        while q0 + 1 < name.len {
+            if name[q0] == ':' && name[q0 + 1] == ':' {
+                name = name[q0 + 2..name.len];
+                q0 = 0;
+            } else {
+                q0 += 1;
+            }
+        }
+        var r: i64 = -1;
+        var i: i64 = 0;
+        while i + 3 < tr.rows.count && r < 0 {
+            let t = buf_slice(tr.rows.get(i + 2));
+            if buf_slice(tr.rows.get(i)) == name && t.len > 5 && t[0..5] == "type " {
+                r = i;
+            }
+            i += 4;
+        }
+        if r < 0 {
+            continue;
+        }
+        let row = buf_slice(tr.rows.get(r + 2));
+        let t = row[5..row.len];
+        // (the row's text cut at its `$k`s: pieces[k] before `$k+1`)
+        var cuts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var ok = true;
+        var q: usize = 0;
+        while q < t.len {
+            if t[q] == '$' && q + 1 < t.len && t[q + 1] >= '1' && t[q + 1] <= '9' {
+                if (t[q + 1] - '0') as i64 != cuts.count / 2 + 1 {
+                    ok = false;
+                }
+                cuts.push(q as i64);
+                cuts.push(q as i64 + 2);
+                q += 2;
+            } else {
+                q += 1;
+            }
+        }
+        let m = cuts.count / 2;
+        // (its type arguments: the Generics node g holds them)
+        let g = pcx.nodes[n].g;
+        let args = if g > 0 { pcx.nodes[g].count } else { 0 };
+        if !ok || m != args {
+            left(s, TL_ROW, &tr, &pcx);
+            continue;
+        }
+        note_row_names(s, t, &tr, &pcx);
+        var from = s;
+        var piece: i64 = 0;
+        for k in 0..m + 1 {
+            let to = if k < m { pcx.nodes[child(g, k, pcx)].start } else { e };
+            let a = if k == 0 { 0 } else { cuts.get(2 * k - 1) };
+            let b = if k < m { cuts.get(2 * k) } else { t.len as i64 };
+            let text = t[a as usize..b as usize];
+            if SRC[from as usize..to as usize] != text {
+                let w = buf_new();
+                buf_bytes(w, text);
+                if editable(from, &pcx) && edit_replace(from, to, w, &pcx) {
+                    piece += 1;
+                }
+            }
+            if k < m {
+                from = pcx.nodes[child(g, k, pcx)].end;
+            }
+        }
+        if piece > 0 {
+            tr.counts[crate::tools::translate::TC_TYPE] += 1;
+        }
     }
 }
 
