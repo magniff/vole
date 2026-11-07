@@ -237,8 +237,14 @@ the reservation is still shared; the IR has `copy _1.0` as an operand
 of the call, not a statement before it). (0.27.5) In a rust body an
 operand is read where it is evaluated, as rustc's `as_operand`: a Copy
 place operand of a call argument (or a callee value), of an array,
-tuple, struct or variant literal's element, or of an assignment's right
-side (`=` and `op=`) is copied into a fresh temporary at that point,
+tuple, struct or variant literal's element, of an assignment's right
+side (`=` and `op=`), or of a primitive binary operator's left side when
+its right side may evaluate a statement of its own (anything but a
+literal, a constant, a place evaluated with no statement as below, or a
+unary, binary or cast operator of those: `pcx.nodes[n].a ==
+intern(c"Self", pcx)` is accepted, `x + f(&mut x)` adds the old `x`;
+rustc's `as_operand` of a binary operator's operands, 0.27.5 front
+gate 3) is copied into a fresh temporary at that point,
 `_t = copy P`, and the statement reads `copy _t`. So a view or a
 reference it reads through is dead after the copy (D3.7) and its loan
 ends there: `f(pcx.nodes[p].start, pcx)` (the slice view of
@@ -393,6 +399,30 @@ loan of one is `borrowck.borrow_immutable` (E0596, "cannot borrow
 `*s` as mutable"). An MVS program's `own.readonly` is the same rule's
 MVS spelling; with the own pass off on std2 (Z8) it is this one, for
 std2's bodies too.
+
+**D2.8 (constant promotion, in the body; 0.27.5).** In a rust body a
+shared borrow of a *promotable* rvalue `e` (`&e`, or `&e` made a shared
+slice, `&[T]`) borrows a temporary whose storage is the body's: it has
+no `StorageLive`, and its `StorageDead` is the body's scope's (at every
+return, D6.2.2), so the end of its statement's or branch's scope does
+not end the loan (rustc's promotion; no E0716):
+`let list: &[&str] = if sub { &["sub", "checked_sub"] } else { &["add"]
+}; list.len()` is accepted. Promotable, rustc's `promote_consts`
+narrowed: a literal (integer, float, char, bool, string, C string,
+`()`), `-` of a numeric literal, an array or tuple literal of
+promotable elements, `[e; N]` of a promotable `e`. Not promotable: a
+name (a local, or a const: `&N` stays L2), a call or a method call
+(`&[String::new()]`, `&Cell::new(1)`), a struct or variant literal, any
+other operator, a block, a cast; a `&mut` borrow (rustc promotes only
+`&mut []`); any MVS body. A promotable value has no drop glue and no
+interior mutability (no `UnsafeCell` can be in it: every one is made
+by a call), so evaluating the temporary again (a loop's) writes the
+same value, and it is never dropped. Divergence (L2, kept): the
+temporary is the function's, not `'static`. A reference to it that
+outlives the function (`fn g() -> &'static [i64] { &[1, 2] }`) is still
+`borrowck.return_local`. A loop that holds the last iteration's
+reference while it evaluates the borrow again is
+`borrowck.assign_borrowed`, where rustc has a single static.
 
 ## 3. Regions (S3)
 
@@ -1243,9 +1273,17 @@ outside the holes named below.
   `borrowck.return_local`), `&[]` and `&mut []` (rustc promotes the
   empty array): std2 writes an empty `&mut [T]` from a dangling pointer
   (slice.vl's `empty_mut`). Case `rust_b_err_promote_const`.
+  (0.27.5) Narrowed by D2.8: a promotable rvalue's temporary is the
+  body's, so a borrow of one used after its statement or branch is
+  accepted; one that escapes the function is still refused.
 - L3 Temporaries' scopes are vole's (the statement; the block for `let
   r = &f(x)`), not Rust 2024's tail-expression rule: a difference only
-  in `match`/block tail temporaries. (0.27.3) In the rust edition the
+  in `match`/block tail temporaries. (0.27.5) Nor rustc's extension of a `let`
+  initializer's temporaries through the tails of an `if`'s and a
+  `match`'s branches (Rust 1.79): `let l: &[i64] = if c { &[x, 1] }
+  else { &[2] }; l.len()` is accepted by rustc and refused here
+  (`borrowck.dropped_borrowed`) unless every operand is promotable
+  (D2.8). (0.27.3) In the rust edition the
   condition of an `if` and a match arm's guard are terminating scopes,
   as a `while`'s condition already was (the Rust reference, "Temporary
   scopes"): their temporaries drop once the condition or the guard is
