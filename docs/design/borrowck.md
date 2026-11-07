@@ -2015,12 +2015,26 @@ bounds (F11.2).
 
 **D22.2 (what runs on it).** The opaque instances are built after the
 concrete ones and type-checked and borrow-checked; they, and every
-instance and closure their checking makes, are left out of code
-generation (finish_program) and effects. An error in one is reported at
-the template's position, without an instance note, and not when an error
+instance with an Ω among its type arguments (or a virtual function's,
+its `Self` an Ω) and the closures in them, are left out of code
+generation (finish_program) and effects; an instance without one that
+their checking makes first (`println::<&str>`) is lowered as any. An
+instance of a std template with an Ω is type-checked only: std's bodies
+are borrow-checked as std's (Z7). An error in one is reported at the
+template's position, without an instance note, and not when an error
 is already reported at that position (a concrete instance's: D4.4's
 dedupe). std2's templates get theirs under `--std2-check` only (the
 `std2-check` row), as their bodies' borrow checking is (Z7).
+
+In 0.27.2.1 the type check reports only D22.3's error, and only for a
+parameter's own Ω in a template without a `where` predicate; every
+other type error in an opaque instance leaves it out, unreported and
+not counted, as it may be the model's gap and not the program's:
+operators on an Ω (`a + b` with `T: Add<Output = T>`, `==` with
+`PartialEq`), a bound's type arguments (`T: AsRef<str>`), `T::f()` and
+`T::CONST`, `where` predicates on projections (`X::Item: Show`). The
+borrow checker's errors are reported in full. Each gap closes in
+0.27.3 (front-rust.md FL11).
 
 **D22.3 (the bound-only rule)** is front-rust.md §6's: it is what the
 opaque instance checks for every template, used or not; the concrete

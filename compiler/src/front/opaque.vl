@@ -27,9 +27,12 @@
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{err_begin, err_end, err_end_soft, err_help, err_jump, err_str, err_sym};
-use crate::front::ast::{NodeKind, TY_OPAQUE, child, list_begin, list_end, list_push, new_node};
+use crate::front::ast::{
+    FN_BODY_FAILED, FN_INTRINSIC, FN_SIG_FAILED, NodeKind, TY_OMEGA, TY_OPAQUE, child, list_begin,
+    list_end, list_push, new_node,
+};
 use crate::front::traits::{bound_trait, trait_supers};
-use crate::front::types::{ENUMS, TY_NEVER, TyKind, err_type, make_type, ref_to, type_elem};
+use crate::front::types::{ENUMS, TY_NEVER, TY_UNIT, TyKind, err_type, make_type, ref_to, type_elem};
 
 pub fn is_opaque_node(n: i64, pcx: Ctx<Comp>) -> bool {
     n > 0 && pcx.nodes[n].kind == NodeKind::TyName && (pcx.nodes[n].p & TY_OPAQUE) != 0
@@ -225,9 +228,10 @@ pub fn result_value(e: i64, got: i64, t: i64, pcx: inout Ctx<Comp>) {
     err_jump(&pcx)
 }
 
-// Whether type t is or holds opaque type o (to a small depth).
+// Whether type t is or holds opaque type o (o < 0: any Ω) (to a small
+// depth).
 fn mentions(t: i64, o: i64, depth: i64, pcx: Ctx<Comp>) -> bool {
-    if t == o {
+    if t == o || o < 0 && t > 0 && is_omega(t, pcx) {
         return true;
     }
     if t <= 0 || depth > 8 {
@@ -355,6 +359,16 @@ pub fn reveal_receiver(n: i64, receiver: i64, rt: i64, name: i64, pcx: inout Ctx
     if o == 0 {
         return rt;
     }
+    // RULE: D22.1a, D22.3 (an Ω: a bound's method is its virtual function,
+    // found as its method; else a blanket impl's; else none:
+    // generic.unbounded_use, rustc E0599)
+    if is_omega(o, pcx) {
+        if virtual_fn(o, name, &pcx) >= 0
+            || crate::front::check::calls::pattern_method_of(o, name, &pcx) >= 0 {
+            return rt;
+        }
+        unbounded_method_error(n, o, name, &pcx);
+    }
     if !bound_method(o, name, &pcx) {
         // (a blanket impl's method that the bounds entail, `impl<I:
         // Iterator> IntoIterator for I`: of the opaque type itself)
@@ -383,6 +397,18 @@ pub fn reveal_callee(callee: i64, ct: i64, pcx: inout Ctx<Comp>) -> i64 {
     if o == 0 || fn_bound(pcx.types[o].b, pcx) == 0 {
         return ct;
     }
+    // RULE: D22.1a (an Ω's `Fn*` bound: a call of its signature)
+    if is_omega(o, pcx) {
+        let sig = fn_bound_sig(o, &pcx);
+        if sig != 0 {
+            // (through a reference: `pred(x)` with `pred: &mut F`, a
+            // reference to the fn pointer, which fn_through_ref calls)
+            let r = revealed(ct, o, sig, &pcx);
+            pcx.nodes[callee].ty = r;
+            return r;
+        }
+        return ct;
+    }
     let h = hidden(o, pcx.nodes[callee].start, &pcx);
     let r = revealed(ct, o, h, &pcx);
     pcx.nodes[callee].ty = r;
@@ -392,8 +418,361 @@ pub fn reveal_callee(callee: i64, ct: i64, pcx: inout Ctx<Comp>) -> i64 {
 // RULE: D21.3 A `Fn*` bound on a value of type t: an opaque type with an
 // `Fn*` bound of its own is checked as its hidden closure.
 pub fn fn_bound_type(t: i64, pos: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if is_omega(t, pcx) {
+        let sig = fn_bound_sig(t, &pcx);
+        return if sig != 0 { sig } else { t };
+    }
     if is_opaque(t, pcx) && fn_bound(pcx.types[t].b, pcx) != 0 {
         return hidden(t, pos, &pcx);
     }
     t
+}
+
+// The fn type of Ω t's `Fn*` bound (its types in the scope it is used
+// in), or 0.
+fn fn_bound_sig(t: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let fnb = fn_bound(pcx.types[t].b, pcx);
+    if fnb == 0 {
+        return 0;
+    }
+    let mark = pcx.tscratch.count;
+    for i in 0..pcx.nodes[fnb].count {
+        let pt = resolve_quietly(child(fnb, i, pcx), &pcx);
+        if pt == 0 {
+            pcx.tscratch.count = mark;
+            return 0;
+        }
+        pcx.tscratch.push(pt);
+    }
+    let ret = if pcx.nodes[fnb].a != 0 { resolve_quietly(pcx.nodes[fnb].a, &pcx) } else { TY_UNIT };
+    if ret == 0 {
+        pcx.tscratch.count = mark;
+        return 0;
+    }
+    make_type(TyKind::Fn, ret, 0, mark, &pcx)
+}
+
+// RULE: D22.3 Method `name` on Ω type o that no bound gives: rustc's
+// E0599, with the bound to add when one trait in scope declares it.
+fn unbounded_method_error(n: i64, o: i64, name: i64, pcx: inout Ctx<Comp>) -> ! {
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"generic.unbounded_use";
+    err_begin(pcx.nodes[n].start, &pcx);
+    err_str(c"no method '", pcx);
+    err_sym(name, pcx);
+    err_str(c"' on type parameter '", pcx);
+    err_type(o, pcx);
+    err_str(c"': its bounds do not give it (rustc E0599)", pcx);
+    for tr in 0..pcx.traits.len() as i64 {
+        if crate::front::traits::trait_declares(tr, name, pcx) {
+            err_help(c"add the bound: '", pcx);
+            crate::base::diag::err_help_sym(pcx.nodes[pcx.types[o].b].a, pcx);
+            err_help(c": ", pcx);
+            crate::base::diag::err_help_sym(pcx.traits[tr].name, pcx);
+            err_help(c"'", pcx);
+            break;
+        }
+    }
+    pcx.opaque_sure = sure_unbounded(o, pcx);
+    err_end_soft(&pcx);
+    pcx.opaque_sure = false;
+    pcx.err_kind = saved;
+    err_jump(&pcx)
+}
+
+// RULE: D22.3 Whether the bound-only error on Ω o is sure (reported): o
+// is a parameter's own Ω, not `T::Item`'s, and the template has no `where`
+// predicate (one on a projection may give it: 0.27.3).
+fn sure_unbounded(o: i64, pcx: Ctx<Comp>) -> bool {
+    if pcx.cur_inst < 0 || pcx.fns[pcx.cur_inst].tmpl == 0 {
+        return false;
+    }
+    let item = pcx.fns[pcx.fns[pcx.cur_inst].tmpl - 1].node;
+    if crate::front::traits::wp_start(item, pcx) >= 0 {
+        return false;
+    }
+    let g = pcx.nodes[item].g;
+    for k in 0..(if g > 0 { pcx.nodes[g].count } else { 0 }) {
+        if pcx.nodes[child(g, k, pcx)].a == pcx.nodes[pcx.types[o].b].a {
+            return true;
+        }
+    }
+    false
+}
+
+// ---- The opaque instance (§22) ----
+
+// RULE: D22.1 Whether t is an opaque type parameter, an Ωᵢ.
+pub fn is_omega(t: i64, pcx: Ctx<Comp>) -> bool {
+    is_opaque(t, pcx) && (pcx.nodes[pcx.types[t].b].p & TY_OMEGA) != 0
+}
+
+// RULE: D22.2 Whether function f is an instance with a type argument that
+// is or holds an Ω: an opaque instance, or one its check made; neither is
+// lowered (finish_program), nor are their closures.
+pub fn omega_instance(f: i64, pcx: Ctx<Comp>) -> bool {
+    if f < 0 || pcx.fns[f].tmpl == 0 {
+        return false;
+    }
+    // (or a virtual function's, its Self an Ω: `T::hash<DefaultHasher>`;
+    // by its node, as the types are erased before code)
+    let h = pcx.nodes[pcx.fns[f].node].h;
+    if h > 0 && pcx.nodes[h].kind == NodeKind::TyName && (pcx.nodes[h].p & TY_OMEGA) != 0 {
+        return true;
+    }
+    for i in 0..pcx.fns[f].targ_count {
+        if mentions(pcx.tlists.get(pcx.fns[f].targs + i), -1, 0, pcx) {
+            return true;
+        }
+    }
+    false
+}
+
+// RULE: D22.1 The Ω standing for type parameter `param` (a TyName of a
+// Generics node, its bounds in h): a distinct type over `()` whose node, a
+// copy of the parameter's, names it in messages and resolves to it
+// (resolve_type: z).
+pub fn omega_of(param: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let node = new_node(NodeKind::TyName, pcx.nodes[param].start, pcx.nodes[param].end, &pcx);
+    pcx.nodes[node].a = pcx.nodes[param].a;
+    pcx.nodes[node].h = pcx.nodes[param].h;
+    pcx.nodes[node].p |= TY_OPAQUE | TY_OMEGA;
+    pcx.any_distinct = true;
+    let t = make_type(TyKind::Distinct, TY_UNIT, node, pcx.tscratch.count, &pcx);
+    pcx.nodes[node].z = t;
+    t
+}
+
+// The trait of opaque type t's bounds (with their supertraits, F2.2) that
+// declares function `name`, and the bound naming it: (trait, bound), or
+// (-1, 0).
+fn bound_declaring(t: i64, name: i64, pcx: inout Ctx<Comp>) -> (i64, i64) {
+    let bounds = pcx.nodes[pcx.types[t].b].h;
+    for i in 0..(if bounds > 0 { pcx.nodes[bounds].count } else { 0 }) {
+        let b = child(bounds, i, pcx);
+        let tr = declaring(bound_trait(b, &pcx), name, 0, &pcx);
+        if tr >= 0 {
+            return (tr, b);
+        }
+    }
+    (-1, 0)
+}
+
+fn declaring(tr: i64, name: i64, depth: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if tr < 0 || depth > 8 {
+        return -1;
+    }
+    if crate::front::traits::trait_fn(tr, name, pcx) != 0 {
+        return tr;
+    }
+    let supers = trait_supers(tr, pcx);
+    for i in 0..(if supers > 0 { pcx.nodes[supers].count } else { 0 }) {
+        let s = declaring(bound_trait(child(supers, i, pcx), &pcx), name, depth + 1, &pcx);
+        if s >= 0 {
+            return s;
+        }
+    }
+    -1
+}
+
+// RULE: D22.1a The virtual function `Tr::name⟨Self := Ω⟩` of Ω type t, made
+// once (a method of t, find_method): the trait's declaration of it without
+// a body, its signature resolved with Self = t; -1 when no bound of t
+// declares it.
+pub fn virtual_fn(t: i64, name: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let had = crate::front::types::find_method(t, name, pcx);
+    if had >= 0 {
+        return had;
+    }
+    let (tr, _) = bound_declaring(t, name, &pcx);
+    if tr < 0 {
+        return -1;
+    }
+    let decl = crate::front::traits::trait_fn(tr, name, pcx);
+    let item = crate::front::generics::instantiate::clone_node(decl, &pcx);
+    pcx.nodes[item].c = 0;
+    pcx.nodes[item].p |= FN_INTRINSIC;
+    pcx.nodes[item].h = pcx.types[t].b;
+    // (its lifetimes are the declaration's, for the borrow checker)
+    crate::front::parser::rust::share_lifetimes(decl, item, &pcx);
+    let sym = crate::front::modules::join_sym(pcx.nodes[pcx.types[t].b].a, c"::", name, &pcx);
+    crate::front::check::collect::add_fn(item, sym, sym, &pcx);
+    let f = pcx.fns.len() as i64 - 1;
+    pcx.fns[f].module = pcx.traits[tr].module;
+    pcx.fns[f].self_ty = t;
+    if pcx.fns[f].generic == 0 {
+        let (saved_mod, saved_self, saved_impl) = (pcx.cur_mod, pcx.self_type, pcx.self_impl);
+        pcx.cur_mod = pcx.traits[tr].module;
+        pcx.self_type = t;
+        pcx.self_impl = -1;
+        crate::front::check::resolve::resolve_signature(f, &pcx);
+        pcx.cur_mod = saved_mod;
+        pcx.self_type = saved_self;
+        pcx.self_impl = saved_impl;
+    }
+    crate::front::check::collect::meth_push(crate::front::types::MethodInfo {
+        ty: t, name: name, f: f,
+    }, &pcx);
+    f
+}
+
+// RULE: D22.1 `Ω::name` (`<Ω as Tr>::name`): the bound's equality when one
+// of t's bounds has it (`Iterator<Item = X>`), else 0 (no such type).
+pub fn omega_projection(t: i64, name: i64, pcx: inout Ctx<Comp>) -> i64 {
+    // (each once, under the instance's parameters: places asks again,
+    // without them)
+    var k = 0;
+    while k + 2 < pcx.assoc_omegas.count {
+        if pcx.assoc_omegas.get(k) == t && pcx.assoc_omegas.get(k + 1) == name {
+            return pcx.assoc_omegas.get(k + 2);
+        }
+        k += 3;
+    }
+    let bounds = pcx.nodes[pcx.types[t].b].h;
+    for i in 0..(if bounds > 0 { pcx.nodes[bounds].count } else { 0 }) {
+        let b = child(bounds, i, pcx);
+        let holder = pcx.nodes[b].h;
+        if pcx.nodes[b].kind != NodeKind::TyName || holder <= 0 {
+            continue;
+        }
+        for j in 0..pcx.nodes[holder].count {
+            let c = child(holder, j, pcx);
+            if pcx.nodes[c].kind == NodeKind::AssocType && pcx.nodes[c].a == name {
+                // (0 while it is made: `Iterator<Item = Self::Item>` asks
+                // again; `Self` there is the Ω whose associated type t is)
+                let slot = pcx.assoc_omegas.count;
+                pcx.assoc_omegas.push(t);
+                pcx.assoc_omegas.push(name);
+                pcx.assoc_omegas.push(0);
+                let saved = pcx.cur_mod;
+                let saved_self = pcx.self_type;
+                pcx.cur_mod = crate::front::modules::module_of(c, &pcx);
+                let owner = assoc_owner(t, pcx);
+                if owner != 0 {
+                    pcx.self_type = owner;
+                }
+                let r = crate::front::check::resolve_type_or_error(pcx.nodes[c].b, &pcx);
+                pcx.cur_mod = saved;
+                pcx.self_type = saved_self;
+                pcx.assoc_omegas.set(slot + 2, r);
+                return r;
+            }
+        }
+    }
+    // (none: a fresh Ω for `Ω::name`, with the declaration's bounds, F11.2)
+    for i in 0..(if bounds > 0 { pcx.nodes[bounds].count } else { 0 }) {
+        let decl = assoc_decl(bound_trait(child(bounds, i, pcx), &pcx), name, 0, &pcx);
+        if decl != 0 {
+            return assoc_omega(t, name, decl, &pcx);
+        }
+    }
+    0
+}
+
+// The Ω whose associated type Ω t is (`T` of `T::Item`), or 0.
+fn assoc_owner(t: i64, pcx: Ctx<Comp>) -> i64 {
+    // (assoc_omega keeps it in the node's x)
+    let node = pcx.types[t].b;
+    if pcx.nodes[node].x > 0 { pcx.nodes[node].x - 1 } else { 0 }
+}
+
+// The AssocType node trait tr (or a supertrait) declares `name` with, or 0.
+fn assoc_decl(tr: i64, name: i64, depth: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if tr < 0 || depth > 8 {
+        return 0;
+    }
+    let h = pcx.nodes[pcx.traits[tr].node].b;
+    for i in 0..(if h > 0 { pcx.nodes[h].count } else { 0 }) {
+        let c = child(h, i, pcx);
+        if pcx.nodes[c].kind == NodeKind::AssocType && pcx.nodes[c].a == name {
+            return c;
+        }
+    }
+    let supers = trait_supers(tr, pcx);
+    for i in 0..(if supers > 0 { pcx.nodes[supers].count } else { 0 }) {
+        let d = assoc_decl(bound_trait(child(supers, i, pcx), &pcx), name, depth + 1, &pcx);
+        if d != 0 {
+            return d;
+        }
+    }
+    0
+}
+
+// RULE: D22.1 The Ω of `t::name` (t an Ω), made once: named `T::Item`,
+// bounded by the declaration's bounds (its h, when a Generics holder).
+fn assoc_omega(t: i64, name: i64, decl: i64, pcx: inout Ctx<Comp>) -> i64 {
+    var i = 0;
+    while i + 2 < pcx.assoc_omegas.count {
+        if pcx.assoc_omegas.get(i) == t && pcx.assoc_omegas.get(i + 1) == name {
+            return pcx.assoc_omegas.get(i + 2);
+        }
+        i += 3;
+    }
+    let node = new_node(NodeKind::TyName, pcx.nodes[decl].start, pcx.nodes[decl].end, &pcx);
+    pcx.nodes[node].a = crate::front::modules::join_sym(pcx.nodes[pcx.types[t].b].a, c"::",
+        name, &pcx);
+    let h = pcx.nodes[decl].h;
+    pcx.nodes[node].h = if h > 0 && pcx.nodes[h].kind == NodeKind::Generics { h } else { 0 };
+    pcx.nodes[node].p |= TY_OPAQUE | TY_OMEGA;
+    pcx.any_distinct = true;
+    let r = make_type(TyKind::Distinct, TY_UNIT, node, pcx.tscratch.count, &pcx);
+    pcx.nodes[node].z = r;
+    pcx.nodes[node].x = t + 1;
+    pcx.assoc_omegas.push(t);
+    pcx.assoc_omegas.push(name);
+    pcx.assoc_omegas.push(r);
+    r
+}
+
+// RULE: D22.2 The opaque instances, after the concrete ones: one per
+// generic template with a body of the program's own rust-edition files,
+// type-checked (and so borrow-checked), never lowered: finish_program
+// leaves out every instance and closure made from here on to the end of
+// their checks.
+pub fn build_opaque_instances(program: i64, pcx: inout Ctx<Comp>) {
+    // (a rust program on std2 only: MVS's std, VOLE_STD2=0, has no traits
+    // for a bound to name, `for` over an Ω)
+    if !crate::front::known::on_std2(pcx) {
+        return;
+    }
+    pcx.opaque_q0 = pcx.inst_queue.count;
+    pcx.opaque_phase = true;
+    var made_fns = Vec::<i64, Comp>::new_in(Comp {});
+    for i in 0..pcx.nodes[program].count {
+        let item = child(program, i, pcx);
+        if pcx.nodes[item].kind != NodeKind::Fn || pcx.nodes[item].x == 0
+            || (pcx.nodes[item].p & (FN_SIG_FAILED | FN_BODY_FAILED | FN_INTRINSIC
+                | crate::front::ast::FN_DERIVED)) != 0
+            || pcx.nodes[item].c == 0 {
+            continue;
+        }
+        let f = pcx.nodes[item].x - 1;
+        let g = pcx.nodes[item].g;
+        if pcx.fns[f].generic == 0 || pcx.fns[f].tmpl != 0 || g == 0
+            || !crate::front::conv::user_at(pcx.nodes[item].start, &pcx)
+            || !crate::front::rust::rust_at(pcx.nodes[item].start, &pcx) {
+            continue;
+        }
+        var plain = true;
+        for k in 0..pcx.nodes[g].count {
+            let p = child(g, k, pcx);
+            plain = plain && pcx.nodes[p].kind == NodeKind::TyName
+                && crate::front::generics::instantiate::array_len_name(p, pcx) == 0;
+        }
+        if !plain {
+            continue;
+        }
+        let made = crate::front::check::opaque_instance(f, item, &pcx);
+        if made >= 0 {
+            made_fns.push(made);
+        }
+    }
+    crate::front::check::check_queued_instances(pcx.opaque_q0, &pcx);
+    // (the templates whose instance checked: not one the model left out)
+    for made in made_fns.as_slice() {
+        if (pcx.nodes[pcx.fns[made].node].p & FN_BODY_FAILED) == 0 {
+            pcx.opaque_count += 1;
+        }
+    }
+    pcx.opaque_phase = false;
 }
