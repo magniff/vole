@@ -816,6 +816,14 @@ and that declare `name`; with `τ` a parameter, its bounds (F0.4a).
 Ambiguity is F9.3's. `<τ>::name` with an explicit type is what
 disambiguates a primitive (`<i64>::MAX`, `<[T]>::len`).
 
+**F8.4 (`<τ as Tr>::name` in an expression).** With `τ` a name
+(`<i32 as FromStr>::from_str("-7")`, `<W as Make>::make()`), the path
+`τ::name` (F8.3). In 0.27.2.1 the trait is parsed and not kept, so two
+traits in scope that both declare `name` for `τ` are F9.3's ambiguity,
+where rustc takes `Tr`'s; a `τ` that is not a name (`<Vec<T> as
+Tr>::f`) is a parser error. *Anchor:* `front/parser/exprs.vl:
+parse_primary`. Case `rust_f_f8_qualified_call_ok`.
+
 ### F9 Method name clash
 
 **F9.1 (order).** F0.5: at each probe step inherent candidates first;
