@@ -152,6 +152,28 @@ The front (front273):
   impl's supertrait check (`derive_generic.vl` read in the rust edition).
 - front-rust.md names FR5 (integer widening) and FR6 (an index of any
   integer type), the rust edition's lenient MVS rules.
+- On std2 a `&str` is Copy and clones by copying (F0.4): `parts.iter()
+  .copied()` over a `[&str]`, `Option<&&str>::copied`, `r.clone()` of a
+  `&&str`, `repeat_n("a", 2)`; of two impls a `&str` makes alike
+  (`Extend<T>`, `Extend<&'a T>` of a `Vec<&str>`) the by-value one is
+  taken (F26.3).
+- `TryFrom::try_from(x)` takes Self from an expected `Result<Self, _>`
+  (F8.2), and `x.try_into()` against an expected `Result<U, _>` is
+  `U::try_from(x)`; without an expected type (a match's scrutinee, a
+  generic instance) U waits for FL1 (0.27.4).
+- A range value indexes a slice, an array or a str through Index (`a[r]`
+  with `r: Range<usize>`, a RangeFull; a read, F26.3); a RangeFull's
+  RangeBounds parameter comes from the expected type
+  (`r.start_bound()` as a `Bound<&i64>`, F14.1).
+- A `&mut self` method of str on a String's index borrows it through
+  IndexMut (`s[1..].make_ascii_uppercase()`, `&mut s[1..]`), and needs
+  the String mutable (own.readonly, rustc E0596).
+- A `&mut self` method of a generic trait called on a `let` binding,
+  `s.index_mut(r)`, is own.readonly as any other `&mut self` method
+  (F6.3, rustc E0596); 0.27.2.1 accepted it.
+- Known gap: `index_mut` on a `&mut [T]` receiver (`(&mut a[..])
+  .index_mut(r)`, and so `&mut v[r]` with a range value r) is refused as
+  "calling a method through a raw pointer is unsafe".
 
 std2 (std273):
 
@@ -209,6 +231,40 @@ std2 (std273):
   supertrait default through a bound, Cloned's DoubleEndedIterator
   bound, and an Index bound on a type parameter. None waits for a
   std2 body.
+
+The front's views, contracts and borrowck singles (front273b):
+
+- Z9.1's second part, stage 1 (front-rust.md Z9.1b, FL10): in the rust
+  edition `&mut X` of a reference-written view (`&mut &[u8]`, `&mut
+  &str`), of Self in an impl for `&[T]` or `&str`, and of a Sized type
+  parameter is a pointer to the view, not the exclusive view; `?Sized`
+  is recorded on the parameter. 23 std2 cases pass (io's `Read for
+  &[u8]`, patterns). Stage 2, `[T]` its own type (Z9.1c), is specified.
+- A `requires` call's implicit `&mut` receiver of a view (a temporary
+  `&mut` receiver) is bound exclusive (T3), not checked as a shared
+  borrow.
+- A trait default body's `requires` and `ensures` clauses are written
+  into each impl that uses the default (C7.6), as a declaration's are.
+- The borrow checker reads a substitution's impl bounds (borrowck.md
+  L14): an equality bound through a supertrait, an Fn bound's
+  signature, recursively and through blanket impls. 10 std2 cases pass.
+- A `static mut` is unsafe to read or write in the rust edition
+  (F19.6, rustc E0133).
+- `write(w, ..)` on an io::Write goes through std2's IoFmt (F16.3).
+- A struct's, enum's or trait's `where` predicate is no function's
+  (F10.1): the parser made Flatten's a bound of the function before it,
+  Cloned's `next_back`, so Cloned's DoubleEndedIterator now resolves.
+- A rust-edition union drops none of its fields (F19.7); rustc's E0740
+  for a field that needs a drop is FL12, a named divergence.
+- Arrays' by-value IntoIterator (FL13): std2's `std::array::IntoIter<T,
+  [T; N]>` over a `ManuallyDrop<[T; N]>` (a union), `#[array_builtin]`
+  until const generics (0.29), where Rust has `IntoIter<T, N>`.
+  `a.into_iter()` and `for x in a` move the elements out, by rustc's
+  probe order (by value before `&[T; N]` and the slice); what is not
+  yielded drops with the iterator. A pattern impl's trait defaults
+  (F12.3) and its drop are found by its header. 24 std2 cases pass, and
+  4 new rust cases twin with rustc (a partly consumed `[String; 3]`
+  under `--check-alloc`, an early `break`).
 
 Compile cost and the machine's load (cost273):
 
