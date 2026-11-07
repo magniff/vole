@@ -1245,7 +1245,14 @@ outside the holes named below.
   a substitution's impl bounds join `⊒` (the impl's own D4.6 (d) for
   the impl chosen for each type argument). std2's cases:
   `std2_iter_iterator_chain`, `std2_iter_adapters_chain`,
-  `std2_iter_adapters_chain_impl_doubleendediterator`.
+  `std2_iter_adapters_chain_impl_doubleendediterator`. The same class
+  with an `Fn*` bound: `Vec::extend<I = Map<Iter<'x, i64>, C>>`'s `for
+  x in iter` calls `Map`'s `next`, whose instance ties `C`'s X_C slots
+  to `I::Item`'s (D19.10 (4), from `impl<B, I: Iterator, F: FnMut(I::Item)
+  -> B> Iterator for Map<I, F>`), while in `extend` the two are slots
+  of one substitution with nothing between them; rustc's closure
+  signature is higher-ranked there (`for<'p> FnMut(&'p i64)`). Cases:
+  `std2_iter_adapters_map`, `_inspect`, `_map_while`, `_scan`.
 
 ## 12. The MVS std boundary (S12, 0.27.1 only)
 
