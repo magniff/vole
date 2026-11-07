@@ -160,6 +160,12 @@ The borrow checker (bc2721):
   receiver (D7.4): `write(f, "{}", f.width())` reads f while the
   reborrow is reserved, and f is usable after the call, where the
   desugaring moved f (`borrowck.use_moved`). 6 Formatter cases pass.
+- An arithmetic operator moves its operands in the rust edition (D8.5):
+  `a + b` is `Add::add(a, b)`, where the operands' bindings were
+  borrowed copies, so an operand with a drop was dropped again at the
+  end of its scope (a double free, already in 0.27.2); a comparison's
+  stay borrowed. `rust_b_ops_` cases for `+`, `+=`, `==` and a use after
+  the move.
 
 std2 (std2721):
 
