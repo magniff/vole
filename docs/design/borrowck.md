@@ -726,6 +726,23 @@ D3.6).
   caller checked it: D4.5's walk of `τ` alone (`&'m mut Copied<Iter<'x,
   i64>>` gives `'x ⊒ 'm`) and the requirements of its declarations
   ((a)) join `⊒`, each slot the universal of `T`'s slot (D4.4).
+- (f) *A projection with no impl to normalize it (0.27.5).* In the
+  opaque instance (D4.4 (d)) a projection `P::A` or `Self::A` whose base
+  is a synthesized argument has no impl, so D4.4's reading of it fails.
+  Its regions are not elided output regions: E2 and E3 do not apply to
+  them (rustc reads `<I as Iterator>::Item` through the bounds in scope,
+  never as an elided lifetime of `&mut self`). In the callee's signature
+  each slot `j` of such a projection is a universal of its own,
+  `proj(S, A, j)`, `S` the base's substitution. At a call (D3.6) it is,
+  both ways, the caller's region for slot `j` of `X` when the caller's
+  bound on the type parameter that `S` substitutes says `P: Tr<A = X>`
+  (`X` read in the caller's signature, D4.2); a call region of its own
+  otherwise. So `fn first<'a, I: Iterator<Item = &'a str>>(args: I) ->
+  Option<&'a str> { let mut it = args; it.next() }` checks (`it.next()`'s
+  item is `'a`, not a borrow of `it`), and with `Item = &'b str` and a
+  `'a` result it is `borrowck.outlives` ('b: 'a not known), as rustc's
+  E0495/lifetime error. A real instance normalizes the projection by its
+  impl (D4.4) and is checked as before.
 
 ## 5. Variance (S5)
 

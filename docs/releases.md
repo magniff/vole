@@ -177,6 +177,18 @@ The translator (g3274):
   distinct.mix, 1 item.private); borrowck (partial), with front275's
   D2.4a: 161.
 
+The borrow checker (bc275):
+
+- A generic iterator's item is its bound's, not a borrow of the
+  iterator (borrowck.md D4.6 (f)): in `fn first<'a, I: Iterator<Item =
+  &'a str>>(args: I) -> Option<&'a str>`, `let mut it = args;
+  it.next()` and a `for t in args` loop return the item. 0.27.4 tied
+  the template's `I::Item` to `next`'s `&mut self` (E3) and reported
+  borrowck.return_local, which blocked std::cli's `parse_in`. With
+  `Item = &'b str` and an `&'a str` result it is borrowck.outlives, as
+  in rustc. Cases `rust_b_proj_item_bound` and
+  `rust_b_err_proj_item_bound`, both twinned with rustc.
+
 std2 (std2275), for the modules compiler/src uses:
 
 - `std::time`: `Duration` (`new`, `from_secs`..`from_nanos`,
@@ -206,6 +218,18 @@ std2 (std2275), for the modules compiler/src uses:
   InvalidData); `mode` and `as_raw_fd` are inherent until std::os. MVS's
   `fs::append` is gone: `OpenOptions::new().append(true).create(true)`.
   Four std2_fs cases, three twinned with rustc.
+- `std::process`: `Command::new_in(program, a)` (its strings on a: the
+  allocator named, Rust's `Command::new`) with Rust's `&mut self`
+  builder: `arg`, `args`, `env_remove`, `stdin`/`stdout`/`stderr` with
+  `Stdio::inherit`/`null`/`piped`, `spawn`, `status` and `output` (stdout
+  and stderr piped and stdin /dev/null unless set, as Rust's, the bytes
+  on clones of a); `Child` with its piped `stdin`/`stdout`/`stderr`
+  (`ChildStdin` a Write, the others Read), `id`, `wait`, `try_wait`,
+  `kill`; `ExitStatus` (`success`, `code`, `signal`, Display as Rust's:
+  `exit status: 3`, `signal: 9 (SIGKILL)`); `exit`, `abort`, `id`.
+  MVS's `foreground` stays (vole's own). Four std2_process cases, three
+  twinned with rustc (the twin's prelude maps `Command::new_in(p, gpa)`
+  to `Command::new(p)`).
 
 ### What's new in 0.27.4
 
