@@ -103,6 +103,18 @@ The front (front273):
   rustc accepts it (F18.4). 0.27.5 checked the sliced literal against
   the `&mut` type and refused it with "expected 'inout [i64]', got
   '[i64]'".
+- `A::clone(&a)` and `Clone::clone(&a)` of a bounded parameter `a: A`
+  call the bound's clone of the type A stands for, as `a.clone()` does
+  (Z9.1c). With `A = &Gpa`, `fn two<A: Allocator + Clone>(a: A)` now
+  checks; 0.27.5 took Gpa's clone through the reference.
+- In the rust edition a shared `&e` where `&mut` goes is refused, as
+  rustc refuses it (E0308): `bump(&n)`, `first(&[1, 2, 3][..])`,
+  `first(&a[..])`.
+  - Each is a type error, with `&mut n`, `&mut [1, 2, 3][..]` or
+    `&mut a[..]` as its `try:` and fix.
+  - 0.27.5 made such a `&` exclusive, MVS's inout marker, and accepted
+    it. MVS keeps the marker.
+  - No std2 or rust case relied on it.
 
 ### What's new in 0.27.5
 
