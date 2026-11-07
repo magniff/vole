@@ -112,6 +112,19 @@ The front (front275):
   - It is also a run-time fix: `f(x, { x += 1; x })` now passes the old
     `x` first, and `v[{ y += 1; 0 }] = y` stores the old `y`, as in Rust.
   - MVS is unchanged.
+  - The same goes for the left side of a primitive binary operator when
+    its right side may run a statement: `pcx.nodes[n].a ==
+    intern(c"Self", pcx)` is accepted, and `x + f(&mut x)` adds the old
+    `x`.
+- A shared borrow of a literal, or of an array, tuple or repeat of
+  literals, lives for the whole body (borrowck.md D2.8, rustc's
+  promotion), so `if sub { &["sub", "checked_sub"] } else { &["add"] }`
+  can be used after its branch. `&[x, 1]` and `&[f()]` stay their
+  branch's temporaries, as in rustc. A promoted borrow still cannot
+  leave the function (L2).
+- With both, gate 3's borrowck errors go from 307 to 286: conflicts from
+  215 to 201, dropped_borrowed from 7 to 0. All 286 are the translator's
+  to fix; for each shape rustc rejects the same code.
 
 The translator (g3274):
 
