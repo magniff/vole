@@ -403,8 +403,9 @@ std2's bodies too.
 **D2.8 (constant promotion, in the body; 0.27.5).** In a rust body a
 shared borrow of a *promotable* rvalue `e` (`&e`, or `&e` made a shared
 slice, `&[T]`) borrows a temporary whose storage is the body's: it has
-no `StorageLive` nor `StorageDead`, so the end of its statement's or
-branch's scope does not end the loan (rustc's promotion; no E0716):
+no `StorageLive`, and its `StorageDead` is the body's scope's (at every
+return, D6.2.2), so the end of its statement's or branch's scope does
+not end the loan (rustc's promotion; no E0716):
 `let list: &[&str] = if sub { &["sub", "checked_sub"] } else { &["add"]
 }; list.len()` is accepted. Promotable, rustc's `promote_consts`
 narrowed: a literal (integer, float, char, bool, string, C string,
