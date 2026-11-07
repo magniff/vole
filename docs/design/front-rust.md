@@ -363,6 +363,18 @@ parameter's inference (`f(&[1, 2])` with `f<T>(x: T)` gives `T = &[i64;
 check_call_arg`, `front/check/mod.vl: mismatch_error`, `front/check/
 widen.vl`.
 
+**F32.2 (deref coercion through Deref, 0.27.2.1).** At a coercion site a
+shared reference `&S` where `&U` (or the view `&[T]`, `&str`) is
+expected, with `U` reached from `S` by `<_ as Deref>::Target` steps (at
+most 4), is `n.deref()` that many times: `f(&b)` with `b: Box<i64, A>`
+and `f(x: &i64)`. At a generic call, a parameter `&P` whose own
+parameters the argument `&S` does not bind is unified with the first
+`&D` of the chain that binds them (`sum(rest)` with `rest: &Box<List<A>,
+A>` and `sum<A>(l: &List<A>)`), as rustc's coercion of an argument
+against `&List<?A>`. *Anchor:* `front/check/rust.vl: deref_coerce,
+deref_projection`, `front/generics/instantiate.vl: deref_unify`. Case
+`rust_f_f32_deref_coerce_ok`.
+
 ### F33 Raw pointers hold no allocator
 
 **F33.1 (alloc.field through a raw pointer).** In a rust-edition
@@ -598,6 +610,14 @@ kept as a projection type, equal only to itself (and to its `= X`
 constraint when `Γ` has `T: Tr<A = X>`). *Anchor:* `front/assoc.vl:
 projection, trait_projection, constraint_type`.
 
+
+**F11.5 (a bound's equality through a supertrait, 0.27.2.1).** A bound
+`I: Tr<Name = τ>` whose `Name` a supertrait of `Tr` declares
+(`DoubleEndedIterator<Item = &'a T>`, Item Iterator's) is read through
+that supertrait's impl for the bound's type, so it binds the parameters
+τ names as `Iterator<Item = &'a T>` would (`Copied<I>`'s
+`DoubleEndedIterator` impl). *Anchor:* `front/assoc.vl:
+super_projection, infer_from_assoc`. Case `rust_f_f11_super_projection_ok`.
 ### F12 Default bodies in generic traits
 
 **F12.1.** A method of a generic trait `Tr<P..>` may have a default
