@@ -121,6 +121,16 @@ The front (front274):
   An untyped literal fixes `i32` at once (`v.push(1)`: `Vec<i32>`, where
   rustc may infer from a later use; FL1, case `rust_f_fl1_literal_i32`).
   std2 at -O0: 1,430 pass, 39 xfail (1,400 and 69).
+- F30.2, `&raw const P` and `&raw mut P`, in the rust edition: a place's
+  address, a raw pointer, with no reference made. `&raw mut S` of a
+  `static mut` needs no `unsafe`; a field of one, `&raw const S.n`, does
+  (E0133). `&raw mut` needs a `mut` place (E0596), and a temporary is an
+  error (E0745). D6.2.5 is tightened: `&mut S` of a `static mut` is a
+  reference even where a `*mut T` goes (`let p: *mut T = &mut S;`), and
+  its help now gives `&raw mut S`. std2's checking allocator takes its
+  lock's address that way.
+- `e as *const _` and `e as *mut _` take the pointee from the operand
+  (F29.1). An integer cast to one is E0641.
 
 ### What's new in 0.27.3
 
