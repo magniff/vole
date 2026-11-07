@@ -171,7 +171,9 @@
 # (0.27.2) std2's cases (std2_*) are built with --check-alloc, and fail
 # when blocks of Gpa are left at exit (and it exits 0) unless a STDERR
 # line expects the list ($VOLE_TEST_STD2_PLAIN=1: without it); $VOLE_TEST_XFAIL_WHY=FILE
-# gets each XFAIL case's name and the start of its failure, for a triage.
+# gets each XFAIL case's name and the start of its failure, for a triage;
+# (0.27.2.1) $VOLE_TEST_RESULTS=FILE each case's name, status and borrowck
+# errors at std's positions (the gate's std2 rows read the suite's).
 
 set -u
 LC_ALL=C
@@ -1150,6 +1152,16 @@ while read -r name file; do
             printf '%s\t%s\t%s\n' "$name" "$(head -1 "$dir/why" 2>/dev/null | tr '\t' ' ')" \
                 "$(grep -m1 'error' "$dir/why" 2>/dev/null | tr '\t' ' ')" >>"$VOLE_TEST_XFAIL_WHY"
         fi
+    fi
+    # (0.27.2.1) VOLE_TEST_RESULTS=FILE: each case's name, its status
+    # (pass, xfail, fail, xpass, skip) and how many borrowck errors its
+    # compilation had at std's positions (`<std>:L:C`), one line each: the
+    # gate's std2-tests and std2-check rows read the suite rows' builds of
+    # std2's cases from it instead of building them again
+    if [ -n "${VOLE_TEST_RESULTS:-}" ]; then
+        bck=0
+        [ -f "$dir/compile.out" ] && bck=$(grep -c '^<std>:[0-9]*:[0-9]*: error\[borrowck' "$dir/compile.out")
+        echo "$name $status $bck" >>"$VOLE_TEST_RESULTS"
     fi
     count=$((count + 1))
 done <"$CASES"

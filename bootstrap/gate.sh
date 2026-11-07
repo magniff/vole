@@ -71,10 +71,14 @@
 # verdict against rustc's, accept or reject, and its code; a divergence
 # only when the case names its class; skipped without rustc; --quick too);
 # std2-check (tests/std2/check.sh, 0.27.2, borrowck.md Z7: every std2 body
-# type-checked and solved by the borrow checker, 0 errors);
+# type-checked and solved by the borrow checker, 0 errors; 0.27.2.1: with
+# suite-O0 in the gate, only the std2 cases that row did not pass are
+# compiled again);
 # std2-tests (0.27.2, gate 1: std2's cases, tests/run/std2_*.vl, at -O0
 # and -O2, built with --check-alloc, a block of Gpa left at exit failing
-# one; the count passing at both, against gate 1's 1,000; --quick too);
+# one; the count passing at both, against gate 1's 1,000; --quick too;
+# 0.27.2.1: a level read from its suite row's case results when the gate
+# runs that row, which builds them the same way);
 # cachediff (tests/cachediff/run.sh, 0.25.3: every command line of the
 # tools' transcripts and walkthroughs without the tools' cache, with a
 # fresh one and from it, the same output, status and files; the suite
@@ -580,6 +584,29 @@ find_previous_release() {
 
 # Runs step $1 (its output is its log). Exit 77: skipped, the reason on the
 # last line.
+# (0.27.2.1) The case results of the suite-O$1 row (tests/run.sh's
+# VOLE_TEST_RESULTS) when this gate runs that row: its file's path once
+# the row has ended, after waiting for it (step $2 waits: $RUN/$2.waiting,
+# which the stall check passes over); false when the gate does not run it
+# or it left no results (then the caller builds the cases itself). The
+# std2 rows read std2's cases from it: the gate built them six times.
+suite_results() {
+    case " $STEPS " in *" suite-O$1 "*) ;; *) return 1 ;; esac
+    touch "$RUN/$2.waiting"
+    while [ ! -f "$RUN/suite-O$1.status" ]; do
+        # (a row the stall check stopped may leave no status: its process
+        # gone, it has ended)
+        if [ -f "$RUN/suite-O$1.pid" ] && ! kill -0 "$(cat "$RUN/suite-O$1.pid")" 2>/dev/null; then
+            sleep 2
+            [ -f "$RUN/suite-O$1.status" ] || break
+        fi
+        sleep 5
+    done
+    rm -f "$RUN/$2.waiting"
+    [ -s "$RUN/suite-O$1.results" ] || return 1
+    echo "$RUN/suite-O$1.results"
+}
+
 run_step() {
     k="$RUN/failures/$1"
     case "$1" in
@@ -587,11 +614,15 @@ run_step() {
             sh "$ROOT/bootstrap/bootstrap.sh" --dev --no-head-tests --history "$HISTORY" </dev/null \
                 && cp "$ROOT/target/$HEAD_BIN" "$C" ;;
         suite-O2)
-            VOLE_CODE_CACHE=on VOLE_CACHE="$RUN/code-cache" sh "$ROOT/tests/run.sh" -c "$C" -O 2
+            rm -f "$RUN/$1.results"
+            VOLE_TEST_RESULTS="$RUN/$1.results" VOLE_CODE_CACHE=on VOLE_CACHE="$RUN/code-cache" \
+                sh "$ROOT/tests/run.sh" -c "$C" -O 2
             st=$?
             rm -rf "$RUN/code-cache"
             return $st ;;
-        suite-O*) sh "$ROOT/tests/run.sh" -c "$C" -O "${1#suite-O}" ;;
+        suite-O*)
+            rm -f "$RUN/$1.results"
+            VOLE_TEST_RESULTS="$RUN/$1.results" sh "$ROOT/tests/run.sh" -c "$C" -O "${1#suite-O}" ;;
         fuzz-plain) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" ;;
         fuzz-loops) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -l ;;
         fuzz-generics) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -g ;;
@@ -642,16 +673,40 @@ run_step() {
         # (0.27.1) the borrow checker's corpus against rustc's verdicts
         borrowck-twin) sh "$ROOT/tools/borrowck-twin.sh" --std2 "$ROOT"/tests/run/rust_b_*.vl ;;
         # (0.27.2) std2's bodies through the borrow checker (Z7)
-        std2-check) sh "$ROOT/tests/std2/check.sh" -c "$C" ;;
+        std2-check)
+            # (0.27.2.1) the cases' part from the suite-O0 row's builds of
+            # them when this gate runs that row (suite_results)
+            if r=$(suite_results 0 std2-check); then
+                sh "$ROOT/tests/std2/check.sh" -c "$C" -r "$r"
+            else
+                sh "$ROOT/tests/std2/check.sh" -c "$C"
+            fi ;;
         std2-tests)
             # (0.27.2, gate 1) std2's cases at -O0 and -O2: the runner builds
             # each with --check-alloc (std2's checking Gpa) and fails one
             # whose blocks of Gpa are left at exit; a case passes when it
-            # passes at both levels (its XFAIL ones do not count)
+            # passes at both levels (its XFAIL ones do not count).
+            # (0.27.2.1) A level whose suite row this gate runs is read from
+            # that row's builds (suite_results), not built again: the suite
+            # builds std2's cases the same way.
             rc=0
             for level in 0 2; do
-                sh "$ROOT/tests/run.sh" -c "$C" -O $level std2_ >"$RUN/std2-tests-O$level.out" 2>&1 || rc=1
-                awk '/^FAIL|^XPASS/' "$RUN/std2-tests-O$level.out"
+                out="$RUN/std2-tests-O$level.out"
+                if r=$(suite_results $level std2-tests); then
+                    echo "std2-tests: -O$level read from the suite-O$level row's builds"
+                    # (the cases `tests/run.sh std2_` runs: names containing std2_)
+                    awk -v row="suite-O$level" '$1 ~ /std2_/ {
+                            if ($2 == "pass") p++
+                            else if ($2 == "xfail") x++
+                            else if ($2 == "skip") s++
+                            else { f++; print ($2 == "xpass" ? "XPASS " : "FAIL ") $1 " (the " row " row)" }
+                        }
+                        END { printf "  %-10s %5d %6d %5d %5d\n", "total", p, x, f, s }' "$r" >"$out"
+                    grep -q '^FAIL\|^XPASS' "$out" && rc=1
+                else
+                    sh "$ROOT/tests/run.sh" -c "$C" -O $level std2_ >"$out" 2>&1 || rc=1
+                fi
+                awk '/^FAIL|^XPASS/' "$out"
             done
             awk -v o0="$RUN/std2-tests-O0.out" -v o2="$RUN/std2-tests-O2.out" '
                 function row(f,   l, t) {
@@ -932,6 +987,8 @@ check_stalls() {
     for s in $STARTED; do
         case " $REPORTED " in *" $s "*) continue ;; esac
         case "$s" in linux-*) continue ;; esac
+        # (0.27.2.1: a step waiting for another's results, suite_results)
+        [ -f "$RUN/$s.waiting" ] && continue
         [ -f "$RUN/$s.status" ] || [ ! -f "$RUN/$s.pid" ] || roots="$roots $s=$(cat "$RUN/$s.pid")"
     done
     [ -n "$roots" ] || return 0
