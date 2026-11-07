@@ -48,16 +48,23 @@
 # load_std2); the commit hook remakes it when compiler/std2 changes.
 set -eu
 # (0.27.5, Z5.2) std2's index, std2_units, is made by a compiler: the one
-# VOLE_EMBED_VOLEC names, else the tree's target/tools/volec, else its
-# target/volec (the caller's tree first: the hooks run this script in a
-# copy of std), the first that writes this format (STD2_UNITS_FORMAT,
-# front/modules/std2lazy.vl's INDEX_FORMAT). With none, the index is empty
-# (a build lexes std2 whole) and -c does not compare it.
+# VOLE_EMBED_VOLEC names, else target/tools/volec, else target/volec, of
+# the caller's tree, then of this script's, then of the main checkout (the
+# hooks run this script in a copy of std), the first that writes this
+# format (STD2_UNITS_FORMAT, front/modules/std2lazy.vl's INDEX_FORMAT).
+# Its first line, `std2-text SUM`, is the cksum of the text it was made
+# for, and std2_text_sum the text's: a build reads the index only when
+# they agree. With no such compiler the index the file has is kept (made
+# for another text, it is not read: a build lexes std2 whole), with a
+# warning, never replaced by an empty one; and -c does not compare it.
 STD2_UNITS_FORMAT=1
 caller=$(pwd)
 here=$(cd "$(dirname "$0")/../.." && pwd)
 embed_volec=${VOLE_EMBED_VOLEC:-}
 case "$embed_volec" in ""|/*) ;; *) embed_volec=$caller/$embed_volec ;; esac
+main_tree=
+common=$(git -C "$caller" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+case "$common" in */.git) main_tree=${common%/.git} ;; esac
 cd "$(dirname "$0")/../.."
 edition=mvs
 if [ "${1:-}" = "--edition" ]; then
@@ -157,17 +164,29 @@ index() {
 }
 # (0.27.5, Z5.2) std2's units, `volec --edition rust __std2-index TEXT`
 units_made=0
+text_sum=
 if [ "$edition" = rust ]; then
+    text_sum=$(cksum <"$text" | awk '{ print $1 }')
     for c in "$embed_volec" "$caller/target/tools/volec" "$caller/target/volec" \
-        "$here/target/tools/volec" "$here/target/volec"; do
+        "$here/target/tools/volec" "$here/target/volec" \
+        ${main_tree:+"$main_tree/target/tools/volec" "$main_tree/target/volec"}; do
         [ -n "$c" ] && [ -x "$c" ] || continue
-        if "$c" --edition rust __std2-index "$text" >"$work/units" 2>/dev/null \
-            && head -1 "$work/units" | grep -q "^std2-units $STD2_UNITS_FORMAT "; then
+        if "$c" --edition rust __std2-index "$text" >"$work/made" 2>/dev/null \
+            && head -1 "$work/made" | grep -q "^std2-units $STD2_UNITS_FORMAT "; then
             units_made=1
             break
         fi
     done
-    [ "$units_made" = 1 ] || : >"$work/units"
+    if [ "$units_made" = 1 ]; then
+        { echo "std2-text $text_sum"; cat "$work/made"; } | lines >"$work/units"
+    else
+        # (the file's own, as it is: for another text, or none)
+        [ -f "$out" ] && awk '/^pub fn std2_units/ { on = 1; next } on && /^}/ { exit } on' "$out" >"$work/units"
+        [ -f "$work/units" ] || : >"$work/units"
+        if [ -s "$work/units" ] && [ "${1:-}" != "-c" ]; then
+            echo "embed.sh: no compiler here writes std2's index (format $STD2_UNITS_FORMAT, volec 0.27.5 or later): $out's std2_units kept as it was; a build lexes std2 whole until it is made again (try: VOLE_EMBED_VOLEC=target/volec compiler/std/embed.sh --edition rust)" >&2
+        fi
+    fi
 fi
 if [ "$edition" = rust ]; then
     {
@@ -185,7 +204,13 @@ if [ "$edition" = rust ]; then
         echo "// (0.27.5, Z5.2) std2's units, for a build that lexes only those it"
         echo "// reaches (front/modules/std2lazy.vl: index_command writes it)"
         echo "pub fn std2_units(out: i64) {"
-        lines <"$work/units"
+        cat "$work/units"
+        echo "}"
+        echo ""
+        echo "// (0.27.5, Z5.2) the cksum of std2_source's text (std2_units is read"
+        echo "// only when its first line names the same)"
+        echo "pub fn std2_text_sum() -> i64 {"
+        echo "    $text_sum"
         echo "}"
         echo ""
         echo "pub fn std2_files(out: i64) {"
@@ -292,14 +317,11 @@ else {
 fi
 if [ "${1:-}" = "-c" ]; then
     if cmp -s "$tmp" "$out"; then rm -f "$tmp"; exit 0; fi
-    # (no compiler here made the index, or the file has none, made where
-    # none could: the rest compared; a build then lexes std2 whole, and
-    # tests/std2/units.sh says so)
-    if [ "$edition" = rust ]; then
+    # (no compiler here made the index: the rest compared; one that can
+    # makes it, and an empty or other index is then stale)
+    if [ "$edition" = rust ] && [ "$units_made" = 0 ]; then
         nounits() { awk '/^pub fn std2_units/ { skip = 1; next } skip && /^}/ { skip = 0; next } !skip' "$1"; }
-        empty=$(awk '/^pub fn std2_units/ { getline; print ($0 == "}") ? 1 : 0; exit }' "$out")
-        if { [ "$units_made" = 0 ] || [ "$empty" = 1 ]; } \
-            && [ "$(nounits "$tmp" | cksum)" = "$(nounits "$out" | cksum)" ]; then
+        if [ "$(nounits "$tmp" | cksum)" = "$(nounits "$out" | cksum)" ]; then
             rm -f "$tmp"
             exit 0
         fi

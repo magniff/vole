@@ -1806,10 +1806,11 @@ symbol's or a string literal's number may differ from the token path's
 (what is interned, and in which order, is not the same); no meaning
 does.
 - The index is used only when it was made for this text: its format and
-  the text's length match, and the text is the built-in one. Otherwise
-  (std2 read from a tree, `VOLE_STD_TREE`; an index made by an older
-  format; none written, when embed.sh found no compiler able to make
-  one), and when std2 is read whole (queries, `--std2-check`,
+  the text's length match, the text is the built-in one, and the
+  index's first line, `std2-text SUM`, names the cksum of this text
+  (`std2_text_sum`, which embed.sh writes from the text alone, with no
+  compiler). Otherwise (std2 read from a tree, `VOLE_STD_TREE`; an index
+  made by an older format, or for another text; none), and when std2 is read whole (queries, `--std2-check`,
   `VOLE_STD2_EAGER=1`, the eager rerun), the text is lexed whole as in
   0.27.4. `VOLE_STD2_INDEX=0` forces the token path.
 - Kept up to date with no manual step: the commit hook and the
@@ -1819,9 +1820,16 @@ does.
   merge without a conflict on it: the driver makes it again from the
   merged std2. The compiler chosen is the first that writes the index's
   format (embed.sh's `STD2_UNITS_FORMAT`, std2lazy's `INDEX_FORMAT`);
-  with none (a tree whose compilers predate 0.27.5) the index is written
-  empty, and `-c` then compares the rest of the file: a build reads such
-  a text whole.
+  the hooks name the tree's `target/volec` by its absolute path, and the
+  main checkout's compilers are tried last. With none (a tree whose
+  compilers predate 0.27.5) the index the file has is kept as it is,
+  never replaced by an empty one, and embed.sh and the hook say so: made
+  for another text, it is not read, and a build reads std2 whole until a
+  compiler that can makes it again. `-c` then compares the rest of the
+  file; with a compiler that can, an empty index or one for another text
+  is stale. (0.27.5's first merges wrote an empty index where the hooks
+  ran with 0.27.4's compilers; tools/git-hooks/test-stdsrc.py's std2
+  cases are that commit.)
 - Checked: `embed.sh --edition rust -c` with the current compiler says
   whether the index is stale, and a test compares the tokens a build
   keeps with the index and without it (`VOLE_STD2_INDEX=0`), on a set of
