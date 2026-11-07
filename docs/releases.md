@@ -173,6 +173,23 @@ std2 (std2275), for the modules compiler/src uses:
   no `Duration::ZERO`/`MAX` constants (a constant of a struct type waits
   for const evaluation). Seven std2_time cases, six of them twinned with
   rustc.
+- `std::fs`: `File` (`open`, `create`, `create_new`, `options`,
+  `metadata`, `set_len`, `sync_all`; Read, Write and Seek, and Read and
+  Write for `&File`), `OpenOptions` (Rust's `&mut self` builder and its
+  EINVAL rules), `Metadata` (`len`, `file_type`, `is_dir`, `is_file`,
+  `is_symlink`, `permissions`, `modified` as a SystemTime), `FileType`,
+  `Permissions`, `read_dir` with `DirEntry` (`path`, `file_name`,
+  `file_type`, `metadata`), and `read_in`, `read_to_string_in`, `write`,
+  `copy` (the permission bits too), `metadata`, `symlink_metadata`,
+  `exists` (an `io::Result<bool>`), `remove_file`, `remove_dir`, `rename`,
+  `create_dir`, `create_dir_all`, `remove_dir_all`. `std::io` gains
+  `Seek` and `SeekFrom` (Rust's place), and `ErrorKind::InvalidFilename`;
+  `[T]` and `[T; N]` are `AsRef<[T]>`. Changed from Rust's: a path is a
+  `&str` until std::path, and a DirEntry's `path()` and `file_name()` are
+  `&str` views of the entry (a name that is not UTF-8 is read_dir's
+  InvalidData); `mode` and `as_raw_fd` are inherent until std::os. MVS's
+  `fs::append` is gone: `OpenOptions::new().append(true).create(true)`.
+  Four std2_fs cases, three twinned with rustc.
 
 ### What's new in 0.27.4
 
