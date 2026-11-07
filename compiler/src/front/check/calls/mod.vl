@@ -41,9 +41,9 @@ use crate::front::modules::lookup::is_prelude_name;
 use crate::front::own::kinds::has_drop_impl;
 use crate::front::traits::require_in_bounds;
 use crate::front::types::{
-    ENUMS, REF_MUT, TY_U8, TY_UNIT, TY_USIZE, TyKind, buf_type, decay_ref, enum_variant, err_type,
-    find_field, find_method, fn_param, is_compound, is_float, is_mut_slice, is_pointer, is_ref,
-    is_vector, ptr_to, slice_of,
+    ENUMS, REF_MUT, REF_SHARED, TY_U8, TY_UNIT, TY_USIZE, TyKind, buf_type, decay_ref, enum_variant,
+    err_type, find_field, find_method, fn_param, is_compound, is_float, is_mut_slice, is_pointer,
+    is_ref, is_vector, ptr_to, slice_of,
 };
 use crate::places::front::fn_param_count;
 
@@ -58,6 +58,23 @@ pub fn method_of(t: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
             return f;
         }
         let kind = pcx.types[t].kind;
+        // RULE: Z9.1c (0.27.4: a view's methods are its place's, the
+        // autoderef step from `&str` to `str`; a slice's generic ones below)
+        let place = crate::front::types::find_place_of_view(t, pcx);
+        if place > 0 {
+            let g = find_method(place, name, pcx);
+            // (its `&self` methods and associated functions, `str::from_utf8`:
+            // a by-value `self` one takes no view)
+            if g >= 0 && (node_ref_self(g, pcx) || !node_has_self(g, pcx)) {
+                return g;
+            }
+        }
+        if kind == TyKind::Unsized && pcx.types[pcx.types[t].a].kind == TyKind::Slice {
+            return find_generic_method(TPL_SLICE, name, pcx);
+        }
+        if kind == TyKind::Unsized {
+            return method_of(pcx.types[t].a, name, pcx);
+        }
         if kind == TyKind::Struct && pcx.structs[pcx.types[t].a].tmpl != 0 {
             return find_generic_method(pcx.structs[pcx.types[t].a].tmpl, name, pcx);
         }
@@ -262,6 +279,11 @@ fn method_template(t: i64, pcx: Ctx<Comp>) -> i64 {
     }
     if kind == TyKind::Distinct && pcx.types[t].count > 0 {
         return TPL_DISTINCT + pcx.types[t].b;
+    }
+    // RULE: Z9.1c (0.27.4: `[T]` the place is the slice template too)
+    if kind == TyKind::Unsized
+        && pcx.types[pcx.types[t].a].kind == TyKind::Slice {
+        return TPL_SLICE;
     }
     if kind == TyKind::Slice { TPL_SLICE } else { 0 }
 }
@@ -570,6 +592,57 @@ fn mut_slice_impl_method(t: i64, name: i64, pcx: inout Ctx<Comp>) -> i64 {
         && (pcx.nodes[h].p & crate::front::ast::NODE_REF_MUT) != 0 { f } else { -1 }
 }
 
+// RULE: F6.2 (0.27.4) Whether method f takes `&self` or `&mut self` (read
+// from its nodes, as a template's own signature is not resolved).
+fn node_ref_self(f: i64, pcx: Ctx<Comp>) -> bool {
+    if f < 0 {
+        return false;
+    }
+    let item = pcx.fns[f].node;
+    if item <= 0 || pcx.nodes[item].count == 0 {
+        return false;
+    }
+    let p0 = child(item, 0, pcx);
+    let tn = pcx.nodes[p0].b;
+    pcx.nodes[p0].a == pcx.self_sym && tn > 0 && pcx.nodes[tn].kind == NodeKind::TyPtr
+        && (pcx.nodes[tn].p & crate::front::ast::NODE_REF) != 0
+}
+
+// (0.27.4) Whether method f takes `&mut self`, from its nodes.
+fn node_mut_self(f: i64, pcx: Ctx<Comp>) -> bool {
+    node_ref_self(f, pcx)
+        && (pcx.nodes[pcx.nodes[child(pcx.fns[f].node, 0, pcx)].b].p & NODE_REF_MUT) != 0
+}
+
+// (0.27.4) Whether function f takes a `self` (in any form), from its nodes.
+fn node_has_self(f: i64, pcx: Ctx<Comp>) -> bool {
+    if f < 0 {
+        return false;
+    }
+    let item = pcx.fns[f].node;
+    item > 0 && pcx.nodes[item].count > 0 && pcx.nodes[child(item, 0, pcx)].a == pcx.self_sym
+}
+
+// RULE: F6.2 (0.27.4) Whether f is a `&self` (`&mut self`) method of an impl
+// for a reference type, `impl<A: Ord> Ord for &A`: its receiver is `&&A`,
+// at the probe's `&` step of a `&A` (read from its nodes: a template's
+// signature is its instances').
+fn ref_self_of_ref_impl(f: i64, pcx: Ctx<Comp>) -> bool {
+    let im = if f >= 0 { crate::front::traits::impl_of_fn(f, pcx) } else { -1 };
+    if im < 0 {
+        return false;
+    }
+    let head = pcx.nodes[pcx.traits_impls[im].node].b;
+    let item = pcx.fns[f].node;
+    if pcx.nodes[head].kind != NodeKind::TyPtr || pcx.nodes[item].count == 0 {
+        return false;
+    }
+    let p0 = child(item, 0, pcx);
+    let tn = pcx.nodes[p0].b;
+    pcx.nodes[p0].a == pcx.self_sym && tn > 0 && pcx.nodes[tn].kind == NodeKind::TyPtr
+        && (pcx.nodes[tn].p & crate::front::ast::NODE_REF) != 0
+}
+
 // `x.m(args)`: a call of method m of x's type (or of the type x points
 // to), with `&x` or `*x` as needed for its `self`; becomes an NodeKind::Call.
 pub fn synth_method(n: i64, pcx: inout Ctx<Comp>) -> i64 {
@@ -702,14 +775,48 @@ pub fn synth_method(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         if pcx.nodes[receiver].kind == Ident && pcx.nodes[receiver].res == Res::Local
             && pcx.nodes[receiver].y >= 0
             && pcx.locals[pcx.nodes[receiver].y].tparam != 0
-            && !(name == intern_c(c"drop", &pcx) && has_drop_impl(t, &pcx)) {
+            && !(name == intern_c(c"drop", &pcx) && has_drop_impl(t, &pcx))
+            // RULE: Z9.1c (0.27.4: `x: &T` with T the unsized place is a
+            // view, not a T: its methods are the place's, size_of_val's `len`)
+            && !(crate::front::types::find_place_of_view(t, pcx) > 0) {
             require_in_bounds(pcx.locals[pcx.nodes[receiver].y].tparam, name, pcx.nodes[n].start,
                 &pcx);
         }
         var f0 = if own_mut { mut_slice_impl_method(t, name, &pcx) }
             else { method_of(t, name, pcx) };
-        if f0 >= 0 && !own_mut && crate::front::check::rust::rust_node(n, &pcx) {
+        // RULE: Z9.1c, F6.2 (0.27.4: on a view its place's `&self` method,
+        // receiver the view itself, comes at the by-value step, before the
+        // view's own `&self` one at the `&` step; through a type parameter
+        // the bound's, the view's own)
+        let tparam_receiver = pcx.nodes[receiver].kind == Ident
+            && pcx.nodes[receiver].res == Res::Local && pcx.nodes[receiver].y >= 0
+            && pcx.locals[pcx.nodes[receiver].y].tparam != 0;
+        var placed = false;
+        // (not through a reference, `(&s).tell()`: `&&str` by value first)
+        let ref_receiver = pcx.types[receiver_ty].kind == TyKind::Ptr
+            && (pcx.types[receiver_ty].b == REF_SHARED || pcx.types[receiver_ty].b == REF_MUT);
+        if f0 >= 0 && !own_mut && !tparam_receiver && !ref_receiver
+            && crate::front::check::rust::rust_node(n, &pcx) {
+            let place = crate::front::types::find_place_of_view(t, pcx);
+            let g = if place > 0 { find_method(place, name, pcx) } else { -1 };
+            // (a `&self` method only: a by-value one of the place, a default
+            // `max(self, ..)`, takes no view)
+            if g >= 0 && node_ref_self(g, pcx) {
+                // (of the trait `Tr::m(x)` names, F8.2)
+                f0 = trait_method_choice(n, place, method_template(place, pcx), name, g, via, &pcx);
+                placed = true;
+            }
+        }
+        if f0 >= 0 && !own_mut && !placed && crate::front::check::rust::rust_node(n, &pcx) {
             f0 = trait_method_choice(n, t, method_template(t, pcx), name, f0, via, &pcx);
+        }
+        // RULE: Z9.1c, F8.2 (0.27.4: `Tr::m(x)` of a view whose own impls
+        // lack Tr's m: the place's method of another trait is not it; the
+        // pattern impls below are searched, `impl<T: Debug> Debug for &T`)
+        if f0 >= 0 && via >= 0 && !placed
+            && crate::front::traits::impl_of_fn(f0, pcx) >= 0
+            && pcx.traits_impls[crate::front::traits::impl_of_fn(f0, pcx)].tr != via {
+            f0 = -1;
         }
         // RULE: F0.5 (0.27.2: a pattern impl's method, first for the
         // receiver's own type by value, `impl<'a, T> IntoIterator for &'a
@@ -729,7 +836,52 @@ pub fn synth_method(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             } else {
                 -1
             };
-            if pf >= 0 && (f0 < 0 || first == pf || first < 0 && through_pointer) {
+            // RULE: F6.2 (0.27.4: a `&self` method of a pattern impl for the
+            // receiver's reference type, `impl<A: Ord> Ord for &A`, is at the
+            // `&` step: one found at the by-value step, `<P as Ord>::cmp` of
+            // a `&P`, comes first)
+            let pf_ref_self = ref_self_of_ref_impl(pf, pcx);
+            // (a receiver `&X`: the impl for `&A` matched against X, its `&self`
+            // the receiver itself, is at the by-value step; the one matched
+            // against `&X` at the `&` step: `Ord::cmp(*self, *other)` of `impl
+            // Ord for &A` with A = &str is `<&str as Ord>::cmp`)
+            var took_referent = false;
+            // (`a.cmp(b)` of a `&String` the closure gives: String's `&self`
+            // cmp at the by-value step, before `<&String as Ord>::cmp`)
+            if pf_ref_self && f0 < 0 && is_pointer(receiver_ty, pcx)
+                && pcx.types[receiver_ty].a > 0 {
+                let pt = pcx.types[receiver_ty].a;
+                let gm = method_of(pt, name, pcx);
+                let g_trait_ok = gm >= 0
+                    && (via < 0 || crate::front::traits::impl_of_fn(gm, pcx) >= 0
+                        && pcx.traits_impls[crate::front::traits::impl_of_fn(gm, pcx)].tr == via);
+                // (else the `&A` impl matched against the referent, its `&self`
+                // the receiver itself: `<&str as Debug>::fmt` of a `&&str`)
+                let g = if g_trait_ok && node_ref_self(gm, pcx) { gm } else {
+                    let g2 = pattern_method_via(pt, name, via, &pcx);
+                    if node_ref_self(g2, pcx) { g2 } else { -1 }
+                };
+                if g >= 0 {
+                    f0 = g;
+                    t = pt;
+                    through_pointer = true;
+                    took_referent = true;
+                }
+            }
+            if pf_ref_self && through_pointer && receiver_ty != t && !took_referent {
+                let pf2 = pattern_method_via(t, name, via, &pcx);
+                if pf2 >= 0 && node_ref_self(pf2, pcx)
+                    && !(f0 >= 0 && crate::front::traits::impl_of_fn(f0, pcx) < 0) {
+                    f0 = pf2;
+                    took_referent = true;
+                }
+            }
+            // (`&self` of t, the receiver a reference to t, `let` bound or not)
+            let f0_by_value = f0 >= 0 && node_ref_self(f0, pcx) && is_pointer(probe_ty, pcx)
+                && pcx.types[probe_ty].a == t
+                && node_mut_self(f0, pcx) == (pcx.types[probe_ty].b == REF_MUT);
+            if pf >= 0 && !took_referent && !(pf_ref_self && f0_by_value)
+                && (f0 < 0 || first == pf || first < 0 && through_pointer) {
                 f0 = pf;
                 t = receiver_ty;
                 through_pointer = false;
