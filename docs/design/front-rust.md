@@ -1294,6 +1294,20 @@ impls for primitives (the number formatting MVS has). *Anchor:*
 `front/check/interp.vl: direct_body` (today: MVS's `__print_begin`,
 `Fmt::display`), `format.vl: panic_call`.
 
+**F16.4 (format_args's value).** `format_args(lit, ..)` outside a
+compiler-known call (F16.1) is a value: its holes' arguments are
+evaluated once, where it stands, into the hole lets, and it is
+`std::__rt::Interp { f: move |__out: &mut std::fmt::Formatter| WRITES }`,
+WRITES F16.3's for the literal through `__out`. `Interp<F>` is std2's
+(the compiler's tail, Z5.1) with `impl<F: Fn(&mut Formatter<'_>)>
+Display`, so the value goes wherever a `T: Display` goes (a parameter,
+`to_string_in`, `write(f, "{}", v)`), as Rust's `fmt::Arguments` does.
+Divergences, named: the value's type is its own per literal, not one
+`Arguments<'a>`; a write's error inside the closure is not carried out of
+`fmt` (0.27.4: it returns `Ok(())`; the sinks keep an io error for their
+own `finish`). *Anchor:* `front/check/interp.vl: expand,
+push_writes_std2`, `front/stdalloc.vl: std2_tail`.
+
 **F16.5 (the spec's traits and flags).** A hole's trait is the spec's: `x`
 LowerHex, `X` UpperHex, `o` Octal, `b` Binary, `e` LowerExp, `E`
 UpperExp, `p` Pointer (0.27.2.1; a pointer's `{:p}` stays its address),

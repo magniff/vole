@@ -86,6 +86,15 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.27.4
 
+The front (integrator):
+
+- `format_args(..)` is a value in the rust edition (F16.4): std2's
+  `std::__rt::Interp`, a Display that writes the literal through the
+  Formatter it is given, so it goes to a `T: Display` parameter,
+  `to_string_in` or `write`. In 0.27.3 any such use was "unknown struct
+  'Interp'" (102 of gate 3's errors). std2_fmt_format_args,
+  std2_fmt_formatter_write_fmt and std2_fmt_write_write_fmt pass.
+
 The front (front274):
 
 - FL11: a template's opaque instance (borrowck.md §22) reports its type
