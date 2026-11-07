@@ -16,6 +16,8 @@
 #   std      the committed compiler/src/front/stdsrc.vl is what compiler/std/embed.sh
 #            makes of the committed std (0.25.3: made by the commit hook and the
 #            merge driver, tools/git-hooks/setup.sh; said when they are not set up)
+#   table    (0.27.3) the translator's compiler/src/tools/translate/table.vl
+#            is what its embed.sh makes of compiler/std2
 #   layout   every tests/examples case names a SOURCE that exists
 #
 # One line per check (PASS, FAIL or SKIP and why), the details after;
@@ -134,6 +136,17 @@ if printf '%s\n' "$CHANGED" | grep -q -e '^compiler/std/' -e '^compiler/src/fron
     fi
 else
     row std SKIP "compiler/std unchanged$setup"
+fi
+
+# table: the translator's tables (0.27.3, `fix --edition rust`) are what
+# compiler/src/tools/translate/embed.sh makes of std2's rewrite.tsv,
+# checklist.tsv and prelude.vl
+if [ -x compiler/src/tools/translate/embed.sh ]; then
+    if compiler/src/tools/translate/embed.sh -c > "$TMP/table.out" 2>&1; then
+        row table PASS "the translator's table.vl matches compiler/std2"
+    else
+        row table FAIL "$(head -1 "$TMP/table.out")"
+    fi
 fi
 
 # layout: tests/examples cases name sources that exist
