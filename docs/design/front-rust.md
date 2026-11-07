@@ -262,6 +262,13 @@ words; one from an unsized to a sized pointee (`*const [T] as *const
 T`) keeps the address and drops the length; sized to unsized is
 `error type.cast` (rustc E0606; use `from_raw_parts`). F29.2.
 
+
+**Z9.1a (a reference impl over an unsized self, 0.27.2.1).** While `&[T]`
+is represented as `[T]`, a pattern impl for `&A` (`impl<A: PartialEq<B>,
+B> PartialEq<&B> for &A`) matches a slice too; when it and the slice's
+own impl both take a call, the slice's own is chosen (rustc reaches it
+through the reference impl). *Anchor:* `front/convert/mod.vl:
+by_unsized_self`. Case `rust_f_z91_ref_impl_ok`.
 ### F23 Literals
 
 **F23.1 (string literals).** `"…"` has type `&'static str` in a
@@ -1056,6 +1063,13 @@ code (Z1): the trait calls are F0.5's and go through F15.1's intrinsic
 impls for primitives (the number formatting MVS has). *Anchor:*
 `front/check/interp.vl: direct_body` (today: MVS's `__print_begin`,
 `Fmt::display`), `format.vl: panic_call`.
+
+**F16.5 (the spec's traits and flags).** A hole's trait is the spec's: `x`
+LowerHex, `X` UpperHex, `o` Octal, `b` Binary, `e` LowerExp, `E`
+UpperExp, `?` Debug, else Display; `+` sets the Formatter's
+`sign_plus` (bit 0), `-` its `sign_minus` (bit 1), `#` `alternate`, `0`
+`sign_aware_zero_pad`. *Anchor:* `front/check/interp.vl:
+direct_body_std2, spec_call`, `format.vl: parse_spec`.
 
 ### F17 Derives
 

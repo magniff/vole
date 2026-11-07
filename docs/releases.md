@@ -82,6 +82,28 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.2 | `v0.27.2` | 0.27.1 | aarch64-macos | std2 the rust edition's std (1,032 of 1,413 std2 tests at -O0/-O2 under `--check-alloc`, gate 1); the front's rules (docs/design/front-rust.md: pattern and blanket impls, coherence, deref coercion, ranges, format specs); closures in full (kinds, captures, `Send`/`Sync`, bodies borrow-checked, `borrowck.unchecked` retired, E0594/E0596); `[T]`/`str` unsized; the borrow checker's verdict cache; every rust case on std2 |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.27.2.1
+
+The front's gaps behind std2's XFAILs (front2721b):
+
+- A generic trait's impl is picked by an own type parameter's bound
+  (`extend<I: IntoIterator<Item = T>>`: Extend<T> over Extend<&T>,
+  F13.3), by the expected type (`let r: &i64 = w.borrow()`, F13.2) and,
+  in an instance, by the receiver's type parameter bound (`s.as_ref()`
+  with `S: AsRef<str>`, F13.4).
+- Literals take their context: `let d: &[u8] = &[1, 2, 3]` is an array
+  of u8 (F18.4), `s.get(1..3)` a `Range<usize>` (F18.3). Integer
+  inference variables (a later statement's type) and the i32 fallback
+  stay 0.27.3's (FL6).
+- A template impl binds an instance's arguments by position only when
+  its header names its parameters in order: `impl<T> SliceIndex<[T]> for
+  Range<usize>` no longer covers `Range<i64>` (F14.2).
+- A reference impl (`impl<A: PartialEq<B>, B> PartialEq<&B> for &A`)
+  yields to a slice's own impl under Z9.1, so std2 can have Rust's
+  reference impls; an ambiguity message for a pattern impl no longer
+  reads past TLISTS (the crash at types.vl:608).
+- `{:E}` is UpperExp, and `{:-}` sets Formatter's sign_minus.
+
 ### What's new in 0.27.2
 
 The rust edition's std is std2, Rust's std with explicit allocators: a rust-edition program now reads `std::vec::Vec`, `String`, `HashMap`, the iterator adapters, `fmt`, `io` and `thread` as Rust's, and 1,032 of std2's 1,413 tests pass at -O0 and -O2 under `--check-alloc` (gate 1). The front end fills the gaps std2's bodies hit (pattern and blanket impls, coherence, deref coercion, ranges, format specs; the rules are docs/design/front-rust.md). Closures are checked in full: their kinds, captures and signatures, `Send` and `Sync`, and the borrow checker reads their bodies (`borrowck.unchecked` is gone), with Rust's mutability errors E0594 and E0596. `[T]` and `str` are unsized types; their full representation, `impl Trait` in return position and the rest of std2 are 0.27.2.1's. MVS programs compile exactly as before; a rust hello-world's `check` costs about 4.2x MVS's (printed, not enforced; 2.0x is 0.27.4's target). Built and tested on aarch64-macos only.
