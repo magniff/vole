@@ -400,6 +400,15 @@ rust-edition position, with these readings:
   str` is `<str as AsRef<[u8]>>`, in an instance too, with or without an
   expected type (before, with `let b: &[u8] = ..` the reference impl took
   it, called itself, and the program overflowed its stack).
+- *Not yet: an instance's call is resolved again, not the template's
+  choice substituted* (0.27.5, a wrong output). rustc resolves a method
+  call once, on the generic body: `(**self).tag()` in `impl<T: ?Sized +
+  Tag> Tag for &T` is `<T as Tag>` for every T, so with `C = &&str`,
+  `via(r)` of `fn via<C: Tag>(c: C) { c.tag() }` is the reference impl
+  twice (21). Vole checks the instance's body with T = `&str` and takes
+  the place's impl for `(**self)`, a view (11). The fix: an instance's
+  call takes the template's resolution with the instance's types. Case
+  `rust_f_z91c_template_choice` (XFAIL).
 - *`&'a T` of an unsized argument in a signature* (0.27.5, D4.6). With
   `T = Unsized(v)`, `&'a T` is the view `v` whose region is the
   reference's (`'a`, or the elided one, E2/E3's), with T's slots (the
@@ -1773,6 +1782,61 @@ the `sys` layer and `panic`'s exit-101 path. `std::gpu`, `std::window`,
 feature name, `std_gpu`, for the five; U4). *Anchor:* `compiler/std/
 embed.sh`, `front/modules/lookup.vl: private_error` (the "no such
 module" site).
+
+**Z5.2 (std2 lexed by its units; 0.27.5).** A build reads std2 by the
+units std2lazy splits it into (an item; an inherent impl's header, each
+member and its closing brace; a trait's header with its required items,
+each default method and its brace; a `use` line; a module's lines), and
+keeps only the units it reaches (0.27.3's rule, unchanged). In 0.27.5
+the split is made once, when std2 is embedded, not at each build:
+`embed.sh --edition rust` writes `std2_units`, the index of the built-in
+text's units: each unit's kind, its bytes, its name, trait, type head and
+parent, the identifiers it holds (as positions in one table of std2's
+words), and the asks of its `use` leaves and its trait's item names. It
+is made by the compiler (`volec --edition rust __std2-index TEXT`, the
+same split the token path runs), so the two cannot differ. A build on the built-in text
+reads the index, interns its words, runs the reach over its units, and
+lexes only the units it keeps, in their order; the tail (Z5.1, made per
+build) is lexed and split as tokens, as before. The tokens kept are
+those the token path keeps, the same and in the same order (each run of
+kept units lexed at once, its last token's `joint` as in the whole
+text), and std2's inline modules are made after they are lexed, in the
+text's order and the tail's last, as when the text is lexed whole. A
+symbol's or a string literal's number may differ from the token path's
+(what is interned, and in which order, is not the same); no meaning
+does.
+- The index is used only when it was made for this text: its format and
+  the text's length match, and the text is the built-in one. Otherwise
+  (std2 read from a tree, `VOLE_STD_TREE`; an index made by an older
+  format; none written, when embed.sh found no compiler able to make
+  one), and when std2 is read whole (queries, `--std2-check`,
+  `VOLE_STD2_EAGER=1`, the eager rerun), the text is lexed whole as in
+  0.27.4. `VOLE_STD2_INDEX=0` forces the token path.
+- Kept up to date with no manual step: the commit hook and the
+  stdsrc_rust.vl merge driver run embed.sh, which makes the index with
+  the tree's compiler (`target/tools/volec`, else `target/volec`;
+  `VOLE_EMBED_VOLEC` names another). Two branches that change std2
+  merge without a conflict on it: the driver makes it again from the
+  merged std2. The compiler chosen is the first that writes the index's
+  format (embed.sh's `STD2_UNITS_FORMAT`, std2lazy's `INDEX_FORMAT`);
+  with none (a tree whose compilers predate 0.27.5) the index is written
+  empty, and `-c` then compares the rest of the file: a build reads such
+  a text whole.
+- Checked: `embed.sh --edition rust -c` with the current compiler says
+  whether the index is stale, and a test compares the tokens a build
+  keeps with the index and without it (`VOLE_STD2_INDEX=0`), on a set of
+  programs; both run for every change to std2 or the front's std2 files
+  (tests/affected.map). The test (tests/std2/units.sh) reads what
+  `VOLE_STD2_DUMP=FILE` writes, the kept tokens with the way they were
+  read (by-index, by-tokens), and builds with `VOLE_STD2_NORERUN=1`: a
+  lazy build with errors would be made again whole and hide a wrong
+  index.
+- The cost: the hello-rust row of tests/compile_cost.sh is enforced at
+  2.0x the MVS hello world from 0.27.5 (1.78x with the index, 2.08x
+  without, which the row would refuse); the index adds about 150 KB to
+  stdsrc_rust.vl and 0.5% to the compiler's own compile.
+*Anchor:* `front/modules/std2lazy.vl`, `front/modules/mod.vl:
+load_std2`, `compiler/std/embed.sh`.
 
 **Z6.1 (two stds, one binary).** Both texts are embedded; the on-disk
 cache is keyed by `(edition, std hash)`; `ls -l target/volec` is
