@@ -198,6 +198,15 @@ mod vole_twin_prelude {
     impl StdinLinesIn for std::io::Stdin {
         fn lines_in(self, _: Gpa) -> std::io::Lines<std::io::StdinLock<'static>> { self.lines() }
     }
+
+    // `Command::new_in(p, a)`: std's `Command::new(p)` (std2's Command
+    // keeps its strings on a)
+    pub trait CommandNewIn {
+        fn new_in<S: AsRef<std::ffi::OsStr>>(program: S, a: Gpa) -> Self;
+    }
+    impl CommandNewIn for std::process::Command {
+        fn new_in<S: AsRef<std::ffi::OsStr>>(program: S, _: Gpa) -> Self { std::process::Command::new(program) }
+    }
 }
 #[allow(unused_imports)]
 use vole_twin_prelude::*;

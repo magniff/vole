@@ -58,7 +58,7 @@ SCOPE_OWNERS = {"Option", "Result", "Vec", "[T]", "str", "String", "Buf", "HashM
                 "Clone", "Default", "Eq", "Ord", "Hash", "Cell", "UnsafeCell", "From", "Into", "TryFrom",
                 "Duration", "File", "OpenOptions", "Metadata", "ReadDir", "DirEntry"}
 SCOPE_MODULES = {"std::fmt", "std::io", "std::thread", "std::slice", "std::iter", "std::cell", "std::time",
-                 "std::fs"}
+                 "std::fs", "std::process"}
 # std2 owner names of MVS's owners that were renamed (for the auto match)
 OWNER_ALIASES = {"Formatter": "Fmt", "ArenaScope": "ScopedArena", "Iter": None}
 

@@ -196,6 +196,18 @@ std2 (std2275), for the modules compiler/src uses:
   InvalidData); `mode` and `as_raw_fd` are inherent until std::os. MVS's
   `fs::append` is gone: `OpenOptions::new().append(true).create(true)`.
   Four std2_fs cases, three twinned with rustc.
+- `std::process`: `Command::new_in(program, a)` (its strings on a: the
+  allocator named, Rust's `Command::new`) with Rust's `&mut self`
+  builder: `arg`, `args`, `env_remove`, `stdin`/`stdout`/`stderr` with
+  `Stdio::inherit`/`null`/`piped`, `spawn`, `status` and `output` (stdout
+  and stderr piped and stdin /dev/null unless set, as Rust's, the bytes
+  on clones of a); `Child` with its piped `stdin`/`stdout`/`stderr`
+  (`ChildStdin` a Write, the others Read), `id`, `wait`, `try_wait`,
+  `kill`; `ExitStatus` (`success`, `code`, `signal`, Display as Rust's:
+  `exit status: 3`, `signal: 9 (SIGKILL)`); `exit`, `abort`, `id`.
+  MVS's `foreground` stays (vole's own). Four std2_process cases, three
+  twinned with rustc (the twin's prelude maps `Command::new_in(p, gpa)`
+  to `Command::new(p)`).
 
 ### What's new in 0.27.4
 
