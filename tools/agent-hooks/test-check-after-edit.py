@@ -748,19 +748,31 @@ try:
              (["main.vl:3: let mut y = z + 1; -> var y = z + 1;"], ["main.vl:3: let mut y = z + 1; -> var y = z + 1;"]))
         # (0.27.2.1) The check after the fixes timed out (a loaded machine:
         # 0.27.2's gate at load 150): the rewrites are said all the same.
+        # (0.27.3) The third call (that check) never ends before the hook's
+        # limit, which the load scales up to 8 times (limit); the first two
+        # (the check and the fixes, real compilations) get 8 s, scaled the
+        # same. At 3 s (24 s at the gate's load) every suite row of 0.27.2.1's
+        # release gate (load 116 to 136) failed this case with nothing said:
+        # the real calls had too little room. The case shows its calls and
+        # the hook's words when it fails.
         slow = os.path.join(tmp, "slow-volec")
         count = os.path.join(tmp, "slow-count")
         write(count, "0\n")
         write(slow, f"#!/bin/sh\nn=$(cat '{count}'); n=$((n + 1)); echo $n > '{count}'\n"
-                    f"[ $n -eq 3 ] && sleep 30\nexec '{real}' \"$@\"\n")
+                    f"[ $n -eq 3 ] && exec sleep 100\nexec '{real}' \"$@\"\n")
         os.chmod(slow, 0o755)
         write(os.path.join(prog, "main.vl"), before)
-        os.environ["VOLE_HOOK_TIMEOUT"] = "3"
+        os.environ["VOLE_HOOK_TIMEOUT"] = "8"
         got = ctx_of(run(ev2, slow, tempfile.mkdtemp(dir=tmp))[1])
         del os.environ["VOLE_HOOK_TIMEOUT"]
+        with open(count) as fh:
+            calls = fh.read().strip()
+        # (the calls made, and what the hook said: a failure shows which
+        # call timed out)
         case("real: the check after the fixes timed out, the rewrites said",
-             [x[len("changed "):] for x in got.split("\n") if x.startswith("changed ")],
-             ["main.vl:3: let mut y = z + 1; -> var y = z + 1;"])
+             ([x[len("changed "):] for x in got.split("\n") if x.startswith("changed ")], calls,
+              got if "changed " not in got else ""),
+             (["main.vl:3: let mut y = z + 1; -> var y = z + 1;"], "4", ""))
         # (0.25.3) An agent's own `volec fmt`: its summary counts lines, the
         # hook names them (from the journal, `volec query diff`); no check.
         write(os.path.join(prog, "main.vl"), "fn main() {\n    let   z  =  3;\n    let y = z+1;\n    println(\"{y}\");\n}\n")
