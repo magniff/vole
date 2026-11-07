@@ -129,6 +129,8 @@ The front (front274):
   reference even where a `*mut T` goes (`let p: *mut T = &mut S;`), and
   its help now gives `&raw mut S`. std2's checking allocator takes its
   lock's address that way.
+- `e as *const _` and `e as *mut _` take the pointee from the operand
+  (F29.1). An integer cast to one is E0641.
 
 ### What's new in 0.27.3
 
