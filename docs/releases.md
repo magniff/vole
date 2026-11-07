@@ -167,6 +167,18 @@ The translator (g3274):
   distinct.mix, 1 item.private); borrowck (partial), with front275's
   D2.4a: 161.
 
+The borrow checker (bc275):
+
+- A generic iterator's item is its bound's, not a borrow of the
+  iterator (borrowck.md D4.6 (f)): in `fn first<'a, I: Iterator<Item =
+  &'a str>>(args: I) -> Option<&'a str>`, `let mut it = args;
+  it.next()` and a `for t in args` loop return the item. 0.27.4 tied
+  the template's `I::Item` to `next`'s `&mut self` (E3) and reported
+  borrowck.return_local, which blocked std::cli's `parse_in`. With
+  `Item = &'b str` and an `&'a str` result it is borrowck.outlives, as
+  in rustc. Cases `rust_b_proj_item_bound` and
+  `rust_b_err_proj_item_bound`, both twinned with rustc.
+
 std2 (std2275), for the modules compiler/src uses:
 
 - `std::time`: `Duration` (`new`, `from_secs`..`from_nanos`,
