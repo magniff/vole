@@ -1003,6 +1003,20 @@ PartialOrd>::lt(&a, &b)`, resolved per instance; without the bound,
 applied to type `T`") with `try: T: PartialOrd`. `==` needs
 `PartialEq`; `+` needs `Add<Output = ..>`.
 
+**F26.3 (a comparison's right operand of another type).** On std2, `a
+== b`, `a < b` and the others with `a` of a struct or enum type and `b`
+of another (not a literal that takes its type from context; an array
+literal does not) check `b` alone: the impl of `PartialEq<Rhs>` or
+`PartialOrd<Rhs>` its type picks decides (`s == "x"` with `impl
+PartialEq<str> for String`, `v == [1, 2]`, `v == other_vec_in_arena`).
+When the operand is a view (`[T]`, `str`, Z9.1, where `&str` is the view
+too), an impl whose argument is written `&..` yields to one that is not:
+`PartialEq<str>` and `PartialEq<&'a str>` compare alike (0.27.2.1). An
+arithmetic operator's right operand stays checked against `a`'s type in
+0.27.2.1: the operator call frees a by-value operand that drops twice.
+*Anchor:* `front/check/synth_mode.vl: synth_operands`,
+`front/convert: by_view_rhs`. Case `rust_f_f26_cmp_rhs_ok`.
+
 ### F27 Patterns in `let` and parameters
 
 **F27.1 (irrefutable patterns).** `let PAT = e;`, `let PAT: τ = e;`,
