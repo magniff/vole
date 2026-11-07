@@ -830,11 +830,331 @@ fn param_is_display(fnode: i64, c: i64, n: i64, pcx: Ctx<Comp>) -> bool {
     false
 }
 
+// (0.27.5) Whether type node t is written `[u8]` (a slice whose element
+// is neither text nor a slice): where a text literal's value is bytes.
+fn bytes_type(t: i64, pcx: Ctx<Comp>) -> bool {
+    t > 0 && pcx.nodes[t].kind == NodeKind::TySlice && !str_type_node(pcx.nodes[t].a, pcx)
+        && (pcx.nodes[t].a <= 0 || pcx.nodes[pcx.nodes[t].a].kind != NodeKind::TySlice)
+}
+
+// (0.27.5) The type node written where the value of expression e goes, 0
+// when none is: a let's, a static's or a constant's annotation, a
+// function's result, a parameter's (of a function of the program, or of
+// std's method on a receiver declared bytes, `name.ends_with("_in")`), a
+// field's; an element of an array or a tuple takes its part of the type
+// its literal goes to; a borrow, an `if`'s branch, a match's arm and a
+// block's value the type theirs goes to.
+fn ctx_type(e: i64, depth: i64, d: TextDecls, tr: Tr, pcx: inout Ctx<Comp>) -> i64 {
+    if e <= 0 || depth > 32 {
+        return 0;
+    }
+    let p = parent_of(e, tr);
+    if p <= 0 {
+        return 0;
+    }
+    let pk = pcx.nodes[p].kind;
+    if pk == NodeKind::Let || pk == NodeKind::Static || pk == NodeKind::Const {
+        return if pcx.nodes[p].c == e { pcx.nodes[p].b } else { 0 };
+    }
+    if pk == NodeKind::Array {
+        let t = ctx_type(p, depth + 1, d, tr, &pcx);
+        return if t > 0
+            && (pcx.nodes[t].kind == NodeKind::TyArray || pcx.nodes[t].kind == NodeKind::TySlice) {
+            pcx.nodes[t].a
+        } else { 0 };
+    }
+    if pk == NodeKind::Tuple {
+        let t = ctx_type(p, depth + 1, d, tr, &pcx);
+        if t <= 0 || pcx.nodes[t].kind != NodeKind::TyTuple {
+            return 0;
+        }
+        for i in 0..pcx.nodes[p].count {
+            if child(p, i, pcx) == e {
+                return if i < pcx.nodes[t].count { child(t, i, pcx) } else { 0 };
+            }
+        }
+        return 0;
+    }
+    if pk == NodeKind::Unary && pcx.nodes[p].op == Tok::Amp {
+        return ctx_type(p, depth + 1, d, tr, &pcx);
+    }
+    if pk == NodeKind::Index {
+        // (an array given as a slice, `[..]` of it, the checker's)
+        let r = pcx.nodes[p].b;
+        return if pcx.nodes[p].a == e && (r <= 0 || pcx.nodes[r].kind == NodeKind::Range) {
+            ctx_type(p, depth + 1, d, tr, &pcx)
+        } else { 0 };
+    }
+    if pk == NodeKind::Block {
+        if pcx.nodes[p].a != e {
+            return 0;
+        }
+        let q = parent_of(p, tr);
+        if q > 0 && pcx.nodes[q].kind == NodeKind::Fn {
+            return pcx.nodes[q].b;
+        }
+        return ctx_type(p, depth + 1, d, tr, &pcx);
+    }
+    if pk == NodeKind::If {
+        return if pcx.nodes[p].a != e { ctx_type(p, depth + 1, d, tr, &pcx) } else { 0 };
+    }
+    if pk == NodeKind::Arm {
+        return if pcx.nodes[p].c == e { ctx_type(parent_of(p, tr), depth + 1, d, tr, &pcx) }
+            else { 0 };
+    }
+    if pk == NodeKind::Return {
+        let f = enclosing_fn(pcx.nodes[e].start, pcx);
+        return if f > 0 { pcx.nodes[f].b } else { 0 };
+    }
+    if pk == NodeKind::FieldInit {
+        return if pcx.nodes[p].b == e { field_type_node(parent_of(p, tr), pcx.nodes[p].a, pcx) }
+            else { 0 };
+    }
+    let c = if pk == NodeKind::NamedArg { parent_of(p, tr) } else { p };
+    // (not a call the checker made, which has no width: a print's hole
+    // given to std's writer of bytes)
+    if c > 0 && pcx.nodes[c].kind == NodeKind::Call && pcx.nodes[c].end > pcx.nodes[c].start {
+        var f = pcx.nodes[c].x - 1;
+        if f < 0 || f >= pcx.fns.len() as i64 {
+            return 0;
+        }
+        if pcx.fns[f].tmpl > 0 {
+            f = pcx.fns[f].tmpl - 1;
+        }
+        let fnode = pcx.fns[f].node;
+        let q = if fnode > 0 { param_of(fnode, c, e, pcx) } else { 0 };
+        if q <= 0 {
+            return 0;
+        }
+        // (std's method on bytes, `name.ends_with("_in")`: its receiver is
+        // declared bytes, as on a `str` the same method takes text; or on a
+        // receiver that is no view, `b.extend_from_slice("hey")` of a
+        // Vec<u8>)
+        let r = if pcx.nodes[c].count > 1 { child(c, 0, pcx) } else { 0 };
+        var rt = if r > 0 { pcx.nodes[r].ty } else { 0 };
+        if rt > 0 && pcx.types[rt].kind == TyKind::Ptr {
+            rt = pcx.types[rt].a;
+        }
+        let method = r > 0 && r != e && pcx.nodes[r].start == pcx.nodes[c].start
+            && pcx.nodes[r].end < pcx.nodes[c].end && SRC[pcx.nodes[r].end] == '.';
+        if editable(pcx.nodes[fnode].start, &pcx)
+            || method
+            && (declared_bytes(r, 0, d, pcx) || rt > 0 && pcx.types[rt].kind != TyKind::Slice) {
+            return pcx.nodes[q].b;
+        }
+    }
+    0
+}
+
+// (0.27.5) The type node of field name of the struct that struct literal
+// s makes, 0 when unknown.
+fn field_type_node(s: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
+    if s <= 0 || pcx.nodes[s].kind != NodeKind::StructLit {
+        return 0;
+    }
+    let t = pcx.nodes[s].ty;
+    if t <= 0 || pcx.types[t].kind != TyKind::Struct {
+        return 0;
+    }
+    let si = pcx.types[t].a;
+    let sn = pcx.structs[if pcx.structs[si].tmpl > 0 { pcx.structs[si].tmpl - 1 } else { si }].node;
+    for i in 0..if sn > 0 { pcx.nodes[sn].count } else { 0 } {
+        let f = child(sn, i, pcx);
+        if pcx.nodes[f].kind == NodeKind::Field && pcx.nodes[f].a == name {
+            return pcx.nodes[f].b;
+        }
+    }
+    0
+}
+
+// (0.27.5) Whether the value of expression e goes where bytes are
+// declared: a place whose type is written `[u8]` (ctx_type), an
+// assignment to declared bytes, the other side of `==` or `!=` from them,
+// an `if` another branch of which is; through a borrow, an `if`'s
+// branches, a match's arms and a block's value. F0.6: `&str` is no
+// `&[u8]` in the rust edition (rustc E0308). up: e's place was asked
+// already, below.
+fn bytes_go(e: i64, up: i64, depth: i64, d: TextDecls, tr: Tr, pcx: inout Ctx<Comp>) -> bool {
+    if up == 0 && bytes_type(ctx_type(e, 0, d, tr, &pcx), pcx) {
+        return true;
+    }
+    if e <= 0 || depth > 32 {
+        return false;
+    }
+    let p = parent_of(e, tr);
+    if p <= 0 {
+        return false;
+    }
+    let pk = pcx.nodes[p].kind;
+    if pk == NodeKind::Let && pcx.nodes[p].b == 0 && pcx.nodes[p].start == pcx.nodes[p].end {
+        // (the checker's `{ let l = a; let r = b; .. }` of `a == b` on views,
+        // equality.vl, rewritten in place: the other side's value)
+        let q = parent_of(p, tr);
+        if pcx.nodes[p].c != e || q <= 0 || pcx.nodes[q].kind != NodeKind::Block
+            || pcx.nodes[q].count < 2 {
+            return false;
+        }
+        let o = if child(q, 0, pcx) == p { child(q, 1, pcx) }
+            else if child(q, 1, pcx) == p { child(q, 0, pcx) } else { 0 };
+        if o <= 0 || pcx.nodes[o].kind != NodeKind::Let || pcx.nodes[o].c <= 0 {
+            return false;
+        }
+        // (a print's lowering has such lets too: `==` or `!=` between the two)
+        let a = pcx.nodes[pcx.nodes[child(q, 0, pcx)].c].end;
+        let b = pcx.nodes[pcx.nodes[child(q, 1, pcx)].c].start;
+        var i = a;
+        while i < b && (SRC[i] == ' ' || SRC[i] == '\n' || SRC[i] == ')') {
+            i += 1;
+        }
+        return i + 1 < b && (SRC[i] == '=' || SRC[i] == '!') && SRC[i + 1] == '='
+            && declared_bytes(pcx.nodes[o].c, 0, d, pcx);
+    }
+    if pk == NodeKind::Unary && pcx.nodes[p].op == Tok::Amp {
+        return bytes_go(p, 1, depth + 1, d, tr, &pcx);
+    }
+    if pk == NodeKind::Block {
+        return pcx.nodes[p].a == e && bytes_go(p, 1, depth + 1, d, tr, &pcx);
+    }
+    if pk == NodeKind::If {
+        if pcx.nodes[p].a == e {
+            return false;
+        }
+        let o = if pcx.nodes[p].b == e { pcx.nodes[p].c } else { pcx.nodes[p].b };
+        return o > 0 && declared_bytes(o, 0, d, pcx) || bytes_go(p, 1, depth + 1, d, tr, &pcx);
+    }
+    if pk == NodeKind::Arm {
+        return pcx.nodes[p].c == e && bytes_go(parent_of(p, tr), 1, depth + 1, d, tr, &pcx);
+    }
+    if pk == NodeKind::Binary && (pcx.nodes[p].op == Tok::EqEq || pcx.nodes[p].op == Tok::BangEq) {
+        let o = if pcx.nodes[p].b == e { pcx.nodes[p].c } else { pcx.nodes[p].b };
+        return declared_bytes(o, 0, d, pcx);
+    }
+    if pk == NodeKind::Assign {
+        return pcx.nodes[p].c == e && declared_bytes(pcx.nodes[p].b, 0, d, pcx);
+    }
+    false
+}
+
+// (0.27.5) Whether expression e is text where it is declared, positively:
+// a binding or parameter written `str` (or initialized from such a
+// value), a field declared `str` alone, a call of a function whose result
+// is written `str`, a part or a borrow of one; a text literal edit_str
+// leaves text (`let m = if w { "7" } else { "15" };`), an `if`, a block or
+// a match all of whose values are.
+fn declared_str(e: i64, depth: i64, d: TextDecls, tr: Tr, pcx: inout Ctx<Comp>) -> bool {
+    if e <= 0 || depth > 8 {
+        return false;
+    }
+    let k = pcx.nodes[e].kind;
+    if k == NodeKind::Ident {
+        let best = bound_at(e, d, pcx);
+        if best < 0 {
+            return false;
+        }
+        let b = d.binds.get(best + 3);
+        if pcx.nodes[b].kind == NodeKind::PatBind {
+            return d.tuples.get(b + 1) == 2;
+        }
+        if pcx.nodes[b].kind == NodeKind::Param || pcx.nodes[b].b > 0 {
+            return str_type_node(pcx.nodes[b].b, pcx);
+        }
+        return declared_str(pcx.nodes[b].c, depth + 1, d, tr, &pcx);
+    }
+    if k == NodeKind::FieldAccess {
+        return d.fields.get(pcx.nodes[e].b + 1) == 1;
+    }
+    if k == NodeKind::Call {
+        let f = pcx.nodes[e].x - 1;
+        if f < 0 || f >= pcx.fns.len() as i64 {
+            return false;
+        }
+        let g = if pcx.fns[f].tmpl > 0 { pcx.fns[f].tmpl - 1 } else { f };
+        let fnode = pcx.fns[g].node;
+        return fnode > 0 && editable(pcx.nodes[fnode].start, &pcx)
+            && str_type_node(pcx.nodes[fnode].b, pcx);
+    }
+    if k == NodeKind::Str {
+        return SRC[pcx.nodes[e].start] == '"' && !bytes_go(e, 0, 0, d, tr, &pcx);
+    }
+    if k == NodeKind::If {
+        return pcx.nodes[e].c > 0 && declared_str(pcx.nodes[e].b, depth + 1, d, tr, &pcx)
+            && declared_str(pcx.nodes[e].c, depth + 1, d, tr, &pcx);
+    }
+    if k == NodeKind::Block {
+        return pcx.nodes[e].a > 0 && declared_str(pcx.nodes[e].a, depth + 1, d, tr, &pcx);
+    }
+    if k == NodeKind::Match {
+        var arms: i64 = 0;
+        for i in 0..pcx.nodes[e].count {
+            let arm = child(e, i, pcx);
+            if arm <= 0 || pcx.nodes[arm].kind != NodeKind::Arm
+                || !declared_str(pcx.nodes[arm].c, depth + 1, d, tr, &pcx) {
+                return false;
+            }
+            arms += 1;
+        }
+        return arms > 0;
+    }
+    if k == NodeKind::Unary && pcx.nodes[e].op == Tok::Amp {
+        return declared_str(pcx.nodes[e].b, depth + 1, d, tr, &pcx);
+    }
+    if k == NodeKind::Index {
+        let r = pcx.nodes[e].b;
+        if r > 0 && pcx.nodes[r].kind == NodeKind::Range {
+            return declared_str(pcx.nodes[e].a, depth + 1, d, tr, &pcx);
+        }
+        // (an element of a local array of text, `let kws = ["fn ", ..];`
+        // then `kws[k]`, or of one written `[str; N]`)
+        let a = pcx.nodes[e].a;
+        let best = if a > 0 && pcx.nodes[a].kind == NodeKind::Ident { bound_at(a, d, pcx) }
+            else { -1 };
+        if best < 0 {
+            return false;
+        }
+        let b = d.binds.get(best + 3);
+        if pcx.nodes[b].kind == NodeKind::PatBind {
+            return false;
+        }
+        let t = pcx.nodes[b].b;
+        if pcx.nodes[b].kind == NodeKind::Param || t > 0 {
+            return t > 0
+                && (pcx.nodes[t].kind == NodeKind::TyArray
+                    || pcx.nodes[t].kind == NodeKind::TySlice)
+                && str_type_node(pcx.nodes[t].a, pcx);
+        }
+        let init = pcx.nodes[b].c;
+        if init <= 0 || pcx.nodes[init].kind != NodeKind::Array || pcx.nodes[init].count == 0 {
+            return false;
+        }
+        for i in 0..pcx.nodes[init].count {
+            if !declared_str(child(init, i, pcx), depth + 1, d, tr, &pcx) {
+                return false;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+// (0.27.5) A value declared `str` given where bytes are declared,
+// `int_method(out, p, ..)` of a `p: str` to a `[u8]` parameter: its
+// bytes, `p.as_bytes()` (F0.6, rustc E0308).
+fn edit_text_to_bytes(n: i64, d: TextDecls, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let t = pcx.nodes[n].ty;
+    if tr.text_mode || t <= 0 || pcx.types[t].kind != TyKind::Slice || pcx.types[t].a != TY_U8
+        || !declared_str(n, 0, d, tr, &pcx) || !bytes_go(n, 0, 0, d, tr, &pcx) {
+        return;
+    }
+    put(pcx.nodes[n].end, pcx.nodes[n].end, ".as_bytes()", TC_BYTES, &tr, &pcx);
+}
+
 // A text literal MVS types as bytes, `[u8]`, given where the program
 // takes bytes (a parameter, the type written for a let, a static or a
 // constant, or for its array's elements, a result of `[u8]`) is
 // `b".."` (a literal is a str in the rust edition); so is a branch of an
-// `if` whose other branch is written or declared bytes.
+// `if` whose other branch is written or declared bytes, and any literal
+// whose value goes where bytes are declared (bytes_go: `s == ".vl"` of
+// an `s: [u8]`, a branch, an element, a field, an assignment).
 fn edit_str(n: i64, d: TextDecls, tr: inout Tr, pcx: inout Ctx<Comp>) {
     if tr.text_mode {
         return;
@@ -885,6 +1205,9 @@ fn edit_str(n: i64, d: TextDecls, tr: inout Tr, pcx: inout Ctx<Comp>) {
         let f = enclosing_fn(pcx.nodes[n].start, pcx);
         let r = if f > 0 { pcx.nodes[f].b } else { 0 };
         bytes = r > 0 && pcx.nodes[r].kind == NodeKind::TySlice;
+    }
+    if !bytes {
+        bytes = bytes_go(n, 0, 0, d, tr, &pcx);
     }
     if !bytes {
         return;
@@ -1184,17 +1507,81 @@ fn str_type_node(tn: i64, pcx: Ctx<Comp>) -> bool {
 
 // The program's bindings and fields declared `str` or `[u8]` (what an
 // expression's erased `[u8]` type was written as): binds holds from, to,
-// name and the Param or Let node of each binding, in [from, to) its
+// name and the Param, Let or PatBind node of each binding, in [from, to) its
 // scope (its block or function); fields the field names declared `str`
 // (1), `[u8]` (2) or both (3); statics the statics and constants written
-// `[u8]` (1) or `[[u8]; N]` (2).
-struct TextDecls { binds: IntVec, fields: HMap, statics: HMap }
+// `[u8]` (1) or `[[u8]; N]` (2); tuples a tuple pattern's PatBinds whose
+// part of the function's result is written `[u8]` (1) or `str` (2).
+struct TextDecls { binds: IntVec, fields: HMap, statics: HMap, tuples: HMap }
+
+// (0.27.5) Whether part i of the tuple e makes is a text literal in every
+// branch: `if c { ("len()", m) } else { ("", 0) }`, which a tuple pattern
+// binds as text.
+fn tuple_part_text(e: i64, i: i64, depth: i64, pcx: Ctx<Comp>) -> bool {
+    if e <= 0 || depth > 32 {
+        return false;
+    }
+    let k = pcx.nodes[e].kind;
+    if k == NodeKind::Tuple {
+        let c = if i < pcx.nodes[e].count { child(e, i, pcx) } else { 0 };
+        return c > 0 && pcx.nodes[c].kind == NodeKind::Str && SRC[pcx.nodes[c].start] == '"';
+    }
+    if k == NodeKind::If {
+        return pcx.nodes[e].c > 0 && tuple_part_text(pcx.nodes[e].b, i, depth + 1, pcx)
+            && tuple_part_text(pcx.nodes[e].c, i, depth + 1, pcx);
+    }
+    if k == NodeKind::Block {
+        return tuple_part_text(pcx.nodes[e].a, i, depth + 1, pcx);
+    }
+    false
+}
+
+// (0.27.5) The bindings of let n's tuple pattern pat, `let (word, end) =
+// word_at(text, q);`, into d: each with its PatBind node, and in
+// d.tuples as the function's result writes its part, `[u8]` (1) or `str`
+// (2), or as text (2) when the value is a tuple of text literals there.
+fn tuple_decls(n: i64, pat: i64, d: inout TextDecls, tr: Tr, pcx: inout Ctx<Comp>) {
+    let scope = parent_of(n, tr);
+    if scope <= 0 {
+        return;
+    }
+    let init = pcx.nodes[n].c;
+    var rt: i64 = 0;
+    if init > 0 && pcx.nodes[init].kind == NodeKind::Call {
+        let f = pcx.nodes[init].x - 1;
+        if f >= 0 && f < pcx.fns.len() as i64 {
+            let g = if pcx.fns[f].tmpl > 0 { pcx.fns[f].tmpl - 1 } else { f };
+            let fnode = pcx.fns[g].node;
+            let t = if fnode > 0 { pcx.nodes[fnode].b } else { 0 };
+            if t > 0 && pcx.nodes[t].kind == NodeKind::TyTuple {
+                rt = t;
+            }
+        }
+    }
+    for i in 0..pcx.nodes[pat].count {
+        let b = child(pat, i, pcx);
+        if b <= 0 || pcx.nodes[b].kind != NodeKind::PatBind {
+            continue;
+        }
+        d.binds.push(pcx.nodes[n].start);
+        d.binds.push(pcx.nodes[scope].end);
+        d.binds.push(pcx.nodes[b].a);
+        d.binds.push(b);
+        let part = if rt > 0 && i < pcx.nodes[rt].count { child(rt, i, pcx) } else { 0 };
+        if str_type_node(part, pcx) || rt == 0 && tuple_part_text(init, i, 0, pcx) {
+            d.tuples.put(b + 1, 2);
+        } else if part > 0 && pcx.nodes[part].kind == NodeKind::TySlice {
+            d.tuples.put(b + 1, 1);
+        }
+    }
+}
 
 fn text_decls(tr: Tr, pcx: inout Ctx<Comp>) -> TextDecls {
     var d = TextDecls {
         binds: IntVec { data: 0 as *i64, count: 0, cap: 0 },
         fields: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
         statics: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
+        tuples: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
     };
     for n in 1..pcx.nodes.len() as i64 {
         let k = pcx.nodes[n].kind;
@@ -1230,6 +1617,8 @@ fn text_decls(tr: Tr, pcx: inout Ctx<Comp>) -> TextDecls {
             let pat = pcx.nodes[n].a;
             if pat > 0 && pcx.nodes[pat].kind == NodeKind::PatBind {
                 name = pcx.nodes[pat].a;
+            } else if pat > 0 && pcx.nodes[pat].kind == NodeKind::PatTuple {
+                tuple_decls(n, pat, &d, tr, &pcx);
             }
         }
         let scope = parent_of(n, tr);
@@ -1268,6 +1657,9 @@ fn declared_text(e: i64, depth: i64, d: TextDecls, pcx: Ctx<Comp>) -> bool {
             return false;
         }
         let b = d.binds.get(best + 3);
+        if pcx.nodes[b].kind == NodeKind::PatBind {
+            return d.tuples.get(b + 1) == 2;
+        }
         if pcx.nodes[b].kind == NodeKind::Param || pcx.nodes[b].b > 0 {
             let t = pcx.nodes[b].b;
             return t <= 0 || pcx.nodes[t].kind != NodeKind::TySlice;
@@ -1363,6 +1755,9 @@ fn declared_bytes(e: i64, depth: i64, d: TextDecls, pcx: Ctx<Comp>) -> bool {
             return d.statics.get(pcx.nodes[e].a + 1) == 1;
         }
         let b = d.binds.get(best + 3);
+        if pcx.nodes[b].kind == NodeKind::PatBind {
+            return d.tuples.get(b + 1) == 1;
+        }
         if pcx.nodes[b].kind == NodeKind::Param || pcx.nodes[b].b > 0 {
             let t = pcx.nodes[b].b;
             return t > 0 && pcx.nodes[t].kind == NodeKind::TySlice;
@@ -1388,6 +1783,16 @@ fn declared_bytes(e: i64, depth: i64, d: TextDecls, pcx: Ctx<Comp>) -> bool {
     }
     if k == NodeKind::Unary && pcx.nodes[e].op == Tok::Amp {
         return declared_bytes(pcx.nodes[e].b, depth + 1, d, pcx);
+    }
+    if k == NodeKind::Unary && pcx.nodes[e].op == Tok::Star {
+        // (what a raw pointer written `*[u8]` points to, `*message`)
+        let o = pcx.nodes[e].b;
+        let best = if o > 0 && pcx.nodes[o].kind == NodeKind::Ident { bound_at(o, d, pcx) }
+            else { -1 };
+        let b = if best >= 0 { d.binds.get(best + 3) } else { 0 };
+        let t = if b > 0 && pcx.nodes[b].kind != NodeKind::PatBind { pcx.nodes[b].b } else { 0 };
+        return t > 0 && pcx.nodes[t].kind == NodeKind::TyPtr && pcx.nodes[t].a > 0
+            && pcx.nodes[pcx.nodes[t].a].kind == NodeKind::TySlice;
     }
     if k == NodeKind::If {
         // (both branches, `if c { &s[1..] } else { s }`, a literal one only
@@ -1651,13 +2056,17 @@ pub fn body_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
         } else if k == NodeKind::Call || k == NodeKind::FieldAccess {
             edit_len(n, &tr, &pcx);
             edit_call_args(n, &tr, &pcx);
+            edit_text_to_bytes(n, decls, &tr, &pcx);
         } else if k == NodeKind::Index {
             // (a raw pointer's part: ptr_slice_edits, after the statics)
             if !ptr_slice_node(n, pcx) {
                 edit_view(n, &tr, &pcx);
                 edit_index(n, &tr, &pcx);
                 edit_ptr_index(n, &tr, &pcx);
+                edit_text_to_bytes(n, decls, &tr, &pcx);
             }
+        } else if k == NodeKind::Ident {
+            edit_text_to_bytes(n, decls, &tr, &pcx);
         } else if k == NodeKind::Str {
             edit_str(n, decls, &tr, &pcx);
         } else if k == NodeKind::Char {
