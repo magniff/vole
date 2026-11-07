@@ -103,6 +103,8 @@ The front's gaps behind std2's XFAILs (front2721b):
   reference impls; an ambiguity message for a pattern impl no longer
   reads past TLISTS (the crash at types.vl:608).
 - `{:E}` is UpperExp, and `{:-}` sets Formatter's sign_minus.
+- Deref coercion at an argument: `&Box<T, A>` where `&T` goes, and in a
+  generic call through the Deref chain (`sum(rest)` binds A, F32.2).
 The borrow checker (bc2721):
 
 - Implied outlives bounds as rustc's well-formedness (borrowck.md

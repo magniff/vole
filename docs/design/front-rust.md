@@ -363,6 +363,18 @@ parameter's inference (`f(&[1, 2])` with `f<T>(x: T)` gives `T = &[i64;
 check_call_arg`, `front/check/mod.vl: mismatch_error`, `front/check/
 widen.vl`.
 
+**F32.2 (deref coercion through Deref, 0.27.2.1).** At a coercion site a
+shared reference `&S` where `&U` (or the view `&[T]`, `&str`) is
+expected, with `U` reached from `S` by `<_ as Deref>::Target` steps (at
+most 4), is `n.deref()` that many times: `f(&b)` with `b: Box<i64, A>`
+and `f(x: &i64)`. At a generic call, a parameter `&P` whose own
+parameters the argument `&S` does not bind is unified with the first
+`&D` of the chain that binds them (`sum(rest)` with `rest: &Box<List<A>,
+A>` and `sum<A>(l: &List<A>)`), as rustc's coercion of an argument
+against `&List<?A>`. *Anchor:* `front/check/rust.vl: deref_coerce,
+deref_projection`, `front/generics/instantiate.vl: deref_unify`. Case
+`rust_f_f32_deref_coerce_ok`.
+
 ### F33 Raw pointers hold no allocator
 
 **F33.1 (alloc.field through a raw pointer).** In a rust-edition
