@@ -598,6 +598,13 @@ reference (`&'a T: IntoIterator`), a closure bound (`F: FnMut(I::Item)
 -> B`, D20.1). *Anchor:* `front/parser/items/params.vl: parse_where`
 (today `edition.later: where_bound` for a non-parameter subject),
 `front/parser/rust.vl: where_key`.
+A clause is its own item's: a function's is checked for that function
+(F10.2), a struct's, an enum's, a trait's and an impl's are none
+function's (0.27.3: a struct's predicate was the function's parsed
+before it, `struct Flatten<I> where I::Item: IntoIterator` read as a
+bound of Cloned's `next_back` when the whole std2 was loaded; which
+impls a program loads does not change which predicates a function has).
+Case `std2_iter_adapters_cloned_impl_doubleendediterator`.
 
 **F10.2 (at instantiation).** For an instance with substitution `θ`,
 every clause `σ: Tr<b..>` is checked as `θ(σ): Tr<θ(b)..>` by F0.4 at
@@ -1018,6 +1025,13 @@ rustc E0512) and the bits are reinterpreted (a move, no drop of `x`).
 `char::from_u32_unchecked` is written with it (M3a's gap 11; the
 `*const u32 as *const char` spelling is Z9.3-legal too).
 
+**F19.6 (`static mut`).** In a rust-edition position a read or a write of
+a `static mut` item is an unsafe operation (`error unsafe`, rustc E0133):
+inside `unsafe { }` or an `unsafe fn`'s body only. A reference to one is
+D6.2.5's error either way. An MVS `static var` is unchanged (safe).
+*Anchor:* `front/check/names.vl: synth_name` (`U_STATIC_MUT`). Case
+`rust_f_f19_static_mut_err`.
+
 ### F22 `for` loops
 
 **F22.1 (desugaring).** In a rust-edition position
@@ -1180,7 +1194,9 @@ writer `w` for `write(w, ..)`/`writeln` (calling `w.write_fmt`-free:
 the pieces go to `w.write_str` through `fmt::Write` or `io::Write`,
 whichever `w` implements, F13.2), a 256-byte stack buffer for
 `panic`/`assert*` (0.26.2's decision 5). `write`/`writeln` return
-`fmt::Result` (or `io::Result<()>` for an `io::Write` writer); the
+`fmt::Result` (or `io::Result<()>` for an `io::Write` writer: 0.27.3,
+through the tail's `std::__rt::io_fmt`, the first io error kept, its
+`finish` the value; a writer whose referent is no `fmt::Write`); the
 print functions return `()`. The lowering is rust-edition generated
 code (Z1): the trait calls are F0.5's and go through F15.1's intrinsic
 impls for primitives (the number formatting MVS has). *Anchor:*
@@ -1557,6 +1573,10 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   (`impl Pattern for &str`). 0.27.2.1 has the parts that do not need it:
   `size_of_val` of a view (its length times the element's size) and
   `size_of::<[T]>()`/`size_of::<str>()` as `type.unsized`.
+  (0.27.3) Stage 1 is Z9.1b. Until stage 2, a view written as an
+  element or argument, `Vec<[i64]>`, is the view (`Vec<&[i64]>`) and is
+  accepted; rustc rejects it (E0277), F21.2's `type.unsized` under stage
+  2 (rust_capture_view_copy writes `Vec<&[i64]>`).
 - **FL11 (the opaque instance's type errors; later, 0.27.3).**
   borrowck.md D22.2: in 0.27.2.1 an opaque instance reports only the
   bound-only rule's error (D22.3) on a parameter's own Ω, with no `where`
