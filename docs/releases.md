@@ -105,6 +105,63 @@ Gate 2's harness (twin273):
 - `tools/borrowck-twin.sh --shim`: the verdicts through the shim. The gate row uses it: 365 of 400 agree (358 with `--std2`), 10 divergences, 0 mismatches. Seven `// RUSTC: none` markers ("no allocator until 0.27.3") are gone.
 - `tests/translate.sh --record query|refactor`: the migration surface's record mode. Each transcript's program is translated in a copy, the suite's runner re-records the transcripts (`-u`), and the result is a diff to review (target/translate/record/SUITE.diff). With the identity translator, 0 of 42 query transcripts change. `tests/guide/run.sh --split DIR` writes the guide's blocks out for the runners.
 
+std2 (std273):
+
+- f64's and f32's methods, Rust's names and meanings (front-rust.md
+  F15.4's "come in 0.27.3"): `floor`, `ceil`, `round`,
+  `round_ties_even`, `trunc`, `fract`, `abs`, `signum`, `copysign`,
+  `is_nan` and the other tests, `min`, `max`, `clamp` (which panics on
+  min > max), `recip`, `to_radians`, `to_degrees`, `sqrt`, `cbrt`,
+  `hypot`, the trigonometric functions, `exp`, `exp2`, `ln`, `log2`,
+  `log10`, `log`, `powi`, `powf`, `next_up`, `next_down`, `div_euclid`,
+  `rem_euclid`, `total_cmp`, `to_bits`, `from_bits`. They live in
+  std2's private `fmath` module, which uses MVS's std::math algorithms
+  (fdlibm's, no libm). The transcendental functions are within an ulp
+  or two of the libm Rust calls: their cases print 12 digits. `mul_add`
+  is not in.
+- char's classification and case use Unicode's tables (18.0.0, MVS's),
+  in a private `unicode` module, in place of std2's approximations:
+  `is_alphabetic`, `is_numeric`, `is_whitespace`, `is_lowercase`,
+  `is_uppercase`, `to_uppercase` (`ß` gives `SS`), `to_lowercase`.
+  `str::to_lowercase_in` applies Final_Sigma (`ΟΔΟΣ` gives `οδος`).
+  The tables are str literals, because the front has no `b"..."` yet.
+  char's and str's Debug escape the controls and every white space
+  but `' '`, as Rust's do.
+- `std::sync::atomic`, std::sync's first part: `Atomic<T>`, plus Rust's
+  `AtomicBool`, `AtomicI8` .. `AtomicUsize` and `AtomicPtr` as its
+  aliases, `Ordering`, `fence` and `compiler_fence`. The intrinsics are
+  lowered by name, as MVS's are (Z3.1). A `static` atomic works. A
+  load with Release, or a store with Acquire, panics, where rustc
+  rejects it at compile time.
+- `std::env`: `vars_in(a)`, an iterator of `(String<A>, String<A>)`;
+  `current_dir_in(a)`, a `String<A>`, since std2 has no PathBuf yet;
+  `set_current_dir`. The target's `environ` is in `std::__sys`.
+- char is PartialEq, Eq, PartialOrd, Ord, Hash and Default; `()` is
+  PartialEq, Eq, PartialOrd and Ord. Through `#[array_builtin]`,
+  `[T; N]` is Clone, PartialEq, Eq, PartialOrd, Ord, Hash and Debug,
+  and `&[T; N]` and `&mut [T; N]` are IntoIterator (`for x in &arr`,
+  `derive(Clone)` on a struct with an array field). An array's Hash
+  waits for FL10, as a slice's does. `&[u8]`'s `read_exact` leaves buf untouched at
+  the end, as Rust's does. Fixed std2 bodies: Drain's and Cycle's
+  `size_hint`, and Range's `size_hint`, now `A::steps_between`.
+- rewrite.tsv gains 55 rows for the translator: MVS's math functions
+  become methods, the unicode code-point tests become char's,
+  `f64_to_bits` becomes `to_bits`, `parse_int` and `parse_f64` become
+  `str::parse`, and the env items.
+- std2's cases at -O0 and -O2 under `--check-alloc`: 1,361 of 1,468
+  pass (1,309 of 1,454 in 0.27.2.1, with the other streams' merged
+  fixes counted). There are 15 new cases, each agreeing with rustc
+  (tools/std2-twin.sh), and 10 XFAIL cases now pass on std2's fixes. The 107 XFAIL cases left, by
+  what they wait for: inference from a later statement or the expected
+  type (FL1, 0.27.4) 48; arrays' by-value IntoIterator, which needs
+  const generics or a ManuallyDrop (a union's field is dropped today)
+  27; the integer literal's type from its use (FL6) 12; `[T]`/`&[T]`
+  and the view receivers (FL10) 11; `format_args` 4; `write(w, ..)` on
+  an io::Write 1; and 4 front singles: an empty enum's match, a
+  supertrait default through a bound, Cloned's DoubleEndedIterator
+  bound, and an Index bound on a type parameter. None waits for a
+  std2 body.
+
 ### What's new in 0.27.2.1
 
 The rust edition grows toward Rust: 1,306 of std2's 1,454 tests pass at -O0 and -O2 under `--check-alloc` (1,035 of 1,413 in 0.27.2). `impl Trait` in return position (borrowck.md §21) and the opaque type-parameter instance (§22: an uncalled template's borrows are checked, and a parameter used beyond its bounds is `generic.unbounded_use`; its other type errors are 0.27.3's, FL11). The borrow checker takes rustc's implied outlives bounds (D4.6), and fixes three miscompiles of consumed values that 0.27.2 had: a collection consumed by value (`for x in v`, `extend`, `into_iter`), an arithmetic operator's by-value operands, and `(t, t)` not caught as a use after move (D8.5); a non-Copy element moved out of an array is E0508, and `write(f, .., f.width())` is a two-phase reborrow. The front fills std2's largest gaps (Extend and Borrow chosen by bounds and the expected type, literal temporaries typed by their annotation, traits in scope for methods, operators chosen by the right operand), with an impl-binding soundness fix (F14.2). std2 gains floats printed and parsed as Rust's, `std::env`, tuples' comparisons and Hash; contracts and effects R2 declare every std2 `pub` item's effects, with 27 `requires` and 11 `ensures`. A rust hello world's check costs 3.48x MVS's (4.38x in 0.27.2); the gate builds std2's tests half as often. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
