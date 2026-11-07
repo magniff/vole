@@ -1177,8 +1177,18 @@ rustc E0512) and the bits are reinterpreted (a move, no drop of `x`).
 a `static mut` item is an unsafe operation (`error unsafe`, rustc E0133):
 inside `unsafe { }` or an `unsafe fn`'s body only. A reference to one is
 D6.2.5's error either way. An MVS `static var` is unchanged (safe).
-*Anchor:* `front/check/names.vl: synth_name` (`U_STATIC_MUT`). Case
-`rust_f_f19_static_mut_err`.
+(0.27.4) Since every such use is unsafe, the program vouches for it, and a
+thread may reach it, as in rustc: a rust-edition `static mut` (or an
+`extern` static) used by a spawned closure, or by what it calls, is not
+`sync.global`, and neither is a C function declared in the rust edition
+(its call is unsafe too; `--check-alloc`'s allocator, std2's, calls
+`mmap` and `sigaction` from any thread). Each keeps the `global` effect,
+the memory the optimizer keeps other threads' view of
+(contracts-effects.md E1). An MVS `static var` stays for the main thread
+only. *Anchor:* `front/check/names.vl: synth_name` (`U_STATIC_MUT`),
+`front/effects/infer.vl: walk_ident`, `effects/check.vl:
+extern_effects` (no `raw_global`). Cases `rust_f_f19_static_mut_err`,
+`rust_f_f19_static_mut_thread`.
 
 **F19.7 (unions drop nothing).** A union declared in a rust-edition
 position has no drop glue of its own fields (an `impl Drop for U` of its
