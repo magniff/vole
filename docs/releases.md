@@ -128,9 +128,16 @@ The front (front274):
   error (E0745). D6.2.5 is tightened: `&mut S` of a `static mut` is a
   reference even where a `*mut T` goes (`let p: *mut T = &mut S;`), and
   its help now gives `&raw mut S`. std2's checking allocator takes its
-  lock's address that way.
+  lock's address that way. A place under the deref of a raw borrow is a
+  place through the raw pointer: `(*&raw mut S).push(2)` and `&mut
+  *&raw mut S` make no reference to the static (D6.2.5), as in rustc.
 - `e as *const _` and `e as *mut _` take the pointee from the operand
   (F29.1). An integer cast to one is E0641.
+- A closure whose body is a captured integer widened to its bound's
+  result type (`move || k` with `FnOnce() -> i64` and `k` an i32, as a
+  loop's `thread::spawn_in(move || k, gpa)`) failed the build ("places: a
+  function not lowered from its body", MVS too): the capture is found
+  under the widening cast now.
 
 ### What's new in 0.27.3
 
