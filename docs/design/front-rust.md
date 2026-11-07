@@ -400,15 +400,20 @@ rust-edition position, with these readings:
   str` is `<str as AsRef<[u8]>>`, in an instance too, with or without an
   expected type (before, with `let b: &[u8] = ..` the reference impl took
   it, called itself, and the program overflowed its stack).
-- *Not yet: an instance's call is resolved again, not the template's
-  choice substituted* (0.27.5, a wrong output). rustc resolves a method
-  call once, on the generic body: `(**self).tag()` in `impl<T: ?Sized +
-  Tag> Tag for &T` is `<T as Tag>` for every T, so with `C = &&str`,
-  `via(r)` of `fn via<C: Tag>(c: C) { c.tag() }` is the reference impl
-  twice (21). Vole checks the instance's body with T = `&str` and takes
-  the place's impl for `(**self)`, a view (11). The fix: an instance's
-  call takes the template's resolution with the instance's types. Case
-  `rust_f_z91c_template_choice` (XFAIL).
+- *An instance's call through a type parameter* (0.27.5). rustc resolves
+  a method call once, on the generic body: `(**self).tag()` in `impl<T:
+  ?Sized + Tag> Tag for &T` is `<T as Tag>::tag` for every T. Vole checks
+  the instance's body, and a receiver whose type as written in the body
+  is a bare type parameter T bounded by a trait Tr that declares the
+  method takes `<X as Tr>::m`, X the type T stands for: X's own impl of
+  Tr or a pattern impl (`impl<T> Tr for &T`), its `&self` borrowing the
+  receiver, and never a method found again through X's references or a
+  view's place. So with `C = &&str`, `via(r)` of `fn via<C: Tag>(c: C) {
+  c.tag() }` is the reference impl twice (21, as rustc; 0.27.4 took
+  str's for `(**self)`, 11). The type as written is a local's declared
+  type (a parameter's, a `let`'s annotation), `Self` read as the impl's
+  self type as written, and `*e` as e's pointee; any other receiver is
+  resolved in the instance as before. Case `rust_f_z91c_template_choice`.
 - *`&'a T` of an unsized argument in a signature* (0.27.5, D4.6). With
   `T = Unsized(v)`, `&'a T` is the view `v` whose region is the
   reference's (`'a`, or the elided one, E2/E3's), with T's slots (the
