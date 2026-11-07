@@ -284,7 +284,9 @@ fill<R: Read>(r: &mut R)` with R = `&[u8]`: a Sized parameter is never
 `[T]`, so a view it stands for is a reference.
 A `?Sized` parameter bound to a view keeps the exclusive view (it may be
 `[T]`; telling `R = &[u8]` from `R = [u8]` is Z9.1c's, the second stage). *Anchor:*
-`front/check/resolve.vl: view_ref_node, sized_param_node`. Cases
+`front/check/resolve.vl: view_ref_node, sized_param_node`, `front/parser/types.vl:
+parse_ref_rest` (`&mut &[u8]` a TyPtr around the view), `synth_mode.vl:
+synth_index` (`self[n..]` through a `&mut &str`). Cases
 `rust_f_z91b_mut_ref_view`, `rust_f_z91b_sized_param`.
 ### F23 Literals
 
