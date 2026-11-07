@@ -123,6 +123,16 @@ if GUIDE:
         progs.append(("guide-" + b, src, rd("out"), int(rd("exit", "0") or 0), rd("stdin"), [], True))
 
 
+def overflow_checks(src):
+    """vole's: on at -O0 (a case's FLAGS level, else the suite's -O2-safe
+    default, off), or as its --overflow-checks= says."""
+    flags = " ".join(re.findall(r"^\s*// FLAGS:(.*)$", src, re.M))
+    m = re.search(r"--overflow-checks=(on|off)", flags)
+    if m:
+        return m.group(1) == "on"
+    return re.search(r"(^|\s)-O0\b", flags) is not None
+
+
 def run(prog):
     name, src, want, wexit, stdin, args, merged = prog
     m = re.search(r"^\s*// RUSTC-DIFFERS:\s*(.*)$", src, re.M)
@@ -137,7 +147,7 @@ def run(prog):
     exe = os.path.join(d, "main")
     # (Rust's overflow checks where vole's are: a case built at -O0)
     bad = rustc_build(RUSTC, os.path.join(d, "main.rs"), exe, rust_edition(src),
-                      overflow=bool(re.search(r"^\s*// FLAGS:.*(^|\s)-O0\b", src, re.M)), alloc_api=ALLOC)
+                      overflow=overflow_checks(src), alloc_api=ALLOC)
     if bad:
         # (a borrowck divergence the case names, tools/borrowck-twin.sh's)
         mk = re.search(r"^\s*// RUSTC: rejects\s+(\S+)\s*(.*)$", src, re.M)

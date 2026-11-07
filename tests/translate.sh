@@ -14,7 +14,8 @@
 #   -c COMPILER     the volec to build with (default: target/volec, else
 #                   target/tools/volec)
 #   -j N            programs at once (default 4)
-#   -O LEVEL        the level every program is built at (default 0)
+#   -O LEVEL        the level every program is built at (default 0, and 2
+#                   for bench, whose programs are sized for it)
 #   -s SETS         the sets, comma separated (default examples,bench,run):
 #                     examples  tests/examples/*.test, each its SOURCE's
 #                               directory, with the case's directives
@@ -131,7 +132,7 @@ export VOLE_CODE_CACHE
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 COMPILER=""
 JOBS=4
-OPT=0
+OPT=""
 SETS=examples,bench,run
 TRANSLATOR=""
 IDENTITY=0
@@ -247,6 +248,8 @@ from concurrent.futures import ThreadPoolExecutor
  VERBOSE, LISTS, TWIN, ALLOC) = sys.argv[1:15]
 FILTERS = sys.argv[15:]
 ALLOC = ALLOC == "1"
+OPT_GIVEN = OPT != ""
+OPT = OPT or "0"
 TWIN_NAME = "rustc twin (allocator_api, RUSTC_BOOTSTRAP=1)" if ALLOC else "rustc twin"
 sys.path.insert(0, os.path.join(ROOT, "tools", "rustc-twin"))
 from twin import directives, trimmed, stdout_differs, to_rust, rustc_build, rust_edition, find_rustc  # noqa: E402
@@ -313,7 +316,10 @@ def programs():
                 if "// bench-std: data" in src or not re.search(r"^fn main\(", src, re.M):
                     continue  # (reads a file bench/std/run.sh makes; a module)
                 name = (sub[len("bench"):].lstrip("/") + "/" if sub != "bench" else "") + f[:-3]
-                out.append(("bench", name, p, None, directives(p), False))
+                d = directives(p)
+                if not OPT_GIVEN:
+                    d["level"] = "2"  # (sized for -O2, as bench/run.sh builds them)
+                out.append(("bench", name, p, None, d, False))
     if "guide" in SETS:
         gdir = os.path.join(WORK, "guide-blocks", "blocks")
         for b in sorted(os.listdir(gdir)):
@@ -384,7 +390,8 @@ def build(entry, cwd, d, out, rust, log):
     flags = [f.replace("@ROOT@", ROOT) for f in d["flags"]]
     cs = [os.path.join(ROOT, c) for c in d["csource"]]
     # (as tests/run.sh: --check-unsafe needs the IR, -O1 for -O0)
-    level = "1" if OPT == "0" and "--check-unsafe" in flags else OPT
+    opt = d.get("level", OPT)
+    level = "1" if opt == "0" and "--check-unsafe" in flags else opt
     cmd = [COMPILER, f"-O{level}"] + (["--edition", "rust"] if rust else []) + flags
     if d.get("cheader"):
         r = subprocess.run(cmd + ["--emit-header", entry, "-o", os.path.join(cwd, d["cheader"])],
@@ -477,9 +484,11 @@ def twin(key, w, mine, src, d, want):
         f.write(rs)
     if why:
         return "outside", why
-    level = next((f[2:] for f in d["flags"] if re.fullmatch(r"-O[0-2]", f)), OPT)
+    level = next((f[2:] for f in d["flags"] if re.fullmatch(r"-O[0-2]", f)), d.get("level", OPT))
+    checks = next((f.split("=", 1)[1] == "on" for f in d["flags"] if f.startswith("--overflow-checks=")),
+                  level == "0")
     bad = rustc_build(RUSTC, os.path.join(tw, "main.rs"), os.path.join(tw, "prog"), rust_edition(text),
-                      overflow=(level == "0"), alloc_api=ALLOC)
+                      overflow=checks, alloc_api=ALLOC)
     if bad:
         # (a borrowck divergence the program names, tools/borrowck-twin.sh's)
         mk = re.search(r"^\s*// RUSTC: rejects\s+(\S+)\s*(.*)$", text, re.M)
