@@ -126,6 +126,34 @@ std2 (std2721):
 - The XFAIL std2 cases grouped by cause and owner; the cases that failed
   only on their own unused imports or test shapes are fixed.
 
+Compile cost and the machine's load (cost2721):
+
+- hello-rust from 4.38x its MVS row to 3.35x (`tests/compile_cost.sh`,
+  434M to 327M instructions); MVS's rows are not dearer: hello 0.99x,
+  std 0.99x, check 0.91x, rust 0.97x of 0.27.2. std2's declaration
+  tables are walked by key, not scanned whole: the lifetimes by node,
+  the `where` predicates by owner, METHODS by type and name, the impls
+  by trait. gm_key keeps a method's name in the bits HMap hashes.
+  std2's impls are not checked against their traits in every compile;
+  the gate's `--std2-check` row checks them whole.
+- What is left of hello-rust's cost over MVS's is structural: std2 is
+  lexed and parsed whole (+47M), its 489 builtin impls are made and
+  parsed (33M), and its println costs the back end +40M. A pass that
+  left out the impls of traits nothing reaches was measured and dropped:
+  println reaches nearly every trait, and the pass cost more than the 95
+  impls it left out. 0.27.3 takes lazy std2 parsing, in sections as MVS's
+  std is read, with a lighter std2 println.
+- The gate builds std2's cases three times, not six. The std2-tests row
+  reads its counts from the suite rows' case results ($VOLE_TEST_RESULTS),
+  and std2-check compiles only the cases suite-O0 did not pass (283 of
+  1,413), with the same tally.
+- The check hook reports its rewrites when the check after them times
+  out, and its compiler runs' limits grow with the load average (at most
+  8 times): the hooks test "the hook's rewrites, each a changed line"
+  failed under the gate's load.
+- The stress-grow row's one-time segfault (arch_x86_sse3.vl at -O0 for
+  x86_64-macos) did not recur in 42,400 compilations under load.
+
 ### What's new in 0.27.2
 
 The rust edition's std is std2, Rust's std with explicit allocators: a rust-edition program now reads `std::vec::Vec`, `String`, `HashMap`, the iterator adapters, `fmt`, `io` and `thread` as Rust's, and 1,032 of std2's 1,413 tests pass at -O0 and -O2 under `--check-alloc` (gate 1). The front end fills the gaps std2's bodies hit (pattern and blanket impls, coherence, deref coercion, ranges, format specs; the rules are docs/design/front-rust.md). Closures are checked in full: their kinds, captures and signatures, `Send` and `Sync`, and the borrow checker reads their bodies (`borrowck.unchecked` is gone), with Rust's mutability errors E0594 and E0596. `[T]` and `str` are unsized types; their full representation, `impl Trait` in return position and the rest of std2 are 0.27.2.1's. MVS programs compile exactly as before; a rust hello-world's `check` costs about 4.2x MVS's (printed, not enforced; 2.0x is 0.27.4's target). Built and tested on aarch64-macos only.

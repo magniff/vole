@@ -18,7 +18,10 @@
 #
 #   hello-rust  a rust hello world built, at most 2.0x hello's (target 1.5x;
 #               printed, not failing: the ceiling 2.0x is enforced from
-#               0.27.4; 0.27.2 shipped at about 4.4x)
+#               0.27.4; 0.27.2 shipped at about 4.4x, 0.27.2.1 at 3.35x:
+#               the rest is std2 lexed and parsed whole, +47M, its builtin
+#               impls, 33M, and println's back end, +40M; lazy std2
+#               sections and a lighter println are 0.27.3's)
 #   std-rust    tests/cost/std2_heavy.vl built, at most 2.0x std's (target 1.5x)
 #
 # Instructions, not time: they hardly move with the machine's load. They
