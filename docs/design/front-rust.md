@@ -1158,10 +1158,19 @@ expectation does. So does a sliced array literal where `&[U]` goes,
 Where `&mut [U]` goes (0.27.6), the slice is checked as `[U]` and the
 reference is the exclusive one, so `&mut [1, 2, 3][..]` passed to a `&mut
 [i64]` is accepted, as rustc accepts it (0.27.5 checked the slice against
-`&mut [U]` and refused it). A shared `&` there becomes exclusive, as any
-`&e` where `&mut` goes does (check_mode: check_expr, the inout marker):
-rustc refuses `&[1, 2, 3][..]` there (E0308), a known gap of the rust
-edition's `&`, which a translation must not rely on.
+`&mut [U]` and refused it).
+
+*A shared `&e` where `&mut` goes* (0.27.6) is refused in the rust
+edition, as rustc refuses it (E0308, the types differ in mutability):
+`bump(&n)` with `bump(x: &mut i64)`, `first(&[1, 2, 3][..])` and
+`first(&a[..])` with `first(v: &mut [i64])`. Each is a `type error`
+(not MVS's `own.readonly`) whose help says so and whose `try:` and fix
+borrow exclusively (`&mut n`, `&mut [1, 2, 3][..]`, `&mut a[..]`). The
+`&` of a rust node is shared as written: MVS's inout marker, which makes
+`&x` exclusive where an exclusive reference is expected (check_mode:
+check_expr and coerce_ref), is MVS's alone. 0.27.5 accepted all three.
+Cases: rust_f_f18_shared_for_mut_err, and tests/borrowck-try's mut_ref_arg,
+mut_slice_literal and mut_slice_place, whose try: lines are run.
 Not yet the same slicing as a `let`'s whole initializer, `let s: &[i64]
 = &[1, 2, 3][1..];`, which F18.4's hoisting takes first (the fallback,
 `i32`: a type error). *Anchor:* `check_mode.vl: check_expr_inner`.
