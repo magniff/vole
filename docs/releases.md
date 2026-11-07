@@ -140,6 +140,22 @@ The front (front273):
   impl's supertrait check (`derive_generic.vl` read in the rust edition).
 - front-rust.md names FR5 (integer widening) and FR6 (an index of any
   integer type), the rust edition's lenient MVS rules.
+- On std2 a `&str` is Copy and clones by copying (F0.4): `parts.iter()
+  .copied()` over a `[&str]`, `Option<&&str>::copied`, `r.clone()` of a
+  `&&str`, `repeat_n("a", 2)`; of two impls a `&str` makes alike
+  (`Extend<T>`, `Extend<&'a T>` of a `Vec<&str>`) the by-value one is
+  taken (F26.3).
+- `TryFrom::try_from(x)` takes Self from an expected `Result<Self, _>`
+  (F8.2), and `x.try_into()` against an expected `Result<U, _>` is
+  `U::try_from(x)`; without an expected type (a match's scrutinee, a
+  generic instance) U waits for FL1 (0.27.4).
+- A range value indexes a slice, an array or a str through Index (`a[r]`
+  with `r: Range<usize>`, a RangeFull; a read, F26.3); a RangeFull's
+  RangeBounds parameter comes from the expected type
+  (`r.start_bound()` as a `Bound<&i64>`, F14.1).
+- A `&mut self` method of str on a String's index borrows it through
+  IndexMut (`s[1..].make_ascii_uppercase()`, `&mut s[1..]`), and needs
+  the String mutable (own.readonly, rustc E0596).
 
 std2 (std273):
 
