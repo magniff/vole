@@ -920,6 +920,12 @@ iterator, which drops what it holds; `e` is not dropped again. The exception is 
 loop over an array value (F22.1's plain elements, which reads each
 element in place by its index): its sequence is a borrowed copy, as in
 MVS. MVS's `for` over a place is a borrowed copy (unchanged).
+The same holds for an arithmetic operator's operands (F26: `a + b` is
+`Add::add(a, b)`, its desugaring's `let =+l = a; let =+r = b;`): each
+binding takes its place by an `OK_MOVE`, so `a` and `b` are moved by
+`a + b` (E0382 after it) and dropped once, by `add`; a compound `a +=
+b` moves `b` into `add_assign(&mut a, b)`. A comparison's operands
+(`==l`, `==r`: `PartialEq::eq(&a, &b)`) stay borrowed copies.
 
 **D8.6 (moves out of an index; 0.27.2.1).** In a rust body an index
 `a[k]` of an array or slice whose element type is not `Copy` is a place
