@@ -11,8 +11,9 @@ use crate::front::lexer::Tok;
 use crate::front::types::{TY_I64, TY_U8, TyKind};
 use crate::tools::translate::{
     D_REF, TC_BORROW, TC_BYTES, TC_DEREF, TC_INOUT_LOCAL, TC_INT, TC_LEN, TC_MUT_MARKER, TC_PRINT,
-    TC_STATIC, TC_VAR, TC_VIEW, Tr, add_ref, editable, enclosing_fn, ident_char, is_mut_ref, is_ref,
-    is_ws, own_node, parent_of, put, ref_binding, skip_ws, token_at, word_here, written_name,
+    TC_STATIC, TC_USIZE, TC_VAR, TC_VIEW, Tr, add_ref, editable, enclosing_fn, ident_char,
+    is_mut_ref, is_ref, is_ws, own_node, parent_of, put, ref_binding, skip_ws, token_at, word_here,
+    written_name,
 };
 
 // The symbol of the name node n is written as (its token's), or 0.
@@ -270,11 +271,77 @@ fn edit_view(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
         return;
     }
     let p = parent_of(n, tr);
-    if p > 0 && (receiver_of(n, p, pcx) || pcx.nodes[p].kind == NodeKind::Index
-        && pcx.nodes[p].a == n) {
+    // (a method's receiver, `.len` too: Rust borrows it itself)
+    if p > 0 && (receiver_of(n, p, pcx) || (pcx.nodes[p].kind == NodeKind::Index
+        || pcx.nodes[p].kind == NodeKind::FieldAccess) && pcx.nodes[p].a == n) {
         return;
     }
     put(s, s, if mut_slice(t, pcx) { "&mut " } else { "&" }, TC_VIEW, &tr, &pcx);
+}
+
+// A raw pointer's element, `p[i]` (MVS indexes a `*T`), is `(*p.add(i))`
+// (rustc E0608: a raw pointer is not indexed), a place as well as a value.
+fn edit_ptr_index(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let a = pcx.nodes[n].a;
+    let b = pcx.nodes[n].b;
+    if a <= 0 || b <= 0 || pcx.nodes[b].kind == NodeKind::Range
+        || token_at(pcx.nodes[n].start, pcx) < 0 {
+        return;
+    }
+    let t = pcx.nodes[a].ty;
+    if t <= 0 || pcx.types[t].kind != TyKind::Ptr || pcx.types[t].b != 0 {
+        return;
+    }
+    var q = pcx.nodes[a].end;
+    while q < pcx.nodes[b].start && SRC[q] != '[' {
+        q += 1;
+    }
+    let e = pcx.nodes[n].end - 1;
+    if q >= pcx.nodes[b].start || SRC[e] != ']' {
+        return;
+    }
+    if put(q, q + 1, ".add(", TC_USIZE, &tr, &pcx) {
+        // (no once-per-place key: `pp[i][j]` opens two at one place)
+        let open = crate::base::buf_new();
+        crate::base::buf_bytes(open, "(*");
+        crate::tools::edit::edit_replace(pcx.nodes[n].start, pcx.nodes[n].start, open, &pcx);
+        // (not TC_USIZE's key: an index's ` as usize` may end where `]` is)
+        put(e, e + 1, "))", -1, &tr, &pcx);
+    }
+}
+
+// An i64 index is `i as usize` (Rust indexes with a usize; until the
+// rust edition infers it, FL6), a range's ends too; a literal is left.
+fn edit_index(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let b = pcx.nodes[n].b;
+    if b <= 0 || token_at(pcx.nodes[n].start, pcx) < 0 {
+        return;
+    }
+    if pcx.nodes[b].kind == NodeKind::Range {
+        cast_usize(pcx.nodes[b].a, &tr, &pcx);
+        cast_usize(pcx.nodes[b].b, &tr, &pcx);
+    } else {
+        cast_usize(b, &tr, &pcx);
+    }
+}
+
+fn cast_usize(e: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    if e <= 0 || pcx.nodes[e].ty != TY_I64 || pcx.nodes[e].kind == NodeKind::Int {
+        return;
+    }
+    let k = pcx.nodes[e].kind;
+    let simple = k == NodeKind::Ident || k == NodeKind::Call || k == NodeKind::FieldAccess
+        || k == NodeKind::Index || k == NodeKind::TupleField || k == NodeKind::MethodCall
+        || k == NodeKind::Path || k == NodeKind::Unary || k == NodeKind::Cast
+        || k == NodeKind::Block;
+    let s = pcx.nodes[e].start;
+    let t = pcx.nodes[e].end;
+    if simple {
+        put(t, t, " as usize", TC_USIZE, &tr, &pcx);
+    } else if put(s, s, "(", TC_USIZE, &tr, &pcx) {
+        put(t, t, ") as usize", TC_USIZE, &tr, &pcx);
+        tr.counts[TC_USIZE] -= 1;
+    }
 }
 
 fn word_back(q: i64, w: [u8]) -> bool {
@@ -357,6 +424,9 @@ fn edit_static(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
 // takes bytes (a parameter, a let's annotation, a result of `[u8]`) is
 // `"..".as_bytes()` (a literal is a str in the rust edition).
 fn edit_str(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    if tr.text_mode {
+        return;
+    }
     let t = pcx.nodes[n].ty;
     if t <= 0 || pcx.types[t].kind != TyKind::Slice || pcx.types[t].a != TY_U8
         || SRC[pcx.nodes[n].start] != '"' {
@@ -405,6 +475,123 @@ fn edit_char(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     }
 }
 
+// An integer literal MVS types by its context as another type than i64,
+// given to a std function (a generic one, `assert_eq(v.len(), 2)`): its
+// type as a suffix, `2usize` (the rust edition infers no further).
+fn edit_int(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let t = pcx.nodes[n].ty;
+    if pcx.nodes[n].b != 0 || t <= 0 || t == TY_I64 || !crate::front::types::is_integer(t)
+        || token_at(pcx.nodes[n].start, pcx) < 0 {
+        return;
+    }
+    let k = token_at(pcx.nodes[n].start, pcx);
+    if pcx.toks[k].kind != Tok::Int || pcx.toks[k].end != pcx.nodes[n].end {
+        return;
+    }
+    var p = parent_of(n, tr);
+    if p > 0 && pcx.nodes[p].kind == NodeKind::Unary && SRC[pcx.nodes[p].start] != '-' {
+        p = parent_of(p, tr);
+    }
+    if p <= 0 || pcx.nodes[p].kind != NodeKind::Call {
+        return;
+    }
+    let f = pcx.nodes[p].x - 1;
+    if f < 0 || f >= pcx.fns.len() as i64 || pcx.fns[f].node > 0
+        && editable(pcx.nodes[pcx.fns[f].node].start, &pcx) {
+        return;
+    }
+    let b = crate::base::buf_new();
+    crate::front::types::buf_type(b, t, pcx);
+    put(pcx.nodes[n].end, pcx.nodes[n].end, crate::base::buf_slice(b), TC_INT, &tr, &pcx);
+}
+
+// ---- Text or bytes ----
+
+fn byte_slice(t0: i64, pcx: Ctx<Comp>) -> bool {
+    var t = t0;
+    if t > 0 && pcx.types[t].kind == TyKind::Ptr {
+        t = pcx.types[t].a;
+    }
+    t > 0 && pcx.types[t].kind == TyKind::Slice && pcx.types[t].a == TY_U8
+}
+
+// Whether type t holds bytes as a container: a Vec<u8, A>, a Buf, an array
+// of u8.
+fn byte_container(t0: i64, pcx: Ctx<Comp>) -> bool {
+    var t = t0;
+    if t > 0 && pcx.types[t].kind == TyKind::Ptr {
+        t = pcx.types[t].a;
+    }
+    if t <= 0 {
+        return false;
+    }
+    if pcx.types[t].kind == TyKind::Array {
+        return pcx.types[t].a == TY_U8;
+    }
+    crate::front::conv::container_elem(t, pcx) == TY_U8
+}
+
+// (the approved rule: `[u8]` is `&str` only when every use agrees) Whether
+// the program uses its `[u8]` values as text alone: no byte read by index,
+// no loop over one, no view of a byte container (a Vec<u8>'s, an array's),
+// no byte method (`iter`, `as_ptr`, `extend_from_slice`).
+pub fn text_program(tr: Tr, pcx: inout Ctx<Comp>) -> bool {
+    var any = false;
+    for n in 1..pcx.nodes.len() as i64 {
+        if !own_node(n, tr, &pcx) {
+            continue;
+        }
+        let k = pcx.nodes[n].kind;
+        if k == NodeKind::TySlice {
+            let e = pcx.nodes[n].a;
+            if e > 0 && SRC[pcx.nodes[e].start..pcx.nodes[e].end] == "u8" {
+                any = true;
+            }
+        } else if k == NodeKind::Index {
+            let b = pcx.nodes[n].a;
+            let i = pcx.nodes[n].b;
+            let range = i > 0 && pcx.nodes[i].kind == NodeKind::Range;
+            if b > 0 && !range && byte_slice(pcx.nodes[b].ty, pcx) {
+                return false;
+            }
+            if b > 0 && range && byte_container(pcx.nodes[b].ty, pcx) {
+                return false;
+            }
+        } else if k == NodeKind::For {
+            let c = pcx.nodes[n].c;
+            if c > 0 && (byte_slice(pcx.nodes[c].ty, pcx)
+                || pcx.nodes[c].kind == NodeKind::Let && pcx.nodes[c].c > 0
+                && byte_slice(pcx.nodes[pcx.nodes[c].c].ty, pcx)) {
+                return false;
+            }
+        } else if k == NodeKind::Call && pcx.nodes[n].a == 0 && pcx.nodes[n].count > 0
+            && pcx.nodes[n].b > 0 {
+            let m = crate::base::sym_text(pcx.nodes[n].b, pcx);
+            let r = child(n, 0, pcx);
+            if byte_slice(pcx.nodes[r].ty, pcx) && (m == "iter" || m == "as_ptr" || m == "to_vec_in"
+                || m == "get" || m == "first" || m == "last") {
+                return false;
+            }
+            if m == "extend_from_slice" || m == "as_slice" && byte_container(pcx.nodes[r].ty, pcx) {
+                return false;
+            }
+        }
+    }
+    any
+}
+
+// Whether the program prints a `[u8]` value with `{}` (bytes MVS prints as
+// text): a Str-typed hole of a print.
+pub fn prints_bytes(tr: Tr, pcx: inout Ctx<Comp>) -> bool {
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind == NodeKind::InterpHole && own_node(n, tr, &pcx)
+            && pcx.nodes[n].a > 0 && byte_slice(pcx.nodes[pcx.nodes[n].a].ty, pcx) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn body_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
     // (first the bindings, which the accesses read)
     for n in 1..pcx.nodes.len() as i64 {
@@ -436,10 +623,14 @@ pub fn body_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
             edit_call_args(n, &tr, &pcx);
         } else if k == NodeKind::Index {
             edit_view(n, &tr, &pcx);
+            edit_index(n, &tr, &pcx);
+            edit_ptr_index(n, &tr, &pcx);
         } else if k == NodeKind::Str {
             edit_str(n, &tr, &pcx);
         } else if k == NodeKind::Char {
             edit_char(n, &tr, &pcx);
+        } else if k == NodeKind::Int {
+            edit_int(n, &tr, &pcx);
         } else if k == NodeKind::Closure {
             let s = pcx.nodes[n].start;
             if (pcx.nodes[n].p & CONV_NEW) != 0 && word_here(s, "sink") {
