@@ -172,8 +172,12 @@ The translator (g3274):
   code: 117 type error, 2 distinct.mix, 2 edition.lenient,
   1 item.private). Of the 122, 110 are std2's missing modules and items
   (`std::cli`'s `Matches` above all, `fs`, `process`, `gpu`,
-  `env::get_in`, `count_ones`); borrowck's errors come after the type
-  errors.
+  `env::get_in`, `count_ones`). borrowck runs only on a program with no
+  type errors, so `check --borrowck-partial` (informational) checks the
+  bodies that type-checked, and gate 3 prints that count too: 3,048
+  (2,950 conflict, nearly all a Vec index's copy beside a `&mut` of its
+  root, which rustc accepts: three XFAIL rust_b_ok_index_temp_ cases for
+  0.27.5's fix).
 - The first wall's three shapes: a static's `unsafe { }` that starts a
   statement and is an operand there is `(unsafe { .. })`, and a method
   on a static through the receiver's borrow wraps the call, not a copy;
