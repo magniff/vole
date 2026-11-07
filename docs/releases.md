@@ -127,10 +127,9 @@ The front's smaller gaps (front2721c):
   binds (`P: FnMut(I::Item) -> Option<B>`: MapWhile, Scan, FromFn, Fuse;
   F14.1), and a tuple of literals indexes as the impl's index type
   (`g[(0, 1)]` with `Index<(usize, usize)>`, F20.5).
-- A comparison's right operand of another type picks its PartialEq<Rhs>
-  impl: `s == "x"` for a String, `v == *slice`, a Vec against one on
-  another allocator (F26.3). `s + "bar"` waits: an operator's by-value
-  operand that drops is freed twice.
+- An operator's right operand of another type picks the impl for it:
+  `s == "x"` for a String, `v == *slice`, a Vec against one on another
+  allocator, `s + "bar"` (F26.3).
 - `<T as Tr>::f(..)` in an expression, T a name: `<i32 as
   FromStr>::from_str("-7")` (F8.4).
 
