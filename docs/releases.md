@@ -82,6 +82,25 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.2 | `v0.27.2` | 0.27.1 | aarch64-macos | std2 the rust edition's std (1,032 of 1,413 std2 tests at -O0/-O2 under `--check-alloc`, gate 1); the front's rules (docs/design/front-rust.md: pattern and blanket impls, coherence, deref coercion, ranges, format specs); closures in full (kinds, captures, `Send`/`Sync`, bodies borrow-checked, `borrowck.unchecked` retired, E0594/E0596); `[T]`/`str` unsized; the borrow checker's verdict cache; every rust case on std2 |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.27.2.1
+
+The borrow checker (bc2721):
+
+- Implied outlives bounds as rustc's well-formedness (borrowck.md
+  D4.6): a struct's or enum's inferred outlives requirements (RFC 2093,
+  `struct Iter<'a, T> { v: &'a [T] }` gives `T: 'a`), carried through
+  nested fields; an elided lifetime of an impl's header (`impl Ord for
+  str`) is the impl's own, the same at every `Self`; `&self` on an impl
+  for `[T]` or `str`; `Self` of a trait's default method as a type
+  parameter; a bound's `Item = T` and trait arguments
+  (`B: FromIteratorIn<Self::Item, A>`) as equalities; a blanket impl's
+  projection (`U::IntoIter` of an iterator). 28 std2 tests and 3
+  `rust_t_` cases that failed on `borrowck.outlives` or
+  `borrowck.elision` now pass; `tests/std2/check.sh`'s known-gap XFAIL
+  cases with borrowck errors in std2 fall from 45 to 6 (each a front
+  gap: `&mut self` on an impl for a view type reads as `inout [u8]`).
+  10 `rust_b_implied_` cases, each agreeing with rustc.
+
 ### What's new in 0.27.2
 
 The rust edition's std is std2, Rust's std with explicit allocators: a rust-edition program now reads `std::vec::Vec`, `String`, `HashMap`, the iterator adapters, `fmt`, `io` and `thread` as Rust's, and 1,032 of std2's 1,413 tests pass at -O0 and -O2 under `--check-alloc` (gate 1). The front end fills the gaps std2's bodies hit (pattern and blanket impls, coherence, deref coercion, ranges, format specs; the rules are docs/design/front-rust.md). Closures are checked in full: their kinds, captures and signatures, `Send` and `Sync`, and the borrow checker reads their bodies (`borrowck.unchecked` is gone), with Rust's mutability errors E0594 and E0596. `[T]` and `str` are unsized types; their full representation, `impl Trait` in return position and the rest of std2 are 0.27.2.1's. MVS programs compile exactly as before; a rust hello-world's `check` costs about 4.2x MVS's (printed, not enforced; 2.0x is 0.27.4's target). Built and tested on aarch64-macos only.
