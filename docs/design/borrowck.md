@@ -926,6 +926,14 @@ binding takes its place by an `OK_MOVE`, so `a` and `b` are moved by
 `a + b` (E0382 after it) and dropped once, by `add`; a compound `a +=
 b` moves `b` into `add_assign(&mut a, b)`. A comparison's operands
 (`==l`, `==r`: `PartialEq::eq(&a, &b)`) stay borrowed copies.
+A statement's operands are read in order (rustc's evaluation order):
+an operand that reads or moves a place an earlier operand of the same
+statement moved, the same place, a part of it or a place it is part of,
+is M1's `borrowck.use_moved` (E0382), as if the move were its own
+statement: `(t, t)`, `[t, t]`, `S { a: t, b: t }`, `(t, t.n)` and, for a
+non-Copy `t.n`, `(t.n, t)` (t partially moved) are errors; `(t.n, t)`
+for a Copy `t.n` (a copy, then the move) and `(t.a, t.b)` (disjoint
+parts) are not.
 
 **D8.6 (moves out of an index; 0.27.2.1).** In a rust body an index
 `a[k]` of an array or slice whose element type is not `Copy` is a place
