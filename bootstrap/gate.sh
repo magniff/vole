@@ -97,6 +97,11 @@
 # chain-fresh (bootstrap/chain-fresh.sh: the seed and every release
 # rebuilt from their tags into an empty cache, compared with
 # bootstrap/chain-hashes/, 0.25; --release);
+# translate (tests/translate.sh, 0.27.3, gate 2: the examples, bench and
+# tests/run's MVS run cases translated by `volec fix --edition rust`,
+# built in the rust edition and run, against the MVS output; one count per
+# set and the total; informational until 0.27.4: it prints N and never
+# fails; --release);
 # linux-x86_64 (bootstrap/linux-check.sh); linux-aarch64
 # (bootstrap/aarch64-linux-check.sh: in the container, the fixpoint,
 # the suite at -O0 and -O2 (0.25.2: not -O1; the optimizer is the same
@@ -250,7 +255,7 @@ ABI_STEPS="abi-plain abi-import abi-header"
 HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost unsafe-audit borrowck-twin std2-check std2-tests cachediff"
 # (0.25) the chain's integrity, by --release (or --only): slow, and they
 # rebuild compilers rather than test one
-RELEASE_STEPS="chain-diverse chain-fresh"
+RELEASE_STEPS="chain-diverse chain-fresh translate"
 LINUX_STEPS="linux-x86_64 linux-aarch64"
 # (0.25.2) --quick's container row, and the steps it runs in the
 # container (gate.sh --inside --only 'smoke-*'; run_step says what they
@@ -742,6 +747,10 @@ run_step() {
             previous=$(find_previous_release)
             sh "$ROOT/bootstrap/chain-diverse.sh" ${previous:+-p "$previous"} -w "$RUN/chain-diverse" ;;
         chain-fresh) sh "$ROOT/bootstrap/chain-fresh.sh" -w "$RUN/chain-fresh" --history "$HISTORY" ;;
+        translate)
+            # (0.27.3, gate 2) informational until 0.27.4: the count, never
+            # a failure
+            sh "$ROOT/tests/translate.sh" -c "$C" -j 4 || true ;;
         compile-cost)
             previous=$(find_previous_release)
             sh "$ROOT/tests/compile_cost.sh" -c "$C" ${previous:+-p "$previous"} ;;
@@ -1171,8 +1180,8 @@ note_of() {
     case "$1" in
         chain) awk '/^  head / { sub(/^  head +/, ""); print; exit }' "$l" ;;
         suite-*|smoke-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed%s\n", $2, $3, $4, ($5 > 0 ? ", " $5 " SKIPPED" : "") }' "$l" ;;
-        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*|unsafe-audit|borrowck-twin|std2-check|std2-tests|cachediff)
-            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh|unsafe-audit|borrowck-twin|std2-check|std2-tests|cachediff):' "$l" | tail -1 ;;
+        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*|unsafe-audit|borrowck-twin|std2-check|std2-tests|cachediff|translate)
+            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh|unsafe-audit|borrowck-twin|std2-check|std2-tests|cachediff|translate):' "$l" | tail -1 ;;
         voltty-fuzz) grep -E '^(pass|FAIL|skip) oracle' "$l" | tail -1 ;;
         compile-cost) awk '$2 ~ /^[0-9.]+$/ && $3 == "M" { printf "%s%s %s M %s", sep, $1, $2, $8; sep = ", " } END { print "" }' "$l" ;;
         # (no rows: it failed before the container's steps, e.g. docker)
