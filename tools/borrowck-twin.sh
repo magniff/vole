@@ -37,6 +37,7 @@
 # CLASS one of R1-R19 (vole more permissive, or R8's Box) and L1-L19 (vole
 # stricter).
 #   // RUSTC: none why              (outside the common subset: not run)
+#   // RUSTC-EDITION: 2024          (0.27.2.1: compiled as Rust 2024)
 # A marked divergence where rustc agrees with the case is a mismatch too
 # (the marker is stale). An `XFAIL` case is checked the same: its
 # directives say what the checker is to do, not what it does today.
@@ -92,6 +93,8 @@ map_code() {
         E0509) echo move_from_drop ;;
         E0525) echo closure.kind ;;  # (0.27.2, D19.6: the front's code)
         E0631) echo closure.sig ;;
+        E0700) echo opaque.ambiguous ;;  # (0.27.2.1, D21.2: the front's code)
+        E0720) echo opaque.cycle ;;
         auto) echo sync.auto ;;  # (0.27.2, AT3: E0277's Send and Sync, sync.not_send and sync.not_sync)
         E0594) echo assign_immutable ;;  # (0.27.2, D2.7; in a guard: guard_write, below)
         E0596) echo borrow_immutable ;;
@@ -108,8 +111,11 @@ for case_ in "$@"; do
     name=$(basename "$case_" .vl)
     [ -f "$case_" ] || { echo "FAIL $name: no such file $case_"; FAILN=$((FAILN + 1)); continue; }
     # the expectation and the marker
-    want=$(awk '/^[ \t]*\/\/ ERROR:/ { if (match($0, /sync\.not_s(end|ync)/)) { print "sync.auto"; found = 1; exit } else if (match($0, /borrowck\.[a-z_0-9]+/)) { print substr($0, RSTART + 9, RLENGTH - 9); found = 1; exit } else if (match($0, /closure\.[a-z_0-9]+/)) { print substr($0, RSTART, RLENGTH); found = 1; exit } else other = 1 }
+    want=$(awk '/^[ \t]*\/\/ ERROR:/ { if (match($0, /sync\.not_s(end|ync)/)) { print "sync.auto"; found = 1; exit } else if (match($0, /borrowck\.[a-z_0-9]+/)) { print substr($0, RSTART + 9, RLENGTH - 9); found = 1; exit } else if (match($0, /(closure|opaque)\.[a-z_0-9]+/)) { print substr($0, RSTART, RLENGTH); found = 1; exit } else other = 1 }
         END { if (!found && other) print "?other" }' "$case_")
+    # (0.27.2.1: `// RUSTC-EDITION: 2024`, a case of Rust 2024's rules, its
+    # `impl Trait` results capturing every lifetime, D21.3)
+    redition=$(awk '/^[ \t]*\/\/ RUSTC-EDITION:/ { print $3; exit }' "$case_")
     mark=$(awk '/^[ \t]*\/\/ RUSTC:/ { sub(/^[ \t]*\/\/ RUSTC:[ \t]*/, ""); print; exit }' "$case_")
     mverb=$(echo "$mark" | awk '{ print $1 }')
     mclass=$(echo "$mark" | awk '{ print $2 }')
@@ -138,7 +144,7 @@ for case_ in "$@"; do
     else
         mv "$rs.0" "$rs"
     fi
-    if "$RUSTC" --edition 2021 --crate-type bin -C panic=abort -A warnings -D static-mut-refs \
+    if "$RUSTC" --edition "${redition:-2021}" --crate-type bin -C panic=abort -A warnings -D static-mut-refs \
         --emit=metadata -o "$WORK/out.rmeta" "$rs" >"$WORK/out" 2>&1; then
         got=accept first= gotcode=
     else
@@ -153,6 +159,10 @@ for case_ in "$@"; do
         # (E0594, E0596 in a match guard: a `ref mut` binding is read-only, L6)
         if [ "$want" = guard_write ] && { [ "$first" = E0594 ] || [ "$first" = E0596 ]; }; then
             gotcode=guard_write
+        fi
+        # (E0308 where an `impl Trait` result's values differ, D21.2)
+        if [ "$want" = opaque.mismatch ] && [ "$first" = E0308 ]; then
+            gotcode=opaque.mismatch
         fi
     fi
     msg=$(awk '/^error/ && !/^error: aborting/ { print; exit }' "$WORK/out" | cut -c1-120)

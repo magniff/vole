@@ -123,6 +123,16 @@ The front's smaller gaps (front2721c):
 - The primitives' builtin `Sum<&'a P>` and `Product<&'a P>`
   (`v.iter().sum()`, F15.1); char is Clone and Copy.
 - std2's `Stdin::read_line` annotates its result, so the stdin cases run.
+- An impl parameter fixed by a closure bound's result with arguments
+  binds (`P: FnMut(I::Item) -> Option<B>`: MapWhile, Scan, FromFn, Fuse;
+  F14.1), and a tuple of literals indexes as the impl's index type
+  (`g[(0, 1)]` with `Index<(usize, usize)>`, F20.5).
+- A comparison's right operand of another type picks its PartialEq<Rhs>
+  impl: `s == "x"` for a String, `v == *slice`, a Vec against one on
+  another allocator (F26.3). `s + "bar"` waits: an operator's by-value
+  operand that drops is freed twice.
+- `<T as Tr>::f(..)` in an expression, T a name: `<i32 as
+  FromStr>::from_str("-7")` (F8.4).
 
 The borrow checker (bc2721):
 
@@ -223,6 +233,12 @@ Compile cost and the machine's load (cost2721):
   failed under the gate's load.
 - The stress-grow row's one-time segfault (arch_x86_sse3.vl at -O0 for
   x86_64-macos) did not recur in 42,400 compilations under load.
+
+The front (front2721):
+
+- `impl Trait` in return position (docs/design/borrowck.md §21): `fn f(..) -> impl Tr + ..` at the top of a free function's or an inherent method's result is an opaque type, one per function and instance (`front/opaque.vl`). Its hidden type is the body's type: every `return` and the tail must be that one type (`opaque.mismatch`), and it must meet each bound. A closure leaves its function by `-> impl Fn*(..)`, its parameters typed by the bound. The caller sees only the bounds' methods (rustc E0599 for any other), the bounds' traits and the blanket impls they entail. The type is `Copy` only when a bound says so, it converts to nothing, and `Send`/`Sync` leak from the hidden type. A caller checked before the function gets the function's body checked first. A hidden type that holds the result itself is `opaque.cycle` (E0720). `Option<impl Tr>`, a trait method's `-> impl Tr` and `let x: impl Tr` are `edition.later: impl_trait_nested (0.29)`.
+- Regions of an `impl Trait` result follow Rust 2024: every input lifetime is captured. While the result is live, every argument's loan is too. Each slot of the hidden type is one of the inputs or `'static`, and a slot that holds loans of two unrelated inputs is `opaque.ambiguous` (rustc E0700). 24 `rust_b_rpit_*` cases, checked against rustc 2024 by `tools/borrowck-twin.sh`, which now reads a case's `// RUSTC-EDITION: 2024`. `volec explain opaque.mismatch|opaque.ambiguous|opaque.cycle`.
+- `&T: Copy` on std2: a `T: Copy` bound holds for a shared reference (it failed for `&u8`).
 
 ### What's new in 0.27.2
 
