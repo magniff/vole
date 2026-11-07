@@ -41,7 +41,7 @@
 #                   expansion) is run with the copy's root file as its last
 #                   argument, or in place of a `{}` word, in the copy's
 #                   directory, and rewrites the copy in place (default:
-#                   COMPILER fix --edition rust). Its exit code 1 with a
+#                   COMPILER fix --edition rust --force). Its exit code 1 with a
 #                   line `// EDITION: rust` in the root (the translator puts
 #                   it last, every other line kept where it is) is a translation
 #                   that leaves errors (the build then names them); any
@@ -179,7 +179,9 @@ if [ -z "$COMPILER" ]; then
 fi
 case "$COMPILER" in /*) ;; *) COMPILER="$(pwd)/$COMPILER" ;; esac
 [ -x "$COMPILER" ] || { echo "tests/translate.sh: no compiler $COMPILER" >&2; exit 2; }
-[ -n "$TRANSLATOR" ] || TRANSLATOR="$COMPILER fix --edition rust"
+# (--force: a generated case, tools/sinksweep's, is a program to translate
+# too; its copy is never written back)
+[ -n "$TRANSLATOR" ] || TRANSLATOR="$COMPILER fix --edition rust --force"
 [ $IDENTITY = 1 ] && TRANSLATOR=""
 if [ -n "$RECORD" ]; then
     case "$RECORD" in
