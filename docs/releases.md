@@ -230,6 +230,19 @@ std2 (std2275), for the modules compiler/src uses:
   MVS's `foreground` stays (vole's own). Four std2_process cases, three
   twinned with rustc (the twin's prelude maps `Command::new_in(p, gpa)`
   to `Command::new(p)`).
+- `std::cli`: MVS's parser (clap's builder without derive) in the rust
+  edition: `Arg`, `Command`, `Matches` and `CliError` carry the lifetime
+  of the text they are given (`Command<'a, A>`; a `Command<'static, A>`
+  of literals parses any words), the builders take and return the value
+  as clap's, `short` takes a char and `num_values`, `width` and `count`
+  are usize; `indices_of` stays `&[i64]`. CliError is Debug. The
+  translation's rows: `short(b'o')` is `short(b'o' as char)`, the usizes
+  are cast, and `Command`, `Arg`, `Matches`, `CliError` written as types
+  get their `'_`. MVS's 16 cli cases are std2_cli cases (`// RUSTC:
+  none`: Rust's std has no command-line parser). With std::cli, gate 3
+  goes from 127 errors to 37.
+- `Clone` for `&T` (Rust's core): an allocator given by reference,
+  `&ArenaScope<'_, Gpa>`, is `A: Allocator + Clone`.
 
 ### What's new in 0.27.4
 
