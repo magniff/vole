@@ -6,7 +6,8 @@
 #
 # usage: tests/translate.sh [-c COMPILER] [-j N] [-O LEVEL] [-s SETS]
 #            [--translator CMD | --identity] [--ref expect|build]
-#            [--causes FILE] [--triage] [-f LIST] [-l] [-v] [FILTER...]
+#            [--causes FILE] [--triage] [--twin] [-f LIST] [-l] [-v]
+#            [FILTER...]
 #
 #   -c COMPILER     the volec to build with (default: target/volec, else
 #                   target/tools/volec)
@@ -22,6 +23,11 @@
 #                               `// EDITION: rust`, no ERROR, no XFAIL, no
 #                               FIXIMPORTS or FIXUNSAFE (a tests/run/NAME/
 #                               main.vl is its directory)
+#                     guide     the guide's MVS programs: the vole blocks of
+#                               compiler/guide/*.md (tests/guide/run.sh
+#                               --split), their out block the reference
+#                               (stdout and stderr together); a block
+#                               without one is only built
 #                     rust      tests/run's rust-edition cases that run (the
 #                               rust_* corpus: rust_t_ gate 0's hand
 #                               translations, rust_b_, rust_f_): the
@@ -47,6 +53,15 @@
 #                   below)
 #   --triage        add each unclassified failure to the classification as
 #                   `?`, for whoever fills it
+#   --twin          (gate 2's second half) each program that round-trips is
+#                   built by stable rustc too, through the rustc twin's shim
+#                   (tools/rustc-twin.sh, tools/rustc-twin/), and run: its
+#                   output against the same reference, agree, differ
+#                   (named: a `// RUSTC-DIFFERS: WHY` line in the
+#                   translation, or `SET/NAME<TAB>WHY` in
+#                   tools/rustc-twin/divergences.tsv) or outside (the shim
+#                   cannot make it Rust, or rustc rejects it); one count
+#                   per set
 #   -f LIST         only the programs LIST names, one per line (# comments):
 #                   NAME, SET/NAME or a path (tests/run/NAME.vl,
 #                   tests/run/NAME/main.vl, tests/examples/NAME.test,
@@ -104,6 +119,7 @@ REF=expect
 CLASSES="$ROOT/tests/translate/causes.tsv"
 LISTS=""
 TRIAGE=0
+TWIN=0
 LIST=0
 VERBOSE=0
 usage() { sed -n '2,/^# then one line/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2; exit 2; }
@@ -122,6 +138,7 @@ while [ $# -gt 0 ]; do
             LISTS="$LISTS$(sed 's/#.*//; s/^[[:space:]]*//; s/[[:space:]]*$//; /^$/d' "$2")
 "; shift 2 ;;
         --triage) TRIAGE=1; shift ;;
+        --twin) TWIN=1; shift ;;
         -l) LIST=1; shift ;;
         -v) VERBOSE=1; shift ;;
         -h|--help) usage ;;
@@ -139,8 +156,11 @@ case "$COMPILER" in /*) ;; *) COMPILER="$(pwd)/$COMPILER" ;; esac
 [ -x "$COMPILER" ] || { echo "tests/translate.sh: no compiler $COMPILER" >&2; exit 2; }
 [ -n "$TRANSLATOR" ] || TRANSLATOR="$COMPILER fix --edition rust"
 [ $IDENTITY = 1 ] && TRANSLATOR=""
+case ",$SETS," in
+    *,guide,*) sh "$ROOT/tests/guide/run.sh" --split "$ROOT/target/translate/guide-blocks" || exit 2 ;;
+esac
 exec python3 -I - "$ROOT" "$COMPILER" "$JOBS" "$OPT" "$SETS" "$TRANSLATOR" "$REF" \
-    "$CLASSES" "$TRIAGE" "$LIST" "$VERBOSE" "$LISTS" "$@" <<'PY'
+    "$CLASSES" "$TRIAGE" "$LIST" "$VERBOSE" "$LISTS" "$TWIN" "$@" <<'PY'
 import os
 import re
 import shlex
@@ -150,8 +170,22 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 (ROOT, COMPILER, JOBS, OPT, SETS, TRANSLATOR, REF, CLASSES, TRIAGE, LIST,
- VERBOSE, LISTS) = sys.argv[1:13]
-FILTERS = sys.argv[13:]
+ VERBOSE, LISTS, TWIN) = sys.argv[1:14]
+FILTERS = sys.argv[14:]
+sys.path.insert(0, os.path.join(ROOT, "tools", "rustc-twin"))
+from twin import directives, trimmed, stdout_differs, to_rust, rustc_build, rust_edition, find_rustc  # noqa: E402
+TWIN = TWIN == "1"
+RUSTC = find_rustc() if TWIN else ""
+if TWIN and not RUSTC:
+    print("translate: --twin: no rustc, the twin skipped")
+    TWIN = False
+SIDE = {}
+_side = os.path.join(ROOT, "tools", "rustc-twin", "divergences.tsv")
+if os.path.isfile(_side):
+    for _l in open(_side):
+        if _l.strip() and not _l.startswith("#"):
+            _k, _, _why = _l.rstrip("\n").partition("\t")
+            SIDE[_k.strip()] = _why.strip()
 
 
 def list_name(x):
@@ -174,54 +208,8 @@ JOBS, TRIAGE, LIST, VERBOSE = int(JOBS), TRIAGE == "1", LIST == "1", VERBOSE == 
 SETS = [s for s in SETS.split(",") if s]
 WORK = os.path.join(ROOT, "target", "translate")
 for s in SETS:
-    if s not in ("examples", "bench", "run", "rust"):
-        sys.exit(f"tests/translate.sh: no set {s} (examples, bench, run, rust)")
-
-
-def directives(path):
-    """tests/directives.awk's reading: a `//` line's KEY: VALUE."""
-    d = {"expect": [], "stdin": [], "env": [], "stderr": [], "csource": [], "flags": [],
-         "exit": 0, "timeout": 1, "has": set()}
-    try:
-        text = open(path, encoding="utf-8", errors="replace").read()
-    except OSError:
-        return d
-    for line in text.split("\n"):
-        line = line.rstrip("\r").lstrip(" \t")
-        if not line.startswith("//"):
-            continue
-        c = line[2:]
-        if c.startswith(" "):
-            c = c[1:]
-        i = c.find(":")
-        if i < 0:
-            continue
-        key, value = c[:i], c[i + 1:]
-        if value.startswith(" "):
-            value = value[1:]
-        d["has"].add(key)
-        if key == "EXPECT":
-            d["expect"].append(value)
-        elif key == "STDIN":
-            d["stdin"].append(value)
-        elif key == "ENV":
-            d["env"].append(value)
-        elif key == "STDERR":
-            d["stderr"].append(value)
-        elif key == "EXIT":
-            d["exit"] = int(value.split()[0]) if value.split() else 0
-        elif key == "CSOURCE":
-            d["csource"] += value.split()
-        elif key == "FLAGS":
-            d["flags"] += value.split()
-        elif key in ("ARGS", "SOURCE", "CHEADER", "EDITION"):
-            d[key.lower()] = value.strip() if key != "ARGS" else value
-        elif key == "TIMEOUT":
-            try:
-                d["timeout"] = max(1, int(value.split()[0]))
-            except (ValueError, IndexError):
-                pass
-    return d
+    if s not in ("examples", "bench", "run", "guide", "rust"):
+        sys.exit(f"tests/translate.sh: no set {s} (examples, bench, run, guide, rust)")
 
 
 # The programs: (set, name, entry, directory to copy or None, directives,
@@ -250,6 +238,25 @@ def programs():
                     continue  # (reads a file bench/std/run.sh makes; a module)
                 name = (sub[len("bench"):].lstrip("/") + "/" if sub != "bench" else "") + f[:-3]
                 out.append(("bench", name, p, None, directives(p), False))
+    if "guide" in SETS:
+        gdir = os.path.join(WORK, "guide-blocks", "blocks")
+        for b in sorted(os.listdir(gdir)):
+            p = os.path.join(gdir, b)
+            src = "".join(open(os.path.join(p, f)).read() for f in os.listdir(p) if f.endswith(".vl"))
+            if src.startswith("// EDITION: rust") or os.path.isfile(os.path.join(p, "err")):
+                continue
+            if re.search(r"std::(gpu|objc|window)", src):
+                continue  # (built to an object only, or linked with Metal: tests/guide/run.sh's)
+            d = directives(os.path.join(p, "none"))
+            d["merged"] = True
+            if os.path.isfile(os.path.join(p, "out")):
+                d["expect"] = [open(os.path.join(p, "out")).read()]
+                d["exit"] = int(open(os.path.join(p, "exit")).read() or 0)
+            else:
+                d["has"].add("BUILD")
+            if os.path.isfile(os.path.join(p, "stdin")):
+                d["stdin"] = [open(os.path.join(p, "stdin")).read()]
+            out.append(("guide", b, os.path.join(p, "prog.vl"), p, d, True))
     for s in ("run", "rust"):
         if s not in SETS:
             continue
@@ -277,41 +284,6 @@ def programs():
         out = [p for p in out if any(flt in p[0] + "/" + p[1] for flt in FILTERS)
                or p[1] in NAMES or p[0] + "/" + p[1] in NAMES]
     return out
-
-
-def trimmed(text):
-    return re.sub(r"[ \t\r\n]+$", "", text)
-
-
-NUM = r"[-+]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][-+]?[0-9]+)?"
-
-
-def same_line(want, got):
-    if want == got:
-        return True
-    if "{num}" not in want and "{int}" not in want and "{..}" not in want:
-        return False
-    rx = ""
-    for part in re.split(r"(\{num\}|\{int\}|\{\.\.\})", want):
-        rx += {"{num}": NUM, "{int}": r"[-+]?[0-9]+", "{..}": r".*"}.get(part, re.escape(part))
-    return re.fullmatch(rx, got, re.S) is not None
-
-
-def stdout_differs(want, got):
-    """tests/expect.awk's comparison: None, or the first line that differs."""
-    want, got = trimmed(want), trimmed(got)
-    if want == got:
-        return None
-    w = want.split("\n") if want else []
-    a = got.split("\n") if got else []
-    for i in range(max(len(w), len(a))):
-        if i >= len(w):
-            return f"line {i + 1}: expected the end of the output, got {a[i]!r}"
-        if i >= len(a):
-            return f"line {i + 1}: expected {w[i]!r}, got the end of the output"
-        if not same_line(w[i], a[i]):
-            return f"line {i + 1}: expected {w[i]!r}, got {a[i]!r}"
-    return None
 
 
 def first_error(out):
@@ -359,19 +331,69 @@ def build(entry, cwd, d, out, rust, log):
 
 
 def run_prog(prog, cwd, d):
-    """(stdout, stderr, exit code) or None when it ran out of time."""
+    """(stdout, stderr, exit code) or None when it ran out of time; a guide
+    block's stdout and stderr together."""
     env = dict(os.environ)
     for kv in d["env"]:
         k, _, v = kv.replace("@ROOT@", ROOT).partition("=")
         env[k] = v
     args = d.get("args", "").replace("@ROOT@", ROOT).split()
     try:
-        p = subprocess.run([prog] + args, input="\n".join(d["stdin"]).encode(), capture_output=True,
+        p = subprocess.run([prog] + args, input="\n".join(d["stdin"]).encode(), stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT if d.get("merged") else subprocess.PIPE,
                            cwd=cwd, env=env, timeout=60 * d["timeout"])
     except subprocess.TimeoutExpired:
         return None
     dec = lambda b: b.decode("utf-8", errors="replace")
-    return dec(p.stdout), dec(p.stderr), p.returncode
+    return dec(p.stdout), dec(p.stderr or b""), p.returncode
+
+
+def compare(want, r, d):
+    """None, or (cause, detail): a run r = (stdout, stderr, exit code) against
+    the reference want = (stdout, exit code, stderr lines)."""
+    out, err, rc = r
+    if d.get("merged"):  # (tests/guide/run.sh's: each line's trailing blanks aside)
+        out = "\n".join(l.rstrip() for l in out.split("\n"))
+        want = ("\n".join(l.rstrip() for l in want[0].split("\n")),) + tuple(want[1:])
+    why = stdout_differs(want[0], out)
+    if why:
+        return "output", why
+    if rc != want[1]:
+        return "exit", f"exit {rc}, expected {want[1]}" + (": " + trimmed(err).split("\n")[-1][:120] if err.strip() else "")
+    for m in want[2]:
+        if m not in err:
+            return "stderr", f"no stderr line containing {m!r}"
+    return None
+
+
+def twin(key, w, mine, src, d, want):
+    """The rustc twin of a translation that round-trips: (verdict, why)."""
+    if len([f for f in os.listdir(os.path.dirname(mine)) if f.endswith(".vl")]) > 1:
+        return "outside", "a program of several files"
+    text = open(mine, encoding="utf-8", errors="replace").read()
+    m = re.search(r"^\s*// RUSTC-DIFFERS:\s*(.*)$", text, re.M)
+    named = (m.group(1).strip() or "(no reason)") if m else SIDE.get(key)
+    rs, why = to_rust(text)
+    tw = os.path.join(w, "rustc")
+    os.makedirs(tw, exist_ok=True)
+    with open(os.path.join(tw, "main.rs"), "w") as f:
+        f.write(rs)
+    if why:
+        return "outside", why
+    bad = rustc_build(RUSTC, os.path.join(tw, "main.rs"), os.path.join(tw, "prog"), rust_edition(text))
+    if bad:
+        # (a borrowck divergence the program names, tools/borrowck-twin.sh's)
+        mk = re.search(r"^\s*// RUSTC: rejects\s+(\S+)\s*(.*)$", text, re.M)
+        if mk:
+            return "named", f"rustc rejects, named {mk.group(1)}: {mk.group(2)[:80]}"
+        return "outside", "rustc rejects: " + bad
+    r = run_prog(os.path.join(tw, "prog"), tw, d)
+    diff = ("timeout", "ran out of time") if r is None else compare(want, r, d)
+    if diff:
+        return ("named" if named else "differ"), f"{diff[0]}: {diff[1]}" + (f" (named: {named})" if named else "")
+    if named:
+        return "stale", f"named ({named}), and it agrees"
+    return "agree", ""
 
 
 def one(prog):
@@ -383,6 +405,12 @@ def one(prog):
     if copy:
         shutil.copytree(copy, src, symlinks=True)
         mine = os.path.join(src, os.path.relpath(entry, copy))
+        if s == "guide":  # (compiled as main.vl, tests/guide/run.sh's)
+            os.rename(mine, os.path.join(src, "main.vl"))
+            mine = os.path.join(src, "main.vl")
+            for f in ("out", "exit", "stdin", "name"):
+                if os.path.isfile(os.path.join(src, f)):
+                    os.remove(os.path.join(src, f))
     else:
         os.makedirs(src)
         mine = os.path.join(src, os.path.basename(entry))
@@ -429,15 +457,11 @@ def one(prog):
     r = run_prog(os.path.join(w, "prog"), w, d)
     if r is None:
         return key, "timeout", f"killed after {60 * d['timeout']} s"
-    out, err, rc = r
-    why = stdout_differs(want[0], out)
-    if why:
-        return key, "output", why
-    if rc != want[1]:
-        return key, "exit", f"exit {rc}, expected {want[1]}" + (": " + trimmed(err).split("\n")[-1][:120] if err.strip() else "")
-    for m in want[2]:
-        if m not in err:
-            return key, "stderr", f"no stderr line containing {m!r}"
+    bad = compare(want, r, d)
+    if bad:
+        return key, bad[0], bad[1]
+    if TWIN:
+        return key, "ok", "", twin(key, w, mine, src, d, want)
     return key, "ok", ""
 
 
@@ -461,19 +485,24 @@ if LIST:
     sys.exit(0)
 os.makedirs(WORK, exist_ok=True)
 with ThreadPoolExecutor(max_workers=JOBS) as ex:
-    results = list(ex.map(one, progs))
+    results = [r if len(r) == 4 else r + (None,) for r in ex.map(one, progs)]
 cls = read_classes()
 with open(os.path.join(WORK, "results.tsv"), "w") as f:
-    for key, status, why in results:
-        cause = status.split(" ", 1)
-        f.write(f"{key}\t{'ok' if status == 'ok' else 'fail'}\t{status}\t{why}\n")
-for key, status, why in sorted(results):
+    for key, status, why, tw in results:
+        f.write(f"{key}\t{'ok' if status == 'ok' else 'fail'}\t{status}\t{why}"
+                + (f"\ttwin {tw[0]}\t{tw[1]}" if tw else "") + "\n")
+for key, status, why, tw in sorted(results):
+    if tw and tw[0] in ("differ", "stale"):
+        print(f"TWIN {key}: {tw[0]}: {tw[1]}")
+    elif tw and VERBOSE:
+        print(f"twin {key}: {tw[0]}" + (f": {tw[1]}" if tw[1] else ""))
     if status != "ok":
         c = cls.get(key) or cls.get(key.split("/", 1)[1])
         print(f"FAIL {key}: {status}: {why}" + (f" [{c[0]}]" if c else ""))
     elif VERBOSE:
         print(f"ok   {key}")
 tot_ok = tot = 0
+twin_tot = [0, 0]
 for s in SETS:
     rs = [r for r in results if r[0].startswith(s + "/")]
     if not rs and FILTERS:
@@ -490,6 +519,13 @@ for s in SETS:
     if refs:
         parts.append(f"ref {refs} not counted")
     print(f"translate: {s}: {ok} of {len(rs) - refs} round-trip" + (f" ({', '.join(parts)})" if parts else ""))
+    if TWIN:
+        tws = [r[3] for r in rs if r[3]]
+        tc = {v: sum(1 for t in tws if t[0] == v) for v in ("agree", "differ", "named", "stale", "outside")}
+        print(f"translate: {s}: rustc twin: {tc['agree']} of {len(tws)} agree ({tc['differ']} differ, "
+              f"{tc['named']} named, {tc['stale']} stale, {tc['outside']} outside)")
+        twin_tot[0] += tc["agree"]
+        twin_tot[1] += len(tws)
     tot_ok += ok
     tot += len(rs) - refs
 # the type and borrowck codes, most frequent first
@@ -527,5 +563,14 @@ if TRIAGE and unclassified:
         for k in unclassified:
             f.write(f"{k.split('/', 1)[1] if k.startswith('run/') else k}\t?\t{fails[k][1]}: {fails[k][2][:120]}\n")
     print(f"translate: {len(unclassified)} added to {os.path.relpath(CLASSES, ROOT)} as ?")
+if TWIN:
+    reasons = {}
+    for r in results:
+        if r[3] and r[3][0] == "outside":
+            k = re.sub(r"`[^`]*`", "`..`", re.sub(r" at \S+$", "", r[3][1]))[:90]
+            reasons[k] = reasons.get(k, 0) + 1
+    for k, n in sorted(reasons.items(), key=lambda x: -x[1])[:10]:
+        print(f"  twin outside {n}: {k}")
+    print(f"translate: rustc twin: {twin_tot[0]} of {twin_tot[1]} round-tripped programs agree")
 print(f"translate: {tot_ok} of {tot} round-trip (translator: {TRANSLATOR or 'identity'})")
 PY
