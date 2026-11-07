@@ -1774,6 +1774,43 @@ feature name, `std_gpu`, for the five; U4). *Anchor:* `compiler/std/
 embed.sh`, `front/modules/lookup.vl: private_error` (the "no such
 module" site).
 
+**Z5.2 (std2 lexed by its units; 0.27.5).** A build reads std2 by the
+units std2lazy splits it into (an item; an inherent impl's header, each
+member and its closing brace; a trait's header with its required items,
+each default method and its brace; a `use` line; a module's lines), and
+keeps only the units it reaches (0.27.3's rule, unchanged). In 0.27.5
+the split is made once, when std2 is embedded, not at each build:
+`embed.sh --edition rust` writes `std2_units`, the index of the built-in
+text's units: each unit's kind, its bytes, its name, trait, type head and
+parent, the identifiers it holds (as positions in one table of std2's
+words), and the asks of its `use` leaves and its trait's item names. It
+is made by the compiler (`volec __std2-index TEXT`, the same split the
+token path runs), so the two cannot differ. A build on the built-in text
+reads the index, interns its words, runs the reach over its units, and
+lexes only the units it keeps, in their order; the tail (Z5.1, made per
+build) is lexed and split as tokens, as before. The tokens kept are
+those the token path keeps, the same and in the same order.
+- The index is used only when it was made for this text: its format and
+  the text's length match, and the text is the built-in one. Otherwise
+  (std2 read from a tree, `VOLE_STD_TREE`; an index made by an older
+  format; none written, when embed.sh found no compiler able to make
+  one), and when std2 is read whole (queries, `--std2-check`,
+  `VOLE_STD2_EAGER=1`, the eager rerun), the text is lexed whole as in
+  0.27.4. `VOLE_STD2_INDEX=0` forces the token path.
+- Kept up to date with no manual step: the commit hook and the
+  stdsrc_rust.vl merge driver run embed.sh, which makes the index with
+  the tree's compiler (`target/tools/volec`, else `target/volec`;
+  `VOLE_EMBED_VOLEC` names another). Two branches that change std2
+  merge without a conflict on it: the driver makes it again from the
+  merged std2.
+- Checked: `embed.sh --edition rust -c` with the current compiler says
+  whether the index is stale, and a test compares the tokens a build
+  keeps with the index and without it (`VOLE_STD2_INDEX=0`), on a set of
+  programs; both run for every change to std2 or the front's std2 files
+  (tests/affected.map).
+*Anchor:* `front/modules/std2lazy.vl`, `front/modules/mod.vl:
+load_std2`, `compiler/std/embed.sh`.
+
 **Z6.1 (two stds, one binary).** Both texts are embedded; the on-disk
 cache is keyed by `(edition, std hash)`; `ls -l target/volec` is
 printed by the release's gate.
