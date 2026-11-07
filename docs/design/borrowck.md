@@ -400,6 +400,29 @@ loan of one is `borrowck.borrow_immutable` (E0596, "cannot borrow
 MVS spelling; with the own pass off on std2 (Z8) it is this one, for
 std2's bodies too.
 
+**D2.8 (constant promotion, in the body; 0.27.5).** In a rust body a
+shared borrow of a *promotable* rvalue `e` (`&e`, or `&e` made a shared
+slice, `&[T]`) borrows a temporary whose storage is the body's: it has
+no `StorageLive` nor `StorageDead`, so the end of its statement's or
+branch's scope does not end the loan (rustc's promotion; no E0716):
+`let list: &[&str] = if sub { &["sub", "checked_sub"] } else { &["add"]
+}; list.len()` is accepted. Promotable, rustc's `promote_consts`
+narrowed: a literal (integer, float, char, bool, string, C string,
+`()`), `-` of a numeric literal, an array or tuple literal of
+promotable elements, `[e; N]` of a promotable `e`. Not promotable: a
+name (a local, or a const: `&N` stays L2), a call or a method call
+(`&[String::new()]`, `&Cell::new(1)`), a struct or variant literal, any
+other operator, a block, a cast; a `&mut` borrow (rustc promotes only
+`&mut []`); any MVS body. A promotable value has no drop glue and no
+interior mutability (no `UnsafeCell` can be in it: every one is made
+by a call), so evaluating the temporary again (a loop's) writes the
+same value, and it is never dropped. Divergence (L2, kept): the
+temporary is the function's, not `'static`. A reference to it that
+outlives the function (`fn g() -> &'static [i64] { &[1, 2] }`) is still
+`borrowck.return_local`. A loop that holds the last iteration's
+reference while it evaluates the borrow again is
+`borrowck.assign_borrowed`, where rustc has a single static.
+
 ## 3. Regions (S3)
 
 **D3.1 (denotation).** A region variable `'r` denotes a set `val('r) ⊆
@@ -1249,6 +1272,9 @@ outside the holes named below.
   `borrowck.return_local`), `&[]` and `&mut []` (rustc promotes the
   empty array): std2 writes an empty `&mut [T]` from a dangling pointer
   (slice.vl's `empty_mut`). Case `rust_b_err_promote_const`.
+  (0.27.5) Narrowed by D2.8: a promotable rvalue's temporary is the
+  body's, so a borrow of one used after its statement or branch is
+  accepted; one that escapes the function is still refused.
 - L3 Temporaries' scopes are vole's (the statement; the block for `let
   r = &f(x)`), not Rust 2024's tail-expression rule: a difference only
   in `match`/block tail temporaries. (0.27.3) In the rust edition the
