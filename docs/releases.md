@@ -166,6 +166,10 @@ The borrow checker (bc2721):
   end of its scope (a double free, already in 0.27.2); a comparison's
   stay borrowed. `rust_b_ops_` cases for `+`, `+=`, `==` and a use after
   the move.
+- A statement's operands are read in order (D8.5): `(t, t)`, `[t, t]`
+  and `S { a: t, b: t }` of a non-Copy t are a use after move (E0382),
+  in generic bodies too, where the second move went unseen. 6
+  `rust_b_moves_` cases.
 
 std2 (std2721):
 
