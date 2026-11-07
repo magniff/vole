@@ -889,6 +889,33 @@ F4.2 (a written `impl Tr for i64` beside the list is an overlap). An
 impl so synthesized has no position: its errors are reported at the
 attribute. *Anchor:* `front/parser/rust.vl: take_builtin_impls` (today
 `edition.later: primitive_builtin`), `intrinsic`.
+(0.27.4) *Which primitives a build makes them for.* A lazy build
+(std2lazy) makes the impls, and the integers' inherent methods (F15.4),
+only for the primitives a program brings in. A program brings in a
+primitive when one of these holds:
+- one of its files names it as a word;
+- a literal's suffix names it (`5u16`);
+- an unsuffixed float (f64) or a char literal (u32) appears;
+- a float is brought in (f32 or f64): then u64, i64 and u32 are too, the
+  types its formatting and bit methods work in;
+- a word in std2lazy's PRIM_WORDS table brings it through std2's types.
+  For example `chars` and `to_digit` bring u32, `Hash`, `HashMap`, `copy`
+  and `to_bits` bring u64, `PartialOrd` and `Ord` bring a derived
+  order's isize, `floor`, `pop` and `drain` bring u32, and `AtomicU16`
+  brings u16.
+The impls for i32, usize, u8 and bool are always made. They come without
+a name: the literal default, a length, a str's bytes, a condition.
+A dropped impl counts as dropped std2 text, so a build whose check then
+fails is made again with std2 whole (rerun_eager). Its diagnostics are
+then the eager build's, and a missing impl is an error before it is
+anything else: no impl is ever chosen in its place. An open literal
+closed by a bound keeps its default (FL6: i32 and f64, whose impls are
+always there when the literal is), and a type variable solved through an
+impl (FL1) is solved among the impls of the named types, which are all
+made. Queries,
+`--std2-check`, `fix` and an on-disk std2 make every impl. Cases
+`rust_f_f15_prim_impl_literal_ok`, `rust_f_f15_prim_impl_unnamed_ok`,
+`rust_f_f15_prim_impl_bound_ok`, `rust_f_f15_prim_impl_solved_ok`.
 
 **F15.2 (what counts as a primitive here).** The listed names are the
 primitives; `&T`, `[T]`, `str`, tuples are not (their impls are written,
