@@ -228,7 +228,7 @@ The front's views, contracts and borrowck singles (front273b):
   `a.into_iter()` and `for x in a` move the elements out, by rustc's
   probe order (by value before `&[T; N]` and the slice); what is not
   yielded drops with the iterator. A pattern impl's trait defaults
-  (F12.3) and its drop are found by its header. 23 std2 cases pass, and
+  (F12.3) and its drop are found by its header. 24 std2 cases pass, and
   4 new rust cases twin with rustc (a partly consumed `[String; 3]`
   under `--check-alloc`, an early `break`).
 
