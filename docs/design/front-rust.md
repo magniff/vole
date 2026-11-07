@@ -983,6 +983,15 @@ D6.2.5's error either way. An MVS `static var` is unchanged (safe).
 *Anchor:* `front/check/names.vl: synth_name` (`U_STATIC_MUT`). Case
 `rust_f_f19_static_mut_err`.
 
+**F19.7 (unions drop nothing).** A union declared in a rust-edition
+position has no drop glue of its own fields (an `impl Drop for U` of its
+own runs): which field holds a value is the program's to know, as in
+Rust. A field read out by value (in `unsafe`) moves the union: a union's
+field has the union's own move path (borrowck.md D8.3). Not yet: rustc's
+E0740 for a field that is neither `Copy` nor `ManuallyDrop` (FL12).
+*Anchor:* `front/own/glue.vl: glue_of`, `places/elab.vl: path_of,
+rust_union`. Case `rust_f_f19_union_no_drop`.
+
 ### F22 `for` loops
 
 **F22.1 (desugaring).** In a rust-edition position
@@ -1514,6 +1523,11 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   method of a generic impl over the impl's own parameters, and `*x` with
   a `Deref` bound. A template that meets one is not counted in `opaque:
   N templates`.
+- **FL12 (a union's field that needs a drop; 0.27.3).** rustc rejects a
+  union field that is neither `Copy` nor `ManuallyDrop<_>` (E0740, a
+  generic `T` too); vole accepts it and drops no field (F19.7), so std2
+  can write `ManuallyDrop<T>` as a union over a `T`. Case
+  `rust_f_f19_union_no_drop` (`// RUSTC: none FL12`).
 
 ## 10. The gap map
 
