@@ -354,6 +354,46 @@ of a partial step, seen in 0.27.3 (making the str view Copy alone):
 collapsing to one, and `Copied<Iter<str>>::next` reads `Option<&&str>`
 as `Option<str>` (`no method 'copied' on type 'Option<str>'`): both are
 `&T` with `T = &str` collapsed to the view.
+*As landed (0.27.4, step B).* The rules above hold in every
+rust-edition position, with these readings:
+- *The probe on a view* (F6.2). The place's `&self` method, inherent or
+  of a trait, is at the by-value step on the view; the view's own impls'
+  `&self` methods (`impl<T: ?Sized + Ord> Ord for &T`) are at the `&` step.
+  So `a.cmp(b)` of two `&str`s is `<str as Ord>::cmp`, `b.as_ref()` of a
+  `&str` is `<str as AsRef<[u8]>>`, and `rr.tag()` of a `&&S` is still the
+  `&S` impl's (the step is read from the receiver's written type). In
+  `Tr::m(x)` (F8.2), x is the `&self` itself, with no autoref, so a view x
+  takes the place's. In an instance, a receiver of a parameter's type
+  (`k: K`, or a field of type `K`) takes the bound's method, the one the
+  generic body named: `<&str as Borrow<&str>>` for `K = &str`. A receiver
+  `x: &P` takes P's.
+- *Associated functions* of the place are its view's path too
+  (`str::from_utf8(b)`).
+- *A default body's trait argument.* `PartialEq<[U]>`'s `[U]`,
+  substituted for `Rhs` in `ne`'s default, stays the place: its written
+  text is kept (`traits.vl: subst_trait_args`).
+- *Sized* (F21.1). A parameter without `?Sized` bound to `Unsized(v)` is
+  `type.unsized` (E0277), checked with the bounds of every struct, enum
+  and function instance (`traits.vl: check_bounds`).
+- *`&e` of a view value.* `&e`/`&mut e` of a call's view
+  (`&mut "ab".as_bytes()`) is a reference to a temporary view,
+  `&mut &[u8]`; `&v[..]` stays the place's view.
+- *Slots.* `slots_in` and `slot_variances_in` read `Unsized(v)` as its
+  element.
+- *std2* gains rustc's forwarding impls that the distinct `&&str` now
+  needs: `Borrow<T>` for `&T`/`&mut T`, `AsRef<U>` for `&T`/`&mut T`,
+  `AsMut<U>` for `&mut T`, `Eq`/`Ord` for `&A`.
+Not closed (0.27.5): an iterator whose Item is a view, in std2's
+generic instances (`[&str; 2].into_iter().collect_in(a)`, `Extend::extend`'s
+`I: IntoIterator<Item = T>`), is a `borrowck.outlives` between the
+parameters' regions (D4.6's ties do not reach a view's slot). It also
+fails without step B. Case `rust_b_view_item_collect`.
+Not closed either: `Box<[T], A>` and `Box<str, A>`. std2's `Box<T, A>` has
+a Sized T, so they are `type.unsized`; an unsized Box needs `T: ?Sized` on
+the Box and its impls (0.27.5). A `NonNull<[u8]>` is two words.
+*Cases:* `rust_f_z91c_ref_of_view`, `rust_f_z91c_impl_place_and_ref`,
+`rust_f_z91c_unsized_param`, `rust_f_z91c_vec_unsized_err`,
+`rust_f_z91c_fat_nonnull`.
 ### F23 Literals
 
 **F23.1 (string literals).** `"…"` has type `&'static str` in a
@@ -920,8 +960,14 @@ take_array_builtin`; `places/shim.vl: drop_fn` (a pattern impl's drop).
 hold (F0.4, else `trait.unmet`). For a method the result is the
 function value of the impl's (or builtin's, or default's) method; its
 call passes the receiver explicitly. In type position
-`<τ as Tr>::A` is F11.3's projection. *Anchor:* `front/parser/rust.vl:
-qualified_path` (today `edition.later`), `split_shl`, `synth_path`.
+`<τ as Tr>::A` is F11.3's projection. (0.27.4) In type position the
+trait's arguments pick the impl: `<I as SliceIndex<[i64]>>::Output`
+with I = `RangeFrom<usize>` is the impl for `[T]` (T := i64 from the
+arguments, F14.1), not the one for `str`; without arguments, or when
+none matches, it is t's impl of Tr, as before. Case
+`std2_slice_sliceindex_output`. *Anchor:* `front/parser/rust.vl:
+qualified_path` (today `edition.later`), `split_shl`, `synth_path`,
+`check/resolve.vl: qualified_projection`.
 
 **F8.2 (`Tr::name`).** A trait name used as a path head (`Debug::fmt(v,
 f)`, `Iterator::next(&mut it)`, `Default::default()`) is `<_ as
@@ -1460,6 +1506,12 @@ returned reference (Z9), so `&c[a..b]` is `&*index(&c, a..b)`, a
 reborrow, and `c[a..b]` by value is `type.unsized`. *Anchor:*
 `front/check/rust.vl: index_through_trait`, `synth_mode.vl:
 synth_index` (today: a view's index is MVS's).
+(0.27.4) Through references: `h[i]` of an `h: &[T; N]`, `&mut [T; N]`
+or `&&[T; N]` is `(*h)[i]` (each reference dereferenced, as rustc's
+autoderef of the indexed expression), read, written through `&mut` and
+sliced (`&h[a..b]`). A write through `&` is borrowck.assign_immutable
+(E0594). 0.27.3 read it as a raw pointer's arithmetic (unsafe). Cases
+`rust_f_f20_index_array_ref_ok`, `rust_f_f20_index_array_ref_err`.
 
 **F20.2 (std2's impls).** `impl<T, I: SliceIndex<[T]>> Index<I> for [T]
 { type Output = I::Output; fn index(&self, i: I) -> &I::Output {
