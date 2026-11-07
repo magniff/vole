@@ -110,6 +110,18 @@ Gate 2's harness (twin273):
 - `tools/borrowck-twin.sh --shim`: the verdicts through the shim. The gate row uses it: 365 of 400 agree (358 with `--std2`), 10 divergences, 0 mismatches. Seven `// RUSTC: none` markers ("no allocator until 0.27.3") are gone.
 - `tests/translate.sh --record query|refactor`: the migration surface's record mode. Each transcript's program is translated in a copy, the suite's runner re-records the transcripts (`-u`), and the result is a diff to review (target/translate/record/SUITE.diff). With the identity translator, 0 of 42 query transcripts change. With the translator's first merge, 35 of 42 change (2,198 lines to review; 34 programs translated, 1 not). `tests/guide/run.sh --split DIR` writes the guide's blocks out for the runners.
 
+The translator (tr273):
+
+- `volec fix --edition rust FILE|DIR` translates an MVS program into the rust edition, in place (`--dry-run`: the diff only; `--list-left`: each place left to hand, `note fix.edition_left`). It is type-directed: the MVS front checks the program, and what it resolved decides each rewrite (`guide fix#edition`, `explain fix.edition_left`):
+  - parameters: a let `x: T` is `x: &T` where MVS borrows and `T` for a copy, `inout T` is `&mut T`, `sink T` is `T` (`mut` when the body changes it), a view `[T]` is `&[T]` (`&str` in a program that uses its bytes only as text); receivers are `&self`, `&mut self` and `self`;
+  - bodies: `var` is `let mut`, `inout r = &v` is `let r = &mut v`, the inout marker `&x` is `&mut x`, a borrow MVS makes is written `&x`, an access Rust does not dereference by itself is `*r`, `v.len` is `v.len()`, `println(x)` is `println("{}", x)`, a literal MVS types as i64 by default is annotated, an i64 index is cast `as usize`;
+  - statics and pointers: `static var` is `static mut`, and each use outside unsafe code is put in `unsafe { }`; a raw pointer `*T` is `*mut T`, and its element `p[i]` is `(*p.add(i))`;
+  - items: the derives get Rust's names (`Eq` with `PartialEq`, `Ord` with `PartialOrd`), the copy types derive Clone and Copy, Display's `fmt` returns its Result, an operator impl gets its `Output`, and a view result of a function that takes no reference is `&'static`;
+  - std: each call with a rewrite.tsv row is written as the row says, chosen by type (`T: Copy`, `use=read`), with the row's `!` cases left to hand; std's paths become std2's, and the imports std2 needs are added. A closure literal that a row calls in place is inlined, its parameters bound to the arguments, and the `sort_by` rows dereference a Copy element.
+- Struct regions: a struct or enum holding a view (`[T]`, `str`, a `let T` or `inout T` field, or another such type) is generic over its region, `struct Tok<'a> { text: &'a str }`, used as `Tok<'_>` elsewhere, or `Tok<'static>` as the result of a function that takes no reference; where elision does not decide, `'_` stays for a hand fix. Contracts carry over: their clauses are translated as the body is (`*v`, `old(v.len())`).
+- FL6 (front273): an i64 literal at a generic position gets `i64` (`fold(0i64, ..)`, `Some(4i64)`, `(0i64..n).map(..)`), and a literal-only `let` its `: i64`; a text literal given as bytes is `b".."`; a raw pointer's part is `std::slice::from_raw_parts(..)`.
+- Gate 2's counts, round-tripping through the translator: run 734 of 1,347, bench 15 of 44, examples 4 of 83. In 0.27.2.1 they were 598, 5 and 3. tests/translate/causes.tsv classifies the rest: std2 175 (`std::cli`, `std::gpu`, `Scanner`, `sync::Mutex`, `fs`, which are 0.27.4's), front 17 (`embed` blocks), borrowck 63, translator 454. The run corpus (tests/translate/corpus1.txt): 41 of 50.
+
 The front (front273):
 
 - FL6, the i32 literal default (front-rust.md F18.5): in the rust
