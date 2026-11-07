@@ -221,7 +221,7 @@ fn is_ref_type_node(tn: i64, pcx: Ctx<Comp>) -> bool {
 
 // Whether type node tn names a type parameter of function node n or of
 // its impl (gen, the impl's generics): -1 when it does not, else its Fn
-// bound's kind (0: none, 2: Fn, 3: FnMut).
+// bound's kind (0: none, 2: Fn or Allocator, by value, 3: FnMut).
 fn type_param_bound(n: i64, tn: i64, gen: i64, pcx: Ctx<Comp>) -> i64 {
     if tn <= 0 || pcx.nodes[tn].kind != NodeKind::TyName || pcx.nodes[tn].count > 0 {
         return -1;
@@ -243,6 +243,11 @@ fn type_param_bound(n: i64, tn: i64, gen: i64, pcx: Ctx<Comp>) -> i64 {
                     let b = child(h, j, pcx);
                     if pcx.nodes[b].kind == NodeKind::TyFn && pcx.nodes[b].d >= 2 {
                         return pcx.nodes[b].d;
+                    }
+                    // (an allocator, which MVS copies: by value, as Gpa)
+                    if pcx.nodes[b].kind == NodeKind::TyName
+                        && word_here(pcx.nodes[b].start, "Allocator") {
+                        return 2;
                     }
                 }
             }
@@ -282,7 +287,8 @@ fn borrows_param(n: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
 // Function node n's parameters and result.
 fn edit_signature(n: i64, impls: HMap, tr: inout Tr, pcx: inout Ctx<Comp>) {
     let f = pcx.nodes[n].x - 1;
-    var fi = if f >= 0 && f < pcx.fns.len() as i64 && pcx.fns[f].node == n { f } else { -1 };
+    var fi = if f >= 0 && f < pcx.fns.len() as i64 && pcx.fns[f].node == n
+        && pcx.fns[f].generic == 0 { f } else { -1 };
     if fi < 0 {
         // (a generic function's template: an instance's checked signature,
         // its clone at the same place; a type parameter's is decided apart)
@@ -434,6 +440,8 @@ fn impl_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
             }
         } else if name == "Display" || name == "Debug" {
             fmt_impl(n, name == "Debug", &tr, &pcx);
+        } else if name == "Ord" && word_here(pcx.nodes[t].start, "Ord") {
+            ord_impl(n, t, self_ty, &tr, &pcx);
         } else if name == "Eq" && word_here(pcx.nodes[t].start, "Eq") {
             put(pcx.nodes[t].start, pcx.nodes[t].start + 2, "PartialEq", TC_TYPE, &tr, &pcx);
             let b = crate::base::buf_new();
@@ -445,6 +453,76 @@ fn impl_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
             put(pcx.nodes[n].end, pcx.nodes[n].end, crate::base::buf_slice(b), -1, &tr, &pcx);
         }
     }
+}
+
+// An impl of MVS's Ord, whose `cmp` gives an i64 (negative, zero,
+// positive): Rust's, `-> Ordering`, the body's value compared with 0, and
+// the PartialOrd it needs after it (with PartialEq and Eq from cmp when the
+// type has no Eq of its own).
+fn ord_impl(n: i64, t: i64, self_ty: [u8], tr: inout Tr, pcx: inout Ctx<Comp>) {
+    var f = 0;
+    for j in 0..pcx.nodes[n].count {
+        let c = child(n, j, pcx);
+        if pcx.nodes[c].kind == NodeKind::Fn && word_here(skip_ws(pcx.nodes[c].start + 2), "cmp") {
+            f = c;
+        }
+    }
+    let r = if f > 0 { pcx.nodes[f].b } else { 0 };
+    let body = if f > 0 { pcx.nodes[f].c } else { 0 };
+    if r <= 0 || body <= 0 || !word_here(pcx.nodes[r].start, "i64") {
+        return;
+    }
+    put(pcx.nodes[r].start, pcx.nodes[r].end, "std::cmp::Ordering", TC_TYPE, &tr, &pcx);
+    put(pcx.nodes[body].start, pcx.nodes[body].start, "{ (", -1, &tr, &pcx);
+    put(pcx.nodes[body].end, pcx.nodes[body].end, ").cmp(&0) }", -1, &tr, &pcx);
+    let head = SRC[pcx.nodes[n].start..pcx.nodes[t].start];
+    let b = crate::base::buf_new();
+    crate::base::buf_bytes(b, " ");
+    crate::base::buf_bytes(b, head);
+    crate::base::buf_bytes(b, "PartialOrd for ");
+    crate::base::buf_bytes(b, self_ty);
+    crate::base::buf_bytes(b,
+        " { fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(o)) } }");
+    if !has_eq(n, self_ty, pcx) {
+        crate::base::buf_bytes(b, " ");
+        crate::base::buf_bytes(b, head);
+        crate::base::buf_bytes(b, "PartialEq for ");
+        crate::base::buf_bytes(b, self_ty);
+        crate::base::buf_bytes(b,
+            " { fn eq(&self, o: &Self) -> bool { self.cmp(o) == std::cmp::Ordering::Equal } } ");
+        crate::base::buf_bytes(b, head);
+        crate::base::buf_bytes(b, "Eq for ");
+        crate::base::buf_bytes(b, self_ty);
+        crate::base::buf_bytes(b, " {}");
+    }
+    put(pcx.nodes[n].end, pcx.nodes[n].end, crate::base::buf_slice(b), -1, &tr, &pcx);
+}
+
+// Whether the type impl n is of (written self_ty) has an Eq: an impl of
+// Eq or PartialEq, or a derive's.
+fn has_eq(n: i64, self_ty: [u8], pcx: Ctx<Comp>) -> bool {
+    let tb = pcx.nodes[n].b;
+    let sym = if tb > 0 { pcx.nodes[tb].a } else { 0 };
+    for m in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[m].kind;
+        if k == NodeKind::Impl && m != n && pcx.nodes[m].a > 0 && pcx.nodes[m].b > 0 {
+            let tn = crate::base::sym_text(pcx.nodes[pcx.nodes[m].a].a, pcx);
+            let st = SRC[pcx.nodes[pcx.nodes[m].b].start..pcx.nodes[pcx.nodes[m].b].end];
+            if (tn == "Eq" || tn == "PartialEq") && st == self_ty {
+                return true;
+            }
+        }
+        if (k == NodeKind::Struct || k == NodeKind::Enum) && pcx.nodes[m].a == sym
+            && pcx.nodes[m].h > 0 {
+            let h = pcx.nodes[m].h;
+            for j in 0..pcx.nodes[h].count {
+                if word_here(pcx.nodes[child(h, j, pcx)].start, "Eq") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 // An impl of Display or Debug (rewrite.tsv's Display::fmt, Debug::fmt_debug
@@ -560,6 +638,14 @@ fn derive_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
         if k != NodeKind::Struct && k != NodeKind::Enum || !editable(pcx.nodes[n].start, &pcx) {
             continue;
         }
+        // (a union: the rust edition derives nothing for one)
+        var q = pcx.nodes[n].start;
+        while q < pcx.nodes[n].end && SRC[q] != '{' && !word_here(q, "union") {
+            q += 1;
+        }
+        if q < pcx.nodes[n].end && SRC[q] != '{' {
+            continue;
+        }
         let copy = copied.get(n + 1) == 1;
         var fieldless = k == NodeKind::Enum;
         if k == NodeKind::Enum {
@@ -623,6 +709,23 @@ fn derive_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
             }
             if q >= 2 && SRC[q - 2..q + 1] == "pub" {
                 at = q - 2;
+            }
+            // (before the item's other attributes, `#[repr(C)]`: the rust
+            // edition takes a derive first)
+            q = at - 1;
+            while q > 0 && crate::tools::translate::is_ws(SRC[q]) {
+                q -= 1;
+            }
+            while q > 0 && SRC[q] == ']' {
+                var o = q;
+                while o > 0 && !(SRC[o] == '#' && SRC[o + 1] == '[') {
+                    o -= 1;
+                }
+                at = o;
+                q = o - 1;
+                while q > 0 && crate::tools::translate::is_ws(SRC[q]) {
+                    q -= 1;
+                }
             }
             let line = crate::base::buf_new();
             crate::base::buf_bytes(line, "#[derive(");
