@@ -53,6 +53,11 @@ pub const U_CSLOT: i64 = 7;
 // (0.27.2.1) An `impl Tr` result's one region (D21.2, D21.3; external):
 // every input region outlives it, and the body chooses which it is.
 pub const U_OPAQUE: i64 = 8;
+// (0.27.5, D4.6 (f)) A region of a projection an Ω's bound defines,
+// `Ω::Item` with `Iterator<Item = &'a str>` (external): x the bound's
+// lifetime's symbol, the caller's; a call ties it to the caller's
+// universal of that name.
+pub const U_OUTER: i64 = 9;
 
 // Variances (D5.1), as bits: the meet is their union, `*` (bivariant)
 // the identity.
@@ -78,6 +83,11 @@ const B_SELF: i64 = 5;
 // substitution collapses, `&T` with T = str: B_PARAM's, and an input of
 // E2 as the reference is)
 const B_PARAM_REF: i64 = 6;
+// (0.27.5, D4.6 (f)) a slot of a projection of an Ω, `Ω::Item`: the
+// lifetime its bound's `Item = X` names there (x: its symbol), or a region
+// of its own (B_FREE); never an elided output region
+const B_OUTER: i64 = 7;
+const B_FREE: i64 = 8;
 
 // Kind b read as B_PARAM when it is B_PARAM_REF.
 fn param_kind(b: i64) -> i64 {
@@ -236,7 +246,7 @@ pub fn buf_region(out: i64, r: i64, pbody: Body<Comp>, pcx: Ctx<Comp>) {
         buf_str(out, c" ");
         if a == U_STATIC {
             buf_str(out, c"'static");
-        } else if a == U_NAMED {
+        } else if a == U_NAMED || a == U_OUTER {
             buf_str(out, c"'");
             crate::base::buf_bytes(out, sym_text(b, pcx));
         } else if a == U_SUBST {
@@ -1232,6 +1242,9 @@ fn bind_walk(n0: i64, t: i64, tps: i64, self_node: i64, up: i64, out: inout Vec<
     if t <= 0 || depth > 16 {
         return;
     }
+    if f >= 0 && omega_proj(n0, t, tps, up, &out, depth, f, pcx) {
+        return;
+    }
     if proj_walk(n0, t, tps, self_node, up, &out, depth, f, pcx) {
         return;
     }
@@ -1577,6 +1590,83 @@ fn proj_map(i: i64, vn: i64, t: i64, s: i64, base: Vec<i64, Comp>, up: i64,
     }
 }
 
+// RULE: D4.6 (f) (a projection `P::A` or `Self::A` of instance f whose base
+// is an Ω, which no impl normalizes: each slot the lifetime the Ω's bound
+// `A = X` names at it (X read alone: its named lifetimes the caller's,
+// B_OUTER), 'static, or a region of its own (B_FREE); true when written
+// to out)
+fn omega_proj(n: i64, t: i64, tps: i64, up: i64, out: inout Vec<i64, Comp>, depth: i64, f: i64,
+    pcx: Ctx<Comp>) -> bool {
+    if !proj_shape(n, pcx) {
+        return false;
+    }
+    let first = child(n, 0, pcx);
+    var s = 0;
+    if sym_text(pcx.nodes[first].a, pcx) == "Self" {
+        s = pcx.fns[f].self_ty;
+    } else {
+        let k = param_index(tps, pcx.nodes[first].a, pcx);
+        if k < 0 || k >= pcx.fns[f].targ_count {
+            return false;
+        }
+        s = tlist_at(pcx.fns[f].targs + k, pcx);
+    }
+    if s <= 0 || !crate::front::opaque::is_omega(s, pcx) {
+        return false;
+    }
+    let x = omega_binding(s, pcx.nodes[n].a, pcx);
+    if x <= 0 {
+        return false;
+    }
+    var w = Vec::<i64, Comp>::new_in(Comp {});
+    bind_walk(x, t, 0, 0, -1, &w, depth + 1, pcx, -1);
+    let count = slot_count(t, pcx);
+    let read = w.len() as i64 == 4 * count;
+    let me = out.len() as i64 / 4;
+    for j in 0..count {
+        var kind = B_FREE;
+        var sym = 0;
+        var u = up;
+        if read {
+            if w[4 * j] == B_STATIC {
+                kind = B_STATIC;
+            } else if w[4 * j] == B_NAMED {
+                kind = B_OUTER;
+                sym = w[4 * j + 1];
+            }
+            if w[4 * j + 3] >= 0 {
+                u = me + w[4 * j + 3];
+            }
+        }
+        push_entry(kind, sym, j, u, &out);
+    }
+    true
+}
+
+// The type node X of Ω s's bound `Tr<name = X>` (0: none).
+fn omega_binding(s: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
+    let pn = pcx.types[s].b;
+    let bounds = if pn > 0 { pcx.nodes[pn].h } else { 0 };
+    if bounds <= 0 {
+        return 0;
+    }
+    for bi in 0..pcx.nodes[bounds].count {
+        let b = child(bounds, bi, pcx);
+        let holder = if is_node(b, NodeKind::TyName, pcx) { pcx.nodes[b].h } else { 0 };
+        if holder <= 0 {
+            continue;
+        }
+        for ci in 0..pcx.nodes[holder].count {
+            let c = child(holder, ci, pcx);
+            if is_node(c, NodeKind::AssocType, pcx) && pcx.nodes[c].a == name
+                && pcx.nodes[c].b > 0 {
+                return pcx.nodes[c].b;
+            }
+        }
+    }
+    0
+}
+
 // Whether type node n is a projection's, `Self::Item` or `I::Item` (one
 // segment before the name, no arguments, not `<T as Tr>::A`).
 fn proj_shape(n: i64, pcx: Ctx<Comp>) -> bool {
@@ -1663,7 +1753,7 @@ fn add_universal(kind: i64, x: i64, y: i64, sig: inout Sig<Comp>) -> i64 {
             }
         }
     }
-    if kind == U_NAMED || kind == U_SUBST {
+    if kind == U_NAMED || kind == U_SUBST || kind == U_OUTER {
         for u in 0..universal_count(sig) {
             if sig.univ[3 * u] == kind && sig.univ[3 * u + 1] == x && sig.univ[3 * u + 2] == y {
                 return u;
@@ -1758,8 +1848,10 @@ pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
         // RULE: D4.2 (E2 counts the lifetimes written in the inputs, elided
         // or not; a type parameter's slots are not one: `fn f<T>(a: &A, x:
         // T) -> &T` borrows from a)
+        // (D4.6 (f): an Ω's projection's slots are not one either)
         for e in 0..count {
-            if sig.walk[4 * e] != B_PARAM && sig.walk[4 * e] != B_SELF {
+            let b = sig.walk[4 * e];
+            if b != B_PARAM && b != B_SELF && b != B_OUTER && b != B_FREE {
                 if only < 0 {
                     only = sig.params[base + e];
                 }
@@ -2477,6 +2569,9 @@ fn entry_universal(e: i64, param: i64, tps: i64, sig: inout Sig<Comp>, pcx: Ctx<
     }
     if b == B_SELF {
         return add_universal(U_SUBST, sig.walk[4 * e + 1], sig.walk[4 * e + 2], &sig);
+    }
+    if b == B_OUTER {
+        return add_universal(U_OUTER, sig.walk[4 * e + 1], 0, &sig);
     }
     if param_kind(b) == B_PARAM {
         let sym = pcx.nodes[child(tps, sig.walk[4 * e + 1], pcx)].a;
