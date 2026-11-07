@@ -123,6 +123,15 @@ The front's smaller gaps (front2721c):
 - The primitives' builtin `Sum<&'a P>` and `Product<&'a P>`
   (`v.iter().sum()`, F15.1); char is Clone and Copy.
 - std2's `Stdin::read_line` annotates its result, so the stdin cases run.
+- An impl parameter fixed by a closure bound's result with arguments
+  binds (`P: FnMut(I::Item) -> Option<B>`: MapWhile, Scan, FromFn, Fuse;
+  F14.1), and a tuple of literals indexes as the impl's index type
+  (`g[(0, 1)]` with `Index<(usize, usize)>`, F20.5).
+- An operator's right operand of another type picks the impl for it:
+  `s == "x"` for a String, `v == *slice`, a Vec against one on another
+  allocator, `s + "bar"` (F26.3).
+- `<T as Tr>::f(..)` in an expression, T a name: `<i32 as
+  FromStr>::from_str("-7")` (F8.4).
 
 The borrow checker (bc2721):
 
@@ -160,6 +169,16 @@ The borrow checker (bc2721):
   receiver (D7.4): `write(f, "{}", f.width())` reads f while the
   reborrow is reserved, and f is usable after the call, where the
   desugaring moved f (`borrowck.use_moved`). 6 Formatter cases pass.
+- An arithmetic operator moves its operands in the rust edition (D8.5):
+  `a + b` is `Add::add(a, b)`, where the operands' bindings were
+  borrowed copies, so an operand with a drop was dropped again at the
+  end of its scope (a double free, already in 0.27.2); a comparison's
+  stay borrowed. `rust_b_ops_` cases for `+`, `+=`, `==` and a use after
+  the move.
+- A statement's operands are read in order (D8.5): `(t, t)`, `[t, t]`
+  and `S { a: t, b: t }` of a non-Copy t are a use after move (E0382),
+  in generic bodies too, where the second move went unseen. 6
+  `rust_b_moves_` cases.
 
 std2 (std2721):
 
