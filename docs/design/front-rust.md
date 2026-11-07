@@ -1084,9 +1084,9 @@ These uses keep it free: a method call whose instance names the
 variable only through `Self` (`v.len()`, `v.is_empty()`,
 `v.capacity()`): the instance waits for the variable, and is made again
 with its solution. Any other use is `type.infer` (rustc E0282) at the
-call that made the variable: a method call or a field on a bare
-variable, `x as τ`, a by-value use whose `Copy` depends on the
-variable, a capture by a closure, a format hole. Solving retypes in
+call that made the variable: a method call on a bare variable, `x as
+τ`, a capture by a closure, a format hole (`println("{:?}", v)` before
+the push). Solving retypes in
 place the function's locals, nodes and closure signatures that mention
 the variable, and makes again each instance made with it; a variable
 free at the function's end is F18.2's `type.infer`. After the function
@@ -1629,9 +1629,10 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   F18.6's variables are solved in the order the function is checked, by
   the first use that meets a definite type; rustc unifies over the whole
   function. So a use F18.6 does not let wait, before the one that fixes
-  the variable, rejects where rustc accepts (`let v = Vec::new_in(a);
-  let w = v; w.push(1)`: the move, as `Copy` is not known; `x[0]` of a
-  pending `Vec`), and a variable fixed by an untyped literal takes `i32`
+  the variable, rejects where rustc accepts (`println("{:?}", v)`, then
+  `v.push(1)`; a closure capturing `v`, then the push; a deref through
+  a type that holds a variable, `Box::new_in(Vec::new_in(a), a)` then
+  `b.push(1)`), and a variable fixed by an untyped literal takes `i32`
   at once where rustc keeps an `{integer}` that a later use may fix:
   `v.push(1); let b: u8 = v[0];` is rustc's `Vec<u8>` and vole's error
   (`Vec<i32>`, FL6). No projection on a variable (`"4".parse().unwrap()`
