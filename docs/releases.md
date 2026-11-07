@@ -98,6 +98,21 @@ The front (fl10274):
   borrowck.borrow_immutable where rustc compiles them. A type with Index
   and no IndexMut keeps `index`, and the write is borrowck's (E0596).
 
+The front (front275):
+
+- A rust body reads each operand where it is evaluated, as Rust does
+  (borrowck.md D2.4a). A Copy place given as an argument, a literal's
+  element or an assignment's right side is copied out at that point.
+  - The view or reference it reads through ends there, so rustc's
+    accepted shapes now pass the borrow checker:
+    `err_begin(pcx.nodes[p].start, pcx)`, `pcx.nodes[p].b =
+    pcx.nodes[q].a`, `v.push(v[0])`, `f(s.x, &mut s)`, `g(y, &mut y)`.
+    Gate 3's `check --borrowck-partial` goes from 3,049 errors to 313
+    (conflicts from 2,951 to 215).
+  - It is also a run-time fix: `f(x, { x += 1; x })` now passes the old
+    `x` first, and `v[{ y += 1; 0 }] = y` stores the old `y`, as in Rust.
+  - MVS is unchanged.
+
 The translator (g3274):
 
 - A result's views where elision cannot tie them: with no parameter to
@@ -130,7 +145,8 @@ The translator (g3274):
   static's or a constant's `[u8]` value, or an `if` branch beside
   declared bytes, is `b".."`.
 - Gate 3 so far: 121 errors (117 type error, 2 edition.lenient, 1
-  distinct.mix, 1 item.private); borrowck (partial): 2,906.
+  distinct.mix, 1 item.private); borrowck (partial), with front275's
+  D2.4a: 161.
 
 ### What's new in 0.27.4
 
