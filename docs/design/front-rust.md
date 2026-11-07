@@ -1138,7 +1138,9 @@ writer `w` for `write(w, ..)`/`writeln` (calling `w.write_fmt`-free:
 the pieces go to `w.write_str` through `fmt::Write` or `io::Write`,
 whichever `w` implements, F13.2), a 256-byte stack buffer for
 `panic`/`assert*` (0.26.2's decision 5). `write`/`writeln` return
-`fmt::Result` (or `io::Result<()>` for an `io::Write` writer); the
+`fmt::Result` (or `io::Result<()>` for an `io::Write` writer: 0.27.3,
+through the tail's `std::__rt::io_fmt`, the first io error kept, its
+`finish` the value; a writer whose referent is no `fmt::Write`); the
 print functions return `()`. The lowering is rust-edition generated
 code (Z1): the trait calls are F0.5's and go through F15.1's intrinsic
 impls for primitives (the number formatting MVS has). *Anchor:*
