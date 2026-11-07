@@ -17,11 +17,11 @@
 # (the previous release has no std2), against its own MVS rows above:
 #
 #   hello-rust  a rust hello world built, at most 2.0x hello's (target 1.5x;
-#               printed, not failing: the ceiling 2.0x is enforced from
-#               0.27.4; 0.27.2 shipped at about 4.4x, 0.27.2.1 at 3.35x:
-#               the rest is std2 lexed and parsed whole, +47M, its builtin
-#               impls, 33M, and println's back end, +40M; lazy std2
-#               sections and a lighter println are 0.27.3's)
+#               printed, not failing: the ceiling is enforced from 0.27.5,
+#               with std2 lexed lazily; 0.27.2 shipped at about 4.4x,
+#               0.27.2.1 at 3.35x, 0.27.3 at 2.32x, 0.27.4 at about 2.0x,
+#               a build making the builtin impls only of the primitives
+#               the program names, F15.1)
 #   std-rust    tests/cost/std2_heavy.vl built, at most 2.0x std's (target 1.5x)
 #
 # Instructions, not time: they hardly move with the machine's load. They
@@ -113,7 +113,7 @@ measure_edition() {
     awk -v n="$name" -v a="$base" -v b="$new" -v l="$limit" -v t="$target" -v e="$enforced" 'BEGIN {
         r = b / a
         bad = (r > l)
-        printf "  %-10s %8.1f M instructions, its MVS row %8.1f M: %.2fx (at most %.2fx%s, target %.2fx)%s\n", n, b / 1e6, a / 1e6, r, l, (e ? "" : ", enforced from 0.27.4"), t, (bad ? (e ? "  TOO DEAR" : "  over the ceiling") : "")
+        printf "  %-10s %8.1f M instructions, its MVS row %8.1f M: %.2fx (at most %.2fx%s, target %.2fx)%s\n", n, b / 1e6, a / 1e6, r, l, (e ? "" : ", enforced from 0.27.5"), t, (bad ? (e ? "  TOO DEAR" : "  over the ceiling") : "")
         exit (bad ? (e ? 1 : 2) : 0)
     }'
     case $? in 0) ;; 2) OVER="$OVER $name" ;; *) FAILED=1 ;; esac
@@ -141,7 +141,7 @@ if [ $FAILED -ne 0 ]; then
     exit 1
 fi
 if [ -n "$OVER" ]; then
-    echo "compile-cost: within the bounds enforced now; over the ceiling enforced from 0.27.4:$OVER"
+    echo "compile-cost: within the bounds enforced now; over the ceiling enforced from 0.27.5:$OVER"
 else
     echo "compile-cost: hello, std, check, rust, hello-rust and std-rust within the bounds"
 fi
