@@ -262,6 +262,13 @@ words; one from an unsized to a sized pointee (`*const [T] as *const
 T`) keeps the address and drops the length; sized to unsized is
 `error type.cast` (rustc E0606; use `from_raw_parts`). F29.2.
 
+
+**Z9.1a (a reference impl over an unsized self, 0.27.2.1).** While `&[T]`
+is represented as `[T]`, a pattern impl for `&A` (`impl<A: PartialEq<B>,
+B> PartialEq<&B> for &A`) matches a slice too; when it and the slice's
+own impl both take a call, the slice's own is chosen (rustc reaches it
+through the reference impl). *Anchor:* `front/convert/mod.vl:
+by_unsized_self`. Case `rust_f_z91_ref_impl_ok`.
 ### F23 Literals
 
 **F23.1 (string literals).** `"…"` has type `&'static str` in a
@@ -663,6 +670,14 @@ trait.unconstrained` (E0207) at the impl. *Anchor:* `collect_impl`
 `later_impl`), `front/check/calls/paths.vl: impl_param_count,
 bind_impl_params`.
 
+**F14.2 (positional binding).** An instance's arguments bind a template
+impl's parameters by position only when the header names them in order
+(`impl<T> Tr for W<T>`); `impl<T> SliceIndex<[T]> for Range<usize>` is
+matched (F0.3), does not cover `Range<i64>`, and its `T` is fixed by
+the trait arguments a projection is read with (`trait_args_agree`).
+*Anchor:* `front/traits.vl: header_in_order, impl_bindings,
+trait_args_agree`.
+
 ### F15 Builtin impls
 
 **F15.1 (`#[builtin_impls(P₁, .., Pₙ)]`).** On a trait declaration in a
@@ -839,6 +854,18 @@ that does not fit is `arith.overflow`). An unsuffixed float literal is
 `front/generics/mod.vl: is_untyped_literal_expr`, `front/check/
 literals.vl: defaulted_apart`, `synth_mode.vl: is_untyped_literal`
 (the default kind).
+(0.27.2.1: a range of unsuffixed integer literals at a bare bounded
+parameter, `s.get(1..3)`, is checked as the one `Range<N>` the bounds
+admit before the call's arguments are inferred:
+`generics/instantiate.vl: range_literal_by_bounds`.)
+
+**F18.4 (a hoisted literal takes the let's annotation).** `let r: &U = &e;`
+with `e` a literal (an array, an integer, a float, a tuple) makes its
+temporary (lifetime extension) with the annotation's type: `let d: &[u8]
+= &[1, 2, 3];` is `let t: [u8; 3] = [1, 2, 3]; let d: &[u8] = &t;`, so
+the literals are `u8`, not the default. *Anchor:* `front/check/temps.vl:
+annotate_temp`. Integer inference variables (a literal typed by a later
+statement, `let a = [1, 2]; f(&a)` with `f(&[u8])`) stay FL6's, 0.27.3.
 
 ### F19 Small syntax
 
@@ -1036,6 +1063,13 @@ code (Z1): the trait calls are F0.5's and go through F15.1's intrinsic
 impls for primitives (the number formatting MVS has). *Anchor:*
 `front/check/interp.vl: direct_body` (today: MVS's `__print_begin`,
 `Fmt::display`), `format.vl: panic_call`.
+
+**F16.5 (the spec's traits and flags).** A hole's trait is the spec's: `x`
+LowerHex, `X` UpperHex, `o` Octal, `b` Binary, `e` LowerExp, `E`
+UpperExp, `?` Debug, else Display; `+` sets the Formatter's
+`sign_plus` (bit 0), `-` its `sign_minus` (bit 1), `#` `alternate`, `0`
+`sign_aware_zero_pad`. *Anchor:* `front/check/interp.vl:
+direct_body_std2, spec_call`, `format.vl: parse_spec`.
 
 ### F17 Derives
 
