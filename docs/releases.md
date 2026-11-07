@@ -98,6 +98,40 @@ The front (fl10274):
   borrowck.borrow_immutable where rustc compiles them. A type with Index
   and no IndexMut keeps `index`, and the write is borrowck's (E0596).
 
+The translator (g3274):
+
+- A result's views where elision cannot tie them: with no parameter to
+  borrow from, every view in the result is `'static`, inside it too
+  (`Vec<Opt<'static>, Gpa>`); with two or more and no `self`, the
+  function's `'a`, on the result and on each parameter taken by a shared
+  reference (`&mut` ones keep their own). Gate 3's borrowck.elision: 40
+  to 4.
+- No move out of an index: an `if` of two places given to a reference
+  parameter borrows each branch (`if c { &a.x } else { &a.y }`), and
+  rewrite.tsv's `Vec::free`/`String::free` on an element (`$r=index`, a
+  new condition) is `{ $r.clear(); $r.shrink_to_fit(); }`.
+- `'static` results by an explicit list in sig.vl's static_result, each
+  with its evidence: base::sym_text (intern's copies and the cache's
+  buffer, never freed), tools::patch::target (argv),
+  tools::testrun::build_key (a fresh buffer). A view of SRC is not
+  `'static` (add_source reallocates it): tools/probe keeps two offsets
+  in place of its view, and lex_text_block reads `SRC[0..lex_end]`
+  itself. MVS's `static var SRC: [u8]` stays a known gap (its
+  translation `static mut SRC: &'static [u8]` is unsound), a design item
+  of 0.27.5's.
+- `str::from_utf8(..).unwrap()` only for a printed value that is bytes
+  where it is declared: a binding, parameter, field, static or constant
+  written `[u8]` (or an element of one written `[[u8]; N]`), a call whose
+  result is, a part, a borrow, a block or an `if` of such values. A
+  literal, an `if` of literals, a `str` binding and an element of a
+  `[str; N]` stay text: 0.27.4's twin agreed on 305 of the 911
+  round-tripped programs, 230 of its rejections `str::from_utf8("..")`;
+  the same programs now agree on 522 of 559. A literal that is a
+  static's or a constant's `[u8]` value, or an `if` branch beside
+  declared bytes, is `b".."`.
+- Gate 3 so far: 121 errors (117 type error, 2 edition.lenient, 1
+  distinct.mix, 1 item.private); borrowck (partial): 2,906.
+
 ### What's new in 0.27.4
 
 Gate 3 opens. `volec fix --edition rust` run on a copy of compiler/src leaves N errors, printed by the gate's `gate3` row every release; 0.28 starts at N = 0. Its first full measurement was 1,414 (after 0.27.3's three parse shapes); 0.27.4 leaves 122 type errors, most of them std2 modules the compiler uses that std2 does not have yet (`std::cli`, `fs`, `process`, `gpu`), and `volec check --borrowck-partial` counts the 3,048 borrowck errors behind them, about 2,750 of one shape that 0.27.5's first item fixes (an operand read where it is evaluated, D2.4a). In the rust edition: a type is inferred from a later statement (FL1, F18.6: `Vec::new_in(a)` then a push, a later arm, `"4".parse().unwrap()`, `_` in a type); `[T]` and `str` are unsized places that `&[T]` and `&str` refer to (Z9.1c step B: impls keyed by them, method lookup through a view, `NonNull<[u8]>` 16 bytes); `&raw const`/`&raw mut` (F30.2), and a reference to a `static mut` refused as Rust 2024 does (D6.2.5); `format_args(..)` a Display value (F16.4); indexing through `&mut [T; N]` (F20.1). std2 passes 1,445 of its 1,473 tests at -O0 (1,402 of 1,472 in 0.27.3). A rust hello world's check is 2.03x MVS's (2.32x): builtin impls only for the primitives a program brings in (F15.1), and std2's own settled bodies are not borrow-checked again (Z7.2); the 2.0x ceiling is printed, enforced from 0.27.5. A crash on a closure capturing a widened integer, in MVS too, is fixed. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
