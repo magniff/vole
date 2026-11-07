@@ -1241,6 +1241,16 @@ literal arguments, so that its result binds their parameter
 (`map_or(0, |x| x + 1)`), and one whose value is itself a literal
 after; a negated literal where an unsigned type goes is an error, rustc
 E0600.)
+(0.27.6, the branches of an `if` or a `match` where no type is expected:
+an element of a tuple that every earlier branch gives by a literal tree
+is an inference variable (F18.6) where a later branch is checked. A
+branch of a definite type there solves it, and the earlier branches'
+literals take that type. `match k { 0 => (gap, 0), _ => (0, gap) }`
+with `gap: usize` is `(usize, usize)`, as in rustc; 0.27.5 typed the
+first arm `(usize, i32)` and refused the second. A variable that the
+later branches leave free, all of them literals there, is the `i32`
+fallback. *Anchor:* `literals.vl: branch_expected, branch_settle`,
+`patterns/mod.vl: check_match`, `body.vl: synth_if`.)
 
 **F18.6 (type variables: deferred inference; 0.27.4).** In the rust
 edition a type parameter of a generic call (a function, a method, a path
