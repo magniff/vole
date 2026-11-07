@@ -669,6 +669,11 @@ D3.6).
   (D4.4), or else by a blanket impl `impl<I: ..> Tr for I` when it is
   the one impl that defines the name (`U::IntoIter` of an iterator `U`
   is `U`, its slots `U`'s).
+- (e) *A substitution is well-formed.* In an instance, the type `τ`
+  substituted for a type parameter `T` is assumed well-formed, as the
+  caller checked it: D4.5's walk of `τ` alone (`&'m mut Copied<Iter<'x,
+  i64>>` gives `'x ⊒ 'm`) and the requirements of its declarations
+  ((a)) join `⊒`, each slot the universal of `T`'s slot (D4.4).
 
 ## 5. Variance (S5)
 
@@ -1222,6 +1227,18 @@ outside the holes named below.
   signature relates at most these regions); ends with `for<'a>` `fn`
   types (0.29). Case `rust_b_err_fn_value_arg_flow_strict`
   (`// RUSTC: accepts L13`).
+- L14 (0.27.2.1) An instance's type argument whose trait impl has an
+  equality bound is not read with it (D4.6 (d) reads the bounds of the
+  function's own parameters only): in `Copied<Chain<Iter<'x, T>,
+  Iter<'y, T>>>::next`, `'x` and `'y` are one region only by Chain's
+  `impl<A: Iterator, B: Iterator<Item = A::Item>> Iterator`, so the call
+  of Chain's `next`, whose instance ties them, is
+  `borrowck.outlives` in Copied's body; rustc checks the generic body,
+  where no such pair of regions exists. Sound (stricter). It closes when
+  a substitution's impl bounds join `⊒` (the impl's own D4.6 (d) for
+  the impl chosen for each type argument). std2's cases:
+  `std2_iter_iterator_chain`, `std2_iter_adapters_chain`,
+  `std2_iter_adapters_chain_impl_doubleendediterator`.
 
 ## 12. The MVS std boundary (S12, 0.27.1 only)
 
