@@ -4,11 +4,12 @@
 ## `let mut`, an inout local `&mut`), the borrows and accesses written
 ## (`&k` `&mut k`, `r` `*r`), `.len()`, prints given their format, a
 ## `static var` `static mut` and its uses in `unsafe { }`, a raw pointer
-## `*mut T`, an i64 index `as usize`, the derives Rust names, Display's
+## `*mut T`, an i64 index `as usize`, a struct holding a view `Word<'a>`
+## (used as `Word<'_>`), the derives Rust names, Display's
 ## `fmt` result, an operator's `Output`, std's paths; written, then built
 ## and run in the rust edition with the MVS program's output.
 $ fix --edition rust --list-left main.vl
-fixed, 1 parameter to &T, 2 parameters to &mut T, 3 receivers, 2 views to &[T], 2 '&x's to '&mut x', 1 borrow written '&x', 2 accesses written '*r', 5 vars to 'let mut', 1 inout local, 1 print given its format, 4 integers annotated, 1 static var to 'static mut', 2 imports, 5 types, 4 std calls by rewrite.tsv, 1 text view to &str, 4 static mut uses put in unsafe, 1 index cast to usize, 1 copy type derived Clone, Copy	main.vl	+33 -28 lines
+fixed, 1 parameter to &T, 2 parameters to &mut T, 3 receivers, 6 views to &[T], 2 '&x's to '&mut x', 1 borrow written '&x', 2 accesses written '*r', 5 vars to 'let mut', 1 inout local, 1 print given its format, 4 integers annotated, 1 static var to 'static mut', 2 imports, 5 types, 4 std calls by rewrite.tsv, 2 text views to &str, 4 static mut uses put in unsafe, 1 index cast to usize, 2 copy types derived Clone, Copy	main.vl	+35 -30 lines
 % cat main.vl
 // fix --edition rust (0.27.3): an MVS program of each rewrite kind.
 use std::fmt::Debug; use std::ops::Add; use std::fmt::Display; use std::fmt::Formatter as Fmt;
@@ -55,6 +56,10 @@ fn total(l: &Ledger<Gpa>) -> i64 { l.total }
 
 fn none() -> *mut u8 { 0 as *mut u8 }
 
+#[derive(Clone, Copy)] struct Word<'a> { text: &'a str, at: i64 }
+
+fn first_word(s: &str) -> Word<'_> { Word { text: &s[0..2], at: 0 } }
+
 fn main(gpa: Gpa) {
     let mut l = Ledger { names: Vec::new_in(gpa), total: 0 };
     l.add(5);
@@ -79,6 +84,8 @@ fn main(gpa: Gpa) {
     let i: i64 = 1;
     let calls_now = unsafe { CALLS };
     println("{} {calls_now} {}", arr[(i + 1) as usize], none() == 0 as *mut u8);
+    let w = first_word("hello");
+    println("{} {}", w.text, w.at);
 }
 // EDITION: rust
 $ main.vl -o prog
@@ -88,3 +95,4 @@ big
 2 12 1 7
 $4.25 true 1
 9 1 true
+he 0

@@ -624,7 +624,11 @@ on `x: &T` with `T: Clone` finds `<T as Clone>::clone` (receiver `&T`)
 at `τ₀` by value, before `<&T as Clone>::clone` (receiver `&&T`, the `&`
 step); `r.into_iter()` on `r: &Vec<T>` finds the `&'a Vec<T>` impl at
 `τ₀` by value before `Vec`'s at `τ₁`; `it.next()` on a `&mut I` with
-`I: Iterator` finds `I::next` (receiver `&mut I`) at `τ₀` by value. A
+`I: Iterator` finds `I::next` (receiver `&mut I`) at `τ₀` by value;
+`a.into_iter()` on `a: [T; N]` finds `[T; N]`'s by-value `IntoIterator`
+(std::array's `IntoIter`, yielding `T`, FL13) at `τ₀` by value, before
+the `&[T; N]` impl (the `&` step) and the slice's at `τ₁ = [T]`
+(rustc's 2021 edition; 0.27.3). A
 receiver of unsized type (`τᵢ = [T]`) is probed by `&` and `&mut` only
 (F21.2). *Anchor:* `method_of`, `front/check/rust.vl: probe_step,
 probe_first, autoref_first` (the steps through references; a `Deref`
@@ -716,6 +720,14 @@ for Map<I, F>`) is renamed in the copy, in its signature, its `where`
 predicates and its body, a path's head included (`B::from_iter_in(..)`,
 0.27.2.1). *Anchor:* `front/traits.vl: rename_own_params,
 subst_trait_args`. Case `rust_f_f12_own_param_path_ok`.
+
+**F12.3 (a default in a pattern impl, 0.27.3).** A default copied into
+a pattern impl (F5.1, `count` in `impl<T> Iterator for W<T, Option<T>>`)
+is found by the impl's header, as the impl's own methods are; the copy
+is checked in the trait's module, but the header's names (`W`, a
+struct of the impl's module) are resolved in the impl's. *Anchor:*
+`front/traits.vl: fn_pattern_bindings`. Case
+`rust_f_f12_pattern_impl_default`.
 
 ### F13 Several impls of one generic trait for one type
 
@@ -865,7 +877,11 @@ header mentions `[T; N]` with `N` a declared name: a template over the
 length, instantiated for each `N` the program uses (`impl<T: Clone, N>
 Clone for [T; N]`, `Vec::from_in([..], a)`); within it `N` is a `usize`
 constant. It is the stopgap for const generics (0.29), std2-only.
-*Anchor:* `front/parser/rust.vl: take_array_builtin`.
+An impl over a type that holds `[T; N]` as an argument (`impl<T> Drop
+for IntoIter<T, [T; N]>`, std2's by-value iterator, FL13) is a pattern
+impl (F5.1): its methods, its trait's defaults (F12.3) and its `drop`
+are found by its header. *Anchor:* `front/parser/rust.vl:
+take_array_builtin`; `places/shim.vl: drop_fn` (a pattern impl's drop).
 
 ## 3. Names, calls and inference
 
@@ -1653,6 +1669,16 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   generic `T` too); vole accepts it and drops no field (F19.7), so std2
   can write `ManuallyDrop<T>` as a union over a `T`. Case
   `rust_f_f19_union_no_drop` (`// RUSTC: none FL12`).
+- **FL13 (an array's by-value iterator; 0.27.3, until const generics,
+  0.29).** Rust's `std::array::IntoIter<T, const N: usize>` is std2's
+  `IntoIter<T, Arr>` with `Arr = [T; N]` (`IntoIter<i64, [i64; 3]>`),
+  its impls `#[array_builtin(N)]` (F15.3): a type parameter stands for
+  the length a const parameter would carry. A program that names the
+  type writes `IntoIter<T, [T; N]>` where Rust writes `IntoIter<T, N>`;
+  one that only calls `into_iter()`, or loops over `[T; N]` by value,
+  is Rust's. Const generics retire it: std2's type becomes Rust's.
+  Cases `rust_f_fl13_array_iter_partial_drop`,
+  `rust_f_fl13_array_iter_break`, `rust_f_fl13_array_iter_by_value`.
 
 - **FL12 (a byte string is `&[u8]`; 0.27.3).** F23.2: `b"…"` is typed
   `&[u8]`, not `&'static [u8; n]`: `let a: &[u8; 2] = b"ab";` and
