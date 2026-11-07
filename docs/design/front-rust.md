@@ -1793,12 +1793,18 @@ the split is made once, when std2 is embedded, not at each build:
 text's units: each unit's kind, its bytes, its name, trait, type head and
 parent, the identifiers it holds (as positions in one table of std2's
 words), and the asks of its `use` leaves and its trait's item names. It
-is made by the compiler (`volec __std2-index TEXT`, the same split the
-token path runs), so the two cannot differ. A build on the built-in text
+is made by the compiler (`volec --edition rust __std2-index TEXT`, the
+same split the token path runs), so the two cannot differ. A build on the built-in text
 reads the index, interns its words, runs the reach over its units, and
 lexes only the units it keeps, in their order; the tail (Z5.1, made per
 build) is lexed and split as tokens, as before. The tokens kept are
-those the token path keeps, the same and in the same order.
+those the token path keeps, the same and in the same order (each run of
+kept units lexed at once, its last token's `joint` as in the whole
+text), and std2's inline modules are made after they are lexed, in the
+text's order and the tail's last, as when the text is lexed whole. A
+symbol's or a string literal's number may differ from the token path's
+(what is interned, and in which order, is not the same); no meaning
+does.
 - The index is used only when it was made for this text: its format and
   the text's length match, and the text is the built-in one. Otherwise
   (std2 read from a tree, `VOLE_STD_TREE`; an index made by an older
@@ -1811,12 +1817,24 @@ those the token path keeps, the same and in the same order.
   the tree's compiler (`target/tools/volec`, else `target/volec`;
   `VOLE_EMBED_VOLEC` names another). Two branches that change std2
   merge without a conflict on it: the driver makes it again from the
-  merged std2.
+  merged std2. The compiler chosen is the first that writes the index's
+  format (embed.sh's `STD2_UNITS_FORMAT`, std2lazy's `INDEX_FORMAT`);
+  with none (a tree whose compilers predate 0.27.5) the index is written
+  empty, and `-c` then compares the rest of the file: a build reads such
+  a text whole.
 - Checked: `embed.sh --edition rust -c` with the current compiler says
   whether the index is stale, and a test compares the tokens a build
   keeps with the index and without it (`VOLE_STD2_INDEX=0`), on a set of
   programs; both run for every change to std2 or the front's std2 files
-  (tests/affected.map).
+  (tests/affected.map). The test (tests/std2/units.sh) reads what
+  `VOLE_STD2_DUMP=FILE` writes, the kept tokens with the way they were
+  read (by-index, by-tokens), and builds with `VOLE_STD2_NORERUN=1`: a
+  lazy build with errors would be made again whole and hide a wrong
+  index.
+- The cost: the hello-rust row of tests/compile_cost.sh is enforced at
+  2.0x the MVS hello world from 0.27.5 (1.78x with the index, 2.08x
+  without, which the row would refuse); the index adds about 150 KB to
+  stdsrc_rust.vl and 0.5% to the compiler's own compile.
 *Anchor:* `front/modules/std2lazy.vl`, `front/modules/mod.vl:
 load_std2`, `compiler/std/embed.sh`.
 
