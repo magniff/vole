@@ -1973,6 +1973,18 @@ does.
   made by an older format, or for another text; none), and when std2 is read whole (queries, `--std2-check`,
   `VOLE_STD2_EAGER=1`, the eager rerun), the text is lexed whole as in
   0.27.4. `VOLE_STD2_INDEX=0` forces the token path.
+- (0.27.6) A gated module's units wait for its name. The reach matches
+  names without their modules, so a module of many common names
+  (std::gpu::wgsl: `Type`, `Module`, `Entry`, `Block`, `check`) would be
+  reached, a little at a time, from any program. A unit inside a top
+  module of std2 listed in std2lazy's GATED (`gpu`) is loaded only once
+  the word `gpu` is asked (by the program, or by a unit it reaches);
+  until then it waits, and the units waiting are loaded when it is. The
+  module's own `mod` lines and braces are kept, as every module's are.
+  The gate is set from the units' text after they are made (index or
+  tokens alike, so the two reads keep the same tokens). A rust hello
+  world reads none of std::gpu: 1.86x MVS's with it in std2 (1.80x
+  before it, the rest the index's larger tables), not 2.42x.
 - Kept up to date with no manual step: the commit hook and the
   stdsrc_rust.vl merge driver run embed.sh, which makes the index with
   the tree's compiler (`target/tools/volec`, else `target/volec`;

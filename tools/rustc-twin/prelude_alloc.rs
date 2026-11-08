@@ -476,3 +476,7 @@ mod vole_twin_prelude {
 use vole_twin_prelude::*;
 #[allow(unused_imports)]
 use std::fmt::Write as _;
+// (0.27.6: into a Vec<u8, A>, `write(&mut buf, ..)` of a Buf's push_fmt:
+// io::Write's)
+#[allow(unused_imports)]
+use std::io::Write as _;

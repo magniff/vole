@@ -63,6 +63,21 @@ fn edit_let(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
         return;
     }
     let init = pcx.nodes[n].c;
+    // (0.27.6) `let f = fs[i];` of an element that is not Copy: MVS's copy
+    // of a view, which nothing writes, is a reference, `&fs[i]` (Rust's
+    // index moves out of the Vec: borrowck.move_out)
+    // (through the checker's own borrow of the element, not written)
+    var el = init;
+    while el > 0 && pcx.nodes[el].kind == NodeKind::Unary && SRC[pcx.nodes[el].start] != '&'
+        && SRC[pcx.nodes[el].start] != '*' {
+        el = pcx.nodes[el].b;
+    }
+    if word_here(s, "let") && pat > 0 && pcx.nodes[pat].kind == NodeKind::PatBind
+        && pcx.nodes[n].b == 0 && el > 0 && pcx.nodes[el].kind == NodeKind::Index
+        && pcx.nodes[el].ty > 0 && pcx.types[pcx.nodes[el].ty].kind != TyKind::Slice
+        && !crate::front::conv::copyable(pcx.nodes[el].ty, &pcx) {
+        put(pcx.nodes[el].start, pcx.nodes[el].start, "&", TC_BORROW, &tr, &pcx);
+    }
     if pat > 0 && pcx.nodes[pat].kind == NodeKind::PatBind && pcx.nodes[n].b == 0 && init > 0
         && pcx.nodes[init].ty == TY_I64 && literal_only(init, 0, pcx) {
         put(pcx.nodes[pat].end, pcx.nodes[pat].end, ": i64", TC_INT, &tr, &pcx);
@@ -1269,7 +1284,7 @@ fn arm_str_binding(b: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
 // is written `str`, a part or a borrow of one; a text literal edit_str
 // leaves text (`let m = if w { "7" } else { "15" };`), an `if`, a block or
 // a match all of whose values are.
-fn declared_str(e: i64, depth: i64, d: TextDecls, tr: Tr, pcx: inout Ctx<Comp>) -> bool {
+pub fn declared_str(e: i64, depth: i64, d: TextDecls, tr: Tr, pcx: inout Ctx<Comp>) -> bool {
     if e <= 0 || depth > 8 {
         return false;
     }
@@ -1400,7 +1415,8 @@ fn elements_str(a: i64, depth: i64, d: TextDecls, tr: Tr, pcx: inout Ctx<Comp>) 
 // (0.27.5) Whether fn node f's module is std's `name` (`std::fs`).
 fn in_std_module(g: i64, name: [u8], pcx: Ctx<Comp>) -> bool {
     let m = pcx.fns[g].module;
-    m >= 0 && m < pcx.modules.len() as i64 && crate::base::sym_text(pcx.modules[m].key, pcx) == name
+    m >= 0 && m < pcx.modules.len() as i64 && pcx.modules[m].key >= 0
+        && crate::base::sym_text(pcx.modules[m].key, pcx) == name
 }
 
 // (0.27.5) A match on a copy value read from a place, with a guard
@@ -1479,7 +1495,8 @@ fn edit_inout_args(c: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
 // (0.27.5) A path given to std::fs as bytes, a value declared `[u8]`
 // (MVS's fs takes `path: [u8]`): std2's takes a `&str` until std::path,
 // so it is `str::from_utf8(p).unwrap()`. A literal is text already. The
-// same for std::process's program and arguments (std2's are &str).
+// same for std::process's program and arguments (std2's are &str), and
+// for std::num's `parse_f64(s)` and the others (0.27.6: `str::parse`).
 fn edit_std_path(c: i64, d: TextDecls, tr: inout Tr, pcx: inout Ctx<Comp>) {
     if tr.text_mode || pcx.nodes[c].end <= pcx.nodes[c].start {
         return;
@@ -1490,8 +1507,9 @@ fn edit_std_path(c: i64, d: TextDecls, tr: inout Tr, pcx: inout Ctx<Comp>) {
     }
     let g = if pcx.fns[f].tmpl > 0 { pcx.fns[f].tmpl - 1 } else { f };
     let fnode = pcx.fns[g].node;
+    let num = in_std_module(g, "std::num", pcx);
     if fnode <= 0 || editable(pcx.nodes[fnode].start, &pcx) || !in_std_module(g, "std::fs", pcx)
-        && !in_std_module(g, "std::process", pcx) {
+        && !in_std_module(g, "std::process", pcx) && !num {
         return;
     }
     for i in 0..pcx.nodes[c].count {
@@ -1503,14 +1521,19 @@ fn edit_std_path(c: i64, d: TextDecls, tr: inout Tr, pcx: inout Ctx<Comp>) {
         let nm = crate::base::sym_text(pcx.nodes[p].a, pcx);
         let fs = in_std_module(g, "std::fs", pcx);
         if fs && nm != "path" && nm != "from" && nm != "to" && nm != "dir"
-            || !fs && nm != "prog" && nm != "a" && nm != "name" {
+            || num && nm != "s" || !fs && !num && nm != "prog" && nm != "a" && nm != "name" {
             continue;
         }
         // (std::process: Command::new, arg and env_remove, whose bytes are
         // any value not written as text: a Vec<[u8]> element, an args_os item)
         if fs && declared_bytes(a, 0, d, pcx)
             || !fs && pcx.nodes[a].kind != NodeKind::Str && !declared_str(a, 0, d, tr, &pcx) {
-            put(pcx.nodes[a].start, pcx.nodes[a].start, "str::from_utf8(", TC_UTF8, &tr, &pcx);
+            // (before the view's `&`: `str::from_utf8(&s[a..b])`)
+            if num {
+                put_first(pcx.nodes[a].start, "str::from_utf8(", &tr, &pcx);
+            } else {
+                put(pcx.nodes[a].start, pcx.nodes[a].start, "str::from_utf8(", TC_UTF8, &tr, &pcx);
+            }
             put(pcx.nodes[a].end, pcx.nodes[a].end, ").unwrap()", TC_UTF8, &tr, &pcx);
         }
     }
@@ -2406,6 +2429,17 @@ fn edit_byte_holes(decls: TextDecls, tr: inout Tr, pcx: inout Ctx<Comp>) {
         return;
     }
     var named = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    // (0.27.6: each call's start + 1 by its end, the outermost's)
+    var calls = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    for c in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[c].kind;
+        if (k == NodeKind::Call || k == NodeKind::MethodCall) && own_node(c, tr, &pcx) {
+            let at = calls.get(pcx.nodes[c].end);
+            if at == 0 || pcx.nodes[c].start + 1 < at {
+                calls.put(pcx.nodes[c].end, pcx.nodes[c].start + 1);
+            }
+        }
+    }
     for n in 1..pcx.nodes.len() as i64 {
         // (a hole, or the value of `println(x)`, which is `println("{}", x)`)
         let hole = pcx.nodes[n].kind == NodeKind::InterpHole && pcx.nodes[n].b == 0
@@ -2442,6 +2476,26 @@ fn edit_byte_holes(decls: TextDecls, tr: inout Tr, pcx: inout Ctx<Comp>) {
             continue;
         }
         named.put(key, 1);
+        // (0.27.6) a function's or a method's call, `write(&mut out,
+        // "{what}")`, takes no named argument (only print's and its kind
+        // do): `{ let what = str::from_utf8(what).unwrap(); CALL }`
+        let s0 = calls.get(close + 1) - 1;
+        if s0 >= 0 && !word_here(s0, "println") && !word_here(s0, "print")
+            && !word_here(s0, "eprintln") && !word_here(s0, "eprint") {
+            let open = buf_new();
+            buf_bytes(open, "{ let ");
+            buf_bytes(open, SRC[a..b]);
+            buf_bytes(open, " = str::from_utf8(");
+            buf_bytes(open, SRC[a..b]);
+            buf_bytes(open, ").unwrap(); ");
+            let shut = buf_new();
+            buf_bytes(shut, " }");
+            if editable(s0, &pcx) && crate::tools::edit::edit_replace(s0, s0, open, &pcx)
+                && crate::tools::edit::edit_replace(close + 1, close + 1, shut, &pcx) {
+                tr.counts[TC_UTF8] += 1;
+            }
+            continue;
+        }
         let t = buf_new();
         buf_bytes(t, ", ");
         buf_bytes(t, SRC[a..b]);

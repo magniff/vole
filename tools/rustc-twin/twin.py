@@ -321,6 +321,9 @@ def to_rust(src, alloc_api=False):
         s = re.sub(r"::<Gpa>", "", s)
         s = re.sub(r",\s*Gpa\s*>", ">", s)
         s = re.sub(r"<Gpa>", "", s)
+        # (0.27.6: a Vec's allocator inferred, rewrite.tsv's Buf::new_in,
+        # `Vec::<u8, _>::new_in(gpa)`: `Vec::<u8>::new_in(gpa)`)
+        s = re.sub(r"\bVec::<([^<>]*),\s*_\s*>::", r"Vec::<\1>::", s)
     while True:
         t = inverse_in(s, gpas)  # nested calls: the outer one first
         if t == s:
