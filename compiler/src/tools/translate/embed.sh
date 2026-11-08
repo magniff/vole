@@ -22,10 +22,14 @@ check=0
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-# A [u8] literal's text: backslashes, quotes and tabs escaped.
+# A [u8] literal's text: backslashes, quotes and tabs escaped; (0.28.0)
+# `b"..."` when compiler/src is in the rust edition (its root's
+# `// EDITION: rust`), as `fix --edition rust` writes it.
+q='"'
+grep -q '^// EDITION: rust *$' compiler/src/main.vl && q='b"'
 lit() {
     sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' \
-        -e 's/^/    buf_bytes(out, "/' -e 's/$/\\n");/'
+        -e "s/^/    buf_bytes(out, $q/" -e 's/$/\\n");/'
 }
 
 {

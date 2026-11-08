@@ -577,6 +577,11 @@ try:
     case("stale-std: target/volec reads the tree's: checked with it",
          (use, "checked with target/volec instead" in line), (os.path.join(srepo, "target", "volec"), True))
     case("stale-std: a reader is used as it is", hook.current_std(reader, srepo, {}), (reader, ""))
+    # (0.28.0) the tree's version from a rust-edition compiler/src, `-> *mut u8`
+    vr = os.path.join(tmp, "vr")
+    write(os.path.join(vr, "compiler", "src", "main.vl"),
+          '// EDITION: rust\nfn main() {}\n\npub fn version() -> *mut u8 {\n    c"0.28.0"\n}\n')
+    case("tree_version: the rust edition's version()", hook.tree_version(vr), "0.28.0")
     write(os.path.join(srepo, "ex", "main.vl"), "fn main() {}\n")
     sev = {"hook_event_name": "PostToolUse", "tool_name": "Edit", "cwd": srepo, "session_id": "stalestd",
            "tool_input": {"file_path": os.path.join(srepo, "ex", "main.vl")}}
