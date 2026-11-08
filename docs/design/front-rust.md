@@ -590,6 +590,22 @@ Arena<P>`), `Box<T, A>`, arrays, tuples and the other parts are looked
 through as before; MVS is unchanged. *Anchor:* `front/check/
 alloc_rules.vl: field_allocator`.
 
+### F34 `const fn`
+
+**F34.1 (the qualifier).** (0.27.6) In a rust-edition file `const fn`,
+`const unsafe fn` and `const extern "C" fn` declare a function as
+`fn`, `unsafe fn` and `extern "C" fn` do: at the top level and in an
+inherent impl or a trait impl, after any visibility (`pub const fn`); a
+block holds no item in vole, `const fn` or other. The qualifier changes nothing in the function, which is called
+at run time like any other. A call of it is constant where a call of a
+function whose body is one expression already is: a static's
+initializer (consteval.vl's constant constructors). rustc's checks of a
+`const fn` body (E0015: a non-`const` call in it) are not made. A
+`const` before anything else is a constant, as before (`const N: τ =
+v;`), and `*const fn()` is a raw pointer type. *Anchor:*
+`front/parser/rust.vl: skip_const_fn`, `front/parser/items/mod.vl:
+parse_item, parse_impl`. *Cases:* `rust_f_f34_const_fn`.
+
 ## 2. Traits
 
 ### F2 Supertraits
