@@ -89,7 +89,9 @@ binary is invoked, where its test runner is and which hosts it supports.
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
-### What's new in 0.28.0
+### What's new in 0.27.8
+
+The front (f185x):
 
 - **Open locals are one variable (F18.5).** An open local is a leaf of
   the literal trees built from it: `let c = a;`, `let b = a + 1;`, `let m
@@ -108,6 +110,27 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   a `[u8]`), which rustc refuses too (E0308).
   *Cases:* `rust_f_f185_open_leaves`, `rust_f_f185_open_compare`,
   `rust_f_f185_open_loops`, `rust_f_f185_open_format`.
+
+The front (front273, I7):
+
+- A `&mut T` place given where a raw pointer goes outside a call (a
+  `let`'s value, the function's tail or `return`, an assigned value, a
+  struct literal's field) is reborrowed raw, `&raw mut (*x)`, as an
+  argument is (D3.6). 0.27.7 copied the `&mut` there, which
+  `--verify-places` refused (I7), and missed rustc's E0502 for a shared
+  borrow of `*x` live across it (rust_b_raw_coerce_positions,
+  rust_b_raw_coerce_let_live_shared_err). The reborrow is a write only
+  where `*mut T` is written; to `*const T` it is a read, as rustc's.
+- A view coerces to a fat raw pointer (D3.6a): `&[T]` and `&mut [T]` to
+  `*const [T]`, `&mut [T]` to `*mut [T]`, `&str` to `*const str`, `&a`
+  and `&mut a` of an array as its slice. 0.27.7 refused them all. A
+  shared view where `*mut [T]` is written is rustc's E0308. A `&mut`
+  made a written `*mut` by a cast (`x as *mut T`, `s as *mut [T]`), a
+  `&mut [T]` given to `*mut [T]`, and `&mut s[..]` made a fat raw
+  pointer are a write of what they point to, so a shared borrow live
+  across one is rustc's E0502; 0.27.7 accepted these
+  (rust_b_raw_fat_coerce, rust_b_raw_fat_from_shared_err,
+  rust_b_raw_mut_write_live_shared_err).
 
 ### What's new in 0.27.7
 
@@ -164,24 +187,6 @@ The front (front273):
   mutability, `try: &mut x`. `&mut T` still coerces to both raw
   pointers, and `&T` to `*const T`. 0.27.6 accepted it, so a callee
   could write through a pointer made from a shared borrow.
-- A `&mut T` place given where a raw pointer goes outside a call (a
-  `let`'s value, the function's tail or `return`, an assigned value, a
-  struct literal's field) is reborrowed raw, `&raw mut (*x)`, as an
-  argument is (D3.6). 0.27.6 copied the `&mut` there, which
-  `--verify-places` refused (I7), and missed rustc's E0502 for a shared
-  borrow of `*x` live across it (rust_b_raw_coerce_positions,
-  rust_b_raw_coerce_let_live_shared_err). The reborrow is a write only
-  where `*mut T` is written; to `*const T` it is a read, as rustc's.
-- A view coerces to a fat raw pointer (D3.6a): `&[T]` and `&mut [T]` to
-  `*const [T]`, `&mut [T]` to `*mut [T]`, `&str` to `*const str`, `&a`
-  and `&mut a` of an array as its slice. 0.27.6 refused them all. A
-  shared view where `*mut [T]` is written is rustc's E0308. A `&mut`
-  made a written `*mut` by a cast (`x as *mut T`, `s as *mut [T]`), a
-  `&mut [T]` given to `*mut [T]`, and `&mut s[..]` made a fat raw
-  pointer are a write of what they point to, so a shared borrow live
-  across one is rustc's E0502; 0.27.6 accepted these
-  (rust_b_raw_fat_coerce, rust_b_raw_fat_from_shared_err,
-  rust_b_raw_mut_write_live_shared_err).
 - A literal beside a value an earlier error left untyped takes the
   error type, so it gets no second error (F18.3). 0.27.6 checked it
   against the i32 fallback: `let value = parse("x")` was a mismatch,
@@ -491,7 +496,7 @@ std2 and the translator (fl10274):
     "(unknown)" through fn-value dispatch; it is `io panic diverge`, and
     `fix --only effects-std` writes that on a function that panics.
 
-The front (fl10274):
+The front (f185x):
 
 - A generic struct's or variant's field typed by its allocator
   parameter itself (`struct Cx<W: Allocator> { arena: W }`) takes the
@@ -516,7 +521,7 @@ The front (fl10274):
 
 Gate 3 at 37. std2 has the modules compiler/src uses: `std::time`, `std::fs`, `std::process` and `std::cli`, Rust-shaped, with the translator's rows bending MVS's calls onto them. `fix --edition rust` on a copy of compiler/src now leaves 37 errors (122 in 0.27.4), and `check --borrowck-partial` counts 154 borrowck errors behind them (3,048 in 0.27.4): a rust body reads each operand where it is evaluated (D2.4a), and borrowed literals are promoted (D2.8). In the rust edition, text is not its bytes (F0.6: a `&str` where a `&[u8]` goes is E0308), and the translator writes `b".."` or `.as_bytes()` where bytes are declared; a generic iterator's item is its bound's region, not a borrow of the iterator (D4.6 f); `AsRef` for `&T` with T = `str` no longer calls itself (a stack overflow at run time) nor gives a false outlives (Z9.1c); a borrowed array or tuple literal takes the expected type (F18.4). std2 is lexed by its units from an index made when it is embedded (Z5.2): a rust hello world's check is 1.82x MVS's (2.03x), and the 2.0x ceiling is enforced. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
 
-The front (fl10274):
+The front (f185x):
 
 - A place used mutably once its use is known takes IndexMut and
   DerefMut, as rustc's autoref does (F20.6): `vs[0].push(x)`,
@@ -683,7 +688,7 @@ The front (integrator):
   'Interp'" (102 of gate 3's errors). std2_fmt_format_args,
   std2_fmt_formatter_write_fmt and std2_fmt_write_write_fmt pass.
 
-The front (front274):
+The front (front273, I7):
 
 - FL11: a template's opaque instance (borrowck.md §22) reports its type
   errors as rustc does (`x + x` of `T: Add<Output = T>` returned as an
@@ -819,7 +824,7 @@ The translator (g3274):
   sweep cases); the corpus round-trips 43 of 50 (41 at 0.27.3's
   end). causes.tsv reclassified for every case the walls moved.
 
-The front (fl10274):
+The front (f185x):
 
 - `[T]` and `str` are types of their own in the rust edition (Z9.1c,
   FL10's second stage): the unsized place, which `&[T]` and `&str`
