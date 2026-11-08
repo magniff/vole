@@ -43,11 +43,22 @@
 # stops the rehearsal (the translation moved under it).
 # `tests/flip-rehearsal.sh --export DIR` writes hand.patch from DIR/src's
 # commits after the translation's (each commit's subject is its `#!` line).
+#
+# (0.28.0) Retired by the flip: compiler/src is the translation (its root
+# says `// EDITION: rust`), so there is nothing to rehearse. Its stages
+# are the tree's own now: gate 3 (tests/gate3.sh) checks compiler/src is
+# a fixed point of `fix --edition rust` and checks with no error, and
+# bootstrap/bootstrap.sh builds it, checks its fixpoint and runs the
+# suite. On such a tree the script says so and exits 0.
 
 set -u
 LC_ALL=C
 export LC_ALL
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+if grep -q '^// EDITION: rust *$' "$ROOT/compiler/src/main.vl"; then
+    echo "flip: compiler/src is in the rust edition: nothing to rehearse (tests/gate3.sh checks its fixed point; bootstrap/bootstrap.sh builds and tests it)"
+    exit 0
+fi
 PATCH="$ROOT/tests/flip28/hand.patch"
 COMPILER="$ROOT/target/volec"
 KEEP=""

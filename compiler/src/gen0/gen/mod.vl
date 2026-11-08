@@ -41,8 +41,8 @@ use crate::back::emit::stats::print_stats;
 use crate::back::isel::select_instructions;
 use crate::back::objfile::{asm_flush, asm_hand_over, asm_stream_begin, write_output};
 use crate::base::{
-    BUFS, STDOUT, buf_bytes, buf_clear, buf_fmt, buf_new, buf_slice, buf_str, buf_write_fd,
-    buf_write_file, cstr, intern_c, out_path, sym_text,
+    STDOUT, buf_bytes, buf_clear, buf_fmt, buf_new, buf_slice, buf_str, buf_write_fd,
+    buf_write_file, cstr, get_bufs, intern_c, out_path, sym_text,
 };
 use crate::base::timer::{
     T_CHECK, T_CODEGEN, T_ISEL, T_LOWER, T_OUTPUT, T_PARSE, timer_add, timer_now, timer_report,
@@ -53,7 +53,7 @@ use crate::front::cheader::emit_c_header;
 use crate::front::check::check_program;
 use crate::front::cimport::drop_shadowed_imports;
 use crate::front::consteval::{all_zero, const_emit};
-use crate::front::lexer::STR_COUNT;
+use crate::front::lexer::get_str_count;
 use crate::front::parser::parse_program;
 use crate::front::types::{
     TY_F32, TY_U32, TY_U64, align_to, fn_param, init_declarations, init_types, is_compound,
@@ -67,20 +67,20 @@ use crate::gen0::target::{
     emit_store, first_int_arg, function_prefix, global_prefix, ins, local_prefix, new_label, pop_d,
     pop_x, static_prefix,
 };
-use crate::middle::ir::{IRFUNCS, Op, ir_enter, ir_tables_bytes};
+use crate::middle::ir::{Op, get_irfuncs, ir_enter, ir_tables_bytes};
 use crate::middle::ir::print::print_ir_func;
 use crate::middle::lower::lower_program;
 use crate::middle::opt::optimize_program;
 use crate::middle::profile::profile_after_lowering;
 
 // Used by lower.vl.
-use std::Arena;
+use std::alloc::Arena;
 
 use crate::back::codecache::cc_end;
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::flush_warnings;
-use crate::base::target::X86;
+use crate::base::target::get_x86;
 use crate::base::term::{build_checked, build_compiling};
 use crate::front::effects::print_effects;
 use crate::front::embed::wgsl::WgslCx;
@@ -95,8 +95,8 @@ use crate::places::ir::body_new;
 use atomic::gen_atomic_body;
 
 // A new frame slot; returns its offset below the frame pointer.
-fn alloc_slot(size: i64, align: i64, pcx: inout Ctx<Comp>) -> i64 {
-    var a = align;
+fn alloc_slot(size: i64, align: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let mut a = align;
     if a < 1 {
         a = 1;
     }
@@ -114,12 +114,12 @@ fn alloc_slot(size: i64, align: i64, pcx: inout Ctx<Comp>) -> i64 {
 // The slot aligned above 16 holding frame offset `offset` (the offset of
 // a slot, or of a field inside one: `slot - field`), as its index in
 // OVERALIGNED, or -1.
-pub fn overaligned_slot(offset: i64, pcx: Ctx<Comp>) -> i64 {
+pub fn overaligned_slot(offset: i64, pcx: &Ctx<Comp>) -> i64 {
     unsafe {
-        var i = 0;
+        let mut i: i64 = 0;
         while i < pcx.overaligned.count {
-            let slot = pcx.overaligned.data[i];
-            if offset <= slot && offset > slot - pcx.overaligned.data[i + 2] {
+            let slot = (*pcx.overaligned.data.add(i as usize));
+            if offset <= slot && offset > slot - (*pcx.overaligned.data.add((i + 2) as usize)) {
                 return i;
             }
             i += 3;
@@ -130,44 +130,45 @@ pub fn overaligned_slot(offset: i64, pcx: Ctx<Comp>) -> i64 {
 
 // A frame slot for a value of type `ty`; compound values get a multiple
 // of 8 bytes, so that they can be read and written in 8-byte pieces.
-fn alloc_slot_for(ty: i64, pcx: inout Ctx<Comp>) -> i64 {
+fn alloc_slot_for(ty: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let size = if is_compound(ty, pcx) { align_to(type_size(ty, pcx), 8) }
         else { type_size(ty, pcx) };
-    alloc_slot(size, type_align(ty, pcx), &pcx)
+    alloc_slot(size, type_align(ty, pcx), pcx)
 }
 
-pub fn fn_symbol_prefix(f: i64, pcx: Ctx<Comp>) -> *u8 {
-    if pcx.fns[f].is_extern || pcx.fns[f].export || pcx.fns[f].name == pcx.main_sym {
+pub fn fn_symbol_prefix(f: i64, pcx: &Ctx<Comp>) -> *mut u8 {
+    if pcx.fns[f as usize].is_extern || pcx.fns[f as usize].export
+        || pcx.fns[f as usize].name == pcx.main_sym {
         global_prefix()
     }
     else { function_prefix() }
 }
 
 // Whether function f has a global (C-visible) symbol.
-pub fn fn_is_global(f: i64, pcx: Ctx<Comp>) -> bool {
-    pcx.fns[f].name == pcx.main_sym || pcx.fns[f].export
+pub fn fn_is_global(f: i64, pcx: &Ctx<Comp>) -> bool {
+    pcx.fns[f as usize].name == pcx.main_sym || pcx.fns[f as usize].export
 }
 
-pub fn static_symbol_prefix(s: i64, pcx: Ctx<Comp>) -> *u8 {
-    if pcx.statics[s].linkage != 0 { global_prefix() } else { static_prefix() }
+pub fn static_symbol_prefix(s: i64, pcx: &Ctx<Comp>) -> *mut u8 {
+    if pcx.statics[s as usize].linkage != 0 { global_prefix() } else { static_prefix() }
 }
 
-pub fn static_named(s: i64, pcx: inout Ctx<Comp>) {
+pub fn static_named(s: i64, pcx: &mut Ctx<Comp>) {
     while pcx.static_named.len() as i64 <= s {
         pcx.static_named.push(false);
     }
-    pcx.static_named[s] = true;
+    pcx.static_named[s as usize] = true;
 }
 
-pub fn is_static_named(s: i64, pcx: Ctx<Comp>) -> bool {
-    s < pcx.static_named.len() as i64 && pcx.static_named[s]
+pub fn is_static_named(s: i64, pcx: &Ctx<Comp>) -> bool {
+    s < pcx.static_named.len() as i64 && pcx.static_named[s as usize]
 }
 
 // -O1, -O2, before the emission: the statics the live functions' IR
 // addresses (GADDR; at -O2 optimized, at -O1 every function's as
 // lowered, which -O1's optimizer only takes from), and std::arch::detect's word, which
 // instruction selection addresses later (back::isel::arch).
-pub fn statics_named_by_ir(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
+pub fn statics_named_by_ir(cx: &mut FnCtx, pcx: &mut Ctx<Comp>) {
     // UNSAFE: the IR's tables (IRFUNCS, a function's blocks and
     // instructions in cx) and SYM_STATIC are the compiler's raw arrays.
     // SAFETY: fi < IRFUNC_COUNT; ir_enter makes cx's tables fi's, which
@@ -178,59 +179,62 @@ pub fn statics_named_by_ir(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
         for fi in 0..pcx.irfunc_count {
             // (-O1 optimizes each function as it emits it: every one
             // lowered, as its inlining may take any)
-            if pcx.fn_live[fi] == 0 && !pcx.per_function {
+            if (*pcx.fn_live.add(fi as usize)) == 0 && !pcx.per_function {
                 continue;
             }
-            ir_enter(&cx, fi, pcx);
-            for b in IRFUNCS[fi].blocks.items() {
-                if cx.blocks[b].removed != 0 {
+            ir_enter(cx, fi, pcx);
+            for b in (*get_irfuncs().add(fi as usize)).blocks.items() {
+                if (*cx.blocks.add(b as usize)).removed != 0 {
                     continue;
                 }
-                var v = cx.blocks[b].first;
+                let mut v = (*cx.blocks.add(b as usize)).first;
                 while v != 0 {
-                    if cx.insts[v].op == Op::GAddr {
-                        static_named(pcx.sym_static[cx.insts[v].imm] - 1, &pcx);
+                    if (*cx.insts.add(v as usize)).op == Op::GAddr {
+                        static_named(
+                            (*pcx.sym_static.add((*cx.insts.add(v as usize)).imm as usize)) - 1,
+                            pcx);
                     }
-                    v = cx.insts[v].next;
+                    v = (*cx.insts.add(v as usize)).next;
                 }
             }
         }
         let word = pcx.arch_word_sym;
-        if word > 0 && pcx.sym_static[word] > 0 {
-            static_named(pcx.sym_static[word] - 1, &pcx);
+        if word > 0 && (*pcx.sym_static.add(word as usize)) > 0 {
+            static_named((*pcx.sym_static.add(word as usize)) - 1, pcx);
         }
     }
 }
 
 // ---- The program ----
 
-pub fn compile_program(cx: inout FnCtx, output: *u8, pcx: inout Ctx<Comp>, wgx: inout WgslCx<Arena>) {
-    var pbody = body_new();
+pub fn compile_program(cx: &mut FnCtx, output: *mut u8, pcx: &mut Ctx<Comp>,
+    wgx: &mut WgslCx<Arena<Gpa>>) {
+    let mut pbody = body_new();
     unsafe {
-        var t = timer_now(pcx);
-        phase_time(0 as *u8, &pcx);
+        let mut t = timer_now(pcx);
+        phase_time(0 as *mut u8, pcx);
         // (0.26.2) Both code generators read the places IR only, each
         // function's kept body (middle/lower/places.vl, gen0/gen/places.vl)
         pcx.keep_bodies = true;
-        init_ast(&pcx);
+        init_ast(pcx);
         pcx.err_kind = c"parser error";
-        let program = parse_program(&pcx);
+        let program = parse_program(pcx);
         // (0.18: test items only in test builds, front/tests; `check` sees them)
-        crate::front::tests::drop_test_items(program, &pcx);
+        crate::front::tests::drop_test_items(program, pcx);
         if pcx.imported_start >= 0 {
-            drop_shadowed_imports(program, &pcx);
+            drop_shadowed_imports(program, pcx);
         }
         timer_add(T_PARSE, t, pcx);
         t = timer_now(pcx);
-        pcx.main_sym = intern_c(c"main", &pcx);
-        init_types(&pcx);
-        init_declarations(&pcx);
+        pcx.main_sym = intern_c(c"main", pcx);
+        init_types(pcx);
+        init_declarations(pcx);
         pcx.err_kind = c"type error";
-        check_program(program, &pcx, &wgx);
+        check_program(program, pcx, wgx);
         timer_add(T_CHECK, t, pcx);
-        flush_warnings(&pcx);
+        flush_warnings(pcx);
         // (0.25.3) an executable needs fn main; the phases on a terminal
-        crate::back::objfile::linkfail::require_main(&pcx);
+        crate::back::objfile::linkfail::require_main(pcx);
         build_checked(pcx);
         // (0.16)
         if pcx.print_effects {
@@ -239,84 +243,84 @@ pub fn compile_program(cx: inout FnCtx, output: *u8, pcx: inout Ctx<Comp>, wgx: 
             buf_write_fd(out, STDOUT);
         }
         if pcx.emit_header {
-            emit_c_header(program, output, &pcx);
+            emit_c_header(program, output, pcx);
             return;
         }
         pcx.data = buf_new();
         // (0.27.0: the layouts the code generators read, kept)
-        crate::front::types::lay_out_types(&pcx);
-        phase_time(c"front end", &pcx);
+        crate::front::types::lay_out_types(pcx);
+        phase_time(c"front end", pcx);
         build_compiling(pcx);
         if pcx.opt_level > 0 || pcx.emit_ir {
             t = timer_now(pcx);
-            lower_program(&cx, program, &pcx);
+            lower_program(cx, program, pcx);
             // (0.16: the effects checked against the IR)
             if pcx.verify_effects {
-                verify_effects(&cx, &pcx);
+                verify_effects(cx, pcx);
             }
             // (0.10: profiles, on the IR as lowered)
-            profile_after_lowering(&cx, &pcx);
+            profile_after_lowering(cx, pcx);
             // (0.18: --coverage's counters, middle/coverage.vl)
-            crate::middle::coverage::coverage_after_lowering(&cx, &pcx);
+            crate::middle::coverage::coverage_after_lowering(cx, pcx);
             // (0.17: --trace's frames)
-            trace_after_lowering(&cx, &pcx);
+            trace_after_lowering(cx, pcx);
             // (0.19: std::arch::detect's word: main fills it)
-            crate::back::isel::arch::arch_after_lowering(&cx, &pcx);
-            flush_warnings(&pcx);
+            crate::back::isel::arch::arch_after_lowering(cx, pcx);
+            flush_warnings(pcx);
             timer_add(T_LOWER, t, pcx);
-            phase_time(c"lowering", &pcx);
+            phase_time(c"lowering", pcx);
             if pcx.time_passes {
                 crate::middle::lower::places::lower_stats(pcx);
             }
             pcx.per_function = pcx.opt_level == 1 && !pcx.emit_ir && !pcx.emit_mir;
             if pcx.time_passes {
-                pcx.t_ir_bytes[0] = ir_tables_bytes(&cx, pcx);
+                pcx.t_ir_bytes[0] = ir_tables_bytes(cx, pcx);
             }
-            optimize_program(&cx, &pcx);
+            optimize_program(cx, pcx);
             // (0.18: --print-checks, tools/query/checks.vl)
-            if pcx.print_checks != 0 as *u8 {
-                crate::tools::query::checks::print_checks(&pcx);
+            if pcx.print_checks != 0 as *mut u8 {
+                crate::tools::query::checks::print_checks(pcx);
                 return;
             }
             if pcx.time_passes {
-                pcx.t_ir_bytes[1] = ir_tables_bytes(&cx, pcx);
+                pcx.t_ir_bytes[1] = ir_tables_bytes(cx, pcx);
             }
             if pcx.emit_ir {
                 for fi in 0..pcx.irfunc_count {
-                    if pcx.fn_live[fi] != 0 {
-                        ir_enter(&cx, fi, pcx);
-                        print_ir_func(&cx, cx.asm, fi, pcx);
+                    if (*pcx.fn_live.add(fi as usize)) != 0 {
+                        ir_enter(cx, fi, pcx);
+                        print_ir_func(cx, cx.asm, fi, pcx);
                     }
                 }
                 write_dump(cx.asm, output);
-                parallel_end(&pcx);
+                parallel_end(pcx);
                 return;
             }
             if pcx.emit_mir {
                 t = timer_now(pcx);
-                select_instructions(&cx, pcx);
+                select_instructions(cx, pcx);
                 timer_add(T_ISEL, t, pcx);
                 for fi in 0..pcx.irfunc_count {
-                    if pcx.fn_live[fi] != 0 {
-                        ir_enter(&cx, fi, pcx);
-                        print_ir_func(&cx, cx.asm, fi, pcx);
+                    if (*pcx.fn_live.add(fi as usize)) != 0 {
+                        ir_enter(cx, fi, pcx);
+                        print_ir_func(cx, cx.asm, fi, pcx);
                     }
                 }
                 write_dump(cx.asm, output);
-                parallel_end(&pcx);
+                parallel_end(pcx);
                 return;
             }
         }
         t = timer_now(pcx);
-        emit_file_header(&cx, pcx);
-        asm_stream_begin(&pcx);
+        emit_file_header(cx, pcx);
+        asm_stream_begin(pcx);
         if pcx.opt_level > 0 {
             timer_add(T_CODEGEN, t, pcx);
             // (0.25.5: the statics the code names; gen_data writes those)
-            statics_named_by_ir(&cx, &pcx);
+            statics_named_by_ir(cx, pcx);
             // (0.17: each function selected, allocated and emitted, then
             // freed; at -O1 optimized there too)
-            emit_ir_functions(&cx, &pcx);
+            emit_ir_functions(cx, pcx);
             t = timer_now(pcx);
             print_stats(pcx);
         } else {
@@ -324,25 +328,25 @@ pub fn compile_program(cx: inout FnCtx, output: *u8, pcx: inout Ctx<Comp>, wgx: 
             // code generation)
             let threaded = assembler_thread_wanted(pcx);
             if threaded {
-                asm_thread_start(&pcx);
+                asm_thread_start(pcx);
             }
             // (0.26.1: from the kept bodies, gen0's places.vl, and the drop
             // shims those call; 0.26.2: only; an atomic intrinsic's body is its
             // instructions, gen_atomic_function)
-            for item in kids(program, &pcx) {
-                if pcx.nodes[item].kind == Fn {
-                    let f = pcx.nodes[item].x - 1;
-                    if !places::gen_places_function(&cx, item, f, &pbody, &pcx) {
+            for item in kids(program, pcx) {
+                if pcx.nodes[item as usize].kind == Fn {
+                    let f = pcx.nodes[item as usize].x - 1;
+                    if !places::gen_places_function(cx, item, f, &mut pbody, pcx) {
                         if crate::middle::lower::atomic::atomic_intrinsic(f, pcx) < 0 {
                             crate::middle::lower::places::lower_stats(pcx);
                             crate::base::die(c"places: a function not generated from its body");
                         }
-                        gen_atomic_function(&cx, item, &pcx);
+                        gen_atomic_function(cx, item, pcx);
                     }
                     if threaded {
-                        asm_hand_over(&cx, pcx);
+                        asm_hand_over(cx, pcx);
                     } else {
-                        asm_flush(&cx, pcx);
+                        asm_flush(cx, pcx);
                     }
                 }
             }
@@ -352,15 +356,15 @@ pub fn compile_program(cx: inout FnCtx, output: *u8, pcx: inout Ctx<Comp>, wgx: 
                     if f < 0 {
                         continue;
                     }
-                    if !places::gen_places_function(&cx, crate::places::front::fn_node(f, pcx), f,
-                        &pbody, &pcx) {
+                    if !places::gen_places_function(cx, crate::places::front::fn_node(f, pcx), f,
+                        &mut pbody, pcx) {
                         crate::middle::lower::places::lower_stats(pcx);
                         crate::base::die(c"places: a drop shim not generated from its body");
                     }
                     if threaded {
-                        asm_hand_over(&cx, pcx);
+                        asm_hand_over(cx, pcx);
                     } else {
-                        asm_flush(&cx, pcx);
+                        asm_flush(cx, pcx);
                     }
                 }
             }
@@ -373,33 +377,33 @@ pub fn compile_program(cx: inout FnCtx, output: *u8, pcx: inout Ctx<Comp>, wgx: 
         }
         timer_add(T_CODEGEN, t, pcx);
         t = timer_now(pcx);
-        emit_runtime(&cx, &pcx);
+        emit_runtime(cx, pcx);
         // (0.19: x86-64's cpuid and xgetbv, for std::arch::detect)
-        crate::back::isel::arch::emit_arch_runtime(&cx, &pcx);
-        dbg_text_end(&cx, pcx);
-        gen_data(&pcx);
+        crate::back::isel::arch::emit_arch_runtime(cx, pcx);
+        dbg_text_end(cx, pcx);
+        gen_data(pcx);
         buf_bytes(cx.asm, buf_slice(pcx.data));
         if pcx.debug_info {
             let producer = buf_new();
-            buf_fmt(producer, format_args("volec {}\0", cstr(version())));
-            dbg_sections(&cx, out_path(0, pcx), BUFS[producer].data, pcx);
+            buf_fmt(producer, format_args("volec {}\0", str::from_utf8(cstr(version())).unwrap()));
+            dbg_sections(cx, out_path(0, pcx), (*get_bufs().add(producer as usize)).data, pcx);
         }
-        emit_file_trailer(&cx);
-        dbg_place_locs(&cx, pcx);
-        write_output(&cx, output, &pcx);
+        emit_file_trailer(cx);
+        dbg_place_locs(cx, pcx);
+        write_output(cx, output, pcx);
         // (0.18.1: the code cache's new entries, back::codecache)
         cc_end(pcx);
         timer_add(T_OUTPUT, t, pcx);
-        phase_time(c"data and output", &pcx);
+        phase_time(c"data and output", pcx);
         timer_report(pcx);
     }
 }
 
 // (0.18.1) An --emit-ir or --emit-mir dump: to stdout when the output is
 // `-` (no -o given), else to the file.
-fn write_dump(b: i64, output: *u8) {
+fn write_dump(b: i64, output: *mut u8) {
     unsafe {
-        if output[0] == '-' && output[1] == 0 {
+        if (*output.add(0)) == b'-' && (*output.add(1)) == 0 {
             buf_write_fd(b, STDOUT);
         } else {
             buf_write_file(b, output);
@@ -407,75 +411,78 @@ fn write_dump(b: i64, output: *u8) {
     }
 }
 
-fn gen_data(pcx: inout Ctx<Comp>) {
+fn gen_data(pcx: &mut Ctx<Comp>) {
     unsafe {
         data_section(writable: false, pcx: pcx);
-        for id in 0..STR_COUNT {
+        for id in 0..get_str_count() {
             data_string(id, pcx);
         }
         let scratch = buf_new();
         for s in 0..pcx.statics.len() as i64 {
-            let item = pcx.statics[s].node;
-            let ty = pcx.statics[s].ty;
-            if pcx.statics[s].linkage == 1 {
+            let item = pcx.statics[s as usize].node;
+            let ty = pcx.statics[s as usize].ty;
+            if pcx.statics[s as usize].linkage == 1 {
                 // Defined in C.
                 continue;
             }
             // (0.25.5) one no code names (C can name it only when exported:
             // linkage 2)
-            if pcx.statics[s].linkage == 0 && !is_static_named(s, pcx) {
+            if pcx.statics[s as usize].linkage == 0 && !is_static_named(s, pcx) {
                 continue;
             }
             buf_clear(scratch);
-            let init = pcx.nodes[item].c;
-            if pcx.nodes[init].kind == CStr {
+            let init = pcx.nodes[item as usize].c;
+            if pcx.nodes[init as usize].kind == CStr {
                 // A C string (0.4): the address of its bytes. (In the
                 // writable section: the address is relocated at load time.)
                 data_section(writable: true, pcx: pcx);
                 data_align(8, pcx);
-                if pcx.statics[s].linkage == 2 {
+                if pcx.statics[s as usize].linkage == 2 {
                     buf_fmt(pcx.data,
-                        format_args(".globl {}{}\n", cstr(global_prefix()),
-                            sym_text(pcx.nodes[item].a, pcx)));
+                        format_args(".globl {}{}\n", str::from_utf8(cstr(global_prefix())).unwrap(),
+                            str::from_utf8(sym_text(pcx.nodes[item as usize].a, pcx)).unwrap()));
                 }
-                data_label(static_symbol_prefix(s, pcx), pcx.nodes[item].a, pcx);
+                data_label(static_symbol_prefix(s, pcx), pcx.nodes[item as usize].a, pcx);
                 buf_fmt(pcx.data,
-                    format_args("    .quad {}str.{}\n", cstr(local_prefix()), pcx.nodes[init].a));
+                    format_args("    .quad {}str.{}\n",
+                        str::from_utf8(cstr(local_prefix())).unwrap(), pcx.nodes[init as usize].a));
                 continue;
             }
-            const_emit(init, ty, scratch, &pcx);
+            const_emit(init, ty, scratch, pcx);
             // (with addresses in it, in the writable section: relocated at
             // load time)
             let relocs = pcx.const_relocs.count > 0;
             // (0.21: an atomic or a lock changes through a shared reference)
-            let writable = pcx.statics[s].mutable || relocs || is_interior_type(ty, pcx);
+            let writable = pcx.statics[s as usize].mutable || relocs || is_interior_type(ty, pcx);
             // (0.25.5: all zero, it takes no room in the object)
-            if writable && !relocs && BUFS[scratch].len > 0 && all_zero(buf_slice(scratch)) {
+            if writable && !relocs && (*get_bufs().add(scratch as usize)).len > 0
+                && all_zero(buf_slice(scratch)) {
                 bss_section(pcx);
             } else {
                 data_section(writable, pcx);
             }
             data_align(type_align(ty, pcx), pcx);
-            if pcx.statics[s].linkage == 2 {
+            if pcx.statics[s as usize].linkage == 2 {
                 buf_fmt(pcx.data,
-                    format_args(".globl {}{}\n", cstr(global_prefix()),
-                        sym_text(pcx.nodes[item].a, pcx)));
+                    format_args(".globl {}{}\n", str::from_utf8(cstr(global_prefix())).unwrap(),
+                        str::from_utf8(sym_text(pcx.nodes[item as usize].a, pcx)).unwrap()));
             }
-            data_label(static_symbol_prefix(s, pcx), pcx.nodes[item].a, pcx);
+            data_label(static_symbol_prefix(s, pcx), pcx.nodes[item as usize].a, pcx);
             let bytes = buf_slice(scratch);
-            var done = 0;
-            var r = 0;
+            let mut done: i64 = 0;
+            let mut r: i64 = 0;
             while r < pcx.const_relocs.count {
-                let at = pcx.const_relocs.data[r];
-                data_bytes(bytes[done..at], pcx);
+                let at = (*pcx.const_relocs.data.add(r as usize));
+                data_bytes(&bytes[done as usize..at as usize], pcx);
                 buf_fmt(pcx.data,
-                    format_args("    .quad {}str.{}\n", cstr(local_prefix()),
-                        pcx.const_relocs.data[r + 1]));
+                    format_args("    .quad {}str.{}\n",
+                        str::from_utf8(cstr(local_prefix())).unwrap(),
+                        (*pcx.const_relocs.data.add((r + 1) as usize))));
                 done = at + 8;
                 r += 2;
             }
-            data_bytes(bytes[done..], pcx);
-            if BUFS[scratch].len == 0 {
+            data_bytes(&bytes[done as usize..], pcx);
+            if (*get_bufs().add(scratch as usize)).len == 0 {
                 buf_str(pcx.data, c"    .space 1\n");
             }
         }
@@ -486,63 +493,63 @@ fn gen_data(pcx: inout Ctx<Comp>) {
 
 // (0.21) An atomic intrinsic's function: its body is its instructions, on
 // the argument registers (gen_atomic_body); the places IR has none.
-fn gen_atomic_function(cx: inout FnCtx, item: i64, pcx: inout Ctx<Comp>) {
+fn gen_atomic_function(cx: &mut FnCtx, item: i64, pcx: &mut Ctx<Comp>) {
     // UNSAFE: NODES and FNS are the checker's raw tables, cx the code
     // generator's raw context pointer.
     // SAFETY: item is a Fn node, f below FN_COUNT; cx points at
     // compile_program's live FnCtx; code generation is single-threaded.
     unsafe {
-        let f = pcx.nodes[item].x - 1;
+        let f = pcx.nodes[item as usize].x - 1;
         pcx.gen_cur_fn = f;
         buf_clear(cx.code);
         pcx.depth = 0;
         pcx.frame_size = 0;
         pcx.overaligned.count = 0;
-        pcx.return_label = new_label(&cx);
+        pcx.return_label = new_label(cx);
         pcx.stmt_pos = -1;
-        dbg_function_begin(&cx, f, fn_symbol_prefix(f, pcx), pcx.nodes[item].start, pcx);
-        emit_function_start(&cx, fn_symbol_prefix(f, pcx), pcx.fns[f].name, fn_is_global(f, pcx),
-            pcx);
+        dbg_function_begin(cx, f, fn_symbol_prefix(f, pcx), pcx.nodes[item as usize].start, pcx);
+        emit_function_start(cx, fn_symbol_prefix(f, pcx), pcx.fns[f as usize].name,
+            fn_is_global(f, pcx), pcx);
         pcx.result_slot = 0;
-        if returns_through_pointer(&cx, pcx.fns[f].ret, pcx) {
-            pcx.result_slot = alloc_slot(8, 8, &pcx);
-            emit_frame_addr(&cx, R_ADDR, pcx.result_slot, pcx);
-            emit_store(&cx, TY_U64, R_RESULT, R_ADDR, pcx);
+        if returns_through_pointer(cx, pcx.fns[f as usize].ret, pcx) {
+            pcx.result_slot = alloc_slot(8, 8, pcx);
+            emit_frame_addr(cx, R_ADDR, pcx.result_slot, pcx);
+            emit_store(cx, TY_U64, R_RESULT, R_ADDR, pcx);
         }
-        gen_atomic_body(&cx, f, pcx);
-        gen_main_arch_init(&cx, f, &pcx);
-        emit_label(&cx, pcx.return_label);
-        emit_epilogue(&cx);
-        emit_frame_reserve(&cx, pcx.frame_size);
+        gen_atomic_body(cx, f, pcx);
+        gen_main_arch_init(cx, f, pcx);
+        emit_label(cx, pcx.return_label);
+        emit_epilogue(cx);
+        emit_frame_reserve(cx, pcx.frame_size);
         buf_bytes(cx.asm, buf_slice(cx.code));
-        dbg_function_end(&cx, pcx);
+        dbg_function_end(cx, pcx);
     }
 }
 
 // (0.19 T3) std::arch::detect's word, filled before main's body (f).
-fn gen_main_arch_init(cx: inout FnCtx, f: i64, pcx: inout Ctx<Comp>) {
+fn gen_main_arch_init(cx: &mut FnCtx, f: i64, pcx: &mut Ctx<Comp>) {
     // UNSAFE: FNS is the checker's raw table of functions.
     // SAFETY: f is the function being generated and init std's (both below
     // FN_COUNT: arch_std_fn gives -1 when std has none).
     unsafe {
-        if pcx.fns[f].name == pcx.main_sym && pcx.arch_used
-            && crate::front::features::any_runtime_detect(&pcx) {
-            let init = crate::back::isel::arch::arch_std_fn(true, &pcx);
+        if pcx.fns[f as usize].name == pcx.main_sym && pcx.arch_used
+            && crate::front::features::any_runtime_detect(pcx) {
+            let init = crate::back::isel::arch::arch_std_fn(true, pcx);
             if init >= 0 {
                 // (its argument: the build's features)
-                emit_load_imm(&cx, R_ACC, crate::arch::features::build_features(&pcx) as u64);
-                if X86 {
-                    ins(&cx, c"movq %rax, %rdi");
+                emit_load_imm(cx, R_ACC, crate::arch::features::build_features(pcx) as u64);
+                if get_x86() {
+                    ins(cx, c"movq %rax, %rdi");
                 }
-                emit_call(&cx, fn_symbol_prefix(init, pcx), pcx.fns[init].name, false, false, 0,
-                    pcx);
+                emit_call(cx, fn_symbol_prefix(init, pcx), pcx.fns[init as usize].name, false,
+                    false, 0, pcx);
             }
         }
     }
 }
 
 // (-g) Starts the code of the statement at `pos`.
-fn stmt_loc(cx: inout FnCtx, pos: i64, pcx: inout Ctx<Comp>) {
+fn stmt_loc(cx: &mut FnCtx, pos: i64, pcx: &mut Ctx<Comp>) {
     pcx.stmt_pos = pos;
     dbg_loc(cx.code, pos, pcx);
 }
@@ -551,25 +558,26 @@ fn stmt_loc(cx: inout FnCtx, pos: i64, pcx: inout Ctx<Comp>) {
 // register is saved before another parameter's move can reuse it).
 // Aggregates in registers are stored piece by piece; those passed by
 // reference or on the stack are copied once every register is saved.
-fn gen_params(cx: inout FnCtx, item: i64, f: i64, pcx: inout Ctx<Comp>) {
-    var state: [i64; 3] = [first_int_arg(&cx, pcx.fns[f].ret, pcx), 0, 0];
-    var pending: [i64; 64] = [0; 64];
-    var pending_count = 0;
-    var pieces: [i64; 4] = [0; 4];
-    for i in 0..pcx.fns[f].param_count {
+fn gen_params(cx: &mut FnCtx, item: i64, f: i64, pcx: &mut Ctx<Comp>) {
+    let mut state: [i64; 3] = [first_int_arg(cx, pcx.fns[f as usize].ret, pcx), 0, 0];
+    let mut pending: [i64; 64] = [0i64; 64];
+    let mut pending_count: i64 = 0;
+    let mut pieces: [i64; 4] = [0i64; 4];
+    for i in 0..pcx.fns[f as usize].param_count {
         let ty = fn_param(f, i, pcx);
         if is_void(ty) {
             continue;
         }
-        let kind = abi_classify(&cx, ty, pcx);
-        let local = pcx.nodes[child(item, i, pcx)].x;
+        let kind = abi_classify(cx, ty, pcx);
+        let local = pcx.nodes[child(item, i, pcx) as usize].x;
         if kind == AbiClass::Pieces {
-            abi_piece_locations(&cx, ty, &state as *i64, &pieces as *i64, pcx);
+            abi_piece_locations(cx, ty, state.as_mut_ptr() as *mut i64,
+                pieces.as_mut_ptr() as *mut i64, pcx);
             if local < 0 {
                 continue;
             }
-            let slot = alloc_slot_for(ty, &pcx);
-            pcx.locals[local].offset = slot;
+            let slot = alloc_slot_for(ty, pcx);
+            pcx.locals[local as usize].offset = slot;
             for k in 0..cx.abi_piece_count {
                 // On x86-64 a piece on the stack is copied as an integer of
                 // its size: through the float accumulator it would
@@ -580,53 +588,53 @@ fn gen_params(cx: inout FnCtx, item: i64, f: i64, pcx: inout Ctx<Comp>) {
                 // ran out, may come before int parameters still in
                 // registers); its float registers are all taken by earlier
                 // parameters then.
-                var piece_ty = cx.abi_piece_ty[k];
-                if X86 && pieces[k] >= 16 && is_float(piece_ty) {
+                let mut piece_ty = cx.abi_piece_ty[k as usize];
+                if get_x86() && pieces[k as usize] >= 16 && is_float(piece_ty) {
                     piece_ty = if piece_ty == TY_F32 { TY_U32 } else { TY_U64 };
                 }
-                emit_load_param(&cx, pieces[k], piece_ty, pcx);
-                store_to_frame(&cx, piece_ty, slot - cx.abi_piece_offset[k], pcx);
+                emit_load_param(cx, pieces[k as usize], piece_ty, pcx);
+                store_to_frame(cx, piece_ty, slot - cx.abi_piece_offset[k as usize], pcx);
             }
             continue;
         }
-        var location = 0;
+        let mut location: i64 = 0;
         if kind == AbiClass::Stack {
-            location = abi_stack_location(ty, &state as *i64, pcx);
+            location = abi_stack_location(ty, state.as_mut_ptr() as *mut i64, pcx);
         } else {
             location = arg_location(if kind == AbiClass::Ref { TY_U64 } else { ty },
-                &state as *i64, pcx);
+                state.as_mut_ptr() as *mut i64, pcx);
         }
         if local < 0 {
             continue;
         }
-        let slot = alloc_slot_for(ty, &pcx);
-        pcx.locals[local].offset = slot;
+        let slot = alloc_slot_for(ty, pcx);
+        pcx.locals[local as usize].offset = slot;
         if kind == AbiClass::Scalar {
-            emit_load_param(&cx, location, ty, pcx);
-            emit_frame_addr(&cx, R_ADDR, slot, pcx);
-            emit_store(&cx, ty, R_ACC, R_ADDR, pcx);
+            emit_load_param(cx, location, ty, pcx);
+            emit_frame_addr(cx, R_ADDR, slot, pcx);
+            emit_store(cx, ty, R_ACC, R_ADDR, pcx);
             continue;
         }
         // The accumulator = the address of the caller's copy.
         if kind == AbiClass::Stack {
-            m_lea(&cx, 0, reg_fp(), location);
+            m_lea(cx, 0, reg_fp(), location);
         } else {
-            emit_load_param(&cx, location, TY_U64, pcx);
+            emit_load_param(cx, location, TY_U64, pcx);
         }
-        let pointer_slot = alloc_slot(8, 8, &pcx);
-        emit_frame_addr(&cx, R_ADDR, pointer_slot, pcx);
-        emit_store(&cx, TY_U64, R_ACC, R_ADDR, pcx);
-        pending[pending_count] = local;
-        pending[pending_count + 1] = pointer_slot;
+        let pointer_slot = alloc_slot(8, 8, pcx);
+        emit_frame_addr(cx, R_ADDR, pointer_slot, pcx);
+        emit_store(cx, TY_U64, R_ACC, R_ADDR, pcx);
+        pending[pending_count as usize] = local;
+        pending[(pending_count + 1) as usize] = pointer_slot;
         pending_count += 2;
     }
-    var i = 0;
+    let mut i: i64 = 0;
     while i < pending_count {
-        let local = pending[i];
-        emit_frame_addr(&cx, R_ADDR, pending[i + 1], pcx);
-        emit_load_reg(&cx, R_ACC, R_ADDR);
-        emit_frame_addr(&cx, R_SECOND, pcx.locals[local].offset, pcx);
-        emit_copy(&cx, type_size(pcx.locals[local].ty, pcx));
+        let local = pending[i as usize];
+        emit_frame_addr(cx, R_ADDR, pending[(i + 1) as usize], pcx);
+        emit_load_reg(cx, R_ACC, R_ADDR);
+        emit_frame_addr(cx, R_SECOND, pcx.locals[local as usize].offset, pcx);
+        emit_copy(cx, type_size(pcx.locals[local as usize].ty, pcx));
         i += 2;
     }
 }
@@ -634,35 +642,35 @@ fn gen_params(cx: inout FnCtx, item: i64, f: i64, pcx: inout Ctx<Comp>) {
 // The accumulator holds the function's result: hand it to the caller (in
 // registers, or copied through the result pointer, which x86-64 also
 // returns in rax).
-fn gen_return_value(cx: inout FnCtx, ret: i64, pcx: inout Ctx<Comp>) {
+fn gen_return_value(cx: &mut FnCtx, ret: i64, pcx: &mut Ctx<Comp>) {
     if !is_compound(ret, pcx) {
         return;
     }
-    if returns_through_pointer(&cx, ret, pcx) {
-        emit_frame_addr(&cx, R_ADDR, pcx.result_slot, pcx);
-        emit_load_reg(&cx, R_SECOND, R_ADDR);
-        emit_copy(&cx, type_size(ret, pcx));
-        if X86 {
-            load_reg_from_frame(&cx, R_ACC, pcx.result_slot, pcx);
+    if returns_through_pointer(cx, ret, pcx) {
+        emit_frame_addr(cx, R_ADDR, pcx.result_slot, pcx);
+        emit_load_reg(cx, R_SECOND, R_ADDR);
+        emit_copy(cx, type_size(ret, pcx));
+        if get_x86() {
+            load_reg_from_frame(cx, R_ACC, pcx.result_slot, pcx);
         }
         return;
     }
     let size = type_size(ret, pcx);
     if size % 8 != 0 {
         // Read in whole pieces from a copy of a multiple of 8 bytes.
-        let copy = alloc_slot_for(ret, &pcx);
-        emit_frame_addr(&cx, R_SECOND, copy, pcx);
-        emit_copy(&cx, size);
-        emit_frame_addr(&cx, R_ACC, copy, pcx);
+        let copy = alloc_slot_for(ret, pcx);
+        emit_frame_addr(cx, R_SECOND, copy, pcx);
+        emit_copy(cx, size);
+        emit_frame_addr(cx, R_ACC, copy, pcx);
     }
-    abi_classify(&cx, ret, pcx);
+    abi_classify(cx, ret, pcx);
     // The address moves out of the accumulator (a result register).
-    let base = if X86 { 11 } else { 16 };
-    m_mov(&cx, base, 0, TY_U64, pcx);
+    let base: i64 = if get_x86() { 11 } else { 16 };
+    m_mov(cx, base, 0, TY_U64, pcx);
     for k in 0..cx.abi_piece_count {
-        let arg_v = cx.abi_piece_ty[k];
-        let return_piece_reg_v = return_piece_reg(&cx, k, pcx);
-        m_load(&cx, arg_v, return_piece_reg_v, base, cx.abi_piece_offset[k],
+        let arg_v = cx.abi_piece_ty[k as usize];
+        let return_piece_reg_v = return_piece_reg(cx, k, pcx);
+        m_load(cx, arg_v, return_piece_reg_v, base, cx.abi_piece_offset[k as usize],
             pcx);
     }
 }
@@ -670,48 +678,48 @@ fn gen_return_value(cx: inout FnCtx, ret: i64, pcx: inout Ctx<Comp>) {
 // ---- Statements ----
 
 // Stores the accumulator (of type `ty`) in the frame slot at `offset`.
-fn store_to_frame(cx: inout FnCtx, ty: i64, offset: i64, pcx: Ctx<Comp>) {
+fn store_to_frame(cx: &mut FnCtx, ty: i64, offset: i64, pcx: &Ctx<Comp>) {
     if is_void(ty) {
         return;
     }
     if is_compound(ty, pcx) {
-        emit_frame_addr(&cx, R_SECOND, offset, pcx);
-        emit_copy(&cx, type_size(ty, pcx));
+        emit_frame_addr(cx, R_SECOND, offset, pcx);
+        emit_copy(cx, type_size(ty, pcx));
         return;
     }
-    emit_frame_addr(&cx, R_ADDR, offset, pcx);
-    emit_store(&cx, ty, R_ACC, R_ADDR, pcx);
+    emit_frame_addr(cx, R_ADDR, offset, pcx);
+    emit_store(cx, ty, R_ACC, R_ADDR, pcx);
 }
 
 // ---- Values: the accumulator, temporaries, frame slots ----
 
 // The accumulator holds the address of a value of type `ty`: load it if it
 // is a scalar.
-fn load_from_x0(cx: inout FnCtx, ty: i64, pcx: Ctx<Comp>) {
+fn load_from_x0(cx: &mut FnCtx, ty: i64, pcx: &Ctx<Comp>) {
     if !is_compound(ty, pcx) && !is_void(ty) {
-        emit_load(&cx, ty, R_ACC, pcx);
+        emit_load(cx, ty, R_ACC, pcx);
     }
 }
 
 // Moves the accumulator to the second operand and pops the first one into
 // the accumulator.
-fn pop_second_operand(cx: inout FnCtx, ty: i64, pcx: inout Ctx<Comp>) {
-    emit_move_to_second(&cx, ty);
+fn pop_second_operand(cx: &mut FnCtx, ty: i64, pcx: &mut Ctx<Comp>) {
+    emit_move_to_second(cx, ty);
     if is_float(ty) {
-        pop_d(&cx, 0, &pcx);
+        pop_d(cx, 0, pcx);
     } else {
-        pop_x(&cx, R_ACC, &pcx);
+        pop_x(cx, R_ACC, pcx);
     }
 }
 
 // The 8 bytes of frame slot `offset` = <reg> (R_ADDR keeps the address).
-fn store_reg_to_frame(cx: inout FnCtx, reg: i64, offset: i64, pcx: Ctx<Comp>) {
-    emit_frame_addr(&cx, R_ADDR, offset, pcx);
-    emit_store(&cx, TY_U64, reg, R_ADDR, pcx);
+fn store_reg_to_frame(cx: &mut FnCtx, reg: i64, offset: i64, pcx: &Ctx<Comp>) {
+    emit_frame_addr(cx, R_ADDR, offset, pcx);
+    emit_store(cx, TY_U64, reg, R_ADDR, pcx);
 }
 
 // <reg> = the 8 bytes of frame slot `offset` (R_ADDR keeps the address).
-fn load_reg_from_frame(cx: inout FnCtx, reg: i64, offset: i64, pcx: Ctx<Comp>) {
-    emit_frame_addr(&cx, R_ADDR, offset, pcx);
-    emit_load_reg(&cx, reg, R_ADDR);
+fn load_reg_from_frame(cx: &mut FnCtx, reg: i64, offset: i64, pcx: &Ctx<Comp>) {
+    emit_frame_addr(cx, R_ADDR, offset, pcx);
+    emit_load_reg(cx, reg, R_ADDR);
 }

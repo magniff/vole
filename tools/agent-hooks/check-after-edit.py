@@ -303,7 +303,8 @@ def compiler_for(where, ran=None, root=None):
     return which("volec")
 
 
-VERSION_FN = re.compile(r'pub fn version\(\)\s*->\s*\*u8\s*\{\s*c"([0-9]+(?:\.[0-9]+)+)"')
+# (0.28.0: `-> *mut u8` in the rust edition)
+VERSION_FN = re.compile(r'pub fn version\(\)\s*->\s*\*(?:mut |const )?u8\s*\{\s*c"([0-9]+(?:\.[0-9]+)+)"')
 VERSION_OUT = re.compile(r"\b([0-9]+(?:\.[0-9]+)+)\b")
 
 

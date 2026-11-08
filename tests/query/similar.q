@@ -46,8 +46,8 @@ try: volec query items
 [exit 1]
 ## `query examples` lists the kinds (they name the compiler's items).
 $ examples
-std-fn	a std function: compiler/std/*.vl, by its section (guide how add-std-fn)
-std-method	a method of a std type: its impl in compiler/std/*.vl (guide how add-std-fn)
+std-fn	a std function: compiler/std/*.vl (a rust program's: compiler/std2/*.vl), by its section (guide how add-std-fn)
+std-method	a method of a std type: its impl in compiler/std/*.vl (a rust program's: compiler/std2/*.vl) (guide how add-std-fn)
 peephole	an instruction-combining rule: compiler/src/middle/fold/mod.vl, called from combine (guide how add-peephole)
 egraph-rule	a rewrite rule of the e-graph: a line of rule_text, middle/egraph.vl (guide how add-peephole)
 pass	an optimization pass: fn(fi: i64) -> bool, called from middle/opt.vl (guide how add-pass)

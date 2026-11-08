@@ -41,12 +41,12 @@ mod link_macho;
 use crate::back::enc_arm64::init_a64;
 use crate::back::enc_x86::init_x86;
 use crate::base::{
-    BUFS, alloc_array, alloc_zeroed, buf_byte, buf_fmt, buf_new, buf_reserve, buf_write_file, cstr,
-    die, free, grow, memcmp, memcpy, realloc, strlen,
+    alloc_array, alloc_zeroed, buf_byte, buf_fmt, buf_new, buf_reserve, buf_write_file, cstr, die,
+    free, get_bufs, grow, memcmp, memcpy, realloc, strlen,
 };
 
-use assemble::{HOOKS, MAPPING, assemble_begin, assemble_line};
-use debug::{CFI_FNS, ROWS, compact_unwind, line_program};
+use assemble::{assemble_begin, assemble_line, get_mapping, set_hooks, set_mapping};
+use debug::{compact_unwind, get_cfi_fns, get_rows, line_program};
 use elf::elf_write;
 use macho::macho_write;
 use resolve::{build_sections, layout, resolve_fixups};
@@ -54,7 +54,7 @@ use resolve::{build_sections, layout, resolve_fixups};
 // The assembler's text helpers, used by the instruction encoders.
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
-use crate::base::target::{ELF, X86};
+use crate::base::target::{get_elf, get_x86};
 use crate::base::term::build_linking;
 use crate::base::timer::{T_CODEGEN, T_OUTPUT, timer_now, timer_sub};
 use crate::middle::ctx::FnCtx;
@@ -82,9 +82,9 @@ pub const SEC_UNWIND: i64 = 7;
 pub const SEC_BSS: i64 = 8;
 const SEC_COUNT: i64 = 9;
 
-pub static var CUR_SEC: i64 = 0;
-static var SEC_ALIGN: [i64; 9] = [0; 9];
-static var SEC_USED: [bool; 9] = [false; 9];
+static mut CUR_SEC: i64 = 0;
+static mut SEC_ALIGN: [i64; 9] = [0i64; 9];
+static mut SEC_USED: [bool; 9] = [false; 9];
 
 // ---- Fragments ----
 
@@ -96,37 +96,37 @@ pub const TAIL_JCC: i64 = 3;
 // Bytes [start, start + len) of OBJ_BYTES, then the tail: an alignment to
 // 2^arg bytes, or a branch (arg: the condition) to symbol `sym`, short or
 // long. `addr`: the fragment's offset in its section.
-struct Frag {
+#[derive(Clone, Copy)] struct Frag {
     sec: i64, start: i64, len: i64, tail: i64, arg: i64, sym: i64, long: bool, addr: i64, atom: i64,
 }
 
-static var FRAGS: *Frag = 0 as *Frag;
-static var FRAG_COUNT: i64 = 0;
-static var FRAG_CAP: i64 = 0;
+static mut FRAGS: *mut Frag = 0 as *mut Frag;
+static mut FRAG_COUNT: i64 = 0;
+static mut FRAG_CAP: i64 = 0;
 // The fragment being filled (always the last one).
-static var OPEN: i64 = -1;
+static mut OPEN: i64 = -1;
 // (0.18.1) The assembled bytes, the assembler's own (not a buffer of
 // BUFS, which code generation may grow while the assembler runs on a
 // thread of its own).
-pub struct ObjBytes { data: *u8, len: i64, cap: i64 }
-pub static var OBJ: ObjBytes = ObjBytes { data: 0 as *u8, len: 0, cap: 0 };
+#[derive(Clone, Copy)] pub struct ObjBytes { data: *mut u8, len: i64, cap: i64 }
+static mut OBJ: ObjBytes = ObjBytes { data: 0 as *mut u8, len: 0, cap: 0 };
 
 // Room for n more bytes in OBJ.
 pub fn obj_reserve(n: i64) {
     unsafe {
-        if OBJ.len + n <= OBJ.cap {
+        if get_obj().len + n <= get_obj().cap {
             return;
         }
-        var cap = OBJ.cap * 2;
-        while cap < OBJ.len + n {
+        let mut cap = get_obj().cap * 2;
+        while cap < get_obj().len + n {
             cap *= 2;
         }
-        let grown = realloc(OBJ.data, cap as u64);
-        if grown == 0 as *u8 {
+        let grown = realloc(get_obj().data, cap as u64);
+        if grown == 0 as *mut u8 {
             die(c"out of memory");
         }
-        OBJ.data = grown;
-        OBJ.cap = cap;
+        { let mut obj_copy = get_obj(); obj_copy.data = grown; set_obj(obj_copy); }
+        { let mut obj_copy = get_obj(); obj_copy.cap = cap; set_obj(obj_copy); }
     }
 }
 
@@ -136,31 +136,32 @@ pub fn obj_reserve(n: i64) {
 // lines (12 MB of text for the compiler's 2.9 MB of constants), and the
 // assembler copies it. Written and read on the main thread only, after
 // the code generation's threads.
-pub static var RAW: ObjBytes = ObjBytes { data: 0 as *u8, len: 0, cap: 0 };
+static mut RAW: ObjBytes = ObjBytes { data: 0 as *mut u8, len: 0, cap: 0 };
 
 // Appends bytes to RAW; returns their offset there.
-pub fn raw_data(bytes: [u8]) -> i64 {
-    bytes_append(&RAW, bytes)
+pub fn raw_data(bytes: &[u8]) -> i64 {
+    { let mut raw_copy = get_raw(); let r_copy = bytes_append(&mut raw_copy, bytes);
+        set_raw(raw_copy); r_copy }
 }
 
 // Appends bytes to b; returns their offset there.
-pub fn bytes_append(b: inout ObjBytes, bytes: [u8]) -> i64 {
+pub fn bytes_append(b: &mut ObjBytes, bytes: &[u8]) -> i64 {
     unsafe {
-        let n = bytes.len as i64;
+        let n = bytes.len() as i64;
         if b.len + n > b.cap {
-            var cap = if b.cap == 0 { 65536 } else { b.cap * 2 };
+            let mut cap: i64 = if b.cap == 0 { 65536 } else { b.cap * 2 };
             while cap < b.len + n {
                 cap *= 2;
             }
             let grown = realloc(b.data, cap as u64);
-            if grown == 0 as *u8 {
+            if grown == 0 as *mut u8 {
                 die(c"out of memory");
             }
             b.data = grown;
             b.cap = cap;
         }
         let at = b.len;
-        memcpy(&b.data[at], bytes.ptr, n as u64);
+        memcpy(b.data.add(at as usize), bytes.ptr, n as u64);
         b.len = at + n;
         at
     }
@@ -168,48 +169,54 @@ pub fn bytes_append(b: inout ObjBytes, bytes: [u8]) -> i64 {
 
 fn new_frag(sec: i64) {
     unsafe {
-        if OPEN >= 0 {
-            FRAGS[OPEN].len = OBJ.len - FRAGS[OPEN].start;
+        if get_open() >= 0 {
+            (*get_frags().add(get_open() as usize)).len = get_obj().len - (
+                *get_frags().add(get_open() as usize)).start;
         }
-        FRAGS = grow(FRAGS, FRAG_COUNT, &FRAG_CAP);
-        FRAGS[FRAG_COUNT] = Frag {
-            sec, start: OBJ.len, len: 0, tail: TAIL_NONE, arg: 0, sym: -1,
+        set_frags({
+            let mut frag_cap_copy = get_frag_cap();
+            let r_copy = grow(get_frags(), get_frag_count(), &mut frag_cap_copy);
+            set_frag_cap(frag_cap_copy); r_copy
+        });
+        (*get_frags().add(get_frag_count() as usize)) = Frag {
+            sec, start: get_obj().len, len: 0, tail: TAIL_NONE, arg: 0, sym: -1,
             long: false, addr: 0, atom: -1,
         };
-        OPEN = FRAG_COUNT;
-        FRAG_COUNT += 1;
+        set_open(get_frag_count());
+        set_frag_count(get_frag_count() + (1));
     }
 }
 
 // Ends the open fragment with a tail, and opens the next.
 fn end_frag(tail: i64, arg: i64, sym: i64) {
     unsafe {
-        FRAGS[OPEN].tail = tail;
-        FRAGS[OPEN].arg = arg;
-        FRAGS[OPEN].sym = sym;
-        FRAGS[OPEN].atom = CUR_ATOM[CUR_SEC];
+        (*get_frags().add(get_open() as usize)).tail = tail;
+        (*get_frags().add(get_open() as usize)).arg = arg;
+        (*get_frags().add(get_open() as usize)).sym = sym;
+        (*get_frags().add(get_open() as usize)).atom = get_cur_atom()[get_cur_sec() as usize];
     }
-    new_frag(CUR_SEC);
+    new_frag(get_cur_sec());
 }
 
 fn switch_section(sec: i64) {
-    SEC_USED[sec] = true;
-    if sec != CUR_SEC {
-        CUR_SEC = sec;
+    { let mut sec_used_copy = get_sec_used(); sec_used_copy[sec as usize] = true;
+        set_sec_used(sec_used_copy); }
+    if sec != get_cur_sec() {
+        set_cur_sec(sec);
         new_frag(sec);
     }
 }
 
 // The position (in OBJ_BYTES) of the next byte.
 pub fn here() -> i64 {
-    OBJ.len
+    get_obj().len
 }
 
 pub fn out8(b: i64) {
     unsafe {
         obj_reserve(1);
-        OBJ.data[OBJ.len] = (b & 255) as u8;
-        OBJ.len += 1;
+        (*get_obj().data.add(get_obj().len as usize)) = (b & 255) as u8;
+        { let mut obj_copy = get_obj(); obj_copy.len += 1; set_obj(obj_copy); }
     }
 }
 
@@ -222,13 +229,13 @@ pub fn out16(v: i64) {
 pub fn out32(v: i64) {
     unsafe {
         obj_reserve(4);
-        let at = OBJ.len;
-        let d = OBJ.data;
-        d[at] = (v & 255) as u8;
-        d[at + 1] = ((v >> 8) & 255) as u8;
-        d[at + 2] = ((v >> 16) & 255) as u8;
-        d[at + 3] = ((v >> 24) & 255) as u8;
-        OBJ.len = at + 4;
+        let at = get_obj().len;
+        let d = get_obj().data;
+        (*d.add(at as usize)) = (v & 255) as u8;
+        (*d.add((at + 1) as usize)) = ((v >> 8) & 255) as u8;
+        (*d.add((at + 2) as usize)) = ((v >> 16) & 255) as u8;
+        (*d.add((at + 3) as usize)) = ((v >> 24) & 255) as u8;
+        { let mut obj_copy = get_obj(); obj_copy.len = at + 4; set_obj(obj_copy); }
     }
 }
 
@@ -240,19 +247,20 @@ pub fn out64(v: i64) {
 // Reads and writes a little-endian 32-bit word of OBJ_BYTES.
 fn get32(pos: i64) -> i64 {
     unsafe {
-        let d = OBJ.data;
-        (d[pos] as i64) | (d[pos + 1] as i64) << 8 | (d[pos + 2] as i64) << 16
-            | (d[pos + 3] as i64) << 24
+        let d = get_obj().data;
+        ((*d.add(pos as usize)) as i64) | ((*d.add((pos + 1) as usize)) as i64) << 8
+            | ((*d.add((pos + 2) as usize)) as i64) << 16
+            | ((*d.add((pos + 3) as usize)) as i64) << 24
     }
 }
 
 fn put32(pos: i64, v: i64) {
     unsafe {
-        let d = OBJ.data;
-        d[pos] = (v & 255) as u8;
-        d[pos + 1] = ((v >> 8) & 255) as u8;
-        d[pos + 2] = ((v >> 16) & 255) as u8;
-        d[pos + 3] = ((v >> 24) & 255) as u8;
+        let d = get_obj().data;
+        (*d.add(pos as usize)) = (v & 255) as u8;
+        (*d.add((pos + 1) as usize)) = ((v >> 8) & 255) as u8;
+        (*d.add((pos + 2) as usize)) = ((v >> 16) & 255) as u8;
+        (*d.add((pos + 3) as usize)) = ((v >> 24) & 255) as u8;
     }
 }
 
@@ -264,8 +272,8 @@ fn put32(pos: i64, v: i64) {
 // there.
 // (0.18.1: its name its own bytes, not an interned symbol: the assembler
 // runs beside code generation's threads, which read the symbols.)
-struct ASym {
-    text: [u8], hash: u64, defined: bool, global: bool, frag: i64, off: i64, sec: i64,
+#[derive(Clone, Copy)] struct ASym<'a> {
+    text: &'a [u8], hash: u64, defined: bool, global: bool, frag: i64, off: i64, sec: i64,
     in_table: bool,
     index: i64, atom: i64,
 }
@@ -273,48 +281,54 @@ struct ASym {
 // Mach-O's atoms: a label that is not temporary starts one, which runs to
 // the next. LLVM resolves a pc-relative reference only within one atom
 // (else the linker could move them apart): the current atom per section.
-static var CUR_ATOM: [i64; 9] = [-1; 9];
+static mut CUR_ATOM: [i64; 9] = [-1; 9];
 
-static var ASYMS: *ASym = 0 as *ASym;
-static var ASYM_COUNT: i64 = 0;
-static var ASYM_CAP: i64 = 0;
+static mut ASYMS: *mut ASym<'_> = 0 as *mut ASym<'_>;
+static mut ASYM_COUNT: i64 = 0;
+static mut ASYM_CAP: i64 = 0;
 // Interned name + 1 -> symbol + 1.
-static var ASYM_TABLE: *i64 = 0 as *i64;
-static var ASYM_TABLE_SIZE: i64 = 0;
+static mut ASYM_TABLE: *mut i64 = 0 as *mut i64;
+static mut ASYM_TABLE_SIZE: i64 = 0;
 
 // (0.25) asym's calls: an instruction that made none names no symbol
 // (assemble.vl's memo).
-pub static var ASYM_LOOKUPS: i64 = 0;
+static mut ASYM_LOOKUPS: i64 = 0;
 
-pub fn asym(name: [u8]) -> i64 {
+pub fn asym(name: &[u8]) -> i64 {
     unsafe {
-        ASYM_LOOKUPS += 1;
-        if (ASYM_COUNT + 1) * 2 > ASYM_TABLE_SIZE {
+        set_asym_lookups(get_asym_lookups() + (1));
+        if (get_asym_count() + 1) * 2 > get_asym_table_size() {
             asym_rehash();
         }
-        let n = name.len as i64;
+        let n = name.len() as i64;
         let hash = hash_bytes(name.ptr, n);
-        let mask = (ASYM_TABLE_SIZE - 1) as u64;
-        var slot = hash & mask;
-        while ASYM_TABLE[slot] != 0 {
-            let s = ASYM_TABLE[slot] - 1;
+        let mask = (get_asym_table_size() - 1) as u64;
+        let mut slot = hash & mask;
+        while (*get_asym_table().add(slot as usize)) != 0 {
+            let s = (*get_asym_table().add(slot as usize)) - 1;
             // (0.25: the hashes first, then memcmp, not the bytes one by one)
-            if ASYMS[s].hash == hash && ASYMS[s].text.len as i64 == n
-                && memcmp(ASYMS[s].text.ptr, name.ptr, n as u64) == 0 {
+            if (*get_asyms().add(s as usize)).hash == hash
+                && (*get_asyms().add(s as usize)).text.len() as i64 == n
+                && memcmp((*get_asyms().add(s as usize)).text.ptr, name.ptr, n as u64) == 0 {
                 return s;
             }
             slot = (slot + 1) & mask;
         }
-        ASYMS = grow(ASYMS, ASYM_COUNT, &ASYM_CAP);
-        let s = ASYM_COUNT;
+        set_asyms({
+            let mut asym_cap_copy = get_asym_cap();
+            let r_copy = grow(get_asyms(), get_asym_count(), &mut asym_cap_copy);
+            set_asym_cap(asym_cap_copy); r_copy
+        });
+        let s = get_asym_count();
         let copy = alloc_zeroed(n + 1);
         memcpy(copy, name.ptr, n as u64);
-        ASYMS[s] = ASym {
-            text: copy[0..n], hash, defined: false, global: false, frag: -1, off: 0, sec: -1,
+        (*get_asyms().add(s as usize)) = ASym {
+            text: std::slice::from_raw_parts(copy.add((0) as usize), (n - (0)) as usize), hash,
+            defined: false, global: false, frag: -1, off: 0, sec: -1,
             in_table: false, index: -1, atom: -1,
         };
-        ASYM_COUNT += 1;
-        ASYM_TABLE[slot] = s + 1;
+        set_asym_count(get_asym_count() + (1));
+        (*get_asym_table().add(slot as usize)) = s + 1;
         s
     }
 }
@@ -322,48 +336,52 @@ pub fn asym(name: [u8]) -> i64 {
 // The table of ASYMS by name (index + 1, open addressing), twice as large.
 fn asym_rehash() {
     unsafe {
-        let size = if ASYM_TABLE_SIZE == 0 { 1024 } else { ASYM_TABLE_SIZE * 2 };
-        free(ASYM_TABLE as *u8);
-        ASYM_TABLE = alloc_array::<i64>(size);
-        ASYM_TABLE_SIZE = size;
+        let size: i64 = if get_asym_table_size() == 0 { 1024 } else { get_asym_table_size() * 2 };
+        free(get_asym_table() as *mut u8);
+        set_asym_table(alloc_array::<i64>(size));
+        set_asym_table_size(size);
         let mask = (size - 1) as u64;
-        for s in 0..ASYM_COUNT {
-            var slot = ASYMS[s].hash & mask;
-            while ASYM_TABLE[slot] != 0 {
+        for s in 0..get_asym_count() {
+            let mut slot = (*get_asyms().add(s as usize)).hash & mask;
+            while (*get_asym_table().add(slot as usize)) != 0 {
                 slot = (slot + 1) & mask;
             }
-            ASYM_TABLE[slot] = s + 1;
+            (*get_asym_table().add(slot as usize)) = s + 1;
         }
     }
 }
 
 // A hash of a name.
-fn name_hash(t: [u8]) -> u64 {
-    hash_bytes(t.ptr, t.len as i64)
+fn name_hash(t: &[u8]) -> u64 {
+    hash_bytes(t.ptr, t.len() as i64)
 }
 
 // (0.25) A hash of bytes [0, n) of p, eight at a time (FNV-1a's byte at a
 // time was a chain of multiplications as long as the name).
-pub fn hash_bytes(p: *u8, n: i64) -> u64 {
+pub fn hash_bytes(p: *mut u8, n: i64) -> u64 {
     unsafe {
-        var h: u64 = (n as u64).wrapping_mul(0x9e3779b97f4a7c15);
-        var i = 0;
+        let mut h: u64 = (n as u64).wrapping_mul(0x9e3779b97f4a7c15u64);
+        let mut i: i64 = 0;
         while i + 8 <= n {
-            let w = p[i] as u64 | (p[i + 1] as u64) << 8 | (p[i + 2] as u64) << 16
-                | (p[i + 3] as u64) << 24 | (p[i + 4] as u64) << 32 | (p[i + 5] as u64) << 40
-                | (p[i + 6] as u64) << 48 | (p[i + 7] as u64) << 56;
-            h = (h ^ w).wrapping_mul(0xff51afd7ed558ccd);
+            let w = (*p.add(i as usize)) as u64 | ((*p.add((i + 1) as usize)) as u64) << 8
+                | ((*p.add((i + 2) as usize)) as u64) << 16
+                | ((*p.add((i + 3) as usize)) as u64) << 24
+                | ((*p.add((i + 4) as usize)) as u64) << 32
+                | ((*p.add((i + 5) as usize)) as u64) << 40
+                | ((*p.add((i + 6) as usize)) as u64) << 48
+                | ((*p.add((i + 7) as usize)) as u64) << 56;
+            h = (h ^ w).wrapping_mul(0xff51afd7ed558ccdu64);
             h = h ^ (h >> 32);
             i += 8;
         }
-        var w: u64 = 0;
-        var s: u64 = 0;
+        let mut w: u64 = 0;
+        let mut s: u64 = 0;
         while i < n {
-            w = w | (p[i] as u64) << s;
+            w = w | ((*p.add(i as usize)) as u64) << s;
             s += 8;
             i += 1;
         }
-        h = (h ^ w).wrapping_mul(0xff51afd7ed558ccd);
+        h = (h ^ w).wrapping_mul(0xff51afd7ed558ccdu64);
         h ^ (h >> 32)
     }
 }
@@ -372,57 +390,66 @@ pub fn hash_bytes(p: *u8, n: i64) -> u64 {
 // (its mnemonics, registers), so that it reads no table the rest of the
 // compiler grows while it runs on a thread of its own. A name is its
 // bytes' address and length.
-pub struct NameMap { pub ptrs: *i64, pub lens: *i64, pub vals: *i64, pub size: i64, pub count: i64 }
-
-fn name_at(m: NameMap, slot: i64) -> [u8] {
-    unsafe { (m.ptrs[slot] as *u8)[0..m.lens[slot]] }
+#[derive(Clone, Copy)] pub struct NameMap {
+    pub ptrs: *mut i64, pub lens: *mut i64, pub vals: *mut i64, pub size: i64, pub count: i64,
 }
 
-pub fn name_put(m: inout NameMap, name: [u8], value: i64) {
+fn name_at(m: NameMap, slot: i64) -> &'static [u8] {
+    unsafe {
+        std::slice::from_raw_parts(((*m.ptrs.add(slot as usize)) as *mut u8).add((0) as usize),
+            ((*m.lens.add(slot as usize)) - (0)) as usize)
+    }
+}
+
+pub fn name_put(m: &mut NameMap, name: &[u8], value: i64) {
     unsafe {
         if (m.count + 1) * 2 > m.size {
-            let old = m;
+            let old = *m;
             m.size = if old.size == 0 { 256 } else { old.size * 2 };
             m.ptrs = alloc_array::<i64>(m.size);
             m.lens = alloc_array::<i64>(m.size);
             m.vals = alloc_array::<i64>(m.size);
             m.count = 0;
             for i in 0..old.size {
-                if old.vals[i] != 0 {
-                    name_put(&m, (old.ptrs[i] as *u8)[0..old.lens[i]], old.vals[i]);
+                if (*old.vals.add(i as usize)) != 0 {
+                    name_put(m,
+                        std::slice::from_raw_parts(
+                            ((*old.ptrs.add(i as usize)) as *mut u8).add((0) as usize),
+                            ((*old.lens.add(i as usize)) - (0)) as usize),
+                        (*old.vals.add(i as usize)));
                 }
             }
-            free(old.ptrs as *u8);
-            free(old.lens as *u8);
-            free(old.vals as *u8);
+            free(old.ptrs as *mut u8);
+            free(old.lens as *mut u8);
+            free(old.vals as *mut u8);
         }
         let mask = (m.size - 1) as u64;
-        var slot = name_hash(name) & mask;
-        while m.vals[slot] != 0 && name_at(m, slot as i64) != name {
+        let mut slot = name_hash(name) & mask;
+        while (*m.vals.add(slot as usize)) != 0 && name_at(*m, slot as i64) != name {
             slot = (slot + 1) & mask;
         }
-        if m.vals[slot] == 0 {
-            let n = name.len as i64;
+        if (*m.vals.add(slot as usize)) == 0 {
+            let n = name.len() as i64;
             let copy = alloc_zeroed(n + 1);
             memcpy(copy, name.ptr, n as u64);
-            m.ptrs[slot] = copy as i64;
-            m.lens[slot] = n;
+            (*m.ptrs.add(slot as usize)) = copy as i64;
+            (*m.lens.add(slot as usize)) = n;
             m.count += 1;
         }
-        m.vals[slot] = value;
+        (*m.vals.add(slot as usize)) = value;
     }
 }
 
-pub fn name_get(m: NameMap, name: [u8]) -> i64 {
+pub fn name_get(m: NameMap, name: &[u8]) -> i64 {
     unsafe {
         if m.size == 0 {
             return 0;
         }
         let mask = (m.size - 1) as u64;
-        var slot = name_hash(name) & mask;
-        while m.vals[slot] != 0 {
+        let mut slot = name_hash(name) & mask;
+        while (*m.vals.add(slot as usize)) != 0 {
             if name_at(m, slot as i64) == name {
-                return m.vals[slot];
+                return (*m.vals.add(slot as usize));
             }
             slot = (slot + 1) & mask;
         }
@@ -431,20 +458,21 @@ pub fn name_get(m: NameMap, name: [u8]) -> i64 {
 }
 
 // A C string's bytes.
-pub fn c_bytes(s: *u8) -> [u8] {
-    unsafe { s[0..strlen(s) as i64] }
+pub fn c_bytes(s: *mut u8) -> &'static [u8] {
+    unsafe { std::slice::from_raw_parts(s.add((0) as usize), (strlen(s) as i64 - (0)) as usize) }
 }
 
 // A temporary label (L... on Mach-O, .L... on ELF): never in the symbol
 // table unless a relocation needs it (Mach-O only; ELF uses the section).
 fn is_temp(s: i64) -> bool {
-    let t = unsafe { ASYMS[s].text };
-    if ELF { t.len >= 2 && t[0] == '.' && t[1] == 'L' }
-    else { t.len >= 1 && t[0] == 'L' }
+    let t = unsafe { (*get_asyms().add(s as usize)).text };
+    if get_elf() { t.len() >= 2 && t[0] == b'.' && t[1] == b'L' }
+    else { t.len() >= 1 && t[0] == b'L' }
 }
 
 fn sym_addr(s: i64) -> i64 {
-    unsafe { FRAGS[ASYMS[s].frag].addr + ASYMS[s].off }
+    unsafe { (*get_frags().add((*get_asyms().add(s as usize)).frag as usize)).addr + (
+        *get_asyms().add(s as usize)).off }
 }
 
 // ---- Fixups ----
@@ -468,23 +496,28 @@ pub const FX_ABS32: i64 = 14;
 // x86-64 or data field); `frag`: its fragment; `end`: for x86-64, the
 // position where the instruction ends (pc); `sym2`: the subtracted label
 // of FX_DIFF32. `rex`: an x86-64 GOT load with a REX prefix.
-struct Fixup {
+#[derive(Clone, Copy)] struct Fixup {
     kind: i64, frag: i64, pos: i64, sym: i64, sym2: i64, addend: i64, end: i64, rex: bool,
     atom: i64,
 }
 
-static var FIXUPS: *Fixup = 0 as *Fixup;
-static var FIXUP_COUNT: i64 = 0;
-static var FIXUP_CAP: i64 = 0;
+static mut FIXUPS: *mut Fixup = 0 as *mut Fixup;
+static mut FIXUP_COUNT: i64 = 0;
+static mut FIXUP_CAP: i64 = 0;
 
 pub fn fixup(kind: i64, pos: i64, sym: i64, addend: i64, end: i64, rex: bool) {
     unsafe {
-        FIXUPS = grow(FIXUPS, FIXUP_COUNT, &FIXUP_CAP);
-        FIXUPS[FIXUP_COUNT] = Fixup {
-            kind, frag: OPEN, pos, sym, sym2: -1, addend, end, rex, atom: CUR_ATOM[CUR_SEC],
+        set_fixups({
+            let mut fixup_cap_copy = get_fixup_cap();
+            let r_copy = grow(get_fixups(), get_fixup_count(), &mut fixup_cap_copy);
+            set_fixup_cap(fixup_cap_copy); r_copy
+        });
+        (*get_fixups().add(get_fixup_count() as usize)) = Fixup {
+            kind, frag: get_open(), pos, sym, sym2: -1, addend, end, rex,
+            atom: get_cur_atom()[get_cur_sec() as usize],
         };
     }
-    FIXUP_COUNT += 1;
+    set_fixup_count(get_fixup_count() + (1));
 }
 
 // x86-64 branches whose size layout decides (jmp, jcc to a label).
@@ -498,32 +531,33 @@ pub fn emit_relaxable(tail: i64, cond: i64, sym: i64) {
 // `rtype`, against symbol `sym` (an ASYMS index, or -1 - section for a
 // section of ELF), with `addend` (ELF) and, for Mach-O, pc-relativity and
 // the field's length (log2 bytes).
-pub struct Reloc {
+#[derive(Clone, Copy)] pub struct Reloc {
     sec: i64, offset: i64, rtype: i64, sym: i64, addend: i64, pcrel: bool, length: i64,
 }
 
 fn reloc(sec: i64, offset: i64, rtype: i64, sym: i64, addend: i64, pcrel: bool, length: i64,
-    pcx: inout Ctx<Comp>) {
+    pcx: &mut Ctx<Comp>) {
     pcx.relocs.push(Reloc { sec, offset, rtype, sym, addend, pcrel, length });
 }
 
 // A relocation against symbol s itself (a GOT entry's).
-fn reloc_to_symbol(sec: i64, offset: i64, rtype: i64, s: i64, pcrel: bool, pcx: inout Ctx<Comp>) {
-    unsafe { ASYMS[s].in_table = true; }
-    reloc(sec, offset, rtype, s, 0, pcrel, 2, &pcx);
+fn reloc_to_symbol(sec: i64, offset: i64, rtype: i64, s: i64, pcrel: bool, pcx: &mut Ctx<Comp>) {
+    unsafe { (*get_asyms().add(s as usize)).in_table = true; }
+    reloc(sec, offset, rtype, s, 0, pcrel, 2, pcx);
 }
 
 // A relocation against symbol s plus `extra`: on ELF a temporary label
 // becomes its section's symbol plus the label's offset.
 fn reloc_to(sec: i64, offset: i64, rtype: i64, s: i64, extra: i64, pcrel: bool, length: i64,
-    pcx: inout Ctx<Comp>) {
+    pcx: &mut Ctx<Comp>) {
     unsafe {
-        if ELF && ASYMS[s].defined && is_temp(s) {
-            reloc(sec, offset, rtype, -1 - ASYMS[s].sec, extra + sym_addr(s), pcrel, length, &pcx);
+        if get_elf() && (*get_asyms().add(s as usize)).defined && is_temp(s) {
+            reloc(sec, offset, rtype, -1 - (*get_asyms().add(s as usize)).sec, extra + sym_addr(s),
+                pcrel, length, pcx);
             return;
         }
-        ASYMS[s].in_table = true;
-        reloc(sec, offset, rtype, s, extra, pcrel, length, &pcx);
+        (*get_asyms().add(s as usize)).in_table = true;
+        reloc(sec, offset, rtype, s, extra, pcrel, length, pcx);
     }
 }
 
@@ -536,11 +570,11 @@ fn w8(out: i64, v: i64) {
 fn w16(out: i64, v: i64) {
     unsafe {
         buf_reserve(out, 2);
-        let at = BUFS[out].len;
-        let d = BUFS[out].data;
-        d[at] = (v & 255) as u8;
-        d[at + 1] = ((v >> 8) & 255) as u8;
-        BUFS[out].len = at + 2;
+        let at = (*get_bufs().add(out as usize)).len;
+        let d = (*get_bufs().add(out as usize)).data;
+        (*d.add(at as usize)) = (v & 255) as u8;
+        (*d.add((at + 1) as usize)) = ((v >> 8) & 255) as u8;
+        (*get_bufs().add(out as usize)).len = at + 2;
     }
 }
 
@@ -548,13 +582,13 @@ fn w16(out: i64, v: i64) {
 fn w32(out: i64, v: i64) {
     unsafe {
         buf_reserve(out, 4);
-        let at = BUFS[out].len;
-        let d = BUFS[out].data;
-        d[at] = (v & 255) as u8;
-        d[at + 1] = ((v >> 8) & 255) as u8;
-        d[at + 2] = ((v >> 16) & 255) as u8;
-        d[at + 3] = ((v >> 24) & 255) as u8;
-        BUFS[out].len = at + 4;
+        let at = (*get_bufs().add(out as usize)).len;
+        let d = (*get_bufs().add(out as usize)).data;
+        (*d.add(at as usize)) = (v & 255) as u8;
+        (*d.add((at + 1) as usize)) = ((v >> 8) & 255) as u8;
+        (*d.add((at + 2) as usize)) = ((v >> 16) & 255) as u8;
+        (*d.add((at + 3) as usize)) = ((v >> 24) & 255) as u8;
+        (*get_bufs().add(out as usize)).len = at + 4;
     }
 }
 
@@ -564,17 +598,17 @@ fn w64(out: i64, v: i64) {
 }
 
 // A name in a fixed 16-byte field.
-fn wname16(out: i64, name: *u8) {
+fn wname16(out: i64, name: *mut u8) {
     unsafe {
         let n = strlen(name) as i64;
         for i in 0..16 {
-            w8(out, if i < n { name[i] } else { 0 });
+            w8(out, if i < n { (*name.add(i as usize)) as i64 } else { 0 });
         }
     }
 }
 
 fn pad_to(out: i64, size: i64) {
-    while unsafe { BUFS[out].len < size } {
+    while unsafe { (*get_bufs().add(out as usize)).len < size } {
         buf_byte(out, 0);
     }
 }
@@ -592,44 +626,46 @@ pub fn is_debug(sec: i64) -> bool {
 
 // Assembles ASM into an object file at `path` (what asm_flush has not
 // assembled yet).
-pub fn write_object(cx: inout FnCtx, path: *u8, pcx: inout Ctx<Comp>) {
+pub fn write_object(cx: &mut FnCtx, path: *mut u8, pcx: &mut Ctx<Comp>) {
     unsafe {
         if !pcx.asm_stream {
             assembler_begin();
         }
-        assemble_text(&cx);
+        assemble_text(cx);
         if pcx.asm_stream {
-            BUFS[cx.asm].len = 0;
+            (*get_bufs().add(cx.asm as usize)).len = 0;
         }
-        new_frag(CUR_SEC);
+        new_frag(get_cur_sec());
         layout();
-        resolve_fixups(&cx, &pcx);
-        build_sections(&pcx);
-        if ROWS.count > 0 {
-            line_program(&pcx);
+        resolve_fixups(cx, pcx);
+        build_sections(pcx);
+        if get_rows().count > 0 {
+            line_program(pcx);
         }
-        if CFI_FNS.count > 0 {
-            compact_unwind(&pcx);
+        if get_cfi_fns().count > 0 {
+            compact_unwind(pcx);
         }
-        if ELF {
-            SEC_ALIGN[SEC_NOTE] = 0;
-            elf_write(path, &pcx);
+        if get_elf() {
+            { let mut sec_align_copy = get_sec_align(); sec_align_copy[SEC_NOTE as usize] = 0;
+                set_sec_align(sec_align_copy); }
+            elf_write(path, pcx);
         } else {
-            macho_write(path, &pcx);
+            macho_write(path, pcx);
         }
     }
 }
 
 // The assembler's state before the first line.
 fn assembler_begin() {
-    OBJ = ObjBytes { data: alloc_zeroed(65536), len: 0, cap: 65536 };
-    MAPPING = ELF && !X86;
-    HOOKS = MAPPING;
-    CUR_SEC = SEC_TEXT;
-    SEC_USED[SEC_TEXT] = true;
+    set_obj(ObjBytes { data: alloc_zeroed(65536), len: 0, cap: 65536 });
+    set_mapping(get_elf() && !get_x86());
+    set_hooks(get_mapping());
+    set_cur_sec(SEC_TEXT);
+    { let mut sec_used_copy = get_sec_used(); sec_used_copy[SEC_TEXT as usize] = true;
+        set_sec_used(sec_used_copy); }
     new_frag(SEC_TEXT);
     assemble_begin();
-    if X86 {
+    if get_x86() {
         init_x86();
     } else {
         init_a64();
@@ -637,21 +673,25 @@ fn assembler_begin() {
 }
 
 // Assembles the lines in ASM.
-fn assemble_text(cx: inout FnCtx) {
-    unsafe { assemble_bytes(&cx, BUFS[cx.asm].data, BUFS[cx.asm].len); }
+fn assemble_text(cx: &mut FnCtx) {
+    unsafe {
+        assemble_bytes(cx, (*get_bufs().add(cx.asm as usize)).data,
+            (*get_bufs().add(cx.asm as usize)).len);
+    }
 }
 
 // (0.18.1) Assembles the lines of text[0..n] (ATEXT while it runs).
-pub fn assemble_bytes(cx: inout FnCtx, text: *u8, n: i64) {
+pub fn assemble_bytes(cx: &mut FnCtx, text: *mut u8, n: i64) {
     unsafe {
-        ATEXT = text;
+        set_atext(text);
         let t = text;
-        var i = 0;
+        let mut i: i64 = 0;
         while i < n {
             // (0.17: the end of the line by memchr, not byte by byte)
-            let nl = memchr(&t[i], 10, (n - i) as u64);
-            let e = if nl == 0 as *u8 { n } else { i + (nl as i64 - (&t[i]) as i64) };
-            assemble_line(&cx, i, e);
+            let nl = memchr(t.add(i as usize), 10, (n - i) as u64);
+            let e = if nl == 0 as *mut u8 { n }
+                else { i + (nl as i64 - (t.add(i as usize)) as i64) };
+            assemble_line(cx, i, e);
             i = e + 1;
         }
     }
@@ -660,10 +700,10 @@ pub fn assemble_bytes(cx: inout FnCtx, text: *u8, n: i64) {
 // (0.18.1) The text being assembled (assemble_text's): the assembler
 // reads it here, not from a buffer of BUFS, which code generation may
 // grow while the assembler runs on a thread of its own.
-pub static var ATEXT: *u8 = 0 as *u8;
+static mut ATEXT: *mut u8 = 0 as *mut u8;
 
 // From the first function on (after the file's header): see ASM_STREAM.
-pub fn asm_stream_begin(pcx: inout Ctx<Comp>) {
+pub fn asm_stream_begin(pcx: &mut Ctx<Comp>) {
     if pcx.output_mode != OUT_ASM && !pcx.debug_info {
         pcx.asm_stream = true;
         assembler_begin();
@@ -672,15 +712,15 @@ pub fn asm_stream_begin(pcx: inout Ctx<Comp>) {
 
 // Assembles the text written so far (whole lines: a function's), when
 // streaming.
-pub fn asm_flush(cx: inout FnCtx, pcx: Ctx<Comp>) {
+pub fn asm_flush(cx: &mut FnCtx, pcx: &Ctx<Comp>) {
     unsafe {
         if pcx.asm_stream {
             // (its time is the output's, as when the text is assembled at
             // the end, not the code generation's that runs it)
             let t = timer_now(pcx);
-            c_module_symbols(&cx, pcx);
-            assemble_text(&cx);
-            BUFS[cx.asm].len = 0;
+            c_module_symbols(cx, pcx);
+            assemble_text(cx);
+            (*get_bufs().add(cx.asm as usize)).len = 0;
             timer_sub(T_CODEGEN, T_OUTPUT, t, pcx);
         }
     }
@@ -688,15 +728,15 @@ pub fn asm_flush(cx: inout FnCtx, pcx: Ctx<Comp>) {
 
 // (0.18.1) asm_flush on the assembler's thread (middle::threads): the text
 // so far, copied, is handed to it.
-pub fn asm_hand_over(cx: inout FnCtx, pcx: Ctx<Comp>) {
+pub fn asm_hand_over(cx: &mut FnCtx, pcx: &Ctx<Comp>) {
     unsafe {
         if pcx.asm_stream {
-            c_module_symbols(&cx, pcx);
-            let n = BUFS[cx.asm].len;
+            c_module_symbols(cx, pcx);
+            let n = (*get_bufs().add(cx.asm as usize)).len;
             let copy = alloc_zeroed(n + 1);
-            memcpy(copy, BUFS[cx.asm].data, n as u64);
+            memcpy(copy, (*get_bufs().add(cx.asm as usize)).data, n as u64);
             asm_thread_push(copy, n);
-            BUFS[cx.asm].len = 0;
+            (*get_bufs().add(cx.asm as usize)).len = 0;
         }
     }
 }
@@ -704,10 +744,10 @@ pub fn asm_hand_over(cx: inout FnCtx, pcx: Ctx<Comp>) {
 // ---- Output ----
 
 extern "C" {
-    fn system(command: *u8) -> i32;
-    fn unlink(path: *u8) -> i32;
-    fn getenv(name: *u8) -> *u8;
-    fn memchr(s: *u8, c: i32, n: u64) -> *u8;
+    fn system(command: *mut u8) -> i32;
+    fn unlink(path: *mut u8) -> i32;
+    fn getenv(name: *mut u8) -> *mut u8;
+    fn memchr(s: *mut u8, c: i32, n: u64) -> *mut u8;
 }
 
 // What the compiler writes: assembly (`-S`, `--emit-asm`, or an output
@@ -718,13 +758,15 @@ pub const OUT_OBJECT: i64 = 1;
 pub const OUT_EXECUTABLE: i64 = 2;
 
 // The output mode for `path` when no option chose one.
-pub fn output_mode_of(path: *u8) -> i64 {
+pub fn output_mode_of(path: *mut u8) -> i64 {
     unsafe {
         let n = strlen(path) as i64;
-        if n >= 2 && path[n - 2] == '.' && path[n - 1] == 's' {
+        if n >= 2 && (*path.add((n - 2) as usize)) == b'.'
+            && (*path.add((n - 1) as usize)) == b's' {
             return OUT_ASM;
         }
-        if n >= 2 && path[n - 2] == '.' && path[n - 1] == 'o' {
+        if n >= 2 && (*path.add((n - 2) as usize)) == b'.'
+            && (*path.add((n - 1) as usize)) == b'o' {
             return OUT_OBJECT;
         }
         OUT_EXECUTABLE
@@ -732,39 +774,819 @@ pub fn output_mode_of(path: *u8) -> i64 {
 }
 
 // Writes the program (ASM) to `path` as the output mode says.
-pub fn write_output(cx: inout FnCtx, path: *u8, pcx: inout Ctx<Comp>) {
+pub fn write_output(cx: &mut FnCtx, path: *mut u8, pcx: &mut Ctx<Comp>) {
     unsafe {
-        c_module_symbols(&cx, pcx);
+        c_module_symbols(cx, pcx);
         if pcx.output_mode == OUT_ASM {
             buf_write_file(cx.asm, path);
             return;
         }
         if pcx.output_mode == OUT_OBJECT {
-            write_object(&cx, path, &pcx);
+            write_object(cx, path, pcx);
             return;
         }
         let obj = buf_new();
-        buf_fmt(obj, format_args("{}.vole.o\0", cstr(path)));
-        let obj_path = BUFS[obj].data;
-        write_object(&cx, obj_path, &pcx);
+        buf_fmt(obj, format_args("{}.vole.o\0", str::from_utf8(cstr(path)).unwrap()));
+        let obj_path = (*get_bufs().add(obj as usize)).data;
+        write_object(cx, obj_path, pcx);
         // (0.25.3: the link's inputs first, its failure one error)
-        check_link_inputs(&pcx);
+        check_link_inputs(pcx);
         build_linking(path, pcx);
-        var status = link_program(path, obj_path, &pcx) as i32;
+        let mut status = link_program(path, obj_path, pcx) as i32;
         if status != 0 {
             unlink(obj_path);
-            link_failed(status as i64, path, &pcx);
+            link_failed(status as i64, path, pcx);
         }
-        if status == 0 && pcx.debug_info && !ELF {
+        if status == 0 && pcx.debug_info && !get_elf() {
             // (-g) On macOS the debug information stays in the object, which
             // goes: dsymutil gathers it into <path>.dSYM first, as clang does.
             let dsym = buf_new();
-            buf_fmt(dsym, format_args("dsymutil '{}'\0", cstr(path)));
-            status = system(BUFS[dsym].data);
+            buf_fmt(dsym, format_args("dsymutil '{}'\0", str::from_utf8(cstr(path)).unwrap()));
+            status = system((*get_bufs().add(dsym as usize)).data);
         }
         unlink(obj_path);
         if status != 0 {
             die(c"dsymutil failed");
         }
+    }
+}
+
+// (0.28.0) CUR_SEC's accessors: every use of it is one of them.
+pub fn get_cur_sec() -> i64 {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe { CUR_SEC }
+}
+
+pub fn set_cur_sec(v: i64) {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe {
+        CUR_SEC = v;
+    }
+}
+
+// (0.28.0) SEC_ALIGN's accessors: every use of it is one of them.
+fn get_sec_align() -> [i64; 9] {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe { SEC_ALIGN }
+}
+
+fn set_sec_align(v: [i64; 9]) {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe {
+        SEC_ALIGN = v;
+    }
+}
+
+// (0.28.0) SEC_USED's accessors: every use of it is one of them.
+fn get_sec_used() -> [bool; 9] {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe { SEC_USED }
+}
+
+fn set_sec_used(v: [bool; 9]) {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe {
+        SEC_USED = v;
+    }
+}
+
+// (0.28.0) FRAGS's accessors: every use of it is one of them.
+fn get_frags() -> *mut Frag {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe { FRAGS }
+}
+
+fn set_frags(v: *mut Frag) {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe {
+        FRAGS = v;
+    }
+}
+
+// (0.28.0) FRAG_COUNT's accessors: every use of it is one of them.
+fn get_frag_count() -> i64 {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe { FRAG_COUNT }
+}
+
+fn set_frag_count(v: i64) {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe {
+        FRAG_COUNT = v;
+    }
+}
+
+// (0.28.0) FRAG_CAP's accessors: every use of it is one of them.
+fn get_frag_cap() -> i64 {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe { FRAG_CAP }
+}
+
+fn set_frag_cap(v: i64) {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe {
+        FRAG_CAP = v;
+    }
+}
+
+// (0.28.0) OPEN's accessors: every use of it is one of them.
+fn get_open() -> i64 {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe { OPEN }
+}
+
+fn set_open(v: i64) {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe {
+        OPEN = v;
+    }
+}
+
+// (0.28.0) OBJ's accessors: every use of it is one of them.
+pub fn get_obj() -> ObjBytes {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe { OBJ }
+}
+
+pub fn set_obj(v: ObjBytes) {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe {
+        OBJ = v;
+    }
+}
+
+// (0.28.0) RAW's accessors: every use of it is one of them.
+pub fn get_raw() -> ObjBytes {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe { RAW }
+}
+
+pub fn set_raw(v: ObjBytes) {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe {
+        RAW = v;
+    }
+}
+
+// (0.28.0) CUR_ATOM's accessors: every use of it is one of them.
+fn get_cur_atom() -> [i64; 9] {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe { CUR_ATOM }
+}
+
+fn set_cur_atom(v: [i64; 9]) {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe {
+        CUR_ATOM = v;
+    }
+}
+
+// (0.28.0) ASYMS's accessors: every use of it is one of them.
+fn get_asyms() -> *mut ASym<'static> {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe { ASYMS }
+}
+
+fn set_asyms(v: *mut ASym<'static>) {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe {
+        ASYMS = v;
+    }
+}
+
+// (0.28.0) ASYM_COUNT's accessors: every use of it is one of them.
+fn get_asym_count() -> i64 {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe { ASYM_COUNT }
+}
+
+fn set_asym_count(v: i64) {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe {
+        ASYM_COUNT = v;
+    }
+}
+
+// (0.28.0) ASYM_CAP's accessors: every use of it is one of them.
+fn get_asym_cap() -> i64 {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe { ASYM_CAP }
+}
+
+fn set_asym_cap(v: i64) {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe {
+        ASYM_CAP = v;
+    }
+}
+
+// (0.28.0) ASYM_TABLE's accessors: every use of it is one of them.
+fn get_asym_table() -> *mut i64 {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe { ASYM_TABLE }
+}
+
+fn set_asym_table(v: *mut i64) {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe {
+        ASYM_TABLE = v;
+    }
+}
+
+// (0.28.0) ASYM_TABLE_SIZE's accessors: every use of it is one of them.
+fn get_asym_table_size() -> i64 {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe { ASYM_TABLE_SIZE }
+}
+
+fn set_asym_table_size(v: i64) {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe {
+        ASYM_TABLE_SIZE = v;
+    }
+}
+
+// (0.28.0) ASYM_LOOKUPS's accessors: every use of it is one of them.
+pub fn get_asym_lookups() -> i64 {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe { ASYM_LOOKUPS }
+}
+
+pub fn set_asym_lookups(v: i64) {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe {
+        ASYM_LOOKUPS = v;
+    }
+}
+
+// (0.28.0) FIXUPS's accessors: every use of it is one of them.
+fn get_fixups() -> *mut Fixup {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe { FIXUPS }
+}
+
+fn set_fixups(v: *mut Fixup) {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe {
+        FIXUPS = v;
+    }
+}
+
+// (0.28.0) FIXUP_COUNT's accessors: every use of it is one of them.
+fn get_fixup_count() -> i64 {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe { FIXUP_COUNT }
+}
+
+fn set_fixup_count(v: i64) {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe {
+        FIXUP_COUNT = v;
+    }
+}
+
+// (0.28.0) FIXUP_CAP's accessors: every use of it is one of them.
+fn get_fixup_cap() -> i64 {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe { FIXUP_CAP }
+}
+
+fn set_fixup_cap(v: i64) {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe {
+        FIXUP_CAP = v;
+    }
+}
+
+// (0.28.0) ATEXT's accessors: every use of it is one of them.
+pub fn get_atext() -> *mut u8 {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe { ATEXT }
+}
+
+pub fn set_atext(v: *mut u8) {
+    // UNSAFE: the assembler's state, a process-wide static mut that the
+    // main thread and the assembler thread use in turn; Rust has no safe
+    // access to a static mut
+    // SAFETY: one thread at a time uses it: the main thread before
+    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
+    // it in compile_program) and after asm_thread_finish's pthread_join,
+    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
+    // pthread_create and pthread_join order the hand-overs; no worker
+    // reaches it, the -O0 main thread's code generation between start and
+    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
+    // the loop around them) touches none of it, and at -O1+ there is no
+    // assembler thread (only the main thread assembles, in join_task's
+    // asm_flush); accessed through the accessor's raw pointer, no reference
+    // kept
+    unsafe {
+        ATEXT = v;
     }
 }

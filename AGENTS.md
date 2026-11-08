@@ -6,6 +6,16 @@ in [docs/releases.md](docs/releases.md) and
 [docs/roadmap.md](docs/roadmap.md); the language in
 [docs/grammar.md](docs/grammar.md).
 
+**compiler/src is in the rust edition** (0.28.0: `// EDITION: rust`
+in `main.vl`; `target/volec guide edition`): `&T`, `&mut T`, `let mut`,
+`&'static [u8]`, Rust's meanings, not MVS's. The compiler still reads
+MVS programs (std, the guide's examples, most of tests/run). A static of
+compiler/src is read and written only through its accessors at its
+file's end (`get_x()`, `set_x(v)`); their `unsafe` blocks' UNSAFE:/
+SAFETY: lines (from the review in compiler/src/tools/translate/
+statics.tsv, with its evidence) say which functions and threads write
+and read it: a change to who writes or reads a static keeps them true.
+
 **New to vole? Run `target/volec guide` first**: the language in
 about 2k tokens, for a reader who knows Rust (where it looks like Rust
 and means something else, std's most used items, the first errors and
