@@ -1469,6 +1469,16 @@ is not offered (`let else` is 0.29) and `if let` is. *Anchor:*
 arms do (by value, moving out of `e` the parts it binds by value,
 borrowck.md M3; `ref`/`&` by reference): a struct pattern on a place
 moves only the bound fields (partial move, M2).
+(0.27.6) A `let` whose whole pattern is `ref x` or `ref mut x` is
+`let x = &e;` or `let x = &mut e;` (`let ref x: τ = e;` is `let x: &τ =
+&e;`): of a place it borrows the place and moves nothing, as rustc
+does. `let ref z = a; a.x` reads `a`, and `let ref mut w = v[0]; *w +=
+1` changes `v[0]` (through IndexMut, F20.6). Of a value, its temporary
+lives as long as `x` (lifetime extension, as F18.4's `let r = &e;`).
+0.27.5 moved `e` into the binding's temporary: `a` was moved, and `v[0]`
+was copied. *Anchor:*
+`front/parser/stmts.vl: parse_let`. *Cases:* `rust_f_f27_let_ref`,
+`rust_f_f27_let_ref_err`.
 
 ### F31 `#[track_caller]`
 
