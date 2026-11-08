@@ -766,9 +766,19 @@ D3.6).
   `J = Skip<Split<char>>` gives an item of `'a`, not a borrow of `*it`.
   0.27.5 read the inner projection as elided, and E2 tied it to `&mut
   J`: two `pass(&mut it)` calls whose items were both live were
-  borrowck.mut_twice, which rustc accepts. *Anchor:*
-  `places/regions.vl: proj_map, proj_again`. *Case:*
-  `rust_b_nested_projection_item`.
+  borrowck.mut_twice, which rustc accepts. L14's ties read such a
+  projection the same way, for an impl's equality bound and for a
+  closure's Fn bound (`F: FnMut(I::Item)` of Map with `I =
+  Chain<..>`). The front resolves `Chain<A, B>::Item` to the impl it
+  normalizes to, which is Iter's. When the impl for the type itself
+  has a projection as its value, the ties read through that impl,
+  not the one the front resolved to. Otherwise the callee's walk and
+  the caller's ties would name different slots. An impl whose value
+  is not a projection keeps the impl the front resolved to, as
+  before: `Copied<I>`'s `type Item = T;`, with T bound by I's `Item =
+  &'a T`. *Anchor:* `places/regions.vl: proj_map, proj_again,
+  direct_impl`. *Case:* `rust_b_nested_projection_item`,
+  `rust_b_ok_l14_impl_bound_ties` (the Map over Chain line).
 
 ## 5. Variance (S5)
 
