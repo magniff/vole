@@ -66,7 +66,7 @@ inserted after crate::catalog::price	catalog.vl	+7 -0 lines
 note edit.imports: added the imports the new text needs (fix --only imports)
 % git diff catalog.vl
 diff --git a/catalog.vl b/catalog.vl
-index b98312a..5b15531 100644
+index 8281ba3..299e5be 100644
 --- a/catalog.vl
 +++ b/catalog.vl
 @@ -1,5 +1,7 @@
@@ -74,7 +74,7 @@ index b98312a..5b15531 100644
  
 +use crate::shapes::{Shape, area};
 +
- pub struct Item {
+ #[derive(Clone, Copy)] pub struct Item {
      pub cost: i64,
  }
 @@ -8,6 +10,11 @@ pub fn price(i: Item) -> i64 {
@@ -114,10 +114,10 @@ inserted after crate::catalog::price	catalog.vl	+4 -0 lines
 script steps.txt: 2 commands	catalog.vl	+6 -1 lines
 % git diff catalog.vl
 diff --git a/catalog.vl b/catalog.vl
-index b98312a..c126827 100644
+index 8281ba3..958af63 100644
 --- a/catalog.vl
 +++ b/catalog.vl
-@@ -5,7 +5,12 @@ pub struct Item {
+@@ -5,7 +5,12 @@
  }
  
  pub fn price(i: Item) -> i64 {

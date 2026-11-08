@@ -1,8 +1,6 @@
 ## volec refactor signature|field|variant (tests/refactor/shapes/).
 $ check
-main.vl:4:19: warning[use.unused] unused import 'Pair': nothing in this file names it | help: remove it (`volec fix` removes every unused import) | try: volec fix --only unused main.vl
-main.vl:4:32: warning[use.unused] unused import 'Shape': nothing in this file names it | help: remove it (`volec fix` removes every unused import) | try: volec fix --only unused main.vl
-ok: 0 errors, 2 warnings in main.vl
+ok: 0 errors in main.vl
 ## --- signature ---
 ## A parameter added: the definition, and each call with the value.
 $ refactor signature area --add 'scale: i64 = 1' --fill-calls --dry-run
@@ -22,14 +20,14 @@ $ refactor signature Point::scale --add 'extra: i64 = 0' --at 1 --dry-run
 +++ b/main.vl
 @@ -14,2 +14,2 @@
 -    p.scale(2);
--    Point::scale(&p, 3);
+-    Point::scale(&mut p, 3);
 +    p.scale(0, 2);
-+    Point::scale(&p, 0, 3);
++    Point::scale(&mut p, 0, 3);
 --- a/geom.vl
 +++ b/geom.vl
 @@ -46 +46 @@
--    pub fn scale(inout self, k: i64) {
-+    pub fn scale(inout self, extra: i64, k: i64) {
+-    pub fn scale(&mut self, k: i64) {
++    pub fn scale(&mut self, extra: i64, k: i64) {
 note refactor.fill-calls: the calls get the value (a default is on trailing parameters only, and a later one has none)
 ## A trait's function: the trait, every impl, the calls (in a generic
 ## function's instances too).
@@ -37,19 +35,19 @@ $ refactor signature Shape::size --add 'bias: i64 = 0' --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -20 +20 @@
--    let s = total(p) + total(r) + p.size(3);
-+    let s = total(p) + total(r) + p.size(3, 0);
+-    let s = total(&p) + total(&r) + p.size(3);
++    let s = total(&p) + total(&r) + p.size(3, 0);
 --- a/geom.vl
 +++ b/geom.vl
 @@ -53 +53 @@
--    fn size(self, unit: i64) -> i64;
-+    fn size(self, unit: i64, bias: i64) -> i64;
+-    fn size(&self, unit: i64) -> i64;
++    fn size(&self, unit: i64, bias: i64) -> i64;
 @@ -57 +57 @@
--    fn size(self, unit: i64) -> i64 {
-+    fn size(self, unit: i64, bias: i64) -> i64 {
+-    fn size(&self, unit: i64) -> i64 {
++    fn size(&self, unit: i64, bias: i64) -> i64 {
 @@ -63 +63 @@
--    fn size(self, unit: i64) -> i64 {
-+    fn size(self, unit: i64, bias: i64) -> i64 {
+-    fn size(&self, unit: i64) -> i64 {
++    fn size(&self, unit: i64, bias: i64) -> i64 {
 @@ -69 +69 @@
 -    s.size(1) + s.size(2)
 +    s.size(1, 0) + s.size(2, 0)
@@ -76,17 +74,17 @@ $ refactor signature Point::size --rename-param unit u --dry-run
 --- a/geom.vl
 +++ b/geom.vl
 @@ -53 +53 @@
--    fn size(self, unit: i64) -> i64;
-+    fn size(self, u: i64) -> i64;
+-    fn size(&self, unit: i64) -> i64;
++    fn size(&self, u: i64) -> i64;
 @@ -57,2 +57,2 @@
--    fn size(self, unit: i64) -> i64 {
+-    fn size(&self, unit: i64) -> i64 {
 -        (self.x + self.y) * unit
-+    fn size(self, u: i64) -> i64 {
++    fn size(&self, u: i64) -> i64 {
 +        (self.x + self.y) * u
 @@ -63,2 +63,2 @@
--    fn size(self, unit: i64) -> i64 {
+-    fn size(&self, unit: i64) -> i64 {
 -        (self.a + self.b) as i64 * unit
-+    fn size(self, u: i64) -> i64 {
++    fn size(&self, u: i64) -> i64 {
 +        (self.a + self.b) as i64 * u
 $ refactor signature apply --reorder x,f --dry-run
 --- a/main.vl
@@ -97,12 +95,12 @@ $ refactor signature apply --reorder x,f --dry-run
 @@ -22 +22 @@
 -    let t = apply(twice, w + s + o);
 +    let t = apply(w + s + o, twice);
-$ refactor signature area --type p '*Point' --dry-run
+$ refactor signature area --type p '*const Point' --dry-run
 --- a/geom.vl
 +++ b/geom.vl
 @@ -17 +17 @@
 -pub fn area(p: Point) -> i64 {
-+pub fn area(p: *Point) -> i64 {
++pub fn area(p: *const Point) -> i64 {
 main.vl:16:18: error[type error] expected '*Point', got 'Point' | help: a pointer to it: its address | try: &p | try: volec fix --suggested main.vl  [in crate::main]
 geom.vl:18:5: error[unsafe] access to a field through a raw pointer is unsafe: `p` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `p` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: volec fix --values main.vl | try: volec fix --only unsafe main.vl  [edited: crate::geom::area]
 geom.vl:18:11: error[unsafe] access to a field through a raw pointer is unsafe: `p` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `p` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: volec fix --values main.vl | try: volec fix --only unsafe main.vl  [edited: crate::geom::area]
@@ -178,8 +176,8 @@ $ refactor field Point --add 'pub z: i64 = 0' --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -12 +12 @@
--    var p = Point { x: 2, y: 3 };
-+    var p = Point { x: 2, y: 3, z: 0 };
+-    let mut p = Point { x: 2, y: 3 };
++    let mut p = Point { x: 2, y: 3, z: 0 };
 --- a/geom.vl
 +++ b/geom.vl
 @@ -6,0 +7 @@
@@ -191,8 +189,8 @@ $ refactor field Point --rename y height --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -12 +12 @@
--    var p = Point { x: 2, y: 3 };
-+    var p = Point { x: 2, height: 3 };
+-    let mut p = Point { x: 2, y: 3 };
++    let mut p = Point { x: 2, height: 3 };
 --- a/geom.vl
 +++ b/geom.vl
 @@ -6 +6 @@
@@ -310,17 +308,17 @@ $ refactor variant Kind --remove Square
 removed variant Square of crate::kinds::Kind, 2 arms	kinds.vl	+1 -4 lines
 % git diff
 diff --git a/kinds.vl b/kinds.vl
-index f6e1340..c1bfa03 100644
+index 9cde1a0..9dbe121 100644
 --- a/kinds.vl
 +++ b/kinds.vl
 @@ -1,6 +1,5 @@
- pub enum Kind {
+ #[derive(Clone, Copy)] pub enum Kind {
      Circle(i64),
 -    Square(i64),
      Dot,
      Empty,
  }
-@@ -8,8 +7,6 @@ pub enum Kind {
+@@ -8,8 +7,6 @@
  pub fn weight(k: Kind) -> i64 {
      match k {
          Kind::Circle(r) => 3 * r * r,
@@ -357,8 +355,8 @@ replaced crate::geom::twice	geom.vl	+1 -1 lines
 --- a/main.vl
 +++ b/main.vl
 @@ -12 +12 @@
--    var p = Point { x: 2, y: 3 };
-+    var p = Point { x: 2, height: 3 };
+-    let mut p = Point { x: 2, y: 3 };
++    let mut p = Point { x: 2, height: 3 };
 @@ -16 +16 @@
 -    let a = area(p) + area(q);
 +    let a = area(p, 2) + area(q, 2);
