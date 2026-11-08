@@ -1269,7 +1269,10 @@ slice, typed by the fallback `i32`: a type error). *Anchor:*
 edition an unannotated `let x = e;` binding one name, with `e` a literal
 tree (an unsuffixed integer literal, its negation, an array, a repeat or
 a tuple of literal trees, where a tuple's other elements are any
-value, an arithmetic operator of two literal trees; 0.27.4: an `if`
+value, an arithmetic operator of two literal trees; 0.27.7: a shift
+whose left operand is a literal tree, its right operand any integer
+value, which does not type it, `1 << (l % 64)` and `(0 - 1) << (bits -
+1)`, and `!` of a literal tree, `!0`; 0.27.4: an `if`
 with an `else`, or a `match`, whose every branch's value, its block's
 tail, is a literal tree, `let e0 = if c { 1 } else { 0 };`, and a block
 whose tail is one), makes `x` **open**:
@@ -1303,6 +1306,17 @@ is checked nothing is open. *Anchor:* `front/check/literals.vl: open_let,
 open_solve, open_expected`, `check_mode.vl: check_expr_inner`,
 `assign.vl: check_assign`. MVS is unchanged: no local is open, its
 fallback is `i64`.
+(0.27.7, the shift) A shift's type is its left operand's, so only that
+operand makes it a literal tree, and solving it types that operand: `let
+bit = 1 << (l % 64);` then `v[w] | bit` with `v: Vec<i64>` is an `i64`
+shift, as rustc infers it. 0.27.6 did not count a shift as a literal
+tree, so its literal took `i32` at the `let` and the later `i64` use
+widened the wrong value: `1 << 40` was `256`, and `(0 - 1) << 63`
+passed as an `i64` was `i32`'s minimum. That was a silent wrong value,
+found by the 0.28 flip rehearsal (19 such `let`s in compiler/src's
+translation). A `!` of a literal tree (an integer `!`, checked as `~`)
+is one too. *Cases:* `rust_f_f185_shift_open`,
+`rust_f_f185_shift_open_err`.
 (0.27.3, the literals around it, F18.3: `&1` where `&τ` of a number
 goes is a `τ` (`m.get(&1)`, `x.total_cmp(&0.0)`); a literal bound only
 by a parameter's bound picks the one integer type an impl gives, also
