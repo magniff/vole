@@ -98,6 +98,8 @@ The front (front277), from the 0.28 flip rehearsal:
 
 The translator: an integer method called on literals, `(1 << n).wrapping_sub(1)` or `(2 + 3).pow(2)`, gets its leftmost literal suffixed with MVS's `i64` (`1i64 << n`, T6). The receiver otherwise has no type in the rust edition, the error above. That error added two to gate 3 (compiler/src's `logical_imm` and the egraph's random constants); with this row, gate 3 is back at 0 type errors, and its borrowck count drops to 75, since the `static mut` change accepts `&mut *A_CTX`. Transcript `tests/refactor/edition0277t6`, case `rust_t_literal_receiver` (rustc builds it and prints the same).
 
+The bootstrap: the fixpoint's last build, the one compared with the build before it, is made without the code cache (`--no-cache`); the builds before it use the cache as before. A code cache entry made one function's register schedule differ from a cold build's in the compiler's own self-compile: a tree that held it failed the fixpoint (head built by head, cached, against the cold path), and a tree whose two builds both took it would have passed with a binary no clean build makes. Now such an entry is a failed fixpoint. It costs about 1.6 s on `bootstrap.sh --dev --no-suite` (9.4 to 11.0 s, warm, under load). chain-diverse, whose builds all have the cache off, also builds the head compiler with it on in a cache of its own, storing and then taking every entry, and compares both with the cold build. The cache bug itself is being chased.
+
 In progress. Gate 3's borrowck errors that view storage other than SRC
 are being fixed in MVS (docs/design/src-buffer.md, views of other
 storage): 76 to 67 so far. MVS programs compile exactly as before.
