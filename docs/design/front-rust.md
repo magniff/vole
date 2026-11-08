@@ -400,15 +400,26 @@ rust-edition position, with these readings:
   str` is `<str as AsRef<[u8]>>`, in an instance too, with or without an
   expected type (before, with `let b: &[u8] = ..` the reference impl took
   it, called itself, and the program overflowed its stack).
-- *Not yet: an instance's call is resolved again, not the template's
-  choice substituted* (0.27.5, a wrong output). rustc resolves a method
-  call once, on the generic body: `(**self).tag()` in `impl<T: ?Sized +
-  Tag> Tag for &T` is `<T as Tag>` for every T, so with `C = &&str`,
-  `via(r)` of `fn via<C: Tag>(c: C) { c.tag() }` is the reference impl
-  twice (21). Vole checks the instance's body with T = `&str` and takes
-  the place's impl for `(**self)`, a view (11). The fix: an instance's
-  call takes the template's resolution with the instance's types. Case
-  `rust_f_z91c_template_choice` (XFAIL).
+- *An instance's call through a type parameter* (0.27.5). rustc resolves
+  a method call once, on the generic body: `(**self).tag()` in `impl<T:
+  ?Sized + Tag> Tag for &T` is `<T as Tag>::tag` for every T. Vole checks
+  the instance's body, and a receiver whose type as written in the body
+  is a bare type parameter T bounded by a trait Tr that declares the
+  method takes `<X as Tr>::m`, X the type T stands for: X's own impl of
+  Tr or a pattern impl (`impl<T> Tr for &T`), its `&self` borrowing the
+  receiver, and never a method found again through X's references or a
+  view's place. So with `C = &&str`, `via(r)` of `fn via<C: Tag>(c: C) {
+  c.tag() }` is the reference impl twice (21, as rustc; 0.27.4 took
+  str's for `(**self)`, 11). The type as written is a local's declared
+  type (a parameter's, a `let`'s annotation), `Self` read as the impl's
+  self type as written, and `*e` as e's pointee; any other receiver is
+  resolved in the instance as before. Case `rust_f_z91c_template_choice`.
+  (0.27.6) The same holds for the path forms: `Clone::clone(&a)`, and
+  `A::clone(&a)` of a bounded parameter A whose bound declares the method
+  with a receiver, which is read as `Clone::clone(&a)`. With `A = &Gpa`
+  all three are `<&Gpa as Clone>::clone` (0.27.5 took Gpa's, "expected
+  &Gpa, got Gpa", or found no `clone` in `&Gpa`). Cases
+  `rust_f_z91c_template_choice_clone` and `_alloc`.
 - *`&'a T` of an unsized argument in a signature* (0.27.5, D4.6). With
   `T = Unsized(v)`, `&'a T` is the view `v` whose region is the
   reference's (`'a`, or the elided one, E2/E3's), with T's slots (the
@@ -460,6 +471,17 @@ today. *Anchor:* `synth_mode.vl: synth_array` ("cannot infer the type
 of an empty array").
 
 **F23.4 (character literals).** F1.2.
+
+**F23.5 (octal literals).** (0.27.6) In a rust-edition file an integer
+literal may be written `0o` then octal digits and `_` (`0o644`,
+`0o7_55`, `0o17u8`): its value in base 8, typed like any integer
+literal (F18.3) and suffixed like one. A digit `8` or `9` among its
+digits is rustc's error, "invalid digit for a base 8 literal" (`0o8`,
+`0o78`); `0o` with no digit after it, "expected octal digit after
+'0o'" (rustc E0768). Only the lower-case `o` (rustc refuses `0O`). `{:o}` formats an integer in base
+8 (`{:#o}`: `0o` first). MVS files keep refusing `0o` (an invalid
+suffix on `0`). *Anchor:* `front/lexer/mod.vl: lex_number`,
+`lex_radix_digits`. *Cases:* `rust_f_f23_octal`.
 
 ### F29 Casts
 
@@ -1150,6 +1172,22 @@ tuple type of as many elements for a tuple): `let b: &[i64; 2] = if c {
 }` where `&(i64, bool)` goes type their literals from `U`, as rustc's
 expectation does. So does a sliced array literal where `&[U]` goes,
 `if c { &[1, 2, 3][1..] } else { &[0][..] }`: the array is a `[U; N]`.
+Where `&mut [U]` goes (0.27.6), the slice is checked as `[U]` and the
+reference is the exclusive one, so `&mut [1, 2, 3][..]` passed to a `&mut
+[i64]` is accepted, as rustc accepts it (0.27.5 checked the slice against
+`&mut [U]` and refused it).
+
+*A shared `&e` where `&mut` goes* (0.27.6) is refused in the rust
+edition, as rustc refuses it (E0308, the types differ in mutability):
+`bump(&n)` with `bump(x: &mut i64)`, `first(&[1, 2, 3][..])` and
+`first(&a[..])` with `first(v: &mut [i64])`. Each is a `type error`
+(not MVS's `own.readonly`) whose help says so and whose `try:` and fix
+borrow exclusively (`&mut n`, `&mut [1, 2, 3][..]`, `&mut a[..]`). The
+`&` of a rust node is shared as written: MVS's inout marker, which makes
+`&x` exclusive where an exclusive reference is expected (check_mode:
+check_expr and coerce_ref), is MVS's alone. 0.27.5 accepted all three.
+Cases: rust_f_f18_shared_for_mut_err, and tests/borrowck-try's mut_ref_arg,
+mut_slice_literal and mut_slice_place, whose try: lines are run.
 Not yet the same slicing as a `let`'s whole initializer, `let s: &[i64]
 = &[1, 2, 3][1..];`, which F18.4's hoisting takes first (the fallback,
 `i32`: a type error). *Anchor:* `check_mode.vl: check_expr_inner`.
