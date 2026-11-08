@@ -112,6 +112,20 @@ The places IR (sc280):
   *Cases:* `rust_f_short_circuit_ir` (no phi in an `if` of `&&`, `||`
   and `!`), `rust_f_short_circuit_order` (a rustc twin: the operands'
   effects in order, the right one only when the left does not decide).
+  An MVS body keeps its own lowering, which its optimizer if-converts
+  (opt_ord_select's branch-free sift).
+
+std2 (sc280b):
+
+- **`Vec::push` is inline.** Its `ensures` clauses made every push a
+  call of `push$body`, out of line. They are `debug ensures` now, which
+  `volec test` checks. The fast path is a compare, one copy of the
+  element into its slot and an increment, and the growth is
+  `grow_one`, out of line. The flipped compiler's check of its own tree
+  went from 51.5 G instructions to 47.6 G.
+- `ptr::read` and `ptr::write` are `#[inline]`, as rustc's are. A copy
+  of a large element was a call; measured alone, the gain is in the
+  noise.
 
 ### What's new in 0.27.8
 
