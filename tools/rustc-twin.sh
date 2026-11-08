@@ -170,7 +170,20 @@ def run(prog):
         return name, ("named" if named else "differ"), "no exit after 60 s"
     got = p.stdout.decode("utf-8", errors="replace")
     if merged:  # (the guide's out block: each line's trailing blanks aside)
-        got = "\n".join(l.rstrip() for l in got.split("\n"))
+        # (0.28.0: a panic's frame, rustc's alone: its `thread 'main'
+        # panicked at FILE:L:C:` line, the blank line before it and the
+        # backtrace note; the message, which the vole program prints too,
+        # stays)
+        kept = []
+        for l in got.split("\n"):
+            l = l.rstrip()
+            if re.match(r"thread '[^']*'( \(\d+\))? panicked at .*:$", l):
+                while kept and not kept[-1]:
+                    kept.pop()
+                continue
+            if not l.startswith("note: run with `RUST_BACKTRACE=1`"):
+                kept.append(l)
+        got = "\n".join(kept)
         want = "\n".join(l.rstrip() for l in want.split("\n"))
     diff = stdout_differs(want, got)
     if not diff and p.returncode != wexit:
