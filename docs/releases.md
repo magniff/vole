@@ -94,6 +94,7 @@ The front (front277), from the 0.28 flip rehearsal:
 
 - **A let-bound shift of a literal was typed i32 (a wrong value), in 0.27.5 and 0.27.6.** In the rust edition, `let bit = 1 << (l % 64);` then `v[w] | bit` with `v: Vec<i64>` took the literal as `i32` at the `let`, so the shift was `1 << (l % 32)`. The same went for `let min = (0 - 1) << (bits - 1);` passed as an `i64` (it was `i32`'s minimum). No error was reported. A shift's left operand now decides its type and stays open until a later use fixes it, as rustc infers it (F18.5); so does `!` of a literal (`let a = !0;` then a `u64`). Cases `rust_f_f185_shift_open`, `rust_f_f185_shift_open_err`.
 - An integer type's own method on a literal, `(1 << s).wrapping_sub(1)` or `2.pow(2)`, is error `type.infer` (rustc's E0689). Before, it was `i32`'s method: `1 << 40` became `1 << 8`, silently. A trait's method there (`5.max(3)`, `3.clone()`) is still `i32`'s, as rustc's. Cases `rust_f_f185_literal_method_err`, `rust_f_f185_literal_method_ok`.
+- `&mut *P` of a `static mut P: *mut T`, a reference through the pointer the static holds, is accepted, as rustc 2024 accepts it. So are `&mut *S.1` and an autoref through `(*Q)`. 0.27.6 refused these as `borrowck.static_mut_ref` (D6.2.5). Case `rust_b_ok_static_mut_ptr_deref`.
 
 ### What's new in 0.27.6
 
