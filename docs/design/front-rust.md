@@ -1188,9 +1188,13 @@ borrow exclusively (`&mut n`, `&mut [1, 2, 3][..]`, `&mut a[..]`). The
 check_expr and coerce_ref), is MVS's alone. 0.27.5 accepted all three.
 Cases: rust_f_f18_shared_for_mut_err, and tests/borrowck-try's mut_ref_arg,
 mut_slice_literal and mut_slice_place, whose try: lines are run.
-Not yet the same slicing as a `let`'s whole initializer, `let s: &[i64]
-= &[1, 2, 3][1..];`, which F18.4's hoisting takes first (the fallback,
-`i32`: a type error). *Anchor:* `check_mode.vl: check_expr_inner`.
+(0.27.6) The same slicing as a `let`'s whole initializer with a slice
+annotation, `let s: &[i64] = &[1, 2, 3][1..];`, hoists the array, not
+the slice: `let t: [i64; 3] = [1, 2, 3]; let s: &[i64] = &t[1..];`, so
+its literals take the annotation's element type (0.27.5 hoisted the
+slice, typed by the fallback `i32`: a type error). *Anchor:*
+`check_mode.vl: check_expr_inner`, `temps.vl: annotate_temp`. *Cases:*
+`rust_f_f18_let_sliced_literal`.
 
 **F18.5 (integer inference variables: an open local).** In the rust
 edition an unannotated `let x = e;` binding one name, with `e` a literal
@@ -1241,6 +1245,16 @@ literal arguments, so that its result binds their parameter
 (`map_or(0, |x| x + 1)`), and one whose value is itself a literal
 after; a negated literal where an unsigned type goes is an error, rustc
 E0600.)
+(0.27.6, the branches of an `if` or a `match` where no type is expected:
+an element of a tuple that every earlier branch gives by a literal tree
+is an inference variable (F18.6) where a later branch is checked. A
+branch of a definite type there solves it, and the earlier branches'
+literals take that type. `match k { 0 => (gap, 0), _ => (0, gap) }`
+with `gap: usize` is `(usize, usize)`, as in rustc; 0.27.5 typed the
+first arm `(usize, i32)` and refused the second. A variable that the
+later branches leave free, all of them literals there, is the `i32`
+fallback. *Anchor:* `literals.vl: branch_expected, branch_settle`,
+`patterns/mod.vl: check_match`, `body.vl: synth_if`.)
 
 **F18.6 (type variables: deferred inference; 0.27.4).** In the rust
 edition a type parameter of a generic call (a function, a method, a path
@@ -1484,6 +1498,16 @@ is not offered (`let else` is 0.29) and `if let` is. *Anchor:*
 arms do (by value, moving out of `e` the parts it binds by value,
 borrowck.md M3; `ref`/`&` by reference): a struct pattern on a place
 moves only the bound fields (partial move, M2).
+(0.27.6) A `let` whose whole pattern is `ref x` or `ref mut x` is
+`let x = &e;` or `let x = &mut e;` (`let ref x: τ = e;` is `let x: &τ =
+&e;`): of a place it borrows the place and moves nothing, as rustc
+does. `let ref z = a; a.x` reads `a`, and `let ref mut w = v[0]; *w +=
+1` changes `v[0]` (through IndexMut, F20.6). Of a value, its temporary
+lives as long as `x` (lifetime extension, as F18.4's `let r = &e;`).
+0.27.5 moved `e` into the binding's temporary: `a` was moved, and `v[0]`
+was copied. *Anchor:*
+`front/parser/stmts.vl: parse_let`. *Cases:* `rust_f_f27_let_ref`,
+`rust_f_f27_let_ref_err`.
 
 ### F31 `#[track_caller]`
 

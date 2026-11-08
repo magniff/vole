@@ -131,6 +131,10 @@ The translator (g3274):
   borrowck (partial) 152 to 96. A borrowck case for the class it leaves,
   a `&mut` coerced to a raw pointer held through the call:
   `rust_b_raw_coerce_ends_borrow` (XFAIL).
+- An argument the checker takes as a view for a parameter written `&mut`
+  (std::arch's `vst1q_u32(s: &mut [u32], ..)`) is `&mut` too, as for
+  `inout`: link_macho's `vst1q_u32(&mut h[..], 0, abcd)` (rustc E0308,
+  which the rust edition's `&e` reports since front273). Gate 3: 5 to 3.
 
 The front (front273):
 
@@ -167,6 +171,17 @@ The front (front273):
   opaque instance made a drop shim for `Vec<i64, Ω>`. Shims are lowered,
   and that one called a `Vec::drop` that had no instance, so the link
   failed with an undefined symbol. -O2 was not affected.
+- Tuple branches type their literals from each other when no type is
+  expected (F18.5). In `match k { 0 => (gap, 0), _ => (0, gap) }` with
+  `gap: usize`, both elements are `usize`, as rustc infers. 0.27.5 typed
+  the first arm `(usize, i32)` and refused the second. The same applies
+  to an `if` and its `else`.
+- `let s: &[i64] = &[1, 2, 3][1..];` is accepted: the hoisted temporary
+  is the array, typed by the annotation (F18.4). 0.27.5 typed it by the
+  `i32` fallback and refused it.
+- `let ref x = e;` and `let ref mut x = e;` borrow `e` as `&e` and
+  `&mut e` do, as rustc does (F27.2). 0.27.5 moved `e`: after `let ref z
+  = a;`, `a` was moved, and `let ref mut w = v[0]` changed a copy.
 
 std2 and the translator (fl10274):
 
