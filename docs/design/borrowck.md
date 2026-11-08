@@ -525,6 +525,27 @@ re-inferred.
   it as the shared reborrow `&(*Q)`, whose loan lived to the call.
   *Cases:* `rust_b_raw_coerce_ends_borrow`,
   `rust_b_raw_coerce_live_shared_err`.
+  **D3.6a (0.27.7, the coercion's mutability).** In the rust edition
+  only `&mut T` coerces to `*mut T`. A `&T` coerces to `*const T` and
+  not to `*mut T`: that is rustc's E0308 ("the types differ in
+  mutability"), with `&mut x` as the fix. vole's types do not tell
+  `*const T` from `*mut T` (both are `*T`, front/parser/rust.vl), so
+  the check reads the written type the value goes to (its TyPtr's `c`:
+  1 `*const`, 2 `*mut`): a parameter's, a `let`'s, a struct literal's
+  field's (`S { p: &x }`, the field as declared), the function's result
+  (its tail and a `return`'s value; a closure's result is not read) and
+  an assignment's place (`p = &x` of a local declared `*mut T`, `s.p =
+  &x` of a field declared so, `*pp = &x` where `pp`'s declared type
+  points to a `*mut T`). Only the value itself is read, not a block or
+  `if` around it. 0.27.6 accepted
+  `bump(&x)` with `fn bump(p: *mut i64)`, and the callee's write went
+  through a pointer to a place that had only a shared borrow. MVS's
+  `*T` takes `&x` as before. A fat raw pointer (`*mut [T]`) takes no
+  reference yet, shared or exclusive (rustc: `&mut s[..]` and `&s[..]`
+  to `*const [T]`). *Anchor:* `front/check/check_mode.vl: coerce_ref`.
+  *Cases:* `rust_b_raw_mut_from_shared_err`,
+  `rust_b_raw_mut_from_mut`, `rust_b_raw_mut_positions_err`,
+  `rust_b_raw_mut_positions`.
 - `SK_ASSIGN (a,b) = RV_REF P` (`e = 'ℓ`, `d ≠ BK_RAW`): loan `ℓ`
   created; `sub(&'ℓ [mut] type(P) ≤ type((a,b)))` (a `BK_FAKE` loan:
   `type((a,b))` is `&type(P)`); **the supporting-prefix rule:** for
@@ -675,6 +696,17 @@ template, so a template with no instance is checked too, and
 region-free instances are deduped against it (front272: no opaque
 type kind exists in `front/types.vl` at v0.27.0). The key is stable
 across releases (0.27.4 checks compiler/src's many instances).
+0.27.6 adds (e): rustc checks only the template, so a template whose
+opaque instance has borrowck errors reports only those. The errors of a
+concrete instance with a region among its type arguments (`slots(τᵢ) ≠
+∅` for some i) are held until every body is solved. They are reported
+then, unless the template's opaque instance has errors. For
+`fn mixed<'a, 'b, I: Iterator<Item = &'b str>>(args: I) -> Option<&'a
+str>`, the opaque instance's `'b must outlive 'a` is reported, and not
+`mixed<Split<char>>`'s at the `let`, which says the same of Split's
+lifetime. A region-free instance is not held: the opaque instance
+reuses its verdict (b, d). *Anchor:* `places/borrowck/mod.vl:
+check_body, release_held`. *Case:* `rust_b_err_proj_item_bound`.
 
 **D4.5 (implied and declared bounds; the order ⊒).** `⊒` is the least
 preorder on `U` containing: `'static ⊒ 'u` for every `'u`; every
@@ -766,9 +798,36 @@ D3.6).
   `J = Skip<Split<char>>` gives an item of `'a`, not a borrow of `*it`.
   0.27.5 read the inner projection as elided, and E2 tied it to `&mut
   J`: two `pass(&mut it)` calls whose items were both live were
-  borrowck.mut_twice, which rustc accepts. *Anchor:*
-  `places/regions.vl: proj_map, proj_again`. *Case:*
-  `rust_b_nested_projection_item`.
+  borrowck.mut_twice, which rustc accepts. L14's ties read such a
+  projection the same way, for an impl's equality bound and for a
+  closure's Fn bound (`F: FnMut(I::Item)` of Map with `I =
+  Chain<..>`). The front resolves `Chain<A, B>::Item` to the impl it
+  normalizes to, which is Iter's. When the impl for the type itself
+  has a projection as its value, the ties read through that impl,
+  not the one the front resolved to. Otherwise the callee's walk and
+  the caller's ties would name different slots. An impl whose value
+  is neither a projection nor a parameter (h) keeps the impl the front
+  resolved to, as before. *Anchor:* `places/regions.vl: proj_map,
+  proj_again, direct_impl`. *Case:* `rust_b_nested_projection_item`,
+  `rust_b_ok_l14_impl_bound_ties` (the Map over Chain line).
+- (h) *A projection whose impl's value is a parameter its header does
+  not name (0.27.7).* `impl<'a, T: Copy + 'a, I: Iterator<Item = &'a
+  T>> Iterator for Copied<I> { type Item = T; }`: the header binds `I`,
+  and `T` only through `I`'s bound. The value is read through that
+  bound: `T`'s slots are those of the part of `I::Item` where the bound's
+  `&'a T` has `T`, with `I::Item` read by the direct impl for the type
+  the header binds `I` to, in the base's slots (g). For `Copied<Iter<'r,
+  &'s str>>`, `Iter`'s `type Item = &'a T` has at `T` its `T`, `&'s str`:
+  the item is `'s`, the vector's element, not `'r`, the borrow of the
+  vector. The impl for the type itself is used, not the one the front
+  resolved to (`Iter`'s, through the bound), as in (g). So `fn first<'a,
+  I: Iterator<Item = &'a str>>(it: I) -> &'a str` called with
+  `args.iter().copied()` of a `Vec<&'a str>` returns an `&'a str`. 0.27.6
+  read `Iter`'s value with `Copied`'s slots and tied `'a` to the borrow
+  of `args`: borrowck.return_local, which rustc accepts (the flip
+  rehearsal's F4). `Cloned<I>` is the same. *Anchor:* `places/regions.vl:
+  proj_bound, unnamed_param, bound_at`. *Cases:* `rust_b_ok_copied_items`,
+  `rust_b_copied_items_err`.
 
 ## 5. Variance (S5)
 
@@ -889,7 +948,12 @@ project's rule: every error of a compilation), deduped by §14.3.
    of `S`: a reference to it (a method's autoref, `(*&raw mut S).push(2)`;
    `&mut *&raw mut S`) is no reference to the static, as in rustc (0.27.4;
    the builder does not fold `*&raw mut S` back to `S`, as it folds
-   `*&x`). ir271 implements it at the front (the borrow expression's
+   `*&x`). So is any place through a `*` of the static's value (0.27.7):
+   `&mut *P` of a `static mut P: *mut T`, `&mut *S.1` of a pointer field,
+   an autoref through one (`(*Q).add()`). The static is read, a copy, and
+   the reference is the pointee's, as rustc's static_mut_refs has it.
+   0.27.6 refused each one (`emit_ref`: a projection with a `*` is no part
+   of the static). Case `rust_b_ok_static_mut_ptr_deref`. ir271 implements it at the front (the borrow expression's
    operand is a `static mut` item, and the `&` is not a raw borrow), so no
    loan of a `static mut` reaches the solve.
 

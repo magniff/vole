@@ -9,7 +9,7 @@ use crate::base::ctx::Ctx;
 use crate::front::ast::{CONV_NEW, NodeKind, child};
 use crate::front::check::is_std_named;
 use crate::front::lexer::Tok;
-use crate::front::types::{TY_I64, TY_I8, TY_ISIZE, TY_U64, TY_U8, TyKind};
+use crate::front::types::{REF_MUT, TY_I64, TY_I8, TY_ISIZE, TY_U64, TY_U8, TyKind};
 use crate::middle::lower::ssa::HMap;
 use crate::tools::translate::{
     D_REF, TC_BORROW, TC_BYTES, TC_DEREF, TC_INOUT_LOCAL, TC_INT, TC_LEN, TC_MUT_MARKER, TC_PRINT,
@@ -247,18 +247,114 @@ fn edit_for_copy(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
 // Whether place e's root is a local bound by `let` (not `var`): its
 // address is a shared one.
 fn let_root(e: i64, pcx: Ctx<Comp>) -> bool {
+    let d = root_decl(e, pcx);
+    d > 0 && pcx.nodes[d].kind == NodeKind::Let && pcx.nodes[pcx.nodes[d].a].b == 0
+        && !word_here(pcx.nodes[d].start, "var")
+}
+
+// Whether place e's root is a local bound by `var`.
+fn var_root(e: i64, pcx: Ctx<Comp>) -> bool {
+    let d = root_decl(e, pcx);
+    d > 0 && pcx.nodes[d].kind == NodeKind::Let && word_here(pcx.nodes[d].start, "var")
+}
+
+// Whether place e can be lent `&mut` in the rust edition: a `var`
+// local's, or a part of what a raw pointer or a `&mut` points to (an
+// inout parameter's, `cx.inst_cap`; `*af`; `cc.rel` of a `let cc: *C`),
+// not a `let`'s, a parameter's own or a static's.
+fn place_mut(e: i64, pcx: Ctx<Comp>) -> bool {
+    var r = e;
+    while r > 0 {
+        let k = pcx.nodes[r].kind;
+        if k == NodeKind::Unary && pcx.nodes[r].op == Tok::Star {
+            let b = pcx.nodes[r].b;
+            let t = if b > 0 { pcx.nodes[b].ty } else { 0 };
+            return t > 0 && pcx.types[t].kind == TyKind::Ptr
+                && (pcx.types[t].b == 0 || pcx.types[t].b == REF_MUT);
+        }
+        if k == NodeKind::FieldAccess || k == NodeKind::Index || k == NodeKind::TupleField {
+            let b = pcx.nodes[r].a;
+            let t = if b > 0 { pcx.nodes[b].ty } else { 0 };
+            if t > 0 && pcx.types[t].kind == TyKind::Ptr {
+                return pcx.types[t].b == 0 || pcx.types[t].b == REF_MUT;
+            }
+            r = b;
+            continue;
+        }
+        if k == NodeKind::Ident {
+            return var_root(r, pcx);
+        }
+        return false;
+    }
+    false
+}
+
+// Whether e is an element of a raw pointer, `p[i]`, whose address
+// `&p[i]` the translation writes `p.add(i)` (edit_ptr_index).
+fn ptr_element(e: i64, pcx: Ctx<Comp>) -> bool {
+    let b = if pcx.nodes[e].kind == NodeKind::Index { pcx.nodes[e].a } else { 0 };
+    let t = if b > 0 { pcx.nodes[b].ty } else { 0 };
+    t > 0 && pcx.types[t].kind == TyKind::Ptr && pcx.types[t].b == 0
+}
+
+// Whether place e is a part of a `let` local or a by-value parameter
+// itself (not through a pointer or a reference), and its binding is made
+// `mut` for a `&mut` of it: `let mut k`, `fn f(mut x: T)`.
+fn owned_binding(e: i64, tr: inout Tr, pcx: inout Ctx<Comp>) -> bool {
+    var r = e;
+    while r > 0 && (pcx.nodes[r].kind == NodeKind::FieldAccess
+        || pcx.nodes[r].kind == NodeKind::Index || pcx.nodes[r].kind == NodeKind::TupleField) {
+        let b = pcx.nodes[r].a;
+        let t = if b > 0 { pcx.nodes[b].ty } else { 0 };
+        if t > 0 && pcx.types[t].kind == TyKind::Ptr {
+            return false;
+        }
+        r = b;
+    }
+    if r <= 0 || pcx.nodes[r].kind != NodeKind::Ident {
+        return false;
+    }
+    let d = root_decl(r, pcx);
+    if d <= 0 {
+        return false;
+    }
+    if pcx.nodes[d].kind == NodeKind::Let {
+        let pat = pcx.nodes[d].a;
+        if pat <= 0 || pcx.nodes[pat].kind != NodeKind::PatBind
+            || !word_here(pcx.nodes[d].start, "let")
+            || pcx.nodes[r].ty <= 0 || pcx.types[pcx.nodes[r].ty].kind == TyKind::Ptr {
+            return false;
+        }
+        put(pcx.nodes[pat].start, pcx.nodes[pat].start, "mut ", TC_VAR, &tr, &pcx);
+        return true;
+    }
+    // (a parameter by value, written with its name first)
+    let tn = pcx.nodes[d].b;
+    let name = crate::base::sym_text(pcx.nodes[d].a, pcx);
+    if pcx.nodes[d].kind != NodeKind::Param || tn <= 0 || pcx.nodes[tn].kind == NodeKind::TyPtr
+        || !word_here(pcx.nodes[d].start, name) || pcx.nodes[r].ty <= 0
+        || pcx.types[pcx.nodes[r].ty].kind == TyKind::Ptr {
+        return false;
+    }
+    put(pcx.nodes[d].start, pcx.nodes[d].start, "mut ", TC_VAR, &tr, &pcx);
+    true
+}
+
+// The declaration of place e's root in its function, a Param or a Let
+// (the nearest before it), or 0 (a static, a constant).
+fn root_decl(e: i64, pcx: Ctx<Comp>) -> i64 {
     var r = e;
     while r > 0 && (pcx.nodes[r].kind == NodeKind::FieldAccess
         || pcx.nodes[r].kind == NodeKind::Index || pcx.nodes[r].kind == NodeKind::TupleField) {
         r = pcx.nodes[r].a;
     }
     if r <= 0 || pcx.nodes[r].kind != NodeKind::Ident {
-        return false;
+        return 0;
     }
     let pos = pcx.nodes[r].start;
     let f = enclosing_fn(pos, pcx);
     if f <= 0 {
-        return false;
+        return 0;
     }
     var best = 0;
     for n in 1..pcx.nodes.len() as i64 {
@@ -275,8 +371,7 @@ fn let_root(e: i64, pcx: Ctx<Comp>) -> bool {
             best = n;
         }
     }
-    best > 0 && pcx.nodes[best].kind == NodeKind::Let
-        && pcx.nodes[pcx.nodes[best].a].b == 0 && !word_here(pcx.nodes[best].start, "var")
+    best
 }
 
 // Whether place e's root is a parameter of its function (immutable in
@@ -364,6 +459,28 @@ fn edit_amp(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
         && pcx.types[t].b == 0 && operand > 0 && access_to_ref(operand, tr, pcx) {
         put(s, inner, "", TC_MUT_MARKER, &tr, &pcx);
         return;
+    }
+    // (0.27.7) a mutable place's address given where a raw pointer goes,
+    // MVS's `&m` to a `*[u8]` out parameter, `&cx.inst_cap` of an inout cx:
+    // `&mut m`, which Rust coerces to `*mut T` (rustc coerces a `&T` only
+    // to a `*const T`, E0308; place_mut). A `let`'s or a parameter's own
+    // place (not through a pointer) is `&mut x` too, its binding made
+    // `mut` (owned_binding): the callee may write through the pointer, and
+    // a write through one made from `&raw const x` is undefined. A static's,
+    // or a place behind a shared reference, keeps its `&` (a `static
+    // mut`'s reference is Rust 2024's error)
+    if SRC[s] == '&' && SRC[s + 1] != '&' && t > 0 && pcx.types[t].kind == TyKind::Ptr
+        && pcx.types[t].b == 0 && operand > 0 && !word_here(inner, "mut")
+        && !(c > 0 && pcx.nodes[c].kind == NodeKind::Cast) && !ptr_element(operand, pcx) {
+        if place_mut(operand, pcx) {
+            // (before a deref put there, `&mut (*p.add(i)).f`)
+            put_first(s + 1, "mut ", &tr, &pcx);
+            return;
+        }
+        if !access_to_ref(operand, tr, pcx) && owned_binding(operand, &tr, &pcx) {
+            put_first(s + 1, "mut ", &tr, &pcx);
+            return;
+        }
     }
     if SRC[s] != '&' || SRC[s + 1] == '&'
         || !is_mut_ref(t, pcx) && !mut_slice(t, pcx) {
@@ -674,6 +791,156 @@ pub fn hoist_index_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
     }
 }
 
+// (0.27.6, flip28's T3) A read of an element of a container whose index
+// calls a function that takes the container's root `&mut`,
+// `pcx.types[place_ty(l, p, pbody, pcx)].kind`: Rust's Index borrows the
+// container before the index is computed (rustc E0502), so the index is
+// computed first, `{ let at_ix = place_ty(l, p, pbody, pcx);
+// pcx.types[at_ix].kind }`, around the first copied value of the
+// element (a field of it, or itself), not a place written or borrowed.
+// Run after every other pass, with hoist_index_edits.
+pub fn hoist_read_index_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind == NodeKind::Index && pcx.nodes[n].end > pcx.nodes[n].start
+            && own_node(n, tr, &pcx) && editable(pcx.nodes[n].start, &pcx) {
+            hoist_read_index(n, &tr, &pcx);
+        }
+    }
+}
+
+// hoist_read_index_edits' rule on index n.
+fn hoist_read_index(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    var base = pcx.nodes[n].a;
+    let ix = pcx.nodes[n].b;
+    // (the checker's view of a Vec indexed, a call around it at its place)
+    if base > 0 && pcx.nodes[base].kind == NodeKind::Call && pcx.nodes[base].count == 1 {
+        let v = child(base, 0, pcx);
+        if v > 0 && pcx.nodes[v].start == pcx.nodes[base].start
+            && pcx.nodes[v].end == pcx.nodes[base].end {
+            base = v;
+        }
+    }
+    if base <= 0 || ix <= 0 || pcx.nodes[ix].kind == NodeKind::Range
+        || pcx.nodes[ix].end <= pcx.nodes[ix].start {
+        return;
+    }
+    // (a struct's Index, a Vec's: not an array's or a slice's)
+    var bt = pcx.nodes[base].ty;
+    if bt > 0 && pcx.types[bt].kind == TyKind::Ptr {
+        bt = pcx.types[bt].a;
+    }
+    if bt <= 0 || pcx.types[bt].kind != TyKind::Struct {
+        return;
+    }
+    var r = base;
+    while r > 0 && (pcx.nodes[r].kind == NodeKind::FieldAccess
+        || pcx.nodes[r].kind == NodeKind::Index || pcx.nodes[r].kind == NodeKind::Unary) {
+        r = if pcx.nodes[r].kind == NodeKind::Unary { pcx.nodes[r].b } else { pcx.nodes[r].a };
+    }
+    if r <= 0 || pcx.nodes[r].kind != NodeKind::Ident
+        || !calls_mut_with(ix, SRC[pcx.nodes[r].start..pcx.nodes[r].end], pcx) {
+        return;
+    }
+    // (out to the first value copied: the element, or a field of it)
+    var e = n;
+    var p = parent_of(n, tr);
+    while p > 0 && (pcx.nodes[p].kind == NodeKind::FieldAccess
+        || pcx.nodes[p].kind == NodeKind::TupleField) && pcx.nodes[p].a == e
+        && (pcx.nodes[e].ty <= 0 || !crate::front::conv::copyable(pcx.nodes[e].ty, &pcx)) {
+        e = p;
+        p = parent_of(p, tr);
+    }
+    if pcx.nodes[e].ty <= 0 || !crate::front::conv::copyable(pcx.nodes[e].ty, &pcx) {
+        return;
+    }
+    // (not a place written, borrowed or a method's receiver)
+    if p > 0 && (pcx.nodes[p].kind == NodeKind::Assign && pcx.nodes[p].b == e
+        || pcx.nodes[p].kind == NodeKind::Unary && SRC[pcx.nodes[p].start] == '&'
+        || pcx.nodes[p].kind == NodeKind::MethodCall && pcx.nodes[p].a == e) {
+        return;
+    }
+    let a = pcx.nodes[ix].start;
+    let b = pcx.nodes[ix].end;
+    let s0 = pcx.nodes[e].start;
+    let e0 = pcx.nodes[e].end;
+    // (no edit that crosses the index, or holds the value whole)
+    for i in 0..pcx.e_start.count {
+        let s = pcx.e_start.get(i);
+        let t = pcx.e_end.get(i);
+        if !(s >= a && t <= b) && s < b && a < t || s < s0 && t > e0 {
+            return;
+        }
+    }
+    let text = buf_new();
+    let paren = leads_statement(e, tr, pcx);
+    buf_bytes(text, if paren { "({ let at_ix = " } else { "{ let at_ix = " });
+    crate::tools::translate::rows::render(a, b, true, text, pcx);
+    buf_bytes(text, "; ");
+    var w: i64 = 0;
+    for i in 0..pcx.e_start.count {
+        let s = pcx.e_start.get(i);
+        let t = pcx.e_end.get(i);
+        if !(s >= a && t <= b) {
+            pcx.e_start.set(w, s);
+            pcx.e_end.set(w, t);
+            pcx.e_text.set(w, pcx.e_text.get(i));
+            w += 1;
+        }
+    }
+    pcx.e_start.count = w;
+    pcx.e_end.count = w;
+    pcx.e_text.count = w;
+    let name = buf_new();
+    buf_bytes(name, "at_ix");
+    if crate::tools::edit::edit_replace(a, b, name, &pcx) {
+        put_first(s0, buf_slice(text), &tr, &pcx);
+        put_first(e0, if paren { " })" } else { " }" }, &tr, &pcx);
+    }
+}
+
+// Whether node e holds a call (not a closure's) that gives the name r to
+// a `&mut` parameter.
+fn calls_mut_with(e: i64, r: [u8], pcx: Ctx<Comp>) -> bool {
+    if e <= 0 || pcx.nodes[e].kind == NodeKind::Closure {
+        return false;
+    }
+    if pcx.nodes[e].kind == NodeKind::Call {
+        let f = pcx.nodes[e].x - 1;
+        for k in 0..pcx.nodes[e].count {
+            let x = arg_behind(child(e, k, pcx), pcx);
+            if f >= 0 && f < pcx.fns.len() as i64 && k < pcx.fns[f].param_count && x > 0
+                && pcx.nodes[x].kind == NodeKind::Ident
+                && SRC[pcx.nodes[x].start..pcx.nodes[x].end] == r
+                && is_mut_ref(crate::front::types::fn_param(f, k, pcx), pcx) {
+                return true;
+            }
+        }
+    }
+    var kids = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    crate::tools::translate::kids_of(e, &kids, pcx);
+    for k in 0..kids.count {
+        if calls_mut_with(kids.get(k), r, pcx) {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether expression e is the first part of a larger expression that
+// starts a statement or a block's value (`f(..) && x`), where a block
+// written at e would be a statement of its own: one is parenthesized.
+fn leads_statement(e: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
+    var c = e;
+    var p = parent_of(e, tr);
+    while p > 0 && pcx.nodes[p].start == pcx.nodes[e].start && pcx.nodes[p].kind != NodeKind::Block
+        && pcx.nodes[p].kind != NodeKind::ExprStmt {
+        c = p;
+        p = parent_of(p, tr);
+    }
+    c != e && p > 0
+        && (pcx.nodes[p].kind == NodeKind::Block || pcx.nodes[p].kind == NodeKind::ExprStmt)
+}
+
 // (0.27.6) A call that takes root r `&mut` (an inout parameter) and
 // another argument after it that calls a function with r too, `is_const(cx,
 // ir_val(cx, v))`: Rust's reborrow of r for the first argument lives through
@@ -756,6 +1023,18 @@ fn calls_with(e: i64, r: [u8], pcx: Ctx<Comp>) -> bool {
     false
 }
 
+// Whether argument a reads the name r for a value that is copied (not a
+// closure, which would capture it): `sym_name(&mut l, l.imports[i])` is
+// rustc's E0503 (l used while mutably borrowed), and its value can be
+// read first.
+fn reads_root(a: i64, r: [u8], pcx: inout Ctx<Comp>) -> bool {
+    let e = arg_behind(a, pcx);
+    r.len > 0 && e > 0 && pcx.nodes[e].kind != NodeKind::Closure && pcx.nodes[e].ty > 0
+        && pcx.nodes[e].kind != NodeKind::Str
+        && mentions_word(pcx.nodes[e].start, pcx.nodes[e].end, r)
+        && crate::front::conv::copyable(pcx.nodes[e].ty, &pcx)
+}
+
 // Whether argument e is plain: its evaluation reads names only (a name,
 // a literal, a field of one, a borrow of one).
 fn plain_arg(a: i64, pcx: Ctx<Comp>) -> bool {
@@ -789,6 +1068,7 @@ fn hoist_args(c: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
         }
         let x = arg_behind(a, pcx);
         if at < 0 && x > 0 && pcx.nodes[x].kind == NodeKind::Ident
+            && pcx.nodes[x].end > pcx.nodes[x].start
             && is_mut_ref(crate::front::types::fn_param(f, k, pcx), pcx) {
             root = SRC[pcx.nodes[x].start..pcx.nodes[x].end];
             at = k;
@@ -797,11 +1077,26 @@ fn hoist_args(c: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     if at < 0 {
         return;
     }
-    // (the arguments after it that call with the root, and the last)
+    // (the arguments after it that call with the root, or read it (in a
+    // call of the program's own function, not a lowered print), and the
+    // last)
+    // (a call of the program's own function, whose root is written
+    // `&mut r`: rustc's two-phase reborrow of a reference `r` lets a later
+    // argument read it)
+    var own_fn = pcx.fns[f].node > 0 && editable(pcx.nodes[pcx.fns[f].node].start, &pcx);
+    if own_fn {
+        let ra = child(c, at, pcx);
+        let written = buf_new();
+        crate::tools::translate::rows::render(pcx.nodes[ra].start, pcx.nodes[ra].end, true, written,
+            pcx);
+        let w = buf_slice(written);
+        own_fn = w.len >= 5 && w[0..5] == "&mut ";
+    }
     var hoist = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     for k in at + 1..count {
         let a = child(c, k, pcx);
-        if pcx.nodes[a].end > pcx.nodes[a].start && calls_with(a, root, pcx) {
+        if pcx.nodes[a].end > pcx.nodes[a].start
+            && (calls_with(a, root, pcx) || own_fn && reads_root(a, root, &pcx)) {
             hoist.push(k);
         }
     }
@@ -836,7 +1131,8 @@ fn hoist_args(c: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
         }
     }
     let text = buf_new();
-    buf_bytes(text, "{ ");
+    let paren = leads_statement(c, tr, pcx);
+    buf_bytes(text, if paren { "({ " } else { "{ " });
     for q in 0..hoist.count {
         let k = hoist.get(q);
         let a = child(c, k, pcx);
@@ -868,7 +1164,7 @@ fn hoist_args(c: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     }
     put_first(s0, buf_slice(text), &tr, &pcx);
     // (right after the call, before what was put after it: a cast)
-    put_first(e0, " }", &tr, &pcx);
+    put_first(e0, if paren { " })" } else { " }" }, &tr, &pcx);
 }
 
 // (after the statics, mod.vl) A raw pointer's part, `p[a..b]`, is
@@ -1936,7 +2232,10 @@ fn edit_int_cast(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
 // would type by its own default or a later use, gets MVS's i64 as a
 // suffix, `1i64`: a value given to a type parameter (`Some(4)`,
 // `fold(0, ..)`, `Vec::from_in([1, 2], a)`), a generic struct's field
-// (`W { x: 7 }`), a range or literal receiver (`(0..n).map(..)`).
+// (`W { x: 7 }`), a range or literal receiver (`(0..n).map(..)`). (0.27.7,
+// T6) Also through a shift's left operand and an operator's left operand
+// whose right one is a literal tree, to a receiver: `(1 << n).wrapping_sub(1)`
+// is `(1i64 << n)..`, rustc's E0689 (and vole's type.infer) otherwise.
 fn edit_int_generic(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     if pcx.nodes[n].b != 0 || pcx.nodes[n].ty != TY_I64 {
         return;
@@ -1950,7 +2249,7 @@ fn edit_int_generic(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     var p = parent_of(n, tr);
     while p > 0 && (pcx.nodes[p].kind == NodeKind::Unary && SRC[pcx.nodes[p].start] == '-'
         || pcx.nodes[p].kind == NodeKind::Array || pcx.nodes[p].kind == NodeKind::Tuple
-        || pcx.nodes[p].kind == NodeKind::Range) {
+        || pcx.nodes[p].kind == NodeKind::Range || int_operand(c, p, pcx)) {
         c = p;
         p = parent_of(p, tr);
     }
@@ -2007,6 +2306,45 @@ fn generic_field(t: i64, name: i64, pcx: Ctx<Comp>) -> bool {
         }
     }
     false
+}
+
+// (edit_int_generic, T6) Whether c is the left operand of binary p whose
+// type it decides: a shift's, or an arithmetic operator's whose right
+// operand is a tree of literals.
+fn int_operand(c: i64, p: i64, pcx: Ctx<Comp>) -> bool {
+    if pcx.nodes[p].kind != NodeKind::Binary || pcx.nodes[p].b != c {
+        return false;
+    }
+    let op = pcx.nodes[p].op;
+    if op == Tok::Shl || op == Tok::Shr {
+        return true;
+    }
+    int_arith(op) && int_tree(pcx.nodes[p].c, pcx)
+}
+
+// Whether e is unsuffixed integer literals under signs and operators (a
+// shift by its left operand).
+fn int_tree(e: i64, pcx: Ctx<Comp>) -> bool {
+    let k = pcx.nodes[e].kind;
+    if k == NodeKind::Int {
+        return pcx.nodes[e].b == 0;
+    }
+    if k == NodeKind::Unary {
+        return SRC[pcx.nodes[e].start] == '-' && int_tree(pcx.nodes[e].b, pcx);
+    }
+    if k != NodeKind::Binary {
+        return false;
+    }
+    let op = pcx.nodes[e].op;
+    if op == Tok::Shl || op == Tok::Shr {
+        return int_tree(pcx.nodes[e].b, pcx);
+    }
+    int_arith(op) && int_tree(pcx.nodes[e].b, pcx) && int_tree(pcx.nodes[e].c, pcx)
+}
+
+fn int_arith(op: Tok) -> bool {
+    op == Tok::Plus || op == Tok::Minus || op == Tok::Star || op == Tok::Slash
+        || op == Tok::Percent || op == Tok::Amp || op == Tok::Pipe || op == Tok::Caret
 }
 
 // Whether c, a part of p, is at a generic position of p.

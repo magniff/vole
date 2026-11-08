@@ -85,8 +85,161 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.4 | `v0.27.4` | 0.27.3 | aarch64-macos | gate 3 opens (`fix --edition rust` on compiler/src: 122 type errors, 3,048 borrowck behind them); inference from a later statement (FL1); `[T]`/`str` unsized places (Z9.1c); `&raw` and Rust 2024's `static mut` rule; `format_args` a value; std2 1,445 of 1,473 tests at -O0; a rust hello world 2.03x MVS's |
 | 0.27.5 | `v0.27.5` | 0.27.4 | aarch64-macos | std2's `std::time`, `fs`, `process`, `cli` (gate 3 from 122 to 37 type errors); operands read where evaluated (D2.4a); text is not its bytes (F0.6); a generic iterator's item is its bound's (D4.6 f); std2 lexed by its units (a rust hello world 1.82x MVS's, the 2.0x ceiling enforced) |
 | 0.27.6 | `v0.27.6` | 0.27.5 | aarch64-macos | gate 3 has no type errors (76 borrowck left); std::gpu::wgsl in std2; a method in a generic body is the one it names (Z9.1c); const fn and constants made at each use; octal, `let ref`; a 0.27.5 wrong-output fix (constants' names) and an -O0 link fix |
+| 0.27.7 | `v0.27.7` | 0.27.6 | aarch64-macos | gate 3 is 0 (no type or borrowck error); SRC a view valid for the process, frozen buffers; the translator's last shapes; a copied/cloned iterator's items; two rust-edition wrong-value fixes (a let-bound literal shift typed i32) |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.27.7
+
+Gate 3 is 0. `fix --edition rust` on a copy of compiler/src type-checks
+and passes the borrow checker, with no error left (0.27.6: 76 borrowck
+errors). This is the state 0.28, the flip, starts from. SRC is a view
+valid for the process, a frozen buffer's views are static, the
+translator's last shapes (an index or an argument that calls with the
+root `&mut`, impl regions, out parameters of views, `&mut x` where a
+`*mut T` goes) are written as rustc takes them, and the front reads an
+adapter's items through the bound that names them. Two silent wrong
+values of 0.27.5 and 0.27.6 in the rust edition are fixed: a let-bound
+literal shift, and such a local closed by a cast, were typed `i32`. MVS
+programs compile exactly as before. Built and tested on aarch64-macos
+only.
+
+The front (front277), from the 0.28 flip rehearsal:
+
+- **A let-bound shift of a literal was typed i32 (a wrong value), in 0.27.5 and 0.27.6.** In the rust edition, `let bit = 1 << (l % 64);` then `v[w] | bit` with `v: Vec<i64>` took the literal as `i32` at the `let`, so the shift was `1 << (l % 32)`. The same went for `let min = (0 - 1) << (bits - 1);` passed as an `i64` (it was `i32`'s minimum). No error was reported. A shift's left operand now decides its type and stays open until a later use fixes it, as rustc infers it (F18.5); so does `!` of a literal (`let a = !0;` then a `u64`). Cases `rust_f_f185_shift_open`, `rust_f_f185_shift_open_err`.
+- **A cast of such a local also typed it i32 (a wrong value).** `let max = (1 << bits) - 1;` then `if value >= max as f64 { return max; }` in a function returning `i64` closed `max` at the cast, so `clamp(40, ..)` returned 255. A cast's operand now leaves the local open, as rustc's does, and the later `return max` types it. An integer type's own method on such a local, `max.count_ones()`, is error `type.infer` (rustc's E0689), as on the literal itself. Cases `rust_f_f185_cast_open`, `rust_f_f185_local_method_err`.
+- An integer type's own method on a literal, `(1 << s).wrapping_sub(1)` or `2.pow(2)`, is error `type.infer` (rustc's E0689). Before, it was `i32`'s method: `1 << 40` became `1 << 8`, silently. A trait's method there (`5.max(3)`, `3.clone()`) is still `i32`'s, as rustc's. Cases `rust_f_f185_literal_method_err`, `rust_f_f185_literal_method_ok`.
+- `&mut *P` of a `static mut P: *mut T`, a reference through the pointer the static holds, is accepted, as rustc 2024 accepts it. So are `&mut *S.1` and an autoref through `(*Q)`. 0.27.6 refused these as `borrowck.static_mut_ref` (D6.2.5). Case `rust_b_ok_static_mut_ptr_deref`.
+- The items of `v.iter().copied()` (and `.cloned()`) of a `Vec<&'a str>` are the `&'a str`s the vector holds. 0.27.6 tied them to the borrow of `v`, so `first(args.iter().copied())` returning one was `borrowck.return_local`, which rustc accepts. Copied's `type Item = T;` is now read through its bound `I: Iterator<Item = &'a T>` (D4.6 (h)). Cases `rust_b_ok_copied_items`, `rust_b_copied_items_err`.
+
+The translator: an integer method called on literals, `(1 << n).wrapping_sub(1)` or `(2 + 3).pow(2)`, gets its leftmost literal suffixed with MVS's `i64` (`1i64 << n`, T6). The receiver otherwise has no type in the rust edition, the error above. That error added two to gate 3 (compiler/src's `logical_imm` and the egraph's random constants); with this row, gate 3 is back at 0 type errors, and its borrowck count drops to 75, since the `static mut` change accepts `&mut *A_CTX`. Transcript `tests/refactor/edition0277t6`, case `rust_t_literal_receiver` (rustc builds it and prints the same).
+
+The bootstrap: the fixpoint's last build, the one compared with the build before it, is made without the code cache (`--no-cache`); the builds before it use the cache as before. A code cache entry made one function's register schedule differ from a cold build's in the compiler's own self-compile: a tree that held it failed the fixpoint (head built by head, cached, against the cold path), and a tree whose two builds both took it would have passed with a binary no clean build makes. Now such an entry is a failed fixpoint. It costs about 1.6 s on `bootstrap.sh --dev --no-suite` (9.4 to 11.0 s, warm, under load). chain-diverse, whose builds all have the cache off, also builds the head compiler with it on in a cache of its own, storing and then taking every entry, and compares both with the cold build. The cache bug itself is being chased.
+
+That entry turned out to be a cold build's: the first self-compile by the new head, with an empty cache, made `tools.lsp.answer.find_operators` with three more blocks. Its key and all 120 of its recorded reads were the same as a clean build's, and no build since has made it again (some 80 cold builds, 30 of them in a row under load). The cache only kept it, so later builds repeated it. One way a cold build could depend on the schedule is now closed. Passes check instruction and block marks against stamps of their thread's context, and every context counts those stamps from the same base. A mark left by the function's task in another context, or installed from the cache, could equal the next stamp. Each task now zeroes its functions' marks as it begins (`middle::parallel::clear_marks`). The self-compile's output is unchanged, and its cost is the same (compile_cost 1.00x).
+
+
+The front (front273):
+
+- A projection whose impl's value is a projection itself is normalized
+  again (D4.6 (g)). `type Item = I::Item;` of Skip is normalized again
+  through Skip's header, so `fn pass<J: Iterator>(it: &mut J) ->
+  Option<J::Item>` with `J = Skip<Split<char>>` gives Split's `&'a str`,
+  a borrow of the text. Two live `pass(&mut it)` items are no longer
+  borrowck.mut_twice. L14's ties read the same way, so a closure over
+  `Chain<..>::Item` (`a.iter().chain(b.iter()).map(|x| ..)`) is tied as
+  the callee is.
+- A template whose opaque instance has borrowck errors reports only
+  those, as rustc does (D4.4 (e)). Its concrete instances with regions
+  hold their errors until every body is solved. 0.27.6 also reported
+  `mixed<Split<char>>`'s copy of the template's `'b must outlive 'a`,
+  at the `let`, in terms of Split's lifetime.
+- std2's `[T]` hash calls `Hash::hash_slice(self, state)`, as Rust's
+  does, with Self taken from the argument (F8.2): an element type's own
+  hash_slice runs. 0.27.6 called `T::hash_slice`.
+- A `&T` given where a `*mut T` goes, the written type of a parameter,
+  a `let`, a struct literal's field, the function's result (its tail or
+  a `return`) or an assigned place (`p = &x`, `s.p = &x`, `*pp = &x`),
+  is rustc's E0308 (D3.6a): the types differ in
+  mutability, `try: &mut x`. `&mut T` still coerces to both raw
+  pointers, and `&T` to `*const T`. 0.27.6 accepted it, so a callee
+  could write through a pointer made from a shared borrow.
+- A literal beside a value an earlier error left untyped takes the
+  error type, so it gets no second error (F18.3). 0.27.6 checked it
+  against the i32 fallback: `let value = parse("x")` was a mismatch,
+  and `value > 9223372036854775807` then reported "does not fit in
+  type 'i32'" too. rustc reports only the mismatch.
+
+The compiler's own source (gate 3, front273):
+
+- Views of storage other than SRC are made so that no view outlives a
+  write it could see. modules' `joined` is read where it is consumed;
+  linkfail's `root_path`, conflicts' `path_of` and query's
+  `bad_item_kind` view their C strings, not pcx or tcx; link_macho's
+  `sym_name` only reads the link. Gate 3: 76 to 67 borrowck errors.
+- A buffer written for the last time is frozen (`buf_done`,
+  `buf_freeze`): base's writers stop with an internal error if it is
+  written again, so its bytes are valid for the process.
+  lsp/complete's signatures and snippets, embed's type names and
+  positions, arch's intrinsic table and the tools' cache's read buffer
+  are frozen. `volec __selftest freeze` checks the stop
+  (tests/selftest.sh).
+- The translator reads a frozen buffer's views as SRC's: base's
+  `buf_done`, arch's `text` and `intr_text` and the tools' cache's
+  `get_str` are rows of static_result's list, each with its evidence,
+  and static_returns carries them to what returns them (lsp/complete's
+  `signature`, `call_snippet`, `mod_detail`; embed's `embed_type_name`
+  and `file_line_text`) and to their callers
+  (tests/refactor/edition0277b). Gate 3: 52 to 17 borrowck errors.
+
+The translator (g3274; flip28's T2 to T5, its rehearsal's hand fixes):
+
+- An index that calls with the indexed container's root `&mut`,
+  `pcx.types[place_ty(l, p, pbody, pcx)].kind`, is computed first,
+  `{ let at_ix = place_ty(..); pcx.types[at_ix] }.kind`, around the
+  element's first copied value (Rust's Index borrows the container
+  before the index: rustc E0502; T3). An argument that reads the root
+  another argument gives as `&mut r`, `name(&mut l, l.imports[i])`, is
+  read first (rustc E0503; a reference `r` reborrowed is two-phase and
+  stays; T4). A hoisted block that would lead a statement is
+  parenthesized, `({ .. }) > 0 && ..` (tests/refactor/edition0276e,
+  tests/run/rust_t_hoist_read).
+- An inherent impl of a struct with views names its region, `impl<'a>
+  Line<'a>`; a method's result with views and no reference to borrow
+  from (a receiver by value, or none) is `'a`, and so are the views it
+  takes and may store: `fn word(self, k) -> &'a str`, `fn new(opts:
+  Vec<Opt<'a>, A>, word: &'a str) -> Leaf<'a, A>` (T5;
+  tests/refactor/edition0276f, tests/run/rust_t_impl_region).
+- A pointer to views a function takes as an out parameter and sets to a
+  part of a view parameter (or to a local each of whose values is one),
+  `*message = text`, is tied to it: `fn error_offset<'a>(line: &'a [u8],
+  .., message: *mut &'a [u8])` (T2; tests/refactor/edition0276g,
+  tests/run/rust_t_out_view).
+- An address given where a raw pointer goes is one rustc takes for a
+  `*mut T`, as the rust edition does since D3.6a (rustc coerces a `&T`
+  only to a `*const T`, E0308): a mutable place's is `&mut x` (a
+  `var`'s, a `var` array's element, a part of what a raw pointer or a
+  `&mut` points to, `&mut cx.inst_cap`); a `let`'s or a by-value
+  parameter's is `&mut x` too, its binding made `mut` (`let mut k`, `fn
+  twice(mut n: i64)`), since the callee may write through the pointer
+  (a write through one made from `&raw const k` would be undefined); a
+  static's, or a place behind a shared reference, keeps its `&`. With front273's
+  D3.6a, gate 3's 120 such sites go to 0 (tests/refactor/edition0277r,
+  tests/run/rust_t_raw_address).
+- static_returns takes two more static values: a call of a function
+  every result of which is a part of one view parameter, given a static
+  value there (rows' `owner_name`, `base_name(sym_text(..))`), and a
+  local bound in a tuple pattern each of whose values is static
+  (sealed016's `let (text, method) = if .. { ("len()", ..) } ..`).
+  format's `fixed_literal` and the lexer's `label_line` end with
+  `buf_done`, mentions' `owner_name` returns `""`, not `c_slice(c"")`.
+  Gate 3: 9 to 3, cli/line's `args.iter().copied()`, a front gap
+  (tests/refactor/edition0277s, tests/run/rust_t_static_parts).
+
+The sources (g3274, docs/design/src-buffer.md):
+
+- SRC is a view of one region per source set, reserved by mmap
+  (MAP_NORESERVE: address space, committed when written; 4 GiB,
+  VOLE_SRC_CAP for a run) and never moved, unmapped or written again
+  where SRC has been given it: appends copy past its end, a new set
+  takes a new region, and fmt's read_pieces lexes a copy in a region of
+  its own. A view of SRC is valid for the rest of the process, so the
+  rust edition's `static mut SRC: &'static [u8]` holds a `'static`
+  value. A reservation mmap refuses, or a set past its capacity, stops
+  the compiler with an error (tests/refactor/srccap), never a null SRC.
+  mmap's flags are Darwin's or Linux's by std::TARGET_OS; std2's
+  rt/sys_macos.vl and sys_linux.vl hold MAP_ANON, MAP_NORESERVE and
+  TARGET_OS (`std::TARGET_OS` in the rust edition). Compile cost the
+  same (check 8496.9 to 8464.6 M instructions), the stress-grow
+  self-compile the same object, x86_64-macos's objcheck 4 of 4.
+- The translator's static_returns: a function whose every returned
+  value is static has a `'static` result: a text literal, a call of a
+  function with a `'static` result (static_result's list, or one such
+  itself), a local each of whose `let`s is one, a range of one or of
+  base::SRC, an `if` or a block of them (`tok_text`, `node_text`,
+  `src(pcx)`, `file_bytes`, `src_text`, `flag_prefix`;
+  tests/refactor/edition0276c). It takes in static_forward (a body that
+  is one such call). Gate 3: 76 to 63.
 
 ### What's new in 0.27.6
 
