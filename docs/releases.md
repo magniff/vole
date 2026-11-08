@@ -86,10 +86,154 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.5 | `v0.27.5` | 0.27.4 | aarch64-macos | std2's `std::time`, `fs`, `process`, `cli` (gate 3 from 122 to 37 type errors); operands read where evaluated (D2.4a); text is not its bytes (F0.6); a generic iterator's item is its bound's (D4.6 f); std2 lexed by its units (a rust hello world 1.82x MVS's, the 2.0x ceiling enforced) |
 | 0.27.6 | `v0.27.6` | 0.27.5 | aarch64-macos | gate 3 has no type errors (76 borrowck left); std::gpu::wgsl in std2; a method in a generic body is the one it names (Z9.1c); const fn and constants made at each use; octal, `let ref`; a 0.27.5 wrong-output fix (constants' names) and an -O0 link fix |
 | 0.27.7 | `v0.27.7` | 0.27.6 | aarch64-macos | gate 3 is 0 (no type or borrowck error); SRC a view valid for the process, frozen buffers; the translator's last shapes; a copied/cloned iterator's items; two rust-edition wrong-value fixes (a let-bound literal shift typed i32) |
+| 0.27.8 | `v0.27.8` | 0.27.7 | aarch64-macos | open integer locals one variable (a wrong-value fix); a unit-only enum's derives by its discriminant (rustc's order and hash; one compare); three data races of released compilers fixed; `&mut` to raw pointer reborrowed, fat raw pointer coercions |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.28.0
+
+The places IR (sc280):
+
+- **A condition's `&&` and `||` are control flow.** In `if`, `while`, a
+  match guard and a `!` of one, the rust edition now branches on each
+  operand in turn: `a && b` sends `a`'s false edge to the else branch
+  and its true edge to `b`, and `!` swaps the targets (places::build
+  cond_into). MVS's lowering and rustc's MIR do the same. 0.27.8 made
+  the bool first, assigned on each path, then branched on it: a phi and
+  a branch the optimizer did not thread, at every such `if` and `while`.
+  In the flipped compiler that was most of what remained of its gap to
+  the MVS build, after derive278: ir_val, a `while r != 0 && ..` loop,
+  was 168 bytes against 104 and was no longer inlined, and form_lcssa
+  and simplify_cfg were four to five times their MVS size. With it, the
+  flipped compiler on the MVS tree took 9.04 G instructions to check
+  (9.74 G before) and 99.4 G to build itself (108.5 G), against 8.55 G
+  and 96.4 G for the MVS build. A `let`'s `a && b`, a value, is built as
+  before.
+  *Cases:* `rust_f_short_circuit_ir` (no phi in an `if` of `&&`, `||`
+  and `!`), `rust_f_short_circuit_order` (a rustc twin: the operands'
+  effects in order, the right one only when the left does not decide).
+  An MVS body keeps its own lowering, which its optimizer if-converts
+  (opt_ord_select's branch-free sift).
+- **Each operand of `&&` and `||` is a terminating scope** (scope280),
+  as in rustc. An operand's temporaries are dropped before the other
+  operand runs, both in a condition and in a value (`let v = a && b`).
+  0.27.8 dropped them at the end of the condition or the statement, so
+  `l.lock().a() > 0 && l.lock().b() > 1` held both guards at once, a
+  deadlock with a real lock. In a condition, an operand's value is kept
+  in a temporary, its scope ends, and only then does the branch read
+  it. *Case:* `rust_f_short_circuit_drops`, a rustc twin with 47 lines
+  of drop order: `if`, `while`, a match guard, `!`, `let` values, and
+  two guards of one lock.
+
+std2 (sc280b):
+
+- **`Vec::push` is inline.** Its `ensures` clauses made every push a
+  call of `push$body`, out of line. They are `debug ensures` now, which
+  `volec test` checks. The fast path is a compare, one copy of the
+  element into its slot and an increment, and the growth is
+  `grow_one`, out of line. The flipped compiler's check of its own tree
+  went from 51.5 G instructions to 47.6 G.
+- `ptr::read` and `ptr::write` are `#[inline]`, as rustc's are. A copy
+  of a large element was a call; measured alone, the gain is in the
+  noise.
+
+The translator and the migration of tests/run (mig28):
+
+- **tests/run's MVS cases move to the rust edition.** Of 2873 cases
+  without `// EDITION: rust`, 1777 are translated by `fix --edition
+  rust` and kept where they pass at -O0 and -O2. An error case's
+  `ERROR` lines name the rust edition's code at the translation's
+  position; an ownership case is kept only where rustc rejects it too
+  (the borrowck twin). 68 are deleted: rustc accepts them, or they pin
+  MVS-only behaviour. The rest wait on the translator, the front and
+  std2.
+- **`collect_in`'s turbofish names both type arguments.** std2's
+  collect_in takes the collection and the allocator; `fix --edition
+  rust` wrote `collect_in::<Vec<_, _>>(a)`, one of the two. Where the
+  value goes to a written type (a let's annotation, the function's
+  result: rewrite.tsv's new `use=typed` condition) the call is
+  `collect_in(a)`; elsewhere `collect_in::<C, _>(a)`, with C, the
+  collection, in full (rewrite.tsv's `$T`), because the front does not
+  infer a `Vec<_, _>` from FromIteratorIn's impls.
+  *Transcript:* `tests/refactor/edition0280m1`.
+- The borrowck twin checks type-error cases: an `ERROR` naming no
+  borrowck code agrees with a rustc rejection by a code the borrowck
+  table does not map (E0308, E0277). The shim's `collect_in` takes two
+  type arguments.
+
+Two crashes in the rust edition (crash280):
+
+- **`#[thread_local] static mut` works.** std2 had no
+  `std::thread::__tls_addr`, which the compiler calls for every access
+  of a thread-local. An executable build stopped with "internal error: a
+  thread-local without std::thread", and an object build crashed. std2's
+  thread module now has it, kept the same way MVS std's is: C's
+  thread-specific data, with one key per thread-local found by its
+  initial value's address in a lock-free table, and each thread's copy
+  made from the initial value at that thread's first access and freed
+  when the thread ends. A program that writes `thread_local` asks the
+  lazy std2 build for `__tls_addr`, since no source names it. *Case:*
+  `rust_f_thread_local_std2` (two scoped threads and main, each with its
+  own copy).
+- **A `&mut` given to a C variadic's `...` is moved**, as in rustc.
+  Nothing there coerces it, so it is not reborrowed. 0.27.8 copied it,
+  and `--verify-places` refused the body (I7). A later use is
+  `borrowck.use_moved` (rustc E0382, checked by hand, since the twin
+  tools skip an `extern` block), and its `try:` is the reborrow `&mut
+  *r`, not `.clone()`. *Cases:* `rust_b_variadic_mut_ref` (with
+  `--verify-places`; sscanf writes through it),
+  `rust_b_variadic_mut_ref_moved_err`.
+
+The borrow checker (sound280): three gaps that accepted programs rustc
+rejects and that used memory after it was freed (mig28's soundness
+group, 12 cases of the views audit):
+
+- **A statement's temporaries end with the statement.** A `let` kept
+  its initializer's temporaries to the block's end whenever its type
+  was a view. Now, as rustc's rule, only an extending initializer keeps
+  them: `&e`, or a tuple, array, braced struct or cast of one. `let w =
+  v[0].clone().as_str();` borrows a temporary that is dropped at the
+  `;`, and a later use of `w` is `borrowck.dropped_borrowed`, "a temporary value
+  is dropped at the end of its statement" (rustc E0716). *Cases:*
+  `rust_b_temp_dropped_err`, `rust_b_temp_extended_ok`.
+- **A static's slots are `'static`.** A `static mut` of a reference
+  had a free region, so storing a local's borrow there was accepted,
+  directly or through a function. It is `dropped_borrowed` (E0597) now,
+  or `outlives` through a parameter (E0521). *Cases:*
+  `rust_b_static_holds_local_err`, `rust_b_static_holds_static_ok`.
+- **An array's elements have regions.** An array of references had
+  none, so its loans ended at once, and a write to what they borrow was
+  accepted (E0502 in rustc). *Cases:* `rust_b_array_of_refs_err`,
+  `rust_b_array_of_refs_ok`. `rust_b_err_dk_array_glue` passes now
+  (no XFAIL).
+- Gate 3 found one true positive in the flipped tree. `base::src_copy`'s
+  result was tied to its parameter and stored into `SRC`, which is
+  `&'static`. The copy is in a mapping of its own that is never
+  unmapped or written again, so the translator now lists it as a
+  `'static` result (translate/sig.vl static_result). std2-check and
+  gate 3 are both at 0 errors, as before.
+- Known gap: there is no rvalue static promotion yet (D6.2.2). `&7` and
+  `[&7]` have the body's storage, not `'static`, so
+  `rust_b_unsized_err_raw_slice_invariant` borrows a static instead.
+
 ### What's new in 0.27.8
+
+The last release before the flip, and the compiler that builds 0.28.0.
+Two wrong-value fixes in the rust edition: an open integer local
+(`let c = a;`, `let b = a + 1;`, `s += x`, a loop over literals) is one
+variable with the literals it is built from, typed by the use that types
+it, as rustc's `{integer}`; 0.27.7 closed it at `i32` and widened it
+later, a silent wrong value past 2^31. And the derives of a unit-only
+enum order and hash by its written discriminants, as rustc does. The
+derives of a unit-only enum compare its tag, one compare, which the
+flipped compiler needs (it was 5x slower without). Three data races of
+released compilers, found by a review of the compiler's statics for the
+flip, are fixed: -O0's assembler thread read the buffer table the main
+thread could grow, the assembler's internal error grew it, and two
+-O2 tasks could touch FN_ATTRS_DONE and the code cache's use marks
+unordered. A `&mut T` given where a raw pointer goes outside a call is
+reborrowed, and views coerce to fat raw pointers. MVS programs compile
+exactly as before. Built and tested on aarch64-macos only.
 
 The front (f185x):
 
@@ -110,6 +254,36 @@ The front (f185x):
   a `[u8]`), which rustc refuses too (E0308).
   *Cases:* `rust_f_f185_open_leaves`, `rust_f_f185_open_compare`,
   `rust_f_f185_open_loops`, `rust_f_f185_open_format`.
+
+Derives (derive278, a flip blocker):
+
+- **A unit-only enum's derives compare its tag.** 0.27.7's rust-edition
+  `#[derive(PartialEq)]` on an enum matched the pair, `match (self,
+  other) { (A, A) => true, .. _ => false }`: a compare and branch per
+  variant, inlined at every `==`. The translator derives `Clone, Copy,
+  PartialEq, Eq` on the compiler's enums, so the flipped compiler
+  spent most of its time in `Tok`'s and `NodeKind`'s `==`: `volec
+  check` of the MVS tree took 43.2 G instructions, against 8.6 G built
+  from MVS. Now a unit-only enum that derives Copy compares, orders and
+  hashes `*self as isize`, rustc's discriminant_value, as one load and
+  one compare. Its `ne`, `lt`, `le`, `gt` and `ge` are derived too, all
+  inline. A Copy type without type parameters clones by `*self`. Any
+  other enum compares the variants' indexes first, then matches only the
+  variants with fields (`_ => true`), as rustc's derive does. MVS's
+  derives do the same for an enum with fields: on a mixed-enum `==` loop,
+  234M instructions to 74M. The flipped compiler on the MVS tree now
+  takes 9.74 G to check and 108.5 G to build itself (343 G before),
+  against 8.55 G and 96.4 G built from MVS. The rest of that gap is not
+  the derives: the rust edition's lowering makes `a && b` in a condition
+  a bool phi, where MVS branches.
+  *Case:* `rust_f_derive_discriminant_ir` checks the IR's single compare.
+- **The derives agree with rustc on written discriminants.** cmp, `<`
+  and Hash of a unit-only enum use its written discriminants (`enum K {
+  A, B = 5, C, D = -3 }` orders D first), with or without Copy, and an
+  enum of one variant hashes no index. 0.27.7 used the declaration
+  index, so its order and its hash values differed from rustc's.
+  *Case:* `rust_f_derive_discriminant`, a rustc twin, including
+  DefaultHasher values.
 
 Threads (races278, the statics review's races, all in released
 compilers):

@@ -12,6 +12,10 @@
 #           case, tests/run/rust_t_iter_for_sources.vl (the borrow
 #           checker's whole cost on it, against 0.27.0's unchecked
 #           regions), at most 1.5x
+#   regions (0.27.8) `volec check` of tests/cost/regions_heavy.vl, many
+#           calls of functions on structs with lifetimes (a callee's
+#           signature, read at each call, reads its types' declared and
+#           inferred bounds: made once per type), at most 1.5x
 #
 # and (0.27.2) two of the rust edition on std2, with this compiler only
 # (the previous release has no std2), against its own MVS rows above:
@@ -57,6 +61,7 @@ trap 'rm -rf "$W"' EXIT
 printf 'fn main() {\n    println("hello");\n}\n' >"$W/hello.vl"
 cp "$ROOT/tests/cost/std_heavy.vl" "$W/std_heavy.vl"
 cp "$ROOT/tests/cost/rust_heavy.vl" "$W/rust_heavy.vl"
+cp "$ROOT/tests/cost/regions_heavy.vl" "$W/regions_heavy.vl"
 printf '// EDITION: rust\nfn main() {\n    println("hello");\n}\n' >"$W/hello_rust.vl"
 cp "$ROOT/tests/cost/std2_heavy.vl" "$W/std2_heavy.vl"
 mkdir -p "$W/src"
@@ -133,6 +138,7 @@ VOLE_STD2=0
 export VOLE_STD2
 measure rust 1.5 check rust_heavy.vl
 unset VOLE_STD2
+measure regions 1.5 check regions_heavy.vl
 measure_edition hello-rust 2.0 1.5 1 "$hello_new" hello_rust.vl -c -o hello_rust.o
 measure_edition std-rust 2.0 1.5 1 "$std_new" std2_heavy.vl -c -o std2_heavy.o
 if [ $FAILED -ne 0 ]; then
@@ -142,5 +148,5 @@ fi
 if [ -n "$OVER" ]; then
     echo "compile-cost: within the bounds enforced now; over the ceiling enforced from 0.27.5:$OVER"
 else
-    echo "compile-cost: hello, std, check, rust, hello-rust and std-rust within the bounds"
+    echo "compile-cost: hello, std, check, rust, regions, hello-rust and std-rust within the bounds"
 fi

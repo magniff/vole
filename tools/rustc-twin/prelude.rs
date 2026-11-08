@@ -138,7 +138,9 @@ mod vole_twin_prelude {
 
     // `it.collect_in(a)`, `it.unzip_in(a)`, `it.partition_in(f, a)`
     pub trait CollectIn: Iterator + Sized {
-        fn collect_in<B: FromIterator<Self::Item>>(self, _: Gpa) -> B { self.collect() }
+        // (two type arguments, std2's: the collection and the allocator,
+        // `collect_in::<Vec<T, Gpa>, _>(gpa)`)
+        fn collect_in<B: FromIterator<Self::Item>, A>(self, _: A) -> B { self.collect() }
         fn unzip_in<X, Y, FX: Default + Extend<X>, FY: Default + Extend<Y>>(self, _: Gpa) -> (FX, FY)
         where
             Self: Iterator<Item = (X, Y)>,

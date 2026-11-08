@@ -35,8 +35,11 @@
 # rustc's first `error[E0xxx]` (or its first error without a code, by its
 # message) maps to a borrowck code by the table below (docs/design/
 # borrowck.md §14.1's rustc column); a rejection must
-# map to the case's code. A case that diverges from rustc on purpose says
-# so, with a class of docs/design/borrowck.md's divergences:
+# map to the case's code; (0.28.0) a case whose ERROR lines name no
+# borrowck code (a type error, `?other`) agrees with a rejection whose
+# first code is none of the table's (E0308, E0277: `?E0308`). A case that
+# diverges from rustc on purpose says so, with a class of docs/design/
+# borrowck.md's divergences:
 #   // RUSTC: accepts CLASS why    (the case is rejected, rustc accepts it)
 #   // RUSTC: rejects CLASS why    (the case is accepted, rustc rejects it)
 # CLASS one of R1-R19 (vole more permissive, or R8's Box) and L1-L19 (vole
@@ -184,6 +187,10 @@ for case_ in "$@"; do
     msg=$(awk '/^error/ && !/^error: aborting/ { print; exit }' "$WORK/out" | cut -c1-120)
     if [ -z "$want" ]; then wantv=accept; else wantv=reject; fi
     if [ "$got" = "$wantv" ] && [ -z "$mark" ]; then
+        # (0.28.0: a type error against a code the table does not map)
+        if [ "$want" = "?other" ] && [ "${gotcode#\?}" != "$gotcode" ]; then
+            gotcode="?other"
+        fi
         if [ $got = reject ] && [ "$gotcode" != "$want" ]; then
             echo "FAIL $name: both reject, but rustc's $first is borrowck.$gotcode, the case's borrowck.$want: $msg"
             FAILN=$((FAILN + 1))

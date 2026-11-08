@@ -777,7 +777,7 @@ fn shared_place(e: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
         as_place(e, &pbody, &pcx);
         return;
     }
-    let l = new_local(pcx.nodes[e].ty, LF_TEMP, -1, e, &pbody);
+    let l = new_local(pcx.nodes[e].ty, LF_TEMP | crate::places::ir::LF_PROMOTED, -1, e, &pbody);
     // (its storage ends with the body: D6.2.2 refuses a loan of it that
     // leaves the function)
     schedule_in(0, EN_DEAD, l, pbody, &pcx);
@@ -1109,7 +1109,15 @@ fn lower_binary(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ct
         let tl = if once { new_temp(pcx.nodes[pcx.nodes[e].b].ty, e, false, &pbody, &pcx) }
             else { dl };
         let tp = if once { 0 } else { dp };
+        // RULE: D8.1 (0.28.0, a rust body) each operand is a terminating
+        // scope, as rustc's: its temporaries drop before the other one
+        // is evaluated (`a.lock().x && a.lock().y` holds one guard at a
+        // time); 0.27.8 dropped them at the statement's end
+        let sa = if once { push_scope(SC_STMT, pcx.nodes[e].b, true, &pcx) } else { -1 };
         expr_into(pcx.nodes[e].b, tl, tp, &pbody, &pcx);
+        if once {
+            pop_scope_at(sa, &pbody, &pcx);
+        }
         if !reachable(pbody) {
             return;
         }
@@ -1131,7 +1139,11 @@ fn lower_binary(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ct
             goto(done, &pbody);
         }
         enter_block(rhs, &pbody);
+        let sb = if once { push_scope(SC_STMT, pcx.nodes[e].c, true, &pcx) } else { -1 };
         expr_into(pcx.nodes[e].c, dl, dp, &pbody, &pcx);
+        if once {
+            pop_scope_at(sb, &pbody, &pcx);
+        }
         if reachable(pbody) {
             goto(done, &pbody);
         }
@@ -1210,6 +1222,74 @@ fn switch_bool(at: i64, f: i64, t: i64, node: i64, pbody: inout Body<Comp>) {
     pbody.targets.push(0);
     pbody.targets.push(f);
     terminate(TK_SWITCH, ti, 1, t, at, 1, node, &pbody);
+}
+
+// (0.28.0) Whether condition `c` of a rust body is a short-circuit, `a &&
+// b`, `a || b` or a `!` of one, which cond_into makes control flow. (An
+// MVS body keeps its own lowering, `a`'s value and then `b`'s written to
+// the destination, which its optimizer if-converts: opt_ord_select's
+// branch-free sift loses its `sel` as control flow.)
+fn short_circuit(c: i64, pcx: Ctx<Comp>) -> bool {
+    if !pcx.rust_body {
+        return false;
+    }
+    let k = pcx.nodes[c].kind;
+    let op = pcx.nodes[c].op;
+    if k == NodeKind::Binary {
+        return op == Tok::AmpAmp || op == Tok::PipePipe;
+    }
+    k == NodeKind::Unary && op == Tok::Bang && short_circuit(pcx.nodes[c].b, pcx)
+}
+
+// (0.28.0) Condition `c` as control flow: false to `f`, true to `t`. A
+// short-circuit branches on each operand in turn (`a && b`: `a` false to
+// `f`, else `b`; `!` swaps the targets), as MVS's lowering and rustc's
+// MIR build it; any other condition is an operand switched on. 0.27.8
+// made `a && b` a bool, assigned on each path, then switched on: a phi
+// and a branch the optimizer did not thread, at every `if` and `while`
+// with `&&` of the rust edition. The blocks it makes are entered here;
+// `f` and `t` are the caller's to enter.
+fn cond_into(c: i64, f: i64, t: i64, node: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let k = pcx.nodes[c].kind;
+    let op = pcx.nodes[c].op;
+    if k == NodeKind::Binary && (op == Tok::AmpAmp || op == Tok::PipePipe) {
+        let mid = new_block(&pbody);
+        if op == Tok::AmpAmp {
+            cond_into(pcx.nodes[c].b, f, mid, node, &pbody, &pcx);
+        } else {
+            cond_into(pcx.nodes[c].b, mid, t, node, &pbody, &pcx);
+        }
+        enter_block(mid, &pbody);
+        cond_into(pcx.nodes[c].c, f, t, node, &pbody, &pcx);
+        return;
+    }
+    if k == NodeKind::Unary && op == Tok::Bang && short_circuit(pcx.nodes[c].b, pcx) {
+        cond_into(pcx.nodes[c].b, t, f, node, &pbody, &pcx);
+        return;
+    }
+    if pcx.rust_body && !quiet_expr(c, pcx) {
+        // RULE: D8.1 (0.28.0) an operand of `&&` or `||` is a terminating
+        // scope: its value kept, its temporaries dropped, then the branch
+        let tl = new_temp(pcx.nodes[c].ty, c, false, &pbody, &pcx);
+        let s = push_scope(SC_STMT, c, true, &pcx);
+        expr_into(c, tl, 0, &pbody, &pcx);
+        pop_scope_at(s, &pbody, &pcx);
+        if !reachable(pbody) {
+            return;
+        }
+        let at = ops_mark(pbody);
+        set_op(OK_COPY, tl, 0, &pcx);
+        push_now(&pbody, pcx);
+        switch_bool(at, f, t, node, &pbody);
+        return;
+    }
+    operand(c, false, &pbody, &pcx);
+    if !reachable(pbody) {
+        return;
+    }
+    let at = ops_mark(pbody);
+    push_now(&pbody, pcx);
+    switch_bool(at, f, t, node, &pbody);
 }
 
 fn goto(b: i64, pbody: inout Body<Comp>) {
@@ -1491,7 +1571,9 @@ fn lower_call(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<
     for i in 0..pcx.nodes[n].count {
         let arg = child(n, i, pcx);
         let mode = if f >= 0 { param_mode(f, i, pcx) } else { arg_mode_of(arg, pcx) };
-        lower_arg(i, arg, mode, c_callee || pre, &pbody, &pcx);
+        // (an argument past a C function's parameters: its `...`)
+        let variadic = c_callee && !pre && i >= pcx.fns[f].param_count;
+        lower_arg(i, arg, mode, c_callee || pre, variadic, &pbody, &pcx);
         if pre && pcx.opk == OK_COPY && !has_flag(pcx.opa, LF_BORROWED, pbody)
             && type_glue(pcx.nodes[arg].ty, &pcx) {
             let t = new_temp(pcx.nodes[arg].ty, arg, true, &pbody, &pcx);
@@ -1618,7 +1700,7 @@ fn arg_mode_of(arg: i64, pcx: Ctx<Comp>) -> i64 {
 }
 
 // Argument i (node arg) of call n: its operand (OPK..).
-fn lower_arg(i: i64, arg: i64, mode: i64, c_callee: bool, pbody: inout Body<Comp>,
+fn lower_arg(i: i64, arg: i64, mode: i64, c_callee: bool, variadic: bool, pbody: inout Body<Comp>,
     pcx: inout Ctx<Comp>) {
     let k = pcx.nodes[arg].kind;
     let temp = k == NodeKind::Block && own_temp_block(arg, pcx) && own_temp_addr(arg, pcx);
@@ -1688,6 +1770,16 @@ fn lower_arg(i: i64, arg: i64, mode: i64, c_callee: bool, pbody: inout Body<Comp
     // only reads it: a raw or C parameter, a view)
     let moving = mode == P_VALUE && !c_callee;
     arg_operand(arg, moving, &pbody, &pcx);
+    if variadic && pcx.rust_body && pcx.opk == OK_COPY && is_place_expr(arg, pcx) {
+        // RULE: D3.6 (0.28.0) a `&mut T` place given to a C variadic's
+        // `...` is moved, as rustc's: no parameter type makes the argument
+        // a coercion site, so it is not reborrowed (a later use is
+        // borrowck.use_moved, rustc's E0382). 0.27.8 copied it (I7).
+        let vt = undistinct(place_type(pcx.opa, pcx.opb, pbody, &pcx), pcx);
+        if vt > 0 && pcx.types[vt].kind == TyKind::Ptr && pcx.types[vt].b == REF_MUT {
+            pcx.opk = OK_MOVE;
+        }
+    }
     // (the place's own type: the argument's is the parameter's after a
     // coercion, `&T` of a `&mut T`)
     let place = pcx.rust_body && !c_callee && is_place_expr(arg, pcx)
@@ -1878,17 +1970,27 @@ fn lower_if(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Co
         }
         return;
     }
-    operand(pcx.nodes[n].a, false, &pbody, &pcx);
-    if !reachable(pbody) {
-        return;
-    }
-    let then_b = new_block(&pbody);
     let has_else = pcx.nodes[n].c != 0;
-    let else_b = if has_else { new_block(&pbody) } else { -1 };
-    let join = new_block(&pbody);
-    let at = ops_mark(pbody);
-    push_now(&pbody, pcx);
-    switch_bool(at, if has_else { else_b } else { join }, then_b, n, &pbody);
+    var then_b = -1;
+    var else_b = -1;
+    var join = -1;
+    if short_circuit(pcx.nodes[n].a, pcx) {
+        then_b = new_block(&pbody);
+        else_b = if has_else { new_block(&pbody) } else { -1 };
+        join = new_block(&pbody);
+        cond_into(pcx.nodes[n].a, if has_else { else_b } else { join }, then_b, n, &pbody, &pcx);
+    } else {
+        operand(pcx.nodes[n].a, false, &pbody, &pcx);
+        if !reachable(pbody) {
+            return;
+        }
+        then_b = new_block(&pbody);
+        else_b = if has_else { new_block(&pbody) } else { -1 };
+        join = new_block(&pbody);
+        let at = ops_mark(pbody);
+        push_now(&pbody, pcx);
+        switch_bool(at, if has_else { else_b } else { join }, then_b, n, &pbody);
+    }
     enter_block(then_b, &pbody);
     expr_into(pcx.nodes[n].b, dl, dp, &pbody, &pcx);
     if reachable(pbody) {
@@ -1923,13 +2025,21 @@ fn lower_loop(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<
         // (the condition is a unit of its own: its temporaries drop when
         // it is evaluated)
         let c = push_scope(SC_STMT, n, true, &pcx);
-        operand(pcx.nodes[n].b, false, &pbody, &pcx);
-        let at = ops_mark(pbody);
-        push_now(&pbody, pcx);
-        let body = new_block(&pbody);
-        let out = new_block(&pbody);
-        // (the condition's temporaries end on both edges)
-        switch_bool(at, out, body, n, &pbody);
+        var body = -1;
+        var out = -1;
+        if short_circuit(pcx.nodes[n].b, pcx) {
+            body = new_block(&pbody);
+            out = new_block(&pbody);
+            cond_into(pcx.nodes[n].b, out, body, n, &pbody, &pcx);
+        } else {
+            operand(pcx.nodes[n].b, false, &pbody, &pcx);
+            let at = ops_mark(pbody);
+            push_now(&pbody, pcx);
+            body = new_block(&pbody);
+            out = new_block(&pbody);
+            // (the condition's temporaries end on both edges)
+            switch_bool(at, out, body, n, &pbody);
+        }
         enter_block(out, &pbody);
         emit_scope(c, &pbody, &pcx);
         goto(exit, &pbody);
@@ -2070,8 +2180,19 @@ fn lower_match(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx
             phase_begin(-1, &pcx);
             bind_pattern(pat, sl, sp, st, true, &pbody, &pcx);
             let g = push_scope(SC_STMT, guard, false, &pcx);
-            operand(guard, false, &pbody, &pcx);
-            if reachable(pbody) {
+            if short_circuit(guard, pcx) {
+                // (0.28.0) a guard `a && b` branches on each operand
+                let ok = new_block(&pbody);
+                let refused = new_block(&pbody);
+                cond_into(guard, refused, ok, arm, &pbody, &pcx);
+                enter_block(refused, &pbody);
+                exit_to(s, arm, &pbody, &pcx);
+                goto(fail, &pbody);
+                enter_block(ok, &pbody);
+            } else {
+                operand(guard, false, &pbody, &pcx);
+            }
+            if !short_circuit(guard, pcx) && reachable(pbody) {
                 let at = ops_mark(pbody);
                 push_now(&pbody, pcx);
                 let ok = new_block(&pbody);
@@ -2754,7 +2875,16 @@ fn lower_let(st: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     let pk = pcx.nodes[pat].kind;
     // (its temporaries: to the end of the statement, or of the block when
     // it may keep a view of them)
-    let keep = init != 0 && pcx.nodes[init].ty > 0 && is_view_type(pcx.nodes[init].ty, &pcx);
+    // RULE: D8.2 (0.28.0, a rust body's own `let`) rustc's temporary
+    // lifetime extension: kept only when the initializer is an extending
+    // expression, `&temp` (in a tuple, an array, a braced struct or a
+    // cast); `let w = v[0].clone().as_str();` drops its String at the end
+    // of the statement, and a later use of w is rustc's E0716. (A hidden
+    // binding of a desugaring, `=f0`, `__out`, keeps the view rule.)
+    let user = pcx.rust_body && init != 0
+        && (pk != NodeKind::PatBind || !desugared_name(pcx.nodes[pat].a, pcx));
+    let keep = if user { extending(init, pcx) }
+        else { init != 0 && pcx.nodes[init].ty > 0 && is_view_type(pcx.nodes[init].ty, &pcx) };
     let s = if keep { -1 } else { push_scope(SC_STMT, st, pcx.stmt_home, &pcx) };
     if pk == NodeKind::PatWild {
         if init != 0 {
@@ -2930,6 +3060,39 @@ fn let_borrows(pat: i64, init: i64, pcx: inout Ctx<Comp>) -> bool {
         return false;
     }
     text.len > 0 && text[0] == '='
+}
+
+// (0.28.0) Whether a `let`'s name is a desugaring's: a hidden binding
+// (`=f0`) or a lowering's own (`__out`, `__s`).
+fn desugared_name(name: i64, pcx: Ctx<Comp>) -> bool {
+    let text = sym_text(name, pcx);
+    hidden_name(name, pcx) || text.len > 1 && text[0] == '_' && text[1] == '_'
+}
+
+// (0.28.0) RULE: D8.2 Whether expression e is extending, rustc's rule for
+// a `let`'s initializer: `&x` (its operand's temporaries live to the end
+// of the block), and a tuple, an array, a braced struct literal or a cast
+// of an extending expression; a block counts as one (its tail's rule,
+// left to the block).
+fn extending(e: i64, pcx: Ctx<Comp>) -> bool {
+    let k = pcx.nodes[e].kind;
+    if k == NodeKind::Unary {
+        return pcx.nodes[e].op == Tok::Amp;
+    }
+    if k == NodeKind::Cast {
+        return extending(pcx.nodes[e].a, pcx);
+    }
+    if k == NodeKind::Tuple || k == NodeKind::Array || k == NodeKind::StructLit {
+        for i in 0..pcx.nodes[e].count {
+            let c = child(e, i, pcx);
+            let v = if pcx.nodes[c].kind == NodeKind::FieldInit { pcx.nodes[c].b } else { c };
+            if v != 0 && extending(v, pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    k == NodeKind::Block
 }
 
 // Whether symbol name is one of the checker's hidden bindings (`=fN` an

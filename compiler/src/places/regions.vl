@@ -17,7 +17,7 @@
 // variance of each user type (D5.3: variance_table) and of each slot of a
 // type (D5.4: slot_variances): what places/borrowck reads.
 
-use crate::base::{buf_int, buf_new, buf_str, sym_text};
+use crate::base::{IntVec, buf_int, buf_new, buf_str, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::{NODE_REF, NODE_REF_MUT, NodeKind, child};
@@ -150,8 +150,13 @@ pub fn assign_regions(pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
         let param = l >= 1 && l <= pbody.params && l < sig.param_at.len() as i64;
         let base = if param { sig.param_at[l - 1] } else { 0 };
         let bound = if param { sig.param_at[l] - base } else { 0 };
+        // RULE: D3.2 (0.28.0) a static's slots are 'static: a value stored
+        // in it outlives 'static (rustc's E0597 for `K = s.as_str()`)
+        let fixed = (pbody.locals[l].flags & crate::places::ir::LF_STATIC) != 0;
         for j in 0..n {
-            if j < bound {
+            if fixed {
+                pbody.slot_var.push(1);
+            } else if j < bound {
                 pbody.slot_var.push(sig.params[base + j] + 1);
             } else {
                 push_row(RO_LOCAL, l, j, 0, &pbody);
@@ -772,7 +777,7 @@ pub fn closure_sig_slots(id: i64, pcx: inout Ctx<Comp>) {
 // the signature; a local one per bound region (U_BOUND); the implied
 // bounds (D4.5) of the env's and the signature's types. No elision rule
 // and no elision error (D20.3).
-fn closure_sig(id: i64, f: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
+fn closure_sig(id: i64, f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
     sig.closure = id;
     let nc = slot_count(pcx.closures[id].ty, pcx);
     let nenv = nc - pcx.closures[id].xc_n;
@@ -821,7 +826,7 @@ fn closure_sig(id: i64, f: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
             let u = code_universal(codes[e], i + 1, nenv, &sig);
             sig.params.push(u);
         }
-        push_decl_bounds(fn_param(f, i, pcx), false, base, &sig, pcx);
+        push_decl_bounds(fn_param(f, i, pcx), false, base, &sig, &pcx);
         for e in at[k]..at[k + 1] {
             let up = walk[4 * e + 3];
             if up >= 0 {
@@ -837,7 +842,7 @@ fn closure_sig(id: i64, f: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
         let u = code_universal(codes[e], 0, nenv, &sig);
         sig.ret.push(u);
     }
-    push_decl_bounds(fn_ret(f, pcx), true, 0, &sig, pcx);
+    push_decl_bounds(fn_ret(f, pcx), true, 0, &sig, &pcx);
     for e in r0..r1 {
         let up = walk[4 * e + 3];
         if up >= 0 {
@@ -1104,12 +1109,37 @@ fn req_walk(n: i64, t: i64, enc: i64, dn: i64, depth: i64, out: inout Vec<i64, C
     }
 }
 
+// decl_pairs(t, 0, 0) into out, made once per type (pcx.decl_pair_at): a
+// signature's types are read again at every call of its function, and a
+// type's pairs (its fields' requirements, D4.6, through every struct and
+// enum they name) depend on the type alone.
+fn decl_pairs_of(t: i64, out: inout Vec<i64, Comp>, pcx: inout Ctx<Comp>) {
+    if t <= 0 {
+        return;
+    }
+    var at = pcx.decl_pair_at.get(t + 1) - 1;
+    if at < 0 {
+        var pairs = Vec::<i64, Comp>::new_in(Comp {});
+        decl_pairs(t, 0, 0, &pairs, pcx);
+        at = pcx.decl_pair_store.count;
+        pcx.decl_pair_store.push(pairs.len() as i64);
+        for x in pairs.as_slice() {
+            pcx.decl_pair_store.push(x);
+        }
+        pcx.decl_pair_at.put(t + 1, at + 1);
+    }
+    let n = pcx.decl_pair_store.get(at);
+    for i in 0..n {
+        out.push(pcx.decl_pair_store.get(at + 1 + i));
+    }
+}
+
 // The declared bounds of type t (decl_pairs), whose slots are the
 // universals sig.params[base..] (sig.ret[base..] when ret), as bounds of
 // sig.
-fn push_decl_bounds(t: i64, ret: bool, base: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
+fn push_decl_bounds(t: i64, ret: bool, base: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
     var pairs = Vec::<i64, Comp>::new_in(Comp {});
-    decl_pairs(t, 0, 0, &pairs, pcx);
+    decl_pairs_of(t, &pairs, &pcx);
     let n = if ret { sig.ret.len() as i64 } else { sig.params.len() as i64 };
     var i = 0;
     while i + 1 < pairs.len() as i64 {
@@ -1932,11 +1962,58 @@ fn add_universal(kind: i64, x: i64, y: i64, sig: inout Sig<Comp>) -> i64 {
     universal_count(sig) - 1
 }
 
-// RULE: D4.1 Function f's signature regions, into sig. A rust-edition
+// Function f's signature regions, into sig: made once (sig_compute),
+// then copied from pcx.sig_memo. The borrow checker reads a callee's at
+// every call; a signature depends on the function alone.
+pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
+    var at = pcx.sig_memo_at.get(f + 1) - 1;
+    if at < 0 {
+        sig_compute(f, &sig, &pcx);
+        at = pcx.sig_memo.count;
+        memo_push(sig.univ, &pcx.sig_memo);
+        memo_push(sig.param_at, &pcx.sig_memo);
+        memo_push(sig.params, &pcx.sig_memo);
+        memo_push(sig.ret, &pcx.sig_memo);
+        memo_push(sig.bounds, &pcx.sig_memo);
+        memo_push(sig.cslots, &pcx.sig_memo);
+        pcx.sig_memo.push(sig.elision);
+        pcx.sig_memo.push(sig.closure);
+        pcx.sig_memo_at.put(f + 1, at + 1);
+        return;
+    }
+    memo_load(&sig.univ, &at, pcx.sig_memo);
+    memo_load(&sig.param_at, &at, pcx.sig_memo);
+    memo_load(&sig.params, &at, pcx.sig_memo);
+    memo_load(&sig.ret, &at, pcx.sig_memo);
+    memo_load(&sig.bounds, &at, pcx.sig_memo);
+    memo_load(&sig.cslots, &at, pcx.sig_memo);
+    sig.elision = pcx.sig_memo.get(at);
+    sig.closure = pcx.sig_memo.get(at + 1);
+}
+
+// v's length, then its words, onto out (sig_of's memo).
+fn memo_push(v: Vec<i64, Comp>, out: inout IntVec) {
+    out.push(v.len() as i64);
+    for x in v.as_slice() {
+        out.push(x);
+    }
+}
+
+// v from the memo's words at `at` (memo_push's), at moved past them.
+fn memo_load(v: inout Vec<i64, Comp>, at: inout i64, memo: IntVec) {
+    v.clear();
+    let n = memo.get(at);
+    for i in 0..n {
+        v.push(memo.get(at + 1 + i));
+    }
+    at += n + 1;
+}
+
+// RULE: D4.1 Function f's signature regions, into sig (sig_of: once). A rust-edition
 // function's are read from its signature's lifetimes (the parallel walk,
 // D4.2); any other's (std's, a closure body's: D10.5) are a universal
 // per slot (E1; §12's bridge relates a std result's).
-pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
+fn sig_compute(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
     sig.univ.clear();
     sig.param_at.clear();
     sig.params.clear();
@@ -1954,7 +2031,7 @@ pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
     let cid = closure_of_fn(f, pcx);
     if cid >= 0 && pcx.closures[cid].env_struct >= 0
         && crate::front::rust::rust_at(pcx.nodes[node].start, &pcx) {
-        closure_sig(cid, f, &sig, pcx);
+        closure_sig(cid, f, &sig, &pcx);
         return;
     }
     if !(is_node(node, NodeKind::Fn, pcx)
@@ -2001,7 +2078,7 @@ pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
         sig.walk.clear();
         bind_walk(tn, t, tps, self_node, -1, &sig.walk, 0, pcx, f);
         bind_entries(i + 1, tps, &sig, pcx);
-        push_decl_bounds(t, false, base, &sig, pcx);
+        push_decl_bounds(t, false, base, &sig, &pcx);
         let count = sig.params.len() as i64 - base;
         for e in 0..count {
             let up = sig.walk[4 * e + 3];
@@ -2091,7 +2168,7 @@ pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
                 sig.bounds.push(sig.ret[up]);
             }
         }
-        push_decl_bounds(fn_ret(f, pcx), true, 0, &sig, pcx);
+        push_decl_bounds(fn_ret(f, pcx), true, 0, &sig, &pcx);
     }
     // RULE: D4.5 (declared: `'b: 'a` in the generics, the impl's and the
     // function's)
@@ -2233,7 +2310,7 @@ fn subst_requirements(f: i64, tps: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
 // own implied bounds hold of its slots: `&'m mut Copied<Iter<'x, T>>`
 // gives `'x ⊒ 'm`, and its declarations' requirements (D4.6 (a)), each
 // slot the U_SUBST of k's.
-fn subst_wf(k: i64, s: i64, tps: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
+fn subst_wf(k: i64, s: i64, tps: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
     if s <= 0 {
         return;
     }
@@ -2250,7 +2327,7 @@ fn subst_wf(k: i64, s: i64, tps: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
         }
     }
     var pairs = Vec::<i64, Comp>::new_in(Comp {});
-    decl_pairs(s, 0, 0, &pairs, pcx);
+    decl_pairs_of(s, &pairs, &pcx);
     var i = 0;
     while i + 1 < pairs.len() as i64 {
         let a = add_universal(U_SUBST, sym, pairs[i], &sig);
@@ -2274,7 +2351,7 @@ fn bound_ties(f: i64, tps: i64, self_node: i64, sig: inout Sig<Comp>, pcx: inout
         if k >= pcx.fns[f].targ_count {
             break;
         }
-        subst_wf(k, tlist_at(pcx.fns[f].targs + k, pcx), tps, &sig, pcx);
+        subst_wf(k, tlist_at(pcx.fns[f].targs + k, pcx), tps, &sig, &pcx);
         let bounds = pcx.nodes[child(tps, k, pcx)].h;
         if bounds <= 0 {
             continue;
@@ -2888,6 +2965,15 @@ pub fn field_map(t0: i64, k: i64, v: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Co
                 }
             }
             off += n;
+        }
+        return;
+    }
+    if tk == TyKind::Array {
+        // RULE: D3.3 (0.28.0) an element of an array: the array's slots,
+        // its element type's (`[s.as_str(), "x"]` holds the loan of s; 0.27.8
+        // mapped none, so the loan did not reach the array)
+        for j in 0..slot_count(pcx.types[t].a, pcx) {
+            out.push(j);
         }
         return;
     }
