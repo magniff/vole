@@ -9,7 +9,8 @@ use crate::base::diag::{
 };
 use crate::front::assoc::ensure_checked;
 use crate::front::ast::{
-    CALL_FIELDS, FN_INTRINSIC, NodeKind, VK_NEW, child, list_begin, list_end, list_push, new_node,
+    CALL_FIELDS, FN_INTRINSIC, NODE_REF_MUT, NodeKind, VK_NEW, child, list_begin, list_end,
+    list_push, new_node,
 };
 use crate::front::ast::NodeKind::{Ident, Path, VariantLit};
 use crate::front::check::{Res, has_error_type, lookup_local, name_error};
@@ -692,6 +693,84 @@ fn self_in_result(ret: i64, expected: i64, depth: i64, pcx: inout Ctx<Comp>) -> 
     0
 }
 
+// RULE: F8.2 (0.27.6) The type a trait function's Self is from call n's
+// arguments, for a function without a receiver whose parameter's written
+// type holds Self (`Self`, `&Self`, `&mut Self`, `&[Self]`, `[Self]`):
+// from the type the argument has without being checked (a local, `&e`,
+// `&mut e`, `e[a..b]` of one), as rustc infers it (`Hash::hash_slice(self,
+// state)` with `self: &[T]` is `<T as Hash>::hash_slice`); 0 when none says.
+fn self_from_args(f: i64, n: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let count = if pcx.nodes[n].count < pcx.nodes[f].count { pcx.nodes[n].count }
+        else { pcx.nodes[f].count };
+    for i in 0..count {
+        let param_ty = pcx.nodes[child(f, i, pcx)].b;
+        let t = quiet_type(child(n, i, pcx), 0, &pcx);
+        let s = self_in_param(param_ty, t, 0, &pcx);
+        if s > 0 {
+            return s;
+        }
+    }
+    0
+}
+
+// The type of expression e known without checking it: a local's, `&e` and
+// `&mut e` of one, `e[a..b]` of an array, a slice or a Vec; 0 otherwise.
+fn quiet_type(e: i64, depth: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if e <= 0 || depth > 4 {
+        return 0;
+    }
+    let k = pcx.nodes[e].kind;
+    if k == NodeKind::Ident && pcx.nodes[e].count == 0 {
+        return match lookup_local(pcx.nodes[e].a, pcx) {
+            Option::Some(l) => pcx.locals[l].ty,
+            Option::None => 0,
+        };
+    }
+    if k == NodeKind::Unary && pcx.nodes[e].op == Tok::Amp {
+        let t = quiet_type(pcx.nodes[e].b, depth + 1, &pcx);
+        if t <= 0 {
+            return 0;
+        }
+        if pcx.types[t].kind == TyKind::Slice {
+            return t;
+        }
+        return crate::front::types::ref_to(t,
+            if (pcx.nodes[e].p & NODE_REF_MUT) != 0 { crate::front::types::REF_MUT }
+            else { crate::front::types::REF_SHARED }, &pcx);
+    }
+    if k == NodeKind::Index && pcx.nodes[pcx.nodes[e].b].kind == NodeKind::Range {
+        var t = quiet_type(pcx.nodes[e].a, depth + 1, &pcx);
+        while t > 0 && pcx.types[t].kind == TyKind::Ptr {
+            t = pcx.types[t].a;
+        }
+        if t > 0 && (pcx.types[t].kind == TyKind::Array || pcx.types[t].kind == TyKind::Slice) {
+            return crate::front::types::slice_of(pcx.types[t].a, &pcx);
+        }
+    }
+    0
+}
+
+// The type Self is when a parameter written `ty` (a type node) takes a
+// value of type t: `Self` itself, through `&`, `&mut` and `[..]`; 0 when
+// ty does not hold Self in those.
+fn self_in_param(ty: i64, t: i64, depth: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if ty <= 0 || t <= 0 || depth > 4 {
+        return 0;
+    }
+    let k = pcx.nodes[ty].kind;
+    if k == NodeKind::TyName {
+        return if pcx.nodes[ty].a == pcx.self_type_sym && pcx.nodes[ty].count == 0
+            && pcx.nodes[ty].g == 0 { t } else { 0 };
+    }
+    if k == NodeKind::TyPtr && pcx.types[t].kind == TyKind::Ptr {
+        return self_in_param(pcx.nodes[ty].a, pcx.types[t].a, depth + 1, &pcx);
+    }
+    if k == NodeKind::TySlice && pcx.types[t].kind == TyKind::Slice {
+        return self_in_param(pcx.nodes[ty].a, pcx.types[t].a, depth + 1, &pcx);
+    }
+    0
+}
+
 // RULE: Z9.1c (0.27.6) The trait of a bound of type parameter `name` (of
 // the instance being checked) that declares `member` with a `self`
 // receiver, or -1.
@@ -738,6 +817,18 @@ fn synth_path_call(n: i64, callee: i64, pcx: inout Ctx<Comp>) -> i64 {
             // is `<&Gpa as Clone>::clone`)
             if tr == 0 && pcx.nodes[callee].count == 0 {
                 tr = bound_method_trait(pcx.nodes[callee].a, pcx.nodes[callee].b, &pcx) + 1;
+            }
+            // RULE: F8.2 (0.27.6: a function of the trait without a receiver,
+            // its Self from an argument, `Hash::hash_slice(self, state)`:
+            // `<T as Hash>::hash_slice`, path_target reads y)
+            let f = if tr != 0 { crate::front::traits::trait_fn(tr - 1, pcx.nodes[callee].b, pcx) }
+                else { 0 };
+            let receiver = f != 0 && pcx.nodes[f].count > 0
+                && pcx.nodes[child(f, 0, pcx)].a == pcx.self_sym;
+            let s = if f != 0 && !receiver { self_from_args(f, n, &pcx) } else { 0 };
+            if s > 0 {
+                pcx.nodes[callee].y = s;
+                tr = 0;
             }
             if tr != 0 {
                 var first = child(n, 0, pcx);

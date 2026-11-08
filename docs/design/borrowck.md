@@ -514,6 +514,17 @@ re-inferred.
   `RV_REF` with the supporting-prefix constraint `'q : 'new` below, and
   the verifier (`--verify-places`, I7) rejects such a `copy`. (M1's
   reading of it as that reborrow was the stopgap until then; retired.)
+  (0.27.6) A `&mut` place given where a raw pointer goes (a `*mut T` or
+  `*const T` parameter: the coercion) is reborrowed raw, `_t = &raw mut
+  (*Q)` (`BK_RAW_MUT`), as rustc's MIR has it. That creates no loan
+  (D2.1), so the reborrow ends at the coercion: a later `&mut` of a
+  part of `*Q` in the same call's arguments, `f(cx, &mut cx.cap)`, is
+  no conflict. The coercion's own access is a deep write of `*Q`
+  (D2.2), so a loan of a part of `*Q` that is live across it still
+  conflicts (rustc E0502: `let r = &cx.cap; f(cx); r`). 0.27.5 gave
+  it as the shared reborrow `&(*Q)`, whose loan lived to the call.
+  *Cases:* `rust_b_raw_coerce_ends_borrow`,
+  `rust_b_raw_coerce_live_shared_err`.
 - `SK_ASSIGN (a,b) = RV_REF P` (`e = 'ℓ`, `d ≠ BK_RAW`): loan `ℓ`
   created; `sub(&'ℓ [mut] type(P) ≤ type((a,b)))` (a `BK_FAKE` loan:
   `type((a,b))` is `&type(P)`); **the supporting-prefix rule:** for

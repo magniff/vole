@@ -207,6 +207,21 @@ The front (front273):
   - Such a constant is not yet a compile-time value: as an array length
     or in a pattern it is an error.
   - 0.27.5 refused these constants.
+  - The copied value is resolved as at the constant: a local or type
+    parameter at the use with the same name is not seen. Inherent
+    constants work the same way now. Before, a closure `double` at the
+    use of `impl D { const T: u64 = double(22); }` was called, which was
+    wrong code (in 0.27.5 too).
+- A `&mut` given where a raw pointer goes is a raw reborrow that ends
+  at the coercion, as in rustc (D3.6). `f(cx, cx.f, &mut cx.cap)` with
+  `cx` going to a `*mut C` is no longer a conflict (gate 3's class S).
+  A shared borrow that is live across the coercion still conflicts
+  (E0502).
+- `Tr::f(x, ..)` of a trait function without a receiver takes Self from
+  the argument whose parameter holds it (F8.2):
+  `Hash::hash_slice(self, state)` in `impl<T: Hash> Hash for [T]` is
+  `<T as Hash>::hash_slice`. A trait function with `where Self: Sized`
+  is no longer checked for an impl whose Self is unsized (F12.4).
 
 std::gpu::wgsl in std2 (fl10274):
 
