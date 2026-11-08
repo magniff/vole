@@ -89,6 +89,26 @@ binary is invoked, where its test runner is and which hosts it supports.
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.28.0
+
+- **Open locals are one variable (F18.5).** An open local is a leaf of
+  the literal trees built from it: `let c = a;`, `let b = a + 1;`, `let m
+  = if x > 0 { a } else { 0 };`, a comparison of two open locals (`a >
+  b`), `s += x`, and a `for` loop over a range of literals and open
+  locals (`for i in 0..64`) keep the locals open and link them, and the
+  use that types one types them all, as rustc's unified `{integer}`. A
+  shift amount (`1 << k`) and a cast's operand give an open local no type,
+  and on std2 a direct call's format hole (`println("{}", x)`) neither:
+  its write is made again with the solved type's impl. 0.27.7 closed the
+  local at each of these at `i32` and widened it at the later `i64` use
+  (FR5): a silent wrong value past 2^31 (`let c = a;` of `1 << 40` was
+  256; a loop's `i * i` wrapped). The FR5 census of compiler/src's
+  translation (gate 3) counts 146 such widenings at 0.27.7 and none now;
+  the 10 left are values of a narrower declared type (`h ^= bytes[i]` of
+  a `[u8]`), which rustc refuses too (E0308).
+  *Cases:* `rust_f_f185_open_leaves`, `rust_f_f185_open_compare`,
+  `rust_f_f185_open_loops`, `rust_f_f185_open_format`.
+
 ### What's new in 0.27.7
 
 Gate 3 is 0. `fix --edition rust` on a copy of compiler/src type-checks

@@ -361,30 +361,47 @@ fn shift_op(op: Tok) -> bool {
 }
 
 // Whether checked expression e is a literal tree whose integer positions
-// are untyped literals at the fallback (F18.5).
+// are untyped literals at the fallback (F18.5), or (0.28.0) open locals of
+// an integer type (open_leaf) where its value is one.
 pub fn open_tree(e: i64, pcx: Ctx<Comp>) -> bool {
+    open_tree_at(e, true, pcx)
+}
+
+// open_tree of e; `leaf`: an open local may be e itself (a position of the
+// tree's own type, not an element of an array or a tuple).
+fn open_tree_at(e: i64, leaf: bool, pcx: Ctx<Comp>) -> bool {
     let x = node(e, pcx);
     if x.kind == NodeKind::Int {
         return x.b == SUF_NONE && x.ty == TY_I32;
     }
+    if x.kind == NodeKind::Ident {
+        return leaf && open_leaf(e, pcx) >= 0;
+    }
+    // (0.28.0: a `for` loop's range, its local's init, of an integer type)
+    if x.kind == NodeKind::Range {
+        return leaf && x.a != 0 && x.b != 0 && x.ty == TY_I32 && open_tree_at(x.a, true, pcx)
+            && open_tree_at(x.b, true, pcx);
+    }
     if x.kind == NodeKind::Unary {
         // (0.27.7: `!` of a literal tree too, `!0`, an integer `!` made `~`)
-        return (x.op == Tok::Minus || x.op == Tok::Tilde) && x.ty == TY_I32 && open_tree(x.b, pcx);
+        return (x.op == Tok::Minus || x.op == Tok::Tilde) && x.ty == TY_I32
+            && open_tree_at(x.b, leaf, pcx);
     }
     if x.kind == NodeKind::Binary {
         // RULE: F18.5 (0.27.7: a shift by its left operand alone; the right
         // operand, any integer, does not type it, as in rustc)
         if shift_op(x.op) {
-            return x.ty == TY_I32 && open_tree(x.b, pcx);
+            return x.ty == TY_I32 && open_tree_at(x.b, leaf, pcx);
         }
-        return arith_op(x.op) && x.ty == TY_I32 && open_tree(x.b, pcx) && open_tree(x.c, pcx);
+        return arith_op(x.op) && x.ty == TY_I32 && open_tree_at(x.b, leaf, pcx)
+            && open_tree_at(x.c, leaf, pcx);
     }
     if x.kind == NodeKind::Repeat {
-        return open_tree(x.a, pcx);
+        return open_tree_at(x.a, false, pcx);
     }
     if x.kind == NodeKind::Array && x.count > 0 {
         for i in 0..x.count {
-            if !open_tree(child(e, i, pcx), pcx) {
+            if !open_tree_at(child(e, i, pcx), false, pcx) {
                 return false;
             }
         }
@@ -392,7 +409,7 @@ pub fn open_tree(e: i64, pcx: Ctx<Comp>) -> bool {
     }
     if x.kind == NodeKind::Tuple {
         for i in 0..x.count {
-            if open_tree(child(e, i, pcx), pcx) {
+            if open_tree_at(child(e, i, pcx), false, pcx) {
                 return true;
             }
         }
@@ -400,14 +417,14 @@ pub fn open_tree(e: i64, pcx: Ctx<Comp>) -> bool {
     // RULE: F18.5 (0.27.4: a block by its tail, an `if` with an `else` and
     // a `match` by their branches, each a literal tree)
     if x.kind == NodeKind::Block {
-        return x.a != 0 && open_tree(x.a, pcx);
+        return x.a != 0 && open_tree_at(x.a, leaf, pcx);
     }
     if x.kind == NodeKind::If {
-        return x.c != 0 && open_tree(x.b, pcx) && open_tree(x.c, pcx);
+        return x.c != 0 && open_tree_at(x.b, leaf, pcx) && open_tree_at(x.c, leaf, pcx);
     }
     if x.kind == NodeKind::Match && x.count > 0 {
         for i in 0..x.count {
-            if !open_tree(node(child(e, i, pcx), pcx).c, pcx) {
+            if !open_tree_at(node(child(e, i, pcx), pcx).c, leaf, pcx) {
                 return false;
             }
         }
@@ -424,8 +441,14 @@ fn open_fit(e: i64, t: i64, pcx: Ctx<Comp>) -> bool {
     }
     let x = node(e, pcx);
     let tt = type_info(t, pcx);
-    if x.kind == NodeKind::Int {
+    // (0.28.0: an open local's identifier, a leaf, its local solved with
+    // the tree, open_group)
+    if x.kind == NodeKind::Int || x.kind == NodeKind::Ident || x.kind == NodeKind::InterpHole {
         return is_integer(t) && t != pcx.char_type;
+    }
+    if x.kind == NodeKind::Range {
+        return is_integer(t) && t != pcx.char_type && open_fit(x.a, t, pcx)
+            && open_fit(x.b, t, pcx);
     }
     if x.kind == NodeKind::Unary {
         return (x.op == Tok::Tilde && is_integer(t) && t != pcx.char_type || is_signed(t))
@@ -501,6 +524,12 @@ fn open_fits(n: i64, negated: bool, t: i64, pcx: inout Ctx<Comp>) {
 // takes type t (open_fit said it can), its literals checked to fit.
 fn open_set(e: i64, t: i64, pcx: inout Ctx<Comp>) {
     let x = node(e, pcx);
+    // (0.28.0: a direct call's hole that writes the local, its write made
+    // again, interp.vl's record)
+    if x.kind == NodeKind::InterpHole {
+        crate::front::check::interp::hole_retype(e, t, &pcx);
+        return;
+    }
     let tt = type_info(t, pcx);
     pcx.nodes[e].ty = t;
     if x.kind == NodeKind::Int {
@@ -515,6 +544,9 @@ fn open_set(e: i64, t: i64, pcx: inout Ctx<Comp>) {
         if !shift_op(x.op) {
             open_set(x.c, t, &pcx);
         }
+    } else if x.kind == NodeKind::Range {
+        open_set(x.a, t, &pcx);
+        open_set(x.b, t, &pcx);
     } else if x.kind == NodeKind::Repeat {
         open_set(x.a, tt.a, &pcx);
     } else if x.kind == NodeKind::Array {
@@ -717,9 +749,36 @@ pub fn open_let(l: i64, init: i64, pcx: inout Ctx<Comp>) {
     if l >= 0 && (root >= 0 || open_tree(init, pcx)) {
         pcx.open_lets.push(l);
         pcx.open_lets.push(init);
-    } else if root >= 0 {
+        return;
+    }
+    if root >= 0 {
         open_close(open_index(root, pcx), &pcx);
     }
+    // (`let _ = a + 1;`, a tree of open locals bound to no name: a use of
+    // its first, retyped with them)
+    let owner = open_owner(init, pcx);
+    if root < 0 && owner >= 0 && open_tree(init, pcx) {
+        open_record(owner, init, &pcx);
+        return;
+    }
+    open_release(init, &pcx);
+}
+
+// (0.28.0) The open locals among the leaves of tree e, which no open local
+// holds (a `let` that bound none, `let _ = a + 1;`), are closed.
+fn open_release(e: i64, pcx: inout Ctx<Comp>) {
+    var k = open_owner(e, pcx);
+    while k >= 0 {
+        open_close(k, &pcx);
+        k = open_owner(e, pcx);
+    }
+}
+
+// RULE: F18.5 (0.28.0) Whether the range bounds a and b of a `for` loop
+// are trees of untyped literals and open locals (`0..64`, `0..n` of an
+// open n): its local is open, its init the range (check_for).
+pub fn open_bounds(a: i64, b: i64, pcx: Ctx<Comp>) -> bool {
+    shape_leaves(a, true, pcx) >= 0 && shape_leaves(b, true, pcx) >= 0
 }
 
 // The pair of the open local identifier n names (its index in
@@ -755,24 +814,45 @@ fn open_drop(k: i64, pcx: inout Ctx<Comp>) {
 }
 
 // Pair k is closed at its provisional type, the fallback: its literals
-// are checked to fit it. A link closes its root, a root its links.
+// are checked to fit it. A link closes its root, a root its links; (0.28.0)
+// a pair closes its group (open_group) with it.
 fn open_close(k: i64, pcx: inout Ctx<Comp>) {
-    let l = pcx.open_lets.get(k);
     let init = pcx.open_lets.get(k + 1);
     let root = open_link(init, pcx);
     if root >= 0 {
         open_close(open_index(root, pcx), &pcx);
         return;
     }
-    open_dependents(l, 0, &pcx);
-    let t = pcx.locals[l].ty;
-    open_drop(open_index(l, pcx), &pcx);
-    open_set(init, t, &pcx);
+    let mark = open_group(k, &pcx);
+    let end = pcx.tscratch.count;
+    for i in mark..end {
+        let l = pcx.tscratch.get(i);
+        // (the trees its uses recorded too, their literals checked to fit)
+        var u = 0;
+        while u + 1 < pcx.open_uses.count {
+            if pcx.open_uses.get(u) == l {
+                open_set(pcx.open_uses.get(u + 1), pcx.locals[l].ty, &pcx);
+            }
+            u += 2;
+        }
+        open_dependents(l, 0, &pcx);
+    }
+    for i in mark..end {
+        let l = pcx.tscratch.get(i);
+        let j = open_index(l, pcx);
+        if j >= 0 {
+            let e = pcx.open_lets.get(j + 1);
+            open_drop(j, &pcx);
+            open_set(e, pcx.locals[l].ty, &pcx);
+        }
+    }
+    pcx.tscratch.count = mark;
 }
 
 // Pair k is solved to type t when its literals, and those of the uses
 // that kept it open, can take it: the local, its init and those nodes
-// retyped in place. Whether it was. RULE: F18.5
+// retyped in place; (0.28.0) with its group's (open_group), one variable.
+// Whether it was. RULE: F18.5
 pub fn open_solve(k: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
     let l = pcx.open_lets.get(k);
     let init = pcx.open_lets.get(k + 1);
@@ -795,7 +875,50 @@ pub fn open_solve(k: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
         open_close(k, &pcx);
         return true;
     }
-    if !open_fit(init, t, pcx) {
+    let mark = open_group(k, &pcx);
+    let end = pcx.tscratch.count;
+    if end - mark > 1 && !is_integer(t) {
+        pcx.tscratch.count = mark;
+        return false;
+    }
+    for g in mark..end {
+        if !open_fits_all(pcx.tscratch.get(g), t, pcx) {
+            pcx.tscratch.count = mark;
+            return false;
+        }
+    }
+    for g in mark..end {
+        pcx.locals[pcx.tscratch.get(g)].ty = t;
+    }
+    for g in mark..end {
+        let m = pcx.tscratch.get(g);
+        var i = 0;
+        while i + 1 < pcx.open_uses.count {
+            if pcx.open_uses.get(i) == m {
+                open_set(pcx.open_uses.get(i + 1), t, &pcx);
+            }
+            i += 2;
+        }
+        open_dependents(m, t, &pcx);
+    }
+    for g in mark..end {
+        let m = pcx.tscratch.get(g);
+        let j = open_index(m, pcx);
+        if j >= 0 {
+            let e = pcx.open_lets.get(j + 1);
+            open_drop(j, &pcx);
+            open_set(e, t, &pcx);
+        }
+    }
+    pcx.tscratch.count = mark;
+    true
+}
+
+// Whether open local l's init, and the uses that kept it open, can take
+// type t (open_fit).
+fn open_fits_all(l: i64, t: i64, pcx: Ctx<Comp>) -> bool {
+    let k = open_index(l, pcx);
+    if k < 0 || !open_fit(pcx.open_lets.get(k + 1), t, pcx) {
         return false;
     }
     var i = 0;
@@ -807,18 +930,214 @@ pub fn open_solve(k: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
         }
         i += 2;
     }
-    pcx.locals[l].ty = t;
-    i = 0;
+    true
+}
+
+// RULE: F18.5 (0.28.0) The open locals one variable with pair k's: its
+// local, the open locals that are leaves of its init or of a tree a use
+// recorded (`let b = a + 1;`, `a < b`, `s += x`), theirs, and the locals
+// whose init or use trees have one of them as a leaf, pushed on TSCRATCH;
+// the mark they start at. Solving or closing one solves or closes them
+// all, at one type.
+fn open_group(k: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let mark = pcx.tscratch.count;
+    pcx.tscratch.push(pcx.open_lets.get(k));
+    var g = mark;
+    while g < pcx.tscratch.count {
+        let l = pcx.tscratch.get(g);
+        var j = 0;
+        while j + 1 < pcx.open_lets.count {
+            let m = pcx.open_lets.get(j);
+            if open_link(pcx.open_lets.get(j + 1), pcx) < 0 && !in_group(m, mark, pcx)
+                && (open_names(m, l, pcx) || open_names(l, m, pcx)) {
+                pcx.tscratch.push(m);
+            }
+            j += 2;
+        }
+        g += 1;
+    }
+    mark
+}
+
+fn in_group(l: i64, mark: i64, pcx: Ctx<Comp>) -> bool {
+    for g in mark..pcx.tscratch.count {
+        if pcx.tscratch.get(g) == l {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether open local l's init, or a tree one of its uses recorded, has
+// local m as a leaf.
+fn open_names(l: i64, m: i64, pcx: Ctx<Comp>) -> bool {
+    let k = open_index(l, pcx);
+    if k < 0 {
+        return false;
+    }
+    if leaf_of(pcx.open_lets.get(k + 1), m, pcx) {
+        return true;
+    }
+    var i = 0;
     while i + 1 < pcx.open_uses.count {
-        if pcx.open_uses.get(i) == l {
-            open_set(pcx.open_uses.get(i + 1), t, &pcx);
+        if pcx.open_uses.get(i) == l && leaf_of(pcx.open_uses.get(i + 1), m, pcx) {
+            return true;
         }
         i += 2;
     }
-    open_dependents(l, t, &pcx);
-    open_drop(open_index(l, pcx), &pcx);
-    open_set(init, t, &pcx);
-    true
+    false
+}
+
+// Whether tree e (checked) has an identifier of local m as a leaf, where
+// the tree's own type goes (open_tree_at's leaves).
+fn leaf_of(e: i64, m: i64, pcx: Ctx<Comp>) -> bool {
+    if e <= 0 {
+        return false;
+    }
+    let x = node(e, pcx);
+    if x.kind == NodeKind::Ident {
+        return x.res == Res::Local && x.y == m;
+    }
+    if x.kind == NodeKind::Range {
+        return leaf_of(x.a, m, pcx) || leaf_of(x.b, m, pcx);
+    }
+    if x.kind == NodeKind::Unary {
+        return (x.op == Tok::Minus || x.op == Tok::Tilde) && leaf_of(x.b, m, pcx);
+    }
+    if x.kind == NodeKind::Binary {
+        return leaf_of(x.b, m, pcx) || !shift_op(x.op) && leaf_of(x.c, m, pcx);
+    }
+    if x.kind == NodeKind::Block {
+        return leaf_of(x.a, m, pcx);
+    }
+    if x.kind == NodeKind::If {
+        return leaf_of(x.b, m, pcx) || leaf_of(x.c, m, pcx);
+    }
+    if x.kind == NodeKind::Match {
+        for i in 0..x.count {
+            if leaf_of(node(child(e, i, pcx), pcx).c, m, pcx) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// The pair of the open local of an integer type identifier n (checked)
+// names, or -1. RULE: F18.5 (0.28.0)
+pub fn open_leaf(n: i64, pcx: Ctx<Comp>) -> i64 {
+    let x = node(n, pcx);
+    if pcx.open_lets.count == 0 || x.kind != NodeKind::Ident || x.res != Res::Local {
+        return -1;
+    }
+    let k = open_index(x.y, pcx);
+    if k < 0 || !is_integer(pcx.locals[x.y].ty) {
+        return -1;
+    }
+    k
+}
+
+// (synth_operands) The pair of the first open local among the leaves of
+// tree e (checked), or -1.
+pub fn open_owner(e: i64, pcx: Ctx<Comp>) -> i64 {
+    if e <= 0 {
+        return -1;
+    }
+    let x = node(e, pcx);
+    if x.kind == NodeKind::Ident {
+        return open_leaf(e, pcx);
+    }
+    if x.kind == NodeKind::Unary || x.kind == NodeKind::Block {
+        return open_owner(if x.kind == NodeKind::Unary { x.b } else { x.a }, pcx);
+    }
+    if x.kind == NodeKind::Range || x.kind == NodeKind::If {
+        let k = open_owner(if x.kind == NodeKind::If { x.b } else { x.a }, pcx);
+        return if k >= 0 { k }
+            else { open_owner(if x.kind == NodeKind::If { x.c } else { x.b }, pcx) };
+    }
+    if x.kind == NodeKind::Binary {
+        let k = open_owner(x.b, pcx);
+        return if k >= 0 || shift_op(x.op) { k } else { open_owner(x.c, pcx) };
+    }
+    -1
+}
+
+// RULE: F18.5 (0.28.0) Whether e, not yet checked, is a tree of untyped
+// integer literals and names (`a`, `a + 1`, `n - i`, `1 << k`) with an
+// open local of an integer type among them; `strict`: every name is one.
+// Its open locals stay open while it is checked (OPEN_KEEP): the tree's
+// leaves, solved or closed with what it gives its type.
+pub fn open_shape(e: i64, strict: bool, pcx: Ctx<Comp>) -> bool {
+    pcx.open_lets.count > 0 && shape_leaves(e, strict, pcx) > 0
+}
+
+// RULE: F18.5 (0.28.0) Tree e (open_shape, not yet checked) where it
+// gives its open locals no type, a cast's operand or a shift amount
+// (rustc's `{integer}` there stays a variable): checked with its open
+// locals kept, and recorded as a use of the first, retyped with them
+// (open_group). Its type.
+pub fn open_kept(e: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let saved_keep = pcx.open_keep;
+    let saved_init = pcx.open_init;
+    pcx.open_keep = true;
+    pcx.open_init = e;
+    let t = crate::front::check::synth_mode::synth_expr(e, &pcx);
+    pcx.open_keep = saved_keep;
+    pcx.open_init = saved_init;
+    let k = open_owner(e, pcx);
+    if k >= 0 && open_tree(e, pcx) {
+        open_record(k, e, &pcx);
+    } else {
+        open_release(e, &pcx);
+    }
+    t
+}
+
+// (check_assign) Whether e, not yet checked, is a tree of untyped integer
+// literals and open locals of an integer type only (`1`, `1 << 31`, `x`,
+// `x + 1`): assigned to an open local it keeps it open.
+pub fn open_value(e: i64, pcx: Ctx<Comp>) -> bool {
+    pcx.open_lets.count > 0 && shape_leaves(e, true, pcx) >= 0
+}
+
+// The open locals among the leaves of tree e (open_shape), -1 when e is
+// not one.
+fn shape_leaves(e: i64, strict: bool, pcx: Ctx<Comp>) -> i64 {
+    if e <= 0 {
+        return -1;
+    }
+    let x = node(e, pcx);
+    if x.kind == NodeKind::Int {
+        return if x.b == SUF_NONE { 0 } else { -1 };
+    }
+    if x.kind == NodeKind::Ident {
+        if x.count != 0 {
+            return -1;
+        }
+        if open_scalar(e, pcx) >= 0 {
+            return 1;
+        }
+        return if strict { -1 } else { 0 };
+    }
+    if x.kind == NodeKind::Unary {
+        return if x.op == Tok::Minus || x.op == Tok::Tilde || x.op == Tok::Bang {
+            shape_leaves(x.b, strict, pcx) } else { -1 };
+    }
+    if x.kind == NodeKind::Binary && (arith_op(x.op) || shift_op(x.op)) {
+        let a = shape_leaves(x.b, strict, pcx);
+        let b = shape_leaves(x.c, strict, pcx);
+        return if a < 0 || b < 0 { -1 } else { a + b };
+    }
+    if x.kind == NodeKind::Block && x.count == 0 {
+        return shape_leaves(x.a, strict, pcx);
+    }
+    // (an `if` with an `else` by its branches; its condition is any)
+    if x.kind == NodeKind::If && x.c != 0 {
+        let a = shape_leaves(x.b, strict, pcx);
+        let b = shape_leaves(x.c, strict, pcx);
+        return if a < 0 || b < 0 { -1 } else { a + b };
+    }
+    -1
 }
 
 // (synth_name) Identifier n uses local l: when l is open, the use is
@@ -966,6 +1285,9 @@ fn in_tree(root: i64, n: i64, pcx: Ctx<Comp>) -> bool {
     }
     if x.kind == NodeKind::Binary {
         return in_tree(x.b, n, pcx) || !shift_op(x.op) && in_tree(x.c, n, pcx);
+    }
+    if x.kind == NodeKind::Range {
+        return in_tree(x.a, n, pcx) || in_tree(x.b, n, pcx);
     }
     if x.kind == NodeKind::Array || x.kind == NodeKind::Tuple {
         for i in 0..x.count {

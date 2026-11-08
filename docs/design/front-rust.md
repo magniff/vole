@@ -1303,8 +1303,8 @@ bind. These uses keep it open and are retyped when it is solved: `x op=
 lit`, `x = lit` and a comparison with a literal (`x < 10`). A closure
 that captures an open local closes it when the closure is checked (its
 environment holds the type). Any other use closes it at its provisional
-type (the `i32` fallback, F18.3): a method receiver, `let y =
-x`, a pattern's scrutinee, a format hole (FL6 names each). (0.27.7) A
+type (the `i32` fallback, F18.3): a method receiver, a pattern's
+scrutinee, a `format_args` hole (FL6 names each). (0.27.7) A
 cast's operand, `x as τ`, keeps it open: the cast gives `x` no type, as
 in rustc. A local still
 open at the function's end has the fallback. Solving retypes the local
@@ -1343,6 +1343,29 @@ max as f64 { return max; }` in a function returning `i64` is an `i64`
 `i32`'s 255 for `bits` 40 (a silent wrong value, the flip rehearsal's,
 through consteval's `float_to_int`). *Anchor:* `check/synth_mode:
 synth_cast`. *Case:* `rust_f_f185_cast_open`.
+(0.28.0, open locals as leaves) An open local of an integer type is a
+leaf of a literal tree where the tree's own type goes (not as an array's
+or a tuple's element): `let c = a;`, `let b = a + 1;` and `let p = a *
+k;` make `c`, `b` and `p` open, and their uses in the tree keep `a` and
+`k` open. So do a comparison of two such trees (`a > b`, `i + 1 == n`),
+the assignment of one to an open local (`s += x`, `t = x + 1`), and a
+`for` loop over a range of two (`for i in 0..64`, `for q in 0..r` of an
+open `r`): the loop's local is open, its init the range. The locals a tree
+links are one variable, a **group** (rustc's unified `{integer}`): solving
+one solves them all at its type, and closing one closes them all. On std2
+a format hole of a direct call (`println`, `print`, `eprintln`,
+`format_in`, `write`, `panic`) keeps its open local open too: when the
+local is solved, the hole's value takes its type and its write is made
+again, with that type's impl. 0.27.7 closed the local at each of these
+at `i32`, and a later `i64` use widened the `i32` value (FR5): `let c =
+a;` of `1 << 40` gave 256, a loop's `i * i` wrapped past 2^31 (silent
+wrong values: the FR5 census found 146 widenings in compiler/src's
+translation, 132 of them a `for` loop's local over a literal range).
+*Anchor:* `front/check/literals.vl: open_group, open_shape, open_bounds`,
+`synth_mode.vl: synth_operands`, `body.vl: check_for`, `assign.vl:
+check_assign`, `interp.vl: hole_retype`. *Cases:*
+`rust_f_f185_open_leaves`, `rust_f_f185_open_compare`,
+`rust_f_f185_open_loops`, `rust_f_f185_open_format`.
 (0.27.3, the literals around it, F18.3: `&1` where `&τ` of a number
 goes is a `τ` (`m.get(&1)`, `x.total_cmp(&0.0)`); a literal bound only
 by a parameter's bound picks the one integer type an impl gives, also
@@ -2165,12 +2188,15 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   early close rejects where rustc accepts, or picks `i32` where rustc
   infers from a later use: a method receiver (`a.iter_mut()` then
   `zero(it)` with `IterMut<i64>`; `Some(4).and_then(half)` with `half:
-  fn(i64)`), `let y = x;` and `x + 1` into another `let` (no unification between two locals,
-  but `let r = &x;` links), a capture by a closure (closed when the
-  closure is checked), a pattern's scrutinee (`match x {..}`), a format
-  hole (`println("{n}")` then `f(n)` with `f(usize)`: the hole's
-  `Display` impl is picked where it is checked; a later `i64` use still
-  widens, F29.3), a closure whose body is a literal (`|| 1`, then `twice(c)`
+  fn(i64)`), an open local in a tree other than F18.5's leaves (a branch
+  of an `if` or a `match`, `let b = if c { a } else { 0 };`, an array's
+  element), a capture by a closure (closed when the closure is checked),
+  a pattern's scrutinee (`match x {..}`), a
+  destructuring `let` (`let (a, b) = (0, 1);`), a hole of a
+  `format_args` value (`format_args("{n}")` then `f(n)` with `f(usize)`:
+  its closure holds the hole's value, whose `Display` impl is picked
+  where it is checked; a later `i64` use still widens, F29.3; a direct
+  call's hole keeps it open since 0.28.0), a closure whose body is a literal (`|| 1`, then `twice(c)`
   with `FnMut() -> i64`), a literal that fixes a closure's parameter type
   (`fold(0, |a, x| a + x)` with `x: &i64`, `scan(0, ..)`), a range of
   literals as a receiver or behind `&` (`(1..4).sum()` into an `i64`), a
@@ -2184,10 +2210,11 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   then `&W<i64>`) is not F18.6's either: the literals bind `T` at the
   call, to `i32` (a variable is made only for a parameter left free;
   FL1). The corpus writes the suffix
-  (`1i64`) where it meets one. A comparison of two open locals, `a > b`,
-  closes both. (Since 0.27.7 a cast keeps the local open, and an integer
-  type's own method on an open local, `x.pow(2)`, is E0689, F18.5, as on a
-  literal tree.)
+  (`1i64`) where it meets one. (Since 0.27.7 a cast keeps the local
+  open, and an integer type's own method on an open local, `x.pow(2)`, is
+  E0689, F18.5, as on a literal tree; since 0.28.0 `let y = x;`, `x + 1`
+  into another `let`, a comparison of two open locals, `s += x` and a
+  `for` loop's local over a literal range are one variable, F18.5.)
 - **FL7 (const evaluation).** F3.2's consts fold with `consteval.vl`'s
   language, smaller than rustc's const eval (no loops, no `if` over
   consts until 0.29).
