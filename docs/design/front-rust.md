@@ -590,6 +590,43 @@ Arena<P>`), `Box<T, A>`, arrays, tuples and the other parts are looked
 through as before; MVS is unchanged. *Anchor:* `front/check/
 alloc_rules.vl: field_allocator`.
 
+### F34 `const fn`
+
+**F34.1 (the qualifier).** (0.27.6) In a rust-edition file `const fn`,
+`const unsafe fn` and `const extern "C" fn` declare a function as
+`fn`, `unsafe fn` and `extern "C" fn` do: at the top level and in an
+inherent impl or a trait impl, after any visibility (`pub const fn`); a
+block holds no item in vole, `const fn` or other. The qualifier changes nothing in the function, which is called
+at run time like any other. A call of it is constant where a call of a
+function whose body is one expression already is: a static's
+initializer (consteval.vl's constant constructors). rustc's checks of a
+`const fn` body (E0015: a non-`const` call in it) are not made. A
+`const` before anything else is a constant, as before (`const N: τ =
+v;`), and `*const fn()` is a raw pointer type. *Anchor:*
+`front/parser/rust.vl: skip_const_fn`, `front/parser/items/mod.vl:
+parse_item, parse_impl`. *Cases:* `rust_f_f34_const_fn`.
+
+**F34.2 (constants of other types).** (0.27.6) In a rust-edition file
+a `const C: τ = v;` whose type is not a number, a `bool`, a fieldless
+enum or a string, or whose value calls a function (`const N: u64 =
+double(21);`, `const SECOND: D = D::new(1, 0);`), is made at each use:
+`C` stands for a copy of `v`, checked against `τ` in the constant's
+module, as an inherent impl's constant already is (F3.1:
+`assoc.vl: inherent_const_value`). So each use is a fresh value, as in
+Rust: two uses of a constant with a Drop field are two values, each
+dropped once, and a change to one does not reach the other. Rust
+evaluates `v` at compile time and copies the result; vole evaluates it
+at each use, which gives the same values because a `const fn`'s body is
+deterministic. Such a constant is not a compile-time value yet: as an
+array length or in a pattern it is an error that says so (rustc accepts
+both). A constant defined through itself is an error at its use.
+0.27.5 refused such a constant ("constants must be integers, floats,
+bool or string literals"). MVS is unchanged. *Anchor:*
+`front/check/collect.vl: collect_const_types` (state 3),
+`front/check/names.vl: inline_const`, `front/consteval.vl:
+const_value, eval_array_len`. *Cases:* `rust_f_f34_const_values`,
+`rust_f_f34_const_len_err`.
+
 ## 2. Traits
 
 ### F2 Supertraits
@@ -1305,10 +1342,24 @@ an expected type checks the value it gives (the `Ok`'s or `Some`'s
 payload) against it first, by (a), before its error's conversion
 (`let n: u8 = s.parse()?`). A variant pattern checked against a
 variable's enum names its variant of the solution's when the function's
-check ends. *Anchor:* `front/check/infer.vl`, `generics/instantiate.vl:
-require_bound, infer_from`, `check_mode.vl: check_expr_inner`,
-`assoc.vl: projection`, `resolve.vl: resolve_type` (the `_`),
-`try_op.vl: check_try`.
+check ends. (g) (0.27.6) A variable for a bounded parameter
+(`Vec::<u8, _>::new_in(gpa)`, `let v: Vec<u8, _> = ..`: `A: Allocator`)
+is not checked against its bound while free: the instance made with it
+is made again with the solution, and the bound is checked then, at the
+call and at the `_` that made it (rustc E0277 for `Vec::<u8,
+_>::new_in(5i64)`). A value synthesized before it is checked (a struct
+literal's field, synthesized to infer the struct's parameters) is
+unified with the type it is checked against when either mentions a free
+variable, as by (a): `gpa` where the `_` goes, and `Vec::new_in(g)`
+(`Vec<?T, &Gpa>`) where the field's `Vec<i64, &Gpa>` goes. Before, the
+bound was checked on the variable ("the trait 'Allocator' is not
+implemented for '_'"), and the field's value did not solve it
+("expected 'Vec<i64, &Gpa>', got 'Vec<_, &Gpa>'"). *Anchor:*
+`front/check/infer.vl`, `generics/instantiate.vl: require_bound,
+infer_from`, `check_mode.vl: check_expr_inner`, `assoc.vl: projection`,
+`resolve.vl: resolve_type` (the `_`), `try_op.vl: check_try`,
+`traits.vl: check_bounds` and `generics/mod.vl: check_arg` (g). Cases
+`rust_f_f18_hole_alloc_ok`, `rust_f_f18_hole_alloc_err`.
 
 **F18.7 (a field typed by its parameter takes the value's type;
 0.27.6).** A generic struct literal or enum variant whose one free

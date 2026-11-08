@@ -198,6 +198,16 @@ The front (front273):
 - `let ref x = e;` and `let ref mut x = e;` borrow `e` as `&e` and
   `&mut e` do, as rustc does (F27.2). 0.27.5 moved `e`: after `let ref z
   = a;`, `a` was moved, and `let ref mut w = v[0]` changed a copy.
+- `const fn` declares a function, at the top level and in impls (F34.1).
+  A call of one is constant in a static's value (`static S: D =
+  D::new(5);`).
+- A constant of a struct or tuple type, or whose value calls a function,
+  is accepted (F34.2). Examples: `const ORIGIN: D = D { secs: 5 };`,
+  `const N: u64 = double(21);`. Each use makes the value again, so two
+  uses of a constant with a Drop field are two values, as in Rust.
+  - Such a constant is not yet a compile-time value: as an array length
+    or in a pattern it is an error.
+  - 0.27.5 refused these constants.
 
 std2 and the translator (fl10274):
 
@@ -234,6 +244,18 @@ The front (fl10274):
   arena: Arena::new_in(gpa) }` is `Cx<Arena<Gpa>>`. 0.27.5 bound `W` to
   the `_in` call's allocator argument, the rule for a field `Vec<T, W>`,
   and gave "expected 'Gpa', got 'Arena<Gpa>'" (gate 3's main.vl:204).
+- A `_` for a bounded parameter is inferred, as rustc infers it
+  (front-rust.md F18.6 g): `Vec::<u8, _>::new_in(gpa)`, `let v: Vec<u8,
+  _> = Vec::new_in(gpa)`, and the same as a struct literal's field. The
+  bound is checked once the `_` is solved. 0.27.5 checked it on the `_`
+  itself ("the trait 'Allocator' is not implemented for '_'"), and the
+  translator's `Buf::new_in` row writes that form.
+- `HashMap<&[u8], V>` checks: std2's `[T]` hash calls `T::hash_slice`.
+- std2's `write(self.emsg, "{}", self.name())`, a writer place that is
+  no reference, is two-phase, as rustc's `write!(self.emsg, ..)`'s
+  autoref'd receiver (borrowck.md D7.4): the arguments may read what
+  holds the writer. `write(&mut self.emsg, ..)` and an explicit `&mut v`
+  argument are not, as in rustc (E0502).
 
 ### What's new in 0.27.5
 
