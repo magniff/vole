@@ -675,6 +675,17 @@ template, so a template with no instance is checked too, and
 region-free instances are deduped against it (front272: no opaque
 type kind exists in `front/types.vl` at v0.27.0). The key is stable
 across releases (0.27.4 checks compiler/src's many instances).
+0.27.6 adds (e): rustc checks only the template, so a template whose
+opaque instance has borrowck errors reports only those. The errors of a
+concrete instance with a region among its type arguments (`slots(τᵢ) ≠
+∅` for some i) are held until every body is solved. They are reported
+then, unless the template's opaque instance has errors. For
+`fn mixed<'a, 'b, I: Iterator<Item = &'b str>>(args: I) -> Option<&'a
+str>`, the opaque instance's `'b must outlive 'a` is reported, and not
+`mixed<Split<char>>`'s at the `let`, which says the same of Split's
+lifetime. A region-free instance is not held: the opaque instance
+reuses its verdict (b, d). *Anchor:* `places/borrowck/mod.vl:
+check_body, release_held`. *Case:* `rust_b_err_proj_item_bound`.
 
 **D4.5 (implied and declared bounds; the order ⊒).** `⊒` is the least
 preorder on `U` containing: `'static ⊒ 'u` for every `'u`; every
