@@ -7,6 +7,7 @@ use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::{NodeKind, child};
 use crate::front::conv::{CONV_IN_OUT, CONV_LET, CONV_SINK_K, param_conv};
+use crate::front::lexer::Tok;
 use crate::front::own::summary::{S_L1_P, S_L1_STAR, S_L2_P, S_L2_STAR, summary_of};
 use crate::front::types::fn_param;
 use crate::middle::lower::ssa::HMap;
@@ -585,7 +586,9 @@ fn ref_view_item(n: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
 // temporary given to one (`&leaf_of(..)`) need not live as long as the
 // result. A view, an item or a container of views by value (`Vec<Ev<'_>>`)
 // has it always: the summary may miss a view a moved value carries.
-fn name_region(n: i64, fi: i64, r: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+// (0.27.6) fn_region false: the `'a` an impl names (impl_region), the
+// result marked with it even when no parameter is.
+fn name_region(n: i64, fi: i64, r: i64, fn_region: bool, tr: inout Tr, pcx: inout Ctx<Comp>) {
     var known = false;
     var own_mask: i64 = 0;
     var through_mask: i64 = 0;
@@ -645,10 +648,173 @@ fn name_region(n: i64, fi: i64, r: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
             named += 1;
         }
     }
-    if named == 0 {
+    if named == 0 && fn_region {
         return;
     }
     mark_region(r, 2, 0, &tr, pcx);
+    // (the impl's `'a`, impl_region: named there)
+    if fn_region {
+        put_fn_region(n, &tr, &pcx);
+    }
+}
+
+// (0.27.6, flip28's T2) A pointer to views a function takes as an out
+// parameter, `message: *[u8]`, and sets to a part of a view it takes,
+// `*message = line[m..n]`: the two are tied, `fn f<'a>(line: &'a [u8],
+// .., message: *mut &'a [u8])`; elided, the pointer's views would be of
+// a region of their own, which the part of `line` does not outlive.
+fn out_view_tie(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let body = pcx.nodes[n].c;
+    if body <= 0 {
+        return;
+    }
+    var tied = false;
+    for j in 0..pcx.nodes[n].count {
+        let p = child(n, j, pcx);
+        if p <= 0 || pcx.nodes[p].kind != NodeKind::Param {
+            continue;
+        }
+        let tn = pcx.nodes[p].b;
+        if tn <= 0 || pcx.nodes[tn].kind != NodeKind::TyPtr || SRC[pcx.nodes[tn].start] != '*' {
+            continue;
+        }
+        let a = pcx.nodes[tn].a;
+        if a <= 0 || pcx.nodes[a].kind != NodeKind::TySlice || SRC[pcx.nodes[a].start] != '[' {
+            continue;
+        }
+        let v = view_set_from(body, pcx.nodes[p].a, n, pcx);
+        if v > 0 {
+            tr.static_res.put(a + 1, 2);
+            tr.static_res.put(pcx.nodes[v].b + 1, 2);
+            tied = true;
+        }
+    }
+    if tied {
+        put_fn_region(n, &tr, &pcx);
+    }
+}
+
+// The view parameter of function node n (a Param) a part of which node e
+// (not a closure's) assigns to `*out`, or 0.
+fn view_set_from(e: i64, out: i64, n: i64, pcx: Ctx<Comp>) -> i64 {
+    if e <= 0 || pcx.nodes[e].kind == NodeKind::Closure {
+        return 0;
+    }
+    if pcx.nodes[e].kind == NodeKind::Assign {
+        let t = pcx.nodes[e].b;
+        if t > 0 && pcx.nodes[t].kind == NodeKind::Unary && pcx.nodes[t].op == Tok::Star
+            && pcx.nodes[t].b > 0 && pcx.nodes[pcx.nodes[t].b].kind == NodeKind::Ident
+            && pcx.nodes[pcx.nodes[t].b].a == out {
+            let p = view_root(pcx.nodes[e].c, n, 0, pcx);
+            if p > 0 {
+                return p;
+            }
+        }
+    }
+    var kids = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    crate::tools::translate::kids_of(e, &kids, pcx);
+    for i in 0..kids.count {
+        let p = view_set_from(kids.get(i), out, n, pcx);
+        if p > 0 {
+            return p;
+        }
+    }
+    0
+}
+
+// The view parameter of function node n (a Param) value e is a part of,
+// or 0: a range of one, an `if` or a block of such parts, a local each of
+// whose `let`s and assignments in n's body is one of the same.
+fn view_root(e0: i64, n: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
+    var e = e0;
+    while e > 0 && (pcx.nodes[e].kind == NodeKind::Index && pcx.nodes[e].b > 0
+        && pcx.nodes[pcx.nodes[e].b].kind == NodeKind::Range
+        || pcx.nodes[e].kind == NodeKind::Unary && SRC[pcx.nodes[e].start] != '&'
+        && SRC[pcx.nodes[e].start] != '*') {
+        e = if pcx.nodes[e].kind == NodeKind::Index { pcx.nodes[e].a } else { pcx.nodes[e].b };
+    }
+    if e <= 0 || depth > 6 {
+        return 0;
+    }
+    let k = pcx.nodes[e].kind;
+    if k == NodeKind::Block {
+        return view_root(pcx.nodes[e].a, n, depth + 1, pcx);
+    }
+    if k == NodeKind::If {
+        let a = view_root(pcx.nodes[e].b, n, depth + 1, pcx);
+        return if a > 0 && pcx.nodes[e].c > 0 && view_root(pcx.nodes[e].c, n, depth + 1, pcx) == a {
+            a
+        } else {
+            0
+        };
+    }
+    if k != NodeKind::Ident {
+        return 0;
+    }
+    let name = pcx.nodes[e].a;
+    for j in 0..pcx.nodes[n].count {
+        let p = child(n, j, pcx);
+        let tn = if p > 0 && pcx.nodes[p].kind == NodeKind::Param { pcx.nodes[p].b } else { 0 };
+        if tn > 0 && pcx.nodes[p].a == name {
+            return if pcx.nodes[tn].kind == NodeKind::TySlice && SRC[pcx.nodes[tn].start] == '[' {
+                p
+            } else {
+                0
+            };
+        }
+    }
+    // (a local: every value given to it, the same parameter's part)
+    var values = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    local_values(pcx.nodes[n].c, name, &values, pcx);
+    var root: i64 = 0;
+    for i in 0..values.count {
+        let v = values.get(i);
+        // (a part of itself, `text = text[0..q]`, keeps its root)
+        var w = v;
+        while w > 0 && pcx.nodes[w].kind == NodeKind::Index && pcx.nodes[w].b > 0
+            && pcx.nodes[pcx.nodes[w].b].kind == NodeKind::Range {
+            w = pcx.nodes[w].a;
+        }
+        if w > 0 && pcx.nodes[w].kind == NodeKind::Ident && pcx.nodes[w].a == name {
+            continue;
+        }
+        let r = view_root(v, n, depth + 1, pcx);
+        if r <= 0 || root > 0 && r != root {
+            return 0;
+        }
+        root = r;
+    }
+    root
+}
+
+// The values node e (not a closure's) gives the local name: its `let`s'
+// and assignments'.
+fn local_values(e: i64, name: i64, out: inout IntVec, pcx: Ctx<Comp>) {
+    if e <= 0 || pcx.nodes[e].kind == NodeKind::Closure {
+        return;
+    }
+    let k = pcx.nodes[e].kind;
+    if k == NodeKind::Let {
+        let pat = pcx.nodes[e].a;
+        if pat > 0 && pcx.nodes[pat].kind == NodeKind::PatBind && pcx.nodes[pat].a == name {
+            out.push(pcx.nodes[e].c);
+        }
+    } else if k == NodeKind::Assign {
+        let t = pcx.nodes[e].b;
+        if t > 0 && pcx.nodes[t].kind == NodeKind::Ident && pcx.nodes[t].a == name {
+            out.push(pcx.nodes[e].c);
+        }
+    }
+    var kids = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    crate::tools::translate::kids_of(e, &kids, pcx);
+    for i in 0..kids.count {
+        local_values(kids.get(i), name, &out, pcx);
+    }
+}
+
+// Function node n's own `<'a>`, after its name (or first in its
+// parameters, `<'a, T>`).
+fn put_fn_region(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     let g = pcx.nodes[n].g;
     if g > 0 && SRC[pcx.nodes[g].start] == '<' {
         put(pcx.nodes[g].start + 1, pcx.nodes[g].start + 1, "'a, ", TC_VIEW, &tr, &pcx);
@@ -663,6 +829,37 @@ fn name_region(n: i64, fi: i64, r: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
         q += 1;
     }
     put(q, q, "<'a>", TC_VIEW, &tr, &pcx);
+}
+
+// (0.27.6, flip28's T5) Whether method n is in an inherent impl of a
+// struct with views, `impl Line`: the impl names the struct's region,
+// `impl<'a> Line<'a>`, and a method's result that has views and no
+// reference to borrow from, `fn word(self, k) -> &'a str`, `fn new(..,
+// word: &'a str) -> Leaf<'a, A>`, names it too (name_region), as Rust's
+// elision would not (a receiver by value, a view by value it stores).
+fn impl_region(n: i64, tname: [u8], tr: inout Tr, pcx: inout Ctx<Comp>) -> bool {
+    let h = pcx.nodes[n].h;
+    if tname.len != 0 || h <= 0 || pcx.nodes[h].kind != NodeKind::TyName
+        || !editable(pcx.nodes[h].start, &pcx)
+        || !crate::tools::translate::regions::names_view_item(h, tr, pcx) {
+        return false;
+    }
+    // (the impl's `impl`, before its parameters and the type)
+    var q = pcx.nodes[h].start - 4;
+    let low = if q > 200 { q - 200 } else { 0 };
+    while q >= low && !(word_here(q, "impl") && (q == 0 || !ident_char(SRC[q - 1]))) {
+        q -= 1;
+    }
+    if q < low {
+        return false;
+    }
+    tr.static_res.put(h + 1, 2);
+    if SRC[q + 4] == '<' {
+        put(q + 5, q + 5, "'a, ", TC_VIEW, &tr, &pcx);
+    } else {
+        put(q + 4, q + 4, "<'a>", TC_VIEW, &tr, &pcx);
+    }
+    true
 }
 
 // Function node n's parameters and result.
@@ -686,6 +883,11 @@ fn edit_signature(n: i64, impls: HMap, tr: inout Tr, pcx: inout Ctx<Comp>) {
     let tname = impl_trait(n, impls, pcx);
     tr.force_ref = tname == "Eq" || tname == "Ord" || tname == "PartialEq" || tname == "PartialOrd";
     let im = impls.get(n + 1);
+    // (before the parameters: the regions their views take)
+    let impl_a = impl_region(n, tname, &tr, &pcx);
+    if !impl_a {
+        out_view_tie(n, &tr, &pcx);
+    }
     let gen = if im > 0 { pcx.nodes[im].g } else { 0 };
     var i: i64 = 0;
     for j in 0..pcx.nodes[n].count {
@@ -715,12 +917,14 @@ fn edit_signature(n: i64, impls: HMap, tr: inout Tr, pcx: inout Ctx<Comp>) {
     var budget: i64 = 4096;
     if r > 0 && (static_result(n, pcx) || static_returns(n, 0, &budget, pcx)) {
         mark_region(r, 1, 0, &tr, pcx);
+    } else if r > 0 && impl_a && !receiver && has_view(r, 0, tr, pcx) {
+        name_region(n, fi, r, false, &tr, &pcx);
     } else if r > 0 && borrowed == 0 && !receiver {
         // (every view in it: `[&'static str; 21]`, `Vec<Opt<'static>>`)
         mark_region(r, 1, 0, &tr, pcx);
     } else if r > 0 && (borrowed >= 2 || borrowed == 1 && ref_view_item(n, tr, pcx)) && !receiver
         && has_view(r, 0, tr, pcx) {
-        name_region(n, fi, r, &tr, &pcx);
+        name_region(n, fi, r, true, &tr, &pcx);
     }
     if r > 0 && pcx.nodes[r].kind == NodeKind::TySlice && SRC[pcx.nodes[r].start] == '[' {
         view_put(r, pcx.nodes[r].start, &tr, &pcx);
@@ -767,7 +971,9 @@ fn edit_types(tr: inout Tr, pcx: inout Ctx<Comp>) {
             let a = pcx.nodes[n].a;
             if a > 0 && pcx.nodes[a].kind == NodeKind::TySlice && SRC[pcx.nodes[a].start] == '[' {
                 put(pcx.nodes[a].start, pcx.nodes[a].start,
-                    if params.get(n + 1) != 0 { "&" } else { "&'static " }, TC_VIEW, &tr, &pcx);
+                    if params.get(n + 1) != 0 { region_amp(tr.static_res.get(a + 1)) }
+                    else { "&'static " },
+                    TC_VIEW, &tr, &pcx);
             }
             continue;
         }

@@ -9,7 +9,7 @@ use crate::base::ctx::Ctx;
 use crate::front::ast::{CONV_NEW, NodeKind, child};
 use crate::front::check::is_std_named;
 use crate::front::lexer::Tok;
-use crate::front::types::{TY_I64, TY_I8, TY_ISIZE, TY_U64, TY_U8, TyKind};
+use crate::front::types::{REF_MUT, TY_I64, TY_I8, TY_ISIZE, TY_U64, TY_U8, TyKind};
 use crate::middle::lower::ssa::HMap;
 use crate::tools::translate::{
     D_REF, TC_BORROW, TC_BYTES, TC_DEREF, TC_INOUT_LOCAL, TC_INT, TC_LEN, TC_MUT_MARKER, TC_PRINT,
@@ -247,18 +247,114 @@ fn edit_for_copy(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
 // Whether place e's root is a local bound by `let` (not `var`): its
 // address is a shared one.
 fn let_root(e: i64, pcx: Ctx<Comp>) -> bool {
+    let d = root_decl(e, pcx);
+    d > 0 && pcx.nodes[d].kind == NodeKind::Let && pcx.nodes[pcx.nodes[d].a].b == 0
+        && !word_here(pcx.nodes[d].start, "var")
+}
+
+// Whether place e's root is a local bound by `var`.
+fn var_root(e: i64, pcx: Ctx<Comp>) -> bool {
+    let d = root_decl(e, pcx);
+    d > 0 && pcx.nodes[d].kind == NodeKind::Let && word_here(pcx.nodes[d].start, "var")
+}
+
+// Whether place e can be lent `&mut` in the rust edition: a `var`
+// local's, or a part of what a raw pointer or a `&mut` points to (an
+// inout parameter's, `cx.inst_cap`; `*af`; `cc.rel` of a `let cc: *C`),
+// not a `let`'s, a parameter's own or a static's.
+fn place_mut(e: i64, pcx: Ctx<Comp>) -> bool {
+    var r = e;
+    while r > 0 {
+        let k = pcx.nodes[r].kind;
+        if k == NodeKind::Unary && pcx.nodes[r].op == Tok::Star {
+            let b = pcx.nodes[r].b;
+            let t = if b > 0 { pcx.nodes[b].ty } else { 0 };
+            return t > 0 && pcx.types[t].kind == TyKind::Ptr
+                && (pcx.types[t].b == 0 || pcx.types[t].b == REF_MUT);
+        }
+        if k == NodeKind::FieldAccess || k == NodeKind::Index || k == NodeKind::TupleField {
+            let b = pcx.nodes[r].a;
+            let t = if b > 0 { pcx.nodes[b].ty } else { 0 };
+            if t > 0 && pcx.types[t].kind == TyKind::Ptr {
+                return pcx.types[t].b == 0 || pcx.types[t].b == REF_MUT;
+            }
+            r = b;
+            continue;
+        }
+        if k == NodeKind::Ident {
+            return var_root(r, pcx);
+        }
+        return false;
+    }
+    false
+}
+
+// Whether e is an element of a raw pointer, `p[i]`, whose address
+// `&p[i]` the translation writes `p.add(i)` (edit_ptr_index).
+fn ptr_element(e: i64, pcx: Ctx<Comp>) -> bool {
+    let b = if pcx.nodes[e].kind == NodeKind::Index { pcx.nodes[e].a } else { 0 };
+    let t = if b > 0 { pcx.nodes[b].ty } else { 0 };
+    t > 0 && pcx.types[t].kind == TyKind::Ptr && pcx.types[t].b == 0
+}
+
+// Whether place e is a part of a `let` local or a by-value parameter
+// itself (not through a pointer or a reference), and its binding is made
+// `mut` for a `&mut` of it: `let mut k`, `fn f(mut x: T)`.
+fn owned_binding(e: i64, tr: inout Tr, pcx: inout Ctx<Comp>) -> bool {
+    var r = e;
+    while r > 0 && (pcx.nodes[r].kind == NodeKind::FieldAccess
+        || pcx.nodes[r].kind == NodeKind::Index || pcx.nodes[r].kind == NodeKind::TupleField) {
+        let b = pcx.nodes[r].a;
+        let t = if b > 0 { pcx.nodes[b].ty } else { 0 };
+        if t > 0 && pcx.types[t].kind == TyKind::Ptr {
+            return false;
+        }
+        r = b;
+    }
+    if r <= 0 || pcx.nodes[r].kind != NodeKind::Ident {
+        return false;
+    }
+    let d = root_decl(r, pcx);
+    if d <= 0 {
+        return false;
+    }
+    if pcx.nodes[d].kind == NodeKind::Let {
+        let pat = pcx.nodes[d].a;
+        if pat <= 0 || pcx.nodes[pat].kind != NodeKind::PatBind
+            || !word_here(pcx.nodes[d].start, "let")
+            || pcx.nodes[r].ty <= 0 || pcx.types[pcx.nodes[r].ty].kind == TyKind::Ptr {
+            return false;
+        }
+        put(pcx.nodes[pat].start, pcx.nodes[pat].start, "mut ", TC_VAR, &tr, &pcx);
+        return true;
+    }
+    // (a parameter by value, written with its name first)
+    let tn = pcx.nodes[d].b;
+    let name = crate::base::sym_text(pcx.nodes[d].a, pcx);
+    if pcx.nodes[d].kind != NodeKind::Param || tn <= 0 || pcx.nodes[tn].kind == NodeKind::TyPtr
+        || !word_here(pcx.nodes[d].start, name) || pcx.nodes[r].ty <= 0
+        || pcx.types[pcx.nodes[r].ty].kind == TyKind::Ptr {
+        return false;
+    }
+    put(pcx.nodes[d].start, pcx.nodes[d].start, "mut ", TC_VAR, &tr, &pcx);
+    true
+}
+
+// The declaration of place e's root in its function, a Param or a Let
+// (the nearest before it), or 0 (a static, a constant).
+fn root_decl(e: i64, pcx: Ctx<Comp>) -> i64 {
     var r = e;
     while r > 0 && (pcx.nodes[r].kind == NodeKind::FieldAccess
         || pcx.nodes[r].kind == NodeKind::Index || pcx.nodes[r].kind == NodeKind::TupleField) {
         r = pcx.nodes[r].a;
     }
     if r <= 0 || pcx.nodes[r].kind != NodeKind::Ident {
-        return false;
+        return 0;
     }
     let pos = pcx.nodes[r].start;
     let f = enclosing_fn(pos, pcx);
     if f <= 0 {
-        return false;
+        return 0;
     }
     var best = 0;
     for n in 1..pcx.nodes.len() as i64 {
@@ -275,8 +371,7 @@ fn let_root(e: i64, pcx: Ctx<Comp>) -> bool {
             best = n;
         }
     }
-    best > 0 && pcx.nodes[best].kind == NodeKind::Let
-        && pcx.nodes[pcx.nodes[best].a].b == 0 && !word_here(pcx.nodes[best].start, "var")
+    best
 }
 
 // Whether place e's root is a parameter of its function (immutable in
@@ -364,6 +459,28 @@ fn edit_amp(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
         && pcx.types[t].b == 0 && operand > 0 && access_to_ref(operand, tr, pcx) {
         put(s, inner, "", TC_MUT_MARKER, &tr, &pcx);
         return;
+    }
+    // (0.27.7) a mutable place's address given where a raw pointer goes,
+    // MVS's `&m` to a `*[u8]` out parameter, `&cx.inst_cap` of an inout cx:
+    // `&mut m`, which Rust coerces to `*mut T` (rustc coerces a `&T` only
+    // to a `*const T`, E0308; place_mut). A `let`'s or a parameter's own
+    // place (not through a pointer) is `&mut x` too, its binding made
+    // `mut` (owned_binding): the callee may write through the pointer, and
+    // a write through one made from `&raw const x` is undefined. A static's,
+    // or a place behind a shared reference, keeps its `&` (a `static
+    // mut`'s reference is Rust 2024's error)
+    if SRC[s] == '&' && SRC[s + 1] != '&' && t > 0 && pcx.types[t].kind == TyKind::Ptr
+        && pcx.types[t].b == 0 && operand > 0 && !word_here(inner, "mut")
+        && !(c > 0 && pcx.nodes[c].kind == NodeKind::Cast) && !ptr_element(operand, pcx) {
+        if place_mut(operand, pcx) {
+            // (before a deref put there, `&mut (*p.add(i)).f`)
+            put_first(s + 1, "mut ", &tr, &pcx);
+            return;
+        }
+        if !access_to_ref(operand, tr, pcx) && owned_binding(operand, &tr, &pcx) {
+            put_first(s + 1, "mut ", &tr, &pcx);
+            return;
+        }
     }
     if SRC[s] != '&' || SRC[s + 1] == '&'
         || !is_mut_ref(t, pcx) && !mut_slice(t, pcx) {
