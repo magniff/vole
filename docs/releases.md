@@ -85,10 +85,24 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.4 | `v0.27.4` | 0.27.3 | aarch64-macos | gate 3 opens (`fix --edition rust` on compiler/src: 122 type errors, 3,048 borrowck behind them); inference from a later statement (FL1); `[T]`/`str` unsized places (Z9.1c); `&raw` and Rust 2024's `static mut` rule; `format_args` a value; std2 1,445 of 1,473 tests at -O0; a rust hello world 2.03x MVS's |
 | 0.27.5 | `v0.27.5` | 0.27.4 | aarch64-macos | std2's `std::time`, `fs`, `process`, `cli` (gate 3 from 122 to 37 type errors); operands read where evaluated (D2.4a); text is not its bytes (F0.6); a generic iterator's item is its bound's (D4.6 f); std2 lexed by its units (a rust hello world 1.82x MVS's, the 2.0x ceiling enforced) |
 | 0.27.6 | `v0.27.6` | 0.27.5 | aarch64-macos | gate 3 has no type errors (76 borrowck left); std::gpu::wgsl in std2; a method in a generic body is the one it names (Z9.1c); const fn and constants made at each use; octal, `let ref`; a 0.27.5 wrong-output fix (constants' names) and an -O0 link fix |
+| 0.27.7 | `v0.27.7` | 0.27.6 | aarch64-macos | gate 3 is 0 (no type or borrowck error); SRC a view valid for the process, frozen buffers; the translator's last shapes; a copied/cloned iterator's items; two rust-edition wrong-value fixes (a let-bound literal shift typed i32) |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.27.7
+
+Gate 3 is 0. `fix --edition rust` on a copy of compiler/src type-checks
+and passes the borrow checker, with no error left (0.27.6: 76 borrowck
+errors). This is the state 0.28, the flip, starts from. SRC is a view
+valid for the process, a frozen buffer's views are static, the
+translator's last shapes (an index or an argument that calls with the
+root `&mut`, impl regions, out parameters of views, `&mut x` where a
+`*mut T` goes) are written as rustc takes them, and the front reads an
+adapter's items through the bound that names them. Two silent wrong
+values of 0.27.5 and 0.27.6 in the rust edition are fixed: a let-bound
+literal shift, and such a local closed by a cast, were typed `i32`. MVS
+programs compile exactly as before. Built and tested on aarch64-macos
+only.
 
 The front (front277), from the 0.28 flip rehearsal:
 
@@ -104,10 +118,6 @@ The bootstrap: the fixpoint's last build, the one compared with the build before
 
 That entry turned out to be a cold build's: the first self-compile by the new head, with an empty cache, made `tools.lsp.answer.find_operators` with three more blocks. Its key and all 120 of its recorded reads were the same as a clean build's, and no build since has made it again (some 80 cold builds, 30 of them in a row under load). The cache only kept it, so later builds repeated it. One way a cold build could depend on the schedule is now closed. Passes check instruction and block marks against stamps of their thread's context, and every context counts those stamps from the same base. A mark left by the function's task in another context, or installed from the cache, could equal the next stamp. Each task now zeroes its functions' marks as it begins (`middle::parallel::clear_marks`). The self-compile's output is unchanged, and its cost is the same (compile_cost 1.00x).
 
-In progress. Gate 3's borrowck errors that view storage other than SRC
-are being fixed in MVS (docs/design/src-buffer.md, views of other
-storage): 76 to 67 so far. MVS programs compile exactly as before.
-Built and tested on aarch64-macos only.
 
 The front (front273):
 
