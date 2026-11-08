@@ -131,6 +131,10 @@ The translator (g3274):
   borrowck (partial) 152 to 96. A borrowck case for the class it leaves,
   a `&mut` coerced to a raw pointer held through the call:
   `rust_b_raw_coerce_ends_borrow` (XFAIL).
+- An argument the checker takes as a view for a parameter written `&mut`
+  (std::arch's `vst1q_u32(s: &mut [u32], ..)`) is `&mut` too, as for
+  `inout`: link_macho's `vst1q_u32(&mut h[..], 0, abcd)` (rustc E0308,
+  which the rust edition's `&e` reports since front273). Gate 3: 5 to 3.
 
 The front (front273):
 
