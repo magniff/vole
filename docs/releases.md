@@ -310,6 +310,12 @@ std2 gets the rest of MVS's std (std280):
   std2/rt/sys_macos.vl and sys_linux.vl. *Cases:* `sys_files`,
   `sys_process`, `sys_pty`, `sys_layout` (struct layouts against the C
   headers), run without XFAIL and under `--check-alloc`.
+- **std::capture.** The frame-capture request that std::window's
+  scripted loop makes (`shot FILE`) and std::gpu serves when a frame is
+  presented: `capture_next_frame(&str)`, `capture_pending`,
+  `capture_cancel` and `take_capture(&mut String<A>)`. The request is a
+  `static mut`, guarded by an AtomicBool spin lock, so any thread may
+  make or serve one. *Case:* `std2_capture_request`.
 - tools/std2-checklist.py reads MVS's items from an MVS program
   (examples/args). Since the flip, the tree's root is a rust program
   whose std is std2, so the checklist could not be made.
