@@ -174,6 +174,38 @@ Two crashes in the rust edition (crash280):
   `--verify-places`; sscanf writes through it),
   `rust_b_variadic_mut_ref_moved_err`.
 
+The borrow checker (sound280): three gaps that accepted programs rustc
+rejects and that used memory after it was freed (mig28's soundness
+group, 12 cases of the views audit):
+
+- **A statement's temporaries end with the statement.** A `let` kept
+  its initializer's temporaries to the block's end whenever its type
+  was a view. Now, as rustc's rule, only an extending initializer keeps
+  them: `&e`, or a tuple, array, braced struct or cast of one. `let w =
+  v[0].clone().as_str();` borrows a temporary that is dropped at the
+  `;`, and a later use of `w` is `borrowck.dropped_borrowed`, "a temporary value
+  is dropped at the end of its statement" (rustc E0716). *Cases:*
+  `rust_b_temp_dropped_err`, `rust_b_temp_extended_ok`.
+- **A static's slots are `'static`.** A `static mut` of a reference
+  had a free region, so storing a local's borrow there was accepted,
+  directly or through a function. It is `dropped_borrowed` (E0597) now,
+  or `outlives` through a parameter (E0521). *Cases:*
+  `rust_b_static_holds_local_err`, `rust_b_static_holds_static_ok`.
+- **An array's elements have regions.** An array of references had
+  none, so its loans ended at once, and a write to what they borrow was
+  accepted (E0502 in rustc). *Cases:* `rust_b_array_of_refs_err`,
+  `rust_b_array_of_refs_ok`. `rust_b_err_dk_array_glue` passes now
+  (no XFAIL).
+- Gate 3 found one true positive in the flipped tree. `base::src_copy`'s
+  result was tied to its parameter and stored into `SRC`, which is
+  `&'static`. The copy is in a mapping of its own that is never
+  unmapped or written again, so the translator now lists it as a
+  `'static` result (translate/sig.vl static_result). std2-check and
+  gate 3 are both at 0 errors, as before.
+- Known gap: there is no rvalue static promotion yet (D6.2.2). `&7` and
+  `[&7]` have the body's storage, not `'static`, so
+  `rust_b_unsized_err_raw_slice_invariant` borrows a static instead.
+
 ### What's new in 0.27.8
 
 The last release before the flip, and the compiler that builds 0.28.0.
