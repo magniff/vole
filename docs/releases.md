@@ -306,7 +306,9 @@ The front (fl10274):
   bound is checked once the `_` is solved. 0.27.5 checked it on the `_`
   itself ("the trait 'Allocator' is not implemented for '_'"), and the
   translator's `Buf::new_in` row writes that form.
-- `HashMap<&[u8], V>` checks: std2's `[T]` hash calls `T::hash_slice`.
+- `HashMap<&[u8], V>` checks. std2's `[T]` hash calls
+  `Hash::hash_slice(self, state)`, as Rust's does, with Self taken from
+  the argument (F8.2): an element type's own hash_slice runs.
 - std2's `write(self.emsg, "{}", self.name())`, a writer place that is
   no reference, is two-phase, as rustc's `write!(self.emsg, ..)`'s
   autoref'd receiver (borrowck.md D7.4): the arguments may read what
