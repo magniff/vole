@@ -111,6 +111,32 @@ The front (f185x):
   *Cases:* `rust_f_f185_open_leaves`, `rust_f_f185_open_compare`,
   `rust_f_f185_open_loops`, `rust_f_f185_open_format`.
 
+Threads (races278, the statics review's races, all in released
+compilers):
+
+- **-O0's assembler thread read BUFS while the main thread grew it.**
+  The instruction tables' text (arch::table::insn_text, for a SIMD line
+  of an intrinsic) was read as `BUFS[INSN_BUF].data` on the assembler's
+  thread, while gen0 on the main thread could grow BUFS (its overflow
+  message, made at the first overflow check: buf_new). Nothing ordered
+  the two, so under `VOLE_STRESS_GROW=1` the read could hit the moved,
+  poisoned block. insn_text reads `INSN_TEXT` now, a view of the
+  table's bytes taken when the front end loads them, before the thread
+  starts. `tests/threads_writes.sh` checks this kind now: a static the
+  main thread writes while the assembler runs, touched by a function on
+  the assembler's streaming path, must be in its ASM_READS list. (A
+  case that fails before the fix was not made: at -O0 the table is read
+  only in the intrinsics' own bodies, a few lines a program.)
+- **FN_ATTRS_DONE was read in the -O2 component phase** (ipo's
+  call_attrs and captured, before fn_facts_ready's test), where a
+  component of the same level on another thread may write it. The read
+  was unused there, as the level decides, so the race was benign in
+  value. It is read only outside the phase now.
+- **pack::USED** could be set by two tasks at once: two functions that
+  share their symbol (fn_ambig) may have one cache key and run in one
+  phase. Their tasks no longer mark the entry used. The mark only keeps
+  an entry from aging out of the pack.
+
 The front (front273, I7):
 
 - A `&mut T` place given where a raw pointer goes outside a call (a
