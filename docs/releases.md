@@ -86,6 +86,7 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.5 | `v0.27.5` | 0.27.4 | aarch64-macos | std2's `std::time`, `fs`, `process`, `cli` (gate 3 from 122 to 37 type errors); operands read where evaluated (D2.4a); text is not its bytes (F0.6); a generic iterator's item is its bound's (D4.6 f); std2 lexed by its units (a rust hello world 1.82x MVS's, the 2.0x ceiling enforced) |
 | 0.27.6 | `v0.27.6` | 0.27.5 | aarch64-macos | gate 3 has no type errors (76 borrowck left); std::gpu::wgsl in std2; a method in a generic body is the one it names (Z9.1c); const fn and constants made at each use; octal, `let ref`; a 0.27.5 wrong-output fix (constants' names) and an -O0 link fix |
 | 0.27.7 | `v0.27.7` | 0.27.6 | aarch64-macos | gate 3 is 0 (no type or borrowck error); SRC a view valid for the process, frozen buffers; the translator's last shapes; a copied/cloned iterator's items; two rust-edition wrong-value fixes (a let-bound literal shift typed i32) |
+| 0.27.8 | `v0.27.8` | 0.27.7 | aarch64-macos | open integer locals one variable (a wrong-value fix); a unit-only enum's derives by its discriminant (rustc's order and hash; one compare); three data races of released compilers fixed; `&mut` to raw pointer reborrowed, fat raw pointer coercions |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
@@ -114,6 +115,23 @@ The places IR (sc280):
 
 ### What's new in 0.27.8
 
+The last release before the flip, and the compiler that builds 0.28.0.
+Two wrong-value fixes in the rust edition: an open integer local
+(`let c = a;`, `let b = a + 1;`, `s += x`, a loop over literals) is one
+variable with the literals it is built from, typed by the use that types
+it, as rustc's `{integer}`; 0.27.7 closed it at `i32` and widened it
+later, a silent wrong value past 2^31. And the derives of a unit-only
+enum order and hash by its written discriminants, as rustc does. The
+derives of a unit-only enum compare its tag, one compare, which the
+flipped compiler needs (it was 5x slower without). Three data races of
+released compilers, found by a review of the compiler's statics for the
+flip, are fixed: -O0's assembler thread read the buffer table the main
+thread could grow, the assembler's internal error grew it, and two
+-O2 tasks could touch FN_ATTRS_DONE and the code cache's use marks
+unordered. A `&mut T` given where a raw pointer goes outside a call is
+reborrowed, and views coerce to fat raw pointers. MVS programs compile
+exactly as before. Built and tested on aarch64-macos only.
+
 The front (f185x):
 
 - **Open locals are one variable (F18.5).** An open local is a leaf of
@@ -133,6 +151,36 @@ The front (f185x):
   a `[u8]`), which rustc refuses too (E0308).
   *Cases:* `rust_f_f185_open_leaves`, `rust_f_f185_open_compare`,
   `rust_f_f185_open_loops`, `rust_f_f185_open_format`.
+
+Derives (derive278, a flip blocker):
+
+- **A unit-only enum's derives compare its tag.** 0.27.7's rust-edition
+  `#[derive(PartialEq)]` on an enum matched the pair, `match (self,
+  other) { (A, A) => true, .. _ => false }`: a compare and branch per
+  variant, inlined at every `==`. The translator derives `Clone, Copy,
+  PartialEq, Eq` on the compiler's enums, so the flipped compiler
+  spent most of its time in `Tok`'s and `NodeKind`'s `==`: `volec
+  check` of the MVS tree took 43.2 G instructions, against 8.6 G built
+  from MVS. Now a unit-only enum that derives Copy compares, orders and
+  hashes `*self as isize`, rustc's discriminant_value, as one load and
+  one compare. Its `ne`, `lt`, `le`, `gt` and `ge` are derived too, all
+  inline. A Copy type without type parameters clones by `*self`. Any
+  other enum compares the variants' indexes first, then matches only the
+  variants with fields (`_ => true`), as rustc's derive does. MVS's
+  derives do the same for an enum with fields: on a mixed-enum `==` loop,
+  234M instructions to 74M. The flipped compiler on the MVS tree now
+  takes 9.74 G to check and 108.5 G to build itself (343 G before),
+  against 8.55 G and 96.4 G built from MVS. The rest of that gap is not
+  the derives: the rust edition's lowering makes `a && b` in a condition
+  a bool phi, where MVS branches.
+  *Case:* `rust_f_derive_discriminant_ir` checks the IR's single compare.
+- **The derives agree with rustc on written discriminants.** cmp, `<`
+  and Hash of a unit-only enum use its written discriminants (`enum K {
+  A, B = 5, C, D = -3 }` orders D first), with or without Copy, and an
+  enum of one variant hashes no index. 0.27.7 used the declaration
+  index, so its order and its hash values differed from rustc's.
+  *Case:* `rust_f_derive_discriminant`, a rustc twin, including
+  DefaultHasher values.
 
 Threads (races278, the statics review's races, all in released
 compilers):
