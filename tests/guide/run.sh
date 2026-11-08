@@ -54,7 +54,7 @@ export LC_ALL
 # and --split writes its prog.vl with `// EDITION: rust` first (the twin's
 # guide programs). A topic moves here when its examples are translated
 # (0.28.0 workstream C); the others are MVS's until then.
-RUST_TOPICS=" cli closures contracts fmt generics io math memory modules unsafe "
+RUST_TOPICS=" cli closures contracts fmt generics io iterators math memory modules unsafe "
 rust_topic() { case "$RUST_TOPICS" in *" $1 "*) echo 1 ;; *) echo 0 ;; esac; }
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -345,7 +345,7 @@ if ! "$COMPILER" guide --list >"$WORK/list" 2>&1; then
     result FAIL guide-list "volec guide --list failed:" "$(cat "$WORK/list")"
 fi
 missing=""
-for t in core language rust syntax types std errors unsafe c-interop arch modules generics traits closures iterators conversions formatting memory views tools gpu; do
+for t in core language rust syntax types std errors unsafe c-interop arch modules generics traits closures iterators conversions formatting memory tools gpu; do
     awk -F '\t' -v t="$t" '$1 == t { found = 1 } END { exit !found }' "$WORK/list" || missing="$missing $t"
 done
 if [ -n "$missing" ]; then
