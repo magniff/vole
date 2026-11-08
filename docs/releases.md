@@ -100,6 +100,8 @@ The translator: an integer method called on literals, `(1 << n).wrapping_sub(1)`
 
 The bootstrap: the fixpoint's last build, the one compared with the build before it, is made without the code cache (`--no-cache`); the builds before it use the cache as before. A code cache entry made one function's register schedule differ from a cold build's in the compiler's own self-compile: a tree that held it failed the fixpoint (head built by head, cached, against the cold path), and a tree whose two builds both took it would have passed with a binary no clean build makes. Now such an entry is a failed fixpoint. It costs about 1.6 s on `bootstrap.sh --dev --no-suite` (9.4 to 11.0 s, warm, under load). chain-diverse, whose builds all have the cache off, also builds the head compiler with it on in a cache of its own, storing and then taking every entry, and compares both with the cold build. The cache bug itself is being chased.
 
+That entry turned out to be a cold build's: the first self-compile by the new head, with an empty cache, made `tools.lsp.answer.find_operators` with three more blocks. Its key and all 120 of its recorded reads were the same as a clean build's, and no build since has made it again (some 80 cold builds, 30 of them in a row under load). The cache only kept it, so later builds repeated it. One way a cold build could depend on the schedule is now closed. Passes check instruction and block marks against stamps of their thread's context, and every context counts those stamps from the same base. A mark left by the function's task in another context, or installed from the cache, could equal the next stamp. Each task now zeroes its functions' marks as it begins (`middle::parallel::clear_marks`). The self-compile's output is unchanged, and its cost is the same (compile_cost 1.00x).
+
 In progress. Gate 3's borrowck errors that view storage other than SRC
 are being fixed in MVS (docs/design/src-buffer.md, views of other
 storage): 76 to 67 so far. MVS programs compile exactly as before.
@@ -123,8 +125,10 @@ The front (front273):
 - std2's `[T]` hash calls `Hash::hash_slice(self, state)`, as Rust's
   does, with Self taken from the argument (F8.2): an element type's own
   hash_slice runs. 0.27.6 called `T::hash_slice`.
-- A `&T` given where a `*mut T` goes, a parameter's or a `let`'s
-  written type, is rustc's E0308 (D3.6a): the types differ in
+- A `&T` given where a `*mut T` goes, the written type of a parameter,
+  a `let`, a struct literal's field, the function's result (its tail or
+  a `return`) or an assigned place (`p = &x`, `s.p = &x`, `*pp = &x`),
+  is rustc's E0308 (D3.6a): the types differ in
   mutability, `try: &mut x`. `&mut T` still coerces to both raw
   pointers, and `&T` to `*const T`. 0.27.6 accepted it, so a callee
   could write through a pointer made from a shared borrow.
@@ -148,6 +152,13 @@ The compiler's own source (gate 3, front273):
   positions, arch's intrinsic table and the tools' cache's read buffer
   are frozen. `volec __selftest freeze` checks the stop
   (tests/selftest.sh).
+- The translator reads a frozen buffer's views as SRC's: base's
+  `buf_done`, arch's `text` and `intr_text` and the tools' cache's
+  `get_str` are rows of static_result's list, each with its evidence,
+  and static_returns carries them to what returns them (lsp/complete's
+  `signature`, `call_snippet`, `mod_detail`; embed's `embed_type_name`
+  and `file_line_text`) and to their callers
+  (tests/refactor/edition0277b). Gate 3: 52 to 17 borrowck errors.
 
 The translator (g3274; flip28's T2 to T5, its rehearsal's hand fixes):
 
