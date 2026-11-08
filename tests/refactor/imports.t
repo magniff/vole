@@ -62,6 +62,7 @@ fn main() -> i32 {
     let b = crate::shapes::calc::perimeter(1) + util::twice(1) + shapes::local();
     if a + b > 0 { 0 } else { 1 }
 }
+// EDITION: rust
 % cat shapes/mod.vl
 // Shapes: what shapes::calc and shapes::extra define, re-exported.
 pub mod calc;

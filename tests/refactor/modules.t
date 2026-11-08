@@ -159,7 +159,7 @@ use crate::geom::{Point, half, scale};
 pub const LIMIT: i64 = 100;
 
 // How many times `twice` ran.
-pub static var COUNTER: i64 = 0;
+pub static mut COUNTER: i64 = 0;
 
 pub fn twice(x: i64) -> i64 {
     unsafe { COUNTER += 1; }
@@ -182,7 +182,7 @@ moved 3 items to crate::util	3 files	+20 -19 lines
 % cat geom.vl
 // Points and their areas.
 
-pub struct Point {
+#[derive(Clone, Copy)] pub struct Point {
     pub x: i64,
     pub y: i64,
 }
@@ -204,7 +204,7 @@ use crate::geom::Point;
 pub const LIMIT: i64 = 100;
 
 // How many times `twice` ran.
-pub static var COUNTER: i64 = 0;
+pub static mut COUNTER: i64 = 0;
 
 pub fn twice(x: i64) -> i64 {
     unsafe { COUNTER += 1; }
@@ -234,7 +234,7 @@ $ refactor move geom::Point --to crate::shapes
 moved crate::geom::Point to crate::shapes	3 files	+16 -14 lines
 % git diff
 diff --git a/geom.vl b/geom.vl
-index c211645..872f916 100644
+index 161be2d..872f916 100644
 --- a/geom.vl
 +++ b/geom.vl
 @@ -1,19 +1,8 @@
@@ -243,7 +243,7 @@ index c211645..872f916 100644
 +use crate::shapes::Point;
  use crate::util::twice;
  
--pub struct Point {
+-#[derive(Clone, Copy)] pub struct Point {
 -    pub x: i64,
 -    pub y: i64,
 -}
@@ -259,7 +259,7 @@ index c211645..872f916 100644
  pub fn area(p: Point) -> i64 {
      p.x * p.y
 diff --git a/main.vl b/main.vl
-index 620be80..2ddb6f5 100644
+index 73f384a..16c9edc 100644
 --- a/main.vl
 +++ b/main.vl
 @@ -3,7 +3,8 @@ mod geom;
@@ -273,7 +273,7 @@ index 620be80..2ddb6f5 100644
  
  fn main() -> i32 {
 diff --git a/shapes.vl b/shapes.vl
-index 0c40caf..a466091 100644
+index 0c40caf..ee7e0f0 100644
 --- a/shapes.vl
 +++ b/shapes.vl
 @@ -1,6 +1,6 @@
@@ -289,7 +289,7 @@ index 0c40caf..a466091 100644
      2
  }
 +
-+pub struct Point {
++#[derive(Clone, Copy)] pub struct Point {
 +    pub x: i64,
 +    pub y: i64,
 +}
@@ -313,7 +313,7 @@ $ refactor move util::COUNTER --to crate::geom --dry-run
 @@ -36,0 +37,3 @@
 +
 +// How many times `twice` ran.
-+pub static var COUNTER: i64 = 0;
++pub static mut COUNTER: i64 = 0;
 --- a/util.vl
 +++ b/util.vl
 @@ -1 +1 @@
@@ -321,7 +321,7 @@ $ refactor move util::COUNTER --to crate::geom --dry-run
 +use crate::geom::COUNTER;
 @@ -3,2 +3 @@
 -// How many times `twice` ran.
--pub static var COUNTER: i64 = 0;
+-pub static mut COUNTER: i64 = 0;
 +pub const LIMIT: i64 = 100;
 ## An item imported alone (`use p::twice;`): the `use` lines get its new
 ## path.
@@ -450,10 +450,10 @@ moved module crate::shapes to crate::figures::shapes	3 files	+3 -2 lines
 pub mod shapes;
 % git diff main.vl
 diff --git a/main.vl b/main.vl
-index 620be80..b915abc 100644
+index 73f384a..f47b72c 100644
 --- a/main.vl
 +++ b/main.vl
-@@ -1,13 +1,13 @@
+@@ -1,14 +1,14 @@
  // A program of four modules to reorganize (tests/refactor/modules.t).
  mod geom;
 -mod shapes;
@@ -469,6 +469,7 @@ index 620be80..b915abc 100644
 +    let n = twice(area(p)) + crate::figures::shapes::perimeter(p) + util::LIMIT + p.sum();
      if n == 127 { 0 } else { 1 }
  }
+ // EDITION: rust
 $ main.vl -o prog
 ok: built prog
 % ./prog; echo "exit $?"
@@ -502,7 +503,7 @@ split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
 
 pub mod scaling;
 
-pub struct Point {
+#[derive(Clone, Copy)] pub struct Point {
     pub x: i64,
     pub y: i64,
 }
@@ -658,7 +659,7 @@ split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
 +
 +pub mod scaling;
 +
-+pub struct Point {
++#[derive(Clone, Copy)] pub struct Point {
 +    pub x: i64,
 +    pub y: i64,
 +}
@@ -697,7 +698,7 @@ split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
 -
 -use crate::util::twice;
 -
--pub struct Point {
+-#[derive(Clone, Copy)] pub struct Point {
 -    pub x: i64,
 -    pub y: i64,
 -}
@@ -743,10 +744,10 @@ script steps.txt: 3 commands	7 files	+55 -51 lines
 ./util.vl
 % git diff main.vl
 diff --git a/main.vl b/main.vl
-index 620be80..b915abc 100644
+index 73f384a..f47b72c 100644
 --- a/main.vl
 +++ b/main.vl
-@@ -1,13 +1,13 @@
+@@ -1,14 +1,14 @@
  // A program of four modules to reorganize (tests/refactor/modules.t).
  mod geom;
 -mod shapes;
@@ -762,6 +763,7 @@ index 620be80..b915abc 100644
 +    let n = twice(area(p)) + crate::figures::shapes::perimeter(p) + util::LIMIT + p.sum();
      if n == 127 { 0 } else { 1 }
  }
+ // EDITION: rust
 % cat figures/shapes.vl
 // Shapes made of points.
 
