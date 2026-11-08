@@ -139,6 +139,44 @@ The compiler's own source (gate 3, front273):
   are frozen. `volec __selftest freeze` checks the stop
   (tests/selftest.sh).
 
+The translator (g3274; flip28's T3 and T4, its rehearsal's hand fixes):
+
+- An index that calls with the indexed container's root `&mut`,
+  `pcx.types[place_ty(l, p, pbody, pcx)].kind`, is computed first,
+  `{ let at_ix = place_ty(..); pcx.types[at_ix] }.kind`, around the
+  element's first copied value (Rust's Index borrows the container
+  before the index: rustc E0502; T3). An argument that reads the root
+  another argument gives as `&mut r`, `name(&mut l, l.imports[i])`, is
+  read first (rustc E0503; a reference `r` reborrowed is two-phase and
+  stays; T4). A hoisted block that would lead a statement is
+  parenthesized, `({ .. }) > 0 && ..` (tests/refactor/edition0276e,
+  tests/run/rust_t_hoist_read).
+
+The sources (g3274, docs/design/src-buffer.md):
+
+- SRC is a view of one region per source set, reserved by mmap
+  (MAP_NORESERVE: address space, committed when written; 4 GiB,
+  VOLE_SRC_CAP for a run) and never moved, unmapped or written again
+  where SRC has been given it: appends copy past its end, a new set
+  takes a new region, and fmt's read_pieces lexes a copy in a region of
+  its own. A view of SRC is valid for the rest of the process, so the
+  rust edition's `static mut SRC: &'static [u8]` holds a `'static`
+  value. A reservation mmap refuses, or a set past its capacity, stops
+  the compiler with an error (tests/refactor/srccap), never a null SRC.
+  mmap's flags are Darwin's or Linux's by std::TARGET_OS; std2's
+  rt/sys_macos.vl and sys_linux.vl hold MAP_ANON, MAP_NORESERVE and
+  TARGET_OS (`std::TARGET_OS` in the rust edition). Compile cost the
+  same (check 8496.9 to 8464.6 M instructions), the stress-grow
+  self-compile the same object, x86_64-macos's objcheck 4 of 4.
+- The translator's static_returns: a function whose every returned
+  value is static has a `'static` result: a text literal, a call of a
+  function with a `'static` result (static_result's list, or one such
+  itself), a local each of whose `let`s is one, a range of one or of
+  base::SRC, an `if` or a block of them (`tok_text`, `node_text`,
+  `src(pcx)`, `file_bytes`, `src_text`, `flag_prefix`;
+  tests/refactor/edition0276c). It takes in static_forward (a body that
+  is one such call). Gate 3: 76 to 63.
+
 ### What's new in 0.27.6
 
 Gate 3 has no type errors. `fix --edition rust` on a copy of compiler/src now type-checks: std2 has `std::gpu::wgsl`, the WGSL front compiler/src uses (translated by `fix --edition rust`, finished by hand, the same answers as MVS's front on every .wgsl in the tree), behind a gate that keeps it out of a program that does not name `gpu`; the translator's last type-error shapes are done (eight found by the wgsl port). What is left is borrowck: 76 errors (154 behind 37 type errors in 0.27.5), after nested calls on one `&mut` root are hoisted (rustc's E0499, which 0.27.5 missed). In the rust edition: a method call in a generic body takes the method the body names, as rustc does (Z9.1c); `const fn`, and constants of any type made at each use; a constant's initializer is checked in its own scope (0.27.5 could call a local of the use's scope instead: wrong output); octal literals, `let ref`, tuple branches typed together; `&e` stays shared where `&mut` goes (rustc's E0308); a `&mut` given to a raw pointer ends its borrow. A generic function with a local `Vec<T, A>` links at -O0 and -O1 again (0.27.4 and 0.27.5 failed). A rust hello world's check is 1.88x MVS's (1.82x). MVS programs compile exactly as before. Built and tested on aarch64-macos only.
