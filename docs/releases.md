@@ -278,6 +278,13 @@ std2 gets the rest of MVS's std (std280):
   *Cases:* `std2_path_path` (a rustc twin: every result on 19 paths, as
   Rust's), `std2_path_pathbuf`. The ten `sem_views_pth_*` cases run
   without XFAIL, nine of them as rustc's borrowck errors.
+- **std::random.** MVS's xoshiro256++ generator, vole's own API, since
+  Rust's std has none: `Xoshiro256pp` (seeded from a number through
+  splitmix64, from a state or from the system's entropy), its ranges by
+  Lemire's method, `unit_f64`, `random_bool`, `fill_bytes` and `jump`,
+  plus `shuffle` and `fill_bytes_os`. The outputs are MVS's (and
+  rand_xoshiro's) on the same seeds. *Cases:* `std2_random_xoshiro`,
+  `std2_random_empty_range`.
 - tools/std2-checklist.py reads MVS's items from an MVS program
   (examples/args). Since the flip, the tree's root is a rust program
   whose std is std2, so the checklist could not be made.
