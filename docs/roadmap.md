@@ -2887,6 +2887,30 @@ unsafe-audit 2775 unjustified (baseline 2775, from 3057) and 0 in std,
 chain-diverse, chain-fresh 40 releases. compile-cost against v0.26.5: a
 hello world 1.00x, std 0.99x, check of the compiler 1.01x.
 
+### 0.27.6
+
+The release gate (`gate.sh --release --no-linux -j 4`), macOS only, at
+load 5 to 16 on 10 CPUs: every row passed on its first run. The rows:
+the suite 6975 at -O0, -O1 and -O2 (131 XFAIL; SKIPPED: no spirv-val),
+std2-tests 1482 at -O0 and -O2 under --check-alloc (26 XFAIL, gate 1:
+1000), std2-check 2395 bodies (2393 clean, 0 with borrowck errors, 2
+not solved; 0 cases with borrowck errors in std2), threads 15673,
+incremental 172 series, objcheck 13468 (and 264 for x86_64-macos),
+compiler-memcheck 727, examples-checkalloc 183, every fuzz and ABI row,
+stress-grow, cachediff 1539 lines (425 from the cache), borrowck-twin
+430 cases (393 agree, 10 named divergences, 27 outside the subset, 0
+mismatches), unsafe-audit 2771 unjustified (baseline 2773) and 0 in
+std, chain-fresh (47 releases from the seed), chain-diverse. The
+translate row: 979 of 1475 programs round-trip (944 in 0.27.5), and the
+rustc twin agrees on 555 of 978 (536 of 944). The gate3 row: no type
+errors (37 in 0.27.5); 76 errors, all borrowck (48 conflict, 8
+use_borrowed, 7 outlives, 5 mut_twice, 4 elision, 2 assign_borrowed, 1
+return_local, 1 static_mut_ref; 154 behind the type errors in 0.27.5).
+compile-cost against v0.27.5: a hello world 1.00x, std 1.00x, check of
+the compiler 1.01x, the rust row 1.00x; hello-rust 1.88x its MVS row
+(185.2M; 1.82x in 0.27.5: std::gpu::wgsl's index, its units gated
+out), under the 2.0x ceiling, std-rust 0.53x.
+
 ### 0.27.5
 
 The release gate (`gate.sh --release --no-linux -j 4`), macOS only, at
