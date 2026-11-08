@@ -151,6 +151,29 @@ The translator and the migration of tests/run (mig28):
   table does not map (E0308, E0277). The shim's `collect_in` takes two
   type arguments.
 
+Two crashes in the rust edition (crash280):
+
+- **`#[thread_local] static mut` works.** std2 had no
+  `std::thread::__tls_addr`, which the compiler calls for every access
+  of a thread-local. An executable build stopped with "internal error: a
+  thread-local without std::thread", and an object build crashed. std2's
+  thread module now has it, kept the same way MVS std's is: C's
+  thread-specific data, with one key per thread-local found by its
+  initial value's address in a lock-free table, and each thread's copy
+  made from the initial value at that thread's first access and freed
+  when the thread ends. A program that writes `thread_local` asks the
+  lazy std2 build for `__tls_addr`, since no source names it. *Case:*
+  `rust_f_thread_local_std2` (two scoped threads and main, each with its
+  own copy).
+- **A `&mut` given to a C variadic's `...` is moved**, as in rustc.
+  Nothing there coerces it, so it is not reborrowed. 0.27.8 copied it,
+  and `--verify-places` refused the body (I7). A later use is
+  `borrowck.use_moved` (rustc E0382, checked by hand, since the twin
+  tools skip an `extern` block), and its `try:` is the reborrow `&mut
+  *r`, not `.clone()`. *Cases:* `rust_b_variadic_mut_ref` (with
+  `--verify-places`; sscanf writes through it),
+  `rust_b_variadic_mut_ref_moved_err`.
+
 The borrow checker (sound280): three gaps that accepted programs rustc
 rejects and that used memory after it was freed (mig28's soundness
 group, 12 cases of the views audit):

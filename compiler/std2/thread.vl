@@ -517,3 +517,120 @@ pub fn sleep(d: crate::time::Duration) {
         req = rem;
     }
 }
+
+// ---- Thread-locals ----
+
+// `#[thread_local] static mut X: T = INIT;`: each thread has its own X,
+// made from INIT when the thread first reaches it. The compiler makes
+// every access of X `*__tls_addr(&X's initial value, size)`
+// (front/threadlocal.vl), as for MVS's std::thread, which keeps them the
+// same way: C's thread-specific data, a key per thread-local found by
+// the initial value's address in a table read without a lock, the
+// thread's copy allocated from C at its first access and freed when the
+// thread ends. A thread-local's drop does not run.
+
+// UNSAFE: POSIX thread-specific data and memcpy, with raw pointers.
+// SAFETY: the prototypes are pthread.h's and string.h's (pthread_key_t
+// written as a u64 that starts 0: macOS's unsigned long, or Linux's
+// unsigned int in its low half), as MVS's thread.
+extern "C" {
+    #[link_name = "pthread_key_create"]
+    fn tls_c_key_create(key: *mut u64, destructor: extern "C" fn(*mut u8)) -> i32;
+    #[link_name = "pthread_getspecific"]
+    fn tls_c_get(key: u64) -> *mut u8;
+    #[link_name = "pthread_setspecific"]
+    fn tls_c_set(key: u64, p: *mut u8) -> i32;
+    #[link_name = "memcpy"]
+    fn tls_c_memcpy(d: *mut u8, s: *const u8, n: usize) -> *mut u8;
+}
+
+// UNSAFE: as atomic_load (built in: the old value, then `new` stored when
+// it was `expected`).
+// SAFETY: as atomic_load.
+unsafe fn atomic_cas<T>(p: *mut T, expected: T, new: T, order: i64) -> T {
+    crate::panic::unreachable()
+}
+
+// The key table, by the initial value's address (open addressing): a
+// slot's address is claimed by a compare-and-swap, then its key + 1 is
+// published (release) by the thread that claimed it.
+const TLS_SLOTS: usize = 1024;
+static mut TLS_ADDRS: [u64; 1024] = [0; 1024];
+static mut TLS_KEYS: [u64; 1024] = [0; 1024];
+
+extern "C" fn tls_free(p: *mut u8) {
+    // UNSAFE: C's free.
+    // SAFETY: p is a thread's copy tls_first allocated, freed once, by the
+    // key's destructor when the thread ends.
+    unsafe { thread_c_free(p) };
+}
+
+// This thread's copy of the thread-local whose initial value (size bytes)
+// is at template.
+// UNSAFE: returns a raw pointer to this thread's copy.
+// SAFETY: (the caller's: the compiler's) template is a thread-local's
+// initial value of size bytes, live for the program.
+pub unsafe fn __tls_addr(template: *mut u8, size: i64) -> *mut u8 {
+    let key = tls_key(template);
+    let p = tls_c_get(key);
+    if !p.is_null() {
+        return p;
+    }
+    tls_first(key, template, size)
+}
+
+// UNSAFE: C memory and a copy from a raw pointer.
+// SAFETY: (the caller's) template has size bytes; p is checked non-null,
+// with room for them.
+#[inline(never)]
+unsafe fn tls_first(key: u64, template: *mut u8, size: i64) -> *mut u8 {
+    let n = if size > 0 { size as usize } else { 1 };
+    let p = thread_c_malloc(n);
+    if p.is_null() {
+        crate::panic::panic("thread-locals: out of memory");
+    }
+    tls_c_memcpy(p, template as *const u8, n);
+    tls_c_set(key, p);
+    p
+}
+
+// The key of the thread-local at template, made at its first use: the
+// thread whose compare-and-swap claims the slot makes it and publishes
+// it; another one that finds the address waits for the key.
+// UNSAFE: the key table's statics through raw pointers, atomically, and
+// pthread_key_create.
+// SAFETY: i stays in 0..TLS_SLOTS (a hash's top 10 bits, then mod); a
+// slot's address is written only by the compare-and-swap, its key only by
+// the thread whose swap claimed it, before others read it (release,
+// acquire).
+unsafe fn tls_key(template: *mut u8) -> u64 {
+    let a = template as u64;
+    let addrs = &raw mut TLS_ADDRS as *mut u64;
+    let keys = &raw mut TLS_KEYS as *mut u64;
+    let mut i = ((a >> 4).wrapping_mul(0x9e3779b97f4a7c15) >> 54) as usize % TLS_SLOTS;
+    for _ in 0..TLS_SLOTS {
+        let mut seen = atomic_load(addrs.add(i) as *const u64, ACQUIRE);
+        if seen == 0 {
+            seen = atomic_cas(addrs.add(i), 0, a, ACQ_REL);
+            if seen == 0 {
+                let mut key: u64 = 0;
+                if tls_c_key_create(&mut key as *mut u64, tls_free) != 0 {
+                    crate::panic::panic("thread-locals: the system has no key left");
+                }
+                atomic_store(keys.add(i), key + 1, RELEASE);
+                return key;
+            }
+        }
+        if seen == a {
+            loop {
+                let k = atomic_load(keys.add(i) as *const u64, ACQUIRE);
+                if k != 0 {
+                    return k - 1;
+                }
+                thread_c_yield();
+            }
+        }
+        i = (i + 1) % TLS_SLOTS;
+    }
+    crate::panic::panic("thread-locals: more than 1024")
+}
