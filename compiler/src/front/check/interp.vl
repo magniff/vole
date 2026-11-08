@@ -25,7 +25,7 @@ use crate::front::ast::{
     FMT_UPPER, FMT_ZERO, NODE_IMPLICIT, NODE_REF, NODE_REF_MUT, NodeKind, child, list_begin,
     list_end, list_push, new_node,
 };
-use crate::front::check::{mismatch_error, pop_scope, push_scope, type_error};
+use crate::front::check::{Res, mismatch_error, pop_scope, push_scope, type_error};
 use crate::front::check::format::{
     FMT_ALT, FMT_OCT, FMT_PTR, hole_alias, hole_debug, hole_eval_only, hole_fill,
 };
@@ -84,7 +84,7 @@ fn expand(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         type_error(n,
             c"a format_args value cannot be used in a constant expression: it is made when it runs", &pcx);
     }
-    if !check_holes(n, &pcx) {
+    if !check_holes(n, false, &pcx) {
         pcx.nodes[n].y = new_node(NodeKind::Block, start, end, &pcx);
         return pcx.ty_error;
     }
@@ -161,7 +161,7 @@ fn expand(n: i64, pcx: inout Ctx<Comp>) -> i64 {
 // failed. (0.26.2, a format literal's) A hole that reads an argument's
 // hole (HOLE_ALIAS) has its type; a width or precision named by an
 // argument or a name (g, h) is an integer.
-fn check_holes(n: i64, pcx: inout Ctx<Comp>) -> bool {
+fn check_holes(n: i64, direct: bool, pcx: inout Ctx<Comp>) -> bool {
     var failed = false;
     var k = 0;
     for i in 0..pcx.nodes[n].count {
@@ -170,8 +170,16 @@ fn check_holes(n: i64, pcx: inout Ctx<Comp>) -> bool {
             continue;
         }
         let alias = hole_alias(item, pcx);
+        // RULE: F18.5 (0.28.0: a direct call's hole of an open local, on
+        // std2, keeps it open: its write is made again when it is solved,
+        // hole_retype)
+        let e = pcx.nodes[item].a;
+        pcx.open_keep = direct && alias < 0 && crate::front::known::on_std2(pcx)
+            && crate::front::check::literals::open_scalar(e, pcx) >= 0
+            && crate::front::check::rust::rust_node(e, &pcx);
         let t = if alias >= 0 { hole_type(n, alias, pcx) }
-            else { synth_expr(pcx.nodes[item].a, &pcx) };
+            else { synth_expr(e, &pcx) };
+        pcx.open_keep = false;
         if alias >= 0 {
             pcx.nodes[pcx.nodes[item].a].ty = t;
         }
@@ -517,7 +525,7 @@ pub fn direct_call(n: i64, f: i64, k: i64, recv: i64, pcx: inout Ctx<Comp>) -> i
         list_push(child(n, i, pcx), &pcx);
     }
     list_end(orig, omark, &pcx);
-    var ok = check_holes(fs, &pcx);
+    var ok = check_holes(fs, true, &pcx);
     var alloc = 0;
     if k == D_FORMAT_IN {
         alloc = child(n, 1, pcx);
@@ -797,41 +805,118 @@ fn push_writes_std2(fs: i64, out: i64, by_ref: bool, pcx: inout Ctx<Comp>) {
         }
         let alias = hole_alias(item, pcx);
         let name = hidden(c"=f", if alias >= 0 { alias } else { holes }, &pcx);
-        let flags = pcx.nodes[item].p;
-        // (`{:p}` of a pointer: its Display; of a type with Pointer: that)
-        let tr = if (flags & FMT_PTR) != 0 && !spec_trait_impl(item, pcx.nodes[item].ty, &pcx) {
-            c"Display"
-        } else {
-            spec_trait(item, pcx)
-        };
-        var value = unary(Tok::Amp, ident(name, item, &pcx), &pcx);
-        if (flags & crate::front::check::format::FMT_AS_SLICE) != 0 {
-            // (`&__fN[..]`, `&(*__fN)[..]` for a reference to an array)
-            let full = new_node(NodeKind::Range, pcx.nodes[item].start, pcx.nodes[item].end, &pcx);
-            let ix = new_node(NodeKind::Index, pcx.nodes[item].start, pcx.nodes[item].end, &pcx);
-            let ht = pcx.nodes[item].ty;
-            pcx.nodes[ix].a = if ht > 0 && pcx.types[ht].kind == TyKind::Ptr {
-                unary(Tok::Star, ident(name, item, &pcx), &pcx)
-            } else {
-                ident(name, item, &pcx)
-            };
-            pcx.nodes[ix].b = full;
-            value = unary(Tok::Amp, ix, &pcx);
-        }
-        let dst = if by_ref { ident(out, item, &pcx) }
-            else { amp_mut(ident(out, item, &pcx), &pcx) };
-        let write = std_path_call(c"fmt", tr, c"fmt", value, dst, item, &pcx);
+        let write = hole_write(item, name, out, by_ref, &pcx);
         // (the hole's spec on the Formatter for its value, then cleared)
         let spec = hole_has_spec(item, pcx);
         if spec {
             list_push(stmt(spec_call(out, item, false, &pcx), &pcx), &pcx);
         }
-        list_push(stmt(write, &pcx), &pcx);
+        let ws = stmt(write, &pcx);
+        // RULE: F18.5 (0.28.0: a hole of an open local, kept open by
+        // check_holes: its write is made again when the local is solved,
+        // hole_retype)
+        let source = pcx.nodes[hole_source(fs, item, pcx)].a;
+        let k = crate::front::check::literals::open_leaf(source, pcx);
+        if k >= 0 {
+            let m = new_node(NodeKind::InterpHole, pcx.nodes[item].start, pcx.nodes[item].end,
+                &pcx);
+            pcx.nodes[m].a = ws;
+            pcx.nodes[m].b = item;
+            pcx.nodes[m].c = pcx.nodes[child(write, 0, pcx)].b;
+            pcx.nodes[m].d = if by_ref { child(write, 1, pcx) }
+                else { pcx.nodes[child(write, 1, pcx)].b };
+            pcx.nodes[m].x = if by_ref { 1 } else { 0 };
+            pcx.nodes[m].y = name;
+            crate::front::check::literals::open_record(k, m, &pcx);
+        }
+        list_push(ws, &pcx);
         if spec {
             list_push(stmt(spec_call(out, item, true, &pcx), &pcx), &pcx);
         }
         holes += 1;
     }
+}
+
+// The write of hole item through std2's Formatter `out` (push_writes_std2),
+// its value `name`: `std::fmt::Tr::fmt(&name, &mut out)`, Tr the trait its
+// spec names.
+fn hole_write(item: i64, name: i64, out: i64, by_ref: bool, pcx: inout Ctx<Comp>) -> i64 {
+    let flags = pcx.nodes[item].p;
+    // (`{:p}` of a pointer: its Display; of a type with Pointer: that)
+    let tr = if (flags & FMT_PTR) != 0 && !spec_trait_impl(item, pcx.nodes[item].ty, &pcx) {
+        c"Display"
+    } else {
+        spec_trait(item, pcx)
+    };
+    var value = unary(Tok::Amp, ident(name, item, &pcx), &pcx);
+    if (flags & crate::front::check::format::FMT_AS_SLICE) != 0 {
+        // (`&__fN[..]`, `&(*__fN)[..]` for a reference to an array)
+        let full = new_node(NodeKind::Range, pcx.nodes[item].start, pcx.nodes[item].end, &pcx);
+        let ix = new_node(NodeKind::Index, pcx.nodes[item].start, pcx.nodes[item].end, &pcx);
+        let ht = pcx.nodes[item].ty;
+        pcx.nodes[ix].a = if ht > 0 && pcx.types[ht].kind == TyKind::Ptr {
+            unary(Tok::Star, ident(name, item, &pcx), &pcx)
+        } else {
+            ident(name, item, &pcx)
+        };
+        pcx.nodes[ix].b = full;
+        value = unary(Tok::Amp, ix, &pcx);
+    }
+    let dst = if by_ref { ident(out, item, &pcx) }
+        else { amp_mut(ident(out, item, &pcx), &pcx) };
+    std_path_call(c"fmt", tr, c"fmt", value, dst, item, &pcx)
+}
+
+// The hole of f-string fs whose value hole item writes: item, or the one
+// it reads (HOLE_ALIAS).
+fn hole_source(fs: i64, item: i64, pcx: Ctx<Comp>) -> i64 {
+    let alias = hole_alias(item, pcx);
+    if alias < 0 {
+        return item;
+    }
+    var j = 0;
+    for i in 0..pcx.nodes[fs].count {
+        let h = child(fs, i, pcx);
+        if pcx.nodes[h].kind == NodeKind::InterpHole {
+            if j == alias {
+                return h;
+            }
+            j += 1;
+        }
+    }
+    item
+}
+
+// RULE: F18.5 (0.28.0) The open local a hole of a direct call writes
+// (push_writes_std2's record m, an InterpHole: its write statement a, its
+// hole b, the identifiers of its value c and of its Formatter d, by_ref x,
+// the value's name y) is solved to type t: the value's local and the hole
+// take t, and the write is made and checked again, its impl t's (rustc
+// picks the impl when the integer is typed, at the end if nothing does).
+pub fn hole_retype(m: i64, t: i64, pcx: inout Ctx<Comp>) {
+    let fid = pcx.nodes[m].c;
+    let oid = pcx.nodes[m].d;
+    if pcx.nodes[fid].res != Res::Local || pcx.nodes[oid].res != Res::Local {
+        return;
+    }
+    let item = pcx.nodes[m].b;
+    let value = pcx.nodes[fid].y;
+    if pcx.locals[value].ty == t {
+        return;
+    }
+    pcx.locals[value].ty = t;
+    pcx.nodes[item].ty = t;
+    let write = hole_write(item, pcx.nodes[m].y, pcx.nodes[oid].a, pcx.nodes[m].x != 0, &pcx);
+    // (the value and the Formatter by their locals, wherever this is)
+    let saved_env = pcx.env.count;
+    let saved_keep = pcx.open_keep;
+    pcx.env.push(value);
+    pcx.env.push(pcx.nodes[oid].y);
+    pcx.open_keep = false;
+    synth_expr(write, &pcx);
+    pcx.open_keep = saved_keep;
+    pcx.env.count = saved_env;
+    pcx.nodes[pcx.nodes[m].a].a = write;
 }
 
 // (0.27.2) Whether hole item has a spec std2's Formatter carries: a

@@ -516,7 +516,24 @@ re-inferred.
   reading of it as that reborrow was the stopgap until then; retired.)
   (0.27.6) A `&mut` place given where a raw pointer goes (a `*mut T` or
   `*const T` parameter: the coercion) is reborrowed raw, `_t = &raw mut
-  (*Q)` (`BK_RAW_MUT`), as rustc's MIR has it. That creates no loan
+  (*Q)` (`BK_RAW_MUT`), as rustc's MIR has it. (0.27.7) So is one that
+  goes to a raw pointer anywhere else, as any operand: a `let`'s value,
+  the function's result (`fn f(x: &mut T) -> *mut T { x }`, `return
+  x`), an assigned value, a struct literal's field; 0.27.6 copied the
+  `&mut` there (the value's type, the raw pointer's, is Copy), an I7
+  break `--verify-places` reported. `Q` stays usable after it, as
+  after rustc's reborrow. Outside a call the reborrow is `&raw mut
+  (*Q)`, a write, only where the type written is `*mut T` (D3.6a's
+  positions; the checker keeps them, `Ctx.raw_mut_coerced`); where it
+  is `*const T`, or not written, it is `&raw const (*Q)` (`BK_RAW`), a
+  read, as rustc's coercion to `*const T` is (`let r = &*x; let p:
+  *const T = x; *r` is accepted). A cast is read the same way: `x as
+  *mut T` of a `&mut T` x is a deep write of `*x` (rustc E0502 with a
+  shared borrow of it live), `x as *const T` a read. The fat ones
+  alike: a `&mut [T]` place given or cast to a written `*mut [T]`, and
+  `&mut s[..]` made a fat raw pointer (which has no loan, R1), are a
+  deep write of what the view views; `&s[..]` and a `&mut [T]` given
+  to `*const [T]` are reads. That creates no loan
   (D2.1), so the reborrow ends at the coercion: a later `&mut` of a
   part of `*Q` in the same call's arguments, `f(cx, &mut cx.cap)`, is
   no conflict. The coercion's own access is a deep write of `*Q`
@@ -524,7 +541,8 @@ re-inferred.
   conflicts (rustc E0502: `let r = &cx.cap; f(cx); r`). 0.27.5 gave
   it as the shared reborrow `&(*Q)`, whose loan lived to the call.
   *Cases:* `rust_b_raw_coerce_ends_borrow`,
-  `rust_b_raw_coerce_live_shared_err`.
+  `rust_b_raw_coerce_live_shared_err`, `rust_b_raw_coerce_positions`,
+  `rust_b_raw_coerce_let_live_shared_err`.
   **D3.6a (0.27.7, the coercion's mutability).** In the rust edition
   only `&mut T` coerces to `*mut T`. A `&T` coerces to `*const T` and
   not to `*mut T`: that is rustc's E0308 ("the types differ in
@@ -540,12 +558,22 @@ re-inferred.
   `if` around it. 0.27.6 accepted
   `bump(&x)` with `fn bump(p: *mut i64)`, and the callee's write went
   through a pointer to a place that had only a shared borrow. MVS's
-  `*T` takes `&x` as before. A fat raw pointer (`*mut [T]`) takes no
-  reference yet, shared or exclusive (rustc: `&mut s[..]` and `&s[..]`
-  to `*const [T]`). *Anchor:* `front/check/check_mode.vl: coerce_ref`.
+  `*T` takes `&x` as before. **A fat raw pointer** (0.27.7; 0.27.6
+  took no reference there, shared or exclusive) takes a view as a thin
+  one takes a reference: `&[T]` (`s`, `&m[..]`) and `&mut [T]`
+  coerce to `*const [T]`, `&mut [T]` to `*mut [T]`, and `&str` to
+  `*const str`; a reference to an array, `&a` or `&mut a` of an
+  `a: [T; N]`, coerces as its slice `&a[..]` (`&mut a[..]`) does, the
+  unsizing coercion (rustc's; a Vec's reference does not, rustc's
+  E0308 too). A shared view where `*mut [T]` is written is E0308, the
+  types differing in mutability, as for a thin `*mut T` and in the
+  same positions. The view's two words are the pointer's: the
+  coercion is its operand, as Z9.3's cast. *Anchor:*
+  `front/check/check_mode.vl: coerce_ref, fat_raw_coerce`.
   *Cases:* `rust_b_raw_mut_from_shared_err`,
   `rust_b_raw_mut_from_mut`, `rust_b_raw_mut_positions_err`,
-  `rust_b_raw_mut_positions`.
+  `rust_b_raw_mut_positions`, `rust_b_raw_fat_coerce`,
+  `rust_b_raw_fat_from_shared_err`.
 - `SK_ASSIGN (a,b) = RV_REF P` (`e = 'ℓ`, `d ≠ BK_RAW`): loan `ℓ`
   created; `sub(&'ℓ [mut] type(P) ≤ type((a,b)))` (a `BK_FAKE` loan:
   `type((a,b))` is `&type(P)`); **the supporting-prefix rule:** for
