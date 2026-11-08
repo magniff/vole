@@ -150,6 +150,15 @@ The translator (g3274):
   `str::from_utf8(&s[a..b]).unwrap().parse::<f64>()` (a receiver a `&`
   starts is parenthesized); `let f = fs[i];` of an element that is not
   Copy is `&fs[i]`.
+- An argument that calls with the root a call takes `&mut` is computed
+  first, `{ let at_arg1 = ir_val(cx, v); is_const(cx, at_arg1) }`:
+  Rust's reborrow for the first argument lives through the others, so
+  the inner call's `cx` is a second mutable borrow (rustc E0499, which
+  the borrow checker reports since D3.6 for a raw-pointer parameter too).
+  Only when every argument before it is plain, so MVS's order is kept;
+  innermost calls first (tests/refactor/edition0276d,
+  tests/run/rust_t_hoist_arg). Gate 3: 103 to 76 (32 borrowck.mut_twice
+  to 5).
 
 The sources (g3274, docs/design/src-buffer.md):
 
