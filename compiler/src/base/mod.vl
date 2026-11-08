@@ -746,23 +746,162 @@ pub fn read_file(path: *u8, out: i64, pcx: Ctx<Comp>) {
     }
 }
 
+// ---- The sources' region (0.27.6, docs/design/src-buffer.md) ----
+
+// The bytes reserved for a source set: address space, committed when
+// first written (MAP_NORESERVE); VOLE_SRC_CAP=N in the environment sets
+// it for a run.
+pub const SRC_CAP: i64 = 1 << 32;
+
+// UNSAFE: C's mmap, the reservation's only maker.
+// SAFETY: <sys/mman.h>'s prototype, on macOS and Linux alike.
+extern "C" {
+    fn mmap(addr: *u8, len: u64, prot: i32, flags: i32, fd: i32, offset: i64) -> *u8;
+}
+
+// mmap's PROT_READ | PROT_WRITE.
+const SRC_PROT: i32 = 3;
+
+// mmap's MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, whose values differ
+// between the C libraries (<sys/mman.h>): Darwin's MAP_ANON 0x1000 and
+// MAP_NORESERVE 0x40, Linux's 0x20 and 0x4000. std::TARGET_OS is std's
+// per-OS tail (std/sys/macos.vl, std/sys/linux.vl), the system of the
+// target this compiler was built for: a compiler built for aarch64-linux
+// gets Linux's values by construction. (A std item new in 0.27.6 is
+// used here from 0.27.7: the chain rule.)
+fn src_map_flags() -> i32 {
+    if std::TARGET_OS == 1 { 0x02 | 0x20 | 0x4000 } else { 0x02 | 0x1000 | 0x40 }
+}
+
+// The capacity a source set reserves: VOLE_SRC_CAP's, else SRC_CAP.
+fn src_cap_wanted() -> i64 {
+    unsafe {
+        let value = getenv(c"VOLE_SRC_CAP");
+        if value == 0 as *u8 {
+            return SRC_CAP;
+        }
+        var n: i64 = 0;
+        var i: i64 = 0;
+        while value[i] >= '0' && value[i] <= '9' && n < SRC_CAP {
+            n = n * 10 + (value[i] - '0') as i64;
+            i += 1;
+        }
+        if n > 0 && n < SRC_CAP { n } else { SRC_CAP }
+    }
+}
+
+// A fresh region of cap bytes, never unmapped; the compiler stops when
+// mmap refuses it (never a null SRC).
+fn src_reserve(cap: i64) -> *u8 {
+    // UNSAFE: C's mmap.
+    // SAFETY: an anonymous private mapping at an address the system
+    // chooses, of no file: it aliases no memory of the program; its
+    // failure, MAP_FAILED, is checked before the pointer is used.
+    let p = unsafe { mmap(0 as *u8, cap as u64, SRC_PROT, src_map_flags(), -1, 0) };
+    if p as i64 == -1 || p == 0 as *u8 {
+        let n = buf_new();
+        buf_int(n, cap);
+        buf_str(n, c" bytes for the sources (mmap)");
+        buf_byte(n, 0);
+        die2(c"cannot reserve ", buf_slice(n).ptr);
+    }
+    p
+}
+
+// A new source set: a region of the wanted capacity, empty.
+fn src_begin(pcx: inout Ctx<Comp>) {
+    pcx.src_cap = src_cap_wanted();
+    pcx.src_base = src_reserve(pcx.src_cap);
+    pcx.src_used = 0;
+}
+
+// bytes appended at the region's end, past every byte SRC was given; the
+// compiler stops when they would pass its capacity.
+fn src_put(bytes: [u8], pcx: inout Ctx<Comp>) {
+    let n = bytes.len as i64;
+    if n > pcx.src_cap - pcx.src_used {
+        let m = buf_new();
+        buf_int(m, pcx.src_cap);
+        buf_str(m, c" bytes reserved for them (VOLE_SRC_CAP)");
+        buf_byte(m, 0);
+        die2(c"the sources pass the ", buf_slice(m).ptr);
+    }
+    if n > 0 {
+        // UNSAFE: a copy into the region through its base pointer.
+        // SAFETY: [src_used, src_used + n) is inside the region (checked
+        // above against src_cap, the bytes mmap reserved) and past every
+        // byte SRC has been given (src_publish: [0, src_used)), so no view
+        // of SRC sees it change; bytes is a live view of other memory.
+        unsafe { memcpy(&pcx.src_base[pcx.src_used], bytes.ptr, n as u64); }
+    }
+    pcx.src_used += n;
+}
+
+// One byte appended (src_put's).
+fn src_put_byte(b: u8, pcx: inout Ctx<Comp>) {
+    let one = [b];
+    src_put(one[..], &pcx);
+}
+
+// The n bytes at p, a region's (src_publish, src_copy): a raw pointer and
+// a length, which view nothing, made into a slice here.
+fn region_bytes(p: *u8, n: i64) -> [u8] {
+    // UNSAFE: a slice made from a raw pointer and a length.
+    // SAFETY: the callers' p is a region's base (src_reserve), never
+    // unmapped, and n at most the bytes written in it.
+    unsafe { p[0..n] }
+}
+
+// SRC is the region's bytes so far, its last a NUL.
+fn src_publish(pcx: inout Ctx<Comp>) {
+    // UNSAFE: SRC is a static (the front end's single-threaded phase
+    // writes it, base only) and the view is made from the region's base
+    // pointer.
+    // SAFETY: [0, src_used) is written (src_put) and stays mapped, in
+    // place and unchanged for the rest of the process: the region is never
+    // unmapped and appends go past src_used.
+    unsafe {
+        SRC = region_bytes(pcx.src_base, pcx.src_used);
+    }
+    pcx.src_len = pcx.src_used - 1;
+}
+
+// (0.27.6) text copied into a region of its own, never unmapped nor
+// written again: read_pieces' SRC while it lexes text.
+pub fn src_copy(text: [u8]) -> [u8] {
+    let n = text.len as i64;
+    let p = src_reserve(n + 1);
+    // UNSAFE: a copy into the new region, and a view of it.
+    // SAFETY: the region holds n + 1 bytes (mmap rounds up to pages), its
+    // own: nothing else points into it; it is never unmapped nor written
+    // after this, so the view stays valid; text is a live view.
+    unsafe {
+        memcpy(p, text.ptr, n as u64);
+        p[n] = 0;
+        p[0..n]
+    }
+}
+
 // Reads all source files into SRC; each file is followed by a newline so
-// that tokens never span files.
+// that tokens never span files. (0.27.6) A new source set: a region of
+// its own (src_begin), never moved, freed or written again where SRC has
+// been given it.
 pub fn load_sources(paths: **u8, count: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        let all = buf_new();
+        src_begin(&pcx);
+        let text = buf_new();
         for i in 0..count {
-            let start = BUFS[all].len;
-            read_file(paths[i], all, pcx);
+            buf_clear(text);
+            read_file(paths[i], text, pcx);
+            let start = pcx.src_used;
+            src_put(buf_slice(text), &pcx);
             pcx.files.push(SourceFile {
-                path: paths[i], start, end: BUFS[all].len, module: 0, kind: 0,
+                path: paths[i], start, end: pcx.src_used, module: 0, kind: 0,
             });
-            buf_byte(all, '\n');
+            src_put_byte('\n', &pcx);
         }
-        buf_byte(all, 0);
-        SRC = buf_slice(all);
-        pcx.src_len = BUFS[all].len - 1;
-        pcx.src_buf = all;
+        src_put_byte(0, &pcx);
+        src_publish(&pcx);
     }
 }
 
@@ -770,21 +909,21 @@ pub fn load_sources(paths: **u8, count: i64, pcx: inout Ctx<Comp>) {
 // C headers) after the others, of `kind` (SOURCE_WGSL: an embedded
 // block's file, 0.26.2); returns its start in SRC.
 pub fn add_source(path: *u8, text: i64, pcx: inout Ctx<Comp>, kind: i64 = 0) -> i64 {
-    unsafe {
-        let all = pcx.src_buf;
-        // (0.27.6: after the last file's NUL, which stays, and a newline:
-        // no byte of a SRC already given out is written again, a view of
-        // it ending at the NUL included; each file starts after a newline)
-        buf_byte(all, '\n');
-        let start = BUFS[all].len;
-        buf_bytes(all, buf_slice(text));
-        pcx.files.push(SourceFile { path, start, end: BUFS[all].len, module: 0, kind });
-        buf_byte(all, '\n');
-        buf_byte(all, 0);
-        SRC = buf_slice(all);
-        pcx.src_len = BUFS[all].len - 1;
-        start
+    // (no set yet: one, src_begin)
+    if pcx.src_base == 0 as *u8 {
+        src_begin(&pcx);
     }
+    // (0.27.6: after the last file's NUL, which stays, and a newline:
+    // no byte of a SRC already given out is written again, a view of
+    // it ending at the NUL included; each file starts after a newline)
+    src_put_byte('\n', &pcx);
+    let start = pcx.src_used;
+    src_put(buf_slice(text), &pcx);
+    pcx.files.push(SourceFile { path, start, end: pcx.src_used, module: 0, kind });
+    src_put_byte('\n', &pcx);
+    src_put_byte(0, &pcx);
+    src_publish(&pcx);
+    start
 }
 
 // (0.18) Source file paths as the compiler writes them into what it makes
@@ -980,9 +1119,10 @@ pub fn restore_sources(all: i64, files: IntVec, pcx: inout Ctx<Comp>) {
             });
             i += 5;
         }
-        SRC = buf_slice(all);
-        pcx.src_len = BUFS[all].len - 1;
-        pcx.src_buf = all;
+        // (0.27.6: a new source set, its region's, as load_sources)
+        src_begin(&pcx);
+        src_put(buf_slice(all), &pcx);
+        src_publish(&pcx);
     }
 }
 
@@ -1019,11 +1159,12 @@ extern "C" {
 
 // (0.21) The environment variables the compiler reads, VOLE_ + these
 // (tests/run.sh checks that every VOLE_ name in compiler/src is here).
-const ENV_NAMES: [*u8; 27] = [
+const ENV_NAMES: [*u8; 28] = [
     c"CACHE", c"CACHE_CHECK", c"CACHE_LIMIT", c"CACHE_STATS", c"CACHE_SYNC", c"CACHE_TRACE",
     c"CACHE_WHY", c"CC", c"CODE_CACHE", c"COUNTERS", c"EDITION", c"FRESH_CONTEXTS", c"LINKER",
     c"LINK_CACHE", c"LOWER", c"LSP_TIME", c"OK", c"OVF_CENSUS", c"OWN_STD", c"PHASE_TIMES",
-    c"PLANT_MISCOMPILE", c"QUERY_FULL", c"QUERY_STD", c"ROOT", c"STRESS_GROW", c"SYNTAX",
+    c"PLANT_MISCOMPILE", c"QUERY_FULL", c"QUERY_STD", c"ROOT", c"SRC_CAP", c"STRESS_GROW",
+    c"SYNTAX",
     // (0.27.3: the translator's probe, tools/translate)
     c"TR_DUMP"];
 
@@ -1032,7 +1173,7 @@ const ENV_NAMES: [*u8; 27] = [
 // the children inherit both.
 pub fn env_aliases() {
     unsafe {
-        for k in 0..26 {
+        for k in 0..27 {
             let n = ENV_NAMES[k];
             let vole = buf_new();
             buf_str(vole, c"VOLE_");

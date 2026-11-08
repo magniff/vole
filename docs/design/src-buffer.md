@@ -122,9 +122,15 @@ last `add_source`.
   copy of each file from the scratch buffer.
 - One `mmap` per source set, one per `read_pieces`.
 - No change to the 1,700 readers.
-- tests/compile_cost.sh before and after, and one `VOLE_STRESS_GROW=1`
-  self-compile; the language server over 5,000 edits (tests/lsp's
-  driver), its processes' address space before and after.
+- Measured (aarch64-macos, 0.27.6): tests/compile_cost.sh before and
+  after, in instructions, hello 98.8 to 98.4 M, std 1121.9 to 1116.4 M,
+  check 8496.9 to 8464.6 M, rust 200.1 to 197.9 M (the same, within
+  noise); the `VOLE_STRESS_GROW=1` self-compile gives the same object as
+  without; x86_64-macos's objcheck of the compiler, 4 of 4.
+- The language server over 5,000 edits of tests/lsp/prog's main.vl
+  (didChange each, a hover every 50): the server's address space grew by
+  0 KB (it loads no sources), its worker's by 6 MB (of 4.2 GB: the one 4
+  GiB region, reserved once), with one worker throughout.
 
 **Why not the others.**
 - (b) Append-only chunks would make offsets per-file. Every

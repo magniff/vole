@@ -168,6 +168,25 @@ The sources (g3274, docs/design/src-buffer.md):
   byte). The lexer reads that NUL, which is no file's text, as blank (a
   module of several files is lexed as one range), and the tools' cache
   restores the layout.
+- SRC is a view of one region per source set, reserved by mmap
+  (MAP_NORESERVE: address space, committed when written; 4 GiB,
+  VOLE_SRC_CAP for a run) and never moved, unmapped or written again
+  where SRC has been given it: appends copy past its end, a new set
+  takes a new region, and fmt's read_pieces lexes a copy in a region of
+  its own. A view of SRC is valid for the rest of the process, so the
+  rust edition's `static mut SRC: &'static [u8]` holds a `'static`
+  value. A reservation mmap refuses, or a set past its capacity, stops
+  the compiler with an error (tests/refactor/srccap), never a null SRC.
+  mmap's flags are Darwin's or Linux's by std::TARGET_OS; std2's
+  rt/sys_macos.vl and sys_linux.vl hold MAP_ANON, MAP_NORESERVE and
+  TARGET_OS (`std::TARGET_OS` in the rust edition). Compile cost the
+  same (check 8496.9 to 8464.6 M instructions), the stress-grow
+  self-compile the same object, x86_64-macos's objcheck 4 of 4.
+- The translator's static_src: a function whose every returned value is
+  a part of base::SRC, a text literal, a part of a `let` bound to one or
+  a call of such a function has a `'static` result (`tok_text`,
+  `node_text`, `src(pcx)`, `file_bytes`, `src_text`, `flag_prefix`;
+  tests/refactor/edition0276c). Gate 3: 76 to 64.
 
 The front (front273):
 
