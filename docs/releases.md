@@ -131,6 +131,10 @@ The translator (g3274):
   borrowck (partial) 152 to 96. A borrowck case for the class it leaves,
   a `&mut` coerced to a raw pointer held through the call:
   `rust_b_raw_coerce_ends_borrow` (XFAIL).
+- An argument the checker takes as a view for a parameter written `&mut`
+  (std::arch's `vst1q_u32(s: &mut [u32], ..)`) is `&mut` too, as for
+  `inout`: link_macho's `vst1q_u32(&mut h[..], 0, abcd)` (rustc E0308,
+  which the rust edition's `&e` reports since front273). Gate 3: 5 to 3.
 
 The front (front273):
 
@@ -215,6 +219,15 @@ std2 and the translator (fl10274):
     Their bodies did not check, which left `std::panic::panic`'s effects
     "(unknown)" through fn-value dispatch; it is `io panic diverge`, and
     `fix --only effects-std` writes that on a function that panics.
+
+The front (fl10274):
+
+- A generic struct's or variant's field typed by its allocator
+  parameter itself (`struct Cx<W: Allocator> { arena: W }`) takes the
+  value's own type, as rustc infers it (front-rust.md F18.7): `Cx {
+  arena: Arena::new_in(gpa) }` is `Cx<Arena<Gpa>>`. 0.27.5 bound `W` to
+  the `_in` call's allocator argument, the rule for a field `Vec<T, W>`,
+  and gave "expected 'Gpa', got 'Arena<Gpa>'" (gate 3's main.vl:204).
 
 ### What's new in 0.27.5
 
