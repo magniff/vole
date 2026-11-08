@@ -806,11 +806,28 @@ D3.6).
   has a projection as its value, the ties read through that impl,
   not the one the front resolved to. Otherwise the callee's walk and
   the caller's ties would name different slots. An impl whose value
-  is not a projection keeps the impl the front resolved to, as
-  before: `Copied<I>`'s `type Item = T;`, with T bound by I's `Item =
-  &'a T`. *Anchor:* `places/regions.vl: proj_map, proj_again,
-  direct_impl`. *Case:* `rust_b_nested_projection_item`,
+  is neither a projection nor a parameter (h) keeps the impl the front
+  resolved to, as before. *Anchor:* `places/regions.vl: proj_map,
+  proj_again, direct_impl`. *Case:* `rust_b_nested_projection_item`,
   `rust_b_ok_l14_impl_bound_ties` (the Map over Chain line).
+- (h) *A projection whose impl's value is a parameter its header does
+  not name (0.27.7).* `impl<'a, T: Copy + 'a, I: Iterator<Item = &'a
+  T>> Iterator for Copied<I> { type Item = T; }`: the header binds `I`,
+  and `T` only through `I`'s bound. The value is read through that
+  bound: `T`'s slots are those of the part of `I::Item` where the bound's
+  `&'a T` has `T`, with `I::Item` read by the direct impl for the type
+  the header binds `I` to, in the base's slots (g). For `Copied<Iter<'r,
+  &'s str>>`, `Iter`'s `type Item = &'a T` has at `T` its `T`, `&'s str`:
+  the item is `'s`, the vector's element, not `'r`, the borrow of the
+  vector. The impl for the type itself is used, not the one the front
+  resolved to (`Iter`'s, through the bound), as in (g). So `fn first<'a,
+  I: Iterator<Item = &'a str>>(it: I) -> &'a str` called with
+  `args.iter().copied()` of a `Vec<&'a str>` returns an `&'a str`. 0.27.6
+  read `Iter`'s value with `Copied`'s slots and tied `'a` to the borrow
+  of `args`: borrowck.return_local, which rustc accepts (the flip
+  rehearsal's F4). `Cloned<I>` is the same. *Anchor:* `places/regions.vl:
+  proj_bound, unnamed_param, bound_at`. *Cases:* `rust_b_ok_copied_items`,
+  `rust_b_copied_items_err`.
 
 ## 5. Variance (S5)
 
