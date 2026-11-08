@@ -150,6 +150,13 @@ The compiler's own source (gate 3, front273):
   positions, arch's intrinsic table and the tools' cache's read buffer
   are frozen. `volec __selftest freeze` checks the stop
   (tests/selftest.sh).
+- The translator reads a frozen buffer's views as SRC's: base's
+  `buf_done`, arch's `text` and `intr_text` and the tools' cache's
+  `get_str` are rows of static_result's list, each with its evidence,
+  and static_returns carries them to what returns them (lsp/complete's
+  `signature`, `call_snippet`, `mod_detail`; embed's `embed_type_name`
+  and `file_line_text`) and to their callers
+  (tests/refactor/edition0277b). Gate 3: 52 to 17 borrowck errors.
 
 The translator (g3274; flip28's T3 and T4, its rehearsal's hand fixes):
 
