@@ -151,6 +151,15 @@ The translator (g3274):
   starts is parenthesized); `let f = fs[i];` of an element that is not
   Copy is `&fs[i]`.
 
+The sources (g3274, docs/design/src-buffer.md):
+
+- add_source no longer writes over the NUL that ends SRC: the next file
+  starts after it and a newline, so no byte of a SRC already given out
+  changes (a view of it that ended at the NUL saw the next file's first
+  byte). The lexer reads that NUL, which is no file's text, as blank (a
+  module of several files is lexed as one range), and the tools' cache
+  restores the layout.
+
 The front (front273):
 
 - A method call in a generic body takes the method the body names, as
