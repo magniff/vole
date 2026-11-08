@@ -90,6 +90,43 @@ binary is invoked, where its test runner is and which hosts it supports.
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.28.0
+
+The places IR (sc280):
+
+- **A condition's `&&` and `||` are control flow.** In `if`, `while`, a
+  match guard and a `!` of one, the rust edition now branches on each
+  operand in turn: `a && b` sends `a`'s false edge to the else branch
+  and its true edge to `b`, and `!` swaps the targets (places::build
+  cond_into). MVS's lowering and rustc's MIR do the same. 0.27.8 made
+  the bool first, assigned on each path, then branched on it: a phi and
+  a branch the optimizer did not thread, at every such `if` and `while`.
+  In the flipped compiler that was most of what remained of its gap to
+  the MVS build, after derive278: ir_val, a `while r != 0 && ..` loop,
+  was 168 bytes against 104 and was no longer inlined, and form_lcssa
+  and simplify_cfg were four to five times their MVS size. With it, the
+  flipped compiler on the MVS tree took 9.04 G instructions to check
+  (9.74 G before) and 99.4 G to build itself (108.5 G), against 8.55 G
+  and 96.4 G for the MVS build. A `let`'s `a && b`, a value, is built as
+  before.
+  *Cases:* `rust_f_short_circuit_ir` (no phi in an `if` of `&&`, `||`
+  and `!`), `rust_f_short_circuit_order` (a rustc twin: the operands'
+  effects in order, the right one only when the left does not decide).
+  An MVS body keeps its own lowering, which its optimizer if-converts
+  (opt_ord_select's branch-free sift).
+
+std2 (sc280b):
+
+- **`Vec::push` is inline.** Its `ensures` clauses made every push a
+  call of `push$body`, out of line. They are `debug ensures` now, which
+  `volec test` checks. The fast path is a compare, one copy of the
+  element into its slot and an increment, and the growth is
+  `grow_one`, out of line. The flipped compiler's check of its own tree
+  went from 51.5 G instructions to 47.6 G.
+- `ptr::read` and `ptr::write` are `#[inline]`, as rustc's are. A copy
+  of a large element was a call; measured alone, the gain is in the
+  noise.
+
 ### What's new in 0.27.8
 
 The last release before the flip, and the compiler that builds 0.28.0.

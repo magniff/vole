@@ -15,7 +15,8 @@
 mod try_main;
 
 use crate::base::{
-    alloc_array, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, free, intern, intern_c, sym_text,
+    IntVec, alloc_array, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, free, intern, intern_c,
+    sym_text,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -45,6 +46,7 @@ use crate::front::types::{
     ENUMS, REF_MUT, TY_NEVER, TyKind, buf_type, enum_variant, err_type, fn_param, is_float,
     is_integer, is_pointer, primitive_name, type_elem, variant_field,
 };
+use crate::middle::lower::ssa::HMap;
 
 pub use try_main::{main_result_wrapper, std_enum_name, std_variant_pattern};
 
@@ -536,10 +538,11 @@ fn impl_fn(i: i64, member: i64, pcx: Ctx<Comp>) -> i64 {
     }
     // (0.27.2: a generic trait's default copied into the impl, F12.1:
     // collect_impl's impl_extra, not in the impl node's list)
-    for k in 0..pcx.impl_extra.count {
-        // UNSAFE: IMPL_EXTRA is a raw IntVec (base/comp.vl), as every table.
-        // SAFETY: k < count, the vector's own length.
-        let f = unsafe { pcx.impl_extra.data[k] };
+    // (those of impl i named member, in order: traits::impl_extra_at)
+    var k = crate::front::traits::impl_extra_at(i, member, pcx);
+    while k >= 0 {
+        let f = pcx.impl_extra.get(k);
+        k = crate::front::traits::impl_extra_after(k, pcx);
         if pcx.nodes[f].a == member && pcx.nodes[f].x != 0
             && (pcx.nodes[f].p & FN_SIG_FAILED) == 0
             && crate::front::traits::impl_of_fn(pcx.nodes[f].x - 1, pcx) == i {
@@ -960,6 +963,82 @@ fn place_takes(n: i64, place: i64, member: i64, tys: *i64, kinds: *i64,
     found
 }
 
+// (0.28.0) The impls that may have a function named member, in order:
+// the first's index (-1: none), then impl_naming_after's. A superset of
+// those impl_fn finds it in (their own functions and the trait defaults
+// copied into them, whatever their flags), made again when an impl or a
+// copy was added since.
+fn impl_naming(member: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if pcx.name_impls != pcx.traits_impls.len() as i64
+        || pcx.name_extra != pcx.impl_extra.count {
+        index_impl_names(&pcx);
+    }
+    pcx.name_first.get(member + 1) - 1
+}
+
+// The cell after cell c (impl_naming's), -1 at the end; its impl:
+// pcx.name_cells.get(c).
+fn impl_naming_after(c: i64, pcx: Ctx<Comp>) -> i64 {
+    pcx.name_cells.get(c + 1) - 1
+}
+
+// pcx.name_first, name_last and name_cells, for every impl: each name
+// once an impl, the impls in their order.
+fn index_impl_names(pcx: inout Ctx<Comp>) {
+    pcx.name_first.clear();
+    pcx.name_last.clear();
+    pcx.name_cells.count = 0;
+    let n = pcx.traits_impls.len() as i64;
+    // (the copied defaults by their impl: a chain per impl, extra_head)
+    var extra_head = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    var extra_next = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for k in 0..pcx.impl_extra.count {
+        extra_next.push(0);
+    }
+    var k = pcx.impl_extra.count - 1;
+    while k >= 0 {
+        let f = pcx.impl_extra.get(k);
+        if pcx.nodes[f].x != 0 {
+            let i = crate::front::traits::impl_of_fn(pcx.nodes[f].x - 1, pcx);
+            if i >= 0 {
+                extra_next.set(k, extra_head.get(i + 1));
+                extra_head.put(i + 1, k + 1);
+            }
+        }
+        k -= 1;
+    }
+    for i in 0..n {
+        let node = pcx.traits_impls[i].node;
+        for j in 0..pcx.nodes[node].count {
+            name_impl(pcx.nodes[child(node, j, pcx)].a, i, &pcx);
+        }
+        var e = extra_head.get(i + 1) - 1;
+        while e >= 0 {
+            name_impl(pcx.nodes[pcx.impl_extra.get(e)].a, i, &pcx);
+            e = extra_next.get(e) - 1;
+        }
+    }
+    pcx.name_impls = n;
+    pcx.name_extra = pcx.impl_extra.count;
+}
+
+// Impl i onto name's list, once (the impls come in order).
+fn name_impl(name: i64, i: i64, pcx: inout Ctx<Comp>) {
+    let last = pcx.name_last.get(name + 1) - 1;
+    if last >= 0 && pcx.name_cells.get(last) == i {
+        return;
+    }
+    let c = pcx.name_cells.count;
+    pcx.name_cells.push(i);
+    pcx.name_cells.push(0);
+    if last < 0 {
+        pcx.name_first.put(name + 1, c + 1);
+    } else {
+        pcx.name_cells.set(last + 1, c + 1);
+    }
+    pcx.name_last.put(name + 1, c + 1);
+}
+
 // generic_trait_call, the first `pre` arguments synthesized already.
 fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
@@ -980,7 +1059,17 @@ fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: inout Ctx<Comp>) -> i64 
         }
         let hint = hint_for(n, pcx);
         let mark = pcx.cands.count;
-        for i in 0..pcx.traits_impls.len() as i64 {
+        // (0.28.0: only the impls that may have a function named member,
+        // in order, impl_naming; the others have no candidate)
+        // (the impls there now: one an impl_covers adds is not tried)
+        let impls_now = pcx.traits_impls.len() as i64;
+        var c = impl_naming(member, &pcx);
+        while c >= 0 {
+            let i = pcx.name_cells.get(c);
+            c = impl_naming_after(c, pcx);
+            if i >= impls_now {
+                break;
+            }
             if trait_param_count(pcx.traits_impls[i].tr, pcx) == 0 || !impl_covers(i, t, &pcx) {
                 continue;
             }
