@@ -530,7 +530,8 @@ re-inferred.
   conflicts (rustc E0502: `let r = &cx.cap; f(cx); r`). 0.27.5 gave
   it as the shared reborrow `&(*Q)`, whose loan lived to the call.
   *Cases:* `rust_b_raw_coerce_ends_borrow`,
-  `rust_b_raw_coerce_live_shared_err`, `rust_b_raw_coerce_positions`.
+  `rust_b_raw_coerce_live_shared_err`, `rust_b_raw_coerce_positions`,
+  `rust_b_raw_coerce_let_live_shared_err`.
   **D3.6a (0.27.7, the coercion's mutability).** In the rust edition
   only `&mut T` coerces to `*mut T`. A `&T` coerces to `*const T` and
   not to `*mut T`: that is rustc's E0308 ("the types differ in
