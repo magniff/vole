@@ -34,21 +34,21 @@ $ undo --json
 ## A compiler error with help and its position; --json anywhere on the line.
 % printf '// Two errors.\nfn main() {\n    let x: i64 = "s\\t";\n    prinln("{}", x);\n}\n// EDITION: rust\n' > bad.vl
 $ --json check bad.vl
-{"kind":"diagnostic","severity":"error","code":"type error","file":"bad.vl","line":3,"col":18,"message":"expected 'i64', got 'str'","help":[],"notes":[],"try":[]}
+{"kind":"diagnostic","severity":"error","code":"type error","file":"bad.vl","line":3,"col":18,"message":"expected 'i64', got '&str'","help":[],"notes":[],"try":[]}
 {"kind":"diagnostic","severity":"error","code":"type error","file":"bad.vl","line":4,"col":5,"message":"undefined variable 'prinln'","help":["did you mean 'println'?"],"notes":[],"try":["volec fix --suggested bad.vl"]}
 [exit 1]
 $ bad.vl -o prog --json
-{"kind":"diagnostic","severity":"error","code":"type error","file":"bad.vl","line":3,"col":18,"message":"expected 'i64', got 'str'","help":[],"notes":[],"try":[]}
+{"kind":"diagnostic","severity":"error","code":"type error","file":"bad.vl","line":3,"col":18,"message":"expected 'i64', got '&str'","help":[],"notes":[],"try":[]}
 {"kind":"diagnostic","severity":"error","code":"type error","file":"bad.vl","line":4,"col":5,"message":"undefined variable 'prinln'","help":["did you mean 'println'?"],"notes":[],"try":["volec fix --suggested bad.vl"]}
 [exit 1]
 ## A build whose stderr is not a terminal (here, a file) prints check's
 ## one-line form; --diagnostics=human the human form.
 $ bad.vl -o prog
-bad.vl:3:18: error[type error] expected 'i64', got 'str'
+bad.vl:3:18: error[type error] expected 'i64', got '&str'
 bad.vl:4:5: error[type error] undefined variable 'prinln' | help: did you mean 'println'? | try: volec fix --suggested bad.vl
 [exit 1]
 $ --diagnostics=human bad.vl -o prog
-error[type error]: expected 'i64', got 'str'
+error[type error]: expected 'i64', got '&str'
  --> bad.vl: line 3, column 18
 error[type error]: undefined variable 'prinln'
  --> bad.vl: line 4, column 5

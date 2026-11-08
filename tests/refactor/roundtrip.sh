@@ -53,7 +53,7 @@ unset VOLE_ROOT
 
 # The modules of the program (but the root), one per line.
 modules() {
-    "$COMPILER" query items "$PROGRAM/main.vl" | awk -F'\t' '$1 != "crate" { print $1 }'
+    "$COMPILER" query items "$PROGRAM/main.vl" | awk -F'\t' '$1 != "crate" && $2 != "<std>" { print $1 }'
 }
 
 # The top-level items of module $1 in the copy, in order, after a line
