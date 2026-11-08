@@ -620,12 +620,21 @@ at each use, which gives the same values because a `const fn`'s body is
 deterministic. Such a constant is not a compile-time value yet: as an
 array length or in a pattern it is an error that says so (rustc accepts
 both). A constant defined through itself is an error at its use.
+The copy is read as at the constant: no local and no type parameter of
+the use is seen, so `let double = |x| x;` at a use of `const N: u64 =
+double(21);` does not take the place of the function `double`. The
+same holds for an inherent impl's constant (`impl D { const T: u64 =
+double(22); }`), whose copy 0.27.5 resolved in the use's scope: a
+local `double` was called there, which was wrong code. (`lookup_local`
+reads the env from `env_floor` up, and the copy is checked with no
+type parameter bound beyond the impl's.)
 0.27.5 refused such a constant ("constants must be integers, floats,
 bool or string literals"). MVS is unchanged. *Anchor:*
 `front/check/collect.vl: collect_const_types` (state 3),
 `front/check/names.vl: inline_const`, `front/consteval.vl:
-const_value, eval_array_len`. *Cases:* `rust_f_f34_const_values`,
-`rust_f_f34_const_len_err`.
+const_value, eval_array_len`, `front/assoc.vl: inherent_const_value`,
+`front/check/mod.vl: lookup_local`. *Cases:* `rust_f_f34_const_values`,
+`rust_f_f34_const_len_err`, `rust_f_f34_const_hygiene`.
 
 ## 2. Traits
 
