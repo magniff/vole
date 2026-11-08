@@ -60,7 +60,7 @@ back::codecache::OUT_EMIT	the task'"'"'s own function'"'"'s entry, read after th
 back::codecache::OUT_SCALAR	the task'"'"'s own function'"'"'s entry, read after the phases
 back::codecache::SCALAR_REC	the task'"'"'s own function'"'"'s entry (its cleanup'"'"'s, then its scalar pipeline'"'"'s, a phase after)
 back::codecache::pack::NEW	the task'"'"'s own slot, read when the pack is written
-back::codecache::pack::USED	the entry of the task'"'"'s own key (a key is one task'"'"'s), read when the pack is written
+back::codecache::pack::USED	the entry of the task'"'"'s own key, read when the pack is written (0.27.8: a key is one task'"'"'s but a function'"'"'s that shares its symbol, fn_ambig, whose task does not mark it: mark_used)
 base::ctx::Ctx.pack	read only: an entry'"'"'s body is read through its address
 base::STRESS_GROW	read by prepare_tasks (stress_grow)
 middle::egraph::P_KIND	the rules, parsed by prepare_tasks (init_rules)
@@ -121,6 +121,16 @@ ASSEMBLER='base::BUFS	asm_error (an internal error, which exits) and dwarf_file 
 base::BUF_CAP	the same
 base::BUF_COUNT	the same
 base::STRESS_GROW	read by asm_thread_start before the thread starts (stress_grow)'
+# (0.27.8) And per function: a static -O0's main thread writes while the
+# assembler thread runs (gen0's messages grow BUFS: buf_new) that a
+# function on the assembler's streaming path touches: static <TAB> function
+# <TAB> why. The streaming path is what assemble_bytes reaches but through
+# ASM_EXITS (an internal error, which exits; -g's DWARF, made where no
+# thread streams). A new one fails: 0.27.7's insn_text read BUFS[INSN_BUF]
+# as main grew BUFS (it reads INSN_TEXT now, a view taken before the thread
+# starts).
+ASM_EXITS='back::objfile::assemble::asm_error back::objfile::debug::dwarf_file'
+ASM_READS='base::STRESS_GROW	base::stress_grow	set by asm_thread_start before the thread starts (stress_grow); main writes it only while it is unset'
 
 # Every static task code reads or writes: static <TAB> how the code cache
 # covers it (key: in the entry's key; read: recorded, cc_note; IR: in
@@ -423,6 +433,63 @@ newa=$(comm -23 "$WORK/asm-shared" "$WORK/asm-allowed")
 for s in $newa; do
     echo "FAIL $s: -O0's assembler thread and its main thread share it; try: $COMPILER query callees crate::back::objfile::assemble_bytes --writes crate::$s"
 done
+# (0.27.8) Per function, against ASM_READS: the assembler's functions that
+# touch a static the main thread writes meanwhile, those of them on its
+# streaming path (reached from assemble_bytes, not through ASM_EXITS: their
+# callers in the assembler, walked up level by level).
+awk -F'\t' -v A="$WORK/assembler" -v M="$WORK/gen0" '
+    BEGIN {
+        while ((getline f < A) > 0) in_asm[f] = 1
+        while ((getline f < M) > 0) in_main[f] = 1
+    }
+    /^## \$ volec query refs / { s = $0; sub(/^## \$ volec query refs crate::/, "", s); sub(/ --all$/, "", s); n = s; sub(/.*::/, "", n); sub(/.*\./, "", n); next }
+    NF >= 4 && $1 ~ /^[0-9]+:[0-9]+$/ {
+        w = ($2 == "write" || $2 == "borrow")
+        if ($2 == "read" && match($4, n "(\\[[^]]*\\])?[ \t]*\\.[ \t]*(push|pop|clear|set|insert|put|reserve|truncate|remove|append|extend)[ \t]*\\(")) w = 1
+        if ($2 == "read" && match($4, "&(mut )?([A-Za-z_0-9]+\\.)*" n "([^A-Za-z_0-9]|$)")) w = 1
+        t = ($2 != "use" && $2 != "def" && $2 != "init")
+        if (($3 in in_main) && w) mw[s] = 1
+        if (($3 in in_asm) && t) touch[s "\t" $3] = 1
+    }
+    END { for (k in touch) { split(k, p, "\t"); if (p[1] in mw) print k } }' "$WORK/refs" | sort -u >"$WORK/asm-touch"
+cut -f2 "$WORK/asm-touch" | sort -u >"$WORK/up-new"
+: >"$WORK/up-seen"
+: >"$WORK/up-edges"
+while [ -s "$WORK/up-new" ]; do
+    cat "$WORK/up-new" >>"$WORK/up-seen"
+    sed 's/^/query callers crate::/; s/$/ --all/' "$WORK/up-new" | "$COMPILER" batch 2>&1 \
+        | awk -F'\t' -v A="$WORK/assembler" -v exits="$ASM_EXITS" '
+            BEGIN {
+                while ((getline f < A) > 0) in_asm[f] = 1
+                n = split(exits, e, " "); for (i = 1; i <= n; i++) cut[e[i]] = 1
+            }
+            /^## \$ volec query callers / { g = $0; sub(/^## \$ volec query callers crate::/, "", g); sub(/ --all$/, "", g); next }
+            NF >= 3 && $2 == "call" && ($3 in in_asm) && !($3 in cut) { print $3 "\t" g }' \
+        | sort -u >"$WORK/up-level"
+    cat "$WORK/up-level" >>"$WORK/up-edges"
+    sort -u "$WORK/up-seen" -o "$WORK/up-seen"
+    cut -f1 "$WORK/up-level" | sort -u | comm -23 - "$WORK/up-seen" >"$WORK/up-new"
+done
+awk -F'\t' '{ edge[$1] = edge[$1] " " $2 }
+    END {
+        q[1] = "back::objfile::assemble_bytes"; seen[q[1]] = 1; h = 1; t = 1
+        while (h <= t) {
+            g = q[h++]; print g
+            m = split(edge[g], c, " ")
+            for (i = 1; i <= m; i++) if (!(c[i] in seen)) { seen[c[i]] = 1; q[++t] = c[i] }
+        }
+    }' "$WORK/up-edges" | sort -u >"$WORK/asm-stream"
+awk -F'\t' -v S="$WORK/asm-stream" -v exits="$ASM_EXITS" '
+    BEGIN {
+        while ((getline f < S) > 0) on[f] = 1
+        n = split(exits, e, " "); for (i = 1; i <= n; i++) delete on[e[i]]
+    }
+    ($2 in on)' "$WORK/asm-touch" >"$WORK/asm-reads"
+printf '%s\n' "$ASM_READS" | cut -f1,2 | sort -u >"$WORK/asm-reads-allowed"
+newar=$(comm -23 "$WORK/asm-reads" "$WORK/asm-reads-allowed" | tr '\t' ' ')
+printf '%s\n' "$newar" | while read -r s f; do
+    [ -n "$s" ] && echo "FAIL $s: -O0's main thread writes it while the assembler thread reads it in $f; try: $COMPILER query refs crate::$s --in $f"
+done
 # (T8) Every static task code touches, against READ.
 awk -F'\t' -v reached="$WORK/reached" '
     BEGIN { while ((getline f < reached) > 0) in_task[f] = 1 }
@@ -434,5 +501,5 @@ newr=$(comm -23 "$WORK/touched" "$WORK/read-allowed")
 for s in $newr; do
     echo "FAIL $s: a task reads it, and the code cache does not know how it covers it (tests/threads_writes.sh READ); try: $COMPILER query refs crate::$s"
 done
-echo "threads-writes: $(wc -l <"$WORK/written" | tr -d ' ') statics written by tasks, $(wc -l <"$WORK/join-written" | tr -d ' ') by the join and used by tasks, $(wc -l <"$WORK/asm-shared" | tr -d ' ') shared by -O0's assembler thread; $(echo "$new$newj$newa" | grep -c .) not known to be race-free; $(wc -l <"$WORK/touched" | tr -d ' ') touched, $(echo "$newr" | grep -c .) the code cache does not cover"
-[ -z "$new" ] && [ -z "$newj" ] && [ -z "$newa" ] && [ -z "$newr" ]
+echo "threads-writes: $(wc -l <"$WORK/written" | tr -d ' ') statics written by tasks, $(wc -l <"$WORK/join-written" | tr -d ' ') by the join and used by tasks, $(wc -l <"$WORK/asm-shared" | tr -d ' ') shared by -O0's assembler thread; $(printf '%s\n%s\n%s\n%s\n' "$new" "$newj" "$newa" "$newar" | grep -c .) not known to be race-free; $(wc -l <"$WORK/touched" | tr -d ' ') touched, $(echo "$newr" | grep -c .) the code cache does not cover"
+[ -z "$new" ] && [ -z "$newj" ] && [ -z "$newa" ] && [ -z "$newar" ] && [ -z "$newr" ]
