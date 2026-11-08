@@ -217,7 +217,12 @@ The front (front273):
   at the coercion, as in rustc (D3.6). `f(cx, cx.f, &mut cx.cap)` with
   `cx` going to a `*mut C` is no longer a conflict (gate 3's class S).
   A shared borrow that is live across the coercion still conflicts
-  (E0502).
+  (E0502). The coercion is a mutable use of what `cx` points to, both
+  ways round: 0.27.5 accepted `outer(cx, inner(cx))` with `outer`
+  taking `&mut C` and `inner` a `*mut C`, which rustc rejects (E0499,
+  now `borrowck.mut_twice`: gate 3's 27 nested `is_const(cx, ir_val(cx,
+  ..))` calls, which the translator has to hoist), and rejected it with
+  the two parameter types swapped, which rustc accepts.
 - `Tr::f(x, ..)` of a trait function without a receiver takes Self from
   the argument whose parameter holds it (F8.2):
   `Hash::hash_slice(self, state)` in `impl<T: Hash> Hash for [T]` is
