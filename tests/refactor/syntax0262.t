@@ -5,21 +5,21 @@
 $ fmt
 formatted	main.vl	+8 -6 lines
 % cat main.vl
-use std::Display;
+use std::fmt::Display;
 
 fn show<T>(x: T, y: impl Display) where T: Display + Copy, {
     println("{x} {y}");
 }
 
-struct Pair<A, B> where A: Display, B: Display { a: A, b: B }
+#[derive(Clone, Copy)] struct Pair<A, B> where A: Display, B: Display { a: A, b: B }
 
-fn long_one<Aaaaaaaaaaa, Bbbbbbbbbbbbb, Cccccccccccc>(a: Aaaaaaaaaaa, b: Bbbbbbbbbbbbb,
-    c: Cccccccccccc) -> i64 where Aaaaaaaaaaa: Display, Bbbbbbbbbbbbb: Display + Copy,
+fn long_one<Aaaaaaaaaaa, Bbbbbbbbbbbbb, Cccccccccccc>(a: &Aaaaaaaaaaa, b: &Bbbbbbbbbbbbb,
+    c: &Cccccccccccc) -> i64 where Aaaaaaaaaaa: Display, Bbbbbbbbbbbbb: Display + Copy,
     Cccccccccccc: Copy {
     0
 }
 
-fn own_line<T, U>(x: T, u: U)
+fn own_line<T, U>(x: T, u: &U)
     where
         T: Display,
         U: Copy,
@@ -28,12 +28,13 @@ fn own_line<T, U>(x: T, u: U)
 }
 
 fn main() -> i32 {
-    show(1, "a");
-    own_line(2, 3);
-    let p = Pair { a: 1, b: 2 };
+    show(1i64, "a");
+    own_line(2i64, &3i64);
+    let p = Pair { a: 1i64, b: 2i64 };
     println("{}", p.a);
-    long_one(1, 2, 3) as i32
+    long_one(&1i64, &2i64, &3i64) as i32
 }
+// EDITION: rust
 $ fmt
 note fmt.none: 1 file formatted already
 $ check

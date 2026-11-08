@@ -3,21 +3,22 @@
 ## --differs: -O0 and -O2 disagree (here a test-only switch makes -O2 read
 ## the literal 12345 as 12346, in one of 30 functions of 428 lines)
 % VOLE_PLANT_MISCOMPILE=1 "$COMPILER" reduce main.vl --differs
-reduced main.vl: 428 lines to 12 in 307 runs; written to main.min.vl
+reduced main.vl: 429 lines to 13 in 308 runs; written to main.min.vl
 fn f17(x: i64) -> i64 {
-    var t = x;
+    let mut t = x;
     t = t + 12345;
     t
 }
 
 fn main() -> i32 {
-    var total = 0;
+    let mut total: i64 = 0;
     total += f17(total % 1000);
     println("{total}");
     0
 }
+// EDITION: rust
 % wc -l < main.min.vl | tr -d ' '
-12
+13
 ## --fails TEXT: its build or run prints TEXT
 $ reduce crash.vl --fails 'index out of bounds'
 reduced crash.vl: 21 lines to 9 in 35 runs; written to crash.min.vl

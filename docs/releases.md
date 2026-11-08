@@ -257,6 +257,19 @@ group, 12 cases of the views audit):
   `[&7]` have the body's storage, not `'static`, so
   `rust_b_unsized_err_raw_slice_invariant` borrows a static instead.
 
+The front for the rust edition (front280):
+
+- **Types print the way rustc spells them.** A rust-edition program's
+  messages printed MVS's words: `&T` as 'let T', `&mut T` as 'inout
+  T', and the views `&[T]` and `&str` as '[T]' and 'str'. They now print
+  `&T`, `&mut T`, `&[T]`, `&mut [T]`, `&str` and `&mut str`, and an
+  unsized `[T]` or `str` prints without the `&` (front/types.vl
+  buf_type). An MVS program's messages are unchanged. Two gaps remain:
+  a raw pointer still prints as `*T`, because the type does not record
+  const or mut, and no reference prints `&'a T`, because a lifetime is
+  the borrow checker's and not part of the type. 15 cases' `ERROR`
+  lines moved to the new spelling.
+
 ### What's new in 0.27.8
 
 The last release before the flip, and the compiler that builds 0.28.0.

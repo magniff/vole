@@ -5,14 +5,14 @@
 ## `#[sealed]` is that rule: attr.obsolete, which fix --only
 ## obsolete-attr deletes.
 $ check
-geometry.vl:1:1: warning[attr.obsolete] '#[sealed]' is the default from 0.26: every field not marked 'pub' is private to its module | help: delete it (`volec fix --only obsolete-attr` deletes every one) | try: volec fix --only obsolete-attr main.vl
+geometry.vl:1:24: warning[attr.obsolete] '#[sealed]' is the default from 0.26: every field not marked 'pub' is private to its module | help: delete it (`volec fix --only obsolete-attr` deletes every one) | try: volec fix --only obsolete-attr main.vl
 main.vl:7:15: error[field.literal-private] cannot make a 'Rect' here: its field 'w' is private to module 'geometry' | help: make one with its constructor: 'Rect::new'
 main.vl:8:6: error[field.private] field 'w' of 'Rect' is private to module 'geometry' | help: make it public: 'pub w: i64' at geometry.vl:2:19 | try: volec fix --suggested main.vl
 [exit 1]
 ## query context says a field's visibility.
 $ query context Rect.w
 // crate::geometry::Rect.w	geometry.vl:1-2	private to module geometry
-#[sealed]
+#[derive(Clone, Copy)] #[sealed]
 pub struct Rect { w: i64, pub h: i64 }
 // used by (4)
 geometry::Rect::new	geometry.vl:6:16	Rect { w: w, h: h }
@@ -23,7 +23,7 @@ warning query.program-errors: 2 errors in the program; results may be incomplete
 try: volec --diagnostics=short main.vl -c -o /dev/null
 $ query context Rect.h
 // crate::geometry::Rect.h	geometry.vl:1-2	pub field
-#[sealed]
+#[derive(Clone, Copy)] #[sealed]
 pub struct Rect { w: i64, pub h: i64 }
 // used by (3)
 geometry::Rect::new	geometry.vl:6:22	Rect { w: w, h: h }
@@ -41,11 +41,12 @@ $ fix --only pub
 fixed 1 pub	geometry.vl	+1 -1 lines
 ## Then only the warning is left, and its fix.
 $ check
-geometry.vl:1:1: warning[attr.obsolete] '#[sealed]' is the default from 0.26: every field not marked 'pub' is private to its module | help: delete it (`volec fix --only obsolete-attr` deletes every one) | try: volec fix --only obsolete-attr main.vl
+geometry.vl:1:24: warning[attr.obsolete] '#[sealed]' is the default from 0.26: every field not marked 'pub' is private to its module | help: delete it (`volec fix --only obsolete-attr` deletes every one) | try: volec fix --only obsolete-attr main.vl
 ok: 0 errors, 1 warning in main.vl
 $ fix --only obsolete-attr
-fixed 1 obsolete attribute	geometry.vl	+0 -1 lines
+fixed 1 obsolete attribute	geometry.vl	+1 -1 lines
 % cat geometry.vl
+#[derive(Clone, Copy)]
 pub struct Rect { pub w: i64, pub h: i64 }
 
 impl Rect {
