@@ -26,7 +26,7 @@ use crate::middle::fold::is_const;
 use crate::middle::gvn::has_ref_facts;
 use crate::middle::ipo::devirtualize;
 use crate::middle::ir::{
-    IRFUNCS, Op, Term, ir_append, ir_arg, ir_enter, ir_make, ir_new_block, ir_new_slot, ir_prepend,
+    get_irfuncs, Op, Term, ir_append, ir_arg, ir_enter, ir_make, ir_new_block, ir_new_slot, ir_prepend,
     ir_replace, ir_set_arg, ir_unlink, ir_val, ir_view,
 };
 use crate::middle::ir::cfg::{copy_terminator, ir_switch_no_preds, pred_index, succ, succ_count};
@@ -58,29 +58,29 @@ const CONST_ARG_BONUS: i64 = 10;
 const HINT_ALWAYS: i64 = 1;
 const HINT_NEVER: i64 = -1;
 
-pub static var FN_SIZE: *i64 = 0 as *i64;
+static mut FN_SIZE: *mut i64 = 0 as *mut i64;
 // (0.17) Per IR function, once it is optimized (its component done):
 // whether it calls a function that returns twice (1), or not (0); -1 not
 // yet known. should_inline asked calls_returns_twice of the caller and the
 // callee for every candidate call, a scan of both: a few percent of -O2.
-pub static var FN_RT: *i64 = 0 as *i64;
+static mut FN_RT: *mut i64 = 0 as *mut i64;
 
 // (0.17) See deciders: -1 not yet known.
-pub static var FN_DECIDERS_START: *i64 = 0 as *i64;
+static mut FN_DECIDERS_START: *mut i64 = 0 as *mut i64;
 // (0.18.1) Per function, the deciders (its own list: the function's task
 // makes it, its callers read it).
-pub static var FN_DECIDERS: *IntVec = 0 as *IntVec;
+static mut FN_DECIDERS: *mut IntVec = 0 as *mut IntVec;
 
 // (0.17) The inliner's caches of function information (FN_RT, deciders),
 // for IRFUNC_COUNT functions, none known.
-pub fn init_fn_caches(pcx: Ctx<Comp>) {
+pub fn init_fn_caches(pcx: &Ctx<Comp>) {
     unsafe {
-        FN_RT = alloc_array::<i64>(pcx.irfunc_count + 1);
-        FN_DECIDERS_START = alloc_array::<i64>(pcx.irfunc_count + 1);
-        FN_DECIDERS = alloc_zeroed((pcx.irfunc_count + 1) * size_of(IntVec)) as *IntVec;
+        set_fn_rt(alloc_array::<i64>(pcx.irfunc_count + 1));
+        set_fn_deciders_start(alloc_array::<i64>(pcx.irfunc_count + 1));
+        set_fn_deciders(alloc_zeroed((pcx.irfunc_count + 1) * size_of(IntVec)) as *mut IntVec);
         for fi in 0..pcx.irfunc_count {
-            FN_RT[fi] = -1;
-            FN_DECIDERS_START[fi] = -1;
+            (*get_fn_rt().add(fi as usize)) = -1;
+            (*get_fn_deciders_start().add(fi as usize)) = -1;
         }
     }
 }
@@ -88,26 +88,26 @@ pub fn init_fn_caches(pcx: Ctx<Comp>) {
 // Forgets what the caches know of fi (it changed).
 pub fn forget_fn_caches(fi: i64) {
     unsafe {
-        FN_RT[fi] = -1;
-        FN_DECIDERS_START[fi] = -1;
+        (*get_fn_rt().add(fi as usize)) = -1;
+        (*get_fn_deciders_start().add(fi as usize)) = -1;
     }
 }
 
 // The number of instructions that turn into code.
-pub fn func_size(cx: inout FnCtx, fi: i64) -> i64 {
-    var size = 0;
+pub fn func_size(cx: &mut FnCtx, fi: i64) -> i64 {
+    let mut size: i64 = 0;
     unsafe {
-        for i in 0..IRFUNCS[fi].blocks.count {
-            let b = IRFUNCS[fi].blocks.data[i];
-            if cx.blocks[b].removed != 0 {
+        for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
+            let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
+            if (*cx.blocks.add(b as usize)).removed != 0 {
                 continue;
             }
-            var v = cx.blocks[b].first;
+            let mut v = (*cx.blocks.add(b as usize)).first;
             while v != 0 {
-                if !cx.insts[v].op.is_remat() && cx.insts[v].op != Op::Param {
+                if !(*cx.insts.add(v as usize)).op.is_remat() && (*cx.insts.add(v as usize)).op != Op::Param {
                     size += 1;
                 }
-                v = cx.insts[v].next;
+                v = (*cx.insts.add(v as usize)).next;
             }
             size += 1;
         }
@@ -116,45 +116,45 @@ pub fn func_size(cx: inout FnCtx, fi: i64) -> i64 {
 }
 
 // The IR function called by direct call v, or -1.
-pub fn ir_callee(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) -> i64 {
+pub fn ir_callee(cx: &mut FnCtx, v: i64, pcx: &Ctx<Comp>) -> i64 {
     unsafe {
-        if cx.insts[v].op != Op::Call {
+        if (*cx.insts.add(v as usize)).op != Op::Call {
             return -1;
         }
-        let g = pcx.fn_ir[cx.insts[v].imm] - 1;
+        let g = (*pcx.fn_ir.add((*cx.insts.add(v as usize)).imm as usize)) - 1;
         // (0.18.1: what the task saw of g, for the code cache)
-        cc_note(&cx, R_STATIC, g, pcx);
+        cc_note(cx, R_STATIC, g, pcx);
         g
     }
 }
 
 // Counts the call sites and address uses of every function.
-pub fn count_call_sites(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
+pub fn count_call_sites(cx: &mut FnCtx, pcx: &mut Ctx<Comp>) {
     unsafe {
         for fi in 0..pcx.irfunc_count {
-            pcx.fn_calls[fi] = 0;
-            pcx.fn_address[fi] = 0;
+            (*pcx.fn_calls.add(fi as usize)) = 0;
+            (*pcx.fn_address.add(fi as usize)) = 0;
         }
         for fi in 0..pcx.irfunc_count {
-            if pcx.fn_live[fi] == 0 {
+            if (*pcx.fn_live.add(fi as usize)) == 0 {
                 continue;
             }
-            ir_enter(&cx, fi, pcx);
-            for i in 0..IRFUNCS[fi].blocks.count {
-                let b = IRFUNCS[fi].blocks.data[i];
-                if cx.blocks[b].removed != 0 {
+            ir_enter(cx, fi, pcx);
+            for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
+                let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
+                if (*cx.blocks.add(b as usize)).removed != 0 {
                     continue;
                 }
-                var v = cx.blocks[b].first;
+                let mut v = (*cx.blocks.add(b as usize)).first;
                 while v != 0 {
-                    let g = ir_callee(&cx, v, pcx);
+                    let g = ir_callee(cx, v, pcx);
                     if g >= 0 {
-                        pcx.fn_calls[g] += 1;
+                        (*pcx.fn_calls.add(g as usize)) += 1;
                     }
-                    if cx.insts[v].op == Op::FAddr && pcx.fn_ir[cx.insts[v].imm] != 0 {
-                        pcx.fn_address[pcx.fn_ir[cx.insts[v].imm] - 1] = 1;
+                    if (*cx.insts.add(v as usize)).op == Op::FAddr && (*pcx.fn_ir.add((*cx.insts.add(v as usize)).imm as usize)) != 0 {
+                        (*pcx.fn_address.add(((*pcx.fn_ir.add((*cx.insts.add(v as usize)).imm as usize)) - 1) as usize)) = 1;
                     }
-                    v = cx.insts[v].next;
+                    v = (*cx.insts.add(v as usize)).next;
                 }
             }
         }
@@ -164,28 +164,28 @@ pub fn count_call_sites(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
 // ---- Strongly connected components (Tarjan) ----
 
 // The direct callees of fi (with repeats), in `out`.
-pub fn callees(cx: inout FnCtx, fi: i64, out: inout IntVec, pcx: Ctx<Comp>) {
+pub fn callees(cx: &mut FnCtx, fi: i64, out: &mut IntVec, pcx: &Ctx<Comp>) {
     out.count = 0;
     unsafe {
-        ir_enter(&cx, fi, pcx);
-        for i in 0..IRFUNCS[fi].blocks.count {
-            let b = IRFUNCS[fi].blocks.data[i];
-            if cx.blocks[b].removed != 0 {
+        ir_enter(cx, fi, pcx);
+        for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
+            let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
+            if (*cx.blocks.add(b as usize)).removed != 0 {
                 continue;
             }
-            var v = cx.blocks[b].first;
+            let mut v = (*cx.blocks.add(b as usize)).first;
             while v != 0 {
-                let g = ir_callee(&cx, v, pcx);
+                let g = ir_callee(cx, v, pcx);
                 if g >= 0 {
                     out.push(g);
                 }
-                v = cx.insts[v].next;
+                v = (*cx.insts.add(v as usize)).next;
             }
         }
     }
 }
 
-pub fn compute_sccs(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
+pub fn compute_sccs(cx: &mut FnCtx, pcx: &mut Ctx<Comp>) {
     unsafe {
         let n = pcx.irfunc_count;
         let index = alloc_array::<i64>(n + 1);
@@ -193,65 +193,65 @@ pub fn compute_sccs(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
         let on_stack = alloc_array::<i64>(n + 1);
         // Adjacency, computed once (CSR).
         let adj_start = alloc_array::<i64>(n + 2);
-        var adj = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        var scratch = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut adj = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+        let mut scratch = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
         for fi in 0..n {
-            adj_start[fi] = adj.count;
-            callees(&cx, fi, &scratch, pcx);
+            (*adj_start.add(fi as usize)) = adj.count;
+            callees(cx, fi, &mut scratch, pcx);
             for i in 0..scratch.count {
-                adj.push(scratch.data[i]);
+                adj.push((*scratch.data.add(i as usize)));
             }
         }
-        adj_start[n] = adj.count;
-        var stack = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        var calls = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        var next_index = 1;
-        var scc_id = 0;
+        (*adj_start.add(n as usize)) = adj.count;
+        let mut stack = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+        let mut calls = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+        let mut next_index: i64 = 1;
+        let mut scc_id: i64 = 0;
         pcx.scc_order.count = 0;
         for root in 0..n {
-            if index[root] != 0 {
+            if (*index.add(root as usize)) != 0 {
                 continue;
             }
             // (node, next edge) frames.
             calls.push(root);
-            calls.push(adj_start[root]);
-            index[root] = next_index;
-            low[root] = next_index;
+            calls.push((*adj_start.add(root as usize)));
+            (*index.add(root as usize)) = next_index;
+            (*low.add(root as usize)) = next_index;
             next_index += 1;
             stack.push(root);
-            on_stack[root] = 1;
+            (*on_stack.add(root as usize)) = 1;
             while calls.count > 0 {
                 let top = calls.count - 2;
-                let v = calls.data[top];
-                let e = calls.data[top + 1];
-                if e < adj_start[v + 1] {
-                    calls.data[top + 1] = e + 1;
-                    let w = adj.data[e];
-                    if index[w] == 0 {
-                        index[w] = next_index;
-                        low[w] = next_index;
+                let v = (*calls.data.add(top as usize));
+                let e = (*calls.data.add((top + 1) as usize));
+                if e < (*adj_start.add((v + 1) as usize)) {
+                    (*calls.data.add((top + 1) as usize)) = e + 1;
+                    let w = (*adj.data.add(e as usize));
+                    if (*index.add(w as usize)) == 0 {
+                        (*index.add(w as usize)) = next_index;
+                        (*low.add(w as usize)) = next_index;
                         next_index += 1;
                         stack.push(w);
-                        on_stack[w] = 1;
+                        (*on_stack.add(w as usize)) = 1;
                         calls.push(w);
-                        calls.push(adj_start[w]);
-                    } else if on_stack[w] != 0 && index[w] < low[v] {
-                        low[v] = index[w];
+                        calls.push((*adj_start.add(w as usize)));
+                    } else if (*on_stack.add(w as usize)) != 0 && (*index.add(w as usize)) < (*low.add(v as usize)) {
+                        (*low.add(v as usize)) = (*index.add(w as usize));
                     }
                     continue;
                 }
                 calls.count -= 2;
                 if calls.count > 0 {
-                    let parent = calls.data[calls.count - 2];
-                    if low[v] < low[parent] {
-                        low[parent] = low[v];
+                    let parent = (*calls.data.add((calls.count - 2) as usize));
+                    if (*low.add(v as usize)) < (*low.add(parent as usize)) {
+                        (*low.add(parent as usize)) = (*low.add(v as usize));
                     }
                 }
-                if low[v] == index[v] {
+                if (*low.add(v as usize)) == (*index.add(v as usize)) {
                     loop {
                         let w = stack.pop();
-                        on_stack[w] = 0;
-                        pcx.fn_scc[w] = scc_id;
+                        (*on_stack.add(w as usize)) = 0;
+                        (*pcx.fn_scc.add(w as usize)) = scc_id;
                         pcx.scc_order.push(w);
                         if w == v {
                             break;
@@ -261,14 +261,14 @@ pub fn compute_sccs(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
                 }
             }
         }
-        free(index as *u8);
-        free(low as *u8);
-        free(on_stack as *u8);
-        free(adj_start as *u8);
-        free(adj.data as *u8);
-        free(scratch.data as *u8);
-        free(stack.data as *u8);
-        free(calls.data as *u8);
+        free(index as *mut u8);
+        free(low as *mut u8);
+        free(on_stack as *mut u8);
+        free(adj_start as *mut u8);
+        free(adj.data as *mut u8);
+        free(scratch.data as *mut u8);
+        free(stack.data as *mut u8);
+        free(calls.data as *mut u8);
     }
 }
 
@@ -276,56 +276,56 @@ pub fn compute_sccs(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
 
 // Whether block b is cold: it leads only to a panic (it ends in UNREACH),
 // or it calls a #[cold] function.
-fn block_is_cold(cx: inout FnCtx, b: i64, pcx: Ctx<Comp>) -> bool {
+fn block_is_cold(cx: &mut FnCtx, b: i64, pcx: &Ctx<Comp>) -> bool {
     unsafe {
-        if cx.blocks[b].term == Term::Unreach {
+        if (*cx.blocks.add(b as usize)).term == Term::Unreach {
             return true;
         }
-        var v = cx.blocks[b].first;
+        let mut v = (*cx.blocks.add(b as usize)).first;
         while v != 0 {
-            if cx.insts[v].op == Op::Call && fn_attr_cold(cx.insts[v].imm, pcx) {
+            if (*cx.insts.add(v as usize)).op == Op::Call && fn_attr_cold((*cx.insts.add(v as usize)).imm, pcx) {
                 return true;
             }
-            v = cx.insts[v].next;
+            v = (*cx.insts.add(v as usize)).next;
         }
         false
     }
 }
 
-fn mark_call_sites(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) {
+fn mark_call_sites(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) {
     unsafe {
-        resolve_all(&cx, fi);
-        analyze_loops(&cx, fi);
-        cx.site_depth = block_array(&cx, cx.site_depth, &cx.site_depth_cap, fi);
-        cx.site_cold = block_array(&cx, cx.site_cold, &cx.site_cold_cap, fi);
+        resolve_all(cx, fi);
+        analyze_loops(cx, fi);
+        cx.site_depth = block_array(cx, cx.site_depth, &mut cx.site_depth_cap, fi);
+        cx.site_cold = block_array(cx, cx.site_cold, &mut cx.site_cold_cap, fi);
         cx.site_nblocks = cx.block_count;
-        for i in 0..IRFUNCS[fi].blocks.count {
-            let b = IRFUNCS[fi].blocks.data[i];
-            if cx.blocks[b].removed != 0 {
+        for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
+            let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
+            if (*cx.blocks.add(b as usize)).removed != 0 {
                 continue;
             }
-            let l = innermost_loop(&cx, b);
-            cx.site_depth[b] = if l >= 0 { cx.lp_depth.data[l] } else { 0 };
-            cx.site_cold[b] = if block_is_cold(&cx, b, pcx) { 1 } else { 0 };
+            let l = innermost_loop(cx, b);
+            (*cx.site_depth.add(b as usize)) = if l >= 0 { (*cx.lp_depth.data.add(l as usize)) } else { 0 };
+            (*cx.site_cold.add(b as usize)) = if block_is_cold(cx, b, pcx) { 1 } else { 0 };
         }
     }
 }
 
 // The operand of a call holding the value of PARAM instruction p of
 // callee g (its piece, for an aggregate passed in pieces), or -1.
-pub fn param_operand(cx: inout FnCtx, g: i64, p: i64, pcx: Ctx<Comp>) -> i64 {
+pub fn param_operand(cx: &mut FnCtx, g: i64, p: i64, pcx: &Ctx<Comp>) -> i64 {
     unsafe {
-        let index = cx.insts[p].imm;
-        let piece = cx.insts[p].imm2;
+        let index = (*cx.insts.add(p as usize)).imm;
+        let piece = (*cx.insts.add(p as usize)).imm2;
         if index < 0 {
             return -1;
         }
-        let callee_f = IRFUNCS[g].f;
-        var k = 0;
+        let callee_f = (*get_irfuncs().add(g as usize)).f;
+        let mut k: i64 = 0;
         for q in 0..index {
             let ty = fn_param(callee_f, q, pcx);
             if !is_void(ty) {
-                k += if conv_classify(&cx, fn_uses_c(callee_f, pcx), ty, pcx)
+                k += if conv_classify(cx, fn_uses_c(callee_f, pcx), ty, pcx)
                     == AbiClass::Pieces { cx.abi_piece_count } else { 1 };
             }
         }
@@ -336,26 +336,26 @@ pub fn param_operand(cx: inout FnCtx, g: i64, p: i64, pcx: Ctx<Comp>) -> i64 {
 // Whether value p decides something in function g: it is compared,
 // switched on, or an operand of a multiplication, division, shift or mask
 // (a constant there folds in the copy).
-fn decides(cx: inout FnCtx, g: i64, p: i64) -> bool {
+fn decides(cx: &mut FnCtx, g: i64, p: i64) -> bool {
     unsafe {
-        for i in 0..IRFUNCS[g].blocks.count {
-            let b = IRFUNCS[g].blocks.data[i];
-            if cx.blocks[b].removed != 0 {
+        for i in 0..(*get_irfuncs().add(g as usize)).blocks.count {
+            let b = (*(*get_irfuncs().add(g as usize)).blocks.data.add(i as usize));
+            if (*cx.blocks.add(b as usize)).removed != 0 {
                 continue;
             }
-            if cx.blocks[b].term == Term::Switch && ir_val(&cx, cx.blocks[b].cond) == p {
+            if (*cx.blocks.add(b as usize)).term == Term::Switch && ir_val(cx, (*cx.blocks.add(b as usize)).cond) == p {
                 return true;
             }
-            var v = cx.blocks[b].first;
+            let mut v = (*cx.blocks.add(b as usize)).first;
             while v != 0 {
-                let op = cx.insts[v].op;
+                let op = (*cx.insts.add(v as usize)).op;
                 if op == Op::Cmp || op == Op::Mul || op == Op::Div || op == Op::Rem
                     || op == Op::Shl || op == Op::Shr || op == Op::And {
-                    if ir_val(&cx, cx.insts[v].a) == p || ir_val(&cx, cx.insts[v].b) == p {
+                    if ir_val(cx, (*cx.insts.add(v as usize)).a) == p || ir_val(cx, (*cx.insts.add(v as usize)).b) == p {
                         return true;
                     }
                 }
-                v = cx.insts[v].next;
+                v = (*cx.insts.add(v as usize)).next;
             }
         }
     }
@@ -366,15 +366,15 @@ fn decides(cx: inout FnCtx, g: i64, p: i64) -> bool {
 // for constant arguments that decide something in it, less the call's own
 // cost (its argument moves, the call and the result). (0.17: which of g's
 // parameters decide something is found once g is optimized, deciders.)
-fn inline_cost(cx: inout FnCtx, g: i64, call: i64, pcx: Ctx<Comp>) -> i64 {
+fn inline_cost(cx: &mut FnCtx, g: i64, call: i64, pcx: &Ctx<Comp>) -> i64 {
     unsafe {
-        let nargs = cx.insts[call].nargs;
-        cc_note(&cx, R_SIZE, g, pcx);
-        var cost = FN_SIZE[g];
-        let list = deciders(&cx, g, pcx);
+        let nargs = (*cx.insts.add(call as usize)).nargs;
+        cc_note(cx, R_SIZE, g, pcx);
+        let mut cost = (*get_fn_size().add(g as usize));
+        let list = deciders(cx, g, pcx);
         for i in 0..(*list).count {
-            let k = (*list).data[i];
-            if k < nargs && is_const(&cx, ir_val(&cx, ir_arg(&cx, call, k))) {
+            let k = (*(*list).data.add(i as usize));
+            if k < nargs && { let at_arg1 = ir_val(cx, ir_arg(cx, call, k)); is_const(cx, at_arg1) } {
                 cost -= CONST_ARG_BONUS;
             }
         }
@@ -385,73 +385,73 @@ fn inline_cost(cx: inout FnCtx, g: i64, call: i64, pcx: Ctx<Comp>) -> i64 {
 // The call operands of g's parameters that decide something in it (one
 // per parameter instruction, in order): FN_DECIDERS[g], found once g is
 // optimized (reset with FN_RT; 0.18.1: by g's task, finish_component).
-fn deciders(cx: inout FnCtx, g: i64, pcx: Ctx<Comp>) -> *IntVec {
+fn deciders(cx: &mut FnCtx, g: i64, pcx: &Ctx<Comp>) -> *mut IntVec {
     unsafe {
-        if FN_DECIDERS_START[g] < 0 {
+        if (*get_fn_deciders_start().add(g as usize)) < 0 {
             let back = cx.ir_cur;
-            ir_enter(&cx, g, pcx);
-            FN_DECIDERS_START[g] = 0;
-            FN_DECIDERS[g].count = 0;
-            let entry = IRFUNCS[g].entry;
-            var v = cx.blocks[entry].first;
+            ir_enter(cx, g, pcx);
+            (*get_fn_deciders_start().add(g as usize)) = 0;
+            (*get_fn_deciders().add(g as usize)).count = 0;
+            let entry = (*get_irfuncs().add(g as usize)).entry;
+            let mut v = (*cx.blocks.add(entry as usize)).first;
             while v != 0 {
-                if cx.insts[v].op == Op::Param {
-                    let k = param_operand(&cx, g, v, pcx);
-                    if k >= 0 && decides(&cx, g, v) {
-                        FN_DECIDERS[g].push(k);
+                if (*cx.insts.add(v as usize)).op == Op::Param {
+                    let k = param_operand(cx, g, v, pcx);
+                    if k >= 0 && decides(cx, g, v) {
+                        (*get_fn_deciders().add(g as usize)).push(k);
                     }
                 }
-                v = cx.insts[v].next;
+                v = (*cx.insts.add(v as usize)).next;
             }
-            ir_enter(&cx, back, pcx);
+            ir_enter(cx, back, pcx);
         }
-        cc_note(&cx, R_DEC, g, pcx);
-        &FN_DECIDERS[g]
+        cc_note(cx, R_DEC, g, pcx);
+        get_fn_deciders().add(g as usize)
     }
 }
 
-fn site_depth(cx: inout FnCtx, b: i64) -> i64 {
-    if b < cx.site_nblocks { unsafe { cx.site_depth[b] } } else { 0 }
+fn site_depth(cx: &mut FnCtx, b: i64) -> i64 {
+    if b < cx.site_nblocks { unsafe { (*cx.site_depth.add(b as usize)) } } else { 0 }
 }
 
-fn site_cold(cx: inout FnCtx, b: i64) -> bool {
-    unsafe { b < cx.site_nblocks && cx.site_cold[b] != 0 }
+fn site_cold(cx: &mut FnCtx, b: i64) -> bool {
+    unsafe { b < cx.site_nblocks && (*cx.site_cold.add(b as usize)) != 0 }
 }
 
 // Whether optimized function g calls a function that returns twice (see
 // FN_RT).
-fn callee_returns_twice(cx: inout FnCtx, g: i64, pcx: Ctx<Comp>) -> bool {
-    (callee_flags(&cx, g, pcx) & RT_RETURNS_TWICE) != 0
+fn callee_returns_twice(cx: &mut FnCtx, g: i64, pcx: &Ctx<Comp>) -> bool {
+    (callee_flags(cx, g, pcx) & RT_RETURNS_TWICE) != 0
 }
 
 // Whether optimized function g calls nothing (0.17: see should_inline).
-fn callee_is_leaf(cx: inout FnCtx, g: i64, pcx: Ctx<Comp>) -> bool {
-    (callee_flags(&cx, g, pcx) & RT_CALLS) == 0
+fn callee_is_leaf(cx: &mut FnCtx, g: i64, pcx: &Ctx<Comp>) -> bool {
+    (callee_flags(cx, g, pcx) & RT_CALLS) == 0
 }
 
 // FN_RT[g], computed once g is optimized.
-fn callee_flags(cx: inout FnCtx, g: i64, pcx: Ctx<Comp>) -> i64 {
+fn callee_flags(cx: &mut FnCtx, g: i64, pcx: &Ctx<Comp>) -> i64 {
     unsafe {
-        if FN_RT[g] < 0 {
+        if (*get_fn_rt().add(g as usize)) < 0 {
             let back = cx.ir_cur;
-            ir_enter(&cx, g, pcx);
-            var flags = if calls_returns_twice(&cx, g, pcx) { RT_RETURNS_TWICE } else { 0 };
-            for b in IRFUNCS[g].blocks.items() {
-                if cx.blocks[b].removed == 0 {
-                    var v = cx.blocks[b].first;
+            ir_enter(cx, g, pcx);
+            let mut flags: i64 = if calls_returns_twice(cx, g, pcx) { RT_RETURNS_TWICE } else { 0 };
+            for b in (*get_irfuncs().add(g as usize)).blocks.items() {
+                if (*cx.blocks.add(b as usize)).removed == 0 {
+                    let mut v = (*cx.blocks.add(b as usize)).first;
                     while v != 0 {
-                        if cx.insts[v].op.is_call() {
+                        if (*cx.insts.add(v as usize)).op.is_call() {
                             flags = flags | RT_CALLS;
                         }
-                        v = cx.insts[v].next;
+                        v = (*cx.insts.add(v as usize)).next;
                     }
                 }
             }
-            FN_RT[g] = flags;
-            ir_enter(&cx, back, pcx);
+            (*get_fn_rt().add(g as usize)) = flags;
+            ir_enter(cx, back, pcx);
         }
-        cc_note(&cx, R_RT, g, pcx);
-        FN_RT[g]
+        cc_note(cx, R_RT, g, pcx);
+        (*get_fn_rt().add(g as usize))
     }
 }
 
@@ -461,23 +461,23 @@ const RT_CALLS: i64 = 2;
 // should_inline).
 const INLINE_LEAF: i64 = 6;
 
-fn should_inline(cx: inout FnCtx, fi: i64, g: i64, call: i64, pcx: Ctx<Comp>) -> bool {
+fn should_inline(cx: &mut FnCtx, fi: i64, g: i64, call: i64, pcx: &Ctx<Comp>) -> bool {
     unsafe {
-        if g == fi || pcx.fn_scc[g] == pcx.fn_scc[fi] || pcx.fn_live[g] == 0 {
+        if g == fi || (*pcx.fn_scc.add(g as usize)) == (*pcx.fn_scc.add(fi as usize)) || (*pcx.fn_live.add(g as usize)) == 0 {
             return false;
         }
         // (0.18.1) Only a callee whose component is done (below this one: a
         // call made direct may call any function).
-        if !fn_facts_ready(&cx, g, true, pcx) {
+        if !fn_facts_ready(cx, g, true, pcx) {
             return false;
         }
-        cc_note(&cx, R_SIZE, g, pcx);
+        cc_note(cx, R_SIZE, g, pcx);
         // A function calling setjmp (or the like) keeps its own frame, and
         // its callers theirs (see regalloc.vl).
-        if cx.caller_rt || callee_returns_twice(&cx, g, pcx) {
+        if cx.caller_rt || callee_returns_twice(cx, g, pcx) {
             return false;
         }
-        let gf = IRFUNCS[g].f;
+        let gf = (*get_irfuncs().add(g as usize)).f;
         let hint = fn_attr_inline(gf, pcx);
         if hint == HINT_NEVER || fn_attr_cold(gf, pcx) {
             return false;
@@ -490,12 +490,12 @@ fn should_inline(cx: inout FnCtx, fi: i64, g: i64, call: i64, pcx: Ctx<Comp>) ->
         // `as_slice`.
         // (0.17: computed once; it scans the callee for what each constant
         // argument decides)
-        let cost = inline_cost(&cx, g, call, pcx);
-        if cost <= INLINE_TINY && budget_allows(&cx, FN_SIZE[g], pcx) {
+        let cost = inline_cost(cx, g, call, pcx);
+        if cost <= INLINE_TINY && budget_allows(cx, (*get_fn_size().add(g as usize)), pcx) {
             return true;
         }
-        let b = cx.insts[call].block;
-        let once = calls_left(&cx, g, pcx) == 1 && pcx.fn_address[g] == 0 && !fn_is_global(gf, pcx);
+        let b = (*cx.insts.add(call as usize)).block;
+        let once = calls_left(cx, g, pcx) == 1 && (*pcx.fn_address.add(g as usize)) == 0 && !fn_is_global(gf, pcx);
         // A closure called once is inlined whatever its size: it is moved,
         // not copied, and its size before its environment is known (the
         // loads through it) says little of what it becomes (a closure
@@ -507,25 +507,25 @@ fn should_inline(cx: inout FnCtx, fi: i64, g: i64, call: i64, pcx: Ctx<Comp>) ->
         // code is about its call's (the arguments' moves, the call, the
         // caller-saved registers it clobbers), and the program's callers,
         // last in the order, found the budget spent.
-        let small_leaf = FN_SIZE[g] <= INLINE_LEAF && callee_is_leaf(&cx, g, pcx);
-        if FN_SIZE[fi] + FN_SIZE[g] > INLINE_BUDGET
-            || (!budget_allows(&cx, FN_SIZE[g], pcx) && !small_leaf) {
+        let small_leaf = (*get_fn_size().add(g as usize)) <= INLINE_LEAF && callee_is_leaf(cx, g, pcx);
+        if (*get_fn_size().add(fi as usize)) + (*get_fn_size().add(g as usize)) > INLINE_BUDGET
+            || (!budget_allows(cx, (*get_fn_size().add(g as usize)), pcx) && !small_leaf) {
             return false;
         }
         // (0.10: with a profile, a call that never ran is cold, and a hot one
         // takes a callee up to INLINE_HOT)
-        if site_cold(&cx, b) || is_cold_block(&cx, b, pcx) {
+        if site_cold(cx, b) || is_cold_block(cx, b, pcx) {
             // In a cold block, only when that makes the program no bigger.
             return once || cost <= 0;
         }
-        if once && FN_SIZE[g] <= INLINE_ONCE {
+        if once && (*get_fn_size().add(g as usize)) <= INLINE_ONCE {
             return true;
         }
-        if is_hot_count(cx.blocks[b].count, pcx) && cost <= INLINE_HOT {
+        if is_hot_count((*cx.blocks.add(b as usize)).count, pcx) && cost <= INLINE_HOT {
             return true;
         }
-        let depth = site_depth(&cx, b);
-        var threshold = INLINE_SMALL;
+        let depth = site_depth(cx, b);
+        let mut threshold = INLINE_SMALL;
         if depth >= 1 {
             threshold *= 2;
         }
@@ -539,56 +539,56 @@ fn should_inline(cx: inout FnCtx, fi: i64, g: i64, call: i64, pcx: Ctx<Comp>) ->
 // Whether inlining function g is charged to the budgets only for what it
 // adds once simplified (see inline_calls): `#[inline]` functions (the std
 // iterator methods are) and closures' functions.
-fn counted_after(g: i64, pcx: Ctx<Comp>) -> bool {
-    unsafe { fn_attr_inline(IRFUNCS[g].f, pcx) == HINT_ALWAYS || is_closure_fn(g, pcx) }
+fn counted_after(g: i64, pcx: &Ctx<Comp>) -> bool {
+    unsafe { fn_attr_inline((*get_irfuncs().add(g as usize)).f, pcx) == HINT_ALWAYS || is_closure_fn(g, pcx) }
 }
 
 // Whether IR function g is a closure's (FN_CLOSURE, 0.14).
-fn is_closure_fn(g: i64, pcx: Ctx<Comp>) -> bool {
+fn is_closure_fn(g: i64, pcx: &Ctx<Comp>) -> bool {
     unsafe {
-        let node = pcx.fns[IRFUNCS[g].f].node;
-        node != 0 && (pcx.nodes[node].p & FN_CLOSURE) != 0
+        let node = pcx.fns[(*get_irfuncs().add(g as usize)).f as usize].node;
+        node != 0 && (pcx.nodes[node as usize].p & FN_CLOSURE) != 0
     }
 }
 
 // Inlines the calls of function fi that should be, in one pass over its
 // blocks. Returns whether any was.
-pub fn inline_calls(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool {
+pub fn inline_calls(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> bool {
     unsafe {
-        devirtualize(&cx, fi, pcx);
-        mark_call_sites(&cx, fi, pcx);
-        cx.caller_rt = calls_returns_twice(&cx, fi, pcx);
-        var changed = false;
-        var i = 0;
+        devirtualize(cx, fi, pcx);
+        mark_call_sites(cx, fi, pcx);
+        cx.caller_rt = calls_returns_twice(cx, fi, pcx);
+        let mut changed = false;
+        let mut i: i64 = 0;
         // Blocks appended by inlining are visited too, except the callees'
         // copies (BLOCKS[b].loop_depth == 1): their calls wait for the next
         // round, once the copies are simplified.
-        while i < IRFUNCS[fi].blocks.count {
-            let b = IRFUNCS[fi].blocks.data[i];
+        while i < (*get_irfuncs().add(fi as usize)).blocks.count {
+            let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
             i += 1;
-            if cx.blocks[b].removed != 0 || cx.blocks[b].loop_depth == 1 {
+            if (*cx.blocks.add(b as usize)).removed != 0 || (*cx.blocks.add(b as usize)).loop_depth == 1 {
                 continue;
             }
-            var v = cx.blocks[b].first;
+            let mut v = (*cx.blocks.add(b as usize)).first;
             while v != 0 {
-                let next = cx.insts[v].next;
-                let g = ir_callee(&cx, v, pcx);
-                if g >= 0 && should_inline(&cx, fi, g, v, pcx) {
+                let next = (*cx.insts.add(v as usize)).next;
+                let g = ir_callee(cx, v, pcx);
+                if g >= 0 && should_inline(cx, fi, g, v, pcx) {
                     // (0.14) A function made to be inlined counts for its size
                     // once simplified, when inline_rounds measures it: its
                     // size alone, before its arguments are known, would use
                     // up the budgets in the middle of an iterator chain.
                     if !counted_after(g, pcx) {
-                        FN_SIZE[fi] += FN_SIZE[g];
-                        program_grows(&cx, FN_SIZE[g]);
+                        (*get_fn_size().add(fi as usize)) += (*get_fn_size().add(g as usize));
+                        program_grows(cx, (*get_fn_size().add(g as usize)));
                     }
-                    note_inlined(&cx, g);
+                    note_inlined(cx, g);
                     // The continuation block keeps the call site's loop depth
                     // and coldness.
-                    let depth = site_depth(&cx, b);
-                    let cold = site_cold(&cx, b);
-                    let cont = inline_call(&cx, fi, v, g, pcx);
-                    set_site(&cx, cont, depth, cold);
+                    let depth = site_depth(cx, b);
+                    let cold = site_cold(cx, b);
+                    let cont = inline_call(cx, fi, v, g, pcx);
+                    set_site(cx, cont, depth, cold);
                     changed = true;
                     // The rest of this block moved to the continuation block,
                     // visited later.
@@ -597,8 +597,8 @@ pub fn inline_calls(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool {
                 v = next;
             }
         }
-        for k in 0..IRFUNCS[fi].blocks.count {
-            cx.blocks[IRFUNCS[fi].blocks.data[k]].loop_depth = 0;
+        for k in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
+            (*cx.blocks.add((*(*get_irfuncs().add(fi as usize)).blocks.data.add(k as usize)) as usize)).loop_depth = 0;
         }
         changed
     }
@@ -619,18 +619,18 @@ fn scaled_count(count: i64, site: i64, entry: i64) -> i64 {
 // mark_call_sites. (0.18.1: the tables grow to cover it; 0.17 recorded it
 // only when they covered it already, which depended on the largest
 // function optimized before, on this thread.)
-fn set_site(cx: inout FnCtx, b: i64, depth: i64, cold: bool) {
+fn set_site(cx: &mut FnCtx, b: i64, depth: i64, cold: bool) {
     unsafe {
         if b >= cx.site_depth_cap || b >= cx.site_cold_cap {
             let cap = (b + 1) * 2;
             let depths = alloc_array::<i64>(cap);
             let colds = alloc_array::<i64>(cap);
             for x in 0..cx.site_nblocks {
-                depths[x] = cx.site_depth[x];
-                colds[x] = cx.site_cold[x];
+                (*depths.add(x as usize)) = (*cx.site_depth.add(x as usize));
+                (*colds.add(x as usize)) = (*cx.site_cold.add(x as usize));
             }
-            free(cx.site_depth as *u8);
-            free(cx.site_cold as *u8);
+            free(cx.site_depth as *mut u8);
+            free(cx.site_cold as *mut u8);
             cx.site_depth = depths;
             cx.site_cold = colds;
             cx.site_depth_cap = cap;
@@ -638,13 +638,13 @@ fn set_site(cx: inout FnCtx, b: i64, depth: i64, cold: bool) {
         }
         if b >= cx.site_nblocks {
             for x in cx.site_nblocks..b + 1 {
-                cx.site_depth[x] = 0;
-                cx.site_cold[x] = 0;
+                (*cx.site_depth.add(x as usize)) = 0;
+                (*cx.site_cold.add(x as usize)) = 0;
             }
             cx.site_nblocks = b + 1;
         }
-        cx.site_depth[b] = depth;
-        cx.site_cold[b] = if cold { 1 } else { 0 };
+        (*cx.site_depth.add(b as usize)) = depth;
+        (*cx.site_cold.add(b as usize)) = if cold { 1 } else { 0 };
     }
 }
 
@@ -652,34 +652,34 @@ fn set_site(cx: inout FnCtx, b: i64, depth: i64, cold: bool) {
 // (so constants reach the copies) and recounts the function's size; the
 // copies' own calls are candidates in the next round. Returns whether
 // anything was inlined.
-pub fn inline_rounds(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool {
+pub fn inline_rounds(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> bool {
     unsafe {
-        var any = false;
+        let mut any = false;
         for round in 0..INLINE_ROUNDS {
-            if !inline_calls(&cx, fi, pcx) {
+            if !inline_calls(cx, fi, pcx) {
                 break;
             }
             any = true;
-            let before = FN_SIZE[fi];
-            optimize_after_inlining(&cx, fi, pcx);
-            let after = func_size(&cx, fi);
+            let before = (*get_fn_size().add(fi as usize));
+            optimize_after_inlining(cx, fi, pcx);
+            let after = func_size(cx, fi);
             // (0.14: not a function that goes once inlined everywhere)
             if !inlined_everywhere(fi, pcx) {
-                program_grows(&cx, after - before);
+                program_grows(cx, after - before);
             }
-            FN_SIZE[fi] = after;
+            (*get_fn_size().add(fi as usize)) = after;
         }
         any
     }
 }
 
 // The program's size now, and its growth budget.
-pub fn start_inlining_budget(pcx: inout Ctx<Comp>) {
+pub fn start_inlining_budget(pcx: &mut Ctx<Comp>) {
     unsafe {
         pcx.program_size = 0;
         for fi in 0..pcx.irfunc_count {
-            if pcx.fn_live[fi] != 0 && !inlined_everywhere(fi, pcx) {
-                pcx.program_size += FN_SIZE[fi];
+            if (*pcx.fn_live.add(fi as usize)) != 0 && !inlined_everywhere(fi, pcx) {
+                pcx.program_size += (*get_fn_size().add(fi as usize));
             }
         }
         pcx.program_budget = pcx.program_size + pcx.program_size / 2 + 2000;
@@ -689,197 +689,197 @@ pub fn start_inlining_budget(pcx: inout Ctx<Comp>) {
 // ---- Inlining one call ----
 
 // The copy of value `v` of the callee (cx.inl_imap; its aux until 0.18.1).
-fn mapped(cx: inout FnCtx, v: i64) -> i64 {
-    if v == 0 { 0 } else { unsafe { cx.inl_imap[v] } }
+fn mapped(cx: &mut FnCtx, v: i64) -> i64 {
+    if v == 0 { 0 } else { unsafe { (*cx.inl_imap.add(v as usize)) } }
 }
 
 // Inlines callee g at call `call` of function fi. Returns the continuation
 // block (the instructions after the call). (0.17: g's IR is read through
 // its own tables, gt, while fi's are current: ids are each function's.)
-fn inline_call(cx: inout FnCtx, fi: i64, call: i64, g: i64, pcx: Ctx<Comp>) -> i64 {
+fn inline_call(cx: &mut FnCtx, fi: i64, call: i64, g: i64, pcx: &Ctx<Comp>) -> i64 {
     unsafe {
         // (0.18.1: g is resolved already, finish_component_function and
         // simplify_inlining_leaves; its tables are only read: another thread
         // may be copying it too)
-        ir_enter(&cx, fi, pcx);
-        cc_note(&cx, R_IR, g, pcx);
+        ir_enter(cx, fi, pcx);
+        cc_note(cx, R_IR, g, pcx);
         let gt = ir_view(g);
-        inline_maps(&cx, gt.block_count + 1, gt.inst_count + 1);
-        let b = cx.insts[call].block;
+        inline_maps(cx, gt.block_count + 1, gt.inst_count + 1);
+        let b = (*cx.insts.add(call as usize)).block;
         // The continuation: the instructions after the call, and b's end.
-        let cont = ir_new_block(&cx);
-        cx.blocks[cont].sealed = 1;
-        cx.blocks[cont].count = cx.blocks[b].count;
-        var v = cx.insts[call].next;
+        let cont = ir_new_block(cx);
+        (*cx.blocks.add(cont as usize)).sealed = 1;
+        (*cx.blocks.add(cont as usize)).count = (*cx.blocks.add(b as usize)).count;
+        let mut v = (*cx.insts.add(call as usize)).next;
         while v != 0 {
-            let next = cx.insts[v].next;
-            ir_unlink(&cx, v);
-            ir_append(&cx, cont, v);
+            let next = (*cx.insts.add(v as usize)).next;
+            ir_unlink(cx, v);
+            ir_append(cx, cont, v);
             v = next;
         }
-        copy_terminator(&cx, cont, b);
-        for k in 0..succ_count(&cx, cont) {
-            let s = succ(&cx, cont, k);
-            let index = pred_index(&cx, s, b);
-            cx.blocks[s].preds.data[index] = cont;
+        copy_terminator(cx, cont, b);
+        for k in 0..succ_count(cx, cont) {
+            let s = succ(cx, cont, k);
+            let index = pred_index(cx, s, b);
+            (*(*cx.blocks.add(s as usize)).preds.data.add(index as usize)) = cont;
         }
         // The operand of the call holding each parameter (its first piece,
         // for an aggregate passed in pieces).
-        let callee_f = IRFUNCS[g].f;
-        var param_first: [i64; 64] = [0; 64];
-        var k = 0;
-        for p in 0..pcx.fns[callee_f].param_count {
+        let callee_f = (*get_irfuncs().add(g as usize)).f;
+        let mut param_first: [i64; 64] = [0i64; 64];
+        let mut k: i64 = 0;
+        for p in 0..pcx.fns[callee_f as usize].param_count {
             let ty = fn_param(callee_f, p, pcx);
             if !is_void(ty) {
-                param_first[p] = k;
-                k += if conv_classify(&cx, fn_uses_c(callee_f, pcx), ty, pcx)
+                param_first[p as usize] = k;
+                k += if conv_classify(cx, fn_uses_c(callee_f, pcx), ty, pcx)
                     == AbiClass::Pieces { cx.abi_piece_count } else { 1 };
             }
         }
         // Copy the blocks and instructions.
-        let gentry = IRFUNCS[g].entry;
-        for i in 0..IRFUNCS[g].blocks.count {
-            let gb = IRFUNCS[g].blocks.data[i];
-            if gt.blocks[gb].removed != 0 {
+        let gentry = (*get_irfuncs().add(g as usize)).entry;
+        for i in 0..(*get_irfuncs().add(g as usize)).blocks.count {
+            let gb = (*(*get_irfuncs().add(g as usize)).blocks.data.add(i as usize));
+            if (*gt.blocks.add(gb as usize)).removed != 0 {
                 continue;
             }
-            let nb = ir_new_block(&cx);
-            cx.blocks[nb].sealed = 1;
-            cx.blocks[nb].loop_depth = 1;
-            cx.blocks[nb].novec = gt.blocks[gb].novec;
-            cx.blocks[nb].count = scaled_count(gt.blocks[gb].count, cx.blocks[b].count,
-                gt.blocks[gentry].count);
-            cx.inl_bmap[gb] = nb;
-            var gv = gt.blocks[gb].first;
+            let nb = ir_new_block(cx);
+            (*cx.blocks.add(nb as usize)).sealed = 1;
+            (*cx.blocks.add(nb as usize)).loop_depth = 1;
+            (*cx.blocks.add(nb as usize)).novec = (*gt.blocks.add(gb as usize)).novec;
+            (*cx.blocks.add(nb as usize)).count = scaled_count((*gt.blocks.add(gb as usize)).count, (*cx.blocks.add(b as usize)).count,
+                (*gt.blocks.add(gentry as usize)).count);
+            (*cx.inl_bmap.add(gb as usize)) = nb;
+            let mut gv = (*gt.blocks.add(gb as usize)).first;
             while gv != 0 {
-                let op = gt.insts[gv].op;
+                let op = (*gt.insts.add(gv as usize)).op;
                 if op == Op::Param {
-                    let index = gt.insts[gv].imm;
-                    let piece = gt.insts[gv].imm2;
+                    let index = (*gt.insts.add(gv as usize)).imm;
+                    let piece = (*gt.insts.add(gv as usize)).imm2;
                     if index < 0 {
-                        cx.inl_imap[gv] = cx.insts[call].c;
+                        (*cx.inl_imap.add(gv as usize)) = (*cx.insts.add(call as usize)).c;
                     } else {
-                        cx.inl_imap[gv] = ir_arg(&cx, call,
-                            param_first[index] + if piece > 0 { piece - 1 } else { 0 });
+                        (*cx.inl_imap.add(gv as usize)) = ir_arg(cx, call,
+                            param_first[index as usize] + if piece > 0 { piece - 1 } else { 0 });
                     }
                 } else {
-                    let nv = ir_make(&cx, op, gt.insts[gv].ty, gt.insts[gv].a, gt.insts[gv].b,
-                        gt.insts[gv].imm, pcx);
-                    cx.insts[nv].c = gt.insts[gv].c;
-                    cx.insts[nv].cond = gt.insts[gv].cond;
-                    cx.insts[nv].imm2 = gt.insts[gv].imm2;
+                    let nv = ir_make(cx, op, (*gt.insts.add(gv as usize)).ty, (*gt.insts.add(gv as usize)).a, (*gt.insts.add(gv as usize)).b,
+                        (*gt.insts.add(gv as usize)).imm, pcx);
+                    (*cx.insts.add(nv as usize)).c = (*gt.insts.add(gv as usize)).c;
+                    (*cx.insts.add(nv as usize)).cond = (*gt.insts.add(gv as usize)).cond;
+                    (*cx.insts.add(nv as usize)).imm2 = (*gt.insts.add(gv as usize)).imm2;
                     if op == Op::Slot {
-                        let s = gt.insts[gv].imm;
-                        cx.insts[nv].imm = ir_new_slot(&cx, gt.slots[s].size, gt.slots[s].align);
-                        cx.slots[cx.insts[nv].imm].ty = gt.slots[s].ty;
+                        let s = (*gt.insts.add(gv as usize)).imm;
+                        (*cx.insts.add(nv as usize)).imm = ir_new_slot(cx, (*gt.slots.add(s as usize)).size, (*gt.slots.add(s as usize)).align);
+                        { let at_ix = (*cx.insts.add(nv as usize)).imm as usize; (*cx.slots.add(at_ix)).ty = (*gt.slots.add(s as usize)).ty };
                     }
-                    if gt.insts[gv].nargs > 0 || op == Op::Phi || op.is_call() {
-                        let base = gt.insts[gv].args;
-                        cx.insts[nv].args = cx.args.count;
-                        cx.insts[nv].nargs = gt.insts[gv].nargs;
-                        for a in 0..gt.insts[gv].nargs {
-                            cx.args.push(gt.args.data[base + a]);
-                            cx.argty.push(gt.argty.data[base + a]);
+                    if (*gt.insts.add(gv as usize)).nargs > 0 || op == Op::Phi || op.is_call() {
+                        let base = (*gt.insts.add(gv as usize)).args;
+                        (*cx.insts.add(nv as usize)).args = cx.args.count;
+                        (*cx.insts.add(nv as usize)).nargs = (*gt.insts.add(gv as usize)).nargs;
+                        for a in 0..(*gt.insts.add(gv as usize)).nargs {
+                            cx.args.push((*gt.args.data.add((base + a) as usize)));
+                            cx.argty.push((*gt.argty.data.add((base + a) as usize)));
                         }
                     }
-                    ir_append(&cx, nb, nv);
-                    cx.inl_imap[gv] = nv;
+                    ir_append(cx, nb, nv);
+                    (*cx.inl_imap.add(gv as usize)) = nv;
                 }
-                gv = gt.insts[gv].next;
+                gv = (*gt.insts.add(gv as usize)).next;
             }
         }
         // Map the operands, the terminators and the predecessors. An aggregate
         // returned in registers is copied from its address to the call's
         // result slot.
-        let ret = pcx.fns[callee_f].ret;
-        let copy_result = cx.insts[call].c != 0
-            && !conv_returns_through_pointer(&cx, fn_uses_c(callee_f, pcx), ret, pcx);
-        var returns = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..IRFUNCS[g].blocks.count {
-            let gb = IRFUNCS[g].blocks.data[i];
-            if gt.blocks[gb].removed != 0 {
+        let ret = pcx.fns[callee_f as usize].ret;
+        let copy_result = (*cx.insts.add(call as usize)).c != 0
+            && !conv_returns_through_pointer(cx, fn_uses_c(callee_f, pcx), ret, pcx);
+        let mut returns = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+        for i in 0..(*get_irfuncs().add(g as usize)).blocks.count {
+            let gb = (*(*get_irfuncs().add(g as usize)).blocks.data.add(i as usize));
+            if (*gt.blocks.add(gb as usize)).removed != 0 {
                 continue;
             }
-            let nb = cx.inl_bmap[gb];
-            var nv = cx.blocks[nb].first;
+            let nb = (*cx.inl_bmap.add(gb as usize));
+            let mut nv = (*cx.blocks.add(nb as usize)).first;
             while nv != 0 {
-                cx.insts[nv].a = mapped(&cx, cx.insts[nv].a);
-                cx.insts[nv].b = mapped(&cx, cx.insts[nv].b);
-                cx.insts[nv].c = mapped(&cx, cx.insts[nv].c);
-                for a in 0..cx.insts[nv].nargs {
-                    let ir_arg_v = ir_arg(&cx, nv, a);
-                    let mapped_v = mapped(&cx, ir_arg_v);
-                    ir_set_arg(&cx, nv, a, mapped_v);
+                (*cx.insts.add(nv as usize)).a = mapped(cx, (*cx.insts.add(nv as usize)).a);
+                (*cx.insts.add(nv as usize)).b = mapped(cx, (*cx.insts.add(nv as usize)).b);
+                (*cx.insts.add(nv as usize)).c = mapped(cx, (*cx.insts.add(nv as usize)).c);
+                for a in 0..(*cx.insts.add(nv as usize)).nargs {
+                    let ir_arg_v = ir_arg(cx, nv, a);
+                    let mapped_v = mapped(cx, ir_arg_v);
+                    ir_set_arg(cx, nv, a, mapped_v);
                 }
-                nv = cx.insts[nv].next;
+                nv = (*cx.insts.add(nv as usize)).next;
             }
-            for p in 0..gt.blocks[gb].preds.count {
-                cx.blocks[nb].preds.push(cx.inl_bmap[gt.blocks[gb].preds.data[p]]);
+            for p in 0..(*gt.blocks.add(gb as usize)).preds.count {
+                (*cx.blocks.add(nb as usize)).preds.push((*cx.inl_bmap.add((*(*gt.blocks.add(gb as usize)).preds.data.add(p as usize)) as usize)));
             }
-            let term = gt.blocks[gb].term;
-            let gcond = gt.blocks[gb].cond;
+            let term = (*gt.blocks.add(gb as usize)).term;
+            let gcond = (*gt.blocks.add(gb as usize)).cond;
             if term == Term::Ret {
                 if copy_result {
-                    let arg_v = cx.insts[call].c;
-                    let mapped_v1 = mapped(&cx, gcond);
-                    let copy = ir_make(&cx, Op::Copy, 0, arg_v, mapped_v1,
+                    let arg_v = (*cx.insts.add(call as usize)).c;
+                    let mapped_v1 = mapped(cx, gcond);
+                    let copy = ir_make(cx, Op::Copy, 0, arg_v, mapped_v1,
                         type_size(ret, pcx), pcx);
-                    ir_append(&cx, nb, copy);
+                    ir_append(cx, nb, copy);
                 }
-                cx.blocks[nb].term = Term::Jump;
-                cx.blocks[nb].s0 = cont;
-                cx.blocks[cont].preds.push(nb);
-                returns.push(mapped(&cx, gcond));
+                (*cx.blocks.add(nb as usize)).term = Term::Jump;
+                (*cx.blocks.add(nb as usize)).s0 = cont;
+                (*cx.blocks.add(cont as usize)).preds.push(nb);
+                returns.push(mapped(cx, gcond));
             } else if term == Term::Switch {
                 let mark = cx.ssa_stack.count;
-                let cases = gt.blocks[gb].cases;
-                for c in 0..gt.blocks[gb].ncases {
-                    cx.ssa_stack.push(gt.swcases.data[cases + 2 * c]);
-                    cx.ssa_stack.push(cx.inl_bmap[gt.swcases.data[cases + 2 * c + 1]]);
+                let cases = (*gt.blocks.add(gb as usize)).cases;
+                for c in 0..(*gt.blocks.add(gb as usize)).ncases {
+                    cx.ssa_stack.push((*gt.swcases.data.add((cases + 2 * c) as usize)));
+                    cx.ssa_stack.push((*cx.inl_bmap.add((*gt.swcases.data.add((cases + 2 * c + 1) as usize)) as usize)));
                 }
-                let mapped_v2 = mapped(&cx, gcond);
-                ir_switch_no_preds(&cx, nb, mapped_v2, cx.inl_bmap[gt.blocks[gb].s0],
+                let mapped_v2 = mapped(cx, gcond);
+                ir_switch_no_preds(cx, nb, mapped_v2, (*cx.inl_bmap.add((*gt.blocks.add(gb as usize)).s0 as usize)),
                     mark);
             } else {
-                let s0 = gt.blocks[gb].s0;
-                let s1 = gt.blocks[gb].s1;
-                cx.blocks[nb].term = term;
-                cx.blocks[nb].cond = mapped(&cx, gcond);
-                cx.blocks[nb].s0 = if s0 != 0 { cx.inl_bmap[s0] } else { 0 };
-                cx.blocks[nb].s1 = if s1 != 0 { cx.inl_bmap[s1] } else { 0 };
+                let s0 = (*gt.blocks.add(gb as usize)).s0;
+                let s1 = (*gt.blocks.add(gb as usize)).s1;
+                (*cx.blocks.add(nb as usize)).term = term;
+                (*cx.blocks.add(nb as usize)).cond = mapped(cx, gcond);
+                (*cx.blocks.add(nb as usize)).s0 = if s0 != 0 { (*cx.inl_bmap.add(s0 as usize)) } else { 0 };
+                (*cx.blocks.add(nb as usize)).s1 = if s1 != 0 { (*cx.inl_bmap.add(s1 as usize)) } else { 0 };
             }
         }
         // Enter the copy.
-        let entry = cx.inl_bmap[gentry];
-        cx.blocks[b].term = Term::Jump;
-        cx.blocks[b].cond = 0;
-        cx.blocks[b].s0 = entry;
-        cx.blocks[b].s1 = 0;
-        cx.blocks[entry].preds.push(b);
+        let entry = (*cx.inl_bmap.add(gentry as usize));
+        (*cx.blocks.add(b as usize)).term = Term::Jump;
+        (*cx.blocks.add(b as usize)).cond = 0;
+        (*cx.blocks.add(b as usize)).s0 = entry;
+        (*cx.blocks.add(b as usize)).s1 = 0;
+        (*cx.blocks.add(entry as usize)).preds.push(b);
         // The result.
-        let ty = cx.insts[call].ty;
+        let ty = (*cx.insts.add(call as usize)).ty;
         if ty != 0 {
-            var result = 0;
+            let mut result: i64 = 0;
             if returns.count == 0 {
-                result = ssa_undef(&cx, ty, pcx);
+                result = ssa_undef(cx, ty, pcx);
             } else if returns.count == 1 {
-                result = returns.data[0];
+                result = (*returns.data.add(0));
             } else {
-                result = ir_make(&cx, Op::Phi, ty, 0, 0, 0, pcx);
-                cx.insts[result].args = cx.args.count;
-                cx.insts[result].nargs = returns.count;
+                result = ir_make(cx, Op::Phi, ty, 0, 0, 0, pcx);
+                (*cx.insts.add(result as usize)).args = cx.args.count;
+                (*cx.insts.add(result as usize)).nargs = returns.count;
                 for r in 0..returns.count {
-                    cx.args.push(returns.data[r]);
+                    cx.args.push((*returns.data.add(r as usize)));
                     cx.argty.push(0);
                 }
-                ir_prepend(&cx, cont, result);
+                ir_prepend(cx, cont, result);
             }
-            ir_replace(&cx, call, result);
+            ir_replace(cx, call, result);
         } else {
-            replace_pieces(&cx, call, cont, returns, pcx);
-            ir_unlink(&cx, call);
+            replace_pieces(cx, call, cont, returns, pcx);
+            ir_unlink(cx, call);
         }
-        free(returns.data as *u8);
+        free(returns.data as *mut u8);
         cont
     }
 }
@@ -887,38 +887,38 @@ fn inline_call(cx: inout FnCtx, fi: i64, call: i64, g: i64, pcx: Ctx<Comp>) -> i
 // The pieces of an aggregate result in registers (PIECE instructions after
 // the call, now in `cont`) become the pieces the inlined returns pack (a
 // phi of them when there are several); the packs go.
-fn replace_pieces(cx: inout FnCtx, call: i64, cont: i64, returns: IntVec, pcx: Ctx<Comp>) {
+fn replace_pieces(cx: &mut FnCtx, call: i64, cont: i64, returns: IntVec, pcx: &Ctx<Comp>) {
     unsafe {
-        var v = cx.blocks[cont].first;
+        let mut v = (*cx.blocks.add(cont as usize)).first;
         while v != 0 {
-            let next = cx.insts[v].next;
-            if cx.insts[v].op == Op::Piece && cx.insts[v].a == call {
-                let k = cx.insts[v].imm;
-                let ty = cx.insts[v].ty;
-                var result = 0;
+            let next = (*cx.insts.add(v as usize)).next;
+            if (*cx.insts.add(v as usize)).op == Op::Piece && (*cx.insts.add(v as usize)).a == call {
+                let k = (*cx.insts.add(v as usize)).imm;
+                let ty = (*cx.insts.add(v as usize)).ty;
+                let mut result: i64 = 0;
                 if returns.count == 0 {
-                    result = ssa_undef(&cx, ty, pcx);
+                    result = ssa_undef(cx, ty, pcx);
                 } else if returns.count == 1 {
-                    result = ir_arg(&cx, returns.data[0], k);
+                    result = ir_arg(cx, (*returns.data.add(0)), k);
                 } else {
-                    result = ir_make(&cx, Op::Phi, ty, 0, 0, 0, pcx);
-                    cx.insts[result].args = cx.args.count;
-                    cx.insts[result].nargs = returns.count;
+                    result = ir_make(cx, Op::Phi, ty, 0, 0, 0, pcx);
+                    (*cx.insts.add(result as usize)).args = cx.args.count;
+                    (*cx.insts.add(result as usize)).nargs = returns.count;
                     for r in 0..returns.count {
-                        let ir_arg_v = ir_arg(&cx, returns.data[r], k);
+                        let ir_arg_v = ir_arg(cx, (*returns.data.add(r as usize)), k);
                         cx.args.push(ir_arg_v);
                         cx.argty.push(0);
                     }
-                    ir_prepend(&cx, cont, result);
+                    ir_prepend(cx, cont, result);
                 }
-                ir_replace(&cx, v, result);
+                ir_replace(cx, v, result);
             }
             v = next;
         }
         for r in 0..returns.count {
-            let pack = returns.data[r];
-            if pack != 0 && cx.insts[pack].op == Op::Pack {
-                ir_unlink(&cx, pack);
+            let pack = (*returns.data.add(r as usize));
+            if pack != 0 && (*cx.insts.add(pack as usize)).op == Op::Pack {
+                ir_unlink(cx, pack);
             }
         }
     }
@@ -932,10 +932,10 @@ fn replace_pieces(cx: inout FnCtx, call: i64, cont: i64, returns: IntVec, pcx: C
 // it leaves once inlined. (0.17) Not one whose reference parameters
 // give facts (gvn.vl, has_ref_facts): inlining would lose them, so its
 // loops are optimized while they hold.
-pub fn inlined_everywhere(fi: i64, pcx: Ctx<Comp>) -> bool {
+pub fn inlined_everywhere(fi: i64, pcx: &Ctx<Comp>) -> bool {
     unsafe {
-        let f = IRFUNCS[fi].f;
-        fn_attr_inline(f, pcx) == 1 && pcx.fn_address[fi] == 0 && !fn_is_global(f, pcx)
+        let f = (*get_irfuncs().add(fi as usize)).f;
+        fn_attr_inline(f, pcx) == 1 && (*pcx.fn_address.add(fi as usize)) == 0 && !fn_is_global(f, pcx)
             && !has_ref_facts(f, pcx)
     }
 }
@@ -947,33 +947,33 @@ pub fn inlined_everywhere(fi: i64, pcx: Ctx<Comp>) -> bool {
 // their checks there, and its loops are better left to them as they are
 // (cleaned by the facts, they would come to the caller unrolled, where it
 // would have vectorized them).
-pub fn never_inlined(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool {
+pub fn never_inlined(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> bool {
     unsafe {
-        let f = IRFUNCS[fi].f;
+        let f = (*get_irfuncs().add(fi as usize)).f;
         let hint = fn_attr_inline(f, pcx);
         if hint == HINT_NEVER || fn_attr_cold(f, pcx) {
             return true;
         }
-        hint != HINT_ALWAYS && !is_closure_fn(fi, pcx) && func_size(&cx, fi) > INLINE_ONCE
+        hint != HINT_ALWAYS && !is_closure_fn(fi, pcx) && func_size(cx, fi) > INLINE_ONCE
     }
 }
 
 // (0.18.1) Room in cx's maps from a callee's blocks and instructions to
 // their copies for `blocks` and `insts` ids, all 0 (inline_call).
-fn inline_maps(cx: inout FnCtx, blocks: i64, insts: i64) {
+fn inline_maps(cx: &mut FnCtx, blocks: i64, insts: i64) {
     unsafe {
         if cx.inl_bmap_cap < blocks {
-            free(cx.inl_bmap as *u8);
+            free(cx.inl_bmap as *mut u8);
             cx.inl_bmap_cap = blocks * 2;
             cx.inl_bmap = alloc_array::<i64>(cx.inl_bmap_cap);
         }
         if cx.inl_imap_cap < insts {
-            free(cx.inl_imap as *u8);
+            free(cx.inl_imap as *mut u8);
             cx.inl_imap_cap = insts * 2;
             cx.inl_imap = alloc_array::<i64>(cx.inl_imap_cap);
         }
-        memset(cx.inl_bmap as *u8, 0, (blocks * 8) as u64);
-        memset(cx.inl_imap as *u8, 0, (insts * 8) as u64);
+        memset(cx.inl_bmap as *mut u8, 0, (blocks * 8) as u64);
+        memset(cx.inl_imap as *mut u8, 0, (insts * 8) as u64);
     }
 }
 
@@ -981,59 +981,59 @@ fn inline_maps(cx: inout FnCtx, blocks: i64, insts: i64) {
 // the program's before the bottom-up phase, and what the component
 // itself added (PROGRAM_SIZE, which every component added to in 0.17,
 // made the decisions depend on the order the components were done in).
-fn program_size(cx: inout FnCtx, pcx: Ctx<Comp>) -> i64 {
+fn program_size(cx: &mut FnCtx, pcx: &Ctx<Comp>) -> i64 {
     pcx.program_size + cx.comp_growth
 }
 
 // (0.18.1) Whether the program, grown by n more, is within the inlining
 // budget as the component being optimized sees it (the code cache keeps
 // the answer, not the size: back::codecache).
-fn budget_allows(cx: inout FnCtx, n: i64, pcx: Ctx<Comp>) -> bool {
-    let within = program_size(&cx, pcx) + n <= pcx.program_budget;
-    cc_note_budget(&cx, cx.comp_growth + n, within);
+fn budget_allows(cx: &mut FnCtx, n: i64, pcx: &Ctx<Comp>) -> bool {
+    let within = program_size(cx, pcx) + n <= pcx.program_budget;
+    cc_note_budget(cx, cx.comp_growth + n, within);
     within
 }
 
-fn program_grows(cx: inout FnCtx, n: i64) {
+fn program_grows(cx: &mut FnCtx, n: i64) {
     cx.comp_growth += n;
 }
 
 // (0.18.1) Between the bottom-up phase's levels (middle::parallel): what
 // a level's components added.
-pub fn add_program_size(n: i64, pcx: inout Ctx<Comp>) {
+pub fn add_program_size(n: i64, pcx: &mut Ctx<Comp>) {
     pcx.program_size += n;
 }
 
 // (0.18.1) The calls of g left as the component being optimized sees them:
 // those before the bottom-up phase, less the ones it inlined itself.
-fn calls_left(cx: inout FnCtx, g: i64, pcx: Ctx<Comp>) -> i64 {
+fn calls_left(cx: &mut FnCtx, g: i64, pcx: &Ctx<Comp>) -> i64 {
     unsafe {
-        var n = pcx.fn_calls[g];
-        var own = 0;
+        let mut n = (*pcx.fn_calls.add(g as usize));
+        let mut own: i64 = 0;
         for i in 0..cx.comp_dec.count {
-            if cx.comp_dec.data[i] == g {
+            if (*cx.comp_dec.data.add(i as usize)) == g {
                 own += 1;
             }
         }
         n -= own;
         // (0.18.1: the code cache keeps whether it is one, not the count)
-        cc_note_calls(&cx, g, own, n == 1, pcx);
+        cc_note_calls(cx, g, own, n == 1, pcx);
         n
     }
 }
 
-fn note_inlined(cx: inout FnCtx, g: i64) {
+fn note_inlined(cx: &mut FnCtx, g: i64) {
     cx.comp_dec.push(g);
 }
 
 // (0.18.1) What the callers of fi read of it, made by fi's task once its
 // component is done (so that no caller's task writes it): its call flags,
 // its deciders, and its operands resolved (inline_call copies them).
-pub fn finish_component_function(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) {
-    ir_enter(&cx, fi, pcx);
-    callee_flags(&cx, fi, pcx);
-    deciders(&cx, fi, pcx);
-    resolve_all(&cx, fi);
+pub fn finish_component_function(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) {
+    ir_enter(cx, fi, pcx);
+    callee_flags(cx, fi, pcx);
+    deciders(cx, fi, pcx);
+    resolve_all(cx, fi);
 }
 
 // ---- (0.17) -O1: small leaf functions ----
@@ -1057,69 +1057,69 @@ const LEAF_HINTED: i64 = 40;
 // emitted: PER_FUNCTION). A small leaf every call of which is inlined (no
 // caller calls setjmp or the like, its address not taken, not global) is
 // not emitted (leaf_dropped). -O2 inlines by its own cost model.
-pub fn simplify_inlining_leaves(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
+pub fn simplify_inlining_leaves(cx: &mut FnCtx, pcx: &mut Ctx<Comp>) {
     unsafe {
-        free(pcx.leaf_small as *u8);
-        free(pcx.leaf_done as *u8);
-        free(pcx.leaf_keep as *u8);
+        free(pcx.leaf_small as *mut u8);
+        free(pcx.leaf_done as *mut u8);
+        free(pcx.leaf_keep as *mut u8);
         pcx.leaf_small = alloc_array::<i64>(pcx.irfunc_count + 1);
         pcx.leaf_done = alloc_array::<i64>(pcx.irfunc_count + 1);
         pcx.leaf_keep = alloc_array::<i64>(pcx.irfunc_count + 1);
         for fi in 0..pcx.irfunc_count {
-            if pcx.fn_live[fi] == 0 || has_calls(&cx, fi, pcx) {
+            if (*pcx.fn_live.add(fi as usize)) == 0 || has_calls(cx, fi, pcx) {
                 continue;
             }
-            ir_enter(&cx, fi, pcx);
-            simplify_function(&cx, fi, pcx);
+            ir_enter(cx, fi, pcx);
+            simplify_function(cx, fi, pcx);
             // (0.18.1: resolved now, as inline_call reads it; it was resolved
             // there, which another thread may be doing too)
-            resolve_all(&cx, fi);
-            pcx.leaf_done[fi] = 1;
-            let f = IRFUNCS[fi].f;
+            resolve_all(cx, fi);
+            (*pcx.leaf_done.add(fi as usize)) = 1;
+            let f = (*get_irfuncs().add(fi as usize)).f;
             let hint = fn_attr_inline(f, pcx);
-            if hint == HINT_NEVER || fn_attr_cold(f, pcx) || pcx.fns[f].variadic {
+            if hint == HINT_NEVER || fn_attr_cold(f, pcx) || pcx.fns[f as usize].variadic {
                 continue;
             }
             let limit = if hint == HINT_ALWAYS { LEAF_HINTED } else { LEAF_SIZE };
-            if func_size(&cx, fi) <= limit {
-                pcx.leaf_small[fi] = 1;
+            if func_size(cx, fi) <= limit {
+                (*pcx.leaf_small.add(fi as usize)) = 1;
             }
         }
         // The small leaves something keeps: an address taken, a call from a
         // function that calls setjmp or the like (which inlines nothing).
         for fi in 0..pcx.irfunc_count {
-            if pcx.fn_live[fi] == 0 {
+            if (*pcx.fn_live.add(fi as usize)) == 0 {
                 continue;
             }
-            ir_enter(&cx, fi, pcx);
-            let rt = pcx.leaf_done[fi] == 0 && calls_returns_twice(&cx, fi, pcx);
-            for i in 0..IRFUNCS[fi].blocks.count {
-                let b = IRFUNCS[fi].blocks.data[i];
-                if cx.blocks[b].removed != 0 {
+            ir_enter(cx, fi, pcx);
+            let rt = (*pcx.leaf_done.add(fi as usize)) == 0 && calls_returns_twice(cx, fi, pcx);
+            for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
+                let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
+                if (*cx.blocks.add(b as usize)).removed != 0 {
                     continue;
                 }
-                var v = cx.blocks[b].first;
+                let mut v = (*cx.blocks.add(b as usize)).first;
                 while v != 0 {
-                    let g = ir_callee(&cx, v, pcx);
+                    let g = ir_callee(cx, v, pcx);
                     if g >= 0 && rt {
-                        pcx.leaf_keep[g] = 1;
+                        (*pcx.leaf_keep.add(g as usize)) = 1;
                     }
-                    if cx.insts[v].op == Op::FAddr && pcx.fn_ir[cx.insts[v].imm] != 0 {
-                        pcx.leaf_keep[pcx.fn_ir[cx.insts[v].imm] - 1] = 1;
+                    if (*cx.insts.add(v as usize)).op == Op::FAddr && (*pcx.fn_ir.add((*cx.insts.add(v as usize)).imm as usize)) != 0 {
+                        (*pcx.leaf_keep.add(((*pcx.fn_ir.add((*cx.insts.add(v as usize)).imm as usize)) - 1) as usize)) = 1;
                     }
-                    v = cx.insts[v].next;
+                    v = (*cx.insts.add(v as usize)).next;
                 }
             }
         }
         if !pcx.per_function {
             for fi in 0..pcx.irfunc_count {
-                if pcx.fn_live[fi] != 0 {
-                    optimize_with_leaves(&cx, fi, pcx);
+                if (*pcx.fn_live.add(fi as usize)) != 0 {
+                    optimize_with_leaves(cx, fi, pcx);
                 }
             }
             for fi in 0..pcx.irfunc_count {
                 if leaf_dropped(fi, pcx) {
-                    pcx.fn_live[fi] = 0;
+                    (*pcx.fn_live.add(fi as usize)) = 0;
                 }
             }
         }
@@ -1129,49 +1129,49 @@ pub fn simplify_inlining_leaves(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
 // Function fi's -O1 pipeline after the leaves (see
 // simplify_inlining_leaves): their calls inlined, then the scalar
 // pipeline; nothing for a leaf (simplified already).
-pub fn optimize_with_leaves(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) {
+pub fn optimize_with_leaves(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) {
     unsafe {
-        if pcx.leaf_done[fi] != 0 {
+        if (*pcx.leaf_done.add(fi as usize)) != 0 {
             return;
         }
-        ir_enter(&cx, fi, pcx);
-        if inline_leaf_calls(&cx, fi, pcx.leaf_small, pcx) {
-            optimize_after_inlining(&cx, fi, pcx);
+        ir_enter(cx, fi, pcx);
+        if inline_leaf_calls(cx, fi, pcx.leaf_small, pcx) {
+            optimize_after_inlining(cx, fi, pcx);
         } else {
-            simplify_function(&cx, fi, pcx);
+            simplify_function(cx, fi, pcx);
         }
     }
 }
 
 // Whether fi is a small leaf no call of which is left (not emitted).
-pub fn leaf_dropped(fi: i64, pcx: Ctx<Comp>) -> bool {
+pub fn leaf_dropped(fi: i64, pcx: &Ctx<Comp>) -> bool {
     unsafe {
-        pcx.leaf_small != 0 as *i64 && pcx.leaf_small[fi] != 0 && pcx.leaf_keep[fi] == 0
-            && !fn_is_global(IRFUNCS[fi].f, pcx)
+        pcx.leaf_small != 0 as *mut i64 && (*pcx.leaf_small.add(fi as usize)) != 0 && (*pcx.leaf_keep.add(fi as usize)) == 0
+            && !fn_is_global((*get_irfuncs().add(fi as usize)).f, pcx)
     }
 }
 
 // Whether fi's IR is still needed after it is emitted: a small leaf, which
 // a later function may inline.
-pub fn leaf_kept(fi: i64, pcx: Ctx<Comp>) -> bool {
-    unsafe { pcx.leaf_small != 0 as *i64 && pcx.leaf_small[fi] != 0 }
+pub fn leaf_kept(fi: i64, pcx: &Ctx<Comp>) -> bool {
+    unsafe { pcx.leaf_small != 0 as *mut i64 && (*pcx.leaf_small.add(fi as usize)) != 0 }
 }
 
 // Whether function fi makes a call (direct or not).
-fn has_calls(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool {
+fn has_calls(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> bool {
     unsafe {
-        ir_enter(&cx, fi, pcx);
-        for i in 0..IRFUNCS[fi].blocks.count {
-            let b = IRFUNCS[fi].blocks.data[i];
-            if cx.blocks[b].removed != 0 {
+        ir_enter(cx, fi, pcx);
+        for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
+            let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
+            if (*cx.blocks.add(b as usize)).removed != 0 {
                 continue;
             }
-            var v = cx.blocks[b].first;
+            let mut v = (*cx.blocks.add(b as usize)).first;
             while v != 0 {
-                if cx.insts[v].op.is_call() {
+                if (*cx.insts.add(v as usize)).op.is_call() {
                     return true;
                 }
-                v = cx.insts[v].next;
+                v = (*cx.insts.add(v as usize)).next;
             }
         }
         false
@@ -1182,35 +1182,157 @@ fn has_calls(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool {
 // their copies make no calls), in one pass over its blocks; whether any
 // was. (None in a function that calls setjmp or the like: it keeps its
 // frame, see regalloc.vl.)
-fn inline_leaf_calls(cx: inout FnCtx, fi: i64, small: *i64, pcx: Ctx<Comp>) -> bool {
+fn inline_leaf_calls(cx: &mut FnCtx, fi: i64, small: *mut i64, pcx: &Ctx<Comp>) -> bool {
     unsafe {
-        var changed = false;
-        var i = 0;
+        let mut changed = false;
+        let mut i: i64 = 0;
         // (a call's continuation block is appended: visited too)
-        while i < IRFUNCS[fi].blocks.count {
-            let b = IRFUNCS[fi].blocks.data[i];
+        while i < (*get_irfuncs().add(fi as usize)).blocks.count {
+            let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
             i += 1;
-            if cx.blocks[b].removed != 0 || cx.blocks[b].loop_depth == 1 {
+            if (*cx.blocks.add(b as usize)).removed != 0 || (*cx.blocks.add(b as usize)).loop_depth == 1 {
                 continue;
             }
-            var v = cx.blocks[b].first;
+            let mut v = (*cx.blocks.add(b as usize)).first;
             while v != 0 {
-                let next = cx.insts[v].next;
-                let g = ir_callee(&cx, v, pcx);
-                if g >= 0 && g != fi && small[g] != 0 && pcx.fn_live[g] != 0 {
-                    if !changed && calls_returns_twice(&cx, fi, pcx) {
+                let next = (*cx.insts.add(v as usize)).next;
+                let g = ir_callee(cx, v, pcx);
+                if g >= 0 && g != fi && (*small.add(g as usize)) != 0 && (*pcx.fn_live.add(g as usize)) != 0 {
+                    if !changed && calls_returns_twice(cx, fi, pcx) {
                         return false;
                     }
-                    inline_call(&cx, fi, v, g, pcx);
+                    inline_call(cx, fi, v, g, pcx);
                     changed = true;
                     break;
                 }
                 v = next;
             }
         }
-        for k in 0..IRFUNCS[fi].blocks.count {
-            cx.blocks[IRFUNCS[fi].blocks.data[k]].loop_depth = 0;
+        for k in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
+            (*cx.blocks.add((*(*get_irfuncs().add(fi as usize)).blocks.data.add(k as usize)) as usize)).loop_depth = 0;
         }
         changed
+    }
+}
+
+// (0.28.0) FN_SIZE's accessors: every use of it is one of them.
+pub fn get_fn_size() -> *mut i64 {
+    // UNSAFE: the per-function size table, a process-wide static mut; Rust
+    // has no safe access to a static mut
+    // SAFETY: allocated and filled by optimize_program on the main thread
+    // before the bottom-up phase; in it a task writes only entries of its
+    // own component's functions (optimize_component_function,
+    // inline_rounds, inline_calls: FN_SIZE[fi]; get_facts on a cache hit:
+    // the component's fi); it reads another function g's entry only in
+    // should_inline/inline_cost/inline_calls after fn_facts_ready(g) held,
+    // i.e. g's component is of a lower level, finished in an earlier
+    // pool_run (ordered by MUTEX) and not written since; codecache's
+    // fact/own_fp/put_facts read own entries or, through
+    // cc_note/reads_hold, only ready ones
+    unsafe { FN_SIZE }
+}
+
+pub fn set_fn_size(v: *mut i64) {
+    // UNSAFE: the per-function size table, a process-wide static mut; Rust
+    // has no safe access to a static mut
+    // SAFETY: allocated and filled by optimize_program on the main thread
+    // before the bottom-up phase; in it a task writes only entries of its
+    // own component's functions (optimize_component_function,
+    // inline_rounds, inline_calls: FN_SIZE[fi]; get_facts on a cache hit:
+    // the component's fi); it reads another function g's entry only in
+    // should_inline/inline_cost/inline_calls after fn_facts_ready(g) held,
+    // i.e. g's component is of a lower level, finished in an earlier
+    // pool_run (ordered by MUTEX) and not written since; codecache's
+    // fact/own_fp/put_facts read own entries or, through
+    // cc_note/reads_hold, only ready ones
+    unsafe {
+        FN_SIZE = v;
+    }
+}
+
+// (0.28.0) FN_RT's accessors: every use of it is one of them.
+pub fn get_fn_rt() -> *mut i64 {
+    // UNSAFE: the per-function returns-twice/calls flags, a process-wide
+    // static mut; Rust has no safe access to a static mut
+    // SAFETY: made by init_fn_caches on the main thread before the
+    // bottom-up phase; a task writes its own functions' entries
+    // (forget_fn_caches(fi) in optimize_component_function,
+    // callee_flags(fi) in finish_component_function, get_facts on a cache
+    // hit); callee_flags writes another g's entry only while FN_RT[g] < 0,
+    // and its other callers (callee_returns_twice, callee_is_leaf) are
+    // reached only from should_inline after fn_facts_ready(g), when g's
+    // lower-level task has already set it >= 0 (finish_component_function,
+    // or the cached value put after it), so they only read
+    unsafe { FN_RT }
+}
+
+pub fn set_fn_rt(v: *mut i64) {
+    // UNSAFE: the per-function returns-twice/calls flags, a process-wide
+    // static mut; Rust has no safe access to a static mut
+    // SAFETY: made by init_fn_caches on the main thread before the
+    // bottom-up phase; a task writes its own functions' entries
+    // (forget_fn_caches(fi) in optimize_component_function,
+    // callee_flags(fi) in finish_component_function, get_facts on a cache
+    // hit); callee_flags writes another g's entry only while FN_RT[g] < 0,
+    // and its other callers (callee_returns_twice, callee_is_leaf) are
+    // reached only from should_inline after fn_facts_ready(g), when g's
+    // lower-level task has already set it >= 0 (finish_component_function,
+    // or the cached value put after it), so they only read
+    unsafe {
+        FN_RT = v;
+    }
+}
+
+// (0.28.0) FN_DECIDERS_START's accessors: every use of it is one of them.
+pub fn get_fn_deciders_start() -> *mut i64 {
+    // UNSAFE: the per-function deciders index, a process-wide static mut;
+    // Rust has no safe access to a static mut
+    // SAFETY: made by init_fn_caches on the main thread; written by a task
+    // for its own functions (forget_fn_caches, deciders(fi) in
+    // finish_component_function, get_facts); deciders writes another g's
+    // entry only while it is < 0, and its other caller inline_cost is
+    // reached only from should_inline after fn_facts_ready(g), when g's
+    // lower-level task has set it, so it only reads
+    unsafe { FN_DECIDERS_START }
+}
+
+pub fn set_fn_deciders_start(v: *mut i64) {
+    // UNSAFE: the per-function deciders index, a process-wide static mut;
+    // Rust has no safe access to a static mut
+    // SAFETY: made by init_fn_caches on the main thread; written by a task
+    // for its own functions (forget_fn_caches, deciders(fi) in
+    // finish_component_function, get_facts); deciders writes another g's
+    // entry only while it is < 0, and its other caller inline_cost is
+    // reached only from should_inline after fn_facts_ready(g), when g's
+    // lower-level task has set it, so it only reads
+    unsafe {
+        FN_DECIDERS_START = v;
+    }
+}
+
+// (0.28.0) FN_DECIDERS's accessors: every use of it is one of them.
+pub fn get_fn_deciders() -> *mut IntVec {
+    // UNSAFE: the per-function deciders lists, a process-wide static mut;
+    // Rust has no safe access to a static mut
+    // SAFETY: as FN_DECIDERS_START: entry g is reset and pushed only by
+    // deciders while FN_DECIDERS_START[g] < 0 (by g's own task in
+    // finish_component_function) or by get_facts for the component's own
+    // functions; a reader of another g (inline_cost, codecache's
+    // deciders_hash) runs after fn_facts_ready(g), i.e. after g's level
+    // finished, and the returned pointer is read only
+    unsafe { FN_DECIDERS }
+}
+
+pub fn set_fn_deciders(v: *mut IntVec) {
+    // UNSAFE: the per-function deciders lists, a process-wide static mut;
+    // Rust has no safe access to a static mut
+    // SAFETY: as FN_DECIDERS_START: entry g is reset and pushed only by
+    // deciders while FN_DECIDERS_START[g] < 0 (by g's own task in
+    // finish_component_function) or by get_facts for the component's own
+    // functions; a reader of another g (inline_cost, codecache's
+    // deciders_hash) runs after fn_facts_ready(g), i.e. after g's level
+    // finished, and the returned pointer is read only
+    unsafe {
+        FN_DECIDERS = v;
     }
 }
