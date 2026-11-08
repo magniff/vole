@@ -7,8 +7,8 @@ the tree, `--changed` (0.25.2) the `.vl` files changed since git's HEAD
 full: docs/style.md.
 
 ```text
-use std::{HashMap, Vec};          // groups: std, crate, the rest; sorted, merged
-use std::cli::Arg;
+use std::{fs, io};                // groups: std, crate, the rest; sorted, merged
+use std::collections::HashMap;
 
 use crate::shapes::Point;
 
