@@ -21,6 +21,8 @@
 //   type);
 // - a `use` line's leaf asks for the capitalized segments before it
 //   (`Some` asks for `Option`) and, under `as`, for the name it renames.
+// - (0.27.6) a unit of a GATED module (std::gpu), its `use` lines
+//   included, only once its name is asked: until then it waits (Z5.2).
 // `use` and `mod` lines, extern blocks and the tail's modules (`__rt`,
 // `__gpa`, `__sys`, which the lowerings name) are always kept, the last
 // two read.
@@ -32,7 +34,9 @@
 // is lazy only (BUILD); VOLE_STD2_EAGER=1 keeps every unit, and so do
 // queries, `--std2-check`, `fix --only buf` and std2 read from its files.
 
-use crate::base::{buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_uint, intern, sym_text};
+use crate::base::{
+    SRC, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_uint, intern, sym_text,
+};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::lexer::Tok;
@@ -469,6 +473,11 @@ struct Units<A: Allocator> {
     wlist: Vec<i64, A>,
     method_name: Vec<i64, A>,
     alias_from: Vec<i64, A>,
+    // RULE: Z5.2 (0.27.6) a unit of a gated module (GATED): the module's
+    // name, else -1; the units waiting for it, listed by gate_head
+    gate: Vec<i64, A>,
+    gate_head: HMap,
+    gate_next: Vec<i64, A>,
 }
 
 fn units_new() -> Units<Comp> {
@@ -485,6 +494,7 @@ fn units_new() -> Units<Comp> {
         words: Vec::new_in(Comp {}), todo: Vec::new_in(Comp {}), nbytes: 0,
         wstart: Vec::new_in(Comp {}), wend: Vec::new_in(Comp {}), wlist: Vec::new_in(Comp {}),
         method_name: Vec::new_in(Comp {}), alias_from: Vec::new_in(Comp {}),
+        gate: Vec::new_in(Comp {}), gate_head: hmap(), gate_next: Vec::new_in(Comp {}),
     }
 }
 
@@ -508,6 +518,8 @@ fn add_unit(u: inout Units<Comp>, kind: i64, start: i64, end: i64, name: i64, tr
     u.next_trait.push(-1);
     u.wstart.push(-1);
     u.wend.push(-1);
+    u.gate.push(-1);
+    u.gate_next.push(-1);
     if kind == K_ITEM && name >= 0 {
         u.next_name[k] = u.by_name.get(name + 1) - 1;
         u.by_name.put(name + 1, k + 1);
@@ -556,6 +568,7 @@ pub fn filter_std2(pcx: inout Ctx<Comp>) {
         read_index(&u, &pcx);
     }
     split_units(&u, pcx);
+    set_gates(&u, &pcx);
     // the program's words, then the seeds; the primitives it names
     var prim_syms = Vec::<i64, Comp>::new_in(Comp {});
     for k in 0..PRIM_NAMES.len() {
@@ -742,14 +755,90 @@ fn ask(u: inout Units<Comp>, s: i64) {
     }
     u.used.put(s + 1, 1);
     u.words.push(s);
+    // RULE: Z5.2 (0.27.6: a gated module's name asked: its waiting units)
+    var k = u.gate_head.get(s + 1) - 1;
+    u.gate_head.put(s + 1, 0);
+    while k >= 0 {
+        let next = u.gate_next[k];
+        u.gate_next[k] = -1;
+        load(&u, k);
+        k = if next == -2 { -1 } else { next };
+    }
 }
 
 fn load(u: inout Units<Comp>, k: i64) {
     if u.loaded[k] {
         return;
     }
+    // RULE: Z5.2 (0.27.6: a gated module's unit waits for its name)
+    let g = u.gate[k];
+    if g >= 0 && u.used.get(g + 1) == 0 {
+        if u.gate_next[k] == -1 {
+            let h = u.gate_head.get(g + 1) - 1;
+            u.gate_next[k] = if h >= 0 { h } else { -2 };
+            u.gate_head.put(g + 1, k + 1);
+        }
+        return;
+    }
     u.loaded[k] = true;
     u.todo.push(k);
+}
+
+// RULE: Z5.2 (0.27.6) The modules of std2 a build reads only when its
+// program, or a unit it reaches, names them: std::gpu (the WGSL front,
+// 7k lines whose common names, `Type`, `Module`, `Entry`, `check`, would
+// otherwise be reached by name from any program).
+const GATED: [[u8]; 1] = ["gpu"];
+
+// The gate of each unit: the name of the top module of std2 it is in,
+// when that module is GATED (its own `mod` lines and braces excepted).
+fn set_gates(u: inout Units<Comp>, pcx: inout Ctx<Comp>) {
+    var stack = Vec::<i64, Comp>::new_in(Comp {});
+    var gated = Vec::<i64, Comp>::new_in(Comp {});
+    for k in 0..GATED.len() {
+        gated.push(intern(GATED[k], &pcx));
+    }
+    let n = u.kind.len() as i64;
+    for k in 0..n {
+        if u.kind[k] != K_CORE {
+            if stack.len() > 0 {
+                let top = stack[0];
+                for g in 0..gated.len() {
+                    if gated[g] == top {
+                        u.gate[k] = top;
+                    }
+                }
+            }
+            continue;
+        }
+        // (a module's `mod NAME {` line pushes it, its `}` pops it)
+        let bs = if k < u.nbytes { u.start[k] } else { pcx.toks[u.start[k]].start };
+        let be = if k < u.nbytes { u.end[k] } else { pcx.toks[u.end[k] - 1].end };
+        var a = bs;
+        var b = be;
+        while a < b && (SRC[a] == ' ' || SRC[a] == '\n' || SRC[a] == '\t') {
+            a += 1;
+        }
+        while b > a && (SRC[b - 1] == ' ' || SRC[b - 1] == '\n' || SRC[b - 1] == '\t') {
+            b -= 1;
+        }
+        if b == a + 1 && SRC[a] == '}' {
+            if stack.len() > 0 {
+                stack.pop();
+            }
+        } else if b > a && SRC[b - 1] == '{' {
+            var m = b - 1;
+            while m > a + 3 && !(SRC[m - 4] == 'm' && SRC[m - 3] == 'o' && SRC[m - 2] == 'd'
+                && SRC[m - 1] == ' ') {
+                m -= 1;
+            }
+            var e = m;
+            while e < b - 1 && SRC[e] != ' ' && SRC[e] != '{' {
+                e += 1;
+            }
+            stack.push(if m > a + 3 { intern(SRC[m..e], &pcx) } else { -1 });
+        }
+    }
 }
 
 // Whether a unit's type is reached, or is no item of std2 (any type).
