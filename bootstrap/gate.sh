@@ -108,7 +108,9 @@
 # translated by `volec fix --edition rust` and checked in the rust
 # edition, its N errors by code; informational, N goes into every
 # release's notes and 0.28 starts at 0: it fails only when the translator
-# or the check cannot run; --release);
+# or the check cannot run; (0.28.0) on the flipped compiler/src it checks
+# a fixed point: the translator leaves it as it is and it checks with no
+# error, else it fails; --release);
 # linux-x86_64 (bootstrap/linux-check.sh); linux-aarch64
 # (bootstrap/aarch64-linux-check.sh: in the container, the fixpoint,
 # the suite at -O0 and -O2 (0.25.2: not -O1; the optimizer is the same
@@ -761,7 +763,9 @@ run_step() {
             sh "$ROOT/tests/translate.sh" -c "$C" -j 4 --twin || true ;;
         gate3)
             # (0.27.4, gate 3) informational: N, the errors the rust-edition
-            # check finds in the translated copy of compiler/src, by code
+            # check finds in the translated copy of compiler/src, by code;
+            # (0.28.0) after the flip, compiler/src a fixed point (a failure
+            # otherwise)
             sh "$ROOT/tests/gate3.sh" -c "$C" -k "$RUN/gate3" ;;
         compile-cost)
             previous=$(find_previous_release)

@@ -9,7 +9,7 @@ ok: built mvs
 % ./mvs
 106 6 true
 $ fix --edition rust --list-left main.vl
-fixed, 6 views to &[T], 3 '&x's to '&mut x', 1 var to 'let mut', 1 integer annotated, 1 static var to 'static mut', 3 text literals to bytes, 7 types, 2 indexes cast to usize	main.vl	+10 -9 lines
+fixed, 6 views to &[T], 3 '&x's to '&mut x', 1 var to 'let mut', 1 integer annotated, 1 static var to 'static mut', 3 text literals to bytes, 7 types, 1 static use through its accessors, 2 indexes cast to usize	main.vl	+15 -9 lines
 % cat main.vl
 // fix --edition rust (0.27.4, gate 3): a raw pointer to views, `*[u8]`
 // (a table of views, an out parameter), is `*mut &[u8]` (`&'static` but
@@ -32,7 +32,12 @@ fn main() {
     // UNSAFE: a test. SAFETY: q is the second element's first byte.
     let b = unsafe { *q };
     // UNSAFE: a test. SAFETY: STRS is only compared.
-    println("{} {} {}", m.len() + m[0] as usize, b, unsafe { STRS == 0 as *mut &'static [u8] });
+    println("{} {} {}", m.len() + m[0] as usize, b, unsafe { get_strs() == 0 as *mut &'static [u8] });
+}
+
+// (0.28.0) STRS's accessors: every use of it is one of them.
+fn get_strs() -> *mut &'static [u8] {
+    unsafe { STRS }
 }
 // EDITION: rust
 $ main.vl -o prog

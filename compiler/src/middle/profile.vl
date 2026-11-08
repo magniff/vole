@@ -24,20 +24,22 @@
 // counts as hints (layout.vl, inline.vl, scev.vl); those that copy
 // blocks keep them (scaled when inlining).
 
-use crate::base::{BUFS, IntVec, buf_byte, buf_int, buf_new, buf_str, buf_uint, intern_c, sym_name};
+use crate::base::{
+    IntVec, buf_byte, buf_int, buf_new, buf_str, buf_uint, get_bufs, intern_c, sym_name,
+};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::report_warning;
 use crate::front::lexer::add_string;
 use crate::front::types::{TY_I64, TY_U64, TY_U8, ptr_to};
 use crate::middle::ctx::FnCtx;
-use crate::middle::ir::{IRFUNCS, Op, ir_append, ir_enter, ir_insert_before, ir_make};
+use crate::middle::ir::{Op, get_irfuncs, ir_append, ir_enter, ir_insert_before, ir_make};
 use crate::middle::ir::cfg::{succ, succ_count};
 
 extern "C" {
-    fn fopen(path: *u8, mode: *u8) -> *u8;
-    fn fread(buf: *u8, size: u64, count: u64, file: *u8) -> u64;
-    fn fclose(file: *u8) -> i32;
+    fn fopen(path: *mut u8, mode: *mut u8) -> *mut u8;
+    fn fread(buf: *mut u8, size: u64, count: u64, file: *mut u8) -> u64;
+    fn fclose(file: *mut u8) -> i32;
 }
 
 // The runtime: started first in main, it writes the profile at exit.
@@ -95,9 +97,9 @@ pub fn profile_runtime_source(out: i64) {
 
 // Whether IR function fi takes part (the runtimes' own functions do not:
 // --check-unsafe's run before the counters are made).
-fn profiled(fi: i64, pcx: Ctx<Comp>) -> bool {
+fn profiled(fi: i64, pcx: &Ctx<Comp>) -> bool {
     unsafe {
-        let m = pcx.fns[IRFUNCS[fi].f].module;
+        let m = pcx.fns[(*get_irfuncs().add(fi as usize)).f as usize].module;
         (m != pcx.profile_module || pcx.profile_module < 0)
             && (m != pcx.check_module || m < 0)
     }
@@ -105,25 +107,28 @@ fn profiled(fi: i64, pcx: Ctx<Comp>) -> bool {
 
 // The checksum of IR function fi's shape: per block (in order), its
 // instructions' operations, its terminator and its successors' positions.
-fn checksum(cx: inout FnCtx, fi: i64) -> u64 {
+fn checksum(cx: &mut FnCtx, fi: i64) -> u64 {
     unsafe {
-        let n = IRFUNCS[fi].blocks.count;
+        let n = (*get_irfuncs().add(fi as usize)).blocks.count;
         for i in 0..n {
-            cx.blocks[IRFUNCS[fi].blocks.data[i]].aux = i;
+            (*cx.blocks.add(
+                (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize)) as usize)).aux = i;
         }
-        var h: u64 = 1469598103934665603;
-        h = (h ^ n as u64).wrapping_mul(1099511628211);
+        let mut h: u64 = 1469598103934665603;
+        h = (h ^ n as u64).wrapping_mul(1099511628211u64);
         for i in 0..n {
-            let b = IRFUNCS[fi].blocks.data[i];
-            var v = cx.blocks[b].first;
+            let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
+            let mut v = (*cx.blocks.add(b as usize)).first;
             while v != 0 {
-                h = (h ^ cx.insts[v].op as u64).wrapping_mul(1099511628211);
-                v = cx.insts[v].next;
+                h = (h ^ (*cx.insts.add(v as usize)).op as u64).wrapping_mul(1099511628211u64);
+                v = (*cx.insts.add(v as usize)).next;
             }
-            h = (h ^ (100 + cx.blocks[b].term as i64) as u64).wrapping_mul(1099511628211);
-            for k in 0..succ_count(&cx, b) {
-                h = (h ^ (1000 + cx.blocks[succ(&cx, b, k)].aux) as u64).wrapping_mul(
-                    1099511628211);
+            h = (h ^ (100 + (*cx.blocks.add(b as usize)).term as i64) as u64).wrapping_mul(
+                1099511628211u64);
+            for k in 0..succ_count(cx, b) {
+                h = (h
+                    ^ (1000 + { let at_ix = succ(cx, b, k) as usize; (*cx.blocks.add(at_ix)) }.aux) as u64).wrapping_mul(
+                        1099511628211u64);
             }
         }
         h
@@ -131,76 +136,79 @@ fn checksum(cx: inout FnCtx, fi: i64) -> u64 {
 }
 
 // The first instruction of block b after its phis and parameters (0: none).
-fn body_start(cx: inout FnCtx, b: i64) -> i64 {
+fn body_start(cx: &mut FnCtx, b: i64) -> i64 {
     unsafe {
-        var v = cx.blocks[b].first;
-        while v != 0 && (cx.insts[v].op == Op::Phi || cx.insts[v].op == Op::Param) {
-            v = cx.insts[v].next;
+        let mut v = (*cx.blocks.add(b as usize)).first;
+        while v != 0
+            && ((*cx.insts.add(v as usize)).op == Op::Phi
+                || (*cx.insts.add(v as usize)).op == Op::Param) {
+            v = (*cx.insts.add(v as usize)).next;
         }
         v
     }
 }
 
-fn make(cx: inout FnCtx, op: Op, ty: i64, a: i64, x: i64, imm: i64, pcx: Ctx<Comp>) -> i64 {
-    ir_make(&cx, op, ty, a, x, imm, pcx)
+fn make(cx: &mut FnCtx, op: Op, ty: i64, a: i64, x: i64, imm: i64, pcx: &Ctx<Comp>) -> i64 {
+    ir_make(cx, op, ty, a, x, imm, pcx)
 }
 
 // Counter `k`'s increment, at the start of block b.
-fn count_block(cx: inout FnCtx, b: i64, k: i64, counters: i64, pcx: Ctx<Comp>) {
+fn count_block(cx: &mut FnCtx, b: i64, k: i64, counters: i64, pcx: &Ctx<Comp>) {
     unsafe {
-        let g = make(&cx, Op::GAddr, TY_U64, 0, 0, counters, pcx);
-        let p = make(&cx, Op::Load, TY_U64, g, 0, 0, pcx);
-        let off = make(&cx, Op::Const, TY_U64, 0, 0, 8 * k, pcx);
-        let a = make(&cx, Op::Add, TY_U64, p, off, 0, pcx);
-        let c = make(&cx, Op::Load, TY_U64, a, 0, 0, pcx);
-        let one = make(&cx, Op::Const, TY_U64, 0, 0, 1, pcx);
-        let c1 = make(&cx, Op::Add, TY_U64, c, one, 0, pcx);
-        let s = make(&cx, Op::Store, 0, a, c1, 0, pcx);
-        cx.insts[s].imm2 = TY_U64;
+        let g = make(cx, Op::GAddr, TY_U64, 0, 0, counters, pcx);
+        let p = make(cx, Op::Load, TY_U64, g, 0, 0, pcx);
+        let off = make(cx, Op::Const, TY_U64, 0, 0, 8 * k, pcx);
+        let a = make(cx, Op::Add, TY_U64, p, off, 0, pcx);
+        let c = make(cx, Op::Load, TY_U64, a, 0, 0, pcx);
+        let one = make(cx, Op::Const, TY_U64, 0, 0, 1, pcx);
+        let c1 = make(cx, Op::Add, TY_U64, c, one, 0, pcx);
+        let s = make(cx, Op::Store, 0, a, c1, 0, pcx);
+        (*cx.insts.add(s as usize)).imm2 = TY_U64;
         let list: [i64; 8] = [g, p, off, a, c, one, c1, s];
-        let at = body_start(&cx, b);
+        let at = body_start(cx, b);
         for i in 0..8 {
             if at == 0 {
-                ir_append(&cx, b, list[i]);
+                ir_append(cx, b, list[i as usize]);
             } else {
-                ir_insert_before(&cx, at, list[i]);
+                ir_insert_before(cx, at, list[i as usize]);
             }
         }
     }
 }
 
-fn function_name(fi: i64, pcx: Ctx<Comp>) -> *u8 {
-    unsafe { sym_name(pcx.fns[IRFUNCS[fi].f].name, pcx) }
+fn function_name(fi: i64, pcx: &Ctx<Comp>) -> *mut u8 {
+    unsafe { sym_name(pcx.fns[(*get_irfuncs().add(fi as usize)).f as usize].name, pcx) }
 }
 
 // A function's name in a profile: its spaces (a generic instance's tuple
 // types have some) written as `~`.
 fn name_char(c: u8) -> u8 {
-    if c == ' ' { '~' } else { c }
+    if c == b' ' { b'~' } else { c }
 }
 
-fn buf_name(out: i64, name: *u8) {
+fn buf_name(out: i64, name: *mut u8) {
     unsafe {
-        var i = 0;
-        while name[i] != 0 {
-            buf_byte(out, name_char(name[i]));
+        let mut i: i64 = 0;
+        while (*name.add(i as usize)) != 0 {
+            buf_byte(out, name_char((*name.add(i as usize))));
             i += 1;
         }
     }
 }
 
 // --profile-generate: the counters, and the runtime's start in main.
-fn instrument(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
+fn instrument(cx: &mut FnCtx, pcx: &mut Ctx<Comp>) {
     unsafe {
-        let counters = intern_c(c"__profile.COUNTERS", &pcx);
-        let start = pcx.sym_fn[intern_c(c"__profile::start", &pcx)] - 1;
-        if pcx.sym_static[counters] == 0 || start < 0 {
+        let counters = intern_c(c"__profile.COUNTERS", pcx);
+        let start = (*pcx.sym_fn.add(intern_c(c"__profile::start", pcx) as usize)) - 1;
+        if (*pcx.sym_static.add(counters as usize)) == 0 || start < 0 {
             return;
         }
         // (Without main, nothing would start the runtime: no counters.)
-        var main = -1;
+        let mut main: i64 = -1;
         for fi in 0..pcx.irfunc_count {
-            if profiled(fi, pcx) && pcx.fns[IRFUNCS[fi].f].name == pcx.main_sym {
+            if profiled(fi, pcx)
+                && pcx.fns[(*get_irfuncs().add(fi as usize)).f as usize].name == pcx.main_sym {
                 main = fi;
             }
         }
@@ -208,39 +216,44 @@ fn instrument(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
             return;
         }
         let meta = buf_new();
-        var total = 0;
+        let mut total: i64 = 0;
         for fi in 0..pcx.irfunc_count {
             if !profiled(fi, pcx) {
                 continue;
             }
-            ir_enter(&cx, fi, pcx);
-            let n = IRFUNCS[fi].blocks.count;
+            ir_enter(cx, fi, pcx);
+            let n = (*get_irfuncs().add(fi as usize)).blocks.count;
             buf_str(meta, c"fn ");
             buf_name(meta, function_name(fi, pcx));
-            buf_byte(meta, ' ');
-            buf_uint(meta, checksum(&cx, fi));
-            buf_byte(meta, ' ');
+            buf_byte(meta, b' ');
+            buf_uint(meta, checksum(cx, fi));
+            buf_byte(meta, b' ');
             buf_int(meta, n);
-            buf_byte(meta, '\n');
+            buf_byte(meta, b'\n');
             for i in 0..n {
-                count_block(&cx, IRFUNCS[fi].blocks.data[i], total + i, counters, pcx);
+                count_block(cx, (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize)),
+                    total + i, counters, pcx);
             }
             total += n;
         }
-        let meta_id = add_string(BUFS[meta].data[0..BUFS[meta].len]);
+        let meta_id = add_string(
+            std::slice::from_raw_parts((*get_bufs().add(meta as usize)).data.add((0) as usize),
+                ((*get_bufs().add(meta as usize)).len - (0)) as usize));
         let path = buf_new();
         buf_str(path, pcx.profile_generate);
-        let path_id = add_string(BUFS[path].data[0..BUFS[path].len]);
+        let path_id = add_string(
+            std::slice::from_raw_parts((*get_bufs().add(path as usize)).data.add((0) as usize),
+                ((*get_bufs().add(path as usize)).len - (0)) as usize));
         // start(total, path, meta), before the entry's counter.
-        ir_enter(&cx, main, pcx);
-        let entry = IRFUNCS[main].entry;
-        let n = make(&cx, Op::Const, TY_I64, 0, 0, total, pcx);
-        let p = make(&cx, Op::SAddr, TY_U64, 0, 0, path_id, pcx);
-        let m = make(&cx, Op::SAddr, TY_U64, 0, 0, meta_id, pcx);
-        let call = make(&cx, Op::Call, 0, 0, 0, start, pcx);
-        cx.insts[call].args = cx.args.count;
-        cx.insts[call].nargs = 3;
-        let str_ty = ptr_to(TY_U8, &pcx);
+        ir_enter(cx, main, pcx);
+        let entry = (*get_irfuncs().add(main as usize)).entry;
+        let n = make(cx, Op::Const, TY_I64, 0, 0, total, pcx);
+        let p = make(cx, Op::SAddr, TY_U64, 0, 0, path_id, pcx);
+        let m = make(cx, Op::SAddr, TY_U64, 0, 0, meta_id, pcx);
+        let call = make(cx, Op::Call, 0, 0, 0, start, pcx);
+        (*cx.insts.add(call as usize)).args = cx.args.count;
+        (*cx.insts.add(call as usize)).nargs = 3;
+        let str_ty = ptr_to(TY_U8, pcx);
         cx.args.push(n);
         cx.argty.push(TY_I64);
         cx.args.push(p);
@@ -248,12 +261,12 @@ fn instrument(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
         cx.args.push(m);
         cx.argty.push(str_ty);
         let list: [i64; 4] = [n, p, m, call];
-        let at = body_start(&cx, entry);
+        let at = body_start(cx, entry);
         for i in 0..4 {
             if at == 0 {
-                ir_append(&cx, entry, list[i]);
+                ir_append(cx, entry, list[i as usize]);
             } else {
-                ir_insert_before(&cx, at, list[i]);
+                ir_insert_before(cx, at, list[i as usize]);
             }
         }
     }
@@ -261,37 +274,37 @@ fn instrument(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
 
 // ---- Reading a profile ----
 
-fn pf_char(pcx: Ctx<Comp>) -> u8 {
-    unsafe { if pcx.pf_at < pcx.pf_len { pcx.pf_text[pcx.pf_at] } else { 0 } }
+fn pf_char(pcx: &Ctx<Comp>) -> u8 {
+    unsafe { if pcx.pf_at < pcx.pf_len { (*pcx.pf_text.add(pcx.pf_at as usize)) } else { 0 } }
 }
 
 // The next word of the line (up to a space or the end of the line).
-fn pf_word(start: inout i64, pcx: inout Ctx<Comp>) -> i64 {
-    while pf_char(pcx) == ' ' {
+fn pf_word(start: &mut i64, pcx: &mut Ctx<Comp>) -> i64 {
+    while pf_char(pcx) == b' ' {
         pcx.pf_at += 1;
     }
-    start = pcx.pf_at;
-    while pcx.pf_at < pcx.pf_len && pf_char(pcx) != ' ' && pf_char(pcx) != '\n' {
+    *start = pcx.pf_at;
+    while pcx.pf_at < pcx.pf_len && pf_char(pcx) != b' ' && pf_char(pcx) != b'\n' {
         pcx.pf_at += 1;
     }
-    pcx.pf_at - start
+    pcx.pf_at - *start
 }
 
-fn pf_number(pcx: inout Ctx<Comp>) -> u64 {
-    var s = 0;
-    let n = pf_word(&s, &pcx);
-    var x: u64 = 0;
+fn pf_number(pcx: &mut Ctx<Comp>) -> u64 {
+    let mut s: i64 = 0;
+    let n = pf_word(&mut s, pcx);
+    let mut x: u64 = 0;
     for i in 0..n {
-        let c = unsafe { pcx.pf_text[s + i] };
-        if c >= '0' && c <= '9' {
-            x = x * 10 + (c - '0') as u64;
+        let c = unsafe { (*pcx.pf_text.add((s + i) as usize)) };
+        if c >= b'0' && c <= b'9' {
+            x = x * 10 + (c - b'0') as u64;
         }
     }
     x
 }
 
-fn pf_next_line(pcx: inout Ctx<Comp>) {
-    while pcx.pf_at < pcx.pf_len && pf_char(pcx) != '\n' {
+fn pf_next_line(pcx: &mut Ctx<Comp>) {
+    while pcx.pf_at < pcx.pf_len && pf_char(pcx) != b'\n' {
         pcx.pf_at += 1;
     }
     pcx.pf_at += 1;
@@ -299,78 +312,80 @@ fn pf_next_line(pcx: inout Ctx<Comp>) {
 
 // Whether the word at [s, s + n) is the C string `name` (as buf_name
 // writes it).
-fn word_is(s: i64, n: i64, name: *u8, pcx: Ctx<Comp>) -> bool {
+fn word_is(s: i64, n: i64, name: *mut u8, pcx: &Ctx<Comp>) -> bool {
     unsafe {
         for i in 0..n {
-            if name[i] == 0 || pcx.pf_text[s + i] != name_char(name[i]) {
+            if (*name.add(i as usize)) == 0
+                || (*pcx.pf_text.add((s + i) as usize)) != name_char((*name.add(i as usize))) {
                 return false;
             }
         }
-        name[n] == 0
+        (*name.add(n as usize)) == 0
     }
 }
 
 // --profile-use: the counts of the functions whose profile matches.
-fn annotate(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
+fn annotate(cx: &mut FnCtx, pcx: &mut Ctx<Comp>) {
     unsafe {
         let file = fopen(pcx.profile_use, c"rb");
-        if file == 0 as *u8 {
-            report_warning(0, 1, c"profile", c"cannot read the profile: no counts used", 0 as *u8,
-                &pcx);
+        if file == 0 as *mut u8 {
+            report_warning(0, 1, c"profile", c"cannot read the profile: no counts used",
+                0 as *mut u8, pcx);
             return;
         }
         let text = buf_new();
         loop {
-            let at = BUFS[text].len;
+            let at = (*get_bufs().add(text as usize)).len;
             crate::base::buf_reserve(text, 65536);
-            let got = fread(&BUFS[text].data[at], 1, 65536, file);
-            BUFS[text].len += got as i64;
+            let got = fread((*get_bufs().add(text as usize)).data.add(at as usize), 1, 65536, file);
+            (*get_bufs().add(text as usize)).len += got as i64;
             if got == 0 {
                 break;
             }
         }
         fclose(file);
-        pcx.pf_text = BUFS[text].data;
-        pcx.pf_len = BUFS[text].len;
+        pcx.pf_text = (*get_bufs().add(text as usize)).data;
+        pcx.pf_len = (*get_bufs().add(text as usize)).len;
         pcx.pf_at = 0;
-        var s = 0;
-        let n = pf_word(&s, &pcx);
-        if !word_is(s, n, c"vole-profile", pcx) || pf_number(&pcx) != 1 {
+        let mut s: i64 = 0;
+        let n = pf_word(&mut s, pcx);
+        if !word_is(s, n, c"vole-profile", pcx) || pf_number(pcx) != 1 {
             report_warning(0, 2, c"profile", c"not a vole profile (version 1): no counts used",
-                0 as *u8, &pcx);
+                0 as *mut u8, pcx);
             return;
         }
-        pf_next_line(&pcx);
+        pf_next_line(pcx);
         // The functions, by name: (name start, length, checksum, blocks, first
         // count's position) per function.
-        var fns = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut fns = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
         while pcx.pf_at < pcx.pf_len {
-            var ws = 0;
-            let wn = pf_word(&ws, &pcx);
+            let mut ws: i64 = 0;
+            let wn = pf_word(&mut ws, pcx);
             if !word_is(ws, wn, c"fn", pcx) {
-                pf_next_line(&pcx);
+                pf_next_line(pcx);
                 continue;
             }
-            var ns = 0;
-            let nn = pf_word(&ns, &pcx);
-            let sum = pf_number(&pcx);
-            let blocks = pf_number(&pcx) as i64;
-            pf_next_line(&pcx);
+            let mut ns: i64 = 0;
+            let nn = pf_word(&mut ns, pcx);
+            let sum = pf_number(pcx);
+            let blocks = pf_number(pcx) as i64;
+            pf_next_line(pcx);
             fns.push(ns);
             fns.push(nn);
             fns.push(sum as i64);
             fns.push(blocks);
             fns.push(pcx.pf_at);
             for _ in 0..blocks {
-                pf_next_line(&pcx);
+                pf_next_line(pcx);
             }
         }
         for fi in 0..pcx.irfunc_count {
-            ir_enter(&cx, fi, pcx);
+            ir_enter(cx, fi, pcx);
             let name = function_name(fi, pcx);
-            var k = 0;
+            let mut k: i64 = 0;
             while k < fns.count {
-                if word_is(fns.data[k], fns.data[k + 1], name, pcx) {
+                if word_is((*fns.data.add(k as usize)), (*fns.data.add((k + 1) as usize)), name,
+                    pcx) {
                     break;
                 }
                 k += 5;
@@ -378,23 +393,27 @@ fn annotate(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
             if k >= fns.count {
                 continue;
             }
-            let n = IRFUNCS[fi].blocks.count;
-            if fns.data[k + 2] as u64 != checksum(&cx, fi) || fns.data[k + 3] != n {
+            let n = (*get_irfuncs().add(fi as usize)).blocks.count;
+            if (*fns.data.add((k + 2) as usize)) as u64 != checksum(cx, fi)
+                || (*fns.data.add((k + 3) as usize)) != n {
                 let message = buf_new();
                 buf_str(message, c"the profile of '");
                 buf_str(message, name);
                 buf_str(message, c"' is stale (the function changed since it was made): ignored");
                 buf_byte(message, 0);
-                report_warning(pcx.nodes[pcx.fns[IRFUNCS[fi].f].node].start, 3, c"profile",
-                    BUFS[message].data, c"make the profile again with --profile-generate", &pcx);
+                report_warning(
+                    pcx.nodes[pcx.fns[(*get_irfuncs().add(fi as usize)).f as usize].node as usize].start, 3, c"profile",
+                    (*get_bufs().add(message as usize)).data,
+                    c"make the profile again with --profile-generate", pcx);
                 continue;
             }
-            pcx.pf_at = fns.data[k + 4];
+            pcx.pf_at = (*fns.data.add((k + 4) as usize));
             for i in 0..n {
-                let count = pf_number(&pcx);
-                pf_next_line(&pcx);
-                let c = if count > 1099511627776 { 1099511627776 } else { count as i64 };
-                cx.blocks[IRFUNCS[fi].blocks.data[i]].count = c;
+                let count = pf_number(pcx);
+                pf_next_line(pcx);
+                let c: i64 = if count > 1099511627776 { 1099511627776 } else { count as i64 };
+                (*cx.blocks.add(
+                    (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize)) as usize)).count = c;
                 if c > pcx.profile_max {
                     pcx.profile_max = c;
                 }
@@ -404,22 +423,22 @@ fn annotate(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
 }
 
 // After lowering: instruments the functions, or reads their counts.
-pub fn profile_after_lowering(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
-    if pcx.profile_generate != 0 as *u8 {
-        instrument(&cx, &pcx);
+pub fn profile_after_lowering(cx: &mut FnCtx, pcx: &mut Ctx<Comp>) {
+    if pcx.profile_generate != 0 as *mut u8 {
+        instrument(cx, pcx);
     }
-    if pcx.profile_use != 0 as *u8 {
-        annotate(&cx, &pcx);
+    if pcx.profile_use != 0 as *mut u8 {
+        annotate(cx, pcx);
     }
 }
 
 // Whether a block that ran `count` times is hot: a 32nd of the most run
 // block, and 64 times at least.
-pub fn is_hot_count(count: i64, pcx: Ctx<Comp>) -> bool {
+pub fn is_hot_count(count: i64, pcx: &Ctx<Comp>) -> bool {
     pcx.profile_max > 0 && count >= 64 && count >= pcx.profile_max / 32
 }
 
 // Whether block b never ran (in a function with a profile).
-pub fn is_cold_block(cx: inout FnCtx, b: i64, pcx: Ctx<Comp>) -> bool {
-    unsafe { pcx.profile_max > 0 && cx.blocks[b].count == 0 }
+pub fn is_cold_block(cx: &mut FnCtx, b: i64, pcx: &Ctx<Comp>) -> bool {
+    unsafe { pcx.profile_max > 0 && (*cx.blocks.add(b as usize)).count == 0 }
 }

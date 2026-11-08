@@ -237,7 +237,7 @@ check self_def_variant "$ok" "$out"
 out=$("$COMPILER" query items gvn 2>&1)
 ok=0
 printf '%s\n' "$out" | head -1 | grep -q "^# crate::middle::gvn${TAB}compiler/src/middle/gvn.vl\$" \
-    && printf '%s\n' "$out" | grep -q "^[0-9]*${TAB}fn${TAB}pub fn run_gvn(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool\$" && ok=1
+    && printf '%s\n' "$out" | grep -q "^[0-9]*${TAB}fn${TAB}pub fn run_gvn(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> bool\$" && ok=1
 check self_items "$ok" "$(printf '%s\n' "$out" | head -5)"
 # More than 5 definitions for show: their paths, and an error.
 out=$("$COMPILER" query show .name 2>&1)
@@ -295,12 +295,16 @@ check std_show_no_program "$ok" "$(printf '%s\n' "$out" | head -5)"
 # every function of std checks with them, and the "add an X" queries
 # answer: `query examples` for every kind (its items still exist),
 # `query similar`.
-out=$("$COMPILER" query def std::trim 2>&1)
+# (0.28.0: compiler/src reads std2, whose items are the built-in text's,
+# `<std>`; compiler/std's files are an MVS program's std, asked here of
+# tests/query/clash.)
+MVS_ROOT="--root $HERE/clash/main.vl"
+out=$("$COMPILER" query def std::trim $MVS_ROOT 2>&1)
 loc=$(printf '%s\n' "$out" | awk -F "$TAB" '$1 == "std::trim" { print $2 }')
 ok=0
 case "$loc" in compiler/std/*.vl:*) ok=1 ;; esac
 check std_def_in_repo "$ok" "$out"
-out=$("$COMPILER" query show "${loc%:*}" 2>&1)
+out=$("$COMPILER" query show "${loc%:*}" $MVS_ROOT 2>&1)
 ok=0
 printf '%s\n' "$out" | head -1 | grep -q '^// std::trim' && ok=1
 check std_show_by_file "$ok" "$(printf '%s\n' "$out" | head -3)"
@@ -322,7 +326,7 @@ n=$("$COMPILER" query examples | wc -l)
 ok=0
 [ -z "$bad" ] && [ "$n" -ge 8 ] && ok=1
 check self_examples "$ok" "$n kinds; failing:$bad"
-out=$("$COMPILER" query similar std::trim crate::middle::fold::combine_not 2>&1)
+out=$("$COMPILER" query similar std::mem::swap crate::middle::fold::combine_not 2>&1)
 ok=0
 [ "$(printf '%s\n' "$out" | grep -c '^// 3 of [0-9]* fns like ')" = 2 ] && ok=1
 check self_similar "$ok" "$(printf '%s\n' "$out" | grep '^// ' | head -8)"

@@ -95,84 +95,84 @@ use crate::back::regalloc::prepare::layout_blocks;
 use crate::base::{alloc_array, free};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
-use crate::base::target::X86;
+use crate::base::target::get_x86;
 use crate::front::types::{TY_F64, is_float, is_vector, type_size};
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{
-    IRFUNCS, Op, Term, ir_append, ir_enter, ir_insert_before, ir_operand, ir_operand_count,
+    Op, Term, get_irfuncs, ir_append, ir_enter, ir_insert_before, ir_operand, ir_operand_count,
     ir_unlink,
 };
 use crate::middle::ir::Op::{Cmp, Const, Copy, Load, LoadX, Param, Store, StoreX, Test};
 use crate::middle::ir::verify::verify_func;
 use crate::middle::opt::{eliminate_dead_code, resolve_all};
 
-pub fn select_instructions(cx: inout FnCtx, pcx: Ctx<Comp>) {
+pub fn select_instructions(cx: &mut FnCtx, pcx: &Ctx<Comp>) {
     unsafe {
         for fi in 0..pcx.irfunc_count {
-            if pcx.fn_live[fi] != 0 {
-                select_function(&cx, fi, pcx);
+            if (*pcx.fn_live.add(fi as usize)) != 0 {
+                select_function(cx, fi, pcx);
             }
         }
     }
 }
 
 // Instruction selection for function fi.
-pub fn select_function(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) {
-    ir_enter(&cx, fi, pcx);
-    if lower_sels(&cx, fi, pcx) {
-        resolve_all(&cx, fi);
-        eliminate_dead_code(&cx, fi, pcx);
+pub fn select_function(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) {
+    ir_enter(cx, fi, pcx);
+    if lower_sels(cx, fi, pcx) {
+        resolve_all(cx, fi);
+        eliminate_dead_code(cx, fi, pcx);
     }
-    let threaded = thread_phi_branches(&cx, fi, pcx);
-    if form_selects(&cx, fi, pcx) || threaded {
-        eliminate_dead_code(&cx, fi, pcx);
+    let threaded = thread_phi_branches(cx, fi, pcx);
+    if form_selects(cx, fi, pcx) || threaded {
+        eliminate_dead_code(cx, fi, pcx);
     }
     // (0.19: std::arch's run-time feature tests)
     if pcx.arch_used {
-        expand_cpu_features(&cx, fi, pcx);
+        expand_cpu_features(cx, fi, pcx);
     }
-    lower_divisions(&cx, fi, pcx);
-    isel_function(&cx, fi, pcx);
-    eliminate_dead_code(&cx, fi, pcx);
-    schedule_function(&cx, fi, pcx);
-    verify_func(&cx, fi, c"instruction selection", pcx);
+    lower_divisions(cx, fi, pcx);
+    isel_function(cx, fi, pcx);
+    eliminate_dead_code(cx, fi, pcx);
+    schedule_function(cx, fi, pcx);
+    verify_func(cx, fi, c"instruction selection", pcx);
 }
 
 // ---- Use counts ----
 
-fn isel_count_uses(cx: inout FnCtx, fi: i64) {
+fn isel_count_uses(cx: &mut FnCtx, fi: i64) {
     unsafe {
         if cx.isel_cap < cx.inst_count + 1 {
-            free(cx.isel_uses as *u8);
+            free(cx.isel_uses as *mut u8);
             cx.isel_cap = 2 * cx.inst_count + 1024;
             cx.isel_uses = alloc_array::<i64>(cx.isel_cap);
         }
-        for b in IRFUNCS[fi].blocks.items() {
-            if cx.blocks[b].removed != 0 {
+        for b in (*get_irfuncs().add(fi as usize)).blocks.items() {
+            if (*cx.blocks.add(b as usize)).removed != 0 {
                 continue;
             }
-            var v = cx.blocks[b].first;
+            let mut v = (*cx.blocks.add(b as usize)).first;
             while v != 0 {
-                cx.isel_uses[v] = 0;
-                v = cx.insts[v].next;
+                (*cx.isel_uses.add(v as usize)) = 0;
+                v = (*cx.insts.add(v as usize)).next;
             }
         }
-        for b in IRFUNCS[fi].blocks.items() {
-            if cx.blocks[b].removed != 0 {
+        for b in (*get_irfuncs().add(fi as usize)).blocks.items() {
+            if (*cx.blocks.add(b as usize)).removed != 0 {
                 continue;
             }
-            var v = cx.blocks[b].first;
+            let mut v = (*cx.blocks.add(b as usize)).first;
             while v != 0 {
-                for k in 0..ir_operand_count(&cx, v) {
-                    let operand = ir_operand(&cx, v, k);
+                for k in 0..ir_operand_count(cx, v) {
+                    let operand = ir_operand(cx, v, k);
                     if operand != 0 {
-                        cx.isel_uses[operand] += 1;
+                        (*cx.isel_uses.add(operand as usize)) += 1;
                     }
                 }
-                v = cx.insts[v].next;
+                v = (*cx.insts.add(v as usize)).next;
             }
-            if cx.blocks[b].cond != 0 {
-                cx.isel_uses[cx.blocks[b].cond] += 1;
+            if (*cx.blocks.add(b as usize)).cond != 0 {
+                (*cx.isel_uses.add((*cx.blocks.add(b as usize)).cond as usize)) += 1;
             }
         }
     }
@@ -180,41 +180,44 @@ fn isel_count_uses(cx: inout FnCtx, fi: i64) {
 
 // One use of `v` less; when it was the last, `v` is dead and so are its
 // own uses.
-fn isel_release(cx: inout FnCtx, v: i64) {
+fn isel_release(cx: &mut FnCtx, v: i64) {
     unsafe {
         if v == 0 {
             return;
         }
-        cx.isel_uses[v] -= 1;
-        if cx.isel_uses[v] == 0 && !cx.insts[v].op.has_side_effect() {
-            for k in 0..ir_operand_count(&cx, v) {
-                let ir_operand_v = ir_operand(&cx, v, k);
-                isel_release(&cx, ir_operand_v);
+        (*cx.isel_uses.add(v as usize)) -= 1;
+        if (*cx.isel_uses.add(v as usize)) == 0
+            && !(*cx.insts.add(v as usize)).op.has_side_effect() {
+            for k in 0..ir_operand_count(cx, v) {
+                let ir_operand_v = ir_operand(cx, v, k);
+                isel_release(cx, ir_operand_v);
             }
         }
     }
 }
 
-fn isel_retain(cx: inout FnCtx, v: i64) {
+fn isel_retain(cx: &mut FnCtx, v: i64) {
     if v != 0 {
-        unsafe { cx.isel_uses[v] += 1; }
+        unsafe { (*cx.isel_uses.add(v as usize)) += 1; }
     }
 }
 
 // Whether `v` (an operand of `user`) can be covered by a rule rooted at
 // `user`: an integer instruction `op` of the same block used by `user`
 // alone.
-fn coverable(cx: inout FnCtx, v: i64, op: Op, user: i64) -> bool {
+fn coverable(cx: &mut FnCtx, v: i64, op: Op, user: i64) -> bool {
     unsafe {
-        v != 0 && cx.insts[v].op == op && cx.insts[v].block == cx.insts[user].block
-            && cx.isel_uses[v] == 1 && !is_float(cx.insts[v].ty)
+        v != 0 && (*cx.insts.add(v as usize)).op == op
+            && (*cx.insts.add(v as usize)).block == (*cx.insts.add(user as usize)).block
+            && (*cx.isel_uses.add(v as usize)) == 1 && !is_float((*cx.insts.add(v as usize)).ty)
     }
 }
 
-fn isel_const(cx: inout FnCtx, v: i64, out: inout i64) -> bool {
+fn isel_const(cx: &mut FnCtx, v: i64, out: &mut i64) -> bool {
     unsafe {
-        if v != 0 && cx.insts[v].op == Const && !is_float(cx.insts[v].ty) {
-            out = cx.insts[v].imm;
+        if v != 0 && (*cx.insts.add(v as usize)).op == Const
+            && !is_float((*cx.insts.add(v as usize)).ty) {
+            *out = (*cx.insts.add(v as usize)).imm;
             return true;
         }
         false
@@ -223,65 +226,68 @@ fn isel_const(cx: inout FnCtx, v: i64, out: inout i64) -> bool {
 
 // Rewrites root `v`'s operands to a, b, c (counting the new uses before
 // releasing the old ones, so that shared leaves stay alive).
-fn isel_set_operands(cx: inout FnCtx, v: i64, a: i64, b: i64, c: i64) {
+fn isel_set_operands(cx: &mut FnCtx, v: i64, a: i64, b: i64, c: i64) {
     unsafe {
-        let old_a = cx.insts[v].a;
-        let old_b = cx.insts[v].b;
-        let old_c = cx.insts[v].c;
-        cx.insts[v].a = a;
-        cx.insts[v].b = b;
-        cx.insts[v].c = c;
-        isel_retain(&cx, a);
-        isel_retain(&cx, b);
-        isel_retain(&cx, c);
-        isel_release(&cx, old_a);
-        isel_release(&cx, old_b);
-        isel_release(&cx, old_c);
+        let old_a = (*cx.insts.add(v as usize)).a;
+        let old_b = (*cx.insts.add(v as usize)).b;
+        let old_c = (*cx.insts.add(v as usize)).c;
+        (*cx.insts.add(v as usize)).a = a;
+        (*cx.insts.add(v as usize)).b = b;
+        (*cx.insts.add(v as usize)).c = c;
+        isel_retain(cx, a);
+        isel_retain(cx, b);
+        isel_retain(cx, c);
+        isel_release(cx, old_a);
+        isel_release(cx, old_b);
+        isel_release(cx, old_c);
     }
 }
 
 // ---- Scheduling ----
 
-fn schedule_function(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) {
+fn schedule_function(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) {
     unsafe {
-        isel_count_uses(&cx, fi);
-        let entry = IRFUNCS[fi].entry;
+        isel_count_uses(cx, fi);
+        let entry = (*get_irfuncs().add(fi as usize)).entry;
         // Loop depths (by layout index), from the allocator's layout.
-        layout_blocks(&cx, fi);
+        layout_blocks(cx, fi);
         // Constants go after the entry's parameters (and before its branch's
         // comparison, which stays last).
-        var at = cx.blocks[entry].first;
-        while at != 0 && cx.insts[at].op == Param {
-            at = cx.insts[at].next;
+        let mut at = (*cx.blocks.add(entry as usize)).first;
+        while at != 0 && (*cx.insts.add(at as usize)).op == Param {
+            at = (*cx.insts.add(at as usize)).next;
         }
-        var hoisted = 0;
-        for b in IRFUNCS[fi].blocks.items() {
-            if cx.blocks[b].removed != 0 || cx.blocks[b].order < 0 {
+        let mut hoisted: i64 = 0;
+        for b in (*get_irfuncs().add(fi as usize)).blocks.items() {
+            if (*cx.blocks.add(b as usize)).removed != 0 || (*cx.blocks.add(b as usize)).order < 0 {
                 continue;
             }
             // The branch's comparison (or test), used by it alone, last.
-            let c = cx.blocks[b].cond;
-            if cx.blocks[b].term == Term::Branch && c != 0 && cx.insts[c].block == b
-                && cx.insts[c].next != 0
-                && (cx.insts[c].op == Cmp || cx.insts[c].op == Test) && cx.isel_uses[c] == 1 {
-                ir_unlink(&cx, c);
-                ir_append(&cx, b, c);
+            let c = (*cx.blocks.add(b as usize)).cond;
+            if (*cx.blocks.add(b as usize)).term == Term::Branch && c != 0
+                && (*cx.insts.add(c as usize)).block == b && (*cx.insts.add(c as usize)).next != 0
+                && ((*cx.insts.add(c as usize)).op == Cmp || (*cx.insts.add(c as usize)).op == Test)
+                && (*cx.isel_uses.add(c as usize)) == 1 {
+                ir_unlink(cx, c);
+                ir_append(cx, b, c);
             }
-            if !X86 {
-                pair_accesses(&cx, b, pcx);
+            if !get_x86() {
+                pair_accesses(cx, b, pcx);
             }
-            if b == entry || cx.ldepth.data[cx.blocks[b].order] == 0 {
+            if b == entry
+                || (*cx.ldepth.data.add((*cx.blocks.add(b as usize)).order as usize)) == 0 {
                 continue;
             }
-            var v = cx.blocks[b].first;
+            let mut v = (*cx.blocks.add(b as usize)).first;
             while v != 0 {
-                let next = cx.insts[v].next;
-                if cx.insts[v].op == Const && cx.isel_uses[v] > 0 && hoisted < 16 {
-                    ir_unlink(&cx, v);
+                let next = (*cx.insts.add(v as usize)).next;
+                if (*cx.insts.add(v as usize)).op == Const && (*cx.isel_uses.add(v as usize)) > 0
+                    && hoisted < 16 {
+                    ir_unlink(cx, v);
                     if at == 0 {
-                        ir_append(&cx, entry, v);
+                        ir_append(cx, entry, v);
                     } else {
-                        ir_insert_before(&cx, at, v);
+                        ir_insert_before(cx, at, v);
                     }
                     hoisted += 1;
                 }
@@ -293,9 +299,10 @@ fn schedule_function(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) {
 
 // (0.15) The size of an access ldp or stp can pair (a 64-bit integer or
 // float, a vector), or 0.
-fn pair_size(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) -> i64 {
+fn pair_size(cx: &mut FnCtx, v: i64, pcx: &Ctx<Comp>) -> i64 {
     unsafe {
-        let ty = if cx.insts[v].op == Load { cx.insts[v].ty } else { cx.insts[v].imm2 };
+        let ty = if (*cx.insts.add(v as usize)).op == Load { (*cx.insts.add(v as usize)).ty }
+            else { (*cx.insts.add(v as usize)).imm2 };
         if is_vector(ty, pcx) {
             16
         } else if type_size(ty, pcx) == 8 && (!is_float(ty) || ty == TY_F64) {
@@ -309,7 +316,7 @@ fn pair_size(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) -> i64 {
 // (0.25.5) Whether loads of types a and b can pair: the same type, or two
 // 64-bit integers whatever their signedness (a Vec's ptr, a u64, and its
 // len, an i64, read side by side for each `v[i]`).
-fn pair_types(a: i64, b: i64, pcx: Ctx<Comp>) -> bool {
+fn pair_types(a: i64, b: i64, pcx: &Ctx<Comp>) -> bool {
     a == b
         || (!is_float(a) && !is_vector(a, pcx) && !is_float(b) && !is_vector(b, pcx)
             && type_size(a, pcx) == 8 && type_size(b, pcx) == 8)
@@ -320,38 +327,44 @@ fn pair_types(a: i64, b: i64, pcx: Ctx<Comp>) -> bool {
 // one ldp (stp): a load moves up to the other, past no store or call; a
 // store moves down to the other, past no memory access or call. Unrolled
 // copies of a loop body load a[k], b[k], then a[k + 1], b[k + 1].
-fn pair_accesses(cx: inout FnCtx, b: i64, pcx: Ctx<Comp>) {
+fn pair_accesses(cx: &mut FnCtx, b: i64, pcx: &Ctx<Comp>) {
     unsafe {
-        var w = cx.blocks[b].first;
+        let mut w = (*cx.blocks.add(b as usize)).first;
         while w != 0 {
-            let next = cx.insts[w].next;
-            let op = cx.insts[w].op;
-            let size = if op == Load || op == Store { pair_size(&cx, w, pcx) } else { 0 };
-            if size != 0 && (op == Store || cx.isel_uses[w] > 0) {
-                var v = cx.insts[w].prev;
-                var steps = 0;
+            let next = (*cx.insts.add(w as usize)).next;
+            let op = (*cx.insts.add(w as usize)).op;
+            let size: i64 = if op == Load || op == Store { pair_size(cx, w, pcx) } else { 0 };
+            if size != 0 && (op == Store || (*cx.isel_uses.add(w as usize)) > 0) {
+                let mut v = (*cx.insts.add(w as usize)).prev;
+                let mut steps: i64 = 0;
                 while v != 0 && steps < 16 {
-                    let vop = cx.insts[v].op;
-                    if vop == op && cx.insts[v].a == cx.insts[w].a && pair_size(&cx, v, pcx) == size
-                        && (cx.insts[v].imm + size == cx.insts[w].imm
-                            || cx.insts[w].imm + size == cx.insts[v].imm)
+                    let vop = (*cx.insts.add(v as usize)).op;
+                    if vop == op && (*cx.insts.add(v as usize)).a == (*cx.insts.add(w as usize)).a
+                        && pair_size(cx, v, pcx) == size
+                        && ((*cx.insts.add(v as usize)).imm + size
+                            == (*cx.insts.add(w as usize)).imm
+                            || (*cx.insts.add(w as usize)).imm + size
+                            == (*cx.insts.add(v as usize)).imm)
                         && (op == Store
-                            || (cx.isel_uses[v] > 0
-                                && pair_types(cx.insts[v].ty, cx.insts[w].ty, pcx)))
-                        && (op == Load || cx.insts[v].imm2 == cx.insts[w].imm2) {
+                            || ((*cx.isel_uses.add(v as usize)) > 0
+                                && pair_types((*cx.insts.add(v as usize)).ty,
+                                    (*cx.insts.add(w as usize)).ty, pcx)))
+                        && (op == Load
+                            || (*cx.insts.add(v as usize)).imm2
+                            == (*cx.insts.add(w as usize)).imm2) {
                         if op == Load {
-                            ir_unlink(&cx, w);
-                            if cx.insts[v].imm < cx.insts[w].imm {
-                                insert_after(&cx, v, w);
+                            ir_unlink(cx, w);
+                            if (*cx.insts.add(v as usize)).imm < (*cx.insts.add(w as usize)).imm {
+                                insert_after(cx, v, w);
                             } else {
-                                ir_insert_before(&cx, v, w);
+                                ir_insert_before(cx, v, w);
                             }
                         } else {
-                            ir_unlink(&cx, v);
-                            if cx.insts[v].imm < cx.insts[w].imm {
-                                ir_insert_before(&cx, w, v);
+                            ir_unlink(cx, v);
+                            if (*cx.insts.add(v as usize)).imm < (*cx.insts.add(w as usize)).imm {
+                                ir_insert_before(cx, w, v);
                             } else {
-                                insert_after(&cx, w, v);
+                                insert_after(cx, w, v);
                             }
                         }
                         break;
@@ -360,10 +373,10 @@ fn pair_accesses(cx: inout FnCtx, b: i64, pcx: Ctx<Comp>) {
                     if vop.is_call() || vop == Store || vop == StoreX || vop == Copy
                         || vop == Op::Phi || (op == Store && (vop == Load || vop == LoadX))
                         || vop == Op::Atomic || vop == Op::Fence
-                        || cx.insts[v].block != b {
+                        || (*cx.insts.add(v as usize)).block != b {
                         break;
                     }
-                    v = cx.insts[v].prev;
+                    v = (*cx.insts.add(v as usize)).prev;
                     steps += 1;
                 }
             }
@@ -373,12 +386,12 @@ fn pair_accesses(cx: inout FnCtx, b: i64, pcx: Ctx<Comp>) {
 }
 
 // Puts unlinked instruction y right after x.
-fn insert_after(cx: inout FnCtx, x: i64, y: i64) {
+fn insert_after(cx: &mut FnCtx, x: i64, y: i64) {
     unsafe {
-        if cx.insts[x].next != 0 {
-            ir_insert_before(&cx, cx.insts[x].next, y);
+        if (*cx.insts.add(x as usize)).next != 0 {
+            ir_insert_before(cx, (*cx.insts.add(x as usize)).next, y);
         } else {
-            ir_append(&cx, cx.insts[x].block, y);
+            ir_append(cx, (*cx.insts.add(x as usize)).block, y);
         }
     }
 }

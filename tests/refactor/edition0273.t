@@ -9,7 +9,7 @@
 ## `fmt` result, an operator's `Output`, std's paths; written, then built
 ## and run in the rust edition with the MVS program's output.
 $ fix --edition rust --list-left main.vl
-fixed, 1 parameter to &T, 2 parameters to &mut T, 3 receivers, 6 views to &[T], 2 '&x's to '&mut x', 2 borrows written '&x', 2 accesses written '*r', 5 vars to 'let mut', 1 inout local, 1 print given its format, 6 integers annotated, 1 static var to 'static mut', 2 imports, 6 types, 4 std calls by rewrite.tsv, 2 text views to &str, 4 static mut uses put in unsafe, 1 index cast to usize, 3 copy types derived Clone, Copy	main.vl	+34 -33 lines
+fixed, 1 parameter to &T, 2 parameters to &mut T, 3 receivers, 6 views to &[T], 2 '&x's to '&mut x', 2 borrows written '&x', 2 accesses written '*r', 5 vars to 'let mut', 1 inout local, 1 print given its format, 6 integers annotated, 1 static var to 'static mut', 2 imports, 6 types, 4 std calls by rewrite.tsv, 2 text views to &str, 3 static uses through their accessors, 1 index cast to usize, 3 copy types derived Clone, Copy	main.vl	+45 -33 lines
 % cat main.vl
 // fix --edition rust (0.27.3): an MVS program of each rewrite kind.
 use std::fmt::Debug; use std::ops::Add; use std::fmt::Display; use std::fmt::Formatter as Fmt; use std::alloc::Allocator; use std::collections::HashMap;
@@ -46,7 +46,7 @@ fn sum(v: &[i64]) -> i64 {
 
 fn bump(n: &mut i64) {
     *n += 1;
-    unsafe { CALLS += 1; }
+    set_calls(get_calls() + (1));
 }
 
 fn total(l: &Ledger<Gpa>) -> i64 { l.total }
@@ -76,12 +76,23 @@ fn main(gpa: Gpa) {
     let b = Money { cents: 275 };
     println("{}", label(total(&l)));
     println("{} {} {} {}", l.count(), k, v[0usize], sum(&v[1..]));
-    println("{} {} {}", a + b, seen.contains_key(&1), unsafe { CALLS });
+    println("{} {} {}", a + b, seen.contains_key(&1), get_calls());
     let arr = [7i64, 8, 9];
     let i: i64 = 1;
-    let calls_now = unsafe { CALLS }; println("{} {calls_now} {}", arr[(i + 1) as usize], none() == 0 as *mut u8);
+    let calls_now = get_calls(); println("{} {calls_now} {}", arr[(i + 1) as usize], none() == 0 as *mut u8);
     let w = first_word("hello");
     println("{} {}", w.text, w.at);
+}
+
+// (0.28.0) CALLS's accessors: every use of it is one of them.
+fn get_calls() -> i64 {
+    unsafe { CALLS }
+}
+
+fn set_calls(v: i64) {
+    unsafe {
+        CALLS = v;
+    }
 }
 // EDITION: rust
 $ main.vl -o prog
