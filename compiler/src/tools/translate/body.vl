@@ -3,7 +3,7 @@
 // and the spellings that differ (`v.len`, `println(x)`, `static var`, an
 // i64 literal's annotation).
 
-use crate::base::{IntVec, SRC, buf_bytes, buf_new, buf_slice};
+use crate::base::{IntVec, SRC, buf_bytes, buf_new, buf_slice, buf_str};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::{CONV_NEW, NodeKind, child};
@@ -13,9 +13,9 @@ use crate::front::types::{REF_MUT, TY_I64, TY_I8, TY_ISIZE, TY_U64, TY_U8, TyKin
 use crate::middle::lower::ssa::HMap;
 use crate::tools::translate::{
     D_REF, TC_BORROW, TC_BYTES, TC_DEREF, TC_INOUT_LOCAL, TC_INT, TC_LEN, TC_MUT_MARKER, TC_PRINT,
-    TC_STATIC, TC_USIZE, TC_UTF8, TC_VAR, TC_VIEW, TL_BYTES, Tr, add_ref, editable, enclosing_fn,
-    ident_char, is_mut_ref, is_ref, is_ws, left, own_node, parent_of, put, put_first, ref_binding,
-    skip_ws, token_at, word_here, written_name,
+    TC_STATIC, TC_USIZE, TC_UTF8, TC_VAR, TC_VIEW, TC_WIDEN, TL_BYTES, Tr, add_ref, editable,
+    enclosing_fn, ident_char, is_mut_ref, is_ref, is_ws, left, own_node, parent_of, put, put_first,
+    ref_binding, skip_ws, token_at, word_here, written_name,
 };
 
 // The symbol of the name node n is written as (its token's), or 0.
@@ -1261,6 +1261,66 @@ pub fn ptr_slice_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
     }
 }
 
+// (0.28.0) Whether node n is an integer literal tree (literals and
+// operators on them): its type the rust edition infers from where it
+// goes, not fixes.
+fn literal_tree(n: i64, pcx: Ctx<Comp>) -> bool {
+    let k = pcx.nodes[n].kind;
+    if k == NodeKind::Int {
+        return true;
+    }
+    if k == NodeKind::Unary {
+        return pcx.nodes[n].op == Tok::Minus && literal_tree(pcx.nodes[n].b, pcx);
+    }
+    if k == NodeKind::Binary {
+        return literal_tree(pcx.nodes[n].b, pcx) && literal_tree(pcx.nodes[n].c, pcx);
+    }
+    false
+}
+
+// (0.28.0) An integer MVS widened implicitly (a Cast the checker made,
+// NODE_IMPLICIT) from a value whose type the rust edition fixes as well
+// (a byte read, a call's u32, a u8 local): `as T` written, as rustc
+// wants (E0308): `h ^= bytes[i] as u64`, `f(x + y)` -> `f((x + y) as
+// i64)`. Not a literal tree (the rust edition infers it), nor an index
+// (cast to usize already).
+pub fn widen_cast_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind != NodeKind::Cast
+            || (pcx.nodes[n].p & crate::front::ast::NODE_IMPLICIT) == 0 {
+            continue;
+        }
+        let v = pcx.nodes[n].a;
+        let from = pcx.nodes[v].ty;
+        let to = pcx.nodes[n].ty;
+        let ints = from >= crate::front::types::TY_I8 && from <= crate::front::types::TY_ISIZE
+            && to >= crate::front::types::TY_I8 && to <= crate::front::types::TY_ISIZE;
+        if !ints || from == to || literal_tree(v, pcx) {
+            continue;
+        }
+        let a = pcx.nodes[v].start;
+        let b = pcx.nodes[v].end;
+        if a >= b || token_at(a, pcx) < 0 || !editable(a, &pcx) {
+            continue;
+        }
+        let q = parent_of(n, tr);
+        if q > 0 && pcx.nodes[q].kind == NodeKind::Index && pcx.nodes[q].b == n {
+            continue;
+        }
+        let k = pcx.nodes[v].kind;
+        let paren = k == NodeKind::Binary || k == NodeKind::Unary;
+        let t = buf_new();
+        if paren {
+            buf_bytes(t, ")");
+        }
+        buf_bytes(t, " as ");
+        buf_str(t, crate::front::types::primitive_name(to));
+        if put(b, b, buf_slice(t), TC_WIDEN, &tr, &pcx) && paren {
+            put_first(a, "(", &tr, &pcx);
+        }
+    }
+}
+
 // Whether node u is the operand of a cast to a raw pointer, `(&x) as *u8`.
 fn raw_cast_parent(u: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
     let c = parent_of(u, tr);
@@ -1422,7 +1482,8 @@ fn edit_prints(tr: inout Tr, pcx: inout Ctx<Comp>) {
 
 // `static var` is `static mut`.
 fn edit_static(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
-    if (pcx.nodes[n].p & CONV_NEW) == 0 {
+    if (pcx.nodes[n].p & CONV_NEW) == 0
+        || crate::tools::translate::statics::accessed_decl(n, tr, pcx) {
         return;
     }
     var q = pcx.nodes[n].start;

@@ -5,8 +5,11 @@
 // call or operator it is the operand of (`unsafe { M += 1; }`, `unsafe {
 // V.push(x) }`); one in a format literal's hole (`"{M}"`) is read into a
 // local before its statement (`let m_now = unsafe { M }; .. "{m_now}"`).
+// (0.28.0) That is now only for a static the accessors below do not take
+// (C's, or one whose type they are not written for): the others are read
+// and written through accessors.
 
-use crate::base::{IntVec, SRC, buf_byte, buf_bytes, buf_new};
+use crate::base::{IntVec, SRC, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::{BLOCK_UNSAFE, NodeKind, child};
@@ -16,8 +19,8 @@ use crate::front::types::TyKind;
 use crate::middle::lower::ssa::HMap;
 use crate::tools::edit::edit_replace;
 use crate::tools::translate::{
-    TC_UNSAFE, Tr, editable, enclosing_fn, ident_char, parent_of, put, put_first, token_at,
-    word_here,
+    TC_ACCESS, TC_STATIC, TC_UNSAFE, Tr, editable, enclosing_fn, ident_char, parent_of, put,
+    put_first, skip_ws, token_at, word_here,
 };
 
 // Whether position pos is in unsafe code: an `unsafe { }` block of the
@@ -219,7 +222,9 @@ pub fn static_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
             continue;
         }
         let y = pcx.nodes[n].y;
-        if y < 0 || y >= pcx.statics.len() as i64 || !pcx.statics[y].mutable {
+        // (0.28.0: not one with accessors, accessor_edits')
+        if y < 0 || y >= pcx.statics.len() as i64 || !pcx.statics[y].mutable
+            || tr.accessed.get(y + 1) != 0 {
             continue;
         }
         let a = pcx.nodes[n].start;
@@ -297,5 +302,827 @@ pub fn static_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
                 put_first(pcx.nodes[t].end, close, &tr, &pcx);
             }
         }
+    }
+}
+
+// ---- (0.28.0) Accessors ----
+//
+// A `static var` of the program's own (not C's) is read and written only
+// through functions next to it, so that whatever makes its accesses sound
+// is argued once, where the `unsafe` is: `get_x()` reads it, `set_x(v)`
+// writes it, and a write into a part of it (`V.count = 0`, `V.push(x)`,
+// `inc(&V)`) is made on a copy, written back after (`{ let mut v_copy =
+// get_v(); v_copy.push(x); set_v(v_copy); }`): no reference to it is ever
+// made. The table (statics.tsv, table.vl's static_rows) says, by the
+// static's path: `atomic`, an Atomic<T> read and written Relaxed (safe
+// code; its safety column the comment above the accessors), or
+// `justified` with the UNSAFE and SAFETY lines of the accessors' `unsafe`
+// blocks; any other static's accessors have none. A static whose type
+// the accessors cannot be written for is left to static_edits.
+
+// How a static is kept (Tr.accessed: static + 1 -> it).
+pub const SA_ATOMIC: i64 = 1;
+pub const SA_ACCESSOR: i64 = 2;
+
+// What a file does with a static (the uses' bits): reads it, writes it,
+// takes its raw address.
+const SU_GET: i64 = 1;
+const SU_SET: i64 = 2;
+const SU_PTR: i64 = 4;
+
+// The path of module m into out (`a::b`; nothing for the root).
+fn put_module_path(out: i64, m: i64, pcx: Ctx<Comp>) {
+    if m <= 0 {
+        return;
+    }
+    let p = pcx.modules[m].parent;
+    if p > 0 {
+        put_module_path(out, p, pcx);
+        buf_bytes(out, "::");
+    }
+    buf_bytes(out, sym_text(pcx.modules[m].name, pcx));
+}
+
+// The module path of file f, `crate::a::b`, into out.
+fn put_file_module(out: i64, f: i64, pcx: Ctx<Comp>) {
+    buf_bytes(out, "crate");
+    let m = pcx.files[f].module;
+    if m > 0 {
+        buf_bytes(out, "::");
+        put_module_path(out, m, pcx);
+    }
+}
+
+// Static y's file.
+fn static_file(y: i64, pcx: Ctx<Comp>) -> i64 {
+    crate::front::modules::file_of_pos(pcx.nodes[pcx.statics[y].node].start, pcx)
+}
+
+// Static y's name, as declared (`COUNT` of `pub static var COUNT: i64`).
+fn static_name(y: i64, pcx: Ctx<Comp>) -> [u8] {
+    let n = pcx.statics[y].node;
+    var q = pcx.nodes[n].start;
+    while q < pcx.nodes[n].end && !word_here(q, "static") {
+        q += 1;
+    }
+    q = skip_ws(q + 6);
+    if word_here(q, "var") || word_here(q, "mut") {
+        q = skip_ws(q + 3);
+    }
+    var e = q;
+    while e < pcx.nodes[n].end && ident_char(SRC[e]) {
+        e += 1;
+    }
+    SRC[q..e]
+}
+
+// Where static y's `pub` starts (its declaration's, or just before it), or -1.
+fn static_pub(y: i64, pcx: Ctx<Comp>) -> i64 {
+    let s = pcx.nodes[pcx.statics[y].node].start;
+    if word_here(s, "pub") {
+        return s;
+    }
+    var p = s;
+    while p > 0 && (SRC[p - 1] == ' ' || SRC[p - 1] == '\t') {
+        p -= 1;
+    }
+    if p >= 3 && word_here(p - 3, "pub") && (p == 3 || !ident_char(SRC[p - 4])) {
+        return p - 3;
+    }
+    -1
+}
+
+// The table's row of static y (its first cell's index in rows), or -1.
+fn static_row(y: i64, rows: IntVec, pcx: Ctx<Comp>) -> i64 {
+    let path = buf_new();
+    put_file_module(path, static_file(y, pcx), pcx);
+    buf_bytes(path, "::");
+    buf_bytes(path, static_name(y, pcx));
+    var r: i64 = 0;
+    while r + 3 < rows.count {
+        if buf_slice(rows.get(r)) == buf_slice(path) {
+            return r;
+        }
+        r += 4;
+    }
+    -1
+}
+
+// The rust edition's spelling of type t, a static's, into out (a view
+// `&'static [T]`, a raw pointer `*mut T`, a struct that holds a view
+// `S<'static>`); false for one it is not written for here (a generic or
+// a closure's struct, an enum, a function, a text view).
+fn put_rust_type(t: i64, out: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
+    if t <= 0 {
+        return false;
+    }
+    let k = pcx.types[t].kind;
+    if k == TyKind::Prim {
+        let name = crate::front::types::primitive_name(t);
+        if name == 0 as *u8 {
+            return false;
+        }
+        buf_str(out, name);
+        return true;
+    }
+    if k == TyKind::Ptr {
+        if pcx.types[t].b != 0 {
+            return false;
+        }
+        buf_bytes(out, "*mut ");
+        return put_rust_type(pcx.types[t].a, out, tr, pcx);
+    }
+    if k == TyKind::Array {
+        buf_bytes(out, "[");
+        if !put_rust_type(pcx.types[t].a, out, tr, pcx) {
+            return false;
+        }
+        buf_bytes(out, "; ");
+        buf_int(out, pcx.types[t].b);
+        buf_bytes(out, "]");
+        return true;
+    }
+    if k == TyKind::Slice {
+        if tr.text_mode {
+            return false;
+        }
+        buf_bytes(out, "&'static [");
+        if !put_rust_type(pcx.types[t].a, out, tr, pcx) {
+            return false;
+        }
+        buf_bytes(out, "]");
+        return true;
+    }
+    if k == TyKind::Struct {
+        let s = pcx.types[t].a;
+        if pcx.structs[s].targ_count > 0 || pcx.structs[s].generic > 0
+            || pcx.structs[s].closure != 0 {
+            return false;
+        }
+        let name = pcx.structs[s].name;
+        buf_bytes(out, sym_text(name, pcx));
+        if tr.view_items.get(name + 1) != 0 {
+            buf_bytes(out, "<'static>");
+        }
+        return true;
+    }
+    false
+}
+
+// Whether a static of type t can be an Atomic<T>: an integer, bool or a
+// raw pointer.
+fn atomic_type(t: i64, pcx: Ctx<Comp>) -> bool {
+    if t <= 0 {
+        return false;
+    }
+    if pcx.types[t].kind == TyKind::Ptr {
+        return pcx.types[t].b == 0;
+    }
+    t == crate::front::types::TY_BOOL
+        || t >= crate::front::types::TY_I8 && t <= crate::front::types::TY_ISIZE
+}
+
+// Whether the storage of a value of type t holds its parts (a struct's
+// fields, an array's elements, a tuple's): a write to a part is a write
+// to it. (A pointer's or a view's parts are elsewhere.)
+fn holds_parts(t: i64, pcx: Ctx<Comp>) -> bool {
+    if t <= 0 {
+        return false;
+    }
+    let k = pcx.types[t].kind;
+    k == TyKind::Struct || k == TyKind::Array || k == TyKind::Tuple
+}
+
+// The top of the place rooted at static use n that is the static's own
+// storage: `V.count`, `V.a[2]` of an array field (not through a pointer
+// or a view: `V.data[i]` is V.data, read).
+fn own_place(n: i64, tr: Tr, pcx: Ctx<Comp>) -> i64 {
+    var p = n;
+    loop {
+        let q = parent_of(p, tr);
+        if q <= 0 || pcx.nodes[q].a != p || !holds_parts(pcx.nodes[p].ty, pcx) {
+            return p;
+        }
+        let k = pcx.nodes[q].kind;
+        if k != NodeKind::FieldAccess && k != NodeKind::TupleField && k != NodeKind::Index {
+            return p;
+        }
+        p = q;
+    }
+}
+
+// How static use n is used: 1 read, 2 the whole written (`V = e`, `V += e`:
+// the Assign), 3 a part written or exclusively borrowed (the place's
+// node, made on a copy), 4 its raw address taken (`&V` given to a `*T`),
+// with the node it concerns into at.
+fn static_use(n: i64, at: inout i64, tr: Tr, pcx: Ctx<Comp>) -> i64 {
+    let p = own_place(n, tr, pcx);
+    let q = parent_of(p, tr);
+    at = q;
+    if q > 0 && pcx.nodes[q].kind == NodeKind::Assign && pcx.nodes[q].b == p {
+        if p == n {
+            return 2;
+        }
+        return 3;
+    }
+    if q > 0 && pcx.nodes[q].kind == NodeKind::Unary && pcx.nodes[q].op == Tok::Amp
+        && pcx.nodes[q].b == p {
+        let t = pcx.nodes[q].ty;
+        if t > 0 && pcx.types[t].kind == TyKind::Ptr && pcx.types[t].b == 0 {
+            if SRC[pcx.nodes[q].start] == '&' && p == n {
+                return 4;
+            }
+            return 1;
+        }
+        if crate::tools::translate::is_mut_ref(t, pcx) {
+            return 3;
+        }
+    }
+    at = n;
+    1
+}
+
+// The call or statement a copy of the static is made around for use n
+// (static_use 3, at its node q): the call that borrows the place, or the
+// assignment's statement; the assignment or the place's borrow itself
+// when there is none.
+fn copy_target(q: i64, tr: Tr, pcx: Ctx<Comp>) -> i64 {
+    var t = q;
+    if pcx.nodes[q].kind == NodeKind::Unary {
+        let c = parent_of(q, tr);
+        if c > 0
+            && (pcx.nodes[c].kind == NodeKind::Call || pcx.nodes[c].kind == NodeKind::MethodCall) {
+            t = c;
+        }
+    }
+    let s = parent_of(t, tr);
+    if s > 0 && pcx.nodes[s].kind == NodeKind::ExprStmt && pcx.nodes[s].a == t
+        && pcx.nodes[s].b == 1 {
+        return s;
+    }
+    t
+}
+
+// The accessor's name of static y into out: `get_x`, `set_x`, `x_ptr`.
+// (`get_x_value` when the module has a function of the name already:
+// Tr.renamed)
+fn put_accessor(out: i64, what: i64, y: i64, tr: Tr, pcx: Ctx<Comp>) {
+    let name = static_name(y, pcx);
+    if what == SU_GET {
+        buf_bytes(out, "get_");
+    } else if what == SU_SET {
+        buf_bytes(out, "set_");
+    }
+    for i in 0..name.len {
+        let c = name[i];
+        buf_byte(out, if c >= 'A' && c <= 'Z' { c + 32 } else { c });
+    }
+    if tr.renamed.get(y + 1) != 0 {
+        buf_bytes(out, "_value");
+    }
+    if what == SU_PTR {
+        buf_bytes(out, "_ptr");
+    }
+}
+
+// Whether module m has a function named name (its last segment).
+fn fn_named(m: i64, name: [u8], pcx: Ctx<Comp>) -> bool {
+    for g in 0..pcx.fns.len() as i64 {
+        if pcx.fns[g].module != m || pcx.fns[g].self_ty != 0 {
+            continue;
+        }
+        let t = sym_text(pcx.fns[g].name, pcx);
+        var i = t.len;
+        while i > 0 && t[i - 1] != '.' && t[i - 1] != ':' {
+            i -= 1;
+        }
+        if t[i..t.len] == name {
+            return true;
+        }
+    }
+    false
+}
+
+// The local a copy of static y is held in, `v_copy`, into out.
+fn put_copy_name(out: i64, y: i64, pcx: Ctx<Comp>) {
+    let name = static_name(y, pcx);
+    for i in 0..name.len {
+        let c = name[i];
+        buf_byte(out, if c >= 'A' && c <= 'Z' { c + 32 } else { c });
+    }
+    buf_bytes(out, "_copy");
+}
+
+// An edit made once (key: position and tag, in seen); whether it was.
+fn edit_once(a: i64, b: i64, text: i64, tag: i64, seen: inout HMap, pcx: inout Ctx<Comp>) -> bool {
+    let key = a * 16 + tag + 1;
+    if seen.get(key) != 0 || !editable(a, &pcx) {
+        return false;
+    }
+    if !edit_replace(a, b, text, &pcx) {
+        return false;
+    }
+    seen.put(key, 1);
+    true
+}
+
+// Comment lines of text into out, `INDENT// LEAD` then words up to about
+// 76 columns, `INDENT// ` before each line after.
+fn put_comment(out: i64, indent: [u8], lead: [u8], text: [u8]) {
+    buf_bytes(out, indent);
+    buf_bytes(out, "// ");
+    buf_bytes(out, lead);
+    var col: usize = indent.len + 3 + lead.len;
+    var i: usize = 0;
+    var first = true;
+    while i < text.len {
+        while i < text.len && text[i] == ' ' {
+            i += 1;
+        }
+        var e = i;
+        while e < text.len && text[e] != ' ' {
+            e += 1;
+        }
+        if e == i {
+            break;
+        }
+        if !first && col + 1 + (e - i) > 76 {
+            buf_bytes(out, "\n");
+            buf_bytes(out, indent);
+            buf_bytes(out, "//");
+            col = indent.len + 2;
+        }
+        if !first || lead.len > 0 {
+            buf_bytes(out, " ");
+            col += 1;
+        }
+        buf_bytes(out, text[i..e]);
+        col += e - i;
+        first = false;
+        i = e;
+    }
+    buf_bytes(out, "\n");
+}
+
+// The UNSAFE and SAFETY lines of row r (none: nothing) into out, at indent.
+fn put_justification(out: i64, r: i64, rows: IntVec, indent: [u8]) {
+    if r < 0 || buf_slice(rows.get(r + 1)) != "justified" {
+        return;
+    }
+    put_comment(out, indent, "UNSAFE:", buf_slice(rows.get(r + 2)));
+    put_comment(out, indent, "SAFETY:", buf_slice(rows.get(r + 3)));
+}
+
+// The accessors of static y (its uses' bits, `uses`) into out, at its
+// file's end.
+fn put_accessors(out: i64, y: i64, mode: i64, uses: i64, r: i64, rows: IntVec, tr: Tr,
+    pcx: Ctx<Comp>) {
+    let n = pcx.statics[y].node;
+    let vis = if static_pub(y, pcx) >= 0 { "pub " } else { "" };
+    let ty = buf_new();
+    put_rust_type(pcx.statics[y].ty, ty, tr, pcx);
+    let name = static_name(y, pcx);
+    buf_bytes(out, "\n// (0.28.0) ");
+    buf_bytes(out, name);
+    buf_bytes(out, "'s accessors: every use of it is one of them.\n");
+    if mode == SA_ATOMIC && r >= 0 && buf_slice(rows.get(r + 3)).len > 0 {
+        put_comment(out, "", "Atomic, Relaxed:", buf_slice(rows.get(r + 3)));
+    }
+    if (uses & SU_GET) != 0 {
+        buf_bytes(out, vis);
+        buf_bytes(out, "fn ");
+        put_accessor(out, SU_GET, y, tr, pcx);
+        buf_bytes(out, "() -> ");
+        buf_bytes(out, buf_slice(ty));
+        buf_bytes(out, " {\n");
+        if mode == SA_ATOMIC {
+            buf_bytes(out, "    ");
+            buf_bytes(out, name);
+            buf_bytes(out, ".load(Ordering::Relaxed)\n}\n");
+        } else {
+            put_justification(out, r, rows, "    ");
+            buf_bytes(out, "    unsafe { ");
+            buf_bytes(out, name);
+            buf_bytes(out, " }\n}\n");
+        }
+    }
+    if (uses & SU_SET) != 0 {
+        if (uses & SU_GET) != 0 {
+            buf_bytes(out, "\n");
+        }
+        buf_bytes(out, vis);
+        buf_bytes(out, "fn ");
+        put_accessor(out, SU_SET, y, tr, pcx);
+        buf_bytes(out, "(v: ");
+        buf_bytes(out, buf_slice(ty));
+        buf_bytes(out, ") {\n");
+        if mode == SA_ATOMIC {
+            buf_bytes(out, "    ");
+            buf_bytes(out, name);
+            buf_bytes(out, ".store(v, Ordering::Relaxed);\n}\n");
+        } else {
+            put_justification(out, r, rows, "    ");
+            buf_bytes(out, "    unsafe {\n        ");
+            buf_bytes(out, name);
+            buf_bytes(out, " = v;\n    }\n}\n");
+        }
+    }
+    if (uses & SU_PTR) != 0 {
+        buf_bytes(out, "\n");
+        buf_bytes(out, vis);
+        buf_bytes(out, "fn ");
+        put_accessor(out, SU_PTR, y, tr, pcx);
+        buf_bytes(out, "() -> *mut ");
+        buf_bytes(out, buf_slice(ty));
+        buf_bytes(out, " {\n    &raw mut ");
+        buf_bytes(out, name);
+        buf_bytes(out, "\n}\n");
+    }
+}
+
+// (0.28.0) Whether the static declared at node n gets accessors (its
+// declaration is accessor_edits').
+pub fn accessed_decl(n: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
+    for y in 0..pcx.statics.len() as i64 {
+        if pcx.statics[y].node == n {
+            return tr.accessed.get(y + 1) != 0;
+        }
+    }
+    false
+}
+
+// Which statics get accessors (Tr.accessed), before any edit: those of
+// the program (not C's), mutable, whose type is written here; an
+// `atomic` row's when it is an integer, bool or raw pointer whose raw
+// address is not taken.
+pub fn plan_statics(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let rb = buf_new();
+    crate::tools::translate::table::static_rows(rb);
+    crate::tools::translate::paths::split_rows(rb, 4, &tr.static_rows);
+    for y in 0..pcx.statics.len() as i64 {
+        let n = pcx.statics[y].node;
+        if !pcx.statics[y].mutable || pcx.statics[y].linkage != 0 || n <= 0
+            || !editable(pcx.nodes[n].start, &pcx) {
+            continue;
+        }
+        let ty = buf_new();
+        if !put_rust_type(pcx.statics[y].ty, ty, tr, pcx) {
+            continue;
+        }
+        let r = static_row(y, tr.static_rows, pcx);
+        let atomic = r >= 0 && buf_slice(tr.static_rows.get(r + 1)) == "atomic"
+            && atomic_type(pcx.statics[y].ty, pcx);
+        tr.accessed.put(y + 1, if atomic { SA_ATOMIC } else { SA_ACCESSOR });
+        let m = pcx.files[static_file(y, pcx)].module;
+        var w = SU_GET;
+        while w <= SU_PTR {
+            let a = buf_new();
+            put_accessor(a, w, y, tr, pcx);
+            if fn_named(m, buf_slice(a), pcx) {
+                tr.renamed.put(y + 1, 1);
+            }
+            w *= 2;
+        }
+    }
+    // (a raw address of an atomic one is not its value's: an accessor's)
+    var at = 0;
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind == NodeKind::Ident && pcx.nodes[n].res == Res::Static {
+            let y = pcx.nodes[n].y;
+            if y >= 0 && tr.accessed.get(y + 1) == SA_ATOMIC
+                && static_use(n, &at, tr, pcx) == 4 {
+                tr.accessed.put(y + 1, SA_ACCESSOR);
+            }
+        }
+    }
+}
+
+// The edits of the statics plan_statics chose: their declarations, every
+// use, the imports of them, and their accessors at their files' ends.
+pub fn accessor_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    var seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    // (file * 2^20 + static -> its uses' bits)
+    var uses = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    var all = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    var read = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    var at = 0;
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind != NodeKind::Ident || pcx.nodes[n].res != Res::Static
+            || !editable(pcx.nodes[n].start, &pcx) {
+            continue;
+        }
+        let y = pcx.nodes[n].y;
+        if y < 0 || tr.accessed.get(y + 1) == 0 {
+            continue;
+        }
+        let a = pcx.nodes[n].start;
+        let b = pcx.nodes[n].end;
+        let file = crate::front::modules::file_of_pos(a, pcx);
+        let key = file * 1048576 + y + 1;
+        if token_at(a, pcx) < 0 {
+            // (a hole of a format literal: a local, read before)
+            let st = statement_at(a, pcx);
+            if st < 0 {
+                continue;
+            }
+            let name = buf_new();
+            local_name(a, b, name);
+            if read.get(st * 4096 + y + 1) == 0 {
+                read.put(st * 4096 + y + 1, 1);
+                let t = buf_new();
+                buf_bytes(t, "let ");
+                buf_bytes(t, buf_slice(name));
+                buf_bytes(t, " = ");
+                put_accessor(t, SU_GET, y, tr, pcx);
+                buf_bytes(t, "(); ");
+                edit_once(st, st, t, 1, &seen, &pcx);
+            }
+            if edit_once(a, b, name, 2, &seen, &pcx) {
+                tr.counts[TC_ACCESS] += 1;
+            }
+            uses.put(key, uses.get(key) | SU_GET);
+            all.put(y + 1, all.get(y + 1) | SU_GET);
+            continue;
+        }
+        let how = static_use(n, &at, tr, pcx);
+        var bits = SU_GET;
+        // (a path's qualifier, `crate::base::` of `crate::base::SRC`, is kept)
+        var last = b;
+        while last > a && ident_char(SRC[last - 1]) {
+            last -= 1;
+        }
+        let head = SRC[a..last];
+        if how == 1 {
+            let t = buf_new();
+            buf_bytes(t, head);
+            put_accessor(t, SU_GET, y, tr, pcx);
+            buf_bytes(t, "()");
+            if edit_once(a, b, t, 2, &seen, &pcx) {
+                tr.counts[TC_ACCESS] += 1;
+            }
+        } else if how == 2 {
+            // (`V = e` -> `set_v(e)`, `V += e` -> `set_v(get_v() + (e))`)
+            let q = at;
+            let c = pcx.nodes[q].c;
+            let t = buf_new();
+            buf_bytes(t, head);
+            put_accessor(t, SU_SET, y, tr, pcx);
+            buf_bytes(t, "(");
+            var close = ")";
+            if pcx.nodes[q].op != Tok::Eq {
+                var o = skip_ws(b);
+                var oe = o;
+                while oe < pcx.nodes[c].start && SRC[oe] != '=' {
+                    oe += 1;
+                }
+                buf_bytes(t, head);
+                put_accessor(t, SU_GET, y, tr, pcx);
+                buf_bytes(t, "() ");
+                buf_bytes(t, SRC[o..oe]);
+                buf_bytes(t, " (");
+                close = "))";
+                bits = SU_GET | SU_SET;
+            } else {
+                bits = SU_SET;
+            }
+            if edit_once(pcx.nodes[q].start, pcx.nodes[c].start, t, 2, &seen, &pcx) {
+                tr.counts[TC_ACCESS] += 1;
+                let ct = buf_new();
+                buf_bytes(ct, close);
+                edit_once(pcx.nodes[c].end, pcx.nodes[c].end, ct, 8, &seen, &pcx);
+            }
+        } else if how == 3 {
+            // (a part written, or the place borrowed exclusively: on a copy)
+            bits = SU_GET | SU_SET;
+            let t = copy_target(at, tr, pcx);
+            let copy = buf_new();
+            put_copy_name(copy, y, pcx);
+            let open = buf_new();
+            let close = buf_new();
+            let stmt = pcx.nodes[t].kind == NodeKind::ExprStmt;
+            let paren = !stmt && operand_at_statement_start(t, tr, pcx);
+            buf_bytes(open, if paren { "({ let mut " } else { "{ let mut " });
+            buf_bytes(open, buf_slice(copy));
+            buf_bytes(open, " = ");
+            buf_bytes(open, head);
+            put_accessor(open, SU_GET, y, tr, pcx);
+            buf_bytes(open, "(); ");
+            if !stmt {
+                buf_bytes(open, "let r_copy = ");
+                buf_bytes(close, "; ");
+            } else {
+                buf_bytes(close, " ");
+            }
+            buf_bytes(close, head);
+            put_accessor(close, SU_SET, y, tr, pcx);
+            buf_bytes(close, "(");
+            buf_bytes(close, buf_slice(copy));
+            buf_bytes(close, ");");
+            buf_bytes(close, if stmt { " }" } else if paren { " r_copy })" } else { " r_copy }" });
+            if edit_once(pcx.nodes[t].start, pcx.nodes[t].start, open, 3, &seen, &pcx) {
+                put_first(pcx.nodes[t].end, buf_slice(close), &tr, &pcx);
+            }
+            if edit_once(a, b, copy, 2, &seen, &pcx) {
+                tr.counts[TC_ACCESS] += 1;
+            }
+        } else {
+            // (`&V` given to a `*T`: the static's raw address, `v_ptr()`)
+            bits = SU_PTR;
+            let t = buf_new();
+            buf_bytes(t, head);
+            put_accessor(t, SU_PTR, y, tr, pcx);
+            buf_bytes(t, "()");
+            if edit_once(pcx.nodes[at].start, b, t, 2, &seen, &pcx) {
+                tr.counts[TC_ACCESS] += 1;
+            }
+        }
+        uses.put(key, uses.get(key) | bits);
+        all.put(y + 1, all.get(y + 1) | bits);
+    }
+    accessor_imports(uses, &seen, tr, &pcx);
+    // (the declarations, and the accessors at each file's end)
+    var atomic_files = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    var ends = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    for y in 0..pcx.statics.len() as i64 {
+        let mode = tr.accessed.get(y + 1);
+        if mode == 0 {
+            continue;
+        }
+        let n = pcx.statics[y].node;
+        let s = pcx.nodes[n].start;
+        // (`pub static var X` -> `static mut X`, `static X: Atomic<T>`:
+        // private, its accessors are what is used)
+        let p = static_pub(y, pcx);
+        if p >= 0 {
+            put(p, skip_ws(p + 3), "", -1, &tr, &pcx);
+        }
+        var q = s;
+        while q < pcx.nodes[n].end && !word_here(q, "static") {
+            q += 1;
+        }
+        let v = skip_ws(q + 6);
+        if word_here(v, "var") {
+            if mode == SA_ATOMIC {
+                put(v, skip_ws(v + 3), "", TC_STATIC, &tr, &pcx);
+            } else {
+                put(v, v + 3, "mut", TC_STATIC, &tr, &pcx);
+            }
+        }
+        let file = static_file(y, pcx);
+        if mode == SA_ATOMIC {
+            let tn = pcx.nodes[n].b;
+            let init = pcx.nodes[n].c;
+            put_first(pcx.nodes[tn].start, "Atomic<", &tr, &pcx);
+            let gt = buf_new();
+            buf_bytes(gt, ">");
+            edit_once(pcx.nodes[tn].end, pcx.nodes[tn].end, gt, 6, &seen, &pcx);
+            put_first(pcx.nodes[init].start, "Atomic::new(", &tr, &pcx);
+            let paren = buf_new();
+            buf_bytes(paren, ")");
+            edit_once(pcx.nodes[init].end, pcx.nodes[init].end, paren, 7, &seen, &pcx);
+            atomic_files.put(file + 1, 1);
+        }
+        var text = ends.get(file + 1);
+        if text == 0 {
+            text = buf_new();
+            ends.put(file + 1, text);
+        }
+        let r = static_row(y, tr.static_rows, pcx);
+        put_accessors(text, y, mode, all.get(y + 1), r, tr.static_rows, tr, pcx);
+    }
+    for f in 0..pcx.files.len() as i64 {
+        let text = ends.get(f + 1);
+        if text == 0 {
+            continue;
+        }
+        let end = pcx.files[f].end;
+        let out = buf_new();
+        if end > pcx.files[f].start && SRC[end - 1] != '\n' {
+            buf_bytes(out, "\n");
+        }
+        if atomic_files.get(f + 1) != 0 {
+            buf_bytes(out, "\nuse std::sync::atomic::{Atomic, Ordering};\n");
+        }
+        buf_bytes(out, buf_slice(text));
+        edit_once(end, end, out, 4, &seen, &pcx);
+    }
+}
+
+// The `use` items that name a static with accessors: the accessors the
+// file uses instead (`use crate::base::{SRC, ..}` -> `use crate::base::{
+// get_src, ..}`; two in braces where one name was alone).
+fn accessor_imports(uses: HMap, seen: inout HMap, tr: Tr, pcx: inout Ctx<Comp>) {
+    let nt = pcx.toks.len() as i64;
+    var k: i64 = 0;
+    while k < nt {
+        if pcx.toks[k].kind != Tok::Use || !editable(pcx.toks[k].start, &pcx) {
+            k += 1;
+            continue;
+        }
+        let first = k + 1;
+        var semi = first;
+        while semi < nt && pcx.toks[semi].kind != Tok::Semi {
+            semi += 1;
+        }
+        let file = crate::front::modules::file_of_pos(pcx.toks[k].start, pcx);
+        let here = buf_new();
+        put_file_module(here, file, pcx);
+        var j = first;
+        while j < semi {
+            let tj = pcx.toks[j].kind;
+            let before = if j > first { pcx.toks[j - 1].kind } else { Tok::Use };
+            let after = if j + 1 < nt { pcx.toks[j + 1].kind } else { Tok::Semi };
+            if tj == Tok::Ident && (before == Tok::ColonColon || before == Tok::LBrace
+                || before == Tok::Comma)
+                && (after == Tok::Comma || after == Tok::RBrace || after == Tok::Semi) {
+                import_static(first, j, semi, file, buf_slice(here), uses, &seen, tr, &pcx);
+            }
+            j += 1;
+        }
+        k = semi + 1;
+    }
+}
+
+// The use item's name at token j (the item's path from token first), if
+// it is a static with accessors: replaced by the accessors file uses.
+fn import_static(first: i64, j: i64, semi: i64, file: i64, here: [u8], uses: HMap,
+    seen: inout HMap, tr: Tr, pcx: inout Ctx<Comp>) {
+    let name = SRC[pcx.toks[j].start..pcx.toks[j].end];
+    // (the path's prefix: up to the brace around j, else to j)
+    var open = -1;
+    var depth = 0;
+    var i = j - 1;
+    while i >= first && open < 0 {
+        if pcx.toks[i].kind == Tok::RBrace {
+            depth += 1;
+        } else if pcx.toks[i].kind == Tok::LBrace {
+            if depth == 0 {
+                open = i;
+            } else {
+                depth -= 1;
+            }
+        }
+        i -= 1;
+    }
+    let pend = if open >= 0 { pcx.toks[open].start } else { pcx.toks[j].start };
+    var prefix = SRC[pcx.toks[first].start..pend];
+    if prefix.len >= 2 && prefix[prefix.len - 2..prefix.len] == "::" {
+        prefix = prefix[0..prefix.len - 2];
+    }
+    let module = buf_new();
+    if prefix.len >= 5 && prefix[0..5] == "crate" {
+        buf_bytes(module, prefix);
+    } else if prefix.len >= 4 && prefix[0..4] == "self" {
+        buf_bytes(module, here);
+        buf_bytes(module, prefix[4..prefix.len]);
+    } else if prefix.len >= 5 && prefix[0..5] == "super" {
+        var cut = here.len;
+        while cut > 0 && here[cut - 1] != ':' {
+            cut -= 1;
+        }
+        buf_bytes(module, here[0..if cut >= 2 { cut - 2 } else { 0 }]);
+        buf_bytes(module, prefix[5..prefix.len]);
+    } else {
+        buf_bytes(module, here);
+        buf_bytes(module, "::");
+        buf_bytes(module, prefix);
+    }
+    for y in 0..pcx.statics.len() as i64 {
+        if tr.accessed.get(y + 1) == 0 || static_name(y, pcx) != name {
+            continue;
+        }
+        let m = buf_new();
+        put_file_module(m, static_file(y, pcx), pcx);
+        if buf_slice(m) != buf_slice(module) {
+            continue;
+        }
+        let bits = uses.get(file * 1048576 + y + 1);
+        let t = buf_new();
+        var count = 0;
+        var w = SU_GET;
+        while w <= SU_PTR {
+            if (bits & w) != 0 {
+                if count > 0 {
+                    buf_bytes(t, ", ");
+                }
+                put_accessor(t, w, y, tr, pcx);
+                count += 1;
+            }
+            w *= 2;
+        }
+        if count == 0 {
+            put_accessor(t, SU_GET, y, tr, pcx);
+        }
+        let text = buf_new();
+        let braced = count > 1 && open < 0;
+        if braced {
+            buf_bytes(text, "{");
+        }
+        buf_bytes(text, buf_slice(t));
+        if braced {
+            buf_bytes(text, "}");
+        }
+        edit_once(pcx.toks[j].start, pcx.toks[j].end, text, 5, &seen, &pcx);
+        return;
     }
 }
