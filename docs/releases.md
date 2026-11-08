@@ -90,7 +90,7 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.27.7
 
-The translator (g3274; flip28's T3 and T4, its rehearsal's hand fixes):
+The translator (g3274; flip28's T2 to T5, its rehearsal's hand fixes):
 
 - An index that calls with the indexed container's root `&mut`,
   `pcx.types[place_ty(l, p, pbody, pcx)].kind`, is computed first,
@@ -102,6 +102,21 @@ The translator (g3274; flip28's T3 and T4, its rehearsal's hand fixes):
   stays; T4). A hoisted block that would lead a statement is
   parenthesized, `({ .. }) > 0 && ..` (tests/refactor/edition0276e,
   tests/run/rust_t_hoist_read).
+- An inherent impl of a struct with views names its region, `impl<'a>
+  Line<'a>`; a method's result with views and no reference to borrow
+  from (a receiver by value, or none) is `'a`, and so are the views it
+  takes and may store: `fn word(self, k) -> &'a str`, `fn new(opts:
+  Vec<Opt<'a>, A>, word: &'a str) -> Leaf<'a, A>` (T5;
+  tests/refactor/edition0276f, tests/run/rust_t_impl_region).
+- A pointer to views a function takes as an out parameter and sets to a
+  part of a view parameter (or to a local each of whose values is one),
+  `*message = text`, is tied to it: `fn error_offset<'a>(line: &'a [u8],
+  .., message: *mut &'a [u8])` (T2; tests/refactor/edition0276g,
+  tests/run/rust_t_out_view).
+- A `var`'s address given where a raw pointer goes, MVS's `&m` to a
+  `*[u8]` parameter, is `&mut m`, which Rust coerces to `*mut T`: rustc
+  coerces a `&T` only to a `*const T` (E0308), as the rust edition will
+  (front274). A `let`'s, a parameter's or a static's keeps its `&`.
 
 The sources (g3274, docs/design/src-buffer.md):
 
