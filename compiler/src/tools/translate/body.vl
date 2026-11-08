@@ -138,8 +138,12 @@ fn edit_for(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
 
 // `for x in v` over a view or a reference (`xs: [i64]`, a let `v: Vec`),
 // whose items Rust gives as `&T`: a copy item is `for &x in v`, as MVS
-// copies it. (The checker lowers the loop: its pattern and its iterable,
-// a name, are found by their places.)
+// copies it; (0.27.5) the same over a call that gives a view, `for v in
+// m.values("cache")` (`&[&str]`: `&&str` items without the `&`), a Vec's
+// view of its items among them (`for t in omegas.as_slice()`). (The
+// checker lowers the loop: its pattern and its iterable, a name or a
+// call, which a method call's lowering may make a block, are found by
+// their places.)
 fn edit_for_copy(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     let s = pcx.nodes[n].start;
     if !word_here(s, "for") || token_at(s, pcx) < 0 {
@@ -162,8 +166,32 @@ fn edit_for_copy(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     while ident_char(SRC[ve]) {
         ve += 1;
     }
-    if ve == vs || SRC[skip_ws(ve)] != '{' {
+    if ve == vs {
         return;
+    }
+    // (a name, or a call: the text up to the body's `{` outside brackets)
+    var call = false;
+    if SRC[skip_ws(ve)] != '{' {
+        var depth: i64 = 0;
+        var q = ve;
+        while q < SRC.len as i64 && !(depth == 0 && SRC[q] == '{') {
+            if SRC[q] == '(' || SRC[q] == '[' {
+                depth += 1;
+            } else if SRC[q] == ')' || SRC[q] == ']' {
+                depth -= 1;
+            } else if depth == 0 && (SRC[q] == ';' || SRC[q] == '}') {
+                return;
+            }
+            q += 1;
+        }
+        while q > ve && (SRC[q - 1] == ' ' || SRC[q - 1] == '\n') {
+            q -= 1;
+        }
+        if q <= ve || SRC[q - 1] != ')' {
+            return;
+        }
+        ve = q;
+        call = true;
     }
     var pat = 0;
     var it = 0;
@@ -173,7 +201,11 @@ fn edit_for_copy(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
             && pcx.nodes[m].end == pe {
             pat = m;
         }
-        if it == 0 && k == NodeKind::Ident && pcx.nodes[m].start == vs && pcx.nodes[m].end == ve {
+        if it == 0
+            && (!call && k == NodeKind::Ident
+                || call
+                && (k == NodeKind::Call || k == NodeKind::MethodCall || k == NodeKind::Block))
+            && pcx.nodes[m].start == vs && pcx.nodes[m].end == ve {
             it = m;
         }
         if pat > 0 && it > 0 || pcx.nodes[m].start > pcx.nodes[n].end && m > n + 64 {
@@ -188,7 +220,9 @@ fn edit_for_copy(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     if et <= 0 || !crate::front::conv::copyable(et, &pcx) || is_ref(et, pcx) || t <= 0 {
         return;
     }
-    if pcx.types[t].kind == TyKind::Slice || is_ref(t, pcx) || names_ref(it, tr, pcx) {
+    if call && pcx.types[t].kind == TyKind::Slice
+        || !call
+        && (pcx.types[t].kind == TyKind::Slice || is_ref(t, pcx) || names_ref(it, tr, pcx)) {
         put(ps, ps, "&", TC_BORROW, &tr, &pcx);
     }
 }
@@ -502,6 +536,114 @@ fn ptr_slice_node(n: i64, pcx: Ctx<Comp>) -> bool {
     }
     let t = pcx.nodes[a].ty;
     t > 0 && pcx.types[t].kind == TyKind::Ptr && pcx.types[t].b == 0
+}
+
+// (0.27.5) Whether SRC[a..b) names w as a whole word.
+fn mentions_word(a: i64, b: i64, w: [u8]) -> bool {
+    var i = a;
+    while i + (w.len as i64) <= b {
+        if SRC[i..i + w.len as i64] == w && (i == a || !ident_char(SRC[i - 1]))
+            && (i + w.len as i64 == b || !ident_char(SRC[i + w.len as i64])) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+// (0.27.5) An assignment to an element of a container whose index reads
+// the container's root, `pcx.files[pcx.files.len() - 1].module = m` or
+// `pcx.nodes[child(own, i, pcx)].a = ..`: Rust's IndexMut borrows the
+// container mutably before the index is read (rustc E0502), so the index
+// is computed first, `{ let at_ix = I; pcx.files[at_ix].module = m }`.
+// Run after every other pass: the index moves with its edits.
+pub fn hoist_index_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind != NodeKind::Assign || pcx.nodes[n].end <= pcx.nodes[n].start
+            || !own_node(n, tr, &pcx) || !editable(pcx.nodes[n].start, &pcx) {
+            continue;
+        }
+        var t = pcx.nodes[n].b;
+        while t > 0 && pcx.nodes[t].kind == NodeKind::FieldAccess {
+            t = pcx.nodes[t].a;
+        }
+        if t <= 0 || pcx.nodes[t].kind != NodeKind::Index {
+            continue;
+        }
+        var base = pcx.nodes[t].a;
+        let ix = pcx.nodes[t].b;
+        // (the checker's view of a Vec indexed, a call around it at its place)
+        if base > 0 && pcx.nodes[base].kind == NodeKind::Call && pcx.nodes[base].count == 1 {
+            let v = child(base, 0, pcx);
+            if v > 0 && pcx.nodes[v].start == pcx.nodes[base].start
+                && pcx.nodes[v].end == pcx.nodes[base].end {
+                base = v;
+            }
+        }
+        if base <= 0 || ix <= 0 || pcx.nodes[ix].kind == NodeKind::Range
+            || pcx.nodes[ix].end <= pcx.nodes[ix].start {
+            continue;
+        }
+        // (a struct's IndexMut, a Vec's: not an array's or a slice's)
+        var bt = pcx.nodes[base].ty;
+        if bt > 0 && pcx.types[bt].kind == TyKind::Ptr {
+            bt = pcx.types[bt].a;
+        }
+        if bt <= 0 || pcx.types[bt].kind != TyKind::Struct {
+            continue;
+        }
+        var r = base;
+        while r > 0 && (pcx.nodes[r].kind == NodeKind::FieldAccess
+            || pcx.nodes[r].kind == NodeKind::Index || pcx.nodes[r].kind == NodeKind::Unary) {
+            // (a borrow the checker made, `&mut p.files`, is its operand's)
+            r = if pcx.nodes[r].kind == NodeKind::Unary { pcx.nodes[r].b } else { pcx.nodes[r].a };
+        }
+        if r <= 0 || pcx.nodes[r].kind != NodeKind::Ident {
+            continue;
+        }
+        let a = pcx.nodes[ix].start;
+        let b = pcx.nodes[ix].end;
+        if !mentions_word(a, b, SRC[pcx.nodes[r].start..pcx.nodes[r].end]) {
+            continue;
+        }
+        // (no edit that crosses the index, or holds the assignment whole)
+        var crossed = false;
+        for i in 0..pcx.e_start.count {
+            let s = pcx.e_start.get(i);
+            let e = pcx.e_end.get(i);
+            let within = s >= a && e <= b;
+            if !within && s < b && a < e || s < pcx.nodes[n].start && e > pcx.nodes[n].end {
+                crossed = true;
+            }
+        }
+        if crossed {
+            continue;
+        }
+        let text = buf_new();
+        buf_bytes(text, "{ let at_ix = ");
+        crate::tools::translate::rows::render(a, b, true, text, pcx);
+        buf_bytes(text, "; ");
+        var w: i64 = 0;
+        for i in 0..pcx.e_start.count {
+            let s = pcx.e_start.get(i);
+            let e = pcx.e_end.get(i);
+            if !(s >= a && e <= b) {
+                pcx.e_start.set(w, s);
+                pcx.e_end.set(w, e);
+                pcx.e_text.set(w, pcx.e_text.get(i));
+                w += 1;
+            }
+        }
+        pcx.e_start.count = w;
+        pcx.e_end.count = w;
+        pcx.e_text.count = w;
+        let name = buf_new();
+        buf_bytes(name, "at_ix");
+        if crate::tools::edit::edit_replace(a, b, name, &pcx) {
+            put_first(pcx.nodes[n].start, buf_slice(text), &tr, &pcx);
+            put(pcx.nodes[n].end, pcx.nodes[n].end, " }", -1, &tr, &pcx);
+        }
+    }
 }
 
 // (after the statics, mod.vl) A raw pointer's part, `p[a..b]`, is
@@ -969,6 +1111,43 @@ fn field_type_node(s: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
     0
 }
 
+// (0.27.5) Whether e is an argument of std's Vec method given as its
+// element T (`words.push("-c")` of a Vec<[u8]>), checked as `[u8]`: the
+// element is bytes where the Vec is declared.
+fn vec_element_bytes(e: i64, tr: Tr, pcx: inout Ctx<Comp>) -> bool {
+    let c = parent_of(e, tr);
+    let t = if e > 0 { pcx.nodes[e].ty } else { 0 };
+    if c <= 0 || pcx.nodes[c].kind != NodeKind::Call || pcx.nodes[c].end <= pcx.nodes[c].start
+        || pcx.nodes[c].count < 2 || t <= 0 || pcx.types[t].kind != TyKind::Slice
+        || pcx.types[t].a != TY_U8 {
+        return false;
+    }
+    var f = pcx.nodes[c].x - 1;
+    if f < 0 || f >= pcx.fns.len() as i64 {
+        return false;
+    }
+    if pcx.fns[f].tmpl > 0 {
+        f = pcx.fns[f].tmpl - 1;
+    }
+    let fnode = pcx.fns[f].node;
+    let q = if fnode > 0 { param_of(fnode, c, e, pcx) } else { 0 };
+    let r = child(c, 0, pcx);
+    if q <= 0 || r == e || pcx.nodes[q].b <= 0 || pcx.nodes[pcx.nodes[q].b].kind != NodeKind::TyName
+        || SRC[pcx.nodes[pcx.nodes[q].b].start..pcx.nodes[pcx.nodes[q].b].end] != "T" {
+        return false;
+    }
+    var rt = pcx.nodes[r].ty;
+    if rt > 0 && pcx.types[rt].kind == TyKind::Ptr {
+        rt = pcx.types[rt].a;
+    }
+    // (the Vec's element `[u8]`, not `str`, which the argument's erased
+    // type does not tell)
+    let el = if rt > 0 { crate::tools::translate::rows::type_arg(rt, 0, pcx) } else { 0 };
+    rt > 0 && is_std_named(rt, c"Vec", pcx) && pcx.nodes[r].start == pcx.nodes[c].start
+        && pcx.nodes[r].end < pcx.nodes[c].end && SRC[pcx.nodes[r].end] == '.'
+        && el > 0 && pcx.types[el].kind == TyKind::Slice && pcx.types[el].a == TY_U8
+}
+
 // (0.27.5) Whether the value of expression e goes where bytes are
 // declared: a place whose type is written `[u8]` (ctx_type), an
 // assignment to declared bytes, the other side of `==` or `!=` from them,
@@ -977,7 +1156,7 @@ fn field_type_node(s: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
 // `&[u8]` in the rust edition (rustc E0308). up: e's place was asked
 // already, below.
 fn bytes_go(e: i64, up: i64, depth: i64, d: TextDecls, tr: Tr, pcx: inout Ctx<Comp>) -> bool {
-    if up == 0 && bytes_type(ctx_type(e, 0, d, tr, &pcx), pcx) {
+    if up == 0 && (bytes_type(ctx_type(e, 0, d, tr, &pcx), pcx) || vec_element_bytes(e, tr, &pcx)) {
         return true;
     }
     if e <= 0 || depth > 32 {
@@ -1037,6 +1216,40 @@ fn bytes_go(e: i64, up: i64, depth: i64, d: TextDecls, tr: Tr, pcx: inout Ctx<Co
     false
 }
 
+// (0.27.5) Whether pattern binding b is the payload of `Some(spec)` (or
+// `Ok(spec)`) in an arm of a match on a call whose result is written
+// `Option<str>` (`Result<str, ..>`): `w.strip_prefix("--")` of std's str.
+fn arm_str_binding(b: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
+    let p = parent_of(b, tr);
+    if p <= 0 || pcx.nodes[p].kind != NodeKind::PatVariant || pcx.nodes[p].count != 1 {
+        return false;
+    }
+    let arm = parent_of(p, tr);
+    if arm <= 0 || pcx.nodes[arm].kind != NodeKind::Arm || pcx.nodes[arm].a != p {
+        return false;
+    }
+    let m = parent_of(arm, tr);
+    if m <= 0 || pcx.nodes[m].kind != NodeKind::Match {
+        return false;
+    }
+    let s = pcx.nodes[m].a;
+    if s <= 0 || pcx.nodes[s].kind != NodeKind::Call {
+        return false;
+    }
+    let f = pcx.nodes[s].x - 1;
+    if f < 0 || f >= pcx.fns.len() as i64 {
+        return false;
+    }
+    let g = if pcx.fns[f].tmpl > 0 { pcx.fns[f].tmpl - 1 } else { f };
+    let fnode = pcx.fns[g].node;
+    let r = if fnode > 0 { pcx.nodes[fnode].b } else { 0 };
+    if r <= 0 {
+        return false;
+    }
+    let t = SRC[pcx.nodes[r].start..pcx.nodes[r].end];
+    t == "Option<str>" || t.len > 11 && t[0..11] == "Result<str,"
+}
+
 // (0.27.5) Whether expression e is text where it is declared, positively:
 // a binding or parameter written `str` (or initialized from such a
 // value), a field declared `str` alone, a call of a function whose result
@@ -1055,7 +1268,7 @@ fn declared_str(e: i64, depth: i64, d: TextDecls, tr: Tr, pcx: inout Ctx<Comp>) 
         }
         let b = d.binds.get(best + 3);
         if pcx.nodes[b].kind == NodeKind::PatBind {
-            return d.tuples.get(b + 1) == 2;
+            return d.tuples.get(b + 1) == 2 || arm_str_binding(b, tr, pcx);
         }
         if pcx.nodes[b].kind == NodeKind::Param || pcx.nodes[b].b > 0 {
             return str_type_node(pcx.nodes[b].b, pcx);
@@ -1072,8 +1285,19 @@ fn declared_str(e: i64, depth: i64, d: TextDecls, tr: Tr, pcx: inout Ctx<Comp>) 
         }
         let g = if pcx.fns[f].tmpl > 0 { pcx.fns[f].tmpl - 1 } else { f };
         let fnode = pcx.fns[g].node;
-        return fnode > 0 && editable(pcx.nodes[fnode].start, &pcx)
-            && str_type_node(pcx.nodes[fnode].b, pcx);
+        if fnode <= 0 {
+            return false;
+        }
+        if editable(pcx.nodes[fnode].start, &pcx) {
+            return str_type_node(pcx.nodes[fnode].b, pcx);
+        }
+        // (std's method on text, a view of it: `tok.strip_prefix("--")
+        // .unwrap()` of a `tok: str`; not its bytes, `as_bytes`)
+        let r = if pcx.nodes[e].count > 0 { child(e, 0, pcx) } else { 0 };
+        return r > 0 && pcx.nodes[r].start == pcx.nodes[e].start
+            && pcx.nodes[r].end < pcx.nodes[e].end && SRC[pcx.nodes[r].end] == '.'
+            && crate::base::sym_text(pcx.nodes[fnode].a, pcx) != "as_bytes"
+            && declared_str(r, depth + 1, d, tr, &pcx);
     }
     if k == NodeKind::Str {
         return SRC[pcx.nodes[e].start] == '"' && !bytes_go(e, 0, 0, d, tr, &pcx);
@@ -1107,35 +1331,176 @@ fn declared_str(e: i64, depth: i64, d: TextDecls, tr: Tr, pcx: inout Ctx<Comp>) 
         }
         // (an element of a local array of text, `let kws = ["fn ", ..];`
         // then `kws[k]`, or of one written `[str; N]`)
-        let a = pcx.nodes[e].a;
-        let best = if a > 0 && pcx.nodes[a].kind == NodeKind::Ident { bound_at(a, d, pcx) }
-            else { -1 };
-        if best < 0 {
+        return elements_str(pcx.nodes[e].a, depth + 1, d, tr, &pcx);
+    }
+    false
+}
+
+// (0.27.5) Whether expression a is an array or a slice whose elements are
+// text where it is declared: a binding written `[str; N]` or `[str]`, or
+// initialized with an array literal of text (`let kws = ["fn ", ..];`), a
+// part or a borrow of one (`let names = all[..];`).
+fn elements_str(a: i64, depth: i64, d: TextDecls, tr: Tr, pcx: inout Ctx<Comp>) -> bool {
+    if a <= 0 || depth > 8 {
+        return false;
+    }
+    let k = pcx.nodes[a].kind;
+    if k == NodeKind::Unary && SRC[pcx.nodes[a].start] == '&' {
+        return elements_str(pcx.nodes[a].b, depth + 1, d, tr, &pcx);
+    }
+    if k == NodeKind::Index {
+        let r = pcx.nodes[a].b;
+        return r > 0 && pcx.nodes[r].kind == NodeKind::Range
+            && elements_str(pcx.nodes[a].a, depth + 1, d, tr, &pcx);
+    }
+    if k == NodeKind::Array {
+        if pcx.nodes[a].count == 0 {
             return false;
         }
-        let b = d.binds.get(best + 3);
-        if pcx.nodes[b].kind == NodeKind::PatBind {
-            return false;
-        }
-        let t = pcx.nodes[b].b;
-        if pcx.nodes[b].kind == NodeKind::Param || t > 0 {
-            return t > 0
-                && (pcx.nodes[t].kind == NodeKind::TyArray
-                    || pcx.nodes[t].kind == NodeKind::TySlice)
-                && str_type_node(pcx.nodes[t].a, pcx);
-        }
-        let init = pcx.nodes[b].c;
-        if init <= 0 || pcx.nodes[init].kind != NodeKind::Array || pcx.nodes[init].count == 0 {
-            return false;
-        }
-        for i in 0..pcx.nodes[init].count {
-            if !declared_str(child(init, i, pcx), depth + 1, d, tr, &pcx) {
+        for i in 0..pcx.nodes[a].count {
+            if !declared_str(child(a, i, pcx), depth + 1, d, tr, &pcx) {
                 return false;
             }
         }
         return true;
     }
-    false
+    if k != NodeKind::Ident {
+        return false;
+    }
+    let best = bound_at(a, d, pcx);
+    if best < 0 {
+        return false;
+    }
+    let b = d.binds.get(best + 3);
+    if pcx.nodes[b].kind == NodeKind::PatBind {
+        return false;
+    }
+    let t = pcx.nodes[b].b;
+    if pcx.nodes[b].kind == NodeKind::Param || t > 0 {
+        return t > 0
+            && (pcx.nodes[t].kind == NodeKind::TyArray || pcx.nodes[t].kind == NodeKind::TySlice)
+            && str_type_node(pcx.nodes[t].a, pcx);
+    }
+    elements_str(pcx.nodes[b].c, depth + 1, d, tr, &pcx)
+}
+
+// (0.27.5) Whether fn node f's module is std's `name` (`std::fs`).
+fn in_std_module(g: i64, name: [u8], pcx: Ctx<Comp>) -> bool {
+    let m = pcx.fns[g].module;
+    m >= 0 && m < pcx.modules.len() as i64 && crate::base::sym_text(pcx.modules[m].key, pcx) == name
+}
+
+// (0.27.5) A match on a copy value read from a place, with a guard
+// (`match pcx.nodes[n].kind { K if f(&mut pcx) => .. }`): Rust keeps the
+// scrutinee's place borrowed through the guards (rustc E0502 against the
+// guard's `&mut`), so the value is matched, `match { pcx.nodes[n].kind }`.
+fn edit_match_copy(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let s = pcx.nodes[n].a;
+    if s <= 0 || pcx.nodes[s].end <= pcx.nodes[s].start || !editable(pcx.nodes[s].start, &pcx) {
+        return;
+    }
+    let k = pcx.nodes[s].kind;
+    if k != NodeKind::FieldAccess && k != NodeKind::Index {
+        return;
+    }
+    let t = pcx.nodes[s].ty;
+    if t <= 0 || is_ref(t, pcx) || !crate::front::conv::copyable(t, &pcx) {
+        return;
+    }
+    var guarded = false;
+    for i in 0..pcx.nodes[n].count {
+        let arm = child(n, i, pcx);
+        if arm > 0 && pcx.nodes[arm].kind == NodeKind::Arm && pcx.nodes[arm].b > 0 {
+            guarded = true;
+        }
+    }
+    if guarded && put_first(pcx.nodes[s].start, "{ ", &tr, &pcx) {
+        put(pcx.nodes[s].end, pcx.nodes[s].end, " }", -1, &tr, &pcx);
+    }
+}
+
+// (0.27.5) An argument MVS marks `&` for a parameter taken inout whose
+// `&` the checker took into its view of an array (`first(&a)`,
+// `first(&[1, 2, 3][..])` to `v: inout [i64]`): `&mut`, as Rust's
+// `&mut [T]` takes (rustc E0308: types differ in mutability). A written
+// Unary `&` is edit_amp's.
+fn edit_inout_args(c: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    if pcx.nodes[c].end <= pcx.nodes[c].start {
+        return;
+    }
+    let f = pcx.nodes[c].x - 1;
+    if f < 0 || f >= pcx.fns.len() as i64 {
+        return;
+    }
+    let g = if pcx.fns[f].tmpl > 0 { pcx.fns[f].tmpl - 1 } else { f };
+    let fnode = pcx.fns[g].node;
+    if fnode <= 0 {
+        return;
+    }
+    for i in 0..pcx.nodes[c].count {
+        let a = child(c, i, pcx);
+        if a <= 0 || pcx.nodes[a].kind == NodeKind::Unary
+            || pcx.nodes[a].end <= pcx.nodes[a].start {
+            continue;
+        }
+        let p = param_of(fnode, c, a, pcx);
+        let t = if p > 0 { pcx.nodes[p].b } else { 0 };
+        // (`inout [i64]`, a slice type written with its mode; `inout T`)
+        if t <= 0 || !word_here(pcx.nodes[t].start, "inout")
+            && (pcx.nodes[t].kind != NodeKind::TyPtr || SRC[pcx.nodes[t].start] == '*') {
+            continue;
+        }
+        // (the view starts after the marker: `&` just before it, itself an
+        // argument's start, after `(` or `,`; not a `&` operator's)
+        let q = pcx.nodes[a].start - 1;
+        var w = q - 1;
+        while w > 0 && SRC[w] == ' ' {
+            w -= 1;
+        }
+        if q > 0 && SRC[q] == '&' && (SRC[w] == '(' || SRC[w] == ',') {
+            put(q + 1, q + 1, "mut ", TC_MUT_MARKER, &tr, &pcx);
+        }
+    }
+}
+
+// (0.27.5) A path given to std::fs as bytes, a value declared `[u8]`
+// (MVS's fs takes `path: [u8]`): std2's takes a `&str` until std::path,
+// so it is `str::from_utf8(p).unwrap()`. A literal is text already. The
+// same for std::process's program and arguments (std2's are &str).
+fn edit_std_path(c: i64, d: TextDecls, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    if tr.text_mode || pcx.nodes[c].end <= pcx.nodes[c].start {
+        return;
+    }
+    let f = pcx.nodes[c].x - 1;
+    if f < 0 || f >= pcx.fns.len() as i64 {
+        return;
+    }
+    let g = if pcx.fns[f].tmpl > 0 { pcx.fns[f].tmpl - 1 } else { f };
+    let fnode = pcx.fns[g].node;
+    if fnode <= 0 || editable(pcx.nodes[fnode].start, &pcx) || !in_std_module(g, "std::fs", pcx)
+        && !in_std_module(g, "std::process", pcx) {
+        return;
+    }
+    for i in 0..pcx.nodes[c].count {
+        let a = child(c, i, pcx);
+        let p = if a > 0 { param_of(fnode, c, a, pcx) } else { 0 };
+        if p <= 0 || pcx.nodes[p].b <= 0 || pcx.nodes[pcx.nodes[p].b].kind != NodeKind::TySlice {
+            continue;
+        }
+        let nm = crate::base::sym_text(pcx.nodes[p].a, pcx);
+        let fs = in_std_module(g, "std::fs", pcx);
+        if fs && nm != "path" && nm != "from" && nm != "to" && nm != "dir"
+            || !fs && nm != "prog" && nm != "a" && nm != "name" {
+            continue;
+        }
+        // (std::process: Command::new, arg and env_remove, whose bytes are
+        // any value not written as text: a Vec<[u8]> element, an args_os item)
+        if fs && declared_bytes(a, 0, d, pcx)
+            || !fs && pcx.nodes[a].kind != NodeKind::Str && !declared_str(a, 0, d, tr, &pcx) {
+            put(pcx.nodes[a].start, pcx.nodes[a].start, "str::from_utf8(", TC_UTF8, &tr, &pcx);
+            put(pcx.nodes[a].end, pcx.nodes[a].end, ").unwrap()", TC_UTF8, &tr, &pcx);
+        }
+    }
 }
 
 // (0.27.5) A value declared `str` given where bytes are declared,
@@ -1228,16 +1593,42 @@ fn edit_str(n: i64, d: TextDecls, tr: inout Tr, pcx: inout Ctx<Comp>) {
     }
 }
 
+// (0.27.5) Whether character literal n is the pattern of std's method on
+// text, `s.split('|')` of an `s: str`: a char in Rust (a Pattern), not
+// the byte MVS types it as.
+fn char_pattern(n: i64, d: TextDecls, tr: Tr, pcx: inout Ctx<Comp>) -> bool {
+    let c = parent_of(n, tr);
+    if c <= 0 || pcx.nodes[c].kind != NodeKind::Call || pcx.nodes[c].count < 2 {
+        return false;
+    }
+    let r = child(c, 0, pcx);
+    if r == n || pcx.nodes[r].start != pcx.nodes[c].start || pcx.nodes[r].end >= pcx.nodes[c].end
+        || SRC[pcx.nodes[r].end] != '.' {
+        return false;
+    }
+    let f = pcx.nodes[c].x - 1;
+    if f < 0 || f >= pcx.fns.len() as i64 {
+        return false;
+    }
+    let g = if pcx.fns[f].tmpl > 0 { pcx.fns[f].tmpl - 1 } else { f };
+    let fnode = pcx.fns[g].node;
+    fnode > 0 && !editable(pcx.nodes[fnode].start, &pcx) && declared_str(r, 0, d, tr, &pcx)
+}
+
 // A character literal MVS types as a byte, `'a'`, is `b'a'`; as a code
 // point (u32) `'a' as u32` (a char in the rust edition); as another
-// integer `b'a' as i64`.
-fn edit_char(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+// integer `b'a' as i64`; a pattern of std's method on text, `s.split('|')`,
+// stays a char.
+fn edit_char(n: i64, d: TextDecls, tr: inout Tr, pcx: inout Ctx<Comp>) {
     let s = pcx.nodes[n].start;
     let t = pcx.nodes[n].ty;
     if SRC[s] != '\'' || token_at(s, pcx) < 0 {
         return;
     }
     if t == TY_U8 {
+        if char_pattern(n, d, tr, &pcx) {
+            return;
+        }
         put(s, s, "b", TC_BYTES, &tr, &pcx);
     } else if t == crate::front::types::TY_U32 {
         put(pcx.nodes[n].end, pcx.nodes[n].end, " as u32", TC_BYTES, &tr, &pcx);
@@ -1496,6 +1887,12 @@ pub fn text_program(tr: Tr, pcx: inout Ctx<Comp>) -> bool {
                 return false;
             }
         }
+        // (0.27.5) bytes std2 gives as bytes: args_os's items (`&[u8]`),
+        // which no `&str` takes
+        if k == NodeKind::Call && pcx.nodes[n].x > 0 && pcx.nodes[n].x <= pcx.fns.len() as i64
+            && crate::base::sym_text(pcx.fns[pcx.nodes[n].x - 1].name, pcx) == "std.env.args_os" {
+            return false;
+        }
     }
     any
 }
@@ -1514,7 +1911,7 @@ fn str_type_node(tn: i64, pcx: Ctx<Comp>) -> bool {
 // (1), `[u8]` (2) or both (3); statics the statics and constants written
 // `[u8]` (1) or `[[u8]; N]` (2); tuples a tuple pattern's PatBinds whose
 // part of the function's result is written `[u8]` (1) or `str` (2).
-struct TextDecls { binds: IntVec, fields: HMap, statics: HMap, tuples: HMap }
+pub struct TextDecls { binds: IntVec, fields: HMap, statics: HMap, tuples: HMap }
 
 // (0.27.5) Whether part i of the tuple e makes is a text literal in every
 // branch: `if c { ("len()", m) } else { ("", 0) }`, which a tuple pattern
@@ -1578,7 +1975,7 @@ fn tuple_decls(n: i64, pat: i64, d: inout TextDecls, tr: Tr, pcx: inout Ctx<Comp
     }
 }
 
-fn text_decls(tr: Tr, pcx: inout Ctx<Comp>) -> TextDecls {
+pub fn text_decls(tr: Tr, pcx: inout Ctx<Comp>) -> TextDecls {
     var d = TextDecls {
         binds: IntVec { data: 0 as *i64, count: 0, cap: 0 },
         fields: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
@@ -1622,6 +2019,19 @@ fn text_decls(tr: Tr, pcx: inout Ctx<Comp>) -> TextDecls {
             } else if pat > 0 && pcx.nodes[pat].kind == NodeKind::PatTuple {
                 tuple_decls(n, pat, &d, tr, &pcx);
             }
+        } else if k == NodeKind::Arm {
+            // (`Some(spec) =>` of a match on an Option<str>: text, in the arm)
+            let p = pcx.nodes[n].a;
+            let b = if p > 0 && pcx.nodes[p].kind == NodeKind::PatVariant
+                && pcx.nodes[p].count == 1 { child(p, 0, pcx) } else { 0 };
+            if b > 0 && pcx.nodes[b].kind == NodeKind::PatBind && arm_str_binding(b, tr, pcx) {
+                d.binds.push(pcx.nodes[n].start);
+                d.binds.push(pcx.nodes[n].end);
+                d.binds.push(pcx.nodes[b].a);
+                d.binds.push(b);
+                d.tuples.put(b + 1, 2);
+            }
+            continue;
         }
         let scope = parent_of(n, tr);
         if name < 0 || scope <= 0 {
@@ -1639,7 +2049,7 @@ fn text_decls(tr: Tr, pcx: inout Ctx<Comp>) -> TextDecls {
 // where it is declared (a `str`, which is `&str` in the rust edition, or a
 // type parameter whose instance has it): a binding (its type, or its
 // initializer's), a field, a function's result.
-fn declared_text(e: i64, depth: i64, d: TextDecls, pcx: Ctx<Comp>) -> bool {
+pub fn declared_text(e: i64, depth: i64, d: TextDecls, pcx: Ctx<Comp>) -> bool {
     if e <= 0 || depth > 4 {
         return false;
     }
@@ -1932,6 +2342,44 @@ fn printed_value(a: i64, b: i64) -> bool {
     len > 0 && (s < 0 || !ident_char(SRC[s]) && SRC[s] != '.')
 }
 
+// (0.27.5) Whether hole n is an argument only evaluated (HOLE_EVAL, a
+// call with named arguments: `format_args("{} {lv}", name(), lv = 2)`)
+// that a Display hole of the same literal reads (its alias). The checker
+// makes the evaluated arguments' holes in order, then the literal's
+// (front/check/format.vl's build), so they are found by node number.
+fn eval_hole_display(n: i64, pcx: Ctx<Comp>) -> bool {
+    let eval = crate::front::check::format::HOLE_EVAL;
+    if pcx.nodes[n].kind != NodeKind::InterpHole || pcx.nodes[n].b != eval {
+        return false;
+    }
+    var v: i64 = 0;
+    while n - v - 1 > 0 && pcx.nodes[n - v - 1].kind == NodeKind::InterpHole
+        && pcx.nodes[n - v - 1].b == eval {
+        v += 1;
+    }
+    var aliases = false;
+    var j = n + 1;
+    while j < pcx.nodes.len() as i64 && j < n + 256 {
+        if pcx.nodes[j].kind == NodeKind::InterpHole {
+            let b = pcx.nodes[j].b;
+            if b == eval {
+                if aliases {
+                    return false;
+                }
+            } else if b >= 1024 {
+                aliases = true;
+                if b / 1024 - 1 == v && (b & 1) == 0 {
+                    return true;
+                }
+            } else {
+                return false;
+            }
+        }
+        j += 1;
+    }
+    false
+}
+
 // (0.27.4) A `[u8]` value a program that uses bytes as bytes too prints
 // as text (a Display hole, `{x}` or `{}`): Rust's [u8] has no Display, so
 // the hole is given `str::from_utf8(x).unwrap()` (MVS's text is UTF-8;
@@ -1947,7 +2395,8 @@ fn edit_byte_holes(decls: TextDecls, tr: inout Tr, pcx: inout Ctx<Comp>) {
     var named = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
     for n in 1..pcx.nodes.len() as i64 {
         // (a hole, or the value of `println(x)`, which is `println("{}", x)`)
-        let hole = pcx.nodes[n].kind == NodeKind::InterpHole && pcx.nodes[n].b == 0;
+        let hole = pcx.nodes[n].kind == NodeKind::InterpHole && pcx.nodes[n].b == 0
+            || eval_hole_display(n, pcx);
         if !hole && !(pcx.nodes[n].ty > 0 && SRC[pcx.nodes[n].start] != '"'
             && token_at(pcx.nodes[n].start, pcx) >= 0
             && printed_value(pcx.nodes[n].start, pcx.nodes[n].end)) || !own_node(n, tr, &pcx) {
@@ -2053,12 +2502,18 @@ pub fn body_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
         }
         if k == NodeKind::Unary && pcx.nodes[n].op == Tok::Amp {
             edit_amp(n, &tr, &pcx);
+        } else if k == NodeKind::Match {
+            edit_match_copy(n, &tr, &pcx);
         } else if k == NodeKind::Unary && pcx.nodes[n].op == Tok::Star {
             edit_deref(n, &tr, &pcx);
         } else if k == NodeKind::Call || k == NodeKind::FieldAccess {
             edit_len(n, &tr, &pcx);
             edit_call_args(n, &tr, &pcx);
             edit_text_to_bytes(n, decls, &tr, &pcx);
+            if k == NodeKind::Call {
+                edit_std_path(n, decls, &tr, &pcx);
+                edit_inout_args(n, &tr, &pcx);
+            }
         } else if k == NodeKind::Index {
             // (a raw pointer's part: ptr_slice_edits, after the statics)
             if !ptr_slice_node(n, pcx) {
@@ -2072,7 +2527,7 @@ pub fn body_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
         } else if k == NodeKind::Str {
             edit_str(n, decls, &tr, &pcx);
         } else if k == NodeKind::Char {
-            edit_char(n, &tr, &pcx);
+            edit_char(n, decls, &tr, &pcx);
         } else if k == NodeKind::Int {
             edit_int(n, &tr, &pcx);
             edit_int_generic(n, &tr, &pcx);

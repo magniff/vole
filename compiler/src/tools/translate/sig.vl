@@ -7,11 +7,13 @@ use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::{NodeKind, child};
 use crate::front::conv::{CONV_IN_OUT, CONV_LET, CONV_SINK_K, param_conv};
+use crate::front::own::summary::{S_L1_P, S_L1_STAR, S_L2_P, S_L2_STAR, summary_of};
 use crate::front::types::fn_param;
 use crate::middle::lower::ssa::HMap;
 use crate::tools::translate::{
     D_MUT, D_REF, D_VALUE, TC_DERIVE, TC_INOUT, TC_LET, TC_RECEIVER, TC_SINK, TC_TEXT, TC_TYPE,
-    TC_VIEW, Tr, add_ref, editable, ident_char, is_ref, is_ws, put, skip_ws, word_here,
+    TC_VIEW, Tr, add_ref, editable, ident_char, is_ref, is_ws, own_node, parent_of, put, skip_ws,
+    word_here,
 };
 
 // The operator traits, whose methods take self and their operand by value
@@ -326,7 +328,8 @@ fn borrowing_params(n: i64, tr: Tr, pcx: Ctx<Comp>) -> (i64, bool) {
             let s = pcx.nodes[tn].start;
             if k == NodeKind::TySlice || k == NodeKind::TyName && word_here(s, "str")
                 || k == NodeKind::TyPtr && SRC[s] != '*'
-                || crate::tools::translate::regions::names_view_item(tn, tr, pcx) {
+                || crate::tools::translate::regions::names_view_item(tn, tr, pcx)
+                || crate::tools::translate::rows::type_row_region(tn, tr, pcx) {
                 count += 1;
             }
         }
@@ -366,7 +369,8 @@ fn has_view(t: i64, depth: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
     let s = pcx.nodes[t].start;
     if k == NodeKind::TySlice && SRC[s] == '[' || k == NodeKind::TyName && word_here(s, "str")
         && SRC[pcx.nodes[t].end - 1] == 'r'
-        || k == NodeKind::TyName && crate::tools::translate::regions::names_view_item(t, tr, pcx) {
+        || k == NodeKind::TyName && crate::tools::translate::regions::names_view_item(t, tr, pcx)
+        || crate::tools::translate::rows::type_row_region(t, tr, pcx) {
         return true;
     }
     if k == NodeKind::TyName {
@@ -408,16 +412,75 @@ fn static_result(n: i64, pcx: Ctx<Comp>) -> bool {
         || ends_with_text(file, "tools/testrun/mod.vl") && name == "build_key"
 }
 
+// (0.27.5) Whether function node n's body is only a call of a function
+// whose result is `'static` (static_result, or one such itself): a
+// forwarder, `fn sym_text(sym: i64, pcx: Ctx<Comp>) -> [u8] {
+// crate::base::sym_text(sym, pcx) }`, whose result is the callee's.
+fn static_forward(n: i64, depth: i64, pcx: Ctx<Comp>) -> bool {
+    let body = if n > 0 { pcx.nodes[n].c } else { 0 };
+    if depth > 4 || body <= 0 || pcx.nodes[body].kind != NodeKind::Block
+        || pcx.nodes[body].count != 0 {
+        return false;
+    }
+    let t = pcx.nodes[body].a;
+    if t <= 0 || pcx.nodes[t].kind != NodeKind::Call {
+        return false;
+    }
+    let f = pcx.nodes[t].x - 1;
+    if f < 0 || f >= pcx.fns.len() as i64 {
+        return false;
+    }
+    let g = if pcx.fns[f].tmpl > 0 { pcx.fns[f].tmpl - 1 } else { f };
+    let fnode = pcx.fns[g].node;
+    fnode > 0 && fnode != n && (static_result(fnode, pcx) || static_forward(fnode, depth + 1, pcx))
+}
+
 // Whether s ends with t.
 fn ends_with_text(s: [u8], t: [u8]) -> bool {
     s.len >= t.len && s[s.len - t.len..s.len] == t
 }
 
+// (0.27.5) Whether function node n takes an item with views by a shared
+// reference, `line: &Line<'_>`: two lifetimes, which elision does not
+// choose between.
+fn ref_view_item(n: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
+    for j in 0..pcx.nodes[n].count {
+        let p = child(n, j, pcx);
+        if pcx.nodes[p].kind == NodeKind::Param && pcx.nodes[p].a != tr.sym_self
+            && tr.decided.get(p + 1) == D_REF && pcx.nodes[p].b > 0
+            && pcx.nodes[pcx.nodes[p].b].kind == NodeKind::TyName
+            && (crate::tools::translate::regions::names_view_item(pcx.nodes[p].b, tr, pcx)
+                || crate::tools::translate::rows::type_row_region(pcx.nodes[p].b, tr, pcx)) {
+            return true;
+        }
+    }
+    false
+}
+
 // (a result with a view that elision cannot tie: two or more parameters
-// it could borrow from and no `self`) The function's `'a`: on the result's
+// it could borrow from, or one item with views by reference, and no
+// `self`) The function's `'a`: on the result's
 // views and on each parameter taken by a shared reference, `fn f<'a>(t:
 // &'a [u8], pcx: &'a Ctx) -> &'a [u8]`; an exclusive one keeps its own.
-fn name_region(n: i64, r: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+// (0.27.5) With MVS's view summary of function fi (inferred or declared,
+// not assumed): an item with views taken by reference has it on the
+// item's own region, `&Leaf<'a>`, not the reference's, and a reference to
+// a struct without views the result does not view keeps elision, so a
+// temporary given to one (`&leaf_of(..)`) need not live as long as the
+// result. A view, an item or a container of views by value (`Vec<Ev<'_>>`)
+// has it always: the summary may miss a view a moved value carries.
+fn name_region(n: i64, fi: i64, r: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    var known = false;
+    var own_mask: i64 = 0;
+    var through_mask: i64 = 0;
+    if fi >= 0 {
+        let s = summary_of(fi, &pcx);
+        // (a summary with no parameter in it, a view made from a raw
+        // pointer, says nothing: every parameter, as before)
+        known = !s.top && (s.ret[0] | s.ret[1] | s.ret[2] | s.ret[3]) != 0;
+        own_mask = s.ret[S_L1_P] | s.ret[S_L2_P];
+        through_mask = s.ret[S_L1_STAR] | s.ret[S_L2_STAR];
+    }
     var named: i64 = 0;
     for j in 0..pcx.nodes[n].count {
         let p = child(n, j, pcx);
@@ -428,10 +491,28 @@ fn name_region(n: i64, r: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
         if tn <= 0 || tr.decided.get(p + 1) == D_MUT {
             continue;
         }
+        let bit = if j >= 63 { -1 } else { 1 << j };
         let ts = pcx.nodes[tn].start;
         let at = if word_here(ts, "let") { skip_ws(ts + 3) } else { ts };
         let k = pcx.nodes[tn].kind;
+        let item = k == NodeKind::TyName
+            && (crate::tools::translate::regions::names_view_item(tn, tr, pcx)
+                || crate::tools::translate::rows::type_row_region(tn, tr, pcx));
         if tr.decided.get(p + 1) == D_REF && !primitive_name(tn, pcx) {
+            if known && item {
+                // (a view item's views are its region's, `leaf.last` of a
+                // `&Leaf<'a>`, whatever the reference's)
+                mark_region(tn, 2, 0, &tr, pcx);
+                named += 1;
+                continue;
+            }
+            // (a reference to a struct without views the result does not
+            // view: elided; MVS's summary misses no view a reference's
+            // referent owns, but may one that a moved value carries, so
+            // views and items by value keep the region)
+            if known && (own_mask & bit) == 0 && (through_mask & bit) == 0 {
+                continue;
+            }
             // (after the `&` edit_param put at the same place; no rule's
             // key: view_put's is TC_VIEW's at this place)
             put(at, at, "'a ", -1, &tr, &pcx);
@@ -439,9 +520,12 @@ fn name_region(n: i64, r: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
         } else if k == NodeKind::TySlice && SRC[at] == '[' {
             put(at, at, "'a ", -1, &tr, &pcx);
             named += 1;
-        } else if k == NodeKind::TyName && (word_here(ts, "str")
-            || crate::tools::translate::regions::names_view_item(tn, tr, pcx)) {
+        } else if k == NodeKind::TyName && word_here(ts, "str") || item {
             tr.static_res.put(tn + 1, 2);
+            named += 1;
+        } else if k == NodeKind::TyName && has_view(tn, 0, tr, pcx) {
+            // (a container of views by value, `errs: Vec<Ev<'_>, Gpa>`)
+            mark_region(tn, 2, 0, &tr, pcx);
             named += 1;
         }
     }
@@ -511,13 +595,14 @@ fn edit_signature(n: i64, impls: HMap, tr: inout Tr, pcx: inout Ctx<Comp>) {
     // parameter is a reference, which Rust's elision would name)
     let r = pcx.nodes[n].b;
     let (borrowed, receiver) = borrowing_params(n, tr, pcx);
-    if r > 0 && static_result(n, pcx) {
+    if r > 0 && (static_result(n, pcx) || static_forward(n, 0, pcx)) {
         mark_region(r, 1, 0, &tr, pcx);
     } else if r > 0 && borrowed == 0 && !receiver {
         // (every view in it: `[&'static str; 21]`, `Vec<Opt<'static>>`)
         mark_region(r, 1, 0, &tr, pcx);
-    } else if r > 0 && borrowed >= 2 && !receiver && has_view(r, 0, tr, pcx) {
-        name_region(n, r, &tr, &pcx);
+    } else if r > 0 && (borrowed >= 2 || borrowed == 1 && ref_view_item(n, tr, pcx)) && !receiver
+        && has_view(r, 0, tr, pcx) {
+        name_region(n, fi, r, &tr, &pcx);
     }
     if r > 0 && pcx.nodes[r].kind == NodeKind::TySlice && SRC[pcx.nodes[r].start] == '[' {
         view_put(r, pcx.nodes[r].start, &tr, &pcx);
@@ -897,6 +982,108 @@ fn has_eq(n: i64, self_ty: [u8], pcx: Ctx<Comp>) -> bool {
     false
 }
 
+// (0.27.5) Whether fn node f writes through a Fmt parameter and returns
+// nothing: a Display or Debug impl's fmt, or MVS's helper of one, `fn
+// put_name(f: inout Fmt, o: Opt)`, whose writes rewrite.tsv's rows `?`.
+fn fmt_fn(f: i64, pcx: Ctx<Comp>) -> bool {
+    if f <= 0 || pcx.nodes[f].kind != NodeKind::Fn || pcx.nodes[f].b != 0 || pcx.nodes[f].c <= 0 {
+        return false;
+    }
+    for i in 0..pcx.nodes[f].count {
+        let p = child(f, i, pcx);
+        var t = if p > 0 && pcx.nodes[p].kind == NodeKind::Param { pcx.nodes[p].b } else { 0 };
+        // (`inout Fmt` is the parser's TyPtr of it)
+        if t > 0 && pcx.nodes[t].kind == NodeKind::TyPtr {
+            t = pcx.nodes[t].a;
+        }
+        if t > 0 && pcx.nodes[t].kind == NodeKind::TyName
+            && SRC[pcx.nodes[t].start..pcx.nodes[t].end] == "Fmt" {
+            return true;
+        }
+    }
+    false
+}
+
+// (0.27.5) fn node f's result `-> std::fmt::Result` and its body's end
+// `Ok(())`: an impl's fmt (fmt_impl), a helper of one (fmt_helpers).
+fn fmt_result(f: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let body = pcx.nodes[f].c;
+    if pcx.nodes[f].b == 0 {
+        // (the result, after the parameters' `)`)
+        var q = pcx.nodes[body].start - 1;
+        while q > pcx.nodes[f].start && SRC[q] != ')' {
+            q -= 1;
+        }
+        put(q + 1, q + 1, " -> std::fmt::Result", TC_TYPE, &tr, &pcx);
+    }
+    let tail = pcx.nodes[body].a;
+    if tail > 0 {
+        put(pcx.nodes[tail].end, pcx.nodes[tail].end, "; Ok(())", -1, &tr, &pcx);
+    } else {
+        var q = pcx.nodes[body].end - 1;
+        while q > pcx.nodes[body].start && SRC[q] != '}' {
+            q -= 1;
+        }
+        put(q, q, " Ok(()) ", -1, &tr, &pcx);
+    }
+}
+
+// (0.27.5) The Fn node node n is in, by the tree (enclosing_fn's search
+// by position may find a copy the checker made at the same place), or 0.
+fn parent_fn(n: i64, tr: Tr, pcx: Ctx<Comp>) -> i64 {
+    var p = parent_of(n, tr);
+    var steps = 0;
+    while p > 0 && pcx.nodes[p].kind != NodeKind::Fn && steps < 10000 {
+        p = parent_of(p, tr);
+        steps += 1;
+    }
+    p
+}
+
+// (0.27.5) In the rust edition a Display body's writes are `?`'d, so a
+// function that writes through a Fmt and returns nothing returns
+// std::fmt::Result: MVS's helpers of a fmt get the result and `Ok(())`
+// (an impl's fmt has them from fmt_impl), a call of one its `?` (in a
+// function that returns no Result, `.unwrap()`), and an empty `return;`
+// in either is `return Ok(());`.
+fn fmt_helpers(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    for n in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[n].kind;
+        if !own_node(n, tr, &pcx) {
+            continue;
+        }
+        if k == NodeKind::Fn && fmt_fn(n, pcx) {
+            let nm = crate::base::sym_text(pcx.nodes[n].a, pcx);
+            if nm != "fmt" && nm != "fmt_debug" {
+                fmt_result(n, &tr, &pcx);
+            }
+        }
+        else if k == NodeKind::Return && pcx.nodes[n].a <= 0
+            && word_here(pcx.nodes[n].start, "return")
+            && fmt_fn(parent_fn(n, tr, pcx), pcx) {
+            put(pcx.nodes[n].start + 6, pcx.nodes[n].start + 6, " Ok(())", -1, &tr, &pcx);
+        } else if k == NodeKind::Call && pcx.nodes[n].end > pcx.nodes[n].start {
+            let f = pcx.nodes[n].x - 1;
+            if f < 0 || f >= pcx.fns.len() as i64 {
+                continue;
+            }
+            let g = if pcx.fns[f].tmpl > 0 { pcx.fns[f].tmpl - 1 } else { f };
+            let fnode = pcx.fns[g].node;
+            if !fmt_fn(fnode, pcx) || !editable(pcx.nodes[fnode].start, &pcx) {
+                continue;
+            }
+            let nm = crate::base::sym_text(pcx.nodes[fnode].a, pcx);
+            if nm == "fmt" || nm == "fmt_debug" {
+                continue;
+            }
+            let e = pcx.nodes[n].end;
+            put(e, e,
+                if fmt_fn(parent_fn(n, tr, pcx), pcx) { "?" } else { ".unwrap()" },
+                -1, &tr, &pcx);
+        }
+    }
+}
+
 // An impl of Display or Debug (rewrite.tsv's Display::fmt, Debug::fmt_debug
 // rows): `fn fmt(&self, f: &mut Fmt) -> std::fmt::Result`, its body ending
 // in `Ok(())` (its writes are `?`'d by their rows).
@@ -917,25 +1104,7 @@ fn fmt_impl(n: i64, debug: bool, tr: inout Tr, pcx: inout Ctx<Comp>) {
             }
             put(q, q + 9, "fmt", TC_TYPE, &tr, &pcx);
         }
-        let body = pcx.nodes[f].c;
-        if pcx.nodes[f].b == 0 {
-            // (the result, after the parameters' `)`)
-            var q = pcx.nodes[body].start - 1;
-            while q > pcx.nodes[f].start && SRC[q] != ')' {
-                q -= 1;
-            }
-            put(q + 1, q + 1, " -> std::fmt::Result", TC_TYPE, &tr, &pcx);
-        }
-        let tail = pcx.nodes[body].a;
-        if tail > 0 {
-            put(pcx.nodes[tail].end, pcx.nodes[tail].end, "; Ok(())", -1, &tr, &pcx);
-        } else {
-            var q = pcx.nodes[body].end - 1;
-            while q > pcx.nodes[body].start && SRC[q] != '}' {
-                q -= 1;
-            }
-            put(q, q, " Ok(()) ", -1, &tr, &pcx);
-        }
+        fmt_result(f, &tr, &pcx);
     }
 }
 
@@ -1018,7 +1187,6 @@ fn derive_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
         if q < pcx.nodes[n].end && SRC[q] != '{' {
             continue;
         }
-        let copy = copied.get(n + 1) == 1;
         var fieldless = k == NodeKind::Enum;
         if k == NodeKind::Enum {
             for j in 0..pcx.nodes[n].count {
@@ -1027,6 +1195,9 @@ fn derive_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
                 }
             }
         }
+        // (0.27.5: an enum without fields too, which MVS copies even with
+        // its own `#[derive(Clone)]`, as a struct of it that is Copy needs)
+        let copy = copied.get(n + 1) == 1 || fieldless;
         let h = pcx.nodes[n].h;
         var has_clone = false;
         var has_copy = false;
@@ -1069,8 +1240,14 @@ fn derive_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
             continue;
         }
         if h > 0 && pcx.nodes[h].count > 0 {
-            let at = pcx.nodes[child(h, 0, pcx)].start;
-            put(at, at, text, TC_DERIVE, &tr, &pcx);
+            // (after the last name: the first may have its `PartialEq, `
+            // already, `#[derive(Eq, Clone)]`, which a second insertion
+            // there would not join)
+            let at = pcx.nodes[child(h, pcx.nodes[h].count - 1, pcx)].end;
+            let more = crate::base::buf_new();
+            crate::base::buf_bytes(more, ", ");
+            crate::base::buf_bytes(more, text[0..text.len - 2]);
+            put(at, at, crate::base::buf_slice(more), TC_DERIVE, &tr, &pcx);
         } else {
             // (a new attribute on the item's line)
             // (before the item's `pub`)
@@ -1146,5 +1323,6 @@ pub fn signature_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
     edit_types(&tr, &pcx);
     derive_edits(&tr, &pcx);
     impl_edits(&tr, &pcx);
+    fmt_helpers(&tr, &pcx);
     crate::tools::translate::rows::type_row_edits(&tr, &pcx);
 }

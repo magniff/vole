@@ -83,11 +83,54 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.2.1 | `v0.27.2.1` | 0.27.2 | aarch64-macos | std2 1,306 of 1,454 tests at -O0/-O2 under `--check-alloc`; `impl Trait` returns (§21) and the opaque instance (§22, narrowed: FL11); implied outlives bounds (D4.6); three consumed-value miscompiles fixed (D8.5), E0508, two-phase `write`; the front's std2 gaps (F13, F14.2, F18.4, F9.2, F26.3); floats, `std::env`; contracts and effects R2 (std2 declared, 27 `requires`, 11 `ensures`); hello-rust 3.48x; the gate's std2 builds halved |
 | 0.27.3 | `v0.27.3` | 0.27.2.1 | aarch64-macos | the translator `fix --edition rust` and gate 2 (`tests/translate.sh`, the rustc twin); the i32 literal default (FL6); std2 1,402 of 1,472 tests at -O0; lazy std2 parsing (a rust hello world 2.32x MVS's); arrays' by-value IntoIterator |
 | 0.27.4 | `v0.27.4` | 0.27.3 | aarch64-macos | gate 3 opens (`fix --edition rust` on compiler/src: 122 type errors, 3,048 borrowck behind them); inference from a later statement (FL1); `[T]`/`str` unsized places (Z9.1c); `&raw` and Rust 2024's `static mut` rule; `format_args` a value; std2 1,445 of 1,473 tests at -O0; a rust hello world 2.03x MVS's |
-| 0.27.5 | `v0.27.5` | 0.27.4 | aarch64-macos | std2's `std::time`, `fs`, `process`, `cli` (gate 3 from 122 to 37 type errors); operands read where evaluated (D2.4a); text is not its bytes (F0.6); a generic iterator's item is its bound's (D4.6 f); std2 lexed by its units (a rust hello world 1.78x MVS's, the 2.0x ceiling enforced) |
+| 0.27.5 | `v0.27.5` | 0.27.4 | aarch64-macos | std2's `std::time`, `fs`, `process`, `cli` (gate 3 from 122 to 37 type errors); operands read where evaluated (D2.4a); text is not its bytes (F0.6); a generic iterator's item is its bound's (D4.6 f); std2 lexed by its units (a rust hello world 1.82x MVS's, the 2.0x ceiling enforced) |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.27.6
+
+The translator (g3274):
+
+- std2's fs, process and env by rewrite.tsv's rows: `fs::exists`,
+  `fs::append`, `fs::copy`, `Metadata::modified`, `DirEntry::is_*`,
+  `Command::new` to `Command::new_in($1, $a)` (`$a`, when the function
+  has no Gpa, a program allocator it makes before the call), `process::id`
+  and `Child::id` as i32, `env::get_in` to `var_in`. A free function's
+  row may name its module (`fs::copy`, not io::copy). Bytes given as a
+  path, a program or an argument are `str::from_utf8(p).unwrap()`.
+- A result's `'a` by flow: with MVS's view summary, only on the
+  parameters the result's views come from, and on an item's region for
+  an item with views taken by reference (`leaf: &Leaf<'a, Gpa>`), so a
+  temporary given to another parameter need not outlive the result
+  (cli/tree.vl's two borrowck.return_local).
+- Gate 3: 127 (at std2's process) to 17 errors; 12 wait for std2's cli,
+  2 for std::gpu, 1 for std::num; borrowck (partial) 142 to 139.
+- A Vec's element assigned with an index that reads the Vec, or what
+  holds it (`pcx.files[pcx.files.len() - 1].module = m`,
+  `pcx.nodes[child(own, i, pcx)].a = ..`), is `{ let at_ix = I;
+  pcx.files[at_ix].module = m }`: Rust's IndexMut borrows the Vec before
+  the index is read (rustc E0502). A pass after the others, so the index
+  moves with its edits.
+- std::cli's type rows' `'_` (`Command<'_, $1>`, `Arg<'_>`) take the
+  region the signature gives them: `build_command(gpa) -> Command<'static,
+  Gpa>`, `flag<'a>(name: &'a str, help: &'a str) -> Arg<'a>`; such a type
+  is an item with views for elision and for the flow rule (a reference to
+  one gets the item's region). A container of views by value
+  (`errs: Vec<Ev<'_>, Gpa>`) takes the function's `'a` too.
+- An inout slice parameter given an array or a part of one, whose `&` the
+  checker takes into its view, is `&mut` (`first(&mut a)`,
+  `first(&mut [1i64, 2, 3][..])`; rustc E0308 otherwise).
+- A function whose body only calls one with a `'static` result
+  (static_result's list) has a `'static` result too: the forwarders
+  `fn sym_text(sym, pcx) -> [u8] { crate::base::sym_text(sym, pcx) }` of
+  tools/refactor_shape, guide/stdapi and front/own/infer.
+- A guarded match on a copy value read from a place matches the value,
+  `match { pcx.nodes[n].kind } { .. }`: Rust keeps the scrutinee's place
+  borrowed through the guards (rustc E0502 against a guard's `&mut`).
+- Gate 3, with std2's cli: 14 type errors, none of them the translator's;
+  borrowck (partial) 152 to 96. A borrowck case for the class it leaves,
+  a `&mut` coerced to a raw pointer held through the call:
+  `rust_b_raw_coerce_ends_borrow` (XFAIL).
 
 The front (front273):
 
@@ -136,9 +179,36 @@ The front (front273):
   `&mut e` do, as rustc does (F27.2). 0.27.5 moved `e`: after `let ref z
   = a;`, `a` was moved, and `let ref mut w = v[0]` changed a copy.
 
+std2 and the translator (fl10274):
+
+- Gate 3's type errors go from 14 to 3, with g3274's rows and std2's cli.
+  - `for v in m.values("x") { if v == "on" .. }` over a call that gives
+    a slice is written `for &v in ..`, as for a named slice: the cli's
+    `expected 'let str', got 'str'`.
+  - A row for `str` also fires on a text the MVS front sees as `[u8]`
+    (a literal, or a value declared as text): `s.split(b'|')` in a
+    `match` scrutinee or a call's argument. A row's `'c' as char` is
+    written `'c'`.
+  - `arena_scope(&gpa, f)` is `Arena::new_in(gpa).scope(|s| f(s))`, and
+    `Arena::none()` is `Arena::new_in` on the allocator in scope.
+  - `IntVecItems::fold` reads through a method, not a `*i64` index, and
+    std2 has crate-private `count_ones`, `leading_zeros` and
+    `trailing_zeros` for std::arch's callers.
+- std2's effects:
+  - `tools/std2-effects.py` no longer writes a second `#[effects(..)]`
+    above an item that has one under its comments; 14 duplicates in
+    ptr.vl, slice.vl, str.vl, string.vl and env.vl are gone.
+  - `Result::ok`, `and`, `or`, `unwrap_or` and Option's `unwrap_or`,
+    `ok_or`, `and`, `or`, `xor`, `zip` name the type parameters they
+    drop, so a `T` with Drop is checked (std2_result_option_drops).
+  - `impl Read for &File` and `impl Write for &File` read `(*self).fd`.
+    Their bodies did not check, which left `std::panic::panic`'s effects
+    "(unknown)" through fn-value dispatch; it is `io panic diverge`, and
+    `fix --only effects-std` writes that on a function that panics.
+
 ### What's new in 0.27.5
 
-Gate 3 at 37. std2 has the modules compiler/src uses: `std::time`, `std::fs`, `std::process` and `std::cli`, Rust-shaped, with the translator's rows bending MVS's calls onto them. `fix --edition rust` on a copy of compiler/src now leaves 37 errors (122 in 0.27.4), and `check --borrowck-partial` counts 154 borrowck errors behind them (3,048 in 0.27.4): a rust body reads each operand where it is evaluated (D2.4a), and borrowed literals are promoted (D2.8). In the rust edition, text is not its bytes (F0.6: a `&str` where a `&[u8]` goes is E0308), and the translator writes `b".."` or `.as_bytes()` where bytes are declared; a generic iterator's item is its bound's region, not a borrow of the iterator (D4.6 f); `AsRef` for `&T` with T = `str` no longer calls itself (a stack overflow at run time) nor gives a false outlives (Z9.1c); a borrowed array or tuple literal takes the expected type (F18.4). std2 is lexed by its units from an index made when it is embedded (Z5.2): a rust hello world's check is 1.78x MVS's (2.03x), and the 2.0x ceiling is enforced. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
+Gate 3 at 37. std2 has the modules compiler/src uses: `std::time`, `std::fs`, `std::process` and `std::cli`, Rust-shaped, with the translator's rows bending MVS's calls onto them. `fix --edition rust` on a copy of compiler/src now leaves 37 errors (122 in 0.27.4), and `check --borrowck-partial` counts 154 borrowck errors behind them (3,048 in 0.27.4): a rust body reads each operand where it is evaluated (D2.4a), and borrowed literals are promoted (D2.8). In the rust edition, text is not its bytes (F0.6: a `&str` where a `&[u8]` goes is E0308), and the translator writes `b".."` or `.as_bytes()` where bytes are declared; a generic iterator's item is its bound's region, not a borrow of the iterator (D4.6 f); `AsRef` for `&T` with T = `str` no longer calls itself (a stack overflow at run time) nor gives a false outlives (Z9.1c); a borrowed array or tuple literal takes the expected type (F18.4). std2 is lexed by its units from an index made when it is embedded (Z5.2): a rust hello world's check is 1.82x MVS's (2.03x), and the 2.0x ceiling is enforced. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
 
 The front (fl10274):
 
@@ -189,7 +259,7 @@ The front (front275):
   A build reads the index and lexes only the units it reaches, about
   half of std2's text. The tokens it keeps are the same as from lexing
   the whole text (tests/std2/units.sh).
-  - A rust hello world's build is 1.78x MVS's, down from 2.08x. The 2.0x
+  - A rust hello world's build is 1.82x MVS's at the gate, down from 2.08x. The 2.0x
     ceiling in tests/compile_cost.sh is now enforced.
   - The commit hook and the merge driver remake the index, like the rest
     of stdsrc_rust.vl. It adds about 150 KB to that file and 0.5% to the
@@ -226,9 +296,6 @@ The translator (g3274):
   the same programs now agree on 522 of 559. A literal that is a
   static's or a constant's `[u8]` value, or an `if` branch beside
   declared bytes, is `b".."`.
-- Gate 3 so far: 121 errors (117 type error, 2 edition.lenient, 1
-  distinct.mix, 1 item.private); borrowck (partial), with front275's
-  D2.4a: 161.
 
 The borrow checker (bc275):
 

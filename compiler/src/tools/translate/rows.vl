@@ -16,7 +16,8 @@ use crate::front::lexer::Tok;
 use crate::front::types::{TyKind, buf_type};
 use crate::tools::edit::edit_replace;
 use crate::tools::translate::{
-    TC_STD, TL_ROW, Tr, editable, is_ref, left, own_node, parent_of, token_at, word_here,
+    D_MUT, TC_STD, TL_ROW, Tr, editable, enclosing_fn, is_ref, left, own_node, parent_of, token_at,
+    word_here,
 };
 
 // ---- The text so far ----
@@ -137,7 +138,7 @@ fn base_name(n: [u8]) -> [u8] {
 
 // Type argument i of type t (a struct's or an enum's instance; a slice's
 // element for 0), or 0.
-fn type_arg(t0: i64, i: i64, pcx: Ctx<Comp>) -> i64 {
+pub fn type_arg(t0: i64, i: i64, pcx: Ctx<Comp>) -> i64 {
     var t = t0;
     if t > 0 && pcx.types[t].kind == TyKind::Ptr {
         t = pcx.types[t].a;
@@ -321,20 +322,49 @@ fn allocator_type(t0: i64, pcx: Ctx<Comp>) -> bool {
     o == "Gpa" || o == "Arena" || o == "ScopedArena" || o == "FixedBuf" || o == "AnyAlloc"
 }
 
+// (0.27.5) The last segment of the module of call c's function, std's
+// (`fs` of std::fs), or "".
+fn callee_module(c: i64, pcx: Ctx<Comp>) -> [u8] {
+    let f = pcx.nodes[c].x - 1;
+    if f < 0 || f >= pcx.fns.len() as i64 {
+        return "";
+    }
+    let g = if pcx.fns[f].tmpl > 0 { pcx.fns[f].tmpl - 1 } else { f };
+    let m = pcx.fns[g].module;
+    if m < 0 || m >= pcx.modules.len() as i64 {
+        return "";
+    }
+    let k = sym_text(pcx.modules[m].key, pcx);
+    var i = k.len;
+    while i > 0 && k[i - 1] != ':' {
+        i -= 1;
+    }
+    k[i..k.len]
+}
+
 // The row of call c (its index in Tr.rows, a multiple of 4), or -1; with
 // the call's parts.
 fn find_row(name: [u8], owner: [u8], trait_name: [u8], free: bool, c: i64, rt: i64, a1: i64,
     tr: Tr, pcx: inout Ctx<Comp>) -> i64 {
-    for w in 0..4 {
+    for w in 0..5 {
         // (the owner's row, the trait's, Iterator's for a method of an
-        // adapter, a free function's)
+        // adapter, a free function's by its module, `fs::copy` (0.27.5: not
+        // io::copy), a free function's)
         let o = if w == 0 { owner } else if w == 1 { trait_name } else if w == 2 { "Iterator" }
             else { "" };
-        if w < 3 && o.len == 0 || w == 3 && !free || w == 2 && (free || trait_name.len > 0) {
+        if w < 3 && o.len == 0 || w >= 3 && !free || w == 2 && (free || trait_name.len > 0) {
             continue;
         }
         let want = buf_new();
-        if o.len > 0 {
+        if w == 3 {
+            // (the module's name is copied: no view of pcx is kept)
+            let m = callee_module(c, pcx);
+            if m.len == 0 {
+                continue;
+            }
+            buf_bytes(want, m);
+            buf_bytes(want, "::");
+        } else if o.len > 0 {
             buf_bytes(want, o);
             buf_bytes(want, "::");
         }
@@ -410,10 +440,27 @@ fn inline_closure(k: i64, t: [u8], open: usize, out: i64, pcx: Ctx<Comp>) -> i64
     (q + 1) as i64
 }
 
+// (0.27.5) Whether the program has `impl Allocator for S` of struct name
+// sym s (by the impl's written names).
+fn allocator_struct(s: i64, pcx: Ctx<Comp>) -> bool {
+    let name = sym_text(s, pcx);
+    for n in 1..pcx.nodes.len() as i64 {
+        let t = pcx.nodes[n].a;
+        let b = pcx.nodes[n].b;
+        if pcx.nodes[n].kind == NodeKind::Impl && t > 0 && b > 0
+            && SRC[pcx.nodes[t].start..pcx.nodes[t].end] == "Allocator"
+            && SRC[pcx.nodes[b].start..pcx.nodes[b].end] == name {
+            return true;
+        }
+    }
+    false
+}
+
 // The allocator in scope at call c, for a row's `$a` when the call has
 // none (MVS's `thread::spawn(f)` allocated from C): the `Gpa` parameter
 // of the innermost function around it that has one, by position (main's
-// is not in its list once checked), or "".
+// is not in its list once checked), or an allocator the function makes
+// before it, or "".
 fn scope_allocator(c: i64, pcx: Ctx<Comp>) -> [u8] {
     let pos = pcx.nodes[c].start;
     var outer = SRC.len() as i64;
@@ -433,14 +480,52 @@ fn scope_allocator(c: i64, pcx: Ctx<Comp>) -> [u8] {
             best = p;
         }
     }
-    if best > 0 { sym_text(pcx.nodes[best].a, pcx) } else { "" }
+    if best > 0 {
+        return sym_text(pcx.nodes[best].a, pcx);
+    }
+    // (0.27.5) else an allocator the function makes before the call, a
+    // literal of a struct of the program's that implements Allocator:
+    // `Vec::new_in(Comp {})` and then MVS's `Command::new(p)`, std's Gpa
+    // (front/modules/std2lazy.vl's rerun_eager, which has no gpa)
+    for s in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[s].kind == NodeKind::StructLit && pcx.nodes[s].start >= outer
+            && pcx.nodes[s].end <= pos && pcx.nodes[s].count == 0
+            && allocator_struct(pcx.nodes[s].a, pcx) {
+            return SRC[pcx.nodes[s].start..pcx.nodes[s].end];
+        }
+    }
+    ""
+}
+
+// (0.27.5) Whether n names a parameter the rust edition takes `&mut T`
+// (D_MUT), through the checker's access to it: `&mut $r` of such a
+// receiver is `&mut *out` (a reborrow), not `&mut out`, a borrow of the
+// reference.
+fn mut_param(n: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
+    var x = n;
+    while x > 0 && pcx.nodes[x].kind == NodeKind::Unary && pcx.nodes[x].b > 0
+        && (pcx.nodes[x].op == Tok::Star && SRC[pcx.nodes[x].start] != '*'
+            || pcx.nodes[x].op == Tok::Amp && SRC[pcx.nodes[x].start] != '&') {
+        x = pcx.nodes[x].b;
+    }
+    if x <= 0 || pcx.nodes[x].kind != NodeKind::Ident {
+        return false;
+    }
+    let f = enclosing_fn(pcx.nodes[x].start, pcx);
+    for i in 0..if f > 0 { pcx.nodes[f].count } else { 0 } {
+        let p = child(f, i, pcx);
+        if p > 0 && pcx.nodes[p].kind == NodeKind::Param && pcx.nodes[p].a == pcx.nodes[x].a {
+            return tr.decided.get(p + 1) == D_MUT;
+        }
+    }
+    false
 }
 
 // The text of a row's rust column t with the call's operands: recv the
 // receiver's (-1: none), args the arguments' nodes (the receiver not among
 // them), alloc the allocator's index in args (-1: none: `$a` is the
 // allocator in scope). Empty when an operand it names is missing.
-fn expand(t: [u8], c: i64, recv: i64, args: IntVec, alloc: i64, out: i64, pcx: Ctx<Comp>) -> bool {
+fn expand(t: [u8], c: i64, recv: i64, args: IntVec, alloc: i64, out: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
     var trailing = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     var in_str = false;
     var i: usize = 0;
@@ -514,6 +599,10 @@ fn expand(t: [u8], c: i64, recv: i64, args: IntVec, alloc: i64, out: i64, pcx: C
                     i += 2;
                     continue;
                 }
+                if !in_str && o.len >= 5 && o[o.len - 5..o.len] == "&mut "
+                    && mut_param(node, tr, pcx) {
+                    buf_byte(out, '*');
+                }
                 if in_str {
                     trailing.push(node);
                 } else if nx == '1' && pcx.nodes[node].kind == NodeKind::Interp
@@ -580,7 +669,8 @@ fn written_call(c: i64, callee: i64, method: bool, name: [u8], pcx: Ctx<Comp>) -
 }
 
 // Call c, rewritten by its row.
-fn edit_call(c: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+fn edit_call(c: i64, decls: crate::tools::translate::body::TextDecls, tr: inout Tr,
+    pcx: inout Ctx<Comp>) {
     let f = pcx.nodes[c].x - 1;
     if f < 0 || f >= pcx.fns.len() as i64 {
         return;
@@ -653,7 +743,15 @@ fn edit_call(c: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     }
     let rt = if recv > 0 { pcx.nodes[recv].ty } else { 0 };
     let a1 = if args.count > 0 { args.get(0) } else { 0 };
-    let r = find_row(name, owner, trait_name, free, c, rt, a1, tr, &pcx);
+    var r = find_row(name, owner, trait_name, free, c, rt, a1, tr, &pcx);
+    // (0.27.5) a receiver declared `str`, whose checker type is the erased
+    // `[u8]`, or a text literal: str's row (`line.split(' ')`, a byte
+    // pattern a char one)
+    if r < 0 && owner == "[T]"
+        && (pcx.nodes[recv].kind == NodeKind::Str && SRC[pcx.nodes[recv].start] == '"'
+            || crate::tools::translate::body::declared_text(recv, 0, decls, pcx)) {
+        r = find_row(name, "str", trait_name, free, c, rt, a1, tr, &pcx);
+    }
     if r < 0 {
         return;
     }
@@ -695,11 +793,18 @@ fn edit_call(c: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
             format_text(args.get(0), c, -1, out, pcx);
         }
         buf_bytes(out, ")?");
-    } else if !expand(rust, c, recv, args, alloc, out, pcx) {
+    } else if !expand(rust, c, recv, args, alloc, out, tr, pcx) {
         row_left(c, r, &tr, &pcx);
         return;
     }
-    put_call(pcx.nodes[c].start, pcx.nodes[c].end, buf_slice(out), &tr, &pcx);
+    let text = char_casts_dropped(buf_slice(out));
+    // (a row whose cast of a char literal went, and so leaves the call as
+    // written, `s.split('|')`: no edit)
+    if text.len != buf_slice(out).len
+        && text == SRC[pcx.nodes[c].start as usize..pcx.nodes[c].end as usize] {
+        return;
+    }
+    put_call(pcx.nodes[c].start, pcx.nodes[c].end, text, &tr, &pcx);
 }
 
 // Call c left to hand by row r: its MVS item, its rust form, its note.
@@ -732,6 +837,36 @@ fn put_call(a: i64, b: i64, text: [u8], tr: inout Tr, pcx: inout Ctx<Comp>) {
     }
 }
 
+// (0.27.5) A row's text with `'c' as char` written `'c'`: a byte row's
+// cast of a literal that is already a char (a text program keeps `'|'`
+// a char, or a receiver read as str: `s.split('|' as char)`); a byte
+// literal's, `b'|' as char`, stays.
+fn char_casts_dropped(t: [u8]) -> [u8] {
+    let out = buf_new();
+    var i: usize = 0;
+    var changed = false;
+    while i < t.len {
+        if t[i] == '\''
+            && (i == 0 || t[i - 1] != 'b' && !crate::tools::translate::ident_char(t[i - 1])) {
+            // (the literal's end: `'c'` or `'\n'`)
+            var e = i + 1;
+            if e < t.len && t[e] == '\\' {
+                e += 1;
+            }
+            e += 1;
+            if e < t.len && t[e] == '\'' && e + 9 <= t.len && t[e + 1..e + 9] == " as char" {
+                buf_bytes(out, t[i..e + 1]);
+                i = e + 9;
+                changed = true;
+                continue;
+            }
+        }
+        buf_byte(out, t[i]);
+        i += 1;
+    }
+    if changed { buf_slice(out) } else { t }
+}
+
 // The capitalized names a row's text brings at position at (`Layout`,
 // `NonNull`) and the modules its paths start with (`mem::`): Tr.row_names, (symbol, position) pairs, for the imports
 // (paths.vl). A path's later segment or a method is not one.
@@ -757,6 +892,43 @@ pub fn note_row_names(at: i64, text: [u8], tr: inout Tr, pcx: inout Ctx<Comp>) {
         tr.row_names.push(at);
         i = j;
     }
+}
+
+// (0.27.5) Whether type node n names an MVS std type whose type row
+// writes a region, `'_` (`Command` to `Command<'_, $1>`, `Arg` to
+// `Arg<'_>`): an item with views, as a program's struct with a view is,
+// whose `'_` takes the region the signature gives the node (static_res).
+pub fn type_row_region(n: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
+    if n <= 0 || pcx.nodes[n].kind != NodeKind::TyName {
+        return false;
+    }
+    let s = pcx.nodes[n].start;
+    var ne = s;
+    while ne < pcx.nodes[n].end && SRC[ne] != '<' {
+        ne += 1;
+    }
+    var q = ne;
+    while q > s && (crate::tools::translate::ident_char(SRC[q - 1])) {
+        q -= 1;
+    }
+    if q == ne {
+        return false;
+    }
+    let name = SRC[q..ne];
+    var i: i64 = 0;
+    while i + 3 < tr.rows.count {
+        let t = buf_slice(tr.rows.get(i + 2));
+        if t.len > 5 && t[0..5] == "type " && buf_slice(tr.rows.get(i)) == name {
+            for k in 5..t.len {
+                if k + 1 < t.len && t[k] == '\'' && t[k + 1] == '_' {
+                    return true;
+                }
+            }
+            return false;
+        }
+        i += 4;
+    }
+    false
 }
 
 // (0.27.4) The type rows (rewrite.tsv's `type ..`): an MVS std type's name
@@ -839,6 +1011,24 @@ pub fn type_row_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
                 t = buf_slice(w);
             }
         }
+        // (0.27.5) its `'_` the region the signature gave the node: a
+        // result's `'static` with no parameter to borrow from, or the
+        // function's `'a` (sig.vl's mark_region, name_region)
+        let region = tr.static_res.get(n + 1);
+        if region == 1 || region == 2 {
+            let w = buf_new();
+            var k: usize = 0;
+            while k < t.len {
+                if k + 1 < t.len && t[k] == '\'' && t[k + 1] == '_' {
+                    buf_bytes(w, if region == 1 { "'static" } else { "'a" });
+                    k += 2;
+                } else {
+                    buf_byte(w, t[k]);
+                    k += 1;
+                }
+            }
+            t = buf_slice(w);
+        }
         // (the row's text cut at its `$k`s: pieces[k] before `$k+1`)
         var cuts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var ok = true;
@@ -903,8 +1093,9 @@ pub fn row_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
         spans.push(pcx.nodes[n].end - pcx.nodes[n].start);
     }
     sort_by_key(&calls, &spans);
+    let decls = crate::tools::translate::body::text_decls(tr, &pcx);
     for i in 0..calls.count {
-        edit_call(calls.get(i), &tr, &pcx);
+        edit_call(calls.get(i), decls, &tr, &pcx);
     }
 }
 
