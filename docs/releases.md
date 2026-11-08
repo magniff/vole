@@ -203,6 +203,13 @@ The front (fl10274):
   arena: Arena::new_in(gpa) }` is `Cx<Arena<Gpa>>`. 0.27.5 bound `W` to
   the `_in` call's allocator argument, the rule for a field `Vec<T, W>`,
   and gave "expected 'Gpa', got 'Arena<Gpa>'" (gate 3's main.vl:204).
+- A `_` for a bounded parameter is inferred, as rustc infers it
+  (front-rust.md F18.6 g): `Vec::<u8, _>::new_in(gpa)`, `let v: Vec<u8,
+  _> = Vec::new_in(gpa)`, and the same as a struct literal's field. The
+  bound is checked once the `_` is solved. 0.27.5 checked it on the `_`
+  itself ("the trait 'Allocator' is not implemented for '_'"), and the
+  translator's `Buf::new_in` row writes that form.
+- `HashMap<&[u8], V>` checks: std2's `[T]` hash calls `T::hash_slice`.
 
 ### What's new in 0.27.5
 
