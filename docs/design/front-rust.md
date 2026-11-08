@@ -1188,9 +1188,13 @@ borrow exclusively (`&mut n`, `&mut [1, 2, 3][..]`, `&mut a[..]`). The
 check_expr and coerce_ref), is MVS's alone. 0.27.5 accepted all three.
 Cases: rust_f_f18_shared_for_mut_err, and tests/borrowck-try's mut_ref_arg,
 mut_slice_literal and mut_slice_place, whose try: lines are run.
-Not yet the same slicing as a `let`'s whole initializer, `let s: &[i64]
-= &[1, 2, 3][1..];`, which F18.4's hoisting takes first (the fallback,
-`i32`: a type error). *Anchor:* `check_mode.vl: check_expr_inner`.
+(0.27.6) The same slicing as a `let`'s whole initializer with a slice
+annotation, `let s: &[i64] = &[1, 2, 3][1..];`, hoists the array, not
+the slice: `let t: [i64; 3] = [1, 2, 3]; let s: &[i64] = &t[1..];`, so
+its literals take the annotation's element type (0.27.5 hoisted the
+slice, typed by the fallback `i32`: a type error). *Anchor:*
+`check_mode.vl: check_expr_inner`, `temps.vl: annotate_temp`. *Cases:*
+`rust_f_f18_let_sliced_literal`.
 
 **F18.5 (integer inference variables: an open local).** In the rust
 edition an unannotated `let x = e;` binding one name, with `e` a literal
