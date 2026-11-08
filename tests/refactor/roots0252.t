@@ -16,6 +16,7 @@ $ query items alpha/util.vl
 6	fn	pub fn sum3(a: i64, b: i64, c: i64) -> i64
 $ query items --root beta
 crate	beta/main.vl	2
+std	<std>	87
 $ check alpha/util.vl
 ok: 0 errors in alpha/main.vl
 ## A NAME one program defines: answered from it, with a note.
