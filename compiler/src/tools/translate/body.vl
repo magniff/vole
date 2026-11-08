@@ -556,8 +556,18 @@ fn if_branch_place(b: i64, pcx: Ctx<Comp>) -> i64 {
 // reference (D_REF: a let parameter of a type MVS does not copy) is
 // written `&e`, unless it is one already.
 fn edit_call_args(c: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    // (0.28.0: a call of a local, a closure or a function value, `f(x)`
+    // of an `f: F` or an `f: fn(..)`)
+    let callee = if pcx.nodes[c].kind == NodeKind::Call { pcx.nodes[c].a } else { 0 };
+    let value = callee > 0 && pcx.nodes[callee].kind == NodeKind::Ident
+        && pcx.nodes[callee].res != crate::front::check::Res::Fn
+        && (pcx.nodes[callee].res == crate::front::check::Res::Local
+            || callee_fn_type(c, tr, pcx) > 0);
     var f = pcx.nodes[c].x - 1;
     if f < 0 || f >= pcx.fns.len() as i64 {
+        if value {
+            value_call_args(c, &tr, &pcx);
+        }
         return;
     }
     if pcx.fns[f].tmpl > 0 {
@@ -565,11 +575,19 @@ fn edit_call_args(c: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     }
     let fnode = pcx.fns[f].node;
     if fnode <= 0 || !editable(pcx.nodes[fnode].start, &pcx) {
+        if value {
+            value_call_args(c, &tr, &pcx);
+        }
         return;
     }
+    // (0.28.0: a closure's call, of the function the checker made of it,
+    // whose body is the closure's: the closure's parameters)
+    let body = pcx.nodes[fnode].c;
+    let up = if body > 0 { parent_of(body, tr) } else { 0 };
+    let owner = if up > 0 && pcx.nodes[up].kind == NodeKind::Closure { up } else { fnode };
     var params = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    for j in 0..pcx.nodes[fnode].count {
-        let p = child(fnode, j, pcx);
+    for j in 0..pcx.nodes[owner].count {
+        let p = child(owner, j, pcx);
         if pcx.nodes[p].kind == NodeKind::Param {
             params.push(p);
         }
@@ -582,37 +600,133 @@ fn edit_call_args(c: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
         if pcx.nodes[arg].kind == NodeKind::NamedArg {
             arg = pcx.nodes[arg].b;
         }
-        if arg <= 0 || tr.decided.get(params.get(i) + 1) != D_REF {
+        // (a closure's parameter written `let T`: `&T`, sig.vl's types)
+        let p = params.get(i);
+        let by_ref = if owner != fnode {
+            pcx.nodes[p].b > 0 && word_here(pcx.nodes[pcx.nodes[p].b].start, "let")
+        } else { tr.decided.get(p + 1) == D_REF };
+        if arg <= 0 || !by_ref {
             continue;
         }
-        // (a method's receiver: Rust borrows it itself; an argument the
-        // checker made, a contract's check's, at the call)
-        if pcx.nodes[arg].start <= pcx.nodes[c].start || pcx.nodes[arg].end > pcx.nodes[c].end {
-            continue;
-        }
-        // (the checker's borrow: what it borrows)
-        var e = arg;
-        if pcx.nodes[e].kind == NodeKind::Unary && pcx.nodes[e].op == Tok::Amp
-            && SRC[pcx.nodes[e].start] != '&' {
-            e = pcx.nodes[e].b;
-        }
-        if e <= 0 || access_to_ref(e, tr, pcx) || pcx.nodes[e].kind == NodeKind::Closure
-            || is_ref(pcx.nodes[e].ty, pcx) && SRC[pcx.nodes[e].start] == '&'
-            || token_at(pcx.nodes[arg].start, pcx) < 0 {
-            continue;
-        }
-        // (an `if` of two places, `if c { bck.dlive } else { bck.live }`:
-        // each branch borrowed, `&if ..` would move out of them)
-        if pcx.nodes[e].kind == NodeKind::If && if_branch_place(pcx.nodes[e].b, pcx) > 0
-            && if_branch_place(pcx.nodes[e].c, pcx) > 0 {
-            let x = if_branch_place(pcx.nodes[e].b, pcx);
-            let y = if_branch_place(pcx.nodes[e].c, pcx);
-            put(pcx.nodes[x].start, pcx.nodes[x].start, "&", TC_BORROW, &tr, &pcx);
-            put(pcx.nodes[y].start, pcx.nodes[y].start, "&", TC_BORROW, &tr, &pcx);
-            continue;
-        }
-        put(pcx.nodes[arg].start, pcx.nodes[arg].start, "&", TC_BORROW, &tr, &pcx);
+        borrow_arg(c, arg, &tr, &pcx);
     }
+}
+
+// (0.28.0) The arguments of a call of a function value, a parameter typed
+// `fn(let T)` or a generic `F: Fn(let T)` (no function of the program the
+// checker names): one the type writes `let T` (`&T` in the translation) is
+// borrowed as a function's is, `f(1)` -> `f(&1)`; so is one the checker
+// borrows.
+fn value_call_args(c: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let ft = callee_fn_type(c, tr, pcx);
+    for i in 0..pcx.nodes[c].count {
+        var arg = child(c, i, pcx);
+        if arg > 0 && pcx.nodes[arg].kind == NodeKind::NamedArg {
+            arg = pcx.nodes[arg].b;
+        }
+        let q = if ft > 0 && i < pcx.nodes[ft].count { child(ft, i, pcx) } else { 0 };
+        if arg > 0
+            && (q > 0 && (word_here(pcx.nodes[q].start, "let") || let_before(pcx.nodes[q].start))
+                || pcx.nodes[arg].kind == NodeKind::Unary && pcx.nodes[arg].op == Tok::Amp
+                && SRC[pcx.nodes[arg].start] != '&' && pcx.nodes[arg].b > 0) {
+            borrow_arg(c, arg, &tr, &pcx);
+        }
+    }
+}
+
+// Whether the word before position s is `let` (a fn type's parameter
+// `let T`, whose node starts at T).
+fn let_before(s: i64) -> bool {
+    var q = s - 1;
+    while q > 0 && is_ws(SRC[q]) {
+        q -= 1;
+    }
+    word_back(q, "let")
+}
+
+// (0.28.0) The fn type written for call c's callee, a parameter of the
+// function around it: `f: fn(let T) -> U`, or `f: F` with `F: Fn(let T)` in
+// its generics; 0 when none is.
+fn callee_fn_type(c: i64, tr: Tr, pcx: Ctx<Comp>) -> i64 {
+    let callee = pcx.nodes[c].a;
+    if callee <= 0 || pcx.nodes[callee].kind != NodeKind::Ident {
+        return 0;
+    }
+    // (the function the call is written in, by its parents: an instance
+    // the checker made of a generic one has no generics)
+    var f = parent_of(c, tr);
+    while f > 0 && pcx.nodes[f].kind != NodeKind::Fn {
+        f = parent_of(f, tr);
+    }
+    if f <= 0 {
+        return 0;
+    }
+    for j in 0..pcx.nodes[f].count {
+        let p = child(f, j, pcx);
+        if pcx.nodes[p].kind != NodeKind::Param || pcx.nodes[p].a != pcx.nodes[callee].a {
+            continue;
+        }
+        let tn = pcx.nodes[p].b;
+        if tn <= 0 {
+            return 0;
+        }
+        if pcx.nodes[tn].kind == NodeKind::TyFn {
+            return tn;
+        }
+        let g = pcx.nodes[f].g;
+        if pcx.nodes[tn].kind != NodeKind::TyName || g <= 0
+            || pcx.nodes[g].kind != NodeKind::Generics {
+            return 0;
+        }
+        for i in 0..pcx.nodes[g].count {
+            let tp = child(g, i, pcx);
+            let h = pcx.nodes[tp].h;
+            if pcx.nodes[tp].a != pcx.nodes[tn].a || h <= 0
+                || pcx.nodes[h].kind != NodeKind::Generics {
+                continue;
+            }
+            for k in 0..pcx.nodes[h].count {
+                let b = child(h, k, pcx);
+                if pcx.nodes[b].kind == NodeKind::TyFn {
+                    return b;
+                }
+            }
+        }
+        return 0;
+    }
+    0
+}
+
+// Argument arg of call c, to a `&T` parameter: written `&arg`, unless it is
+// a reference already.
+fn borrow_arg(c: i64, arg: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    // (a method's receiver: Rust borrows it itself; an argument the
+    // checker made, a contract's check's, at the call)
+    if pcx.nodes[arg].start <= pcx.nodes[c].start || pcx.nodes[arg].end > pcx.nodes[c].end {
+        return;
+    }
+    // (the checker's borrow: what it borrows)
+    var e = arg;
+    if pcx.nodes[e].kind == NodeKind::Unary && pcx.nodes[e].op == Tok::Amp
+        && SRC[pcx.nodes[e].start] != '&' {
+        e = pcx.nodes[e].b;
+    }
+    if e <= 0 || access_to_ref(e, tr, pcx) || pcx.nodes[e].kind == NodeKind::Closure
+        || is_ref(pcx.nodes[e].ty, pcx) && SRC[pcx.nodes[e].start] == '&'
+        || token_at(pcx.nodes[arg].start, pcx) < 0 {
+        return;
+    }
+    // (an `if` of two places, `if c { bck.dlive } else { bck.live }`:
+    // each branch borrowed, `&if ..` would move out of them)
+    if pcx.nodes[e].kind == NodeKind::If && if_branch_place(pcx.nodes[e].b, pcx) > 0
+        && if_branch_place(pcx.nodes[e].c, pcx) > 0 {
+        let x = if_branch_place(pcx.nodes[e].b, pcx);
+        let y = if_branch_place(pcx.nodes[e].c, pcx);
+        put(pcx.nodes[x].start, pcx.nodes[x].start, "&", TC_BORROW, &tr, &pcx);
+        put(pcx.nodes[y].start, pcx.nodes[y].start, "&", TC_BORROW, &tr, &pcx);
+        return;
+    }
+    put(pcx.nodes[arg].start, pcx.nodes[arg].start, "&", TC_BORROW, &tr, &pcx);
 }
 
 // The checker's access to a reference r, used as its value: `*r` where
