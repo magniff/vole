@@ -87,6 +87,51 @@ binary is invoked, where its test runner is and which hosts it supports.
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.27.6
+
+The translator (g3274):
+
+- std2's fs, process and env by rewrite.tsv's rows: `fs::exists`,
+  `fs::append`, `fs::copy`, `Metadata::modified`, `DirEntry::is_*`,
+  `Command::new` to `Command::new_in($1, $a)` (`$a`, when the function
+  has no Gpa, a program allocator it makes before the call), `process::id`
+  and `Child::id` as i32, `env::get_in` to `var_in`. A free function's
+  row may name its module (`fs::copy`, not io::copy). Bytes given as a
+  path, a program or an argument are `str::from_utf8(p).unwrap()`.
+- A result's `'a` by flow: with MVS's view summary, only on the
+  parameters the result's views come from, and on an item's region for
+  an item with views taken by reference (`leaf: &Leaf<'a, Gpa>`), so a
+  temporary given to another parameter need not outlive the result
+  (cli/tree.vl's two borrowck.return_local).
+- Gate 3: 127 (at std2's process) to 17 errors; 12 wait for std2's cli,
+  2 for std::gpu, 1 for std::num; borrowck (partial) 142 to 139.
+- A Vec's element assigned with an index that reads the Vec, or what
+  holds it (`pcx.files[pcx.files.len() - 1].module = m`,
+  `pcx.nodes[child(own, i, pcx)].a = ..`), is `{ let at_ix = I;
+  pcx.files[at_ix].module = m }`: Rust's IndexMut borrows the Vec before
+  the index is read (rustc E0502). A pass after the others, so the index
+  moves with its edits.
+- std::cli's type rows' `'_` (`Command<'_, $1>`, `Arg<'_>`) take the
+  region the signature gives them: `build_command(gpa) -> Command<'static,
+  Gpa>`, `flag<'a>(name: &'a str, help: &'a str) -> Arg<'a>`; such a type
+  is an item with views for elision and for the flow rule (a reference to
+  one gets the item's region). A container of views by value
+  (`errs: Vec<Ev<'_>, Gpa>`) takes the function's `'a` too.
+- An inout slice parameter given an array or a part of one, whose `&` the
+  checker takes into its view, is `&mut` (`first(&mut a)`,
+  `first(&mut [1i64, 2, 3][..])`; rustc E0308 otherwise).
+- A function whose body only calls one with a `'static` result
+  (static_result's list) has a `'static` result too: the forwarders
+  `fn sym_text(sym, pcx) -> [u8] { crate::base::sym_text(sym, pcx) }` of
+  tools/refactor_shape, guide/stdapi and front/own/infer.
+- A guarded match on a copy value read from a place matches the value,
+  `match { pcx.nodes[n].kind } { .. }`: Rust keeps the scrutinee's place
+  borrowed through the guards (rustc E0502 against a guard's `&mut`).
+- Gate 3, with std2's cli: 14 type errors, none of them the translator's;
+  borrowck (partial) 152 to 96. A borrowck case for the class it leaves,
+  a `&mut` coerced to a raw pointer held through the call:
+  `rust_b_raw_coerce_ends_borrow` (XFAIL).
+
 ### What's new in 0.27.5
 
 Gate 3 at 37. std2 has the modules compiler/src uses: `std::time`, `std::fs`, `std::process` and `std::cli`, Rust-shaped, with the translator's rows bending MVS's calls onto them. `fix --edition rust` on a copy of compiler/src now leaves 37 errors (122 in 0.27.4), and `check --borrowck-partial` counts 154 borrowck errors behind them (3,048 in 0.27.4): a rust body reads each operand where it is evaluated (D2.4a), and borrowed literals are promoted (D2.8). In the rust edition, text is not its bytes (F0.6: a `&str` where a `&[u8]` goes is E0308), and the translator writes `b".."` or `.as_bytes()` where bytes are declared; a generic iterator's item is its bound's region, not a borrow of the iterator (D4.6 f); `AsRef` for `&T` with T = `str` no longer calls itself (a stack overflow at run time) nor gives a false outlives (Z9.1c); a borrowed array or tuple literal takes the expected type (F18.4). std2 is lexed by its units from an index made when it is embedded (Z5.2): a rust hello world's check is 1.82x MVS's (2.03x), and the 2.0x ceiling is enforced. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
@@ -177,9 +222,6 @@ The translator (g3274):
   the same programs now agree on 522 of 559. A literal that is a
   static's or a constant's `[u8]` value, or an `if` branch beside
   declared bytes, is `b".."`.
-- Gate 3 so far: 121 errors (117 type error, 2 edition.lenient, 1
-  distinct.mix, 1 item.private); borrowck (partial), with front275's
-  D2.4a: 161.
 
 The borrow checker (bc275):
 
