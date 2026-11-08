@@ -24,7 +24,8 @@
 # &'static [u8]`, which holds: SRC is a view of base's region, which is
 # never moved, unmapped or written again where SRC has been given it
 # (docs/design/src-buffer.md), and the translator gives a function whose
-# every result is a part of SRC a `'static` result (sig.vl: static_src).
+# every result is static, a part of SRC among them, a `'static` result
+# (sig.vl: static_returns).
 #
 # Exits 1 only when the translator or the check could not run (a crash,
 # no output); errors left are the measurement, not a failure.

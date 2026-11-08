@@ -185,11 +185,14 @@ The sources (g3274, docs/design/src-buffer.md):
   TARGET_OS (`std::TARGET_OS` in the rust edition). Compile cost the
   same (check 8496.9 to 8464.6 M instructions), the stress-grow
   self-compile the same object, x86_64-macos's objcheck 4 of 4.
-- The translator's static_src: a function whose every returned value is
-  a part of base::SRC, a text literal, a part of a `let` bound to one or
-  a call of such a function has a `'static` result (`tok_text`,
-  `node_text`, `src(pcx)`, `file_bytes`, `src_text`, `flag_prefix`;
-  tests/refactor/edition0276c). Gate 3: 76 to 64.
+- The translator's static_returns: a function whose every returned
+  value is static has a `'static` result: a text literal, a call of a
+  function with a `'static` result (static_result's list, or one such
+  itself), a local each of whose `let`s is one, a range of one or of
+  base::SRC, an `if` or a block of them (`tok_text`, `node_text`,
+  `src(pcx)`, `file_bytes`, `src_text`, `flag_prefix`;
+  tests/refactor/edition0276c). It takes in static_forward (a body that
+  is one such call). Gate 3: 76 to 64.
 
 The front (front273):
 
