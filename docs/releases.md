@@ -223,6 +223,14 @@ The front (front273):
   now `borrowck.mut_twice`: gate 3's 27 nested `is_const(cx, ir_val(cx,
   ..))` calls, which the translator has to hoist), and rejected it with
   the two parameter types swapped, which rustc accepts.
+- A projection whose impl's value is a projection itself is normalized
+  again (D4.6 (g)). `type Item = I::Item;` of Skip is normalized again
+  through Skip's header, so `fn pass<J: Iterator>(it: &mut J) ->
+  Option<J::Item>` with `J = Skip<Split<char>>` gives Split's `&'a str`,
+  a borrow of the text. Two live `pass(&mut it)` items are no longer
+  borrowck.mut_twice. L14's ties read the same way, so a closure over
+  `Chain<..>::Item` (`a.iter().chain(b.iter()).map(|x| ..)`) is tied as
+  the callee is.
 - `Tr::f(x, ..)` of a trait function without a receiver takes Self from
   the argument whose parameter holds it (F8.2):
   `Hash::hash_slice(self, state)` in `impl<T: Hash> Hash for [T]` is
