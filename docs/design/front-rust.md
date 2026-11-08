@@ -1310,6 +1310,21 @@ require_bound, infer_from`, `check_mode.vl: check_expr_inner`,
 `assoc.vl: projection`, `resolve.vl: resolve_type` (the `_`),
 `try_op.vl: check_try`.
 
+**F18.7 (a field typed by its parameter takes the value's type;
+0.27.6).** A generic struct literal or enum variant whose one free
+parameter `A` is an allocator parameter binds it from an `_in` call's
+allocator argument (0.26.3: `Tokens { kinds: Vec::new_in(a) }` is
+`Tokens<typeof a>`, as the field is `Vec<u8, A>`). That rule is for a
+field that holds something *made in* the allocator. A field typed by
+the parameter itself (`struct Cx<W: Allocator> { arena: W }`) holds the
+value, so `W` is the value's own type, as rustc infers it: `Cx { arena:
+Arena::new_in(gpa) }` is `Cx<Arena<Gpa>>`, not `Cx<Gpa>`, which was an
+error in 0.27.5 ("expected 'Gpa', got 'Arena<Gpa>'"). The same holds
+for a variant's payload (`E::A(Arena::new_in(gpa))` with `A(W)`). The
+rule is in shared code, so MVS gets it too; what MVS compiled before is
+unchanged. *Anchor:* `generics/instantiate.vl: bind_allocator_arg`
+(its `p`, the place's type node). Case `rust_f_f18_alloc_field_ok`.
+
 ### F19 Small syntax
 
 **F19.1 (turbofish).** `f::<τ..>(..)`, `x.m::<τ..>(..)`, `S::<τ..>`,
