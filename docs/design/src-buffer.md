@@ -155,3 +155,59 @@ cleared and are rewritten (lsp/complete's `signature`, `result_text`,
 `file_line_text`; modules' `joined`; cache's `get_str`), arch's tables
 read through a raw pointer (`text`, `intr_text`), `cstr` views of paths
 (linkfail's `root_path`), and views of tcx's own vectors.
+
+## Views of other storage (0.27.7)
+
+Gate 3's borrow checker ties a view to the parameter it was read
+through. `buf_slice`, `sym_text`, `cstr` and `c_slice` translate as
+`-> &'static [u8]`. A function that wraps one of them and takes `&Ctx`
+or `&Tcx` has its `&[u8]` result elided onto that parameter, so the
+view borrows `pcx` or `tcx`, and the caller's next `&mut` conflicts
+with it. Each class below is fixed where it is made, in MVS, by one
+of two rules: a view that could change is consumed before the next
+write, and a view of storage that is never written again is made
+without the context.
+
+- **A scratch buffer is read where it is consumed.** `joined` writes
+  `a`, `sep` and `b` into `pcx.join_buf`, which it clears on every
+  call, so its view lasts only until the next call and is never
+  `'static`. It returns nothing. Its two consumers, `join_sym`'s
+  `intern` and `qualified_if_known`'s `find_sym`, read
+  `buf_slice(pcx.join_buf)` in their own call, so no view crosses a
+  `&mut pcx`.
+- **A path is a view of its own C string.** linkfail's `root_path`,
+  conflicts' `path_of` and query's `bad_item_kind` take the `*u8`
+  (a file's path, `--kind`'s argument), not `(f, pcx)` or `tcx`. A
+  function with no reference parameter translates with a `'static`
+  result, the convention `cstr` and `c_slice` keep. A file path and
+  argv are never freed or written (paths: `load_sources`, `add_source`
+  and the tools' cache's read buffer).
+- **A reader takes what it reads.** link_macho's `sym_name` only
+  reads the link, so it takes `l: Link`, not `inout`. That is `&Link`
+  in the translation, and `sym_name(&l, l.imports[i])` is two shared
+  reads, not rustc's E0503.
+
+- **A buffer written for the last time is frozen.** `buf_done(b)`
+  freezes buffer b and returns its slice; `buf_freeze(b)` freezes it
+  without the slice. A frozen buffer is never written again: its cap
+  word is stored as `-1 - cap`, so every one of base's writers
+  (`buf_byte`'s `len >= cap`, and `buf_bytes`, `buf_str` and
+  `buf_uint` through `buf_reserve`) reaches `buf_reserve`'s slow path,
+  and `buf_reserve` and `buf_clear` stop the compiler there with
+  `error: internal: buffer N written after buf_done froze it` and
+  exit status 1. The writers' fast path costs nothing more. The
+  slice is then valid for the rest of the process. Buffers are never
+  freed, BUFS ids are never reused (`BUF_COUNT` only grows, and only
+  `buf_new` assigns a slot), and a buffer's data moves only when it
+  grows, which is a write. The frozen buffers are each producer's own
+  fresh buffer (lsp/complete's `signature`, `call_snippet` and
+  `mod_detail`; embed's `embed_type_name` and `file_line_text`),
+  arch's table (`load_table` fills `table_buf` once) and the tools'
+  cache's read buffer (`restore`). None of them is one of the buffers
+  written directly, outside base (`BUFS[x].len = ..`: the code
+  generator's asm and code buffers, objfile's out, the scratches).
+  `volec __selftest freeze` writes to a frozen buffer and must stop
+  with that error (tests/selftest.sh).
+
+The translator's `'static` propagation, which reads `buf_done` as
+`SRC` is read, follows after SRC's representation is in.

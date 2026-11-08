@@ -98,6 +98,45 @@ The front (front277), from the 0.28 flip rehearsal:
 
 The translator: an integer method called on literals, `(1 << n).wrapping_sub(1)` or `(2 + 3).pow(2)`, gets its leftmost literal suffixed with MVS's `i64` (`1i64 << n`, T6). The receiver otherwise has no type in the rust edition, the error above. That error added two to gate 3 (compiler/src's `logical_imm` and the egraph's random constants); with this row, gate 3 is back at 0 type errors, and its borrowck count drops to 75, since the `static mut` change accepts `&mut *A_CTX`. Transcript `tests/refactor/edition0277t6`, case `rust_t_literal_receiver` (rustc builds it and prints the same).
 
+In progress. Gate 3's borrowck errors that view storage other than SRC
+are being fixed in MVS (docs/design/src-buffer.md, views of other
+storage): 76 to 67 so far. MVS programs compile exactly as before.
+Built and tested on aarch64-macos only.
+
+The front (front273):
+
+- A projection whose impl's value is a projection itself is normalized
+  again (D4.6 (g)). `type Item = I::Item;` of Skip is normalized again
+  through Skip's header, so `fn pass<J: Iterator>(it: &mut J) ->
+  Option<J::Item>` with `J = Skip<Split<char>>` gives Split's `&'a str`,
+  a borrow of the text. Two live `pass(&mut it)` items are no longer
+  borrowck.mut_twice. L14's ties read the same way, so a closure over
+  `Chain<..>::Item` (`a.iter().chain(b.iter()).map(|x| ..)`) is tied as
+  the callee is.
+- A template whose opaque instance has borrowck errors reports only
+  those, as rustc does (D4.4 (e)). Its concrete instances with regions
+  hold their errors until every body is solved. 0.27.6 also reported
+  `mixed<Split<char>>`'s copy of the template's `'b must outlive 'a`,
+  at the `let`, in terms of Split's lifetime.
+- std2's `[T]` hash calls `Hash::hash_slice(self, state)`, as Rust's
+  does, with Self taken from the argument (F8.2): an element type's own
+  hash_slice runs. 0.27.6 called `T::hash_slice`.
+
+The compiler's own source (gate 3, front273):
+
+- Views of storage other than SRC are made so that no view outlives a
+  write it could see. modules' `joined` is read where it is consumed;
+  linkfail's `root_path`, conflicts' `path_of` and query's
+  `bad_item_kind` view their C strings, not pcx or tcx; link_macho's
+  `sym_name` only reads the link. Gate 3: 76 to 67 borrowck errors.
+- A buffer written for the last time is frozen (`buf_done`,
+  `buf_freeze`): base's writers stop with an internal error if it is
+  written again, so its bytes are valid for the process.
+  lsp/complete's signatures and snippets, embed's type names and
+  positions, arch's intrinsic table and the tools' cache's read buffer
+  are frozen. `volec __selftest freeze` checks the stop
+  (tests/selftest.sh).
+
 ### What's new in 0.27.6
 
 Gate 3 has no type errors. `fix --edition rust` on a copy of compiler/src now type-checks: std2 has `std::gpu::wgsl`, the WGSL front compiler/src uses (translated by `fix --edition rust`, finished by hand, the same answers as MVS's front on every .wgsl in the tree), behind a gate that keeps it out of a program that does not name `gpu`; the translator's last type-error shapes are done (eight found by the wgsl port). What is left is borrowck: 76 errors (154 behind 37 type errors in 0.27.5), after nested calls on one `&mut` root are hoisted (rustc's E0499, which 0.27.5 missed). In the rust edition: a method call in a generic body takes the method the body names, as rustc does (Z9.1c); `const fn`, and constants of any type made at each use; a constant's initializer is checked in its own scope (0.27.5 could call a local of the use's scope instead: wrong output); octal literals, `let ref`, tuple branches typed together; `&e` stays shared where `&mut` goes (rustc's E0308); a `&mut` given to a raw pointer ends its borrow. A generic function with a local `Vec<T, A>` links at -O0 and -O1 again (0.27.4 and 0.27.5 failed). A rust hello world's check is 1.88x MVS's (1.82x). MVS programs compile exactly as before. Built and tested on aarch64-macos only.
