@@ -11,14 +11,14 @@
 
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
-use crate::front::types::TyKind;
+use crate::front::types::{REF_MUT, TyKind};
 use crate::places::borrowck::{Bck, LOAN_WORDS, MODE_MUT, MODE_RAW, MODE_SHARED, bit_on};
 use crate::places::borrowck::constraints::mode_of;
 use crate::places::borrowck::diag::report;
 use crate::places::cfg::{pred, pred_count};
 use crate::places::ir::{
     BK_FAKE, BK_MUT, BK_MUT2, BK_RAW, BK_RAW_MUT, BK_SHARED, Body, DS_REMOVED, LF_PARAM, LF_STATIC,
-    OK_COPY, OK_INT, OK_MOVE, PJ_CONST, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT,
+    OK_COPY, OK_INT, OK_MOVE, PJ_CONST, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT, RV_CAST,
     RV_DISCR, RV_LEN, RV_REF, RV_SLICE, RV_USE, SK_ASSERT, SK_ASSIGN, SK_CALL, SK_DEAD, SK_DROP,
     SK_INTRINSIC, SK_LIVE, SK_MENTION, TK_RETURN, TK_SWITCH, block_count, block_start, block_term,
     has_flag, local_ty, op_a, op_b, op_kind, proj_kind, proj_parent, proj_val, step_type,
@@ -363,6 +363,28 @@ fn kills(loc: i64, bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>
     }
 }
 
+// RULE: D3.6 (0.27.7) Whether `(a, b) = use ops[0]` (or `cast`) makes a
+// `&mut` place a raw pointer the checker made a written `*mut` of: a
+// `&mut [T]` coerced or cast to `*mut [T]` (the cast is its operand,
+// Z9.3), a `&mut T` cast to `*mut T` (places::build::raw_mut_goal of the
+// statement's node; a `&mut T` coerced is build's `&raw mut` already).
+fn raw_mut_write(a: i64, b: i64, ops: i64, node: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>)
+    -> bool {
+    if a < 0 || node <= 0 || !crate::places::ir::op_is_place(op_kind(ops, 0, pbody)) {
+        return false;
+    }
+    let dt = undistinct(crate::places::ir::full_place_type(a, b, pbody, &pcx), pcx);
+    let raw_thin = dt > 0 && pcx.types[dt].kind == TyKind::Ptr && pcx.types[dt].b == 0;
+    if !raw_thin && !crate::front::types::is_raw_view(dt, pcx) {
+        return false;
+    }
+    let st = undistinct(crate::places::ir::full_place_type(op_a(ops, 0, pbody), op_b(ops, 0, pbody),
+        pbody, &pcx), pcx);
+    let from_mut = st > 0 && (pcx.types[st].kind == TyKind::Ptr && pcx.types[st].b == REF_MUT
+        || crate::front::types::is_mut_slice(st, pcx));
+    from_mut && crate::places::build::raw_mut_goal(node, pcx)
+}
+
 // The accesses of the statement at loc, in D2.4a's order.
 // RULE: D2.2, D2.4a
 fn accesses(loc: i64, bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
@@ -399,10 +421,21 @@ fn accesses(loc: i64, bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Co
                 var bk = st.d;
                 if rv == RV_SLICE {
                     bk = BK_SHARED;
+                    var loaned = false;
                     for j in 0..loan_count(bck) {
                         if loan_stmt(j, bck) == loc {
                             bk = loan_kind(j, bck);
+                            loaned = true;
                         }
+                    }
+                    // RULE: D3.6 (0.27.7: `&mut s[..]` made a fat raw pointer
+                    // has no loan, R1; it is `&raw mut`, a write)
+                    if !loaned && st.a >= 0 && st.d > 0
+                        && (pcx.nodes[st.d].p & crate::front::ast::NODE_REF_MUT) != 0
+                        && crate::front::types::is_raw_view(undistinct(
+                            crate::places::ir::full_place_type(st.a, st.b, pbody, &pcx), pcx),
+                            pcx) {
+                        bk = BK_RAW_MUT;
                     }
                 }
                 if bk == BK_SHARED {
@@ -419,6 +452,13 @@ fn accesses(loc: i64, bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Co
                 } else if bk == BK_RAW_MUT {
                     access(true, A_WB, -1, l, p, 0, loc, &bck, pbody, &pcx);
                 }
+            } else if (rv == RV_USE || rv == RV_CAST) && st.nops > 0
+                && raw_mut_write(st.a, st.b, st.ops, st.node, pbody, &pcx) {
+                // RULE: D3.6 (0.27.7: a `&mut [T]` made a written `*mut [T]`,
+                // `r as *mut T` of a `&mut T` r, is `&raw mut`: a deep write
+                // of what it points to, no loan)
+                access(true, A_WB, -1, op_a(st.ops, 0, pbody), op_b(st.ops, 0, pbody), 0, loc,
+                    &bck, pbody, &pcx);
             } else if rv == RV_LEN || rv == RV_DISCR {
                 access(false, A_RC, -1, op_a(st.ops, 0, pbody), op_b(st.ops, 0, pbody), 0, loc,
                     &bck, pbody, &pcx);
