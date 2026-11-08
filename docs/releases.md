@@ -123,6 +123,16 @@ The front (front273):
 - std2's `[T]` hash calls `Hash::hash_slice(self, state)`, as Rust's
   does, with Self taken from the argument (F8.2): an element type's own
   hash_slice runs. 0.27.6 called `T::hash_slice`.
+- A `&T` given where a `*mut T` goes, a parameter's or a `let`'s
+  written type, is rustc's E0308 (D3.6a): the types differ in
+  mutability, `try: &mut x`. `&mut T` still coerces to both raw
+  pointers, and `&T` to `*const T`. 0.27.6 accepted it, so a callee
+  could write through a pointer made from a shared borrow.
+- A literal beside a value an earlier error left untyped takes the
+  error type, so it gets no second error (F18.3). 0.27.6 checked it
+  against the i32 fallback: `let value = parse("x")` was a mismatch,
+  and `value > 9223372036854775807` then reported "does not fit in
+  type 'i32'" too. rustc reports only the mismatch.
 
 The compiler's own source (gate 3, front273):
 

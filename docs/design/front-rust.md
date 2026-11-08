@@ -1224,6 +1224,12 @@ literals.vl: defaulted_apart`, `synth_mode.vl: is_untyped_literal`
 parameter, `s.get(1..3)`, is checked as the one `Range<N>` the bounds
 admit before the call's arguments are inferred:
 `generics/instantiate.vl: range_literal_by_bounds`.)
+(0.27.7: a literal whose context is a value an error left untyped, `value >
+9223372036854775807` after a reported mismatch in `let value = ..`, takes
+the error type, not the fallback. Its fit is not checked, as rustc
+reports only the first error. 0.27.6 checked it against `i32` and
+reported a second error. *Anchor:* `check_mode.vl: check_expr_inner`.
+*Case:* `rust_f_f183_literal_after_error_err`.)
 
 **F18.4 (a hoisted literal takes the let's annotation).** `let r: &U = &e;`
 with `e` a literal (an array, an integer, a float, a tuple) makes its

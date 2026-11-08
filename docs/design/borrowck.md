@@ -525,6 +525,20 @@ re-inferred.
   it as the shared reborrow `&(*Q)`, whose loan lived to the call.
   *Cases:* `rust_b_raw_coerce_ends_borrow`,
   `rust_b_raw_coerce_live_shared_err`.
+  **D3.6a (0.27.7, the coercion's mutability).** In the rust edition
+  only `&mut T` coerces to `*mut T`. A `&T` coerces to `*const T` and
+  not to `*mut T`: that is rustc's E0308 ("the types differ in
+  mutability"), with `&mut x` as the fix. vole's types do not tell
+  `*const T` from `*mut T` (both are `*T`, front/parser/rust.vl), so
+  the check reads the written type the value goes to, a parameter's or
+  a `let`'s (its TyPtr's `c`: 1 `*const`, 2 `*mut`). 0.27.6 accepted
+  `bump(&x)` with `fn bump(p: *mut i64)`, and the callee's write went
+  through a pointer to a place that had only a shared borrow. MVS's
+  `*T` takes `&x` as before. A fat raw pointer (`*mut [T]`) takes no
+  reference yet, shared or exclusive (rustc: `&mut s[..]` and `&s[..]`
+  to `*const [T]`). *Anchor:* `front/check/check_mode.vl: coerce_ref`.
+  *Cases:* `rust_b_raw_mut_from_shared_err`,
+  `rust_b_raw_mut_from_mut`.
 - `SK_ASSIGN (a,b) = RV_REF P` (`e = 'ℓ`, `d ≠ BK_RAW`): loan `ℓ`
   created; `sub(&'ℓ [mut] type(P) ≤ type((a,b)))` (a `BK_FAKE` loan:
   `type((a,b))` is `&type(P)`); **the supporting-prefix rule:** for
