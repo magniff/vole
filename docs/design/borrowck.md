@@ -516,7 +516,13 @@ re-inferred.
   reading of it as that reborrow was the stopgap until then; retired.)
   (0.27.6) A `&mut` place given where a raw pointer goes (a `*mut T` or
   `*const T` parameter: the coercion) is reborrowed raw, `_t = &raw mut
-  (*Q)` (`BK_RAW_MUT`), as rustc's MIR has it. That creates no loan
+  (*Q)` (`BK_RAW_MUT`), as rustc's MIR has it. (0.27.7) So is one that
+  goes to a raw pointer anywhere else, as any operand: a `let`'s value,
+  the function's result (`fn f(x: &mut T) -> *mut T { x }`, `return
+  x`), an assigned value, a struct literal's field; 0.27.6 copied the
+  `&mut` there (the value's type, the raw pointer's, is Copy), an I7
+  break `--verify-places` reported. `Q` stays usable after it, as
+  after rustc's reborrow. That creates no loan
   (D2.1), so the reborrow ends at the coercion: a later `&mut` of a
   part of `*Q` in the same call's arguments, `f(cx, &mut cx.cap)`, is
   no conflict. The coercion's own access is a deep write of `*Q`
@@ -524,7 +530,7 @@ re-inferred.
   conflicts (rustc E0502: `let r = &cx.cap; f(cx); r`). 0.27.5 gave
   it as the shared reborrow `&(*Q)`, whose loan lived to the call.
   *Cases:* `rust_b_raw_coerce_ends_borrow`,
-  `rust_b_raw_coerce_live_shared_err`.
+  `rust_b_raw_coerce_live_shared_err`, `rust_b_raw_coerce_positions`.
   **D3.6a (0.27.7, the coercion's mutability).** In the rust edition
   only `&mut T` coerces to `*mut T`. A `&T` coerces to `*const T` and
   not to `*mut T`: that is rustc's E0308 ("the types differ in
