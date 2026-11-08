@@ -6,7 +6,7 @@ of the compiler and of std, made by `tests/unsafe_audit.sh -u` from
     volec query unsafe --summary --no-std     # compiler/src (the tree's root)
     volec query unsafe --summary std          # std
 
-on Darwin arm64, c3a472340. The gate's unsafe-audit row
+on Darwin arm64, 143075ba2. The gate's unsafe-audit row
 (bootstrap/gate.sh, tests/unsafe_audit.sh) fails when either count of
 unjustified sites (without `// UNSAFE:` and `// SAFETY:` right above them,
 AGENTS.md) rises above its line below; a lower count asks for this file
@@ -14,28 +14,28 @@ to be made again. The classes and the comments' rule: `volec query unsafe
 --help`, docs/query.md; `unneeded`: unsafe blocks with nothing unsafe
 inside (statics are safe), removable as they are.
 
-baseline compiler/src unjustified: 2773
+baseline compiler/src unjustified: 2769
 baseline std unjustified: 0
 
 ## compiler/src
 
 ```
-sites: 3162 (3111 blocks, 8 unsafe fns, 43 extern blocks); unjustified: 2773; unneeded: 180
+sites: 3214 (3162 blocks, 8 unsafe fns, 44 extern blocks); unjustified: 2769; unneeded: 182
 
 class	sites	unjustified
-raw-pointer	2156	2018
-ffi	318	291
-static-mut	242	218
-other	189	8
-alloc	140	130
-transmute/cast	117	108
+raw-pointer	2192	2016
+ffi	324	292
+static-mut	247	216
+other	192	8
+alloc	142	130
+transmute/cast	117	107
 
 module	sites	unjustified
-crate::front	854	713
-crate::tools	847	756
-crate::middle	689	625
+crate::front	887	712
+crate::tools	858	755
+crate::middle	690	625
 crate::back	524	514
-crate::base	98	82
+crate::base	105	80
 crate::places	49	0
 crate::arch	47	47
 crate::gen0	40	24
@@ -45,9 +45,9 @@ crate::cli	2	0
 
 file	sites	unjustified
 compiler/src/back/codecache/mod.vl	56	56
-compiler/src/base/mod.vl	49	46
+compiler/src/base/mod.vl	56	44
 compiler/src/middle/gvn.vl	40	39
-compiler/src/middle/parallel.vl	37	37
+compiler/src/middle/parallel.vl	38	37
 compiler/src/front/own/state.vl	36	36
 compiler/src/middle/inline.vl	36	36
 compiler/src/front/own/views.vl	35	35
@@ -56,19 +56,19 @@ compiler/src/back/objfile/mod.vl	32	32
 compiler/src/base/diag.vl	32	28
 compiler/src/middle/ir/mod.vl	30	30
 compiler/src/back/regalloc/intervals.vl	29	29
+compiler/src/front/types.vl	28	22
 compiler/src/back/objfile/output.vl	27	26
 compiler/src/back/regalloc/scan.vl	27	27
 compiler/src/front/check/alloc_rules.vl	27	0
-compiler/src/front/types.vl	27	22
 compiler/src/tools/lsp/answer.vl	27	22
 compiler/src/front/generics/mod.vl	25	23
 compiler/src/front/own/fast.vl	25	19
 compiler/src/tools/proc.vl	24	19
-(345 more; --all lists every one)
+(354 more; --all lists every one)
 
 justification	sites	unjustified
-missing both	2773	2773
-justified	389	0
+missing both	2769	2769
+justified	445	0
 try: /Users/magniff/workspace/vole/.claude/worktrees/integ264/target/volec fix --only unneeded-unsafe
 ```
 
