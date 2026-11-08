@@ -1,64 +1,62 @@
 # Memory
 
-Vole's values have one owner each (0.17; spelled `let` / `inout` /
-`sink` since 0.20): an owned value moves and is dropped at the end of
-its scope, a function says by its parameters' conventions what it does
-with each argument, and the views a slice holds are checked. Nothing
-stores a reference, so there are no lifetimes to write. There is no
-garbage collector and no reference counting; memory comes from an
-allocator (`guide allocators`).
+Rust's ownership. Each value has one owner: `let w = v;`, an argument
+passed by value and `return v` move it (a `Copy` value is copied), and
+the owner drops it at the end of its scope. References borrow it: `&T`
+shared, `&mut T` exclusive, checked by the borrow checker, with
+lifetimes (`'a`) where a signature needs them. There is no garbage
+collector and no reference counting; memory comes from an allocator,
+written in the type (`Vec<i64, Gpa>`, `guide allocators`).
 
-## Three kinds of types
+## Copy and move
 
-The kind is computed from the type; nothing is declared:
+- `Copy` types are copied bit for bit: integers, floats, `bool`,
+  `char`, `&T`, raw pointers, `fn` pointers, tuples and arrays of `Copy`
+  types, and a struct or enum that derives `Clone, Copy` (its fields all
+  `Copy`). A struct without the derive moves, as in Rust.
+- Everything else moves: `Vec`, `String`, `HashMap`, `Box`, a type with
+  `Drop`, a struct holding one. A use after the move is
+  `borrowck.use_moved` (rustc E0382), whose help says where it moved:
+  use it before, pass a `.clone()`, or lend it (`&v`).
 
-| kind | what | `let w = v;`, a sink argument, `return` |
+## Borrowing
+
+A parameter's type says what the function does with the argument:
+
+| written | the callee | the caller writes |
 |---|---|---|
-| plain | numbers, bool, raw `*T`, structs, tuples and arrays of plain types | a bit copy, as in C |
-| owned | `Vec`, `Buf`, `HashMap`, `Arena`, a type with `Drop`, a struct holding one | a move: the old name is dead until assigned again; `.clone()` copies |
-| view | a slice `[T]`, a struct holding one (`Scanner`) or an access field (`q: inout Query`), a closure capturing by access | a copy (one holding an `inout`: a move) that cannot outlive what it views |
-
-`volec query own FILE:LINE:COL` shows each local's kind there, and
-whether it is moved or what it views.
-
-## Conventions: let, inout, sink
-
-A parameter's convention says what the function does with the argument:
-
-| convention | written | the callee | the caller writes |
-|---|---|---|---|
-| let (the default) | `v: Vec<i64, Gpa>` | reads it; cannot change or keep it | `total(v)`: lent for the call, or a temporary |
-| inout | `v: inout Vec<i64, Gpa>` | may change it; the change reaches the caller | `fill(&v)`: `&` marks it |
-| sink | `v: sink Vec<i64, Gpa>` | owns it (may change it, keeps or drops it) | `keep(v)`: v moves (a plain value is copied) |
+| `v: &Vec<i64, Gpa>` | reads it | `total(&v)` |
+| `v: &mut Vec<i64, Gpa>` | may change it; the change reaches the caller | `fill(&mut v)` |
+| `v: Vec<i64, Gpa>` | owns it (keeps it or drops it) | `keep(v)`: v moves |
 
 ```vole
-fn total(v: Vec<i64, Gpa>) -> i64 { // let: reads, no copy
-    var s = 0;
-    for x in v { s += x; }
+fn total(v: &Vec<i64, Gpa>) -> i64 { // reads, no copy
+    let mut s = 0;
+    for x in v { s += *x; }
     s
 }
 
-fn fill(v: inout Vec<i64, Gpa>, n: i64) { // inout: changes the caller's Vec
+fn fill(v: &mut Vec<i64, Gpa>, n: i64) { // changes the caller's Vec
     for i in 0..n { v.push(i * i); }
 }
 
-fn keep(all: inout Vec<Vec<i64, Gpa>, Gpa>, v: sink Vec<i64, Gpa>) { // sink: takes it
+fn keep(all: &mut Vec<Vec<i64, Gpa>, Gpa>, v: Vec<i64, Gpa>) { // takes v
     all.push(v);
 }
 
 fn make(n: i64, gpa: Gpa) -> Vec<i64, Gpa> { // the caller owns the result
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
-    fill(&v, n);
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
+    fill(&mut v, n);
     v                                    // moved out: not dropped here
 }
 
 fn main(gpa: Gpa) {
     let v = make(4, gpa);
     let w = v.clone();                   // a copy; `let w = v;` moves v
-    println("{} {} {}", total(v), total(w), w.len());
-    var all: Vec<Vec<i64, Gpa>, Gpa> = Vec::new_in(gpa);
-    keep(&all, w);                       // w is dead from here
-    println(all.len());
+    println("{} {} {}", total(&v), total(&w), w.len());
+    let mut all: Vec<Vec<i64, Gpa>, Gpa> = Vec::new_in(gpa);
+    keep(&mut all, w);                   // w is dead from here
+    println("{}", all.len());
 }                                        // all (and w in it), then v, dropped (freed)
 ```
 ```out
@@ -66,132 +64,95 @@ fn main(gpa: Gpa) {
 1
 ```
 
-- There are no references to take or store: where other languages
-  borrow a reference, a let parameter borrows the value read-only for
-  the call and an inout one borrows it exclusively, with `&x` at the
-  call. An inout access needs a mutable place: `&x` and an `inout self`
-  method (`x.push(1)`) on a let binding are `own.readonly` (`var x`).
-- For a plain type (`i64`, a struct of numbers) `let` and `sink` are
-  both a copy; only `inout` changes the caller's value. For an owned one
-  `let` lends it and `sink` moves it.
-- Receivers: `fn len(self)`, `fn push(inout self, x: sink T)`, `fn
-  finish(sink self)`. A method call lends its receiver without `&`:
-  `v.push(1)` changes `v`, so `v` must be `var` (or an inout parameter).
-- A let parameter is read-only: changing it is an error that names the
-  fix (take it `inout`). Defaults: `b: i64 = 2` on let and sink
-  parameters, not on inout ones.
-- Mutable locals are `var x = e;`; `let` ones cannot change. A `sink`
-  parameter is the callee's own, so it is mutable.
+- At each point a place has any number of shared borrows or one
+  mutable one, never both. A borrow lasts until its last use, not to
+  the end of its block. `v.push(v.len())` is fine (the argument is read
+  before the receiver's mutable borrow starts).
+- The errors, with rustc's codes: `borrowck.conflict` (E0502),
+  `borrowck.mut_twice` (E0499), `borrowck.assign_borrowed` (E0506),
+  `borrowck.move_out` (E0507, E0508), `borrowck.dropped_borrowed`
+  (E0597, E0716), `borrowck.borrow_immutable` (E0596),
+  `borrowck.elision` (E0106), `borrowck.outlives` (a lifetime too
+  short). Each one's help names the fix.
+- A binding changes only if declared `let mut x`; `&mut x` or a `&mut
+  self` method (`x.push(1)`) of a `let x` is an error (E0596).
+- Receivers: `fn len(&self)`, `fn push(&mut self, x: T)`, `fn
+  finish(self)`. A method call borrows its receiver itself: `v.push(1)`
+  is `Vec::push(&mut v, 1)`.
+- Lifetimes, Rust's: a result that borrows from the one reference
+  parameter (or from `&self`) needs none written; otherwise name it,
+  `fn longest<'a>(a: &'a str, b: &'a str) -> &'a str`
+  (`borrowck.elision` says so). A struct that holds a reference takes
+  one: `struct Parser<'a> { text: &'a str }`. A reference to a function's
+  own local cannot leave it.
 
 ## Moves and drops
 
-- `let w = v;`, a sink argument, `return v`, a struct literal's field
-  and a `sink ||` closure move `v`; using `v` after that is `own.moved`,
-  which names where it moved (`'keep(sink v)'`); its `try:` passes
-  `v.clone()`, or lend it to a let parameter instead.
 - At the end of a scope its owned locals are dropped, last declared
-  first, on every exit (`return`, `break`, `?`), not on `exit` or a
+  first, on every exit (`return`, `break`, `?`), not on an `exit` or a
   panic. A moved value is not dropped where it was.
-- `impl Drop for T { fn drop(inout self) { ... } }` runs code at the
+- `impl Drop for T { fn drop(&mut self) { ... } }` runs code at the
   drop; a type without one drops its fields. `drop(x)` drops early,
-  `std::forget(x)` never (a leak, safe); `x.drop()` by hand is
-  `own.drop_call` (`try: drop(x)`). A type with a Drop of its own
-  holds no view, also through a type argument (`G<[i64]>` of `impl<T>
-  Drop for G<T>`): `own.drop_view`, since its drop could read what the
-  view points to after that is gone. std's containers of views are fine.
+  `std::mem::forget(x)` never (a leak, safe); calling `x.drop()` is an
+  error (rustc E0040).
 - A guard is a struct whose `Drop` releases what it holds (closes a
   descriptor, restores the terminal), made where the resource is taken:
   `let _closer = Closer { fd };` runs its drop on every exit of the
-  scope, after the locals made later (`let _ = ..` drops at once). It is
-  what `defer` did before 0.26.2 (now `syntax.defer`).
-- A `match`, `if let` or `let (a, _) = t` by value on a local moves
-  only the parts it binds; the rest (`_`, `..`, a wildcard arm) stays
-  in the local and is dropped with it, at its scope's end. `v[i] = x`
-  drops the element it replaces.
-- `let x = v[i];` of an owned element borrows it (a let access, read
-  only); `var x = v[i];` would move it out of the Vec and is
-  `own.move_out`, as is `var k = self.keys;` in an `inout self` method:
-  take it with `self.keys.take()`, which leaves an empty one
-  (`std::take(&x)` for a `Default` value), `std::replace`, or
-  `.clone()`.
-- `v.free()` still works: it frees now and leaves `v` empty (its drop
-  then frees nothing).
+  scope, after the locals made later (`let _ = ..` drops at once).
+- A `match`, `if let` or `let Two { a, .. } = t` by value moves only the
+  parts it binds; the rest stays in `t` and is dropped with it.
+  `v[i] = x` drops the element it replaces.
+- `let x = v[i];` of an element that is not `Copy` would move it out of
+  the Vec: `borrowck.move_out`. Borrow it (`&v[i]`), clone it, or take
+  it with `std::mem::replace(&mut v[i], new)` or `Option::take`
+  (`std::mem::take` for a type with `Default`).
 
-## Accesses
+## Slices
 
-An access is what a let or inout parameter holds: not a pointer to
-manage, but the caller's value itself, used as that value.
-
-- Read it, write it, call its methods: `n + 1`, `out = acc`, `out +=
-  1`, `v.push(x)`, `p.x`. There is no `*r`; `*` is only for raw `*T`
-  pointers.
-- `inout r = &st;` names an inout access in a local; pass it on as
-  `&r`, any number of times: `bump(&r); bump(&r);`. A let argument needs
-  no local: pass `st` itself.
-- A struct may hold one as a field: `struct Parser { toks: [Tok], q:
-  inout Query }`, built as `Parser { toks: t, q: &q }`; such a struct is
-  a view (`guide views`).
-- `match e { E::A(n) => n + 1, .. }` on a let `e` binds into it;
-  `match &x { .. }` binds inout accesses that change `x`'s parts.
-- Exclusivity: while an inout access of `x` (or a view of it) is in use,
-  `x` is not read or changed another way. `f(&a, a)` and `f(&a, &a)` are
-  errors (`own.conflict`); `v.push(v.len())` is fine (the receiver is
-  taken after the arguments).
-- `*T` is a raw pointer (0.18.1): dereferencing it needs `unsafe`;
-  `&x` passed where a `*T` is wanted gives the address, with an
-  exclusive loan for the call (`guide unsafe`).
-
-## Views
-
-A slice does not own memory: `v.as_slice()` views `v`'s elements, a
-`Scanner` views its text. The checker keeps every view inside what it
-views: a view used after its owner grew or was dropped (`own.conflict`),
-returned out of the function that owns its memory (`own.escape`), or a
-`for` loop over a Vec that pushes to it, is an error, not undefined
-behaviour. Take the view again after the change, or keep an index:
+A slice `&[T]` borrows its owner's elements: `v.as_slice()`, `&v[a..b]`,
+`s.as_bytes()`. While it is used, its owner does not grow, shrink or
+drop (`borrowck.conflict`), so a slice never points at freed memory. Use
+the slice before the change, then borrow again, or keep an index:
 
 ```vole
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
-v.push(1);
-let s = v.as_slice();
-    print("{} ", s[0]); // used before the pushes
-for i in 0..100 { v.push(i); }            // may move the elements
-let s2 = v.as_slice();                    // a fresh view
+fn main(gpa: Gpa) {
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
+    v.push(1);
+    let s = v.as_slice();
+    print("{} ", s[0]);                  // s's last use: before the pushes
+    for i in 0..100 { v.push(i); }       // may move the elements
+    let s2 = v.as_slice();               // a fresh borrow
     println("{}", s2.len());
+}
 ```
 ```out
 1 101
 ```
 
-`volec guide views` has the rules, the diagnostics and the patterns
-(parsers and lexers that keep views of their input are fine).
-
 `volec --check-alloc` (0.16) also checks at run time: every Gpa block
 on pages of its own, so a use after free (through `unsafe` code) faults
 and is reported with where the block was allocated and freed; bad frees
-and leaks are reported too (`gpa.live_blocks()`, `gpa.check_leaks()` for
-tests).
+and leaks are reported too.
 
 ## Cells
 
-*(0.26.1)* `std::cell::Cell<T>` is a value that changes through a shared
-(let) access, Rust's Cell: `get` (a copy, T: Copy), `set`, `replace`,
-`take`, `swap`, `update`. A cell is owned, so a let parameter of one is
-the caller's cell, and the callee's `set` reaches it:
+`std::cell::Cell<T>` is a value that changes through a shared
+reference, Rust's Cell: `get` (a copy, `T: Copy`), `set`, `replace`,
+`take`, `swap`, `update`.
 
 ```vole
 use std::cell::Cell;
 
 struct Counter { hits: Cell<i64> }
 
-fn hit(c: Counter) { c.hits.set(c.hits.get() + 1); }
+fn hit(c: &Counter) { c.hits.set(c.hits.get() + 1); }
 
 fn main() {
     let c = Counter { hits: Cell::new(0) };
-    hit(c);
-    hit(c);
-    let arr = [Cell::new(1), Cell::new(2)];
-    for x in arr { x.set(x.get() * 10); }
+    hit(&c);
+    hit(&c);
+    let arr = [Cell::new(1i64), Cell::new(2)];
+    for x in &arr { x.set(x.get() * 10); }
     println("{} {}", c.hits.get(), arr[1].get());
 }
 ```
@@ -199,19 +160,12 @@ fn main() {
 2 20
 ```
 
-- A cell moves (`let d = c`) and has no drop of its own.
-- No copy of a cell is made where its place is meant: a `for` over an
-  array of cells iterates the array itself; `v.get(i)` of one is
-  `own.interior_copy` (write `v[i].set(x)`).
-- `UnsafeCell<T>` is the primitive under Cell, Atomic and Mutex: `get`
-  gives a `*T` to write through in `unsafe`.
-- A type that holds a cell by value is not `Freeze` (`std::Freeze`): not
-  Sync (`guide threads#cells-and-threads`), and a `#[pure]` function or a
-  contract condition may not read it (`query effects F --why interior`).
+- `UnsafeCell<T>` is the primitive under Cell, the atomics and Mutex:
+  `get` gives a `*mut T` to write through in `unsafe`.
 
 ## Raw memory
 
-`malloc` and `free` from C, raw `*T` pointers, in `unsafe` (`volec
-guide unsafe`). `volec --check-unsafe -O1` checks heap accesses
-through raw pointers at run time. Memory nobody wrote (from `malloc`)
-has an unspecified value: write it before reading it.
+`malloc` and `free` from C, raw `*const T` and `*mut T` pointers, in
+`unsafe` (`volec guide unsafe`). `volec --check-unsafe -O1` checks heap
+accesses through raw pointers at run time. Memory nobody wrote (from
+`malloc`) has an unspecified value: write it before reading it.

@@ -54,7 +54,7 @@ export LC_ALL
 # and --split writes its prog.vl with `// EDITION: rust` first (the twin's
 # guide programs). A topic moves here when its examples are translated
 # (0.28.0 workstream C); the others are MVS's until then.
-RUST_TOPICS=" cli fmt generics io modules unsafe "
+RUST_TOPICS=" cli closures fmt generics io memory modules unsafe "
 rust_topic() { case "$RUST_TOPICS" in *" $1 "*) echo 1 ;; *) echo 0 ;; esac; }
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -546,13 +546,13 @@ if [ -z "$missed" ]; then
 else
     result FAIL guide-find-arch "not first on guide arch:$missed"
 fi
-# (0.20) The words of the parameter conventions, and Rust's for them,
-# land on the sections that teach them.
+# (0.20) The words of borrowing land on the sections that teach them
+# (0.28.0: memory's borrowing, the rust edition's; MVS's inout and sink
+# are gone from it).
 missed=""
-# (a Rust spelling: memory's conventions or rust's mapping of them)
-for pair in 'inout:memory#conventions' 'sink:memory#conventions' 'borrow:memory#conventions' \
-    'mutable reference:(memory#conventions|rust#parameters)' '&mut:(memory#conventions|rust#parameters)' \
-    'let mut:(memory#conventions|rust#parameters)' 'move closure:closures#sink-closures'; do
+for pair in 'borrow:memory#borrowing' \
+    'mutable reference:(memory#borrowing|rust#parameters)' '&mut:(memory#borrowing|rust#parameters)' \
+    'let mut:(memory#borrowing|rust#parameters)' 'move closure:closures#move-closures'; do
     w=${pair%%:*}
     want=${pair#*:}
     "$COMPILER" guide --find $w 2>/dev/null | head -1 >"$WORK/findconv.out"
