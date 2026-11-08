@@ -12,10 +12,10 @@ use crate::front::lexer::Tok;
 use crate::front::types::{REF_MUT, TY_I64, TY_I8, TY_ISIZE, TY_U64, TY_U8, TyKind};
 use crate::middle::lower::ssa::HMap;
 use crate::tools::translate::{
-    D_REF, TC_BORROW, TC_BYTES, TC_DEREF, TC_INOUT_LOCAL, TC_INT, TC_LEN, TC_MUT_MARKER, TC_PRINT,
-    TC_STATIC, TC_USIZE, TC_UTF8, TC_VAR, TC_VIEW, TL_BYTES, Tr, add_ref, editable, enclosing_fn,
-    ident_char, is_mut_ref, is_ref, is_ws, left, own_node, parent_of, put, put_first, ref_binding,
-    skip_ws, token_at, word_here, written_name,
+    D_REF, TC_BORROW, TC_BYTES, TC_CHAR, TC_DEREF, TC_INOUT_LOCAL, TC_INT, TC_LEN, TC_MUT_MARKER,
+    TC_PRINT, TC_STATIC, TC_USIZE, TC_UTF8, TC_VAR, TC_VIEW, TL_BYTES, Tr, add_ref, editable,
+    enclosing_fn, ident_char, is_mut_ref, is_ref, is_ws, left, own_node, parent_of, put, put_first,
+    ref_binding, skip_ws, token_at, word_here, written_name,
 };
 
 // The symbol of the name node n is written as (its token's), or 0.
@@ -556,8 +556,18 @@ fn if_branch_place(b: i64, pcx: Ctx<Comp>) -> i64 {
 // reference (D_REF: a let parameter of a type MVS does not copy) is
 // written `&e`, unless it is one already.
 fn edit_call_args(c: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    // (0.28.0: a call of a local, a closure or a function value, `f(x)`
+    // of an `f: F` or an `f: fn(..)`)
+    let callee = if pcx.nodes[c].kind == NodeKind::Call { pcx.nodes[c].a } else { 0 };
+    let value = callee > 0 && pcx.nodes[callee].kind == NodeKind::Ident
+        && pcx.nodes[callee].res != crate::front::check::Res::Fn
+        && (pcx.nodes[callee].res == crate::front::check::Res::Local
+            || callee_fn_type(c, tr, pcx) > 0);
     var f = pcx.nodes[c].x - 1;
     if f < 0 || f >= pcx.fns.len() as i64 {
+        if value {
+            value_call_args(c, &tr, &pcx);
+        }
         return;
     }
     if pcx.fns[f].tmpl > 0 {
@@ -565,11 +575,19 @@ fn edit_call_args(c: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     }
     let fnode = pcx.fns[f].node;
     if fnode <= 0 || !editable(pcx.nodes[fnode].start, &pcx) {
+        if value {
+            value_call_args(c, &tr, &pcx);
+        }
         return;
     }
+    // (0.28.0: a closure's call, of the function the checker made of it,
+    // whose body is the closure's: the closure's parameters)
+    let body = pcx.nodes[fnode].c;
+    let up = if body > 0 { parent_of(body, tr) } else { 0 };
+    let owner = if up > 0 && pcx.nodes[up].kind == NodeKind::Closure { up } else { fnode };
     var params = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    for j in 0..pcx.nodes[fnode].count {
-        let p = child(fnode, j, pcx);
+    for j in 0..pcx.nodes[owner].count {
+        let p = child(owner, j, pcx);
         if pcx.nodes[p].kind == NodeKind::Param {
             params.push(p);
         }
@@ -582,45 +600,143 @@ fn edit_call_args(c: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
         if pcx.nodes[arg].kind == NodeKind::NamedArg {
             arg = pcx.nodes[arg].b;
         }
-        if arg <= 0 || tr.decided.get(params.get(i) + 1) != D_REF {
+        // (a closure's parameter written `let T`: `&T`, sig.vl's types)
+        let p = params.get(i);
+        let by_ref = if owner != fnode {
+            pcx.nodes[p].b > 0 && word_here(pcx.nodes[pcx.nodes[p].b].start, "let")
+        } else { tr.decided.get(p + 1) == D_REF };
+        if arg <= 0 || !by_ref {
             continue;
         }
-        // (a method's receiver: Rust borrows it itself; an argument the
-        // checker made, a contract's check's, at the call)
-        if pcx.nodes[arg].start <= pcx.nodes[c].start || pcx.nodes[arg].end > pcx.nodes[c].end {
-            continue;
-        }
-        // (the checker's borrow: what it borrows)
-        var e = arg;
-        if pcx.nodes[e].kind == NodeKind::Unary && pcx.nodes[e].op == Tok::Amp
-            && SRC[pcx.nodes[e].start] != '&' {
-            e = pcx.nodes[e].b;
-        }
-        if e <= 0 || access_to_ref(e, tr, pcx) || pcx.nodes[e].kind == NodeKind::Closure
-            || is_ref(pcx.nodes[e].ty, pcx) && SRC[pcx.nodes[e].start] == '&'
-            || token_at(pcx.nodes[arg].start, pcx) < 0 {
-            continue;
-        }
-        // (an `if` of two places, `if c { bck.dlive } else { bck.live }`:
-        // each branch borrowed, `&if ..` would move out of them)
-        if pcx.nodes[e].kind == NodeKind::If && if_branch_place(pcx.nodes[e].b, pcx) > 0
-            && if_branch_place(pcx.nodes[e].c, pcx) > 0 {
-            let x = if_branch_place(pcx.nodes[e].b, pcx);
-            let y = if_branch_place(pcx.nodes[e].c, pcx);
-            put(pcx.nodes[x].start, pcx.nodes[x].start, "&", TC_BORROW, &tr, &pcx);
-            put(pcx.nodes[y].start, pcx.nodes[y].start, "&", TC_BORROW, &tr, &pcx);
-            continue;
-        }
-        put(pcx.nodes[arg].start, pcx.nodes[arg].start, "&", TC_BORROW, &tr, &pcx);
+        borrow_arg(c, arg, &tr, &pcx);
     }
+}
+
+// (0.28.0) The arguments of a call of a function value, a parameter typed
+// `fn(let T)` or a generic `F: Fn(let T)` (no function of the program the
+// checker names): one the type writes `let T` (`&T` in the translation) is
+// borrowed as a function's is, `f(1)` -> `f(&1)`; so is one the checker
+// borrows.
+fn value_call_args(c: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let ft = callee_fn_type(c, tr, pcx);
+    for i in 0..pcx.nodes[c].count {
+        var arg = child(c, i, pcx);
+        if arg > 0 && pcx.nodes[arg].kind == NodeKind::NamedArg {
+            arg = pcx.nodes[arg].b;
+        }
+        let q = if ft > 0 && i < pcx.nodes[ft].count { child(ft, i, pcx) } else { 0 };
+        if arg > 0
+            && (q > 0 && (word_here(pcx.nodes[q].start, "let") || let_before(pcx.nodes[q].start))
+                || pcx.nodes[arg].kind == NodeKind::Unary && pcx.nodes[arg].op == Tok::Amp
+                && SRC[pcx.nodes[arg].start] != '&' && pcx.nodes[arg].b > 0) {
+            borrow_arg(c, arg, &tr, &pcx);
+        }
+    }
+}
+
+// Whether the word before position s is `let` (a fn type's parameter
+// `let T`, whose node starts at T).
+fn let_before(s: i64) -> bool {
+    var q = s - 1;
+    while q > 0 && is_ws(SRC[q]) {
+        q -= 1;
+    }
+    word_back(q, "let")
+}
+
+// (0.28.0) The fn type written for call c's callee, a parameter of the
+// function around it: `f: fn(let T) -> U`, or `f: F` with `F: Fn(let T)` in
+// its generics; 0 when none is.
+fn callee_fn_type(c: i64, tr: Tr, pcx: Ctx<Comp>) -> i64 {
+    let callee = pcx.nodes[c].a;
+    if callee <= 0 || pcx.nodes[callee].kind != NodeKind::Ident {
+        return 0;
+    }
+    // (the function the call is written in, by its parents: an instance
+    // the checker made of a generic one has no generics)
+    var f = parent_of(c, tr);
+    while f > 0 && pcx.nodes[f].kind != NodeKind::Fn {
+        f = parent_of(f, tr);
+    }
+    if f <= 0 {
+        return 0;
+    }
+    for j in 0..pcx.nodes[f].count {
+        let p = child(f, j, pcx);
+        if pcx.nodes[p].kind != NodeKind::Param || pcx.nodes[p].a != pcx.nodes[callee].a {
+            continue;
+        }
+        let tn = pcx.nodes[p].b;
+        if tn <= 0 {
+            return 0;
+        }
+        if pcx.nodes[tn].kind == NodeKind::TyFn {
+            return tn;
+        }
+        let g = pcx.nodes[f].g;
+        if pcx.nodes[tn].kind != NodeKind::TyName || g <= 0
+            || pcx.nodes[g].kind != NodeKind::Generics {
+            return 0;
+        }
+        for i in 0..pcx.nodes[g].count {
+            let tp = child(g, i, pcx);
+            let h = pcx.nodes[tp].h;
+            if pcx.nodes[tp].a != pcx.nodes[tn].a || h <= 0
+                || pcx.nodes[h].kind != NodeKind::Generics {
+                continue;
+            }
+            for k in 0..pcx.nodes[h].count {
+                let b = child(h, k, pcx);
+                if pcx.nodes[b].kind == NodeKind::TyFn {
+                    return b;
+                }
+            }
+        }
+        return 0;
+    }
+    0
+}
+
+// Argument arg of call c, to a `&T` parameter: written `&arg`, unless it is
+// a reference already.
+fn borrow_arg(c: i64, arg: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    // (a method's receiver: Rust borrows it itself; an argument the
+    // checker made, a contract's check's, at the call)
+    if pcx.nodes[arg].start <= pcx.nodes[c].start || pcx.nodes[arg].end > pcx.nodes[c].end {
+        return;
+    }
+    // (the checker's borrow: what it borrows)
+    var e = arg;
+    if pcx.nodes[e].kind == NodeKind::Unary && pcx.nodes[e].op == Tok::Amp
+        && SRC[pcx.nodes[e].start] != '&' {
+        e = pcx.nodes[e].b;
+    }
+    if e <= 0 || access_to_ref(e, tr, pcx) || pcx.nodes[e].kind == NodeKind::Closure
+        || is_ref(pcx.nodes[e].ty, pcx) && SRC[pcx.nodes[e].start] == '&'
+        || token_at(pcx.nodes[arg].start, pcx) < 0 {
+        return;
+    }
+    // (an `if` of two places, `if c { bck.dlive } else { bck.live }`:
+    // each branch borrowed, `&if ..` would move out of them)
+    if pcx.nodes[e].kind == NodeKind::If && if_branch_place(pcx.nodes[e].b, pcx) > 0
+        && if_branch_place(pcx.nodes[e].c, pcx) > 0 {
+        let x = if_branch_place(pcx.nodes[e].b, pcx);
+        let y = if_branch_place(pcx.nodes[e].c, pcx);
+        put(pcx.nodes[x].start, pcx.nodes[x].start, "&", TC_BORROW, &tr, &pcx);
+        put(pcx.nodes[y].start, pcx.nodes[y].start, "&", TC_BORROW, &tr, &pcx);
+        return;
+    }
+    put(pcx.nodes[arg].start, pcx.nodes[arg].start, "&", TC_BORROW, &tr, &pcx);
 }
 
 // The checker's access to a reference r, used as its value: `*r` where
 // Rust does not dereference it itself (an assignment's target, a copy's
-// read), as it is in a field, an index, a method's receiver.
+// read), as it is in a field, an index, a method's receiver. (0.28.0) A
+// field of a reference type too, MVS's `n: inout i64` (`&'a mut i64`):
+// `c.n += 1` -> `*c.n += 1`.
 fn edit_deref(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     let s = pcx.nodes[n].start;
-    if SRC[s] == '*' || !written_name(n, pcx) || !access_to_ref(n, tr, pcx) {
+    if SRC[s] == '*' || !(written_name(n, pcx) && access_to_ref(n, tr, pcx) || ref_field(n, pcx)) {
         return;
     }
     let p = parent_of(n, tr);
@@ -644,6 +760,22 @@ fn edit_deref(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     }
 }
 
+// (0.28.0) Whether n is the checker's access to a field of a reference
+// type, written `x.f` (its deref, no `*` in the text, of a field access
+// that ends at the field's name).
+fn ref_field(n: i64, pcx: Ctx<Comp>) -> bool {
+    if pcx.nodes[n].kind != NodeKind::Unary || pcx.nodes[n].op != Tok::Star {
+        return false;
+    }
+    let o = pcx.nodes[n].b;
+    if o <= 0 || pcx.nodes[o].kind != NodeKind::FieldAccess || !is_ref(pcx.nodes[o].ty, pcx)
+        || pcx.nodes[o].start != pcx.nodes[n].start || pcx.nodes[o].end != pcx.nodes[n].end {
+        return false;
+    }
+    let k = token_at(pcx.nodes[o].end - 1, pcx);
+    k >= 0 && pcx.toks[k].kind == Tok::Ident && pcx.toks[k].end == pcx.nodes[o].end
+}
+
 // A view of a part, `v[a..b]` (MVS: a `[T]` of v's elements), is `&v[a..b]`
 // (`&mut` for an inout one), unless written so.
 fn edit_view(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
@@ -658,10 +790,20 @@ fn edit_view(n: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
     while q > 0 && is_ws(SRC[q]) {
         q -= 1;
     }
+    let p = parent_of(n, tr);
+    let pk = if p > 0 { pcx.nodes[p].kind } else { NodeKind::Unit };
+    if SRC[q] == '&' && !word_back(q, "mut") && mut_slice(t, pcx)
+        && (pk == NodeKind::Block || pk == NodeKind::Return || pk == NodeKind::Let
+            || pk == NodeKind::If || pk == NodeKind::Arm) {
+        // (0.28.0) MVS's `&v[a..b]` of an inout view given as a value (a
+        // function's `-> inout [T]` result, a let's): `&mut v[a..b]`; an
+        // argument's is the inout marker, edit_inout_args'
+        put(q + 1, q + 1, "mut ", TC_VIEW, &tr, &pcx);
+        return;
+    }
     if SRC[q] == '&' || word_back(q, "mut") {
         return;
     }
-    let p = parent_of(n, tr);
     // (a method's receiver, `.len` too: Rust borrows it itself)
     if p > 0 && (receiver_of(n, p, pcx) || (pcx.nodes[p].kind == NodeKind::Index
         || pcx.nodes[p].kind == NodeKind::FieldAccess) && pcx.nodes[p].a == n) {
@@ -2758,10 +2900,22 @@ fn declared_bytes(e: i64, depth: i64, d: TextDecls, pcx: Ctx<Comp>) -> bool {
         // (a function value's call, `h(e)`: no declaration to read, bytes as
         // its type says)
         let f = pcx.nodes[e].x - 1;
-        return f < 0 || f >= pcx.fns.len() as i64 || written_bytes(e, pcx);
+        return f < 0 || f >= pcx.fns.len() as i64 || written_bytes(e, pcx)
+            || vec_element_call(e, pcx);
     }
     if k == NodeKind::Block {
-        // (the checker's form of a call such as `nm(e).unwrap()`: its tail)
+        // (the checker's form of a call such as `nm(e).unwrap()`: its tail;
+        // 0.28.0: or what it unwraps, a call of a function written
+        // `-> Option<[u8]>`)
+        if SRC[pcx.nodes[e].start] != '{' {
+            for i in 0..pcx.nodes[e].count {
+                let s = child(e, i, pcx);
+                if s > 0 && pcx.nodes[s].kind == NodeKind::Let
+                    && wrapped_bytes(pcx.nodes[s].c, pcx) {
+                    return true;
+                }
+            }
+        }
         return pcx.nodes[e].a > 0 && declared_bytes(pcx.nodes[e].a, depth + 1, d, pcx);
     }
     if k == NodeKind::Unary && pcx.nodes[e].op == Tok::Amp {
@@ -2802,6 +2956,51 @@ fn declared_bytes(e: i64, depth: i64, d: TextDecls, pcx: Ctx<Comp>) -> bool {
             || declared_bytes(a, depth + 1, d, pcx);
     }
     false
+}
+
+// (0.28.0) Whether call e is std's method taking an element out of a Vec,
+// `keep.get(i)` (`keep[i]` in the translation), as an index of one is
+// (declared_bytes's Index).
+fn vec_element_call(e: i64, pcx: Ctx<Comp>) -> bool {
+    if pcx.nodes[e].count < 1 || pcx.nodes[e].a != 0 {
+        return false;
+    }
+    let r = child(e, 0, pcx);
+    if r <= 0 || pcx.nodes[r].start != pcx.nodes[e].start || pcx.nodes[r].end >= pcx.nodes[e].end
+        || SRC[pcx.nodes[r].end] != '.' {
+        return false;
+    }
+    let m = pcx.nodes[r].end + 1;
+    if !(word_here(m, "get") || word_here(m, "first") || word_here(m, "last")
+        || word_here(m, "pop")) {
+        return false;
+    }
+    var rt = pcx.nodes[r].ty;
+    if rt > 0 && pcx.types[rt].kind == TyKind::Ptr {
+        rt = pcx.types[rt].a;
+    }
+    rt > 0 && is_std_named(rt, c"Vec", pcx)
+}
+
+// (0.28.0) Whether e is a call of the program's function whose result is
+// written `Option<[u8]>` (or another type whose first argument is `[u8]`).
+fn wrapped_bytes(e: i64, pcx: Ctx<Comp>) -> bool {
+    if e <= 0 || pcx.nodes[e].kind != NodeKind::Call {
+        return false;
+    }
+    let f = pcx.nodes[e].x - 1;
+    if f < 0 || f >= pcx.fns.len() as i64 {
+        return false;
+    }
+    let g = if pcx.fns[f].tmpl > 0 { pcx.fns[f].tmpl - 1 } else { f };
+    let fnode = pcx.fns[g].node;
+    let t = if fnode > 0 { pcx.nodes[fnode].b } else { 0 };
+    if t <= 0 || pcx.nodes[t].kind != NodeKind::TyName || pcx.nodes[t].g <= 0
+        || pcx.nodes[pcx.nodes[t].g].count < 1 {
+        return false;
+    }
+    let a = child(pcx.nodes[t].g, 0, pcx);
+    a > 0 && pcx.nodes[a].kind == NodeKind::TySlice
 }
 
 // Whether expression e is positively bytes where it is declared: a call of
@@ -2850,6 +3049,100 @@ fn if_other(b: i64, tr: Tr, pcx: Ctx<Comp>) -> i64 {
         pcx.nodes[q].b
     } else {
         0
+    }
+}
+
+// (0.28.0) MVS's `{x:c}`, a byte written as a character: the rust edition
+// has no `c` (it prints the number), so the hole is `{x}` and its value
+// `x as char` (`x as u8 as char` of a wider integer), as rustc's
+// `{}` of a char prints it: a positional argument after the literal is
+// wrapped, a name in the literal is `{x_c}` with the named argument
+// `x_c = x as char` at the end of its print's call (a `{x}` of the
+// same literal prints the number). Another call's (a function's, which
+// takes no named argument) or a hole whose value the checker binds
+// (`{0:c}` twice) is left as it is.
+fn edit_char_holes(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    var named = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    var calls = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    for c in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[c].kind;
+        if (k == NodeKind::Call || k == NodeKind::MethodCall) && own_node(c, tr, &pcx) {
+            let at = calls.get(pcx.nodes[c].end);
+            if at == 0 || pcx.nodes[c].start + 1 < at {
+                calls.put(pcx.nodes[c].end, pcx.nodes[c].start + 1);
+            }
+        }
+    }
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind != NodeKind::InterpHole
+            || (pcx.nodes[n].p & crate::front::ast::FMT_CHAR) == 0 || !own_node(n, tr, &pcx) {
+            continue;
+        }
+        // (the hole: its name, `x` of `{x:c}`, or the text of a positional
+        // one, `:c` of `{:c}`; t its closing brace)
+        let s = pcx.nodes[n].start;
+        var t = pcx.nodes[n].end;
+        while t < SRC.len() as i64 && SRC[t] != '}' && SRC[t] != '"' {
+            t += 1;
+        }
+        let e = pcx.nodes[n].a;
+        if t >= SRC.len() as i64 || SRC[t] != '}' || t - s < 2 || SRC[t - 1] != 'c' || e <= 0
+            || !editable(s, &pcx) {
+            continue;
+        }
+        let cut = if SRC[t - 2] == ':' { t - 2 } else { t - 1 };
+        let ty = pcx.nodes[e].ty;
+        let conv = if ty == TY_U8 { " as char" } else { " as u8 as char" };
+        if token_at(pcx.nodes[e].start, pcx) >= 0 {
+            // (a positional argument)
+            let k = pcx.nodes[e].kind;
+            let term = k == NodeKind::Ident || k == NodeKind::Int || k == NodeKind::Char
+                || k == NodeKind::FieldAccess || k == NodeKind::TupleField || k == NodeKind::Index
+                || k == NodeKind::Call || k == NodeKind::MethodCall;
+            if put(cut, t, "", TC_CHAR, &tr, &pcx) {
+                if !term {
+                    put_first(pcx.nodes[e].start, "(", &tr, &pcx);
+                }
+                put_first(pcx.nodes[e].end, if term { conv } else if ty == TY_U8 { ") as char" }
+                    else { ") as u8 as char" }, &tr, &pcx);
+            }
+            continue;
+        }
+        // (a name written in the hole, `{x:c}`)
+        var q = s;
+        while q < t && ident_char(SRC[q]) {
+            q += 1;
+        }
+        if q == s || SRC[q] != ':' {
+            continue;
+        }
+        let close = literal_call_close(t);
+        let s0 = if close >= 0 { calls.get(close + 1) - 1 } else { -1 };
+        if s0 < 0 || !(word_here(s0, "println") || word_here(s0, "print")
+            || word_here(s0, "eprintln") || word_here(s0, "eprint")) || !editable(close, &pcx) {
+            continue;
+        }
+        // (its own name, `{x_c}`: the hole `{x}` of the same literal prints
+        // the number)
+        if !put(cut, t, "_c", TC_CHAR, &tr, &pcx) {
+            continue;
+        }
+        // (once per name and call)
+        var key = close;
+        for r in s..q {
+            key = key * 31 + SRC[r] as i64;
+        }
+        if named.get(key) != 0 {
+            continue;
+        }
+        named.put(key, 1);
+        let w = buf_new();
+        buf_bytes(w, ", ");
+        buf_bytes(w, SRC[s..q]);
+        buf_bytes(w, "_c = ");
+        buf_bytes(w, SRC[s..q]);
+        buf_bytes(w, conv);
+        crate::tools::edit::edit_replace(close, close, w, &pcx);
     }
 }
 
@@ -3145,4 +3438,5 @@ pub fn body_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
     }
     edit_prints(&tr, &pcx);
     edit_byte_holes(decls, &tr, &pcx);
+    edit_char_holes(&tr, &pcx);
 }
