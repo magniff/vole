@@ -4,8 +4,8 @@ $ edit patch sum_to --dry-run < $T/inputs/partial.patch
 --- a/calc.vl
 +++ b/calc.vl
 @@ -16 +16 @@
--    var total = 0;
-+    var total = 0 * n;
+-    let mut total = 0;
++    let mut total = 0 * n;
 @@ -18,0 +19 @@
 +        // (a term)
 ## --pairs FILE: the blocks from a file, no stdin, no shell quoting.
@@ -13,8 +13,8 @@ $ edit patch sum_to --dry-run --pairs $T/inputs/partial.patch
 --- a/calc.vl
 +++ b/calc.vl
 @@ -16 +16 @@
--    var total = 0;
-+    var total = 0 * n;
+-    let mut total = 0;
++    let mut total = 0 * n;
 @@ -18,0 +19 @@
 +        // (a term)
 $ edit patch sum_to --pairs nothing.patch
@@ -57,19 +57,19 @@ $ edit wrap first --in unsafe --show
 wrapped the body of crate::calc::first in unsafe	calc.vl	+4 -2 lines
 // calc.vl:32-35
 32	    unsafe {
-33	        let a = p[0];
+33	        let a = (*p.add(0));
 34	        a + 0
 35	    }
 $ edit wrap sum_to --in '' --lines 17-21 --dry-run
 --- a/calc.vl
 +++ b/calc.vl
 @@ -17,4 +17,6 @@
--    var i = 1;
+-    let mut i = 1;
 -    while i <= n {
 -        total += i;
 -        i += 1;
 +    {
-+        var i = 1;
++        let mut i = 1;
 +        while i <= n {
 +            total += i;
 +            i += 1;
@@ -90,14 +90,14 @@ $ edit wrap calc.vl:19 --in unsafe --dry-run
 --- a/calc.vl
 +++ b/calc.vl
 @@ -18,5 +18,8 @@
--    var total = 0;
--    var i = 1;
+-    let mut total = 0;
+-    let mut i = 1;
 -    while i <= n {
 -        total += i;
 -        i += 1;
 +    unsafe {
-+        var total = 0;
-+        var i = 1;
++        let mut total = 0;
++        let mut i = 1;
 +        while i <= n {
 +            total += i;
 +            i += 1;

@@ -9,13 +9,13 @@
 % ln -s "$COMPILER" other-volec
 % VOLE_CACHE_TRACE=/dev/null ./other-volec check
 main.vl:4:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: ./other-volec fix --suggested main.vl
-main.vl:10:9: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `var count`
+main.vl:10:9: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
 [exit 1]
 $ check
 main.vl:4:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: volec fix --suggested main.vl
-main.vl:10:9: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `var count`
+main.vl:10:9: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
 [exit 1]
-$ edit patch count_to --old 'let count' --new 'var count'
+$ edit patch count_to --old 'let count' --new 'let mut count'
 patched crate::count_to	main.vl	+1 -1 lines
 $ check
 main.vl:4:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: volec fix --suggested main.vl

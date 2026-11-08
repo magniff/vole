@@ -10,8 +10,8 @@ $ refactor field P --rename x px --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -4 +4 @@
--struct P { x: i64, y: i64 }
-+struct P { px: i64, y: i64 }
+-#[derive(Clone, Copy)] struct P { x: i64, y: i64 }
++#[derive(Clone, Copy)] struct P { px: i64, y: i64 }
 @@ -10 +10 @@
 -    P { x, y }
 +    P { px: x, y }

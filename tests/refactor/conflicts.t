@@ -86,13 +86,13 @@ note conflict.none: no conflict markers in the .vl files under .
 % cat shapes.vl
 // Shapes, merged from two branches.
 
-pub struct Shape {
+#[derive(Clone, Copy)] pub struct Shape {
     pub w: i64,
     pub h: i64,
 }
 
 impl Shape {
-    pub fn grow(inout self, by: i64) {
+    pub fn grow(&mut self, by: i64) {
         self.w = self.w + 1;
     }
 }

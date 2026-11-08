@@ -1,13 +1,9 @@
 ## The tools' fixes of 0.17 (tests/refactor/tools017/).
 $ check
-main.vl:7:10: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
 main.vl:14:1: warning[unsafe.unjustified] extern block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe main.vl
 main.vl:22:5: warning[unsafe.unjustified] unsafe block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe main.vl
-main.vl:27:16: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
 calc.vl:4:17: warning[use.unused] unused import 'area': nothing in this file names it | help: remove it (`volec fix` removes every unused import) | try: volec fix --only unused main.vl
-calc.vl:5:10: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-calc.vl:24:45: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-ok: 0 errors, 7 warnings in main.vl
+ok: 0 errors, 3 warnings in main.vl
 ## edit delete MODULE: its `mod` line and its file; undo brings both back.
 $ edit delete report
 deleted crate::report	2 files	+0 -5 lines
@@ -35,14 +31,14 @@ $ edit patch crate::extern --old 'i32' --new 'i64' --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -15 +15 @@
--    fn puts(s: *u8) -> i32;
-+    fn puts(s: *u8) -> i64;
+-    fn puts(s: *mut u8) -> i32;
++    fn puts(s: *mut u8) -> i64;
 $ edit patch main::extern --old 'puts' --new 'fputs' --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -15 +15 @@
--    fn puts(s: *u8) -> i32;
-+    fn fputs(s: *u8) -> i32;
+-    fn puts(s: *mut u8) -> i32;
++    fn fputs(s: *mut u8) -> i32;
 main.vl:23:9: error[type error] undefined variable 'puts' | help: did you mean 'fputs'? | try: volec fix --suggested main.vl  [in crate::main]
 warning edit.breaks: 1 new error (1 in crate::main, which the edit does not change) (dry run); the error: main.vl:23:9: undefined variable 'puts'
 [exit 1]
@@ -122,9 +118,9 @@ $ refactor inline percent --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -6 +5,0 @@
--use calc::{empties, percent, twice};
+-use calc::{Text, empties, percent, twice};
 @@ -8,0 +8,2 @@
-+use calc::{empties, twice};
++use calc::{Text, empties, twice};
 +
 @@ -21 +22,5 @@
 -    println("{TITLE}: share {}%, twice {}", percent(a, b), twice(a));
@@ -149,9 +145,9 @@ $ rewrite 'twice($x)' '$x + $x' --in main --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -6 +5,0 @@
--use calc::{empties, percent, twice};
+-use calc::{Text, empties, percent, twice};
 @@ -8,0 +8,2 @@
-+use calc::{empties, percent};
++use calc::{Text, empties, percent};
 +
 @@ -21 +22 @@
 -    println("{TITLE}: share {}%, twice {}", percent(a, b), twice(a));
@@ -173,11 +169,11 @@ $ undo
 undid rewrote 2 sites in 1 file	main.vl	+4 -3 lines
 ## rewrite refused (edit.breaks): a hole of several types gets --where per type.
 $ rewrite '$v.len() == 0' '$v.is_empty()'
-calc.vl:29:8: error[type error] no method 'is_empty' on type 'Buf<Gpa>' | help: no `is_empty`: `x.len() == 0` | try: volec query items Buf main.vl  [edited: crate::calc::empties]
-error edit.breaks: 1 new error; nothing written; the error: calc.vl:29:8: no method 'is_empty' on type 'Buf<Gpa>'
-note rewrite.where: $v has 2 types at the sites: Vec<[u8],Gpa> (1 site), Buf<Gpa> (1 site); --where takes the ones the replacement fits
-try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8],Gpa>'
-try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Buf<Gpa>'
+calc.vl:29:8: error[type error] no method 'is_empty' on type 'let Text' | try: volec query items Text main.vl  [edited: crate::calc::empties]
+error edit.breaks: 1 new error; nothing written; the error: calc.vl:29:8: no method 'is_empty' on type 'let Text'
+note rewrite.where: $v has 2 types at the sites: letVec<str,Gpa> (1 site), letText (1 site); --where takes the ones the replacement fits
+try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: letVec<str,Gpa>'
+try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: letText'
 try: volec rewrite '$v.len() == 0' '$v.is_empty()' --no-check
 [exit 1]
 ## refactor rename: a path mention must name the item's module.
@@ -198,8 +194,8 @@ $ refactor rename crate::calc::header top --dry-run
 ## query refs: the uses of string and C-string constants.
 $ query refs GREETING TITLE
 # main.vl
-9:7	def	->GREETING	const GREETING: *u8 = c"hello";
-10:7	def	->TITLE	const TITLE: [u8] = "totals";
+9:7	def	->GREETING	const GREETING: *mut u8 = c"hello";
+10:7	def	->TITLE	const TITLE: &str = "totals";
 21:15	read	main	->TITLE	println("{TITLE}: share {}%, twice {}", percent(a, b), twice(a));
 23:14	read	main	->GREETING	puts(GREETING);
 ## query grep --comments: a doc comment is its item's.
