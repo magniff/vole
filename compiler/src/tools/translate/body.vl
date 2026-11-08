@@ -674,6 +674,203 @@ pub fn hoist_index_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
     }
 }
 
+// (0.27.6) A call that takes root r `&mut` (an inout parameter) and
+// another argument after it that calls a function with r too, `is_const(cx,
+// ir_val(cx, v))`: Rust's reborrow of r for the first argument lives through
+// the call's arguments, so the inner call's r is a second mutable borrow
+// (rustc E0499, also when the inner parameter is a raw pointer, D3.6).
+// Such an argument is computed first, `{ let at_arg1 = ir_val(cx, v);
+// is_const(cx, at_arg1) }`, rustc's own suggestion; only when each
+// argument before it is plain (a name, a literal, a field of a name), so
+// that MVS's left-to-right order is kept. Innermost calls first; run after
+// every other pass: the argument moves with its edits.
+pub fn hoist_arg_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    var calls = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    var spans = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind == NodeKind::Call && pcx.nodes[n].end > pcx.nodes[n].start
+            && own_node(n, tr, &pcx) && editable(pcx.nodes[n].start, &pcx) {
+            calls.push(n);
+            spans.push(pcx.nodes[n].end - pcx.nodes[n].start);
+        }
+    }
+    // (the shortest first: an inner call's arguments before an outer's)
+    var order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for i in 0..calls.count {
+        order.push(i);
+    }
+    var i: i64 = 1;
+    while i < order.count {
+        var j = i;
+        while j > 0 && spans.get(order.get(j - 1)) > spans.get(order.get(j)) {
+            let t = order.get(j - 1);
+            order.set(j - 1, order.get(j));
+            order.set(j, t);
+            j -= 1;
+        }
+        i += 1;
+    }
+    for q in 0..order.count {
+        hoist_args(calls.get(order.get(q)), &tr, &pcx);
+    }
+}
+
+// The argument node behind a borrow (the checker's, or MVS's inout
+// marker `&x`) and behind the checker's own deref of a reference
+// parameter (`cx` of `cx: inout C` is `*cx`): `x`.
+fn arg_behind(a: i64, pcx: Ctx<Comp>) -> i64 {
+    var e = a;
+    if e > 0 && pcx.nodes[e].kind == NodeKind::NamedArg {
+        e = pcx.nodes[e].b;
+    }
+    while e > 0 && pcx.nodes[e].kind == NodeKind::Unary && pcx.nodes[e].b > 0
+        && (pcx.nodes[e].op == Tok::Amp
+            || pcx.nodes[e].op == Tok::Star && SRC[pcx.nodes[e].start] != '*') {
+        e = pcx.nodes[e].b;
+    }
+    e
+}
+
+// Whether node e is a call (not a closure's) one of whose arguments is
+// the name r.
+fn calls_with(e: i64, r: [u8], pcx: Ctx<Comp>) -> bool {
+    if e <= 0 || pcx.nodes[e].kind == NodeKind::Closure {
+        return false;
+    }
+    if pcx.nodes[e].kind == NodeKind::Call || pcx.nodes[e].kind == NodeKind::MethodCall {
+        for k in 0..pcx.nodes[e].count {
+            let x = arg_behind(child(e, k, pcx), pcx);
+            if x > 0 && pcx.nodes[x].kind == NodeKind::Ident
+                && SRC[pcx.nodes[x].start..pcx.nodes[x].end] == r {
+                return true;
+            }
+        }
+    }
+    var kids = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    crate::tools::translate::kids_of(e, &kids, pcx);
+    for k in 0..kids.count {
+        if calls_with(kids.get(k), r, pcx) {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether argument e is plain: its evaluation reads names only (a name,
+// a literal, a field of one, a borrow of one).
+fn plain_arg(a: i64, pcx: Ctx<Comp>) -> bool {
+    var e = arg_behind(a, pcx);
+    while e > 0 && (pcx.nodes[e].kind == NodeKind::FieldAccess
+        || pcx.nodes[e].kind == NodeKind::TupleField) {
+        e = pcx.nodes[e].a;
+    }
+    if e <= 0 {
+        return false;
+    }
+    let k = pcx.nodes[e].kind;
+    k == NodeKind::Ident || k == NodeKind::Int || k == NodeKind::Str || k == NodeKind::Char
+        || k == NodeKind::Bool || k == NodeKind::Float || k == NodeKind::Path
+}
+
+// hoist_arg_edits' rule on call c.
+fn hoist_args(c: i64, tr: inout Tr, pcx: inout Ctx<Comp>) {
+    let f = pcx.nodes[c].x - 1;
+    if f < 0 || f >= pcx.fns.len() as i64 {
+        return;
+    }
+    let count = pcx.nodes[c].count;
+    // (the first argument a name given to an inout parameter: its root)
+    var root = SRC[0..0];
+    var at: i64 = -1;
+    for k in 0..count {
+        let a = child(c, k, pcx);
+        if a <= 0 || pcx.nodes[a].kind == NodeKind::NamedArg || k >= pcx.fns[f].param_count {
+            return;
+        }
+        let x = arg_behind(a, pcx);
+        if at < 0 && x > 0 && pcx.nodes[x].kind == NodeKind::Ident
+            && is_mut_ref(crate::front::types::fn_param(f, k, pcx), pcx) {
+            root = SRC[pcx.nodes[x].start..pcx.nodes[x].end];
+            at = k;
+        }
+    }
+    if at < 0 {
+        return;
+    }
+    // (the arguments after it that call with the root, and the last)
+    var hoist = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for k in at + 1..count {
+        let a = child(c, k, pcx);
+        if pcx.nodes[a].end > pcx.nodes[a].start && calls_with(a, root, pcx) {
+            hoist.push(k);
+        }
+    }
+    if hoist.count == 0 {
+        return;
+    }
+    let last = hoist.get(hoist.count - 1);
+    var h: i64 = 0;
+    for k in 0..last {
+        if h < hoist.count && hoist.get(h) == k {
+            h += 1;
+        } else if !plain_arg(child(c, k, pcx), pcx) {
+            return;
+        }
+    }
+    // (no edit that crosses an argument hoisted, or holds the call whole)
+    let s0 = pcx.nodes[c].start;
+    let e0 = pcx.nodes[c].end;
+    for i in 0..pcx.e_start.count {
+        let s = pcx.e_start.get(i);
+        let e = pcx.e_end.get(i);
+        if s < s0 && e > e0 {
+            return;
+        }
+        for q in 0..hoist.count {
+            let a = child(c, hoist.get(q), pcx);
+            let x = pcx.nodes[a].start;
+            let y = pcx.nodes[a].end;
+            if !(s >= x && e <= y) && s < y && x < e {
+                return;
+            }
+        }
+    }
+    let text = buf_new();
+    buf_bytes(text, "{ ");
+    for q in 0..hoist.count {
+        let k = hoist.get(q);
+        let a = child(c, k, pcx);
+        let x = pcx.nodes[a].start;
+        let y = pcx.nodes[a].end;
+        let name = buf_new();
+        buf_bytes(name, "at_arg");
+        crate::base::buf_int(name, k);
+        buf_bytes(text, "let ");
+        buf_bytes(text, buf_slice(name));
+        buf_bytes(text, " = ");
+        crate::tools::translate::rows::render(x, y, true, text, pcx);
+        buf_bytes(text, "; ");
+        var w: i64 = 0;
+        for i in 0..pcx.e_start.count {
+            let s = pcx.e_start.get(i);
+            let e = pcx.e_end.get(i);
+            if !(s >= x && e <= y) {
+                pcx.e_start.set(w, s);
+                pcx.e_end.set(w, e);
+                pcx.e_text.set(w, pcx.e_text.get(i));
+                w += 1;
+            }
+        }
+        pcx.e_start.count = w;
+        pcx.e_end.count = w;
+        pcx.e_text.count = w;
+        crate::tools::edit::edit_replace(x, y, name, &pcx);
+    }
+    put_first(s0, buf_slice(text), &tr, &pcx);
+    // (right after the call, before what was put after it: a cast)
+    put_first(e0, " }", &tr, &pcx);
+}
+
 // (after the statics, mod.vl) A raw pointer's part, `p[a..b]`, is
 // `std::slice::from_raw_parts(p.add(a), b - a)` (`_mut` for an inout one,
 // `&p[a..b]`, whose `&` it replaces), made of its operands' rewritten text:

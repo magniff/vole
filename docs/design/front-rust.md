@@ -620,12 +620,21 @@ at each use, which gives the same values because a `const fn`'s body is
 deterministic. Such a constant is not a compile-time value yet: as an
 array length or in a pattern it is an error that says so (rustc accepts
 both). A constant defined through itself is an error at its use.
+The copy is read as at the constant: no local and no type parameter of
+the use is seen, so `let double = |x| x;` at a use of `const N: u64 =
+double(21);` does not take the place of the function `double`. The
+same holds for an inherent impl's constant (`impl D { const T: u64 =
+double(22); }`), whose copy 0.27.5 resolved in the use's scope: a
+local `double` was called there, which was wrong code. (`lookup_local`
+reads the env from `env_floor` up, and the copy is checked with no
+type parameter bound beyond the impl's.)
 0.27.5 refused such a constant ("constants must be integers, floats,
 bool or string literals"). MVS is unchanged. *Anchor:*
 `front/check/collect.vl: collect_const_types` (state 3),
 `front/check/names.vl: inline_const`, `front/consteval.vl:
-const_value, eval_array_len`. *Cases:* `rust_f_f34_const_values`,
-`rust_f_f34_const_len_err`.
+const_value, eval_array_len`, `front/assoc.vl: inherent_const_value`,
+`front/check/mod.vl: lookup_local`. *Cases:* `rust_f_f34_const_values`,
+`rust_f_f34_const_len_err`, `rust_f_f34_const_hygiene`.
 
 ## 2. Traits
 
@@ -897,6 +906,17 @@ struct of the impl's module) are resolved in the impl's. *Anchor:*
 `front/traits.vl: fn_pattern_bindings`. Case
 `rust_f_f12_pattern_impl_default`.
 
+**F12.4 (`where Self: Sized`, 0.27.6).** A trait function whose `where`
+says `Self: Sized` is not part of an impl whose `Self` is unsized (`[T]`,
+`str`), as in rustc. Its default is not checked for that impl: no opaque
+instance of the copy is made (D22.2). `impl<T: Hash> Hash for [T]` does
+not check `hash_slice(data: &[[T]], ..)`. 0.27.5 checked it and
+reported "the size of '[T]' cannot be known" in the default's body.
+The bound itself still says nothing elsewhere (it is dropped when it is
+parsed, F21). *Anchor:* `front/parser/items/params.vl: parse_where`
+(FN_SELF_SIZED), `front/opaque.vl: build_opaque_instances`. *Case:*
+`rust_f_f82_assoc_self_from_arg`.
+
 ### F13 Several impls of one generic trait for one type
 
 **F13.1 (the key).** An impl's key is its whole header `(Tr, a..,
@@ -1104,6 +1124,18 @@ with `v: &T` finds `T: Debug`) or from the expected type (an
 associated function, F18.1). Neither: `error type.infer` with `try: <T
 as Tr>::name`. *Anchor:* `front/check/resolve.vl: resolve_key` (today
 "is a trait, not a type"), `path_target`.
+(0.27.6) An associated function without a receiver also takes `Self`
+from an argument whose parameter's written type holds `Self` (`Self`,
+`&Self`, `&mut Self`, `&[Self]`, `[Self]`), as rustc infers it.
+`Hash::hash_slice(self, state)` in `impl<T: Hash> Hash for [T]`, with
+`data: &[Self]` and `self: &[T]`, is `<T as Hash>::hash_slice`. 0.27.5
+read every `Tr::f(x, ..)` as the method call `x.f(..)`, which gave Self
+`= [T]` and "an associated function, not a method". The argument's
+type is the one it has without being checked: a local, `&e` or `&mut
+e` of one, or `e[a..b]` of an array or a slice. Another argument (a
+literal array sliced in place) gives no `Self` yet. *Anchor:*
+`front/check/calls/paths.vl: synth_path_call, self_from_args`. *Case:*
+`rust_f_f82_assoc_self_from_arg`.
 
 **F8.3 (`<τ>::name`, `τ::name`).** The inherent namespace of `τ` first;
 then, with `τ` concrete, the traits in scope (F9.2) that `τ` implements
