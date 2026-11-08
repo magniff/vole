@@ -126,6 +126,11 @@ The front (front273):
   mutability, `try: &mut x`. `&mut T` still coerces to both raw
   pointers, and `&T` to `*const T`. 0.27.6 accepted it, so a callee
   could write through a pointer made from a shared borrow.
+- A literal beside a value an earlier error left untyped takes the
+  error type, so it gets no second error (F18.3). 0.27.6 checked it
+  against the i32 fallback: `let value = parse("x")` was a mismatch,
+  and `value > 9223372036854775807` then reported "does not fit in
+  type 'i32'" too. rustc reports only the mismatch.
 
 The compiler's own source (gate 3, front273):
 
