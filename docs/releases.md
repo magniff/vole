@@ -164,8 +164,11 @@ The translator (g3274; flip28's T2 to T5, its rehearsal's hand fixes):
   `*mut T`, as the rust edition does since D3.6a (rustc coerces a `&T`
   only to a `*const T`, E0308): a mutable place's is `&mut x` (a
   `var`'s, a `var` array's element, a part of what a raw pointer or a
-  `&mut` points to, `&mut cx.inst_cap`); a `let`'s or a parameter's is
-  `&raw const x as *mut _`; a static's keeps its `&`. With front273's
+  `&mut` points to, `&mut cx.inst_cap`); a `let`'s or a by-value
+  parameter's is `&mut x` too, its binding made `mut` (`let mut k`, `fn
+  twice(mut n: i64)`), since the callee may write through the pointer
+  (a write through one made from `&raw const k` would be undefined); a
+  static's, or a place behind a shared reference, keeps its `&`. With front273's
   D3.6a, gate 3's 120 such sites go to 0 (tests/refactor/edition0277r,
   tests/run/rust_t_raw_address).
 
