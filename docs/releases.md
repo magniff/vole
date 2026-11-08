@@ -160,10 +160,14 @@ The translator (g3274; flip28's T2 to T5, its rehearsal's hand fixes):
   `*message = text`, is tied to it: `fn error_offset<'a>(line: &'a [u8],
   .., message: *mut &'a [u8])` (T2; tests/refactor/edition0276g,
   tests/run/rust_t_out_view).
-- A `var`'s address given where a raw pointer goes, MVS's `&m` to a
-  `*[u8]` parameter, is `&mut m`, which Rust coerces to `*mut T`: rustc
-  coerces a `&T` only to a `*const T` (E0308), as the rust edition does
-  (D3.6a). A `let`'s, a parameter's or a static's keeps its `&`.
+- An address given where a raw pointer goes is one rustc takes for a
+  `*mut T`, as the rust edition does since D3.6a (rustc coerces a `&T`
+  only to a `*const T`, E0308): a mutable place's is `&mut x` (a
+  `var`'s, a `var` array's element, a part of what a raw pointer or a
+  `&mut` points to, `&mut cx.inst_cap`); a `let`'s or a parameter's is
+  `&raw const x as *mut _`; a static's keeps its `&`. With front273's
+  D3.6a, gate 3's 120 such sites go to 0 (tests/refactor/edition0277r,
+  tests/run/rust_t_raw_address).
 
 The sources (g3274, docs/design/src-buffer.md):
 

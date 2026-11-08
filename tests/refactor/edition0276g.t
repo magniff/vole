@@ -11,7 +11,7 @@ ok: built mvs
 % ./mvs
 7 9
 $ fix --edition rust --list-left main.vl
-fixed, 10 views to &[T], 1 '&x' to '&mut x', 3 vars to 'let mut', 7 '.len's to '.len()', 1 integer annotated, 5 text literals to bytes, 1 type, 6 indexes cast to usize	main.vl	+14 -13 lines
+fixed, 10 views to &[T], 3 vars to 'let mut', 7 '.len's to '.len()', 1 integer annotated, 5 text literals to bytes, 1 type, 6 indexes cast to usize	main.vl	+14 -13 lines
 $ fmt main.vl
 note fmt.none: 1 file formatted already
 % cat main.vl
