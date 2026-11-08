@@ -156,6 +156,36 @@ The translator and the migration of tests/run (mig28):
   collection, in full (rewrite.tsv's `$T`), because the front does not
   infer a `Vec<_, _>` from FromIteratorIn's impls.
   *Transcript:* `tests/refactor/edition0280m1`.
+- **A call of a closure, a fn pointer or an `F: Fn(..)` borrows its
+  `let` arguments.** Before, only a call of one of the program's
+  functions borrowed them (`&e`). A value's call passed them by value,
+  which is a type error where the parameter became `&T`. A closure's
+  parameter written `let T`, and a `let` position of a parameter's
+  `fn(let T)` type or of its `F: Fn(let T)` bound, take `&arg` now.
+  *Transcript:* `tests/refactor/edition0280m2`.
+- **A field of reference type written through gets its `*`**, as a
+  reference binding does where Rust does not dereference it itself. One
+  example is `*c.n += 10` for MVS's `n: inout i64`; a copy's read is
+  another. *Transcript:* `tests/refactor/edition0280m3`.
+- **An inout view given as a value is `&mut v[a..b]`.** That covers a
+  `-> inout [T]` result and a let's view; both kept a `&`, a `&[T]`
+  where `&mut [T]` goes. *Transcript:* `tests/refactor/edition0280m4`.
+- **Two more byte values print as text.** They are what a function
+  written `-> Option<[u8]>` gives, unwrapped, and a Vec element taken by
+  `get`, `first`, `last` or `pop`. *Transcript:*
+  `tests/refactor/edition0280m5`.
+- **MVS's `{x:c}` prints a character.** The rust edition has no `c`
+  spec and printed the number. The value is `x as char` (`x as u8 as
+  char` for a wider integer). A positional argument is wrapped; a named
+  hole is `{x_c}`, with `x_c = x as char` added to the call once.
+  *Transcript:* `tests/refactor/edition0280m6`.
+- **An `embed wgsl` block derives nothing, and imports go after a
+  file's leading blocks.** The translator wrote `#[derive(Clone, Copy)]`
+  inside the block's declaration, because the checker makes a struct of
+  it. A file starting with a block got its imports on the block's line,
+  and fmt then formatted the WGSL as vole. The imports now go on the
+  line of the first item after the blocks. *Transcript:*
+  `tests/refactor/edition0280m7`.
 - The borrowck twin checks type-error cases: an `ERROR` naming no
   borrowck code agrees with a rustc rejection by a code the borrowck
   table does not map (E0308, E0277). The shim's `collect_in` takes two
