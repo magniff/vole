@@ -231,6 +231,11 @@ The front (front273):
   borrowck.mut_twice. L14's ties read the same way, so a closure over
   `Chain<..>::Item` (`a.iter().chain(b.iter()).map(|x| ..)`) is tied as
   the callee is.
+- A template whose opaque instance has borrowck errors reports only
+  those, as rustc does (D4.4 (e)). Its concrete instances with regions
+  hold their errors until every body is solved. 0.27.5 also reported
+  `mixed<Split<char>>`'s copy of the template's `'b must outlive 'a`,
+  at the `let`, in terms of Split's lifetime.
 - `Tr::f(x, ..)` of a trait function without a receiver takes Self from
   the argument whose parameter holds it (F8.2):
   `Hash::hash_slice(self, state)` in `impl<T: Hash> Hash for [T]` is
