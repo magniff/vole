@@ -382,6 +382,7 @@ extract() { # <commit> <dir>
 # file <root> (a module tree, from 0.6), or else all the files of <src>
 # with extension <ext> (one module; .vl then).
 # (POSIX sh has no local variables: each function uses its own prefix.)
+CW_COLD=""
 compile_with() { # <cli> <bin> <src> <root> <out> <ext>
     cw_cli=$1 cw_bin=$2 cw_src=$3 cw_root=$4 cw_out=$5 cw_ext=${6:-.vl}
     if [ -n "$cw_root" ]; then
@@ -425,7 +426,9 @@ compile_with() { # <cli> <bin> <src> <root> <out> <ext>
             # As 0.7: the compiler's own source is in unsafe code (0.10
             # has no --allow-unsafe; unsafe operations outside unsafe code
             # are errors). (0.24: the same interface, named volec.)
-            "$cw_bin" --target "$HOST" "$@" -o "$cw_out.o" || die "$cw_bin failed to compile $cw_src"
+            # (0.27.7: $CW_COLD, the fixpoint's last build: --no-cache)
+            # shellcheck disable=SC2086
+            "$cw_bin" --target "$HOST" $CW_COLD "$@" -o "$cw_out.o" || die "$cw_bin failed to compile $cw_src"
             # shellcheck disable=SC2086
             "$CC" $LINK_FLAGS -o "$cw_out" "$cw_out.o" -lm || die "$CC failed to link $cw_out.o"
             CW_EMITTED=o
@@ -449,9 +452,19 @@ build_and_check() { # <name> <tree> <compiler> <root> <cli> <tests> <builder_cli
     compile_with "$bc_builder_cli" "$bc_builder_bin" "$bc_src" "$bc_root" "$bc_dir/build1" "$bc_ext"
     step "$bc_name: building with itself, twice"
     compile_with "$bc_cli" "$bc_dir/build1" "$bc_src" "$bc_root" "$bc_dir/build2" "$bc_ext"
+    # (0.27.7) build3, the build the fixpoint compares, is made cold: the
+    # code cache off (--no-cache, the volec-0.24 interface's), the earlier
+    # builds cached as before. A stale or wrong cache entry that changed
+    # build2 is then a failed fixpoint, not baked into the compiler or
+    # hidden by the same entry in build3. (A code cache entry gave build3
+    # another register schedule in one function than a cold build makes:
+    # docs/releases.md, 0.27.7.)
+    CW_COLD=""
+    [ "$bc_cli" = volec-0.24 ] && CW_COLD="--no-cache"
     compile_with "$bc_cli" "$bc_dir/build2" "$bc_src" "$bc_root" "$bc_dir/build3" "$bc_ext"
+    CW_COLD=""
     cmp -s "$bc_dir/build2.$CW_EMITTED" "$bc_dir/build3.$CW_EMITTED" \
-        || die "$bc_name: no fixpoint: $bc_dir/build2.$CW_EMITTED and build3.$CW_EMITTED differ (its output depends on how it was built)"
+        || die "$bc_name: no fixpoint: $bc_dir/build2.$CW_EMITTED and build3.$CW_EMITTED differ (its output depends on how it was built; build3 is made without the code cache: if VOLE_CACHE=off bootstrap.sh passes, the code cache is wrong)"
     cp "$bc_dir/build2" "$bc_dir/$bc_bin"
     TEST_TOTAL="not run"
     [ "$bc_run_tests" = 1 ] || return 0

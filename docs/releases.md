@@ -98,6 +98,8 @@ The front (front277), from the 0.28 flip rehearsal:
 
 The translator: an integer method called on literals, `(1 << n).wrapping_sub(1)` or `(2 + 3).pow(2)`, gets its leftmost literal suffixed with MVS's `i64` (`1i64 << n`, T6). The receiver otherwise has no type in the rust edition, the error above. That error added two to gate 3 (compiler/src's `logical_imm` and the egraph's random constants); with this row, gate 3 is back at 0 type errors, and its borrowck count drops to 75, since the `static mut` change accepts `&mut *A_CTX`. Transcript `tests/refactor/edition0277t6`, case `rust_t_literal_receiver` (rustc builds it and prints the same).
 
+The bootstrap: the fixpoint's last build, the one compared with the build before it, is made without the code cache (`--no-cache`); the builds before it use the cache as before. A code cache entry made one function's register schedule differ from a cold build's in the compiler's own self-compile: a tree that held it failed the fixpoint (head built by head, cached, against the cold path), and a tree whose two builds both took it would have passed with a binary no clean build makes. Now such an entry is a failed fixpoint. It costs about 1.6 s on `bootstrap.sh --dev --no-suite` (9.4 to 11.0 s, warm, under load). chain-diverse, whose builds all have the cache off, also builds the head compiler with it on in a cache of its own, storing and then taking every entry, and compares both with the cold build. The cache bug itself is being chased.
+
 In progress. Gate 3's borrowck errors that view storage other than SRC
 are being fixed in MVS (docs/design/src-buffer.md, views of other
 storage): 76 to 67 so far. MVS programs compile exactly as before.
@@ -148,6 +150,44 @@ The compiler's own source (gate 3, front273):
   positions, arch's intrinsic table and the tools' cache's read buffer
   are frozen. `volec __selftest freeze` checks the stop
   (tests/selftest.sh).
+
+The translator (g3274; flip28's T3 and T4, its rehearsal's hand fixes):
+
+- An index that calls with the indexed container's root `&mut`,
+  `pcx.types[place_ty(l, p, pbody, pcx)].kind`, is computed first,
+  `{ let at_ix = place_ty(..); pcx.types[at_ix] }.kind`, around the
+  element's first copied value (Rust's Index borrows the container
+  before the index: rustc E0502; T3). An argument that reads the root
+  another argument gives as `&mut r`, `name(&mut l, l.imports[i])`, is
+  read first (rustc E0503; a reference `r` reborrowed is two-phase and
+  stays; T4). A hoisted block that would lead a statement is
+  parenthesized, `({ .. }) > 0 && ..` (tests/refactor/edition0276e,
+  tests/run/rust_t_hoist_read).
+
+The sources (g3274, docs/design/src-buffer.md):
+
+- SRC is a view of one region per source set, reserved by mmap
+  (MAP_NORESERVE: address space, committed when written; 4 GiB,
+  VOLE_SRC_CAP for a run) and never moved, unmapped or written again
+  where SRC has been given it: appends copy past its end, a new set
+  takes a new region, and fmt's read_pieces lexes a copy in a region of
+  its own. A view of SRC is valid for the rest of the process, so the
+  rust edition's `static mut SRC: &'static [u8]` holds a `'static`
+  value. A reservation mmap refuses, or a set past its capacity, stops
+  the compiler with an error (tests/refactor/srccap), never a null SRC.
+  mmap's flags are Darwin's or Linux's by std::TARGET_OS; std2's
+  rt/sys_macos.vl and sys_linux.vl hold MAP_ANON, MAP_NORESERVE and
+  TARGET_OS (`std::TARGET_OS` in the rust edition). Compile cost the
+  same (check 8496.9 to 8464.6 M instructions), the stress-grow
+  self-compile the same object, x86_64-macos's objcheck 4 of 4.
+- The translator's static_returns: a function whose every returned
+  value is static has a `'static` result: a text literal, a call of a
+  function with a `'static` result (static_result's list, or one such
+  itself), a local each of whose `let`s is one, a range of one or of
+  base::SRC, an `if` or a block of them (`tok_text`, `node_text`,
+  `src(pcx)`, `file_bytes`, `src_text`, `flag_prefix`;
+  tests/refactor/edition0276c). It takes in static_forward (a body that
+  is one such call). Gate 3: 76 to 63.
 
 ### What's new in 0.27.6
 

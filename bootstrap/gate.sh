@@ -92,8 +92,9 @@
 # --check-alloc, and under Guard Malloc, on its self-compile and a sample
 # of the suite, 0.25);
 # chain-diverse (bootstrap/chain-diverse.sh: HEAD's compiler by the
-# normal chain, by a path without the optimizer and at -j1, the same
-# bytes and the same output on the corpus, 0.25; --release);
+# normal chain, by a path without the optimizer, at -j1 and, 0.27.7,
+# with the code cache on, the same bytes and the same output on the
+# corpus, 0.25; --release);
 # chain-fresh (bootstrap/chain-fresh.sh: the seed and every release
 # rebuilt from their tags into an empty cache, compared with
 # bootstrap/chain-hashes/, 0.25; --release);

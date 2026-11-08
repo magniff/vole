@@ -122,9 +122,15 @@ last `add_source`.
   copy of each file from the scratch buffer.
 - One `mmap` per source set, one per `read_pieces`.
 - No change to the 1,700 readers.
-- tests/compile_cost.sh before and after, and one `VOLE_STRESS_GROW=1`
-  self-compile; the language server over 5,000 edits (tests/lsp's
-  driver), its processes' address space before and after.
+- Measured (aarch64-macos, 0.27.6): tests/compile_cost.sh before and
+  after, in instructions, hello 98.8 to 98.4 M, std 1121.9 to 1116.4 M,
+  check 8496.9 to 8464.6 M, rust 200.1 to 197.9 M (the same, within
+  noise); the `VOLE_STRESS_GROW=1` self-compile gives the same object as
+  without; x86_64-macos's objcheck of the compiler, 4 of 4.
+- The language server over 5,000 edits of tests/lsp/prog's main.vl
+  (didChange each, a hover every 50): the server's address space grew by
+  0 KB (it loads no sources), its worker's by 6 MB (of 4.2 GB: the one 4
+  GiB region, reserved once), with one worker throughout.
 
 **Why not the others.**
 - (b) Append-only chunks would make offsets per-file. Every
@@ -148,8 +154,18 @@ check/format's `fixed_literal` and gpu_lint's `flag_prefix`.
 ## Not covered
 
 Gate 3's C/D group is about 45 borrowck errors, about 12 of them views
-of SRC; the other ~33 view storage this design does not touch, and are
-the next item: `buf_slice` views of BUFS buffers, which grow, are
+of SRC; the other ~33 view storage this design does not touch. They
+are front274's item (0.27.7, "Views of other storage"), in its order:
+a scratch buffer read where it is consumed (modules' `joined`); a path
+as a view of its own C string (linkfail's `root_path`, conflicts'
+`path_of`, query's `bad_item_kind`); a reader that takes what it reads
+(link_macho's `sym_name`); BUFS buffers frozen once written
+(`buf_done`); and the translator's `'static` propagation, on
+static_returns (sig.vl, this design's), whose rule already holds for
+every static value: a function whose every return is one (a listed
+static_result's call among them), or a range of one, returns
+`&'static`, so a new static_result row propagates. The storage they
+view: `buf_slice` views of BUFS buffers, which grow, are
 cleared and are rewritten (lsp/complete's `signature`, `result_text`,
 `field_text` and `call_snippet`, about 17; embed's `embed_type_name` and
 `file_line_text`; modules' `joined`; cache's `get_str`), arch's tables
