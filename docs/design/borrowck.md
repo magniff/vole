@@ -924,7 +924,12 @@ project's rule: every error of a compilation), deduped by §14.3.
    of `S`: a reference to it (a method's autoref, `(*&raw mut S).push(2)`;
    `&mut *&raw mut S`) is no reference to the static, as in rustc (0.27.4;
    the builder does not fold `*&raw mut S` back to `S`, as it folds
-   `*&x`). ir271 implements it at the front (the borrow expression's
+   `*&x`). So is any place through a `*` of the static's value (0.27.7):
+   `&mut *P` of a `static mut P: *mut T`, `&mut *S.1` of a pointer field,
+   an autoref through one (`(*Q).add()`). The static is read, a copy, and
+   the reference is the pointee's, as rustc's static_mut_refs has it.
+   0.27.6 refused each one (`emit_ref`: a projection with a `*` is no part
+   of the static). Case `rust_b_ok_static_mut_ptr_deref`. ir271 implements it at the front (the borrow expression's
    operand is a `static mut` item, and the `&` is not a raw borrow), so no
    loan of a `static mut` reaches the solve.
 
