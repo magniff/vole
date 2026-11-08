@@ -196,6 +196,15 @@ The translator (g3274; flip28's T2 to T5, its rehearsal's hand fixes):
   static's, or a place behind a shared reference, keeps its `&`. With front273's
   D3.6a, gate 3's 120 such sites go to 0 (tests/refactor/edition0277r,
   tests/run/rust_t_raw_address).
+- static_returns takes two more static values: a call of a function
+  every result of which is a part of one view parameter, given a static
+  value there (rows' `owner_name`, `base_name(sym_text(..))`), and a
+  local bound in a tuple pattern each of whose values is static
+  (sealed016's `let (text, method) = if .. { ("len()", ..) } ..`).
+  format's `fixed_literal` and the lexer's `label_line` end with
+  `buf_done`, mentions' `owner_name` returns `""`, not `c_slice(c"")`.
+  Gate 3: 9 to 3, cli/line's `args.iter().copied()`, a front gap
+  (tests/refactor/edition0277s, tests/run/rust_t_static_parts).
 
 The sources (g3274, docs/design/src-buffer.md):
 
