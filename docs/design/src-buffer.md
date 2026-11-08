@@ -155,3 +155,37 @@ cleared and are rewritten (lsp/complete's `signature`, `result_text`,
 `file_line_text`; modules' `joined`; cache's `get_str`), arch's tables
 read through a raw pointer (`text`, `intr_text`), `cstr` views of paths
 (linkfail's `root_path`), and views of tcx's own vectors.
+
+## Views of other storage (0.27.7)
+
+Gate 3's borrow checker ties a view to the parameter it was read
+through. `buf_slice`, `sym_text`, `cstr` and `c_slice` translate as
+`-> &'static [u8]`. A function that wraps one of them and takes `&Ctx`
+or `&Tcx` has its `&[u8]` result elided onto that parameter, so the
+view borrows `pcx` or `tcx`, and the caller's next `&mut` conflicts
+with it. Each class below is fixed where it is made, in MVS, by one
+of two rules: a view that could change is consumed before the next
+write, and a view of storage that is never written again is made
+without the context.
+
+- **A scratch buffer is read where it is consumed.** `joined` writes
+  `a`, `sep` and `b` into `pcx.join_buf`, which it clears on every
+  call, so its view lasts only until the next call and is never
+  `'static`. It returns nothing. Its two consumers, `join_sym`'s
+  `intern` and `qualified_if_known`'s `find_sym`, read
+  `buf_slice(pcx.join_buf)` in their own call, so no view crosses a
+  `&mut pcx`.
+- **A path is a view of its own C string.** linkfail's `root_path`,
+  conflicts' `path_of` and query's `bad_item_kind` take the `*u8`
+  (a file's path, `--kind`'s argument), not `(f, pcx)` or `tcx`. A
+  function with no reference parameter translates with a `'static`
+  result, the convention `cstr` and `c_slice` keep. A file path and
+  argv are never freed or written (paths: `load_sources`, `add_source`
+  and the tools' cache's read buffer).
+- **A reader takes what it reads.** link_macho's `sym_name` only
+  reads the link, so it takes `l: Link`, not `inout`. That is `&Link`
+  in the translation, and `sym_name(&l, l.imports[i])` is two shared
+  reads, not rustc's E0503.
+
+Frozen BUFS buffers (`buf_done`) and the translator's `'static`
+propagation follow, in their own batches.
