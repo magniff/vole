@@ -13,7 +13,7 @@ use crate::back::regalloc::intervals::trailing_zeros;
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::types::{REF_MUT, TyKind};
-use crate::places::borrowck::{Bck, LOAN_WORDS, MODE_MUT, MODE_RAW, MODE_SHARED, bit_on};
+use crate::places::borrowck::{Bck, LOAN_WORDS, MODE_MUT, MODE_RAW, MODE_SHARED, bit_on, zero_fill};
 use crate::places::borrowck::constraints::mode_of;
 use crate::places::borrowck::diag::report;
 use crate::places::cfg::{pred, pred_count};
@@ -153,14 +153,11 @@ pub fn check(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     activations(&bck, pbody);
     constant_indexes(&bck, pbody);
     loans_by_stmt(nl, &bck, pbody);
+    loans_by_act(nl, &bck, pbody);
     let nb = block_count(pbody);
-    bck.sin.clear();
-    bck.sout.clear();
+    zero_fill(&bck.sin, nb * nw);
+    zero_fill(&bck.sout, nb * nw);
     bck.cur.clear();
-    for _ in 0..nb * nw {
-        bck.sin.push(0);
-        bck.sout.push(0);
-    }
     for _ in 0..nw {
         bck.cur.push(0);
     }
@@ -345,6 +342,36 @@ fn loans_by_stmt(nl: i64, bck: inout Bck<Comp>, pbody: Body<Comp>) {
     }
 }
 
+// bck.act_at and act_ids: the nl loans by their activation location
+// (act, -1: none), each location's in their order, as loans_by_stmt.
+fn loans_by_act(nl: i64, bck: inout Bck<Comp>, pbody: Body<Comp>) {
+    let ns = pbody.stmts.len() as i64;
+    bck.act_at.clear();
+    bck.act_ids.clear();
+    for _ in 0..ns + 2 {
+        bck.act_at.push(0);
+    }
+    for _ in 0..nl {
+        bck.act_ids.push(0);
+    }
+    for j in 0..nl {
+        let s = bck.act[j];
+        if s >= 0 && s < ns {
+            bck.act_at[s + 2] += 1;
+        }
+    }
+    for s in 0..ns {
+        bck.act_at[s + 2] += bck.act_at[s + 1];
+    }
+    for j in 0..nl {
+        let s = bck.act[j];
+        if s >= 0 && s < ns {
+            bck.act_ids[bck.act_at[s + 1]] = j;
+            bck.act_at[s + 1] += 1;
+        }
+    }
+}
+
 // The loans in the current set whose region does not hold point p, taken
 // out of it: its set bits only, word by word.
 fn cur_drop_outside(p: i64, bck: inout Bck<Comp>) {
@@ -454,8 +481,10 @@ fn accesses(loc: i64, bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Co
         // RULE: D7.3 (the activations of the reservations this location
         // uses, after the operands' own accesses: the arguments are read
         // before the call activates its receiver)
-        for j in 0..loan_count(bck) {
-            if bck.act[j] == loc {
+        // (loans_by_act: those activated here, in order)
+        if loc >= 0 && loc + 1 < bck.act_at.len() as i64 {
+            for q in bck.act_at[loc]..bck.act_at[loc + 1] {
+                let j = bck.act_ids[q];
                 access(true, A_ACTIVATE, j, loan_local(j, bck), loan_proj(j, bck),
                     loan_deref(j, bck), loc, &bck, pbody, &pcx);
             }
@@ -469,9 +498,10 @@ fn accesses(loc: i64, bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Co
                 if rv == RV_SLICE {
                     bk = BK_SHARED;
                     var loaned = false;
-                    for j in 0..loan_count(bck) {
-                        if loan_stmt(j, bck) == loc {
-                            bk = loan_kind(j, bck);
+                    // (the loans made here: loans_by_stmt; the last's kind)
+                    if loc + 1 < bck.loan_at.len() as i64 {
+                        for q in bck.loan_at[loc]..bck.loan_at[loc + 1] {
+                            bk = loan_kind(bck.loan_ids[q], bck);
                             loaned = true;
                         }
                     }
@@ -540,74 +570,82 @@ fn accesses(loc: i64, bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Co
 // RULE: D2.5
 fn access(deep: bool, kind: i64, target: i64, l: i64, p: i64, deref: i64, loc: i64,
     bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
-    for j in 0..loan_count(bck) {
-        if !in_cur(j, bck) || j == target {
-            continue;
-        }
-        let lk = loan_kind(j, bck);
-        let r = rel(loan_local(j, bck), loan_proj(j, bck), loan_deref(j, bck), l, p, deref, false,
-            &bck, pbody, &pcx);
-        if r == R_DISJOINT {
-            continue;
-        }
-        var overlap = false;
-        if r == R_EXTENDS {
-            // (the first projection of the loan's place beyond the access's)
-            let e_deref = bck.w_first != 0;
-            let mode = bck.w_type;
-            if !deep && bck.w_count != 0 {
-                // RULE: D2.5 (2) (a shallow access: P is behind a deref
-                // past Q's fields)
-                overlap = false;
-            } else if !e_deref {
-                overlap = true;
-            } else if !deep || mode == MODE_SHARED {
-                overlap = false;
+    // (the loans in scope, in order: the current set's bits, as
+    // cur_drop_outside; nothing here changes the set)
+    for w in 0..bck.nw_n {
+        var x = bck.cur[w] as u64;
+        while x != 0 {
+            let j = w * 64 + trailing_zeros(x);
+            x = x & x.wrapping_sub(1);
+            if j == target {
+                continue;
+            }
+            let lk = loan_kind(j, bck);
+            let r = rel(loan_local(j, bck), loan_proj(j, bck), loan_deref(j, bck), l, p, deref,
+                false, &bck, pbody, &pcx);
+            if r == R_DISJOINT {
+                continue;
+            }
+            var overlap = false;
+            if r == R_EXTENDS {
+                // (the first projection of the loan's place beyond the access's)
+                let e_deref = bck.w_first != 0;
+                let mode = bck.w_type;
+                if !deep && bck.w_count != 0 {
+                    // RULE: D2.5 (2) (a shallow access: P is behind a deref
+                    // past Q's fields)
+                    overlap = false;
+                } else if !e_deref {
+                    overlap = true;
+                } else if !deep || mode == MODE_SHARED {
+                    overlap = false;
+                } else {
+                    overlap = true;
+                }
             } else {
                 overlap = true;
             }
-        } else {
-            overlap = true;
+            if lk == BK_FAKE {
+                // RULE: D2.5 step 4, R10 (shallow: the place or a prefix, by a write)
+                let write = kind == A_WA || kind == A_WB || kind == A_WD;
+                overlap = write && (r == R_EQUAL || r == R_EXTENDS && bck.w_first == 0);
+            }
+            if !overlap {
+                continue;
+            }
+            // The table (step 5): class S or M at this point.
+            let mutable = lk == BK_MUT
+                || lk == BK_MUT2 && bck.act[j] >= 0 && loc > bck.act[j];
+            let conflict = if kind == A_RC || kind == A_RB || kind == A_RESERVE { mutable }
+                else { true };
+            if !conflict {
+                continue;
+            }
+            // The code (step 6), by the loan's kind.
+            let mut_kind = lk == BK_MUT || lk == BK_MUT2;
+            var code = C_CONFLICT;
+            if lk == BK_FAKE {
+                code = C_GUARD_WRITE;
+            } else if kind == A_RC {
+                code = C_USE_BORROWED;
+            } else if kind == A_RB {
+                code = C_CONFLICT;
+            } else if kind == A_RESERVE || kind == A_ACTIVATE || kind == A_WB {
+                code = if mut_kind { C_MUT_TWICE } else { C_CONFLICT };
+            } else if kind == A_WA {
+                code = C_ASSIGN_BORROWED;
+            } else if kind == A_WM {
+                code = C_MOVE_BORROWED;
+            } else if kind == A_WD {
+                // RULE: D6.2.2
+                code = if escapes(j, &bck, pbody, &pcx) { C_RETURN_LOCAL }
+                    else { C_DROPPED_BORROWED };
+            }
+            if code == C_MOVE_BORROWED {
+                bck.bad_moves.push(loc);
+            }
+            report(code, kind, loc, j, l, p, deref, &bck, pbody, &pcx);
         }
-        if lk == BK_FAKE {
-            // RULE: D2.5 step 4, R10 (shallow: the place or a prefix, by a write)
-            let write = kind == A_WA || kind == A_WB || kind == A_WD;
-            overlap = write && (r == R_EQUAL || r == R_EXTENDS && bck.w_first == 0);
-        }
-        if !overlap {
-            continue;
-        }
-        // The table (step 5): class S or M at this point.
-        let mutable = lk == BK_MUT
-            || lk == BK_MUT2 && bck.act[j] >= 0 && loc > bck.act[j];
-        let conflict = if kind == A_RC || kind == A_RB || kind == A_RESERVE { mutable }
-            else { true };
-        if !conflict {
-            continue;
-        }
-        // The code (step 6), by the loan's kind.
-        let mut_kind = lk == BK_MUT || lk == BK_MUT2;
-        var code = C_CONFLICT;
-        if lk == BK_FAKE {
-            code = C_GUARD_WRITE;
-        } else if kind == A_RC {
-            code = C_USE_BORROWED;
-        } else if kind == A_RB {
-            code = C_CONFLICT;
-        } else if kind == A_RESERVE || kind == A_ACTIVATE || kind == A_WB {
-            code = if mut_kind { C_MUT_TWICE } else { C_CONFLICT };
-        } else if kind == A_WA {
-            code = C_ASSIGN_BORROWED;
-        } else if kind == A_WM {
-            code = C_MOVE_BORROWED;
-        } else if kind == A_WD {
-            // RULE: D6.2.2
-            code = if escapes(j, &bck, pbody, &pcx) { C_RETURN_LOCAL } else { C_DROPPED_BORROWED };
-        }
-        if code == C_MOVE_BORROWED {
-            bck.bad_moves.push(loc);
-        }
-        report(code, kind, loc, j, l, p, deref, &bck, pbody, &pcx);
     }
 }
 
