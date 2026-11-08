@@ -2887,6 +2887,29 @@ unsafe-audit 2775 unjustified (baseline 2775, from 3057) and 0 in std,
 chain-diverse, chain-fresh 40 releases. compile-cost against v0.26.5: a
 hello world 1.00x, std 0.99x, check of the compiler 1.01x.
 
+### 0.27.8
+
+The release gate (`gate.sh --release --no-linux -j 4`), macOS only, at
+a load of four agents' builds beside it: every row but borrowck-twin
+passed on its first run. borrowck-twin found a new type-error case
+(E0308, D3.6a) without the twin's `RUSTC: none` marker; with the marker
+it passed on its rerun (0 mismatches). The rows: the suite 7027 at
+-O0, -O1 and -O2 (131 XFAIL; SKIPPED: no spirv-val), std2-tests 1483 at
+-O0 and -O2 under --check-alloc (26 XFAIL, gate 1: 1000), std2-check
+2399 bodies (2397 clean, 0 with borrowck errors, 2 not solved; 1505
+cases, 0 with borrowck errors), threads 15775, incremental 172 series,
+objcheck 13560 (and 264 for x86_64-macos), compiler-memcheck 727,
+examples-checkalloc 183, every fuzz and ABI row, stress-grow, cachediff
+1569 lines (425 from the cache), borrowck-twin 444 cases (404 agree, 10
+named divergences, 30 outside the subset, 0 mismatches), unsafe-audit
+2769 unjustified (baseline 2769) and 0 in std, chain-fresh (49 releases
+from the seed), chain-diverse. The translate row: 985 of 1475 programs
+round-trip (981 in 0.27.7), and the rustc twin agrees on 559 of 985
+(560 of 981). The gate3 row: 0 errors. compile-cost against v0.27.7: a
+hello world 1.00x, std 1.00x, check of the compiler 1.02x, the rust row
+1.00x; hello-rust 1.79x its MVS row (176.9M; 1.88x in 0.27.7), under
+the 2.0x ceiling, std-rust 0.53x.
+
 ### 0.27.7
 
 The release gate (`gate.sh --release --no-linux -j 4`), macOS only:
