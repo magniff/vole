@@ -166,6 +166,11 @@ compilers):
   share their symbol (fn_ambig) may have one cache key and run in one
   phase. Their tasks no longer mark the entry used. The mark only keeps
   an entry from aging out of the pack.
+- **The assembler's internal error** (asm_error, a line it cannot
+  encode) made its message in base's buffer table, on -O0's assembler
+  thread or on a joining main thread at -O1 and above, where another
+  thread may grow the table. It writes to stderr through std's `eprint`
+  now, under std's print lock, and touches no buffer of base's.
 
 The front (front273, I7):
 
