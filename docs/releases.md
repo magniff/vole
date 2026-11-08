@@ -149,8 +149,7 @@ The translator (g3274):
   `std::num::parse_f64(s[a..b])` of bytes is
   `str::from_utf8(&s[a..b]).unwrap().parse::<f64>()` (a receiver a `&`
   starts is parenthesized); `let f = fs[i];` of an element that is not
-  Copy is `&fs[i]`. `Buf::new_in` is `Vec::new_in` (the rust edition
-  infers no `_` in `Vec::<u8, _>::new_in(gpa)`, which rustc does).
+  Copy is `&fs[i]`.
 
 The front (front273):
 
