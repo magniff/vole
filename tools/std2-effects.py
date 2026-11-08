@@ -136,7 +136,18 @@ def main():
         path = os.path.join(STD2, name)
         lines = open(path).read().split("\n")
         for line, decl in sorted(edits, reverse=True):
-            if line >= 2 and lines[line - 2].strip().startswith("#[effects("):
+            # (already declared: a declaration among the item's attributes
+            # and the comments above it, an unsafe item's `// UNSAFE:` and
+            # `// SAFETY:` lines between them; 0.27.5: each run added one
+            # more above those)
+            k = line - 1
+            declared = False
+            while k > 0 and lines[k - 1].strip().startswith(("//", "#[")):
+                k -= 1
+                if lines[k].strip().startswith("#[effects("):
+                    declared = True
+                    break
+            if declared:
                 continue
             # (above an unsafe item's `// UNSAFE:` and `// SAFETY:` lines,
             # which stay right above it, and above its other attributes)

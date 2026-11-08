@@ -514,6 +514,17 @@ re-inferred.
   `RV_REF` with the supporting-prefix constraint `'q : 'new` below, and
   the verifier (`--verify-places`, I7) rejects such a `copy`. (M1's
   reading of it as that reborrow was the stopgap until then; retired.)
+  (0.27.6) A `&mut` place given where a raw pointer goes (a `*mut T` or
+  `*const T` parameter: the coercion) is reborrowed raw, `_t = &raw mut
+  (*Q)` (`BK_RAW_MUT`), as rustc's MIR has it. That creates no loan
+  (D2.1), so the reborrow ends at the coercion: a later `&mut` of a
+  part of `*Q` in the same call's arguments, `f(cx, &mut cx.cap)`, is
+  no conflict. The coercion's own access is a deep write of `*Q`
+  (D2.2), so a loan of a part of `*Q` that is live across it still
+  conflicts (rustc E0502: `let r = &cx.cap; f(cx); r`). 0.27.5 gave
+  it as the shared reborrow `&(*Q)`, whose loan lived to the call.
+  *Cases:* `rust_b_raw_coerce_ends_borrow`,
+  `rust_b_raw_coerce_live_shared_err`.
 - `SK_ASSIGN (a,b) = RV_REF P` (`e = 'ℓ`, `d ≠ BK_RAW`): loan `ℓ`
   created; `sub(&'ℓ [mut] type(P) ≤ type((a,b)))` (a `BK_FAKE` loan:
   `type((a,b))` is `&type(P)`); **the supporting-prefix rule:** for
@@ -743,6 +754,21 @@ D3.6).
   `'a` result it is `borrowck.outlives` ('b: 'a not known), as rustc's
   E0495/lifetime error. A real instance normalizes the projection by its
   impl (D4.4) and is checked as before.
+- (g) *A projection whose impl's value is a projection (0.27.6).* An
+  impl's associated type may be a projection of one of the impl's own
+  parameters: `impl<I: Iterator> Iterator for Skip<I> { type Item =
+  I::Item; }`. Such a projection is normalized again, by the direct
+  impl for the type the impl's header binds that parameter to in the
+  base. For `Skip<Split<'a, char>>`, the header binds `I` to
+  `Split<'a, char>`, so the item is `Split`'s `&'a str`. Each slot
+  stays in the base's slots, through the header's binding, at every
+  depth. So `fn pass<J: Iterator>(it: &mut J) -> Option<J::Item>` with
+  `J = Skip<Split<char>>` gives an item of `'a`, not a borrow of `*it`.
+  0.27.5 read the inner projection as elided, and E2 tied it to `&mut
+  J`: two `pass(&mut it)` calls whose items were both live were
+  borrowck.mut_twice, which rustc accepts. *Anchor:*
+  `places/regions.vl: proj_map, proj_again`. *Case:*
+  `rust_b_nested_projection_item`.
 
 ## 5. Variance (S5)
 
@@ -910,6 +936,19 @@ desugaring's receiver binding `__r` is the two-phase reborrow `__r =
 &'r mut2 *w`, not a move of `w`, so the arguments read `w` in its
 reservation window (`write(f, "{}", f.width())`) and `w` is usable after
 the call, as rustc's.
+(0.27.6) So is a writer place that is no reference, `write(self.emsg,
+"{}", self.name())`: F16.3 makes it `&mut self.emsg`, an autoref whose
+span is the place's, and that `__r = &'r mut2 self.emsg` is two-phase,
+as rustc's `write!(self.emsg, ..)` (`self.emsg.write_fmt(..)`, an
+autoref'd receiver). This covers std2's writer functions only (`write`,
+`writeln`), which stand in for Rust's macros: a writer the program
+borrows itself, `write(&mut self.emsg, "{}", self.len())` (rustc's
+`write!(&mut self.emsg, ..)`), and an explicit `&mut v` argument to any
+other function, `take(&mut v, v.len())`, stay ordinary `&mut` borrows,
+borrowck.conflict as rustc's E0502. *Anchor:* `places/build.vl:
+writer_autoref, lower_let`. Cases `rust_b_ok_tp_write_autoref` (the
+twin's `write!(self.emsg, ..)` agrees) and
+`rust_b_err_tp_write_explicit_ref`.
 
 ## 8. Moves and initialization (S8)
 
@@ -2150,7 +2189,12 @@ concrete ones and type-checked and borrow-checked; they, and every
 instance with an Ω among its type arguments (or a virtual function's,
 its `Self` an Ω) and the closures in them, are left out of code
 generation (finish_program) and effects; an instance without one that
-their checking makes first (`println::<&str>`) is lowered as any. An
+their checking makes first (`println::<&str>`) is lowered as any. Nor
+are the drop shims (places-ir.md §3.9) of the types holding an Ω that
+their drops drop: `drop(v)` of a `v: Vec<i64, Ω>` asks for no shim
+(0.27.6; 0.27.4 and 0.27.5 made one, lowered at -O0 and -O1 as every
+shim is, which called a `Vec::drop` of no instance: an undefined
+symbol). An
 instance of a std template with an Ω is type-checked only: std's bodies
 are borrow-checked as std's (Z7). An error in one is reported at the
 template's position, without an instance note, and not when an error

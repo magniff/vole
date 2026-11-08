@@ -84,8 +84,242 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.3 | `v0.27.3` | 0.27.2.1 | aarch64-macos | the translator `fix --edition rust` and gate 2 (`tests/translate.sh`, the rustc twin); the i32 literal default (FL6); std2 1,402 of 1,472 tests at -O0; lazy std2 parsing (a rust hello world 2.32x MVS's); arrays' by-value IntoIterator |
 | 0.27.4 | `v0.27.4` | 0.27.3 | aarch64-macos | gate 3 opens (`fix --edition rust` on compiler/src: 122 type errors, 3,048 borrowck behind them); inference from a later statement (FL1); `[T]`/`str` unsized places (Z9.1c); `&raw` and Rust 2024's `static mut` rule; `format_args` a value; std2 1,445 of 1,473 tests at -O0; a rust hello world 2.03x MVS's |
 | 0.27.5 | `v0.27.5` | 0.27.4 | aarch64-macos | std2's `std::time`, `fs`, `process`, `cli` (gate 3 from 122 to 37 type errors); operands read where evaluated (D2.4a); text is not its bytes (F0.6); a generic iterator's item is its bound's (D4.6 f); std2 lexed by its units (a rust hello world 1.82x MVS's, the 2.0x ceiling enforced) |
+| 0.27.6 | `v0.27.6` | 0.27.5 | aarch64-macos | gate 3 has no type errors (76 borrowck left); std::gpu::wgsl in std2; a method in a generic body is the one it names (Z9.1c); const fn and constants made at each use; octal, `let ref`; a 0.27.5 wrong-output fix (constants' names) and an -O0 link fix |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.27.6
+
+Gate 3 has no type errors. `fix --edition rust` on a copy of compiler/src now type-checks: std2 has `std::gpu::wgsl`, the WGSL front compiler/src uses (translated by `fix --edition rust`, finished by hand, the same answers as MVS's front on every .wgsl in the tree), behind a gate that keeps it out of a program that does not name `gpu`; the translator's last type-error shapes are done (eight found by the wgsl port). What is left is borrowck: 76 errors (154 behind 37 type errors in 0.27.5), after nested calls on one `&mut` root are hoisted (rustc's E0499, which 0.27.5 missed). In the rust edition: a method call in a generic body takes the method the body names, as rustc does (Z9.1c); `const fn`, and constants of any type made at each use; a constant's initializer is checked in its own scope (0.27.5 could call a local of the use's scope instead: wrong output); octal literals, `let ref`, tuple branches typed together; `&e` stays shared where `&mut` goes (rustc's E0308); a `&mut` given to a raw pointer ends its borrow. A generic function with a local `Vec<T, A>` links at -O0 and -O1 again (0.27.4 and 0.27.5 failed). A rust hello world's check is 1.88x MVS's (1.82x). MVS programs compile exactly as before. Built and tested on aarch64-macos only.
+
+The translator (g3274):
+
+- std2's fs, process and env by rewrite.tsv's rows: `fs::exists`,
+  `fs::append`, `fs::copy`, `Metadata::modified`, `DirEntry::is_*`,
+  `Command::new` to `Command::new_in($1, $a)` (`$a`, when the function
+  has no Gpa, a program allocator it makes before the call), `process::id`
+  and `Child::id` as i32, `env::get_in` to `var_in`. A free function's
+  row may name its module (`fs::copy`, not io::copy). Bytes given as a
+  path, a program or an argument are `str::from_utf8(p).unwrap()`.
+- A result's `'a` by flow: with MVS's view summary, only on the
+  parameters the result's views come from, and on an item's region for
+  an item with views taken by reference (`leaf: &Leaf<'a, Gpa>`), so a
+  temporary given to another parameter need not outlive the result
+  (cli/tree.vl's two borrowck.return_local).
+- Gate 3: 127 (at std2's process) to 17 errors; 12 wait for std2's cli,
+  2 for std::gpu, 1 for std::num; borrowck (partial) 142 to 139.
+- A Vec's element assigned with an index that reads the Vec, or what
+  holds it (`pcx.files[pcx.files.len() - 1].module = m`,
+  `pcx.nodes[child(own, i, pcx)].a = ..`), is `{ let at_ix = I;
+  pcx.files[at_ix].module = m }`: Rust's IndexMut borrows the Vec before
+  the index is read (rustc E0502). A pass after the others, so the index
+  moves with its edits.
+- std::cli's type rows' `'_` (`Command<'_, $1>`, `Arg<'_>`) take the
+  region the signature gives them: `build_command(gpa) -> Command<'static,
+  Gpa>`, `flag<'a>(name: &'a str, help: &'a str) -> Arg<'a>`; such a type
+  is an item with views for elision and for the flow rule (a reference to
+  one gets the item's region). A container of views by value
+  (`errs: Vec<Ev<'_>, Gpa>`) takes the function's `'a` too.
+- An inout slice parameter given an array or a part of one, whose `&` the
+  checker takes into its view, is `&mut` (`first(&mut a)`,
+  `first(&mut [1i64, 2, 3][..])`; rustc E0308 otherwise).
+- A function whose body only calls one with a `'static` result
+  (static_result's list) has a `'static` result too: the forwarders
+  `fn sym_text(sym, pcx) -> [u8] { crate::base::sym_text(sym, pcx) }` of
+  tools/refactor_shape, guide/stdapi and front/own/infer.
+- A guarded match on a copy value read from a place matches the value,
+  `match { pcx.nodes[n].kind } { .. }`: Rust keeps the scrutinee's place
+  borrowed through the guards (rustc E0502 against a guard's `&mut`).
+- Gate 3, with std2's cli: 14 type errors, none of them the translator's;
+  borrowck (partial) 152 to 96. A borrowck case for the class it leaves,
+  a `&mut` coerced to a raw pointer held through the call:
+  `rust_b_raw_coerce_ends_borrow` (XFAIL).
+- An argument the checker takes as a view for a parameter written `&mut`
+  (std::arch's `vst1q_u32(s: &mut [u32], ..)`) is `&mut` too, as for
+  `inout`: link_macho's `vst1q_u32(&mut h[..], 0, abcd)` (rustc E0308,
+  which the rust edition's `&e` reports since front273). Gate 3: 5 to 3.
+- The std::gpu::wgsl port's classes (tests/refactor/edition0276b,
+  tests/run/rust_t_wgsl_classes, which the rustc twin builds):
+  `use std::Option::Some;` (a prelude variant) goes; a type row keeps the
+  MVS name only for a name std2 has (`Buf<A>` is `Vec<u8, A>`, not
+  `Buf<u8, A>`); a Buf's `push_fmt` with holes takes its row through a
+  field or a parameter (the checker's copy of the written call keeps the
+  method's name); `f.emsg.len` of a Buf is `len()` once; rewrite.tsv's
+  `$b1`, an argument where bytes go, makes a text literal `b".."` (and a
+  `&str` value `.as_bytes()`): `extend_from_slice(b"ref to ")`; a bytes
+  hole of a function's format call (no named arguments there) is bound
+  by a `let`, `{ let what = str::from_utf8(what).unwrap(); write(..) }`;
+  `std::num::parse_f64(s[a..b])` of bytes is
+  `str::from_utf8(&s[a..b]).unwrap().parse::<f64>()` (a receiver a `&`
+  starts is parenthesized); `let f = fs[i];` of an element that is not
+  Copy is `&fs[i]`.
+- An argument that calls with the root a call takes `&mut` is computed
+  first, `{ let at_arg1 = ir_val(cx, v); is_const(cx, at_arg1) }`:
+  Rust's reborrow for the first argument lives through the others, so
+  the inner call's `cx` is a second mutable borrow (rustc E0499, which
+  the borrow checker reports since D3.6 for a raw-pointer parameter too).
+  Only when every argument before it is plain, so MVS's order is kept;
+  innermost calls first (tests/refactor/edition0276d,
+  tests/run/rust_t_hoist_arg). Gate 3: 103 to 76 (32 borrowck.mut_twice
+  to 5).
+
+The sources (g3274, docs/design/src-buffer.md):
+
+- add_source no longer writes over the NUL that ends SRC: the next file
+  starts after it and a newline, so no byte of a SRC already given out
+  changes (a view of it that ended at the NUL saw the next file's first
+  byte). The lexer reads that NUL, which is no file's text, as blank (a
+  module of several files is lexed as one range), and the tools' cache
+  restores the layout.
+
+The front (front273):
+
+- A method call in a generic body takes the method the body names, as
+  rustc does (Z9.1c). The receiver must be a value of a bounded type
+  parameter, like `(**self)` of `self: &&T` or `c` of `c: C`. It gets
+  the bound's method for the type the parameter stands for, never one
+  found again through that type's references. `via(r)` of `fn via<C:
+  Tag>(c: C) { c.tag() }` with `C = &&str` now runs the reference impl
+  twice and prints 21; 0.27.4 took str's impl for `(**self)` and
+  printed 11.
+- `&mut [1, 2, 3][..]` passed where a `&mut [i64]` goes is accepted, as
+  rustc accepts it (F18.4). 0.27.5 checked the sliced literal against
+  the `&mut` type and refused it with "expected 'inout [i64]', got
+  '[i64]'".
+- `A::clone(&a)` and `Clone::clone(&a)` of a bounded parameter `a: A`
+  call the bound's clone of the type A stands for, as `a.clone()` does
+  (Z9.1c). With `A = &Gpa`, `fn two<A: Allocator + Clone>(a: A)` now
+  checks; 0.27.5 took Gpa's clone through the reference.
+- In the rust edition a shared `&e` where `&mut` goes is refused, as
+  rustc refuses it (E0308): `bump(&n)`, `first(&[1, 2, 3][..])`,
+  `first(&a[..])`.
+  - Each is a type error, with `&mut n`, `&mut [1, 2, 3][..]` or
+    `&mut a[..]` as its `try:` and fix.
+  - 0.27.5 made such a `&` exclusive, MVS's inout marker, and accepted
+    it. MVS keeps the marker.
+  - No std2 or rust case relied on it.
+- Octal literals: `0o644`, `0o7_55` and `0o17u8` are read in the rust
+  edition (F23.5). An 8 or 9 among the digits is rustc's "invalid digit
+  for a base 8 literal". MVS still refuses `0o`.
+- A rust-edition generic function with a local whose type names its
+  parameter, like `let v: Vec<i64, A>` in `fn two<A: Allocator>`, now
+  links at -O0 and -O1 (D22.2). In 0.27.4 and 0.27.5, the borrow check's
+  opaque instance made a drop shim for `Vec<i64, Ω>`. Shims are lowered,
+  and that one called a `Vec::drop` that had no instance, so the link
+  failed with an undefined symbol. -O2 was not affected.
+- Tuple branches type their literals from each other when no type is
+  expected (F18.5). In `match k { 0 => (gap, 0), _ => (0, gap) }` with
+  `gap: usize`, both elements are `usize`, as rustc infers. 0.27.5 typed
+  the first arm `(usize, i32)` and refused the second. The same applies
+  to an `if` and its `else`.
+- `let s: &[i64] = &[1, 2, 3][1..];` is accepted: the hoisted temporary
+  is the array, typed by the annotation (F18.4). 0.27.5 typed it by the
+  `i32` fallback and refused it.
+- `let ref x = e;` and `let ref mut x = e;` borrow `e` as `&e` and
+  `&mut e` do, as rustc does (F27.2). 0.27.5 moved `e`: after `let ref z
+  = a;`, `a` was moved, and `let ref mut w = v[0]` changed a copy.
+- `const fn` declares a function, at the top level and in impls (F34.1).
+  A call of one is constant in a static's value (`static S: D =
+  D::new(5);`).
+- A constant of a struct or tuple type, or whose value calls a function,
+  is accepted (F34.2). Examples: `const ORIGIN: D = D { secs: 5 };`,
+  `const N: u64 = double(21);`. Each use makes the value again, so two
+  uses of a constant with a Drop field are two values, as in Rust.
+  - Such a constant is not yet a compile-time value: as an array length
+    or in a pattern it is an error.
+  - 0.27.5 refused these constants.
+  - The copied value is resolved as at the constant: a local or type
+    parameter at the use with the same name is not seen. Inherent
+    constants work the same way now.
+  - 0.27.5 could call a local instead (wrong output). With `impl D {
+    const T: u64 = double(22); }` and a closure `let double = ..` at the
+    use, `D::T` called the closure.
+- A `&mut` given where a raw pointer goes is a raw reborrow that ends
+  at the coercion, as in rustc (D3.6). `f(cx, cx.f, &mut cx.cap)` with
+  `cx` going to a `*mut C` is no longer a conflict (gate 3's class S).
+  A shared borrow that is live across the coercion still conflicts
+  (E0502). The coercion is a mutable use of what `cx` points to, both
+  ways round: 0.27.5 accepted `outer(cx, inner(cx))` with `outer`
+  taking `&mut C` and `inner` a `*mut C`, which rustc rejects (E0499,
+  now `borrowck.mut_twice`: gate 3's 27 nested `is_const(cx, ir_val(cx,
+  ..))` calls, which the translator has to hoist), and rejected it with
+  the two parameter types swapped, which rustc accepts.
+- `Tr::f(x, ..)` of a trait function without a receiver takes Self from
+  the argument whose parameter holds it (F8.2):
+  `Hash::hash_slice(self, state)` in `impl<T: Hash> Hash for [T]` is
+  `<T as Hash>::hash_slice`. A trait function with `where Self: Sized`
+  is no longer checked for an impl whose Self is unsized (F12.4).
+
+std::gpu::wgsl in std2 (fl10274):
+
+- std2 has MVS's WGSL front, the half of std::gpu::wgsl the compiler
+  checks an `embed wgsl` block with: `std::gpu::wgsl::front::{Front,
+  new_front}`, `Front::module` and `uniformity::check` (6.9k lines of
+  compiler/std/gpu/wgsl's ir, names, lex, front, expr, builtins and entry,
+  translated by `fix --edition rust` and finished by hand: generic over an
+  `A: Allocator + Copy`, names `&'a [u8]` of the source). The writers,
+  the interpreter and the device API come later.
+  - It gives every .wgsl file of the tree MVS's verdict, error and help
+    lines included: tests/wgsl/front2.sh, 37 files, 0 differ. Case
+    std2_gpu_wgsl_front_new_front.
+  - Gate 3 has 0 type errors: `fix --edition rust` on compiler/src now
+    leaves only borrowck errors (96, `check --borrowck-partial`). The
+    row `uniformity::check(&$1)` takes the front by reference.
+  - A rust hello world does not read it: front-rust.md Z5.2's gated
+    modules (`gpu`) wait for their name, as the reach matches names
+    without modules. hello-rust is 1.86x MVS's here, 1.88x at the gate (1.80x before; 2.42x
+    ungated), the compiler's self-build 0.23% dearer (its embedded std2,
+    1.155 MB to 1.48 MB).
+- tests/translate/wgsl-classes.md: the eight translator mistakes the
+  port found, a minimal program each, for g3274.
+
+std2 and the translator (fl10274):
+
+- Gate 3's type errors go from 14 to 3, with g3274's rows and std2's cli.
+  - `for v in m.values("x") { if v == "on" .. }` over a call that gives
+    a slice is written `for &v in ..`, as for a named slice: the cli's
+    `expected 'let str', got 'str'`.
+  - A row for `str` also fires on a text the MVS front sees as `[u8]`
+    (a literal, or a value declared as text): `s.split(b'|')` in a
+    `match` scrutinee or a call's argument. A row's `'c' as char` is
+    written `'c'`.
+  - `arena_scope(&gpa, f)` is `Arena::new_in(gpa).scope(|s| f(s))`, and
+    `Arena::none()` is `Arena::new_in` on the allocator in scope.
+  - `IntVecItems::fold` reads through a method, not a `*i64` index, and
+    std2 has crate-private `count_ones`, `leading_zeros` and
+    `trailing_zeros` for std::arch's callers.
+- std2's effects:
+  - `tools/std2-effects.py` no longer writes a second `#[effects(..)]`
+    above an item that has one under its comments; 14 duplicates in
+    ptr.vl, slice.vl, str.vl, string.vl and env.vl are gone.
+  - `Result::ok`, `and`, `or`, `unwrap_or` and Option's `unwrap_or`,
+    `ok_or`, `and`, `or`, `xor`, `zip` name the type parameters they
+    drop, so a `T` with Drop is checked (std2_result_option_drops).
+  - `impl Read for &File` and `impl Write for &File` read `(*self).fd`.
+    Their bodies did not check, which left `std::panic::panic`'s effects
+    "(unknown)" through fn-value dispatch; it is `io panic diverge`, and
+    `fix --only effects-std` writes that on a function that panics.
+
+The front (fl10274):
+
+- A generic struct's or variant's field typed by its allocator
+  parameter itself (`struct Cx<W: Allocator> { arena: W }`) takes the
+  value's own type, as rustc infers it (front-rust.md F18.7): `Cx {
+  arena: Arena::new_in(gpa) }` is `Cx<Arena<Gpa>>`. 0.27.5 bound `W` to
+  the `_in` call's allocator argument, the rule for a field `Vec<T, W>`,
+  and gave "expected 'Gpa', got 'Arena<Gpa>'" (gate 3's main.vl:204).
+- A `_` for a bounded parameter is inferred, as rustc infers it
+  (front-rust.md F18.6 g): `Vec::<u8, _>::new_in(gpa)`, `let v: Vec<u8,
+  _> = Vec::new_in(gpa)`, and the same as a struct literal's field. The
+  bound is checked once the `_` is solved. 0.27.5 checked it on the `_`
+  itself ("the trait 'Allocator' is not implemented for '_'"), and the
+  translator's `Buf::new_in` row writes that form.
+- `HashMap<&[u8], V>` checks: std2's `[T]` hash calls `T::hash_slice`.
+- std2's `write(self.emsg, "{}", self.name())`, a writer place that is
+  no reference, is two-phase, as rustc's `write!(self.emsg, ..)`'s
+  autoref'd receiver (borrowck.md D7.4): the arguments may read what
+  holds the writer. `write(&mut self.emsg, ..)` and an explicit `&mut v`
+  argument are not, as in rustc (E0502).
 
 ### What's new in 0.27.5
 
@@ -177,9 +411,6 @@ The translator (g3274):
   the same programs now agree on 522 of 559. A literal that is a
   static's or a constant's `[u8]` value, or an `if` branch beside
   declared bytes, is `b".."`.
-- Gate 3 so far: 121 errors (117 type error, 2 edition.lenient, 1
-  distinct.mix, 1 item.private); borrowck (partial), with front275's
-  D2.4a: 161.
 
 The borrow checker (bc275):
 

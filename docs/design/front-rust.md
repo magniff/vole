@@ -400,15 +400,26 @@ rust-edition position, with these readings:
   str` is `<str as AsRef<[u8]>>`, in an instance too, with or without an
   expected type (before, with `let b: &[u8] = ..` the reference impl took
   it, called itself, and the program overflowed its stack).
-- *Not yet: an instance's call is resolved again, not the template's
-  choice substituted* (0.27.5, a wrong output). rustc resolves a method
-  call once, on the generic body: `(**self).tag()` in `impl<T: ?Sized +
-  Tag> Tag for &T` is `<T as Tag>` for every T, so with `C = &&str`,
-  `via(r)` of `fn via<C: Tag>(c: C) { c.tag() }` is the reference impl
-  twice (21). Vole checks the instance's body with T = `&str` and takes
-  the place's impl for `(**self)`, a view (11). The fix: an instance's
-  call takes the template's resolution with the instance's types. Case
-  `rust_f_z91c_template_choice` (XFAIL).
+- *An instance's call through a type parameter* (0.27.5). rustc resolves
+  a method call once, on the generic body: `(**self).tag()` in `impl<T:
+  ?Sized + Tag> Tag for &T` is `<T as Tag>::tag` for every T. Vole checks
+  the instance's body, and a receiver whose type as written in the body
+  is a bare type parameter T bounded by a trait Tr that declares the
+  method takes `<X as Tr>::m`, X the type T stands for: X's own impl of
+  Tr or a pattern impl (`impl<T> Tr for &T`), its `&self` borrowing the
+  receiver, and never a method found again through X's references or a
+  view's place. So with `C = &&str`, `via(r)` of `fn via<C: Tag>(c: C) {
+  c.tag() }` is the reference impl twice (21, as rustc; 0.27.4 took
+  str's for `(**self)`, 11). The type as written is a local's declared
+  type (a parameter's, a `let`'s annotation), `Self` read as the impl's
+  self type as written, and `*e` as e's pointee; any other receiver is
+  resolved in the instance as before. Case `rust_f_z91c_template_choice`.
+  (0.27.6) The same holds for the path forms: `Clone::clone(&a)`, and
+  `A::clone(&a)` of a bounded parameter A whose bound declares the method
+  with a receiver, which is read as `Clone::clone(&a)`. With `A = &Gpa`
+  all three are `<&Gpa as Clone>::clone` (0.27.5 took Gpa's, "expected
+  &Gpa, got Gpa", or found no `clone` in `&Gpa`). Cases
+  `rust_f_z91c_template_choice_clone` and `_alloc`.
 - *`&'a T` of an unsized argument in a signature* (0.27.5, D4.6). With
   `T = Unsized(v)`, `&'a T` is the view `v` whose region is the
   reference's (`'a`, or the elided one, E2/E3's), with T's slots (the
@@ -460,6 +471,17 @@ today. *Anchor:* `synth_mode.vl: synth_array` ("cannot infer the type
 of an empty array").
 
 **F23.4 (character literals).** F1.2.
+
+**F23.5 (octal literals).** (0.27.6) In a rust-edition file an integer
+literal may be written `0o` then octal digits and `_` (`0o644`,
+`0o7_55`, `0o17u8`): its value in base 8, typed like any integer
+literal (F18.3) and suffixed like one. A digit `8` or `9` among its
+digits is rustc's error, "invalid digit for a base 8 literal" (`0o8`,
+`0o78`); `0o` with no digit after it, "expected octal digit after
+'0o'" (rustc E0768). Only the lower-case `o` (rustc refuses `0O`). `{:o}` formats an integer in base
+8 (`{:#o}`: `0o` first). MVS files keep refusing `0o` (an invalid
+suffix on `0`). *Anchor:* `front/lexer/mod.vl: lex_number`,
+`lex_radix_digits`. *Cases:* `rust_f_f23_octal`.
 
 ### F29 Casts
 
@@ -567,6 +589,52 @@ made it, through the allocator that code names. References (`&'a
 Arena<P>`), `Box<T, A>`, arrays, tuples and the other parts are looked
 through as before; MVS is unchanged. *Anchor:* `front/check/
 alloc_rules.vl: field_allocator`.
+
+### F34 `const fn`
+
+**F34.1 (the qualifier).** (0.27.6) In a rust-edition file `const fn`,
+`const unsafe fn` and `const extern "C" fn` declare a function as
+`fn`, `unsafe fn` and `extern "C" fn` do: at the top level and in an
+inherent impl or a trait impl, after any visibility (`pub const fn`); a
+block holds no item in vole, `const fn` or other. The qualifier changes nothing in the function, which is called
+at run time like any other. A call of it is constant where a call of a
+function whose body is one expression already is: a static's
+initializer (consteval.vl's constant constructors). rustc's checks of a
+`const fn` body (E0015: a non-`const` call in it) are not made. A
+`const` before anything else is a constant, as before (`const N: τ =
+v;`), and `*const fn()` is a raw pointer type. *Anchor:*
+`front/parser/rust.vl: skip_const_fn`, `front/parser/items/mod.vl:
+parse_item, parse_impl`. *Cases:* `rust_f_f34_const_fn`.
+
+**F34.2 (constants of other types).** (0.27.6) In a rust-edition file
+a `const C: τ = v;` whose type is not a number, a `bool`, a fieldless
+enum or a string, or whose value calls a function (`const N: u64 =
+double(21);`, `const SECOND: D = D::new(1, 0);`), is made at each use:
+`C` stands for a copy of `v`, checked against `τ` in the constant's
+module, as an inherent impl's constant already is (F3.1:
+`assoc.vl: inherent_const_value`). So each use is a fresh value, as in
+Rust: two uses of a constant with a Drop field are two values, each
+dropped once, and a change to one does not reach the other. Rust
+evaluates `v` at compile time and copies the result; vole evaluates it
+at each use, which gives the same values because a `const fn`'s body is
+deterministic. Such a constant is not a compile-time value yet: as an
+array length or in a pattern it is an error that says so (rustc accepts
+both). A constant defined through itself is an error at its use.
+The copy is read as at the constant: no local and no type parameter of
+the use is seen, so `let double = |x| x;` at a use of `const N: u64 =
+double(21);` does not take the place of the function `double`. The
+same holds for an inherent impl's constant (`impl D { const T: u64 =
+double(22); }`), whose copy 0.27.5 resolved in the use's scope: a
+local `double` was called there, which was wrong code. (`lookup_local`
+reads the env from `env_floor` up, and the copy is checked with no
+type parameter bound beyond the impl's.)
+0.27.5 refused such a constant ("constants must be integers, floats,
+bool or string literals"). MVS is unchanged. *Anchor:*
+`front/check/collect.vl: collect_const_types` (state 3),
+`front/check/names.vl: inline_const`, `front/consteval.vl:
+const_value, eval_array_len`, `front/assoc.vl: inherent_const_value`,
+`front/check/mod.vl: lookup_local`. *Cases:* `rust_f_f34_const_values`,
+`rust_f_f34_const_len_err`, `rust_f_f34_const_hygiene`.
 
 ## 2. Traits
 
@@ -838,6 +906,17 @@ struct of the impl's module) are resolved in the impl's. *Anchor:*
 `front/traits.vl: fn_pattern_bindings`. Case
 `rust_f_f12_pattern_impl_default`.
 
+**F12.4 (`where Self: Sized`, 0.27.6).** A trait function whose `where`
+says `Self: Sized` is not part of an impl whose `Self` is unsized (`[T]`,
+`str`), as in rustc. Its default is not checked for that impl: no opaque
+instance of the copy is made (D22.2). `impl<T: Hash> Hash for [T]` does
+not check `hash_slice(data: &[[T]], ..)`. 0.27.5 checked it and
+reported "the size of '[T]' cannot be known" in the default's body.
+The bound itself still says nothing elsewhere (it is dropped when it is
+parsed, F21). *Anchor:* `front/parser/items/params.vl: parse_where`
+(FN_SELF_SIZED), `front/opaque.vl: build_opaque_instances`. *Case:*
+`rust_f_f82_assoc_self_from_arg`.
+
 ### F13 Several impls of one generic trait for one type
 
 **F13.1 (the key).** An impl's key is its whole header `(Tr, a..,
@@ -1045,6 +1124,18 @@ with `v: &T` finds `T: Debug`) or from the expected type (an
 associated function, F18.1). Neither: `error type.infer` with `try: <T
 as Tr>::name`. *Anchor:* `front/check/resolve.vl: resolve_key` (today
 "is a trait, not a type"), `path_target`.
+(0.27.6) An associated function without a receiver also takes `Self`
+from an argument whose parameter's written type holds `Self` (`Self`,
+`&Self`, `&mut Self`, `&[Self]`, `[Self]`), as rustc infers it.
+`Hash::hash_slice(self, state)` in `impl<T: Hash> Hash for [T]`, with
+`data: &[Self]` and `self: &[T]`, is `<T as Hash>::hash_slice`. 0.27.5
+read every `Tr::f(x, ..)` as the method call `x.f(..)`, which gave Self
+`= [T]` and "an associated function, not a method". The argument's
+type is the one it has without being checked: a local, `&e` or `&mut
+e` of one, or `e[a..b]` of an array or a slice. Another argument (a
+literal array sliced in place) gives no `Self` yet. *Anchor:*
+`front/check/calls/paths.vl: synth_path_call, self_from_args`. *Case:*
+`rust_f_f82_assoc_self_from_arg`.
 
 **F8.3 (`<τ>::name`, `τ::name`).** The inherent namespace of `τ` first;
 then, with `τ` concrete, the traits in scope (F9.2) that `τ` implements
@@ -1150,9 +1241,29 @@ tuple type of as many elements for a tuple): `let b: &[i64; 2] = if c {
 }` where `&(i64, bool)` goes type their literals from `U`, as rustc's
 expectation does. So does a sliced array literal where `&[U]` goes,
 `if c { &[1, 2, 3][1..] } else { &[0][..] }`: the array is a `[U; N]`.
-Not yet the same slicing as a `let`'s whole initializer, `let s: &[i64]
-= &[1, 2, 3][1..];`, which F18.4's hoisting takes first (the fallback,
-`i32`: a type error). *Anchor:* `check_mode.vl: check_expr_inner`.
+Where `&mut [U]` goes (0.27.6), the slice is checked as `[U]` and the
+reference is the exclusive one, so `&mut [1, 2, 3][..]` passed to a `&mut
+[i64]` is accepted, as rustc accepts it (0.27.5 checked the slice against
+`&mut [U]` and refused it).
+
+*A shared `&e` where `&mut` goes* (0.27.6) is refused in the rust
+edition, as rustc refuses it (E0308, the types differ in mutability):
+`bump(&n)` with `bump(x: &mut i64)`, `first(&[1, 2, 3][..])` and
+`first(&a[..])` with `first(v: &mut [i64])`. Each is a `type error`
+(not MVS's `own.readonly`) whose help says so and whose `try:` and fix
+borrow exclusively (`&mut n`, `&mut [1, 2, 3][..]`, `&mut a[..]`). The
+`&` of a rust node is shared as written: MVS's inout marker, which makes
+`&x` exclusive where an exclusive reference is expected (check_mode:
+check_expr and coerce_ref), is MVS's alone. 0.27.5 accepted all three.
+Cases: rust_f_f18_shared_for_mut_err, and tests/borrowck-try's mut_ref_arg,
+mut_slice_literal and mut_slice_place, whose try: lines are run.
+(0.27.6) The same slicing as a `let`'s whole initializer with a slice
+annotation, `let s: &[i64] = &[1, 2, 3][1..];`, hoists the array, not
+the slice: `let t: [i64; 3] = [1, 2, 3]; let s: &[i64] = &t[1..];`, so
+its literals take the annotation's element type (0.27.5 hoisted the
+slice, typed by the fallback `i32`: a type error). *Anchor:*
+`check_mode.vl: check_expr_inner`, `temps.vl: annotate_temp`. *Cases:*
+`rust_f_f18_let_sliced_literal`.
 
 **F18.5 (integer inference variables: an open local).** In the rust
 edition an unannotated `let x = e;` binding one name, with `e` a literal
@@ -1203,6 +1314,16 @@ literal arguments, so that its result binds their parameter
 (`map_or(0, |x| x + 1)`), and one whose value is itself a literal
 after; a negated literal where an unsigned type goes is an error, rustc
 E0600.)
+(0.27.6, the branches of an `if` or a `match` where no type is expected:
+an element of a tuple that every earlier branch gives by a literal tree
+is an inference variable (F18.6) where a later branch is checked. A
+branch of a definite type there solves it, and the earlier branches'
+literals take that type. `match k { 0 => (gap, 0), _ => (0, gap) }`
+with `gap: usize` is `(usize, usize)`, as in rustc; 0.27.5 typed the
+first arm `(usize, i32)` and refused the second. A variable that the
+later branches leave free, all of them literals there, is the `i32`
+fallback. *Anchor:* `literals.vl: branch_expected, branch_settle`,
+`patterns/mod.vl: check_match`, `body.vl: synth_if`.)
 
 **F18.6 (type variables: deferred inference; 0.27.4).** In the rust
 edition a type parameter of a generic call (a function, a method, a path
@@ -1253,10 +1374,39 @@ an expected type checks the value it gives (the `Ok`'s or `Some`'s
 payload) against it first, by (a), before its error's conversion
 (`let n: u8 = s.parse()?`). A variant pattern checked against a
 variable's enum names its variant of the solution's when the function's
-check ends. *Anchor:* `front/check/infer.vl`, `generics/instantiate.vl:
-require_bound, infer_from`, `check_mode.vl: check_expr_inner`,
-`assoc.vl: projection`, `resolve.vl: resolve_type` (the `_`),
-`try_op.vl: check_try`.
+check ends. (g) (0.27.6) A variable for a bounded parameter
+(`Vec::<u8, _>::new_in(gpa)`, `let v: Vec<u8, _> = ..`: `A: Allocator`)
+is not checked against its bound while free: the instance made with it
+is made again with the solution, and the bound is checked then, at the
+call and at the `_` that made it (rustc E0277 for `Vec::<u8,
+_>::new_in(5i64)`). A value synthesized before it is checked (a struct
+literal's field, synthesized to infer the struct's parameters) is
+unified with the type it is checked against when either mentions a free
+variable, as by (a): `gpa` where the `_` goes, and `Vec::new_in(g)`
+(`Vec<?T, &Gpa>`) where the field's `Vec<i64, &Gpa>` goes. Before, the
+bound was checked on the variable ("the trait 'Allocator' is not
+implemented for '_'"), and the field's value did not solve it
+("expected 'Vec<i64, &Gpa>', got 'Vec<_, &Gpa>'"). *Anchor:*
+`front/check/infer.vl`, `generics/instantiate.vl: require_bound,
+infer_from`, `check_mode.vl: check_expr_inner`, `assoc.vl: projection`,
+`resolve.vl: resolve_type` (the `_`), `try_op.vl: check_try`,
+`traits.vl: check_bounds` and `generics/mod.vl: check_arg` (g). Cases
+`rust_f_f18_hole_alloc_ok`, `rust_f_f18_hole_alloc_err`.
+
+**F18.7 (a field typed by its parameter takes the value's type;
+0.27.6).** A generic struct literal or enum variant whose one free
+parameter `A` is an allocator parameter binds it from an `_in` call's
+allocator argument (0.26.3: `Tokens { kinds: Vec::new_in(a) }` is
+`Tokens<typeof a>`, as the field is `Vec<u8, A>`). That rule is for a
+field that holds something *made in* the allocator. A field typed by
+the parameter itself (`struct Cx<W: Allocator> { arena: W }`) holds the
+value, so `W` is the value's own type, as rustc infers it: `Cx { arena:
+Arena::new_in(gpa) }` is `Cx<Arena<Gpa>>`, not `Cx<Gpa>`, which was an
+error in 0.27.5 ("expected 'Gpa', got 'Arena<Gpa>'"). The same holds
+for a variant's payload (`E::A(Arena::new_in(gpa))` with `A(W)`). The
+rule is in shared code, so MVS gets it too; what MVS compiled before is
+unchanged. *Anchor:* `generics/instantiate.vl: bind_allocator_arg`
+(its `p`, the place's type node). Case `rust_f_f18_alloc_field_ok`.
 
 ### F19 Small syntax
 
@@ -1417,6 +1567,16 @@ is not offered (`let else` is 0.29) and `if let` is. *Anchor:*
 arms do (by value, moving out of `e` the parts it binds by value,
 borrowck.md M3; `ref`/`&` by reference): a struct pattern on a place
 moves only the bound fields (partial move, M2).
+(0.27.6) A `let` whose whole pattern is `ref x` or `ref mut x` is
+`let x = &e;` or `let x = &mut e;` (`let ref x: τ = e;` is `let x: &τ =
+&e;`): of a place it borrows the place and moves nothing, as rustc
+does. `let ref z = a; a.x` reads `a`, and `let ref mut w = v[0]; *w +=
+1` changes `v[0]` (through IndexMut, F20.6). Of a value, its temporary
+lives as long as `x` (lifetime extension, as F18.4's `let r = &e;`).
+0.27.5 moved `e` into the binding's temporary: `a` was moved, and `v[0]`
+was copied. *Anchor:*
+`front/parser/stmts.vl: parse_let`. *Cases:* `rust_f_f27_let_ref`,
+`rust_f_f27_let_ref_err`.
 
 ### F31 `#[track_caller]`
 
@@ -1813,6 +1973,18 @@ does.
   made by an older format, or for another text; none), and when std2 is read whole (queries, `--std2-check`,
   `VOLE_STD2_EAGER=1`, the eager rerun), the text is lexed whole as in
   0.27.4. `VOLE_STD2_INDEX=0` forces the token path.
+- (0.27.6) A gated module's units wait for its name. The reach matches
+  names without their modules, so a module of many common names
+  (std::gpu::wgsl: `Type`, `Module`, `Entry`, `Block`, `check`) would be
+  reached, a little at a time, from any program. A unit inside a top
+  module of std2 listed in std2lazy's GATED (`gpu`) is loaded only once
+  the word `gpu` is asked (by the program, or by a unit it reaches);
+  until then it waits, and the units waiting are loaded when it is. The
+  module's own `mod` lines and braces are kept, as every module's are.
+  The gate is set from the units' text after they are made (index or
+  tokens alike, so the two reads keep the same tokens). A rust hello
+  world reads none of std::gpu: 1.86x MVS's with it in std2 (1.80x
+  before it, the rest the index's larger tables), not 2.42x.
 - Kept up to date with no manual step: the commit hook and the
   stdsrc_rust.vl merge driver run embed.sh, which makes the index with
   the tree's compiler (`target/tools/volec`, else `target/volec`;

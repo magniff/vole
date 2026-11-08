@@ -648,7 +648,12 @@ def main():
     for r in rewrites:
         if len(r) != 4:
             die(f"rewrite.tsv: a row needs mvs, when, rust and note: {r}")
-        if key_of(r[0]) not in mvs:
+        k = key_of(r[0])
+        if k not in mvs and k[0] and k[0][0].islower():
+            # `fs::copy`: a free function by its module's last segment (the
+            # translator's find_row); the free function's name is the item
+            k = (None, k[1])
+        if k not in mvs:
             die(f"rewrite.tsv: {r[0]} is no MVS item")
     # completeness: in-scope MVS items no line accounts for
     missing = sorted(f"{o + '::' if o else ''}{n} ({m})" for (o, n), (m, k) in mvs.items()
