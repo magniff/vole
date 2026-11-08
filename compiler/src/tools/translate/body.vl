@@ -12,10 +12,10 @@ use crate::front::lexer::Tok;
 use crate::front::types::{REF_MUT, TY_I64, TY_I8, TY_ISIZE, TY_U64, TY_U8, TyKind};
 use crate::middle::lower::ssa::HMap;
 use crate::tools::translate::{
-    D_REF, TC_BORROW, TC_BYTES, TC_DEREF, TC_INOUT_LOCAL, TC_INT, TC_LEN, TC_MUT_MARKER, TC_PRINT,
-    TC_STATIC, TC_USIZE, TC_UTF8, TC_VAR, TC_VIEW, TL_BYTES, Tr, add_ref, editable, enclosing_fn,
-    ident_char, is_mut_ref, is_ref, is_ws, left, own_node, parent_of, put, put_first, ref_binding,
-    skip_ws, token_at, word_here, written_name,
+    D_REF, TC_BORROW, TC_BYTES, TC_CHAR, TC_DEREF, TC_INOUT_LOCAL, TC_INT, TC_LEN, TC_MUT_MARKER,
+    TC_PRINT, TC_STATIC, TC_USIZE, TC_UTF8, TC_VAR, TC_VIEW, TL_BYTES, Tr, add_ref, editable,
+    enclosing_fn, ident_char, is_mut_ref, is_ref, is_ws, left, own_node, parent_of, put, put_first,
+    ref_binding, skip_ws, token_at, word_here, written_name,
 };
 
 // The symbol of the name node n is written as (its token's), or 0.
@@ -3052,6 +3052,100 @@ fn if_other(b: i64, tr: Tr, pcx: Ctx<Comp>) -> i64 {
     }
 }
 
+// (0.28.0) MVS's `{x:c}`, a byte written as a character: the rust edition
+// has no `c` (it prints the number), so the hole is `{x}` and its value
+// `x as char` (`x as u8 as char` of a wider integer), as rustc's
+// `{}` of a char prints it: a positional argument after the literal is
+// wrapped, a name in the literal is `{x_c}` with the named argument
+// `x_c = x as char` at the end of its print's call (a `{x}` of the
+// same literal prints the number). Another call's (a function's, which
+// takes no named argument) or a hole whose value the checker binds
+// (`{0:c}` twice) is left as it is.
+fn edit_char_holes(tr: inout Tr, pcx: inout Ctx<Comp>) {
+    var named = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    var calls = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    for c in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[c].kind;
+        if (k == NodeKind::Call || k == NodeKind::MethodCall) && own_node(c, tr, &pcx) {
+            let at = calls.get(pcx.nodes[c].end);
+            if at == 0 || pcx.nodes[c].start + 1 < at {
+                calls.put(pcx.nodes[c].end, pcx.nodes[c].start + 1);
+            }
+        }
+    }
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind != NodeKind::InterpHole
+            || (pcx.nodes[n].p & crate::front::ast::FMT_CHAR) == 0 || !own_node(n, tr, &pcx) {
+            continue;
+        }
+        // (the hole: its name, `x` of `{x:c}`, or the text of a positional
+        // one, `:c` of `{:c}`; t its closing brace)
+        let s = pcx.nodes[n].start;
+        var t = pcx.nodes[n].end;
+        while t < SRC.len() as i64 && SRC[t] != '}' && SRC[t] != '"' {
+            t += 1;
+        }
+        let e = pcx.nodes[n].a;
+        if t >= SRC.len() as i64 || SRC[t] != '}' || t - s < 2 || SRC[t - 1] != 'c' || e <= 0
+            || !editable(s, &pcx) {
+            continue;
+        }
+        let cut = if SRC[t - 2] == ':' { t - 2 } else { t - 1 };
+        let ty = pcx.nodes[e].ty;
+        let conv = if ty == TY_U8 { " as char" } else { " as u8 as char" };
+        if token_at(pcx.nodes[e].start, pcx) >= 0 {
+            // (a positional argument)
+            let k = pcx.nodes[e].kind;
+            let term = k == NodeKind::Ident || k == NodeKind::Int || k == NodeKind::Char
+                || k == NodeKind::FieldAccess || k == NodeKind::TupleField || k == NodeKind::Index
+                || k == NodeKind::Call || k == NodeKind::MethodCall;
+            if put(cut, t, "", TC_CHAR, &tr, &pcx) {
+                if !term {
+                    put_first(pcx.nodes[e].start, "(", &tr, &pcx);
+                }
+                put_first(pcx.nodes[e].end, if term { conv } else if ty == TY_U8 { ") as char" }
+                    else { ") as u8 as char" }, &tr, &pcx);
+            }
+            continue;
+        }
+        // (a name written in the hole, `{x:c}`)
+        var q = s;
+        while q < t && ident_char(SRC[q]) {
+            q += 1;
+        }
+        if q == s || SRC[q] != ':' {
+            continue;
+        }
+        let close = literal_call_close(t);
+        let s0 = if close >= 0 { calls.get(close + 1) - 1 } else { -1 };
+        if s0 < 0 || !(word_here(s0, "println") || word_here(s0, "print")
+            || word_here(s0, "eprintln") || word_here(s0, "eprint")) || !editable(close, &pcx) {
+            continue;
+        }
+        // (its own name, `{x_c}`: the hole `{x}` of the same literal prints
+        // the number)
+        if !put(cut, t, "_c", TC_CHAR, &tr, &pcx) {
+            continue;
+        }
+        // (once per name and call)
+        var key = close;
+        for r in s..q {
+            key = key * 31 + SRC[r] as i64;
+        }
+        if named.get(key) != 0 {
+            continue;
+        }
+        named.put(key, 1);
+        let w = buf_new();
+        buf_bytes(w, ", ");
+        buf_bytes(w, SRC[s..q]);
+        buf_bytes(w, "_c = ");
+        buf_bytes(w, SRC[s..q]);
+        buf_bytes(w, conv);
+        crate::tools::edit::edit_replace(close, close, w, &pcx);
+    }
+}
+
 // The `)` closing the call whose format literal holds position pos (in
 // the literal), or -1: the literal's end, then its call's `)` at depth 0.
 fn literal_call_close(pos: i64) -> i64 {
@@ -3344,4 +3438,5 @@ pub fn body_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
     }
     edit_prints(&tr, &pcx);
     edit_byte_holes(decls, &tr, &pcx);
+    edit_char_holes(&tr, &pcx);
 }
