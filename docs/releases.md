@@ -127,6 +127,30 @@ std2 (sc280b):
   of a large element was a call; measured alone, the gain is in the
   noise.
 
+The translator and the migration of tests/run (mig28):
+
+- **tests/run's MVS cases move to the rust edition.** Of 2873 cases
+  without `// EDITION: rust`, 1777 are translated by `fix --edition
+  rust` and kept where they pass at -O0 and -O2. An error case's
+  `ERROR` lines name the rust edition's code at the translation's
+  position; an ownership case is kept only where rustc rejects it too
+  (the borrowck twin). 68 are deleted: rustc accepts them, or they pin
+  MVS-only behaviour. The rest wait on the translator, the front and
+  std2.
+- **`collect_in`'s turbofish names both type arguments.** std2's
+  collect_in takes the collection and the allocator; `fix --edition
+  rust` wrote `collect_in::<Vec<_, _>>(a)`, one of the two. Where the
+  value goes to a written type (a let's annotation, the function's
+  result: rewrite.tsv's new `use=typed` condition) the call is
+  `collect_in(a)`; elsewhere `collect_in::<C, _>(a)`, with C, the
+  collection, in full (rewrite.tsv's `$T`), because the front does not
+  infer a `Vec<_, _>` from FromIteratorIn's impls.
+  *Transcript:* `tests/refactor/edition0280m1`.
+- The borrowck twin checks type-error cases: an `ERROR` naming no
+  borrowck code agrees with a rustc rejection by a code the borrowck
+  table does not map (E0308, E0277). The shim's `collect_in` takes two
+  type arguments.
+
 ### What's new in 0.27.8
 
 The last release before the flip, and the compiler that builds 0.28.0.
