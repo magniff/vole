@@ -182,6 +182,16 @@ The front (front273):
 - `let ref x = e;` and `let ref mut x = e;` borrow `e` as `&e` and
   `&mut e` do, as rustc does (F27.2). 0.27.5 moved `e`: after `let ref z
   = a;`, `a` was moved, and `let ref mut w = v[0]` changed a copy.
+- `const fn` declares a function, at the top level and in impls (F34.1).
+  A call of one is constant in a static's value (`static S: D =
+  D::new(5);`).
+- A constant of a struct or tuple type, or whose value calls a function,
+  is accepted (F34.2). Examples: `const ORIGIN: D = D { secs: 5 };`,
+  `const N: u64 = double(21);`. Each use makes the value again, so two
+  uses of a constant with a Drop field are two values, as in Rust.
+  - Such a constant is not yet a compile-time value: as an array length
+    or in a pattern it is an error.
+  - 0.27.5 refused these constants.
 
 std2 and the translator (fl10274):
 
