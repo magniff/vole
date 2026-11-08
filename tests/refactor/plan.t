@@ -2,13 +2,13 @@
 $ query stats
 37	8	lang.vl
 28	6	util.vl
-16	1	main.vl
-81	15	total
+17	1	main.vl
+82	15	total
 $ query stats --over 30
 37	8	lang.vl	over
 28	6	util.vl
-16	1	main.vl
-81	15	total
+17	1	main.vl
+82	15	total
 note query.over: 1 file over 30 lines
 try: volec query deps crate::lang --max-lines 30
 $ query stats util
@@ -57,7 +57,6 @@ groups	1	at most 1000 lines	0 references between them
 group 1	21	square times cube unused_helper Shape Pair
 ## 1 group of at most 1000 lines, 0 references between them
 $ query unused
-lang::Token	main.vl:6:19	import
 crate::util::cube	lang.vl:2:18	import
 crate::lang::summary	lang.vl:35:4	fn
 crate::util::cube	util.vl:11:8	fn
@@ -74,7 +73,7 @@ util.vl	1	0	util::cube
 main.vl	1	1	crate main
 total	2	1	2 files
 $ query impact lang::Token
-crate::lang::Token	lang.vl:4:12	struct	pub struct Token
+crate::lang::Token	lang.vl:4:35	struct	pub struct Token
 lang.vl	0	10	lang::lex_digit lang::lex lang::parse lang::check lang::report lang::describe lang::summary
 main.vl	0	1	crate
 total	0	11	2 files

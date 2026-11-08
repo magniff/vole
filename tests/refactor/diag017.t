@@ -11,5 +11,6 @@ mod util;
 fn main() -> i32 {
     util::twice(2) as i32
 }
+// EDITION: rust
 $ check
 ok: 0 errors in main.vl

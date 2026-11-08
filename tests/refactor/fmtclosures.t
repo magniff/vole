@@ -14,16 +14,16 @@ $ fmt --dry-run main.vl
 --- a/main.vl
 +++ b/main.vl
 @@ -15,2 +15,2 @@
--    let a = apply(| x | x + k, 1);
+-    let a = apply(| x | x + k, 1i64);
 -    let b = apply(|x : i64| x * 2, a);
-+    let a = apply(|x| x + k, 1);
++    let a = apply(|x| x + k, 1i64);
 +    let b = apply(|x: i64| x * 2, a);
 @@ -18 +18 @@
 -    let d = apply(| (p, q): (i64, i64) | p + q, c);
 +    let d = apply(|(p, q): (i64, i64)| p + q, c);
 @@ -20 +20 @@
--    each(4, | i | { total += i; });
-+    each(4, |i| { total += i; });
+-    each(4i64, | i | { total += i; });
++    each(4i64, |i| { total += i; });
 @@ -23 +23,7 @@
 -    let v = numbers.iter().map(|x| x * 3).filter(|x| x % 2 == 0).enumerate().map(|(i, x)| i * x).sum();
 +    let v = numbers
@@ -34,8 +34,8 @@ $ fmt --dry-run main.vl
 +        .map(|(i, x)| i * x)
 +        .sum();
 @@ -25 +31,3 @@
--    let f = sink |left: i64, right: i64| -> i64 { let m = left * right; m + total + some_long_name_here + 1 };
-+    let f = sink |left: i64, right: i64| -> i64 {
+-    let f = move |left: i64, right: i64| -> i64 { let m = left * right; m + total + some_long_name_here + 1 };
++    let f = move |left: i64, right: i64| -> i64 {
 +        let m = left * right; m + total + some_long_name_here + 1
 +    };
 $ fmt
@@ -44,23 +44,23 @@ formatted	main.vl	+14 -6 lines
 // Closures and iterator chains laid out by hand, for `volec fmt` (0.14).
 fn apply<F: Fn(i64) -> i64>(f: F, x: i64) -> i64 { f(x) }
 
-fn each<F: FnMut(i64)>(n: i64, f: sink F) { for i in 0..n { f(i); } }
+fn each<F: FnMut(i64)>(n: i64, f: F) { for i in 0..n { f(i); } }
 
-fn sum_of<I: Iterator<Item = i64>>(it: sink I) -> I::Item { it.sum() }
+fn sum_of<I: Iterator<Item = i64>>(it: I) -> I::Item { it.sum() }
 
 trait Source {
     type Item;
-    fn get(self: *Self) -> Self::Item;
+    fn get(self: *mut Self) -> Self::Item;
 }
 
 fn main() -> i32 {
-    let k = 3;
-    let a = apply(|x| x + k, 1);
+    let k: i64 = 3;
+    let a = apply(|x| x + k, 1i64);
     let b = apply(|x: i64| x * 2, a);
-    let c = apply(sink |x| -> i64 { x | k }, b);
+    let c = apply(move |x| -> i64 { x | k }, b);
     let d = apply(|(p, q): (i64, i64)| p + q, c);
-    var total = 0;
-    each(4, |i| { total += i; });
+    let mut total: i64 = 0;
+    each(4i64, |i| { total += i; });
     each(2, || -> () {});
     let all = a || b > 0 || c | d > 0;
     let v = numbers
@@ -71,11 +71,12 @@ fn main() -> i32 {
         .map(|(i, x)| i * x)
         .sum();
     let w = numbers.iter().map(|x| x + 1).sum();
-    let f = sink |left: i64, right: i64| -> i64 {
+    let f = move |left: i64, right: i64| -> i64 {
         let m = left * right; m + total + some_long_name_here + 1
     };
     let neg = |&x| -x;
     0
 }
+// EDITION: rust
 ## A second time: nothing to do (the layout is a fixpoint).
 $ fmt --check

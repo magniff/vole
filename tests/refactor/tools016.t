@@ -22,7 +22,7 @@ ok: 0 errors, 1 warning in main.vl
 ## --nth N patches the Nth, --all every one; --nth past the last.
 $ edit patch clamp --old 'r = ' --new 'r = 0 + '
 error patch.ambiguous: OLD 1 occurs 3 times in crate::calc::clamp, lines 2, 4, 7; give more of the text around it, or --nth N (--all: every one)
-try: volec edit patch clamp --old 'var r = v;' --new 'var r = 0 + v;'
+try: volec edit patch clamp --old 'let mut r = v;' --new 'let mut r = 0 + v;'
 try: volec edit patch clamp --old 'r = lo;' --new 'r = 0 + lo;'
 try: volec edit patch clamp --old 'r = hi;' --new 'r = 0 + hi;'
 [exit 1]
@@ -78,7 +78,7 @@ note edit.imports: added the imports the new text needs (fix --only imports)
 ## rewrite --list: a line per site, what each hole matched.
 $ rewrite 'for $i in 0..$v.count { $s... }' --list
 loops.vl:8:5	$i=i	$v=w	$s...=t += w.data[i] * 2; if w.data[i] > 2 { t += w.data[i]; }
-loops.vl:15:5	$i=i	$v=w	$s...=t += w.data[i] + x + i;
+loops.vl:15:5	$i=i	$v=w	$s...=t += w.data[i] + x + i as i64;
 loops.vl:18:5	$i=j	$v=w	$s...=t -= w.data[j];
 ## Name holes: `$x~/re/`, `--where '$x: name'` (any name or path, not
 ## another expression), `--where '$x: name ~ RE'`.
@@ -144,10 +144,10 @@ rewrote 2 sites in 1 file	loops.vl	+5 -5 lines
 note rewrite.dropped: 1 site is left: the replacement drops $i, which the code it keeps uses; first: loops.vl:16:30
 try: volec query show loops.vl:16
 $ query show total
-// crate::loops::total	loops.vl:5-22	effects: panic
+// crate::loops::total	loops.vl:5-22	effects: panic diverge
 pub fn total() -> i64 {
     let w = unsafe { V };
-    var t = 0;
+    let mut t = 0;
     for x2 in w.data.iter() {
         t += x2 * 2;
         if x2 > 2 {
@@ -156,7 +156,7 @@ pub fn total() -> i64 {
     }
     let x = 1;
     for i in 0..w.count {
-        t += w.data[i] + x + i;
+        t += w.data[i] + x + i as i64;
     }
     for x2 in w.data.iter() { t -= x2; }
     let v_two = 2;

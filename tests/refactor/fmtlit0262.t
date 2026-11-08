@@ -25,11 +25,12 @@ use crate::limits::MAX;
 const CAP: i64 = 9;
 
 fn main() {
-    let n = 3;
-    let w = 6;
+    let n: i64 = 3;
+    let w: i64 = 6;
     println("{n} items, {n:>w$} of {CAP}");
     println("{}  {{x}}", n);
     println("at most {MAX}");
     let s = "{count} stays text";
-    println(s);
+    println("{}", s);
 }
+// EDITION: rust
