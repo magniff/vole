@@ -1269,7 +1269,10 @@ slice, typed by the fallback `i32`: a type error). *Anchor:*
 edition an unannotated `let x = e;` binding one name, with `e` a literal
 tree (an unsuffixed integer literal, its negation, an array, a repeat or
 a tuple of literal trees, where a tuple's other elements are any
-value, an arithmetic operator of two literal trees; 0.27.4: an `if`
+value, an arithmetic operator of two literal trees; 0.27.7: a shift
+whose left operand is a literal tree, its right operand any integer
+value, which does not type it, `1 << (l % 64)` and `(0 - 1) << (bits -
+1)`, and `!` of a literal tree, `!0`; 0.27.4: an `if`
 with an `else`, or a `match`, whose every branch's value, its block's
 tail, is a literal tree, `let e0 = if c { 1 } else { 0 };`, and a block
 whose tail is one), makes `x` **open**:
@@ -1303,6 +1306,27 @@ is checked nothing is open. *Anchor:* `front/check/literals.vl: open_let,
 open_solve, open_expected`, `check_mode.vl: check_expr_inner`,
 `assign.vl: check_assign`. MVS is unchanged: no local is open, its
 fallback is `i64`.
+(0.27.7, the shift) A shift's type is its left operand's, so only that
+operand makes it a literal tree, and solving it types that operand: `let
+bit = 1 << (l % 64);` then `v[w] | bit` with `v: Vec<i64>` is an `i64`
+shift, as rustc infers it. 0.27.6 did not count a shift as a literal
+tree, so its literal took `i32` at the `let` and the later `i64` use
+widened the wrong value: `1 << 40` was `256`, and `(0 - 1) << 63`
+passed as an `i64` was `i32`'s minimum. That was a silent wrong value,
+found by the 0.28 flip rehearsal (19 such `let`s in compiler/src's
+translation). A `!` of a literal tree (an integer `!`, checked as `~`)
+is one too. *Cases:* `rust_f_f185_shift_open`,
+`rust_f_f185_shift_open_err`.
+(0.27.7, a method on a literal tree) An integer type's own method (F15.4's
+`impl i32 { .. }`: `wrapping_sub`, `pow`, `count_ones`, `abs`) called on a
+literal tree, `(1 << s).wrapping_sub(1)`, `2.pow(2)`, is error
+`type.infer`, rustc's E0689, where 0.27.6 took `i32`'s method (so `1 << 40`
+was `1 << 8`: a silent wrong value, the flip rehearsal's). A trait's method
+there, `5.max(3)`, `3.clone()`, `1.cmp(&2)`, is `i32`'s, as rustc's
+fallback gives it. A method on an open local, `let x = 2; x.pow(2)`, is
+still `i32`'s (FL6's leniency). *Anchor:* `check/calls: synth_method,
+literal_method_error`. *Cases:* `rust_f_f185_literal_method_err`,
+`rust_f_f185_literal_method_ok`.
 (0.27.3, the literals around it, F18.3: `&1` where `&τ` of a number
 goes is a `τ` (`m.get(&1)`, `x.total_cmp(&0.0)`); a literal bound only
 by a parameter's bound picks the one integer type an impl gives, also
@@ -2041,7 +2065,7 @@ where a `try:` is named, a case in `tests/borrowck-try`'s shape under
 | `method.unknown` | F9.2 (the trait exists but is not in scope) | E0599 | `use path::Tr;` |
 | `method.ambiguous` | F9.3, F3.2, F8.3 | E0034 | `Tr::m(&x, ..)` per candidate |
 | `type.ambiguous` | F13.2 | E0283 | `AsRef::<U>::as_ref(&x)` per candidate |
-| `type.infer` | F18.1, F18.2, F7.3, F8.2 | E0282 | `g::<τ>(..)`, `let x: τ` |
+| `type.infer` | F18.1, F18.2, F7.3, F8.2, F18.5 (an integer's own method on a literal, 0.27.7) | E0282, E0689 | `g::<τ>(..)`, `let x: τ` |
 | `type.unsized` | F21.1, F21.2, F20.1 | E0277 | `&` the type, `?Sized` on the parameter, `Box<_>` |
 | `type.cast` | F1.3, F29.1, Z9.3, D22.3 | E0604, E0605, E0606 | `char::from_u32(x)` for `u32 as char`; none else |
 | `type.transmute` | F19.5 | E0512 | none; names both sizes |
@@ -2145,7 +2169,8 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   call, to `i32` (a variable is made only for a parameter left free;
   FL1). The corpus writes the suffix
   (`1i64`) where it meets one. (Lenient: a method call on an open local,
-  `x.pow(2)`, is `i32`'s method, where rustc says E0689.)
+  `x.pow(2)`, is `i32`'s method, where rustc says E0689; on a literal tree,
+  `2.pow(2)`, it is E0689 since 0.27.7, F18.5.)
 - **FL7 (const evaluation).** F3.2's consts fold with `consteval.vl`'s
   language, smaller than rustc's const eval (no loops, no `if` over
   consts until 0.29).
