@@ -86,10 +86,28 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.5 | `v0.27.5` | 0.27.4 | aarch64-macos | std2's `std::time`, `fs`, `process`, `cli` (gate 3 from 122 to 37 type errors); operands read where evaluated (D2.4a); text is not its bytes (F0.6); a generic iterator's item is its bound's (D4.6 f); std2 lexed by its units (a rust hello world 1.82x MVS's, the 2.0x ceiling enforced) |
 | 0.27.6 | `v0.27.6` | 0.27.5 | aarch64-macos | gate 3 has no type errors (76 borrowck left); std::gpu::wgsl in std2; a method in a generic body is the one it names (Z9.1c); const fn and constants made at each use; octal, `let ref`; a 0.27.5 wrong-output fix (constants' names) and an -O0 link fix |
 | 0.27.7 | `v0.27.7` | 0.27.6 | aarch64-macos | gate 3 is 0 (no type or borrowck error); SRC a view valid for the process, frozen buffers; the translator's last shapes; a copied/cloned iterator's items; two rust-edition wrong-value fixes (a let-bound literal shift typed i32) |
+| 0.27.8 | `v0.27.8` | 0.27.7 | aarch64-macos | open integer locals one variable (a wrong-value fix); a unit-only enum's derives by its discriminant (rustc's order and hash; one compare); three data races of released compilers fixed; `&mut` to raw pointer reborrowed, fat raw pointer coercions |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.27.8
+
+The last release before the flip, and the compiler that builds 0.28.0.
+Two wrong-value fixes in the rust edition: an open integer local
+(`let c = a;`, `let b = a + 1;`, `s += x`, a loop over literals) is one
+variable with the literals it is built from, typed by the use that types
+it, as rustc's `{integer}`; 0.27.7 closed it at `i32` and widened it
+later, a silent wrong value past 2^31. And the derives of a unit-only
+enum order and hash by its written discriminants, as rustc does. The
+derives of a unit-only enum compare its tag, one compare, which the
+flipped compiler needs (it was 5x slower without). Three data races of
+released compilers, found by a review of the compiler's statics for the
+flip, are fixed: -O0's assembler thread read the buffer table the main
+thread could grow, the assembler's internal error grew it, and two
+-O2 tasks could touch FN_ATTRS_DONE and the code cache's use marks
+unordered. A `&mut T` given where a raw pointer goes outside a call is
+reborrowed, and views coerce to fat raw pointers. MVS programs compile
+exactly as before. Built and tested on aarch64-macos only.
 
 The front (f185x):
 
