@@ -88,6 +88,13 @@ binary is invoked, where its test runner is and which hosts it supports.
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.27.7
+
+The front (front277), from the 0.28 flip rehearsal:
+
+- **A let-bound shift of a literal was typed i32 (a wrong value), in 0.27.5 and 0.27.6.** In the rust edition, `let bit = 1 << (l % 64);` then `v[w] | bit` with `v: Vec<i64>` took the literal as `i32` at the `let`, so the shift was `1 << (l % 32)`. The same went for `let min = (0 - 1) << (bits - 1);` passed as an `i64` (it was `i32`'s minimum). No error was reported. A shift's left operand now decides its type and stays open until a later use fixes it, as rustc infers it (F18.5); so does `!` of a literal (`let a = !0;` then a `u64`). Cases `rust_f_f185_shift_open`, `rust_f_f185_shift_open_err`.
+- An integer type's own method on a literal, `(1 << s).wrapping_sub(1)` or `2.pow(2)`, is error `type.infer` (rustc's E0689). Before, it was `i32`'s method: `1 << 40` became `1 << 8`, silently. A trait's method there (`5.max(3)`, `3.clone()`) is still `i32`'s, as rustc's. Cases `rust_f_f185_literal_method_err`, `rust_f_f185_literal_method_ok`.
+
 ### What's new in 0.27.6
 
 Gate 3 has no type errors. `fix --edition rust` on a copy of compiler/src now type-checks: std2 has `std::gpu::wgsl`, the WGSL front compiler/src uses (translated by `fix --edition rust`, finished by hand, the same answers as MVS's front on every .wgsl in the tree), behind a gate that keeps it out of a program that does not name `gpu`; the translator's last type-error shapes are done (eight found by the wgsl port). What is left is borrowck: 76 errors (154 behind 37 type errors in 0.27.5), after nested calls on one `&mut` root are hoisted (rustc's E0499, which 0.27.5 missed). In the rust edition: a method call in a generic body takes the method the body names, as rustc does (Z9.1c); `const fn`, and constants of any type made at each use; a constant's initializer is checked in its own scope (0.27.5 could call a local of the use's scope instead: wrong output); octal literals, `let ref`, tuple branches typed together; `&e` stays shared where `&mut` goes (rustc's E0308); a `&mut` given to a raw pointer ends its borrow. A generic function with a local `Vec<T, A>` links at -O0 and -O1 again (0.27.4 and 0.27.5 failed). A rust hello world's check is 1.86x MVS's. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
