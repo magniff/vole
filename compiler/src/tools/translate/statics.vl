@@ -19,8 +19,8 @@ use crate::front::types::TyKind;
 use crate::middle::lower::ssa::HMap;
 use crate::tools::edit::edit_replace;
 use crate::tools::translate::{
-    TC_ACCESS, TC_STATIC, TC_UNSAFE, Tr, editable, enclosing_fn, ident_char, parent_of, put,
-    put_first, skip_ws, token_at, word_here,
+    TC_ACCESS, TC_STATIC, TC_UNSAFE, TL_STATIC_COPY, Tr, editable, enclosing_fn, ident_char,
+    parent_of, put, put_first, skip_ws, token_at, word_here,
 };
 
 // Whether position pos is in unsafe code: an `unsafe { }` block of the
@@ -797,6 +797,161 @@ pub fn plan_statics(tr: inout Tr, pcx: inout Ctx<Comp>) {
     }
 }
 
+// The function node around node n (climbing the parents; fn_of caches
+// it, node + 1 -> Fn node + 1), or 0.
+fn fn_around(n: i64, fn_of: inout HMap, tr: Tr, pcx: Ctx<Comp>) -> i64 {
+    var p = n;
+    var steps = 0;
+    while p > 0 && steps < 4096 {
+        let known = fn_of.get(p + 1);
+        if known != 0 {
+            fn_of.put(n + 1, known);
+            return known - 1;
+        }
+        if pcx.nodes[p].kind == NodeKind::Fn {
+            fn_of.put(n + 1, p + 1);
+            return p;
+        }
+        p = parent_of(p, tr);
+        steps += 1;
+    }
+    0
+}
+
+// Which copies of a static are proven to be the only view of it while
+// they live (accessor_edits' sites, static_use 3): nothing evaluated in
+// the copy's call or statement t reads or writes the same static, not
+// another of its uses there, nor a function called there or one those
+// call. A call through a function value (no known function) is not
+// proven. sites: (t, static, use) triples; the answer, t + 1 -> 1 proven,
+// 2 not.
+fn prove_copies(sites: IntVec, tr: Tr, pcx: Ctx<Comp>) -> HMap {
+    var out = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    if sites.count == 0 {
+        return out;
+    }
+    var fn_of = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    // (Fn node + 1 -> function index + 1)
+    var index = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    for g in 0..pcx.fns.len() as i64 {
+        let fnode = pcx.fns[g].node;
+        if fnode > 0 && index.get(fnode + 1) == 0 {
+            index.put(fnode + 1, g + 1);
+        }
+    }
+    // (the statics the sites copy, static + 1 -> 1)
+    var copied = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    var i: i64 = 0;
+    while i + 2 < sites.count {
+        copied.put(sites.get(i + 1) + 1, 1);
+        i += 3;
+    }
+    // direct: function * 2^20 + static + 1 -> 1; unknown: function + 1 ->
+    // 1 (a call through a value); the calls: (caller, callee) pairs
+    var direct = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    var unknown = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    var edges = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for n in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[n].kind;
+        let is_use = k == NodeKind::Ident && pcx.nodes[n].res == Res::Static
+            && copied.get(pcx.nodes[n].y + 1) != 0;
+        let is_call = k == NodeKind::Call || k == NodeKind::MethodCall;
+        if !is_use && !is_call {
+            continue;
+        }
+        let f = fn_around(n, &fn_of, tr, pcx);
+        let g = index.get(f + 1) - 1;
+        if g < 0 {
+            continue;
+        }
+        if is_use {
+            direct.put(g * 1048576 + pcx.nodes[n].y + 1, 1);
+        } else if pcx.nodes[n].x <= 0 || pcx.nodes[n].x > pcx.fns.len() as i64 {
+            unknown.put(g + 1, 1);
+        } else {
+            edges.push(g);
+            edges.push(pcx.nodes[n].x - 1);
+        }
+    }
+    // (the callers of each function: callee + 1 -> the first edge + 1, and
+    // each edge's next, a list through IntVec next)
+    var first = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    var next = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    var e: i64 = 0;
+    while e + 1 < edges.count {
+        let h = edges.get(e + 1);
+        next.push(first.get(h + 1));
+        first.put(h + 1, e / 2 + 1);
+        e += 2;
+    }
+    // touches: function * 2^20 + static + 1 -> 1, from each function that
+    // names the static (or calls an unknown one) up through its callers
+    var touches = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    var queue = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for y in 0..pcx.statics.len() as i64 {
+        if copied.get(y + 1) == 0 {
+            continue;
+        }
+        queue.count = 0;
+        for g in 0..pcx.fns.len() as i64 {
+            if direct.get(g * 1048576 + y + 1) != 0 || unknown.get(g + 1) != 0 {
+                touches.put(g * 1048576 + y + 1, 1);
+                queue.push(g);
+            }
+        }
+        var qi: i64 = 0;
+        while qi < queue.count {
+            let h = queue.get(qi);
+            qi += 1;
+            var ed = first.get(h + 1);
+            while ed > 0 {
+                let caller = edges.get((ed - 1) * 2);
+                if touches.get(caller * 1048576 + y + 1) == 0 {
+                    touches.put(caller * 1048576 + y + 1, 1);
+                    queue.push(caller);
+                }
+                ed = next.get(ed - 1);
+            }
+        }
+    }
+    // each site: the nodes inside its t (by position) that touch it
+    i = 0;
+    while i + 2 < sites.count {
+        out.put(sites.get(i) + 1, 1);
+        i += 3;
+    }
+    for n in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[n].kind;
+        let is_use = k == NodeKind::Ident && pcx.nodes[n].res == Res::Static;
+        let is_call = k == NodeKind::Call || k == NodeKind::MethodCall;
+        if !is_use && !is_call {
+            continue;
+        }
+        let at = pcx.nodes[n].start;
+        i = 0;
+        while i + 2 < sites.count {
+            let t = sites.get(i);
+            let y = sites.get(i + 1);
+            let u = sites.get(i + 2);
+            if pcx.nodes[t].start <= at && at < pcx.nodes[t].end && out.get(t + 1) == 1 {
+                var dirty = false;
+                if is_use {
+                    dirty = pcx.nodes[n].y == y && at != pcx.nodes[u].start;
+                } else {
+                    let x = pcx.nodes[n].x;
+                    dirty = x <= 0 || x > pcx.fns.len() as i64
+                        || touches.get((x - 1) * 1048576 + y + 1) != 0;
+                }
+                if dirty {
+                    out.put(t + 1, 2);
+                }
+            }
+            i += 3;
+        }
+    }
+    out
+}
+
 // The edits of the statics plan_statics chose: their declarations, every
 // use, the imports of them, and their accessors at their files' ends.
 pub fn accessor_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
@@ -806,6 +961,20 @@ pub fn accessor_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
     var all = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
     var read = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
     var at = 0;
+    // (the copies first: which are proven the static's only view while
+    // they live, prove_copies)
+    var sites = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind == NodeKind::Ident && pcx.nodes[n].res == Res::Static
+            && pcx.nodes[n].y >= 0 && tr.accessed.get(pcx.nodes[n].y + 1) != 0
+            && token_at(pcx.nodes[n].start, pcx) >= 0 && editable(pcx.nodes[n].start, &pcx)
+            && static_use(n, &at, tr, pcx) == 3 {
+            sites.push(copy_target(at, tr, pcx));
+            sites.push(pcx.nodes[n].y);
+            sites.push(n);
+        }
+    }
+    let proven = prove_copies(sites, tr, pcx);
     for n in 1..pcx.nodes.len() as i64 {
         if pcx.nodes[n].kind != NodeKind::Ident || pcx.nodes[n].res != Res::Static
             || !editable(pcx.nodes[n].start, &pcx) {
@@ -891,8 +1060,33 @@ pub fn accessor_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
                 buf_bytes(ct, close);
                 edit_once(pcx.nodes[c].end, pcx.nodes[c].end, ct, 8, &seen, &pcx);
             }
+        } else if how == 3 && proven.get(copy_target(at, tr, pcx) + 1) == 2 {
+            // (a copy not proven the only view while it lives: the place
+            // itself, through the static's raw address, in unsafe code
+            // without UNSAFE:/SAFETY: lines, and left to hand)
+            bits = SU_PTR;
+            let t = copy_target(at, tr, pcx);
+            let stmt = pcx.nodes[t].kind == NodeKind::ExprStmt;
+            let paren = !stmt && operand_at_statement_start(t, tr, pcx);
+            let open = buf_new();
+            buf_bytes(open, if paren { "(unsafe { " } else { "unsafe { " });
+            if edit_once(pcx.nodes[t].start, pcx.nodes[t].start, open, 3, &seen, &pcx) {
+                put_first(pcx.nodes[t].end, if paren { " })" } else { " }" }, &tr, &pcx);
+                let why = buf_new();
+                buf_bytes(why, static_name(y, pcx));
+                crate::tools::translate::left_note(a, TL_STATIC_COPY, why, &tr, &pcx);
+            }
+            let t2 = buf_new();
+            buf_bytes(t2, "(*");
+            buf_bytes(t2, head);
+            put_accessor(t2, SU_PTR, y, tr, pcx);
+            buf_bytes(t2, "())");
+            if edit_once(a, b, t2, 2, &seen, &pcx) {
+                tr.counts[TC_ACCESS] += 1;
+            }
         } else if how == 3 {
-            // (a part written, or the place borrowed exclusively: on a copy)
+            // (a part written, or the place borrowed exclusively: on a copy,
+            // proven the static's only view while it lives)
             bits = SU_GET | SU_SET;
             let t = copy_target(at, tr, pcx);
             let copy = buf_new();
