@@ -298,6 +298,18 @@ std2 gets the rest of MVS's std (std280):
   plus `shuffle` and `fill_bytes_os`. The outputs are MVS's (and
   rand_xoshiro's) on the same seeds. *Cases:* `std2_random_xoshiro`,
   `std2_random_empty_range`.
+- **std::sys.** MVS's OS layer, vole's own at the libc crate's level,
+  with the `sys_` names and `Result<T, i32>` errnos MVS's had. It has
+  files and descriptors, stat, directories, the environment,
+  posix_spawn, signals, waitpid, pseudo-terminals, termios, poll,
+  clocks and getentropy. Rust's std::sys is private, and std::fs,
+  process and env are Rust's API above it. A path, a name or written
+  data is a `P: AsRef<[u8]>`, so a text literal goes where MVS's `[u8]`
+  went. Pointers C only reads are `*const`. The target's numbers
+  (O_NONBLOCK, the TIOC requests, ...) and strerror_r are in
+  std2/rt/sys_macos.vl and sys_linux.vl. *Cases:* `sys_files`,
+  `sys_process`, `sys_pty`, `sys_layout` (struct layouts against the C
+  headers), run without XFAIL and under `--check-alloc`.
 - tools/std2-checklist.py reads MVS's items from an MVS program
   (examples/args). Since the flip, the tree's root is a rust program
   whose std is std2, so the checklist could not be made.
