@@ -10,9 +10,13 @@
 #               from HEAD's own -O0 back end, run unoptimized), B2 builds
 #               HEAD at -O2: B3.o
 #   serial      the normal path at -j1: J1, then J2.o
+#   cached      (0.27.7) A2 builds HEAD with the code cache on, which every
+#               other build has off, in a cache of its own: C1.o (storing),
+#               then C2.o (from the cache)
 #
 # Checked: B3.o and A3.o are the same bytes (and A2.o: the fixpoint); B2.o
-# is what A2 emits at -O0; J1.o is A1.o and J2.o is A2.o. An optimizer bug
+# is what A2 emits at -O0; J1.o is A1.o and J2.o is A2.o; C1.o and C2.o
+# are A3.o. An optimizer bug
 # that miscompiled the compiler in a way that changes what it does would
 # make the paths diverge; one that hides itself (the same wrong code
 # from both paths) would need the -O0 back end of PREVIOUS and of HEAD to
@@ -45,8 +49,8 @@ while [ $# -gt 0 ]; do
         -p) PREV=$2; shift 2 ;;
         -w) W=$2; shift 2 ;;
         --no-same-output) SAME=0; shift ;;
-        -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        -h|--help) sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
 [ -n "$PREV" ] && [ -x "$PREV" ] || { echo "chain-diverse: no previous release (-p; bootstrap/bootstrap.sh builds it)"; exit 77; }
@@ -98,11 +102,27 @@ build "$W/B2" B3 -O2
 build "$W/A2" A2O0 -O0
 build "$PREV" J1 -O2 -j1
 build "$W/J1" J2 -O2 -j1
+# (0.27.7) The code cache, which every other build here has off: A2
+# builds HEAD with it on in a cache of its own, twice (C1 stores every
+# entry, C2 takes them), each the same bytes as A3, made without it.
+# (In a subshell: the cache's variables are this build's alone.)
+cached() { # <name>
+    (
+        VOLE_CODE_CACHE=on VOLE_CACHE="$W/cache" VOLE_CACHE_SYNC=1
+        export VOLE_CODE_CACHE VOLE_CACHE VOLE_CACHE_SYNC
+        build "$W/A2" "$1" -O2
+    ) || exit 1
+}
+mkdir -p "$W/cache"
+cached C1
+cached C2
 same A2 A3 "the normal fixpoint"
 same A3 B3 "-O2 by the optimized and by the unoptimized compiler"
 same A2O0 B2 "-O0 by A2 and by B1"
 same A1 J1 "PREVIOUS at -j8 and -j1"
 same A2 J2 "HEAD at -j8 and -j1"
+same A3 C1 "HEAD by A2 without the code cache and with it, storing"
+same A3 C2 "HEAD by A2 without the code cache and with it, every entry taken"
 
 if [ $SAME -eq 1 ] && [ $FAILED -eq 0 ]; then
     # A2 against B2 on the corpus. Both are run by an absolute path, which
