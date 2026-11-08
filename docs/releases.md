@@ -132,6 +132,42 @@ The translator (g3274):
   a `&mut` coerced to a raw pointer held through the call:
   `rust_b_raw_coerce_ends_borrow` (XFAIL).
 
+The front (front273):
+
+- A method call in a generic body takes the method the body names, as
+  rustc does (Z9.1c). The receiver must be a value of a bounded type
+  parameter, like `(**self)` of `self: &&T` or `c` of `c: C`. It gets
+  the bound's method for the type the parameter stands for, never one
+  found again through that type's references. `via(r)` of `fn via<C:
+  Tag>(c: C) { c.tag() }` with `C = &&str` now runs the reference impl
+  twice and prints 21; 0.27.4 took str's impl for `(**self)` and
+  printed 11.
+- `&mut [1, 2, 3][..]` passed where a `&mut [i64]` goes is accepted, as
+  rustc accepts it (F18.4). 0.27.5 checked the sliced literal against
+  the `&mut` type and refused it with "expected 'inout [i64]', got
+  '[i64]'".
+- `A::clone(&a)` and `Clone::clone(&a)` of a bounded parameter `a: A`
+  call the bound's clone of the type A stands for, as `a.clone()` does
+  (Z9.1c). With `A = &Gpa`, `fn two<A: Allocator + Clone>(a: A)` now
+  checks; 0.27.5 took Gpa's clone through the reference.
+- In the rust edition a shared `&e` where `&mut` goes is refused, as
+  rustc refuses it (E0308): `bump(&n)`, `first(&[1, 2, 3][..])`,
+  `first(&a[..])`.
+  - Each is a type error, with `&mut n`, `&mut [1, 2, 3][..]` or
+    `&mut a[..]` as its `try:` and fix.
+  - 0.27.5 made such a `&` exclusive, MVS's inout marker, and accepted
+    it. MVS keeps the marker.
+  - No std2 or rust case relied on it.
+- Octal literals: `0o644`, `0o7_55` and `0o17u8` are read in the rust
+  edition (F23.5). An 8 or 9 among the digits is rustc's "invalid digit
+  for a base 8 literal". MVS still refuses `0o`.
+- A rust-edition generic function with a local whose type names its
+  parameter, like `let v: Vec<i64, A>` in `fn two<A: Allocator>`, now
+  links at -O0 and -O1 (D22.2). In 0.27.4 and 0.27.5, the borrow check's
+  opaque instance made a drop shim for `Vec<i64, Ω>`. Shims are lowered,
+  and that one called a `Vec::drop` that had no instance, so the link
+  failed with an undefined symbol. -O2 was not affected.
+
 ### What's new in 0.27.5
 
 Gate 3 at 37. std2 has the modules compiler/src uses: `std::time`, `std::fs`, `std::process` and `std::cli`, Rust-shaped, with the translator's rows bending MVS's calls onto them. `fix --edition rust` on a copy of compiler/src now leaves 37 errors (122 in 0.27.4), and `check --borrowck-partial` counts 154 borrowck errors behind them (3,048 in 0.27.4): a rust body reads each operand where it is evaluated (D2.4a), and borrowed literals are promoted (D2.8). In the rust edition, text is not its bytes (F0.6: a `&str` where a `&[u8]` goes is E0308), and the translator writes `b".."` or `.as_bytes()` where bytes are declared; a generic iterator's item is its bound's region, not a borrow of the iterator (D4.6 f); `AsRef` for `&T` with T = `str` no longer calls itself (a stack overflow at run time) nor gives a false outlives (Z9.1c); a borrowed array or tuple literal takes the expected type (F18.4). std2 is lexed by its units from an index made when it is embedded (Z5.2): a rust hello world's check is 1.82x MVS's (2.03x), and the 2.0x ceiling is enforced. MVS programs compile exactly as before. Built and tested on aarch64-macos only.

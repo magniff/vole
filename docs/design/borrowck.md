@@ -2150,7 +2150,12 @@ concrete ones and type-checked and borrow-checked; they, and every
 instance with an Ω among its type arguments (or a virtual function's,
 its `Self` an Ω) and the closures in them, are left out of code
 generation (finish_program) and effects; an instance without one that
-their checking makes first (`println::<&str>`) is lowered as any. An
+their checking makes first (`println::<&str>`) is lowered as any. Nor
+are the drop shims (places-ir.md §3.9) of the types holding an Ω that
+their drops drop: `drop(v)` of a `v: Vec<i64, Ω>` asks for no shim
+(0.27.6; 0.27.4 and 0.27.5 made one, lowered at -O0 and -O1 as every
+shim is, which called a `Vec::drop` of no instance: an undefined
+symbol). An
 instance of a std template with an Ω is type-checked only: std's bodies
 are borrow-checked as std's (Z7). An error in one is reported at the
 template's position, without an instance note, and not when an error
