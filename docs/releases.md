@@ -158,7 +158,7 @@ The compiler's own source (gate 3, front273):
   and `file_line_text`) and to their callers
   (tests/refactor/edition0277b). Gate 3: 52 to 17 borrowck errors.
 
-The translator (g3274; flip28's T3 and T4, its rehearsal's hand fixes):
+The translator (g3274; flip28's T2 to T5, its rehearsal's hand fixes):
 
 - An index that calls with the indexed container's root `&mut`,
   `pcx.types[place_ty(l, p, pbody, pcx)].kind`, is computed first,
@@ -170,6 +170,28 @@ The translator (g3274; flip28's T3 and T4, its rehearsal's hand fixes):
   stays; T4). A hoisted block that would lead a statement is
   parenthesized, `({ .. }) > 0 && ..` (tests/refactor/edition0276e,
   tests/run/rust_t_hoist_read).
+- An inherent impl of a struct with views names its region, `impl<'a>
+  Line<'a>`; a method's result with views and no reference to borrow
+  from (a receiver by value, or none) is `'a`, and so are the views it
+  takes and may store: `fn word(self, k) -> &'a str`, `fn new(opts:
+  Vec<Opt<'a>, A>, word: &'a str) -> Leaf<'a, A>` (T5;
+  tests/refactor/edition0276f, tests/run/rust_t_impl_region).
+- A pointer to views a function takes as an out parameter and sets to a
+  part of a view parameter (or to a local each of whose values is one),
+  `*message = text`, is tied to it: `fn error_offset<'a>(line: &'a [u8],
+  .., message: *mut &'a [u8])` (T2; tests/refactor/edition0276g,
+  tests/run/rust_t_out_view).
+- An address given where a raw pointer goes is one rustc takes for a
+  `*mut T`, as the rust edition does since D3.6a (rustc coerces a `&T`
+  only to a `*const T`, E0308): a mutable place's is `&mut x` (a
+  `var`'s, a `var` array's element, a part of what a raw pointer or a
+  `&mut` points to, `&mut cx.inst_cap`); a `let`'s or a by-value
+  parameter's is `&mut x` too, its binding made `mut` (`let mut k`, `fn
+  twice(mut n: i64)`), since the callee may write through the pointer
+  (a write through one made from `&raw const k` would be undefined); a
+  static's, or a place behind a shared reference, keeps its `&`. With front273's
+  D3.6a, gate 3's 120 such sites go to 0 (tests/refactor/edition0277r,
+  tests/run/rust_t_raw_address).
 
 The sources (g3274, docs/design/src-buffer.md):
 
