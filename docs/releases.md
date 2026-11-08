@@ -257,6 +257,31 @@ group, 12 cases of the views audit):
   `[&7]` have the body's storage, not `'static`, so
   `rust_b_unsized_err_raw_slice_invariant` borrows a static instead.
 
+std2 gets the rest of MVS's std (std280):
+
+- **std::path.** `Path` and `PathBuf<A>`, with Rust's names and
+  results. That covers components (`Component::RootDir`, `CurDir`,
+  `ParentDir`, `Normal`, from both ends), `iter`, `ancestors`, `parent`,
+  `file_name`, `file_stem`, `extension`, `starts_with`, `ends_with`,
+  `strip_prefix`, `join_in`, `with_extension_in`, `with_file_name_in`,
+  `push`, `pop`, `set_extension`, `set_file_name`, `exists`, `is_dir`,
+  `is_file`, and equality by components. A named divergence: Rust's
+  `Path` is an unsized newtype reached as `&Path`. The rust edition has
+  no user-defined DSTs yet (cut to 0.29), so `Path<'a>` is a sized,
+  copyable view of a `&'a str`, written `Path<'_>` (or `Path`, elided)
+  where Rust writes `&Path`. A component is a `&str` where Rust's is an
+  `&OsStr`, and paths are UTF-8. `PathBuf` derefs to `str` and has
+  Path's methods itself. When unsized newtypes come, `Path<'a>` becomes
+  `&'a Path`. std::fs and `env::set_current_dir` take a path as
+  `P: AsRef<str>`, Rust's `AsRef<Path>` (a `&str`, a `&String`, a `Path`
+  or a `&PathBuf`), not a `&str`. `DirEntry::path` stays a `&str`.
+  *Cases:* `std2_path_path` (a rustc twin: every result on 19 paths, as
+  Rust's), `std2_path_pathbuf`. The ten `sem_views_pth_*` cases run
+  without XFAIL, nine of them as rustc's borrowck errors.
+- tools/std2-checklist.py reads MVS's items from an MVS program
+  (examples/args). Since the flip, the tree's root is a rust program
+  whose std is std2, so the checklist could not be made.
+
 ### What's new in 0.27.8
 
 The last release before the flip, and the compiler that builds 0.28.0.

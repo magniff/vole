@@ -1,0 +1,857 @@
+// EDITION: rust
+// std::path (0.28.0): Path and PathBuf, Rust's names and meanings over
+// UTF-8 text ('/' between the components, as on Unix).
+//
+// A named divergence from Rust: Rust's `Path` is an unsized newtype over
+// OsStr, reached as `&Path`; the rust edition has no unsized newtypes
+// yet (rust-surface-plan.md, later: "an unsized newtype"), so `Path<'a>`
+// is a sized, copyable view of a `&'a str`, written `Path<'_>` (or `Path`
+// with its lifetime elided) where Rust writes `&Path`, and a component is
+// a `&str` where Rust's is an `&OsStr`. `PathBuf<A>` owns its text in a
+// String<A>; it derefs to str, so `fs::metadata(&p)` takes it, and it has
+// Path's methods itself. A path taken as an argument is `P: AsRef<str>`
+// (Rust's `AsRef<Path>`): a &str, a String, a Path or a PathBuf. When the
+// front has unsized newtypes, `Path<'a>` becomes `&'a Path`.
+// mvs: std::path
+
+use crate::alloc::Allocator;
+use crate::cmp::{Eq, PartialEq};
+use crate::convert::AsRef;
+use crate::fmt::{Debug, Display, Formatter};
+use crate::iter::{DoubleEndedIterator, Iterator};
+use crate::ops::Deref;
+use crate::option::Option;
+use crate::result::Result;
+use crate::string::String;
+
+// ---- Components ----
+
+// One component of a path: the root, a leading ".", "..", or a name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Component<'a> {
+    RootDir,
+    CurDir,
+    ParentDir,
+    Normal(&'a str),
+}
+
+impl<'a> Component<'a> {
+    // Its text: "/", ".", ".." or the name.
+    // std2: changed: a &str (Rust: as_os_str, an &OsStr)
+    #[effects()]
+    pub fn as_str(self) -> &'a str {
+        match self {
+            Component::RootDir => "/",
+            Component::CurDir => ".",
+            Component::ParentDir => "..",
+            Component::Normal(s) => s,
+        }
+    }
+}
+
+impl<'a> AsRef<str> for Component<'a> {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+// The length of s's prefix component: 1 for the root ('/') or for a
+// leading "." (".", "./..."), else 0.
+fn prefix_len(s: &str) -> usize {
+    let b = s.as_bytes();
+    if b.len() > 0 && b[0] == b'/' {
+        return 1;
+    }
+    if b.len() > 0 && b[0] == b'.' && (b.len() == 1 || b[1] == b'/') {
+        return 1;
+    }
+    0
+}
+
+// `p.components()`: the root or a leading "." first, then the names and
+// ".."s; empty components and "." past the first are left out, as Rust's.
+// Both ends: `next_back` gives the last component.
+#[derive(Clone, Copy)]
+pub struct Components<'a> {
+    s: &'a str,
+    // the prefix component (RootDir or CurDir) not yet given
+    pre: bool,
+    // the body not yet given: s[front..back]
+    front: usize,
+    back: usize,
+}
+
+impl<'a> Components<'a> {
+    fn of(s: &'a str) -> Components<'a> {
+        let n = prefix_len(s);
+        Components { s: s, pre: n > 0, front: n, back: s.len() }
+    }
+
+    fn prefix(&self) -> Component<'a> {
+        if self.s.as_bytes()[0] == b'/' { Component::RootDir } else { Component::CurDir }
+    }
+
+    fn body(c: &'a str) -> Option<Component<'a>> {
+        if c.len() == 0 || c == "." {
+            Option::None
+        } else if c == ".." {
+            Option::Some(Component::ParentDir)
+        } else {
+            Option::Some(Component::Normal(c))
+        }
+    }
+
+    // What is left, as a path: "" when nothing is.
+    #[effects(panic, diverge)]
+    pub fn as_path(&self) -> Path<'a> {
+        let b = self.s.as_bytes();
+        let mut lo = self.front;
+        let mut hi = self.back;
+        // trailing '/'s and "." components
+        loop {
+            if hi > lo && b[hi - 1] == b'/' {
+                hi -= 1;
+            } else if hi > lo && b[hi - 1] == b'.' && (hi - 1 == lo || b[hi - 2] == b'/') {
+                hi -= 1;
+            } else {
+                break;
+            }
+        }
+        if self.pre {
+            let n = prefix_len(self.s);
+            return Path { s: &self.s[0..if hi > n { hi } else { n }] };
+        }
+        // leading '/'s and "." components
+        loop {
+            if lo < hi && b[lo] == b'/' {
+                lo += 1;
+            } else if lo < hi && b[lo] == b'.' && (lo + 1 == hi || b[lo + 1] == b'/') {
+                lo += 1;
+            } else {
+                break;
+            }
+        }
+        Path { s: &self.s[lo..hi] }
+    }
+}
+
+impl<'a> Iterator for Components<'a> {
+    type Item = Component<'a>;
+
+    fn next(&mut self) -> Option<Component<'a>> {
+        if self.pre {
+            self.pre = false;
+            return Option::Some(self.prefix());
+        }
+        let b = self.s.as_bytes();
+        while self.front < self.back {
+            let start = self.front;
+            let mut end = start;
+            while end < self.back && b[end] != b'/' {
+                end += 1;
+            }
+            self.front = if end < self.back { end + 1 } else { end };
+            match Components::body(&self.s[start..end]) {
+                Option::Some(c) => return Option::Some(c),
+                Option::None => {}
+            }
+        }
+        Option::None
+    }
+}
+
+impl<'a> DoubleEndedIterator for Components<'a> {
+    fn next_back(&mut self) -> Option<Component<'a>> {
+        let b = self.s.as_bytes();
+        while self.front < self.back {
+            let end = self.back;
+            let mut start = end;
+            while start > self.front && b[start - 1] != b'/' {
+                start -= 1;
+            }
+            self.back = if start > self.front { start - 1 } else { start };
+            match Components::body(&self.s[start..end]) {
+                Option::Some(c) => return Option::Some(c),
+                Option::None => {}
+            }
+        }
+        if self.pre {
+            self.pre = false;
+            return Option::Some(self.prefix());
+        }
+        Option::None
+    }
+}
+
+// `p.iter()`: the components' texts.
+#[derive(Clone, Copy)]
+pub struct Iter<'a> {
+    inner: Components<'a>,
+}
+
+impl<'a> Iter<'a> {
+    // What is left, as a path.
+    #[effects(panic, diverge)]
+    pub fn as_path(&self) -> Path<'a> {
+        self.inner.as_path()
+    }
+}
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        match self.inner.next() {
+            Option::Some(c) => Option::Some(c.as_str()),
+            Option::None => Option::None,
+        }
+    }
+}
+
+impl<'a> DoubleEndedIterator for Iter<'a> {
+    fn next_back(&mut self) -> Option<&'a str> {
+        match self.inner.next_back() {
+            Option::Some(c) => Option::Some(c.as_str()),
+            Option::None => Option::None,
+        }
+    }
+}
+
+// `p.ancestors()`: p, its parent, the parent's parent, ...
+#[derive(Clone, Copy)]
+pub struct Ancestors<'a> {
+    next: Option<Path<'a>>,
+}
+
+impl<'a> Iterator for Ancestors<'a> {
+    type Item = Path<'a>;
+
+    fn next(&mut self) -> Option<Path<'a>> {
+        let cur = self.next;
+        match cur {
+            Option::Some(p) => self.next = p.parent(),
+            Option::None => {}
+        }
+        cur
+    }
+}
+
+// ---- Path ----
+
+// A path: a view of its text.
+// std2: changed: a sized view `Path<'a>`, Rust's `&'a Path` (no unsized
+// newtypes yet); MVS: a distinct [u8]
+#[derive(Clone, Copy)]
+pub struct Path<'a> {
+    s: &'a str,
+}
+
+// What `strip_prefix` fails with: the base is not a prefix.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StripPrefixError {}
+
+impl Display for StripPrefixError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        f.write_str("prefix not found")
+    }
+}
+
+// The byte range of the file name in s (its last Normal component): it
+// ends where the trailing '/'s and "." components start.
+fn file_name_range(s: &str) -> Option<(usize, usize)> {
+    let n = match Path::new(s).file_name() {
+        Option::Some(n) => n.len(),
+        Option::None => return Option::None,
+    };
+    let b = s.as_bytes();
+    let mut hi = b.len();
+    loop {
+        if hi > 0 && b[hi - 1] == b'/' {
+            hi -= 1;
+        } else if hi > 0 && b[hi - 1] == b'.' && (hi == 1 || b[hi - 2] == b'/') {
+            hi -= 1;
+        } else {
+            break;
+        }
+    }
+    Option::Some((hi - n, hi))
+}
+
+// A file name split at its last '.': (stem, extension); ".." and a name
+// whose only '.' leads (".bashrc") have no extension.
+fn split_dot(name: &str) -> (&str, Option<&str>) {
+    if name == ".." {
+        return (name, Option::None);
+    }
+    match name.rfind('.') {
+        Option::Some(0) => (name, Option::None),
+        Option::Some(k) => (&name[0..k], Option::Some(&name[k + 1..])),
+        Option::None => (name, Option::None),
+    }
+}
+
+impl<'a> Path<'a> {
+    // The path of the text s: `Path::new("a/b.txt")`.
+    // std2: changed: a Path<'a> of a &'a str (Rust: &Path of an AsRef<OsStr>)
+    #[effects()]
+    pub fn new(s: &'a str) -> Path<'a> {
+        Path { s: s }
+    }
+
+    // Its text.
+    // std2: changed: Rust's as_os_str, a &str
+    #[effects()]
+    pub fn as_str(&self) -> &'a str {
+        self.s
+    }
+
+    // Its text: always Some, a path being UTF-8 here.
+    #[effects()]
+    pub fn to_str(&self) -> Option<&'a str> {
+        Option::Some(self.s)
+    }
+
+    // Its bytes.
+    #[effects()]
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.s.as_bytes()
+    }
+
+    // What prints it: the path itself, which is Display.
+    // std2: changed: a Path (Rust: a path::Display)
+    #[effects()]
+    pub fn display(&self) -> Path<'a> {
+        *self
+    }
+
+    #[effects(panic)]
+    pub fn is_absolute(&self) -> bool {
+        self.has_root()
+    }
+
+    #[effects(panic)]
+    pub fn is_relative(&self) -> bool {
+        !self.has_root()
+    }
+
+    // Whether it starts with '/'.
+    #[effects(panic)]
+    pub fn has_root(&self) -> bool {
+        self.s.len() > 0 && self.s.as_bytes()[0] == b'/'
+    }
+
+    // Its components.
+    #[effects(panic)]
+    pub fn components(&self) -> Components<'a> {
+        Components::of(self.s)
+    }
+
+    // Its components' texts.
+    #[effects(panic)]
+    pub fn iter(&self) -> Iter<'a> {
+        Iter { inner: Components::of(self.s) }
+    }
+
+    // It and its parents, up to the root (or "").
+    #[effects()]
+    pub fn ancestors(&self) -> Ancestors<'a> {
+        Ancestors { next: Option::Some(*self) }
+    }
+
+    // The path without its last component: None for "/" and "", "" for a
+    // single relative component.
+    #[effects(panic, diverge)]
+    pub fn parent(&self) -> Option<Path<'a>> {
+        let mut c = Components::of(self.s);
+        match c.next_back() {
+            Option::Some(Component::RootDir) => Option::None,
+            Option::Some(_) => Option::Some(c.as_path()),
+            Option::None => Option::None,
+        }
+    }
+
+    // The last component, when it is a name (not "/", "." or "..").
+    // std2: changed: a &str (Rust: &OsStr; MVS: a Path)
+    #[effects(panic, diverge)]
+    pub fn file_name(&self) -> Option<&'a str> {
+        match Components::of(self.s).next_back() {
+            Option::Some(Component::Normal(n)) => Option::Some(n),
+            _ => Option::None,
+        }
+    }
+
+    // The file name before its last '.' (all of it when it has none, or
+    // only a leading one).
+    // std2: changed: a &str (Rust: &OsStr; MVS: a Path)
+    #[effects(io, panic, diverge)]
+    pub fn file_stem(&self) -> Option<&'a str> {
+        match self.file_name() {
+            Option::Some(n) => Option::Some(split_dot(n).0),
+            Option::None => Option::None,
+        }
+    }
+
+    // The file name after its last '.' (None for ".bashrc" or "a").
+    // std2: changed: a &str (Rust: &OsStr; MVS: a Path)
+    #[effects(io, panic, diverge)]
+    pub fn extension(&self) -> Option<&'a str> {
+        match self.file_name() {
+            Option::Some(n) => split_dot(n).1,
+            Option::None => Option::None,
+        }
+    }
+
+    // Whether base's components are its first ones.
+    // std2: changed: base an AsRef<str> (Rust: AsRef<Path>)
+    #[effects(panic, diverge)]
+    pub fn starts_with<P: AsRef<str>>(&self, base: P) -> bool {
+        let mut mine = Components::of(self.s);
+        let mut theirs = Components::of(base.as_ref());
+        loop {
+            match theirs.next() {
+                Option::None => return true,
+                Option::Some(t) => match mine.next() {
+                    Option::Some(m) => {
+                        if m != t {
+                            return false;
+                        }
+                    }
+                    Option::None => return false,
+                },
+            }
+        }
+    }
+
+    // Whether child's components are its last ones.
+    // std2: changed: child an AsRef<str> (Rust: AsRef<Path>)
+    #[effects(panic, diverge)]
+    pub fn ends_with<P: AsRef<str>>(&self, child: P) -> bool {
+        let mut mine = Components::of(self.s);
+        let mut theirs = Components::of(child.as_ref());
+        loop {
+            match theirs.next_back() {
+                Option::None => return true,
+                Option::Some(t) => match mine.next_back() {
+                    Option::Some(m) => {
+                        if m != t {
+                            return false;
+                        }
+                    }
+                    Option::None => return false,
+                },
+            }
+        }
+    }
+
+    // The path after base, when base's components are its first ones.
+    // std2: changed: base an AsRef<str> (Rust: AsRef<Path>)
+    #[effects(panic, diverge)]
+    pub fn strip_prefix<P: AsRef<str>>(&self, base: P) -> Result<Path<'a>, StripPrefixError> {
+        let mut mine = Components::of(self.s);
+        let mut theirs = Components::of(base.as_ref());
+        loop {
+            match theirs.next() {
+                Option::None => return Result::Ok(mine.as_path()),
+                Option::Some(t) => match mine.next() {
+                    Option::Some(m) => {
+                        if m != t {
+                            return Result::Err(StripPrefixError {});
+                        }
+                    }
+                    Option::None => return Result::Err(StripPrefixError {}),
+                },
+            }
+        }
+    }
+
+    // The path with p after it, on allocator a (p absolute: p).
+    // std2: changed: an allocator (Rust: join)
+    #[effects(P, A)]
+    pub fn join_in<P: AsRef<str>, A: Allocator>(&self, p: P, a: A) -> PathBuf<A> {
+        let mut out = PathBuf::from_in(self.s, a);
+        out.push(p);
+        out
+    }
+
+    // An owned copy, on allocator a.
+    // std2: changed: an allocator (Rust: to_path_buf)
+    #[effects(A)]
+    pub fn to_path_buf_in<A: Allocator>(&self, a: A) -> PathBuf<A> {
+        PathBuf::from_in(self.s, a)
+    }
+
+    // The path with its file name replaced by name, on allocator a.
+    // std2: changed: an allocator (Rust: with_file_name)
+    #[effects(S, A)]
+    pub fn with_file_name_in<S: AsRef<str>, A: Allocator>(&self, name: S, a: A) -> PathBuf<A> {
+        let mut out = PathBuf::from_in(self.s, a);
+        out.set_file_name(name);
+        out
+    }
+
+    // The path with its extension replaced by ext, on allocator a.
+    // std2: changed: an allocator (Rust: with_extension)
+    #[effects(S, A)]
+    pub fn with_extension_in<S: AsRef<str>, A: Allocator>(&self, ext: S, a: A) -> PathBuf<A> {
+        let mut out = PathBuf::from_in(self.s, a);
+        out.set_extension(ext);
+        out
+    }
+
+    // What stat says of the file at the path.
+    #[effects(alloc(extern), io, static, panic, diverge)]
+    pub fn metadata(&self) -> crate::io::Result<crate::fs::Metadata> {
+        crate::fs::metadata(self.s)
+    }
+
+    // What lstat says of it.
+    #[effects(alloc(extern), io, static, panic, diverge)]
+    pub fn symlink_metadata(&self) -> crate::io::Result<crate::fs::Metadata> {
+        crate::fs::symlink_metadata(self.s)
+    }
+
+    // Whether something is there (stat succeeds).
+    #[effects(alloc(extern), io, static, panic, diverge)]
+    pub fn exists(&self) -> bool {
+        match crate::fs::metadata(self.s) {
+            Result::Ok(_) => true,
+            Result::Err(_) => false,
+        }
+    }
+
+    #[effects(alloc(extern), io, static, panic, diverge)]
+    pub fn is_dir(&self) -> bool {
+        match crate::fs::metadata(self.s) {
+            Result::Ok(m) => m.is_dir(),
+            Result::Err(_) => false,
+        }
+    }
+
+    #[effects(alloc(extern), io, static, panic, diverge)]
+    pub fn is_file(&self) -> bool {
+        match crate::fs::metadata(self.s) {
+            Result::Ok(m) => m.is_file(),
+            Result::Err(_) => false,
+        }
+    }
+
+    #[effects(alloc(extern), io, static, panic, diverge)]
+    pub fn is_symlink(&self) -> bool {
+        match crate::fs::symlink_metadata(self.s) {
+            Result::Ok(m) => m.is_symlink(),
+            Result::Err(_) => false,
+        }
+    }
+}
+
+impl<'a> AsRef<str> for Path<'a> {
+    fn as_ref(&self) -> &str {
+        self.s
+    }
+}
+
+// Two paths are equal when their components are ("a//b/" is "a/b").
+impl<'a> PartialEq for Path<'a> {
+    fn eq(&self, other: &Path<'a>) -> bool {
+        let mut x = Components::of(self.s);
+        let mut y = Components::of(other.s);
+        loop {
+            match x.next() {
+                Option::Some(c) => match y.next() {
+                    Option::Some(d) => {
+                        if c != d {
+                            return false;
+                        }
+                    }
+                    Option::None => return false,
+                },
+                Option::None => return y.next().is_none(),
+            }
+        }
+    }
+}
+
+impl<'a> Eq for Path<'a> {}
+
+// Its text (Rust's `p.display()`).
+impl<'a> Display for Path<'a> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        Display::fmt(self.s, f)
+    }
+}
+
+// Its text, quoted, as a str's Debug.
+impl<'a> Debug for Path<'a> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        Debug::fmt(self.s, f)
+    }
+}
+
+// ---- PathBuf ----
+
+// An owned path, its text in a String on allocator A.
+// std2: changed: its text a String<A> (MVS: a pub Vec<u8, A>)
+pub struct PathBuf<A: Allocator> {
+    s: String<A>,
+}
+
+impl<A: Allocator> PathBuf<A> {
+    // An empty path.
+    // std2: changed: an allocator (Rust: new)
+    pub fn new_in(a: A) -> PathBuf<A> {
+        PathBuf { s: String::new_in(a) }
+    }
+
+    // An empty path with room for n bytes.
+    // std2: changed: an allocator (Rust: with_capacity)
+    #[effects(A)]
+    pub fn with_capacity_in(n: usize, a: A) -> PathBuf<A> {
+        PathBuf { s: String::with_capacity_in(n, a) }
+    }
+
+    // A path of s's text.
+    // std2: changed: a &str (MVS: [u8]); Rust: PathBuf::from
+    #[effects(A)]
+    pub fn from_in(s: &str, a: A) -> PathBuf<A> {
+        PathBuf { s: String::from_in(s, a) }
+    }
+
+    // A path that owns s.
+    #[effects()]
+    pub fn from_string(s: String<A>) -> PathBuf<A> {
+        PathBuf { s: s }
+    }
+
+    // A view of it.
+    #[effects(A)]
+    pub fn as_path(&self) -> Path<'_> {
+        Path { s: self.s.as_str() }
+    }
+
+    // Its text.
+    // std2: changed: Rust's as_os_str, a &str
+    #[effects(A)]
+    pub fn as_str(&self) -> &str {
+        self.s.as_str()
+    }
+
+    #[effects(A)]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.s.as_bytes()
+    }
+
+    // Its String.
+    // std2: changed: Rust's into_os_string, a String<A>
+    #[effects()]
+    pub fn into_string(self) -> String<A> {
+        self.s
+    }
+
+    #[effects(A)]
+    pub fn capacity(&self) -> usize {
+        self.s.capacity()
+    }
+
+    #[effects(A)]
+    pub fn clear(&mut self) {
+        self.s.clear();
+    }
+
+    // Appends p after a '/' (p absolute: p replaces the path).
+    // std2: changed: p an AsRef<str> (Rust: AsRef<Path>; MVS: [u8])
+    #[effects(panic, A)]
+    pub fn push<P: AsRef<str>>(&mut self, p: P) {
+        let t = p.as_ref();
+        if t.len() > 0 && t.as_bytes()[0] == b'/' {
+            self.s.clear();
+        } else if self.s.len() > 0 && self.s.as_bytes()[self.s.len() - 1] != b'/' {
+            self.s.push('/');
+        }
+        self.s.push_str(t);
+    }
+
+    // Removes the last component: false when there is none (the root, or
+    // nothing).
+    #[effects(panic, diverge, A)]
+    pub fn pop(&mut self) -> bool {
+        let n = match self.as_path().parent() {
+            Option::Some(q) => q.as_str().len(),
+            Option::None => return false,
+        };
+        self.s.truncate(n);
+        true
+    }
+
+    // Its file name replaced by name (added when it has none).
+    // std2: changed: name an AsRef<str> (Rust: AsRef<OsStr>)
+    #[effects(panic, diverge, A, S)]
+    pub fn set_file_name<S: AsRef<str>>(&mut self, name: S) {
+        if self.as_path().file_name().is_some() {
+            self.pop();
+        }
+        self.push(name);
+    }
+
+    // Its extension replaced by ext (added when it has none; "" removes
+    // it): false, and nothing changed, when it has no file name.
+    // std2: changed: ext an AsRef<str> (Rust: AsRef<OsStr>; MVS: [u8])
+    #[effects(io, panic, diverge, A)]
+    pub fn set_extension<S: AsRef<str>>(&mut self, ext: S) -> bool {
+        let (start, end) = match file_name_range(self.s.as_str()) {
+            Option::Some(r) => r,
+            Option::None => return false,
+        };
+        let stem = split_dot(&self.s.as_str()[start..end]).0.len();
+        self.s.truncate(start + stem);
+        let e = ext.as_ref();
+        if e.len() > 0 {
+            self.s.push('.');
+            self.s.push_str(e);
+        }
+        true
+    }
+
+    // Path's methods, through as_path (Rust's PathBuf derefs to Path).
+
+    pub fn is_absolute(&self) -> bool {
+        self.as_path().is_absolute()
+    }
+
+    #[effects(panic, A)]
+    pub fn is_relative(&self) -> bool {
+        self.as_path().is_relative()
+    }
+
+    #[effects(panic, A)]
+    pub fn has_root(&self) -> bool {
+        self.as_path().has_root()
+    }
+
+    #[effects(A)]
+    pub fn to_str(&self) -> Option<&str> {
+        Option::Some(self.s.as_str())
+    }
+
+    #[effects(A)]
+    pub fn display(&self) -> Path<'_> {
+        self.as_path()
+    }
+
+    #[effects(panic, A)]
+    pub fn components(&self) -> Components<'_> {
+        self.as_path().components()
+    }
+
+    #[effects(panic, A)]
+    pub fn iter(&self) -> Iter<'_> {
+        self.as_path().iter()
+    }
+
+    #[effects(A)]
+    pub fn ancestors(&self) -> Ancestors<'_> {
+        self.as_path().ancestors()
+    }
+
+    #[effects(panic, diverge, A)]
+    pub fn parent(&self) -> Option<Path<'_>> {
+        self.as_path().parent()
+    }
+
+    #[effects(panic, diverge, A)]
+    pub fn file_name(&self) -> Option<&str> {
+        self.as_path().file_name()
+    }
+
+    #[effects(io, panic, diverge, A)]
+    pub fn file_stem(&self) -> Option<&str> {
+        self.as_path().file_stem()
+    }
+
+    #[effects(io, panic, diverge, A)]
+    pub fn extension(&self) -> Option<&str> {
+        self.as_path().extension()
+    }
+
+    #[effects(A, P)]
+    pub fn starts_with<P: AsRef<str>>(&self, base: P) -> bool {
+        self.as_path().starts_with(base)
+    }
+
+    #[effects(A, P)]
+    pub fn ends_with<P: AsRef<str>>(&self, child: P) -> bool {
+        self.as_path().ends_with(child)
+    }
+
+    #[effects(A, P)]
+    pub fn strip_prefix<P: AsRef<str>>(&self, base: P) -> Result<Path<'_>, StripPrefixError> {
+        self.as_path().strip_prefix(base)
+    }
+
+    #[effects(A, P, B)]
+    pub fn join_in<P: AsRef<str>, B: Allocator>(&self, p: P, b: B) -> PathBuf<B> {
+        self.as_path().join_in(p, b)
+    }
+
+    #[effects(alloc(extern), io, static, panic, diverge, A)]
+    pub fn exists(&self) -> bool {
+        self.as_path().exists()
+    }
+
+    #[effects(alloc(extern), io, static, panic, diverge, A)]
+    pub fn is_dir(&self) -> bool {
+        self.as_path().is_dir()
+    }
+
+    #[effects(alloc(extern), io, static, panic, diverge, A)]
+    pub fn is_file(&self) -> bool {
+        self.as_path().is_file()
+    }
+
+    #[effects(alloc(extern), io, static, panic, diverge, A)]
+    pub fn metadata(&self) -> crate::io::Result<crate::fs::Metadata> {
+        self.as_path().metadata()
+    }
+}
+
+// Its text: `fs::metadata(&p)`, `p.len()`.
+// std2: changed: derefs to str (Rust: to Path)
+impl<A: Allocator> Deref for PathBuf<A> {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.s.as_str()
+    }
+}
+
+impl<A: Allocator> AsRef<str> for PathBuf<A> {
+    fn as_ref(&self) -> &str {
+        self.s.as_str()
+    }
+}
+
+// A copy on the same allocator (a clone of it).
+impl<A: Allocator + Clone> Clone for PathBuf<A> {
+    fn clone(&self) -> PathBuf<A> {
+        PathBuf { s: self.s.clone() }
+    }
+}
+
+impl<A: Allocator, B: Allocator> PartialEq<PathBuf<B>> for PathBuf<A> {
+    fn eq(&self, other: &PathBuf<B>) -> bool {
+        self.as_path() == other.as_path()
+    }
+}
+
+impl<A: Allocator> Eq for PathBuf<A> {}
+
+impl<A: Allocator> Display for PathBuf<A> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        Display::fmt(self.s.as_str(), f)
+    }
+}
+
+impl<A: Allocator> Debug for PathBuf<A> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        Debug::fmt(self.s.as_str(), f)
+    }
+}
