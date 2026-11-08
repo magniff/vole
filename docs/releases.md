@@ -89,6 +89,49 @@ binary is invoked, where its test runner is and which hosts it supports.
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.27.8
+
+The front (f185x):
+
+- **Open locals are one variable (F18.5).** An open local is a leaf of
+  the literal trees built from it: `let c = a;`, `let b = a + 1;`, `let m
+  = if x > 0 { a } else { 0 };`, a comparison of two open locals (`a >
+  b`), `s += x`, and a `for` loop over a range of literals and open
+  locals (`for i in 0..64`) keep the locals open and link them, and the
+  use that types one types them all, as rustc's unified `{integer}`. A
+  shift amount (`1 << k`) and a cast's operand give an open local no type,
+  and on std2 a direct call's format hole (`println("{}", x)`) neither:
+  its write is made again with the solved type's impl. 0.27.7 closed the
+  local at each of these at `i32` and widened it at the later `i64` use
+  (FR5): a silent wrong value past 2^31 (`let c = a;` of `1 << 40` was
+  256; a loop's `i * i` wrapped). The FR5 census of compiler/src's
+  translation (gate 3) counts 146 such widenings at 0.27.7 and none now;
+  the 10 left are values of a narrower declared type (`h ^= bytes[i]` of
+  a `[u8]`), which rustc refuses too (E0308).
+  *Cases:* `rust_f_f185_open_leaves`, `rust_f_f185_open_compare`,
+  `rust_f_f185_open_loops`, `rust_f_f185_open_format`.
+
+The front (front273, I7):
+
+- A `&mut T` place given where a raw pointer goes outside a call (a
+  `let`'s value, the function's tail or `return`, an assigned value, a
+  struct literal's field) is reborrowed raw, `&raw mut (*x)`, as an
+  argument is (D3.6). 0.27.7 copied the `&mut` there, which
+  `--verify-places` refused (I7), and missed rustc's E0502 for a shared
+  borrow of `*x` live across it (rust_b_raw_coerce_positions,
+  rust_b_raw_coerce_let_live_shared_err). The reborrow is a write only
+  where `*mut T` is written; to `*const T` it is a read, as rustc's.
+- A view coerces to a fat raw pointer (D3.6a): `&[T]` and `&mut [T]` to
+  `*const [T]`, `&mut [T]` to `*mut [T]`, `&str` to `*const str`, `&a`
+  and `&mut a` of an array as its slice. 0.27.7 refused them all. A
+  shared view where `*mut [T]` is written is rustc's E0308. A `&mut`
+  made a written `*mut` by a cast (`x as *mut T`, `s as *mut [T]`), a
+  `&mut [T]` given to `*mut [T]`, and `&mut s[..]` made a fat raw
+  pointer are a write of what they point to, so a shared borrow live
+  across one is rustc's E0502; 0.27.7 accepted these
+  (rust_b_raw_fat_coerce, rust_b_raw_fat_from_shared_err,
+  rust_b_raw_mut_write_live_shared_err).
+
 ### What's new in 0.27.7
 
 Gate 3 is 0. `fix --edition rust` on a copy of compiler/src type-checks
