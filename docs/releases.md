@@ -168,6 +168,33 @@ The front (front273):
   and that one called a `Vec::drop` that had no instance, so the link
   failed with an undefined symbol. -O2 was not affected.
 
+std2 and the translator (fl10274):
+
+- Gate 3's type errors go from 14 to 3, with g3274's rows and std2's cli.
+  - `for v in m.values("x") { if v == "on" .. }` over a call that gives
+    a slice is written `for &v in ..`, as for a named slice: the cli's
+    `expected 'let str', got 'str'`.
+  - A row for `str` also fires on a text the MVS front sees as `[u8]`
+    (a literal, or a value declared as text): `s.split(b'|')` in a
+    `match` scrutinee or a call's argument. A row's `'c' as char` is
+    written `'c'`.
+  - `arena_scope(&gpa, f)` is `Arena::new_in(gpa).scope(|s| f(s))`, and
+    `Arena::none()` is `Arena::new_in` on the allocator in scope.
+  - `IntVecItems::fold` reads through a method, not a `*i64` index, and
+    std2 has crate-private `count_ones`, `leading_zeros` and
+    `trailing_zeros` for std::arch's callers.
+- std2's effects:
+  - `tools/std2-effects.py` no longer writes a second `#[effects(..)]`
+    above an item that has one under its comments; 14 duplicates in
+    ptr.vl, slice.vl, str.vl, string.vl and env.vl are gone.
+  - `Result::ok`, `and`, `or`, `unwrap_or` and Option's `unwrap_or`,
+    `ok_or`, `and`, `or`, `xor`, `zip` name the type parameters they
+    drop, so a `T` with Drop is checked (std2_result_option_drops).
+  - `impl Read for &File` and `impl Write for &File` read `(*self).fd`.
+    Their bodies did not check, which left `std::panic::panic`'s effects
+    "(unknown)" through fn-value dispatch; it is `io panic diverge`, and
+    `fix --only effects-std` writes that on a function that panics.
+
 ### What's new in 0.27.5
 
 Gate 3 at 37. std2 has the modules compiler/src uses: `std::time`, `std::fs`, `std::process` and `std::cli`, Rust-shaped, with the translator's rows bending MVS's calls onto them. `fix --edition rust` on a copy of compiler/src now leaves 37 errors (122 in 0.27.4), and `check --borrowck-partial` counts 154 borrowck errors behind them (3,048 in 0.27.4): a rust body reads each operand where it is evaluated (D2.4a), and borrowed literals are promoted (D2.8). In the rust edition, text is not its bytes (F0.6: a `&str` where a `&[u8]` goes is E0308), and the translator writes `b".."` or `.as_bytes()` where bytes are declared; a generic iterator's item is its bound's region, not a borrow of the iterator (D4.6 f); `AsRef` for `&T` with T = `str` no longer calls itself (a stack overflow at run time) nor gives a false outlives (Z9.1c); a borrowed array or tuple literal takes the expected type (F18.4). std2 is lexed by its units from an index made when it is embedded (Z5.2): a rust hello world's check is 1.82x MVS's (2.03x), and the 2.0x ceiling is enforced. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
