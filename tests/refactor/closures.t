@@ -23,13 +23,13 @@ $ rewrite 'apply($f, $x)' '$f($x)' --dry-run
 -    apply(by, x)
 +    by(x)
 @@ -20,2 +20,2 @@
--    total += apply(add, 1);
+-    total += apply(add, 1i64);
 -    total += apply(|y| {
-+    total += add(1);
++    total += add(1i64);
 +    total += (|y| {
 @@ -24 +24 @@
--    }, 2);
-+    })(2);
+-    }, 2i64);
++    })(2i64);
 main.vl:21:16: error[type error] cannot infer the type of closure parameter 'y' | help: write its type: '|y: i64| ...'  [edited: crate::main]
 warning edit.breaks: 1 new error (dry run); the error: main.vl:21:16: cannot infer the type of closure parameter 'y'
 [exit 1]
@@ -37,8 +37,8 @@ $ rewrite 'apply(|y| $b, $x)' 'apply(|y| $b + 0, $x)' --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -24 +24 @@
--    }, 2);
-+    } + 0, 2);
+-    }, 2i64);
++    } + 0, 2i64);
 ## A pattern with other parameters matches nothing.
 $ rewrite 'apply(|z| $b, $x)' 'apply(|z| $b + 0, $x)' --dry-run
 note rewrite.none: nothing matches 'apply(|z| $b, $x)'
@@ -47,15 +47,15 @@ rewrote 2 sites in 1 file	main.vl	+2 -2 lines
 % git diff | sed -n '/^@@/,$p'
 @@ -16,11 +16,11 @@ fn scaled(k: i64, x: i64) -> i64 {
  fn main() -> i32 {
-     let k = 3;
-     var total = 0;
+     let k: i64 = 3;
+     let mut total: i64 = 0;
 -    let add = |x: i64| double(x) + k;
 +    let add = |x: i64| (x * 2) + k;
-     total += apply(add, 1);
+     total += apply(add, 1i64);
      total += apply(|y| {
          let z = y + k;
 -        double(z)
 +        (z * 2)
-     }, 2);
+     }, 2i64);
      total += scaled(2, 5);
-     std::print_int(total);
+     print("{}", total);
