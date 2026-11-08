@@ -164,6 +164,24 @@ The front (front273):
   mutability, `try: &mut x`. `&mut T` still coerces to both raw
   pointers, and `&T` to `*const T`. 0.27.6 accepted it, so a callee
   could write through a pointer made from a shared borrow.
+- A `&mut T` place given where a raw pointer goes outside a call (a
+  `let`'s value, the function's tail or `return`, an assigned value, a
+  struct literal's field) is reborrowed raw, `&raw mut (*x)`, as an
+  argument is (D3.6). 0.27.6 copied the `&mut` there, which
+  `--verify-places` refused (I7), and missed rustc's E0502 for a shared
+  borrow of `*x` live across it (rust_b_raw_coerce_positions,
+  rust_b_raw_coerce_let_live_shared_err). The reborrow is a write only
+  where `*mut T` is written; to `*const T` it is a read, as rustc's.
+- A view coerces to a fat raw pointer (D3.6a): `&[T]` and `&mut [T]` to
+  `*const [T]`, `&mut [T]` to `*mut [T]`, `&str` to `*const str`, `&a`
+  and `&mut a` of an array as its slice. 0.27.6 refused them all. A
+  shared view where `*mut [T]` is written is rustc's E0308. A `&mut`
+  made a written `*mut` by a cast (`x as *mut T`, `s as *mut [T]`), a
+  `&mut [T]` given to `*mut [T]`, and `&mut s[..]` made a fat raw
+  pointer are a write of what they point to, so a shared borrow live
+  across one is rustc's E0502; 0.27.6 accepted these
+  (rust_b_raw_fat_coerce, rust_b_raw_fat_from_shared_err,
+  rust_b_raw_mut_write_live_shared_err).
 - A literal beside a value an earlier error left untyped takes the
   error type, so it gets no second error (F18.3). 0.27.6 checked it
   against the i32 fallback: `let value = parse("x")` was a mismatch,
