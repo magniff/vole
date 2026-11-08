@@ -522,7 +522,18 @@ re-inferred.
   x`), an assigned value, a struct literal's field; 0.27.6 copied the
   `&mut` there (the value's type, the raw pointer's, is Copy), an I7
   break `--verify-places` reported. `Q` stays usable after it, as
-  after rustc's reborrow. That creates no loan
+  after rustc's reborrow. Outside a call the reborrow is `&raw mut
+  (*Q)`, a write, only where the type written is `*mut T` (D3.6a's
+  positions; the checker keeps them, `Ctx.raw_mut_coerced`); where it
+  is `*const T`, or not written, it is `&raw const (*Q)` (`BK_RAW`), a
+  read, as rustc's coercion to `*const T` is (`let r = &*x; let p:
+  *const T = x; *r` is accepted). A cast is read the same way: `x as
+  *mut T` of a `&mut T` x is a deep write of `*x` (rustc E0502 with a
+  shared borrow of it live), `x as *const T` a read. The fat ones
+  alike: a `&mut [T]` place given or cast to a written `*mut [T]`, and
+  `&mut s[..]` made a fat raw pointer (which has no loan, R1), are a
+  deep write of what the view views; `&s[..]` and a `&mut [T]` given
+  to `*const [T]` are reads. That creates no loan
   (D2.1), so the reborrow ends at the coercion: a later `&mut` of a
   part of `*Q` in the same call's arguments, `f(cx, &mut cx.cap)`, is
   no conflict. The coercion's own access is a deep write of `*Q`
