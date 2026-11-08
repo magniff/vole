@@ -24,7 +24,7 @@ fn main(gpa: Gpa) -> i32 {
 
 ## Parsing and Matches
 
-`cmd.parse(args)` takes any iterator of `str`, the program's name first
+`cmd.parse(args)` takes any iterator of `&str`, the program's name first
 (`env::args()`, `line.split(' ')`, `v.iter()`); `parse_in(args, a)`
 puts the Matches on allocator `a` (an arena). Accepted: `-v`, `-vvv`,
 clusters `-vq`, `-ofile`, `-o file`, `-o=file`, `--out file`,
@@ -51,7 +51,7 @@ fn main(gpa: Gpa) -> i32 {
     }
     match cmd.parse("tool --outt x".split(' ')) {
         Ok(_) => println("ok"),
-        Err(e) => print(cmd.render_in(e, gpa).as_slice()),
+        Err(e) => print("{}", cmd.render_in(e, gpa)),
     }
     0
 }
@@ -65,10 +65,10 @@ usage: tool [options] [file]... [command]
 ```
 
 - `m.flag(name)`: given (a default is not); `m.count(name)`: how many
-  times; `m.get(name)`: the last value or the default, an
-  `Option<str>`; `m.values(name)`: every value, a `[str]`;
+  times (a usize); `m.get(name)`: the last value or the default, an
+  `Option<&str>`; `m.values(name)`: every value, a `&[&str]`;
   `m.get_as::<T>(name)`: parsed (`FromStr`), `Err(CliError)` naming the
-  argument; `m.subcommand()`: `Option<(str, Matches)>`;
+  argument; `m.subcommand()`: `Option<(&str, Matches)>`;
   `m.indices_of(name)` (0.25): each value's (or flag's) index among the
   arguments, for the order of different options (`-l m x.o -l z`). A
   name that is no Arg of that command panics.
@@ -78,7 +78,7 @@ usage: tool [options] [file]... [command]
   rest), `.choices("fast|slow")` (0.25: another value is an error,
   `try: --mode <fast|slow>`). Options may repeat.
 - (0.25) `Command::new_in(name, a)` takes any allocator, an arena too
-  (`arena_scope(gpa, |a| ..)`: nothing on the Gpa). A program's own
+  (`arena_scope(&gpa, |a| ..)`: nothing on the Gpa). A program's own
   check fails in std::cli's form: `cmd.exit(CliError::custom("-b and -t
   together", "-b"))`; `e.letter()`: the unknown letter of a cluster.
 
@@ -103,11 +103,11 @@ fn main(gpa: Gpa) -> i32 {
     println("{name} {} {} {}", m.get("stats").unwrap(), m.values("overlay").len(),
         sub.get("root").unwrap());
     println("{} {}", sub.values("expr")[0], sub.values("args")[0]);
-    let lines: [str; 2] = ["vc", "vc rm -b -t"];
+    let lines: [&str; 2] = ["vc", "vc rm -b -t"];
     for line in lines {
         match cmd.parse(line.split(' ')) {
             Ok(_) => println("ok"),
-            Err(e) => print(cmd.render_in(e, gpa).as_slice()),
+            Err(e) => print("{}", cmd.render_in(e, gpa)),
         }
     }
     0
@@ -146,5 +146,5 @@ usage: vc remove [options] [expr]... [-- args]...
 help or version on stdout (0), else on stderr (2) the error, a `try:`
 line (the nearest option or command by edit distance, or the fix) and
 the usage line. `cmd.render_in(e, a)` and `cmd.help_in(a)` give that
-text as a `Buf`; `.width(n)` wraps the help (80). Parsing does no io
+text as a `String`; `.width(n)` wraps the help (80). Parsing does no io
 (`query effects`): only `exit` and `parse_or_exit` print.

@@ -43,7 +43,7 @@ mod shop {
 }
 
 fn main() -> i32 {
-    println(shop::till::total(50) + shop::quote(50));   // not shop::till::tax
+    println("{}", shop::till::total(50) + shop::quote(50));   // not shop::till::tax
     0
 }
 ```
@@ -55,15 +55,14 @@ fn main() -> i32 {
 mod geo {
     pub struct Rect { pub w: i64, h: i64 }
     impl Rect {
-        pub fn new(w: i64, h: i64) -> Rect { Rect { w: w, h: h } }
-        pub fn area(self) -> i64 { self.w * self.h }
+        pub fn new(w: i64, h: i64) -> Rect { Rect { w, h } }
+        pub fn area(&self) -> i64 { self.w * self.h }
     }
 }
 
 fn main() -> i32 {
     let r = geo::Rect::new(3, 4);     // not `geo::Rect { w: 3, h: 4 }`: h is private
-    std::print_int(r.w + r.area());   // r.w is pub; r.h would be field.private
-    println("");
+    println("{}", r.w + r.area());   // r.w is pub; r.h would be field.private
     0
 }
 ```
@@ -105,8 +104,7 @@ fn speed(m: util::Mode) -> i64 {
 }
 
 fn main() -> i32 {
-    std::print_int(double(3) + halve(8) + quad(1) + speed(Fast) + crate::util::double(1));
-    println("");
+    println("{}", double(3) + halve(8) + quad(1) + speed(Fast) + crate::util::double(1));
     0
 }
 ```
@@ -120,14 +118,17 @@ fn main() -> i32 {
 - Name resolution: a local binding, then the module's own items, then
   its imports, then the prelude. A program's own `Vec` (or `trim`) hides
   the prelude's.
-- The prelude, std's names used without a `use`: `Option Some None
-  Result Ok Err Vec Buf HashMap print println eprint eprintln format
-  format_in Gpa Allocator Arena ScopedArena arena_scope read_line
-  read_stdin_in Scanner parse_int trim split_in split_whitespace_in sort
-  sort_by cmp_of eq_of Fmt Display Debug Clone From Into Iterator Hash
-  Eq Ord` and the operator traits, `panic(msg)` (prints `msg`, exits with
-  101) and `unreachable()`. The rest of std is `use std::{...}` (or
-  `std::name`); a program that names none of it is built without std.
+- The prelude, std's names used without a `use`, is Rust's plus `Gpa`:
+  `Option Some None Result Ok Err Vec String Box Clone Copy Default Drop
+  drop PartialEq Eq PartialOrd Ord From Into TryFrom TryInto AsRef AsMut
+  Iterator IntoIterator DoubleEndedIterator ExactSizeIterator Extend`,
+  the allocator forms `DefaultIn FromIteratorIn ToStringIn ToOwnedIn`,
+  and as functions (Rust's macros) `print println eprint eprintln
+  format_args format_in write writeln panic assert assert_eq assert_ne
+  debug_assert todo unimplemented unreachable` (`panic("msg")` prints
+  `msg` and exits with 101). The rest of std is `use std::...` (or a
+  path, `std::collections::HashMap`); a program that names none of it
+  is built without std.
 - A C header: `import "stdio.h" as c;` then `c::printf`; in a pattern,
   import a C constant by name: `use c::EOF;`.
 

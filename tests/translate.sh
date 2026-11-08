@@ -327,7 +327,8 @@ def programs():
         for b in sorted(os.listdir(gdir)):
             p = os.path.join(gdir, b)
             src = "".join(open(os.path.join(p, f)).read() for f in os.listdir(p) if f.endswith(".vl"))
-            if src.startswith("// EDITION: rust") or os.path.isfile(os.path.join(p, "err")):
+            if (src.startswith("// EDITION: rust") or os.path.isfile(os.path.join(p, "edition"))
+                    or os.path.isfile(os.path.join(p, "err"))):
                 continue
             if re.search(r"std::(gpu|objc|window)", src):
                 continue  # (built to an object only, or linked with Metal: tests/guide/run.sh's)
