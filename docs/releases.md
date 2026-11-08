@@ -171,6 +171,17 @@ The front (front273):
   opaque instance made a drop shim for `Vec<i64, Ω>`. Shims are lowered,
   and that one called a `Vec::drop` that had no instance, so the link
   failed with an undefined symbol. -O2 was not affected.
+- Tuple branches type their literals from each other when no type is
+  expected (F18.5). In `match k { 0 => (gap, 0), _ => (0, gap) }` with
+  `gap: usize`, both elements are `usize`, as rustc infers. 0.27.5 typed
+  the first arm `(usize, i32)` and refused the second. The same applies
+  to an `if` and its `else`.
+- `let s: &[i64] = &[1, 2, 3][1..];` is accepted: the hoisted temporary
+  is the array, typed by the annotation (F18.4). 0.27.5 typed it by the
+  `i32` fallback and refused it.
+- `let ref x = e;` and `let ref mut x = e;` borrow `e` as `&e` and
+  `&mut e` do, as rustc does (F27.2). 0.27.5 moved `e`: after `let ref z
+  = a;`, `a` was moved, and `let ref mut w = v[0]` changed a copy.
 
 std2 and the translator (fl10274):
 
