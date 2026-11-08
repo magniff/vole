@@ -111,6 +111,36 @@ The front (f185x):
   *Cases:* `rust_f_f185_open_leaves`, `rust_f_f185_open_compare`,
   `rust_f_f185_open_loops`, `rust_f_f185_open_format`.
 
+Derives (derive278, a flip blocker):
+
+- **A unit-only enum's derives compare its tag.** 0.27.7's rust-edition
+  `#[derive(PartialEq)]` on an enum matched the pair, `match (self,
+  other) { (A, A) => true, .. _ => false }`: a compare and branch per
+  variant, inlined at every `==`. The translator derives `Clone, Copy,
+  PartialEq, Eq` on the compiler's enums, so the flipped compiler
+  spent most of its time in `Tok`'s and `NodeKind`'s `==`: `volec
+  check` of the MVS tree took 43.2 G instructions, against 8.6 G built
+  from MVS. Now a unit-only enum that derives Copy compares, orders and
+  hashes `*self as isize`, rustc's discriminant_value, as one load and
+  one compare. Its `ne`, `lt`, `le`, `gt` and `ge` are derived too, all
+  inline. A Copy type without type parameters clones by `*self`. Any
+  other enum compares the variants' indexes first, then matches only the
+  variants with fields (`_ => true`), as rustc's derive does. MVS's
+  derives do the same for an enum with fields: on a mixed-enum `==` loop,
+  234M instructions to 74M. The flipped compiler on the MVS tree now
+  takes 9.74 G to check and 108.5 G to build itself (343 G before),
+  against 8.55 G and 96.4 G built from MVS. The rest of that gap is not
+  the derives: the rust edition's lowering makes `a && b` in a condition
+  a bool phi, where MVS branches.
+  *Case:* `rust_f_derive_discriminant_ir` checks the IR's single compare.
+- **The derives agree with rustc on written discriminants.** cmp, `<`
+  and Hash of a unit-only enum use its written discriminants (`enum K {
+  A, B = 5, C, D = -3 }` orders D first), with or without Copy, and an
+  enum of one variant hashes no index. 0.27.7 used the declaration
+  index, so its order and its hash values differed from rustc's.
+  *Case:* `rust_f_derive_discriminant`, a rustc twin, including
+  DefaultHasher values.
+
 Threads (races278, the statics review's races, all in released
 compilers):
 

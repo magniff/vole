@@ -272,6 +272,17 @@ pub fn write_rust_impl(item: i64, d: i64, code: i64, pcx: inout Ctx<Comp>) {
         w_self(item, pcx);
         w(c") -> bool {\n", pcx);
         if is_struct { struct_eq(item, d, &pcx); } else { enum_eq(item, d, &pcx); }
+        // (0.27.8) `ne` written, inline: the trait's default `!self.eq(o)`
+        // was a call out of line at every `!=` of a derived type
+        w(c"    }\n    #[inline]\n    fn ne(&self, other: &", pcx);
+        w_self(item, pcx);
+        w(c") -> bool {\n", pcx);
+        if !is_struct && by_cast(item, pcx) {
+            w(c"        *self as isize != *other as isize\n", pcx);
+        } else {
+            w(c"        !", pcx);
+            wp(item, c"::cmp::PartialEq::eq(self, other)\n", &pcx);
+        }
     } else if code == R_PARTIAL_ORD || code == R_ORD {
         let ord = code == R_ORD;
         w_head(item, if ord { c"::cmp::Ord" } else { c"::cmp::PartialOrd" }, &pcx);
@@ -287,6 +298,21 @@ pub fn write_rust_impl(item: i64, d: i64, code: i64, pcx: inout Ctx<Comp>) {
         }
         w(c" {\n", pcx);
         if is_struct { struct_cmp(item, d, ord, &pcx); } else { enum_cmp(item, d, ord, &pcx); }
+        if !ord && !is_struct && by_cast(item, pcx) {
+            // (0.27.8) `<` and the rest on the discriminants, inline, not
+            // the trait's defaults through partial_cmp
+            for op in 0..4 {
+                w(c"    }\n    #[inline]\n    fn ", pcx);
+                w(if op == 0 { c"lt" } else if op == 1 { c"le" } else if op == 2 { c"gt" }
+                    else { c"ge" }, pcx);
+                w(c"(&self, other: &", pcx);
+                w_self(item, pcx);
+                w(c") -> bool {\n        (*self as isize) ", pcx);
+                w(if op == 0 { c"<" } else if op == 1 { c"<=" } else if op == 2 { c">" }
+                    else { c">=" }, pcx);
+                w(c" (*other as isize)\n", pcx);
+            }
+        }
     } else if code == R_HASH {
         w_head(item, c"::hash::Hash", &pcx);
         w(c"    fn hash<__H: ", pcx);
@@ -336,15 +362,66 @@ fn struct_eq(item: i64, d: i64, pcx: inout Ctx<Comp>) {
     w(c"\n", pcx);
 }
 
+// (0.27.8) Whether `item`'s own derive list names Copy.
+fn derives_copy(item: i64, pcx: Ctx<Comp>) -> bool {
+    let holder = pcx.nodes[item].h;
+    holder != 0 && (0..pcx.nodes[holder].count).any(|k|
+        sym_text(pcx.nodes[child(holder, k, pcx)].a, pcx) == "Copy")
+}
+
+// (0.27.8) Whether no variant of enum `item` has fields (`E::V()` and
+// `E::V {}` count as fields here: Rust casts only a unit-only enum).
+fn unit_only(item: i64, pcx: Ctx<Comp>) -> bool {
+    for i in 0..pcx.nodes[item].count {
+        let v = child(item, i, pcx);
+        if pcx.nodes[v].count != 0 || pcx.nodes[v].c != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+// (0.27.8) Whether some variant of enum `item` has fields.
+fn some_fields(item: i64, pcx: Ctx<Comp>) -> bool {
+    (0..pcx.nodes[item].count).any(|i| pcx.nodes[child(item, i, pcx)].count != 0)
+}
+
+// (0.27.8) A unit-only enum that derives Copy: its derives read the
+// discriminant, `*self as isize`, as rustc's do, with no match (a match
+// of a pair is a compare and branch per variant: 0.27.8's flipped
+// compiler spent most of its time in `Tok`'s `==`).
+fn by_cast(item: i64, pcx: Ctx<Comp>) -> bool {
+    pcx.nodes[item].count > 0 && unit_only(item, pcx) && derives_copy(item, pcx)
+}
+
 // The pairs of the same variant, fieldwise; any other pair is unequal.
+// (0.27.8) A unit-only Copy enum compares its discriminants; another
+// compares the variants' indexes first, then matches the variants with
+// fields only.
 fn enum_eq(item: i64, d: i64, pcx: inout Ctx<Comp>) {
     if pcx.nodes[item].count == 0 {
         w(c"        match *self {}\n", pcx);
         return;
     }
+    if by_cast(item, pcx) {
+        w(c"        *self as isize == *other as isize\n", pcx);
+        return;
+    }
+    if pcx.nodes[item].count > 1 {
+        w_index(item, c"__i", c"self", &pcx);
+        w_index(item, c"__j", c"other", &pcx);
+        if !some_fields(item, pcx) {
+            w(c"        __i == __j\n", pcx);
+            return;
+        }
+        w(c"        if __i != __j {\n            return false;\n        }\n", pcx);
+    }
     w(c"        match (self, other) {\n", pcx);
     for i in 0..pcx.nodes[item].count {
         let v = child(item, i, pcx);
+        if pcx.nodes[item].count > 1 && pcx.nodes[v].count == 0 {
+            continue;
+        }
         w(c"            (", pcx);
         w_variant_pattern(item, v, c"__a", pcx);
         w(c", ", pcx);
@@ -368,7 +445,8 @@ fn enum_eq(item: i64, d: i64, pcx: inout Ctx<Comp>) {
         w(c",\n", pcx);
     }
     if pcx.nodes[item].count > 1 {
-        w(c"            _ => false,\n", pcx);
+        // (the same variant, without fields)
+        w(c"            _ => true,\n", pcx);
     }
     w(c"        }\n", pcx);
 }
@@ -436,18 +514,28 @@ fn struct_cmp(item: i64, d: i64, ord: bool, pcx: inout Ctx<Comp>) {
 }
 
 // `let __i: isize = match self { E::A(..) => 0, .. };`: the index of the
-// variant `value` (text) holds.
+// variant `value` (text) holds. (0.27.8) Of a unit-only enum with a
+// written discriminant, the discriminant (`E::A as isize`): rustc orders
+// and hashes by it.
 fn w_index(item: i64, binder: *u8, value: *u8, pcx: inout Ctx<Comp>) {
+    let written = unit_only(item, pcx)
+        && (0..pcx.nodes[item].count).any(|i| pcx.nodes[child(item, i, pcx)].b != 0);
     w(c"        let ", pcx);
     w(binder, pcx);
     w(c": isize = match ", pcx);
     w(value, pcx);
     w(c" {", pcx);
     for i in 0..pcx.nodes[item].count {
+        let v = child(item, i, pcx);
         w(c" ", pcx);
-        w_variant_pattern(item, child(item, i, pcx), 0 as *u8, pcx);
+        w_variant_pattern(item, v, 0 as *u8, pcx);
         w(c" => ", pcx);
-        w_int(i, pcx);
+        if written {
+            w_variant_pattern(item, v, 0 as *u8, pcx);
+            w(c" as isize", pcx);
+        } else {
+            w_int(i, pcx);
+        }
         w(c",", pcx);
     }
     w(c" };\n", pcx);
@@ -459,8 +547,21 @@ fn enum_cmp(item: i64, d: i64, ord: bool, pcx: inout Ctx<Comp>) {
         w(c"        match *self {}\n", pcx);
         return;
     }
+    if by_cast(item, pcx) {
+        w(c"        ", pcx);
+        wp(item, if ord { c"::cmp::Ord::cmp(&(*self as isize), &(*other as isize))\n" }
+            else { c"::cmp::PartialOrd::partial_cmp(&(*self as isize), &(*other as isize))\n" },
+            &pcx);
+        return;
+    }
     w_index(item, c"__i", c"self", &pcx);
     w_index(item, c"__j", c"other", &pcx);
+    if !some_fields(item, pcx) {
+        w(c"        ", pcx);
+        wp(item, if ord { c"::cmp::Ord::cmp(&__i, &__j)\n" }
+            else { c"::cmp::PartialOrd::partial_cmp(&__i, &__j)\n" }, &pcx);
+        return;
+    }
     w(c"        if __i != __j {\n            return ", pcx);
     wp(item, if ord { c"::cmp::Ord::cmp(&__i, &__j);\n" }
         else { c"::cmp::PartialOrd::partial_cmp(&__i, &__j);\n" }, &pcx);
@@ -500,18 +601,37 @@ fn struct_hash(item: i64, d: i64, pcx: inout Ctx<Comp>) {
     }
 }
 
-// The variant's index as an isize, then its fields.
+// The variant's index as an isize, then its fields. (0.27.8) As rustc's:
+// a unit-only Copy enum hashes its discriminant, `*self as isize`; an
+// enum of one variant hashes no index, only the fields.
 fn enum_hash(item: i64, d: i64, pcx: inout Ctx<Comp>) {
-    if pcx.nodes[item].count == 0 {
+    let count = pcx.nodes[item].count;
+    if count == 0 {
         w(c"        match *self {}\n", pcx);
         return;
     }
-    w_index(item, c"__i", c"self", &pcx);
-    w(c"        ", pcx);
-    wp(item, c"::hash::Hash::hash(&__i, state);\n", &pcx);
+    if count > 1 && by_cast(item, pcx) {
+        w(c"        ", pcx);
+        wp(item, c"::hash::Hash::hash(&(*self as isize), state);\n", &pcx);
+        return;
+    }
+    if count > 1 {
+        w_index(item, c"__i", c"self", &pcx);
+        w(c"        ", pcx);
+        wp(item, c"::hash::Hash::hash(&__i, state);\n", &pcx);
+    }
+    if !some_fields(item, pcx) {
+        if count == 1 {
+            w(c"        let _ = state;\n", pcx);
+        }
+        return;
+    }
     w(c"        match self {\n", pcx);
-    for i in 0..pcx.nodes[item].count {
+    for i in 0..count {
         let v = child(item, i, pcx);
+        if pcx.nodes[v].count == 0 {
+            continue;
+        }
         w(c"            ", pcx);
         w_variant_pattern(item, v, c"__a", pcx);
         w(c" => {\n", pcx);
@@ -524,6 +644,9 @@ fn enum_hash(item: i64, d: i64, pcx: inout Ctx<Comp>) {
             span_from(d, &pcx);
         }
         w(c"            }\n", pcx);
+    }
+    if (0..count).any(|i| pcx.nodes[child(item, i, pcx)].count == 0) {
+        w(c"            _ => {}\n", pcx);
     }
     w(c"        }\n", pcx);
 }
@@ -598,8 +721,20 @@ fn enum_debug(item: i64, d: i64, pcx: inout Ctx<Comp>) {
     w(c"        }\n", pcx);
 }
 
+// (0.27.8) Whether a derived Clone of `item` is `*self`, as rustc's: the
+// list derives Copy too and `item` has no type parameters (a parameter's
+// Clone is not its Copy).
+fn plain_copy(item: i64, pcx: Ctx<Comp>) -> bool {
+    let g = pcx.nodes[item].g;
+    derives_copy(item, pcx) && (g == 0 || pcx.nodes[g].count == 0)
+}
+
 // `S { a: Clone::clone(&self.a), .. }` (a raw pointer field copied).
 fn struct_clone(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    if plain_copy(item, pcx) {
+        w(c"        *self\n", pcx);
+        return;
+    }
     w(c"        ", pcx);
     w_sym(pcx.nodes[item].a, pcx);
     w(c" {", pcx);
@@ -659,6 +794,10 @@ fn w_variant_value(item: i64, v: i64, field: i64, pcx: inout Ctx<Comp>) {
 fn enum_clone(item: i64, d: i64, pcx: inout Ctx<Comp>) {
     if pcx.nodes[item].count == 0 {
         w(c"        match *self {}\n", pcx);
+        return;
+    }
+    if plain_copy(item, pcx) {
+        w(c"        *self\n", pcx);
         return;
     }
     w(c"        match self {\n", pcx);
