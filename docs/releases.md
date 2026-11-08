@@ -84,10 +84,13 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.3 | `v0.27.3` | 0.27.2.1 | aarch64-macos | the translator `fix --edition rust` and gate 2 (`tests/translate.sh`, the rustc twin); the i32 literal default (FL6); std2 1,402 of 1,472 tests at -O0; lazy std2 parsing (a rust hello world 2.32x MVS's); arrays' by-value IntoIterator |
 | 0.27.4 | `v0.27.4` | 0.27.3 | aarch64-macos | gate 3 opens (`fix --edition rust` on compiler/src: 122 type errors, 3,048 borrowck behind them); inference from a later statement (FL1); `[T]`/`str` unsized places (Z9.1c); `&raw` and Rust 2024's `static mut` rule; `format_args` a value; std2 1,445 of 1,473 tests at -O0; a rust hello world 2.03x MVS's |
 | 0.27.5 | `v0.27.5` | 0.27.4 | aarch64-macos | std2's `std::time`, `fs`, `process`, `cli` (gate 3 from 122 to 37 type errors); operands read where evaluated (D2.4a); text is not its bytes (F0.6); a generic iterator's item is its bound's (D4.6 f); std2 lexed by its units (a rust hello world 1.82x MVS's, the 2.0x ceiling enforced) |
+| 0.27.6 | `v0.27.6` | 0.27.5 | aarch64-macos | gate 3 has no type errors (76 borrowck left); std::gpu::wgsl in std2; a method in a generic body is the one it names (Z9.1c); const fn and constants made at each use; octal, `let ref`; a 0.27.5 wrong-output fix (constants' names) and an -O0 link fix |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.27.6
+
+Gate 3 has no type errors. `fix --edition rust` on a copy of compiler/src now type-checks: std2 has `std::gpu::wgsl`, the WGSL front compiler/src uses (translated by `fix --edition rust`, finished by hand, the same answers as MVS's front on every .wgsl in the tree), behind a gate that keeps it out of a program that does not name `gpu`; the translator's last type-error shapes are done (eight found by the wgsl port). What is left is borrowck: 76 errors (154 behind 37 type errors in 0.27.5), after nested calls on one `&mut` root are hoisted (rustc's E0499, which 0.27.5 missed). In the rust edition: a method call in a generic body takes the method the body names, as rustc does (Z9.1c); `const fn`, and constants of any type made at each use; a constant's initializer is checked in its own scope (0.27.5 could call a local of the use's scope instead: wrong output); octal literals, `let ref`, tuple branches typed together; `&e` stays shared where `&mut` goes (rustc's E0308); a `&mut` given to a raw pointer ends its borrow. A generic function with a local `Vec<T, A>` links at -O0 and -O1 again (0.27.4 and 0.27.5 failed). A rust hello world's check is 1.86x MVS's. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
 
 The translator (g3274):
 
@@ -150,6 +153,24 @@ The translator (g3274):
   `str::from_utf8(&s[a..b]).unwrap().parse::<f64>()` (a receiver a `&`
   starts is parenthesized); `let f = fs[i];` of an element that is not
   Copy is `&fs[i]`.
+- An argument that calls with the root a call takes `&mut` is computed
+  first, `{ let at_arg1 = ir_val(cx, v); is_const(cx, at_arg1) }`:
+  Rust's reborrow for the first argument lives through the others, so
+  the inner call's `cx` is a second mutable borrow (rustc E0499, which
+  the borrow checker reports since D3.6 for a raw-pointer parameter too).
+  Only when every argument before it is plain, so MVS's order is kept;
+  innermost calls first (tests/refactor/edition0276d,
+  tests/run/rust_t_hoist_arg). Gate 3: 103 to 76 (32 borrowck.mut_twice
+  to 5).
+
+The sources (g3274, docs/design/src-buffer.md):
+
+- add_source no longer writes over the NUL that ends SRC: the next file
+  starts after it and a newline, so no byte of a SRC already given out
+  changes (a view of it that ended at the NUL saw the next file's first
+  byte). The lexer reads that NUL, which is no file's text, as blank (a
+  module of several files is lexed as one range), and the tools' cache
+  restores the layout.
 
 The front (front273):
 
