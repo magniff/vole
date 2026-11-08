@@ -135,6 +135,22 @@ The translator (g3274):
   (std::arch's `vst1q_u32(s: &mut [u32], ..)`) is `&mut` too, as for
   `inout`: link_macho's `vst1q_u32(&mut h[..], 0, abcd)` (rustc E0308,
   which the rust edition's `&e` reports since front273). Gate 3: 5 to 3.
+- The std::gpu::wgsl port's classes (tests/refactor/edition0276b,
+  tests/run/rust_t_wgsl_classes, which the rustc twin builds):
+  `use std::Option::Some;` (a prelude variant) goes; a type row keeps the
+  MVS name only for a name std2 has (`Buf<A>` is `Vec<u8, A>`, not
+  `Buf<u8, A>`); a Buf's `push_fmt` with holes takes its row through a
+  field or a parameter (the checker's copy of the written call keeps the
+  method's name); `f.emsg.len` of a Buf is `len()` once; rewrite.tsv's
+  `$b1`, an argument where bytes go, makes a text literal `b".."` (and a
+  `&str` value `.as_bytes()`): `extend_from_slice(b"ref to ")`; a bytes
+  hole of a function's format call (no named arguments there) is bound
+  by a `let`, `{ let what = str::from_utf8(what).unwrap(); write(..) }`;
+  `std::num::parse_f64(s[a..b])` of bytes is
+  `str::from_utf8(&s[a..b]).unwrap().parse::<f64>()` (a receiver a `&`
+  starts is parenthesized); `let f = fs[i];` of an element that is not
+  Copy is `&fs[i]`. `Buf::new_in` is `Vec::new_in` (the rust edition
+  infers no `_` in `Vec::<u8, _>::new_in(gpa)`, which rustc does).
 
 The front (front273):
 

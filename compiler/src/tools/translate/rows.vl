@@ -91,6 +91,26 @@ pub fn drop_inside(a: i64, b: i64, pcx: inout Ctx<Comp>) {
     pcx.e_text.count = w;
 }
 
+// (0.27.6) The insertion of text at position p taken back.
+fn drop_insert_at(p: i64, text: [u8], pcx: inout Ctx<Comp>) {
+    var w: i64 = 0;
+    for i in 0..pcx.e_start.count {
+        let s = pcx.e_start.get(i);
+        let e = pcx.e_end.get(i);
+        let gone = s == p && e == p && pcx.e_text.get(i) >= 0
+            && buf_slice(pcx.e_text.get(i)) == text;
+        if !gone {
+            pcx.e_start.set(w, s);
+            pcx.e_end.set(w, e);
+            pcx.e_text.set(w, pcx.e_text.get(i));
+            w += 1;
+        }
+    }
+    pcx.e_start.count = w;
+    pcx.e_end.count = w;
+    pcx.e_text.count = w;
+}
+
 // ---- The call ----
 
 // The name of the MVS item type t is (its template's: `Vec`, `Option`),
@@ -521,11 +541,29 @@ fn mut_param(n: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
     false
 }
 
+// (0.27.6) For each of args, 1 when it is text where it is declared
+// (body::declared_str, or any view of a program of text only: a `&str` in
+// the rust edition), else 0: a `$b1`'s
+// `.as_bytes()`.
+fn text_args(args: IntVec, d: crate::tools::translate::body::TextDecls, tr: Tr,
+    pcx: inout Ctx<Comp>) -> IntVec {
+    var out = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for i in 0..args.count {
+        let a = args.get(i);
+        // (a program of text only, text_mode: every `[u8]` view is a `&str`)
+        let view = a > 0 && pcx.nodes[a].ty > 0 && pcx.types[pcx.nodes[a].ty].kind == TyKind::Slice;
+        out.push(if a > 0 && (tr.text_mode && view
+            || crate::tools::translate::body::declared_str(a, 0, d, tr, &pcx)) { 1 } else { 0 });
+    }
+    out
+}
+
 // The text of a row's rust column t with the call's operands: recv the
 // receiver's (-1: none), args the arguments' nodes (the receiver not among
 // them), alloc the allocator's index in args (-1: none: `$a` is the
 // allocator in scope). Empty when an operand it names is missing.
-fn expand(t: [u8], c: i64, recv: i64, args: IntVec, alloc: i64, out: i64, tr: Tr, pcx: Ctx<Comp>) -> bool {
+fn expand(t: [u8], c: i64, recv: i64, args: IntVec, texts: IntVec, alloc: i64, out: i64, tr: Tr,
+    pcx: Ctx<Comp>) -> bool {
     var trailing = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     var in_str = false;
     var i: usize = 0;
@@ -570,6 +608,32 @@ fn expand(t: [u8], c: i64, recv: i64, args: IntVec, alloc: i64, out: i64, tr: Tr
             } else if nx >= '1' && nx <= '9' {
                 let k = (nx - '1') as i64;
                 node = if k < args.count { args.get(k) } else { -1 };
+            } else if nx == 'b' && i + 2 < t.len && t[i + 2] >= '1' && t[i + 2] <= '9' {
+                // (0.27.6) `$b1`: the argument where bytes go, a text
+                // literal `b".."` (`"..".as_bytes()` when not ASCII):
+                // `extend_from_slice(b"ref to ")`
+                let k = (t[i + 2] - '1') as i64;
+                let lit = if k < args.count { args.get(k) } else { -1 };
+                if lit <= 0 {
+                    return false;
+                }
+                let text = pcx.nodes[lit].kind == NodeKind::Str && SRC[pcx.nodes[lit].start] == '"';
+                var ascii = true;
+                for q in pcx.nodes[lit].start..pcx.nodes[lit].end {
+                    if SRC[q] >= 128 || SRC[q] == '\\' && q + 1 < pcx.nodes[lit].end
+                        && SRC[q + 1] == 'u' {
+                        ascii = false;
+                    }
+                }
+                if text && ascii {
+                    buf_byte(out, 'b');
+                }
+                operand(lit, pcx.nodes[c].start, out, pcx);
+                if text && !ascii || !text && texts.get(k) != 0 {
+                    buf_bytes(out, ".as_bytes()");
+                }
+                i += 3;
+                continue;
             } else {
                 used = 0;
             }
@@ -622,6 +686,20 @@ fn expand(t: [u8], c: i64, recv: i64, args: IntVec, alloc: i64, out: i64, tr: Tr
                     buf_byte(out, '(');
                     operand(node, pcx.nodes[c].start, out, pcx);
                     buf_byte(out, ')');
+                } else if i + 2 < t.len && t[i + 2] == '.' {
+                    // (0.27.6: a receiver, whose text may start with what
+                    // the edits put there: `(&s[a..b]).parse::<f64>()`)
+                    let w = buf_new();
+                    operand(node, pcx.nodes[c].start, w, pcx);
+                    let s = buf_slice(w);
+                    let wrap = s.len > 0 && (s[0] == '&' || s[0] == '*');
+                    if wrap {
+                        buf_byte(out, '(');
+                    }
+                    buf_bytes(out, s);
+                    if wrap {
+                        buf_byte(out, ')');
+                    }
                 } else {
                     operand(node, pcx.nodes[c].start, out, pcx);
                 }
@@ -793,7 +871,7 @@ fn edit_call(c: i64, decls: crate::tools::translate::body::TextDecls, tr: inout 
             format_text(args.get(0), c, -1, out, pcx);
         }
         buf_bytes(out, ")?");
-    } else if !expand(rust, c, recv, args, alloc, out, tr, pcx) {
+    } else if !expand(rust, c, recv, args, text_args(args, decls, tr, &pcx), alloc, out, tr, pcx) {
         row_left(c, r, &tr, &pcx);
         return;
     }
@@ -829,6 +907,13 @@ fn put_call(a: i64, b: i64, text: [u8], tr: inout Tr, pcx: inout Ctx<Comp>) {
     }
     tr.done.put(key, 1);
     drop_inside(a, b, &pcx);
+    // (0.27.6: a method written without its parentheses, `f.emsg.len` of
+    // a Buf: the row's text has them, edit_len's `()` after it goes)
+    if b > a && crate::tools::translate::ident_char(SRC[b - 1])
+        && SRC[crate::tools::translate::skip_ws(b)] != '(' && text.len >= 2
+        && text[text.len - 2..text.len] == "()" {
+        drop_insert_at(b, "()", &pcx);
+    }
     let t = buf_new();
     buf_bytes(t, text);
     if edit_replace(a, b, t, &pcx) {
@@ -992,8 +1077,11 @@ pub fn type_row_edits(tr: inout Tr, pcx: inout Ctx<Comp>) {
         var t = row[5..row.len];
         // (a renamed type written by its MVS name is that name, which the
         // path pass imports as an alias, `use std::fmt::Formatter as Fmt;`:
-        // `Fmt<'_>`, not `Formatter<'_>`)
-        if name.len as i64 == ne - s {
+        // `Fmt<'_>`, not `Formatter<'_>`; 0.27.6: only a name std2 has a
+        // path for, not Buf, which is gone: `Vec<u8, A>`, not `Buf<u8, A>`)
+        if name.len as i64 == ne - s
+            && crate::tools::translate::paths::std2_path(crate::base::intern(name, &pcx),
+                SRC[0..0], tr) != 0 {
             var b: usize = 0;
             while b < t.len && (t[b] == '&' || t[b] == ' ') {
                 b += 1;
