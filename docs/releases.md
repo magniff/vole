@@ -194,9 +194,10 @@ The front (front273):
   - 0.27.5 refused these constants.
   - The copied value is resolved as at the constant: a local or type
     parameter at the use with the same name is not seen. Inherent
-    constants work the same way now. Before, a closure `double` at the
-    use of `impl D { const T: u64 = double(22); }` was called, which was
-    wrong code (in 0.27.5 too).
+    constants work the same way now.
+  - 0.27.5 could call a local instead (wrong output). With `impl D {
+    const T: u64 = double(22); }` and a closure `let double = ..` at the
+    use, `D::T` called the closure.
 - A `&mut` given where a raw pointer goes is a raw reborrow that ends
   at the coercion, as in rustc (D3.6). `f(cx, cx.f, &mut cx.cap)` with
   `cx` going to a `*mut C` is no longer a conflict (gate 3's class S).
