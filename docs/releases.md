@@ -496,7 +496,7 @@ std2 and the translator (fl10274):
     "(unknown)" through fn-value dispatch; it is `io panic diverge`, and
     `fix --only effects-std` writes that on a function that panics.
 
-The front (f185x):
+The front (fl10274):
 
 - A generic struct's or variant's field typed by its allocator
   parameter itself (`struct Cx<W: Allocator> { arena: W }`) takes the
@@ -521,7 +521,7 @@ The front (f185x):
 
 Gate 3 at 37. std2 has the modules compiler/src uses: `std::time`, `std::fs`, `std::process` and `std::cli`, Rust-shaped, with the translator's rows bending MVS's calls onto them. `fix --edition rust` on a copy of compiler/src now leaves 37 errors (122 in 0.27.4), and `check --borrowck-partial` counts 154 borrowck errors behind them (3,048 in 0.27.4): a rust body reads each operand where it is evaluated (D2.4a), and borrowed literals are promoted (D2.8). In the rust edition, text is not its bytes (F0.6: a `&str` where a `&[u8]` goes is E0308), and the translator writes `b".."` or `.as_bytes()` where bytes are declared; a generic iterator's item is its bound's region, not a borrow of the iterator (D4.6 f); `AsRef` for `&T` with T = `str` no longer calls itself (a stack overflow at run time) nor gives a false outlives (Z9.1c); a borrowed array or tuple literal takes the expected type (F18.4). std2 is lexed by its units from an index made when it is embedded (Z5.2): a rust hello world's check is 1.82x MVS's (2.03x), and the 2.0x ceiling is enforced. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
 
-The front (f185x):
+The front (fl10274):
 
 - A place used mutably once its use is known takes IndexMut and
   DerefMut, as rustc's autoref does (F20.6): `vs[0].push(x)`,
@@ -688,7 +688,7 @@ The front (integrator):
   'Interp'" (102 of gate 3's errors). std2_fmt_format_args,
   std2_fmt_formatter_write_fmt and std2_fmt_write_write_fmt pass.
 
-The front (front273, I7):
+The front (front274):
 
 - FL11: a template's opaque instance (borrowck.md §22) reports its type
   errors as rustc does (`x + x` of `T: Add<Output = T>` returned as an
@@ -824,7 +824,7 @@ The translator (g3274):
   sweep cases); the corpus round-trips 43 of 50 (41 at 0.27.3's
   end). causes.tsv reclassified for every case the walls moved.
 
-The front (f185x):
+The front (fl10274):
 
 - `[T]` and `str` are types of their own in the rust edition (Z9.1c,
   FL10's second stage): the unsized place, which `&[T]` and `&str`
