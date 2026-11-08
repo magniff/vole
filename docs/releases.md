@@ -225,6 +225,11 @@ The front (fl10274):
   itself ("the trait 'Allocator' is not implemented for '_'"), and the
   translator's `Buf::new_in` row writes that form.
 - `HashMap<&[u8], V>` checks: std2's `[T]` hash calls `T::hash_slice`.
+- std2's `write(self.emsg, "{}", self.name())`, a writer place that is
+  no reference, is two-phase, as rustc's `write!(self.emsg, ..)`'s
+  autoref'd receiver (borrowck.md D7.4): the arguments may read what
+  holds the writer. `write(&mut self.emsg, ..)` and an explicit `&mut v`
+  argument are not, as in rustc (E0502).
 
 ### What's new in 0.27.5
 
