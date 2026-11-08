@@ -754,6 +754,21 @@ D3.6).
   `'a` result it is `borrowck.outlives` ('b: 'a not known), as rustc's
   E0495/lifetime error. A real instance normalizes the projection by its
   impl (D4.4) and is checked as before.
+- (g) *A projection whose impl's value is a projection (0.27.6).* An
+  impl's associated type may be a projection of one of the impl's own
+  parameters: `impl<I: Iterator> Iterator for Skip<I> { type Item =
+  I::Item; }`. Such a projection is normalized again, by the direct
+  impl for the type the impl's header binds that parameter to in the
+  base. For `Skip<Split<'a, char>>`, the header binds `I` to
+  `Split<'a, char>`, so the item is `Split`'s `&'a str`. Each slot
+  stays in the base's slots, through the header's binding, at every
+  depth. So `fn pass<J: Iterator>(it: &mut J) -> Option<J::Item>` with
+  `J = Skip<Split<char>>` gives an item of `'a`, not a borrow of `*it`.
+  0.27.5 read the inner projection as elided, and E2 tied it to `&mut
+  J`: two `pass(&mut it)` calls whose items were both live were
+  borrowck.mut_twice, which rustc accepts. *Anchor:*
+  `places/regions.vl: proj_map, proj_again`. *Case:*
+  `rust_b_nested_projection_item`.
 
 ## 5. Variance (S5)
 

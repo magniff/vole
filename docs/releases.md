@@ -209,14 +209,20 @@ The front (front273):
   - 0.27.5 refused these constants.
   - The copied value is resolved as at the constant: a local or type
     parameter at the use with the same name is not seen. Inherent
-    constants work the same way now. Before, a closure `double` at the
-    use of `impl D { const T: u64 = double(22); }` was called, which was
-    wrong code (in 0.27.5 too).
+    constants work the same way now.
+  - 0.27.5 could call a local instead (wrong output). With `impl D {
+    const T: u64 = double(22); }` and a closure `let double = ..` at the
+    use, `D::T` called the closure.
 - A `&mut` given where a raw pointer goes is a raw reborrow that ends
   at the coercion, as in rustc (D3.6). `f(cx, cx.f, &mut cx.cap)` with
   `cx` going to a `*mut C` is no longer a conflict (gate 3's class S).
   A shared borrow that is live across the coercion still conflicts
-  (E0502).
+  (E0502). The coercion is a mutable use of what `cx` points to, both
+  ways round: 0.27.5 accepted `outer(cx, inner(cx))` with `outer`
+  taking `&mut C` and `inner` a `*mut C`, which rustc rejects (E0499,
+  now `borrowck.mut_twice`: gate 3's 27 nested `is_const(cx, ir_val(cx,
+  ..))` calls, which the translator has to hoist), and rejected it with
+  the two parameter types swapped, which rustc accepts.
 - `Tr::f(x, ..)` of a trait function without a receiver takes Self from
   the argument whose parameter holds it (F8.2):
   `Hash::hash_slice(self, state)` in `impl<T: Hash> Hash for [T]` is
