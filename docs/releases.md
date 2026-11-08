@@ -93,6 +93,7 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 The front (front277), from the 0.28 flip rehearsal:
 
 - **A let-bound shift of a literal was typed i32 (a wrong value), in 0.27.5 and 0.27.6.** In the rust edition, `let bit = 1 << (l % 64);` then `v[w] | bit` with `v: Vec<i64>` took the literal as `i32` at the `let`, so the shift was `1 << (l % 32)`. The same went for `let min = (0 - 1) << (bits - 1);` passed as an `i64` (it was `i32`'s minimum). No error was reported. A shift's left operand now decides its type and stays open until a later use fixes it, as rustc infers it (F18.5); so does `!` of a literal (`let a = !0;` then a `u64`). Cases `rust_f_f185_shift_open`, `rust_f_f185_shift_open_err`.
+- **A cast of such a local also typed it i32 (a wrong value).** `let max = (1 << bits) - 1;` then `if value >= max as f64 { return max; }` in a function returning `i64` closed `max` at the cast, so `clamp(40, ..)` returned 255. A cast's operand now leaves the local open, as rustc's does, and the later `return max` types it. An integer type's own method on such a local, `max.count_ones()`, is error `type.infer` (rustc's E0689), as on the literal itself. Cases `rust_f_f185_cast_open`, `rust_f_f185_local_method_err`.
 - An integer type's own method on a literal, `(1 << s).wrapping_sub(1)` or `2.pow(2)`, is error `type.infer` (rustc's E0689). Before, it was `i32`'s method: `1 << 40` became `1 << 8`, silently. A trait's method there (`5.max(3)`, `3.clone()`) is still `i32`'s, as rustc's. Cases `rust_f_f185_literal_method_err`, `rust_f_f185_literal_method_ok`.
 - `&mut *P` of a `static mut P: *mut T`, a reference through the pointer the static holds, is accepted, as rustc 2024 accepts it. So are `&mut *S.1` and an autoref through `(*Q)`. 0.27.6 refused these as `borrowck.static_mut_ref` (D6.2.5). Case `rust_b_ok_static_mut_ptr_deref`.
 
@@ -125,8 +126,10 @@ The front (front273):
 - std2's `[T]` hash calls `Hash::hash_slice(self, state)`, as Rust's
   does, with Self taken from the argument (F8.2): an element type's own
   hash_slice runs. 0.27.6 called `T::hash_slice`.
-- A `&T` given where a `*mut T` goes, a parameter's or a `let`'s
-  written type, is rustc's E0308 (D3.6a): the types differ in
+- A `&T` given where a `*mut T` goes, the written type of a parameter,
+  a `let`, a struct literal's field, the function's result (its tail or
+  a `return`) or an assigned place (`p = &x`, `s.p = &x`, `*pp = &x`),
+  is rustc's E0308 (D3.6a): the types differ in
   mutability, `try: &mut x`. `&mut T` still coerces to both raw
   pointers, and `&T` to `*const T`. 0.27.6 accepted it, so a callee
   could write through a pointer made from a shared borrow.
@@ -150,6 +153,13 @@ The compiler's own source (gate 3, front273):
   positions, arch's intrinsic table and the tools' cache's read buffer
   are frozen. `volec __selftest freeze` checks the stop
   (tests/selftest.sh).
+- The translator reads a frozen buffer's views as SRC's: base's
+  `buf_done`, arch's `text` and `intr_text` and the tools' cache's
+  `get_str` are rows of static_result's list, each with its evidence,
+  and static_returns carries them to what returns them (lsp/complete's
+  `signature`, `call_snippet`, `mod_detail`; embed's `embed_type_name`
+  and `file_line_text`) and to their callers
+  (tests/refactor/edition0277b). Gate 3: 52 to 17 borrowck errors.
 
 The translator (g3274; flip28's T2 to T5, its rehearsal's hand fixes):
 

@@ -530,15 +530,22 @@ re-inferred.
   not to `*mut T`: that is rustc's E0308 ("the types differ in
   mutability"), with `&mut x` as the fix. vole's types do not tell
   `*const T` from `*mut T` (both are `*T`, front/parser/rust.vl), so
-  the check reads the written type the value goes to, a parameter's or
-  a `let`'s (its TyPtr's `c`: 1 `*const`, 2 `*mut`). 0.27.6 accepted
+  the check reads the written type the value goes to (its TyPtr's `c`:
+  1 `*const`, 2 `*mut`): a parameter's, a `let`'s, a struct literal's
+  field's (`S { p: &x }`, the field as declared), the function's result
+  (its tail and a `return`'s value; a closure's result is not read) and
+  an assignment's place (`p = &x` of a local declared `*mut T`, `s.p =
+  &x` of a field declared so, `*pp = &x` where `pp`'s declared type
+  points to a `*mut T`). Only the value itself is read, not a block or
+  `if` around it. 0.27.6 accepted
   `bump(&x)` with `fn bump(p: *mut i64)`, and the callee's write went
   through a pointer to a place that had only a shared borrow. MVS's
   `*T` takes `&x` as before. A fat raw pointer (`*mut [T]`) takes no
   reference yet, shared or exclusive (rustc: `&mut s[..]` and `&s[..]`
   to `*const [T]`). *Anchor:* `front/check/check_mode.vl: coerce_ref`.
   *Cases:* `rust_b_raw_mut_from_shared_err`,
-  `rust_b_raw_mut_from_mut`.
+  `rust_b_raw_mut_from_mut`, `rust_b_raw_mut_positions_err`,
+  `rust_b_raw_mut_positions`.
 - `SK_ASSIGN (a,b) = RV_REF P` (`e = 'ℓ`, `d ≠ BK_RAW`): loan `ℓ`
   created; `sub(&'ℓ [mut] type(P) ≤ type((a,b)))` (a `BK_FAKE` loan:
   `type((a,b))` is `&type(P)`); **the supporting-prefix rule:** for
