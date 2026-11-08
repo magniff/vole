@@ -208,6 +208,29 @@ The front (front273):
     or in a pattern it is an error.
   - 0.27.5 refused these constants.
 
+std::gpu::wgsl in std2 (fl10274):
+
+- std2 has MVS's WGSL front, the half of std::gpu::wgsl the compiler
+  checks an `embed wgsl` block with: `std::gpu::wgsl::front::{Front,
+  new_front}`, `Front::module` and `uniformity::check` (6.9k lines of
+  compiler/std/gpu/wgsl's ir, names, lex, front, expr, builtins and entry,
+  translated by `fix --edition rust` and finished by hand: generic over an
+  `A: Allocator + Copy`, names `&'a [u8]` of the source). The writers,
+  the interpreter and the device API come later.
+  - It gives every .wgsl file of the tree MVS's verdict, error and help
+    lines included: tests/wgsl/front2.sh, 37 files, 0 differ. Case
+    std2_gpu_wgsl_front_new_front.
+  - Gate 3 has 0 type errors: `fix --edition rust` on compiler/src now
+    leaves only borrowck errors (96, `check --borrowck-partial`). The
+    row `uniformity::check(&$1)` takes the front by reference.
+  - A rust hello world does not read it: front-rust.md Z5.2's gated
+    modules (`gpu`) wait for their name, as the reach matches names
+    without modules. hello-rust is 1.86x MVS's (1.80x before; 2.42x
+    ungated), the compiler's self-build 0.23% dearer (its embedded std2,
+    1.155 MB to 1.48 MB).
+- tests/translate/wgsl-classes.md: the eight translator mistakes the
+  port found, a minimal program each, for g3274.
+
 std2 and the translator (fl10274):
 
 - Gate 3's type errors go from 14 to 3, with g3274's rows and std2's cli.
