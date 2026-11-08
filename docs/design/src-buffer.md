@@ -187,5 +187,27 @@ without the context.
   in the translation, and `sym_name(&l, l.imports[i])` is two shared
   reads, not rustc's E0503.
 
-Frozen BUFS buffers (`buf_done`) and the translator's `'static`
-propagation follow, in their own batches.
+- **A buffer written for the last time is frozen.** `buf_done(b)`
+  freezes buffer b and returns its slice; `buf_freeze(b)` freezes it
+  without the slice. A frozen buffer is never written again: its cap
+  word is stored as `-1 - cap`, so every one of base's writers
+  (`buf_byte`'s `len >= cap`, and `buf_bytes`, `buf_str` and
+  `buf_uint` through `buf_reserve`) reaches `buf_reserve`'s slow path,
+  and `buf_reserve` and `buf_clear` stop the compiler there with
+  `error: internal: buffer N written after buf_done froze it` and
+  exit status 1. The writers' fast path costs nothing more. The
+  slice is then valid for the rest of the process. Buffers are never
+  freed, BUFS ids are never reused (`BUF_COUNT` only grows, and only
+  `buf_new` assigns a slot), and a buffer's data moves only when it
+  grows, which is a write. The frozen buffers are each producer's own
+  fresh buffer (lsp/complete's `signature`, `call_snippet` and
+  `mod_detail`; embed's `embed_type_name` and `file_line_text`),
+  arch's table (`load_table` fills `table_buf` once) and the tools'
+  cache's read buffer (`restore`). None of them is one of the buffers
+  written directly, outside base (`BUFS[x].len = ..`: the code
+  generator's asm and code buffers, objfile's out, the scratches).
+  `volec __selftest freeze` writes to a frozen buffer and must stop
+  with that error (tests/selftest.sh).
+
+The translator's `'static` propagation, which reads `buf_done` as
+`SRC` is read, follows after SRC's representation is in.
