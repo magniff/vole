@@ -130,7 +130,7 @@ std2 (sc280b):
 The translator and the migration of tests/run (mig28):
 
 - **tests/run's MVS cases move to the rust edition.** Of 2873 cases
-  without `// EDITION: rust`, 1778 are translated by `fix --edition
+  without `// EDITION: rust`, 1777 are translated by `fix --edition
   rust` and kept where they pass at -O0 and -O2. An error case's
   `ERROR` lines name the rust edition's code at the translation's
   position; an ownership case is kept only where rustc rejects it too
