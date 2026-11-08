@@ -910,6 +910,19 @@ desugaring's receiver binding `__r` is the two-phase reborrow `__r =
 &'r mut2 *w`, not a move of `w`, so the arguments read `w` in its
 reservation window (`write(f, "{}", f.width())`) and `w` is usable after
 the call, as rustc's.
+(0.27.6) So is a writer place that is no reference, `write(self.emsg,
+"{}", self.name())`: F16.3 makes it `&mut self.emsg`, an autoref whose
+span is the place's, and that `__r = &'r mut2 self.emsg` is two-phase,
+as rustc's `write!(self.emsg, ..)` (`self.emsg.write_fmt(..)`, an
+autoref'd receiver). This covers std2's writer functions only (`write`,
+`writeln`), which stand in for Rust's macros: a writer the program
+borrows itself, `write(&mut self.emsg, "{}", self.len())` (rustc's
+`write!(&mut self.emsg, ..)`), and an explicit `&mut v` argument to any
+other function, `take(&mut v, v.len())`, stay ordinary `&mut` borrows,
+borrowck.conflict as rustc's E0502. *Anchor:* `places/build.vl:
+writer_autoref, lower_let`. Cases `rust_b_ok_tp_write_autoref` (the
+twin's `write!(self.emsg, ..)` agrees) and
+`rust_b_err_tp_write_explicit_ref`.
 
 ## 8. Moves and initialization (S8)
 
