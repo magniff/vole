@@ -89,6 +89,29 @@ binary is invoked, where its test runner is and which hosts it supports.
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.28.0
+
+The places IR (sc280):
+
+- **A condition's `&&` and `||` are control flow.** In `if`, `while`, a
+  match guard and a `!` of one, the rust edition now branches on each
+  operand in turn: `a && b` sends `a`'s false edge to the else branch
+  and its true edge to `b`, and `!` swaps the targets (places::build
+  cond_into). MVS's lowering and rustc's MIR do the same. 0.27.8 made
+  the bool first, assigned on each path, then branched on it: a phi and
+  a branch the optimizer did not thread, at every such `if` and `while`.
+  In the flipped compiler that was most of what remained of its gap to
+  the MVS build, after derive278: ir_val, a `while r != 0 && ..` loop,
+  was 168 bytes against 104 and was no longer inlined, and form_lcssa
+  and simplify_cfg were four to five times their MVS size. With it, the
+  flipped compiler on the MVS tree took 9.04 G instructions to check
+  (9.74 G before) and 99.4 G to build itself (108.5 G), against 8.55 G
+  and 96.4 G for the MVS build. A `let`'s `a && b`, a value, is built as
+  before.
+  *Cases:* `rust_f_short_circuit_ir` (no phi in an `if` of `&&`, `||`
+  and `!`), `rust_f_short_circuit_order` (a rustc twin: the operands'
+  effects in order, the right one only when the left does not decide).
+
 ### What's new in 0.27.8
 
 The front (f185x):

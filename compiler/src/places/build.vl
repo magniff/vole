@@ -1212,6 +1212,52 @@ fn switch_bool(at: i64, f: i64, t: i64, node: i64, pbody: inout Body<Comp>) {
     terminate(TK_SWITCH, ti, 1, t, at, 1, node, &pbody);
 }
 
+// (0.28.0) Whether condition `c` is a short-circuit, `a && b`, `a || b`
+// or a `!` of one, which cond_into makes control flow.
+fn short_circuit(c: i64, pcx: Ctx<Comp>) -> bool {
+    let k = pcx.nodes[c].kind;
+    let op = pcx.nodes[c].op;
+    if k == NodeKind::Binary {
+        return op == Tok::AmpAmp || op == Tok::PipePipe;
+    }
+    k == NodeKind::Unary && op == Tok::Bang && short_circuit(pcx.nodes[c].b, pcx)
+}
+
+// (0.28.0) Condition `c` as control flow: false to `f`, true to `t`. A
+// short-circuit branches on each operand in turn (`a && b`: `a` false to
+// `f`, else `b`; `!` swaps the targets), as MVS's lowering and rustc's
+// MIR build it; any other condition is an operand switched on. 0.27.8
+// made `a && b` a bool, assigned on each path, then switched on: a phi
+// and a branch the optimizer did not thread, at every `if` and `while`
+// with `&&` of the rust edition. The blocks it makes are entered here;
+// `f` and `t` are the caller's to enter.
+fn cond_into(c: i64, f: i64, t: i64, node: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let k = pcx.nodes[c].kind;
+    let op = pcx.nodes[c].op;
+    if k == NodeKind::Binary && (op == Tok::AmpAmp || op == Tok::PipePipe) {
+        let mid = new_block(&pbody);
+        if op == Tok::AmpAmp {
+            cond_into(pcx.nodes[c].b, f, mid, node, &pbody, &pcx);
+        } else {
+            cond_into(pcx.nodes[c].b, mid, t, node, &pbody, &pcx);
+        }
+        enter_block(mid, &pbody);
+        cond_into(pcx.nodes[c].c, f, t, node, &pbody, &pcx);
+        return;
+    }
+    if k == NodeKind::Unary && op == Tok::Bang && short_circuit(pcx.nodes[c].b, pcx) {
+        cond_into(pcx.nodes[c].b, t, f, node, &pbody, &pcx);
+        return;
+    }
+    operand(c, false, &pbody, &pcx);
+    if !reachable(pbody) {
+        return;
+    }
+    let at = ops_mark(pbody);
+    push_now(&pbody, pcx);
+    switch_bool(at, f, t, node, &pbody);
+}
+
 fn goto(b: i64, pbody: inout Body<Comp>) {
     terminate(TK_GOTO, b, 0, 0, 0, 0, 0, &pbody);
 }
@@ -1878,17 +1924,27 @@ fn lower_if(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Co
         }
         return;
     }
-    operand(pcx.nodes[n].a, false, &pbody, &pcx);
-    if !reachable(pbody) {
-        return;
-    }
-    let then_b = new_block(&pbody);
     let has_else = pcx.nodes[n].c != 0;
-    let else_b = if has_else { new_block(&pbody) } else { -1 };
-    let join = new_block(&pbody);
-    let at = ops_mark(pbody);
-    push_now(&pbody, pcx);
-    switch_bool(at, if has_else { else_b } else { join }, then_b, n, &pbody);
+    var then_b = -1;
+    var else_b = -1;
+    var join = -1;
+    if short_circuit(pcx.nodes[n].a, pcx) {
+        then_b = new_block(&pbody);
+        else_b = if has_else { new_block(&pbody) } else { -1 };
+        join = new_block(&pbody);
+        cond_into(pcx.nodes[n].a, if has_else { else_b } else { join }, then_b, n, &pbody, &pcx);
+    } else {
+        operand(pcx.nodes[n].a, false, &pbody, &pcx);
+        if !reachable(pbody) {
+            return;
+        }
+        then_b = new_block(&pbody);
+        else_b = if has_else { new_block(&pbody) } else { -1 };
+        join = new_block(&pbody);
+        let at = ops_mark(pbody);
+        push_now(&pbody, pcx);
+        switch_bool(at, if has_else { else_b } else { join }, then_b, n, &pbody);
+    }
     enter_block(then_b, &pbody);
     expr_into(pcx.nodes[n].b, dl, dp, &pbody, &pcx);
     if reachable(pbody) {
@@ -1923,13 +1979,21 @@ fn lower_loop(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<
         // (the condition is a unit of its own: its temporaries drop when
         // it is evaluated)
         let c = push_scope(SC_STMT, n, true, &pcx);
-        operand(pcx.nodes[n].b, false, &pbody, &pcx);
-        let at = ops_mark(pbody);
-        push_now(&pbody, pcx);
-        let body = new_block(&pbody);
-        let out = new_block(&pbody);
-        // (the condition's temporaries end on both edges)
-        switch_bool(at, out, body, n, &pbody);
+        var body = -1;
+        var out = -1;
+        if short_circuit(pcx.nodes[n].b, pcx) {
+            body = new_block(&pbody);
+            out = new_block(&pbody);
+            cond_into(pcx.nodes[n].b, out, body, n, &pbody, &pcx);
+        } else {
+            operand(pcx.nodes[n].b, false, &pbody, &pcx);
+            let at = ops_mark(pbody);
+            push_now(&pbody, pcx);
+            body = new_block(&pbody);
+            out = new_block(&pbody);
+            // (the condition's temporaries end on both edges)
+            switch_bool(at, out, body, n, &pbody);
+        }
         enter_block(out, &pbody);
         emit_scope(c, &pbody, &pcx);
         goto(exit, &pbody);
@@ -2070,8 +2134,19 @@ fn lower_match(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx
             phase_begin(-1, &pcx);
             bind_pattern(pat, sl, sp, st, true, &pbody, &pcx);
             let g = push_scope(SC_STMT, guard, false, &pcx);
-            operand(guard, false, &pbody, &pcx);
-            if reachable(pbody) {
+            if short_circuit(guard, pcx) {
+                // (0.28.0) a guard `a && b` branches on each operand
+                let ok = new_block(&pbody);
+                let refused = new_block(&pbody);
+                cond_into(guard, refused, ok, arm, &pbody, &pcx);
+                enter_block(refused, &pbody);
+                exit_to(s, arm, &pbody, &pcx);
+                goto(fail, &pbody);
+                enter_block(ok, &pbody);
+            } else {
+                operand(guard, false, &pbody, &pcx);
+            }
+            if !short_circuit(guard, pcx) && reachable(pbody) {
                 let at = ops_mark(pbody);
                 push_now(&pbody, pcx);
                 let ok = new_block(&pbody);
