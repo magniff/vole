@@ -114,6 +114,16 @@ The places IR (sc280):
   effects in order, the right one only when the left does not decide).
   An MVS body keeps its own lowering, which its optimizer if-converts
   (opt_ord_select's branch-free sift).
+- **Each operand of `&&` and `||` is a terminating scope** (scope280),
+  as in rustc. An operand's temporaries are dropped before the other
+  operand runs, both in a condition and in a value (`let v = a && b`).
+  0.27.8 dropped them at the end of the condition or the statement, so
+  `l.lock().a() > 0 && l.lock().b() > 1` held both guards at once, a
+  deadlock with a real lock. In a condition, an operand's value is kept
+  in a temporary, its scope ends, and only then does the branch read
+  it. *Case:* `rust_f_short_circuit_drops`, a rustc twin with 47 lines
+  of drop order: `if`, `while`, a match guard, `!`, `let` values, and
+  two guards of one lock.
 
 std2 (sc280b):
 
