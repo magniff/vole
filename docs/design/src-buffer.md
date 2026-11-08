@@ -225,5 +225,28 @@ without the context.
   `volec __selftest freeze` writes to a frozen buffer and must stop
   with that error (tests/selftest.sh).
 
-The translator's `'static` propagation, which reads `buf_done` as
-`SRC` is read, follows after SRC's representation is in.
+**The translator reads them as it reads SRC.** sig.vl's
+static_returns already holds for every static value: a function whose
+every return is a text literal, a range of SRC, a call of a function
+with a `'static` result (static_result's list, or static_returns
+itself), a local bound only to one, or a range of one, returns
+`&'static`. So a frozen buffer's views need only rows in
+static_result's list, each with its evidence, and they propagate from
+there to their callers and to ranges of them:
+
+- base's `buf_done`: the buffer is frozen (above), so its slice is
+  valid for the process. lsp/complete's `signature`, `call_snippet`
+  and `mod_detail`, embed's `embed_type_name` and `file_line_text`
+  return it, and are `'static` by static_returns.
+- arch's `text` (arch/table.vl) and `intr_text` (arch/mod.vl): ranges
+  of `BUFS[pcx.table_buf].data`, the table, which `load_table` fills
+  once and freezes before any reader runs.
+- the tools' cache's `get_str` (tools/query/cache.vl): a range of
+  `tcx.rd`, the read buffer `restore` freezes before `read_words`
+  points `rd` at it (its only writer), or an empty literal. A second
+  `restore` reads into a fresh buffer and leaves the first frozen.
+
+A row is a function the translator cannot prove from its body (the
+buffer it reads is named by an id, `pcx.table_buf`, or a raw pointer,
+`tcx.rd`); the list stays explicit, so a new reader of a buffer that
+is not frozen does not become `'static` by its shape.
