@@ -234,7 +234,35 @@ D2.2 lists. A two-phase activation (D7.1) is performed after step (1),
 once every operand's own access is done: a call's arguments are read
 before the call activates its receiver (`s.add(s.x)` reads `s.x` while
 the reservation is still shared; the IR has `copy _1.0` as an operand
-of the call, not a statement before it). Consequences: `x = &mut *x`
+of the call, not a statement before it). (0.27.5) In a rust body an
+operand is read where it is evaluated, as rustc's `as_operand`: a Copy
+place operand of a call argument (or a callee value), of an array,
+tuple, struct or variant literal's element, of an assignment's right
+side (`=` and `op=`), or of a primitive binary operator's left side when
+its right side may evaluate a statement of its own (anything but a
+literal, a constant, a place evaluated with no statement as below, or a
+unary, binary or cast operator of those: `pcx.nodes[n].a ==
+intern(c"Self", pcx)` is accepted, `x + f(&mut x)` adds the old `x`;
+rustc's `as_operand` of a binary operator's operands, 0.27.5 front
+gate 3) is copied into a fresh temporary at that point,
+`_t = copy P`, and the statement reads `copy _t`. So a view or a
+reference it reads through is dead after the copy (D3.7) and its loan
+ends there: `f(pcx.nodes[p].start, pcx)` (the slice view of
+`pcx.nodes` is dead before `pcx`'s reborrow is activated), `pcx.nodes[p].b
+= pcx.nodes[q].a`, `v.push(v[0])`; and what is evaluated after it sees
+the old value, as Rust's left-to-right order says: `f(x, { x += 1; x })`
+passes the old `x` first, `f(s.x, &mut s)` and `g(y, &mut y)` are
+accepted. Exempt (read in place, as before): a whole temporary of the
+builder's (no later operand names it); a whole local whose type has a
+region slot (a reference: the callee holds its loan anyway, and D2.7
+reads the receiver it names); the last operand of its statement when it
+is a whole local or reads no loan (a place of a local whose type has no
+region slot, reached by field and constant-index steps only: no deref,
+no index); and an assignment's right side when the assigned place
+evaluates with no statement of its own (a name, and `*`, `.f`, `.0` of
+one: `*b += *a`). Moves are unchanged (D8.5's in-order rule; a
+rust-edition argument moved out of a place already gets its own `_t =
+move P`). MVS keeps the deferred read. Consequences: `x = &mut *x`
 (`x: &'x mut T`):
 (2) borrows `*x` with the supporting-prefix constraint `'x : 'new`; (3)
 the shallow write to `x` meets other loans of `*x…` as `Extends` through
@@ -371,6 +399,30 @@ loan of one is `borrowck.borrow_immutable` (E0596, "cannot borrow
 `*s` as mutable"). An MVS program's `own.readonly` is the same rule's
 MVS spelling; with the own pass off on std2 (Z8) it is this one, for
 std2's bodies too.
+
+**D2.8 (constant promotion, in the body; 0.27.5).** In a rust body a
+shared borrow of a *promotable* rvalue `e` (`&e`, or `&e` made a shared
+slice, `&[T]`) borrows a temporary whose storage is the body's: it has
+no `StorageLive`, and its `StorageDead` is the body's scope's (at every
+return, D6.2.2), so the end of its statement's or branch's scope does
+not end the loan (rustc's promotion; no E0716):
+`let list: &[&str] = if sub { &["sub", "checked_sub"] } else { &["add"]
+}; list.len()` is accepted. Promotable, rustc's `promote_consts`
+narrowed: a literal (integer, float, char, bool, string, C string,
+`()`), `-` of a numeric literal, an array or tuple literal of
+promotable elements, `[e; N]` of a promotable `e`. Not promotable: a
+name (a local, or a const: `&N` stays L2), a call or a method call
+(`&[String::new()]`, `&Cell::new(1)`), a struct or variant literal, any
+other operator, a block, a cast; a `&mut` borrow (rustc promotes only
+`&mut []`); any MVS body. A promotable value has no drop glue and no
+interior mutability (no `UnsafeCell` can be in it: every one is made
+by a call), so evaluating the temporary again (a loop's) writes the
+same value, and it is never dropped. Divergence (L2, kept): the
+temporary is the function's, not `'static`. A reference to it that
+outlives the function (`fn g() -> &'static [i64] { &[1, 2] }`) is still
+`borrowck.return_local`. A loop that holds the last iteration's
+reference while it evaluates the borrow again is
+`borrowck.assign_borrowed`, where rustc has a single static.
 
 ## 3. Regions (S3)
 
@@ -674,6 +726,23 @@ D3.6).
   caller checked it: D4.5's walk of `τ` alone (`&'m mut Copied<Iter<'x,
   i64>>` gives `'x ⊒ 'm`) and the requirements of its declarations
   ((a)) join `⊒`, each slot the universal of `T`'s slot (D4.4).
+- (f) *A projection with no impl to normalize it (0.27.5).* In the
+  opaque instance (D4.4 (d)) a projection `P::A` or `Self::A` whose base
+  is a synthesized argument has no impl, so D4.4's reading of it fails.
+  Its regions are not elided output regions: E2 and E3 do not apply to
+  them (rustc reads `<I as Iterator>::Item` through the bounds in scope,
+  never as an elided lifetime of `&mut self`). In the callee's signature
+  each slot `j` of such a projection is a universal of its own,
+  `proj(S, A, j)`, `S` the base's substitution. At a call (D3.6) it is,
+  both ways, the caller's region for slot `j` of `X` when the caller's
+  bound on the type parameter that `S` substitutes says `P: Tr<A = X>`
+  (`X` read in the caller's signature, D4.2); a call region of its own
+  otherwise. So `fn first<'a, I: Iterator<Item = &'a str>>(args: I) ->
+  Option<&'a str> { let mut it = args; it.next() }` checks (`it.next()`'s
+  item is `'a`, not a borrow of `it`), and with `Item = &'b str` and a
+  `'a` result it is `borrowck.outlives` ('b: 'a not known), as rustc's
+  E0495/lifetime error. A real instance normalizes the projection by its
+  impl (D4.4) and is checked as before.
 
 ## 5. Variance (S5)
 
@@ -1221,9 +1290,17 @@ outside the holes named below.
   `borrowck.return_local`), `&[]` and `&mut []` (rustc promotes the
   empty array): std2 writes an empty `&mut [T]` from a dangling pointer
   (slice.vl's `empty_mut`). Case `rust_b_err_promote_const`.
+  (0.27.5) Narrowed by D2.8: a promotable rvalue's temporary is the
+  body's, so a borrow of one used after its statement or branch is
+  accepted; one that escapes the function is still refused.
 - L3 Temporaries' scopes are vole's (the statement; the block for `let
   r = &f(x)`), not Rust 2024's tail-expression rule: a difference only
-  in `match`/block tail temporaries. (0.27.3) In the rust edition the
+  in `match`/block tail temporaries. (0.27.5) Nor rustc's extension of a `let`
+  initializer's temporaries through the tails of an `if`'s and a
+  `match`'s branches (Rust 1.79): `let l: &[i64] = if c { &[x, 1] }
+  else { &[2] }; l.len()` is accepted by rustc and refused here
+  (`borrowck.dropped_borrowed`) unless every operand is promotable
+  (D2.8). (0.27.3) In the rust edition the
   condition of an `if` and a match arm's guard are terminating scopes,
   as a `while`'s condition already was (the Rust reference, "Temporary
   scopes"): their temporaries drop once the condition or the guard is

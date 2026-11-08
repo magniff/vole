@@ -702,6 +702,51 @@ fn as_place(e: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     pcx.pl_p = 0;
 }
 
+// RULE: D2.8 (0.27.5) Whether rvalue e is promotable: a literal, `-` of a
+// numeric literal, an array or tuple literal of promotable elements, a
+// repeat of one. No name, call, struct or variant literal, other operator.
+fn promotable(e: i64, pcx: Ctx<Comp>) -> bool {
+    let k = pcx.nodes[e].kind;
+    if k == NodeKind::Int || k == NodeKind::Float || k == NodeKind::Char || k == NodeKind::Bool
+        || k == NodeKind::Str || k == NodeKind::CStr || k == NodeKind::Unit {
+        return true;
+    }
+    if k == NodeKind::Unary && pcx.nodes[e].op == Tok::Minus {
+        let kb = pcx.nodes[pcx.nodes[e].b].kind;
+        return kb == NodeKind::Int || kb == NodeKind::Float;
+    }
+    if k == NodeKind::Array || k == NodeKind::Tuple {
+        for j in 0..pcx.nodes[e].count {
+            if !promotable(child(e, j, pcx), pcx) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if k == NodeKind::Repeat {
+        return promotable(pcx.nodes[e].a, pcx);
+    }
+    false
+}
+
+// RULE: D2.8 (0.27.5) The place of e for a shared borrow: a promotable
+// rvalue of a rust body in a temporary of the body's storage (no
+// StorageLive, its StorageDead at the body's end: its loan outlives its
+// statement and its branch, not the function), else as_place's.
+fn shared_place(e: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    if !pcx.rust_body || !promotable(e, pcx) {
+        as_place(e, &pbody, &pcx);
+        return;
+    }
+    let l = new_local(pcx.nodes[e].ty, LF_TEMP, -1, e, &pbody);
+    // (its storage ends with the body: D6.2.2 refuses a loan of it that
+    // leaves the function)
+    schedule_in(0, EN_DEAD, l, pbody, &pcx);
+    expr_into(e, l, 0, &pbody, &pcx);
+    pcx.pl_l = l;
+    pcx.pl_p = 0;
+}
+
 // ---- The own pass's statement temporaries, read as what they stand for ----
 //
 // (0.26.2) drops.vl's temp_value puts a NODE_TEMP block where a statement
@@ -932,7 +977,11 @@ fn lower_unary(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx
     let op = pcx.nodes[e].op;
     let ty = undistinct(pcx.nodes[e].ty, pcx);
     if op == Tok::Amp {
-        as_place(pcx.nodes[e].b, &pbody, &pcx);
+        if ref_kind(e, ty, pcx) == BK_SHARED {
+            shared_place(pcx.nodes[e].b, &pbody, &pcx);
+        } else {
+            as_place(pcx.nodes[e].b, &pbody, &pcx);
+        }
         emit_ref(dl, dp, pcx.pl_l, pcx.pl_p, ref_kind(e, ty, pcx), e, &pbody, &pcx);
         return;
     }
@@ -1037,6 +1086,11 @@ fn lower_binary(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ct
     // (the left operand held while the right one is made: it may emit
     // statements of its own, with their operands)
     operand(pcx.nodes[e].b, false, &pbody, &pcx);
+    // RULE: D2.4a (0.27.5) a rust body reads the left side here when the
+    // right side may evaluate a statement of its own
+    if !quiet_expr(pcx.nodes[e].c, pcx) {
+        settle_operand(pcx.nodes[e].b, false, &pbody, &pcx);
+    }
     let k1 = pcx.opk;
     let a1 = pcx.opa;
     let b1 = pcx.opb;
@@ -1163,6 +1217,9 @@ fn lower_aggregate(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout
         } else {
             operand(value, true, &pbody, &pcx);
         }
+        if !capture {
+            settle_operand(value, j + 1 == n, &pbody, &pcx);
+        }
         if i >= 0 && i < slots {
             pbody.ops[at + 3 * i] = pcx.opk;
             pbody.ops[at + 3 * i + 1] = pcx.opa;
@@ -1215,7 +1272,13 @@ fn capture_loan(value: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
 fn lower_slicing(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     let base = pcx.nodes[e].a;
     let range = pcx.nodes[e].b;
-    as_place(base, &pbody, &pcx);
+    let st = undistinct(pcx.nodes[e].ty, pcx);
+    if st > 0 && pcx.types[st].kind == TyKind::Slice && pcx.types[st].b != REF_MUT
+        && !crate::front::types::is_raw_view(st, pcx) {
+        shared_place(base, &pbody, &pcx);
+    } else {
+        as_place(base, &pbody, &pcx);
+    }
     set_op(OK_PLACE, pcx.pl_l, pcx.pl_p, &pcx);
     var at = ops_add(ops_mark(pbody), 0, &pbody, pcx);
     if pcx.nodes[range].a != 0 {
@@ -1264,6 +1327,81 @@ fn lower_vecop(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx
 
 // ---- Calls ----
 
+// (settle_operand) Whether place expression e evaluates with no statement
+// of its own: a name, and `*`, `.f`, `.0` of such (an index evaluates its
+// index and checks it; a call's or a block's value is made).
+fn plain_place(e: i64, pcx: Ctx<Comp>) -> bool {
+    let k = pcx.nodes[e].kind;
+    if k == NodeKind::Ident {
+        return true;
+    }
+    if k == NodeKind::Unary && pcx.nodes[e].op == Tok::Star
+        || k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+        let base = if k == NodeKind::Unary { pcx.nodes[e].b } else { pcx.nodes[e].a };
+        return plain_place(base, pcx);
+    }
+    false
+}
+
+// (lower_binary, D2.4a) Whether expression e evaluates with no statement
+// that borrows or writes: a literal, a name, a place of plain_place, and
+// a unary, binary or cast operator of such.
+fn quiet_expr(e: i64, pcx: Ctx<Comp>) -> bool {
+    let k = pcx.nodes[e].kind;
+    if k == NodeKind::Int || k == NodeKind::Char || k == NodeKind::Bool || k == NodeKind::Float
+        || k == NodeKind::Unit || k == NodeKind::Str || k == NodeKind::CStr || k == NodeKind::Path {
+        return true;
+    }
+    if plain_place(e, pcx) {
+        return true;
+    }
+    if k == NodeKind::Unary {
+        let op = pcx.nodes[e].op;
+        return op != Tok::Amp && op != Tok::Star && quiet_expr(pcx.nodes[e].b, pcx);
+    }
+    if k == NodeKind::Binary {
+        return quiet_expr(pcx.nodes[e].b, pcx) && quiet_expr(pcx.nodes[e].c, pcx);
+    }
+    if k == NodeKind::Cast {
+        return quiet_expr(pcx.nodes[e].a, pcx);
+    }
+    false
+}
+
+// RULE: D2.4a (0.27.5) In a rust body the current operand, of expression
+// e, is read where it is evaluated, as rustc's as_operand: a Copy place
+// becomes `_t = copy P` here, and the statement reads `copy _t`. So a view
+// or reference it reads through is dead after it (its loan ends here), and
+// what is evaluated after it sees the old value. Exempt: a whole temporary
+// of the builder's (no later operand names it), a whole local of a type
+// with a region slot (a reference: the callee holds its loan anyway, and
+// D2.7 reads the receiver it names), and, `last`, the final
+// operand of its statement when it is a whole local (its value is what the
+// statement takes, its region the callee's too) or reads no loan (a
+// local's part with no region slot, by field and constant-index steps).
+fn settle_operand(e: i64, last: bool, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    if !pcx.rust_body || pcx.opk != OK_COPY || pcx.opa < 0 || !reachable(pbody) {
+        return;
+    }
+    let l = pcx.opa;
+    let p = pcx.opb;
+    if p == 0 && (has_flag(l, LF_TEMP, pbody)
+        || crate::places::regions::slot_count(pbody.locals[l].ty, pcx) > 0) {
+        return;
+    }
+    if last && (p == 0 || !proj_indirect(p, pbody)
+        && crate::places::regions::slot_count(pbody.locals[l].ty, pcx) == 0) {
+        return;
+    }
+    let ty = place_type(l, p, pbody, &pcx);
+    if ty <= 0 || !crate::places::regions::rust_copy(ty, &pcx) {
+        return;
+    }
+    let t = new_temp(ty, e, false, &pbody, &pcx);
+    emit_use(t, 0, e, &pbody, pcx);
+    set_op(OK_COPY, t, 0, &pcx);
+}
+
 // Call n: the callee value (a function value), each argument left to
 // right (a `&place` a borrow of its parameter's kind: a receiver's
 // exclusive borrow two-phase), then the call; a `!` result ends the block.
@@ -1274,6 +1412,7 @@ fn lower_call(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<
     var count = 0;
     if f < 0 {
         operand(pcx.nodes[n].a, false, &pbody, &pcx);
+        settle_operand(pcx.nodes[n].a, pcx.nodes[n].count == 0, &pbody, &pcx);
         at = ops_add(at, count, &pbody, pcx);
         count += 1;
     }
@@ -1303,6 +1442,8 @@ fn lower_call(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<
             let t = new_temp(pcx.nodes[arg].ty, arg, true, &pbody, &pcx);
             emit_use(t, 0, arg, &pbody, pcx);
             set_op(OK_COPY, t, 0, &pcx);
+        } else if !pre {
+            settle_operand(arg, i + 1 == pcx.nodes[n].count, &pbody, &pcx);
         }
         at = ops_add(at, count, &pbody, pcx);
         count += 1;
@@ -1533,6 +1674,11 @@ fn lower_assign(n: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     let value = pcx.nodes[n].c;
     if op == Tok::Eq {
         operand(value, true, &pbody, &pcx);
+        // (the place is evaluated after the value: a plain one emits nothing,
+        // and the write meets no loan the value reads through)
+        if !plain_place(target, pcx) {
+            settle_operand(value, false, &pbody, &pcx);
+        }
         if !reachable(pbody) {
             return;
         }
@@ -1549,6 +1695,9 @@ fn lower_assign(n: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     }
     // `p op= v`: p = p op v, the value first
     operand(value, false, &pbody, &pcx);
+    if !plain_place(target, pcx) {
+        settle_operand(value, false, &pbody, &pcx);
+    }
     let vk = pcx.opk;
     let va = pcx.opa;
     let vb = pcx.opb;
@@ -2413,10 +2562,15 @@ fn lower_block(b: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx
             expr_into(e, dl, dp, &pbody, &pcx);
             return;
         }
-        own_temp_place(b, &pbody, &pcx);
+        let rk = ref_kind(pcx.nodes[b].a, pcx.nodes[b].ty, pcx);
+        if rk == BK_SHARED && pcx.rust_body && promotable(e, pcx) {
+            // RULE: D2.8 (0.27.5)
+            shared_place(e, &pbody, &pcx);
+        } else {
+            own_temp_place(b, &pbody, &pcx);
+        }
         if dl >= 0 && reachable(pbody) {
-            emit_ref(dl, dp, pcx.pl_l, pcx.pl_p, ref_kind(pcx.nodes[b].a, pcx.nodes[b].ty, pcx), b,
-                &pbody, &pcx);
+            emit_ref(dl, dp, pcx.pl_l, pcx.pl_p, rk, b, &pbody, &pcx);
         }
         return;
     }

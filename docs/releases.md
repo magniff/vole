@@ -83,7 +83,170 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.2.1 | `v0.27.2.1` | 0.27.2 | aarch64-macos | std2 1,306 of 1,454 tests at -O0/-O2 under `--check-alloc`; `impl Trait` returns (§21) and the opaque instance (§22, narrowed: FL11); implied outlives bounds (D4.6); three consumed-value miscompiles fixed (D8.5), E0508, two-phase `write`; the front's std2 gaps (F13, F14.2, F18.4, F9.2, F26.3); floats, `std::env`; contracts and effects R2 (std2 declared, 27 `requires`, 11 `ensures`); hello-rust 3.48x; the gate's std2 builds halved |
 | 0.27.3 | `v0.27.3` | 0.27.2.1 | aarch64-macos | the translator `fix --edition rust` and gate 2 (`tests/translate.sh`, the rustc twin); the i32 literal default (FL6); std2 1,402 of 1,472 tests at -O0; lazy std2 parsing (a rust hello world 2.32x MVS's); arrays' by-value IntoIterator |
 | 0.27.4 | `v0.27.4` | 0.27.3 | aarch64-macos | gate 3 opens (`fix --edition rust` on compiler/src: 122 type errors, 3,048 borrowck behind them); inference from a later statement (FL1); `[T]`/`str` unsized places (Z9.1c); `&raw` and Rust 2024's `static mut` rule; `format_args` a value; std2 1,445 of 1,473 tests at -O0; a rust hello world 2.03x MVS's |
+| 0.27.5 | `v0.27.5` | 0.27.4 | aarch64-macos | std2's `std::time`, `fs`, `process`, `cli` (gate 3 from 122 to 37 type errors); operands read where evaluated (D2.4a); text is not its bytes (F0.6); a generic iterator's item is its bound's (D4.6 f); std2 lexed by its units (a rust hello world 1.82x MVS's, the 2.0x ceiling enforced) |
+
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.27.5
+
+Gate 3 at 37. std2 has the modules compiler/src uses: `std::time`, `std::fs`, `std::process` and `std::cli`, Rust-shaped, with the translator's rows bending MVS's calls onto them. `fix --edition rust` on a copy of compiler/src now leaves 37 errors (122 in 0.27.4), and `check --borrowck-partial` counts 154 borrowck errors behind them (3,048 in 0.27.4): a rust body reads each operand where it is evaluated (D2.4a), and borrowed literals are promoted (D2.8). In the rust edition, text is not its bytes (F0.6: a `&str` where a `&[u8]` goes is E0308), and the translator writes `b".."` or `.as_bytes()` where bytes are declared; a generic iterator's item is its bound's region, not a borrow of the iterator (D4.6 f); `AsRef` for `&T` with T = `str` no longer calls itself (a stack overflow at run time) nor gives a false outlives (Z9.1c); a borrowed array or tuple literal takes the expected type (F18.4). std2 is lexed by its units from an index made when it is embedded (Z5.2): a rust hello world's check is 1.82x MVS's (2.03x), and the 2.0x ceiling is enforced. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
+
+The front (fl10274):
+
+- A place used mutably once its use is known takes IndexMut and
+  DerefMut, as rustc's autoref does (F20.6): `vs[0].push(x)`,
+  `ps[0].x.push(x)`, `m[i][j].push(x)`, `r[0].push(x)` through a
+  `&mut Vec`, `v[0].iter_mut()`, the same in a closure, `match vs[0] {
+  ref mut w => .. }`, and `w.x.push(x)` through a user DerefMut. In
+  0.27.4 these read the index through Index and were
+  borrowck.borrow_immutable where rustc compiles them. A type with Index
+  and no IndexMut keeps `index`, and the write is borrowck's (E0596).
+- A `&str` where a `&[u8]` goes is rustc's E0308 in the rust edition
+  (F0.6): `str::from_utf8("Hello")`, a `&str` value, and a `&String`, which
+  derefs to `str` only. The error's `try:` gives `b"Hello"` or
+  `s.as_bytes()`. 0.27.4 took the text as its bytes, the view model of MVS
+  (which keeps it). This hid 348 of gate 2's bad translations, most of
+  them `str::from_utf8("..")` around a literal.
+
+The front (front275):
+
+- A rust body reads each operand where it is evaluated, as Rust does
+  (borrowck.md D2.4a). A Copy place given as an argument, a literal's
+  element or an assignment's right side is copied out at that point.
+  - The view or reference it reads through ends there, so rustc's
+    accepted shapes now pass the borrow checker:
+    `err_begin(pcx.nodes[p].start, pcx)`, `pcx.nodes[p].b =
+    pcx.nodes[q].a`, `v.push(v[0])`, `f(s.x, &mut s)`, `g(y, &mut y)`.
+    Gate 3's `check --borrowck-partial` goes from 3,049 errors to 313
+    (conflicts from 2,951 to 215).
+  - It is also a run-time fix: `f(x, { x += 1; x })` now passes the old
+    `x` first, and `v[{ y += 1; 0 }] = y` stores the old `y`, as in Rust.
+  - MVS is unchanged.
+  - The same goes for the left side of a primitive binary operator when
+    its right side may run a statement: `pcx.nodes[n].a ==
+    intern(c"Self", pcx)` is accepted, and `x + f(&mut x)` adds the old
+    `x`.
+- A shared borrow of a literal, or of an array, tuple or repeat of
+  literals, lives for the whole body (borrowck.md D2.8, rustc's
+  promotion), so `if sub { &["sub", "checked_sub"] } else { &["add"] }`
+  can be used after its branch. `&[x, 1]` and `&[f()]` stay their
+  branch's temporaries, as in rustc. A promoted borrow still cannot
+  leave the function (L2).
+- With both, gate 3's borrowck errors go from 307 to 286: conflicts from
+  215 to 201, dropped_borrowed from 7 to 0. All 286 are the translator's
+  to fix; for each shape rustc rejects the same code.
+- std2 is lexed by its units (front-rust.md Z5.2). `embed.sh` writes an
+  index of std2's units, made by the compiler (`volec __std2-index`).
+  A build reads the index and lexes only the units it reaches, about
+  half of std2's text. The tokens it keeps are the same as from lexing
+  the whole text (tests/std2/units.sh).
+  - A rust hello world's build is 1.82x MVS's at the gate, down from 2.08x. The 2.0x
+    ceiling in tests/compile_cost.sh is now enforced.
+  - The commit hook and the merge driver remake the index, like the rest
+    of stdsrc_rust.vl. It adds about 150 KB to that file and 0.5% to the
+    compiler's own compile.
+
+The translator (g3274):
+
+- A result's views where elision cannot tie them: with no parameter to
+  borrow from, every view in the result is `'static`, inside it too
+  (`Vec<Opt<'static>, Gpa>`); with two or more and no `self`, the
+  function's `'a`, on the result and on each parameter taken by a shared
+  reference (`&mut` ones keep their own). Gate 3's borrowck.elision: 40
+  to 4.
+- No move out of an index: an `if` of two places given to a reference
+  parameter borrows each branch (`if c { &a.x } else { &a.y }`), and
+  rewrite.tsv's `Vec::free`/`String::free` on an element (`$r=index`, a
+  new condition) is `{ $r.clear(); $r.shrink_to_fit(); }`.
+- `'static` results by an explicit list in sig.vl's static_result, each
+  with its evidence: base::sym_text (intern's copies and the cache's
+  buffer, never freed), tools::patch::target (argv),
+  tools::testrun::build_key (a fresh buffer). A view of SRC is not
+  `'static` (add_source reallocates it): tools/probe keeps two offsets
+  in place of its view, and lex_text_block reads `SRC[0..lex_end]`
+  itself. MVS's `static var SRC: [u8]` stays a known gap (its
+  translation `static mut SRC: &'static [u8]` is unsound), a design item
+  of 0.27.5's.
+- `str::from_utf8(..).unwrap()` only for a printed value that is bytes
+  where it is declared: a binding, parameter, field, static or constant
+  written `[u8]` (or an element of one written `[[u8]; N]`), a call whose
+  result is, a part, a borrow, a block or an `if` of such values. A
+  literal, an `if` of literals, a `str` binding and an element of a
+  `[str; N]` stay text: 0.27.4's twin agreed on 305 of the 911
+  round-tripped programs, 230 of its rejections `str::from_utf8("..")`;
+  the same programs now agree on 522 of 559. A literal that is a
+  static's or a constant's `[u8]` value, or an `if` branch beside
+  declared bytes, is `b".."`.
+- Gate 3 so far: 121 errors (117 type error, 2 edition.lenient, 1
+  distinct.mix, 1 item.private); borrowck (partial), with front275's
+  D2.4a: 161.
+
+The borrow checker (bc275):
+
+- A generic iterator's item is its bound's, not a borrow of the
+  iterator (borrowck.md D4.6 (f)): in `fn first<'a, I: Iterator<Item =
+  &'a str>>(args: I) -> Option<&'a str>`, `let mut it = args;
+  it.next()` and a `for t in args` loop return the item. 0.27.4 tied
+  the template's `I::Item` to `next`'s `&mut self` (E3) and reported
+  borrowck.return_local, which blocked std::cli's `parse_in`. With
+  `Item = &'b str` and an `&'a str` result it is borrowck.outlives, as
+  in rustc. Cases `rust_b_proj_item_bound` and
+  `rust_b_err_proj_item_bound`, both twinned with rustc.
+
+std2 (std2275), for the modules compiler/src uses:
+
+- `std::time`: `Duration` (`new`, `from_secs`..`from_nanos`,
+  `from_secs_f64`/`f32` and their `try_`, `as_*`, `subsec_*`, `checked_*`,
+  `saturating_*`, `mul_f64`, `div_f64`, `div_duration_f64`, the operators
+  and Debug as Rust prints it: `1.5s`, `2ms`, `{:.2?}`), `Instant`,
+  `SystemTime` with `UNIX_EPOCH` and `SystemTimeError`; and
+  `std::thread::sleep`. Changed from Rust's: `as_millis`, `as_micros` and
+  `as_nanos` are u64 (saturating), `UNIX_EPOCH` is a static, and there are
+  no `Duration::ZERO`/`MAX` constants (a constant of a struct type waits
+  for const evaluation). Seven std2_time cases, six of them twinned with
+  rustc.
+- `std::fs`: `File` (`open`, `create`, `create_new`, `options`,
+  `metadata`, `set_len`, `sync_all`; Read, Write and Seek, and Read and
+  Write for `&File`), `OpenOptions` (Rust's `&mut self` builder and its
+  EINVAL rules), `Metadata` (`len`, `file_type`, `is_dir`, `is_file`,
+  `is_symlink`, `permissions`, `modified` as a SystemTime), `FileType`,
+  `Permissions`, `read_dir` with `DirEntry` (`path`, `file_name`,
+  `file_type`, `metadata`), and `read_in`, `read_to_string_in`, `write`,
+  `copy` (the permission bits too), `metadata`, `symlink_metadata`,
+  `exists` (an `io::Result<bool>`), `remove_file`, `remove_dir`, `rename`,
+  `create_dir`, `create_dir_all`, `remove_dir_all`. `std::io` gains
+  `Seek` and `SeekFrom` (Rust's place), and `ErrorKind::InvalidFilename`;
+  `[T]` and `[T; N]` are `AsRef<[T]>`. Changed from Rust's: a path is a
+  `&str` until std::path, and a DirEntry's `path()` and `file_name()` are
+  `&str` views of the entry (a name that is not UTF-8 is read_dir's
+  InvalidData); `mode` and `as_raw_fd` are inherent until std::os. MVS's
+  `fs::append` is gone: `OpenOptions::new().append(true).create(true)`.
+  Four std2_fs cases, three twinned with rustc.
+- `std::process`: `Command::new_in(program, a)` (its strings on a: the
+  allocator named, Rust's `Command::new`) with Rust's `&mut self`
+  builder: `arg`, `args`, `env_remove`, `stdin`/`stdout`/`stderr` with
+  `Stdio::inherit`/`null`/`piped`, `spawn`, `status` and `output` (stdout
+  and stderr piped and stdin /dev/null unless set, as Rust's, the bytes
+  on clones of a); `Child` with its piped `stdin`/`stdout`/`stderr`
+  (`ChildStdin` a Write, the others Read), `id`, `wait`, `try_wait`,
+  `kill`; `ExitStatus` (`success`, `code`, `signal`, Display as Rust's:
+  `exit status: 3`, `signal: 9 (SIGKILL)`); `exit`, `abort`, `id`.
+  MVS's `foreground` stays (vole's own). Four std2_process cases, three
+  twinned with rustc (the twin's prelude maps `Command::new_in(p, gpa)`
+  to `Command::new(p)`).
+- `std::cli`: MVS's parser (clap's builder without derive) in the rust
+  edition: `Arg`, `Command`, `Matches` and `CliError` carry the lifetime
+  of the text they are given (`Command<'a, A>`; a `Command<'static, A>`
+  of literals parses any words), the builders take and return the value
+  as clap's, `short` takes a char and `num_values`, `width` and `count`
+  are usize; `indices_of` stays `&[i64]`. CliError is Debug. The
+  translation's rows: `short(b'o')` is `short(b'o' as char)`, the usizes
+  are cast, and `Command`, `Arg`, `Matches`, `CliError` written as types
+  get their `'_`. MVS's 16 cli cases are std2_cli cases (`// RUSTC:
+  none`: Rust's std has no command-line parser). With std::cli, gate 3
+  goes from 127 errors to 37.
+- `Clone` for `&T` (Rust's core): an allocator given by reference,
+  `&ArenaScope<'_, Gpa>`, is `A: Allocator + Clone`.
 
 ### What's new in 0.27.4
 

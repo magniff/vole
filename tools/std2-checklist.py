@@ -55,8 +55,11 @@ OUT = os.path.join(TREE, "checklist.tsv")
 SCOPE_OWNERS = {"Option", "Result", "Vec", "[T]", "str", "String", "Buf", "HashMap", "HashSet", "Iterator",
                 "Fmt", "Display", "Debug", "Arena", "ScopedArena", "FixedBuf", "Gpa", "Allocator", "Scope",
                 "ScopedJoinHandle", "JoinHandle", "Read", "Write", "BufRead", "BufReader", "BufWriter",
-                "Clone", "Default", "Eq", "Ord", "Hash", "Cell", "UnsafeCell", "From", "Into", "TryFrom"}
-SCOPE_MODULES = {"std::fmt", "std::io", "std::thread", "std::slice", "std::iter", "std::cell"}
+                "Clone", "Default", "Eq", "Ord", "Hash", "Cell", "UnsafeCell", "From", "Into", "TryFrom",
+                "Duration", "File", "OpenOptions", "Metadata", "ReadDir", "DirEntry", "Arg", "Command",
+                "Matches", "CliError"}
+SCOPE_MODULES = {"std::fmt", "std::io", "std::thread", "std::slice", "std::iter", "std::cell", "std::time",
+                 "std::fs", "std::process", "std::cli"}
 # std2 owner names of MVS's owners that were renamed (for the auto match)
 OWNER_ALIASES = {"Formatter": "Fmt", "ArenaScope": "ScopedArena", "Iter": None}
 

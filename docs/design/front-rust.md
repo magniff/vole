@@ -118,6 +118,23 @@ not the rule: a receiver `r: &S` finds `S::m(&self)` at its first step,
 deref_receiver` (today: inherent and impl methods of `τ₀`'s template,
 then one `Deref`).
 
+**F0.6 (text is not its bytes, 0.27.5).** In a rust-edition position a
+`&str` where a `&[u8]` goes is a mismatch, as rustc's E0308: a string
+literal, a `&str` value, or a `&String` (which derefs to `str` only).
+MVS's view model (0.20, `coerce_text`) made a `str` its bytes for free.
+In the rust edition the bytes are `s.as_bytes()`, and a literal's are
+`b".."`. The error's `try:` gives that conversion. A string literal
+where a `&str` goes is that `&str` as it is: it is not checked as its
+bytes. Two places take a literal's bytes as before, the compiler's own
+reads: its writes of a format literal's text in a direct `print`/`write`
+(F16.3), and an intrinsic's feature name (`std::arch::has("neon")`). A generic
+`&[T]` does not bind `T = u8` from a `&str`. *Anchor:*
+`front/check/check_mode.vl: coerce_text`, `check/distinct.vl:
+distinct_literal, distinct_mismatch`, `check/interp.vl: direct_call`,
+`check/calls/paths.vl: check_direct_call`.
+Cases `rust_f_f0_str_not_bytes_err`, `rust_f_f0_string_not_bytes_err`,
+`rust_f_f0_str_bytes_ok`.
+
 ## 1. Types
 
 ### F1 `char`
@@ -375,6 +392,30 @@ rust-edition position, with these readings:
 - *Sized* (F21.1). A parameter without `?Sized` bound to `Unsized(v)` is
   `type.unsized` (E0277), checked with the bounds of every struct, enum
   and function instance (`traits.vl: check_bounds`).
+- *A receiver written `*v` of a view* (0.27.5). `*v` is read as the view
+  (Z4.1's reading), but as a receiver it is the place `Unsized(v)`, as
+  rustc's probe starts from `str`: only the place's methods take it
+  (their `&self` the view), never an impl for `&T`. So `(**self).as_ref()`
+  in `impl<T: ?Sized + AsRef<U>, U: ?Sized> AsRef<U> for &T` with `T =
+  str` is `<str as AsRef<[u8]>>`, in an instance too, with or without an
+  expected type (before, with `let b: &[u8] = ..` the reference impl took
+  it, called itself, and the program overflowed its stack).
+- *Not yet: an instance's call is resolved again, not the template's
+  choice substituted* (0.27.5, a wrong output). rustc resolves a method
+  call once, on the generic body: `(**self).tag()` in `impl<T: ?Sized +
+  Tag> Tag for &T` is `<T as Tag>` for every T, so with `C = &&str`,
+  `via(r)` of `fn via<C: Tag>(c: C) { c.tag() }` is the reference impl
+  twice (21). Vole checks the instance's body with T = `&str` and takes
+  the place's impl for `(**self)`, a view (11). The fix: an instance's
+  call takes the template's resolution with the instance's types. Case
+  `rust_f_z91c_template_choice` (XFAIL).
+- *`&'a T` of an unsized argument in a signature* (0.27.5, D4.6). With
+  `T = Unsized(v)`, `&'a T` is the view `v` whose region is the
+  reference's (`'a`, or the elided one, E2/E3's), with T's slots (the
+  elements') under it, not a region of T's: the result `&U` of `fn
+  as_ref(&self) -> &U` with `U = [u8]` is `&self`'s region, so
+  `AsRef::as_ref(*self)` in the impl for `&T` is no
+  `borrowck.outlives` (rustc accepts it).
 - *`&e` of a view value.* `&e`/`&mut e` of a call's view
   (`&mut "ab".as_bytes()`) is a reference to a temporary view,
   `&mut &[u8]`; `&v[..]` stays the place's view.
@@ -1100,6 +1141,18 @@ temporary (lifetime extension) with the annotation's type: `let d: &[u8]
 the literals are `u8`, not the default. *Anchor:* `front/check/temps.vl:
 annotate_temp`. Integer inference variables (a literal typed by a later
 statement, `let a = [1, 2]; f(&a)` with `f(&[u8])`) are F18.5's.
+(0.27.5) Where no `let` hoists it (a block's tail, an `if`'s or a
+`match`'s branch, an argument, a field), a shared `&e` checked where
+`&U` goes, with `e` an array, a repeat or a tuple, checks `e` against
+`U` when `U` is of its kind (an array type for an array or a repeat, a
+tuple type of as many elements for a tuple): `let b: &[i64; 2] = if c {
+&[1, 2] } else { &[3, 4] };` and `if c { &(7, true) } else { &(8, false)
+}` where `&(i64, bool)` goes type their literals from `U`, as rustc's
+expectation does. So does a sliced array literal where `&[U]` goes,
+`if c { &[1, 2, 3][1..] } else { &[0][..] }`: the array is a `[U; N]`.
+Not yet the same slicing as a `let`'s whole initializer, `let s: &[i64]
+= &[1, 2, 3][1..];`, which F18.4's hoisting takes first (the fallback,
+`i32`: a type error). *Anchor:* `check_mode.vl: check_expr_inner`.
 
 **F18.5 (integer inference variables: an open local).** In the rust
 edition an unannotated `let x = e;` binding one name, with `e` a literal
@@ -1558,8 +1611,44 @@ for usize { type Output = T; .. }`, `for Range<usize> { type Output =
 
 **F20.4 (`IndexMut` and assignment).** `c[i] = e`, `c[i] += e`,
 `&mut c[i]`, `c[i].m()` with `m` taking `&mut self` (F6.2's `&mut`
-autoref) use `index_mut`; a `τ` with `Index` but no `IndexMut` is
-`error trait.unmet` naming `IndexMut` (E0594's shape).
+autoref) use `index_mut`; a `τ` with `Index` but no `IndexMut` keeps
+`index`, and the write through its `&` is borrowck.assign_immutable or
+borrow_immutable (rustc E0594, E0596). The same holds of `Deref` and
+`DerefMut` on the path (`w.x.push(..)` of a `w: W`, `W: DerefMut`), and
+of a Vec's `as_slice` and `as_mut_slice` (`v[i]`, 0.17).
+
+**F20.6 (where a place is used mutably, 0.27.5).** A place is used
+mutably when it is:
+- an assignment's target, `+=`'s included;
+- the operand of `&mut` or `&raw mut`;
+- the receiver of a method whose `self` is `&mut Self`, autoref'd
+  (F6.2), the method found either way (`v[0].push(x)`, `v[0].iter_mut()`,
+  in a closure's body too);
+- the scrutinee of a match, `if let` or `let else` with a `ref mut`
+  binding.
+
+On such a place every index and deref of its path, through fields and
+tuple fields, is IndexMut's, DerefMut's or `as_mut_slice`, each level
+(`m[i][j].push(x)`, `ps[0].x.push(x)`). The first two contexts are known
+before the place is checked (`Ctx.mut_place`, check::rust::on_mut_path).
+The last two are known only after it is, once the method is found or the
+pattern checked. The place is then made mutable after the fact, as
+rustc's `convert_place_derefs_to_mutable` does. Each index or deref read
+through Index or Deref keeps the IndexMut or DerefMut call it would be
+(`Ctx.mut_alt`, with its receiver's type as checked, keep_alt).
+place_to_mut puts that call in place and checks it as any other: its
+instance is the one made and called, and the superseded `index` is no
+longer called (its effects are not the caller's). The kept call takes its receiver by
+`&mut`, so the places under it are made mutable in turn. A container
+whose type still holds an unsolved type variable (FL1) is made mutable
+the same way. F26.3's `s[1..].make_ascii_uppercase()` on str is decided
+before the place is checked, as before. *Anchor:* `front/check/rust.vl:
+place_to_mut, keep_alt`, `synth_mode.vl: keep_mut_slice`,
+`calls/mod.vl: synth_method`, `convert/mod.vl: method_call`,
+`patterns/mod.vl: check_match`. Cases `rust_f_f20_index_mut_method_ok`,
+`rust_f_f20_deref_mut_method_ok`, `rust_f_f20_index_mut_ref_mut_pat_ok`,
+`rust_f_f20_index_mut_infer_ok`, `rust_f_f20_index_mut_method_err`,
+`rust_f_f20_index_mut_readonly_err`.
 
 **F20.5 (a tuple index of literals).** `g[(0, 1)]` with `G:
 Index<(usize, usize)>`: a tuple of unsuffixed literals takes its
@@ -1693,6 +1782,69 @@ the `sys` layer and `panic`'s exit-101 path. `std::gpu`, `std::window`,
 feature name, `std_gpu`, for the five; U4). *Anchor:* `compiler/std/
 embed.sh`, `front/modules/lookup.vl: private_error` (the "no such
 module" site).
+
+**Z5.2 (std2 lexed by its units; 0.27.5).** A build reads std2 by the
+units std2lazy splits it into (an item; an inherent impl's header, each
+member and its closing brace; a trait's header with its required items,
+each default method and its brace; a `use` line; a module's lines), and
+keeps only the units it reaches (0.27.3's rule, unchanged). In 0.27.5
+the split is made once, when std2 is embedded, not at each build:
+`embed.sh --edition rust` writes `std2_units`, the index of the built-in
+text's units: each unit's kind, its bytes, its name, trait, type head and
+parent, the identifiers it holds (as positions in one table of std2's
+words), and the asks of its `use` leaves and its trait's item names. It
+is made by the compiler (`volec --edition rust __std2-index TEXT`, the
+same split the token path runs), so the two cannot differ. A build on the built-in text
+reads the index, interns its words, runs the reach over its units, and
+lexes only the units it keeps, in their order; the tail (Z5.1, made per
+build) is lexed and split as tokens, as before. The tokens kept are
+those the token path keeps, the same and in the same order (each run of
+kept units lexed at once, its last token's `joint` as in the whole
+text), and std2's inline modules are made after they are lexed, in the
+text's order and the tail's last, as when the text is lexed whole. A
+symbol's or a string literal's number may differ from the token path's
+(what is interned, and in which order, is not the same); no meaning
+does.
+- The index is used only when it was made for this text: its format and
+  the text's length match, the text is the built-in one, and the
+  index's first line, `std2-text SUM`, names the cksum of this text
+  (`std2_text_sum`, which embed.sh writes from the text alone, with no
+  compiler). Otherwise (std2 read from a tree, `VOLE_STD_TREE`; an index
+  made by an older format, or for another text; none), and when std2 is read whole (queries, `--std2-check`,
+  `VOLE_STD2_EAGER=1`, the eager rerun), the text is lexed whole as in
+  0.27.4. `VOLE_STD2_INDEX=0` forces the token path.
+- Kept up to date with no manual step: the commit hook and the
+  stdsrc_rust.vl merge driver run embed.sh, which makes the index with
+  the tree's compiler (`target/tools/volec`, else `target/volec`;
+  `VOLE_EMBED_VOLEC` names another). Two branches that change std2
+  merge without a conflict on it: the driver makes it again from the
+  merged std2. The compiler chosen is the first that writes the index's
+  format (embed.sh's `STD2_UNITS_FORMAT`, std2lazy's `INDEX_FORMAT`);
+  the hooks name the tree's `target/volec` by its absolute path, and the
+  main checkout's compilers are tried last. With none (a tree whose
+  compilers predate 0.27.5) the index the file has is kept as it is,
+  never replaced by an empty one, and embed.sh and the hook say so: made
+  for another text, it is not read, and a build reads std2 whole until a
+  compiler that can makes it again. `-c` then compares the rest of the
+  file; with a compiler that can, an empty index or one for another text
+  is stale. (0.27.5's first merges wrote an empty index where the hooks
+  ran with 0.27.4's compilers; tools/git-hooks/test-stdsrc.py's std2
+  cases are that commit.)
+- Checked: `embed.sh --edition rust -c` with the current compiler says
+  whether the index is stale, and a test compares the tokens a build
+  keeps with the index and without it (`VOLE_STD2_INDEX=0`), on a set of
+  programs; both run for every change to std2 or the front's std2 files
+  (tests/affected.map). The test (tests/std2/units.sh) reads what
+  `VOLE_STD2_DUMP=FILE` writes, the kept tokens with the way they were
+  read (by-index, by-tokens), and builds with `VOLE_STD2_NORERUN=1`: a
+  lazy build with errors would be made again whole and hide a wrong
+  index.
+- The cost: the hello-rust row of tests/compile_cost.sh is enforced at
+  2.0x the MVS hello world from 0.27.5 (1.78x with the index, 2.08x
+  without, which the row would refuse); the index adds about 150 KB to
+  stdsrc_rust.vl and 0.5% to the compiler's own compile.
+*Anchor:* `front/modules/std2lazy.vl`, `front/modules/mod.vl:
+load_std2`, `compiler/std/embed.sh`.
 
 **Z6.1 (two stds, one binary).** Both texts are embedded; the on-disk
 cache is keyed by `(edition, std hash)`; `ls -l target/volec` is
