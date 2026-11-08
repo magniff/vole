@@ -547,12 +547,22 @@ re-inferred.
   `if` around it. 0.27.6 accepted
   `bump(&x)` with `fn bump(p: *mut i64)`, and the callee's write went
   through a pointer to a place that had only a shared borrow. MVS's
-  `*T` takes `&x` as before. A fat raw pointer (`*mut [T]`) takes no
-  reference yet, shared or exclusive (rustc: `&mut s[..]` and `&s[..]`
-  to `*const [T]`). *Anchor:* `front/check/check_mode.vl: coerce_ref`.
+  `*T` takes `&x` as before. **A fat raw pointer** (0.27.7; 0.27.6
+  took no reference there, shared or exclusive) takes a view as a thin
+  one takes a reference: `&[T]` (`s`, `&m[..]`) and `&mut [T]`
+  coerce to `*const [T]`, `&mut [T]` to `*mut [T]`, and `&str` to
+  `*const str`; a reference to an array, `&a` or `&mut a` of an
+  `a: [T; N]`, coerces as its slice `&a[..]` (`&mut a[..]`) does, the
+  unsizing coercion (rustc's; a Vec's reference does not, rustc's
+  E0308 too). A shared view where `*mut [T]` is written is E0308, the
+  types differing in mutability, as for a thin `*mut T` and in the
+  same positions. The view's two words are the pointer's: the
+  coercion is its operand, as Z9.3's cast. *Anchor:*
+  `front/check/check_mode.vl: coerce_ref, fat_raw_coerce`.
   *Cases:* `rust_b_raw_mut_from_shared_err`,
   `rust_b_raw_mut_from_mut`, `rust_b_raw_mut_positions_err`,
-  `rust_b_raw_mut_positions`.
+  `rust_b_raw_mut_positions`, `rust_b_raw_fat_coerce`,
+  `rust_b_raw_fat_from_shared_err`.
 - `SK_ASSIGN (a,b) = RV_REF P` (`e = 'ℓ`, `d ≠ BK_RAW`): loan `ℓ`
   created; `sub(&'ℓ [mut] type(P) ≤ type((a,b)))` (a `BK_FAKE` loan:
   `type((a,b))` is `&type(P)`); **the supporting-prefix rule:** for
