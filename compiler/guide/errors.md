@@ -5,24 +5,25 @@ agent's shell, a pipe; `--diagnostics=short` anywhere): one line per
 error, `FILE:LINE:COL: error[KIND] MESSAGE | help: HELP | note: NOTE |
 try: TRY`, every error of every file at once (up to 50), sorted by
 position. A `try:` (0.17) is text to use as it is: code to paste where
-the error is (`a as i32`, `std::trim(s)`, the missing match arms), a
+the error is (`a as i32`, `&v`, the missing match arms), a
 `use` line, or a `volec` command to run (`volec fix --only unsafe
 main.vl`, `volec edit new-file util.vl main.vl`); VALUE in it
 is yours to fill in.
 An error whose fix the compiler knows exactly (0.18: a did-you-mean with
-one name that near, a conversion, a path from `crate::`, a Rust type or
-label respelled, a missing `use` or `pub`, a missing `gpa` argument)
+one name that near, a conversion, a path from `crate::`, a missing
+`use` or `pub`, a missing `gpa` argument)
 also has `try: volec fix --suggested main.vl`: one command makes
 all of them, as one checked edit (`--dry-run` shows the diff, `volec
 undo` takes it back, `--at FILE:LINE` fixes one line's), then prints the
 errors left. Run it instead of editing those lines by hand or with sed.
-KIND is `tokenizer error`, `parser error`, `module error`, `type error`
-or `unsafe`. Fix the first errors first: a parser error can hide
+KIND is `tokenizer error`, `parser error`, `module error`, `type error`,
+`unsafe`, or a code (`alloc.no_in`, `borrowck.conflict`: `volec explain
+CODE`). Fix the first errors first: a parser error can hide
 type errors in the same function. `volec query show FILE:LINE` prints
 the item at an error's position. Below: what a newcomer writes, the
 error (short form, without the position), and the fix.
 
-## Rust habits
+## Where vole is not Rust
 
 ```vole
 let s: String<Gpa> = String::new();
@@ -30,73 +31,41 @@ let s: String<Gpa> = String::new();
 ```err
 error[alloc.no_in] 'String::new' allocates from nothing: pass the allocator, last, to 'String::new_in' | help: this function's `gpa` is the allocator to pass
 ```
-`String` and `str` are std's (0.20, `guide text`); what allocates
-takes an allocator: `String::new_in(gpa)`, `s.to_uppercase_in(gpa)`.
-A Rust type vole does not have gets the type to write as its `try:`:
-`char` (`u8`), `Box`, `Rc` (`*T`), `VecDeque`, `RefCell`.
+Nothing allocates without an allocator: `String::new_in(gpa)`,
+`s.to_uppercase_in(gpa)`, `x.to_string_in(gpa)`, `it.collect_in(gpa)`,
+with `gpa` from `fn main(gpa: Gpa)`, passed down (`guide allocators`).
+`volec fix --only alloc` writes the `_in` form where one allocator is in
+scope.
 
 ```vole
-use std::cmp::max;
+let v: Vec<i64> = Vec::new_in(gpa);
 ```
 ```err
-error[type error] no 'cmp' in module 'std' | help: vole's std has no module 'cmp': std's items are all `std::NAME` too | try: use std::max;
+error[alloc.default] 'Vec' names no allocator: its 'A' is written
 ```
-std has a few of Rust's modules (0.20: `std::collections::HashMap`,
-`std::fmt::Display`, `std::io::read_line`, `std::iter`, `std::ops`,
-`std::slice`, `std::num`, `std::convert`, `std::clone`, `std::string`,
-`std::fs`, `std::path`, `std::env`, `std::process`), and every item is
-`std::NAME` as well: `use std::{IoError, is_digit};` (`HashMap`,
-`read_line` and std's most used names are in the prelude: no `use`).
+The allocator is part of the type: `Vec<i64, Gpa>`, `String<Gpa>`,
+`HashMap<K, V, Gpa>`, `Box<T, Gpa>`.
 
 ```vole
-fn main() -> i32 { let s = "  a "; let t = s.trim(); 0 }
+struct Parser { toks: Vec<u8, Gpa> }
+fn main() -> i32 { 0 }
 ```
 ```err
-error[type error] no method 'trim' on type '[u8]' | help: 'trim' is no method: std's function `trim` takes the value as its first argument | try: trim(s)
+error[alloc.field] the struct 'Parser' holds an allocator its parameters do not name: 'Gpa', in field 'toks'
 ```
-`s` is a `[u8]` here: bytes. A `str` has `trim`, `split`, `parse` (0.20):
-`let s: str = "  a ";`, or `"  a ".trim()` on the literal itself. A
-method std has as a function (`trim`, `sort`, `parse` as `parse_int`,
-`split_whitespace` as `split_whitespace_in(s, gpa)`) gets the call to
-write; another unknown method, the type's nearest methods and `volec
-query items TYPE`, which lists them all.
-
-`fn count(s: str)` takes a `str` (0.20: Rust's `&str` is `str`, as
-`&[T]` is `[T]`), and a literal, a `str` or a String goes there. A
-parameter is read-only by default (let: `s: str`, `v: Vec<i64, Gpa>`,
-nothing to write); `x: inout T` may change the caller's value, called
-with `&x`; `x: sink T` takes it. `*T` is the raw pointer.
+`struct Parser<A: Allocator> { toks: Vec<u8, A> }` (`use
+std::alloc::Allocator;`), used as `Parser<Gpa>`.
 
 ```vole
-struct P { x: i64 }
-impl P { fn get(&self) -> i64 { self.x } }
+fn name(s: String<Gpa>) -> usize { s.len() }
+fn main() -> i32 { name("x") as i32 }
 ```
 ```err
-error[parser error] expected identifier, got '&' | help: `self` for `&self`, `inout self` for `&mut self`, `sink self` for `self` (0.19: `self: &Self`, `self: &mut Self`, `self: Self`)
+error[type error] expected 'String<Gpa>', got '&str'
 ```
-`fn get(self) -> i64`; `fn bump(inout self)` to change it, `fn
-finish(sink self)` to take it (`self: *P` is the raw pointer).
-
-```vole
-fn main() -> i32 { let mut x = 1; x += 1; x as i32 }
-```
-```err
-error[conv.rust] 'let mut' is Rust's spelling; a mutable binding is 'var x'
-```
-`var x = 1;`. Each of Rust's spellings is `conv.rust` with the
-replacement in its `try:` (`fix --suggested` makes them all): `&T` and
-`&mut T` in a type (`x: T`, `x: inout T`), `&mut x` (`&x`), `*r` on an
-access (`r`), `move ||` (`sink ||`), `static mut` (`static var`), `mut
-x: T` (`x: sink T`).
-
-```vole
-fn main() -> i32 { var x = 1; let r = &mut x; 0 }
-```
-```err
-error[conv.rust] '&mut x' is Rust's spelling; an inout argument (the callee may change it) is marked '&x'
-```
-`&x` lends `x` inout, to an `inout` parameter or an `inout r = &x;`
-local; nothing else takes `&`.
+A String owns its text, on an allocator: `String::from_in("x", gpa)`. A
+function that only reads text takes `s: &str`, which a literal and a
+String's `&s` both go to.
 
 ```vole
 println!("{}", 1);
@@ -104,18 +73,9 @@ println!("{}", 1);
 ```err
 error[parser error] 'println!' is a macro call: vole has no macros | help: write `println("{}", 1)`
 ```
-Since 0.26.2 the call without its `!` takes the same format string
-(`volec guide formatting`). The help names what replaces `vec!`,
+The call without its `!` takes the same format string (`volec guide
+formatting`). The help names what replaces `vec!`,
 `format!`, `assert!` and the others.
-
-```vole
-'outer: for i in 0..3 { break 'outer; }
-```
-```err
-error[tokenizer error] unterminated character literal | help: a label has no quote: `outer: loop { break :outer; }` | try: outer: for i in 0..3 { break :outer; }
-```
-Labels have no quote: `outer: for i in 0..3 { break :outer; }` (the
-try: line is yours, respelled).
 
 ```vole
 let o: Option<i64> = Some(1);
@@ -128,23 +88,13 @@ error[type error] refutable pattern in 'let'
 leave), or `let x = match o { Some(x) => x, None => 0 };`.
 
 ```vole
-let n = 5;
-let m = !n;
-```
-```err
-error[type error] expected 'bool', got 'i64'
-```
-Bitwise not is `~n`.
-
-```vole
 let big = i64::MAX();
 ```
 ```err
 error[type error] no associated function 'MAX' in 'i64' | help: a constant, without (): 'i64::MAX'
 ```
-`i64::MAX`, `u8::MIN`, ... are constants (0.15); integer types have no
-other associated items. Floats have Rust's (0.25.2.1): `f64::EPSILON`,
-`f64::MAX`, `f64::NAN`, `f64::consts::PI` (`guide math`).
+`i64::MAX`, `u8::MIN`, ... are constants, as `f64::EPSILON`, `f64::MAX`,
+`f64::NAN` and `std::f64::consts::PI` (`guide math`).
 
 ```vole
 let s = "add";
@@ -153,26 +103,8 @@ match s { "add" => println("a"), _ => println("b") }
 ```err
 error[parser error] expected a pattern, got 'string literal'
 ```
-`if s == "add" { ... }`: patterns are integers, bytes, bools, variants,
-tuples.
-
-```vole
-#[derive(PartialEq, Debug)]
-struct P { x: i64 }
-```
-```err
-error[type error] cannot derive 'PartialEq' (derivable: Eq, Ord, Hash, Debug, Clone)
-```
-`#[derive(Eq, Ord, Hash, Debug, Clone)]` (0.15): Eq is Rust's PartialEq
-and Eq, Ord its PartialOrd and Ord; there is no Copy (every type copies).
-
-```vole
-fn f<I>(it: I) -> i64 where I: Iterator, I::Item: Ord { 0 }
-```
-```err
-error[where.unsupported] 'I::Item: Ord': a 'where' bound is on a type parameter of the item, and 'I::Item' is not one
-```
-`where` (0.26.2) bounds the item's parameters: `I: Iterator<Item = X>, X: Ord`.
+`if s == "add" { ... }`: a string literal is not a pattern yet (integers,
+chars, bools, variants, tuples are).
 
 ```vole
 fn main() -> i32 {
@@ -192,9 +124,9 @@ let x = 1;
 x = 2;
 ```
 ```err
-error[type error] cannot assign to immutable variable 'x' | help: make it mutable: `var x`
+error[type error] cannot assign to immutable variable 'x' | help: make it mutable: `let mut x`
 ```
-`var x = 1;`: a `let` binding does not change.
+`let mut x = 1;`: a `let` binding does not change.
 
 ```vole
 let a: i64 = 1;
@@ -203,8 +135,8 @@ let b: i32 = a;
 ```err
 error[type error] expected 'i32', got 'i64'
 ```
-Only widening is implicit (0.15: `i32` to `i64`, `u8` to `u32`, ...):
-narrowing is `a as i32`. The same for `1 + 1.0`, `u32` to `i32`, and
+Only widening is implicit (`i32` to `i64`, `u8` to `u32`, ...; Rust
+writes those too, `i64::from(a)`): narrowing is `a as i32`. The same for `1 + 1.0`, `u32` to `i32`, and
 for `main` returning an `i64` (`n as i32`).
 
 ```vole
@@ -215,28 +147,19 @@ error[type error] integer literal 300 does not fit in type 'u8'
 ```
 An unsuffixed literal takes the type the code around it gives: `if ok {
 line[i] } else { 0 }` is a `u8`, from the other branch; so are match arms
-and array elements beside a `u8`, and (0.25.4) an array of literals
-beside an array (`if down { ACCENT } else { [0.2, 0.5, 0.7, 1.0] }` is
-a `[f32; 4]` when `ACCENT` is). Alone, a literal is `i64` (`f64`), and a
-`let` of literals keeps that type: `let base = [0.2, 0.5, 0.7, 1.0];`
+and array elements beside a `u8`, and an array of literals beside an
+array (`if down { ACCENT } else { [0.2, 0.5, 0.7, 1.0] }` is a `[f32;
+4]` when `ACCENT` is). Alone, a literal is `i32` (`f64`), and a `let` of
+literals keeps that type: `let base = [0.2, 0.5, 0.7, 1.0];`
 beside a `[f32; 4]` is an error whose note names the `let` and its
 annotation, `let base: [f32; 4] = ...`.
-
-```vole
-const ORIGIN: (i64, i64) = (0, 0);
-fn main() -> i32 { 0 }
-```
-```err
-error[type error] constant 'ORIGIN' has type '(i64, i64)'; constants must be integers, floats, bool or string literals | help: a `static` holds other values: `static ORIGIN: (i64, i64) = ...;`
-```
-`const GREETING: [u8] = "hello";` is a constant (0.14).
 
 ```vole
 let x = 1;
 if x { }
 ```
 ```err
-error[type error] expected 'bool', got 'i64'
+error[type error] expected 'bool', got 'i32'
 ```
 `if x != 0`.
 
@@ -256,13 +179,6 @@ fn f() -> i64 { 1; }
 error[type error] function 'f' body has type '()', expected 'i64'
 ```
 The value is the last expression without `;`: `fn f() -> i64 { 1 }`.
-
-```vole
-let x: i64;
-```
-```err
-error[parser error] 'let' without an initializer is not supported
-```
 
 ```vole
 struct P { x: i64, y: i64 }
@@ -322,7 +238,7 @@ fn main() -> i32 {
 ```err
 error[type error] variant 'Ev::Key' has named fields; give them by name | try: Ev::Key { code: 1, shift: false }
 ```
-A struct-like variant (0.17) is built and matched by name, as in Rust:
+A struct-like variant is built and matched by name, as in Rust:
 `Ev::Key { code: 1, shift: false }`, `Ev::Key { code, .. } => code`.
 
 ```vole
@@ -346,58 +262,57 @@ error[type error] cannot access field 'code' on type 'Ev' | help: a variant's fi
 ## Slices, Vec, std
 
 ```vole
-var m: HashMap<i64, i64, Gpa> = HashMap::new_in(gpa);
-let a = m[0];
-```
-```err
-error[type error] cannot index type 'HashMap<i64, i64, Gpa>'
-```
-`m.get(0)` (an Option), `m.insert(0, x)`. A `Vec` and a `Buf` index as
-their slice (0.17): `v[0]`, `v[0] = x`, `v[1..3]` are
-`v.as_slice()[0]`, ..., checked.
-
-```vole
 let n = 3;
 for x in n { }
 ```
 ```err
-error[type error] 'for' iterates over ranges, slices, arrays, iterators and types with an 'iter' method, got 'i64'
+error[type error] no method 'into_iter' on type 'i32'
 ```
-`for x in 0..n`. A type of yours iterates with `impl Iterator for T`, or
-an `iter` method returning one (`volec guide iterators`).
+`for x in 0..n`. A `for` takes an `IntoIterator`: a range, `&v`,
+`v.iter()`, a `HashMap`; a type of yours with `impl Iterator for T`
+(`volec guide iterators`).
 
 A misspelt method, field or item gets the nearest name of its kind:
 
 ```vole
-fn main(gpa: Gpa) -> i32 { var b = Buf::new_in(gpa); b.push_string("x"); 0 }
+fn main(gpa: Gpa) -> i32 { let mut b = String::new_in(gpa); b.push_string("x"); 0 }
 ```
 ```err
-error[type error] no method 'push_string' on type 'Buf<Gpa>' | help: did you mean 'push_str'?
+error[type error] no method 'push_string' on type 'String<Gpa>' | help: did you mean 'push_str'?
 ```
 
-An array, a Vec or a Buf goes where a slice of its elements does:
-`sum(a)` for `fn sum(s: [i64])` (0.20; `sum(&v)` for `s: inout [T]`).
-An array's length is `a.len()`.
-
 ```vole
-let e: IoError = IoError::Read;
+fn main(gpa: Gpa) -> i32 { let m: HashMap<i64, i64, Gpa> = HashMap::new_in(gpa); 0 }
 ```
 ```err
-error[type error] unknown type 'IoError'
+error[type error] unknown type 'HashMap' | help: add `use std::collections::hash_map::HashMap;`
 ```
-`use std::IoError;` (the prelude's names need no import: `volec guide
-modules`).
+`use std::collections::HashMap;` (the prelude's names need no import:
+`volec guide modules`); `volec fix --suggested` adds the line.
 
 ```vole
+use std::collections::HashMap;
 struct K { a: i64 }
-fn main(gpa: Gpa) -> i32 { let m: HashMap<K, i64> = HashMap::new_in(gpa); 0 }
+fn main(gpa: Gpa) -> i32 {
+    let mut m: HashMap<K, i64, Gpa> = HashMap::new_in(gpa);
+    m.insert(K { a: 1 }, 2);
+    0
+}
 ```
 ```err
-error[type error] the trait 'Hash' is not implemented for 'K' | help: required by the bound 'K: Hash' of 'HashMap'
+error[type error] the trait 'Hash' is not implemented for 'K' | help: required by the bound 'K: Hash' of 'HashMap::insert'
 ```
-`impl Hash for K { fn hash(self) -> u64 { std::hash_u64(self.a as u64) } }`.
+`#[derive(PartialEq, Eq, Hash)] struct K { a: i64 }`.
 
-## Closures and iterators (0.14)
+```vole
+let c: char = 65u8;
+```
+```err
+error[distinct.mix] '65u8' is 'u8' where 'char' goes
+```
+`65u8 as char`; a byte literal is `b'A'`, a `char` `'A'`.
+
+## Closures and iterators
 
 ```vole
 let f = |x| x + 1;
@@ -422,20 +337,9 @@ A closure that captures is no plain `fn`: `fn run<F: Fn(i64) -> i64>(f:
 F) -> i64`. One that captures nothing converts.
 
 ```vole
-fn apply<F: Fn(i64) -> i64>(f: F) -> i64 { let x = 1; f(x) }
-fn main() -> i32 { apply(|a: *i64| 1); 0 }
-```
-```err
-error[type error] expected 'i64', got '*i64'
-```
-A `*T` is a raw pointer, not a way to pass: a closure parameter is let
-as any other, so annotate the type the bound gives (`|a: i64|`), or
-leave it untyped.
-
-```vole
 fn apply<F: Fn(i64)>(f: F) { f(1); }
 fn main() -> i32 {
-    var total = 0;
+    let mut total = 0;
     apply(|x| { total += x; });
     total as i32
 }
@@ -444,25 +348,25 @@ fn main() -> i32 {
 FnMut
 ```
 `Fn` takes closures that assign no captured variable: bound `F:
-FnMut(i64)` (and take it `f: sink F`, which may be called).
+FnMut(i64)` (and take it `mut f: F`).
 
 ```vole
 fn apply<F: Fn(i64) -> i64>(f: F) -> i64 { f(1) }
 fn main() -> i32 {
     let f = {
-        var j = 1;
+        let j = 1;
         |x: i64| x + j
     };
     apply(f) as i32
 }
 ```
 ```err
-which does not live outside this block
+error[borrowck.dropped_borrowed] 'j' does not live long enough
 ```
-The closure captures the `var j` inout, and `j` ends with the block:
-`sink |x: i64| x + j` takes a copy, or declare `j` before the block.
+The closure borrows `j`, and `j` ends with the block: `move |x: i64| x +
+j` takes a copy, or declare `j` before the block.
 
-## ?, conversions, arguments, formatting, derive (0.15)
+## ?, conversions, arguments, formatting, derive
 
 ```vole
 fn first(v: Option<i64>) -> i64 { let x = v?; x }
@@ -475,9 +379,8 @@ Return `Option<i64>` (or `Result<i64, E>`), or `match` on the value.
 `v.ok_or(MyError::Missing)?`.
 
 ```vole
-use std::ParseIntError;
 enum AppError { Bad }
-fn read(s: [u8]) -> Result<i64, AppError> { let n = parse_int(s)?; Ok(n) }
+fn read(s: &str) -> Result<i64, AppError> { let n: i64 = s.parse()?; Ok(n) }
 ```
 ```err
 '?' cannot convert the error 'ParseIntError' into 'AppError'
@@ -490,9 +393,9 @@ struct M { m: i64 }
 impl Into<M> for i64 { fn into(self) -> M { M { m: self } } }
 ```
 ```err
-From
+conflicting impls of trait 'Into'
 ```
-Implement `From<i64> for M`; `Into` comes with it. `x.into()` needs the
+Implement `From<i64> for M`; `Into` comes with it (std's blanket impl). `x.into()` needs the
 type it converts to: `let y: M = x.into();`.
 
 ```vole
@@ -531,12 +434,11 @@ The shorthand `P { x, y }` takes locals of the fields' names: write
 struct P { x: i64 }
 ```
 ```err
-did you mean 'Debug'
+cannot derive 'Debg' (derivable: PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy, Default)
 ```
-Derivable: `Eq`, `Ord`, `Hash`, `Debug`, `Clone` (Display is written by
-hand). Deriving a trait and implementing it too is a coherence error
-whose help is `remove Ord from #[derive]`; deriving `Eq` needs `==` on
-every field.
+Display is written by hand. Deriving a trait and implementing it too is a coherence error
+whose help is `remove Ord from #[derive]`; deriving `PartialEq` needs
+`==` on every field.
 
 ```vole
 struct P { x: i64 }
@@ -545,10 +447,9 @@ fn main() -> i32 { let p = P { x: 1 }; println("{p}"); 0 }
 ```err
 'P' does not implement Display
 ```
-Implement it (`impl Display for P { fn fmt(self, f: inout std::Fmt) {
-f.write("P({})", self.x); } }`), or print with `{p:?}` and
-`#[derive(Debug)]`. Rust's `fn fmt(&self, f: &mut Formatter) ->
-fmt::Result` is `fn fmt(self, f: inout Fmt)`, with nothing to return.
+Implement it (`impl fmt::Display for P { fn fmt(&self, f: &mut
+fmt::Formatter) -> fmt::Result { write(f, "P({})", self.x) } }`, with
+`use std::fmt;`), or print with `{p:?}` and `#[derive(Debug)]`.
 
 ```vole
 fn main() -> i32 { let x = 1; println(f"x = {x + 1}"); 0 }
@@ -563,7 +464,7 @@ stays in its hole, an expression becomes `{}` and an argument,
 ## Generics and traits
 
 ```vole
-fn biggest<T>(a: sink T, b: sink T) -> T { if a > b { a } else { b } }
+fn biggest<T>(a: T, b: T) -> T { if a > b { a } else { b } }
 struct P { x: i64 }
 fn main() -> i32 { let p = biggest(P { x: 1 }, P { x: 2 }); 0 }
 ```
@@ -571,7 +472,8 @@ fn main() -> i32 { let p = biggest(P { x: 1 }, P { x: 2 }); 0 }
 error[type error] comparison requires numeric type, got 'P' | note: in instantiation of 'biggest<P>'
 ```
 A generic body is checked per use; the note names the instance.
-Implement `Ord` for `P`, or bound `T: Ord` to say what it needs.
+Derive or implement `PartialOrd` for `P`, and bound `T: PartialOrd` to
+say what it needs.
 
 ```vole
 trait A { fn a(self) -> i64; fn b(self) -> i64; }
@@ -591,17 +493,6 @@ error[parser error] 'dyn' is a reserved keyword
 ```
 No trait objects: `fn f<T: A>(x: T)`, or an enum of the cases.
 
-```vole
-struct K { n: i64 }
-impl Ord for K { fn cmp(self: *K, o: *K) -> i64 { 0 } }
-fn main() -> i32 { 0 }
-```
-```err
-error[type error] 'cmp' does not have the signature trait 'Ord' declares: expected 'fn(K, K) -> i64'
-```
-An impl takes what the trait declares, as let parameters: `fn cmp(self,
-o: K) -> i64` (`*K` is a raw pointer).
-
 ## Modules and imports
 
 ```vole
@@ -610,7 +501,8 @@ use std::*;
 ```err
 error[module error] wildcard imports are not allowed
 ```
-`use std::{Buf, HashMap};`; `volec fix --only imports` writes them.
+`use std::collections::{HashMap, HashSet};`; `volec fix --only imports`
+writes them.
 
 ```vole
 mod m { pub fn helper() -> i64 { 1 } }
@@ -624,7 +516,7 @@ Add the `use` line the help names, or run the `try:` line, `volec fix
 other errors' exact fixes; `fix --only imports`: the imports alone).
 
 In a module other than the root, a path starts in that module, or with
-a sibling module, or one of the root (0.17): `use table::Table;` and
+a sibling module, or one of the root: `use table::Table;` and
 `table::f(x)` in check.vl are `crate::table::...` when `mod table;` is
 in main.vl. A module elsewhere (`crate::a::table`) is `unknown module
 'table'`, whose help says `crate::a::table::...` and whose `try:` is the
@@ -635,17 +527,7 @@ stdin; the `mod` line that is there stays). A `mod` line for a file that
 is next to a submodule's file belongs in the root.
 
 ```vole
-fn main() -> i32 { let text = read_to_string(); 0 }
-```
-```err
-error[type error] undefined variable 'read_to_string' | help: std reads stdin: `read_stdin_in(gpa)` (all of it, a Vec<u8>)
-```
-std's items outside the prelude get their `use` line (`add `use
-std::is_digit;``) or the nearest std name; an unknown function with neither points to `volec
-guide std`.
-
-```vole
-fn main() -> i32 { let total = 1; std::print_int(totl); 0 }
+fn main() -> i32 { let total = 1; println("{}", totl); 0 }
 ```
 ```err
 error[type error] undefined variable 'totl' | help: did you mean 'total'?
@@ -663,7 +545,7 @@ error[item.private] 'hidden' is private | help: make it public: `pub fn hidden` 
 ```
 The help gives the declaration with `pub` and where it is (`volec fix
 --only pub` writes them all). Child modules see their parent's private items, not
-the reverse. A struct's fields too (0.26):
+the reverse. A struct's fields too:
 
 ```vole
 mod m {
@@ -696,7 +578,7 @@ fn main() -> i32 { helper() as i32 }
 ```err
 add the parameter `gpa: Gpa` to 'helper' and pass it down
 ```
-Allocation is explicit (0.16; `alloc.no_in` since 0.26.3): the help
+Allocation is explicit (`alloc.no_in`): the help
 says where the allocator comes from here (this function's `gpa`, main's
 parameter, or one to add). `volec fix --only alloc` writes the call
 when one allocator is in scope; here there is none, and the parameter
@@ -705,8 +587,8 @@ is yours to add (`volec refactor signature`).
 ```vole
 struct P { x: i64 }
 fn main() -> i32 {
-    var p = P { x: 1 };
-    let q: *P = &p;
+    let mut p = P { x: 1 };
+    let q: *mut P = &mut p;
     q.x = 9;
     0
 }
@@ -714,25 +596,8 @@ fn main() -> i32 {
 ```err
 error[unsafe] access to a field through a raw pointer is unsafe
 ```
-A local declared `*P` holds a raw pointer. Use `p.x = 9;`, an inout
-local (`inout q = &p; q.x = 9;`, safe), or pass `&p` to a function
-taking `p: inout P`.
-
-```vole
-struct P { x: i64 }
-fn one() -> i64 { 1 }
-fn get(n: i64, p: inout P) -> i64 { n + p.x }
-fn main() -> i32 { get(one(), &P { x: one() }) as i32 }
-```
-```err
-error[type error] cannot take address of non-lvalue expression
-```
-`&` lends a place (a variable, a field, an element) inout. A let
-parameter takes a value as it is (`get(one(), P { x: 1 })` for `p: P`);
-for an inout one, `&f(x)` or `&P { x: 1 }` makes a temporary (0.18.1),
-unless something evaluated before it in the statement (`one()` here, a
-call) could see the difference: then name it first: `var t = P { x:
-one() }; get(one(), &t)`.
+`q` is a raw pointer. Use `p.x = 9;`, a reference (`let q = &mut p; q.x =
+9;`, safe), or pass `&mut p` to a function taking `p: &mut P`.
 
 ```vole
 fn factorial(n: i64) -> i64 { if n < 2 { 1 } else { n * factorial(n - 1) } }
@@ -742,169 +607,147 @@ fn main() -> i32 { let f = &factorial; f(5) as i32 }
 error[type error] cannot take the address of 'factorial': a function's name is already a pointer to it
 ```
 A function's name is a `fn(i64) -> i64` value: `let f = factorial;`,
-then `f(5)`; `(*f)(5)` is `f(5)` too. `fix --suggested` drops the `&`
-(the `*`).
+then `f(5)`. `fix --suggested` drops the `&`.
 
 ```vole
-fn first(p: *i64) -> i64 { p[1] }
+fn first(p: *const i64) -> i64 { p[1] }
 ```
 ```err
-error[unsafe] indexing a raw pointer is unsafe
+error[type error] cannot index into a value of type '*i64' | help: a raw pointer is not indexed: offset it and read, `unsafe { *p.add(i) }`
 ```
-A pointer is one value; for many, take a slice `[i64]`. A Vec, Buf or
-slice parameter (`v: Vec<i64, Gpa>`, `v: inout Vec<i64, Gpa>`) indexes its
-elements, checked and safe; through a `*T` it needs `unsafe`. To write
-one number for the caller, take `out: inout i64` and write `out = acc`.
+A pointer is one value; for many, take a slice `&[i64]`: a slice or a
+Vec indexes its elements, checked and safe.
 
 ```vole
-fn read(x: *i64) -> i64 { *x }
+fn read(x: *const i64) -> i64 { *x }
 ```
 ```err
-error[unsafe] dereference of a raw pointer is unsafe: `x` is a `*T` parameter
+error[unsafe] dereference of a raw pointer is unsafe
 ```
-A `*T` parameter is a raw pointer (0.18.1), as in Rust. Take it let,
-`x: i64` (`x: inout i64` when written through, called with `&n`;
-`volec fix --values` changes such parameters with their calls), or vouch for it in
-`unsafe { *x }` (`fix --only unsafe`). The same for a field access, a
-method call and an index through it.
+Take a reference, `x: &i64` (`x: &mut i64` when written through, called
+with `&mut n`), or vouch for the pointer in `unsafe { *x }` (`fix --only
+unsafe`). The same for a field access and a method call through it.
 
 ```vole
 unsafe fn danger() -> i64 { 1 }
-fn main() -> i32 { let f = danger; 0 }
-```
-```err
-error[unsafe] using an `unsafe fn` as a value is unsafe
-```
-Call it in `unsafe`, or wrap it in a safe `fn`.
-
-```vole
-fn main() -> i32 { std::print_cstr(c"x"); 0 }
+fn main() -> i32 { danger() as i32 }
 ```
 ```err
 error[unsafe] calling an `unsafe fn` is unsafe
 ```
-`std::panic`, `print_cstr` and `Buf::push_cstr` take C strings and are
-`unsafe fn`; for literals use `print("x")`, `panic("x")` (the prelude's,
-safe).
+Call it in `unsafe { }`, under a `// SAFETY:` comment that says why its
+contract holds here.
 
-## Conventions, moves and views (0.17, 0.20)
+## Borrowing and moves
 
-A parameter is let (read-only, the default), `inout` (it may change
-the caller's value: the call marks it `&x`) or `sink` (it takes the
-value). The call must say what the parameter says:
+The borrow checker's errors (`borrowck.*`) are Rust's, one line each,
+with both positions and a `help:` with the fix; the message names
+rustc's code where it has one, and `volec explain borrowck.CODE` has
+each in full (`guide memory#borrowing`).
 
 ```vole
-struct P { x: i64 }
-fn bump(p: inout P) { p.x += 1; }
-fn main() -> i32 { var q = P { x: 1 }; bump(q); q.x as i32 }
+fn bump(n: &mut i64) { *n += 1; }
+fn main() -> i32 { let mut q = 1i64; bump(q); q as i32 }
 ```
 ```err
-error[conv.marker] 'q' is lent inout here (the callee may change it): mark it '&q'
+error[type error] expected '&mut i64', got 'i64'
 ```
-`bump(&q)`: `&` shows at the call what may change. When the callee only
-reads, the help's `volec refactor signature bump --convention p let`
-makes it a let parameter, with every call.
+`bump(&mut q)`: the call shows what may change. Where a `&T` goes, a
+value is `edition.lenient: 'q' is a value where a reference goes`: pass
+`&q`.
 
 ```vole
-fn total(v: Vec<i64>) -> i64 { v.len() }
-fn main(gpa: Gpa) -> i32 { let v: Vec<i64> = Vec::new_in(gpa); total(&v) as i32 }
-```
-```err
-error[conv.marker_extra] '&' marks an argument the callee may change; 'v' is taken let or sink here (read, or moved): pass 'v'
-```
-`total(v)`: a let parameter borrows `v` for the call, unmarked, and `v`
-stays the caller's.
-
-```vole
-fn fill(v: Vec<i64, Gpa>) { v.push(1); }
-```
-```err
-error[own.readonly] writes through 'v'
-```
-A let parameter is read-only: take it `v: inout Vec<i64, Gpa>` and call
-`fill(&v)` (the `try:`, `volec refactor signature fill --convention
-v inout`, changes both); a slice to sort in place is `s: inout [T]`,
-passed as `&v` or `&a[..]`.
-
-```vole
-fn bump(n: inout i64) { n += 1; }
-fn main() -> i32 { let n = 1; bump(&n); n as i32 }
-```
-```err
-error[own.readonly] '&n' changes 'n', a let binding: it is read-only
-```
-An inout access needs a mutable place: `&n`, `inout r = &n`, `match
-&n` and an `inout self` method (`v.push(x)`, `v[i] = x`) on a let
-binding, a let parameter or receiver, or an immutable static are
-errors. The `try:` says which: `var n = ...`, `x: inout T`, `inout
-self`, `static var N`.
-
-```vole
-fn keep(v: sink Vec<i64, Gpa>) -> usize { v.len() }
+fn keep(v: Vec<i64, Gpa>) -> usize { v.len() }
 fn main(gpa: Gpa) -> i32 { let v: Vec<i64, Gpa> = Vec::new_in(gpa); keep(v); v.len() as i32 }
 ```
 ```err
-error[own.moved] 'v' is used here after it moved into 'keep(sink v)'
+error[borrowck.use_moved] 'v' is used here after it moved
 ```
-A `sink` parameter takes the value; the caller's `v` is dead after the
-call. When `keep` only reads, make it let (`v: Vec<i64, Gpa>`: nothing
-moves; `refactor signature keep --convention v let`); else pass
-`keep(v.clone())` or use `v` before. An owned value also moves with
-`let w = v;`, `return v` and into a struct literal.
-
-The own pass's errors (`own.*`) are one line each, with both positions,
-a `help:` with the fix and `try:` lines; `volec explain own.CODE` has
-each in full, `volec query own FILE:LINE:COL` the state of every
-local there.
+A parameter by value takes the argument; the caller's `v` is dead after
+the call (rustc E0382). When `keep` only reads, make it `v: &Vec<i64,
+Gpa>` and pass `&v`; else pass `keep(v.clone())` or use `v` before. An
+owned value also moves with `let w = v;`, `return v`, into a struct
+literal and into a `for x in v`.
 
 ```vole
-struct T<A: Allocator> { keys: Vec<i64, A> }
-impl T<Gpa> { fn rehash(inout self) { var old = self.keys; old.push(1); } }
+fn main(gpa: Gpa) -> i32 {
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
+    v.push(1);
+    let first = &v[0];
+    v.push(4);
+    *first as i32
+}
 ```
 ```err
-error[own.move_out] cannot move 'self.keys' (Vec<i64, Gpa>) out of a reference
+error[borrowck.conflict] cannot borrow 'v' as mutable because it is also borrowed as immutable
 ```
-`var old = self.keys.take();` leaves an empty Vec on the same allocator
-(`std::take(&x)` for a `Default` value, `std::replace(&x, v)`); `let
-old = self.keys;` reads it where it is (a `let` of a part borrows it).
+`v.push(4)` may move the elements `first` points into (E0502). Use the
+borrow before the change, or take it again after; keep an index (`for i
+in 0..v.len() { let x = v[i]; ... }`); copy a `Copy` value out first
+(`let x = v[0];`). The same for a push inside `for x in &v`.
 
-```text
-error[own.conflict] 'v.push(4)' may move v's elements while 'first' (4:17) views them; 'first' is used at 6:16
-error[own.conflict] 'v.push' may move v's elements while the 'for' at 7:1 iterates over them
-error[own.conflict] 'a' is lent inout to '&a' and inout again to '&a' in the same call
+```vole
+fn swap(a: &mut i64, b: &mut i64) { let t = *a; *a = *b; *b = t; }
+fn main() -> i32 { let mut a = 1; swap(&mut a, &mut a); a as i32 }
 ```
-A view (a slice, a let or inout access, a `for` over `v`) is still used
-after `v` changes, or one value is lent inout twice at once. Use the
-view before the change, or take it again after; keep an index (`for i
-in 0..v.len() { let x = v[i]; ... }`); copy a plain value out first
-(`let x = v[0];`); `v.swap(i, j)` for two elements; `let n =
-rng.next();` before `rng.big(n)`. `guide memory#slices` has the rules.
+```err
+error[borrowck.mut_twice] cannot borrow 'a' as mutable more than once at a time
+```
+A `&mut` is the only way to its place while it is used (E0499): two
+elements of one Vec swap with `v.swap(i, j)`, two halves borrow with
+`split_at_mut`.
 
-```text
-error[own.escape] 'greet' returns a view of 'b', which is dropped when 'greet' returns
+```vole
+fn main() -> i32 { let mut n = 1; let r = &n; n = 2; *r }
 ```
-Return the `Buf` (`-> Buf`, `b`), not `b.as_slice()`; the caller takes
-the view.
+```err
+error[borrowck.assign_borrowed] cannot assign to 'n' because it is borrowed
+```
+Assign after the borrow's last use (E0506).
 
-```text
-error[own.readonly] changes 'v' (Vec<i64>), a copy the match on 'e' (2:26) binds: the change would not reach it, and could free memory it points to
-error[own.readonly] changes 'w' (Vec<i64>), a copy of an element 'vv.get(0)' reads: ...
+```vole
+use std::alloc::Allocator;
+struct T<A: Allocator> { keys: Vec<i64, A> }
+impl T<Gpa> { fn rehash(&mut self) { let mut old = self.keys; old.push(1); } }
+fn main() -> i32 { 0 }
 ```
-(0.18.1) `match e`, `v.get(i)` and a `for` loop's element give a copy
-of an owned value that stays where it is: read it, do not change it.
-Match through an inout access instead (`match &e` binds `v` inout, for
-`e: inout E` or a `var e`), or change the element in place
-(`vv[0].push(1)`).
+```err
+error[borrowck.move_out] cannot move out of 'self.keys', which is reached through a reference or an index
+```
+A value behind a reference stays there (E0507): borrow it (`&self.keys`),
+clone it, or take it and leave another in its place
+(`std::mem::replace(&mut self.keys, Vec::new_in(gpa))`, `Option::take`).
+`let s = v[i];` of an element that is not `Copy` is the same error.
+
+```vole
+fn greet<'a>(gpa: Gpa) -> &'a str { let b = String::from_in("hi", gpa); b.as_str() }
+fn main() -> i32 { 0 }
+```
+```err
+error[borrowck.return_local] a reference to 'b', a local of this function, escapes it
+```
+Return the `String` (`-> String<Gpa>`, `b`), not a borrow of it (E0515);
+the caller borrows.
+
+```vole
+fn longest(a: &str, b: &str) -> &str { if a.len() > b.len() { a } else { b } }
+fn main() -> i32 { 0 }
+```
+```err
+error[borrowck.elision] the result of 'longest' borrows, but from which parameter is not said
+```
+`fn longest<'a>(a: &'a str, b: &'a str) -> &'a str` (E0106): with one
+reference parameter, or `&self`, nothing is written.
 
 ## At run time
 
 A failed check prints its message on stderr and exits with code 101:
 `index out of bounds: index I, length N`, `slice range out of bounds:
 ...`, `called unwrap on None`, `called unwrap on Err`, `invalid value V
-for enum E`. A note follows (0.17). A program built with `--trace`
+for enum E`, `attempt to divide by zero`. A program built with `--trace`
 prints, instead, the failing line and the calls that led to it
-(`volec test` builds so; `guide debug`). Arithmetic never fails (it
-wraps; `/ 0` is 0). Runaway recursion is stopped by the operating system
+(`volec test` builds so; `guide debug`). Integer overflow panics at -O0
+and wraps at -O1 and above. Runaway recursion is stopped by the operating system
 (a signal, no message).
 
 ```vole
@@ -912,14 +755,13 @@ enum Level { Low, High }
 
 fn main() -> i32 {
     let v: Option<i64> = None;
-    std::print_int(v.unwrap_or(5));
-    println("");
+    println("{}", v.unwrap_or(5));
     let e = 3 as Level;
-    std::print_int(e as i64);
+    println("{}", e as i64);
     0
 }
 ```
 ```out (exit 101)
 5
-main.vl:7:13: invalid value 3 for enum Level
+main.vl:6:13: invalid value 3 for enum Level
 ```

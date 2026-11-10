@@ -1,3 +1,4 @@
+// EDITION: rust
 // (0.25.4) Loops over a std Vec<i64> reached through a parameter and over
 // a Vec of 48-byte nodes (a static one until 0.26.3), the kernels of
 // docs/design/modernize-0254.md §2; bench/vecloop/raw.vl is the same
@@ -7,65 +8,91 @@
 // runs, and its CPU time is written on stderr (for timing one at a
 // time); without, all of them.
 use std::env;
+use std::alloc::{AllocError, Allocator, Layout};
+use std::ptr::NonNull;
 
 // A zero-sized allocator, as the compiler's Comp. (0.26.3: a static holds
 // no allocator, alloc.static: the node table is run's, passed down, as
 // the compiler's tables will be once 0.26.4 moves them into context
 // structs.)
+#[derive(Clone, Copy)]
 struct Heap {}
 
 // UNSAFE: C's allocator, which Heap hands out.
 // SAFETY: called with sizes checked non-negative, on blocks Heap allocated.
 extern "C" {
-    fn malloc(n: u64) -> *u8;
-    fn realloc(p: *u8, n: u64) -> *u8;
-    fn free(p: *u8);
+    fn malloc(n: u64) -> *mut u8;
+    fn realloc(p: *mut u8, n: u64) -> *mut u8;
+    fn free(p: *mut u8);
     fn clock() -> i64;
 }
 
 // UNSAFE: a test's allocator built over C's (0.26.3: Allocator is an unsafe trait).
 // SAFETY: its memory comes from C's malloc, realloc and free, aligned to 16.
 unsafe impl Allocator for Heap {
-    fn try_alloc(self: *Heap, size: i64, align: i64) -> *u8 {
-        if align > 16 || size < 0 {
-            return 0 as *u8;
-        }
-        // UNSAFE: C's allocator.
-        // SAFETY: size is checked non-negative; the block is this allocator's.
-        unsafe { malloc(if size == 0 { 1 } else { size } as u64) }
-    }
+    fn allocate(&self, __layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        let size = __layout.size() as i64;
+        let align = __layout.align() as i64;
+        NonNull::new({
+            if align > 16 || size < 0 {
+                return NonNull::new(0 as *mut u8).ok_or(AllocError);
+            }
+            // UNSAFE: C's allocator.
+            // SAFETY: size is checked non-negative; the block is this allocator's.
+            unsafe { malloc(if size == 0 { 1 } else { size } as u64) }
+        }).ok_or(AllocError) }
 
     // UNSAFE: the trait's unsafe method (p must be Heap's block).
     // SAFETY: Vec passes its own block, of old_size bytes.
-    unsafe fn try_resize(self: *Heap, p: *u8, old_size: i64, new_size: i64, align: i64) -> *u8 {
-        if align > 16 || new_size < 0 {
-            return 0 as *u8;
-        }
-        realloc(p, if new_size == 0 { 1 } else { new_size } as u64)
+    unsafe fn grow(&self, __p: NonNull<u8>, __old: Layout, __new: Layout) -> Result<NonNull<u8>,
+        AllocError> {
+        let p = __p.as_ptr();
+        let old_size = __old.size() as i64;
+        let new_size = __new.size() as i64;
+        let align = __new.align() as i64;
+        NonNull::new({
+            if align > 16 || new_size < 0 {
+                return NonNull::new(0 as *mut u8).ok_or(AllocError);
+            }
+            realloc(p, if new_size == 0 { 1 } else { new_size } as u64)
+        }).ok_or(AllocError) }
+
+    // UNSAFE: shrink is an unsafe fn of the unsafe trait Allocator
+    // SAFETY: its caller keeps Allocator's contract for p, old and new
+    unsafe fn shrink(&self, p: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<u8>,
+        AllocError> {
+        // UNSAFE: grow is an unsafe fn of Allocator
+        // SAFETY: the caller of shrink keeps the same contract, and
+        // realloc makes a block smaller as it makes one larger
+        unsafe { self.grow(p, old, new) }
     }
 
     // UNSAFE: the trait's unsafe method (p must be Heap's block).
     // SAFETY: Vec passes its own block, once.
-    unsafe fn free(self: *Heap, p: *u8, size: i64, align: i64) {
+    unsafe fn deallocate(&self, __p: NonNull<u8>, __layout: Layout) {
+        let p = __p.as_ptr();
+        let size = __layout.size() as i64;
+        let align = __layout.align() as i64;
         free(p);
     }
 }
 
+#[derive(Clone, Copy)]
 struct Node { start: i64, end: i64, kind: i64, a: i64, b: i64, c: i64 }
 
 const N: i64 = 4194304;
 const ROUNDS: i64 = 15;
 
 #[inline(never)]
-fn fill(v: inout Vec<i64, Gpa>, n: i64) {
+fn fill(v: &mut Vec<i64, Gpa>, n: i64) {
     for i in 0..n {
         v.push(i & 1023);
     }
 }
 
 #[inline(never)]
-fn sum_let(v: Vec<i64, Gpa>, k: i64) -> i64 {
-    var s = k;
+fn sum_let(v: &Vec<i64, Gpa>, k: i64) -> i64 {
+    let mut s = k;
     for i in 0..v.len() {
         s += v[i];
     }
@@ -73,33 +100,33 @@ fn sum_let(v: Vec<i64, Gpa>, k: i64) -> i64 {
 }
 
 #[inline(never)]
-fn sum_iter(v: Vec<i64, Gpa>, k: i64) -> i64 {
-    var s = k;
-    for x in v.iter() {
+fn sum_iter(v: &Vec<i64, Gpa>, k: i64) -> i64 {
+    let mut s = k;
+    for x in v.iter().copied() {
         s += x;
     }
     s
 }
 
 #[inline(never)]
-fn inc_inout(v: inout Vec<i64, Gpa>) {
+fn inc_inout(v: &mut Vec<i64, Gpa>) {
     for i in 0..v.len() {
         v[i] = v[i] + 1;
     }
 }
 
 #[inline(never)]
-fn chase(v: Vec<i64, Gpa>, steps: i64) -> i64 {
-    var k = 0;
+fn chase(v: &Vec<i64, Gpa>, steps: i64) -> i64 {
+    let mut k: i64 = 0;
     for _ in 0..steps {
-        let x = v[k];
+        let x = v[k as usize];
         k = (x * 7 + k) & 65535;
     }
     k
 }
 
 #[inline(never)]
-fn add_nodes(nodes: inout Vec<Node, Heap>, n: i64) {
+fn add_nodes(nodes: &mut Vec<Node, Heap>, n: i64) {
     nodes.clear();
     for i in 0..n {
         nodes.push(Node { start: i, end: 0, kind: i & 3, a: (i * 7919 + 1) % n, b: 0, c: 0 });
@@ -107,18 +134,18 @@ fn add_nodes(nodes: inout Vec<Node, Heap>, n: i64) {
 }
 
 #[inline(never)]
-fn walk(nodes: Vec<Node, Heap>, steps: i64) -> i64 {
-    var k = 0;
-    var s = 0;
+fn walk(nodes: &Vec<Node, Heap>, steps: i64) -> i64 {
+    let mut k: i64 = 0;
+    let mut s: i64 = 0;
     for _ in 0..steps {
-        k = nodes[k].a;
+        k = nodes[k as usize].a;
         s += k;
     }
     s
 }
 
 #[inline(never)]
-fn mark(nodes: inout Vec<Node, Heap>) {
+fn mark(nodes: &mut Vec<Node, Heap>) {
     for i in 0..nodes.len() {
         nodes[i].end = nodes[i].start + nodes[i].kind;
     }
@@ -133,67 +160,67 @@ fn now() -> i64 {
 }
 
 fn run(which: i64, gpa: Gpa) {
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
     if which != 1 {
-        fill(&v, N);
+        fill(&mut v, N);
     }
-    var w: Vec<i64, Gpa> = Vec::new_in(gpa);
+    let mut w: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..65536 {
         w.push((i * 31 + 7) & 65535);
     }
-    var nodes: Vec<Node, Heap> = Vec::new_in(Heap {});
+    let mut nodes: Vec<Node, Heap> = Vec::new_in(Heap {});
     if which >= 7 {
-        add_nodes(&nodes, 1000000);
+        add_nodes(&mut nodes, 1000000);
     }
     let t = now();
     if which == 0 || which == 1 {
-        var total = 0;
+        let mut total: i64 = 0;
         for _ in 0..ROUNDS {
             v.clear();
-            fill(&v, N);
+            fill(&mut v, N);
             total += v.len() as i64;
         }
         println("fill {total}");
     }
     if which == 0 || which == 2 {
-        var s = 0;
+        let mut s: i64 = 0;
         for r in 0..ROUNDS * 5 {
-            s += sum_let(v, r);
+            s += sum_let(&v, r);
         }
         println("sum {s}");
     }
     if which == 0 || which == 3 {
-        var s = 0;
+        let mut s: i64 = 0;
         for r in 0..ROUNDS * 5 {
-            s += sum_iter(v, r);
+            s += sum_iter(&v, r);
         }
         println("iter {s}");
     }
     if which == 0 || which == 4 {
         for _ in 0..ROUNDS {
-            inc_inout(&v);
+            inc_inout(&mut v);
         }
-        println("inc {} {}", v[0], v[N - 1]);
+        println("inc {} {}", v[0], v[(N - 1) as usize]);
     }
     if which == 0 || which == 5 {
-        var s = 0;
+        let mut s: i64 = 0;
         for r in 0..ROUNDS {
-            s += chase(w, 1000000 + r);
+            s += chase(&w, 1000000 + r);
         }
         println("chase {s}");
     }
     if which == 0 || which == 6 {
         for _ in 0..10 {
-            add_nodes(&nodes, 1000000);
+            add_nodes(&mut nodes, 1000000);
         }
         println("nodes {}", nodes.len());
     }
     if which == 0 || which == 7 {
-        println("walk {}", walk(nodes, 10000000));
+        println("walk {}", walk(&nodes, 10000000));
     }
     if which == 0 || which == 8 {
         for _ in 0..ROUNDS {
-            mark(&nodes);
+            mark(&mut nodes);
         }
         println("mark {}", nodes[999999].end);
     }
@@ -203,7 +230,7 @@ fn run(which: i64, gpa: Gpa) {
 }
 
 fn main(gpa: Gpa) {
-    var which = 0;
+    let mut which: i64 = 0;
     for (k, a) in env::args().enumerate() {
         if k == 1 {
             which = a.parse::<i64>().unwrap_or(0);

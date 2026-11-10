@@ -1,18 +1,26 @@
+// EDITION: rust
 // Conway's Game of Life in the terminal: a torus the size of the window,
-// random at first. Each frame is built in a std Buf and written at once.
+// random at first. Each frame is built in a String and written at once.
 // ANSI 24-bit color: live cells are white, dead ones fade from blue to
 // black with the time since they died.
 //
 // It runs on Linux and macOS, built for either from either: the one
 // difference it meets, the number of the ioctl that asks for the window
 // size, is chosen at run time by uname().
+use std::alloc::Allocator;
+use std::fmt::Write;
+
+// UNSAFE: C's functions, declared by hand.
+// SAFETY: the signatures are libc's (unistd.h, stdlib.h, time.h,
+// sys/ioctl.h, sys/utsname.h).
 extern "C" {
-    fn write(fd: i32, buf: *u8, count: u64) -> i64;
+    #[link_name = "write"]
+    fn c_write(fd: i32, buf: *const u8, count: u64) -> i64; // `write` is the prelude's
     fn rand() -> i32;
     fn srand(seed: u32);
-    fn time(t: *i64) -> i64;
+    fn time(t: *mut i64) -> i64;
     fn ioctl(fd: i32, request: u64, ...) -> i32;
-    fn uname(name: *u8) -> i32;
+    fn uname(name: *mut u8) -> i32;
 }
 
 // struct winsize, the same on both systems.
@@ -25,23 +33,29 @@ const TIOCGWINSZ_MACOS: u64 = 0x40087468; // _IOR('t', 104, struct winsize)
 fn on_macos() -> bool {
     // struct utsname starts with the system's name on both systems (its
     // fields are 65 bytes long on Linux, 256 on macOS)
-    var names: [u8; 1280] = [0; 1280];
-    if unsafe { uname(&names as *u8) != 0 } {
+    let mut names: [u8; 1280] = [0; 1280];
+    // UNSAFE: uname is C's.
+    // SAFETY: names is larger than struct utsname on both systems.
+    if unsafe { uname(names.as_mut_ptr()) != 0 } {
         return false;
     }
-    names[0..6] == "Darwin"
+    names.starts_with(b"Darwin")
 }
 
 // `age`: the generations since the cell died, up to 255.
+#[derive(Clone, Copy)]
 struct Cell { alive: bool, age: u8 }
 
-struct World<A: Allocator> { width: i64, height: i64, cells: Vec<Cell, A>, next: Vec<Cell, A> }
+struct World<A: Allocator> { width: usize, height: usize, cells: Vec<Cell, A>, next: Vec<Cell, A> }
 
 impl World<Gpa> {
-    fn random(width: i64, height: i64, gpa: Gpa) -> World<Gpa> {
-        var world = World { width, height, cells: Vec::new_in(gpa), next: Vec::new_in(gpa) };
+    fn random(width: usize, height: usize, gpa: Gpa) -> World<Gpa> {
+        let mut world = World { width, height, cells: Vec::new_in(gpa), next: Vec::new_in(gpa) };
         for _ in 0..width * height {
-            let cell = unsafe { Cell { alive: rand() % 2 == 0, age: 0 } };
+            // UNSAFE: rand is C's.
+            // SAFETY: it takes nothing and returns an int.
+            let r = unsafe { rand() };
+            let cell = Cell { alive: r % 2 == 0, age: 0 };
             world.cells.push(cell);
             world.next.push(cell);
         }
@@ -49,17 +63,19 @@ impl World<Gpa> {
     }
 
     // The cell at (x, y), the edges wrapping around.
-    fn alive(self, x: i64, y: i64) -> bool {
-        let wx = (x + self.width) % self.width;
-        let wy = (y + self.height) % self.height;
+    // (dx and dy are 0, 1 or 2: one more than the offset, so that the
+    // unsigned x + width + dx - 1 never goes below zero.)
+    fn alive(&self, x: usize, dx: usize, y: usize, dy: usize) -> bool {
+        let wx = (x + self.width + dx - 1) % self.width;
+        let wy = (y + self.height + dy - 1) % self.height;
         self.cells[wy * self.width + wx].alive
     }
 
-    fn neighbours(self, x: i64, y: i64) -> i64 {
-        var n = 0;
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                if (dx != 0 || dy != 0) && self.alive(x + dx, y + dy) {
+    fn neighbours(&self, x: usize, y: usize) -> i64 {
+        let mut n = 0;
+        for dy in 0..3 {
+            for dx in 0..3 {
+                if (dx != 1 || dy != 1) && self.alive(x, dx, y, dy) {
                     n += 1;
                 }
             }
@@ -67,7 +83,7 @@ impl World<Gpa> {
         n
     }
 
-    fn step(inout self) {
+    fn step(&mut self) {
         for y in 0..self.height {
             for x in 0..self.width {
                 let i = y * self.width + x;
@@ -86,55 +102,60 @@ impl World<Gpa> {
             }
         }
         // the two buffers trade places, nothing copied
-        let old = self.cells.take();
-        self.cells = std::replace(&self.next, old);
+        std::mem::swap(&mut self.cells, &mut self.next);
     }
 
     // One character cell per cell, row after row, the terminal wrapping
     // the lines; then the cursor back home.
-    fn render(self, out: inout String<Gpa>) {
+    fn render(&self, out: &mut String<Gpa>) {
         out.clear();
-        for cell in self.cells.as_slice() {
+        for cell in &self.cells {
             if cell.alive {
                 out.push_str("\x1B[48;2;255;255;255m ");
             } else {
                 // blue fading to black: the red, green and blue of the
                 // background color
                 let color = 255 - cell.age as i64;
-                out.push_fmt("\x1B[48;2;{};{};{color}m ", color / 2, color / 5);
+                write(out, "\x1B[48;2;{};{};{color}m ", color / 2, color / 5).unwrap();
             }
         }
         out.push_str("\x1B[1;1H");
     }
 }
 
-fn write_all(bytes: [u8]) {
-    var at = 0;
-    while at < bytes.len() as i64 {
-        let n = unsafe { write(1, &bytes[at], (bytes.len() as i64 - at) as u64) };
+fn write_all(bytes: &[u8]) {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        // UNSAFE: c_write is C's write.
+        // SAFETY: rest is rest.len() readable bytes.
+        let n = unsafe { c_write(1, rest.as_ptr(), rest.len() as u64) };
         if n <= 0 {
             return;
         }
-        at += n;
+        rest = &rest[n as usize..];
     }
 }
 
 fn main(gpa: Gpa) -> i32 {
-    unsafe { srand(time(0 as *i64) as u32); }
+    // UNSAFE: srand and time are C's.
+    // SAFETY: time takes a null pointer (it then only returns the time).
+    unsafe { srand(time(std::ptr::null_mut()) as u32); }
 
-    var size = Winsize { rows: 0, cols: 0, xpixel: 0, ypixel: 0 };
+    let mut size = Winsize { rows: 0, cols: 0, xpixel: 0, ypixel: 0 };
     let request = if on_macos() { TIOCGWINSZ_MACOS } else { TIOCGWINSZ_LINUX };
-    if unsafe { ioctl(1, request, &size) != 0 } {
+    // UNSAFE: ioctl is C's.
+    // SAFETY: TIOCGWINSZ writes one struct winsize, which size is.
+    if unsafe { ioctl(1, request, &mut size as *mut Winsize) != 0 } {
         println("ioctl failed");
         return 1;
     }
 
-    var world = World::random(size.cols as i64, size.rows as i64, gpa);
-    var frame = String::new_in(gpa);
+    let mut world = World::random(size.cols as usize, size.rows as usize, gpa);
+    let mut frame = String::new_in(gpa);
     print("\x1B[?25l");
     loop {
-        world.render(&frame);
-        write_all(frame.as_slice());
+        world.render(&mut frame);
+        write_all(frame.as_bytes());
         world.step();
     }
 }
