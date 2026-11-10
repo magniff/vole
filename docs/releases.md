@@ -139,14 +139,14 @@ std2 (sc280b):
 
 The translator and the migration of tests/run (mig28):
 
-- **tests/run's MVS cases move to the rust edition.** There were 2873
+- **tests/run's MVS cases move to the rust edition.** There were 2872
   cases without `// EDITION: rust`:
   - 1900 are translated by `fix --edition rust`, or by hand where its
     output fell short, and pass at -O0 and -O2. An error case's `ERROR`
     lines name the rust edition's code at the translation's position. An
     ownership case is kept only where rustc rejects it too, with the
     same code (the borrowck twin).
-  - 820 are translated and marked `// XFAIL: gap N: REASON`. N names
+  - 819 are translated and marked `// XFAIL: gap N: REASON`. N names
     what they wait on: the translator, the front or std2 (the groups
     are in the case's line). An XFAIL case that comes to pass fails the
     run (XPASS), so the line goes as soon as its gap closes. Where rustc
@@ -256,6 +256,19 @@ group, 12 cases of the views audit):
 - Known gap: there is no rvalue static promotion yet (D6.2.2). `&7` and
   `[&7]` have the body's storage, not `'static`, so
   `rust_b_unsized_err_raw_slice_invariant` borrows a static instead.
+
+The front for the rust edition (front280):
+
+- **Types print the way rustc spells them.** A rust-edition program's
+  messages printed MVS's words: `&T` as 'let T', `&mut T` as 'inout
+  T', and the views `&[T]` and `&str` as '[T]' and 'str'. They now print
+  `&T`, `&mut T`, `&[T]`, `&mut [T]`, `&str` and `&mut str`, and an
+  unsized `[T]` or `str` prints without the `&` (front/types.vl
+  buf_type). An MVS program's messages are unchanged. Two gaps remain:
+  a raw pointer still prints as `*T`, because the type does not record
+  const or mut, and no reference prints `&'a T`, because a lifetime is
+  the borrow checker's and not part of the type. 15 cases' `ERROR`
+  lines moved to the new spelling.
 
 ### What's new in 0.27.8
 

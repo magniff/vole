@@ -14,7 +14,7 @@ extracted lines 92-94 of crate::calc::bytes into sum_bytes(t, p) -> i64	calc.vl	
 94	    t
 95	}
 96	
-97	fn sum_bytes(t: sink i64, p: *u8) -> i64 {
+97	fn sum_bytes(mut t: i64, p: *mut u8) -> i64 {
 98	    unsafe {
 // calc.vl:102
 102	        t
@@ -33,9 +33,9 @@ pub fn sum_to(n: i64) -> i64 {
 }
 
 fn sums(n: i64) -> (i64, i64) {
-    var total = 0;
-    var squares = 0;
-    var i = 1;
+    let mut total: i64 = 0;
+    let mut squares: i64 = 0;
+    let mut i: i64 = 1;
     while i <= n {
         total += i;
         squares += i * i;
@@ -49,11 +49,11 @@ fn sums(n: i64) -> (i64, i64) {
 $ refactor extract-function mean_to --lines 45-48 --to add_all --show
 extracted lines 45-48 of crate::calc::mean_to into add_all(i, n, acc) -> i64	calc.vl	+6 -1 lines
 // calc.vl:45-49
-45	    i = add_all(i, n, &acc);
+45	    i = add_all(i, n, &mut acc);
 46	    acc.mean()
 47	}
 48	
-49	fn add_all(i: sink i64, n: i64, acc: inout Acc) -> i64 {
+49	fn add_all(mut i: i64, n: i64, acc: &mut Acc) -> i64 {
 // calc.vl:54
 54	    i
 ## In a method, using self: a method of the same impl.
@@ -134,7 +134,7 @@ exit 0
 $ refactor inline quad
 inlined crate::calc::quad at 1 call, deleted it	2 files	+10 -12 lines
 % git diff main.vl | sed -n '/^@@/,$p'
-@@ -1,9 +1,16 @@
+@@ -1,10 +1,17 @@
  // A program to extract functions from and inline (tests/refactor/code.t).
  mod calc;
  
@@ -153,6 +153,7 @@ inlined crate::calc::quad at 1 call, deleted it	2 files	+10 -12 lines
 +    } + bytes(4);
      if s == 78 { 0 } else { 1 }
  }
+ // EDITION: rust
 $ main.vl -o prog
 ok: built prog
 % ./prog; echo "exit $?"
@@ -174,9 +175,9 @@ $ refactor inline sum_to --at main.vl:7 --dry-run
 @@ -7 +7,12 @@
 -    let s = sum_to(3) + mean_to(5) + first_big(10, 20) + quad(2) + bytes(4);
 +    let s = {
-+        var total = 0;
-+        var squares = 0;
-+        var i = 1;
++        let mut total: i64 = 0;
++        let mut squares: i64 = 0;
++        let mut i: i64 = 1;
 +        while i <= 3 {
 +            total += i;
 +            squares += i * i;

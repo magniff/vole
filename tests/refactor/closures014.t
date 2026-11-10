@@ -38,22 +38,22 @@ try: volec refactor extract-function main --lines 20-21 --to step
 extracted lines 20-21 of crate::main into step(k, total) -> i64
 % sed -n '17,35p' main.vl
 fn main() -> i32 {
-    let k = 3;
-    var total = 0;
+    let k: i64 = 3;
+    let mut total: i64 = 0;
     total = step(k, total);
     total += apply(|y| {
         let z = y + k;
         double(z)
-    }, 2);
+    }, 2i64);
     total += scaled(2, 5);
-    std::print_int(total);
+    print("{}", total);
     println("");
     0
 }
 
-fn step(k: i64, total: sink i64) -> i64 {
+fn step(k: i64, mut total: i64) -> i64 {
     let add = |x: i64| double(x) + k;
-    total += apply(add, 1);
+    total += apply(add, 1i64);
     total
 }
 $ main.vl -o prog
@@ -70,9 +70,9 @@ extracted lines 23-23 of crate::main into shift(y, k) -> i64
     total += apply(|y| {
         let z = shift(y, k);
         double(z)
-    }, 2);
+    }, 2i64);
     total += scaled(2, 5);
-    std::print_int(total);
+    print("{}", total);
     println("");
     0
 }
@@ -91,7 +91,7 @@ undid extracted lines 23-23 of crate::main into shift(y, k) -> i64
 % "$COMPILER" refactor rename main.vl:18:9 kk | cut -f1
 renamed local k to kk in crate::main, 2 uses
 % grep -n kk main.vl
-18:    let kk = 3;
+18:    let kk: i64 = 3;
 20:    let add = |x: i64| double(x) + kk;
 23:        let z = y + kk;
 % "$COMPILER" undo | cut -f1
@@ -107,14 +107,14 @@ renamed crate::double to twice
 inlined crate::twice at 2 calls, deleted it
 % sed -n '13,21p' main.vl
 fn main() -> i32 {
-    let k = 3;
-    var total = 0;
+    let k: i64 = 3;
+    let mut total: i64 = 0;
     let add = |x: i64| x * 2 + k;
-    total += apply(add, 1);
+    total += apply(add, 1i64);
     total += apply(|y| {
         let z = y + k;
         z * 2
-    }, 2);
+    }, 2i64);
 $ main.vl -o prog
 ok: built prog
 % ./prog

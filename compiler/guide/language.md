@@ -385,7 +385,7 @@ diverge unsafe`): `volec query effects f --why io` shows where;
 one to a `sink` parameter moves it (`.clone()` copies). Pass `v` to a
 `v: Vec<T, A>` (let) parameter to read it, `&v` to a `v: inout Vec<T, A>` one
 to let a function push. A slice from `as_slice` views the vector: using it after the
-vector grew or was dropped is an error (`guide views`). std's API,
+vector grew or was dropped is an error (`guide memory#slices`). std's API,
 made from its source in this compiler, a
 line per item: `volec guide std#the-api`; each item with its comment:
 `volec guide std#every-item`; one name: `volec guide --find NAME`.

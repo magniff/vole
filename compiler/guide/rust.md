@@ -68,7 +68,7 @@ value itself.
 | `match &mut x { .. }` | `match &x { .. }`: binds inout accesses |
 | moves, `Clone`, `Copy` | the same idea: an owned value (`Vec`, `Buf`, `HashMap`, a struct holding one) moves; `.clone()` copies; plain values copy (no `Copy` derive) |
 | `Drop`, RAII | dropped at the end of the scope, last first; `impl Drop for T { fn drop(inout self) }`; `drop(x)` |
-| lifetimes `'a`, `fn f<'a>(x: &'a str) -> &'a str` | none: each function's view summary is inferred (`query views NAME`); `#[views(s)]` pins one (`guide views`) |
+| lifetimes `'a`, `fn f<'a>(x: &'a str) -> &'a str` | none: each function's view summary is inferred (`query views NAME`); `#[views(s)]` pins one (`guide memory#slices`) |
 | the borrow checker | the own pass: `own.moved`, `own.conflict`, `own.escape`... each with `try:` lines (`volec explain own.conflict`) |
 | `Box<T>`, `Rc<T>`, `Arc<T>` | none: a `Vec<T, A>`, an index, or `malloc` in `unsafe` |
 | `Vec::new()`, the global allocator | `Vec::new_in(gpa)`: allocation is explicit (0.16); `gpa: Gpa` comes from `fn main(gpa: Gpa)` and is passed down; `arena_scope(gpa, \|a\| ..)` (`guide allocators`) |

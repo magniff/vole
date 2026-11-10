@@ -15,12 +15,12 @@ $ query diff
 --- a/main.vl
 +++ b/main.vl
 @@ -10,3 +10,3 @@
--    var i = 0;
+-    let mut i: i64 = 0;
 -    while i < points.len() as i64 {
--        let p = points.get(i as usize);
-+    var j = 0;
+-        let p = points[i as usize];
++    let mut j: i64 = 0;
 +    while j < points.len() as i64 {
-+        let p = points.get(j as usize);
++        let p = points[j as usize];
 @@ -14 +14 @@
 -        i = i + 1;
 +        j = j + 1;
@@ -46,29 +46,29 @@ $ refactor rename main.vl:30:13 inner --dry-run
 +++ b/main.vl
 @@ -30,2 +30,2 @@
 -        let x = x + 1;
--        std::print_int(x);
+-        print("{}", x);
 +        let inner = x + 1;
-+        std::print_int(inner);
-$ refactor rename main.vl:31:24 inner --dry-run
++        print("{}", inner);
+$ refactor rename main.vl:31:21 inner --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -30,2 +30,2 @@
 -        let x = x + 1;
--        std::print_int(x);
+-        print("{}", x);
 +        let inner = x + 1;
-+        std::print_int(inner);
++        print("{}", inner);
 $ refactor rename main.vl:28:9 n --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -28 +28 @@
--    let x = total(v);
-+    let n = total(v);
+-    let x = total(&v);
++    let n = total(&v);
 @@ -30 +30 @@
 -        let x = x + 1;
 +        let x = n + 1;
 @@ -33 +33 @@
--    std::print_int(twice(x));
-+    std::print_int(twice(n));
+-    print("{}", twice(x));
++    print("{}", twice(n));
 ## The new name is taken in its scope.
 $ refactor rename main.vl:28:9 c
 error refactor.collision: 'c' is already a name in the scope of local x (at main.vl:34:9); nothing written
@@ -79,17 +79,17 @@ $ refactor rename main.vl:28:9 total --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -28 +28 @@
--    let x = total(v);
-+    let total = total(v);
+-    let x = total(&v);
++    let total = total(&v);
 @@ -30 +30 @@
 -        let x = x + 1;
 +        let x = total + 1;
 @@ -33 +33 @@
--    std::print_int(twice(x));
-+    std::print_int(twice(total));
+-    print("{}", twice(x));
++    print("{}", twice(total));
 $ refactor rename total::total p
 error refactor.collision: 'p' is already a name in the scope of local total (at main.vl:12:13); nothing written
-try: volec query show main.vl:9:9
+try: volec query show main.vl:9:13
 [exit 1]
 ## A local of a generic function (and its instances).
 $ refactor rename twice::s sum --dry-run
@@ -107,9 +107,9 @@ $ refactor rename Catalog::add::qty copies --dry-run
 +++ b/catalog.vl
 @@ -12,2 +12,2 @@
 -    // Adds `qty` copies of the book `id`; see `Catalog::total`.
--    pub fn add(inout self, id: i64, qty: i64) -> i64 {
+-    pub fn add(&mut self, id: i64, qty: i64) -> i64 {
 +    // Adds `copies` copies of the book `id`; see `Catalog::total`.
-+    pub fn add(inout self, id: i64, copies: i64) -> i64 {
++    pub fn add(&mut self, id: i64, copies: i64) -> i64 {
 @@ -18,2 +18,2 @@
 -                // `qty` more; `Item::qty` is the count.
 -                it.qty += qty;
@@ -141,8 +141,8 @@ $ refactor rename main.vl:13:26 surface --dry-run
 -pub fn area(p: Point) -> i64 {
 +// The `surface` of p: x times y.
 +pub fn surface(p: Point) -> i64 {
-$ refactor rename main.vl:31:14 show
-error edit.not-source: std::fmt::print_int is not in a file of the program
+$ refactor rename main.vl:31:9 show
+error edit.not-source: std::fmt is not in a file of the program
 [exit 1]
 ## ---- the mentions in comments ----
 ## A field: only `Item.qty`, `Item::qty` mentions, not the parameter's
@@ -171,8 +171,8 @@ $ refactor rename Item.qty copies --dry-run
 -    // The sum of `Item.qty`.
 +    // The sum of `Item.copies`.
 @@ -33 +33 @@
--            n += self.items.get(k).qty;
-+            n += self.items.get(k).copies;
+-            n += self.items[k].qty;
++            n += self.items[k].copies;
 $ refactor field Item --rename qty copies --dry-run
 --- a/catalog.vl
 +++ b/catalog.vl
@@ -197,8 +197,8 @@ $ refactor field Item --rename qty copies --dry-run
 -    // The sum of `Item.qty`.
 +    // The sum of `Item.copies`.
 @@ -33 +33 @@
--            n += self.items.get(k).qty;
-+            n += self.items.get(k).copies;
+-            n += self.items[k].qty;
++            n += self.items[k].copies;
 ## An item: a bare `area` is left alone in a function with a parameter
 ## named area (and its comment); `total` above fn total too (a local).
 $ refactor rename geom::area surface --dry-run
@@ -224,8 +224,8 @@ $ refactor rename crate::total sum --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -8 +8 @@
--fn total(points: Vec<Point, Gpa>) -> i64 {
-+fn sum(points: Vec<Point, Gpa>) -> i64 {
+-fn total(points: &Vec<Point, Gpa>) -> i64 {
++fn sum(points: &Vec<Point, Gpa>) -> i64 {
 @@ -28 +28 @@
--    let x = total(v);
-+    let x = sum(v);
+-    let x = total(&v);
++    let x = sum(&v);

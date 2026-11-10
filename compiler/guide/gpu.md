@@ -243,7 +243,7 @@ at `dev.buffer`, 0.25.3): `MAP_READ` goes with `COPY_DST` alone,
 COPY_SRC` buffer, copied (`enc.copy_buffer`) into a `MAP_READ |
 COPY_DST` one that is mapped (the compute examples below).
 
-A mapped buffer is a view (`guide views`): `let b = buf.map_read(dev);`
+A mapped buffer is a view (`guide memory#slices`): `let b = buf.map_read(dev);`
 waits for the GPU and views the buffer's bytes (`gpu::f32s(b)`,
 `u32s`, `i32s`: the same bytes as numbers, still a view of `buf`). The
 buffer stays **mapped until `buf.unmap(dev)`**, and nothing writes a

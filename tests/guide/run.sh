@@ -49,6 +49,13 @@ LC_ALL=C
 VOLE_STD2=0
 export VOLE_STD2
 export LC_ALL
+# (0.28.0) The topics whose examples are the rust edition's, all of their
+# blocks: each is compiled with --edition rust, on std2 (VOLE_STD2=1),
+# and --split writes its prog.vl with `// EDITION: rust` first (the twin's
+# guide programs). A topic moves here when its examples are translated
+# (0.28.0 workstream C); the others are MVS's until then.
+RUST_TOPICS=" cli closures contracts conversions debug fmt formatting generics io iterators math memory modules syntax text threads traits unsafe "
+rust_topic() { case "$RUST_TOPICS" in *" $1 "*) echo 1 ;; *) echo 0 ;; esac; }
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -83,7 +90,7 @@ RESULTS="$WORK/results"
 # under $WORK/blocks: prog.vl (wrapped as its kind needs), and, when an
 # out or err block follows, out (with exit) or err.
 split_blocks() {
-    awk -v topic="$2" -v dir="$WORK/blocks" '
+    awk -v topic="$2" -v dir="$WORK/blocks" -v rust="$(rust_topic "$2")" -v splitting="${SPLIT:+1}" '
         function flush_pending() { pending = "" }
         function item_line(l) {
             return l ~ /^(pub |fn |struct |enum |union |impl|trait |const |static |type |use |mod |import |extern |unsafe fn |#\[|}|\/\/|$)/
@@ -114,9 +121,11 @@ split_blocks() {
                         system("mkdir -p \"" proj "\"")
                         printf "%s\n", topic ":" start > (proj "/name")
                         close(proj "/name")
+                        if (rust) { print "rust" > (proj "/edition"); close(proj "/edition") }
                     }
                     fname = substr(lang, 6)
                     f = proj "/" (fname == "main.vl" ? "prog.vl" : fname)
+                    if (rust && splitting && fname == "main.vl") print "// EDITION: rust" > f
                     for (i = 1; i <= nbody; i++) print b[i] > f
                     close(f)
                     pending = proj
@@ -134,6 +143,7 @@ split_blocks() {
                     system("mkdir -p \"" d "\"")
                     printf "%s\n", name > (d "/name")
                     close(d "/name")
+                    if (rust) { print "rust" > (d "/edition"); close(d "/edition") }
                     # the kind: program, items or statements
                     kind = "items"
                     for (i = 1; i <= nbody; i++) {
@@ -144,6 +154,7 @@ split_blocks() {
                             if (b[i] !~ /^[ \t]/ && !item_line(b[i])) { kind = "stmts"; break }
                     }
                     f = d "/prog.vl"
+                    if (rust && splitting) print "// EDITION: rust" > f
                     if (kind == "program" || kind == "items") {
                         for (i = 1; i <= nbody; i++) print b[i] > f
                         if (kind == "items") print "fn main() -> i32 { 0 }" > f
@@ -195,8 +206,12 @@ trimmed() {
 check_block() {
     d=$1
     name=$(cat "$d/name")
+    # (0.28.0) a rust topic's block: --edition rust, on std2
+    ed=""
+    std2=0
+    if [ -f "$d/edition" ]; then ed="--edition rust"; std2=1; fi
     if [ -f "$d/err" ]; then
-        "$COMPILER" --syntax=0.20 --deny-warnings --diagnostics=short "$d/prog.vl" -o "$d/prog" >"$d/compile.out" 2>&1
+        VOLE_STD2=$std2 "$COMPILER" --syntax=0.20 $ed --deny-warnings --diagnostics=short "$d/prog.vl" -o "$d/prog" >"$d/compile.out" 2>&1
         rc=$?
         if [ $rc -ne 1 ]; then
             { echo "FAIL $name: expected a compile error (exit 1), got exit $rc"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
@@ -222,7 +237,7 @@ check_block() {
         if [ "$HOST" = Darwin-arm64 ]; then
             link="-l objc"
         else
-            if (cd "$d" && "$COMPILER" --syntax=0.20 --deny-warnings --diagnostics=short main.vl -o prog.o) >"$d/compile.out" 2>&1; then
+            if (cd "$d" && VOLE_STD2=$std2 "$COMPILER" --syntax=0.20 $ed --deny-warnings --diagnostics=short main.vl -o prog.o) >"$d/compile.out" 2>&1; then
                 echo "pass $name" >"$d/result"
             else
                 { echo "FAIL $name: does not compile"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
@@ -230,14 +245,14 @@ check_block() {
             return
         fi
     fi
-    if ! (cd "$d" && "$COMPILER" --syntax=0.20 --deny-warnings --diagnostics=short main.vl $link -o prog) >"$d/compile.out" 2>&1; then
+    if ! (cd "$d" && VOLE_STD2=$std2 "$COMPILER" --syntax=0.20 $ed --deny-warnings --diagnostics=short main.vl $link -o prog) >"$d/compile.out" 2>&1; then
         { echo "FAIL $name: does not compile"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
         return
     fi
     # (0.25.4) A program's #[test]s are left out of its build: `volec
     # test` runs them, at -O0 and -O2, and they must pass.
     if grep -q '^#\[test\]' "$d"/*.vl; then
-        if ! (cd "$d" && "$COMPILER" test main.vl) >"$d/test.out" 2>&1; then
+        if ! (cd "$d" && VOLE_STD2=$std2 "$COMPILER" test $ed main.vl) >"$d/test.out" 2>&1; then
             { echo "FAIL $name: its #[test]s fail (volec test main.vl)"; sed 's/^/    /' "$d/test.out"; } >"$d/result"
             return
         fi
@@ -330,7 +345,7 @@ if ! "$COMPILER" guide --list >"$WORK/list" 2>&1; then
     result FAIL guide-list "volec guide --list failed:" "$(cat "$WORK/list")"
 fi
 missing=""
-for t in core language rust syntax types std errors unsafe c-interop arch modules generics traits closures iterators conversions formatting memory views tools gpu; do
+for t in core language rust syntax types std errors unsafe c-interop arch modules generics traits closures iterators conversions formatting memory tools gpu; do
     awk -F '\t' -v t="$t" '$1 == t { found = 1 } END { exit !found }' "$WORK/list" || missing="$missing $t"
 done
 if [ -n "$missing" ]; then
@@ -484,8 +499,8 @@ fi
 # section; TOPIC# the sections; --budget cuts any of it, with a note.
 "$COMPILER" guide --find read a line >"$WORK/find.out" 2>"$WORK/find.err"
 rc=$?
-if [ $rc -eq 0 ] && head -1 "$WORK/find.out" | grep -q '^# std#input$' \
-    && grep -q 'read_line(&buf)' "$WORK/find.out" \
+if [ $rc -eq 0 ] && head -1 "$WORK/find.out" | grep -q '^# conversions#reading-input$' \
+    && grep -qF 'read_line(&mut s)' "$WORK/find.out" \
     && [ "$(wc -c <"$WORK/find.out" | tr -d ' ')" -le 4000 ]; then
     result pass guide-find
 else
@@ -495,8 +510,8 @@ fi
 # command that prints its section.
 "$COMPILER" guide --find read a line --budget 5 >"$WORK/over.out" 2>"$WORK/over.err"
 rc=$?
-if [ $rc -eq 0 ] && [ "$(cat "$WORK/over.out")" = "# std#input" ] \
-    && grep -q '^try: .* guide std#input$' "$WORK/over.err"; then
+if [ $rc -eq 0 ] && [ "$(cat "$WORK/over.out")" = "# conversions#reading-input" ] \
+    && grep -q '^try: .* guide conversions#reading-input$' "$WORK/over.err"; then
     result pass guide-find-over
 else
     result FAIL guide-find-over "exit $rc:" "$(cat "$WORK/over.out")" "$(cat "$WORK/over.err")"
@@ -531,13 +546,13 @@ if [ -z "$missed" ]; then
 else
     result FAIL guide-find-arch "not first on guide arch:$missed"
 fi
-# (0.20) The words of the parameter conventions, and Rust's for them,
-# land on the sections that teach them.
+# (0.20) The words of borrowing land on the sections that teach them
+# (0.28.0: memory's borrowing, the rust edition's; MVS's inout and sink
+# are gone from it).
 missed=""
-# (a Rust spelling: memory's conventions or rust's mapping of them)
-for pair in 'inout:memory#conventions' 'sink:memory#conventions' 'borrow:memory#conventions' \
-    'mutable reference:(memory#conventions|rust#parameters)' '&mut:(memory#conventions|rust#parameters)' \
-    'let mut:(memory#conventions|rust#parameters)' 'move closure:closures#sink-closures'; do
+for pair in 'borrow:memory#borrowing' \
+    'mutable reference:(memory#borrowing|rust#parameters)' '&mut:(memory#borrowing|rust#parameters)' \
+    'let mut:(memory#borrowing|rust#parameters)' 'move closure:closures#move-closures'; do
     w=${pair%%:*}
     want=${pair#*:}
     "$COMPILER" guide --find $w 2>/dev/null | head -1 >"$WORK/findconv.out"

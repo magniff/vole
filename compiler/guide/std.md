@@ -93,7 +93,7 @@ dropped (freed) at the end of its scope (0.17): no `free` calls.
   `v: inout Vec<T, A>` (called `f(&v)`), one that keeps it `v: sink
   Vec<T, A>` (`f(v)` moves it).
 - A slice from `as_slice()` views the container: the checker rejects its
-  use after the next push, `free` or drop (`volec guide views`).
+  use after the next push, `free` or drop (`volec guide memory#slices`).
 - `get`, `set`, slice indexing and `unwrap` are checked: a failure prints
   a message and exits with 101.
 - `HashMap` keys need `Hash` and `Eq` (integers, `bool`, `[u8]` have
