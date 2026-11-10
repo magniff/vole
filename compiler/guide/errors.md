@@ -878,7 +878,7 @@ after `v` changes, or one value is lent inout twice at once. Use the
 view before the change, or take it again after; keep an index (`for i
 in 0..v.len() { let x = v[i]; ... }`); copy a plain value out first
 (`let x = v[0];`); `v.swap(i, j)` for two elements; `let n =
-rng.next();` before `rng.big(n)`. `guide views` has the rules.
+rng.next();` before `rng.big(n)`. `guide memory#slices` has the rules.
 
 ```text
 error[own.escape] 'greet' returns a view of 'b', which is dropped when 'greet' returns

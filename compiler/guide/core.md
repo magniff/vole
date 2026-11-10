@@ -171,7 +171,7 @@ one name with its comment: `volec guide --find split_in`.
 | `conv.rust: 'let mut' is Rust's spelling` | the `try:` line's form (`var`, `x: inout T`, `self`, `&x`) |
 | `cannot assign to immutable variable 'a'` | `var a`; a parameter you change: `a: inout T` |
 | `own.moved: 'v' is used here after it moved into 'keep(sink v)'` | lend it (a let parameter), or `keep(v.clone())` |
-| `own.conflict: ... while 'first' views them` | use the view before the change, or take it again after (`guide views`) |
+| `own.conflict: ... while 'first' views them` | use the view before the change, or take it again after (`guide memory#slices`) |
 | `non-exhaustive match: 'E::B' is not covered` | an arm for it, or `_ =>` |
 | `calling a C function is unsafe` | `unsafe { ... }`; `volec fix --only unsafe` adds them |
 | `no 'cmp' in module 'std'` | every std item is `std::name` (its most used names need no `use`) |
