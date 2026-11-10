@@ -1,0 +1,305 @@
+// EDITION: rust
+// std::sync::mpsc: channels between threads. Values sent through any of a
+// channel's Senders come out of its Receiver in the order they were sent.
+// Rust's API, with the allocator the queue grows from:
+//
+//     let (tx, rx) = mpsc::channel_in(gpa);
+//     tx.send(7).unwrap();
+//     let x = rx.recv().unwrap();
+//
+// `send` fails (giving the value back) when the receiver is gone, `recv`
+// when every sender is gone and nothing is left. The shared state is an
+// Arc of a Mutex and a Condvar: no unsafe code here. The queue is two
+// Vecs (an inbox the senders push to, an outbox the receiver pops,
+// refilled from the inbox reversed).
+// mvs: std::sync::mpsc
+
+use crate::alloc::Allocator;
+use crate::clone::Clone;
+use crate::fmt::{Debug, Display, Formatter};
+use crate::iter::{IntoIterator, Iterator};
+use crate::ops::{DerefMut, Drop};
+use crate::option::Option;
+use crate::result::Result;
+use crate::sync::{Arc, Condvar, Mutex};
+use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crate::vec::Vec;
+
+struct Queue<T, A: Allocator> {
+    inbox: Vec<T, A>,
+    outbox: Vec<T, A>,
+}
+
+impl<T, A: Allocator> Queue<T, A> {
+    fn pop(&mut self) -> Option<T> {
+        if self.outbox.is_empty() {
+            while let Option::Some(x) = self.inbox.pop() {
+                self.outbox.push(x);
+            }
+        }
+        self.outbox.pop()
+    }
+}
+
+struct Chan<T, A: Allocator> {
+    queue: Mutex<Queue<T, A>>,
+    // Notified by each send and by the last sender's drop.
+    ready: Condvar,
+    senders: AtomicUsize,
+    receiving: AtomicBool,
+}
+
+// The sending end; clone it for more senders.
+pub struct Sender<T, A: Allocator> {
+    chan: Arc<Chan<T, A>, A>,
+}
+
+// The receiving end.
+pub struct Receiver<T, A: Allocator> {
+    chan: Arc<Chan<T, A>, A>,
+}
+
+// send's error: the receiver is gone; the value comes back (`e.0`).
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub struct SendError<T>(pub T);
+
+impl<T> Debug for SendError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        f.write_str("SendError { .. }")
+    }
+}
+
+impl<T> Display for SendError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        f.write_str("sending on a closed channel")
+    }
+}
+
+// recv's error: every sender is gone and the channel is empty.
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub struct RecvError;
+
+impl Display for RecvError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        f.write_str("receiving on a closed channel")
+    }
+}
+
+// try_recv's error: nothing is there now (Empty), or ever will be
+// (Disconnected: every sender is gone).
+// std2: changed: Rust's TryRecvError (MVS: try_recv gave an Option)
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum TryRecvError {
+    Empty,
+    Disconnected,
+}
+
+impl Display for TryRecvError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        match self {
+            TryRecvError::Empty => f.write_str("receiving on an empty channel"),
+            TryRecvError::Disconnected => {
+                f.write_str("receiving on an empty and disconnected channel")
+            }
+        }
+    }
+}
+
+// A channel; its two ends. The queue and the shared state are on a
+// (Rust's `channel()`).
+// std2: changed: any allocator that is Clone (MVS: Gpa)
+#[effects(T, A)]
+pub fn channel_in<T, A: Allocator + Clone>(a: A) -> (Sender<T, A>, Receiver<T, A>) {
+    let chan = Arc::new_in(Chan {
+        queue: Mutex::new(Queue { inbox: Vec::new_in(a.clone()), outbox: Vec::new_in(a.clone()) }),
+        ready: Condvar::new(),
+        senders: AtomicUsize::new(1),
+        receiving: AtomicBool::new(true),
+    }, a);
+    (Sender { chan: chan.clone() }, Receiver { chan: chan })
+}
+
+impl<T, A: Allocator> Sender<T, A> {
+    // Sends x; Err(x back) when the receiver is gone.
+    #[effects(io, sync, panic, diverge, T, A)]
+    pub fn send(&self, x: T) -> Result<(), SendError<T>> {
+        let mut q = match self.chan.queue.lock() {
+            Result::Ok(g) => g,
+            Result::Err(e) => e.into_inner(),
+        };
+        if !self.chan.receiving.load(Ordering::Relaxed) {
+            return Result::Err(SendError(x));
+        }
+        q.deref_mut().inbox.push(x);
+        crate::mem::drop(q);
+        self.chan.ready.notify_one();
+        Result::Ok(())
+    }
+}
+
+impl<T, A: Allocator + Clone> Clone for Sender<T, A> {
+    fn clone(&self) -> Sender<T, A> {
+        self.chan.senders.fetch_add(1, Ordering::Relaxed);
+        Sender { chan: self.chan.clone() }
+    }
+}
+
+impl<T, A: Allocator> Drop for Sender<T, A> {
+    fn drop(&mut self) {
+        if self.chan.senders.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // (the last one: a receiver that waits learns it. Under the
+            // lock, so that it is not between its test and its sleep.)
+            let q = match self.chan.queue.lock() {
+                Result::Ok(g) => g,
+                Result::Err(e) => e.into_inner(),
+            };
+            crate::mem::drop(q);
+            self.chan.ready.notify_all();
+        }
+    }
+}
+
+impl<T, A: Allocator> Debug for Sender<T, A> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        f.write_str("Sender { .. }")
+    }
+}
+
+impl<T, A: Allocator> Receiver<T, A> {
+    // The next value, waiting for one; Err when every sender is gone and
+    // nothing is left.
+    #[effects(io, sync, panic, diverge, T, A)]
+    pub fn recv(&self) -> Result<T, RecvError> {
+        let mut q = match self.chan.queue.lock() {
+            Result::Ok(g) => g,
+            Result::Err(e) => e.into_inner(),
+        };
+        loop {
+            match q.deref_mut().pop() {
+                Option::Some(x) => return Result::Ok(x),
+                Option::None => {}
+            }
+            if self.chan.senders.load(Ordering::Acquire) == 0 {
+                return Result::Err(RecvError);
+            }
+            q = match self.chan.ready.wait(q) {
+                Result::Ok(g) => g,
+                Result::Err(e) => e.into_inner(),
+            };
+        }
+    }
+
+    // The next value if there is one now.
+    #[effects(io, sync, panic, diverge, T, A)]
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        let mut q = match self.chan.queue.lock() {
+            Result::Ok(g) => g,
+            Result::Err(e) => e.into_inner(),
+        };
+        match q.deref_mut().pop() {
+            Option::Some(x) => Result::Ok(x),
+            Option::None => {
+                if self.chan.senders.load(Ordering::Acquire) == 0 {
+                    Result::Err(TryRecvError::Disconnected)
+                } else {
+                    Result::Err(TryRecvError::Empty)
+                }
+            }
+        }
+    }
+
+    // The values, until every sender is gone: `for x in rx.iter()`.
+    #[effects()]
+    pub fn iter(&self) -> Iter<'_, T, A> {
+        Iter { rx: self }
+    }
+
+    // The values that are there now, without waiting.
+    #[effects()]
+    pub fn try_iter(&self) -> TryIter<'_, T, A> {
+        TryIter { rx: self }
+    }
+}
+
+impl<T, A: Allocator> Drop for Receiver<T, A> {
+    fn drop(&mut self) {
+        let q = match self.chan.queue.lock() {
+            Result::Ok(g) => g,
+            Result::Err(e) => e.into_inner(),
+        };
+        self.chan.receiving.store(false, Ordering::Relaxed);
+        crate::mem::drop(q);
+    }
+}
+
+impl<T, A: Allocator> Debug for Receiver<T, A> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        f.write_str("Receiver { .. }")
+    }
+}
+
+// Receiver::iter's iterator: recv until it fails.
+pub struct Iter<'a, T, A: Allocator> {
+    rx: &'a Receiver<T, A>,
+}
+
+impl<'a, T, A: Allocator> Iterator for Iter<'a, T, A> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        match self.rx.recv() {
+            Result::Ok(x) => Option::Some(x),
+            Result::Err(_) => Option::None,
+        }
+    }
+}
+
+// Receiver::try_iter's iterator: try_recv until it fails.
+pub struct TryIter<'a, T, A: Allocator> {
+    rx: &'a Receiver<T, A>,
+}
+
+impl<'a, T, A: Allocator> Iterator for TryIter<'a, T, A> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        match self.rx.try_recv() {
+            Result::Ok(x) => Option::Some(x),
+            Result::Err(_) => Option::None,
+        }
+    }
+}
+
+// `for x in rx`: the Receiver's values, the Receiver owned.
+pub struct IntoIter<T, A: Allocator> {
+    rx: Receiver<T, A>,
+}
+
+impl<T, A: Allocator> Iterator for IntoIter<T, A> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        match self.rx.recv() {
+            Result::Ok(x) => Option::Some(x),
+            Result::Err(_) => Option::None,
+        }
+    }
+}
+
+impl<T, A: Allocator> IntoIterator for Receiver<T, A> {
+    type Item = T;
+    type IntoIter = IntoIter<T, A>;
+
+    fn into_iter(self) -> IntoIter<T, A> {
+        IntoIter { rx: self }
+    }
+}
+
+impl<'a, T, A: Allocator> IntoIterator for &'a Receiver<T, A> {
+    type Item = T;
+    type IntoIter = Iter<'a, T, A>;
+
+    fn into_iter(self) -> Iter<'a, T, A> {
+        Iter { rx: self }
+    }
+}
