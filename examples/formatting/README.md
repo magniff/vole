@@ -95,7 +95,7 @@ in a `String`:
 
 ```tach
 let mut line = format_in("{:04x}  ", n * 8, gpa); // format_in: a new String to keep
-for i in 0..8 {
+for i in 0..8usize {
     if i < chunk.len() { write(&mut line, "{:02x} ", chunk[i]).unwrap(); }
     else { line.push_str("   "); }
 }
