@@ -13,7 +13,7 @@
 > @change main.vl main-broken
 > {"jsonrpc":"2.0","id":4,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":9,"character":4}}}
 < {"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file://@DIR@/main.vl","diagnostics":[{"range":{"start":{"line":7,"character":12},"end":{"line":7,"character":16}},"severity":1,"code":"type error","source":"volec","message":"undefined variable 'aera'\nhelp: did you mean 'area'?","relatedInformation":[{"location":{"uri":"file://@DIR@/main.vl","range":{"start":{"line":7,"character":12},"end":{"line":7,"character":16}}},"message":"try: volec fix --suggested @DIR@/main.vl"}]}]}}
-< {"jsonrpc":"2.0","id":4,"result":{"uri":"file://@DIR@/main.vl","range":{"start":{"line":8,"character":8},"end":{"line":8,"character":9}}}}
+< {"jsonrpc":"2.0","id":4,"result":{"uri":"file://@DIR@/main.vl","range":{"start":{"line":8,"character":12},"end":{"line":8,"character":13}}}}
 > {"jsonrpc":"2.0","id":5,"method":"shutdown"}
 < {"jsonrpc":"2.0","id":5,"result":null}
 > {"jsonrpc":"2.0","method":"exit"}
