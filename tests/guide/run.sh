@@ -54,7 +54,7 @@ export LC_ALL
 # and --split writes its prog.vl with `// EDITION: rust` first (the twin's
 # guide programs). A topic moves here when its examples are translated
 # (0.28.0 workstream C); the others are MVS's until then.
-RUST_TOPICS=" cli closures contracts fmt generics io math memory modules unsafe "
+RUST_TOPICS=" cli closures contracts conversions debug fmt formatting generics io iterators math memory modules syntax text threads traits unsafe "
 rust_topic() { case "$RUST_TOPICS" in *" $1 "*) echo 1 ;; *) echo 0 ;; esac; }
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -345,7 +345,7 @@ if ! "$COMPILER" guide --list >"$WORK/list" 2>&1; then
     result FAIL guide-list "volec guide --list failed:" "$(cat "$WORK/list")"
 fi
 missing=""
-for t in core language rust syntax types std errors unsafe c-interop arch modules generics traits closures iterators conversions formatting memory views tools gpu; do
+for t in core language rust syntax types std errors unsafe c-interop arch modules generics traits closures iterators conversions formatting memory tools gpu; do
     awk -F '\t' -v t="$t" '$1 == t { found = 1 } END { exit !found }' "$WORK/list" || missing="$missing $t"
 done
 if [ -n "$missing" ]; then
@@ -499,8 +499,8 @@ fi
 # section; TOPIC# the sections; --budget cuts any of it, with a note.
 "$COMPILER" guide --find read a line >"$WORK/find.out" 2>"$WORK/find.err"
 rc=$?
-if [ $rc -eq 0 ] && head -1 "$WORK/find.out" | grep -q '^# std#input$' \
-    && grep -q 'read_line(&buf)' "$WORK/find.out" \
+if [ $rc -eq 0 ] && head -1 "$WORK/find.out" | grep -q '^# conversions#reading-input$' \
+    && grep -qF 'read_line(&mut s)' "$WORK/find.out" \
     && [ "$(wc -c <"$WORK/find.out" | tr -d ' ')" -le 4000 ]; then
     result pass guide-find
 else
@@ -510,8 +510,8 @@ fi
 # command that prints its section.
 "$COMPILER" guide --find read a line --budget 5 >"$WORK/over.out" 2>"$WORK/over.err"
 rc=$?
-if [ $rc -eq 0 ] && [ "$(cat "$WORK/over.out")" = "# std#input" ] \
-    && grep -q '^try: .* guide std#input$' "$WORK/over.err"; then
+if [ $rc -eq 0 ] && [ "$(cat "$WORK/over.out")" = "# conversions#reading-input" ] \
+    && grep -q '^try: .* guide conversions#reading-input$' "$WORK/over.err"; then
     result pass guide-find-over
 else
     result FAIL guide-find-over "exit $rc:" "$(cat "$WORK/over.out")" "$(cat "$WORK/over.err")"

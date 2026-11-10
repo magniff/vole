@@ -1,122 +1,59 @@
-# Conversions and errors (0.15)
+# Conversions and errors
 
-Widening between integers, `From`/`Into`, the `?` operator, `main`
-returning a `Result`, and std's convention for failure: Option means
-absent, Result means failed.
+Integer conversions, `From`/`Into`, the `?` operator, and std's
+convention for failure: Option means absent, Result means failed.
 
-## Widening
+## Integers
 
-A narrower integer becomes a wider one where a value of the wider type
-is expected: `let x: T = v`, assignment and `+=`, arguments, `return`,
-a block's last value, struct fields, variant payloads, array and tuple
-elements. It is lossless, so it is implicit; nothing else is:
+`x as T` converts between any number types (truncating, wrapping or
+saturating as Rust's `as` does); `i64::from(x)` widens losslessly
+(`From` holds for every widening: `i8 -> i16 -> i32 -> i64`, `u8 -> u16
+-> u32 -> u64`, unsigned to a strictly wider signed type).
 
-- it widens: `i8 -> i16 -> i32 -> i64` and `u8 -> u16 -> u32 -> u64`
-  (the same signedness), and unsigned to a strictly wider signed type
-  (`u8 -> i16`, `u32 -> i64`); `usize` and `isize` are 64-bit types of
-  their own (0.26.2): `u8`..`u32` widen to `usize`, `i8`..`i32` and
-  `u8`..`u32` to `isize`, and `usize`/`u64` (`isize`/`i64`) take `x as T`
-  or `T::try_from(x)` (a `Result`, `Err(TryFromIntError)` when the value
-  does not fit);
-- it never converts int to float, `bool` to int, signed to unsigned, or
-  to a narrower type: write `x as T`;
-- it applies to a value, never inside another type: `*i32`, `[i32]`,
-  `Vec<i32, Gpa>`, `fn(i32)` stay what they are.
-
-Where two integer types meet without an expected type (the operands of
-`+` or `<`, the branches of `if` and `match`, two arguments for one
-type parameter), the result is the wider one, if one widens to the
-other: `a_i32 + b_i64` is an `i64`, `max(a_i32, b_i64)` is
-`max::<i64>`. An expected type flows into the arithmetic, as it does for
-literals: `let t: i64 = a_i32 * b_i32` multiplies in `i64`, so the
-product cannot overflow `i32` first (C's bug, avoided).
-
-```vole
-fn total(xs: [i32]) -> i64 {
-    var t: i64 = 0;
-    for x in xs { t += x; }              // each i32 widens
-    t
-}
-
-fn main() -> i32 {
-    let a: i32 = 2000000000;
-    let b: i32 = 2000000000;
-    let wide: i64 = a + b;               // computed in i64
-    let c: u32 = 1200;
-    let xs = [1i32, 2, 3];
-    std::print_int(wide);
-    print(" ");
-    std::print_int(total(xs[..]) + c);   // u32 + i64: an i64
-    println("");
-    0
-}
-```
-```out
-4000000000 1206
-```
+vole also widens by itself, where rustc says E0308: an `i32` where an
+`i64` goes, and two integer operands of different widths join to the
+wider (`a_i32 + b_i64` is an `i64`). Code meant to build with rustc too
+writes the `from` or the `as`, as the block below does. An index may be
+any integer type (rustc's: `usize` only).
 
 ## From and Into
 
-Traits may have type parameters (0.15): `trait From<T> { fn from(x: T)
--> Self; }` is std's. A type can implement it for several `T`s, one
-impl per trait, arguments and type; `T::from(x)` picks the impl by the
-type of `x`.
-
-```vole
-struct Celsius { deg: i64 }
-struct Fahrenheit { deg: i64 }
-
-impl From<Celsius> for Fahrenheit {
-    fn from(c: Celsius) -> Fahrenheit { Fahrenheit { deg: c.deg * 9 / 5 + 32 } }
-}
-
-fn main() -> i32 {
-    let f = Fahrenheit::from(Celsius { deg: 100 });
-    let g: Fahrenheit = Celsius { deg: -40 }.into();   // Into: From backwards
-    let n = i64::from(7i32);                           // widening is a From too
-    std::print_int(f.deg);
-    print(" ");
-    std::print_int(g.deg);
-    print(" ");
-    std::print_int(n);
-    println("");
-    0
-}
-```
-```out
-212 -40 7
-```
-
-- Implement `From`, never `Into`: `x.into()` is `U::from(x)` with `U`
-  the type expected there (`let y: U = x.into();`); without one it is an
-  error. `t: Into<U>` holds when `U: From<t>`.
-- `From` is there without an impl for the identity and for every
-  widening (`i64::from(x_i32)` is a cast).
-- Bounds take arguments: `fn f<T: From<i64>>(n: i64) -> T { T::from(n) }`.
-- Restrictions of generic traits: no default bodies; the operator traits
-  (`Add`, ...) stay without parameters; an impl names concrete types or
-  its own parameters (`impl<T> From<T> for Wrap<T>`).
+`trait From<T> { fn from(x: T) -> Self; }` is std's (Rust's). A type can
+implement it for several `T`s, one impl per trait, arguments and type;
+`T::from(x)` picks the impl by the type of `x`. Implement `From`, never
+`Into`: `x.into()` is `U::from(x)` with `U` the type expected there
+(`let y: U = x.into();`). Bounds take arguments: `fn f<T: From<i64>>(n:
+i64) -> T { T::from(n) }`.
 
 ## The ? operator
 
 `e?` on an `Option<T>` gives the `T`, or returns `None` from the
-function. On a `Result<T, E>` it gives the `T`, or returns `Err`: the
-error as it is when `E` is the function's error type `F`, widened when
-`E` widens to `F`, else `F::from(err)` through an `impl From<E> for F`.
-Inside a closure it returns from the closure (give it `-> T`). The
-drops run, as for `return`.
+function. On a `Result<T, E>` it gives the `T`, or returns
+`Err(F::from(err))`, `F` the function's error type (`From<E> for E`
+holds, so the same type passes). Inside a closure it returns from the
+closure. The drops run, as for `return`. `?` on an Option in a function
+returning a Result needs the error named: `x.ok_or(AppError::Missing)?`.
+Option and Result have Rust's methods (`map`, `and_then`, `ok_or`,
+`unwrap_or`, `unwrap_or_else`, `map_err`, `ok`, `err`, `is_some`...).
 
 ```vole
-use std::ParseIntError;
+use std::str::ParseIntError;
 
+fn total(xs: &[i32]) -> i64 {
+    let mut t: i64 = 0;
+    for x in xs { t += i64::from(*x); }  // each i32 widened by From
+    t
+}
+
+#[derive(Debug)]
 enum AppError { Parse(ParseIntError), Negative(i64) }
 
 impl From<ParseIntError> for AppError {
     fn from(e: ParseIntError) -> AppError { AppError::Parse(e) }
 }
 
-fn checked(s: [u8]) -> Result<i64, AppError> {
-    let n = parse_int(s)?;               // an Err returns Err(AppError::from(e))
+fn checked(s: &str) -> Result<i64, AppError> {
+    let n: i64 = s.parse()?;            // an Err returns Err(AppError::from(e))
     if n < 0 { return Err(AppError::Negative(n)); }
     Ok(n)
 }
@@ -127,91 +64,53 @@ fn half(x: Option<i64>) -> Option<i64> {
 }
 
 fn main() -> i32 {
-    match checked("42") { Ok(n) => std::print_int(n), Err(_) => print("error") }
-    print(" ");
-    match checked("4x") {
-        Err(AppError::Parse(ParseIntError::InvalidDigit(at))) => std::print_int(at),
-        _ => print("?"),
-    }
-    print(" ");
-    match checked("-3") { Err(AppError::Negative(n)) => std::print_int(n), _ => print("?") }
-    print(" ");
-    std::print_int(half(Some(8)).unwrap_or(-1) + half(None).unwrap_or(-1));
-    println("");
+    let a: i32 = 2000000000;
+    let b: i32 = 2000000000;
+    let wide = a as i64 + b as i64;
+    let c: u32 = 1200;
+    let xs = [1i32, 2, 3];
+    println("{wide} {}", total(&xs) + i64::from(c));
+    println("{:?} {:?} {:?} {}", checked("42"), checked("4x"), checked("-3"), half(Some(8)).unwrap_or(-1) + half(None).unwrap_or(-1));
+    match checked("4x") { Err(AppError::Parse(e)) => println("{:?}", e.kind()), _ => {} }
     0
 }
 ```
 ```out
-42 1 -3 3
+4000000000 1206
+Ok(42) Err(Parse(ParseIntError { kind: InvalidDigit })) Err(Negative(-3)) 3
+InvalidDigit
 ```
 
-`?` on an Option in a function returning a Result needs the error
-named: `x.ok_or(AppError::Missing)?`. std's `Option` has `ok_or`, `map`,
-`and_then`, `unwrap_or_else`; `Result` has `map`, `map_err`, `err`,
-`ok`, `unwrap_or_else`.
+- `s.parse::<T>()` (or `let n: T = s.parse()?`) gives a `Result<T,
+  T::Err>`: `ParseIntError` (its `kind()`: `IntErrorKind::Empty`,
+  `InvalidDigit`, `PosOverflow`, `NegOverflow`), `ParseFloatError`,
+  `ParseBoolError`.
+- `main` returns an `i32` (its exit code) or nothing: a
+  `run() -> Result<(), E>` called from main does the work, and main
+  prints the error and returns 1.
 
-## main returning a Result
+## Reading input
 
-`fn main() -> Result<(), E>` with `E: Debug` (`#[derive(Debug)]`): on
-`Err(e)` it prints `Error: ` and `e`'s Debug text on stderr and exits
-with 1, as Rust does.
+`std::io::stdin()` reads standard input: `read_line(&mut s)` appends a
+line to a String (`Ok(0)` at the end), `lines_in(gpa)` iterates over
+them, and `io::read_to_string_in(io::stdin(), gpa)` reads it all
+(`guide io`).
 
 ```vole
-#[derive(Debug)]
-enum ConfigError { Missing, Bad(i64) }
-
-fn port(raw: i64) -> Result<i64, ConfigError> {
-    if raw == 0 { return Err(ConfigError::Missing); }
-    if raw < 0 { return Err(ConfigError::Bad(raw)); }
-    Ok(raw)
-}
-
-fn main() -> Result<(), ConfigError> {
-    let p = port(8080)?;
-    println("port {p}");
-    let q = port(-1)?;
-    println("port {q}");
-    Ok(())
-}
-```
-```out (exit 1)
-port 8080
-Error: Bad(-1)
-```
-
-## std's errors and input
-
-Option means absence (the end of the input, a key not found); a Result
-with an error enum means failure. std's input (0.15):
-
-| function | returns | at the end, on failure |
-|---|---|---|
-| `read_line(&buf)` | `Result<bool, IoError>` | `Ok(false)` at the end; `Err(IoError::Read)` |
-| `read_stdin_in(gpa)` | `Result<Vec<u8, Gpa>, IoError>` | `Err(IoError::Read)` |
-| `parse_int(s)` | `Result<i64, ParseIntError>` | `Empty`, `InvalidDigit(at)` (the byte's index), `Overflow` |
-| `sc.next_int()` | `Result<i64, ScanError>` | `ScanError::End`, `ScanError::Parse(e)` |
-| `sc.next_token()`, `sc.next_line()` | `Option<[u8]>` | `None` at the end |
-
-`pub enum IoError { Read, Write }`, `pub enum ParseIntError { Empty,
-InvalidDigit(i64), Overflow }`, `pub enum ScanError { End,
-Parse(ParseIntError) }`; each has Display and Debug.
-
-```vole
-use std::ScanError;
+use std::io;
 
 fn main(gpa: Gpa) -> i32 {
-    let input = read_stdin_in(gpa).unwrap();
-    var sc = Scanner::new(input.as_slice());
-    var sum = 0;
-    loop {
-        match sc.next_int() {
+    let input = io::read_to_string_in(io::stdin(), gpa).unwrap();
+    let mut sum = 0i64;
+    for tok in input.split_whitespace() {
+        match tok.parse::<i64>() {
             Ok(n) => sum += n,
-            Err(ScanError::End) => break,
-            Err(ScanError::Parse(_)) => println("skipped a token"),
+            Err(e) => println("skipped {tok:?}: {:?}", e.kind()),
         }
     }
-    std::print_int(sum);
-    println("");
+    let mut line = String::new_in(gpa);
+    let n = io::stdin().read_line(&mut line).unwrap();
+    println("{sum} {n}");
     0
 }
 ```
@@ -219,15 +118,6 @@ fn main(gpa: Gpa) -> i32 {
 1 2 x 3
 ```
 ```out
-skipped a token
-6
+skipped "x": InvalidDigit
+6 0
 ```
-
-Code written for 0.14's API (Option and bool results) is moved by
-`volec fix --only std015`: `parse_int(s)` becomes
-`parse_int(s).ok()`, `sc.next_int()` `sc.next_int().ok()`,
-`read_line(b)` `read_line(b).unwrap_or(false)`, `read_stdin()`
-`read_stdin().unwrap()`. All four mean what they meant, but a read
-error, which `read_stdin().unwrap()` now reports (exit 101). (Allocation
-is explicit since 0.16, and a capability since 0.26.3: `guide
-allocators`.)
