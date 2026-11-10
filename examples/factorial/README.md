@@ -50,7 +50,7 @@ The closure's parameter types come from `fold`'s bound, so `|acc, k|`
 needs no annotations. Iterator chains are compiled to the loop you would
 write by hand.
 
-`main` prints each line with an f-string, and reports a disagreement on
+`main` prints each line with a format string, and reports a disagreement on
 stderr with `eprintln` (it never happens: `i64` holds every factorial up
 to 20!).
 
@@ -63,4 +63,4 @@ println("Factorial of {n} == {f}");
 - `if` as an expression, recursion: `volec guide syntax`
 - ranges as iterators, `fold`: `volec guide iterators`
 - closures: `volec guide closures`
-- f-strings, `eprintln`: `volec guide formatting`
+- format strings, `eprintln`: `volec guide formatting`

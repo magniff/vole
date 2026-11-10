@@ -22,50 +22,34 @@ argc: 3
 
 ## How it works
 
-`main` may take C's two parameters. `argv` is a pointer to `argc` C
-strings, each a NUL-terminated `*u8`:
+`std::env::args()` is an iterator over the program's arguments, each a
+`&str`, the program's own name first (C's `argv[0]`):
 
 ```tach
-fn main(argc: i64, argv: **u8) -> i32 {
-    println("argc: {argc}");
-    for i in 0..argc {
-        let arg = unsafe { c_bytes(argv[i]) };
+use std::env;
+
+fn main() -> i32 {
+    println("argc: {}", env::args().count());
+    for arg in env::args() {
         println("-- {arg}");
     }
     0
 }
 ```
 
-Indexing a raw pointer (`argv[i]`) is unchecked, so it is `unsafe`: the
-compiler cannot know that `argv` holds `argc` pointers. A C string becomes
-a vole slice, a pointer and a length, once its length is known; C's
-`strlen` gives it, from the header `string.h`:
-
-```tach
-import "string.h" as c;
-
-unsafe fn c_bytes(s: *u8) -> [u8] {
-    s[0..c::strlen(s) as i64]
-}
-```
-
-`c_bytes` is an `unsafe fn` because its argument must be a valid C string,
-a promise its caller makes by calling it inside `unsafe { }`. The slice
-`s[0..n]` of a raw pointer is how memory from C becomes a `[u8]`, which
-the format string `"-- {arg}"` then prints as text.
+`count()` consumes one iterator, so the loop asks for another; a program
+that needs them twice can keep them, `env::args().collect_in(gpa)` (a
+`Vec<&str, Gpa>`, with `fn main(gpa: Gpa)`).
 
 ## The same with std::cli
 
-`argv` by hand is how a program reaches C's arguments. A program that
-takes flags and options declares them instead, with `std::cli` (0.24),
-which parses them and gives `--help` and the errors for bad arguments:
-[cli](../cli/) is this program with a flag and two options, and no
-`unsafe`.
+A program that takes flags and options declares them instead, with
+`std::cli`, which parses them and gives `--help` and the errors for bad
+arguments: [cli](../cli/) is this program with a flag and two options.
 
 ## Language features
 
-- `main(argc, argv)`, `**u8`: `volec guide types`
-- `unsafe` blocks and `unsafe fn`: `volec guide unsafe`
-- importing a C header, `c::strlen`: `volec guide c-interop`
-- f-strings: `volec guide formatting`
+- `std::env::args()`: `volec guide io`
+- iterators, `count`, `for`: `volec guide iterators`
+- format strings: `volec guide formatting`
 - parsing flags and options instead: `volec guide cli`, [cli](../cli/)

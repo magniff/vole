@@ -35,15 +35,15 @@ fn main() -> i32 {
 - `main` returns the process's exit status. Its last expression, `0`,
   written without a `;`, is the value of the body: there is no `return`.
   `fn main()` with no result type exits with 0 too.
-- `"Hello from vole!"` is a `[u8]`, a slice of bytes (or a `str`, UTF-8
-  text, where one is wanted). A literal needs no allocation; text that
-  grows is built in a `Buf` or a `String`, on an allocator.
+- `"Hello from vole!"` is a `&str`, UTF-8 text. A literal needs no
+  allocation; text that grows is built in a `String`, on an allocator.
 - `println` comes from the prelude, the part of `std` every module sees
-  without a `use`. It prints anything with `Display` (numbers, slices,
-  f-strings) and a newline; `print` leaves the newline out.
+  without a `use`. It takes a format string (`println("{x} {}", y)`,
+  any `Display` value) and adds a newline; `print` leaves the newline
+  out. It is a function: vole has no macros, so no `!`.
 
 ## Language features
 
 - functions, the block's value as the result: `volec guide syntax`
-- string literals as `[u8]` slices: `volec guide types`
+- string literals, `&str`: `volec guide text`
 - the prelude (`println`, `print`, `Vec`, `Option`, ...): `volec guide modules`

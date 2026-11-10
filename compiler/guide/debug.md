@@ -94,7 +94,7 @@ depends on the line:
 | opens a block (`} else {`, `X => {`, `fn f(x: T) {`) | runs at the start of that block |
 
 Values are printed by type. Integers, floats and bool print as values,
-`&str`, `String` and `&[u8]` quoted, arrays and slices up to 16 elements, `Option` and tuples
+`&str` and `String` quoted, arrays and slices up to 16 elements, `Option` and tuples
 element by element, pointers as addresses. A struct uses Debug when it
 has it, else prints field by field. The program is built from copies of
 its files with the probes written in (`--overlay`), so line numbers stay

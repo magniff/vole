@@ -1,14 +1,14 @@
-# vole, the core (vole 0.20)
+# vole, the core (vole 0.28)
 
-Vole is a compiled systems language of values: a value has one
-owner, is copied or moved, and is dropped at the end of its scope. A
-function says what it does with each argument: reads it (`let`, the
-default), changes it (`inout`, marked `&x` at the call) or takes it
-(`sink`). There are no references to store or lifetimes to write; views
-(slices, structs holding one) are checked to stay inside what they view.
-Nothing allocates without an allocator, indexing is checked, and safe
-code has no undefined behaviour. This page is the core; the rest is on
-demand (the end). From Rust: `volec guide rust` has the mapping.
+Vole is a compiled systems language with Rust's surface: its syntax,
+ownership (a value has one owner, moves or is copied, and is dropped at
+the end of its scope), references (`&T`, `&mut T`) checked by a borrow
+checker, traits, generics and std's names. It differs in a few places:
+no macros (`println("{x}")` is a function), and nothing allocates
+without an allocator, which is written in the type (`Vec<i64, Gpa>`) and
+passed to what allocates (`Vec::new_in(gpa)`). Indexing is checked, and
+safe code has no undefined behaviour. This page is the core; the rest is
+on demand (the end). Every difference from Rust: `volec guide rust`.
 
 ## Build and run
 
@@ -16,64 +16,65 @@ demand (the end). From Rust: `volec guide rust` has the mapping.
 volec run < in.txt                         # ./main.vl built (when changed), run
 volec main.vl -o prog                      # the executable; `mod x;` loads x.vl
 volec check main.vl                        # every error, one line each
-volec try 'parse_int("42")'                  # a snippet: its TYPE = VALUE
+volec try '"42".parse::<i64>()'            # a snippet: its TYPE = VALUE
 ```
 
 ## The language in one program
 
 ```vole
 import "stdio.h" as c;                 // a C header; its names under c::
-use std::is_digit;                     // std items by name (never *)
+use std::fmt::Write;
+use std::collections::HashMap;         // std items by name (never *)
 
 struct P { x: i64 }
 
 impl P {
-    fn bump(inout self) { self.x += 1; }   // inout self: changes the caller's P
-    fn get(self) -> i64 { self.x }         // self (let): reads it
+    fn bump(&mut self) { self.x += 1; }    // &mut self: changes the caller's P
+    fn get(&self) -> i64 { self.x }        // &self: reads it
 }
 
-fn total(v: Vec<i64, Gpa>) -> i64 { // let (default): read-only, no copy
+fn total(v: &Vec<i64, Gpa>) -> i64 { // &: reads, no copy
     v.iter().sum()
 }
 
-fn grow(v: inout Vec<i64, Gpa>, x: i64) { // inout: the caller writes grow(&v, x)
+fn grow(v: &mut Vec<i64, Gpa>, x: i64) { // &mut: the caller writes grow(&mut v, x)
     v.push(x);
 }
 
-fn keep(all: inout Vec<Vec<i64, Gpa>, Gpa>, v: sink Vec<i64, Gpa>) { // sink: keep takes v
+fn keep(all: &mut Vec<Vec<i64, Gpa>, Gpa>, v: Vec<i64, Gpa>) { // by value: keep takes v
     all.push(v);
 }
 
-fn first(s: [u8]) -> u8 { s[0] } // text is [u8]; 'a' is a u8; no char
+fn first(s: &str) -> char { s.chars().next().unwrap() } // text is &str, UTF-8; 'a' is a char, b'a' a u8
 
 fn odds(n: i64, gpa: Gpa) -> Vec<i64, Gpa> { // allocating takes an allocator
     (0..n).filter(|i| i % 2 == 1).collect_in(gpa)
 }
 
 fn main(gpa: Gpa) -> i32 { // gpa: the program's allocator; 0 = exit status
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa); // var: mutable; let: not
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa); // let mut: mutable; let: not
     v.push(5);
-    grow(&v, 2);                       // & marks the argument grow may change
-    v[0] += 10;                        // checked (v[1..2] a slice)
-    v.sort();                          // or sort(v.as_mut_slice())
-    var p = P { x: 1 };
-    p.bump();                          // a receiver needs no &; p must be var
-    println("{} {v:?} {}", p.get(), total(v)); // formatted; total(v) only reads
-    var all: Vec<Vec<i64, Gpa>, Gpa> = Vec::new_in(gpa);
-    keep(&all, v);                     // v moved into keep: dead from here
+    grow(&mut v, 2);
+    v[0] += 10;                        // checked (&v[1..2] a slice)
+    v.sort();
+    let mut p = P { x: 1 };
+    p.bump();                          // a receiver needs no &mut; p must be let mut
+    println("{} {v:?} {}", p.get(), total(&v)); // formatted; total(&v) only reads
+    let mut all: Vec<Vec<i64, Gpa>, Gpa> = Vec::new_in(gpa);
+    keep(&mut all, v);                 // v moved into keep: dead from here
     let s = "hi";
-    println(s.len());                  // an i64 (slices, Vec, String, HashMap)
-    var b = String::new_in(gpa);       // a text builder
+    println("{}", s.len());            // a usize (slices, Vec, String, HashMap)
+    let mut b = String::new_in(gpa);   // a text builder
     let o = odds(7, gpa);
     b.push_str("n=");
-    b.push_fmt(o.len());
-    println(b.as_slice());
-    if s == "hi" && !is_digit(first(s)) { println(first(s)); }   // compared, not matched
-    var m: HashMap<[u8], i64, Gpa> = HashMap::new_in(gpa);
-    m.get_or_insert("k", 0)[0] += 1;   // a one-element view: [0] is the value
+    write(&mut b, "{}", o.len()).unwrap();
+    println("{b}");
+    if s == "hi" && !first(s).is_ascii_digit() { println("{}", first(s)); }
+    let mut m: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
+    *m.entry("k").or_insert(0) += 1;
     let z = 0;
-    println("{} {} {}", ~0u8, 250u8.wrapping_add(7), m.get("k").unwrap()); // ~x; x / 0 panics
-    unsafe { c::puts(c"from C"); }     // C calls need unsafe; c"..": a NUL-terminated *u8
+    println("{} {} {}", !0u8, 250u8.wrapping_add(7), m["k"]); // x / 0 panics
+    unsafe { c::puts(c"from C"); }     // C calls need unsafe; c"..": a NUL-terminated *const u8
     if z != 0 { panic("z"); }          // exit 101; unreachable()
     0
 }                                      // all, o, b, m: dropped (freed) here
@@ -82,116 +83,113 @@ fn main(gpa: Gpa) -> i32 { // gpa: the program's allocator; 0 = exit status
 2 [2, 15] 17
 2
 n=3
-104
+h
 255 1 1
 from C
 ```
 
-Also: lengths and indices are `usize` (0.26.2; a counter from a literal
-says `var i: usize = 0`); overflow panics at -O0, wraps at -O2 (`wrapping_add`: always); `a as i32`
-narrows, widening is implicit; `x?`, closures (`|x| x + k`, `sink ||`
-to take what it captures), `impl Trait for T`, `T: Trait`,
-`#[derive(Eq, Debug)]`, `where T: Ord` and `x: impl Display` (0.26.2); no `dyn`, `Box`. A let or inout
-parameter is used as the value itself: `n + 1`, `out = acc`, `p.x`
-(`*` is only for raw `*T` pointers, which need `unsafe`). `inout r =
-&st;` names an access to pass on: `f(&r)`, `g(&r)`. `match e` on a let
-`e: E` binds into it (`E::A(n) => n + 1`). Arguments may have defaults
-and names: `fn f(a: i64, b: i64 = 2)`, `f(1, b: 3)`. The prelude (no
-`use`) has `Option`, `Result`, `Vec`, `Buf`, `HashMap`, `BinaryHeap` and
-`MinHeap` (priority queues: `pop` the largest, the smallest), `print`,
-`println`, `format_in`, `Gpa`, `read_line`, `read_stdin_in`, `Scanner`,
-`parse_int` (`parse_int(s)` is a `Result<i64, ParseIntError>`: take
-it with `.unwrap_or(0)`, `?`, or `match` on `Ok(n)` and `Err(e)`),
-`trim`, `split_in`, `split_whitespace_in`, `sort`,
-`sort_by`, `sort_stable_by`, `cmp_of`, `Fmt`, `panic`, `unreachable`;
-the rest of std is `use std::{...}`; `use lexer::Tok;` in a module
-reaches its sibling `lexer`.
+Also: lengths and indices are `usize` (an index may be any integer
+type); overflow panics at -O0, wraps at -O2 (`wrapping_add`: always);
+`a as i32` narrows, widening is implicit (`i64::from(a)` is Rust's
+form); `x?`, closures (`|x| x + k`, `move ||` to take what it captures),
+`impl Trait for T`, `T: Trait`, `#[derive(Clone, PartialEq, Debug)]`,
+`where T: Ord`, `x: impl Display`, lifetimes (`'a`) where a signature
+needs them, `Box<T, A>`; no `dyn`. A struct is moved unless it derives
+`Clone, Copy`. A reference is used as in Rust: `*x` reads or writes
+through it, a field or method needs no `*` (`p.x`, `v.len()`), and
+`match e` on an `e: &E` binds references (`E::A(n) => *n + 1`). The
+prelude (no `use`) is Rust's plus `Gpa`: `Option`, `Result`, `Vec`,
+`String`, `Box`, the common traits, and as functions Rust's macros:
+`print`, `println`, `eprintln`, `format_in`, `write`, `writeln`,
+`panic`, `assert`, `assert_eq`, `unreachable`, `todo`. The rest of std
+is `use std::...` (`std::collections::HashMap`); `use crate::lexer::Tok;`
+reaches the program's module `lexer`.
 
 ## std: what programs use most
 
 ```vole
-struct Item { name: [u8], qty: i64 }
+use std::collections::HashMap;
+use std::io;
 
-fn add(v: inout Vec<Item, Gpa>, it: Item) { v.push(it); } // called as add(&items, ..)
+struct Item<'a> { name: &'a str, qty: i64 }    // 'a: the name borrows the input
 
 fn main(gpa: Gpa) -> i32 {
-    let input = read_stdin_in(gpa).unwrap();   // all of stdin: Result<Vec<u8, Gpa>, IoError>
-    var sc = Scanner::new(input.as_slice());
-    let n = sc.next_int().unwrap();            // Result<i64, ScanError>
-    var items: Vec<Item, Gpa> = Vec::new_in(gpa);
-    var seen: HashMap<[u8], i64, Gpa> = HashMap::new_in(gpa);
+    let input = io::read_to_string_in(io::stdin(), gpa).unwrap(); // all of stdin, a String<Gpa>
+    let mut lines = input.lines();
+    let mut toks = lines.next().unwrap().split_whitespace();
+    let n: i64 = toks.next().unwrap().parse().unwrap(); // parse: a Result<i64, ParseIntError>
+    let mut items: Vec<Item, Gpa> = Vec::new_in(gpa);
+    let mut seen: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
     for _ in 0..n {
-        let name = sc.next_token().unwrap();   // Option<[u8]>: a slice of input
-        let qty = sc.next_int().unwrap_or(0);
-        add(&items, Item { name: name, qty: qty });
-        seen.insert(name, qty);                // also contains(k), remove(k)
+        let name = toks.next().unwrap();       // Option<&str>: a slice of input
+        let qty = toks.next().unwrap_or("").parse().unwrap_or(0);
+        items.push(Item { name, qty });
+        seen.insert(name, qty);                // also contains_key(k), remove(k)
     }
-    items.sort_by(|a, b| b.qty - a.qty);       // a, b: Item (let); < 0: a first
+    items.sort_by(|a, b| b.qty.cmp(&a.qty));   // a, b: &Item; an Ordering
     for (i, it) in items.iter().enumerate() { print("{i}:{} ", it.name); }
-    let line = trim(sc.next_line().unwrap());  // the rest of the line
-    let total = split_in(line, ',', gpa).iter()
-        .map(|w| parse_int(trim(w)).unwrap_or(0)).sum();
-    match seen.get("pen") {                    // Option<i64>
+    let line = lines.next().unwrap_or("").trim();
+    let total: i64 = line.split(',').map(|w| w.trim().parse::<i64>().unwrap_or(0)).sum();
+    match seen.get("pen") {                    // Option<&i64>
         Some(q) => println("pen={q} total={total}"),
         None => println("no pen"),
     }
-    let text = format_in("{} {}", items.len(), seen.len(), gpa); // a String
-    println(text.as_slice());                  // text, seen, items, input: dropped at the end
+    let text = format_in("{} {}", items.len(), seen.len(), gpa); // a String<Gpa>
+    println("{text}");                         // text, seen, items, input: dropped at the end
     0
 }
 ```
 ```in
-3 pen 2 ink 5 cap 1 1,2, 3
+3 pen 2 ink 5 cap 1
+1,2, 3
 ```
 ```out
 0:ink 1:pen 2:cap pen=2 total=6
 3 3
 ```
 
-Lines one at a time: `var b = String::new_in(gpa); while
-read_line(&b).unwrap() { ... }` (without the `'\n'`). An owned value
-(`Vec`, `Buf`, `HashMap`, a struct holding one) moves into a `sink`
-parameter, a `let w = v;`, a struct field or a `return`: `v` is dead
-after it (`own.moved`); pass it to a let parameter to lend it, or pass
-`v.clone()`. A plain value (numbers, structs of them) is copied. `&f(x)`
-makes a temporary that lives to the end of the block (0.18.1); any other
-owned temporary used without being moved (`f()?.read()`,
-`make().len()`, `total(make())`) is dropped at the end of its statement,
-or of its block when a `let` keeps a view of it (0.25). A slice
-of `v` is a view: take it again after `v` grows. std's most used items:
-`volec guide std`; all, a line each: `volec guide std#the-api`;
-one name with its comment: `volec guide --find split_in`.
+Lines one at a time: `let mut b = String::new_in(gpa); while
+io::stdin().read_line(&mut b).unwrap() > 0 { ... }` (appends, with the
+`'\n'`; `b.clear()` between). An owned value (`Vec`, `String`,
+`HashMap`, a struct holding one) moves into a by-value parameter, a
+`let w = v;`, a struct field or a `return`: `v` is dead after it
+(`borrowck.use_moved`); pass `&v` to lend it, or `v.clone()`. A `Copy`
+value (numbers, `&T`, a struct deriving it) is copied. A temporary is
+dropped at the end of its statement. A slice of `v` (`&v[a..b]`) borrows
+it: `v` does not grow while the slice is used. What allocates has Rust's
+name with `_in` and takes the allocator last: `collect_in(gpa)`,
+`to_string_in(gpa)`, `format_in(.., gpa)`. std's most used items:
+`volec guide std`; all, a line each: `volec guide std#the-api`; one name
+with its comment: `volec guide --find split_once`.
 
 ## The first errors and their fixes
 
 | error (short form) | fix |
 |---|---|
-| `conv.marker: 'v' is lent inout here` | `f(&v)`: the callee may change `v` |
-| `conv.marker_extra: '&' marks an argument the callee may change` | `f(v)`: a let or sink argument has no `&` |
-| `conv.rust: 'let mut' is Rust's spelling` | the `try:` line's form (`var`, `x: inout T`, `self`, `&x`) |
-| `cannot assign to immutable variable 'a'` | `var a`; a parameter you change: `a: inout T` |
-| `own.moved: 'v' is used here after it moved into 'keep(sink v)'` | lend it (a let parameter), or `keep(v.clone())` |
-| `own.conflict: ... while 'first' views them` | use the view before the change, or take it again after (`guide memory#slices`) |
+| `'println!' is a macro call: vole has no macros` | `println("{a}")`, the help's form |
+| `'Vec::new' allocates from nothing` (`alloc.no_in`) | `Vec::new_in(gpa)`: main's `gpa`, passed down; `volec fix --only alloc` |
+| `'Vec' names no allocator` (`alloc.default`) | `Vec<i64, Gpa>`, or a generic `A: Allocator` |
+| `expected 'String<Gpa>', got '&str'` | `String::from_in("..", gpa)`: a String owns its text; a parameter `s: &str` takes literals and a String's `&s` |
+| `cannot assign to immutable variable 'a'` | `let mut a` |
+| `expected '&mut Vec<i64, Gpa>', got 'Vec<i64, Gpa>'` | `f(&mut v)`: the callee may change `v` |
+| `borrowck.use_moved: 'v' is used here after it moved` | lend it (`&v`), or `keep(v.clone())` |
+| `borrowck.conflict: cannot borrow 'u' as mutable because it is also borrowed as immutable` | use the shared borrow before the change, or take it again after (`guide memory#borrowing`) |
 | `non-exhaustive match: 'E::B' is not covered` | an arm for it, or `_ =>` |
 | `calling a C function is unsafe` | `unsafe { ... }`; `volec fix --only unsafe` adds them |
-| `no 'cmp' in module 'std'` | every std item is `std::name` (its most used names need no `use`) |
-| `expected 'String<Gpa>', got '[u8]'` | `String::from_in("..", gpa)`: a String owns its text; a parameter `s: str` takes literals and a String's `&s` |
-| `'Vec::new' allocates from nothing` | `Vec::new_in(gpa)`: main's `gpa`, passed down |
+| `expected 'i32', got 'i64'` | `x as i32`: only widening is implicit |
 
 Every error has a `help:`; `volec guide errors` has more.
 
-Tests and checks (0.18): `#[test] fn` and `#[property] fn p(x: i64)`
-(inputs generated, shrunk) sit next to the code and `volec test` runs
-them at -O0 and -O2; `requires`/`ensures` clauses and `assert_eq(a, b)`
-are checked at run time, a failure one line `FILE:L:C: message` (`guide
-testing`, `guide contracts`).
+Tests and checks: `#[test] fn` and `#[property] fn p(x: i64)` (inputs
+generated, shrunk) sit next to the code and `volec test` runs them at
+-O0 and -O2; `requires`/`ensures` clauses and `assert_eq(&a, &b)` are
+checked at run time (`guide testing`, `guide contracts`).
 
-Float math (0.25.2.1): Rust's methods on f32 and f64, no `use`
-(`x.sqrt()`, `x.sin()`, `y.atan2(x)`, `x.powi(2)`, `a.max(b)`) and
-constants (`f64::consts::PI`, `f64::EPSILON`), in vole: `volec guide math`.
-SIMD and CPU intrinsics (0.19): `std::arch`, the vendors' names (`vaddq_u8`,
-`__crc32cd`) checked against the CPU: `volec guide arch`; `query arch WORDS`.
-GPU compute and rendering (0.22): `std::gpu`, wgpu's objects on Metal: `volec guide gpu`.
+Float math: Rust's methods on f32 and f64 (`x.sqrt()`, `y.atan2(x)`,
+`x.powi(2)`) and constants (`std::f64::consts::PI`): `volec guide math`.
+SIMD and CPU intrinsics: `std::arch`, the vendors' names (`vaddq_u8`)
+checked against the CPU: `volec guide arch`; `query arch WORDS`.
+GPU compute and rendering: `std::gpu`, wgpu's objects on Metal: `volec guide gpu`.
 
 ## The loop
 
