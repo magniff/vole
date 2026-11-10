@@ -54,7 +54,7 @@ export LC_ALL
 # and --split writes its prog.vl with `// EDITION: rust` first (the twin's
 # guide programs). A topic moves here when its examples are translated
 # (0.28.0 workstream C); the others are MVS's until then.
-RUST_TOPICS=" cli closures contracts conversions debug fmt formatting generics io iterators math memory modules syntax text threads traits unsafe "
+RUST_TOPICS=" cli closures contracts conversions debug fmt formatting generics io iterators math memory modules std syntax text threads traits types unsafe "
 rust_topic() { case "$RUST_TOPICS" in *" $1 "*) echo 1 ;; *) echo 0 ;; esac; }
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -457,8 +457,8 @@ page=$(wc -c <"$WORK/std-page.md" | tr -d ' ')
 if [ "$size" -le 22400 ] && [ "$page" -le 4500 ] \
     && head -1 "$WORK/std-page.md" | grep -q '^# std$' \
     && grep -q '^## The most used$' "$WORK/std-page.md" \
-    && grep -qF 'Vec::new_in(gpa) -> Vec<T>' "$WORK/std-page.md" \
-    && grep -qF 'volec guide std#the-api' "$WORK/std-page.md" && grep -qF 'MinHeap::new_in(gpa)' "$WORK/std-page.md" \
+    && grep -qF 'Vec::new_in(gpa) -> Vec<T, Gpa>' "$WORK/std-page.md" \
+    && grep -qF 'volec guide std#the-api' "$WORK/std-page.md" && grep -qF 'HashMap::new_in(gpa)' "$WORK/std-page.md" \
     && ! grep -q '^## Overview$' "$WORK/std-page.md" && ! grep -q '@PAGE-END@' "$WORK/std-page.md" "$WORK/topic-std.md" \
     && grep -q '^## Overview$' "$WORK/topic-std.md" && grep -qF 'fn push(inout self, x: sink T)' "$WORK/topic-std.md" \
     && grep -qF 'fn split_in<A: Allocator>(s: [u8], sep: u8, a: sink A) -> Vec<[u8], A>' "$WORK/topic-std.md" \
