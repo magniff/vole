@@ -735,6 +735,19 @@ str>`, the opaque instance's `'b must outlive 'a` is reported, and not
 lifetime. A region-free instance is not held: the opaque instance
 reuses its verdict (b, d). *Anchor:* `places/borrowck/mod.vl:
 check_body, release_held`. *Case:* `rust_b_err_proj_item_bound`.
+0.28.0 adds (g): in a concrete instance, a violated `'u ⊒ 'v` with
+either side a substitution's universal is not reported. An instance has
+one universal per slot of each type argument, and which of them the
+caller wrote as one lifetime is not in them: in `v.iter().copied()
+.filter(|e| e.s == key)` the item's lifetime and the closure's
+parameter's are one in the caller, two in `Iterator::find`'s instance,
+where the item flows into the closure. rustc checks the template, where
+a type parameter has no region; the opaque instance (d) does the same
+here, and a flow between two parameters' types is an error there, as a
+type error or by a bound's equalities (D4.6 (d)). The instance's other
+errors (moves, a `&mut` through a `&`, a local returned) are reported
+as before. *Anchor:* `places/borrowck/solve.vl: substitution_pair`.
+*Case:* `rust_b_subst_adapter_regions`.
 
 **D4.5 (implied and declared bounds; the order ⊒).** `⊒` is the least
 preorder on `U` containing: `'static ⊒ 'u` for every `'u`; every
