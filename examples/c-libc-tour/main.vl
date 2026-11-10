@@ -1,3 +1,4 @@
+// EDITION: rust
 // c-libc-tour: the C library through its own headers. `import "x.h" as c`
 // reads the system's headers for the target, so the structs (struct tm,
 // struct stat, struct dirent) have the layout of this system's libc,
@@ -12,62 +13,76 @@ import "unistd.h" as c;
 import "dirent.h" as c;
 import "sys/stat.h" as c;
 
+use std::alloc::Allocator;
 use std::cli::{Arg, Command};
+use std::mem::size_of;
 
 // ---- between vole text and C strings ----------------------------------
 
-// A vole slice as a C string: C wants the NUL a slice does not have,
-// so the bytes are copied into a Buf with a 0 after them. Pass
-// `s.as_slice().ptr` to C; the Buf is dropped with its owner.
-fn cstring(s: [u8], gpa: Gpa) -> Vec<u8, Gpa> {
-    var b = Vec::<u8, Gpa>::new_in(gpa);
-    b.extend_from_slice(s);
+// A vole `&str` as a C string: C wants the NUL a `&str` does not have,
+// so the bytes are copied into a Vec with a 0 after them. Pass its
+// `as_ptr()` to C; the Vec is dropped with its owner.
+fn cstring(s: &str, gpa: Gpa) -> Vec<u8, Gpa> {
+    let mut b = Vec::<u8, Gpa>::new_in(gpa);
+    b.extend_from_slice(s.as_bytes());
     b.push(0);
     b
 }
 
 // The C string "DIR/NAME", for the file NAME in the directory DIR.
-fn c_path(dir: [u8], name: [u8], gpa: Gpa) -> String<Gpa> {
-    var b = format_in("{dir}/{name}", gpa);
-    b.push(0);
+fn c_path(dir: &str, name: &str, gpa: Gpa) -> String<Gpa> {
+    let mut b = format_in("{dir}/{name}", gpa);
+    b.push('\0');
     b
 }
 
 // A C string's text, copied into a String the caller owns: C may reuse
 // its memory (readdir and getenv may), a String is ours.
 //
-// Unsafe: `p` must point to a NUL-terminated string.
-unsafe fn owned(p: *u8, gpa: Gpa) -> String<Gpa> {
-    // UNSAFE: p is C's string, a raw pointer.
-    // SAFETY: the caller's: p is NUL-terminated, so its strlen bytes are readable.
-    String::from_utf8_lossy_in(unsafe { p[0..c::strlen(p) as i64] }, gpa)
+// UNSAFE: it reads C's string through a raw pointer.
+// SAFETY: the caller's promise: `p` points to a NUL-terminated string,
+// so its strlen bytes are readable.
+unsafe fn owned(p: *const u8, gpa: Gpa) -> String<Gpa> {
+    String::from_utf8_lossy_in(std::slice::from_raw_parts(p, c::strlen(p) as usize), gpa)
 }
 
 // A C struct of zero bytes, to be filled in by C: a struct stat has no
 // vole constructor, and its fields differ between systems.
 //
-// Unsafe: it calls C, and `T` must be a C type for which all zero bytes
-// are a valid value (a C struct of numbers and pointers is).
+// UNSAFE: it calls C's calloc and free, and reads a `T` out of raw memory.
+// SAFETY: the caller's promise: `T` is a C type for which all zero bytes
+// are a valid value (a C struct of numbers and pointers is). The memory
+// is calloc's (a failed calloc ends the program here), read once, and
+// freed once.
 unsafe fn zeroed<T>() -> T {
-    let p = c::calloc(1, size_of(T) as u64) as *T;
-    let value = *p;
-    c::free(p as *u8);
+    let p = c::calloc(1, size_of::<T>() as u64) as *mut T;
+    if p.is_null() { panic("out of memory"); }
+    let value = std::ptr::read(p);
+    c::free(p as *mut u8);
     value
 }
 
 // ---- the environment ---------------------------------------------------------
 
 // getenv's NULL becomes None.
-fn env(name: [u8], gpa: Gpa) -> Option<String<Gpa>> {
+fn env(name: &str, gpa: Gpa) -> Option<String<Gpa>> {
     let cname = cstring(name, gpa);
-    let p = unsafe { c::getenv(cname.as_slice().ptr) };
-    if p == 0 as *u8 { None } else { Some(unsafe { owned(p, gpa) }) }
+    // UNSAFE: getenv is C's; `owned` reads the string it returns.
+    // SAFETY: `cname` is NUL-terminated and lives past the call; the
+    // result is null or a C string, copied before anything can change it.
+    unsafe {
+        let p = c::getenv(cname.as_ptr());
+        if p.is_null() { None } else { Some(owned(p, gpa)) }
+    }
 }
 
-fn set_env(name: [u8], value: [u8], gpa: Gpa) {
+fn set_env(name: &str, value: &str, gpa: Gpa) {
     let cname = cstring(name, gpa);
     let cvalue = cstring(value, gpa);
-    unsafe { c::setenv(cname.as_slice().ptr, cvalue.as_slice().ptr, 1); }
+    // UNSAFE: setenv is C's.
+    // SAFETY: both strings are NUL-terminated and live past the call
+    // (setenv copies them); the program has one thread.
+    unsafe { c::setenv(cname.as_ptr(), cvalue.as_ptr(), 1); }
 }
 
 fn environment(gpa: Gpa) {
@@ -75,10 +90,12 @@ fn environment(gpa: Gpa) {
     set_env("TOUR_GREETING", "hello from setenv", gpa);
     let greeting = env("TOUR_GREETING", gpa);
     println("TOUR_GREETING = {greeting:?}");
+    // UNSAFE: unsetenv is C's.
+    // SAFETY: the name is a C string literal; the program has one thread.
     unsafe { c::unsetenv(c"TOUR_MISSING"); }
     println("TOUR_MISSING  = {:?}", env("TOUR_MISSING", gpa));
     let entries = match env("PATH", gpa) {
-        Some(path) => std::split_in(path.as_slice(), ':', gpa).len(),
+        Some(path) => path.split(':').count(),
         None => 0,
     };
     println("PATH is set: {}", entries > 0);
@@ -86,40 +103,49 @@ fn environment(gpa: Gpa) {
 
 // ---- time ----------------------------------------------------------------------
 
-// strftime into a stack buffer; the text as a Buf.
-fn format_time(format: [u8], t: c::tm, gpa: Gpa) -> Vec<u8, Gpa> {
+// strftime into a stack buffer; the text as a String.
+fn format_time(format: &str, t: &c::tm, gpa: Gpa) -> String<Gpa> {
     let cformat = cstring(format, gpa);
-    var out: [u8; 128] = [0; 128];
-    let n = unsafe { c::strftime(&out as *u8, 128, cformat.as_slice().ptr, &t) };
-    var b = Vec::<u8, Gpa>::new_in(gpa);
-    b.extend_from_slice(out[0..n as i64]);
-    b
+    let mut out: [u8; 128] = [0; 128];
+    // UNSAFE: strftime is C's, and writes through a pointer.
+    // SAFETY: it writes at most 128 bytes, the size of `out`; the format
+    // is NUL-terminated, and `t` is a whole struct tm.
+    let n = unsafe { c::strftime(out.as_mut_ptr(), 128, cformat.as_ptr(), t) };
+    String::from_utf8_lossy_in(&out[..n as usize], gpa)
 }
 
 // localtime follows $TZ: tzset reads it again.
-fn use_zone(zone: [u8], gpa: Gpa) {
+fn use_zone(zone: &str, gpa: Gpa) {
     set_env("TZ", zone, gpa);
+    // UNSAFE: tzset is C's.
+    // SAFETY: no arguments; it reads $TZ, and the program has one thread.
     unsafe { c::tzset(); }
 }
 
-fn show_in_zone(zone: [u8], when: i64, gpa: Gpa) {
+fn show_in_zone(zone: &str, when: i64, gpa: Gpa) {
     use_zone(zone, gpa);
     // localtime returns a pointer to a static struct tm: copy it out.
+    //
+    // UNSAFE: localtime is C's, and its result is a raw pointer.
+    // SAFETY: `&when` is a time_t for the call; the result points to
+    // libc's static struct tm, copied before the next call can change it.
     let parts: c::tm = unsafe { *c::localtime(&when) };
-    let text = format_time("%Y-%m-%d %H:%M:%S %z", parts, gpa);
+    let text = format_time("%Y-%m-%d %H:%M:%S %z", &parts, gpa);
     let offset = parts.tm_gmtoff;
     let sign = if offset < 0 { "-" } else { "+" };
     let minutes = if offset < 0 { -offset / 60 } else { offset / 60 };
-    println("  {zone:<9} {}  (UTC{sign}{}:{:02})", text.as_slice(), minutes / 60, minutes % 60);
+    println("  {zone:<9} {text}  (UTC{sign}{}:{:02})", minutes / 60, minutes % 60);
 }
 
 fn time_demo(gpa: Gpa) {
     println("== time");
     // A fixed moment, so the output is the same on every run.
     let when: i64 = 1234567890;
-    var utc: c::tm = unsafe { *c::gmtime(&when) };
-    let long = format_time("%A, %d %B %Y, %H:%M:%S UTC", utc, gpa);
-    println("{when} is {}", long.as_slice());
+    // UNSAFE: gmtime is C's, and its result is a raw pointer.
+    // SAFETY: as localtime above: a static struct tm, copied at once.
+    let mut utc: c::tm = unsafe { *c::gmtime(&when) };
+    let long = format_time("%A, %d %B %Y, %H:%M:%S UTC", &utc, gpa);
+    println("{when} is {long}");
     println(
         "  struct tm: year {}, month {}, day {} of the year, weekday {}", utc.tm_year + 1900,
         utc.tm_mon + 1, utc.tm_yday + 1, utc.tm_wday);
@@ -129,9 +155,11 @@ fn time_demo(gpa: Gpa) {
     // normalizes it: day 113 of February is in May.
     use_zone("UTC0", gpa);
     utc.tm_mday += 100;
-    let later = unsafe { c::mktime(&utc) };
-    let date = format_time("%Y-%m-%d, a %A", utc, gpa);
-    println("100 days later: {} ({} seconds later)", date.as_slice(), later - when);
+    // UNSAFE: mktime is C's, and writes through a pointer.
+    // SAFETY: `&mut utc` is a whole struct tm, borrowed for the call.
+    let later = unsafe { c::mktime(&mut utc) };
+    let date = format_time("%Y-%m-%d, a %A", &utc, gpa);
+    println("100 days later: {date} ({} seconds later)", later - when);
 }
 
 // ---- files and directories ------------------------------------------------------
@@ -143,21 +171,20 @@ fn is_dir(mode: u32) -> bool {
 }
 
 // "drwxr-xr-x", as ls prints it.
-fn mode_text(mode: u32, out: inout Vec<u8, Gpa>) {
+fn mode_text(mode: u32, out: &mut String<Gpa>) {
     out.push(if is_dir(mode) { 'd' } else { '-' });
-    let letters = "rwxrwxrwx";
-    for i in 0..9 {
+    for (i, letter) in "rwxrwxrwx".chars().enumerate() {
         let bit = 1u32 << (8 - i) as u32;
-        out.push(if mode & bit != 0 { letters[i] } else { '-' });
+        out.push(if mode & bit != 0 { letter } else { '-' });
     }
 }
 
 // An open directory, closed when the guard is dropped: on every way out
 // of the function that holds it.
-struct Dir { d: *c::DIR }
+struct Dir { d: *mut c::DIR }
 
 impl Drop for Dir {
-    fn drop(inout self) {
+    fn drop(&mut self) {
         // UNSAFE: closedir(3) is the C library's; std has no directory type.
         // SAFETY: the pointer is the one opendir() returned (not null), held by
         // this guard alone, and closed once, here.
@@ -167,63 +194,72 @@ impl Drop for Dir {
 
 // The entries of `dir` but . and .., sorted by name, with their sizes and
 // modes; None if it cannot be opened.
-fn list(dir: [u8], gpa: Gpa) -> Option<Vec<Entry<Gpa>, Gpa>> {
+fn list(dir: &str, gpa: Gpa) -> Option<Vec<Entry<Gpa>, Gpa>> {
     let cdir = cstring(dir, gpa);
-    let d = unsafe { c::opendir(cdir.as_slice().ptr) };
-    if d == 0 as *c::DIR {
+    // UNSAFE: opendir is C's.
+    // SAFETY: `cdir` is NUL-terminated and lives past the call.
+    let d = unsafe { c::opendir(cdir.as_ptr()) };
+    if d.is_null() {
         return None;
     }
     let _dir = Dir { d };
-    var entries: Vec<Entry<Gpa>, Gpa> = Vec::new_in(gpa);
+    let mut entries: Vec<Entry<Gpa>, Gpa> = Vec::new_in(gpa);
     loop {
-        let ent = unsafe { c::readdir(d) };
-        if ent == 0 as *c::dirent {
-            break;
-        }
-        // d_name is a char array inside the struct readdir returns
-        let name_ptr = unsafe { &ent.d_name as *u8 };
-        let name = unsafe { owned(name_ptr, gpa) };
-        if name.as_slice() == "." || name.as_slice() == ".." {
+        // UNSAFE: readdir is C's; the entry's name is read through its pointer.
+        // SAFETY: `d` is open until `_dir` is dropped. The result is null
+        // at the end, else a dirent whose d_name (a char array inside it)
+        // is NUL-terminated and valid until the next readdir: `owned`
+        // copies it before that.
+        let name = unsafe {
+            let ent = c::readdir(d);
+            if ent.is_null() {
+                break;
+            }
+            owned((*ent).d_name.as_ptr(), gpa)
+        };
+        if name == "." || name == ".." {
             continue; // (name is dropped)
         }
-        entries.push(Entry { name: name, size: 0, mode: 0 });
+        entries.push(Entry { name, size: 0, mode: 0 });
     }
     // readdir's order is the file system's: sort by name.
-    entries.sort_by(|a, b| {
-        let x = a.name.as_slice();
-        let y = b.name.as_slice();
-        x.cmp(y)
-    });
-    for i in 0..entries.len() {
-        let path = c_path(dir, entries[i].name.as_slice(), gpa);
-        var st: c::stat = unsafe { zeroed() };
-        if unsafe { c::stat(path.as_slice().ptr, &st) } == 0 {
-            entries[i].size = st.st_size;
-            entries[i].mode = st.st_mode; // u16 on macOS, u32 on Linux: it widens
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    for e in entries.iter_mut() {
+        let path = c_path(dir, &e.name, gpa);
+        // UNSAFE: zeroed makes a C struct from zero bytes; stat is C's,
+        // and writes through a pointer.
+        // SAFETY: struct stat is numbers only, so zero bytes are one;
+        // `path` is NUL-terminated, `&mut st` a whole struct stat.
+        let (status, st) = unsafe {
+            let mut st: c::stat = zeroed();
+            (c::stat(path.as_ptr(), &mut st), st)
+        };
+        if status == 0 {
+            e.size = st.st_size;
+            e.mode = st.st_mode; // u16 on macOS, u32 on Linux: it widens
         }
     }
     Some(entries)
 }
 
-fn print_listing(title: [u8], entries: Vec<Entry<Gpa>, Gpa>, gpa: Gpa) {
+fn print_listing(title: &str, entries: &[Entry<Gpa>], gpa: Gpa) {
     println("{title}: {} entries", entries.len());
-    var line = Vec::<u8, Gpa>::new_in(gpa);
-    for e in entries.as_slice() {
+    let mut line = String::new_in(gpa);
+    for e in entries {
         line.clear();
-        mode_text(e.mode, &line);
+        mode_text(e.mode, &mut line);
         // (a directory's size is the file system's business: 64 on
-        // APFS, 4096 on ext4)
+        // APFS, 4096 on ext4; write appends to a String, and cannot
+        // fail there)
         if is_dir(e.mode) {
-            line.extend_from_slice(format_in(" {:>6}  {}/", "<dir>", e.name.as_slice(),
-                line.allocator()).as_bytes());
+            write(&mut line, " {:>6}  {}/", "<dir>", e.name).unwrap();
         } else {
-            line.extend_from_slice(format_in(" {:>6}  {}", e.size, e.name.as_slice(),
-                line.allocator()).as_bytes());
+            write(&mut line, " {:>6}  {}", e.size, e.name).unwrap();
         }
-        println(line.as_slice());
+        println("{line}");
     }
-    var bytes = 0;
-    for e in entries.as_slice() {
+    let mut bytes = 0;
+    for e in entries {
         if !is_dir(e.mode) { bytes += e.size; }
     }
     println("total {bytes} bytes in files");
@@ -231,58 +267,72 @@ fn print_listing(title: [u8], entries: Vec<Entry<Gpa>, Gpa>, gpa: Gpa) {
 
 // Writes `text` to the file `name` in `dir` with stdio and gives it the
 // permissions `mode` (not left to the umask); false if it cannot.
-fn write_file(dir: [u8], name: [u8], text: [u8], mode: u16, gpa: Gpa) -> bool {
+fn write_file(dir: &str, name: &str, text: &str, mode: u16, gpa: Gpa) -> bool {
     let cpath = c_path(dir, name, gpa);
-    let f = unsafe { c::fopen(cpath.as_slice().ptr, c"w") };
-    if f == 0 as *c::FILE {
-        return false;
-    }
+    // UNSAFE: fopen, fwrite, fclose and chmod are C's.
+    // SAFETY: `cpath` is NUL-terminated and lives past the calls; the
+    // FILE is checked for null, written with `text`'s own pointer and
+    // length, and closed once.
     unsafe {
-        c::fwrite(text.ptr, 1, text.len() as u64, f);
+        let f = c::fopen(cpath.as_ptr(), c"w");
+        if f.is_null() {
+            return false;
+        }
+        c::fwrite(text.as_ptr(), 1, text.len() as u64, f);
         c::fclose(f);
-        c::chmod(cpath.as_slice().ptr, mode) == 0
+        c::chmod(cpath.as_ptr(), mode) == 0
     }
 }
 
-// Permission bits (vole has no octal literals: 0755 is 0x1ed).
-const RWXR_XR_X: u16 = 0x1ed;
-const RW_R__R__: u16 = 0x1a4;
-const RW_______: u16 = 0x180;
+// Permission bits, in octal as chmod(1) takes them (C's 0755 is 0o755).
+const RWXR_XR_X: u16 = 0o755;
+const RW_R__R__: u16 = 0o644;
+const RW_______: u16 = 0o600;
 
 fn files_demo(gpa: Gpa) {
     println("== files");
     // mkdtemp replaces the XXXXXX in place: the template must be ours.
-    var template = cstring("/tmp/c-libc-tour.XXXXXX", gpa);
-    if unsafe { c::mkdtemp(template.as_slice().ptr) } == 0 as *u8 {
+    let mut template = cstring("/tmp/c-libc-tour.XXXXXX", gpa);
+    // UNSAFE: mkdtemp is C's, and writes through a pointer.
+    // SAFETY: `template` is NUL-terminated and ours to change; mkdtemp
+    // replaces its six X's, no more.
+    if unsafe { c::mkdtemp(template.as_mut_ptr()) }.is_null() {
         println("mkdtemp failed");
         return;
     }
-    let dir = template.as_slice()[0..template.len() - 1]; // without the NUL
+    // without the NUL
+    let dir = std::str::from_utf8(&template[..template.len() - 1]).unwrap_or("/tmp");
     let made = write_file(dir, "notes.txt", "remember the NUL\n", RW_______, gpa)
         && write_file(dir, "data.csv", "a,b\n1,2\n3,4\n", RW_R__R__, gpa)
         && write_file(dir, "empty", "", RW_R__R__, gpa);
     let sub = c_path(dir, "subdir", gpa);
+    // UNSAFE: mkdir and chmod are C's.
+    // SAFETY: `sub` is NUL-terminated and lives past the calls.
     unsafe {
-        c::mkdir(sub.as_slice().ptr, RWXR_XR_X);
-        c::chmod(sub.as_slice().ptr, RWXR_XR_X); // mkdir's mode is masked by the umask
+        c::mkdir(sub.as_ptr(), RWXR_XR_X);
+        c::chmod(sub.as_ptr(), RWXR_XR_X); // mkdir's mode is masked by the umask
     }
     println("made three files and a directory: {made}");
 
     match list(dir, gpa) {
         Some(entries) => {
-            print_listing("the directory", entries, gpa);
+            print_listing("the directory", &entries, gpa);
             // clean up: files with unlink, directories with rmdir
-            for e in entries.as_slice() {
-                let path = c_path(dir, e.name.as_slice(), gpa);
+            for e in &entries {
+                let path = c_path(dir, &e.name, gpa);
+                // UNSAFE: rmdir and unlink are C's.
+                // SAFETY: `path` is NUL-terminated and lives past the call.
                 unsafe {
-                    if is_dir(e.mode) { c::rmdir(path.as_slice().ptr); }
-                    else { c::unlink(path.as_slice().ptr); }
+                    if is_dir(e.mode) { c::rmdir(path.as_ptr()); }
+                    else { c::unlink(path.as_ptr()); }
                 }
             }
         }
         None => println("cannot list it"),
     }
-    let removed = unsafe { c::rmdir(template.as_slice().ptr) } == 0;
+    // UNSAFE: rmdir is C's.
+    // SAFETY: `template` is NUL-terminated and lives past the call.
+    let removed = unsafe { c::rmdir(template.as_ptr()) } == 0;
     println("removed it again: {removed}");
 }
 
@@ -295,7 +345,7 @@ fn main(gpa: Gpa) -> i32 {
     if dirs.len() > 0 {
         for dir in dirs {
             match list(dir, gpa) {
-                Some(entries) => print_listing(dir, entries, gpa),
+                Some(entries) => print_listing(dir, &entries, gpa),
                 None => eprintln("cannot open {dir}"),
             }
         }
