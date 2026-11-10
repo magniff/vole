@@ -7,36 +7,39 @@
 ## for an item of std; `query show parse_primary` in the compiler). Each
 ## line runs once without the cache and twice with it (run.sh): the same
 ## answers.
-$ show print_int
-// std::fmt::print_int	../../compiler/std/fmt.vl:194-204	effects: io panic
-// use std::print_int;
-#[inline(never)]
-pub fn print_int(v: i64) {
-    print_acquire();
-    var f = Fmt::to_fd(1);
-    // (decimal only: not Fmt::int, whose hex and binary every program
-    // using print_int would compile)
-    let negative = v < 0;
-    fmt_decimal(&f, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative);
-    f.flush();
-    print_release();
+$ show print
+// std::fmt::print	<std>:15164-15173
+// x on stdout (`print("{x}")`); stdout is line-buffered when a terminal.
+// later: format_fns
+#[effects(io, panic, diverge, T)]
+pub fn print<T: Display>(x: T) {
+    let mut out = crate::io::stdout();
+    if crate::io::Write::write_fmt(&mut out, x).is_err() {
+        let msg: &str = "failed printing to stdout";
+        crate::panic::panic(msg);
+    }
 }
 $ show Vec::push
-// std::Vec::push	../../compiler/std/std.vl:300-310
-    #[stores(x)]
-    pub fn push(inout self, x: sink T) {
-        if self.len == self.cap && !self.reserve_more(1) {
-            out_of_memory();
+// std::vec::Vec::push	<std>:4541-4556
+    // Appends x, growing from A when it is full. (0.28.0) Inline, and its
+    // clauses `debug` (checked by volec test): a push is a compare, one
+    // copy of x into its slot and an increment, the growth out of line.
+    // Its `ensures` made it a call of push$body, out of line, at every
+    // push (about 7% of the rust-edition compiler's check of itself).
+    #[inline]
+    #[effects(panic, T, A)]
+    pub fn push(&mut self, x: T)
+        debug ensures self.len() == old(self.len()) + 1
+        debug ensures self.len() <= self.capacity()
+    {
+        if self.len == self.cap {
+            self.grow_one();
         }
-        // UNSAFE: a raw write. SAFETY: len < cap here, so ptr[len] is room; len counts x.
-        unsafe {
-            self.ptr[self.len] = x;
-        }
-        self.len += 1;
+        self.put(x);
     }
 $ show HashMap::len
-// std::collections::hash_map::HashMap::len	../../compiler/std/collections/hash_map.vl:37-40
-    #[inline]
-    pub fn len(self) -> usize {
-        self.table.len()
+// std::collections::hash_map::HashMap::len	<std>:11146-11149
+    #[effects()]
+    pub fn len(&self) -> usize {
+        self.table.items
     }
