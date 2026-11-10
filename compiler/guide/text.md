@@ -72,8 +72,9 @@ What turns one form into another:
 | a slice | appended | `v.extend_from_slice(s)` to a `Vec`; `push_str(s)` to a `String` |
 
 `print`, `println` and `eprintln` take a format literal and its
-arguments, any `T: Display`, with no allocator; `panic("bad {x}")` and
-`assert(c, "bad {}", x)` format their message the same way.
+arguments, any `T: Display`, with no allocator; `panic("bad {x}")`
+formats its message the same way (`assert(c, "msg")` and `assert_eq(a,
+b, "msg")` take a plain message, no arguments yet).
 
 ```vole
 const SHADER: &str = "@compute @workgroup_size(1)\nfn main() {}\n";

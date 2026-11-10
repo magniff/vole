@@ -2,240 +2,191 @@
 
 | type | |
 |---|---|
-| `i8 i16 i32 i64 isize`, `u8 u16 u32 u64 usize` | integers; literals are `i64` unless the context or a suffix says |
-| `f32`, `f64` | IEEE floats; literals are `f64` unless the context or a suffix says: `let c = [1.0, 0.5];` is `[f64; 2]` (annotate: `let c: [f32; 2] = ..`; 0.25.2: a mismatch from it names the `let`) |
-| `bool` | `true`, `false` |
+| `i8 i16 i32 i64 isize`, `u8 u16 u32 u64 usize` | integers (no `i128`); an unsuffixed literal is `i32` unless the context or a suffix says (Rust's) |
+| `f32`, `f64` | IEEE floats; a literal is `f64` unless the context or a suffix says |
+| `bool`, `char` | `true`, `false`; a `char` is a Unicode scalar value, `'a'` |
 | `()` | the unit type |
 | `!` | never: `return`, `break`, `loop` without `break`, `fn f() -> !` |
-| `(A, B)` | tuples: `t.0` (through a pointer too: `p.0`); `(x,)` has one element |
+| `(A, B)` | tuples: `t.0`; `(x,)` has one element |
 | `[T; N]` | an array, a value; `N` a constant expression |
-| `[T]` | a slice: `.len()` (an `i64`); `.ptr` (a `*T`) for C |
-| `*T` | a pointer (`*u8` is also C's `void *` and `char *`) |
-| `fn(A, inout B) -> R` | a plain function value; a parameter's convention is part of its type |
-| `let T`, `inout T` | an access, in a field (`q: inout Query`) or a function type (`guide memory`) |
+| `[T]`, `str` | a slice, text: behind a reference, `&[T]`, `&mut [T]`, `&str`; `.len()` is a `usize` |
+| `&T`, `&mut T` | references, checked by the borrow checker (`guide memory`) |
+| `*const T`, `*mut T` | raw pointers (`*mut u8` is also C's `void *`) |
+| `fn(A, &B) -> R` | a plain function value |
 | `extern "C" fn(A) -> R` | a C function pointer, another type |
 | `S`, `E`, `S<T>` | structs, enums, unions, their instances |
-| `type X = distinct T` | a type of its own with T's representation (0.18) |
-| `std::NonNull<T>` | a `*T` that is never null; `Option<NonNull<T>>` is one pointer |
-| `v16u8 v8i16 v4f32 v2f64 ...` | SIMD vectors: 8, 16 or 32 bytes of signed, unsigned or float lanes (0.19: `guide arch`) |
+| `type X = distinct T` | vole's: a type of its own with T's representation |
+| `std::ptr::NonNull<T>` | a `*mut T` that is never null |
+| `v16u8 v8i16 v4f32 v2f64 ...` | SIMD vectors: 8, 16 or 32 bytes of signed, unsigned or float lanes (`guide arch`) |
 
 ## Numbers
 
-Only widening converts implicitly (0.15: a narrower integer to a wider
-one, `volec guide conversions`); otherwise both sides of `+`, `==`,
-`=` have one type, and `as` converts between numeric types (and `bool` to an integer,
-fieldless enums to integers and back). An unsuffixed literal takes the
-type the context needs (`let b: u8 = 7;`, `x + 1` with `x: u32`), and
-must fit: `let b: u8 = 300;` is an error.
+`as` converts between numeric types (and `bool` and `char` to an
+integer, a fieldless enum to an integer); `T::from(x)` widens (`guide
+conversions`, which also has vole's own widening). An unsuffixed literal
+takes the type the context needs (`let b: u8 = 7;`, `x + 1` with `x:
+u32`), and must fit: `let b: u8 = 300;` is an error.
 
-Every operation is defined. Overflow is Rust's (0.26.3): `max + 1`
-panics at -O0 (`attempt to add with overflow`, at the expression) and
-wraps at -O1 and -O2; `--overflow-checks=on|off` chooses for any level.
-`x / 0` and `MIN / -1` panic at every level, and so does a shift by the
-type's bits or more at -O0 (at -O2 the amount is taken modulo the bits).
-Where wrapping (or a check) is what you mean, say so, at every level:
+Every operation is defined. Overflow is Rust's: `max + 1` panics at -O0
+(`attempt to add with overflow`, at the expression) and wraps at -O1
+and -O2; `--overflow-checks=on|off` chooses for any level. `x / 0` and
+`MIN / -1` panic at every level, and so does a shift by the type's bits
+or more at -O0 (at -O2 the amount is taken modulo the bits). Where
+wrapping (or a check) is what you mean, say so, at every level:
 `x.wrapping_add(y)` (`_sub _mul _neg _shl _shr _div _rem _pow _abs`),
 `checked_*` (an `Option`), `overflowing_*` (the value and a bool),
-`saturating_*`, and `std::num::Wrapping<T>` (`Wrapping(x) + Wrapping(y)`,
-its `.value`). Hashes and PRNGs write `wrapping_*`.
+`saturating_*`. Hashes and PRNGs write `wrapping_*`.
 
 ```vole
-let max: i64 = 9223372036854775807;
-let b: u8 = 250;
-let s: u32 = 1;
-std::print_int(max.wrapping_add(1)); print(" ");                // wraps at every level
-std::print_int(b.wrapping_add(10) as i64); print(" ");          // u8 wraps: 4
-std::print_int(max.checked_add(1).unwrap_or(-1)); print(" ");   // None: it overflowed
-std::print_int(b.saturating_add(10) as i64); print(" ");        // 255
-std::print_int(-7 % 3); print(" ");                             // the sign of the dividend
-std::print_int(s.wrapping_shl(33) as i64); print(" ");          // the amount mod the bits
-std::print_int(1e30 as i64 - max); print(" ");                  // float to int saturates
-std::print_int(-1.9 as i64); print(" ");                        // truncates
-std::print_int((0.0 / 0.0) as i64);                             // NaN becomes 0
-println("");
+fn main() {
+    let max: i64 = i64::MAX;
+    let b: u8 = 250;
+    let s: u32 = 1;
+    print("{} ", max.wrapping_add(1));               // wraps at every level
+    print("{} ", b.wrapping_add(10));                // u8 wraps: 4
+    print("{} ", max.checked_add(1).unwrap_or(-1));  // None: it overflowed
+    print("{} ", b.saturating_add(10));              // 255
+    print("{} ", -7 % 3);                            // the sign of the dividend
+    print("{} ", s.wrapping_shl(33));                // the amount mod the bits
+    print("{} ", 1e30 as i64 - max);                 // float to int saturates
+    print("{} ", -1.9 as i64);                       // truncates
+    println("{}", (0.0f64 / 0.0) as i64);            // NaN becomes 0
+    let (v, o) = 250u8.overflowing_add(10);
+    println("{v} {o} {}", i32::MIN);
+}
 ```
 ```out
 -9223372036854775808 4 -1 255 -1 2 0 -1 0
+4 true -2147483648
 ```
 
 Floats are IEEE 754 without fast-math; `1.0 / 0.0` is infinity, and
-`NaN != NaN`. Floats have Rust's methods and constants (0.25.2.1):
-`x.sqrt()`, `x.sin()`, `x.abs()`, `x.powi(2)`, `a.max(b)`, `f64::EPSILON`,
-`f64::MAX`, `f64::consts::PI` (`volec guide math`), in vole, with no C
-call; integers have none (`i64::MAX` and `MIN` aside).
+`NaN != NaN`. Floats have Rust's methods and constants: `x.sqrt()`,
+`x.sin()`, `x.abs()`, `x.powi(2)`, `a.max(b)`, `f64::EPSILON`,
+`f64::MAX`, `std::f64::consts::PI` (`volec guide math`), in vole, with
+no C call.
 
 ## Arrays and slices
 
 ```vole
-var grid = [[0; 3]; 2];           // [[i64; 3]; 2]
-grid[1][2] = 5;
-let copy = grid;                  // arrays are values: copied whole
-grid[0][0] = 1;
-let row = grid[1][..];            // [i64]: a view of the array
-let part = row[1..];              // checked: lo <= hi <= len
-std::print_int(copy[0][0] + part.len() as i64 + part[1]);
-println("");
-```
-```out
-7
-```
-
-Indexing (`a[i]`, any integer type) and slicing (`a[lo..hi]`, `a[..hi]`,
-`a[lo..]`, `a[..]`) are checked: out of bounds, the program prints
-`index out of bounds: index I, length N` and exits with 101. An array
-has its length too: `a.len()` (0.17), or slice it: `a[..].len()`. A function taking `[T]` gets
-`a[..]`, not `a`. An array literal where a slice of numbers goes takes
-its element type (0.25.2.1): `let xs: [u32] = [1, 2, 3];`, `sum([1, 2])`
-for `xs: [u32]`. A slice of a raw pointer, `p[0..n]`, is unchecked and
-unsafe.
-
-## Accesses and pointers
-
-An *access* is how a function reaches a value it does not own: a let
-parameter (read-only), an `x: inout T` parameter (exclusive, writes
-reach the caller, passed as `&place`), an `inout r = &place;` local, an
-access field (`q: inout Query`). All are checked (`volec guide
-memory`), safe, and used as the value itself: `r.n += 5`, `r = v`, `n +
-1`, with no `*`. A raw pointer `*T` (from C, `&place` where a `*T` is
-expected, `0 as *T` for null) is dereferenced only in `unsafe`. There is
-no pointer arithmetic: index a raw pointer (`p[i]`, `&p[i]`) in unsafe
-code, or cast through `i64`. Through an access to a Vec, a Buf or a
-slice, `p[i]` is that element, checked; through a raw pointer it is
-`unsafe`.
-
-```vole
-struct Counter { n: i64 }
-
-fn bump(c: inout Counter) { c.n += 1; }  // an access: safe
-
-fn main() -> i32 {
-    var c = Counter { n: 0 };
-    bump(&c);
-    inout r = &c;                        // an inout local: safe
-    r.n += 5;
-    let p = &c as *Counter;              // a raw pointer: unsafe
-    unsafe { p.n += 5; }
-    std::print_int(c.n);
-    println("");
-    0
-}
-```
-```out
-11
-```
-
-## Distinct types
-
-`type NodeId = distinct i64;` is a new type, as Go's defined types are:
-T's representation and ABI, but not interchangeable with T. `as`
-converts both ways for free (`id as i64`, `n as NodeId`); a literal is
-the one implicit conversion. T's operators work between two values of
-the type, or one and a literal (`a + 1`, `m / 2.0`, `a < b` is a bool);
-mixing it with T is `distinct.mix`, whose `try:` is the `as` to write
-(`volec fix --suggested` writes them all). It has T's Eq, Ord, Hash,
-Debug, Display and Clone (`Vec<NodeId, Gpa>` sorts, prints, is a HashMap key)
-and T's literal patterns, but none of T's methods (`distinct.method`):
-`impl NodeId { .. }` adds its own. `type Id<T> = distinct i64;` makes
-`Id<Node>` and `Id<Edge>` two types. T is plain: numbers, bool, raw
-pointers, and structs, tuples and arrays of them; not owned (a Vec, a
-type with a Drop impl) nor a view (a slice, an access field) (`distinct.kind`).
-
-```vole
-type NodeId = distinct i64;
-type Meters = distinct f64;
-
-impl NodeId {
-    fn next(self) -> NodeId { self + 1 }
-}
-
+fn sum(xs: &[u32]) -> u32 { xs.iter().sum() }
 fn main() {
-    let a: NodeId = 3;
-    let b = a.next() * 2;              // NodeId
-    let x: f64 = 0.5;
-    let d: Meters = 2.0;
-    let e = d + x as Meters;           // `d + x` is distinct.mix
-    println("{b} {} {e} {}", a < b, b as i64 + 1);
+    let mut grid = [[0i64; 3]; 2];      // [[i64; 3]; 2]
+    grid[1][2] = 5;
+    let copy = grid;                  // arrays are Copy: copied whole
+    grid[0][0] = 1;
+    let row = &grid[1][..];           // &[i64]: a borrow of the array's row
+    let part = &row[1..];             // checked: lo <= hi <= len
+    println("{} {} {}", copy[0][0] + part.len() as i64 + part[1], grid.len(), sum(&[1, 2]));
+    let t = (1, "a");
+    let one = (5,);
+    println("{} {} {}", t.0, t.1, one.0);
 }
 ```
 ```out
-8 true 2.5 9
+7 2 3
+1 a 5
 ```
 
-`std::NonNull<T>` is std's `distinct *T` that is never null:
-`NonNull::new(p)` is `Some` unless p is null, `p as NonNull<T>` is
-checked (a null p exits 101: `null pointer made NonNull`), `p.as_ptr()`
-(or `p as *T`) is the raw pointer, and dereferencing stays `unsafe`.
-`Option<NonNull<T>>` is one pointer, `None` the null one, so it is the
-field type of a nullable link and C's nullable pointer in an `extern
-"C"` signature; a C header's `_Nonnull` pointers import as NonNull (a
-result is C's promise, which the unsafe call vouches for). `_Nonnull`
-is clang's nullability qualifier: imports read headers as the system's
-C compiler does, so they see it where that compiler is clang (macOS);
-with gcc (most Linux systems) a header has no such qualifier and its
-pointers import as `*T`. Any `*T` has `p.is_null()`.
+Indexing (`a[i]`) and slicing (`a[lo..hi]`, `a[..hi]`, `a[lo..]`,
+`a[..]`) are checked: out of bounds, the program prints `index out of
+bounds: index I, length N` and exits with 101. An index may be any
+integer type (vole's; rustc's is `usize`). A function taking `&[T]`
+takes `&a` of an array or a Vec. An array is `Copy` when its elements
+are.
 
-```vole
-use std::NonNull;
+## References and pointers
 
-struct Node { value: i64, next: Option<NonNull<Node>> }
+A reference, `&T` or `&mut T`, is checked (`volec guide memory`) and
+safe; a field or method through one needs no `*` (`r.n += 5`), a value
+does (`*r += 1`). A raw pointer (`&x as *const T`, `&mut x as *mut T`,
+`std::ptr::null()`) is dereferenced only in `unsafe`, `(*p).n`;
+`p.add(i)` is pointer arithmetic, unsafe (`guide unsafe`).
 
-fn main() {
-    let b = Node { value: 2, next: None };
-    let a = Node { value: 1, next: NonNull::new(&b) };
-    var total = 0;
-    var cur = NonNull::new(&a);
-    while let Some(p) = cur {
-        unsafe {
-            total += (*p.as_ptr()).value;
-            cur = (*p.as_ptr()).next;
-        }
-    }
-    println("{total} {}", size_of(Option<NonNull<Node>>));
-}
-```
-```out
-3 8
-```
+`std::ptr::NonNull<T>` is a `*mut T` that is never null:
+`NonNull::new(p)` is `Some` unless p is null, `p.as_ptr()` is the raw
+pointer, and dereferencing stays `unsafe`. `Option<NonNull<T>>` is the
+field type of a nullable link. Any raw pointer has `p.is_null()`.
 
 ## Enums as integers
 
+`#[repr(u8)] enum Level { Low = 1, Mid = 5, High = 9 }` gives each
+variant its value: `l as u8`. vole also casts back, checked: `9 as
+Level` is `High`, `4 as Level` exits 101 (`invalid value 4 for enum
+Level`); rustc has no such cast (E0605).
+
 ```vole
+use std::ptr::NonNull;
+
+struct Counter { n: i64 }
+
+fn bump(c: &mut Counter) { c.n += 1; }   // a reference: checked, safe
+
+struct Node { value: i64, next: Option<NonNull<Node>> }
+
+#[derive(Clone, Copy, PartialEq, PartialOrd, Debug)]
 #[repr(u8)]
 enum Level { Low = 1, Mid = 5, High = 9 }
 
-fn main() -> i32 {
+fn main() {
+    let mut c = Counter { n: 0 };
+    bump(&mut c);
+    let r = &mut c;
+    r.n += 5;                            // auto-deref: (*r).n
+    let p = &mut c as *mut Counter;      // a raw pointer: deref in unsafe
+    unsafe { (*p).n += 5; }
+    let b = Node { value: 2, next: None };
+    let a = Node { value: 1, next: NonNull::new(&b as *const Node as *mut Node) };
+    let mut total = 0;
+    let mut cur = NonNull::new(&a as *const Node as *mut Node);
+    while let Some(q) = cur {
+        unsafe {
+            total += (*q.as_ptr()).value;
+            cur = (*q.as_ptr()).next;
+        }
+    }
     let l = Level::Mid;
-    std::print_int(l as i64);
-    if Level::Low < l { println(" above low"); }   // declaration order
-    let back = 9 as Level;                         // checked: 4 as Level exits 101
-    if back == Level::High { println("high"); }
-    0
+    println("{} {total} {} {} {}", c.n, std::mem::size_of::<NonNull<Node>>(), l as u8, Level::Low < l);
+    println("{} {}", std::mem::size_of::<(u8, u32)>(), std::mem::align_of::<u64>());
 }
 ```
 ```out
-5 above low
-high
+11 3 8 5 true
+8 8
 ```
 
 ## Layout
 
-`size_of(T)` and `align_of(T)` are constants. Vole's own types have
-no guaranteed layout (field order, enum tags, slices); `#[repr(C)]`
-gives C's. See `volec guide c-interop`.
+`std::mem::size_of::<T>()` and `align_of::<T>()` are constants. vole's
+own types have no guaranteed layout (field order, enum tags);
+`#[repr(C)]` gives C's. See `volec guide c-interop`.
+
+## Distinct types
+
+vole's: `type NodeId = distinct i64;` is a new type, as Go's defined
+types are: T's representation and ABI, but not interchangeable with T.
+`as` converts both ways for free (`id as i64`, `n as NodeId`); a
+literal is the one implicit conversion. T's operators work between two
+values of the type, or one and a literal (`a + 1`, `a < b` is a bool);
+mixing it with T is `distinct.mix`, whose `try:` is the `as` to write.
+It has T's comparisons, Hash, Debug, Display and Clone, but none of T's
+methods (`distinct.method`): `impl NodeId { .. }` adds its own. T is
+plain: numbers, bool, raw pointers, and structs, tuples and arrays of
+them (`distinct.kind`).
 
 ## SIMD vectors
 
-`v4f32(a, b, c, d)`, `v4f32::splat(x)`, `v4f32::load(s, i)` (checked)
-make vectors; `+ - *` work lane by lane on all six types, `/` on float
-vectors, `& | ^` on integer ones; comparisons give a mask
+`v4f32(a, b, c, d)`, `v4f32::splat(x)`, `v4f32::load(s, i)` (checked,
+`s` a slice) make vectors; `+ - *` work lane by lane on all six types,
+`/` on float vectors, `& | ^` on integer ones; comparisons give a mask
 (`m.select(a, b)`); `v.lane(i)`, `v.with_lane(i, x)`, `v.sum()`,
-`v.store(s, i)`. They are not FFI-safe.
+`v.store(&mut s, i)`. They are not FFI-safe.
 
-| bytes | signed | unsigned (0.19) | float |
+| bytes | signed | unsigned | float |
 |---|---|---|---|
-| 8 (0.19) | `v8i8 v4i16 v2i32 v1i64` | `v8u8 v4u16 v2u32 v1u64` | `v2f32 v1f64` |
+| 8 | `v8i8 v4i16 v2i32 v1i64` | `v8u8 v4u16 v2u32 v1u64` | `v2f32 v1f64` |
 | 16 | `v16i8 v8i16 v4i32 v2i64` | `v16u8 v8u16 v4u32 v2u64` | `v4f32 v2f64` |
-| 32 (0.19) | `v32i8 v16i16 v8i32 v4i64` | `v32u8 v16u16 v8u32 v4u64` | `v8f32 v4f64` |
+| 32 | `v32i8 v16i16 v8i32 v4i64` | `v32u8 v16u16 v8u32 v4u64` | `v8f32 v4f64` |
 
 An unsigned vector compares unsigned, and its mask is itself (a lane all
 ones or 0); 32-byte vectors are two registers where the CPU has no wider
@@ -244,11 +195,16 @@ instruction. The CPU's own instructions on them (NEON, SSE, AVX2, CRC,
 AES, SHA) are `std::arch`'s: `volec guide arch`.
 
 ```vole
-let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
-let v = v4f32::load(xs[..], 0) * v4f32::splat(2.0);
-std::print_int(v.sum() as i64);
-println("");
+fn main() {
+    let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let s: &[f32] = &xs;
+    let v = v4f32::load(s, 0) * v4f32::splat(2.0);
+    let mut out = [0.0f32; 4];
+    v.store(&mut out[..], 0);
+    let m = v < v4f32::splat(5.0);       // a mask, lane by lane
+    println("{} {} {:?}", v.sum(), m.select(v, v4f32::splat(0.0)).sum(), out);
+}
 ```
 ```out
-20
+20 6 [2.0, 4.0, 6.0, 8.0]
 ```
