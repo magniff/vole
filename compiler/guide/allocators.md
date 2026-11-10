@@ -185,5 +185,5 @@ allocated and freed; leaks are listed at exit (`gpa.check_leaks()` in a
 test). Arenas and `FixedBuf` are checked the same way: a block
 used after their `reset`, after its scope ended, or after it moved is
 reported. Views (`as_slice()`, a `[T]`) into memory that was freed or
-moved are rejected in safe code since 0.17 (`volec guide views`);
+moved are rejected in safe code since 0.17 (`volec guide memory#slices`);
 this mode still finds them in `unsafe` code and under `--values=off`.

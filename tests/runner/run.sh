@@ -239,8 +239,8 @@ got=$(sh "$ROOT/tests/run.sh" -l -n readme_sync -n example_helloworld | sort | t
 # that fails every case)
 printf '#!/bin/sh\necho "error: no" >&2\nexit 1\n' >"$WORK/failing-volec"
 chmod +x "$WORK/failing-volec"
-got=$(sh "$ROOT/tests/run.sh" -c "$WORK/failing-volec" -j 2 -n abi_c_structs -n abi_callee_alignment 2>&1 | tail -1)
-[ "$got" = "try: tests/run.sh -n abi_c_structs -n abi_callee_alignment   (the failing cases alone)" ] \
+got=$(sh "$ROOT/tests/run.sh" -c "$WORK/failing-volec" -j 2 -n abi_callee_alignment -n abi_extern_small_struct 2>&1 | tail -1)
+[ "$got" = "try: tests/run.sh -n abi_callee_alignment -n abi_extern_small_struct   (the failing cases alone)" ] \
     && ok filters_try_dash_n || bad filters_try_dash_n "got '$got'"
 # tests/affected.map: every set, cmd and prefix it names exists.
 problems=$(awk '

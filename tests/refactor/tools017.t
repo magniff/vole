@@ -169,11 +169,11 @@ $ undo
 undid rewrote 2 sites in 1 file	main.vl	+4 -3 lines
 ## rewrite refused (edit.breaks): a hole of several types gets --where per type.
 $ rewrite '$v.len() == 0' '$v.is_empty()'
-calc.vl:29:8: error[type error] no method 'is_empty' on type 'let Text' | try: volec query items Text main.vl  [edited: crate::calc::empties]
-error edit.breaks: 1 new error; nothing written; the error: calc.vl:29:8: no method 'is_empty' on type 'let Text'
-note rewrite.where: $v has 2 types at the sites: letVec<str,Gpa> (1 site), letText (1 site); --where takes the ones the replacement fits
-try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: letVec<str,Gpa>'
-try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: letText'
+calc.vl:29:8: error[type error] no method 'is_empty' on type '&Text' | try: volec query items Text main.vl  [edited: crate::calc::empties]
+error edit.breaks: 1 new error; nothing written; the error: calc.vl:29:8: no method 'is_empty' on type '&Text'
+note rewrite.where: $v has 2 types at the sites: &Vec<&str,Gpa> (1 site), &Text (1 site); --where takes the ones the replacement fits
+try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: &Vec<&str,Gpa>'
+try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: &Text'
 try: volec rewrite '$v.len() == 0' '$v.is_empty()' --no-check
 [exit 1]
 ## refactor rename: a path mention must name the item's module.
