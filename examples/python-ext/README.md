@@ -97,7 +97,7 @@ the module calls real exported functions.
 ### The single Python-visible function
 
 ```tach
-extern "C" fn hello(self: *py::PyObject, args: *py::PyObject) -> *py::PyObject {
+extern "C" fn hello(module: *mut py::PyObject, args: *mut py::PyObject) -> *mut py::PyObject {
     unsafe {
         py::PySys_WriteStdout(c"hello from vole\n");
         py::Py_BuildValue(c"")
@@ -120,9 +120,9 @@ second entry is the zeroed terminator) and a `PyModuleDef`, fills them,
 and returns `PyModule_Create2(def, PYTHON_API_VERSION)`:
 
 ```tach
-extern "C" fn PyInit_vole_hello() -> *py::PyObject {
-    let methods = unsafe { c::calloc(2, size_of(py::PyMethodDef) as u64) as *py::PyMethodDef };
-    let def = unsafe { c::calloc(1, size_of(py::PyModuleDef) as u64) as *py::PyModuleDef };
+extern "C" fn PyInit_vole_hello() -> *mut py::PyObject {
+    let methods = unsafe { c::calloc(2, size_of::<py::PyMethodDef>() as u64) as *mut py::PyMethodDef };
+    let def = unsafe { c::calloc(1, size_of::<py::PyModuleDef>() as u64) as *mut py::PyModuleDef };
     // ... fill methods and def ...
     unsafe { py::PyModule_Create2(def, py::PYTHON_API_VERSION) }
 }
@@ -167,7 +167,7 @@ the same. `cc` is therefore not asked to find a Python library.
 
 ## Verified
 
-`make check` builds the object with Vole 0.25.1, links it with the
+`make check` builds the object with Vole 0.28.0, links it with the
 Python 3.14 `LDSHARED`, imports the result, checks the module and
 function documentation, and calls `hello()`:
 

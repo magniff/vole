@@ -2,7 +2,7 @@
 
 The MD5 digest (RFC 1321) of a file, or of stdin, printed in hex like
 `md5sum`. Fixed-size arrays, `u32` arithmetic that wraps, a streaming
-hash state, and the C library's `open` and `read`.
+hash state, and `std::fs` and `std::io` for the bytes.
 
 ## Build and run
 
@@ -34,9 +34,10 @@ the same program in C.
 static K: [u32; 64] = [0xd76aa478, 0xe8c7b756, ...];
 ```
 
-**Arithmetic that wraps.** MD5 is defined modulo 2^32, and vole's
-integers wrap on overflow (it is defined, never undefined behaviour), so
-`f + a + K[i] + m[g]` on `u32`s is MD5's addition as written in the RFC.
+**Arithmetic that wraps.** MD5 is defined modulo 2^32. A plain `+` that
+overflows panics at -O0 (and wraps at -O1 and above), so the additions
+say what they mean: `f.wrapping_add(a).wrapping_add(K[i])` wraps at
+every level.
 
 **A streaming state.** `Md5` keeps the four state words, the bytes of an
 incomplete 64-byte block, and the total length; `update` takes any number
@@ -44,43 +45,39 @@ of bytes, and `finish` pads the message and returns the digest as a
 `[u8; 16]` (an array, a value: returned by copy):
 
 ```tach
-struct Md5 { state: [u32; 4], block: [u8; 64], used: i64, total: u64 }
+struct Md5 { state: [u32; 4], block: [u8; 64], used: usize, total: u64 }
 
 impl Md5 {
-    fn update(inout self, data: [u8]) { ... }
-    fn finish(inout self) -> [u8; 16] { ... }
+    fn update(&mut self, data: &[u8]) { ... }
+    fn finish(&mut self) -> [u8; 16] { ... }
 }
 ```
 
-Methods take `inout self`, an exclusive access, to change the state in
-place; `hash.update(...)` lends `hash` itself.
+Methods take `&mut self`, an exclusive borrow, to change the state in
+place; `hash.update(...)` borrows `hash` itself.
 
 **Slices of an array.** `compress` gets each block as a slice,
-`data[at..at + 64]`, a view (pointer and length) into the bytes read: no
-copy. Indexing and slicing are bounds-checked. The pending block is the
-exception: `self.compress(self.block[..])` would view `self` while the
-call changes it, so `update` copies the 64 bytes first.
+`&rest[..64]`, a pointer and a length into the bytes read: no copy.
+Indexing and slicing are bounds-checked. The pending block is the
+exception: `self.compress(&self.block)` would borrow `self.block` while
+the call borrows `self` mutably (`borrowck.conflict`), so `update` copies
+the 64 bytes first.
 
-**Reading through C.** The file is read 64 KB at a time with the C
-library's `read`, declared by hand; a guard, `Fd`, whose `Drop` closes
-the file, closes it whatever path `main` leaves by:
+**Reading through std::io.** `digest` is generic over `io::Read`, which
+a `File` and stdin both implement, and reads 64 KiB at a time; `?`
+passes a read error up as an `io::Error`. The `File` closes when it is
+dropped, whatever path `main` leaves by:
 
 ```tach
-struct Fd { fd: i32 }
-
-impl Drop for Fd {
-    fn drop(inout self) {
-        if self.fd != 0 {
-            unsafe { close(self.fd); }
-        }
+fn digest<R: Read>(input: &mut R) -> io::Result<[u8; 16]> {
+    let mut hash = Md5::new();
+    let mut chunk: [u8; 65536] = [0; 65536];
+    loop {
+        let n = input.read(&mut chunk)?;
+        if n == 0 { break; }
+        hash.update(&chunk[..n]);
     }
-}
-
-let _file = Fd { fd };
-loop {
-    let n = unsafe { read(fd, &chunk as *u8, 65536) };
-    if n <= 0 { break; }
-    hash.update(chunk[..n]);
+    Ok(hash.finish())
 }
 ```
 
@@ -88,15 +85,15 @@ loop {
 with a zero to a width of 2:
 
 ```tach
-for byte in hash.finish() {
-    hex.push_fmt("{byte:02x}");
+for byte in bytes {
+    write(&mut hex, "{byte:02x}").unwrap();
 }
 ```
 
 ## Language features
 
 - fixed-size arrays, slices, `u32`/`u64` and wrapping arithmetic: `volec guide types`
-- statics, structs, methods on `inout self`: `volec guide syntax`
-- a guard with `Drop`: `volec guide memory`
-- `extern "C"` and `unsafe` calls: `volec guide c-interop`
-- hex format specs, `push_fmt`: `volec guide formatting`
+- statics, structs, methods on `&mut self`: `volec guide syntax`
+- files, `io::Read`, `io::Result` and `?`: `volec guide io`
+- generics with a trait bound: `volec guide generics`
+- hex format specs, `write` to a String: `volec guide formatting`
