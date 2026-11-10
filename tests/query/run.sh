@@ -297,8 +297,8 @@ check std_show_no_program "$ok" "$(printf '%s\n' "$out" | head -5)"
 # `query similar`.
 # (0.28.0: compiler/src reads std2, whose items are the built-in text's,
 # `<std>`; compiler/std's files are an MVS program's std, asked here of
-# tests/query/clash.)
-MVS_ROOT="--root $HERE/clash/main.vl"
+# tests/query/stdpos0253, MVS until D4.)
+MVS_ROOT="--root $HERE/stdpos0253/main.vl"
 out=$("$COMPILER" query def std::trim $MVS_ROOT 2>&1)
 loc=$(printf '%s\n' "$out" | awk -F "$TAB" '$1 == "std::trim" { print $2 }')
 ok=0
@@ -338,7 +338,10 @@ check self_similar "$ok" "$(printf '%s\n' "$out" | grep '^// ' | head -8)"
 # runtime's, nor std's statics: 0.20.0 names `vole.static.std.X` for a
 # static of a std submodule, which `query def` does not take back yet, a
 # 0.20.1 item; aarch64-linux's argv statics showed it; nor, 0.26.1, the
-# places IR's drop shims, `vole.$drop.T`: glue with no item of its own),
+# places IR's drop shims, `vole.$drop.T`: glue with no item of its own;
+# nor, 0.28.0, std2's methods of the integer types, `vole.Ty.max`: the
+# compiler's `#[builtin_impls]` text, `<builtin>`, which the tools do not
+# index yet),
 # each given to `query def` (positions and modules to `show` and `items`).
 cd "$HERE" || exit 2
 roundtrip() { # <program dir> <seed names...>
@@ -355,7 +358,7 @@ roundtrip() { # <program dir> <seed names...>
         "$COMPILER" query items 2>/dev/null | awk -F "$TAB" '{ print "items " $1; print "items " $2 }'
         "$COMPILER" check --diagnostics=short "$prog/main.vl" 2>&1 | awk '/^[^ ]*:[0-9]+:[0-9]+:/ { print "show " $1 }'
         "$COMPILER" "$prog/main.vl" -O0 -S -o "$WORK/rt.s" >/dev/null 2>&1 \
-            && awk '/^_?vole\.[^ \t]*:$/ && !/^_?vole\.rt\./ && !/^_?vole\.static\.std\./ && !/^_?vole\.\$drop\./ { sub(/:$/, ""); print "def " $0 }' "$WORK/rt.s"
+            && awk '/^_?vole\.[^ \t]*:$/ && !/^_?vole\.rt\./ && !/^_?vole\.static\.std\./ && !/^_?vole\.\$drop\./ && !/^_?vole\.T[asilhtjmyx]\./ { sub(/:$/, ""); print "def " $0 }' "$WORK/rt.s"
     } | sort -u >"$WORK/rt.names"
     : >"$WORK/rt.bad"
     n=0

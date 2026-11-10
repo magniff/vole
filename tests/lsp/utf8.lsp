@@ -19,7 +19,7 @@
 > {"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file://@DIR@/main.vl"}}}
 > {"jsonrpc":"2.0","id":6,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":7,"character":12}}}
 < {"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file://@DIR@/main.vl","diagnostics":[]}}
-< {"jsonrpc":"2.0","id":6,"result":{"contents":{"kind":"markdown","value":"```vole\npub fn area(s: Shape) -> i64\neffects: none (declared #[pure])\nfeatures: none\n```\n\n`crate::shapes::area` (fn)\n"},"range":{"start":{"line":7,"character":12},"end":{"line":7,"character":16}}}}
+< {"jsonrpc":"2.0","id":6,"result":{"contents":{"kind":"markdown","value":"```vole\npub fn area(s: Shape) -> i64\neffects: panic diverge (declared #[pure])\nfeatures: none\n```\n- panic ← (no source found)\n- diverge ← (no source found)\n\n`crate::shapes::area` (fn)\n"},"range":{"start":{"line":7,"character":12},"end":{"line":7,"character":16}}}}
 > {"jsonrpc":"2.0","id":7,"method":"shutdown"}
 < {"jsonrpc":"2.0","id":7,"result":null}
 > {"jsonrpc":"2.0","method":"exit"}

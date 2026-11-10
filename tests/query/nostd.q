@@ -1,26 +1,30 @@
 ## std from a program that does not use it (0.15): by path, by a name
 ## the program does not define, its source by `std`, grep in it, a
 ## show with the `use` line a program needs.
-$ def std::read_line Vec::push
-std::io::read_line	../../compiler/std/io.vl:61:8	fn	pub fn read_line<A: Allocator>(line: inout String<A>) -> std::Result<bool, IoError>
-std::Vec::push	../../compiler/std/std.vl:286:12	method	pub fn push(inout self, x: sink T)
+$ def std::mem::swap Vec::push
+std::mem::swap	<std>:1395:8	fn	pub fn swap<T>(a: &mut T, b: &mut T)
+std::vec::Vec::push	<std>:4548:12	method	pub fn push(&mut self, x: T) debug ensures self.len() == old(self.len()) + 1 debug ensures self.len() <= self.capacity()
 $ def read_line twice
-std::io::read_line	../../compiler/std/io.vl:61:8	fn	pub fn read_line<A: Allocator>(line: inout String<A>) -> std::Result<bool, IoError>
-std::io::buffered::BufReader::read_line	../../compiler/std/io/buffered.vl:152:12	method	pub fn read_line<A: Allocator>(inout self, s: inout String<A>) -> Result<i64>
+std::io::BufRead::read_line	<std>:19798:8	trait-method	fn read_line<A: Allocator>(&mut self, buf: &mut String<A>) -> Result<usize>
+std::io::Stdin::read_line	<std>:20078:12	method	pub fn read_line<A: Allocator>(&self, buf: &mut String<A>) -> Result<usize>
 crate::twice	nostd/main.vl:4:4	fn	fn twice(x: i64) -> i64	effects: none
-$ show std::print_int
-// std::fmt::print_int	../../compiler/std/fmt.vl:194-204	effects: io panic
-// use std::print_int;
-#[inline(never)]
-pub fn print_int(v: i64) {
-    print_acquire();
-    var f = Fmt::to_fd(1);
-    // (decimal only: not Fmt::int, whose hex and binary every program
-    // using print_int would compile)
-    let negative = v < 0;
-    fmt_decimal(&f, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative);
-    f.flush();
-    print_release();
+$ show std::mem::swap
+// std::mem::swap	<std>:1392-1406
+// use std::mem::swap;
+// Exchanges the values of two places (MVS: two inout parameters).
+// std2: changed: takes &mut T twice
+#[effects(unsafe, T)]
+pub fn swap<T>(a: &mut T, b: &mut T) {
+    // UNSAFE: raw moves (an assignment would drop the old value).
+    // SAFETY: a and b are two live &mut, so valid, aligned and distinct;
+    // each value is read once and ends in exactly one place.
+    unsafe {
+        let pa = a as *mut T;
+        let pb = b as *mut T;
+        let t = crate::ptr::read(pa as *const T);
+        crate::ptr::copy_nonoverlapping(pb as *const T, pa, 1);
+        crate::ptr::write(pb, t);
+    }
 }
 $ text std:1-2
 // std:1-2
@@ -28,8 +32,7 @@ $ text std:1-2
 2	// (compiler/std/embed.sh makes compiler/src/front/stdsrc.vl from this file,
 $ grep 'pub fn read_line' --in std
 # <std>
-10936:1	code	std::io	pub fn read_line<A: Allocator>(line: inout String<A>) -> std::Result<bool, IoError> {
-10553:5	code	std::io::buffered	pub fn read_line<A: Allocator>(inout self, s: inout String<A>) -> Result<i64> {
+20078:5	code	std::io	pub fn read_line<A: Allocator>(&self, buf: &mut String<A>) -> Result<usize> {
 $ def no_such_name
 error query.no-match: no definition 'no_such_name'
 try: volec query items
