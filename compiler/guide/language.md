@@ -1,18 +1,17 @@
-# The language, the long form (vole 0.20)
+# The language, the long form (vole 0.28)
 
-Vole is a compiled systems language of values: structs, enums with
-exhaustive `match`, traits and generics (monomorphized), modules,
-checked slices, `unsafe` raw pointers, exact C interop. A value has one
-owner and is dropped at the end of its scope; a function says what it
-does with each parameter, `let` (the default: it reads it), `inout`
-(it changes it: the caller writes `&x`) or `sink` (it takes it), and
-the compiler checks that no two accesses of a value conflict. There
-are no lifetimes to write and no macros. Nothing allocates without an
-allocator, and every function's effects are known (0.16). Safe code
-has no undefined behaviour. This text matches this compiler;
-`volec guide` is the short core of this text, `volec guide TOPIC`
-the detail (topics at the end); `volec guide --full` prints this
-topic with std's API in its place.
+Vole is a compiled systems language with Rust's surface: structs, enums
+with exhaustive `match`, traits and generics (monomorphized), closures,
+iterators, modules, checked slices, `unsafe` raw pointers, exact C
+interop. Ownership is Rust's: a value has one owner and is dropped at
+the end of its scope; `&T` and `&mut T` borrow it, checked by the borrow
+checker, with lifetimes where a signature needs them. It is not Rust in
+a few places (the table below): there are no macros, and nothing
+allocates without an allocator. Every function's effects are known.
+Safe code has no undefined behaviour. This text matches this compiler;
+`volec guide` is the short core of this text, `volec guide TOPIC` the
+detail (topics at the end); `volec guide --full` prints this topic with
+std's API in its place.
 
 ## Build and run
 
@@ -34,101 +33,93 @@ hello
 ```
 
 `main` returns the exit status (`fn main()` with no result is 0).
-`fn main(gpa: Gpa)` takes the program's allocator (below), `fn
-main(argc: i32, argv: **u8, gpa: Gpa)` the arguments too. Several files
-on the command line make one program; `mod name;` loads `name.vl`.
+`fn main(gpa: Gpa)` takes the program's allocator (below); the
+arguments are `std::env::args()`. Several files on the command line
+make one program; `mod name;` loads `name.vl`.
 
-## Rust habits and what vole has instead
+## Where it is not Rust
 
 | Rust | vole |
 |---|---|
-| `String`, `&str` | the same (0.20): `str` (UTF-8 text, a view; `&str` is `str`) and `String` (owned, `String::new_in(gpa)`); bytes are `[u8]`; `c"text"` is a NUL-terminated `*u8` for C |
-| `x: &T`, `x: &mut T`, `x: T` | conventions (0.20): `x: T` (let: read; called `f(v)`), `x: inout T` (called `f(&v)`), `x: sink T` (taken; an owned argument moves); no lifetimes; `*T` is the raw pointer: dereferencing it needs `unsafe`; no `Box` (`guide rust`: the whole mapping) |
-| `fn f(&self)`, `fn f(&mut self)`, `fn f(self)` | `fn f(self)`, `fn f(inout self)`, `fn f(sink self)` |
-| `let mut x`, `move \|\|` | `var x`, `sink \|\|`; `inout r = &x;` keeps an access, used as `x` itself (no `*r`) |
+| `println!("{}", x)`, `format!`, `vec!`, `assert!` | no macros: functions, `println("x = {x:>4} {:?}", v)`, `format_in("..", args, gpa)` (a `String`), `assert(c)`, `panic("..")` (`guide formatting`) |
+| `Vec::new()`, a global allocator | `Vec::new_in(gpa)`: nothing allocates without an allocator; `gpa` comes from `fn main(gpa: Gpa)`, passed down as a parameter (`guide allocators`) |
+| `Vec<T>`, `String`, `HashMap<K, V>`, `Box<T>` | the allocator is in the type: `Vec<T, Gpa>`, `String<Gpa>`, `HashMap<K, V, Gpa>`, `Box<T, Gpa>`; a struct that holds one is generic over it (`struct S<A: Allocator> { v: Vec<u8, A> }`) |
+| `s.to_string()`, `it.collect()`, `s.to_uppercase()` | what allocates has the name with `_in` and takes the allocator last: `to_string_in(gpa)`, `collect_in(gpa)` (`alloc.no_in` names it; `volec fix --only alloc`) |
 | `use m::*;` | not allowed: `use m::{a, b};`, or the path `m::a` |
-| `println!("{}", x)`, `format!` | no macros: `println("x = {x:>4} {:?}", v)`, `format_in("..", args, gpa)` (a `String`) (`guide formatting`) |
-| `Vec::new()`, a global allocator | `Vec::new_in(gpa)`: nothing allocates without an allocator; `gpa` comes from `fn main(gpa: Gpa)`, passed down as a parameter (0.16, `guide allocators`) |
-| `Box<T>`, arenas | a `Vec`; `arena_scope(gpa, \|a\| ..)` frees all it allocated at its end; `--check-alloc` traps a use after free |
-| `const fn`, purity | `#[pure]`, `#[no_alloc]`: checked declarations; `volec query effects f` (0.16, `guide effects`) |
-| `v[i]` on a `Vec` | the same (0.17): `v[i]`, `v[i] = x`, `v[a..b]` index its slice, checked, also through an access (`v: inout Vec<i64, Gpa>`); `v.get(i)`, `v.set(i, x)` too |
-| closures, `.iter().map()` | the same (0.14): `v.iter().map(\|x\| x * k).sum()`; `F: Fn(i64) -> i64` bounds; no `dyn Fn`, `iter_mut` (`guide closures`, `guide iterators`) |
-| `x?` | the same on `Option` and `Result` (0.15); `impl From<E> for F` converts the error; `main` may return `Result<(), E>` (`guide conversions`) |
-| `impl Trait for T`, `T: Trait` | the same; `type Item;` associated types (0.14); `#[derive(Eq, Ord, Hash, Debug, Clone)]` (0.15); no `dyn`, supertraits; `where` (0.26.2) |
-| `Drop`, RAII | the same (0.17): values are dropped at the end of their scope; `impl Drop for T`, `drop(x)`, `std::forget(x)`; no `free` calls (`guide memory`) |
-| `!x` on integers | `~x`; `!` is for `bool` only |
-| `i64::MAX`, `x.abs()`, `x.pow(2)` | `i64::MAX`, `u8::MIN` the same (0.15); floats have Rust's methods (`x.sqrt()`, `x.powi(2)`, `f64::consts::PI`: `guide math`, 0.25.2.1), integers `abs`, `signum`, `min`, `max`, `clamp`, `pow` (0.25.2.2) |
-| overflow panics, `/ 0` panics | integers wrap; `x / 0 == 0`, `x % 0 == x`; no panic |
-| `match s { "add" => ... }` | strings are not patterns: `if s == "add" { ... }` |
-| `char` | none: `'a'` is a `u8` (one ASCII byte) |
-| no default or named arguments | `fn f(a: i64, b: i64 = 2)`, `f(1, b: 3)` (0.15): named ones last, in order |
-| `usize`, implicit `i32` -> `i64` | lengths and indices are `usize` (0.26.2); lossless widening (0.15), `a as i32` narrows |
+| `a as i64` to widen | written or not: an `i32` goes where an `i64` does, losslessly; `a as i32` narrows (`guide conversions`) |
+| `v[i as usize]` | an index may be any integer type |
+| `dyn Trait`, `i128`, `async`, macros by example, a function inside a function, a string literal as a pattern | not there: dispatch is static (`impl Trait`, generics); `if s == "add"` |
+| contracts, effects | `requires`/`ensures` clauses, `#[no_alloc]`, `volec query effects f` (`guide contracts`, `guide effects`) |
 
-The prelude, in every module without `use`: `Option`, `Some`, `None`,
-`Result`, `Ok`, `Err`, `Vec`, `print`, `println`, `eprint`, `eprintln`,
-`format_in`, `Gpa`, `Arena`, `ScopedArena`, `arena_scope`, and the traits
-`Add`, `Sub`, `Mul`, `Div`, `Neg`, `Eq`, `Ord`, `Hash`, `Display`, `Debug`,
-`Clone`, `From`, `Into`, `Allocator`. The rest of std is used by path
-(`std::print_int(n)`) or imported (`use std::{HashMap, is_digit};`).
-Calling C or an `unsafe fn`, and dereferencing or indexing a raw
-pointer, are allowed only in `unsafe { }` (`volec guide rust`: the
-full list).
+`volec guide rust` has every difference. The prelude, in every module
+without `use`, is Rust's (`Option`, `Some`, `None`, `Result`, `Ok`,
+`Err`, `Vec`, `String`, `Box`, `Clone`, `Copy`, `Default`, `Drop`,
+`PartialEq`, `Eq`, `PartialOrd`, `Ord`, `From`, `Into`, `Iterator`...)
+plus `Gpa` and, as functions, Rust's macros: `print`, `println`,
+`eprint`, `eprintln`, `format_in`, `write`, `writeln`, `panic`,
+`assert`, `assert_eq`, `assert_ne`, `debug_assert`, `todo`,
+`unimplemented`, `unreachable`. The rest of std is used by path
+(`std::mem::swap(&mut a, &mut b)`) or imported (`use
+std::collections::HashMap;`). Calling C or an `unsafe fn`,
+dereferencing a raw pointer and using a `static mut` are allowed only
+in `unsafe { }` (`volec guide unsafe`: the full list).
 
 ## Values and types
 
 ```vole
-let a = 42;               // i64: an integer literal is i64 unless the context says
+let a = 42;               // i32: an integer literal is i32 unless the context says
 let b: u8 = 255;          // i8 i16 i32 i64 u8 u16 u32 u64 isize usize
 let c = 3u32;             // suffixes; 1_000, 0xff, 0b1010
 let d = 2.5;              // f64; 2.5f32 is f32
-let e = 'A';              // u8: a byte, ASCII only
+let e = 'A';              // char: a Unicode scalar value; b'A' is a u8
 let f = true;             // bool
-let s = "bytes";          // [u8]: s.len() (an i64), s[0], s[1..3]
-let p = c"for C";         // *u8, NUL-terminated
+let s = "text";           // &str: s.len() (bytes), &s[1..3], s.chars()
+let bs = b"bytes";        // &[u8; 5]: bs[0]
+let p = c"for C";         // *const u8, NUL-terminated
 let t = (1, "two");       // a tuple: t.0, t.1
-let arr = [0; 8];         // [i64; 8]; also [1, 2, 3]; arr[i] is checked
-var n = a as i32;         // `as` converts numbers; nothing converts implicitly
-n += c as i32 + b as i32 + e as i32;
+let arr = [0; 8];         // [i32; 8]; also [1, 2, 3]; arr[i] is checked
+let mut n = a as u8;      // `as` converts numbers; only widening is implicit
+n += c as u8 + b / 5 + e as u8;
 ```
 
-`let` bindings are immutable, `var` ones mutable. Shadowing (`let x =
-x + 1;`) is allowed. `const N: i64 = 10;` and `static var COUNT: i64 = 0;`
-are items (statics are safe to use; with threads, a `static var` is for
-one thread: `guide threads`). Integers wrap, `x / 0 ==
-0`, `x % 0 == x`; indexing, slicing, `unwrap` and casts to enums are
-checked (a message, exit 101): `guide types`.
+`let` bindings are immutable, `let mut` ones mutable. Shadowing (`let x
+= x + 1;`) is allowed. `const N: i64 = 10;` and `static LIMIT: i64 = 3;`
+are items; a `static mut` is read and written in `unsafe` (`guide
+threads`). Overflow panics at -O0 and wraps at -O1 and above, `x / 0`
+panics; indexing, slicing, `unwrap` and casts to enums are checked (a
+message, exit 101): `guide types`.
 
 ## Functions and control flow
 
 ```vole
-fn classify(n: i64) -> [u8] {
+fn classify(n: i64) -> &'static str {
     if n < 0 { "negative" } else if n == 0 { "zero" } else { "positive" }
 }
 
-fn greet(name: [u8], times: i64 = 1, sep: [u8] = " ") {   // defaults (0.15)
+fn greet(name: &str, times: i64, sep: &str) {
     for _ in 0..times { print("hi {name}{sep}"); }
 }
 
 fn main() -> i32 {
-    var total = 0;
-    for i in 0..10 {              // 0..10 and 0..=9: ranges exist only in `for`
+    let mut total = 0;
+    for i in 0..10 {              // 0..10 and 0..=9; (0..10).rev(), .step_by(2)
         if i % 2 == 0 { continue; }
         total += i;
     }
-    var k = 0;
+    let mut k = 0;
     while k < 3 { k += 1; }
     let found = loop {            // loop's value comes from `break value`
         k += 1;
         if k * k > 50 { break k; }
     };
-    outer: for i in 0..5 {        // a label: `name:`, then `break :name`
+    'outer: for i in 0..5 {       // a label: `'name:`, then `break 'name`
         for j in 0..5 {
-            if i * j == 6 { break :outer; }
+            if i * j == 6 { break 'outer; }
         }
     }
-    greet("ann");
-    greet("bob", times: 2, sep: "! ");    // named arguments: last, in order
-    println(classify(total - found));
+    greet("ann", 1, " ");
+    greet("bob", 2, "! ");
+    println("{}", classify(total - found));
     0
 }
 ```
@@ -137,14 +128,17 @@ hi ann hi bob! hi bob! positive
 ```
 
 The last expression of a block, without `;`, is its value; `if`, `match`,
-`loop` and blocks are expressions. There are no nested functions.
+`loop` and blocks are expressions. A range is a value (`let r = 0..3;`,
+`(0..10).rev()`, `.step_by(2)`). There are no nested functions.
 
-## Parameters: let, inout, sink
+## References: &T, &mut T, by value
 
 ```vole
-struct Account<A: Allocator> { balance: i64, log: Vec<i64, A> }
+use std::alloc::Allocator;
 
-fn transfer(from: inout Account<Gpa>, to: inout Account<Gpa>, amount: i64) -> bool {
+struct Account<A: Allocator> { balance: i64, log: Vec<i64, A> } // the allocator: a parameter
+
+fn transfer(from: &mut Account<Gpa>, to: &mut Account<Gpa>, amount: i64) -> bool {
     if from.balance < amount { return false; }
     from.balance -= amount;
     to.balance += amount;
@@ -153,19 +147,19 @@ fn transfer(from: inout Account<Gpa>, to: inout Account<Gpa>, amount: i64) -> bo
     true
 }
 
-fn report(a: Account<Gpa>, out: inout i64) { out += a.balance; } // an access is its value
+fn report(a: &Account<Gpa>, out: &mut i64) { *out += a.balance; } // *out: the caller's i64
 
-fn keep(all: inout Vec<Account<Gpa>, Gpa>, a: sink Account<Gpa>) { all.push(a); }
+fn keep(all: &mut Vec<Account<Gpa>, Gpa>, a: Account<Gpa>) { all.push(a); }
 
 fn main(gpa: Gpa) {
-    var a = Account { balance: 100, log: Vec::new_in(gpa) };
-    var b = Account { balance: 5, log: Vec::new_in(gpa) };
-    transfer(&a, &b, 30);                 // the call shows what changes
-    var sum = 0;
-    report(a, &sum);
-    report(b, &sum);
-    var all: Vec<Account<Gpa>, Gpa> = Vec::new_in(gpa);
-    keep(&all, a);                        // a moves: dead from here
+    let mut a = Account { balance: 100, log: Vec::new_in(gpa) };
+    let mut b = Account { balance: 5, log: Vec::new_in(gpa) };
+    transfer(&mut a, &mut b, 30);         // the call shows what changes
+    let mut sum = 0;
+    report(&a, &mut sum);
+    report(&b, &mut sum);
+    let mut all: Vec<Account<Gpa>, Gpa> = Vec::new_in(gpa);
+    keep(&mut all, a);                    // a moves: dead from here
     println("{sum} {} {}", all[0].log.len(), b.balance);
 }
 ```
@@ -173,30 +167,32 @@ fn main(gpa: Gpa) {
 105 1 35
 ```
 
-- `let` (nothing written) reads: a plain value (`i64`, `Point`) is
-  copied, an owned one (`Vec`, a struct with one) is borrowed for the
-  call, so the caller keeps it. `inout` changes the caller's place,
-  exclusively: `transfer(&a, &a, 1)` is `own.conflict`. `sink` takes the
-  value: the callee owns it, may change it, and drops it.
-- Inside the function every parameter is used as the value: `out +=
-  a.balance`, `from.log.push(x)`; there is no `*`.
-- `inout r = &a;` is a local access to `a`, passed on as `f(&r)`; `let`
-  and `var` locals own their value (`guide memory`).
+- `&T` reads: any number of them at once. `&mut T` changes the caller's
+  place, exclusively: `transfer(&mut a, &mut a, 1)` is
+  `borrowck.mut_twice`. A parameter by value takes the argument: a
+  `Copy` value (`i64`, a struct deriving `Clone, Copy`) is copied, any
+  other moves, and the callee owns it and drops it.
+- Through a reference, a field or a method needs no `*`
+  (`from.balance`, `from.log.push(x)`); the value itself does (`*out +=
+  1`).
+- `let r = &mut a;` keeps a borrow, passed on as `f(r)`; it ends at its
+  last use (`guide memory`).
 
 ## Structs, enums, match, methods
 
 ```vole
+#[derive(Clone, Copy, PartialEq, Debug)]
 struct Point { x: i64, y: i64 }
 
 enum Shape { Circle(Point, i64), Rect { min: Point, max: Point }, Empty }
 
 impl Point {
-    fn new(x: i64, y: i64) -> Point { Point { x: x, y: y } }   // Point::new(1, 2)
-    fn shift(inout self, dx: i64) { self.x += dx; }             // writes through self
-    fn sum(self) -> i64 { self.x + self.y }                     // a copy
+    fn new(x: i64, y: i64) -> Point { Point { x, y } }          // Point::new(1, 2)
+    fn shift(&mut self, dx: i64) { self.x += dx; }              // writes through self
+    fn sum(&self) -> i64 { self.x + self.y }
 }
 
-fn area(s: Shape) -> i64 {
+fn area(s: &Shape) -> i64 {
     match s {
         Shape::Circle(_, r) => 3 * r * r,
         Shape::Rect { min, max } => (max.x - min.x) * (max.y - min.y),
@@ -205,18 +201,16 @@ fn area(s: Shape) -> i64 {
 }
 
 fn main() -> i32 {
-    var p = Point::new(1, 2);
-    p.shift(10);                          // lends p inout: p is a var
+    let mut p = Point::new(1, 2);
+    p.shift(10);                          // borrows p mutably: p is a let mut
     let shapes = [Shape::Rect { min: Point::new(0, 0), max: p }, Shape::Circle(p, 2),
-        Shape::Empty];
-    for s in shapes {
-        std::print_int(area(s));
-        print(" ");
+        Shape::Empty];                    // p is Copy: used twice
+    for s in &shapes {
+        print("{} ", area(s));
     }
-    std::print_int(p.sum());
-    println("");
+    println("{} {:?}", p.sum(), p);
     let o: Option<i64> = Some(7);
-    if let Some(v) = o { std::print_int(v); }
+    if let Some(v) = o { print("{v}"); }
     match 15 {
         0 => println(" zero"),
         1..=9 => println(" digit"),
@@ -227,46 +221,48 @@ fn main() -> i32 {
 }
 ```
 ```out
-22 12 0 13
+22 12 0 13 Point { x: 11, y: 2 }
 7 fives
 ```
 
 A variant's fields are by position (`Circle(Point, i64)`) or by name
-(`Rect { min: Point, max: Point }`, 0.17: made as `Shape::Rect { min: a,
-max }` in any order, matched as `Shape::Rect { min, .. }`; a variant's
-fields are read only through patterns, as in Rust). A match must cover
-every value; arms can have `|`, ranges `a..=b` and guards `if`. `use Shape::{Circle, Empty};` lets variants be written
-without `Shape::`. `==` compares structs, enums, tuples and arrays field
-by field; `[u8]` compares by bytes, a `Vec` or `HashMap` by contents.
+(`Rect { min: Point, max: Point }`: made as `Shape::Rect { min: a, max
+}` in any order, matched as `Shape::Rect { min, .. }`; a variant's
+fields are read only through patterns). A match must cover every value;
+arms can have `|`, ranges `a..=b` and guards `if`. Matching a `&Shape`
+binds references (`r` above is a `&i64`). `use Shape::{Circle, Empty};`
+lets variants be written without `Shape::`. `==` is `PartialEq`:
+`#[derive(PartialEq)]` compares a struct or enum field by field; `&str`
+compares by bytes, a `Vec` or `HashMap` by contents.
 
 ## Generics and traits
 
 ```vole
 trait Area {
-    fn area(self) -> i64;
-    fn twice(self) -> i64 { 2 * self.area() }          // a default method
+    fn area(&self) -> i64;
+    fn twice(&self) -> i64 { 2 * self.area() }         // a default method
 }
 
 struct Square { side: i64 }
 
 impl Area for Square {
-    fn area(self) -> i64 { self.side * self.side }
+    fn area(&self) -> i64 { self.side * self.side }
 }
 
-fn total<T: Area>(items: [T]) -> i64 {    // bounds: T: A + B
+fn total<T: Area>(items: &[T]) -> i64 {   // bounds: T: A + B
     items.iter().map(|it| it.area()).sum()
 }
 
 struct Pair<T> { a: T, b: T }
 
-impl<T: Ord> Pair<T> {
+impl<T: PartialOrd> Pair<T> {
     fn max(self) -> T { if self.a > self.b { self.a } else { self.b } }
 }
 
 fn main() -> i32 {
     let squares = [Square { side: 2 }, Square { side: 3 }];
     let p = Pair::<i64> { a: 3, b: 9 };   // the turbofish: Pair::<i64>
-    println("{} {} {}", total(squares[..]), squares[0].twice(), p.max()); // a[..]: a slice
+    println("{} {} {}", total(&squares), squares[0].twice(), p.max()); // &array: a slice
     0
 }
 ```
@@ -275,9 +271,10 @@ fn main() -> i32 {
 ```
 
 Generics are templates, checked per instantiation (`max::<i64>(a, b)`
-is the turbofish). Operators go through the prelude's traits: `impl Add
-for V` makes `a + b` work; `Ord`'s `cmp` gives `<`. There are no trait
-objects: dispatch is static.
+is the turbofish). Operators go through std's traits: `impl
+std::ops::Add for V` makes `a + b` work; `PartialOrd` gives `<`. There
+are no trait objects: dispatch is static (`guide traits`, `guide
+generics`).
 
 ## Modules and imports
 
@@ -285,29 +282,29 @@ objects: dispatch is static.
 `use geometry::{Rect, area};` imports by name, never `*`. Paths start
 with a name in scope, `crate`, `self`, `super` or `std`. Items are
 private (to their module and its children) unless `pub`, and so are a
-struct's fields (0.26: `pub w: i64` to show one); `pub use`
-re-exports. A missing import's error says which `use` line to add, and
-`volec fix` adds it.
+struct's fields (`pub w: i64` to show one); `pub use` re-exports. A
+missing import's error says which `use` line to add, and `volec fix`
+adds it.
 
 ## Slices, arrays, text
 
 ```vole
-fn sum(xs: [i64]) -> i64 {
-    var t = 0;
+fn sum(xs: &[i64]) -> i64 {
+    let mut t = 0;
     for i in 0..xs.len() { t += xs[i]; }    // indices are usize; checked
     t
 }
 
 fn main() -> i32 {
-    var a = [5, 1, 4];
+    let mut a = [5i64, 1, 4];
     a[1] = 2;
-    std::print_int(sum(a[..]) + sum(a[1..]));   // a[lo..hi], a[..hi], a[lo..]
-    println("");
+    println("{}", sum(&a) + sum(&a[1..]));  // &a[lo..hi], &a[..hi], &a[lo..]
     let s = "hello world";
-    println(s[6..]);
-    if s[0..5] == "hello" { println("starts with hello"); }
+    println("{}", &s[6..]);
+    if s.starts_with("hello") { println("starts with hello"); }
     let words = [0; 4];
-    std::print_int(words[4]);             // out of bounds: a message, exit 101
+    let i = s.len() - 7;
+    println("{}", words[i]);              // out of bounds: a message, exit 101
     0
 }
 ```
@@ -315,48 +312,51 @@ fn main() -> i32 {
 17
 world
 starts with hello
-main.vl:16:20: index out of bounds: index 4, length 4
+main.vl:16:19: index out of bounds: index 4, length 4
 ```
 
-An array `[T; N]` is a value (copied by `=`; `a.len()` is N); a slice
-`[T]` is a pointer and a length (`.len()`; `.ptr` for C) viewing an
-array, a `Vec` or memory. A `[T]` is read-only; `inout [T]`
-(`&a[..]`, `v.as_mut_slice()`) writes its elements.
+An array `[T; N]` is a value (`a.len()` is N); a slice `&[T]` is a
+pointer and a length (`.len()`; `.as_ptr()` for C) borrowing an array, a
+`Vec` or memory. A `&[T]` is read-only; `&mut [T]` (`&mut a[..]`,
+`v.as_mut_slice()`) writes its elements. Text is `&str`, UTF-8: `&s[a..b]`
+slices by bytes, `s.chars()` gives its `char`s, `s.as_bytes()` its
+`&[u8]` (`guide text`).
 
 ## std: Vec, HashMap, String; allocation
 
 ```vole
+use std::collections::HashMap;
+use std::fmt::Write;
+
 fn evens(n: i64, gpa: Gpa) -> Vec<i64, Gpa> { // it allocates: it takes an allocator
     (0..n).map(|i| i * 2).collect_in(gpa)
 }
 
 fn main(gpa: Gpa) -> i32 {                 // the program's allocator
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa); // dropped (freed) when main returns
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa); // dropped (freed) when main returns
     v.push(30);
     v.push(10);
     v.push(20);
-    sort(v.as_mut_slice());                // in place
-    v.set(0, v.get(0) + 1);                // get/set are checked
-    for x in v { std::print_int(x); print(" "); }   // also &v, v.iter()
+    v.sort();                              // in place
+    v[0] += 1;                             // checked; v.get(0) is an Option<&i64>
+    for x in &v { print("{x} "); }         // also v.iter(); `for x in v` moves v
     println("");
     let last = v.pop();                    // Option<i64>
-    std::print_int(last.unwrap_or(-1));
-    println("");
+    println("{}", last.unwrap_or(-1));
 
-    var m: HashMap<[u8], i64, Gpa> = HashMap::new_in(gpa);
+    let mut m: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
     m.insert("a", 1);
     m.insert("b", 2);
-    match m.get("a") { Some(x) => std::print_int(x), None => print("none") }
-    println("");
-    for (k, _) in m.iter() { print(k); }   // (K, V) pairs, in slot order
+    match m.get("a") { Some(x) => println("{x}"), None => println("none") }
+    for (k, _) in &m { print("{k}"); }     // (&K, &V) pairs, in slot order
     println("");
 
-    var b = String::new_in(gpa);           // text builder
+    let mut b = String::new_in(gpa);       // text builder
     let e = evens(4, gpa);
     b.push_str("n=");
-    b.push_fmt(m.len() as i64 + e.len() as i64);
-    b.push_str("!");
-    println(b.as_slice());
+    write(&mut b, "{}", m.len() + e.len()).unwrap();
+    b.push('!');
+    println("{b}");
     0
 }
 ```
@@ -368,89 +368,54 @@ ba
 n=6!
 ```
 
-Allocation is explicit (0.16): nothing allocates without an allocator.
-A function that allocates takes one, `gpa: Gpa` or `a: A` with `A:
+Allocation is explicit: nothing allocates without an allocator. A
+function that allocates takes one, `gpa: Gpa` or `a: A` with `A:
 Allocator`, or a container it was given (`push` uses the Vec's own);
-main's `gpa` is where they come from. `arena_scope(gpa, |a| ...)` hands out
-an arena whose memory is all freed when the closure returns.
-`--check-alloc` builds the program with a checking allocator: a use
-after free, a double free, a leak are reported where they happen.
-`volec fix --only alloc016` moves 0.15 code (`Vec::new()`) over.
-Every function's effects are inferred (`alloc(Gpa) io panic
-diverge unsafe`): `volec query effects f --why io` shows where;
-`#[pure]` or `#[no_alloc]` on a function is checked (`guide effects`,
-`guide allocators`).
+main's `gpa` is where they come from. `std::alloc::arena_scope(&gpa, |a|
+...)` hands out an arena whose memory is all freed when the closure
+returns. `--check-alloc` builds the program with a checking allocator: a
+use after free, a double free, a leak are reported where they happen.
+Every function's effects are inferred (`alloc(Gpa) io panic diverge
+unsafe`): `volec query effects f --why io` shows where; `#[no_alloc]` on
+a function is checked (`guide effects`, `guide allocators`).
 
-`Vec`, `Buf` and `HashMap` own their contents: `let w = v;` or passing
-one to a `sink` parameter moves it (`.clone()` copies). Pass `v` to a
-`v: Vec<T, A>` (let) parameter to read it, `&v` to a `v: inout Vec<T, A>` one
-to let a function push. A slice from `as_slice` views the vector: using it after the
-vector grew or was dropped is an error (`guide memory#slices`). std's API,
-made from its source in this compiler, a
-line per item: `volec guide std#the-api`; each item with its comment:
-`volec guide std#every-item`; one name: `volec guide --find NAME`.
+`Vec`, `String` and `HashMap` own their contents: `let w = v;` or
+passing one by value moves it (`.clone()` copies). Pass `&v` to a `v:
+&Vec<T, A>` (or `&[T]`) parameter to read it, `&mut v` to a `v: &mut
+Vec<T, A>` one to let a function push. A slice from `as_slice` borrows
+the vector: the vector does not grow or drop while the slice is used
+(`guide memory#slices`). std's API, made from its source in this
+compiler, a line per item: `volec guide std#the-api`; each item with its
+comment: `volec guide std#every-item`; one name: `volec guide --find
+NAME`.
 @STD-API-FULL@
-
-A priority queue is a `BinaryHeap` (the largest first) or a `MinHeap`
-(the smallest first; Rust's `BinaryHeap<Reverse<T>>`), both in the
-prelude (`guide std#heaps-priority-queues`). Dijkstra's shortest paths
-with a MinHeap of (distance, node) pairs:
-
-```vole
-// Dijkstra: the shortest distances from node 0.
-fn main(gpa: Gpa) -> i32 {
-    let n = 5;
-    var adj: Vec<Vec<(i64, i64), Gpa>, Gpa> = Vec::new_in(gpa); // adj[u]: (to, weight)
-    for _ in 0..n {
-        adj.push(Vec::new_in(gpa));
-    }
-    for (u, v, w) in [(0, 1, 4), (0, 2, 1), (2, 1, 2), (1, 3, 1), (2, 3, 5)] {
-        adj[u].push((v, w));
-    }
-    var dist: Vec<i64, Gpa> = Vec::filled_in(n as usize, i64::MAX, gpa);
-    var heap: MinHeap<(i64, i64), Gpa> = MinHeap::new_in(gpa); // (distance, node)
-    dist[0] = 0;
-    heap.push((0, 0));
-    while let Some((d, u)) = heap.pop() {      // the nearest first
-        if d > dist[u] {
-            continue;                          // stale: u was reached sooner
-        }
-        for (v, w) in adj[u].iter() {
-            if d + w < dist[v] {
-                dist[v] = d + w;
-                heap.push((d + w, v));
-            }
-        }
-    }
-    println("{} {} {} {}", dist[1], dist[2], dist[3], dist[4] == i64::MAX);
-    0
-}
-```
-```out
-3 1 4 true
-```
 
 ## Input, output, arguments
 
-std prints and reads stdin: `read_stdin_in(gpa)` (all of it, a
-`Result<Vec<u8, Gpa>, IoError>`), `read_line(&buf)` (the next line, without its
-`'\n'`; `Ok(false)` at the end), `Scanner` (tokens, numbers, lines of a
-text), `parse_int` (a `Result`), `split_in`, `trim` (`guide conversions`:
-Option means absent, Result failed). Files go through C (`fopen`):
+std prints and reads stdin, Rust's way: `io::read_to_string_in(
+io::stdin(), gpa)` (all of it, an `io::Result<String<Gpa>>`),
+`io::stdin().read_line(&mut s)` (appends the next line with its
+`'\n'`; `Ok(0)` at the end), then `str`'s methods (`lines`,
+`split_whitespace`, `split`, `trim`, `parse::<i64>()`, a `Result`:
+`guide conversions`, where Option means absent and Result failed).
+Files, the environment and processes are `std::fs`, `std::env` and
+`std::process` (`guide io`):
 
 ```vole
-import "string.h" as c;
+use std::{env, io};
 
-fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
-    let input = read_stdin_in(gpa).unwrap(); // all of stdin, a Vec<u8, Gpa>
-    var sc = Scanner::new(input.as_slice());
-    var total = 0;
-    while let Ok(n) = sc.next_int() {     // Err(ScanError::End) at the end
-        total += n;
+fn main(gpa: Gpa) -> i32 {
+    let input = io::read_to_string_in(io::stdin(), gpa).unwrap(); // all of stdin, a String<Gpa>
+    let mut total = 0i64;
+    for tok in input.split_whitespace() {
+        match tok.parse::<i64>() {        // a Result<i64, ParseIntError>
+            Ok(n) => total += n,
+            Err(_) => eprintln("not a number: {tok}"),
+        }
     }
-    println(total);
-    for k in 1..argc as i64 {             // argv[0] is the program; C strings
-        println(unsafe { argv[k][0..c::strlen(argv[k]) as i64] });
+    println("{total}");
+    for a in env::args().skip(1) {        // the first is the program
+        println("{a}");
     }
     0
 }
@@ -481,38 +446,36 @@ fn main() -> i32 {
 5.0 3
 ```
 
-Unsafe operations: calling C or an `unsafe fn`, dereferencing (`*p`,
-`p.f`) or indexing (`p[i]`) a raw pointer, reading a union field. An
-access (a let or inout parameter, an `inout` local, a `let T` / `inout
-T` field) is safe to read and write through wherever it is kept; every
-`*T` is raw, a parameter too (`fix --values` makes a parameter an
-access).
-`volec fix --only unsafe` wraps what needs it; `#[repr(C)]`, callbacks
-and linking: `guide c-interop`.
+Unsafe operations: calling C or an `unsafe fn`, dereferencing a raw
+pointer (`*p`, `(*p).f`), using a `static mut`, reading a union field. A
+reference (`&T`, `&mut T`) is safe to read and write through wherever it
+is kept; `*const T` and `*mut T` are raw. `volec fix --only unsafe`
+wraps what needs it; `#[repr(C)]`, callbacks and linking: `guide
+c-interop`.
 
 ## Errors you will meet first
 
 | error (short form) | fix |
 |---|---|
-| `unknown type 'char'` (or `Box`) | `u8` (or a `u32` code point), `*T` or `Vec<T, A>` |
-| `expected type, got '&'`; `expected identifier, got '&'` | `str` for `&str`; `self`, `inout self` or `sink self` for `&self`, `&mut self`, `self` |
-| `conv.rust: '&mut T' is Rust's spelling` (`let mut`, `&mut x`, `move`) | the `try:` line's form: `inout T`, `var`, `&x`, `sink`; `volec fix --suggested` |
-| `conv.marker: 'v' is lent inout here` | `f(&v)`: an inout argument is marked |
-| `conv.marker_extra: '&' marks an argument the callee may change` | `f(v)`: a let or sink argument is not |
-| `own.readonly: writes through 'v' ... read-only (let)` | take it `v: inout T`, called `f(&v)` |
-| `own.readonly: '&n' changes 'n', a let binding` (or `v.push(x)`) | `var n`; a parameter `x: inout T`; `inout self`; `static var` |
+| `'println!' is a macro call: vole has no macros` | `println("{}", x)`, the help's form |
+| `'Vec::new' allocates from nothing` (`alloc.no_in`; `to_string`, `collect`) | `Vec::new_in(gpa)`, `to_string_in(gpa)`: `fn main(gpa: Gpa)`, `gpa` passed down; `volec fix --only alloc` |
+| `'Vec' names no allocator` (`alloc.default`) | `Vec<i64, Gpa>` |
+| `alloc.field: the struct 'S' holds an allocator its parameters do not name` | `struct S<A: Allocator> { v: Vec<u8, A> }`, used as `S<Gpa>` |
+| `expected 'String<Gpa>', got '&str'` | `String::from_in("..", gpa)`; a parameter `s: &str` takes both |
+| `wildcard imports are not allowed` | `use m::{a, b};` |
+| `borrowck.use_moved: 'v' is used here after it moved` | lend it (`&v`), or pass `v.clone()` |
+| `borrowck.conflict: cannot borrow 'u' as mutable because it is also borrowed as immutable` | use the shared borrow before the change, or take it again after |
+| `edition.lenient: 'n' is a value where a reference goes` | `f(&n)` |
+| `expected '&mut Vec<i64, Gpa>', got 'Vec<i64, Gpa>'` | `f(&mut v)` |
+| `cannot assign to immutable variable 'x'` | `let mut x` |
 | `cannot infer the type of closure parameter 'x'` | `\|x: i64\| ...`, or pass it where an `Fn` bound or `fn` type gives it |
 | `'?' needs 'f' to return Option or Result` | `fn f(..) -> Option<T>` or `-> Result<T, E>` |
-| `'println!' is a macro call` | no macros: `println("{}", x)` |
-| `cannot assign to immutable variable 'x'` | `var x` |
-| `cannot index type 'HashMap<K, V, A>'` | `m.get(k)` (an Option), `m.insert(k, v)` |
-| `allocation is explicit: pass an allocator (try: Vec::new_in(gpa))` | `fn main(gpa: Gpa)`, `gpa` passed down; `volec fix --only alloc016` |
-| `'for' iterates over ... got 'i64'` | a range: `for x in 0..n`; a Vec, a HashMap, `v.iter()` and ranges as values iterate too (0.14) |
-| `expected '[i64]', got '[i64; 3]'` | pass `a[..]` |
+| `expected '&[i64]', got '&[i32; 3]'` | `[5i64, 1, 4]`: an unsuffixed literal is an `i32` unless the context says at once |
 | `expected 'i32', got 'i64'` | `x as i32`: only widening is implicit |
+| `distinct.mix: '5u8' is 'u8' where 'char' goes` | `5u8 as char` |
 | `non-exhaustive match: 'E::C' is not covered` | an arm, or `_ =>` |
 | `error[unsafe] calling a C function is unsafe` | `unsafe { ... }` |
-| `undefined variable 'helper' \| help: add 'use ...'` | add the `use` line the help names |
+| `unknown type 'HashMap' \| help: add 'use ...'` | add the `use` line the help names (`volec fix`) |
 
 `volec guide errors` has more, each with its fix.
 

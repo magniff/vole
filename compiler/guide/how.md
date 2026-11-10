@@ -103,7 +103,8 @@ block for the second target, or `volec edit apply`). `volec --check-rules` tests
 random values (the suite runs it).
 
 Anything else (a select, a negated comparison, an address): a function
-`combine_X(v: i64) -> bool` in `compiler/src/middle/fold/mod.vl`,
+`combine_X(cx: &mut FnCtx, v: i64, pcx: &Ctx<Comp>) -> bool` in
+`compiler/src/middle/fold/mod.vl`,
 section "Instruction combining", called from `combine` on the
 instruction's op; true when it changed `v` (in place, or with
 `replace_same_type`, `make_const`, `op_before`). Templates: `volec
@@ -118,13 +119,13 @@ Test: `tests/run/opt_NAME.vl`, a program with `// EXPECT:` and
 To add an optimization pass.
 
 1. `volec edit new-file compiler/src/middle/NAME.vl < text` (adds
-   the `mod` line): `pub fn NAME(fi: i64) -> bool`, true when it
-   changed function `fi`. Templates: `volec query examples pass`
+   the `mod` line): `pub fn NAME(cx: &mut FnCtx, fi: i64, pcx:
+   &Ctx<Comp>) -> bool`, true when it changed function `fi`. Templates: `volec query examples pass`
    (`elide_copies`, `thread_tags`).
 2. Call it in `compiler/src/middle/opt.vl`: in `simplify_function`
-   (scalar, -O1 and -O2) as `if round == 0 && NAME(fi) { verify_func(fi,
-   c"NAME"); }`, or in `optimize_loops` (-O2) as `if NAME(fi) { changed =
-   true; light_cleanup(fi); }`. `verify_func` checks the IR under
+   (scalar, -O1 and -O2) as `if round == 0 && NAME(cx, fi, pcx) {
+   verify_func(cx, fi, c"NAME", pcx); }`, or in `optimize_loops` (-O2) as
+   `if NAME(cx, fi, pcx) { changed = true; light_cleanup(cx, fi, pcx); }`. `verify_func` checks the IR under
    `--verify-ir` and prints it under `--print-after-all`.
 3. Test: `tests/run/opt_NAME.vl` with `// CHECK:` lines (see
    `add-peephole`); `tests/run.sh opt_`; `tests/fuzz/run.sh` (random
@@ -147,15 +148,17 @@ To add an optimization pass.
 To add a compiler error, or a tool diagnostic with a code.
 
 A compiler error (`error[type error] ... | help: ...`), where the
-checker finds it: `err_begin(pos); err_str(c"..."); err_sym(name);
-err_help(c"try ..."); err_end();` (`err_end_soft()` goes on checking).
+checker finds it: `err_begin(pos, pcx); err_str(c"...", pcx);
+err_sym(name, pcx); err_help(c"try ...", pcx); err_end(pcx);`
+(`err_end_soft(pcx)` goes on checking; `pcx` is the compiler's context,
+a parameter of every function that reports).
 Templates: `volec query examples diagnostic`. Test:
 `tests/run/err_NAME.vl` with `// ERROR: text` lines, the help line
 too (`// ERROR: help: ...`).
 
 A tool diagnostic (`error edit.not-source: ...` then `try:` lines):
-`let d = diag(c"error", c"tool.code"); buf_str(d, c"...\n");` then
-`try_end(try_begin(c"cmd", name, true))`: a command that runs as it is
+`let d = diag(c"error", c"tool.code", tcx); buf_str(d, c"...\n");` then
+`try_end(try_begin(c"cmd", name, true, tcx, pcx))`: a command that runs as it is
 written. Then its `explain` entry: an `Explain { code, severity,
 means, fix, example }` in `crate::tools::explain::tools_table::TOOLS_TABLE`
 (or `refactor_table`), `TOOLS_COUNT` and the array's length one more,
@@ -200,13 +203,14 @@ To add a test case.
 To add a volec command, or a query command.
 
 A command (`volec NAME ...`): its arguments, `pub fn NAME_leaf(gpa:
-Gpa) -> Leaf` (a table of `flag`s and `option`s, `cli::line`), and `pub
-fn run_NAME(c: Call) -> i64` reading `c.evs` (its arguments in the
-line's order) or `c.m` (their Matches); diagnostics with `diag`, written
-with `write_diags()` before it returns. Its name in `tops` and its leaf
+Gpa) -> Leaf<'static, Gpa>` (a table of `flag`s and `option`s,
+`cli::line`), and `pub fn run_NAME(c: &Call<'_, Gpa>, tcx: &mut
+Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64` reading `c.evs` (its arguments
+in the line's order) or `c.m` (their Matches); diagnostics with `diag`,
+written with `write_diags(tcx)` before it returns. Its name in `tops` and its leaf
 in `leaf_of` (`compiler/src/cli/tree.vl`, volec's Command tree), and its
 line in `run_call` (`compiler/src/tools/commands.vl`): `if name ==
-"NAME" { return run_NAME(c); }` (`batch` runs it too). Its `--help`: a
+"NAME" { return run_NAME(c, tcx, pcx); }` (`batch` runs it too). Its `--help`: a
 `Help { cmd: "NAME", text: "..." }` row in `compiler/src/tools/help.vl`
 (15 lines at most; `HELP_COUNT` and the array's length one more), and
 the command in the list `tests/guide/run.sh` checks `--help` for.
