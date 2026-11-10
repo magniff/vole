@@ -30,7 +30,7 @@ build; x86-64 is compiled and its encodings checked.
 | hashing, GHASH, CRC folding | `vmull_p64` (aes: carry-less multiply), `vaeseq_u8` + `vaesmcq_u8` | `_mm_clmulepi64_si128` (pclmulqdq), `_mm_aesenc_si128` (aes) |
 | SHA-1, SHA-256 | `vsha256hq_u32`, `vsha256h2q_u32`, `vsha256su0q_u32`, `vsha256su1q_u32` (sha2) | `_mm_sha256rnds2_epu32`, `_mm_sha256msg1_epu32` (sha) |
 | dot products (int8 ML, Adler-32) | `vdotq_u32`, `vdotq_s32` (dotprod) | `_mm_maddubs_epi16` (ssse3), `_mm_madd_epi16`, `_mm_sad_epu8` (sse2) |
-| popcount, bit scans | `count_ones`, `leading_zeros`, `trailing_zeros` (std, one instruction); `vcntq_u8` per byte | the same std functions (popcnt, lzcnt, tzcnt when known); `_popcnt64` (popcnt), `_lzcnt_u64` (lzcnt), `_tzcnt_u64` (bmi1) |
+| popcount, bit scans | `x.count_ones()`, `leading_zeros`, `trailing_zeros` (the integer methods, one instruction); `vcntq_u8` per byte | the same methods (popcnt, lzcnt, tzcnt when known); `_popcnt64` (popcnt), `_lzcnt_u64` (lzcnt), `_tzcnt_u64` (bmi1) |
 | table lookup, shuffles | `vqtbl1q_u8`, `vextq_u8`, `vzip1q_u8` | `_mm_shuffle_epi8`, `_mm_alignr_epi8` (ssse3) |
 | saturating arithmetic | `vqaddq_u8`, `vqsubq_u8` | `_mm_adds_epu8`, `_mm_subs_epu8` (sse2) |
 
@@ -115,32 +115,32 @@ use std::arch::aarch64::__crc32cb;
 use std::arch::detect;
 
 // CRC-32C of s, bit by bit: the fallback.
-fn crc32c_portable(s: [u8]) -> u32 {
-    var c: u32 = 0xffffffff;
+fn crc32c_portable(s: &[u8]) -> u32 {
+    let mut c: u32 = 0xffffffff;
     for b in s {
-        c ^= b as u32;
+        c ^= *b as u32;
         for _ in 0..8 {
             c = if (c & 1) != 0 { (c >> 1) ^ 0x82f63b78 } else { c >> 1 };
         }
     }
-    ~c
+    !c
 }
 
 // The same by the crc instructions: needs crc (inferred).
-fn crc32c_hw(s: [u8]) -> u32 {
-    var c: u32 = 0xffffffff;
+fn crc32c_hw(s: &[u8]) -> u32 {
+    let mut c: u32 = 0xffffffff;
     for b in s {
-        c = __crc32cb(c, b);
+        c = __crc32cb(c, *b);
     }
-    ~c
+    !c
 }
 
-fn crc32c(s: [u8]) -> u32 {
+fn crc32c(s: &[u8]) -> u32 {
     if detect("crc") { crc32c_hw(s) } else { crc32c_portable(s) }
 }
 
 fn main() {
-    println("{:x} {:x}", crc32c("123456789"), crc32c_portable("123456789"));
+    println("{:x} {:x}", crc32c(b"123456789"), crc32c_portable(b"123456789"));
 }
 ```
 ```out
@@ -186,18 +186,18 @@ use std::arch::has;
 
 // The dot product of a and b (equal lengths, a multiple of 16).
 #[multiversion("dotprod")]
-fn dot(a: [u8], b: [u8]) -> u32 {
+fn dot(a: &[u8], b: &[u8]) -> u32 {
     if has("dotprod") {
-        var acc = vdupq_n_u32(0);
-        var i = 0;
-        while i + 16 <= a.len as i64 {
+        let mut acc = vdupq_n_u32(0);
+        let mut i: i64 = 0;       // the intrinsics take an i64 index
+        while i + 16 <= a.len() as i64 {
             acc = vdotq_u32(acc, vld1q_u8(a, i), vld1q_u8(b, i));
             i += 16;
         }
         vaddvq_u32(acc)
     } else {
-        var n: u32 = 0;
-        for i in 0..a.len {
+        let mut n: u32 = 0;
+        for i in 0..a.len() {
             n += a[i] as u32 * b[i] as u32;
         }
         n
@@ -207,7 +207,7 @@ fn dot(a: [u8], b: [u8]) -> u32 {
 fn main() {
     let a: [u8; 32] = [3; 32];
     let b: [u8; 32] = [2; 32];
-    println("{}", dot(a[..], b[..]));
+    println("{}", dot(&a, &b));
 }
 ```
 ```out
@@ -218,18 +218,19 @@ fn main() {
 
 The vendor's name is the safe form: it takes a slice and an index,
 `vld1q_u8(s, i)` (16 bytes from `s[i]`), `vst1q_u8(s, i, v)`,
-`_mm_loadu_si128(s, i)`, and checks `0 <= i` and `i + 16 <= s.len` as
-`s[i]` does (`panic` in its effects). A store writes, so its slice is
-`inout [T]`: `vst1q_u8(&out[..], i, v)`, `v.as_mut_slice()`, or an
-`inout [T]` parameter passed on; a read-only `[T]` there is
-`own.readonly`, whose `try:` line makes the view exclusive. Range analysis removes the check
-in counted loops (`while i + 16 <= s.len`), so the loop body is the bare
-load. Aligned forms (`_mm_load_si128`) check the alignment too and stop
+`_mm_loadu_si128(s, i)`, and checks `0 <= i` and `i + 16 <= s.len()` as
+`s[i]` does (`panic` in its effects). The slice is a `&[T]` (`&a` of an
+array, `&v`, `&s[..]`) and the index an `i64`. A store writes, so its
+slice is `&mut [T]`: `vst1q_u8(&mut out, i, v)`, `v.as_mut_slice()`, or
+a `&mut [T]` parameter passed on; a `&[T]` there is a type error (the
+types differ in mutability). Range analysis removes the check in
+counted loops (`while i + 16 <= s.len() as i64`), so the loop body is
+the bare load. Aligned forms (`_mm_load_si128`) check the alignment too and stop
 with `misaligned access` instead of faulting (`arch.misaligned`).
 
 The pointer forms keep the vendor signatures and are `unsafe`, in the
 `raw` submodules, for porting C: `std::arch::aarch64::raw::vld1q_u8(p:
-*u8)`. Passing a pointer to the safe form is `arch.raw_form`, with the
+*const u8)`. Passing a pointer to the safe form is `arch.raw_form`, with the
 edit to `s, i` when the pointer is `&s[i]`. `--check-unsafe` checks raw
 loads against the program's blocks as it checks any raw access.
 
@@ -249,32 +250,31 @@ use std::arch::aarch64::{
 };
 use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8};
 use std::arch::has;
-use std::trailing_zeros;
 
 // The first i with s[i] == b, or -1.
-fn find(s: [u8], b: u8) -> i64 {
-    var i = 0;
+fn find(s: &[u8], b: u8) -> i64 {
+    let mut i: i64 = 0;
     if has("neon") {
         let needle = vdupq_n_u8(b);
-        while i + 16 <= s.len as i64 {
+        while i + 16 <= s.len() as i64 {
             let eq = vceqq_u8(vld1q_u8(s, i), needle);
             if vmaxvq_u8(eq) != 0 {
                 let m = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq), 4)), 0);
-                return i + trailing_zeros(m) / 4;
+                return i + m.trailing_zeros() as i64 / 4;
             }
             i += 16;
         }
     } else if has("sse2") {
         let needle = _mm_set1_epi8(b as i8);
-        while i + 16 <= s.len as i64 {
+        while i + 16 <= s.len() as i64 {
             let m = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(s, i), needle));
             if m != 0 {
-                return i + trailing_zeros(m as u64);
+                return i + m.trailing_zeros() as i64;
             }
             i += 16;
         }
     }
-    while i < s.len as i64 {
+    while i < s.len() as i64 {
         if s[i] == b {
             return i;
         }
@@ -284,8 +284,8 @@ fn find(s: [u8], b: u8) -> i64 {
 }
 
 fn main() {
-    let text = "the quick brown fox jumps over the lazy dog";
-    println("{} {} {}", find(text, 'z'), find(text, 'q'), find(text, '!'));
+    let text = b"the quick brown fox jumps over the lazy dog";
+    println("{} {} {}", find(text, b'z'), find(text, b'q'), find(text, b'!'));
 }
 ```
 ```out
@@ -327,21 +327,21 @@ static K: [u32; 64] = [
 ];
 
 // The 4 big-endian words of block[i..i + 16].
-fn words(block: [u8], i: i64) -> uint32x4_t {
+fn words(block: &[u8], i: i64) -> uint32x4_t {
     vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block, i)))
 }
 
 // One 64-byte block into the state (a, b, c, d, e, f, g, h).
-fn compress(state: inout [u32], block: [u8]) {
-    var abcd = vld1q_u32(state, 0);
-    var efgh = vld1q_u32(state, 4);
+fn compress(state: &mut [u32], block: &[u8]) {
+    let mut abcd = vld1q_u32(state, 0);
+    let mut efgh = vld1q_u32(state, 4);
     let (abcd0, efgh0) = (abcd, efgh);
-    var w0 = words(block, 0);
-    var w1 = words(block, 16);
-    var w2 = words(block, 32);
-    var w3 = words(block, 48);
+    let mut w0 = words(block, 0);
+    let mut w1 = words(block, 16);
+    let mut w2 = words(block, 32);
+    let mut w3 = words(block, 48);
     for g in 0..16 {
-        let wk = vaddq_u32(w0, vld1q_u32(K[..], 4 * g));
+        let wk = vaddq_u32(w0, vld1q_u32(&K, 4 * g));
         let next = if g < 12 { vsha256su1q_u32(vsha256su0q_u32(w0, w1), w2, w3) } else { w0 };
         let old = abcd;
         abcd = vsha256hq_u32(abcd, efgh, wk);
@@ -351,26 +351,26 @@ fn compress(state: inout [u32], block: [u8]) {
         w2 = w3;
         w3 = next;
     }
-    vst1q_u32(&state, 0, vaddq_u32(abcd, abcd0));
-    vst1q_u32(&state, 4, vaddq_u32(efgh, efgh0));
+    vst1q_u32(state, 0, vaddq_u32(abcd, abcd0));
+    vst1q_u32(state, 4, vaddq_u32(efgh, efgh0));
 }
 
 fn main() {
-    var state: [u32; 8] = [
+    let mut state: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
     ];
     // "abc" padded to one block: 0x80, zeros, its length in bits at the end.
-    var block: [u8; 64] = [0; 64];
-    block[0] = 'a';
-    block[1] = 'b';
-    block[2] = 'c';
+    let mut block: [u8; 64] = [0; 64];
+    block[0] = b'a';
+    block[1] = b'b';
+    block[2] = b'c';
     block[3] = 0x80;
     block[63] = 24;
     if !detect("sha2") {
         println("no sha2 on this CPU: use a portable SHA-256");
         return;
     }
-    compress(&state[..], block[..]);
+    compress(&mut state, &block);
     for k in 0..8 {
         print("{:08x}", state[k]);
     }

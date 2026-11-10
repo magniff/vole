@@ -27,8 +27,8 @@ small queries.
    cast, a did-you-mean naming the function the call is in, one with
    which the program has a new error) is not made: `note fix.refused`
    says why, and the error is yours to fix. The check hook makes only
-   the mechanical ones itself (a call's `&`, Rust's spellings, an
-   unused import), each shown as `changed FILE:LINE: OLD -> NEW`; the
+   the mechanical ones itself (an unused import), each shown as
+   `changed FILE:LINE: OLD -> NEW`; the
    others it shows as `suggested, not applied`: read each first.
 4. Build and run: `volec run` (0.25.4: `volec run DIR -- ARGS`;
    DIR/main.vl, here ./main.vl, built into volec's cache when it
@@ -54,19 +54,19 @@ and its callers (instead of `show`, then `def`, then `refs`):
 
 ```text
 $ volec query context parse_item
-// crate::parse_item  main.vl:5-9  effects: panic
-fn parse_item(sc: inout Scanner) -> Option<Item> {
-    let name = sc.next_token()?;
+// crate::parse_item  main.vl:5-9  effects: panic diverge
+fn parse_item<'a>(toks: &mut SplitWhitespace<'a>) -> Option<Item<'a>> {
+    let name = toks.next()?;
     ...
 }
 // calls (3)
-std::Scanner::next_token  <std>:2184:12  method  pub fn next_token(inout self) -> Option<[u8]>
+str::parse  <std>:7349:12  method  pub fn parse<F: FromStr>(&self) -> Result<F, F::Err>
 ...
 // types (3)
-crate::Item  main.vl:3:8  struct  struct Item { name: [u8], qty: i64 }
+crate::Item  main.vl:3:8  struct  struct Item<'a> { name: &'a str, qty: i64 }
 ...
 // callers (1)
-main  main.vl:19:26  while let Some(it) = parse_item(&sc) {
+main  main.vl:15:26  while let Some(it) = parse_item(&mut toks) {
 ```
 
 (The fields are separated by TABs.) It stays within about 2,000 tokens
@@ -81,7 +81,6 @@ bodies.
 | where it is defined, its signature | `volec query def NAME` |
 | every use | `volec query refs NAME` (`--count`, `--in FILE\|MODULE`; a local: `FN::x`) |
 | who calls a function; what it calls | `volec query callers NAME`; `query callees FN` (`--transitive`) |
-| each local's kind, moves and views there (0.17) | `volec query own main.vl:12:5` |
 | what a function may do: allocate, io, panic... (0.16) | `volec query effects NAME\|MODULE` (`--why io`, `--has alloc(Gpa)`) |
 | every unsafe site: what it does, its class, its `UNSAFE:`/`SAFETY:` comments (0.25.3) | `volec query unsafe [FILE...\|std]` (`--unjustified`, `--summary`, `--json`) |
 | a module's items, with signatures | `volec query items MODULE`; every module: `query items` |
@@ -92,8 +91,8 @@ bodies.
 | a word in code, comments or strings (a shader's WGSL); in every program under a directory | `volec query grep WORD` (`--strings`, `--in FILE`); `query grep WORD --in examples/gpu` |
 | what nothing uses | `volec query unused` |
 | sizes, dependencies | `volec query stats`, `query deps MODULE` |
-| std's API, a std item | `volec query items std`, `query show std::read_line` (any program; a re-exported name too: `query show std::gpu::Color`) |
-| what a snippet does | `volec try 'let v = [3, 1]; v[..].len()'` prints `i64 = 2` |
+| std's API, a std item | `volec query items std`, `query show std::io::stdin` (any program; a re-exported name too: `query show std::gpu::Color`) |
+| what a snippet does | `volec try 'let v = [3, 1]; v.len()'` prints `usize = 2` |
 | build a program and run it (0.25.4) | `volec run [DIR] [OPTIONS] [-- ARGS]` (DIR/main.vl; rebuilt only when it changed; the binary in volec's cache, never in DIR) |
 | the guide on some words | `volec guide --find WORDS`, `guide TOPIC#SECTION`, `explain WORDS` |
 | items like one, to copy for a new one; recipes for adding an X (0.17) | `volec query similar NAME`; `query examples KIND`; `volec guide how` |
@@ -123,7 +122,7 @@ an edit then `check`.
 | merge conflicts | `volec query conflicts --show`, then `volec edit resolve FILE:LINE --ours` (`--theirs`, `--both`, `< text`) |
 | rename anything, with every use | `volec refactor rename PATH NEW` |
 | rename a local or parameter | `volec refactor rename FILE:LINE:COL NEW` or `refactor rename FN::x NEW` (shadowing respected) |
-| a parameter, with every call | `volec refactor signature FN --add 'x: i64 = 0'` (a default; `--fill-calls`: each call gets 0; `--remove`, `--rename-param`, `--reorder`, `--type`; `--convention v inout`: the calls pass `&v`, `--convention v let` or `sink`: `v`) |
+| a parameter, with every call | `volec refactor signature FN --add 'x: i64 = 0'` (a default; `--fill-calls`: each call gets 0; `--remove`, `--rename-param`, `--reorder`, `--type`) |
 | a field, with every literal | `volec refactor field STRUCT --add 'g: i64 = 0'` (`--type g T --default EXPR`) |
 | a raw table (`*T`, X_COUNT, X_CAP) to a Vec, with every use | `volec refactor table X --dry-run` (refused, nothing changed, when a use cannot be placed: each listed); then `volec fix --only unneeded-unsafe` (`unneeded-justified`: the justified accessors too, with their comments) |
 | a variant, with every match | `volec refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match) |
@@ -132,8 +131,6 @@ an edit then `check`.
 | a word in every file git tracks (docs, scripts, a source's comments or strings) | `volec rewrite --text OLD NEW --word --case --dry-run --diff` (`--files GLOB`, `--comments`, `--strings`, `--no-sources`, `--exclude SPEC`, `--check ROOT`) |
 | sources to another extension, with the mentions of their paths | `volec refactor extension .vl .vl ROOT\|DIR\|--all --dry-run` (git mv; the build compared before and after) |
 | imports, unused, pub, unsafe | `volec fix` (`--only imports,unused,pub,unsafe`, `--dry-run`) |
-| 0.19's spelling to 0.20's (`&T` to `T`, `&mut T` to `inout T`, `let mut` to `var`, receivers, `&mut v` to `&v`, `*r` to `r`) | `volec fix --only conventions` (`--dry-run`) |
-| `*T` and by-value parameters of 0.16 code to accesses, with every call (0.17) | `volec fix --values` (`--dry-run`) |
 | the errors' exact fixes (their `try: volec fix --suggested`) | `volec fix --suggested` (`--dry-run`, `--at FILE:LINE`, `--codes CODE,...`, `--diff`) |
 
 Every edit is atomic: the edited program is checked first, and an edit
@@ -203,8 +200,8 @@ A tool's problem is one line, `SEVERITY CODE: MESSAGE` (the code is
 stable), followed by `try:` lines, each a command to run as it is:
 
 ```text
-error patch.no-match: OLD 1 is not in crate::main; nearest, line 4: std::print_int(total);
-try: volec edit patch main --old 'print_int(total)' --new 'print_int(total + 1)'
+error patch.no-match: OLD 1 is not in crate::main; nearest, line 4: println("{}", total);
+try: volec edit patch main --old 'println("{}", total)' --new 'println("{}", total + 1)'
 ```
 
 Exit status: 0 done, 1 refused or failed (nothing written), 2 usage.

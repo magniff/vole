@@ -1,8 +1,8 @@
 # cli
 
 [args](../args/) with `std::cli`: it prints the words on its command
-line, one a line, and takes a flag and two options. `args` reads C's
-`argv` by hand; this program declares its arguments and lets std parse
+line, one a line, and takes a flag and two options. `args` walks
+`env::args()` itself; this program declares its arguments and lets std parse
 them, so `--help`, `--version` and the errors for bad arguments come
 with it.
 

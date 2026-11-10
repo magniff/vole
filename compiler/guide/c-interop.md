@@ -15,35 +15,44 @@ import "stdio.h" as c;
 import "string.h" as c;
 
 extern "C" {
-    fn getenv(name: *u8) -> *u8;          // declared by hand
+    fn getenv(name: *const u8) -> *const u8;   // declared by hand
     #[link_name = "strlen"]
-    fn c_length(s: *u8) -> u64;           // another name for a C symbol
+    fn c_length(s: *const u8) -> usize;        // another name for a C symbol
 }
 
 fn main() -> i32 {
     let s = c"vole";
     let n = unsafe { c::strlen(s) } as i64;
     let home = unsafe { getenv(c"NO_SUCH_VARIABLE_HERE") };
+    let bytes = unsafe { std::slice::from_raw_parts(s, c::strlen(s) as usize) }; // a C string as a slice
+    println("{:?}", std::str::from_utf8(bytes));
     unsafe {
-        c::printf(c"%s has %ld bytes, %d %.3f\n", s, n, home == 0 as *u8, 1.0 / 8.0);
+        c::printf(c"%s has %ld bytes, %d %.3f\n", s, n, home.is_null(), 1.0 / 8.0);
         c::printf(c"%lu\n", c_length(c"abc"));
     }
     0
 }
 ```
 ```out
+Ok("vole")
 vole has 4 bytes, 1 0.125
 3
 ```
 
-- `c"..."` is a NUL-terminated `*u8`, for C. A `[u8]` slice (`"..."`) is
-  not terminated: pass `s.ptr` and `s.len()` to C (`write(1, s.ptr,
-  s.len() as u64)`), or copy into a buffer with a 0 at the end.
-- A C string to a slice: `unsafe { p[0..c::strlen(p) as i64] }`.
+- `c"..."` is a NUL-terminated `*const u8`, for C. A `&str` or `&[u8]`
+  is not terminated: pass `s.as_ptr()` and `s.len()` to C (`write(1,
+  s.as_ptr(), s.len() as u64)`), or copy into a buffer with a 0 at the
+  end.
+- A C string to a slice: `unsafe { std::slice::from_raw_parts(p,
+  c::strlen(p) as usize) }`, then `std::str::from_utf8` for text.
 - Variadic functions (`printf`) take any FFI-safe value; `%ld` for `i64`,
-  `%d` for `i32` and `bool`, `%f` for `f64` (and `f32`), `%s` for `*u8`.
-- Types from C: `int` is `i32`, `long` is `i64`, `char *` and `void *`
-  are `*u8`, `size_t` is `u64`, structs are `#[repr(C)]` structs, enums
+  `%d` for `i32` and `bool`, `%f` for `f64` (and `f32`), `%s` for a
+  `*const u8`.
+- Types from C: `int` is `i32`, `long` is `i64`, `char *`, `const char
+  *` and `void *` are pointers to `u8` (the checker does not tell
+  `*const u8` from `*mut u8` yet, and prints both as `*u8`), `size_t` is
+  `u64` (`n as usize` where vole wants a length), structs are
+  `#[repr(C)]` structs, enums
   are integer types with constants. `volec --emit-imports prog.vl
   -o decls.vl` shows what a program's headers declare.
 - What headers cannot give: function-like macros, `static inline`
@@ -56,6 +65,8 @@ vole has 4 bytes, 1 0.125
 ## Layout: #[repr(C)]
 
 ```vole
+use std::mem::size_of;
+
 #[repr(C)]
 struct Header { tag: u8, size: u32 }          // C's field order and padding
 
@@ -70,10 +81,7 @@ enum Kind { A = 1, B = 2 }                    // an enum with a u8 tag
 
 fn main() -> i32 {
     let b = Bits { f: 1.0 };
-    std::print_int(size_of(Header) + size_of(Packed) + size_of(Kind));
-    print(" ");
-    std::print_int(unsafe { b.i } as i64);
-    println("");
+    println("{} {}", size_of::<Header>() + size_of::<Packed>() + size_of::<Kind>(), unsafe { b.i });
     0
 }
 ```
@@ -85,11 +93,9 @@ Also `#[repr(C, align(N))]` and `#[repr(C, packed(N))]`. A `#[repr(C)]`
 enum with fields is C's struct of a tag and a union. Types in `extern
 "C"` signatures must be FFI-safe: numbers, `bool`, pointers, `extern
 "C" fn` pointers, `#[repr(C)]` types. Slices, tuples, plain structs and
-plain `fn` pointers are rejected with a hint. C has only values and
-pointers: its parameters are by value (let, the default), and `inout`
-or `sink` there is `conv.extern`. A C function that writes through a
-pointer takes `p: *T`, and the call passes `&x`, which converts (an
-exclusive loan of `x` for the call).
+plain `fn` pointers are rejected with a hint. A C function that writes
+through a pointer takes `p: *mut T`, and the call passes `&mut x`,
+which converts (a mutable borrow of `x` for the call).
 
 ## C calling vole
 
@@ -100,16 +106,16 @@ type).
 ```vole
 import "stdlib.h" as c;
 
-extern "C" fn by_value(a: *u8, b: *u8) -> i32 {
-    let x = unsafe { *(a as *i32) };
-    let y = unsafe { *(b as *i32) };
+extern "C" fn by_value(a: *const u8, b: *const u8) -> i32 {
+    let x = unsafe { *(a as *const i32) };
+    let y = unsafe { *(b as *const i32) };
     if x < y { -1 } else if x > y { 1 } else { 0 }
 }
 
 fn main() -> i32 {
-    var a: [i32; 5] = [4, 2, 5, 1, 3];
-    unsafe { c::qsort(&a as *u8, 5, 4, by_value); }
-    for x in a { std::print_int(x as i64); }
+    let mut a: [i32; 5] = [4, 2, 5, 1, 3];
+    unsafe { c::qsort(a.as_mut_ptr() as *mut u8, 5, 4, by_value); }
+    for x in a { print("{x}"); }
     println("");
     0
 }
@@ -118,7 +124,7 @@ fn main() -> i32 {
 12345
 ```
 
-`extern "C" static var COUNT: i64 = 0;` defines a static C can use.
+`extern "C" static mut COUNT: i64 = 0;` defines a static C can use.
 `volec --emit-header prog.vl -o prog.h` writes the C header of a
 program's `extern "C"` functions and statics, with the `#[repr(C)]`
 types they use.
@@ -171,8 +177,7 @@ linker runs directly, with the command `cc -###` gave the first time
 compiler links such a program itself, without `ld` (a few ms), when it
 needs nothing but libSystem; `--linker=system` runs `ld` instead.
 
-Reading stdin: std has `read_line` and `read_stdin` (`volec guide
-std`); from C, `getchar()` from `stdio.h`, or `read(0, buf, n)` from
+Reading stdin: std has `std::io::stdin()` (`volec guide io`); from C, `getchar()` from `stdio.h`, or `read(0, buf, n)` from
 `unistd.h`, into a `Vec<u8, A>` or an array (not mixed with std's, which
 buffers):
 
@@ -180,15 +185,13 @@ buffers):
 import "stdio.h" as c;
 
 fn main(gpa: Gpa) -> i32 {
-    var line: Vec<u8, Gpa> = Vec::new_in(gpa);    // dropped (freed) at the end
+    let mut line: Vec<u8, Gpa> = Vec::new_in(gpa);    // dropped (freed) at the end
     loop {
         let ch = unsafe { c::getchar() };
         if ch < 0 || ch == '\n' as i32 { break; }
         line.push(ch as u8);
     }
-    print("read ");
-    std::print_int(line.len() as i64);
-    println(" bytes");
+    println("read {} bytes", line.len());
     0
 }
 ```
