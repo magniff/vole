@@ -31,28 +31,35 @@ precedence; numbers are `i64`. Empty lines are skipped.
 ## How it works
 
 **Tokens and errors are enums.** A variant may carry data (`Num(i64)`),
-and `use Token::{...}` lets the variants be written without `Token::`:
+and `use Token::{...}` lets the variants be written without `Token::`.
+`Token` derives `Clone, Copy` (the parser copies one out of the slice)
+and `PartialEq` (it compares one with `Close`):
 
 ```tach
+#[derive(Clone, Copy, PartialEq)]
 enum Token { Num(i64), Plus, Minus, Star, Slash, Percent, Open, Close, End }
-enum Error { BadChar(u8), Unexpected(Token), DivideByZero }
+enum Error { BadChar(char), Unexpected(Token), DivideByZero }
 ```
 
-**The tokenizer** walks the line's bytes with a `match` on each one;
-`'0'..='9'` is a range pattern, and `' ' => continue` skips a blank from
-inside the `match`. A byte that starts no token ends it with an error:
+**The tokenizer** walks the line's characters with a `match` on each
+one; `'0'..='9'` is a range pattern, and `' ' => continue` skips a blank
+from inside the `match`. `chars().peekable()` lets it look at the next
+character before taking it, for the digits of a number. A character that
+starts no token ends it with an error:
 
 ```tach
-fn tokenize(text: [u8], gpa: Gpa) -> Result<Vec<Token>, Error> {
-    var tokens: Vec<Token> = Vec::new_in(gpa);
-    ...
+fn tokenize(text: &str, gpa: Gpa) -> Result<Vec<Token, Gpa>, Error> {
+    let mut tokens: Vec<Token, Gpa> = Vec::new_in(gpa);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        ...
             _ => return Err(BadChar(c)),
 ```
 
 The vector owns its memory and is dropped when it goes out of scope, so
 the early `return` frees it; on success it moves out in the `Ok`, and
-`evaluate` drops it when it returns. The parser holds only a view of
-the tokens, `tokens.as_slice()`.
+`evaluate` drops it when it returns. The parser only borrows the tokens:
+`struct Parser<'a> { tokens: &'a [Token], at: usize }`.
 
 **The parser** has one method per grammar rule, each returning
 `Result<i64, Error>`. `?` returns the first error from every level at
@@ -60,8 +67,8 @@ once, so the grammar reads as it would without errors:
 
 ```tach
 // term: unary (('*' | '/' | '%') unary)*
-fn term(inout self) -> Result<i64, Error> {
-    var value = self.unary()?;
+fn term(&mut self) -> Result<i64, Error> {
+    let mut value = self.unary()?;
     loop {
         let op = self.peek();
         match op {
@@ -82,34 +89,33 @@ fn term(inout self) -> Result<i64, Error> {
 ```
 
 `Star | Slash | Percent` is an or-pattern and `_ if rhs == 0` a guard.
-(Vole defines `x / 0` as 0, so the check is the program's choice, not
-a crash it avoids.)
+(`x / 0` panics, so the check turns a crash into a message.)
 
-**Messages come from `Display` impls.** `impl Display for Error` writes
-the text, with f-strings for the parts; the `c` spec prints a `u8` as its
-character, and `{t}` uses `Token`'s own `Display`:
+**Messages come from `Display` impls.** `impl fmt::Display for Error`
+writes the text with `write(f, "..")`, the format function for a
+formatter; `{t}` uses `Token`'s own `Display`:
 
 ```tach
-impl Display for Error {
-    fn fmt(self, f: inout Fmt) {
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            BadChar(c) => f.write("unexpected character '{c:c}'"),
-            Unexpected(t) => f.write("unexpected {t}"),
-            DivideByZero => f.str("division by zero"),
+            BadChar(c) => write(f, "unexpected character '{c}'"),
+            Unexpected(t) => write(f, "unexpected {t}"),
+            DivideByZero => f.write_str("division by zero"),
         }
     }
 }
 ```
 
-**The main loop** reads stdin a line at a time with `std::read_line`,
-which returns `Ok(false)` at the end of the input:
+**The main loop** reads stdin a line at a time: `read_line` appends the
+next line to the String, its `'\n'` included, and returns how many bytes
+it read, 0 at the end of the input:
 
 ```tach
-while read_line(&line).unwrap_or(false) {
-    match evaluate(line.as_slice(), gpa) {
-        Ok(value) => println("{value}"),
-        Err(e) => println("error: {e}"),
-    }
+while io::stdin().read_line(&mut line).unwrap_or(0) > 0 {
+    let text = line.trim();
+    ...
+    line.clear();
 }
 ```
 
@@ -117,6 +123,6 @@ while read_line(&line).unwrap_or(false) {
 
 - enums with data, `match`, or-patterns, ranges and guards: `volec guide syntax`
 - `Result` and `?`: `volec guide conversions`
-- `impl Display`, f-strings and specs (`{c:c}`): `volec guide formatting`
-- methods on `inout self`, a `Vec` and its drop, a struct holding a view: `volec guide memory`
-- reading stdin (`read_line`): `volec guide std`
+- `impl Display`, format strings: `volec guide formatting`
+- `&mut self` methods, a `Vec` and its drop, a struct holding a borrow: `volec guide memory`
+- reading stdin (`read_line`): `volec guide conversions#reading-input`

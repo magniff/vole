@@ -3,8 +3,8 @@
 Formatted text in vole: format strings and every part of a spec
 (width, alignment, zero padding, precision, hex, binary, characters,
 Debug), `Display` and `Debug` written by hand and derived, and the ways
-to send formatted text somewhere (`println`, `eprintln`, `format`,
-`push_fmt`). The program prints a spec cheat sheet, an aligned inventory
+to send formatted text somewhere (`println`, `eprintln`, `format_in`,
+`write`). The program prints a spec cheat sheet, an aligned inventory
 table, some Debug views and a hex dump.
 
 ## Build and run
@@ -33,7 +33,7 @@ On stdout:
 {x:>9.3}      [    3.142]  width and precision
 {name:>9}     [     vole]  text goes left by default
 {name:?}      ["vole"]     Debug: quoted and escaped
-{:c}, 'A'     [A]          a u8 as a character
+{}, 'A'       [A]          a char
 {}, n * 2 + 1 [85]         the next argument
 {{ and }} in a format string are literal braces: {n}
 == inventory
@@ -78,54 +78,59 @@ first argument; each argument's type has `Display` (with `:?`, `Debug`).
 | `{n:08}` | zero-padded to 8 |
 | `{n:x}` `{n:X}` `{n:b}` | hex, upper-case hex, binary (`{n:08b}`: padded) |
 | `{x:.2}` `{x:>9.3}` | a float with 2 decimals; width 9 with 3 decimals |
-| `{b:c}` | a `u8` as its character (otherwise a `u8` prints as a number) |
-| `{v:?}` `{v:<26?}` | Debug, also with a width |
-| `{s:*^9}` `{n:+}` `{n:#x}` | a fill byte and centring, a sign, `0x` |
-| `{x:>w$}` `{x:.*}` | a width or a precision from a local or an argument |
+| `{v:?}` | Debug |
+| `{s:*^9}` `{n:+}` `{n:#x}` | a fill character and centring, a sign, `0x` |
 
 A float without a precision prints the shortest text that reads back as
-the same value (`3.14159`, `0.1`).
+the same value (`3.14159`, `0.1`). A `u8` prints as a number; `b as
+char` prints its character.
 
 **Where a format string goes.** `println`, `eprintln` (stderr),
-`format_in` (returns a new `Buf`, dropped when its owner's scope ends;
-the allocator comes last), `buf.push_fmt(..)` (appends to a `Buf`) and
-`f.write(..)` inside a Display impl. The cheat sheet passes
-`format_in("...", args, gpa)` results to a helper that reads them (a temporary, dropped at the end of the call's statement); the hex
-dump builds each line in a `Buf`:
+`format_in` (returns a new `String`, dropped when its owner's scope
+ends; the allocator comes last), `write(&mut s, ..)` (appends to a
+`String`, or to anything with `std::fmt::Write`) and `write(f, ..)`
+inside a Display impl. The cheat sheet passes `format_in("...", args,
+gpa)` results to a helper that takes them; the hex dump builds each line
+in a `String`:
 
 ```tach
-var line = format_in("{at:04x}  ", gpa); // format: a new Buf to keep
-for i in at..at + 8 {
-    if i < end { line.push_fmt("{:02x} ", bytes[i]); } else { line.push_str("   "); }
+let mut line = format_in("{:04x}  ", n * 8, gpa); // format_in: a new String to keep
+for i in 0..8 {
+    if i < chunk.len() { write(&mut line, "{:02x} ", chunk[i]).unwrap(); }
+    else { line.push_str("   "); }
 }
 ```
 
-**Display by hand.** `Display` has one method, `fmt(self, f: inout
-Fmt)`, which writes through the `Fmt` with `f.str`, `f.byte` and
-`f.write` (a format string and its arguments, or any Display value). Unlike Rust there is
-no `fmt::Result` to return. `Money` prints cents as dollars with
-thousands separators, using a zero-padded spec for each group:
+**Display by hand.** `Display` has one method, Rust's `fmt(&self, f:
+&mut Formatter) -> fmt::Result`, which writes through the formatter
+with `write(f, "..", args)`, `f.write_str` and `f.write_char`. `Money`
+prints cents as dollars with thousands separators, using a zero-padded
+spec for each group:
 
 ```tach
 impl Display for Money {
-    fn fmt(self, f: inout Fmt) {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let mut text = Text { buf: [0; 32], len: 0 };
         ...
-        f.write(dollars / group);
+        write(&mut text, "{}", dollars / group)?;
         while group > 1 {
             group /= 1000;
-            f.write(",{:03}", dollars / group % 1000);
+            write(&mut text, ",{:03}", dollars / group % 1000)?;
         }
-        f.write(".{:02}", c % 100);
+        write(&mut text, ".{:02}", c % 100)?;
+        f.pad(text.as_str())
     }
 }
 ```
 
-A width in the caller's spec applies to the whole of what the impl
-writes, so `{it.price:>10}` right-aligns `$15.99` in the table just as
-it would a number.
+As in Rust, a width in the caller's spec (`{value:>12}`) is the impl's
+to apply: `f.pad(text)` writes a text with the spec's width and
+alignment. So `Money` builds its text first, in `Text`, a 32-byte buffer
+on the stack that implements `std::fmt::Write` (one method,
+`write_str`): no allocator is needed to format.
 
-**Debug by hand and derived.** `Debug` is `fmt_debug(self, f: inout
-Fmt)`. `Sku` prints `#42` for people and `SKU-0042` for programmers.
+**Debug by hand and derived.** `Debug` is the same method in another
+trait. `Sku` prints `#42` for people and `SKU-0042` for programmers.
 `#[derive(Debug)]` writes Rust's text for a struct or enum, calling the
 fields' own Debug impls, which is how `Item`'s Debug shows
 `sku: SKU-0007` and `price: Money(1599)`:
@@ -135,10 +140,10 @@ fields' own Debug impls, which is how `Item`'s Debug shows
 enum Category { Tools, Food(i64), Toys }
 
 #[derive(Debug)]
-struct Item { sku: Sku, name: [u8], category: Category, qty: i64, price: Money }
+struct Item { sku: Sku, name: &'static str, category: Category, qty: i64, price: Money }
 ```
 
-std has Debug for the numbers, `[u8]` (quoted and escaped:
+std has Debug for the numbers, `&str` (quoted and escaped:
 `"tab\there"`), `Vec` (`[12, 3, 40, 250, 2]`), `Option`, `Result` and
 `HashMap`.
 
@@ -151,22 +156,18 @@ println("{:<6} {:<16} {:>5} {:>10} {:>12}", "sku", "item", "qty", "price", "valu
 println("{:<6} {:<16} {:>5} {:>10} {value:>12}", it.sku, it.name, it.qty, it.price);
 ```
 
-String literals are allowed inside holes (`{"sku":<6}`).
-
 **stdout and stderr.** The low-stock warnings go through `eprintln`, so
-`./formatting 2>/dev/null` leaves the report alone. Printing goes
-through a small static buffer, one `write` per call, with no heap
-allocation.
+`./formatting 2>/dev/null` leaves the report alone.
 
 ## Language features
 
-- format strings, specs, `Display`, `Debug`, `format_in`, `push_fmt`, `eprintln`, `#[derive(Debug)]`: `volec guide formatting`
-- `Buf`, `Vec`, drops: `volec guide std`, `volec guide memory`
+- format strings, specs, `Display`, `Debug`, `format_in`, `write`, `eprintln`, `#[derive(Debug)]`: `volec guide formatting`
+- `String`, `Vec`, drops: `volec guide std`, `volec guide memory`
 - struct field shorthand (`Item { sku: Sku { id }, name, ... }`): `volec guide syntax`
+- formatting without an allocator (`std::fmt::Write`): `volec guide text`
 
 ## Going further
 
-- A computed width or precision is `{x:>w$}` (w a local) or `{x:.*}`
-  (the precision an argument before x). `{x:e}` and `{x:E}` print a
-  float in exponent notation (`volec guide formatting`).
+- `{x:e}` and `{x:E}` print a float in exponent notation (`volec guide
+  formatting`).
 - Display has no derive; write the text you want.
