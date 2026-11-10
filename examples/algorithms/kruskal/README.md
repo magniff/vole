@@ -59,27 +59,27 @@ by weight, with ties broken by `u` then `v`, so the result is
 deterministic. `Debug` is derived too, for printing one:
 
 ```tach
-#[derive(Eq, Ord, Debug)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]
 struct Edge { w: i64, u: i32, v: i32 }
 ```
 
-**The generator** has default arguments, so the call in `main` gives
-only what differs from the defaults:
+**The generator** takes the seed, so a run is repeatable; the largest
+weight is a `const`:
 
 ```tach
-fn random_edges(n: i64, m: i64, gpa: Gpa, max_weight: i64 = 1_000_000, seed: u64 = 7) -> Vec<Edge>
+fn random_edges(n: i64, m: i64, seed: u64, gpa: Gpa) -> Vec<Edge, Gpa>
 ...
-var edges = random_edges(n, 1_000_000, gpa);
+let mut edges = random_edges(n, 1_000_000, 7, gpa);
 ```
 
-**The union-find** keeps two `Vec<i32>` (4 bytes a node: better for the
+**The union-find** keeps two `Vec<i32, Gpa>` (4 bytes a node: better for the
 cache than `i64`). `new` builds the identity `parent` array with an
-iterator and `collect`:
+iterator and `collect_in`:
 
 ```tach
-fn new(n: i64, gpa: Gpa) -> UnionFind {
+fn new(n: i64, gpa: Gpa) -> UnionFind<Gpa> {
     let parent = (0..n).map(|i| i as i32).collect_in(gpa);
-    UnionFind { parent: parent, size: Vec::filled_in(n, 1i32, gpa), sets: n }
+    UnionFind { parent, size: Vec::from_elem_in(1i32, n as usize, gpa), sets: n }
 }
 ```
 
@@ -88,9 +88,9 @@ goes. Indexing a slice with an `i32` works directly (any integer type
 indexes):
 
 ```tach
-fn find(inout self, x: i64) -> i64 {
+fn find(&mut self, x: i64) -> i64 {
     let p = self.parent.as_mut_slice();
-    var x = x;
+    let mut x = x;
     while p[x] as i64 != x {
         let g = p[p[x]];
         p[x] = g;
@@ -100,9 +100,10 @@ fn find(inout self, x: i64) -> i64 {
 }
 ```
 
-`unite` orders the two roots by size with a tuple-valued `if` (vole
-has no tuple assignment, so `let (ra, rb) = if ... { (y, x) } else {
-(x, y) };` replaces `(ra, rb) = (rb, ra)`):
+`unite` orders the two roots by size with a tuple-valued `if` (`let
+(ra, rb) = if ... { (y, x) } else { (x, y) };`, where another language
+would swap with `(ra, rb) = (rb, ra)`). It writes `self.parent` while
+`size` borrows `self.size`: two fields are borrowed apart:
 
 ```tach
 let (x, y) = (self.find(a), self.find(b));
@@ -113,23 +114,20 @@ self.parent[rb] = ra as i32;
 size[ra] += size[rb];
 ```
 
-(`union` is a keyword in vole, for C-compatible unions, hence the
-name `unite`.)
-
 **Kruskal** is then a sort and a loop. It returns a tuple, the forest's
 edges and the number of trees, and stops early once `n - 1` edges are
 taken (a spanning tree has no room for more). The `i32` fields of the
 edge widen to the `i64` parameters of `unite` by themselves:
 
 ```tach
-fn kruskal(n: i64, edges: inout [Edge], gpa: Gpa) -> (Vec<Edge>, i64) {
-    std::sort(edges);
-    var uf = UnionFind::new(n, gpa);
-    var tree: Vec<Edge> = Vec::with_capacity_in(n - 1, gpa);
-    for e in edges {
+fn kruskal(n: i64, edges: &mut [Edge], gpa: Gpa) -> (Vec<Edge, Gpa>, i64) {
+    edges.sort_unstable();
+    let mut uf = UnionFind::new(n, gpa);
+    let mut tree: Vec<Edge, Gpa> = Vec::with_capacity_in(n as usize - 1, gpa);
+    for e in edges.iter() {
         if uf.unite(e.u, e.v) {
-            tree.push(e);
-            if tree.len() == n - 1 { break; }
+            tree.push(*e);
+            if tree.len() as i64 == n - 1 { break; }
         }
     }
     (tree, uf.sets)
@@ -137,9 +135,9 @@ fn kruskal(n: i64, edges: inout [Edge], gpa: Gpa) -> (Vec<Edge>, i64) {
 ```
 
 **The output** destructures that tuple (`let (tree, trees) =
-kruskal(7, &roads[..], gpa);`), sums and maxes weights with iterator chains
-(`tree.iter().map(|e| e.w).sum()`), and prints with f-strings,
-`{tree[0]:?}` through the derived `Debug`. The timing goes to
+kruskal(7, &mut roads, gpa);`), sums and maxes weights with iterator chains
+(`let cost: i64 = tree.iter().map(|e| e.w).sum();`), and prints with
+format strings, `{:?}` of `tree[0]` through the derived `Debug`. The timing goes to
 stderr through C's `timespec_get`.
 
 ## Output
@@ -184,22 +182,21 @@ one of the ~20 million comparisons.
 
 | feature | where | guide |
 |---|---|---|
-| `#[derive(Eq, Ord, Debug)]`, sorting by a derived `Ord` | `Edge`, `kruskal` | `volec guide formatting` (derive), `guide std` (sort) |
-| default and named arguments | `random_edges` | `volec guide core` |
+| `#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]`, sorting by a derived `Ord` | `Edge`, `kruskal` | `volec guide formatting` (derive), `guide std` (sort) |
 | ranges as iterators, `map`, `collect`, `sum`, `max` | `UnionFind::new`, `main` | `volec guide iterators`, `guide closures` |
 | tuples: returned, destructured, a tuple-valued `if` | `kruskal`, `unite`, `main` | `volec guide syntax` |
 | widening (`i32` fields to `i64` parameters) | `kruskal` | `volec guide conversions` |
-| `Vec::filled_in`, `as_mut_slice`, slices written through | `UnionFind` | `volec guide std`, `guide memory` |
+| `Vec::from_elem_in`, `as_mut_slice`, slices written through | `UnionFind` | `volec guide std`, `guide memory` |
 | drops: the union-find and the forests freed at the end of their scope, with no `free` | everywhere | `volec guide memory` |
-| f-strings: `{w:>2}`, `{e:?}` | `main` | `volec guide formatting` |
+| format strings: `{:>2}`, `{:?}` | `main` | `volec guide formatting` |
 | a C header: `import "time.h" as c;` | `now_ns` | `volec guide c-interop` |
 
 ## Try
 
-- Make the random graph denser (`random_edges(n, 5_000_000)`): one
+- Make the random graph denser (`random_edges(n, 5_000_000, 7, gpa)`): one
   component, and the early `break` cuts the loop short.
 - Replace path halving by full path compression (a second loop that
   points every node on the path at the root) and time both.
 - Stop when `uf.sets == k` to split the nodes into `k` clusters.
-- Sort with `edges.sort_by(|a, b| b.w - a.w)` to get a maximum
+- Sort with `edges.sort_unstable_by(|a, b| b.w.cmp(&a.w))` to get a maximum
   spanning tree.
