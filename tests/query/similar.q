@@ -34,7 +34,7 @@ $ similar Square::perimeter Square
     }
 // 1 of 1 structs like crate::shapes::Square, nearest first; a new one beside it: volec edit insert --after crate::shapes::Square < new.vl
 // crate::shapes::Circle	similar/shapes.vl:3-5
-pub struct Circle {
+#[derive(Clone, Copy)] pub struct Circle {
     pub r: i64,
 }
 // 2 methods (with their lines and whole contracts: query items crate::shapes::Circle)

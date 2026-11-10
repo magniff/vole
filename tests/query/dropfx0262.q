@@ -3,28 +3,24 @@
 ## a value given back is not dropped, so 'keep' has none. The same
 ## drops are calls for refs and callees.
 $ effects crate dropfx0262/main.vl
-<crate::Loud as Drop>::drop	io panic
-crate::quiet	io panic
+<crate::Loud as Drop>::drop	io panic diverge
+crate::quiet	io panic diverge
 crate::keep	none
-crate::temp	io panic unsafe
-crate::main	io panic
+crate::temp	io panic diverge unsafe
+crate::main	io panic diverge
 $ effects quiet --why io dropfx0262/main.vl
-crate::quiet	io panic
+crate::quiet	io panic diverge
   'l' at dropfx0262/main.vl:15:9 calls 'Loud::drop'
   'println("drop {}", self.n)' at dropfx0262/main.vl:9:9 calls 'std::fmt::println'
-  'print_acquire()' at <std>:11804:5 calls 'std::fmt::print_acquire'
-  'print_acquire_held()' at <std>:11714:9 calls 'std::fmt::print_acquire_held'
   (no source found)
 $ effects temp --why io dropfx0262/main.vl
-crate::temp	io panic unsafe
+crate::temp	io panic diverge unsafe
   'Loud { n: n }' at dropfx0262/main.vl:27:5 calls 'Loud::drop'
   'println("drop {}", self.n)' at dropfx0262/main.vl:9:9 calls 'std::fmt::println'
-  'print_acquire()' at <std>:11804:5 calls 'std::fmt::print_acquire'
-  'print_acquire_held()' at <std>:11714:9 calls 'std::fmt::print_acquire_held'
   (no source found)
 $ refs 'Loud::drop' dropfx0262/main.vl
 # dropfx0262/main.vl
-8:8	def	fn drop(inout self) {
+8:8	def	fn drop(&mut self) {
 15:9	call	quiet	let l = Loud { n: n };
 27:5	call	temp	Loud { n: n }.n
 32:9	call	main	let k = keep(3);
