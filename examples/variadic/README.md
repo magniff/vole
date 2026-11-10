@@ -25,13 +25,13 @@ A variadic C function is declared with `...` after its fixed parameters:
 
 ```tach
 extern "C" {
-    fn printf(format: *u8, ...) -> i32;
+    fn printf(format: *const u8, ...) -> i32;
 }
 ```
 
 The variadic arguments are passed as C passes them, on each target's
 convention (on aarch64-macos they go on the stack, on Linux in registers):
-an `i32` for `%d`, an `f64` for `%f`, a `*u8` for `%s`, an `i64` for
+an `i32` for `%d`, an `f64` for `%f`, a `*const u8` for `%s`, an `i64` for
 `%ld`. The format must be a C string, NUL-terminated, which is what a
 `c"..."` literal is:
 
