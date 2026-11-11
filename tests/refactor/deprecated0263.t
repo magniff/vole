@@ -16,6 +16,16 @@ ok: 0 errors, 9 warnings in main.vl
 $ explain item.deprecated
 item.deprecated: warning
 (0.26.3) A use of an item marked `#[deprecated]` (Rust's attribute: `#[deprecated]`, `#[deprecated = "note"]`, `#[deprecated(since = "1.2", note = "use new_fn")]`), on a function, a method, a struct, an enum, a trait, a type alias, a constant, a static or a field: a call, a name, a type, a path, a `use`, a field read or a struct literal's field. The message gives the item's note; the help, where it is marked. A use inside a deprecated item (a recursive call, a derived impl, a deprecated method reading a deprecated field) is not one, as in Rust, and std's uses of its own deprecated items are std's.
-fix: Do what the note says (it names what to use instead); for std's `Buf`, `volec fix --only buf` rewrites each binding to `String<A>` (text) or `Vec<u8, A>` (bytes).
+fix: Do what the note says (it names what to use instead).
 example:
-    warning[item.deprecated] use of deprecated function 'old_fn': use new_fn | help: marked #[deprecated] at main.vl:2:5
+    #[deprecated(note = "use new_fn")]
+    fn old_fn() -> i64 { 1 }
+    
+    fn new_fn() -> i64 { 1 }
+    
+    fn main() {
+        println("{} {}", old_fn(), new_fn());
+    }
+    
+    main.vl:7:22: warning[item.deprecated] use of deprecated function 'old_fn': use new_fn
+      help: marked #[deprecated] at main.vl:2:1
