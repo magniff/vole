@@ -461,12 +461,9 @@ fn main(gpa: Gpa) {
 error[borrowck.outlives]: lifetime may not live long enough: the lifetime of the closure's parameter 'a' is only the call's, but it flows where a lifetime of the closure's signature, from outside it is required, which lasts longer
  --> main.vl: line 5, column 21
   = help: keep a copy of the value instead of the reference (`*p`, `.clone()`); a closure's result borrows from its parameter only when the bound it is passed for says so (`Fn(&T) -> &T`)
-error[borrowck.outlives]: lifetime may not live long enough: the lifetime of the closure's parameter 'a' is only the call's, but it flows where a lifetime of the closure's signature, from outside it is required, which lasts longer
- --> main.vl: line 5, column 21
-  = help: keep a copy of the value instead of the reference (`*p`, `.clone()`); a closure's result borrows from its parameter only when the bound it is passed for says so (`Fn(&T) -> &T`)
 ```
 
-The error is long (and this compiler prints it twice), but its first
+The error is long, but its first
 line has the point. `a` is a reference to the arena, good only for the
 length of the call, and the Vec holds it, so the Vec can't be the closure's result: that is
 chapter 4's rule about a reference outliving what it points to. There
