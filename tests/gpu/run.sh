@@ -90,7 +90,14 @@ run_case() {
     mkdir -p "$dir"
     why="$dir/why"
     : >"$why"
-    if ! "$COMPILER" $OPT --deny-warnings "$file" "$ROOT/tests/gpu/support.vl" -o "$dir/prog" >"$dir/build" 2>&1; then
+    # (0.28.0) support.vl is joined when it is of the case's edition: while
+    # it is the old edition's (it moves with std::gpu's runtime), a
+    # rust-edition case (std::objc's) is built alone.
+    support="$ROOT/tests/gpu/support.vl"
+    if grep -q '^// EDITION: rust' "$file" && ! grep -q '^// EDITION: rust' "$support"; then
+        support=""
+    fi
+    if ! "$COMPILER" $OPT --deny-warnings "$file" $support -o "$dir/prog" >"$dir/build" 2>&1; then
         { echo "build failed:"; sed 's/^/    /' "$dir/build" | head -20; } >>"$why"
         echo fail >"$dir/status"
         return
