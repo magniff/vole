@@ -41,10 +41,10 @@ source; don't copy its style.
 - Motivate before you explain: what problem does this solve? A sentence
   is often enough ("Reading can fail, so...").
 - Explain *why* vole does it this way when it differs from what the
-  reader probably knows (explicit allocators, no references, effects).
+  reader probably knows (explicit allocators, contracts, effects).
   One or two sentences; the design docs have the long version.
 - Prefer common words. Introduce each term once, in italics, with its
-  meaning (*view*, *panic*, *allocator*), then use it consistently.
+  meaning (*borrow*, *panic*, *allocator*), then use it consistently.
 - Don't overpromise: "the compiler checks that..." only when it does
   (verify with a block). No marketing words (blazing, powerful,
   seamless).
@@ -74,11 +74,14 @@ is enough.
 Use a block quote that starts with the bold label:
 
 ```markdown
-> **If you know Rust:** `&line` here is not a reference. ...
+> **If you know Rust:** it's like Rust's allocator API (`Vec::new_in`)
+> made mandatory, without a global default.
 ```
 
-- Use them only where vole looks like Rust but means something else, or
-  where a Rust habit gives an error. Keep them to two to four sentences.
+- Vole's surface is Rust's, so most of the text needs none. Use them
+  only where vole differs from Rust (allocators, contracts, effects, no
+  macros), or where a Rust habit gives an error. Keep them to two to
+  four sentences.
 - The main text must never need the aside: a reader who skips them
   loses nothing.
 - "If you know C", "If you know Go", "If you know Python" asides follow
@@ -94,8 +97,14 @@ Use a block quote that starts with the bold label:
   the prose says so the first time ("Start a new file, `guess.vl`").
 - Code style is `volec fmt`'s: four-space indents, braces on the same
   line. Run `volec fmt` on a program before pasting it.
-- Prefer `str` and `String` for text in new examples; use `[u8]` and
-  `Buf` when the topic is bytes.
+- Prefer `&str` and `String` for text in new examples; use `&[u8]` and
+  `Vec<u8, Gpa>` when the topic is bytes.
+- Write the Rust way: `let mut`, `&` and `&mut`, moves and lifetimes,
+  in chapter 4's words. `println` takes a literal format string first
+  (`println("{x}")`, never `println(x)`); `==` on a struct needs
+  `#[derive(PartialEq)]`; a struct that holds a `Vec` names its
+  allocator (`<A: Allocator>`). Don't teach default or named arguments,
+  or `{:c}`.
 - Keep lines in code blocks under about 90 characters, so they read on
   GitHub without scrolling.
 - Markdown that renders on GitHub: no HTML except the hidden-code
@@ -114,6 +123,7 @@ checked, comes from its fence. The words after `vole` are annotations.
 | ` ```vole ` | a snippet | compiles with `--deny-warnings` (see below for how it's wrapped) |
 | ` ```vole NAME.vl ` | a file the reader saves | compiles as it is, never wrapped |
 | ` ```vole ... warn ` | code that has a warning on purpose | compiles; warnings allowed |
+| ` ```vole ... mvs `, ` ```console mvs ` | (0.28 only) a block or session still in the old edition, waiting for something the new one lacks; listed with what it waits on | as its fence says, in the old edition |
 | ` ```vole ... skip ` | an excerpt of a listing already shown, or code that can't compile on purpose without an error to show | nothing |
 | ` ```in ` | after a vole block: the program's stdin | used by the next `out` |
 | ` ```out ` | after a vole block (and its `in`) | the program runs; stdout and stderr together match exactly, trailing blanks aside; exit status 0 |
@@ -187,10 +197,10 @@ the snippet's file, and GitHub doesn't show it:
 
 ````markdown
 <!-- vole-hidden
-struct Song { title: str, seconds: i64 }
+struct Song { title: &'static str, seconds: i64 }
 -->
 ```vole
-fn minutes(s: Song) -> i64 { s.seconds / 60 }
+fn minutes(s: &Song) -> i64 { s.seconds / 60 }
 ```
 ````
 
