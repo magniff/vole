@@ -182,7 +182,7 @@ it? `volec query context` answers all three at once:
 
 ```console
 $ volec query context report::top
-// crate::report::top	report.vl:12-24	effects: alloc(Gpa) io panic diverge
+// crate::report::top	report.vl:12-24	effects: alloc(Gpa) panic diverge
 pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa>, n: usize, order: Order, gpa: Gpa) -> Vec<(
     String<Gpa>, i64), Gpa> {
     let mut pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
@@ -279,7 +279,7 @@ one line for each of its functions:
 $ volec query effects crate::count
 crate::count::is_word_byte	none
 crate::count::trim_punct	panic diverge
-crate::count::add_words	alloc(Gpa) io panic diverge
+crate::count::add_words	alloc(Gpa) panic diverge
 ```
 
 `--why EFFECT` on a function explains an effect it has, call by call, down
@@ -415,7 +415,7 @@ same):
 $ volec edit patch count_words --old 'if w.is_empty() {' --new 'if w.len() < min_len {'
 patched crate::count::count_words	count.vl	+1 -1 lines
 $ volec query show count_words
-// crate::count::count_words	count.vl:28-38	effects: alloc(Gpa) io panic diverge
+// crate::count::count_words	count.vl:28-38	effects: alloc(Gpa) panic diverge
 // Adds the words of text to counts, lowercased.
 pub fn count_words(counts: &mut HashMap<String<Gpa>, i64, Gpa>, text: &str, min_len: usize,
     gpa: Gpa) {
@@ -443,7 +443,7 @@ variant and an arm to each match, with the expression you give:
 $ volec refactor variant report::Order --add 'Longest' --arm 'pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()))'
 added variant Longest to crate::report::Order, an arm in 1 match	report.vl	+2 -0 lines
 $ volec query show report::top
-// crate::report::top	report.vl:13-26	effects: alloc(Gpa) io panic diverge
+// crate::report::top	report.vl:13-26	effects: alloc(Gpa) panic diverge
 pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa>, n: usize, order: Order, gpa: Gpa) -> Vec<(
     String<Gpa>, i64), Gpa> {
     let mut pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);

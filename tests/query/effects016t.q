@@ -7,7 +7,6 @@ crate::out_write	io
 crate::labs	none
 <crate::Square as Shape>::area	none
 apply<closure(i64) -> i64 at syntax016/main.vl:48:32>	none
-apply<F>	none
 crate::grow_by_one	alloc(Gpa) panic diverge
 crate::main	alloc(Gpa) io panic diverge unsafe
 $ effects crate --has io syntax016/main.vl
@@ -18,7 +17,7 @@ crate::grow_by_one	alloc(Gpa) panic diverge
   'v.push(1)' at syntax016/main.vl:40:5 grows a Vec<i64, Gpa>
   'self.grow_one()' at <std>:5064:13 calls 'Vec::grow_one'
   'self.reserve(1)' at <std>:5083:9 grows a Vec<i64, Gpa>
-  '' at <std>:4975:9 grows a Vec<i64, Gpa>
+  'the body, after its contract' at <std>:5026:9 grows a Vec<i64, Gpa>
   'self.try_reserve(extra)' at <std>:4978:33 grows a Vec<i64, Gpa>
   'self.grow_to(new_cap)' at <std>:5010:9 calls 'Vec::grow_to'
   'self.alloc.allocate(new_layout)' at <std>:4933:13 allocates from Gpa (an Allocator method)

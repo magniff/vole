@@ -30,7 +30,7 @@ pub fn one() -> i64 {
     1
 }
 
-#[effects(alloc(Gpa), panic, diverge)]
+#[effects(alloc(Gpa), panic)]
 pub fn grow(v: &mut Vec<i64, Gpa>) {
     v.push(1);
 }
