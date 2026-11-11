@@ -407,17 +407,16 @@ a positional argument after a named one: the named arguments come last
 ```
 Named arguments follow the positional ones, in the parameters' order
 (`f(1, c: 3, b: 2)` is an error whose `try:` is `f(1, b: 2, c: 3)`); a
-missing one without a default gets `try: f(1, b: VALUE)`, a misspelt
-name the nearest.
+missing one gets `try: f(1, b: VALUE)`, a misspelt name the nearest.
 
 ```vole
-trait T { fn f(x: i64 = 1) -> i64; }
+fn f(a: i64, b: i64 = 2) -> i64 { a + b }
 ```
 ```err
-a default value is for a parameter of a function or an inherent method, not of a trait function
+a parameter has no default value; pass it at each call
 ```
-Defaults go on trailing parameters of `fn` items and inherent methods,
-not on trait or extern functions, closures or `fn` types.
+No parameter has a default value (`syntax.default-arg`; the `try:`
+removes it): every call passes every argument, by position or by name.
 
 ```vole
 struct P { x: i64, y: i64 }

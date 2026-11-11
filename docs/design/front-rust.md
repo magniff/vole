@@ -977,6 +977,19 @@ trait.unconstrained` (E0207) at the impl. *Anchor:* `collect_impl`
 (today: parameters must be the self type's arguments in order:
 `later_impl`), `front/check/calls/paths.vl: impl_param_count,
 bind_impl_params`.
+In an instance, a parameter of a pattern impl that the receiver's type
+and the arguments leave free is taken from the bound of the receiver's
+type parameter that names the impl's trait: `r.start_bound()` with `R:
+RangeBounds<K>`, `R = RangeFull`, is `impl<T> RangeBounds<T> for
+RangeFull` with `T = K` (0.28.0: `m.range(..)`, `v.drain(..)`).
+In an instance a receiver `*a` of `a: &T` is a `T`: when no impl of
+what `T` points to takes the call, `T`'s own does, as the generic body
+resolved it by `T`'s bound (`<&u8 as PartialEq<&u8>>::eq` in
+`Option<&u8>::eq`); and a receiver that is a reference to a view, `k:
+&K` with `K = &str`, is the view's own impl, not its place's (`K:
+Borrow<K>` is the reflexive impl; 0.28.0, gap 59). *Anchor:*
+`front/convert: unify_recv_bound, dispatch`. Cases
+`rust_t_bound_blanket_impl`, `rust_t_borrow_reflexive`.
 
 **F14.2 (positional binding).** An instance's arguments bind a template
 impl's parameters by position only when the header names them in order
@@ -1609,8 +1622,19 @@ Add<&str> for String`).
 When the operand is a view (`[T]`, `str`, Z9.1, where `&str` is the view
 too), an impl whose argument is written `&..` yields to one that is not:
 `PartialEq<str>` and `PartialEq<&'a str>` compare alike (0.27.2.1).
-*Anchor:* `front/check/synth_mode.vl: synth_operands`,
-`front/convert: by_view_rhs`. Case `rust_f_f26_cmp_rhs_ok`.
+A comparison whose left type has exactly one impl of the operator's
+trait (a derive's `PartialEq for Option<T>`) gives the right operand
+that type as its expected type, as rustc's inference does: `a ==
+Some(0)` of an `Option<i64>`, `v.last() == Some(&0)`; and a left operand
+that is a call holding a literal without a suffix (`Some(0) == a`) is
+read after the right one, with its type expected (0.28.0, gap 103).
+A comparison of two references with no impl of their own is of what
+they refer to, level by level (Rust's `impl PartialEq<&B> for &A`):
+`&a == &b` of two `&u8`, `a == b` of `a: &T` with `T = &u8`; never of
+the addresses (0.28.0; a raw pointer compares its address).
+*Anchor:* `front/check/synth_mode.vl: synth_operands, binary_result`,
+`front/convert: by_view_rhs, one_generic_trait_fn`. Cases
+`rust_f_f26_cmp_rhs_ok`, `rust_t_ref_eq_instance`.
 
 ### F27 Patterns in `let` and parameters
 
@@ -1887,6 +1911,26 @@ N]>`, a struct with its own Deref), or of a reference to one, is
 one written, so a place written goes through `deref_mut` (a guard not
 declared `mut` is E0596). *Anchor:* `check/synth_mode.vl: synth_index`.
 Cases `rust_t_index_deref`, `rust_b_err_index_deref_mut`.
+
+**F33.1 (no default values; named arguments stay, 0.28.0).** A parameter
+has no default value: `fn f(a: i64, b: i64 = 2)` is a parse error at the
+`=` (`syntax.default-arg`: "a parameter has no default value; pass it at
+each call"), with the
+fix that removes ` = value` (`volec fix --suggested`). Named arguments
+are kept, a documented divergence from Rust: `f(1, b: 3)`, after the
+positional ones and in parameter order. One exception, by name and not
+by syntax: std's macro-like panic functions, Rust's macros of the same
+names, take their message `msg` (and the position `at` the compiler
+fills) as an empty string when a call leaves it out: `assert`,
+`assert_eq`, `assert_ne`, `debug_assert`, `unreachable`, `todo`,
+`unimplemented`, and `__assert_fmt` (what an `assert` with a format
+message becomes). The set is fixed in the checker; their declarations
+in std's panic.vl carry no default, and no other function, in std or in a
+program, can ask for it. `contract_check` gets its three values from the
+compiler (0 for those a message does not show). *Anchor:*
+`parser/items/params.vl: parse_param`, `check/args.vl: macro_message,
+normalize_args`, `contracts/expand.vl: check_call`. Cases
+`err_args_defaults`, `args_defaults`, `err_args_named`.
 
 ## 6. The bound-only rule (D22.3's front side; U1)
 

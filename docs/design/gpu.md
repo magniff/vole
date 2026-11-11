@@ -160,6 +160,13 @@ Descriptors are small `#[derive(Clone)]` structs, and the constructors
 take default parameter values (0.15), so a common call names only what
 differs: `dev.texture(w, h, Format::Rgba8Unorm, usage = RENDER |
 COPY_SRC)`.
+(0.28.0: no parameter has a default value. Every call passes every
+argument, `dev.texture(w, h, Format::Rgba8Unorm, usage)`, and what was
+called two ways is two functions: `texture` and `texture_array(..,
+layers, mips)`, `write_texture` and `write_texture_region`,
+`copy_texture_to_buffer` and `copy_texture_to_buffer_region`,
+`Reflection::bind(group, binding, ty, StageSlots::compute(0))` and
+`bind_sized(.., min_size)`.)
 
 ### 2.3 Ownership and lifetimes
 
@@ -944,7 +951,7 @@ work autonomously through 0.23. Each can be revisited.
   violation), always on; no error scopes; `Result` only for failures a
   correct program can meet.
 - D8. **Flags and ids are distinct types (0.18)**; descriptors use
-  default parameters.
+  default parameters (until 0.28.0, which has none: §2.2).
 - D9. **Allocation:** host memory from the instance's allocator,
   per-frame arenas, no `Gpa` allocation in steady-state frames (checked
   with `query effects`); a TLSF sub-allocator for Vulkan device memory.
