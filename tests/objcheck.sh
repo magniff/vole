@@ -169,7 +169,7 @@ case_flags() {
 check() { # <file> <level> <dir> [-g]
     f=$1 o=$2 d=$3 g=${4:-}
     mkdir -p "$d"
-    # The case's FLAGS (0.17: --values=off, --check-alloc, ...), as
+    # The case's FLAGS (--check-alloc, ...), as
     # tests/run.sh builds it.
     flags=$(case_flags "$f")
     # (-l and -L are for the link: kept out of -c and -S, given to both

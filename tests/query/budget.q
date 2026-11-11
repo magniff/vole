@@ -216,7 +216,6 @@ usage: volec query def|show NAME... [--root ROOT] [--exact] [--with-comments]
        volec query show MODULE::section TITLE
        volec query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
        volec query type FILE:LINE[:COL]...
-       volec query own FILE:LINE:COL...   (0.17: each local's kind, moves and views there)
        volec query contracts NAME...   (0.27.2.1: its requires and ensures; a trait method's, then each impl's: what it adds, the trait's marked)
        volec query drops FILE:LINE...   (0.26.1: the function's drops as the places IR decides them, each with where it runs)
        volec query stats [MODULE|FILE] [--over N] [--all]
@@ -226,7 +225,6 @@ usage: volec query def|show NAME... [--root ROOT] [--exact] [--with-comments]
        volec query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (alloc(Gpa) io panic diverge unsafe; --why static)
        volec query features NAME... [--why FEATURE] [-C target-cpu=CPU] [-C target-feature=+x,-y]   (std::arch: what a function needs beyond the build's features)
        volec query arch WORDS... [--feature F] [--arch aarch64|x86_64|portable] [--equiv NAME]   (std::arch: the intrinsics by name, instruction, feature or doc; also query intrinsics)
-       volec query views NAME...|MODULE [--why]   (what results and `&mut` parameters view: views(self), views(*self), stores(word))
        volec query conflicts [FILE|DIR|FILE:LINE...] [--show]
        volec query similar NAME... [--limit N]   (items like NAME to copy, nearest first)
        volec query examples [KIND...]   (items to start from for an "add an X" change; volec guide how)
