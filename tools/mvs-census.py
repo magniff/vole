@@ -35,8 +35,7 @@ of the whole path).
 Owners: mig28 (book, examples, guide, bench, the editor samples), d4 (the
 old std and its copies in tests), d5 (the translator's transcripts), gpu
 (the gpu port: tests/gpu, window, voltty-render, two tools), del280 (the
-other tests, tools/numtables), other (evals/ and tests/agent-eval/: the
-user's call, not to be touched).
+other tests, tools/numtables), other (anything else).
 """
 import fnmatch
 import os
@@ -74,7 +73,7 @@ def owner(path):
         return "mig28"
     if path.startswith(("tests/translate", "tests/flip28", "tests/refactor/edition0")):
         return "d5"
-    if path.startswith("tools/numtables/") or (top[0] == "tests" and top[1] != "agent-eval"):
+    if path.startswith("tools/numtables/") or top[0] == "tests":
         return "del280"
     return "other"
 

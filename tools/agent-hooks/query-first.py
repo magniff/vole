@@ -12,8 +12,7 @@ Edit, Write) and PostToolUse (Bash). Reads the hook event (JSON) on stdin.
   carries `# no-query: <reason>`: then it runs, and the reason is logged.
   Source is the compiler's (compiler/src, compiler/std) and any program
   being worked on (examples/, bench/, a .vl elsewhere); a .vl under a
-  tests/ directory (a test case, a refactoring fixture, an agent-eval
-  task's data) is read freely, and logged as `read-fixture` (0.14).
+  tests/ directory (a test case, a refactoring fixture) is read freely, and logged as `read-fixture` (0.14).
 - A shell command that rewrites program source with `sed -i`, `perl
   -pi` or Python (`.write(`) is blocked with the `volec edit patch`
   command that does it (with `--root` for another program than cwd's),
