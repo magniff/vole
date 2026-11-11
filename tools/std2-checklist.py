@@ -49,16 +49,22 @@ import sys
 TOP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TREE = os.path.join(TOP, "compiler", "std2")
 OUT = os.path.join(TREE, "checklist.tsv")
-# An MVS program: its std is MVS's. The examples move to the rust edition
-# one by one in 0.28.0: the first that has not (when MVS's std goes, D4,
-# the `mvs` columns go with it).
+# An MVS program: its std is MVS's. tests/query/stdpos0253 while it is one;
+# else the first example that has not moved to the rust edition (when MVS's
+# std goes, D4, the `mvs` columns go with it).
+MVS_ROOT = "tests/query/stdpos0253/main.vl"
+
+
 def mvs_root():
     import glob
-    for p in sorted(glob.glob(os.path.join(TOP, "examples", "*", "main.vl"))):
+    cands = [os.path.join(TOP, MVS_ROOT)] + sorted(glob.glob(os.path.join(TOP, "examples", "*", "main.vl")))
+    for p in cands:
+        if not os.path.exists(p):
+            continue
         with open(p) as f:
             if "// EDITION: rust" not in f.read(300):
                 return os.path.relpath(p, TOP)
-    die("no program of the old edition is left under examples/ to read MVS's std from")
+    die("no program of the old edition is left to read MVS's std from")
 
 
 # MVS owners and modules in the 0.27.0 brief's scope: an item of theirs that

@@ -28,8 +28,9 @@ Go, C, Java, it doesn't matter. You know what a variable, a function
 and a loop are. You do not need to know Rust or C++, although vole will
 look familiar if you do.
 
-Some vole code looks like Rust but means something different. Where
-that happens, you will see a note like this one:
+Vole is written the way Rust is: the same syntax, the same rules about
+who owns a value, the same names in its library. It differs in a few
+places, and where it does, you will see a note like this one:
 
 > **If you know Rust:** these asides are for you. Everyone else can skip
 > them.
@@ -242,12 +243,12 @@ snippet and tells you its type and its value:
 
 ```console
 $ volec try '6 * 7'
-i64 = 42
+i32 = 42
 $ volec try 'let name = "vole"; name.len()'
 usize = 4
 ```
 
-`i64` is a 64-bit integer, the type vole gives a whole number unless
+`i32` is a 32-bit integer, the type vole gives a whole number unless
 you ask for another; a length is a `usize`, an unsigned one. Keep `volec try` in mind as you read: whenever
 you wonder how something behaves, try it.
 

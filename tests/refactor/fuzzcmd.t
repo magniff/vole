@@ -5,7 +5,7 @@
 ## crash, after 16001 runs; a loaded machine needs more than 120 s for them.)
 $ fuzz parse_never_crashes --time 600
 FAIL parse_never_crashes (fuzz, after 32859 runs, shrunk in 1 step): main.vl:9:28: index out of bounds: index 4, length 2
-  input: data = "FUZZ"
+  input: data = [70, 85, 90, 90]
   saved: .volec/fuzz/parse_never_crashes/crash-c6d0a3857a0d9820 (volec test replays it; test --accept keeps it in tests/fuzz/parse_never_crashes/)
   try: volec test parse_never_crashes main.vl
 [exit 1]
@@ -16,14 +16,14 @@ $ test
 test main.vl: 0 passed, 1 failed (1 #[fuzz] target; -O0 and -O2 agree)
 FAIL parse_never_crashes (fuzz, input .volec/fuzz/parse_never_crashes/crash-c6d0a3857a0d9820): main.vl:9:28: index out of bounds: index 4, length 2
   trace: main.vl:9 parse < main.vl:24 parse_never_crashes
-  input: data = "FUZZ"
+  input: data = [70, 85, 90, 90]
 (outputs: .volec/test/O2/case-NAME.got, .err; test-NAME.got, .err)
 [exit 1]
 $ test --accept
 test main.vl: 0 passed, 1 failed (1 #[fuzz] target; -O0 and -O2 agree)
 FAIL parse_never_crashes (fuzz, input tests/fuzz/parse_never_crashes/crash-c6d0a3857a0d9820): main.vl:9:28: index out of bounds: index 4, length 2
   trace: main.vl:9 parse < main.vl:24 parse_never_crashes
-  input: data = "FUZZ"
+  input: data = [70, 85, 90, 90]
 (outputs: .volec/test/O2/case-NAME.got, .err; test-NAME.got, .err)
 [exit 1]
 % ls tests/fuzz/parse_never_crashes

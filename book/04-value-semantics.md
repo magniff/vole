@@ -1,4 +1,4 @@
-# 4. Value semantics: let, inout, sink
+# 4. Ownership and borrowing
 
 This is the chapter that makes vole different from the languages you
 probably know, so we'll take it slowly. It answers two questions every
@@ -7,9 +7,10 @@ data, who may change it? And when is its memory given back?
 
 By the end of the chapter you'll know what it means that every value in
 vole has one owner, when a value is copied and when it is moved, and how
-a function says what it does with each argument: reads it, changes it,
-or takes it. You'll also see why vole has no references to manage and
-no lifetimes to write, even though it has no garbage collector.
+a function says what it does with each argument: borrows it to read,
+borrows it to change, or takes it. You'll also meet the *borrow
+checker*, the part of the compiler that makes sure a borrowed value is
+still there, and unchanged, for as long as someone is looking at it.
 
 Our running example is a playlist: songs, and functions that add to a
 playlist, total it up, and put it away.
@@ -36,18 +37,25 @@ any more.
 
 Other languages answer the same questions differently. C lets you share
 freely and makes you call `free` yourself, at exactly the right moment,
-or else. Rust lets you share through *references*, and checks with a
-*borrow checker* that no reference outlives its data, which sometimes
-means writing out *lifetimes* to explain to the compiler how long each
-reference lives.
+or else.
 
-Vole's answer is called *mutable value semantics*. The idea is that
-every value behaves like a number does. When you write
+Vole's answer is Rust's, and it's called *ownership*. Every value has
+exactly one owner, the variable that holds it. Other parts of the
+program can *borrow* the value for a while, through a *reference*, and
+the compiler checks two things about every borrow: the value outlives
+it, and while anyone can change the value, nobody else is looking. So
+you can always change what is yours (`let mut`), and nothing changes
+behind your back. The rest of this chapter is about how that works, one
+rule at a time.
+
+## Copies and moves
+
+Start with the simplest values:
 
 ```vole
 fn main() {
     let a = 5;
-    var b = a;
+    let mut b = a;
     b += 1;
     println("{a} {b}");
 }
@@ -57,122 +65,84 @@ fn main() {
 5 6
 ```
 
-nobody is surprised that `a` is still 5. `b = a` gave `b` its own 5.
-In vole, a list, a string, a struct, any value at all, behaves like
-that: assigning it or passing it never creates a second name through
-which someone else can change it, unless you hand one over on purpose,
-in a way you can see at the call. You can always change what is yours
-(`var`), and nothing changes behind your back. The rest of this chapter
-is about how vole keeps that promise without copying everything all
-the time.
+Nobody is surprised that `a` is still 5. `b = a` gave `b` its own 5.
+Numbers, `bool`s and `char`s are *copied* by `=`: afterwards there are
+two values, each with its own owner.
 
-## Plain and owned values
-
-Here's our song type. Structs are chapter 5's subject; for now, a
-`struct` is a value with named fields.
+A list is different. A `Vec` (a growable list, chapter 7) holds its
+elements in memory it got from an allocator, and that memory can be
+large. Copying it on every `=` would be slow, and sharing it is what
+we're trying to avoid. So what does `=` do with a `Vec`? Let's try.
+Here's our song type (structs are chapter 5's subject; for now, a
+`struct` is a value with named fields) and a playlist:
 
 ```vole playlist.vl
-struct Song { title: str, seconds: i64 }
+struct Song { title: &'static str, seconds: i64 }
 
 fn main(gpa: Gpa) {
+    let mut list: Vec<Song, Gpa> = Vec::new_in(gpa);
+    list.push(Song { title: "Blue Moon", seconds: 185 });
+    list.push(Song { title: "Summertime", seconds: 210 });
+    let copy = list;
+    println("{} {}", list.len(), copy.len());
+}
+```
+
+```err
+error[borrowck.use_moved]: 'list' is used here after it moved (moved at playlist.vl: line 7, column 16)
+ --> playlist.vl: line 8, column 22
+  = help: use it before the move, pass a clone where it moves, or take it by reference
+  = try: volec edit patch playlist.vl:7 --old 'let copy = list;' --new 'let copy = list.clone();'
+```
+
+`let copy = list;` did not copy the list. It *moved* it: the list now
+belongs to `copy`, and `list` is no longer a variable you can use. The
+error says where the value was used and where it moved. Nothing was
+copied, and there is still exactly one owner, so there is still nobody
+who can change the list behind anybody's back.
+
+Moving is what `=` does with every value that isn't one of the simple
+copied kinds: a `Vec`, a `String`, and a struct too, whatever its
+fields are. Passing a value to a function moves it in the same way, and
+so does returning it.
+
+A struct made only of copied things can ask to be copied as well, with
+a line above it:
+
+```vole
+#[derive(Clone, Copy)]
+struct Song { title: &'static str, seconds: i64 }
+
+fn main() {
     let first = Song { title: "Blue Moon", seconds: 185 };
-    var edit = first;
+    let mut edit = first;
     edit.seconds = 190;
     println("{} {}", first.seconds, edit.seconds);
-
-    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
-    list.push(first);
-    list.push(Song { title: "Summertime", seconds: 210 });
-    println("{} songs", list.len());
 }
 ```
 
 ```out
 185 190
-2 songs
 ```
 
-`var edit = first;` copied the song. Changing `edit` left `first` alone,
-just as with the numbers. A song is a couple of small fields, so
-copying it costs about as much as copying a few numbers.
+With `#[derive(Clone, Copy)]`, a `Song` behaves like a number: `let mut
+edit = first;` copied it, and changing `edit` left `first` alone.
+Without that line, `first` would have moved, and the last line would be
+the error we just saw. Types that are copied this way are called
+`Copy` types. A struct that holds a `Vec` or a `String` can't be one:
+there is no cheap way to copy what it owns. (Chapter 9 explains what
+`derive` writes.)
 
-Values like that are called *plain*: numbers, `bool`, and tuples,
-arrays and structs made only of plain values. `=` copies them, bit for
-bit, as C would. (A `Song` holds a `str`, which is a *view* of text
-stored somewhere else. Views are copied too, and the section on views,
-later in this chapter, explains them. For now, read a `Song` as plain.)
-
-`list` is different. A `Vec` (a growable list, chapter 7) holds its
-elements in memory it got from an allocator, and that memory can be
-large. A value that holds memory like this is *owned*: `Vec`, `String`,
-`HashMap`, and any struct with one of those inside. What does `=` do
-with an owned value? Let's try:
-
-```vole playlist.vl
-struct Song { title: str, seconds: i64 }
-
-fn main(gpa: Gpa) {
-    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
-    list.push(Song { title: "Blue Moon", seconds: 185 });
-    let backup = list;
-    list.push(Song { title: "Summertime", seconds: 210 });
-    println("{} {}", backup.len(), list.len());
-}
-```
-
-```err
-error[own.moved]: 'list' is used here after it moved at 6:18
- --> playlist.vl: line 7, column 5
-  = help: use it before the move, pass a copy where it moves ('.clone()'), or let the callee read it: a let parameter ('x: T'), not 'sink'
-  = try: volec edit patch playlist.vl:6 --old 'let backup = list;' --new 'let backup = list.clone();'
-```
-
-`let backup = list;` *moved* the list into `backup`. After a move, the
-old name is dead: `list` no longer holds anything, and using it is an
-error. The error says where the move happened (line 6, column 18) and
-where the dead name was used (line 7).
-
-Why move instead of copy? Copying a list means allocating new memory
-and copying every element, which is too expensive to happen silently
-on every `=`. Sharing, as Python does, would break the promise that
-nothing changes behind your back. A move is cheap, because only the
-list's small handle changes hands, not its elements, and it keeps the
-promise: there is still exactly one name for the list, it's just a
-different one.
-
-If you really want two separate lists, say so with `.clone()`. That's
-what the `try:` line at the end of the error does: it is a command
-that changes line 6 to `let backup = list.clone();`.
-
-```vole playlist.vl
-struct Song { title: str, seconds: i64 }
-
-fn main(gpa: Gpa) {
-    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
-    list.push(Song { title: "Blue Moon", seconds: 185 });
-    let backup = list.clone();
-    list.push(Song { title: "Summertime", seconds: 210 });
-    println("{} {}", backup.len(), list.len());
-}
-```
-
-```out
-1 2
-```
-
-Now there are two lists, and the push changed only one of them.
-
-You never declare whether a type is plain or owned. The compiler works
-it out from what the type holds: a struct of numbers is plain, and the
-moment you add a `Vec` field to it, it is owned.
+(The type of `title`, `&'static str`, is the type of a string literal.
+The section on lifetimes, later in this chapter, explains it.)
 
 ## Drops: giving memory back
 
-An owned value has exactly one owner at a time, the variable that
-holds it. That makes the second question, when to give the memory
-back, easy: when the owner goes away. At the end of the block where a
-variable was declared, its value is *dropped*, which for a `Vec` means
-its memory goes back to the allocator. You never call `free`.
+A value has exactly one owner at a time. That makes the second
+question, when to give the memory back, easy: when the owner goes away.
+At the end of the block where a variable was declared, its value is
+*dropped*, which for a `Vec` means its memory goes back to the
+allocator. You never call `free`.
 
 To watch drops happen, we can give a type some code to run when it is
 dropped, with `impl Drop`:
@@ -181,7 +151,7 @@ dropped, with `impl Drop`:
 struct Noisy { id: i64 }
 
 impl Drop for Noisy {
-    fn drop(inout self) {
+    fn drop(&mut self) {
         println("dropping {}", self.id);
     }
 }
@@ -208,731 +178,548 @@ dropping 2
 dropping 1
 ```
 
-A type with a `Drop` is owned, like a `Vec`, even though it holds only
-a number. Reading the output from the top:
+Reading the output from the top:
 
 - `c` is dropped when the inner block ends, right after its last line.
-- `drop(d)` drops `d` early, on the spot. After it, `d` is dead, as if
-  it had moved (it did: into `drop`).
+- `drop(d)` drops `d` early, on the spot. After it, `d` can't be used:
+  it moved, into `drop`.
 - `a` and `b` are dropped when `main` ends, the last declared first.
 
 Drops happen on every way out of a block: falling off the end,
 `return`, `break`, `continue`. A value that was moved somewhere else
 isn't dropped where it was; its new owner drops it later. So every
-owned value is dropped exactly once, and you never free memory twice or
+value is dropped exactly once, and you never free memory twice or
 forget to free it.
 
 You'll rarely write `impl Drop` yourself. A struct without one is
 dropped field by field, so a struct holding a `Vec` frees the `Vec`'s
 memory with no code from you.
 
-## let: reading
+## &: borrowing to read
 
 Now let's write functions that work on a playlist. The first one only
-reads it:
+reads it. If it took the list by value, the call would move the list
+into the function, and the caller would lose it. What we want is to
+lend the list for the length of the call:
 
 ```vole playlist.vl
-struct Song { title: str, seconds: i64 }
+struct Song { title: &'static str, seconds: i64 }
 
-fn total_seconds(list: Vec<Song, Gpa>) -> i64 {
-    var total = 0;
-    for s in list {
-        total += s.seconds;
+fn total_seconds(list: &Vec<Song, Gpa>) -> i64 {
+    let mut total = 0;
+    for song in list {
+        total += song.seconds;
     }
     total
 }
 
 fn main(gpa: Gpa) {
-    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
+    let mut list: Vec<Song, Gpa> = Vec::new_in(gpa);
     list.push(Song { title: "Blue Moon", seconds: 185 });
     list.push(Song { title: "Summertime", seconds: 210 });
-    println("{} seconds", total_seconds(list));
-    println("{} songs, still here", list.len());
+    println("{} seconds", total_seconds(&list));
+    println("{} songs", list.len());
 }
 ```
 
 ```out
 395 seconds
-2 songs, still here
+2 songs
 ```
 
-After the last section you might expect `total_seconds(list)` to move
-the list into the function. It doesn't, because of what the parameter
-says. Every parameter has a *convention*, which says what the function
-does with its argument, and `list: Vec<Song>`, with nothing written
-before the type, has the default convention, `let`:
+`&Vec<Song, Gpa>` is the type of a *reference* to a list: a way to
+reach a list that someone else owns. `&list` at the call makes one. We
+say `total_seconds` *borrows* the list. Nothing is copied, however long
+the list is, and when the function returns, the borrow is over and
+`main` still owns its list, as the last line shows.
 
-- the function may read the argument, and nothing else: not change it,
-  not keep it;
-- the argument is not copied: the function reads the caller's list in
-  place;
-- the caller keeps its value.
+Through a `&` reference you can read and nothing else: `total_seconds`
+can't push a song or change one. You use a reference much as you would
+the value: `list.len()` and `song.seconds` work through one, and a
+`for` loop over a reference to a list visits references to its
+elements. Where you need the value itself, `*r` is what the reference
+`r` points to.
 
-A `let` parameter is *lent* to the function for the length of the call
-and comes back, unchanged, when the call returns. This is the
-convention you'll use most, and it's the default so that the harmless
-case is the one you don't have to write.
+Any number of `&` references to a value can exist at once. Readers
+don't get in each other's way.
 
-Since a `let` parameter is read-only, changing one is an error. Here's
-a first try at a function that adds a song:
+## &mut: borrowing to change
+
+A function that changes its argument asks for a different kind of
+reference, `&mut`:
 
 ```vole playlist.vl
-struct Song { title: str, seconds: i64 }
+struct Song { title: &'static str, seconds: i64 }
 
-fn add(list: Vec<Song, Gpa>, song: Song) {
-    list.push(song);
+fn add_song(list: &mut Vec<Song, Gpa>, title: &'static str, seconds: i64) {
+    list.push(Song { title, seconds });
+}
+
+fn trim_all(list: &mut Vec<Song, Gpa>, limit: i64) {
+    for song in list {
+        if song.seconds > limit {
+            song.seconds = limit;
+        }
+    }
 }
 
 fn main(gpa: Gpa) {
-    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
-    add(list, Song { title: "Blue Moon", seconds: 185 });
+    let mut list: Vec<Song, Gpa> = Vec::new_in(gpa);
+    add_song(&mut list, "Blue Moon", 185);
+    add_song(&mut list, "Summertime", 210);
+    trim_all(&mut list, 200);
+    for song in &list {
+        println("{} {}", song.title, song.seconds);
+    }
+}
+```
+
+```out
+Blue Moon 185
+Summertime 200
+```
+
+`&mut list` lends the list for changing, and you can see it at the
+call: reading `main`, you know which calls may change `list` without
+looking at the functions. A `&mut` can be made only of a `let mut`
+variable; you can't lend for changing what you may not change yourself.
+
+Inside `trim_all`, the loop over a `&mut` list visits `&mut` references
+to its songs, so `song.seconds = limit` changes the song in the
+caller's list.
+
+### One change at a time
+
+A `&mut` reference comes with a promise: while it exists, it is the
+only way to reach the value. No other reference, `&` or `&mut`, may be
+in use at the same time. Here's a function that appends one list to
+another, called with the same list twice:
+
+```vole playlist.vl
+struct Song { title: &'static str, seconds: i64 }
+
+fn append(to: &mut Vec<Song, Gpa>, from: &Vec<Song, Gpa>) {
+    for s in from {
+        to.push(Song { title: s.title, seconds: s.seconds });
+    }
+}
+
+fn main(gpa: Gpa) {
+    let mut list: Vec<Song, Gpa> = Vec::new_in(gpa);
+    list.push(Song { title: "Blue Moon", seconds: 185 });
+    append(&mut list, &list);
     println("{}", list.len());
 }
 ```
 
 ```err
-error[own.readonly]: writes through 'list', a 'let Vec<Song, Gpa>', which is read-only (let: read-only)
- --> playlist.vl: line 4, column 5
-  = help: take it inout ('x: inout T', called with '&x') to change it
-  = try: volec refactor signature add --type list 'inout Vec<Song, Gpa>'
-```
-
-The help says how to fix it, and that's the next convention.
-
-## inout: changing
-
-```vole playlist.vl
-struct Song { title: str, seconds: i64 }
-
-fn add(list: inout Vec<Song, Gpa>, song: Song) {
-    list.push(song);
-}
-
-fn main(gpa: Gpa) {
-    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
-    add(&list, Song { title: "Blue Moon", seconds: 185 });
-    add(&list, Song { title: "Summertime", seconds: 210 });
-    println("{} songs", list.len());
-}
-```
-
-```out
-2 songs
-```
-
-`list: inout Vec<Song>` says that `add` may change the list, and that
-the change reaches the caller. At the call, the caller writes `&list`.
-The `&` is the point of the whole design: reading `add(&list, ...)`,
-you know that this call may change `list`, and that it can't change
-anything else you passed it. In vole, you can see from a line of code
-which of your variables it may change.
-
-Inside the function, `list` is used as the list itself: `list.push(song)`,
-`list.len()`, `list[0]`. There's nothing to dereference. The same goes
-for a number:
-
-```vole
-fn bump(count: inout i64) {
-    count += 1;
-}
-
-fn main() {
-    var plays = 0;
-    bump(&plays);
-    bump(&plays);
-    println("{plays}");
-}
-```
-
-```out
-2
-```
-
-The variable you pass with `&` must be one you're allowed to change,
-so it's a `var` (or an inout parameter of your own). A `let` can't be
-lent to be changed:
-
-```vole
-fn bump(count: inout i64) {
-    count += 1;
-}
-
-fn main() {
-    let plays = 0;
-    bump(&plays);
-    println("{plays}");
-}
-```
-
-```err
-error[own.readonly]: '&plays' changes 'plays', a let binding: it is read-only
- --> main.vl: line 7, column 10
-  = help: declare it `var` to change it
-  = try: var plays = ...
-```
-
-The compiler checks the `&` both ways. Leave it off for an inout
-parameter:
-
-```vole
-fn bump(count: inout i64) {
-    count += 1;
-}
-
-fn main() {
-    var plays = 0;
-    bump(plays);
-    println("{plays}");
-}
-```
-
-```err
-error[conv.marker]: 'plays' is lent inout here (the callee may change it): mark it '&plays'
- --> main.vl: line 7, column 9
-  = help: an inout parameter takes '&place'; when the callee never changes it, take it let: 'volec refactor signature F --convention x let'
-  = try: volec edit patch main.vl:7 --old '(plays' --new '(&plays'
-  = try: volec fix --suggested main.vl
-```
-
-Or put one where the function only reads:
-
-```vole playlist.vl
-struct Song { title: str, seconds: i64 }
-
-fn total_seconds(list: Vec<Song, Gpa>) -> i64 {
-    var total = 0;
-    for s in list {
-        total += s.seconds;
-    }
-    total
-}
-
-fn main(gpa: Gpa) {
-    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
-    list.push(Song { title: "Blue Moon", seconds: 185 });
-    println("{}", total_seconds(&list));
-}
-```
-
-```err
-error[conv.marker_extra]: '&' marks an argument the callee may change; 'list' is taken let or sink here (read, or moved): pass 'list'
- --> playlist.vl: line 14, column 33
-  = try: volec edit patch playlist.vl:14 --old '&list' --new 'list'
-  = try: volec fix --suggested playlist.vl
-```
-
-Either way, the error names the fix, and `volec fix --suggested` makes
-it.
-
-### One change at a time
-
-An inout parameter is *exclusive*: while a function is changing a
-value, nothing else may look at it or change it. Here's a function that
-moves every song from one list to another, called with the same list
-twice:
-
-```vole playlist.vl
-struct Song { title: str, seconds: i64 }
-
-fn append_all(to: inout Vec<Song, Gpa>, from: inout Vec<Song, Gpa>) {
-    while let Some(s) = from.pop() {
-        to.push(s);
-    }
-}
-
-fn main(gpa: Gpa) {
-    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
-    list.push(Song { title: "Blue Moon", seconds: 185 });
-    append_all(&list, &list);
-}
-```
-
-```err
-error[own.conflict]: 'list' has an inout access, '&list', and another one, '&list', in the same call
+error[borrowck.conflict]: cannot borrow 'list' as immutable because it is also borrowed as mutable (mutably borrowed at playlist.vl: line 12, column 12)
  --> playlist.vl: line 12, column 23
-  = help: pass disjoint places ('&a.x, a.y'), copy the plain value out first, or for two elements of one Vec use 'v.swap(i, j)'
+  = help: use the shared borrow before the mutable one, or take it again after
 ```
 
-With `to` and `from` the same list, every pop would make room for a
-push, and the loop would never end. The rule that two inout arguments
-can't be the same value stops this before it runs. More generally, it
-means that inside a function, an inout parameter is the only way to
-reach that value. Nothing can change it under the function's feet, and
-the function's changes can't surprise anyone else. (It also lets the
-compiler optimize: it never has to wonder whether two parameters are
-the same memory.)
+Think about what `append` would do: push onto a list while looping over
+it. Each push could move the songs to a bigger block of memory while
+the loop is still walking the old one. Inside `append` nothing looks
+wrong; the trouble is the call. So that's where the rule is checked:
+`list` can't be borrowed to read while it is borrowed to change. This
+is the borrow checker at work, and its rule is short:
 
-Passing two *different* parts of one value is fine: `f(&song.seconds,
-song.title)` lends one field to be changed and another to be read.
+- any number of `&` references, **or**
+- exactly one `&mut` reference,
 
-### When the change begins
+and never both at once. Everything else in this chapter follows from
+it. Because of it, a function holding a `&mut` knows nobody else sees
+the value half-changed, and a function holding a `&` knows the value
+won't change while it reads.
 
-An inout access begins when the call starts, after every argument has
-been worked out. So an argument that only reads the same value, and is
-done reading by then, is fine:
+### When a borrow ends
 
-```vole playlist.vl
-struct Song { title: str, seconds: i64 }
+A borrow doesn't last to the end of the block. It lasts until the
+reference is used for the last time:
 
-fn add_copies(list: inout Vec<Song, Gpa>, n: usize) {
-    for i in 0..n {
-        list.push(Song { title: "Encore", seconds: 60 + i as i64 });
-    }
-}
-
+```vole
 fn main(gpa: Gpa) {
-    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
-    list.push(Song { title: "Blue Moon", seconds: 185 });
-    add_copies(&list, list.len());
-    println("{} songs", list.len());
+    let mut scores: Vec<i64, Gpa> = Vec::new_in(gpa);
+    scores.push(185);
+    let first = &scores[0];
+    println("first: {first}");
+    scores.push(210);
+    println("{} scores", scores.len());
 }
 ```
 
 ```out
-2 songs
+first: 185
+2 scores
 ```
 
-`list.len()` runs first, and gives a number, 1. By the time
-`add_copies` starts changing the list, nothing else is looking at it.
-That's also why `v.push(v.len())` works.
+`first` borrows from `scores`, and `push` needs to change `scores`. But
+`first` is never used after its `println`, so by the time of the push
+the borrow is over. Use `first` after the push, and the two overlap:
 
-What can't go alongside an inout argument is one that is still looking
-at the same value *while the call runs*: a view of it, or a second
-inout access, as in `append_all(&list, &list)`. Here `add_all` would
-push onto the list while it reads the songs to add from that same list:
-
-```vole playlist.vl
-struct Song { title: str, seconds: i64 }
-
-fn add_all(list: inout Vec<Song, Gpa>, more: [Song]) {
-    for s in more {
-        list.push(s);
-    }
-}
-
+```vole
 fn main(gpa: Gpa) {
-    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
-    list.push(Song { title: "Blue Moon", seconds: 185 });
-    add_all(&list, list[..]);
-    println("{} songs", list.len());
+    let mut scores: Vec<i64, Gpa> = Vec::new_in(gpa);
+    scores.push(185);
+    let first = &scores[0];
+    scores.push(210);
+    println("first: {first}");
 }
 ```
 
 ```err
-error[own.conflict]: 'list' has an inout access, '&list', and a view, 'list[..]', in the same call
- --> playlist.vl: line 12, column 20
-  = help: pass disjoint places ('&a.x, a.y'), copy the plain value out first, or for two elements of one Vec use 'v.swap(i, j)'
+error[borrowck.conflict]: cannot borrow 'scores' as mutable because it is also borrowed as immutable (borrowed at main.vl: line 4, column 18)
+ --> main.vl: line 5, column 5
+  = help: use the shared borrow before the mutable one, or take it again after
 ```
 
-`list[..]` is a view of all the songs (views come later in this
-chapter), and it would still be in use while `add_all` changes the list
-under it. The rule is the same as before: while a call may change a
-value, nothing else in that call may look at it. Put the songs to add
-in a list of their own first, and pass that.
+The message names both places: where the shared borrow began (line 4)
+and where the list is borrowed to change (line 5). And it's right to
+complain: the push may move the elements, and `first` would be left
+pointing at memory the list no longer owns. In C, this is a bug that
+shows up some of the time. Here it doesn't compile, and the help says
+how to fix it: use `first` before the push, or take it again after.
 
-### Keeping an access in a variable
+## Taking a value
 
-Sometimes you want to change one value through several calls, and give
-the access a shorter name. `inout name = &place;` does that:
-
-```vole
-fn bump(count: inout i64) {
-    count += 1;
-}
-
-fn main() {
-    var plays = [0, 0, 0];
-    inout middle = &plays[1];
-    bump(&middle);
-    bump(&middle);
-    middle += 10;
-    println("{}", plays[1]);
-}
-```
-
-```out
-12
-```
-
-`middle` isn't a copy of `plays[1]`: it is `plays[1]`, under another
-name, for as long as it is used. It's passed on with `&middle`, and
-changed directly with `middle += 10`. While `middle` is in use, `plays`
-is reached only through it, by the same exclusivity rule.
-
-## sink: taking
-
-The third convention hands a value over for good. Let's put finished
-playlists on a shelf:
+The third thing a function can do with an argument is keep it. Then the
+parameter has no `&`: the value moves in, and the function is its new
+owner.
 
 ```vole playlist.vl
-struct Song { title: str, seconds: i64 }
+struct Song { title: &'static str, seconds: i64 }
 
-fn archive(shelf: inout Vec<Vec<Song, Gpa>, Gpa>, list: sink Vec<Song, Gpa>) {
+fn put_away(shelf: &mut Vec<Vec<Song, Gpa>, Gpa>, list: Vec<Song, Gpa>) {
     shelf.push(list);
 }
 
 fn main(gpa: Gpa) {
-    var shelf: Vec<Vec<Song, Gpa>, Gpa> = Vec::new_in(gpa);
-    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
+    let mut shelf: Vec<Vec<Song, Gpa>, Gpa> = Vec::new_in(gpa);
+    let mut list: Vec<Song, Gpa> = Vec::new_in(gpa);
     list.push(Song { title: "Blue Moon", seconds: 185 });
-    archive(&shelf, list);
-    println("{} playlist, {} song", shelf.len(), shelf[0].len());
+    put_away(&mut shelf, list);
+    println("{} list on the shelf, with {} song", shelf.len(), shelf[0].len());
 }
 ```
 
 ```out
-1 playlist, 1 song
+1 list on the shelf, with 1 song
 ```
 
-`list: sink Vec<Song>` says that `archive` takes the list: the caller's
-value moves into the function, which then owns it. The function can
-keep it (here, by pushing it onto the shelf, which moves it again),
-change it, or let it be dropped when the function ends. Back in `main`,
-`list` is dead after the call, exactly as after `let backup = list;`.
-Use it again and you get the same `own.moved` error as before, this
-time naming the call it moved into.
+`put_away` takes the list and pushes it onto a shelf of lists, which it
+only borrows. The call says `list`, with no `&`: the list moves into
+the function and from there into the shelf, without its songs being
+copied. After the call,
+`main` has no `list` any more; use it and you get the "used after it
+moved" error from the start of the chapter.
 
-There's no marker at the call for a sink argument. You can tell from the
-parameter, and the compiler tells you if you use the dead variable.
+So a function's signature tells you what it does with each argument:
 
-A sink parameter belongs to the function, so the function may change
-it, with no `var` needed. Here a function takes a playlist, adds an
-encore to it, and hands it back:
+| the parameter | the call | what happens |
+|---|---|---|
+| `list: &Vec<Song, Gpa>` | `f(&list)` | the function reads it |
+| `list: &mut Vec<Song, Gpa>` | `f(&mut list)` | the function may change it |
+| `list: Vec<Song, Gpa>` | `f(list)` | the function takes it; the caller's is gone |
 
-```vole playlist.vl
-struct Song { title: str, seconds: i64 }
-
-fn with_encore(list: sink Vec<Song, Gpa>, encore: Song) -> Vec<Song, Gpa> {
-    list.push(encore);
-    list
-}
-
-fn main(gpa: Gpa) {
-    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
-    list.push(Song { title: "Blue Moon", seconds: 185 });
-    let concert = with_encore(list, Song { title: "Summertime", seconds: 210 });
-    println("{} songs", concert.len());
-}
-```
-
-```out
-2 songs
-```
-
-For a plain value, `sink` and `let` are almost the same: the function
-gets a copy, and the caller keeps its own. The difference is that a
-sink copy is the function's to change.
-
-Here are the three conventions side by side:
-
-| convention | written | the function | the caller writes | afterwards, the caller's value |
-|---|---|---|---|---|
-| let | `list: Vec<Song>` | reads it | `total_seconds(list)` | unchanged |
-| inout | `list: inout Vec<Song>` | changes it | `add(&list, s)` | changed |
-| sink | `list: sink Vec<Song>` | takes it | `archive(&shelf, list)` | moved away (an owned value) |
-
-Choosing is usually easy. Start with `let`. Make it `inout` if the
-function has to change the caller's value, and `sink` if it has to keep
-the value after it returns (in a struct, a list, another owner).
+For a `Copy` type, like an `i64`, taking is copying, which is why
+numbers are passed without any `&`.
 
 ## Methods and their receivers
 
-A method is a function attached to a type, and its first parameter,
-`self`, is the value it's called on, its *receiver*. A receiver has a
-convention too, written before `self`:
+Methods (chapter 5) make the same three choices for the value they're
+called on, in how they write `self`:
 
 ```vole playlist.vl
-struct Song { title: str, seconds: i64 }
+struct Song { title: &'static str, seconds: i64 }
 
-struct Playlist<A: Allocator> { name: str, songs: Vec<Song, A> }
-
-impl Playlist<Gpa> {
-    fn new(name: str, gpa: Gpa) -> Playlist<Gpa> {
-        Playlist { name: name, songs: Vec::new_in(gpa) }
+impl Song {
+    fn minutes(&self) -> i64 {
+        self.seconds / 60
     }
 
-    fn len(self) -> usize {
-        self.songs.len()
+    fn extend(&mut self, seconds: i64) {
+        self.seconds += seconds;
     }
 
-    fn add(inout self, song: Song) {
-        self.songs.push(song);
-    }
-
-    fn finish(sink self) -> Vec<Song, Gpa> {
-        println("closing {}", self.name);
-        self.songs
+    fn into_title(self) -> &'static str {
+        self.title
     }
 }
 
-fn main(gpa: Gpa) {
-    var mix = Playlist::new("Sunday", gpa);
-    mix.add(Song { title: "Blue Moon", seconds: 185 });
-    mix.add(Song { title: "Summertime", seconds: 210 });
-    println("{} has {} songs", mix.name, mix.len());
-    let songs = mix.finish();
-    println("{} songs kept", songs.len());
+fn main() {
+    let mut song = Song { title: "Blue Moon", seconds: 185 };
+    song.extend(60);
+    println("{} minutes", song.minutes());
+    let title = song.into_title();
+    println("{title}");
 }
 ```
 
 ```out
-Sunday has 2 songs
-closing Sunday
-2 songs kept
+4 minutes
+Blue Moon
 ```
 
-- `fn len(self)` reads the playlist: `self` is a let receiver.
-- `fn add(inout self, ...)` changes it.
-- `fn finish(sink self)` takes it: after `mix.finish()`, `mix` is dead,
-  and its songs have moved out to the caller.
-
-A method call lends its receiver without an `&`: `mix.add(...)`, not
-`(&mix).add(...)`. The method's signature says it changes `mix`, and
-the name of the method usually does too. Since `add` changes `mix`,
-`mix` has to be a `var`.
-
-You've been calling methods like these all along. `Vec`'s `push` is
-`fn push(inout self, x: sink T)`: it changes the list and takes the
-element.
+`&self` borrows the song to read it, `&mut self` borrows it to change
+it, and a plain `self` takes it: `into_title` uses the song up and
+hands back its title, and `song` can't be used after it. At the call
+you write no `&`: `song.extend(60)` borrows `song` the way `extend`
+asks for.
+The variable still has to be a `let mut` for a `&mut self` method.
 
 ## Returning values
 
-Look at `Playlist::new` and `finish` again. Each makes or takes an
-owned value and returns it. Returning an owned value moves it to the
-caller: nothing is copied, and nothing is dropped at the function's
-end, because the value has a new owner.
+Returning a value moves it to the caller, like any other move. That's
+how a function makes something and hands it over:
 
-```vole playlist.vl
-struct Song { title: str, seconds: i64 }
-
-fn sampler(gpa: Gpa) -> Vec<Song, Gpa> {
-    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
-    list.push(Song { title: "Blue Moon", seconds: 185 });
-    list.push(Song { title: "Summertime", seconds: 210 });
-    list
+```vole
+fn countdown(from: i64, gpa: Gpa) -> Vec<i64, Gpa> {
+    let mut v = Vec::new_in(gpa);
+    let mut n = from;
+    while n > 0 {
+        v.push(n);
+        n -= 1;
+    }
+    v
 }
 
 fn main(gpa: Gpa) {
-    let list = sampler(gpa);
-    println("{} songs", list.len());
+    let v = countdown(3, gpa);
+    println("{v:?}");
 }
 ```
 
 ```out
-2 songs
+[3, 2, 1]
 ```
 
-This is the normal way to make a value in a function and hand it out.
-In some languages, returning a big value is something to avoid; in
-vole, it costs the same as returning its small handle.
+The `Vec` made inside `countdown` isn't dropped when the function ends:
+it moved out, into `main`'s `v`, and `main` drops it. However big it
+is, moving it costs the same: a `Vec` is a pointer, a length and a
+capacity, and those are what move. Its elements stay where they are.
 
-So prefer returning a result to filling in an `inout` parameter the
-caller made empty for you. To return several things, return a tuple or
-a struct.
+## Slices
 
-## Views
+A reference doesn't have to be to a whole value. A *slice* is a
+reference to a run of elements inside an array or a `Vec`: `&v[1..3]`
+is elements 1 and 2 of `v`, of type `&[i64]`. It's a pointer and a
+length, and making one copies nothing.
 
-Not everything is a value with its own memory. Take `opening`, which
-gives you the first two songs of a playlist, without copying them:
-
-```vole playlist.vl
-struct Song { title: str, seconds: i64 }
-
-fn opening(list: Vec<Song, Gpa>) -> [Song] {
-    list[0..2]
+```vole
+fn sum(xs: &[i64]) -> i64 {
+    let mut t = 0;
+    for x in xs {
+        t += x;
+    }
+    t
 }
 
 fn main(gpa: Gpa) {
-    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
-    list.push(Song { title: "Blue Moon", seconds: 185 });
-    list.push(Song { title: "Summertime", seconds: 210 });
-    list.push(Song { title: "Cheek to Cheek", seconds: 300 });
-    let start = opening(list);
-    println("{} songs, starting with {}", start.len(), start[0].title);
+    let mut lengths: Vec<i64, Gpa> = Vec::new_in(gpa);
+    lengths.push(185);
+    lengths.push(210);
+    lengths.push(143);
+    println("{} {} {}", sum(&lengths), sum(&lengths[1..3]), sum(&lengths[..1]));
 }
 ```
 
 ```out
-2 songs, starting with Blue Moon
+538 353 185
 ```
 
-`[Song]` is a *slice*: a view of some songs that something else owns.
-A *view* points into memory owned by another value. `list[0..2]` makes
-a view of elements 0 and 1 of `list`; nothing is copied. A `str` is a
-view too: a string literal like `"Blue Moon"` views text stored in the
-program itself, and `String` (chapter 7) is the owned kind of text that
-views can point into.
+A function that reads a list should take a slice, `&[i64]`, and not a
+`&Vec<i64, Gpa>`: then it works on a whole `Vec` (`&lengths` becomes a
+slice of all of it), on a part of one, and on an array. `&mut [i64]`
+is a slice whose elements can be changed.
 
-How does the compiler know that `start` views `list`, and not something
-else? It works it out from the body of `opening`. For every function,
-the compiler computes a short *view summary*: which parameters the
-result can point into. It does this the same way it works out the
-effects you saw at the end of chapter 2, from the function's code and
-the summaries of the functions it calls. You can ask for it:
+Text works the same way. A `String` owns its text, and a `&str` is a
+slice of text someone else owns: a part of a `String`, or a string
+literal, whose text is in the program itself.
 
-```console
-$ volec query views opening playlist.vl
-crate::opening	views(list) inferred
-```
-
-`views(list)`: the result points into the argument `list`. So at the
-call `opening(list)` in `main`, the compiler knows that `start` views
-`main`'s `list`, and it checks `main` with that.
-
-Views are what make vole fast without copying, and they're also where
-other languages get into trouble. What if `list` changes while `start`
-still views it? A `push` may need more room and move the elements to
-new memory, and then `start` would point at memory that has been given
-back. In C, that's a use after free, one of the worst bugs there is.
-In vole, it's a compile error:
-
-```vole playlist.vl
-struct Song { title: str, seconds: i64 }
-
-fn add(list: inout Vec<Song, Gpa>, song: Song) {
-    list.push(song);
-}
-
-fn opening(list: Vec<Song, Gpa>) -> [Song] {
-    list[0..2]
+```vole
+fn first_word(text: &str) -> &str {
+    match text.split_once(' ') {
+        Some((word, _)) => word,
+        None => text,
+    }
 }
 
 fn main(gpa: Gpa) {
-    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
-    add(&list, Song { title: "Blue Moon", seconds: 185 });
-    add(&list, Song { title: "Summertime", seconds: 210 });
-    let start = opening(list);
-    add(&list, Song { title: "Cheek to Cheek", seconds: 300 });
-    println(start[0].title);
+    let title = String::from_in("Blue Moon", gpa);
+    let word = first_word(&title);
+    println("{word}");
+}
+```
+
+```out
+Blue
+```
+
+`first_word` returns a piece of the text it was given. No text was
+copied: `word` points into `title`'s memory. A slice is a borrow like
+any other, so the rules you've seen apply to it. `title` can't be
+changed or dropped while `word` is still to be used.
+
+## Lifetimes
+
+How does the compiler know that `word` borrows from `title`? It doesn't
+look inside `first_word` at the call. It reads the signature: one
+reference goes in, a reference comes out, so the result borrows from
+the argument. Most functions that return a reference are like this, and
+you write nothing special.
+
+When there are two references to borrow from, the signature has to
+say which:
+
+```vole
+fn longer(a: &str, b: &str) -> &str {
+    if a.len() >= b.len() { a } else { b }
+}
+
+fn main() {
+    println("{}", longer("Blue Moon", "Summertime"));
 }
 ```
 
 ```err
-error[own.conflict]: 'add(&list, Song { title: "Cheek to Cheek", seconds: 300 })' may change 'list' while 'start' (playlist.vl: line 15, column 9) views it; 'start' is used at playlist.vl: line 17, column 13
- --> playlist.vl: line 16, column 5
-  = help: use the view before the change, keep an index instead of a view, or keep a copy
-  = try: volec query own playlist.vl:17:13
+error[borrowck.elision]: the result of 'longer' borrows, but from which parameter is not said: it has no single reference parameter and no `&self`
+ --> main.vl: line 1, column 32
+  = help: name the lifetime the result borrows from: `fn f<'a>(x: &'a T, y: &U) -> &'a T` (rustc E0106)
 ```
 
-It's the same exclusivity rule as before, applied to views: while
-`start` views `list` and is still going to be used, `list` can't be
-changed. The help lists the usual fixes. Here, the simplest is to use
-the view before the change: move the `println` up a line. A view that
-is never used again is no conflict, so the change is then fine.
+The fix is the one in the help: give the borrow a name. A name for how
+long a borrow lasts is a *lifetime*, written with a `'` in front:
 
-A view also can't outlive what it views. Here's a function that makes
-an uppercase copy of a title, and tries to return a view of it:
-
-```vole shout.vl
-fn shout(title: str, gpa: Gpa) -> str {
-    let loud = title.to_uppercase_in(gpa);
-    loud.as_str()
+```vole
+fn longer<'a>(a: &'a str, b: &'a str) -> &'a str {
+    if a.len() >= b.len() { a } else { b }
 }
 
 fn main(gpa: Gpa) {
-    println(shout("Blue Moon", gpa));
-}
-```
-
-```err
-error[own.escape]: 'shout' returns a view of 'loud', which is dropped when 'shout' returns
- --> shout.vl: line 3, column 5
-  = help: return the owner itself; a caller that wants a view takes '.as_slice()' of it
-```
-
-`loud` is a `String` that `shout` owns, so it's dropped when `shout`
-returns, and the view would point at nothing. The fix is to return the
-owner instead, moving it out to the caller, as the help says:
-
-```vole shout.vl
-fn shout(title: str, gpa: Gpa) -> String<Gpa> {
-    title.to_uppercase_in(gpa)
-}
-
-fn main(gpa: Gpa) {
-    println(shout("Blue Moon", gpa));
+    let title = String::from_in("Blue Moon", gpa);
+    let best = longer(&title, "Summertime");
+    println("{best}");
 }
 ```
 
 ```out
-BLUE MOON
+Summertime
 ```
 
-### Why there are no lifetimes to write
+`<'a>` declares the lifetime, and the three `&'a str` say: the result
+borrows from both `a` and `b`, and is good for as long as both are. A
+lifetime changes nothing about how the program runs. It's a label that
+tells the compiler, and the reader, where a reference comes from.
 
-In Rust, a function like `opening` takes a reference and returns one,
-and its signature has to say how long the returned reference may live
-compared with the one passed in. In the simple cases the compiler fills
-that in, and in the others you write it as *lifetimes*: `fn opening<'a>(list:
-&'a Vec<Song>) -> &'a [Song]`. In vole you wrote nothing, yet the
-compiler caught the conflict in `main`. It didn't need to be told,
-for three reasons, all of which you've now seen:
+A struct that holds a reference needs a lifetime too, so that the
+compiler knows a value of that type can't outlive what it borrows:
 
-- There are no references to store. A parameter is lent for the call
-  and comes back when it ends; nothing in the program holds a pointer
-  to someone else's variable that could outlive the call.
-- The only things that point into other values are views, and views
-  are made only from what the compiler can see: a parameter, a local
-  variable, constant data in the program. A view can be kept in a
-  variable, a struct field, even a list of views, but the compiler
-  follows it wherever it goes, and nothing can keep one in a global
-  variable or anywhere else it can't follow.
-- What a function's result views is computed from its body, as its
-  view summary, so a caller is checked against what the function really
-  does.
+```vole
+struct Pick<'a> {
+    title: &'a str,
+    rank: i64,
+}
 
-So the question a lifetime answers in Rust, "how long may this point
-into that?", is one the compiler can answer for itself in vole: for as
-long as the owner is neither changed nor gone. There's nothing for you
-to write, and when there's a problem, the error points at the lines
-that conflict and says how to fix them.
+fn main(gpa: Gpa) {
+    let title = String::from_in("Summertime", gpa);
+    let pick = Pick { title: &title, rank: 1 };
+    println("{}: {}", pick.rank, pick.title);
+}
+```
+
+```out
+1: Summertime
+```
+
+One lifetime has a name of its own: `'static`, for what lives as long
+as the program. A string literal is a `&'static str`, because its text
+is part of the program. That's why `Song`'s `title` could be a plain
+`&'static str` earlier, with no `<'a>` on `Song`: our titles were all
+literals.
+
+What the lifetimes are for is the second half of the borrow checker's
+job: no reference may outlive what it borrows from. Here a function
+tries to return a reference to its own local variable:
+
+```vole
+fn title_or_default(titles: &Vec<String<Gpa>, Gpa>, gpa: Gpa) -> &str {
+    let fallback = String::from_in("(untitled)", gpa);
+    if titles.is_empty() {
+        return &fallback;
+    }
+    &titles[0]
+}
+
+fn main(gpa: Gpa) {
+    let titles: Vec<String<Gpa>, Gpa> = Vec::new_in(gpa);
+    println("{}", title_or_default(&titles, gpa));
+}
+```
+
+```err
+error[borrowck.return_local]: a reference to 'fallback', a local of this function, escapes it (borrowed at main.vl: line 4, column 16)
+ --> main.vl: line 4, column 9
+  = help: return an owned value, or borrow from a parameter
+```
+
+`fallback` is dropped when the function returns, so a reference to it
+would point at freed memory. The help gives the two ways out: return a
+value the caller can own (a `String`), or return something borrowed
+from a parameter. Returning `"(untitled)"`, a literal, would work too:
+it's `'static`, so it outlives everything.
+
+> **If you know C or C++:** a reference is a pointer that the compiler
+> has checked. It is never null, never dangling, and never a way to
+> change something another part of the program is reading.
 
 ## When to clone
 
-`.clone()` makes an independent copy of an owned value, with memory of
-its own. Reach for it when you really want two values that will go
-their separate ways: a backup before an edit, a starting point you want
-to keep.
+Sometimes you really do want two independent values: a copy of a list
+to change while the original stays as it was. That's `clone()`:
 
-It's rarely the right fix for an `own.moved` error, though, even if the
-`try:` line offers it. Usually the value moved because a function took
-it with `sink`, or because you wrote `let w = v;`, when all you needed
-was to read it. Then the better fix is to read it in place: pass `v` to
-a `let` parameter, which lends it and gives it back, or just keep using
-`v` instead of making `w`. A `clone` that's there only to get past the
-compiler is a copy your program does on every run.
+```vole
+fn main(gpa: Gpa) {
+    let mut original: Vec<i64, Gpa> = Vec::new_in(gpa);
+    original.push(185);
+    original.push(210);
+    let mut edited = original.clone();
+    edited.push(143);
+    println("{original:?} {edited:?}");
+}
+```
 
-> **If you know Rust:** `x: T` is like `x: &T`, `x: inout T` like `x:
-> &mut T`, and `x: sink T` like taking `T` by value; the receivers are
-> `self`, `inout self` and `sink self`. `&x` at a call marks only an
-> inout argument, an access is used without `*`, and there are no
-> lifetimes. Rust's spellings (`&mut T`, `&mut x`, `let mut`, `*r`) are
-> `conv.rust` errors whose `try:` lines write vole's, and `volec fix
-> --only conventions` rewrites a whole file of them.
+```out
+[185, 210] [185, 210, 143]
+```
 
-> **If you know Swift:** `inout` with `&` at the call is Swift's idea,
-> and the words `let`, `inout` and `sink` come from Hylo, a language
-> built on mutable value semantics.
+`clone()` makes a full copy: new memory, every element copied. It's
+explicit because it can be expensive, and seeing it in the code tells
+you where the copies are. The compiler's help for a "used after it
+moved" error often offers a `clone()`. Before taking it, ask whether a
+borrow would do: if the function only reads, give it a `&`, and nothing
+is copied at all.
 
 ## Summary
 
-This chapter was about how vole shares data without sharing it:
+This chapter was about how vole shares data safely:
 
-- every value has one owner; plain values (numbers, structs of them)
-  are copied by `=`, and owned ones (`Vec`, `String`, a struct with
-  one) are moved, leaving the old name dead (`own.moved`);
-- an owned value is dropped at the end of its owner's scope, exactly
-  once; `drop(x)` drops it early, and `impl Drop` runs code then;
-- a parameter's convention says what a function does with it: `let`
-  (the default) reads, `inout` changes and is marked `&x` at the call,
-  `sink` takes;
-- methods take `self`, `inout self` or `sink self`, and a call lends
-  the receiver without `&`;
-- returning an owned value moves it to the caller;
-- a view (`[T]`, `str`) points into what something else owns; the
-  compiler keeps it inside its owner (`own.conflict`, `own.escape`) and
-  works out each function's view summary, so there are no lifetimes to
-  write;
+- every value has one owner; numbers and other `Copy` types are copied
+  by `=`, and everything else (`Vec`, `String`, a struct) is moved,
+  leaving the old name unusable;
+- a value is dropped at the end of its owner's scope, exactly once;
+  `drop(x)` drops it early, and `impl Drop` runs code then;
+- a function borrows what it reads (`&T`, `f(&x)`), borrows what it
+  changes (`&mut T`, `f(&mut x)`), and takes what it keeps (`T`,
+  `f(x)`);
+- methods take `&self`, `&mut self` or `self`, and a call borrows the
+  receiver without `&`;
+- the borrow checker allows any number of `&` references or one `&mut`,
+  never both, and a borrow lasts until the reference's last use;
+- returning a value moves it to the caller;
+- a slice (`&[T]`, `&str`) borrows part of what something else owns;
+- a lifetime (`'a`) names a borrow where a signature or a struct has to
+  say where a reference comes from; `'static` is the whole program;
 - `.clone()` is for when you really want two values.
 
 With these rules in hand, the next chapter builds types of your own:
@@ -940,11 +727,10 @@ structs, enums, and the pattern matching that takes them apart.
 
 ## Try it yourself
 
-- Write `fn longest(list: Vec<Song>) -> Song`, which returns the longest
-  song. Which convention does `list` need? Why can you return a `Song`
-  from it without a `clone`?
-- Write `fn remove_short(list: inout Vec<Song>, limit: i64)`, which
-  removes the songs shorter than `limit` seconds. (`list.remove(i)`
-  removes element `i`; watch your index as the list gets shorter.)
-- Add `fn total(self) -> i64` to `Playlist`, and try calling `mix.total()`
-  after `mix.finish()`. Read the error, and fix it by moving the call.
+- Write `fn longest(list: &[Song]) -> &Song`, which returns the longest
+  song. Why does it need no lifetime written out?
+- Write `fn remove_short(list: &mut Vec<Song, Gpa>, limit: i64)`, which
+  removes the songs shorter than `limit` seconds. (`list.retain(|s|
+  s.seconds >= limit)` keeps the others; chapter 7 has more on `Vec`.)
+- Call `song.minutes()` after `song.into_title()`. Read the error, and
+  fix it by moving the call.

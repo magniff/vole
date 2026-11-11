@@ -103,12 +103,22 @@ esac
 EOF
 chmod +x "$WORK/bin/volec"
 
+# (0.28.0) The chapters whose code is the rust edition's, by number: each
+# of their blocks and sessions is compiled and run with VOLE_EDITION=rust
+# (a file without an edition line is read as the rust edition's). A
+# chapter moves here when it is rewritten; the others are MVS's until
+# then. In a rust chapter, a block or a session that waits for the
+# compiler is left as it was and marked `mvs` (```vole mvs, ```console
+# mvs): it is checked as MVS's until it is rewritten.
+RUST_CHAPTERS=" 01 02 03 04 05 06 07 09 10 11 13 15 16 "
+rust_chapter() { case "$RUST_CHAPTERS" in *" ${1%%-*} "*) echo 1 ;; *) echo 0 ;; esac; }
+
 # Splits chapter $1 (named $2) into units under $WORK/units: a directory
 # per program, holding name, src/ (its files), root, and as given stdin,
 # out, exit, err, warn, console-NNN. Problems with the annotations go to
 # $WORK/lint.
 split_chapter() {
-    awk -v chap="$2" -v dir="$WORK/units" -v lint="$WORK/lint" -v host="$(uname -s)" '
+    awk -v chap="$2" -v dir="$WORK/units" -v lint="$WORK/lint" -v host="$(uname -s)" -v rust="$(rust_chapter "$2")" '
         function item_line(l) {
             return l ~ /^(pub |fn |struct |enum |union |impl|trait |const |static |type |use |mod |import |extern |unsafe fn |#\[|}|\/\/|$)/
         }
@@ -117,6 +127,7 @@ split_chapter() {
             system("mkdir -p \"" d "/src\"")
             printf "%s:%d\n", chap, line > (d "/name")
             close(d "/name")
+            if (rust) { print "rust" > (d "/edition"); close(d "/edition") }
             return d
         }
         function problem(msg) {
@@ -156,11 +167,12 @@ split_chapter() {
             n = split(info, w, /[ \t]+/)
             lang = (n > 0) ? w[1] : ""
             if (lang == "vole") {
-                fname = ""; skip = 0; warn = 0; oskip = 0
+                fname = ""; skip = 0; warn = 0; oskip = 0; mvs = 0
                 for (i = 2; i <= n; i++) {
                     if (w[i] ~ /^[A-Za-z_][A-Za-z0-9_]*\.vl$/) fname = w[i]
                     else if (w[i] == "skip") skip = 1
                     else if (w[i] == "warn") warn = 1
+                    else if (w[i] == "mvs") mvs = 1
                     else if (w[i] == "macos") { if (host != "Darwin") { skip = 1; oskip = 1 } }
                     else problem("unknown annotation `" w[i] "` on a vole block (NAME.vl, warn, skip, macos)")
                 }
@@ -206,6 +218,7 @@ split_chapter() {
                     row = 1
                 }
                 if (warn) { printf "" > (d "/warn"); close(d "/warn") }
+                if (mvs) system("rm -f \"" d "/edition\"")
                 pending = d
                 last = d
                 nunits++
@@ -241,6 +254,7 @@ split_chapter() {
                 write_body(f, 1, nbody)
                 close(f)
                 printf "%s:%d\n", chap, start > (f ".name"); close(f ".name")
+                if (info ~ /(^|[ \t])mvs([ \t]|$)/) { printf "" > (f ".mvs"); close(f ".mvs") }
                 next
             }
             if (lang ~ /^tach/) problem("the fence is `vole`, not `" lang "`")
@@ -319,6 +333,14 @@ check_unit() {
     d=$1
     name=$(cat "$d/name")
     : >"$d/result"
+    # (0.28.0) a rust chapter's unit: its builds, its tools and the
+    # sessions' commands read the rust edition
+    if [ -f "$d/edition" ]; then
+        VOLE_EDITION=rust
+        export VOLE_EDITION
+    else
+        unset VOLE_EDITION
+    fi
     if [ -f "$d/root" ]; then
         rootf=$(cat "$d/root")
         mkdir -p "$d/build"
@@ -348,6 +370,12 @@ check_unit() {
                 rc=$?
                 trimmed "$d/build/run.out" >"$d/got"
                 trimmed "$d/out" >"$d/want"
+                # (0.28) a panic's line may name a position in std (`unwrap`'s
+                # requires): compared normalized, as a session's is
+                if grep -q '<std>:' "$d/want" && ! grep -q '^<!-- exact-std -->' "$ROOT/book/${name%%:*}.md" 2>/dev/null; then
+                    awk -f "$ROOT/tests/stdpos.awk" "$d/got" >"$d/got.n" && mv "$d/got.n" "$d/got"
+                    awk -f "$ROOT/tests/stdpos.awk" "$d/want" >"$d/want.n" && mv "$d/want.n" "$d/want"
+                fi
                 want_rc=$(cat "$d/exit")
                 if ! cmp -s "$d/got" "$d/want"; then
                     { echo "FAIL $name: output differs"; echo "    --- the book says"; sed 's/^/    /' "$d/want"; echo
@@ -370,6 +398,12 @@ check_unit() {
             for s in "$d"/src/*; do [ -f "$s" ] && cp "$s" "$d/sess/"; done
         fi
         console_script "$c" "$c.sh"
+        if [ -f "$d/edition" ] && [ ! -f "$c.mvs" ]; then
+            VOLE_EDITION=rust
+            export VOLE_EDITION
+        else
+            unset VOLE_EDITION
+        fi
         # (0.25.5) `volec test`'s own time limit (10 s a test; a property's
         # shrinking takes most of it) gets the load scaling the watchdog's
         # has: on a loaded machine (tests/load.sh), (1 + VOLE_WATCHDOG_EXTEND)
