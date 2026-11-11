@@ -22,7 +22,7 @@ like any other input.
 
 Here are two functions side by side. Save them as `lengths.vl`:
 
-```vole lengths.vl
+```vole lengths.vl mvs
 // Reads the words it's given: allocates nothing.
 fn longest(words: [str]) -> usize {
     var best: usize = 0;
@@ -57,7 +57,7 @@ fn main(gpa: Gpa) {
 for it to allocate from. `lengths` takes one, and you can see that from
 its first line, without reading its body. The compiler sees it too:
 
-```console
+```console mvs
 $ volec query effects crate lengths.vl
 crate::longest	none
 crate::lengths	alloc(Gpa) panic
@@ -100,8 +100,10 @@ handler splits the path into its parts and answers. Start
 `requests.vl`:
 
 ```vole requests.vl
-fn split_path(path: str, gpa: Gpa) -> Vec<str, Gpa> {
-    var parts: Vec<str, Gpa> = Vec::new_in(gpa);
+use std::io;
+
+fn split_path(path: &str, gpa: Gpa) -> Vec<&str, Gpa> {
+    let mut parts: Vec<&str, Gpa> = Vec::new_in(gpa);
     for p in path.split('/') {
         if !p.is_empty() {
             parts.push(p);
@@ -110,8 +112,8 @@ fn split_path(path: str, gpa: Gpa) -> Vec<str, Gpa> {
     parts
 }
 
-fn handle(line: str, gpa: Gpa) -> String<Gpa> {
-    var out = String::new_in(gpa);
+fn handle(line: &str, gpa: Gpa) -> String<Gpa> {
+    let mut out = String::new_in(gpa);
     let (method, path) = match line.split_once(' ') {
         Some(pair) => pair,
         None => {
@@ -121,16 +123,15 @@ fn handle(line: str, gpa: Gpa) -> String<Gpa> {
     };
     let parts = split_path(path, gpa);
     if method == "GET" && parts.len() == 2 && parts[0] == "users" {
-        out.push_fmt("200 user {}", parts[1]);
+        write(&mut out, "200 user {}", parts[1]).unwrap();
     } else {
-        out.push_fmt("404 no page {path}");
+        write(&mut out, "404 no page {path}").unwrap();
     }
     out
 }
 
 fn main(gpa: Gpa) {
-    let input = read_stdin_in(gpa).unwrap();
-    let text = str::from_utf8(input.as_slice()).unwrap();
+    let text = io::read_to_string_in(io::stdin(), gpa).unwrap();
     for line in text.lines() {
         let reply = handle(line, gpa);
         println("{line:<24} -> {reply}");
@@ -152,13 +153,14 @@ POST /users/alan         -> 404 no page /users/alan
 hello                    -> 400 bad request
 ```
 
-`main` passes `gpa` to `handle`, which passes it to `split_path` and to
-`String::new_in`. Each function that allocates, or calls something
-that does, has a `gpa: Gpa` parameter. `Gpa` takes no memory itself (it
+`main` passes `gpa` to `io::read_to_string_in`, which reads the whole
+input into a `String`, and to `handle`, which passes it to `split_path`
+and to `String::new_in`. Each function that allocates, or calls
+something that does, has a `gpa: Gpa` parameter. `Gpa` takes no memory itself (it
 is *zero-sized*), so passing it around costs nothing at run time.
 
-Notice what doesn't take the allocator: `parts.push(p)` and
-`out.push_str(...)`. A container remembers the allocator it was made
+Notice what doesn't take the allocator: `parts.push(p)`,
+`out.push_str(...)` and the `write`s into `out`. A container remembers the allocator it was made
 with, and uses it whenever it grows. Only the functions that make a
 new container, the constructors and the `_in` functions, need to be
 told. The allocator is always their last argument.
@@ -169,8 +171,8 @@ If a function uses `gpa` without having one, the compiler can't find
 it:
 
 ```vole
-fn split_path(path: str) -> Vec<str, Gpa> {
-    var parts: Vec<str, Gpa> = Vec::new_in(gpa);
+fn split_path(path: &str) -> Vec<&str, Gpa> {
+    let mut parts: Vec<&str, Gpa> = Vec::new_in(gpa);
     for p in path.split('/') {
         parts.push(p);
     }
@@ -185,16 +187,13 @@ fn main(gpa: Gpa) {
 
 ```err
 error[type error]: undefined variable 'gpa'
- --> main.vl: line 2, column 44
+ --> main.vl: line 2, column 49
   = help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'split_path' and pass it down
 ```
 
 `gpa` is just a parameter name, and `split_path` has no parameter by
 that name. The fix is to add one, `gpa: Gpa`, at the end of
-`split_path`'s parameters, and pass `gpa` at the call. When a whole
-chain of functions needs it, `volec fix --only alloc main.vl` adds
-the parameter to every function from `main` down to the allocation,
-and passes it at every call.
+`split_path`'s parameters, and pass `gpa` at the call.
 
 If you forget it the other way, writing `Vec::new()` the way other
 languages do, you get the error from chapter 2, `alloc.no_in`, which
@@ -239,48 +238,54 @@ forward through a big block, and frees nothing until the end, when it
 frees everything at once. Asking an arena for memory costs a few
 instructions, and giving it all back costs one.
 
-`arena_scope(gpa, |a| ...)` makes an arena (its block comes from
-`gpa`), runs the closure with it as `a`, and frees the arena when the
-closure returns. Let's try it on a small program first:
+`arena_scope(&gpa, |a| ...)`, from `std::alloc`, makes an arena (its
+block comes from `gpa`), runs the closure with it as `a`, and frees the
+arena when the closure returns. Let's try it on a small program first:
 
 ```vole
-fn shout(s: str, gpa: Gpa) -> String<Gpa> {
+use std::alloc::arena_scope;
+
+fn shout(s: &str, gpa: Gpa) -> String<Gpa> {
     s.to_uppercase_in(gpa)
 }
 
 fn main(gpa: Gpa) {
-    arena_scope(gpa, |a| {
-        println(shout("hello", a));
+    arena_scope(&gpa, |a| {
+        println("{}", shout("hello", a));
     });
 }
 ```
 
 ```err
-error[type error]: expected 'Gpa', got 'ScopedArena'
- --> main.vl: line 7, column 32
+error[type error]: expected 'Gpa', got '&ArenaScope<&Gpa>'
+ --> main.vl: line 9, column 38
 ```
 
-The arena isn't a `Gpa`: it has its own type, `ScopedArena`. `shout`
-asked for a `Gpa` specifically, so it can't be given anything else. We
-could change it to take a `ScopedArena`, but then it couldn't take a
-`Gpa`. What we want is a `shout` that takes any allocator.
+The arena isn't a `Gpa`: `a` is a reference to an `ArenaScope`, a type
+of its own. `shout` asked for a `Gpa` specifically, so it can't be
+given anything else. We could change it to take the arena's type, but
+then it couldn't take a `Gpa`. What we want is a `shout` that takes any
+allocator.
 
 ## Generic over the allocator
 
-Every allocator type implements a *trait* called `Allocator`. A trait
+Every allocator type implements a *trait* called `Allocator`, which
+lives in `std::alloc`. A trait
 names what a type can do, and a function can take "any type with this
 trait" with a *type parameter*. Chapter 9 explains both properly; here
 is all we need:
 
 ```vole
-fn shout<A: Allocator>(s: str, a: A) -> String<A> {
+use std::alloc::{Allocator, arena_scope};
+
+fn shout<A: Allocator>(s: &str, a: A) -> String<A> {
     s.to_uppercase_in(a)
 }
 
 fn main(gpa: Gpa) {
-    println(shout("from the gpa", gpa));
-    arena_scope(gpa, |a| {
-        println(shout("from an arena", a));
+    println("{}", shout("from the gpa", gpa));
+    arena_scope(&gpa, |a| {
+        println("{}", shout("from an arena", a));
     });
 }
 ```
@@ -295,46 +300,50 @@ allocator, and `a: A` is the allocator it's given. The result is a
 `String<A>`, a `String` whose memory comes from an `A`.
 
 That type explains something you've been writing all along. A
-container's allocator is part of its type: `Vec<i64, ScopedArena>` is
-a Vec on an arena, `Vec<i64, Gpa>` one on `Gpa`. The allocator is
-always written: a bare `Vec<i64>` is `alloc.default`, and a struct that
-holds a Vec names the allocator in its own parameters, `struct
-Log<A: Allocator> { lines: Vec<String<A>, A> }`, used as `Log<Gpa>`
-(`alloc.field`). `volec fix --only alloc` writes both.
+container's allocator is part of its type: `Vec<i64, Gpa>` is a Vec on
+`Gpa`, and a Vec made inside an `arena_scope` has the arena's type in
+that place (`Vec<i64, &ArenaScope<&Gpa>>`: a mouthful, so the examples
+below let the compiler work it out). The allocator is always written:
+a bare `Vec<i64>` is the error `alloc.default`, and a struct that holds
+a Vec names the allocator in its own parameters, `struct Log<A:
+Allocator> { lines: Vec<String<A>, A> }`, used as `Log<Gpa>` (the
+error is `alloc.field`).
 
 The compiler makes a separate copy of `shout` for each allocator type
 it's used with, so the generic version costs nothing extra at run time.
 
 ### Functions that only read don't care
 
-A function that only reads a container takes a slice or a `str`, as in
+A function that only reads a container takes a slice or a `&str`, as in
 chapter 7. A slice doesn't say where its elements live, so the function
 works on a Vec from any allocator without being generic:
 
 ```vole
-fn total(xs: [i64]) -> i64 {
-    var t = 0;
+use std::alloc::{Allocator, arena_scope};
+
+fn total(xs: &[i64]) -> i64 {
+    let mut t = 0;
     for x in xs {
         t += x;
     }
     t
 }
 
-fn fill<A: Allocator>(v: inout Vec<i64, A>, n: i64) {
+fn fill<A: Allocator>(v: &mut Vec<i64, A>, n: i64) {
     for i in 1..n + 1 {
         v.push(i);
     }
 }
 
 fn main(gpa: Gpa) {
-    var on_heap: Vec<i64, Gpa> = Vec::new_in(gpa);
-    fill(&on_heap, 3);
-    let from_arena = arena_scope(gpa, |a| {
-        var scratch: Vec<i64, ScopedArena> = Vec::new_in(a);
-        fill(&scratch, 4);
-        total(scratch)
+    let mut on_heap: Vec<i64, Gpa> = Vec::new_in(gpa);
+    fill(&mut on_heap, 3);
+    let from_arena = arena_scope(&gpa, |a| {
+        let mut scratch = Vec::new_in(a);
+        fill(&mut scratch, 4);
+        total(&scratch)
     });
-    println("{} {from_arena}", total(on_heap));
+    println("{} {from_arena}", total(&on_heap));
 }
 ```
 
@@ -343,7 +352,7 @@ fn main(gpa: Gpa) {
 ```
 
 `fill` changes a Vec, so it names the allocator in the Vec's type and
-is generic over it. `total` only reads, so it takes `[i64]`.
+is generic over it. `total` only reads, so it takes `&[i64]`.
 
 ## The request handler on an arena
 
@@ -352,8 +361,11 @@ Now we can give each request an arena of its own. `split_path` and
 inside an `arena_scope`:
 
 ```vole requests.vl
-fn split_path<A: Allocator>(path: str, a: A) -> Vec<str, A> {
-    var parts: Vec<str, A> = Vec::new_in(a);
+use std::alloc::{Allocator, arena_scope};
+use std::io;
+
+fn split_path<A: Allocator>(path: &str, a: A) -> Vec<&str, A> {
+    let mut parts: Vec<&str, A> = Vec::new_in(a);
     for p in path.split('/') {
         if !p.is_empty() {
             parts.push(p);
@@ -362,8 +374,8 @@ fn split_path<A: Allocator>(path: str, a: A) -> Vec<str, A> {
     parts
 }
 
-fn handle<A: Allocator>(line: str, a: A) -> String<A> {
-    var out = String::new_in(a);
+fn handle<A: Allocator + Copy>(line: &str, a: A) -> String<A> {
+    let mut out = String::new_in(a);
     let (method, path) = match line.split_once(' ') {
         Some(pair) => pair,
         None => {
@@ -373,19 +385,18 @@ fn handle<A: Allocator>(line: str, a: A) -> String<A> {
     };
     let parts = split_path(path, a);
     if method == "GET" && parts.len() == 2 && parts[0] == "users" {
-        out.push_fmt("200 user {}", parts[1]);
+        write(&mut out, "200 user {}", parts[1]).unwrap();
     } else {
-        out.push_fmt("404 no page {path}");
+        write(&mut out, "404 no page {path}").unwrap();
     }
     out
 }
 
 fn main(gpa: Gpa) {
-    let input = read_stdin_in(gpa).unwrap();
-    let text = str::from_utf8(input.as_slice()).unwrap();
-    var most = 0;
+    let text = io::read_to_string_in(io::stdin(), gpa).unwrap();
+    let mut most = 0;
     for line in text.lines() {
-        let used = arena_scope(gpa, |a| {
+        let used = arena_scope(&gpa, |a| {
             let reply = handle(line, a);
             println("{line:<24} -> {reply}");
             a.used()
@@ -410,11 +421,14 @@ GET /users/ada           -> 200 user ada
 GET /users/ada/posts     -> 404 no page /users/ada/posts
 POST /users/alan         -> 404 no page /users/alan
 hello                    -> 400 bad request
-at most 92 bytes per request
+at most 104 bytes per request
 ```
 
 The bodies of `split_path` and `handle` didn't change; only their
-signatures did. Each request's parts and reply now come from its
+signatures did. `handle` uses its allocator twice, for the `String` and
+for `split_path`, so it asks for one that can be copied: `A: Allocator
++ Copy`. A `Gpa` can, and so can a reference to an arena. Each
+request's parts and reply now come from its
 arena, and all of it is freed in one go when the closure returns.
 `a.used()` says how many bytes the arena handed out, and the closure
 returns that number as the scope's value.
@@ -430,34 +444,40 @@ Everything allocated from the arena is gone when the scope ends. So the
 compiler doesn't let anything that still uses the arena out of it:
 
 ```vole
+use std::alloc::arena_scope;
+
 fn main(gpa: Gpa) {
-    let squares = arena_scope(gpa, |a| {
-        var v: Vec<i64, ScopedArena> = Vec::new_in(a);
+    let squares = arena_scope(&gpa, |a| {
+        let mut v = Vec::new_in(a);
         v.push(1);
         v.push(4);
         v
     });
-    println(squares.len());
+    println("{}", squares.len());
 }
 ```
 
 ```err
-error[type error]: this arena scope's value holds 'ScopedArena' (Vec<i64, ScopedArena>): its memory is gone when the scope ends
- --> main.vl: line 6, column 9
-  = help: copy it out: 'v.clone_in(gpa)', or return what is computed from it
+error[borrowck.outlives]: lifetime may not live long enough: the lifetime of the closure's parameter 'a' is only the call's, but it flows where a lifetime of the closure's signature, from outside it is required, which lasts longer
+ --> main.vl: line 5, column 21
+  = help: keep a copy of the value instead of the reference (`*p`, `.clone()`); a closure's result borrows from its parameter only when the bound it is passed for says so (`Fn(&T) -> &T`)
 ```
 
-The `help:` line gives both ways out. Return what you computed from the
-Vec (`v.len()`, a total, a plain number) instead of the Vec itself, or
-copy it to a longer-lived allocator with `v.clone_in(gpa)` and return
-the copy. In the request handler, the reply is printed inside the scope
-and only a number leaves it.
+The error is long, but its first
+line has the point. `a` is a reference to the arena, good only for the
+length of the call, and the Vec holds it, so the Vec can't be the closure's result: that is
+chapter 4's rule about a reference outliving what it points to. There
+are two ways out. Return what you computed from the Vec (`v.len()`, a
+total, a plain number) instead of the Vec itself, or copy it to a
+longer-lived allocator with `v.clone_in(gpa)` and return the copy. In
+the request handler, the reply is printed inside the scope and only a
+number leaves it.
 
 For memory that must live longer than one call but still be freed all
-at once, `Arena::new_in(gpa)` makes an arena you keep in a variable.
-It's less convenient for now (giving its memory back takes an `unsafe`
-call), so prefer `arena_scope` when the work fits in a closure; `volec
-guide allocators` has the details.
+at once, `Arena::new_in(gpa)` makes an arena you keep in a variable:
+`&arena` is the allocator to hand to containers, and all of its memory
+is freed when the arena is dropped. `volec guide allocators` has the
+details.
 
 ## No heap at all: FixedBuf
 
@@ -470,7 +490,7 @@ version of `main` takes no `Gpa` at all, so nothing in the program can
 use the heap. The requests are in the program, since reading stdin
 would need an allocator too:
 
-```vole requests.vl
+```vole requests.vl mvs
 use std::FixedBuf;
 
 fn split_path<A: Allocator>(path: str, a: A) -> Vec<str, A> {
@@ -539,7 +559,7 @@ exit status 101, like any other panic.
 
 The compiler confirms that no `Gpa` is involved:
 
-```console
+```console mvs
 $ volec query effects crate requests.vl
 split_path<FixedBuf>	alloc(FixedBuf) panic diverge
 handle<FixedBuf>	alloc(FixedBuf) io panic diverge
@@ -548,26 +568,29 @@ crate::main	alloc(FixedBuf) io panic diverge
 
 ### Handling running out
 
-When running out is a possibility rather than a bug, use `try_push`
-instead of `push`. It returns a `Result`: `Ok(())` when the value fit,
-and `Err(AllocError::OutOfMemory)` when it didn't. Here `split_path`
-uses it, and passes the error up with `?` (chapter 6):
+When running out is a possibility rather than a bug, ask for the room
+first, with `try_reserve`. `parts.try_reserve(1)` returns a `Result`:
+`Ok(())` when there is room for one more item, growing the Vec if it
+has to, and an `Err(TryReserveError)` when there isn't and the
+allocator has no more to give. Here `split_path` uses it, and passes
+the error up with `?` (chapter 6):
 
 ```vole requests.vl
-use std::{AllocError, FixedBuf};
+use std::alloc::{Allocator, FixedBuf, TryReserveError};
 
-fn split_path<A: Allocator>(path: str, a: A) -> Result<Vec<str, A>, AllocError> {
-    var parts: Vec<str, A> = Vec::new_in(a);
+fn split_path<A: Allocator>(path: &str, a: A) -> Result<Vec<&str, A>, TryReserveError> {
+    let mut parts: Vec<&str, A> = Vec::new_in(a);
     for p in path.split('/') {
         if !p.is_empty() {
-            parts.try_push(p)?;
+            parts.try_reserve(1)?;
+            parts.push(p);
         }
     }
     Ok(parts)
 }
 
-fn handle<A: Allocator>(line: str, a: A) -> String<A> {
-    var out = String::new_in(a);
+fn handle<A: Allocator + Copy>(line: &str, a: A) -> String<A> {
+    let mut out = String::new_in(a);
     let (method, path) = match line.split_once(' ') {
         Some(pair) => pair,
         None => {
@@ -583,62 +606,62 @@ fn handle<A: Allocator>(line: str, a: A) -> String<A> {
         }
     };
     if method == "GET" && parts.len() == 2 && parts[0] == "users" {
-        out.push_fmt("200 user {}", parts[1]);
+        write(&mut out, "200 user {}", parts[1]).unwrap();
     } else {
-        out.push_fmt("404 no page {path}");
+        write(&mut out, "404 no page {path}").unwrap();
     }
     out
 }
 
 fn main() {
-    let requests: [str; 4] = [
+    let requests = [
         "GET /users/ada",
         "hello",
         "GET /users/ada/posts",
         "GET /a/b/c/d/e/f/g/h/i",
     ];
-    var mem = [0u8; 256];
+    let mut mem = [0u8; 256];
     for line in requests {
-        let fb = FixedBuf::new(&mem[..]);
-        let reply = handle(line, fb);
+        let fb = FixedBuf::new(&mut mem);
+        let reply = handle(line, &fb);
         println("{line:<24} -> {reply} ({} bytes)", fb.used());
     }
 }
 ```
 
 ```out
-GET /users/ada           -> 200 user ada (76 bytes)
+GET /users/ada           -> 200 user ada (91 bytes)
 hello                    -> 400 bad request (15 bytes)
-GET /users/ada/posts     -> 404 no page /users/ada/posts (92 bytes)
-GET /a/b/c/d/e/f/g/h/i   -> 414 path too long (17 bytes)
+GET /users/ada/posts     -> 404 no page /users/ada/posts (104 bytes)
+GET /a/b/c/d/e/f/g/h/i   -> 414 path too long (209 bytes)
 ```
 
-The long request is now an answer instead of a crash. Notice the "17
-bytes": when `split_path` failed, its half-built Vec was dropped, and a
-`FixedBuf`, like an arena, takes back the last block it handed out.
+The long request is now an answer instead of a crash. `main` hands
+`handle` a `&fb`: a reference to an allocator is an allocator too, and
+one that can be copied.
 
-Only `Vec` has `try_` forms so far (`try_push`, `try_reserve`); a
-`String` or a `HashMap` that runs out of room stops the program.
+`String` and `HashMap` have `try_reserve` as well. A plain `push`,
+`push_str` or `insert` that runs out of room stops the program.
 
 ## Checking memory
 
 Safe vole can't free memory twice, use it after it's freed, or keep a
-view of memory that moved: the compiler rejects those programs, as
+reference to memory that moved: the compiler rejects those programs, as
 you've seen. Two things are still possible. Code in an `unsafe` block
 (chapter 15) works with raw pointers, which the compiler can't follow.
 And a program can *leak*, keeping memory it never gives back.
 
 `volec --check-alloc` builds a program with a checking allocator that
-watches for all of these at run time. Here is a leak: `std::forget`
+watches for all of these at run time. Here is a leak: `std::mem::forget`
 throws a value away without dropping it, so its memory is never freed.
 That's allowed in safe code, but it's rarely what you want:
 
 ```vole leak.vl
 fn main(gpa: Gpa) {
-    var log = String::new_in(gpa);
+    let mut log = String::new_in(gpa);
     log.push_str("a reply nobody frees");
     println("{log}");
-    std::forget(log);
+    std::mem::forget(log);
 }
 ```
 
@@ -659,12 +682,12 @@ A use after free in unsafe code is stopped where it happens:
 
 ```vole uaf.vl
 fn main(gpa: Gpa) {
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
     v.push(7);
-    let p = v.as_slice().ptr;
+    let p = v.as_ptr();
     drop(v);
-    let x = unsafe { p[0] };
-    println(x);
+    let x = unsafe { *p };
+    println("{x}");
 }
 ```
 
@@ -688,9 +711,9 @@ gets whole pages of its own), so it's for tests and debugging, not for
 the program you ship. `volec test` (chapter 13) runs a program's tests
 with it on, so a test that leaks fails.
 
-> **If you know Rust:** there is no `Box`, `Rc` or `Arc`. For a single
-> owned value, use the value; for shared or linked data, use a `Vec` and
-> indexes into it, or an arena.
+> **If you know Rust:** `Box::new_in(x, gpa)` is there; `Rc` and `Arc`
+> are not. For shared or linked data, use a `Vec` and indexes into it,
+> or an arena.
 
 ## Summary
 
@@ -700,10 +723,10 @@ with it on, so a test that leaks fails.
   take the allocator last; containers remember theirs, so `push` and
   `clone` need none.
 - Drops give memory back; there is no `free` to call.
-- `arena_scope(gpa, |a| ...)` gives a piece of work an arena, freed all
+- `arena_scope(&gpa, |a| ...)` gives a piece of work an arena, freed all
   at once; nothing that uses the arena can leave the scope.
 - `FixedBuf` allocates from memory you provide, with no heap at all;
-  `try_push` handles running out.
+  `try_reserve` handles running out.
 - `<A: Allocator>` makes a function work with any allocator;
   `Vec<T, A>` and `String<A>` carry the allocator in their types.
 - `volec --check-alloc` finds leaks, and memory bugs in unsafe code.
@@ -714,7 +737,7 @@ covers them properly, with the traits that make them work.
 ## Try it yourself
 
 - Add a request `GET /users`, which answers with `200 all users`.
-- Give the arena version a `HashMap<str, i64>` on the arena that counts
+- Give the arena version a `HashMap` on the arena (`HashMap::new_in(a)`) that counts
   how often each part appears in one request, and print the counts
   inside the scope.
 - Make the fixed buffer smaller, 128 bytes, and see which requests
