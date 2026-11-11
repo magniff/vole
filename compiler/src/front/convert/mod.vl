@@ -355,6 +355,9 @@ pub fn complete_impl_targs(i: i64, f: i64, n: i64, tys: *mut i64, skip: i64,
             crate::front::generics::instantiate::unify(params, bound, tmod,
                 pcx.nodes[item as usize].b, pcx.hint_ty, pcx);
         }
+        if skip == 1 {
+            unify_recv_bound(i, n, params, bound, pcx);
+        }
         let mut complete = true;
         let mark = pcx.tscratch.count;
         for k in 0..count {
@@ -373,6 +376,52 @@ pub fn complete_impl_targs(i: i64, f: i64, n: i64, tys: *mut i64, skip: i64,
             pcx.traits_impls[i as usize].module, pcx);
         env_leave(saved, pcx);
         r
+    }
+}
+
+// RULE: F14.1 (0.28.0) The parameters of pattern impl i that its type
+// leaves free, from the bound of the receiver's type parameter that names
+// the impl's trait, in an instance: `r.start_bound()` with `R:
+// RangeBounds<K>`, R = RangeFull, is `impl<T> RangeBounds<T> for
+// RangeFull` with T = K. n is the method call; `params` (the impl's, or
+// its function's, which begin with them) and `bound` are unify's.
+pub fn unify_recv_bound(i: i64, n: i64, params: i64, bound: *mut i64, pcx: &mut Ctx<Comp>) {
+    if pcx.nodes[n as usize].kind != NodeKind::MethodCall {
+        return;
+    }
+    let mut recv = pcx.nodes[n as usize].a;
+    while pcx.nodes[recv as usize].kind == NodeKind::Unary
+        && pcx.nodes[recv as usize].op == Tok::Star {
+        recv = pcx.nodes[recv as usize].b;
+    }
+    if pcx.nodes[recv as usize].kind != NodeKind::Ident
+        || pcx.nodes[recv as usize].res != Res::Local
+        || pcx.nodes[recv as usize].y < 0
+        || pcx.locals[pcx.nodes[recv as usize].y as usize].tparam == 0 {
+        return;
+    }
+    let tr = pcx.traits_impls[i as usize].tr;
+    let head = pcx.nodes[pcx.nodes[pcx.traits_impls[i as usize].node as usize].a as usize].g;
+    let bounds = pcx.nodes[pcx.locals[pcx.nodes[recv as usize].y as usize].tparam as usize].h;
+    if head == 0 {
+        return;
+    }
+    for k in 0..pcx.nodes[bounds as usize].count {
+        let b = child(bounds, k, pcx);
+        if pcx.nodes[b as usize].kind != NodeKind::TyName || pcx.nodes[b as usize].g == 0
+            || bound_trait(b, pcx) != tr {
+            continue;
+        }
+        let args = pcx.nodes[b as usize].g;
+        for j in 0..pcx.nodes[head as usize].count {
+            if j < pcx.nodes[args as usize].count {
+                let bt = resolve_type(child(args, j, pcx), pcx);
+                if bt > 0 && !has_error_type(bt, pcx) {
+                    crate::front::generics::instantiate::unify(params, bound,
+                        pcx.traits_impls[i as usize].module, child(head, j, pcx), bt, pcx);
+                }
+            }
+        }
     }
 }
 
@@ -785,6 +834,23 @@ pub fn has_generic_trait_fn(t: i64, member: i64, pcx: &mut Ctx<Comp>) -> bool {
         }
     }
     false
+}
+
+// (0.28.0) Whether exactly one generic-trait impl covering t has a
+// function `member`: an operator's other operand is then of that impl's
+// type, known before it is read (front/check/synth_mode.vl, F26.3).
+pub fn one_generic_trait_fn(t: i64, member: i64, pcx: &mut Ctx<Comp>) -> bool {
+    if t < 0 || has_error_type(t, pcx) {
+        return false;
+    }
+    let mut found: i64 = 0;
+    for i in 0..pcx.traits_impls.len() as i64 {
+        if trait_param_count(pcx.traits_impls[i as usize].tr, pcx) != 0 && impl_covers(i, t, pcx)
+            && impl_fn(i, member, pcx) >= 0 {
+            found += 1;
+        }
+    }
+    found == 1
 }
 
 // `W::from(x)` with W a generic type written without its arguments (n a
@@ -1225,8 +1291,20 @@ fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: &mut Ctx<Comp>) -> i64 {
             let param_local = recv > 0 && pcx.nodes[recv as usize].kind == NodeKind::Ident
                 && pcx.nodes[recv as usize].res == Res::Local && pcx.nodes[recv as usize].y >= 0
                 && pcx.locals[pcx.nodes[recv as usize].y as usize].tparam != 0;
-            let place_first = pcx.via_node == n || pcx.place_recv == n
-                || (if param_local { pcx.locals[pcx.nodes[recv as usize].y as usize].borrow }
+            // (0.28.0: `Tr::m(x)` with x a reference to the view, `<K as
+            // Borrow<Q>>::borrow(k)` of `k: &K`, K = &str: Self is the view)
+            let via_ref = recv > 0 && pcx.nodes[recv as usize].ty > 0
+                && pcx.nodes[recv as usize].ty != t
+                && pcx.types[pcx.nodes[recv as usize].ty as usize].kind == TyKind::Ptr
+                && pcx.types[pcx.nodes[recv as usize].ty as usize].a == t;
+            let place_first = pcx.via_node == n && !via_ref || pcx.place_recv == n
+                // (0.28.0: `x: &P` with P the place, the view x itself; not `k:
+                // &K` with K = &str, a reference to the view: K's own impl,
+                // `<&str as Borrow<&str>>` by the bound `K: Borrow<K>`)
+                || (if param_local {
+                    pcx.locals[pcx.nodes[recv as usize].y as usize].borrow
+                        && pcx.nodes[recv as usize].ty == t
+                }
                     else { pcx.cur_fn < 0 || pcx.fns[pcx.cur_fn as usize].tmpl == 0 });
             if place > 0 && place_first && place_takes(n, place, member, tys, kinds, pcx) {
                 pcx.cands.count = mark;
@@ -1320,6 +1398,21 @@ fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: &mut Ctx<Comp>) -> i64 {
             if place > 0 && place != t && covers_member(place, member, pcx) {
                 pcx.cands.count = mark;
                 return dispatch(n, place, member, count, pcx);
+            }
+        }
+        // RULE: F6.2 (0.28.0: in an instance a receiver `*a` of `a: &T` is a
+        // T: with T = `&u8` no impl of what T points to takes the call, and
+        // T's own does, as the generic body resolved it by T's bound: `<&u8
+        // as PartialEq<&u8>>::eq`, `a.eq(b)` and the derives' `PartialEq::eq(a,
+        // b)` in `Option<&u8>::eq`)
+        if method && !is_from && pcx.cur_fn >= 0 && pcx.fns[pcx.cur_fn as usize].tmpl != 0
+            && crate::front::rust::rust_at(pcx.nodes[n as usize].start, pcx) {
+            let rt = pcx.nodes[pcx.nodes[n as usize].a as usize].ty;
+            if rt > 0 && rt != t && pcx.types[rt as usize].kind == TyKind::Ptr
+                && pcx.types[rt as usize].b == crate::front::types::REF_SHARED
+                && pcx.types[rt as usize].a == t && has_generic_trait_fn(rt, member, pcx) {
+                pcx.cands.count = mark;
+                return dispatch(n, rt, member, count, pcx);
             }
         }
         no_impl_error(n, t, member, mark, tys, kinds, is_from, from, pcx);
