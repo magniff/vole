@@ -28,7 +28,6 @@ $ refactor signature Point::scale --add 'extra: i64 = 0' --at 1 --dry-run
 @@ -46 +46 @@
 -    pub fn scale(&mut self, k: i64) {
 +    pub fn scale(&mut self, extra: i64, k: i64) {
-note refactor.fill-calls: the calls get the value (a default is on trailing parameters only, and a later one has none)
 ## A trait's function: the trait, every impl, the calls (in a generic
 ## function's instances too).
 $ refactor signature Shape::size --add 'bias: i64 = 0' --dry-run
@@ -51,7 +50,6 @@ $ refactor signature Shape::size --add 'bias: i64 = 0' --dry-run
 @@ -69 +69 @@
 -    s.size(1) + s.size(2)
 +    s.size(1, 0) + s.size(2, 0)
-note refactor.fill-calls: the calls get the value (a trait's function has no defaults)
 ## Named by an impl's function: the same.
 $ refactor signature Pair::size --remove unit --dry-run
 error refactor.used: parameter unit is used in <crate::geom::Pair as Shape>::size at geom.vl:64:36

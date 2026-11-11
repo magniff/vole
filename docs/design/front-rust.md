@@ -1890,7 +1890,8 @@ Cases `rust_t_index_deref`, `rust_b_err_index_deref_mut`.
 
 **F33.1 (no default values; named arguments stay, 0.28.0).** A parameter
 has no default value: `fn f(a: i64, b: i64 = 2)` is a parse error at the
-`=` ("a parameter has no default value; pass it at each call"), with the
+`=` (`syntax.default-arg`: "a parameter has no default value; pass it at
+each call"), with the
 fix that removes ` = value` (`volec fix --suggested`). Named arguments
 are kept, a documented divergence from Rust: `f(1, b: 3)`, after the
 positional ones and in parameter order. One exception, by name and not
