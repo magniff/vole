@@ -29,7 +29,8 @@ and the compiler's errors for Rust habits name vole's form on their
 | `v[i as usize]` | `v[i]`: any integer type indexes | 3 |
 | `use std::io::*;` | no wildcard imports: every name is imported by name | 2, 11 |
 | `dyn Trait` | none: generics, `fn f<T: Trait>(x: &T)`, or an enum | 9 |
-| `Rc<T>`, `Arc<T>` | not there: a `Vec` and indices, or an arena | 8 |
+| `Rc<T>` | not there: a `Vec` and indices, or an arena | 8 |
+| `Arc<T>`, `Mutex<T>`, `thread::spawn` | `Arc<T, Gpa>` from `Arc::new_in(x, gpa)`, `Mutex<T>`, `thread::spawn_in(f, gpa)`; no poisoning, a panic stops the program | 14 |
 | comments about what a function expects | `requires` and `ensures`, checked in every build | 13 |
 | Cargo, crates | none yet: a program is its files, and C libraries through headers | 11 |
 | bindgen | `import "header.h" as c;` | 15 |
