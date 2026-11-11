@@ -79,21 +79,21 @@ the total cost is a small multiple of one full-size product.
 
 ## The code
 
-**The kernels** work on slices of limbs, `[u32]`, so the recursion can
-pass halves of numbers without copying them (`a[..m]` is a view). The
+**The kernels** work on slices of limbs, `&[u32]`, so the recursion can
+pass halves of numbers without copying them (`&a[..m]` borrows a part). The
 schoolbook kernel's inner loop is a multiply-add on a `u64` column; the
 `u32` limb widens to `u64` by itself:
 
 ```tach
 for row in i..end {
     let ai: u64 = a[row];
-    inout out = &acc[row..row + b.len()];
+    let out = &mut acc[row..row + b.len()];
     for j in 0..b.len() { out[j] += ai * b[j]; }
 }
 ```
 
-`out` is a writable slice of the accumulator (an `inout` access: a
-plain `[T]` is read-only): indexing it is checked against its length once per row,
+`out` is a writable slice of the accumulator (`&mut [u64]`; a `&[T]` is
+read-only): indexing it is checked against its length once per row,
 outside the inner loop.
 
 **Karatsuba** writes `z0` and `z2` straight into the two halves of the
@@ -102,16 +102,16 @@ the middle:
 
 ```tach
 let m = a.len() / 2;                // b.len > m: both halves are there
-let (a0, a1) = (a[..m], a[m..]);
-let (b0, b1) = (b[..m], b[m..]);
-mul_karatsuba(a0, b0, &r[..2 * m], gpa);  // z0, in place
-mul_karatsuba(a1, b1, &r[2 * m..], gpa);  // z2, in place
+let (a0, a1) = (&a[..m], &a[m..]);
+let (b0, b1) = (&b[..m], &b[m..]);
+mul_karatsuba(a0, b0, &mut r[..2 * m], gpa);  // z0, in place
+mul_karatsuba(a1, b1, &mut r[2 * m..], gpa);  // z2, in place
 let sa = sum_of(a0, a1, gpa);
 let sb = sum_of(b0, b1, gpa);
 ...
-mul_karatsuba(sa.as_slice(), sb.as_slice(), p, gpa);
-sub_from(p, r[..2 * m]);            // p - z0
-sub_from(p, r[2 * m..]);            // p - z0 - z2 = a0 b1 + a1 b0
+mul_karatsuba(&sa, &sb, p, gpa);
+sub_from(p, &r[..2 * m]);           // p - z0
+sub_from(p, &r[2 * m..]);           // p - z0 - z2 = a0 b1 + a1 b0
 add_at(r, trimmed(p), m);
 ```
 
@@ -119,85 +119,84 @@ A lopsided product (one operand at least twice as long) is cut into
 pieces of the shorter one's length first, so the halves always both
 exist.
 
-**`BigUint`** wraps the limbs. `#[derive(Eq, Clone, Debug)]` gives `==`
+**`BigUint`** wraps the limbs. `#[derive(PartialEq, Eq, Clone, Debug)]` gives `==`
 (by contents: a `Vec` compares its elements), a deep `clone` and the
 `{x:?}` that prints `BigUint { limbs: [480000000, ...] }`. `Ord` is
 written by hand, because a longer number is larger whatever its limbs
-say; with it, `self < other` works:
+say; with it and a `PartialOrd` that calls it, `self < other` works:
 
 ```tach
-#[derive(Eq, Clone, Debug)]
-struct BigUint { limbs: Vec<u32> }
+#[derive(PartialEq, Eq, Clone, Debug)]
+struct BigUint<A: Allocator> { limbs: Vec<u32, A> }
 
-impl Ord for BigUint {
-    fn cmp(self, other: BigUint) -> i64 {
+impl Ord for BigUint<Gpa> {
+    fn cmp(&self, other: &BigUint<Gpa>) -> Ordering {
         let (a, b) = (self.limbs.as_slice(), other.limbs.as_slice());
-        if a.len() != b.len() { return a.len() - b.len(); }
+        if a.len() != b.len() { return a.len().cmp(&b.len()); }
         ...
     }
 }
 ```
 
-**The arithmetic** is three methods that read their operands (`let`,
-the default) and return a new number, `a.plus(b)`, `a.minus(b)` and
-`a.times(b)`. A
+**The arithmetic** is three methods that borrow their operands (`&self`,
+`&BigUint`) and return a new number, `a.plus(&b)`, `a.minus(&b)` and
+`a.times(&b)`. A
 method takes no allocator, so the result is allocated where the left
 operand's limbs are: a `Vec` carries its allocator
 (`self.limbs.allocator()`). A number from a `u64` has no operand to ask,
 so it is `BigUint::from_u64(x, gpa)` rather than `From<u64>`:
 
 ```tach
-fn times(self, other: BigUint) -> BigUint {
+fn times(&self, other: &BigUint<Gpa>) -> BigUint<Gpa> {
     // (the result is allocated where self's limbs are)
-    let gpa = self.limbs.allocator();
-    var r = Vec::filled_in(self.limbs.len() + other.limbs.len(), 0u32, gpa);
-    mul_karatsuba(self.limbs.as_slice(), other.limbs.as_slice(), r.as_mut_slice(), gpa);
+    let gpa = *self.limbs.allocator();
+    let mut r = Vec::from_elem_in(0u32, self.limbs.len() + other.limbs.len(), gpa);
+    mul_karatsuba(&self.limbs, &other.limbs, &mut r, gpa);
     BigUint::from_limbs(r)
 }
 ```
 
-**The operators** are the prelude's `Add`, `Sub` and `Mul`, on top of
-them. Their traits take both operands `let` (0.20), so `a * b` reads `a`
-and `b` as `a.times(b)` does, and both can be used again; a temporary, as
-in the product tree's `product(lo, mid, gpa) * product(mid + 1, hi, gpa)`,
-is dropped after the call:
+**The operators** are `std::ops`'s `Add`, `Sub` and `Mul`, on top of
+them. Their traits take both operands by value, so `a * b` consumes `a`
+and `b` where `a.times(&b)` borrows them: the operator suits
+temporaries, as in the product tree's `product(lo, mid, gpa) *
+product(mid + 1, hi, gpa)`, both dropped after the call; a number that
+is used again goes through the method:
 
 ```tach
-impl Mul for BigUint {
-    fn mul(self, other: BigUint) -> BigUint { self.times(other) }
+impl Mul for BigUint<Gpa> {
+    type Output = BigUint<Gpa>;
+    fn mul(self, other: BigUint<Gpa>) -> BigUint<Gpa> { self.times(&other) }
 }
 ```
 
 **Who frees what.** Nobody, by hand: a `BigUint` owns its limbs, and
-each one is dropped at the end of its scope (or when it is moved into a
-`sink` parameter, whose callee drops it). Fast doubling makes six numbers per step and
+each one is dropped at the end of its scope (or, when it is moved into
+a by-value parameter, by the callee). Fast doubling makes six numbers per step and
 keeps two, with no `free` in sight:
 
 ```tach
-let twice = b.plus(b);
-let diff = twice.minus(a);
-let sq_a = a.times(a);
-let sq_b = b.times(b);
-let even = a.times(diff);           // F(2k)
-let odd = sq_a.plus(sq_b);          // F(2k + 1)
+let twice = b.plus(&b);
+let diff = twice.minus(&a);
+let sq_a = a.times(&a);
+let sq_b = b.times(&b);
+let even = a.times(&diff);          // F(2k)
+let odd = sq_a.plus(&sq_b);         // F(2k + 1)
 ...
 a = even;                           // the old a is dropped here
 b = odd;
 ```
 
 **Display** prints the top limb as it is and every other one as exactly
-nine digits, with an f-string spec (`{x:09}`: zero-padded to 9):
+nine digits, with a format spec (`{:09}`: zero-padded to 9):
 
 ```tach
-impl Display for BigUint {
-    fn fmt(self, f: inout Fmt) {
+impl<A: Allocator> Display for BigUint<A> {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         ...
-        f.write("{}", s[s.len() - 1]);
-        var i = s.len() - 2;
-        while i >= 0 {
-            f.write("{:09}", s[i]);
-            i -= 1;
-        }
+        write(f, "{}", s[s.len() - 1])?;
+        for i in (0..s.len() - 1).rev() { write(f, "{:09}", s[i])?; }
+        Ok(())
     }
 }
 ```
@@ -208,7 +207,7 @@ the trailing zeros of 1000! are a `fold` over the decimal text that
 restarts its count at every nonzero digit:
 
 ```tach
-let zeros = text.as_slice().iter().fold(0, |n, d| if d == '0' { n + 1 } else { 0 });
+let zeros = text.as_bytes().iter().fold(0, |n, d| if *d == b'0' { n + 1 } else { 0 });
 ```
 
 **The checks**: 1000! by a product tree (balanced halves, so the big
@@ -278,13 +277,13 @@ another 10%.
 
 | feature | where | guide |
 |---|---|---|
-| operator traits `Add`, `Sub`, `Mul` (operands `let`); `Ord` by hand gives `<` | `impl ... for BigUint` | `volec guide traits` |
-| `let` parameters (the default), `inout [u32]` for slices that are written | `plus`/`minus`/`times`, the kernels | `volec guide memory`, `guide views` |
-| `#[derive(Eq, Clone, Debug)]`, `{x:?}` | `BigUint` | `volec guide formatting` |
-| `impl Display`, `f.write("...")`, `{x:09}` | `Display for BigUint` | `volec guide formatting` |
+| operator traits `Add`, `Sub`, `Mul` (operands by value, `type Output`); `Ord` and `PartialOrd` by hand give `<` | `impl ... for BigUint<Gpa>` | `volec guide traits` |
+| `&self` and `&BigUint` operands, `&mut [u32]` for slices that are written | `plus`/`minus`/`times`, the kernels | `volec guide memory` |
+| `#[derive(PartialEq, Eq, Clone, Debug)]`, `{x:?}` | `BigUint` | `volec guide formatting` |
+| `impl Display`, `write(f, "...")`, `{:09}` | `Display for BigUint` | `volec guide formatting` |
 | a `Vec` carries its allocator: `self.limbs.allocator()` | `BigUint::times` | `volec guide allocators` |
 | widening: `u32` limbs into `u64` arithmetic | the kernels | `volec guide conversions` |
-| slices as views, sub-slices `a[..m]`, written through | the kernels | `volec guide types`, `guide memory` |
+| slices, sub-slices `&a[..m]` and `&mut r[..2 * m]`, written through | the kernels | `volec guide types`, `guide memory` |
 | drops: every number freed at the end of its scope | everywhere | `volec guide memory` |
 | closures and iterators: `map`, `sum`, `fold` | `digit_sum`, `main` | `volec guide iterators`, `guide closures` |
 | `panic("...")` for a broken precondition, `self < other` from `Ord` | `BigUint::minus` | `volec guide errors` |
