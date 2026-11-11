@@ -10,10 +10,7 @@ ok: built mvs
 % ./mvs
 2 1
 $ fix --edition rust main.vl
-main.vl:1:14: error[type error] expected '&[u8]', got '&str'  [in crate::K]
 fixed, 1 var to 'let mut', 1 import, 1 copy type derived Clone, Copy	main.vl	+3 -2 lines
-warning edit.breaks: 1 new error (1 in crate::K, which the edit does not change); written anyway (--no-check); the error: main.vl:1:14: expected '&[u8]', got '&str'
-try: volec check main.vl
 % cat main.vl
 embed wgsl K {
     @compute @workgroup_size(1)
