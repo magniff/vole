@@ -21,6 +21,16 @@
         $0 = substr($0, 1, RSTART - 1) "mut " name ": " substr($0, RSTART + RLENGTH)
     }
 }
+# (0.28) The programs are in the rust edition; its forms the seed
+# subset uses (tests/fuzz/gen.awk's plain mode, what fuzz-seed runs) and the
+# seed spells otherwise: the edition line (dropped), `*const T` and
+# `*mut T` (`*T`), an index `[(E) as usize]` (`[(E)]`: the seed indexes
+# with any integer). `let mut` and `mut p: T` are the seed's own.
+/^\/\/ EDITION: rust *$/ { next }
+{
+    gsub(/\*const /, "*"); gsub(/\*mut /, "*")
+    gsub(/\) as usize\]/, ")]")
+}
 /^extern "C" \{ *fn .*; *\}$/ {
     sub(/^extern "C" \{ */, "extern ")
     sub(/ *\}$/, "")
