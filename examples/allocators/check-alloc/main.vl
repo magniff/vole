@@ -1,39 +1,38 @@
-// The memory bugs vole 0.25 still lets through, one per command-line
+// EDITION: rust
+// The memory bugs vole still lets through, one per command-line
 // argument: `leak`, `dangling` and `twice` (none: the correct version of
 // each). Safe code cannot read memory after it is freed or free it twice:
-// since 0.17 those are compile errors (the README shows them). What is
-// left is a leak, which is safe, and a bug in `unsafe` code, whose raw
-// pointers nothing checks. Built as usual, each prints a wrong number,
+// those are compile errors (the README shows them). What is left is a
+// leak, which is safe, and a bug in `unsafe` code, whose raw pointers
+// nothing checks. Built as usual, each prints a wrong number,
 // crashes or shows nothing at all; built with `volec --check-alloc`, each
 // is reported with its block, where it was allocated and where it was
 // freed.
 use std::env;
+use std::alloc::{Allocator, Layout};
 use std::cli::{Arg, Command};
+use std::ptr::NonNull;
 
-// The bug: an Arena's memory never given back. An Arena is not dropped:
-// `free_all` returns its memory, and it is unsafe, as a view into the
-// arena could still be used after it.
+// The bug: a String whose drop never runs. `std::mem::forget` takes a
+// value and does not drop it: safe code, and its memory is never freed.
 fn leaked(gpa: Gpa, fixed: bool) {
-    let notes = Arena::new_in(gpa);
-    {
-        var b: String<Arena> = String::new_in(notes);
-        b.push_str("a report nobody frees");
-        println(b.as_slice());
-    }
-    if fixed {
-        unsafe { notes.free_all() };
+    let mut b = String::new_in(gpa);
+    b.push_str("a report nobody frees");
+    println("{b}");
+    if !fixed {
+        std::mem::forget(b);
     }
 }
 
 // The bug: a raw pointer into a Vec kept across a push that moved the
-// Vec's memory. A view (`v.as_slice()`) kept across the push would be a
+// Vec's memory. A reference (`&v[0]`) kept across the push would be a
 // compile error; a raw pointer is not checked.
 fn dangling(gpa: Gpa, fixed: bool) {
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..4 {
         v.push(i * 10 + 1);
     }
-    let first = v.as_slice().ptr;
+    let first = v.as_ptr();
     v.push(41);
     if fixed {
         // safe code indexes the Vec: there is no pointer to keep valid
@@ -41,25 +40,32 @@ fn dangling(gpa: Gpa, fixed: bool) {
     } else {
         // UNSAFE: the bug this example shows: a read through a pointer into the Vec's buffer.
         // SAFETY: none, on purpose: v.push(41) may have moved the buffer (--check-alloc says so).
-        println("first {}", unsafe { first[0] });
+        println("first {}", unsafe { *first });
     }
 }
 
-// Two i64s managed by hand, through a raw pointer. The struct has no
-// `Drop`, so it is a plain type: `let b = a;` copies the pointer, not the
-// memory, and nothing frees it but an explicit `gpa.free`.
-struct Pair { p: *i64 }
+// Two i64s managed by hand, through a raw pointer. The struct is `Copy`
+// and has no `Drop`: `let b = a;` copies the pointer, not the memory, and
+// nothing frees it but an explicit `deallocate`.
+#[derive(Clone, Copy)]
+struct Pair { p: *mut i64 }
+
+fn pair_layout() -> Layout { Layout::array::<i64>(2).unwrap() }
 
 fn pair_new(gpa: Gpa, a: i64, b: i64) -> Pair {
-    let p = gpa.try_alloc(16, 8) as *i64;
-    if p == 0 as *i64 {
-        panic("out of memory");
-    }
+    let p = gpa.allocate(pair_layout()).expect("out of memory").as_ptr() as *mut i64;
+    // UNSAFE: the two i64s are written through the raw pointer.
+    // SAFETY: p is a new block of 16 bytes, aligned for i64: p and p + 1 are inside it.
     unsafe {
-        p[0] = a;
-        p[1] = b;
+        *p = a;
+        *p.add(1) = b;
     }
-    Pair { p: p }
+    Pair { p }
+}
+
+impl Pair {
+    // The block to give back to the allocator.
+    fn block(self) -> NonNull<u8> { NonNull::new(self.p as *mut u8).unwrap() }
 }
 
 // The bug: two copies of a Pair, each freed.
@@ -68,13 +74,18 @@ fn freed_twice(gpa: Gpa, fixed: bool) {
     let shelf = counts;
     // UNSAFE: a Pair's memory is managed by hand, through a raw pointer.
     // SAFETY: shelf.p points to the two i64s pair_new wrote, not freed yet.
-    println("shelf: {}", unsafe { shelf.p[0] + shelf.p[1] });
-    unsafe { gpa.free(counts.p as *u8, 16, 8) };
+    println("shelf: {}", unsafe { *shelf.p + *shelf.p.add(1) });
+    // UNSAFE: deallocate is the allocator's unsafe method.
+    // SAFETY: the block is pair_new's, with its layout, and this is its first free.
+    unsafe { gpa.deallocate(counts.block(), pair_layout()) };
     if !fixed {
-        unsafe { gpa.free(shelf.p as *u8, 16, 8) };
+        // UNSAFE: the bug this example shows: the copy freed as well.
+        // SAFETY: none, on purpose: shelf.p is counts.p, freed above (--check-alloc says so).
+        unsafe { gpa.deallocate(shelf.block(), pair_layout()) };
     }
 }
 
+#[derive(PartialEq)]
 enum Bug { NoBug, Leak, Dangling, Twice }
 
 // The bug the arguments name; None (and a message) for one it does not
@@ -114,8 +125,8 @@ fn main(gpa: Gpa) -> i32 {
     if fixed || bug == Bug::Twice {
         freed_twice(gpa, fixed);
     }
-    if fixed && std::CHECK_ALLOC {
-        // (known only to the checking Gpa: -1 otherwise)
+    if fixed {
+        // (counted only by the checking Gpa: 0 otherwise)
         println("blocks still allocated: {}", gpa.live_blocks());
     }
     0
