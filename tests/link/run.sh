@@ -86,17 +86,21 @@ fn main() {
 }
 EOF
 cat >bss.vl <<'EOF'
-static var DATA: [u8; 20000] = [1; 20000];
-static var NAMES: [str; 4] = ["a", "b", "c", "d"];
-static var ZEROS: [u8; 100000] = [0; 100000];
+// EDITION: rust
+static mut DATA: [u8; 20000] = [1; 20000];
+static mut NAMES: [&str; 4] = ["a", "b", "c", "d"];
+static mut ZEROS: [u8; 100000] = [0; 100000];
 
 fn main() {
-    var sum = 0;
+    let mut sum = 0i64;
     for i in 0..100000 {
-        sum += ZEROS[i] as i64;
+        sum += unsafe { ZEROS[i] } as i64;
     }
-    ZEROS[99999] = 2;
-    println("{sum} {} {} {}", NAMES[3], DATA[19999], ZEROS[99999]);
+    unsafe {
+        ZEROS[99999] = 2;
+    }
+    let (name, d, z) = unsafe { (NAMES[3], DATA[19999], ZEROS[99999]) };
+    println("{sum} {} {} {}", name, d, z);
 }
 EOF
 cat >missing.vl <<'EOF'
