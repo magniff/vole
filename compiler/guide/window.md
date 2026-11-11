@@ -352,7 +352,7 @@ are physical pixels from the content's top-left:
 | `press [B] X Y`, `release [B] X Y`, `click [B] X Y` | B: `left` (default), `right`, `middle`; then `shift`, `ctrl`, `alt` or `cmd` held |
 | `scroll DY [DX]` | a wheel, in lines (positive: up) |
 | `resize WxH`, `focus on`/`off` | `Resize`, `Focus` |
-| `shot FILE.ppm` | the next frame presented (`frame.present`) is also written to FILE (`gpu::capture_next_frame`) |
+| `shot FILE.ppm` | the next frame presented (`frame.present`) is also written to FILE (`std::capture::capture_next_frame`) |
 | `close`, `quit` | `Close`, `Quit` |
 
 - When the script ends, each open window gets `Close`, then `Quit`; a
