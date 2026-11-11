@@ -12,10 +12,10 @@ These words are reserved: you can't use them as names.
 | keyword | meaning | chapter |
 |---|---|---|
 | `as` | converts a number, `bool` or fieldless enum (`x as i32`), a pointer, or a distinct type | 3, 15 |
-| `break` | leaves a loop, optionally with a value or a label: `break n`, `break :outer` | 3 |
+| `break` | leaves a loop, optionally with a value or a label: `break n`, `break 'outer` | 3 |
 | `const` | a constant item: `const MAX: i64 = 100;` | 3 |
-| `continue` | starts the next round of a loop: `continue :outer` | 3 |
-| `defer` | reserved: removed in 0.26.2 (`syntax.defer`); a guard with `Drop` does what it did | `guide memory` |
+| `continue` | starts the next round of a loop: `continue 'outer` | 3 |
+| `defer` | reserved, and an error (`syntax.defer`): a guard with `Drop` does that job | `guide memory` |
 | `else` | the other branch of `if`; also in `let ... else` and a contract's message | 3, 5 |
 | `enum` | a type whose value is one of several variants | 5 |
 | `extern` | a C function or block of them: `extern "C" { ... }` | 15 |
@@ -26,28 +26,26 @@ These words are reserved: you can't use them as names.
 | `impl` | methods for a type, or a trait for a type: `impl Drop for T` | 5, 9 |
 | `import` | a C header: `import "stdio.h" as c;` | 15 |
 | `in` | the `in` of a `for` loop | 3 |
-| `inout` | the convention for a parameter a function may change; `inout x = &place;` | 4 |
-| `let` | an immutable variable; the default parameter convention | 3, 4 |
+| `let` | a variable; `let mut` for one that can change | 3 |
 | `loop` | repeats until a `break` | 3 |
 | `match` | picks an arm by pattern | 5 |
 | `mod` | a module: `mod util;` loads `util.vl` | 11 |
+| `move` | a closure that takes what it captures: `move \|\| ...` | 10 |
+| `mut` | marks what may change: `let mut x`, `&mut x`, `&mut self` | 3, 4 |
 | `pub` | makes an item visible outside its module | 11 |
 | `return` | leaves the function, with a value | 3 |
-| `sink` | the convention for a parameter a function takes; `sink \|\|` for a closure that takes its captures | 4, 10 |
-| `static` | a value that lives as long as the program: `static var` for one that changes | 3, 14 |
+| `static` | a value that lives as long as the program; a `static mut` can change, and using one is `unsafe` | 3, 14 |
 | `struct` | a type with named fields | 5 |
 | `trait` | a set of methods types can provide | 9 |
 | `type` | an alias, or a distinct type: `type Id = distinct i64;` | `guide types` |
 | `union` | a C-style union, read only in `unsafe` code | 15 |
 | `unsafe` | a block or function allowed to do what the compiler can't check | 15 |
-| `use` | imports a name: `use std::io::BufReader;` | 2, 11 |
-| `var` | a mutable variable | 3 |
+| `use` | imports a name: `use std::collections::HashMap;` | 2, 11 |
+| `where` | bounds written after a signature: `where T: Ord` | 9 |
 | `while` | loops while a condition holds; `while let` while a pattern fits | 3, 5 |
 
-`where` and `dyn` are reserved too, and are errors: vole has neither
-(bounds go in the angle brackets, `<T: Ord>`, and there are no trait
-objects). `mut` and `move` are Rust's spellings; each is an error whose
-`try:` line gives vole's (`var` or `sink`).
+`dyn` is reserved too, and is an error: vole has no trait objects.
+`ref` (in a pattern, borrow instead of move) is there as in Rust.
 
 ### Words that are special in one place
 
@@ -71,16 +69,15 @@ variable called `result` or `debug`:
 
 | operator | meaning |
 |---|---|
-| `+ - * /` | arithmetic; integers wrap, `x / 0` is 0 |
-| `%` | remainder, with the sign of the left side; `x % 0` is `x` |
+| `+ - * /` | arithmetic; an integer overflow stops a debug build and wraps in an optimized one (chapter 3); an integer divided by zero panics |
+| `%` | remainder, with the sign of the left side; `x % 0` panics |
 | `-x` | negation |
 | `& \| ^` | bitwise and, or, xor (on integers) |
-| `~x` | bitwise not |
 | `<< >>` | shifts; `>>` keeps the sign of a signed integer |
-| `== !=` | equal, not equal: numbers, `bool`, text, structs, enums, tuples, arrays |
+| `== !=` | equal, not equal: numbers, `bool`, text, tuples, arrays; structs and enums with `#[derive(PartialEq)]` |
 | `< <= > >=` | ordering; they don't chain (`a < b < c` is an error) |
 | `&& \|\|` | `bool` and, or; the right side runs only if needed |
-| `!x` | `bool` not; only on `bool` (on integers, use `~`) |
+| `!x` | `bool` not; on an integer, bitwise not |
 
 There's no `**` (power), no `++` or `--`, and no `?:` (an `if` is an
 expression).
@@ -96,14 +93,14 @@ allowed.
 | operator | meaning | chapter |
 |---|---|---|
 | `a..b`, `a..=b` | a range, excluding or including `b`: `for i in 0..n`; a slice: `v[1..3]` | 3, 7 |
-| `a[i]` | an element of an array, a slice, a `Vec` or a `Buf`; checked | 3, 7 |
+| `a[i]` | an element of an array, a slice or a `Vec`; checked | 3, 7 |
 | `x.f`, `t.0` | a field; a tuple's part | 3, 5 |
 | `x.m()` | a method call | 5 |
 | `T::f` | an associated function or a variant: `Player::new()`, `Option::None` | 5 |
 | `f::<T>()` | a function told its type (the *turbofish*): `s.parse::<i64>()` | 2 |
 | `e?` | the value in an `Ok` or `Some`; else return the error or `None` | 6 |
-| `&x` | at a call, marks an argument the function may change (inout); where a raw pointer is wanted, the address of `x` | 4, 15 |
-| `*p` | reads or writes through a raw pointer, in `unsafe` code only | 15 |
+| `&x`, `&mut x` | borrows `x`: a reference to read it, or to change it | 4 |
+| `*r` | what a reference points to; through a raw pointer, in `unsafe` code only | 4, 15 |
 | `\|x\| e` | a closure | 10 |
 | `=>` | separates a `match` arm's pattern from its value | 5 |
 | `->` | a function's result type | 3 |
@@ -124,7 +121,7 @@ and group left to right, except assignment, which groups right to left.
 | `+` `-` | |
 | `*` `/` `%` | |
 | `as` | `-x as f64` is `(-x) as f64`; `a * b as f64` is `a * (b as f64)` |
-| prefix `-` `!` `~` `*` `&` | |
+| prefix `-` `!` `*` `&` `&mut` | |
 | `f()` `a[i]` `x.f` `x.0` `x.m()` `e?` | |
 
 Note that `&`, `|` and `^` bind looser than `+` and `<<` but tighter
@@ -138,10 +135,10 @@ fn main() {
     let a = 6;
     let b = 4;
     println("{} {} {} {} {}", a + b * 2, (a + b) * 2, a - b - 1, a / b, a % b);
-    println("{} {} {} {} {} {}", a & b, a | b, a ^ b, ~a, 1 << 4, -16 >> 2);
+    println("{} {} {} {} {} {}", a & b, a | b, a ^ b, !a, 1 << 4, -16 >> 2);
     println("{} {} {}", a | b == 6, a + 1 << 1, -a as f64 / 4.0);
     println("{} {} {}", a > b && b > 0 || false, !(a == b), a != b);
-    var x = 1;
+    let mut x = 1;
     x += 2;
     x *= 5;
     x -= 1;
@@ -163,15 +160,17 @@ true true true
 
 | literal | type | example |
 |---|---|---|
-| integer | `i64`, or what the context needs | `42`, `1_000_000`, `0xff`, `0b1010` |
+| integer | `i32`, or what the context needs | `42`, `1_000_000`, `0xff`, `0o17`, `0b1010` |
 | integer with a suffix | the suffix's | `255u8`, `7i32`, `1_000_u64` |
 | float | `f64`, or what the context needs | `2.5`, `1e10`, `1.5e-3` |
 | float with a suffix | `f32` | `2.5f32` |
 | `bool` | `bool` | `true`, `false` |
-| byte | `u8` | `'a'`, `'\n'`, `'\x41'`, `'\''` |
-| string | `str` where one is wanted, else `[u8]` | `"hello\n"` |
-| C string | `*u8`, NUL-terminated | `c"for C"` |
-| format string | a string literal, the first argument of `println`, `format_in`, `panic` | `"{name} is {age:>3}"` |
+| character | `char` | `'a'`, `'\n'`, `'\u{e9}'`, `'\''` |
+| byte | `u8` | `b'a'`, `b'\n'`, `b'\x41'` |
+| string | `&str` | `"hello\n"` |
+| byte string | `&[u8; N]`, a reference to an array of its bytes | `b"GET "` |
+| C string | `*const u8`, NUL-terminated | `c"for C"` |
+| format string | a string literal, the first argument of `println`, `format_in`, `write`, `panic` | `"{name} is {age:>3}"` |
 | unit | `()` | `()` |
 
 Strings take the escapes `\n`, `\t`, `\r`, `\0`, `\\`, `\"`, `\'`,
@@ -179,17 +178,16 @@ Strings take the escapes `\n`, `\t`, `\r`, `\0`, `\\`, `\"`, `\'`,
 backslash at the end of a line continues the string on the next line,
 without the line break and the next line's indentation.
 
-A plain string literal is bytes, `[u8]`, unless it's used where a
-`str` is expected, as a `str` parameter or a `let s: str = "...";`.
-Then it's a `str`, which has the text methods (`trim`, `split`,
-`find`, ...). Chapter 7 explains the difference.
+A string literal is a `&str`: text that lives as long as the program
+(a `&'static str`), with the text methods (`trim`, `split`, `find`,
+...). `b"..."` is the same characters as bytes. Chapter 7 explains the
+difference.
 
 In a format string, `{name}` is replaced by a variable's text and `{}`
 by the next argument's (an expression is an argument after the string,
 never inside the braces), and a *spec* after a colon shapes it: `{x:>8}` (right-aligned in 8 columns), `{x:<8}`
 (left), `{x:08}` (zero-padded), `{x:.2}` (2 decimals), `{x:x}` (hex),
-`{x:b}` (binary), `{b:c}` (a byte as a character), `{v:?}` (the Debug
-form). `{{` and `}}` are literal braces. Chapter 7 has more.
+`{x:b}` (binary), `{v:?}` (the Debug form). `{{` and `}}` are literal braces. Chapter 7 has more.
 
 ## Attributes
 
@@ -198,7 +196,7 @@ an item.
 
 | attribute | on | meaning | chapter |
 |---|---|---|---|
-| `#[derive(Debug, Eq, Ord, Hash, Clone)]` | struct, enum | generates those traits from the fields | 5, 9 |
+| `#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]` | struct, enum | generates those traits from the fields | 5, 9 |
 | `#[repr(u8)]` (or another integer) | enum | stores the enum as that integer; variants can have `= N` | 5 |
 | `#[repr(C)]` | struct, union | C's layout, for passing to C | 15 |
 | `#[test]` | function | a test, run by `volec test` | 13 |
@@ -208,11 +206,11 @@ an item.
 | `#[pure]` | function | checked: no allocation, I/O or globals (it may still panic) | 12 |
 | `#[no_alloc]`, `#[no_io]`, `#[no_panic]` | function | checked: the function never allocates, does I/O, or panics | 12 |
 | `#[effects(io, global, ...)]` | function | checked: the function does at most these | 12 |
-| `#[views(s)]` | function | states its view summary, checked against its body | `guide views` |
 | `#[inline]`, `#[inline(never)]` | function | asks the optimizer to inline it, or not to | 16 |
 | `#[cold]` | function | rarely called: the optimizer keeps it out of the way | `guide syntax` |
 | `#[target_feature(...)]`, `#[multiversion(...)]` | function | compiled for particular CPU features | 16 |
-| `#[thread_local]` | `static var` | one copy per thread | 14 |
+| `#[thread_local]` | `static mut` | one copy per thread | 14 |
+| `#[deprecated(note = "...")]` | item | each use gets a warning with the note | `guide syntax` |
 | `#[link(...)]`, `#[link_name = "..."]` | `extern` block, function | which C library to link, and a function's C name | 15 |
 
 Until 0.26 you could see `#[sealed]` before a struct, which made its
@@ -225,23 +223,21 @@ deletes it).
 These names are available in every file without a `use`:
 
 - **Option and Result:** `Option`, `Some`, `None`, `Result`, `Ok`, `Err`.
-- **Printing:** `print`, `println`, `eprint`, `eprintln`, `format`,
-  `format_in`, `Fmt`.
-- **Text and input:** `str`, `String`, `to_string_in`, `Buf`,
-  `read_line`, `read_stdin_in`, `read_stdin`, `Scanner`, `parse_int`,
-  `trim`, `split`, `split_in`, `split_whitespace`,
-  `split_whitespace_in`.
-- **Collections and sorting:** `Vec`, `HashMap`, `BinaryHeap`,
-  `MinHeap`, `sort`, `sort_by`, `sort_stable`, `sort_stable_by`,
-  `sort_stable_in`, `sort_stable_by_in`, `cmp_of`, `eq_of`.
-- **Memory:** `Allocator`, `Gpa`, `Arena`, `ScopedArena`, `arena_scope`,
-  `Drop`, `drop`, `forget`, `needs_drop`, `Copy`.
-- **Traits:** `Add`, `Sub`, `Mul`, `Div`, `Neg`, `Eq`, `Ord`, `Hash`,
-  `Iterator`, `Display`, `Debug`, `Clone`, `From`, `Into`.
-- **Checks:** `panic`, `unreachable`, `assert`, `assert_eq`,
-  `assert_ne`, `debug_assert`.
+- **Printing and formatting:** `print`, `println`, `eprint`,
+  `eprintln`, `format_in`, `write`, `writeln`.
+- **Text and containers:** `String`, `Vec`, `Box`, and `ToStringIn`,
+  the trait behind `x.to_string_in(gpa)`.
+- **Memory:** `Gpa`, `Drop`, `drop`.
+- **Traits:** `Clone`, `Copy`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`,
+  `Default`, `From`, `Into`, `TryFrom`, `TryInto`, `AsRef`, `AsMut`,
+  `Iterator`, `IntoIterator`, `DoubleEndedIterator`,
+  `ExactSizeIterator`, `Extend`.
+- **Checks:** `panic`, `unreachable`, `todo`, `unimplemented`, `assert`,
+  `assert_eq`, `assert_ne`, `debug_assert`.
 
-Everything else in the standard library is imported by name, `use
-std::io::BufReader;`, or written as a path, `std::io::stdin()`. Your
+The built-in types (`i32`, `f64`, `bool`, `char`, `str` and the rest)
+need no import either. Everything else in the standard library is
+imported by name, `use std::collections::HashMap;`, or written as a
+path, `std::io::stdin()`. Your
 own items hide prelude names of the same spelling. `volec query items
 std` lists the whole library.

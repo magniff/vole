@@ -12,85 +12,92 @@ Read the section for the language you know best; the others are short.
 
 Vole looks like Rust on purpose: the same `fn`, `struct`, `enum`,
 `match`, `impl`, traits and generics, `Option` and `Result` with `?`,
-modules and `use`, `unsafe` and `extern "C"`. That's the good news. The
-bad news is that a few things that look the same mean something else,
-and Rust habits are the most common source of errors for a Rust
-programmer. The compiler knows this, and most of them get an error
-called `conv.rust` with the vole spelling on its `try:` line.
+modules and `use`, `unsafe` and `extern "C"`. Ownership carries over
+too: moves, `&T` and `&mut T`, lifetimes, and a borrow checker with the
+rules you know (chapter 4). What doesn't carry over is a short list,
+and the compiler's errors for Rust habits name vole's form on their
+`help:` or `try:` lines.
 
 | Rust | vole | chapter |
 |---|---|---|
-| `x: &T`, `f(&x)` | `x: T`, `f(x)`: a parameter is read-only by default (*let*) | 4 |
-| `x: &mut T`, `f(&mut x)` | `x: inout T`, `f(&x)`: `&` marks the argument that may change | 4 |
-| `x: T`, taking ownership | `x: sink T`, `f(x)` | 4 |
-| `&self`, `&mut self`, `self` | `self`, `inout self`, `sink self` | 4, 5 |
-| `let mut x` | `var x` | 3 |
-| `*r += 1` through a `&mut` | `r += 1`: an `inout` is used as the value; `*` is only for raw pointers | 4, 15 |
-| lifetimes, `'a` | none: the compiler infers what each function's result views | 4 |
-| `Box<T>`, `Rc<T>`, `Arc<T>` | none: values, a `Vec` and indices, or raw memory in `unsafe` | 8 |
-| `Vec::new()`, `String::new()`, `format!` | `Vec::new_in(gpa)`, `String::new_in(gpa)`, `to_string_in(format_args(".."), gpa)`: allocation is explicit | 8 |
-| `println!`, `vec!`, `assert!`, macros | `println("{x}")`, `assert(c)`, `assert_eq(a, b)`; there are no macros | 1, 13 |
-| `dyn Trait`, `impl Trait` arguments, `where` | generics: `fn f<T: Trait>(x: T)` | 9 |
-| overflow panics in debug builds | the same: checked at `-O0`, wrapping at `-O2`; `wrapping_add` and the rest; `x / 0` panics | 3 |
-| `char`, `'a'` | no `char` yet: `'a'` is a `u8`; a code point is a `u32` | 7 |
-| `a.cmp(&b)` returns `Ordering` | `a.cmp(b)` returns an `i64`: negative, zero or positive | 9 |
-| `'outer: loop { break 'outer; }` | `outer: loop { break :outer; }` | 3 |
-| `m.entry(k).or_insert(0)` | `m.get_or_insert(k, 0)[0] += 1` | 7 |
-| `iter_mut()` | an index loop: `for i in 0..v.len() { v[i] += 1; }` | 7 |
+| `println!`, `vec!`, `assert!`, macros | functions: `println("{x}")`, `assert(c)`, `assert_eq(&a, &b)`; there are no macros | 1, 13 |
+| `Vec::new()`, `String::new()`, `collect()`, `format!` | `Vec::new_in(gpa)`, `String::new_in(gpa)`, `collect_in(gpa)`, `format_in("{x}", gpa)`: allocation is explicit, the allocator goes last | 8 |
+| `Vec<T>`, `String`, `HashMap<K, V>` | `Vec<T, Gpa>`, `String<Gpa>`, `HashMap<K, V, Gpa>`: the allocator is part of the type, and there is no default | 8 |
+| a struct holding a `Vec` | names the allocator: `struct Log<A: Allocator> { lines: Vec<String<A>, A> }` | 8, 9 |
+| `fn main()` | `fn main(gpa: Gpa)`, for a program that allocates | 2, 8 |
+| `x as i64` to widen an `i32` | nothing: an `i32` goes where an `i64` is wanted; narrowing still takes `as` | 3 |
+| `v[i as usize]` | `v[i]`: any integer type indexes | 3 |
+| `use std::io::*;` | no wildcard imports: every name is imported by name | 2, 11 |
+| `dyn Trait` | none: generics, `fn f<T: Trait>(x: &T)`, or an enum | 9 |
+| `Rc<T>`, `Arc<T>` | not there: a `Vec` and indices, or an arena | 8 |
+| comments about what a function expects | `requires` and `ensures`, checked in every build | 13 |
 | Cargo, crates | none yet: a program is its files, and C libraries through headers | 11 |
 | bindgen | `import "header.h" as c;` | 15 |
 | `#[test]`, proptest, cargo-fuzz | `#[test]`, `#[property]`, `#[fuzz]`, run by `volec test` | 13 |
 
-The biggest difference is the first three rows. In Rust, `&x` makes a
-reference, a value you can store and return, and the borrow checker
-follows it with lifetimes. Vole has no references. A parameter says
-what the function does with its argument: reads it (the default),
-changes it (`inout`), or takes it (`sink`). That's all a caller needs to
-know, so there's nothing to annotate and no lifetime to name. Views
-(`str`, `[T]`) exist, and the compiler checks them, but you never write
-their lifetimes.
+The biggest difference is allocation. Rust has a global allocator that
+`Vec::new()` reaches for; vole has none. A function that allocates is
+given an allocator, `main` gets the program's from outside, and a
+container's type says which allocator it grows from. In return, a
+signature tells you whether a function allocates, and a part of a
+program can run on an arena or a fixed buffer (chapter 8).
 
-Here's a small Rust-shaped program, as a Rust programmer would type it
-on day one. Save it as `bump.vl`:
+Here's a small program as a Rust programmer would type it on day one:
 
-```vole bump.vl skip
-fn bump(n: &mut i64) {
-    *n += 1;
-}
-
+```vole
 fn main() {
-    let mut x = 1;
-    bump(&mut x);
-    println("{x}");
+    let mut v = Vec::new();
+    v.push(1);
+    v.push(2);
+    let total: i32 = v.iter().sum();
+    println!("{} {total}", v.len());
 }
 ```
 
-Every Rust spelling in it is an error, and every error has an exact fix.
-`volec fix --only conventions` makes them all at once:
-
-```console
-$ printf '%s\n' 'fn bump(n: &mut i64) {' '    *n += 1;' '}' '' 'fn main() {' '    let mut x = 1;' '    bump(&mut x);' '    println("{x}");' '}' > bump.vl
-$ volec fix --only conventions bump.vl
-fixed 1 parameter to inout, 1 '&mut e' to '&e', 1 '*r' of an access, 1 'let mut' / 'mut x' to var	bump.vl	+4 -4 lines
-$ cat bump.vl
-fn bump(n: inout i64) {
-    n += 1;
-}
-
-fn main() {
-    var x = 1;
-    bump(&x);
-    println("{x}");
-}
-$ volec bump.vl -o bump
-ok: built bump
-$ ./bump
-2
+```err
+error[parser error]: 'println!' is a macro call: vole has no macros
+ --> main.vl: line 6, column 5
+  = help: write `println("{} {total}", v.len())`
 ```
 
-(The first line writes the file, so that the book's tests can run this
-session.) `volec guide rust` is the full mapping, a page of tables like
-the one above.
+The `help:` line has the call without its `!`. With that fixed, the
+next error is the allocation:
+
+```vole
+fn main() {
+    let mut v = Vec::new();
+    v.push(1);
+    v.push(2);
+    let total: i32 = v.iter().sum();
+    println("{} {total}", v.len());
+}
+```
+
+```err
+error[alloc.no_in]: 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in'
+ --> main.vl: line 2, column 17
+  = help: main takes the allocator: `fn main(gpa: Gpa)`, passed down as a parameter
+  = try: volec fix --only alloc main.vl
+```
+
+And with an allocator from `main`, it runs:
+
+```vole
+fn main(gpa: Gpa) {
+    let mut v = Vec::new_in(gpa);
+    v.push(1);
+    v.push(2);
+    let total: i32 = v.iter().sum();
+    println("{} {total}", v.len());
+}
+```
+
+```out
+2 3
+```
+
+`volec guide` is the language in a couple of pages, written for a
+reader who knows Rust.
 
 ## From C and C++
 
@@ -101,11 +108,11 @@ is designed so that ordinary code can't have undefined behaviour.
 
 | C or C++ | vole | chapter |
 |---|---|---|
-| undefined behaviour: signed overflow, a bad index, an uninitialized variable | none in safe code: overflow stops a debug build and wraps in an optimized one, every index is checked, every variable is set | 3, 15 |
+| undefined behaviour: signed overflow, a bad index | none in safe code: overflow stops a debug build and wraps in an optimized one, and every index is checked | 3, 15 |
 | `malloc` and `free`, `new` and `delete` | allocators passed as parameters; values are freed when they go out of scope | 8 |
 | destructors (C++) | `impl Drop`, run at the end of the scope | 4, 15 |
-| a pointer and a length, passed separately | a slice, `[T]`, which carries its length | 7 |
-| `char *` strings | `str`, UTF-8 with a length; `c"..."` for C | 7, 15 |
+| a pointer and a length, passed separately | a slice, `&[T]`, which carries its length | 7 |
+| `char *` strings | `&str`, UTF-8 with a length; `c"..."` for C | 7, 15 |
 | `int`, `long`, `size_t` | `i32`, `i64`, `usize`; lengths and indices are `usize` | 3 |
 | `#include` and the preprocessor | `mod` and `use`; no macros | 11 |
 | exceptions (C++), error codes | `Result` and `?` | 6 |
@@ -131,19 +138,19 @@ marks the few lines where C's rules apply (chapter 15).
 
 ```vole c.vl
 // The sum of a slice: the slice knows its length.
-fn sum(xs: [i32]) -> i32 {
-    var total: i32 = 0;
+fn sum(xs: &[i32]) -> i32 {
+    let mut total: i32 = 0;
     for x in xs {
-        total = total.wrapping_add(x); // wraps: defined, unlike C's int
+        total = total.wrapping_add(*x); // wraps: defined, unlike C's int
     }
     total
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<i32, Gpa> = Vec::new_in(gpa); // freed when main ends: no free()
+    let mut v: Vec<i32, Gpa> = Vec::new_in(gpa); // freed when main ends: no free()
     v.push(2147483647);
     v.push(1);
-    println("{} {}", sum(v.as_slice()), v.len());
+    println("{} {}", sum(&v), v.len());
     let two = v.len();
     println("{} {}", 7 / two, 7 % two);
     println("{}", v[2]);
@@ -176,11 +183,11 @@ choice about memory.
 | data races found by `-race`, at run time | data races rejected by the compiler | 14 |
 | interfaces, satisfied implicitly | traits, implemented explicitly, resolved at compile time; enums for "one of several types" | 5, 9 |
 | generics | generics, specialized for each type (no boxing) | 9 |
-| slices that share an array | `[T]` views, which can't outlive or see changes to what they view | 4 |
-| `defer` | a guard, a struct whose `Drop` cleans up, made where the defer was (`volec guide memory`); `defer` itself is removed in 0.26.2 | 4, 15 |
+| slices that share an array | `&[T]` slices, which borrow: they can't outlive what they borrow from, and it can't change while they're in use | 4 |
+| `defer` | a guard, a struct whose `Drop` cleans up, made where the defer was (`volec guide memory`); there is no `defer` | 4, 15 |
 | `go fmt`, `go vet` | `volec fmt`, and the compiler's own checks | 17 |
 | modules and packages | modules (`mod`, `use`, `pub`); no packages yet | 11 |
-| zero values | every variable is set when it's declared | 3 |
+| zero values | none: a variable holds the value the program gave it | 3 |
 
 The trade is this: Go makes memory easy by collecting it for you, at the
 cost of a collector running alongside your program. Vole makes you pass
@@ -192,7 +199,7 @@ instead (chapter 8).
 Here is Go's most common pattern, returning an error up the call
 chain, with a few threads sending results down a channel:
 
-```vole go.vl
+```vole go.vl mvs
 use std::thread;
 use std::sync::mpsc;
 
@@ -256,8 +263,8 @@ without a collector.
 | Python, JavaScript, Java | vole | chapter |
 |---|---|---|
 | types checked at run time (Python, JavaScript) | types checked by the compiler; most are inferred, so you write few | 3 |
-| `b = a` shares one list | `var b = a;` moves a `Vec` into `b`; `a.clone()` copies it | 4 |
-| a function can change any object you pass it | only an `inout` parameter can, and the call says so: `f(&x)` | 4 |
+| `b = a` shares one list | `let b = a;` moves a `Vec` into `b`; `a.clone()` copies it | 4 |
+| a function can change any object you pass it | only through a `&mut` parameter, and the call says so: `f(&mut x)` | 4 |
 | exceptions, `try`/`except` | `Result` and `?`; a `panic` for bugs | 6 |
 | `None`, `null`, `undefined` | `Option<T>`: `Some(x)` or `None`, and the compiler makes you handle both | 6 |
 | a garbage collector | values are freed when they go out of scope | 8 |
@@ -268,34 +275,34 @@ without a collector.
 
 The second row is the one to watch. In Python, after `b = a`, both
 names refer to the same list, and a change through one shows through
-the other. In vole, a `Vec` has one owner. `var b = a;` moves it, and
+the other. In vole, a `Vec` has one owner. `let mut b = a;` moves it, and
 using `a` afterwards is an error:
 
 ```vole
 fn main(gpa: Gpa) {
-    var a: Vec<i64, Gpa> = Vec::new_in(gpa);
+    let mut a: Vec<i64, Gpa> = Vec::new_in(gpa);
     a.push(1);
-    var b = a;
+    let mut b = a;
     b.push(2);
     println("{} {}", a.len(), b.len());
 }
 ```
 
 ```err
-error[own.moved]: 'a' is used here after it moved at 4:13
+error[borrowck.use_moved]: 'a' is used here after it moved (moved at main.vl: line 4, column 17)
  --> main.vl: line 6, column 22
-  = help: use it before the move, pass a copy where it moves ('.clone()'), or let the callee read it: a let parameter ('x: T'), not 'sink'
-  = try: volec edit patch main.vl:4 --old 'var b = a;' --new 'var b = a.clone();'
+  = help: use it before the move, pass a clone where it moves, or take it by reference
+  = try: volec edit patch main.vl:4 --old 'let mut b = a;' --new 'let mut b = a.clone();'
 ```
 
-Following the `try:` line, `var b = a.clone();` makes `b` a copy, and
+Following the `try:` line, `let mut b = a.clone();` makes `b` a copy, and
 the two lists are independent:
 
 ```vole
 fn main(gpa: Gpa) {
-    var a: Vec<i64, Gpa> = Vec::new_in(gpa);
+    let mut a: Vec<i64, Gpa> = Vec::new_in(gpa);
     a.push(1);
-    var b = a.clone();
+    let mut b = a.clone();
     b.push(2);
     println("{} {}", a.len(), b.len());
 }
@@ -307,6 +314,6 @@ fn main(gpa: Gpa) {
 
 Nothing is shared by accident, so a function that reads a value can't
 change it behind your back, and two threads can't race on it. When you
-do want a function to change a value, `inout` and `&` say so in both the
+do want a function to change a value, `&mut` says so in both the
 signature and the call. Chapter 4 explains the whole idea; it's the one
 chapter worth reading slowly.
