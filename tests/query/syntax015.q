@@ -5,8 +5,11 @@
 $ items
 crate	syntax015/main.vl	6
 std	<std>	607
+## effects: carries alloc(Gpa, ArenaScope<Gpa>) from every fmt::Write impl
+## instance in std (gap: dyn Write's join is over all instances, gated modules
+## included); to be re-recorded when the join is limited to reachable instances.
 $ show main
-// crate::main	syntax015/main.vl:25-31	effects: io panic diverge
+// crate::main	syntax015/main.vl:25-31	effects: alloc(Gpa, ArenaScope<Gpa>) io panic diverge
 fn main() -> Option<i64> {
     let x = half(8)?;
     let y = area(x, h: 2);
