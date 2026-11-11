@@ -523,7 +523,7 @@ fn main() {
 
 ```out exit=101
 port 8080
-port.vl:2:5: called `Result::unwrap()` on an `Err` value
+port.vl:2:5: called `Result::unwrap()` on an `Err` value: ParseIntError { kind: InvalidDigit }
 ```
 
 The line names the position of the failing call (line 2, the `unwrap`
@@ -537,7 +537,7 @@ $ volec port.vl -o port --trace
 ok: built port
 $ ./port
 port 8080
-port.vl:2:5: called `Result::unwrap()` on an `Err` value
+port.vl:2:5: called `Result::unwrap()` on an `Err` value: ParseIntError { kind: InvalidDigit }
 trace, innermost call first:
   port.vl:2  port_of
   port.vl:6  show

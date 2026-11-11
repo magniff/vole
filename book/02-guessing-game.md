@@ -273,7 +273,7 @@ ok: built guess
 $ echo seven | ./guess
 Guess the number!
 Please input your guess.
-guess.vl:11:17: called `Result::unwrap()` on an `Err` value
+guess.vl:11:17: called `Result::unwrap()` on an `Err` value: ParseIntError { kind: InvalidDigit }
 $ echo $?
 101
 ```
