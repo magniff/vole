@@ -24,7 +24,8 @@ work is in [agent-tool-usage.md](agent-tool-usage.md), "0.14".
   Together: 2,219 tool calls in 2,154 turns, with 405M tokens of
   context read (input plus cache), so **188k tokens per turn**. Only
   aggregates were taken from them.
-- **The 0.13 agent-eval baseline transcripts**: Haiku and Sonnet, 12
+- **The 0.13 agent-eval baseline transcripts** (the harness, tests/agent-eval,
+  was deleted at 0.28.0): Haiku and Sonnet, 12
   tasks, conditions bare, guide, tools, both and Rust; 120 runs. In the
   tools condition, each turn re-reads **17.8k tokens (Sonnet)** or
   **25.3k (Haiku)** of context.

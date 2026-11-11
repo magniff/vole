@@ -1,6 +1,10 @@
 # Agent eval reports
 
-Results of the agent eval ([tests/agent-eval](../../tests/agent-eval/README.md)):
+The agent eval's harness (tests/agent-eval) and the GPU eval's programs
+(evals/) were deleted at 0.28.0 with the MVS edition they were written
+in; this page and the reports are the record, as written then.
+
+Results of the agent eval:
 how well coding agents write tachyon with no help (`bare`), with the
 guide inlined (`guide`), with the tools table (`tools`), with both
 (`both`), against the same tasks in Rust (`rust`).
