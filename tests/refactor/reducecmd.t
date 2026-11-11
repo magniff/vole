@@ -21,14 +21,16 @@ fn main() -> i32 {
 13
 ## --fails TEXT: its build or run prints TEXT
 $ reduce crash.vl --fails 'index out of bounds'
-reduced crash.vl: 21 lines to 9 in 35 runs; written to crash.min.vl
-fn last(v: [i64]) -> i64 {
-    v[v.len]
+reduced crash.vl: 22 lines to 11 in 40 runs; written to crash.min.vl
+// EDITION: rust
+
+fn last(v: &[i64]) -> i64 {
+    v[v.len()]
 }
 
 fn main() -> i32 {
     let b = [4, 5];
-    println("{}", last(b[..]));
+    println("{}", last(&b[..]));
     0
 }
 ## nothing to keep

@@ -22,10 +22,11 @@ An entry is:
   mvs-block a block or session marked `mvs` in a rust chapter (PATH:LINE)
 
 A module file is the rust edition's when one rust root reaches it; a file
-no root reaches is its own root (the texts tests feed to `edit`, under
-inputs/ and texts/, are such files: they are read with the program they
-are put into, so they are listed only when they use MVS's words: `var`,
-`inout`, `sink`, `defer`, `self: *T`).
+no root reaches is its own root. One without a `fn main`, or under inputs/
+or texts/ (a text a test feeds to `edit`, a module a step adds, a file
+left out on purpose), is read with the program it is put into: it is
+listed only when it uses MVS's words (`var`, `inout`, `sink`, `defer`,
+`self: *T`, a `[T]` parameter or result, `.len` without a call, `*T`).
 
 The allow-list (default tools/mvs-census.allow) has one path or path
 prefix per line (`#` comments; a prefix ends with `/`); an entry under it
@@ -35,8 +36,7 @@ of the whole path).
 Owners: mig28 (book, examples, guide, bench, the editor samples), d4 (the
 old std and its copies in tests), d5 (the translator's transcripts), gpu
 (the gpu port: tests/gpu, window, voltty-render, two tools), del280 (the
-other tests, tools/numtables), other (evals/ and tests/agent-eval/: the
-user's call, not to be touched).
+other tests, tools/numtables), other (anything else).
 """
 import fnmatch
 import os
@@ -51,7 +51,10 @@ OLD_STD = re.compile(r"^// ENV: VOLE_STD2=0\s*$", re.M)
 MOD = re.compile(r"(?:^|[;{}])\s*(?:pub(?:\([a-z]+\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;", re.M)
 # MVS's words, for a text no root reaches
 MVS_WORDS = re.compile(
-    r"^\s*(?:pub\s+)?(?:static\s+)?var\s+[a-z_]|\b(?:inout|sink)\s+[A-Za-z_&*\[(]|^\s*defer\s|\bself:\s*\*", re.M)
+    r"^\s*(?:pub\s+)?(?:static\s+)?var\s+[a-z_]|\b(?:inout|sink)\s+[A-Za-z_&*\[(]|^\s*defer\s|\bself:\s*\*"
+    r"|[(,]\s*[a-z_][a-z0-9_]*:\s*\[[A-Za-z0-9_]+\]\s*[,)]|\)\s*->\s*\[[A-Za-z0-9_]+\]\s*\{|\.len\b(?!\s*\()"
+    r"|:\s*\*(?!const\b|mut\b)[A-Za-z]", re.M)
+MAIN = re.compile(r"\bfn\s+main\s*\(")
 
 
 def read(path):
@@ -61,12 +64,13 @@ def read(path):
 
 def tracked():
     out = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True).stdout
-    return [p for p in out.decode().split("\0") if p]
+    return [p for p in out.decode().split("\0") if p and os.path.isfile(os.path.join(ROOT, p))]
 
 
 def owner(path):
     top = path.split("/")
-    if path.startswith(("compiler/std/", "tests/refactor/stdedit/", "tests/query/stdpos0253/")):
+    if path.startswith(("compiler/std/", "tests/refactor/stdedit/", "tests/query/stdpos0253/",
+                        "tests/refactor/inputs/strip_prefix")):
         return "d4"
     if path.startswith(("tests/gpu/", "tests/window/", "tests/voltty-render/", "tools/objcgen/", "tools/wgslc/")):
         return "gpu"
@@ -74,7 +78,7 @@ def owner(path):
         return "mig28"
     if path.startswith(("tests/translate", "tests/flip28", "tests/refactor/edition0")):
         return "d5"
-    if path.startswith("tools/numtables/") or (top[0] == "tests" and top[1] != "agent-eval"):
+    if path.startswith("tools/numtables/") or top[0] == "tests":
         return "del280"
     return "other"
 
@@ -137,10 +141,11 @@ def programs(paths):
             entries.append(("std", p, ""))
             continue
         parts = p.split("/")
-        if p in roots and ("inputs" in parts or "texts" in parts):
-            # a text fed to an edit: MVS only by its words
+        if p in roots and ("inputs" in parts or "texts" in parts or not MAIN.search(text[p])):
+            # a text fed to an edit, a module a step adds, a file left out
+            # on purpose (no `fn main`): MVS only by its words
             if MVS_WORDS.search(text[p]):
-                entries.append(("program", p, "edit text"))
+                entries.append(("program", p, "text"))
             continue
         entries.append(("program", p, "root" if p in roots else "module"))
     for r in old_std:

@@ -89,7 +89,7 @@ else
     # which only its root says (a fmt before 0.28.0 reads a file alone)
     flipped=
     grep -q '^// EDITION: rust *$' compiler/src/main.vl 2>/dev/null && flipped=1
-    for f in $(printf '%s\n' "$CHANGED" | grep '\.vl$' | grep -v -e '^tests/' -e '^evals/' | grep -v 'front/stdsrc\.vl$'); do
+    for f in $(printf '%s\n' "$CHANGED" | grep '\.vl$' | grep -v -e '^tests/' | grep -v 'front/stdsrc\.vl$'); do
         ed=
         case "$f" in compiler/src/*) [ -n "$flipped" ] && ed="--edition rust" ;; esac
         # shellcheck disable=SC2086
