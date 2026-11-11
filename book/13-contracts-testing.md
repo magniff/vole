@@ -203,9 +203,10 @@ error[contract.effect]: the 'requires' of 'first' calls 'checked', which does io
 ### Assertions
 
 Inside a body, `assert(cond)`, `assert(cond, "message")`,
-`assert_eq(&a, &b)` and `assert_ne(&a, &b)` check a condition at that
-point, and stop the program the same way when it doesn't hold, with
-exit status 101. You'll use them in tests in a moment.
+`assert_eq(a, b)` and `assert_ne(a, b)` check a condition at that
+point, and fail the same way: one line with the position, the condition
+or message, and the values, then exit 101. You'll use them in tests in a
+moment.
 
 > **If you know Eiffel, Ada/SPARK or Dafny:** these are run-time
 > checks, not proofs. The compiler doesn't try to prove a contract
@@ -401,8 +402,8 @@ fn first_in_first_out(gpa: Gpa) {
     let mut r = Ring::new(3, gpa);
     r.push(1);
     r.push(2);
-    assert_eq(&r.pop(), &1);
-    assert_eq(&r.pop(), &2);
+    assert_eq(r.pop(), 1);
+    assert_eq(r.pop(), 2);
 }
 
 #[test]
@@ -410,10 +411,10 @@ fn wraps_around(gpa: Gpa) {
     let mut r = Ring::new(2, gpa);
     r.push(1);
     r.push(2);
-    assert_eq(&r.pop(), &1);
+    assert_eq(r.pop(), 1);
     r.push(3);
-    assert_eq(&r.get(0), &2);
-    assert_eq(&r.get(1), &3);
+    assert_eq(r.get(0), 2);
+    assert_eq(r.get(1), 3);
 }
 
 #[property]
@@ -423,7 +424,7 @@ fn pop_gives_back_what_push_put(xs: Vec<i64, Gpa>, gpa: Gpa) {
         let mut next = 0;
         for &x in &xs {
             if r.is_full() {
-                assert_eq(&r.pop(), &xs[next]);
+                assert_eq(r.pop(), xs[next]);
                 next += 1;
             }
             r.push(x);
@@ -508,7 +509,7 @@ fn pop_gives_back_what_push_put(xs: Vec<i64, Gpa>, gpa: Gpa) {
         let mut next = 0;
         for &x in &xs {
             if r.is_full() {
-                assert_eq(&r.pop(), &xs[next]);
+                assert_eq(r.pop(), xs[next]);
                 next += 1;
             }
             r.push(x);
@@ -670,7 +671,7 @@ fn double(x: i64) -> i64 {
 
 #[test]
 fn doubles(x: i64) {
-    assert_eq(&double(x), &(x + x));
+    assert_eq(double(x), x + x);
 }
 
 fn main() {
