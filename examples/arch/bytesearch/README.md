@@ -17,7 +17,7 @@ are the first match.
 let eq = vceqq_u8(vld1q_u8(s, i), needle);
 let m = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq), 4)), 0);
 if m != 0 {
-    return i + trailing_zeros(m) / 4;
+    return i + m.trailing_zeros() as i64 / 4;
 }
 ```
 
@@ -61,10 +61,10 @@ be called under `detect("sse2")` (or `has`), where it is dead code:
 
 ```console
 $ volec query def find_byte_neon find_byte_sse2 find_byte
-crate::find_byte_neon	main.vl:32:4	fn	fn find_byte_neon(s: [u8], b: u8, from: i64) -> i64	effects: panic diverge
-crate::find_byte_sse2	main.vl:58:4	fn	fn find_byte_sse2(s: [u8], b: u8, from: i64) -> i64	effects: panic diverge	features: sse2 (inferred)
-crate::find_byte	main.vl:74:4	fn	fn find_byte(s: [u8], b: u8) -> i64	effects: panic diverge
-std::string::find_byte	<std>:44082:4	fn	fn find_byte(b: u8, s: [u8], from: i64) -> i64	effects: panic diverge
+crate::find_byte_neon	main.vl:33:4	fn	fn find_byte_neon(s: &[u8], b: u8, from: i64) -> i64	effects: panic diverge
+crate::find_byte_sse2	main.vl:59:4	fn	fn find_byte_sse2(s: &[u8], b: u8, from: i64) -> i64	effects: panic diverge	features: sse2 (inferred)
+crate::find_byte	main.vl:75:4	fn	fn find_byte(s: &[u8], b: u8) -> i64	effects: panic diverge
+std::str::find_byte	<std>:8673:4	fn	fn find_byte(b: &[u8], x: u8) -> Option<usize>	effects: panic diverge
 ```
 
 ## Timings
