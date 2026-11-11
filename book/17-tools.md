@@ -197,9 +197,9 @@ pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa>, n: usize, order: Order, gpa:
     pairs
 }
 // calls (9)
-<std::string::String as Clone>::clone	<std>:L:C	method	fn clone(&self) -> String<A>
 crate::report::by_count	report.vl:27:4	fn	fn by_count(a: &(String<Gpa>, i64), b: &(String<Gpa>, i64)) -> Ordering
 <&'a HashMap<K, V, A, S> as IntoIterator>::into_iter	<std>:L:C	method	fn into_iter(self) -> Iter<'a, K, V>
+<std::string::String as Clone>::clone	<std>:L:C	method	fn clone(&self) -> String<A>
 std::vec::Vec::sort_by	<std>:L:C	method	pub fn sort_by<F: FnMut(&T, &T) -> Ordering>(&mut self, compare: F)
 <std::string::String as Ord>::cmp	<std>:L:C	method	fn cmp(&self, other: &String<A>) -> Ordering
 <std::collections::hash_map::Iter as Iterator>::next	<std>:L:C	method	fn next(&mut self) -> Option<(&'a K, &'a V)>

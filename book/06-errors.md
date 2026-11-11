@@ -78,10 +78,10 @@ want to know what went wrong. That's `Result<T, E>`: either `Ok(value)`,
 holding a `T`, or `Err(error)`, holding an `E` that describes the
 failure. Parsing a number is the classic example:
 
-```vole mvs
+```vole
 fn main() {
-    let good: str = "8080";
-    let bad: str = "80x80";
+    let good = "8080";
+    let bad = "80x80";
     match good.parse::<i64>() {
         Ok(n) => println("got {n}"),
         Err(e) => println("error: {e}"),
@@ -95,13 +95,13 @@ fn main() {
 
 ```out
 got 8080
-error: invalid digit at byte 2
+error: invalid digit found in string
 ```
 
 `parse::<i64>()` returns a `Result<i64, ParseIntError>`. `ParseIntError`
-is the standard library's enum of the ways parsing an integer can fail:
-an empty string, a byte that isn't a digit, or a number too big for the
-type. It knows how to print itself, which is what `{e}` did.
+is the standard library's type for the ways parsing an integer can fail:
+an empty string, a character that isn't a digit, or a number too big for
+the type. It knows how to print itself, which is what `{e}` did.
 
 Option means absent, Result means failed. The standard library follows
 this rule throughout, and your code should too. A key missing from a
@@ -114,8 +114,8 @@ Our settings parser can fail in several ways, so let's give it an
 error enum, with one variant for each way, and the facts a user would
 need to fix the file:
 
-```vole settings.vl mvs
-use std::ParseIntError;
+```vole settings.vl
+use std::num::ParseIntError;
 
 enum ConfigError {
     MissingEquals(i64),
@@ -123,12 +123,12 @@ enum ConfigError {
     Unknown(i64),
 }
 
-enum Setting {
+enum Setting<'a> {
     Port(i64),
-    Name(str),
+    Name(&'a str),
 }
 
-fn parse_line(s: str, number: i64) -> Result<Setting, ConfigError> {
+fn parse_line(s: &str, number: i64) -> Result<Setting, ConfigError> {
     let Some((key, value)) = s.split_once("=") else {
         return Err(ConfigError::MissingEquals(number));
     };
@@ -146,7 +146,7 @@ fn parse_line(s: str, number: i64) -> Result<Setting, ConfigError> {
     }
 }
 
-fn report(line: str, number: i64) {
+fn report(line: &str, number: i64) {
     match parse_line(line, number) {
         Ok(Setting::Port(p)) => println("port {p}"),
         Ok(Setting::Name(n)) => println("name {n}"),
@@ -166,11 +166,13 @@ fn main() {
 
 ```out
 port 8080
-bad number: invalid digit at byte 2
+bad number: invalid digit found in string
 line 3: no '='
 line 4: unknown setting
 ```
 
+`Setting<'a>` has a lifetime, as `Command<'a>` had in chapter 5: a
+`Name` borrows its text from the line it was parsed from.
 `MissingEquals` and `Unknown` carry the line number. `BadNumber`
 carries the `ParseIntError` itself, so nothing about the failure is
 lost. And the `match` in `report` must handle every variant, so a caller
@@ -199,7 +201,7 @@ Put `?` after a `Result`, and:
 Here's `load` with it:
 
 <!-- vole-hidden
-use std::ParseIntError;
+use std::num::ParseIntError;
 
 enum ConfigError {
     MissingEquals(i64),
@@ -207,12 +209,12 @@ enum ConfigError {
     Unknown(i64),
 }
 
-enum Setting {
+enum Setting<'a> {
     Port(i64),
-    Name(str),
+    Name(&'a str),
 }
 
-fn parse_line(s: str, number: i64) -> Result<Setting, ConfigError> {
+fn parse_line(s: &str, number: i64) -> Result<Setting, ConfigError> {
     let Some((key, value)) = s.split_once("=") else {
         return Err(ConfigError::MissingEquals(number));
     };
@@ -230,12 +232,12 @@ fn parse_line(s: str, number: i64) -> Result<Setting, ConfigError> {
     }
 }
 -->
-```vole mvs
-struct Config { port: i64, name: str }
+```vole
+struct Config<'a> { port: i64, name: &'a str }
 
-fn load(text: str) -> Result<Config, ConfigError> {
-    var config = Config { port: 80, name: "unnamed" };
-    var number = 0;
+fn load(text: &str) -> Result<Config, ConfigError> {
+    let mut config = Config { port: 80, name: "unnamed" };
+    let mut number = 0;
     for line in text.lines() {
         number += 1;
         if line.trim() == "" {
@@ -286,8 +288,8 @@ Look back at `parse_line`. It still has a `match` to turn the
 `ParseIntError` from `parse` into a `ConfigError`. Can we use `?`
 there too? Let's try:
 
-```vole mvs
-use std::ParseIntError;
+```vole
+use std::num::ParseIntError;
 
 enum ConfigError {
     MissingEquals(i64),
@@ -295,7 +297,7 @@ enum ConfigError {
     Unknown(i64),
 }
 
-fn parse_port(value: str) -> Result<i64, ConfigError> {
+fn parse_port(value: &str) -> Result<i64, ConfigError> {
     let port = value.parse::<i64>()?;
     Ok(port)
 }
@@ -320,7 +322,7 @@ tell it with an `impl From`, and the help line has written it out for
 you:
 
 <!-- vole-hidden
-use std::ParseIntError;
+use std::num::ParseIntError;
 
 enum ConfigError {
     MissingEquals(i64),
@@ -328,7 +330,7 @@ enum ConfigError {
     Unknown(i64),
 }
 -->
-```vole mvs
+```vole
 impl From<ParseIntError> for ConfigError {
     fn from(e: ParseIntError) -> ConfigError {
         ConfigError::BadNumber(e)
@@ -354,7 +356,7 @@ one place, convert by hand. `map_err` changes the error inside a
 error a `None` is:
 
 <!-- vole-hidden
-use std::ParseIntError;
+use std::num::ParseIntError;
 
 enum ConfigError {
     MissingEquals(i64),
@@ -362,13 +364,13 @@ enum ConfigError {
     Unknown(i64),
 }
 
-enum Setting {
+enum Setting<'a> {
     Port(i64),
-    Name(str),
+    Name(&'a str),
 }
 -->
-```vole mvs
-fn parse_port_line(s: str, number: i64) -> Result<Setting, ConfigError> {
+```vole
+fn parse_port_line(s: &str, number: i64) -> Result<Setting, ConfigError> {
     let (key, value) = s.split_once("=").ok_or(ConfigError::MissingEquals(number))?;
     if key.trim() != "port" {
         return Err(ConfigError::Unknown(number));
@@ -386,9 +388,9 @@ work all the way up. When `main` returns an `Err`, the program prints
 the type needs `#[derive(Debug)]`, as in chapter 5. Here's the whole
 program, reading the settings from standard input:
 
-```vole settings.vl mvs
-use std::{ParseIntError, io};
-use std::io::BufReader;
+```vole settings.vl
+use std::io;
+use std::num::ParseIntError;
 
 #[derive(Debug)]
 enum ConfigError {
@@ -403,14 +405,14 @@ impl From<ParseIntError> for ConfigError {
     }
 }
 
-enum Setting {
+enum Setting<'a> {
     Port(i64),
-    Name(str),
+    Name(&'a str),
 }
 
-struct Config { port: i64, name: str }
+struct Config<'a> { port: i64, name: &'a str }
 
-fn parse_line(s: str, number: i64) -> Result<Setting, ConfigError> {
+fn parse_line(s: &str, number: i64) -> Result<Setting, ConfigError> {
     let Some((key, value)) = s.split_once("=") else {
         return Err(ConfigError::MissingEquals(number));
     };
@@ -425,9 +427,9 @@ fn parse_line(s: str, number: i64) -> Result<Setting, ConfigError> {
     }
 }
 
-fn load(text: str) -> Result<Config, ConfigError> {
-    var config = Config { port: 80, name: "unnamed" };
-    var number = 0;
+fn load(text: &str) -> Result<Config, ConfigError> {
+    let mut config = Config { port: 80, name: "unnamed" };
+    let mut number = 0;
     for line in text.lines() {
         number += 1;
         if line.trim() == "" {
@@ -442,16 +444,14 @@ fn load(text: str) -> Result<Config, ConfigError> {
 }
 
 fn main(gpa: Gpa) -> Result<(), ConfigError> {
-    var input = BufReader::new(io::stdin());
-    var text = String::new_in(gpa);
-    while input.read_line(&text).unwrap() > 0 {}
+    let mut text = String::new_in(gpa);
+    while io::stdin().read_line(&mut text).unwrap() > 0 {}
     let config = load(text.as_str())?;
     println("serving {} on port {}", config.name, config.port);
     Ok(())
 }
 ```
 
-The first `use` line imports two names from `std` at once.
 `read_line` adds each line to the end of `text`, so the empty `while`
 loop reads the whole input. (Reading can fail too; we `unwrap` it here,
 and the first exercise fixes that.) A good settings file:
@@ -468,11 +468,11 @@ serving vole on port 8080
 
 And a few bad ones:
 
-```console mvs
+```console
 $ volec settings.vl -o settings
 ok: built settings
 $ printf 'port = 80x80\n' | ./settings
-Error: BadNumber(InvalidDigit(2))
+Error: BadNumber(ParseIntError { kind: InvalidDigit })
 $ echo $?
 1
 $ printf 'name = vole\ncolour = red\n' | ./settings
@@ -597,20 +597,20 @@ them for you. `assert` checks a condition and panics if it's false:
 fn main() {
     let workers = 3;
     let per_worker = 10;
-    let total = workers * per_worker;
-    assert_eq(&total, &30);
+    assert_eq(workers * per_worker, 30);
     assert(workers > 4, "need more than four workers");
     println("not reached");
 }
 ```
 
 ```out exit=101
-main.vl:6:5: need more than four workers: workers = 3
+main.vl:5:5: need more than four workers: workers = 3
 ```
 
-`assert_eq(&a, &b)` checks that two values are equal (it borrows both,
-so each gets a `&`); `assert(c, "message")` checks a condition, with a
-message for when it fails.
+`assert_eq(a, b)` checks that two values are equal; `assert(c,
+"message")` checks a condition, with a message for when it fails. The
+failure line shows the values of the numbers in the condition, which is
+often all you need to see what went wrong.
 
 A function can state what it needs from its caller, with `requires`
 between its signature and its body:

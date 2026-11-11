@@ -20,7 +20,7 @@ and the compiler's errors for Rust habits name vole's form on their
 
 | Rust | vole | chapter |
 |---|---|---|
-| `println!`, `vec!`, `assert!`, macros | functions: `println("{x}")`, `assert(c)`, `assert_eq(&a, &b)`; there are no macros | 1, 13 |
+| `println!`, `vec!`, `assert!`, macros | functions: `println("{x}")`, `assert(c)`, `assert_eq(a, b)`; there are no macros | 1, 13 |
 | `Vec::new()`, `String::new()`, `collect()`, `format!` | `Vec::new_in(gpa)`, `String::new_in(gpa)`, `collect_in(gpa)`, `format_in("{x}", gpa)`: allocation is explicit, the allocator goes last | 8 |
 | `Vec<T>`, `String`, `HashMap<K, V>` | `Vec<T, Gpa>`, `String<Gpa>`, `HashMap<K, V, Gpa>`: the allocator is part of the type, and there is no default | 8 |
 | a struct holding a `Vec` | names the allocator: `struct Log<A: Allocator> { lines: Vec<String<A>, A> }` | 8, 9 |
@@ -199,34 +199,33 @@ instead (chapter 8).
 Here is Go's most common pattern, returning an error up the call
 chain, with a few threads sending results down a channel:
 
-```vole go.vl mvs
-use std::thread;
+```vole go.vl
 use std::sync::mpsc;
+use std::thread;
 
 // Like Go's strconv.Atoi: the number, or an error to return.
-fn parse(s: str) -> Result<i64, str> {
+fn parse(s: &str) -> Result<i64, &'static str> {
     match s.parse::<i64>() {
         Ok(n) => Ok(n),
         Err(_) => Err("not a number"),
     }
 }
 
-fn sum_of_squares(words: [str], gpa: Gpa) -> Result<i64, str> {
-    var nums: Vec<i64, Gpa> = Vec::new_in(gpa);
+fn sum_of_squares(words: &[&str], gpa: Gpa) -> Result<i64, &'static str> {
+    let mut nums: Vec<i64, Gpa> = Vec::new_in(gpa);
     for w in words {
         nums.push(parse(w)?); // Go: if err != nil { return 0, err }
     }
     let total = thread::scope(|s| {
-        let (tx, rx) = mpsc::channel_in::<i64>(gpa);
-        for n in nums.as_slice() {
+        let (tx, rx) = mpsc::channel_in(gpa);
+        for &n in &nums {
             let tx = tx.clone();
-            s.spawn(sink || {
+            s.spawn(move || {
                 tx.send(n * n).unwrap();
-                0
             });
         }
         drop(tx);
-        var sum = 0;
+        let mut sum = 0;
         for x in rx.iter() {
             sum += x;
         }
@@ -236,10 +235,10 @@ fn sum_of_squares(words: [str], gpa: Gpa) -> Result<i64, str> {
 }
 
 fn main(gpa: Gpa) {
-    let good: [str; 3] = ["1", "2", "3"];
-    let bad: [str; 2] = ["1", "two"];
-    println("{:?}", sum_of_squares(good, gpa));
-    println("{:?}", sum_of_squares(bad, gpa));
+    let good = ["1", "2", "3"];
+    let bad = ["1", "two"];
+    println("{:?}", sum_of_squares(&good, gpa));
+    println("{:?}", sum_of_squares(&bad, gpa));
 }
 ```
 
