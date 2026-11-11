@@ -59,7 +59,7 @@ check() { # <name> <ok> <why>
 # embed_crlf
 d="$WORK/crlf"
 mkdir -p "$d"
-printf 'fn main() -> i32 {\r\n    let s = """\r\n        a\r\n          b \\\r\n        c\r\n\r\n        """;\r\n    print(s);\r\n    println("|");\r\n    0\r\n}\r\n' >"$d/main.vl"
+printf '// EDITION: rust\r\nfn main() -> i32 {\r\n    let s = """\r\n        a\r\n          b \\\r\n        c\r\n\r\n        """;\r\n    print("{}", s);\r\n    println("|");\r\n    0\r\n}\r\n' >"$d/main.vl"
 out=$(cd "$d" && VOLE_OK=0 "$COMPILER" main.vl -o prog 2>&1 && ./prog | od -An -c | tr -s ' ' | sed 's/ *$//')
 ok=0
 [ "$out" = ' a \n b c \n | \n' ] && ok=1
@@ -68,8 +68,8 @@ check embed_crlf "$ok" "$out"
 # embed_message
 d="$WORK/msg"
 mkdir -p "$d/gfx"
-printf 'mod gfx;\n\nfn main() -> i32 {\n    println(gfx::W);\n    0\n}\n' >"$d/main.vl"
-printf 'pub const W: [u8] = include_str("shaders/a.wgsl");\n' >"$d/gfx/mod.vl"
+printf '// EDITION: rust\nmod gfx;\n\nfn main() -> i32 {\n    println("{}", gfx::W);\n    0\n}\n' >"$d/main.vl"
+printf 'pub const W: &str = include_str("shaders/a.wgsl");\n' >"$d/gfx/mod.vl"
 out=$(cd "$d" && "$COMPILER" check main.vl 2>&1)
 ok=0
 printf '%s\n' "$out" | grep -q '^gfx/mod.vl:1:21: error\[embed.missing\] include_str("shaders/a.wgsl"): cannot read gfx/shaders/a.wgsl | help: the path is relative to the directory of gfx/mod.vl, the file that holds the call$' && ok=1
@@ -78,8 +78,8 @@ check embed_message "$ok" "$out"
 # embed_tools_cache: each `check` traced (hit, miss, save)
 d="$WORK/tools"
 mkdir -p "$d/data"
-printf 'mod data;\n\nfn main() -> i32 {\n    println(data::TEXT);\n    0\n}\n' >"$d/main.vl"
-printf 'pub const TEXT: [u8] = include_str("text.txt");\n' >"$d/data/mod.vl"
+printf '// EDITION: rust\nmod data;\n\nfn main() -> i32 {\n    println("{}", data::TEXT);\n    0\n}\n' >"$d/main.vl"
+printf 'pub const TEXT: &str = include_str("text.txt");\n' >"$d/data/mod.vl"
 printf 'one\n' >"$d/data/text.txt"
 tools_check() { # <label>: the check's first line and the cache's words, into $d/log
     : >"$d/trace"
@@ -115,7 +115,7 @@ check embed_tools_cache "$ok" "$(printf 'expected:\n%s\ngot:\n%s\n' "$want" "$go
 # other functions (std's) from the cache
 d="$WORK/code"
 mkdir -p "$d"
-printf 'const MSG: [u8] = include_str("msg.txt");\n\nfn main() -> i32 {\n    println(MSG);\n    0\n}\n' >"$d/main.vl"
+printf '// EDITION: rust\nconst MSG: &str = include_str("msg.txt");\n\nfn main() -> i32 {\n    println("{}", MSG);\n    0\n}\n' >"$d/main.vl"
 printf 'first' >"$d/msg.txt"
 code_build() { # <out> <cache: on|no>
     flag=--cache=on
