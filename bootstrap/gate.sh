@@ -98,167 +98,10 @@
 # corpus, 0.25; --release);
 # chain-fresh (bootstrap/chain-fresh.sh: the seed and every release
 # rebuilt from their tags into an empty cache, compared with
-# bootstrap/chain-hashes/, 0.25; --release);
-# translate (tests/translate.sh, 0.27.3, gate 2: the examples, bench and
-# tests/run's MVS run cases translated by `volec fix --edition rust`,
-# built in the rust edition and run, against the MVS output; one count per
-# set and the total, and the rustc twin of what round-trips (the stable
-# shim, tools/rustc-twin/); informational until 0.27.4: it prints both
-# N's and never fails; --release);
-# gate3 (tests/gate3.sh, 0.27.4, gate 3: a copy of compiler/src
-# translated by `volec fix --edition rust` and checked in the rust
-# edition, its N errors by code; informational, N goes into every
-# release's notes and 0.28 starts at 0: it fails only when the translator
-# or the check cannot run; (0.28.0) on the flipped compiler/src it checks
-# a fixed point: the translator leaves it as it is and it checks with no
-# error, else it fails; --release);
-# linux-x86_64 (bootstrap/linux-check.sh); linux-aarch64
-# (bootstrap/aarch64-linux-check.sh: in the container, the fixpoint,
-# the suite at -O0 and -O2 (0.25.2: not -O1; the optimizer is the same
-# for every target and -O1 runs on macOS, while what is Linux's own, the
-# ABI, libc and the link, -O0 and -O2 exercise), fuzz, ABI, objcheck,
-# debug, (--release) valgrind; the longest started first);
-# linux-smoke (0.25.2, --quick: aarch64-linux-check.sh --smoke, the
-# cross-built compiler on the container's smoke-* steps: the runner's
-# self-test, the language server, the examples' builds, every case and
-# the walkthroughs' and book's sessions; a few minutes beside the macOS
-# steps); bench.
-#
-# (0.25.2) One gate at a time: a second one waits for the first, saying
-# whose it is (or, with --no-wait, fails). A step whose processes neither
-# use the CPU nor change for $VOLE_GATE_STALL seconds (default 600) is
-# stopped and fails, with the free slots of the pool: a hang (a slot lost
-# by a killed job) is reported, not waited for.
-#
-# Logs: target/gate/<date>/ (target/gate/last), one STEP.log per step;
-# failing random programs are kept in failures/STEP/ there.
-#
-# Inside the Linux containers the check scripts run the host's steps with
-# `gate.sh --inside -c COMPILER --only ...`, which prints the rows for the
-# outer table too.
-
-set -u
-LC_ALL=C
-export LC_ALL
-# (0.18.1) The steps build without the code cache (back::codecache), but
-# the incremental step and the suite at -O2 (a smoke row: its cache in the
-# run's directory, removed after).
-VOLE_CODE_CACHE=off
-export VOLE_CODE_CACHE
-
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
-GATE_ARGS="$*"
-MODE=default
-# (0.16) Each test program may run for a minute, not 20 s: the gate runs
-# its steps side by side with the containers, and the heavier examples
-# (algorithms at -O0) took longer than 20 s on a loaded machine. A hang
-# is still caught.
-VOLE_TEST_TIMEOUT=${VOLE_TEST_TIMEOUT:-60}
-export VOLE_TEST_TIMEOUT
-LINUX=1
-# (0.15) x86_64: bootstrap/gate.conf's X86, then $VOLE_GATE_X86, then
-# --no-x86/--with-x86
-X86=1
-[ ! -f "$ROOT/bootstrap/gate.conf" ] || X86=$(sed -n 's/^X86=\([01]\)$/\1/p' "$ROOT/bootstrap/gate.conf" | tail -1)
-[ -n "$X86" ] || X86=1
-[ -z "${VOLE_GATE_X86:-}" ] || X86=$VOLE_GATE_X86
-ONLY=""
-BENCH=0
-JOBS=""
-CPUS=8
-FUZZ_N=""
-ABI_N=""
-HISTORY=fast
-FRESH=0
-COMPILER=""
-INSIDE=0
-SEED_BIN=""
-LIST=0
-NO_WAIT=0
-SELF_TEST=0
-
-die() {
-    echo "gate: error: $*" >&2
-    exit 2
-}
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --quick) MODE=quick ;;
-        --release) MODE=release ;;
-        --no-linux) LINUX=0 ;;
-        --no-x86) X86=0 ;;
-        --with-x86) X86=1 ;;
-        --only) [ $# -ge 2 ] || die "--only needs steps"; ONLY=$2; shift ;;
-        --only=*) ONLY=${1#--only=} ;;
-        --bench) BENCH=1 ;;
-        -j) [ $# -ge 2 ] || die "-j needs a number"; JOBS=$2; shift ;;
-        -j*) JOBS=${1#-j} ;;
-        --cpus) [ $# -ge 2 ] || die "--cpus needs a number"; CPUS=$2; shift ;;
-        --cpus=*) CPUS=${1#--cpus=} ;;
-        --fuzz) [ $# -ge 2 ] || die "--fuzz needs a number"; FUZZ_N=$2; shift ;;
-        --fuzz=*) FUZZ_N=${1#--fuzz=} ;;
-        --abi) [ $# -ge 2 ] || die "--abi needs a number"; ABI_N=$2; shift ;;
-        --abi=*) ABI_N=${1#--abi=} ;;
-        --history) [ $# -ge 2 ] || die "--history needs fast or full"; HISTORY=$2; shift ;;
-        --history=*) HISTORY=${1#--history=} ;;
-        --fresh) FRESH=1 ;;
-        -c) [ $# -ge 2 ] || die "-c needs a compiler"; COMPILER=$2; shift ;;
-        --seed) [ $# -ge 2 ] || die "--seed needs a binary"; SEED_BIN=$2; shift ;;
-        --inside) INSIDE=1; LINUX=0 ;;
-        --list) LIST=1 ;;
-        --no-wait) NO_WAIT=1 ;;
-        --self-test) SELF_TEST=1 ;;
-        -h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
-        *) die "unknown option '$1' (see --help)" ;;
-    esac
-    shift
-done
-case "$HISTORY" in fast|full) ;; *) die "--history is fast or full" ;; esac
-case "$X86" in 0|1) ;; *) die "X86 (bootstrap/gate.conf, \$VOLE_GATE_X86) is 0 or 1, not '$X86'" ;; esac
-for n in "$CPUS" ${JOBS:+"$JOBS"} ${FUZZ_N:+"$FUZZ_N"} ${ABI_N:+"$ABI_N"}; do
-    case "$n" in ''|*[!0-9]*) die "'$n' is not a number" ;; esac
-done
-
-# ---- The host ----
-
-case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) HOST=aarch64-macos ;;
-    Darwin-x86_64) HOST=x86_64-macos ;;
-    Linux-x86_64) HOST=x86_64-linux ;;
-    Linux-aarch64) HOST=aarch64-linux ;;
-    *) die "unsupported host $(uname -s) $(uname -m)" ;;
-esac
-NCPU=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)
-case "$NCPU" in ''|*[!0-9]*) NCPU=4 ;; esac
-# (On macOS more slots than CPUs do not help: a new program's first launch
-# waits for the system's check of it, and those checks are taken about
-# one at a time; more programs waiting made the gate slower. See
-# docs/releases.md, "The gate".)
-[ -n "$JOBS" ] || JOBS=$NCPU
-
-# ---- The steps ----
-
-# The counts of each mode: this host's fuzz and ABI programs per mode,
-# then x86_64-linux's (emulated on Apple silicon) and aarch64-linux's.
-# On macOS every program costs a launch check (docs/releases.md, "The
-# gate"), so the volume of random programs is in aarch64-linux, the same
-# code generator, natively; tests/fuzz/forever.sh adds more between
-# releases.
-case "$MODE" in
-    quick) FZ=10; AB=20; XFZ=0; XAB=0; AFZ=0; AAB=0 ;;
-    default) FZ=30; AB=30; XFZ=25; XAB=20; AFZ=100; AAB=60 ;;
-    release) FZ=60; AB=100; XFZ=50; XAB=40; AFZ=300; AAB=150 ;;
-esac
-[ -z "$FUZZ_N" ] || { FZ=$FUZZ_N; XFZ=$FUZZ_N; AFZ=$FUZZ_N; }
-[ -z "$ABI_N" ] || { AB=$ABI_N; XAB=$ABI_N; AAB=$ABI_N; }
-
-FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-guard fuzz-seed"
-ABI_STEPS="abi-plain abi-import abi-header"
-HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost unsafe-audit borrowck-twin std2-check std2-tests cachediff"
+# bootstrap/chain-hashes/, 0.25; --release).
 # (0.25) the chain's integrity, by --release (or --only): slow, and they
 # rebuild compilers rather than test one
-RELEASE_STEPS="chain-diverse chain-fresh translate gate3"
+RELEASE_STEPS="chain-diverse chain-fresh"
 LINUX_STEPS="linux-x86_64 linux-aarch64"
 # (0.25.2) --quick's container row, and the steps it runs in the
 # container (gate.sh --inside --only 'smoke-*'; run_step says what they
@@ -746,17 +589,6 @@ run_step() {
             previous=$(find_previous_release)
             sh "$ROOT/bootstrap/chain-diverse.sh" ${previous:+-p "$previous"} -w "$RUN/chain-diverse" ;;
         chain-fresh) sh "$ROOT/bootstrap/chain-fresh.sh" -w "$RUN/chain-fresh" --history "$HISTORY" ;;
-        translate)
-            # (0.27.3, gate 2) informational until 0.27.4: the count, never
-            # a failure; with the stable shim's rustc twin of what round-trips
-            # (tools/rustc-twin/; --alloc-api is a manual mode)
-            sh "$ROOT/tests/translate.sh" -c "$C" -j 4 --twin || true ;;
-        gate3)
-            # (0.27.4, gate 3) informational: N, the errors the rust-edition
-            # check finds in the translated copy of compiler/src, by code;
-            # (0.28.0) after the flip, compiler/src a fixed point (a failure
-            # otherwise)
-            sh "$ROOT/tests/gate3.sh" -c "$C" -k "$RUN/gate3" ;;
         compile-cost)
             previous=$(find_previous_release)
             sh "$ROOT/tests/compile_cost.sh" -c "$C" ${previous:+-p "$previous"} ;;
@@ -1187,7 +1019,7 @@ note_of() {
         chain) awk '/^  head / { sub(/^  head +/, ""); print; exit }' "$l" ;;
         suite-*|smoke-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed%s\n", $2, $3, $4, ($5 > 0 ? ", " $5 " SKIPPED" : "") }' "$l" ;;
         fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*|unsafe-audit|borrowck-twin|std2-check|std2-tests|cachediff|translate|gate3)
-            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh|unsafe-audit|borrowck-twin|std2-check|std2-tests|cachediff|translate|gate3):' "$l" | tail -1 ;;
+            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh|unsafe-audit|borrowck-twin|std2-check|std2-tests|cachediff):' "$l" | tail -1 ;;
         voltty-fuzz) grep -E '^(pass|FAIL|skip) oracle' "$l" | tail -1 ;;
         compile-cost) awk '$2 ~ /^[0-9.]+$/ && $3 == "M" { printf "%s%s %s M %s", sep, $1, $2, $8; sep = ", " } END { print "" }' "$l" ;;
         # (no rows: it failed before the container's steps, e.g. docker)

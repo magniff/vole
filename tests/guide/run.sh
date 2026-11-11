@@ -13,7 +13,7 @@
 #   --split DIR   (0.27.3) check nothing: write the blocks of every
 #                 compiler/guide/*.md to DIR/blocks/TOPIC-LINE/ (prog.vl
 #                 as compiled, and its in, out, exit or err), for
-#                 tests/translate.sh and tools/rustc-twin.sh
+#                 tools/rustc-twin.sh
 #
 # The code blocks of every topic (`volec guide NAME`), by the fence's
 # language:

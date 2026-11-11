@@ -37,7 +37,7 @@ is counted as allowed and does not fail the run (`*` in a line: a glob
 of the whole path).
 
 Owners: mig28 (book, examples, guide, bench, the editor samples), d4 (the
-old std and its copies in tests), d5 (the translator's transcripts), gpu
+old std and its copies in tests), gpu
 (the gpu port: tests/gpu, window, voltty-render, two tools), del280 (the
 other tests, tools/numtables), other (anything else).
 """
@@ -88,8 +88,6 @@ def owner(path):
         return "gpu"
     if top[0] in ("book", "examples", "bench", "editors") or path.startswith("compiler/guide/") or path == "README.md":
         return "mig28"
-    if path.startswith(("tests/translate", "tests/flip28", "tests/refactor/edition0")):
-        return "d5"
     if path.startswith("tools/numtables/"):
         return "d4"
     if path.startswith("tools/agent-hooks/") or top[0] == "tests":
@@ -169,11 +167,10 @@ def programs(paths):
 
 def generators(paths):
     """The scripts that write MVS programs: (class, path, the first MVS
-    word and how many lines have one). The census's own files and the
-    translator's are not generators."""
+    word and how many lines have one). The census's own files are not generators."""
     entries = []
     for p in sorted(paths):
-        if not p.endswith(GEN_EXT) or p.startswith(("tools/mvs-census", "tools/translate", ".claude/")):
+        if not p.endswith(GEN_EXT) or p.startswith(("tools/mvs-census", ".claude/")):
             continue
         # tests/seed-compat.awk rewrites a program into the bootstrap
         # seed's dialect (the gate's fuzz-seed row): the `*u8` and `var`
