@@ -1,3 +1,4 @@
+// EDITION: rust
 // sha256sum: SHA-256 checksums of files, coreutils-compatible. The
 // hashing is sha256.vl (the ARMv8 SHA-256 instructions behind
 // detect("sha2"), with a portable fallback); this file is the command:
@@ -10,13 +11,16 @@ mod sha256;
 // for x86-64 on a machine without its C headers). The constants are the
 // same on Linux and macOS.
 mod libc {
+    // UNSAFE: the C library's functions, declared by hand (see above).
+    // SAFETY: the signatures are POSIX's, the same on Linux and macOS;
+    // each call says below why its arguments are valid.
     pub extern "C" {
-        fn open(path: *u8, flags: i32) -> i32;
-        fn read(fd: i32, buf: *u8, n: u64) -> i64;
-        fn write(fd: i32, buf: *u8, n: u64) -> i64;
+        fn open(path: *const u8, flags: i32) -> i32;
+        fn read(fd: i32, buf: *mut u8, n: u64) -> i64;
+        fn write(fd: i32, buf: *const u8, n: u64) -> i64;
         fn close(fd: i32) -> i32;
-        fn strerror(e: i32) -> *u8;
-        fn strlen(s: *u8) -> u64;
+        fn strerror(e: i32) -> *const u8;
+        fn strlen(s: *const u8) -> u64;
     }
 
     pub const O_RDONLY: i32 = 0;
@@ -29,31 +33,33 @@ use crate::sha256::{H0, blocks, finish};
 // The read buffer: 1 MiB, allocated once and reused by every file.
 const BUF: i64 = 1 << 20;
 
-fn usage(out: inout Vec<u8, Gpa>) {
-    out.extend_from_slice("Usage: sha256sum [OPTION]... [FILE]...\n");
-    out.extend_from_slice("Print or check SHA256 (256-bit) checksums.\n");
-    out.extend_from_slice("\n");
-    out.extend_from_slice("With no FILE, or when FILE is -, read standard input.\n");
+fn usage(out: &mut Vec<u8, Gpa>) {
+    out.extend_from_slice(b"Usage: sha256sum [OPTION]... [FILE]...\n");
+    out.extend_from_slice(b"Print or check SHA256 (256-bit) checksums.\n");
+    out.extend_from_slice(b"\n");
+    out.extend_from_slice(b"With no FILE, or when FILE is -, read standard input.\n");
     out.extend_from_slice(
-        "  -b, --binary          read in binary mode (marks the name with '*')\n");
-    out.extend_from_slice("  -c, --check           read checksums from the FILEs and check them\n");
-    out.extend_from_slice("      --tag             create a BSD-style checksum\n");
-    out.extend_from_slice("  -t, --text            read in text mode (default)\n");
-    out.extend_from_slice("\n");
-    out.extend_from_slice("The following five options are useful only when verifying checksums:\n");
+        b"  -b, --binary          read in binary mode (marks the name with '*')\n");
     out.extend_from_slice(
-        "      --ignore-missing  don't fail or report status for missing files\n");
+        b"  -c, --check           read checksums from the FILEs and check them\n");
+    out.extend_from_slice(b"      --tag             create a BSD-style checksum\n");
+    out.extend_from_slice(b"  -t, --text            read in text mode (default)\n");
+    out.extend_from_slice(b"\n");
     out.extend_from_slice(
-        "      --quiet           don't print OK for each successfully verified file\n");
+        b"The following five options are useful only when verifying checksums:\n");
     out.extend_from_slice(
-        "      --status          don't output anything, status code shows success\n");
+        b"      --ignore-missing  don't fail or report status for missing files\n");
     out.extend_from_slice(
-        "      --strict          exit non-zero for improperly formatted checksum lines\n");
+        b"      --quiet           don't print OK for each successfully verified file\n");
     out.extend_from_slice(
-        "  -w, --warn            warn about improperly formatted checksum lines\n");
-    out.extend_from_slice("\n");
-    out.extend_from_slice("      --help            display this help and exit\n");
-    out.extend_from_slice("      --version         output version information and exit\n");
+        b"      --status          don't output anything, status code shows success\n");
+    out.extend_from_slice(
+        b"      --strict          exit non-zero for improperly formatted checksum lines\n");
+    out.extend_from_slice(
+        b"  -w, --warn            warn about improperly formatted checksum lines\n");
+    out.extend_from_slice(b"\n");
+    out.extend_from_slice(b"      --help            display this help and exit\n");
+    out.extend_from_slice(b"      --version         output version information and exit\n");
 }
 
 struct Opts {
@@ -70,10 +76,12 @@ struct Opts {
 // ---- output ---------------------------------------------------------
 
 // Writes all of s to fd.
-fn write_all(fd: i32, s: [u8]) {
-    var i = 0;
-    while i < s.len as i64 {
-        let n = unsafe { libc::write(fd, &s[i], (s.len as i64 - i) as u64) };
+fn write_all(fd: i32, s: &[u8]) {
+    let mut i = 0i64;
+    while i < s.len() as i64 {
+        // UNSAFE: write(2) is the C library's.
+        // SAFETY: s[i..] is the caller's slice, and the count is its length.
+        let n = unsafe { libc::write(fd, s[i..].as_ptr(), (s.len() as i64 - i) as u64) };
         if n <= 0 {
             return;
         }
@@ -83,87 +91,94 @@ fn write_all(fd: i32, s: [u8]) {
 
 // Stdout is buffered in out, written when it passes 64 KiB, at an
 // error (so the two streams keep their order) and at the end.
-fn flush(out: inout Vec<u8, Gpa>) {
+fn flush(out: &mut Vec<u8, Gpa>) {
     write_all(1, out.as_slice());
     out.clear();
 }
 
 fn errno() -> i32 {
-    std::sys::sys_errno()
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
 // `sha256sum: NAME: MESSAGE` on stderr, coreutils' form: the name
 // quoted as a shell would need it, the line number after it (if > 0).
-fn report(out: inout Vec<u8, Gpa>, name: [u8], line: i64, message: [u8]) {
-    flush(&out);
-    write_all(2, "sha256sum: ");
-    if name.len > 0 {
+fn report(out: &mut Vec<u8, Gpa>, name: &[u8], line: i64, message: &[u8]) {
+    flush(out);
+    write_all(2, b"sha256sum: ");
+    if name.len() > 0 {
         write_quoted(name);
         if line > 0 {
-            out.extend_from_slice(": ");
-            out.extend_from_slice(format_in("{}", line, out.allocator()).as_bytes());
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(format_in("{}", line, *out.allocator()).as_bytes());
             write_all(2, out.as_slice());
             out.clear();
         }
-        write_all(2, ": ");
+        write_all(2, b": ");
     }
     write_all(2, message);
-    write_all(2, "\n");
+    write_all(2, b"\n");
 }
 
 // A name on stderr as coreutils quotes it: bare if every byte is plain,
 // else in single quotes ('\'' for one inside), or in double quotes when
 // it has a single quote and nothing a shell expands there.
-fn write_quoted(name: [u8]) {
-    var plain = true;
-    var single = false;
-    var double_ok = true;
-    for b in name {
-        let ok = (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
-            || b == '%' || b == '+' || b == ',' || b == '-' || b == '.' || b == '/' || b == ':'
-            || b == '=' || b == '@' || b == '_' || b == '^';
+fn write_quoted(name: &[u8]) {
+    let mut plain = true;
+    let mut single = false;
+    let mut double_ok = true;
+    for &b in name {
+        let ok = (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z') || (b >= b'0' && b <= b'9')
+            || b == b'%' || b == b'+' || b == b',' || b == b'-' || b == b'.' || b == b'/'
+            || b == b':' || b == b'=' || b == b'@' || b == b'_' || b == b'^';
         if !ok {
             plain = false;
         }
-        if b == '\'' {
+        if b == b'\'' {
             single = true;
         }
-        if b == '"' || b == '$' || b == '`' || b == '\\' || b == '!' {
+        if b == b'"' || b == b'$' || b == b'`' || b == b'\\' || b == b'!' {
             double_ok = false;
         }
     }
     if plain {
         write_all(2, name);
     } else if single && double_ok {
-        write_all(2, "\"");
+        write_all(2, b"\"");
         write_all(2, name);
-        write_all(2, "\"");
+        write_all(2, b"\"");
     } else {
-        write_all(2, "'");
-        var from = 0;
-        for j in 0..name.len {
-            if name[j] == '\'' {
-                write_all(2, name[from..j]);
-                write_all(2, "'\\''");
+        write_all(2, b"'");
+        let mut from = 0i64;
+        for j in 0..name.len() {
+            if name[j] == b'\'' {
+                write_all(2, &name[from..j]);
+                write_all(2, b"'\\''");
                 from = j as i64 + 1;
             }
         }
-        write_all(2, name[from..name.len]);
-        write_all(2, "'");
+        write_all(2, &name[from..name.len()]);
+        write_all(2, b"'");
     }
 }
 
 // The C library's text for an errno value.
-fn strerror(e: i32) -> [u8] {
-    let p = unsafe { libc::strerror(e) };
-    unsafe { p[0..libc::strlen(p) as i64] }
+fn strerror(e: i32) -> &'static [u8] {
+    // UNSAFE: strerror is the C library's, and its text is read through
+    // a raw pointer.
+    // SAFETY: strerror returns a NUL-terminated string that lives in the
+    // C library; strlen measures it. The program has one thread, and the
+    // text is written out before the next call.
+    unsafe {
+        let p = libc::strerror(e);
+        std::slice::from_raw_parts(p, libc::strlen(p) as usize)
+    }
 }
 
 // Does a name need coreutils' escaping (a leading backslash, and \\, \n,
 // \r spelled out)?
-fn needs_escape(name: [u8]) -> bool {
-    for b in name {
-        if b == '\\' || b == '\n' || b == '\r' {
+fn needs_escape(name: &[u8]) -> bool {
+    for &b in name {
+        if b == b'\\' || b == b'\n' || b == b'\r' {
             return true;
         }
     }
@@ -172,36 +187,36 @@ fn needs_escape(name: [u8]) -> bool {
 
 // -c's test: a newline or CR in the name (a backslash alone is not
 // escaped there).
-fn has_line_break(name: [u8]) -> bool {
-    for b in name {
-        if b == '\n' || b == '\r' {
+fn has_line_break(name: &[u8]) -> bool {
+    for &b in name {
+        if b == b'\n' || b == b'\r' {
             return true;
         }
     }
     false
 }
 
-fn push_name(out: inout Vec<u8, Gpa>, name: [u8], escape: bool) {
+fn push_name(out: &mut Vec<u8, Gpa>, name: &[u8], escape: bool) {
     if !escape {
         out.extend_from_slice(name);
         return;
     }
-    for b in name {
-        if b == '\\' {
-            out.extend_from_slice("\\\\");
-        } else if b == '\n' {
-            out.extend_from_slice("\\n");
-        } else if b == '\r' {
-            out.extend_from_slice("\\r");
+    for &b in name {
+        if b == b'\\' {
+            out.extend_from_slice(b"\\\\");
+        } else if b == b'\n' {
+            out.extend_from_slice(b"\\n");
+        } else if b == b'\r' {
+            out.extend_from_slice(b"\\r");
         } else {
             out.push(b);
         }
     }
 }
 
-fn push_hex(out: inout Vec<u8, Gpa>, digest: [u8]) {
-    let hex = "0123456789abcdef";
-    for b in digest {
+fn push_hex(out: &mut Vec<u8, Gpa>, digest: &[u8]) {
+    let hex = b"0123456789abcdef";
+    for &b in digest {
         out.push(hex[(b >> 4) as i64]);
         out.push(hex[(b & 15) as i64]);
     }
@@ -212,12 +227,17 @@ fn push_hex(out: inout Vec<u8, Gpa>, digest: [u8]) {
 // The digest of what fd holds, into digest[0..32], reading into buf;
 // 0, or the errno of a failed read. Each read's whole blocks are hashed
 // in place; the few bytes after them move to buf's start.
-fn hash_fd(fd: i32, buf: inout [u8], digest: inout [u8]) -> i32 {
-    var state: [u32; 8] = H0;
-    var total: u64 = 0;
-    var fill = 0;
+fn hash_fd(fd: i32, buf: &mut [u8], digest: &mut [u8]) -> i32 {
+    let mut state: [u32; 8] = H0;
+    let mut total: u64 = 0;
+    let mut fill = 0i64;
     loop {
-        let n = unsafe { libc::read(fd, &buf[fill], (buf.len as i64 - fill) as u64) };
+        // UNSAFE: read(2) is the C library's, and writes through a pointer.
+        // SAFETY: buf[fill..] is ours to write, and the count is its length
+        // (fill < 64 here, far below buf's megabyte).
+        let n = unsafe {
+            libc::read(fd, buf[fill..].as_mut_ptr(), (buf.len() as i64 - fill) as u64)
+        };
         if n < 0 {
             let e = errno();
             if e == libc::EINTR {
@@ -230,30 +250,35 @@ fn hash_fd(fd: i32, buf: inout [u8], digest: inout [u8]) -> i32 {
         }
         fill += n as i64;
         total += n as u64;
-        let whole = fill & ~63;
+        let whole = fill & !63;
         if whole > 0 {
-            blocks(&state[..], buf[0..whole]);
+            blocks(&mut state[..], &buf[0..whole]);
             for j in whole..fill {
                 buf[j - whole] = buf[j];
             }
             fill -= whole;
         }
     }
-    finish(&state[..], buf[0..fill], total, digest);
+    finish(&mut state[..], &buf[0..fill], total, digest);
     0
 }
 
 // The digest of the file at path (a C string; "-": stdin): 0 or an
 // errno.
-fn hash_path(path: *u8, name: [u8], buf: inout [u8], digest: inout [u8]) -> i32 {
-    if name == "-" {
+fn hash_path(path: *const u8, name: &[u8], buf: &mut [u8], digest: &mut [u8]) -> i32 {
+    if name == b"-" {
         return hash_fd(0, buf, digest);
     }
+    // UNSAFE: open(2) is the C library's.
+    // SAFETY: path is NUL-terminated: an argv string, or parse_line's
+    // name with its 0 pushed.
     let fd = unsafe { libc::open(path, libc::O_RDONLY) };
     if fd < 0 {
         return errno();
     }
     let e = hash_fd(fd, buf, digest);
+    // UNSAFE: close(2) is the C library's.
+    // SAFETY: fd is the descriptor open returned, closed once.
     unsafe {
         libc::close(fd);
     }
@@ -262,44 +287,44 @@ fn hash_path(path: *u8, name: [u8], buf: inout [u8], digest: inout [u8]) -> i32 
 
 // One line of output for a file: `HASH  NAME`, `HASH *NAME` (-b) or
 // `SHA256 (NAME) = HASH` (--tag).
-fn print_sum(out: inout Vec<u8, Gpa>, o: Opts, name: [u8], digest: [u8]) {
+fn print_sum(out: &mut Vec<u8, Gpa>, o: &Opts, name: &[u8], digest: &[u8]) {
     let escape = needs_escape(name);
     if escape {
-        out.push('\\');
+        out.push(b'\\');
     }
     if o.tag {
-        out.extend_from_slice("SHA256 (");
-        push_name(&out, name, escape);
-        out.extend_from_slice(") = ");
-        push_hex(&out, digest);
+        out.extend_from_slice(b"SHA256 (");
+        push_name(out, name, escape);
+        out.extend_from_slice(b") = ");
+        push_hex(out, digest);
     } else {
-        push_hex(&out, digest);
-        out.extend_from_slice(if o.binary { " *" } else { "  " });
-        push_name(&out, name, escape);
+        push_hex(out, digest);
+        out.extend_from_slice(if o.binary { b" *" } else { b"  " });
+        push_name(out, name, escape);
     }
-    out.push('\n');
+    out.push(b'\n');
     if out.len() >= 65536 {
-        flush(&out);
+        flush(out);
     }
 }
 
 // ---- checking (-c) --------------------------------------------------
 
 fn hex_value(b: u8) -> i64 {
-    if b >= '0' && b <= '9' {
-        (b - '0') as i64
-    } else if b >= 'a' && b <= 'f' {
-        (b - 'a' + 10) as i64
-    } else if b >= 'A' && b <= 'F' {
-        (b - 'A' + 10) as i64
+    if b >= b'0' && b <= b'9' {
+        (b - b'0') as i64
+    } else if b >= b'a' && b <= b'f' {
+        (b - b'a' + 10) as i64
+    } else if b >= b'A' && b <= b'F' {
+        (b - b'A' + 10) as i64
     } else {
         -1
     }
 }
 
 // 64 hex digits at s[i..] into want[0..32]; false if they are not.
-fn parse_hex(s: [u8], i: i64, want: inout [u8]) -> bool {
-    if i < 0 || i + 64 > s.len as i64 {
+fn parse_hex(s: &[u8], i: i64, want: &mut [u8]) -> bool {
+    if i < 0 || i + 64 > s.len() as i64 {
         return false;
     }
     for j in 0..32 {
@@ -316,60 +341,60 @@ fn parse_hex(s: [u8], i: i64, want: inout [u8]) -> bool {
 // A checksum line, `HASH  NAME`, `HASH *NAME` or `SHA256 (NAME) = HASH`
 // (a leading backslash: the name escaped), into want and name (the
 // name without its escapes, then a 0 for C); false if it is none.
-fn parse_line(line: [u8], want: inout [u8], name: inout Vec<u8, Gpa>) -> bool {
-    var i = 0;
-    while i < line.len as i64 && (line[i] == ' ' || line[i] == '\t') {
+fn parse_line(line: &[u8], want: &mut [u8], name: &mut Vec<u8, Gpa>) -> bool {
+    let mut i = 0i64;
+    while i < line.len() as i64 && (line[i] == b' ' || line[i] == b'\t') {
         i += 1;
     }
-    let escaped = i < line.len as i64 && line[i] == '\\';
+    let escaped = i < line.len() as i64 && line[i] == b'\\';
     if escaped {
         i += 1;
     }
-    var from = 0;
-    var to = 0;
-    let tag = "SHA256 (";
-    if line.len as i64 - i >= tag.len as i64 && line[i..i + tag.len as i64] == tag {
+    let mut from = 0i64;
+    let mut to = 0i64;
+    let tag: &[u8] = b"SHA256 (";
+    if line.len() as i64 - i >= tag.len() as i64 && &line[i..i + tag.len() as i64] == tag {
         // BSD: the hash is the last 64 bytes, after ") = ".
-        let h = line.len - 64;
-        if h as i64 < i + tag.len as i64 + 4 || line[h - 4..h] != ") = "
+        let h = line.len() - 64;
+        if h as i64 < i + tag.len() as i64 + 4 || &line[h - 4..h] != b") = "
             || !parse_hex(line, h as i64, want) {
             return false;
         }
-        from = i + tag.len as i64;
+        from = i + tag.len() as i64;
         to = h as i64 - 4;
     } else {
         if !parse_hex(line, i, want) {
             return false;
         }
-        var j = i + 64;
-        if j >= line.len as i64 || (line[j] != ' ' && line[j] != '\t') {
+        let mut j = i + 64;
+        if j >= line.len() as i64 || (line[j] != b' ' && line[j] != b'\t') {
             return false;
         }
         j += 1;
-        if j < line.len as i64 && (line[j] == ' ' || line[j] == '*') {
+        if j < line.len() as i64 && (line[j] == b' ' || line[j] == b'*') {
             j += 1;
         }
         from = j;
-        to = line.len as i64;
+        to = line.len() as i64;
     }
     if from >= to {
         return false;
     }
     name.clear();
-    var k = from;
+    let mut k = from;
     while k < to {
         let b = line[k];
-        if escaped && b == '\\' {
+        if escaped && b == b'\\' {
             if k + 1 >= to {
                 return false;
             }
             let e = line[k + 1];
-            if e == '\\' {
-                name.push('\\');
-            } else if e == 'n' {
-                name.push('\n');
-            } else if e == 'r' {
-                name.push('\r');
+            if e == b'\\' {
+                name.push(b'\\');
+            } else if e == b'n' {
+                name.push(b'\n');
+            } else if e == b'r' {
+                name.push(b'\r');
             } else {
                 return false;
             }
@@ -385,10 +410,12 @@ fn parse_line(line: [u8], want: inout [u8], name: inout Vec<u8, Gpa>) -> bool {
 
 // The whole of fd into text (cleared first), read through buf: 0 or an
 // errno.
-fn read_all(fd: i32, buf: inout [u8], text: inout Vec<u8, Gpa>) -> i32 {
+fn read_all(fd: i32, buf: &mut [u8], text: &mut Vec<u8, Gpa>) -> i32 {
     text.clear();
     loop {
-        let n = unsafe { libc::read(fd, &buf[0], buf.len as u64) };
+        // UNSAFE: read(2) is the C library's, and writes through a pointer.
+        // SAFETY: buf is ours to write, and the count is its length.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr(), buf.len() as u64) };
         if n < 0 {
             let e = errno();
             if e == libc::EINTR {
@@ -399,75 +426,79 @@ fn read_all(fd: i32, buf: inout [u8], text: inout Vec<u8, Gpa>) -> i32 {
         if n == 0 {
             return 0;
         }
-        text.extend_from_slice(buf[0..n as i64]);
+        text.extend_from_slice(&buf[0..n as i64]);
     }
 }
 
-fn plural(n: i64, one: [u8], many: [u8], out: inout Vec<u8, Gpa>, scratch: inout Vec<u8, Gpa>) {
+fn plural(n: i64, one: &[u8], many: &[u8], out: &mut Vec<u8, Gpa>, scratch: &mut Vec<u8, Gpa>) {
     scratch.clear();
-    scratch.extend_from_slice("WARNING: ");
-    scratch.extend_from_slice(format_in("{}", n, scratch.allocator()).as_bytes());
+    scratch.extend_from_slice(b"WARNING: ");
+    scratch.extend_from_slice(format_in("{}", n, *scratch.allocator()).as_bytes());
     scratch.extend_from_slice(if n == 1 { one } else { many });
-    report(&out, "", 0, scratch.as_slice());
+    report(out, b"", 0, scratch.as_slice());
 }
 
 // Checks the list in the file at path (name "-": stdin); true if all
 // is well.
 fn check_list(
-    path: *u8, list: [u8], o: Opts, buf: inout [u8], out: inout Vec<u8, Gpa>,
-    text: inout Vec<u8, Gpa>, name: inout Vec<u8, Gpa>, scratch: inout Vec<u8, Gpa>) -> bool {
-    var e: i32 = 0;
-    if list == "-" {
-        e = read_all(0, buf, &text);
+    path: *const u8, list: &[u8], o: &Opts, buf: &mut [u8], out: &mut Vec<u8, Gpa>,
+    text: &mut Vec<u8, Gpa>, name: &mut Vec<u8, Gpa>, scratch: &mut Vec<u8, Gpa>) -> bool {
+    let mut e: i32 = 0;
+    if list == b"-" {
+        e = read_all(0, buf, text);
     } else {
+        // UNSAFE: open(2) is the C library's.
+        // SAFETY: path is an argv string, NUL-terminated.
         let fd = unsafe { libc::open(path, libc::O_RDONLY) };
         if fd < 0 {
             e = errno();
         } else {
-            e = read_all(fd, buf, &text);
+            e = read_all(fd, buf, text);
+            // UNSAFE: close(2) is the C library's.
+            // SAFETY: fd is the descriptor open returned, closed once.
             unsafe {
                 libc::close(fd);
             }
         }
     }
     // (coreutils' name for stdin in its messages)
-    let shown = if list == "-" { "standard input" } else { list };
+    let shown: &[u8] = if list == b"-" { b"standard input" } else { list };
     if e != 0 {
-        report(&out, shown, 0, strerror(e));
+        report(out, shown, 0, strerror(e));
         return false;
     }
-    var want: [u8; 32] = [0; 32];
-    var digest: [u8; 32] = [0; 32];
-    var lines = 0;
-    var good = 0;
-    var bad_lines = 0;
-    var mismatched = 0;
-    var unreadable = 0;
-    var verified = 0;
+    let mut want: [u8; 32] = [0; 32];
+    let mut digest: [u8; 32] = [0; 32];
+    let mut lines = 0i64;
+    let mut good = 0i64;
+    let mut bad_lines = 0i64;
+    let mut mismatched = 0i64;
+    let mut unreadable = 0i64;
+    let mut verified = 0i64;
     let all = text.as_slice();
-    var start = 0;
-    while start < all.len as i64 {
-        var end = start;
-        while end < all.len as i64 && all[end] != '\n' {
+    let mut start = 0i64;
+    while start < all.len() as i64 {
+        let mut end = start;
+        while end < all.len() as i64 && all[end] != b'\n' {
             end += 1;
         }
-        let line = all[start..end];
+        let line = &all[start..end];
         start = end + 1;
         lines += 1;
-        if line.len > 0 && line[0] == '#' {
+        if line.len() > 0 && line[0] == b'#' {
             continue;
         }
-        if !parse_line(line, &want[..], &name) {
+        if !parse_line(line, &mut want[..], name) {
             bad_lines += 1;
             if o.warn {
-                report(&out, shown, lines, "improperly formatted SHA256 checksum line");
+                report(out, shown, lines, b"improperly formatted SHA256 checksum line");
             }
             continue;
         }
         good += 1;
         let cname = name.as_slice();
-        let file = cname[0..cname.len - 1];
-        let r = hash_path(&cname[0], file, buf, &digest[..]);
+        let file = &cname[0..cname.len() - 1];
+        let r = hash_path(cname.as_ptr(), file, buf, &mut digest[..]);
         // (coreutils escapes a name here only for a newline or CR)
         let escape = has_line_break(file);
         if r != 0 {
@@ -475,13 +506,13 @@ fn check_list(
                 continue;
             }
             unreadable += 1;
-            report(&out, file, 0, strerror(r));
+            report(out, file, 0, strerror(r));
             if !o.status {
                 if escape {
-                    out.push('\\');
+                    out.push(b'\\');
                 }
-                push_name(&out, file, escape);
-                out.extend_from_slice(": FAILED open or read\n");
+                push_name(out, file, escape);
+                out.extend_from_slice(b": FAILED open or read\n");
             }
             continue;
         }
@@ -492,36 +523,36 @@ fn check_list(
         }
         if !o.status && (!ok || !o.quiet) {
             if escape {
-                out.push('\\');
+                out.push(b'\\');
             }
-            push_name(&out, file, escape);
-            out.extend_from_slice(if ok { ": OK\n" } else { ": FAILED\n" });
+            push_name(out, file, escape);
+            out.extend_from_slice(if ok { b": OK\n" } else { b": FAILED\n" });
             if out.len() >= 65536 {
-                flush(&out);
+                flush(out);
             }
         }
     }
     if good == 0 {
-        report(&out, shown, 0, "no properly formatted checksum lines found");
+        report(out, shown, 0, b"no properly formatted checksum lines found");
         return false;
     }
     if !o.status {
         if bad_lines > 0 {
-            plural(bad_lines, " line is improperly formatted", " lines are improperly formatted",
-                &out, &scratch);
+            plural(bad_lines, b" line is improperly formatted", b" lines are improperly formatted",
+                out, scratch);
         }
         if unreadable > 0 {
-            plural(unreadable, " listed file could not be read", " listed files could not be read",
-                &out, &scratch);
+            plural(unreadable, b" listed file could not be read",
+                b" listed files could not be read", out, scratch);
         }
         if mismatched > 0 {
-            plural(mismatched, " computed checksum did NOT match",
-                " computed checksums did NOT match", &out, &scratch);
+            plural(mismatched, b" computed checksum did NOT match",
+                b" computed checksums did NOT match", out, scratch);
         }
     }
     if o.ignore_missing && verified == 0 {
         if !o.status {
-            report(&out, shown, 0, "no file was verified");
+            report(out, shown, 0, b"no file was verified");
         }
         return false;
     }
@@ -530,132 +561,139 @@ fn check_list(
 
 // ---- the command ----------------------------------------------------
 
-fn arg(argv: **u8, i: i64) -> [u8] {
-    let p = unsafe { argv[i] };
-    unsafe { p[0..libc::strlen(p) as i64] }
+fn arg(argv: *const *const u8, i: i64) -> &'static [u8] {
+    // UNSAFE: argv is C's array of C strings.
+    // SAFETY: the caller's i is in 0..argc, so argv[i] is a NUL-terminated
+    // string that lives as long as the program; strlen measures it.
+    unsafe {
+        let p = *argv.add(i as usize);
+        std::slice::from_raw_parts(p, libc::strlen(p) as usize)
+    }
 }
 
-fn usage_error(out: inout Vec<u8, Gpa>, message: [u8]) -> i32 {
-    report(&out, "", 0, message);
-    write_all(2, "Try 'sha256sum --help' for more information.\n");
+fn usage_error(out: &mut Vec<u8, Gpa>, message: &[u8]) -> i32 {
+    report(out, b"", 0, message);
+    write_all(2, b"Try 'sha256sum --help' for more information.\n");
     1
 }
 
-fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
-    var o = Opts {
+fn main(argc: i32, argv: *const *const u8, gpa: Gpa) -> i32 {
+    let mut o = Opts {
         check: false, tag: false, binary: false, quiet: false, status: false, strict: false,
         warn: false, ignore_missing: false,
     };
-    var out = Vec::<u8, Gpa>::with_capacity_in(1 << 17, gpa);
-    var scratch = Vec::<u8, Gpa>::new_in(gpa);
+    let mut out = Vec::<u8, Gpa>::with_capacity_in(1 << 17, gpa);
+    let mut scratch = Vec::<u8, Gpa>::new_in(gpa);
     // The operands: their indexes in argv.
-    var files: Vec<i64, Gpa> = Vec::with_capacity_in(argc as usize, gpa);
-    var options_end = false;
-    var mode_given = false;
+    let mut files: Vec<i64, Gpa> = Vec::with_capacity_in(argc as usize, gpa);
+    let mut options_end = false;
+    let mut mode_given = false;
     for i in 1..argc as i64 {
         let a = arg(argv, i);
-        if options_end || a.len < 2 || a[0] != '-' {
+        if options_end || a.len() < 2 || a[0] != b'-' {
             files.push(i);
-        } else if a == "--" {
+        } else if a == b"--" {
             options_end = true;
-        } else if a[1] == '-' {
-            if a == "--check" {
+        } else if a[1] == b'-' {
+            if a == b"--check" {
                 o.check = true;
-            } else if a == "--tag" {
+            } else if a == b"--tag" {
                 o.tag = true;
-            } else if a == "--binary" || a == "--text" {
-                o.binary = a == "--binary";
+            } else if a == b"--binary" || a == b"--text" {
+                o.binary = a == b"--binary";
                 mode_given = true;
-            } else if a == "--quiet" {
+            } else if a == b"--quiet" {
                 o.quiet = true;
-            } else if a == "--status" {
+            } else if a == b"--status" {
                 o.status = true;
-            } else if a == "--strict" {
+            } else if a == b"--strict" {
                 o.strict = true;
-            } else if a == "--warn" {
+            } else if a == b"--warn" {
                 o.warn = true;
-            } else if a == "--ignore-missing" {
+            } else if a == b"--ignore-missing" {
                 o.ignore_missing = true;
-            } else if a == "--help" {
-                usage(&out);
-                flush(&out);
+            } else if a == b"--help" {
+                usage(&mut out);
+                flush(&mut out);
                 return 0;
-            } else if a == "--version" {
-                out.extend_from_slice("sha256sum (vole example) 0.19\n");
-                flush(&out);
+            } else if a == b"--version" {
+                out.extend_from_slice(b"sha256sum (vole example) 0.19\n");
+                flush(&mut out);
                 return 0;
             } else {
-                scratch.extend_from_slice("unrecognized option '");
+                scratch.extend_from_slice(b"unrecognized option '");
                 scratch.extend_from_slice(a);
-                scratch.extend_from_slice("'");
-                return usage_error(&out, scratch.as_slice());
+                scratch.extend_from_slice(b"'");
+                return usage_error(&mut out, scratch.as_slice());
             }
         } else {
-            for j in 1..a.len {
+            for j in 1..a.len() {
                 let f = a[j];
-                if f == 'c' {
+                if f == b'c' {
                     o.check = true;
-                } else if f == 'b' || f == 't' {
-                    o.binary = f == 'b';
+                } else if f == b'b' || f == b't' {
+                    o.binary = f == b'b';
                     mode_given = true;
-                } else if f == 'w' {
+                } else if f == b'w' {
                     o.warn = true;
                 } else {
-                    scratch.extend_from_slice("invalid option -- '");
+                    scratch.extend_from_slice(b"invalid option -- '");
                     scratch.push(f);
-                    scratch.extend_from_slice("'");
-                    return usage_error(&out, scratch.as_slice());
+                    scratch.extend_from_slice(b"'");
+                    return usage_error(&mut out, scratch.as_slice());
                 }
             }
         }
     }
     if o.check && o.tag {
-        return usage_error(&out, "the --tag option is meaningless when verifying checksums");
+        return usage_error(&mut out, b"the --tag option is meaningless when verifying checksums");
     }
     if o.check && mode_given {
-        return usage_error(&out,
-            "the --binary and --text options are meaningless when verifying checksums");
+        return usage_error(&mut out,
+            b"the --binary and --text options are meaningless when verifying checksums");
     }
     // (coreutils' order)
-    let only: [(bool, [u8]); 5] = [
-        (o.ignore_missing, "ignore-missing"), (o.status, "status"), (o.warn, "warn"),
-        (o.quiet, "quiet"), (o.strict, "strict"),
+    let only: [(bool, &[u8]); 5] = [
+        (o.ignore_missing, b"ignore-missing"), (o.status, b"status"), (o.warn, b"warn"),
+        (o.quiet, b"quiet"), (o.strict, b"strict"),
     ];
     for (set, option) in only {
         if set && !o.check {
-            scratch.extend_from_slice("the --");
+            scratch.extend_from_slice(b"the --");
             scratch.extend_from_slice(option);
-            scratch.extend_from_slice(" option is meaningful only when verifying checksums");
-            return usage_error(&out, scratch.as_slice());
+            scratch.extend_from_slice(b" option is meaningful only when verifying checksums");
+            return usage_error(&mut out, scratch.as_slice());
         }
     }
-    var buf: Vec<u8, Gpa> = Vec::filled_in(BUF as usize, 0, gpa);
+    let mut buf: Vec<u8, Gpa> = Vec::from_elem_in(0u8, BUF as usize, gpa);
     let b = buf.as_mut_slice();
-    var ok = true;
+    let mut ok = true;
     let n = if files.len() == 0 { 1 } else { files.len() };
-    var digest: [u8; 32] = [0; 32];
-    var text = Vec::<u8, Gpa>::new_in(gpa);
-    var name = Vec::<u8, Gpa>::new_in(gpa);
+    let mut digest: [u8; 32] = [0; 32];
+    let mut text = Vec::<u8, Gpa>::new_in(gpa);
+    let mut name = Vec::<u8, Gpa>::new_in(gpa);
     for k in 0..n {
-        let (path, file) = if files.len() == 0 {
-            (c"-", "-")
+        let (path, file): (*const u8, &[u8]) = if files.len() == 0 {
+            (c"-", b"-")
         } else {
-            (unsafe { argv[files[k]] }, arg(argv, files[k]))
+            // UNSAFE: argv is C's array of C strings.
+            // SAFETY: files holds indexes in 1..argc only.
+            (unsafe { *argv.add(files[k] as usize) }, arg(argv, files[k]))
         };
         if o.check {
-            if !check_list(path, file, o, b, &out, &text, &name, &scratch) {
+            if !check_list(path, file, &o, b, &mut out, &mut text, &mut name, &mut scratch) {
                 ok = false;
             }
             continue;
         }
-        let e = hash_path(path, file, b, &digest[..]);
+        let e = hash_path(path, file, b, &mut digest[..]);
         if e != 0 {
-            report(&out, file, 0, strerror(e));
+            report(&mut out, file, 0, strerror(e));
             ok = false;
         } else {
-            print_sum(&out, o, file, digest[..]);
+            print_sum(&mut out, &o, file, &digest[..]);
         }
     }
-    flush(&out);
+    flush(&mut out);
     if ok { 0 } else { 1 }
 }
