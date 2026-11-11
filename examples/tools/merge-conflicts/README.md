@@ -26,9 +26,9 @@ CONFLICT (content): Merge conflict in main.vl
 Automatic merge failed; fix conflicts and then commit the result.
 [exit 1]
 $ volec check 2>&1 | head -3
-main.vl:5:1: error[parser error] expected an item ('fn', 'extern', 'struct', 'union', 'enum', 'impl', 'const', 'static' or 'type'), got '<<'
-main.vl:7:1: error[parser error] expected an item ('fn', 'extern', 'struct', 'union', 'enum', 'impl', 'const', 'static' or 'type'), got '=='
-main.vl:8:15: error[type error] 'c_to_f' is imported twice
+main.vl:6:1: error[parser error] expected an item ('fn', 'extern', 'struct', 'union', 'enum', 'impl', 'const', 'static' or 'type'), got '<<'
+main.vl:8:1: error[parser error] expected an item ('fn', 'extern', 'struct', 'union', 'enum', 'impl', 'const', 'static' or 'type'), got '=='
+main.vl:9:15: error[type error] 'c_to_f' is imported twice
 ```
 
 Thirteen errors, every one caused by the markers. Nothing that reads the
@@ -41,9 +41,9 @@ text), and each side's size and branch:
 
 ```console
 $ volec query conflicts
-convert.vl:22-31	mi_to_km	ours 6 lines (HEAD)	theirs 1 line (rounding)
-main.vl:5-9	use	ours 1 line (HEAD)	theirs 1 line (rounding)
-main.vl:24-32	main	ours 3 lines (HEAD)	theirs 3 lines (rounding)
+convert.vl:23-32	mi_to_km	ours 6 lines (HEAD)	theirs 1 line (rounding)
+main.vl:6-10	use	ours 1 line (HEAD)	theirs 1 line (rounding)
+main.vl:25-33	main	ours 3 lines (HEAD)	theirs 3 lines (rounding)
 ```
 
 `--show` prints the sides of a region (here every region of
@@ -51,17 +51,17 @@ main.vl:24-32	main	ours 3 lines (HEAD)	theirs 3 lines (rounding)
 
 ```console
 $ volec query conflicts main.vl --show
-// main.vl:5-9	use
-// ours (HEAD), line 6:
+// main.vl:6-10	use
+// ours (HEAD), line 7:
 use convert::{c_to_f, f_to_c, kg_to_lb, km_to_mi, mi_to_km};
-// theirs (rounding), line 8:
+// theirs (rounding), line 9:
 use convert::{c_to_f, f_to_c, kg_to_lb, km_to_mi, lb_to_kg};
-// main.vl:24-32	main
-// ours (HEAD), lines 25-27:
+// main.vl:25-33	main
+// ours (HEAD), lines 26-28:
     println("miles  km");
     for mi in [1, 26, 100] {
         println("{mi:>5}  {:>3}", mi_to_km(mi));
-// theirs (rounding), lines 29-31:
+// theirs (rounding), lines 30-32:
     println("pounds  kg");
     for lb in [1, 100, 150] {
         println("{lb:>6}  {:>2}", lb_to_kg(lb));
@@ -74,7 +74,7 @@ added comes back by itself below, once the code that uses it is in:
 
 ```console
 $ volec edit resolve use --ours
-resolved main.vl:5-9 (ours)	main.vl	+0 -4 lines
+resolved main.vl:6-10 (ours)	main.vl	+0 -4 lines
 note conflict.left: 2 conflict regions left in 2 files
 try: volec query conflicts
 ```
@@ -94,15 +94,15 @@ $ volec edit resolve main --show <<'EOF'
 >     for lb in [1, 100, 150] {
 >         println("{lb:>6}  {:>2}", lb_to_kg(lb));
 > EOF
-resolved main.vl:20-28 (text)	main.vl	+1 -3 lines
-// main.vl:20-26
-20	    println("miles  km");
-21	    for mi in [1, 26, 100] {
-22	        println("{mi:>5}  {:>3}", mi_to_km(mi));
-23	    }
-24	    println("pounds  kg");
-25	    for lb in [1, 100, 150] {
-26	        println("{lb:>6}  {:>2}", lb_to_kg(lb));
+resolved main.vl:21-29 (text)	main.vl	+1 -3 lines
+// main.vl:21-27
+21	    println("miles  km");
+22	    for mi in [1, 26, 100] {
+23	        println("{mi:>5}  {:>3}", mi_to_km(mi));
+24	    }
+25	    println("pounds  kg");
+26	    for lb in [1, 100, 150] {
+27	        println("{lb:>6}  {:>2}", lb_to_kg(lb));
 note conflict.left: 1 conflict region left in 1 file
 try: volec query conflicts
 ```
@@ -113,8 +113,8 @@ has the rounding. Take ours:
 
 ```console
 $ volec edit resolve mi_to_km --ours
-resolved convert.vl:22-31 (ours)	convert.vl	+0 -4 lines
-main.vl:26:35: error[type error] undefined variable 'lb_to_kg' | help: add `use crate::convert::lb_to_kg;` | try: volec fix --suggested main.vl
+resolved convert.vl:23-32 (ours)	convert.vl	+0 -4 lines
+main.vl:27:35: error[type error] undefined variable 'lb_to_kg' | help: add `use crate::convert::lb_to_kg;` | try: volec fix --suggested main.vl
 warning conflict.check: the resolved program has errors (written; the merge may need more than one side)
 try: volec check
 ```
@@ -131,14 +131,14 @@ into both functions, written with ours' constant:
 ```console
 $ volec fix --only imports --show
 fixed 1 missing import	main.vl	+1 -1 lines
-// main.vl:5
-5	use convert::{c_to_f, f_to_c, kg_to_lb, km_to_mi, lb_to_kg, mi_to_km};
+// main.vl:6
+6	use convert::{c_to_f, f_to_c, kg_to_lb, km_to_mi, lb_to_kg, mi_to_km};
 $ volec edit patch km_to_mi --old 'km * 1000 / METRES_PER_MILE' --new 'round_div(km * 1000, METRES_PER_MILE)' --in mi_to_km --old 'mi * METRES_PER_MILE / 1000' --new 'round_div(mi * METRES_PER_MILE, 1000)' --show
 patched crate::convert::mi_to_km, crate::convert::km_to_mi	convert.vl	+2 -2 lines
-// convert.vl:22
-22	    round_div(km * 1000, METRES_PER_MILE)
-// convert.vl:27
-27	    round_div(mi * METRES_PER_MILE, 1000)
+// convert.vl:23
+23	    round_div(km * 1000, METRES_PER_MILE)
+// convert.vl:28
+28	    round_div(mi * METRES_PER_MILE, 1000)
 $ volec check && volec main.vl -o units && ./units | tail -14
  42     26
 100     62
