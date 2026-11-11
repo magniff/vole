@@ -9,7 +9,7 @@ beyond them:
 
 | effect | comes from |
 |---|---|
-| `alloc(Gpa)`, `alloc(Arena)`, `alloc(extern)` | allocating from that allocator type (`extern`: C's malloc) |
+| `alloc(Gpa)`, `alloc(Arena<Gpa>)`, `alloc(extern)` | allocating from that allocator type (`ArenaScope<&Gpa>`: `arena_scope`'s; `extern`: C's malloc); several as one, `alloc(Gpa, Arena<Gpa>)` |
 | `io` | a C function that reads or writes: `write`, `read`, stdio |
 | `static` | reading or writing a `static mut`, taking its address (not shown in a set: `--why static`; `global` its old name, an alias) |
 | `panic` | a checked index or slice, `unwrap`, `as E`, std's panic, an `assert` (but `assert(true)`), a requires (in the caller), an ensures |
@@ -25,7 +25,7 @@ explicit (`guide allocators`), so `alloc(Gpa)` without `static` means
 ```sh
 volec query effects total            # crate::total  alloc(Gpa) panic
 volec query effects crate::parser    # every function of a module
-volec query effects total --why alloc     # the chain of calls down to where it allocates
+volec query effects total --why 'alloc(Gpa)'   # the chain of calls down to where it allocates
 volec query effects crate --has io        # the functions that do io
 volec --print-effects main.vl           # every function's set, then the build
 ```
@@ -67,8 +67,8 @@ fn main() -> i32 {
   `#[no_panic]` forbid one; `#[effects(...)]` lists what is allowed,
   `#[effects()]` nothing. Several attributes intersect.
 - On a trait's function (`#[pure] fn eq(&self, other: &Self) -> bool;`)
-  the declaration binds every impl; std's `PartialEq`, `Ord` and `Hash`
-  are pure.
+  the declaration binds every impl; std's `PartialEq` and `Ord` are
+  pure.
 - On a C function in an `extern` block it is trusted, as its signature
   is. Undeclared, std's table applies (libm and `mem*`: none, `malloc`:
   `alloc(extern)`, stdio: `io`), else everything.
@@ -80,7 +80,7 @@ fn main() -> i32 {
 A broken declaration is one error with where the effect comes from:
 
 ```text
-sum.vl:3:1: error[effect] 'total' is #[no_alloc], but it allocates from Gpa: 'v.push(x)' at sum.vl:7:9 grows a Vec<i64>
+sum.vl:3:1: error[effect] 'total' is #[no_alloc], but it allocates from Gpa: 'v.push(x)' at sum.vl:7:9 grows a Vec<i64, Gpa>
 help: allocate in the caller and pass the memory in, or remove #[no_alloc]
-try: volec query effects total --why alloc
+try: volec query effects total --why alloc(Gpa)
 ```

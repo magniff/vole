@@ -110,7 +110,7 @@ chmod +x "$WORK/bin/volec"
 # then. In a rust chapter, a block or a session that waits for the
 # compiler is left as it was and marked `mvs` (```vole mvs, ```console
 # mvs): it is checked as MVS's until it is rewritten.
-RUST_CHAPTERS=" 01 02 03 04 05 06 07 08 09 10 11 13 14 15 16 17 18 19 21 "
+RUST_CHAPTERS=" 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 21 "
 rust_chapter() { case "$RUST_CHAPTERS" in *" ${1%%-*} "*) echo 1 ;; *) echo 0 ;; esac; }
 
 # Splits chapter $1 (named $2) into units under $WORK/units: a directory
