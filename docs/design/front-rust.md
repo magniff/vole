@@ -977,6 +977,19 @@ trait.unconstrained` (E0207) at the impl. *Anchor:* `collect_impl`
 (today: parameters must be the self type's arguments in order:
 `later_impl`), `front/check/calls/paths.vl: impl_param_count,
 bind_impl_params`.
+In an instance, a parameter of a pattern impl that the receiver's type
+and the arguments leave free is taken from the bound of the receiver's
+type parameter that names the impl's trait: `r.start_bound()` with `R:
+RangeBounds<K>`, `R = RangeFull`, is `impl<T> RangeBounds<T> for
+RangeFull` with `T = K` (0.28.0: `m.range(..)`, `v.drain(..)`).
+In an instance a receiver `*a` of `a: &T` is a `T`: when no impl of
+what `T` points to takes the call, `T`'s own does, as the generic body
+resolved it by `T`'s bound (`<&u8 as PartialEq<&u8>>::eq` in
+`Option<&u8>::eq`); and a receiver that is a reference to a view, `k:
+&K` with `K = &str`, is the view's own impl, not its place's (`K:
+Borrow<K>` is the reflexive impl; 0.28.0, gap 59). *Anchor:*
+`front/convert: unify_recv_bound, dispatch`. Cases
+`rust_t_bound_blanket_impl`, `rust_t_borrow_reflexive`.
 
 **F14.2 (positional binding).** An instance's arguments bind a template
 impl's parameters by position only when the header names them in order
@@ -1609,8 +1622,19 @@ Add<&str> for String`).
 When the operand is a view (`[T]`, `str`, Z9.1, where `&str` is the view
 too), an impl whose argument is written `&..` yields to one that is not:
 `PartialEq<str>` and `PartialEq<&'a str>` compare alike (0.27.2.1).
-*Anchor:* `front/check/synth_mode.vl: synth_operands`,
-`front/convert: by_view_rhs`. Case `rust_f_f26_cmp_rhs_ok`.
+A comparison whose left type has exactly one impl of the operator's
+trait (a derive's `PartialEq for Option<T>`) gives the right operand
+that type as its expected type, as rustc's inference does: `a ==
+Some(0)` of an `Option<i64>`, `v.last() == Some(&0)`; and a left operand
+that is a call holding a literal without a suffix (`Some(0) == a`) is
+read after the right one, with its type expected (0.28.0, gap 103).
+A comparison of two references with no impl of their own is of what
+they refer to, level by level (Rust's `impl PartialEq<&B> for &A`):
+`&a == &b` of two `&u8`, `a == b` of `a: &T` with `T = &u8`; never of
+the addresses (0.28.0; a raw pointer compares its address).
+*Anchor:* `front/check/synth_mode.vl: synth_operands, binary_result`,
+`front/convert: by_view_rhs, one_generic_trait_fn`. Cases
+`rust_f_f26_cmp_rhs_ok`, `rust_t_ref_eq_instance`.
 
 ### F27 Patterns in `let` and parameters
 
