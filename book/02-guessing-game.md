@@ -273,16 +273,14 @@ ok: built guess
 $ echo seven | ./guess
 Guess the number!
 Please input your guess.
-guess.vl:11:17: requires failed: 'self.is_ok()' of 'Result<i32, ParseIntError>::unwrap' (<std>:2849:13)
+guess.vl:11:17: called `Result::unwrap()` on an `Err` value
 $ echo $?
 101
 ```
 
 `parse` returned an `Err`, and `unwrap` stopped the program. The message
 starts with the file, line and column of the `unwrap` that failed. Then
-it says which check failed: `unwrap` requires its `Result` to be an
-`Ok` (that is the `self.is_ok()`), and this one wasn't. The position at
-the end is where the standard library states that requirement. The
+it says what went wrong: `unwrap` was called on an `Err`. The
 program exits with status 101, which in vole always means "stopped by
 a failed check". A failure like this is called a *panic*.
 

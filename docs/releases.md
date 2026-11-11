@@ -284,6 +284,56 @@ The front for the rust edition (front280):
   `Allocator::free` list, so an impl is checked against them, as in
   MVS.
 
+std2 gets the rest of MVS's std (std280):
+
+- **std::path.** `Path` and `PathBuf<A>`, with Rust's names and
+  results. That covers components (`Component::RootDir`, `CurDir`,
+  `ParentDir`, `Normal`, from both ends), `iter`, `ancestors`, `parent`,
+  `file_name`, `file_stem`, `extension`, `starts_with`, `ends_with`,
+  `strip_prefix`, `join_in`, `with_extension_in`, `with_file_name_in`,
+  `push`, `pop`, `set_extension`, `set_file_name`, `exists`, `is_dir`,
+  `is_file`, and equality by components. A named divergence: Rust's
+  `Path` is an unsized newtype reached as `&Path`. The rust edition has
+  no user-defined DSTs yet (cut to 0.29), so `Path<'a>` is a sized,
+  copyable view of a `&'a str`, written `Path<'_>` (or `Path`, elided)
+  where Rust writes `&Path`. A component is a `&str` where Rust's is an
+  `&OsStr`, and paths are UTF-8. `PathBuf` derefs to `str` and has
+  Path's methods itself. When unsized newtypes come, `Path<'a>` becomes
+  `&'a Path`. std::fs and `env::set_current_dir` take a path as
+  `P: AsRef<str>`, Rust's `AsRef<Path>` (a `&str`, a `&String`, a `Path`
+  or a `&PathBuf`), not a `&str`. `DirEntry::path` stays a `&str`.
+  *Cases:* `std2_path_path` (a rustc twin: every result on 19 paths, as
+  Rust's), `std2_path_pathbuf`. The ten `sem_views_pth_*` cases run
+  without XFAIL, nine of them as rustc's borrowck errors.
+- **std::random.** MVS's xoshiro256++ generator, vole's own API, since
+  Rust's std has none: `Xoshiro256pp` (seeded from a number through
+  splitmix64, from a state or from the system's entropy), its ranges by
+  Lemire's method, `unit_f64`, `random_bool`, `fill_bytes` and `jump`,
+  plus `shuffle` and `fill_bytes_os`. The outputs are MVS's (and
+  rand_xoshiro's) on the same seeds. *Cases:* `std2_random_xoshiro`,
+  `std2_random_empty_range`.
+- **std::sys.** MVS's OS layer, vole's own at the libc crate's level,
+  with the `sys_` names and `Result<T, i32>` errnos MVS's had. It has
+  files and descriptors, stat, directories, the environment,
+  posix_spawn, signals, waitpid, pseudo-terminals, termios, poll,
+  clocks and getentropy. Rust's std::sys is private, and std::fs,
+  process and env are Rust's API above it. A path, a name or written
+  data is a `P: AsRef<[u8]>`, so a text literal goes where MVS's `[u8]`
+  went. Pointers C only reads are `*const`. The target's numbers
+  (O_NONBLOCK, the TIOC requests, ...) and strerror_r are in
+  std2/rt/sys_macos.vl and sys_linux.vl. *Cases:* `sys_files`,
+  `sys_process`, `sys_pty`, `sys_layout` (struct layouts against the C
+  headers), run without XFAIL and under `--check-alloc`.
+- **std::capture.** The frame-capture request that std::window's
+  scripted loop makes (`shot FILE`) and std::gpu serves when a frame is
+  presented: `capture_next_frame(&str)`, `capture_pending`,
+  `capture_cancel` and `take_capture(&mut String<A>)`. The request is a
+  `static mut`, guarded by an AtomicBool spin lock, so any thread may
+  make or serve one. *Case:* `std2_capture_request`.
+- tools/std2-checklist.py reads MVS's items from an MVS program
+  (examples/args). Since the flip, the tree's root is a rust program
+  whose std is std2, so the checklist could not be made.
+
 ### What's new in 0.27.8
 
 The last release before the flip, and the compiler that builds 0.28.0.
