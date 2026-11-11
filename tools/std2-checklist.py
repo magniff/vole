@@ -49,23 +49,8 @@ import sys
 TOP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TREE = os.path.join(TOP, "compiler", "std2")
 OUT = os.path.join(TREE, "checklist.tsv")
-# An MVS program: its std is MVS's. tests/query/stdpos0253 while it is one;
-# else the first example that has not moved to the rust edition (when MVS's
-# std goes, D4, the `mvs` columns go with it).
+# An MVS program (examples/ stays MVS until after 0.28): its std is MVS's.
 MVS_ROOT = "tests/query/stdpos0253/main.vl"
-
-
-def mvs_root():
-    import glob
-    cands = [os.path.join(TOP, MVS_ROOT)] + sorted(glob.glob(os.path.join(TOP, "examples", "*", "main.vl")))
-    for p in cands:
-        if not os.path.exists(p):
-            continue
-        with open(p) as f:
-            if "// EDITION: rust" not in f.read(300):
-                return os.path.relpath(p, TOP)
-    die("no program of the old edition is left to read MVS's std from")
-
 
 # MVS owners and modules in the 0.27.0 brief's scope: an item of theirs that
 # no std2 item or gone.tsv line names is reported.
@@ -497,7 +482,7 @@ def mvs_items(volec, wanted_traits):
     try:
         # (0.28.0) an MVS program's std: since the flip the tree's root
         # (compiler/src) is a rust program, whose std is std2
-        r = subprocess.run([volec, "query", "items", "std", "--root", mvs_root(), "--budget", "10000000"],
+        r = subprocess.run([volec, "query", "items", "std", "--root", MVS_ROOT, "--budget", "10000000"],
                            capture_output=True, text=True, cwd=TOP, timeout=300)
     except OSError as e:
         die(f"{volec}: {e}")
@@ -538,7 +523,7 @@ def mvs_items(volec, wanted_traits):
     for module, t in traits:
         if t not in wanted_traits:
             continue
-        r = subprocess.run([volec, "query", "show", f"{module}::{t}", "--root", mvs_root()], capture_output=True,
+        r = subprocess.run([volec, "query", "show", f"{module}::{t}", "--root", MVS_ROOT], capture_output=True,
                            text=True, cwd=TOP, timeout=60)
         for line in r.stdout.split("\n"):
             if line.lstrip().startswith("//"):

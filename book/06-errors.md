@@ -523,11 +523,11 @@ fn main() {
 
 ```out exit=101
 port 8080
-port.vl:2:5: requires failed: 'self.is_ok()' of 'Result<i64, ParseIntError>::unwrap' (<std>:2849:13)
+port.vl:2:5: called `Result::unwrap()` on an `Err` value
 ```
 
 The line names the position of the failing call (line 2, the `unwrap`
-in `port_of`) and the check that failed: `unwrap` requires an `Ok`. When the function that failed is called from many
+in `port_of`) and what went wrong: an `unwrap` of an `Err`. When the function that failed is called from many
 places, you'll also want to know how the program got there. Build with
 `--trace`, and a panic prints the calls that led to it, innermost
 first:
@@ -537,7 +537,7 @@ $ volec port.vl -o port --trace
 ok: built port
 $ ./port
 port 8080
-port.vl:2:5: requires failed: 'self.is_ok()' of 'Result<i64, ParseIntError>::unwrap' (<std>:2849:13)
+port.vl:2:5: called `Result::unwrap()` on an `Err` value
 trace, innermost call first:
   port.vl:2  port_of
   port.vl:6  show
@@ -605,7 +605,7 @@ fn main() {
 ```
 
 ```out exit=101
-need more than four workers
+main.vl:6:5: need more than four workers: workers = 3
 ```
 
 `assert_eq(&a, &b)` checks that two values are equal (it borrows both,
