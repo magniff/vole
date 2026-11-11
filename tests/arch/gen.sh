@@ -22,12 +22,15 @@
 # table's `semantics` column, translated (compiler/arch/README.md,
 # "Semantics"), or, when the column is prose, `fn ref_NAME` in
 # tests/arch/ref/*.vl. The reference takes the intrinsic's parameters
-# (a vector or a slice as its lanes, `[D]`; a scalar as `D`; a constant
-# or an index as `i64`; the slice of a store as `inout [D]`, which it
+# (a vector or a slice as its lanes, `&[D]`; a scalar as `D`; a constant
+# or an index as `i64`; the slice of a store as `&mut [D]`, which it
 # writes) and, for a vector result, the lane `k: i64`, and returns that
 # lane (or the scalar) as `D`: D is i64 for integers narrower than 64
 # bits, the lane type itself for 64-bit ones, f64 for floats. A ref file
-# holds only functions; its helpers' names must be its own. A failure
+# holds only functions; its helpers' names must be its own. The programs
+# and the references are in the rust edition (0.28): an index is a
+# usize, so the generator writes a parameter's `s[E]` as `s[(E) as
+# usize]`, and a reference does the same. A failure
 # prints `FAIL NAME`, the inputs and the lane.
 #
 # --check builds each program at each level (-O): the host's

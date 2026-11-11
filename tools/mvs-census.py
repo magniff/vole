@@ -14,6 +14,9 @@ An entry is:
             and every module file reached only from such roots
   old-std   a rust-edition root that asks for the old std (`// ENV:
             VOLE_STD2=0`)
+  generator a script (.awk, .sh, .py, .pl) that writes vole programs and
+            has MVS's words in what it writes (tests/fuzz/gen.awk); its
+            programs are not in the tree, so no other class sees them
   std       a file of the old std, compiler/std
   guide     a topic of compiler/guide with code blocks that is not in
             tests/guide/run.sh's RUST_TOPICS
@@ -53,9 +56,18 @@ MOD = re.compile(r"(?:^|[;{}])\s*(?:pub(?:\([a-z]+\))?\s+)?mod\s+([A-Za-z_][A-Za
 # MVS's words, for a text no root reaches
 MVS_WORDS = re.compile(
     r"^\s*(?:pub\s+)?(?:static\s+)?var\s+[a-z_]|\b(?:inout|sink)\s+[A-Za-z_&*\[(]|^\s*defer\s|\bself:\s*\*"
-    r"|[(,]\s*[a-z_][a-z0-9_]*:\s*\[[A-Za-z0-9_]+\]\s*[,)]|\)\s*->\s*\[[A-Za-z0-9_]+\]\s*\{|\.len\b(?!\s*\()"
+    r"|[(,]\s*[a-z_][a-z0-9_]*:\s*\[[A-Za-z0-9_]+\]\s*[,)]|\)\s*->\s*\[[A-Za-z0-9_]+\]\s*\{|(?<=[A-Za-z0-9_\])])\.len\b(?!\s*\()"
     r"|:\s*\*(?!const\b|mut\b)[A-Za-z]", re.M)
 MAIN = re.compile(r"\bfn\s+main\s*\(")
+# A script that writes vole programs (a generator: tests/arch/gen.awk,
+# the fuzzers): its text has a `fn NAME(` and MVS's words, wherever they
+# stand in a line (inside a string, after a quote)
+GEN_EXT = (".awk", ".sh", ".py", ".pl")
+GEN_FN = re.compile(r"\bfn\s+[a-z_][a-z0-9_]*\s*(?:<[^>]*>)?\(")
+GEN_WORDS = re.compile(
+    r"\bvar\s+[a-z_][a-z0-9_]*\s*(?::\s*[A-Za-z\[(&*]|=[^=])|\b(?:inout|sink)\s+[A-Za-z_&*\[(]|\bself:\s*\*"
+    r"|[(,]\s*[a-z_][a-z0-9_]*:\s*\[[A-Za-z0-9_]+\]\s*[,)]|\)\s*->\s*\[[A-Za-z0-9_]+\]\s*\{"
+    r"|[a-z_\])]\.len\b(?!\s*\()|[a-z_]:\s*\*(?!const\b|mut\b)[A-Za-z*]")
 
 
 def read(path):
@@ -79,7 +91,9 @@ def owner(path):
         return "mig28"
     if path.startswith(("tests/translate", "tests/flip28", "tests/refactor/edition0")):
         return "d5"
-    if path.startswith("tools/numtables/") or (top[0] == "tests" and top[1] != "agent-eval"):
+    if path.startswith("tools/numtables/"):
+        return "d4"
+    if path.startswith("tools/agent-hooks/") or (top[0] == "tests" and top[1] != "agent-eval"):
         return "del280"
     return "other"
 
@@ -151,6 +165,24 @@ def programs(paths):
         entries.append(("program", p, "root" if p in roots else "module"))
     for r in old_std:
         entries.append(("old-std", r, ""))
+    return entries
+
+
+def generators(paths):
+    """The scripts that write MVS programs: (class, path, the first MVS
+    word and how many lines have one). The census's own files and the
+    translator's are not generators."""
+    entries = []
+    for p in sorted(paths):
+        if not p.endswith(GEN_EXT) or p.startswith(("tools/mvs-census", "tools/translate", ".claude/")):
+            continue
+        text = read(p)
+        if not GEN_FN.search(text):
+            continue
+        hits = [(i, m.group(0).strip()) for i, line in enumerate(text.split("\n"), 1)
+                for m in [GEN_WORDS.search(line)] if m]
+        if hits:
+            entries.append(("generator", p, "line %d `%s`, %d lines" % (hits[0][0], hits[0][1][:24], len(hits))))
     return entries
 
 
@@ -235,7 +267,7 @@ def main(argv):
             return 2
         i += 1
     paths = tracked()
-    entries = programs(paths) + docs(paths)
+    entries = programs(paths) + generators(paths) + docs(paths)
     allow = load_allow(allow_file)
     counts = {}
     dirs = {}
