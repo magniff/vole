@@ -222,7 +222,6 @@ out (`#[array_builtin(N)]`, a blanket impl, an impl on an instance).
 
 | feature | release |
 |---|---|
-| `const_ptr_write` (a write through `*const T`) | 0.27.1 |
 | `where_bound` (a bound on a type that is not a parameter), `array_builtin`, `qualified_path` (a longer path than `<T as Tr>::X`), `auto_trait` (`Send`, `Sync`) | 0.27.2 |
 | `impl_trait_return` (`-> impl Tr` at the top of a function's result) | 0.27.2.1 |
 | `impl_trait_nested` (`-> Option<impl Tr>`, a trait method's `-> impl Tr`, `let x: impl Tr`) | 0.29 |
