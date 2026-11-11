@@ -13,7 +13,7 @@
 --- a/main.vl
 +++ b/main.vl
 @@ -1,0 +2 @@
-+use std::collections::hash_map::HashMap;
++use std::collections::HashMap;
 $ fix
 fixed 1 missing import	main.vl	+1 -0 lines
 $ check
