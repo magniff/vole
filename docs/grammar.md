@@ -2166,8 +2166,7 @@ match_expr += "match" "&" expr "{" arms "}" ;           (* binds inout accesses 
   is `conv.set`, and `sink T` outside a parameter `conv.sink_type`.
   Rust's spellings (`&T`, `&mut T`, `&mut x`, `&self`, `let mut`, `mut
   x`, `static mut`, `move`, `*r` on an access) are `conv.rust`, each
-  with the new form in a `try:` line; `volec fix --only conventions`
-  rewrites a program.
+  with the new form in a `try:` line.
 - Not yet: results that are accesses (`-> let T`, `-> inout T`,
   `Option<inout V>`) and `for inout x in &v`; until they land,
   `get_or_insert(k, v)` and `get_mut(k)` give one-element views
