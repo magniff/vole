@@ -179,6 +179,11 @@ for case_ in "$@"; do
         if [ "$want" = guard_write ] && { [ "$first" = E0594 ] || [ "$first" = E0596 ]; }; then
             gotcode=guard_write
         fi
+        # (0.28.0, M8: E0381 is also a binding read before it is assigned,
+        # `let y: i64; println("{y}")`: use_uninit)
+        if [ "$want" = use_uninit ] && [ "$first" = E0381 ]; then
+            gotcode=use_uninit
+        fi
         # (E0308 where an `impl Trait` result's values differ, D21.2)
         if [ "$want" = opaque.mismatch ] && [ "$first" = E0308 ]; then
             gotcode=opaque.mismatch
