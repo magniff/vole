@@ -1880,6 +1880,14 @@ elements' types from the impl's index type, as one literal does
 *Anchor:* `front/convert: literal_kind, literal_tuple_fits`. Case
 `rust_f_f20_tuple_index_ok`.
 
+**F20.7 (an index through Deref, 0.28.0).** `g[i]` of a type that has
+Deref and no Index (a `MutexGuard<Vec<T>>`, an `Arc<Vec<T>>`, a `Box<[T;
+N]>`, a struct with its own Deref), or of a reference to one, is
+`(*g)[i]`: rustc's autoderef of an index's base. The `*g` is checked as
+one written, so a place written goes through `deref_mut` (a guard not
+declared `mut` is E0596). *Anchor:* `check/synth_mode.vl: synth_index`.
+Cases `rust_t_index_deref`, `rust_b_err_index_deref_mut`.
+
 ## 6. The bound-only rule (D22.3's front side; U1)
 
 **D22.3 (restated for the front).** In a rust-edition generic body
