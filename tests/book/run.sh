@@ -110,7 +110,7 @@ chmod +x "$WORK/bin/volec"
 # then. In a rust chapter, a block or a session that waits for the
 # compiler is left as it was and marked `mvs` (```vole mvs, ```console
 # mvs): it is checked as MVS's until it is rewritten.
-RUST_CHAPTERS=" 01 03 04 05 07 09 10 11 15 16 "
+RUST_CHAPTERS=" 01 02 03 04 05 06 07 09 10 11 13 15 16 "
 rust_chapter() { case "$RUST_CHAPTERS" in *" ${1%%-*} "*) echo 1 ;; *) echo 0 ;; esac; }
 
 # Splits chapter $1 (named $2) into units under $WORK/units: a directory
@@ -370,6 +370,12 @@ check_unit() {
                 rc=$?
                 trimmed "$d/build/run.out" >"$d/got"
                 trimmed "$d/out" >"$d/want"
+                # (0.28) a panic's line may name a position in std (`unwrap`'s
+                # requires): compared normalized, as a session's is
+                if grep -q '<std>:' "$d/want" && ! grep -q '^<!-- exact-std -->' "$ROOT/book/${name%%:*}.md" 2>/dev/null; then
+                    awk -f "$ROOT/tests/stdpos.awk" "$d/got" >"$d/got.n" && mv "$d/got.n" "$d/got"
+                    awk -f "$ROOT/tests/stdpos.awk" "$d/want" >"$d/want.n" && mv "$d/want.n" "$d/want"
+                fi
                 want_rc=$(cat "$d/exit")
                 if ! cmp -s "$d/got" "$d/want"; then
                     { echo "FAIL $name: output differs"; echo "    --- the book says"; sed 's/^/    /' "$d/want"; echo

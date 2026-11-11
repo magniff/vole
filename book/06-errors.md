@@ -26,15 +26,17 @@ value may simply not be there, and that's nothing unusual. The standard
 library uses it that way everywhere:
 
 ```vole
+use std::collections::HashMap;
+
 fn main(gpa: Gpa) {
-    let line: str = "port = 8080";
+    let line = "port = 8080";
     println("{:?} {:?}", line.find("="), line.find("#"));
 
-    var defaults: HashMap<str, i64, Gpa> = HashMap::new_in(gpa);
+    let mut defaults: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
     defaults.insert("port", 80);
     defaults.insert("workers", 4);
-    let port = defaults.get("port").unwrap_or(0);
-    let timeout = defaults.get("timeout").unwrap_or(30);
+    let port = defaults.get("port").copied().unwrap_or(0);
+    let timeout = defaults.get("timeout").copied().unwrap_or(30);
     println("{port} {timeout}");
 
     if let Some(w) = defaults.get("workers") {
@@ -50,10 +52,11 @@ Some(5) None
 ```
 
 `line.find("=")` is the position of the first `=`, if there is one.
-`defaults.get(key)` is the value stored under `key`, if there is one (a
-`HashMap` is a table from keys to values; chapter 7 has more). Neither
-is an error when the answer is "nowhere": it's one of the two expected
-outcomes.
+`defaults.get(key)` is a reference to the value stored under `key`, if
+there is one, and `copied()` makes that an `Option` of the number
+itself (a `HashMap` is a table from keys to values; chapter 7 has
+more). Neither is an error when the answer is "nowhere": it's one of
+the two expected outcomes.
 
 You've now seen three ways to get at what's inside an `Option`:
 
@@ -75,7 +78,7 @@ want to know what went wrong. That's `Result<T, E>`: either `Ok(value)`,
 holding a `T`, or `Err(error)`, holding an `E` that describes the
 failure. Parsing a number is the classic example:
 
-```vole
+```vole mvs
 fn main() {
     let good: str = "8080";
     let bad: str = "80x80";
@@ -111,7 +114,7 @@ Our settings parser can fail in several ways, so let's give it an
 error enum, with one variant for each way, and the facts a user would
 need to fix the file:
 
-```vole settings.vl
+```vole settings.vl mvs
 use std::ParseIntError;
 
 enum ConfigError {
@@ -227,7 +230,7 @@ fn parse_line(s: str, number: i64) -> Result<Setting, ConfigError> {
     }
 }
 -->
-```vole
+```vole mvs
 struct Config { port: i64, name: str }
 
 fn load(text: str) -> Result<Config, ConfigError> {
@@ -283,7 +286,7 @@ Look back at `parse_line`. It still has a `match` to turn the
 `ParseIntError` from `parse` into a `ConfigError`. Can we use `?`
 there too? Let's try:
 
-```vole
+```vole mvs
 use std::ParseIntError;
 
 enum ConfigError {
@@ -325,7 +328,7 @@ enum ConfigError {
     Unknown(i64),
 }
 -->
-```vole
+```vole mvs
 impl From<ParseIntError> for ConfigError {
     fn from(e: ParseIntError) -> ConfigError {
         ConfigError::BadNumber(e)
@@ -364,7 +367,7 @@ enum Setting {
     Name(str),
 }
 -->
-```vole
+```vole mvs
 fn parse_port_line(s: str, number: i64) -> Result<Setting, ConfigError> {
     let (key, value) = s.split_once("=").ok_or(ConfigError::MissingEquals(number))?;
     if key.trim() != "port" {
@@ -383,7 +386,7 @@ work all the way up. When `main` returns an `Err`, the program prints
 the type needs `#[derive(Debug)]`, as in chapter 5. Here's the whole
 program, reading the settings from standard input:
 
-```vole settings.vl
+```vole settings.vl mvs
 use std::{ParseIntError, io};
 use std::io::BufReader;
 
@@ -465,7 +468,7 @@ serving vole on port 8080
 
 And a few bad ones:
 
-```console
+```console mvs
 $ volec settings.vl -o settings
 ok: built settings
 $ printf 'port = 80x80\n' | ./settings
@@ -504,11 +507,11 @@ thought impossible: those are bugs in the program. For them, vole
 status 101. You've seen panics already:
 
 ```vole port.vl
-fn port_of(value: str) -> i64 {
+fn port_of(value: &str) -> i64 {
     value.parse::<i64>().unwrap()
 }
 
-fn show(value: str) {
+fn show(value: &str) {
     println("port {}", port_of(value));
 }
 
@@ -520,11 +523,11 @@ fn main() {
 
 ```out exit=101
 port 8080
-port.vl:2:5: called unwrap on Err
+port.vl:2:5: requires failed: 'self.is_ok()' of 'Result<i64, ParseIntError>::unwrap' (<std>:2849:13)
 ```
 
-The line names the position of the failing call: line 2, the `unwrap`
-in `port_of`. When the function that failed is called from many
+The line names the position of the failing call (line 2, the `unwrap`
+in `port_of`) and the check that failed: `unwrap` requires an `Ok`. When the function that failed is called from many
 places, you'll also want to know how the program got there. Build with
 `--trace`, and a panic prints the calls that led to it, innermost
 first:
@@ -534,7 +537,7 @@ $ volec port.vl -o port --trace
 ok: built port
 $ ./port
 port 8080
-port.vl:2:5: called unwrap on Err
+port.vl:2:5: requires failed: 'self.is_ok()' of 'Result<i64, ParseIntError>::unwrap' (<std>:2849:13)
 trace, innermost call first:
   port.vl:2  port_of
   port.vl:6  show
@@ -553,7 +556,7 @@ fn main() {
         1 => "odd",
         _ => unreachable(),
     };
-    println(parity);
+    println("{parity}");
 }
 ```
 
@@ -562,7 +565,7 @@ odd
 ```
 
 (The remainder of a positive number divided by 2 is 0 or 1, but the
-compiler only knows it's an `i64`, so the `match` needs the last arm.)
+compiler only knows it's an `i32`, so the `match` needs the last arm.)
 
 A panic is not a crash. Nothing goes on running in a broken state:
 vole checks, and stops cleanly at the first sign of trouble, before a
@@ -594,20 +597,20 @@ them for you. `assert` checks a condition and panics if it's false:
 fn main() {
     let workers = 3;
     let per_worker = 10;
-    assert_eq(workers * per_worker, 30);
+    let total = workers * per_worker;
+    assert_eq(&total, &30);
     assert(workers > 4, "need more than four workers");
     println("not reached");
 }
 ```
 
 ```out exit=101
-main.vl:5:5: need more than four workers: workers = 3
+need more than four workers
 ```
 
-`assert_eq(a, b)` checks that two values are equal; `assert(c,
-"message")` checks a condition, with a message for when it fails. The
-failure line shows the values of the numbers in the condition, which is
-often all you need to see what went wrong.
+`assert_eq(&a, &b)` checks that two values are equal (it borrows both,
+so each gets a `&`); `assert(c, "message")` checks a condition, with a
+message for when it fails.
 
 A function can state what it needs from its caller, with `requires`
 between its signature and its body:
