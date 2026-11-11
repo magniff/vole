@@ -225,7 +225,7 @@ case noalloc in
 *"$FILTER"*)
     why="$WORK/noalloc.why"
     : >"$why"
-    printf 'use std::gpu;\nfn main(gpa: Gpa) {\n    let _i = gpu::Instance::new_in(gpa);\n}\n' >"$WORK/noalloc.vl"
+    printf '// EDITION: rust\nuse std::gpu;\nfn main(gpa: Gpa) {\n    let _i = gpu::Instance::new_in(gpa);\n}\n' >"$WORK/noalloc.vl"
     for f in std::gpu::Device::encoder std::gpu::Device::bind_group std::gpu::Encoder::compute_pass std::gpu::Encoder::render_pass \
              std::gpu::Encoder::copy_buffer std::gpu::Encoder::copy_texture_to_buffer std::gpu::Encoder::finish \
              std::gpu::ComputePass::set_pipeline std::gpu::ComputePass::set_bind_group std::gpu::ComputePass::dispatch \
@@ -246,17 +246,24 @@ case noalloc in
                 # file's path in a Buf, std::capture::take_capture). That
                 # runs only after capture_next_frame, a debugging path, not
                 # the per-frame one, so a chain whose first step is
-                # capture::write passes. Until 0.26.2 the check never saw
-                # it: the first step found was the drop of `f` (Id::drop,
+                # capture::write_frame passes. Until 0.26.2 the check never
+                # saw it: the first step found was the drop of `f` (Id::drop,
                 # into C); a drop's call is now found after the body's.
+                # (0.28.0) A second one, which the chain through unknown C
+                # hid until std's C symbols had their effects: a copy that
+                # names a mappable buffer (MAP_READ, MAP_WRITE) notes it
+                # once in the encoder (Encoder::uses, for the gpu.state
+                # contracts of submit): a push when that buffer is new to
+                # the encoder. A readback's path, not a frame's drawing.
                 chain=$("$COMPILER" query effects "$f" --root "$WORK/noalloc.vl" --why 'alloc(Gpa)' 2>&1)
                 last=$(printf '%s\n' "$chain" | tail -1)
                 first=$(printf '%s\n' "$chain" | sed -n 2p)
                 case "$first" in
-                    *"calls 'std::gpu::capture::write'"*) last="(the capture)" ;;
+                    *"calls 'std::gpu::capture::write_frame'"*) last="(the capture)" ;;
+                    *"calls 'Encoder<Gpa>::uses'"*) last="(the maps)" ;;
                 esac
                 case "$last" in
-                    *"calls C's"*|*"(no source found)"*|"(the capture)") ;;
+                    *"calls C's"*|*"(no source found)"*|"(the capture)"|"(the maps)") ;;
                     *) echo "$f allocates from Gpa: $out" >>"$why"
                        printf '%s\n' "$chain" | sed 's/^/    /' >>"$why" ;;
                 esac ;;
