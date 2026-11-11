@@ -170,6 +170,11 @@ added parameter scale: i64 to crate::geom::area, 2 calls	2 files	+2 -2 lines
 $ undo
 undid added parameter scale: i64 to crate::geom::area, 2 calls	2 files	+2 -2 lines
 % git status --short
+## (0.28.0) --convention writes the old edition's let, inout and sink: refused
+## on a rust program, with the option that does it.
+$ refactor signature area --convention p inout
+error refactor.usage: --convention is the old edition's; change the parameter's type: --type p '&mut T'
+[exit 1]
 ## --- field ---
 ## (0.26: a field main's literal names is `pub`, or the literal breaks)
 $ refactor field Point --add 'pub z: i64 = 0' --dry-run

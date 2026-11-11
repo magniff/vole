@@ -645,6 +645,25 @@ printf 'struct P { x: i64 }\n\nlet p = P { x: 4 };\np.x * 10\n' >"$WORK/snip.vl"
 try_case file 'i64 = 40' --file "$WORK/snip.vl"
 got=$(printf '7\n' | "$COMPILER" try 'var b = String::new_in(gpa); read_line(&b).unwrap(); parse_int(b.as_slice()).ok()' 2>&1)
 if [ "$got" = 'Option<i64> = Some(7)' ]; then result pass try-stdin; else result FAIL try-stdin "$got"; fi
+# (0.28.0) a rust snippet, on std2: its value printed by Debug; a type
+# with none, its type alone.
+rust_try_case() { # <name> <expected output> <snippet...>
+    n=$1
+    want=$2
+    shift 2
+    got=$(VOLE_STD2=1 "$COMPILER" --edition rust try "$@" 2>&1)
+    if [ "$got" = "$want" ]; then
+        result pass "try-rust-$n"
+    else
+        result FAIL "try-rust-$n" "expected:" "$want" "got:" "$got"
+    fi
+}
+rust_try_case int 'i32 = 3' '1 + 2'
+rust_try_case vec 'Vec<i64, Gpa> = [4, 5]' 'let mut v: Vec<i64, Gpa> = Vec::new_in(gpa); v.push(4); v.push(5); v'
+rust_try_case tuple '(u8, Option<bool>) = (2, Some(true))' '(2u8, Some(true))'
+rust_try_case output "hi
+f64 = 1.5" 'println("hi"); 1.5'
+rust_try_case nodebug 'P' 'struct P { x: i32 } P { x: 1 }'
 "$COMPILER" try >"$WORK/try.out" 2>&1
 rc=$?
 if [ $rc -eq 2 ] && grep -q '^error try.usage: ' "$WORK/try.out" && grep -q "^try: .* try 'let v" "$WORK/try.out"; then
