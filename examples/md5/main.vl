@@ -1,31 +1,12 @@
+// EDITION: rust
 // md5: the MD5 digest (RFC 1321) of a file, or of stdin, in hex.
 //
 // usage: md5 [FILE]
-extern "C" {
-    fn read(fd: i32, buf: *u8, count: u64) -> i64;
-    fn open(path: *u8, flags: i32, ...) -> i32;
-    fn close(fd: i32) -> i32;
-}
-
 use std::env;
 use std::cli::{Arg, Command};
-
-const O_RDONLY: i32 = 0;
-
-// A file descriptor, closed when the guard is dropped, on every way out
-// of the function that holds it; stdin (0) is left open.
-struct Fd { fd: i32 }
-
-impl Drop for Fd {
-    fn drop(inout self) {
-        if self.fd != 0 {
-            // UNSAFE: close(2) is the C library's; std has no file descriptor type.
-            // SAFETY: the descriptor is the one open() returned, held by this guard
-            // alone, and closed once, here.
-            unsafe { close(self.fd); }
-        }
-    }
-}
+use std::fmt::Write;
+use std::fs::File;
+use std::io::{Read, self};
 
 // The round constants: floor(2^32 * abs(sin(i + 1))).
 static K: [u32; 64] = [
@@ -60,13 +41,13 @@ fn rotl(x: u32, n: u32) -> u32 {
 }
 
 // The little-endian u32 at s[at..at + 4].
-fn load_le(s: [u8], at: i64) -> u32 {
+fn load_le(s: &[u8], at: usize) -> u32 {
     s[at] as u32 | (s[at + 1] as u32 << 8) | (s[at + 2] as u32 << 16) | (s[at + 3] as u32 << 24)
 }
 
 // The digest of a stream of bytes: `update` with each part, then `finish`.
 // `block` holds the bytes of a block not yet complete (`used` of them).
-struct Md5 { state: [u32; 4], block: [u8; 64], used: i64, total: u64 }
+struct Md5 { state: [u32; 4], block: [u8; 64], used: usize, total: u64 }
 
 impl Md5 {
     fn new() -> Md5 {
@@ -79,32 +60,27 @@ impl Md5 {
     }
 
     // Mixes one 64-byte block into the state.
-    fn compress(inout self, block: [u8]) {
-        var m: [u32; 16] = [0; 16];
-        for i in 0..16 {
+    fn compress(&mut self, block: &[u8]) {
+        let mut m: [u32; 16] = [0; 16];
+        for i in 0..16usize {
             m[i] = load_le(block, i * 4);
         }
-        var a = self.state[0];
-        var b = self.state[1];
-        var c = self.state[2];
-        var d = self.state[3];
-        for i in 0..64 {
-            var f: u32 = 0;
-            var g: i64 = 0;
-            if i < 16 {
-                f = (b & c) | (~b & d);
-                g = i;
+        let mut a = self.state[0];
+        let mut b = self.state[1];
+        let mut c = self.state[2];
+        let mut d = self.state[3];
+        for i in 0..64usize {
+            // the round's function of b, c, d, and its message word
+            let (f, g) = if i < 16 {
+                ((b & c) | (!b & d), i)
             } else if i < 32 {
-                f = (d & b) | (~d & c);
-                g = (5 * i + 1) % 16;
+                ((d & b) | (!d & c), (5 * i + 1) % 16)
             } else if i < 48 {
-                f = b ^ c ^ d;
-                g = (3 * i + 5) % 16;
+                (b ^ c ^ d, (3 * i + 5) % 16)
             } else {
-                f = c ^ (b | ~d);
-                g = (7 * i) % 16;
-            }
-            f = f.wrapping_add(a).wrapping_add(K[i]).wrapping_add(m[g]);
+                (c ^ (b | !d), (7 * i) % 16)
+            };
+            let f = f.wrapping_add(a).wrapping_add(K[i]).wrapping_add(m[g]);
             a = d;
             d = c;
             c = b;
@@ -116,46 +92,43 @@ impl Md5 {
         self.state[3] = self.state[3].wrapping_add(d);
     }
 
-    fn update(inout self, data: [u8]) {
+    fn update(&mut self, data: &[u8]) {
         self.total += data.len() as u64;
-        var at = 0;
+        let mut rest = data;
         // complete the pending block first
         if self.used > 0 {
-            while self.used < 64 && at < data.len() as i64 {
-                self.block[self.used] = data[at];
-                self.used += 1;
-                at += 1;
-            }
+            let n = rest.len().min(64 - self.used);
+            self.block[self.used..self.used + n].copy_from_slice(&rest[..n]);
+            self.used += n;
+            rest = &rest[n..];
             if self.used < 64 {
                 return;
             }
-            let block = self.block; // a copy: compress changes self
-            self.compress(block[..]);
+            let block = self.block; // a copy: compress borrows self mutably
+            self.compress(&block);
             self.used = 0;
         }
-        while data.len() as i64 - at >= 64 {
-            self.compress(data[at..at + 64]);
-            at += 64;
+        while rest.len() >= 64 {
+            self.compress(&rest[..64]);
+            rest = &rest[64..];
         }
-        for b in data[at..] {
-            self.block[self.used] = b;
-            self.used += 1;
-        }
+        self.block[..rest.len()].copy_from_slice(rest);
+        self.used = rest.len();
     }
 
     // Pads the message (a 1 bit, zeros, its length in bits) and returns
     // the digest.
-    fn finish(inout self) -> [u8; 16] {
+    fn finish(&mut self) -> [u8; 16] {
         let bits = self.total * 8;
-        var tail: [u8; 72] = [0; 72];
+        let mut tail: [u8; 72] = [0; 72];
         tail[0] = 0x80;
         // up to 56 bytes into a block, then the 8 of the length
         let pad = if self.used < 56 { 56 - self.used } else { 120 - self.used };
         for i in 0..8 {
             tail[pad + i] = (bits >> (8 * i)) as u8;
         }
-        self.update(tail[..pad + 8]);
-        var digest: [u8; 16] = [0; 16];
+        self.update(&tail[..pad + 8]);
+        let mut digest: [u8; 16] = [0; 16];
         for i in 0..16 {
             digest[i] = (self.state[i / 4] >> (8 * (i % 4))) as u8;
         }
@@ -163,39 +136,49 @@ impl Md5 {
     }
 }
 
+// Everything `input` has, through the hash, 64 KiB at a time. Generic over
+// the reader: a File and stdin both implement io::Read.
+fn digest<R: Read>(input: &mut R) -> io::Result<[u8; 16]> {
+    let mut hash = Md5::new();
+    let mut chunk: [u8; 65536] = [0; 65536];
+    loop {
+        let n = input.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&chunk[..n]);
+    }
+    Ok(hash.finish())
+}
+
 fn main(gpa: Gpa) -> i32 {
     let cmd = Command::new_in("md5", gpa).about("the MD5 digest of a file, or of stdin, in hex")
         .arg(Arg::positional("file").help("the file to read (none: stdin)"));
     let m = cmd.parse_or_exit(env::args());
-    var fd: i32 = 0;
-    if let Some(file) = m.get("file") {
-        // (C wants the path NUL-terminated: a slice is not)
-        var path = String::new_in(gpa);
-        path.push_str(file);
-        path.push(0);
-        unsafe { fd = open(path.as_slice().ptr, O_RDONLY); }
-        if fd < 0 {
-            eprintln("error: cannot open file");
+    let result = match m.get("file") {
+        // The File is closed when it is dropped, at the end of this arm.
+        Some(path) => match File::open(path) {
+            Ok(mut file) => digest(&mut file),
+            Err(_) => {
+                eprintln("error: cannot open file");
+                return 1;
+            }
+        },
+        None => digest(&mut io::stdin()),
+    };
+    let bytes = match result {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln("error: {e}");
             return 1;
         }
-    }
-    let _file = Fd { fd };
-
-    var hash = Md5::new();
-    var chunk: [u8; 65536] = [0; 65536];
-    loop {
-        let n = unsafe { read(fd, &chunk as *u8, 65536) };
-        if n <= 0 {
-            break;
-        }
-        hash.update(chunk[..n]);
-    }
+    };
 
     // Each byte as two hex digits: the spec `02x` pads with a zero.
-    var hex = String::new_in(gpa);
-    for byte in hash.finish() {
-        hex.push_fmt("{byte:02x}");
+    let mut hex = String::new_in(gpa);
+    for byte in bytes {
+        write(&mut hex, "{byte:02x}").unwrap();
     }
-    println(hex.as_slice());
+    println("{hex}");
     0
 }

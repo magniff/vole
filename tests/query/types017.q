@@ -1,11 +1,11 @@
 ## query items TYPE (0.17): a type's own line and the functions of its
 ## impl blocks (std's types too: what an unknown method's try: names).
 $ items Shape
-# crate::Shape	types017/main.vl:3:10
+# crate::Shape	types017/main.vl:3:33
 3	enum	pub enum Shape
 8	impl	impl Shape
 9	method	pub fn area(self) -> i64
-16	method	pub fn name(self) -> [u8]
+16	method	pub fn name(self) -> &'static str
 $ items Nothing
 error query.no-match: no module 'Nothing'
 try: volec query items

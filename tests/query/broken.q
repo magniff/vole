@@ -32,6 +32,7 @@ warning query.program-errors: 5 errors in the program; results may be incomplete
 try: volec --diagnostics=short broken/main.vl -c -o /dev/null
 $ items
 crate	broken/main.vl	8
+std	<std>	87
 crate::util	broken/util.vl	1
 warning query.program-errors: 5 errors in the program; results may be incomplete
 try: volec --diagnostics=short broken/main.vl -c -o /dev/null

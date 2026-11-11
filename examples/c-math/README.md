@@ -5,7 +5,7 @@ Numerical methods in vole, checked against the C math library
 Newton's method for roots. The algorithms are generic over the function
 they work on (`F: Fn(f64) -> f64`), so they take vole closures, and
 libm's functions go in through closures too. The results print with
-f-strings; libm's out-parameter functions (`frexp`, `modf`) show how C
+format strings; libm's out-parameter functions (`frexp`, `modf`) show how C
 returns a second value through a pointer.
 
 ## Build and run
@@ -73,8 +73,9 @@ println("sqrt(2)      = {:.12}", c::sqrt(2.0));
 
 `import "math.h" as c;` declares libm's functions as `c::sqrt`,
 `c::tgamma`, ... with C's `double` as `f64`. A call to C is unsafe, so
-the block of calls sits in one `unsafe { }`; an f-string hole can hold
-any expression, a C call included, and `:.12` prints twelve decimals.
+the block of calls sits in one `unsafe { }`, under the comments that
+say why it is needed and why it is sound; a call is an argument of
+`println` like any value, and `:.12` prints twelve decimals.
 `round(-2.5)` is `-3`: C rounds halves away from zero.
 
 Object-like macros that are numbers come in as constants:
@@ -85,21 +86,21 @@ instead.
 ### Out-parameters
 
 ```tach
-var exponent: i32 = 0;
-let mantissa = unsafe { c::frexp(48.0, &exponent) };
+let mut exponent: i32 = 0;
+let mantissa = unsafe { c::frexp(48.0, &mut exponent) };
 println("frexp(48)    = {mantissa:.4} * 2^{exponent}");
 ```
 
 C functions that return two values write the second through a pointer
-(`int *exp`). `&exponent` is the address of a vole local, a `*i32`,
-valid for the call.
+(`int *exp`). `&mut exponent` borrows a vole local for the call and
+converts to the `*mut i32` C wants.
 
 ### Algorithms generic over the function
 
 ```tach
 fn simpson<F: Fn(f64) -> f64>(f: F, a: f64, b: f64, n: i64) -> f64 {
     let h = (b - a) / n as f64;
-    var sum = f(a) + f(b);
+    let mut sum = f(a) + f(b);
     for i in 1..n {
         let x = a + i as f64 * h;
         sum += if i % 2 == 1 { 4.0 * f(x) } else { 2.0 * f(x) };
@@ -111,7 +112,9 @@ fn simpson<F: Fn(f64) -> f64>(f: F, a: f64, b: f64, n: i64) -> f64 {
 A parameter `f: F` with the bound `F: Fn(f64) -> f64` takes a closure or
 a plain function; each call site gets its own copy of `simpson` with the
 closure inlined, so there is no indirect call per evaluation. libm's
-functions go in wrapped in closures, which also hold the `unsafe`:
+functions go in wrapped in closures, which also hold the `unsafe`. A
+closure that captures nothing, or only copies, is itself a copy, so the
+loop passes `sin` again each time:
 
 ```tach
 let sin = |x: f64| unsafe { c::sin(x) };
@@ -127,14 +130,15 @@ step).
 ```tach
 let x = 4.5;
 let integrand = |t: f64| unsafe { c::pow(t, x - 1.0) * c::exp(-t) };
-var gamma_calls = 0;
-let gamma = adaptive(integrand, 0.0, 60.0, 1e-11, &gamma_calls);
+let mut gamma_calls = 0;
+let gamma = adaptive(integrand, 0.0, 60.0, 1e-11, &mut gamma_calls);
 ```
 
-The closure captures `x` (read only: `x` is a `let`). `adaptive` splits an
-interval only where the two halves disagree with the whole, and counts
-its evaluations through an `inout i64` parameter (`&gamma_calls` at the
-call). The integral of
+The closure captures `x` by reference. `adaptive` splits an interval
+only where the two halves disagree with the whole, and counts its
+evaluations through a `&mut i64` parameter (`&mut gamma_calls` at the
+call); its recursive half, `refine`, takes the function as `&F`, so the
+two recursive calls share it. The integral of
 `t^(x-1) e^-t` is the Gamma function, which libm's `tgamma` computes
 directly: the two agree to 1e-8 (the integral is cut at 60). The normal
 distribution's mass within two standard deviations is checked the same
@@ -152,15 +156,15 @@ root and the steps taken, as an `Option` of a tuple matched with
 
 ```tach
 fn newton<F: Fn(f64) -> f64, D: Fn(f64) -> f64, T: FnMut(i64, f64)>(
-    f: F, df: D, x0: f64, trace: sink T,
+    f: F, df: D, x0: f64, mut trace: T,
 ) -> Option<f64>
 ```
 
 Newton's method takes three closures: the function, its derivative, and
 a `FnMut` that sees each iterate (here it prints them: the number of
 correct digits doubles each step). Calling a `FnMut` may change what it
-captured, so `newton` takes it `sink`: it owns the closure and may call
-it as often as it likes. A zero derivative gives `None`,
+captured, so the parameter is `mut trace`: `newton` owns the closure and
+may call it as often as it likes. A zero derivative gives `None`,
 printed with `{flat:?}`.
 
 ## C interop rules in brief
@@ -169,8 +173,8 @@ printed with `{flat:?}`.
   f64) -> f64; }` by hand. C calls are `unsafe`; a closure can wrap one so
   that generic code calls it safely.
 - **Types**: `double` is `f64`, `float` is `f32`, `int` is `i32`, `T *`
-  is `*T`. Floats pass to C by value exactly as C expects.
-- **Out-parameters**: pass `&local`; C writes through it.
+  is `*mut T`. Floats pass to C by value exactly as C expects.
+- **Out-parameters**: pass `&mut local`; C writes through it.
 - **Callbacks into C APIs** must be `extern "C" fn` (see
   [c-qsort](../c-qsort/)); closures are for vole's own generic code.
 - **Linking**: libm is linked when the program calls into it (on Linux
@@ -182,7 +186,7 @@ printed with `{flat:?}`.
   `volec guide c-interop`
 - closures, captures, `Fn` and `FnMut` bounds: `volec guide closures`
 - generic functions with several type parameters: `volec guide generics`
-- f-strings with precision and width (`{x:.12}`, `{v:>12.3}`), `{o:?}`:
+- format strings with precision and width (`{x:.12}`, `{v:>12.3}`), `{o:?}`:
   `volec guide formatting`
 - tuples, `Option<(f64, i64)>`, pattern matching: `volec guide syntax`
 - `unsafe` blocks inside closures: `volec guide unsafe`

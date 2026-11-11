@@ -1,19 +1,21 @@
 # Tests, properties and fuzzing
 
-Tests are written in the language (0.18) and run by `volec test`,
+Tests are written in the language and run by `volec test`,
 which builds them at -O0 and at -O2 and compares the two. Other builds
 leave test items out; `check` and the queries see them.
 
 A test that allocates takes the allocator as its parameter, as `main`
-does: `#[test] fn t(gpa: Gpa) { var v = Vec::new_in(gpa); .. }` (there
-is no `Gpa::default()` or `Gpa::new()`; the test runner gives the gpa,
-and checks that the test frees what it allocates).
+does: `#[test] fn t(gpa: Gpa) { let mut v = Vec::new_in(gpa); .. }` (the
+test runner gives the gpa, and checks that the test frees what it
+allocates).
 
 ## #[test]
 
 ```vole
-fn gap(v: [i64]) -> i64 {
-    var best = 0;
+use std::str::ParseIntError;
+
+fn gap(v: &[i64]) -> i64 {
+    let mut best = 0;
     for i in 1..v.len() {
         if v[i] - v[i - 1] > best {
             best = v[i] - v[i - 1];
@@ -24,24 +26,24 @@ fn gap(v: [i64]) -> i64 {
 
 #[test]
 fn gap_of_three() {
-    assert_eq(gap([1, 5, 6][..]), 4);
+    assert_eq(&gap(&[1, 5, 6]), &4);
 }
 
 #[test]
-fn parses() -> Result<(), std::ParseIntError> {
-    let n = std::parse_int("12")?;
+fn parses() -> Result<(), ParseIntError> {
+    let n: i64 = "12".parse()?;
     assert(n == 12);
     Ok(())
 }
 
 #[test]
 fn keeps_nothing(gpa: Gpa) {
-    var b = Buf::new_in(gpa);
+    let mut b = String::new_in(gpa);
     b.push_str("dropped at the end");
 }
 
 fn main() -> i32 {
-    std::print_int(gap([2, 9][..]));
+    println("{}", gap(&[2, 9]));
     0
 }
 ```
@@ -56,15 +58,17 @@ fn main() -> i32 {
 - `#[cfg(test)] mod tests;` (a file, or `mod tests { .. }`) is a module
   only test builds have. It sees its parent's items without an import:
   `use super::*;` is refused (`import.wildcard`; no wildcard imports).
-- `assert_snapshot(x)` compares `{x:?}` with
-  `tests/snapshots/MODULE__TEST__N.snap`; the first run writes it, a
+- `std::test::assert_snapshot(&x)` compares `{x:?}` with
+  `tests/snapshots/MODULE__TEST__N.snap` (`TEST__N.snap` in the root
+  module); the first run writes it, a
   change fails with the first differing line, `--accept` rewrites it.
 - A `#[test]` sees what its module sees: written in the
   module it tests, it calls that module's private functions and
-  methods, and reads any field (a field is as visible as its struct:
-  `guide modules#visibility`), so a test of a widget's state needs no
-  `pub` and no accessor. From another module a private function is an
-  error (`'clamp01' is private`).
+  methods, and reads its private fields (`guide modules#visibility`),
+  so a test of a widget's state needs no `pub` and no accessor. From
+  another module they are errors (`item.private`: `'clamp01' is
+  private`; `field.private`: `field 'active' of 'Slider' is private to
+  module 'widget'`).
 
 ```vole widget.vl
 // A slider: `drag` and `clamp01` are private to this module.
@@ -75,14 +79,14 @@ pub fn slider_new() -> Slider {
 }
 
 impl Slider {
-    pub fn press(inout self, x: f64) {
+    pub fn press(&mut self, x: f64) {
         self.active = true;
         self.drag(x);
     }
 
-    pub fn value(self) -> f64 { self.value }
+    pub fn value(&self) -> f64 { self.value }
 
-    fn drag(inout self, x: f64) {
+    fn drag(&mut self, x: f64) {
         if self.active {
             self.value = clamp01(x);
         }
@@ -95,7 +99,7 @@ fn clamp01(x: f64) -> f64 {
 
 #[test]
 fn a_press_starts_a_drag() {
-    var s = slider_new();
+    let mut s = slider_new();
     s.press(0.25);
     assert(s.active); // the state behind the widget
     s.drag(2.0); // a private method
@@ -108,9 +112,9 @@ mod widget;
 use widget::slider_new;
 
 fn main() {
-    var s = slider_new();
+    let mut s = slider_new();
     s.press(0.5);
-    println(s.value());
+    println("{}", s.value());
 }
 ```
 ```out
@@ -157,7 +161,7 @@ fn stays_inside() {
 // step's `v * dt` into `v` and this fails; stays_inside still passes).
 #[test]
 fn moves_by_v_dt() {
-    assert_eq(step(0.25, 0.5, 0.5), 0.5);
+    assert_eq(&step(0.25, 0.5, 0.5), &0.5);
 }
 
 fn main() -> i32 {
@@ -171,6 +175,8 @@ A property's parameters are generated: 100 cases (`--cases N`), sizes
 growing, a failure shrunk to a small input and printed with its seed.
 
 ```vole
+use std::test::{Arbitrary, Gen};
+
 fn clamp(x: i64, lo: i64, hi: i64) -> i64 {
     if x < lo { lo } else if x > hi { hi } else { x }
 }
@@ -185,8 +191,8 @@ fn clamp_stays_in(x: i64, lo: i64, hi: i64) {
 
 struct Small { n: i64 }
 
-impl std::Arbitrary for Small {
-    fn arbitrary(g: inout std::Gen<Gpa>) -> Small {
+impl Arbitrary for Small {
+    fn arbitrary(g: &mut Gen<Gpa>) -> Small {
         Small { n: g.int_in(0, 9) }
     }
 }
@@ -197,7 +203,7 @@ fn small_is_small(s: Small) {
 }
 
 fn main() -> i32 {
-    std::print_int(clamp(12, 0, 9));
+    println("{}", clamp(12, 0, 9));
     0
 }
 ```
@@ -205,10 +211,11 @@ fn main() -> i32 {
 9
 ```
 
-- Numbers, bool, `Vec<T, A>`, `[T]`, `Buf`, `Option`, `Result`, tuples
-  and the program's structs and enums are generated from their types;
-  `impl std::Arbitrary` gives a type its own (`g.int_in(lo, hi)`,
-  `g.choose(n)`, `g.bool()`, `g.size()`).
+- Numbers, bool, char, `Vec<T, Gpa>`, `&[T]`, `String<Gpa>`, `&str`,
+  `Option`, `Result` and tuples are generated from their types; a
+  struct or an enum of the program needs its `impl Arbitrary`
+  (`std::test::{Arbitrary, Gen}`: `g.int_in(lo, hi)`, `g.choose(n)`,
+  `g.bool()`, `g.size()`).
 - Each case runs in a child process; its values are dropped after it,
   and a block it leaves allocated fails the case (a leak).
 - A function with an `ensures` is tested as a property too, its
@@ -218,11 +225,11 @@ fn main() -> i32 {
 
 ```text
 $ volec test
-test main.vl: 6 passed, 2 failed (1 case, 5 #[test], 2 #[property], 1 contract; -O0 and -O2 agree)
-FAIL gap_needs_two: checks.vl:14:8: index out of bounds: index 1, length 1
-  trace: checks.vl:14 checks::gap_needs_two
-FAIL bubble_sorts (property, case 11 of 100, shrunk in 8 steps): not sorted
-  input: v = [1, 0]
+test main.vl: 4 passed, 2 failed (1 case, 3 #[test], 1 #[property], 1 contract; -O0 and -O2 agree)
+FAIL gap_needs_two: checks.vl:24:12: index out of bounds: index 1, length 1
+  trace: checks.vl:24 checks::gap_needs_two
+FAIL bubble_sorts (property, case 11 of 100, shrunk in 496 steps): not sorted
+  input: v = [0, 0, -2]
   try: volec test bubble_sorts --seed 0xf788dd27897d1fed main.vl
 ```
 
@@ -241,20 +248,20 @@ FAIL bubble_sorts (property, case 11 of 100, shrunk in 8 steps): not sorted
 ## #[fuzz] and volec fuzz
 
 ```vole
-fn parse(data: [u8]) -> i64 {
-    if data.len() >= 2 && data[0] == 'O' && data[1] == 'K' {
+fn parse(data: &[u8]) -> i64 {
+    if data.len() >= 2 && data[0] == b'O' && data[1] == b'K' {
         return 1;
     }
     0
 }
 
 #[fuzz]
-fn parse_never_crashes(data: [u8]) {
+fn parse_never_crashes(data: &[u8]) {
     let _ = parse(data);
 }
 
 fn main() -> i32 {
-    std::print_int(parse("OK"));
+    println("{}", parse(b"OK"));
     0
 }
 ```
@@ -266,7 +273,7 @@ fn main() -> i32 {
 (every block counts in std's map) and mutates inputs, keeping those that
 reach new code. A crash is shrunk, saved under `.volec/fuzz/NAME/`
 and replayed by every `volec test` after (`--accept` keeps it in
-`tests/fuzz/NAME/`). A `#[fuzz]` takes one `[u8]` (or any generated
+`tests/fuzz/NAME/`). A `#[fuzz]` takes one `&[u8]` (or any generated
 types, like a property).
 
 ## volec reduce over programs

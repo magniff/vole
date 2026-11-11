@@ -54,7 +54,7 @@ export LC_ALL
 # and --split writes its prog.vl with `// EDITION: rust` first (the twin's
 # guide programs). A topic moves here when its examples are translated
 # (0.28.0 workstream C); the others are MVS's until then.
-RUST_TOPICS=" allocators arch c-interop cli closures contracts conversions core debug errors example fmt formatting generics how io iterators language math memory modules std syntax text threads tools traits types unsafe "
+RUST_TOPICS=" allocators arch c-interop cli closures contracts conversions core debug errors example fmt formatting generics how io iterators language math memory modules std syntax text threads testing tools traits types unsafe "
 rust_topic() { case "$RUST_TOPICS" in *" $1 "*) echo 1 ;; *) echo 0 ;; esac; }
 
 HERE=$(cd "$(dirname "$0")" && pwd)

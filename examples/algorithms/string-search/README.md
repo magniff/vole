@@ -61,34 +61,36 @@ short and its advantage small.
 **A trait for the searchers.** Each one implements `each_match`, which
 calls a closure with every match position; `count` is a default method
 written once on top of it. The closure parameter is generic (`F:
-FnMut(i64)`), so each use is its own instance with the closure inlined:
+FnMut(usize)`), so each use is its own instance with the closure inlined:
 counting compiles to a loop with an increment, no call per match.
 
 ```tach
 trait Searcher {
-    fn each_match<F: FnMut(i64)>(self, text: [u8], found: F);
+    fn each_match<F: FnMut(usize)>(&self, text: &[u8], found: F);
 
-    fn count(self, text: [u8]) -> i64 {
-        var n = 0;
-        self.each_match(text, |_| { n += 1; });   // `var n`: the closure changes it in place
+    fn count(&self, text: &[u8]) -> i64 {
+        let mut n = 0;
+        self.each_match(text, |_| { n += 1; });   // `let mut n`: the closure changes it in place
         n
     }
 }
 ```
 
 The demo collects positions with another closure, `|i| at.push(i)`, and
-prints the `Vec` with `{at:?}`.
+prints the `Vec` with `{at:?}`. A searcher borrows its pattern
+(`struct Naive<'a> { pat: &'a [u8] }`): the text is searched as bytes,
+and a `&str` gives its own with `as_bytes()`.
 
 **Naive** compares the first byte, then the window as a slice: `==` on
-two `[u8]` compares their bytes.
+two `&[u8]` compares their bytes.
 
 ```tach
 for i in 0..text.len() - m + 1 {
-    if text[i] == first && text[i..i + m] == pat { found(i); }
+    if text[i] == first && &text[i..i + m] == pat { found(i); }
 }
 ```
 
-**KMP** builds the failure table in a `Vec` (`Vec::filled_in(m, 0, gpa)`) and
+**KMP** builds the failure table in a `Vec` (`Vec::from_elem_in(0, m, gpa)`) and
 writes it through a slice; the search is the same loop over the text:
 
 ```tach
@@ -103,26 +105,26 @@ for i in 0..text.len() {
 }
 ```
 
-**Horspool** keeps its shift table as an array value, `[i64; 256]`,
-inside the struct, indexed by a byte (`shift[b]`: any integer type
-indexes):
+**Horspool** keeps its shift table as an array value, `[usize; 256]`,
+inside the struct, indexed by a byte (`shift[b as usize]`):
 
 ```tach
-var shift = [m; 256];
-for j in 0..m - 1 { shift[pat[j]] = m - 1 - j; }
+let mut shift = [m; 256];
+for j in 0..m - 1 { shift[pat[j] as usize] = m - 1 - j; }
 ...
 while i + m <= text.len() {
     let b = text[i + m - 1];
-    if b == last && text[i..i + m - 1] == head { found(i); }
-    i += self.shift[b];
+    if b == last && &text[i..i + m - 1] == head { found(i); }
+    i += self.shift[b as usize];
 }
 ```
 
 **The driver** runs each searcher on each pattern through a generic
 `timed<S: Searcher>`, which adds the time to a slot of `times` (passed
-as `&times[k]`, an inout access to an array element), and stops with exit
+as `&mut times[k]`, a mutable borrow of one array element), and stops with exit
 status 1 if the counts disagree. The word count is an iterator,
-`t.iter().filter(|b| b == ' ').count()`.
+`t.iter().filter(|b| **b == b' ').count()` (`b' '` is the byte, a `u8`;
+`' '` is a `char`).
 
 ## Output
 
@@ -179,12 +181,12 @@ per position and KMP still one.
 | feature | where | guide |
 |---|---|---|
 | a trait with a generic method and a default method | `Searcher` | `volec guide traits` |
-| closures as `FnMut` arguments, capturing a `var` and changing it | `count`, `demo` | `volec guide closures` |
+| closures as `FnMut` arguments, capturing a `let mut` and changing it | `count`, `demo` | `volec guide closures` |
 | generic functions bounded by a trait | `timed<S: Searcher>` | `volec guide generics` |
-| `[u8]` slices, slicing, `==` by bytes | the searchers | `volec guide types` |
-| arrays as values, `[m; 256]`, indexed by a `u8` | `Horspool` | `volec guide types` |
+| `&[u8]` slices, slicing, `==` by bytes, structs that borrow (`<'a>`) | the searchers | `volec guide types` |
+| arrays as values, `[m; 256]` | `Horspool` | `volec guide types` |
 | iterators: `iter().filter(..).count()`, `fail.iter()` | `main`, `demo` | `volec guide iterators` |
-| f-strings: `{pat:<12}`, `{n:>8}`, `{b:c}`, `{v:?}`, `{x:>6.1}` | output | `volec guide formatting` |
+| format strings: `{pat:<12}`, `{:>8}`, `{at:?}`, `{ms:>6.1}` | output | `volec guide formatting` |
 | drops: each pattern's KMP table freed at the end of its loop iteration | `main` | `volec guide memory` |
 | a C header for the clock | `now_ns` | `volec guide c-interop` |
 

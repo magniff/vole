@@ -269,6 +269,20 @@ The front for the rust edition (front280):
   const or mut, and no reference prints `&'a T`, because a lifetime is
   the borrow checker's and not part of the type. 15 cases' `ERROR`
   lines moved to the new spelling.
+- **Effect declarations are checked in a rust program.** A rust
+  program's `#[no_io]`, `#[no_panic]`, `#[pure]` and `#[effects(..)]`
+  let through whatever came by a fn value: a `println`, a Drop that
+  prints and is reached through a Vec's drop, or a closure the body
+  makes. Each is now the function's own, as in MVS (E3.3b). A panic is
+  `panic diverge`, not io: its message goes out through its own buffer,
+  as MVS's `panic_str` (E1.6). So std2's lists that named io only
+  because they panic were written again by `fix --only effects-std`
+  (181 out, 168 back, 61 of them with io). `fix` takes `--check-alloc`
+  for that run. std2's `assert(true)` is no effect, and its
+  `debug_assert` is dropped outside test builds. `PartialEq::eq` and
+  `Ord::cmp` are `#[pure]`, and `Allocator::deallocate` carries MVS's
+  `Allocator::free` list, so an impl is checked against them, as in
+  MVS.
 
 std2 gets the rest of MVS's std (std280):
 
