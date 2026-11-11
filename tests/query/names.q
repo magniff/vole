@@ -25,7 +25,7 @@ $ show geom.vl:16:9 clash/main.vl:33 --root clash/main.vl
     pub fn len(self) -> i64 {
         self.x * self.x + self.y * self.y
     }
-// crate::main	clash/main.vl:30-52	effects: alloc(Gpa) io panic diverge unsafe
+// crate::main	clash/main.vl:30-52	effects: alloc(Gpa) io panic unsafe
 fn main(gpa: Gpa) -> i32 {
     let helper: i64 = 3;
     let n = a_helper() + b::helper() + helper;

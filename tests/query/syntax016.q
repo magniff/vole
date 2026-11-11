@@ -26,7 +26,6 @@ $ refs Pair
 45:24	init	main	let p: Pair<i64> = Pair { a: s.area(), b: unsafe { labs(-2) } };
 $ effects apply grow_by_one main
 apply<closure(i64) -> i64 at syntax016/main.vl:48:32>	none
-apply<F>	none
 crate::grow_by_one	alloc(Gpa) panic diverge
 crate::main	alloc(Gpa) io panic diverge unsafe
 $ def Vec::new_in

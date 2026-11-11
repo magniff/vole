@@ -11,9 +11,9 @@ std::ptr::NonNull::add	<std>:1600:19	method	pub unsafe fn add(self, count: usize
 std::alloc::Chunks::add	<std>:3301:8	method	fn add<P: Allocator>(&self, parent: &P, bytes: usize) -> Result<(), AllocError>
 <std::string::String as Add>::add	<std>:9945:8	method	fn add(self, other: &'b str) -> String<A>
 std::flt::Big::add	<std>:15411:8	method	fn add(&mut self, o: &Big)	effects: panic diverge
-<std::time::Duration as Add>::add	<std>:25380:8	method	fn add(self, rhs: Duration) -> Duration	effects: panic diverge
-<std::time::Instant as Add>::add	<std>:25668:8	method	fn add(self, d: Duration) -> Instant	effects: panic diverge
-<std::time::SystemTime as Add>::add	<std>:25764:8	method	fn add(self, d: Duration) -> SystemTime	effects: panic diverge
+<std::time::Duration as Add>::add	<std>:32055:8	method	fn add(self, rhs: Duration) -> Duration	effects: panic
+<std::time::Instant as Add>::add	<std>:32336:8	method	fn add(self, d: Duration) -> Instant	effects: panic
+<std::time::SystemTime as Add>::add	<std>:32429:8	method	fn add(self, d: Duration) -> SystemTime	effects: panic
 std::gpu::Unwritten::add	<std>:32833:8	method	fn add(&mut self, o: Unwritten, group: i64)	effects: panic
 ## (quotes and tabs escaped)
 $ query grep bad --json
