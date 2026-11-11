@@ -83,10 +83,9 @@ no-query: need the comment above run_gvn, show omits it` (or `# no-tool:
 every Write/Edit of a `.vl` file and every writing `volec` command:
 what changed since the last check (new errors, how many fixed) is added
 to that call's result; nothing added means no change, so do not run
-`check` after an edit. It makes only the mechanical exact fixes itself
-(a call's `&` marker, an import unused at two checks)
-and shows each change, `changed FILE:LINE: OLD -> NEW` (repeats in one
-line), then `the hook rewrote FILE: ...`, all it wrote (`volec undo`
+`check` after an edit. It makes one fix itself (it removes an import
+unused at two checks)
+and shows each change, `changed FILE:LINE: OLD -> NEW`, then `the hook rewrote FILE: ...`, all it wrote (`volec undo`
 takes it back; `VOLE_HOOK_FIX=0`: off); a new `.vl` file you Write
 outside compiler/src and compiler/std it formats (`volec fmt`) and names
 the same way; it says once when another file you changed is not

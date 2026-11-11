@@ -39,14 +39,13 @@ errors left (the 0.18 eval: the line was offered 43 times and run once):
     fixed main.vl:2:5: undefined variable 'prinln' | did you mean 'println'?
     volec check main.vl: 0 errors (1 fixed)
 
-(0.25.2.1) Only the mechanical classes, whose fix changes no meaning:
-a call's `&` marker (conv.marker, conv.marker_extra), as `fix
---suggested --codes ... --diff` (0.28: not conv.rust, which respelled
-Rust as the old edition; the rust edition is the language); and an
-unused import that was unused at the last check too (`fix --only unused
---in FILE`; not one just written). Each change is shown:
+(0.25.2.1) Only a fix that changes no meaning; (0.28.0) there is one:
+an unused import that was unused at the last check too (`fix --only
+unused --in FILE`; not one just written). The call's `&` marker and
+Rust's spellings were the old edition's errors, gone with it. Each
+change is shown:
 
-    changed marks.vl:11: bump(&mut ui); -> bump(&ui);
+    changed main.vl:1: - use std::fs;
 
 The other exact fixes (a did-you-mean, a conversion, a `use`, a path:
 the 0.25.2 eval's wrong fixes were all of these) are shown, not made,
@@ -59,14 +58,12 @@ with the compiler's refusals (`fix --suggested --dry-run`):
 VOLE_HOOK_FIX=0: the hook names the fix and applies nothing, as
 before. Not at a turn's end (turn-end.py).
 
-(0.25.2.2, after the 0.25.2.1 GPU eval) Repeats of one fix in a file
-are one line, and each file the hook rewrote is named once, after its
-changes: they are all it wrote (no formatter runs; the eval's `changed on
-disk` notices followed the agents' own sed -i, perl -pi and Python
-edits, 27 of 30, and the hook's fixes, 3):
+(0.25.2.2, after the 0.25.2.1 GPU eval) Each file the hook rewrote is
+named once, after its changes: they are all it wrote (no formatter runs;
+the eval's `changed on disk` notices followed the agents' own sed -i,
+perl -pi and Python edits, 27 of 30, and the hook's fixes, 3):
 
-    fixed 20 'x' to '&x' (conv.marker) in main.vl: lines 3, 7, ...
-    the hook rewrote main.vl: the 20 changes above, nothing else (read it again before an Edit)
+    the hook rewrote main.vl: the 2 changes above, nothing else (read it again before an Edit)
 
 (0.25.3, after the round 3 eval: five agents met `changed on disk` after
 the hook's fixes) Each change is still its `changed FILE:LINE: OLD -> NEW`
@@ -692,17 +689,13 @@ def exact_errors(errors):
     return [d for d in errors if any(SUGGESTED.search(t) for t in d.get("try") or [])]
 
 
-# (0.25.2.1) The exact fixes the hook makes itself: the mechanical
-# classes, whose fix changes no meaning (a call's `&` marker). Every other exact fix (a did-you-mean, a
-# conversion, a `use` or a path) is shown, not made: the 0.25.2 eval's
-# wrong ones (a cast of a cast, `std::abs` of an f64, a `use` of a
-# function where a bool goes, a call made recursive) were all of these.
-MECHANICAL = ("conv.marker", "conv.marker_extra")
+# (0.25.2.1) The hook makes no exact fix itself (a did-you-mean, a
+# conversion, a `use` or a path is shown, not made: the 0.25.2 eval's
+# wrong ones, a cast of a cast, `std::abs` of an f64, a `use` of a
+# function where a bool goes, a call made recursive, were all of these);
+# (0.28.0) the mechanical class it did make, a call's `&` marker, went
+# with the old edition. It removes an import unused at two checks.
 UNUSED = "use.unused"
-
-
-def mechanical(d):
-    return (d.get("code") or "") in MECHANICAL
 
 
 def fix_output(compiler, cwd, args, root=None):
@@ -768,18 +761,14 @@ def diff_changes(diff):
     return out
 
 
-def apply_exact(compiler, root, cwd, unused_in=(), suggested=True):
-    """(0.18.1; 0.25.2.1) The mechanical exact fixes, made: `volec fix
-    --suggested --codes MECHANICAL --diff ROOT`, and `fix --only unused
-    --in FILE` for each file of unused_in (the first when suggested;
-    one checked edit each,
+def apply_exact(compiler, root, cwd, unused_in=()):
+    """(0.18.1; 0.25.2.1) The hook's own fixes, made: `fix --only unused
+    --in FILE` for each file of unused_in (one checked edit each,
     journaled: `volec undo` takes it back). ([(file, what it fixed)],
     [each change, `FILE:LINE: OLD -> NEW`]), or None when nothing changed."""
     changed, lines = [], []
-    runs = [["--suggested", "--codes", ",".join(MECHANICAL), "--diff"]] if suggested else []
-    runs += [["--only", "unused", "--in", f, "--diff"] for f in unused_in]
-    for args in runs:
-        got = fix_output(compiler, cwd, args + root_args(root, cwd), root)
+    for f in unused_in:
+        got = fix_output(compiler, cwd, ["--only", "unused", "--in", f, "--diff"] + root_args(root, cwd), root)
         if got is None or not got[0]:
             continue
         changed += got[0]
@@ -796,111 +785,28 @@ def shown_exact(compiler, root, cwd):
     return diff_changes(got[1]) + [f"refused: {m}" for m in got[2]]
 
 
-# (0.25.2.2) An exact fix's change as the compiler's `try:` names it:
-# `edit patch FILE:LINE --old 'OLD' --new 'NEW'`.
-PATCH_TRY = re.compile(r"edit patch \S+ --old '([^']*)' --new '([^']*)'")
-QUOTED = re.compile(r"(?<!\w)'([^']+)'(?!\w)")
-WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-KEYWORDS = {"mut", "let", "var", "fn", "as", "in", "inout", "sink"}
-
-
-def fix_pattern(d):
-    """(0.25.2.2) The change an error's exact fix makes, with its names put
-    as x, y: ('&mut x', '&x') for `'&mut enc' is Rust's spelling`, ('x',
-    '&x') for a lent argument, ('let mut', 'var'): the key the report
-    groups repeated fixes by; None when the error does not say."""
-    old = new = None
-    for t in d.get("try") or []:
-        m = PATCH_TRY.search(t)
-        if m:
-            old, new = m.group(1), m.group(2)
-            break
-    if old is None:
-        q = QUOTED.findall(d.get("message") or "")
-        if len(q) < 2:
-            return None
-        old, new = q[0], q[-1]
-        # (`'&mut a' is ...: marked '&x'`: the message's own x)
-        ids = [w for w in WORD.findall(old) if w not in KEYWORDS]
-        if ids and re.search(r"\bx\b", new) and not re.search(r"\bx\b", old):
-            old = re.sub(r"\b%s\b" % ids[-1], "x", old)
-    # (the text both keep around the change: `(a` -> `(&a` is a -> &a)
-    while old and new and old[0] == new[0] and old[0] in "([{, ":
-        old, new = old[1:], new[1:]
-    while old and new and old[-1] == new[-1] and old[-1] in ")]}, ;":
-        old, new = old[:-1], new[:-1]
-    names = [w for w in dict.fromkeys(WORD.findall(old)) if w not in KEYWORDS and re.search(r"\b%s\b" % w, new)]
-    for k, w in enumerate(names[:3]):
-        v = "xyz"[k]
-        old = re.sub(r"\b%s\b" % w, v, old)
-        new = re.sub(r"\b%s\b" % w, v, new)
-    return old, new
-
-
 def same_file(a, b):
     a, b = os.path.normpath(a or ""), os.path.normpath(b or "")
     return a == b or a.endswith(os.sep + b) or b.endswith(os.sep + a)
 
 
-def fixed_report(fixed, changed, root_shown, lines=()):
+def fixed_report(changed, root_shown, lines=()):
     """(0.18.1) What the hook's fix did: a head, each change it made
-    (`FILE:LINE: OLD -> NEW`, 0.25.2.1), then each fixed error. (0.25.2.2)
-    Repeats of one fix in a file in one line (`fixed 20 'x' to '&x'
-    (conv.marker) in main.vl: lines 3, 7, ...`; the 0.25.2.1 eval's sdftext
-    had 20 lines of them), and at the end each file the hook rewrote, with
-    how many changes, once: those changes are all the hook wrote (the
-    harness's `changed on disk` notice after it is about them)."""
+    (`FILE:LINE: OLD -> NEW`, 0.25.2.1; every one a `changed` line,
+    0.25.3: five agents of the round 3 eval met the harness's `changed on
+    disk` notice after the hook's fixes), and at the end each file the
+    hook rewrote, with how many changes, once (0.25.2.2): those changes
+    are all the hook wrote."""
     where = " " + root_shown if root_shown else ""
-    head = [f"volec fix{where}, run by the hook (only mechanical fixes: a call's `&`, an import "
-            f"unused at two checks; volec undo takes it back; positions as before it):"]
-    groups = {}
-    for d in fixed:
-        pat = fix_pattern(d)
-        key = (d.get("file") or "", d.get("code") or "", pat) if pat else id(d)
-        groups.setdefault(key, []).append(d)
-    summed = [g for g in groups.values() if len(g) >= 2]
-    summed_ids = {id(d) for g in summed for d in g}
-    # (0.25.3) every change is a `changed FILE:LINE: OLD -> NEW` line (the
-    # round 3 eval: five agents met the harness's `changed on disk` notice
-    # after the hook's fixes, one agent's later string replacement missed
-    # its old text); past MAX_SHOWN, a change on a line of a summary line
-    # is left to that summary
-    on_line = {}
-    for d in fixed:
-        on_line.setdefault((os.path.normpath(d.get("file") or ""), d.get("line")), []).append(id(d))
-    kept = []
+    out = [f"volec fix{where}, run by the hook (only an import unused at two checks; volec undo takes it "
+           f"back; positions as before it):"]
     per_file = {}
-    left = 0
     for x in lines:
         m = re.match(r"^(.+?):(\d+): ", x)
-        f, ln = (m.group(1), int(m.group(2))) if m else ("", 0)
-        ids = next((v for (ff, ll), v in on_line.items() if ll == ln and same_file(ff, f)), [])
-        if len(lines) <= MAX_SHOWN or not (ids and all(i in summed_ids for i in ids)) or len(kept) < MAX_SHOWN:
-            kept.append(x)
-        else:
-            left += 1
-        if f:
-            per_file[f] = per_file.get(f, 0) + 1
-    out = head + [f"changed {x}" for x in kept]
-    if left:
-        out.append(f"changed: {left} more, on the lines the `fixed N ...` lines below name")
-    for d in fixed:
-        if id(d) in summed_ids:
-            continue
-        pos = f"{d['file']}:{d['line']}:{d['col']}: " if d.get("file") else ""
-        fix = " | ".join(d.get("help") or []) or "its exact fix"
-        out.append(f"fixed {pos}{d.get('message', '')} | {fix}")
-    for g in summed:
-        old, new = fix_pattern(g[0])
-        lns = sorted({d.get("line") for d in g if d.get("line")})
-        out.append(f"fixed {len(g)} '{old}' to '{new}' ({g[0].get('code', '')}) in {g[0].get('file') or 'the files'}: "
-                   f"line{'s' if len(lns) != 1 else ''} {', '.join(map(str, lns))}")
-    # (a file with no change line: its fixed errors are its changes)
-    for d in fixed:
-        f = d.get("file") or ""
-        if f and not any(same_file(k, f) for k in per_file):
-            per_file[f] = sum(1 for e in fixed if same_file(e.get("file") or "", f))
-    if not fixed and not lines:
+        if m:
+            per_file[m.group(1)] = per_file.get(m.group(1), 0) + 1
+    out += [f"changed {x}" for x in lines]
+    if not lines:
         out.append("fixed: " + "; ".join(f"{f}: {what}" for f, what in changed))
     files = sorted(set(per_file) | {f for f, _ in changed if f and not any(same_file(f, k) for k in per_file)})
     for f in files:
@@ -1418,17 +1324,14 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
     key_root = root or default_root(cwd)
     shown = root_shown(root, cwd, run_dir)
     errors = [d for d in diags if d.get("severity") == "error"]
-    # (0.18.1) the errors' exact fixes, applied: fix --suggested, then
-    # check again; (0.25.2.1) only the mechanical ones, and the unused
-    # imports that were unused at the last check too (not one the agent
-    # has just written); the other exact fixes shown, not made
+    # (0.18.1) the hook's own fix, then check again: (0.25.2.1) the
+    # unused imports that were unused at the last check too (not one the
+    # agent has just written); the errors' exact fixes shown, not made
     fixed_text, hook_fixed, shown_text = "", None, ""
     key = key_root or ("check@" + cwd)
     prev = (st.get("roots") or {}).get(key) or {}
     allowed = not at_turn_end and os.environ.get("VOLE_HOOK_FIX", "1") != "0" \
         and not expects_errors(cwd, key_root, edited)
-    exact = exact_errors(errors) if allowed else []
-    mech = [d for d in exact if mechanical(d)]
     unused = [d for d in diags if d.get("code") == UNUSED]
     unused_keys = [error_key(d) for d in unused]
     stale = []
@@ -1437,30 +1340,19 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
             mine = [error_key(d) for d in unused if d.get("file") == f]
             if f and all(k in (prev.get("unused") or []) for k in mine):
                 stale.append(f)
-    if mech or stale:
-        done = apply_exact(compiler, root, run_dir, stale, bool(mech))
+    if stale:
+        done = apply_exact(compiler, root, run_dir, stale)
         again = run_check(compiler, root, run_dir) if done else None
-        if done and again is None:
-            # (0.27.2.1) the check after the fixes could not run (timed
-            # out): what the hook wrote is said all the same, each change
-            hook_fixed = len(mech)
-            fixed_text = fixed_report(mech, done[0], shown, done[1])
+        if done:
+            # (0.27.2.1) said even when the check after the fixes could
+            # not run (timed out): what the hook wrote, each change
+            hook_fixed = len(done[1]) or len(done[0])
+            fixed_text = fixed_report(done[0], shown, done[1])
         if again is not None:
             diags = again
             errors = [d for d in again if d.get("severity") == "error"]
             unused_keys = [error_key(d) for d in again if d.get("code") == UNUSED]
-            left = {}
-            for d in errors:
-                left[error_key(d)] = left.get(error_key(d), 0) + 1
-            fixed = []
-            for d in mech:
-                if left.get(error_key(d), 0) > 0:
-                    left[error_key(d)] -= 1
-                else:
-                    fixed.append(d)
-            hook_fixed = len(fixed)
-            fixed_text = fixed_report(fixed, done[0], shown, done[1])
-    if allowed and any(not mechanical(d) for d in exact_errors(errors)):
+    if allowed and exact_errors(errors):
         lines = shown_exact(compiler, root, run_dir)
         if lines:
             shown_text = shown_report(lines, shown, compiler, run_dir)
