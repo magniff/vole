@@ -12,9 +12,9 @@ language server, `volec lsp`.
 ## Features
 
 - **Highlighting** (`syntaxes/vole.tmLanguage.json`, scope `source.vole`):
-  keywords, including the parameter conventions `let`, `inout`, `sink`
-  and `var` and the older `let mut`, `&mut`, `static mut` spelling, so
-  both read well during the transition; contracts (`requires`,
+  keywords; references and `mut` (`&mut T`, `let mut`, `*mut T`),
+  lifetimes (`'a`, `'static`), loop labels (`'outer:`), `where`, `impl`,
+  `dyn`; contracts (`requires`,
   `ensures`, `result`, `old(..)`); types and numbers with suffixes
   (`255u8`, `1.5f32`); strings with escapes, `c"..."`, `b"..."`,
   f-strings with their holes and format specs (`f"{x:>4}"`), char
@@ -30,7 +30,7 @@ language server, `volec lsp`.
   (`~/Library/Caches/vole/std-*`, `~/.cache/vole/std-*`) and the
   extension opens read-only; operators, type parameters, names in
   f-strings and contracts resolve too, and a hover on a keyword
-  (`inout`, `sink`), an attribute or a primitive type explains it.
+  (`unsafe`, `where`), an attribute or a primitive type explains it.
 - **Completion** (0.25.1) as you type, on code that does not parse yet:
   after `.` the receiver's fields and methods (`v.` of a `Vec<i64>`:
   `push`, `iter`...; a `str`'s, a struct's public ones), after `::` a
@@ -39,7 +39,7 @@ language server, `volec lsp`.
   the prelude and keywords, with snippets for calls and common forms.
   Each item shows its signature; the selected one its comment and
   effects. **Signature help** in a call's arguments: the parameters with
-  their conventions (`let`, `inout`, `sink`).
+  their types (`&T`, `&mut T`, by value).
 - **Formatting** (0.25.1): Format Document and Format Selection use the
   compiler's formatter (`volec fmt`'s style), on the editor's unsaved
   text; a file that does not parse is left as it is. Vole is the
@@ -120,8 +120,8 @@ F5 (Extension Development Host).
 vscode-tmgrammar-test's format:
 
 ```vl
-    fill(&v, 4);
-//       ^ keyword.operator.access.vole
+    fill(&mut v, 4);
+//       ^ keyword.operator.borrow.vole
 ```
 
 `test/package.test.js` checks the manifest (the formatter defaults),
