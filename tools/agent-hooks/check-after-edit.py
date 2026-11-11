@@ -40,8 +40,9 @@ errors left (the 0.18 eval: the line was offered 43 times and run once):
     volec check main.vl: 0 errors (1 fixed)
 
 (0.25.2.1) Only the mechanical classes, whose fix changes no meaning:
-a call's `&` marker (conv.marker, conv.marker_extra) and Rust's
-spellings (conv.rust), as `fix --suggested --codes ... --diff`; and an
+a call's `&` marker (conv.marker, conv.marker_extra), as `fix
+--suggested --codes ... --diff` (0.28: not conv.rust, which respelled
+Rust as the old edition; the rust edition is the language); and an
 unused import that was unused at the last check too (`fix --only unused
 --in FILE`; not one just written). Each change is shown:
 
@@ -64,7 +65,7 @@ changes: they are all it wrote (no formatter runs; the eval's `changed on
 disk` notices followed the agents' own sed -i, perl -pi and Python
 edits, 27 of 30, and the hook's fixes, 3):
 
-    fixed 20 '&mut x' to '&x' (conv.rust) in main.vl: lines 3, 7, ...
+    fixed 20 'x' to '&x' (conv.marker) in main.vl: lines 3, 7, ...
     the hook rewrote main.vl: the 20 changes above, nothing else (read it again before an Edit)
 
 (0.25.3, after the round 3 eval: five agents met `changed on disk` after
@@ -692,12 +693,11 @@ def exact_errors(errors):
 
 
 # (0.25.2.1) The exact fixes the hook makes itself: the mechanical
-# classes, whose fix changes no meaning (a call's `&` marker, Rust's
-# spellings respelled). Every other exact fix (a did-you-mean, a
+# classes, whose fix changes no meaning (a call's `&` marker). Every other exact fix (a did-you-mean, a
 # conversion, a `use` or a path) is shown, not made: the 0.25.2 eval's
 # wrong ones (a cast of a cast, `std::abs` of an f64, a `use` of a
 # function where a bool goes, a call made recursive) were all of these.
-MECHANICAL = ("conv.marker", "conv.marker_extra", "conv.rust")
+MECHANICAL = ("conv.marker", "conv.marker_extra")
 UNUSED = "use.unused"
 
 
@@ -845,13 +845,13 @@ def same_file(a, b):
 def fixed_report(fixed, changed, root_shown, lines=()):
     """(0.18.1) What the hook's fix did: a head, each change it made
     (`FILE:LINE: OLD -> NEW`, 0.25.2.1), then each fixed error. (0.25.2.2)
-    Repeats of one fix in a file in one line (`fixed 20 '&mut x' to '&x'
-    (conv.rust) in main.vl: lines 3, 7, ...`; the 0.25.2.1 eval's sdftext
+    Repeats of one fix in a file in one line (`fixed 20 'x' to '&x'
+    (conv.marker) in main.vl: lines 3, 7, ...`; the 0.25.2.1 eval's sdftext
     had 20 lines of them), and at the end each file the hook rewrote, with
     how many changes, once: those changes are all the hook wrote (the
     harness's `changed on disk` notice after it is about them)."""
     where = " " + root_shown if root_shown else ""
-    head = [f"volec fix{where}, run by the hook (only mechanical fixes: a call's `&`, Rust's spellings, an import "
+    head = [f"volec fix{where}, run by the hook (only mechanical fixes: a call's `&`, an import "
             f"unused at two checks; volec undo takes it back; positions as before it):"]
     groups = {}
     for d in fixed:

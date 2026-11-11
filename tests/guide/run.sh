@@ -616,37 +616,10 @@ for c in "" edit "edit patch" refactor "refactor signature" fix fmt check undo e
 done
 result pass help
 
-# volec try (0.15): a snippet run with std; its last value and type,
-# its output, its errors at the snippet's lines, its exit code.
-try_case() { # <name> <expected output> <snippet...>
-    n=$1
-    want=$2
-    shift 2
-    got=$("$COMPILER" try "$@" 2>&1)
-    if [ "$got" = "$want" ]; then
-        result pass "try-$n"
-    else
-        result FAIL "try-$n" "expected:" "$want" "got:" "$got"
-    fi
-}
-try_case int 'i64 = 3' '1 + 2'
-try_case std 'Option<i64> = Some(42)' 'parse_int("42").ok()'
-try_case vec 'Vec<i64, Gpa> = [4, 5]' 'var v: Vec<i64, Gpa> = Vec::new_in(gpa); v.push(4); v.push(5); v'
-try_case output "hi
-[u8] = \"abc\"" 'println("hi"); "abc"'
-try_case item 'i64 = 49' 'fn sq(x: i64) -> i64 { x * x } sq(7)'
-try_case tuple '(i64, bool) = (1, true)' '(1, true)'
-try_case unit '' 'let x = 3;'
-try_case error "snippet:2:5: error[type error] expected 'i64', got '[u8]'" 'let a = 1;
-a + "b"'
-try_case panic 'snippet:1:42: index out of bounds: index 3, length 0
-exit 101' 'let v: Vec<i64, Gpa> = Vec::new_in(gpa); v.get(3)'
-printf 'struct P { x: i64 }\n\nlet p = P { x: 4 };\np.x * 10\n' >"$WORK/snip.vl"
-try_case file 'i64 = 40' --file "$WORK/snip.vl"
-got=$(printf '7\n' | "$COMPILER" try 'var b = String::new_in(gpa); read_line(&b).unwrap(); parse_int(b.as_slice()).ok()' 2>&1)
-if [ "$got" = 'Option<i64> = Some(7)' ]; then result pass try-stdin; else result FAIL try-stdin "$got"; fi
-# (0.28.0) a rust snippet, on std2: its value printed by Debug; a type
-# with none, its type alone.
+# volec try (0.15; 0.28.0: a rust snippet, on std2): a snippet run with
+# std; its last value (printed by Debug; a type with none, its type
+# alone) and type, its output, its errors at the snippet's lines, its
+# exit code.
 rust_try_case() { # <name> <expected output> <snippet...>
     n=$1
     want=$2
@@ -659,11 +632,22 @@ rust_try_case() { # <name> <expected output> <snippet...>
     fi
 }
 rust_try_case int 'i32 = 3' '1 + 2'
+rust_try_case std 'Option<i64> = Some(42)' '"42".parse::<i64>().ok()'
 rust_try_case vec 'Vec<i64, Gpa> = [4, 5]' 'let mut v: Vec<i64, Gpa> = Vec::new_in(gpa); v.push(4); v.push(5); v'
 rust_try_case tuple '(u8, Option<bool>) = (2, Some(true))' '(2u8, Some(true))'
 rust_try_case output "hi
 f64 = 1.5" 'println("hi"); 1.5'
 rust_try_case nodebug 'P' 'struct P { x: i32 } P { x: 1 }'
+rust_try_case item 'i64 = 49' 'fn sq(x: i64) -> i64 { x * x } sq(7)'
+rust_try_case unit '' 'let x = 3;'
+rust_try_case error "snippet:2:1: error[type error] expected '&str', got 'i32'" 'let a = 1;
+a + "b"'
+rust_try_case panic 'snippet:1:42: index out of bounds: index 3, length 0
+exit 101' 'let v: Vec<i64, Gpa> = Vec::new_in(gpa); v[3]'
+printf 'struct P { x: i64 }\n\nlet p = P { x: 4 };\np.x * 10\n' >"$WORK/snip.vl"
+rust_try_case file 'i64 = 40' --file "$WORK/snip.vl"
+got=$(printf '7\n' | VOLE_STD2=1 "$COMPILER" --edition rust try 'let mut b = String::new_in(gpa); std::io::stdin().read_line(&mut b).unwrap(); b.trim().parse::<i64>().ok()' 2>&1)
+if [ "$got" = 'Option<i64> = Some(7)' ]; then result pass try-rust-stdin; else result FAIL try-rust-stdin "$got"; fi
 "$COMPILER" try >"$WORK/try.out" 2>&1
 rc=$?
 if [ $rc -eq 2 ] && grep -q '^error try.usage: ' "$WORK/try.out" && grep -q "^try: .* try 'let v" "$WORK/try.out"; then

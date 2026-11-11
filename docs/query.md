@@ -1410,7 +1410,7 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
   offered 43 times and run once.) (0.25.2.1) Only the mechanical
   classes are made: `fix --suggested --codes
   conv.marker,conv.marker_extra,conv.rust --diff` (a call's `&`
-  marker, Rust's spellings), and `fix --only unused --in FILE` for an
+  marker), and `fix --only unused --in FILE` for an
   import unused at this check and the last (not one just written); each
   change is a `changed FILE:LINE: OLD -> NEW` line after the head. The
   other exact fixes (a did-you-mean, a conversion, a `use`, a path: the
