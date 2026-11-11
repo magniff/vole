@@ -749,6 +749,52 @@ errors (moves, a `&mut` through a `&`, a local returned) are reported
 as before. *Anchor:* `places/borrowck/solve.vl: substitution_pair`.
 *Case:* `rust_b_subst_adapter_regions`.
 
+*Why the template's check covers the instance (g).* Let `f<T₁..Tₙ>` be a
+template and `f<τ₁..τₙ>` an instance, with `Sub(Tᵢ)` the universals of
+`τᵢ`'s slots. Claim: if the opaque instance of `f` (each `Tᵢ` an Ω with
+no slots, D4.4 (d)) is clean, then every execution of the instance
+respects the lifetimes its caller gave it, whatever outlives relations
+hold among the `Sub(Tᵢ)`.
+1. *Parametricity.* The body of `f` is type-checked once per instance,
+   but against the same text. A value whose type is `Tᵢ`, or holds `Tᵢ`,
+   can reach a place of type `Tⱼ`, or one that holds `Tⱼ`, in three
+   ways only: `i = j` by the type's own identity; through a call whose
+   signature relates them (a bound's method, `P: FnMut(&I::Item)`, a
+   bound's equality `Extend<T>::extend<I: IntoIterator<Item = T>>`); or
+   through a concrete type the body names, which has no `Sub` region.
+   The checker refuses anything else as a type error in the opaque
+   instance, where `Tᵢ` and `Tⱼ` are distinct opaque types.
+2. *The first way needs no bound.* Every occurrence of `Tᵢ` has the same
+   universals (D4.4), so the flow is `'s ⊒ 's`.
+3. *The second way is the caller's obligation, and it was checked
+   there.* A call `g(x)` in the body, with `g`'s signature saying its
+   parameter is `&Tᵢ::Item` or `Tⱼ`, is well-typed in the instance only
+   because the caller's substitution made the two types equal: the
+   caller wrote one type for both, lifetimes included, and D3.6 checked
+   the call of `f` against `f`'s signature and where-clauses with the
+   caller's regions. Inside the instance the two sides are different
+   universals only because slots are numbered per type argument; in the
+   caller they are one region or regions the caller's own check related.
+   D4.6 (d) and (e) recover some of these equalities; (g) says the rest
+   are not this body's to refuse.
+4. *What (g) does not cover, and stays reported.* A violation between
+   two universals neither of which is a substitution's (named lifetimes,
+   elided inputs, `'static`: the template says the same and reports it,
+   D4.4 (e)); every error that is not an outlives between universals: a
+   loan that conflicts, a move, a `&mut` through a `&`, a local's
+   reference returned or stored (those read loans and paths, and
+   an instance can have them where the opaque one cannot: an `FnMut`
+   closure's captures behind `&F`, E0596).
+5. *The cost.* A flow from a named lifetime into a substitution's region
+   (`'a ⊒ 's`) is also left to the template. There it is a flow of a
+   `&'a X` into a `T`-typed place, which step 1 makes a type error unless
+   a bound says `T` is that reference type, and then D4.6 (d) ties the
+   regions. So no program is accepted by (g) that the opaque instance
+   and the caller's check together refuse. The two things assumed are
+   D3.6 (the call of `f` is checked against its signature in the caller)
+   and D4.4 (d) (every template has its opaque instance solved); std2's
+   are solved when the compiler is built (Z7).
+
 **D4.5 (implied and declared bounds; the order ⊒).** `⊒` is the least
 preorder on `U` containing: `'static ⊒ 'u` for every `'u`; every
 declared `'a: 'b` (generics and `where`); for every declared `T: 'a`,
