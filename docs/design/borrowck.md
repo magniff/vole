@@ -1155,6 +1155,15 @@ unless named, at the access's statement.
   (`MaybeUninit` at the loop head by the back edge); the message adds
   "in a previous iteration of the loop" when the move's location is
   reachable from the use's.
+- (M8, 0.28.0) A read of a deferred `let y: T;` whose local has no move
+  path (a plain value: an integer, a reference, which M1's paths do not
+  follow) requires it assigned on every path to the read: a forward
+  dataflow of the deferred locals maybe unassigned, set at the local's
+  StorageLive, cleared by an assignment to it or to a part of it
+  (`borrowck.use_uninit`, rustc E0381 "used binding isn't
+  initialized"). Before it `let y: i64; println("{y}")` printed 0.
+  *Anchor:* `places/borrowck/moves.vl: unassigned_reads`. *Case:*
+  `rust_b_err_use_uninit`.
 - (M7) An assignment (`WA`) to a whole local `L` (`(L, 0)`) that is
   not `mut` (no `LF_MUT`) requires `¬MaybeInit(path(L), 2·loc)`: a
   deferred `let x;` / `let x: T;` is assigned once on every path
@@ -1664,6 +1673,7 @@ where a `try:` is named, a case in `tests/borrowck-try/NAME/main.vl`
 | `borrowck.use_moved` | M1, M5 | E0382 | `.clone()` when `Clone` (as `own.moved`'s) |
 | `borrowck.assign_moved_part` | M2 | E0381 | none |
 | `borrowck.assign_twice` | M7 | E0384 | `let mut x;` on the deferred declaration |
+| `borrowck.use_uninit` | M8 | E0381 | none |
 | `borrowck.assign_immutable` | D2.7 | E0594 | `let mut x` on the local; `&mut` in the reference's type |
 | `borrowck.borrow_immutable` | D2.7 | E0596 | as `assign_immutable`'s |
 | `borrowck.move_out` | M3 | E0507, E0508 | `.clone()`, or `&` the place (as `own.move_out`'s) |

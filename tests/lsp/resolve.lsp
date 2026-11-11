@@ -190,7 +190,7 @@
 > {"jsonrpc":"2.0","id":90,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":72,"character":19}}}
 < {"jsonrpc":"2.0","id":90,"result":{"contents":{"kind":"markdown","value":"```vole\np: V2\n```\n"},"range":{"start":{"line":72,"character":19},"end":{"line":72,"character":20}}}}
 > {"jsonrpc":"2.0","id":91,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":75,"character":28}}}
-< {"jsonrpc":"2.0","id":91,"result":{"contents":{"kind":"markdown","value":"```vole\nfn twice(x: i64) -> i64\neffects: panic diverge (declared #[pure])\nfeatures: none\n```\n- panic ← (no source found)\n- diverge ← (no source found)\n\nx, twice.\n\n`crate::twice` (fn)\n"},"range":{"start":{"line":75,"character":28},"end":{"line":75,"character":33}}}}
+< {"jsonrpc":"2.0","id":91,"result":{"contents":{"kind":"markdown","value":"```vole\nfn twice(x: i64) -> i64\neffects: none (declared #[pure])\nfeatures: none\n```\n\nx, twice.\n\n`crate::twice` (fn)\n"},"range":{"start":{"line":75,"character":28},"end":{"line":75,"character":33}}}}
 ## more.vl: a derived method, `into`, an enum's path in a `use`, an associated type
 > {"jsonrpc":"2.0","id":92,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/more.vl"},"position":{"line":44,"character":14}}}
 < {"jsonrpc":"2.0","id":92,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/clone.vl","range":{"start":{"line":3,"character":21},"end":{"line":3,"character":26}}}}
