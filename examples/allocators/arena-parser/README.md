@@ -26,7 +26,7 @@ $ volec main.vl -o parser && ./parser 2>/dev/null
 (1 2): no operator at byte 1
 input: 1771952 bytes, 134180 lists (one allocation each)
 value: -9194208206490895369, the same three ways: true
-the tree in the arena: 33773 KB
+the tree in the arena: 25176 KB
 ok: built parser
 ```
 
@@ -132,19 +132,23 @@ comparison is the allocator's cost, not a different algorithm.
 ## What the effects say
 
 ```console
-$ volec query effects parse eval
+$ volec query effects crate::parse eval
 parse<Gpa>	alloc(Gpa) panic diverge
-parse<ScopedArena>	alloc(ScopedArena) panic diverge
+parse<&ArenaScope<&Gpa>>	alloc(ArenaScope<&Gpa>) panic diverge
+parse<&ArenaScope<Gpa>>	alloc(ArenaScope<Gpa>) panic diverge
 eval<Gpa>	diverge
-eval<ScopedArena>	diverge
+eval<&ArenaScope<&Gpa>>	diverge
+eval<&ArenaScope<Gpa>>	diverge
 ```
 
 Each generic function has one line per instance (the two arena lines
-are `arena_scope`'s arena and the kept `Arena`'s scope): an arena
-instance of `parse` allocates only from its arena, `parse<Gpa>` only
-from `Gpa`. `eval` was
-declared `#[no_alloc]`, and the compiler checked it for both trees.
-(`diverge` is the recursion: a parser of nested lists recurses.)
+are `arena_scope`'s arena, made from `&gpa`, and the kept `Arena`'s
+scope): an arena instance of `parse` allocates only from its arena,
+`parse<Gpa>` only from `Gpa`. `eval` was declared `#[no_alloc]`, and
+the compiler checked it for all three trees. `diverge` is the
+recursion: a parser of nested lists recurses, and so does the walk.
+`panic` is `parse`'s only: an index, a `Vec` too large.
+(`crate::parse` names this program's `parse`; std has one too.)
 
 ## The bug the arena would have hidden
 
