@@ -32,13 +32,14 @@ $ def --exact helper
 error query.no-match: no definition 'helper'
 try: volec query def crate::a::helper
 try: volec query def crate::b::helper
-try: volec query def std::cli::Arg.help
+try: volec query def std::gpu::wgsl::msl::helpers
 [exit 1]
 $ def --exact crate::a::helper
 crate::a::helper	clash/a.vl:2:8	fn	pub fn helper() -> i64	effects: none
 $ def Point
 crate::a::Point	clash/a.vl:6:35	struct	pub struct Point
 crate::geom::Point	clash/geom.vl:4:8	fn	pub fn Point(x: i64) -> i64	effects: none
+std::window::objc::Point	<std>:48486:12	struct	pub struct Point
 $ refs Point
 # clash/a.vl
 6:35	def	->a::Point	#[derive(Clone, Copy)] pub struct Point {
@@ -48,6 +49,18 @@ $ refs Point
 16:12	use	crate	->geom::Point	use geom::{Point, V2};
 33:16	init	main	->a::Point	let p = a::Point { x: Point(n) };
 33:27	call	main	->geom::Point	let p = a::Point { x: Point(n) };
+# <std>
+46343:16	use	std::window::cocoa	->std::window::objc::Point	NOT_FOUND, Point, Range, Rect, class, class_addIvar, class_addProtocol,
+46411:77	type	std::window::cocoa::add_u_t	->std::window::objc::Point	fn add_u_t(c: *mut u8, s: *mut u8, imp: extern "C" fn(*mut u8, *mut u8, Point) -> u64,
+46561:25	init	std::window::cocoa::post_wake	->std::window::objc::Point	EV_APP_DEFINED, Point { x: 0.0, y: 0.0 }, 0, 0.0, 0, 0 as *mut u8, 0, WAKE, 0);
+46969:62	type	std::window::cocoa::imp_char_index	->std::window::objc::Point	extern "C" fn imp_char_index(this: *mut u8, cmd: *mut u8, p: Point) -> u64 {
+48486:12	def	->std::window::objc::Point	pub struct Point {
+48576:61	type	std::window::objc::msg_p_utudipsii	->std::window::objc::Point	fn msg_p_utudipsii(o: *mut u8, s: *mut u8, ty: u64, at: Point, flags: u64, time: f64, win: i64,
+48581:62	type	std::window::objc::msg_p_utudipppbh	->std::window::objc::Point	fn msg_p_utudipppbh(o: *mut u8, s: *mut u8, ty: u64, at: Point, flags: u64, time: f64, win: i64,
+48586:61	type	std::window::objc::msg_p_utudipiif	->std::window::objc::Point	fn msg_p_utudipiif(o: *mut u8, s: *mut u8, ty: u64, at: Point, flags: u64, time: f64, win: i64,
+48645:41	type	std::window::objc::msg_t	->std::window::objc::Point	fn msg_t(o: *mut u8, s: *mut u8) -> Point;
+48657:44	type	std::window::objc::msg_t_tp	->std::window::objc::Point	fn msg_t_tp(o: *mut u8, s: *mut u8, a: Point, b: *mut u8) -> Point;
+48657:66	type	std::window::objc::msg_t_tp	->std::window::objc::Point	fn msg_t_tp(o: *mut u8, s: *mut u8, a: Point, b: *mut u8) -> Point;
 $ show a::Point
 // crate::a::Point	clash/a.vl:6-8
 #[derive(Clone, Copy)] pub struct Point {
@@ -137,6 +150,9 @@ $ refs crate::shapes::Area
 # clash/shapes.vl
 1:11	def	pub trait Area {
 13:6	type	shapes	impl Area for Square {
+## std::window::cocoa::push's effects: carries alloc(Gpa, ArenaScope<Gpa>) from every
+## fmt::Write impl instance in std (gap: dyn Write's join is over all instances, gated
+## modules included); to be re-recorded when the join is limited to reachable instances.
 $ def push
 crate::myvec::Vec::push	clash/myvec.vl:7:12	method	pub fn push(&mut self, x: i64)	effects: none
 std::vec::Vec::push	<std>:4548:12	method	pub fn push(&mut self, x: T) debug ensures self.len() == old(self.len()) + 1 debug ensures self.len() <= self.capacity()
@@ -146,6 +162,8 @@ std::collections::binary_heap::MinHeap::push	<std>:11905:12	method	pub fn push(&
 std::flt::Text::push	<std>:15714:8	method	fn push(&mut self, b: u8)	effects: panic diverge
 std::path::PathBuf::push	<std>:23132:12	method	pub fn push<P: AsRef<str>>(&mut self, p: P)
 std::cli::Matches::push	<std>:22958:8	method	fn push(&mut self, s: i64, text: &'a str, at: i64)
+std::objc::Pool::push	<std>:45195:12	method	pub fn push() -> Pool	effects: io unsafe
+std::window::cocoa::push	<std>:46537:4	fn	fn push(e: Event)	effects: alloc(Gpa, ArenaScope<Gpa>, extern) io panic diverge unsafe
 $ refs Vec::push --count
 2	crate::myvec::Vec::push
 99	std::vec::Vec::push
@@ -192,13 +210,21 @@ $ callers c::printf --count
 1
 $ refs Point.x
 # clash/a.vl
-7:9	def	pub x: i64,
+7:9	def	->a::Point.x	pub x: i64,
 # clash/main.vl
-33:24	init	main	let p = a::Point { x: Point(n) };
-34:39	read	main	let s = sys::SockaddrIn { port: p.x };
+33:24	init	main	->a::Point.x	let p = a::Point { x: Point(n) };
+34:39	read	main	->a::Point.x	let s = sys::SockaddrIn { port: p.x };
+# <std>
+46561:33	init	std::window::cocoa::post_wake	->std::window::objc::Point.x	EV_APP_DEFINED, Point { x: 0.0, y: 0.0 }, 0, 0.0, 0, 0 as *mut u8, 0, WAKE, 0);
+46768:18	read	std::window::cocoa::imp_mouse	->std::window::objc::Point.x	x: p.x * s,
+48487:9	def	->std::window::objc::Point.x	pub x: f64,
 $ refs .x --count
 3	crate::a::Point.x
 9	crate::geom::V2.x
+4	std::window::Mouse.x
+3	std::window::objc::Point.x
+5	std::window::objc::Rect.x
+1	std::window::objc::MtlRegion.x
 $ refs SockaddrIn.port
 # clash/main.vl
 10:56	def	#[derive(Clone, Copy)] pub struct SockaddrIn { pub port: i64 }

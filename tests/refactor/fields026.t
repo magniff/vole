@@ -19,6 +19,14 @@ geometry::Rect::new	geometry.vl:6:16	Rect { w: w, h: h }
 geometry::Rect::area	geometry.vl:10:14	self.w * self.h
 main	main.vl:7:22	let lit = Rect { w: 1, h: 2 };
 main	main.vl:8:8	(r.w + r.h + lit.area()) as i32
+// std::window::objc::Rect.w	<std>:48501-48501	pub field
+    pub w: f64,
+// used by (5)
+std::window::cocoa::view_size	<std>:46616:18	Size { w: (b.w * s + 0.5) as i64, h: (b.h * s + 0.5) as i64, scale: s }
+std::window::cocoa::imp_first_rect	<std>:46975:39	return Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+std::window::cocoa::imp_first_rect	<std>:46983:60	let local = Rect { x: d.ime_x / s, y: d.ime_y / s, w: d.ime_w / s, h: d.ime_h / s };
+<std::window::cocoa::Cocoa as Backend>::open_window	<std>:47670:47	let rect = Rect { x: 0.0, y: 0.0, w: desc.w as f64, h: desc.h as f64 };
+<std::window::cocoa::Cocoa as Backend>::open_window	<std>:47703:40	Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }, 0x01 | 0x02 | 0x80 | 0x200, view,
 warning query.program-errors: 2 errors in the program; results may be incomplete
 try: volec --diagnostics=short main.vl -c -o /dev/null
 $ query context Rect.h
@@ -29,6 +37,14 @@ pub struct Rect { w: i64, pub h: i64 }
 geometry::Rect::new	geometry.vl:6:22	Rect { w: w, h: h }
 geometry::Rect::area	geometry.vl:10:23	self.w * self.h
 main	main.vl:8:14	(r.w + r.h + lit.area()) as i32
+// std::window::objc::Rect.h	<std>:48502-48502	pub field
+    pub h: f64,
+// used by (5)
+std::window::cocoa::view_size	<std>:46616:45	Size { w: (b.w * s + 0.5) as i64, h: (b.h * s + 0.5) as i64, scale: s }
+std::window::cocoa::imp_first_rect	<std>:46975:47	return Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+std::window::cocoa::imp_first_rect	<std>:46983:76	let local = Rect { x: d.ime_x / s, y: d.ime_y / s, w: d.ime_w / s, h: d.ime_h / s };
+<std::window::cocoa::Cocoa as Backend>::open_window	<std>:47670:65	let rect = Rect { x: 0.0, y: 0.0, w: desc.w as f64, h: desc.h as f64 };
+<std::window::cocoa::Cocoa as Backend>::open_window	<std>:47703:48	Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }, 0x01 | 0x02 | 0x80 | 0x200, view,
 warning query.program-errors: 2 errors in the program; results may be incomplete
 try: volec --diagnostics=short main.vl -c -o /dev/null
 $ fix --only pub --dry-run
