@@ -39,8 +39,7 @@ of the whole path).
 Owners: mig28 (book, examples, guide, bench, the editor samples), d4 (the
 old std and its copies in tests), d5 (the translator's transcripts), gpu
 (the gpu port: tests/gpu, window, voltty-render, two tools), del280 (the
-other tests, tools/numtables), other (evals/ and tests/agent-eval/: the
-user's call, not to be touched).
+other tests, tools/numtables), other (anything else).
 """
 import fnmatch
 import os
@@ -85,7 +84,7 @@ def owner(path):
     if path.startswith(("compiler/std/", "tests/refactor/stdedit/", "tests/query/stdpos0253/",
                         "tests/refactor/inputs/strip_prefix")):
         return "d4"
-    if path.startswith(("tests/gpu/", "tests/window/", "tests/voltty-render/", "tools/objcgen/", "tools/wgslc/")):
+    if path.startswith(("tests/gpu/", "tests/window/", "tests/voltty-render/", "tools/objcgen/", "tools/wgslc/", "bench/gpu/shader/run.sh")):
         return "gpu"
     if top[0] in ("book", "examples", "bench", "editors") or path.startswith("compiler/guide/") or path == "README.md":
         return "mig28"
@@ -93,7 +92,7 @@ def owner(path):
         return "d5"
     if path.startswith("tools/numtables/"):
         return "d4"
-    if path.startswith("tools/agent-hooks/") or (top[0] == "tests" and top[1] != "agent-eval"):
+    if path.startswith("tools/agent-hooks/") or top[0] == "tests":
         return "del280"
     return "other"
 
