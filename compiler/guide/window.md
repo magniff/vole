@@ -8,18 +8,24 @@ and X11 come in 0.23.1 behind the same API.
 use std::window::{App, Event, WindowDesc};
 
 fn main(gpa: Gpa) -> i32 {
-    var app = App::new_in(gpa).unwrap();              // Err(NoDisplay) under ssh
+    let mut app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => return 1,                           // Err(NoDisplay) under ssh
+    };
     let desc = WindowDesc::new("demo", 800, 600);     // logical points
-    var win = app.window(desc).unwrap();
+    let mut win = match app.window(desc) {
+        Ok(w) => w,
+        Err(_) => return 1,
+    };
     win.request_frame();
     loop {
-        match app.wait().unwrap() {                   // blocks; nothing busy-waits
-            Event::Frame(_) => draw(win),             // once per request_frame
-            Event::Key(k) => if k.pressed && !k.ime { on_key(k) },
-            Event::Text(t) => typed(t.bytes[0..t.len as i64]),  // UTF-8, inline
-            Event::Resize(_, s) => resize(s.w, s.h, s.scale),   // physical pixels
-            Event::Readable(fd) => read_more(fd),     // a watched fd (app.watch)
-            Event::Close(_) | Event::Quit => break,
+        match app.wait() {                            // blocks; nothing busy-waits
+            Ok(Event::Frame(_)) => draw(&win),            // once per request_frame
+            Ok(Event::Key(k)) => if k.pressed && !k.ime { on_key(k) },
+            Ok(Event::Text(t)) => typed(&t.bytes[..t.len as usize]), // UTF-8, inline
+            Ok(Event::Resize(_, s)) => resize(s.w, s.h, s.scale),   // physical pixels
+            Ok(Event::Readable(fd)) => read_more(fd),     // a watched fd (app.watch)
+            Ok(Event::Close(_)) | Ok(Event::Quit) | Err(_) => break,
             _ => {}
         }
     }
@@ -35,7 +41,7 @@ fn main(gpa: Gpa) -> i32 {
   `Cursor` (enter, leave), `Focus`, `Readable`, `Close`, `Quit`.
 - **Calls**: `app.wait()`, `poll()`, `wait_timeout(ms)`; `app.watch(fd)`;
   `app.clipboard_get_in(gpa)`, `clipboard_set(text)`;
-  `app.on_live_resize(f, ctx)` (`ctx` a raw `*u8`; macOS runs its own loop while a window
+  `app.on_live_resize(f, ctx)` (`ctx` a raw `*mut u8`; macOS runs its own loop while a window
   edge is dragged: `f` is called there and may `poll` and draw).
   `win.request_frame()`, `size()`, `raw_surface()` (the CAMetalLayer),
   `set_title`, `set_cursor`, `hide_cursor_while_typing`,
@@ -45,7 +51,7 @@ fn main(gpa: Gpa) -> i32 {
   `win.size()` (a `Size { w, h, scale }`), `Resize`'s size, `Mouse.x`
   and `.y`, `Scroll`'s precise deltas. On a Retina display (`scale`
   2.0) `WindowDesc::new("demo", 800, 600)` gives `win.size()` 1600 x
-  1200. Configure the surface with that size (`surf.configure(dev,
+  1200. Configure the surface with that size (`surf.configure(&dev,
   s.w, s.h, ..)`, again at each `Resize`), so `surf.width` and
   `surf.height` are the drawable's pixels too; a snapshot of the window
   (a copy of its frame, a canvas, a PPM) is `surf.width` x
@@ -92,30 +98,32 @@ use std::window::{App, Button, Event, MouseAction, WindowDesc};
 const GRID: f64 = 128.0; // the simulation's cells across and down
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
-    var app = match App::new_in(gpa) {
+    let mut app = match App::new_in(gpa) {
         Ok(a) => a,
         Err(_) => return Ok(()),
     };
-    var win = match app.window(WindowDesc::new("mouse", 512, 512)) {
+    let mut win = match app.window(WindowDesc::new("mouse", 512, 512)) {
         Ok(w) => w,
         Err(_) => return Ok(()),
     };
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, var _queue) = inst.adapter()?.device()?;
-    var surf = inst.surface(dev, RawSurface::MetalLayer(win.raw_surface()))?;
+    let (dev, _queue) = inst.adapter()?.device()?;
+    let mut surf = inst.surface(&dev, RawSurface::MetalLayer(win.raw_surface()))?;
     let px = win.size(); // the size now: stale after a Resize
-    surf.configure(dev, px.w, px.h);
-    var scale = px.scale; // the window's; a Surface has no scale
-    var down = false;
+    surf.configure(&dev, px.w, px.h);
+    let mut scale = px.scale; // the window's; a Surface has no scale
+    let mut down = false;
     loop {
         match app.wait() {
             Ok(Event::Resize(_, s)) => {
-                surf.configure(dev, s.w, s.h); // surf.width, .height follow
+                surf.configure(&dev, s.w, s.h); // surf.width, .height follow
                 scale = s.scale;
             }
             Ok(Event::Mouse(m)) => {
-                if m.button == Button::Left && m.action != MouseAction::Move {
-                    down = m.action == MouseAction::Press;
+                if let Button::Left = m.button {
+                    if m.action != MouseAction::Move {
+                        down = m.action == MouseAction::Press;
+                    }
                 }
                 if down {
                     // with the surface's size, never px
@@ -167,9 +175,9 @@ embed wgsl STEP {
 }
 
 // A frame's GPU work: what the windowed program submits each frame.
-fn frame(dev: gpu::Device<Gpa>, queue: inout gpu::Queue, pipe: gpu::ComputePipeline,
-    group: gpu::BindGroup) {
-    var enc = dev.encoder();
+fn frame(dev: &gpu::Device<Gpa>, queue: &mut gpu::Queue, pipe: &gpu::ComputePipeline,
+    group: &gpu::BindGroup) {
+    let mut enc = dev.encoder();
     enc.compute_pass(|pass| {
         pass.set_pipeline(pipe);
         pass.set_bind_group(0, group);
@@ -180,19 +188,19 @@ fn frame(dev: gpu::Device<Gpa>, queue: inout gpu::Queue, pipe: gpu::ComputePipel
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, var queue) = inst.adapter()?.device()?;
+    let (dev, mut queue) = inst.adapter()?.device()?;
     let pipe = dev.compute_pipeline(dev.shader_wgsl(STEP.src)?, STEP.main)?;
     let xs = dev.buffer(1024 * 64 * 4, BufferUsage::STORAGE);
-    let group = dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, xs)][..]);
-    frame(dev, &queue, pipe, group); // a warm-up: the first submit sets things up
+    let group = dev.bind_group(pipe.bind_layout(0), &[gpu::bind(0, &xs)][..]);
+    frame(&dev, &mut queue, &pipe, &group); // a warm-up: the first submit sets things up
     queue.wait_idle()?;
-    let n = 200;
-    let t0 = std::time::monotonic_now();
+    let n: i64 = 200;
+    let t0 = std::time::Instant::now();
     for _ in 0..n {
-        frame(dev, &queue, pipe, group); // no wait between them
+        frame(&dev, &mut queue, &pipe, &group); // no wait between them
     }
     queue.wait_idle()?; // all n done
-    let ms = std::time::monotonic_now().saturating_sub(t0).as_millis_f64() / n as f64;
+    let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
     println("{n} frames timed: {}", ms > 0.0); // a report prints format_args("{ms:.3} ms a frame")
     Ok(())
 }
@@ -216,13 +224,14 @@ the window's own UI pipeline (`--ui-scale 2` for a Retina layout), and
 its case in tests/examples checks it.
 
 ```vole
-use std::{fs, gpu};
+use std::fs;
+use std::gpu;
 use std::gpu::{BufferUsage, Color, Format, PassDesc, RawSurface, TextureView};
 
 // The frame's drawing, shared with the window's Event::Frame: here a
 // clear; in a program its scene passes, then the overlay.
-fn draw(dev: gpu::Device<Gpa>, queue: inout gpu::Queue, view: TextureView) {
-    var enc = dev.encoder();
+fn draw(dev: &gpu::Device<Gpa>, queue: &mut gpu::Queue, view: &TextureView) {
+    let mut enc = dev.encoder();
     enc.render_pass(PassDesc::color(view, clear: Color::rgba(1.0, 0.5, 0.0, 1.0)), |_| {});
     queue.submit(enc.finish());
 }
@@ -230,25 +239,24 @@ fn draw(dev: gpu::Device<Gpa>, queue: inout gpu::Queue, view: TextureView) {
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let (w, h) = (64, 32);
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, var queue) = inst.adapter()?.device()?;
-    var surf = inst.surface(dev, RawSurface::Headless)?; // frames, no window
-    surf.configure(dev, w, h, format: Format::Bgra8Unorm, vsync: false);
+    let (dev, mut queue) = inst.adapter()?.device()?;
+    let mut surf = inst.surface(&dev, RawSurface::Headless)?; // frames, no window
+    surf.configure(&dev, w, h, format: Format::Bgra8Unorm, vsync: false);
     let frame = surf.frame()?;
-    draw(dev, &queue, frame.texture.view());
+    draw(&dev, &mut queue, &frame.texture.view());
     let stride = (w * 4 + 255) / 256 * 256; // rows 256-byte aligned
-    var readback = dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
-    var enc = dev.encoder();
-    enc.copy_texture_to_buffer(frame.texture, readback, stride);
+    let mut readback = dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    let mut enc = dev.encoder();
+    enc.copy_texture_to_buffer(&frame.texture, &readback, stride);
     queue.submit(enc.finish());
-    frame.present(&queue);
-    let px = readback.map_read(dev); // B, G, R, A a pixel
-    var ppm = format_in("P6\n{w} {h}\n255\n", gpa);
-    for y in 0..h {
-        for x in 0..w {
-            let p = y * stride + x * 4;
-            ppm.push(px[p + 2]);
-            ppm.push(px[p + 1]);
-            ppm.push(px[p]);
+    frame.present(&mut queue);
+    let px = readback.map_read(&dev); // B, G, R, A a pixel
+    let mut ppm: Vec<u8, Gpa> = Vec::new_in(gpa);
+    ppm.extend_from_slice(format_in("P6\n{w} {h}\n255\n", gpa).as_bytes());
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let p = y * stride as usize + x * 4;
+            ppm.extend_from_slice(&[px[p + 2], px[p + 1], px[p]][..]);
         }
     }
     let ok = fs::write("shot.ppm", ppm.as_slice()).is_ok(); // open it, or compare
@@ -280,39 +288,43 @@ use std::window::{App, Button, Event, MouseAction, WindowDesc};
 use std::window::keys::Logical;
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
-    var app = match App::new_in(gpa) {
+    let mut app = match App::new_in(gpa) {
         Ok(a) => a,
         Err(_) => return Ok(()), // no display, no script
     };
-    var win = match app.window(WindowDesc::new("paint", 400, 300)) {
+    let mut win = match app.window(WindowDesc::new("paint", 400, 300)) {
         Ok(w) => w,
         Err(_) => return Ok(()),
     };
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, var queue) = inst.adapter()?.device()?;
-    var surf = inst.surface(dev, RawSurface::MetalLayer(win.raw_surface()))?;
-    var red = false;
+    let (dev, mut queue) = inst.adapter()?.device()?;
+    let mut surf = inst.surface(&dev, RawSurface::MetalLayer(win.raw_surface()))?;
+    let mut red = false;
     win.request_frame();
     loop {
         match app.wait() {
-            Ok(Event::Resize(_, s)) => surf.configure(dev, s.w, s.h),
+            Ok(Event::Resize(_, s)) => surf.configure(&dev, s.w, s.h),
             Ok(Event::Frame(_)) => {
                 let frame = surf.frame()?;
                 let c = if red { Color::rgba(1.0, 0.0, 0.0, 1.0) } else { Color::black() };
-                var enc = dev.encoder();
-                enc.render_pass(PassDesc::color(frame.texture.view(), clear: c), |_| {});
+                let mut enc = dev.encoder();
+                enc.render_pass(PassDesc::color(&frame.texture.view(), clear: c), |_| {});
                 queue.submit(enc.finish());
-                frame.present(&queue);
+                frame.present(&mut queue);
                 win.request_frame();
             }
             Ok(Event::Mouse(m)) => {
-                if m.button == Button::Left && m.action == MouseAction::Press {
-                    red = !red;
+                if let Button::Left = m.button {
+                    if m.action == MouseAction::Press {
+                        red = !red;
+                    }
                 }
             }
             Ok(Event::Key(k)) => {
-                if k.pressed && k.key == Logical::Char('q' as u32) {
-                    break;
+                if let Logical::Char(c) = k.key {
+                    if k.pressed && c == b'q' as u32 {
+                        break;
+                    }
                 }
             }
             Ok(Event::Close(_)) | Ok(Event::Quit) => break,
@@ -340,7 +352,7 @@ are physical pixels from the content's top-left:
 | `press [B] X Y`, `release [B] X Y`, `click [B] X Y` | B: `left` (default), `right`, `middle`; then `shift`, `ctrl`, `alt` or `cmd` held |
 | `scroll DY [DX]` | a wheel, in lines (positive: up) |
 | `resize WxH`, `focus on`/`off` | `Resize`, `Focus` |
-| `shot FILE.ppm` | the next frame presented (`frame.present`) is also written to FILE (`gpu::capture_next_frame`) |
+| `shot FILE.ppm` | the next frame presented (`frame.present`) is also written to FILE (`std::capture::capture_next_frame`) |
 | `close`, `quit` | `Close`, `Quit` |
 
 - When the script ends, each open window gets `Close`, then `Quit`; a

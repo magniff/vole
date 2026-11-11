@@ -122,12 +122,14 @@
 #                        ASM(T)s' lines
 #   // TIMEOUT: n why   (0.22) the case may run n times the time limit (a
 #                        long one at -O0, under the gate's load)
-#   // CROSS: T          (0.19) the case is also compiled for target T (at the
+#   // CROSS: T...       (0.19) the case is also compiled for target T (at the
 #                        suite's level, to an object: the compiler's own
 #                        assembler; then -S at the CHECK-OPT level, matched
 #                        against its ASM(T) and ASM-NOT(T) lines), nothing of
 #                        it run: x86-64's intrinsics are checked so on an arm
-#                        host. Skipped when T is the target tested.
+#                        host. Skipped when T is the target tested. (0.28.0)
+#                        Several targets: each in turn (std's effect lists
+#                        are checked for the target of the build).
 #   // FIXIMPORTS: why   (0.8) a copy of the case (its directory, for a
 #                        main.vl) is rewritten by volec --fix-imports,
 #                        which must then find nothing more to do; the copy
@@ -863,21 +865,24 @@ check_asm() {
 # suite's level and to assembly at the CHECK level, the assembly matched
 # against its ASM lines for that target; nothing run.
 check_cross() {
-    cross=$(cat "$2/cross")
-    # shellcheck disable=SC2086
-    if ! "$COMPILER" --target "$cross" $OPT $FLAGS "$1" -c -o "$2/cross.o" >"$2/compile.out" 2>&1; then
-        { echo "compile for $cross failed:"; cat "$2/compile.out"; } >"$2/why"
+    # (0.28.0) one target or several, each in turn
+    for cross in $(cat "$2/cross"); do
+        # shellcheck disable=SC2086
+        if ! "$COMPILER" --target "$cross" $OPT $FLAGS "$1" -c -o "$2/cross.o" >"$2/compile.out" 2>&1; then
+            { echo "compile for $cross failed:"; cat "$2/compile.out"; } >"$2/why"
+            return 1
+        fi
+        # shellcheck disable=SC2086
+        if ! "$COMPILER" --target "$cross" "-O$(cat "$2/checkopt")" $FLAGS "$1" -S -o "$2/cross.s" >"$2/compile.out" 2>&1; then
+            { echo "compile for $cross (-S) failed:"; cat "$2/compile.out"; } >"$2/why"
+            return 1
+        fi
+        [ -s "$2/crossasms.$cross" ] || continue
+        match_checks "$2/cross.s" "$2/crossasms.$cross" "$2/check.out" && continue
+        { cat "$2/check.out"; echo "--- assembly for $cross:"; cat "$2/cross.s"; } >"$2/why"
         return 1
-    fi
-    # shellcheck disable=SC2086
-    if ! "$COMPILER" --target "$cross" "-O$(cat "$2/checkopt")" $FLAGS "$1" -S -o "$2/cross.s" >"$2/compile.out" 2>&1; then
-        { echo "compile for $cross (-S) failed:"; cat "$2/compile.out"; } >"$2/why"
-        return 1
-    fi
-    [ -s "$2/crossasms" ] || return 0
-    match_checks "$2/cross.s" "$2/crossasms" "$2/check.out" && return 0
-    { cat "$2/check.out"; echo "--- assembly for $cross:"; cat "$2/cross.s"; } >"$2/why"
-    return 1
+    done
+    return 0
 }
 
 # Matches the checks in file $2 (+text: a line containing text, after the
