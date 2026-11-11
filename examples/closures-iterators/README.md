@@ -113,7 +113,9 @@ per closure and the call is direct, usually inlined:
 
 ```tach
 fn count_where<F: Fn(&Entry) -> bool>(entries: &[Entry], pred: F) -> usize {
-    entries.iter().filter(|e| pred(e)).count()
+    let mut n = 0;
+    for e in entries { if pred(e) { n += 1; } }
+    n
 }
 
 let errors = count_where(all, |e| e.level == Level::Error);
