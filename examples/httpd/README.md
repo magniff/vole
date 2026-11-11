@@ -3,8 +3,8 @@
 A small HTTP file server, a clone of `python -m http.server`: it serves
 the files of a directory, and an HTML listing for directories, on
 http://127.0.0.1:8000/. Sockets, directory reading and file I/O through
-the C library, declared by hand; the HTML and the headers built in
-`std::Buf`s with f-strings.
+the C library, declared by hand; the HTML built in a `Vec<u8, Gpa>`, the
+headers in a `String` with `format_in`.
 
 ## Build and run
 
@@ -45,14 +45,15 @@ file. The test suite only builds it (a server runs until stopped).
 
 **Declaring the C library by hand.** Every C function the server uses is
 in one `extern "C"` block, with vole types for C's (`int` is `i32`,
-`size_t` is `u64`, any pointer `*u8`):
+`size_t` is `u64`, any pointer `*const u8` or, where C writes through
+it, `*mut u8`):
 
 ```tach
 extern "C" {
     fn socket(domain: i32, kind: i32, protocol: i32) -> i32;
-    fn accept(fd: i32, addr: *u8, len: *u32) -> i32;
-    fn opendir(path: *u8) -> *u8;
-    fn readdir(dir: *u8) -> *u8;
+    fn accept(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
+    fn opendir(path: *const u8) -> *mut u8;
+    fn readdir(dir: *mut u8) -> *const u8;
     ...
 }
 ```
@@ -76,38 +77,42 @@ struct SockaddrIn { family: u16, port: u16, addr: u32, zero: [u8; 8] }
 struct SockaddrInBsd { len: u8, family: u8, port: u16, addr: u32, zero: [u8; 8] }
 ```
 
-`listen_tcp` returns `Result<i32, [u8]>`: the socket, or the message of
+`listen_tcp` returns `Result<i32, &'static str>`: the socket, or the message of
 what failed, which `main` prints.
 
 **Raw pointers from C, viewed safely.** `readdir` returns a pointer to an
 entry; `sys::dirent` casts it to the system's layout and returns the
-name's address and the entry's type. `sys::cstr` turns a C string into a
-`[u8]` slice, after which everything is checked vole code. Both are
+name's address (`&raw const (*d).name`: no reference to the entry is
+made) and the entry's type. `sys::cstr` turns a C string into a `&[u8]`
+slice, after which everything is checked vole code. Both are
 `unsafe fn`s: their comments state what the caller promises (a pointer
 to this system's `struct dirent`, a NUL-terminated string), and the
-calls sit in `unsafe { }`:
+calls sit in `unsafe { }`, each under a comment that says why it holds
+there:
 
 ```tach
-// Unsafe: `s` must point to a NUL-terminated string that outlives the
-// slice.
-pub unsafe fn cstr(s: *u8) -> [u8] {
-    s[0..strlen(s) as i64]
+// UNSAFE: it reads C's string through a raw pointer.
+// SAFETY: the caller's promise: `s` points to a NUL-terminated string
+// that outlives the slice.
+pub unsafe fn cstr<'a>(s: *const u8) -> &'a [u8] {
+    std::slice::from_raw_parts(s, strlen(s) as usize)
 }
 ```
 
-**Paths for C.** C wants NUL-terminated strings; `Path` keeps a `Buf`
-with a 0 at the end and hands out both views: `c()` the `*u8` for C,
-`bytes()` the slice without the NUL. `probe(system, path)` takes a
-`Path`, not a `*u8`, so it is safe to call: a `Path` always ends with
-its NUL.
+**Paths for C.** C wants NUL-terminated strings; `Path` keeps a `Vec`
+with a 0 at the end and hands out both views: `c()` the `*const u8` for
+C, `bytes()` the slice without the NUL. `probe(system, &path)` takes a
+`&Path`, not a `*const u8`, so it is safe to call: a `Path` always ends
+with its NUL.
 
-**Responses.** The headers are one f-string per line pushed into a `Buf`,
-and sent with one `write` loop:
+**Responses.** The headers are formatted into a `String` and sent with
+one `write` loop (the prelude's `write(&mut s, "..")` is not used: the
+program's own `write`, C's, has the name):
 
 ```tach
-h.push_fmt("HTTP/1.0 {status}\r\nContent-Type: {content_type}");
+let mut h = format_in("HTTP/1.0 {status}\r\nContent-Type: {content_type}", gpa);
 if let Some(n) = length {
-    h.push_fmt("\r\nContent-Length: {n}");
+    h.push_str(format_in("\r\nContent-Length: {n}", gpa).as_str());
 }
 ```
 
@@ -120,10 +125,10 @@ end of their scope too, so they need no `free`:
 struct Fd { fd: i32 }
 
 impl Drop for Fd {
-    fn drop(inout self) { unsafe { close(self.fd) }; }
+    fn drop(&mut self) { unsafe { close(self.fd) }; }
 }
 
-fn handle_request(fd: i32, system: System, root: [u8], gpa: Gpa) {
+fn handle_request(fd: i32, system: System, root: &[u8], gpa: Gpa) {
     let _connection = Fd { fd };
     ...
     let path = Path::join(root, url, gpa);   // dropped when the function returns
@@ -138,6 +143,6 @@ extension) are ordinary safe code over slices, with `match` on bytes and
 - `extern "C"` declarations, `#[repr(C)]` structs, raw pointers: `volec guide c-interop`
 - `unsafe fn` with a stated contract, `unsafe` blocks, raw pointers: `volec guide unsafe`
 - inline modules (`mod sys { ... }`), `pub`, `use super::`: `volec guide modules`
-- guards with `Drop` for descriptors, `Buf` and its drop: `volec guide memory`
+- guards with `Drop` for descriptors, `Vec` and its drop: `volec guide memory`
 - `Result`, `Option`, `if let`: `volec guide conversions`
-- f-strings, `push_fmt`, `eprintln`: `volec guide formatting`
+- `format_in`, `eprintln`: `volec guide formatting`
