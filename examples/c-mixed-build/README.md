@@ -7,7 +7,7 @@ statistics. The calls go both ways:
 
 - vole calls C through the C file's own header (`import "./ring.h" as c;`);
 - C calls vole through a function pointer vole hands over
-  (`ring_each(ring, accumulate, &stats)`);
+  (`ring_each(ring, accumulate, ctx)`, `ctx` a pointer to its `Stats`);
 - C calls vole **by name**: `ring.c` calls `on_evict(value)` and
   increments `EVICTIONS`, both defined in `main.vl` and declared for C
   in a header that `volec --emit-header` writes.
@@ -98,12 +98,15 @@ A path starting with `./` is relative to the importing file. The header's
 `c::Ring` with the same fields, so vole can read them directly:
 
 ```tach
-fn len(self) -> i64 {
+fn len(&self) -> i64 {
     unsafe { (*self.ring).len as i64 }
 }
 ```
 
-`size_t` fields are `u64`; `as i64` converts to vole's length type.
+`size_t` fields are `u64`; `as i64` converts to the type the program
+counts in. (In the program every `unsafe` block has two comments above
+it, `// UNSAFE:` why it is needed and `// SAFETY:` why it is sound; the
+snippets here leave them out.)
 
 ### C imports vole's header
 
@@ -132,7 +135,7 @@ if (r->len == r->cap) {
 On the vole side:
 
 ```tach
-extern "C" static var EVICTIONS: i64 = 0;
+extern "C" static mut EVICTIONS: i64 = 0;
 
 extern "C" fn on_evict(value: i64) {
     println("    (dropped {value})");
@@ -161,22 +164,23 @@ back:
 ```tach
 struct Stats { count: i64, sum: i64, min: i64, max: i64 }
 
-extern "C" fn accumulate(value: i64, ctx: *u8) -> i32 {
-    let stats = ctx as *Stats;
-    unsafe {
-        stats.count += 1;
-        stats.sum += value;
-        ...
-    }
+extern "C" fn accumulate(value: i64, ctx: *mut u8) -> i32 {
+    let stats = unsafe { &mut *(ctx as *mut Stats) };
+    stats.count += 1;
+    stats.sum += value;
+    ...
     0 // keep going
 }
 
-fn stats(self) -> Stats {
-    var s = Stats { count: 0, sum: 0, min: i64::MAX, max: i64::MIN };
-    unsafe { c::ring_each(self.ring, accumulate, &s as *u8); }
+fn stats(&self) -> Stats {
+    let mut s = Stats { count: 0, sum: 0, min: i64::MAX, max: i64::MIN };
+    unsafe { c::ring_each(self.ring, accumulate, &mut s as *mut Stats as *mut u8); }
     s
 }
 ```
+
+The one unsafe step in the callback is turning `ctx` back into the
+`&mut Stats` it was; the rest is safe code on that reference.
 
 `Stats` is not `#[repr(C)]`: C never looks inside it, it only hands the
 pointer back. `above` uses the same mechanism to stop early: its context
@@ -185,16 +189,16 @@ is an `i64` limit, and returning nonzero ends the walk.
 ### A safe face over the C API
 
 ```tach
-struct Window { ring: *c::Ring }
+struct Window { ring: *mut c::Ring }
 
 impl Window {
     fn new(cap: i64) -> Option<Window> { ... }
-    fn push(inout self, value: i64) { unsafe { c::ring_push(self.ring, value); } }
-    fn get(self, i: i64) -> i64 { ... }   // checks i first
+    fn push(&mut self, value: i64) { unsafe { c::ring_push(self.ring, value); } }
+    fn get(&self, i: i64) -> i64 { ... }   // checks i first
 }
 
 impl Drop for Window {
-    fn drop(inout self) {
+    fn drop(&mut self) {
         unsafe { c::ring_free(self.ring); }
     }
 }
@@ -205,21 +209,21 @@ rules (the ring is non-NULL, the index is in range). `main` uses only
 safe code: `Window::new(size)` returns `None` for a bad size or a failed
 allocation, and the `Drop` impl releases the C memory when `window` goes
 out of scope, on every way out of `main`. A type with a `Drop` is
-move-only, so no copy of the `*c::Ring` can be freed twice or used after
-the free.
+move-only, so no copy of the `*mut c::Ring` can be freed twice or used
+after the free.
 
 ### A vole slice to C
 
 ```tach
 let word = "vole";
-let from_c = unsafe { c::fnv1a(word.ptr, word.len() as u64) };
-println("fnv1a(\"{word}\"): C {from_c:08x}, vole {:08x}", fnv1a(word));
+let from_c = unsafe { c::fnv1a(word.as_ptr(), word.len() as u64) };
+println("fnv1a(\"{word}\"): C {from_c:08x}, vole {:08x}", fnv1a(word.as_bytes()));
 ```
 
-A `[u8]` is a pointer and a length, which is exactly what a C function
+A `&str` (or a `&[u8]`) is a pointer and a length, which is exactly what a C function
 taking `(const uint8_t *data, size_t n)` wants: no NUL needed. The same
-hash written in vole gives the same bits (`u32` arithmetic wraps, as
-in C), printed in hex with `{x:08x}`.
+hash written in vole gives the same bits (`wrapping_mul` on a `u32`
+wraps as C's unsigned arithmetic does), printed in hex with `{x:08x}`.
 
 ## C interop rules in brief
 
@@ -241,13 +245,14 @@ in C), printed in hex with `{x:08x}`.
 
 ## Language features
 
-- `import "./ring.h" as c`, `extern "C" fn`, `extern "C" static var`,
+- `import "./ring.h" as c`, `extern "C" fn`, `extern "C" static mut`,
   `--emit-header`, linking: `volec guide c-interop`
-- `unsafe` blocks kept inside methods, raw pointers, casts of `*u8`:
+- `unsafe` blocks kept inside methods, raw pointers, casts of `*mut u8`:
   `volec guide unsafe`
-- `impl` blocks, `self` and `inout self` methods, `impl Drop`: `volec guide syntax`, `volec guide memory`
-- `Option` from a constructor, `parse_int(..).unwrap_or(0)`, `Scanner` and
-  `read_stdin_in`: `volec guide conversions`, `volec guide std`
+- `impl` blocks, `&self` and `&mut self` methods, `impl Drop`: `volec guide syntax`, `volec guide memory`
+- `Option` from a constructor, `let Ok(n) = token.parse::<i64>() else`,
+  `io::read_to_string_in` and `split_whitespace`: `volec guide
+  conversions`, `volec guide io`
 - `Drop` for C resources: `volec guide memory`
-- f-strings with width and hex (`{x:<4}`, `{h:08x}`, `{m:.2}`):
+- format strings with width and hex (`{x:<4}`, `{h:08x}`, `{m:.2}`):
   `volec guide formatting`

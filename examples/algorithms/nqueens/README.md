@@ -49,15 +49,15 @@ That halves the work.
 ## The code
 
 **The count** is the whole algorithm. The masks are `u64`, the
-operators are C's, and `~` is the integer NOT (`!` is for `bool`):
+operators are C's but one: `!` is the integer NOT as well as `bool`'s:
 
 ```tach
 fn count(all: u64, cols: u64, left: u64, right: u64) -> i64 {
     if cols == all { return 1; }
-    var free = all & ~(cols | left | right);
-    var total = 0;
+    let mut free = all & !(cols | left | right);
+    let mut total = 0;
     while free != 0 {
-        let bit = free & (0 - free);          // the lowest free column
+        let bit = free & free.wrapping_neg(); // the lowest free column
         free ^= bit;
         total += count(all, cols | bit, (left | bit) << 1, (right | bit) >> 1);
     }
@@ -65,8 +65,9 @@ fn count(all: u64, cols: u64, left: u64, right: u64) -> i64 {
 }
 ```
 
-`0 - free` on an unsigned integer wraps, which is defined in vole (it
-is the two's complement negation); there is no overflow trap to avoid.
+`free.wrapping_neg()` is the two's complement negation, `0 - free`
+wrapped; written with `-`, the subtraction would be an overflow, which
+panics in a debug build.
 The diagonal masks grow bits above column n as they shift left; `all &`
 drops them.
 
@@ -83,20 +84,21 @@ if n % 2 == 1 { ... the middle column, once ... }
 
 **One board** comes from `first`, the same search writing each row's
 column into a slice and stopping at the first complete board. An array
-`[0; 8]` is passed as `&queens[..]`, a slice that the function writes
-through (an `inout [i64]` parameter, so the call marks it with `&`):
+`[0u32; 8]` is passed as `&mut queens`, which becomes the slice the
+function writes through (a `&mut [u32]` parameter); the slice's length
+is the board's size:
 
 ```tach
-var queens = [0; 8];
-if first(8, 0, 0, 0, 0, &queens[..]) { ... draw(queens[..]); }
+let mut queens = [0u32; 8];
+if first(0, 0, 0, 0, &mut queens) { ... draw(&queens); }
 ```
 
 `draw` uses `if` as an expression inside the call:
-`print(if j == q { " Q" } else { " ." });`.
+`print(if j == *q { " Q" } else { " ." });`.
 
 **The check** compares each count with the known values, a `const`
-array, and prints `WRONG` next to a mismatch from inside the f-string
-(any expression fits in a hole, an `if` too). The exit status is 1 if
+array, and prints `WRONG` next to a mismatch: the `if` is an argument
+of `println`. The exit status is 1 if
 one differs.
 
 ## Output
@@ -153,14 +155,14 @@ about 0.4 s, n = 16 about 2.5 s.
 
 | feature | where | guide |
 |---|---|---|
-| unsigned integers, `~`, `<<`, `>>`, `^=`, defined wrapping | `count` | `volec guide types` |
-| `std::trailing_zeros`: a set bit's column (an instruction on AArch64) | `first` | `volec guide std` |
+| unsigned integers, `!`, `<<`, `>>`, `^=`, `wrapping_neg` | `count` | `volec guide types` |
+| `bit.trailing_zeros()`: a set bit's column (an instruction on AArch64) | `first` | `volec guide types` |
 | recursion, early `return` | `count`, `first` | `volec guide syntax` |
-| arrays as values, `a[..]` as a slice written through | `main`, `first` | `volec guide types` |
+| arrays as values, `&mut a` as a slice written through | `main`, `first` | `volec guide types` |
 | `const` arrays | `KNOWN` | `volec guide syntax` |
-| `if` as an expression, inside a call and an f-string hole | `draw`, `main` | `volec guide syntax`, `guide formatting` |
+| `if` as an expression, inside a call | `draw`, `main` | `volec guide syntax`, `guide formatting` |
 | `for n in 1..=14`, `for q in queens` | `main`, `draw` | `volec guide syntax` |
-| f-strings with widths: `{found:>10}` | `main` | `volec guide formatting` |
+| format strings with widths: `{found:>10}` | `main` | `volec guide formatting` |
 | `main`'s value as the exit status | `main` | `volec guide core` |
 | a C header: `import "time.h" as c;` | `now_ns` | `volec guide c-interop` |
 
