@@ -670,6 +670,16 @@ owned value also moves with `let w = v;`, `return v`, into a struct
 literal and into a `for x in v`.
 
 ```vole
+fn main(gpa: Gpa) -> i32 { let w: Vec<i64, Gpa> = Vec::new_in(gpa); w.push(1); w.len() as i32 }
+```
+```err
+error[borrowck.borrow_immutable] cannot borrow 'w' as mutable, as it is not declared as mutable
+```
+A `&mut self` method and `&mut w` change `w`, so it is a `let mut w`
+(E0596), as for an assignment; the same for a closure that changes what
+it captures and is called (`let mut bump = || n += 1;`).
+
+```vole
 fn main(gpa: Gpa) -> i32 {
     let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
     v.push(1);

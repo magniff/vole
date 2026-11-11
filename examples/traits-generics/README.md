@@ -137,7 +137,7 @@ impl<A: Allocator> Shape for AnyShape<A> {
 
 **An iterator in the library.** `Polygon::edges` returns an `Edges`,
 whose `Item` is a pair of points; the area (the shoelace formula) and
-the perimeter are then one loop each:
+the perimeter are then one chain each:
 
 ```tach
 impl<'a> Iterator for Edges<'a> {
@@ -146,9 +146,7 @@ impl<'a> Iterator for Edges<'a> {
 }
 
 fn perimeter(&self) -> f64 {
-    let mut sum = 0.0;
-    for (a, b) in self.edges() { sum += (b - a).length(); }
-    sum
+    self.edges().fold(0.0, |acc, (a, b)| acc + (b - a).length())
 }
 ```
 

@@ -7,9 +7,9 @@ spirit of Unix's `wc`: it counts the lines, words and bytes of files,
 and can list their most common words.
 
 On the way you'll use most of what the earlier chapters taught:
-modules, `std::cli` for the command line, views, an arena, a
+modules, `std::cli` for the command line, borrowed text, an arena, a
 `Result`-based error type, effects, contracts, tests and the tools. By
-the end you'll have a program of about 250 lines in three files, with
+the end you'll have a program of about 280 lines in three files, with
 tests, and a feel for how to structure a small real program on your
 own.
 
@@ -61,15 +61,16 @@ mod report;
 
 use std::{env, fs, io};
 use std::cli::{Arg, Command, Matches};
+use std::collections::HashMap;
 
-fn run(m: Matches<Gpa>, n: usize, gpa: Gpa) -> io::Result<()> {
-    var counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
+fn run(m: &Matches<Gpa>, n: usize, gpa: Gpa) -> io::Result<()> {
+    let mut counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
     for path in m.values("file") {
         let text = fs::read_to_string_in(path, gpa)?;
-        count::add_words(&counts, text, gpa);
+        count::add_words(&mut counts, &text, gpa);
     }
-    let top = report::top(counts, n, gpa);
-    report::print_table(top);
+    let top = report::top(&counts, n, gpa);
+    report::print_table(&top);
     Ok(())
 }
 
@@ -83,7 +84,7 @@ fn main(gpa: Gpa) -> i32 {
         Ok(n) => n,
         Err(e) => cmd.exit(e),
     };
-    match run(m, n, gpa) {
+    match run(&m, n, gpa) {
         Ok(()) => 0,
         Err(e) => {
             eprintln("tally: {e}");
@@ -97,38 +98,40 @@ fn main(gpa: Gpa) -> i32 {
 
 ```vole count.vl
 // Counting the words of a text.
+use std::collections::HashMap;
 
 // Letters, digits and apostrophes are parts of words. So is every
 // byte of a non-ASCII character (0x80 and up), so "café" stays whole.
 fn is_word_byte(b: u8) -> bool {
     match b {
-        'a'..='z' | 'A'..='Z' | '0'..='9' | '\'' => true,
+        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'\'' => true,
         0x80..=0xff => true,
         _ => false,
     }
 }
 
 // The word without the punctuation around it: "end!" is "end".
-fn trim_punct(word: str) -> str {
-    var start: usize = 0;
-    var end = word.len();
-    while start < end && !is_word_byte(word[start]) {
+fn trim_punct(word: &str) -> &str {
+    let bytes = word.as_bytes();
+    let mut start = 0;
+    let mut end = bytes.len();
+    while start < end && !is_word_byte(bytes[start]) {
         start += 1;
     }
-    while end > start && !is_word_byte(word[end - 1]) {
+    while end > start && !is_word_byte(bytes[end - 1]) {
         end -= 1;
     }
-    word[start..end]
+    &word[start..end]
 }
 
 // Adds the words of text to counts, lowercased.
-pub fn add_words(counts: inout HashMap<String<Gpa>, i64, Gpa>, text: str, gpa: Gpa) {
+pub fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa>, text: &str, gpa: Gpa) {
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.is_empty() {
             continue;
         }
-        counts.get_or_insert(w.to_lowercase_in(gpa), 0)[0] += 1;
+        *counts.entry(w.to_lowercase_in(gpa)).or_insert(0) += 1;
     }
 }
 ```
@@ -136,18 +139,20 @@ pub fn add_words(counts: inout HashMap<String<Gpa>, i64, Gpa>, text: str, gpa: G
 ```vole report.vl
 // The table of the most common words.
 
-pub fn top(counts: HashMap<String<Gpa>, i64, Gpa>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64),
+use std::collections::HashMap;
+
+pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64),
     Gpa> {
-    var pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
-    for (word, k) in counts.iter() {
-        pairs.push((word.clone(), k));
+    let mut pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
+    for (word, k) in counts {
+        pairs.push((word.clone(), *k));
     }
-    pairs.sort_by(|a, b| if a.1 != b.1 { b.1 - a.1 } else { a.0.cmp(b.0) });
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     pairs.truncate(n);
     pairs
 }
 
-pub fn print_table(rows: [(String<Gpa>, i64)]) {
+pub fn print_table(rows: &[(String<Gpa>, i64)]) {
     for row in rows {
         println("{:<12}{:>5}", row.0, row.1);
     }
@@ -186,7 +191,7 @@ command line, or, if the arguments don't fit the description, prints a
 message and exits.
 
 From the `Matches`, `m.values("file")` gives the positional values, as
-a slice of `str`, and `m.get_as::<i64>("top")` parses an option's value
+a slice of `&str`, and `m.get_as::<usize>("top")` parses an option's value
 as a number. Parsing a number can fail, so it returns a `Result`, and on
 an `Err` we hand the error back to `cmd.exit(e)`, which prints it the
 same way `parse_or_exit` would.
@@ -259,6 +264,9 @@ complete program, one file at a time.
 // word occurs. Nothing here reads or writes: the functions take text and
 // give back numbers, which makes them easy to test.
 
+use std::alloc::Allocator;
+use std::collections::HashMap;
+
 pub struct Counts {
     pub lines: usize,
     pub words: usize,
@@ -266,7 +274,7 @@ pub struct Counts {
 }
 
 impl Counts {
-    pub fn add(inout self, other: Counts) {
+    pub fn add(&mut self, other: &Counts) {
         self.lines += other.lines;
         self.words += other.words;
         self.bytes += other.bytes;
@@ -276,24 +284,24 @@ impl Counts {
 // The lines, words and bytes of text, as wc counts them: a line ends with
 // a newline, a word is a run of anything but spaces.
 #[no_io]
-pub fn count(text: str) -> Counts {
-    var lines: usize = 0;
+pub fn count(text: &str) -> Counts {
+    let mut lines: usize = 0;
     for b in text.as_bytes() {
-        if b == '\n' {
+        if *b == b'\n' {
             lines += 1;
         }
     }
-    Counts { lines: lines, words: text.split_whitespace().count(), bytes: text.len() }
+    Counts { lines, words: text.split_whitespace().count(), bytes: text.len() }
 }
 
 // Adds one to freq for each word of text, without the punctuation around
-// it. The keys are views of text: no word is copied.
+// it. The keys borrow from text: no word is copied.
 #[no_io]
-pub fn add_words<A: Allocator>(freq: inout HashMap<str, i64, A>, text: str) {
+pub fn add_words<'a, A: Allocator>(freq: &mut HashMap<&'a str, i64, A>, text: &'a str) {
     for word in text.split_whitespace() {
         let w = trim_punct(word);
-        if w.len() > 0 {
-            freq.get_or_insert(w, 0)[0] += 1;
+        if !w.is_empty() {
+            *freq.entry(w).or_insert(0) += 1;
         }
     }
 }
@@ -302,57 +310,58 @@ pub fn add_words<A: Allocator>(freq: inout HashMap<str, i64, A>, text: str) {
 // so is every byte of a non-ASCII character, so "café" stays whole.
 fn is_word_byte(b: u8) -> bool {
     match b {
-        'a'..='z' | 'A'..='Z' | '0'..='9' | '\'' => true,
+        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'\'' => true,
         0x80..=0xff => true,
         _ => false,
     }
 }
 
 // Chapter 7's: the word without the punctuation around it.
-fn trim_punct(word: str) -> str {
-    var start: usize = 0;
-    var end = word.len();
-    while start < end && !is_word_byte(word[start]) {
+fn trim_punct(word: &str) -> &str {
+    let bytes = word.as_bytes();
+    let mut start = 0;
+    let mut end = bytes.len();
+    while start < end && !is_word_byte(bytes[start]) {
         start += 1;
     }
-    while end > start && !is_word_byte(word[end - 1]) {
+    while end > start && !is_word_byte(bytes[end - 1]) {
         end -= 1;
     }
-    word[start..end]
+    &word[start..end]
 }
 
 #[test]
 fn counts_lines_words_bytes() {
     let c = count("the cat\nsat\n");
-    assert_eq(c.lines, 2);
-    assert_eq(c.words, 3);
-    assert_eq(c.bytes, 12);
+    assert_eq(&c.lines, &2);
+    assert_eq(&c.words, &3);
+    assert_eq(&c.bytes, &12);
 }
 
 #[test]
 fn trims_punctuation(gpa: Gpa) {
-    var freq: HashMap<str, i64, Gpa> = HashMap::new_in(gpa);
-    add_words(&freq, "(the) end. The end!");
-    assert_eq(freq.get("end"), Some(2));
-    assert_eq(freq.get("the"), Some(1));
-    assert_eq(freq.len(), 3);
+    let mut freq: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
+    add_words(&mut freq, "(the) end. The end!");
+    assert_eq(&freq["end"], &2);
+    assert_eq(&freq["the"], &1);
+    assert_eq(&freq.len(), &3);
 }
 
 // Every word is counted once: the counts add up to the number of words.
 #[property]
 fn counts_add_up(bytes: Vec<u8, Gpa>, gpa: Gpa) {
-    let pieces: [str; 4] = ["a", "b", " ", "\n"];
-    var text = String::new_in(gpa);
-    for b in bytes {
-        text.push_str(pieces[(b % 4) as i64]);
+    let pieces = ["a", "b", " ", "\n"];
+    let mut text = String::new_in(gpa);
+    for b in &bytes {
+        text.push_str(pieces[(*b % 4) as usize]);
     }
-    var freq: HashMap<str, i64, Gpa> = HashMap::new_in(gpa);
-    add_words(&freq, text);
-    var total = 0;
-    for (_, k) in freq.iter() {
-        total += k;
+    let mut freq: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
+    add_words(&mut freq, &text);
+    let mut total = 0;
+    for (_, k) in &freq {
+        total += *k;
     }
-    assert_eq(total, count(text).words as i64);
+    assert_eq(&total, &(count(&text).words as i64));
 }
 ```
 
@@ -366,18 +375,19 @@ call, reads or writes anything. The functions marked `#[test]` and
 The interesting part is `add_words`'s map. Chapter 11's version made a
 lowercased `String` for every word it saw, then stored it as a key:
 a new allocation for each of the thousands of words in a file. This
-one doesn't copy anything. The keys of `freq` are `str`s, views into
-`text` (chapter 4): each key is just the position and length of the word
-in the text that's already in memory.
+one doesn't copy anything. The keys of `freq` are `&str`s that borrow
+from `text` (chapter 4): each key is just the address and length of the
+word in the text that's already in memory.
 
 That's only safe if the text outlives the map, and the compiler checks
-exactly that: a view can't be used after what it views is gone or has
-changed. If `main` dropped the text while the map was still around,
-the program wouldn't compile. You get the speed of pointers into a
+exactly that: a reference can't be used after what it points to is gone
+or has changed. The lifetime `'a` in `add_words`'s signature is that
+promise: the keys are good for as long as the text is. If `main` dropped
+the text while the map was still around, the program wouldn't compile. You get the speed of pointers into a
 buffer, the way a C program would do it, without the risk of a pointer to memory that is gone.
 
 `trim_punct` and `is_word_byte` are chapter 7's, unchanged.
-`trim_punct` returns a view too: `word[start..end]` is a slice of
+`trim_punct` borrows too: `&word[start..end]` is a slice of
 `word`, so "(end)." becomes "end" without copying. And `add_words` is
 generic over the map's allocator (`A: Allocator`), so it works with a
 map on any allocator: in the tests, the `Gpa`; in `main.vl`, an arena.
@@ -389,10 +399,12 @@ map on any allocator: in the tests, the `Gpa`; in `main.vl`, an arena.
 ```vole report.vl
 // The report: the counts, and a table of the most common words.
 
+use std::collections::HashMap;
+
 use crate::count::Counts;
 
 // One line of counts, as wc prints them.
-pub fn print_counts(c: Counts, name: str, words_only: bool) {
+pub fn print_counts(c: &Counts, name: &str, words_only: bool) {
     if words_only {
         println("{:>8} {name}", c.words);
     } else {
@@ -401,20 +413,20 @@ pub fn print_counts(c: Counts, name: str, words_only: bool) {
 }
 
 // The n most common words, most common first; as common, alphabetically.
-pub fn top(counts: HashMap<String<Gpa>, i64, Gpa>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64),
+pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64),
     Gpa> {
-    var pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
-    for (word, k) in counts.iter() {
-        pairs.push((word.clone(), k));
+    let mut pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
+    for (word, k) in counts {
+        pairs.push((word.clone(), *k));
     }
-    pairs.sort_by(|a, b| if a.1 != b.1 { b.1 - a.1 } else { a.0.cmp(b.0) });
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     pairs.truncate(n);
     pairs
 }
 
 // The width of the word column: the widest word, and at least 4.
-fn word_width(rows: [(String<Gpa>, i64)]) -> i64 {
-    var w = 4;
+fn word_width(rows: &[(String<Gpa>, i64)]) -> usize {
+    let mut w = 4;
     for row in rows {
         if row.0.width() > w {
             w = row.0.width();
@@ -424,18 +436,18 @@ fn word_width(rows: [(String<Gpa>, i64)]) -> i64 {
 }
 
 // How many spaces after word, to fill a column w wide.
-fn padding(word: str, w: i64) -> i64
+fn padding(word: &str, w: usize) -> usize
     requires word.width() <= w
 {
     w - word.width()
 }
 
 // The rows as a table, the counts lined up however wide the words are.
-pub fn print_table(rows: [(String<Gpa>, i64)]) {
+pub fn print_table(rows: &[(String<Gpa>, i64)]) {
     let w = word_width(rows);
     for row in rows {
         print("{}", row.0);
-        for _ in 0..padding(row.0, w) {
+        for _ in 0..padding(&row.0, w) {
             print(" ");
         }
         println("{:>6}", row.1);
@@ -458,8 +470,8 @@ terminal, which for a word like "café" is less than its number of bytes
 
 `padding` has a contract: `requires word.width() <= w`. If a later
 change ever computed the width wrong, the program would stop with a
-message naming the call, instead of printing a ragged table, or asking
-for a negative number of spaces. It costs one comparison per row.
+message naming the call, instead of printing a ragged table, or
+subtracting below zero. It costs one comparison per row.
 
 ### The program
 
@@ -471,9 +483,13 @@ Last, `main.vl`, which ties it together:
 mod count;
 mod report;
 
-use std::{IoError, env, fs, io};
+use std::{env, fmt, fs, io};
+use std::alloc::{Allocator, arena_scope};
 use std::cli::{Arg, Command, Matches};
-use std::str::Utf8Error;
+use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
+use std::io::Read;
+use std::string::FromUtf8Error;
 
 use crate::count::Counts;
 
@@ -482,78 +498,80 @@ enum TallyError<A: Allocator> {
     // a file can't be read
     File(String<A>, io::Error),
     // stdin can't be read
-    Stdin(IoError),
+    Stdin(io::Error),
     // stdin isn't UTF-8 text
     NotText,
 }
 
-impl From<IoError> for TallyError<Gpa> {
-    fn from(e: IoError) -> TallyError<Gpa> {
+impl From<io::Error> for TallyError<Gpa> {
+    fn from(e: io::Error) -> TallyError<Gpa> {
         TallyError::Stdin(e)
     }
 }
 
-impl From<Utf8Error> for TallyError<Gpa> {
-    fn from(_: Utf8Error) -> TallyError<Gpa> {
+impl From<FromUtf8Error<Gpa>> for TallyError<Gpa> {
+    fn from(_e: FromUtf8Error<Gpa>) -> TallyError<Gpa> {
         TallyError::NotText
     }
 }
 
 impl Display for TallyError<Gpa> {
-    fn fmt(self, f: inout std::Fmt) {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
-            TallyError::File(path, e) => f.write("{path}: {e}"),
-            TallyError::Stdin(e) => f.write("stdin: {e}"),
-            TallyError::NotText => f.write("the input is not UTF-8 text"),
+            TallyError::File(path, e) => write(f, "{path}: {e}"),
+            TallyError::Stdin(e) => write(f, "stdin: {e}"),
+            TallyError::NotText => write(f, "the input is not UTF-8 text"),
         }
     }
 }
 
 // Counts one text, and adds its words to totals. The text's own word
 // counts live in an arena, freed all at once when the text is done.
-fn tally(text: str, fold: bool, totals: inout HashMap<String<Gpa>, i64, Gpa>, gpa: Gpa) -> Counts {
-    arena_scope(gpa, |a| {
+fn tally(text: &str, fold: bool, totals: &mut HashMap<String<Gpa>, i64, Gpa>, gpa: Gpa) -> Counts {
+    arena_scope(&gpa, |a| {
         // the words, lowercased if asked: in the arena
         let words = if fold {
             text.to_lowercase_in(a)
         } else {
             String::from_in(text, a)
         };
-        var freq: HashMap<str, i64, ScopedArena> = HashMap::new_in(a);
-        count::add_words(&freq, words);
-        for (word, k) in freq.iter() {
-            totals.get_or_insert(String::from_in(word, gpa), 0)[0] += k;
+        let mut freq = HashMap::new_in(a);
+        count::add_words(&mut freq, &words);
+        for (word, k) in &freq {
+            *totals.entry(String::from_in(word, gpa)).or_insert(0) += *k;
         }
     });
     count::count(text)
 }
 
-fn run(m: Matches<Gpa>, top: usize, gpa: Gpa) -> Result<(), TallyError<Gpa>> {
+fn run(m: &Matches<Gpa>, top: usize, gpa: Gpa) -> Result<(), TallyError<Gpa>> {
     let fold = m.flag("ignore-case");
     let words_only = m.flag("words");
-    var totals: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
+    let mut totals: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
     let files = m.values("file");
-    if files.len() == 0 {
-        let text = String::from_utf8(io::read_stdin_in(gpa)?)?;
-        report::print_counts(tally(text, fold, &totals, gpa), "", words_only);
+    if files.is_empty() {
+        let mut bytes: Vec<u8, Gpa> = Vec::new_in(gpa);
+        io::stdin().read_to_end(&mut bytes)?;
+        let text = String::from_utf8(bytes)?;
+        report::print_counts(&tally(&text, fold, &mut totals, gpa), "", words_only);
     }
-    var all = Counts { lines: 0, words: 0, bytes: 0 };
+    let mut all = Counts { lines: 0, words: 0, bytes: 0 };
     for path in files {
         let text = match fs::read_to_string_in(path, gpa) {
             Ok(t) => t,
             Err(e) => return Err(TallyError::File(String::from_in(path, gpa), e)),
         };
-        let c = tally(text, fold, &totals, gpa);
-        report::print_counts(c, path, words_only);
-        all.add(c);
+        let c = tally(&text, fold, &mut totals, gpa);
+        report::print_counts(&c, path, words_only);
+        all.add(&c);
     }
     if files.len() > 1 {
-        report::print_counts(all, "total", words_only);
+        report::print_counts(&all, "total", words_only);
     }
     if top > 0 {
-        let rows = report::top(totals, top, gpa);
+        let rows = report::top(&totals, top, gpa);
         println("");
-        report::print_table(rows);
+        report::print_table(&rows);
     }
     Ok(())
 }
@@ -574,7 +592,7 @@ fn main(gpa: Gpa) -> i32 {
         Ok(n) => n,
         Err(e) => cmd.exit(e),
     };
-    match run(m, top, gpa) {
+    match run(&m, top, gpa) {
         Ok(()) => 0,
         Err(e) => {
             eprintln("tally: {e}");
@@ -590,17 +608,18 @@ There are two new ideas here: an arena, and an error type.
 
 Look at `tally`. Counting a file's words needs memory: a copy of its
 text (lowercased, when `-i` is given), and the map of its words, whose
-keys are views of that copy. All of that is needed only while the file is being counted.
+keys borrow from that copy. All of that is needed only while the file
+is being counted.
 Afterwards, the words and their counts are added to `totals`, and
 nothing else is kept.
 
-That's the case an arena is for (chapter 8). `arena_scope(gpa, |a| {
+That's the case an arena is for (chapter 8). `arena_scope(&gpa, |a| {
 ... })` makes an arena, runs the closure with it, and frees everything
 allocated from it, all at once, when the closure returns. Inside, the
 copy and the map come from `a`. The compiler makes sure nothing
-allocated from the arena escapes the closure: the map is a
-`HashMap<str, i64, ScopedArena>`, and returning it, or storing it in
-`totals`, would be an error. What does leave is copied out explicitly:
+allocated from the arena escapes the closure: the map's type names
+the arena, and returning it, or storing it in `totals`, would be an
+error. What does leave is copied out explicitly:
 `String::from_in(word, gpa)` makes a `String` on the `Gpa` for each
 word added to `totals`.
 
@@ -619,18 +638,17 @@ chapter 11 used, with an error type that says more than an
 `io::Error` alone.
 
 The two `From` impls let `?` convert errors (chapter 6). In `run`, the
-line that reads standard input uses `?` twice:
+lines that read standard input use `?` twice:
 
 ```vole skip
-        let text = String::from_utf8(io::read_stdin_in(gpa)?)?;
+        io::stdin().read_to_end(&mut bytes)?;
+        let text = String::from_utf8(bytes)?;
 ```
 
-`read_stdin_in` can fail with an `IoError`, and `String::from_utf8`,
-which checks that the bytes are UTF-8 text, with a `Utf8Error`. `?`
+`read_to_end` can fail with an `io::Error`, and `String::from_utf8`,
+which checks that the bytes are UTF-8 text, with a `FromUtf8Error`. `?`
 turns each into a `TallyError` through its `From` impl and returns it.
-(The two kinds of I/O error, `IoError` from reading stdin and
-`io::Error` from the file system, are one of the places where std is
-still being tidied up before 1.0.) Reading a file doesn't use `?`,
+Reading a file doesn't use `?`,
 because the error needs the file's name added, so it builds the
 `TallyError::File` by hand.
 
@@ -738,8 +756,9 @@ what each of its functions may do:
 $ volec query effects crate::count
 crate::count::Counts::add	none
 crate::count::count	panic diverge
-add_words<ScopedArena>	alloc(ScopedArena) panic diverge
+add_words<&ArenaScope<&Gpa>>	alloc(ArenaScope<&Gpa>) panic diverge
 add_words<Gpa>	alloc(Gpa) panic diverge
+add_words<A>	alloc io tls thread sync panic diverge (unknown)
 crate::count::is_word_byte	none
 crate::count::trim_punct	panic diverge
 crate::count::counts_lines_words_bytes	panic diverge
@@ -747,18 +766,20 @@ crate::count::trims_punctuation	alloc(Gpa) panic diverge
 crate::count::counts_add_up	alloc(Gpa) panic diverge
 ```
 
-Allocation, panics and loops, but no `io` anywhere. The generic
-`add_words` is listed once for each allocator it's used with, and the
-tests are listed too, since they're functions of the module. The
+Allocation, panics and loops, and no `io` in anything the program
+runs. The generic `add_words` is listed once for each allocator it's
+used with, and once as `add_words<A>`, the function before an allocator
+is chosen, about which nothing is known. The tests are listed too,
+since they're functions of the module. The
 `#[no_io]` marks make this a rule, not just an observation. Suppose
 someone adds a debugging print to `count`, with chapter 17's `edit
 patch`:
 
 ```console
-$ volec edit patch count::count --old 'var lines: usize = 0;' --new 'println("counting"); var lines: usize = 0;'
-count.vl:22:5: error[effect] 'count::count' is #[no_io], but it does io: 'println("counting")' at count.vl:23:5 calls 'std::fmt::println' | help: return the data and let the caller print it, or remove #[no_io] | try: volec query effects count::count --why io  [edited: crate::count::count]
-error edit.breaks: 1 new error; nothing written; the error: count.vl:22:5: 'count::count' is #[no_io], but it does io: 'println("counting")' at count.vl:23:5 calls 'std::fmt::println'
-try: volec edit patch count::count --old 'var lines: usize = 0;' --new 'println("counting"); var lines: usize = 0;' --no-check
+$ volec edit patch count::count --old 'let mut lines: usize = 0;' --new 'println("counting {} bytes", text.len()); let mut lines: usize = 0;'
+count.vl:25:5: error[effect] 'count::count' is #[no_io], but it does io: 'println("counting {} bytes", text.len())' at count.vl:26:5 calls 'std::fmt::println' | help: return the data and let the caller print it, or remove #[no_io] | try: volec query effects count::count --why io  [edited: crate::count::count]
+error edit.breaks: 1 new error; nothing written; the error: count.vl:25:5: 'count::count' is #[no_io], but it does io: 'println("counting {} bytes", text.len())' at count.vl:26:5 calls 'std::fmt::println'
+try: volec edit patch count::count --old 'let mut lines: usize = 0;' --new 'println("counting {} bytes", text.len()); let mut lines: usize = 0;' --no-check
 ```
 
 The edit is refused, and the message says why and what to do: return
@@ -825,8 +846,8 @@ learn from:
   the computing separated from the input and output (`#[no_io]`).
 - `std::cli` describes a command line with `Command` and `Arg`, parses it
   with `parse_or_exit`, and gives `--help` and helpful errors for free.
-- Views as map keys count words without copying them, and the
-  compiler checks that the text outlives them.
+- Borrowed `&str`s as map keys count words without copying them, and
+  the compiler checks that the text outlives them.
 - An arena per file frees each file's scratch memory at once.
 - An error enum with `Display` and `From` impls gives `?` and clear
   messages; `run` returns it, `main` prints it.

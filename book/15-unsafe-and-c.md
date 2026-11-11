@@ -24,7 +24,8 @@ Let's recall what the earlier chapters showed. In safe vole:
 - every index into an array, a `Vec` or a slice is checked, and a bad
   one stops the program with a panic (chapter 7);
 - a reference to a value can't outlive the value or see it change
-  underneath it (chapter 4).
+  underneath it (chapter 4);
+- every variable is set before it's read (chapter 3).
 
 Together these mean safe code has no *undefined behaviour*: there is
 no program you can write in safe vole whose meaning is "whatever the
@@ -77,7 +78,7 @@ go in an `unsafe` block, which marks the spot where you, not the
 compiler, vouch that the call is right. The `try:` line does that for
 us:
 
-```console mvs
+```console
 $ volec fix --only unsafe roots.vl
 fixed 1 unsafe block	roots.vl	+1 -1 lines
 $ cat roots.vl
