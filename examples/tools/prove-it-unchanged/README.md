@@ -48,13 +48,13 @@ longest run 20
 ```console
 $ volec refactor rename adler32::a low --show
 renamed local a to low in crate::adler::adler32, 4 uses	adler.vl	+4 -4 lines
-// adler.vl:4
-4	    var low: u64 = 1;
-// adler.vl:7-8
-7	        low = (low + x as u64) % 65521;
-8	        b = (b + low) % 65521;
-// adler.vl:10
-10	    (b << 16) | low
+// adler.vl:5
+5	    let mut low: u64 = 1;
+// adler.vl:8-9
+8	        low = (low + x as u64) % 65521;
+9	        b = (b + low) % 65521;
+// adler.vl:11
+11	    (b << 16) | low
 $ volec refactor rename adler32::b high
 renamed local b to high in crate::adler::adler32, 3 uses	adler.vl	+3 -3 lines
 $ volec refactor rename main::c1 sum_in
@@ -80,15 +80,15 @@ $ volec edit insert --before adler32 <<'EOF'
 > EOF
 inserted before crate::adler::adler32	adler.vl	+3 -0 lines
 $ volec rewrite '65521' 'MOD_ADLER'
-adler.vl:4:1: error[type error] constant 'MOD_ADLER' is defined in terms of itself  [edited: crate::adler::MOD_ADLER]
-error edit.breaks: 1 new error; nothing written; the error: adler.vl:4:1: constant 'MOD_ADLER' is defined in terms of itself
+adler.vl:5:1: error[type error] constant 'MOD_ADLER' is defined in terms of itself  [edited: crate::adler::MOD_ADLER]
+error edit.breaks: 1 new error; nothing written; the error: adler.vl:5:1: constant 'MOD_ADLER' is defined in terms of itself
 try: volec rewrite 65521 MOD_ADLER --no-check
 [exit 1]
 $ volec rewrite '$e % 65521' '$e % MOD_ADLER' --show
 rewrote 2 sites in 1 file	adler.vl	+2 -2 lines
-// adler.vl:10-11
-10	        low = (low + x as u64) % MOD_ADLER;
-11	        high = (high + low) % MOD_ADLER;
+// adler.vl:11-12
+11	        low = (low + x as u64) % MOD_ADLER;
+12	        high = (high + low) % MOD_ADLER;
 $ volec main.vl --no-positions -o after.s && cmp before.s after.s && echo same assembly
 same assembly
 ok: wrote after.s
@@ -119,11 +119,11 @@ the layout:
 $ volec fmt rle.vl
 formatted	rle.vl	+4 -4 lines
 $ volec query show run_at
-// crate::rle::run_at	rle.vl:4-9	effects: panic diverge
-fn run_at(s: [u8], i: i64) -> i64 {
-    var n = 1;
+// crate::rle::run_at	rle.vl:5-10	effects: panic diverge
+fn run_at(s: &[u8], i: usize) -> usize {
+    let mut n = 1;
     // a run ends at the end of s, at another byte, or at 255 (one count byte)
-    while i + n < s.len as i64 && s[i + n] == s[i] && n < 255 { n += 1; }
+    while i + n < s.len() && s[i + n] == s[i] && n < 255 { n += 1; }
     n
 }
 $ volec main.vl --no-positions -o after.s && cmp before.s after.s && echo same assembly
@@ -141,19 +141,19 @@ parameters (in the order of their first use), the one they define and
 `main` uses after them its result:
 
 ```console
-$ volec refactor extract-function main --lines 22-25 --to round_trips --show
-extracted lines 22-25 of crate::main into round_trips(out, gpa, s) -> bool	main.vl	+9 -4 lines
-// main.vl:22
-22	    let ok = round_trips(out, gpa, s);
-// main.vl:36-43
-36	}
-37	
-38	fn round_trips(out: [u8], gpa: Gpa, s: [u8]) -> bool {
-39	    let ok = match rle::decode(out, gpa) {
-40	        Some(back) => back.as_slice() == s,
-41	        None => false,
-42	    };
-43	    ok
+$ volec refactor extract-function main --lines 24-27 --to round_trips --show
+extracted lines 24-27 of crate::main into round_trips(out, gpa, s) -> bool	main.vl	+9 -4 lines
+// main.vl:24
+24	    let ok = round_trips(out, gpa, s);
+// main.vl:39-46
+39	}
+40	
+41	fn round_trips(out: &[u8], gpa: Gpa, s: &[u8]) -> bool {
+42	    let ok = match rle::decode(out, gpa) {
+43	        Some(back) => back.as_slice() == s,
+44	        None => false,
+45	    };
+46	    ok
 ```
 
 The compiled code changes now (there is a new function), so the

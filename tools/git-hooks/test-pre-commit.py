@@ -51,7 +51,7 @@ if not os.access(compiler, os.X_OK):
 compiler = os.path.abspath(compiler)
 
 BASE = """extern "C" {
-    fn puts(s: *u8) -> i32;
+    fn puts(s: *const u8) -> i32;
 }
 
 fn main() -> i32 {
