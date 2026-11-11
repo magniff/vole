@@ -18,8 +18,8 @@ your own. The running example is a small log analyzer.
 fn main() {
     let k = 10;
     let add_k = |x: i64| x + k;
-    println(add_k(1));
-    println(add_k(32));
+    println("{}", add_k(1));
+    println("{}", add_k(32));
 
     let check = |x: i64| -> bool {
         if x < 0 {
@@ -53,7 +53,7 @@ out. Leave one off, and the compiler asks for it:
 ```vole
 fn main() {
     let double = |x| x * 2;
-    println(double(4));
+    println("{}", double(4));
 }
 ```
 
@@ -66,31 +66,33 @@ error[type error]: cannot infer the type of closure parameter 'x'
 Where a closure is passed straight to a function, the function's
 signature says what the parameters are, so you can leave the types
 off. That's why `v.retain(|x| x % 2 == 1)` didn't need one: `retain`
-on a `Vec<i64>` says it passes an `i64`.
+on a Vec of `i64`s says it passes a reference to an `i64`.
+
+> **If you know Rust:** Rust works out `x` from the call two lines
+> down. Vole doesn't yet: a closure in a `let` says its types.
 
 ## What a closure captures
 
 When a closure uses a variable from outside, it doesn't get a copy. It
-uses the variable itself, in place, the way an `inout` or a `let`
-parameter does (chapter 4). And like a parameter, it holds an *access*
-to the variable: not just for one call, but from the moment the closure
-is made until the last time it's used. What kind of access depends on
-what the closure does with the variable:
+borrows the variable, the way a `&` or a `&mut` parameter does (chapter
+4). And it holds that borrow not just for one call, but from the moment
+the closure is made until the last time it's used. What kind of borrow
+depends on what the closure does with the variable:
 
 | the closure | it holds | while the closure is still to be used |
 |---|---|---|
-| only reads the variable | a let access | the variable may be read, not changed |
-| changes the variable | an inout access | nothing else may read or change it |
-| is a `sink \|..\|` closure | its own copy, or the value moved in | nothing is shared at all |
+| only reads the variable | a shared borrow, `&` | the variable may be read, not changed |
+| changes the variable | a mutable borrow, `&mut` | nothing else may read or change it |
+| is a `move \|..\|` closure | its own copy, or the value moved in | nothing is shared at all |
 
-After the closure's last use, the access is over, and the variable is
+After the closure's last use, the borrow is over, and the variable is
 yours again.
 
 ### A closure that reads
 
 ```vole
 fn main() {
-    var limit = 10;
+    let mut limit = 10;
     let over = |x: i64| x > limit;
     println("{limit} {} {}", over(5), over(15));
     limit = 3;
@@ -110,38 +112,38 @@ still to be used: the closure would see a value change under it.
 
 ```vole
 fn main() {
-    var limit = 10;
+    let mut limit = 10;
     let over = |x: i64| x > limit;
-    println(over(5));
+    println("{}", over(5));
     limit = 3;
-    println(over(5));
+    println("{}", over(5));
 }
 ```
 
 ```err
-error[own.conflict]: 'limit = 3' writes 'limit' while 'over' (main.vl: line 3, column 9) views it; 'over' is used at main.vl: line 6, column 13
+error[borrowck.assign_borrowed]: cannot assign to 'limit' because it is borrowed (borrowed at main.vl: line 3, column 16)
  --> main.vl: line 5, column 5
-  = help: a closure holds what it captures until its last call: move this after that call, or pass the value to the closure as a parameter instead of capturing it
-  = try: volec query own main.vl:6:13
+  = help: assign after the borrow's last use, or shadow the reference (`let r = ..`) instead of reassigning it
 ```
 
-The message calls the closure a *view* of `limit`, as a slice is a view
-of a Vec: it reads something that lives somewhere else. The help gives
-the fixes: change `limit` after the closure's last call, or pass the
-limit to the closure as a parameter instead of capturing it. If `over`
-should keep the old limit, give it its own copy with `sink` (below).
+It's the borrow checker's message from chapter 4: `limit` is borrowed
+on line 3, where the closure is made, and the borrow lasts until the
+closure's last call on line 6. The help gives the fix: change `limit`
+after that call. You could also pass the limit to the closure as a
+parameter instead of capturing it. If `over` should keep the old limit,
+give it its own copy with `move` (below).
 
 ### A closure that changes
 
 ```vole
 fn main() {
-    var count = 0;
-    let bump = || {
+    let mut count = 0;
+    let mut bump = || {
         count += 1;
     };
     bump();
     bump();
-    println(count);
+    println("{count}");
 }
 ```
 
@@ -149,48 +151,46 @@ fn main() {
 2
 ```
 
-`bump` changes `count`, the real one, and `main` sees the result. A
+`bump` changes `count`, the real one, and `main` sees the result.
+(`bump` is a `let mut` because calling it changes what it holds.) A
 closure that changes a variable is the only way to that variable while
-it is still to be used, as an `inout` parameter is during a call. So
-`main` can't even read `count` between the two calls:
+it is still to be used, as a `&mut` is. So `main` can't even read
+`count` between the two calls:
 
 ```vole
 fn main() {
-    var count = 0;
-    let bump = || {
+    let mut count = 0;
+    let mut bump = || {
         count += 1;
     };
     bump();
-    println(count);
+    println("{count}");
     bump();
 }
 ```
 
 ```err
-error[own.conflict]: 'count' is read while 'bump' (main.vl: line 3, column 9) has an inout access to it; 'bump' is used at main.vl: line 8, column 5
- --> main.vl: line 7, column 13
-  = help: a closure holds what it captures until its last call: move this after that call, or pass the value to the closure as a parameter instead of capturing it
-  = try: volec query own main.vl:8:5
+error[borrowck.use_borrowed]: cannot use 'count' because it is mutably borrowed (mutably borrowed at main.vl: line 3, column 20)
+ --> main.vl: line 7, column 15
+  = help: use it after the mutable borrow's last use
 ```
 
-The message says it the way this section does: `bump` has an inout
-access to `count`, until its last use on line 8. The help gives the two
-ways out: read `count` after `bump`'s last call, as the first version
-did, or pass the value to the closure as a parameter instead of
-capturing it. This is the
-same rule as everywhere else in vole: while something may change a
-value, nothing else looks at it, so nothing changes behind anyone's
-back.
+`count` is mutably borrowed from line 3 until `bump`'s last use on line
+8. The way out is to read `count` after `bump`'s last call, as the
+first version did, or to pass the value to the closure as a parameter
+instead of capturing it. This is the same rule as everywhere else in
+vole: while something may change a value, nothing else looks at it, so
+nothing changes behind anyone's back.
 
-### sink closures
+### move closures
 
 Sometimes you want the closure to have its own copy, taken when the
-closure is made. Put `sink` in front:
+closure is made. Put `move` in front:
 
 ```vole
 fn main() {
-    var n = 1;
-    let snapshot = sink || n;
+    let mut n = 1;
+    let snapshot = move || n;
     n += 100;
     println("{} {n}", snapshot());
 }
@@ -201,15 +201,11 @@ fn main() {
 ```
 
 `snapshot` copied `n` when it was made, so changing `n` afterwards is
-fine, and doesn't reach the closure. For an owned value, `sink` moves
-it into the closure: the variable can't be used after that, just as
-after passing it to a `sink` parameter.
-
-> **If you know Rust:** `sink ||` is `move ||`, and the compiler says
-> so if you write `move`: `error[conv.rust]: 'move' is Rust's spelling;
-> a closure that takes its captures is 'sink |..|'`, with a `try:` line
-> that rewrites it. Closure parameters are plain names, `|x|`, never
-> `|&x|`.
+fine, and doesn't reach the closure. For a value that isn't `Copy`, a
+`String` say, `move` moves it into the closure: the variable can't be
+used after that, just as after passing it to a function by value. A
+closure that has to outlive the variables around it, because a function
+returns it or a thread runs it, is a `move` closure.
 
 > **If you know Python or JavaScript:** a closure never sees a variable
 > "change behind its back". While a closure that reads a variable is
@@ -226,7 +222,7 @@ fn apply<F: Fn(i64) -> i64>(f: F, x: i64) -> i64 {
     f(x)
 }
 
-fn repeat<F: FnMut(i64)>(n: i64, f: sink F) {
+fn repeat<F: FnMut(i64)>(n: i64, mut f: F) {
     for i in 0..n {
         f(i);
     }
@@ -234,14 +230,14 @@ fn repeat<F: FnMut(i64)>(n: i64, f: sink F) {
 
 fn main() {
     let k = 10;
-    println(apply(|x| x + k, 1));
-    println(apply(|x| x * 2, 21));
+    println("{}", apply(|x| x + k, 1));
+    println("{}", apply(|x| x * 2, 21));
 
-    var total = 0;
+    let mut total = 0;
     repeat(4, |i| {
         total += i;
     });
-    println(total);
+    println("{total}");
 }
 ```
 
@@ -255,7 +251,9 @@ fn main() {
   an `i64`, and doesn't change anything it captured.
 - `F: FnMut(i64)` also accepts closures that change their captures,
   like the one adding to `total`. (A missing `-> ...` means it returns
-  nothing.) To call it, `repeat` takes `f` as `sink`.
+  nothing.) To call it, `repeat` takes `f` as `mut f`.
+- There is a third, `FnOnce`, for a closure that can be called only
+  once, because calling it gives away something it captured.
 
 Every closure has a type of its own, with no name you can write. That's
 why these functions are generic: `F` stands for whatever the closure's
@@ -277,8 +275,8 @@ fn add_one(x: i64) -> i64 {
 }
 
 fn main() {
-    println(twice(add_one, 5));
-    println(twice(|x| x * 3, 2));
+    println("{}", twice(add_one, 5));
+    println("{}", twice(|x| x * 3, 2));
 }
 ```
 
@@ -298,13 +296,13 @@ fn twice(f: fn(i64) -> i64, x: i64) -> i64 {
 
 fn main() {
     let k = 3;
-    println(twice(|x| x + k, 1));
+    println("{}", twice(|x| x + k, 1));
 }
 ```
 
 ```err
 error[type error]: a closure that captures variables cannot be a 'fn(i64) -> i64' (it captures 'k')
- --> main.vl: line 7, column 19
+ --> main.vl: line 7, column 25
   = help: make the parameter generic: `fn apply<F: Fn(i64) -> i64>(f: F)`
 ```
 
@@ -312,11 +310,31 @@ The `help:` line is the fix: make `twice` generic, `fn twice<F: Fn(i64)
 -> i64>(f: F, x: i64)`, and it takes both kinds.
 
 A struct can hold a closure in a field whose type is a type parameter:
-`struct Button<F> { label: str, on_click: F }`, called as
+`struct Button<F> { label: &'static str, on_click: F }`, called as
 `(b.on_click)(3)`.
 
-What isn't there yet: there is no `FnOnce`, and a function can't return
-a closure, because there is no way to write its type.
+### Returning a closure
+
+A function can make a closure and return it. A closure's type has no
+name, so the result type says only what it can do, with `impl`:
+
+```vole
+fn adder(k: i64) -> impl Fn(i64) -> i64 {
+    move |x| x + k
+}
+
+fn main() {
+    let add_five = adder(5);
+    println("{} {}", add_five(1), add_five(10));
+}
+```
+
+```out
+6 15
+```
+
+The closure is a `move` one: `k` is gone when `adder` returns, so the
+closure takes its own copy along.
 
 ## Iterators
 
@@ -329,9 +347,11 @@ time you ask. Many things give you one:
 - `s.split(',')`, `s.lines()`, `s.chars()` on text, from chapter 7.
 
 The items of `v.iter()`, and of a map's `iter`, `keys` and `values`,
-are the container's own elements, read in place, as `for x in v` reads
-them. To keep an owned one, a `String` say, take a copy with
-`.clone()`, as chapter 7's `sorted_counts` did with the map's words.
+are references to the container's own elements, as in `for x in &v`.
+`.copied()` after it gives the values themselves, when they are `Copy`
+as numbers are. To keep one that isn't, a `String` say, take a copy
+with `.clone()`, as chapter 7's `sorted_counts` did with the map's
+words. (`v.iter_mut()` gives `&mut` references, to change the elements.)
 
 On its own, an iterator does nothing. *Adapters* such as `map` and
 `filter` wrap it in a new iterator that changes the values or skips
@@ -340,12 +360,13 @@ you a result:
 
 ```vole
 fn main(gpa: Gpa) {
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 1..7 {
         v.push(i);
     }
-    let even_squares = v.iter().filter(|x| x % 2 == 0).map(|x| x * x).sum();
-    let big = v.iter().filter(|x| x > 2).count();
+    let nums = v.iter().copied();
+    let even_squares: i64 = nums.filter(|x| x % 2 == 0).map(|x| x * x).sum();
+    let big = v.iter().filter(|x| **x > 2).count();
     println("{even_squares} {big} {:?}", v.iter().max());
 
     let tenfold: Vec<i64, Gpa> = v.iter().map(|x| x * 10).collect_in(gpa);
@@ -359,9 +380,17 @@ fn main(gpa: Gpa) {
 ```
 
 Read the first chain from left to right: take the elements of `v`, keep
-the even ones, square each, add them up: 4 + 16 + 36 = 56.
+the even ones, square each, add them up: 4 + 16 + 36 = 56. `sum` can
+add up into more than one type, so the `let` says which: `i64`.
 `collect_in(gpa)` gathers the values into a new `Vec`, and since that
 allocates, it takes the allocator (chapter 8).
+
+A closure given to `filter` gets a reference to each item, since
+`filter` only looks at it and passes it on. Over `v.iter()`, whose
+items are references already, that is a reference to a reference, and
+`**x` is the number. Arithmetic and method calls see through
+references by themselves; a comparison like `>` wants the same type on
+both sides.
 
 ### Lazy until consumed
 
@@ -401,15 +430,15 @@ Here are the ones std has, by example:
 
 ```vole
 fn main() {
-    let words: [str; 3] = ["ant", "bee", "cat"];
+    let words = ["ant", "bee", "cat"];
     for (i, w) in words.iter().enumerate() {
         print("{i}:{w} ");
     }
     println("");
 
-    let dot = (1..4).zip(10..13).map(|(a, b)| a * b).sum();
+    let dot: i32 = (1..4).zip(10..13).map(|(a, b)| a * b).sum();
     let product = (1..6).fold(1, |acc, x| acc * x);
-    let first_three: i64 = (1..100).take(3).sum();
+    let first_three: i32 = (1..100).take(3).sum();
     println("{dot} {product} {first_three}");
 
     println("{:?} {:?}", (1..20).find(|x| x * x > 50), (1..20).position(|x| x == 5));
@@ -428,7 +457,8 @@ true false Some(1)
   with the next value of another iterator, stopping when either runs
   out. A pair comes as a tuple, which the closure can take apart:
   `|(a, b)|`.
-- `take(n)` stops after `n` values.
+- `take(n)` stops after `n` values, and `skip(n)` leaves out the first
+  `n`.
 - `fold(start, |acc, x| ...)` carries a value through the sequence:
   here, a running product.
 - `find` gives the first value that passes a test, and `position` its
@@ -437,16 +467,20 @@ true false Some(1)
 - `min`, `max`, `sum` and `count` do what they say. `min` and `max`
   return an `Option`, since the sequence may be empty.
 
-A consumer takes the iterator for good (`sink self`, chapter 4) and
-uses it up, so a chain is one value from start to end. `find`,
-`position`, `any` and `all` are different: they stop at the value that
-decides the answer, and change the iterator rather than take it
-(`inout self`), so the rest of its values are still there. To go on
-with them, keep the iterator in a `var`, as `parse` below does for
-`next`.
+A consumer takes the iterator for good (`self`, chapter 4) and uses it
+up, so a chain is one value from start to end. `find`, `position`,
+`any` and `all` are different: they stop at the value that decides the
+answer, and change the iterator rather than take it (`&mut self`), so
+the rest of its values are still there. To go on with them, keep the
+iterator in a `let mut`, as `parse` below does for `next`.
 
-> **If you know Rust:** these are Rust's names. `collect_in(gpa)` makes
-> a `Vec` and nothing else; there's no `collect::<HashSet<_>>()`.
+There are more: `chain` puts one iterator after another, `rev` goes
+backwards, `step_by(n)` takes every `n`th value, `filter_map` and
+`flat_map` combine two steps, `peekable` lets you look at the next
+value without taking it. `volec guide iterators` has the list.
+
+> **If you know Rust:** these are Rust's names. `collect()` is
+> `collect_in(gpa)`, because collecting allocates.
 
 ## A log analyzer
 
@@ -456,16 +490,25 @@ of the reply in bytes, and the time it took in milliseconds. Save this
 as `logs.vl`:
 
 ```vole logs.vl
-struct Request {
+use std::io;
+use std::collections::HashMap;
+
+struct Request<'a> {
     status: i64,
-    path: str,
+    path: &'a str,
     bytes: i64,
     ms: i64,
 }
 
+impl Request<'_> {
+    fn ok(&self) -> bool {
+        self.status < 400
+    }
+}
+
 // "200 GET /index.html 512 31" is a Request; anything else is None.
-fn parse(line: str) -> Option<Request> {
-    var fields = line.split_whitespace();
+fn parse(line: &str) -> Option<Request> {
+    let mut fields = line.split_whitespace();
     let status = fields.next()?.parse::<i64>().ok()?;
     let _method = fields.next()?;
     let path = fields.next()?;
@@ -475,9 +518,8 @@ fn parse(line: str) -> Option<Request> {
 }
 
 fn main(gpa: Gpa) {
-    let input = read_stdin_in(gpa).unwrap();
-    let text = str::from_utf8(input.as_slice()).unwrap();
-    var reqs: Vec<Request, Gpa> = Vec::new_in(gpa);
+    let text = io::read_to_string_in(io::stdin(), gpa).unwrap();
+    let mut reqs: Vec<Request, Gpa> = Vec::new_in(gpa);
     for line in text.lines() {
         match parse(line) {
             Some(r) => reqs.push(r),
@@ -485,18 +527,18 @@ fn main(gpa: Gpa) {
         }
     }
 
-    let ok_bytes = reqs.iter().filter(|r| r.status < 400).map(|r| r.bytes).sum();
-    let failed = reqs.iter().filter(|r| r.status >= 400).count();
+    let ok_bytes: i64 = reqs.iter().filter(|r| r.ok()).map(|r| r.bytes).sum();
+    let failed = reqs.iter().filter(|r| !r.ok()).count();
     println("{} requests, {failed} failed, {ok_bytes} bytes served", reqs.len());
 
-    var by_status: HashMap<i64, i64, Gpa> = HashMap::new_in(gpa);
+    let mut by_status: HashMap<i64, i64, Gpa> = HashMap::new_in(gpa);
     reqs.iter().for_each(|r| {
-        by_status.get_or_insert(r.status, 0)[0] += 1;
+        *by_status.entry(r.status).or_insert(0) += 1;
     });
-    var codes: Vec<i64, Gpa> = by_status.keys().collect_in(gpa);
+    let mut codes: Vec<i64, Gpa> = by_status.keys().copied().collect_in(gpa);
     codes.sort();
-    for code in codes {
-        println("  {code}: {}", by_status.get(code).unwrap());
+    for code in &codes {
+        println("  {code}: {}", by_status[code]);
     }
 
     match reqs.iter().map(|r| (r.ms, r.path)).max() {
@@ -504,12 +546,12 @@ fn main(gpa: Gpa) {
         None => println("no requests"),
     }
 
-    var broken: Vec<str, Gpa> = reqs
+    let mut broken: Vec<&str, Gpa> = reqs
         .iter()
-        .filter(|r| r.status >= 400)
+        .filter(|r| !r.ok())
         .map(|r| r.path)
         .collect_in(gpa);
-    broken.sort_by(|a, b| a.cmp(b));
+    broken.sort();
     println("failed paths: {broken:?}");
 }
 ```
@@ -538,25 +580,28 @@ Let's go through it.
 
 `parse` calls `next()` on the iterator of fields itself, one field at a
 time. `next` changes the iterator (it moves it along), so `fields` is a
-`var`. Each `?` returns `None` from `parse` as soon as a field is
+`let mut`. A `Request` borrows its path from the line, so it has a
+lifetime, as chapter 5's `Command` did; `impl Request<'_>` gives it a
+method without having to name that lifetime. Each `?` returns `None` from `parse` as soon as a field is
 missing or isn't a number (chapter 6), so `oops` is skipped.
 
 The two totals are one chain each: keep the successful requests and add
 up their bytes; keep the failed ones and count them.
 
 `for_each` runs a closure on every value. This one changes `by_status`,
-a `var` it captured, so it counts each status code. A map's order is
-unspecified, so we collect its keys into a Vec and sort them before
-printing.
+a `let mut` it captured, so it counts each status code. A map's order
+is unspecified, so we collect its keys into a Vec and sort them before
+printing; `by_status[code]` is the value under a key that is known to
+be there.
 
 To find the slowest request, `map` turns each one into a pair `(ms,
 path)`, and `max` finds the largest pair. Tuples compare by their first
 element, then the second, so the largest pair is the one with the
 biggest time.
 
-The last chain collects the failed paths into a `Vec<str>`. These are
-views of the input text, so nothing is copied. `sort_by` sorts them with
-the comparison we give it, here the paths' own `cmp`.
+The last chain collects the failed paths into a Vec of `&str`s. These
+borrow from the input text, so nothing is copied, and `sort` puts them
+in alphabetical order.
 
 ## Writing an iterator
 
@@ -573,7 +618,7 @@ struct Fibonacci {
 impl Iterator for Fibonacci {
     type Item = i64;
 
-    fn next(inout self) -> Option<i64> {
+    fn next(&mut self) -> Option<i64> {
         let n = self.a;
         self.a = self.b;
         self.b = n + self.b;
@@ -590,7 +635,7 @@ fn main(gpa: Gpa) {
         print("{n} ");
     }
     println("");
-    let even_sum = fibonacci().take(30).filter(|n| n % 2 == 0).sum();
+    let even_sum: i64 = fibonacci().take(30).filter(|n| n % 2 == 0).sum();
     let first_big = fibonacci().position(|n| n > 1000);
     let five: Vec<i64, Gpa> = fibonacci().take(5).collect_in(gpa);
     println("{even_sum} {first_big:?} {five:?}");
@@ -603,7 +648,7 @@ fn main(gpa: Gpa) {
 ```
 
 `type Item = i64;` is the associated type from chapter 9: it says the
-iterator produces `i64`s. `next` takes `inout self`, because producing a
+iterator produces `i64`s. `next` takes `&mut self`, because producing a
 value moves the state along.
 
 That's all the impl has, and yet `take`, `filter`, `sum`, `position` and
@@ -627,48 +672,48 @@ optimizations on, and time it:
 
 ```vole sum_chain.vl
 fn main(gpa: Gpa) {
-    var xs: Vec<i64, Gpa> = Vec::new_in(gpa);
+    let mut xs: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..50000000 {
         xs.push(i % 1000);
     }
-    var total = 0;
+    let mut total: i64 = 0;
     for round in 0..10 {
-        total += xs.iter().filter(|x| x % 2 == 0).map(|x| x * x + round).sum();
+        total += xs.iter().filter(|x| *x % 2 == 0).map(|x| x * x + round).sum::<i64>();
     }
-    println(total);
+    println("{total}");
 }
 ```
 
 ```text
 $ volec -O2 sum_chain.vl -o sum_chain && time ./sum_chain
 83084625000000
-real 3.68
+real 0.38
 ```
 
 And here is the same work written as a loop:
 
 ```vole sum_loop.vl
 fn main(gpa: Gpa) {
-    var xs: Vec<i64, Gpa> = Vec::new_in(gpa);
+    let mut xs: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..50000000 {
         xs.push(i % 1000);
     }
-    var total = 0;
+    let mut total: i64 = 0;
     for round in 0..10 {
-        for x in xs {
+        for x in &xs {
             if x % 2 == 0 {
                 total += x * x + round;
             }
         }
     }
-    println(total);
+    println("{total}");
 }
 ```
 
 ```text
 $ volec -O2 sum_loop.vl -o sum_loop && time ./sum_loop
 83084625000000
-real 3.98
+real 0.40
 ```
 
 These are one busy machine's numbers, and yours will differ, but the
@@ -676,26 +721,18 @@ two take the same time, give or take the noise of the machine.
 
 Chapter 16 shows how to look at the machine code itself.
 
-## What's not there yet
-
-std's iterators cover the common cases, but some familiar ones are
-missing for now: there is no `iter_mut` (change elements through an
-index loop, as in chapter 7), and no `chain`, `flat_map`, `filter_map`,
-`peekable`, `step_by` or `skip`. A `for` loop with an `if` inside does
-the job of each. The list will shrink.
-
 ## Summary
 
 - A closure, `|x: i64| x + k`, is a function written where it's used.
   Its parameter types come from where it's passed, or are written out.
-- A closure uses what it captures in place, and holds an access to it
-  from its creation to its last use: a let access if it only reads the
-  variable (others may read it, not change it), an inout access if it
-  changes it (nothing else may read or change it). After its last use,
-  the variable is free again. A `sink ||` closure takes its own copies.
-- Functions take closures through bounds, `F: Fn(i64) -> i64` or `F:
-  FnMut(i64)`; a closure that captures nothing is also a plain `fn(i64)
-  -> i64`.
+- A closure borrows what it captures, from its creation to its last
+  use: a shared borrow if it only reads the variable (others may read
+  it, not change it), a mutable one if it changes it (nothing else may
+  read or change it). After its last use, the variable is free again. A
+  `move ||` closure takes its own copies.
+- Functions take closures through bounds, `F: Fn(i64) -> i64`, `F:
+  FnMut(i64)` or `FnOnce`, and return them as `impl Fn(i64) -> i64`; a
+  closure that captures nothing is also a plain `fn(i64) -> i64`.
 - Iterators come from `iter()`, ranges, maps and text. Adapters (`map`,
   `filter`, `enumerate`, `zip`, `take`) are lazy; consumers (`sum`,
   `count`, `fold`, `min`, `max`, `any`, `all`, `find`, `position`,

@@ -21,7 +21,7 @@
 > {"jsonrpc":"2.0","id":7,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":3,"character":9}}}
 < {"jsonrpc":"2.0","id":7,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/thread.vl","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}}
 > {"jsonrpc":"2.0","id":9,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":6,"character":14}}}
-< {"jsonrpc":"2.0","id":9,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/ops.vl","range":{"start":{"line":9,"character":10},"end":{"line":9,"character":13}}}}
+< {"jsonrpc":"2.0","id":9,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/collections/mod.vl","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}}
 > {"jsonrpc":"2.0","id":10,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":4,"character":17}}}
 < {"jsonrpc":"2.0","id":10,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/alloc.vl","range":{"start":{"line":106,"character":17},"end":{"line":106,"character":26}}}}
 > {"jsonrpc":"2.0","id":11,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":4,"character":47}}}
