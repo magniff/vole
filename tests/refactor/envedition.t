@@ -20,8 +20,7 @@ main.vl:17:13: error[unsafe] calling a C function is unsafe | help: put it in an
 fixed 1 suggested fix	main.vl	+1 -1 lines
 main.vl:17:13: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: volec fix --only unsafe main.vl
 note fix.left: 1 error left (above)
-## The flag with a kind of fix is the same (the flag alone, `fix
-## --edition rust ROOT`, is the translation).
+## The flag with a kind of fix is the same.
 $ --edition rust fix --only unsafe
 fixed 1 unsafe block	main.vl	+1 -1 lines
 % cat main.vl

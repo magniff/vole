@@ -12,8 +12,8 @@ in `main.vl`; `target/volec guide edition`): `&T`, `&mut T`, `let mut`,
 MVS programs (std, the guide's examples, most of tests/run). A static of
 compiler/src is read and written only through its accessors at its
 file's end (`get_x()`, `set_x(v)`); their `unsafe` blocks' UNSAFE:/
-SAFETY: lines (from the review in compiler/src/tools/translate/
-statics.tsv, with its evidence) say which functions and threads write
+SAFETY: lines (from the review in tools/statics/statics.tsv, with
+its evidence) say which functions and threads write
 and read it: a change to who writes or reads a static keeps them true.
 
 **New to vole? Run `target/volec guide` first**: the language in
