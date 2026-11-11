@@ -171,6 +171,7 @@ with its comment: `volec guide --find split_once`.
 | `'Vec' names no allocator` (`alloc.default`) | `Vec<i64, Gpa>`, or a generic `A: Allocator` |
 | `expected 'String<Gpa>', got '&str'` | `String::from_in("..", gpa)`: a String owns its text; a parameter `s: &str` takes literals and a String's `&s` |
 | `cannot assign to immutable variable 'a'` | `let mut a` |
+| `borrowck.borrow_immutable: cannot borrow 'w' as mutable, as it is not declared as mutable` | `let mut w`: `w.push(1)` and `&mut w` change it |
 | `expected '&mut Vec<i64, Gpa>', got 'Vec<i64, Gpa>'` | `f(&mut v)`: the callee may change `v` |
 | `borrowck.use_moved: 'v' is used here after it moved` | lend it (`&v`), or `keep(v.clone())` |
 | `borrowck.conflict: cannot borrow 'u' as mutable because it is also borrowed as immutable` | use the shared borrow before the change, or take it again after (`guide memory#borrowing`) |

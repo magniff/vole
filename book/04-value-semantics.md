@@ -282,6 +282,28 @@ Summertime 200
 call: reading `main`, you know which calls may change `list` without
 looking at the functions. A `&mut` can be made only of a `let mut`
 variable; you can't lend for changing what you may not change yourself.
+With a plain `let`:
+
+```vole playlist.vl
+struct Song { title: &'static str, seconds: i64 }
+
+fn add_song(list: &mut Vec<Song, Gpa>, title: &'static str, seconds: i64) {
+    list.push(Song { title, seconds });
+}
+
+fn main(gpa: Gpa) {
+    let list: Vec<Song, Gpa> = Vec::new_in(gpa);
+    add_song(&mut list, "Blue Moon", 185);
+    println("{}", list.len());
+}
+```
+
+```err
+error[borrowck.borrow_immutable]: cannot borrow 'list' as mutable, as it is not declared as mutable (rustc E0596)
+ --> playlist.vl: line 9, column 14
+  = help: declare it `let mut`
+  = try: let mut list = ...
+```
 
 Inside `trim_all`, the loop over a `&mut` list visits `&mut` references
 to its songs, so `song.seconds = limit` changes the song in the

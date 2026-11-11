@@ -82,6 +82,12 @@ value yet, that's usually a sign to compute it with an expression, like
 the `if` and `match` expressions you'll see below, and not a reason for
 a `let mut` that each branch sets.
 
+A `let total: i64;` without a value is allowed, as long as the variable
+is assigned before it is read, on every path that reaches the read. The
+compiler checks it: reading a variable that may not have its value yet
+is an error (`borrowck.use_uninit`), so a vole program can never read a
+variable that was never set.
+
 ## Numbers
 
 Vole has signed integers `i8`, `i16`, `i32`, `i64` and unsigned ones
