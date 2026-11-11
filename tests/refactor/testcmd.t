@@ -63,7 +63,7 @@ line 3: c
 test main.vl: ran on -: exit 0, 1 line of output
 line 1: x
 ## the program is built again when a source changes
-% printf 'use std::println;\n\nfn main() -> i32 {\n    println("x");\n    0\n}\n' > main.vl
+% printf '// EDITION: rust\nfn main() -> i32 {\n    println("x");\n    0\n}\n' > main.vl
 $ test ok
 test main.vl: 0 passed, 1 failed (1 case; -O0 and -O2 agree)
 FAIL ok: stdout differs at line 1 (3 lines expected, 1 printed)
