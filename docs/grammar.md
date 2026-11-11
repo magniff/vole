@@ -1585,15 +1585,12 @@ bytes on the stack, a piece that does not fit left out, so that a
 `#[no_alloc]` function can panic with one.
 
 Until 0.26.1 a plain literal at a format position was printed as it is,
-braces and all; `volec fix --only fstring` doubles such a literal's
-braces, so that its output stays the same.
+braces and all.
 
 **f-strings** (`f"..."`, 0.15 to 0.26.2) are removed (0.26.3): an
 f-string is `error syntax.fstring`, once per file, at its first, with
-how many the file has; its `try:` line is `volec fix --only fstring
---keep-braces FILE`. The lexer and the parser still read the form, so
-that the rest of the file is checked and the fix rewrites it, as
-below. An f-string was an expression of the same `std::Interp` type. Its text takes the escapes of
+how many the file has. The lexer and the parser still read the form, so
+that the rest of the file is checked. An f-string was an expression of the same `std::Interp` type. Its text takes the escapes of
 a string literal; `{{` and `}}` are braces; `{expr}` is a hole holding
 any expression, `{expr:spec}` one with a spec (the same specs). The lexer
 reads it as pieces: `f"text{` (FHead), the hole's tokens, `:spec}text{`
@@ -1603,9 +1600,8 @@ outside brackets that is not `::`, so an expression with a top-level `:`
 needs parentheses; string literals may appear in holes; f-strings do not
 nest; a hole may not be empty, and a lone `}` in the text is an error.
 The holes are evaluated where the f-string is, once each, left to right;
-the value holds copies of them. `volec fix --only fstring` rewrites an
-f-string as a format literal (at a format position) or as
-`format_args(..)` (anywhere else).
+the value holds copies of them. An f-string is written as a format
+literal (at a format position) or as `format_args(..)` (anywhere else).
 
 ### Named arguments, defaults, shorthand
 
@@ -2170,8 +2166,7 @@ match_expr += "match" "&" expr "{" arms "}" ;           (* binds inout accesses 
   is `conv.set`, and `sink T` outside a parameter `conv.sink_type`.
   Rust's spellings (`&T`, `&mut T`, `&mut x`, `&self`, `let mut`, `mut
   x`, `static mut`, `move`, `*r` on an access) are `conv.rust`, each
-  with the new form in a `try:` line; `volec fix --only conventions`
-  rewrites a program.
+  with the new form in a `try:` line.
 - Not yet: results that are accesses (`-> let T`, `-> inout T`,
   `Option<inout V>`) and `for inout x in &v`; until they land,
   `get_or_insert(k, v)` and `get_mut(k)` give one-element views

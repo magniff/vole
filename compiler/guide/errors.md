@@ -457,7 +457,7 @@ fn main() -> i32 { let x = 1; println(f"x = {x + 1}"); 0 }
 ```err
 f-strings are removed (0.26.3)
 ```
-`volec fix --only fstring --keep-braces FILE` rewrites them: a name
+Write the format literal: a name
 stays in its hole, an expression becomes `{}` and an argument,
 `println("x = {}", x + 1)`.
 
