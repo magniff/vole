@@ -500,12 +500,6 @@ struct Request<'a> {
     ms: i64,
 }
 
-impl Request<'_> {
-    fn ok(&self) -> bool {
-        self.status < 400
-    }
-}
-
 // "200 GET /index.html 512 31" is a Request; anything else is None.
 fn parse(line: &str) -> Option<Request> {
     let mut fields = line.split_whitespace();
@@ -527,8 +521,8 @@ fn main(gpa: Gpa) {
         }
     }
 
-    let ok_bytes: i64 = reqs.iter().filter(|r| r.ok()).map(|r| r.bytes).sum();
-    let failed = reqs.iter().filter(|r| !r.ok()).count();
+    let ok_bytes: i64 = reqs.iter().filter(|r| r.status < 400).map(|r| r.bytes).sum();
+    let failed = reqs.iter().filter(|r| r.status >= 400).count();
     println("{} requests, {failed} failed, {ok_bytes} bytes served", reqs.len());
 
     let mut by_status: HashMap<i64, i64, Gpa> = HashMap::new_in(gpa);
@@ -548,7 +542,7 @@ fn main(gpa: Gpa) {
 
     let mut broken: Vec<&str, Gpa> = reqs
         .iter()
-        .filter(|r| !r.ok())
+        .filter(|r| r.status >= 400)
         .map(|r| r.path)
         .collect_in(gpa);
     broken.sort();

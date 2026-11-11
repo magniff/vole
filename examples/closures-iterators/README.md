@@ -113,9 +113,7 @@ per closure and the call is direct, usually inlined:
 
 ```tach
 fn count_where<F: Fn(&Entry) -> bool>(entries: &[Entry], pred: F) -> usize {
-    let mut n = 0;
-    for e in entries { if pred(e) { n += 1; } }
-    n
+    entries.iter().filter(|e| pred(e)).count()
 }
 
 let errors = count_where(all, |e| e.level == Level::Error);
@@ -153,7 +151,7 @@ ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
 ```
 
 **zip** walks two iterators in step, ending with the shorter one;
-zipping the entries with `all[1..].iter()` pairs each request with the
+zipping the entries with `&all[1..]` pairs each request with the
 next.
 
 ## Language features
