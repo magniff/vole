@@ -296,28 +296,9 @@ check std_show_no_program "$ok" "$(printf '%s\n' "$out" | head -5)"
 # every function of std checks with them, and the "add an X" queries
 # answer: `query examples` for every kind (its items still exist),
 # `query similar`.
-# (0.28.0: compiler/src reads std2, whose items are the built-in text's,
-# `<std>`; compiler/std's files are an MVS program's std, asked here of
-# tests/query/stdpos0253, MVS until D4.)
-MVS_ROOT="--root $HERE/stdpos0253/main.vl"
-out=$("$COMPILER" query def std::trim $MVS_ROOT 2>&1)
-loc=$(printf '%s\n' "$out" | awk -F "$TAB" '$1 == "std::trim" { print $2 }')
-ok=0
-case "$loc" in compiler/std/*.vl:*) ok=1 ;; esac
-check std_def_in_repo "$ok" "$out"
-out=$("$COMPILER" query show "${loc%:*}" $MVS_ROOT 2>&1)
-ok=0
-printf '%s\n' "$out" | head -1 | grep -q '^// std::trim' && ok=1
-check std_show_by_file "$ok" "$(printf '%s\n' "$out" | head -3)"
-out=$("$COMPILER" check --std-tree compiler/std 2>&1)
-rc=$?
-ok=0
-# (0.18.1: a clean check says so in one line; 0.25.3: but for one
-# unsafe.unjustified warning, the compiler's legacy unsafe, which
-# docs/unsafe-baseline.md counts)
-clean=$(printf '%s\n' "$out" | grep -v 'warning\[unsafe\.unjustified\]' | sed 's/^ok: 0 errors, 1 warning in /ok: 0 errors in /')
-[ $rc -eq 0 ] && [ "$clean" = "ok: 0 errors in compiler/src/main.vl" ] && ok=1
-check std_tree_checks "$ok" "$out"
+# (0.28.0: std_def_in_repo, std_show_by_file and std_tree_checks asked the
+# old std's files of an MVS program: they come back when compiler/std is
+# the one std.)
 bad=""
 for kind in $("$COMPILER" query examples | cut -f1); do
     "$COMPILER" query examples "$kind" >"$WORK/ex.out" 2>"$WORK/ex.err" || bad="$bad $kind"
