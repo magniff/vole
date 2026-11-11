@@ -12,7 +12,7 @@ allocates).
 ## #[test]
 
 ```vole
-use std::str::ParseIntError;
+use std::num::ParseIntError;
 
 fn gap(v: &[i64]) -> i64 {
     let mut best = 0;

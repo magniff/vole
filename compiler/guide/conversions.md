@@ -9,6 +9,9 @@ convention for failure: Option means absent, Result means failed.
 saturating as Rust's `as` does); `i64::from(x)` widens losslessly
 (`From` holds for every widening: `i8 -> i16 -> i32 -> i64`, `u8 -> u16
 -> u32 -> u64`, unsigned to a strictly wider signed type).
+`u8::try_from(x)` and `x.try_into()` narrow with a check: a
+`Result<u8, TryFromIntError>` (`std::num`), `Err` when the value does
+not fit.
 
 vole also widens by itself, where rustc says E0308: an `i32` where an
 `i64` goes, and two integer operands of different widths join to the
@@ -37,7 +40,7 @@ Option and Result have Rust's methods (`map`, `and_then`, `ok_or`,
 `unwrap_or`, `unwrap_or_else`, `map_err`, `ok`, `err`, `is_some`...).
 
 ```vole
-use std::str::ParseIntError;
+use std::num::ParseIntError;
 
 fn total(xs: &[i32]) -> i64 {
     let mut t: i64 = 0;
@@ -63,7 +66,7 @@ fn half(x: Option<i64>) -> Option<i64> {
     Some(v / 2)
 }
 
-fn main() -> i32 {
+fn main() -> Result<(), AppError> {
     let a: i32 = 2000000000;
     let b: i32 = 2000000000;
     let wide = a as i64 + b as i64;
@@ -71,23 +74,25 @@ fn main() -> i32 {
     let xs = [1i32, 2, 3];
     println("{wide} {}", total(&xs) + i64::from(c));
     println("{:?} {:?} {:?} {}", checked("42"), checked("4x"), checked("-3"), half(Some(8)).unwrap_or(-1) + half(None).unwrap_or(-1));
-    match checked("4x") { Err(AppError::Parse(e)) => println("{:?}", e.kind()), _ => {} }
-    0
+    match checked("4x") { Err(AppError::Parse(e)) => println("{e}"), _ => {} }
+    println("{:?} {:?}", u8::try_from(300i64).is_err(), u8::try_from(checked("7")?));
+    Ok(())
 }
 ```
 ```out
 4000000000 1206
 Ok(42) Err(Parse(ParseIntError { kind: InvalidDigit })) Err(Negative(-3)) 3
-InvalidDigit
+invalid digit found in string
+true Ok(7)
 ```
 
 - `s.parse::<T>()` (or `let n: T = s.parse()?`) gives a `Result<T,
   T::Err>`: `ParseIntError` (its `kind()`: `IntErrorKind::Empty`,
   `InvalidDigit`, `PosOverflow`, `NegOverflow`), `ParseFloatError`,
   `ParseBoolError`.
-- `main` returns an `i32` (its exit code) or nothing: a
-  `run() -> Result<(), E>` called from main does the work, and main
-  prints the error and returns 1.
+- `main` returns nothing, an `i32` (its exit code) or a `Result<(), E>`
+  with `E: Debug`: an `Err(e)` prints `Error: ` and `{e:?}` on stderr,
+  and the program exits with 1.
 
 ## Reading input
 

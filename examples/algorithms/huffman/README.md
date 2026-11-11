@@ -96,7 +96,7 @@ while let Some((node, depth)) = stack.pop() {
 **Canonical codes** sort `(length, byte)` pairs with `sort_unstable`
 and another derived `Ord`, then count upward. Building the codebook
 returns a `Result`: a code longer than the decoder's table allows is an
-error, `HuffError::CodeTooLong`, which `?` passes up to `run`:
+error, `HuffError::CodeTooLong`, which `?` passes up to `main`:
 
 ```tach
 order.sort_unstable();                          // by the derived Ord
@@ -147,9 +147,8 @@ for _ in 0..count {
 
 **Checking and reporting.** The first byte that differs after the round
 trip, if any, is found with `(0..text.len()).position(..)` and returned
-as `HuffError::Mismatch`; `run` returns `Result<(), HuffError>`, and
-`main` prints an error as `Error: Mismatch(...)` on stderr and exits
-with status 1. The total bit count is
+as `HuffError::Mismatch`; `main` returns `Result<(), HuffError>`, so an
+error prints `Error: Mismatch(...)` and exits with status 1. The total bit count is
 a `zip` of the lengths and counts folded into a sum; the entropy calls
 C's `log2` through `import "math.h"`.
 
@@ -221,7 +220,7 @@ fix (in C too, where the compiler has more freedom to promote it).
 |---|---|---|
 | `#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]` to order heap entries and sort | `Subtree`, `ByLength`, `HuffError` | `volec guide formatting` |
 | generic `MinHeap<T: Ord + Copy>`, `?` on an `Option` | `MinHeap` | `volec guide generics`, `guide conversions` |
-| `Result`, `?`, `match` on the result in `main` | `Codebook::new`, `round_trip`, `run`, `main` | `volec guide conversions` |
+| `Result`, `?`, `main -> Result<(), E>` | `Codebook::new`, `round_trip`, `main` | `volec guide conversions` |
 | tuples in a `Vec`, destructured in `while let` and `let` | `code_lengths` | `volec guide syntax` |
 | widening: `u8` into `u64`, `u32` into `i64` | `decode`, `encode` | `volec guide conversions` |
 | iterators: `zip`, `fold`, `filter`, `count`, `position`, `Option::map` | `round_trip`, `entropy` | `volec guide iterators` |
