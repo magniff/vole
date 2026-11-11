@@ -19,10 +19,10 @@ crate::at	panic
 crate::part	panic
 crate::whole	none
 std::window::script::whole	io panic diverge
-crate::color	panic diverge
+crate::color	panic
 std::gpu::PassDesc::color	none
 crate::sum	none
-crate::same	panic diverge
+crate::same	panic
 crate::spin	diverge
 crate::forever	diverge
 crate::fact	diverge
@@ -50,14 +50,12 @@ crate::t0	none
 $ effects Bump::allocate Bump::deallocate fill_one in_scope apply double shout hof allocators
 <crate::Bump as Allocator>::allocate	unsafe
 <crate::Bump as Allocator>::deallocate	unsafe
-fill_one<Gpa>	alloc(Gpa) panic diverge
-fill_one<Bump>	alloc(Bump) panic diverge
-fill_one<A>	alloc io tls thread sync panic diverge (unknown)
+fill_one<Gpa>	alloc(Gpa) panic
+fill_one<Bump>	alloc(Bump) panic
 crate::in_scope	alloc(Gpa) diverge
 crate::apply	io
 crate::double	none
 crate::shout	io
 hof<closure(i64) -> i64 at effects016/main.vl:134:9>	none
 hof<closure(i64) -> i64 at effects016/main.vl:134:29>	io
-hof<F>	io
-crate::allocators	alloc(Gpa, Bump) io panic diverge
+crate::allocators	alloc(Gpa, Bump) io panic
