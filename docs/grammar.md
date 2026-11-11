@@ -487,9 +487,8 @@ valid for its length while it is used. The same holds for memory a
 slice views: a slice of an array is valid while the array lives, and one
 from `Vec::as_slice` until the vector grows or is freed. Until 0.17,
 using a view after its storage was gone was the one way safe code could
-still reach undefined behaviour; from 0.17 the own pass rejects it under
-`--values=error`, the default (its opt-outs `warn`, `report` and `off`
-do not; std's types also assume their fields are changed by their
+still reach undefined behaviour; the borrow checker rejects it (std's
+types also assume their fields are changed by their
 methods only: from 0.26 their fields are private to std). A view need not have a name: a slice argument (or a
 receiver taken by value) is a copy made before the later arguments run
 (`take(v.as_slice(), grow(&v))`); the base of an index that is not a
@@ -1461,7 +1460,6 @@ fstring     = 'f"' { text | "{{" | "}}" | "{" expr [ ":" spec ] "}" } '"'
 spec        = [ "<" | ">" ] [ "0" ] [ digits ] [ "." digits ] [ "?" | "x" | "X" | "b" | "c" ]
 args        = [ arg { "," arg } [ "," ] ]
 arg         = expr | ident ":" expr                      (* named: after every positional one *)
-param      += ... [ "=" expr ]                           (* fn items and inherent methods only *)
 field_init  = ident ":" expr | ident                     (* `ident` alone: shorthand *)
 attr       += "#[" "derive" "(" path { "," path } [ "," ] ")" "]"   (* before struct, enum *)
 trait       = "trait" ident [ "<" tparam { "," tparam } ">" ] "{" { trait_item } "}"
@@ -1603,21 +1601,22 @@ The holes are evaluated where the f-string is, once each, left to right;
 the value holds copies of them. An f-string is written as a format
 literal (at a format position) or as `format_args(..)` (anywhere else).
 
-### Named arguments, defaults, shorthand
+### Named arguments, shorthand
 
-A trailing run of a function's parameters may have defaults, `b: i64 =
-2`, on `fn` items and inherent methods; not on trait functions (nor the
-functions of trait impls), extern functions, closures or `fn` types. A
-default may not name a parameter or a local; it is checked against the
-parameter's type once, and evaluated at each call that leaves it out, in
-the callee's module (a fresh `Vec::new()` each time).
+A parameter has no default value (0.28.0; 0.15 to 0.27 had them on a
+trailing run of parameters): `fn f(a: i64, b: i64 = 2)` is `error
+syntax.default-arg` at its `=`, with the fix that removes the value, and
+every call passes every argument. A function that is called two ways is
+two functions (std::gpu's `write_texture` and `write_texture_region`).
+The one exception is not in the language: std's `assert`, `assert_eq`,
+`assert_ne`, `debug_assert`, `unreachable`, `todo` and `unimplemented`
+may leave their message out, as Rust's macros do; the checker fills it.
 
 At a call, the positional arguments come first, then `name: value`
 arguments, in the order of the parameters (so arguments are evaluated
 in the written order). Each parameter is given once; `self` cannot be
 named; calls of trait functions take positional arguments only. A
-function used as a value has its whole signature (its defaults do not
-come with it). `f(label: loop { .. })` is a named argument: an argument
+function used as a value has its whole signature. `f(label: loop { .. })` is a named argument: an argument
 cannot be a labelled loop (parenthesize it).
 
 In a struct literal, a field written alone, `P { x, y: 0 }`, is `x: x`.
@@ -1781,12 +1780,9 @@ attributes `#[views(a, *b)]` and `#[stores(c)]` declare a view summary.
 an owned type (a `Vec`, `Buf`, `HashMap`, a type with `Drop`, a struct
 holding one) moves on `=`, a by-value argument and `return`, and is
 dropped at the end of its scope; views (slices, references) cannot
-outlive or alias against what they view. These checks and the drops are
-on by default: `--values=error` (the default since T7, which moved the
-tests, examples and evals over with `volec fix --values`).
-`--values=warn` and `--values=report` keep 0.16's semantics (no drops)
-and only warn or list; `--values=off` turns the pass off. They are
-opt-outs for 0.17 only. `v.free()` stays legal (`free` frees now and
+outlive or alias against what they view. These checks (the borrow
+checker's) and the drops are always on (0.28.0: `--values` and its
+opt-outs are gone with the own pass). `v.free()` stays legal (`free` frees now and
 leaves the container empty) and is no longer needed.
 
 **The prelude** gains `Buf`, `HashMap`, `read_line`, `read_stdin_in`,
@@ -2145,7 +2141,7 @@ match_expr += "match" "&" expr "{" arms "}" ;           (* binds inout accesses 
   argument, `conv.place` on a temporary). A `sink` parameter owns its
   value and is mutable; an owned argument moves into it. Receivers are
   `self`, `inout self` and `sink self` and are lent without `&`.
-  Defaults are allowed on let and sink parameters. In `extern "C"`
+  In `extern "C"`
   signatures `inout` and `sink` are `conv.extern`.
 - **Accesses are used as their values.** A let or inout parameter, an
   `inout x = &place;` local, a `let x = part;` that borrows, and an

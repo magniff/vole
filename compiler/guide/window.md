@@ -52,7 +52,7 @@ fn main(gpa: Gpa) -> i32 {
   and `.y`, `Scroll`'s precise deltas. On a Retina display (`scale`
   2.0) `WindowDesc::new("demo", 800, 600)` gives `win.size()` 1600 x
   1200. Configure the surface with that size (`surf.configure(&dev,
-  s.w, s.h, ..)`, again at each `Resize`), so `surf.width` and
+  s.w, s.h, format, vsync)`, again at each `Resize`), so `surf.width` and
   `surf.height` are the drawable's pixels too; a snapshot of the window
   (a copy of its frame, a canvas, a PPM) is `surf.width` x
   `surf.height`, never the WindowDesc's numbers (those give its top-left
@@ -107,16 +107,17 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
         Err(_) => return Ok(()),
     };
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, _queue) = inst.adapter()?.device()?;
+    let (dev, _queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
     let mut surf = inst.surface(&dev, RawSurface::MetalLayer(win.raw_surface()))?;
     let px = win.size(); // the size now: stale after a Resize
-    surf.configure(&dev, px.w, px.h);
+    surf.configure(&dev, px.w, px.h, gpu::Format::Bgra8Unorm, true);
     let mut scale = px.scale; // the window's; a Surface has no scale
     let mut down = false;
     loop {
         match app.wait() {
             Ok(Event::Resize(_, s)) => {
-                surf.configure(&dev, s.w, s.h); // surf.width, .height follow
+                surf.configure(&dev, s.w, s.h, gpu::Format::Bgra8Unorm,
+                    true); // surf.width, .height follow
                 scale = s.scale;
             }
             Ok(Event::Mouse(m)) => {
@@ -181,14 +182,14 @@ fn frame(dev: &gpu::Device<Gpa>, queue: &mut gpu::Queue, pipe: &gpu::ComputePipe
     enc.compute_pass(|pass| {
         pass.set_pipeline(pipe);
         pass.set_bind_group(0, group);
-        pass.dispatch(1024);
+        pass.dispatch(1024, 1, 1);
     });
     queue.submit(enc.finish());
 }
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, mut queue) = inst.adapter()?.device()?;
+    let (dev, mut queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
     let pipe = dev.compute_pipeline(dev.shader_wgsl(STEP.src)?, STEP.main)?;
     let xs = dev.buffer(1024 * 64 * 4, BufferUsage::STORAGE);
     let group = dev.bind_group(pipe.bind_layout(0), &[gpu::bind(0, &xs)][..]);
@@ -232,14 +233,15 @@ use std::gpu::{BufferUsage, Color, Format, PassDesc, RawSurface, TextureView};
 // clear; in a program its scene passes, then the overlay.
 fn draw(dev: &gpu::Device<Gpa>, queue: &mut gpu::Queue, view: &TextureView) {
     let mut enc = dev.encoder();
-    enc.render_pass(PassDesc::color(view, clear: Color::rgba(1.0, 0.5, 0.0, 1.0)), |_| {});
+    enc.render_pass(PassDesc::color(view, clear: Color::rgba(1.0, 0.5, 0.0, 1.0),
+        load: gpu::Load::Clear), |_| {});
     queue.submit(enc.finish());
 }
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let (w, h) = (64, 32);
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, mut queue) = inst.adapter()?.device()?;
+    let (dev, mut queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
     let mut surf = inst.surface(&dev, RawSurface::Headless)?; // frames, no window
     surf.configure(&dev, w, h, format: Format::Bgra8Unorm, vsync: false);
     let frame = surf.frame()?;
@@ -297,18 +299,20 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
         Err(_) => return Ok(()),
     };
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, mut queue) = inst.adapter()?.device()?;
+    let (dev, mut queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
     let mut surf = inst.surface(&dev, RawSurface::MetalLayer(win.raw_surface()))?;
     let mut red = false;
     win.request_frame();
     loop {
         match app.wait() {
-            Ok(Event::Resize(_, s)) => surf.configure(&dev, s.w, s.h),
+            Ok(Event::Resize(_, s)) => surf.configure(&dev, s.w, s.h, gpu::Format::Bgra8Unorm,
+                true),
             Ok(Event::Frame(_)) => {
                 let frame = surf.frame()?;
                 let c = if red { Color::rgba(1.0, 0.0, 0.0, 1.0) } else { Color::black() };
                 let mut enc = dev.encoder();
-                enc.render_pass(PassDesc::color(&frame.texture.view(), clear: c), |_| {});
+                enc.render_pass(PassDesc::color(&frame.texture.view(), clear: c,
+                    load: gpu::Load::Clear), |_| {});
                 queue.submit(enc.finish());
                 frame.present(&mut queue);
                 win.request_frame();

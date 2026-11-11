@@ -10,8 +10,7 @@
 # tests/voltty/run.sh (the terminal's core against its oracle, 0.23),
 # tests/walkthrough/run.sh (the sessions of examples/tools/*/README.md,
 # 0.15, and of every examples/GROUP/NAME/README.md with one, 0.16) and
-# tests/own-try/run.sh (the own pass's try: lines run, 0.17) and
-# tests/borrowck-try/run.sh (the borrow checker's, 0.27.1) and
+# tests/borrowck-try/run.sh (the borrow checker's try: lines run, 0.27.1) and
 # tests/lsp/run.sh (`volec lsp`'s sessions, 0.24) and tests/book/run.sh
 # (the book's examples and sessions, 0.25) and tests/link/run.sh
 # (the link without cc, 0.25) and tests/perf/run.sh (--time-passes=instructions
@@ -290,7 +289,7 @@ want() {
 # NAME)` is below (tests/runner/run.sh checks the two agree): what -l
 # lists. LEVELED: the ones that take -O (the others are the same at
 # every level).
-SUITES="query refactor guide book fmt walkthrough wgsl voltty own-try borrowck-try std-own std-moves runner embed-checks stdpos cachediff lsp link gpu hooks arch-gen arch-enc voltty_render window example_layout example_build readme_sync perf"
+SUITES="query refactor guide book fmt walkthrough wgsl voltty borrowck-try runner embed-checks stdpos cachediff lsp link gpu hooks arch-gen arch-enc voltty_render window example_layout example_build readme_sync perf"
 LEVELED="gpu arch-gen"
 if [ "$LIST" = 1 ]; then
     all_cases | select_names | awk '{ print "case " $1 }'
@@ -1007,21 +1006,9 @@ esac
 case $(want voltty) in
     y) "$ROOT/tests/voltty/run.sh" -c "$COMPILER" -n 20 >"$WORK/voltty.out" 2>&1 & ;;
 esac
-case $(want own-try) in
-    y) "$ROOT/tests/own-try/run.sh" -c "$COMPILER" >"$WORK/own-try.out" 2>&1 & ;;
-esac
 # (0.27.1) the borrow checker's try: lines (tests/borrowck-try/run.sh)
 case $(want borrowck-try) in
     y) sh "$ROOT/tests/borrowck-try/run.sh" -c "$COMPILER" >"$WORK/borrowck-try.out" 2>&1 & ;;
-esac
-# (0.22) std through the own pass (tests/std/own.sh): category "std-own".
-case $(want std-own) in
-    y) sh "$ROOT/tests/std/own.sh" -c "$COMPILER" >"$WORK/std-own.out" 2>&1 & ;;
-esac
-# (0.25.2) std's moves checked as a program's (tests/std/moves.sh):
-# category "std-moves".
-case $(want std-moves) in
-    y) sh "$ROOT/tests/std/moves.sh" -c "$COMPILER" >"$WORK/std-moves.out" 2>&1 & ;;
 esac
 # (0.25.3) Text blocks in a CRLF file and the caches seeing an embedded
 # file change (tests/embed/run.sh): category "embed-checks".
@@ -1553,27 +1540,9 @@ case $(want walkthrough) in
         ;;
 esac
 
-# The try: lines of the own pass's diagnostics (0.17): tests/own-try/run.sh
-# (run above), each tests/own-try/NAME/ checked under --values=error and
-# each try: of its first error run; category "own-try".
-case $(want own-try) in
-    y)
-        while read -r status _; do
-            case "$status" in
-                pass) echo "own-try pass" >>"$TALLY"; count=$((count + 1)) ;;
-                xfail) echo "own-try xfail" >>"$TALLY"; count=$((count + 1)) ;;
-                FAIL) echo "own-try fail" >>"$TALLY"; count=$((count + 1)) ;;
-            esac
-        done <"$WORK/own-try.out"
-        if ! grep -q '^pass\|^xfail' "$WORK/own-try.out"; then
-            echo "own-try fail" >>"$TALLY"
-            count=$((count + 1))
-        fi
-        grep '^FAIL' "$WORK/own-try.out" >>"$FAILURES"
-        ;;
-esac
-# The borrow checker's try: lines (0.27.1, run above): tests/borrowck-try/,
-# the same runner; category "borrowck-try".
+# The borrow checker's try: lines (0.27.1, run above): each
+# tests/borrowck-try/NAME/ checked and each try: of its first error run;
+# category "borrowck-try".
 case $(want borrowck-try) in
     y)
         while read -r status _; do
@@ -1588,32 +1557,6 @@ case $(want borrowck-try) in
             count=$((count + 1))
         fi
         grep '^FAIL' "$WORK/borrowck-try.out" >>"$FAILURES"
-        ;;
-esac
-# std's own functions through the own pass (0.22, run above): one case,
-# "std-own"; its findings must be in tests/std/own.allowed.
-case $(want std-own) in
-    y)
-        if grep -q '^pass std-own' "$WORK/std-own.out"; then
-            echo "std-own pass" >>"$TALLY"
-        else
-            echo "std-own fail" >>"$TALLY"
-            { echo "FAIL std-own:"; sed 's/^/    /' "$WORK/std-own.out"; } >>"$FAILURES"
-        fi
-        count=$((count + 1))
-        ;;
-esac
-# std's moves outside its containers (0.25.2, run above): one case,
-# "std-moves".
-case $(want std-moves) in
-    y)
-        if grep -q '^pass std-moves' "$WORK/std-moves.out"; then
-            echo "std-moves pass" >>"$TALLY"
-        else
-            echo "std-moves fail" >>"$TALLY"
-            { echo "FAIL std-moves:"; sed 's/^/    /' "$WORK/std-moves.out"; } >>"$FAILURES"
-        fi
-        count=$((count + 1))
         ;;
 esac
 

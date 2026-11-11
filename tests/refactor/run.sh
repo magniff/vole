@@ -363,7 +363,4 @@ while IFS= read -r code; do
 done <"$WORK/codes"
 check self_explain "$([ "$(wc -l <"$WORK/codes")" -ge 90 ] && [ -z "$missing$extra$bad" ] && echo 1)" \
     "$(wc -l <"$WORK/codes") codes; no entry:$(echo $missing); not a code:$(echo $extra); bad:$bad"
-# (0.17-0.27: own_report_compiler, the own pass's walk of compiler/src
-# under --values=report. 0.28.0: compiler/src is in the rust edition,
-# which the own pass does not walk; the borrow checker checks it.)
 exit $STATUS

@@ -42,7 +42,7 @@ use hal::metal as backend;
 pub use hal::{Caps, RawSurface};
 pub use shader::{
     Binding, BindingType, EntryPoint, GroupBinding, Reflection, ShaderKind, ShaderSource,
-    VertexInput,
+    StageSlots, VertexInput,
 };
 pub use timing::{MAX_QUERIES, QuerySet};
 use types::{MAX_BIND_GROUPS, MAX_COLOR_TARGETS, MAX_VERTEX_BUFFERS};
@@ -134,7 +134,7 @@ impl Instance<Gpa> {
     }
 
     /// An adapter: the low-power one when asked and there is one.
-    pub fn adapter(self, power: Power = Power::High) -> Result<Adapter<Gpa>, Error<Gpa>> {
+    pub fn adapter(self, power: Power) -> Result<Adapter<Gpa>, Error<Gpa>> {
         if power == Power::Low {
             let found = arena_scope(&self.gpa, |a| {
                 let mut raw = Vec::new_in(a);
@@ -206,7 +206,7 @@ impl Adapter<Gpa> {
     /// every adapter takes, a buffer at most 1 GiB; wgpu's model). More, up
     /// to adapter.limits(): `var lim = Limits::default(); lim.max_buffer_size
     /// = 4 << 30; adapter.device(lim)`.
-    pub fn device(&self, limits: Limits = Limits::default()) -> Result<(Device<Gpa>, Queue),
+    pub fn device(&self, limits: Limits) -> Result<(Device<Gpa>, Queue),
         Error<Gpa>>
         requires limits.max_buffer_size <= self.max_buffer_size
         else "gpu.limits: device(lim) asks for buffers of up to {} bytes (lim.max_buffer_size) and this adapter makes them up to {} (adapter.limits().max_buffer_size)", limits.max_buffer_size, self.max_buffer_size
@@ -415,10 +415,33 @@ impl Device<Gpa> {
         }
     }
 
-    /// A 2D texture (a 2D array when layers > 1).
-    pub fn texture(&self, width: i64, height: i64, format: Format,
-        usage: u32 = TextureUsage::TEXTURE_BINDING | TextureUsage::COPY_DST, layers: i64 = 1,
-        mips: i64 = 1) -> Texture
+    /// A 2D texture: one layer, one mip level.
+    pub fn texture(&self, width: i64, height: i64, format: Format, usage: u32) -> Texture
+        requires self.caps.textures
+        else "gpu.unsupported: this device has no textures (dev.caps().textures)"
+        requires width >= 1 && height >= 1 && width <= self.limits.max_texture_dimension_2d
+        && height <= self.limits.max_texture_dimension_2d
+        else "gpu.limits: a texture of {width} x {height}; its sides are 1 to {} (dev.limits().max_texture_dimension_2d)", self.limits.max_texture_dimension_2d
+        requires usage != 0 else "gpu.usage: a texture needs a usage"
+        requires usage & TextureUsage::STORAGE_BINDING == 0 || format.is_storable()
+        else "gpu.format: STORAGE_BINDING needs a storable format"
+        requires usage & TextureUsage::RENDER_ATTACHMENT == 0 || self.caps.render
+        else "gpu.unsupported: RENDER_ATTACHMENT on a device without render"
+        {
+        let desc = TextureDesc {
+            width: width, height: height, layers: 1, mips: 1, format: format, usage: usage,
+        };
+        match N::create_texture(&self.raw, desc) {
+            Some(t) => Texture { raw: t, desc: desc },
+            None => out_of_memory("texture"),
+        }
+    }
+
+    /// A 2D texture of `layers` layers (a 2D array when layers > 1) and
+    /// `mips` mip levels.
+    pub fn texture_array(&self, width: i64, height: i64, format: Format,
+        usage: u32, layers: i64,
+        mips: i64) -> Texture
         requires self.caps.textures
         else "gpu.unsupported: this device has no textures (dev.caps().textures)"
         requires width >= 1 && height >= 1 && width <= self.limits.max_texture_dimension_2d
@@ -839,10 +862,26 @@ impl Queue {
         N::write_buffer(&mut self.raw, &buf.raw, offset, bytes);
     }
 
+    /// Writes the whole of tex (its first layer): rows of texels,
+    /// bytes_per_row bytes each.
+    pub fn write_texture(&mut self, tex: &Texture, bytes: &[u8], bytes_per_row: i64)
+        requires tex.desc.usage & TextureUsage::COPY_DST != 0
+        else "gpu.usage: write_texture needs COPY_DST"
+        {
+        let ww = tex.desc.width;
+        let hh = tex.desc.height;
+        assert(bytes_per_row >= ww * tex.desc.format.size(),
+            "gpu.range: bytes_per_row is shorter than a row");
+        assert(bytes.len() as i64 >= bytes_per_row * (hh - 1) + ww * tex.desc.format.size(),
+            "gpu.range: fewer bytes than the region");
+        N::write_texture(&mut self.raw, &tex.raw, 0, 0, 0, ww, hh, bytes, bytes_per_row);
+    }
+
     /// Writes rows of texels into layer `layer` of tex at (x, y): h rows of
-    /// bytes_per_row bytes each, w texels used of each row.
-    pub fn write_texture(&mut self, tex: &Texture, bytes: &[u8], bytes_per_row: i64,
-        x: i64 = 0, y: i64 = 0, w: i64 = -1, h: i64 = -1, layer: i64 = 0)
+    /// bytes_per_row bytes each, w texels used of each row (w or h below
+    /// 0: up to the texture's edge).
+    pub fn write_texture_region(&mut self, tex: &Texture, bytes: &[u8], bytes_per_row: i64,
+        x: i64, y: i64, w: i64, h: i64, layer: i64)
         requires tex.desc.usage & TextureUsage::COPY_DST != 0
         else "gpu.usage: write_texture needs COPY_DST"
         requires layer >= 0 && layer < tex.desc.layers else "gpu.range: no such layer"
@@ -1399,8 +1438,8 @@ impl<'a> RenderDesc<'a, Gpa> {
     /// A depth-only pipeline (a shadow map): the vertex entry `vs`, no
     /// fragment stage, no color target, a depth test of `format` that
     /// writes. It draws in a `PassDesc::depth_only` pass.
-    pub fn depth_only(shader: &'a Shader<Gpa>, vs: &'a str, format: Format = Format::Depth32Float,
-        compare: Compare = Compare::Less) -> RenderDesc<'a, Gpa> {
+    pub fn depth_only(shader: &'a Shader<Gpa>, vs: &'a str, format: Format,
+        compare: Compare) -> RenderDesc<'a, Gpa> {
         let mut d = RenderDesc {
             vertex: shader, vs: vs, fragment: shader, fs: "", has_fs: false,
             state: PipelineState::new(Format::Rgba8Unorm),
@@ -1427,7 +1466,7 @@ impl<'a> RenderDesc<'a, Gpa> {
     }
 
     /// Blending for target i (0: the first).
-    pub fn blend(&mut self, blend: Blend, target: i64 = 0)
+    pub fn blend(&mut self, blend: Blend, target: i64)
         requires target >= 0 && target < self.state.target_count
         else "gpu.range: no such color target"
         {
@@ -1445,8 +1484,8 @@ impl<'a> RenderDesc<'a, Gpa> {
         self.state.target_count += 1;
     }
 
-    pub fn depth(&mut self, format: Format = Format::Depth32Float,
-        compare: Compare = Compare::Less, write: bool = true) {
+    pub fn depth(&mut self, format: Format,
+        compare: Compare, write: bool) {
         self.state.depth = Some(DepthState { format: format, write: write, compare: compare });
     }
 
@@ -1454,7 +1493,7 @@ impl<'a> RenderDesc<'a, Gpa> {
         self.state.topology = t;
     }
 
-    pub fn cull(&mut self, c: Cull, front: FrontFace = FrontFace::Ccw) {
+    pub fn cull(&mut self, c: Cull, front: FrontFace) {
         self.state.cull = c;
         self.state.front_face = front;
     }
@@ -1569,7 +1608,7 @@ impl ComputePass {
     }
 
     /// x * y * z workgroups of the pipeline's workgroup size.
-    pub fn dispatch(&mut self, x: i64, y: i64 = 1, z: i64 = 1)
+    pub fn dispatch(&mut self, x: i64, y: i64, z: i64)
         requires x >= 0 && y >= 0 && z >= 0
         else "gpu.range: dispatch({x}, {y}, {z}): a count of workgroups is 0 or more"
         requires x <= self.max_groups && y <= self.max_groups && z <= self.max_groups
@@ -1621,7 +1660,7 @@ fn largest(x: i64, y: i64, z: i64) -> i64 {
 impl<'a> PassDesc<'a> {
     /// One color attachment, cleared to `clear` (or kept: load =
     /// Load::Keep) and stored; `.with_color` adds more.
-    pub fn color(view: &'a TextureView, clear: Color = Color::black(), load: Load = Load::Clear) -> PassDesc<'a> {
+    pub fn color(view: &'a TextureView, clear: Color, load: Load) -> PassDesc<'a> {
         let mut colors: [Option<ColorAttachment<'_>>; 8] = [None; 8];
         colors[0] = Some(ColorAttachment { view: view, load: load, clear: clear, store: true });
         PassDesc { colors: colors, color_count: 1, depth: None }
@@ -1630,7 +1669,7 @@ impl<'a> PassDesc<'a> {
     /// No color attachment, only depth: a shadow map's pass, drawn with a
     /// `RenderDesc::depth_only` pipeline. Stored by default, to be read
     /// afterwards.
-    pub fn depth_only(view: &'a TextureView, clear: f64 = 1.0, store: bool = true) -> PassDesc<'a> {
+    pub fn depth_only(view: &'a TextureView, clear: f64, store: bool) -> PassDesc<'a> {
         PassDesc {
             colors: [None; 8], color_count: 0,
             depth: Some(DepthAttachment {
@@ -1644,8 +1683,8 @@ impl<'a> PassDesc<'a> {
     /// the fragment shader's `@location(i)` writes the i-th, and the
     /// pipeline has a target of the same format for each
     /// (`RenderDesc::target`).
-    pub fn with_color(self, view: &'a TextureView, clear: Color = Color::black(),
-        load: Load = Load::Clear) -> PassDesc<'a>
+    pub fn with_color(self, view: &'a TextureView, clear: Color,
+        load: Load) -> PassDesc<'a>
         requires self.color_count < MAX_COLOR_TARGETS
         else "gpu.limits: a pass has at most 8 color attachments; this one has {}", self.color_count
         {
@@ -1657,7 +1696,7 @@ impl<'a> PassDesc<'a> {
         d
     }
 
-    pub fn with_depth(self, view: &'a TextureView, clear: f64 = 1.0, store: bool = false) -> PassDesc<'a> {
+    pub fn with_depth(self, view: &'a TextureView, clear: f64, store: bool) -> PassDesc<'a> {
         let mut d = self;
         d.depth = Some(DepthAttachment {
             view: view, load: Load::Clear, clear: clear, store: store,
@@ -1818,7 +1857,7 @@ impl RenderPass {
         }
     }
 
-    pub fn set_vertex_buffer(&mut self, slot: i64, buf: &Buffer, offset: i64 = 0)
+    pub fn set_vertex_buffer(&mut self, slot: i64, buf: &Buffer, offset: i64)
         requires slot >= 0 && slot < MAX_VERTEX_BUFFERS else "gpu.limits: vertex buffer slots 0..7"
         requires buf.usage & BufferUsage::VERTEX != 0
         else "gpu.usage: set_vertex_buffer needs VERTEX"
@@ -1831,7 +1870,7 @@ impl RenderPass {
     }
 
     pub fn set_index_buffer(&mut self, buf: &Buffer, format: IndexFormat,
-        offset: i64 = 0)
+        offset: i64)
         requires buf.usage & BufferUsage::INDEX != 0 else "gpu.usage: set_index_buffer needs INDEX"
         requires offset % format.size() == 0
         else "gpu.align: an index buffer's offset is a multiple of the index size"
@@ -1842,8 +1881,8 @@ impl RenderPass {
         N::render_set_index_buffer(&mut self.raw, &buf.raw, format, offset);
     }
 
-    pub fn set_viewport(&mut self, x: f32, y: f32, w: f32, h: f32, min_depth: f32 = 0.0,
-        max_depth: f32 = 1.0)
+    pub fn set_viewport(&mut self, x: f32, y: f32, w: f32, h: f32, min_depth: f32,
+        max_depth: f32)
         requires w > 0.0 && h > 0.0 && min_depth >= 0.0 && max_depth <= 1.0
         && min_depth <= max_depth else "gpu.range: the viewport"
         {
@@ -2017,11 +2056,36 @@ impl Encoder<Gpa> {
         N::copy_buffer(&mut self.raw, &src.raw, src_offset, &dst.raw, dst_offset, size);
     }
 
-    /// Copies a region of layer `layer` of tex (the whole of it by default)
-    /// into buf at offset, rows bytes_per_row apart (a multiple of 256).
-    pub fn copy_texture_to_buffer(&mut self, tex: &Texture, buf: &Buffer,
-        bytes_per_row: i64, offset: i64 = 0, x: i64 = 0, y: i64 = 0, w: i64 = -1, h: i64 = -1,
-        layer: i64 = 0)
+    /// Copies the whole of tex (its first layer) into buf from its start,
+    /// rows bytes_per_row apart (a multiple of 256).
+    pub fn copy_texture_to_buffer(&mut self, tex: &Texture, buf: &Buffer, bytes_per_row: i64)
+        requires tex.desc.usage & TextureUsage::COPY_SRC != 0
+        else "gpu.usage: copy_texture_to_buffer's texture was made without TextureUsage::COPY_SRC: add it in dev.texture(.., usage: ..)"
+        requires buf.usage & BufferUsage::COPY_DST != 0
+        else "gpu.usage: copy_texture_to_buffer's buffer ({} bytes) was made without BufferUsage::COPY_DST: add it where that buffer is made", buf.size
+        requires bytes_per_row % 256 == 0
+        else "gpu.align: bytes_per_row is a multiple of 256"
+        requires !buf.mapped
+        else "gpu.state: copy_texture_to_buffer's buffer ({} bytes) is mapped (map_read): the copy would change its view. Unmap it (buf.unmap(dev)) when its view is done", buf.size
+        {
+        let ww = tex.desc.width;
+        let hh = tex.desc.height;
+        assert(bytes_per_row >= ww * tex.desc.format.size(),
+            "gpu.range: bytes_per_row is shorter than a row");
+        assert(bytes_per_row * (hh - 1) + ww * tex.desc.format.size() <= buf.size,
+            "gpu.range: the copy reaches past the buffer");
+        self.uses(buf);
+        if buf.usage & BufferUsage::UNIFORM != 0 { self.unwritten.wrote(buffer_id(buf)); }
+        N::copy_texture_to_buffer(&mut self.raw, &tex.raw, 0, 0, 0, ww, hh, &buf.raw, 0,
+            bytes_per_row);
+    }
+
+    /// Copies a region of layer `layer` of tex (w or h below 0: up to the
+    /// texture's edge) into buf at offset, rows bytes_per_row apart (a
+    /// multiple of 256).
+    pub fn copy_texture_to_buffer_region(&mut self, tex: &Texture, buf: &Buffer,
+        bytes_per_row: i64, offset: i64, x: i64, y: i64, w: i64, h: i64,
+        layer: i64)
         requires tex.desc.usage & TextureUsage::COPY_SRC != 0
         else "gpu.usage: copy_texture_to_buffer's texture was made without TextureUsage::COPY_SRC: add it in dev.texture(.., usage: ..)"
         requires buf.usage & BufferUsage::COPY_DST != 0
@@ -2050,8 +2114,8 @@ impl Encoder<Gpa> {
     /// Copies rows of buf (bytes_per_row apart, a multiple of 256) into a
     /// region of layer `layer` of tex.
     pub fn copy_buffer_to_texture(&mut self, buf: &Buffer, tex: &Texture,
-        bytes_per_row: i64, offset: i64 = 0, x: i64 = 0, y: i64 = 0, w: i64 = -1, h: i64 = -1,
-        layer: i64 = 0)
+        bytes_per_row: i64, offset: i64, x: i64, y: i64, w: i64, h: i64,
+        layer: i64)
         requires buf.usage & BufferUsage::COPY_SRC != 0
         else "gpu.usage: copy_buffer_to_texture's buffer ({} bytes) was made without BufferUsage::COPY_SRC: add it where that buffer is made", buf.size
         requires tex.desc.usage & TextureUsage::COPY_DST != 0
@@ -2122,7 +2186,7 @@ pub struct Frame<A: Allocator> {
 impl Surface<Gpa> {
     /// Sizes the surface's frames; vsync: presented at the display's rate.
     pub fn configure(&mut self, dev: &Device<Gpa>, width: i64, height: i64,
-        format: Format = Format::Bgra8Unorm, vsync: bool = true)
+        format: Format, vsync: bool)
         requires width >= 1 && height >= 1 && width <= dev.limits.max_texture_dimension_2d
         && height <= dev.limits.max_texture_dimension_2d else "gpu.limits: a surface's size"
         requires format == Format::Bgra8Unorm || format == Format::Bgra8UnormSrgb
