@@ -71,8 +71,8 @@ $ cat > old.vl <<'EOF'
 > }
 > EOF
 $ volec check old.vl
-old.vl:10:10: error[borrowck.use_moved] 'counts' is used here after it moved (moved at old.vl:9:17) | help: use it before the move, pass a clone where it moves, or take it by reference | try: volec edit patch old.vl:9 --old 'let shelf = Shelf { name: "fruit", counts };' --new 'let shelf = Shelf { name: "fruit", counts }.clone();'
-old.vl:18:10: error[borrowck.use_moved] 'shelf' is used here after it moved (moved at old.vl:17:10) | help: use it before the move, pass a clone where it moves, or take it by reference | try: volec edit patch old.vl:17 --old 'drop(shelf);' --new 'drop(shelf.clone());'
+old.vl:10:10: error[borrowck.use_moved] 'counts' is used here after it moved (moved at old.vl:9:17) | help: use it before the move, pass a clone where it moves, or take it by reference
+old.vl:18:10: error[borrowck.use_moved] 'shelf' is used here after it moved (moved at old.vl:17:10) | help: use it before the move, pass a clone where it moves, or take it by reference
 old.vl:25:5: error[borrowck.conflict] cannot borrow 'v' as mutable because it is also borrowed as immutable (borrowed at old.vl:24:18) | help: use the shared borrow before the mutable one, or take it again after
 old.vl:31:21: error[borrowck.outlives] lifetime may not live long enough: the lifetime of the closure's parameter 'a' is only the call's, but it flows where a lifetime of the closure's signature, from outside it is required, which lasts longer | help: keep a copy of the value instead of the reference (`*p`, `.clone()`); a closure's result borrows from its parameter only when the bound it is passed for says so (`Fn(&T) -> &T`)
 [exit 1]
