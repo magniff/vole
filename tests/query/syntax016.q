@@ -24,13 +24,10 @@ $ refs Pair
 30:8	def	struct Pair<T, U = i64> { a: T, b: U }
 45:12	type	main	let p: Pair<i64> = Pair { a: s.area(), b: unsafe { labs(-2) } };
 45:24	init	main	let p: Pair<i64> = Pair { a: s.area(), b: unsafe { labs(-2) } };
-## effects: carries alloc(Gpa, ArenaScope<Gpa>) from every fmt::Write impl
-## instance in std (gap: dyn Write's join is over all instances, gated modules
-## included); to be re-recorded when the join is limited to reachable instances.
 $ effects apply grow_by_one main
 apply<closure(i64) -> i64 at syntax016/main.vl:48:32>	none
 apply<F>	none
 crate::grow_by_one	alloc(Gpa) panic diverge
-crate::main	alloc(Gpa, ArenaScope<Gpa>) io panic diverge unsafe
+crate::main	alloc(Gpa) io panic diverge unsafe
 $ def Vec::new_in
 std::vec::Vec::new_in	<std>:4854:12	method	pub fn new_in(a: A) -> Vec<T, A>

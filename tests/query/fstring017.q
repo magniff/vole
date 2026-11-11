@@ -18,10 +18,7 @@ $ refs println std::fmt::write format_in --in fstring017/main.vl
 12:5	call	main	->std::fmt::write	std::fmt::write(&mut b, "[{n}]").unwrap();
 13:17	call	main	->std::fmt::format_in	let mut t = format_in("{n}!", gpa);
 14:5	call	main	->std::fmt::println	println("{}", str::from_utf8(t.as_bytes()).unwrap());
-## effects: carries alloc(Gpa, ArenaScope<Gpa>) from every fmt::Write impl
-## instance in std (gap: dyn Write's join is over all instances, gated modules
-## included); to be re-recorded when the join is limited to reachable instances.
 $ effects main --why io
-crate::main	alloc(Gpa, ArenaScope<Gpa>) io panic diverge
+crate::main	alloc(Gpa) io panic diverge
   'println("n = {n}")' at fstring017/main.vl:9:5 calls 'std::fmt::println'
   (no source found)
