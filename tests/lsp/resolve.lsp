@@ -57,7 +57,7 @@
 < {"jsonrpc":"2.0","id":25,"result":{"contents":{"kind":"markdown","value":"```vole\npub fn println<T: Display>(x: T)\neffects: per instance (none checked)\nfeatures: none\n```\n\nx and a newline on stdout.\nlater: format_fns\n\n`std::fmt::println` (fn)\n"},"range":{"start":{"line":80,"character":4},"end":{"line":80,"character":11}}}}
 > {"jsonrpc":"2.0","id":26,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":73,"character":24}}}
 < {"jsonrpc":"2.0","id":26,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/vec.vl","range":{"start":{"line":395,"character":11},"end":{"line":395,"character":19}}}}
-## std::thread, std::cli through their paths and methods (std::gpu: when std2 has it)
+## std::thread, std::cli, std::gpu through their paths and methods
 > {"jsonrpc":"2.0","id":27,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":74,"character":24}}}
 < {"jsonrpc":"2.0","id":27,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/thread.vl","range":{"start":{"line":263,"character":7},"end":{"line":263,"character":12}}}}
 > {"jsonrpc":"2.0","id":28,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":74,"character":24}}}
@@ -72,6 +72,10 @@
 < {"jsonrpc":"2.0","id":32,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/cli.vl","range":{"start":{"line":380,"character":11},"end":{"line":380,"character":14}}}}
 > {"jsonrpc":"2.0","id":33,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":78,"character":49}}}
 < {"jsonrpc":"2.0","id":33,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/cli.vl","range":{"start":{"line":159,"character":11},"end":{"line":159,"character":15}}}}
+> {"jsonrpc":"2.0","id":34,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":79,"character":26}}}
+< {"jsonrpc":"2.0","id":34,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/gpu/mod.vl","range":{"start":{"line":111,"character":34},"end":{"line":111,"character":42}}}}
+> {"jsonrpc":"2.0","id":35,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":79,"character":36}}}
+< {"jsonrpc":"2.0","id":35,"result":{"contents":{"kind":"markdown","value":"```vole\npub fn new_in(gpa: Gpa) -> Instance<Gpa>\neffects: none (inferred)\nfeatures: none\n```\n\n`std::gpu::Instance::new_in` (method)\n"},"range":{"start":{"line":79,"character":36},"end":{"line":79,"character":42}}}}
 ## allocators: main's Gpa, arenas, a fixed buffer, the Allocator bound
 > {"jsonrpc":"2.0","id":36,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":63,"character":13}}}
 < {"jsonrpc":"2.0","id":36,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/alloc.vl","range":{"start":{"line":240,"character":11},"end":{"line":240,"character":14}}}}

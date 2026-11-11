@@ -181,6 +181,10 @@ def generators(paths):
         # MVS written into a program the compiler reads.
         if p == "tests/seed-compat.awk":
             continue
+        # bench/gpu/shader/run.sh writes a WGSL shader (large.wgsl): the
+        # `fn` and `var` in it are WGSL's.
+        if p == "bench/gpu/shader/run.sh":
+            continue
         text = read(p)
         if not GEN_FN.search(text):
             continue
