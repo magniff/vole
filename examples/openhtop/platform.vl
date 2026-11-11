@@ -1,21 +1,28 @@
+// EDITION: rust
 // The system beneath: C calls, commands, the terminal and its keys.
 
-use std::{SYS_TIOCGWINSZ, fs, parse_int};
+use std::fs;
 use std::process::Command as ProcCommand;
-use std::sys::{SYS_POLLIN, SysPollFd, sys_poll, sys_read, sys_write};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sys::{SYS_POLLIN, SYS_TIOCGWINSZ, SysPollFd, sys_poll, sys_read, sys_write};
 
 use crate::model::{Key, Snapshot, State, max};
+use crate::text::{parse_int, trim};
 
+// UNSAFE: libc's functions, which std does not wrap: the load average, the page size, the
+// terminal's size, and the loader's lookup of the Mach calls.
+// SAFETY: the declarations are the C prototypes (ioctl's third argument is variadic in C).
 extern "C" {
-    fn getloadavg(loadavg: *f64, nelem: i32) -> i32;
+    fn getloadavg(loadavg: *mut f64, nelem: i32) -> i32;
     fn getpagesize() -> i32;
     fn ioctl(fd: i32, request: u64, ...) -> i32;
-    fn dlopen(path: *u8, mode: i32) -> *u8;
-    fn dlsym(handle: *u8, name: *u8) -> *u8;
+    fn dlopen(path: *mut u8, mode: i32) -> *mut u8;
+    fn dlsym(handle: *mut u8, name: *mut u8) -> *mut u8;
 }
 
 // struct winsize, the same on Linux and macOS (the request differs; std
 // exports the right one for the target).
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct Winsize {
     rows: u16,
@@ -26,17 +33,20 @@ struct Winsize {
 
 // The page size in kB: the unit of /proc's resident and shared counts.
 pub fn page_size_kb() -> i64 {
-    max(unsafe { getpagesize() } as i64 / 1024, 1)
+    // UNSAFE: getpagesize is C's.
+    // SAFETY: it takes nothing and returns a number.
+    let bytes = unsafe { getpagesize() };
+    max(bytes as i64 / 1024, 1)
 }
 
 // The bytes of a command's output, or None when it could not run or exited
 // non-zero.
-pub fn run_command(prog: [u8], args: [[u8]], gpa: Gpa) -> Option<Vec<u8, Gpa>> {
-    var c = ProcCommand::new(prog);
-    for a in args {
+pub fn run_command(prog: &str, args: &[&str], gpa: Gpa) -> Option<Vec<u8, Gpa>> {
+    let mut c = ProcCommand::new_in(prog, gpa);
+    for &a in args {
         c.arg(a);
     }
-    match c.output_in(gpa) {
+    match c.output() {
         Ok(o) => if o.status.success() { Some(o.stdout.clone()) }
             else { None },
         Err(_) => None,
@@ -44,7 +54,7 @@ pub fn run_command(prog: [u8], args: [[u8]], gpa: Gpa) -> Option<Vec<u8, Gpa>> {
 }
 
 // A command whose output is one integer, or fallback.
-pub fn run_int_command(prog: [u8], args: [[u8]], fallback: i64, gpa: Gpa) -> i64 {
+pub fn run_int_command(prog: &str, args: &[&str], fallback: i64, gpa: Gpa) -> i64 {
     match run_command(prog, args, gpa) {
         Some(b) => parse_int(trim(b.as_slice())).unwrap_or(fallback),
         None => fallback,
@@ -52,13 +62,15 @@ pub fn run_int_command(prog: [u8], args: [[u8]], fallback: i64, gpa: Gpa) -> i64
 }
 
 pub fn linux_here() -> bool {
-    fs::exists("/proc/self/stat")
+    std::fs::exists("/proc/self/stat").unwrap_or(false)
 }
 
 // getloadavg(3): the 1, 5 and 15 minute load averages, on both systems.
-pub fn read_load_average(snap: inout Snapshot<Gpa>) {
-    var load: [f64; 3] = [0.0, 0.0, 0.0];
-    let r = unsafe { getloadavg(&load as *f64, 3) };
+pub fn read_load_average(snap: &mut Snapshot<Gpa>) {
+    let mut load: [f64; 3] = [0.0, 0.0, 0.0];
+    // UNSAFE: getloadavg is C's.
+    // SAFETY: it writes at most 3 f64s, and `load` has room for 3.
+    let r = unsafe { getloadavg(load.as_mut_ptr(), 3) };
     if r >= 0 {
         snap.load = load;
     }
@@ -78,56 +90,64 @@ const CPU_STATES: i64 = 4; // user, system, idle, nice
 // One address, read as whichever C function it names.
 #[repr(C)]
 union MachCall {
-    address: *u8,
+    address: *mut u8,
     host_self: extern "C" fn() -> u32,
-    processor_info: extern "C" fn(u32, i32, *u32, **i32, *u32) -> i32,
+    processor_info: extern "C" fn(u32, i32, *mut u32, *mut *mut i32, *mut u32) -> i32,
     vm_deallocate: extern "C" fn(u32, u64, u64) -> i32,
 }
 
-fn mach_symbol(library: *u8, name: *u8) -> *u8 {
+fn mach_symbol(library: *mut u8, name: *mut u8) -> u64 {
     if !library.is_null() {
+        // UNSAFE: dlsym is C's.
+        // SAFETY: library is a handle dlopen returned and name a C string literal.
         let found = unsafe { dlsym(library, name) };
         if !found.is_null() {
-            return found;
+            return found as u64;
         }
     }
     // RTLD_DEFAULT: every library the process has loaded, whether or not
     // dlopen(NULL) named it (libSystem carries the Mach calls on macOS).
-    unsafe { dlsym(-2 as *u8, name) }
+    // UNSAFE: dlsym is C's.
+    // SAFETY: -2 is RTLD_DEFAULT, a handle dlsym defines; name is a C string literal.
+    unsafe { dlsym(-2 as *mut u8, name) as u64 }
 }
 
-fn resolve_mach_symbols(library: *u8) {
-    MACH_HOST_SELF = mach_symbol(library, c"mach_host_self");
-    MACH_PROCESSOR_INFO = mach_symbol(library, c"host_processor_info");
-    MACH_DEALLOCATE = mach_symbol(library, c"vm_deallocate");
-    MACH_TASK_SELF = mach_symbol(library, c"mach_task_self_");
+fn resolve_mach_symbols(library: *mut u8) {
+    MACH_HOST_SELF.store(mach_symbol(library, c"mach_host_self"), Ordering::Relaxed);
+    MACH_PROCESSOR_INFO.store(mach_symbol(library, c"host_processor_info"), Ordering::Relaxed);
+    MACH_DEALLOCATE.store(mach_symbol(library, c"vm_deallocate"), Ordering::Relaxed);
+    MACH_TASK_SELF.store(mach_symbol(library, c"mach_task_self_"), Ordering::Relaxed);
 }
 
-// The symbols and the host port, looked up once: a refresh every second
-// should not leak a port right or a library handle.
-static var MACH_LOADED: bool = false;
-static var MACH_LIBRARY: *u8 = 0 as *u8;
-static var MACH_HOST_SELF: *u8 = 0 as *u8;
-static var MACH_PROCESSOR_INFO: *u8 = 0 as *u8;
-static var MACH_DEALLOCATE: *u8 = 0 as *u8;
-static var MACH_TASK_SELF: *u8 = 0 as *u8;
-static var HOST_PORT: u32 = 0;
+// The symbols' addresses (0: not found) and the host port, looked up
+// once: a refresh every second should not leak a port right or a library
+// handle. Atomics, so that the statics need no `unsafe` to read or write.
+static MACH_LOADED: AtomicU64 = AtomicU64::new(0);
+static MACH_HOST_SELF: AtomicU64 = AtomicU64::new(0);
+static MACH_PROCESSOR_INFO: AtomicU64 = AtomicU64::new(0);
+static MACH_DEALLOCATE: AtomicU64 = AtomicU64::new(0);
+static MACH_TASK_SELF: AtomicU64 = AtomicU64::new(0);
+static HOST_PORT: AtomicU64 = AtomicU64::new(0);
 
 fn load_mach_symbols() {
-    if MACH_LOADED {
+    if MACH_LOADED.load(Ordering::Relaxed) != 0 {
         return;
     }
-    MACH_LOADED = true;
+    MACH_LOADED.store(1, Ordering::Relaxed);
     // dlopen(NULL) is the running program and the libraries it already
     // has: libSystem on macOS, libc on Linux.
-    MACH_LIBRARY = unsafe { dlopen(0 as *u8, RTLD_NOW) };
-    resolve_mach_symbols(MACH_LIBRARY);
-    if MACH_HOST_SELF.is_null() || MACH_PROCESSOR_INFO.is_null() {
+    // UNSAFE: dlopen is C's.
+    // SAFETY: a null path is the documented way to name the program itself.
+    let own = unsafe { dlopen(0 as *mut u8, RTLD_NOW) };
+    resolve_mach_symbols(own);
+    if MACH_HOST_SELF.load(Ordering::Relaxed) == 0
+        || MACH_PROCESSOR_INFO.load(Ordering::Relaxed) == 0 {
         // A static link or a stripped loader can leave libSystem out of
         // that handle; open it by name before giving up.
+        // UNSAFE: dlopen is C's.
+        // SAFETY: the path is a C string literal.
         let system = unsafe { dlopen(c"/usr/lib/libSystem.B.dylib", RTLD_NOW) };
         if !system.is_null() {
-            MACH_LIBRARY = system;
             resolve_mach_symbols(system);
         }
     }
@@ -136,51 +156,76 @@ fn load_mach_symbols() {
 // Fills totals (the ticks of all four states) and idle with one entry per
 // CPU, the same counters compute_usage_rates() reads from /proc/stat.
 // Returns the number of CPUs, or 0 when Mach is not there.
-pub fn read_macos_core_ticks(totals: inout Vec<i64, Gpa>, idle: inout Vec<i64, Gpa>) -> i64 {
+pub fn read_macos_core_ticks(totals: &mut Vec<i64, Gpa>, idle: &mut Vec<i64, Gpa>) -> i64 {
     load_mach_symbols();
-    if MACH_HOST_SELF.is_null() || MACH_PROCESSOR_INFO.is_null() {
+    let host_self_at = MACH_HOST_SELF.load(Ordering::Relaxed);
+    let processor_info_at = MACH_PROCESSOR_INFO.load(Ordering::Relaxed);
+    if host_self_at == 0 || processor_info_at == 0 {
         return 0;
     }
-    if HOST_PORT == 0 {
-        let host_self = unsafe { MachCall { address: MACH_HOST_SELF }.host_self };
-        HOST_PORT = unsafe { host_self() };
+    if HOST_PORT.load(Ordering::Relaxed) == 0 {
+        // UNSAFE: a C function known only by its address: the union reads the address as the
+        // function pointer, and the call is C's.
+        // SAFETY: the address is dlsym's for mach_host_self, whose C type is the field's
+        // (no argument, a port name back).
+        let port = unsafe {
+            let host_self = MachCall { address: host_self_at as *mut u8 }.host_self;
+            host_self()
+        };
+        HOST_PORT.store(port as u64, Ordering::Relaxed);
     }
-    var cpu_count: u32 = 0;
-    var info: *i32 = 0 as *i32;
-    var info_count: u32 = 0;
-    let read = unsafe { MachCall { address: MACH_PROCESSOR_INFO }.processor_info };
+    let mut cpu_count: u32 = 0;
+    let mut info: *mut i32 = 0 as *mut i32;
+    let mut info_count: u32 = 0;
+    // UNSAFE: as above, for host_processor_info.
+    // SAFETY: the address is dlsym's for host_processor_info and the field has its C type; the
+    // three out parameters point at locals that live across the call.
     let status = unsafe {
-        read(HOST_PORT, PROCESSOR_CPU_LOAD_INFO, &cpu_count, &info, &info_count)
+        let read = MachCall { address: processor_info_at as *mut u8 }.processor_info;
+        read(HOST_PORT.load(Ordering::Relaxed) as u32, PROCESSOR_CPU_LOAD_INFO, &mut cpu_count,
+            &mut info, &mut info_count)
     };
     if status != 0 || cpu_count == 0 || info.is_null() {
         return 0;
     }
-    var i = 0;
-    while i < cpu_count as i64 {
-        let base = i * CPU_STATES;
-        let user = unsafe { info[base] } as i64;
-        let system = unsafe { info[base + 1] } as i64;
-        let idle_ticks = unsafe { info[base + 2] } as i64;
-        let nice = unsafe { info[base + 3] } as i64;
+    // UNSAFE: the kernel's array is known only by its address and count.
+    // SAFETY: on success host_processor_info set info to info_count i32s it mapped for this
+    // task; they stay mapped until the vm_deallocate below, after the last use of `ticks`.
+    let ticks = unsafe { std::slice::from_raw_parts(info as *const i32, info_count as usize) };
+    let mut i: usize = 0;
+    while i < cpu_count as usize && (i + 1) * CPU_STATES as usize <= ticks.len() {
+        let base = i * CPU_STATES as usize;
+        let user = ticks[base] as i64;
+        let system = ticks[base + 1] as i64;
+        let idle_ticks = ticks[base + 2] as i64;
+        let nice = ticks[base + 3] as i64;
         totals.push(user + system + idle_ticks + nice);
         idle.push(idle_ticks);
         i += 1;
     }
-    if !MACH_DEALLOCATE.is_null() && !MACH_TASK_SELF.is_null() {
+    let deallocate_at = MACH_DEALLOCATE.load(Ordering::Relaxed);
+    let task_self_at = MACH_TASK_SELF.load(Ordering::Relaxed);
+    if deallocate_at != 0 && task_self_at != 0 {
         // mach_task_self() is a macro for the mach_task_self_ port.
-        let task = unsafe { *(MACH_TASK_SELF as *u32) };
-        let release = unsafe { MachCall { address: MACH_DEALLOCATE }.vm_deallocate };
-        unsafe { release(task, info as u64, info_count as u64 * 4) };
+        // UNSAFE: a C variable and a C function known only by their addresses.
+        // SAFETY: mach_task_self_ is a u32 the loader keeps for the process's life;
+        // vm_deallocate has the field's C type and is given the very array and size (4 bytes
+        // an entry) host_processor_info returned, not used after this.
+        unsafe {
+            let task = *(task_self_at as *const u32);
+            let release = MachCall { address: deallocate_at as *mut u8 }.vm_deallocate;
+            release(task, info as u64, info_count as u64 * 4);
+        }
     }
     cpu_count as i64
 }
 
 // ---- The terminal ----
 
-pub fn write_bytes(fd: i32, bytes: [u8]) {
-    var at = 0;
-    while at < bytes.len as i64 {
-        match sys_write(fd, bytes[at..]) {
+pub fn write_bytes(fd: i32, bytes: &[u8]) {
+    let mut at: i64 = 0;
+    while at < bytes.len() as i64 {
+        match sys_write(fd, &bytes[at as usize..]) {
             Ok(n) => {
                 if n <= 0 {
                     return;
@@ -193,10 +238,13 @@ pub fn write_bytes(fd: i32, bytes: [u8]) {
 }
 
 pub fn terminal_size(state: State) -> (i64, i64) {
-    var ws = Winsize { rows: 0, cols: 0, xpixel: 0, ypixel: 0 };
-    let r = unsafe { ioctl(1, SYS_TIOCGWINSZ, &ws as *u8) };
-    var w = if r == 0 && ws.cols > 0 { ws.cols as i64 } else { 100 };
-    var h = if r == 0 && ws.rows > 0 { ws.rows as i64 } else { 24 };
+    let mut ws = Winsize { rows: 0, cols: 0, xpixel: 0, ypixel: 0 };
+    // UNSAFE: ioctl is C's.
+    // SAFETY: TIOCGWINSZ writes one struct winsize, which Winsize is (#[repr(C)], four u16),
+    // into `ws`, which lives across the call.
+    let r = unsafe { ioctl(1, SYS_TIOCGWINSZ, &raw mut ws as *mut u8) };
+    let mut w: i64 = if r == 0 && ws.cols > 0 { ws.cols as i64 } else { 100 };
+    let mut h: i64 = if r == 0 && ws.rows > 0 { ws.rows as i64 } else { 24 };
     if state.width > 0 {
         w = state.width;
     }
@@ -214,16 +262,16 @@ pub fn key_pressed(k: Key) -> bool {
 }
 
 pub fn read_key(timeout_ms: i32) -> Key {
-    var fds: [SysPollFd; 1] = [SysPollFd { fd: 0, events: SYS_POLLIN, revents: 0 }];
-    let ready = match sys_poll(&fds[..], timeout_ms) {
+    let mut fds: [SysPollFd; 1] = [SysPollFd { fd: 0, events: SYS_POLLIN, revents: 0 }];
+    let ready = match sys_poll(&mut fds[..], timeout_ms) {
         Ok(n) => n,
         Err(_) => return Key::None,
     };
     if ready <= 0 {
         return Key::None;
     }
-    var bytes: [u8; 16] = [0; 16];
-    let count = match sys_read(0, &bytes[..]) {
+    let mut bytes: [u8; 16] = [0; 16];
+    let count = match sys_read(0, &mut bytes[..]) {
         Ok(n) => n,
         Err(_) => return Key::None,
     };
@@ -237,44 +285,44 @@ pub fn read_key(timeout_ms: i32) -> Key {
     if count == 1 {
         return Key::Escape;
     }
-    if bytes[1] == 'O' && count >= 3 {
+    if bytes[1] == b'O' && count >= 3 {
         // SS3: the arrows on some terminals, F1 to F4 on most.
         return match bytes[2] {
-            'A' => Key::Up,
-            'B' => Key::Down,
-            'C' => Key::None,
-            'D' => Key::None,
-            'H' => Key::Home,
-            'F' => Key::End,
-            'P' => Key::Function(1),
-            'Q' => Key::Function(2),
-            'R' => Key::Function(3),
-            'S' => Key::Function(4),
+            b'A' => Key::Up,
+            b'B' => Key::Down,
+            b'C' => Key::None,
+            b'D' => Key::None,
+            b'H' => Key::Home,
+            b'F' => Key::End,
+            b'P' => Key::Function(1),
+            b'Q' => Key::Function(2),
+            b'R' => Key::Function(3),
+            b'S' => Key::Function(4),
             _ => Key::None,
         };
     }
-    if bytes[1] != '[' || count < 3 {
+    if bytes[1] != b'[' || count < 3 {
         return Key::Escape;
     }
     let third = bytes[2];
-    if third == 'A' {
+    if third == b'A' {
         return Key::Up;
-    } else if third == 'B' {
+    } else if third == b'B' {
         return Key::Down;
-    } else if third == 'H' {
+    } else if third == b'H' {
         return Key::Home;
-    } else if third == 'F' {
+    } else if third == b'F' {
         return Key::End;
-    } else if third == 'Z' {
+    } else if third == b'Z' {
         return Key::None;
     }
     // CSI with a number: "\x1b[5~", "\x1b[15~", "\x1b[1;5A" (the modifier
     // is ignored). Home and End have two forms each.
-    var number = 0;
-    var at = 2;
-    var digits = false;
-    while at < count && bytes[at] >= '0' && bytes[at] <= '9' {
-        number = number * 10 + (bytes[at] - '0') as i64;
+    let mut number: i64 = 0;
+    let mut at: i64 = 2;
+    let mut digits = false;
+    while at < count && bytes[at as usize] >= b'0' && bytes[at as usize] <= b'9' {
+        number = number * 10 + (bytes[at as usize] - b'0') as i64;
         digits = true;
         at += 1;
     }
