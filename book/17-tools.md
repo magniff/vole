@@ -211,8 +211,8 @@ crate::report::Order	report.vl:7:10	enum	pub enum Order { ByCount, Alphabetical,
 std::alloc::Gpa	<std>:L:C	struct	pub struct Gpa { sealed: (), }
 std::collections::hash_map::HashMap	<std>:L:C	struct	pub struct HashMap<K, V, A: Allocator, S = FixedState> { table: RawTable<(K, V), A>, hasher: S, }
 std::string::String	<std>:L:C	struct	pub struct String<A: Allocator> { vec: Vec<u8, A>, }
-std::vec::Vec	<std>:L:C	struct	pub struct Vec<T, A: Allocator> { ptr: NonNull<T>, cap: usize, len: usize, alloc: A, }
 std::option::Option	<std>:L:C	enum	pub enum Option<T> { None, Some(T), }
+std::vec::Vec	<std>:L:C	struct	pub struct Vec<T, A: Allocator> { ptr: NonNull<T>, cap: usize, len: usize, alloc: A, }
 // callers (1)
 run	main.vl:21:23	let top = report::top(&counts, n, report::Order::ByCount, gpa);
 ```

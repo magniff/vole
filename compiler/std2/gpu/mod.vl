@@ -1,7 +1,2276 @@
 // EDITION: rust
-// std::gpu (0.27.6): what of MVS's std::gpu (docs/design/gpu.md) std2 has
-// so far, the WGSL front end, `wgsl`. The device API (Instance, Device,
-// buffers, pipelines) and the writers (MSL, SPIR-V) come later.
-// mvs: std::gpu
+// std::gpu (0.22, docs/design/gpu.md §2): GPU compute and rendering on
+// wgpu's model. On macOS it runs on Metal (std::gpu::hal::metal); a
+// program that uses it links libobjc: `volec prog.vl -l objc -o
+// prog` (Metal itself is opened at run time).
+//
+// - The objects are wgpu's: Instance, Adapter, Device and Queue, Buffer
+//   (mapping included), Texture and TextureView, Sampler, Shader, the
+//   pipelines, BindGroup, Encoder and Commands, the passes, Surface and
+//   Frame. Each resource is an owned value: dropping it releases it, also
+//   while the GPU still uses it (the work keeps it alive).
+// - Passes are closure-scoped: `enc.compute_pass(|pass| { ... })`.
+// - Misuse is a contract failure (`requires`, exit 101 with the rule's
+//   code: gpu.usage, gpu.align, gpu.range, gpu.layout, gpu.pipeline,
+//   gpu.format, gpu.limits, gpu.state, gpu.unsupported, gpu.unwritten); what can fail
+//   however correct the program is (no adapter, a shader the driver
+//   rejects, a lost device) is a Result.
+// - Backends are behind std::gpu::hal: `Api` (compute, memory, copies)
+//   and `Render` (pipelines, passes, surfaces). Nothing here assumes a
+//   backend's memory model or queue: buffers are reached through
+//   map_read, map_write and unmap; `dev.caps()` says what the device can
+//   do, and a compute-only backend reports `render: false`.
+// - Shaders: `dev.shader(&src)` takes the shader compiler's output for
+//   the device's ShaderKind (MSL on Metal): a ShaderSource, the code and
+//   its reflection.
 
+use crate::alloc::{Allocator, arena_scope};
+use crate::fmt::{Debug, Display};
+use crate::fmt::Formatter as Fmt;
+mod capture;
+pub mod hal;
+pub mod shader;
+mod timing;
+pub mod types;
 pub mod wgsl;
+
+use crate::capture::{capture_next_frame, capture_pending};
+pub use crate::capture::capture_cancel;
+use crate::ops::Range;
+
+use hal::metal as backend;
+pub use hal::{Caps, RawSurface};
+pub use shader::{
+    Binding, BindingType, EntryPoint, GroupBinding, Reflection, ShaderKind, ShaderSource,
+    VertexInput,
+};
+pub use timing::{MAX_QUERIES, QuerySet};
+use types::{MAX_BIND_GROUPS, MAX_COLOR_TARGETS, MAX_VERTEX_BUFFERS};
+pub use types::{
+    AddressMode, Blend, BlendComponent, BlendFactor, BlendOp, BufferUsage, Color, ColorTarget,
+    Compare, Cull, DepthState, Filter, Format, FrontFace, IndexFormat, Limits, Load, PipelineState,
+    Power, SamplerDesc, ShaderStage, StepMode, TextureDesc, TextureUsage, Topology, VertexAttribute,
+    VertexFormat, VertexLayout,
+};
+
+/// The backend of this build (Metal on macOS).
+pub type Native = backend::Metal;
+
+type N = backend::Metal;
+
+// ---- GPU: errors (0.22) ----
+
+/// What can fail however correct the program is (§2.7); misuse is a
+/// contract failure instead. Messages are the driver's.
+pub enum Error<A: Allocator> {
+    NoAdapter,
+    DeviceCreation,
+    Shader(String<A>),
+    Pipeline(String<A>),
+    Submission,
+    SurfaceLost,
+}
+
+impl Display for Error<Gpa> {
+    fn fmt(&self, f: &mut Fmt<'_>) -> crate::fmt::Result {
+        match self {
+            Error::NoAdapter => f.write_str("gpu: no adapter")?,
+            Error::DeviceCreation => f.write_str("gpu: the device could not be opened")?,
+            Error::Shader(m) => {
+                f.write_str("gpu: the shader did not compile: ")?;
+                f.write_str(m.as_str())?;
+            }
+            Error::Pipeline(m) => {
+                f.write_str("gpu: the pipeline was rejected: ")?;
+                f.write_str(m.as_str())?;
+            }
+            Error::Submission => f.write_str(
+                "gpu: a submission failed (device lost or out of memory)")?,
+            Error::SurfaceLost => f.write_str(
+                "gpu: the surface has no frame to give (lost, or reconfigure it)")?,
+        }; Ok(())
+    }
+}
+
+impl Debug for Error<Gpa> {
+    fn fmt(&self, f: &mut Fmt<'_>) -> crate::fmt::Result {
+        Display::fmt(self, f)
+    }
+}
+
+/// The device ran out of memory where the API returns no Result (buffer,
+/// texture, sampler creation): the process ends, as an allocation failure
+/// of Gpa does.
+fn out_of_memory(what: &str) -> ! {
+    eprintln("gpu: out of device memory ({what})");
+    crate::process::exit(101i32)
+}
+
+// ---- GPU: instance, adapters, devices (0.22) ----
+
+/// The entry point: holds the allocator the devices use for host memory.
+#[derive(Clone, Copy)] pub struct Instance<A: Allocator> {
+    pub gpa: A,
+}
+
+impl Instance<Gpa> {
+    pub fn new_in(gpa: Gpa) -> Instance<Gpa> {
+        Instance { gpa: gpa }
+    }
+
+    /// Every adapter of the system.
+    pub fn adapters(self) -> Vec<Adapter<Gpa>, Gpa> {
+        let gpa = self.gpa;
+        let mut out: Vec<Adapter<Gpa>, Gpa> = Vec::new_in(gpa);
+        // the backend's list is scratch: an arena, freed at once
+        arena_scope(&gpa, |a| {
+            let mut raw = Vec::new_in(a);
+            N::adapters(&mut raw);
+            for r in raw.iter() {
+                out.push(adapter_new(backend::Adapter { dev: r.dev.clone() }, gpa));
+            }
+        });
+        out
+    }
+
+    /// An adapter: the low-power one when asked and there is one.
+    pub fn adapter(self, power: Power = Power::High) -> Result<Adapter<Gpa>, Error<Gpa>> {
+        if power == Power::Low {
+            let found = arena_scope(&self.gpa, |a| {
+                let mut raw = Vec::new_in(a);
+                N::adapters(&mut raw);
+                let mut f: Option<backend::Adapter> = None;
+                for r in raw.iter() {
+                    if f.is_none() && N::adapter_low_power(r) {
+                        f = Some(backend::Adapter { dev: r.dev.clone() });
+                    }
+                }
+                f
+            });
+            match found {
+                Some(a) => return Ok(adapter_new(a, self.gpa)),
+                None => {}
+            }
+        }
+        match N::default_adapter() {
+            Some(a) => Ok(adapter_new(a, self.gpa)),
+            None => Err(Error::NoAdapter),
+        }
+    }
+
+    /// A surface for a window (or a headless one): its frames are drawn
+    /// into and presented. Needs a device whose caps have `surfaces`.
+    pub fn surface(self, dev: &Device<Gpa>, raw: RawSurface) -> Result<Surface<Gpa>, Error<Gpa>>
+        requires dev.caps.surfaces
+        else "gpu.unsupported: this device has no surfaces (dev.caps().surfaces)"
+        {
+        match N::create_surface(&dev.raw, raw) {
+            Some(s) => Ok(Surface {
+                raw: s, configured: false, width: 0, height: 0, format: Format::Bgra8Unorm,
+                dev: dev.raw.clone(), gpa: self.gpa,
+            }),
+            None => Err(Error::SurfaceLost),
+        }
+    }
+}
+
+pub struct Adapter<A: Allocator> {
+    pub raw: backend::Adapter,
+    pub gpa: A,
+    // the largest buffer it makes (N::adapter_max_buffer_size), for
+    // device()'s contract
+    max_buffer_size: i64,
+}
+
+fn adapter_new(raw: backend::Adapter, gpa: Gpa) -> Adapter<Gpa> {
+    let max = N::adapter_max_buffer_size(&raw);
+    Adapter { raw: raw, gpa: gpa, max_buffer_size: max }
+}
+
+impl Adapter<Gpa> {
+    /// The most this adapter takes (wgpu's `adapter.limits()`): Limits::default()
+    /// with the largest buffer it makes (on Apple silicon several GiB, with
+    /// the memory). `adapter.device(adapter.limits())` asks for all of it.
+    pub fn limits(&self) -> Limits {
+        let mut l = Limits::default();
+        l.max_buffer_size = self.max_buffer_size;
+        l
+    }
+
+    /// The adapter's name ("Apple M5").
+    pub fn name_in<A: Allocator>(&self, out: &mut String<A>) {
+        N::adapter_name(&self.raw, out);
+    }
+
+    /// The device and its queue, with `limits` (Limits::default(): those
+    /// every adapter takes, a buffer at most 1 GiB; wgpu's model). More, up
+    /// to adapter.limits(): `var lim = Limits::default(); lim.max_buffer_size
+    /// = 4 << 30; adapter.device(lim)`.
+    pub fn device(&self, limits: Limits = Limits::default()) -> Result<(Device<Gpa>, Queue),
+        Error<Gpa>>
+        requires limits.max_buffer_size <= self.max_buffer_size
+        else "gpu.limits: device(lim) asks for buffers of up to {} bytes (lim.max_buffer_size) and this adapter makes them up to {} (adapter.limits().max_buffer_size)", limits.max_buffer_size, self.max_buffer_size
+        {
+        match N::open(&self.raw) {
+            Some((d, q)) => {
+                let caps = N::caps(&d);
+                Ok((Device { raw: d, gpa: self.gpa, limits: limits, caps: caps },
+                    Queue { raw: q, written: [0; 256], nwritten: 0, lost: false }))
+            }
+            None => Err(Error::DeviceCreation),
+        }
+    }
+}
+
+pub struct Device<A: Allocator> {
+    pub raw: backend::Device,
+    pub gpa: A,
+    pub limits: Limits,
+    pub caps: Caps,
+}
+
+pub struct Queue {
+    pub raw: backend::Queue,
+    // the ids (buffer_id) of the uniform buffers written so far, by
+    // write_buffer or by submitted commands (Unwritten's fills), for
+    // submit's gpu.unwritten: the first `nwritten`, no allocation (the
+    // queue's path allocates nothing)
+    written: [u64; 256],
+    nwritten: i64,
+    // more were written than these hold: gpu.unwritten checks no more (it
+    // would report a written one)
+    lost: bool,
+}
+
+/// A layout key: the bindings' kinds and slots, so that a bind group made
+/// for one pipeline is accepted by another only when their layouts agree.
+// h with x mixed in (the old std's hash_mix over a 64-bit finalizer; a
+// layout's key is only compared with other keys made here).
+fn hash_mix(h: u64, x: u64) -> u64 {
+    let mut z = h ^ x.wrapping_add(0x9e3779b97f4a7c15u64).wrapping_add(h << 6).wrapping_add(h >> 2);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9u64);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111ebu64);
+    z ^ (z >> 31)
+}
+
+fn layout_key(entries: &[Binding]) -> u64 {
+    let mut h: u64 = 0x9e3779b97f4a7c15;
+    for &b in entries {
+        h = hash_mix(h, b.binding as u64);
+        h = hash_mix(h, b.ty as u64);
+        h = hash_mix(h, b.slot_vertex as u64);
+        h = hash_mix(h, b.slot_fragment as u64);
+        h = hash_mix(h, b.slot_compute as u64);
+    }
+    if h == 0 { 1 } else { h }
+}
+
+// (0.25.2.1) bind_group's checks. A contract's message holds only integers, so bind_group's name the
+// layout's bindings by number: the i-th (-1: none).
+fn layout_at(l: BindLayout, i: i64) -> i64 {
+    if i >= 0 && i < l.count { l.entries[i as usize].binding } else { -1 }
+}
+
+// The first binding at which entries and the layout differ: an entry for
+// a binding the layout lacks, a binding of the layout with no entry or
+// with two; -1 when they fit.
+fn layout_fit(l: BindLayout, entries: &[BindEntry<'_>]) -> i64 {
+    for &e in entries {
+        let mut n: i64 = 0;
+        for k in 0..l.count {
+            if l.entries[k as usize].binding == e.binding { n += 1; }
+        }
+        if n == 0 { return e.binding; }
+    }
+    for k in 0..l.count {
+        let mut n: i64 = 0;
+        for &e in entries {
+            if e.binding == l.entries[k as usize].binding { n += 1; }
+        }
+        if n != 1 { return l.entries[k as usize].binding; }
+    }
+    -1
+}
+
+// bind_group's rules for each entry (bind_fault's `rule`).
+const BF_KIND: i64 = 0;
+const BF_UNIFORM: i64 = 1;
+const BF_STORAGE: i64 = 2;
+const BF_MAPPED: i64 = 3;
+const BF_ALIGN: i64 = 4;
+const BF_RANGE: i64 = 5;
+const BF_TEXTURE: i64 = 6;
+const BF_SAMPLER: i64 = 7;
+
+// The first binding whose entry breaks `rule` against the layout's
+// binding (the entries fit the layout: layout_fit); -1: none.
+fn bind_fault(l: BindLayout, entries: &[BindEntry<'_>], lim: Limits, rule: i64) -> i64 {
+    for k in 0..l.count {
+        let b = l.entries[k as usize];
+        for &e in entries {
+            if e.binding != b.binding { continue; }
+            let bad = match e.res {
+                Resource::Buffer(buf, offset, size) => {
+                    let uniform = b.ty == BindingType::Uniform;
+                    let align = if uniform { lim.min_uniform_buffer_offset_alignment }
+                        else { lim.min_storage_buffer_offset_alignment };
+                    let n = if size < 0 { buf.size - offset } else { size };
+                    if rule == BF_KIND { !b.ty.is_buffer() }
+                    else if rule == BF_UNIFORM { uniform && buf.usage & BufferUsage::UNIFORM == 0 }
+                    else if rule == BF_STORAGE {
+                        b.ty.is_buffer() && !uniform && buf.usage & BufferUsage::STORAGE == 0
+                    }
+                    else if rule == BF_MAPPED { buf.mapped }
+                    else if rule == BF_ALIGN { align > 0 && offset % align != 0 }
+                    else if rule == BF_RANGE {
+                        offset < 0 || n < b.min_size || offset + n > buf.size
+                    }
+                    else { false }
+                }
+                Resource::Texture(v) => {
+                    let need = if b.ty
+                        == BindingType::StorageTexture { TextureUsage::STORAGE_BINDING }
+                        else { TextureUsage::TEXTURE_BINDING };
+                    if rule == BF_KIND { !b.ty.is_texture() }
+                    else if rule == BF_TEXTURE { v.usage & need == 0 }
+                    else { false }
+                }
+                Resource::Sampler(s) => {
+                    if rule == BF_KIND { !b.ty.is_sampler() }
+                    else if rule == BF_SAMPLER {
+                        s.comparison != (b.ty == BindingType::ComparisonSampler)
+                    }
+                    else { false }
+                }
+            };
+            if bad { return b.binding; }
+        }
+    }
+    -1
+}
+
+// (0.25.3) WebGPU's rule for mappable buffers: MAP_READ goes with COPY_DST
+// alone, MAP_WRITE with COPY_SRC alone, so the GPU reaches a mappable
+// buffer only by copies (which the encoder records for submit's
+// gpu.state). 1: MAP_READ with more, 2: MAP_WRITE with more, 0: fine.
+fn map_usage_fault(usage: u32) -> i64 {
+    let read = BufferUsage::MAP_READ | BufferUsage::COPY_DST;
+    let write = BufferUsage::MAP_WRITE | BufferUsage::COPY_SRC;
+    if usage & BufferUsage::MAP_READ != 0 && usage | read != read { 1 }
+    else if usage & BufferUsage::MAP_WRITE != 0 && usage | write != write { 2 }
+    else { 0 }
+}
+
+impl Device<Gpa> {
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    /// What the device can do: compute, render, surfaces, its ShaderKind.
+    pub fn caps(&self) -> Caps {
+        self.caps
+    }
+
+    /// n rounded up to the uniform buffer offset alignment.
+    pub fn align_uniform(&self, n: i64) -> i64 {
+        let a = self.limits.min_uniform_buffer_offset_alignment;
+        (n + a - 1) / a * a
+    }
+
+    /// A buffer of size bytes, zeroed.
+    pub fn buffer(&self, size: i64, usage: u32) -> Buffer
+        requires size >= 0 && size <= self.limits.max_buffer_size
+        else "gpu.limits: a buffer of {size} bytes; this device makes them up to {} (dev.limits().max_buffer_size; Limits::default() has 1 GiB): ask for more when opening it, up to the adapter's largest (adapter.limits().max_buffer_size): `var lim = Limits::default(); lim.max_buffer_size = {size}; adapter.device(lim)`", self.limits.max_buffer_size
+        requires usage != 0 else "gpu.usage: a buffer needs a usage"
+        requires map_usage_fault(usage) != 1
+        else "gpu.usage: a buffer made with BufferUsage::MAP_READ has COPY_DST besides and nothing more (WebGPU's rule: what the GPU writes otherwise could change a mapped view); this one's usage is {usage}: make the buffer the GPU writes with COPY_SRC (not MAP_READ), copy it into one of MAP_READ | COPY_DST (enc.copy_buffer) and map that"
+        requires map_usage_fault(usage) != 2
+        else "gpu.usage: a buffer made with BufferUsage::MAP_WRITE has COPY_SRC besides and nothing more (WebGPU's rule: the GPU could read it while the CPU writes); this one's usage is {usage}: write the buffer the GPU uses with queue.write_buffer, or write one of MAP_WRITE | COPY_SRC and copy it (enc.copy_buffer)"
+        {
+        match N::create_buffer(&self.raw, size, b"") {
+            Some(b) => Buffer {
+                raw: b, size: size, usage: usage, mapped: false,
+                written: false,
+            },
+            None => out_of_memory("buffer"),
+        }
+    }
+
+    /// A buffer holding a copy of bytes.
+    pub fn buffer_init(&self, bytes: &[u8], usage: u32) -> Buffer
+        requires bytes.len() as i64 <= self.limits.max_buffer_size
+        else "gpu.limits: a buffer of {} bytes; this device makes them up to {} (dev.limits().max_buffer_size; Limits::default() has 1 GiB): ask for more when opening it, up to the adapter's largest (adapter.limits().max_buffer_size): `var lim = Limits::default(); lim.max_buffer_size = {}; adapter.device(lim)`", bytes.len(), self.limits.max_buffer_size, bytes.len()
+        requires usage != 0 else "gpu.usage: a buffer needs a usage"
+        requires map_usage_fault(usage) != 1
+        else "gpu.usage: a buffer made with BufferUsage::MAP_READ has COPY_DST besides and nothing more (WebGPU's rule: what the GPU writes otherwise could change a mapped view); this one's usage is {usage}: make the buffer the GPU writes with COPY_SRC (not MAP_READ), copy it into one of MAP_READ | COPY_DST (enc.copy_buffer) and map that"
+        requires map_usage_fault(usage) != 2
+        else "gpu.usage: a buffer made with BufferUsage::MAP_WRITE has COPY_SRC besides and nothing more (WebGPU's rule: the GPU could read it while the CPU writes); this one's usage is {usage}: write the buffer the GPU uses with queue.write_buffer, or write one of MAP_WRITE | COPY_SRC and copy it (enc.copy_buffer)"
+        {
+        match N::create_buffer(&self.raw, bytes.len() as i64, bytes) {
+            Some(b) => Buffer {
+                raw: b, size: bytes.len() as i64, usage: usage, mapped: false,
+                written: true,
+            },
+            None => out_of_memory("buffer"),
+        }
+    }
+
+    /// A 2D texture (a 2D array when layers > 1).
+    pub fn texture(&self, width: i64, height: i64, format: Format,
+        usage: u32 = TextureUsage::TEXTURE_BINDING | TextureUsage::COPY_DST, layers: i64 = 1,
+        mips: i64 = 1) -> Texture
+        requires self.caps.textures
+        else "gpu.unsupported: this device has no textures (dev.caps().textures)"
+        requires width >= 1 && height >= 1 && width <= self.limits.max_texture_dimension_2d
+        && height <= self.limits.max_texture_dimension_2d
+        else "gpu.limits: a texture of {width} x {height}; its sides are 1 to {} (dev.limits().max_texture_dimension_2d)", self.limits.max_texture_dimension_2d
+        requires layers >= 1 && layers <= self.limits.max_texture_array_layers && mips >= 1
+        else "gpu.limits: layers and mips"
+        requires usage != 0 else "gpu.usage: a texture needs a usage"
+        requires usage & TextureUsage::STORAGE_BINDING == 0 || format.is_storable()
+        else "gpu.format: STORAGE_BINDING needs a storable format"
+        requires usage & TextureUsage::RENDER_ATTACHMENT == 0 || self.caps.render
+        else "gpu.unsupported: RENDER_ATTACHMENT on a device without render"
+        {
+        let desc = TextureDesc {
+            width: width, height: height, layers: layers, mips: mips, format: format, usage: usage,
+        };
+        match N::create_texture(&self.raw, desc) {
+            Some(t) => Texture { raw: t, desc: desc },
+            None => out_of_memory("texture"),
+        }
+    }
+
+    pub fn sampler(&self, desc: SamplerDesc) -> Sampler
+        requires self.caps.textures
+        else "gpu.unsupported: this device has no samplers (dev.caps().textures)"
+        requires desc.anisotropy >= 1 && desc.anisotropy <= 16
+        else "gpu.limits: anisotropy is 1..16"
+        {
+        match N::create_sampler(&self.raw, desc) {
+            Some(s) => Sampler { raw: s, comparison: desc.compare.is_some() },
+            None => out_of_memory("sampler"),
+        }
+    }
+
+    /// A shader module from the shader compiler's output for this device
+    /// (`caps().shader_kind`: MSL on Metal). What it keeps of the source
+    /// is copied.
+    pub fn shader(&self, src: &ShaderSource<'_, Gpa>) -> Result<Shader<Gpa>, Error<Gpa>>
+        requires src.kind == self.caps.shader_kind
+        else "gpu.format: the shader is not of this device's ShaderKind (dev.caps().shader_kind)"
+        {
+        // (what the shader asks of the device is the shader's error, not
+        // a contract: it may come from WGSL text the program reads)
+        if src.reflection.sizes.len() as i64 > MAX_SIZES {
+            return Err(Error::Shader(format_in("gpu.limits: {} runtime-sized storage bindings; at most {MAX_SIZES} (the sizes buffer)", src.reflection.sizes.len() as i64, self.gpa)));
+        }
+        let mut err: String<Gpa> = String::new_in(self.gpa);
+        match N::create_shader(&self.raw, src, &mut err) {
+            Some(s) => {
+                let mut entries: Vec<ShaderEntry<Gpa>, Gpa> = Vec::new_in(self.gpa);
+                for e in src.reflection.entries.iter().copied() {
+                    entries.push(ShaderEntry {
+                        name: String::from_in(e.name, self.gpa),
+                        native: String::from_in(e.native, self.gpa), stage: e.stage,
+                        workgroup: e.workgroup, sizes_slot: e.sizes_slot,
+                    });
+                }
+                let mut sizes: Vec<GroupBinding, Gpa> = Vec::new_in(self.gpa);
+                sizes.extend_from_slice(src.reflection.sizes.as_slice());
+                let mut bindings: Vec<Binding, Gpa> = Vec::new_in(self.gpa);
+                bindings.extend_from_slice(src.reflection.bindings.as_slice());
+                let mut inputs: Vec<VertexInput, Gpa> = Vec::new_in(self.gpa);
+                inputs.extend_from_slice(src.reflection.inputs.as_slice());
+                let mut uses: Vec<[i64; 2], Gpa> = Vec::new_in(self.gpa);
+                uses.extend_from_slice(src.reflection.uses.as_slice());
+                Ok(Shader {
+                    raw: s, entries: entries, bindings: bindings, inputs: inputs, sizes: sizes,
+                    uses: uses,
+                })
+            }
+            None => Err(Error::Shader(err)),
+        }
+    }
+
+    /// A shader module from WGSL source: std::gpu::wgsl translates it for
+    /// this device (MSL on Metal), and its reflection (entry points,
+    /// bindings and their slots, vertex inputs, the sizes buffer) feeds
+    /// pipeline creation as dev.shader's does. A rejected shader is
+    /// Error::Shader with the compiler's `LINE:COL: error wgsl.CODE: ...`;
+    /// one Metal rejects, `LINE:COL: error wgsl.target: ...` at the WGSL
+    /// function, then Metal's log. Nothing about the shader panics.
+    pub fn shader_wgsl(&self, src: &str) -> Result<Shader<Gpa>, Error<Gpa>> {
+        if self.caps.shader_kind != ShaderKind::Msl {
+            return Err(
+                Error::Shader(
+                    String::from_in(
+                        "std::gpu::wgsl writes no code for this device's ShaderKind yet",
+                        self.gpa)));
+        }
+        let mut code = Vec::<u8, _>::new_in(self.gpa);
+        let mut refl = wgsl::new_reflection(self.gpa);
+        let mut err = wgsl::new_error(self.gpa);
+        if !wgsl::translate_buf(src.as_bytes(), wgsl::options(wgsl::TARGET_MSL), &mut code,
+            &mut refl, &mut err, self.gpa) {
+            // (a message can quote the source's bytes: lossy, never a panic)
+            let mut m = format_in("{}:{}: error {}: {}", err.line, err.col,
+                String::from_utf8_lossy_in(err.code, self.gpa),
+                String::from_utf8_lossy_in(err.msg.as_slice(), self.gpa), self.gpa);
+            if err.help.len() as i64 > 0 {
+                m.push_str(" (help: ");
+                m.push_str(String::from_utf8_lossy_in(err.help.as_slice(), self.gpa).as_str());
+                m.push_str(")");
+            }
+            return Err(Error::Shader(m));
+        }
+        match shader::from_wgsl(&refl, self.gpa) {
+            Ok(r) => {
+                // (the translator writes ASCII and the source's own names)
+                let code = match String::from_utf8(code) {
+                    Ok(c) => c,
+                    Err(_) => return Err(
+                        Error::Shader(
+                            String::from_in("std::gpu::wgsl wrote code that is not UTF-8",
+                                self.gpa))),
+                };
+                let s = ShaderSource::msl(code.as_str(), r);
+                match self.shader(&s) {
+                    Ok(sh) => Ok(sh),
+                    Err(Error::Shader(log)) => {
+                        // Metal rejected WGSL the translator took: the
+                        // message at the WGSL function, then Metal's
+                        let mut m: String<Gpa> = String::new_in(self.gpa);
+                        if wgsl::target_error(src.as_bytes(), &refl, log.as_bytes(), &mut m) {
+                            m.push_str("\n");
+                        }
+                        m.push_str(log.as_str());
+                        Err(Error::Shader(m))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Err(m) => Err(Error::Shader(m)),
+        }
+    }
+
+    /// A compute pipeline for the entry point `entry` of the shader; its
+    /// bind layouts come from the shader's reflection.
+    pub fn compute_pipeline(&self, shader: &Shader<Gpa>, entry: &str) -> Result<ComputePipeline,
+        Error<Gpa>>
+        requires self.caps.compute
+        else "gpu.unsupported: this device has no compute (dev.caps().compute)"
+        {
+        let e = match shader.entry(entry, ShaderStage::COMPUTE) {
+            Some(e) => e,
+            None => return Err(
+                Error::Pipeline({
+                    let entry = entry;
+                    format_in("no compute entry point '{entry}' in the shader", self.gpa)
+                })),
+        };
+        let wg = e.workgroup;
+        let l = self.limits;
+        // (the shader's sizes against the device's: the shader's error)
+        if wg[0] < 1 || wg[1] < 1 || wg[2] < 1 || wg[0] > l.max_compute_workgroup_size_x
+            || wg[1] > l.max_compute_workgroup_size_y || wg[2] > l.max_compute_workgroup_size_z
+            || wg[0] * wg[1] * wg[2] > l.max_compute_invocations_per_workgroup {
+            return Err(Error::Pipeline({ let entry = entry; format_in("gpu.limits: '{entry}' has @workgroup_size({}, {}, {}); the device takes at most ({}, {}, {}), {} in all (dev.limits())", wg[0], wg[1], wg[2], l.max_compute_workgroup_size_x, l.max_compute_workgroup_size_y, l.max_compute_workgroup_size_z, l.max_compute_invocations_per_workgroup, self.gpa) }));
+        }
+        if e.sizes_slot >= 31 {
+            return Err(Error::Pipeline({
+                let entry = entry;
+                format_in("gpu.limits: '{entry}' binds {} buffers; at most 30", e.sizes_slot,
+                    self.gpa)
+            }));
+        }
+        let mut err: String<Gpa> = String::new_in(self.gpa);
+        match N::create_compute_pipeline(&self.raw, &shader.raw, e, &mut err) {
+            Some(p) => {
+                let mut out = ComputePipeline {
+                    raw: p, layouts: Layouts::new(), workgroup: wg,
+                    sizes: StageSizes::of(shader, e.sizes_slot),
+                };
+                out.layouts.merge_stage(shader, shader.entry_index(entry, ShaderStage::COMPUTE),
+                    ShaderStage::COMPUTE);
+                Ok(out)
+            }
+            None => Err(Error::Pipeline(err)),
+        }
+    }
+
+    /// A render pipeline.
+    pub fn render_pipeline(&self, desc: RenderDesc<'_, Gpa>) -> Result<RenderPipeline, Error<Gpa>>
+        requires self.caps.render
+        else "gpu.unsupported: this device does not render (dev.caps().render)"
+        requires desc.state.buffer_count <= self.limits.max_vertex_buffers
+        else "gpu.limits: {} vertex buffers; the device takes at most {} (dev.limits().max_vertex_buffers)", desc.state.buffer_count, self.limits.max_vertex_buffers
+        requires desc.state.target_count >= 0
+        && desc.state.target_count <= self.limits.max_color_attachments
+        else "gpu.limits: {} color targets; the device takes 0 to {} (dev.limits().max_color_attachments)", desc.state.target_count, self.limits.max_color_attachments
+        requires desc.state.target_count > 0 || desc.state.depth.is_some()
+        else "gpu.format: a pipeline with no color target draws only depth: give it a depth state (desc.depth(), or RenderDesc::depth_only)"
+        {
+        let vs = match desc.vertex.entry(desc.vs, ShaderStage::VERTEX) {
+            Some(e) => e,
+            None => return Err(
+                Error::Pipeline(format_in("no vertex entry point '{}' in the shader", desc.vs,
+                    self.gpa))),
+        };
+        let mut fs = vs;
+        if desc.has_fs {
+            fs = match desc.fragment.entry(desc.fs, ShaderStage::FRAGMENT) {
+                Some(e) => e,
+                None => return Err(
+                    Error::Pipeline(format_in("no fragment entry point '{}' in the shader", desc.fs,
+                        self.gpa))),
+            };
+        }
+        let st = desc.state;
+        for i in 0..st.buffer_count {
+            let l = st.buffers[i as usize];
+            assert(l.stride >= 0 && l.stride % 4 == 0,
+                "gpu.align: a vertex buffer's stride is a multiple of 4");
+            for k in 0..l.count {
+                let a = l.attributes[k as usize];
+                assert(a.offset % 4 == 0,
+                    "gpu.align: a vertex attribute's offset is a multiple of 4");
+                assert(a.offset + a.format.size() <= l.stride
+                    || (l.stride == 0 && l.step == StepMode::Instance),
+                    "gpu.range: a vertex attribute reaches past its stride");
+            }
+        }
+        // every vertex input of the shader is fed by an attribute
+        for inp in desc.vertex.inputs.iter().copied() {
+            let mut fed = false;
+            for i in 0..st.buffer_count {
+                let l = st.buffers[i as usize];
+                for k in 0..l.count {
+                    if l.attributes[k as usize].location == inp.location {
+                        fed = true;
+                        assert(l.attributes[k as usize].format.shader_type()
+                            == inp.format.shader_type(),
+                            "gpu.format: a vertex attribute's format differs from the shader's input");
+                    }
+                }
+            }
+            assert(fed,
+                "gpu.layout: a vertex input of the shader has no attribute (desc.vertex_buffer)");
+        }
+        for i in 0..st.target_count {
+            assert(!st.targets[i as usize].format.is_depth(),
+                "gpu.format: a color target of a depth format");
+        }
+        match st.depth {
+            Some(d) => assert(d.format.is_depth(),
+                "gpu.format: the depth state needs a depth format"),
+            None => {}
+        }
+        // (the sizes buffer's slot stays below the vertex buffers: 30 - i)
+        if vs.sizes_slot >= 31 - st.buffer_count || fs.sizes_slot >= 31 {
+            return Err(Error::Pipeline(format_in("gpu.limits: the shader's buffers ({} in '{}', {} in '{}') and {} vertex buffers take more than Metal's 31 slots", vs.sizes_slot, desc.vs, fs.sizes_slot, desc.fs, st.buffer_count, self.gpa)));
+        }
+        let mut err: String<Gpa> = String::new_in(self.gpa);
+        match N::create_render_pipeline(&self.raw, &desc.vertex.raw, vs, &desc.fragment.raw, fs,
+            desc.has_fs, st, &mut err) {
+            Some(p) => {
+                let mut out = RenderPipeline {
+                    raw: p, layouts: Layouts::new(), state: st,
+                    vs_sizes: StageSizes::of(&desc.vertex, vs.sizes_slot),
+                    fs_sizes: if desc.has_fs { StageSizes::of(&desc.fragment, fs.sizes_slot) }
+                        else { StageSizes::none() }
+                };
+                out.layouts.merge_stage(&desc.vertex,
+                    desc.vertex.entry_index(desc.vs, ShaderStage::VERTEX), ShaderStage::VERTEX);
+                if desc.has_fs {
+                    out.layouts.merge_stage(&desc.fragment,
+                        desc.fragment.entry_index(desc.fs, ShaderStage::FRAGMENT),
+                        ShaderStage::FRAGMENT);
+                }
+                Ok(out)
+            }
+            None => Err(Error::Pipeline(err)),
+        }
+    }
+
+    /// A bind group for `layout` (from `pipe.bind_layout(i)`): one entry per
+    /// binding of the layout, in any order. A layout holds the bindings of
+    /// group i that the pipeline's own entry points use, through their
+    /// calls (WebGPU's `layout: "auto"`): one only another entry point of
+    /// the module uses is not in it, nor one declared and never used.
+    pub fn bind_group(&self, layout: BindLayout, entries: &[BindEntry<'_>]) -> BindGroup
+        requires layout_fit(layout, entries) < 0 || layout.count != 0
+        else "gpu.layout: the layout of group {} has no bindings: the pipeline's own entry points use no binding of group {}, and the bind group has {} entries: bind nothing for this group, or use the bindings in the shader", layout.group, layout.group, entries.len()
+        requires layout_fit(layout, entries) < 0 || layout.count != 1
+        else "gpu.layout: the layout has 1 binding, {}, and binding {} of the bind group does not fit it: a layout is the bindings the pipeline's own entry points use, through their calls (one only another entry point of the module uses is not in it, nor one declared and never used): give one entry for each", layout_at(layout, 0), layout_fit(layout, entries)
+        requires layout_fit(layout, entries) < 0 || layout.count != 2
+        else "gpu.layout: the layout has 2 bindings, {} and {}, and binding {} of the bind group does not fit them: a layout is the bindings the pipeline's own entry points use, through their calls (one only another entry point of the module uses is not in it, nor one declared and never used): give one entry for each", layout_at(layout, 0), layout_at(layout, 1), layout_fit(layout, entries)
+        requires layout_fit(layout, entries) < 0 || layout.count != 3
+        else "gpu.layout: the layout has 3 bindings, {}, {} and {}, and the bind group does not fit them: a layout is the bindings the pipeline's own entry points use, through their calls (one only another entry point of the module uses is not in it, nor one declared and never used): give one entry for each", layout_at(layout, 0), layout_at(layout, 1), layout_at(layout, 2)
+        requires layout_fit(layout, entries) < 0
+        else "gpu.layout: the layout has {} bindings, the first {} (all: pipe.bind_layout(g).entries[i].binding), and binding {} of the bind group does not fit them: a layout is the bindings the pipeline's own entry points use, through their calls (one only another entry point of the module uses is not in it, nor one declared and never used): give one entry for each", layout.count, layout_at(layout, 0), layout_fit(layout, entries)
+        requires bind_fault(layout, entries, self.limits, BF_KIND) < 0
+        else "gpu.layout: the resource at binding {} is not of the shader's kind there: gpu::bind (a buffer) for var<uniform> and var<storage>, gpu::bind_texture for a texture, gpu::bind_sampler for a sampler", bind_fault(layout, entries, self.limits, BF_KIND)
+        requires bind_fault(layout, entries, self.limits, BF_UNIFORM) < 0
+        else "gpu.usage: the buffer at binding {} is a var<uniform> in the shader and was made without BufferUsage::UNIFORM", bind_fault(layout, entries, self.limits, BF_UNIFORM)
+        requires bind_fault(layout, entries, self.limits, BF_STORAGE) < 0
+        else "gpu.usage: the buffer at binding {} is a var<storage> in the shader and was made without BufferUsage::STORAGE", bind_fault(layout, entries, self.limits, BF_STORAGE)
+        requires bind_fault(layout, entries, self.limits, BF_MAPPED) < 0
+        else "gpu.state: the buffer at binding {} is mapped: unmap it first",
+
+    bind_fault(layout, entries, self.limits, BF_MAPPED)
+        requires bind_fault(layout, entries, self.limits, BF_ALIGN) < 0
+        else "gpu.align: the offset at binding {} is not a multiple of the device's alignment (dev.align_uniform(n))", bind_fault(layout, entries, self.limits, BF_ALIGN)
+        requires bind_fault(layout, entries, self.limits, BF_RANGE) < 0
+        else "gpu.range: the range at binding {} reaches past its buffer, or is smaller than the shader's type there", bind_fault(layout, entries, self.limits, BF_RANGE)
+        requires bind_fault(layout, entries, self.limits, BF_TEXTURE) < 0
+        else "gpu.usage: the texture at binding {} was made without TextureUsage::TEXTURE_BINDING (sampled) or STORAGE_BINDING (a storage texture), as the shader uses it", bind_fault(layout, entries, self.limits, BF_TEXTURE)
+        requires bind_fault(layout, entries, self.limits, BF_SAMPLER) < 0
+        else "gpu.layout: the sampler at binding {} is a comparison sampler where the shader has a plain one, or the reverse (SamplerDesc's compare)", bind_fault(layout, entries, self.limits, BF_SAMPLER)
+        {
+        let mut g = N::bind_group_new(&self.raw);
+        let mut bytes = GroupBytes::new();
+        let mut unwritten = Unwritten::new();
+        for k in 0..layout.count {
+            let b = layout.entries[k as usize];
+            for &e in entries {
+                if e.binding != b.binding { continue; }
+                match e.res {
+                    Resource::Buffer(buf, offset, size) => {
+                        let n = if size < 0 { buf.size - offset } else { size };
+                        N::bind_group_buffer(&mut g, b, &buf.raw, offset, n);
+                        if buf.usage & BufferUsage::UNIFORM != 0 {
+                            if b.ty == BindingType::Uniform && !buf.written
+                                && buf.usage & BufferUsage::MAP_WRITE == 0 {
+                                // (one mapped for writing may be written after this)
+                                unwritten.read(buffer_id(buf), layout.group, b.binding, buf.size);
+                            } else if b.ty == BindingType::Storage {
+                                unwritten.wrote(buffer_id(buf));
+                            }
+                        }
+                        // (at most 16 bindings in a layout, each given once)
+                        bytes.binding[bytes.count as usize] = b.binding;
+                        bytes.bytes[bytes.count as usize] = n;
+                        bytes.count += 1;
+                    }
+                    Resource::Texture(v) => N::bind_group_texture(&mut g, b, &v.raw),
+                    Resource::Sampler(s) => N::bind_group_sampler(&mut g, b, &s.raw),
+                }
+            }
+        }
+        BindGroup { raw: g, key: layout.key, bytes: bytes, unwritten: unwritten }
+    }
+
+    /// A command encoder.
+    pub fn encoder(&self) -> Encoder<Gpa> {
+        Encoder {
+            raw: N::begin(&self.raw), limits: self.limits, caps: self.caps,
+            unwritten: Unwritten::new(), maps: Vec::new_in(self.gpa),
+            dev: self.raw.clone(), segs: Vec::new_in(self.gpa), stamps: Vec::new_in(self.gpa),
+            resolve_next: false,
+        }
+    }
+
+    /// Waits until the GPU has finished everything submitted.
+    pub fn wait_idle(&self) {
+        N::device_wait_idle(&self.raw);
+    }
+}
+
+impl Queue {
+    /// Submits recorded commands; they run after everything submitted
+    /// before. A uniform buffer they read must have been written first
+    /// (gpu.unwritten): by write_buffer, by commands submitted before or
+    /// these, or made with its bytes (buffer_init). A buffer they copy
+    /// into or from is not mapped (gpu.state): one mapped after the copy
+    /// was recorded is unmapped first.
+    pub fn submit(&mut self, cmds: Commands<Gpa>)
+        requires self.lost
+        || unwritten_fault(&self.written[0..self.nwritten as usize], cmds.unwritten, 0) < 0
+        else "gpu.unwritten: binding {} of group {} (a uniform buffer of {} bytes) was never written: write it (queue.write_buffer) before submitting the first dispatch or draw that reads it (dev.buffer's zeros are not a value; dev.buffer_init makes a buffer with its bytes)", unwritten_fault(&self.written[0..self.nwritten as usize], cmds.unwritten, 2), unwritten_fault(&self.written[0..self.nwritten as usize], cmds.unwritten, 1), unwritten_fault(&self.written[0..self.nwritten as usize], cmds.unwritten, 3)
+        requires map_fault(cmds.maps.as_slice(), hal::MAPPED_READ, 0) < 0
+        else "gpu.state: these commands copy into a buffer of {} bytes that was mapped (map_read) after the copy was recorded: the copy would change its view. Unmap it (buf.unmap(dev)) when its view is done, or read a copy (map_read_copy_in)", map_fault(cmds.maps.as_slice(), hal::MAPPED_READ, 1)
+        requires map_fault(cmds.maps.as_slice(), hal::MAPPED_WRITE, 0) < 0
+        else "gpu.state: these commands copy from a buffer of {} bytes that was mapped for writing (map_write) after the copy was recorded: unmap it (buf.unmap(dev)) before submitting, which sends what was written", map_fault(cmds.maps.as_slice(), hal::MAPPED_WRITE, 1)
+        {
+        let mut c = cmds;
+        if c.unwritten.lost {
+            self.lost = true;
+        }
+        for i in 0..c.unwritten.fills {
+            self.wrote(c.unwritten.fill[i as usize]);
+        }
+        if c.segs.len() as i64 > 0 || c.resolve_next {
+            // (0.25.4) timed passes or resolves (timing.vl)
+            timing::submit_segments(&mut self.raw, &mut c);
+        } else {
+            N::submit(&mut self.raw, &mut c.raw);
+        }
+    }
+
+    // A uniform buffer has been written (its id, once).
+    fn wrote(&mut self, id: u64) {
+        for i in 0..self.nwritten {
+            if self.written[i as usize] == id { return; }
+        }
+        if self.nwritten < 256 {
+            self.written[self.nwritten as usize] = id;
+            self.nwritten += 1;
+        } else {
+            self.lost = true;
+        }
+    }
+
+    /// Writes bytes into buf at offset, before the commands submitted next
+    /// run (and after the ones submitted before).
+    pub fn write_buffer(&mut self, buf: &Buffer, offset: i64, bytes: &[u8])
+        requires buf.usage & BufferUsage::COPY_DST != 0
+        else "gpu.usage: write_buffer's buffer ({} bytes) was made without BufferUsage::COPY_DST: add it where that buffer is made", buf.size
+        requires offset % 4 == 0 && bytes.len() % 4 == 0
+        else "gpu.align: write_buffer's offset and size are multiples of 4"
+        requires offset >= 0 && offset + bytes.len() as i64 <= buf.size
+        else "gpu.range: write_buffer reaches past the buffer"
+        requires !buf.mapped
+        else "gpu.state: write_buffer's buffer ({} bytes) is mapped (map_read): the write would change its view. Unmap it (buf.unmap(dev)) when its view is done, or read a copy (map_read_copy_in)", buf.size
+        {
+        if buf.usage & BufferUsage::UNIFORM != 0 && !buf.written {
+            self.wrote(buffer_id(buf));
+        }
+        N::write_buffer(&mut self.raw, &buf.raw, offset, bytes);
+    }
+
+    /// Writes rows of texels into layer `layer` of tex at (x, y): h rows of
+    /// bytes_per_row bytes each, w texels used of each row.
+    pub fn write_texture(&mut self, tex: &Texture, bytes: &[u8], bytes_per_row: i64,
+        x: i64 = 0, y: i64 = 0, w: i64 = -1, h: i64 = -1, layer: i64 = 0)
+        requires tex.desc.usage & TextureUsage::COPY_DST != 0
+        else "gpu.usage: write_texture needs COPY_DST"
+        requires layer >= 0 && layer < tex.desc.layers else "gpu.range: no such layer"
+    {
+        let ww = if w < 0 { tex.desc.width - x } else { w };
+        let hh = if h < 0 { tex.desc.height - y } else { h };
+        assert(x >= 0 && y >= 0 && ww >= 1 && hh >= 1 && x + ww <= tex.desc.width
+            && y + hh <= tex.desc.height, "gpu.range: the region is outside the texture");
+        assert(bytes_per_row >= ww * tex.desc.format.size(),
+            "gpu.range: bytes_per_row is shorter than a row");
+        assert(bytes.len() as i64 >= bytes_per_row * (hh - 1) + ww * tex.desc.format.size(),
+            "gpu.range: fewer bytes than the region");
+        N::write_texture(&mut self.raw, &tex.raw, layer, x, y, ww, hh, bytes, bytes_per_row);
+    }
+
+    /// Waits until everything submitted has finished.
+    pub fn wait_idle(&mut self) -> Result<(), Error<Gpa>> {
+        if N::queue_wait_idle(&mut self.raw) { Ok(()) } else { Err(Error::Submission) }
+    }
+}
+
+// ---- GPU: buffers, textures, samplers, shaders (0.22) ----
+
+pub struct Buffer {
+    pub raw: backend::Buffer,
+    pub size: i64,
+    pub usage: u32,
+    /// Mapped by map_read or map_write, until unmap (the native buffer
+    /// holds the same, for the commands recorded before: Queue::submit).
+    pub mapped: bool,
+    /// Made with its bytes (buffer_init) or mapped for writing: gpu.unwritten
+    /// never reports it.
+    pub written: bool,
+}
+
+impl Buffer {
+    pub fn size(&self) -> i64 {
+        self.size
+    }
+
+    pub fn usage(&self) -> u32 {
+        self.usage
+    }
+
+    /// The buffer's bytes once the GPU has finished every submitted
+    /// command (it waits): a view of the buffer, which cannot be used
+    /// while the view is. The buffer stays mapped until `unmap(dev)`:
+    /// until then nothing writes it (a copy into it is gpu.state, when it
+    /// is recorded or, recorded before map_read, when it is submitted), so
+    /// the view never changes; unmap takes the buffer as `inout`, so not
+    /// while a view of it lives. The view lives no longer than the
+    /// buffer: a function may return it when the buffer is its caller's
+    /// (an inout or let parameter), not when the buffer is its own local;
+    /// then return a copy, `map_read_copy_in(dev, gpa)`.
+    pub fn map_read(&mut self, dev: &Device<Gpa>) -> &[u8]
+        requires self.usage & BufferUsage::MAP_READ != 0
+        else "gpu.usage: map_read's buffer ({} bytes) was made without BufferUsage::MAP_READ: add it where the buffer is made", self.size
+        {
+        N::device_wait_idle(&dev.raw);
+        self.mapped = true;
+        N::map_read(&dev.raw, &mut self.raw)
+    }
+
+    /// The buffer's bytes, as map_read, copied into a new Vec on
+    /// allocator a: they outlive the buffer (return them from the function
+    /// that made it). It maps, copies and unmaps: the buffer is not mapped
+    /// afterwards. `gpu::f32s(v.as_slice())` views them as f32s.
+    pub fn map_read_copy_in<A: Allocator>(&mut self, dev: &Device<Gpa>, a: A) -> Vec<u8, A>
+        requires self.usage & BufferUsage::MAP_READ != 0
+        else "gpu.usage: map_read_copy_in's buffer ({} bytes) was made without BufferUsage::MAP_READ: add it where the buffer is made", self.size
+        {
+        N::device_wait_idle(&dev.raw);
+        let mut out: Vec<u8, A> = Vec::with_capacity_in(self.size as usize, a);
+        out.extend_from_slice(N::map_read(&dev.raw, &mut self.raw));
+        N::unmap(&dev.raw, &mut self.raw);
+        self.mapped = false;
+        out
+    }
+
+    /// The buffer's bytes to write, once the GPU has finished with it; the
+    /// writes reach the GPU at `unmap`, which must come before the buffer
+    /// is used again.
+    pub fn map_write(&mut self, dev: &Device<Gpa>) -> &mut [u8]
+        requires self.usage & BufferUsage::MAP_WRITE != 0
+        else "gpu.usage: map_write needs MAP_WRITE"
+        {
+        N::device_wait_idle(&dev.raw);
+        self.mapped = true;
+        self.written = true;
+        N::map_write(&dev.raw, &mut self.raw)
+    }
+
+    /// Ends a mapping: after a map_write what was written reaches the GPU;
+    /// after a map_read the buffer can be written again (copies into it,
+    /// write_buffer). Its `inout` self is refused while a view of the
+    /// buffer lives (own.*): the view is done first. Unmapping a buffer
+    /// that is not mapped does nothing.
+    pub fn unmap(&mut self, dev: &Device<Gpa>) {
+        N::unmap(&dev.raw, &mut self.raw);
+        self.mapped = false;
+    }
+}
+
+pub struct Texture {
+    pub raw: backend::Texture,
+    pub desc: TextureDesc,
+}
+
+impl Texture {
+    pub fn width(&self) -> i64 {
+        self.desc.width
+    }
+
+    pub fn height(&self) -> i64 {
+        self.desc.height
+    }
+
+    pub fn format(&self) -> Format {
+        self.desc.format
+    }
+
+    pub fn usage(&self) -> u32 {
+        self.desc.usage
+    }
+
+    /// A view of the whole texture (it keeps the texture alive).
+    pub fn view(&self) -> TextureView {
+        self.view_as(self.desc.format)
+    }
+
+    /// A view reading the texels as another format of the same size
+    /// (Rgba8Unorm as Rgba8UnormSrgb).
+    pub fn view_as(&self, format: Format) -> TextureView
+        requires format.size() == self.desc.format.size()
+        && format.is_depth() == self.desc.format.is_depth()
+        else "gpu.format: a view's format has its texture's texel size"
+        {
+        match N::create_view(&self.raw, format, format == self.desc.format) {
+            Some(v) => TextureView {
+                raw: v, format: format, width: self.desc.width, height: self.desc.height,
+                usage: self.desc.usage,
+            },
+            None => out_of_memory("texture view"),
+        }
+    }
+}
+
+pub struct TextureView {
+    pub raw: backend::TextureView,
+    pub format: Format,
+    pub width: i64,
+    pub height: i64,
+    pub usage: u32,
+}
+
+pub struct Sampler {
+    pub raw: backend::Sampler,
+    pub comparison: bool,
+}
+
+/// An entry point of a Shader, its names copied.
+pub struct ShaderEntry<A: Allocator> {
+    pub name: String<A>,
+    pub native: String<A>,
+    pub stage: u32,
+    pub workgroup: [i64; 3],
+    pub sizes_slot: i64,
+}
+
+pub struct Shader<A: Allocator> {
+    pub raw: backend::Shader,
+    pub entries: Vec<ShaderEntry<A>, A>,
+    pub bindings: Vec<Binding, A>,
+    pub inputs: Vec<VertexInput, A>,
+    pub sizes: Vec<GroupBinding, A>,
+    /// (entry, binding) index pairs: the bindings each entry point uses
+    /// (Reflection::uses; empty: each uses all its stage's).
+    pub uses: Vec<[i64; 2], A>,
+}
+
+impl Shader<Gpa> {
+    /// The entry point of that name and stage (its names view the
+    /// shader's copies).
+    pub fn entry(&self, name: &str, stage: u32) -> Option<EntryPoint<'_>> {
+        for i in 0..self.entries.len() as i64 {
+            if self.entries[i as usize].name.as_str() == name
+                && self.entries[i as usize].stage == stage {
+                return Some(EntryPoint {
+                    name: self.entries[i as usize].name.as_str(),
+                    native: self.entries[i as usize].native.as_str(),
+                    stage: self.entries[i as usize].stage,
+                    workgroup: self.entries[i as usize].workgroup,
+                    sizes_slot: self.entries[i as usize].sizes_slot,
+                });
+            }
+        }
+        None
+    }
+
+    /// The index of the entry point of that name and stage in `entries`;
+    /// -1: none.
+    pub fn entry_index(&self, name: &str, stage: u32) -> i64 {
+        for i in 0..self.entries.len() as i64 {
+            if self.entries[i as usize].name.as_str() == name
+                && self.entries[i as usize].stage == stage {
+                return i;
+            }
+        }
+        -1
+    }
+
+    /// Whether entry point `entry` uses binding `binding` (indices into
+    /// `entries` and `bindings`); with no `uses` (a reflection written by
+    /// hand), every binding its stage has a slot for.
+    pub fn entry_uses(&self, entry: i64, binding: i64) -> bool {
+        if self.uses.len() as i64 == 0 {
+            return true;
+        }
+        for u in self.uses.iter().copied() {
+            if u[0] == entry && u[1] == binding { return true; }
+        }
+        false
+    }
+}
+
+// ---- GPU: bind layouts and groups (0.22) ----
+
+/// The bindings of one group as a pipeline sees them: plain data, kept in
+/// the pipeline (no allocation).
+#[derive(Clone, Copy)] pub struct BindLayout {
+    pub group: i64,
+    pub entries: [Binding; 16],
+    pub count: i64,
+    pub key: u64,
+}
+
+/// A pipeline's layouts, groups 0..MAX_BIND_GROUPS.
+#[derive(Clone, Copy)] pub struct Layouts {
+    pub groups: [BindLayout; 4],
+    pub used: i64,
+}
+
+impl Layouts {
+    fn new() -> Layouts {
+        let none = Binding {
+            group: 0, binding: 0, ty: BindingType::Uniform, slot_vertex: -1, slot_fragment: -1,
+            slot_compute: -1, min_size: 0,
+        };
+        let l = BindLayout { group: 0, entries: [none; 16], count: 0, key: 0 };
+        let mut out = Layouts { groups: [l; 4], used: 0 };
+        for i in 0..MAX_BIND_GROUPS {
+            out.groups[i as usize].group = i;
+        }
+        out
+    }
+
+    /// Adds the bindings the entry point `entry` of `shader` (of stage
+    /// `stage`) uses: a pipeline's layout is its own entry points'
+    /// bindings, not those of the module's other entry points. A binding
+    /// seen from two stages is one entry with both slots.
+    fn merge_stage(&mut self, shader: &Shader<Gpa>, entry: i64, stage: u32) {
+        for bi in 0..shader.bindings.len() as i64 {
+            let b = shader.bindings[bi as usize];
+            if b.visibility() & stage == 0 || !shader.entry_uses(entry, bi) { continue; }
+            assert(b.group >= 0 && b.group < MAX_BIND_GROUPS, "gpu.limits: bind groups 0..3");
+            let gi = b.group;
+            let mut merged = false;
+            for k in 0..self.groups[gi as usize].count {
+                let mut e = self.groups[gi as usize].entries[k as usize];
+                if e.binding == b.binding {
+                    assert(e.ty == b.ty,
+                        "gpu.layout: two stages see one binding as different kinds");
+                    if stage == ShaderStage::VERTEX { e.slot_vertex = b.slot_vertex; }
+                    if stage == ShaderStage::FRAGMENT { e.slot_fragment = b.slot_fragment; }
+                    if stage == ShaderStage::COMPUTE { e.slot_compute = b.slot_compute; }
+                    self.groups[gi as usize].entries[k as usize] = e;
+                    merged = true;
+                }
+            }
+            if !merged {
+                let n = self.groups[gi as usize].count;
+                assert(n < 16, "gpu.limits: 16 bindings a group");
+                let mut e = b;
+                if stage != ShaderStage::VERTEX { e.slot_vertex = -1; }
+                if stage != ShaderStage::FRAGMENT { e.slot_fragment = -1; }
+                if stage != ShaderStage::COMPUTE { e.slot_compute = -1; }
+                self.groups[gi as usize].entries[n as usize] = e;
+                self.groups[gi as usize].count = n + 1;
+            }
+            if gi + 1 > self.used { self.used = gi + 1; }
+        }
+        for i in 0..MAX_BIND_GROUPS {
+            let n = self.groups[i as usize].count;
+            self.groups[i as usize].key = if n == 0 { 0 }
+                else { layout_key(&self.groups[i as usize].entries[0..n as usize]) };
+        }
+    }
+}
+
+/// A resource bound at a binding: a buffer range (size -1: to the end), a
+/// texture view or a sampler.
+#[derive(Clone, Copy)] pub enum Resource<'a> {
+    Buffer(&'a Buffer, i64, i64),
+    Texture(&'a TextureView),
+    Sampler(&'a Sampler),
+}
+
+#[derive(Clone, Copy)] pub struct BindEntry<'a> {
+    pub binding: i64,
+    pub res: Resource<'a>,
+}
+
+/// The whole of a buffer at `binding`.
+pub fn bind(binding: i64, buf: &Buffer) -> BindEntry<'_> {
+    BindEntry { binding: binding, res: Resource::Buffer(buf, 0i64, -1i64) }
+}
+
+/// size bytes of a buffer from offset at `binding`.
+pub fn bind_range(binding: i64, buf: &Buffer, offset: i64, size: i64) -> BindEntry<'_> {
+    BindEntry { binding: binding, res: Resource::Buffer(buf, offset, size) }
+}
+
+pub fn bind_texture(binding: i64, view: &TextureView) -> BindEntry<'_> {
+    BindEntry { binding: binding, res: Resource::Texture(view) }
+}
+
+pub fn bind_sampler(binding: i64, s: &Sampler) -> BindEntry<'_> {
+    BindEntry { binding: binding, res: Resource::Sampler(s) }
+}
+
+/// Resources bound together (the group keeps them alive).
+pub struct BindGroup {
+    pub raw: backend::BindGroup,
+    pub key: u64,
+    bytes: GroupBytes,
+    unwritten: Unwritten,
+}
+
+// Uniform buffers read before written (0.25.2.2; in the bind groups' section):
+
+// A buffer's id in gpu.unwritten's records: its Metal object's address
+// (a freed buffer's may come back: a write to the old one then counts for
+// the new, a miss, never a false error).
+fn buffer_id(b: &Buffer) -> u64 {
+    b.raw.raw.ptr as u64
+}
+
+// What a bind group, a pass, an encoder and its commands record for
+// queue.submit's gpu.unwritten: the uniform buffers they read that may
+// be unwritten (made by dev.buffer: its id, the group and binding it is
+// read at, its size), and the uniform buffers they write (`fill`: a copy
+// into one, one bound as read_write storage). Kept small and plain: 16
+// reads, the rest not checked (a miss, never a false error); 16 writes,
+// the rest `lost` (then the queue checks no more).
+#[derive(Clone, Copy)]
+struct Unwritten {
+    count: i64,
+    id: [u64; 16],
+    group: [i64; 16],
+    binding: [i64; 16],
+    size: [i64; 16],
+    fills: i64,
+    fill: [u64; 16],
+    lost: bool,
+}
+
+impl Unwritten {
+    fn new() -> Unwritten {
+        Unwritten {
+            count: 0, id: [0; 16], group: [0i64; 16], binding: [0i64; 16], size: [0i64; 16],
+            fills: 0,
+            fill: [0; 16], lost: false,
+        }
+    }
+
+    fn read(&mut self, id: u64, group: i64, binding: i64, size: i64) {
+        for i in 0..self.count {
+            if self.id[i as usize] == id { return; }
+        }
+        if self.count < 16 {
+            let n = self.count;
+            self.id[n as usize] = id;
+            self.group[n as usize] = group;
+            self.binding[n as usize] = binding;
+            self.size[n as usize] = size;
+            self.count = n + 1;
+        }
+    }
+
+    fn wrote(&mut self, id: u64) {
+        for i in 0..self.fills {
+            if self.fill[i as usize] == id { return; }
+        }
+        if self.fills < 16 {
+            self.fill[self.fills as usize] = id;
+            self.fills += 1;
+        } else {
+            self.lost = true;
+        }
+    }
+
+    // Adds what `o` records (a bind group set at `group`, or a pass's).
+    fn add(&mut self, o: Unwritten, group: i64) {
+        for i in 0..o.count {
+            self.read(o.id[i as usize], if group >= 0 { group } else { o.group[i as usize] },
+                o.binding[i as usize], o.size[i as usize]);
+        }
+        for i in 0..o.fills {
+            self.wrote(o.fill[i as usize]);
+        }
+        if o.lost { self.lost = true; }
+    }
+}
+
+// The first uniform buffer `u` reads that neither `written` nor u's own
+// writes hold: what = 0 its index, 1 its group, 2 its binding, 3 its size;
+// -1 when there is none.
+fn unwritten_fault(written: &[u64], u: Unwritten, what: i64) -> i64 {
+    for i in 0..u.count {
+        let mut seen = false;
+        for &w in written {
+            if w == u.id[i as usize] { seen = true; }
+        }
+        for k in 0..u.fills {
+            if u.fill[k as usize] == u.id[i as usize] { seen = true; }
+        }
+        if !seen {
+            return if what == 0 { i } else if what == 1 { u.group[i as usize] }
+                else if what == 2 { u.binding[i as usize] } else { u.size[i as usize] };
+        }
+    }
+    -1
+}
+
+// ---- GPU: the sizes buffer (0.22) ----
+
+// The most runtime-sized bindings a stage reads (the sizes buffer's
+// words), and the most buffers a bind group records the bytes of.
+const MAX_SIZES: i64 = 16;
+
+/// A bind group's buffers: each one's binding and the bytes it exposes
+/// (its size minus the offset, or the binding's size).
+#[derive(Clone, Copy)]
+struct GroupBytes {
+    count: i64,
+    binding: [i64; 16],
+    bytes: [i64; 16],
+}
+
+impl GroupBytes {
+    fn new() -> GroupBytes { GroupBytes { count: 0, binding: [0i64; 16], bytes: [0i64; 16] } }
+}
+
+/// What one stage of a pipeline reads in its sizes buffer: the slot (-1:
+/// none) and the (group, binding) of each word (shader::Reflection's sizes).
+#[derive(Clone, Copy)]
+struct StageSizes {
+    slot: i64,
+    count: i64,
+    at: [[i64; 2]; 16],
+}
+
+impl StageSizes {
+    fn none() -> StageSizes { StageSizes { slot: -1, count: 0, at: [[0i64, 0]; 16] } }
+
+    fn of(shader: &Shader<Gpa>, slot: i64) -> StageSizes {
+        let mut out = StageSizes::none();
+        if slot < 0 { return out; }
+        out.slot = slot;
+        out.count = shader.sizes.len() as i64;
+        for i in 0..out.count {
+            out.at[i as usize] = shader.sizes[i as usize];
+        }
+        out
+    }
+
+    /// The words (wgsl::sizes_words's rule): the bytes bound at each
+    /// (group, binding), 0 when nothing is bound there, at most u32's
+    /// largest; how many.
+    fn words(self, groups: [GroupBytes; 4], out: &mut [u32; 16]) -> i64 {
+        for i in 0..self.count {
+            let g = self.at[i as usize][0];
+            let b = self.at[i as usize][1];
+            let mut n: i64 = 0;
+            if g >= 0 && g < MAX_BIND_GROUPS {
+                for k in 0..groups[g as usize].count {
+                    if groups[g as usize].binding[k as usize]
+                        == b { n = groups[g as usize].bytes[k as usize]; }
+                }
+            }
+            out[i as usize] = if n < 0 { 0 } else if n > 4294967295 { 4294967295u32 }
+                else { n as u32 };
+        }
+        self.count
+    }
+}
+
+// ---- GPU: pipelines (0.22) ----
+
+pub struct ComputePipeline {
+    pub raw: backend::ComputePipeline,
+    pub layouts: Layouts,
+    pub workgroup: [i64; 3],
+    sizes: StageSizes,
+}
+
+impl ComputePipeline {
+    /// The layout of group i, for `dev.bind_group`.
+    pub fn bind_layout(&self, i: i64) -> BindLayout
+        requires i >= 0 && i < MAX_BIND_GROUPS else "gpu.limits: bind groups 0..3"
+    {
+        self.layouts.groups[i as usize]
+    }
+}
+
+pub struct RenderPipeline {
+    pub raw: backend::RenderPipeline,
+    pub layouts: Layouts,
+    pub state: PipelineState,
+    vs_sizes: StageSizes,
+    fs_sizes: StageSizes,
+}
+
+impl RenderPipeline {
+    pub fn bind_layout(&self, i: i64) -> BindLayout
+        requires i >= 0 && i < MAX_BIND_GROUPS else "gpu.limits: bind groups 0..3"
+    {
+        self.layouts.groups[i as usize]
+    }
+}
+
+/// A render pipeline's description: shaders and entry points, then the
+/// fixed-function state (PipelineState) with its builder methods.
+#[derive(Clone, Copy)] pub struct RenderDesc<'a, A: Allocator> {
+    pub vertex: &'a Shader<A>,
+    pub vs: &'a str,
+    pub fragment: &'a Shader<A>,
+    pub fs: &'a str,
+    pub has_fs: bool,
+    pub state: PipelineState,
+}
+
+impl<'a> RenderDesc<'a, Gpa> {
+    /// Vertex entry `vs` and fragment entry `fs` of one shader, drawing
+    /// into one target of `format`.
+    pub fn new(shader: &'a Shader<Gpa>, vs: &'a str, fs: &'a str, format: Format) -> RenderDesc<'a,
+        Gpa> {
+        RenderDesc {
+            vertex: shader, vs: vs, fragment: shader, fs: fs, has_fs: true,
+            state: PipelineState::new(format),
+        }
+    }
+
+    /// A depth-only pipeline (a shadow map): the vertex entry `vs`, no
+    /// fragment stage, no color target, a depth test of `format` that
+    /// writes. It draws in a `PassDesc::depth_only` pass.
+    pub fn depth_only(shader: &'a Shader<Gpa>, vs: &'a str, format: Format = Format::Depth32Float,
+        compare: Compare = Compare::Less) -> RenderDesc<'a, Gpa> {
+        let mut d = RenderDesc {
+            vertex: shader, vs: vs, fragment: shader, fs: "", has_fs: false,
+            state: PipelineState::new(Format::Rgba8Unorm),
+        };
+        d.state.target_count = 0;
+        d.state.depth = Some(DepthState { format: format, write: true, compare: compare });
+        d
+    }
+
+    /// No fragment stage and no color target (depth only; with
+    /// `.depth(..)`, or use `RenderDesc::depth_only`).
+    pub fn no_fragment(&mut self) {
+        self.has_fs = false;
+        self.state.target_count = 0;
+    }
+
+    /// A vertex buffer's layout, at the next slot.
+    pub fn vertex_buffer(&mut self, layout: VertexLayout)
+        requires self.state.buffer_count < MAX_VERTEX_BUFFERS
+        else "gpu.limits: at most 8 vertex buffers"
+        {
+        self.state.buffers[self.state.buffer_count as usize] = layout;
+        self.state.buffer_count += 1;
+    }
+
+    /// Blending for target i (0: the first).
+    pub fn blend(&mut self, blend: Blend, target: i64 = 0)
+        requires target >= 0 && target < self.state.target_count
+        else "gpu.range: no such color target"
+        {
+        self.state.targets[target as usize].blend = Some(blend);
+    }
+
+    /// Another color target.
+    pub fn target(&mut self, format: Format)
+        requires self.state.target_count < MAX_COLOR_TARGETS
+        else "gpu.limits: at most 8 color targets"
+        {
+        self.state.targets[self.state.target_count as usize] = ColorTarget {
+            format: format, blend: None, write_mask: 15,
+        };
+        self.state.target_count += 1;
+    }
+
+    pub fn depth(&mut self, format: Format = Format::Depth32Float,
+        compare: Compare = Compare::Less, write: bool = true) {
+        self.state.depth = Some(DepthState { format: format, write: write, compare: compare });
+    }
+
+    pub fn topology(&mut self, t: Topology) {
+        self.state.topology = t;
+    }
+
+    pub fn cull(&mut self, c: Cull, front: FrontFace = FrontFace::Ccw) {
+        self.state.cull = c;
+        self.state.front_face = front;
+    }
+}
+
+// ---- GPU: encoders and passes (0.22) ----
+
+pub struct Encoder<A: Allocator> {
+    pub raw: backend::CommandBuffer,
+    pub limits: Limits,
+    pub caps: Caps,
+    unwritten: Unwritten,
+    // (0.25.3) the mappable buffers the commands use (copies: the only
+    // way the GPU reaches one, map_usage_fault), a handle of each, for
+    // submit's gpu.state; on the device's allocator, from the first
+    maps: Vec<backend::Buffer, A>,
+    // (0.25.4) timing (timing.vl): the device, for a new command buffer;
+    // the command buffers ended before a timed pass, by it and before a
+    // resolve; the timestamps written; the current one resolves
+    dev: backend::Device,
+    segs: Vec<timing::Seg, A>,
+    stamps: Vec<timing::Stamp, A>,
+    resolve_next: bool,
+}
+
+/// Recorded commands, for `queue.submit` (dropped unsubmitted: discarded).
+pub struct Commands<A: Allocator> {
+    pub raw: backend::CommandBuffer,
+    unwritten: Unwritten,
+    maps: Vec<backend::Buffer, A>,
+    // (0.25.4) the encoder's split command buffers and timestamps
+    segs: Vec<timing::Seg, A>,
+    stamps: Vec<timing::Stamp, A>,
+    resolve_next: bool,
+}
+
+// (0.25.3) The first buffer of `maps` (the mappable buffers recorded
+// commands use) whose map state is `state` (hal::MAPPED_READ,
+// MAPPED_WRITE) now: what = 0 its index, 1 its size; -1 when none is.
+fn map_fault(maps: &[backend::Buffer], state: i64, what: i64) -> i64 {
+    for i in 0..maps.len() {
+        if N::map_state(&maps[i]) == state {
+            return if what == 0 { i as i64 } else { maps[i].size };
+        }
+    }
+    -1
+}
+
+/// The bind group keys a pass has bound, against a pipeline's layouts.
+#[derive(Clone, Copy)] struct Bindings {
+    bound: [u64; 4],
+    want: [u64; 4],
+    used: i64,
+    has_pipeline: bool,
+}
+
+impl Bindings {
+    fn new() -> Bindings {
+        Bindings { bound: [0, 0, 0, 0], want: [0, 0, 0, 0], used: 0, has_pipeline: false }
+    }
+
+    fn set_pipeline(&mut self, l: Layouts) {
+        self.has_pipeline = true;
+        self.used = l.used;
+        for i in 0..MAX_BIND_GROUPS {
+            self.want[i as usize] = l.groups[i as usize].key;
+        }
+    }
+
+    fn set_group(&mut self, i: i64, key: u64)
+        requires i >= 0 && i < MAX_BIND_GROUPS else "gpu.limits: bind groups 0..3"
+    {
+        assert(!self.has_pipeline || self.want[i as usize] == 0 || self.want[i as usize] == key, "gpu.layout: the bind group was made for another layout (make it from pipe.bind_layout(i))");
+        self.bound[i as usize] = key;
+    }
+
+    /// Before a draw or dispatch: a pipeline, and a matching group for each
+    /// group it uses.
+    fn ready(self) {
+        assert(self.has_pipeline, "gpu.pipeline: set a pipeline before drawing or dispatching");
+        for i in 0..self.used {
+            assert(self.want[i as usize] == 0 || self.bound[i as usize] == self.want[i as usize],
+                "gpu.pipeline: a bind group the pipeline uses is not set (pass.set_bind_group)");
+        }
+    }
+}
+
+pub struct ComputePass {
+    raw: backend::ComputeEncoder,
+    binds: Bindings,
+    max_groups: i64,
+    // the sizes buffer: the pipeline's, and the bound groups' bytes
+    sizes: StageSizes,
+    groups: [GroupBytes; 4],
+    unwritten: Unwritten,
+}
+
+impl ComputePass {
+    pub fn set_pipeline(&mut self, p: &ComputePipeline) {
+        self.binds.set_pipeline(p.layouts);
+        self.sizes = p.sizes;
+        N::compute_set_pipeline(&mut self.raw, &p.raw);
+    }
+
+    pub fn set_bind_group(&mut self, i: i64, g: &BindGroup) {
+        self.binds.set_group(i, g.key);
+        self.groups[i as usize] = g.bytes;
+        if g.unwritten.count > 0 || g.unwritten.fills > 0 {
+            self.unwritten.add(g.unwritten, i);
+        }
+        N::compute_set_bind_group(&mut self.raw, &g.raw);
+    }
+
+    /// x * y * z workgroups of the pipeline's workgroup size.
+    pub fn dispatch(&mut self, x: i64, y: i64 = 1, z: i64 = 1)
+        requires x >= 0 && y >= 0 && z >= 0
+        else "gpu.range: dispatch({x}, {y}, {z}): a count of workgroups is 0 or more"
+        requires x <= self.max_groups && y <= self.max_groups && z <= self.max_groups
+        else "gpu.limits: a dispatch of {} workgroups in one dimension; at most {} (dev.limits().max_compute_workgroups_per_dimension, the device's own, which device(lim) cannot raise): give the kernel a larger @workgroup_size, or spread the work over y and z (dispatch(x, y, z), the index from global_invocation_id.y and .z)", largest(x, y, z), self.max_groups
+        {
+        self.binds.ready();
+        if x == 0 || y == 0 || z == 0 { return; }
+        if self.sizes.slot >= 0 {
+            let mut words: [u32; 16] = [0; 16];
+            let n = self.sizes.words(self.groups, &mut words);
+            N::compute_set_bytes(&mut self.raw, bytes_of_u32(&words[0..n as usize]),
+                self.sizes.slot);
+        }
+        N::dispatch(&mut self.raw, x, y, z);
+    }
+}
+
+// The largest of a dispatch's counts (gpu.limits' message: a contract's
+// message holds three values at most).
+fn largest(x: i64, y: i64, z: i64) -> i64 {
+    if x >= y && x >= z { x } else if y >= z { y } else { z }
+}
+
+/// A color attachment of a render pass.
+#[derive(Clone, Copy)] pub struct ColorAttachment<'a> {
+    pub view: &'a TextureView,
+    pub load: Load,
+    pub clear: Color,
+    pub store: bool,
+}
+
+#[derive(Clone, Copy)] pub struct DepthAttachment<'a> {
+    pub view: &'a TextureView,
+    pub load: Load,
+    pub clear: f64,
+    pub store: bool,
+}
+
+/// A render pass's attachments: color attachments 0..color_count (at
+/// most 8, `@location(i)` of the fragment shader writes the i-th), and
+/// maybe a depth one. A pass has at least one of them: a depth-only pass
+/// (a shadow map) has no color attachment (0.25.2.1).
+#[derive(Clone, Copy)] pub struct PassDesc<'a> {
+    pub colors: [Option<ColorAttachment<'a>>; 8],
+    pub color_count: i64,
+    pub depth: Option<DepthAttachment<'a>>,
+}
+
+impl<'a> PassDesc<'a> {
+    /// One color attachment, cleared to `clear` (or kept: load =
+    /// Load::Keep) and stored; `.with_color` adds more.
+    pub fn color(view: &'a TextureView, clear: Color = Color::black(), load: Load = Load::Clear) -> PassDesc<'a> {
+        let mut colors: [Option<ColorAttachment<'_>>; 8] = [None; 8];
+        colors[0] = Some(ColorAttachment { view: view, load: load, clear: clear, store: true });
+        PassDesc { colors: colors, color_count: 1, depth: None }
+    }
+
+    /// No color attachment, only depth: a shadow map's pass, drawn with a
+    /// `RenderDesc::depth_only` pipeline. Stored by default, to be read
+    /// afterwards.
+    pub fn depth_only(view: &'a TextureView, clear: f64 = 1.0, store: bool = true) -> PassDesc<'a> {
+        PassDesc {
+            colors: [None; 8], color_count: 0,
+            depth: Some(DepthAttachment {
+                view: view, load: Load::Clear, clear: clear, store: store,
+            }),
+        }
+    }
+
+    /// Another color attachment, after the ones there: multiple render
+    /// targets (a G-buffer), `PassDesc::color(albedo).with_color(normal)`;
+    /// the fragment shader's `@location(i)` writes the i-th, and the
+    /// pipeline has a target of the same format for each
+    /// (`RenderDesc::target`).
+    pub fn with_color(self, view: &'a TextureView, clear: Color = Color::black(),
+        load: Load = Load::Clear) -> PassDesc<'a>
+        requires self.color_count < MAX_COLOR_TARGETS
+        else "gpu.limits: a pass has at most 8 color attachments; this one has {}", self.color_count
+        {
+        let mut d = self;
+        d.colors[d.color_count as usize] = Some(ColorAttachment {
+            view: view, load: load, clear: clear, store: true,
+        });
+        d.color_count += 1;
+        d
+    }
+
+    pub fn with_depth(self, view: &'a TextureView, clear: f64 = 1.0, store: bool = false) -> PassDesc<'a> {
+        let mut d = self;
+        d.depth = Some(DepthAttachment {
+            view: view, load: Load::Clear, clear: clear, store: store,
+        });
+        d
+    }
+}
+
+// What render_pass checks of a PassDesc's color attachments (the index of
+// the first one that breaks the rule, -1: none): 0, without
+// RENDER_ATTACHMENT; 1, not a renderable color format; 2, of another size
+// than the first attachment (color, else depth).
+fn color_fault(desc: PassDesc<'_>, rule: i64) -> i64 {
+    let mut w: i64 = -1;
+    let mut h: i64 = -1;
+    for i in 0..desc.color_count {
+        match desc.colors[i as usize] {
+            Some(c) => {
+                let v = c.view;
+                if rule == 0 && v.usage & TextureUsage::RENDER_ATTACHMENT == 0 { return i; }
+                if rule == 1 && (!v.format.is_renderable() || v.format.is_depth()) { return i; }
+                if w < 0 {
+                    w = v.width;
+                    h = v.height;
+                }
+                if rule == 2 && (v.width != w || v.height != h) { return i; }
+            }
+            None => {}
+        }
+    }
+    -1
+}
+
+// What render_pass checks of the depth attachment: 1, no
+// RENDER_ATTACHMENT; 2, not a depth format; 3, not the color
+// attachments' size; 0, none (or no depth attachment).
+fn depth_attachment_fault(desc: PassDesc<'_>) -> i64 {
+    match desc.depth {
+        Some(d) => {
+            if d.view.usage & TextureUsage::RENDER_ATTACHMENT == 0 { return 1; }
+            if !d.view.format.is_depth() { return 2; }
+            if d.view.width != pass_side(desc, false) || d.view.height != pass_side(desc, true) {
+                return 3;
+            }
+            0
+        }
+        None => 0,
+    }
+}
+
+// The width (or height, `height`) of a pass's attachments: the first
+// color one's, else the depth one's.
+fn pass_side(desc: PassDesc<'_>, height: bool) -> i64 {
+    if desc.color_count > 0 {
+        match desc.colors[0] {
+            Some(c) => return if height { c.view.height } else { c.view.width },
+            None => {}
+        }
+    }
+    match desc.depth {
+        Some(d) => if height { d.view.height } else { d.view.width },
+        None => 0,
+    }
+}
+
+pub struct RenderPass {
+    raw: backend::RenderEncoder,
+    binds: Bindings,
+    // the color attachments' formats, 0..color_count
+    formats: [Format; 8],
+    color_count: i64,
+    depth: Option<Format>,
+    width: i64,
+    height: i64,
+    // per vertex buffer slot: the bytes after its offset (-1: none)
+    vertex_bytes: [i64; 8],
+    index_bytes: i64,
+    index_size: i64,
+    strides: [i64; 8],
+    steps: [StepMode; 8],
+    buffer_count: i64,
+    // the sizes buffers: the pipeline's per stage, the bound groups' bytes
+    vs_sizes: StageSizes,
+    fs_sizes: StageSizes,
+    groups: [GroupBytes; 4],
+    unwritten: Unwritten,
+}
+
+// The first color target of a pipeline whose format differs from the
+// pass's attachment at that index (-1: none; the counts are checked
+// first).
+fn target_fault(formats: [Format; 8], count: i64, st: PipelineState) -> i64 {
+    for i in 0..count {
+        if i < st.target_count && st.targets[i as usize].format != formats[i as usize] { return i; }
+    }
+    -1
+}
+
+// 1 when the pipeline has a depth state the pass has no attachment for,
+// 2 when the formats differ, 0 when they fit.
+fn depth_fault(pass_depth: Option<Format>, st: PipelineState) -> i64 {
+    match st.depth {
+        Some(d) => match pass_depth {
+            Some(f) => if f == d.format { 0 } else { 2 },
+            None => 1,
+        },
+        None => 0,
+    }
+}
+
+impl RenderPass {
+    /// The pipeline must fit the pass: a color target for each color
+    /// attachment, of its format and in its order, and a depth state of
+    /// the depth attachment's format when it tests depth.
+    pub fn set_pipeline(&mut self, p: &RenderPipeline)
+        requires p.state.target_count == self.color_count
+        else "gpu.format: the pipeline has {} color targets and the pass {} color attachments: give the pipeline one target per attachment, in order (RenderDesc::new's format, then desc.target(format); none: RenderDesc::depth_only), or the pass one attachment per target (PassDesc::color(view).with_color(view2))", p.state.target_count, self.color_count
+        requires target_fault(self.formats, self.color_count, p.state) < 0
+        else "gpu.format: the pipeline's color target {} has another format than the pass's color attachment {}: the target's format (RenderDesc::new, desc.target) is the texture's (dev.texture)", target_fault(self.formats, self.color_count, p.state), target_fault(self.formats, self.color_count, p.state)
+        requires depth_fault(self.depth, p.state) != 1
+        else "gpu.format: the pipeline tests depth (desc.depth) and the pass has no depth attachment: add one (.with_depth(view)), or drop the pipeline's depth state"
+        requires depth_fault(self.depth, p.state) != 2
+        else "gpu.format: the pipeline's depth format differs from the pass's depth attachment"
+        {
+        let st = p.state;
+        self.binds.set_pipeline(p.layouts);
+        self.vs_sizes = p.vs_sizes;
+        self.fs_sizes = p.fs_sizes;
+        self.buffer_count = st.buffer_count;
+        for i in 0..st.buffer_count {
+            self.strides[i as usize] = st.buffers[i as usize].stride;
+            self.steps[i as usize] = st.buffers[i as usize].step;
+        }
+        N::render_set_pipeline(&mut self.raw, &p.raw);
+    }
+
+    pub fn set_bind_group(&mut self, i: i64, g: &BindGroup) {
+        self.binds.set_group(i, g.key);
+        self.groups[i as usize] = g.bytes;
+        if g.unwritten.count > 0 || g.unwritten.fills > 0 {
+            self.unwritten.add(g.unwritten, i);
+        }
+        N::render_set_bind_group(&mut self.raw, &g.raw);
+    }
+
+    // Before a draw: each stage's sizes buffer, when it reads one.
+    fn set_sizes(&mut self) {
+        let mut words: [u32; 16] = [0; 16];
+        if self.vs_sizes.slot >= 0 {
+            let n = self.vs_sizes.words(self.groups, &mut words);
+            N::render_set_bytes(&mut self.raw, ShaderStage::VERTEX,
+                bytes_of_u32(&words[0..n as usize]), self.vs_sizes.slot);
+        }
+        if self.fs_sizes.slot >= 0 {
+            let n = self.fs_sizes.words(self.groups, &mut words);
+            N::render_set_bytes(&mut self.raw, ShaderStage::FRAGMENT,
+                bytes_of_u32(&words[0..n as usize]), self.fs_sizes.slot);
+        }
+    }
+
+    pub fn set_vertex_buffer(&mut self, slot: i64, buf: &Buffer, offset: i64 = 0)
+        requires slot >= 0 && slot < MAX_VERTEX_BUFFERS else "gpu.limits: vertex buffer slots 0..7"
+        requires buf.usage & BufferUsage::VERTEX != 0
+        else "gpu.usage: set_vertex_buffer needs VERTEX"
+        requires offset % 4 == 0 else "gpu.align: a vertex buffer's offset is a multiple of 4"
+        requires offset >= 0 && offset <= buf.size else "gpu.range: the offset is past the buffer"
+        requires !buf.mapped else "gpu.state: the buffer is mapped: unmap it first"
+    {
+        self.vertex_bytes[slot as usize] = buf.size - offset;
+        N::render_set_vertex_buffer(&mut self.raw, slot, &buf.raw, offset);
+    }
+
+    pub fn set_index_buffer(&mut self, buf: &Buffer, format: IndexFormat,
+        offset: i64 = 0)
+        requires buf.usage & BufferUsage::INDEX != 0 else "gpu.usage: set_index_buffer needs INDEX"
+        requires offset % format.size() == 0
+        else "gpu.align: an index buffer's offset is a multiple of the index size"
+        requires offset >= 0 && offset <= buf.size else "gpu.range: the offset is past the buffer"
+    {
+        self.index_bytes = buf.size - offset;
+        self.index_size = format.size();
+        N::render_set_index_buffer(&mut self.raw, &buf.raw, format, offset);
+    }
+
+    pub fn set_viewport(&mut self, x: f32, y: f32, w: f32, h: f32, min_depth: f32 = 0.0,
+        max_depth: f32 = 1.0)
+        requires w > 0.0 && h > 0.0 && min_depth >= 0.0 && max_depth <= 1.0
+        && min_depth <= max_depth else "gpu.range: the viewport"
+        {
+        N::render_set_viewport(&mut self.raw, x, y, w, h, min_depth, max_depth);
+    }
+
+    pub fn set_scissor(&mut self, x: i64, y: i64, w: i64, h: i64)
+        requires x >= 0 && y >= 0 && w >= 0 && h >= 0 && x + w <= self.width && y + h <= self.height
+        else "gpu.range: the scissor rectangle is outside the target"
+        {
+        N::render_set_scissor(&mut self.raw, x, y, w, h);
+    }
+
+    pub fn set_blend_constant(&mut self, c: Color) {
+        N::render_set_blend_constant(&mut self.raw, c);
+    }
+
+    // The vertex buffers cover `vertices` and `instances` (wgpu's check).
+    fn check_buffers(&self, vertices_end: i64, instances_end: i64) {
+        for i in 0..self.buffer_count {
+            let n = if self.steps[i as usize] == StepMode::Instance { instances_end }
+                else { vertices_end };
+            if self.strides[i as usize] == 0 || n == 0 { continue; }
+            assert(self.vertex_bytes[i as usize] >= 0,
+                "gpu.pipeline: a vertex buffer the pipeline reads is not set");
+            assert(n * self.strides[i as usize] <= self.vertex_bytes[i as usize],
+                "gpu.range: the draw reads past a vertex buffer");
+        }
+    }
+
+    /// Draws vertices `vertices` of instances `instances` (`0..3, 0..1`).
+    pub fn draw(&mut self, vertices: Range<i64>, instances: Range<i64>)
+        requires vertices.start >= 0 && vertices.start <= vertices.end && instances.start >= 0
+        && instances.start <= instances.end else "gpu.range: a draw's ranges"
+        {
+        self.binds.ready();
+        self.check_buffers(vertices.end, instances.end);
+        if vertices.end == vertices.start || instances.end == instances.start { return; }
+        self.set_sizes();
+        N::draw(&mut self.raw, vertices.start, vertices.end - vertices.start, instances.start,
+            instances.end - instances.start);
+    }
+
+    /// Draws indices `indices` of the index buffer, each plus base_vertex.
+    pub fn draw_indexed(&mut self, indices: Range<i64>, base_vertex: i64,
+        instances: Range<i64>)
+        requires indices.start >= 0 && indices.start <= indices.end && instances.start >= 0
+        && instances.start <= instances.end else "gpu.range: a draw's ranges"
+        {
+        self.binds.ready();
+        assert(self.index_size > 0,
+            "gpu.pipeline: draw_indexed without an index buffer (pass.set_index_buffer)");
+        assert(indices.end * self.index_size <= self.index_bytes,
+            "gpu.range: the draw reads past the index buffer");
+        // the vertices the indices reach are not known on the CPU: the
+        // shaders' accesses are checked instead (design §2.6)
+        self.check_buffers(0, instances.end);
+        if indices.end == indices.start || instances.end == instances.start { return; }
+        self.set_sizes();
+        N::draw_indexed(&mut self.raw, indices.start, indices.end - indices.start, base_vertex,
+            instances.start, instances.end - instances.start);
+    }
+}
+
+impl Encoder<Gpa> {
+    /// Runs f with a compute pass; the pass ends when f returns.
+    pub fn compute_pass<F: FnMut(&mut ComputePass)>(&mut self, mut f: F)
+        requires self.caps.compute
+        else "gpu.unsupported: this device has no compute (dev.caps().compute)"
+        {
+        let mut pass = ComputePass {
+            raw: N::begin_compute(&mut self.raw), binds: Bindings::new(),
+            max_groups: self.limits.max_compute_workgroups_per_dimension,
+            sizes: StageSizes::none(), groups: [GroupBytes::new(); 4],
+            unwritten: Unwritten::new(),
+        };
+        f(&mut pass);
+        N::end_compute(&mut pass.raw);
+        self.unwritten.add(pass.unwritten, -1);
+    }
+
+    /// Runs f with a render pass into desc's attachments; the pass ends
+    /// when f returns. Its pipelines fit its attachments (set_pipeline).
+    pub fn render_pass<F: FnMut(&mut RenderPass)>(&mut self, desc: PassDesc<'_>, mut f: F)
+        requires self.caps.render
+        else "gpu.unsupported: this device does not render (dev.caps().render)"
+        requires desc.color_count > 0 || desc.depth.is_some()
+        else "gpu.state: a render pass needs a color or a depth attachment (PassDesc::color, PassDesc::depth_only)"
+        requires desc.color_count >= 0 && desc.color_count <= self.limits.max_color_attachments
+        else "gpu.limits: {} color attachments; the device takes at most {}", desc.color_count,
+
+    self.limits.max_color_attachments
+        requires color_fault(desc, 0) < 0
+        else "gpu.usage: color attachment {} needs a texture made with TextureUsage::RENDER_ATTACHMENT", color_fault(desc, 0)
+        requires color_fault(desc, 1) < 0
+        else "gpu.format: color attachment {} has a format a pass cannot draw into (a depth format goes in .with_depth)", color_fault(desc, 1)
+        requires color_fault(desc, 2) < 0
+        else "gpu.range: color attachment {} has another size than attachment 0: a pass's attachments have one size", color_fault(desc, 2)
+        requires depth_attachment_fault(desc) != 1
+        else "gpu.usage: the depth attachment needs a texture made with TextureUsage::RENDER_ATTACHMENT"
+        requires depth_attachment_fault(desc) != 2
+        else "gpu.format: the depth attachment's texture has no depth format (Format::Depth32Float)"
+        requires depth_attachment_fault(desc) != 3
+        else "gpu.range: the depth attachment's size differs from the color attachments'"
+        {
+        let mut p = N::pass_new();
+        let mut formats: [Format; 8] = [Format::Rgba8Unorm; 8];
+        for i in 0..desc.color_count {
+            match desc.colors[i as usize] {
+                Some(c) => {
+                    N::pass_color(&mut p, i, &c.view.raw, c.load, c.clear, c.store);
+                    formats[i as usize] = c.view.format;
+                }
+                None => {}
+            }
+        }
+        let width = pass_side(desc, false);
+        let height = pass_side(desc, true);
+        let mut depth: Option<Format> = None;
+        match desc.depth {
+            Some(d) => {
+                N::pass_depth(&mut p, &d.view.raw, d.load, d.clear, d.store);
+                depth = Some(d.view.format);
+            }
+            None => {}
+        }
+        let mut pass = RenderPass {
+            raw: N::begin_render(&mut self.raw, &p),
+            binds: Bindings::new(),
+            formats: formats,
+            color_count: desc.color_count,
+            depth: depth,
+            width: width,
+            height: height,
+            vertex_bytes: [-1; 8],
+            index_bytes: 0,
+            index_size: 0,
+            strides: [0i64; 8],
+            steps: [StepMode::Vertex; 8],
+            buffer_count: 0,
+            vs_sizes: StageSizes::none(),
+            fs_sizes: StageSizes::none(),
+            groups: [GroupBytes::new(); 4],
+            unwritten: Unwritten::new(),
+        };
+        f(&mut pass);
+        N::end_render(&mut pass.raw);
+        self.unwritten.add(pass.unwritten, -1);
+    }
+
+    /// Copies size bytes between buffers.
+    pub fn copy_buffer(&mut self, src: &Buffer, src_offset: i64, dst: &Buffer,
+        dst_offset: i64, size: i64)
+        requires src.usage & BufferUsage::COPY_SRC != 0
+        else "gpu.usage: copy_buffer's source, its first argument (a buffer of {} bytes), was made without BufferUsage::COPY_SRC: add it where that buffer is made (dev.buffer(size, usage | BufferUsage::COPY_SRC))", src.size
+        requires dst.usage & BufferUsage::COPY_DST != 0
+        else "gpu.usage: copy_buffer's destination, its third argument (a buffer of {} bytes), was made without BufferUsage::COPY_DST: add it where that buffer is made (dev.buffer(size, usage | BufferUsage::COPY_DST))", dst.size
+        requires src_offset % 4 == 0 && dst_offset % 4 == 0 && size % 4 == 0
+        else "gpu.align: copy offsets and sizes are multiples of 4"
+        requires src_offset >= 0 && dst_offset >= 0 && size >= 0 && src_offset + size <= src.size
+        && dst_offset + size <= dst.size else "gpu.range: the copy reaches past a buffer"
+        requires !dst.mapped
+        else "gpu.state: copy_buffer's destination, its third argument (a buffer of {} bytes), is mapped (map_read): the copy would change its view. Unmap it (buf.unmap(dev)) when its view is done, or read a copy (map_read_copy_in)", dst.size
+        requires !src.mapped
+        else "gpu.state: copy_buffer's source, its first argument (a buffer of {} bytes), is mapped for writing (map_write): unmap it first (buf.unmap(dev)), which sends what was written", src.size
+        {
+        if size == 0 { return; }
+        self.uses(src);
+        self.uses(dst);
+        if dst.usage & BufferUsage::UNIFORM != 0 { self.unwritten.wrote(buffer_id(dst)); }
+        N::copy_buffer(&mut self.raw, &src.raw, src_offset, &dst.raw, dst_offset, size);
+    }
+
+    /// Copies a region of layer `layer` of tex (the whole of it by default)
+    /// into buf at offset, rows bytes_per_row apart (a multiple of 256).
+    pub fn copy_texture_to_buffer(&mut self, tex: &Texture, buf: &Buffer,
+        bytes_per_row: i64, offset: i64 = 0, x: i64 = 0, y: i64 = 0, w: i64 = -1, h: i64 = -1,
+        layer: i64 = 0)
+        requires tex.desc.usage & TextureUsage::COPY_SRC != 0
+        else "gpu.usage: copy_texture_to_buffer's texture was made without TextureUsage::COPY_SRC: add it in dev.texture(.., usage: ..)"
+        requires buf.usage & BufferUsage::COPY_DST != 0
+        else "gpu.usage: copy_texture_to_buffer's buffer ({} bytes) was made without BufferUsage::COPY_DST: add it where that buffer is made", buf.size
+        requires bytes_per_row % 256 == 0 && offset % tex.desc.format.size() == 0
+        else "gpu.align: bytes_per_row is a multiple of 256"
+        requires layer >= 0 && layer < tex.desc.layers else "gpu.range: no such layer"
+        requires !buf.mapped
+        else "gpu.state: copy_texture_to_buffer's buffer ({} bytes) is mapped (map_read): the copy would change its view. Unmap it (buf.unmap(dev)) when its view is done, or read a copy (map_read_copy_in)", buf.size
+        {
+        let ww = if w < 0 { tex.desc.width - x } else { w };
+        let hh = if h < 0 { tex.desc.height - y } else { h };
+        assert(x >= 0 && y >= 0 && ww >= 1 && hh >= 1 && x + ww <= tex.desc.width
+            && y + hh <= tex.desc.height, "gpu.range: the region is outside the texture");
+        assert(bytes_per_row >= ww * tex.desc.format.size(),
+            "gpu.range: bytes_per_row is shorter than a row");
+        assert(offset >= 0
+            && offset + bytes_per_row * (hh - 1) + ww * tex.desc.format.size() <= buf.size,
+            "gpu.range: the copy reaches past the buffer");
+        self.uses(buf);
+        if buf.usage & BufferUsage::UNIFORM != 0 { self.unwritten.wrote(buffer_id(buf)); }
+        N::copy_texture_to_buffer(&mut self.raw, &tex.raw, layer, x, y, ww, hh, &buf.raw, offset,
+            bytes_per_row);
+    }
+
+    /// Copies rows of buf (bytes_per_row apart, a multiple of 256) into a
+    /// region of layer `layer` of tex.
+    pub fn copy_buffer_to_texture(&mut self, buf: &Buffer, tex: &Texture,
+        bytes_per_row: i64, offset: i64 = 0, x: i64 = 0, y: i64 = 0, w: i64 = -1, h: i64 = -1,
+        layer: i64 = 0)
+        requires buf.usage & BufferUsage::COPY_SRC != 0
+        else "gpu.usage: copy_buffer_to_texture's buffer ({} bytes) was made without BufferUsage::COPY_SRC: add it where that buffer is made", buf.size
+        requires tex.desc.usage & TextureUsage::COPY_DST != 0
+        else "gpu.usage: copy_buffer_to_texture's texture was made without TextureUsage::COPY_DST: add it in dev.texture(.., usage: ..)"
+        requires bytes_per_row % 256 == 0 && offset % tex.desc.format.size() == 0
+        else "gpu.align: bytes_per_row is a multiple of 256"
+        requires layer >= 0 && layer < tex.desc.layers else "gpu.range: no such layer"
+        requires !buf.mapped
+        else "gpu.state: copy_buffer_to_texture's buffer ({} bytes) is mapped for writing (map_write): unmap it first (buf.unmap(dev)), which sends what was written", buf.size
+        {
+        let ww = if w < 0 { tex.desc.width - x } else { w };
+        let hh = if h < 0 { tex.desc.height - y } else { h };
+        assert(x >= 0 && y >= 0 && ww >= 1 && hh >= 1 && x + ww <= tex.desc.width
+            && y + hh <= tex.desc.height, "gpu.range: the region is outside the texture");
+        assert(bytes_per_row >= ww * tex.desc.format.size(),
+            "gpu.range: bytes_per_row is shorter than a row");
+        assert(offset >= 0
+            && offset + bytes_per_row * (hh - 1) + ww * tex.desc.format.size() <= buf.size,
+            "gpu.range: the copy reaches past the buffer");
+        self.uses(buf);
+        N::copy_buffer_to_texture(&mut self.raw, &buf.raw, offset, bytes_per_row, &tex.raw, layer,
+            x, y, ww, hh);
+    }
+
+    /// The recorded commands, for `queue.submit`.
+    pub fn finish(self) -> Commands<Gpa> {
+        Commands {
+            raw: self.raw, unwritten: self.unwritten, maps: self.maps, segs: self.segs,
+            stamps: self.stamps, resolve_next: self.resolve_next,
+        }
+    }
+
+    // (0.25.3) A buffer a copy uses: when it is mappable, a handle of it
+    // for submit's gpu.state (once a buffer).
+    fn uses(&mut self, buf: &Buffer) {
+        if buf.usage & (BufferUsage::MAP_READ | BufferUsage::MAP_WRITE) == 0 { return; }
+        let id = buffer_id(buf);
+        for m in self.maps.iter() {
+            if m.raw.ptr as u64 == id { return; }
+        }
+        self.maps.push(N::buffer_handle(&buf.raw));
+    }
+}
+
+// ---- GPU: surfaces and frames (0.22) ----
+
+/// What a window shows: frames drawn into and presented.
+pub struct Surface<A: Allocator> {
+    pub raw: backend::Surface,
+    pub configured: bool,
+    pub width: i64,
+    pub height: i64,
+    pub format: Format,
+    // (0.25.4) the device it was made for, for capture_next_frame
+    dev: backend::Device,
+    gpa: A,
+}
+
+/// A frame of a surface: its texture is the render target; `present`
+/// shows it after the work submitted before.
+pub struct Frame<A: Allocator> {
+    pub raw: backend::Frame,
+    pub texture: Texture,
+    // (0.25.4) a capture asked for (capture_next_frame) when it was taken
+    cap: Option<capture::Capture<A>>,
+}
+
+impl Surface<Gpa> {
+    /// Sizes the surface's frames; vsync: presented at the display's rate.
+    pub fn configure(&mut self, dev: &Device<Gpa>, width: i64, height: i64,
+        format: Format = Format::Bgra8Unorm, vsync: bool = true)
+        requires width >= 1 && height >= 1 && width <= dev.limits.max_texture_dimension_2d
+        && height <= dev.limits.max_texture_dimension_2d else "gpu.limits: a surface's size"
+        requires format == Format::Bgra8Unorm || format == Format::Bgra8UnormSrgb
+        || format == Format::Rgba16Float
+        else "gpu.format: a surface is Bgra8Unorm, Bgra8UnormSrgb or Rgba16Float"
+        {
+        N::configure(&mut self.raw, &dev.raw, width, height, format, vsync);
+        self.configured = true;
+        self.width = width;
+        self.height = height;
+        self.format = format;
+    }
+
+    /// The next frame to draw (waits for one to be free).
+    pub fn frame(&mut self) -> Result<Frame<Gpa>, Error<Gpa>>
+        requires self.configured else "gpu.state: configure the surface before taking a frame"
+    {
+        match N::next_frame(&mut self.raw) {
+            Some((f, t)) => {
+                let desc = TextureDesc {
+                    width: self.width, height: self.height, layers: 1, mips: 1, format: self.format,
+                    usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC,
+                };
+                let cap = if crate::capture::capture_pending() {
+                    Some(capture::Capture { dev: self.dev.clone(), gpa: self.gpa })
+                } else {
+                    None
+                };
+                Ok(Frame { raw: f, texture: Texture { raw: t, desc: desc }, cap: cap })
+            }
+            None => Err(Error::SurfaceLost),
+        }
+    }
+}
+
+impl Frame<Gpa> {
+    /// Shows the frame after the work submitted to queue so far. (0.25.4)
+    /// After capture_next_frame, the frame is also written to its file.
+    pub fn present(self, queue: &mut Queue) {
+        let f = self;
+        match f.cap {
+            Some(cap) => {
+                if crate::capture::capture_pending() {
+                    capture::write_frame(&cap, queue, &f.texture);
+                }
+            }
+            None => {}
+        }
+        N::present(&mut queue.raw, &f.raw);
+    }
+}
+
+// ---- GPU: bytes (0.22) ----
+
+/// The bytes of a slice of f32s (a view of the same memory).
+pub fn bytes_of_f32(s: &[f32]) -> &[u8] {
+    // UNSAFE: a view of one element type as another is a raw-pointer slice; std has no safe cast.
+    // SAFETY: s.len() f32s are s.len() * 4 readable bytes at s.ptr, u8 needs no alignment and any
+    // byte is a u8; the result's lifetime is s's.
+    unsafe {
+        crate::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4)
+    }
+}
+
+/// The bytes of a slice of u32s (a view of the same memory).
+pub fn bytes_of_u32(s: &[u32]) -> &[u8] {
+    // UNSAFE: a view of one element type as another is a raw-pointer slice; std has no safe cast.
+    // SAFETY: s.len() u32s are s.len() * 4 readable bytes at s.ptr, u8 needs no alignment and any
+    // byte is a u8; the result's lifetime is s's.
+    unsafe {
+        crate::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4)
+    }
+}
+
+/// The bytes of a slice of i32s (a view of the same memory).
+pub fn bytes_of_i32(s: &[i32]) -> &[u8] {
+    // UNSAFE: a view of one element type as another is a raw-pointer slice; std has no safe cast.
+    // SAFETY: s.len() i32s are s.len() * 4 readable bytes at s.ptr, u8 needs no alignment and any
+    // byte is a u8; the result's lifetime is s's.
+    unsafe {
+        crate::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4)
+    }
+}
+
+/// Bytes as f32s (a view): the length a multiple of 4 and the memory
+/// 4-aligned, as mapped buffers are.
+pub fn f32s(b: &[u8]) -> &[f32]
+    requires b.len() % 4 == 0 && (b.as_ptr() as u64) % 4 == 0
+    else "gpu.align: f32s needs 4-aligned bytes, a multiple of 4"
+    {
+    // UNSAFE: a view of bytes as f32s is a raw-pointer slice; std has no safe cast.
+    // SAFETY: the contract checked that b.ptr is 4-aligned and b.len() a multiple of 4, so the
+    // b.len() / 4 f32s lie within b; every bit pattern is an f32; the result's lifetime is b's.
+    unsafe {
+        crate::slice::from_raw_parts(b.as_ptr() as *const f32, b.len() / 4)
+    }
+}
+
+/// Bytes as u32s (a view), as f32s.
+pub fn u32s(b: &[u8]) -> &[u32]
+    requires b.len() % 4 == 0 && (b.as_ptr() as u64) % 4 == 0
+    else "gpu.align: u32s needs 4-aligned bytes, a multiple of 4"
+    {
+    // UNSAFE: a view of bytes as u32s is a raw-pointer slice; std has no safe cast.
+    // SAFETY: the contract checked that b.ptr is 4-aligned and b.len() a multiple of 4, so the
+    // b.len() / 4 u32s lie within b; every bit pattern is a u32; the result's lifetime is b's.
+    unsafe {
+        crate::slice::from_raw_parts(b.as_ptr() as *const u32, b.len() / 4)
+    }
+}
+
+/// Bytes as i32s (a view), as f32s.
+pub fn i32s(b: &[u8]) -> &[i32]
+    requires b.len() % 4 == 0 && (b.as_ptr() as u64) % 4 == 0
+    else "gpu.align: i32s needs 4-aligned bytes, a multiple of 4"
+    {
+    // UNSAFE: a view of bytes as i32s is a raw-pointer slice; std has no safe cast.
+    // SAFETY: the contract checked that b.ptr is 4-aligned and b.len() a multiple of 4, so the
+    // b.len() / 4 i32s lie within b; every bit pattern is an i32; the result's lifetime is b's.
+    unsafe {
+        crate::slice::from_raw_parts(b.as_ptr() as *const i32, b.len() / 4)
+    }
+}
+
+/// The same bytes, writable, as u32s (a view of mapped memory).
+pub fn u32s_mut(b: &mut [u8]) -> &mut [u32]
+    requires b.len() % 4 == 0 && (b.as_ptr() as u64) % 4 == 0
+    else "gpu.align: u32s needs 4-aligned bytes, a multiple of 4"
+    {
+    // UNSAFE: a writable view of bytes as u32s is a raw-pointer slice; std has no safe cast.
+    // SAFETY: the contract checked that b.ptr is 4-aligned and b.len() a multiple of 4, so the
+    // u32s lie within b; every bit pattern is a u32; b is &mut, so this view is the only
+    // access to those bytes while it lives.
+    unsafe {
+        crate::slice::from_raw_parts_mut(b.as_mut_ptr() as *mut u32, b.len() / 4)
+    }
+}
+
+/// The same bytes, writable, as f32s.
+pub fn f32s_mut(b: &mut [u8]) -> &mut [f32]
+    requires b.len() % 4 == 0 && (b.as_ptr() as u64) % 4 == 0
+    else "gpu.align: f32s needs 4-aligned bytes, a multiple of 4"
+    {
+    // UNSAFE: a writable view of bytes as f32s is a raw-pointer slice; std has no safe cast.
+    // SAFETY: the contract checked that b.ptr is 4-aligned and b.len() a multiple of 4, so the
+    // f32s lie within b; every bit pattern is an f32; b is &mut, so this view is the only
+    // access to those bytes while it lives.
+    unsafe {
+        crate::slice::from_raw_parts_mut(b.as_mut_ptr() as *mut f32, b.len() / 4)
+    }
+}

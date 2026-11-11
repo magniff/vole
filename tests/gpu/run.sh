@@ -8,7 +8,7 @@
 #   Metal's API and shader validation (MTL_DEBUG_LAYER,
 #   MTL_SHADER_VALIDATION), checked, and run again under `leaks --atExit`,
 #   which must find nothing;
-# - objcgen: every table of compiler/std/objc/tables is regenerated and
+# - objcgen: every table of compiler/std2/objc/tables is regenerated and
 #   compared
 #   with its checked-in module, checked against the Objective-C runtime
 #   (--check) and its constants and structs against the SDK's headers
@@ -90,7 +90,14 @@ run_case() {
     mkdir -p "$dir"
     why="$dir/why"
     : >"$why"
-    if ! "$COMPILER" $OPT --deny-warnings "$file" "$ROOT/tests/gpu/support.vl" -o "$dir/prog" >"$dir/build" 2>&1; then
+    # (0.28.0) support.vl is joined when it is of the case's edition: while
+    # it is the old edition's (it moves with std::gpu's runtime), a
+    # rust-edition case (std::objc's) is built alone.
+    support="$ROOT/tests/gpu/support.vl"
+    if grep -q '^// EDITION: rust' "$file" && ! grep -q '^// EDITION: rust' "$support"; then
+        support=""
+    fi
+    if ! "$COMPILER" $OPT --deny-warnings "$file" $support -o "$dir/prog" >"$dir/build" 2>&1; then
         { echo "build failed:"; sed 's/^/    /' "$dir/build" | head -20; } >>"$why"
         echo fail >"$dir/status"
         return
@@ -167,8 +174,21 @@ done <"$WORK/cases"
 # objcgen: generation, the runtime check, the header check.
 case objcgen in
 *"$FILTER"*)
-    for t in "$ROOT"/compiler/std/objc/tables/*.objc; do
+    # (0.28.0) the rust edition's tables are compiler/std2's; a table still
+    # only in the old std (its module not ported yet) is checked against
+    # the runtime and the SDK, and not regenerated: objcgen writes the
+    # rust edition.
+    for t in "$ROOT"/compiler/std2/objc/tables/*.objc "$ROOT"/compiler/std/objc/tables/*.objc; do
+        [ -f "$t" ] || continue
         tn=$(basename "$t" .objc)
+        td=${t#"$ROOT"/}
+        td=${td%/*}
+        old=0
+        case "$td" in
+        compiler/std/*)
+            [ -f "$ROOT/compiler/std2/objc/tables/$tn.objc" ] && continue
+            old=1 ;;
+        esac
         why="$WORK/objcgen-$tn.why"
         : >"$why"
         if [ "$TOOLS_OK" != 1 ]; then
@@ -176,15 +196,20 @@ case objcgen in
         else
             out=$(sed -n 's/^# Generated into \([^ ]*\) .*/\1/p' "$t" | head -1)
             [ -n "$out" ] || out=$(sed -n 's/^# \{0,1\}.*generated into \([^ ]*\) by.*/\1/p' "$t" | head -1)
-            (cd "$ROOT" && "$WORK/tools/objcgen" "compiler/std/objc/tables/$tn.objc") >"$WORK/gen-$tn.vl" 2>>"$why"
-            if [ -z "$out" ]; then
+            (cd "$ROOT" && "$WORK/tools/objcgen" "$td/$tn.objc") >"$WORK/gen-$tn.vl" 2>>"$why"
+            # (0.28.0) a generated module is objcgen's output in the standard
+            # style (`volec fmt`), as the commit hook wants every .vl
+            [ "$old" = 1 ] || "$COMPILER" fmt "$WORK/gen-$tn.vl" >/dev/null 2>>"$why"
+            if [ "$old" = 1 ]; then
+                :
+            elif [ -z "$out" ]; then
                 echo "the table names no 'Generated into PATH' line" >>"$why"
             elif ! cmp -s "$WORK/gen-$tn.vl" "$ROOT/$out"; then
-                echo "$out is not what objcgen makes of compiler/std/objc/tables/$tn.objc (regenerate it, then compiler/std/embed.sh)" >>"$why"
+                echo "$out is not what objcgen makes of $td/$tn.objc (regenerate it, volec fmt it, then compiler/std/embed.sh --edition rust)" >>"$why"
             fi
-            (cd "$ROOT" && "$WORK/tools/objcgen" --check "compiler/std/objc/tables/$tn.objc") >/dev/null 2>"$WORK/check-$tn.err" ||
+            (cd "$ROOT" && "$WORK/tools/objcgen" --check "$td/$tn.objc") >/dev/null 2>"$WORK/check-$tn.err" ||
                 { echo "objcgen --check:"; sed 's/^/    /' "$WORK/check-$tn.err"; } >>"$why"
-            (cd "$ROOT" && "$WORK/tools/objcgen" --c-check "compiler/std/objc/tables/$tn.objc") >"$WORK/c-check-$tn.m" 2>>"$why"
+            (cd "$ROOT" && "$WORK/tools/objcgen" --c-check "$td/$tn.objc") >"$WORK/c-check-$tn.m" 2>>"$why"
             clang -fsyntax-only -x objective-c "$WORK/c-check-$tn.m" >"$WORK/c-check-$tn.err" 2>&1 ||
                 { echo "objcgen --c-check (clang):"; grep 'error' "$WORK/c-check-$tn.err" | sed 's/^/    /' | head -10; } >>"$why"
         fi
@@ -200,7 +225,7 @@ case noalloc in
 *"$FILTER"*)
     why="$WORK/noalloc.why"
     : >"$why"
-    printf 'use std::gpu;\nfn main(gpa: Gpa) {\n    let _i = gpu::Instance::new_in(gpa);\n}\n' >"$WORK/noalloc.vl"
+    printf '// EDITION: rust\nuse std::gpu;\nfn main(gpa: Gpa) {\n    let _i = gpu::Instance::new_in(gpa);\n}\n' >"$WORK/noalloc.vl"
     for f in std::gpu::Device::encoder std::gpu::Device::bind_group std::gpu::Encoder::compute_pass std::gpu::Encoder::render_pass \
              std::gpu::Encoder::copy_buffer std::gpu::Encoder::copy_texture_to_buffer std::gpu::Encoder::finish \
              std::gpu::ComputePass::set_pipeline std::gpu::ComputePass::set_bind_group std::gpu::ComputePass::dispatch \
@@ -221,17 +246,24 @@ case noalloc in
                 # file's path in a Buf, std::capture::take_capture). That
                 # runs only after capture_next_frame, a debugging path, not
                 # the per-frame one, so a chain whose first step is
-                # capture::write passes. Until 0.26.2 the check never saw
-                # it: the first step found was the drop of `f` (Id::drop,
+                # capture::write_frame passes. Until 0.26.2 the check never
+                # saw it: the first step found was the drop of `f` (Id::drop,
                 # into C); a drop's call is now found after the body's.
+                # (0.28.0) A second one, which the chain through unknown C
+                # hid until std's C symbols had their effects: a copy that
+                # names a mappable buffer (MAP_READ, MAP_WRITE) notes it
+                # once in the encoder (Encoder::uses, for the gpu.state
+                # contracts of submit): a push when that buffer is new to
+                # the encoder. A readback's path, not a frame's drawing.
                 chain=$("$COMPILER" query effects "$f" --root "$WORK/noalloc.vl" --why 'alloc(Gpa)' 2>&1)
                 last=$(printf '%s\n' "$chain" | tail -1)
                 first=$(printf '%s\n' "$chain" | sed -n 2p)
                 case "$first" in
-                    *"calls 'std::gpu::capture::write'"*) last="(the capture)" ;;
+                    *"calls 'std::gpu::capture::write_frame'"*) last="(the capture)" ;;
+                    *"calls 'Encoder<Gpa>::uses'"*) last="(the maps)" ;;
                 esac
                 case "$last" in
-                    *"calls C's"*|*"(no source found)"*|"(the capture)") ;;
+                    *"calls C's"*|*"(no source found)"*|"(the capture)"|"(the maps)") ;;
                     *) echo "$f allocates from Gpa: $out" >>"$why"
                        printf '%s\n' "$chain" | sed 's/^/    /' >>"$why" ;;
                 esac ;;
