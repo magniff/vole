@@ -12,15 +12,11 @@ $ callees add_and_sum --transitive
 2	call	table::put	calls016/table.vl:12	via table::grow
 2	call	table::table_ptr	calls016/table.vl:40	via table::grow
 3	call	table::get_table	calls016/table.vl:30	via table::peek
-## 361 callees: 24 of them (ArenaScope's allocate, Vec's io::Write, HashMap's) are
-## reached only through the join of a dyn Write call over every impl instance in std
-## (gap: gated modules included); to be re-recorded when the join is limited to
-## reachable instances.
 $ callees main --transitive --limit 3
 1	call	add_and_sum	calls016/main.vl:6
 1	call	apply	calls016/main.vl:21
 1	call	sum	calls016/main.vl:11
-note query.truncated: showing 3 of 363 callees
+note query.truncated: showing 3 of 360 callees
 try: volec query callees main --transitive --all
 $ callees main
 1	call	add_and_sum	calls016/main.vl:6

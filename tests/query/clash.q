@@ -162,6 +162,8 @@ std::string::String::push	<std>:9623:12	method	pub fn push(&mut self, c: char) e
 std::collections::binary_heap::BinaryHeap::push	<std>:11802:12	method	pub fn push(&mut self, x: T)
 std::collections::binary_heap::MinHeap::push	<std>:11905:12	method	pub fn push(&mut self, x: T)
 std::flt::Text::push	<std>:15714:8	method	fn push(&mut self, b: u8)	effects: panic diverge
+std::unicode::GraphemeState::push	<std>:22328:12	method	pub fn push(&mut self, cp: u32) -> bool	effects: panic
+std::unicode::ClusterWidth::push	<std>:22516:12	method	pub fn push(&mut self, cp: u32, p: u16)	effects: none
 std::path::PathBuf::push	<std>:23132:12	method	pub fn push<P: AsRef<str>>(&mut self, p: P)
 std::cli::Matches::push	<std>:22958:8	method	fn push(&mut self, s: i64, text: &'a str, at: i64)
 std::objc::Pool::push	<std>:45195:12	method	pub fn push() -> Pool	effects: io unsafe
