@@ -136,7 +136,11 @@ run_runners() {
     done
     while read -r kind name how; do
         out="$WORK/$4-$kind.out"
-        if [ "$how" = exact ] && [ "$4" = moved ] && [ -d "$1/tests/$kind/$name/compiler/std" ]; then
+        if grep -q "^xfail $name\\( \\|:\\)" "$out" && ! grep -q "^FAIL $name\\( \\|:\\)" "$out"; then
+            # (0.28.0) a transcript its runner expects to differ
+            # (`## XFAIL:`): neither verdict is asked of it
+            echo "pass $4_$name (xfail in its runner)"
+        elif [ "$how" = exact ] && [ "$4" = moved ] && [ -d "$1/tests/$kind/$name/compiler/std" ]; then
             if grep -q "^pass $name\\( \\|\$\\)" "$out" && ! grep -q "^FAIL $name\\( \\|:\\)" "$out"; then
                 echo "pass $4_$name (exact-std, its own std: unmoved, passes)"
             else
