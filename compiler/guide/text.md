@@ -73,8 +73,8 @@ What turns one form into another:
 
 `print`, `println` and `eprintln` take a format literal and its
 arguments, any `T: Display`, with no allocator; `panic("bad {x}")`
-formats its message the same way (`assert(c, "msg")` and `assert_eq(a,
-b, "msg")` take a plain message, no arguments yet).
+formats its message the same way, and so does `assert(c, "bad {}",
+x)`.
 
 ```vole
 const SHADER: &str = "@compute @workgroup_size(1)\nfn main() {}\n";
