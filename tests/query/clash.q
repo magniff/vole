@@ -76,6 +76,8 @@ str::len	<std>:6975:12	method	pub fn len(&self) -> usize	effects: none
 std::string::String::len	<std>:9535:12	method	pub fn len(&self) -> usize
 std::collections::binary_heap::BinaryHeap::len	<std>:11791:12	method	pub fn len(&self) -> usize
 std::collections::binary_heap::MinHeap::len	<std>:11895:12	method	pub fn len(&self) -> usize
+std::collections::btree_map::BTreeMap::len	<std>:12246:12	method	pub fn len(&self) -> usize
+std::collections::btree_map::BTreeSet::len	<std>:13295:12	method	pub fn len(&self) -> usize
 std::collections::hash_map::HashMap::len	<std>:11147:12	method	pub fn len(&self) -> usize
 std::collections::hash_set::HashSet::len	<std>:12083:12	method	pub fn len(&self) -> usize
 std::iter::ExactSizeIterator::len	<std>:13093:8	trait-method	fn len(&self) -> usize

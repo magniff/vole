@@ -175,6 +175,12 @@ def generators(paths):
     for p in sorted(paths):
         if not p.endswith(GEN_EXT) or p.startswith(("tools/mvs-census", "tools/translate", ".claude/")):
             continue
+        # tests/seed-compat.awk rewrites a program into the bootstrap
+        # seed's dialect (the gate's fuzz-seed row): the `*u8` and `var`
+        # in it are the seed's spellings and the ones it replaces, not
+        # MVS written into a program the compiler reads.
+        if p == "tests/seed-compat.awk":
+            continue
         text = read(p)
         if not GEN_FN.search(text):
             continue
