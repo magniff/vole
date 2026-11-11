@@ -216,7 +216,24 @@ effect: error (compiler)
 (0.16) A function does more than its effect declaration allows (`#[pure]`, `#[no_alloc]`, `#[no_io]`, `#[no_panic]`, `#[effects(...)]`, or its trait method's), a closure more than its parameter's `effects(...)` bound, or a declaration names an unknown effect or a value instead of an allocator type.
 fix: Follow the chain (`volec query effects NAME --why EFFECT`) to the source and remove it, or widen the declaration; effects are alloc(A), io, static, panic, diverge, unsafe.
 example:
-    sum.vl:3:1: error[effect] 'total' is #[no_alloc], but it allocates from Gpa: 'v.push(x)' at sum.vl:7:9 grows a Vec<i64>
+    #[no_alloc]
+    fn total(v: &mut Vec<i64, Gpa>, x: i64) -> i64 {
+        v.push(x);
+        let mut sum = 0;
+        for &n in v.iter() {
+            sum += n;
+        }
+        sum
+    }
+
+    fn main(gpa: Gpa) {
+        let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
+        println("{}", total(&mut v, 4));
+    }
+
+    main.vl:2:1: error[effect] 'total' is #[no_alloc], but it allocates from Gpa: 'v.push(x)' at main.vl:3:5 grows a Vec<i64, Gpa>
+      help: allocate in the caller and pass the memory in, or remove #[no_alloc]
+      try: volec query effects total --why alloc(Gpa)
 ```
 
 The text is written in the compiler's terse reference style, like
