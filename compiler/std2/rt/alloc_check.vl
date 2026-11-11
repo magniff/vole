@@ -68,13 +68,19 @@ extern "C" {
 
 // std's atomic intrinsics (the lowering makes ATOMIC instructions of a std
 // function named so; middle/lower/atomic.vl): the lock's.
-// UNSAFE: a raw pointer. SAFETY: p is valid and aligned (CHECK_LOCK's).
-unsafe fn atomic_cas(p: *mut u32, expected: u32, new: u32, order: i64) -> u32 {
+// UNSAFE: a raw pointer. SAFETY: p is valid and aligned (CHECK_LOCK's,
+// CHECK_OWNER's).
+unsafe fn atomic_cas<T>(p: *mut T, expected: T, new: T, order: i64) -> T {
     crate::panic::unreachable("an intrinsic")
 }
 
 // UNSAFE: a raw pointer. SAFETY: as atomic_cas.
-unsafe fn atomic_store(p: *mut u32, v: u32, order: i64) {
+unsafe fn atomic_store<T>(p: *mut T, v: T, order: i64) {
+    crate::panic::unreachable("an intrinsic")
+}
+
+// UNSAFE: a raw pointer. SAFETY: as atomic_cas.
+unsafe fn atomic_load<T>(p: *const T, order: i64) -> T {
     crate::panic::unreachable("an intrinsic")
 }
 
@@ -83,20 +89,47 @@ unsafe fn atomic_store(p: *mut u32, v: u32, order: i64) {
 // nothing (it stops the program). CHECK_ALLOC_SITE is stored by the program
 // without it: under threads a block may name another thread's call.
 static mut CHECK_LOCK: u32 = 0;
+// The thread holding CHECK_LOCK (0: none): --check-unsafe checks the
+// allocator's own raw accesses too, through check_alloc_access, inside an
+// entry that holds the lock, so the lock is taken again by no one.
+static mut CHECK_OWNER: u64 = 0;
 
-fn check_lock() {
-    // UNSAFE: the lock's word, through the atomic intrinsics.
-    // SAFETY: CHECK_LOCK is a static u32, valid and aligned; it is only
-    // ever accessed atomically.
+// UNSAFE: C. SAFETY: pthread.h's prototype (pthread_t as u64).
+extern "C" {
+    #[link_name = "pthread_self"]
+    #[effects()]
+    fn check_thread_self() -> u64;
+}
+
+// Takes CHECK_LOCK unless this thread holds it: whether it did.
+fn check_lock() -> bool {
+    // UNSAFE: C, and the lock's and the owner's words, through the atomic
+    // intrinsics.
+    // SAFETY: pthread_self takes nothing; CHECK_LOCK and CHECK_OWNER are
+    // statics, valid and aligned, only ever accessed atomically. The owner
+    // is this thread only when this thread stored it, under the lock.
     unsafe {
+        let me = check_thread_self();
+        let o: *mut u64 = &raw mut CHECK_OWNER;
+        if atomic_load(o, 0) == me {
+            return false;
+        }
         let p: *mut u32 = &raw mut CHECK_LOCK;
         while atomic_cas(p, 0, 1, 1) != 0 {}
+        atomic_store(o, me, 0);
+        true
     }
 }
 
-fn check_unlock() {
+// Lets CHECK_LOCK go when check_lock took it.
+fn check_unlock(took: bool) {
+    if !took {
+        return;
+    }
     // UNSAFE: as check_lock. SAFETY: as check_lock's.
     unsafe {
+        let o: *mut u64 = &raw mut CHECK_OWNER;
+        atomic_store(o, 0, 0);
         let p: *mut u32 = &raw mut CHECK_LOCK;
         atomic_store(p, 0, 2);
     }
@@ -644,14 +677,14 @@ fn check_list_leaks() {
 // At exit: the leaks, unless check_leaks listed them and nothing changed
 // since.
 extern "C" fn check_at_exit() {
-    check_lock();
+    let took = check_lock();
     // UNSAFE: the checker's statics. SAFETY: under the lock.
     unsafe {
         if !CHECK_EVER_LISTED || CHECK_LISTED != CHECK_CHANGES {
             check_list_leaks();
         }
     }
-    check_unlock();
+    check_unlock(took);
 }
 
 // A block for layout on pages of its own (page-aligned: any alignment up
@@ -662,9 +695,9 @@ pub fn allocate(layout: Layout) -> Result<NonNull<u8>, AllocError> {
         // SAFETY: it is never read or written: a zero-size block.
         unsafe { layout.align() as *mut u8 }
     } else {
-        check_lock();
+        let took = check_lock();
         let q = check_new_block(layout.size());
-        check_unlock();
+        check_unlock(took);
         q
     };
     match NonNull::new(p) {
@@ -678,34 +711,143 @@ pub fn allocate(layout: Layout) -> Result<NonNull<u8>, AllocError> {
 // UNSAFE: p must be a block allocate gave, with this layout.
 // SAFETY: a contract on the caller (Allocator::deallocate's), and checked.
 pub unsafe fn deallocate(p: NonNull<u8>, layout: Layout) {
-    check_lock();
+    let took = check_lock();
     let a = p.as_ptr() as usize;
     let mut inside = false;
     if layout.size() == 0 && !check_find(a, &mut inside).is_some() {
-        check_unlock();
+        check_unlock(took);
         return;
     }
     let b = check_owned(a, layout.size());
     // UNSAFE: block b given back. SAFETY: check_owned found it live.
     unsafe { check_drop_block(b) }
-    check_unlock();
+    check_unlock(took);
 }
 
 // The blocks allocated and not freed.
 pub fn live_blocks() -> usize {
-    check_lock();
+    let took = check_lock();
     // UNSAFE: the checker's statics. SAFETY: under the lock.
     let n = unsafe { CHECK_LIVE };
-    check_unlock();
+    check_unlock(took);
     n
 }
 
 // Whether no block is left allocated (the live ones listed on stderr).
 pub fn check_leaks() -> bool {
-    check_lock();
+    let took = check_lock();
     check_list_leaks();
     // UNSAFE: the checker's statics. SAFETY: under the lock.
     let none = unsafe { CHECK_LIVE == 0 };
-    check_unlock();
+    check_unlock(took);
     none
+}
+
+// (0.28.0, std::test) The blocks allocated so far: a mark for
+// check_alloc_leaks_since.
+#[effects(io, static, panic, diverge, unsafe)]
+pub fn check_alloc_mark() -> usize {
+    let took = check_lock();
+    // UNSAFE: the checker's statics. SAFETY: under the lock.
+    let n = unsafe { CHECK_COUNT };
+    check_unlock(took);
+    n
+}
+
+// The blocks allocated from `mark` on and not freed, listed as at exit
+// (the first line names them a case's): a property's case, or a fuzz run,
+// leaks them (std::test); their count.
+#[effects(alloc(extern), io, static, panic, diverge, unsafe)]
+pub fn check_alloc_leaks_since(mark: usize) -> usize {
+    let took = check_lock();
+    let mut live: usize = 0;
+    // UNSAFE: the checker's statics and table. SAFETY: under the lock;
+    // blocks below CHECK_COUNT.
+    unsafe {
+        let mut bytes: usize = 0;
+        let mut b = mark;
+        while b < CHECK_COUNT {
+            if (*check_block(b)).state == CHECK_LIVE_BLOCK {
+                live += 1;
+                bytes += (*check_block(b)).size;
+            }
+            b += 1;
+        }
+        if live > 0 {
+            let mut m = CheckMsg::new();
+            m.text("check-alloc: ");
+            m.int(live);
+            m.text(if live == 1 { " block" } else { " blocks" });
+            m.text(" of Gpa not freed by the case (");
+            m.int(bytes);
+            m.text(" bytes):");
+            m.out();
+            let mut shown: usize = 0;
+            b = mark;
+            while b < CHECK_COUNT {
+                if (*check_block(b)).state == CHECK_LIVE_BLOCK && shown < 20 {
+                    let mut line = CheckMsg::new();
+                    line.text("  ");
+                    check_describe(&mut line, b);
+                    line.out();
+                    shown += 1;
+                }
+                b += 1;
+            }
+            CHECK_LISTED = CHECK_CHANGES;
+        }
+    }
+    check_unlock(took);
+    live
+}
+
+// (--check-unsafe with --check-alloc) The access of size bytes at p:
+// false when p is no memory of the checking allocator, true when it is in
+// bounds of a live block; else the program stops.
+#[effects(alloc(extern), io, static, panic, diverge, unsafe)]
+// UNSAFE: site must be null or a C string.
+// SAFETY: a contract on the caller: the checking mode's runtime passes
+// the site literal the compiler wrote.
+pub unsafe fn check_alloc_access(p: u64, size: u64, site: *const u8) -> bool {
+    let took = check_lock();
+    let mut inside = false;
+    let found = check_find(p as usize, &mut inside);
+    if !inside {
+        check_unlock(took);
+        return false;
+    }
+    let mut m = CheckMsg::new();
+    // UNSAFE: block b of the table. SAFETY: under the lock; b from
+    // check_find, below CHECK_COUNT.
+    unsafe {
+        match found {
+            Option::Some(b) => {
+                let k = check_block(b);
+                if (*k).state == CHECK_LIVE_BLOCK {
+                    if p as usize + size as usize <= (*k).start + (*k).size {
+                        check_unlock(took);
+                        return true;
+                    }
+                    m.text("unsafe access out of bounds: ");
+                } else {
+                    m.text("unsafe access after free: ");
+                }
+                m.int(size as usize);
+                m.text(if size == 1 { " byte at " } else { " bytes at " });
+                m.text("offset ");
+                m.int(p as usize - (*k).start);
+                m.text(" of ");
+                check_describe(&mut m, b);
+            }
+            Option::None => {
+                m.text("unsafe access outside every block: ");
+                m.int(size as usize);
+                m.text(if size == 1 { " byte at " } else { " bytes at " });
+                m.hex(p as usize);
+            }
+        }
+    }
+    m.text("\n --> ");
+    m.site(site);
+    check_stop(&mut m)
 }

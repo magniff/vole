@@ -5,17 +5,19 @@
 ## line outside every body, a line past the file's end.
 $ drops main.vl:22
 drops0261/main.vl:22 in pick
-  31:13  drop(_12) [kept]  t: D<Gpa>
-  34:5  drop(_12) [kept]  t: D<Gpa>
-  35:33  drop(_20) [open]  a temporary (35:18): (D<Gpa>, D<Gpa>)
-  35:33  drop(_20.1) [kept]  a temporary (35:18): D<Gpa>
-  35:33  drop(_21) [removed]  a temporary (35:22): D<Gpa>
-  37:1  drop(_22) [kept]  x: D<Gpa>
+  26:26  drop(_7) [removed]  a temporary (26:24): D<Gpa>
+  31:13  drop(_13) [kept]  t: D<Gpa>
+  34:5  drop(_13) [kept]  t: D<Gpa>
+  35:33  drop(_27) [open]  a temporary (35:18): (D<Gpa>, D<Gpa>)
+  35:33  drop(_27.1) [kept]  a temporary (35:18): D<Gpa>
+  35:33  drop(_28) [removed]  a temporary (35:22): D<Gpa>
+  37:1  drop(_29) [kept]  x: D<Gpa>
   37:1  drop(_5) [kept]  all: Vec<D<Gpa>, Gpa>
   37:1  drop(_4) [removed]  b: D<Gpa>
-  37:1  drop(_3) [flag _26]  a: D<Gpa>
+  37:1  drop(_3) [flag _34]  a: D<Gpa>
 $ drops main.vl:18 main.vl:12
 drops0261/main.vl:18 in keep
+  18:16  drop(_4) [removed]  a temporary (18:14): D<Gpa>
   19:1  drop(_2) [removed]  d: D<Gpa>
 drops0261/main.vl:12 in mk
   15:1  drop(_3) [removed]  v: Vec<i64, Gpa>

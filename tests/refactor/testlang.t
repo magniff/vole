@@ -10,7 +10,7 @@ test main.vl: 7 passed, 4 failed, 1 new snapshot (1 case, 5 #[test], 4 #[propert
 FAIL gap_needs_two: checks.vl:14:8: index out of bounds: index 1, length 1
   trace: checks.vl:14 checks::gap_needs_two
 FAIL keeps_a_buffer: check-alloc: 1 block of Gpa not freed (14 bytes): block #2 (14 bytes), allocated at checks.vl:22:5
-FAIL bubble_sorts (property, case 11 of 100, shrunk in 8 steps): checks.vl:46:13: not sorted
+FAIL bubble_sorts (property, case 11 of 100, shrunk in 8 steps): not sorted
   input: v = [1, 0]
   try: volec test bubble_sorts --seed 0xf788dd27897d1fed main.vl
 FAIL forgets_its_input (property, case 4 of 100, shrunk in 1 step): check-alloc: 1 block of Gpa not freed by the case (32 bytes): block #11 (32 bytes), allocated at <test>:106:21
@@ -21,7 +21,7 @@ FAIL forgets_its_input (property, case 4 of 100, shrunk in 1 step): check-alloc:
 ## a property's failure again, from its seed
 $ test bubble_sorts --seed 0xf788dd27897d1fed
 test main.vl: 0 passed, 1 failed (1 #[property]; -O0 and -O2 agree)
-FAIL bubble_sorts (property, case 11 of 100, shrunk in 8 steps): checks.vl:46:13: not sorted
+FAIL bubble_sorts (property, case 11 of 100, shrunk in 8 steps): not sorted
   input: v = [1, 0]
   try: volec test bubble_sorts --seed 0xf788dd27897d1fed main.vl
 (outputs: .volec/test/O2/case-NAME.got, .err; test-NAME.got, .err)
@@ -63,14 +63,12 @@ DIFF gaps: -O0 and -O2 differ at stdout line 1: '5 12345' against '5 12346'. A c
 ## (and wildcard imports are not allowed)
 % printf 'use super::*;\n' > extra.vl && cat checks.vl >> extra.vl && mv extra.vl checks.vl
 $ check
-checks.vl:22:13: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
 checks.vl:1:1: error[import.wildcard] wildcard imports are not allowed: 'use super::*;' is not needed | help: a #[cfg(test)] module sees its parent's items, private ones too, without an import | try: volec edit patch checks.vl:1 --old 'use super::*;' --new '' main.vl
 [exit 1]
 $ edit patch checks.vl:1 --old 'use super::*;' --new ''
 patched checks.vl:1	checks.vl	+0 -1 lines
 $ check
-checks.vl:21:13: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-ok: 0 errors, 1 warning in main.vl
+ok: 0 errors in main.vl
 ## a #[test] takes nothing or `gpa: Gpa`
 % printf '#[test]\nfn takes(n: i64) {\n}\n' > checks.vl
 $ test
@@ -78,8 +76,8 @@ test main.vl: its tests do not build (1 error)
 checks.vl:2:4: error[test.signature] 'takes' is a #[test] with parameters: a #[test] takes nothing or `gpa: Gpa` | help: a function of generated arguments is a ...
 [exit 1]
 ## a property's parameters must be generable
-% printf '#[property]\nfn takes(p: *i64) {\n}\n' > checks.vl
+% printf '#[property]\nfn takes(p: *const i64) {\n}\n' > checks.vl
 $ test
 test main.vl: its tests do not build (1 error)
-checks.vl:2:10: error[test.generate] no generator for '*i64' (a pointer), parameter 'p' of 'takes' | help: parameters are generated from their types: numbers, b...
+checks.vl:2:10: error[test.generate] no generator for '*const i64' (a pointer), parameter 'p' of 'takes' | help: parameters are generated from their types: numb...
 [exit 1]

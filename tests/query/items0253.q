@@ -2,18 +2,18 @@
 ## (a trait impl's marked, a contract cut to its keyword)
 $ show Shape
 // crate::Shape	items0253/main.vl:3-6
-pub struct Shape {
+#[derive(Clone, Copy)] pub struct Shape {
     pub w: f64,
     pub h: f64,
 }
 // 3 methods (with their lines and whole contracts: query items crate::Shape)
 pub fn area(self) -> f64
 pub fn scaled(self, k: f64) -> Shape requires ...
-fn fmt(self, f: inout Fmt)  // impl Display for Shape
+fn fmt(&self, f: &mut Fmt<'_>) -> std::fmt::Result  // impl Display for Shape
 ## an enum without methods: its source alone
 $ show Unit
 // crate::Unit	items0253/main.vl:24-27
-pub enum Unit {
+#[derive(Clone, Copy, PartialEq, Eq)] pub enum Unit {
     Metre,
     Foot,
 }
@@ -31,20 +31,17 @@ const	crate::UNIT_AREA
 fn	crate::total_area
 fn	crate::main
 $ items Shape --kind method --names
-# crate::Shape	items0253/main.vl:3:12
+# crate::Shape	items0253/main.vl:3:35
 method	crate::Shape::area
 method	crate::Shape::scaled
 method	<crate::Shape as Display>::fmt
 ## std's numeric helpers: methods of the primitive types, and the
 ## constants the language gives them
 $ items std --find is_finite --names
-# std::math	<std>
-method	<f64 as Float>::is_finite
-method	<f32 as Float>::is_finite
-fn	std::math::is_finite
+# std::fmath	<std>
+method	f64::is_finite
+method	f32::is_finite
 $ items std --find FRAC_PI_2 --kind const --names
-# std::math	<std>
-const	std::math::FRAC_PI_2
 # the primitive types' constants	<built in>
 const	f64::consts::FRAC_PI_2
 const	f32::consts::FRAC_PI_2

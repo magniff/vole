@@ -72,28 +72,29 @@ recursion goes too deep.
 
 **Quickselect** narrows a window `lo..=hi` that holds position k. The
 median of three is sorted into `s[lo]`, `s[mid]`, `s[hi]` with three
-compare-and-swaps; the partition is Hoare's, with `loop` and `while`
-standing in for C's `do ... while`:
+compare-and-swaps; the partition is Hoare's: `i` scans up from `lo`,
+`j` down from `hi`, and what they stop on is swapped. Positions are
+`usize`, so the scans start on `lo` and `hi`, not one before and after:
 
 ```tach
-fn quickselect<T: Ord>(s: inout [T], k: i64) -> T {
-    var lo = 0;
-    var hi = s.len() - 1;
+fn quickselect<T: Ord + Copy>(s: &mut [T], k: usize) -> T {
+    let mut lo = 0;
+    let mut hi = s.len() - 1;
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        if s[mid] < s[lo] { swap(s, mid, lo); }
-        if s[hi] < s[lo] { swap(s, hi, lo); }
-        if s[hi] < s[mid] { swap(s, hi, mid); }
+        if s[mid] < s[lo] { s.swap(mid, lo); }
+        if s[hi] < s[lo] { s.swap(hi, lo); }
+        if s[hi] < s[mid] { s.swap(hi, mid); }
         let pivot = s[mid];
-        var i = lo - 1;
-        var j = hi + 1;
+        let mut i = lo;
+        let mut j = hi;
         loop {
-            i += 1;
             while s[i] < pivot { i += 1; }
-            j -= 1;
             while pivot < s[j] { j -= 1; }
             if i >= j { break; }
-            swap(s, i, j);
+            s.swap(i, j);
+            i += 1;
+            j -= 1;
         }
         if k <= j { hi = j; } else { lo = j + 1; }
     }
@@ -102,12 +103,13 @@ fn quickselect<T: Ord>(s: inout [T], k: i64) -> T {
 ```
 
 `<` on a `T: Ord` is `cmp`; for `i64` it compiles to one compare
-instruction. `s` is an `inout [T]`, a writable view, so `swap(s, i, j)`
-writes the caller's values.
+instruction. `Copy` lets `let pivot = s[mid];` take the value out of
+the slice. `s` is a `&mut [T]`, so `s.swap(i, j)` writes the caller's
+values.
 
 **Median of medians** keeps its window as a slice and narrows it by
-re-slicing, `w = &w[..lt]` or `w = &w[gt..]` (`&`: the view stays
-writable): no index bookkeeping. The
+re-slicing, `w = &mut w[..lt]` or `w = &mut w[gt..]`: no index
+bookkeeping. The
 groups' medians are swapped to the front, and the recursive call
 selects their median in place:
 
@@ -115,17 +117,17 @@ selects their median in place:
 let groups = w.len() / 5;
 for g in 0..groups {             // each group's median to the front
     let a = 5 * g;
-    insertion_sort(&w[a..a + 5]);
-    swap(w, g, a + 2);
+    insertion_sort(&mut w[a..a + 5]);
+    w.swap(g, a + 2);
 }
-let pivot = median_of_medians(&w[..groups], groups / 2);
+let pivot = median_of_medians(&mut w[..groups], groups / 2);
 let (lt, gt) = partition3(w, pivot);
 if k < lt {
-    w = &w[..lt];
+    w = &mut w[..lt];
 } else if k < gt {
     return pivot;
 } else {
-    w = &w[gt..];
+    w = &mut w[gt..];
     k -= gt;
 }
 ```
@@ -135,22 +137,23 @@ and returns a tuple, destructured by the `let`. Separating the values
 equal to the pivot guarantees progress when many values are equal.
 
 **The driver** runs the three methods through one generic function,
-which takes the selection as a closure, `F: FnMut(inout [i64], i64) -> i64`,
-and collects the seven answers with an iterator:
+which takes the selection as a closure,
+`F: FnMut(&mut [i64], usize) -> i64`, and calls it once per rank on its
+working copy:
 
 ```tach
-let found = ks.iter().map(|k| select(work.as_mut_slice(), k)).collect_in(gpa);
+for k in ks { found.push(select(&mut work, *k)); }
 ```
 
 The sorting "method" is a closure too; it sorts on its first call and
-then only reads. Its flag is a `var` outside the closure, which the
+then only reads. Its flag is a `let mut` outside the closure, which the
 closure captures and changes in place:
 
 ```tach
-var sorted = false;
-let by_sort = ranks("sort", data.as_slice(), ks[..], |s, k| {
+let mut sorted = false;
+let by_sort = ranks("sort", &data, &ks, |s, k| {
     if !sorted {
-        std::sort(s);
+        s.sort_unstable();
         sorted = true;
     }
     s[k]
@@ -160,7 +163,7 @@ let by_sort = ranks("sort", data.as_slice(), ks[..], |s, k| {
 The answers are compared as whole `Vec`s (`by_quick != by_sort`
 compares contents). The ordered inputs are built with ranges as
 iterators, `(0..m).map(|i| m - 1 - i).collect_in(gpa)`, kept in a
-`Vec<([u8], Vec<i64>, i64)>` of (name, values, expected median), and
+`Vec<(&str, Vec<i64, Gpa>, i64), Gpa>` of (name, values, expected median), and
 each is checked on two `clone()`s, since both algorithms reorder their
 input.
 
@@ -216,13 +219,13 @@ of the hand-specialized C, with every index checked. `std::sort` beats
 
 | feature | where | guide |
 |---|---|---|
-| generic functions with a bound: `<T: Ord>`, `<` through `cmp` | `quickselect`, `median_of_medians`, `partition3` | `volec guide generics`, `guide traits` |
-| `inout [T]` views, written through, re-sliced: `w = &w[gt..]` | `median_of_medians` | `volec guide types`, `guide memory` |
+| generic functions with bounds: `<T: Ord + Copy>`, `<` through `cmp` | `quickselect`, `median_of_medians`, `partition3` | `volec guide generics`, `guide traits` |
+| `&mut [T]` slices, written through, re-sliced: `w = &mut w[gt..]` | `median_of_medians` | `volec guide types`, `guide memory` |
 | tuples returned and destructured, in a `Vec` and in `for` | `partition3`, `main` | `volec guide syntax` |
-| closures as `FnMut` arguments, a `var` captured and changed | `ranks`, `main` | `volec guide closures` |
-| iterators: ranges as values, `map`, `collect`, `enumerate` | `ranks`, `main` | `volec guide iterators` |
+| closures as `FnMut` arguments, a `let mut` captured and changed | `ranks`, `main` | `volec guide closures` |
+| iterators: ranges as values, `map`, `collect_in`, `enumerate` | `main` | `volec guide iterators` |
 | `clone()` of a `Vec`, `==` / `!=` on `Vec` contents | `check_median`, `main` | `volec guide formatting`, `guide std` |
-| f-strings with alignment, an `if` inside a hole | output | `volec guide formatting` |
+| format strings with alignment, an `if` as an argument | output | `volec guide formatting` |
 
 ## Try
 
@@ -232,4 +235,5 @@ of the hand-specialized C, with every index checked. `std::sort` beats
 - Write `introselect`: quickselect that counts its rounds and calls
   `median_of_medians` on the window after 2 log2(n) of them.
 - Select on another type: `quickselect` works unchanged on a slice of
-  `#[derive(Eq, Ord)]` structs, or on `[u8]` text.
+  `#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]` structs, or
+  on the bytes of a text.

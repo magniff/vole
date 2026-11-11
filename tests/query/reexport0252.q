@@ -4,7 +4,7 @@
 $ show paint::Color
 // crate::paint::types::Color	reexport0252/paint/types.vl:1-5
 /// A color, components in 0..1.
-pub struct Color {
+#[derive(Clone, Copy)] pub struct Color {
     pub r: f64,
     pub g: f64,
 }

@@ -49,7 +49,9 @@ same indices. Three flat arrays instead of a `Vec` per node: one
 allocation each, and the edges of a node are adjacent in memory.
 
 ```tach
-struct Graph { n: i64, start: Vec<i64>, targets: Vec<i32>, weights: Vec<i32> }
+struct Graph<A: Allocator> {
+    n: i64, start: Vec<i64, A>, targets: Vec<i32, A>, weights: Vec<i32, A>,
+}
 ```
 
 `Graph::grid` builds it, looping over the four directions with a tuple
@@ -67,15 +69,15 @@ for (dr, dc) in steps {
 }
 ```
 
-**The heap** is generic over any `T: Ord` (the prelude has a `MinHeap`
-too; this one is written out to show a generic struct): the children of
-slot `i` are `2i + 1` and `2i + 2`. `pop` uses `?` on the `Option` that `Vec::pop`
+**The heap** is generic over any `T: Ord + Copy` and over its
+allocator: the children of slot `i` are `2i + 1` and `2i + 2`. `Copy`
+lets the sift loops move entries with plain assignments. `pop` uses `?` on the `Option` that `Vec::pop`
 returns, so an empty heap returns `None` in one token:
 
 ```tach
-struct MinHeap<T: Ord> { items: Vec<T> }
+struct MinHeap<T: Ord + Copy, A: Allocator> { items: Vec<T, A> }
 
-fn pop(inout self) -> Option<T> {
+fn pop(&mut self) -> Option<T> {
     let last = self.items.pop()?;         // empty: None
     let s = self.items.as_mut_slice();
     ...
@@ -117,17 +119,16 @@ while let Some(e) = heap.pop() {
 }
 ```
 
-`Vec::filled_in(g.n, UNREACHED, gpa)` makes the distance array (Rust's
-`vec![x; n]`); `d`, `p`, `start`, ... are slices of the Vecs, taken
+`Vec::from_elem_in(UNREACHED, g.n as usize, gpa)` makes the distance
+array (Rust's `vec![x; n]`); `d`, `p`, `start`, ... are slices of the Vecs, taken
 once, which the loop indexes and writes through.
 
 **The output** follows the predecessors back from the far corner to
-mark the path, and prints with f-strings (`{d:>3}` pads to three
-columns, `{mark:c}` prints a `u8` as its character, `{checksum:x}` in
-hexadecimal). The checksum folds every distance with an iterator:
+mark the path, and prints with format strings (`{d:>3}` pads to three
+columns, `{mark}` prints a `char`, `{checksum:x}` in hexadecimal). The checksum folds every distance with an iterator:
 
 ```tach
-let checksum = big.dist.iter().fold(0u64, |h, x| (h ^ x as u64) * 0x100000001B3);
+let checksum = big.dist.iter().fold(0u64, |h, x| (h ^ *x as u64).wrapping_mul(0x100000001B3));
 ```
 
 **The timing** calls C's `timespec_get` through `import "time.h" as c;`
@@ -175,21 +176,22 @@ by field. The packed `i64` is the classic fix, in either language.
 
 | feature | where | guide |
 |---|---|---|
-| generic struct with a bound, `impl<T: Ord>` | `MinHeap<T: Ord>` | `volec guide generics`, `guide traits` |
+| generic struct with bounds, `impl<T: Ord + Copy, A: Allocator>` | `MinHeap<T, A>` | `volec guide generics`, `guide traits` |
 | `?` on an `Option` | `MinHeap::pop` | `volec guide conversions` |
 | `while let`, `continue`, tuple patterns | `dijkstra` | `volec guide syntax` |
-| `Vec::filled_in`, `as_mut_slice`, slices written through | `dijkstra` | `volec guide std`, `guide memory` |
+| `Vec::from_elem_in`, `as_mut_slice`, slices written through | `dijkstra` | `volec guide std`, `guide memory` |
 | widening (`i32` weight + `i64` distance) | `dijkstra` | `volec guide conversions` |
 | drops: the graph, the paths and the heap are freed at the end of their scope, with no `free` | everywhere | `volec guide memory` |
 | iterators and closures: `iter().max()`, `fold` | `main` | `volec guide iterators`, `guide closures` |
-| f-strings with specs: `{d:>3}`, `{x:c}`, `{h:x}` | `draw`, `main` | `volec guide formatting` |
+| format strings with specs: `{d:>3}`, `{h:x}` | `draw`, `main` | `volec guide formatting` |
 | a C header: `import "time.h" as c;` | `now_ns` | `volec guide c-interop` |
 
 ## Try
 
 - Change the seeds or the sizes in `main` (a 3000 x 3000 grid takes
   about half a second).
-- Replace the packed entries with `#[derive(Eq, Ord)] struct Entry {
-  dist: i64, node: i32 }` and `MinHeap<Entry>`, and time it.
+- Replace the packed entries with `#[derive(PartialEq, Eq, PartialOrd,
+  Ord, Clone, Copy)] struct Entry { dist: i64, node: i32 }` and
+  `MinHeap<Entry, Gpa>`, and time it.
 - Weight the cells instead of the edges, or add diagonal moves: only
   `Graph::grid` changes.

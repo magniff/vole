@@ -3,8 +3,8 @@ $ check
 main.vl:5:32: warning[use.unused] unused import 'square': nothing in this file names it | help: remove it (`volec fix` removes every unused import) | try: volec fix --only unused main.vl
 main.vl:5:40: warning[use.unused] unused import 'trace': nothing in this file names it | help: remove it (`volec fix` removes every unused import) | try: volec fix --only unused main.vl
 ok: 0 errors, 2 warnings in main.vl
-## A typed hole: only the calls whose $v the checker typed *IntVec.
-$ rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: inout IntVec' --dry-run
+## A typed hole: only the calls whose $v the checker typed &mut IntVec.
+$ rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: &mut IntVec' --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -4 +3,0 @@
@@ -12,24 +12,24 @@ $ rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: inout IntVec' --dry-run
 @@ -5,0 +5 @@
 +use crate::vecs::{ByteVec, IntVec, grow_bytes};
 @@ -10 +10 @@
--    grow(&v, 10);
-+    (&v).reserve(10);
+-    grow(&mut v, 10);
++    (&mut v).reserve(10);
 @@ -25,2 +25,2 @@
--    grow(&p, n);
--    grow(&p, n * 2);
-+    (&p).reserve(n);
-+    (&p).reserve(n * 2);
+-    grow(p, n);
+-    grow(p, n * 2);
++    p.reserve(n);
++    p.reserve(n * 2);
 @@ -31,2 +31,2 @@
--    grow(&v, 2);
--    grow(&v, 2);
-+    (&v).reserve(2);
-+    (&v).reserve(2);
+-    grow(v, 2);
+-    grow(v, 2);
++    v.reserve(2);
++    v.reserve(2);
 note rewrite.imports: removed 1 import the rewrite left unused
 ## No site has that type: what the sites have, and the command for it.
 $ rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: IntVec'
 note rewrite.none: nothing matches 'grow($v, $n)'
-note rewrite.types: 5 sites match but for --where; first: $v is inout IntVec at main.vl:10:10
-try: volec rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: inout IntVec' --dry-run
+note rewrite.types: 5 sites match but for --where; first: $v is &mut IntVec at main.vl:10:10
+try: volec rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: &mut IntVec' --dry-run
 ## Casts and comparisons (`x as i64 < y` compares, 0.11).
 $ rewrite '$a as i64 < $b.len' '$a < $b.len as i64' --dry-run
 --- a/main.vl
@@ -79,24 +79,24 @@ $ rewrite 'grow($v, $n);' 'grow($v, $n + 1);' --in main.vl --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -10 +10 @@
--    grow(&v, 10);
-+    grow(&v, 10 + 1);
+-    grow(&mut v, 10);
++    grow(&mut v, 10 + 1);
 @@ -25,2 +25,2 @@
--    grow(&p, n);
--    grow(&p, n * 2);
-+    grow(&p, n + 1);
-+    grow(&p, n * 2 + 1);
+-    grow(p, n);
+-    grow(p, n * 2);
++    grow(p, n + 1);
++    grow(p, n * 2 + 1);
 @@ -31,2 +31,2 @@
--    grow(&v, 2);
--    grow(&v, 2);
-+    grow(&v, 2 + 1);
-+    grow(&v, 2 + 1);
+-    grow(v, 2);
+-    grow(v, 2);
++    grow(v, 2 + 1);
++    grow(v, 2 + 1);
 ## Written, then undone.
 $ rewrite 'twice($x) * twice($x)' 'square(twice($x))'
 rewrote 1 site in 1 file	main.vl	+1 -1 lines
 % git diff
 diff --git a/main.vl b/main.vl
-index 0528a7e..065d912 100644
+index df909a6..1327526 100644
 --- a/main.vl
 +++ b/main.vl
 @@ -14,7 +14,7 @@ fn main() -> i32 {
@@ -107,17 +107,17 @@ index 0528a7e..065d912 100644
 +    let total = square(twice(n + 1)) + twice(n) * twice(n + 1);
      let k = 3 * double(n + 1) + double(double(n));
      log(1, 2);
-     grow_twice(&v, 7);
+     grow_twice(&mut v, 7i64);
 $ undo
 undid rewrote 1 site in 1 file	main.vl	+1 -1 lines
 ## A rewrite that breaks the program: nothing written.
 $ rewrite 'grow($v, $n)' 'grow($n, $v)'
-main.vl:10:10: error[type error] expected 'inout IntVec', got 'i64'  [edited: crate::main]
-main.vl:25:10: error[type error] expected 'inout IntVec', got 'i64'  [edited: crate::more]
-main.vl:26:10: error[type error] expected 'inout IntVec', got 'i64'  [edited: crate::more]
-main.vl:31:10: error[type error] expected 'inout IntVec', got 'i64' | note: in instantiation of 'grow_twice<i64>' at main.vl:20:5  [edited: crate::grow_twice]
-main.vl:32:10: error[type error] expected 'inout IntVec', got 'i64' | note: in instantiation of 'grow_twice<i64>' at main.vl:20:5  [edited: crate::grow_twice]
-error edit.breaks: 5 new errors; nothing written; the first: main.vl:10:10: expected 'inout IntVec', got 'i64'
+main.vl:10:10: error[type error] expected '&mut IntVec', got 'i32'  [edited: crate::main]
+main.vl:25:10: error[type error] expected '&mut IntVec', got 'i64'  [edited: crate::more]
+main.vl:26:10: error[type error] expected '&mut IntVec', got 'i64'  [edited: crate::more]
+main.vl:31:10: error[type error] expected '&mut IntVec', got 'i32' | note: in instantiation of 'grow_twice<i64>' at main.vl:20:5  [edited: crate::grow_twice]
+main.vl:32:10: error[type error] expected '&mut IntVec', got 'i32' | note: in instantiation of 'grow_twice<i64>' at main.vl:20:5  [edited: crate::grow_twice]
+error edit.breaks: 5 new errors; nothing written; the first: main.vl:10:10: expected '&mut IntVec', got 'i32'
 try: volec rewrite 'grow($v, $n)' 'grow($n, $v)' --no-check
 [exit 1]
 % git status --short

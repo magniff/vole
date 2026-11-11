@@ -65,10 +65,11 @@ it (`self.first = self.grid`) copies the cells and masks, with no
 allocation.
 
 ```tach
+#[derive(Clone, Copy)]
 struct Sudoku { cells: [u8; 81], rows: [u64; 9], cols: [u64; 9], boxes: [u64; 9] }
 
-fn candidates(self, i: i64) -> u64 {
-    ALL & ~(self.rows[i / 9] | self.cols[i % 9] | self.boxes[box_of(i)])
+fn candidates(&self, i: usize) -> u64 {
+    ALL & !(self.rows[i / 9] | self.cols[i % 9] | self.boxes[box_of(i)])
 }
 ```
 
@@ -78,43 +79,47 @@ fn candidates(self, i: i64) -> u64 {
 
 ```tach
 #[derive(Debug)]
-enum ParseError { Length(i64), BadChar(i64, u8), Conflict(i64, u8) }
+enum ParseError { Length(usize), BadChar(usize, u8), Conflict(usize, u8) }
 
-fn parse(text: [u8]) -> Result<Sudoku, ParseError> {
+fn parse(text: &str) -> Result<Sudoku, ParseError> {
     if text.len() != 81 { return Err(ParseError::Length(text.len())); }
-    var s = Sudoku::empty();
-    for (i, b) in text.iter().enumerate() {
-        if b == '.' || b == '0' { continue; }
+    let mut s = Sudoku::empty();
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'.' || b == b'0' { continue; }
         ...
 ```
 
 **The search** is `Search::fill`. It keeps the grid it is filling, the
-first solution, and counters; `Search::run` takes the solution limit as
-a default argument, so `Search::run(p)` proves uniqueness and
-`Search::run(p, limit: 1)` (a named argument) stops at the first:
+first solution, and counters; `Search::run` takes the solution limit,
+so `Search::run(p, 2)` proves uniqueness and `Search::run(p, 1)` stops
+at the first:
 
 ```tach
-fn run(puzzle: Sudoku, limit: i64 = 2) -> Search { ... }
+fn run(puzzle: Sudoku, limit: i64) -> Search { ... }
 ```
 
-The candidate loop takes the lowest bit with `m & (0 - m)`, turns it
-into a digit by counting the bits below it (`std::count_ones`), and
+`fill` picks its cell as an `Option<(usize, u64)>`, the cell and its
+candidates, and `let Some((cell, mask)) = best else { ... return; };`
+handles the full grid (a solution) on the spot.
+
+The candidate loop takes the lowest bit with `m & m.wrapping_neg()`,
+turns it into a digit by counting the bits below it (`count_ones`), and
 undoes its move after the recursive call:
 
 ```tach
-var m = best_mask;
+let mut m = mask;
 while m != 0 && self.found < self.limit {
-    let bit = m & (0 - m);
+    let bit = m & m.wrapping_neg();
     m ^= bit;
-    self.grid.place(best, (count_ones(bit - 1) + 1) as u8);
+    self.grid.place(cell, (bit - 1).count_ones() as u8 + 1);
     self.fill();
-    self.grid.clear(best);
+    self.grid.clear(cell);
 }
 ```
 
-**`count_ones`** (std, 0.19) counts the bits of a mask: on AArch64 it is
-the processor's population-count instruction (`cnt`), elsewhere a few
-branch-free operations. `use std::count_ones;` names it.
+**`count_ones`**, a method of every integer type, counts the bits of a
+mask: on AArch64 it is the processor's population-count instruction
+(`cnt`), elsewhere a few branch-free operations.
 
 **The disguises** map a puzzle to an equivalent one: shuffle the three
 bands of rows and the rows inside each band, the same for columns, and
@@ -180,19 +185,19 @@ instruction itself, about 10% faster again than the branch-free version
 | fixed-size arrays in a struct, copied as values | `Sudoku`, `Search` | `volec guide types` |
 | `Result` and an error enum with `#[derive(Debug)]`, `{e:?}` | `parse`, `main` | `volec guide conversions`, `guide formatting` |
 | `match` on `Ok` / `Err` | `main` | `volec guide syntax` |
-| default and named arguments: `limit: i64 = 2`, `run(p, limit: 1)` | `Search::run` | `volec guide core` |
-| methods taking `inout self` and writing through it | `place`, `clear`, `fill` | `volec guide core` |
-| bit operations on `u64`, `~`, wrapping `0 - m`; `std::count_ones` | `candidates`, `fill` | `volec guide types`, `guide std` |
-| iterators and closures: `enumerate`, `filter(\|d\| d != 0).count()` | `parse`, `clues` | `volec guide iterators`, `guide closures` |
-| `const` arrays of strings | `PUZZLES` | `volec guide syntax` |
-| slices of arrays passed to functions that write them | `Rng::shuffle`, `shuffle_lines` | `volec guide memory` |
+| `Option` of a tuple, `let ... else` | `fill` | `volec guide syntax` |
+| methods taking `&mut self` and writing through it | `place`, `clear`, `fill` | `volec guide core` |
+| bit operations on `u64`, `!`, `wrapping_neg`, `count_ones` | `candidates`, `fill` | `volec guide types`, `guide std` |
+| iterators and closures: `enumerate`, `filter(\|d\| **d != 0).count()` | `parse`, `clues` | `volec guide iterators`, `guide closures` |
+| `const` arrays of `&str` | `PUZZLES` | `volec guide syntax` |
+| arrays passed as `&mut [usize]` to functions that write them | `Rng::shuffle`, `shuffle_lines` | `volec guide memory` |
 | a C header: `import "time.h" as c;` | `now_ns` | `volec guide c-interop` |
 
 ## Try
 
 - Add your own puzzle to `PUZZLES` (and its length to the array type).
 - Count all solutions of a puzzle with fewer clues: `Search::run(p,
-  limit: 1_000_000)` on a puzzle with a few clues erased.
+  1_000_000)` on a puzzle with a few clues erased.
 - Pick the cell by a different rule (the first empty one) and compare
   the node counts.
 - Add "hidden singles" (a digit with only one possible cell in a row)
