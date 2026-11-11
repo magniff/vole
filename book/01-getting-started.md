@@ -28,8 +28,9 @@ Go, C, Java, it doesn't matter. You know what a variable, a function
 and a loop are. You do not need to know Rust or C++, although vole will
 look familiar if you do.
 
-Some vole code looks like Rust but means something different. Where
-that happens, you will see a note like this one:
+Vole is written the way Rust is: the same syntax, the same rules about
+who owns a value, the same names in its library. It differs in a few
+places, and where it does, you will see a note like this one:
 
 > **If you know Rust:** these asides are for you. Everyone else can skip
 > them.
@@ -240,7 +241,7 @@ Sometimes you want to know what a single expression does, and writing
 a whole program for it is too much ceremony. `volec try` runs a
 snippet and tells you its type and its value:
 
-```console
+```console mvs
 $ volec try '6 * 7'
 i64 = 42
 $ volec try 'let name = "vole"; name.len()'

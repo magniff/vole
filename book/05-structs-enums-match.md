@@ -22,7 +22,7 @@ A struct is a value with named fields. Let's make a player:
 struct Player { room: i64, moves: i64 }
 
 fn main() {
-    var player = Player { room: 0, moves: 0 };
+    let mut player = Player { room: 0, moves: 0 };
     player.room = 1;
     player.moves += 1;
     println("room {}, {} moves", player.room, player.moves);
@@ -36,7 +36,7 @@ room 1, 1 moves
 The `struct` line declares the type: its name, then each field with its
 type. `Player { room: 0, moves: 0 }` is a *struct literal*: it makes a
 `Player`, with a value for every field. `player.room` reads a field, and
-since `player` is a `var`, you can assign to a field too.
+since `player` is a `let mut`, you can assign to a field too.
 
 Every field needs a value. Forget one and the compiler says which:
 
@@ -59,6 +59,7 @@ When a variable has the same name as a field, you can leave out the
 moves: moves }`:
 
 ```vole
+#[derive(PartialEq)]
 struct Player { room: i64, moves: i64 }
 
 fn main() {
@@ -74,14 +75,16 @@ fn main() {
 true
 ```
 
-`==` compares two structs field by field. It works on any struct whose
-fields can be compared, with nothing to declare.
+`==` compares two structs field by field. A struct doesn't have it
+until you ask: the line `#[derive(PartialEq)]` above the struct tells
+the compiler to write the comparison for you. You'll meet a few more
+things to put in a `derive` as the book goes on.
 
-Remember the two kinds of values from chapter 4. A struct made of plain
-fields, like `Player`, is plain: `let b = a;` copies it. A struct with
-a `Vec` or a `String` in it is owned: `let b = a;` moves it, and it is
-dropped field by field when its owner goes away. You never say which;
-the fields decide.
+Remember ownership from chapter 4. A struct is a value with one owner:
+`let b = a;` moves it, whatever its fields are, and it is dropped field
+by field when its owner goes away. A struct made only of plain values,
+like `Player`, can ask to be copied instead, as numbers are, with
+`#[derive(Clone, Copy)]`.
 
 ## Methods
 
@@ -95,18 +98,18 @@ impl Player {
         Player { room: 0, moves: 0 }
     }
 
-    fn describe(self) {
+    fn describe(&self) {
         println("You are in room {}, after {} moves.", self.room, self.moves);
     }
 
-    fn walk_to(inout self, room: i64) {
+    fn walk_to(&mut self, room: i64) {
         self.room = room;
         self.moves += 1;
     }
 }
 
 fn main() {
-    var player = Player::new();
+    let mut player = Player::new();
     player.describe();
     player.walk_to(2);
     player.describe();
@@ -122,9 +125,10 @@ There are two kinds of functions here:
 
 - `describe` and `walk_to` are *methods*: their first parameter is
   `self`, the value they're called on, and you call them with a dot,
-  `player.describe()`. As chapter 4 showed, `self` reads the player,
-  `inout self` changes it (so `player` must be a `var`), and `sink
-  self` would take it.
+  `player.describe()`. As chapter 4 showed, `&self` borrows the player
+  to read it, `&mut self` borrows it to change it (so `player` must be
+  a `let mut`), and a plain `self` would take it. The call needs no `&`:
+  the dot borrows for you.
 - `new` has no `self`. It's an *associated function*: it belongs to the
   type but isn't called on a value, and you call it with the type's
   name, `Player::new()`. A function called `new` that makes a value is
@@ -153,9 +157,9 @@ data. Here are the commands our player can type:
 ```vole
 enum Direction { North, South, East, West }
 
-enum Command {
+enum Command<'a> {
     Go(Direction),
-    Take { item: str },
+    Take { item: &'a str },
     Look,
     Quit,
 }
@@ -163,9 +167,13 @@ enum Command {
 
 - `Go(Direction)` carries a direction, by position, like a tuple:
   `Command::Go(Direction::North)`.
-- `Take { item: str }` carries a named field, like a struct:
+- `Take { item: &'a str }` carries a named field, like a struct:
   `Command::Take { item: "lamp" }`.
 - `Look` and `Quit` carry nothing.
+
+The `'a` is a lifetime, as in chapter 4: a `Take` borrows its text from
+somewhere, and `Command<'a>` says a command can't outlive the text it
+borrows. Any type that holds a reference is written this way.
 
 That's something a struct can't express well. With a struct, you'd have
 a `kind` field plus a `direction` and an `item` that make sense only for
@@ -178,6 +186,7 @@ write them without the prefix:
 ```vole
 use Direction::{North, South};
 
+#[derive(PartialEq)]
 enum Direction { North, South, East, West }
 
 fn opposite_of_north() -> Direction {
@@ -201,14 +210,14 @@ on it:
 ```vole
 enum Direction { North, South, East, West }
 
-enum Command {
+enum Command<'a> {
     Go(Direction),
-    Take { item: str },
+    Take { item: &'a str },
     Look,
     Quit,
 }
 
-fn explain(c: Command) -> str {
+fn explain(c: Command) -> &str {
     match c {
         Command::Go(Direction::North) => "walk north",
         Command::Go(_) => "walk somewhere else",
@@ -219,10 +228,10 @@ fn explain(c: Command) -> str {
 }
 
 fn main() {
-    println(explain(Command::Go(Direction::North)));
-    println(explain(Command::Go(Direction::West)));
-    println(explain(Command::Take { item: "lamp" }));
-    println(explain(Command::Quit));
+    println("{}", explain(Command::Go(Direction::North)));
+    println("{}", explain(Command::Go(Direction::West)));
+    println("{}", explain(Command::Take { item: "lamp" }));
+    println("{}", explain(Command::Quit));
 }
 ```
 
@@ -247,7 +256,7 @@ runs. Patterns can do several things at once:
   variant's data: there is no `c.item`.
 
 Like `if`, a `match` is an expression, and each arm gives a value of the
-same type. Here, every arm is a `str`, and the `match` is the body's
+same type. Here, every arm is a `&str`, and the `match` is the body's
 last expression, so it's what `explain` returns.
 
 ### More patterns
@@ -256,7 +265,7 @@ Patterns aren't only for enums. You can match numbers, tuples and
 `bool`s too, with a few more tricks:
 
 ```vole
-fn moves_message(moves: i64) -> str {
+fn moves_message(moves: i64) -> &'static str {
     match moves {
         0 => "You haven't moved yet.",
         1 | 2 => "You're just getting started.",
@@ -268,7 +277,7 @@ fn moves_message(moves: i64) -> str {
 
 fn main() {
     for m in [0, 2, 5, 20, 21] {
-        println(moves_message(m));
+        println("{}", moves_message(m));
     }
 }
 ```
@@ -286,6 +295,11 @@ You've been everywhere.
 - `n if n % 10 == 0` binds the number to `n`, then runs a *guard*: the
   arm fits only if the condition holds;
 - `_` takes everything left.
+
+(The result type `&'static str` is a string literal's type: text that
+is part of the program, and so lives as long as it runs. A function
+with no reference among its parameters has nothing else to borrow its
+result from.)
 
 Tuples make it easy to match on two things at once. Here's the map of
 our adventure, matched on a pair of the current room and a direction:
@@ -315,7 +329,7 @@ is an error; compare with `==` instead:
 ```vole
 enum Direction { North, South, East, West }
 
-fn direction(word: str) -> Direction {
+fn direction(word: &str) -> Direction {
     if word == "north" {
         Direction::North
     } else if word == "south" {
@@ -340,14 +354,14 @@ A `match` has to cover every possible value. Leave a variant out:
 ```vole
 enum Direction { North, South, East, West }
 
-enum Command {
+enum Command<'a> {
     Go(Direction),
-    Take { item: str },
+    Take { item: &'a str },
     Look,
     Quit,
 }
 
-fn verb(c: Command) -> str {
+fn verb(c: Command) -> &'static str {
     match c {
         Command::Go(_) => "go",
         Command::Take { .. } => "take",
@@ -356,7 +370,7 @@ fn verb(c: Command) -> str {
 }
 
 fn main() {
-    println(verb(Command::Look));
+    println("{}", verb(Command::Look));
 }
 ```
 
@@ -378,15 +392,15 @@ let the player drop things, and add a variant:
 ```vole
 enum Direction { North, South, East, West }
 
-enum Command {
+enum Command<'a> {
     Go(Direction),
-    Take { item: str },
-    Drop { item: str },
+    Take { item: &'a str },
+    Drop { item: &'a str },
     Look,
     Quit,
 }
 
-fn verb(c: Command) -> str {
+fn verb(c: Command) -> &'static str {
     match c {
         Command::Go(_) => "go",
         Command::Take { .. } => "take",
@@ -493,7 +507,7 @@ an `Option`, `None` once it's empty, so this empties a list:
 
 ```vole
 fn main(gpa: Gpa) {
-    var path: Vec<i64, Gpa> = Vec::new_in(gpa);
+    let mut path: Vec<i64, Gpa> = Vec::new_in(gpa);
     path.push(0);
     path.push(1);
     path.push(2);
@@ -514,7 +528,7 @@ the `else` block when it doesn't. The `else` block must leave (with
 always there. It's the tidiest way to write "get this, or give up":
 
 ```vole
-fn first_word(line: str) -> str {
+fn first_word(line: &str) -> &str {
     let Some((word, _)) = line.split_once(" ") else {
         return line;
     };
@@ -522,8 +536,8 @@ fn first_word(line: str) -> str {
 }
 
 fn main() {
-    println(first_word("take lamp"));
-    println(first_word("look"));
+    println("{}", first_word("take lamp"));
+    println("{}", first_word("look"));
 }
 ```
 
@@ -545,15 +559,14 @@ working with:
 
 ```vole adventure.vl
 use std::io;
-use std::io::BufReader;
 
 #[derive(Debug)]
 enum Direction { North, South, East, West }
 
 #[derive(Debug)]
-enum Command {
+enum Command<'a> {
     Go(Direction),
-    Take { item: str },
+    Take { item: &'a str },
     Look,
     Quit,
 }
@@ -565,7 +578,7 @@ impl Player {
         Player { room: 0, moves: 0, lamp: false }
     }
 
-    fn describe(self) {
+    fn describe(&self) {
         let name = match self.room {
             0 => "the hall",
             1 => "the kitchen",
@@ -575,7 +588,7 @@ impl Player {
     }
 
     // Returns false when the game is over.
-    fn apply(inout self, c: Command) -> bool {
+    fn apply(&mut self, c: Command) -> bool {
         match c {
             Command::Go(d) => match next_room(self.room, d) {
                 Some(r) => {
@@ -610,7 +623,7 @@ fn next_room(room: i64, d: Direction) -> Option<i64> {
     }
 }
 
-fn parse(line: str) -> Option<Command> {
+fn parse(line: &str) -> Option<Command> {
     if line == "look" {
         return Some(Command::Look);
     }
@@ -641,13 +654,12 @@ fn parse(line: str) -> Option<Command> {
 }
 
 fn main(gpa: Gpa) {
-    var input = BufReader::new(io::stdin());
-    var line = String::new_in(gpa);
-    var player = Player::new();
+    let mut line = String::new_in(gpa);
+    let mut player = Player::new();
     player.describe();
     loop {
         line.clear();
-        if input.read_line(&line).unwrap() == 0 {
+        if io::stdin().read_line(&mut line).unwrap() == 0 {
             break;
         }
         let Some(c) = parse(line.trim()) else {
@@ -698,9 +710,10 @@ A few things to notice:
   itself a `match`. Matches nest like any other expression.
 - In the `Quit` arm, `return false` leaves the whole method. Its type
   is "never returns", so it fits in an arm whose neighbours are `()`.
-- A `Command::Take` holds a `str`, a view of the line the player typed
-  (chapter 4). That's fine, because each command is used up before the
-  next `line.clear()` changes the line.
+- A `Command::Take` holds a `&str` borrowed from the line the player
+  typed (chapter 4). That's fine, because each command is used up by
+  `apply` before the next `line.clear()` changes the line; keep a
+  command across that call, and the borrow checker objects.
 - The `// Returns false...` line is a comment above a method; that's
   how vole code documents an item.
 
@@ -712,6 +725,7 @@ number:
 
 ```vole light.vl
 #[repr(u8)]
+#[derive(PartialEq)]
 enum Light { Dark = 0, Dim = 1, Bright = 2 }
 
 fn main() {
@@ -730,7 +744,7 @@ fn main() {
 ```out exit=101
 1
 bright
-light.vl:12:15: invalid value 7 for enum Light
+light.vl:13:15: invalid value 7 for enum Light
 ```
 
 `as` converts both ways. From an enum to a number it can't fail. From a
@@ -743,11 +757,12 @@ panic, naming the line.
 You can now define your own types:
 
 - structs with named fields, struct literals (and the `{ room, moves }`
-  shorthand), field access and assignment, and `==` field by field;
-- methods with `self`, `inout self` and `sink self` in `impl` blocks,
+  shorthand), field access and assignment, and `==` field by field
+  with `#[derive(PartialEq)]`;
+- methods with `&self`, `&mut self` and `self` in `impl` blocks,
   and associated functions like `Player::new()`;
 - enums whose variants carry nothing, data by position, or named
-  fields;
+  fields, and a lifetime when they borrow;
 - `match` with variants, nested patterns, `_`, bindings, `|`, ranges,
   guards and tuples, and `..` to leave fields out;
 - exhaustive matches, and how they find every place a new variant
@@ -762,7 +777,7 @@ operator, and panics.
 
 ## Try it yourself
 
-- Add a `Drop { item: str }` command. Let the compiler tell you every
+- Add a `Drop { item: &'a str }` command. Let the compiler tell you every
   place that needs to handle it, and make dropping the lamp work.
 - Add a fourth room, the cellar, below the kitchen, reached with `go
   down`. You'll need a new `Direction` variant; what does the compiler
