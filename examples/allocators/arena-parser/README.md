@@ -26,7 +26,7 @@ $ volec main.vl -o parser && ./parser 2>/dev/null
 (1 2): no operator at byte 1
 input: 1771952 bytes, 134180 lists (one allocation each)
 value: -9194208206490895369, the same three ways: true
-the tree in the arena: 33773 KB
+the tree in the arena: 25176 KB
 ok: built parser
 ```
 
@@ -44,16 +44,16 @@ Arena::scope         8176     2721        0
 
 The tree's type names its allocator:
 
-```tach
+```vole
 struct Node<A: Allocator> { op: u8, num: i64, kids: Vec<Node<A>, A> }
 ```
 
 and every function that builds one is generic over it, taking the
-allocator as a value (`a: sink A`) and passing it to each `Vec` it makes:
+allocator as a value (`a: A`) and passing it to each `Vec` it makes:
 
-```tach
-fn parse<A: Allocator>(src: [u8], a: sink A) -> Result<(Node<A>, i64), ParseError>
-fn parse_expr<A: Allocator>(p: inout Parser<A>, t: Tok) -> Result<Node<A>, ParseError>
+```vole
+fn parse<A: Allocator>(src: &[u8], a: A) -> Result<(Node<A>, i64), ParseError>
+fn parse_expr<A: Allocator>(p: &mut Parser<'_, A>, t: Tok<'_>) -> Result<Node<A>, ParseError>
 ```
 
 The caller chooses. On `Gpa`, `parse(text, gpa)` returns a
@@ -61,31 +61,30 @@ The caller chooses. On `Gpa`, `parse(text, gpa)` returns a
 it (the drop glue of `Node` and `Vec`: a walk over the whole tree). In
 an arena:
 
-```tach
-values[1] = arena_scope(gpa, |a| {
+```vole
+values[1] = arena_scope(&gpa, |a| {
     let (tree, _) = parse(text, a).unwrap();
-    let v = eval(tree);
-    std::forget(tree);
+    let v = eval(&tree);
+    std::mem::forget(tree);
     v
 });
 ```
 
-`arena_scope(gpa, f)` makes an arena (its memory from `gpa`), calls `f`
-with it (an `a: ScopedArena`), and frees all of it when `f` returns.
-Dropping the tree would walk it to free each list, which on an arena
-frees nothing: `std::forget(tree)` skips the walk, and the scope's end
+`arena_scope(&gpa, f)` makes an arena (its memory from `gpa`), calls `f`
+with a reference to it (an `a: &ArenaScope`), and frees all of it when
+`f` returns. Dropping the tree would walk it to free each list, which on
+an arena frees nothing: `std::mem::forget(tree)` skips the walk, and the scope's end
 frees the memory (a forgotten value is a leak only on an allocator
 that frees block by block). The tree cannot
-outlive the scope either: returning it, or anything holding a
-`ScopedArena`, is a compile error (see [scoped-arena](../scoped-arena/));
+outlive the scope either: returning it, or anything that borrows the
+`ArenaScope`, is a compile error (see [scoped-arena](../scoped-arena/));
 here only the `i64` value leaves.
 
 The third way keeps one `Arena` for every round: `Arena::new_in(gpa)`
 once, and `arena.scope(|a| ...)` per round, which rewinds the arena at
 its end but keeps its memory for the next round (instead of giving it
-back to `Gpa` and asking again). `unsafe { arena.free_all() }` gives it
-back at the end: unsafe because nothing stops a view into the arena
-from being used after it (a scope has no such hole).
+back to `Gpa` and asking again). The arena gives it back when it is
+dropped, at the end of `main`.
 
 ## Arena-friendly allocation
 
@@ -100,11 +99,11 @@ So the children of the lists being parsed wait on one shared stack, and
 when a list's `)` comes, its children are moved into a `Vec` of exactly
 their number:
 
-```tach
+```vole
 Tok::Close => {
     // moved off the stack, in order
     let n = p.stack.len() - base;
-    var kids: Vec<Node<A>, A> = Vec::with_capacity_in(n, p.a);
+    let mut kids: Vec<Node<A>, A> = Vec::with_capacity_in(n, p.a);
     for _ in 0..n {
         kids.push(p.stack.remove(base));
     }
@@ -123,38 +122,41 @@ comparison is the allocator's cost, not a different algorithm.
   any allocation the parse takes 6.0 ms; macOS's `malloc` for small
   blocks is about 12 ns), and a bump saves little of that small part.
 - **Bigger nodes**: a container carries its allocator. A `Gpa` is zero
-  bytes, so `Vec<Node<Gpa>>` is 24 bytes and a node 40; a `ScopedArena`
-  is a 16-byte handle, so the same node is 56 bytes, the tree is 40%
-  larger, and copying the nodes around costs more (most of the
-  difference in the parse column). `Arena` is an 8-byte handle.
-- **Memory held**: the arena's scope used 33 MB, about what the nodes
+  bytes, so a `Vec<Node<Gpa>, Gpa>` is 24 bytes and a node 40; a
+  `&ArenaScope` is a pointer, so the same node is 48 bytes, the tree is
+  20% larger, and copying the nodes around costs more.
+- **Memory held**: the arena's scope used 25 MB, about what the nodes
   take (plus the stack's growth); `query effects` below shows that the
   arena instances allocate nothing from `Gpa` directly.
 
 ## What the effects say
 
 ```console
-$ volec query effects parse eval
+$ volec query effects crate::parse eval
 parse<Gpa>	alloc(Gpa) panic diverge
-parse<ScopedArena>	alloc(ScopedArena) panic diverge
+parse<&ArenaScope<&Gpa>>	alloc(ArenaScope<&Gpa>) panic diverge
+parse<&ArenaScope<Gpa>>	alloc(ArenaScope<Gpa>) panic diverge
 eval<Gpa>	diverge
-eval<ScopedArena>	diverge
+eval<&ArenaScope<&Gpa>>	diverge
+eval<&ArenaScope<Gpa>>	diverge
 ```
 
-Each generic function has one line per instance: `parse<ScopedArena>`
-allocates only from the arena, `parse<Gpa>` only from `Gpa`. `eval` was
-declared `#[no_alloc]`, and the compiler checked it for both trees.
-(`diverge` is the recursion: a parser of nested lists recurses.)
+Each generic function has one line per instance (the two arena lines
+are `arena_scope`'s arena, made from `&gpa`, and the kept `Arena`'s
+scope): an arena instance of `parse` allocates only from its arena,
+`parse<Gpa>` only from `Gpa`. `eval` was declared `#[no_alloc]`, and
+the compiler checked it for all three trees. `diverge` is the
+recursion: a parser of nested lists recurses, and so does the walk.
+`panic` is `parse`'s only: an index, a `Vec` too large.
+(`crate::parse` names this program's `parse`; std has one too.)
 
 ## The bug the arena would have hidden
 
 On `Gpa`, a parse error halfway (`(+ 1 (* 2 3)`, an unclosed list)
 returns with lists already built: the finished children waiting on the
-stack. A 0.16 version leaked them, and `--check-alloc` listed the two
-blocks at exit; it had to free what waited on the stack before
-returning the error. Since 0.17 the stack and what it holds are dropped
-on every exit of `parse`, the early return of `?` included, so there is
-nothing to remember; in an arena the scope's end frees them with the
+stack. The stack and what it holds are dropped on every exit of
+`parse`, the early return of `?` included, so there is nothing to
+remember, and `--check-alloc` lists no block left at exit; in an arena the scope's end frees them with the
 rest. (`--check-alloc` gives each block pages
 of its own: the whole program takes about 7 seconds under it, most of
 them in the kernel.)

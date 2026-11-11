@@ -1,3 +1,4 @@
+// EDITION: rust
 // The glyph atlas (terminal.md §3.5): glyphs rasterized on first use and
 // packed into shelves of two pages, R8 coverage (2048²) and RGBA8 colour
 // (1024², made on the first colour glyph), with a table of entries the
@@ -28,6 +29,8 @@
 // the renderer it happened.
 
 use std::gpu;
+use std::alloc::Allocator;
+use std::collections::HashMap;
 use std::gpu::{BufferUsage, Format, TextureUsage};
 
 use super::font::Font;
@@ -38,6 +41,7 @@ pub const COLOR_PAGE: i64 = 1024;
 const MAX_ENTRIES: i64 = 65536;
 
 // A shelf: a row of the page `h` texels high, filled from the left.
+#[derive(Clone, Copy)]
 struct Shelf {
     y: i64,
     h: i64,
@@ -58,7 +62,7 @@ impl Packer<Gpa> {
 
     // A place for w × h texels, with a texel of space after each glyph
     // (no neighbour bleeds in, whatever the sampling); None when full.
-    fn place(inout self, w: i64, h: i64) -> Option<(i64, i64)> {
+    fn place(&mut self, w: i64, h: i64) -> Option<(i64, i64)> {
         let w1 = w + 1;
         let h1 = h + 1;
         for i in 0..self.shelves.len() {
@@ -75,10 +79,10 @@ impl Packer<Gpa> {
         let y = self.top;
         self.shelves.push(Shelf { y: y, h: h1, x: w1 });
         self.top += h1;
-        Some((0, y))
+        Some((0i64, y))
     }
 
-    fn clear(inout self) {
+    fn clear(&mut self) {
         self.shelves.clear();
         self.top = 0;
     }
@@ -121,7 +125,7 @@ fn key(c: u32, style: i64, cells: i64) -> i64 {
 }
 
 // [lo, hi) grown to hold [a, b).
-fn grow(r: inout [i64; 2], a: i64, b: i64) {
+fn grow(r: &mut [i64; 2], a: i64, b: i64) {
     if r[0] >= r[1] {
         r[0] = a;
         r[1] = b;
@@ -132,7 +136,7 @@ fn grow(r: inout [i64; 2], a: i64, b: i64) {
 }
 
 impl Atlas<Gpa> {
-    pub fn new_in(dev: gpu::Device<Gpa>, gpa: Gpa) -> Atlas<Gpa> {
+    pub fn new_in(dev: &gpu::Device<Gpa>, gpa: Gpa) -> Atlas<Gpa> {
         let cov = dev.texture(COV_PAGE, COV_PAGE, Format::R8Unorm, usage: PAGE_USAGE);
         // A 1 × 1 stand-in until the first colour glyph (the shader binds
         // a colour page in every draw).
@@ -145,17 +149,17 @@ impl Atlas<Gpa> {
             color: color,
             has_color: false,
             table: table,
-            entries: Vec::filled_in(MAX_ENTRIES as usize * 8, 0, gpa),
+            entries: Vec::from_elem_in(0u16, MAX_ENTRIES as usize * 8, gpa),
             count: 1,
             pages: 0,
-            cov_px: Vec::filled_in(COV_PAGE as usize * COV_PAGE as usize, 0, gpa),
+            cov_px: Vec::from_elem_in(0u8, COV_PAGE as usize * COV_PAGE as usize, gpa),
             color_px: Vec::new_in(gpa),
-            cov_dirty: [0, 0],
-            color_dirty: [0, 0],
-            entries_dirty: [0, 0],
+            cov_dirty: [0i64, 0],
+            color_dirty: [0i64, 0],
+            entries_dirty: [0i64, 0],
             cov_pack: Packer::new_in(COV_PAGE, gpa),
             color_pack: Packer::new_in(COLOR_PAGE, gpa),
-            ascii: Vec::filled_in(4 * 128, 0, gpa),
+            ascii: Vec::from_elem_in(0i32, 4 * 128, gpa),
             map: HashMap::new_in(gpa),
             generation: 0,
             gpa: gpa,
@@ -164,7 +168,7 @@ impl Atlas<Gpa> {
 
     // Forgets every glyph (the pages' texels are overwritten as glyphs
     // are added again).
-    pub fn clear(inout self) {
+    pub fn clear(&mut self) {
         self.count = 1;
         self.cov_pack.clear();
         self.color_pack.clear();
@@ -178,34 +182,37 @@ impl Atlas<Gpa> {
     // Writes what was added since the last flush: one write of the rows
     // each page gained, one of the table's new entries. The queue orders
     // them after the frames already submitted and before the next.
-    pub fn flush(inout self, queue: inout gpu::Queue) {
+    pub fn flush(&mut self, queue: &mut gpu::Queue) {
         if self.cov_dirty[0] < self.cov_dirty[1] {
             let (y0, y1) = (self.cov_dirty[0], self.cov_dirty[1]);
-            queue.write_texture(self.cov, self.cov_px[y0 * COV_PAGE..y1 * COV_PAGE], COV_PAGE,
-                y: y0, h: y1 - y0);
-            self.cov_dirty = [0, 0];
+            queue.write_texture(&self.cov,
+                &self.cov_px[(y0 * COV_PAGE) as usize..(y1 * COV_PAGE) as usize], COV_PAGE, y: y0,
+                h: y1 - y0);
+            self.cov_dirty = [0i64, 0];
         }
         if self.color_dirty[0] < self.color_dirty[1] {
             let (y0, y1) = (self.color_dirty[0], self.color_dirty[1]);
             let row = COLOR_PAGE * 4;
-            queue.write_texture(self.color, self.color_px[y0 * row..y1 * row], row, y: y0,
-                h: y1 - y0);
-            self.color_dirty = [0, 0];
+            queue.write_texture(&self.color,
+                &self.color_px[(y0 * row) as usize..(y1 * row) as usize], row, y: y0, h: y1 - y0);
+            self.color_dirty = [0i64, 0];
         }
         if self.entries_dirty[0] < self.entries_dirty[1] {
             let (n0, n1) = (self.entries_dirty[0], self.entries_dirty[1]);
+            let first = &self.entries[(n0 * 8) as usize] as *const u16 as *const u8;
+            // UNSAFE: write_buffer takes bytes, and std has no view of u16s as bytes.
             // SAFETY: entries n0..n1 are (n1 - n0) * 8 u16s of the Vec
             // (n1 <= MAX_ENTRIES: write_entry checks n), 16 bytes each.
             let bytes = unsafe {
-                (&self.entries[n0 * 8] as *u8)[0..(n1 - n0) * ENTRY_BYTES]
+                std::slice::from_raw_parts(first, ((n1 - n0) * ENTRY_BYTES) as usize)
             };
-            queue.write_buffer(self.table, n0 * ENTRY_BYTES, bytes);
-            self.entries_dirty = [0, 0];
+            queue.write_buffer(&self.table, n0 * ENTRY_BYTES, bytes);
+            self.entries_dirty = [0i64, 0];
         }
     }
 
     // Entry n, in the CPU's copy of the table (written by `flush`).
-    fn write_entry(inout self, n: i64, x: i64, y: i64, w: i64, h: i64, ox: i64, oy: i64,
+    fn write_entry(&mut self, n: i64, x: i64, y: i64, w: i64, h: i64, ox: i64, oy: i64,
         kind: i64) {
         if n < 0 || n >= MAX_ENTRIES {
             panic("atlas: entry out of range");
@@ -213,19 +220,19 @@ impl Atlas<Gpa> {
         let i = n * 8;
         let v: [i64; 8] = [x, y, w, h, ox, oy, kind, 0];
         for k in 0..8 {
-            self.entries[i + k] = v[k] as u16;
+            self.entries[(i + k) as usize] = v[k as usize] as u16;
         }
-        grow(&self.entries_dirty, n, n + 1);
+        grow(&mut self.entries_dirty, n, n + 1);
     }
 
     // The entry of `c` in `style` over `cells` cells, rasterized and
     // packed on first use: 0 for an empty glyph, -1 when the atlas is
     // full (the caller clears it and starts again). `dev` makes the
     // colour page on the first colour glyph.
-    pub fn lookup(inout self, font: inout Font<Gpa>, dev: gpu::Device<Gpa>, c: u32, style: i64,
+    pub fn lookup(&mut self, font: &mut Font<Gpa>, dev: &gpu::Device<Gpa>, c: u32, style: i64,
         cells: i64) -> i64 {
         if c > 32 && c < 127 && cells == 1 {
-            let e = self.ascii[style * 128 + c as i64] as i64;
+            let e = self.ascii[(style * 128 + c as i64) as usize] as i64;
             if e != 0 {
                 return e;
             }
@@ -233,15 +240,15 @@ impl Atlas<Gpa> {
             if c <= 32 {
                 return 0;
             }
-            match self.map.get(key(c, style, cells)) {
+            match self.map.get(&key(c, style, cells)).copied() {
                 Some(e) => return e,
                 None => {}
             }
         }
-        let e = self.add(&font, dev, c, style, cells);
+        let e = self.add(font, dev, c, style, cells);
         if e >= 0 {
             if c > 32 && c < 127 && cells == 1 {
-                self.ascii[style * 128 + c as i64] = e as i32;
+                self.ascii[(style * 128 + c as i64) as usize] = e as i32;
             } else {
                 self.map.insert(key(c, style, cells), e);
             }
@@ -249,7 +256,7 @@ impl Atlas<Gpa> {
         e
     }
 
-    fn add(inout self, font: inout Font<Gpa>, dev: gpu::Device<Gpa>, c: u32, style: i64, cells: i64) -> i64 {
+    fn add(&mut self, font: &mut Font<Gpa>, dev: &gpu::Device<Gpa>, c: u32, style: i64, cells: i64) -> i64 {
         let g = font.raster(c, style, cells);
         if g.w == 0 {
             return 0;
@@ -259,7 +266,7 @@ impl Atlas<Gpa> {
         }
         if g.color && !self.has_color {
             self.color = dev.texture(COLOR_PAGE, COLOR_PAGE, Format::Rgba8Unorm, usage: PAGE_USAGE);
-            self.color_px = Vec::filled_in(COLOR_PAGE as usize * COLOR_PAGE as usize * 4, 0,
+            self.color_px = Vec::from_elem_in(0u8, COLOR_PAGE as usize * COLOR_PAGE as usize * 4,
                 self.gpa);
             self.has_color = true;
             self.pages += 1;
@@ -272,7 +279,7 @@ impl Atlas<Gpa> {
                 // the glyph's inked box into the page's copy
                 let px = font.pixels(g.color);
                 let row = font.row_bytes(g.color);
-                let bpp = if g.color { 4 } else { 1 };
+                let bpp: i64 = if g.color { 4 } else { 1 };
                 let page_row = if g.color { COLOR_PAGE * 4 } else { COV_PAGE };
                 let n = g.w * bpp;
                 for r in 0..g.h {
@@ -280,18 +287,18 @@ impl Atlas<Gpa> {
                     let dst = (y + r) * page_row + x * bpp;
                     if g.color {
                         for k in 0..n {
-                            self.color_px[dst + k] = px[src + k];
+                            self.color_px[(dst + k) as usize] = px[(src + k) as usize];
                         }
                     } else {
                         for k in 0..n {
-                            self.cov_px[dst + k] = px[src + k];
+                            self.cov_px[(dst + k) as usize] = px[(src + k) as usize];
                         }
                     }
                 }
                 if g.color {
-                    grow(&self.color_dirty, y, y + g.h);
+                    grow(&mut self.color_dirty, y, y + g.h);
                 } else {
-                    grow(&self.cov_dirty, y, y + g.h);
+                    grow(&mut self.cov_dirty, y, y + g.h);
                 }
                 let e = self.count;
                 self.count += 1;
@@ -302,18 +309,18 @@ impl Atlas<Gpa> {
     }
 
     // An entry's fields (for the CPU reference renderer in the tests).
-    pub fn entry(self, n: i64) -> [i64; 7] {
-        var out: [i64; 7] = [0; 7];
+    pub fn entry(&self, n: i64) -> [i64; 7] {
+        let mut out: [i64; 7] = [0i64; 7];
         if n < 0 || n >= self.count {
             return out;
         }
         for k in 0..7 {
-            out[k] = self.entries[n * 8 + k] as i64;
+            out[k as usize] = self.entries[(n * 8 + k) as usize] as i64;
         }
         out
     }
 
-    pub fn has_color_page(self) -> bool {
+    pub fn has_color_page(&self) -> bool {
         self.has_color
     }
 }

@@ -767,8 +767,7 @@ crate::count::counts_add_up	alloc(Gpa) panic diverge
 
 Allocation, panics and loops, and no `io` in anything the program
 runs. The generic `add_words` is listed once for each allocator it's
-used with, and once as `add_words<A>`, the function before an allocator
-is chosen, about which nothing is known. The tests are listed too,
+used with. The tests are listed too,
 since they're functions of the module. The
 `#[no_io]` marks make this a rule, not just an observation. Suppose
 someone adds a debugging print to `count`, with chapter 17's `edit
