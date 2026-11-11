@@ -6,7 +6,7 @@ $ check tok.vl
 tok.vl:1:5: error[type error] unknown module 'st' | help: tok.vl was checked as a program of its own (no `mod tok;` in main.vl names it), so st.vl beside it is not its module: a module is checked through its program's root, once the root has `mod tok;` | try: volec check main.vl
 [exit 1]
 ## Once main.vl names it, checking the module checks its program.
-% printf 'mod st;\nmod tok;\n\nfn main() {\n    let n = st::one() + tok::two();\n}\n' > main.vl
+% printf 'mod st;\nmod tok;\n\nfn main() {\n    let n = st::one() + tok::two();\n}\n// EDITION: rust\n' > main.vl
 $ check tok.vl
 ok: 0 errors in main.vl
 ## `volec test a.vl b.vl`: test takes the program's root, which pulls in
