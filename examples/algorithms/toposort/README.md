@@ -69,9 +69,9 @@ place. `for (from, _) in edges` destructures each pair; an `i32` indexes
 a slice directly:
 
 ```tach
-var start = Vec::filled_in(n + 1, 0, gpa);
+let mut start = Vec::from_elem_in(0i64, n as usize + 1, gpa);
 let s = start.as_mut_slice();
-for (from, _) in edges { s[from + 1] += 1; }
+for (from, _) in edges.iter().copied() { s[from + 1] += 1; }
 for v in 0..n { s[v + 1] += s[v]; }
 ```
 
@@ -83,11 +83,11 @@ number of nodes it could not place. The output `Vec` is also the
 queue: the nodes before `head` are done, the ones after it wait:
 
 ```tach
-var head = 0;
+let mut head = 0;
 while head < order.len() {
     let v = order[head];
     head += 1;
-    for u in g.edges(v) {
+    for u in g.edges(v).iter().copied() {
         deg[u] -= 1;
         if deg[u] == 0 { order.push(u); }
     }
@@ -105,8 +105,8 @@ if `position` finds nothing (it cannot: a grey node is on the stack):
 ```tach
 let u = targets[k];
 if col[u] == GREY {
-    let from = stack.iter().position(|(w, _)| w == u)?; // grey: on the stack
-    let cycle = stack.as_slice()[from..].iter().map(|(w, _)| w).collect_in(gpa);
+    let from = stack.iter().position(|e| e.0 == u)?; // grey: on the stack
+    let cycle = stack[from..].iter().map(|e| e.0).collect_in(gpa);
     return Some(cycle);
 }
 ```
@@ -116,27 +116,27 @@ if col[u] == GREY {
 parse and once (inside `order`) on the sort:
 
 ```tach
-enum PlanError { Syntax([u8]), Cycle(Vec<[u8]>) }
+enum PlanError<'a, A: Allocator> { Syntax(&'a str), Cycle(Vec<&'a str, A>) }
 
-fn plan_order(lines: [[u8]], gpa: Gpa) -> Result<Vec<[u8]>, PlanError> {
+fn plan_order<'a>(lines: &[&'a str], gpa: Gpa) -> Result<Vec<&'a str, Gpa>, PlanError<'a, Gpa>> {
     let plan = Plan::parse(lines, gpa)?;
-    plan.order(gpa) // the names are views of `lines`, not of the plan
+    plan.order(gpa) // the names borrow the text of `lines` ('a), not the plan
 }
 ```
 
 The sort's error is a `Cycle` of node numbers; `order` turns it into a
 `PlanError::Cycle` of task names with `map_err` and a closure that
-captures the plan (`order` and `named` only read it: `self`, a `let`
-receiver), then `?` returns it:
+captures the plan (`order` and `named` only read it: `&self`), then `?`
+returns it:
 
 ```tach
-let order = sort(g, gpa).map_err(|c| self.named(c, gpa))?;
-Ok(order.iter().map(|v| self.names[v]).collect_in(gpa))
+let order = sort(&g, gpa).map_err(|c| self.named(&c, gpa))?;
+Ok(order.iter().map(|v| self.names[*v]).collect_in(gpa))
 ```
 
-Task names are mapped to numbers with a `HashMap<[u8], i64>`; the names
-themselves are views of the input lines (`split_whitespace_in` returns
-slices of its argument), so nothing is copied.
+Task names are mapped to numbers with a `HashMap<&str, i64, Gpa>`; the
+names themselves are slices of the input lines (`split_whitespace`
+yields slices of its text), so nothing is copied.
 
 **The random DAG** hides a random permutation of the nodes
 (Fisher-Yates) and points each random edge from the lower-ranked node
@@ -186,12 +186,11 @@ program, generation and checks included, runs in about 0.3 s.
 | `Result`, `?`, `map_err` with a closure | `plan_order`, `Plan::order` | `volec guide conversions` |
 | `Option` and `?` | `find_cycle` | `volec guide conversions` |
 | enums with payloads, matched by variant | `PlanError`, `print_plan` | `volec guide syntax` |
-| `HashMap<[u8], i64>`, `split_whitespace_in` (views, no copies) | `Plan` | `volec guide std` |
+| `HashMap<&str, i64, Gpa>`, `split_whitespace` (slices, no copies) | `Plan` | `volec guide std` |
 | tuples in `Vec`s, patterns in `for`, `while let`, closures | `Graph::new`, `find_cycle` | `volec guide syntax`, `guide closures` |
 | iterators: `position`, `map`, `collect`, `all`, `any`, `enumerate` | `find_cycle`, `main` | `volec guide iterators` |
-| default arguments | `random_dag` | `volec guide core` |
 | drops: graphs, plans and orders freed at the end of their scope, on every path out (an early `return` or `?` too) | everywhere | `volec guide memory` |
-| f-strings | `print_plan`, `main` | `volec guide formatting` |
+| format strings | `print_plan`, `main` | `volec guide formatting` |
 | a C header: `import "time.h" as c;` | `now_ns` | `volec guide c-interop` |
 
 ## Try
