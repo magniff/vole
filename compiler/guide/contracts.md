@@ -80,33 +80,32 @@ nothing, is `contract.result`.
 
 ## Assertions
 
-`assert(c)`, `assert(c, "message")`, `assert_eq(&a, &b)`,
-`assert_ne(&a, &b)` and `debug_assert(c)` are in the prelude, as
-functions (Rust's macros; `assert!(..)` is accepted too). std2's
-`assert_eq` and `assert_ne` take references: `assert_eq(&(k * 2), &6)`.
-A failure prints Rust's message and exits with 101: the message given,
-or `assertion failed`, or for `assert_eq` `` assertion `left == right`
-failed `` with a `left:` and a `right:` line. It names no line; a
-`requires` does.
+`assert(c)`, `assert(c, "message")`, `assert_eq(a, b)`,
+`assert_ne(a, b)` and `debug_assert(c)` are in the prelude, as
+functions (Rust's macros; `assert!(..)` is accepted too).
+A failure prints the call's place, then Rust's message, and exits with
+101: the message given, or `assertion failed` with the condition's
+text, then the values of the names the condition compares; for
+`assert_eq` `` assertion `left == right` failed `` with a `left:` and
+a `right:` line.
 
 ```vole
 fn main() -> i32 {
     let k = "3".parse::<i64>().unwrap_or(0);
-    assert_eq(&(k * 2), &6);
+    assert_eq(k * 2, 6);
     assert(k > 5, "k is small");
     0
 }
 ```
 ```out (exit 101)
-k is small
+main.vl:4:5: k is small: k = 3
 ```
 
 ## The failure line
 
 Every run-time check of the compiler prints one line, `FILE:LINE:COL:
 message`, and exits with 101: bounds, `as E`, contracts, and std's
-requires (`unwrap` of a `None`). A `panic` and std2's assertions print
-their message alone, as Rust's do.
+requires (`unwrap` of a `None`), a `panic` and the assertions.
 `--trace` adds the calls that led there (`volec test` builds with
 it; guide debug).
 
