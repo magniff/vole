@@ -283,6 +283,18 @@ The front for the rust edition (front280):
   `Ord::cmp` are `#[pure]`, and `Allocator::deallocate` carries MVS's
   `Allocator::free` list, so an impl is checked against them, as in
   MVS.
+- **A Formatter's sink is its maker's effect.** std's `Formatter`
+  writes through a fn value, so every write was the join over every
+  sink of the program: a `println` allocated in any program that
+  formatted into a `String`, a `#[no_io]` function using `format_in`
+  was refused in any program that printed, and a `println("text")`
+  with no hole passed `#[no_io]` and `#[pure]`. Now the effect is
+  counted where the Formatter is made (E4.3a): a print is io, a
+  `format_in` allocates from its allocator, a write into a program's
+  sink does what its `write_str` does, and a `Display` impl has its own
+  body's effects, whatever it is written into. `Formatter::new` is
+  declared `#[effects(W)]`; `print` and `eprint` say `io, static` as
+  `println` does.
 
 std2 gets the rest of MVS's std (std280):
 

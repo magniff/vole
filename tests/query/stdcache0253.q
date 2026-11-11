@@ -11,7 +11,7 @@ $ show print
 // std::fmt::print	<std>:15164-15173
 // x on stdout (`print("{x}")`); stdout is line-buffered when a terminal.
 // later: format_fns
-#[effects(panic, diverge, T)]
+#[effects(io, static, panic, diverge, T)]
 pub fn print<T: Display>(x: T) {
     let mut out = crate::io::stdout();
     if crate::io::Write::write_fmt(&mut out, x).is_err() {
