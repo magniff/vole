@@ -88,6 +88,11 @@ defined:
   length while it is used;
 - it makes no second live alias of a place a `&mut` reference holds
   (the optimizer relies on a `&mut` being the only way to its memory);
+  overlapping slices made with `std::slice::from_raw_parts` and
+  `from_raw_parts_mut` and passed to a function as its `&[T]` and
+  `&mut [T]` are undefined behaviour (the optimizer knows such
+  parameters apart): overlapping memory goes through raw pointers
+  (`*const T`, `*mut T`), never through two references;
 - it changes nothing behind a live `&` reference, through a raw pointer
   either (a `Cell` aside): the optimizer keeps a `&Vec`'s header (its
   pointer, length and capacity) from before a loop, so a push to the
