@@ -42,7 +42,7 @@ use hal::metal as backend;
 pub use hal::{Caps, RawSurface};
 pub use shader::{
     Binding, BindingType, EntryPoint, GroupBinding, Reflection, ShaderKind, ShaderSource,
-    VertexInput,
+    StageSlots, VertexInput,
 };
 pub use timing::{MAX_QUERIES, QuerySet};
 use types::{MAX_BIND_GROUPS, MAX_COLOR_TARGETS, MAX_VERTEX_BUFFERS};
@@ -415,8 +415,31 @@ impl Device<Gpa> {
         }
     }
 
-    /// A 2D texture (a 2D array when layers > 1).
-    pub fn texture(&self, width: i64, height: i64, format: Format,
+    /// A 2D texture: one layer, one mip level.
+    pub fn texture(&self, width: i64, height: i64, format: Format, usage: u32) -> Texture
+        requires self.caps.textures
+        else "gpu.unsupported: this device has no textures (dev.caps().textures)"
+        requires width >= 1 && height >= 1 && width <= self.limits.max_texture_dimension_2d
+        && height <= self.limits.max_texture_dimension_2d
+        else "gpu.limits: a texture of {width} x {height}; its sides are 1 to {} (dev.limits().max_texture_dimension_2d)", self.limits.max_texture_dimension_2d
+        requires usage != 0 else "gpu.usage: a texture needs a usage"
+        requires usage & TextureUsage::STORAGE_BINDING == 0 || format.is_storable()
+        else "gpu.format: STORAGE_BINDING needs a storable format"
+        requires usage & TextureUsage::RENDER_ATTACHMENT == 0 || self.caps.render
+        else "gpu.unsupported: RENDER_ATTACHMENT on a device without render"
+        {
+        let desc = TextureDesc {
+            width: width, height: height, layers: 1, mips: 1, format: format, usage: usage,
+        };
+        match N::create_texture(&self.raw, desc) {
+            Some(t) => Texture { raw: t, desc: desc },
+            None => out_of_memory("texture"),
+        }
+    }
+
+    /// A 2D texture of `layers` layers (a 2D array when layers > 1) and
+    /// `mips` mip levels.
+    pub fn texture_array(&self, width: i64, height: i64, format: Format,
         usage: u32, layers: i64,
         mips: i64) -> Texture
         requires self.caps.textures
@@ -839,9 +862,25 @@ impl Queue {
         N::write_buffer(&mut self.raw, &buf.raw, offset, bytes);
     }
 
+    /// Writes the whole of tex (its first layer): rows of texels,
+    /// bytes_per_row bytes each.
+    pub fn write_texture(&mut self, tex: &Texture, bytes: &[u8], bytes_per_row: i64)
+        requires tex.desc.usage & TextureUsage::COPY_DST != 0
+        else "gpu.usage: write_texture needs COPY_DST"
+        {
+        let ww = tex.desc.width;
+        let hh = tex.desc.height;
+        assert(bytes_per_row >= ww * tex.desc.format.size(),
+            "gpu.range: bytes_per_row is shorter than a row");
+        assert(bytes.len() as i64 >= bytes_per_row * (hh - 1) + ww * tex.desc.format.size(),
+            "gpu.range: fewer bytes than the region");
+        N::write_texture(&mut self.raw, &tex.raw, 0, 0, 0, ww, hh, bytes, bytes_per_row);
+    }
+
     /// Writes rows of texels into layer `layer` of tex at (x, y): h rows of
-    /// bytes_per_row bytes each, w texels used of each row.
-    pub fn write_texture(&mut self, tex: &Texture, bytes: &[u8], bytes_per_row: i64,
+    /// bytes_per_row bytes each, w texels used of each row (w or h below
+    /// 0: up to the texture's edge).
+    pub fn write_texture_region(&mut self, tex: &Texture, bytes: &[u8], bytes_per_row: i64,
         x: i64, y: i64, w: i64, h: i64, layer: i64)
         requires tex.desc.usage & TextureUsage::COPY_DST != 0
         else "gpu.usage: write_texture needs COPY_DST"
@@ -2017,9 +2056,34 @@ impl Encoder<Gpa> {
         N::copy_buffer(&mut self.raw, &src.raw, src_offset, &dst.raw, dst_offset, size);
     }
 
-    /// Copies a region of layer `layer` of tex (the whole of it by default)
-    /// into buf at offset, rows bytes_per_row apart (a multiple of 256).
-    pub fn copy_texture_to_buffer(&mut self, tex: &Texture, buf: &Buffer,
+    /// Copies the whole of tex (its first layer) into buf from its start,
+    /// rows bytes_per_row apart (a multiple of 256).
+    pub fn copy_texture_to_buffer(&mut self, tex: &Texture, buf: &Buffer, bytes_per_row: i64)
+        requires tex.desc.usage & TextureUsage::COPY_SRC != 0
+        else "gpu.usage: copy_texture_to_buffer's texture was made without TextureUsage::COPY_SRC: add it in dev.texture(.., usage: ..)"
+        requires buf.usage & BufferUsage::COPY_DST != 0
+        else "gpu.usage: copy_texture_to_buffer's buffer ({} bytes) was made without BufferUsage::COPY_DST: add it where that buffer is made", buf.size
+        requires bytes_per_row % 256 == 0
+        else "gpu.align: bytes_per_row is a multiple of 256"
+        requires !buf.mapped
+        else "gpu.state: copy_texture_to_buffer's buffer ({} bytes) is mapped (map_read): the copy would change its view. Unmap it (buf.unmap(dev)) when its view is done", buf.size
+        {
+        let ww = tex.desc.width;
+        let hh = tex.desc.height;
+        assert(bytes_per_row >= ww * tex.desc.format.size(),
+            "gpu.range: bytes_per_row is shorter than a row");
+        assert(bytes_per_row * (hh - 1) + ww * tex.desc.format.size() <= buf.size,
+            "gpu.range: the copy reaches past the buffer");
+        self.uses(buf);
+        if buf.usage & BufferUsage::UNIFORM != 0 { self.unwritten.wrote(buffer_id(buf)); }
+        N::copy_texture_to_buffer(&mut self.raw, &tex.raw, 0, 0, 0, ww, hh, &buf.raw, 0,
+            bytes_per_row);
+    }
+
+    /// Copies a region of layer `layer` of tex (w or h below 0: up to the
+    /// texture's edge) into buf at offset, rows bytes_per_row apart (a
+    /// multiple of 256).
+    pub fn copy_texture_to_buffer_region(&mut self, tex: &Texture, buf: &Buffer,
         bytes_per_row: i64, offset: i64, x: i64, y: i64, w: i64, h: i64,
         layer: i64)
         requires tex.desc.usage & TextureUsage::COPY_SRC != 0
