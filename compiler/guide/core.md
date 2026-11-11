@@ -183,7 +183,7 @@ Every error has a `help:`; `volec guide errors` has more.
 
 Tests and checks: `#[test] fn` and `#[property] fn p(x: i64)` (inputs
 generated, shrunk) sit next to the code and `volec test` runs them at
--O0 and -O2; `requires`/`ensures` clauses and `assert_eq(&a, &b)` are
+-O0 and -O2; `requires`/`ensures` clauses and `assert_eq(a, b)` are
 checked at run time (`guide testing`, `guide contracts`).
 
 Float math: Rust's methods on f32 and f64 (`x.sqrt()`, `y.atan2(x)`,

@@ -12,7 +12,7 @@ allocates).
 ## #[test]
 
 ```vole
-use std::str::ParseIntError;
+use std::num::ParseIntError;
 
 fn gap(v: &[i64]) -> i64 {
     let mut best = 0;
@@ -26,7 +26,7 @@ fn gap(v: &[i64]) -> i64 {
 
 #[test]
 fn gap_of_three() {
-    assert_eq(&gap(&[1, 5, 6]), &4);
+    assert_eq(gap(&[1, 5, 6]), 4);
 }
 
 #[test]
@@ -161,7 +161,7 @@ fn stays_inside() {
 // step's `v * dt` into `v` and this fails; stays_inside still passes).
 #[test]
 fn moves_by_v_dt() {
-    assert_eq(&step(0.25, 0.5, 0.5), &0.5);
+    assert_eq(step(0.25, 0.5, 0.5), 0.5);
 }
 
 fn main() -> i32 {

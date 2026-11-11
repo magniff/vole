@@ -29,8 +29,9 @@ std::io::stdin().read_line(&mut s)   guide conversions#reading-input
 std::fs::read_to_string_in(path, gpa)   guide io
 ```
 
-Not in std2 yet: `BTreeMap`, `BTreeSet`, `BinaryHeap`, `VecDeque`,
-`Rc`, `Arc`, the `Mutex` family (`guide threads`).
+Not in std yet: `BTreeMap`, `BTreeSet`, `VecDeque`, `Rc`.
+`std::collections` has `BinaryHeap` and `MinHeap`, `std::sync` `Arc`,
+`Mutex` and the channels (`guide threads`).
 
 @PAGE-END@ More, a section at a time: `volec guide std#the-api` (every item, a line each), `std#overview` (ownership, HashMap and HashSet); one item: `volec guide --find NAME`; all of it: `volec guide std --whole`.
 

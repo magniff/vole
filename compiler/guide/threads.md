@@ -86,9 +86,55 @@ fn main(gpa: Gpa) {
 (a `usize`). Printing is safe from any thread: once threads run, each
 print holds a lock, so output never interleaves.
 
-Not in std2 yet: `Mutex`, `RwLock`, `Arc`, `Once`, `Condvar` and the
-channels (`std::sync::mpsc`); share an atomic, or join and return the
-results.
+## Locks, Arc, channels
+
+`std::sync` has Rust's `Mutex<T>` (`m.lock().unwrap()` gives a guard:
+`*g` is the data, methods go through it, `g.push(3)`, an index needs
+`(*g)[0]`; dropping the guard unlocks; `try_lock`), `RwLock<T>`
+(`read`, `write`), `Condvar` (`wait(guard)`, `notify_one`,
+`notify_all`), `Once` (`call_once`) and `Arc<T, A>`
+(`Arc::new_in(x, gpa)`, `clone()`: a counted pointer for threads that
+cannot borrow). There is no poisoning: a panic in any thread stops the
+program, so `lock()` and `join()` are always `Ok`. A scoped thread
+borrows a Mutex; a `spawn_in` thread takes an `Arc` of one.
+`std::sync::mpsc::channel_in(gpa)` gives a `(Sender, Receiver)` pair:
+`tx.send(x)` (an `Err` with the value when the receiver is gone),
+`tx.clone()` for each producer, `rx.recv()`, `rx.try_recv()`, and
+`rx.iter()`, which ends when every sender is dropped.
+
+```vole
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+fn main(gpa: Gpa) {
+    let hits = Mutex::new(0);
+    let total = thread::scope(|sc| {
+        let (tx, rx) = mpsc::channel_in(gpa);
+        for k in 1..4 {
+            let tx = tx.clone();
+            let hits = &hits;
+            sc.spawn(move || {
+                *hits.lock().unwrap() += 1;
+                tx.send(k * 10).unwrap();
+            });
+        }
+        drop(tx);
+        let mut t = 0;
+        for x in rx.iter() { t += x; }
+        t
+    });
+    let shared = Arc::new_in(Mutex::new(Vec::new_in(gpa)), gpa);
+    let theirs = shared.clone();
+    let h = thread::spawn_in(move || theirs.lock().unwrap().push(7), gpa);
+    h.join().unwrap();
+    let g = shared.lock().unwrap();
+    println("{total} {} {} {}", hits.lock().unwrap(), g.len(), (*g)[0]);
+}
+```
+```out
+60 3 1 7
+```
 
 ## Thread-locals
 
