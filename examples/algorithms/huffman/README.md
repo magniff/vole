@@ -63,14 +63,14 @@ generator (xorshift64*), so every run compresses the same bytes.
 
 ## The code
 
-**The heap** is the generic `MinHeap<T: Ord>` of
+**The heap** is the generic `MinHeap<T: Ord + Copy>` of
 [`../dijkstra`](../dijkstra), here holding subtrees. A derived `Ord`
 compares fields in order, weight first, then the node number, so trees
 of equal weight always merge in the same order and the codes do not
 depend on the heap's internals:
 
 ```tach
-#[derive(Eq, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct Subtree { weight: i64, node: i64 }
 ```
 
@@ -84,7 +84,7 @@ while heap.len() > 1 {
     let a = heap.pop().unwrap();
     let b = heap.pop().unwrap();
     kids.push((a.node, b.node));
-    heap.push(Subtree { weight: a.weight + b.weight, node: kids.len() - 1 });
+    heap.push(Subtree { weight: a.weight + b.weight, node: kids.len() as i64 - 1 });
 }
 ...
 while let Some((node, depth)) = stack.pop() {
@@ -93,13 +93,13 @@ while let Some((node, depth)) = stack.pop() {
 }
 ```
 
-**Canonical codes** sort `(length, byte)` pairs with `std::sort` and
-another derived `Ord`, then count upward. Building the codebook returns
-a `Result`: a code longer than the decoder's table allows is an error,
-`HuffError::CodeTooLong`, which `?` passes up to `main`:
+**Canonical codes** sort `(length, byte)` pairs with `sort_unstable`
+and another derived `Ord`, then count upward. Building the codebook
+returns a `Result`: a code longer than the decoder's table allows is an
+error, `HuffError::CodeTooLong`, which `?` passes up to `run`:
 
 ```tach
-std::sort(order.as_mut_slice());                // by the derived Ord
+order.sort_unstable();                          // by the derived Ord
 let max_len = order.last().map(|e| e.len).unwrap_or(0);
 if max_len > MAX_BITS { return Err(HuffError::CodeTooLong(max_len)); }
 ...
@@ -115,7 +115,7 @@ for e in order.iter() {
 (fewer than 8 between bytes) and pushes whole bytes:
 
 ```tach
-for b in text {
+for b in text.iter().copied() {
     let len = book.len[b];
     acc = (acc << len) | book.code[b];
     bits += len;
@@ -134,7 +134,7 @@ casts:
 ```tach
 for _ in 0..count {
     while have <= 56 {                             // refill a byte at a time
-        let byte = if pos < bits.len() { bits[pos] } else { 0 };
+        let byte = if pos < bits.len() as i64 { bits[pos] } else { 0 };
         acc = (acc << 8) | byte;
         pos += 1;
         have += 8;
@@ -145,12 +145,11 @@ for _ in 0..count {
 }
 ```
 
-**Checking and reporting.** `round_trip(text, gpa, table: true)` uses a
-named argument for its defaulted `table` parameter. The first byte that
-differs after the round trip, if any, is found with
-`(0..text.len()).position(..)` and returned as `HuffError::Mismatch`;
-`main` returns `Result<(), HuffError>`, so an error prints
-`Error: Mismatch(...)` and exits with status 1. The total bit count is
+**Checking and reporting.** The first byte that differs after the round
+trip, if any, is found with `(0..text.len()).position(..)` and returned
+as `HuffError::Mismatch`; `run` returns `Result<(), HuffError>`, and
+`main` prints an error as `Error: Mismatch(...)` on stderr and exits
+with status 1. The total bit count is
 a `zip` of the lengths and counts folded into a sum; the entropy calls
 C's `log2` through `import "math.h"`.
 
@@ -211,7 +210,7 @@ The vole version checks its indexes and grows its output `Vec` with
 `push`; the C one writes into preallocated arrays unchecked.
 
 The encoder was first written with a `BitWriter { out, acc, bits }`
-struct and a `put(inout self, code, len)` method: 11.0 ms, because
+struct and a `put(&mut self, code, len)` method: 11.0 ms, because
 the accumulator then lives in the struct, in memory, instead of in a
 register. Keeping the hot state in locals of the loop's function is the
 fix (in C too, where the compiler has more freedom to promote it).
@@ -220,20 +219,19 @@ fix (in C too, where the compiler has more freedom to promote it).
 
 | feature | where | guide |
 |---|---|---|
-| `#[derive(Eq, Ord, Debug)]` to order heap entries and sort | `Subtree`, `ByLength`, `HuffError` | `volec guide formatting` |
-| generic `MinHeap<T: Ord>`, `?` on an `Option` | `MinHeap` | `volec guide generics`, `guide conversions` |
-| `Result`, `?`, `main -> Result<(), E>` | `Codebook::new`, `round_trip`, `main` | `volec guide conversions` |
-| default and named arguments: `table: bool = false` | `round_trip` | `volec guide core` |
+| `#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]` to order heap entries and sort | `Subtree`, `ByLength`, `HuffError` | `volec guide formatting` |
+| generic `MinHeap<T: Ord + Copy>`, `?` on an `Option` | `MinHeap` | `volec guide generics`, `guide conversions` |
+| `Result`, `?`, `match` on the result in `main` | `Codebook::new`, `round_trip`, `run`, `main` | `volec guide conversions` |
 | tuples in a `Vec`, destructured in `while let` and `let` | `code_lengths` | `volec guide syntax` |
 | widening: `u8` into `u64`, `u32` into `i64` | `decode`, `encode` | `volec guide conversions` |
 | iterators: `zip`, `fold`, `filter`, `count`, `position`, `Option::map` | `round_trip`, `entropy` | `volec guide iterators` |
 | arrays as values: `[i64; 256]` returned and stored in a struct | `code_lengths`, `Codebook` | `volec guide types` |
-| f-strings: `{x:.4}`, `{h:x}`, `{b:c}`, `{s:?}` | output | `volec guide formatting` |
+| format strings: `{x:.4}`, `{h:x}`, `{q}` of a `char`, `{s:?}` | output | `volec guide formatting` |
 | C's `log2` and clock | `entropy`, `now_ns` | `volec guide c-interop` |
 
 ## Try
 
-- Feed it a text with one byte value (`round_trip("aaaa")`): the
+- Feed it a text with one byte value (`round_trip(b"aaaa", true, gpa)`): the
   one-symbol case gets a 1-bit code.
 - Make the skew stronger in `generate_text` (the minimum of three
   draws) and watch the ratio and the longest code.
