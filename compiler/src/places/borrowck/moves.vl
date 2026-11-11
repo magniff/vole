@@ -41,6 +41,7 @@ pub fn check(bck: &mut Bck<Comp>, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
     dataflow(pbody, pcx);
     bck.reported.clear();
     assign_twice(bck, pbody, pcx);
+    unassigned_reads(bck, pbody, pcx);
     mutability(bck, pbody, pcx);
     for i in 0..pbody.rpo.len() as i64 {
         let b = pbody.rpo[i as usize];
@@ -279,7 +280,21 @@ fn mutability(bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
                 // the front's, which also knows a pattern's `ref mut`
                 // binding)
                 // RULE: F30.2 (`&raw mut a` needs `a` mutable, rustc E0596)
-                if why == 1 || why == 2 && (st.d == crate::places::ir::BK_MUT
+                // RULE: D19.5 (0.28.0: the two-phase `&mut` of an FnMut
+                // closure's call, `f()` of a `let f` or a parameter `f: F`:
+                // the front does not know the closure's kind when it
+                // checks the call; rustc E0596)
+                let ct = crate::places::ir::full_place_type(l, p, pbody, pcx);
+                let call_env = st.d == crate::places::ir::BK_MUT2 && pcx.edition != 0
+                    && crate::front::closures::closure_of_type(ct, pcx) > 0;
+                // (a parameter is no LF_USER local: by its own flags)
+                let param_env = call_env && p == 0 && why == 0
+                    && (pbody.locals[l as usize].flags & crate::places::ir::LF_PARAM) != 0
+                    && (pbody.locals[l as usize].flags & crate::places::ir::LF_MUT) == 0;
+                if param_env {
+                    report_immutable(loc, l, p, 0, 2, true, bck, pbody, pcx);
+                }
+                if why == 1 || why == 2 && (st.d == crate::places::ir::BK_MUT || call_env
                     || st.d == crate::places::ir::BK_RAW_MUT && pcx.edition != 0)
                     && !capture_loan(loc, st.a, block_term(b, pbody), pbody) {
                     report_immutable(loc, l, p, 0, why, true, bck, pbody, pcx);
@@ -474,6 +489,113 @@ fn assign_twice(bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
             }
         }
     }
+}
+
+// RULE: M8 (0.28.0) A user local with no move path (a plain value: an
+// integer, a reference) read where it may not be assigned yet: `let y:
+// i64; println("{y}")` printed 0. A forward dataflow of the locals maybe
+// unassigned: set at the local's StorageLive, cleared by an assignment
+// to it or to a part of it; a read while set is rustc's E0381. (A value
+// with a path is M1's.)
+fn unassigned_reads(bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+    let nw = bck.nw_l;
+    let nb = crate::places::ir::block_count(pbody);
+    // (no `let` without its value: nothing to follow, most bodies)
+    let mut any = false;
+    for l in 0..pbody.locals.len() {
+        if (pbody.locals[l].flags & crate::places::ir::LF_DEFERRED) != 0 {
+            any = true;
+        }
+    }
+    if !any {
+        return;
+    }
+    zero_fill(&mut bck.bin, nb * nw);
+    zero_fill(&mut bck.bout, nb * nw);
+    bck.tmp.clear();
+    for _ in 0..nw {
+        bck.tmp.push(0);
+    }
+    let mut changed = true;
+    let mut checking = false;
+    while changed || !checking {
+        if !changed {
+            checking = true;
+        }
+        changed = false;
+        for i in 0..pbody.rpo.len() as i64 {
+            let b = pbody.rpo[i as usize];
+            for w in 0..nw {
+                bck.tmp[w as usize] = 0;
+            }
+            for j in 0..crate::places::cfg::pred_count(b, pbody) {
+                let pb = crate::places::cfg::pred(b, j, pbody);
+                for w in 0..nw {
+                    bck.tmp[w as usize] = bck.tmp[w as usize] | bck.bout[(pb * nw + w) as usize];
+                }
+            }
+            let start = block_start(b, pbody);
+            for loc in start..block_term(b, pbody) + 1 {
+                let st = pbody.stmts[loc as usize];
+                let k = st.kind;
+                if checking {
+                    for o in 0..st.nops {
+                        if !crate::places::ir::op_is_place(op_kind(st.ops, o, pbody)) {
+                            continue;
+                        }
+                        let l = op_a(st.ops, o, pbody);
+                        if l > 0 && (bck.tmp[(l >> 6) as usize] >> (l & 63)) & 1 != 0 {
+                            report_unassigned(loc, l, bck, pbody, pcx);
+                        }
+                    }
+                }
+                if k == crate::places::ir::SK_LIVE {
+                    let f = pbody.locals[st.a as usize].flags;
+                    if (f & crate::places::ir::LF_DEFERRED) != 0
+                        && pcx.local_path[st.a as usize] < 0 {
+                        bck.tmp[(st.a >> 6) as usize] = bck.tmp[(st.a >> 6) as usize]
+                            | (1 << (st.a & 63));
+                    }
+                } else if (k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC) && st.a > 0 {
+                    bck.tmp[(st.a >> 6) as usize] = bck.tmp[(st.a >> 6) as usize]
+                        & ~(1 << (st.a & 63));
+                }
+            }
+            for w in 0..nw {
+                if bck.bout[(b * nw + w) as usize] != bck.tmp[w as usize] {
+                    bck.bout[(b * nw + w) as usize] = bck.tmp[w as usize];
+                    changed = true;
+                }
+            }
+        }
+    }
+}
+
+fn report_unassigned(loc: i64, l: i64, bck: &mut Bck<Comp>, pbody: &Body<Comp>,
+    pcx: &mut Ctx<Comp>) {
+    let mut i: i64 = 0;
+    while i < bck.reported.len() as i64 {
+        if bck.reported[i as usize] == -3 && bck.reported[(i + 3) as usize] == l {
+            return;
+        }
+        i += 4;
+    }
+    bck.reported.push(-3);
+    bck.reported.push(loc);
+    bck.reported.push(0);
+    bck.reported.push(l);
+    let mut node = pbody.stmts[loc as usize].node;
+    if node == 0 {
+        node = pbody.node;
+    }
+    let m = buf_new();
+    buf_str(m, c"used binding '");
+    crate::places::borrowck::diag::buf_place(m, l, 0, 0, pbody, pcx);
+    buf_str(m, c"' is possibly-uninitialized (rustc E0381)");
+    report_error_tries(pcx.nodes[node as usize].start, 5000 + l, c"borrowck.use_uninit",
+        buf_slice(m).ptr,
+        c"give it its value where it is declared, or assign it on every path before this use",
+        "".as_bytes(), false, pcx);
 }
 
 // A user's local declared without `mut`: assigned once (a deferred `let`).
