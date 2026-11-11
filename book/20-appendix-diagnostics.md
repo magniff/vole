@@ -123,16 +123,7 @@ The compiler lists its codes itself. For example, the `own` family:
 
 ```console
 $ volec explain --list | grep '^own\.'
-own.moved
-own.move_out
-own.partial
-own.conflict
-own.escape
-own.static
-own.views
-own.drop_view
 own.readonly
-own.drop_call
 own.interior_copy
 ```
 

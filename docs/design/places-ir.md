@@ -599,6 +599,9 @@ frees a container twice through two copies of its handle); drops there
 would make them fail to compile or free twice, and a program the own pass
 only warns about would turn from a leak into a double free. The rule is
 revisited in 0.28, when `--values` goes.
+(0.28.0: `--values` is gone with the own pass and its move-out backstop:
+the drops are always placed, the `copy` rule always applies, and the
+cases that named `--values=off` were rewritten or deleted.)
 
 ## 5. What the own pass loses
 

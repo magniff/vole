@@ -1,10 +1,7 @@
-// What the IR's elaborated bodies leave for after the own pass (0.26.0,
+// What the IR's elaborated bodies leave for after the check (0.26.0,
 // docs/design/places-ir.md §3.8, §7.3), recorded per body by run_places
 // and read by after_own:
 //
-// - the move-out backstop: a `move` out of an index, through a reference,
-//   out of a static or of a BORROWED local is own.move_out, reported for
-//   any the own pass let through (a program it passed);
 // - `--places-diff` (0.26.1; 0.26.2: the comparison with the own pass's
 //   drops gone with them): where each drop runs and its flag, check_drops
 //   below, a use after a drop, a flag read before it is written, one line
@@ -14,24 +11,15 @@
 use crate::base::{STDERR, buf_bytes, buf_int, buf_new, buf_str, buf_write_fd, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
-use crate::front::own::diag::{OWN_MOVE_OUT, own_begin, own_end, own_flush, own_str};
-use crate::front::types::TyKind;
 use crate::places::front::ast_local_name;
 use crate::places::ir::{
-    Body, DS_FLAG, DS_KEPT, LF_BORROWED, LF_STATIC, OK_INT, OK_MOVE, PJ_DEREF, PJ_INDEX, PStmt,
-    RV_REF, RV_USE, SK_ASSIGN, SK_CALL, SK_DROP, SK_INTRINSIC, SK_LIVE, block_count, block_len,
-    block_start, has_flag, op_a, op_b, op_is_place, op_kind, place_type, proj_kind, proj_parent,
-    succ, succ_count, undistinct,
+    Body, DS_FLAG, DS_KEPT, LF_BORROWED, OK_INT, PStmt, RV_REF, RV_USE, SK_ASSIGN, SK_CALL, SK_DROP,
+    SK_INTRINSIC, SK_LIVE, block_count, block_len, block_start, has_flag, op_a, op_b, op_is_place,
+    op_kind, proj_parent, succ, succ_count,
 };
 use crate::places::print::{buf_fn_name, buf_pos};
 
-const W_INDEX: i64 = 1;
-const W_REF: i64 = 2;
-const W_STATIC: i64 = 3;
-const W_BORROWED: i64 = 4;
-
 pub fn diff_begin(pcx: &mut Ctx<Comp>) {
-    pcx.moves.clear();
     pcx.diffs = 0;
     pcx.compared = 0;
 }
@@ -43,97 +31,12 @@ pub fn record_body(diff: bool, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
     if diff {
         check_drops(pbody, pcx);
     }
-    // (std's containers and iterators copy elements as unsafe code does,
-    // as the own pass's move_out: no backstop there)
-    let moves = pcx.moves_suspect
-        && !crate::front::modules::std_moves_bits(crate::places::front::fn_module(pbody.fn_, pcx),
-            pcx);
-    if !moves {
-        return;
-    }
-    for b in 0..block_count(pbody) {
-        let start = block_start(b, pbody);
-        if start < 0 || !reached(b, pbody, pcx) {
-            continue;
-        }
-        for s in start..start + block_len(b, pbody) {
-            record_moves(pbody.stmts[s as usize], pbody, pcx);
-        }
-    }
-}
-
-fn record_moves(st: PStmt, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
-    for i in 0..st.nops {
-        if op_kind(st.ops, i, pbody) == OK_MOVE {
-            let what = forbidden_move(op_a(st.ops, i, pbody), op_b(st.ops, i, pbody), pbody, pcx);
-            if what != 0 {
-                pcx.moves.push(st.node);
-                pcx.moves.push(what);
-                pcx.moves.push(pbody.fn_);
-            }
-        }
-    }
 }
 
 // Whether block b is reached from bb0 (elaboration's order, when it made
 // one for this body; a block it added is).
 fn reached(b: i64, pbody: &Body<Comp>, pcx: &Ctx<Comp>) -> bool {
     !pcx.rpo_fresh || b >= pbody.rpo_index.len() as i64 || pbody.rpo_index[b as usize] >= 0
-}
-
-// Whether a move of place (l, p) is one the own pass forbids: out of an
-// index, through a reference, out of a static or a BORROWED local (W_*;
-// 0: none).
-fn forbidden_move(l: i64, p: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
-    if has_flag(l, LF_STATIC, pbody) {
-        return W_STATIC;
-    }
-    if has_flag(l, LF_BORROWED, pbody) {
-        return W_BORROWED;
-    }
-    let mut q = p;
-    while q > 0 {
-        let k = proj_kind(q, pbody);
-        if k == PJ_INDEX {
-            // (an array's or a slice's element; a raw pointer's, `p[i]`, is
-            // unsafe code's read)
-            let t = undistinct(place_type(l, proj_parent(q, pbody), pbody, pcx), pcx);
-            if t > 0
-                && (pcx.types[t as usize].kind == TyKind::Array
-                    || pcx.types[t as usize].kind == TyKind::Slice) {
-                return W_INDEX;
-            }
-        }
-        if k == PJ_DEREF {
-            let t = place_type(l, proj_parent(q, pbody), pbody, pcx);
-            if t > 0 && pcx.types[t as usize].kind == TyKind::Ptr && pcx.types[t as usize].b != 0 {
-                return W_REF;
-            }
-        }
-        q = proj_parent(q, pbody);
-    }
-    0
-}
-
-// After the own pass, in a program it passed: the backstop's errors.
-pub fn report_moves(pcx: &mut Ctx<Comp>) {
-    let mut i: i64 = 0;
-    while i < pcx.moves.len() as i64 {
-        let node = pcx.moves[i as usize];
-        let what = pcx.moves[(i + 1) as usize];
-        i += 3;
-        if node <= 0 {
-            continue;
-        }
-        own_begin(node, OWN_MOVE_OUT, pcx);
-        own_str(c"a value moves out of ", pcx);
-        own_str(if what == W_INDEX { c"an element reached by index" }
-            else if what == W_REF { c"a reference" } else if what == W_STATIC { c"a static" }
-            else { c"a borrowed copy" }, pcx);
-        own_str(c", which keeps it: the places IR's check, which the own pass missed (an internal error: please report it)", pcx);
-        own_end(pcx);
-    }
-    own_flush(pcx);
 }
 
 pub fn report_count(pcx: &Ctx<Comp>) {
