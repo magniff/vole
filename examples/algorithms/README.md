@@ -12,7 +12,7 @@ the README says how the two compare.
 |---|---|---|---|---|---|
 | [dijkstra](dijkstra/) | Dijkstra's shortest paths, binary heap, CSR graph | O((V + E) log V) | generic `MinHeap<T: Ord + Copy>`, `?` on Option, `while let`, `Vec::from_elem_in`, iterators, format specs | 41 ms, 1M nodes | 35 ms |
 | [kruskal](kruskal/) | union-find + Kruskal's minimum spanning tree | O(E log E) | `#[derive(PartialOrd, Ord)]` sort, union-find, iterators, tuples | 55 ms, 1M edges | 73 ms (`qsort`) |
-| [toposort](toposort/) | Kahn's algorithm, three-colour DFS for cycles | O(V + E) | `Result`, `?`, `map_err`, enums with payloads, `HashMap<[u8], i64>` | 30 ms, 4M edges | 31 ms |
+| [toposort](toposort/) | Kahn's algorithm, three-colour DFS for cycles | O(V + E) | `Result`, `?`, `map_err`, enums with payloads, `HashMap<&str, i64, Gpa>` | 30 ms, 4M edges | 31 ms |
 | [string-search](string-search/) | naive, Knuth-Morris-Pratt, Boyer-Moore-Horspool | O(n + m); O(n / m) typical for BMH | a trait with a generic method and a default, `FnMut` closures, slice `==`, `[i64; 256]` tables | about 1 GB/s | 0.9-1.1x |
 | [huffman](huffman/) | Huffman coding: canonical codes, bit packing, table decoder | O(n + k log k) | `#[derive(PartialOrd, Ord, Debug)]`, generic `MinHeap`, `Result` and `?`, tuples in a `Vec`, `zip`/`fold`/`position` | 500 MB/s encode | within 1.2x |
 | [lru-cache](lru-cache/) | LRU cache: `HashMap` + list linked by indices | O(1) per request | generic struct, `HashMap`, custom `Iterator`, `#[derive(Debug)]` | 230 ms, 12M requests | 155 ms |

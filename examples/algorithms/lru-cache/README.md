@@ -55,17 +55,20 @@ links live in the entries themselves.
 ## The code
 
 **The entries** are a generic struct; `NIL` (-1) ends the list. The
-cache's key type needs `Hash + Eq` for the map, the value type nothing:
+cache's key type needs `Hash + Eq` for the map; keys and values are
+`Copy`, so the cache hands out copies, never references into itself.
+`A` is the allocator of its map and its `Vec`: a type that holds one
+names it.
 
 ```tach
 const NIL: i32 = -1;
 
 struct Node<K, V> { key: K, value: V, prev: i32, next: i32 }
 
-struct LruCache<K: Hash + Eq, V> {
-    capacity: i64,
-    slots: HashMap<K, i32>, // key -> its node's index in `nodes`
-    nodes: Vec<Node<K, V>>,
+struct LruCache<K: Hash + Eq + Copy, V: Copy, A: Allocator> {
+    capacity: usize,
+    slots: HashMap<K, i32, A>, // key -> its node's index in `nodes`
+    nodes: Vec<Node<K, V>, A>,
     head: i32, // the most recently used, or NIL
     tail: i32, // the least recently used, or NIL
     stats: Stats,
@@ -77,7 +80,7 @@ struct LruCache<K: Hash + Eq, V> {
 indexes it directly:
 
 ```tach
-fn unlink(inout self, i: i32) {
+fn unlink(&mut self, i: i32) {
     let (prev, next) = (self.nodes[i].prev, self.nodes[i].next);
     if prev == NIL { self.head = next; } else { self.nodes[prev].next = next; }
     if next == NIL { self.tail = prev; } else { self.nodes[next].prev = prev; }
@@ -88,9 +91,9 @@ fn unlink(inout self, i: i32) {
 miss and returns early:
 
 ```tach
-fn get(inout self, key: sink K) -> Option<V> {
-    let i = match self.slots.get(key) {
-        Some(i) => i,
+fn get(&mut self, key: K) -> Option<V> {
+    let i = match self.slots.get(&key) {
+        Some(i) => *i,
         None => {
             self.stats.misses += 1;
             return None;
@@ -101,7 +104,7 @@ fn get(inout self, key: sink K) -> Option<V> {
         self.unlink(i);
         self.push_front(i);
     }
-    Some(self.nodes.as_slice()[i].value)
+    Some(self.nodes[i].value)
 }
 ```
 
@@ -112,24 +115,24 @@ full, it recycles the tail's slot:
 let i = self.tail;
 self.unlink(i);
 let old = (self.nodes[i].key, self.nodes[i].value);
-self.slots.remove(old.0);
+self.slots.remove(&old.0);
 self.nodes[i].key = key;
 self.nodes[i].value = value;
 self.slots.insert(key, i);
 self.push_front(i);
 ```
 
-**An iterator** walks the list from the head: a struct holding a view
+**An iterator** walks the list from the head: a struct holding a slice
 of the nodes and the current index, and an `impl Iterator` with `type
 Item = (K, V)`. Everything iterators have comes with it: `show` uses
 `enumerate` and a nested tuple pattern:
 
 ```tach
-impl<K, V> Iterator for LruIter<K, V> {
+impl<'a, K: Copy, V: Copy> Iterator for LruIter<'a, K, V> {
     type Item = (K, V);
-    fn next(inout self) -> Option<(K, V)> {
+    fn next(&mut self) -> Option<(K, V)> {
         if self.at == NIL { return None; }
-        let n = self.nodes[self.at];
+        let n = &self.nodes[self.at];
         self.at = n.next;
         Some((n.key, n.value))
     }
@@ -138,15 +141,15 @@ impl<K, V> Iterator for LruIter<K, V> {
 for (k, (key, value)) in cache.iter().enumerate() { ... }
 ```
 
-**Two instances** of the one generic type: `LruCache<[u8], i64>` for
-the trace (a `[u8]` key hashes and compares by its bytes) and
-`LruCache<i64, i64>` for the workload. Each is compiled separately, as
+**Two instances** of the one generic type: `LruCache<&str, i64, Gpa>`
+for the trace (a `&str` key hashes and compares by its text) and
+`LruCache<i64, i64, Gpa>` for the workload. Each is compiled separately, as
 if written by hand for its types.
 
 **The workload** draws a magnitude, then a key below it, so key 0 is
 drawn about once in 10 requests while a key near 10^6 is drawn about
-once in 20 million. `serve` has default arguments for the request count
-and the seed, and returns its statistics (`#[derive(Debug)]
+once in 20 million. `serve` takes the request count and the seed, and
+returns its statistics (`#[derive(Debug)]
 struct Stats`, a plain value, copied out of the cache) and the sum of
 the values served in a tuple. The sum is
 the same for every capacity: a cache changes how fast an answer comes,
@@ -165,9 +168,9 @@ get b -> None
 put c=30 -> updates c, evicts nothing
   [c=30, d=4, a=1]
 Stats { hits: 1, misses: 1, evictions: 1 }
-capacity   1000: hit rate 45.84%, 2165200 evictions, sum 2031579725
-capacity  10000: hit rate 63.95%, 1432094 evictions, sum 2031579725
-capacity 100000: hit rate 82.32%,  607309 evictions, sum 2031579725
+capacity   1000: hit rate 45.84%, 2165200 evictions, sum 1957768245
+capacity  10000: hit rate 63.95%, 1432094 evictions, sum 1957768245
+capacity 100000: hit rate 82.32%,  607309 evictions, sum 1957768245
 ```
 
 and on stderr `lru: 12000000 requests in 230 ms` (the time varies).
@@ -197,14 +200,13 @@ map and the node array.
 
 | feature | where | guide |
 |---|---|---|
-| a generic struct with bounds, `impl<K: Hash + Eq, V>` | `LruCache` | `volec guide generics`, `guide traits` |
-| `HashMap` with `[u8]` and `i64` keys | `LruCache` | `volec guide std` |
+| a generic struct with bounds, `impl<K: Hash + Eq + Copy, V: Copy, A: Allocator + Clone>` | `LruCache` | `volec guide generics`, `guide traits` |
+| `HashMap` with `&str` and `i64` keys | `LruCache` | `volec guide std` |
 | your own `impl Iterator`, `type Item`, `enumerate` | `LruIter`, `show` | `volec guide iterators` |
 | `match` as an expression with an early `return` | `get`, `serve` | `volec guide syntax` |
 | `Option<(K, V)>`, tuple patterns in `for` and `if let` | `put`, `main` | `volec guide syntax` |
 | `#[derive(Debug)]`, `{x:?}` | `Stats`, `main` | `volec guide formatting` |
-| default arguments | `serve` | `volec guide core` |
-| f-strings: `{rate:.2}`, `{n:>7}` | `main` | `volec guide formatting` |
+| format specs: `{rate:.2}`, `{n:>7}` | `main` | `volec guide formatting` |
 | drops: each cache freed at the end of its scope, with no `free` | `serve`, `main` | `volec guide memory` |
 | a C header: `import "time.h" as c;` | `now_ns` | `volec guide c-interop` |
 

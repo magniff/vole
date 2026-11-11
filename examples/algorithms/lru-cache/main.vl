@@ -1,3 +1,4 @@
+// EDITION: rust
 // An LRU cache: a HashMap from key to slot, and a doubly linked list
 // threaded through a Vec of slots by index.
 //
@@ -17,7 +18,9 @@
 
 import "time.h" as c;
 
-use std::HashMap;
+use std::alloc::Allocator;
+use std::collections::HashMap;
+use std::hash::Hash;
 
 // ---------------------------------------------------------------- cache
 
@@ -26,11 +29,13 @@ const NIL: i32 = -1;
 // One entry, linked to its neighbours in the list of use by slot index.
 struct Node<K, V> { key: K, value: V, prev: i32, next: i32 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct Stats { hits: i64, misses: i64, evictions: i64 }
 
-struct LruCache<K: Hash + Eq, V, A: Allocator> {
-    capacity: i64,
+// Keys and values are plain values (Copy): the cache hands out copies,
+// never references into itself.
+struct LruCache<K: Hash + Eq + Copy, V: Copy, A: Allocator> {
+    capacity: usize,
     slots: HashMap<K, i32, A>, // key -> its node's index in `nodes`
     nodes: Vec<Node<K, V>, A>,
     head: i32, // the most recently used, or NIL
@@ -38,29 +43,29 @@ struct LruCache<K: Hash + Eq, V, A: Allocator> {
     stats: Stats,
 }
 
-impl<K: Hash + Eq, V, A: Allocator> LruCache<K, V, A> {
-    fn new(capacity: i64, gpa: Gpa) -> LruCache<K, V, A> {
+impl<K: Hash + Eq + Copy, V: Copy, A: Allocator + Clone> LruCache<K, V, A> {
+    fn new(capacity: usize, a: A) -> LruCache<K, V, A> {
         LruCache {
-            capacity: capacity,
-            slots: HashMap::new_in(gpa),
-            nodes: Vec::with_capacity_in(capacity as usize, gpa),
+            capacity,
+            slots: HashMap::new_in(a.clone()),
+            nodes: Vec::with_capacity_in(capacity, a),
             head: NIL,
             tail: NIL,
             stats: Stats { hits: 0, misses: 0, evictions: 0 },
         }
     }
 
-    fn len(self) -> i64 { self.nodes.len() as i64 }
+    fn len(&self) -> usize { self.nodes.len() }
 
     // Takes node i out of the list (its own links are left as they were).
-    fn unlink(inout self, i: i32) {
+    fn unlink(&mut self, i: i32) {
         let (prev, next) = (self.nodes[i].prev, self.nodes[i].next);
         if prev == NIL { self.head = next; } else { self.nodes[prev].next = next; }
         if next == NIL { self.tail = prev; } else { self.nodes[next].prev = prev; }
     }
 
     // Puts node i at the head of the list: the most recently used.
-    fn push_front(inout self, i: i32) {
+    fn push_front(&mut self, i: i32) {
         self.nodes[i].prev = NIL;
         self.nodes[i].next = self.head;
         if self.head != NIL { self.nodes[self.head].prev = i; }
@@ -70,9 +75,9 @@ impl<K: Hash + Eq, V, A: Allocator> LruCache<K, V, A> {
 
     // The value of `key`, which becomes the most recently used; None if
     // the cache does not have it.
-    fn get(inout self, key: sink K) -> Option<V> {
-        let i = match self.slots.get(key) {
-            Some(i) => i,
+    fn get(&mut self, key: K) -> Option<V> {
+        let i = match self.slots.get(&key) {
+            Some(i) => *i,
             None => {
                 self.stats.misses += 1;
                 return None;
@@ -83,14 +88,14 @@ impl<K: Hash + Eq, V, A: Allocator> LruCache<K, V, A> {
             self.unlink(i);
             self.push_front(i);
         }
-        Some(self.nodes.as_slice()[i].value)
+        Some(self.nodes[i].value)
     }
 
     // Sets the value of `key`, the most recently used now. When the cache
     // is full and the key is new, the least recently used entry makes
     // room: it is returned.
-    fn put(inout self, key: sink K, value: sink V) -> Option<(K, V)> {
-        if let Some(i) = self.slots.get(key) {
+    fn put(&mut self, key: K, value: V) -> Option<(K, V)> {
+        if let Some(i) = self.slots.get(&key).copied() {
             self.nodes[i].value = value;
             if i != self.head {
                 self.unlink(i);
@@ -98,9 +103,9 @@ impl<K: Hash + Eq, V, A: Allocator> LruCache<K, V, A> {
             }
             return None;
         }
-        if self.nodes.len() as i64 < self.capacity {
+        if self.nodes.len() < self.capacity {
             let i = self.nodes.len() as i32;
-            self.nodes.push(Node { key: key, value: value, prev: NIL, next: NIL });
+            self.nodes.push(Node { key, value, prev: NIL, next: NIL });
             self.slots.insert(key, i);
             self.push_front(i);
             return None;
@@ -109,7 +114,7 @@ impl<K: Hash + Eq, V, A: Allocator> LruCache<K, V, A> {
         let i = self.tail;
         self.unlink(i);
         let old = (self.nodes[i].key, self.nodes[i].value);
-        self.slots.remove(old.0);
+        self.slots.remove(&old.0);
         self.nodes[i].key = key;
         self.nodes[i].value = value;
         self.slots.insert(key, i);
@@ -119,20 +124,20 @@ impl<K: Hash + Eq, V, A: Allocator> LruCache<K, V, A> {
     }
 
     // The entries from the most to the least recently used.
-    fn iter(self) -> LruIter<K, V> {
-        LruIter { nodes: self.nodes.as_slice(), at: self.head }
+    fn iter(&self) -> LruIter<'_, K, V> {
+        LruIter { nodes: &self.nodes, at: self.head }
     }
 }
 
 // Walks the list of use from its head.
-struct LruIter<K, V> { nodes: [Node<K, V>], at: i32 }
+struct LruIter<'a, K, V> { nodes: &'a [Node<K, V>], at: i32 }
 
-impl<K, V> Iterator for LruIter<K, V> {
+impl<'a, K: Copy, V: Copy> Iterator for LruIter<'a, K, V> {
     type Item = (K, V);
 
-    fn next(inout self) -> Option<(K, V)> {
+    fn next(&mut self) -> Option<(K, V)> {
         if self.at == NIL { return None; }
-        let n = self.nodes[self.at];
+        let n = &self.nodes[self.at];
         self.at = n.next;
         Some((n.key, n.value))
     }
@@ -146,8 +151,8 @@ struct Rng { state: u64 }
 impl Rng {
     fn new(seed: u64) -> Rng { Rng { state: seed | 1 } }
 
-    fn next(inout self) -> u64 {
-        var x = self.state;
+    fn next(&mut self) -> u64 {
+        let mut x = self.state;
         x ^= x >> 12;
         x ^= x << 25;
         x ^= x >> 27;
@@ -156,27 +161,33 @@ impl Rng {
     }
 
     // A value in 0..n.
-    fn below(inout self, n: i64) -> i64 { ((self.next() >> 33) % (n as u64)) as i64 }
+    fn below(&mut self, n: i64) -> i64 { ((self.next() >> 33) % (n as u64)) as i64 }
 
     // A skewed key: a magnitude 2^b for b in 0..=20, then a key below
     // it. Small keys come up far more often than large ones, roughly as
     // the popularity of web pages or words does.
-    fn skewed(inout self) -> i64 {
+    fn skewed(&mut self) -> i64 {
         let bits = self.below(21);
         self.below(1 << bits)
     }
 }
 
-// What the cache saves us from computing: a stand-in for a slow lookup.
-fn slow_value(key: i64) -> i64 { (std::hash_u64(key as u64) % 1000) as i64 }
+// What the cache saves us from computing: a stand-in for a slow lookup
+// (splitmix64's mixing of the key).
+fn slow_value(key: i64) -> i64 {
+    let mut z = (key as u64).wrapping_add(0x9e3779b97f4a7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    ((z ^ (z >> 31)) % 1000) as i64
+}
 
 // Serves `requests` skewed requests through a cache of `capacity`
 // entries, computing and storing the value on a miss. Returns the
 // statistics and the sum of the values served.
-fn serve(capacity: i64, gpa: Gpa, requests: i64 = 4_000_000, seed: u64 = 2026) -> (Stats, i64) {
-    var cache: LruCache<i64, i64, Gpa> = LruCache::new(capacity, gpa);
-    var rng = Rng::new(seed);
-    var sum = 0;
+fn serve(capacity: usize, requests: i64, seed: u64, gpa: Gpa) -> (Stats, i64) {
+    let mut cache: LruCache<i64, i64, Gpa> = LruCache::new(capacity, gpa);
+    let mut rng = Rng::new(seed);
+    let mut sum = 0;
     for _ in 0..requests {
         let key = rng.skewed();
         let value = match cache.get(key) {
@@ -195,12 +206,14 @@ fn serve(capacity: i64, gpa: Gpa, requests: i64 = 4_000_000, seed: u64 = 2026) -
 // --------------------------------------------------------------- output
 
 fn now_ns() -> i64 {
-    var ts = c::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { c::timespec_get(&ts, c::TIME_UTC); }
+    let mut ts = c::timespec { tv_sec: 0, tv_nsec: 0 };
+    // UNSAFE: timespec_get is C's, and writes through a pointer.
+    // SAFETY: `&mut ts` is a whole timespec, borrowed for the call.
+    unsafe { c::timespec_get(&mut ts, c::TIME_UTC); }
     ts.tv_sec * 1_000_000_000 + ts.tv_nsec
 }
 
-fn show(cache: LruCache<[u8], i64, Gpa>) {
+fn show(cache: &LruCache<&str, i64, Gpa>) {
     print("  [");
     for (k, (key, value)) in cache.iter().enumerate() {
         if k > 0 { print(", "); }
@@ -211,29 +224,29 @@ fn show(cache: LruCache<[u8], i64, Gpa>) {
 
 fn main(gpa: Gpa) -> i32 {
     // A cache of three entries, traced.
-    var small: LruCache<[u8], i64, Gpa> = LruCache::new(3, gpa);
+    let mut small: LruCache<&str, i64, Gpa> = LruCache::new(3, gpa);
     for (name, value) in [("a", 1), ("b", 2), ("c", 3)] {
         small.put(name, value);
     }
     println("put a, b, c");
-    show(small);
+    show(&small);
     println("get a -> {:?}", small.get("a"));
-    show(small);
+    show(&small);
     if let Some((key, value)) = small.put("d", 4) {
         println("put d -> evicts {key}={value}");
     }
-    show(small);
+    show(&small);
     println("get b -> {:?}", small.get("b"));
     if small.put("c", 30).is_none() {
         println("put c=30 -> updates c, evicts nothing");
     }
-    show(small);
+    show(&small);
     println("{:?}", small.stats);
 
     // A skewed stream of requests through caches of three sizes.
     let t0 = now_ns();
-    for capacity in [1_000, 10_000, 100_000] {
-        let (stats, sum) = serve(capacity, gpa);
+    for capacity in [1_000usize, 10_000, 100_000] {
+        let (stats, sum) = serve(capacity, 4_000_000, 2026, gpa);
         let rate = stats.hits as f64 * 100.0 / (stats.hits + stats.misses) as f64;
         println(
             "capacity {capacity:>6}: hit rate {rate:.2}%, {:>7} evictions, sum {sum}",
