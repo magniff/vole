@@ -32,8 +32,11 @@ prefix per line (`#` comments; a prefix ends with `/`); an entry under it
 is counted as allowed and does not fail the run (`*` in a line: a glob
 of the whole path).
 
-Owners: mig28 (book, examples, guide, bench, README), d4 (compiler/std),
-d5 (the translator's inputs), del280 (tests), other.
+Owners: mig28 (book, examples, guide, bench, the editor samples), d4 (the
+old std and its copies in tests), d5 (the translator's transcripts), gpu
+(the gpu port: tests/gpu, window, voltty-render, two tools), del280 (the
+other tests, tools/numtables), other (evals/ and tests/agent-eval/: the
+user's call, not to be touched).
 """
 import fnmatch
 import os
@@ -63,13 +66,15 @@ def tracked():
 
 def owner(path):
     top = path.split("/")
-    if path.startswith("compiler/std/"):
+    if path.startswith(("compiler/std/", "tests/refactor/stdedit/", "tests/query/stdpos0253/")):
         return "d4"
-    if top[0] in ("book", "examples", "bench") or path.startswith("compiler/guide/") or path == "README.md":
+    if path.startswith(("tests/gpu/", "tests/window/", "tests/voltty-render/", "tools/objcgen/", "tools/wgslc/")):
+        return "gpu"
+    if top[0] in ("book", "examples", "bench", "editors") or path.startswith("compiler/guide/") or path == "README.md":
         return "mig28"
     if path.startswith(("tests/translate", "tests/flip28", "tests/refactor/edition0")):
         return "d5"
-    if top[0] == "tests" and top[1] not in ("agent-eval",):
+    if path.startswith("tools/numtables/") or (top[0] == "tests" and top[1] != "agent-eval"):
         return "del280"
     return "other"
 
