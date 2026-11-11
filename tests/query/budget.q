@@ -118,6 +118,7 @@ $ refs size --count
 1	crate::m5::size
 1	crate::m6::size
 18	std::alloc::Layout::size
+1	std::test::Gen::size
 $ show size
 crate::m1::size
 crate::m2::size
@@ -126,7 +127,8 @@ crate::m4::size
 crate::m5::size
 crate::m6::size
 std::alloc::Layout::size
-error query.ambiguous: 7 definitions match 'size'; showing paths only
+std::test::Gen::size
+error query.ambiguous: 8 definitions match 'size'; showing paths only
 try: volec query show crate::m1::size
 [exit 1]
 $ show m2::size
