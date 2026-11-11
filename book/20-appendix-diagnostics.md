@@ -56,7 +56,7 @@ A *warning* is a problem that doesn't stop the build. It has the same
 shapes, with `warning` instead of `error`:
 
 ```vole w.vl warn
-use std::HashMap;
+use std::collections::HashMap;
 
 fn main() {
     println("hello");
@@ -66,7 +66,7 @@ fn main() {
 ```console
 $ volec w.vl -o w
 warning[use.unused]: unused import 'HashMap': nothing in this file names it
- --> w.vl: line 1, column 10
+ --> w.vl: line 1, column 23
   = help: remove it (`volec fix` removes every unused import)
   = try: volec fix --only unused w.vl
 ok: built w
@@ -94,7 +94,7 @@ profile
 | kind | what it's about |
 |---|---|
 | `tokenizer error` | the characters themselves: an unclosed string, a stray symbol |
-| `parser error` | the shape of the code: a missing `;` or `}`, a Rust spelling vole doesn't have |
+| `parser error` | the shape of the code: a missing `;` or `}`, something of Rust's vole doesn't have (a macro call, `dyn`) |
 | `module error` | the module tree: a `mod` with no file, a wildcard import (chapter 11) |
 | `type error` | names and types: most errors you'll meet |
 | `C import` | an `import "header.h"` that can't be read (chapter 15) |
@@ -109,8 +109,8 @@ to search for. The families are:
 
 | family | what it's about | chapter |
 |---|---|---|
-| `own.*` | values, moves and views: a value used after it moved, a view used after its data changed | [4](04-value-semantics.md) |
-| `conv.*` | parameter conventions: a missing `&`, an extra one, Rust's spellings | [4](04-value-semantics.md) |
+| `borrowck.*` | moves and borrows: a value used after it moved, two `&mut` of one place, a reference that outlives its data | [4](04-value-semantics.md) |
+| `alloc.*` | the allocator: a `Vec<T>` with no `A`, a `Vec::new()` with nothing to allocate from | [8](08-allocation.md) |
 | `contract.*` | `requires` and `ensures` | [13](13-contracts-testing.md) |
 | `test.*` | tests and properties | [13](13-contracts-testing.md) |
 | `sync.*` | what may cross to another thread | [14](14-threads.md) |
@@ -119,12 +119,31 @@ to search for. The families are:
 | `distinct.*` | distinct types | `volec guide types` |
 | `arch.*` | CPU features and intrinsics | `volec guide arch` |
 
-The compiler lists its codes itself. For example, the `own` family:
+The compiler lists its codes itself. For example, the `borrowck`
+family:
 
 ```console
-$ volec explain --list | grep '^own\.'
-own.readonly
-own.interior_copy
+$ volec explain --list | grep '^borrowck\.'
+borrowck.elision
+borrowck.unused_param
+borrowck.static_mut_ref
+borrowck.mut_twice
+borrowck.conflict
+borrowck.use_borrowed
+borrowck.assign_borrowed
+borrowck.move_borrowed
+borrowck.dropped_borrowed
+borrowck.return_local
+borrowck.outlives
+borrowck.use_moved
+borrowck.assign_moved_part
+borrowck.assign_twice
+borrowck.use_uninit
+borrowck.move_out
+borrowck.move_from_drop
+borrowck.guard_write
+borrowck.assign_immutable
+borrowck.borrow_immutable
 ```
 
 and the `sync` family:
@@ -161,14 +180,14 @@ When a command's `try:` has a word in capitals, like `VALUE`, that part
 is yours to fill in.
 
 Many errors have an exact fix the compiler knows: a misspelled name with
-one close match, a missing `use` or `pub`, a missing `&`, a Rust
-spelling. Their `try:` line is `volec fix --suggested FILE`, which makes
+one close match, a missing `use` or `pub`, a missing `&`. Their
+`try:` line is `volec fix --suggested FILE`, which makes
 every such fix in the program at once, checks the result, and prints the
 errors that are left. Here's one:
 
 ```vole
 fn main(gpa: Gpa) {
-    var s = String::new_in(gpa);
+    let mut s = String::new_in(gpa);
     s.push_string("hi");
     println("{s}");
 }
@@ -282,13 +301,13 @@ from a caller. Build with `--trace`, and a failure also prints the
 chain of calls that led to it, innermost first:
 
 ```vole trace.vl
-fn pick(v: [i64], i: i64) -> i64 {
+fn pick(v: &[i64], i: usize) -> i64 {
     v[i]
 }
 
 fn main() {
     let v = [10, 20, 30];
-    println("{}", pick(v, 3));
+    println("{}", pick(&v, 3));
 }
 ```
 
