@@ -70,49 +70,90 @@ main.vl:20:5: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the all
 [exit 1]
 $ explain alloc.default
 alloc.default: error
-(0.26.3) A container of std written without its allocator type, `Vec<u8>`, `Buf`, `HashMap<K, V>`: std's types have no default allocator (until 0.26.3 the default was Gpa), so the allocator a value may grow from is in its type, and a signature says what a function may allocate from. Also a type parameter bounded by Allocator declared with a default (`A: Allocator = Gpa`).
-fix: Write the allocator: `Vec<u8, Gpa>` (main's, what the default meant), or the allocator parameter of a generic item (`fn fill<A: Allocator>(v: &mut Vec<u8, A>)`); a function that only reads takes a slice, `[u8]`. `volec fix --only alloc` writes Gpa, except in an item generic over an allocator, where it is yours to choose (in its own generic impl, the program's type gets the impl's `A`; an impl block without the allocator gets the parameter).
+(0.26.3) A container of std written without its allocator type, `Vec<u8>`, `String`, `Box<T>`: std's types have no default allocator (until 0.26.3 the default was Gpa), so the allocator a value may grow from is in its type, and a signature says what a function may allocate from. Also a type parameter bounded by Allocator declared with a default (`A: Allocator = Gpa`).
+fix: Write the allocator: `Vec<u8, Gpa>` (main's, what the default meant), or the allocator parameter of a generic item (`fn fill<A: Allocator>(v: &mut Vec<u8, A>)`); a function that only reads takes a slice, `&[u8]`. `volec fix --only alloc` writes Gpa, except in an item generic over an allocator, where it is yours to choose (in its own generic impl, the program's type gets the impl's `A`; an impl block without the allocator gets the parameter).
 example:
-    fn total(v: Vec<i64>) -> i64 { v.iter().sum() }
+    fn total(v: &Vec<i64>) -> i64 { v.iter().sum() }
     
-    main.vl:1:13: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator`
+    fn main() {}
+    
+    main.vl:1:14: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3)
+      help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator`
+      try: volec fix --only alloc main.vl
+      try: volec fix --suggested main.vl
 $ explain alloc.no_in
 alloc.no_in: error
-(0.26.3) A constructor or function that allocated from an allocator nobody passed (`Vec::new()`, `with_capacity(n)`, `collect()`, `format(x)`, `s.to_string()`): std has none of them. Every allocation names its allocator, as the last argument of the `_in` form (`Vec::new_in(a)`, `collect_in(a)`, `format_in(x, a)`).
-fix: Call the `_in` form with the allocator: a parameter (`gpa: Gpa`, from main's `fn main(gpa: Gpa)`), or a container's (`v.alloc()`). `volec fix --only alloc` writes it when one allocator value is in scope, and says so when none or several are.
+(0.26.3) A constructor or function that allocated from an allocator nobody passed (`Vec::new()`, `Vec::with_capacity(n)`, `thread::spawn(f)`): std has none of them. Every allocation names its allocator, as the last argument of the `_in` form (`Vec::new_in(a)`, `collect_in(a)`, `format_in("{x}", a)`).
+fix: Call the `_in` form with the allocator: a parameter (`gpa: Gpa`, from main's `fn main(gpa: Gpa)`), or a container's (`*v.allocator()`). `volec fix --only alloc` writes it when one allocator value is in scope, and says so when none or several are.
 example:
-    let v: Vec<i64, Gpa> = Vec::new();
+    fn main(gpa: Gpa) {
+        let v: Vec<i64, Gpa> = Vec::new();
+        println("{}", v.len());
+    }
     
-    main.vl:2:28: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in' | help: this function's `gpa` is the allocator to pass
+    main.vl:2:28: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in'
+      help: this function's `gpa` is the allocator to pass
+      try: volec fix --only alloc main.vl
+      try: volec fix --suggested main.vl
 $ explain alloc.safe_impl
 alloc.safe_impl: error
 (0.26.3) An impl of std's Allocator written `impl Allocator for T`: Allocator is an `unsafe trait`, as in Rust. Containers' unsafe code relies on an allocator's blocks, and a type made from nothing over malloc is a global allocator, so its impl says so. (Any `unsafe trait`'s impl is `unsafe impl`; `unsafe impl` of a safe trait, or of a type alone, is an error.)
 fix: Write `unsafe impl Allocator for T`, under `// UNSAFE:` (why it cannot be safe) and `// SAFETY:` (where its memory comes from, why its blocks are sound). No tool writes it: the comments are the author's.
 example:
-    impl Allocator for Heap { .. }
+    use std::alloc::{Allocator, AllocError, Layout};
+    use std::ptr::NonNull;
     
-    main.vl:1:1: error[alloc.safe_impl] the trait 'Allocator' is unsafe: its impl is `unsafe impl` | help: an allocator says where its memory comes from: `unsafe impl Allocator for T`, under `// UNSAFE:` (why it cannot be safe) and `// SAFETY:` (where its memory comes from, why it is sound)
+    #[derive(Clone, Copy)]
+    struct Never {}
+    
+    impl Allocator for Never {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> { Err(AllocError) }
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {}
+    }
+    
+    fn main() {}
+    
+    main.vl:7:1: error[alloc.safe_impl] the trait 'Allocator' is unsafe: its impl is `unsafe impl`
+      help: an allocator says where its memory comes from: `unsafe impl Allocator for T`, under `// UNSAFE:` (why it cannot be safe) and `// SAFETY:` (where its memory comes from, why it is sound)
 $ explain alloc.static
 alloc.static: error
-(0.26.3) A `static`, `static var` or thread-local whose type holds an allocator (`Option<Vec<u8, Gpa>>`, an Arena, a struct holding one, through a pointer too): any function could allocate through it with nothing in its signature saying so. So a static's type is AllocFree (the auto trait, `T: AllocFree`), and an allocator value inside a function came in through a parameter.
+(0.26.3) A `static`, `static mut` or thread-local whose type holds an allocator (`Option<Vec<u8, Gpa>>`, an Arena, a struct holding one, through a pointer too): any function could allocate through it with nothing in its signature saying so. So a static's type is AllocFree (the auto trait, `T: AllocFree`), and an allocator value inside a function came in through a parameter.
 fix: Keep the container in main, or in the struct the program's work is done on, and pass it (or what it allocated, as a slice) down. A static may hold what holds no allocator: integers, arrays, atomics, text. No tool moves it.
 example:
-    static var NAMES: Option<Vec<i64, Gpa>> = None;
+    static mut NAMES: Option<Vec<i64, Gpa>> = None;
+    
+    fn main() {}
     
     main.vl:1:1: error[alloc.static] the static 'NAMES' holds an allocator, 'Gpa' (in its type 'Option<Vec<i64, Gpa>>'): a static's type may not hold one
+      help: any function could allocate through it with nothing in its signature saying so: keep the value in main and pass it down (or what it allocates, as a slice)
 $ explain alloc.field
 alloc.field: error
-(0.26.3) A struct's field or an enum variant's payload holds an allocator that the type's parameters do not name (`struct Parser { toks: Vec<Tok, Gpa> }`): `fn f(p: inout Parser)` could allocate with nothing in its signature saying so. A type that holds an allocator says so in its parameters.
+(0.26.3) A struct's field or an enum variant's payload holds an allocator that the type's parameters do not name (`struct Parser { toks: Vec<Tok, Gpa> }`): `fn f(p: &mut Parser)` could allocate with nothing in its signature saying so. A type that holds an allocator says so in its parameters.
 fix: Make the type generic over the allocator, `struct Parser<A: Allocator> { toks: Vec<Tok, A> }`, and name it at each use, `Parser<Gpa>`: `volec fix --only alloc` does both, in rounds (the parameter, then the uses). A literal infers it from its fields (`Parser { toks: Vec::new_in(gpa) }`).
 example:
     struct Parser { toks: Vec<i64, Gpa> }
     
+    fn main() {}
+    
     main.vl:1:23: error[alloc.field] the struct 'Parser' holds an allocator its parameters do not name: 'Gpa', in field 'toks'
+      help: a type that holds an allocator says so in its parameters: make it generic over it (`struct P<A: Allocator> { v: Vec<u8, A> }`, used as `P<Gpa>`)
+      try: volec fix --only alloc main.vl
+      try: volec fix --suggested main.vl
 $ explain alloc.last
 alloc.last: error
 (0.26.3) A function named `..._in` whose allocator parameter is not its last: an `_in` function takes its allocator last, as Rust's allocator API does (`Vec::with_capacity_in(cap, alloc)`), so that every allocating call reads the same way.
 fix: Move the allocator to the end of the parameters and of every call: `volec refactor signature` does both.
 example:
-    fn copy_in<A: Allocator>(a: A, s: [u8]) -> Vec<u8, A>
+    use std::alloc::Allocator;
     
-    main.vl:1:26: error[alloc.last] 'copy_in' takes its allocator 'a' before its last parameter: an `_in` function takes it last
+    fn copy_in<A: Allocator>(a: A, s: &[u8]) -> Vec<u8, A> {
+        let mut v = Vec::new_in(a);
+        v.extend_from_slice(s);
+        v
+    }
+    
+    fn main() {}
+    
+    main.vl:3:26: error[alloc.last] 'copy_in' takes its allocator 'a' before its last parameter: an `_in` function takes it last
+      help: move the allocator to the end of the parameters (Rust's `with_capacity_in(cap, alloc)`), and at every call: `volec refactor signature` does both
+      try: volec refactor signature --help

@@ -51,33 +51,37 @@ rect       12.00 m2
 ## How it works
 
 **derive writes the routine impls.** One line gives `Vec2` structural
-`==` (`Eq`), an order field by field (`Ord`: by `x`, then `y`, which is
-what `sort` and `<` use), a hash (so it can be a `HashMap` key), Rust's
-Debug text, and `.clone()`:
+`==` (`PartialEq`, `Eq`), an order field by field (`PartialOrd`, `Ord`:
+by `x`, then `y`, which is what `sort` and `<` use), a hash (so it can
+be a `HashMap` key), Rust's Debug text, `.clone()`, and `Copy` (a plain
+value: passing it leaves the original usable):
 
 ```tach
-#[derive(Eq, Ord, Hash, Debug, Clone)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
 pub struct Vec2 { pub x: i64, pub y: i64 }
 ```
 
 **Operators are traits.** `a + b` calls `Add::add`, `-a` calls
-`Neg::neg`, `<` calls `Ord::cmp`. `Mat2` implements `Mul` as the
-composition of two linear maps, so `ROTATE_90 * ROTATE_90` is a half
-turn:
+`Neg::neg`, `<` calls `PartialOrd::partial_cmp`. An impl names its
+result type (`type Output`). `Mat2` implements `Mul` as the composition
+of two linear maps, so `ROTATE_90 * ROTATE_90` is a half turn:
 
 ```tach
 impl Add for Vec2 {
+    type Output = Vec2;
     fn add(self, o: Vec2) -> Vec2 { Vec2 { x: self.x + o.x, y: self.y + o.y } }
 }
 
 impl Mul for Mat2 {
+    type Output = Mat2;
     fn mul(self, o: Mat2) -> Mat2 { ... }
 }
 ```
 
-`Meters` has floating-point contents, so its `Ord` is written by hand:
-`cmp` returns negative, zero or positive, and `<`, `<=`, `>`, `>=`
-follow from it.
+`Meters` has floating-point contents, and floats have no total order
+(NaN compares with nothing), so it has `PartialEq` and `PartialOrd`
+written by hand, not `Ord`: `partial_cmp` returns an
+`Option<Ordering>`, and `==`, `<`, `<=`, `>`, `>=` follow from the two.
 
 **A trait with default methods.** `Shape` requires `area` and
 `perimeter`; `name` and `describe` have bodies that an impl may keep or
@@ -86,10 +90,10 @@ default, which is why the triangle prints as `shape`:
 
 ```tach
 pub trait Shape {
-    fn area(self) -> f64;
-    fn perimeter(self) -> f64;
-    fn name(self) -> [u8] { "shape" }
-    fn describe(self) {
+    fn area(&self) -> f64;
+    fn perimeter(&self) -> f64;
+    fn name(&self) -> &'static str { "shape" }
+    fn describe(&self) {
         println("{:<8} area {:>7.2}  perimeter {:>6.2}", self.name(), self.area(),
             self.perimeter());
     }
@@ -101,25 +105,26 @@ each use with a new type compiles a copy for that type
 (monomorphization), so there is no dynamic dispatch:
 
 ```tach
-fn total_area<T: Shape>(shapes: [T]) -> f64 {
-    var total = 0.0;
-    for s in shapes { total += s.area(); } // s: each element in place
+fn total_area<T: Shape>(shapes: &[T]) -> f64 {
+    let mut total = 0.0;
+    for s in shapes { total += s.area(); } // s: a reference to each element
     total
 }
 
-fn largest<T: Ord>(xs: [T]) -> Option<T> { ... }
+fn largest<T: Ord + Copy>(xs: &[T]) -> Option<T> { ... }
 ```
 
 **No trait objects: an enum of the cases.** Vole has no `dyn Shape`.
 A list of different shapes is an enum, and the enum implements the
-trait by dispatching with `match`; `total_area(shapes[..])` then works
-on the mixed list as on the list of rectangles:
+trait by dispatching with `match`; `total_area(&shapes)` then works
+on the mixed list as on the list of rectangles. (`A` is the allocator of
+the polygon's `Vec`: a type that holds one names it.)
 
 ```tach
-pub enum AnyShape { C(Circle), R(Rect), P(Polygon) }
+pub enum AnyShape<A: Allocator> { C(Circle), R(Rect), P(Polygon<A>) }
 
-impl Shape for AnyShape {
-    fn area(self) -> f64 {
+impl<A: Allocator> Shape for AnyShape<A> {
+    fn area(&self) -> f64 {
         match self {
             AnyShape::C(c) => c.area(),
             AnyShape::R(r) => r.area(),
@@ -132,37 +137,41 @@ impl Shape for AnyShape {
 
 **An iterator in the library.** `Polygon::edges` returns an `Edges`,
 whose `Item` is a pair of points; the area (the shoelace formula) and
-the perimeter are then one chain each:
+the perimeter are then one loop each:
 
 ```tach
-impl Iterator for Edges {
+impl<'a> Iterator for Edges<'a> {
     type Item = (Vec2, Vec2);
-    fn next(inout self) -> Option<(Vec2, Vec2)> { ... }
+    fn next(&mut self) -> Option<(Vec2, Vec2)> { ... }
 }
 
-fn perimeter(self) -> f64 {
-    self.edges().fold(0.0, |acc, (a, b)| acc + (b - a).length())
+fn perimeter(&self) -> f64 {
+    let mut sum = 0.0;
+    for (a, b) in self.edges() { sum += (b - a).length(); }
+    sum
 }
 ```
 
 **A trait with an associated type.** What `measure` returns depends on
 the type: a `Segment` measures to `Meters`, a `Rect` to `SquareMeters`.
-A generic function names the result `T::Output`. Its body is checked
-per instance, so `{m}` needs `Display` only for the outputs actually
-used:
+A generic function names the result `T::Output`, and its `where` clause
+says what the body needs of it: `{m}` needs `Display`.
 
 ```tach
 pub trait Measured {
     type Output;
-    fn measure(self) -> Self::Output;
+    fn measure(&self) -> Self::Output;
 }
 
 impl Measured for Segment {
     type Output = Meters;
-    fn measure(self) -> Meters { Meters { m: (self.b - self.a).length() } }
+    fn measure(&self) -> Meters { Meters { m: (self.b - self.a).length() } }
 }
 
-fn show<T: Measured>(label: [u8], x: T) {
+fn show<T: Measured>(label: &str, x: &T)
+    where
+        T::Output: Display,
+{
     let m: T::Output = x.measure();
     println("{label:<10} {m}");
 }
@@ -179,10 +188,10 @@ impl From<Feet> for Meters {
     fn from(f: Feet) -> Meters { Meters { m: f.ft / FEET_PER_METER } }
 }
 
-pub fn total<T: Into<Meters>>(lengths: [T]) -> Meters {
-    var sum = Meters { m: 0.0 };
+pub fn total<T: Into<Meters> + Copy>(lengths: &[T]) -> Meters {
+    let mut sum = Meters { m: 0.0 };
     for x in lengths {
-        let m: Meters = x.into(); // Into needs the target type: here, the let's
+        let m: Meters = (*x).into(); // Into needs the target type: here, the let's
         sum = sum + m;
     }
     sum
@@ -190,7 +199,7 @@ pub fn total<T: Into<Meters>>(lengths: [T]) -> Meters {
 ```
 
 **Clone copies deeply.** `Polygon` holds a `Vec`, which owns its points:
-assigning or passing the struct moves it (the old name cannot be used
+assigning or passing the struct by value moves it (the old name cannot be used
 again). The derived `clone` copies the vector's contents, so changing
 the clone leaves the original as it was; each is freed when it goes out
 of scope. `main` puts a clone of the triangle into the `shapes` array,
@@ -198,8 +207,7 @@ because it uses the triangle afterwards.
 
 **Modules.** `main.vl` loads the library with `mod geometry;` and
 `mod units;` and imports by name (`use geometry::{Shape, Vec2, ...}`);
-items are private unless `pub` (a struct's fields are as visible as the
-struct; the `pub` on them is documentation). `geometry.vl` reaches its
+items and a struct's fields are private unless `pub`. `geometry.vl` reaches its
 sibling with `use crate::units::{Meters, SquareMeters};`.
 
 **A little C.** The square root comes from C's `sqrt`, declared in an
@@ -208,21 +216,18 @@ safe function once: `pub fn square_root(x: f64) -> f64 { unsafe { sqrt(x) } }`.
 
 ## Language features
 
-- traits, default methods, operator traits, `impl Ord` by hand: `volec guide traits`
+- traits, default methods, operator traits, `impl PartialOrd` by hand: `volec guide traits`
 - generic functions and bounds, monomorphization: `volec guide generics`
 - associated types (`type Output;`, `T::Output`), `impl Iterator`: `volec guide traits`, `volec guide iterators`
-- `#[derive(Eq, Ord, Hash, Debug, Clone)]`, `impl Display`: `volec guide formatting`
+- `#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]`, `impl Display`: `volec guide formatting`
 - `From`/`Into` and `T: Into<U>` bounds: `volec guide conversions`
 - modules, `mod`, `pub`, `use crate::...`: `volec guide modules`
-- `static` values of struct type, `extern "C"`: `volec guide syntax`, `volec guide c-interop`
+- `const` values of struct type, `extern "C"`: `volec guide syntax`, `volec guide c-interop`
 
 ## Going further
 
 - No `dyn Trait`: use generics, or an enum of the cases as `AnyShape`.
-- No supertraits (`trait Shape: Display`), associated constants or
-  `where` clauses: put each bound on the type parameter.
-- A `const` holds numbers, bools and strings; a struct value such as
-  `ROTATE_90` is a `static`.
-- `Mul<f64> for Vec2` (an operator with another right-hand type) is not
-  there: the operator traits take `Self` on both sides; write a method
-  (`scale(k)`).
+- Supertraits (`trait Shape: Display`), associated constants and
+  `where` clauses are there, as in Rust.
+- `impl Mul<f64> for Vec2` (an operator with another right-hand type)
+  does not work yet: write a method (`scale(k)`).

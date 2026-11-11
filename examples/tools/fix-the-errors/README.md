@@ -40,10 +40,21 @@ Most say what to do, in their `help:`. A `KIND` (`type error`,
 ```console
 $ volec explain unsafe
 unsafe: error (compiler)
-An unsafe operation (a raw pointer's dereference or indexing, a C call, a union field) outside unsafe code.
-fix: Put it in an `unsafe { }` block, or the function in `unsafe fn`; the try: line, `volec fix --only unsafe ROOT`, wraps every such place (the check hook prints it once, with how many errors it answers). Through a `*T` parameter that only reads or writes one value: make it a let parameter `x: T`, or `x: inout T` when written through (`volec refactor signature F --convention x inout`), and keep `*T` for what stays raw (indexed, compared, cast, stored, given to C).
+An unsafe operation (a raw pointer's dereference or indexing, a C call, a union field, a `static mut`) outside unsafe code.
+fix: Put it in an `unsafe { }` block, or the function in `unsafe fn`; the try: line, `volec fix --only unsafe ROOT`, wraps every such place (the check hook prints it once, with how many errors it answers). A raw pointer parameter that only reads or writes one value: take a reference, `x: &T`, or `x: &mut T` when written through, and keep `*const T` and `*mut T` for what stays raw (indexed, compared, cast, stored, given to C).
 example:
-    main.vl:39:13: error[unsafe] dereference of a raw pointer is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: volec fix --only unsafe main.vl
+    fn first(p: *const i64) -> i64 {
+        *p
+    }
+    
+    fn main() {
+        let x = 5;
+        println("{}", first(&raw const x));
+    }
+    
+    main.vl:2:5: error[unsafe] dereference of a raw pointer is unsafe
+      help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place)
+      try: volec fix --only unsafe main.vl
 ```
 
 ## 2. The mechanical ones: `fix`
