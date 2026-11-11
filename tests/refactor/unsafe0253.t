@@ -13,10 +13,10 @@ main.vl:20:13: error[unsafe.unjustified] unsafe block without a `// UNSAFE:` com
 [exit 1]
 ## Past five, one warning counts them (a program of legacy unsafe).
 $ check many/main.vl
-many/main.vl:2:1: warning[unsafe.unjustified] 6 unsafe sites lack `// UNSAFE:` and `// SAFETY:` comments (the first here) | help: each unsafe site says right above it why it cannot be safe and why it is sound; the try: line lists them | try: volec query unsafe --no-std --unjustified --root many/main.vl
+many/main.vl:3:1: warning[unsafe.unjustified] 6 unsafe sites lack `// UNSAFE:` and `// SAFETY:` comments (the first here) | help: each unsafe site says right above it why it cannot be safe and why it is sound; the try: line lists them | try: volec query unsafe --no-std --unjustified --root many/main.vl
 ok: 0 errors, 1 warning in many/main.vl
 $ check many/main.vl --deny-warnings
-many/main.vl:2:1: error[unsafe.unjustified] 6 unsafe sites lack `// UNSAFE:` and `// SAFETY:` comments (the first here) | help: each unsafe site says right above it why it cannot be safe and why it is sound; the try: line lists them | try: volec query unsafe --no-std --unjustified --root many/main.vl
+many/main.vl:3:1: error[unsafe.unjustified] 6 unsafe sites lack `// UNSAFE:` and `// SAFETY:` comments (the first here) | help: each unsafe site says right above it why it cannot be safe and why it is sound; the try: line lists them | try: volec query unsafe --no-std --unjustified --root many/main.vl
 [exit 1]
 $ explain unsafe.unjustified
 unsafe.unjustified: warning (check)

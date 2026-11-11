@@ -659,6 +659,20 @@ try:
     write(rc, "// EDITION: rust\nfn main() {}\n")
     case("case options: the root line is the compiler's", hook.case_options(rc), ([], {}))
     case("case options: no root", hook.case_options(None), ([], {}))
+    # (0.28.0) a file that names no edition and is written in the rust
+    # edition is read in it; one with an MVS spelling is not; a module
+    # read alone (`fmt`) takes its root's edition
+    write(rc, "fn incr(r: &mut i64) {\n    *r += 1;\n}\n")
+    case("case options: rust source without a line", hook.case_options(rc), (["--edition", "rust"], {}))
+    case("edition args: rust source without a line", hook.edition_args(rc), ["--edition", "rust"])
+    write(rc, "fn incr(r: inout i64) {\n    let mut k = 1; // &mut \n    r += k;\n}\n")
+    case("case options: an MVS spelling, MVS", hook.case_options(rc), ([], {}))
+    write(rc, "// EDITION: rust\nfn main() {\n    let mut k = 1;\n}\n")
+    case("edition args: the line is the compiler's", hook.edition_args(rc), [])
+    rm = os.path.join(os.path.dirname(rc), "rust_mod.vl")
+    write(rm, "pub fn two() -> i64 {\n    2\n}\n")
+    case("edition args: a module of a rust root", hook.edition_args(rm, rc), ["--edition", "rust"])
+    case("edition args: a module alone, no sign", hook.edition_args(rm), [])
     os.remove(rc)
 
     # The real compiler, when it has --json (0.15): a clean program is
@@ -679,7 +693,7 @@ try:
              "volec check main.vl: 1 error\nmain.vl:2:18: error[type error] undefined variable 'q'")
         # (0.18.1) the hook applies the exact fix: the file is changed;
         # (0.25.2.1) a mechanical one only: a did-you-mean is shown
-        write(os.path.join(prog, "main.vl"), "fn main() {\n    prinln(\"x\");\n    let mut y = 1 + \"a\";\n}\n")
+        write(os.path.join(prog, "main.vl"), "fn main() {\n    prinln(\"x\");\n    let mut y = 1 + \"a\";\n}}\n\nfn bump(x: inout i64) {\n    x += 1;\n}\n")
         got = ctx_of(run(ev2, real)[1])
         with open(os.path.join(prog, "main.vl")) as fh:
             now = fh.read()
@@ -741,7 +755,7 @@ try:
         # (0.25.3) The hook's rewrites are its fixes' changes, each named:
         # the file differs from what was written by those lines alone (an
         # unformatted line stays as it was; the hook formats nothing).
-        before = "fn main() {\n    let   z  =  3;\n    let mut y = z + 1;\n    println(\"{y}\");\n}\n"
+        before = "fn main() {\n    let   z  =  3;\n    let mut y = z + 1;\n    println(\"{y}\");\n}\n\nfn bump(x: inout i64) {\n    x += 1;\n}\n"  # (an MVS program: `inout`)
         write(os.path.join(prog, "main.vl"), before)
         got = ctx_of(run(ev2, real, tempfile.mkdtemp(dir=tmp))[1])
         with open(os.path.join(prog, "main.vl")) as fh:

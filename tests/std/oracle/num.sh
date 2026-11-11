@@ -1,6 +1,8 @@
 #!/bin/sh
-# std::num's checks against Rust (0.20, A6): tools/numtables/gen.vl
-# makes the tables checked in; num_check.vl (vole's std) and
+# The number conversions' checks against Rust (0.20, A6): tools/numtables/gen.vl
+# makes the old std's tables checked in (compiler/std/num/tables.vl: that
+# row goes with the old std; std2's flt.vl has no table); num_check.vl
+# (vole's std: std2's `{}`, `{:?}`, `{:e}` and `parse` since 0.28) and
 # num_oracle.rs (Rust's std) print the same hashes, chunk by chunk, of
 #   - {} {:?} {:e} of N f64 (raw bits, near 1, integers, short decimals),
 #     each read back and checked to be the shortest;

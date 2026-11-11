@@ -68,8 +68,8 @@ edit, refactor, fix, check, probe, test; `tools/query/roots.vl`):
   most 3: the program the current directory is in first, when it is in
   one's subdirectory, then the examples', then the rest; (0.25.2.2) never
   one under evals/, tests/, target/ or a dot directory, nor anything from
-  under evals/: the 0.25.2.1 eval's `try:` lines named other agents'
-  programs). A std path (`std::window::Surface::frame`) never goes to
+  under a directory evals/: the 0.25.2.1 eval's `try:` lines named other
+  agents' programs; that tree was deleted at 0.28.0). A std path (`std::window::Surface::frame`) never goes to
   another program: std is every program's, and its nearest names answer
   (`try: volec query show std::gpu::Surface::frame`). When one program defines it, a
   question of `query` is answered from there, with `note
@@ -1120,8 +1120,7 @@ the model, which reads the text form as well and in fewer tokens.
   the end.
 
 tools/agent-hooks/check-after-edit.py (the check after every edit, in
-AGENTS.md) and the agent eval's `final_check` (tests/agent-eval) read
-`check --json`. tests/refactor/json.t has a transcript.
+AGENTS.md) reads `check --json`. tests/refactor/json.t has a transcript.
 
 ## Programs with errors
 

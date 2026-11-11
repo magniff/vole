@@ -7,10 +7,10 @@ ok: built prog
 % ./prog
 42
 $ check bad.vl
-bad.vl:2:5: error[type error] undefined variable 'prinln' | help: did you mean 'println'? | try: volec fix --suggested bad.vl
+bad.vl:3:5: error[type error] undefined variable 'prinln' | help: did you mean 'println'? | try: volec fix --suggested bad.vl
 [exit 1]
 $ bad.vl -o bad
-bad.vl:2:5: error[type error] undefined variable 'prinln' | help: did you mean 'println'? | try: volec fix --suggested bad.vl
+bad.vl:3:5: error[type error] undefined variable 'prinln' | help: did you mean 'println'? | try: volec fix --suggested bad.vl
 [exit 1]
 ## --emit-ir (and --emit-mir) without -o print to stdout, no a.o
 % "$COMPILER" --emit-ir main.vl | head -1
