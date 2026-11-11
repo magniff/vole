@@ -1,10 +1,16 @@
 # Writes a random vole program of loops indexing arrays of fixed sizes
 # (0.11): induction variables with steps of 1 to 4, steps read from the
 # array, decreasing ones, two of them together, sift-downs (`child + 1 <
-# end && a[child] < a[child + 1]`); now and then an index goes past an end
+# end && a[(child) as usize] < a[(child + 1) as usize]`); now and then an index goes past an end
 # (the bounds check stops the program with 101, alike at every level). The
 # range analysis drops the checks it proves (range.vl): every level must
 # print the same.
+#
+# The programs are in the rust edition (0.28): the arithmetic is i64 and
+# every index is written `a[(E) as usize]` (a negative one wraps to a
+# huge usize and stops at the bounds check, as before). Seed subset
+# (tests/seed-compat.awk turns these into the seed's dialect): `let
+# mut`, `(E) as usize` as an index, `*const u8`, arrays by value.
 #
 # usage: awk -v seed=N -f genrange.awk
 
@@ -12,14 +18,14 @@ function rnd(n) { return int(rand() * n) }
 
 BEGIN {
     srand(seed)
-    print "extern \"C\" {\n    fn printf(f: *u8, ...) -> i32;\n}\n"
+    print "// EDITION: rust\nextern \"C\" {\n    fn printf(f: *const u8, ...) -> i32;\n}\n"
     nf = 6
     for (f = 0; f < nf; f++) {
         n = 8 + rnd(60)
         size[f] = n
         print "#[inline(never)]"
         print "fn f" f "(a: [i64; " n "], x: i64) -> i64 {"
-        print "    var t = 0;"
+        print "    let mut t = 0;"
         kind = rnd(5)
         off = (rnd(5) == 0) ? rnd(5) - 2 : rnd(2)
         risky = rnd(6) == 0
@@ -27,51 +33,51 @@ BEGIN {
             # increasing, a constant step
             step = 1 + rnd(4)
             bound = n - off - rnd(4) + (risky ? rnd(4) : 0)
-            print "    var i = " rnd(3) ";"
+            print "    let mut i = " rnd(3) ";"
             print "    while i < " bound " {"
-            print "        t += a[i + " off "] * 3 + i;"
+            print "        t += a[(i + " off ") as usize] * 3 + i;"
             print "        i += " step ";"
             print "    }"
         } else if (kind == 1) {
             # a step read from the array
             bound = n - off - rnd(4) + (risky ? rnd(3) : 0)
-            print "    var i = 0;"
+            print "    let mut i = 0;"
             print "    while i < " bound " {"
-            print "        t += a[i + " off "];"
-            print "        i += 1 + (a[i % " n "] & " (1 + rnd(7)) ");"
+            print "        t += a[(i + " off ") as usize];"
+            print "        i += 1 + (a[(i % " n ") as usize] & " (1 + rnd(7)) ");"
             print "    }"
         } else if (kind == 2) {
             # decreasing
             start = n - (risky ? rnd(3) - 1 : rnd(3))
             step = 1 + rnd(3)
-            print "    var i = " start ";"
+            print "    let mut i = " start ";"
             print "    while i > " rnd(3) " {"
             print "        i -= " step ";"
-            print "        t += a[i" (risky ? " + 1" : "") "] - i;"
+            print "        t += a[(i" (risky ? " + 1" : "") ") as usize] - i;"
             print "    }"
         } else if (kind == 3) {
             # a sift-down
-            print "    var root = x % " n ";"
+            print "    let mut root = x % " n ";"
             print "    if root < 0 { root = 0 - root; }"
             print "    let end = " (n - rnd(3) + (risky ? rnd(2) : 0)) ";"
             print "    loop {"
-            print "        var child = 2 * root + 1;"
+            print "        let mut child = 2 * root + 1;"
             print "        if child >= end {"
             print "            break;"
             print "        }"
-            print "        if child + 1 < end && a[child] < a[child + 1] {"
+            print "        if child + 1 < end && a[(child) as usize] < a[(child + 1) as usize] {"
             print "            child += 1;"
             print "        }"
-            print "        t += a[root] * 2 + a[child];"
+            print "        t += a[(root) as usize] * 2 + a[(child) as usize];"
             print "        root = child;"
             print "    }"
         } else {
             # two induction variables, one reset
             step = 1 + rnd(3)
-            print "    var i = 0;"
-            print "    var j = " rnd(4) ";"
+            print "    let mut i = 0;"
+            print "    let mut j = " rnd(4) ";"
             print "    while i < " (n - rnd(4)) " {"
-            print "        t += a[i] + a[j % " n "] + a[(i + j) / 2];"
+            print "        t += a[(i) as usize] + a[(j % " n ") as usize] + a[((i + j) / 2) as usize];"
             print "        i += " step ";"
             print "        j += " (step + rnd(2)) ";"
             print "        if j > " n " { j = " rnd(3) "; }"
@@ -82,9 +88,9 @@ BEGIN {
     }
     print "fn main() -> i32 {"
     for (f = 0; f < nf; f++) {
-        print "    var a" f ": [i64; " size[f] "] = [0; " size[f] "];"
+        print "    let mut a" f ": [i64; " size[f] "] = [0; " size[f] "];"
         print "    for k in 0.." size[f] " {"
-        print "        a" f "[k] = (k * " (3 + rnd(20)) " + " rnd(9) ") % " (5 + rnd(30)) ";"
+        print "        a" f "[k as usize] = (k * " (3 + rnd(20)) " + " rnd(9) ") % " (5 + rnd(30)) ";"
         print "    }"
         print "    unsafe { printf(c\"%ld\\n\", f" f "(a" f ", " rnd(100) ")); }"
     }

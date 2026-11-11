@@ -543,20 +543,72 @@ CASE_ENV = re.compile(r"^// ENV: (VOLE_STD2)=(\S*)\s*$")
 EDITION_FLAG = re.compile(r"(?:^|\s)--edition(?:=|\s+)(\S+)")
 
 
+# (0.28.0) A file that says nothing of its edition (a transcript's
+# program or input whose `--edition rust` is in the .t, a module read
+# alone by `fmt`) and is written in the rust edition: it has spellings
+# only that edition reads and none that only MVS reads. Read as MVS it
+# would be reported, "fixed" into MVS and formatted as MVS.
+EDITION_LINE = re.compile(r"^// EDITION: rust[ \t\r]*$", re.M)
+RUST_ONLY = re.compile(r"\blet mut\b|&mut |&self\b|&'[a-z_]+ |&str\b|: &\[|-> &|\*(?:const|mut) |\.len\(\)|\bimpl(?:<[^>]*>)? [^{;]* for ")
+MVS_ONLY = re.compile(r"^\s*var [A-Za-z_]|\binout\b|\bsink [A-Za-z_\[]|\bself: \*|: \*[A-Za-z_\[*]|\.len\b(?!\()", re.M)
+
+
+def code_only(text):
+    """text without its line comments (a `//` in a string is rare enough)."""
+    return "\n".join(line.split("//", 1)[0] for line in text.splitlines())
+
+
+def looks_rust(text):
+    """Whether text, with no edition named, is rust-edition source."""
+    code = code_only(text)
+    return bool(RUST_ONLY.search(code)) and not MVS_ONLY.search(code)
+
+
+def edition_args(path, root=None):
+    """(0.28.0) [`--edition rust`] for a command that reads the file path
+    alone (`fmt`), when path is rust-edition source and does not say so
+    itself: its program's root (root, when known) has the line or the
+    FLAGS, or path looks_rust; [] when path has the line (the compiler
+    reads it), is MVS or cannot be read."""
+    try:
+        with open(path, errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return []
+    if EDITION_LINE.search(text):
+        return []
+    args, _ = case_options(path)
+    if args:
+        return args
+    if root and os.path.abspath(root) != os.path.abspath(path):
+        try:
+            with open(root, errors="replace") as fh:
+                root_text = fh.read()
+        except OSError:
+            root_text = ""
+        if EDITION_LINE.search(root_text) or case_options(root)[0] == ["--edition", "rust"]:
+            return ["--edition", "rust"]
+    return ["--edition", "rust"] if looks_rust(text) else []
+
+
 def case_options(root):
     """(0.27.2) The compiler's options of the test case root, as
     tests/run.sh gives them: ([`--edition E`], {VOLE_STD2: V}); a root
     that is no file (check's default, the compiler) has none. Without
     them a rust case is checked as MVS, and its Rust spellings "fixed"
-    into MVS ones."""
+    into MVS ones. (0.28.0) A root that names no edition and looks_rust
+    gets `--edition rust`."""
     args, env = [], {}
     if not root or not root.endswith(".vl"):
         return args, env
     try:
         with open(root, errors="replace") as fh:
-            lines = fh.read().splitlines()
+            text = fh.read()
     except OSError:
         return args, env
+    lines = text.splitlines()
+    if not EDITION_LINE.search(text) and looks_rust(text):
+        args = ["--edition", "rust"]
     for line in lines:
         m = CASE_FLAGS.match(line)
         if m:
@@ -1482,7 +1534,7 @@ def fmt_note(compiler, cwd, edited, st):
         return ""
     full = os.path.abspath(edited)
     arg = os.path.relpath(full, cwd) if full.startswith(cwd + os.sep) else full
-    r = run_typed(compiler, cwd, ["fmt", "--check", arg])
+    r = run_typed(compiler, cwd, ["fmt"] + edition_args(full) + ["--check", arg])
     if r is None or r.returncode not in (0, 1):
         return ""
     said = st.setdefault("unformatted", [])
@@ -1524,7 +1576,7 @@ def fmt_new_file(event, compiler, cwd, edited):
         return ""
     full = os.path.abspath(edited)
     arg = os.path.relpath(full, cwd) if full.startswith(cwd + os.sep) else full
-    r = run_typed(compiler, cwd, ["fmt", arg])
+    r = run_typed(compiler, cwd, ["fmt"] + edition_args(full) + [arg])
     if r is None or r.returncode != 0 or not FORMATTED.search(r.stdout or ""):
         return ""
     d = run_typed(compiler, cwd, ["query", "diff"])

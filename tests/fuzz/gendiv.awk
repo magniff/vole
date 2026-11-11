@@ -137,8 +137,9 @@ BEGIN {
     } else {
         print "// A random program of divisions by constants (tests/fuzz/gendiv.awk, seed " seed ")."
     }
+    print "// EDITION: rust"
     print "extern \"C\" {"
-    print "    fn printf(format: *u8, ...) -> i32;"
+    print "    fn printf(format: *const u8, ...) -> i32;"
     print "}"
     print ""
     nf = 0
@@ -167,7 +168,7 @@ BEGIN {
             if (guard != "") print guard
             print "    let rt = " c " + z;"
             print "    let m = x / rt * rt;"
-            print "    var sum = " f "_one(x, rt);"
+            print "    let mut sum = " f "_one(x, rt);"
             print "    sum = sum * 31u64 + " f "_one(m, rt);"
             print "    sum = sum * 31u64 + " f "_one(m - 1" t ", rt);"
             print "    sum = sum * 31u64 + " f "_one(m + 1" t ", rt);"
@@ -194,13 +195,13 @@ BEGIN {
     print "        0x7fffffffu64, 0x80000000u64, 0xffffffffu64, 0x7fffffffffffffffu64, 0x8000000000000000u64,"
     print "        0xffffffffffffffffu64, 0xfffffffffffffffeu64, 0x8000000000000001u64, 0xffffffff80000000u64,"
     print "        0xffffffffffff8000u64, 0xffffffffffffff80u64, 0x7ffffffeu64, 0xfffffffeu64, 0x100000000u64];"
-    print "    var state = " (1 + rnd(1000000)) "u64;"
-    print "    var acc = 0u64;"
-    print "    var i = 0;"
+    print "    let mut state = " (1 + rnd(1000000)) "u64;"
+    print "    let mut acc = 0u64;"
+    print "    let mut i = 0;"
     print "    while i < " iterations " {"
-    print "        var x = 0u64;"
+    print "        let mut x = 0u64;"
     print "        if i < 24 {"
-    print "            x = special[i];"
+    print "            x = special[i as usize];"
     print "        } else {"
     print "            state = state * 6364136223846793005u64 + 1442695040888963407u64;"
     print "            x = state ^ (state >> 29u64);"
