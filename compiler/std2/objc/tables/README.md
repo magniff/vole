@@ -10,9 +10,7 @@ corruption (docs/design/gpu.md, §2.9 and R1).
 | table | generated module |
 |---|---|
 | `foundation.objc` | `compiler/std2/objc/foundation.vl` (`std::objc::foundation`) |
-
-(`metal.objc`, for `std::gpu::hal::metal::bindings`, and std::window's
-tables move here with their modules.)
+| `metal.objc` | `compiler/std2/gpu/hal/metal/bindings.vl` (`std::gpu::hal::metal::bindings`) |
 
 ```sh
 volec tools/objcgen/main.vl -o objcgen
