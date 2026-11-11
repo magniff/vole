@@ -336,6 +336,11 @@ trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 FAILURES="$WORK/failures"
 TALLY="$WORK/tally"
+# (0.28.0) A build whose lazy read of std failed and whose whole read passed
+# (a rerun: three or four times the work) says so on stderr and is listed
+# here (front/modules/std2lazy.vl: rerun_note); the summary counts them.
+RERUNS="${VOLE_STD2_RERUN_NOTE:-$WORK/reruns}"
+export VOLE_STD2_RERUN_NOTE="$RERUNS"
 # (0.25.2) The skipped checks that say why (a `skip NAME: why` line of a
 # runner below, like the window tests' without a display giving frames):
 # printed before the summary, `SKIP NAME: why`, and counted apart.
@@ -1729,6 +1734,10 @@ awk '
 if [ -s "$WORK/failed-cases" ]; then
     n=$(wc -l <"$WORK/failed-cases" | tr -d ' ')
     echo "try: tests/run.sh $(head -5 "$WORK/failed-cases" | sed 's/^/-n /' | tr '\n' ' ' | sed 's/ $//')   (the failing case$( [ "$n" -gt 1 ] && echo s) alone$( [ "$n" -gt 5 ] && echo ", the first 5 of $n"))"
+fi
+if [ "$RERUNS" != 1 ] && [ -s "$RERUNS" ]; then
+    n=$(wc -l <"$RERUNS" | tr -d ' ')
+    echo "lazy std: $n build(s) were made again with std whole (VOLE_STD2_NORERUN=1 shows why; a word or a seed is missing in front/modules/std2lazy.vl); the first: $(grep -o '[^ ]*\.vl' "$RERUNS" | sed 's|.*/||' | head -8 | tr '\n' ' ' | sed 's/ $//')"
 fi
 if grep -q ' fail$' "$TALLY"; then
     exit 1

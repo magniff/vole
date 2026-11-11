@@ -9,6 +9,7 @@ std::ops::Add::add	<std>:239:8	trait-method	fn add(self, rhs: Rhs) -> Self::Outp
 std::ptr::NonNull::add	<std>:1600:19	method	pub unsafe fn add(self, count: usize) -> NonNull<T>
 *const T::add	<std>:1717:19	method	pub unsafe fn add(self, count: usize) -> *mut T
 std::alloc::Chunks::add	<std>:3301:8	method	fn add<P: Allocator>(&self, parent: &P, bytes: usize) -> Result<(), AllocError>
+<std::intconv::Wrapping as Add>::add	<std>:10531:8	method	fn add(self, rhs: Wrapping<T>) -> Wrapping<T>
 <std::string::String as Add>::add	<std>:9945:8	method	fn add(self, other: &'b str) -> String<A>
 std::flt::Big::add	<std>:15411:8	method	fn add(&mut self, o: &Big)	effects: panic diverge
 <std::time::Duration as Add>::add	<std>:32055:8	method	fn add(self, rhs: Duration) -> Duration	effects: panic
