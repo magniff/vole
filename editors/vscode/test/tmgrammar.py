@@ -19,7 +19,7 @@ valid when the npm tools are installed (`npm test`).
 Assertion files (test/samples/*.test.vl) start with
     // SYNTAX TEST "source.vole" "description"
 and carry lines such as
-    //  ^^^^^ storage.modifier.convention.vole
+    //  ^^^ storage.modifier.mut.vole
     // <--- storage.type.binding.vole
     //   ^ - string.quoted.double.vole
 under the source line they describe: every scope listed must be on each
