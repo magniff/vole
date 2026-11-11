@@ -303,6 +303,10 @@ def to_rust(src, alloc_api=False):
     m = re.search(r"^\s*// RUSTC: none(.*)$", src, re.M)
     if m:
         return src, "RUSTC: none " + (m.group(1).strip() or "(no reason)")
+    # (0.28.0: a `volec test` build, its #[test] functions run by vole's
+    # runner with its own arguments and output: no `fn main` for rustc)
+    if re.search(r"^\s*// FLAGS:.*--test-build\b", src, re.M):
+        return src, "a `volec test` build (--test-build): the runner is vole's"
     # (a `use` anywhere in a line: the translator keeps a line's items on it)
     s = re.sub(r"(?<![\w:])(pub\s+)?use\s+[^;{}]*(\{[^{}]*\})?[^;{}]*;",
                lambda m: drop_uses(m.group(0)) or "", src)

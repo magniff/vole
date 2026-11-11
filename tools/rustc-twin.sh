@@ -41,7 +41,9 @@
 #             (in the case, plan-0271 Q8), or a line `NAME<TAB>WHY` of
 #             tools/rustc-twin/divergences.tsv (for a program that has no
 #             case of its own: a guide block, a translation)
-#   stale     it is named and agrees: the marker is wrong
+#   stale     it is named and agrees: the marker is wrong (not a reason
+#             that starts with `unordered:`: Rust's own output varies by
+#             run, a HashMap's iteration order)
 #   outside   the shim cannot make it Rust: a vole-only item is left, or
 #             rustc rejects the text (its first error), or the case says
 #             `// RUSTC: none WHY`, or its ERROR is vole's alone (an effect
@@ -190,6 +192,11 @@ def run(prog):
         diff = f"exit {p.returncode}, expected {wexit}"
     if diff:
         return name, ("named" if named else "differ"), diff + (f" (named: {named})" if named else "")
+    # (0.28.0: a reason that starts with `unordered:` names an output Rust
+    # itself varies from run to run, a HashMap's iteration order (its
+    # RandomState): agreeing by chance is not a wrong marker)
+    if named and named.startswith("unordered:"):
+        return name, "named", f"it agrees this run (named: {named})"
     if named:
         return name, "stale", f"named ({named}), and it agrees"
     return name, "agree", ""
