@@ -34,9 +34,9 @@ are the way they are. It is not a specification. For precise rules, see
 3. [Values, types, functions and control flow](03-basics.md): `let` and
    `var`, numbers and their defined behaviour, tuples and arrays,
    functions, blocks as expressions, loops
-4. [Value semantics: let, inout, sink](04-value-semantics.md): owners,
-   copies and moves, drops, the three conventions, views, and why there
-   are no lifetimes
+4. [Ownership and borrowing](04-value-semantics.md): owners, copies
+   and moves, drops, `&` and `&mut`, the borrow checker, slices and
+   lifetimes
 5. [Structs, enums and pattern matching](05-structs-enums-match.md):
    your own types, methods, `match`, `Option`, `if let` and `let else`
 6. [Errors: Option, Result and panics](06-errors.md): error types, the
@@ -81,7 +81,7 @@ Appendices:
 ## How to read it
 
 In order, the first time. Chapters 1 to 7 are the core of the language;
-chapter 4, on value semantics, is the one that makes vole different from
+chapter 4, on ownership and borrowing, is the one that makes vole different from
 what you know, so take it slowly. Chapters 8 to 16 can be read in most
 orders once you have the core (each says when it leans on another).
 Chapters 11, 17 and 18 grow chapter 7's word counter, so read them in

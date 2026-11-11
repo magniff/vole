@@ -241,14 +241,14 @@ Sometimes you want to know what a single expression does, and writing
 a whole program for it is too much ceremony. `volec try` runs a
 snippet and tells you its type and its value:
 
-```console mvs
+```console
 $ volec try '6 * 7'
-i64 = 42
+i32 = 42
 $ volec try 'let name = "vole"; name.len()'
 usize = 4
 ```
 
-`i64` is a 64-bit integer, the type vole gives a whole number unless
+`i32` is a 32-bit integer, the type vole gives a whole number unless
 you ask for another; a length is a `usize`, an unsigned one. Keep `volec try` in mind as you read: whenever
 you wonder how something behaves, try it.
 
