@@ -42,10 +42,11 @@ use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::timer::{T_CHECK, T_EFFECTS, timer_now, timer_sub};
 use crate::front::ast::{
-    FN_BODY_FAILED, FN_SIG_FAILED, FN_UNSAFE, NODE_IN_BOUNDS, NODE_RAW, NODE_REF_MUT, NodeKind,
-    REPR_UNION, VK_LANE, VK_LOAD, VK_STORE, VK_WITH, child,
+    ARM_SYNTHETIC, FN_BODY_FAILED, FN_SIG_FAILED, FN_UNSAFE, NODE_CAPTURE, NODE_IN_BOUNDS, NODE_RAW,
+    NODE_REF_MUT, NodeKind, REPR_UNION, VK_LANE, VK_LOAD, VK_STORE, VK_WITH, child,
 };
 use crate::front::check::Res;
+use crate::front::check::iterate::ends_by_itself;
 use crate::front::check::unsafety::{NODE_NO_READ, is_borrow, is_borrow_param};
 use crate::front::effects::{
     ALLOC_ANY, EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_INTERIOR, EFF_IO, EFF_PANIC,
@@ -59,7 +60,7 @@ use crate::front::modules::within_std;
 use crate::front::modules::lookup::std_item_key;
 use crate::front::threadlocal::is_thread_local;
 use crate::front::traits::{impl_of_fn, std_trait};
-use crate::front::types::{REF_SHARED, TyKind, struct_type, vec_lanes};
+use crate::front::types::{REF_SHARED, TyKind, is_integer, struct_type, vec_lanes};
 use crate::middle::lower::atomic::atomic_intrinsic;
 use crate::middle::lower::ssa::HMap;
 
@@ -81,6 +82,13 @@ const LOOP_SLICE: i64 = 1;
 const LOOP_LENGTH: i64 = 2;
 // (0.28.0) (-1, LOOP_NONEMPTY, s): slice binding s has an element here.
 const LOOP_NONEMPTY: i64 = 3;
+// (0.28.0) (x, LOOP_NEXT, 0): inside the body of `while let Some(p) =
+// x.next()`, x a local; (i, LOOP_COUNT, t): inside the body of `while i <
+// n` whose one `i += 1` has the target node t. A use that takes the
+// proof away makes the entry LOOP_BROKEN (local_used).
+const LOOP_NEXT: i64 = 4;
+const LOOP_COUNT: i64 = 5;
+const LOOP_BROKEN: i64 = 6;
 
 // Function f's body failed to check (check_function_recovering): its
 // effects are ⊤.
@@ -740,12 +748,14 @@ pub fn dispatch_of(t: i64, pcx: &Ctx<Comp>) -> i64 {
 fn push_edge(to: i64, kind: i64, add: i64, pcx: &mut Ctx<Comp>) {
     if kind == E_CALL && panic_root(to, pcx) {
         // RULE: E1.6 (0.28.0, as MVS's std::panic_str, effects-
-        // allocation.md §2.2) a call of std2's panic is `panic diverge`:
+        // allocation.md §2.2) a call of std2's panic is `panic`, no
+        // `diverge` (a panic is just a panic: `diverge` is a loop or a
+        // recursion that may not end):
         // its message is the panic's, written into its own buffer and
         // out through the C functions declared so, not the io of the
         // writers its Formatter's fn values reach by type; no edge to it,
         // so no cycle through the formatting it shares with the program
-        pcx.acc.bits |= EFF_PANIC | EFF_DIVERGE;
+        pcx.acc.bits |= EFF_PANIC;
         return;
     }
     if kind == E_SCOPE {
@@ -802,15 +812,15 @@ fn local(n: i64, bits: i64, allocs: i64, pcx: &mut Ctx<Comp>) {
     pcx.acc.allocs |= allocs;
 }
 
-// RULE: E1.6 (0.28.0) Node n calls std2's panic: `panic diverge`, its
+// RULE: E1.6 (0.28.0) Node n calls std2's panic: `panic`, its
 // own (a search finds it there, with no callee to go into).
 fn panic_here(n: i64, pcx: &mut Ctx<Comp>) {
     if !pcx.search {
-        pcx.acc.bits |= EFF_PANIC | EFF_DIVERGE;
+        pcx.acc.bits |= EFF_PANIC;
         return;
     }
     if pcx.found_node == 0
-        && has_effect(Effects { bits: EFF_PANIC | EFF_DIVERGE, allocs: 0 }, pcx.search_bit,
+        && has_effect(Effects { bits: EFF_PANIC, allocs: 0 }, pcx.search_bit,
             pcx.search_alloc) {
         pcx.found_node = n;
         pcx.found_callee = -1;
@@ -882,7 +892,14 @@ fn walk(n: i64, pcx: &mut Ctx<Comp>) {
         return;
     }
     let kind = pcx.nodes[n as usize].kind;
-    if kind == NodeKind::Ident && pcx.nodes[n as usize].res == Res::Local || kind == NodeKind::Int
+    if kind == NodeKind::Ident && pcx.nodes[n as usize].res == Res::Local {
+        // (0.28.0: unless a loop's end hangs on it, walk_loop, walk_while)
+        if pcx.loops.count > 0 {
+            local_used(n, pcx);
+        }
+        return;
+    }
+    if kind == NodeKind::Int
         || kind == NodeKind::CStr || kind == NodeKind::Str || kind == NodeKind::Bool
         || kind == NodeKind::Char {
         return;
@@ -900,13 +917,20 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
             pcx.static_write -= 1;
             walk(pcx.nodes[n as usize].c, pcx);
         }
-        NodeKind::Binary | NodeKind::While => {
-            if pcx.nodes[n as usize].kind == NodeKind::While
-                && (pcx.nodes[n as usize].p & NODE_IN_BOUNDS) == 0 {
-                local(n, EFF_DIVERGE, 0, pcx);
-            }
+        NodeKind::Binary => {
             walk(pcx.nodes[n as usize].b, pcx);
             walk(pcx.nodes[n as usize].c, pcx);
+        }
+        NodeKind::While => walk_while(n, pcx),
+        NodeKind::Continue => {
+            // (a `continue` may skip a counted `while`'s step)
+            let mut k = pcx.loops.count - 3;
+            while k >= 0 {
+                if pcx.loops.get(k + 1) == LOOP_COUNT {
+                    pcx.loops.set(k + 1, LOOP_BROKEN);
+                }
+                k -= 3;
+            }
         }
         NodeKind::Unary => {
             if (pcx.nodes[n as usize].p & NODE_RAW) != 0 {
@@ -977,10 +1001,11 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
         NodeKind::Let => walk(pcx.nodes[n as usize].c, pcx),
         NodeKind::If => walk_if(n, pcx),
         NodeKind::Loop => {
-            if (pcx.nodes[n as usize].p & NODE_IN_BOUNDS) == 0 {
-                local(n, EFF_DIVERGE, 0, pcx);
+            if (pcx.nodes[n as usize].p & NODE_IN_BOUNDS) != 0 {
+                walk(pcx.nodes[n as usize].b, pcx);
+            } else {
+                walk_loop(n, pcx);
             }
-            walk(pcx.nodes[n as usize].b, pcx);
         }
         NodeKind::For => walk_for(n, pcx),
         NodeKind::Match => {
@@ -1346,6 +1371,11 @@ fn walk_index(n: i64, pcx: &mut Ctx<Comp>) {
             && pcx.nodes[pcx.nodes[index as usize].a as usize].a >= 0 && nonempty(base, pcx) {
             // (`s[1..]` of a slice that is not empty, walk_if)
             pcx.nodes[n as usize].p |= NODE_IN_BOUNDS;
+        }
+        else if pcx.nodes[index as usize].a == 0 && last_of(pcx.nodes[index as usize].b, base, pcx)
+            && nonempty(base, pcx) {
+            // (`s[..s.len() - 1]` of a slice that is not empty)
+            pcx.nodes[n as usize].p |= NODE_IN_BOUNDS;
         } else if (pcx.nodes[n as usize].p & NODE_IN_BOUNDS) == 0 {
             local(n, EFF_PANIC, 0, pcx);
         }
@@ -1357,8 +1387,8 @@ fn walk_index(n: i64, pcx: &mut Ctx<Comp>) {
         return;
     }
     if (pcx.nodes[n as usize].p & NODE_IN_BOUNDS) != 0 || in_bounds(base, bt, index, pcx)
-        || pcx.nodes[index as usize].kind == NodeKind::Int && pcx.nodes[index as usize].a == 0
-        && nonempty(base, pcx) {
+        || (pcx.nodes[index as usize].kind == NodeKind::Int && pcx.nodes[index as usize].a == 0
+            || last_of(index, base, pcx)) && nonempty(base, pcx) {
         pcx.nodes[n as usize].p |= NODE_IN_BOUNDS;
         return;
     }
@@ -1392,7 +1422,9 @@ fn in_bounds(base: i64, bt: i64, index: i64, pcx: &Ctx<Comp>) -> bool {
                         && pcx.nodes[base as usize].res == Res::Local
                         && pcx.nodes[base as usize].y == what;
                 }
-                return array && what <= pcx.types[bt as usize].b;
+                if kind == LOOP_LENGTH {
+                    return array && what <= pcx.types[bt as usize].b;
+                }
             }
             k -= 3;
         }
@@ -1463,6 +1495,209 @@ fn nonempty(base: i64, pcx: &Ctx<Comp>) -> bool {
         }
     }
     false
+}
+
+// Whether e is `s.len() - 1`, s the immutable slice binding that base is
+// (the last index of a slice that is not empty, and the end of the rest
+// before it: std2's split_last).
+fn last_of(e: i64, base: i64, pcx: &Ctx<Comp>) -> bool {
+    e > 0 && pcx.nodes[e as usize].kind == NodeKind::Binary
+        && pcx.nodes[e as usize].op == Tok::Minus
+        && pcx.nodes[pcx.nodes[e as usize].c as usize].kind == NodeKind::Int
+        && pcx.nodes[pcx.nodes[e as usize].c as usize].a == 1
+        && pcx.nodes[base as usize].kind == NodeKind::Ident
+        && pcx.nodes[base as usize].res == Res::Local
+        && slice_call(pcx.nodes[e as usize].b, "len".as_bytes(), pcx) == pcx.nodes[base as usize].y
+}
+
+// A use of a local inside a loop whose end is being proven (walk_loop,
+// walk_while): any use of the iterator of a `while let .. = x.next()`,
+// and a write, a `&mut` or a capture of a counted `while`'s variable
+// other than its step, take the proof away.
+fn local_used(n: i64, pcx: &mut Ctx<Comp>) {
+    let y = pcx.nodes[n as usize].y;
+    let mut k = pcx.loops.count - 3;
+    while k >= 0 {
+        let kind = pcx.loops.get(k + 1);
+        if pcx.loops.get(k) == y
+            && (kind == LOOP_NEXT
+                || kind == LOOP_COUNT && pcx.loops.get(k + 2) != n
+                && (pcx.static_write > 0 || (pcx.nodes[n as usize].p & NODE_CAPTURE) != 0)) {
+            pcx.loops.set(k + 1, LOOP_BROKEN);
+        }
+        k -= 3;
+    }
+}
+
+// The local x of loop n when it is `while let Some(p) = x.next() { .. }`
+// (the parser's `loop { match x.next() { Some(p) => .., _ => break } }`),
+// `next` std's and x's type one of std's iterators that end by
+// themselves, itself or through references; else -1.
+fn next_local(n: i64, pcx: &Ctx<Comp>) -> i64 {
+    let blk = pcx.nodes[n as usize].b;
+    if blk <= 0 || pcx.nodes[blk as usize].kind != NodeKind::Block
+        || pcx.nodes[blk as usize].count != 0 {
+        return -1;
+    }
+    let m = pcx.nodes[blk as usize].a;
+    if m <= 0 || pcx.nodes[m as usize].kind != NodeKind::Match || pcx.nodes[m as usize].count != 2
+        || (pcx.nodes[child(m, 1, pcx) as usize].p & ARM_SYNTHETIC) == 0 {
+        return -1;
+    }
+    let pat = pcx.nodes[child(m, 0, pcx) as usize].a;
+    if pat <= 0 || pcx.nodes[pat as usize].kind != NodeKind::PatVariant
+        || sym_text(pcx.nodes[pat as usize].b, pcx) != "Some".as_bytes() {
+        return -1;
+    }
+    let call = pcx.nodes[m as usize].a;
+    if call <= 0 || pcx.nodes[call as usize].kind != NodeKind::Call
+        || pcx.nodes[call as usize].x <= 0 || pcx.nodes[call as usize].count != 1 {
+        return -1;
+    }
+    let g = template_of(pcx.nodes[call as usize].x - 1, pcx);
+    if !within_std(pcx.fns[g as usize].module, pcx)
+        || sym_text(pcx.nodes[pcx.fns[g as usize].node as usize].a, pcx) != "next".as_bytes() {
+        return -1;
+    }
+    let mut x = child(call, 0, pcx);
+    while pcx.nodes[x as usize].kind == NodeKind::Unary {
+        x = pcx.nodes[x as usize].b;
+    }
+    if pcx.nodes[x as usize].kind != NodeKind::Ident || pcx.nodes[x as usize].res != Res::Local
+        || pcx.nodes[x as usize].y < 0 {
+        return -1;
+    }
+    let mut t = pcx.nodes[x as usize].ty;
+    while t > 0 && pcx.types[t as usize].kind == TyKind::Ptr {
+        t = pcx.types[t as usize].a;
+    }
+    if ends_by_itself(t, pcx) { pcx.nodes[x as usize].y } else { -1 }
+}
+
+// RULE: E2.1 (0.28.0) A `loop`: `diverge`, unless it is `while let
+// Some(p) = x.next() { body }` over one of std's iterators that end by
+// themselves and body does not use x (it could start it again): then a
+// counted loop, as `for p in x` (std's `count`, `find`, `fold`, `sum`).
+fn walk_loop(n: i64, pcx: &mut Ctx<Comp>) {
+    let x = next_local(n, pcx);
+    if x < 0 {
+        local(n, EFF_DIVERGE, 0, pcx);
+        walk(pcx.nodes[n as usize].b, pcx);
+        return;
+    }
+    let m = pcx.nodes[pcx.nodes[n as usize].b as usize].a;
+    walk(pcx.nodes[m as usize].a, pcx);
+    let mark = pcx.loops.count;
+    pcx.loops.push(x);
+    pcx.loops.push(LOOP_NEXT);
+    pcx.loops.push(0);
+    let arm = child(m, 0, pcx);
+    walk(pcx.nodes[arm as usize].b, pcx);
+    walk(pcx.nodes[arm as usize].c, pcx);
+    let broken = pcx.loops.get(mark + 1) != LOOP_NEXT;
+    pcx.loops.count = mark;
+    if broken {
+        local(n, EFF_DIVERGE, 0, pcx);
+    }
+}
+
+// Whether e, a counted `while`'s bound, cannot change while the loop
+// runs: a literal, an immutable integer local, the `len()` of an
+// immutable slice binding, or an integer field read from an immutable
+// local through values and shared references only (`self.cap` under
+// `&self`: nothing can write it while the borrow lives).
+fn fixed_bound(e: i64, pcx: &Ctx<Comp>) -> bool {
+    if pcx.nodes[e as usize].kind == NodeKind::Int || slice_call(e, "len".as_bytes(), pcx) >= 0 {
+        return true;
+    }
+    if !is_integer(pcx.nodes[e as usize].ty) {
+        return false;
+    }
+    let mut at = e;
+    while pcx.nodes[at as usize].kind == NodeKind::FieldAccess {
+        if (pcx.nodes[at as usize].p & NODE_RAW) != 0 {
+            return false;
+        }
+        at = pcx.nodes[at as usize].a;
+        let t = pcx.nodes[at as usize].ty;
+        if t <= 0
+            || pcx.types[t as usize].kind == TyKind::Ptr && pcx.types[t as usize].b != REF_SHARED
+            || pcx.types[t as usize].kind != TyKind::Ptr
+            && pcx.types[t as usize].kind != TyKind::Struct {
+            return false;
+        }
+    }
+    pcx.nodes[at as usize].kind == NodeKind::Ident && pcx.nodes[at as usize].res == Res::Local
+        && pcx.nodes[at as usize].y >= 0 && !pcx.locals[pcx.nodes[at as usize].y as usize].mutable
+}
+
+// The target node of the step of a counted `while`: cond is `i < n`, i
+// an integer local, n a bound that cannot change (fixed_bound), and
+// body has the statement `i += 1` itself (not under a branch); else 0. (A step of 1 cannot pass n,
+// so it cannot wrap.)
+fn counted_step(cond: i64, body: i64, pcx: &Ctx<Comp>) -> i64 {
+    if cond <= 0 || pcx.nodes[cond as usize].kind != NodeKind::Binary
+        || pcx.nodes[cond as usize].op != Tok::Lt || body <= 0
+        || pcx.nodes[body as usize].kind != NodeKind::Block {
+        return 0;
+    }
+    let i = pcx.nodes[cond as usize].b;
+    if pcx.nodes[i as usize].kind != NodeKind::Ident || pcx.nodes[i as usize].res != Res::Local
+        || pcx.nodes[i as usize].y < 0 || !is_integer(pcx.nodes[i as usize].ty) {
+        return 0;
+    }
+    if !fixed_bound(pcx.nodes[cond as usize].c, pcx) {
+        return 0;
+    }
+    for k in 0..pcx.nodes[body as usize].count {
+        let s = child(body, k, pcx);
+        if pcx.nodes[s as usize].kind != NodeKind::ExprStmt {
+            continue;
+        }
+        let e = pcx.nodes[s as usize].a;
+        if e <= 0 || pcx.nodes[e as usize].kind != NodeKind::Assign
+            || pcx.nodes[e as usize].op != Tok::PlusEq {
+            continue;
+        }
+        let to = pcx.nodes[e as usize].b;
+        let by = pcx.nodes[e as usize].c;
+        if pcx.nodes[to as usize].kind == NodeKind::Ident
+            && pcx.nodes[to as usize].res == Res::Local
+            && pcx.nodes[to as usize].y == pcx.nodes[i as usize].y
+            && pcx.nodes[by as usize].kind == NodeKind::Int && pcx.nodes[by as usize].a == 1 {
+            return to;
+        }
+    }
+    0
+}
+
+// RULE: E2.1 (0.28.0) A `while`: `diverge`, unless it is counted: `while
+// i < n { ..; i += 1; .. }` (counted_step) whose body has no other write
+// of i, no `&mut i`, no capture of i and no `continue`.
+fn walk_while(n: i64, pcx: &mut Ctx<Comp>) {
+    let cond = pcx.nodes[n as usize].b;
+    let body = pcx.nodes[n as usize].c;
+    walk(cond, pcx);
+    if (pcx.nodes[n as usize].p & NODE_IN_BOUNDS) != 0 {
+        walk(body, pcx);
+        return;
+    }
+    let step = counted_step(cond, body, pcx);
+    if step <= 0 {
+        local(n, EFF_DIVERGE, 0, pcx);
+        walk(body, pcx);
+        return;
+    }
+    let mark = pcx.loops.count;
+    pcx.loops.push(pcx.nodes[step as usize].y);
+    pcx.loops.push(LOOP_COUNT);
+    pcx.loops.push(step);
+    walk(body, pcx);
+    let broken = pcx.loops.get(mark + 1) != LOOP_COUNT;
+    pcx.loops.count = mark;
+    if broken {
+        local(n, EFF_DIVERGE, 0, pcx);
+    }
 }
 
 // `for p in a..b body` (counted): a in-bounds context for the body when
