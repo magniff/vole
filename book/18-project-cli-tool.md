@@ -758,7 +758,6 @@ crate::count::Counts::add	none
 crate::count::count	panic diverge
 add_words<&ArenaScope<&Gpa>>	alloc(ArenaScope<&Gpa>) panic diverge
 add_words<Gpa>	alloc(Gpa) panic diverge
-add_words<A>	alloc io tls thread sync panic diverge (unknown)
 crate::count::is_word_byte	none
 crate::count::trim_punct	panic diverge
 crate::count::counts_lines_words_bytes	panic diverge

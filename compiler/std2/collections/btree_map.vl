@@ -1,0 +1,1466 @@
+// EDITION: rust
+// std::collections::btree_map (0.15.4; std2 0.28.0): `BTreeMap`, a map
+// that keeps its keys sorted, and `BTreeSet` over it. Rust's API with the
+// allocator named: `BTreeMap::new_in(a)`. A B-tree: a node holds 5 to 11
+// keys (the root 1 to 11) in order and, when it is not a leaf, one child
+// more than keys; every leaf is at the same depth. The nodes live in one
+// Vec and name each other by index, so the whole map is safe code and one
+// allocation that grows; a slot is `Option`, None when it is unused.
+// `get`, `insert` and `remove` are O(log n); `iter` and `range` visit the
+// keys in order, from either end.
+//
+// Not Rust's: `range` gives the type `iter` gives (BTreeIter), `entry`'s
+// types are BTreeEntry, BTreeOccupiedEntry and BTreeVacantEntry, and there
+// is no `iter_mut`, `values_mut`, `retain`, `append`, `split_off` or
+// cursor yet; a set has no `union`, `intersection` or `difference` yet.
+// (The names carry `BTree`: the lazy std reads items by name, and an
+// `Iter` or an `Entry` here would be read with HashMap's.)
+// mvs: std::BTreeMap, std::BTreeSet
+
+use crate::alloc::Allocator;
+use crate::borrow::Borrow;
+use crate::clone::Clone;
+use crate::cmp::{Eq, Ord, Ordering, PartialEq};
+use crate::default::{Default, DefaultIn};
+use crate::fmt::{Debug, Formatter};
+use crate::iter::{DoubleEndedIterator, Extend, FromIteratorIn, IntoIterator, Iterator};
+use crate::ops::{Bound, Index, RangeBounds};
+use crate::option::Option;
+use crate::vec::Vec;
+
+// The keys a node holds at most, and at least (but the root).
+const B_CAP: usize = 11;
+const B_MIN: usize = 5;
+// No node: an empty map's root, the end of the free list.
+const B_NONE: u32 = 0xffffffff;
+
+// A node: keys[..len] in order with their values, and, when it is not a
+// leaf, kids[..len + 1], the nodes around them (kids[i]'s keys are less
+// than keys[i], kids[i + 1]'s greater). The slots from len on are None.
+struct BNode<K, V> {
+    len: usize,
+    leaf: bool,
+    keys: [Option<K>; 11],
+    vals: [Option<V>; 11],
+    kids: [u32; 12],
+}
+
+fn b_node<K, V>(leaf: bool) -> BNode<K, V> {
+    BNode {
+        len: 0,
+        leaf: leaf,
+        keys: [None, None, None, None, None, None, None, None, None, None, None],
+        vals: [None, None, None, None, None, None, None, None, None, None, None],
+        kids: [B_NONE; 12],
+    }
+}
+
+// How a lookup's key compares with a map's: a K itself (BDirect), or the Q
+// that K lends (BBorrowed: a `&str` for String keys). Two types with one
+// method, not K's Borrow alone: a lookup by the key's own type would ask
+// for `K: Borrow<K>`, which the front resolves to `&T: Borrow<T>` for a K
+// that is a reference.
+trait BCompare<K> {
+    fn order(&self, k: &K) -> Ordering;
+}
+
+struct BDirect<'a, K> {
+    key: &'a K,
+}
+
+impl<'a, K: Ord> BCompare<K> for BDirect<'a, K> {
+    #[inline]
+    fn order(&self, k: &K) -> Ordering {
+        self.key.cmp(k)
+    }
+}
+
+struct BBorrowed<'a, Q: ?Sized> {
+    key: &'a Q,
+}
+
+impl<'a, K: Borrow<Q>, Q: ?Sized + Ord> BCompare<K> for BBorrowed<'a, Q> {
+    #[inline]
+    fn order(&self, k: &K) -> Ordering {
+        self.key.cmp(<K as Borrow<Q>>::borrow(k))
+    }
+}
+
+// Where key is among node's keys: (i, true) when keys[i] is it, else
+// (i, false) with i the child to look in (the keys before i are less).
+#[inline]
+fn b_find<K, V, C: BCompare<K>>(node: &BNode<K, V>, key: &C) -> (usize, bool) {
+    let mut i = 0;
+    while i < node.len {
+        match &node.keys[i] {
+            Some(k) => match key.order(k) {
+                Ordering::Less => return (i, false),
+                Ordering::Equal => return (i, true),
+                Ordering::Greater => {}
+            },
+            None => {}
+        }
+        i += 1;
+    }
+    (i, false)
+}
+
+// A key's position: the nodes from the root down to its node, and at each
+// the child taken (at the last, the key's index). depth 0 is the end,
+// after the last key.
+#[derive(Clone, Copy)]
+struct BCursor {
+    depth: usize,
+    node: [u32; 16],
+    at: [u8; 16],
+}
+
+fn b_end() -> BCursor {
+    BCursor { depth: 0, node: [B_NONE; 16], at: [0; 16] }
+}
+
+fn b_same(a: &BCursor, b: &BCursor) -> bool {
+    if a.depth != b.depth {
+        return false;
+    }
+    if a.depth == 0 {
+        return true;
+    }
+    let d = a.depth - 1;
+    a.node[d] == b.node[d] && a.at[d] == b.at[d]
+}
+
+// A map from K to V with its keys in order, on allocator A.
+pub struct BTreeMap<K, V, A: Allocator> {
+    nodes: Vec<BNode<K, V>, A>,
+    root: u32,
+    // the first unused slot of nodes; each names the next in its kids[0]
+    free: u32,
+    len: usize,
+}
+
+impl<K, V, A: Allocator> BTreeMap<K, V, A> {
+    // An empty map on a; allocates at the first insert.
+    #[effects(K, V, A)]
+    pub fn new_in(a: A) -> BTreeMap<K, V, A> {
+        BTreeMap { nodes: Vec::new_in(a), root: B_NONE, free: B_NONE, len: 0 }
+    }
+
+    #[effects()]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[effects()]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[effects(K, V, A)]
+    pub fn allocator(&self) -> &A {
+        self.nodes.allocator()
+    }
+
+    // Drops every entry; keeps the nodes' memory.
+    #[effects(K, V, A)]
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+        self.root = B_NONE;
+        self.free = B_NONE;
+        self.len = 0;
+    }
+
+    // The entries in the keys' order.
+    #[effects(K, V, A)]
+    pub fn iter(&self) -> BTreeIter<'_, K, V, A> {
+        BTreeIter { map: self, front: self.cursor_first(), back: b_end() }
+    }
+
+    #[effects(K, V, A)]
+    pub fn keys(&self) -> BTreeKeys<'_, K, V, A> {
+        BTreeKeys { inner: self.iter() }
+    }
+
+    #[effects(K, V, A)]
+    pub fn values(&self) -> BTreeValues<'_, K, V, A> {
+        BTreeValues { inner: self.iter() }
+    }
+
+    // The entry with the smallest key.
+    #[effects(K, V, A)]
+    pub fn first_key_value(&self) -> Option<(&K, &V)> {
+        self.iter().next()
+    }
+
+    // The entry with the largest key.
+    #[effects(K, V, A)]
+    pub fn last_key_value(&self) -> Option<(&K, &V)> {
+        self.iter().next_back()
+    }
+
+    fn new_node(&mut self, leaf: bool) -> u32 {
+        if self.free != B_NONE {
+            let n = self.free;
+            let node = &mut self.nodes[n as usize];
+            self.free = node.kids[0];
+            node.leaf = leaf;
+            node.len = 0;
+            return n;
+        }
+        self.nodes.push(b_node(leaf));
+        (self.nodes.len() - 1) as u32
+    }
+
+    // (n's slots are None by now: its entries moved out)
+    fn free_node(&mut self, n: u32) {
+        let node = &mut self.nodes[n as usize];
+        node.kids[0] = self.free;
+        node.len = 0;
+        self.free = n;
+    }
+
+    // The entry at a cursor that is not the end.
+    fn entry_at(&self, c: &BCursor) -> (&K, &V) {
+        let d = c.depth - 1;
+        let node = &self.nodes[c.node[d] as usize];
+        let i = c.at[d] as usize;
+        (node.keys[i].as_ref().unwrap(), node.vals[i].as_ref().unwrap())
+    }
+
+    // The first key's position (the end when the map is empty).
+    fn cursor_first(&self) -> BCursor {
+        let mut c = b_end();
+        let mut n = self.root;
+        let mut d = 0;
+        while n != B_NONE {
+            c.node[d] = n;
+            c.at[d] = 0;
+            d += 1;
+            let node = &self.nodes[n as usize];
+            n = if node.leaf { B_NONE } else { node.kids[0] };
+        }
+        c.depth = d;
+        c
+    }
+
+    // c, which is not the end, moved to the next key (or the end).
+    fn cursor_next(&self, c: &mut BCursor) {
+        let d = c.depth - 1;
+        let node = &self.nodes[c.node[d] as usize];
+        let i = c.at[d] as usize;
+        if !node.leaf {
+            // the smallest key of the child after it
+            c.at[d] = (i + 1) as u8;
+            let mut n = node.kids[i + 1];
+            let mut e = d + 1;
+            while n != B_NONE {
+                c.node[e] = n;
+                c.at[e] = 0;
+                e += 1;
+                let below = &self.nodes[n as usize];
+                n = if below.leaf { B_NONE } else { below.kids[0] };
+            }
+            c.depth = e;
+            return;
+        }
+        if i + 1 < node.len {
+            c.at[d] = (i + 1) as u8;
+            return;
+        }
+        // the key after the child taken, at the nearest node that has one
+        let mut e = d;
+        while e > 0 {
+            e -= 1;
+            if (c.at[e] as usize) < self.nodes[c.node[e] as usize].len {
+                c.depth = e + 1;
+                return;
+            }
+        }
+        c.depth = 0;
+    }
+
+    // c moved to the key before it (from the end: to the last key). The
+    // caller knows there is one.
+    fn cursor_prev(&self, c: &mut BCursor) {
+        let mut n: u32;
+        let mut e: usize;
+        if c.depth == 0 {
+            n = self.root;
+            e = 0;
+        } else {
+            let d = c.depth - 1;
+            let node = &self.nodes[c.node[d] as usize];
+            let i = c.at[d] as usize;
+            if node.leaf {
+                if i > 0 {
+                    c.at[d] = (i - 1) as u8;
+                    return;
+                }
+                let mut up = d;
+                while up > 0 {
+                    up -= 1;
+                    if c.at[up] > 0 {
+                        c.at[up] -= 1;
+                        c.depth = up + 1;
+                        return;
+                    }
+                }
+                c.depth = 0;
+                return;
+            }
+            // the largest key of the child before it
+            n = node.kids[i];
+            e = d + 1;
+        }
+        while n != B_NONE {
+            let below = &self.nodes[n as usize];
+            c.node[e] = n;
+            if below.leaf {
+                c.at[e] = (below.len - 1) as u8;
+                n = B_NONE;
+            } else {
+                c.at[e] = below.len as u8;
+                n = below.kids[below.len];
+            }
+            e += 1;
+        }
+        c.depth = e;
+    }
+
+    // The by-value iterator's step: the entry at c moved out of its node.
+    fn take_at(&mut self, c: &BCursor) -> (K, V) {
+        let d = c.depth - 1;
+        let node = &mut self.nodes[c.node[d] as usize];
+        let i = c.at[d] as usize;
+        (node.keys[i].take().unwrap(), node.vals[i].take().unwrap())
+    }
+}
+
+impl<K: Ord, V, A: Allocator> BTreeMap<K, V, A> {
+    // The node and index of key, or (B_NONE, 0).
+    fn locate<C: BCompare<K>>(&self, key: &C) -> (u32, usize) {
+        let mut n = self.root;
+        while n != B_NONE {
+            let node = &self.nodes[n as usize];
+            let (i, found) = b_find(node, key);
+            if found {
+                return (n, i);
+            }
+            n = if node.leaf { B_NONE } else { node.kids[i] };
+        }
+        (B_NONE, 0)
+    }
+
+    // The position of the first key that is not less than key (after: that
+    // is greater than key), or the end.
+    fn cursor_seek<C: BCompare<K>>(&self, key: &C, after: bool) -> BCursor {
+        let mut c = b_end();
+        let mut n = self.root;
+        let mut d = 0;
+        while n != B_NONE {
+            let node = &self.nodes[n as usize];
+            let (i, found) = b_find(node, key);
+            let i = if found && after { i + 1 } else { i };
+            c.node[d] = n;
+            c.at[d] = i as u8;
+            d += 1;
+            if found && !after {
+                c.depth = d;
+                return c;
+            }
+            n = if node.leaf { B_NONE } else { node.kids[i] };
+        }
+        // at the leaf, or the nearest node above with a key after the child
+        while d > 0 {
+            if (c.at[d - 1] as usize) < self.nodes[c.node[d - 1] as usize].len {
+                c.depth = d;
+                return c;
+            }
+            d -= 1;
+        }
+        c
+    }
+
+    // The value of key.
+    #[effects(panic, K, V, A, Q)]
+    pub fn get<Q: ?Sized + Ord>(&self, key: &Q) -> Option<&V>
+        where
+            K: Borrow<Q>,
+    {
+        let (n, i) = self.locate(&BBorrowed { key: key });
+        if n == B_NONE {
+            return None;
+        }
+        self.nodes[n as usize].vals[i].as_ref()
+    }
+
+    #[effects(panic, K, V, A, Q)]
+    pub fn get_key_value<Q: ?Sized + Ord>(&self, key: &Q) -> Option<(&K, &V)>
+        where
+            K: Borrow<Q>,
+    {
+        let (n, i) = self.locate(&BBorrowed { key: key });
+        if n == B_NONE {
+            return None;
+        }
+        let node = &self.nodes[n as usize];
+        Some((node.keys[i].as_ref().unwrap(), node.vals[i].as_ref().unwrap()))
+    }
+
+    #[effects(K, V, A, Q)]
+    pub fn contains_key<Q: ?Sized + Ord>(&self, key: &Q) -> bool
+        where
+            K: Borrow<Q>,
+    {
+        self.locate(&BBorrowed { key: key }).0 != B_NONE
+    }
+
+    #[effects(panic, K, V, A, Q)]
+    pub fn get_mut<Q: ?Sized + Ord>(&mut self, key: &Q) -> Option<&mut V>
+        where
+            K: Borrow<Q>,
+    {
+        let (n, i) = self.locate(&BBorrowed { key: key });
+        if n == B_NONE {
+            return None;
+        }
+        self.nodes[n as usize].vals[i].as_mut()
+    }
+
+    // Child i of p, which is full, split in two around its middle key,
+    // which moves up into p (p is not full).
+    fn split_child(&mut self, p: u32, i: usize) {
+        let c = self.nodes[p as usize].kids[i];
+        let leaf = self.nodes[c as usize].leaf;
+        let r = self.new_node(leaf);
+        let mut j = 0;
+        while j < B_MIN {
+            let k = self.nodes[c as usize].keys[j + B_MIN + 1].take();
+            let v = self.nodes[c as usize].vals[j + B_MIN + 1].take();
+            self.nodes[r as usize].keys[j] = k;
+            self.nodes[r as usize].vals[j] = v;
+            j += 1;
+        }
+        if !leaf {
+            j = 0;
+            while j <= B_MIN {
+                let kid = self.nodes[c as usize].kids[j + B_MIN + 1];
+                self.nodes[r as usize].kids[j] = kid;
+                j += 1;
+            }
+        }
+        self.nodes[r as usize].len = B_MIN;
+        let left = &mut self.nodes[c as usize];
+        left.len = B_MIN;
+        let mk = left.keys[B_MIN].take();
+        let mv = left.vals[B_MIN].take();
+        let up = &mut self.nodes[p as usize];
+        j = up.len;
+        while j > i {
+            up.keys[j] = up.keys[j - 1].take();
+            up.vals[j] = up.vals[j - 1].take();
+            up.kids[j + 1] = up.kids[j];
+            j -= 1;
+        }
+        up.keys[i] = mk;
+        up.vals[i] = mv;
+        up.kids[i + 1] = r;
+        up.len += 1;
+    }
+
+    // insert, which also says where the entry is: its node and index.
+    fn insert_at(&mut self, key: K, value: V) -> (u32, usize, Option<V>) {
+        if self.root == B_NONE {
+            let r = self.new_node(true);
+            self.root = r;
+        } else if self.nodes[self.root as usize].len == B_CAP {
+            let r = self.new_node(false);
+            self.nodes[r as usize].kids[0] = self.root;
+            self.root = r;
+            self.split_child(r, 0);
+        }
+        let mut n = self.root;
+        loop {
+            let (i, found) = b_find(&self.nodes[n as usize], &BDirect { key: &key });
+            if found {
+                let old = self.nodes[n as usize].vals[i].replace(value);
+                return (n, i, old);
+            }
+            if self.nodes[n as usize].leaf {
+                let node = &mut self.nodes[n as usize];
+                let mut j = node.len;
+                while j > i {
+                    node.keys[j] = node.keys[j - 1].take();
+                    node.vals[j] = node.vals[j - 1].take();
+                    j -= 1;
+                }
+                node.keys[i] = Some(key);
+                node.vals[i] = Some(value);
+                node.len += 1;
+                self.len += 1;
+                return (n, i, None);
+            }
+            let mut c = self.nodes[n as usize].kids[i];
+            if self.nodes[c as usize].len == B_CAP {
+                // a full child is split on the way down, so that a split
+                // below it has room here
+                self.split_child(n, i);
+                let node = &self.nodes[n as usize];
+                let (at, same) = b_find(node, &BDirect { key: &key });
+                if same {
+                    let old = self.nodes[n as usize].vals[at].replace(value);
+                    return (n, at, old);
+                }
+                c = node.kids[at];
+            }
+            n = c;
+        }
+    }
+
+    // Sets key's value; the value it had.
+    #[effects(unsafe, K, V, A)]
+    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+        self.insert_at(key, value).2
+    }
+
+    // Children i and i + 1 of p, each with the fewest keys, made one node
+    // (child i) around p's key i, which moves down.
+    fn merge(&mut self, p: u32, i: usize) {
+        let l = self.nodes[p as usize].kids[i];
+        let r = self.nodes[p as usize].kids[i + 1];
+        let up = &mut self.nodes[p as usize];
+        let mk = up.keys[i].take();
+        let mv = up.vals[i].take();
+        let mut j = i;
+        while j + 1 < up.len {
+            up.keys[j] = up.keys[j + 1].take();
+            up.vals[j] = up.vals[j + 1].take();
+            up.kids[j + 1] = up.kids[j + 2];
+            j += 1;
+        }
+        up.len -= 1;
+        let base = self.nodes[l as usize].len;
+        self.nodes[l as usize].keys[base] = mk;
+        self.nodes[l as usize].vals[base] = mv;
+        let count = self.nodes[r as usize].len;
+        j = 0;
+        while j < count {
+            let k = self.nodes[r as usize].keys[j].take();
+            let v = self.nodes[r as usize].vals[j].take();
+            self.nodes[l as usize].keys[base + 1 + j] = k;
+            self.nodes[l as usize].vals[base + 1 + j] = v;
+            j += 1;
+        }
+        if !self.nodes[l as usize].leaf {
+            j = 0;
+            while j <= count {
+                let kid = self.nodes[r as usize].kids[j];
+                self.nodes[l as usize].kids[base + 1 + j] = kid;
+                j += 1;
+            }
+        }
+        self.nodes[l as usize].len = base + 1 + count;
+        self.free_node(r);
+    }
+
+    // Child i of p, which has the fewest keys, given one more: from the
+    // sibling before or after it through p's key between them, or merged
+    // with one. Returns the node that holds the child's keys now.
+    fn fill(&mut self, p: u32, i: usize) -> u32 {
+        let c = self.nodes[p as usize].kids[i];
+        let plen = self.nodes[p as usize].len;
+        if i > 0 && self.nodes[self.nodes[p as usize].kids[i - 1] as usize].len > B_MIN {
+            let l = self.nodes[p as usize].kids[i - 1];
+            // c's entries one to the right, p's key down, l's last key up
+            let node = &mut self.nodes[c as usize];
+            let mut j = node.len;
+            while j > 0 {
+                node.keys[j] = node.keys[j - 1].take();
+                node.vals[j] = node.vals[j - 1].take();
+                j -= 1;
+            }
+            if !node.leaf {
+                j = node.len + 1;
+                while j > 0 {
+                    node.kids[j] = node.kids[j - 1];
+                    j -= 1;
+                }
+            }
+            node.len += 1;
+            let dk = self.nodes[p as usize].keys[i - 1].take();
+            let dv = self.nodes[p as usize].vals[i - 1].take();
+            self.nodes[c as usize].keys[0] = dk;
+            self.nodes[c as usize].vals[0] = dv;
+            let left = &mut self.nodes[l as usize];
+            let last = left.len - 1;
+            let uk = left.keys[last].take();
+            let uv = left.vals[last].take();
+            let kid = left.kids[last + 1];
+            left.len = last;
+            self.nodes[p as usize].keys[i - 1] = uk;
+            self.nodes[p as usize].vals[i - 1] = uv;
+            self.nodes[c as usize].kids[0] = kid;
+            return c;
+        }
+        if i < plen && self.nodes[self.nodes[p as usize].kids[i + 1] as usize].len > B_MIN {
+            let r = self.nodes[p as usize].kids[i + 1];
+            // p's key down to c's end, r's first key up, r's rest one left
+            let dk = self.nodes[p as usize].keys[i].take();
+            let dv = self.nodes[p as usize].vals[i].take();
+            let right = &mut self.nodes[r as usize];
+            let uk = right.keys[0].take();
+            let uv = right.vals[0].take();
+            let kid = right.kids[0];
+            let mut j = 0;
+            while j + 1 < right.len {
+                right.keys[j] = right.keys[j + 1].take();
+                right.vals[j] = right.vals[j + 1].take();
+                j += 1;
+            }
+            if !right.leaf {
+                j = 0;
+                while j < right.len {
+                    right.kids[j] = right.kids[j + 1];
+                    j += 1;
+                }
+            }
+            right.len -= 1;
+            self.nodes[p as usize].keys[i] = uk;
+            self.nodes[p as usize].vals[i] = uv;
+            let node = &mut self.nodes[c as usize];
+            let end = node.len;
+            node.keys[end] = dk;
+            node.vals[end] = dv;
+            node.kids[end + 1] = kid;
+            node.len = end + 1;
+            return c;
+        }
+        if i < plen {
+            self.merge(p, i);
+            return c;
+        }
+        self.merge(p, i - 1);
+        self.nodes[p as usize].kids[i - 1]
+    }
+
+    // The entry i of leaf n taken out. n is the root or has more than the
+    // fewest keys.
+    fn take_leaf(&mut self, n: u32, i: usize) -> (K, V) {
+        let node = &mut self.nodes[n as usize];
+        let k = node.keys[i].take();
+        let v = node.vals[i].take();
+        let mut j = i;
+        while j + 1 < node.len {
+            node.keys[j] = node.keys[j + 1].take();
+            node.vals[j] = node.vals[j + 1].take();
+            j += 1;
+        }
+        node.len -= 1;
+        (k.unwrap(), v.unwrap())
+    }
+
+    // Removes the smallest (largest) entry of the subtree of n, which is
+    // the root or has more than the fewest keys. On the way down each node
+    // entered is first given more than the fewest keys, so that taking one
+    // out never leaves it with too few.
+    fn remove_edge(&mut self, start: u32, largest: bool) -> (K, V) {
+        let mut n = start;
+        loop {
+            let node = &self.nodes[n as usize];
+            if node.leaf {
+                let i = if largest { node.len - 1 } else { 0 };
+                return self.take_leaf(n, i);
+            }
+            let i = if largest { node.len } else { 0 };
+            let c = node.kids[i];
+            n = if self.nodes[c as usize].len <= B_MIN { self.fill(n, i) } else { c };
+        }
+    }
+
+    // Removes key's entry from the subtree of n, as remove_edge goes down.
+    fn remove_below<C: BCompare<K>>(&mut self, start: u32, key: &C) -> Option<(K, V)> {
+        let mut n = start;
+        loop {
+            let node = &self.nodes[n as usize];
+            let (i, found) = b_find(node, key);
+            if node.leaf {
+                if !found {
+                    return None;
+                }
+                return Some(self.take_leaf(n, i));
+            }
+            if found {
+                // a key between two children: the entry before it (the
+                // left child's largest) or after it takes its place, when
+                // that child can give one; else the two become one node
+                // with the key in it, and the search goes on there
+                let l = node.kids[i];
+                let r = node.kids[i + 1];
+                let (rk, rv) = if self.nodes[l as usize].len > B_MIN {
+                    self.remove_edge(l, true)
+                } else if self.nodes[r as usize].len > B_MIN {
+                    self.remove_edge(r, false)
+                } else {
+                    self.merge(n, i);
+                    n = l;
+                    continue;
+                };
+                let node = &mut self.nodes[n as usize];
+                let k = node.keys[i].replace(rk);
+                let v = node.vals[i].replace(rv);
+                return Some((k.unwrap(), v.unwrap()));
+            }
+            let c = node.kids[i];
+            n = if self.nodes[c as usize].len <= B_MIN { self.fill(n, i) } else { c };
+        }
+    }
+
+    // After a removal: an empty root's one child is the root now (one
+    // level less), and an empty leaf root is no root.
+    fn shrink_root(&mut self) {
+        let root = self.root;
+        if self.nodes[root as usize].len == 0 {
+            self.root = if self.nodes[root as usize].leaf {
+                B_NONE
+            } else {
+                self.nodes[root as usize].kids[0]
+            };
+            self.free_node(root);
+        }
+    }
+
+    fn remove_with<C: BCompare<K>>(&mut self, key: &C) -> Option<(K, V)> {
+        if self.root == B_NONE {
+            return None;
+        }
+        let out = self.remove_below(self.root, key);
+        self.shrink_root();
+        if out.is_some() {
+            self.len -= 1;
+        }
+        out
+    }
+
+    fn pop_edge(&mut self, largest: bool) -> Option<(K, V)> {
+        if self.root == B_NONE {
+            return None;
+        }
+        let out = self.remove_edge(self.root, largest);
+        self.shrink_root();
+        self.len -= 1;
+        Some(out)
+    }
+
+    // Removes key; its value.
+    #[effects(K, V, A, Q)]
+    pub fn remove<Q: ?Sized + Ord>(&mut self, key: &Q) -> Option<V>
+        where
+            K: Borrow<Q>,
+    {
+        match self.remove_with(&BBorrowed { key: key }) {
+            Some((_, v)) => Some(v),
+            None => None,
+        }
+    }
+
+    #[effects(K, V, A, Q)]
+    pub fn remove_entry<Q: ?Sized + Ord>(&mut self, key: &Q) -> Option<(K, V)>
+        where
+            K: Borrow<Q>,
+    {
+        self.remove_with(&BBorrowed { key: key })
+    }
+
+    // Removes the entry with the smallest key.
+    #[effects(K, V, A)]
+    pub fn pop_first(&mut self) -> Option<(K, V)> {
+        self.pop_edge(false)
+    }
+
+    // Removes the entry with the largest key.
+    #[effects(K, V, A)]
+    pub fn pop_last(&mut self) -> Option<(K, V)> {
+        self.pop_edge(true)
+    }
+
+    // The entries whose keys are in `range` (`a..b`, `a..=b`, `a..`, `..b`,
+    // `..`), in order. Panics when the range's start is after its end.
+    // (`m.range(..)` waits for the front: RangeFull's impl is for every T,
+    // and the T of this bound is not found; `iter` is the same entries.)
+    #[effects(panic, K, V, A, R)]
+    pub fn range<R: RangeBounds<K>>(&self, range: R) -> BTreeIter<'_, K, V, A> {
+        let mut lo: Option<&K> = None;
+        let front = match range.start_bound() {
+            Bound::Included(k) => {
+                lo = Some(k);
+                self.cursor_seek(&BDirect { key: k }, false)
+            }
+            Bound::Excluded(k) => {
+                lo = Some(k);
+                self.cursor_seek(&BDirect { key: k }, true)
+            }
+            Bound::Unbounded => self.cursor_first(),
+        };
+        let mut hi: Option<&K> = None;
+        let back = match range.end_bound() {
+            Bound::Included(k) => {
+                hi = Some(k);
+                self.cursor_seek(&BDirect { key: k }, true)
+            }
+            Bound::Excluded(k) => {
+                hi = Some(k);
+                self.cursor_seek(&BDirect { key: k }, false)
+            }
+            Bound::Unbounded => b_end(),
+        };
+        match (lo, hi) {
+            (Some(a), Some(b)) => if *a > *b {
+                crate::panic::panic("range start is greater than range end in BTreeMap");
+            },
+            _ => {}
+        }
+        BTreeIter { map: self, front: front, back: back }
+    }
+
+    // key's place in the map, to read, fill or change in one lookup.
+    #[effects(K, V, A)]
+    pub fn entry(&mut self, key: K) -> BTreeEntry<'_, K, V, A> {
+        let (n, i) = self.locate(&BDirect { key: &key });
+        if n == B_NONE {
+            BTreeEntry::Vacant(BTreeVacantEntry { map: self, key: key })
+        } else {
+            BTreeEntry::Occupied(BTreeOccupiedEntry { map: self, key: key, node: n, at: i })
+        }
+    }
+
+    // A copy on allocator b.
+    #[effects(diverge, K, V, A, B)]
+    pub fn clone_in<B: Allocator>(&self, b: B) -> BTreeMap<K, V, B>
+        where
+            K: Clone,
+            V: Clone,
+    {
+        let mut m: BTreeMap<K, V, B> = BTreeMap::new_in(b);
+        for (k, v) in self.iter() {
+            m.insert(k.clone(), v.clone());
+        }
+        m
+    }
+}
+
+impl<K: Ord + Clone, V: Clone, A: Allocator + Clone> Clone for BTreeMap<K, V, A> {
+    fn clone(&self) -> BTreeMap<K, V, A> {
+        self.clone_in(self.allocator().clone())
+    }
+}
+
+// The same entries.
+impl<K: PartialEq, V: PartialEq, A: Allocator, B: Allocator> PartialEq<BTreeMap<K, V, B>>
+    for BTreeMap<K, V, A>
+    {
+    fn eq(&self, other: &BTreeMap<K, V, B>) -> bool {
+        if self.len != other.len {
+            return false;
+        }
+        let mut a = self.iter();
+        let mut b = other.iter();
+        loop {
+            match (a.next(), b.next()) {
+                (Some((k, v)), Some((l, w))) => if *k != *l || *v != *w {
+                    return false;
+                },
+                _ => return true,
+            }
+        }
+    }
+}
+
+impl<K: Eq, V: Eq, A: Allocator> Eq for BTreeMap<K, V, A> {}
+
+// `{k: v, ...}`, in the keys' order.
+impl<K: Debug, V: Debug, A: Allocator> Debug for BTreeMap<K, V, A> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+// `m[&k]`: the value; panics when k is not there.
+impl<K: Ord + Borrow<Q>, Q: ?Sized + Ord, V, A: Allocator> Index<&Q> for BTreeMap<K, V, A> {
+    type Output = V;
+
+    fn index(&self, key: &Q) -> &V {
+        self.get(key).expect("no entry found for key")
+    }
+}
+
+impl<K: Ord, V, A: Allocator> Extend<(K, V)> for BTreeMap<K, V, A> {
+    fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
+        for (k, v) in iter {
+            self.insert(k, v);
+        }
+    }
+}
+
+// `pairs.collect_in(a)`.
+impl<K: Ord, V, A: Allocator> FromIteratorIn<(K, V), A> for BTreeMap<K, V, A> {
+    fn from_iter_in<I: IntoIterator<Item = (K, V)>>(iter: I, a: A) -> BTreeMap<K, V, A> {
+        let mut m: BTreeMap<K, V, A> = BTreeMap::new_in(a);
+        m.extend(iter);
+        m
+    }
+}
+
+// An empty map on a (`entry(k).or_default()` for map values).
+impl<K, V, A: Allocator> DefaultIn<A> for BTreeMap<K, V, A> {
+    fn default_in(a: A) -> BTreeMap<K, V, A> {
+        BTreeMap::new_in(a)
+    }
+}
+
+impl<K, V, A: Allocator> IntoIterator for BTreeMap<K, V, A> {
+    type Item = (K, V);
+    type IntoIter = BTreeIntoIter<K, V, A>;
+
+    fn into_iter(self) -> BTreeIntoIter<K, V, A> {
+        let front = self.cursor_first();
+        BTreeIntoIter { map: self, front: front, back: b_end() }
+    }
+}
+
+impl<'a, K, V, A: Allocator> IntoIterator for &'a BTreeMap<K, V, A> {
+    type Item = (&'a K, &'a V);
+    type IntoIter = BTreeIter<'a, K, V, A>;
+
+    fn into_iter(self) -> BTreeIter<'a, K, V, A> {
+        self.iter()
+    }
+}
+
+// ---- Iterators ----
+
+// The entries from `front` up to `back`, which is not one of them.
+pub struct BTreeIter<'a, K, V, A: Allocator> {
+    map: &'a BTreeMap<K, V, A>,
+    front: BCursor,
+    back: BCursor,
+}
+
+impl<'a, K, V, A: Allocator> Clone for BTreeIter<'a, K, V, A> {
+    fn clone(&self) -> BTreeIter<'a, K, V, A> {
+        BTreeIter { map: self.map, front: self.front, back: self.back }
+    }
+}
+
+impl<'a, K, V, A: Allocator> Iterator for BTreeIter<'a, K, V, A> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<(&'a K, &'a V)> {
+        if b_same(&self.front, &self.back) {
+            return None;
+        }
+        let map: &'a BTreeMap<K, V, A> = self.map;
+        let item = map.entry_at(&self.front);
+        map.cursor_next(&mut self.front);
+        Some(item)
+    }
+}
+
+impl<'a, K, V, A: Allocator> DoubleEndedIterator for BTreeIter<'a, K, V, A> {
+    fn next_back(&mut self) -> Option<(&'a K, &'a V)> {
+        if b_same(&self.front, &self.back) {
+            return None;
+        }
+        let map: &'a BTreeMap<K, V, A> = self.map;
+        map.cursor_prev(&mut self.back);
+        Some(map.entry_at(&self.back))
+    }
+}
+
+pub struct BTreeKeys<'a, K, V, A: Allocator> {
+    inner: BTreeIter<'a, K, V, A>,
+}
+
+impl<'a, K, V, A: Allocator> Iterator for BTreeKeys<'a, K, V, A> {
+    type Item = &'a K;
+
+    fn next(&mut self) -> Option<&'a K> {
+        match self.inner.next() {
+            Some((k, _)) => Some(k),
+            None => None,
+        }
+    }
+}
+
+impl<'a, K, V, A: Allocator> DoubleEndedIterator for BTreeKeys<'a, K, V, A> {
+    fn next_back(&mut self) -> Option<&'a K> {
+        match self.inner.next_back() {
+            Some((k, _)) => Some(k),
+            None => None,
+        }
+    }
+}
+
+pub struct BTreeValues<'a, K, V, A: Allocator> {
+    inner: BTreeIter<'a, K, V, A>,
+}
+
+impl<'a, K, V, A: Allocator> Iterator for BTreeValues<'a, K, V, A> {
+    type Item = &'a V;
+
+    fn next(&mut self) -> Option<&'a V> {
+        match self.inner.next() {
+            Some((_, v)) => Some(v),
+            None => None,
+        }
+    }
+}
+
+impl<'a, K, V, A: Allocator> DoubleEndedIterator for BTreeValues<'a, K, V, A> {
+    fn next_back(&mut self) -> Option<&'a V> {
+        match self.inner.next_back() {
+            Some((_, v)) => Some(v),
+            None => None,
+        }
+    }
+}
+
+// A map's entries by value, in order; what is left is dropped with it.
+pub struct BTreeIntoIter<K, V, A: Allocator> {
+    map: BTreeMap<K, V, A>,
+    front: BCursor,
+    back: BCursor,
+}
+
+impl<K, V, A: Allocator> Iterator for BTreeIntoIter<K, V, A> {
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<(K, V)> {
+        if b_same(&self.front, &self.back) {
+            return None;
+        }
+        let item = self.map.take_at(&self.front);
+        self.map.cursor_next(&mut self.front);
+        Some(item)
+    }
+}
+
+impl<K, V, A: Allocator> DoubleEndedIterator for BTreeIntoIter<K, V, A> {
+    fn next_back(&mut self) -> Option<(K, V)> {
+        if b_same(&self.front, &self.back) {
+            return None;
+        }
+        self.map.cursor_prev(&mut self.back);
+        Some(self.map.take_at(&self.back))
+    }
+}
+
+// ---- Entry ----
+
+// A key's place in a map: Occupied (its entry is there) or Vacant.
+pub enum BTreeEntry<'a, K, V, A: Allocator> {
+    Occupied(BTreeOccupiedEntry<'a, K, V, A>),
+    Vacant(BTreeVacantEntry<'a, K, V, A>),
+}
+
+impl<'a, K: Ord, V, A: Allocator> BTreeEntry<'a, K, V, A> {
+    // The value, set to `default` first when the key was not there.
+    #[effects(K, V, A)]
+    pub fn or_insert(self, default: V) -> &'a mut V {
+        match self {
+            BTreeEntry::Occupied(e) => e.into_mut(),
+            BTreeEntry::Vacant(e) => e.insert(default),
+        }
+    }
+
+    #[effects(K, V, A, F)]
+    pub fn or_insert_with<F: FnOnce() -> V>(self, f: F) -> &'a mut V {
+        match self {
+            BTreeEntry::Occupied(e) => e.into_mut(),
+            BTreeEntry::Vacant(e) => e.insert(f()),
+        }
+    }
+
+    #[effects(K, V, A)]
+    pub fn or_default(self) -> &'a mut V
+        where
+            V: Default,
+    {
+        match self {
+            BTreeEntry::Occupied(e) => e.into_mut(),
+            BTreeEntry::Vacant(e) => e.insert(V::default()),
+        }
+    }
+
+    // The entry, its value changed by f when the key is there.
+    #[effects(K, V, A, F)]
+    pub fn and_modify<F: FnOnce(&mut V)>(self, f: F) -> BTreeEntry<'a, K, V, A> {
+        match self {
+            BTreeEntry::Occupied(e) => {
+                let mut e = e;
+                f(e.get_mut());
+                BTreeEntry::Occupied(e)
+            }
+            BTreeEntry::Vacant(e) => BTreeEntry::Vacant(e),
+        }
+    }
+
+    #[effects()]
+    pub fn key(&self) -> &K {
+        match self {
+            BTreeEntry::Occupied(e) => &e.key,
+            BTreeEntry::Vacant(e) => &e.key,
+        }
+    }
+}
+
+pub struct BTreeOccupiedEntry<'a, K, V, A: Allocator> {
+    map: &'a mut BTreeMap<K, V, A>,
+    key: K,
+    node: u32,
+    at: usize,
+}
+
+impl<'a, K: Ord, V, A: Allocator> BTreeOccupiedEntry<'a, K, V, A> {
+    #[effects()]
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    #[effects(panic, K, V, A)]
+    pub fn get(&self) -> &V {
+        self.map.nodes[self.node as usize].vals[self.at].as_ref().unwrap()
+    }
+
+    #[effects(panic, K, V, A)]
+    pub fn get_mut(&mut self) -> &mut V {
+        self.map.nodes[self.node as usize].vals[self.at].as_mut().unwrap()
+    }
+
+    // The value, for as long as the map is borrowed.
+    #[effects(panic, K, V, A)]
+    pub fn into_mut(self) -> &'a mut V {
+        let map = self.map;
+        map.nodes[self.node as usize].vals[self.at].as_mut().unwrap()
+    }
+
+    // Sets the value; the one it had.
+    #[effects(panic, K, V, A)]
+    pub fn insert(&mut self, value: V) -> V {
+        self.map.nodes[self.node as usize].vals[self.at].replace(value).unwrap()
+    }
+
+    // Removes the entry; its value.
+    #[effects(panic, K, V, A)]
+    pub fn remove(self) -> V {
+        self.map.remove_with(&BDirect { key: &self.key }).unwrap().1
+    }
+}
+
+pub struct BTreeVacantEntry<'a, K, V, A: Allocator> {
+    map: &'a mut BTreeMap<K, V, A>,
+    key: K,
+}
+
+impl<'a, K: Ord, V, A: Allocator> BTreeVacantEntry<'a, K, V, A> {
+    #[effects()]
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    #[effects()]
+    pub fn into_key(self) -> K {
+        self.key
+    }
+
+    // Adds the entry; its value, for as long as the map is borrowed.
+    #[effects(panic, K, V, A)]
+    pub fn insert(self, value: V) -> &'a mut V {
+        let map = self.map;
+        let (n, i, _) = map.insert_at(self.key, value);
+        map.nodes[n as usize].vals[i].as_mut().unwrap()
+    }
+}
+
+// ---- BTreeSet ----
+
+// A set of T in order, on allocator A: a BTreeMap with no values.
+pub struct BTreeSet<T, A: Allocator> {
+    map: BTreeMap<T, (), A>,
+}
+
+impl<T, A: Allocator> BTreeSet<T, A> {
+    // An empty set on a; allocates at the first insert.
+    #[effects(T, A)]
+    pub fn new_in(a: A) -> BTreeSet<T, A> {
+        BTreeSet { map: BTreeMap::new_in(a) }
+    }
+
+    #[effects()]
+    pub fn len(&self) -> usize {
+        self.map.len
+    }
+
+    #[effects()]
+    pub fn is_empty(&self) -> bool {
+        self.map.len == 0
+    }
+
+    #[effects(T, A)]
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+
+    // The elements in order.
+    #[effects(T, A)]
+    pub fn iter(&self) -> BTreeSetIter<'_, T, A> {
+        BTreeSetIter { inner: self.map.iter() }
+    }
+
+    // The smallest element.
+    #[effects(T, A)]
+    pub fn first(&self) -> Option<&T> {
+        self.iter().next()
+    }
+
+    // The largest element.
+    #[effects(T, A)]
+    pub fn last(&self) -> Option<&T> {
+        self.iter().next_back()
+    }
+}
+
+impl<T: Ord, A: Allocator> BTreeSet<T, A> {
+    #[effects(T, A, Q)]
+    pub fn contains<Q: ?Sized + Ord>(&self, x: &Q) -> bool
+        where
+            T: Borrow<Q>,
+    {
+        self.map.contains_key(x)
+    }
+
+    // The set's element equal to x.
+    #[effects(T, A, Q)]
+    pub fn get<Q: ?Sized + Ord>(&self, x: &Q) -> Option<&T>
+        where
+            T: Borrow<Q>,
+    {
+        match self.map.get_key_value(x) {
+            Some((k, _)) => Some(k),
+            None => None,
+        }
+    }
+
+    // Adds x; false when it was there already.
+    #[effects(T, A)]
+    pub fn insert(&mut self, x: T) -> bool {
+        self.map.insert(x, ()).is_none()
+    }
+
+    // Removes x; whether it was there.
+    #[effects(T, A, Q)]
+    pub fn remove<Q: ?Sized + Ord>(&mut self, x: &Q) -> bool
+        where
+            T: Borrow<Q>,
+    {
+        self.map.remove_entry(x).is_some()
+    }
+
+    // Removes and returns the element equal to x.
+    #[effects(T, A, Q)]
+    pub fn take<Q: ?Sized + Ord>(&mut self, x: &Q) -> Option<T>
+        where
+            T: Borrow<Q>,
+    {
+        match self.map.remove_entry(x) {
+            Some((k, _)) => Some(k),
+            None => None,
+        }
+    }
+
+    #[effects(T, A)]
+    pub fn pop_first(&mut self) -> Option<T> {
+        match self.map.pop_first() {
+            Some((k, _)) => Some(k),
+            None => None,
+        }
+    }
+
+    #[effects(T, A)]
+    pub fn pop_last(&mut self) -> Option<T> {
+        match self.map.pop_last() {
+            Some((k, _)) => Some(k),
+            None => None,
+        }
+    }
+
+    // The elements in `range`, in order.
+    #[effects(T, A, R)]
+    pub fn range<R: RangeBounds<T>>(&self, range: R) -> BTreeSetIter<'_, T, A> {
+        BTreeSetIter { inner: self.map.range(range) }
+    }
+
+    // Whether every element of self is in other.
+    #[effects(diverge, T, A, B)]
+    pub fn is_subset<B: Allocator>(&self, other: &BTreeSet<T, B>) -> bool {
+        if self.len() > other.len() {
+            return false;
+        }
+        for x in self.iter() {
+            if !other.contains(x) {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[effects(T, A, B)]
+    pub fn is_superset<B: Allocator>(&self, other: &BTreeSet<T, B>) -> bool {
+        other.is_subset(self)
+    }
+
+    // Whether the two have no element in common.
+    #[effects(diverge, T, A, B)]
+    pub fn is_disjoint<B: Allocator>(&self, other: &BTreeSet<T, B>) -> bool {
+        for x in self.iter() {
+            if other.contains(x) {
+                return false;
+            }
+        }
+        true
+    }
+
+    // A copy on allocator b.
+    #[effects(diverge, T, A, B)]
+    pub fn clone_in<B: Allocator>(&self, b: B) -> BTreeSet<T, B>
+        where
+            T: Clone,
+    {
+        let mut s: BTreeSet<T, B> = BTreeSet::new_in(b);
+        for x in self.iter() {
+            s.insert(x.clone());
+        }
+        s
+    }
+}
+
+impl<T: Ord + Clone, A: Allocator + Clone> Clone for BTreeSet<T, A> {
+    fn clone(&self) -> BTreeSet<T, A> {
+        self.clone_in(self.map.allocator().clone())
+    }
+}
+
+impl<T: PartialEq, A: Allocator, B: Allocator> PartialEq<BTreeSet<T, B>> for BTreeSet<T, A> {
+    fn eq(&self, other: &BTreeSet<T, B>) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        let mut a = self.iter();
+        let mut b = other.iter();
+        loop {
+            match (a.next(), b.next()) {
+                (Some(x), Some(y)) => if *x != *y {
+                    return false;
+                },
+                _ => return true,
+            }
+        }
+    }
+}
+
+impl<T: Eq, A: Allocator> Eq for BTreeSet<T, A> {}
+
+// `{a, b, ...}`, in order.
+impl<T: Debug, A: Allocator> Debug for BTreeSet<T, A> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        f.debug_set().entries(self.iter()).finish()
+    }
+}
+
+impl<T: Ord, A: Allocator> Extend<T> for BTreeSet<T, A> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        for x in iter {
+            self.insert(x);
+        }
+    }
+}
+
+// `items.collect_in(a)`.
+impl<T: Ord, A: Allocator> FromIteratorIn<T, A> for BTreeSet<T, A> {
+    fn from_iter_in<I: IntoIterator<Item = T>>(iter: I, a: A) -> BTreeSet<T, A> {
+        let mut s: BTreeSet<T, A> = BTreeSet::new_in(a);
+        s.extend(iter);
+        s
+    }
+}
+
+impl<T, A: Allocator> DefaultIn<A> for BTreeSet<T, A> {
+    fn default_in(a: A) -> BTreeSet<T, A> {
+        BTreeSet::new_in(a)
+    }
+}
+
+impl<T, A: Allocator> IntoIterator for BTreeSet<T, A> {
+    type Item = T;
+    type IntoIter = BTreeSetIntoIter<T, A>;
+
+    fn into_iter(self) -> BTreeSetIntoIter<T, A> {
+        BTreeSetIntoIter { inner: self.map.into_iter() }
+    }
+}
+
+impl<'a, T, A: Allocator> IntoIterator for &'a BTreeSet<T, A> {
+    type Item = &'a T;
+    type IntoIter = BTreeSetIter<'a, T, A>;
+
+    fn into_iter(self) -> BTreeSetIter<'a, T, A> {
+        self.iter()
+    }
+}
+
+pub struct BTreeSetIter<'a, T, A: Allocator> {
+    inner: BTreeIter<'a, T, (), A>,
+}
+
+impl<'a, T, A: Allocator> Iterator for BTreeSetIter<'a, T, A> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<&'a T> {
+        match self.inner.next() {
+            Some((k, _)) => Some(k),
+            None => None,
+        }
+    }
+}
+
+impl<'a, T, A: Allocator> DoubleEndedIterator for BTreeSetIter<'a, T, A> {
+    fn next_back(&mut self) -> Option<&'a T> {
+        match self.inner.next_back() {
+            Some((k, _)) => Some(k),
+            None => None,
+        }
+    }
+}
+
+pub struct BTreeSetIntoIter<T, A: Allocator> {
+    inner: BTreeIntoIter<T, (), A>,
+}
+
+impl<T, A: Allocator> Iterator for BTreeSetIntoIter<T, A> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        match self.inner.next() {
+            Some((k, _)) => Some(k),
+            None => None,
+        }
+    }
+}
+
+impl<T, A: Allocator> DoubleEndedIterator for BTreeSetIntoIter<T, A> {
+    fn next_back(&mut self) -> Option<T> {
+        match self.inner.next_back() {
+            Some((k, _)) => Some(k),
+            None => None,
+        }
+    }
+}

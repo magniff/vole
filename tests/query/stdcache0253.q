@@ -11,7 +11,7 @@ $ show print
 // std::fmt::print	<std>:15164-15173
 // x on stdout (`print("{x}")`); stdout is line-buffered when a terminal.
 // later: format_fns
-#[effects(panic, diverge, T)]
+#[effects(panic, T)]
 pub fn print<T: Display>(x: T) {
     let mut out = crate::io::stdout();
     if crate::io::Write::write_fmt(&mut out, x).is_err() {
@@ -27,7 +27,7 @@ $ show Vec::push
     // Its `ensures` made it a call of push$body, out of line, at every
     // push (about 7% of the rust-edition compiler's check of itself).
     #[inline]
-    #[effects(panic, T, A)]
+    #[effects(T, A)]
     pub fn push(&mut self, x: T)
         debug ensures self.len() == old(self.len()) + 1
         debug ensures self.len() <= self.capacity()

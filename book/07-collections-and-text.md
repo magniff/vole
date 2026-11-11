@@ -666,15 +666,15 @@ A `HashSet` is a map with keys and no values, for asking "have I seen
 this?". A `BTreeMap` is a map that keeps its keys sorted, so looping
 over it goes from the smallest key up, and `range` gives part of it:
 
-```vole mvs
-use std::BTreeMap;
-use std::HashSet;
+```vole
+use std::collections::BTreeMap;
+use std::collections::HashSet;
 
 fn main(gpa: Gpa) {
-    var seen: HashSet<i64, Gpa> = HashSet::new_in(gpa);
-    println("{} {} {}", seen.insert(3), seen.insert(3), seen.contains(3));
+    let mut seen: HashSet<i64, Gpa> = HashSet::new_in(gpa);
+    println("{} {} {}", seen.insert(3), seen.insert(3), seen.contains(&3));
 
-    var grades: BTreeMap<i64, str, Gpa> = BTreeMap::new_in(gpa);
+    let mut grades: BTreeMap<i64, &str, Gpa> = BTreeMap::new_in(gpa);
     grades.insert(90, "A");
     grades.insert(70, "C");
     grades.insert(80, "B");
@@ -682,7 +682,7 @@ fn main(gpa: Gpa) {
         print("{score}:{grade} ");
     }
     println("");
-    for (score, grade) in grades.range(75, 95) {
+    for (score, grade) in grades.range(75..95) {
         print("{score}:{grade} ");
     }
     println("");
@@ -695,8 +695,8 @@ true false true
 80:B 90:A 
 ```
 
-`insert` on a set says whether the value was new. `range(75, 95)`
-includes 75 and stops before 95, like `75..95`.
+`insert` on a set says whether the value was new. `range(75..95)`
+includes 75 and stops before 95.
 
 `HashSet` and `BTreeMap` aren't in the prelude, so they need a `use`
 line. So do two more containers in `std::collections`: `BinaryHeap`, a

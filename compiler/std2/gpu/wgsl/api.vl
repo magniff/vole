@@ -1,0 +1,338 @@
+// EDITION: rust
+// ---- Shader compiler implementation, translate (0.22) ----
+// The translator's entry: WGSL source to an output (the IR as text, MSL,
+// SPIR-V), on an arena of its own (docs/design/gpu.md §2.10: everything a
+// translation allocates is freed when it ends; no io, no globals).
+
+use crate::alloc::{Allocator, Arena};
+
+use super::front::new_front;
+
+pub const TARGET_CHECK: i64 = 0;
+pub const TARGET_IR: i64 = 1;
+pub const TARGET_MSL: i64 = 2;
+pub const TARGET_SPIRV: i64 = 3;
+
+#[derive(Clone, Copy)] pub struct Options {
+    pub target: i64,
+    // bench only: no bounds checks (the cost of the checks is measured
+    // against this; never shipped)
+    pub no_checks: bool,
+    // drop checks proven unneeded by a dominating loop condition
+    pub prove: bool,
+}
+
+pub fn options(target: i64) -> Options { Options { target: target, no_checks: false, prove: true } }
+
+// ---- Shader compiler implementation, translate: Reflection (0.22) ----
+
+// What a binding holds (WebGPU's binding types).
+pub const BK_UNIFORM: u8 = 0;
+pub const BK_STORAGE: u8 = 1;
+pub const BK_READ_ONLY_STORAGE: u8 = 2;
+pub const BK_TEXTURE: u8 = 3;
+pub const BK_STORAGE_TEXTURE: u8 = 4;
+pub const BK_SAMPLER: u8 = 5;
+pub const BK_COMPARISON_SAMPLER: u8 = 6;
+
+// One `@group(g) @binding(b)`: its kind, the smallest buffer it accepts
+// (a runtime-sized array counts one element), and, for the target, its
+// slot in each stage (vertex, fragment, compute; -1: not used there).
+#[derive(Clone, Copy)] pub struct BindingInfo {
+    pub group: i64, pub binding: i64, pub kind: u8, pub min_size: i64, pub slots: [i64; 3],
+    pub global: i64,
+}
+
+// An entry point: its WGSL name, its name in the output, its stage
+// (ir::STAGE_*), a compute entry's workgroup size, and the slot of the
+// sizes buffer it needs (-1: none; Metal only).
+pub struct EntryInfo<A: Allocator> {
+    pub name: Vec<u8, A>, pub target_name: Vec<u8, A>, pub stage: u8, pub workgroup: [i64; 3],
+    pub sizes_slot: i64,
+}
+
+// A vertex entry's input at @location(n): its scalar (ir::SK_*) and
+// component count, as WebGPU's vertex formats (`float32x3`: f32, 3).
+#[derive(Clone, Copy)] pub struct InputInfo {
+    pub location: i64, pub scalar: u8, pub components: i64,
+}
+
+// Where a function of the output starts (msl_line, 1-based, in the
+// target's text) and the byte offset of its WGSL declaration: what maps
+// a target compiler's message back to the WGSL (target_error).
+#[derive(Clone, Copy)] pub struct SourceLine { pub msl_line: i64, pub pos: i64 }
+
+// A translated module's interface, in (group, binding) order; `sizes`
+// lists the runtime-sized storage bindings (indices into `bindings`) in
+// the order of the sizes buffer; `uses`, the bindings each entry point
+// uses, through its calls too: (entry, binding) pairs of indices into
+// `entries` and `bindings` (a pipeline's layout is its entry points'
+// bindings); `lines`, where each function of the output starts (MSL
+// only).
+pub struct Reflection<A: Allocator> {
+    pub entries: Vec<EntryInfo<A>, A>, pub bindings: Vec<BindingInfo, A>,
+    pub inputs: Vec<InputInfo, A>,
+    pub sizes: Vec<i64, A>,
+    pub uses: Vec<[i64; 2], A>, pub lines: Vec<SourceLine, A>,
+}
+
+pub fn new_reflection(gpa: Gpa) -> Reflection<Gpa> {
+    Reflection {
+        entries: Vec::new_in(gpa), bindings: Vec::new_in(gpa), inputs: Vec::new_in(gpa),
+        sizes: Vec::new_in(gpa), uses: Vec::new_in(gpa),
+        lines: Vec::new_in(gpa),
+    }
+}
+
+// The target-neutral part of the reflection, from the IR.
+pub fn reflect<A: Allocator + Copy>(m: &ir::Module<A>, a: A, refl: &mut Reflection<Gpa>, gpa: Gpa) {
+    refl.entries.clear();
+    refl.bindings.clear();
+    refl.inputs.clear();
+    refl.sizes.clear();
+    refl.uses.clear();
+    refl.lines.clear();
+    for e in 0..m.entries.len() as i64 {
+        let en = m.entries[e as usize];
+        let mut name = Vec::<u8, _>::new_in(gpa);
+        name.extend_from_slice(en.name);
+        refl.entries.push(EntryInfo {
+            name: name, target_name: Vec::<u8, _>::new_in(gpa), stage: en.stage, workgroup: en.wg,
+            sizes_slot: -1,
+        });
+        if en.stage == ir::STAGE_VERTEX {
+            let f = &m.functions[en.func as usize];
+            for k in 0..f.params.len() as i64 {
+                let pt = m.types[f.params[k as usize].ty as usize];
+                if pt.kind == ir::TK_STRUCT && f.params[k as usize].binding.kind == ir::BIND_NONE {
+                    for j in pt.mstart..pt.mstart + pt.mcount {
+                        let mem = m.members[j as usize];
+                        if mem.binding.kind == ir::BIND_LOCATION {
+                            refl.inputs.push(InputInfo {
+                                location: mem.binding.value,
+                                scalar: m.types[mem.ty as usize].scalar,
+                                components: m.width_of(mem.ty),
+                            });
+                        }
+                    }
+                } else if f.params[k as usize].binding.kind == ir::BIND_LOCATION {
+                    refl.inputs.push(InputInfo {
+                        location: f.params[k as usize].binding.value, scalar: pt.scalar,
+                        components: m.width_of(f.params[k as usize].ty),
+                    });
+                }
+            }
+        }
+    }
+    let order = msl::binding_order(m, a);
+    for k in 0..order.len() as i64 {
+        let g = order[k as usize];
+        let gl = m.globals[g as usize];
+        if gl.group < 0 {
+            continue;
+        }
+        let t = m.types[gl.ty as usize];
+        let kind = if gl.space == ir::SP_UNIFORM {
+            BK_UNIFORM
+        } else if gl.space == ir::SP_STORAGE {
+            if gl.access == ir::ACC_RW { BK_STORAGE } else { BK_READ_ONLY_STORAGE }
+        } else if t.kind == ir::TK_TEXTURE {
+            if t.n == ir::TEX_STORAGE_2D { BK_STORAGE_TEXTURE } else { BK_TEXTURE }
+        } else if t.n == 1 {
+            BK_COMPARISON_SAMPLER
+        } else {
+            BK_SAMPLER
+        };
+        let min: i64 = if gl.space == ir::SP_UNIFORM || gl.space == ir::SP_STORAGE { t.size }
+            else { 0 };
+        if gl.space == ir::SP_STORAGE && m.is_runtime_sized(gl.ty) {
+            refl.sizes.push(refl.bindings.len() as i64);
+        }
+        refl.bindings.push(BindingInfo {
+            group: gl.group, binding: gl.binding, kind: kind, min_size: min, slots: [-1, -1, -1],
+            global: g,
+        });
+    }
+    let uses = msl::global_uses(m, &msl::call_order(m, a), a);
+    for e in 0..m.entries.len() as i64 {
+        let h = m.entries[e as usize].func;
+        for b in 0..refl.bindings.len() as i64 {
+            if uses[h as usize][refl.bindings[b as usize].global as usize] {
+                refl.uses.push([e, b]);
+            }
+        }
+    }
+}
+
+// The sizes buffer (Metal; the bounds checks of runtime-sized arrays): an
+// entry point whose `sizes_slot` is >= 0 reads one u32 per binding of
+// `refl.sizes`, in that order, the bytes the buffer bound there exposes
+// (its size minus the binding's offset, or the binding's size when one is
+// given), and the backend gives them with setBytes(words, 4 * len,
+// sizes_slot) before each dispatch or draw, in that entry's stage. `bound`
+// says it for a (group, binding), 0 when nothing is bound. A runtime-sized
+// array then has (bytes - its offset in the binding) / stride elements;
+// past them a load reads zero and a store is skipped.
+pub fn sizes_words<F: FnMut(i64, i64) -> i64>(refl: &Reflection<Gpa>, mut bound: F,
+    out: &mut Vec<u32, Gpa>) {
+    let mut f = bound;
+    out.clear();
+    for i in 0..refl.sizes.len() as i64 {
+        let b = refl.bindings[refl.sizes[i as usize] as usize];
+        let n = f(b.group, b.binding);
+        out.push(if n < 0 { 0 } else if n > 4294967295 { 4294967295u32 } else { n as u32 });
+    }
+}
+
+// A shader the translator rejects: its first error.
+pub struct ShaderError<A: Allocator> {
+    pub code: &'static [u8], pub pos: i64, pub line: i64, pub col: i64, pub msg: Vec<u8, A>,
+    pub help: Vec<u8, A>,
+}
+
+pub fn new_error(gpa: Gpa) -> ShaderError<Gpa> {
+    ShaderError {
+        code: b"", pos: 0, line: 0, col: 0, msg: Vec::<u8, _>::new_in(gpa),
+        help: Vec::<u8, _>::new_in(gpa),
+    }
+}
+
+// The 1-based line and column of byte `pos`.
+pub fn line_col(src: &[u8], pos: i64) -> (i64, i64) {
+    let mut line: i64 = 1;
+    let mut col: i64 = 1;
+    let end = if pos < src.len() as i64 { pos } else { src.len() as i64 };
+    for i in 0..end {
+        if src[i as usize] == b'\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+// A target compiler's rejection of the translation of src (Metal's log:
+// `program_source:LINE:COL: error: TEXT` lines) as one line at the WGSL:
+// `LINE:COL: error wgsl.target: ... fn NAME: TEXT (MSL LINE:COL)`, at the
+// declaration of the function whose MSL holds the first error (refl.lines).
+// False, out unchanged, when the log has no error line in a function.
+pub fn target_error<A: Allocator>(src: &[u8], refl: &Reflection<Gpa>, log: &[u8],
+    out: &mut String<A>)
+    -> bool {
+    let key = "program_source:";
+    let mut i: i64 = 0;
+    while i + key.len() as i64 <= log.len() as i64 {
+        if (i == 0 || log[(i - 1) as usize] == b'\n')
+            && log[i as usize..(i + key.len() as i64) as usize] == key.as_bytes() {
+            let (ml, a) = number_at(log, i + key.len() as i64);
+            let (mc, b) = number_at(log, a + 1);
+            let tag = ": error: ";
+            if ml > 0 && a < log.len() as i64 && log[a as usize] == b':'
+                && b + tag.len() as i64 <= log.len() as i64
+                && log[b as usize..(b + tag.len() as i64) as usize] == tag.as_bytes() {
+                let mut e = b + tag.len() as i64;
+                while e < log.len() as i64 && log[e as usize] != b'\n' {
+                    e += 1;
+                }
+                // the last function starting at or before the line
+                let mut pos: i64 = -1;
+                for k in 0..refl.lines.len() as i64 {
+                    if refl.lines[k as usize].msl_line <= ml {
+                        pos = refl.lines[k as usize].pos;
+                    }
+                }
+                if pos < 0 {
+                    return false;
+                }
+                let (l, c) = line_col(src, pos);
+                write(out, "{l}:{c}: error wgsl.target: Metal rejected the translation of fn ").unwrap();
+                write(out, str::from_utf8(name_at(src, pos)).unwrap()).unwrap();
+                write(out, ": {} (MSL {ml}:{mc})",
+                    &str::from_utf8(log[(b + tag.len() as i64) as usize..e as usize]).unwrap()).unwrap();
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+// The decimal number at s[i..] and the index after it (0 and i: none).
+fn number_at(s: &[u8], i: i64) -> (i64, i64) {
+    let mut n: i64 = 0;
+    let mut j = i;
+    while j < s.len() as i64 && s[j as usize] >= b'0' && s[j as usize] <= b'9' && n < 1000000000 {
+        n = n * 10 + (s[j as usize] - b'0') as i64;
+        j += 1;
+    }
+    (n, j)
+}
+
+// The identifier at src[pos..] (a function's position is its name's).
+fn name_at(src: &[u8], pos: i64) -> &[u8] {
+    let i = if pos < src.len() as i64 { pos } else { src.len() as i64 };
+    let mut j = i;
+    while j < src.len() as i64
+        && (src[j as usize] == b'_' || src[j as usize] >= b'a' && src[j as usize] <= b'z'
+            || src[j as usize] >= b'A'
+            && src[j as usize] <= b'Z' || src[j as usize] >= b'0' && src[j as usize] <= b'9') {
+        j += 1;
+    }
+    &src[i as usize..j as usize]
+}
+
+pub fn fill_error<A: Allocator + Copy>(fr: &front::Front<A>, err: &mut ShaderError<Gpa>) {
+    err.code = fr.err_code;
+    err.pos = fr.err_pos;
+    let (l, c) = line_col(fr.src, fr.err_pos);
+    err.line = l;
+    err.col = c;
+    err.msg.clear();
+    err.msg.extend_from_slice(fr.emsg.as_slice());
+    err.help.clear();
+    err.help.extend_from_slice(fr.ehelp.as_slice());
+}
+
+// Translates src; the output is appended to `out` (SPIR-V: its words,
+// little-endian). False, with err filled, when the shader is rejected.
+// (0.26.3: the translator writes a Buf until 0.27, translate_buf; outside
+// std its output is bytes, Buf being deprecated.)
+pub fn translate(src: &[u8], opts: Options, out: &mut Vec<u8, Gpa>, refl: &mut Reflection<Gpa>,
+    err: &mut ShaderError<Gpa>, gpa: Gpa) -> bool {
+    let mut b = Vec::<u8, _>::new_in(gpa);
+    let ok = translate_buf(src, opts, &mut b, refl, err, gpa);
+    out.extend_from_slice(b.as_slice());
+    ok
+}
+
+// translate, into a Buf (std's own callers until 0.27).
+pub(crate) fn translate_buf(src: &[u8], opts: Options, out: &mut Vec<u8, Gpa>,
+    refl: &mut Reflection<Gpa>, err: &mut ShaderError<Gpa>, gpa: Gpa) -> bool {
+    Arena::new_in(gpa).scope(|s| ({ let a = s; {
+        let mut fr = new_front(src, a);
+        fr.module();
+        if !fr.failed {
+            uniformity::check(&fr);
+        }
+        if fr.failed {
+            fill_error(&fr, err);
+            return false;
+        }
+        if !opts.no_checks {
+            bounds::insert_checks(&mut fr.m, a, opts.prove);
+        } else {
+            bounds::insert_no_checks(&mut fr.m);
+        }
+        reflect(&fr.m, a, refl, gpa);
+        if opts.target == TARGET_IR {
+            dump::dump(&fr.m, out);
+        } else if opts.target == TARGET_MSL {
+            msl::write_module(&fr.m, a, out, refl);
+        } else if opts.target == TARGET_SPIRV {
+            spirv::write_module(&fr.m, a, out);
+        }
+        true
+    } }))
+}
