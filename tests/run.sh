@@ -1737,9 +1737,7 @@ if [ -s "$WORK/failed-cases" ]; then
 fi
 if [ "$RERUNS" != 1 ] && [ -s "$RERUNS" ]; then
     n=$(wc -l <"$RERUNS" | tr -d ' ')
-    echo "lazy std: $n build(s) were made again with std whole (VOLE_STD2_NORERUN=1 shows why; a word or a seed is missing in front/modules/std2lazy.vl); the first:"
-    grep -o '[^ ]*\.vl' "$RERUNS" | sed 's|.*/||' | head -8 | tr '\n' ' ' | sed 's/^/  /'
-    echo
+    echo "lazy std: $n build(s) were made again with std whole (VOLE_STD2_NORERUN=1 shows why; a word or a seed is missing in front/modules/std2lazy.vl); the first: $(grep -o '[^ ]*\.vl' "$RERUNS" | sed 's|.*/||' | head -8 | tr '\n' ' ' | sed 's/ $//')"
 fi
 if grep -q ' fail$' "$TALLY"; then
     exit 1

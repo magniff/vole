@@ -346,7 +346,7 @@ for l in $LEVELS; do
     t0=$(date +%s)
     # shellcheck disable=SC2086
     if tests/run.sh -c "$COMPILER" -O "$l" $JFLAG -f "$pf" >"$WORK/run-O$l.log" 2>&1; then
-        tail -n +1 "$WORK/run-O$l.log" | awk '/^tests for /{ p = 1 } p' | grep -E '^tests for|  total'
+        tail -n +1 "$WORK/run-O$l.log" | awk '/^tests for /{ p = 1 } p' | grep -E '^tests for|  total|^lazy std:'
         result PASS "tests/run.sh -O$l: $(awk '$1 == "total" { print $2 " passed, " $3 " xfail" }' "$WORK/run-O$l.log")" $(( $(date +%s) - t0 ))
     else
         cat "$WORK/run-O$l.log"
