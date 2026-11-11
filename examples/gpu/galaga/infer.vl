@@ -1,3 +1,4 @@
+// EDITION: rust
 // infer.vl: the agent — the network, the two-frame observation stack, the
 // top-3 sampling, and the per-entity saliency the overlay shows. A port
 // of the `InferState` in neural-galaga-ui's infer binary: the same
@@ -8,6 +9,7 @@
 // three most likely ones, renormalized; the client's own RNG stands in
 // for rand's.
 
+use std::alloc::Allocator;
 use std::random::Xoshiro256pp;
 
 use crate::game::{Step, action_mask};
@@ -21,6 +23,7 @@ use crate::obs::{
 
 /// One circled entity: where it is, how much it mattered, and the
 /// colour the overlay rings it in.
+#[derive(Clone, Copy)]
 pub struct SaliencyTarget {
     pub x: f32,
     pub y: f32,
@@ -29,7 +32,7 @@ pub struct SaliencyTarget {
 }
 
 pub struct Infer<A: Allocator> {
-    path: Vec<u8, A>,
+    path: String<A>,
     model: Model<A>,
     prev_obs: Vec<f32, A>,
     last_obs: Vec<f32, A>,
@@ -41,17 +44,13 @@ pub struct Infer<A: Allocator> {
     rng: Xoshiro256pp,
 }
 
-pub fn infer_new(path: [u8], gpa: Gpa) -> Infer<Gpa> {
+pub fn infer_new(path: &str, gpa: Gpa) -> Infer<Gpa> {
     let model = load(path, gpa);
     Infer {
-        path: {
-            var p: Vec<u8, Gpa> = Vec::new_in(gpa);
-            p.extend_from_slice(path);
-            p
-        },
+        path: String::from_in(path, gpa),
         model: model,
-        prev_obs: Vec::filled_in(OBS_SIZE as usize, 0.0f32, gpa),
-        last_obs: Vec::filled_in(OBS_SIZE as usize, 0.0f32, gpa),
+        prev_obs: Vec::from_elem_in(0.0f32, OBS_SIZE as usize, gpa),
+        last_obs: Vec::from_elem_in(0.0f32, OBS_SIZE as usize, gpa),
         last_result: Option::None,
         last_action: 0,
         probs: [0.0; 18],
@@ -63,8 +62,8 @@ pub fn infer_new(path: [u8], gpa: Gpa) -> Infer<Gpa> {
 
 /// The same, with the sampler seeded: the headless check needs a run it
 /// can repeat.
-pub fn infer_new_seeded(path: [u8], seed: u64, gpa: Gpa) -> Infer<Gpa> {
-    var inf = infer_new(path, gpa);
+pub fn infer_new_seeded(path: &str, seed: u64, gpa: Gpa) -> Infer<Gpa> {
+    let mut inf = infer_new(path, gpa);
     inf.rng = Xoshiro256pp::seed_from_u64(seed);
     inf
 }
@@ -72,42 +71,43 @@ pub fn infer_new_seeded(path: [u8], seed: u64, gpa: Gpa) -> Infer<Gpa> {
 impl Infer<Gpa> {
     /// Reload the checkpoint from the same path — what the client does
     /// when a game ends.
-    pub fn reload(inout self, gpa: Gpa) {
-        let m = load(self.path.as_slice(), gpa);
+    pub fn reload(&mut self, gpa: Gpa) {
+        let m = load(self.path.as_str(), gpa);
         self.model = m;
     }
 
-    pub fn update_obs(inout self, r: Step<Gpa>, gpa: Gpa) {
+    pub fn update_obs(&mut self, r: &Step<Gpa>, gpa: Gpa) {
         let cur = encode(r, gpa);
         self.prev_obs = self.last_obs.take();
         self.last_obs = cur;
         self.last_result = Option::Some(r.clone());
     }
 
-    fn stacked(self, gpa: Gpa) -> Vec<f32, Gpa> {
+    fn stacked(&self, gpa: Gpa) -> Vec<f32, Gpa> {
         stack(self.prev_obs.as_slice(), self.last_obs.as_slice(), gpa)
     }
 
     /// Sample from the three most likely actions, renormalized, and
     /// return the chosen action's mask.
-    pub fn pick_action(inout self, gpa: Gpa) -> u32 {
+    pub fn pick_action(&mut self, gpa: Gpa) -> u32 {
         let x = self.stacked(gpa);
-        let net = forward(self.model, x.as_slice(), gpa);
+        let net = forward(&self.model, x.as_slice(), gpa);
         self.probs = net.probs;
         self.value = net.value;
 
         let top = top_k(net.probs, 3);
-        var sum = net.probs[top[0]] + net.probs[top[1]] + net.probs[top[2]];
+        let mut sum = net.probs[top[0] as usize] + net.probs[top[1] as usize] + net.probs[
+            top[2] as usize];
         if sum < 1e-8 {
             sum = 1e-8;
         }
         let r = self.rng.unit_f64() as f32;
-        var cumsum: f32 = 0.0;
-        var action = top[2];
+        let mut cumsum: f32 = 0.0;
+        let mut action = top[2];
         for i in 0..3 {
-            cumsum += net.probs[top[i]] / sum;
+            cumsum += net.probs[top[i as usize] as usize] / sum;
             if r < cumsum {
-                action = top[i];
+                action = top[i as usize];
                 break;
             }
         }
@@ -118,25 +118,25 @@ impl Infer<Gpa> {
     /// How much each entity on screen mattered to the last action: the
     /// sum of the absolute gradient of its slot in the current frame's
     /// observation, normalized so the largest is 1.
-    pub fn compute_saliency(inout self, gpa: Gpa) {
+    pub fn compute_saliency(&mut self, gpa: Gpa) {
         self.targets.clear();
         let r = match self.last_result.clone() {
             Option::Some(v) => v,
             Option::None => return,
         };
         let x = self.stacked(gpa);
-        let g = saliency(self.model, x.as_slice(), self.last_action, gpa);
+        let g = saliency(&self.model, x.as_slice(), self.last_action, gpa);
 
         // Enemies.
         for i in 0..NUM_ENEMY_SLOTS {
-            if i >= r.enemies.len() as i64 || !r.enemies[i].alive {
+            if i >= r.enemies.len() as i64 || !r.enemies[i as usize].alive {
                 continue;
             }
             let imp = slot_importance(g.as_slice(),
                 ENEMIES_OFFSET + i * ENEMY_SLOT_FLOATS, ENEMY_SLOT_FLOATS);
             self.targets.push(SaliencyTarget {
-                x: r.enemies[i].x + 8.0,
-                y: r.enemies[i].y + 8.0,
+                x: r.enemies[i as usize].x + 8.0,
+                y: r.enemies[i as usize].y + 8.0,
                 importance: imp,
                 color: [255, 80, 80],
             });
@@ -144,7 +144,7 @@ impl Infer<Gpa> {
 
         // Player bullets (dy < 0), then enemy bullets (dy >= 0), in the
         // order the game produced them.
-        var pb: i64 = 0;
+        let mut pb: i64 = 0;
         for i in 0..r.bullets.len() {
             let b = r.bullets[i];
             if b.dy < 0.0 && pb < NUM_PLAYER_BULLET_SLOTS {
@@ -160,7 +160,7 @@ impl Infer<Gpa> {
                 pb += 1;
             }
         }
-        var eb: i64 = 0;
+        let mut eb: i64 = 0;
         for i in 0..r.bullets.len() {
             let b = r.bullets[i];
             if b.dy >= 0.0 && eb < NUM_ENEMY_BULLET_SLOTS {
@@ -178,7 +178,7 @@ impl Infer<Gpa> {
         }
 
         // Shotgun balls.
-        var sb: i64 = 0;
+        let mut sb: i64 = 0;
         for i in 0..r.shotgun.len() {
             if sb >= NUM_SHOTGUN_SLOTS {
                 break;
@@ -197,7 +197,7 @@ impl Infer<Gpa> {
         }
 
         // Powerups.
-        var pu: i64 = 0;
+        let mut pu: i64 = 0;
         for i in 0..r.powerups.len() {
             if pu >= NUM_POWERUP_SLOTS {
                 break;
@@ -216,7 +216,7 @@ impl Infer<Gpa> {
         }
 
         // Normalize to [0, 1]; an all-zero run keeps 0.
-        var max_imp: f32 = 0.0;
+        let mut max_imp: f32 = 0.0;
         for i in 0..self.targets.len() {
             if self.targets[i].importance > max_imp {
                 max_imp = self.targets[i].importance;
@@ -233,10 +233,10 @@ impl Infer<Gpa> {
 
 /// The sum of absolute gradients over one entity's slot in the current
 /// frame (the second half of the stacked observation).
-fn slot_importance(g: [f32], offset: i64, n: i64) -> f32 {
-    var s: f32 = 0.0;
+fn slot_importance(g: &[f32], offset: i64, n: i64) -> f32 {
+    let mut s: f32 = 0.0;
     for i in 0..n {
-        let v = g[OBS_SIZE + offset + i];
+        let v = g[(OBS_SIZE + offset + i) as usize];
         s += if v < 0.0 { -v } else { v };
     }
     s
