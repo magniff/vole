@@ -79,6 +79,8 @@ const BORROW_PARAMS: i64 = 48;
 
 const LOOP_SLICE: i64 = 1;
 const LOOP_LENGTH: i64 = 2;
+// (0.28.0) (-1, LOOP_NONEMPTY, s): slice binding s has an element here.
+const LOOP_NONEMPTY: i64 = 3;
 
 // Function f's body failed to check (check_function_recovering): its
 // effects are ⊤.
@@ -766,11 +768,7 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
             walk(pcx.nodes[n as usize].a, pcx);
         }
         NodeKind::Let => walk(pcx.nodes[n as usize].c, pcx),
-        NodeKind::If => {
-            walk(pcx.nodes[n as usize].a, pcx);
-            walk(pcx.nodes[n as usize].b, pcx);
-            walk(pcx.nodes[n as usize].c, pcx);
-        }
+        NodeKind::If => walk_if(n, pcx),
         NodeKind::Loop => {
             if (pcx.nodes[n as usize].p & NODE_IN_BOUNDS) == 0 {
                 local(n, EFF_DIVERGE, 0, pcx);
@@ -1075,6 +1073,12 @@ fn walk_index(n: i64, pcx: &mut Ctx<Comp>) {
         } else if pcx.nodes[index as usize].a == 0 && pcx.nodes[index as usize].b == 0 {
             // (`s[..]`: the whole)
             pcx.nodes[n as usize].p |= NODE_IN_BOUNDS;
+        } else if pcx.nodes[index as usize].b == 0
+            && pcx.nodes[pcx.nodes[index as usize].a as usize].kind == NodeKind::Int
+            && pcx.nodes[pcx.nodes[index as usize].a as usize].a <= 1
+            && pcx.nodes[pcx.nodes[index as usize].a as usize].a >= 0 && nonempty(base, pcx) {
+            // (`s[1..]` of a slice that is not empty, walk_if)
+            pcx.nodes[n as usize].p |= NODE_IN_BOUNDS;
         } else if (pcx.nodes[n as usize].p & NODE_IN_BOUNDS) == 0 {
             local(n, EFF_PANIC, 0, pcx);
         }
@@ -1085,7 +1089,9 @@ fn walk_index(n: i64, pcx: &mut Ctx<Comp>) {
         local(n, EFF_UNSAFE, 0, pcx);
         return;
     }
-    if (pcx.nodes[n as usize].p & NODE_IN_BOUNDS) != 0 || in_bounds(base, bt, index, pcx) {
+    if (pcx.nodes[n as usize].p & NODE_IN_BOUNDS) != 0 || in_bounds(base, bt, index, pcx)
+        || pcx.nodes[index as usize].kind == NodeKind::Int && pcx.nodes[index as usize].a == 0
+        && nonempty(base, pcx) {
         pcx.nodes[n as usize].p |= NODE_IN_BOUNDS;
         return;
     }
@@ -1127,6 +1133,71 @@ fn in_bounds(base: i64, bt: i64, index: i64, pcx: &Ctx<Comp>) -> bool {
     }
 }
 
+// (0.28.0) Call n as `s.NAME()` of std's slice method NAME (`len`,
+// `is_empty`), s an immutable local that is a slice: s's local, or -1.
+fn slice_call(n: i64, name: &[u8], pcx: &Ctx<Comp>) -> i64 {
+    if n <= 0 || pcx.nodes[n as usize].kind != NodeKind::Call || pcx.nodes[n as usize].x <= 0
+        || pcx.nodes[n as usize].count != 1 {
+        return -1;
+    }
+    let g = template_of(pcx.nodes[n as usize].x - 1, pcx);
+    if !within_std(pcx.fns[g as usize].module, pcx)
+        || sym_text(pcx.nodes[pcx.fns[g as usize].node as usize].a, pcx) != name {
+        return -1;
+    }
+    let mut s = child(n, 0, pcx);
+    while pcx.nodes[s as usize].kind == NodeKind::Unary {
+        s = pcx.nodes[s as usize].b;
+    }
+    if pcx.nodes[s as usize].kind != NodeKind::Ident || pcx.nodes[s as usize].res != Res::Local
+        || pcx.nodes[s as usize].y < 0 || pcx.locals[pcx.nodes[s as usize].y as usize].mutable {
+        return -1;
+    }
+    let st = pcx.nodes[s as usize].ty;
+    if st > 0 && pcx.types[st as usize].kind == TyKind::Slice { pcx.nodes[s as usize].y }
+    else { -1 }
+}
+
+// RULE: E2.1 (0.28.0) `if s.is_empty() { .. } else { .. }`, s an immutable
+// slice binding: in the else branch s has an element, so `s[0]` and
+// `s[1..]` are in bounds there (LOOP_NONEMPTY; std2's split_first, which
+// a slice's iterator is: iterating is no `panic`).
+fn walk_if(n: i64, pcx: &mut Ctx<Comp>) {
+    let cond = pcx.nodes[n as usize].a;
+    walk(cond, pcx);
+    walk(pcx.nodes[n as usize].b, pcx);
+    let mark = pcx.loops.count;
+    let s = slice_call(cond, "is_empty".as_bytes(), pcx);
+    if s >= 0 {
+        pcx.loops.push(-1);
+        pcx.loops.push(LOOP_NONEMPTY);
+        pcx.loops.push(s);
+    }
+    walk(pcx.nodes[n as usize].c, pcx);
+    pcx.loops.count = mark;
+}
+
+// Whether base is a slice binding known not to be empty here (walk_if).
+fn nonempty(base: i64, pcx: &Ctx<Comp>) -> bool {
+    if pcx.nodes[base as usize].kind != NodeKind::Ident
+        || pcx.nodes[base as usize].res != Res::Local {
+        return false;
+    }
+    // UNSAFE: LOOPS is a raw IntVec (base/comp.vl), as every table.
+    // SAFETY: k + 2 < count: triples, pushed by walk_for and walk_if.
+    unsafe {
+        let mut k = pcx.loops.count - 3;
+        while k >= 0 {
+            if (*pcx.loops.data.add((k + 1) as usize)) == LOOP_NONEMPTY
+                && (*pcx.loops.data.add((k + 2) as usize)) == pcx.nodes[base as usize].y {
+                return true;
+            }
+            k -= 3;
+        }
+    }
+    false
+}
+
 // `for p in a..b body` (counted): a in-bounds context for the body when
 // it is `for i in 0..s.len` or `for i in 0..N`.
 fn walk_for(n: i64, pcx: &mut Ctx<Comp>) {
@@ -1151,6 +1222,11 @@ fn walk_for(n: i64, pcx: &mut Ctx<Comp>) {
             pcx.loops.push(pcx.nodes[pattern as usize].x);
             pcx.loops.push(LOOP_LENGTH);
             pcx.loops.push(pcx.nodes[high as usize].a + inclusive as i64);
+        } else if !inclusive && slice_call(high, "len".as_bytes(), pcx) >= 0 {
+            // (0.28.0: the rust edition's `for i in 0..s.len()`)
+            pcx.loops.push(pcx.nodes[pattern as usize].x);
+            pcx.loops.push(LOOP_SLICE);
+            pcx.loops.push(slice_call(high, "len".as_bytes(), pcx));
         } else if !inclusive && pcx.nodes[high as usize].kind == NodeKind::FieldAccess
             && pcx.nodes[high as usize].b == pcx.len_sym {
             let s = pcx.nodes[high as usize].a;
@@ -1508,7 +1584,15 @@ fn signature_of(m: i64, pcx: &mut Ctx<Comp>) {
             }
             (*pcx.fx_inferred.add(m as usize)) = checked;
         }
-        let d = (*pcx.fx_decl_e.add(m as usize));
+        let mut d = (*pcx.fx_decl_e.add(m as usize));
+        // RULE: E3.1b (0.28.0: a chain with no list forbids and declares
+        // nothing: the signature is what the body does, within it; `query
+        // effects` of a #[no_alloc] sort prints `panic diverge`, not every
+        // effect but alloc)
+        if !crate::front::effects::check::has_list(pcx.fns[m as usize].effect_decl, pcx) {
+            d.bits &= i.bits;
+            d.allocs = if d.allocs < 0 { i.allocs } else { d.allocs & i.allocs };
+        }
         let hidden = EFF_RAW_PANIC | EFF_RAW_DIVERGE | EFF_RAW_GLOBAL | EFF_INTERIOR | EFF_UNSAFE;
         if track {
             (*pcx.fx_fixed.add(m as usize)) = effects_union(d, pf);
