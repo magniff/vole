@@ -381,9 +381,19 @@ kind `BK_MUT`, a two-phase autoref `&mut self` included) only if it is
   `mut r`); a deferred `let x;`'s first assignment is M7's, not this
   rule's;
 - `P.f`, `P[i]`, `P[k]` of an array, a variant's field: as `P`;
-- `*P` with `P: &mut T` (or an exclusive view `&mut [T]`): mutable
-  (it needs `P` uniquely reachable, which D2.5's loans check, not `P`
-  declared `mut`);
+- `*P` with `P: &mut T` (or an exclusive view `&mut [T]`): as `P`'s
+  own path, with the local allowed whether or not it is `mut`. (0.28.0:
+  0.27.2 to 0.27.8 said "mutable" here and stopped, so the path to the
+  `&mut` was never read: with `&self` and a field `v: &mut i64`,
+  `*self.v += 1` and `&mut *self.v` were accepted, and one `&G` gave
+  out any number of `&mut i64` to one value. rustc's `is_mutable`
+  recurses into the base of a `&mut` deref for exactly this: a `&mut`
+  is unique only if the way to it is. The walk now goes on past a
+  `&mut`; a `&T` or a shared view anywhere on the path makes the place
+  immutable (E0594 for a write, E0596 for a `&mut` borrow); when the
+  walk ends at the local, the place is mutable.) *Anchor:*
+  `places/borrowck/moves.vl: immutable_why`. *Cases:*
+  `rust_b_err_mut_behind_shared`, `rust_b_reborrow_result`;
 - `*P` with `P: &T` (or a shared view `[T]`, `&str`): **not** mutable;
 - `*P` with `P: *mut T`: mutable; with `P: *const T`: not (R1: what
   happens through it is `unsafe`'s, but rustc refuses the write to a
