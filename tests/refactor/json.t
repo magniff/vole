@@ -14,6 +14,7 @@ std::flt::Big::add	<std>:15411:8	method	fn add(&mut self, o: &Big)	effects: pani
 <std::time::Duration as Add>::add	<std>:25380:8	method	fn add(self, rhs: Duration) -> Duration	effects: panic diverge
 <std::time::Instant as Add>::add	<std>:25668:8	method	fn add(self, d: Duration) -> Instant	effects: panic diverge
 <std::time::SystemTime as Add>::add	<std>:25764:8	method	fn add(self, d: Duration) -> SystemTime	effects: panic diverge
+std::gpu::Unwritten::add	<std>:32833:8	method	fn add(&mut self, o: Unwritten, group: i64)	effects: panic
 ## (quotes and tabs escaped)
 $ query grep bad --json
 # main.vl

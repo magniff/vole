@@ -1,0 +1,822 @@
+// EDITION: rust
+// std::window::script (0.25.4): the scripted event loop (below).
+
+use crate::alloc::Allocator;
+use crate::fmt::Display;
+
+use super::{Button, Event, Key, Mouse, MouseAction, Scroll, Size, Text, WindowId};
+use super::keys::{ALT_L, CTRL_L, KeyCode, Logical, Mods, Named, SHIFT_L, SUPER_L};
+
+// ---- Windows: the scripted event loop (0.25.4) ----
+
+// std::window::script (0.25.4): the scripted event loop, for testing a
+// windowed program without a display. When the environment has
+// VOLE_WINDOW_SCRIPT, `App::new_in` opens no window server: the events
+// come from the script, in order, each Frame as soon as the program asks
+// for it, and a window's `raw_surface()` is null, which std::gpu takes
+// for `RawSurface::Headless` (frames offscreen, at the scripted size).
+// The program runs its own event loop, unchanged.
+//
+// The script is VOLE_WINDOW_SCRIPT's value, or the file it names after
+// an `@`; commands are separated by newlines or `;`, `#` starts a
+// comment. Coordinates are physical pixels from the content's top-left.
+//
+//   size 640x480 [2]           the window's size (and scale; default: the
+//                              WindowDesc's, scale 1), before any event
+//   frames N                   up to N Event::Frame, one for each
+//                              request_frame (none asked for: none sent)
+//   key K | keydown K | keyup K
+//                              a key: a character (`a`, `+`, `A` is
+//                              shift+a) or a name (space enter tab
+//                              backspace escape delete insert home end
+//                              pageup pagedown left right up down f1..f20),
+//                              after modifiers (shift+ ctrl+ alt+ cmd+);
+//                              `key` is a press and a release, and a
+//                              printable press is followed by its Text
+//   move X Y                   the pointer moves
+//   press [B] X Y | release [B] X Y | click [B] X Y
+//                              B is left (the default), right or middle;
+//                              a trailing shift, ctrl, alt or cmd holds it
+//   scroll DY [DX]             a wheel, in lines (positive: up)
+//   resize WxH                 Event::Resize to that size
+//   focus on|off               Event::Focus
+//   shot FILE.ppm              the next frame presented (std::gpu) is also
+//                              written to FILE, a PPM
+//   close | quit               Event::Close, Event::Quit
+//
+// When the script ends the program gets Close for each open window, then
+// Quit; a program that still waits for an event after that is stopped
+// (exit 1) with a line saying so.
+
+// What a Window reaches without its App (plain values; the main thread's).
+static mut ON: bool = false;
+static mut WIDTH: i64 = 0;
+static mut HEIGHT: i64 = 0;
+static mut SCALE: f64 = 1.0;
+// Bit n: window n asked for a frame (ids 1..63).
+static mut REQUESTS: u64 = 0;
+// Bit n: window n was closed.
+static mut CLOSED: u64 = 0;
+static mut FULLSCREEN: bool = false;
+static mut FOCUSED: bool = true;
+
+/// True when this process runs a scripted event loop (VOLE_WINDOW_SCRIPT).
+pub fn active() -> bool {
+    get_on()
+}
+
+pub fn request_frame(id: WindowId) {
+    if id.n >= 0 && id.n < 64 {
+        set_requests(get_requests() | (1u64 << id.n as u64));
+    }
+}
+
+/// The window was closed (or dropped): no event names it again.
+pub fn closed(id: WindowId) {
+    if id.n >= 0 && id.n < 64 {
+        set_closed(get_closed() | (1u64 << id.n as u64));
+        set_requests(get_requests() & ~(1u64 << id.n as u64));
+    }
+}
+
+fn open(n: i64) -> bool {
+    n >= 0 && n < 64 && (get_closed() & (1u64 << n as u64)) == 0
+}
+
+pub fn size() -> Size {
+    Size { w: get_width(), h: get_height(), scale: get_scale() }
+}
+
+pub fn set_fullscreen(on: bool) {
+    set_fullscreen_value(on);
+}
+
+pub fn is_fullscreen() -> bool {
+    get_fullscreen_value()
+}
+
+pub fn focused() -> bool {
+    get_focused()
+}
+
+enum Step<A: Allocator> {
+    Size(i64, i64, f64),
+    Frames(i64),
+    Key(KeyCode, Logical, Mods, bool, u32),
+    Mouse(MouseAction, Button, f64, f64, Mods),
+    Scroll(f64, f64),
+    Resize(i64, i64),
+    Focus(bool),
+    Shot(String<A>),
+    Close,
+    Quit,
+}
+
+/// The scripted backend: the parsed script and where it is.
+pub struct Script<A: Allocator> {
+    steps: Vec<Step<A>, A>,
+    at: i64,
+    q: Vec<Event, A>,
+    head: i64,
+    frames: i64,
+    wins: Vec<i64, A>,
+    // 0: the script runs; 1: Close sent; 2: Quit sent
+    ended: i64,
+    sized: bool,
+}
+
+impl Script<Gpa> {
+    /// The script of VOLE_WINDOW_SCRIPT, if the variable is set; a script
+    /// that does not parse stops the program (exit 2) with its line.
+    pub fn from_env(gpa: Gpa) -> Option<Script<Gpa>> {
+        let raw = match crate::env::var_os_in("VOLE_WINDOW_SCRIPT", gpa) {
+            Some(v) => v,
+            None => return None,
+        };
+        let mut text: Vec<u8, Gpa> = Vec::new_in(gpa);
+        if raw.len() as i64 > 0 && raw[0] == b'@' {
+            match crate::fs::read_in(
+                str::from_utf8(&raw.as_slice()[1..raw.len() as i64 as usize]).unwrap(), gpa) {
+                Ok(bytes) => text.extend_from_slice(bytes.as_slice()),
+                Err(_) => {
+                    let name = &raw.as_slice()[1..raw.len() as i64 as usize];
+                    fail(0i64, { let name = str::from_utf8(name).unwrap(); format_args("cannot read the script file '{name}'") }, b"VOLE_WINDOW_SCRIPT=@FILE names a file, relative to the program's directory");
+                }
+            }
+        } else {
+            text.extend_from_slice(raw.as_slice());
+        }
+        let s = match str::from_utf8(text.as_slice()) {
+            Ok(s) => s,
+            Err(_) => fail(0i64, "the script is not UTF-8", b"write it in UTF-8"),
+        };
+        let mut steps: Vec<Step<Gpa>, Gpa> = Vec::new_in(gpa);
+        let mut line: i64 = 0;
+        for l in s.lines() {
+            line += 1;
+            let code = match l.split_once('#') {
+                Some((before, _)) => before,
+                None => l,
+            };
+            for cmd in code.split(b';' as char) {
+                let c = cmd.trim();
+                if c.len() as i64 > 0 {
+                    steps.push(command(c, line, gpa));
+                }
+            }
+        }
+        set_on(true);
+        set_width(0);
+        set_height(0);
+        set_scale(1.0);
+        set_requests(0);
+        set_closed(0);
+        Some(Script {
+            steps: steps, at: 0, q: Vec::new_in(gpa), head: 0, frames: 0,
+            wins: Vec::new_in(gpa), ended: 0, sized: false,
+        })
+    }
+
+    /// A window: its size is the script's `size`, or desc's at scale 1.
+    pub fn open(&mut self, w: i64, h: i64, id: WindowId) {
+        if !self.sized {
+            // a leading `size` sets it before the first window
+            if self.at < self.steps.len() as i64 {
+                match &self.steps[self.at as usize] {
+                    Step::Size(sw, sh, sc) => {
+                        set_width(*sw);
+                        set_height(*sh);
+                        set_scale(*sc);
+                        self.at += 1;
+                    }
+                    _ => {
+                        set_width(w);
+                        set_height(h);
+                        set_scale(1.0);
+                    }
+                }
+            } else {
+                set_width(w);
+                set_height(h);
+                set_scale(1.0);
+            }
+            self.sized = true;
+        }
+        self.wins.push(id.n);
+        self.q.push(Event::Resize(id, size()));
+    }
+
+    // The window events go to: the last one opened and not closed.
+    fn win(&self) -> WindowId {
+        let mut i = self.wins.len() as i64 - 1;
+        while i >= 0 {
+            if open(self.wins[i as usize]) {
+                return WindowId { n: self.wins[i as usize] };
+            }
+            i -= 1;
+        }
+        WindowId { n: 0 }
+    }
+
+    // A frame for a window that asked for one, if any did.
+    fn frame(&mut self) -> Option<Event> {
+        for i in 0..self.wins.len() as i64 {
+            let n = self.wins[i as usize];
+            if open(n) && n >= 0 && n < 64 && (get_requests() & (1u64 << n as u64)) != 0 {
+                set_requests(get_requests() & ~(1u64 << n as u64));
+                return Some(Event::Frame(WindowId { n: n }));
+            }
+        }
+        None
+    }
+
+    /// The next event: the queued ones, then the script's; `ms` is
+    /// ignored (nothing waits on a clock).
+    pub fn next_event(&mut self, ms: i64) -> Option<Event> {
+        if self.head < self.q.len() as i64 {
+            let e = self.q[self.head as usize];
+            self.head += 1;
+            if self.head == self.q.len() as i64 {
+                self.q.clear();
+                self.head = 0;
+            }
+            return Some(e);
+        }
+        loop {
+            if self.frames > 0 {
+                match self.frame() {
+                    Some(e) => {
+                        self.frames -= 1;
+                        return Some(e);
+                    }
+                    // nothing asked for a frame: the program is idle
+                    None => self.frames = 0,
+                }
+            }
+            if self.at >= self.steps.len() as i64 {
+                return self.end();
+            }
+            let i = self.at;
+            self.at += 1;
+            let w = self.win();
+            match &self.steps[i as usize] {
+                Step::Size(_, _, _) => fail(0i64, "'size' comes first, before any other command",
+                    b"move it to the start of the script"),
+                Step::Frames(n) => self.frames = *n,
+                Step::Key(code, key, mods, pressed, ch) => {
+                    let text = *pressed && *ch != 0 && !mods.ctrl() && !mods.sup();
+                    if text {
+                        self.q.push(Event::Text(text_of(w, *ch)));
+                    }
+                    return Some(Event::Key(Key {
+                        win: w, code: *code, key: *key, mods: *mods, pressed: *pressed,
+                        repeat: false, ime: false, text_follows: text,
+                    }));
+                }
+                Step::Mouse(action, button, x, y, m) => {
+                    let mut mods = *m;
+                    if (mods.bits & CLICK) != 0 {
+                        mods = Mods { bits: mods.bits & ~CLICK };
+                        self.q.push(Event::Mouse(Mouse {
+                            win: w, action: MouseAction::Release, button: *button, x: *x, y: *y,
+                            mods: mods, clicks: 0,
+                        }));
+                    }
+                    let clicks = match action {
+                        MouseAction::Press => 1,
+                        _ => 0,
+                    };
+                    return Some(Event::Mouse(Mouse {
+                        win: w, action: *action, button: *button, x: *x, y: *y, mods: mods,
+                        clicks: clicks,
+                    }));
+                }
+                Step::Scroll(dy, dx) => {
+                    return Some(Event::Scroll(Scroll {
+                        win: w, dx: *dx, dy: *dy, precise: false, mods: Mods::none(),
+                    }));
+                }
+                Step::Resize(rw, rh) => {
+                    set_width(*rw);
+                    set_height(*rh);
+                    return Some(Event::Resize(w, size()));
+                }
+                Step::Focus(on) => {
+                    set_focused(*on);
+                    return Some(Event::Focus(w, *on));
+                }
+                Step::Shot(path) => {
+                    crate::capture::capture_next_frame(path.as_str());
+                }
+                Step::Close => return Some(Event::Close(w)),
+                Step::Quit => return Some(Event::Quit),
+            }
+        }
+    }
+
+    // The script is over: Close for each open window, Quit, then stop.
+    fn end(&mut self) -> Option<Event> {
+        if crate::capture::capture_pending() {
+            eprintln("window.script: the script ended with a 'shot' no frame was presented after: put 'frames 1' after it | help: a shot is the next frame presented (Frame::present)");
+            crate::capture::capture_cancel();
+        }
+        if self.ended == 0 {
+            self.ended = 1;
+            for i in 0..self.wins.len() as i64 {
+                if open(self.wins[i as usize]) {
+                    self.q.push(Event::Close(WindowId { n: self.wins[i as usize] }));
+                }
+            }
+            self.q.push(Event::Quit);
+            return self.next_event(0);
+        }
+        eprintln("window.script: the script has ended and the program waits for another event (it was sent Close and Quit) | help: end the event loop on Event::Close or Event::Quit, or end the script with the key that quits");
+        crate::process::exit(1i32)
+    }
+}
+
+fn text_of(w: WindowId, ch: u32) -> Text {
+    let mut t = Text { win: w, len: 0, bytes: [0u8; 30] };
+    let mut n: i64 = 0;
+    if ch < 0x80 {
+        t.bytes[0] = ch as u8;
+        n = 1;
+    } else if ch < 0x800 {
+        t.bytes[0] = (0xC0 | (ch >> 6)) as u8;
+        t.bytes[1] = (0x80 | (ch & 0x3F)) as u8;
+        n = 2;
+    } else if ch < 0x10000 {
+        t.bytes[0] = (0xE0 | (ch >> 12)) as u8;
+        t.bytes[1] = (0x80 | ((ch >> 6) & 0x3F)) as u8;
+        t.bytes[2] = (0x80 | (ch & 0x3F)) as u8;
+        n = 3;
+    } else {
+        t.bytes[0] = (0xF0 | (ch >> 18)) as u8;
+        t.bytes[1] = (0x80 | ((ch >> 12) & 0x3F)) as u8;
+        t.bytes[2] = (0x80 | ((ch >> 6) & 0x3F)) as u8;
+        t.bytes[3] = (0x80 | (ch & 0x3F)) as u8;
+        n = 4;
+    }
+    t.len = n as u8;
+    t
+}
+
+// Stops the program over the script: line 0 is the script as a whole.
+fn fail<T: Display>(line: i64, what: T, help: &[u8]) -> ! {
+    if line > 0 {
+        eprintln("window.script: VOLE_WINDOW_SCRIPT line {line}: {what} | help: {help}",
+            help = str::from_utf8(help).unwrap());
+    } else {
+        eprintln("window.script: VOLE_WINDOW_SCRIPT: {what} | help: {help}",
+            help = str::from_utf8(help).unwrap());
+    }
+    crate::process::exit(2i32)
+}
+
+fn num(s: &str, line: i64, what: &[u8]) -> f64 {
+    match s.parse::<f64>() {
+        Ok(v) => v,
+        Err(_) => fail(line,
+            { let what = str::from_utf8(what).unwrap();
+                format_args("'{s}' is not a number ({what})") }, b"write a number: 120, 64.5"),
+    }
+}
+
+fn whole(s: &str, line: i64, what: &[u8]) -> i64 {
+    match s.parse::<i64>() {
+        Ok(v) => v,
+        Err(_) => fail(line,
+            { let what = str::from_utf8(what).unwrap();
+                format_args("'{s}' is not a whole number ({what})") }, b"write a whole number: 3"),
+    }
+}
+
+fn dims(s: &str, line: i64) -> (i64, i64) {
+    match s.split_once('x') {
+        Some((a, b)) => {
+            let w = whole(a, line, b"a width");
+            let h = whole(b, line, b"a height");
+            if w < 1 || h < 1 {
+                fail(line, format_args("'{s}' is not a size"), b"write WxH, at least 1x1: 640x480");
+            }
+            (w, h)
+        }
+        None => fail(line, format_args("'{s}' is not a size"), b"write WxH: 640x480"),
+    }
+}
+
+fn mod_bit(s: &str) -> u32 {
+    if s == "shift" { return SHIFT_L; }
+    if s == "ctrl" { return CTRL_L; }
+    if s == "alt" || s == "option" { return ALT_L; }
+    if s == "cmd" || s == "super" { return SUPER_L; }
+    0
+}
+
+fn button_of(s: &str) -> Option<Button> {
+    if s == "left" { return Some(Button::Left); }
+    if s == "right" { return Some(Button::Right); }
+    if s == "middle" { return Some(Button::Middle); }
+    None
+}
+
+fn command(c: &str, line: i64, gpa: Gpa) -> Step<Gpa> {
+    let mut words: Vec<&str, Gpa> = Vec::new_in(gpa);
+    for w in c.split_whitespace() {
+        words.push(w);
+    }
+    let op = words[0];
+    let n = words.len() as i64;
+    if op == "size" {
+        if n < 2
+            || n > 3 { fail(line, "'size' takes WxH and an optional scale", b"size 640x480 2"); }
+        let (w, h) = dims(words[1], line);
+        let scale = if n == 3 { num(words[2], line, b"a scale") } else { 1.0 };
+        if scale <= 0.0 { fail(line, "the scale is positive", b"size 640x480 2"); }
+        return Step::Size(w, h, scale);
+    }
+    if op == "frames" {
+        if n != 2 { fail(line, "'frames' takes a count", b"frames 3"); }
+        return Step::Frames(whole(words[1], line, b"a count of frames"));
+    }
+    if op == "key" || op == "keydown" || op == "keyup" {
+        if n
+            != 2 {
+            fail(line, format_args("'{op}' takes one key"),
+                b"key space, key shift+r, keydown left");
+        }
+        let step = key_step(words[1], op != "keyup", line);
+        return step;
+    }
+    if op == "move" || op == "press" || op == "release" || op == "click" {
+        let mut i: i64 = 1;
+        let mut button = Button::Left;
+        if n > 1 {
+            match button_of(words[1]) {
+                Some(b) => {
+                    button = b;
+                    i = 2;
+                }
+                None => {}
+            }
+        }
+        if op == "move" { button = Button::None; }
+        if n < i + 2 { fail(line, format_args("'{op}' takes X Y"), b"press left 120 80"); }
+        let x = num(words[i as usize], line, b"X");
+        let y = num(words[(i + 1) as usize], line, b"Y");
+        let mut bits: u32 = 0;
+        for k in i + 2..n {
+            let b = mod_bit(words[k as usize]);
+            if b == 0 {
+                fail(line, format_args("'{}' is not a modifier", words[k as usize]),
+                    b"shift, ctrl, alt or cmd");
+            }
+            bits = bits | b;
+        }
+        let mods = Mods { bits: bits };
+        if op == "move" { return Step::Mouse(MouseAction::Move, button, x, y, mods); }
+        if op == "press" { return Step::Mouse(MouseAction::Press, button, x, y, mods); }
+        if op == "release" { return Step::Mouse(MouseAction::Release, button, x, y, mods); }
+        // click: a press now, its release right after (the caller queues it)
+        return Step::Mouse(MouseAction::Press, button, x, y, Mods { bits: bits | CLICK });
+    }
+    if op == "scroll" {
+        if n < 2 || n > 3 { fail(line, "'scroll' takes DY and an optional DX", b"scroll 3"); }
+        let dy = num(words[1], line, b"DY");
+        let dx = if n == 3 { num(words[2], line, b"DX") } else { 0.0 };
+        return Step::Scroll(dy, dx);
+    }
+    if op == "resize" {
+        if n != 2 { fail(line, "'resize' takes WxH", b"resize 800x600"); }
+        let (w, h) = dims(words[1], line);
+        return Step::Resize(w, h);
+    }
+    if op == "focus" {
+        if n != 2 || (words[1] != "on" && words[1] != "off") {
+            fail(line, "'focus' takes on or off", b"focus off");
+        }
+        return Step::Focus(words[1] == "on");
+    }
+    if op == "shot" {
+        if n != 2 { fail(line, "'shot' takes a file", b"shot frame.ppm"); }
+        let mut path: String<Gpa> = String::new_in(gpa);
+        path.push_str(words[1]);
+        return Step::Shot(path);
+    }
+    if op == "close" && n == 1 { return Step::Close; }
+    if op == "quit" && n == 1 { return Step::Quit; }
+    fail(line, format_args("unknown command '{c}'"),
+        b"the commands: size, frames, key, keydown, keyup, move, press, release, click, scroll, resize, focus, shot, close, quit")
+}
+
+// A bit no modifier uses: marks a `click`'s press (its release follows).
+const CLICK: u32 = 1u32 << 30;
+
+fn key_step(spec: &str, pressed: bool, line: i64) -> Step<Gpa> {
+    let mut bits: u32 = 0;
+    let mut rest = spec;
+    loop {
+        match rest.split_once('+') {
+            Some((m, after)) => {
+                // `+` alone, or a trailing `+` (ctrl++), is the key itself
+                if m.len() as i64 == 0 || after.len() as i64 == 0 { break; }
+                let b = mod_bit(m);
+                if b == 0 {
+                    fail(line, format_args("'{m}' is not a modifier"),
+                        b"shift+, ctrl+, alt+ or cmd+ before the key");
+                }
+                bits = bits | b;
+                rest = after;
+            }
+            None => break,
+        }
+    }
+    if rest.len() as i64 > 1 && rest.ends_with("+")
+        && mod_bit(rest[0..(rest.len() as i64 - 1) as usize]) != 0 {
+        bits = bits | mod_bit(rest[0..(rest.len() as i64 - 1) as usize]);
+        rest = "+";
+    }
+    match named(rest) {
+        Some((code, key, ch)) => Step::Key(code, key, Mods { bits: bits }, pressed, ch),
+        None => {
+            let mut it = rest.chars().map(|c| c as u32);
+            let c = match it.next() {
+                Some(c) => c,
+                None => fail(line, "a key is missing", b"key a"),
+            };
+            if it.next().is_some() {
+                fail(line, format_args("unknown key '{rest}'"),
+                    b"a character, or space enter tab backspace escape delete insert home end pageup pagedown left right up down f1..f20");
+            }
+            if c >= b'A' as u32 && c <= b'Z' as u32 {
+                bits = bits | SHIFT_L;
+            }
+            Step::Key(char_code(c), Logical::Char(c), Mods { bits: bits }, pressed, c)
+        }
+    }
+}
+
+fn named(s: &str) -> Option<(KeyCode, Logical, u32)> {
+    if s == "space" { return Some((KeyCode::Space, Logical::Char(b' ' as u32), b' ' as u32)); }
+    if s == "enter"
+        || s == "return" { return Some((KeyCode::Enter, Logical::Named(Named::Enter), 0)); }
+    if s == "tab" { return Some((KeyCode::Tab, Logical::Named(Named::Tab), 0)); }
+    if s == "backspace" { return Some((KeyCode::Backspace, Logical::Named(Named::Backspace), 0)); }
+    if s == "escape"
+        || s == "esc" { return Some((KeyCode::Escape, Logical::Named(Named::Escape), 0)); }
+    if s == "delete" { return Some((KeyCode::Delete, Logical::Named(Named::Delete), 0)); }
+    if s == "insert" { return Some((KeyCode::Insert, Logical::Named(Named::Insert), 0)); }
+    if s == "home" { return Some((KeyCode::Home, Logical::Named(Named::Home), 0)); }
+    if s == "end" { return Some((KeyCode::End, Logical::Named(Named::End), 0)); }
+    if s == "pageup" { return Some((KeyCode::PageUp, Logical::Named(Named::PageUp), 0)); }
+    if s == "pagedown" { return Some((KeyCode::PageDown, Logical::Named(Named::PageDown), 0)); }
+    if s == "left" { return Some((KeyCode::ArrowLeft, Logical::Named(Named::ArrowLeft), 0)); }
+    if s == "right" { return Some((KeyCode::ArrowRight, Logical::Named(Named::ArrowRight), 0)); }
+    if s == "up" { return Some((KeyCode::ArrowUp, Logical::Named(Named::ArrowUp), 0)); }
+    if s == "down" { return Some((KeyCode::ArrowDown, Logical::Named(Named::ArrowDown), 0)); }
+    if s.len() as i64 >= 2 && s.len() as i64 <= 3 && s.starts_with("f") {
+        match s[1..].parse::<i64>() {
+            Ok(n) => {
+                if n >= 1 && n <= 20 {
+                    return Some((f_code(n), Logical::F(n), 0));
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    None
+}
+
+fn f_code(n: i64) -> KeyCode {
+    match n {
+        1 => KeyCode::F1,
+        2 => KeyCode::F2,
+        3 => KeyCode::F3,
+        4 => KeyCode::F4,
+        5 => KeyCode::F5,
+        6 => KeyCode::F6,
+        7 => KeyCode::F7,
+        8 => KeyCode::F8,
+        9 => KeyCode::F9,
+        10 => KeyCode::F10,
+        11 => KeyCode::F11,
+        12 => KeyCode::F12,
+        13 => KeyCode::F13,
+        14 => KeyCode::F14,
+        15 => KeyCode::F15,
+        16 => KeyCode::F16,
+        17 => KeyCode::F17,
+        18 => KeyCode::F18,
+        19 => KeyCode::F19,
+        _ => KeyCode::F20,
+    }
+}
+
+// The physical key of a character on a US (ANSI) keyboard.
+fn char_code(c: u32) -> KeyCode {
+    let l = if c >= b'A' as u32 && c <= b'Z' as u32 { c + 32 } else { c };
+    // each key's character, then its shifted one
+    match l {
+        0x61 => KeyCode::KeyA,
+        0x62 => KeyCode::KeyB,
+        0x63 => KeyCode::KeyC,
+        0x64 => KeyCode::KeyD,
+        0x65 => KeyCode::KeyE,
+        0x66 => KeyCode::KeyF,
+        0x67 => KeyCode::KeyG,
+        0x68 => KeyCode::KeyH,
+        0x69 => KeyCode::KeyI,
+        0x6A => KeyCode::KeyJ,
+        0x6B => KeyCode::KeyK,
+        0x6C => KeyCode::KeyL,
+        0x6D => KeyCode::KeyM,
+        0x6E => KeyCode::KeyN,
+        0x6F => KeyCode::KeyO,
+        0x70 => KeyCode::KeyP,
+        0x71 => KeyCode::KeyQ,
+        0x72 => KeyCode::KeyR,
+        0x73 => KeyCode::KeyS,
+        0x74 => KeyCode::KeyT,
+        0x75 => KeyCode::KeyU,
+        0x76 => KeyCode::KeyV,
+        0x77 => KeyCode::KeyW,
+        0x78 => KeyCode::KeyX,
+        0x79 => KeyCode::KeyY,
+        0x7A => KeyCode::KeyZ,
+        0x30 | 0x29 => KeyCode::Digit0,
+        0x31 | 0x21 => KeyCode::Digit1,
+        0x32 | 0x40 => KeyCode::Digit2,
+        0x33 | 0x23 => KeyCode::Digit3,
+        0x34 | 0x24 => KeyCode::Digit4,
+        0x35 | 0x25 => KeyCode::Digit5,
+        0x36 | 0x5E => KeyCode::Digit6,
+        0x37 | 0x26 => KeyCode::Digit7,
+        0x38 | 0x2A => KeyCode::Digit8,
+        0x39 | 0x28 => KeyCode::Digit9,
+        0x2D | 0x5F => KeyCode::Minus,
+        0x3D | 0x2B => KeyCode::Equal,
+        0x5B | 0x7B => KeyCode::BracketLeft,
+        0x5D | 0x7D => KeyCode::BracketRight,
+        0x5C | 0x7C => KeyCode::Backslash,
+        0x3B | 0x3A => KeyCode::Semicolon,
+        0x27 | 0x22 => KeyCode::Quote,
+        0x60 | 0x7E => KeyCode::Backquote,
+        0x2C | 0x3C => KeyCode::Comma,
+        0x2E | 0x3E => KeyCode::Period,
+        0x2F | 0x3F => KeyCode::Slash,
+        0x20 => KeyCode::Space,
+        _ => KeyCode::Unidentified,
+    }
+}
+
+// (0.28.0) ON's accessors: every use of it is one of them.
+fn get_on() -> bool {
+    // UNSAFE: a static mut read.
+    // SAFETY: a plain value of the scripted event loop, which the main thread alone reads and
+    // writes (an App and its Windows are the main thread's); read or written whole, no
+    // reference to it is kept.
+    unsafe { ON }
+}
+
+fn set_on(v: bool) {
+    // UNSAFE: a static mut written.
+    // SAFETY: a plain value of the scripted event loop, which the main thread alone reads and
+    // writes (an App and its Windows are the main thread's); read or written whole, no
+    // reference to it is kept.
+    unsafe {
+        ON = v;
+    }
+}
+
+// (0.28.0) WIDTH's accessors: every use of it is one of them.
+fn get_width() -> i64 {
+    // UNSAFE: a static mut read.
+    // SAFETY: a plain value of the scripted event loop, which the main thread alone reads and
+    // writes (an App and its Windows are the main thread's); read or written whole, no
+    // reference to it is kept.
+    unsafe { WIDTH }
+}
+
+fn set_width(v: i64) {
+    // UNSAFE: a static mut written.
+    // SAFETY: a plain value of the scripted event loop, which the main thread alone reads and
+    // writes (an App and its Windows are the main thread's); read or written whole, no
+    // reference to it is kept.
+    unsafe {
+        WIDTH = v;
+    }
+}
+
+// (0.28.0) HEIGHT's accessors: every use of it is one of them.
+fn get_height() -> i64 {
+    // UNSAFE: a static mut read.
+    // SAFETY: a plain value of the scripted event loop, which the main thread alone reads and
+    // writes (an App and its Windows are the main thread's); read or written whole, no
+    // reference to it is kept.
+    unsafe { HEIGHT }
+}
+
+fn set_height(v: i64) {
+    // UNSAFE: a static mut written.
+    // SAFETY: a plain value of the scripted event loop, which the main thread alone reads and
+    // writes (an App and its Windows are the main thread's); read or written whole, no
+    // reference to it is kept.
+    unsafe {
+        HEIGHT = v;
+    }
+}
+
+// (0.28.0) SCALE's accessors: every use of it is one of them.
+fn get_scale() -> f64 {
+    // UNSAFE: a static mut read.
+    // SAFETY: a plain value of the scripted event loop, which the main thread alone reads and
+    // writes (an App and its Windows are the main thread's); read or written whole, no
+    // reference to it is kept.
+    unsafe { SCALE }
+}
+
+fn set_scale(v: f64) {
+    // UNSAFE: a static mut written.
+    // SAFETY: a plain value of the scripted event loop, which the main thread alone reads and
+    // writes (an App and its Windows are the main thread's); read or written whole, no
+    // reference to it is kept.
+    unsafe {
+        SCALE = v;
+    }
+}
+
+// (0.28.0) REQUESTS's accessors: every use of it is one of them.
+fn get_requests() -> u64 {
+    // UNSAFE: a static mut read.
+    // SAFETY: a plain value of the scripted event loop, which the main thread alone reads and
+    // writes (an App and its Windows are the main thread's); read or written whole, no
+    // reference to it is kept.
+    unsafe { REQUESTS }
+}
+
+fn set_requests(v: u64) {
+    // UNSAFE: a static mut written.
+    // SAFETY: a plain value of the scripted event loop, which the main thread alone reads and
+    // writes (an App and its Windows are the main thread's); read or written whole, no
+    // reference to it is kept.
+    unsafe {
+        REQUESTS = v;
+    }
+}
+
+// (0.28.0) CLOSED's accessors: every use of it is one of them.
+fn get_closed() -> u64 {
+    // UNSAFE: a static mut read.
+    // SAFETY: a plain value of the scripted event loop, which the main thread alone reads and
+    // writes (an App and its Windows are the main thread's); read or written whole, no
+    // reference to it is kept.
+    unsafe { CLOSED }
+}
+
+fn set_closed(v: u64) {
+    // UNSAFE: a static mut written.
+    // SAFETY: a plain value of the scripted event loop, which the main thread alone reads and
+    // writes (an App and its Windows are the main thread's); read or written whole, no
+    // reference to it is kept.
+    unsafe {
+        CLOSED = v;
+    }
+}
+
+// (0.28.0) FULLSCREEN's accessors: every use of it is one of them.
+fn get_fullscreen_value() -> bool {
+    // UNSAFE: a static mut read.
+    // SAFETY: a plain value of the scripted event loop, which the main thread alone reads and
+    // writes (an App and its Windows are the main thread's); read or written whole, no
+    // reference to it is kept.
+    unsafe { FULLSCREEN }
+}
+
+fn set_fullscreen_value(v: bool) {
+    // UNSAFE: a static mut written.
+    // SAFETY: a plain value of the scripted event loop, which the main thread alone reads and
+    // writes (an App and its Windows are the main thread's); read or written whole, no
+    // reference to it is kept.
+    unsafe {
+        FULLSCREEN = v;
+    }
+}
+
+// (0.28.0) FOCUSED's accessors: every use of it is one of them.
+fn get_focused() -> bool {
+    // UNSAFE: a static mut read.
+    // SAFETY: a plain value of the scripted event loop, which the main thread alone reads and
+    // writes (an App and its Windows are the main thread's); read or written whole, no
+    // reference to it is kept.
+    unsafe { FOCUSED }
+}
+
+fn set_focused(v: bool) {
+    // UNSAFE: a static mut written.
+    // SAFETY: a plain value of the scripted event loop, which the main thread alone reads and
+    // writes (an App and its Windows are the main thread's); read or written whole, no
+    // reference to it is kept.
+    unsafe {
+        FOCUSED = v;
+    }
+}
