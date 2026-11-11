@@ -570,7 +570,7 @@ When the default message is all you need, `main` can return the
 `Result` itself. Then an `Err` prints `Error: ` and the error's debug
 form, and the program exits with status 1:
 
-```vole mvs
+```vole
 use std::fs;
 use std::io;
 
@@ -599,12 +599,12 @@ a `BufWriter`, which read and write in large blocks:
 use std::fs;
 use std::io;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter};
 
-fn run(gpa: Gpa) -> io::Result<()> {
+fn main(gpa: Gpa) -> io::Result<()> {
     fs::write("notes.txt", "first line\n")?;
     let mut notes = OpenOptions::new().append(true).open("notes.txt")?;
-    notes.write_all(b"second line\n")?;
+    writeln(&mut notes, "second line")?;
     {
         let mut w = BufWriter::new(File::create("squares.txt")?);
         for i in 1..4 {
@@ -620,10 +620,6 @@ fn run(gpa: Gpa) -> io::Result<()> {
     print("{notes}");
     Ok(())
 }
-
-fn main(gpa: Gpa) {
-    run(gpa).unwrap();
-}
 ```
 
 ```out
@@ -635,18 +631,17 @@ second line
 ```
 
 `fs::write` replaces a file's contents. To add to them, open the file
-with `OpenOptions`, which says how (`append(true)`), and write bytes
-with `write_all`. `File::create` makes a file (or empties one that
-exists), and `writeln(&mut w, ...)` writes a formatted line to the
-writer; the `&mut` is there because writing changes it. The writer
+with `OpenOptions`, which says how (`append(true)`). `File::create`
+makes a file (or empties one that exists), and `writeln(&mut w, ...)`
+writes a formatted line to a file or a writer; the `&mut` is there
+because writing changes it. The writer
 lives in a block of its own: at the end of the block it is dropped,
 which writes out what's left in its buffer and closes the file, before
 we open the file again to read it. `lines_in` gives the lines one at a
 time, each a `Result`, because reading can fail halfway through.
 
-The two `use std::io::{...}` names `BufRead` and `Write` are traits:
-`lines_in` and `write_all` are their methods, and a trait's methods can
-be called where the trait is in scope.
+Of the `use std::io::{...}` names, `BufRead` is a trait (chapter 9):
+`lines_in` is one of its methods.
 
 ### Directories
 
@@ -656,7 +651,7 @@ be called where the trait is in scope.
 use std::fs;
 use std::io;
 
-fn run(gpa: Gpa) -> io::Result<()> {
+fn main(gpa: Gpa) -> io::Result<()> {
     let mut names: Vec<String<Gpa>, Gpa> = Vec::new_in(gpa);
     for entry in fs::read_dir(".")? {
         let entry = entry?;
@@ -670,10 +665,6 @@ fn run(gpa: Gpa) -> io::Result<()> {
         println("{n}");
     }
     Ok(())
-}
-
-fn main(gpa: Gpa) {
-    run(gpa).unwrap();
 }
 ```
 
@@ -689,8 +680,8 @@ b.txt
 A directory's entries come in whatever order the file system keeps
 them, so we sort the names. `file_name()` gives the name as a `&str`
 borrowed from the entry, so to keep it past the loop's turn we copy it
-into a `String`. A path is plain text in vole for now: there is no
-`Path` type yet.
+into a `String`. A path is plain text here; `std::path` has `Path` and
+`PathBuf` for taking paths apart and joining them.
 
 ## Running other programs
 

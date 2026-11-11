@@ -83,7 +83,7 @@ fn count_iter(s: &[u8], b: u8) -> usize {
 
 // Runs f on s five times; prints its result and the fastest time.
 fn time_it(name: &str, f: fn(&[u8], u8) -> usize, s: &[u8]) {
-    let mut best = Duration::from_secs(3600); // longer than any run
+    let mut best = Duration::MAX;
     let mut result = 0;
     for _ in 0..5 {
         let start = Instant::now();
@@ -467,37 +467,37 @@ processors that have it (the first `try:` line), or check at run time
 and fall back to portable code. The second is what makes one program
 work everywhere:
 
-```vole crc.vl mvs
+```vole crc.vl
 use std::arch::detect;
 use std::arch::aarch64::__crc32cb;
 
 // CRC-32C of s, a byte at a time, by the CPU's crc instruction.
-fn crc32c_hw(s: [u8]) -> u32 {
-    var c: u32 = 0xffffffff;
-    for b in s {
+fn crc32c_hw(s: &[u8]) -> u32 {
+    let mut c: u32 = 0xffffffff;
+    for &b in s {
         c = __crc32cb(c, b);
     }
-    ~c
+    !c
 }
 
 // The same, bit by bit: for CPUs without crc.
-fn crc32c_portable(s: [u8]) -> u32 {
-    var c: u32 = 0xffffffff;
-    for b in s {
+fn crc32c_portable(s: &[u8]) -> u32 {
+    let mut c: u32 = 0xffffffff;
+    for &b in s {
         c ^= b as u32;
         for _ in 0..8 {
             c = if (c & 1) != 0 { (c >> 1) ^ 0x82f63b78 } else { c >> 1 };
         }
     }
-    ~c
+    !c
 }
 
-fn crc32c(s: [u8]) -> u32 {
+fn crc32c(s: &[u8]) -> u32 {
     if detect("crc") { crc32c_hw(s) } else { crc32c_portable(s) }
 }
 
 fn main() {
-    println("{:08x} (crc: {})", crc32c("123456789"), detect("crc"));
+    println("{:08x} (crc: {})", crc32c(b"123456789"), detect("crc"));
 }
 ```
 
@@ -507,7 +507,7 @@ there the feature is known. To test the fallback on a machine that has
 the feature, the `VOLE_ARCH_DISABLE` environment variable makes
 `detect` answer `false`:
 
-```console mvs
+```console
 $ volec -C target-cpu=generic crc.vl -o crc
 ok: built crc
 $ ./crc

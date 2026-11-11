@@ -699,9 +699,10 @@ true false true
 includes 75 and stops before 95, like `75..95`.
 
 `HashSet` and `BTreeMap` aren't in the prelude, so they need a `use`
-line. Two more containers are in the prelude: `BinaryHeap`, a *priority queue*, where
-you push values in any order and `pop` always gives back the largest
-one left, and `MinHeap`, which gives back the smallest.
+line. So do two more containers in `std::collections`: `BinaryHeap`, a
+*priority queue*, where you push values in any order and `pop` always
+gives back the largest one left, and `MinHeap`, which gives back the
+smallest.
 
 ## Counting the words
 
