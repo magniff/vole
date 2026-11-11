@@ -9,14 +9,16 @@
 ## header (alloc.default: `impl<T, A: Allocator> Stack<T, A>`), then its own
 ## `Stack<T>` inside it, written with the impl's `A`; a turbofish, `Vec::<i64>`.
 ## Then the codes' explanations (alloc.safe_impl, alloc.static, alloc.field, alloc.last: their tests/run/err_alloc_* cases).
+## Rust edition (0.28.0) gaps this records: `HashMap<K, V>` is an arity error, not
+## alloc.default (std's HashMap<K, V, A, S>); `Stack<T>`'s `Vec<T>` field is not flagged; a
+## `collect()` is a type error (the fix still writes collect_in).
 $ check
-main.vl:7:25: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-main.vl:3:13: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
-main.vl:7:12: error[alloc.default] 'HashMap' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
-main.vl:7:25: error[alloc.default] 'Buf' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
+main.vl:3:14: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
+main.vl:7:13: error[type error] struct 'HashMap' takes 4 type arguments, got 2
+main.vl:7:26: error[alloc.default] 'String' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
 main.vl:11:48: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: this item is generic over the allocator 'A': write it, or Gpa (what the default meant) | try: volec fix --only alloc main.vl
 main.vl:15:13: error[alloc.default] the allocator parameter 'A' has a default: an allocator type is always written (0.26.3) | help: take the default out: each use writes its allocator (`Vec<u8, Gpa>`) | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
-main.vl:20:5: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'empty' and pass it down | try: volec fix --only alloc main.vl
+main.vl:20:5: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'empty' and pass it down | try: volec refactor signature empty --add 'gpa: Gpa = gpa' --fill-calls main.vl | try: volec fix --only alloc main.vl
 main.vl:24:28: error[alloc.no_in] 'collect' allocates from nothing: pass the allocator, last, to 'collect_in' | help: this function's `gpa` is the allocator to pass | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
 main.vl:32:12: error[alloc.field] the struct 'Bag' holds an allocator its parameters do not name: 'Gpa', in field 'items' | help: a type that holds an allocator says so in its parameters: make it generic over it (`struct P<A: Allocator> { v: Vec<u8, A> }`, used as `P<Gpa>`) | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
 main.vl:55:13: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
@@ -25,48 +27,38 @@ $ fix --only alloc --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -3 +3 @@
--fn total(v: Vec<i64>) -> i64 {
-+fn total(v: Vec<i64, Gpa>) -> i64 {
+-fn total(v: &Vec<i64>) -> i64 {
++fn total(v: &Vec<i64, Gpa>) -> i64 {
 @@ -7 +7 @@
--fn keys(m: HashMap<i64, Buf>) -> usize {
-+fn keys(m: HashMap<i64, Buf<Gpa>, Gpa>) -> usize {
+-fn keys(m: &HashMap<i64, String>) -> usize {
++fn keys(m: &HashMap<i64, String<Gpa>>) -> usize {
 @@ -15 +15 @@
 -struct Pool<A: Allocator = Gpa> {
 +struct Pool<A: Allocator> {
 @@ -24 +24 @@
--    let t: Vec<i64, Gpa> = (0..3).collect();
-+    let t: Vec<i64, Gpa> = (0..3).collect_in(gpa);
+-    let t: Vec<i64, Gpa> = (0i64..3i64).collect();
++    let t: Vec<i64, Gpa> = (0i64..3i64).collect_in(gpa);
 @@ -31,2 +31,2 @@
 -struct Bag {
 -    items: Vec<i64, Gpa>,
 +struct Bag<A: Allocator> {
 +    items: Vec<i64, A>,
 @@ -35 +35 @@
--fn bag_len(b: Bag) -> usize {
-+fn bag_len(b: Bag<Gpa>) -> usize {
-@@ -39,2 +39,2 @@
--struct Stack<T> {
--    items: Vec<T>,
-+struct Stack<T, A: Allocator> {
-+    items: Vec<T, A>,
-@@ -43 +43 @@
--impl<T> Stack<T> {
-+impl<T, A: Allocator> Stack<T, A> {
-@@ -49 +49 @@
--    fn me(sink self) -> Stack<T> {
-+    fn me(sink self) -> Stack<T, A> {
+-fn bag_len(b: &Bag) -> usize {
++fn bag_len(b: &Bag<Gpa>) -> usize {
 @@ -55 +55 @@
 -    let u = Vec::<i64>::new_in(gpa);
 +    let u = Vec::<i64, Gpa>::new_in(gpa);
 $ fix --only alloc
-fixed 12 suggested fixes	main.vl	+12 -12 lines
+fixed 7 suggested fixes	main.vl	+8 -8 lines
+main.vl:7:13: error[type error] struct 'HashMap' takes 4 type arguments, got 2
 main.vl:11:48: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: this item is generic over the allocator 'A': write it, or Gpa (what the default meant) | try: volec fix --only alloc main.vl
-main.vl:20:5: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'empty' and pass it down | try: volec fix --only alloc main.vl
-note fix.left: 2 errors left (above)
+main.vl:20:5: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'empty' and pass it down | try: volec refactor signature empty --add 'gpa: Gpa = gpa' --fill-calls main.vl | try: volec fix --only alloc main.vl
+note fix.left: 3 errors left (above)
 $ check
-main.vl:7:25: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+main.vl:7:13: error[type error] struct 'HashMap' takes 4 type arguments, got 2
 main.vl:11:48: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: this item is generic over the allocator 'A': write it, or Gpa (what the default meant) | try: volec fix --only alloc main.vl
-main.vl:20:5: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'empty' and pass it down | try: volec fix --only alloc main.vl
+main.vl:20:5: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'empty' and pass it down | try: volec refactor signature empty --add 'gpa: Gpa = gpa' --fill-calls main.vl | try: volec fix --only alloc main.vl
 [exit 1]
 $ explain alloc.default
 alloc.default: error

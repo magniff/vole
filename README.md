@@ -69,7 +69,7 @@ way, but it means different things:
 |---|---|---|
 | parameters | `&T`, `&mut T`, `T` | `let` (the default: read in place), `inout` (the call writes `&x`), `sink` (taken); `var` for `let mut` |
 | borrows | lifetimes, the borrow checker | no lifetimes to write: views (slices, structs holding one) are second-class, checked to stay inside what they view |
-| Rust's spellings | | `&mut T`, `let mut`, `*x`, `move \|\|` are the error `conv.rust` with a `try:` fix; `volec fix --only conventions` rewrites a program |
+| Rust's spellings | | `&mut T`, `let mut`, `*x`, `move \|\|` are the error `conv.rust` with a `try:` fix |
 | allocation | a global allocator, `Box`, `Rc`, `Arc` | explicit: `fn main(gpa: Gpa)`, `Vec::new_in(gpa)`, arenas, fixed buffers |
 | effects | none | inferred: `alloc(A)`, `io`, `global`, `panic`, `diverge`, `unsafe`, `thread`, `sync`, `tls`, CPU features; `query effects --why`; `#[pure]`, `#[no_alloc]`, `#[effects(..)]` are checked bounds |
 | contracts | crates | `requires`, `ensures`: checked at run time in every build, and used by the optimizer |

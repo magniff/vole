@@ -79,8 +79,7 @@ value itself.
 | `Mutex`, threads | none in vole (C's threads are C's business) |
 
 Each Rust spelling above is the error `conv.rust`, whose `try:` line
-writes the vole form (`volec fix --only conventions` rewrites a
-whole program). Pass a container to a function that changes it as
+writes the vole form. Pass a container to a function that changes it as
 `&v` to an `inout` parameter, to one that reads it as `v`; return a new
 one by value (the caller owns it):
 
