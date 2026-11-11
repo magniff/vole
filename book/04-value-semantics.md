@@ -92,7 +92,6 @@ fn main(gpa: Gpa) {
 error[borrowck.use_moved]: 'list' is used here after it moved (moved at playlist.vl: line 7, column 16)
  --> playlist.vl: line 8, column 22
   = help: use it before the move, pass a clone where it moves, or take it by reference
-  = try: volec edit patch playlist.vl:7 --old 'let copy = list;' --new 'let copy = list.clone();'
 ```
 
 `let copy = list;` did not copy the list. It *moved* it: the list now
