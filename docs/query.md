@@ -23,14 +23,12 @@ volec query callers NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE]
 volec query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]   (0.16)
 volec query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (0.16) the inferred effects
 volec query unsafe [FILE...|DIR|std] [--no-std] [--unjustified] [--summary] [--json]   (0.25.3) every unsafe site
-volec query views NAME...|MODULE [--why]   (0.17) what results and `&mut` parameters view
 volec query features NAME... [--why FEATURE] [-C OPTION]   (0.19) what a function needs of the CPU
 volec query arch WORDS... [--feature F] [--arch A] [--equiv NAME]   (0.19) the intrinsic tables (also `intrinsics`; no program read)
 volec query items [MODULE|TYPE...] [--root ROOT] [--comments] [--find WORD] [--kind KIND,...] [--names]
 volec query show MODULE::section TITLE                   (0.13)
 volec query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--ignore-case] [--count] [--limit N] [--all]
 volec query type FILE:LINE[:COL]...                      (0.13)
-volec query own FILE:LINE:COL...                         (0.17)
 volec query drops FILE:LINE...                           (0.26.1)
 volec query stats [MODULE|FILE] [--over N] [--all]      (refactor.md)
 volec query deps MODULE [--max-lines N]                 (refactor.md)
@@ -114,7 +112,6 @@ tools` the ones a program needs.
 | text that is not a name (a message, a comment), with its item | `target/volec query grep TEXT` (`--comments`, `--strings`, `--code`, `--word`, `--ignore-case`, `--in`) |
 | a module's section banners; one section | `target/volec query items MODULE --comments`, `query show MODULE::section TITLE` |
 | the type of an expression | `target/volec query type FILE:LINE:COL` |
-| each local's kind, moves and views at a position (0.17) | `target/volec query own FILE:LINE:COL` |
 | a function's drops, each decided (kept, removed, flagged, opened) and where it runs (0.26.1) | `target/volec query drops FILE:LINE` |
 | what a function may do (allocate, io, panic, loop forever) | `target/volec query effects NAME\|MODULE` (`--why EFFECT`: the chain; `--has alloc(Gpa)`: which still allocate) |
 | every unsafe site: what it does, its class, whether it says why | `target/volec query unsafe [FILE...\|std]` (`--unjustified`, `--summary`, `--json`) |
@@ -748,34 +745,6 @@ $ volec query show vqtbl1q_u8
 pub fn vqtbl1q_u8(t: uint8x16_t, idx: uint8x16_t) -> uint8x16_t;
 ```
 
-## views (0.17)
-
-`views NAME...` prints each function's view summary
-(docs/design/value-semantics.md §2.4): which parameters its result
-points into, and what its `&mut` parameters may come to hold. `p` is
-what the argument p points into (the referent of `p: &T`, the storage of
-`p: [T]`), `*p` what the views p holds point into: `Vec::as_slice` is
-`views(self)`, a parser method returning a token's text `views(*self)`,
-`intern(names: &mut Vec<[u8]>, word: [u8])` `views() stores(word)`.
-After it, how it is known: `inferred` (from the body, callees first),
-`declared` (`#[views(..)]`, `#[stores(..)]`), `parametric` (a generic
-result made of its type parameters: by its type), `assumed` (a body that
-did not check: every parameter). A MODULE gives its functions whose
-summary is not `views()`.
-
-- `--why` adds, under each function's line, the `return` or tail that
-  makes each source, and the callee's summary when the value is a call.
-
-`def`, `show` and `context` add `views: SUMMARY` after the effects when
-it is not `views()`; `--print-views` prints every function's summary
-after checking, as `--print-effects` does.
-
-```
-$ volec query views Parser --why
-crate::Parser::name→views(*self) inferred
-  why: parse.vl:4:83 't.text': views what 'self' holds
-```
-
 ## context (0.15)
 
 `query context NAME` answers in one call what takes three to five
@@ -983,28 +952,6 @@ other (`{p.x + q.y:>4}`: `i64→p.x + q.y`), and a position on its text
 gives the f-string's type. What the compiler writes for an f-string or a
 `?` (the hidden locals `__f0`, `__out`, the match a `?` is) is never
 shown.
-
-## own (0.17)
-
-`own FILE:LINE:COL` shows the own pass's state at a position
-(docs/design/value-semantics.md §2.9): the position and its function,
-then a line per local in scope there (parameters first, then in the
-order they are declared), its name, type and kind (`plain`, `owned`,
-`view`, `owned view`), and, from the own pass's walk of the function
-(front/own/observe.vl), whether it is moved (where, into what) and the
-views it holds (what they view, where they were taken, what invalidated
-them). Without the walk (a template never instantiated, or before the
-checker has it), the kinds alone:
-
-```
-main.vl:16:17 in crate::main
-gpa    Gpa       plain
-v      Vec<i64>  owned
-first  [i64]     view
-```
-
-A `let`'s names are in scope after the `let`. A position in no function
-the checker saw: `error query.no-match`, `try:` the item at that line.
 
 ## drops (0.26.1)
 
