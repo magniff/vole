@@ -189,11 +189,13 @@ fn main(gpa: Gpa) {
 error[type error]: undefined variable 'gpa'
  --> main.vl: line 2, column 49
   = help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'split_path' and pass it down
+  = try: volec refactor signature split_path --add 'gpa: Gpa = gpa' --fill-calls main.vl
 ```
 
 `gpa` is just a parameter name, and `split_path` has no parameter by
 that name. The fix is to add one, `gpa: Gpa`, at the end of
-`split_path`'s parameters, and pass `gpa` at the call.
+`split_path`'s parameters, and pass `gpa` at the call: the `try:` line
+is the command that makes both edits.
 
 If you forget it the other way, writing `Vec::new()` the way other
 languages do, you get the error from chapter 2, `alloc.no_in`, which
