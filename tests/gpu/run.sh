@@ -8,7 +8,7 @@
 #   Metal's API and shader validation (MTL_DEBUG_LAYER,
 #   MTL_SHADER_VALIDATION), checked, and run again under `leaks --atExit`,
 #   which must find nothing;
-# - objcgen: every table of compiler/std/objc/tables is regenerated and
+# - objcgen: every table of compiler/std2/objc/tables is regenerated and
 #   compared
 #   with its checked-in module, checked against the Objective-C runtime
 #   (--check) and its constants and structs against the SDK's headers
@@ -167,8 +167,21 @@ done <"$WORK/cases"
 # objcgen: generation, the runtime check, the header check.
 case objcgen in
 *"$FILTER"*)
-    for t in "$ROOT"/compiler/std/objc/tables/*.objc; do
+    # (0.28.0) the rust edition's tables are compiler/std2's; a table still
+    # only in the old std (its module not ported yet) is checked against
+    # the runtime and the SDK, and not regenerated: objcgen writes the
+    # rust edition.
+    for t in "$ROOT"/compiler/std2/objc/tables/*.objc "$ROOT"/compiler/std/objc/tables/*.objc; do
+        [ -f "$t" ] || continue
         tn=$(basename "$t" .objc)
+        td=${t#"$ROOT"/}
+        td=${td%/*}
+        old=0
+        case "$td" in
+        compiler/std/*)
+            [ -f "$ROOT/compiler/std2/objc/tables/$tn.objc" ] && continue
+            old=1 ;;
+        esac
         why="$WORK/objcgen-$tn.why"
         : >"$why"
         if [ "$TOOLS_OK" != 1 ]; then
@@ -176,15 +189,20 @@ case objcgen in
         else
             out=$(sed -n 's/^# Generated into \([^ ]*\) .*/\1/p' "$t" | head -1)
             [ -n "$out" ] || out=$(sed -n 's/^# \{0,1\}.*generated into \([^ ]*\) by.*/\1/p' "$t" | head -1)
-            (cd "$ROOT" && "$WORK/tools/objcgen" "compiler/std/objc/tables/$tn.objc") >"$WORK/gen-$tn.vl" 2>>"$why"
-            if [ -z "$out" ]; then
+            (cd "$ROOT" && "$WORK/tools/objcgen" "$td/$tn.objc") >"$WORK/gen-$tn.vl" 2>>"$why"
+            # (0.28.0) a generated module is objcgen's output in the standard
+            # style (`volec fmt`), as the commit hook wants every .vl
+            [ "$old" = 1 ] || "$COMPILER" fmt "$WORK/gen-$tn.vl" >/dev/null 2>>"$why"
+            if [ "$old" = 1 ]; then
+                :
+            elif [ -z "$out" ]; then
                 echo "the table names no 'Generated into PATH' line" >>"$why"
             elif ! cmp -s "$WORK/gen-$tn.vl" "$ROOT/$out"; then
-                echo "$out is not what objcgen makes of compiler/std/objc/tables/$tn.objc (regenerate it, then compiler/std/embed.sh)" >>"$why"
+                echo "$out is not what objcgen makes of $td/$tn.objc (regenerate it, volec fmt it, then compiler/std/embed.sh --edition rust)" >>"$why"
             fi
-            (cd "$ROOT" && "$WORK/tools/objcgen" --check "compiler/std/objc/tables/$tn.objc") >/dev/null 2>"$WORK/check-$tn.err" ||
+            (cd "$ROOT" && "$WORK/tools/objcgen" --check "$td/$tn.objc") >/dev/null 2>"$WORK/check-$tn.err" ||
                 { echo "objcgen --check:"; sed 's/^/    /' "$WORK/check-$tn.err"; } >>"$why"
-            (cd "$ROOT" && "$WORK/tools/objcgen" --c-check "compiler/std/objc/tables/$tn.objc") >"$WORK/c-check-$tn.m" 2>>"$why"
+            (cd "$ROOT" && "$WORK/tools/objcgen" --c-check "$td/$tn.objc") >"$WORK/c-check-$tn.m" 2>>"$why"
             clang -fsyntax-only -x objective-c "$WORK/c-check-$tn.m" >"$WORK/c-check-$tn.err" 2>&1 ||
                 { echo "objcgen --c-check (clang):"; grep 'error' "$WORK/c-check-$tn.err" | sed 's/^/    /' | head -10; } >>"$why"
         fi

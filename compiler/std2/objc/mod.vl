@@ -1,0 +1,499 @@
+// EDITION: rust
+// std::objc (0.22, docs/design/gpu.md §2.9; the rust edition's, 0.28): the
+// Objective-C runtime for vole programs, on macOS. A program that uses it
+// links libobjc (`#[link]`, below); frameworks are opened at run time
+// (`objc::framework("Metal")`), so no -framework is needed at link.
+//
+// - `Id<T>`: an owned (+1) reference to an object of class or protocol T,
+//   a zero-sized marker type, so that Id<MTLBuffer> and Id<MTLTexture> do
+//   not mix. Dropping it sends release; `clone()` sends retain.
+// - `Ref<'a, T>`: a borrowed (+0) reference, Copy: it cannot outlive the
+//   Id (or the reference) it came from, which 'a is. `retain()` makes it
+//   an Id<T>.
+// - Methods come from tables (compiler/std2/objc/tables/*.objc) through
+//   tools/objcgen, which checks every line against the runtime's type
+//   encodings: no objc_msgSend prototype is written by hand.
+// mvs: std::objc
+
+pub mod foundation;
+
+use crate::alloc::Allocator;
+use crate::marker::PhantomData;
+use crate::string::String;
+use crate::sync::atomic::{Atomic, Ordering};
+
+use foundation::{
+    NSException, NSExceptionMethods, NSObject, NSObjectMethods, NSString, NSStringMethods,
+};
+
+// The Objective-C runtime, linked by a program that calls into it
+// (#[link]: when it uses a symbol of this block); the frameworks are
+// opened at run time.
+// UNSAFE: the Objective-C runtime's C functions; C calls cannot be checked.
+// SAFETY: the prototypes are objc/runtime.h's and objc/objc-internal.h's (id and SEL as *mut u8).
+#[link(lib = "objc")]
+extern "C" {
+    #[effects(io)]
+    fn objc_retain(o: *mut u8) -> *mut u8;
+    #[effects(io)]
+    fn objc_release(o: *mut u8);
+    #[effects(io)]
+    fn objc_autoreleasePoolPush() -> *mut u8;
+    #[effects(io)]
+    fn objc_autoreleasePoolPop(p: *mut u8);
+    #[effects(io)]
+    fn sel_registerName(name: *const u8) -> *mut u8;
+    #[effects(io)]
+    fn objc_getClass(name: *const u8) -> *mut u8;
+}
+
+// UNSAFE: the C library's string and dynamic-loader functions.
+// SAFETY: the prototypes are string.h's and dlfcn.h's.
+extern "C" {
+    #[link_name = "strlen"]
+    #[effects()]
+    fn objc_c_strlen(s: *const u8) -> u64;
+    #[link_name = "dlopen"]
+    #[effects(io)]
+    fn objc_c_dlopen(path: *const u8, mode: i32) -> *mut u8;
+    #[link_name = "dlsym"]
+    #[effects(io)]
+    fn objc_c_dlsym(handle: *mut u8, name: *const u8) -> *mut u8;
+}
+
+// ---- Objective-C objects (0.22) ----
+
+/// Any object (Objective-C's `id`).
+pub struct Object {}
+
+/// An owned reference (+1) to an object of class or protocol T.
+pub struct Id<T> {
+    pub ptr: *mut u8,
+    of: PhantomData<T>,
+}
+
+/// A borrowed reference (+0) to an object of class or protocol T, valid
+/// for 'a: the life of what keeps the object alive.
+pub struct Ref<'a, T> {
+    pub ptr: *mut u8,
+    keep: PhantomData<&'a T>,
+}
+
+impl<'a, T> Clone for Ref<'a, T> {
+    fn clone(&self) -> Ref<'a, T> {
+        *self
+    }
+}
+
+impl<'a, T> Copy for Ref<'a, T> {}
+
+impl<T> Drop for Id<T> {
+    fn drop(&mut self) {
+        let p = self.ptr;
+        self.ptr = 0 as *mut u8;
+        if !p.is_null() {
+            // UNSAFE: objc_release is a C call on a raw object pointer.
+            // SAFETY: p was the +1 reference this Id owned (from_owned's promise, or a retain);
+            // ptr is cleared above, so it is released once.
+            unsafe { objc_release(p); }
+        }
+    }
+}
+
+impl<T> Id<T> {
+    /// Takes over a +1 reference (a result of the alloc, new, copy or
+    /// mutableCopy families); None for nil. The caller promises that p is
+    /// nil or a +1 reference to an object of T.
+    // UNSAFE: the Id will release p and send it T's messages: no type says p is a +1 object of T.
+    // SAFETY: the caller's: p is nil or a +1 reference, to an object of class or protocol T,
+    // that the caller gives up.
+    pub unsafe fn from_owned(p: *mut u8) -> Option<Id<T>> {
+        if p.is_null() { None } else { Some(Id::<T> { ptr: p, of: PhantomData }) }
+    }
+
+    /// The same, nil kept as a nil Id (messages to nil do nothing and
+    /// return 0; release of nil does nothing).
+    // UNSAFE: as from_owned: the Id will release p and send it T's messages.
+    // SAFETY: the caller's: p is nil or a +1 reference to an object of T, given up.
+    pub unsafe fn from_owned_or_nil(p: *mut u8) -> Id<T> {
+        Id::<T> { ptr: p, of: PhantomData }
+    }
+
+    /// A nil Id.
+    pub fn nil() -> Id<T> {
+        Id::<T> { ptr: 0 as *mut u8, of: PhantomData }
+    }
+
+    /// A borrowed reference to the object, valid while this Id is.
+    pub fn r(&self) -> Ref<'_, T> {
+        Ref::<T> { ptr: self.ptr, keep: PhantomData }
+    }
+
+    pub fn is_nil(&self) -> bool {
+        self.ptr.is_null()
+    }
+
+    /// Gives the +1 reference up without releasing it (to a method of the
+    /// init family, which consumes its receiver).
+    pub fn into_raw(self) -> *mut u8 {
+        let mut me = self;
+        let p = me.ptr;
+        me.ptr = 0 as *mut u8;
+        p
+    }
+
+    /// The object's retain count (for tests: Cocoa's own count, which
+    /// includes the references the frameworks hold).
+    pub fn retain_count(&self) -> u64 {
+        self.r().object().retain_count()
+    }
+
+    /// Reinterprets the reference as one to U. The caller promises that
+    /// the object is of class or protocol U.
+    // UNSAFE: the result is sent U's messages; the runtime's class is not checked.
+    // SAFETY: the caller's: the object is of class or protocol U (or nil).
+    pub unsafe fn cast<U>(self) -> Id<U> {
+        Id::<U> { ptr: self.into_raw(), of: PhantomData }
+    }
+}
+
+impl<T> Clone for Id<T> {
+    /// Another owned reference to the same object: sends retain.
+    fn clone(&self) -> Id<T> {
+        if !self.ptr.is_null() {
+            // UNSAFE: objc_retain is a C call on a raw object pointer.
+            // SAFETY: self owns a +1 reference, so the object is live; the new Id owns the +1
+            // this retain adds.
+            unsafe { objc_retain(self.ptr); }
+        }
+        Id::<T> { ptr: self.ptr, of: PhantomData }
+    }
+}
+
+impl<'a, T> Ref<'a, T> {
+    /// A reference to p that lives as long as `keep`, the reference it was
+    /// read from (a method's +0 result is tied to its receiver so). The
+    /// caller promises that p is nil or an object of T, alive while what
+    /// `keep` borrows is.
+    // UNSAFE: makes a reference no type checks.
+    // SAFETY: the caller's: p is nil or an object of T that what keep borrows keeps alive.
+    pub unsafe fn from_raw<K>(p: *mut u8, keep: Ref<'a, K>) -> Ref<'a, T> {
+        let _ = keep;
+        Ref::<T> { ptr: p, keep: PhantomData }
+    }
+
+    /// The same, None for nil.
+    // UNSAFE: as from_raw: makes a reference no type checks.
+    // SAFETY: the caller's, as from_raw: p nil or an object of T kept alive.
+    pub unsafe fn from_raw_opt<K>(p: *mut u8, keep: Ref<'a, K>) -> Option<Ref<'a, T>> {
+        let _ = keep;
+        if p.is_null() { None } else { Some(Ref::<T> { ptr: p, keep: PhantomData }) }
+    }
+
+    /// A reference to an object the process or the current pool keeps
+    /// (a class, an autoreleased result), for any 'a the caller names. The
+    /// caller promises as for from_raw.
+    // UNSAFE: makes a reference to a raw object pointer with no owner to bound its life.
+    // SAFETY: the caller's: p is nil or an object of T that the process (a class) or the
+    // current autorelease pool keeps for as long as the Ref is used.
+    pub unsafe fn from_global(p: *mut u8) -> Ref<'a, T> {
+        Ref::<T> { ptr: p, keep: PhantomData }
+    }
+
+    /// The same, None for nil.
+    // UNSAFE: as from_global: a reference to a raw pointer with no owner to bound its life.
+    // SAFETY: the caller's, as from_global.
+    pub unsafe fn from_global_opt(p: *mut u8) -> Option<Ref<'a, T>> {
+        if p.is_null() { None } else { Some(Ref::<T> { ptr: p, keep: PhantomData }) }
+    }
+
+    /// An owned reference to the object: sends retain.
+    pub fn retain(self) -> Id<T> {
+        if !self.ptr.is_null() {
+            // UNSAFE: objc_retain is a C call on a raw object pointer.
+            // SAFETY: a Ref is nil or a live object (its constructors' promise); the Id returned
+            // owns the +1 this adds.
+            unsafe { objc_retain(self.ptr); }
+        }
+        Id::<T> { ptr: self.ptr, of: PhantomData }
+    }
+
+    pub fn is_nil(self) -> bool {
+        self.ptr.is_null()
+    }
+
+    /// The object as an NSObject (every class here derives from it).
+    pub fn object(self) -> Ref<'a, NSObject> {
+        Ref::<NSObject> { ptr: self.ptr, keep: PhantomData }
+    }
+
+    /// The object as an `id`.
+    pub fn any(self) -> Ref<'a, Object> {
+        Ref::<Object> { ptr: self.ptr, keep: PhantomData }
+    }
+
+    /// Reinterprets the reference as one to U. The caller promises that
+    /// the object is of class or protocol U.
+    // UNSAFE: the result is sent U's messages; the runtime's class is not checked.
+    // SAFETY: the caller's: the object is of class or protocol U (or nil).
+    pub unsafe fn cast<U>(self) -> Ref<'a, U> {
+        Ref::<U> { ptr: self.ptr, keep: PhantomData }
+    }
+}
+
+/// The pointer of an optional reference (nil for None), for the generated
+/// bindings' nullable parameters.
+pub fn opt_ptr<T>(r: Option<Ref<'_, T>>) -> *mut u8 {
+    match r {
+        Some(x) => x.ptr,
+        None => 0 as *mut u8,
+    }
+}
+
+// ---- Autorelease pools, selectors, classes, frameworks (0.22) ----
+
+/// Runs f inside an autorelease pool: the objects autoreleased while it
+/// runs are released at its end (closure-scoped push and pop).
+pub fn pool<R, F: FnOnce() -> R>(f: F) -> R {
+    // UNSAFE: the runtime's pool push, a C call.
+    // SAFETY: no argument; the pool it returns is popped below, in this frame.
+    let p = unsafe { objc_autoreleasePoolPush() };
+    let r = f();
+    // UNSAFE: the runtime's pool pop, a C call.
+    // SAFETY: p is the pool pushed above; f's own pools were popped before it returned
+    // (pool and Pool pop theirs), so p is the innermost one.
+    unsafe { objc_autoreleasePoolPop(p); }
+    r
+}
+
+/// A pool as a value: popped when dropped (pools nest: drop the inner one
+/// first, as a scope does).
+pub struct Pool {
+    p: *mut u8,
+}
+
+impl Pool {
+    pub fn push() -> Pool {
+        // UNSAFE: the runtime's pool push, a C call.
+        // SAFETY: no argument; the Pool pops it when dropped.
+        let p = unsafe { objc_autoreleasePoolPush() };
+        Pool { p: p }
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        if !self.p.is_null() {
+            // UNSAFE: the runtime's pool pop, a C call.
+            // SAFETY: p came from objc_autoreleasePoolPush and is cleared below, so it is popped
+            // once; Pools are locals dropped in reverse order, which keeps the nesting (popping
+            // an outer pool first pops the inner ones too, and theirs is then a no-op).
+            unsafe { objc_autoreleasePoolPop(self.p); }
+        }
+        self.p = 0 as *mut u8;
+    }
+}
+
+/// The selector for a NUL-terminated name (the generated bindings cache
+/// theirs in statics). The caller passes a NUL-terminated string.
+// UNSAFE: sel_registerName reads name up to its NUL, which no type guarantees (`selector`
+// takes a str and is safe).
+// SAFETY: the caller's: name is a NUL-terminated string, readable for the call.
+pub unsafe fn sel(name: *const u8) -> *mut u8 {
+    sel_registerName(name)
+}
+
+/// The class of that name, or nil. The caller passes a NUL-terminated
+/// string.
+// UNSAFE: objc_getClass reads name up to its NUL, which no type guarantees (`class_named`
+// takes a str and is safe).
+// SAFETY: the caller's: name is a NUL-terminated string, readable for the call.
+pub unsafe fn class(name: *const u8) -> *mut u8 {
+    objc_getClass(name)
+}
+
+// name, NUL-terminated in buf (true), or false when it does not fit.
+fn c_name(name: &[u8], buf: &mut [u8; 256]) -> bool {
+    if name.len() >= 256 { return false; }
+    for i in 0..name.len() {
+        buf[i] = name[i];
+    }
+    buf[name.len()] = 0;
+    true
+}
+
+/// (0.25.4) The selector for a name, safe: `sel` for a str (the
+/// generated bindings cache theirs in statics). A name of 256 bytes or
+/// more panics.
+pub fn selector(name: &str) -> *mut u8 {
+    let mut buf: [u8; 256] = [0; 256];
+    if !c_name(name.as_bytes(), &mut buf) {
+        panic("std::objc::selector: a name of 256 bytes or more");
+    }
+    // UNSAFE: sel_registerName is the Objective-C runtime's C function.
+    // SAFETY: buf holds name NUL-terminated (c_name checked that it fits) and lives across the
+    // call; the runtime copies the name and keeps the selector for the process.
+    unsafe { sel_registerName(buf.as_ptr()) }
+}
+
+/// (0.25.4) The class of that name, or nil, safe: `class` for a str. A
+/// name of 256 bytes or more panics.
+pub fn class_named(name: &str) -> *mut u8 {
+    let mut buf: [u8; 256] = [0; 256];
+    if !c_name(name.as_bytes(), &mut buf) {
+        panic("std::objc::class_named: a name of 256 bytes or more");
+    }
+    // UNSAFE: objc_getClass is the Objective-C runtime's C function.
+    // SAFETY: buf holds name NUL-terminated (c_name checked that it fits) and lives across the
+    // call, which only reads it; a class, once registered, lives as long as the process.
+    unsafe { objc_getClass(buf.as_ptr()) }
+}
+
+/// The selector for a name, looked up once and kept in `slot` (a static of
+/// the generated bindings, zero until the first call). Two threads racing
+/// on a slot both store the same selector: the runtime keeps one per name.
+pub fn cached_selector(slot: &Atomic<usize>, name: &str) -> *mut u8 {
+    let p = slot.load(Ordering::Relaxed);
+    if p != 0 { return p as *mut u8; }
+    let s = selector(name);
+    slot.store(s as usize, Ordering::Relaxed);
+    s
+}
+
+/// The class of a name (or nil, before its framework is opened: then it
+/// is looked up again at the next call), kept in `slot` as
+/// cached_selector's.
+pub fn cached_class(slot: &Atomic<usize>, name: &str) -> *mut u8 {
+    let p = slot.load(Ordering::Relaxed);
+    if p != 0 { return p as *mut u8; }
+    let c = class_named(name);
+    slot.store(c as usize, Ordering::Relaxed);
+    c
+}
+
+/// Opens a system framework (`framework("Metal")`: its classes and
+/// protocols are registered, its C functions reachable through `symbol`);
+/// false when there is none. Opening one twice is cheap.
+pub fn framework(name: &str) -> bool {
+    let mut path: [u8; 256] = [0; 256];
+    let name = name.as_bytes();
+    let parts: [&[u8]; 4] = [b"/System/Library/Frameworks/", name, b".framework/", name];
+    let mut n: usize = 0;
+    for part in parts {
+        for i in 0..part.len() {
+            if n < 255 {
+                path[n] = part[i];
+                n += 1;
+            }
+        }
+    }
+    if n >= 255 { return false; }
+    // UNSAFE: dlopen is a C call taking a C string.
+    // SAFETY: path is a local array, NUL-terminated after n < 255 bytes (checked above), alive
+    // across the call; mode is RTLD_NOW | RTLD_GLOBAL.
+    let h = unsafe { objc_c_dlopen(path.as_ptr(), 2 | 8) };
+    !h.is_null()
+}
+
+/// The address of a C symbol of the process and the frameworks it opened,
+/// or null. The caller passes a NUL-terminated name.
+// UNSAFE: dlsym reads name up to its NUL, which no type guarantees.
+// SAFETY: the caller's: name is a NUL-terminated string; RTLD_DEFAULT is the handle dlfcn.h
+// defines on macOS, ((void *) -2).
+pub unsafe fn symbol(name: *const u8) -> *mut u8 {
+    // RTLD_DEFAULT is (void *)-2 on macOS
+    objc_c_dlsym(-2isize as *mut u8, name)
+}
+
+// ---- Strings and exceptions (0.22) ----
+
+/// A new NSString holding a copy of the UTF-8 bytes of s.
+pub fn ns_string(s: &str) -> Id<NSString> {
+    let a = NSString::alloc();
+    // UNSAFE: initWithBytes:length:encoding: takes the bytes as a raw pointer.
+    // SAFETY: s's pointer is valid for s.len() bytes, the length passed; NSString copies them
+    // before it returns.
+    let r = unsafe {
+        NSString::init_with_bytes_length_encoding(a, s.as_ptr(), s.len() as u64,
+            foundation::NSUTF8StringEncoding)
+    };
+    match r {
+        Some(x) => x,
+        None => Id::<NSString>::nil(),
+    }
+}
+
+/// The UTF-8 bytes of s (empty for nil): a slice valid while s's owner
+/// and the current autorelease pool are.
+pub fn ns_bytes<'a>(s: Ref<'a, NSString>) -> &'a [u8] {
+    if s.is_nil() { return b""; }
+    let p = s.utf8_string();
+    if p.is_null() { return b""; }
+    // UNSAFE: the C string UTF8String returns is a raw pointer, its length strlen's.
+    // SAFETY: p is non-null (checked) and NUL-terminated, owned by s or the current pool, which
+    // outlive the slice as the doc says; strlen reads up to the NUL.
+    unsafe { crate::slice::from_raw_parts(p, objc_c_strlen(p) as usize) }
+}
+
+/// The text of s (empty for nil, and for bytes that are not UTF-8, which
+/// UTF8String does not return): valid as ns_bytes's slice is.
+pub fn ns_str<'a>(s: Ref<'a, NSString>) -> &'a str {
+    match str::from_utf8(ns_bytes(s)) {
+        Ok(t) => t,
+        Err(_) => "",
+    }
+}
+
+/// Appends the UTF-8 text of s (nothing for nil) to out.
+pub fn push_ns_string<A: Allocator>(out: &mut String<A>, s: Ref<'_, NSString>) {
+    out.push_str(ns_str(s));
+}
+
+extern "C" fn print_uncaught(e: *mut u8) {
+    // UNSAFE: the runtime hands the exception over as a raw pointer.
+    // SAFETY: the runtime calls this handler with the live NSException being thrown, which
+    // stays alive while the handler runs (the process ends after it).
+    let ex = unsafe { Ref::<NSException>::from_global(e) };
+    let reason = match ex.reason() {
+        Some(r) => ns_str(r),
+        None => "(no reason)",
+    };
+    eprintln("objc: uncaught exception {}: {reason}", ns_str(ex.name()));
+}
+
+static mut INITIALIZED: bool = false;
+
+/// Opens Foundation and installs a handler that prints an Objective-C
+/// exception's name and reason before the process ends (an exception that
+/// reaches vole frames terminates it: no vole frame has a handler;
+/// a crash, not undefined behaviour). Idempotent.
+pub fn init() {
+    // UNSAFE: a static mut read and written.
+    // SAFETY: a bool flag, read and set whole; init is called from the program's main thread
+    // before it uses objc (two racing first calls would both install the same handler).
+    let done = unsafe {
+        let was = INITIALIZED;
+        INITIALIZED = true;
+        was
+    };
+    if done { return; }
+    framework("Foundation");
+    // UNSAFE: symbol takes a C string.
+    // SAFETY: the name is a NUL-terminated c"" literal.
+    let f = unsafe { symbol(c"NSSetUncaughtExceptionHandler") };
+    if !f.is_null() {
+        // UNSAFE: a symbol's address read as a function pointer (a union field).
+        // SAFETY: NSSetUncaughtExceptionHandler is Foundation's (opened above), declared
+        // `void NSSetUncaughtExceptionHandler(void (*)(NSException *))`, HandlerSetter.f's type.
+        let set = unsafe { HandlerSetter { p: f }.f };
+        // UNSAFE: a call through a C function pointer.
+        // SAFETY: set is that function (above); print_uncaught has the handler's C signature.
+        unsafe { set(print_uncaught); }
+    }
+}
+
+#[repr(C)]
+union HandlerSetter {
+    p: *mut u8,
+    f: extern "C" fn(extern "C" fn(*mut u8)),
+}
