@@ -1,27 +1,26 @@
-# Trait purity: `Hash`, `Eq` and `Ord` are `#[pure]`
+# Trait purity: `PartialEq` and `Ord` are `#[pure]`
 
 The most frequent words of a text, counted without regard to case. The
 words are keys of a `HashMap`, as a type of the program, `Word`, with a
-hand-written `Hash` and `Eq` that look at the lowercase bytes; the
-counts are sorted by a hand-written `Ord`.
+hand-written `Hash` and `PartialEq` that look at the lowercase bytes;
+the counts are sorted by a hand-written `Ord`.
 
-std declares the methods of these three traits `#[pure]`:
+std declares the comparing methods `#[pure]`:
 
-```tach
-pub trait Eq { #[pure] fn eq(self, other: Self) -> bool; }
-pub trait Ord { #[pure] fn cmp(self, other: Self) -> i64; }
-pub trait Hash { #[pure] fn hash(self) -> u64; }
+```vole
+pub trait PartialEq<Rhs = Self> { #[pure] fn eq(&self, other: &Rhs) -> bool; }
+pub trait Ord: Eq + PartialOrd { #[pure] fn cmp(&self, other: &Self) -> Ordering; }
 ```
 
 A declaration on a trait's method binds every impl of it, the program's
-and derived ones alike: an `eq`, `cmp` or `hash` may not allocate, do
-I/O or touch a static. It may panic, loop, and read what it is given.
+and derived ones alike: an `eq` or a `cmp` may not allocate, do I/O or
+touch a static. It may panic, loop, and read what it is given.
 
 Why: the containers and algorithms that call them decide how often. A
 `HashMap` hashes a key on every insert and every lookup, and every key
 again each time it grows; a sort compares as often as its algorithm
-needs, in its own order. A `hash` that counted its calls in a static
-would count the map's internals, and change when they do; an `eq` that
+needs, in its own order. A `cmp` that counted its calls in a static
+would count the sort's internals, and change when they do; an `eq` that
 printed would print a different trace for every version of the map. And
 the optimizer may compute a pure call once and reuse it.
 
@@ -47,68 +46,75 @@ ok: built words
 ```console
 $ volec query effects crate
 crate::lower	none
-<crate::Word as Hash>::hash	none
-<crate::Word as Eq>::eq	panic
+Word::hash<FoldHasher>	none
+<crate::Word as PartialEq>::eq	panic
 <crate::Count as Ord>::cmp	panic
+<crate::Count as PartialOrd>::partial_cmp	panic
 crate::trim_word	panic
 crate::is_letter	none
 crate::main	alloc(Gpa) io panic diverge
 ```
 
-`Word::hash` is `none`. `Word::eq` and `Count::cmp` index (`panic`),
-which `#[pure]` allows.
+`Word::hash` is `none`: it only feeds the hasher it is given. `Word::eq`
+and `Count::cmp` may panic (an index, a slice), which `#[pure]` allows.
 
-## A hash that counts its calls
+## A cmp that counts its calls
 
-Counting how often `hash` runs, in a static: one edit adds the static
-and changes `hash` (`edit apply` takes several items' new text, here on
+Counting how often `cmp` runs, in a static: one edit adds the static
+and changes `cmp` (`edit apply` takes several items' new text, here on
 stdin):
 
 ```console
 $ volec edit apply <<'EOF'
 > @@ new before Word
-> // How many times hash was called.
-> static var HASHES: i64 = 0;
-> @@ Word::hash
->     fn hash(self) -> u64 {
->         HASHES += 1;
->         var h = 0xcbf29ce484222325u64;
->         for b in self.text {
->             h = (h ^ lower(b) as u64) * 0x100000001b3u64;
+> // How many times cmp was called.
+> static mut COMPARES: i64 = 0;
+> @@ Count::cmp
+>     fn cmp(&self, other: &Self) -> Ordering {
+>         // UNSAFE: a static mut.
+>         // SAFETY: the program has one thread.
+>         unsafe { COMPARES += 1 };
+>         if self.n != other.n {
+>             return other.n.cmp(&self.n);
 >         }
->         h
+>         self.word.text.cmp(other.word.text)
 >     }
 > EOF
-main.vl:23:5: error[effect] 'Word::hash' implements 'Hash::hash', which is #[pure], but it touches a static mut or a C static (static): 'HASHES' at main.vl:24:9 is a static's (static) | help: pass the state in as a parameter, or remove #[pure] (the trait's) | try: volec query effects Word::hash --why static  [edited: <crate::Word as Hash>::hash]
-error edit.breaks: 1 new error; nothing written; the error: main.vl:23:5: 'Word::hash' implements 'Hash::hash', which is #[pure], but it touches a static mut or a C static (static): 'HASHES' at main.vl:24:9 is a static's (static)
+main.vl:58:5: error[effect] 'Count::cmp' implements 'Ord::cmp', which is #[pure], but it touches a static mut or a C static (static): 'COMPARES' at main.vl:61:18 is a static's (static) | help: pass the state in as a parameter, or remove #[pure] (the trait's) | try: volec query effects Count::cmp --why static  [edited: <crate::Count as Ord>::cmp]
+error edit.breaks: 1 new error; nothing written; the error: main.vl:58:5: 'Count::cmp' implements 'Ord::cmp', which is #[pure], but it touches a static mut or a C static (static): 'COMPARES' at main.vl:61:18 is a static's (static)
 try: volec edit apply --no-check
 [exit 1]
 ```
 
-The error is at the impl's `hash`, and says whose declaration it breaks:
-`Hash::hash`'s, std's. (The help's two ways out are for a function of
+The error is at the impl's `cmp`, and says whose declaration it breaks:
+`Ord::cmp`'s, std's. (The help's two ways out are for a function of
 your own; for std's traits, keep the count outside the impl: around the
-calls of `insert` and `get` that you make.)
+calls of `sort` that you make.)
 
 ## An eq that prints
 
 A debugging print in `eq`:
 
 ```console
-$ volec edit patch Word::eq --old '        if self.text.len() != other.text.len() {' --new '        println("comparing {} and {}", self.text, other.text);
->         if self.text.len() != other.text.len() {'
-main.vl:30:5: error[effect] 'Word::eq' implements 'Eq::eq', which is #[pure], but it does io: 'println("comparing {} and {}", self.text, ot..' at main.vl:31:9 calls 'std::fmt::println' | help: return the data and let the caller print it, or remove #[pure] (the trait's) | try: volec query effects Word::eq --why io  [edited: <crate::Word as Eq>::eq]
-error edit.breaks: 1 new error; nothing written; the error: main.vl:30:5: 'Word::eq' implements 'Eq::eq', which is #[pure], but it does io: 'println("comparing {} and {}", self.text, ot..' at main.vl:31:9 calls 'std::fmt::println'
-try: volec edit patch Word::eq --old '        if self.text.len() != other.text.len() {' --new '        println("comparing {} and {}", self.text, other.text);
-        if self.text.len() != other.text.len() {' --no-check
+$ volec edit patch Word::eq --old '        if a.len() != b.len() {' --new '        println("comparing {} and {}", self.text, other.text);
+>         if a.len() != b.len() {'
+main.vl:32:5: error[effect] 'Word::eq' implements 'PartialEq::eq', which is #[pure], but it does io: 'println("comparing {} and {}", self.text, ot..' at main.vl:35:9 calls 'std::fmt::println' | help: return the data and let the caller print it, or remove #[pure] (the trait's) | try: volec query effects Word::eq --why io  [edited: <crate::Word as PartialEq>::eq]
+main.vl:52:10: error[effect] 'Count::eq' implements 'PartialEq::eq', which is #[pure], but it does io: 'word: Word<'a>' at main.vl:53:20 calls 'Word::eq' | help: return the data and let the caller print it, or remove #[pure] (the trait's) | try: volec query effects Count::eq --why io
+error edit.breaks: 2 new errors; nothing written; the first in the edited text: main.vl:32:5: 'Word::eq' implements 'PartialEq::eq', which is #[pure], but it does io: 'println("comparing {} and {}", self.text, ot..' at main.vl:35:9 calls 'std::fmt::println'
+try: volec edit patch Word::eq --old '        if a.len() != b.len() {' --new '        println("comparing {} and {}", self.text, other.text);
+        if a.len() != b.len() {' --no-check
 [exit 1]
 ```
 
+Two errors: `Count`'s derived `eq` compares its `word` field with
+`Word::eq`, so it breaks the same promise.
+
 ## Derived impls
 
-`#[derive(Eq, Hash, Ord)]` writes impls that compare and hash the
-fields, so they are pure when the fields' impls are: every number,
-`[u8]`, and every type of std is. They are checked the same way.
+`#[derive(PartialEq, Eq, PartialOrd, Ord)]` writes impls that compare
+the fields, so they are pure when the fields' impls are: every number,
+`&str`, `&[u8]`, and every type of std is. They are checked the same
+way.
 
 ## Pure is not deterministic
 
@@ -118,7 +124,7 @@ still read memory through a raw pointer it holds (in `unsafe` code), and
 change what it answers. std's sort is tested with such comparators
 (tests/run/std_sort_adversarial.vl: random, always-less, alternating):
 they keep their state behind a pointer in each key, which is `unsafe`,
-not `global`. An `Ord` that is not an order leaves a slice in some
+not `static`. An `Ord` that is not an order leaves a slice in some
 order, never out of bounds.
 
 ## Read more

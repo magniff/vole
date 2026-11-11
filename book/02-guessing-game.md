@@ -524,15 +524,15 @@ You win! It took you 5 tries.
 Here's a preview of something vole does that most languages don't. The
 compiler works out what each function may do, and it will tell you:
 
-```text
+```console
 $ volec query effects main guess.vl
-crate::main	alloc(Gpa) io panic diverge
+crate::main	alloc(Gpa, extern) io panic diverge
 ```
 
-That one line says `main` allocates memory from a `Gpa`, does
-input and output, uses some global state (`read_line` keeps its input
-buffer in one), may panic (all those `unwrap`s), and may never return
-(the `loop`). You never wrote any of that down: the compiler worked it
+That one line says `main` allocates memory from a `Gpa` (and
+`extern`: seeding the random numbers asks the operating system, through
+C code that has its own allocator), does input and output, may panic
+(all those `unwrap`s), and may never return (the `loop`). You never wrote any of that down: the compiler worked it
 out from the code. Chapter 12 shows how to use this, and how to make the compiler
 hold a function to a promise such as "this never allocates".
 

@@ -594,16 +594,18 @@ Threads add three effects to the six from chapter 12: `thread` for
 starting one, `sync` for an atomic, a lock, a join or a channel, and
 `tls` for a thread-local. Ask about the thread-local program:
 
-```text
+```console
 $ volec query effects crate main.vl
 crate::work	tls
-crate::main	alloc(extern) io tls thread sync panic
+crate::main	alloc(Gpa, extern) io tls thread sync panic diverge
 ```
 
-`work` uses a thread-local, which is `tls`, not `global`. `main` starts
-a thread and joins it. It's also `alloc(extern)`: starting a thread
-allocates a little memory for it from the C library's allocator, which
-the compiler reports like any other allocation. A `#[pure]` function
+`work` uses a thread-local, which is `tls`, not `static`. `main` starts
+a thread and joins it. It's also `alloc(Gpa, extern)`: `spawn_in` keeps
+the thread's result in memory from the `Gpa` it was given, and the C
+library allocates the thread itself with its own allocator, which the
+compiler reports like any other allocation. And it's `diverge`: `join`
+waits for as long as the thread runs. A `#[pure]` function
 can do none of these things, so a pure function is also one you can
 call from any thread.
 

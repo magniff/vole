@@ -22,10 +22,10 @@ like any other input.
 
 Here are two functions side by side. Save them as `lengths.vl`:
 
-```vole lengths.vl mvs
+```vole lengths.vl
 // Reads the words it's given: allocates nothing.
-fn longest(words: [str]) -> usize {
-    var best: usize = 0;
+fn longest(words: &[&str]) -> usize {
+    let mut best: usize = 0;
     for w in words {
         if w.len() > best {
             best = w.len();
@@ -35,8 +35,8 @@ fn longest(words: [str]) -> usize {
 }
 
 // Builds a new Vec: needs an allocator.
-fn lengths(words: [str], gpa: Gpa) -> Vec<usize, Gpa> {
-    var out: Vec<usize, Gpa> = Vec::new_in(gpa);
+fn lengths(words: &[&str], gpa: Gpa) -> Vec<usize, Gpa> {
+    let mut out: Vec<usize, Gpa> = Vec::new_in(gpa);
     for w in words {
         out.push(w.len());
     }
@@ -44,8 +44,8 @@ fn lengths(words: [str], gpa: Gpa) -> Vec<usize, Gpa> {
 }
 
 fn main(gpa: Gpa) {
-    let words: [str; 3] = ["vole", "mouse", "shrew"];
-    println("{} {:?}", longest(words), lengths(words, gpa));
+    let words = ["vole", "mouse", "shrew"];
+    println("{} {:?}", longest(&words), lengths(&words, gpa));
 }
 ```
 
@@ -57,11 +57,11 @@ fn main(gpa: Gpa) {
 for it to allocate from. `lengths` takes one, and you can see that from
 its first line, without reading its body. The compiler sees it too:
 
-```console mvs
+```console
 $ volec query effects crate lengths.vl
 crate::longest	none
 crate::lengths	alloc(Gpa) panic
-crate::main	alloc(Gpa) io panic
+crate::main	alloc(Gpa) io panic diverge
 ```
 
 This line of output for each function is its *effects*, the things
@@ -492,11 +492,11 @@ version of `main` takes no `Gpa` at all, so nothing in the program can
 use the heap. The requests are in the program, since reading stdin
 would need an allocator too:
 
-```vole requests.vl mvs
-use std::FixedBuf;
+```vole requests.vl
+use std::alloc::{Allocator, FixedBuf};
 
-fn split_path<A: Allocator>(path: str, a: A) -> Vec<str, A> {
-    var parts: Vec<str, A> = Vec::new_in(a);
+fn split_path<A: Allocator>(path: &str, a: A) -> Vec<&str, A> {
+    let mut parts: Vec<&str, A> = Vec::new_in(a);
     for p in path.split('/') {
         if !p.is_empty() {
             parts.push(p);
@@ -505,8 +505,8 @@ fn split_path<A: Allocator>(path: str, a: A) -> Vec<str, A> {
     parts
 }
 
-fn handle<A: Allocator>(line: str, a: A) -> String<A> {
-    var out = String::new_in(a);
+fn handle<A: Allocator + Copy>(line: &str, a: A) -> String<A> {
+    let mut out = String::new_in(a);
     let (method, path) = match line.split_once(' ') {
         Some(pair) => pair,
         None => {
@@ -516,55 +516,57 @@ fn handle<A: Allocator>(line: str, a: A) -> String<A> {
     };
     let parts = split_path(path, a);
     if method == "GET" && parts.len() == 2 && parts[0] == "users" {
-        out.push_fmt("200 user {}", parts[1]);
+        write(&mut out, "200 user {}", parts[1]).unwrap();
     } else {
-        out.push_fmt("404 no page {path}");
+        write(&mut out, "404 no page {path}").unwrap();
     }
     out
 }
 
 fn main() {
-    let requests: [str; 4] = [
+    let requests = [
         "GET /users/ada",
         "hello",
         "GET /users/ada/posts",
         "GET /a/b/c/d/e/f/g/h/i",
     ];
-    var mem = [0u8; 256];
+    let mut mem = [0u8; 256];
     for line in requests {
-        let fb = FixedBuf::new(&mem[..]);
-        let reply = handle(line, fb);
+        let fb = FixedBuf::new(&mut mem);
+        let reply = handle(line, &fb);
         println("{line:<24} -> {reply} ({} bytes)", fb.used());
     }
 }
 ```
 
 ```out exit=101
-GET /users/ada           -> 200 user ada (76 bytes)
+GET /users/ada           -> 200 user ada (91 bytes)
 hello                    -> 400 bad request (15 bytes)
-GET /users/ada/posts     -> 404 no page /users/ada/posts (92 bytes)
-out of memory
+GET /users/ada/posts     -> 404 no page /users/ada/posts (104 bytes)
+memory allocation of 256 bytes failed
 ```
 
-`var mem = [0u8; 256];` is 256 bytes on `main`'s stack, and
-`FixedBuf::new(&mem[..])` makes an allocator that hands them out. The
-`&` is chapter 4's: the `FixedBuf` writes what it allocates into `mem`,
-so it holds an inout access to it, and while the `FixedBuf` and what it
-allocated are in use, nothing else can read or change `mem`. Each
-request gets a fresh `FixedBuf` over the same bytes, because the last
-request's reply and parts were dropped at the end of its round.
+`let mut mem = [0u8; 256];` is 256 bytes on `main`'s stack, and
+`FixedBuf::new(&mut mem)` makes an allocator that hands them out. The
+`&mut` is chapter 4's: the `FixedBuf` writes what it allocates into
+`mem`, so it borrows `mem` mutably, and while the `FixedBuf` and what it
+allocated are in use, nothing else can read or change `mem`. `handle`
+gets `&fb`: a reference to an allocator is an allocator too, and one
+you can copy. Each request gets a fresh `FixedBuf` over the same bytes,
+because the last request's reply and parts were dropped at the end of
+its round.
 
 The fourth request has nine parts, and the Vec holding them needs more
 room than the 256 bytes have. A heap would just give it more; a
-`FixedBuf` can't, and `push` stops the program with "out of memory" and
-exit status 101, like any other panic.
+`FixedBuf` can't, and `push` stops the program, saying that an
+allocation failed, with exit status 101, like any other panic.
 
 The compiler confirms that no `Gpa` is involved:
 
-```console mvs
+```console
 $ volec query effects crate requests.vl
-split_path<FixedBuf>	alloc(FixedBuf) panic diverge
-handle<FixedBuf>	alloc(FixedBuf) io panic diverge
+split_path<&FixedBuf>	alloc(FixedBuf) panic diverge
+handle<&FixedBuf>	alloc(FixedBuf) panic diverge
 crate::main	alloc(FixedBuf) io panic diverge
 ```
 

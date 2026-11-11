@@ -6,7 +6,7 @@ is `fn main()`: it takes no `Gpa`, so nothing in the program can
 allocate from the heap, and the compiler can show it. The numbers'
 stack and the line being read are `Vec`s on a `FixedBuf`, an allocator
 that hands out the bytes of a buffer you give it; when they are used up,
-the `try_` forms return an error the calculator reports, where a heap
+`try_reserve` returns an error the calculator reports, where a heap
 allocation would have grown.
 
 This is the shape of code for places without a heap, or where running
@@ -39,75 +39,73 @@ stack, and 160 bytes in the line.
 
 ## The memory
 
-```tach
+```vole
 fn main() -> i32 {
-    var line_mem = [0u8; 184];
-    var stack_mem = [0u8; 328];
-    let line_fb = FixedBuf::new(&line_mem[..]);
-    let stack_fb = FixedBuf::new(&stack_mem[..]);
-    var line: Vec<u8, FixedBuf> = Vec::with_capacity_in(160, line_fb);
-    var stack: Vec<i64, FixedBuf> = Vec::new_in(stack_fb);
+    let mut line_mem = [0u8; 184];
+    let mut stack_mem = [0u8; 328];
+    let line_fb = FixedBuf::new(&mut line_mem);
+    let stack_fb = FixedBuf::new(&mut stack_mem);
+    let mut line: Vec<u8, &FixedBuf> = Vec::with_capacity_in(160, &line_fb);
+    let mut stack: Stack = Vec::with_capacity_in(32, &stack_fb);
 ```
 
-`FixedBuf::new(&line_mem[..])` makes an allocator over the array: it
-keeps its count of the bytes used in the first 16 (after aligning to
-8), and bumps through the rest. Like an arena, it frees only its last
-block (or grows it in place): the stack grows in place, 4 numbers, 8,
-16, 32. At 32 (256 bytes) the next size needs 256 bytes more, and its
-buffer has no room for them.
+`FixedBuf::new(&mut line_mem)` makes an allocator over the array, and
+bumps through its bytes. Both `Vec`s ask for their room once, up front:
+160 bytes for the line, 32 numbers (256 bytes) for the stack. A `Vec`
+that grows asks its allocator for a new, larger block, and neither
+buffer has room for a second one.
 
-`&` marks that the allocator changes the array: a `FixedBuf` holds its
-memory inout (0.25), and a container on it holds it through its
-allocator. While the line lives, `line_mem` is not read, written or
-dropped another way (`own.conflict`), and neither the allocator nor the
-line can outlive it (`own.escape`): so the line and the stack, alive
-together, each have a buffer of their own. The final count adds their
-capacities, as the handles were moved into the two `Vec`s.
+`&mut` says that the allocator changes the array: a `FixedBuf` borrows
+its memory mutably, and a container on it borrows the `FixedBuf`
+(`&line_fb` is the allocator the `Vec` holds). While the line lives,
+`line_mem` is not read or written another way, and neither the
+allocator nor the line can outlive it (the borrow checker's rules): so
+the line and the stack, alive together, each have a buffer of their
+own.
 
 ## Running out, handled
 
-`push` stops the program when the allocator is out of memory (the
-message is "out of memory", exit 101). `try_push` returns a `Result`
-instead:
+`push` stops the program when the allocator is out of memory (exit
+101). `try_reserve(1)` asks for the room first, and returns a `Result`:
 
-```tach
-fn push(stack: inout Vec<i64, FixedBuf>, x: i64) -> Result<(), CalcError> {
-    match stack.try_push(x) {
-        Ok(()) => Ok(()),
-        Err(AllocError::OutOfMemory) => Err(CalcError::TooDeep(stack.len())),
+```vole
+fn push<'a>(stack: &mut Stack, x: i64) -> Result<(), CalcError<'a>> {
+    if stack.try_reserve(1).is_err() {
+        return Err(CalcError::TooDeep(stack.len()));
     }
+    stack.push(x);
+    Ok(())
 }
 ```
 
-`try_reserve(n)` is the same for room for `n` more. The line is read
-the same way, a byte at a time with `try_push`: a line that does not fit
-is read to its end and reported. (std's `read_line` would grow the line
-with `push`, and it keeps its own buffer for stdin from C's `malloc`:
-this program reads stdin with C's `read` into 64 bytes of its own.)
-Only `Vec` has `try_` forms; a `Buf` or a `HashMap` on a
-`FixedBuf` stops the program when it is full.
+The line is read the same way, a byte at a time with `try_reserve`: a
+line that does not fit is read to its end and reported. (std's readers
+of a whole input take an allocator for what they read: this program
+reads stdin with C's `read` into 64 bytes of its own.) A `String` or a
+`HashMap` on a `FixedBuf` that is full stops the program, unless its
+room was reserved the same way.
 
 ## What the compiler can show
 
 ```console
 $ volec query effects crate
-<crate::CalcError as Display>::fmt	io panic
-crate::push	alloc(FixedBuf)
+<crate::CalcError as Display>::fmt	panic diverge
+crate::push	alloc(FixedBuf) panic
 crate::skip	panic
 crate::pop2	panic
 crate::eval	alloc(FixedBuf) panic
 crate::Input::byte	io panic unsafe
 crate::Input::line	alloc(FixedBuf) io panic diverge
-crate::short	panic
+crate::short	panic diverge
 crate::main	alloc(FixedBuf) io panic diverge
 ```
 
 No function has `alloc(Gpa)`, nor `alloc(extern)` (C's `malloc`):
 every allocation is from the `FixedBuf`. `eval` makes it a promise:
 
-```tach
+```vole
 #[effects(alloc(FixedBuf), panic)]
-fn eval(line: [u8], stack: inout Vec<i64, FixedBuf>) -> Result<i64, CalcError> {
+fn eval<'a>(line: &'a str, stack: &mut Stack) -> Result<i64, CalcError<'a>> {
 ```
 
 The compiler checks the declaration against everything `eval` calls.
