@@ -108,7 +108,7 @@ is designed so that ordinary code can't have undefined behaviour.
 
 | C or C++ | vole | chapter |
 |---|---|---|
-| undefined behaviour: signed overflow, a bad index | none in safe code: overflow stops a debug build and wraps in an optimized one, and every index is checked | 3, 15 |
+| undefined behaviour: signed overflow, a bad index, an uninitialized variable | none in safe code: overflow stops a debug build and wraps in an optimized one, every index is checked, every variable is set before it's read | 3, 15 |
 | `malloc` and `free`, `new` and `delete` | allocators passed as parameters; values are freed when they go out of scope | 8 |
 | destructors (C++) | `impl Drop`, run at the end of the scope | 4, 15 |
 | a pointer and a length, passed separately | a slice, `&[T]`, which carries its length | 7 |
@@ -187,7 +187,7 @@ choice about memory.
 | `defer` | a guard, a struct whose `Drop` cleans up, made where the defer was (`volec guide memory`); there is no `defer` | 4, 15 |
 | `go fmt`, `go vet` | `volec fmt`, and the compiler's own checks | 17 |
 | modules and packages | modules (`mod`, `use`, `pub`); no packages yet | 11 |
-| zero values | none: a variable holds the value the program gave it | 3 |
+| zero values | none: a variable has no value until the program gives it one, and reading it before that is an error | 3 |
 
 The trade is this: Go makes memory easy by collecting it for you, at the
 cost of a collector running alongside your program. Vole makes you pass

@@ -238,7 +238,9 @@ is seen only by the struct's module and the modules inside it. Another
 module reads `r.w` only when the field is `pub w: i64`, and builds the
 struct with a literal only when every field is `pub`; otherwise it
 calls a function of the struct's module (`Rect::new(3, 4)`), which keeps
-the fields meaning what they should.
+the fields meaning what they should. The functions and methods of an
+`impl` are items like any other: `Rect::new` and `r.area()` are called
+from another module only when they are `pub fn`.
 
 ## Paths and use
 

@@ -138,11 +138,10 @@ equal to the pivot guarantees progress when many values are equal.
 
 **The driver** runs the three methods through one generic function,
 which takes the selection as a closure,
-`F: FnMut(&mut [i64], usize) -> i64`, and calls it once per rank on its
-working copy:
+`F: FnMut(&mut [i64], usize) -> i64`, and collects the seven answers with an iterator:
 
 ```tach
-for k in ks { found.push(select(&mut work, *k)); }
+let found = ks.iter().map(|k| select(&mut work, *k)).collect_in(gpa);
 ```
 
 The sorting "method" is a closure too; it sorts on its first call and

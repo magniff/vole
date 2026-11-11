@@ -1,6 +1,403 @@
 // EDITION: rust
-// std::sync: what threads share. Its first part (0.27.3): the atomics.
-// Mutex, RwLock, Arc and the channels come later.
+// std::sync: what threads share: the atomics, Mutex, RwLock, Condvar, Once,
+// Arc and the channels (std::sync::mpsc), Rust's API. A lock is a 32-bit
+// word the waiters sleep on (futex on Linux, __ulock on macOS:
+// std::__sys's futex_wait and futex_wake).
+//
+// There is no poisoning: a panic ends the program (no unwinding), so a
+// lock is never left held by a thread that panicked. `lock()` still returns
+// Rust's LockResult, always Ok, so `m.lock().unwrap()` reads as in Rust.
 // mvs: std::sync
 
 pub mod atomic;
+pub mod mpsc;
+mod arc;
+mod rwlock;
+
+use crate::cell::UnsafeCell;
+use crate::fmt::{Debug, Display, Formatter};
+use crate::ops::{Deref, DerefMut, Drop};
+use crate::result::Result;
+use crate::sync::atomic::{AtomicU32, Ordering};
+
+pub use arc::Arc;
+pub use rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+// The lock under Mutex: a word, 0 unlocked, 1 locked, 2 locked with
+// waiters (U. Drepper, "Futexes are tricky", mutex 3). Acquire on lock,
+// release on unlock.
+pub(crate) struct RawLock {
+    state: AtomicU32,
+}
+
+impl RawLock {
+    #[effects()]
+    pub(crate) fn new() -> RawLock {
+        RawLock { state: AtomicU32::new(0) }
+    }
+
+    // Waits until the lock is free, and takes it.
+    #[effects(io, sync, panic, diverge)]
+    pub(crate) fn lock(&self) {
+        if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            self.lock_contended();
+        }
+    }
+
+    // Takes the lock when it is free; whether it did.
+    #[effects(io, sync, panic, diverge)]
+    pub(crate) fn try_lock(&self) -> bool {
+        self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
+    }
+
+    fn lock_contended(&self) {
+        // A short spin first: the holder may be about to let go.
+        for _ in 0..100 {
+            if self.state.load(Ordering::Relaxed) == 0
+                && self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                return;
+            }
+        }
+        while self.state.swap(2, Ordering::Acquire) != 0 {
+            // UNSAFE: the system sleeps on a raw address.
+            // SAFETY: the address is self.state's, a live AtomicU32 (4
+            // bytes, aligned) for the whole call: self is borrowed.
+            unsafe { crate::__sys::futex_wait(self.state.as_ptr(), 2) };
+        }
+    }
+
+    // Lets the lock go (the caller holds it), waking a waiter.
+    #[effects(sync, unsafe)]
+    pub(crate) fn unlock(&self) {
+        if self.state.swap(0, Ordering::Release) == 2 {
+            // UNSAFE: the system wakes the sleepers on a raw address.
+            // SAFETY: the address is self.state's, live while self is
+            // borrowed; nothing is read through it.
+            unsafe { crate::__sys::futex_wake(self.state.as_ptr(), false) };
+        }
+    }
+}
+
+// Rust's error of a lock whose holder panicked. A panic ends the program
+// here, so no lock ever returns it: it is there for Rust's signatures.
+pub struct PoisonError<T> {
+    data: T,
+}
+
+impl<T> PoisonError<T> {
+    pub fn new(data: T) -> PoisonError<T> {
+        PoisonError { data: data }
+    }
+
+    // The guard (or the data) the error holds.
+    #[effects()]
+    pub fn into_inner(self) -> T {
+        self.data
+    }
+
+    pub fn get_ref(&self) -> &T {
+        &self.data
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.data
+    }
+}
+
+impl<T> Debug for PoisonError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        f.write_str("PoisonError { .. }")
+    }
+}
+
+impl<T> Display for PoisonError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        f.write_str("poisoned lock: another task failed inside")
+    }
+}
+
+// try_lock's error: the lock is held (WouldBlock); Poisoned never happens
+// (see PoisonError).
+pub enum TryLockError<T> {
+    Poisoned(PoisonError<T>),
+    WouldBlock,
+}
+
+impl<T> Debug for TryLockError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        match self {
+            TryLockError::Poisoned(_) => f.write_str("Poisoned(..)"),
+            TryLockError::WouldBlock => f.write_str("WouldBlock"),
+        }
+    }
+}
+
+impl<T> Display for TryLockError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        match self {
+            TryLockError::Poisoned(_) => f.write_str("poisoned lock: another task failed inside"),
+            TryLockError::WouldBlock => {
+                f.write_str("try_lock failed because the operation would block")
+            }
+        }
+    }
+}
+
+// What lock() returns: always Ok here.
+pub type LockResult<T> = Result<T, PoisonError<T>>;
+
+// What try_lock() returns: Err(WouldBlock) when the lock is held.
+pub type TryLockResult<T> = Result<T, TryLockError<T>>;
+
+// Data behind a lock: only the thread holding it reaches the data. `lock`
+// waits for the lock and gives a guard, through which the data is read and
+// written (`*g`); dropping the guard unlocks.
+//
+//     let m = Mutex::new(0);
+//     *m.lock().unwrap() += 1;
+// std2: changed: Rust's guard API (MVS: with, try_with, an unsafe lock)
+pub struct Mutex<T> {
+    raw: RawLock,
+    data: UnsafeCell<T>,
+}
+
+// UNSAFE: a Mutex holds an UnsafeCell, which is not Sync: stated, as Rust's.
+// SAFETY: the data is reached only through a guard, which exists only
+// while its thread holds the lock, or through `&mut self` and `self`: one
+// thread at a time, so sharing the Mutex shares a T between threads the
+// way moving it would (T: Send).
+unsafe impl<T: Send> Sync for Mutex<T> {}
+// UNSAFE: stated with Sync, as Rust's.
+// SAFETY: moving a Mutex moves its T (T: Send); the lock word is an atomic.
+unsafe impl<T: Send> Send for Mutex<T> {}
+
+impl<T> Mutex<T> {
+    #[effects(T)]
+    pub fn new(v: T) -> Mutex<T> {
+        Mutex { raw: RawLock::new(), data: UnsafeCell::new(v) }
+    }
+
+    // Waits for the lock; the guard unlocks when it is dropped.
+    #[effects(io, sync, panic, diverge)]
+    pub fn lock(&self) -> LockResult<MutexGuard<'_, T>> {
+        self.raw.lock();
+        Result::Ok(MutexGuard { lock: self })
+    }
+
+    // The guard when the lock is free now, else Err(WouldBlock).
+    #[effects(io, sync, panic, diverge)]
+    pub fn try_lock(&self) -> TryLockResult<MutexGuard<'_, T>> {
+        if self.raw.try_lock() {
+            Result::Ok(MutexGuard { lock: self })
+        } else {
+            Result::Err(TryLockError::WouldBlock)
+        }
+    }
+
+    // Always false: there is no poisoning.
+    #[effects()]
+    pub fn is_poisoned(&self) -> bool {
+        false
+    }
+
+    // The data, when nothing else can reach the mutex.
+    #[effects(T)]
+    pub fn into_inner(self) -> LockResult<T> {
+        Result::Ok(self.data.into_inner())
+    }
+
+    // The data, through the unique borrow (no locking needed).
+    #[effects(T)]
+    pub fn get_mut(&mut self) -> LockResult<&mut T> {
+        Result::Ok(self.data.get_mut())
+    }
+}
+
+impl<T: Debug> Debug for Mutex<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        match self.try_lock() {
+            Result::Ok(g) => {
+                f.write_str("Mutex { data: ")?;
+                Debug::fmt(g.deref(), f)?;
+                f.write_str(", poisoned: false, .. }")
+            }
+            Result::Err(_) => f.write_str("Mutex { data: <locked>, poisoned: false, .. }"),
+        }
+    }
+}
+
+// A held lock (Mutex::lock): the data through `*g`; dropping it unlocks.
+// It stays on the thread that locked.
+pub struct MutexGuard<'a, T> {
+    lock: &'a Mutex<T>,
+}
+
+// The lock is let go by the thread that took it (stated, as Rust's).
+impl<'a, T> !Send for MutexGuard<'a, T> {}
+
+impl<'a, T> Deref for MutexGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // UNSAFE: the data is behind the Mutex's UnsafeCell, a raw pointer.
+        // SAFETY: a guard exists only while its thread holds the lock, so
+        // nothing else reaches the data; the & lives no longer than the
+        // guard's borrow.
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<'a, T> DerefMut for MutexGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // UNSAFE: as deref's.
+        // SAFETY: as deref's, and `&mut self` makes this the guard's one
+        // access.
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<'a, T> Drop for MutexGuard<'a, T> {
+    fn drop(&mut self) {
+        self.lock.raw.unlock();
+    }
+}
+
+impl<'a, T: Debug> Debug for MutexGuard<'a, T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        Debug::fmt(self.deref(), f)
+    }
+}
+
+impl<'a, T: Display> Display for MutexGuard<'a, T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        Display::fmt(self.deref(), f)
+    }
+}
+
+// Waiting for a change of a Mutex's data: `wait(guard)` unlocks, sleeps
+// until a notify and locks again; a thread that changes the data notifies
+// (`notify_one`, `notify_all`). A wait may wake with no notify: test the
+// condition in a loop, or use wait_while.
+//
+//     let mut g = m.lock().unwrap();
+//     while !*g {
+//         g = cv.wait(g).unwrap();
+//     }
+// std2: changed: Rust's wait and wait_while (MVS: wait_then)
+pub struct Condvar {
+    // Bumped by each notify: a waiter sleeps while it has not changed.
+    seq: AtomicU32,
+}
+
+impl Condvar {
+    #[effects()]
+    pub fn new() -> Condvar {
+        Condvar { seq: AtomicU32::new(0) }
+    }
+
+    // Unlocks guard's mutex, sleeps until notified, locks again.
+    #[effects(io, sync, panic, diverge, unsafe, T)]
+    pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> LockResult<MutexGuard<'a, T>> {
+        let m: &'a Mutex<T> = guard.lock;
+        // (read under the lock: a notify after this changes it, and the
+        // sleep below returns at once)
+        let seen = self.seq.load(Ordering::Acquire);
+        crate::mem::drop(guard);
+        // UNSAFE: the system sleeps on a raw address.
+        // SAFETY: the address is self.seq's, a live AtomicU32 while self
+        // is borrowed.
+        unsafe { crate::__sys::futex_wait(self.seq.as_ptr(), seen) };
+        m.raw.lock();
+        Result::Ok(MutexGuard { lock: m })
+    }
+
+    // wait, again while condition(data) holds.
+    #[effects(diverge, T, F)]
+    pub fn wait_while<'a, T, F: FnMut(&mut T) -> bool>(&self, guard: MutexGuard<'a, T>,
+        condition: F) -> LockResult<MutexGuard<'a, T>> {
+        let mut cond = condition;
+        let mut g = guard;
+        while cond(g.deref_mut()) {
+            g = match self.wait(g) {
+                Result::Ok(next) => next,
+                Result::Err(e) => return Result::Err(e),
+            };
+        }
+        Result::Ok(g)
+    }
+
+    // Wakes one waiting thread.
+    #[effects(sync, unsafe)]
+    pub fn notify_one(&self) {
+        self.seq.fetch_add(1, Ordering::Release);
+        // UNSAFE: the system wakes a sleeper on a raw address.
+        // SAFETY: the address is self.seq's, live while self is borrowed.
+        unsafe { crate::__sys::futex_wake(self.seq.as_ptr(), false) };
+    }
+
+    // Wakes every waiting thread.
+    #[effects(sync, unsafe)]
+    pub fn notify_all(&self) {
+        self.seq.fetch_add(1, Ordering::Release);
+        // UNSAFE: as notify_one's.
+        // SAFETY: as notify_one's.
+        unsafe { crate::__sys::futex_wake(self.seq.as_ptr(), true) };
+    }
+}
+
+impl Debug for Condvar {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        f.write_str("Condvar { .. }")
+    }
+}
+
+// Runs a function once, whatever the threads calling it (`static INIT:
+// Once = Once::new();`). The first call_once runs f; the others wait until
+// it is done.
+pub struct Once {
+    // 0: not run, 1: running, 2: done.
+    state: AtomicU32,
+}
+
+impl Once {
+    #[effects()]
+    pub fn new() -> Once {
+        Once { state: AtomicU32::new(0) }
+    }
+
+    // Runs f unless a call_once of this Once ran (or is running) already;
+    // returns when it is done.
+    // std2: changed: FnOnce (MVS: FnMut)
+    #[effects(io, sync, panic, diverge, unsafe, F)]
+    pub fn call_once<F: FnOnce()>(&self, f: F) {
+        if self.state.load(Ordering::Acquire) == 2 {
+            return;
+        }
+        if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire).is_ok() {
+            f();
+            self.state.store(2, Ordering::Release);
+            // UNSAFE: the system wakes the sleepers on a raw address.
+            // SAFETY: the address is self.state's, live while self is
+            // borrowed.
+            unsafe { crate::__sys::futex_wake(self.state.as_ptr(), true) };
+            return;
+        }
+        while self.state.load(Ordering::Acquire) != 2 {
+            // UNSAFE: the system sleeps on a raw address.
+            // SAFETY: as above; it sleeps only while the word is 1.
+            unsafe { crate::__sys::futex_wait(self.state.as_ptr(), 1) };
+        }
+    }
+
+    // Whether a call_once has finished.
+    #[effects(io, sync, panic, diverge)]
+    pub fn is_completed(&self) -> bool {
+        self.state.load(Ordering::Acquire) == 2
+    }
+}
+
+impl Debug for Once {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        f.write_str("Once { .. }")
+    }
+}

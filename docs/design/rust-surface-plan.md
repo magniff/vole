@@ -416,7 +416,9 @@ translator.
 **Cut to 0.29:** const generics, `Rc` and `Arc`, `RefCell` (its `Ref`
 and `RefMut` guards) and `Mutex`'s lock guard (`with(|d| ..)` stays),
 explicit `for<'a>`, disjoint-field closure capture (whole variables
-first), user-defined DSTs (`?Sized` only for `str` and `[T]`), unsize
+first), user-defined DSTs (`?Sized` only for `str` and `[T]`; with
+them, std::path's `Path<'a>`, a sized view since 0.28.0, becomes Rust's
+unsized `Path` reached as `&'a Path`), unsize
 coercions beyond `&[T; N] → &[T]`, `#[may_dangle]`. **Cut to a 0.27
 point release:** the location-sensitive solve, added behind the NLL
 filter once NLL is green.
