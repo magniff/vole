@@ -14,7 +14,7 @@ use std::gpu::{BufferUsage, Format, PassDesc, Reflection, ShaderSource, TextureU
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, mut queue) = inst.adapter()?.device()?;
+    let (dev, mut queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
     let code = "#include <metal_stdlib>\nusing namespace metal;\nvertex float4 vs(uint v [[vertex_id]]) { float2 p[3] = { float2(-1, -1), float2(3, -1), float2(-1, 3) }; return float4(p[v], 0, 1); }\nfragment float4 fs() { return float4(1, 0.5, 0, 1); }\n";
     let mut refl = Reflection::new_in(gpa);
     refl.vertex("vs", "vs");
@@ -23,11 +23,13 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let shader = dev.shader(&src)?;
     let desc = gpu::RenderDesc::new(&shader, "vs", "fs", Format::Rgba8Unorm);
     let pipe = dev.render_pipeline(desc)?;
-    let tex = dev.texture(8, 8, Format::Rgba8Unorm, usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+    let tex = dev.texture(8, 8, Format::Rgba8Unorm,
+        TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
     let view = tex.view();
     let mut out = dev.buffer(256 * 8, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
     let mut enc = dev.encoder();
-    enc.render_pass(PassDesc::color(&view), |pass| { // cleared to black, then drawn
+    enc.render_pass(PassDesc::color(&view, gpu::Color::black(), gpu::Load::Clear),
+        |pass| { // cleared to black, then drawn
         pass.set_pipeline(&pipe);
         pass.draw(0..3, 0..1); // a triangle over the whole target
     });
@@ -46,7 +48,9 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
 
 A vertex buffer of several attributes (`VertexLayout`: the stride, then
 each `@location(n)` with its format and offset), a one-channel texture
-written from the CPU (`queue.write_texture(&tex, bytes, bytes_per_row)`),
+written from the CPU (`queue.write_texture(&tex, bytes, bytes_per_row)`,
+the whole of it; a part or another layer with `write_texture_region(..,
+x, y, w, h, layer)`, as `copy_texture_to_buffer_region` reads one back),
 a sampler, and both bound beside each other: `gpu::bind_texture`,
 `gpu::bind_sampler`. A fragment shader samples with `textureSample`, or
 `textureSampleLevel(t, s, uv, 0.0)` where it must name the level (a
@@ -72,10 +76,10 @@ embed wgsl QUAD {
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, mut queue) = inst.adapter()?.device()?;
+    let (dev, mut queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
     let shader = dev.shader_wgsl(QUAD.src)?;
     let mut desc = gpu::RenderDesc::new(&shader, QUAD.vs, QUAD.fs, Format::Rgba8Unorm);
-    let mut layout = VertexLayout::new(16); // x, y, u, v: four f32s a vertex
+    let mut layout = VertexLayout::new(16, gpu::StepMode::Vertex); // x, y, u, v: four f32s a vertex
     layout.attribute(0, VertexFormat::Float32x2, 0);
     layout.attribute(1, VertexFormat::Float32x2, 8);
     desc.vertex_buffer(layout);
@@ -87,20 +91,21 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     ];
     let vb = dev.buffer_init(gpu::bytes_of_f32(&quad[..]), BufferUsage::VERTEX);
     // a 2 x 2 R8Unorm texture, a byte a texel, rows of 2 bytes
-    let image = dev.texture(2, 2, Format::R8Unorm); // TEXTURE_BINDING | COPY_DST
+    let image = dev.texture(2, 2, Format::R8Unorm,
+        TextureUsage::TEXTURE_BINDING | TextureUsage::COPY_DST); // TEXTURE_BINDING | COPY_DST
     let texels: [u8; 4] = [0, 64, 128, 255];
     queue.write_texture(&image, &texels[..], 2);
     let sampler = dev.sampler(SamplerDesc::nearest());
     let group = dev.bind_group(pipe.bind_layout(0),
         &[gpu::bind_texture(0, &image.view()), gpu::bind_sampler(1, &sampler)][..]);
     let target = dev.texture(4, 4, Format::Rgba8Unorm,
-        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
     let mut out = dev.buffer(256 * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
     let mut enc = dev.encoder();
-    enc.render_pass(PassDesc::color(&target.view()), |pass| {
+    enc.render_pass(PassDesc::color(&target.view(), gpu::Color::black(), gpu::Load::Clear), |pass| {
         pass.set_pipeline(&pipe);
         pass.set_bind_group(0, &group);
-        pass.set_vertex_buffer(0, &vb);
+        pass.set_vertex_buffer(0, &vb, 0);
         pass.draw(0..6, 0..1);
     });
     enc.copy_texture_to_buffer(&target, &out, 256);
@@ -120,11 +125,11 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
 An overlay (a panel, a label, a cursor) is one more render pass into the
 same target after the scene's passes and before `frame.present`: a
 pass that keeps what is there instead of clearing it,
-`PassDesc::color(&view, load: Load::Keep)`, and a pipeline that blends
-over it, `desc.blend(Blend::alpha())` (source over destination, straight
+`PassDesc::color(&view, Color::black(), load: Load::Keep)`, and a pipeline that blends
+over it, `desc.blend(Blend::alpha(), 0)` (source over destination, straight
 alpha; `Blend::premultiplied()` for premultiplied colours). Everything
 is a textured quad from one vertex buffer of position, colour and uv
-(`VertexLayout::new(32)`: `Float32x2`, `Float32x4`, `Float32x2`), and
+(`VertexLayout::new(32, gpu::StepMode::Vertex)`: `Float32x2`, `Float32x4`, `Float32x2`), and
 one `R8Unorm` atlas (`queue.write_texture`) holds the glyphs and a white
 texel: a solid quad samples the white texel, a character its glyph, and
 the fragment shader writes the colour with alpha times the coverage. A
@@ -200,24 +205,25 @@ fn text(vs: &mut Vec<f32, Gpa>, x: f64, y: f64, s: &[u8], c: [f32; 4]) {
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, mut queue) = inst.adapter()?.device()?;
+    let (dev, mut queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
     let target = dev.texture(W, H, Format::Rgba8Unorm,
-        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
     let view = target.view();
     // the image you just made: here a pass that clears it to blue
     let mut enc = dev.encoder();
-    enc.render_pass(PassDesc::color(&view, clear: Color::rgba(0.0, 0.0, 1.0, 1.0)), |_| {});
+    enc.render_pass(PassDesc::color(&view, clear: Color::rgba(0.0, 0.0, 1.0, 1.0),
+        load: Load::Clear), |_| {});
     queue.submit(enc.finish());
 
     // the overlay: a blended pipeline of position, colour and uv
     let shader = dev.shader_wgsl(UI.src)?;
     let mut desc = gpu::RenderDesc::new(&shader, UI.vs, UI.fs, Format::Rgba8Unorm); // a frame: Bgra8Unorm
-    let mut layout = VertexLayout::new(32); // 8 f32s a vertex
+    let mut layout = VertexLayout::new(32, gpu::StepMode::Vertex); // 8 f32s a vertex
     layout.attribute(0, VertexFormat::Float32x2, 0); // x, y
     layout.attribute(1, VertexFormat::Float32x4, 8); // r, g, b, a
     layout.attribute(2, VertexFormat::Float32x2, 24); // u, v
     desc.vertex_buffer(layout);
-    desc.blend(Blend::alpha()); // source over what is there
+    desc.blend(Blend::alpha(), 0); // source over what is there
     let pipe = dev.render_pipeline(desc)?;
     let mut texels: Vec<u8, Gpa> = Vec::new_in(gpa);
     for row in ART {
@@ -225,7 +231,8 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
             texels.push(if ch == b'#' { 255 } else { 0 });
         }
     }
-    let atlas = dev.texture(12, 5, Format::R8Unorm); // TEXTURE_BINDING | COPY_DST
+    let atlas = dev.texture(12, 5, Format::R8Unorm,
+        TextureUsage::TEXTURE_BINDING | TextureUsage::COPY_DST); // TEXTURE_BINDING | COPY_DST
     queue.write_texture(&atlas, texels.as_slice(), 12); // rows of 12 bytes
     let sampler = dev.sampler(SamplerDesc::nearest());
     let group = dev.bind_group(pipe.bind_layout(0),
@@ -241,10 +248,11 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let count = verts.len() / 8;
     let mut out = dev.buffer(256 * H, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
     let mut enc2 = dev.encoder();
-    enc2.render_pass(PassDesc::color(&view, load: Load::Keep), |pass| { // kept, not cleared
+    enc2.render_pass(PassDesc::color(&view, Color::black(), load: Load::Keep),
+        |pass| { // kept, not cleared
         pass.set_pipeline(&pipe);
         pass.set_bind_group(0, &group);
-        pass.set_vertex_buffer(0, &vb);
+        pass.set_vertex_buffer(0, &vb, 0);
         pass.draw(0..count as i64, 0..1);
     });
     enc2.copy_texture_to_buffer(&target, &out, 256);
@@ -284,7 +292,8 @@ and writes a PPM (`guide window#checking-the-pixels-headless`).
 ## Multiple render targets
 
 One pass can write several textures at once, a G-buffer: the pass
-names a color attachment for each (`PassDesc::color(&a).with_color(&b)`,
+names a color attachment for each (`PassDesc::color(&a, clear,
+load).with_color(&b, clear, load)`,
 at most 8), the pipeline a target of the same format for each, in the
 same order (`RenderDesc::new`'s format is target 0, then
 `desc.target(format)`), and the fragment shader returns a struct whose
@@ -313,16 +322,16 @@ embed wgsl GBUFFER {
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, mut queue) = inst.adapter()?.device()?;
+    let (dev, mut queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
     let shader = dev.shader_wgsl(GBUFFER.src)?;
     let mut desc = gpu::RenderDesc::new(&shader, GBUFFER.vs, GBUFFER.fs, Format::Rgba8Unorm); // target 0
     desc.target(Format::Rgba8Unorm); // target 1
     desc.target(Format::R32Float); // target 2
     let pipe = dev.render_pipeline(desc)?;
     let usage = TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC;
-    let albedo = dev.texture(8, 8, Format::Rgba8Unorm, usage: usage);
-    let normal = dev.texture(8, 8, Format::Rgba8Unorm, usage: usage);
-    let depth = dev.texture(8, 8, Format::R32Float, usage: usage);
+    let albedo = dev.texture(8, 8, Format::Rgba8Unorm, usage);
+    let normal = dev.texture(8, 8, Format::Rgba8Unorm, usage);
+    let depth = dev.texture(8, 8, Format::R32Float, usage);
     let (av, nv, dv) = (albedo.view(), normal.view(), depth.view());
     let mut outs = [
         dev.buffer(256 * 8, BufferUsage::MAP_READ | BufferUsage::COPY_DST),
@@ -330,7 +339,9 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
         dev.buffer(256 * 8, BufferUsage::MAP_READ | BufferUsage::COPY_DST),
     ];
     let mut enc = dev.encoder();
-    enc.render_pass(PassDesc::color(&av).with_color(&nv).with_color(&dv), |pass| {
+    enc.render_pass(PassDesc::color(&av, gpu::Color::black(), gpu::Load::Clear).with_color(&nv,
+        gpu::Color::black(), gpu::Load::Clear).with_color(&dv, gpu::Color::black(),
+        gpu::Load::Clear), |pass| {
         pass.set_pipeline(&pipe);
         pass.draw(0..3, 0..1); // one draw writes all three
     });
@@ -356,10 +367,10 @@ index), and a depth state only where the pass has a depth attachment.
 
 ## Depth-only passes
 
-A shadow map is drawn with no color at all: `PassDesc::depth_only(&view)`
+A shadow map is drawn with no color at all: `PassDesc::depth_only(&view, 1.0, true)`
 (cleared to 1.0 and stored, to be read afterwards) and a pipeline with
 no fragment stage and no color target, `RenderDesc::depth_only(&shader,
-"vs")` (a `Depth32Float` test, `Compare::Less`, that writes). The shader
+"vs", Format::Depth32Float, Compare::Less)` (a test that writes). The shader
 needs only the vertex entry. The depth texture is then read by the next
 pass as a `texture_depth_2d` (`textureLoad`, or `textureSampleCompare`
 with a comparison sampler); it needs `TEXTURE_BINDING` for that.
@@ -376,10 +387,11 @@ embed wgsl SHADOW {
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, mut queue) = inst.adapter()?.device()?;
+    let (dev, mut queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
     let shader = dev.shader_wgsl(SHADOW.src)?;
-    let mut desc = gpu::RenderDesc::depth_only(&shader, SHADOW.vs);
-    let mut layout = VertexLayout::new(12);
+    let mut desc = gpu::RenderDesc::depth_only(&shader, SHADOW.vs, Format::Depth32Float,
+        gpu::Compare::Less);
+    let mut layout = VertexLayout::new(12, gpu::StepMode::Vertex);
     layout.attribute(0, VertexFormat::Float32x3, 0);
     desc.vertex_buffer(layout);
     let pipe = dev.render_pipeline(desc)?;
@@ -387,13 +399,13 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let tri: [f32; 9] = [-1.0, -1.0, 0.25, 0.0, -1.0, 0.25, -1.0, 3.0, 0.25];
     let vb = dev.buffer_init(gpu::bytes_of_f32(&tri[..]), BufferUsage::VERTEX);
     let map = dev.texture(8, 8, Format::Depth32Float,
-        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::TEXTURE_BINDING | TextureUsage::COPY_SRC);
+        TextureUsage::RENDER_ATTACHMENT | TextureUsage::TEXTURE_BINDING | TextureUsage::COPY_SRC);
     let view = map.view();
     let mut out = dev.buffer(256 * 8, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
     let mut enc = dev.encoder();
-    enc.render_pass(PassDesc::depth_only(&view), |pass| {
+    enc.render_pass(PassDesc::depth_only(&view, 1.0, true), |pass| {
         pass.set_pipeline(&pipe);
-        pass.set_vertex_buffer(0, &vb);
+        pass.set_vertex_buffer(0, &vb, 0);
         pass.draw(0..3, 0..1);
     });
     enc.copy_texture_to_buffer(&map, &out, 256);

@@ -244,7 +244,7 @@ fn main() -> i32 {
 | `pub(crate)`, `pub(super)`, `pub(in path)` | the same (0.26.2), on items, fields, `use` and `mod`; nothing is private to the module and its children (fields too, 0.26) |
 | `fn` inside a `fn` | items only at module level |
 | `macro_rules!`, `println!`, `vec!` | none: `println("{}", x)`, a format string (0.26.2) |
-| default arguments (none in Rust) | `fn f(a: i64, b: i64 = 2)`, `f(1, b: 3)` (0.15) |
+| named arguments (none in Rust) | `f(1, b: 3)`: after the positional ones, in the parameters' order; no default values, as in Rust (0.28.0) |
 | `impl<T, A: Allocator> Trait for Vec<T, A>` | the same (one impl per trait and type) |
 | `impl Trait` in argument position | the same (0.26.2): `fn f(x: impl Display)`; `-> impl Trait` comes with the rust edition |
 | `dyn Trait` | generics: `fn f<T: Trait>(x: T)` |

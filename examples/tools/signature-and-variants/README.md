@@ -89,11 +89,11 @@ removed parameter day of crate::ledger::apply, 1 call	2 files	+2 -2 lines
 ### Add
 
 A new parameter needs a value at every call: `--add` takes it after the
-`=`, and `--fill-calls` writes it into each call. One call then gets its
-own value, with the parameter's name as a label:
+`=` and writes it into each call (no parameter has a default value).
+One call then gets its own value, with the parameter's name as a label:
 
 ```console
-$ volec refactor signature open --add 'opening: i64 = 0' --fill-calls --show
+$ volec refactor signature open --add 'opening: i64 = 0' --show
 added parameter opening: i64 to crate::account::open, 2 calls	2 files	+3 -3 lines
 // main.vl:15-16
 15	    l.accounts.push(open(1, "Ada", 0, 0));

@@ -19,7 +19,7 @@ $ grep 'p = {p:?}' --strings
 29:14	string	main	println("p = {p:?}, x = {x:>4}, {{y}} = {y:08x}");
 $ refs area
 # syntax015/main.vl
-13:4	def	fn area(w: i64, h: i64 = 1) -> i64 {
+13:4	def	fn area(w: i64, h: i64) -> i64 {
 27:13	call	main	let y = area(x, h: 2);
 $ type syntax015/main.vl:22:26
 i64	x

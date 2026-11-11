@@ -1888,6 +1888,26 @@ one written, so a place written goes through `deref_mut` (a guard not
 declared `mut` is E0596). *Anchor:* `check/synth_mode.vl: synth_index`.
 Cases `rust_t_index_deref`, `rust_b_err_index_deref_mut`.
 
+**F33.1 (no default values; named arguments stay, 0.28.0).** A parameter
+has no default value: `fn f(a: i64, b: i64 = 2)` is a parse error at the
+`=` (`syntax.default-arg`: "a parameter has no default value; pass it at
+each call"), with the
+fix that removes ` = value` (`volec fix --suggested`). Named arguments
+are kept, a documented divergence from Rust: `f(1, b: 3)`, after the
+positional ones and in parameter order. One exception, by name and not
+by syntax: std's macro-like panic functions, Rust's macros of the same
+names, take their message `msg` (and the position `at` the compiler
+fills) as an empty string when a call leaves it out: `assert`,
+`assert_eq`, `assert_ne`, `debug_assert`, `unreachable`, `todo`,
+`unimplemented`, and `__assert_fmt` (what an `assert` with a format
+message becomes). The set is fixed in the checker; their declarations
+in std's panic.vl carry no default, and no other function, in std or in a
+program, can ask for it. `contract_check` gets its three values from the
+compiler (0 for those a message does not show). *Anchor:*
+`parser/items/params.vl: parse_param`, `check/args.vl: macro_message,
+normalize_args`, `contracts/expand.vl: check_call`. Cases
+`err_args_defaults`, `args_defaults`, `err_args_named`.
+
 ## 6. The bound-only rule (D22.3's front side; U1)
 
 **D22.3 (restated for the front).** In a rust-edition generic body
