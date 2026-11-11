@@ -309,7 +309,7 @@ below let the compiler work it out). The allocator is always written:
 a bare `Vec<i64>` is the error `alloc.default`, and a struct that holds
 a Vec names the allocator in its own parameters, `struct Log<A:
 Allocator> { lines: Vec<String<A>, A> }`, used as `Log<Gpa>` (the
-error is `alloc.field`).
+error is `alloc.field`). `volec fix --only alloc` writes both.
 
 The compiler makes a separate copy of `shout` for each allocator type
 it's used with, so the generic version costs nothing extra at run time.

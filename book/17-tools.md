@@ -48,20 +48,21 @@ mod report;
 use std::env;
 use std::fs;
 use std::io;
+use std::collections::HashMap;
 
 fn run(gpa: Gpa) -> io::Result<()> {
-    let args: Vec<str, Gpa> = env::args().collect_in(gpa);
-    var counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
-    for path in args[1..] {
+    let args: Vec<&str, Gpa> = env::args().collect_in(gpa);
+    let mut counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
+    for path in &args[1..] {
         let text = fs::read_to_string_in(path, gpa)?;
-        count::add_words(&counts, text, gpa);
+        count::add_words(&mut counts, &text, gpa);
     }
-    let n = match env::get_in("WC_TOP", gpa) {
+    let n = match env::var_in("WC_TOP", gpa) {
         Ok(s) => s.parse::<usize>().unwrap_or(5),
         Err(_) => 5,
     };
-    let top = report::top(counts, n, report::Order::ByCount, gpa);
-    report::print_table(top);
+    let top = report::top(&counts, n, report::Order::ByCount, gpa);
+    report::print_table(&top);
     Ok(())
 }
 
@@ -78,38 +79,40 @@ fn main(gpa: Gpa) -> i32 {
 
 ```vole count.vl
 // Counting the words of a text.
+use std::collections::HashMap;
 
 // Letters, digits and apostrophes are parts of words. So is every
 // byte of a non-ASCII character (0x80 and up), so "café" stays whole.
 fn is_word_byte(b: u8) -> bool {
     match b {
-        'a'..='z' | 'A'..='Z' | '0'..='9' | '\'' => true,
+        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'\'' => true,
         0x80..=0xff => true,
         _ => false,
     }
 }
 
 // The word without the punctuation around it: "end!" is "end".
-fn trim_punct(word: str) -> str {
-    var start: usize = 0;
-    var end = word.len();
-    while start < end && !is_word_byte(word[start]) {
+fn trim_punct(word: &str) -> &str {
+    let bytes = word.as_bytes();
+    let mut start = 0;
+    let mut end = bytes.len();
+    while start < end && !is_word_byte(bytes[start]) {
         start += 1;
     }
-    while end > start && !is_word_byte(word[end - 1]) {
+    while end > start && !is_word_byte(bytes[end - 1]) {
         end -= 1;
     }
-    word[start..end]
+    &word[start..end]
 }
 
 // Adds the words of text to counts, lowercased.
-pub fn add_words(counts: inout HashMap<String<Gpa>, i64, Gpa>, text: str, gpa: Gpa) {
+pub fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa>, text: &str, gpa: Gpa) {
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.is_empty() {
             continue;
         }
-        counts.get_or_insert(w.to_lowercase_in(gpa), 0)[0] += 1;
+        *counts.entry(w.to_lowercase_in(gpa)).or_insert(0) += 1;
     }
 }
 ```
@@ -117,32 +120,35 @@ pub fn add_words(counts: inout HashMap<String<Gpa>, i64, Gpa>, text: str, gpa: G
 ```vole report.vl
 // The table of the most common words.
 
+use std::cmp::Ordering;
+use std::collections::HashMap;
+
 // The order of the table's rows.
 pub enum Order {
     ByCount,
     Alphabetical,
 }
 
-pub fn top(counts: HashMap<String<Gpa>, i64, Gpa>, n: usize, order: Order, gpa: Gpa) -> Vec<(
+pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa>, n: usize, order: Order, gpa: Gpa) -> Vec<(
     String<Gpa>, i64), Gpa> {
-    var pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
-    for (word, k) in counts.iter() {
-        pairs.push((word.clone(), k));
+    let mut pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
+    for (word, k) in counts {
+        pairs.push((word.clone(), *k));
     }
     match order {
         Order::ByCount => pairs.sort_by(by_count),
-        Order::Alphabetical => pairs.sort_by(|a, b| a.0.cmp(b.0)),
+        Order::Alphabetical => pairs.sort_by(|a, b| a.0.cmp(&b.0)),
     }
     pairs.truncate(n);
     pairs
 }
 
 // The most common first; words as common as each other, alphabetically.
-fn by_count(a: (String<Gpa>, i64), b: (String<Gpa>, i64)) -> i64 {
-    if a.1 != b.1 { b.1 - a.1 } else { a.0.cmp(b.0) }
+fn by_count(a: &(String<Gpa>, i64), b: &(String<Gpa>, i64)) -> Ordering {
+    b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))
 }
 
-pub fn print_table(rows: [(String<Gpa>, i64)]) {
+pub fn print_table(rows: &[(String<Gpa>, i64)]) {
     for row in rows {
         println("{:<12}{:>5}", row.0, row.1);
     }
@@ -176,53 +182,53 @@ it? `volec query context` answers all three at once:
 
 ```console
 $ volec query context report::top
-// crate::report::top	report.vl:9-21	effects: alloc(Gpa) panic diverge
-pub fn top(counts: HashMap<String<Gpa>, i64, Gpa>, n: usize, order: Order, gpa: Gpa) -> Vec<(
+// crate::report::top	report.vl:12-24	effects: alloc(Gpa) io panic diverge
+pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa>, n: usize, order: Order, gpa: Gpa) -> Vec<(
     String<Gpa>, i64), Gpa> {
-    var pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
-    for (word, k) in counts.iter() {
-        pairs.push((word.clone(), k));
+    let mut pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
+    for (word, k) in counts {
+        pairs.push((word.clone(), *k));
     }
     match order {
         Order::ByCount => pairs.sort_by(by_count),
-        Order::Alphabetical => pairs.sort_by(|a, b| a.0.cmp(b.0)),
+        Order::Alphabetical => pairs.sort_by(|a, b| a.0.cmp(&b.0)),
     }
     pairs.truncate(n);
     pairs
 }
 // calls (9)
-<std::string::String as Clone>::clone	<std>:L:C	method	fn clone(self) -> String<A>
-crate::report::by_count	report.vl:24:4	fn	fn by_count(a: (String<Gpa>, i64), b: (String<Gpa>, i64)) -> i64
-std::Vec::sort_by	<std>:L:C	method	pub fn sort_by<F: FnMut(let T, let T) -> i64>(inout self, f: F)
-<std::string::String as Ord>::cmp	<std>:L:C	method	fn cmp(self, other: String<A>) -> i64
-std::collections::hash_map::HashMap::iter	<std>:L:C	method	pub fn iter(self) -> HashMapIter<K, V>
-<std::iter::HashMapIter as Iterator>::next	<std>:L:C	method	fn next(inout self) -> Option<(K, V)>
-std::Vec::truncate	<std>:L:C	method	pub fn truncate(inout self, n: usize)
-std::Vec::new_in	<std>:L:C	method	pub fn new_in(a: sink A) -> Vec<T, A>
-std::Vec::push	<std>:L:C	method	pub fn push(inout self, x: sink T)
+<std::string::String as Clone>::clone	<std>:L:C	method	fn clone(&self) -> String<A>
+crate::report::by_count	report.vl:27:4	fn	fn by_count(a: &(String<Gpa>, i64), b: &(String<Gpa>, i64)) -> Ordering
+<&'a HashMap<K, V, A, S> as IntoIterator>::into_iter	<std>:L:C	method	fn into_iter(self) -> Iter<'a, K, V>
+std::vec::Vec::sort_by	<std>:L:C	method	pub fn sort_by<F: FnMut(&T, &T) -> Ordering>(&mut self, compare: F)
+<std::string::String as Ord>::cmp	<std>:L:C	method	fn cmp(&self, other: &String<A>) -> Ordering
+<std::collections::hash_map::Iter as Iterator>::next	<std>:L:C	method	fn next(&mut self) -> Option<(&'a K, &'a V)>
+std::vec::Vec::truncate	<std>:L:C	method	pub fn truncate(&mut self, n: usize) ensures self.len() <= n
+std::vec::Vec::new_in	<std>:L:C	method	pub fn new_in(a: A) -> Vec<T, A>
+std::vec::Vec::push	<std>:L:C	method	pub fn push(&mut self, x: T) debug ensures self.len() == old(self.len()) + 1 debug ensures self.len() <= self.capacity()
 // types (6)
-crate::report::Order	report.vl:4:10	enum	pub enum Order { ByCount, Alphabetical, }
-std::collections::hash_map::HashMap	<std>:L:C	struct	pub struct HashMap<K: Hash + Eq, V, A: Allocator> { table: RawTable<(K, V), A>, }
-std::Gpa	<std>:L:C	struct	pub struct Gpa { _private: () }
-std::string::String	<std>:L:C	struct	pub struct String<A: Allocator> { pub bytes: Vec<u8, A> }
-std::Option	<std>:L:C	enum	pub enum Option<T> { None, Some(T) }
-std::Vec	<std>:L:C	struct	pub struct Vec<T, A: Allocator> { ptr: *T, len: i64, cap: i64, alloc: A }
+crate::report::Order	report.vl:7:10	enum	pub enum Order { ByCount, Alphabetical, }
+std::alloc::Gpa	<std>:L:C	struct	pub struct Gpa { sealed: (), }
+std::collections::hash_map::HashMap	<std>:L:C	struct	pub struct HashMap<K, V, A: Allocator, S = FixedState> { table: RawTable<(K, V), A>, hasher: S, }
+std::string::String	<std>:L:C	struct	pub struct String<A: Allocator> { vec: Vec<u8, A>, }
+std::vec::Vec	<std>:L:C	struct	pub struct Vec<T, A: Allocator> { ptr: NonNull<T>, cap: usize, len: usize, alloc: A, }
+std::option::Option	<std>:L:C	enum	pub enum Option<T> { None, Some(T), }
 // callers (1)
-run	main.vl:20:23	let top = report::top(counts, n, report::Order::ByCount, gpa);
+run	main.vl:21:23	let top = report::top(&counts, n, report::Order::ByCount, gpa);
 ```
 
 The first line is the item's full name, where it is (`report.vl`,
-lines 9 to 20) and its effects, which chapter 12 explained. Then its
+lines 12 to 24) and its effects, which chapter 12 explained. Then its
 source. Then, under `// calls`, every function it
 calls, with where each is defined and its signature, including the
 ones in std; under `// types`, the types it uses; and under
-`// callers`, who calls it. (We've cut the calls and types out of the
-listing here, since the positions of things in std change with every
-release.) Two of the calls look like this:
+`// callers`, who calls it. (The positions in std are written
+`<std>:L:C` in this listing, since they change with every release.)
+Two of the calls, as the command prints them:
 
 ```text
-crate::report::by_count	report.vl:23:4	fn	fn by_count(a: (String, i64), b: (String, i64)) -> i64
-std::Vec::truncate	<std>:374:12	method	pub fn truncate(inout self, n: i64)
+crate::report::by_count	report.vl:27:4	fn	fn by_count(a: &(String<Gpa>, i64), b: &(String<Gpa>, i64)) -> Ordering
+std::vec::Vec::new_in	<std>:4365:12	method	pub fn new_in(a: A) -> Vec<T, A>
 ```
 
 The fields on each line are separated by tabs, which makes them easy to
@@ -234,8 +240,8 @@ changes that), so it's safe to ask about something big. For just the source, the
 ### Names
 
 A NAME can be a plain name (`top`), a path (`report::top`,
-`std::read_line`), a method (`Vec::push`), a field (`Point.x`), or a
-place in a file (`main.vl:20`, the item on that line). A plain name that
+`std::io::stdin`), a method (`Vec::push`), a field (`Point.x`), or a
+place in a file (`main.vl:21`, the item on that line). A plain name that
 means several things gets all of them. You don't need to say which
 file the program starts at: the tools look for `main.vl` in the current
 directory (or take the last argument ending in `.vl`).
@@ -248,15 +254,15 @@ of use and the function it's in:
 ```console
 $ volec query refs Order
 # report.vl
-4:10	def	pub enum Order {
-9:69	type	report::top	pub fn top(counts: HashMap<String<Gpa>, i64, Gpa>, n: usize, order: Order, gpa: Gpa) -> Vec<(
-16:9	type	report::top	Order::ByCount => pairs.sort_by(by_count),
-17:9	type	report::top	Order::Alphabetical => pairs.sort_by(|a, b| a.0.cmp(b.0)),
+7:10	def	pub enum Order {
+12:70	type	report::top	pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa>, n: usize, order: Order, gpa: Gpa) -> Vec<(
+19:9	type	report::top	Order::ByCount => pairs.sort_by(by_count),
+20:9	type	report::top	Order::Alphabetical => pairs.sort_by(|a, b| a.0.cmp(&b.0)),
 # main.vl
-20:46	type	run	let top = report::top(counts, n, report::Order::ByCount, gpa);
+21:47	type	run	let top = report::top(&counts, n, report::Order::ByCount, gpa);
 $ volec query callers add_words
 # main.vl
-14:16	call	run	count::add_words(&counts, text, gpa);
+15:16	call	run	count::add_words(&mut counts, &text, gpa);
 ```
 
 Each line is `LINE:COLUMN`, then the kind (`def` for the definition,
@@ -267,25 +273,23 @@ one file. `query callers` does the same for calls only.
 ### effects
 
 Chapter 12 showed `query effects`. It works on a whole module too,
-which is a quick way to check a design promise, here that the counting
-module never does any input or output:
+one line for each of its functions:
 
 ```console
 $ volec query effects crate::count
 crate::count::is_word_byte	none
 crate::count::trim_punct	panic diverge
-crate::count::add_words	alloc(Gpa) panic diverge
+crate::count::add_words	alloc(Gpa) io panic diverge
 ```
 
-`--why io` on a function explains an effect it has, call by call, down
+`--why EFFECT` on a function explains an effect it has, call by call, down
 to the line in std where it comes from.
 
 There are more questions you can ask. `query items MODULE` lists a
 module's items with their signatures (`query items std` lists the
-standard library), `query own FILE:LINE:COL` shows what the compiler
-knows about each variable at a point (chapter 4's moves and views),
-and `query unused` lists what nothing uses. `volec query --help` lists
-them all.
+standard library), `query type FILE:LINE:COL` gives the type of the
+expression at a place, and `query unused` lists what nothing uses.
+`volec query --help` lists them all.
 
 ## Checked edits
 
@@ -297,7 +301,7 @@ says:
 
 ```console
 $ volec edit patch print_table --old '{:>4}' --new '{:>6}'
-error patch.no-match: OLD 1 is not in crate::report::print_table; nearest, line 30: println("{:<12}{:>5}", row.0, row.1);
+error patch.no-match: OLD 1 is not in crate::report::print_table; nearest, line 33: println("{:<12}{:>5}", row.0, row.1);
 try: volec edit patch print_table --old '{:>5}' --new '{:>6}'
 ```
 
@@ -324,8 +328,8 @@ exist:
 
 ```console
 $ volec edit patch print_table --old '{:>6}' --new '{:>6} {share}'
-report.vl:30:31: error[type error] undefined variable 'share'  [edited: crate::report::print_table]
-error edit.breaks: 1 new error; nothing written; the error: report.vl:30:31: undefined variable 'share'
+report.vl:33:31: error[type error] undefined variable 'share'  [edited: crate::report::print_table]
+error edit.breaks: 1 new error; nothing written; the error: report.vl:33:31: undefined variable 'share'
 note edit.together: several steps are one call, checked at its end: `edit patch NAME --old A --new B --old C --new D` (`--in OTHER` before another item's pairs), `edit apply FILE`; or this step alone with --no-check
 try: volec edit patch print_table --old '{:>6}' --new '{:>6} {share}' --no-check
 ```
@@ -360,9 +364,9 @@ $ volec refactor rename count::add_words count_words
 renamed crate::count::add_words to count_words	2 files	+2 -2 lines
 $ volec query refs count_words
 # count.vl
-27:8	def	pub fn count_words(counts: inout HashMap<String<Gpa>, i64, Gpa>, text: str, gpa: Gpa) {
+29:8	def	pub fn count_words(counts: &mut HashMap<String<Gpa>, i64, Gpa>, text: &str, gpa: Gpa) {
 # main.vl
-14:16	call	run	count::count_words(&counts, text, gpa);
+15:16	call	run	count::count_words(&mut counts, &text, gpa);
 ```
 
 Both the definition and the call changed. A rename changes the uses the
@@ -385,12 +389,11 @@ $ volec refactor signature count::count_words --add 'min_len: usize = 1' --fill-
 added parameter min_len: usize to crate::count::count_words, 1 call	2 files	+3 -2 lines
 $ volec query callers count_words
 # main.vl
-14:16	call	run	count::count_words(&counts, text, gpa, 1);
+15:16	call	run	count::count_words(&mut counts, &text, gpa, 1);
 ```
 
 The call in `run` now passes `1`, which keeps every word, as before.
-(Without `--fill-calls`, the parameter keeps `= 1` as a default, and
-the calls stay as they were.) A new parameter goes last, after the
+A new parameter goes last, after the
 allocator; std's convention is to keep the allocator last, so
 `--reorder` puts the parameters in the order we want, at the
 definition and at every call:
@@ -400,7 +403,7 @@ $ volec refactor signature count::count_words --reorder counts,text,min_len,gpa
 reordered the parameters of crate::count::count_words, 1 call	2 files	+3 -3 lines
 $ volec query callers count_words
 # main.vl
-14:16	call	run	count::count_words(&counts, text, 1, gpa);
+15:16	call	run	count::count_words(&mut counts, &text, 1, gpa);
 ```
 
 Now the body can use `min_len`. The loop already skips a word that
@@ -412,24 +415,23 @@ same):
 $ volec edit patch count_words --old 'if w.is_empty() {' --new 'if w.len() < min_len {'
 patched crate::count::count_words	count.vl	+1 -1 lines
 $ volec query show count_words
-// crate::count::count_words	count.vl:26-36	effects: alloc(Gpa) panic diverge
+// crate::count::count_words	count.vl:28-38	effects: alloc(Gpa) io panic diverge
 // Adds the words of text to counts, lowercased.
-pub fn count_words(counts: inout HashMap<String<Gpa>, i64, Gpa>, text: str, min_len: usize,
+pub fn count_words(counts: &mut HashMap<String<Gpa>, i64, Gpa>, text: &str, min_len: usize,
     gpa: Gpa) {
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.len() < min_len {
             continue;
         }
-        counts.get_or_insert(w.to_lowercase_in(gpa), 0)[0] += 1;
+        *counts.entry(w.to_lowercase_in(gpa)).or_insert(0) += 1;
     }
 }
 ```
 
-`refactor signature` also removes and renames parameters, changes a
-parameter's type, and changes its convention: `--convention v inout`
-makes `v` an `inout` parameter and adds the `&` at every call (chapter
-4).
+`refactor signature` also removes and renames parameters, and changes
+a parameter's type: `--type v '&mut Vec<i64, Gpa>'` makes `v` a `&mut`
+parameter and writes `&mut` at every call (chapter 4).
 
 ### variant
 
@@ -438,20 +440,20 @@ longer covers every case (chapter 5). `refactor variant` adds the
 variant and an arm to each match, with the expression you give:
 
 ```console
-$ volec refactor variant report::Order --add 'Longest' --arm 'pairs.sort_by(|a, b| b.0.len().cmp(a.0.len()))'
+$ volec refactor variant report::Order --add 'Longest' --arm 'pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()))'
 added variant Longest to crate::report::Order, an arm in 1 match	report.vl	+2 -0 lines
 $ volec query show report::top
-// crate::report::top	report.vl:10-23	effects: alloc(Gpa) panic diverge
-pub fn top(counts: HashMap<String<Gpa>, i64, Gpa>, n: usize, order: Order, gpa: Gpa) -> Vec<(
+// crate::report::top	report.vl:13-26	effects: alloc(Gpa) io panic diverge
+pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa>, n: usize, order: Order, gpa: Gpa) -> Vec<(
     String<Gpa>, i64), Gpa> {
-    var pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
-    for (word, k) in counts.iter() {
-        pairs.push((word.clone(), k));
+    let mut pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
+    for (word, k) in counts {
+        pairs.push((word.clone(), *k));
     }
     match order {
         Order::ByCount => pairs.sort_by(by_count),
-        Order::Alphabetical => pairs.sort_by(|a, b| a.0.cmp(b.0)),
-        Order::Longest => pairs.sort_by(|a, b| b.0.len().cmp(a.0.len())),
+        Order::Alphabetical => pairs.sort_by(|a, b| a.0.cmp(&b.0)),
+        Order::Longest => pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len())),
     }
     pairs.truncate(n);
     pairs
@@ -488,22 +490,22 @@ lines throughout this book; when the fix is an exact edit, `volec fix
 --suggested` makes it for you.
 
 Let's make a mistake on purpose. `--no-check` writes an edit even when it
-breaks the program, so we can drop the `&` from the call in `run`, the
-mark chapter 4 explained:
+breaks the program, so we can turn the `&mut` at the call in `run`
+into a plain `&`, which may not change the map (chapter 4):
 
 ```console
-$ volec edit patch run --old '(&counts' --new '(counts' --no-check
-main.vl:14:27: error[conv.marker] 'counts' is lent inout here (the callee may change it): mark it '&counts' | help: an inout parameter takes '&place'; when the callee never changes it, take it let: 'volec refactor signature F --convention x let' | try: volec edit patch main.vl:14 --old '(counts' --new '(&counts' | try: volec fix --suggested main.vl  [edited: crate::run]
+$ volec edit patch run --old '(&mut counts' --new '(&counts' --no-check
+main.vl:15:28: error[type error] expected '&mut HashMap<String<Gpa>, i64, Gpa>', got '&HashMap<String<Gpa>, i64, Gpa>' | help: the types differ in mutability (rustc E0308): the parameter takes an exclusive reference, `&mut x` | try: &mut counts | try: volec fix --suggested main.vl  [edited: crate::run]
 patched crate::run	main.vl	+1 -1 lines
-warning edit.breaks: 1 new error; written anyway (--no-check); the error: main.vl:14:27: 'counts' is lent inout here (the callee may change it): mark it '&counts'
+warning edit.breaks: 1 new error; written anyway (--no-check); the error: main.vl:15:28: expected '&mut HashMap<String<Gpa>, i64, Gpa>', got '&HashMap<String<Gpa>, i64, Gpa>'
 try: volec check
 $ volec check
-main.vl:14:27: error[conv.marker] 'counts' is lent inout here (the callee may change it): mark it '&counts' | help: an inout parameter takes '&place'; when the callee never changes it, take it let: 'volec refactor signature F --convention x let' | try: volec edit patch main.vl:14 --old '(counts' --new '(&counts' | try: volec fix --suggested main.vl
+main.vl:15:28: error[type error] expected '&mut HashMap<String<Gpa>, i64, Gpa>', got '&HashMap<String<Gpa>, i64, Gpa>' | help: the types differ in mutability (rustc E0308): the parameter takes an exclusive reference, `&mut x` | try: &mut counts | try: volec fix --suggested main.vl
 ```
 
-`volec check` reports the error with two `try:` lines: one makes that
-edit by hand, the other fixes every error in the program whose fix is
-exact. Let's run the second:
+`volec check` reports the error with two `try:` lines: the first is
+what to write there, the second is a command that fixes every error in
+the program whose fix is exact. Let's run it:
 
 ```console
 $ volec fix --suggested
@@ -521,16 +523,6 @@ Plain `volec fix`, without `--suggested`, does a few common clean-ups:
 it adds missing `use` lines and `pub` markers, removes unused imports,
 and wraps unsafe operations in `unsafe { }` (chapter 15). `--only`
 limits it to some of them, and `--dry-run` shows what it would do.
-
-### Following the language
-
-`volec fix` also carries *migrations*. Vole is pre-1.0 and its syntax
-still changes, and when a release changes how something is written, it
-usually comes with a `fix --only NAME` that rewrites old code to the new
-form. For example, `volec fix --only conventions` turns code written
-with an older, Rust-like spelling of parameters (`&T`, `&mut T`, `let
-mut`) into today's. When an upgrade breaks your code, the errors' `try:`
-lines name the migration to run.
 
 ## Formatting
 
@@ -685,7 +677,7 @@ a few ways to see what changed in behaviour, not just in text:
 ## Summary
 
 - The compiler answers questions by name: `query context`, `show`,
-  `refs`, `callers`, `effects`, `items`, `own`. Its answers follow the
+  `refs`, `callers`, `effects`, `items`, `type`. Its answers follow the
   program's real names, through imports, and ignore comments and
   strings.
 - `edit patch`, `replace`, `insert` and `delete` change items by name;
@@ -694,7 +686,7 @@ a few ways to see what changed in behaviour, not just in text:
 - `refactor rename`, `signature`, `variant`, `field` and `move` change
   a definition and every use of it at once.
 - `volec fix --suggested` applies the errors' exact fixes; `volec fix`
-  does common clean-ups and migrations to new language versions.
+  does common clean-ups.
 - `volec fmt` lays code out; `volec lsp` brings the compiler into your
   editor.
 - An agent working on vole uses the same tools; an `AGENTS.md` pointing
@@ -710,5 +702,5 @@ command-line tool built from this word counter.
   parameter, and make it leave out words seen fewer than `min` times.
 - Add a `ByLength` variant to `Order` with `refactor variant`, sorting
   the longest words first, and add a command-line way to choose it.
-- Run `volec query own main.vl:9:9`. What does it tell you about
-  `counts`?
+- Run `volec query type main.vl:19:9`. What is the type of `top`, and
+  where does the program say so?
