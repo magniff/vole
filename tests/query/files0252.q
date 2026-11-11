@@ -25,7 +25,7 @@ note query.reexport: draw::Square::outline is crate::shapes::Square::outline, wh
 ## A trait impl's function by its type's path (`impl Render<Square> for
 ## Square`, a generic trait: its type was `Square`, not its path).
 $ show crate::shapes::Square::render
-// <crate::shapes::Square as Render>::render	files0252/draw.vl:8-10	effects: none
+// <crate::shapes::Square as crate::draw::Render>::render	files0252/draw.vl:8-10	effects: none
     fn render(&self) -> i64 {
         self.area()
     }

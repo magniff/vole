@@ -118,6 +118,10 @@ $ refs size --count
 1	crate::m5::size
 1	crate::m6::size
 18	std::alloc::Layout::size
+1	std::gpu::Buffer::size
+12	std::gpu::types::Format::size
+2	std::gpu::types::VertexFormat::size
+4	std::gpu::types::IndexFormat::size
 1	std::window::Window::size
 2	std::window::cocoa::NsWindow::size
 4	std::window::script::size
@@ -130,11 +134,15 @@ crate::m4::size
 crate::m5::size
 crate::m6::size
 std::alloc::Layout::size
+std::gpu::Buffer::size
+std::gpu::types::Format::size
+std::gpu::types::VertexFormat::size
+std::gpu::types::IndexFormat::size
 std::window::Window::size
 std::window::cocoa::NsWindow::size
 std::window::script::size
 std::test::Gen::size
-error query.ambiguous: 11 definitions match 'size'; showing paths only
+error query.ambiguous: 15 definitions match 'size'; showing paths only
 try: volec query show crate::m1::size
 [exit 1]
 $ show m2::size

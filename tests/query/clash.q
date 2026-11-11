@@ -221,6 +221,8 @@ $ refs Point.x
 $ refs .x --count
 3	crate::a::Point.x
 9	crate::geom::V2.x
+2	std::gpu::hal::metal::bindings::MTLOrigin.x
+2	std::gpu::hal::metal::bindings::MTLScissorRect.x
 4	std::window::Mouse.x
 3	std::window::objc::Point.x
 5	std::window::objc::Rect.x
