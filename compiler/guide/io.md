@@ -13,13 +13,15 @@ a `&str` (std2 has no Path or PathBuf). `File::open(p)?`,
 the entry; `e.path()`), `fs::exists(p)?` (a `Result<bool>`). Errors are
 `io::Error` (`e.kind()`, an `ErrorKind`; Display as Rust's: `No such file
 or directory (os error 2)`), and `io::Result<T>` goes with `?`; `main`
-returns an `i32`, so a `run() -> io::Result<()>` does the work.
+may return it (an `Err` prints `Error: ` and its Debug form, exit 1); a
+`run() -> io::Result<()>` and a `main` that prints `{e}` say it better.
 `BufReader::new(f)` and `BufWriter::new(f)` keep their buffer inline (no
 allocation). With `use std::io::BufRead`, `r.read_line(&mut s)?` appends a
 line, its `'\n'` included (0 at the end), and `r.lines_in(gpa)` yields
 each line as an `io::Result<String<Gpa>>`. With `use std::io::Write`,
-`w.write_fmt(format_args("{x}\n"))?` writes formatted text (Rust's
-`write!`), `w.write_all(bytes)?` bytes. `env::args()` yields `&str`s
+`write(&mut w, "{x}")?` and `writeln(&mut w, "{x}")?` write formatted
+text to a writer or a `File` (Rust's `write!`, `writeln!`),
+`w.write_all(bytes)?` bytes. `env::args()` yields `&str`s
 (`.collect_in(gpa)`), `env::var_in(name, gpa)` a `Result<String<Gpa>,
 VarError>` (Rust's `env::var`), `env::current_dir_in(gpa)?`.
 `Command::new_in(p, gpa)`, then `.arg(a)` and `.args(list)` (they chain:
@@ -40,7 +42,7 @@ fn run(gpa: Gpa) -> io::Result<()> {
     {
         let mut w = BufWriter::new(File::create(path)?);
         for i in 1..4 {
-            w.write_fmt(format_args("line {i}\n"))?;
+            writeln(&mut w, "line {i}")?;
         }
     }
     let mut r = BufReader::new(File::open(path)?);

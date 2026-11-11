@@ -440,29 +440,27 @@ A game whose answer is always 42 gets old quickly. The standard
 library has a random number generator in `std::random`. Here is the
 finished game:
 
-```vole guess.vl mvs
+```vole guess.vl
 use std::io;
-use std::io::BufReader;
 use std::random::Xoshiro256pp;
 
 fn main(gpa: Gpa) {
     println("Guess the number!");
-    var rng = Xoshiro256pp::from_entropy();
+    let mut rng = Xoshiro256pp::from_entropy();
     let secret = rng.random_range_i64(1, 101);
 
-    var input = BufReader::new(io::stdin());
-    var line = String::new_in(gpa);
-    var tries = 0;
+    let mut line = String::new_in(gpa);
+    let mut tries = 0;
 
     loop {
         println("Please input your guess.");
         line.clear();
-        if input.read_line(&line).unwrap() == 0 {
+        if io::stdin().read_line(&mut line).unwrap() == 0 {
             println("Giving up? The number was {secret}.");
             return;
         }
 
-        let guess = match line.trim().parse::<i64>() {
+        let guess = match line.trim().parse::<i32>() {
             Ok(n) => n,
             Err(_) => {
                 println("That's not a number. Try again.");
@@ -486,7 +484,7 @@ fn main(gpa: Gpa) {
 Only two lines changed, besides the new `use` line:
 
 ```vole skip
-    var rng = Xoshiro256pp::from_entropy();
+    let mut rng = Xoshiro256pp::from_entropy();
     let secret = rng.random_range_i64(1, 101);
 ```
 
@@ -496,7 +494,7 @@ random data the operating system provides, so every game is different.
 `random_range_i64(1, 101)` gives a number from 1 up to, but not
 including, 101.
 
-`rng` is a `var` because drawing a number changes the generator's
+`rng` is a `let mut` because drawing a number changes the generator's
 state, so the next number is different.
 
 Here's one game. Yours will have a different secret, of course:
@@ -526,7 +524,7 @@ You win! It took you 5 tries.
 Here's a preview of something vole does that most languages don't. The
 compiler works out what each function may do, and it will tell you:
 
-```console mvs
+```text
 $ volec query effects main guess.vl
 crate::main	alloc(Gpa) io panic diverge
 ```

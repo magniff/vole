@@ -90,14 +90,15 @@ byte: the shortest digits that read back as the value (Schubfach), `{}`
 never with an exponent, `{:?}` with one below 1e-4 and from 1e16 on.
 `s.parse::<f64>()` reads text back as Rust's does (`-1.5e3`, `.5`,
 `inf`, `NaN`; no spaces; correctly rounded), and `to_bits`,
-`from_bits` give the IEEE bits. Text without an allocator: `guide
+`from_bits` give the IEEE bits; `i64::from_str_radix(s, 16)` reads an
+integer in another base. Text without an allocator: `guide
 text#numbers-as-text-without-an-allocator`.
 
 ```vole
 fn main() -> i32 {
     let x = "0.1".parse::<f64>().unwrap() + "2e-1".parse::<f64>().unwrap();
     println("{x} {x:?} {x:e} {:?} {} {}", 1e16, 1e-7, 0.1f32);
-    println("{:?} {} {:x}", "-255".parse::<i64>(), "1,5".parse::<f64>().is_err(), 1.5f64.to_bits());
+    println("{:?} {} {:x}", i64::from_str_radix("-ff", 16), "1,5".parse::<f64>().is_err(), 1.5f64.to_bits());
     println("{} {:?} {}", f64::from_bits(0x3ff8000000000000), "inf".parse::<f64>(), b'A' as char);
     0
 }

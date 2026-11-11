@@ -333,18 +333,18 @@ fn trim_punct(word: &str) -> &str {
 #[test]
 fn counts_lines_words_bytes() {
     let c = count("the cat\nsat\n");
-    assert_eq(&c.lines, &2);
-    assert_eq(&c.words, &3);
-    assert_eq(&c.bytes, &12);
+    assert_eq(c.lines, 2);
+    assert_eq(c.words, 3);
+    assert_eq(c.bytes, 12);
 }
 
 #[test]
 fn trims_punctuation(gpa: Gpa) {
     let mut freq: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
     add_words(&mut freq, "(the) end. The end!");
-    assert_eq(&freq["end"], &2);
-    assert_eq(&freq["the"], &1);
-    assert_eq(&freq.len(), &3);
+    assert_eq(freq["end"], 2);
+    assert_eq(freq["the"], 1);
+    assert_eq(freq.len(), 3);
 }
 
 // Every word is counted once: the counts add up to the number of words.
@@ -361,7 +361,7 @@ fn counts_add_up(bytes: Vec<u8, Gpa>, gpa: Gpa) {
     for (_, k) in &freq {
         total += *k;
     }
-    assert_eq(&total, &(count(&text).words as i64));
+    assert_eq(total, count(&text).words as i64);
 }
 ```
 
