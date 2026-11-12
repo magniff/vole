@@ -144,7 +144,7 @@ rewrote 2 sites in 1 file	loops.vl	+5 -5 lines
 note rewrite.dropped: 1 site is left: the replacement drops $i, which the code it keeps uses; first: loops.vl:16:30
 try: volec query show loops.vl:16
 $ query show total
-// crate::loops::total	loops.vl:5-22	effects: panic
+// crate::loops::total	loops.vl:5-22	effects: static panic
 pub fn total() -> i64 {
     let w = unsafe { V };
     let mut t = 0;
