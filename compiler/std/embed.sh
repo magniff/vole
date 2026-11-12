@@ -45,9 +45,16 @@ case "$common" in */.git) main_tree=${common%/.git} ;; esac
 cd "$(dirname "$0")/../.."
 out=compiler/src/front/stdsrc_rust.vl
 # (next to the output: writable in a sandbox that only allows the tree, and mv is a rename)
+# (0.28.0: removed on every way out, also an error's and a signal's: a
+# run that was killed, or failed before the end, left it in the tree)
+tmp=
+work=
+trap 'rm -rf "$work"; rm -f "$tmp"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 tmp=$(mktemp "$out.XXXXXX")
 work=$(mktemp -d "${TMPDIR:-/tmp}/vole-embed.XXXXXX")
-trap 'rm -rf "$work"' EXIT
 # std's root module: this file.
 ROOT_FILES=std
 dir=compiler/std

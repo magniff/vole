@@ -12,6 +12,12 @@
 set -eu
 cd "$(dirname "$0")/../.."
 out=compiler/src/arch/tables.vl
+# (0.28.0: removed on every way out, also an error's and a signal's)
+tmp=
+trap 'rm -f "$tmp"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 tmp=$(mktemp "$out.XXXXXX")
 # The lines of a .def file on stdin, without comments and blank lines, as
 # statements writing them (string literals cannot span lines).
