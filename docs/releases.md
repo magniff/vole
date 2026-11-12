@@ -92,6 +92,26 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.28.0
 
+Indexing (idx280):
+
+- **An index is a `usize`.** `a[i]` and the ends of `a[i..j]`, of an
+  array, a slice, a `str` or a Vec, take a `usize` and nothing else, as
+  in Rust (rustc E0277): no other integer type, and no widening to it
+  (a `u8` index is converted too). Until now any integer type indexed,
+  the divergence FR6 of front-rust.md, which is removed (F20.8 there).
+  An untyped literal and an open local still take `usize` from the
+  index. The error, `an index is a 'usize', got 'i64'`, has an exact
+  fix: `volec fix --suggested` writes `i as usize`, `(i + 1) as usize`,
+  and of an index that is itself a cast of an integer changes the
+  cast's type (`hex[(b >> 4) as i64]` becomes `hex[(b >> 4) as
+  usize]`). `fix` makes these although the type converted from holds
+  values a `usize` does not: an index out of range before the
+  conversion is out of range after it, the same panic. Where the
+  variable is only an index, declaring it `usize` is the better change.
+  std2's fmath (42 indices of signed counters), nine examples and one
+  case were converted. *Cases:* `err_index_usize`,
+  `rust_t_index_usize`, the transcript `tests/refactor/indexusize.t`.
+
 The places IR (sc280):
 
 - **A condition's `&&` and `||` are control flow.** In `if`, `while`, a

@@ -545,11 +545,11 @@ fn synth_index(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         let lo = pcx.nodes[index as usize].a;
         let hi = pcx.nodes[index as usize].b;
         if lo != 0 {
-            check_expr(lo, TY_USIZE, pcx);
+            check_index_type(lo, false, pcx);
             pcx.nodes[lo as usize].p |= NODE_CHECKED;
         }
         if hi != 0 {
-            check_expr(hi, TY_USIZE, pcx);
+            check_index_type(hi, false, pcx);
             pcx.nodes[hi as usize].p |= NODE_CHECKED;
         }
         crate::front::check::rust::index_str_range(n, pcx);
@@ -700,10 +700,10 @@ fn synth_index(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if pcx.nodes[index as usize].kind == Range {
         // Slicing.
         if pcx.nodes[index as usize].a != 0 {
-            check_index_type(pcx.nodes[index as usize].a, pcx);
+            check_index_type(pcx.nodes[index as usize].a, base_kind == TyKind::Ptr, pcx);
         }
         if pcx.nodes[index as usize].b != 0 {
-            check_index_type(pcx.nodes[index as usize].b, pcx);
+            check_index_type(pcx.nodes[index as usize].b, base_kind == TyKind::Ptr, pcx);
         } else if base_kind == TyKind::Ptr {
             type_error(index, c"slicing a pointer needs an end: 'p[lo..hi]'", pcx);
         }
@@ -713,7 +713,7 @@ fn synth_index(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         }
         return slice_of(pcx.types[base_ty as usize].a, pcx);
     }
-    check_index_type(index, pcx);
+    check_index_type(index, base_kind == TyKind::Ptr, pcx);
     pcx.types[base_ty as usize].a
 }
 
@@ -767,10 +767,11 @@ fn indexes_through(t: i64, pcx: &Ctx<Comp>) -> bool {
         || (pcx.types[t as usize].kind == TyKind::Struct && indexes_as_slice(t, pcx))
 }
 
-// The index of `a[i]` (or an end of `a[i..j]`): an integer, or (0.18.1) a
+// The index of `a[i]` (or an end of `a[i..j]`): a usize, or (0.18.1) a
 // reference to one, read through (`keys[a]` in a `sort_by` closure, whose
-// `a` is `&i64`; `*a` written for it).
-fn check_index_type(index: i64, pcx: &mut Ctx<Comp>) {
+// `a` is `&usize`; `*a` written for it). `raw`: of a raw pointer (std's
+// `ptr` alone), whose offset is any integer.
+fn check_index_type(index: i64, raw: bool, pcx: &mut Ctx<Comp>) {
     // RULE: F18.5 (0.28.0, the rust edition: an index is a usize, and a
     // literal or a local still open takes that type from here: `for i in
     // 0..81 { cells[i]; f(i) }` with `f(i: usize)` left i an i32)
@@ -778,7 +779,8 @@ fn check_index_type(index: i64, pcx: &mut Ctx<Comp>) {
         check_expr(index, TY_USIZE, pcx);
         return;
     }
-    let index_ty = synth_expr(index, pcx);
+    let mut index_ty = synth_expr(index, pcx);
+    let mut through = false;
     if is_ref(index_ty, pcx) && is_integer(pcx.types[index_ty as usize].a) {
         let inner = new_node(NodeKind::Ident, pcx.nodes[index as usize].start,
             pcx.nodes[index as usize].end, pcx);
@@ -793,7 +795,8 @@ fn check_index_type(index: i64, pcx: &mut Ctx<Comp>) {
         pcx.nodes[index as usize].x = 0;
         pcx.nodes[index as usize].y = 0;
         pcx.nodes[index as usize].ty = pcx.types[index_ty as usize].a;
-        return;
+        index_ty = pcx.types[index_ty as usize].a;
+        through = true;
     }
     if !is_integer(index_ty) {
         err_begin(pcx.nodes[index as usize].start, pcx);
@@ -802,6 +805,76 @@ fn check_index_type(index: i64, pcx: &mut Ctx<Comp>) {
         err_str(c"'", pcx);
         err_end(pcx);
     }
+    // RULE: F20.8 (0.28.0: an index is a usize and nothing else, as
+    // rustc's E0277, `the type [T] cannot be indexed by i64`: no widening
+    // to it either, a `u8` is converted as an `i64` is)
+    if index_ty != TY_USIZE && !raw {
+        err_begin(pcx.nodes[index as usize].start, pcx);
+        err_str(c"an index is a 'usize', got '", pcx);
+        err_type(index_ty, pcx);
+        err_str(c"'", pcx);
+        err_help(c"indexing takes a usize alone, as Rust's (no other integer type, no widening): convert it, or give the variable the type usize where it is declared", pcx);
+        let s = pcx.nodes[index as usize].start;
+        let e = pcx.nodes[index as usize].end;
+        if e > s {
+            let text = &get_src()[s as usize..e as usize];
+            let t = buf_new();
+            // (a prefix operator binds tighter than `as`: `*v as usize`)
+            let simple = !through && (crate::front::check::widen::operand_is_simple(index, pcx)
+                || pcx.nodes[index as usize].kind == Unary);
+            let cast = if through { -1 } else { index_cast_type(index, text, pcx) };
+            if cast >= 0 {
+                buf_fmt(t,
+                    { let head = str::from_utf8(&text[..cast as usize]).unwrap();
+                        format_args("{head}usize") });
+            } else if through {
+                buf_fmt(t,
+                    { let text = str::from_utf8(text).unwrap(); format_args("*{text} as usize") });
+            } else if simple {
+                buf_fmt(t,
+                    { let text = str::from_utf8(text).unwrap(); format_args("{text} as usize") });
+            } else {
+                buf_fmt(t,
+                    { let text = str::from_utf8(text).unwrap(); format_args("({text}) as usize") });
+            }
+            err_try_fmt(str::from_utf8(buf_slice(t)).unwrap(), pcx);
+            err_fix(s, e, buf_slice(t), pcx);
+        }
+        err_end(pcx);
+    }
+}
+
+// (0.28.0) Where the type's name starts in `text`, the source of index
+// node `index`, when it is a cast of an integer to an integer type, `(b
+// >> 4) as i64`: the cast is what to change (`... as usize`: an integer
+// converted to a usize through another integer type is the same value
+// converted at once). -1 otherwise.
+fn index_cast_type(index: i64, text: &[u8], pcx: &Ctx<Comp>) -> i64 {
+    if pcx.nodes[index as usize].kind != NodeKind::Cast {
+        return -1;
+    }
+    let operand = pcx.nodes[index as usize].a;
+    if operand <= 0 || !is_integer(pcx.nodes[operand as usize].ty) {
+        return -1;
+    }
+    let mut k = text.len();
+    while k > 0 {
+        let c = text[k - 1];
+        let lower = c >= 97 && c <= 122;
+        let digit = c >= 48 && c <= 57;
+        if !lower && !digit {
+            break;
+        }
+        k -= 1;
+    }
+    if k == text.len() || k < 5 {
+        return -1;
+    }
+    // (" as " before it)
+    if text[k - 4] != 32 || text[k - 3] != 97 || text[k - 2] != 115 || text[k - 1] != 32 {
+        return -1;
+    }
+    k as i64
 }
 
 // Fields of structs (also through a pointer to one: y = 1) and the `ptr`

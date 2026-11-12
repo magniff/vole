@@ -140,6 +140,17 @@ writes those too, `i64::from(a)`): narrowing is `a as i32`. The same for `1 + 1.
 for `main` returning an `i64` (`n as i32`).
 
 ```vole
+let v = [1, 2, 3];
+let i: i64 = 1;
+println("{}", v[i]);
+```
+```err
+error[type error] an index is a 'usize', got 'i64'
+```
+An index is a `usize`, as in Rust, and nothing widens to it: `v[i as
+usize]` (`volec fix --suggested` writes it), or declare `i: usize`.
+
+```vole
 let b: u8 = 300;
 ```
 ```err
