@@ -454,7 +454,7 @@ fn main(gpa: Gpa) {
 ```err
 error[type error]: expected 'String<Gpa>', got '&str'
  --> main.vl: line 5, column 17
-  = help: a String owns its text, on an allocator: `String::from_in(s, gpa)`; a `str` is a view of one (a `str` parameter takes both)
+  = help: a String owns its text, on an allocator: `String::from_in(s, gpa)`; a `&str` is a view of one (a `&str` parameter takes both: a literal, a String's `&s`)
   = try: String::from_in("ada", gpa)
 ```
 
