@@ -2379,7 +2379,8 @@ copy of the process after the output is written (here with
 `$VOLE_CACHE_SYNC` or `$VOLE_CACHE_TRACE`): the entries it used and
 made, and the others for 3 builds while the pack stays under twice the
 used ones (32 MB at least). When the directory's packs pass
-`$VOLE_CACHE_LIMIT` MB (1024), the least recently used go. A build
+`$VOLE_CACHE_LIMIT` MB (1024), the least recently used go (0.28.0: the
+tools' cache's files too, with the same limit apart, query.md). A build
 that used every entry and made none only marks the pack used.
 
 **Run-time numbers.** A check's site (front/contracts/sites.vl) and

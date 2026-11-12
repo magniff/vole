@@ -37,6 +37,7 @@
 #                 NAME)
 #
 # Then `volec` run from $PATH must use the cache (volec_in_path).
+# and the cache directory must stay under its limit (bound: $VOLE_CACHE_LIMIT).
 #
 # Prints `pass cachediff/NAME (N lines, H from the cache)` or `FAIL
 # cachediff/NAME` (each line that differed, and how) per transcript, then
@@ -361,6 +362,82 @@ if [ "$(tr '\n' ' ' <"$CD_WORK/path.trace")" = "miss save hit " ]; then
     echo "pass cachediff/volec_in_path"
 else
     echo "FAIL cachediff/volec_in_path: \`volec query items\` twice, from \$PATH: the cache's trace is '$(tr '\n' ' ' <"$CD_WORK/path.trace")', not 'miss save hit'"
+    STATUS=1
+fi
+# (0.28.0) The cache directory is bounded: with a limit that holds three
+# programs, checking six leaves its q-KEY.* files under the limit, the
+# program used last is kept (a hit is a use: p1, asked again a second
+# after p2 and p3 were written, outlives them), a program that went is
+# answered as without the cache and cached again, and no other file of
+# the directory is removed, whatever its name is like.
+B="$CD_WORK/bound"
+mkdir -p "$B/cache"
+for i in 1 2 3 4 5 6; do
+    printf 'fn f%s() -> i64 {\n    %s\n}\n\nfn main() {\n    println("{}", f%s());\n}\n' $i $i $i >"$B/p$i.vl"
+done
+: >"$B/trace"
+echo other >"$B/cache/q-notacache.bin"
+echo other >"$B/cache/q-0123456789abcdef.bin.old"
+echo other >"$B/cache/notes.txt"
+bound_bytes() {
+    ls -l "$B/cache" | awk '$NF ~ /^q-[0-9a-f]+\.(bin|refs)$/ { s += $5 } END { print s + 0 }'
+}
+bound_run() {
+    (cd "$B" && VOLE_CACHE="$B/cache" VOLE_CACHE_TRACE="$B/trace" VOLE_CACHE_LIMIT="$BOUND_MB" \
+        "$COMPILER" "$@" 2>&1)
+}
+bound_last() {
+    tail -n "$1" "$B/trace" | tr '\n' ' '
+}
+BOUND_MB=
+bound_run check p1.vl >/dev/null
+one=$(bound_bytes)
+BOUND_MB=$(((one * 7 / 2) / 1048576))
+why=
+[ "$one" -gt 2097152 ] || why="p1's cache is $one bytes: too small for a limit in MB"
+if [ -z "$why" ]; then
+    bound_run check p2.vl >/dev/null
+    bound_run check p3.vl >/dev/null
+    [ "$(ls "$B/cache" | grep -c '^q-[0-9a-f]*\.bin$')" = 3 ] || why="three programs under the limit ($BOUND_MB MB) are not all kept"
+fi
+if [ -z "$why" ]; then
+    sleep 1
+    bound_run query refs f1 --root p1.vl >/dev/null
+    [ "$(bound_last 1)" = "hit " ] || why="p1 asked again: '$(bound_last 1)', not a hit"
+fi
+if [ -z "$why" ]; then
+    bound_run check p4.vl >/dev/null
+    bound_run query refs f1 --root p1.vl >/dev/null
+    [ "$(bound_last 1)" = "hit " ] || why="p1, used after p2 and p3, went before them: '$(bound_last 1)'"
+fi
+if [ -z "$why" ]; then
+    bound_run check p5.vl >/dev/null
+    bound_run check p6.vl >/dev/null
+    left=$(bound_bytes)
+    [ "$left" -le $((BOUND_MB * 1048576)) ] || why="$left bytes of q-KEY files after six programs, over the limit of $BOUND_MB MB"
+    [ "$(ls "$B/cache" | grep -c '^q-[0-9a-f]*\.bin$')" = 3 ] || why="${why:+$why; }not three programs left: $(ls "$B/cache" | tr '\n' ' ')"
+    [ -z "$(ls "$B/cache" | grep 'tmp')" ] || why="${why:+$why; }a temporary file is left: $(ls "$B/cache" | tr '\n' ' ')"
+    for f in q-notacache.bin q-0123456789abcdef.bin.old notes.txt; do
+        [ -f "$B/cache/$f" ] || why="${why:+$why; }$f, not a cache file, was removed"
+    done
+fi
+if [ -z "$why" ]; then
+    for i in 6 2; do
+        (cd "$B" && VOLE_CACHE=off "$COMPILER" query refs f$i --root p$i.vl >"$B/off.$i" 2>&1)
+        bound_run query refs f$i --root p$i.vl >"$B/on.$i"
+        cmp -s "$B/off.$i" "$B/on.$i" && grep -q "f$i()" "$B/on.$i" || why="${why:+$why; }query refs f$i differs from the answer without the cache"
+        case $i in
+            6) [ "$(bound_last 1)" = "hit " ] || why="${why:+$why; }p6, written last, is not in the cache: '$(bound_last 1)'" ;;
+            2) [ "$(bound_last 2)" = "miss save " ] || why="${why:+$why; }p2, the least recently used, was kept: '$(bound_last 2)'" ;;
+        esac
+    done
+    left=$(bound_bytes)
+    [ "$left" -le $((BOUND_MB * 1048576)) ] || why="${why:+$why; }$left bytes after p2 was cached again, over the limit"
+fi
+if [ -z "$why" ]; then
+    echo "pass cachediff/bound"
+else
+    echo "FAIL cachediff/bound: $why"
     STATUS=1
 fi
 echo "cachediff: $n transcripts, $total lines compared, $hits answered from the cache$([ $STATUS = 0 ] || echo '; failed')"
