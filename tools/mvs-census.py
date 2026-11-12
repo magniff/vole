@@ -1,43 +1,48 @@
 #!/usr/bin/env python3
-"""What in the tree is still read as MVS (0.28.0: the measure of "no MVS left").
+"""What in the tree is still the old edition's, or still names an edition
+(0.28.0: the measure of "no MVS left"; after the strip, tools/strip-edition.py).
 
 usage: tools/mvs-census.py [--allow FILE] [--no-allow] [--summary] [--owners]
 
 Prints one line per entry, `OWNER<TAB>CLASS<TAB>PATH[<TAB>note]`, then the
 counts, and exits 1 when an entry is left that the allow-list does not
-cover (0 otherwise). The gate runs it with `--no-allow`.
+cover (0 otherwise). The gate runs it with `--no-allow` (the mvs-census
+row): `census: 0 entries, 0 allowed, 0 left`.
 
-An entry is:
-  program   a .vl file a compiler run reads in the MVS edition: a root (a
-            file no other file of its tree names with `mod NAME;`) without
-            a line `// EDITION: rust` or `// FLAGS: ... --edition rust`,
-            and every module file reached only from such roots
+There is one edition and no file names it, so no file is read as MVS: the
+compiler refuses MVS's spellings in every program the suite builds. What
+the suite does not build, and what still speaks of editions, is counted:
+  edition-line  a file with a line `// EDITION: ...` (alone on a line, or
+                written by a script: `...// EDITION: rust\n...`), outside
+                what the previous release reads (KEEP_LINE) and the
+                records of earlier releases (HISTORY)
+  edition-flag  a file that uses `--edition` or VOLE_EDITION (not rustc's
+                own `--edition 2021`), outside the compiler's parsing of
+                it, the test that it is refused and the rows that give it
+                to the previous release (KEEP_FLAG), and HISTORY
+  old-std       a file that uses VOLE_STD2 (there is one std)
+  std           a file of compiler/std2 (std2 is compiler/std), or of
+                compiler/std while compiler/std2 is still there (the old
+                std)
+  program       a .vl text no compiler run reads on its own (no `fn main`,
+                or under inputs/ or texts/: a text a test feeds to `edit`,
+                a module a step adds) that uses MVS's words (`var`,
+                `inout`, `sink`, `defer`, `self: *T`, a `[T]` parameter or
+                result)
+  generator     a script (.awk, .sh, .py, .pl) that writes vole programs
+                and has MVS's words in what it writes; its programs are
+                not in the tree, so no other class sees them
+  guide, book, mvs-block
+                a topic or chapter outside the runners' RUST_TOPICS and
+                RUST_CHAPTERS lists, a block marked `mvs`: none once the
+                runners have no such lists
 
-  generator a script (.awk, .sh, .py, .pl) that writes vole programs and
-            has MVS's words in what it writes (tests/fuzz/gen.awk); its
-            programs are not in the tree, so no other class sees them
+The allow-list (default tools/mvs-census.allow, gone with 0.28.0) has one
+path or path prefix per line (`#` comments; a prefix ends with `/`; `*` in
+a line: a glob of the whole path).
 
-  guide     a topic of compiler/guide with code blocks that is not in
-            tests/guide/run.sh's RUST_TOPICS
-  book      a chapter of book/ with code blocks that is not in
-            tests/book/run.sh's RUST_CHAPTERS
-  mvs-block a block or session marked `mvs` in a rust chapter (PATH:LINE)
-
-A module file is the rust edition's when one rust root reaches it; a file
-no root reaches is its own root. One without a `fn main`, or under inputs/
-or texts/ (a text a test feeds to `edit`, a module a step adds, a file
-left out on purpose), is read with the program it is put into: it is
-listed only when it uses MVS's words (`var`, `inout`, `sink`, `defer`,
-`self: *T`, a `[T]` parameter or result, `.len` without a call, `*T`).
-
-The allow-list (default tools/mvs-census.allow) has one path or path
-prefix per line (`#` comments; a prefix ends with `/`); an entry under it
-is counted as allowed and does not fail the run (`*` in a line: a glob
-of the whole path).
-
-Owners: mig28 (book, examples, guide, bench, the editor samples), gpu
-(the gpu port: tests/gpu, window, voltty-render, two tools), del280 (the
-other tests), other (anything else).
+Owners: d6 (the edition's line and flag), d4 (the old std, VOLE_STD2),
+mig28, gpu, del280 as before, other.
 """
 import fnmatch
 import os
@@ -46,15 +51,33 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EDITION = re.compile(r"^// EDITION: rust\s*$", re.M)
-FLAGS = re.compile(r"^// FLAGS:.*--edition[= ]rust", re.M)
-
+EDITION = re.compile(r"^// EDITION: \w+\s*$|// EDITION: \w+(?:\\r)?\\n", re.M)
+EDITION_USE = re.compile(r"--edition\b|\bVOLE_EDITION\b")
+# rustc's own option (the twins): `--edition 2021`, `"--edition", edition`
+RUSTC_EDITION = re.compile(r"rustc|RUSTC|--edition[\"', =]+(?:20\d\d|edition\b|\"\$\{redition)")
+STD2_USE = re.compile(r"\bVOLE_STD2\b")
+# What the previous release reads (0.27.8 takes the edition of what it
+# builds from the line: compiler/src, and tests/compile_cost.sh's programs),
+# and the case that the line is a comment now.
+KEEP_LINE = ("compiler/src/main.vl", "tests/cost/", "tests/compile_cost.sh", "tests/run/edition_line_comment.vl")
+# The compiler's reading of the option (accepted and ignored for one
+# release, `mvs` refused; the code cache's key knows its spelling), the
+# transcript and the case of that, the two documents that say it is
+# deprecated, and the two scripts that give the option to the previous
+# release.
+KEEP_FLAG = ("compiler/src/main.vl", "compiler/src/front/rust/mod.vl", "compiler/src/cli/build.vl",
+             "compiler/src/back/codecache/mod.vl", "tests/refactor/envedition.t",
+             "tests/run/edition_flag_ignored.vl", "AGENTS.md", "docs/grammar.md",
+             "tests/compile_cost.sh", "bench/run.sh")
+# The records of earlier releases, and the census's and the strip's own files.
+HISTORY = ("docs/releases.md", "docs/roadmap.md", "docs/design/", "bootstrap/releases.toml", "feedbacks/",
+           "editors/vscode/CHANGELOG.md", "tools/mvs-census", "tools/strip-edition.py",
+           "tools/test-strip-edition.py", ".claude/")
 MOD = re.compile(r"(?:^|[;{}])\s*(?:pub(?:\([a-z]+\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;", re.M)
 # MVS's words, for a text no root reaches
 MVS_WORDS = re.compile(
     r"^\s*(?:pub\s+)?(?:static\s+)?var\s+[a-z_]|\b(?:inout|sink)\s+[A-Za-z_&*\[(]|^\s*defer\s|\bself:\s*\*"
-    r"|[(,]\s*[a-z_][a-z0-9_]*:\s*\[[A-Za-z0-9_]+\]\s*[,)]|\)\s*->\s*\[[A-Za-z0-9_]+\]\s*\{|(?<=[A-Za-z0-9_\])])\.len\b(?!\s*\()"
-    r"|:\s*\*(?!const\b|mut\b)[A-Za-z]", re.M)
+    r"|[(,]\s*[a-z_][a-z0-9_]*:\s*\[[A-Za-z0-9_]+\]\s*[,)]|\)\s*->\s*\[[A-Za-z0-9_]+\]\s*\{", re.M)
 MAIN = re.compile(r"\bfn\s+main\s*\(")
 # A script that writes vole programs (a generator: tests/arch/gen.awk,
 # the fuzzers): its text has a `fn NAME(` and MVS's words, wherever they
@@ -79,12 +102,15 @@ def tracked():
 
 def owner(path):
     top = path.split("/")
-
+    if path.startswith(("tests/refactor/stdedit/", "tests/query/stdpos0253/",
+                        "tests/refactor/inputs/strip_prefix")):
+        return "d4"
     if path.startswith(("tests/gpu/", "tests/window/", "tests/voltty-render/", "tools/objcgen/", "tools/wgslc/", "bench/gpu/shader/run.sh")):
         return "gpu"
     if top[0] in ("book", "examples", "bench", "editors") or path.startswith("compiler/guide/") or path == "README.md":
         return "mig28"
-
+    if path.startswith("tools/numtables/"):
+        return "d4"
     if path.startswith("tools/agent-hooks/") or top[0] == "tests":
         return "del280"
     return "other"
@@ -110,49 +136,57 @@ def shell_list(path, name):
     return set(m.group(1).split()) if m else None
 
 
+def under(path, prefixes):
+    return any(path == p or path.startswith(p) for p in prefixes)
+
+
 def programs(paths):
     files = {p for p in paths if p.endswith(".vl")}
     text = {p: read(p) for p in files}
     kids = {p: children(p, text[p], files) for p in files}
     is_child = {c for p in files for c in kids[p] if c != p}
-    rust = set()
-    old_std = []
-
-    def mark(p, into):
-        stack = [p]
-        while stack:
-            q = stack.pop()
-            if q in into:
-                continue
-            into.add(q)
-            stack.extend(kids[q])
-
-    roots = sorted(files - is_child)
-    for r in roots:
-        if EDITION.search(text[r]) or FLAGS.search(text[r]):
-            mark(r, rust)
-    # a module file with its own rust line (std2's files, a test's module)
-    for p in files:
-        if EDITION.search(text[p]):
-            mark(p, rust)
-    mvs = set()
-    for r in roots:
-        if r not in rust:
-            mark(r, mvs)
-    mvs -= rust
+    old_std = any(p.startswith("compiler/std2/") for p in paths)
     entries = []
-    for p in sorted(mvs):
-
+    for p in sorted(files):
+        if p.startswith("compiler/std2/"):
+            entries.append(("std", p, "std2 is compiler/std"))
+            continue
+        if old_std and p.startswith("compiler/std/"):
+            entries.append(("std", p, ""))
+            continue
         parts = p.split("/")
-        if p in roots and ("inputs" in parts or "texts" in parts or not MAIN.search(text[p])):
+        if p not in is_child and ("inputs" in parts or "texts" in parts or not MAIN.search(text[p])):
             # a text fed to an edit, a module a step adds, a file left out
-            # on purpose (no `fn main`): MVS only by its words
+            # on purpose (no `fn main`): no run reads it alone
             if MVS_WORDS.search(text[p]):
                 entries.append(("program", p, "text"))
+    return entries
+
+
+def marks(paths):
+    """The files that still name an edition or the second std."""
+    entries = []
+    for p in sorted(paths):
+        if under(p, HISTORY):
             continue
-        entries.append(("program", p, "root" if p in roots else "module"))
-    for r in old_std:
-        entries.append(("old-std", r, ""))
+        try:
+            t = read(p)
+        except (OSError, UnicodeDecodeError):
+            continue
+        if "EDITION" not in t and "--edition" not in t and "VOLE_STD2" not in t:
+            continue
+        lines = t.split("\n")
+        if not under(p, KEEP_LINE):
+            hits = [i for i, line in enumerate(lines, 1) if EDITION.search(line)]
+            if hits:
+                entries.append(("edition-line", p, "line %d, %d lines" % (hits[0], len(hits))))
+        if not under(p, KEEP_FLAG):
+            hits = [i for i, line in enumerate(lines, 1) if EDITION_USE.search(line) and not RUSTC_EDITION.search(line)]
+            if hits:
+                entries.append(("edition-flag", p, "line %d, %d lines" % (hits[0], len(hits))))
+        hits = [i for i, line in enumerate(lines, 1) if STD2_USE.search(line)]
+        if hits:
+            entries.append(("old-std", p, "line %d, %d lines" % (hits[0], len(hits))))
     return entries
 
 
@@ -264,14 +298,14 @@ def main(argv):
             return 2
         i += 1
     paths = tracked()
-    entries = programs(paths) + generators(paths) + docs(paths)
+    entries = programs(paths) + marks(paths) + generators(paths) + docs(paths)
     allow = load_allow(allow_file)
     counts = {}
     dirs = {}
     left = 0
     for cls, p, note in entries:
         ok = allowed(p, allow)
-        o = owner(p)
+        o = "d4" if cls in ("std", "old-std") else "d6" if cls.startswith("edition-") else owner(p)
         key = (o, cls)
         c = counts.setdefault(key, [0, 0])
         c[0] += 1
