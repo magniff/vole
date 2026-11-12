@@ -593,33 +593,6 @@ try:
     del os.environ["VOLE_TEST_DEBOUNCE"]
     shutil.rmtree(os.path.join(prog, "tests"))
 
-    # (0.27.2) A test case's options, as tests/run.sh gives them: its
-    # FLAGS' edition (no ENV line is the compiler's); none for a file
-    # without them, or check's default.
-    rc = os.path.join(tmp, "rcase.vl")
-    write(rc, "fn main() {}\n// FLAGS: --edition rust\n// ENV: OTHER=1\n")
-    case("case options: FLAGS and ENV", hook.case_options(rc), (["--edition", "rust"], {}))
-    write(rc, "fn main() {}\n// FLAGS: --deny-warnings --edition=rust\n")
-    case("case options: --edition=rust", hook.case_options(rc), (["--edition", "rust"], {}))
-    write(rc, "fn main() {}\n")
-    case("case options: the root line is the compiler's", hook.case_options(rc), ([], {}))
-    case("case options: no root", hook.case_options(None), ([], {}))
-    # (0.28.0) a file that names no edition and is written in the rust
-    # edition is read in it; one with an MVS spelling is not; a module
-    # read alone (`fmt`) takes its root's edition
-    write(rc, "fn incr(r: &mut i64) {\n    *r += 1;\n}\n")
-    case("case options: rust source without a line", hook.case_options(rc), (["--edition", "rust"], {}))
-    case("edition args: rust source without a line", hook.edition_args(rc), ["--edition", "rust"])
-    write(rc, "fn incr(r: inout i64) {\n    let mut k = 1; // &mut \n    r += k;\n}\n")
-    case("case options: an MVS spelling, MVS", hook.case_options(rc), ([], {}))
-    write(rc, "fn main() {\n    let mut k = 1;\n}\n")
-    case("edition args: the line is the compiler's", hook.edition_args(rc), [])
-    rm = os.path.join(os.path.dirname(rc), "rust_mod.vl")
-    write(rm, "pub fn two() -> i64 {\n    2\n}\n")
-    case("edition args: a module of a rust root", hook.edition_args(rm, rc), ["--edition", "rust"])
-    case("edition args: a module alone, no sign", hook.edition_args(rm), [])
-    os.remove(rc)
-
     # The real compiler, when it has --json (0.15): a clean program is
     # silent, an error is reported; and the latency on a cache hit.
     # (0.25.2.1) The compiler under test when tests/run.sh says which
@@ -647,10 +620,9 @@ try:
         case("real: an exact fix shown, not made", ([x for x in lines if x.startswith(("changed", "fixed", "  main"))],
                                                    now == typo_text),
              (["  main.vl:2: prinln(\"x\"); -> println(\"x\");"], True))
-        # (0.27.2) A case with the old `// FLAGS: --edition rust` line: the
-        # flag is accepted and nothing is rewritten.
+        # (0.27.2) A case with a `// FLAGS:` line: nothing is rewritten.
         rust = ("fn incr(r: &mut i64) {\n    *r += 1;\n}\n\nfn main() {\n    let mut n = 41;\n"
-                "    incr(&mut n);\n}\n// FLAGS: --edition rust\n")
+                "    incr(&mut n);\n}\n// FLAGS: --deny-warnings\n")
         write(os.path.join(prog, "main.vl"), rust)
         got = ctx_of(run(ev2, real)[1])
         with open(os.path.join(prog, "main.vl")) as fh:

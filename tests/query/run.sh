@@ -285,14 +285,14 @@ check default_root "$ok" "$out"
 # default budget: std::io comes after std::slice. 0.28: the rust edition's
 # std, named until the edition is the only one.)
 mkdir -p "$WORK/empty"
-out=$(cd "$WORK/empty" && "$COMPILER" --edition rust query items std --budget 40000 2>&1)
+out=$(cd "$WORK/empty" && "$COMPILER" query items std --budget 40000 2>&1)
 ok=0
 [ "$(printf '%s\n' "$out" | wc -l)" -ge 100 ] && printf '%s\n' "$out" | head -1 | grep -q "^# std${TAB}<std>\$" \
     && printf '%s\n' "$out" | grep -q "${TAB}pub fn read_line<A: Allocator>(&self, buf: &mut String<A>) -> Result<usize>\$" \
     && ! printf '%s\n' "$out" | grep -q 'fn malloc' && ok=1
 check std_items_no_program "$ok" "$(printf '%s\n' "$out" | head -5)"
 # (0.17: a name outside the prelude, which needs no `use`)
-out=$(cd "$WORK/empty" && "$COMPILER" --edition rust query show FixedBuf::used 2>&1)
+out=$(cd "$WORK/empty" && "$COMPILER" query show FixedBuf::used 2>&1)
 ok=0
 printf '%s\n' "$out" | head -2 | grep -q '^// use std::alloc::FixedBuf;$' && ok=1
 check std_show_no_program "$ok" "$(printf '%s\n' "$out" | head -5)"

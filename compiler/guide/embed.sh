@@ -7,10 +7,9 @@
 # functions of 990 calls, part0, part1, ..., that text calls in turn);
 # mod.vl has the table of topics. Run it after changing the guide;
 # tests/guide/run.sh checks they agree.
-# (0.28.0) In the rust edition when compiler/src is (its root's
-# `// EDITION: rust`), as `fix --edition rust` writes it: a literal is
-# `b"..."` (one with a `\u{..}` escape `"...".as_bytes()`, which b""
-# cannot hold), a view result `&'static [u8]`.
+# (0.28.0) A literal is `b"..."` (one with a `\u{..}` escape
+# `"...".as_bytes()`, which b"" cannot hold), a view result
+# `&'static [u8]`.
 #
 # usage: compiler/guide/embed.sh [-c]   (-c: only check, exit 1 if stale)
 set -eu
@@ -26,24 +25,13 @@ trap 'rm -rf "$tmp"' EXIT
 escape() {
     sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
-rust=0
-grep -q '^// EDITION: rust *$' compiler/src/main.vl && rust=1
-# A line's literal, `"TEXT"` (in the rust edition `b"TEXT"`, or
-# `"TEXT".as_bytes()` with a \u{..} escape) from escaped lines: sed
-# replaces OPEN and CLOSE around each.
-if [ "$rust" = 1 ]; then
-    lit() {
-        sed -e '/\\u{/{s/^/OPEN"/;s/$/\\n".as_bytesCLOSE/;b' -e '}' -e 's/^/OPENb"/' -e 's/$/\\n"CLOSE/'
-    }
-    view="&'static [u8]"
-    q='b"'
-else
-    lit() {
-        sed -e 's/^/OPEN"/' -e 's/$/\\n"CLOSE/'
-    }
-    view="[u8]"
-    q='"'
-fi
+# A line's literal, `b"TEXT"` (or `"TEXT".as_bytes()` with a \u{..}
+# escape) from escaped lines: sed replaces OPEN and CLOSE around each.
+lit() {
+    sed -e '/\\u{/{s/^/OPEN"/;s/$/\\n".as_bytesCLOSE/;b' -e '}' -e 's/^/OPENb"/' -e 's/$/\\n"CLOSE/'
+}
+view="&'static [u8]"
+q='b"'
 
 names=""
 count=0

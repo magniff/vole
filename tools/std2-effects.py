@@ -3,7 +3,7 @@
 # declarations `volec fix --only effects-std` prints into compiler/std.
 #
 # std2 is built into the compiler (compiler/src/front/stdsrc_rust.vl, made
-# by compiler/std/embed.sh --edition rust), so fix prints std's lines as
+# by compiler/std/embed.sh), so fix prints std's lines as
 # `<std>:LINE<TAB>THE LINE TO INSERT`, LINE in the built-in text. This
 # reads that text and its file map back from stdsrc_rust.vl, takes the
 # union of the declarations each input gives one line (a generic item's

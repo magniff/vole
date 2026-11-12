@@ -1,7 +1,7 @@
 #!/bin/sh
 # std2 lexed by its units (0.27.5, front-rust.md Z5.2): the index embed.sh
 # writes (stdsrc_rust.vl: std2_units) is the one the compiler makes of
-# the tree's std2 (embed.sh --edition rust -c with this compiler), and a
+# the tree's std2 (embed.sh -c with this compiler), and a
 # build that reads it keeps the tokens the build that lexes std2 whole
 # keeps (VOLE_STD2_INDEX=0): the same, in the same order, on a set of
 # programs. Each build must pass without the eager rerun (a lazy build
@@ -21,11 +21,11 @@ fail=0
 
 # The index is this compiler's (when it can make one: else embed.sh -c
 # compares the rest, and the builds below read no index).
-if ! (cd "$ROOT" && VOLE_EMBED_VOLEC="$C" sh compiler/std/embed.sh --edition rust -c); then
-    echo "FAIL std2-units: stdsrc_rust.vl's std2_units is stale (compiler/std/embed.sh --edition rust)"
+if ! (cd "$ROOT" && VOLE_EMBED_VOLEC="$C" sh compiler/std/embed.sh -c); then
+    echo "FAIL std2-units: stdsrc_rust.vl's std2_units is stale (compiler/std/embed.sh)"
     fail=1
 fi
-if ! "$C" --edition rust __std2-index /dev/null 2>/dev/null | grep -q '^std2-units '; then
+if ! "$C" __std2-index /dev/null 2>/dev/null | grep -q '^std2-units '; then
     echo "std2-units: $C makes no index (before 0.27.5): the token comparison skipped"
     exit $fail
 fi
@@ -76,7 +76,7 @@ for p in "$T/hello.vl" "$T/multi/main.vl" "$ROOT/tests/cost/std_heavy.vl" \
         "$T/$name.$way.bin" > "$T/$name.$way.run" 2>&1 < /dev/null
     done
     if [ "$(head -1 "$T/$name.index")" != by-index ] || [ "$(head -1 "$T/$name.tokens")" != by-tokens ]; then
-        echo "FAIL std2-units: $name: the builds read std2 as $(head -1 "$T/$name.index") and $(head -1 "$T/$name.tokens") (by-index and by-tokens expected: with by-tokens first, stdsrc_rust.vl's std2_units is empty or stale; try: compiler/std/embed.sh --edition rust, with target/volec of 0.27.5 or later)"
+        echo "FAIL std2-units: $name: the builds read std2 as $(head -1 "$T/$name.index") and $(head -1 "$T/$name.tokens") (by-index and by-tokens expected: with by-tokens first, stdsrc_rust.vl's std2_units is empty or stale; try: compiler/std/embed.sh, with target/volec of 0.27.5 or later)"
         fail=1
         continue
     fi

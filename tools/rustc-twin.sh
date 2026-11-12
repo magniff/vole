@@ -14,9 +14,9 @@
 #   -j N      cases at once (default 4)
 #   -r RUSTC  the rustc to run (default: rustc on PATH, else
 #             ~/.cargo/bin/rustc); none found: exit 77 (a gate SKIP)
-#   --guide   also the guide's rust-edition programs: the blocks of
-#             compiler/guide/*.md whose first line is `// EDITION: rust`
-#             and that have an out block (tests/guide/run.sh --split)
+#   --guide   also the guide's programs: the blocks of
+#             compiler/guide/*.md that have an out block
+#             (tests/guide/run.sh --split)
 #   --alloc-api
 #             Rust's own allocator_api instead of the stable shim: rustc run
 #             as nightly (RUSTC_BOOTSTRAP=1, -Zcrate-attr=feature(
@@ -118,7 +118,7 @@ if GUIDE:
     for b in sorted(os.listdir(bdir)):
         p = os.path.join(bdir, b)
         src = open(os.path.join(p, "prog.vl")).read()
-        if not src.startswith("// EDITION: rust") or not os.path.isfile(os.path.join(p, "out")):
+        if not os.path.isfile(os.path.join(p, "out")):
             continue
         if [f for f in os.listdir(p) if f.endswith(".vl") and f != "prog.vl"]:
             continue  # (a program of several files: outside the twin)

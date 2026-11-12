@@ -216,8 +216,7 @@ def example_checks(event, st, top, start):
         if compiler:
             for rel in changed:
                 if rel.endswith(".vl") and example_root(top, rel) == root and os.path.exists(os.path.join(top, rel)):
-                    ed = cae.edition_args(os.path.join(top, rel), os.path.join(top, root, "main.vl"))
-                    r = cae.run_typed(compiler, top, ["fmt"] + ed + ["--check", rel])
+                    r = cae.run_typed(compiler, top, ["fmt", "--check", rel])
                     if r is not None and r.returncode != 0:
                         problems.append(f"{rel} is not formatted; try: volec fmt {rel}")
         names = cases.get(f"{root}/main.vl", [])

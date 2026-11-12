@@ -44,11 +44,6 @@
 set -u
 LC_ALL=C
 export LC_ALL
-# (0.28.0) Every topic's examples are the rust edition's: --split writes
-# a block's prog.vl with `// EDITION: rust` first (the twin's guide
-# programs).
-rust_topic() { echo 1; }
-
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 COMPILER="$ROOT/target/volec"
@@ -82,7 +77,7 @@ RESULTS="$WORK/results"
 # under $WORK/blocks: prog.vl (wrapped as its kind needs), and, when an
 # out or err block follows, out (with exit) or err.
 split_blocks() {
-    awk -v topic="$2" -v dir="$WORK/blocks" -v rust="$(rust_topic "$2")" -v splitting="${SPLIT:+1}" '
+    awk -v topic="$2" -v dir="$WORK/blocks" '
         function flush_pending() { pending = "" }
         function item_line(l) {
             return l ~ /^(pub |fn |struct |enum |union |impl|trait |const |static |type |use |mod |import |extern |unsafe fn |#\[|}|\/\/|$)/
@@ -113,11 +108,9 @@ split_blocks() {
                         system("mkdir -p \"" proj "\"")
                         printf "%s\n", topic ":" start > (proj "/name")
                         close(proj "/name")
-                        if (rust) { print "rust" > (proj "/edition"); close(proj "/edition") }
                     }
                     fname = substr(lang, 6)
                     f = proj "/" (fname == "main.vl" ? "prog.vl" : fname)
-                    if (rust && splitting && fname == "main.vl") print "// EDITION: rust" > f
                     for (i = 1; i <= nbody; i++) print b[i] > f
                     close(f)
                     pending = proj
@@ -135,7 +128,6 @@ split_blocks() {
                     system("mkdir -p \"" d "\"")
                     printf "%s\n", name > (d "/name")
                     close(d "/name")
-                    if (rust) { print "rust" > (d "/edition"); close(d "/edition") }
                     # the kind: program, items or statements
                     kind = "items"
                     for (i = 1; i <= nbody; i++) {
@@ -146,7 +138,6 @@ split_blocks() {
                             if (b[i] !~ /^[ \t]/ && !item_line(b[i])) { kind = "stmts"; break }
                     }
                     f = d "/prog.vl"
-                    if (rust && splitting) print "// EDITION: rust" > f
                     if (kind == "program" || kind == "items") {
                         for (i = 1; i <= nbody; i++) print b[i] > f
                         if (kind == "items") print "fn main() -> i32 { 0 }" > f
@@ -198,11 +189,8 @@ trimmed() {
 check_block() {
     d=$1
     name=$(cat "$d/name")
-    # (0.28.0) a rust topic's block: --edition rust
-    ed=""
-    if [ -f "$d/edition" ]; then ed="--edition rust"; fi
     if [ -f "$d/err" ]; then
-        "$COMPILER" --syntax=0.20 $ed --deny-warnings --diagnostics=short "$d/prog.vl" -o "$d/prog" >"$d/compile.out" 2>&1
+        "$COMPILER" --syntax=0.20 --deny-warnings --diagnostics=short "$d/prog.vl" -o "$d/prog" >"$d/compile.out" 2>&1
         rc=$?
         if [ $rc -ne 1 ]; then
             { echo "FAIL $name: expected a compile error (exit 1), got exit $rc"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
@@ -228,7 +216,7 @@ check_block() {
         if [ "$HOST" = Darwin-arm64 ]; then
             link="-l objc"
         else
-            if (cd "$d" && "$COMPILER" --syntax=0.20 $ed --deny-warnings --diagnostics=short main.vl -o prog.o) >"$d/compile.out" 2>&1; then
+            if (cd "$d" && "$COMPILER" --syntax=0.20 --deny-warnings --diagnostics=short main.vl -o prog.o) >"$d/compile.out" 2>&1; then
                 echo "pass $name" >"$d/result"
             else
                 { echo "FAIL $name: does not compile"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
@@ -236,14 +224,14 @@ check_block() {
             return
         fi
     fi
-    if ! (cd "$d" && "$COMPILER" --syntax=0.20 $ed --deny-warnings --diagnostics=short main.vl $link -o prog) >"$d/compile.out" 2>&1; then
+    if ! (cd "$d" && "$COMPILER" --syntax=0.20 --deny-warnings --diagnostics=short main.vl $link -o prog) >"$d/compile.out" 2>&1; then
         { echo "FAIL $name: does not compile"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
         return
     fi
     # (0.25.4) A program's #[test]s are left out of its build: `volec
     # test` runs them, at -O0 and -O2, and they must pass.
     if grep -q '^#\[test\]' "$d"/*.vl; then
-        if ! (cd "$d" && "$COMPILER" test $ed main.vl) >"$d/test.out" 2>&1; then
+        if ! (cd "$d" && "$COMPILER" test main.vl) >"$d/test.out" 2>&1; then
             { echo "FAIL $name: its #[test]s fail (volec test main.vl)"; sed 's/^/    /' "$d/test.out"; } >"$d/result"
             return
         fi
@@ -442,7 +430,7 @@ fi
 # the heaps' section, Vec's sort_by_key, retain, contains, first; 0.25:
 # 21500, std::min, max, clamp, abs and `(a..=b).rev()`; 0.26.2: 22000,
 # TryFrom and its impls, usize's and isize's; 0.27.0: 22400, Deref,
-# DerefMut, Index and IndexMut, for the rust edition; 0.28.0: 37000,
+# DerefMut, Index and IndexMut; 0.28.0: 37000,
 # the one std, Rust's shape: the index leaves out whole modules
 # (stdapi.vl: index_hides), the types that borrow, the Debug builders and
 # the trait impls, and is still over the 30000 characters: to be cut);
@@ -546,8 +534,8 @@ else
     result FAIL guide-find-arch "not first on guide arch:$missed"
 fi
 # (0.20) The words of borrowing land on the sections that teach them
-# (0.28.0: memory's borrowing, the rust edition's; MVS's inout and sink
-# are gone from it).
+# (0.28.0: memory's borrowing, `&T` and `&mut T`; the old parameter
+# conventions are gone from it).
 missed=""
 for pair in 'borrows:memory#borrowing' \
     'mutable reference:memory#borrowing' '&mut:memory#borrowing' \
@@ -623,7 +611,7 @@ rust_try_case() { # <name> <expected output> <snippet...>
     n=$1
     want=$2
     shift 2
-    got=$("$COMPILER" --edition rust try "$@" 2>&1)
+    got=$("$COMPILER" try "$@" 2>&1)
     if [ "$got" = "$want" ]; then
         result pass "try-rust-$n"
     else
@@ -645,7 +633,7 @@ rust_try_case panic 'snippet:1:42: index out of bounds: index 3, length 0
 exit 101' 'let v: Vec<i64, Gpa> = Vec::new_in(gpa); v[3]'
 printf 'struct P { x: i64 }\n\nlet p = P { x: 4 };\np.x * 10\n' >"$WORK/snip.vl"
 rust_try_case file 'i64 = 40' --file "$WORK/snip.vl"
-got=$(printf '7\n' | "$COMPILER" --edition rust try 'let mut b = String::new_in(gpa); std::io::stdin().read_line(&mut b).unwrap(); b.trim().parse::<i64>().ok()' 2>&1)
+got=$(printf '7\n' | "$COMPILER" try 'let mut b = String::new_in(gpa); std::io::stdin().read_line(&mut b).unwrap(); b.trim().parse::<i64>().ok()' 2>&1)
 if [ "$got" = 'Option<i64> = Some(7)' ]; then result pass try-rust-stdin; else result FAIL try-rust-stdin "$got"; fi
 "$COMPILER" try >"$WORK/try.out" 2>&1
 rc=$?

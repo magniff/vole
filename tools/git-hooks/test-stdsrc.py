@@ -201,7 +201,7 @@ def std2_case():
     cannot make it (0.27.4's, as every worktree's target/tools/volec is
     until the release) keeps the index the file has, never an empty one."""
     compiler = os.environ.get("VOLE_TEST_COMPILER") or os.path.join(ROOT, "target/volec")
-    probe = subprocess.run([compiler, "--edition", "rust", "__std2-index", "/dev/null"],
+    probe = subprocess.run([compiler, "__std2-index", "/dev/null"],
                            capture_output=True, text=True) if os.path.exists(compiler) else None
     if probe is None or not probe.stdout.startswith("std2-units "):
         print("skip std2 index: no compiler of 0.27.5 or later")

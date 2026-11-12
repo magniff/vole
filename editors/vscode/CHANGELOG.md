@@ -10,6 +10,9 @@
   (`keyword.other.where.vole`), `dyn`, `ref`; `&` is
   `keyword.operator.borrow.vole`; `str`, `char`, `String`, `Box` and
   the comparison traits are known types.
+- `defer` is an ordinary name too (it was `keyword.control.vole`). The
+  samples have no edition line: there is one edition, and no file says
+  it.
 
 ## Unreleased (vole 0.25.2)
 

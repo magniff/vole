@@ -629,7 +629,7 @@ with tempfile.TemporaryDirectory() as tmp:
         "compiler/src/middle/egraph.vl": BIG,
         "compiler/src/middle/ir/mod.vl": "pub mod cfg;\nuse crate::base::IntVec;\n" + BIG,
         "compiler/src/front/patterns/usefulness.vl": BIG,
-        "compiler/std/io.vl": BIG.replace("// line 250\n", "    pub fn next_line(self: *Scanner) -> [u8] {\n"),
+        "compiler/std/io.vl": BIG.replace("// line 250\n", "    pub fn next_line(&mut self) -> &[u8] {\n"),
         "compiler/std/std.vl": BIG,
     }
     for name, text in files.items():

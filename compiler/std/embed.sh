@@ -22,9 +22,7 @@
 # Run it after changing any of them; tests/run.sh checks they agree, and
 # the commit hook makes the file again when compiler/std changes.
 #
-# usage: compiler/std/embed.sh [--edition rust] [-c]   (-c: only check,
-# exit 1 if stale; --edition rust: accepted, and means nothing: 0.27's
-# flag, when the script also made the old std's text)
+# usage: compiler/std/embed.sh [-c]   (-c: only check, exit 1 if stale)
 set -eu
 # (0.27.5, Z5.2) std2's index, std2_units, is made by a compiler: the one
 # VOLE_EMBED_VOLEC names, else target/tools/volec, else target/volec, of
@@ -45,10 +43,6 @@ main_tree=
 common=$(git -C "$caller" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
 case "$common" in */.git) main_tree=${common%/.git} ;; esac
 cd "$(dirname "$0")/../.."
-if [ "${1:-}" = "--edition" ]; then
-    [ "${2:-}" = rust ] || { echo "embed.sh: --edition takes rust" >&2; exit 2; }
-    shift 2
-fi
 out=compiler/src/front/stdsrc_rust.vl
 # (next to the output: writable in a sandbox that only allows the tree, and mv is a rename)
 tmp=$(mktemp "$out.XXXXXX")
@@ -114,14 +108,14 @@ lines() {
         }
         END { if (n > 0) print "    buf_str(out, c\"" acc "\");" }'
 }
-# (0.27.5, Z5.2) std2's units, `volec --edition rust __std2-index TEXT`
+# (0.27.5, Z5.2) std2's units, `volec __std2-index TEXT`
 units_made=0
 text_sum=$(cksum <"$text" | awk '{ print $1 }')
 for c in "$embed_volec" "$caller/target/tools/volec" "$caller/target/volec" \
     "$here/target/tools/volec" "$here/target/volec" \
     ${main_tree:+"$main_tree/target/tools/volec" "$main_tree/target/volec"}; do
     [ -n "$c" ] && [ -x "$c" ] || continue
-    if "$c" --edition rust __std2-index "$text" >"$work/made" 2>/dev/null \
+    if "$c" __std2-index "$text" >"$work/made" 2>/dev/null \
         && head -1 "$work/made" | grep -q "^std2-units $STD2_UNITS_FORMAT "; then
         units_made=1
         break
