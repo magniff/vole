@@ -372,7 +372,7 @@ case("compound, eval qwen35: nothing ran, which part", (st, err.splitlines()[0])
             "compiler/std/gpu/types.vl`) reads the compiler's .vl source"))
 case("compound, eval qwen35: the whole line, the read as its query",
      [l for l in err.splitlines() if l.startswith("try the whole line: ")][0].endswith(
-         "query text compiler/std/gpu/types.vl:94-414; ls examples/gpu/fluid2d/; wc -l examples/gpu/fluid2d/*.vl; "
+         "query text compiler/std/gpu/types.vl:95-415; ls examples/gpu/fluid2d/; wc -l examples/gpu/fluid2d/*.vl; "
          "cat tools/agent-feedback | head -20; ls evals/tasks/0.25.2/tools/"), True)
 # (0.25.2.2) The 0.25.2.1 eval's qwen35, round 2: a python edit of its own
 # program and a grep over compiler/std on one line; the grep has no query
@@ -692,11 +692,11 @@ with tempfile.TemporaryDirectory() as tmp:
          "--word --code 'pub mod' mod use import --in compiler/src/middle/ir/mod.vl")
     case("iter3: grep -r of compiler/std: --in std", "%s query grep 'fn trim' --in std | head;" % T in got[5], True)
     case("iter3: sed -n of std, && kept", got[8].startswith(
-        'cd "$PWD" && %s query text compiler/std/io.vl:89-129 && echo ---- && cat compiler/guide/std.md' % T), True)
+        'cd "$PWD" && %s query text compiler/std/io.vl:90-130 && echo ---- && cat compiler/guide/std.md' % T), True)
     case("iter3: one name piped: refs or grep, grouped", "echo ---; { %s query refs Some --in std 2>/dev/null || "
          "%s query grep Some --in std; } | head -5; echo ---" % (T, T) in got[7], True)
     case("iter3: grep -A25 'fn NAME': the lines it prints (the line's own volec)", got[9].endswith(
-        "echo ----; target/volec query text compiler/std/io.vl:249-274 | head -50"), True)
+        "echo ----; target/volec query text compiler/std/io.vl:250-275 | head -50"), True)
     case("iter3: a file that is not there: left as typed", got[14],
          "{ %s query refs ir_make 2>/dev/null || %s query grep ir_make; } | head; git status --short | head -40; "
          "cat compiler/src/middle/ir/build.vl | head -30" % (T, T))

@@ -113,12 +113,12 @@ fn main() {
 }
 EOF
 cat >loops.want <<'EOF'
-vec-stats: kernels, loop at line 26: not vectorized: a call in the loop
-vec-stats: kernels, loop at line 12: vectorized, 2 lanes, the body 4 times an iteration
-vec-stats: kernels, loop at line 15: not vectorized: an address computed from a value loaded in the loop (a gather, a[idx[i]]) (shl)
-vec-stats: kernels, loop at line 18: not vectorized: a branch in its body that is no bounds check (an if, a break)
-vec-stats: kernels, loop at line 32: not vectorized: an unknown trip count: not a loop over a counter to a bound
-vec-stats: kernels, loop at line 36: not vectorized: a float carried from one iteration to the next (a float sum: lanes would add in another order) (phi)
+vec-stats: kernels, loop at line 25: not vectorized: a call in the loop
+vec-stats: kernels, loop at line 11: vectorized, 2 lanes, the body 4 times an iteration
+vec-stats: kernels, loop at line 14: not vectorized: an address computed from a value loaded in the loop (a gather, a[idx[i]]) (shl)
+vec-stats: kernels, loop at line 17: not vectorized: a branch in its body that is no bounds check (an if, a break)
+vec-stats: kernels, loop at line 31: not vectorized: an unknown trip count: not a loop over a counter to a bound
+vec-stats: kernels, loop at line 35: not vectorized: a float carried from one iteration to the next (a float sum: lanes would add in another order) (phi)
 vector loops 3, overlap tests 0, tests dropped by noalias 0
 EOF
 REFUSED="error[time.instructions] the instructions retired cannot be read here | help: the system's counter refused this process (Linux: perf_event_open, which /proc/sys/kernel/perf_event_paranoid above 2 or a container's seccomp profile forbids); --time-passes counts CPU time | try: volec --time-passes FILE.vl -c -o /dev/null"
