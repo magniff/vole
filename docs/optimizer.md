@@ -1986,8 +1986,9 @@ the compilation at its first error):
 - a `&mut T` or `&mut [T]` parameter (exclusive) shares no memory with
   another reference parameter or a static (`params_disjoint`, in
   `may_alias`: gvn, licm, slp and the vectorizer get it);
-- a `&T` or `[T]` parameter (shared) is the same when the function writes
-  through it nowhere (a write through `[T]` is `own.readonly`'s; until
+- a `&T` or `&[T]` parameter (shared) is the same when the function writes
+  through it nowhere (a write through `&[T]` is the borrow checker's
+  error, rustc E0594: `own.readonly` before 0.28.0; until
   that is checked, such a parameter is left raw);
 - a reference parameter the function passes to no call and writes
   nowhere is not written by its calls (`param_frozen`, in

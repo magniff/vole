@@ -1441,7 +1441,7 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
   (untracked, staged, or added by a commit no release-* branch nor main
   has) is the agent's own: read and rewritten with any tool; a file of
   another kind under compiler/src or compiler/std (`tables/*.objc`,
-  index.awk; a `grep -r --include '*.objc'`) is not vole source; a
+  `embed.sh`; a `grep -r --include '*.objc'`) is not vole source; a
   Python script is a rewrite only when a file it opens for writing is
   compiler source, its target followed through the script's assignments
   (`out = os.path.join(scratch, 'x')` is not; a target from `sys.argv`,

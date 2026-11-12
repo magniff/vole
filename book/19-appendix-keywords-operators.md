@@ -15,7 +15,6 @@ These words are reserved: you can't use them as names.
 | `break` | leaves a loop, optionally with a value or a label: `break n`, `break 'outer` | 3 |
 | `const` | a constant item: `const MAX: i64 = 100;` | 3 |
 | `continue` | starts the next round of a loop: `continue 'outer` | 3 |
-| `defer` | reserved, and an error (`syntax.defer`): a guard with `Drop` does that job | `guide memory` |
 | `else` | the other branch of `if`; also in `let ... else` and a contract's message | 3, 5 |
 | `enum` | a type whose value is one of several variants | 5 |
 | `extern` | a C function or block of them: `extern "C" { ... }` | 15 |
