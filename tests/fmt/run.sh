@@ -144,7 +144,7 @@ printf '%s\n' $programs compiler/src/main.vl | awk -v w="$WORK/c" '{ print NR " 
 # changed after the copy was made, or nothing.
 changed_since_copy() {
     case "$1" in
-        compiler/src/main.vl) where="compiler/src compiler/std2" ;;
+        compiler/src/main.vl) where="compiler/src compiler/std" ;;
         tests/run/*/main.vl|examples/*/main.vl|examples/*/*/main.vl) where=$(dirname "$1") ;;
         *) where=$1 ;;
     esac

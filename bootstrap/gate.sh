@@ -71,7 +71,7 @@
 # borrowck-twin (tools/borrowck-twin.sh, 0.27.1: every rust_b_ case's
 # verdict against rustc's, accept or reject, and its code; a divergence
 # only when the case names its class; skipped without rustc; --quick too);
-# std2-check (tests/std2/check.sh, 0.27.2, borrowck.md Z7: every std2 body
+# std2-check (tests/std/check.sh, 0.27.2, borrowck.md Z7: every std2 body
 # type-checked and solved by the borrow checker, 0 errors; 0.27.2.1: with
 # suite-O0 in the gate, only the std2 cases that row did not pass are
 # compiled again);
@@ -668,9 +668,9 @@ run_step() {
             # (0.27.2.1) the cases' part from the suite-O0 row's builds of
             # them when this gate runs that row (suite_results)
             if r=$(suite_results 0 std2-check); then
-                sh "$ROOT/tests/std2/check.sh" -c "$C" -r "$r"
+                sh "$ROOT/tests/std/check.sh" -c "$C" -r "$r"
             else
-                sh "$ROOT/tests/std2/check.sh" -c "$C"
+                sh "$ROOT/tests/std/check.sh" -c "$C"
             fi ;;
         std2-tests)
             # (0.27.2, gate 1) std2's cases at -O0 and -O2: the runner builds

@@ -304,7 +304,7 @@ check std_show_no_program "$ok" "$(printf '%s\n' "$out" | head -5)"
 out=$(env -u VOLE_STD_TREE "$COMPILER" query def str::trim 2>&1)
 loc=$(printf '%s\n' "$out" | awk -F "$TAB" '$1 == "str::trim" { print $2 }')
 ok=0
-case "$loc" in compiler/std2/*.vl:*) ok=1 ;; esac
+case "$loc" in compiler/std/*.vl:*) ok=1 ;; esac
 check std_def_in_repo "$ok" "$out"
 out=$(env -u VOLE_STD_TREE "$COMPILER" query show "${loc%:*}" 2>&1)
 ok=0

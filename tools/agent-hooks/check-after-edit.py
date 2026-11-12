@@ -406,12 +406,12 @@ def current_compiler(compiler, where, st=None):
 # from the directory it runs in, at most three levels up; the hook names
 # them: $VOLE_STD_TREE, the checkout's compiler/std. A compiler before
 # 0.25.5 reads neither $VOLE_STD_TREE nor the tree's system file
-# (sys/macos.vl, sys/linux.vl: 0.25.4's false `std::sys_c_strerror_r`
+# (rt/sys_macos.vl, rt/sys_linux.vl: 0.25.4's false `std::sys_c_strerror_r`
 # errors): when that file is not the one built into it, the hook says so
 # in one line (hook.stale-std) and checks with target/volec when that one
 # is current, else not at all, instead of reporting false errors.
 STD_MARK = b"VOLE_STD_TREE"
-SYS_FILE = "sys/linux.vl" if sys.platform.startswith("linux") else "sys/macos.vl"
+SYS_FILE = "rt/sys_linux.vl" if sys.platform.startswith("linux") else "rt/sys_macos.vl"
 
 
 def std_tree(where):

@@ -8,7 +8,7 @@
 #   Metal's API and shader validation (MTL_DEBUG_LAYER,
 #   MTL_SHADER_VALIDATION), checked, and run again under `leaks --atExit`,
 #   which must find nothing;
-# - objcgen: every table of compiler/std2/objc/tables is regenerated and
+# - objcgen: every table of compiler/std/objc/tables is regenerated and
 #   compared
 #   with its checked-in module, checked against the Objective-C runtime
 #   (--check) and its constants and structs against the SDK's headers
@@ -174,7 +174,7 @@ done <"$WORK/cases"
 # objcgen: generation, the runtime check, the header check.
 case objcgen in
 *"$FILTER"*)
-    for t in "$ROOT"/compiler/std2/objc/tables/*.objc; do
+    for t in "$ROOT"/compiler/std/objc/tables/*.objc; do
         [ -f "$t" ] || continue
         tn=$(basename "$t" .objc)
         td=${t#"$ROOT"/}

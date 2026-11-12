@@ -187,7 +187,7 @@ transcript() {
 
 STDPOS="$ROOT/tests/stdpos.awk"
 # (0.25.5) std's files, relative to compiler/std (stdpos.awk's stdfiles)
-STD_FILES=$(cd "$ROOT/compiler/std2" 2>/dev/null && find . -name '*.vl' | sed 's|^\./||' | sort | tr '\n' ' ')
+STD_FILES=$(cd "$ROOT/compiler/std" 2>/dev/null && find . -name '*.vl' | sed 's|^\./||' | sort | tr '\n' ' ')
 for case in "$HERE"/*.lsp; do
     [ -e "$case" ] || continue
     name=$(basename "$case" .lsp)

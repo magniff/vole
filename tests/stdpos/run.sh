@@ -10,14 +10,14 @@
 #
 #   -c COMPILER   the volec binary (default: target/volec)
 #   --real        also the change itself: in a copy of the tree, a line
-#                 added at the top of compiler/std2/gpu/mod.vl and one in
+#                 added at the top of compiler/std/gpu/mod.vl and one in
 #                 std.vl's first comment (every position after it moves),
-#                 (0.25.5) a function at the top of compiler/std2/num.vl
+#                 (0.25.5) a function at the top of compiler/std/num.vl
 #                 and a module std::stdpos_probe, second of std's modules,
 #                 std embedded again (compiler/std/embed.sh) and the
 #                 compiler rebuilt (by COMPILER), whose runners then must
 #                 pass and fail as below (a transcript whose program has
-#                 its own compiler/std2 is not moved by it: it must pass),
+#                 its own compiler/std is not moved by it: it must pass),
 #                 and the four suites whole:
 #                 nothing else of them may fail (a few minutes)
 #
@@ -62,7 +62,7 @@ AWK="$ROOT/tests/stdpos.awk"
 # (0.25.5) std's file names, for the LSP sessions' positions (stdpos.awk's
 # stdfiles)
 std_files() {
-    (cd "$1/compiler/std2" 2>/dev/null && find . -name '*.vl' | sed 's|^\./||' | sort | tr '\n' ' ')
+    (cd "$1/compiler/std" 2>/dev/null && find . -name '*.vl' | sed 's|^\./||' | sort | tr '\n' ' ')
 }
 STD_FILES=$(std_files "$ROOT")
 
@@ -141,7 +141,7 @@ run_runners() {
             # (0.28.0) a transcript its runner expects to differ
             # (`## XFAIL:`): neither verdict is asked of it
             echo "pass $4_$name (xfail in its runner)"
-        elif [ "$how" = exact ] && [ "$4" = moved ] && [ -d "$1/tests/$kind/$name/compiler/std2" ]; then
+        elif [ "$how" = exact ] && [ "$4" = moved ] && [ -d "$1/tests/$kind/$name/compiler/std" ]; then
             if grep -q "^pass $name\\( \\|\$\\)" "$out" && ! grep -q "^FAIL $name\\( \\|:\\)" "$out"; then
                 echo "pass $4_$name (exact-std, its own std: unmoved, passes)"
             else
@@ -177,18 +177,18 @@ if [ "$REAL" = 1 ]; then
     mkdir -p "$T"
     (cd "$ROOT" && git ls-files -z -c -o --exclude-standard | tar --null -T - -cf - 2>/dev/null) | tar -xf - -C "$T"
     (cd "$T" && git init -q . && git add -A >/dev/null 2>&1)
-    { echo '// (tests/stdpos/run.sh: a line that moves std'"'"'s positions)'; cat "$ROOT/compiler/std2/gpu/mod.vl"; } >"$T/compiler/std2/gpu/mod.vl"
+    { echo '// (tests/stdpos/run.sh: a line that moves std'"'"'s positions)'; cat "$ROOT/compiler/std/gpu/mod.vl"; } >"$T/compiler/std/gpu/mod.vl"
     # (0.25.5) a function at the top of a std file, and a std module of its
     # own, listed second among std's modules (a `mod` line after the
     # first): std's list of modules changes, which the transcripts do not
     # pin (stdpos.awk)
-    { echo 'pub fn stdpos_probe_top() -> i64 { 1 }'; cat "$ROOT/compiler/std2/num.vl"; } >"$T/compiler/std2/num.vl"
+    { echo 'pub fn stdpos_probe_top() -> i64 { 1 }'; cat "$ROOT/compiler/std/num.vl"; } >"$T/compiler/std/num.vl"
     printf '%s\n' '// ---- A module added by tests/stdpos/run.sh (0.25.5) ----' \
-        'pub fn probe_value() -> i64 { 2 }' >"$T/compiler/std2/stdpos_probe.vl"
+        'pub fn probe_value() -> i64 { 2 }' >"$T/compiler/std/stdpos_probe.vl"
     awk 'NR == 5 { print "// (tests/stdpos/run.sh: a line that moves all of std'"'"'s positions)" }
         { print }
         /^pub mod [a-z_]+;/ && !added { print "pub mod stdpos_probe;"; added = 1 }' \
-        "$ROOT/compiler/std2/std.vl" >"$T/compiler/std2/std.vl"
+        "$ROOT/compiler/std/std.vl" >"$T/compiler/std/std.vl"
     if ! sh "$T/compiler/std/embed.sh" >"$WORK/embed.out" 2>&1; then
         echo "FAIL real_build: embed.sh: $(head -3 "$WORK/embed.out")"
         exit 1

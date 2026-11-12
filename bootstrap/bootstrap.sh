@@ -639,16 +639,16 @@ if [ $STOPPED -eq 0 ]; then
         extract "$head_commit" "$head_tree"
     fi
     # (0.25.3) std's embedded text, compiler/src/front/stdsrc_rust.vl, is a
-    # product of the build: made from compiler/std2 before HEAD's compile
+    # product of the build: made from compiler/std before HEAD's compile
     # (a release's tree is built with the file its tag holds). In the work
     # tree a stale one is replaced, and said: commit it (the commit hook
     # and the merge driver keep it current, tools/git-hooks/setup.sh).
     if [ -f "$head_tree/compiler/std/embed.sh" ] && ! sh "$head_tree/compiler/std/embed.sh" -c >/dev/null 2>&1; then
         sh "$head_tree/compiler/std/embed.sh" || die "compiler/std/embed.sh failed in $head_tree"
         if [ $WORKTREE -eq 1 ]; then
-            note "compiler/src/front/stdsrc_rust.vl was stale: made again from compiler/std2 (commit it)"
+            note "compiler/src/front/stdsrc_rust.vl was stale: made again from compiler/std (commit it)"
         else
-            note "HEAD's compiler/src/front/stdsrc_rust.vl is stale: built with it made again from compiler/std2"
+            note "HEAD's compiler/src/front/stdsrc_rust.vl is stale: built with it made again from compiler/std"
         fi
     fi
     build_and_check head "$head_tree" "$HEAD_COMPILER" "$HEAD_ROOT" "$HEAD_CLI" "$HEAD_TESTS" \

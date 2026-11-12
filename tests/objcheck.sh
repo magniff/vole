@@ -183,7 +183,7 @@ check() { # <file> <level> <dir> [-g]
     # off macOS the modules that name them are not compiled.)
     if [ "$(cat "$WORK/directives/$(echo "$f" | tr / _)/link" 2>/dev/null)" = 1 ] &&
         case "$TARGET" in *-macos) true ;; *) false ;; esac; then
-        libs="$libs $(grep -rhoE '#\[link\([^]]*\)\]' "$ROOT/compiler/std2" "$(dirname "$f")" --include='*.vl' |
+        libs="$libs $(grep -rhoE '#\[link\([^]]*\)\]' "$ROOT/compiler/std" "$(dirname "$f")" --include='*.vl' |
             grep -oE '(framework|lib) = "[^"]*"' |
             sed 's/^framework = "\(.*\)"$/-framework \1/; s/^lib = "\(.*\)"$/-l\1/' | sort -u | tr '\n' ' ')"
     fi

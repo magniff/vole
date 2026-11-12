@@ -8,7 +8,7 @@
 # with errors is made again whole, which would hide a wrong index), and
 # its program prints what the other's prints.
 #
-# usage: tests/std2/units.sh [-c COMPILER]
+# usage: tests/std/units.sh [-c COMPILER]
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 C="$ROOT/target/volec"

@@ -7,7 +7,7 @@ one; `volec query examples KIND` prints the items to start from, and
 nearest). In the vole repository (commands from its root):
 
 - `add-std-fn`: a std function or method
-- `add-std-module`: a std module (a file of compiler/std2)
+- `add-std-module`: a std module (a file of compiler/std)
 - `add-peephole`: an instruction-combining or e-graph rule
 - `add-pass`: an optimization pass
 - `add-diagnostic`: a compiler error, or a tool diagnostic with a code
@@ -23,14 +23,14 @@ In a program of your own:
 
 To add a std function or method.
 
-std is `compiler/std2/`: the module `std` (`std.vl`) and its modules
+std is `compiler/std/`: the module `std` (`std.vl`) and its modules
 (`std::fmt` in `fmt.vl`, `std::collections::hash_map` in
 `collections/hash_map.vl`); `compiler/std/embed.sh` builds it into the
 compiler (`compiler/src/front/stdsrc_rust.vl`).
 
 1. Find where it goes: `volec query similar str::trim` (or
    `Vec::swap`) prints its neighbours, with their files
-   (`compiler/std2/str.vl:334`); `volec query examples std-fn`.
+   (`compiler/std/str.vl:334`); `volec query examples std-fn`.
 2. Add it in its file, next to its kin, with an editor (std is one text
    to the compiler, `<std>`: `volec edit` does not write its files),
    then `volec fmt FILE`. A function that allocates takes its
@@ -50,9 +50,9 @@ compiler (`compiler/src/front/stdsrc_rust.vl`).
 
 ## add-std-module
 
-To add a std module (a file of `compiler/std2`).
+To add a std module (a file of `compiler/std`).
 
-1. The file, `compiler/std2/NAME.vl` (or `NAME/mod.vl`; a child of
+1. The file, `compiler/std/NAME.vl` (or `NAME/mod.vl`; a child of
    `std::a` in `a/`), and its `mod NAME;` (or `pub mod NAME;`) line in
    the parent's file: embed.sh finds the modules by those lines.
 2. A build reads only the units of std a program reaches (the index

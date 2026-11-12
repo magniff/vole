@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Writes compiler/std2/intconv.vl: the integers' TryFrom impls,
+"""Writes compiler/std/intconv.vl: the integers' TryFrom impls,
 from_str_radix and std::num::Wrapping<T>, one of each per type, pair of types
 or operator (vole has no macros;
 Rust's std writes them with macro_rules). Run it after changing this
@@ -445,7 +445,7 @@ def main():
     if "--check" in sys.argv[1:]:
         cur = open(OUT).read() if os.path.exists(OUT) else ""
         if cur != text:
-            print("std2-intconv: compiler/std2/intconv.vl is not what tools/std2-intconv.py writes")
+            print("std2-intconv: compiler/std/intconv.vl is not what tools/std2-intconv.py writes")
             sys.exit(1)
         return
     with open(OUT, "w") as f:

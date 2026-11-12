@@ -16,7 +16,7 @@
 # the XFAIL cases with borrowck errors in std2 (rustc's implied outlives
 # bounds, 0.27.2.1), as known gaps, without failing on them.
 #
-# usage: tests/std2/check.sh [-c COMPILER] [-n] [-r RESULTS] [-v]
+# usage: tests/std/check.sh [-c COMPILER] [-n] [-r RESULTS] [-v]
 #   -c COMPILER   the volec to run (default: target/volec)
 #   -n            the region-free run only, not the cases
 #   -r RESULTS    (0.27.2.1) a suite run's case results (tests/run.sh's
@@ -39,7 +39,7 @@ while [ $# -gt 0 ]; do
         -n) CASES=0 ;;
         -r) [ $# -ge 2 ] || exit 2; RESULTS=$2; shift ;;
         -v) VERBOSE=1 ;;
-        *) echo "usage: tests/std2/check.sh [-c COMPILER] [-n] [-r RESULTS] [-v]" >&2; exit 2 ;;
+        *) echo "usage: tests/std/check.sh [-c COMPILER] [-n] [-r RESULTS] [-v]" >&2; exit 2 ;;
     esac
     shift
 done

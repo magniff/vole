@@ -761,27 +761,30 @@ try:
         # (0.25.5) An item just added to the tree's std, its system file
         # too, is no error (0.25.4's false `std::sys_c_strerror_r`), the
         # program checked from another directory.
-        if os.path.isdir(os.path.join(REPO, "compiler", "std2")):
-            print("skip real: the tree's std: a program reads compiler/std2, not the tree the hook watches, "
-                  "until it is the one std")
-        elif hook.STD_MARK in hook.binary_bytes(real) and os.path.isdir(os.path.join(REPO, "compiler", "std")):
+        if hook.STD_MARK in hook.binary_bytes(real) and os.path.isdir(os.path.join(REPO, "compiler", "std")):
             nrepo = os.path.join(tmp, "newstd")
             os.makedirs(os.path.join(nrepo, ".git"))
             shutil.copytree(os.path.join(REPO, "compiler", "std"), os.path.join(nrepo, "compiler", "std"))
+            # (0.28.0: the system's file is std::__sys, std's own; an item a
+            # program names is added to a module's file)
             with open(os.path.join(nrepo, "compiler", "std", hook.SYS_FILE), "a") as fh:
                 fh.write("pub fn zz_hook_probe() -> i64 { 7 }\n")
             with open(os.path.join(nrepo, "compiler", "std", "str.vl"), "a") as fh:
-                fh.write("pub fn zz_hook_probe2() -> i64 { 8 }\n")
+                fh.write("pub fn zz_hook_probe2() -> i64 { 8 + crate::__sys::zz_hook_probe() }\n")
             write(os.path.join(nrepo, "ex", "a", "deep", "er", "main.vl"),
-                  "fn main() {\n    let x = std::zz_hook_probe() + std::str::zz_hook_probe2();\n    println(\"{x}\");\n}\n")
+                  "fn main() {\n    let x = std::str::zz_hook_probe2();\n    println(\"{x}\");\n}\n")
             nev = {"hook_event_name": "PostToolUse", "tool_name": "Edit", "cwd": os.path.join(nrepo, "ex", "a", "deep", "er"),
                    "tool_input": {"file_path": os.path.join(nrepo, "ex", "a", "deep", "er", "main.vl")}}
             case("real: a std item added in the tree, its system file too", run(nev, real), (0, ""))
-            with open(os.path.join(nrepo, "compiler", "std", hook.SYS_FILE), "a") as fh:
+            with open(os.path.join(nrepo, "compiler", "std", "str.vl"), "a") as fh:
                 fh.write("pub fn zz_bad() -> i64 { true }\n")
+            write(os.path.join(nrepo, "ex", "a", "deep", "er", "main.vl"),
+                  "fn main() {\n    let x = std::str::zz_bad();\n    println(\"{x}\");\n}\n")
             got = ctx_of(run(nev, real)[1])
-            case("real: an error in the tree's system file, at its line",
-                 f"compiler/std/{hook.SYS_FILE}:" in got and "expected 'i64', got 'bool'" in got, True)
+            # (std is one text: the error is at `<std>:LINE`, in what the
+            # program reaches)
+            case("real: an error in the tree's std, in an item the program calls",
+                 "expected 'i64', got 'bool'" in got, True)
         write(os.path.join(prog, "main.vl"), "fn main() {\n    let x: i64 = q;\n}\n")
         ms = []
         for _ in range(5):

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Makes compiler/src/front/stdsrc_rust.vl from std's files (compiler/std2):
+# Makes compiler/src/front/stdsrc_rust.vl from std's files (compiler/std):
 # the standard library's source, built into the compiler as functions that
 # write it to a buffer (string literals cannot span lines: a call for each
 # few lines, 0.21).
@@ -20,7 +20,7 @@
 # the target's system, rt/sys_macos.vl or rt/sys_linux.vl, as
 # std2_sys_source (front/stdalloc.vl's std2_tail puts them after the text).
 # Run it after changing any of them; tests/run.sh checks they agree, and
-# the commit hook makes the file again when compiler/std2 changes.
+# the commit hook makes the file again when compiler/std changes.
 #
 # usage: compiler/std/embed.sh [--edition rust] [-c]   (-c: only check,
 # exit 1 if stale; --edition rust: accepted, and means nothing: 0.27's
@@ -56,9 +56,7 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/vole-embed.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 # std's root module: this file.
 ROOT_FILES=std
-dir=compiler/std2
-# (std's files beside this script, when there is no compiler/std2)
-[ -f "$dir/std.vl" ] || dir=compiler/std
+dir=compiler/std
 text=$work/text
 map=$work/map
 : >"$text"

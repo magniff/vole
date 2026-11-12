@@ -7,7 +7,7 @@
 # reports it on the second run too (only clean verdicts are kept, and
 # only std's).
 #
-# usage: tests/std2/cache.sh [-c COMPILER]
+# usage: tests/std/cache.sh [-c COMPILER]
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 C="$ROOT/target/volec"

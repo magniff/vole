@@ -9,15 +9,15 @@ corruption (docs/design/gpu.md, §2.9 and R1).
 
 | table | generated module |
 |---|---|
-| `foundation.objc` | `compiler/std2/objc/foundation.vl` (`std::objc::foundation`) |
-| `metal.objc` | `compiler/std2/gpu/hal/metal/bindings.vl` (`std::gpu::hal::metal::bindings`) |
+| `foundation.objc` | `compiler/std/objc/foundation.vl` (`std::objc::foundation`) |
+| `metal.objc` | `compiler/std/gpu/hal/metal/bindings.vl` (`std::gpu::hal::metal::bindings`) |
 
 ```sh
 volec tools/objcgen/main.vl -o objcgen
-./objcgen compiler/std2/objc/tables/foundation.objc > compiler/std2/objc/foundation.vl   # generate
-volec fmt compiler/std2/objc/foundation.vl                                     # the standard style
-./objcgen --check compiler/std2/objc/tables/foundation.objc                    # against the runtime
-./objcgen --c-check compiler/std2/objc/tables/foundation.objc > c.m && clang -fsyntax-only -x objective-c c.m
+./objcgen compiler/std/objc/tables/foundation.objc > compiler/std/objc/foundation.vl   # generate
+volec fmt compiler/std/objc/foundation.vl                                     # the standard style
+./objcgen --check compiler/std/objc/tables/foundation.objc                    # against the runtime
+./objcgen --c-check compiler/std/objc/tables/foundation.objc > c.m && clang -fsyntax-only -x objective-c c.m
 ```
 
 `tests/gpu/run.sh` runs all three for every table and fails when a
