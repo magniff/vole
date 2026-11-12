@@ -22,7 +22,7 @@ main.vl:38:16: error[type error] undefined variable 'cut' | help: did you mean '
 text.vl:1:5: error[type error] unknown module 'inner' | help: 'inner' is the module crate::lib::inner; a path starts in this module, beside it or at the root: write `crate::lib::inner::...` | try: use crate::lib::inner::width; | try: volec fix --suggested main.vl
 text.vl:4:12: error[type error] unknown module 'shapes' | help: 'shapes' is the module crate::lib::shapes; a path starts in this module, beside it or at the root: write `crate::lib::shapes::...` | try: use crate::lib::shapes; | try: volec fix --suggested main.vl
 text.vl:5:5: error[type error] unknown module 'shapes' | help: 'shapes' is the module crate::lib::shapes; a path starts in this module, beside it or at the root: write `crate::lib::shapes::...` | try: use crate::lib::shapes; | try: volec fix --suggested main.vl
-text.vl:9:19: error[type error] unknown type 'HashMap' | help: add `use std::collections::hash_map::HashMap;` | try: volec fix --suggested main.vl
+text.vl:9:19: error[type error] unknown type 'HashMap' | help: add `use std::collections::HashMap;` | try: volec fix --suggested main.vl
 [exit 1]
 ## The diff first; one line's fixes; one file's.
 $ fix --suggested --dry-run
@@ -54,7 +54,7 @@ $ fix --suggested --dry-run
 +++ b/text.vl
 @@ -1 +1 @@
 -use inner::width;
-+use std::collections::hash_map::HashMap;
++use std::collections::HashMap;
 @@ -3,3 +3,5 @@
 -fn describe(n: i64) -> i64 {
 -    let r: shapes::Rect = shapes::Rect { w: n, h: 2 };
@@ -76,7 +76,7 @@ $ fix --suggested --in text.vl --dry-run
 +++ b/text.vl
 @@ -1 +1 @@
 -use inner::width;
-+use std::collections::hash_map::HashMap;
++use std::collections::HashMap;
 @@ -3,3 +3,5 @@
 -fn describe(n: i64) -> i64 {
 -    let r: shapes::Rect = shapes::Rect { w: n, h: 2 };
@@ -105,7 +105,7 @@ fixed 3 missing imports, 1 pub, 10 suggested fixes	2 files	+15 -10 lines
 // main.vl:38
 38	    b.push_str(wrap(s));
 // text.vl:1
-1	use std::collections::hash_map::HashMap;
+1	use std::collections::HashMap;
 // text.vl:3-7
 3	use crate::lib::inner::width;
 4	
