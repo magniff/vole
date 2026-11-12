@@ -130,7 +130,9 @@ base::STRESS_GROW	read by asm_thread_start before the thread starts (stress_grow
 # as main grew BUFS (it reads INSN_TEXT now, a view taken before the thread
 # starts).
 ASM_EXITS='back::objfile::assemble::asm_error back::objfile::debug::dwarf_file'
-ASM_READS='base::STRESS_GROW	base::stress_grow	set by asm_thread_start before the thread starts (stress_grow); main writes it only while it is unset'
+ASM_READS='base::STRESS_GROW	base::stress_grow	set by asm_thread_start before the thread starts (stress_grow); main writes it only while it is unset
+base::STRESS_GROW	base::get_stress_grow	(0.28.0) stress_grow'"'"'s read of it, the same
+base::STRESS_GROW	base::set_stress_grow	(0.28.0) stress_grow'"'"'s write of it, the same: only while it is unset'
 
 # Every static task code reads or writes: static <TAB> how the code cache
 # covers it (key: in the entry's key; read: recorded, cc_note; IR: in
