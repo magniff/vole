@@ -29,11 +29,13 @@ std::io::stdin().read_line(&mut s)   guide conversions#reading-input
 std::fs::read_to_string_in(path, gpa)   guide io
 ```
 
-Not in std yet: `BTreeMap`, `BTreeSet`, `VecDeque`, `Rc`.
-`std::collections` has `BinaryHeap` and `MinHeap`, `std::sync` `Arc`,
-`Mutex` and the channels (`guide threads`).
+Not in std yet: `VecDeque`, `Rc`, a slice's `join` and `concat` (a
+loop with `push_str`). `std::collections` has `BTreeMap` and `BTreeSet`
+(`BTreeMap<K, V, Gpa>`, `BTreeMap::new_in(gpa)`), `BinaryHeap` and
+`MinHeap`, `std::sync` `Arc`, `Mutex` and the channels (`guide
+threads`).
 
-@PAGE-END@ More, a section at a time: `volec guide std#the-api` (every item, a line each), `std#overview` (ownership, HashMap and HashSet); one item: `volec guide --find NAME`; all of it: `volec guide std --whole`.
+@PAGE-END@ More, a section at a time: `volec guide std#the-api` (every item, a line each), `std#overview` (ownership, HashMap and HashSet); one item: `volec guide --find NAME`; all of it, 34k bytes (more than a shell tool shows: send it to a file): `volec guide std --whole`.
 
 ## Overview
 
@@ -103,9 +105,9 @@ true false
 Generated from std's source in this compiler: every public item a
 program uses most, one line each, in std's source spelling (`&self`
 reads; `&mut self` changes, called as `v.push(x)` on a `let mut`; `self`
-takes the value). Each item with its
-comment: `volec guide std#every-item`; one item's source: `volec
-query show Vec::push`.
+takes the value). One item with its comment: `volec guide --find
+NAME`; its source: `volec query show Vec::push`; all of them with
+their comments, 140k bytes (to a file): `volec guide std#every-item`.
 
 ```text
 @STD-API@

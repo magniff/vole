@@ -28,7 +28,8 @@ p.name)`. The grammar and the output are Rust's std::fmt.
   in place: no allocation, at every `-O` level.
 - `format_args("..", args)` is the formatted text as a value, for a
   function of your own taking `T: Display`.
-- MVS's f-strings, `f"{p.x + 1}"`, are `syntax.fstring`.
+- An f-string, `f"{p.x + 1}"`, is not vole (`syntax.fstring`): write
+  the format string without the `f`, the expression as an argument.
 
 ### The spec
 

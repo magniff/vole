@@ -170,6 +170,9 @@ written. Where it differs in shape:
   gpa)`, then Rust's chain, `.arg(a).output()`.
 
 What Rust's std has and vole's does not yet: `std::rc` (`Rc`, `Weak`),
+`VecDeque`, a slice's `join` and `concat`, `From<&str>` for a String
+(`"x".into()` is `String::from_in("x", gpa)`), `Stdin::lock` (`guide
+conversions#reading-input`),
 `dyn`-based APIs (`Box<dyn Error>`, `Box<dyn Fn>`), `std::num::Wrapping`,
 `u8::is_ascii_whitespace`, a precision taken from an argument (`{:.*}`,
 `{:.p$}`), `Vec::try_push`, async and `std::future`. Vole's std adds

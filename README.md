@@ -85,7 +85,7 @@ grammar is [docs/grammar.md](docs/grammar.md).
 
 | | |
 |---|---|
-| `volec guide` | the language in about 2k tokens; `--find WORDS`, `guide TOPIC` |
+| `volec guide` | the language in about 2.5k tokens; `--find WORDS`, `guide TOPIC` |
 | `volec check`, `explain CODE` | every error on one line, with a stable code and `try:` lines |
 | `volec query context NAME` | an item's source, its callees and callers; also `refs`, `effects` |
 | `volec edit patch`, `refactor rename` | checked edits (one that adds an error writes nothing), `undo` |

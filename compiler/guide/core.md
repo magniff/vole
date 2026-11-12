@@ -168,7 +168,7 @@ with its comment: `volec guide --find split_once`.
 |---|---|
 | `'println!' is a macro call: vole has no macros` | `println("{a}")`, the help's form |
 | `'Vec::new' allocates from nothing` (`alloc.no_in`) | `Vec::new_in(gpa)`: main's `gpa`, passed down; `volec fix --only alloc` |
-| `'Vec' names no allocator` (`alloc.default`) | `Vec<i64, Gpa>`, or a generic `A: Allocator` |
+| `'Vec' names no allocator` (`alloc.default`) | `Vec<i64, Gpa>`, `HashMap<K, V, Gpa>`; a struct holding one: `struct P<A: Allocator> { v: Vec<i64, A> }`, used as `P<Gpa>` (`volec fix --only alloc` writes both) |
 | `expected 'String<Gpa>', got '&str'` | `String::from_in("..", gpa)`: a String owns its text; a parameter `s: &str` takes literals and a String's `&s` |
 | `cannot assign to immutable variable 'a'` | `let mut a` |
 | `borrowck.borrow_immutable: cannot borrow 'w' as mutable, as it is not declared as mutable` | `let mut w`: `w.push(1)` and `&mut w` change it |

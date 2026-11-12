@@ -6,13 +6,13 @@ in [docs/releases.md](docs/releases.md) and
 [docs/roadmap.md](docs/roadmap.md); the language in
 [docs/grammar.md](docs/grammar.md).
 
-**There is one edition, Rust's surface** (0.28.0; `target/volec guide
-rust`: where vole differs from Rust): `&T`, `&mut T`, `let mut`,
-`&'static [u8]`, Rust's meanings. No file says its edition: a
-`// EDITION: rust` line is a comment (the bootstrap's 0.27.8 still reads
-it in compiler/src/main.vl, the one file that keeps it); `--edition rust` is
-accepted and ignored (deprecated: it goes in 0.29), `--edition mvs`
-refused. A static of
+**There is one language, with Rust's surface** (0.28.0; `target/volec
+guide rust`: where vole differs from Rust): `&T`, `&mut T`, `let mut`,
+`&'static [u8]`, Rust's meanings. An `// EDITION: rust` line is a
+comment: write it in no new file (the bootstrap's 0.27.8 still reads it
+in compiler/src/main.vl, the one file that keeps it); `--edition rust`
+is accepted and ignored (deprecated: it goes in 0.29); an error code
+`edition.*` is an ordinary error (renamed in 0.29). A static of
 compiler/src is read and written only through its accessors at its
 file's end (`get_x()`, `set_x(v)`); their `unsafe` blocks' UNSAFE:/
 SAFETY: lines (from the review in tools/statics/statics.tsv, with
@@ -20,12 +20,14 @@ its evidence) say which functions and threads write
 and read it: a change to who writes or reads a static keeps them true.
 
 **New to vole? Run `target/volec guide` first**: the language in
-about 2k tokens, for a reader who knows Rust (where it looks like Rust
+about 2.5k tokens (10k bytes), for a reader who knows Rust (where it looks like Rust
 and means something else, std's most used items, the first errors and
 their fixes). Before using a construct you are unsure of, fetch the
 lines on it: `target/volec guide --find WORDS` or `guide
-TOPIC#SECTION` (`guide --list`: the topics; `guide --full`: the long
-form). The text is `compiler/guide/*.md`; every example in it is
+TOPIC#SECTION` (`guide --list`: the topics with their sizes; a shell
+tool that shows 30k bytes cuts `guide --full`, `guide std --whole` and
+`guide std#every-item`: send those to a file, or ask for a section or
+`--find NAME`). The text is `compiler/guide/*.md`; every example in it is
 compiled and run by `tests/run.sh guide`.
 
 ## Read source through the compiler
@@ -100,6 +102,18 @@ blocks the stop once if errors are left. When a tool falls short, record
 it in one line: `tools/agent-feedback "query refs" "misses uses inside
 never-instantiated generic fns"`; `tools/agent-feedback --find WORDS`
 says whether someone has seen it already (`--list`: the last ones).
+
+**Without those hooks** (opencode and other agent harnesses: only git's
+hooks run there) nothing blocks a shell read, checks an edit or stops
+you with errors left, so do it by hand: read the compiler's source with
+`target/tools/volec query context|show|grep` (a `grep` or `cat` of
+compiler/src floods the context); after every edit of a `.vl` file run
+`target/volec check` (the compiler from the tree's root; `target/volec
+check FILE.vl` a program of your own) until it prints `ok: 0 errors`;
+look at what `target/volec fix --suggested --dry-run` would write
+before running it; `target/volec fmt FILE` each `.vl` you wrote; and
+`tools/premerge.sh` before a commit. The commit hook below still
+applies (`tools/git-hooks/setup.sh` once per clone).
 
 ## The inner loop
 
@@ -177,8 +191,9 @@ load or inherited.
 - **Report what was asked, checkably:** a task's "Done means" list is
   answered item by item with the command or count that shows it (e.g.
   "argv uses in compiler/src: 0, `volec query refs arg_at --count`").
-- **Mind the machine:** at most five agents build and test the compiler
-  at once, and one gate runs at a time: `gate.sh` takes a lock for all
+- **Mind the machine:** at most three agents build and test the compiler
+  at once (`-j 2` each: `tests/run.sh -j 2`, `tests/affected.sh -j 2`),
+  and one gate runs at a time: `gate.sh` takes a lock for all
   worktrees and a second gate waits, saying whose gate runs (`--no-wait`
   fails instead; `bootstrap.sh --dev` and `tests/run.sh` take none).
   Under heavy load, timing results are not evidence (the runner SKIPs

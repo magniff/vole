@@ -12,7 +12,7 @@ is Rust's, with the differences named here.
 - Keywords are Rust's (`let mut`, `move`, `ref`, `match`, `impl`,
   `where`, ...) plus `import` (a C header) and `union`. Reserved
   (errors): `dyn`, `defer` (a guard with `Drop` does it), `@`. `var`,
-  `inout` and `sink`, MVS's words, are plain names here.
+  `inout` and `sink` are plain names (not keywords).
 - Integers: `42`, `1_000`, `0xff`, `0b1010`, with a type suffix `255u8`,
   `7i32`. Floats: `1.5`, `2e10`, `1.5f32`. `'a'`, `'\n'`, `'\u{e9}'` are
   `char`s; `b'A'` is a `u8`. Strings: `"a\tb\n\"q\"\\"`, `"\x41"`,
@@ -21,8 +21,8 @@ is Rust's, with the differences named here.
   string continues it, leaving out the line break and the next line's
   indentation. Not there yet: a line break inside `"..."`, raw strings
   `r"..."` and `r#"..."#` (a raw text block, below, is one).
-- `f"x = {x:>4}"`, MVS's f-string, is `syntax.fstring`: a format
-  string, `println("x = {x:>4}")`, writes it (`guide formatting`).
+- An f-string, `f"x = {x:>4}"`, is not vole (`syntax.fstring`): a
+  format string, `println("x = {x:>4}")`, writes it (`guide formatting`).
 - Text blocks, vole's, for text of several lines (WGSL, SQL, a usage
   message): `"""` ending its line opens one, a line holding only blanks
   and `"""` closes it, and the closing line's indentation is removed

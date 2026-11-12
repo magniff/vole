@@ -24,7 +24,7 @@ dependency: its JSON is read in place and written by hand.
 | `workspace/symbol` | the definitions whose names match the query: the program's (its letters in order, case ignored), then std's (holding it); 256 at most, with their module as `containerName` |
 | `textDocument/completion` (0.25.1) | on the editor's text as it is, parsing or not: after `.` the receiver's fields and methods, after `::` a module's items, an enum's variants, a type's functions, else the names in scope, the prelude and keywords (below); each with its kind and signature; a call's parameters as snippet placeholders when the client takes snippets. Triggered by `.` and `:` |
 | `completionItem/resolve` (0.25.1) | the item with the hover of its definition as its documentation: the signature, effects with why, features, the comment above it |
-| `textDocument/signatureHelp` (0.25.1) | in a call's arguments: the function's signature, its parameters as written (with their conventions, `x: sink T`, `v: inout Vec<i64>`; a method's `self` is no argument of `x.m(..)`), the one being typed, the comment above it. Triggered by `(` and `,` |
+| `textDocument/signatureHelp` (0.25.1) | in a call's arguments: the function's signature, its parameters as written (`x: &T`, `v: &mut Vec<i64, Gpa>`, `x: T` by value; a method's `self` is no argument of `x.m(..)`), the one being typed, the comment above it. Triggered by `(` and `,` |
 | `textDocument/formatting`, `rangeFormatting` (0.25.1) | the document's text (an open one's unsaved text) laid out by `volec fmt`'s engine, one edit from the first line that changes to the last; a range formats the lines it touches. No edits when the text does not parse (below) |
 | `shutdown`, `exit` | the exit status is 0 after a shutdown, else 1 |
 
@@ -64,16 +64,16 @@ features: none
 ## Every name (0.25)
 
 A name is the definition it is written as: what the checker makes at a
-name for itself (a local's drop at its `let`, an f-string's `display`
+name for itself (a local's drop at its `let`, a format string's `display`
 at a hole, a contract's check at a name in it, a derive's functions at
-a field) is not a reference of the program, so a local in an f-string
+a field) is not a reference of the program, so a local in a format string
 or a contract is that local, and a field's name its field. Names in
-f-strings, `requires`/`ensures` clauses and attributes (`#[derive(Eq)]`'s
+format strings, `requires`/`ensures` clauses and attributes (`#[derive(Eq)]`'s
 traits) resolve as anywhere else. The test that every kind does:
 `tests/lsp/resolve.lsp` on `tests/lsp/prog-resolve/main.vl`, a program
 using std's prelude, std::cli, std::thread, std::gpu, Gpa, arenas,
 FixedBuf, an Allocator bound, trait methods, generics, an operator,
-f-strings, contracts, attributes and the conventions.
+format strings, contracts, attributes and references.
 
 ### std's files
 
@@ -142,7 +142,7 @@ gets its type from the text (`let v: T`, `let v = Vec::new_in(gpa)`,
   the module's items, the names it imports, the prelude, the keywords
   and snippets of the common forms (`fn`, `if`, `for`, `match`,
   `struct`, `#[test]`...);
-- nothing in a comment or a string's text (an f-string's hole is code),
+- nothing in a comment or a string's text (a format string's hole is code),
   or where a new name is written (`let |`, `fn |`).
 
 Items whose names start with what is typed come first, then those

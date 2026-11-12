@@ -3,7 +3,7 @@
 ## Files, paths, the environment, processes
 
 Rust's std, with the allocator written where a call allocates. A path is
-a `&str` (std2 has no Path or PathBuf). `File::open(p)?`,
+a `&str` (std has no Path or PathBuf). `File::open(p)?`,
 `File::create(p)?`, `OpenOptions::new().append(true).create(true).open(p)?`;
 `fs::read_to_string_in(p, gpa)?` (a `String<Gpa>`), `fs::read_in(p, gpa)?`
 (a `Vec<u8, Gpa>`), `fs::write(p, data)?`, `fs::metadata(p)?` (`len()`,

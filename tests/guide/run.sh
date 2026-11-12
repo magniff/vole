@@ -433,7 +433,10 @@ fi
 # DerefMut, Index and IndexMut; 0.28.0: 37000,
 # the one std, Rust's shape: the index leaves out whole modules
 # (stdapi.vl: index_hides), the types that borrow, the Debug builders and
-# the trait impls, and is still over the 30000 characters: to be cut);
+# the trait impls; std#the-api, the section the core guide names, is
+# under the 30000 characters again, without the traits Rust has the same
+# (std::ops, convert, clone, default), and the whole topic, 35000 at
+# most, says its size where it is named);
 # std#every-item is not in it. (0.18.1) `guide std` alone is its first
 # page: the most used names and where the rest is (std#the-api), 4500
 # bytes at most (the 0.18 eval's agents read all 18k of it before
@@ -441,7 +444,8 @@ fi
 "$COMPILER" guide std >"$WORK/std-page.md" 2>&1
 size=$(wc -c <"$WORK/topic-std.md" | tr -d ' ')
 page=$(wc -c <"$WORK/std-page.md" | tr -d ' ')
-if [ "$size" -le 37000 ] && [ "$page" -le 4500 ] \
+api=$("$COMPILER" guide 'std#the-api' 2>/dev/null | wc -c | tr -d ' ')
+if [ "$size" -le 35000 ] && [ "$api" -le 30000 ] && [ "$page" -le 4500 ] \
     && head -1 "$WORK/std-page.md" | grep -q '^# std$' \
     && grep -q '^## The most used$' "$WORK/std-page.md" \
     && grep -qF 'Vec::new_in(gpa) -> Vec<T, Gpa>' "$WORK/std-page.md" \
@@ -456,7 +460,7 @@ if [ "$size" -le 37000 ] && [ "$page" -le 4500 ] \
     && grep -q '^## Every item with its comment$' "$WORK/std/every.md"; then
     result pass guide-std-index
 else
-    result FAIL guide-std-index "volec guide std --whole is $size bytes (37000 at most), its first page $page (4500 at most), or not the index (most used first, then std#the-api)"
+    result FAIL guide-std-index "volec guide std --whole is $size bytes (35000 at most), std#the-api $api (30000 at most), its first page $page (4500 at most), or not the index (most used first, then std#the-api)"
 fi
 
 # (0.25.2) The GPU words agents searched for find guide gpu first: its

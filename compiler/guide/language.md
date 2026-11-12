@@ -384,9 +384,9 @@ passing one by value moves it (`.clone()` copies). Pass `&v` to a `v:
 Vec<T, A>` one to let a function push. A slice from `as_slice` borrows
 the vector: the vector does not grow or drop while the slice is used
 (`guide memory#slices`). std's API, made from its source in this
-compiler, a line per item: `volec guide std#the-api`; each item with its
-comment: `volec guide std#every-item`; one name: `volec guide --find
-NAME`.
+compiler, a line per item: `volec guide std#the-api`; one name with
+its comment: `volec guide --find NAME` (all of them, 140k bytes, to a
+file: `volec guide std#every-item`).
 @STD-API-FULL@
 
 A priority queue is a `BinaryHeap` (the largest first; the smallest
