@@ -20,7 +20,7 @@ changing its `&mut` arguments. The compiler knows six of them:
 |---|---|---|
 | `alloc(Gpa)` | allocates memory, from a `Gpa` | `Vec::push`, `String::from_in`, anything `_in` |
 | `io` | reads or writes outside the program | printing, files, stdin |
-| `static` | touches a `static mut` or a C static (not shown in a set: `--why static`) | a `static mut`, C's `errno` |
+| `static` | touches a `static mut` or a C static | a `static mut`, C's `errno` |
 | `panic` | may stop the program | a checked index, `unwrap`, `assert` |
 | `diverge` | may never return | `loop`, a `while` with no count, recursion |
 | `unsafe` | does unsafe operations itself | chapter 15 |
@@ -108,7 +108,7 @@ $ volec query effects crate stats.vl
 crate::mean	none
 crate::bucket	none
 crate::histogram	panic
-crate::main	alloc(Gpa) io panic diverge
+crate::main	alloc(Gpa) io static panic diverge
 ```
 
 Each line is a function and its effects. Let's read them.
@@ -119,7 +119,8 @@ Each line is a function and its effects. Let's read them.
   the program if `i` is out of range. (`bucket` keeps `i` in range, but
   the compiler doesn't follow the arithmetic that far.)
 - `main` does everything: it allocates (the `Vec`, the `String`), does
-  I/O (stdin and printing), may panic (the `unwrap`s), and may not
+  I/O (stdin and printing), touches a C static (`static`: a write that
+  fails reads C's `errno`), may panic (the `unwrap`s), and may not
   return.
 
 That last one is surprising: `main` has no loop that could run forever.
@@ -127,7 +128,7 @@ When an effect surprises you, ask *why*:
 
 ```console
 $ volec query effects main --why diverge stats.vl
-crate::main	alloc(Gpa) io panic diverge
+crate::main	alloc(Gpa) io static panic diverge
   'io::read_to_string_in(io::stdin(), gpa)' at stats.vl:25:16 calls 'std::io::read_to_string_in'
   'r.read_to_string(&mut s)' at <std>:23969:5 calls 'Stdin::read_to_string'
   'self.read_to_end(v)' at <std>:23475:17 calls 'Stdin::read_to_end'
@@ -144,7 +145,7 @@ the input ends, so reading all of stdin may not return.
 
 ```console
 $ volec query effects main --why io stats.vl | head -2
-crate::main	alloc(Gpa) io panic diverge
+crate::main	alloc(Gpa) io static panic diverge
   'io::read_to_string_in(io::stdin(), gpa)' at stats.vl:25:16 calls 'std::io::read_to_string_in'
 ```
 
@@ -153,7 +154,7 @@ module that have an effect:
 
 ```console
 $ volec query effects crate --has 'alloc(Gpa)' stats.vl
-crate::main	alloc(Gpa) io panic diverge
+crate::main	alloc(Gpa) io static panic diverge
 ```
 
 If you use the editor extension from chapter 1, hovering over a

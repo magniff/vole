@@ -374,8 +374,8 @@ main's `gpa` is where they come from. `std::alloc::arena_scope(&gpa, |a|
 ...)` hands out an arena whose memory is all freed when the closure
 returns. `--check-alloc` builds the program with a checking allocator: a
 use after free, a double free, a leak are reported where they happen.
-Every function's effects are inferred (`alloc(Gpa) io panic diverge
-unsafe`): `volec query effects f --why io` shows where; `#[no_alloc]` on
+Every function's effects are inferred (`alloc(Gpa) io static panic
+diverge unsafe`): `volec query effects f --why io` shows where; `#[no_alloc]` on
 a function is checked (`guide effects`, `guide allocators`).
 
 `Vec`, `String` and `HashMap` own their contents: `let w = v;` or
@@ -528,7 +528,7 @@ volec query def NAME                 # where it is defined, its signature
 volec query refs NAME                # every resolved use (--count, --in FILE)
 volec query items [MODULE]           # a module's items with signatures (std: its API)
 volec query context NAME             # source, what it calls, its types and callers, at once
-volec query effects NAME             # what it may do: alloc(Gpa) io panic diverge unsafe
+volec query effects NAME             # what it may do: alloc(Gpa) io static panic diverge unsafe
 volec try '7 / 2'                    # run a snippet with std: its output, TYPE = VALUE
 volec edit patch NAME --old 'a < b' --new 'a <= b'   # change text inside one item
 volec edit replace NAME < new.vl   # replace an item; edit insert --after NAME; edit delete NAME
