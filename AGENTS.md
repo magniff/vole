@@ -8,9 +8,11 @@ in [docs/releases.md](docs/releases.md) and
 
 **There is one edition, Rust's surface** (0.28.0; `target/volec guide
 rust`: where vole differs from Rust): `&T`, `&mut T`, `let mut`,
-`&'static [u8]`, Rust's meanings. `--edition mvs` is refused; a root's
-`// EDITION: rust` line says nothing (the bootstrap's 0.27.8 still reads
-it in compiler/src/main.vl). A static of
+`&'static [u8]`, Rust's meanings. No file says its edition: a
+`// EDITION: rust` line is a comment (the bootstrap's 0.27.8 still reads
+it in compiler/src/main.vl, the one file that keeps it); `--edition rust` is
+accepted and ignored (deprecated: it goes in 0.29), `--edition mvs`
+refused. A static of
 compiler/src is read and written only through its accessors at its
 file's end (`get_x()`, `set_x(v)`); their `unsafe` blocks' UNSAFE:/
 SAFETY: lines (from the review in tools/statics/statics.tsv, with
@@ -151,7 +153,7 @@ load or inherited.
   `unsafe` without its `UNSAFE:`/`SAFETY:` comments, stages an
   unformatted `.vl`, or adds an example case whose SOURCE does not
   exist; a commit that changes `compiler/std` gets the
-  `compiler/src/front/stdsrc.vl` made from it, staged by the hook, and a
+  `compiler/src/front/stdsrc_rust.vl` made from it, staged by the hook, and a
   merge makes it from the merged std (no conflict on it). It runs for
   every committer, under any agent harness (Claude Code's hooks do not
   run under opencode or other tools; git's do).

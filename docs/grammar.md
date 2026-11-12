@@ -16,6 +16,10 @@ alternatives, `"..."` is a literal token.
 whitespace   = " " | "\t" | "\r" | "\n" ;
 comment      = "//" { any - "\n" }
              | "/*" { any | comment } "*/" ;          (* block comments nest *)
+                                                       (* (0.28.0) `// EDITION: rust`, the line 0.27 read as a
+                                                          program's edition, is an ordinary comment: there is one
+                                                          edition. `--edition rust` is accepted and ignored
+                                                          (deprecated; it goes in 0.29), `--edition mvs` refused. *)
 ident        = ( "_" | ascii_letter ) { "_" | ascii_letter | digit } ;
                                                        (* "_" alone is the wildcard pattern *)
 raw_ident    = "r#" ident ;                            (* (0.4) an identifier even if a keyword: r#type *)
@@ -82,8 +86,8 @@ directly by other letters (`3e` and `1foo` are errors).
 if impl import in let loop match mod mut pub return static struct trait true
 type union unsafe use while move where` (`import` and `use` since 0.4, `pub` and
 `mod` since 0.5, `defer` since 0.6, `unsafe` and `trait` since 0.9, `move`
-since 0.14, `where` since 0.26.2). `defer` is a keyword with no statement
-since 0.26.2: `syntax.defer`, which names it.
+since 0.14, `where` since 0.26.2). `defer` had no statement from 0.26.2
+(`syntax.defer`) and is an ordinary name from 0.28.0.
 
 **Reserved** (an error if used): the keyword `dyn` (and `move` until
 0.14, `where` until 0.26.2, keywords since), and the
@@ -161,14 +165,14 @@ enum's or trait's generics, or before an impl's `{`, adds the bounds to
 those written inline: `fn f<T>(x: T) where T: Display` is `fn f<T:
 Display>(x: T)`. A method's `where` may bound its impl's parameters too.
 The left side is a type parameter of the item; a bound on another type
-(`I::Item: Display`, `Vec<T>: Debug`) is `where.unsupported` until the
-rust edition (bound a parameter instead: `I: Iterator<Item = X>, X:
-Display`). A parameter's type `impl B + C` (also `impl Fn(i64) -> i64`,
+(`I::Item: Display`, `Vec<T>: Debug`) was `where.unsupported` before
+0.28.0 and is checked as Rust's now. A parameter's type `impl B + C` (also `impl Fn(i64) -> i64`,
 after a mode: `f: inout impl FnMut(i64)`) is a hidden type parameter
 with those bounds, after the written ones: messages name it by its text,
 `impl Display`, and a turbofish gives only the written ones
-(`pick::<i64>(t, u)`). `impl Trait` anywhere else (a result, a field, a
-`let`) is `type.impl-position`.
+(`pick::<i64>(t, u)`). `impl Trait` at the top of a result is Rust's (0.27.2.1); inside a
+result's type, a trait method's result or a `let` it is `edition.later`
+(0.29); before 0.28.0 every other position was `type.impl-position`.
 
 Items may refer to each other in any order. Constants and statics are
 initialized by constant expressions: literals, other constants, unary and
@@ -276,7 +280,8 @@ bound so may be read, not changed or moved). There is no `&pat` pattern.
 block       = "{" { stmt } [ expr ] "}" ;
 stmt        = ";"                                      (* empty statement *)
             | "let" pattern [ ":" type ] "=" expr ";"
-            | "defer" ( block [ ";" ] | expr ";" )    (* (0.6; 0.26.2: error syntax.defer) *)
+                                                       (* (0.6 to 0.26.1: "defer" ( block | expr ";" ); gone,
+                                                          0.28.0: `defer` is a name) *)
             | block_like [ ";" ]
             | expr ";" ;
 block_like  = block | "unsafe" block | if_expr | match_expr | loop_expr | while_expr | for_expr ;
@@ -878,8 +883,8 @@ change the value already taken from it. A deferred statement sees the
 bindings made before it; it may not `return`, nor `break`/`continue` out
 of itself (loops inside it are fine). Deferred statements do not run when
 the program ends by a failed check (exit 101), `exit`, or a `longjmp` past
-them. (0.26.2: removed, as Rust has none. `defer` is `error
-syntax.defer`; a guard, a value whose `Drop` does what the deferred
+them. (0.26.2: removed, as Rust has none: `defer` was `error
+syntax.defer` until 0.28.0, where it is an ordinary name; a guard, a value whose `Drop` does what the deferred
 statement did, is made where it stood and dropped on the same ways out,
 last first, the value leaving the block computed before.)
 
@@ -1715,7 +1720,7 @@ allocate from is in its signature. The rules, each an error with its
 - `alloc.field`: a struct or enum that holds an allocator names it in
   its parameters, `struct P<A: Allocator> { v: Vec<u8, A> }`, used as
   `P<Gpa>`; a literal infers it from its fields.
-  (0.27.2) In the rust edition a raw pointer is not looked through: a
+  (0.27.2) A raw pointer is not looked through: a
   field `*mut Node<Gpa>` holds no allocator, as a raw pointer carries no
   ownership (front-rust.md F33.1).
 - `alloc.static`: a static's type holds no allocator (it is `AllocFree`,

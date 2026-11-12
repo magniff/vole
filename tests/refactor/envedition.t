@@ -17,19 +17,19 @@ main.vl:17:13: error[unsafe] calling a C function is unsafe | help: put it in an
 ## The old edition is refused, by the flag and by the variable, whatever
 ## the command; nothing is read or written.
 % volec --edition mvs check main.vl
-error: the MVS edition is gone (0.28.0): there is one edition, Rust's surface (volec guide rust)
+error: the MVS edition is gone (0.28.0): there is one edition, Rust's surface (volec guide rust); 0.27.8's `volec fix --edition rust` translates a program
 [exit 1]
 % VOLE_EDITION=mvs volec check main.vl
-error: the MVS edition is gone (0.28.0): there is one edition, Rust's surface (volec guide rust)
+error: the MVS edition is gone (0.28.0): there is one edition, Rust's surface (volec guide rust); 0.27.8's `volec fix --edition rust` translates a program
 [exit 1]
 % VOLE_EDITION=mvs volec fix --suggested main.vl
-error: the MVS edition is gone (0.28.0): there is one edition, Rust's surface (volec guide rust)
+error: the MVS edition is gone (0.28.0): there is one edition, Rust's surface (volec guide rust); 0.27.8's `volec fix --edition rust` translates a program
 [exit 1]
 % volec --edition mvs main.vl -o prog
-error: the MVS edition is gone (0.28.0): there is one edition, Rust's surface (volec guide rust)
+error: the MVS edition is gone (0.28.0): there is one edition, Rust's surface (volec guide rust); 0.27.8's `volec fix --edition rust` translates a program
 [exit 1]
 ## Any other name is no edition.
 % volec --edition 2015 check main.vl
-error: unknown edition (expected --edition rust)
+error: unknown edition (--edition rust is the only one, deprecated and ignored: leave the option out)
 [exit 1]
 % git status --short

@@ -86,8 +86,10 @@ KEEP = [
     "compiler/src/",
     "tests/cost/",
     "tests/compile_cost.sh",
+    "tests/run/edition_line_comment.vl",
     "tools/strip-edition.py",
     "tools/test-strip-edition.py",
+    "tools/mvs-census.py",
 ]
 # The records of earlier releases and the notes of their work.
 HISTORY = [
