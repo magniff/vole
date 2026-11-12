@@ -101,11 +101,11 @@ true false
 ## The API
 
 Generated from std's source in this compiler: every public item a
-program uses, one line each, in std's source spelling (`self` reads;
-`inout self` changes, called as `v.push(x)` on a `var`; `sink self`
+program uses most, one line each, in std's source spelling (`&self`
+reads; `&mut self` changes, called as `v.push(x)` on a `let mut`; `self`
 takes the value). Each item with its
 comment: `volec guide std#every-item`; one item's source: `volec
-query show std::Scanner::next_line`.
+query show Vec::push`.
 
 ```text
 @STD-API@

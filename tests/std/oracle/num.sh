@@ -1,9 +1,7 @@
 #!/bin/sh
-# The number conversions' checks against Rust (0.20, A6): tools/numtables/gen.vl
-# makes the old std's tables checked in (compiler/std/num/tables.vl: that
-# row goes with the old std; std2's flt.vl has no table); num_check.vl
-# (vole's std: std2's `{}`, `{:?}`, `{:e}` and `parse` since 0.28) and
-# num_oracle.rs (Rust's std) print the same hashes, chunk by chunk, of
+# The number conversions' checks against Rust (0.20, A6): num_check.vl
+# (vole's std: its `{}`, `{:?}`, `{:e}` and `parse`) and num_oracle.rs
+# (Rust's std) print the same hashes, chunk by chunk, of
 #   - {} {:?} {:e} of N f64 (raw bits, near 1, integers, short decimals),
 #     each read back and checked to be the shortest;
 #   - parse::<f64> and parse::<f32> of N generated texts (also against
@@ -29,16 +27,10 @@ done
 W=$(mktemp -d "${TMPDIR:-/tmp}/vole-num.XXXXXX")
 trap 'rm -rf "$W"' EXIT
 fail=0
-"$TC" "$ROOT/tools/numtables/gen.vl" -O2 -o "$W/gen" >/dev/null
-"$W/gen" >"$W/tables.vl"
-if cmp -s "$W/tables.vl" "$ROOT/compiler/std/num/tables.vl"; then
-    echo "ok tables: compiler/std/num/tables.vl is gen.vl's"
-else
-    echo "FAIL tables: compiler/std/num/tables.vl differs from gen.vl's output"; fail=1
-fi
+
 "$TC" "$ROOT/tests/std/oracle/num_check.vl" -O2 -o "$W/check" >/dev/null
 if ! command -v rustc >/dev/null 2>&1; then
-    echo "note: no rustc: only the tables are checked"; exit $fail
+    echo "note: no rustc: num_check.vl builds, nothing compared"; exit $fail
 fi
 rustc -O -C codegen-units=1 "$ROOT/tests/std/oracle/num_oracle.rs" -o "$W/oracle"
 for mode in "f64 11" "parse 7" "ints 3"; do

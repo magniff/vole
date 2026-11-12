@@ -49,7 +49,7 @@ T=$(mktemp -d "${TMPDIR:-/tmp}/std2check.XXXXXX")
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/p"
 printf '// EDITION: rust\nfn main() {}\n' > "$T/p/main.vl"
-(cd "$T/p" && VOLE_STD2=1 "$C" --edition rust --std2-check --max-errors=0 main.vl -c -o "$T/p/main.o") \
+(cd "$T/p" && "$C" --edition rust --std2-check --max-errors=0 main.vl -c -o "$T/p/main.o") \
     > "$T/first.out" 2> "$T/first.err"
 tally=$(grep '^std2-check: ' "$T/first.out" | tail -1)
 if [ -z "$tally" ]; then
@@ -81,7 +81,7 @@ if [ $CASES -eq 1 ]; then
     fi
     awk '{ print NR " " $0 }' "$T/list" | xargs -P 4 -n 2 sh -c '
         # ($0 the work directory, $1 the compiler, $2 the number, $3 the case)
-        out=$(cd "$0" && VOLE_STD2=1 "$1" --edition rust --std2-check --max-errors=0 "$3" -c -o "$0/cases/$2.o" 2>&1)
+        out=$(cd "$0" && "$1" --edition rust --std2-check --max-errors=0 "$3" -c -o "$0/cases/$2.o" 2>&1)
         echo "$out" | grep "^<std>:[0-9]*:[0-9]*: error\[borrowck" > "$0/cases/$2.bck"
         echo "$3" > "$0/cases/$2.name"
         rm -f "$0/cases/$2.o"' "$T" "$C"

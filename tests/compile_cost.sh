@@ -1,15 +1,14 @@
 #!/bin/sh
 # The gate's compile-cost row (0.21.1, after 0.20's std made a hello
 # world 5.5 times dearer to build unnoticed): the instructions retired by
-# five compilations, with this compiler and the previous release's,
+# four compilations, with this compiler and the previous release's,
 # each the fewest of a few runs, and their ratios:
 #
 #   hello   a hello world built (an object: no linker), at most 1.5x
 #   std     tests/cost/std_heavy.vl built (most of std read), at most 1.5x
 #   check   `volec check` of compiler/src (a copy without compiler/std,
 #           so that both read their own std; no tools' cache), at most 1.15x
-#   rust    (0.27.1) `volec check` of the borrow checker's biggest case
-#           then, tests/cost/rust_heavy.vl, at most 1.5x
+
 #   regions (0.27.8) `volec check` of tests/cost/regions_heavy.vl, many
 #           calls of functions on structs with lifetimes (a callee's
 #           signature, read at each call, reads its types' declared and
@@ -58,7 +57,7 @@ trap 'rm -rf "$W"' EXIT
 printf '// EDITION: rust\nfn main() {\n    println("hello");\n}\n' >"$W/hello.vl"
 printf 'fn main() {\n    println("hello");\n}\n' >"$W/hello_027.vl"
 cp "$ROOT/tests/cost/std_heavy.vl" "$W/std_heavy.vl"
-cp "$ROOT/tests/cost/rust_heavy.vl" "$W/rust_heavy.vl"
+
 cp "$ROOT/tests/cost/regions_heavy.vl" "$W/regions_heavy.vl"
 mkdir -p "$W/src"
 cp -R "$ROOT/compiler/src/." "$W/src/"
@@ -116,16 +115,11 @@ measure hello 1.5 hello.vl -c -o hello.o
 hello_new=$last_new
 measure std 1.5 std_heavy.vl -c -o std_heavy.o
 measure check 1.15 check src/main.vl
-# tests/cost/rust_heavy.vl is written against the old std: read with it
-# until that std goes
-VOLE_STD2=0
-export VOLE_STD2
-measure rust 1.5 check rust_heavy.vl
-unset VOLE_STD2
+
 measure regions 1.5 check regions_heavy.vl
 hello_027 "$hello_new"
 if [ $FAILED -ne 0 ]; then
-    echo "compile-cost: a compilation is dearer than the previous release allows (see above; --time-passes splits it by phase, and std's sections: tests/std/core_sections.sh)"
+    echo "compile-cost: a compilation is dearer than the previous release allows (see above; --time-passes splits it by phase)"
     exit 1
 fi
-echo "compile-cost: hello, std, check, rust and regions within the bounds"
+echo "compile-cost: hello, std, check and regions within the bounds"

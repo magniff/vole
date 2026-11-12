@@ -43,6 +43,11 @@
 set -u
 LC_ALL=C
 export LC_ALL
+# (0.28.0) std is the compiler's own text here, `<std>`, wherever the
+# runner's programs are: not the files of a vole repository around them
+# (front/stdtree.vl: find_std_tree), which the tools would name instead.
+VOLE_STD_TREE=none
+export VOLE_STD_TREE
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -182,7 +187,7 @@ transcript() {
 
 STDPOS="$ROOT/tests/stdpos.awk"
 # (0.25.5) std's files, relative to compiler/std (stdpos.awk's stdfiles)
-STD_FILES=$(cd "$ROOT/compiler/std" 2>/dev/null && find . -name '*.vl' | sed 's|^\./||' | sort | tr '\n' ' ')
+STD_FILES=$(cd "$ROOT/compiler/std2" 2>/dev/null && find . -name '*.vl' | sed 's|^\./||' | sort | tr '\n' ' ')
 for case in "$HERE"/*.lsp; do
     [ -e "$case" ] || continue
     name=$(basename "$case" .lsp)

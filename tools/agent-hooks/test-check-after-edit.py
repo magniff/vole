@@ -594,11 +594,11 @@ try:
     shutil.rmtree(os.path.join(prog, "tests"))
 
     # (0.27.2) A test case's options, as tests/run.sh gives them: its
-    # FLAGS' edition and its ENV's VOLE_STD2 (the compiler's too); none
-    # for a file without them, or check's default.
+    # FLAGS' edition (no ENV line is the compiler's); none for a file
+    # without them, or check's default.
     rc = os.path.join(tmp, "rcase.vl")
-    write(rc, "fn main() {}\n// FLAGS: --edition rust\n// ENV: VOLE_STD2=0\n// ENV: OTHER=1\n")
-    case("case options: FLAGS and ENV", hook.case_options(rc), (["--edition", "rust"], {"VOLE_STD2": "0"}))
+    write(rc, "fn main() {}\n// FLAGS: --edition rust\n// ENV: OTHER=1\n")
+    case("case options: FLAGS and ENV", hook.case_options(rc), (["--edition", "rust"], {}))
     write(rc, "fn main() {}\n// FLAGS: --deny-warnings --edition=rust\n")
     case("case options: --edition=rust", hook.case_options(rc), (["--edition", "rust"], {}))
     write(rc, "// EDITION: rust\nfn main() {}\n")

@@ -954,17 +954,9 @@ run_case() {
     fi >"$dir/status"
 }
 
-# The standard library built into the compiler must be its source's (0.5).
-if [ -x "$ROOT/compiler/std/embed.sh" ] && ! "$ROOT/compiler/std/embed.sh" -c; then
-    exit 1
-fi
-# (0.27.2) And std2's, the rust edition's (embed.sh --edition rust;
-# 0.27.5: its index of units, std2_units, made by the compiler tested)
-if [ -x "$ROOT/compiler/std/embed.sh" ] && ! VOLE_EMBED_VOLEC="$COMPILER" "$ROOT/compiler/std/embed.sh" --edition rust -c; then
-    exit 1
-fi
-# (0.21.1) std's core, the sections every program reads, stays small.
-if [ -x "$ROOT/tests/std/core_sections.sh" ] && ! "$ROOT/tests/std/core_sections.sh" >/dev/null; then
+# The standard library built into the compiler must be its source's (0.5;
+# 0.27.5: its index of units, std2_units, made by the compiler tested).
+if [ -x "$ROOT/compiler/std/embed.sh" ] && ! VOLE_EMBED_VOLEC="$COMPILER" "$ROOT/compiler/std/embed.sh" -c; then
     exit 1
 fi
 # (0.19) The intrinsic tables, compiler/arch/*.def, as tables.vl has them.

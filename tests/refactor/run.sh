@@ -39,6 +39,11 @@
 set -u
 LC_ALL=C
 export LC_ALL
+# (0.28.0) std is the compiler's own text here, `<std>`, wherever the
+# runner's programs are: not the files of a vole repository around them
+# (front/stdtree.vl: find_std_tree), which the tools would name instead.
+VOLE_STD_TREE=none
+export VOLE_STD_TREE
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -342,8 +347,8 @@ $(cat "$WORK/embedren/main.vl")"
 {
     grep -rhoE --exclude-dir=.volec 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract|conv|syntax|sync|cell|extension|use|link|cli|lex|embed|unsafe|run|gpu|wgsl|field|attr|borrowck|opaque)\.[a-z0-9_-]+"' \
         compiler/src
-    grep -rhoE '"wgsl\.[a-z]+"|error wgsl\.[a-z]+' compiler/std/gpu/wgsl | sed -e 's/^"\(.*\)"$/c"\1"/' -e 's/^error \(.*\)$/c"\1"/'
-    grep -rhoE 'gpu\.[a-z]+:' compiler/std/gpu | sed -e 's/^\(.*\):$/c"\1"/'
+    grep -rhoE '"wgsl\.[a-z]+"|error wgsl\.[a-z]+' compiler/std2/gpu/wgsl | sed -e 's/^"\(.*\)"$/c"\1"/' -e 's/^error \(.*\)$/c"\1"/'
+    grep -rhoE 'gpu\.[a-z]+:' compiler/std2/gpu | sed -e 's/^\(.*\):$/c"\1"/'
     # (0.26.5: the static ERR_KIND is the context's field `pcx.err_kind`)
     grep -rhoE --exclude-dir=.volec '(ERR_KIND|err_kind) = c"[^"]*"' compiler/src
     grep -rhoE --exclude-dir=.volec 'report_(warning|error_once)\([^,]*, [^,]*, c"[^"]*"' compiler/src

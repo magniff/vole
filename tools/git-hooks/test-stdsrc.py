@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Cases for compiler/src/front/stdsrc.vl as git keeps it (0.25.3): the
-commit hook makes it from the staged compiler/std (tools/git-hooks/
+"""Cases for compiler/src/front/stdsrc_rust.vl as git keeps it (0.25.3):
+the commit hook makes it from the staged compiler/std2 (tools/git-hooks/
 pre-commit), and the merge driver (tools/git-hooks/merge-stdsrc,
-.gitattributes) makes it from the merged compiler/std, so that two
+.gitattributes) makes it from the merged compiler/std2, so that two
 branches that both change std merge without a conflict on it. Each case
-runs in a fresh repository with a small std (tests/refactor/stdedit's)
+runs in a fresh repository with a small std (small_std below)
 and this tree's embed.sh, hook and driver, set up as
 tools/git-hooks/setup.sh does. Run by tests/run.sh (category "hooks").
 
@@ -18,7 +18,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
-SRC = "compiler/src/front/stdsrc.vl"
+SRC = "compiler/src/front/stdsrc_rust.vl"
 FAILED = 0
 
 
@@ -55,22 +55,36 @@ def write(path, text):
         fh.write(text)
 
 
+def small_std(repo):
+    """A small std in repo: this tree's embed.sh, a root with one module,
+    and the files embed.sh reads beside them (Gpa's, the systems')."""
+    write(os.path.join(repo, "compiler/std2/std.vl"),
+          "// EDITION: rust\n// A small std.\npub mod io;\n\npub fn zero() -> i64 {\n    0\n}\n")
+    write(os.path.join(repo, "compiler/std2/io.vl"),
+          "// Text.\npub fn bump(n: i64) -> i64 {\n    let mut a = n;\n    a += 1;\n    a\n}\n")
+    for f in ("gpa", "alloc_check", "sys_linux", "sys_macos"):
+        write(os.path.join(repo, "compiler/std2/rt", f + ".vl"), "pub fn " + f + "() {}\n")
+    os.makedirs(os.path.join(repo, "compiler/std"), exist_ok=True)
+    shutil.copy(os.path.join(ROOT, "compiler/std/embed.sh"), os.path.join(repo, "compiler/std/embed.sh"))
+
+
 def embedded(repo, rev):
-    """What embed.sh makes of compiler/std at rev (a commit, or ":" for
-    the index), next to what the commit (or index) holds as stdsrc.vl."""
+    """What embed.sh makes of the std at rev (a commit, or ":" for the
+    index), next to what the commit (or index) holds as stdsrc_rust.vl."""
     t = tempfile.mkdtemp(prefix="vole-stdsrc-case.")
     try:
         if rev == ":":
-            files = run(["git", "ls-files", "compiler/std"], repo).stdout.split()
+            files = run(["git", "ls-files", "compiler/std", "compiler/std2"], repo).stdout.split()
             for f in files:
                 write(os.path.join(t, f), run(["git", "show", ":" + f], repo).stdout)
             held = run(["git", "show", ":" + SRC], repo).stdout
         else:
-            arc = subprocess.run(["git", "archive", rev, "compiler/std"], cwd=repo, capture_output=True)
+            arc = subprocess.run(["git", "archive", rev, "compiler/std", "compiler/std2"], cwd=repo, capture_output=True)
             subprocess.run(["tar", "-xf", "-", "-C", t], input=arc.stdout, check=True)
             held = run(["git", "show", f"{rev}:{SRC}"], repo).stdout
         os.makedirs(os.path.join(t, "compiler/src/front"), exist_ok=True)
-        subprocess.run(["sh", os.path.join(t, "compiler/std/embed.sh")], capture_output=True)
+        # (run there: no compiler of this tree makes the index)
+        subprocess.run(["sh", "compiler/std/embed.sh"], cwd=t, capture_output=True)
         return read(os.path.join(t, SRC)), held
     finally:
         shutil.rmtree(t)
@@ -84,12 +98,7 @@ def main():
     work = tempfile.mkdtemp(prefix="vole-stdsrc.")
     repo = os.path.join(work, "repo")
     try:
-        shutil.copytree(os.path.join(ROOT, "tests/refactor/stdedit/compiler/std"), os.path.join(repo, "compiler/std"))
-        for f in ("embed.sh", "index.awk"):
-            shutil.copy(os.path.join(ROOT, "compiler/std", f), os.path.join(repo, "compiler/std", f))
-        # (the systems' tails, of one length)
-        write(os.path.join(repo, "compiler/std/sys/macos.vl"), "pub const TARGET_OS: i64 = 1;\n")
-        write(os.path.join(repo, "compiler/std/sys/linux.vl"), "pub const TARGET_OS: i64 = 2;\n")
+        small_std(repo)
         os.makedirs(os.path.join(repo, "tools/git-hooks"))
         for f in ("pre-commit", "merge-stdsrc", "setup.sh"):
             shutil.copy(os.path.join(HERE, f), os.path.join(repo, "tools/git-hooks", f))
@@ -105,19 +114,19 @@ def main():
         git(repo, "add", "-A")
         r = git(repo, "commit", "-q", "-m", "base")
         case("base commit", r.returncode == 0, r.stdout + r.stderr)
-        io = os.path.join(repo, "compiler/std/flat/io.vl")
-        std = os.path.join(repo, "compiler/std/std.vl")
+        io = os.path.join(repo, "compiler/std2/io.vl")
+        std = os.path.join(repo, "compiler/std2/std.vl")
         base_io = read(io)
         base_std = read(std)
 
         # A std change committed alone: the hook makes and stages stdsrc.vl.
         git(repo, "checkout", "-q", "-b", "a")
         write(io, base_io + "\n// a's line\npub fn from_a() -> i64 {\n    1\n}\n")
-        git(repo, "add", "compiler/std/flat/io.vl")
+        git(repo, "add", "compiler/std2/io.vl")
         r = git(repo, "commit", "-q", "-m", "a")
         made, held = embedded(repo, "HEAD")
         case("pre-commit: stdsrc.vl made and staged with a std change",
-             r.returncode == 0 and "made from the staged compiler/std" in r.stdout + r.stderr
+             r.returncode == 0 and "made from the staged compiler/std2" in r.stdout + r.stderr
              and made == held and "from_a" in held, r.stdout + r.stderr)
         case("pre-commit: the work tree's stdsrc.vl is the committed one",
              git(repo, "status", "--porcelain").stdout == "", git(repo, "status", "--porcelain").stdout)
@@ -136,7 +145,7 @@ def main():
         case("merge: stdsrc.vl is what embed.sh makes of the merged std",
              made == held and "from_a" in held and "from_b" in held,
              "from_a %s, from_b %s, same %s" % ("from_a" in held, "from_b" in held, made == held))
-        case("merge: the driver said so", "made from the merged compiler/std" in r.stdout + r.stderr, r.stdout + r.stderr)
+        case("merge: the driver said so", "made from the merged compiler/std2" in r.stdout + r.stderr, r.stdout + r.stderr)
 
         # Both change the same std line: std conflicts, stdsrc.vl says what
         # to run; resolved, the commit makes stdsrc.vl.
@@ -149,10 +158,10 @@ def main():
         r = git(repo, "merge", "-q", "--no-edit", "c")
         out = r.stdout + r.stderr
         case("merge: std itself conflicts, stdsrc.vl's driver says what to run",
-             r.returncode != 0 and "merge-stdsrc: compiler/src/front/stdsrc.vl not merged (compiler/std conflicts" in out
+             r.returncode != 0 and "merge-stdsrc: compiler/src/front/stdsrc_rust.vl not merged (compiler/std2 conflicts" in out
              and "compiler/std/embed.sh" in out, out)
         write(io, base_io.replace("a += 1;", "a += 3;"))
-        git(repo, "add", "compiler/std/flat/io.vl", SRC)
+        git(repo, "add", "compiler/std2/io.vl", SRC)
         r = git(repo, "commit", "-q", "--no-edit")
         made, held = embedded(repo, "HEAD")
         case("merge resolved: the commit makes stdsrc.vl of the resolved std",
@@ -160,7 +169,7 @@ def main():
 
         # A commit of named paths has a temporary index: refused, with what to run.
         write(io, base_io + "\n// e\n")
-        r = git(repo, "commit", "-q", "-m", "e", "compiler/std/flat/io.vl")
+        r = git(repo, "commit", "-q", "-m", "e", "compiler/std2/io.vl")
         case("pre-commit: `git commit FILE` with a stale stdsrc.vl is refused",
              r.returncode != 0 and "is not what compiler/std/embed.sh makes" in r.stdout + r.stderr, r.stdout + r.stderr)
         git(repo, "checkout", "-q", "--", ".")
@@ -181,7 +190,7 @@ def main():
         git(repo, "config", "--remove-section", "merge.stdsrc")
         r = git(repo, "merge", "-q", "--no-edit", "a")
         case("no driver set up: stdsrc.vl conflicts as text (setup.sh is needed)",
-             r.returncode != 0 and "stdsrc.vl" in r.stdout + r.stderr, r.stdout + r.stderr)
+             r.returncode != 0 and "stdsrc_rust.vl" in r.stdout + r.stderr, r.stdout + r.stderr)
     finally:
         shutil.rmtree(work)
 
@@ -201,13 +210,8 @@ def std2_case():
     work = tempfile.mkdtemp(prefix="vole-stdsrc2.")
     repo = os.path.join(work, "repo")
     try:
-        # (MVS's std as main()'s: the base commit stages embed.sh, so the
-        # hook makes stdsrc.vl too)
-        shutil.copytree(os.path.join(ROOT, "tests/refactor/stdedit/compiler/std"), os.path.join(repo, "compiler/std"))
-        for f in ("embed.sh", "index.awk"):
-            shutil.copy(os.path.join(ROOT, "compiler/std", f), os.path.join(repo, "compiler/std", f))
-        write(os.path.join(repo, "compiler/std/sys/macos.vl"), "pub const TARGET_OS: i64 = 1;\n")
-        write(os.path.join(repo, "compiler/std/sys/linux.vl"), "pub const TARGET_OS: i64 = 2;\n")
+        small_std(repo)
+        os.remove(os.path.join(repo, "compiler/std2/io.vl"))
         std2 = os.path.join(repo, "compiler/std2/std.vl")
         write(std2, "// EDITION: rust\npub fn one() -> i64 {\n    1\n}\n")
         for f in ("gpa", "alloc_check", "sys_linux", "sys_macos"):
@@ -224,7 +228,6 @@ def std2_case():
         os.symlink(compiler, volec)
         git(repo, "init", "-q", "-b", "main")
         run(["sh", "tools/git-hooks/setup.sh"], repo)
-        subprocess.run(["sh", "compiler/std/embed.sh"], cwd=repo, capture_output=True)
         for f in ["compiler/std2/std.vl"] + ["compiler/std2/rt/%s.vl" % f for f in ("gpa", "alloc_check", "sys_linux", "sys_macos")]:
             run([compiler, "fmt", f], repo)
         git(repo, "add", "-A")
@@ -252,10 +255,10 @@ def std2_case():
         case("std2: the work tree's file is the committed one",
              git(repo, "status", "--porcelain").stdout == "", git(repo, "status", "--porcelain").stdout)
         # a compiler that can: the kept index is stale (it was made for the old text)
-        r = run(["sh", "compiler/std/embed.sh", "--edition", "rust", "-c"], repo, VOLE_EMBED_VOLEC=compiler)
+        r = run(["sh", "compiler/std/embed.sh", "-c"], repo, VOLE_EMBED_VOLEC=compiler)
         case("std2: embed.sh -c with a compiler that can make it says the kept index is stale",
              r.returncode != 0 and "stale" in r.stderr, r.stdout + r.stderr)
-        r = run(["sh", "compiler/std/embed.sh", "--edition", "rust", "-c"], repo, VOLE_EMBED_VOLEC="")
+        r = run(["sh", "compiler/std/embed.sh", "-c"], repo, VOLE_EMBED_VOLEC="")
         case("std2: embed.sh -c with none compares the rest", r.returncode == 0, r.stdout + r.stderr)
     finally:
         shutil.rmtree(work)

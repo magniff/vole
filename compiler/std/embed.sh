@@ -1,51 +1,30 @@
 #!/bin/sh
-# Makes compiler/src/front/stdsrc.vl from std's files: the standard
-# library's source, built into the compiler as a function that writes it
-# to a buffer (string literals cannot span lines: a call for each few
-# lines, 0.21).
+# Makes compiler/src/front/stdsrc_rust.vl from std's files (compiler/std2):
+# the standard library's source, built into the compiler as functions that
+# write it to a buffer (string literals cannot span lines: a call for each
+# few lines, 0.21).
 #
-# std is a crate of its own (0.20): its root module is compiler/std/std.vl
-# and the files appended to it, in this order (ROOT_FILES, those of them
-# that exist): flat/iter.vl (0.14), flat/io.vl, flat/fmt.vl,
-# flat/convert.vl and flat/clone.vl (0.15), flat/alloc.vl (0.16),
-# flat/values.vl (0.17), flat/test.vl, flat/nonnull.vl, flat/fuzz.vl
-# (0.18), flat/collections.vl (0.18.1), flat/arch.vl (0.19): the files
-# of the one module std was before 0.20, in flat/ so that std's modules
-# can have their names. A `mod NAME;` line of the root's files is the module std::NAME,
-# in compiler/std/NAME.vl or NAME/mod.vl, and so on down (a module in
-# a.vl has its children in a/, as in any program). The built-in text is
-# the root's files, then each module as `mod NAME { ... }` after its
-# parent's text (its `mod NAME;` line stays, and the compiler reads the
-# braces instead: front/modules: load_modules), each between banners
-# `// ---- mod std::NAME ----` and `// ---- end mod std::NAME ----`, so
-# that index.awk keeps their lines in sections always read.
+# std is a crate of its own (0.20): its root module is std.vl. A `mod
+# NAME;` line of a file is the module NAME, in NAME.vl or NAME/mod.vl, and
+# so on down (a module in a.vl has its children in a/, as in any program).
+# The built-in text is the root's file, then each module as `mod NAME {
+# ... }` after its parent's text (its `mod NAME;` line stays, and the
+# compiler reads the braces instead: front/modules), each between banners
+# `// ---- mod std::NAME ----` and `// ---- end mod std::NAME ----`.
 #
-# Its end is front/stdalloc.vl's std_alloc_tail (0.16): Gpa's
-# implementation, gpa.vl (std_gpa_source here), and std::CHECK_ALLOC;
-# with --check-alloc, the checking Gpa, alloc_check.vl
-# (std_check_gpa_source), and its index (std_check_index).
-# (0.20) After them, the target's system: sys/macos.vl or sys/linux.vl
-# (std_sys_source), the same length to the byte so that one index holds
-# for both (checked here): std::TARGET_OS and what differs between the C
-# libraries, for std::sys.
-# Run it after changing any of them; tests/run.sh checks they agree.
-# (0.17: `volec edit` of a std item, or of one of these files, runs it.)
-# (0.15) It also writes std_index, the sections' index (index.awk), and
-# (0.20) std_files, where each file's text starts in std's text.
+# It writes std2_source (the text), std2_units (0.27.5: its units, made by
+# the compiler, for a build that lexes only those it reaches), std2_files
+# (where each file's text starts in the text) and std2_line_marks; and
+# Gpa's implementation, std2/rt/gpa.vl and (for --check-alloc)
+# std2/rt/alloc_check.vl, as std2_gpa_source and std2_check_gpa_source, and
+# the target's system, rt/sys_macos.vl or rt/sys_linux.vl, as
+# std2_sys_source (front/stdalloc.vl's std2_tail puts them after the text).
+# Run it after changing any of them; tests/run.sh checks they agree, and
+# the commit hook makes the file again when compiler/std2 changes.
 #
-# usage: compiler/std/embed.sh [--edition rust] [-c | --core]   (-c: only
-# check, exit 1 if stale; --core: the sections every program reads, and why)
-#
-# (0.27.0) --edition rust: the rust edition's std instead, compiler/std2
-# (its root std2/std.vl and its modules, found as above), written to
-# compiler/src/front/stdsrc_rust.vl as std2_source, std2_units (0.27.5:
-# its units, made by the compiler; std2_index before), std2_files and
-# std2_line_marks; and Gpa's implementation, std2/rt/gpa.vl and (for
-# --check-alloc) std2/rt/alloc_check.vl, as std2_gpa_source and
-# std2_check_gpa_source (Z5: front/stdalloc.vl's std2_tail picks one).
-# (0.27.2) Built into the compiler: a rust-edition program reads it with
-# VOLE_STD2=1 until the switch makes it the edition's std (front/modules:
-# load_std2); the commit hook remakes it when compiler/std2 changes.
+# usage: compiler/std/embed.sh [--edition rust] [-c]   (-c: only check,
+# exit 1 if stale; --edition rust: accepted, and means nothing: 0.27's
+# flag, when the script also made the old std's text)
 set -eu
 # (0.27.5, Z5.2) std2's index, std2_units, is made by a compiler: the one
 # VOLE_EMBED_VOLEC names, else target/tools/volec, else target/volec, of
@@ -66,31 +45,20 @@ main_tree=
 common=$(git -C "$caller" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
 case "$common" in */.git) main_tree=${common%/.git} ;; esac
 cd "$(dirname "$0")/../.."
-edition=mvs
 if [ "${1:-}" = "--edition" ]; then
     [ "${2:-}" = rust ] || { echo "embed.sh: --edition takes rust" >&2; exit 2; }
-    edition=rust
     shift 2
 fi
-out=compiler/src/front/stdsrc.vl
-[ "$edition" = rust ] && out=compiler/src/front/stdsrc_rust.vl
+out=compiler/src/front/stdsrc_rust.vl
 # (next to the output: writable in a sandbox that only allows the tree, and mv is a rename)
 tmp=$(mktemp "$out.XXXXXX")
 work=$(mktemp -d "${TMPDIR:-/tmp}/vole-embed.XXXXXX")
 trap 'rm -rf "$work"' EXIT
-# std's root module: these files (front/stdtree.vl: std_tree_file).
-ROOT_FILES="std flat/iter flat/io flat/fmt flat/convert flat/clone flat/alloc flat/values flat/test flat/nonnull flat/fuzz flat/collections flat/arch"
-dir=compiler/std
-if [ "$edition" = rust ]; then
-    ROOT_FILES=std
-    dir=compiler/std2
-fi
-# (0.20) The two systems' tails are one index's text: the same length.
-if [ "$edition" = mvs ] && [ "$(wc -c <compiler/std/sys/macos.vl)" != "$(wc -c <compiler/std/sys/linux.vl)" ]; then
-    rm -f "$tmp"
-    echo "compiler/std/sys/macos.vl and sys/linux.vl differ in length: pad a comment" >&2
-    exit 1
-fi
+# std's root module: this file.
+ROOT_FILES=std
+dir=compiler/std2
+# (std's files beside this script, when there is no compiler/std2)
+[ -f "$dir/std.vl" ] || dir=compiler/std
 text=$work/text
 map=$work/map
 : >"$text"
@@ -136,16 +104,6 @@ walk() (
 walk std "" $ROOT_FILES
 wc -c <"$text" | tr -d ' ' >>"$map"
 
-# (0.21.1) --core: the sections every program reads (index.awk's core),
-# each with why (the section and the name that need it), and their total.
-if [ "${1:-}" = "--core" ] && [ "$edition" = mvs ]; then
-    rm -f "$tmp"
-    { cat "$text"; cat compiler/std/gpa.vl
-        echo "pub const CHECK_ALLOC: bool = false;"; cat compiler/std/sys/macos.vl; } |
-        LC_ALL=C awk -v why=1 -f compiler/std/index.awk
-    exit 0
-fi
-
 # (sed, not awk: awks differ on backslashes in replacements.)
 # (0.21) Up to about 2000 bytes of lines in one call: a program's std is
 # 20 thousand lines, and a call for each cost more than reading it.
@@ -158,168 +116,84 @@ lines() {
         }
         END { if (n > 0) print "    buf_str(out, c\"" acc "\");" }'
 }
-# The index of std's text on stdin (index.awk), as lines of code.
-index() {
-    LC_ALL=C awk -f compiler/std/index.awk | grep -v '^#' | lines
-}
 # (0.27.5, Z5.2) std2's units, `volec --edition rust __std2-index TEXT`
 units_made=0
-text_sum=
-if [ "$edition" = rust ]; then
-    text_sum=$(cksum <"$text" | awk '{ print $1 }')
-    for c in "$embed_volec" "$caller/target/tools/volec" "$caller/target/volec" \
-        "$here/target/tools/volec" "$here/target/volec" \
-        ${main_tree:+"$main_tree/target/tools/volec" "$main_tree/target/volec"}; do
-        [ -n "$c" ] && [ -x "$c" ] || continue
-        if "$c" --edition rust __std2-index "$text" >"$work/made" 2>/dev/null \
-            && head -1 "$work/made" | grep -q "^std2-units $STD2_UNITS_FORMAT "; then
-            units_made=1
-            break
-        fi
-    done
-    if [ "$units_made" = 1 ]; then
-        { echo "std2-text $text_sum"; cat "$work/made"; } | lines >"$work/units"
-    else
-        # (the file's own, as it is: for another text, or none)
-        [ -f "$out" ] && awk '/^pub fn std2_units/ { on = 1; next } on && /^}/ { exit } on' "$out" >"$work/units"
-        [ -f "$work/units" ] || : >"$work/units"
-        if [ -s "$work/units" ] && [ "${1:-}" != "-c" ]; then
-            echo "embed.sh: no compiler here writes std2's index (format $STD2_UNITS_FORMAT, volec 0.27.5 or later): $out's std2_units kept as it was; a build lexes std2 whole until it is made again (try: VOLE_EMBED_VOLEC=target/volec compiler/std/embed.sh --edition rust)" >&2
-        fi
+text_sum=$(cksum <"$text" | awk '{ print $1 }')
+for c in "$embed_volec" "$caller/target/tools/volec" "$caller/target/volec" \
+    "$here/target/tools/volec" "$here/target/volec" \
+    ${main_tree:+"$main_tree/target/tools/volec" "$main_tree/target/volec"}; do
+    [ -n "$c" ] && [ -x "$c" ] || continue
+    if "$c" --edition rust __std2-index "$text" >"$work/made" 2>/dev/null \
+        && head -1 "$work/made" | grep -q "^std2-units $STD2_UNITS_FORMAT "; then
+        units_made=1
+        break
+    fi
+done
+if [ "$units_made" = 1 ]; then
+    { echo "std2-text $text_sum"; cat "$work/made"; } | lines >"$work/units"
+else
+    # (the file's own, as it is: for another text, or none)
+    [ -f "$out" ] && awk '/^pub fn std2_units/ { on = 1; next } on && /^}/ { exit } on' "$out" >"$work/units"
+    [ -f "$work/units" ] || : >"$work/units"
+    if [ -s "$work/units" ] && [ "${1:-}" != "-c" ]; then
+        echo "embed.sh: no compiler here writes std2's index (format $STD2_UNITS_FORMAT, volec 0.27.5 or later): $out's std2_units kept as it was; a build lexes std2 whole until it is made again (try: VOLE_EMBED_VOLEC=target/volec compiler/std/embed.sh)" >&2
     fi
 fi
-if [ "$edition" = rust ]; then
-    {
-        echo "// Generated by compiler/std/embed.sh --edition rust from compiler/std2/"
-        echo "// (do not edit): the rust edition's standard library (0.27), its"
-        echo "// units' index, its files and its line marks, as std_source and"
-        echo "// the others are for MVS's std (stdsrc.vl)."
-        echo ""
-        echo "use crate::base::buf_str;"
-        echo ""
-        echo "pub fn std2_source(out: i64) {"
-        lines <"$text"
-        echo "}"
-        echo ""
-        echo "// (0.27.5, Z5.2) std2's units, for a build that lexes only those it"
-        echo "// reaches (front/modules/std2lazy.vl: index_command writes it)"
-        echo "pub fn std2_units(out: i64) {"
-        cat "$work/units"
-        echo "}"
-        echo ""
-        echo "// (0.27.5, Z5.2) the cksum of std2_source's text (std2_units is read"
-        echo "// only when its first line names the same)"
-        echo "pub fn std2_text_sum() -> i64 {"
-        echo "    $text_sum"
-        echo "}"
-        echo ""
-        echo "pub fn std2_files(out: i64) {"
-        lines <"$map"
-        echo "}"
-        echo ""
-        echo "pub fn std2_line_marks(out: i64) {"
-        LC_ALL=C awk '(NR - 1) % 64 == 0 { print at + 0 } { at += length($0) + 1 }' "$text" | lines
-        echo "}"
-        echo ""
-        echo "// (Z5) Gpa's implementation, std::__gpa (front/stdalloc.vl: std2_tail)"
-        echo "pub fn std2_gpa_source(out: i64) {"
-        lines <compiler/std2/rt/gpa.vl
-        echo "}"
-        echo ""
-        echo "// (Z5) the same with --check-alloc: the checking allocator"
-        echo "pub fn std2_check_gpa_source(out: i64) {"
-        lines <compiler/std2/rt/alloc_check.vl
-        echo "}"
-        echo ""
-        echo "// (0.27.2.1) the target's system, std::__sys (front/stdalloc.vl: std2_tail)"
-        echo "pub fn std2_sys_source(out: i64, linux: bool) {"
-        echo "    if linux {"
-        lines <compiler/std2/rt/sys_linux.vl | sed 's/^/    /'
-        echo "    } else {"
-        lines <compiler/std2/rt/sys_macos.vl | sed 's/^/    /'
-        echo "    }"
-        echo "}"
-    } >"$tmp"
-else {
-    echo "// Generated by compiler/std/embed.sh from compiler/std/ (std.vl, the"
-    echo "// files appended to it and std's modules), gpa.vl and alloc_check.vl"
-    echo "// (do not edit): the standard library's source (0.5), read when a"
-    echo "// program names \`std\` (modules.vl)."
+{
+    echo "// Generated by compiler/std/embed.sh from $dir/ (do not"
+    echo "// edit): the standard library's source, its units' index, its"
+    echo "// files and its line marks."
     echo ""
     echo "use crate::base::buf_str;"
-    echo "use crate::front::stdalloc::std_alloc_tail;"
     echo ""
-    echo "pub fn std_source(out: i64) {"
+    echo "pub fn std2_source(out: i64) {"
     lines <"$text"
-    echo "    std_alloc_tail(out);"
     echo "}"
     echo ""
-    echo "// Gpa's implementation (0.16), the end of std's source unless"
-    echo "// --check-alloc (front/stdalloc.vl)."
-    echo "pub fn std_gpa_source(out: i64) {"
-    lines <compiler/std/gpa.vl
+    echo "// (0.27.5, Z5.2) std2's units, for a build that lexes only those it"
+    echo "// reaches (front/modules/std2lazy.vl: index_command writes it)"
+    echo "pub fn std2_units(out: i64) {"
+    cat "$work/units"
     echo "}"
     echo ""
-    echo "// The checking Gpa (0.16), the end of std's source with --check-alloc"
-    echo "// (front/stdalloc.vl)."
-    echo "pub fn std_check_gpa_source(out: i64) {"
-    lines <compiler/std/alloc_check.vl
+    echo "// (0.27.5, Z5.2) the cksum of std2_source's text (std2_units is read"
+    echo "// only when its first line names the same)"
+    echo "pub fn std2_text_sum() -> i64 {"
+    echo "    $text_sum"
     echo "}"
     echo ""
-    echo "// (0.20) The end of std's text, after std::CHECK_ALLOC: the target's"
-    echo "// system, sys/linux.vl or sys/macos.vl (front/stdalloc.vl), the"
-    echo "// same length, std_sys_len bytes, so that one index holds for both."
-    echo "pub fn std_sys_source(out: i64, linux: bool) {"
-    echo "    if linux {"
-    lines <compiler/std/sys/linux.vl | sed 's/^/    /'
-    echo "    } else {"
-    lines <compiler/std/sys/macos.vl | sed 's/^/    /'
-    echo "    }"
-    echo "}"
-    echo ""
-    echo "pub fn std_sys_len() -> i64 {"
-    echo "    $(wc -c <compiler/std/sys/macos.vl | tr -d ' ')"
-    echo "}"
-    echo ""
-    echo "// (0.15) The index of std's sections (compiler/std/index.awk): what"
-    echo "// each defines and needs, so that a program's loader lexes only the"
-    echo "// sections it can reach (front/modules: load_std_sections)."
-    echo "pub fn std_index(out: i64) {"
-    # (0.16: over std_source's whole text, std_alloc_tail's included: Gpa's
-    # implementation and CHECK_ALLOC as without --check-alloc)
-    { cat "$text"; cat compiler/std/gpa.vl
-        echo "pub const CHECK_ALLOC: bool = false;"; cat compiler/std/sys/macos.vl; } | index
-    echo "}"
-    echo ""
-    echo "// (0.16) The index with --check-alloc: std's source ends with the"
-    echo "// checking Gpa (alloc_check.vl), CHECK_ALLOC and CHECK_ALLOC_OS (one"
-    echo "// digit, so that the index holds for every target)."
-    echo "pub fn std_check_index(out: i64) {"
-    { cat "$text"; cat compiler/std/alloc_check.vl
-        echo "pub const CHECK_ALLOC: bool = true;"
-        echo "const CHECK_ALLOC_OS: i64 = 0;"; cat compiler/std/sys/macos.vl; } | index
-    echo "}"
-    echo ""
-    echo "// (0.20) std's files in std_source's text: a line \`START PATH\` for each"
-    echo "// (PATH under compiler/std), in the text's order, then a line with the"
-    echo "// end of the last module's text (std_alloc_tail's follows; front/stdtree)."
-    echo "pub fn std_files(out: i64) {"
+    echo "pub fn std2_files(out: i64) {"
     lines <"$map"
     echo "}"
     echo ""
-    echo "// (0.26.2) Where lines 1, 65, 129 and so on (every 64th) start in"
-    echo "// std_source's text, a line each, so that the line of a position in"
-    echo "// std counts 64 lines at most (base/diag: std_line_col)."
-    echo "pub fn std_line_marks(out: i64) {"
+    echo "pub fn std2_line_marks(out: i64) {"
     LC_ALL=C awk '(NR - 1) % 64 == 0 { print at + 0 } { at += length($0) + 1 }' "$text" | lines
     echo "}"
+    echo ""
+    echo "// (Z5) Gpa's implementation, std::__gpa (front/stdalloc.vl: std2_tail)"
+    echo "pub fn std2_gpa_source(out: i64) {"
+    lines <"$dir/rt/gpa.vl"
+    echo "}"
+    echo ""
+    echo "// (Z5) the same with --check-alloc: the checking allocator"
+    echo "pub fn std2_check_gpa_source(out: i64) {"
+    lines <"$dir/rt/alloc_check.vl"
+    echo "}"
+    echo ""
+    echo "// (0.27.2.1) the target's system, std::__sys (front/stdalloc.vl: std2_tail)"
+    echo "pub fn std2_sys_source(out: i64, linux: bool) {"
+    echo "    if linux {"
+    lines <"$dir/rt/sys_linux.vl" | sed 's/^/    /'
+    echo "    } else {"
+    lines <"$dir/rt/sys_macos.vl" | sed 's/^/    /'
+    echo "    }"
+    echo "}"
 } >"$tmp"
-fi
 if [ "${1:-}" = "-c" ]; then
     if cmp -s "$tmp" "$out"; then rm -f "$tmp"; exit 0; fi
     # (no compiler here made the index: the rest compared; one that can
     # makes it, and an empty or other index is then stale)
-    if [ "$edition" = rust ] && [ "$units_made" = 0 ]; then
+    if [ "$units_made" = 0 ]; then
         nounits() { awk '/^pub fn std2_units/ { skip = 1; next } skip && /^}/ { skip = 0; next } !skip' "$1"; }
         if [ "$(nounits "$tmp" | cksum)" = "$(nounits "$out" | cksum)" ]; then
             rm -f "$tmp"

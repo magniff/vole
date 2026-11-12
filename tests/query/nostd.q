@@ -28,8 +28,8 @@ pub fn swap<T>(a: &mut T, b: &mut T) {
 }
 $ text std:1-2
 // std:1-2
-1	// The standard library (0.5): the module `std`, built into the compiler
-2	// (compiler/std/embed.sh makes compiler/src/front/stdsrc.vl from this file,
+1	// EDITION: rust
+2	// The rust edition's standard library (0.27): the API of the std that
 $ grep 'pub fn read_line' --in std
 # <std>
 20078:5	code	std::io	pub fn read_line<A: Allocator>(&self, buf: &mut String<A>) -> Result<usize> {

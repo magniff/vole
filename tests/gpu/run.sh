@@ -174,21 +174,12 @@ done <"$WORK/cases"
 # objcgen: generation, the runtime check, the header check.
 case objcgen in
 *"$FILTER"*)
-    # (0.28.0) the rust edition's tables are compiler/std2's; a table still
-    # only in the old std (its module not ported yet) is checked against
-    # the runtime and the SDK, and not regenerated: objcgen writes the
-    # rust edition.
-    for t in "$ROOT"/compiler/std2/objc/tables/*.objc "$ROOT"/compiler/std/objc/tables/*.objc; do
+    for t in "$ROOT"/compiler/std2/objc/tables/*.objc; do
         [ -f "$t" ] || continue
         tn=$(basename "$t" .objc)
         td=${t#"$ROOT"/}
         td=${td%/*}
         old=0
-        case "$td" in
-        compiler/std/*)
-            [ -f "$ROOT/compiler/std2/objc/tables/$tn.objc" ] && continue
-            old=1 ;;
-        esac
         why="$WORK/objcgen-$tn.why"
         : >"$why"
         if [ "$TOOLS_OK" != 1 ]; then
@@ -205,7 +196,7 @@ case objcgen in
             elif [ -z "$out" ]; then
                 echo "the table names no 'Generated into PATH' line" >>"$why"
             elif ! cmp -s "$WORK/gen-$tn.vl" "$ROOT/$out"; then
-                echo "$out is not what objcgen makes of $td/$tn.objc (regenerate it, volec fmt it, then compiler/std/embed.sh --edition rust)" >>"$why"
+                echo "$out is not what objcgen makes of $td/$tn.objc (regenerate it, volec fmt it, then compiler/std/embed.sh)" >>"$why"
             fi
             (cd "$ROOT" && "$WORK/tools/objcgen" --check "$td/$tn.objc") >/dev/null 2>"$WORK/check-$tn.err" ||
                 { echo "objcgen --check:"; sed 's/^/    /' "$WORK/check-$tn.err"; } >>"$why"

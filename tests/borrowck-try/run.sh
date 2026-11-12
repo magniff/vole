@@ -14,7 +14,7 @@
 #   // TRY: text     one of the first diagnostic's try: lines contains text
 #                    (§2.9's exact commands), one directive per line
 #   // ENV: K=V      (0.27.2) the compiler runs with K=V in its
-#                    environment (VOLE_STD2=0: on MVS's std), one per line
+#                    environment, one per line
 #   // XFAIL: why    the checker task that reports CODE has not landed:
 #                    the case is expected to fail, and reported as a
 #                    failure (XPASS) once it passes

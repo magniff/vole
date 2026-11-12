@@ -533,11 +533,9 @@ def current_std(compiler, where, st=None):
 
 
 # (0.27.2) A test case's directives that are the compiler's too
-# (tests/run.sh): `// FLAGS: --edition rust` (or `--edition=rust`) and
-# `// ENV: VOLE_STD2=...`; a root line `// EDITION: rust` the compiler
-# reads itself.
+# (tests/run.sh): `// FLAGS: --edition rust` (or `--edition=rust`); a root
+# line `// EDITION: rust` the compiler reads itself.
 CASE_FLAGS = re.compile(r"^// FLAGS:(.*)$")
-CASE_ENV = re.compile(r"^// ENV: (VOLE_STD2)=(\S*)\s*$")
 EDITION_FLAG = re.compile(r"(?:^|\s)--edition(?:=|\s+)(\S+)")
 
 
@@ -591,7 +589,8 @@ def edition_args(path, root=None):
 
 def case_options(root):
     """(0.27.2) The compiler's options of the test case root, as
-    tests/run.sh gives them: ([`--edition E`], {VOLE_STD2: V}); a root
+    tests/run.sh gives them: ([`--edition E`], {}: no variable of a case
+    is the compiler's now); a root
     that is no file (check's default, the compiler) has none. Without
     them a rust case is checked as MVS, and its Rust spellings "fixed"
     into MVS ones. (0.28.0) A root that names no edition and looks_rust
@@ -613,10 +612,6 @@ def case_options(root):
             e = EDITION_FLAG.search(m.group(1))
             if e:
                 args = ["--edition", e.group(1)]
-            continue
-        m = CASE_ENV.match(line)
-        if m:
-            env[m.group(1)] = m.group(2)
     return args, env
 
 

@@ -72,10 +72,7 @@ cd "$ROOT" || exit 2
 
 # tree
 "$COMPILER" fmt --all --check >"$WORK/check.out" 2>&1
-# (0.28.0) compiler/std, the old std, is MVS text until std2 replaces it:
-# fmt reads it as the one edition and would change it; left out here and
-# in the roundtrip until then.
-bad=$(grep '\.vl$' "$WORK/check.out" | grep -v '^try: ' | grep -v '^compiler/std/')
+bad=$(grep '\.vl$' "$WORK/check.out" | grep -v '^try: ')
 check tree "$([ -z "$bad" ] && echo 1)" "$bad"
 
 # embed_block (0.26.0): an embedded block's bytes are kept as they are
@@ -147,7 +144,7 @@ printf '%s\n' $programs compiler/src/main.vl | awk -v w="$WORK/c" '{ print NR " 
 # changed after the copy was made, or nothing.
 changed_since_copy() {
     case "$1" in
-        compiler/src/main.vl) where="compiler/src compiler/std" ;;
+        compiler/src/main.vl) where="compiler/src compiler/std2" ;;
         tests/run/*/main.vl|examples/*/main.vl|examples/*/*/main.vl) where=$(dirname "$1") ;;
         *) where=$1 ;;
     esac

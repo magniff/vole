@@ -12,12 +12,11 @@ An entry is:
             file no other file of its tree names with `mod NAME;`) without
             a line `// EDITION: rust` or `// FLAGS: ... --edition rust`,
             and every module file reached only from such roots
-  old-std   a rust-edition root that asks for the old std (`// ENV:
-            VOLE_STD2=0`)
+
   generator a script (.awk, .sh, .py, .pl) that writes vole programs and
             has MVS's words in what it writes (tests/fuzz/gen.awk); its
             programs are not in the tree, so no other class sees them
-  std       a file of the old std, compiler/std
+
   guide     a topic of compiler/guide with code blocks that is not in
             tests/guide/run.sh's RUST_TOPICS
   book      a chapter of book/ with code blocks that is not in
@@ -36,10 +35,9 @@ prefix per line (`#` comments; a prefix ends with `/`); an entry under it
 is counted as allowed and does not fail the run (`*` in a line: a glob
 of the whole path).
 
-Owners: mig28 (book, examples, guide, bench, the editor samples), d4 (the
-old std and its copies in tests), gpu
+Owners: mig28 (book, examples, guide, bench, the editor samples), gpu
 (the gpu port: tests/gpu, window, voltty-render, two tools), del280 (the
-other tests, tools/numtables), other (anything else).
+other tests), other (anything else).
 """
 import fnmatch
 import os
@@ -50,7 +48,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EDITION = re.compile(r"^// EDITION: rust\s*$", re.M)
 FLAGS = re.compile(r"^// FLAGS:.*--edition[= ]rust", re.M)
-OLD_STD = re.compile(r"^// ENV: VOLE_STD2=0\s*$", re.M)
+
 MOD = re.compile(r"(?:^|[;{}])\s*(?:pub(?:\([a-z]+\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;", re.M)
 # MVS's words, for a text no root reaches
 MVS_WORDS = re.compile(
@@ -81,15 +79,12 @@ def tracked():
 
 def owner(path):
     top = path.split("/")
-    if path.startswith(("compiler/std/", "tests/refactor/stdedit/", "tests/query/stdpos0253/",
-                        "tests/refactor/inputs/strip_prefix")):
-        return "d4"
+
     if path.startswith(("tests/gpu/", "tests/window/", "tests/voltty-render/", "tools/objcgen/", "tools/wgslc/", "bench/gpu/shader/run.sh")):
         return "gpu"
     if top[0] in ("book", "examples", "bench", "editors") or path.startswith("compiler/guide/") or path == "README.md":
         return "mig28"
-    if path.startswith("tools/numtables/"):
-        return "d4"
+
     if path.startswith("tools/agent-hooks/") or top[0] == "tests":
         return "del280"
     return "other"
@@ -136,8 +131,6 @@ def programs(paths):
     for r in roots:
         if EDITION.search(text[r]) or FLAGS.search(text[r]):
             mark(r, rust)
-            if OLD_STD.search(text[r]):
-                old_std.append(r)
     # a module file with its own rust line (std2's files, a test's module)
     for p in files:
         if EDITION.search(text[p]):
@@ -149,9 +142,7 @@ def programs(paths):
     mvs -= rust
     entries = []
     for p in sorted(mvs):
-        if p.startswith("compiler/std/"):
-            entries.append(("std", p, ""))
-            continue
+
         parts = p.split("/")
         if p in roots and ("inputs" in parts or "texts" in parts or not MAIN.search(text[p])):
             # a text fed to an edit, a module a step adds, a file left out
