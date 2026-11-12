@@ -285,7 +285,7 @@ error[type error] no method 'push_string' on type 'String<Gpa>' | help: did you 
 fn main(gpa: Gpa) -> i32 { let m: HashMap<i64, i64, Gpa> = HashMap::new_in(gpa); 0 }
 ```
 ```err
-error[type error] unknown type 'HashMap' | help: add `use std::collections::hash_map::HashMap;`
+error[type error] unknown type 'HashMap' | help: add `use std::collections::HashMap;`
 ```
 `use std::collections::HashMap;` (the prelude's names need no import:
 `volec guide modules`); `volec fix --suggested` adds the line.

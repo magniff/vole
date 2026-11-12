@@ -118,10 +118,10 @@ the sites, and each gets a command:
 $ volec rewrite '$v.len() == 0' '$v.is_empty()'
 report.vl:43:8: error[type error] no method 'is_empty' on type '&Histogram' | try: volec query items Histogram main.vl  [edited: crate::report::histogram]
 error edit.breaks: 1 new error; nothing written; the error: report.vl:43:8: no method 'is_empty' on type '&Histogram'
-note rewrite.where: $v has 3 types at the sites: Vec<&str,Gpa> (1 site), &Histogram (1 site), &mutString<Gpa> (1 site); --where takes the ones the replacement fits
-try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<&str,Gpa>'
+note rewrite.where: $v has 3 types at the sites: Vec<&str, Gpa> (1 site), &Histogram (1 site), &mut String<Gpa> (1 site); --where takes the ones the replacement fits
+try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<&str, Gpa>'
 try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: &Histogram'
-try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: &mutString<Gpa>'
+try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: &mut String<Gpa>'
 try: volec rewrite '$v.len() == 0' '$v.is_empty()' --no-check
 [exit 1]
 ```
