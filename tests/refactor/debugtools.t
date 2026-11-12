@@ -77,6 +77,18 @@ run: exit 0; stdout 4 lines (target/scratch/probe/main.vl/out)
   | b best 5
   | a best 7
   | ###
+## (0.28.0) probes in two files of one run (each file's report function
+## has its own name: the two were one symbol, defined twice)
+$ probe main.vl:23 i stats.vl:46 m --input tests/ok.in --max 1
+probe main.vl:23 (each time round `while i < keys.len() as i64 {`): 3 times, the first 1 (--max N)
+  #1  i = 0
+probe stats.vl:46 (before `if v[i] > m {`): 2 times, the first 1 (--max N)
+  #1  m = 3
+run: exit 0; stdout 4 lines (target/scratch/probe/main.vl/out)
+  | a best 7
+  | b best 5
+  | a best 7
+  | ###
 ## --count: how often a line runs
 $ probe --count stats.vl:46 --count stats.vl:36 --input tests/ok.in
 probe stats.vl:46 (before `if v[i] > m {`): 2 times
