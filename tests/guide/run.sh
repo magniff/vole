@@ -43,19 +43,15 @@
 
 set -u
 LC_ALL=C
-# (0.27.2) The rust edition's examples are written against MVS's std
-# until they migrate to std2 (front-rust.md Z1): read with it, as the
-# cases marked `// ENV: VOLE_STD2=0` are. Gone by the release.
+# (0.28.0) The checks of `guide std` against std's text read the old std
+# until std2 becomes std; a block is compiled on std2 (VOLE_STD2=1 below).
 VOLE_STD2=0
 export VOLE_STD2
 export LC_ALL
-# (0.28.0) The topics whose examples are the rust edition's, all of their
-# blocks: each is compiled with --edition rust, on std2 (VOLE_STD2=1),
-# and --split writes its prog.vl with `// EDITION: rust` first (the twin's
-# guide programs). A topic moves here when its examples are translated
-# (0.28.0 workstream C); the others are MVS's until then.
-RUST_TOPICS=" allocators arch c-interop cli closures contracts conversions core debug effects errors example fmt formatting generics gpu gpu-render how io iterators language math memory modules std syntax text threads testing tools traits types unsafe window "
-rust_topic() { case "$RUST_TOPICS" in *" $1 "*) echo 1 ;; *) echo 0 ;; esac; }
+# (0.28.0) Every topic's examples are the rust edition's: each block is
+# compiled on std2 (VOLE_STD2=1), and --split writes its prog.vl with
+# `// EDITION: rust` first (the twin's guide programs).
+rust_topic() { echo 1; }
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -551,8 +547,8 @@ fi
 # are gone from it).
 missed=""
 for pair in 'borrow:memory#borrowing' \
-    'mutable reference:(memory#borrowing|rust#parameters)' '&mut:(memory#borrowing|rust#parameters)' \
-    'let mut:(memory#borrowing|rust#parameters)' 'move closure:closures#move-closures'; do
+    'mutable reference:memory#borrowing' '&mut:memory#borrowing' \
+    'let mut:(memory#borrowing|core#the-language-in-one-program)' 'move closure:closures#move-closures'; do
     w=${pair%%:*}
     want=${pair#*:}
     "$COMPILER" guide --find $w 2>/dev/null | head -1 >"$WORK/findconv.out"

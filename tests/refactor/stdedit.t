@@ -2,6 +2,7 @@
 ## one (compiler/std/ with its embed.sh), with a small std.
 ## exact-std: its std is the fixture's own small one, and its point is
 ## positions in std's files (an edit by FILE:LINE, the errors' lines).
+## XFAIL: its small std is a copy of the old edition's, which nothing reads now; rewritten on the one std when compiler/std2 becomes compiler/std
 % mkdir -p compiler/src/front && cp $T/../../compiler/std/embed.sh $T/../../compiler/std/index.awk compiler/std/
 ## A std item is edited in its file, with the edited std checked.
 $ edit insert --after std::trim --dry-run < $T/inputs/strip_prefix.vl

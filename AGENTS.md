@@ -6,10 +6,11 @@ in [docs/releases.md](docs/releases.md) and
 [docs/roadmap.md](docs/roadmap.md); the language in
 [docs/grammar.md](docs/grammar.md).
 
-**compiler/src is in the rust edition** (0.28.0: `// EDITION: rust`
-in `main.vl`; `target/volec guide edition`): `&T`, `&mut T`, `let mut`,
-`&'static [u8]`, Rust's meanings, not MVS's. The compiler still reads
-MVS programs (std, the guide's examples, most of tests/run). A static of
+**There is one edition, Rust's surface** (0.28.0; `target/volec guide
+rust`: where vole differs from Rust): `&T`, `&mut T`, `let mut`,
+`&'static [u8]`, Rust's meanings. `--edition mvs` is refused; a root's
+`// EDITION: rust` line says nothing (the bootstrap's 0.27.8 still reads
+it in compiler/src/main.vl). A static of
 compiler/src is read and written only through its accessors at its
 file's end (`get_x()`, `set_x(v)`); their `unsafe` blocks' UNSAFE:/
 SAFETY: lines (from the review in tools/statics/statics.tsv, with
@@ -82,10 +83,9 @@ no-query: need the comment above run_gvn, show omits it` (or `# no-tool:
 every Write/Edit of a `.vl` file and every writing `volec` command:
 what changed since the last check (new errors, how many fixed) is added
 to that call's result; nothing added means no change, so do not run
-`check` after an edit. It makes only the mechanical exact fixes itself
-(a call's `&` marker, an import unused at two checks)
-and shows each change, `changed FILE:LINE: OLD -> NEW` (repeats in one
-line), then `the hook rewrote FILE: ...`, all it wrote (`volec undo`
+`check` after an edit. It makes one fix itself (it removes an import
+unused at two checks)
+and shows each change, `changed FILE:LINE: OLD -> NEW`, then `the hook rewrote FILE: ...`, all it wrote (`volec undo`
 takes it back; `VOLE_HOOK_FIX=0`: off); a new `.vl` file you Write
 outside compiler/src and compiler/std it formats (`volec fmt`) and names
 the same way; it says once when another file you changed is not

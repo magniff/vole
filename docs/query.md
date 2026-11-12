@@ -1354,10 +1354,9 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
   FIX` line per error it fixed, then the errors left. A refused fix
   leaves the report as before, with its `try:`; VOLE_HOOK_FIX=0 turns
   it off; the record says `hook_fixed`. (The 0.18 eval: the `try:` was
-  offered 43 times and run once.) (0.25.2.1) Only the mechanical
-  classes are made: `fix --suggested --codes
-  conv.marker,conv.marker_extra,conv.rust --diff` (a call's `&`
-  marker), and `fix --only unused --in FILE` for an
+  offered 43 times and run once.) (0.25.2.1) Only a fix that
+  changes no meaning is made; (0.28.0) there is one, `fix --only unused
+  --in FILE` for an
   import unused at this check and the last (not one just written); each
   change is a `changed FILE:LINE: OLD -> NEW` line after the head. The
   other exact fixes (a did-you-mean, a conversion, a `use`, a path: the

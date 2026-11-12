@@ -62,7 +62,7 @@ fn main() {
 EOF
 
 n=0
-for p in "$T/hello.vl" "$T/multi/main.vl" "$ROOT/tests/cost/std2_heavy.vl" \
+for p in "$T/hello.vl" "$T/multi/main.vl" "$ROOT/tests/cost/std_heavy.vl" \
     "$ROOT/tests/run/rust_f_f19_use_self_ok.vl" \
     "$ROOT/tests/run/rust_f_f24_crate_ok.vl" "$ROOT/tests/run/std2_alloc_arena.vl"; do
     [ -f "$p" ] || { echo "FAIL std2-units: no program $p"; fail=1; continue; }

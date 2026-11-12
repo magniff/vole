@@ -1,282 +1,190 @@
-# Rust -> vole
+# Rust and vole: where they differ
 
-What a Rust programmer reaches for, and what vole has instead.
-Vole is not Rust: its values are passed by convention (`let`,
-`inout`, `sink`), not by reference. A Rust habit compiles to an error
-more often than to something else, and each error names the fix.
+Vole's surface is Rust's: its syntax, ownership and moves, `&T` and
+`&mut T` under a borrow checker (NLL, rustc's rules and codes:
+`guide memory`), lifetimes, traits and generics, closures, patterns,
+`?`, and std's names. A Rust program is not a vole program in the
+places below, and only there; each is an error that names the fix, not
+another meaning.
 
-## Text
+## Allocation is a capability
+
+Nothing allocates without an allocator. It is a value passed to what
+allocates, and a parameter of the type that owns memory; there is no
+global allocator and no default `A`.
 
 | Rust | vole |
 |---|---|
-| `&str`, `String` | the same (0.20): `str` is UTF-8 text, a view (`&str` is `str`; a literal is one where one goes, and a `str` goes where `[u8]` does); `String` owns it, on an allocator: `String::new_in(gpa)`, `String::from_in("x", gpa)`; `&s` of a String goes where a `str` does, and it has `str`'s methods (`guide text`) |
-| `String::new()`, `push_str`, `format!` | `String::new_in(gpa)`, `push_str`, `push(c)` (a `u32` code point: no `char` yet), `push_fmt("..", args)`; `to_string_in(format_args("..", args), gpa)`; `Vec<u8, A>` for bytes, `format_in("..", args, gpa)` (a `String<A>`, as `format!` makes) |
-| `&[u8]` | `[u8]`: bytes; `str::from_utf8(b)?` makes a `str` of them (checked); `"abc"` is a `[u8]` where no `str` goes |
-| `s.len()` | the same, an `i64` |
-| `s == "x"`, `s < t` | the same (std's `Eq` and `Ord` for `[u8]`, by bytes) |
-| `&s[1..3]` | `s[1..3]` (checked) |
-| `s.as_bytes()[0]`, `b'a'` | `s[0]`, `'a'` (a `u8`) |
-| `CString`, `.as_ptr()` | `c"text"` (a `*u8`); a slice is not NUL-terminated |
-| `match s { "a" => .. }` | `if s == "a" { .. } else if ...` |
-| `x.to_string()`, `s.parse::<i64>()` | `to_string_in(x, gpa)`, `s.to_string_in(gpa)`; `s.parse::<i64>()` on a `str` (0.20; `std::parse_int(b)` on bytes) |
-| `s.trim()`, `s.split(',')`, `s.split_whitespace()`, `s.lines()` | the same on a `str` (0.20): views of `s`, no allocation; `.collect_in(gpa)` for a Vec; on bytes `std::trim(b)`, `std::split_in(b, ',', gpa)` |
-| `s.to_uppercase()`, `s.replace(a, b)` | `s.to_uppercase_in(gpa)`, `s.replace_in(a, b, gpa)`: the Rust form is `alloc.explicit`, its `try:` the `_in` form |
-| `std::fs::read_to_string(p)?`, `File::open(p)?`, `BufReader::new(f)` | `fs::read_to_string_in(p, gpa)?`; `File::open(p)?` and `BufReader::new(f)` as Rust's (no allocation); `r.lines_in(gpa)`, `r.read_line(&mut s)?` (`guide io`) |
-| `std::env::args()`, `Command::new(p).arg(a).output()` | `env::args()` (views, `.collect_in(gpa)`); `let mut c = Command::new(p); c.arg(a); c.output_in(gpa)?` (`arg` changes `c`: no chaining) |
+| `fn main()` | `fn main(gpa: Gpa)`: the program's allocator, passed down (`fn main()` when nothing allocates) |
+| `Vec<T>`, `String`, `HashMap<K, V>`, `Box<T>` | `Vec<T, Gpa>`, `String<Gpa>`, `HashMap<K, V, Gpa>`, `Box<T, Gpa>`; generic code writes `A: Allocator` (`use std::alloc::Allocator`). `Vec<T>` is `alloc.default` |
+| `Vec::new()`, `String::new()`, `Box::new(x)`, `Arc::new(x)` | `Vec::new_in(gpa)`, `String::new_in(gpa)`, `Box::new_in(x, gpa)`, `Arc::new_in(x, gpa)`: the allocator last. `Vec::new()` is `alloc.no_in` |
+| `x.to_string()`, `format!("{a}-{b}")`, `iter.collect()` | `x.to_string_in(gpa)`, `format_in("{a}-{b}", gpa)`, `iter.collect_in(gpa)`: what returns owned memory ends in `_in` |
 
 ```vole
-fn main(gpa: Gpa) -> i32 {
-    var b = String::new_in(gpa);               // freed at the end of main
-    b.push_str("sum=");
-    let parts = split_in("40,2", ',', gpa);
-    var sum = 0;
-    for p in parts.as_slice() {
-        sum += parse_int(p).unwrap_or(0);
-    }
-    b.push_fmt(sum);
-    println(b.as_slice());
-    if parse_int("4x").is_err() { println("not a number"); }
-    0
+fn squares(n: i64, gpa: Gpa) -> Vec<i64, Gpa> {
+    (1..=n).map(|i| i * i).collect_in(gpa)
+}
+
+fn main(gpa: Gpa) {
+    let v = squares(4, gpa);
+    let s = format_in("{v:?} sum {}", v.iter().sum::<i64>(), gpa);
+    println("{s}");
 }
 ```
 ```out
-sum=42
-not a number
+[1, 4, 9, 16] sum 30
 ```
 
-## Parameters, ownership, memory
+Arenas and the other allocators: `guide allocators`.
 
-Vole has no references to store: a parameter's convention says what
-the function does with its argument, and the argument is used as the
-value itself.
+## No macros
 
-| Rust | vole |
-|---|---|
-| `x: &T`, `f(&x)` | `x: T` (let, the default: read-only), `f(x)` |
-| `x: &mut T`, `f(&mut x)` | `x: inout T`, `f(&x)`: `&` marks only an inout argument |
-| `x: T` (the callee owns it) | `x: sink T`, `f(x)` (moves; a plain value is copied) |
-| `mut x: T` | `x: sink T` (a sink parameter is the callee's, so mutable) |
-| `&self`, `&mut self`, `self`, `mut self` | `self`, `inout self`, `sink self`; calls lend the receiver: `v.push(1)` |
-| `let mut x` | `var x` (also `var` in patterns: `Some(var n)`) |
-| `let r = &mut x;` | `inout r = &x;`, passed on as `f(&r)` |
-| `let r = &x; f(r)` | `f(x)`: a let argument needs no reference |
-| `*r = v`, `*n + 1`, `(*p).f` | `r = v`, `n + 1`, `p.f`: an access is used as its value (`*` is only for raw pointers) |
-| `&T` / `&mut T` fields | `let T` / `inout T` fields: `struct P { q: inout Query }`, built with `q: &q` |
-| `&str`, `&[T]`, `&mut [T]` | `str` (0.20), `[T]` (read-only), `inout [T]` (writable) |
-| `move \|\| ..` | `sink \|\| ..` |
-| `static mut` | `static var` |
-| `match &mut x { .. }` | `match &x { .. }`: binds inout accesses |
-| moves, `Clone`, `Copy` | the same idea: an owned value (`Vec`, `Buf`, `HashMap`, a struct holding one) moves; `.clone()` copies; plain values copy (no `Copy` derive) |
-| `Drop`, RAII | dropped at the end of the scope, last first; `impl Drop for T { fn drop(inout self) }`; `drop(x)` |
-| lifetimes `'a`, `fn f<'a>(x: &'a str) -> &'a str` | none: each function's view summary is inferred (`query views NAME`); `#[views(s)]` pins one (`guide memory#slices`) |
-| the borrow checker | the own pass: `own.moved`, `own.conflict`, `own.escape`... each with `try:` lines (`volec explain own.conflict`) |
-| `Box<T>`, `Rc<T>`, `Arc<T>` | none: a `Vec<T, A>`, an index, or `malloc` in `unsafe` |
-| `Vec::new()`, the global allocator | `Vec::new_in(gpa)`: allocation is explicit (0.16); `gpa: Gpa` comes from `fn main(gpa: Gpa)` and is passed down; `arena_scope(gpa, \|a\| ..)` (`guide allocators`) |
-| `Option<&T>` | `Option<T>` of a copy, an index, or a one-element view `[T]` |
-| `&mut v[i]`, `m.get_mut(&k)` | `&v[i]` to an inout parameter, `v[i].f = x`; `m.get_mut(k)`: an `Option<[V]>`, a view of one element (`a[0].f += 1`) |
-| `*m.entry(k).or_insert(0) += 1` | `m.get_or_insert(k, 0)[0] += 1` |
-| `std::mem::take(&mut x)`, `replace` | `std::take(&x)`, `std::replace(&x, v)` |
-| `Mutex`, threads | none in vole (C's threads are C's business) |
+Rust's macros are functions of the prelude, called without `!`:
+`print`, `println`, `eprintln`, `format_in`, `write`, `writeln`,
+`panic`, `assert`, `assert_eq`, `unreachable`, `todo`. The format
+string is a literal (`println(x)` is an error: `println("{}", x)`).
+`vec![1, 2]` is an array or pushes; `matches!(x, P)` is `if let P = x`
+or a `match`; there is no `macro_rules!`. Attributes and
+`#[derive(Clone, Copy, PartialEq, Debug, ..)]` are Rust's.
 
-Each Rust spelling above is the error `conv.rust`, whose `try:` line
-writes the vole form. Pass a container to a function that changes it as
-`&v` to an `inout` parameter, to one that reads it as `v`; return a new
-one by value (the caller owns it):
+## Effects and contracts
+
+Vole adds two things to a signature, both checked.
+
+- **Effects**: what a function may do, inferred for every function
+  and checked where one is declared: `#[pure]`, `#[no_alloc]`,
+  `#[no_io]`, `#[no_panic]`, `#[effects(io, static, panic, diverge)]`
+  (all it may have: `println`'s four). The effects are `alloc(A)`,
+  `io`, `static`, `panic`, `diverge` and `unsafe`; a panic is only
+  `panic` (`diverge` is a loop or a recursion that may not end).
+  `volec query effects NAME --why io` shows the chain (`guide
+  effects`).
+- **Contracts**: `requires COND else "code: message"` and `ensures
+  COND` (with `result`) after the signature. A caller that breaks a
+  `requires` stops at its own line with the message, exit 101 (`guide
+  contracts`).
 
 ```vole
-fn fill(v: inout Vec<i64, Gpa>, n: i64) { // v.push changes the caller's Vec
-    for i in 0..n { v.push(i * i); }
+fn half(x: i64) -> i64
+    requires x % 2 == 0 else "half.odd: {x} is odd"
+    ensures result * 2 == x
+{
+    x / 2
 }
 
-fn sum(v: Vec<i64, Gpa>) -> i64 { // let: reads it in place
-    var s = 0;
-    for x in v { s += x; }
-    s
+#[pure]
+fn square(x: i64) -> i64 {
+    x * x
 }
 
-fn main(gpa: Gpa) -> i32 {
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
-    fill(&v, 4);
-    inout r = &v;                        // an inout access in a local: passed on twice
-    fill(&r, 1);
-    fill(&r, 1);
-    std::print_int(v.len() as i64 + sum(v));
-    println("");
-    0
+fn main() {
+    println("{} {}", half(8), square(3));
+    println("{}", half(7));
+}
+```
+```out (exit 101)
+4 9
+main.vl:15:19: half.odd: 7 is odd
+```
+
+## Named arguments
+
+An argument may be written with its parameter's name, after the
+positional ones and in the parameters' order: `window(800, 600, title:
+"demo")`. It is the same call; a wrong name or order is an error.
+There are no default arguments: every argument is written.
+
+```vole
+fn scale(x: i64, by: i64, shift: i64) -> i64 {
+    x * by + shift
+}
+
+fn main() {
+    println("{}", scale(5, by: 3, shift: 1));
 }
 ```
 ```out
-20
+16
 ```
 
-`*T` is Rust's `*mut T` / `*const T`: dereferencing it needs `unsafe`,
-a parameter too (0.18.1); `&x` passed where a `*T` is wanted gives its
-address.
+## Numbers
 
-## Errors and Option
-
-| Rust | vole |
-|---|---|
-| `x?` | the same (0.15), on `Option` and `Result`; the error goes through `From` |
-| `panic!("msg")`, `unreachable!()` | `panic("msg")`, `unreachable()` (0.17; exit 101), or `return` an error |
-| `.map()`, `.and_then()`, `.ok_or()`, `.map_err()` | the same (0.15), and `unwrap_or_else` |
-| `.unwrap()`, `.unwrap_or(d)`, `.is_some()`, `.is_none()` | the same |
-| `.is_ok()`, `.is_err()`, `.ok()` | the same |
-| `assert!(c)`, `debug_assert!` | `if !c { panic("..."); }` |
-| `std::process::exit(n)` | `return n;` from `main`, or C's `exit` in `unsafe` |
-| `fn main() -> Result<(), E>` | the same (0.15): `Err(e)` prints `Error: ` and `e`'s Debug, exit 1 |
+- **Lossless integer widening is implicit**: an integer goes where a
+  wider one of the same signedness is wanted, and an unsigned one
+  where a wider signed one is (`u8` to `u16`, `i32` to `i64`, `u8` to
+  `i64`, `u32` to `usize`). Everything else is written: `x as i32`
+  narrows, `usize` to `i64` and `i32` to `u64` need `as`, and `f32` to
+  `f64` does too. `i64::from(a)` is accepted as in Rust.
+- **An index may be any integer type**: `v[i]` with `i: i64` or `u8`
+  compiles and is checked (a negative index panics). Lengths are
+  `usize`, as in Rust.
+- **Overflow** panics at `-O0` (`attempt to add with overflow`) and
+  wraps at `-O2`, as Rust's debug and release builds do; `wrapping_add`
+  and its family always wrap.
+- `~x` is accepted for `!x` until 0.29.
 
 ```vole
-enum Error { Empty, TooBig(i64) }
-
-fn check(n: i64) -> Result<i64, Error> {
-    if n == 0 { return Err(Error::Empty); }
-    if n > 100 { return Err(Error::TooBig(n)); }
-    Ok(n * 2)
-}
-
-fn twice_checked(n: i64) -> Result<i64, Error> {
-    let v = check(n)?;                    // Err(e) returns Err(e)
-    Ok(v + 1)
-}
-
-fn main() -> i32 {
-    match twice_checked(500) {
-        Ok(v) => std::print_int(v),
-        Err(Error::TooBig(n)) => { print("too big: "); std::print_int(n); }
-        Err(Error::Empty) => print("empty"),
-    }
-    println("");
-    std::print_int(twice_checked(4).unwrap());
-    println("");
-    0
+fn main() {
+    let small: u8 = 200;
+    let wide: i64 = small; // widening: no `as`
+    let v = [10, 20, 30];
+    let i: i64 = 2;
+    println("{} {} {}", wide + 1, v[i], small.wrapping_add(100));
 }
 ```
 ```out
-too big: 500
-9
+201 30 44
 ```
 
-## Iteration and closures
+## Pointers and slices
+
+- `*const T` and `*mut T` are one type until 0.29: either goes where
+  the other is wanted, with no cast (`let q: *mut i64 = p;` of a
+  `*const i64`), and diagnostics print it `*T`. A write through a
+  pointer declared `*const T` is still refused.
+- A slice has the fields `ptr` and `len` beside Rust's `as_ptr()` and
+  `len()` (until 0.29).
+- Raw pointers are for `unsafe` code, as in Rust (`guide unsafe`).
+
+## C
+
+- A C header is imported, not bound by hand: `import "stdio.h" as c;`
+  then `unsafe { c::puts(c"text"); }` (`c".."` is a NUL-terminated
+  `*const u8`). `extern "C" { fn f(..); }` blocks and `#[link(name =
+  "m")]`, `#[link(framework = "AppKit")]` are Rust's (`guide
+  c-interop`).
+- An `extern` function named `write` hides the prelude's `write`
+  (the formatting function, Rust's `write!`): declare C's under another
+  name, `#[link_name = "write"] fn c_write(fd: i32, buf: *const u8, n:
+  usize) -> isize;`.
+
+## std
+
+std has Rust's modules, names and signatures with the allocator
+written. Where it differs in shape:
+
+- `std::path::Path<'a>` is a value that borrows its text, not an
+  unsized type: `Path::new("a/b.txt")` is a `Path`, a function takes
+  `p: Path<'a>`, and `p.file_name()` is an `Option<&str>` (there is no
+  `OsStr`: paths and arguments are UTF-8 text).
+- What owns memory takes the allocator there too: `Command::new_in(p,
+  gpa)`, then Rust's chain, `.arg(a).output()`.
+
+What Rust's std has and vole's does not yet: `std::rc` (`Rc`, `Weak`),
+`dyn`-based APIs (`Box<dyn Error>`, `Box<dyn Fn>`), `std::num::Wrapping`,
+`u8::is_ascii_whitespace`, a precision taken from an argument (`{:.*}`,
+`{:.p$}`), `Vec::try_push`, async and `std::future`. Vole's std adds
+`std::gpu`, `std::window` and `std::objc` (`guide gpu`, `guide
+window`), the arenas of `std::alloc`, and `embed wgsl` blocks with
+`#[repr(wgsl)]` structs.
+
+## Not in the language
 
 | Rust | vole |
 |---|---|
-| `for x in v.iter()`, `for x in &v` | the same (0.14), and `for x in v`: a copy of each element |
-| `for (i, x) in s.iter().enumerate()` | the same (0.14) |
-| `for x in v.iter_mut() { *x += 1 }` | `for i in 0..v.len() { v[i] += 1; }` |
-| `.map()`, `.filter()`, `.sum()`, `.collect()` | the same (0.14); `collect_in(gpa)` makes a `Vec` only (`guide iterators`) |
-| `\|x\| x + 1`, `move \|\|` | `\|x\| x + 1`, `sink \|\|` (takes what it captures); a `var` is captured inout, the rest by let access or copy (`guide closures`) |
-| `impl Fn(i64) -> i64`, `Box<dyn Fn>` | a generic parameter `F: Fn(i64) -> i64`; as a result, `-> impl Fn(i64) -> i64` in the rust edition (0.27.2.1) |
-| `(0..n).rev()` | the same (0.18.1) |
-| `.step_by(2)` | `while` with `i += 2` |
-| `sort()`, `sort_by(\|a, b\| ...)` | `std::sort(s)` (`T: Ord`; not stable); `v.sort_by(\|a, b\| b.cmp(a))` (0.14; `a`, `b`: let `T`) |
-| `v.sort_by_key(\|x\| x.k)`, `v.retain(..)`, `v.contains(&x)`, `v.first()` | the same on a `Vec` (0.18.1; `sort_by_key` is stable); `contains(x)` takes x by value |
-| `BinaryHeap<T>`; a min-heap `BinaryHeap<Reverse<T>>` | `BinaryHeap<T>`; `MinHeap<T>`, no `Reverse` (0.18.1, `guide std#heaps-priority-queues`) |
-
-A function value is `fn(A) -> R`, a plain function, no environment.
-Its parameters have conventions (`fn(inout Sum, i64)`); a
-function with `*T` parameters is a value like any other (an `unsafe fn`
-as a value is unsafe):
-
-```vole
-struct Sum { total: i64 }
-
-fn add(s: inout Sum, x: i64) { s.total += x; }
-
-fn each(xs: [i64], f: fn(inout Sum, i64), s: inout Sum) {
-    for x in xs { f(&s, x); }
-}
-
-fn square(x: i64) -> i64 { x * x }
-
-fn map_sum(xs: [i64], f: fn(i64) -> i64) -> i64 {
-    var t = 0;
-    for x in xs { t += f(x); }
-    t
-}
-
-fn main() -> i32 {
-    var s = Sum { total: 0 };
-    let xs = [1, 2, 3];
-    each(xs[..], add, &s);
-    std::print_int(s.total + map_sum(xs[..], square));
-    println("");
-    0
-}
-```
-```out
-20
-```
-
-## Types and numbers
-
-| Rust | vole |
-|---|---|
-| `usize` for lengths and indices | the same (0.26.2: `v.len()`, `s.len()`, `s.len`); indexing takes any integer type |
-| implicit widening `i32` -> `i64` | the same (0.15), lossless only; `i64::from(x)`; narrowing is `x as i32` |
-| `i32::MAX`, `u8::MIN` | the same (0.15), for the integer types |
-| overflow: panic in debug, wrap in release | the same (0.26.3): checked at -O0, wrapping at -O1 and -O2, `--overflow-checks=on\|off`; `wrapping_*`, `checked_*`, `overflowing_*`, `saturating_*`, `Wrapping<T>` (`.value` for `.0`) |
-| `x / 0` panics | the same (0.26.3), and `MIN / -1`, at every level |
-| `!x` (bitwise not) | `~x` |
-| `f.sqrt()`, `f.sin()`, `f.powi(n)`, `f64::consts::PI`, `f64::EPSILON` | the same (0.25.2.1, `guide math`), in vole: no C, no `unsafe` |
-| `x.pow(n)`, `x.abs()`, `a.min(b)`, `x.clamp(lo, hi)`, `x.signum()` on integers | the same (0.25.2.2, `guide math#integers`); they overflow as `*` does |
-| `char`, a non-ASCII `char` literal | `u8`, ASCII literals only; `"\u{e9}"` in strings is UTF-8 bytes |
-| `()` | `()` |
-| `!` (never) | `!`: `fn fail() -> ! { ... }` |
-| `#[derive(PartialEq, Eq)]` | `==` is structural for structs, enums, tuples, arrays; `Vec`, `Buf`, `HashMap` by contents (0.15); `#[derive(Eq)]` checks it |
-| `#[derive(Clone, Copy, Debug, Default, Hash)]` | `#[derive(Clone, Debug, Hash, Ord)]` (0.15); every value copies, no `Copy`, no `Default` |
-| `impl Display`, `{:?}` | `impl Display for T { fn fmt(self, f: inout Fmt) {..} }`, `{x:?}` (0.15, `guide formatting`) |
-| `impl From<A> for B`, `.into()` | the same (0.15, `guide conversions`) |
-| `type A = B;` | the same (`type Pair<T> = (T, T);` too) |
-| `const fn` | none; `const` items take constant expressions |
-
-## Syntax
-
-| Rust | vole |
-|---|---|
-| `fn f(&self)`, `&mut self`, `self` | `fn f(self)`, `fn f(inout self)`, `fn f(sink self)`; `Self` works (`self: *T` is the raw pointer, 0.18.1) |
-| `let mut x = 0;` | `var x = 0;` |
-| `'a: loop { break 'a; }` | `a: loop { break :a; }` |
-| `let x;` then assign | `let x = ...;` always |
-| `let Some(x) = o else { .. };` | the same (0.18.1); the block must leave (`return`, `break`, `continue`, `panic`) |
-| `P { x, y }` shorthand, `..base` | the shorthand (0.15); no `..base` |
-| `where T: Ord` | the same (0.26.2), on a parameter of the item; `where I::Item: Ord` comes with the rust edition |
-| `pub(crate)`, `pub(super)`, `pub(in path)` | the same (0.26.2), on items, fields, `use` and `mod`; nothing is private to the module and its children (fields too, 0.26) |
-| `fn` inside a `fn` | items only at module level |
-| `macro_rules!`, `println!`, `vec!` | none: `println("{}", x)`, a format string (0.26.2) |
-| named arguments (none in Rust) | `f(1, b: 3)`: after the positional ones, in the parameters' order; no default values, as in Rust (0.28.0) |
-| `impl<T, A: Allocator> Trait for Vec<T, A>` | the same (one impl per trait and type) |
-| `impl Trait` in argument position | the same (0.26.2): `fn f(x: impl Display)`; `-> impl Trait` comes with the rust edition |
-| `dyn Trait` | generics: `fn f<T: Trait>(x: T)` |
-| `#[test]`, proptest, cargo-fuzz | `#[test]`, `#[property]`, `#[fuzz]`, run by `volec test` and `volec fuzz` (0.18; guide testing) |
-| `assert!`, `debug_assert!`, contracts crates | `assert(c)`, `assert_eq(a, b)`; `requires`/`ensures` clauses (0.18; guide contracts) |
-| `use a::b::*;` | `use a::b::{c, d};` |
-| `x as T` | the same; `bool as i64` works, an integer to an enum is checked |
-| `if let ... else if let ...`, `while let` | the same |
-| `match` guards, `a \| b`, `1..=9` | the same; no `x @ pat`, no slice patterns, no string patterns |
-
-## Modules and crates
-
-| Rust | vole |
-|---|---|
-| `mod m;` | the same: `m.vl` or `m/mod.vl` next to the file |
-| `use crate::a::b;`, `super::`, `self::` | the same |
-| `extern crate`, Cargo dependencies | none: one program from its files; C through headers |
-| `pub use` | the same |
-| `std::collections::HashMap` | `std::HashMap` |
-| `std::io::stdin().read_line(&mut s)` | `std::read_line(&buf)`: the line without its `'\n'`; `Ok(false)` at the end of input |
-| `io::read_to_string(io::stdin())` | `std::read_stdin_in(gpa)`, a `Result<Vec<u8, Gpa>, IoError>`; `std::Scanner` for its tokens, numbers and lines |
-| `std::env::args()` | `fn main(argc: i32, argv: **u8) -> i32` |
-
-## unsafe and C
-
-| Rust | vole |
-|---|---|
-| `unsafe { }`, `unsafe fn` | the same |
-| `extern "C" { fn f(); }` | the same; or `import "stdio.h" as c;` then `c::printf` |
-| `#[repr(C)]`, `#[repr(u8)]` | the same; also `packed`, `align(N)` |
-| `extern "C" fn cb()` | the same; a plain `fn` is not a C callback |
-| `std::ptr::null()` | `0 as *T` |
-| `p.add(i)`, `p.offset(i)` | `p[i]`, `&p[i]` (unsafe); no pointer arithmetic |
-| `std::mem::size_of::<T>()` | `size_of(T)`, `align_of(T)` |
-| `libc::malloc` | `extern "C" { fn malloc(n: u64) -> *u8; }` or `import "stdlib.h" as c;` |
+| `dyn Trait`, trait objects | none (`dyn` is reserved): generics, `impl Trait`, or an enum of the cases |
+| `macro_rules!`, procedural macros | none |
+| `async`, `await` | none: threads (`guide threads`) |
+| const generics (`struct B<const N: usize>`) | none: the constant is an ordinary argument or field |
+| `-> Option<impl Tr>`, a trait method's `-> impl Tr`, `let x: impl Tr` | 0.29 (`edition.later`); `-> impl Tr` at the top of a result works |
+| crates, `Cargo.toml` | a program is its root file and its `mod x;` files (`guide modules`); std is the only library |
