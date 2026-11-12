@@ -84,12 +84,6 @@ $ refactor inline half --dry-run
 error refactor.escapes: crate::half may return early (`?`), on line 30: inline takes a function that ends with its value
 try: volec query show main.vl:30
 [exit 1]
-$ explain refactor.fill-calls
-refactor.fill-calls: note, exit 0
-`refactor signature FN --add 'x: T = V'` adds the parameter `x: T` and writes V into every call: by position, or `x: V` after a named argument. The `= V` is the tool's syntax for the value the calls get; no parameter has a default value (0.28.0; 0.15 to 0.27 declared V as x's default where the language allowed one, and this note said when the calls got it instead).
-fix: Nothing to fix: every call passes the new argument (--fill-calls is taken and changes nothing).
-example:
-    note refactor.fill-calls: the calls get the value (a trait's function has no defaults)
 ## (0.16) A tool's name with its `-` lists its codes; a subcommand's own
 ## help.
 $ explain same-output
