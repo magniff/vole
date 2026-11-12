@@ -123,9 +123,9 @@ $ cat > old.vl <<'EOF'
 > }
 > EOF
 $ volec check old.vl
-old.vl:1:39: error[alloc.default] 'String' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
+old.vl:1:39: error[alloc.default] 'String' names no allocator: its 'A' is written, last | help: the allocator is part of the type: `Gpa` (the type of main's `gpa`), or a generic `A: Allocator` | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
 old.vl:2:17: error[alloc.no_in] 'String::new' allocates from nothing: pass the allocator, last, to 'String::new_in' | help: this function's `gpa` is the allocator to pass | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
-old.vl:14:20: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
+old.vl:14:20: error[alloc.default] 'Vec' names no allocator: its 'A' is written, last | help: the allocator is part of the type: `Gpa` (the type of main's `gpa`), or a generic `A: Allocator` | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
 old.vl:14:32: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in' | help: this function's `gpa` is the allocator to pass | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
 [exit 1]
 ```
@@ -181,7 +181,7 @@ $ cat > count.vl <<'EOF'
 > }
 > EOF
 $ volec check count.vl
-count.vl:2:68: error[type error] undefined variable 'gpa' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'count' and pass it down | try: volec refactor signature count --add 'gpa: Gpa = gpa' --fill-calls count.vl
+count.vl:2:68: error[type error] undefined variable 'gpa' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'count' and pass it down | try: volec refactor signature count --add 'gpa: Gpa = gpa' --fill-calls --no-check count.vl
 [exit 1]
 ```
 

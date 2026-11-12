@@ -119,12 +119,11 @@ fn main() {
 error[alloc.no_in]: 'String::new' allocates from nothing: pass the allocator, last, to 'String::new_in'
  --> main.vl: line 2, column 20
   = help: main takes the allocator: `fn main(gpa: Gpa)`, passed down as a parameter
-  = try: volec fix --only alloc main.vl
 ```
 
 The error says what to write instead, and its `help:` line says where
-the allocator comes from. Many vole errors end with `try:` lines like
-these. They are meant to be used as they are: either code to put where
+the allocator comes from. Many vole errors also end with `try:`
+lines. They are meant to be used as they are: either code to put where
 the error is, or a command to run. `volec fix` is a command that
 rewrites code for you; we'll meet it properly in chapter 17.
 

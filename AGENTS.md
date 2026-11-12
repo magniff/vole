@@ -191,9 +191,8 @@ load or inherited.
 - **Report what was asked, checkably:** a task's "Done means" list is
   answered item by item with the command or count that shows it (e.g.
   "argv uses in compiler/src: 0, `volec query refs arg_at --count`").
-- **Mind the machine:** at most three agents build and test the compiler
-  at once (`-j 2` each: `tests/run.sh -j 2`, `tests/affected.sh -j 2`),
-  and one gate runs at a time: `gate.sh` takes a lock for all
+- **Mind the machine:** at most five agents build and test the compiler
+  at once, and one gate runs at a time: `gate.sh` takes a lock for all
   worktrees and a second gate waits, saying whose gate runs (`--no-wait`
   fails instead; `bootstrap.sh --dev` and `tests/run.sh` take none).
   Under heavy load, timing results are not evidence (the runner SKIPs

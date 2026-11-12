@@ -77,7 +77,6 @@ fn main() {
 error[alloc.no_in]: 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in'
  --> main.vl: line 2, column 17
   = help: main takes the allocator: `fn main(gpa: Gpa)`, passed down as a parameter
-  = try: volec fix --only alloc main.vl
 ```
 
 And with an allocator from `main`, it runs:

@@ -7,11 +7,11 @@
 ## as its try: line (one function up at a time).
 $ check
 main.vl:2:12: error[alloc.field] the struct 'Log' holds an allocator its parameters do not name: 'Gpa', in field 'lines' | help: a type that holds an allocator says so in its parameters: make it generic over it (`struct P<A: Allocator> { v: Vec<u8, A> }`, used as `P<Gpa>`) | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
-main.vl:6:49: error[type error] undefined variable 'gpa' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'split_path' and pass it down | try: volec refactor signature split_path --add 'gpa: Gpa = gpa' --fill-calls main.vl
+main.vl:6:49: error[type error] undefined variable 'gpa' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'split_path' and pass it down | try: volec refactor signature split_path --add 'gpa: Gpa = gpa' --fill-calls --no-check main.vl
 [exit 1]
 $ fix --only alloc
 fixed 1 suggested fix	main.vl	+4 -2 lines
-main.vl:8:49: error[type error] undefined variable 'gpa' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'split_path' and pass it down | try: volec refactor signature split_path --add 'gpa: Gpa = gpa' --fill-calls main.vl
+main.vl:8:49: error[type error] undefined variable 'gpa' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'split_path' and pass it down | try: volec refactor signature split_path --add 'gpa: Gpa = gpa' --fill-calls --no-check main.vl
 note fix.left: 1 error left (above)
 % cat main.vl
 use std::alloc::Allocator;
@@ -34,7 +34,7 @@ fn main(gpa: Gpa) {
     println("{} {parts:?}", log.lines.len());
 }
 $ check
-main.vl:8:49: error[type error] undefined variable 'gpa' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'split_path' and pass it down | try: volec refactor signature split_path --add 'gpa: Gpa = gpa' --fill-calls main.vl
+main.vl:8:49: error[type error] undefined variable 'gpa' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'split_path' and pass it down | try: volec refactor signature split_path --add 'gpa: Gpa = gpa' --fill-calls --no-check main.vl
 [exit 1]
 $ refactor signature split_path --add 'gpa: Gpa = gpa' --fill-calls
 added parameter gpa: Gpa to crate::split_path, 1 call	main.vl	+2 -2 lines

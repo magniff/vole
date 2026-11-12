@@ -189,4 +189,7 @@ window`), the arenas of `std::alloc`, and `embed wgsl` blocks with
 | `async`, `await` | none: threads (`guide threads`) |
 | const generics (`struct B<const N: usize>`) | none: the constant is an ordinary argument or field |
 | `-> Option<impl Tr>`, a trait method's `-> impl Tr`, `let x: impl Tr` | 0.29 (`edition.later`); `-> impl Tr` at the top of a result works |
+| `matches!(x, P)` | `match x { P => true, _ => false }` |
+| `let mut v = Vec::new_in(gpa);` typed by a later `v.push(x)` | the type is written: `let mut v: Vec<T, Gpa> = Vec::new_in(gpa);` |
+| a closure parameter `\|&&x\|`; `std::cmp::Reverse(k)` by its path | `\|x\| **x > 0`; `use std::cmp::Reverse;` then `Reverse(k)` |
 | crates, `Cargo.toml` | a program is its root file and its `mod x;` files (`guide modules`); std is the only library |

@@ -189,7 +189,7 @@ fn main(gpa: Gpa) {
 error[type error]: undefined variable 'gpa'
  --> main.vl: line 2, column 49
   = help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'split_path' and pass it down
-  = try: volec refactor signature split_path --add 'gpa: Gpa = gpa' --fill-calls main.vl
+  = try: volec refactor signature split_path --add 'gpa: Gpa = gpa' --fill-calls --no-check main.vl
 ```
 
 `gpa` is just a parameter name, and `split_path` has no parameter by
