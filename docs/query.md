@@ -1147,6 +1147,12 @@ sample in the suite, all of it in the gate's `cachediff` step).
   file of the program), one that could not be parsed. A damaged or
   partly written file is not read (a hash of its contents; written
   through a new file renamed over the old).
+- Bounded (0.28.0): whoever writes a cache then removes the programs
+  least recently used (a hit is a use: the time in the `.bin`'s header)
+  while the directory's `q-KEY.*` files pass 1 GB (`$VOLE_CACHE_LIMIT`,
+  in MB: the code cache's limit too), about 85 small programs at 12 MB
+  each; never a file with another name, and a command that only reads
+  does not read the directory. A cache removed under a reader is a miss.
 - (0.18.1) Beside it, a build's code cache, `g-KEY.pack`: each
   function's optimized code at -O1 and -O2, reused by a rebuild where an
   edit did not change it ([optimizer.md](optimizer.md), "0.18.1:
