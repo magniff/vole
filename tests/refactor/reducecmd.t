@@ -3,7 +3,7 @@
 ## --differs: -O0 and -O2 disagree (here a test-only switch makes -O2 read
 ## the literal 12345 as 12346, in one of 30 functions of 428 lines)
 % VOLE_PLANT_MISCOMPILE=1 "$COMPILER" reduce main.vl --differs
-reduced main.vl: 429 lines to 12 in 307 runs; written to main.min.vl
+reduced main.vl: 428 lines to 12 in 307 runs; written to main.min.vl
 fn f17(x: i64) -> i64 {
     let mut t = x;
     t = t + 12345;
@@ -20,7 +20,7 @@ fn main() -> i32 {
 12
 ## --fails TEXT: its build or run prints TEXT
 $ reduce crash.vl --fails 'index out of bounds'
-reduced crash.vl: 22 lines to 9 in 36 runs; written to crash.min.vl
+reduced crash.vl: 21 lines to 9 in 35 runs; written to crash.min.vl
 fn last(v: &[i64]) -> i64 {
     v[v.len()]
 }

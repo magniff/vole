@@ -6,7 +6,7 @@
 ^[[1;31merror[type error]^[[0m^[[1m: expected 'i32', got '&str'^[[0m
  ^[[1;34m-->^[[0m bad.vl:2:18
   ^[[1;34m|^[[0m
-^[[1;34m3 |^[[0m     let x: i32 = "a";
+^[[1;34m2 |^[[0m     let x: i32 = "a";
   ^[[1;34m|^[[0m                  ^[[1;31m^^^^[[0m
     ^[[1;32mChecking^[[0m bad.vl ... ^[[31m1 error^[[0m
       ^[[1;31mFailed^[[0m bad: 1 error in Ts

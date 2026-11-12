@@ -259,7 +259,7 @@ index 161be2d..872f916 100644
  pub fn area(p: Point) -> i64 {
      p.x * p.y
 diff --git a/main.vl b/main.vl
-index 73f384a..16c9edc 100644
+index 620be80..2ddb6f5 100644
 --- a/main.vl
 +++ b/main.vl
 @@ -3,7 +3,8 @@ mod geom;
@@ -450,10 +450,10 @@ moved module crate::shapes to crate::figures::shapes	3 files	+3 -2 lines
 pub mod shapes;
 % git diff main.vl
 diff --git a/main.vl b/main.vl
-index 73f384a..f47b72c 100644
+index 620be80..b915abc 100644
 --- a/main.vl
 +++ b/main.vl
-@@ -1,14 +1,14 @@
+@@ -1,13 +1,13 @@
  // A program of four modules to reorganize (tests/refactor/modules.t).
  mod geom;
 -mod shapes;
@@ -743,10 +743,10 @@ script steps.txt: 3 commands	7 files	+55 -51 lines
 ./util.vl
 % git diff main.vl
 diff --git a/main.vl b/main.vl
-index 73f384a..f47b72c 100644
+index 620be80..b915abc 100644
 --- a/main.vl
 +++ b/main.vl
-@@ -1,14 +1,14 @@
+@@ -1,13 +1,13 @@
  // A program of four modules to reorganize (tests/refactor/modules.t).
  mod geom;
 -mod shapes;

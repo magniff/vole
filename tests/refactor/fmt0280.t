@@ -1,8 +1,8 @@
-## (0.28.0) fmt reads a file in its program's edition: words.vl has no
-## `// EDITION: rust` line of its own, main.vl, its root, has (0.27.7
-## read words.vl as MVS: `'static` an unterminated character literal).
-## By the file's path (the nearest main.vl at or above it) and in the
-## loaded program.
+## (0.28.0) fmt reads a module's file alone as it reads its program:
+## there is one edition, and no file says it (0.27.7 read words.vl, which
+## had no edition line of its own, as MVS: `'static` an unterminated
+## character literal). By the file's path (the nearest main.vl at or
+## above it) and in the loaded program.
 $ fmt --check words.vl
 words.vl
 error fmt.unformatted: 1 of 1 file is not formatted
@@ -18,7 +18,7 @@ try: volec fmt words.vl
 $ fmt words.vl
 formatted	words.vl	+1 -1 lines
 % cat words.vl
-// A module of a rust-edition program: no edition line of its own.
+// A module, formatted alone and with its program.
 pub fn first(text: &'static [u8]) -> &'static [u8] {
     let mut i: usize = 0;
     while i < text.len() && text[i] != b' ' {

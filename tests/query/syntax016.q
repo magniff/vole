@@ -21,9 +21,9 @@ $ show crate::Pair
 struct Pair<T, U = i64> { a: T, b: U }
 $ refs Pair
 # syntax016/main.vl
-30:8	def	struct Pair<T, U = i64> { a: T, b: U }
-45:12	type	main	let p: Pair<i64> = Pair { a: s.area(), b: unsafe { labs(-2) } };
-45:24	init	main	let p: Pair<i64> = Pair { a: s.area(), b: unsafe { labs(-2) } };
+29:8	def	struct Pair<T, U = i64> { a: T, b: U }
+44:12	type	main	let p: Pair<i64> = Pair { a: s.area(), b: unsafe { labs(-2) } };
+44:24	init	main	let p: Pair<i64> = Pair { a: s.area(), b: unsafe { labs(-2) } };
 $ effects apply grow_by_one main
 apply<closure(i64) -> i64 at syntax016/main.vl:47:32>	none
 crate::grow_by_one	alloc(Gpa) panic diverge

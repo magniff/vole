@@ -238,8 +238,8 @@ $ text text/long.vl:31-300
 note query.truncated: lines 31-250 are 220 lines; showing 31-230
 try: volec query text text/long.vl:231-250
 $ text text/main.vl:40-45
-error query.no-match: text/main.vl has 28 lines; no lines 40-45
-try: volec query text text/main.vl:1-28
+error query.no-match: text/main.vl has 27 lines; no lines 40-45
+try: volec query text text/main.vl:1-27
 [exit 1]
 $ text text/nowhere.vl
 error query.no-file: cannot read 'text/nowhere.vl'

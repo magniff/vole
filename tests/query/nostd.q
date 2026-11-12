@@ -28,8 +28,8 @@ pub fn swap<T>(a: &mut T, b: &mut T) {
 }
 $ text std:1-2
 // std:1-2
-1	// EDITION: rust
-2	// The rust edition's standard library (0.27): the API of the std that
+1	// The standard library (0.27; the one std from 0.28.0): Rust's API. In
+2	// 0.27.0 it was a spec for the rust edition: every item's signature in
 $ grep 'pub fn read_line' --in std
 # <std>
 20078:5	code	std::io	pub fn read_line<A: Allocator>(&self, buf: &mut String<A>) -> Result<usize> {

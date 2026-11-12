@@ -134,7 +134,7 @@ exit 0
 $ refactor inline quad
 inlined crate::calc::quad at 1 call, deleted it	2 files	+10 -12 lines
 % git diff main.vl | sed -n '/^@@/,$p'
-@@ -1,10 +1,17 @@
+@@ -1,9 +1,16 @@
  // A program to extract functions from and inline (tests/refactor/code.t).
  mod calc;
  

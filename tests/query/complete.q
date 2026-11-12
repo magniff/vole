@@ -11,14 +11,13 @@ $ items crate shapes --comments
 19	impl	impl Counter
 20	method	pub fn new() -> Self
 24	method	pub fn bump(&mut self) -> i64
-30-68	section	Shapes
+30-67	section	Shapes
 32-32	comment	(the shapes come from shapes.vl)
 34	fn	fn make(k: i64) -> Shape
 42	fn	fn twice_area<T>(x: T, s: Shape) -> i64
 47	fn	fn main() -> i32
 59	fn	fn get_count() -> i64
 63	fn	fn set_count(v: i64)
-68-68	comment	EDITION: rust
 # crate::shapes	complete/shapes.vl
 3	enum	pub enum Shape
 8-16	section	Areas
@@ -55,7 +54,7 @@ pub fn area_of(s: Shape) -> i64 {
         Shape::Circle(r) => 3 * r * r,
     }
 }
-// crate::section Shapes	complete/main.vl:30-68
+// crate::section Shapes	complete/main.vl:30-67
 // ---- Shapes ----
 
 // (the shapes come from shapes.vl)

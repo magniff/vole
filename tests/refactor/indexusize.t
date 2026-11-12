@@ -14,13 +14,13 @@ main.vl:17:27: error[type error] an index is a 'usize', got 'u8' | help: indexin
 $ fix --suggested --show
 fixed 5 suggested fixes	main.vl	+4 -4 lines
 // main.vl:2
-3	    hex[(b >> 4) as usize]
+2	    hex[(b >> 4) as usize]
 // main.vl:7
-8	    for x in &xs[from as usize..] {
+7	    for x in &xs[from as usize..] {
 // main.vl:10
-11	    sum + xs[n as usize] + xs[(from + 1) as usize]
+10	    sum + xs[n as usize] + xs[(from + 1) as usize]
 // main.vl:17
-18	    println("{} {} {}", a[k as usize], digit(b"0123456789abcdef", 0x4f), wide);
+17	    println("{} {} {}", a[k as usize], digit(b"0123456789abcdef", 0x4f), wide);
 $ check
 ok: 0 errors in main.vl
 % volec main.vl -o prog && ./prog

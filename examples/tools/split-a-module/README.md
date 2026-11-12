@@ -38,7 +38,7 @@ command that shows the way out:
 
 ```console
 $ volec lint --max-lines 170
-error lint.max-lines: shop.vl: 386 lines (at most 170)
+error lint.max-lines: shop.vl: 385 lines (at most 170)
 try: volec query deps crate::shop --max-lines 170
 [exit 1]
 ```
@@ -48,11 +48,11 @@ The file already has sections, marked with banner comments; `query items
 
 ```console
 $ volec query items shop --comments | grep section
-8-74	section	Products and stock
-76-141	section	Carts
-143-220	section	Prices and discounts
-222-281	section	Receipts
-283-386	section	Commands
+7-73	section	Products and stock
+75-140	section	Carts
+142-219	section	Prices and discounts
+221-280	section	Receipts
+282-385	section	Commands
 ```
 
 ## 2. What uses what
@@ -88,7 +88,7 @@ outside stays in `shop` itself:
 
 ```console
 $ volec refactor split shop --plan --max-lines 170
-# crate::shop	386 lines	5 parts of at most 170 lines
+# crate::shop	385 lines	5 parts of at most 170 lines
 # commands: banner '// ---- Commands ----': 4 of 4 items, 86 of 86 lines
 volec refactor split crate::shop --into crate::shop::commands --items Command,number,parse_command,run
 # carts: banner '// ---- Carts ----': 9 of 11 items, 56 of 77 lines
@@ -113,11 +113,11 @@ split crate::shop into 4 modules	6 files	+329 -304 lines
 $ volec query stats
 95	4	shop/commands.vl
 95	11	shop/carts.vl
-90	10	shop/mod.vl
+89	10	shop/mod.vl
 73	6	shop/receipts.vl
 55	6	shop/pricing.vl
-32	1	main.vl
-440	38	total
+31	1	main.vl
+438	38	total
 $ volec lint --max-lines 170 && echo every file fits
 every file fits
 ```
@@ -139,20 +139,20 @@ use crate::shop::receipts::{print_receipt, total};
 // Carts
 $ volec query items shop
 # crate::shop	shop/mod.vl
-6	mod	pub mod commands
-7	mod	pub mod carts
-8	mod	pub mod receipts
-9	mod	mod pricing
-18	struct	pub struct Product
-26	struct	pub struct Store<A: Allocator>
-32	fn	pub fn new_store(gpa: Gpa) -> Store<Gpa>
-36	fn	pub fn add_product(st: &mut Store<Gpa>, sku: i64, name: &'static str, price: i64, stock: i64)
-41	fn	pub fn find_sku(st: &Store<Gpa>, sku: i64) -> Option<usize>
-45	fn	pub fn product(st: &Store<Gpa>, sku: i64) -> Option<Product>
-52	fn	pub fn in_stock(st: &Store<Gpa>, sku: i64) -> i64
-60	fn	pub fn restock(st: &mut Store<Gpa>, sku: i64, n: i64) -> bool
-71	fn	fn take_stock(st: &mut Store<Gpa>, sku: i64, n: i64) -> i64
-83	fn	pub fn print_stock(st: &Store<Gpa>, gpa: Gpa)
+5	mod	pub mod commands
+6	mod	pub mod carts
+7	mod	pub mod receipts
+8	mod	mod pricing
+17	struct	pub struct Product
+25	struct	pub struct Store<A: Allocator>
+31	fn	pub fn new_store(gpa: Gpa) -> Store<Gpa>
+35	fn	pub fn add_product(st: &mut Store<Gpa>, sku: i64, name: &'static str, price: i64, stock: i64)
+40	fn	pub fn find_sku(st: &Store<Gpa>, sku: i64) -> Option<usize>
+44	fn	pub fn product(st: &Store<Gpa>, sku: i64) -> Option<Product>
+51	fn	pub fn in_stock(st: &Store<Gpa>, sku: i64) -> i64
+59	fn	pub fn restock(st: &mut Store<Gpa>, sku: i64, n: i64) -> bool
+70	fn	fn take_stock(st: &mut Store<Gpa>, sku: i64, n: i64) -> i64
+82	fn	pub fn print_stock(st: &Store<Gpa>, gpa: Gpa)
 ```
 
 Code outside the module was changed too: `main.vl` imports from where
@@ -161,10 +161,10 @@ the items are now.
 ```console
 $ git diff main.vl
 diff --git a/main.vl b/main.vl
-index dbf46b0..48a03ff 100644
+index a599df1..e4b7d1e 100644
 --- a/main.vl
 +++ b/main.vl
-@@ -3,7 +3,10 @@
+@@ -2,7 +2,10 @@
  
  mod shop;
  

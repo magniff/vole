@@ -52,7 +52,7 @@ example:
         println("{}", first(&raw const x));
     }
     
-    main.vl:1:5: error[unsafe] dereference of a raw pointer is unsafe
+    main.vl:2:5: error[unsafe] dereference of a raw pointer is unsafe
       help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place)
       try: volec fix --only unsafe main.vl
 ```
@@ -70,15 +70,15 @@ show `edit patch`.) `--dry-run` shows the diff first:
 $ volec fix --dry-run
 --- a/main.vl
 +++ b/main.vl
-@@ -8,0 +9,2 @@
+@@ -7,0 +8,2 @@
 +use std::collections::HashMap;
 +
 --- a/grades.vl
 +++ b/grades.vl
-@@ -22 +22 @@
+@@ -21 +21 @@
 -fn letter(avg: i64) -> char {
 +pub fn letter(avg: i64) -> char {
-@@ -40 +40 @@
+@@ -39 +39 @@
 -        let d = abs((scores[i] - scores[i - 1]) as i32) as i64;
 +        let d = unsafe { abs((scores[i] - scores[i - 1]) as i32) as i64 };
 $ volec fix
@@ -121,7 +121,7 @@ try: volec --diagnostics=short main.vl -c -o /dev/null
 $ volec edit patch roster.vl:28 --old 'let count' --new 'let mut count' --show
 patched crate::roster::with_scores	roster.vl	+1 -1 lines
 // roster.vl:25
-26	    let mut count = 0;
+25	    let mut count = 0;
 ```
 
 An OLD that is not there is refused, with the nearest line of the item
@@ -130,13 +130,13 @@ writes the cast without parentheses:
 
 ```console
 $ volec edit patch grades.vl:18 --old 'totl / (scores.len() as i64)' --new 'total / (scores.len() as i64)'
-error patch.no-match: OLD 1 is not in crate::grades::average; nearest, line 19: totl / scores.len() as i64
+error patch.no-match: OLD 1 is not in crate::grades::average; nearest, line 18: totl / scores.len() as i64
 try: volec edit patch grades.vl:18 --old 'totl / scores.len() as i64' --new 'total / (scores.len() as i64)'
 [exit 1]
 $ volec edit patch grades.vl:18 --old 'totl' --new 'total' --show
 patched crate::grades::average	grades.vl	+1 -1 lines
 // grades.vl:18
-19	    total / scores.len() as i64
+18	    total / scores.len() as i64
 ```
 
 ## 4. A fix that spans items: `edit apply`
@@ -191,22 +191,22 @@ $ volec edit apply --show <<'EOF'
 > EOF
 applied 2 blocks: replaced crate::roster::enrol; inserted after crate::roster::enrol	roster.vl	+16 -3 lines
 // roster.vl:18-33
-19	// A student and their scores so far.
-20	pub fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str, scores: &[i64]) {
-21	    let mut v: Vec<i64, Gpa> = Vec::new_in(*r.students.allocator());
-22	    v.extend_from_slice(scores);
-23	    r.students.push(Student { name, scores: v });
-24	}
-25	
-26	// One more score for the student called `name`; false when there is none.
-27	pub fn add_score(r: &mut Roster<Gpa>, name: &str, score: i64) -> bool {
-28	    for i in 0..r.students.len() {
-29	        if r.students[i].name == name {
-30	            r.students[i].scores.push(score);
-31	            return true;
-32	        }
-33	    }
-34	    false
+18	// A student and their scores so far.
+19	pub fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str, scores: &[i64]) {
+20	    let mut v: Vec<i64, Gpa> = Vec::new_in(*r.students.allocator());
+21	    v.extend_from_slice(scores);
+22	    r.students.push(Student { name, scores: v });
+23	}
+24	
+25	// One more score for the student called `name`; false when there is none.
+26	pub fn add_score(r: &mut Roster<Gpa>, name: &str, score: i64) -> bool {
+27	    for i in 0..r.students.len() {
+28	        if r.students[i].name == name {
+29	            r.students[i].scores.push(score);
+30	            return true;
+31	        }
+32	    }
+33	    false
 ```
 
 ## 5. It builds

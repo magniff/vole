@@ -49,16 +49,16 @@ is. `--dry-run` prints the diff without writing it:
 $ volec rewrite 'buf_add($b, $s)' '$b.push_str($s)' --dry-run | head -12
 --- a/report.vl
 +++ b/report.vl
-@@ -4 +4 @@
+@@ -3 +3 @@
 -use crate::compat::{buf_add, buf_add_int, vec_at};
 +use crate::compat::{buf_add_int, vec_at};
-@@ -9 +9 @@
+@@ -8 +8 @@
 -        buf_add(b, "#");
 +        b.push_str("#");
-@@ -14 +14 @@
+@@ -13 +13 @@
 -    buf_add(b, "lines ");
 +    b.push_str("lines ");
-@@ -16 +16 @@
+@@ -15 +15 @@
 note rewrite.imports: removed 1 import the rewrite left unused
 $ volec rewrite 'buf_add($b, $s)' '$b.push_str($s)'
 rewrote 24 sites in 1 file	report.vl	+25 -25 lines
@@ -68,14 +68,14 @@ rewrote 10 sites in 1 file	report.vl	+11 -11 lines
 note rewrite.imports: removed 1 import the rewrite left unused
 $ volec rewrite 'vec_at($v, $i)' '$v[$i]' --show
 rewrote 3 sites in 2 files	2 files	+3 -6 lines
-// report.vl:2: 1 line removed after line 3
+// report.vl:2: 1 line removed after line 2
 // report.vl:30
-31	        let c = top[i];
-// stats.vl:4: 2 lines removed after line 5
+30	        let c = top[i];
+// stats.vl:4: 2 lines removed after line 4
 // stats.vl:66
-67	        out.push(v[i]);
+66	        out.push(v[i]);
 // stats.vl:75
-76	        if v[i].n == 1 {
+75	        if v[i].n == 1 {
 note rewrite.imports: removed 2 imports the rewrite left unused
 ```
 
@@ -103,7 +103,7 @@ edit (`undo` brings both back):
 
 ```console
 $ volec edit delete compat
-deleted crate::compat	2 files	+0 -20 lines
+deleted crate::compat	2 files	+0 -19 lines
 ```
 
 ## 3. A rewrite that only fits some types
@@ -146,15 +146,15 @@ reads `$v[$i]`, and writes a loop over copies of the elements:
 $ volec rewrite 'for $i in 0..$v.len() { let $x = $v[$i]; $s... }' 'for $x in $v.iter().copied() { $s... }' --show
 rewrote 5 sites in 3 files	3 files	+5 -10 lines
 // report.vl:29
-30	    for c in top.iter().copied() {
+29	    for c in top.iter().copied() {
 // stats.vl:13
-14	    for w in ws.iter().copied() {
+13	    for w in ws.iter().copied() {
 // stats.vl:43
-44	    for w in ws.iter().copied() {
+43	    for w in ws.iter().copied() {
 // stats.vl:52
-53	    for w in ws.iter().copied() {
+52	    for w in ws.iter().copied() {
 // text.vl:16
-17	    for c in text.iter().copied() {
+16	    for c in text.iter().copied() {
 note rewrite.dropped: 1 site is left: the replacement drops $i, which the code it keeps uses; first: text.vl:40:18
 try: volec query show text.vl:40
 ```
@@ -189,12 +189,12 @@ same output
 ok: 0 errors in main.vl
 ok: built wordstat
 $ git diff HEAD --stat
- compat.vl | 19 -----------------
+ compat.vl | 18 ----------------
  main.vl   |  1 -
  report.vl | 72 +++++++++++++++++++++++++++++++--------------------------------
  stats.vl  | 15 +++++--------
  text.vl   |  3 +--
- 5 files changed, 41 insertions(+), 69 deletions(-)
+ 5 files changed, 41 insertions(+), 68 deletions(-)
 ```
 
 ## Why not by hand

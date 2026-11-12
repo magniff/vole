@@ -49,12 +49,12 @@ longest run 20
 $ volec refactor rename adler32::a low --show
 renamed local a to low in crate::adler::adler32, 4 uses	adler.vl	+4 -4 lines
 // adler.vl:4
-5	    let mut low: u64 = 1;
+4	    let mut low: u64 = 1;
 // adler.vl:7-8
-8	        low = (low + x as u64) % 65521;
-9	        b = (b + low) % 65521;
+7	        low = (low + x as u64) % 65521;
+8	        b = (b + low) % 65521;
 // adler.vl:10
-11	    (b << 16) | low
+10	    (b << 16) | low
 $ volec refactor rename adler32::b high
 renamed local b to high in crate::adler::adler32, 3 uses	adler.vl	+3 -3 lines
 $ volec refactor rename main::c1 sum_in
@@ -87,8 +87,8 @@ try: volec rewrite 65521 MOD_ADLER --no-check
 $ volec rewrite '$e % 65521' '$e % MOD_ADLER' --show
 rewrote 2 sites in 1 file	adler.vl	+2 -2 lines
 // adler.vl:10-11
-11	        low = (low + x as u64) % MOD_ADLER;
-12	        high = (high + low) % MOD_ADLER;
+10	        low = (low + x as u64) % MOD_ADLER;
+11	        high = (high + low) % MOD_ADLER;
 $ volec main.vl --no-positions -o after.s && cmp before.s after.s && echo same assembly
 same assembly
 ok: wrote after.s
@@ -141,19 +141,19 @@ parameters (in the order of their first use), the one they define and
 `main` uses after them its result:
 
 ```console
-$ volec refactor extract-function main --lines 24-27 --to round_trips --show
-extracted lines 24-27 of crate::main into round_trips(out, gpa, s) -> bool	main.vl	+9 -4 lines
+$ volec refactor extract-function main --lines 23-26 --to round_trips --show
+extracted lines 23-26 of crate::main into round_trips(out, gpa, s) -> bool	main.vl	+9 -4 lines
 // main.vl:23
-24	    let ok = round_trips(out, gpa, s);
+23	    let ok = round_trips(out, gpa, s);
 // main.vl:38-45
-39	}
-40	
-41	fn round_trips(out: &[u8], gpa: Gpa, s: &[u8]) -> bool {
-42	    let ok = match rle::decode(out, gpa) {
-43	        Some(back) => back.as_slice() == s,
-44	        None => false,
-45	    };
-46	    ok
+38	}
+39	
+40	fn round_trips(out: &[u8], gpa: Gpa, s: &[u8]) -> bool {
+41	    let ok = match rle::decode(out, gpa) {
+42	        Some(back) => back.as_slice() == s,
+43	        None => false,
+44	    };
+45	    ok
 ```
 
 The compiled code changes now (there is a new function), so the

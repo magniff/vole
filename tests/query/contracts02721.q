@@ -12,5 +12,5 @@ crate::declared	contracts02721/main.vl:20:8
   requires x > 0	contracts02721/main.vl:21:5
   ensures result > x	contracts02721/main.vl:22:5
 $ items crate --undeclared contracts02721/main.vl
-28	undeclared
+27	undeclared
 undeclared: 1 of 2

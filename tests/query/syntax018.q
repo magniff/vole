@@ -27,7 +27,7 @@ crate::any_id	syntax018/main.vl:56:4	fn	fn any_id(n: i64)	effects: none
 crate::tests::two	syntax018/main.vl:64:8	fn	fn two()	effects: none
 $ refs NodeId
 # syntax018/main.vl
-17:6	def	type NodeId = distinct i64;
-46:15	type	next_id	fn next_id(n: NodeId) -> NodeId requires n >= 0 {
-46:26	type	next_id	fn next_id(n: NodeId) -> NodeId requires n >= 0 {
-75:13	type	main	let id: NodeId = 11;
+16:6	def	type NodeId = distinct i64;
+45:15	type	next_id	fn next_id(n: NodeId) -> NodeId requires n >= 0 {
+45:26	type	next_id	fn next_id(n: NodeId) -> NodeId requires n >= 0 {
+74:13	type	main	let id: NodeId = 11;

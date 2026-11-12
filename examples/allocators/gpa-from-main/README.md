@@ -140,12 +140,12 @@ every type names it:
 $ volec fix --only alloc --dry-run old.vl
 --- a/old.vl
 +++ b/old.vl
-@@ -2,2 +2,2 @@
+@@ -1,2 +1,2 @@
 -fn shout(words: &[&str], gpa: Gpa) -> String {
 -    let mut b = String::new();
 +fn shout(words: &[&str], gpa: Gpa) -> String<Gpa> {
 +    let mut b = String::new_in(gpa);
-@@ -15 +15 @@
+@@ -14 +14 @@
 -    let mut words: Vec<&str> = Vec::new();
 +    let mut words: Vec<&str, Gpa> = Vec::new_in(gpa);
 $ volec fix --only alloc old.vl

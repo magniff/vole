@@ -49,13 +49,13 @@ crate::network	network.vl	2
 crate::route	route.vl	7
 $ volec query items route
 # crate::route	route.vl
-11	const	pub const TRANSFER_MINUTES: i64 = 5
-13	struct	pub struct Leg
-20	struct	pub struct Route<A: Allocator>
-27	struct	struct Step
-34	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64
-38	fn	pub fn quickest(g: &Graph<Gpa>, from: usize, to: usize, gpa: Gpa) -> Option<Route<Gpa>>
-71	fn	fn legs_to(how: &Vec<Step, Gpa>, from: usize, to: usize, gpa: Gpa) -> Vec<Leg, Gpa>
+10	const	pub const TRANSFER_MINUTES: i64 = 5
+12	struct	pub struct Leg
+19	struct	pub struct Route<A: Allocator>
+26	struct	struct Step
+33	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64
+37	fn	pub fn quickest(g: &Graph<Gpa>, from: usize, to: usize, gpa: Gpa) -> Option<Route<Gpa>>
+70	fn	fn legs_to(how: &Vec<Step, Gpa>, from: usize, to: usize, gpa: Gpa) -> Vec<Leg, Gpa>
 ```
 
 ## 2. The function that computes the total
@@ -146,8 +146,8 @@ function. `--kind` keeps some kinds:
 ```console
 $ volec query refs Entry.line --kind init
 # route.vl
-45:47	init	route::quickest	push(&mut h, Entry { cost: 0, node: from, line: 0 });
-59:56	init	route::quickest	push(&mut h, Entry { cost, node: e.to, line: e.line });
+44:47	init	route::quickest	push(&mut h, Entry { cost: 0, node: from, line: 0 });
+58:56	init	route::quickest	push(&mut h, Entry { cost, node: e.to, line: e.line });
 ```
 
 The first state is `Entry { ..., line: 0 }`. A search of the comments
@@ -157,9 +157,9 @@ the field `Entry.line` and the function `ride_cost`):
 ```console
 $ volec query grep start --comments
 # heap.vl
-10:48	comment	heap::Entry.line	// the line the state arrived on; 0 at the start
+9:48	comment	heap::Entry.line	// the line the state arrived on; 0 at the start
 # route.vl
-33:46	comment	route::ride_cost	// What a ride on `e` costs, arriving at its start on `here_line`.
+32:46	comment	route::ride_cost	// What a ride on `e` costs, arriving at its start on `here_line`.
 ```
 
 And `query type` gives the type of the expression at a position (here
@@ -224,7 +224,7 @@ One call, in the same module. The fix is one condition, changed by name:
 $ volec edit patch ride_cost --old 'if line != here_line' --new 'if here_line != 0 && line != here_line' --show
 patched crate::route::ride_cost	route.vl	+1 -1 lines
 // route.vl:34
-35	    if here_line != 0 && line != here_line { minutes + TRANSFER_MINUTES } else { minutes }
+34	    if here_line != 0 && line != here_line { minutes + TRANSFER_MINUTES } else { minutes }
 $ volec main.vl -o transit && ./transit
 Airport -> Museum: 16 min
   line A  Airport    -> Museum      16 min

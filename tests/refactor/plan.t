@@ -2,13 +2,13 @@
 $ query stats
 37	8	lang.vl
 28	6	util.vl
-17	1	main.vl
-82	15	total
+16	1	main.vl
+81	15	total
 $ query stats --over 30
 37	8	lang.vl	over
 28	6	util.vl
-17	1	main.vl
-82	15	total
+16	1	main.vl
+81	15	total
 note query.over: 1 file over 30 lines
 try: volec query deps crate::lang --max-lines 30
 $ query stats util

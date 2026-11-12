@@ -59,7 +59,7 @@ of its `out` names one):
 $ grep -c 'fn .*gpa: Gpa' markup.vl
 4
 $ volec query refs Gpa --in crate::markup | grep inline
-37:40	type	markup::inline	fn inline(text: &str, out: &mut String<Gpa>) {
+36:40	type	markup::inline	fn inline(text: &str, out: &mut String<Gpa>) {
 $ volec query effects markup::inline --why 'alloc(Gpa)' | head -2
 crate::markup::inline	alloc(Gpa) panic diverge
   'out.push_str(if code { "</code>" } else { "<..' at markup.vl:41:13 calls 'String::push_str'
@@ -216,7 +216,7 @@ $ volec edit patch markup::render --old 'pub fn render' --new '#[effects(alloc(A
 > pub fn render' --show
 patched crate::markup::render	markup.vl	+1 -0 lines
 // markup.vl:67
-68	#[effects(alloc(Arena<Gpa>), panic, diverge)]
+67	#[effects(alloc(Arena<Gpa>), panic, diverge)]
 ```
 
 `render`'s set covers everything it calls, so the one declaration

@@ -96,7 +96,7 @@ $ rewrite 'twice($x) * twice($x)' 'square(twice($x))'
 rewrote 1 site in 1 file	main.vl	+1 -1 lines
 % git diff
 diff --git a/main.vl b/main.vl
-index df909a6..1327526 100644
+index 27a2b49..4efeac0 100644
 --- a/main.vl
 +++ b/main.vl
 @@ -14,7 +14,7 @@ fn main() -> i32 {

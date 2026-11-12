@@ -18,7 +18,7 @@ patched crate::main	main.vl	+1 -0 lines
 note patch.loose: OLD 1 matched with other indentation at line 10; NEW re-indented like it (--loose)
 % git diff main.vl
 diff --git a/main.vl b/main.vl
-index 830383a..b96cd51 100644
+index 4d2a85a..9a7a43b 100644
 --- a/main.vl
 +++ b/main.vl
 @@ -2,12 +2,13 @@
