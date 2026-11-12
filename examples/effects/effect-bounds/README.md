@@ -58,7 +58,7 @@ $ volec query effects crate::table
 map_values<closure(i64) -> i64 at main.vl:18:27>	none
 partition<closure(&Row) -> bool at main.vl:19:34>	panic
 sort_by_key<closure(&Row) -> i64 at main.vl:20:33>	panic diverge
-each<closure(&Row) -> () at main.vl:22:17>	io panic diverge
+each<closure(&Row) -> () at main.vl:22:17>	io static panic
 ```
 
 `map_values` is `none` for this closure (its `rows[i]` is in a counted

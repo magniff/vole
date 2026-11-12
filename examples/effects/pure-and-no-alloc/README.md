@@ -44,7 +44,7 @@ crate::bucket	none
 crate::histogram	panic
 crate::peak	none
 crate::outliers	alloc(Gpa) panic
-crate::main	alloc(Gpa) io panic diverge
+crate::main	alloc(Gpa) io static panic
 ```
 
 `clamp`, `scaled` and `bucket` do nothing but compute: `none`.
@@ -87,7 +87,7 @@ patched crate::clamp	main.vl	+1 -0 lines
 warning edit.breaks: 1 new error (1 in crate::score, which the edit does not change); written anyway (--no-check); the error: main.vl:37:1: 'score' is #[pure], but it does io: 'smoothed(s, i, gain)' at main.vl:40:14 calls 'smoothed'
 try: volec check
 $ volec query effects smoothed --why io | head -4
-crate::smoothed	io panic diverge
+crate::smoothed	io static panic
   'scaled(s[i], gain)' at main.vl:30:6 calls 'scaled'
   'clamp(x * gain / 10, 0, 1000)' at main.vl:24:5 calls 'clamp'
   'println("clamp {x}")' at main.vl:13:5 calls 'std::fmt::println'

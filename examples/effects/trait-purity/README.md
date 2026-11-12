@@ -52,7 +52,7 @@ Word::hash<FoldHasher>	none
 <crate::Count as PartialOrd>::partial_cmp	panic
 crate::trim_word	panic
 crate::is_letter	none
-crate::main	alloc(Gpa) io panic diverge
+crate::main	alloc(Gpa) io static panic diverge
 ```
 
 `Word::hash` is `none`: it only feeds the hasher it is given. `Word::eq`

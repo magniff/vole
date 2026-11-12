@@ -79,11 +79,11 @@ body and everything it calls (`volec guide effects`):
 
 ```console
 $ volec query effects crate
-crate::parse_orders	alloc(Gpa) io panic diverge
+crate::parse_orders	alloc(Gpa) io static panic diverge
 crate::total	none
 crate::by_customer	alloc(Gpa) panic diverge
 count_items<Gpa>	alloc(Gpa) panic diverge
-crate::main	alloc(Gpa) io panic diverge
+crate::main	alloc(Gpa) io static panic diverge
 ```
 
 `total` is `none`: no allocation, no I/O, no statics, and not even a

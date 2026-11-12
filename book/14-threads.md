@@ -597,7 +597,7 @@ starting one, `sync` for an atomic, a lock, a join or a channel, and
 ```console
 $ volec query effects crate main.vl
 crate::work	tls
-crate::main	alloc(Gpa, extern) io tls thread sync panic diverge
+crate::main	alloc(Gpa, extern) io static tls thread sync panic diverge
 ```
 
 `work` uses a thread-local, which is `tls`, not `static`. `main` starts

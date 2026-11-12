@@ -8,10 +8,10 @@ crate::labs	none
 <crate::Square as Shape>::area	none
 apply<closure(i64) -> i64 at syntax016/main.vl:48:32>	none
 crate::grow_by_one	alloc(Gpa) panic diverge
-crate::main	alloc(Gpa) io panic diverge unsafe
+crate::main	alloc(Gpa) io static panic diverge unsafe
 $ effects crate --has io syntax016/main.vl
 crate::out_write	io
-crate::main	alloc(Gpa) io panic diverge unsafe
+crate::main	alloc(Gpa) io static panic diverge unsafe
 $ effects grow_by_one --why alloc syntax016/main.vl
 crate::grow_by_one	alloc(Gpa) panic diverge
   'v.push(1)' at syntax016/main.vl:40:5 grows a Vec<i64, Gpa>

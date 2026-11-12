@@ -89,7 +89,7 @@ room was reserved the same way.
 
 ```console
 $ volec query effects crate
-<crate::CalcError as Display>::fmt	panic diverge
+<crate::CalcError as Display>::fmt	panic
 crate::push	alloc(FixedBuf) panic
 crate::skip	panic
 crate::pop2	panic
@@ -97,7 +97,7 @@ crate::eval	alloc(FixedBuf) panic
 crate::Input::byte	io panic unsafe
 crate::Input::line	alloc(FixedBuf) io panic diverge
 crate::short	panic diverge
-crate::main	alloc(FixedBuf) io panic diverge
+crate::main	alloc(FixedBuf) io static panic diverge
 ```
 
 No function has `alloc(Gpa)`, nor `alloc(extern)` (C's `malloc`):
