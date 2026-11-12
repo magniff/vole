@@ -438,12 +438,10 @@ static promotion.
   printing a HashMap, HashSet or BTreeMap with `{:?}`, or an
   `io::Error`. 0.29.
 - **First-contact rough edges left** (0.29):
-  - `fix --only alloc` writes `Gpa`, not the impl's `A`, inside a
-    generic impl in its first round [CHECK: fixed by fixgen280?];
-  - `#[derive(Clone)]` on a struct with a `&mut` field gives a `try:`
-    that is not a command [CHECK: fixed by fixgen280?];
-  - the errors after an impl's `alloc.default` are all tagged
-    `[alloc.default]`;
+  - after an `alloc.default` in a generic item, the rest of the check
+    still assumes `Gpa` for it;
+  - `#[derive(Clone)]` over an `Option<&mut T>` field is refused with
+    no help of the derive's own;
   - `.collect()` on an adapter over a program's own iterator says "no
     method 'collect'", with no hint of `collect_in`;
   - `std::cmp::Reverse(x)` written by its path "is a type, not a
