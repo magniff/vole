@@ -73,7 +73,7 @@ habits carry over. It differs in these places:
 | contracts | `assert!` in the body | `requires`, `ensures` on a signature: a caller that breaks one stops at its own line |
 | macros | `println!`, `vec!`, `macro_rules!` | none: `println("{x}")`, `format_in`, `assert` are functions |
 | arguments | positional | also named, `f(10, by: 3)`; no default arguments |
-| numbers | every conversion written | lossless integer widening is implicit (`i32` to `i64`); an index may be any integer type |
+| numbers | every conversion written | lossless integer widening is implicit (`i32` to `i64`), except to an index, a `usize` |
 | dispatch | monomorphized or `dyn` | monomorphized only: no `dyn`, no const generics, no `async` |
 | C | `extern "C"`, `#[repr(C)]`, bindgen | the same, and `import "stdio.h" as c;` reads a header into `c::` |
 | libraries | crates | std only: a program is its root file and its `mod` files |

@@ -16,8 +16,8 @@ not fit.
 vole also widens by itself, where rustc says E0308: an `i32` where an
 `i64` goes, and two integer operands of different widths join to the
 wider (`a_i32 + b_i64` is an `i64`). Code meant to build with rustc too
-writes the `from` or the `as`, as the block below does. An index may be
-any integer type (rustc's: `usize` only).
+writes the `from` or the `as`, as the block below does. An index is a
+`usize` and is not widened to (`v[i as usize]`).
 
 ## From and Into
 

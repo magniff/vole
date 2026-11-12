@@ -26,7 +26,6 @@ and the compiler's errors for Rust habits name vole's form on their
 | a struct holding a `Vec` | names the allocator: `struct Log<A: Allocator> { lines: Vec<String<A>, A> }` | 8, 9 |
 | `fn main()` | `fn main(gpa: Gpa)`, for a program that allocates | 2, 8 |
 | `x as i64` to widen an `i32` | nothing: an `i32` goes where an `i64` is wanted; narrowing still takes `as` | 3 |
-| `v[i as usize]` | `v[i]`: any integer type indexes | 3 |
 | `use std::io::*;` | no wildcard imports: every name is imported by name | 2, 11 |
 | `dyn Trait` | none: generics, `fn f<T: Trait>(x: &T)`, or an enum | 9 |
 | `Rc<T>` | not there: a `Vec` and indices, or an arena | 8 |

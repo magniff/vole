@@ -47,7 +47,6 @@ make one program; `mod name;` loads `name.vl`.
 | `s.to_string()`, `it.collect()`, `s.to_uppercase()` | what allocates has the name with `_in` and takes the allocator last: `to_string_in(gpa)`, `collect_in(gpa)` (`alloc.no_in` names it; `volec fix --only alloc`) |
 | `use m::*;` | not allowed: `use m::{a, b};`, or the path `m::a` |
 | `a as i64` to widen | written or not: an `i32` goes where an `i64` does, losslessly; `a as i32` narrows (`guide conversions`) |
-| `v[i as usize]` | an index may be any integer type |
 | `dyn Trait`, `i128`, `async`, macros by example, a function inside a function, a string literal as a pattern | not there: dispatch is static (`impl Trait`, generics); `if s == "add"` |
 | contracts, effects | `requires`/`ensures` clauses, `#[no_alloc]`, `volec query effects f` (`guide contracts`, `guide effects`) |
 

@@ -53,8 +53,8 @@ Vole adds two things to a signature, both checked.
 
 - **Effects**: what a function may do, inferred for every function
   and checked where one is declared: `#[pure]`, `#[no_alloc]`,
-  `#[no_io]`, `#[no_panic]`, `#[effects(io, static, panic, diverge)]`
-  (all it may have: `println`'s four). The effects are `alloc(A)`,
+  `#[no_io]`, `#[no_panic]`, `#[effects(io, static, panic)]`
+  (all it may have: `println`'s three). The effects are `alloc(A)`,
   `io`, `static`, `panic`, `diverge` and `unsafe`; a panic is only
   `panic` (`diverge` is a loop or a recursion that may not end).
   `volec query effects NAME --why io` shows the chain (`guide
@@ -115,9 +115,8 @@ fn main() {
   `i64`, `u32` to `usize`). Everything else is written: `x as i32`
   narrows, `usize` to `i64` and `i32` to `u64` need `as`, and `f32` to
   `f64` does too. `i64::from(a)` is accepted as in Rust.
-- **An index may be any integer type**: `v[i]` with `i: i64` or `u8`
-  compiles and is checked (a negative index panics). Lengths are
-  `usize`, as in Rust.
+  An index is not widened to: it is a `usize`, as in Rust (`v[i as
+  usize]` of an `i: u32`).
 - **Overflow** panics at `-O0` (`attempt to add with overflow`) and
   wraps at `-O2`, as Rust's debug and release builds do; `wrapping_add`
   and its family always wrap.
@@ -129,7 +128,7 @@ fn main() {
     let wide: i64 = small; // widening: no `as`
     let v = [10, 20, 30];
     let i: i64 = 2;
-    println("{} {} {}", wide + 1, v[i], small.wrapping_add(100));
+    println("{} {} {}", wide + 1, v[i as usize], small.wrapping_add(100));
 }
 ```
 ```out

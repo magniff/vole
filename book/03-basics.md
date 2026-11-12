@@ -118,9 +118,9 @@ in type 'i32'`. This book writes `i64` for most of its whole numbers,
 so that an example never has to wonder how big they get.
 
 Lengths and indexes are `usize`. A list's `len()` is a `usize`, and you
-index with a `usize` (another integer type works too). A `usize` and an
-`i64` don't mix in arithmetic: the error names the conversion to write,
-such as `v.len() as i64`.
+index with a `usize`: an `i64` index is converted, `v[i as usize]`. A
+`usize` and an `i64` don't mix in arithmetic: the error names the
+conversion to write, such as `v.len() as i64`.
 
 ### Literals
 

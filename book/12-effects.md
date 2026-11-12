@@ -72,8 +72,8 @@ fn main(gpa: Gpa) {
     println("mean: {:.2}", mean(&xs));
     let mut buckets = [0i64; 5];
     histogram(&xs, 0.0, 10.0, &mut buckets);
-    for i in 0..5 {
-        println("{:>2} to {:>2}: {}", i * 2, i * 2 + 2, buckets[i]);
+    for (i, n) in buckets.iter().enumerate() {
+        println("{:>2} to {:>2}: {}", i * 2, i * 2 + 2, n);
     }
 }
 ```
@@ -206,8 +206,8 @@ fn main(gpa: Gpa) {
     println("mean: {:.2}", mean(&xs));
     let mut buckets = [0i64; 5];
     histogram(&xs, 0.0, 10.0, &mut buckets);
-    for i in 0..5 {
-        println("{:>2} to {:>2}: {}", i * 2, i * 2 + 2, buckets[i]);
+    for (i, n) in buckets.iter().enumerate() {
+        println("{:>2} to {:>2}: {}", i * 2, i * 2 + 2, n);
     }
 }
 ```

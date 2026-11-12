@@ -90,8 +90,8 @@ fn main() {
 
 Indexing (`a[i]`) and slicing (`a[lo..hi]`, `a[..hi]`, `a[lo..]`,
 `a[..]`) are checked: out of bounds, the program prints `index out of
-bounds: index I, length N` and exits with 101. An index may be any
-integer type (vole's; rustc's is `usize`). A function taking `&[T]`
+bounds: index I, length N` and exits with 101. An index is a `usize`
+(`a[i as usize]` of another integer type). A function taking `&[T]`
 takes `&a` of an array or a Vec. An array is `Copy` when its elements
 are.
 
