@@ -664,7 +664,7 @@ builtins, and no item may have those names.)
 the address of the bytes (`const PROMPT: *u8 = c"> ";`).
 
 **Slices.** `s.len` is `usize` (0.26.2; it was `i64`, and `u64` before
-that), as std's lengths are. Indexing takes any integer type. `for x in s` iterates a
+that), as std's lengths are. Indexing takes a `usize` (0.28.0; any integer type before). `for x in s` iterates a
 slice or an array by value (the sequence is evaluated once; `break`,
 `continue` and labels work as in other loops).
 
@@ -1924,8 +1924,8 @@ let_stmt += "let" pattern "=" expr "else" block ";" ;     (* let-else *)
   `cannot take address of non-lvalue expression`, whose `try:` names the
   value first. `&e` of a slice value is still the slice; where `&[T]` is
   expected, the temporary's reference (`cmp_of(&a.text(), &b.text())`).
-- **An index** may be a reference to an integer (`keys[a]` with `a:
-  &i64`, a `sort_by` closure's parameter): it is read through.
+- **An index** may be a reference to a `usize` (`keys[a]` with `a:
+  &usize`, a `sort_by` closure's parameter): it is read through.
 - **References where values are expected, and back.** A place (a
   local, a field) where `&T` is expected is borrowed, as a `self: &T`
   receiver is: `f(it)` for `f(x: &Item)`. A reference to a plain value

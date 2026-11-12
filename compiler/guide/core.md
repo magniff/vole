@@ -88,8 +88,8 @@ h
 from C
 ```
 
-Also: lengths and indices are `usize` (an index may be any integer
-type); overflow panics at -O0, wraps at -O2 (`wrapping_add`: always);
+Also: lengths and indices are `usize` (`v[i as usize]` of an `i64`);
+overflow panics at -O0, wraps at -O2 (`wrapping_add`: always);
 `a as i32` narrows, widening is implicit (`i64::from(a)` is Rust's
 form); `x?`, closures (`|x| x + k`, `move ||` to take what it captures),
 `impl Trait for T`, `T: Trait`, `#[derive(Clone, PartialEq, Debug)]`,
@@ -178,6 +178,7 @@ with its comment: `volec guide --find split_once`.
 | `non-exhaustive match: 'E::B' is not covered` | an arm for it, or `_ =>` |
 | `calling a C function is unsafe` | `unsafe { ... }`; `volec fix --only unsafe` adds them |
 | `expected 'i32', got 'i64'` | `x as i32`: only widening is implicit |
+| `an index is a 'usize', got 'i64'` | `v[i as usize]`, or declare `i: usize` |
 
 Every error has a `help:`; `volec guide errors` has more.
 

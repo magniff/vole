@@ -1912,6 +1912,23 @@ one written, so a place written goes through `deref_mut` (a guard not
 declared `mut` is E0596). *Anchor:* `check/synth_mode.vl: synth_index`.
 Cases `rust_t_index_deref`, `rust_b_err_index_deref_mut`.
 
+**F20.8 (an index is a `usize`, 0.28.0).** The index of `a[i]` and the
+ends of `a[i..j]`, of an array, a slice, a `str` or a Vec, are `usize`
+and nothing else, as rustc's `SliceIndex` impls (E0277, `the type [T]
+cannot be indexed by i64`): no other integer type, and no widening to
+it (FR5 stops here: a `u8` index is converted as an `i64` one is). An
+untyped literal and an open local take `usize` from the index (F18.5).
+The error is `an index is a 'usize', got 'i64'`; its fix (`volec fix
+--suggested`) writes `i as usize`, `(i + 1) as usize`, or, of an index
+that is a cast of an integer, the cast's type (`(b >> 4) as i64` becomes
+`(b >> 4) as usize`). `fix` makes it although an `i64` holds values a
+`usize` does not: such an index is out of bounds before the conversion
+and after it. Until 0.28.0 any integer type indexed (the divergence FR6,
+removed). A reference to a `usize` is still read through (`keys[a]` of
+an `a: &usize`). *Anchor:* `check/synth_mode.vl: check_index_type`,
+`tools/fix/verify.vl: index_operand`. Cases `err_index_usize`,
+`rust_t_index_usize`; the transcript `tests/refactor/indexusize.t`.
+
 **F33.1 (no default values; named arguments stay, 0.28.0).** A parameter
 has no default value: `fn f(a: i64, b: i64 = 2)` is a parse error at the
 `=` (`syntax.default-arg`: "a parameter has no default value; pass it at
@@ -2196,10 +2213,6 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   wider (`x + n` with `x: i64`, `n: i32`); rustc says E0308. The
   translator's output never needs it; a hand-written program may lean on
   it.
-- **FR6 (an index of any integer type).** `a[i]` takes an `i`
-  of any integer type, as MVS's; rustc indexes by `usize` only (E0277,
-  `the type [T] cannot be indexed by i64`). Case
-  `rust_t_iter_for_control` writes `names[k as usize]`.
 
 **Strict (vole rejects what rustc accepts).**
 - **FL1 (deferred inference by the first constraining use; 0.27.4).**

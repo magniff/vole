@@ -275,7 +275,7 @@ fn find(s: &[u8], b: u8) -> i64 {
         }
     }
     while i < s.len() as i64 {
-        if s[i] == b {
+        if s[i as usize] == b {
             return i;
         }
         i += 1;
