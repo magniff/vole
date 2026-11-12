@@ -130,6 +130,36 @@ fn allocator_param_in_scope(pcx: &mut Ctx<Comp>) -> i64 {
     0
 }
 
+// The name of an allocator type parameter of an item that pos is in (a
+// function with its impl's parameters, an impl, a struct, an enum, a
+// trait), the first that is not `skip` (0: the first); 0 when none. By
+// position, as a generic item is also checked without an instance, where
+// the scope names no parameter.
+fn allocator_param_at(pos: i64, skip: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    // UNSAFE: NODES is the checker's raw table of nodes.
+    // SAFETY: k < the program's item count; g, when set, is the item's
+    // Generics node, its children type parameters.
+    unsafe {
+        for k in 0..pcx.nodes[pcx.program as usize].count {
+            let item = child(pcx.program, k, pcx);
+            let g = pcx.nodes[item as usize].g;
+            let kind = pcx.nodes[item as usize].kind;
+            if g == 0 || pos < pcx.nodes[item as usize].start || pos >= pcx.nodes[item as usize].end
+                || (kind != NodeKind::Fn && kind != NodeKind::Impl && kind != NodeKind::Struct
+                    && kind != NodeKind::Enum && kind != NodeKind::Trait) {
+                continue;
+            }
+            for i in 0..pcx.nodes[g as usize].count {
+                let p = child(g, i, pcx);
+                if pcx.nodes[p as usize].a != skip && is_allocator_param(p, pcx) {
+                    return pcx.nodes[p as usize].a;
+                }
+            }
+        }
+    }
+    0
+}
+
 // ---- Rule 2: no default allocator type ----
 
 // The type arguments TSCRATCH[mark..] of `name`<..> (a struct or enum
@@ -173,26 +203,42 @@ pub fn missing_allocator(params: i64, generic: i64, mark: i64, name: i64, pos: i
         err_str(c"' names no allocator: its '", pcx);
         err_sym(pcx.nodes[child(params, generic - 1, pcx) as usize].a, pcx);
         err_str(c"' is written, last", pcx);
-        let inside = allocator_param_in_scope(pcx);
-        if inside != 0 {
+        // (0.28.0) The allocator parameters of the item the type is written
+        // in: one, and the fix writes it (`Vec<T, A>` in `impl<T, A:
+        // Allocator> Ring<T, A>`, not `Gpa`, which the item's callers may
+        // not have); two, and which one is the writer's to say: no fix.
+        let mut inside = allocator_param_at(pos, 0, pcx);
+        let other = if inside != 0 { allocator_param_at(pos, inside, pcx) } else { 0 };
+        if inside == 0 {
+            inside = allocator_param_in_scope(pcx);
+        }
+        if other != 0 || (inside != 0 && missing != 1) {
+            err_help(c"this item is generic over the allocators '", pcx);
+            crate::base::diag::err_help_sym(inside, pcx);
+            err_help(if other != 0 { c"' and '" } else { c"" }, pcx);
+            if other != 0 {
+                crate::base::diag::err_help_sym(other, pcx);
+            }
+            err_help(c"': write the one this '", pcx);
+            crate::base::diag::err_help_sym(name, pcx);
+            err_help(c"' allocates from as its last type argument (`, ", pcx);
+            crate::base::diag::err_help_sym(inside, pcx);
+            err_help(c"`); no fix chooses between them", pcx);
+        } else if inside != 0 {
             err_help_fmt(format_args(
-                "this item is generic over the allocator '{}': write it, or `Gpa`",
+                "this item is generic over the allocator '{}': write it (`, {}`, the fix), or `Gpa`",
+                str::from_utf8(sym_text(inside, pcx)).unwrap(),
                 str::from_utf8(sym_text(inside, pcx)).unwrap()), pcx);
-            // (a type of the program's own whose allocator parameter has the
-            // name of the one in scope, `Bag<T>` in `impl<T, A: Allocator>
-            // Bag<T, A>`: that one, as the impl's fix wrote it; std's
-            // containers, whose parameter is `A` too, are left)
-            if missing == 1 && pcx.nodes[child(params, generic - 1, pcx) as usize].a == inside
-                && !within_std(module_of(params, pcx), pcx) {
-                default_fix(pos, name, count, missing, sym_text(inside, pcx), pcx);
+            if default_fix(pos, name, count, missing, sym_text(inside, pcx), pcx) {
+                err_try_tool(b"fix --only alloc", true, pcx);
             }
         } else {
             err_help(c"the allocator is part of the type: `Gpa` (the type of main's `gpa`), or a generic `A: Allocator`", pcx);
             let own = impl_allocator_at(pos, name, pcx);
-            default_fix(pos, name, count, missing,
+            let _ = default_fix(pos, name, count, missing,
                 if own != 0 && missing == 1 { sym_text(own, pcx) } else { b"Gpa" }, pcx);
+            err_try_tool(b"fix --only alloc", true, pcx);
         }
-        err_try_tool(b"fix --only alloc", true, pcx);
         err_end_soft(pcx);
         pcx.err_kind = saved;
         for _ in 0..missing {
@@ -205,7 +251,8 @@ pub fn missing_allocator(params: i64, generic: i64, mark: i64, name: i64, pos: i
 // The fix of a type written at pos, `name` or `name<..count..>`: `Gpa`
 // for each of the `missing` allocators (`what`: Gpa, or the name of an
 // allocator parameter), as the last type arguments.
-fn default_fix(pos: i64, name: i64, count: i64, missing: i64, what: &[u8], pcx: &mut Ctx<Comp>) {
+fn default_fix(pos: i64, name: i64, count: i64, missing: i64, what: &[u8], pcx: &mut Ctx<Comp>)
+    -> bool {
     // The name as written: a path, its last part `name`.
     let mut i = pos;
     let mut last = pos;
@@ -232,7 +279,7 @@ fn default_fix(pos: i64, name: i64, count: i64, missing: i64, what: &[u8], pcx: 
         }
     }
     if &get_src()[last as usize..end as usize] != sym_text(name, pcx) {
-        return;
+        return false;
     }
     while j < get_src().len() as i64 && get_src()[j as usize] == b' ' {
         j += 1;
@@ -257,18 +304,19 @@ fn default_fix(pos: i64, name: i64, count: i64, missing: i64, what: &[u8], pcx: 
             } else if c == b']' || c == b')' {
                 brackets -= 1;
             } else if (c == b';' && brackets == 0) || c == b'{' {
-                return;
+                return false;
             }
             k += 1;
         }
         if k >= get_src().len() as i64 {
-            return;
+            return false;
         }
         for _ in 0..missing {
             buf_str(text, c", ");
             buf_bytes(text, what);
         }
         err_fix(k, k, buf_slice(text), pcx);
+        true
     } else if count == 0 {
         buf_str(text, c"<");
         buf_bytes(text, what);
@@ -278,6 +326,9 @@ fn default_fix(pos: i64, name: i64, count: i64, missing: i64, what: &[u8], pcx: 
         }
         buf_str(text, c">");
         err_fix(end, end, buf_slice(text), pcx);
+        true
+    } else {
+        false
     }
 }
 
@@ -360,6 +411,9 @@ pub fn impl_missing_allocator(item: i64, self_node: i64, tparams: i64, iparams: 
         pcx.impl_alloc.push(pcx.nodes[item as usize].end);
         pcx.impl_alloc.push(name);
         pcx.impl_alloc.push(pcx.nodes[child(tparams, generic - 1, pcx) as usize].a);
+        // (the kind is this error's only: when the check goes on after it,
+        // in a tool that collects errors, the next ones have their own)
+        let saved = pcx.err_kind;
         pcx.err_kind = c"alloc.default";
         err_begin(pcx.nodes[self_node as usize].start, pcx);
         err_str(c"'", pcx);
@@ -372,7 +426,12 @@ pub fn impl_missing_allocator(item: i64, self_node: i64, tparams: i64, iparams: 
         err_help(c"'", pcx);
         impl_fix(self_node, tparams, iparams, pcx);
         err_try_tool(b"fix --only alloc", true, pcx);
-        crate::base::diag::err_end(pcx)
+        if pcx.errors_as_dump {
+            crate::base::diag::err_end(pcx);
+        }
+        err_end_soft(pcx);
+        pcx.err_kind = saved;
+        crate::base::diag::err_jump(pcx)
     }
 }
 
