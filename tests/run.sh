@@ -184,6 +184,12 @@ export LC_ALL
 # program and compiler would fill target/volec-cache.
 VOLE_CODE_CACHE=${VOLE_CODE_CACHE:-off}
 export VOLE_CODE_CACHE
+# (0.28) And without the tools' cache (tools::query::cache), unless the
+# caller says: `check FILE` writes about 12 MB per program, which nothing
+# removes, and a whole suite left over 80 GB in target/volec-cache. The
+# cases about the cache name their own directory.
+VOLE_CACHE=${VOLE_CACHE:-off}
+export VOLE_CACHE
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 COMPILER="$ROOT/target/volec"
