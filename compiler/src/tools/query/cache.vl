@@ -21,6 +21,14 @@
 // A command that read the program in full writes the cache afterwards (a
 // new file, renamed over the old one), when the program was parsed and
 // imports no C header (the headers' text is not a file of the program).
+//
+// (0.28.0) The directory is bounded: a .bin's header has its time of last
+// use (a hit writes it), and whoever writes a cache then reads the
+// directory and, while its q-KEY.* files pass 1 GB ($VOLE_CACHE_LIMIT, in
+// MB), removes the program least recently used (evict, at the end). A
+// command that only reads never reads the directory. The code cache's
+// packs have the same limit apart (back/codecache/pack.vl); the borrow
+// checker's bck-*.bin is one file of a few KB per compiler and std.
 
 use crate::base::{
     IntVec, buf_byte, buf_bytes, buf_freeze, buf_new, buf_reserve, buf_slice, buf_str, fclose,
@@ -63,8 +71,9 @@ extern "C" {
 // "tachyonq", and the version of the format.
 const MAGIC: i64 = 8174034211981648244;
 // (6, 0.17: the kinds and view summaries; 7, 0.19: the features; 9,
-// 0.25.3: std_item_key's answers; 10, 0.26.2: a file's kind)
-const VERSION: i64 = 10;
+// 0.25.3: std_item_key's answers; 10, 0.26.2: a file's kind; 11, 0.28.0:
+// the time of last use, a header word)
+const VERSION: i64 = 11;
 
 // ---- Words ----
 
@@ -290,8 +299,11 @@ fn cwd() -> *mut u8 {
     }
 }
 
-// The cache's file for root and target, with suffix `ext`.
-fn cache_file(root: *mut u8, target: i64, ext: *mut u8, pcx: &mut Ctx<Comp>) -> *mut u8 {
+// The KEY of the cache of root and target: the hash its files are named by.
+fn cache_key(root: *mut u8, target: i64, pcx: &mut Ctx<Comp>) -> u64 {
+    // UNSAFE: hash_region reads the key buffer's bytes by pointer.
+    // SAFETY: `k` is this call's buffer; its data and len are the bytes
+    // put and put_cstr appended, whole words.
     unsafe {
         let k = buf_new();
         put_cstr(k, root);
@@ -303,7 +315,18 @@ fn cache_file(root: *mut u8, target: i64, ext: *mut u8, pcx: &mut Ctx<Comp>) -> 
         // edit ...` from $PATH, read them as other errors, new ones, and
         // refused the edit; `volec check` printed `try: target/volec ...`)
         put_cstr(k, if pcx.diag_prog == 0 as *mut u8 { c"volec" } else { pcx.diag_prog });
-        let h = hash_region((*get_bufs().add(k as usize)).data, (*get_bufs().add(k as usize)).len);
+        hash_region((*get_bufs().add(k as usize)).data, (*get_bufs().add(k as usize)).len)
+    }
+}
+
+// The cache's file for root and target, with suffix `ext`.
+fn cache_file(root: *mut u8, target: i64, ext: *mut u8, pcx: &mut Ctx<Comp>) -> *mut u8 {
+    // UNSAFE: the path is a C string for fopen and rename, the bytes of a
+    // base buffer (BUFS has no safe view that outlives the call).
+    // SAFETY: `out` is this call's buffer, ended with a NUL; BUFS are not
+    // freed, so the pointer holds for the run.
+    unsafe {
+        let h = cache_key(root, target, pcx);
         let out = buf_new();
         buf_str(out, cache_dir(pcx));
         buf_str(out, c"/q-");
@@ -407,8 +430,8 @@ fn restore(root: *mut u8, target: i64, refs: bool, next: bool, tcx: &mut Tcx<Com
             return false;
         }
         let b = buf_new();
-        if !read_file_if(cache_file(root, target, if next { c".next.bin" } else { c".bin" }, pcx),
-            b) {
+        let bin = cache_file(root, target, if next { c".next.bin" } else { c".bin" }, pcx);
+        if !read_file_if(bin, b) {
             return false;
         }
         // (0.27.7: the read buffer is only read from here on; the files'
@@ -417,9 +440,10 @@ fn restore(root: *mut u8, target: i64, refs: bool, next: bool, tcx: &mut Tcx<Com
         read_words(b, tcx);
         if get(tcx) != MAGIC || get(tcx) != VERSION || get(tcx) != ident(pcx)
             || get(tcx) != tcx.rd_n
-            || get(tcx) != body_hash(b, 5) {
+            || get(tcx) != body_hash(b, USED_WORD + 1) {
             return false;
         }
+        let used = get(tcx);
         if !same(get_str(tcx),
             std::slice::from_raw_parts(root.add((0) as usize),
                 (strlen(root) as i64 - (0)) as usize)) || get(tcx) != target {
@@ -529,6 +553,7 @@ fn restore(root: *mut u8, target: i64, refs: bool, next: bool, tcx: &mut Tcx<Com
         }
         tcx.parsed = true;
         tcx.restored = true;
+        touch(bin, used);
         true
     }
 }
@@ -763,16 +788,14 @@ fn save(root: *mut u8, target: i64, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) {
         }
         let refs_header = (*get_bufs().add(r as usize)).data as *mut i64;
         (*refs_header.add(4)) = body_hash(r, 5);
-        if !write_atomic(r,
-            cache_file(root, target, if next { c".next.refs" } else { c".refs" }, pcx)) {
-            return;
-        }
         let b = buf_new();
         put(b, MAGIC);
         put(b, VERSION);
         put(b, ident(pcx));
         put(b, 0);
         put(b, 0);
+        // (0.28.0) the time of last use (USED_WORD; touch writes it at a hit)
+        put(b, now());
         put_cstr(b, root);
         put(b, target);
         put(b, stamp);
@@ -806,11 +829,18 @@ fn save(root: *mut u8, target: i64, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) {
         // (the number of words, in the header)
         let header = (*get_bufs().add(b as usize)).data as *mut i64;
         (*header.add(3)) = (*get_bufs().add(b as usize)).len / 8;
-        (*header.add(4)) = body_hash(b, 5);
-        if write_atomic(b,
+        (*header.add(4)) = body_hash(b, USED_WORD + 1);
+        // (0.28.0: the .bin first, then the references: a program in the
+        // directory always has a .bin, or one being written, with its time,
+        // for another process's evict. A reader between the two has a miss:
+        // the references are of another text, restore's stamp)
+        if !write_atomic(b,
             cache_file(root, target, if next { c".next.bin" } else { c".bin" }, pcx)) {
-            trace(c"save");
+            return;
         }
+        write_atomic(r, cache_file(root, target, if next { c".next.refs" } else { c".refs" }, pcx));
+        evict(cache_key(root, target, pcx), pcx);
+        trace(c"save");
     }
 }
 
@@ -944,5 +974,257 @@ fn is_alias_at(pos: i64, tcx: &Tcx<Comp>) -> bool {
             i += 2;
         }
         false
+    }
+}
+
+// ---- The bound ----
+
+// The directory's tools' caches (every q-KEY.* file), at most (bytes;
+// $VOLE_CACHE_LIMIT in MB, the code cache's packs' limit too): about 85
+// programs the size of hello (12 MB each, std's tables), 35 the size of
+// the compiler.
+const LIMIT: i64 = 1024 * 1024 * 1024;
+// Where a .bin's header has its time of last use (a word; not in its hash).
+const USED_WORD: i64 = 5;
+
+// UNSAFE: the C library's directory, seek, positioned write and clock
+// calls (the compiler has no std here).
+// SAFETY: opendir's handle goes only to readdir and closedir, once; lseek
+// and pwrite get a descriptor this file opened and a buffer of the length
+// given; time is given null.
+extern "C" {
+    fn opendir(path: *mut u8) -> *mut u8;
+    fn readdir(dir: *mut u8) -> *mut u8;
+    fn closedir(dir: *mut u8) -> i32;
+    fn lseek(fd: i32, offset: i64, whence: i32) -> i64;
+    fn pwrite(fd: i32, buf: *mut u8, n: u64, offset: i64) -> i64;
+    fn time(t: *mut i64) -> i64;
+}
+
+fn now() -> i64 {
+    // UNSAFE: time is C's.
+    // SAFETY: a null argument: the time is only returned.
+    unsafe { time(0 as *mut i64) }
+}
+
+// The limit in bytes: $VOLE_CACHE_LIMIT's megabytes when it is a number.
+fn limit_bytes() -> i64 {
+    // UNSAFE: getenv is C's, its value a C string.
+    // SAFETY: a literal's name; the value is read up to its NUL (the first
+    // byte that is not a digit ends the loop).
+    unsafe {
+        let env = getenv(c"VOLE_CACHE_LIMIT");
+        if env == 0 as *mut u8 || (*env.add(0)) < b'0' || (*env.add(0)) > b'9' {
+            return LIMIT;
+        }
+        let mut mb: i64 = 0;
+        let mut i: i64 = 0;
+        while (*env.add(i as usize)) >= b'0' && (*env.add(i as usize)) <= b'9' && mb < 1 << 32 {
+            mb = mb * 10 + ((*env.add(i as usize)) - b'0') as i64;
+            i += 1;
+        }
+        mb * 1024 * 1024
+    }
+}
+
+fn starts(name: &[u8], at: i64, word: &[u8]) -> bool {
+    if at + word.len() as i64 > name.len() as i64 {
+        return false;
+    }
+    for i in 0..word.len() as i64 {
+        if name[(at + i) as usize] != word[i as usize] {
+            return false;
+        }
+    }
+    true
+}
+
+// What a directory entry is by its name: 0, not a file of this cache; 1,
+// one with the header's time of last use (q-KEY.bin, q-KEY.next.bin); 2,
+// its references (.refs, .next.refs). Either may end in .tmpPID, the
+// file while it is written. KEY is 16 hex digits, `key` its value.
+// Nothing else is ever removed: the whole name is matched.
+fn cache_name(name: &[u8], key: &mut u64) -> i64 {
+    let n = name.len() as i64;
+    if n < 18 || name[0] != b'q' || name[1] != b'-' {
+        return 0;
+    }
+    let mut h: u64 = 0;
+    for i in 2..18 {
+        let c = name[i as usize];
+        if c >= b'0' && c <= b'9' {
+            h = (h << 4) | (c - b'0') as u64;
+        } else if c >= b'a' && c <= b'f' {
+            h = (h << 4) | (c - b'a' + 10) as u64;
+        } else {
+            return 0;
+        }
+    }
+    let mut at: i64 = 18;
+    if starts(name, at, b".next") {
+        at += 5;
+    }
+    let mut kind: i64 = 0;
+    if starts(name, at, b".bin") {
+        kind = 1;
+        at += 4;
+    } else if starts(name, at, b".refs") {
+        kind = 2;
+        at += 5;
+    } else {
+        return 0;
+    }
+    if at < n {
+        if !starts(name, at, b".tmp") || at + 4 == n {
+            return 0;
+        }
+        for i in at + 4..n {
+            if name[i as usize] < b'0' || name[i as usize] > b'9' {
+                return 0;
+            }
+        }
+    }
+    *key = h;
+    kind
+}
+
+// A hit: now is the cache's time of last use, in its header (evict's
+// order). Only into a file of this format: another compiler may have
+// written its own over it since it was read.
+fn touch(path: *mut u8, used: i64) {
+    let mut word: [i64; 1] = [now()];
+    if word[0] == used {
+        return;
+    }
+    // UNSAFE: C's open, read, pwrite and close (a write at an offset, into
+    // a file that may be gone or read-only: nothing then).
+    // SAFETY: path is cache_file's NUL-terminated string; head has the 16
+    // bytes read and word the 8 written; the descriptor is closed once.
+    unsafe {
+        let fd = open(path, 2);
+        if fd < 0 {
+            return;
+        }
+        let mut head: [i64; 2] = [0i64; 2];
+        if read(fd, (&raw mut head[0]) as *mut u8, 16) == 16 && head[0] == MAGIC
+            && head[1] == VERSION {
+            pwrite(fd, (&raw mut word[0]) as *mut u8, 8, USED_WORD * 8);
+        }
+        close(fd);
+    }
+}
+
+// After a cache was written: when the directory's q-KEY.* files pass the
+// limit, the programs least recently used go, each with all its files,
+// until they fit; never the one just written (`own`, its KEY). A program's
+// time is its .bin's header's (0 for one of another format, or with no
+// .bin: those go first). Several processes may do this at once: a file
+// already gone is skipped, and a reader whose file goes has a miss.
+fn evict(own: u64, pcx: &mut Ctx<Comp>) {
+    let limit = limit_bytes();
+    let dir = cache_dir(pcx);
+    // Per file: where its path is in `paths`, its program (an index in
+    // `keys`), its size. Per program: its KEY, its time, its bytes (-1
+    // once removed).
+    let paths = buf_new();
+    let mut files = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+    let mut keys = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+    let mut total: i64 = 0;
+    // UNSAFE: C's directory calls and a struct dirent's name; open, lseek
+    // and read for a file's size and header.
+    // SAFETY: d is opendir's, not null, closed once; an entry's name is a
+    // NUL-terminated string at name_offset() in it, copied before the next
+    // readdir; a path is read at its offset in `paths` right after it was
+    // appended with its NUL; head has the 48 bytes read.
+    unsafe {
+        let d = opendir(dir);
+        if d == 0 as *mut u8 {
+            return;
+        }
+        let at = crate::back::codecache::pack::name_offset();
+        loop {
+            let ent = readdir(d);
+            if ent == 0 as *mut u8 {
+                break;
+            }
+            let name = ent.add(at as usize);
+            let mut key: u64 = 0;
+            let kind = cache_name(std::slice::from_raw_parts(name, strlen(name) as usize),
+                &mut key);
+            if kind == 0 {
+                continue;
+            }
+            let off = (*get_bufs().add(paths as usize)).len;
+            buf_str(paths, dir);
+            buf_byte(paths, b'/');
+            buf_str(paths, name);
+            buf_byte(paths, 0);
+            let fd = open((*get_bufs().add(paths as usize)).data.add(off as usize), 0);
+            if fd < 0 {
+                continue;
+            }
+            let mut size = lseek(fd, 0, 2);
+            if size < 0 {
+                size = 0;
+            }
+            let mut used: i64 = 0;
+            if kind == 1 {
+                let mut head: [i64; 6] = [0i64; 6];
+                lseek(fd, 0, 0);
+                if read(fd, (&raw mut head[0]) as *mut u8, 48) == 48 && head[0] == MAGIC
+                    && head[1] == VERSION {
+                    used = head[USED_WORD as usize];
+                }
+            }
+            close(fd);
+            let mut k: i64 = 0;
+            while k < keys.count && keys.get(k) != key as i64 {
+                k += 3;
+            }
+            if k == keys.count {
+                keys.push(key as i64);
+                keys.push(0);
+                keys.push(0);
+            }
+            if used > keys.get(k + 1) {
+                keys.set(k + 1, used);
+            }
+            keys.set(k + 2, keys.get(k + 2) + size);
+            files.push(off);
+            files.push(k);
+            files.push(size);
+            total += size;
+        }
+        closedir(d);
+    }
+    while total > limit {
+        let mut old: i64 = -1;
+        let mut k: i64 = 0;
+        while k < keys.count {
+            if keys.get(k + 2) >= 0 && keys.get(k) != own as i64
+                && (old < 0 || keys.get(k + 1) < keys.get(old + 1)) {
+                old = k;
+            }
+            k += 3;
+        }
+        if old < 0 {
+            break;
+        }
+        let mut f: i64 = 0;
+        while f < files.count {
+            if files.get(f + 1) == old {
+                // UNSAFE: the path as a C string, from the buffer's bytes.
+                // SAFETY: the offset is one evict appended a path at, with
+                // its NUL; `paths` is not changed after the directory was
+                // read.
+                let path = unsafe {
+                    (*get_bufs().add(paths as usize)).data.add(files.get(f) as usize)
+                };
+                remove_file(path);
+            }
+            f += 3;
+        }
+        total -= keys.get(old + 2);
+        keys.set(old + 2, -1);
     }
 }

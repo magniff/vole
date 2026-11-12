@@ -1735,7 +1735,12 @@ if [ -s "$WORK/failed-cases" ]; then
 fi
 if [ "$RERUNS" != 1 ] && [ -s "$RERUNS" ]; then
     n=$(wc -l <"$RERUNS" | tr -d ' ')
-    echo "lazy std: $n build(s) were made again with std whole (VOLE_STD2_NORERUN=1 shows why; a word or a seed is missing in front/modules/std2lazy.vl); the first: $(grep -o '[^ ]*\.vl' "$RERUNS" | sed 's|.*/||' | head -8 | tr '\n' ' ' | sed 's/ $//')"
+    # (0.28.0) the programs, each once: a program is built by its case and,
+    # in the whole suite, twice more by the fmt suite (as it is and
+    # formatted), so two programs made again on purpose
+    # (rust_f_f15_prim_impl_bound_ok, _unnamed_ok) are six builds
+    progs=$(grep -o '[^ ]*\.vl' "$RERUNS" | sed 's|.*/||' | sort -u)
+    echo "lazy std: $n build(s) of $(echo "$progs" | wc -l | tr -d ' ') program(s) were made again with std whole (VOLE_STD2_NORERUN=1 shows why; a word or a seed is missing in front/modules/std2lazy.vl); the first: $(echo "$progs" | head -8 | tr '\n' ' ' | sed 's/ $//')"
 fi
 if grep -q ' fail$' "$TALLY"; then
     exit 1

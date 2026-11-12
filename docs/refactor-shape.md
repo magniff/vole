@@ -58,14 +58,11 @@ added parameter scale: i64 to crate::geom::area, 2 calls→2 files→+2 -2 lines
 
 - `--add 'x: T = VALUE'`: the parameter, at the end or before parameter
   N (`--at N`, counting from 0, `self` included: a method's first
-  position is 1). (0.15) VALUE is the parameter's default, and the calls
-  are left as they are. The calls get VALUE instead (as written; checked
-  in each caller), as 0.14 did, with `--fill-calls`, for a trait's
-  function (it has no defaults) and before a parameter without a default
-  (defaults are on trailing parameters only): `note refactor.fill-calls`
-  says why (not for --fill-calls). A call that leaves a parameter before
-  x to its default gets `x: VALUE`, among its labelled arguments in
-  order. Without `= VALUE` only when there is no call.
+  position is 1). VALUE is written into every call (as written;
+  checked in each caller): no parameter has a default value (0.28.0;
+  `--fill-calls` is still taken and changes nothing). A call with
+  labelled arguments gets `x: VALUE` among them, in order.
+  Without `= VALUE` only when there is no call.
 - `--remove x`: refused while x is used in a body (`refactor.used`); each
   call loses the argument, given by position or (0.15) by its label;
   a call that leaves x to its default is unchanged (`warning
@@ -474,7 +471,6 @@ as it changes the program through the edit engine (`edit_replace`,
 | `refactor.unchecked` | warning | 0 | calls in code the checker did not see are not changed | |
 | `refactor.range` | error | 1 | extract-function: the lines cut a statement, or are not in FN's body | the whole statements' lines |
 | `refactor.escapes` | error | 1 | extract-function: a return, break, continue, defer or (0.15) `?` leaves the lines; inline: FN returns early or has a `?` | the lines before it; `query show FILE:LINE` |
-| `refactor.fill-calls` | note | 0 | signature --add (0.15): the calls get VALUE, not a default (a trait's function, a later parameter without a default) | |
 | `refactor.results` | error | 1 | extract-function: results NEW cannot give back | `query show FILE:LINE` |
 | `refactor.closure` | error | 1 | extract-function (0.14): a parameter or result of NEW would be a closure, whose type has no name | the lines from the closure's `let`; `query show FILE:LINE` |
 | `refactor.self`, `refactor.receiver` | error | 1 | self in a trait impl's function; a borrowed receiver used as `self` | |
