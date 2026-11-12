@@ -21,15 +21,15 @@ file, one per line, `FILE:LINE:COL: error[KIND] MESSAGE | help: ...`:
 
 ```console
 $ volec check
-main.vl:9:38: error[item.private] 'letter' is private | help: make it public: `pub fn letter` at grades.vl:22:1 | try: volec fix --suggested main.vl
-main.vl:10:14: error[type error] unresolved import 'roster::add_score'
-main.vl:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:20)
-main.vl:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:20)
-main.vl:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:20)
-main.vl:23:19: error[type error] unknown type 'HashMap' | help: add `use std::collections::HashMap;` | try: volec fix --suggested main.vl
-grades.vl:19:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: volec fix --suggested main.vl
-grades.vl:40:17: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: volec fix --only unsafe main.vl
-roster.vl:29:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
+main.vl:8:38: error[item.private] 'letter' is private | help: make it public: `pub fn letter` at grades.vl:21:1 | try: volec fix --suggested main.vl
+main.vl:9:14: error[type error] unresolved import 'roster::add_score'
+main.vl:16:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:19)
+main.vl:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:19)
+main.vl:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:19)
+main.vl:22:19: error[type error] unknown type 'HashMap' | help: add `use std::collections::HashMap;` | try: volec fix --suggested main.vl
+grades.vl:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: volec fix --suggested main.vl
+grades.vl:39:17: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: volec fix --only unsafe main.vl
+roster.vl:28:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
 [exit 1]
 ```
 
@@ -52,7 +52,7 @@ example:
         println("{}", first(&raw const x));
     }
     
-    main.vl:2:5: error[unsafe] dereference of a raw pointer is unsafe
+    main.vl:1:5: error[unsafe] dereference of a raw pointer is unsafe
       help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place)
       try: volec fix --only unsafe main.vl
 ```
@@ -84,12 +84,12 @@ $ volec fix --dry-run
 $ volec fix
 fixed 1 missing import, 1 pub, 1 unsafe block	2 files	+4 -2 lines
 $ volec check
-main.vl:12:14: error[type error] unresolved import 'roster::add_score'
-main.vl:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:20)
-main.vl:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:20)
-main.vl:21:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:20)
-grades.vl:19:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: volec fix --suggested main.vl
-roster.vl:29:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
+main.vl:11:14: error[type error] unresolved import 'roster::add_score'
+main.vl:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:19)
+main.vl:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:19)
+main.vl:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:19)
+grades.vl:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: volec fix --suggested main.vl
+roster.vl:28:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
 [exit 1]
 ```
 
@@ -98,8 +98,8 @@ roster.vl:29:13: error[type error] cannot assign to immutable variable 'count' |
 The item at an error's position is `query show FILE:LINE`:
 
 ```console
-$ volec query show roster.vl:29
-// crate::roster::with_scores	roster.vl:24-33
+$ volec query show roster.vl:28
+// crate::roster::with_scores	roster.vl:23-32
 // How many students have at least `n` scores.
 pub fn with_scores(r: &Roster<Gpa>, n: usize) -> usize {
     let count = 0;
@@ -118,9 +118,9 @@ try: volec --diagnostics=short main.vl -c -o /dev/null
 `FILE:LINE` inside it; OLD must occur exactly once in that item:
 
 ```console
-$ volec edit patch roster.vl:29 --old 'let count' --new 'let mut count' --show
+$ volec edit patch roster.vl:28 --old 'let count' --new 'let mut count' --show
 patched crate::roster::with_scores	roster.vl	+1 -1 lines
-// roster.vl:26
+// roster.vl:25
 26	    let mut count = 0;
 ```
 
@@ -129,13 +129,13 @@ and a `try:` command built from it. Here it shows that the source
 writes the cast without parentheses:
 
 ```console
-$ volec edit patch grades.vl:19 --old 'totl / (scores.len() as i64)' --new 'total / (scores.len() as i64)'
+$ volec edit patch grades.vl:18 --old 'totl / (scores.len() as i64)' --new 'total / (scores.len() as i64)'
 error patch.no-match: OLD 1 is not in crate::grades::average; nearest, line 19: totl / scores.len() as i64
-try: volec edit patch grades.vl:19 --old 'totl / scores.len() as i64' --new 'total / (scores.len() as i64)'
+try: volec edit patch grades.vl:18 --old 'totl / scores.len() as i64' --new 'total / (scores.len() as i64)'
 [exit 1]
-$ volec edit patch grades.vl:19 --old 'totl' --new 'total' --show
+$ volec edit patch grades.vl:18 --old 'totl' --new 'total' --show
 patched crate::grades::average	grades.vl	+1 -1 lines
-// grades.vl:19
+// grades.vl:18
 19	    total / scores.len() as i64
 ```
 
@@ -147,13 +147,13 @@ two-argument `enrol` and no `add_score`.
 
 ```console
 $ volec check
-main.vl:12:14: error[type error] unresolved import 'roster::add_score'
-main.vl:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:20)
-main.vl:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:20)
-main.vl:21:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:20)
+main.vl:11:14: error[type error] unresolved import 'roster::add_score'
+main.vl:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:19)
+main.vl:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:19)
+main.vl:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:19)
 [exit 1]
 $ volec query show roster::enrol
-// crate::roster::enrol	roster.vl:19-22	effects: alloc(Gpa) panic
+// crate::roster::enrol	roster.vl:18-21	effects: alloc(Gpa) panic
 // A student with no scores yet.
 pub fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str) {
     r.students.push(Student { name, scores: Vec::new_in(*r.students.allocator()) });
@@ -190,7 +190,7 @@ $ volec edit apply --show <<'EOF'
 > }
 > EOF
 applied 2 blocks: replaced crate::roster::enrol; inserted after crate::roster::enrol	roster.vl	+16 -3 lines
-// roster.vl:19-34
+// roster.vl:18-33
 19	// A student and their scores so far.
 20	pub fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str, scores: &[i64]) {
 21	    let mut v: Vec<i64, Gpa> = Vec::new_in(*r.students.allocator());
@@ -219,8 +219,8 @@ author's (`// UNSAFE:` and `// SAFETY:` right above).
 ```console
 $ volec check && echo no errors
 no errors
-grades.vl:4:1: warning[unsafe.unjustified] extern block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe grades.vl
-grades.vl:40:17: warning[unsafe.unjustified] unsafe block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe grades.vl
+grades.vl:3:1: warning[unsafe.unjustified] extern block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe grades.vl
+grades.vl:39:17: warning[unsafe.unjustified] unsafe block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe grades.vl
 ok: 0 errors, 2 warnings in main.vl
 $ volec main.vl -o gradebook && ./gradebook
 Ada     95 A  swing  6, with honours

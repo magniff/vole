@@ -6,7 +6,7 @@ crate	syntax018/main.vl	14
 std	<std>	607
 crate::tests	syntax018/main.vl	1
 $ show crate::push Stack Percent
-// crate::push	syntax018/main.vl:20-26	effects: panic
+// crate::push	syntax018/main.vl:19-25	effects: panic
 fn push(s: &mut Stack, x: i64)
     requires s.len < s.max else "push on a full stack"
     ensures s.len == old(s.len) + 1
@@ -14,17 +14,17 @@ fn push(s: &mut Stack, x: i64)
     s.items[s.len as usize] = x;
     s.len += 1;
 }
-// crate::Stack	syntax018/main.vl:11-12
+// crate::Stack	syntax018/main.vl:10-11
 struct Stack { items: [i64; 8], len: i64, max: i64 }
 invariant self.len <= self.max else "a stack holds at most max items"
 // 1 method (with their lines and whole contracts: query items crate::Stack)
 fn size2(&self) -> i64 ensures ...  // impl Sized2 for Stack
-// crate::Percent	syntax018/main.vl:18-18
+// crate::Percent	syntax018/main.vl:17-17
 type Percent = distinct i64 invariant 0 <= self && self <= 100;
 $ def NodeId any_id tests::two
-crate::NodeId	syntax018/main.vl:17:6	type	type NodeId = distinct i64
-crate::any_id	syntax018/main.vl:57:4	fn	fn any_id(n: i64)	effects: none
-crate::tests::two	syntax018/main.vl:65:8	fn	fn two()	effects: none
+crate::NodeId	syntax018/main.vl:16:6	type	type NodeId = distinct i64
+crate::any_id	syntax018/main.vl:56:4	fn	fn any_id(n: i64)	effects: none
+crate::tests::two	syntax018/main.vl:64:8	fn	fn two()	effects: none
 $ refs NodeId
 # syntax018/main.vl
 17:6	def	type NodeId = distinct i64;

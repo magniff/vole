@@ -67,7 +67,7 @@ fit is counted, with the commands that print it:
 
 ```console
 $ volec query context quickest --budget 600
-// crate::route::quickest	route.vl:38-67	effects: alloc(Gpa) panic diverge
+// crate::route::quickest	route.vl:37-66	effects: alloc(Gpa) panic diverge
 pub fn quickest(g: &Graph<Gpa>, from: usize, to: usize, gpa: Gpa) -> Option<Route<Gpa>> {
     let n = size(g);
     let mut best: Vec<i64, Gpa> = Vec::from_elem_in(i64::MAX, n, gpa);
@@ -99,14 +99,14 @@ pub fn quickest(g: &Graph<Gpa>, from: usize, to: usize, gpa: Gpa) -> Option<Rout
     Some(Route { legs: legs_to(&how, from, to, gpa), total: best[to] })
 }
 // calls (15)
-crate::route::ride_cost	route.vl:34:4	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64
-crate::route::legs_to	route.vl:71:4	fn	fn legs_to(how: &Vec<Step, Gpa>, from: usize, to: usize, gpa: Gpa) -> Vec<Leg, Gpa>
-crate::graph::size	graph.vl:25:8	fn	pub fn size(g: &Graph<Gpa>) -> usize
-crate::heap::new_heap	heap.vl:18:8	fn	pub fn new_heap(gpa: Gpa) -> Heap<Gpa>
-crate::heap::is_empty	heap.vl:22:8	fn	pub fn is_empty(h: &Heap<Gpa>) -> bool
-crate::heap::pop	heap.vl:39:8	fn	pub fn pop(h: &mut Heap<Gpa>) -> Option<Entry>
-crate::graph::edges_from	graph.vl:57:8	fn	pub fn edges_from(g: &Graph<Gpa>, i: usize) -> &[Edge]
-crate::heap::push	heap.vl:26:8	fn	pub fn push(h: &mut Heap<Gpa>, e: Entry)
+crate::route::ride_cost	route.vl:33:4	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64
+crate::route::legs_to	route.vl:70:4	fn	fn legs_to(how: &Vec<Step, Gpa>, from: usize, to: usize, gpa: Gpa) -> Vec<Leg, Gpa>
+crate::graph::size	graph.vl:24:8	fn	pub fn size(g: &Graph<Gpa>) -> usize
+crate::heap::new_heap	heap.vl:17:8	fn	pub fn new_heap(gpa: Gpa) -> Heap<Gpa>
+crate::heap::is_empty	heap.vl:21:8	fn	pub fn is_empty(h: &Heap<Gpa>) -> bool
+crate::heap::pop	heap.vl:38:8	fn	pub fn pop(h: &mut Heap<Gpa>) -> Option<Entry>
+crate::graph::edges_from	graph.vl:56:8	fn	pub fn edges_from(g: &Graph<Gpa>, i: usize) -> &[Edge]
+crate::heap::push	heap.vl:25:8	fn	pub fn push(h: &mut Heap<Gpa>, e: Entry)
 <std::vec::Vec as Drop>::drop	<std>:5547:8	method	fn drop(&mut self)
 std::vec::Vec::from_elem_in	<std>:5483:12	method	pub fn from_elem_in(x: T, n: usize, a: A) -> Vec<T, A>
 std::option::Option::unwrap	<std>:2771:12	method	pub fn unwrap(self) -> T requires self.is_some() else "called `Option::unwrap()` on a `None` value"
@@ -122,15 +122,15 @@ The context of `ride_cost` is small enough to print whole:
 
 ```console
 $ volec query context ride_cost
-// crate::route::ride_cost	route.vl:33-36	effects: none
+// crate::route::ride_cost	route.vl:32-35	effects: none
 // What a ride on `e` costs, arriving at its start on `here_line`.
 fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64 {
     if line != here_line { minutes + TRANSFER_MINUTES } else { minutes }
 }
 // uses (1)
-crate::route::TRANSFER_MINUTES	route.vl:11:11	const	pub const TRANSFER_MINUTES: i64 = 5
+crate::route::TRANSFER_MINUTES	route.vl:10:11	const	pub const TRANSFER_MINUTES: i64 = 5
 // callers (1)
-route::quickest	route.vl:55:35	let cost = cur.cost + ride_cost(cur.line, e.minutes, e.line);
+route::quickest	route.vl:54:35	let cost = cur.cost + ride_cost(cur.line, e.minutes, e.line);
 ```
 
 `ride_cost` adds a transfer whenever the ride's line differs from the
@@ -166,9 +166,9 @@ And `query type` gives the type of the expression at a position (here
 `cur`, on line 47, and the `e.minutes` passed to `ride_cost`):
 
 ```console
-$ volec query type route.vl:47:13
+$ volec query type route.vl:46:13
 Entry	cur
-$ volec query type route.vl:55:57
+$ volec query type route.vl:54:57
 i64	e.minutes
 ```
 
@@ -213,7 +213,7 @@ lists the calls by file, `query callers` each call:
 
 ```console
 $ volec query impact ride_cost
-crate::route::ride_cost	route.vl:34:4	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64	effects: none
+crate::route::ride_cost	route.vl:33:4	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64	effects: none
 route.vl	1	0	route::quickest
 total	1	0	1 file
 ```
@@ -223,7 +223,7 @@ One call, in the same module. The fix is one condition, changed by name:
 ```console
 $ volec edit patch ride_cost --old 'if line != here_line' --new 'if here_line != 0 && line != here_line' --show
 patched crate::route::ride_cost	route.vl	+1 -1 lines
-// route.vl:35
+// route.vl:34
 35	    if here_line != 0 && line != here_line { minutes + TRANSFER_MINUTES } else { minutes }
 $ volec main.vl -o transit && ./transit
 Airport -> Museum: 16 min

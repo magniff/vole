@@ -33,7 +33,6 @@ fn main() -> i32 {
     }
     run(c) as i32
 }
-// EDITION: rust
 $ refactor rename Cmd::Move Go
 renamed crate::Cmd::Move to Go	main.vl	+4 -4 lines
 $ check

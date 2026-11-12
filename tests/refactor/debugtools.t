@@ -99,7 +99,7 @@ run: exit 0; stdout 4 lines (target/scratch/probe/main.vl/out)
   | a best 7
   | ###
 ## the values by type: structs field by field, Option, tuples, slices
-% printf '#[derive(Debug)]\nstruct P { x: i64, name: &'"'"'static str }\n\nfn main() -> i32 {\n    let p = P { x: 3, name: "ab" };\n    let o: Option<i64> = Some(2);\n    let t = (1, true);\n    let a = [1, 2, 3];\n    print("{}", p.x);\n    0\n}\n// EDITION: rust\n' > one.vl
+% printf '#[derive(Debug)]\nstruct P { x: i64, name: &'"'"'static str }\n\nfn main() -> i32 {\n    let p = P { x: 3, name: "ab" };\n    let o: Option<i64> = Some(2);\n    let t = (1, true);\n    let a = [1, 2, 3];\n    print("{}", p.x);\n    0\n}\n' > one.vl
 $ probe one.vl:9 p o t '&a[1..]' 'a[0] == a[0]' --root one.vl
 probe one.vl:9 (before `print("{}", p.x);`): 1 time
   #1  p = P { x: 3, name: "ab" }  o = Some(2)  t = (1, true)  &a[1..] = [2, 3]  a[0] == a[0] = true

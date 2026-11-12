@@ -34,7 +34,7 @@ $ edit patch add --old 'a + b' --new 'b + a' --json
 $ undo --json
 {"kind":"output","fields":["undid patched crate::add","main.vl","+1 -1 lines"]}
 ## A compiler error with help and its position; --json anywhere on the line.
-% printf '// Two errors.\nfn main() {\n    let x: i64 = "s\\t";\n    prinln("{}", x);\n}\n// EDITION: rust\n' > bad.vl
+% printf '// Two errors.\nfn main() {\n    let x: i64 = "s\\t";\n    prinln("{}", x);\n}\n' > bad.vl
 $ --json check bad.vl
 {"kind":"diagnostic","severity":"error","code":"type error","file":"bad.vl","line":3,"col":18,"message":"expected 'i64', got '&str'","help":[],"notes":[],"try":[]}
 {"kind":"diagnostic","severity":"error","code":"type error","file":"bad.vl","line":4,"col":5,"message":"undefined variable 'prinln'","help":["did you mean 'println'?"],"notes":[],"try":["volec fix --suggested bad.vl"]}

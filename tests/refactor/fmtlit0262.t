@@ -33,4 +33,3 @@ fn main() {
     let s = "{count} stays text";
     println("{}", s);
 }
-// EDITION: rust

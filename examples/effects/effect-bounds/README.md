@@ -55,10 +55,10 @@ A generic function's effects are its instances': one per closure.
 
 ```console
 $ volec query effects crate::table
-map_values<closure(i64) -> i64 at main.vl:18:27>	none
-partition<closure(&Row) -> bool at main.vl:19:34>	panic
-sort_by_key<closure(&Row) -> i64 at main.vl:20:33>	panic diverge
-each<closure(&Row) -> () at main.vl:22:17>	io panic diverge
+map_values<closure(i64) -> i64 at main.vl:17:27>	none
+partition<closure(&Row) -> bool at main.vl:18:34>	panic
+sort_by_key<closure(&Row) -> i64 at main.vl:19:33>	panic diverge
+each<closure(&Row) -> () at main.vl:21:17>	io panic diverge
 ```
 
 `map_values` is `none` for this closure (its `rows[i]` is in a counted
@@ -72,8 +72,8 @@ $ volec edit patch main --old '|v| v + bonus' --new '|v| {
 >         println("{v}");
 >         v + bonus
 >     }'
-main.vl:18:5: error[effect] the closure for 'F' of 'table::map_values' does io ('println("{v}")' at main.vl:19:9 calls 'std::fmt::println'); 'F: Fn(i64) -> i64 + effects(panic)' allows panic only | help: do only what the bound allows in the closure, or allow 'io' in the bound  [edited: crate::main]
-error edit.breaks: 1 new error; nothing written; the error: main.vl:18:5: the closure for 'F' of 'table::map_values' does io ('println("{v}")' at main.vl:19:9 calls 'std::fmt::println'); 'F: Fn(i64) -> i64 + effects(panic)' allows panic only
+main.vl:17:5: error[effect] the closure for 'F' of 'table::map_values' does io ('println("{v}")' at main.vl:18:9 calls 'std::fmt::println'); 'F: Fn(i64) -> i64 + effects(panic)' allows panic only | help: do only what the bound allows in the closure, or allow 'io' in the bound  [edited: crate::main]
+error edit.breaks: 1 new error; nothing written; the error: main.vl:17:5: the closure for 'F' of 'table::map_values' does io ('println("{v}")' at main.vl:18:9 calls 'std::fmt::println'); 'F: Fn(i64) -> i64 + effects(panic)' allows panic only
 try: volec edit patch main --old '|v| v + bonus' --new '|v| {
         println("{v}");
         v + bonus
@@ -94,8 +94,8 @@ program.
 
 ```console
 $ volec edit patch main --old '|r| r.value >= 20' --new "|r| r.name.as_bytes()[0] == b'a'"
-main.vl:19:13: error[effect] the closure for 'F' of 'table::partition' may panic ('r.name.as_bytes()[0]' at main.vl:19:38 is a checked index); 'F: Fn(&Row) -> bool + effects()' allows none only | help: do only what the bound allows in the closure, or allow 'panic' in the bound  [edited: crate::main]
-error edit.breaks: 1 new error; nothing written; the error: main.vl:19:13: the closure for 'F' of 'table::partition' may panic ('r.name.as_bytes()[0]' at main.vl:19:38 is a checked index); 'F: Fn(&Row) -> bool + effects()' allows none only
+main.vl:18:13: error[effect] the closure for 'F' of 'table::partition' may panic ('r.name.as_bytes()[0]' at main.vl:18:38 is a checked index); 'F: Fn(&Row) -> bool + effects()' allows none only | help: do only what the bound allows in the closure, or allow 'panic' in the bound  [edited: crate::main]
+error edit.breaks: 1 new error; nothing written; the error: main.vl:18:13: the closure for 'F' of 'table::partition' may panic ('r.name.as_bytes()[0]' at main.vl:18:38 is a checked index); 'F: Fn(&Row) -> bool + effects()' allows none only
 try: volec edit patch main --old '|r| r.value >= 20' --new '|r| r.name.as_bytes()[0] == b'a'' --no-check
 [exit 1]
 ```
@@ -105,7 +105,7 @@ try: volec edit patch main --old '|r| r.value >= 20' --new '|r| r.name.as_bytes(
 ```console
 $ volec edit patch main --old '|r| r.value >= 20' --new "|r| r.name.as_bytes().first().copied() == Some(b'a')" --show
 patched crate::main	main.vl	+1 -1 lines
-// main.vl:19
+// main.vl:18
 19	    let n = partition(&mut rows, |r| r.name.as_bytes().first().copied() == Some(b'a'));
 $ volec main.vl -o table && ./table
 alan      46

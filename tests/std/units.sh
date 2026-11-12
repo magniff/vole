@@ -34,7 +34,6 @@ fi
 # order of the modules.
 mkdir -p "$T/multi"
 cat > "$T/multi/main.vl" <<'EOF'
-// EDITION: rust
 mod util;
 
 mod inner {
@@ -49,13 +48,11 @@ fn main(gpa: Gpa) {
 }
 EOF
 cat > "$T/multi/util.vl" <<'EOF'
-// EDITION: rust
 pub fn total(v: &[i64]) -> i64 {
     v.iter().sum()
 }
 EOF
 cat > "$T/hello.vl" <<'EOF'
-// EDITION: rust
 fn main() {
     println("hello");
 }

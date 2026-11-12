@@ -62,7 +62,7 @@ $ volec query refs Gpa --in crate::markup | grep inline
 37:40	type	markup::inline	fn inline(text: &str, out: &mut String<Gpa>) {
 $ volec query effects markup::inline --why 'alloc(Gpa)' | head -2
 crate::markup::inline	alloc(Gpa) panic diverge
-  'out.push_str(if code { "</code>" } else { "<..' at markup.vl:42:13 calls 'String::push_str'
+  'out.push_str(if code { "</code>" } else { "<..' at markup.vl:41:13 calls 'String::push_str'
 ```
 
 `inline` appends to a `String<Gpa>` it is given, and a String grows
@@ -87,12 +87,12 @@ $ cat > steps.txt <<'EOF'
 > refactor signature markup::render --type gpa '&Arena<Gpa>'
 > EOF
 $ volec refactor --script steps.txt --dry-run | grep ': error'
-main.vl:11:40: error[type error] expected '&Arena<Gpa>', got '&Gpa'  [edited: crate::main]
-markup.vl:12:5: error[type error] the trait 'FromIteratorIn<&str, &Arena<Gpa>>' is not implemented for 'Vec<&str, Gpa>' | help: required by the bound 'B: FromIteratorIn<&str, &Arena<Gpa>>' of 'Split::collect_in'  [edited: crate::markup::lines]
-markup.vl:18:40: error[type error] expected 'Gpa', got '&Arena<Gpa>'  [edited: crate::markup::slug]
-markup.vl:57:58: error[type error] expected 'Gpa', got '&Arena<Gpa>'  [edited: crate::markup::headings]
-markup.vl:68:41: error[type error] expected 'Gpa', got '&Arena<Gpa>'  [edited: crate::markup::render]
-warning edit.breaks: 5 new errors (dry run); the first: main.vl:11:40: expected '&Arena<Gpa>', got '&Gpa'
+main.vl:10:40: error[type error] expected '&Arena<Gpa>', got '&Gpa'  [edited: crate::main]
+markup.vl:11:5: error[type error] the trait 'FromIteratorIn<&str, &Arena<Gpa>>' is not implemented for 'Vec<&str, Gpa>' | help: required by the bound 'B: FromIteratorIn<&str, &Arena<Gpa>>' of 'Split::collect_in'  [edited: crate::markup::lines]
+markup.vl:17:40: error[type error] expected 'Gpa', got '&Arena<Gpa>'  [edited: crate::markup::slug]
+markup.vl:56:58: error[type error] expected 'Gpa', got '&Arena<Gpa>'  [edited: crate::markup::headings]
+markup.vl:67:41: error[type error] expected 'Gpa', got '&Arena<Gpa>'  [edited: crate::markup::render]
+warning edit.breaks: 5 new errors (dry run); the first: main.vl:10:40: expected '&Arena<Gpa>', got '&Gpa'
 ```
 
 The errors are the rest of the plan: the types that name `Gpa` (a
@@ -173,8 +173,8 @@ reset is an error, and nothing is written:
 ```console
 $ volec edit patch main --old 'print("{}", markup::render(doc, &arena));' --new 'let html = markup::render(doc, &arena);' --old '        arena.reset();' --new '        arena.reset();
 >         print("{html}");'
-main.vl:17:9: error[borrowck.conflict] cannot borrow 'arena' as mutable because it is also borrowed as immutable (borrowed at main.vl:16:40) | help: use the shared borrow before the mutable one, or take it again after  [edited: crate::main]
-error edit.breaks: 1 new error; nothing written; the error: main.vl:17:9: cannot borrow 'arena' as mutable because it is also borrowed as immutable (borrowed at main.vl:16:40)
+main.vl:16:9: error[borrowck.conflict] cannot borrow 'arena' as mutable because it is also borrowed as immutable (borrowed at main.vl:15:40) | help: use the shared borrow before the mutable one, or take it again after  [edited: crate::main]
+error edit.breaks: 1 new error; nothing written; the error: main.vl:16:9: cannot borrow 'arena' as mutable because it is also borrowed as immutable (borrowed at main.vl:15:40)
 try: volec edit patch main --old 'print("{}", markup::render(doc, &arena));' --new 'let html = markup::render(doc, &arena);' --old '        arena.reset();' --new '        arena.reset();
         print("{html}");' --no-check
 [exit 1]
@@ -215,7 +215,7 @@ checked on every build:
 $ volec edit patch markup::render --old 'pub fn render' --new '#[effects(alloc(Arena<Gpa>), panic, diverge)]
 > pub fn render' --show
 patched crate::markup::render	markup.vl	+1 -0 lines
-// markup.vl:68
+// markup.vl:67
 68	#[effects(alloc(Arena<Gpa>), panic, diverge)]
 ```
 
@@ -225,8 +225,8 @@ guards the whole module (`diverge` is the loops over the text). A debugging prin
 ```console
 $ volec edit patch markup::slug --old '    let mut dash = false;' --new '    eprintln("slug of {title}");
 >     let mut dash = false;'
-markup.vl:70:5: error[effect] 'markup::render' is #[effects(alloc(Arena<Gpa>), panic, diverge)], but it does io: 'headings(ls.as_slice(), &arena)' at markup.vl:73:14 calls 'markup::headings' | help: return the data and let the caller print it, or add 'io' to #[effects(alloc(Arena<Gpa>), panic, diverge)] | try: volec query effects markup::render --why io  [in crate::markup::render]
-error edit.breaks: 1 new error (1 in crate::markup::render, which the edit does not change); nothing written; the error: markup.vl:70:5: 'markup::render' is #[effects(alloc(Arena<Gpa>), panic, diverge)], but it does io: 'headings(ls.as_slice(), &arena)' at markup.vl:73:14 calls 'markup::headings'
+markup.vl:69:5: error[effect] 'markup::render' is #[effects(alloc(Arena<Gpa>), panic, diverge)], but it does io: 'headings(ls.as_slice(), &arena)' at markup.vl:72:14 calls 'markup::headings' | help: return the data and let the caller print it, or add 'io' to #[effects(alloc(Arena<Gpa>), panic, diverge)] | try: volec query effects markup::render --why io  [in crate::markup::render]
+error edit.breaks: 1 new error (1 in crate::markup::render, which the edit does not change); nothing written; the error: markup.vl:69:5: 'markup::render' is #[effects(alloc(Arena<Gpa>), panic, diverge)], but it does io: 'headings(ls.as_slice(), &arena)' at markup.vl:72:14 calls 'markup::headings'
 note edit.together: change crate::markup::render in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
 try: volec query show crate::markup::render
 try: volec edit patch markup::slug --old '    let mut dash = false;' --new '    eprintln("slug of {title}");

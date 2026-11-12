@@ -137,7 +137,6 @@ BEGIN {
     } else {
         print "// A random program of divisions by constants (tests/fuzz/gendiv.awk, seed " seed ")."
     }
-    print "// EDITION: rust"
     print "extern \"C\" {"
     print "    fn printf(format: *const u8, ...) -> i32;"
     print "}"

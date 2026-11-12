@@ -8,7 +8,7 @@ $ items crate
 36	static	embed wgsl FILL from "shaders/fill.wgsl"
 38	fn	fn main() -> i32
 $ show SIM
-// crate::SIM	embedwgsl/main.vl:17-34
+// crate::SIM	embedwgsl/main.vl:16-33
 embed wgsl SIM {
     @group(0) @binding(0) var<storage, read_write> cells: array<u32>;
 
@@ -39,7 +39,7 @@ $ refs SIM.step
 31:8	def	fn step(@builtin(global_invocation_id) id: vec3<u32>) {
 40:36	read	main	println("{} {}", SIM.init, SIM.step);
 $ def FILL
-crate::FILL	embedwgsl/main.vl:36:12	static	embed wgsl FILL from "shaders/fill.wgsl"
+crate::FILL	embedwgsl/main.vl:35:12	static	embed wgsl FILL from "shaders/fill.wgsl"
 ## (0.26.2) the file form's file is a file of the program: grep lists its
 ## lines, by WGSL's rules, and FILL.fill is defined in it.
 $ grep workgroup_size

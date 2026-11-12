@@ -6,20 +6,20 @@
 ## a range's end, and of an index that is a cast of an integer the
 ## cast's own type.
 $ check
-main.vl:3:9: error[type error] an index is a 'usize', got 'i64' | help: indexing takes a usize alone, as Rust's (no other integer type, no widening): convert it, or give the variable the type usize where it is declared | try: (b >> 4) as usize | try: volec fix --suggested main.vl
-main.vl:8:18: error[type error] an index is a 'usize', got 'i64' | help: indexing takes a usize alone, as Rust's (no other integer type, no widening): convert it, or give the variable the type usize where it is declared | try: from as usize | try: volec fix --suggested main.vl
-main.vl:11:14: error[type error] an index is a 'usize', got 'i32' | help: indexing takes a usize alone, as Rust's (no other integer type, no widening): convert it, or give the variable the type usize where it is declared | try: n as usize | try: volec fix --suggested main.vl
-main.vl:18:27: error[type error] an index is a 'usize', got 'u8' | help: indexing takes a usize alone, as Rust's (no other integer type, no widening): convert it, or give the variable the type usize where it is declared | try: k as usize | try: volec fix --suggested main.vl
+main.vl:2:9: error[type error] an index is a 'usize', got 'i64' | help: indexing takes a usize alone, as Rust's (no other integer type, no widening): convert it, or give the variable the type usize where it is declared | try: (b >> 4) as usize | try: volec fix --suggested main.vl
+main.vl:7:18: error[type error] an index is a 'usize', got 'i64' | help: indexing takes a usize alone, as Rust's (no other integer type, no widening): convert it, or give the variable the type usize where it is declared | try: from as usize | try: volec fix --suggested main.vl
+main.vl:10:14: error[type error] an index is a 'usize', got 'i32' | help: indexing takes a usize alone, as Rust's (no other integer type, no widening): convert it, or give the variable the type usize where it is declared | try: n as usize | try: volec fix --suggested main.vl
+main.vl:17:27: error[type error] an index is a 'usize', got 'u8' | help: indexing takes a usize alone, as Rust's (no other integer type, no widening): convert it, or give the variable the type usize where it is declared | try: k as usize | try: volec fix --suggested main.vl
 [exit 1]
 $ fix --suggested --show
 fixed 5 suggested fixes	main.vl	+4 -4 lines
-// main.vl:3
+// main.vl:2
 3	    hex[(b >> 4) as usize]
-// main.vl:8
+// main.vl:7
 8	    for x in &xs[from as usize..] {
-// main.vl:11
+// main.vl:10
 11	    sum + xs[n as usize] + xs[(from + 1) as usize]
-// main.vl:18
+// main.vl:17
 18	    println("{} {} {}", a[k as usize], digit(b"0123456789abcdef", 0x4f), wide);
 $ check
 ok: 0 errors in main.vl

@@ -43,7 +43,6 @@ fn main(gpa: Gpa) {
     print("{} ", t.1);
     println("{}", xs.len());
 }
-// EDITION: rust
 % cat shapes/mod.vl
 use std::mem;
 

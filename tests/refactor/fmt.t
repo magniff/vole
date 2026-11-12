@@ -52,7 +52,6 @@ fn main() -> i32 {
     if total != 2469 || s.len() != 18 { return 1; }
     0
 }
-// EDITION: rust
 % cat util.vl
 #[derive(Clone, Copy)] pub struct Pair<T> { pub first: T, pub second: T }
 #[derive(Clone, Copy)] pub enum Kind { Small, Large(i64) }

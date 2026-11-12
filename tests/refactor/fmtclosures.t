@@ -77,6 +77,5 @@ fn main() -> i32 {
     let neg = |&x| -x;
     0
 }
-// EDITION: rust
 ## A second time: nothing to do (the layout is a fixpoint).
 $ fmt --check

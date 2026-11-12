@@ -58,5 +58,4 @@ fn main() {
     println("the first value is {x} and the second is {} at last",
         scale(x, b: y, c: x * y + 1000000));
 }
-// EDITION: rust
 $ fmt --check

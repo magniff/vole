@@ -277,7 +277,6 @@ fn main() -> i32 {
     let b = sum_to(4);
     if a + b == 20 { 0 } else { 1 }
 }
-// EDITION: rust
 % cat calc.vl
 // Arithmetic helpers: clamp and sum_to,
 // patched by tests/refactor/patch.t.

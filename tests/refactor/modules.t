@@ -469,7 +469,6 @@ index 73f384a..f47b72c 100644
 +    let n = twice(area(p)) + crate::figures::shapes::perimeter(p) + util::LIMIT + p.sum();
      if n == 127 { 0 } else { 1 }
  }
- // EDITION: rust
 $ main.vl -o prog
 ok: built prog
 % ./prog; echo "exit $?"
@@ -763,7 +762,6 @@ index 73f384a..f47b72c 100644
 +    let n = twice(area(p)) + crate::figures::shapes::perimeter(p) + util::LIMIT + p.sum();
      if n == 127 { 0 } else { 1 }
  }
- // EDITION: rust
 % cat figures/shapes.vl
 // Shapes made of points.
 

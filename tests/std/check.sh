@@ -48,7 +48,7 @@ case "$C" in /*) ;; *) C="$(pwd)/$C" ;; esac
 T=$(mktemp -d "${TMPDIR:-/tmp}/std2check.XXXXXX")
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/p"
-printf '// EDITION: rust\nfn main() {}\n' > "$T/p/main.vl"
+printf 'fn main() {}\n' > "$T/p/main.vl"
 (cd "$T/p" && "$C" --edition rust --std2-check --max-errors=0 main.vl -c -o "$T/p/main.o") \
     > "$T/first.out" 2> "$T/first.err"
 tally=$(grep '^std2-check: ' "$T/first.out" | tail -1)

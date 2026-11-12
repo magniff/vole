@@ -6,7 +6,7 @@ $ effects crate syntax016/main.vl
 crate::out_write	io
 crate::labs	none
 <crate::Square as Shape>::area	none
-apply<closure(i64) -> i64 at syntax016/main.vl:48:32>	none
+apply<closure(i64) -> i64 at syntax016/main.vl:47:32>	none
 crate::grow_by_one	alloc(Gpa) panic diverge
 crate::main	alloc(Gpa) io panic diverge unsafe
 $ effects crate --has io syntax016/main.vl
@@ -14,7 +14,7 @@ crate::out_write	io
 crate::main	alloc(Gpa) io panic diverge unsafe
 $ effects grow_by_one --why alloc syntax016/main.vl
 crate::grow_by_one	alloc(Gpa) panic diverge
-  'v.push(1)' at syntax016/main.vl:40:5 grows a Vec<i64, Gpa>
+  'v.push(1)' at syntax016/main.vl:39:5 grows a Vec<i64, Gpa>
   'self.grow_one()' at <std>:5064:13 calls 'Vec::grow_one'
   'self.reserve(1)' at <std>:5083:9 grows a Vec<i64, Gpa>
   'the body, after its contract' at <std>:5026:9 grows a Vec<i64, Gpa>
@@ -31,4 +31,4 @@ $ effects Pair syntax016/main.vl
 note query.empty: no function among the names
 [exit 1]
 $ def grow_by_one syntax016/main.vl
-crate::grow_by_one	syntax016/main.vl:39:4	fn	fn grow_by_one(v: &mut Vec<i64, Gpa>)	effects: alloc(Gpa) panic diverge
+crate::grow_by_one	syntax016/main.vl:38:4	fn	fn grow_by_one(v: &mut Vec<i64, Gpa>)	effects: alloc(Gpa) panic diverge

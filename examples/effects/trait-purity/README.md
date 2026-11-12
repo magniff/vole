@@ -80,8 +80,8 @@ $ volec edit apply <<'EOF'
 >         self.word.text.cmp(other.word.text)
 >     }
 > EOF
-main.vl:58:5: error[effect] 'Count::cmp' implements 'Ord::cmp', which is #[pure], but it touches a static mut or a C static (static): 'COMPARES' at main.vl:61:18 is a static's (static) | help: pass the state in as a parameter, or remove #[pure] (the trait's) | try: volec query effects Count::cmp --why static  [edited: <crate::Count as Ord>::cmp]
-error edit.breaks: 1 new error; nothing written; the error: main.vl:58:5: 'Count::cmp' implements 'Ord::cmp', which is #[pure], but it touches a static mut or a C static (static): 'COMPARES' at main.vl:61:18 is a static's (static)
+main.vl:57:5: error[effect] 'Count::cmp' implements 'Ord::cmp', which is #[pure], but it touches a static mut or a C static (static): 'COMPARES' at main.vl:60:18 is a static's (static) | help: pass the state in as a parameter, or remove #[pure] (the trait's) | try: volec query effects Count::cmp --why static  [edited: <crate::Count as Ord>::cmp]
+error edit.breaks: 1 new error; nothing written; the error: main.vl:57:5: 'Count::cmp' implements 'Ord::cmp', which is #[pure], but it touches a static mut or a C static (static): 'COMPARES' at main.vl:60:18 is a static's (static)
 try: volec edit apply --no-check
 [exit 1]
 ```
@@ -98,9 +98,9 @@ A debugging print in `eq`:
 ```console
 $ volec edit patch Word::eq --old '        if a.len() != b.len() {' --new '        println("comparing {} and {}", self.text, other.text);
 >         if a.len() != b.len() {'
-main.vl:32:5: error[effect] 'Word::eq' implements 'PartialEq::eq', which is #[pure], but it does io: 'println("comparing {} and {}", self.text, ot..' at main.vl:35:9 calls 'std::fmt::println' | help: return the data and let the caller print it, or remove #[pure] (the trait's) | try: volec query effects Word::eq --why io  [edited: <crate::Word as PartialEq>::eq]
-main.vl:52:10: error[effect] 'Count::eq' implements 'PartialEq::eq', which is #[pure], but it does io: 'word: Word<'a>' at main.vl:53:20 calls 'Word::eq' | help: return the data and let the caller print it, or remove #[pure] (the trait's) | try: volec query effects Count::eq --why io
-error edit.breaks: 2 new errors; nothing written; the first in the edited text: main.vl:32:5: 'Word::eq' implements 'PartialEq::eq', which is #[pure], but it does io: 'println("comparing {} and {}", self.text, ot..' at main.vl:35:9 calls 'std::fmt::println'
+main.vl:31:5: error[effect] 'Word::eq' implements 'PartialEq::eq', which is #[pure], but it does io: 'println("comparing {} and {}", self.text, ot..' at main.vl:34:9 calls 'std::fmt::println' | help: return the data and let the caller print it, or remove #[pure] (the trait's) | try: volec query effects Word::eq --why io  [edited: <crate::Word as PartialEq>::eq]
+main.vl:51:10: error[effect] 'Count::eq' implements 'PartialEq::eq', which is #[pure], but it does io: 'word: Word<'a>' at main.vl:52:20 calls 'Word::eq' | help: return the data and let the caller print it, or remove #[pure] (the trait's) | try: volec query effects Count::eq --why io
+error edit.breaks: 2 new errors; nothing written; the first in the edited text: main.vl:31:5: 'Word::eq' implements 'PartialEq::eq', which is #[pure], but it does io: 'println("comparing {} and {}", self.text, ot..' at main.vl:34:9 calls 'std::fmt::println'
 try: volec edit patch Word::eq --old '        if a.len() != b.len() {' --new '        println("comparing {} and {}", self.text, other.text);
         if a.len() != b.len() {' --no-check
 [exit 1]

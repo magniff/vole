@@ -18,7 +18,7 @@ function rnd(n) { return int(rand() * n) }
 
 BEGIN {
     srand(seed)
-    print "// EDITION: rust\nextern \"C\" {\n    fn printf(f: *const u8, ...) -> i32;\n}\n"
+    print "extern \"C\" {\n    fn printf(f: *const u8, ...) -> i32;\n}\n"
     nf = 6
     for (f = 0; f < nf; f++) {
         n = 8 + rnd(60)

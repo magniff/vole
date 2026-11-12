@@ -86,7 +86,6 @@ fn main() {
 }
 EOF
 cat >bss.vl <<'EOF'
-// EDITION: rust
 static mut DATA: [u8; 20000] = [1; 20000];
 static mut NAMES: [&str; 4] = ["a", "b", "c", "d"];
 static mut ZEROS: [u8; 100000] = [0; 100000];

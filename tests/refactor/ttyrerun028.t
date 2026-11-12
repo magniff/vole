@@ -4,7 +4,7 @@
 ## second run took itself for a volec inside a volec).
 % sh tty.sh "$COMPILER" bad.vl -o bad | cat -v | sed 's/in [0-9.]*s/in Ts/'
 ^[[1;31merror[type error]^[[0m^[[1m: expected 'i32', got '&str'^[[0m
- ^[[1;34m-->^[[0m bad.vl:3:18
+ ^[[1;34m-->^[[0m bad.vl:2:18
   ^[[1;34m|^[[0m
 ^[[1;34m3 |^[[0m     let x: i32 = "a";
   ^[[1;34m|^[[0m                  ^[[1;31m^^^^[[0m
@@ -12,7 +12,7 @@
       ^[[1;31mFailed^[[0m bad: 1 error in Ts
 % sh tty.sh "$COMPILER" --color=never bad.vl -o bad
 error[type error]: expected 'i32', got '&str'
- --> bad.vl: line 3, column 18
+ --> bad.vl: line 2, column 18
 $ bad.vl -o bad
-bad.vl:3:18: error[type error] expected 'i32', got '&str'
+bad.vl:2:18: error[type error] expected 'i32', got '&str'
 [exit 1]

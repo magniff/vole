@@ -216,7 +216,7 @@ case noalloc in
 *"$FILTER"*)
     why="$WORK/noalloc.why"
     : >"$why"
-    printf '// EDITION: rust\nuse std::gpu;\nfn main(gpa: Gpa) {\n    let _i = gpu::Instance::new_in(gpa);\n}\n' >"$WORK/noalloc.vl"
+    printf 'use std::gpu;\nfn main(gpa: Gpa) {\n    let _i = gpu::Instance::new_in(gpa);\n}\n' >"$WORK/noalloc.vl"
     for f in std::gpu::Device::encoder std::gpu::Device::bind_group std::gpu::Encoder::compute_pass std::gpu::Encoder::render_pass \
              std::gpu::Encoder::copy_buffer std::gpu::Encoder::copy_texture_to_buffer std::gpu::Encoder::finish \
              std::gpu::ComputePass::set_pipeline std::gpu::ComputePass::set_bind_group std::gpu::ComputePass::dispatch \

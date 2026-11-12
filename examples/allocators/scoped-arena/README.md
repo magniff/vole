@@ -121,7 +121,6 @@ cannot be the scope's value:
 
 ```console
 $ cat > escape.vl <<'EOF'
-> // EDITION: rust
 > use std::alloc::arena_scope;
 >
 > fn main(gpa: Gpa) -> i32 {
@@ -137,7 +136,7 @@ $ cat > escape.vl <<'EOF'
 > }
 > EOF
 $ volec check escape.vl
-escape.vl:6:21: error[borrowck.outlives] lifetime may not live long enough: the lifetime of the closure's parameter 'a' is only the call's, but it flows where a lifetime of the closure's signature, from outside it is required, which lasts longer | help: keep a copy of the value instead of the reference (`*p`, `.clone()`); a closure's result borrows from its parameter only when the bound it is passed for says so (`Fn(&T) -> &T`)
+escape.vl:5:21: error[borrowck.outlives] lifetime may not live long enough: the lifetime of the closure's parameter 'a' is only the call's, but it flows where a lifetime of the closure's signature, from outside it is required, which lasts longer | help: keep a copy of the value instead of the reference (`*p`, `.clone()`); a closure's result borrows from its parameter only when the bound it is passed for says so (`Fn(&T) -> &T`)
 [exit 1]
 ```
 
@@ -156,7 +155,6 @@ it views, which is dropped when the scope's closure returns:
 
 ```console
 $ cat > view.vl <<'EOF'
-> // EDITION: rust
 > use std::alloc::arena_scope;
 >
 > fn main(gpa: Gpa) -> i32 {
@@ -172,8 +170,8 @@ $ cat > view.vl <<'EOF'
 > }
 > EOF
 $ volec check view.vl
-view.vl:5:39: error[borrowck.return_local] a reference to 'v', a local of this function, escapes it (borrowed at view.vl:10:9) | help: return an owned value, or borrow from a parameter
-view.vl:6:21: error[borrowck.outlives] lifetime may not live long enough: the lifetime of the closure's parameter 'a' is only the call's, but it flows where a lifetime of the closure's signature, from outside it is required, which lasts longer | help: keep a copy of the value instead of the reference (`*p`, `.clone()`); a closure's result borrows from its parameter only when the bound it is passed for says so (`Fn(&T) -> &T`)
+view.vl:4:39: error[borrowck.return_local] a reference to 'v', a local of this function, escapes it (borrowed at view.vl:9:9) | help: return an owned value, or borrow from a parameter
+view.vl:5:21: error[borrowck.outlives] lifetime may not live long enough: the lifetime of the closure's parameter 'a' is only the call's, but it flows where a lifetime of the closure's signature, from outside it is required, which lasts longer | help: keep a copy of the value instead of the reference (`*p`, `.clone()`); a closure's result borrows from its parameter only when the bound it is passed for says so (`Fn(&T) -> &T`)
 [exit 1]
 ```
 

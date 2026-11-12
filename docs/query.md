@@ -55,9 +55,9 @@ edit, refactor, fix, check, probe, test; `tools/query/roots.vl`):
   (a `mod NAME;` of a main.vl above it declares it) is that program's
   main.vl, and `query items FILE` lists that module.
 - With no ROOT, a `FILE` or `FILE:LINE` argument of another program than
-  the default one names it: `query context examples/nes/check.vl:233`,
+  the default one names it: `query context examples/nes/check.vl:232`,
   `edit patch examples/nes/check.vl --old A --new B --all` and `probe
-  examples/nes/check.vl:235 x -- --check` work from the root of the
+  examples/nes/check.vl:234 x -- --check` work from the root of the
   tree. Their `try:` lines then say `--root examples/nes/main.vl`.
 - A NAME the default program does not define, with no ROOT and no
   `$VOLE_ROOT`, is looked for in the other programs under the current
@@ -809,8 +809,8 @@ not, and where there is no program at all (a directory without
 (`compiler/std/*.vl`, found from the current directory or one of the
 three above it) and are the std built into the compiler, std's
 positions are those files' lines: `query def std::trim` prints
-`compiler/std/io.vl:102:8`, not `<std>:2075:8`; a FILE:LINE in one of
-them (`query show compiler/std/io.vl:102`, `--in
+`compiler/std/io.vl:101:8`, not `<std>:2075:8`; a FILE:LINE in one of
+them (`query show compiler/std/io.vl:101`, `--in
 compiler/std/io.vl`) reads std from its files. Elsewhere std is the
 compiler's text, `<std>`. The edits of std items: refactor.md, "Editing
 std by name".
@@ -828,7 +828,7 @@ its module, its file's first.
 ```
 $ volec query similar std::trim --limit 1
 // 1 of 135 fns like std::trim, nearest first; a new one beside it: volec edit insert --after std::trim < new.vl
-// std::is_digit→compiler/std/io.vl:96-99→effects: none
+// std::is_digit→compiler/std/io.vl:95-98→effects: none
 ...
 ```
 

@@ -38,5 +38,4 @@ fn main(gpa: Gpa) {
     let p: Pair<i64> = Pair { a: 1i64, b: 2i64 };
     println("{}", apply(|x| x + 1, |x| x, p.a) + v.len() as i64);
 }
-// EDITION: rust
 $ fmt --check

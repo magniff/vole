@@ -25,7 +25,6 @@ fn main(gpa: Gpa) {
     grow(&mut v);
     println("{}", middle(2, 10, 0) + (v.len() as i64) * 2 + util::one());
 }
-// EDITION: rust
 pub fn one() -> i64 {
     1
 }

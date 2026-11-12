@@ -34,7 +34,6 @@ fn main() -> i32 {
     println("{}", p.a);
     long_one(&1i64, &2i64, &3i64) as i32
 }
-// EDITION: rust
 $ fmt
 note fmt.none: 1 file formatted already
 $ check

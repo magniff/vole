@@ -86,7 +86,7 @@ function body(ind, nested) {
 
 BEGIN {
     srand(seed)
-    print "// EDITION: rust\nextern \"C\" {\n    fn printf(f: *const u8, ...) -> i32;\n}\n"
+    print "extern \"C\" {\n    fn printf(f: *const u8, ...) -> i32;\n}\n"
     print "static mut Z: i64 = 0;"
     print "static mut G: [i64; 4] = [" rnd(9) ", " rnd(9) ", " rnd(9) ", " rnd(9) "];\n"
     print "#[derive(Clone, Copy)]\nstruct Grid { cells: [i64; 3], n: i64 }"

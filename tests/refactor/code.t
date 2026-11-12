@@ -153,7 +153,6 @@ inlined crate::calc::quad at 1 call, deleted it	2 files	+10 -12 lines
 +    } + bytes(4);
      if s == 78 { 0 } else { 1 }
  }
- // EDITION: rust
 $ main.vl -o prog
 ok: built prog
 % ./prog; echo "exit $?"

@@ -59,7 +59,7 @@ def small_std(repo):
     """A small std in repo: this tree's embed.sh, a root with one module,
     and the files embed.sh reads beside them (Gpa's, the systems')."""
     write(os.path.join(repo, "compiler/std/std.vl"),
-          "// EDITION: rust\n// A small std.\npub mod io;\n\npub fn zero() -> i64 {\n    0\n}\n")
+          "// A small std.\npub mod io;\n\npub fn zero() -> i64 {\n    0\n}\n")
     write(os.path.join(repo, "compiler/std/io.vl"),
           "// Text.\npub fn bump(n: i64) -> i64 {\n    let mut a = n;\n    a += 1;\n    a\n}\n")
     for f in ("gpa", "alloc_check", "sys_linux", "sys_macos"):
@@ -213,9 +213,9 @@ def std2_case():
         small_std(repo)
         os.remove(os.path.join(repo, "compiler/std/io.vl"))
         std2 = os.path.join(repo, "compiler/std/std.vl")
-        write(std2, "// EDITION: rust\npub fn one() -> i64 {\n    1\n}\n")
+        write(std2, "pub fn one() -> i64 {\n    1\n}\n")
         for f in ("gpa", "alloc_check", "sys_linux", "sys_macos"):
-            write(os.path.join(repo, "compiler/std/rt", f + ".vl"), "// EDITION: rust\npub fn " + f + "() {}\n")
+            write(os.path.join(repo, "compiler/std/rt", f + ".vl"), "pub fn " + f + "() {}\n")
         write(os.path.join(repo, ".gitignore"), "target/\n")
         os.makedirs(os.path.join(repo, "tools/git-hooks"))
         for f in ("pre-commit", "merge-stdsrc", "setup.sh"):

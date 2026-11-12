@@ -43,19 +43,19 @@ prints the word, and comments use it. A text search sees all of them:
 
 ```console
 $ grep -n count *.vl
-catalog.vl:12:    pub count: i64,
-catalog.vl:28:        self.books.push(Book { id: id as i64, title: title, author: author, count: n, owned: n });
-catalog.vl:42:            if cat.books[i].count == 0 {
-catalog.vl:45:            cat.books[i].count -= 1;
-catalog.vl:55:        cat.books[i].count += 1;
-loans.vl:40:    ms.list[i].count += 1;
-loans.vl:66:                ms.list[i].count -= 1;
-members.vl:9:    // the count of books held now
-members.vl:10:    pub count: i64,
-members.vl:27:        self.list.push(Member { id: id as i64, name: name, count: 0, limit: limit, owed: 0 });
-members.vl:38:    m.count < m.limit && m.owed == 0
-report.vl:11:        println("  {:<28} {:<18} count {}/{}", b.title, b.author, b.count, b.owned);
-report.vl:18:        println("  {:<10} holds {} of {}, owes {} cents", m.name, m.count, m.limit, m.owed);
+catalog.vl:11:    pub count: i64,
+catalog.vl:27:        self.books.push(Book { id: id as i64, title: title, author: author, count: n, owned: n });
+catalog.vl:41:            if cat.books[i].count == 0 {
+catalog.vl:44:            cat.books[i].count -= 1;
+catalog.vl:54:        cat.books[i].count += 1;
+loans.vl:39:    ms.list[i].count += 1;
+loans.vl:65:                ms.list[i].count -= 1;
+members.vl:8:    // the count of books held now
+members.vl:9:    pub count: i64,
+members.vl:26:        self.list.push(Member { id: id as i64, name: name, count: 0, limit: limit, owed: 0 });
+members.vl:37:    m.count < m.limit && m.owed == 0
+report.vl:10:        println("  {:<28} {:<18} count {}/{}", b.title, b.author, b.count, b.owned);
+report.vl:17:        println("  {:<10} holds {} of {}, owes {} cents", m.name, m.count, m.limit, m.owed);
 ```
 
 The compiler knows which ones are `Book`'s field, including the use
@@ -79,17 +79,17 @@ comments and the report's label alone:
 ```console
 $ volec refactor rename Book.count copies --show
 renamed crate::catalog::Book.count to copies	2 files	+6 -6 lines
-// catalog.vl:12
+// catalog.vl:11
 12	    pub copies: i64,
-// catalog.vl:28
+// catalog.vl:27
 28	        self.books.push(Book { id: id as i64, title: title, author: author, copies: n, owned: n });
-// catalog.vl:42
+// catalog.vl:41
 42	            if cat.books[i].copies == 0 {
-// catalog.vl:45
+// catalog.vl:44
 45	            cat.books[i].copies -= 1;
-// catalog.vl:55
+// catalog.vl:54
 55	        cat.books[i].copies += 1;
-// report.vl:11
+// report.vl:10
 11	        println("  {:<28} {:<18} count {}/{}", b.title, b.author, b.copies, b.owned);
 ```
 
@@ -117,19 +117,19 @@ plain `book_index(cat, id)` inside `catalog.vl`, and the qualified
 ```console
 $ volec refactor rename crate::catalog::find book_index --show
 renamed crate::catalog::find to book_index	catalog.vl	+3 -3 lines
-// catalog.vl:34
+// catalog.vl:33
 34	pub fn book_index(cat: &Catalog<Gpa>, id: i64) -> Option<usize> {
-// catalog.vl:40
+// catalog.vl:39
 40	    match book_index(cat, id) {
-// catalog.vl:54
+// catalog.vl:53
 54	    if let Some(i) = book_index(cat, id) {
 $ volec refactor rename crate::members::find member_index --show
 renamed crate::members::find to member_index	2 files	+3 -3 lines
-// loans.vl:30
+// loans.vl:29
 30	    let i = match crate::members::member_index(ms, member) {
-// loans.vl:65
+// loans.vl:64
 65	            if let Some(i) = crate::members::member_index(ms, member) {
-// members.vl:33
+// members.vl:32
 33	pub fn member_index(ms: &Members<Gpa>, id: i64) -> Option<usize> {
 ```
 
@@ -143,16 +143,16 @@ backquotes) follows it:
 ```console
 $ volec refactor rename give_back::d days_late --show
 renamed local d to days_late in crate::loans::give_back, 1 use	loans.vl	+2 -2 lines
-// loans.vl:63-64
+// loans.vl:62-63
 63	            let days_late = today - l.due;
 64	            let fee = late_fee(days_late);
 $ volec refactor rename late_fee::d days_late --show
 renamed parameter d to days_late in crate::loans::late_fee, 2 uses	loans.vl	+4 -4 lines
-// loans.vl:46-48
+// loans.vl:45-47
 46	// The fee for a book returned `days_late` days after it was due.
 47	pub fn late_fee(days_late: i64) -> i64 {
 48	    if days_late <= 0 {
-// loans.vl:51
+// loans.vl:50
 51	    let fee = days_late * FEE_PER_DAY;
 ```
 
@@ -168,10 +168,10 @@ $ volec refactor new-module fees
 made module fees	2 files	+1 -0 lines
 $ volec refactor move loans::late_fee loans::FEE_PER_DAY loans::MAX_FEE --to fees --show
 moved 3 items to crate::fees	2 files	+14 -13 lines
-// loans.vl:5
+// loans.vl:4
 5	use crate::fees::late_fee;
-// loans.vl:9: 4 lines removed after line 9
-// loans.vl:40: 9 lines removed after line 40
+// loans.vl:8: 4 lines removed after line 9
+// loans.vl:39: 9 lines removed after line 40
 // fees.vl:1-13
 1	// cents per day late
 2	pub const FEE_PER_DAY: i64 = 25;
@@ -187,7 +187,7 @@ moved 3 items to crate::fees	2 files	+14 -13 lines
 12	    if fee > MAX_FEE { MAX_FEE } else { fee }
 13	}
 $ volec query show loans::use
-// crate::loans::use	loans.vl:4-6
+// crate::loans::use	loans.vl:3-5
 use crate::catalog::{Catalog, put_back, take};
 use crate::fees::late_fee;
 use crate::members::{Members, can_borrow};

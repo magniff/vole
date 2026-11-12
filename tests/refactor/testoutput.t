@@ -19,14 +19,14 @@ FAIL bye: stdout differs at line 1 (1 line expected, 1 printed)
   - bye
   + hello
   stderr: warning: on stderr
-FAIL prints_and_fails: main.vl:22:5: assertion failed: '1 + 1 == 3'
-  trace: main.vl:22 prints_and_fails
+FAIL prints_and_fails: main.vl:21:5: assertion failed: '1 + 1 == 3'
+  trace: main.vl:21 prints_and_fails
   stdout: x = 3
   stderr: note from the test
 FAIL errs: test returned Err("bad thing")
   stdout: before the Err
-FAIL small (property, case 36 of 100, shrunk in 60 steps): main.vl:34:5: assertion failed: 'x < 200': x = 200
-  trace: main.vl:34 small
+FAIL small (property, case 36 of 100, shrunk in 60 steps): main.vl:33:5: assertion failed: 'x < 200': x = 200
+  trace: main.vl:33 small
   input: x = 200
   stdout: x=200
   try: volec test small --seed 0x7d6ce172e098998c main.vl
@@ -40,8 +40,8 @@ FAIL bye: stdout differs at line 1 (1 line expected, 1 printed)
   - bye
   + hello
   stderr: warning: on stderr
-FAIL small (property, case 36 of 100, shrunk in 60 steps): main.vl:34:5: assertion failed: 'x < 200': x = 200
-  trace: main.vl:34 small
+FAIL small (property, case 36 of 100, shrunk in 60 steps): main.vl:33:5: assertion failed: 'x < 200': x = 200
+  trace: main.vl:33 small
   input: x = 200
   stdout: x=200
   try: volec test small --seed 0x7d6ce172e098998c main.vl

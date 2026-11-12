@@ -117,8 +117,8 @@ arguments come after `--`. From the root of the tree, an example run with
 its own flags:
 
 ```text
-$ volec probe examples/nes/check.vl:235 mode1 prg power -- --check
-probe examples/nes/check.vl:235 (before `cart.cpu_write(0x8000, 0x00);`): 1 time
+$ volec probe examples/nes/check.vl:234 mode1 prg power -- --check
+probe examples/nes/check.vl:234 (before `cart.cpu_write(0x8000, 0x00);`): 1 time
   #1  mode1 = true  prg = true  power = true
 run: exit 0; stdout 1 line (target/scratch/probe/examples-nes-main.vl/out)
   | ok: 21 NES checks passed

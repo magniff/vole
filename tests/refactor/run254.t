@@ -33,7 +33,7 @@ $ run c c/twice.c -O0
 twice 21: 42
 ## A build error is the plain build's (status 1), and nothing runs.
 $ run bad
-bad/main.vl:3:18: error[type error] expected 'i32', got '&str'
+bad/main.vl:2:18: error[type error] expected 'i32', got '&str'
 [exit 1]
 ## Nothing was written into the program's folder; -o FILE keeps a copy.
 % ls

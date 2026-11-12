@@ -56,6 +56,6 @@ crate::in_scope	alloc(Gpa) diverge
 crate::apply	io
 crate::double	none
 crate::shout	io
-hof<closure(i64) -> i64 at effects016/main.vl:134:9>	none
-hof<closure(i64) -> i64 at effects016/main.vl:134:29>	io
+hof<closure(i64) -> i64 at effects016/main.vl:133:9>	none
+hof<closure(i64) -> i64 at effects016/main.vl:133:29>	io
 crate::allocators	alloc(Gpa, Bump) io panic

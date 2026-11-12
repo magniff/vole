@@ -68,13 +68,13 @@ rewrote 10 sites in 1 file	report.vl	+11 -11 lines
 note rewrite.imports: removed 1 import the rewrite left unused
 $ volec rewrite 'vec_at($v, $i)' '$v[$i]' --show
 rewrote 3 sites in 2 files	2 files	+3 -6 lines
-// report.vl:3: 1 line removed after line 3
-// report.vl:31
+// report.vl:2: 1 line removed after line 3
+// report.vl:30
 31	        let c = top[i];
-// stats.vl:5: 2 lines removed after line 5
-// stats.vl:67
+// stats.vl:4: 2 lines removed after line 5
+// stats.vl:66
 67	        out.push(v[i]);
-// stats.vl:76
+// stats.vl:75
 76	        if v[i].n == 1 {
 note rewrite.imports: removed 2 imports the rewrite left unused
 ```
@@ -93,9 +93,9 @@ functions are left; `query unused` lists them:
 
 ```console
 $ volec query unused
-crate::compat::buf_add	compat.vl:7:8	fn
-crate::compat::buf_add_int	compat.vl:12:8	fn
-crate::compat::vec_at	compat.vl:17:8	fn
+crate::compat::buf_add	compat.vl:6:8	fn
+crate::compat::buf_add_int	compat.vl:11:8	fn
+crate::compat::vec_at	compat.vl:16:8	fn
 ```
 
 The module goes with `edit delete`: its `mod` line and its file, in one
@@ -116,8 +116,8 @@ the sites, and each gets a command:
 
 ```console
 $ volec rewrite '$v.len() == 0' '$v.is_empty()'
-report.vl:43:8: error[type error] no method 'is_empty' on type '&Histogram' | try: volec query items Histogram main.vl  [edited: crate::report::histogram]
-error edit.breaks: 1 new error; nothing written; the error: report.vl:43:8: no method 'is_empty' on type '&Histogram'
+report.vl:42:8: error[type error] no method 'is_empty' on type '&Histogram' | try: volec query items Histogram main.vl  [edited: crate::report::histogram]
+error edit.breaks: 1 new error; nothing written; the error: report.vl:42:8: no method 'is_empty' on type '&Histogram'
 note rewrite.where: $v has 3 types at the sites: Vec<&str, Gpa> (1 site), &Histogram (1 site), &mut String<Gpa> (1 site); --where takes the ones the replacement fits
 try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<&str, Gpa>'
 try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: &Histogram'
@@ -132,7 +132,7 @@ it skipped is reported with its type, and a command for it:
 ```console
 $ volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<&str>' --show
 note rewrite.none: nothing matches '$v.len() == 0'
-note rewrite.types: 3 sites match but for --where; first: $v is Vec<&str, Gpa> at main.vl:18:8
+note rewrite.types: 3 sites match but for --where; first: $v is Vec<&str, Gpa> at main.vl:17:8
 try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<&str, Gpa>' --dry-run
 ```
 
@@ -145,18 +145,18 @@ reads `$v[$i]`, and writes a loop over copies of the elements:
 ```console
 $ volec rewrite 'for $i in 0..$v.len() { let $x = $v[$i]; $s... }' 'for $x in $v.iter().copied() { $s... }' --show
 rewrote 5 sites in 3 files	3 files	+5 -10 lines
-// report.vl:30
+// report.vl:29
 30	    for c in top.iter().copied() {
-// stats.vl:14
+// stats.vl:13
 14	    for w in ws.iter().copied() {
-// stats.vl:44
+// stats.vl:43
 44	    for w in ws.iter().copied() {
-// stats.vl:53
+// stats.vl:52
 53	    for w in ws.iter().copied() {
-// text.vl:17
+// text.vl:16
 17	    for c in text.iter().copied() {
-note rewrite.dropped: 1 site is left: the replacement drops $i, which the code it keeps uses; first: text.vl:41:18
-try: volec query show text.vl:41
+note rewrite.dropped: 1 site is left: the replacement drops $i, which the code it keeps uses; first: text.vl:40:18
+try: volec query show text.vl:40
 ```
 
 One loop was left: `longest_line` uses the index `i` after reading
@@ -164,8 +164,8 @@ One loop was left: `longest_line` uses the index `i` after reading
 would drop `i`. The tool leaves such a site as it is and says where:
 
 ```console
-$ volec query show text.vl:41
-// crate::text::longest_line	text.vl:32-44	effects: none
+$ volec query show text.vl:40
+// crate::text::longest_line	text.vl:31-43	effects: none
 // The length of the longest line, and its index.
 pub fn longest_line(ls: &[&str]) -> (usize, usize) {
     let mut best = 0;

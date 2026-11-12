@@ -325,13 +325,13 @@ pair adds) is one call, checked once after every pair is applied:
   insertion):
 
 ```
-@@ compiler/std/io.vl:102
+@@ compiler/std/io.vl:101
 <<<<<<< OLD
 =======
 // UNSAFE: why it cannot be safe
 // SAFETY: why it is sound
 >>>>>>> NEW
-@@ compiler/std/io.vl:140
+@@ compiler/std/io.vl:139
 <<<<<<< OLD
 =======
 // SAFETY: ...
@@ -498,13 +498,13 @@ In the vole repository (`compiler/std/` with its `embed.sh`, from the
 current directory or one of the three above it), an edit whose target
 is a std item (`edit patch std::trim`, `edit insert --after Vec::swap`,
 `edit replace std::split`, `edit delete`, `edit wrap`, a block of `edit
-apply`) or one of std's files (`edit patch compiler/std/io.vl:102`)
+apply`) or one of std's files (`edit patch compiler/std/io.vl:101`)
 runs again with `--std-tree compiler/std`: std is then read from its
 files, each a file of the module `std` under its own path, so the edit
 is made in `compiler/std/FILE.vl` and checked with the edited std:
 every function of std, and each generic one nothing instantiates with
 `i64` for its type parameters (`Gpa` for an `Allocator`), so an error in
-a body is found at once (`compiler/std/io.vl:124:16: error[type
+a body is found at once (`compiler/std/io.vl:123:16: error[type
 error] expected '[u8]', got 'i64'`). Once it is written, `compiler/std/embed.sh` makes
 `compiler/src/front/stdsrc.vl` from the files (`note edit.std`);
 `undo` of a std edit does the same. The compiler that runs has the old

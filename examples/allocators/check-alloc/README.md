@@ -25,7 +25,6 @@ its old name, a value dropped twice, a slice kept across a `push`, a
 
 ```console
 $ cat > old.vl <<'EOF'
-> // EDITION: rust
 > use std::alloc::{Allocator, arena_scope};
 >
 > struct Shelf<'a, A: Allocator> { name: &'a str, counts: Vec<i64, A> }
@@ -71,10 +70,10 @@ $ cat > old.vl <<'EOF'
 > }
 > EOF
 $ volec check old.vl
-old.vl:10:10: error[borrowck.use_moved] 'counts' is used here after it moved (moved at old.vl:9:17) | help: use it before the move, pass a clone where it moves, or take it by reference
-old.vl:18:10: error[borrowck.use_moved] 'shelf' is used here after it moved (moved at old.vl:17:10) | help: use it before the move, pass a clone where it moves, or take it by reference
-old.vl:25:5: error[borrowck.conflict] cannot borrow 'v' as mutable because it is also borrowed as immutable (borrowed at old.vl:24:18) | help: use the shared borrow before the mutable one, or take it again after
-old.vl:31:21: error[borrowck.outlives] lifetime may not live long enough: the lifetime of the closure's parameter 'a' is only the call's, but it flows where a lifetime of the closure's signature, from outside it is required, which lasts longer | help: keep a copy of the value instead of the reference (`*p`, `.clone()`); a closure's result borrows from its parameter only when the bound it is passed for says so (`Fn(&T) -> &T`)
+old.vl:9:10: error[borrowck.use_moved] 'counts' is used here after it moved (moved at old.vl:8:17) | help: use it before the move, pass a clone where it moves, or take it by reference
+old.vl:17:10: error[borrowck.use_moved] 'shelf' is used here after it moved (moved at old.vl:16:10) | help: use it before the move, pass a clone where it moves, or take it by reference
+old.vl:24:5: error[borrowck.conflict] cannot borrow 'v' as mutable because it is also borrowed as immutable (borrowed at old.vl:23:18) | help: use the shared borrow before the mutable one, or take it again after
+old.vl:30:21: error[borrowck.outlives] lifetime may not live long enough: the lifetime of the closure's parameter 'a' is only the call's, but it flows where a lifetime of the closure's signature, from outside it is required, which lasts longer | help: keep a copy of the value instead of the reference (`*p`, `.clone()`); a closure's result borrows from its parameter only when the bound it is passed for says so (`Fn(&T) -> &T`)
 [exit 1]
 ```
 
@@ -150,7 +149,7 @@ they were allocated:
 $ ./shop-checked leak
 a report nobody frees
 check-alloc: 1 block of Gpa not freed (21 bytes):
-  block #10 (21 bytes), allocated at main.vl:20:5
+  block #10 (21 bytes), allocated at main.vl:19:5
 ```
 
 **A raw pointer kept across a push.** A reference into the Vec kept
@@ -172,7 +171,7 @@ time, not only when the allocator happened to move it:
 
 ```console
 $ ./shop-checked dangling
-use after free: block #10 (32 bytes), allocated at main.vl:33:9, freed at main.vl:36:5
+use after free: block #10 (32 bytes), allocated at main.vl:32:9, freed at main.vl:35:5
 [exit 101]
 ```
 
@@ -195,7 +194,7 @@ unsafe { gpa.deallocate(shelf.block(), pair_layout()) };
 ```console
 $ ./shop-checked twice
 shelf: 7
-double free: block #10 (16 bytes), allocated at main.vl:56:13, freed at main.vl:80:14, freed again at main.vl:84:18
+double free: block #10 (16 bytes), allocated at main.vl:55:13, freed at main.vl:79:14, freed again at main.vl:83:18
 [exit 101]
 ```
 

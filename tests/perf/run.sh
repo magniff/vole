@@ -63,7 +63,6 @@ fn main() {
 }
 EOF
 cat >loops.vl <<'EOF'
-// EDITION: rust
 extern "C" {
     fn putchar(c: i32) -> i32;
 }

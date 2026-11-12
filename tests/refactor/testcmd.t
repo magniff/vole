@@ -63,7 +63,7 @@ line 3: c
 test main.vl: ran on -: exit 0, 1 line of output
 line 1: x
 ## the program is built again when a source changes
-% printf '// EDITION: rust\nfn main() -> i32 {\n    println("x");\n    0\n}\n' > main.vl
+% printf 'fn main() -> i32 {\n    println("x");\n    0\n}\n' > main.vl
 $ test ok
 test main.vl: 0 passed, 1 failed (1 case; -O0 and -O2 agree)
 FAIL ok: stdout differs at line 1 (3 lines expected, 1 printed)
@@ -89,7 +89,7 @@ error test.no-root: no file 'missing.vl'
 % rm -r tests
 $ test
 test main.vl: builds; no tests in tests/ (a case: NAME.in, its stdin, and NAME.out, the expected stdout; a #[test] fn in the program; --input FILE: one run)
-% printf 'fn main() {\n    let x: i64 = "s";\n}\n// EDITION: rust\n' > main.vl
+% printf 'fn main() {\n    let x: i64 = "s";\n}\n' > main.vl
 $ test
 test main.vl: does not build (1 error)
 main.vl:2:18: error[type error] expected 'i64', got '&str'

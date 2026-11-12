@@ -94,7 +94,6 @@ fn set_count(v: i64) {
         COUNT = v;
     }
 }
-// EDITION: rust
 $ show crate::section Nope
 error query.no-match: no section 'Nope' in crate
 try: volec query items crate --comments

@@ -525,7 +525,7 @@ try:
     # (0.28.0) the tree's version from a rust-edition compiler/src, `-> *mut u8`
     vr = os.path.join(tmp, "vr")
     write(os.path.join(vr, "compiler", "src", "main.vl"),
-          '// EDITION: rust\nfn main() {}\n\npub fn version() -> *mut u8 {\n    c"0.28.0"\n}\n')
+          'fn main() {}\n\npub fn version() -> *mut u8 {\n    c"0.28.0"\n}\n')
     case("tree_version: the rust edition's version()", hook.tree_version(vr), "0.28.0")
     write(os.path.join(srepo, "ex", "main.vl"), "fn main() {}\n")
     sev = {"hook_event_name": "PostToolUse", "tool_name": "Edit", "cwd": srepo, "session_id": "stalestd",
@@ -601,7 +601,7 @@ try:
     case("case options: FLAGS and ENV", hook.case_options(rc), (["--edition", "rust"], {}))
     write(rc, "fn main() {}\n// FLAGS: --deny-warnings --edition=rust\n")
     case("case options: --edition=rust", hook.case_options(rc), (["--edition", "rust"], {}))
-    write(rc, "// EDITION: rust\nfn main() {}\n")
+    write(rc, "fn main() {}\n")
     case("case options: the root line is the compiler's", hook.case_options(rc), ([], {}))
     case("case options: no root", hook.case_options(None), ([], {}))
     # (0.28.0) a file that names no edition and is written in the rust
@@ -612,7 +612,7 @@ try:
     case("edition args: rust source without a line", hook.edition_args(rc), ["--edition", "rust"])
     write(rc, "fn incr(r: inout i64) {\n    let mut k = 1; // &mut \n    r += k;\n}\n")
     case("case options: an MVS spelling, MVS", hook.case_options(rc), ([], {}))
-    write(rc, "// EDITION: rust\nfn main() {\n    let mut k = 1;\n}\n")
+    write(rc, "fn main() {\n    let mut k = 1;\n}\n")
     case("edition args: the line is the compiler's", hook.edition_args(rc), [])
     rm = os.path.join(os.path.dirname(rc), "rust_mod.vl")
     write(rm, "pub fn two() -> i64 {\n    2\n}\n")

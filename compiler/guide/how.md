@@ -30,7 +30,7 @@ compiler (`compiler/src/front/stdsrc_rust.vl`).
 
 1. Find where it goes: `volec query similar str::trim` (or
    `Vec::swap`) prints its neighbours, with their files
-   (`compiler/std/str.vl:334`); `volec query examples std-fn`.
+   (`compiler/std/str.vl:333`); `volec query examples std-fn`.
 2. Add it in its file, next to its kin, with an editor (std is one text
    to the compiler, `<std>`: `volec edit` does not write its files),
    then `volec fmt FILE`. A function that allocates takes its

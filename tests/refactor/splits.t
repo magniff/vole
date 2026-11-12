@@ -75,7 +75,6 @@ use table::names::describe;
 fn main() -> i32 {
     if describe(1) + weight(2) + KINDS == 10 { 0 } else { 1 }
 }
-// EDITION: rust
 $ undo
 undid split crate::table: 2 items into crate::table::names	3 files	+17 -11 lines
 ## A banner goes with its group (0.13: all of it, or its first item and

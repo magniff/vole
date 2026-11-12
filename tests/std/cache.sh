@@ -18,7 +18,6 @@ T=$(mktemp -d "${TMPDIR:-/tmp}/std2cache.XXXXXX")
 trap 'rm -rf "$T"' EXIT
 fail=0
 cat > "$T/ok.vl" <<'EOF'
-// EDITION: rust
 fn main(gpa: Gpa) {
     let v = Vec::from_in([3i64, 1, 2], gpa);
     let s = String::from_in("abc", gpa);
@@ -26,7 +25,6 @@ fn main(gpa: Gpa) {
 }
 EOF
 cat > "$T/err.vl" <<'EOF'
-// EDITION: rust
 fn main(gpa: Gpa) {
     let mut v = Vec::from_in([3i64, 1, 2], gpa);
     let r = &v[0];

@@ -48,12 +48,12 @@ longest run 20
 ```console
 $ volec refactor rename adler32::a low --show
 renamed local a to low in crate::adler::adler32, 4 uses	adler.vl	+4 -4 lines
-// adler.vl:5
+// adler.vl:4
 5	    let mut low: u64 = 1;
-// adler.vl:8-9
+// adler.vl:7-8
 8	        low = (low + x as u64) % 65521;
 9	        b = (b + low) % 65521;
-// adler.vl:11
+// adler.vl:10
 11	    (b << 16) | low
 $ volec refactor rename adler32::b high
 renamed local b to high in crate::adler::adler32, 3 uses	adler.vl	+3 -3 lines
@@ -80,13 +80,13 @@ $ volec edit insert --before adler32 <<'EOF'
 > EOF
 inserted before crate::adler::adler32	adler.vl	+3 -0 lines
 $ volec rewrite '65521' 'MOD_ADLER'
-adler.vl:5:1: error[type error] constant 'MOD_ADLER' is defined in terms of itself  [edited: crate::adler::MOD_ADLER]
-error edit.breaks: 1 new error; nothing written; the error: adler.vl:5:1: constant 'MOD_ADLER' is defined in terms of itself
+adler.vl:4:1: error[type error] constant 'MOD_ADLER' is defined in terms of itself  [edited: crate::adler::MOD_ADLER]
+error edit.breaks: 1 new error; nothing written; the error: adler.vl:4:1: constant 'MOD_ADLER' is defined in terms of itself
 try: volec rewrite 65521 MOD_ADLER --no-check
 [exit 1]
 $ volec rewrite '$e % 65521' '$e % MOD_ADLER' --show
 rewrote 2 sites in 1 file	adler.vl	+2 -2 lines
-// adler.vl:11-12
+// adler.vl:10-11
 11	        low = (low + x as u64) % MOD_ADLER;
 12	        high = (high + low) % MOD_ADLER;
 $ volec main.vl --no-positions -o after.s && cmp before.s after.s && echo same assembly
@@ -119,7 +119,7 @@ the layout:
 $ volec fmt rle.vl
 formatted	rle.vl	+4 -4 lines
 $ volec query show run_at
-// crate::rle::run_at	rle.vl:5-10	effects: panic diverge
+// crate::rle::run_at	rle.vl:4-9	effects: panic diverge
 fn run_at(s: &[u8], i: usize) -> usize {
     let mut n = 1;
     // a run ends at the end of s, at another byte, or at 255 (one count byte)
@@ -143,9 +143,9 @@ parameters (in the order of their first use), the one they define and
 ```console
 $ volec refactor extract-function main --lines 24-27 --to round_trips --show
 extracted lines 24-27 of crate::main into round_trips(out, gpa, s) -> bool	main.vl	+9 -4 lines
-// main.vl:24
+// main.vl:23
 24	    let ok = round_trips(out, gpa, s);
-// main.vl:39-46
+// main.vl:38-45
 39	}
 40	
 41	fn round_trips(out: &[u8], gpa: Gpa, s: &[u8]) -> bool {

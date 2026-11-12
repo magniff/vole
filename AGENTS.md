@@ -59,8 +59,8 @@ the edits in [docs/refactor.md](docs/refactor.md). NAME is `foo`,
 is one line, `error CODE: message`, then `try:` lines to run as they are.
 The program is the compiler's from the tree's root; an example's (any
 program's) when a FILE or FILE:LINE argument is one of its files, or
-with `--root DIR` (`query context examples/nes/check.vl:233`, `probe
-examples/nes/check.vl:235 x -- --check`); a NAME the default program
+with `--root DIR` (`query context examples/nes/check.vl:232`, `probe
+examples/nes/check.vl:234 x -- --check`); a NAME the default program
 lacks gets the `try:` of the program that defines it.
 
 **Query and edit with `target/tools/volec` while you change the

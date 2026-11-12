@@ -100,7 +100,6 @@ the calls and the types do not say so:
 
 ```console
 $ cat > old.vl <<'EOF'
-> // EDITION: rust
 > fn shout(words: &[&str], gpa: Gpa) -> String {
 >     let mut b = String::new();
 >     for w in words {
@@ -124,10 +123,10 @@ $ cat > old.vl <<'EOF'
 > }
 > EOF
 $ volec check old.vl
-old.vl:2:39: error[alloc.default] 'String' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
-old.vl:3:17: error[alloc.no_in] 'String::new' allocates from nothing: pass the allocator, last, to 'String::new_in' | help: this function's `gpa` is the allocator to pass | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
-old.vl:15:20: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
-old.vl:15:32: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in' | help: this function's `gpa` is the allocator to pass | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
+old.vl:1:39: error[alloc.default] 'String' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
+old.vl:2:17: error[alloc.no_in] 'String::new' allocates from nothing: pass the allocator, last, to 'String::new_in' | help: this function's `gpa` is the allocator to pass | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
+old.vl:14:20: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
+old.vl:14:32: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in' | help: this function's `gpa` is the allocator to pass | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
 [exit 1]
 ```
 
@@ -171,7 +170,6 @@ one: `gpa` is a name like any other, and here it is not in scope.
 
 ```console
 $ cat > count.vl <<'EOF'
-> // EDITION: rust
 > fn count(text: &str) -> usize {
 >     let words: Vec<&str, Gpa> = text.split_whitespace().collect_in(gpa);
 >     words.len()
@@ -183,7 +181,7 @@ $ cat > count.vl <<'EOF'
 > }
 > EOF
 $ volec check count.vl
-count.vl:3:68: error[type error] undefined variable 'gpa' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'count' and pass it down | try: volec refactor signature count --add 'gpa: Gpa = gpa' --fill-calls count.vl
+count.vl:2:68: error[type error] undefined variable 'gpa' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'count' and pass it down | try: volec refactor signature count --add 'gpa: Gpa = gpa' --fill-calls count.vl
 [exit 1]
 ```
 
@@ -205,7 +203,6 @@ static's type may hold no allocator (`alloc.static`).
 
 ```console
 $ cat > forge.vl <<'EOF'
-> // EDITION: rust
 > static mut CACHE: Vec<i64, Gpa> = Vec::new_in(Gpa {});
 >
 > fn main() -> i32 {
@@ -214,9 +211,9 @@ $ cat > forge.vl <<'EOF'
 > }
 > EOF
 $ volec check forge.vl
-forge.vl:2:1: error[alloc.static] the static 'CACHE' holds an allocator, 'Gpa' (in its type 'Vec<i64, Gpa>'): a static's type may not hold one | help: any function could allocate through it with nothing in its signature saying so: keep the value in main and pass it down (or what it allocates, as a slice)
-forge.vl:2:47: error[field.literal-private] cannot make a 'Gpa' here: its field 'sealed' is private to module 'std::alloc' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
-forge.vl:5:16: error[field.literal-private] cannot make a 'Gpa' here: its field 'sealed' is private to module 'std::alloc' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
+forge.vl:1:1: error[alloc.static] the static 'CACHE' holds an allocator, 'Gpa' (in its type 'Vec<i64, Gpa>'): a static's type may not hold one | help: any function could allocate through it with nothing in its signature saying so: keep the value in main and pass it down (or what it allocates, as a slice)
+forge.vl:1:47: error[field.literal-private] cannot make a 'Gpa' here: its field 'sealed' is private to module 'std::alloc' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
+forge.vl:4:16: error[field.literal-private] cannot make a 'Gpa' here: its field 'sealed' is private to module 'std::alloc' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
 [exit 1]
 ```
 
