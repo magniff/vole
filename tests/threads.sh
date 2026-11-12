@@ -17,6 +17,12 @@
 # context, once gave 1 build in 40 other code, compiled REPEATS times
 # (default 96) at -jN, 32 at once, each the same assembly as -j1's.
 #
+# (0.28) And arch_x86_shifts.vl of tests/arch/gen.sh (-r 20, as
+# tests/objcheck.sh makes it) for x86_64-macos at -O2, REPEATS / 4 times:
+# its two largest functions' phi ranges, emptied when their tables grew,
+# which the sizes left by the thread's earlier functions decided, once gave
+# 1 build in 3 other code (so objcheck's -c and -S differed).
+#
 # usage: tests/threads.sh [-c COMPILER] [-t TARGET] [-n THREADS] [-j JOBS] [FILTER]
 #
 #   -c COMPILER   the volec to check (default: target/volec)
@@ -49,8 +55,8 @@ while [ $# -gt 0 ]; do
         -n) THREADS=$2; shift 2 ;;
         -j) JOBS=$2; shift 2 ;;
         -r) REPEATS=$2; shift 2 ;;
-        -h|--help) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        -*) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
         *) FILTER=$1; shift ;;
     esac
 done
@@ -186,6 +192,25 @@ if [ "$REPEATS" -gt 0 ] && [ -f "$rp" ] && { [ -z "$FILTER" ] || echo "$rp" | gr
         repeat_check "$rp" aarch64-linux "$r" "$WORK/repeat.ref.s" >"$WORK/$n.result" &
         [ $((r % 32)) -eq 0 ] && wait
     done
+fi
+wait
+# (0.28) The generated program (see the header).
+ag="$WORK/arch-gen"
+rp="$ag/arch_x86_shifts.vl"
+if [ "$REPEATS" -gt 0 ] && { [ -z "$FILTER" ] || echo tests/arch/arch_x86_shifts.vl | grep -q "$FILTER"; }; then
+    if sh "$ROOT/tests/arch/gen.sh" -c "$COMPILER" -o "$ag" -r 20 x86_shifts >"$WORK/arch-gen.log" 2>&1 && [ -f "$rp" ]; then
+        "$COMPILER" --target x86_64-macos -O2 -j1 -S "$rp" -o "$WORK/repeat.xref.s" >/dev/null 2>&1
+        r=0
+        while [ "$r" -lt $((REPEATS / 4)) ]; do
+            r=$((r + 1))
+            n=$((n + 1))
+            repeat_check "$rp" x86_64-macos "x$r" "$WORK/repeat.xref.s" >"$WORK/$n.result" &
+            [ $((r % 8)) -eq 0 ] && wait
+        done
+    else
+        n=$((n + 1))
+        echo "FAIL tests/arch/gen.sh: $(tail -3 "$WORK/arch-gen.log" | tr '\n' ' ')" >"$WORK/$n.result"
+    fi
 fi
 wait
 exec 3>&-
