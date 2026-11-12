@@ -75,7 +75,7 @@ $ show std::arch::detect
 // computes: r = whether the CPU running the program has `feature`
 // use std::arch::detect;
 #[intrinsic(2)]
-pub fn detect(feature: [u8]) -> bool;
+pub fn detect(feature: &str) -> bool;
 $ context vdotq_u32 --budget 120
 // std::arch::aarch64::vdotq_u32	<std::arch::aarch64>:169-170	effects: none	features: dotprod	instruction: udot <d>.4s, <a>.16b, <b>.16b
 // each 32-bit lane of acc plus the dot product of its four bytes of a and b
