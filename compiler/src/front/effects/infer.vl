@@ -42,8 +42,9 @@ use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::timer::{T_CHECK, T_EFFECTS, timer_now, timer_sub};
 use crate::front::ast::{
-    ARM_SYNTHETIC, FN_BODY_FAILED, FN_SIG_FAILED, FN_UNSAFE, NODE_CAPTURE, NODE_IN_BOUNDS, NODE_RAW,
-    NODE_REF_MUT, NodeKind, REPR_UNION, VK_LANE, VK_LOAD, VK_STORE, VK_WITH, child,
+    ARM_SYNTHETIC, FN_BODY_FAILED, FN_SIG_FAILED, FN_TERMINATES, FN_UNSAFE, NODE_CAPTURE,
+    NODE_IN_BOUNDS, NODE_RAW, NODE_REF_MUT, NodeKind, REPR_UNION, VK_LANE, VK_LOAD, VK_STORE,
+    VK_WITH, child,
 };
 use crate::front::check::Res;
 use crate::front::check::iterate::ends_by_itself;
@@ -1862,6 +1863,15 @@ fn component_effects(first: i64, comp: i64, pcx: &mut Ctx<Comp>) {
         if track && cyclic {
             split_cycle(first, pcx);
         }
+        // RULE: E2.2 (0.28.0: before a declared member's signature is made
+        // of its set)
+        for k in first..pcx.stack.count {
+            let m = (*pcx.stack.data.add(k as usize));
+            if m < pcx.graph_fns && terminates(m, pcx)
+                && ((*pcx.node_fx.add(m as usize)).bits & EFF_UNKNOWN) == 0 {
+                trusted_to_end(m, comp, pcx);
+            }
+        }
         // (0.27.2.1, E3.1a: a declared member gets its signature, after
         // every member has the component's set)
         if pcx.fx_decl != 0 as *mut i64 {
@@ -1873,6 +1883,74 @@ fn component_effects(first: i64, comp: i64, pcx: &mut Ctx<Comp>) {
                 }
             }
         }
+    }
+}
+
+// RULE: E2.2 (0.28.0) Whether function m (an item or an instance) is one
+// std declares `#[terminates]`: trusted to end, an unchecked promise (the
+// parser accepts the attribute in std's text only).
+pub fn terminates(m: i64, pcx: &Ctx<Comp>) -> bool {
+    if m < 0 || m >= pcx.fns.len() as i64 {
+        return false;
+    }
+    let node = pcx.fns[template_of(m, pcx) as usize].node;
+    node > 0 && (pcx.nodes[node as usize].p & FN_TERMINATES) != 0
+}
+
+// RULE: E2.2 (0.28.0) Member m of the component just made, a
+// `#[terminates]` function, loses the visible `diverge` of its own loops,
+// of its recursion and of the callees it names; what is made for one of
+// its type arguments (a T's method, a drop of a T) and what a fn value's
+// call brings stay: they are the caller's choice, not the promise's. The
+// raw bit, the optimizer's WILLRETURN, is left as the body shows it: no
+// code is compiled on the promise.
+fn trusted_to_end(m: i64, comp: i64, pcx: &mut Ctx<Comp>) {
+    // UNSAFE: the effect graph's tables (EDGE_START, EDGES, COMPONENT,
+    // NODE_FX, FX_FIXED, FX_DYN) and TLISTS, by index.
+    // SAFETY: m is below GRAPH_FNS, so EDGE_START has m + 1; its edges'
+    // targets are graph nodes, whose sets are made (callees first) unless
+    // in m's component, which is skipped; m's targs..targs + targ_count
+    // are in TLISTS; FX_FIXED and FX_DYN, when made, have a word per node.
+    unsafe {
+        let track = pcx.fx_fixed != 0 as *mut Effects;
+        let count = pcx.fns[m as usize].targ_count;
+        let mut kept: i64 = 0;
+        for e in (*pcx.edge_start.data.add(m as usize))..(
+            *pcx.edge_start.data.add((m + 1) as usize)) {
+            let w = edge_to(e, pcx);
+            if (*pcx.component.add(w as usize)) == comp {
+                continue;
+            }
+            if dispatch_edge(w, pcx) {
+                if !track {
+                    kept |= edge_through(e, pcx).bits & EFF_DIVERGE;
+                }
+                continue;
+            }
+            let mut made = ((*pcx.edges.data.add(e as usize)) & 3) == E_DROP && count > 0;
+            for j in 0..count {
+                if node_made_for(w,
+                    (*pcx.tlists.data.add((pcx.fns[m as usize].targs + j) as usize)), pcx) {
+                    made = true;
+                }
+            }
+            if made {
+                let t = if track { edge_pass(e, (*pcx.fx_fixed.add(w as usize)), pcx) }
+                    else { edge_through(e, pcx) };
+                kept |= t.bits & EFF_DIVERGE;
+            }
+        }
+        if track {
+            let fixed = (*pcx.fx_fixed.add(m as usize));
+            (*pcx.fx_fixed.add(m as usize)) = Effects {
+                bits: (fixed.bits & ~EFF_DIVERGE) | kept, allocs: fixed.allocs,
+            };
+            kept |= (*pcx.fx_dyn.add(m as usize)).bits & EFF_DIVERGE;
+        }
+        let all = (*pcx.node_fx.add(m as usize));
+        (*pcx.node_fx.add(m as usize)) = Effects {
+            bits: (all.bits & ~EFF_DIVERGE) | kept, allocs: all.allocs,
+        };
     }
 }
 
@@ -2152,7 +2230,77 @@ pub fn own_effects(f: i64, pcx: &mut Ctx<Comp>) -> (Effects, i64) {
         }
         fx.bits |= local.bits;
         fx.allocs |= local.allocs;
+        // RULE: E2.2 (a `#[terminates]` function's own loops, recursion
+        // and named callees: no `diverge` in the list `fix` writes)
+        if terminates(f, pcx) {
+            fx.bits &= ~EFF_DIVERGE;
+        }
         (fx, params)
+    }
+}
+
+// RULE: E3.4a (0.28.0) What node v does when the methods of root's type
+// arguments from `first` on are not counted: its local set, its cycle's
+// `diverge`, and its edges' sets, but an edge to a method of such a type
+// (Hash::hash's Hasher: its `write`) brings nothing, and an edge to a
+// function made for one (a field's `hash::<H>`) brings that function's
+// part, found the same way. For a trait method's declaration, which binds
+// what an impl does itself (effects/check.vl: check_effects). STACK is
+// the path: a function on it adds nothing new.
+pub fn own_part(v: i64, root: i64, first: i64, pcx: &mut Ctx<Comp>) -> Effects {
+    // UNSAFE: the effect graph's tables (LOCAL_FX, EDGE_START, EDGES,
+    // COMPONENT), STACK and TLISTS, by index.
+    // SAFETY: v and root are below GRAPH_FNS, so EDGE_START has v + 1 and
+    // LOCAL_FX has v; an edge's target is a graph node; k is below STACK's
+    // count; root's targs..targs + targ_count are in TLISTS.
+    unsafe {
+        let mut fx = (*pcx.local_fx.add(v as usize));
+        pcx.stack.push(v);
+        let from = pcx.fns[root as usize].targs;
+        let count = pcx.fns[root as usize].targ_count;
+        for e in (*pcx.edge_start.data.add(v as usize))..(
+            *pcx.edge_start.data.add((v + 1) as usize)) {
+            let w = edge_to(e, pcx);
+            if w >= pcx.graph_fns {
+                fx = effects_union(fx, edge_through(e, pcx));
+                continue;
+            }
+            if (*pcx.component.add(w as usize)) == (*pcx.component.add(v as usize)) {
+                fx.bits |= EFF_DIVERGE | EFF_RAW_DIVERGE;
+            }
+            let mut on_path = false;
+            for k in 0..pcx.stack.count {
+                if (*pcx.stack.data.add(k as usize)) == w {
+                    on_path = true;
+                }
+            }
+            if on_path {
+                continue;
+            }
+            let mut theirs = false;
+            let mut made = false;
+            for j in first..count {
+                let tau = (*pcx.tlists.data.add((from + j) as usize));
+                if pcx.fns[w as usize].self_ty == tau {
+                    theirs = true;
+                }
+                if node_made_for(w, tau, pcx) {
+                    made = true;
+                }
+            }
+            if theirs {
+                continue;
+            }
+            let t = if made && pcx.stack.count < 32 {
+                let part = own_part(w, root, first, pcx);
+                edge_pass(e, part, pcx)
+            } else {
+                edge_through(e, pcx)
+            };
+            fx = effects_union(fx, t);
+        }
+        pcx.stack.count -= 1;
+        fx
     }
 }
 

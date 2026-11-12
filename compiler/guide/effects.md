@@ -16,6 +16,9 @@ beyond them:
 | `diverge` | `loop`, a `while` the compiler cannot count, recursion: it may not return (a `for` over a range or a slice returns, and so do std's iterators that end; a panic is `panic`, not `diverge`) |
 | `unsafe` | unsafe operations in its own body (not its callers') |
 
+std's printing ends (`println("{x}")` is `io panic`): the few loops of
+std the compiler cannot count carry `#[terminates]`, std's own promise.
+
 A set is written in that order, `none` for the empty one. Allocation is
 explicit (`guide allocators`), so `alloc(Gpa)` without `static` means
 "from a Gpa it was given". Running out of memory is `alloc`, not `panic`.
