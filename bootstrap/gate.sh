@@ -71,8 +71,8 @@
 # mvs-census (tools/mvs-census.py --no-allow, 0.28.0: nothing in the tree
 # is read as the old edition or names one: no program, generator, guide
 # topic or Book chapter in it, no `// EDITION:` line but the ones the
-# previous release reads, no --edition; 0 entries, no allow-list; --quick
-# too);
+# previous release reads, no use of the edition option; 0 entries, no
+# allow-list; --quick too);
 # borrowck-twin (tools/borrowck-twin.sh, 0.27.1: every rust_b_ case's
 # verdict against rustc's, accept or reject, and its code; a divergence
 # only when the case names its class; skipped without rustc; --quick too);
