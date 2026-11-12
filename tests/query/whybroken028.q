@@ -21,7 +21,7 @@ crate::score	panic
 warning query.program-errors: 1 error in the program; results may be incomplete
 try: volec --diagnostics=short whybroken028/main.vl -c -o /dev/null
 $ effects scaled --why io whybroken028/main.vl
-crate::scaled	io panic
+crate::scaled	io static panic
   'clamp(x * 2)' at whybroken028/main.vl:7:5 calls 'clamp'
   'println("clamp {x}")' at whybroken028/main.vl:2:5 calls 'std::fmt::println'
   'write_erased::<W>' at <std>:17364:20 calls 'std::fmt::write_erased'

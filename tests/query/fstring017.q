@@ -19,6 +19,6 @@ $ refs println std::fmt::write format_in --in fstring017/main.vl
 13:17	call	main	->std::fmt::format_in	let mut t = format_in("{n}!", gpa);
 14:5	call	main	->std::fmt::println	println("{}", str::from_utf8(t.as_bytes()).unwrap());
 $ effects main --why io
-crate::main	alloc(Gpa) io panic diverge
+crate::main	alloc(Gpa) io static panic diverge
   'println("n = {n}")' at fstring017/main.vl:9:5 calls 'std::fmt::println'
   (no source found)

@@ -6,7 +6,7 @@ $ items
 crate	syntax015/main.vl	6
 std	<std>	607
 $ show main
-// crate::main	syntax015/main.vl:25-31	effects: io panic
+// crate::main	syntax015/main.vl:25-31	effects: io static panic
 fn main() -> Option<i64> {
     let x = half(8)?;
     let y = area(x, h: 2);

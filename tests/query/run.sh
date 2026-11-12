@@ -377,4 +377,100 @@ roundtrip() { # <program dir> <seed names...>
 }
 roundtrip clash a::helper geom::V2::len main Shape::Circle MyVec::push
 roundtrip closures double apply main
+# (0.28.0) A set's text is the list its function may declare, no more
+# and no less (the effects' rule: the lists are honest). For each
+# function of program $1 named by a `//@ NAME` line, the answer of
+# `query effects NAME`, written there as `#[effects(..)]`, is accepted by
+# `volec check` (for target $2, or the host's), and the list without any
+# one of its words (an allocator of `alloc(..)` is a word) is refused
+# with an effect error. The set is the host's: where another target's
+# differs, its check says so here.
+effects_agree() { # <program dir> <host|TARGET>
+    prog=$1
+    target=
+    [ "$2" = host ] || target="--target $2"
+    mkdir -p "$WORK/ea"
+    : >"$WORK/ea.bad"
+    fns=0
+    lists=0
+    sed -n 's|^ *//@ ||p' "$prog/main.vl" >"$WORK/ea.names"
+    while IFS= read -r name; do
+        fns=$((fns + 1))
+        VOLE_CACHE=off "$COMPILER" query effects "$name" --root "$prog/main.vl" >"$WORK/ea.set" 2>&1
+        if [ "$(wc -l <"$WORK/ea.set")" -ne 1 ] || ! grep -q "$TAB" "$WORK/ea.set" \
+            || grep -q '(unknown)' "$WORK/ea.set"; then
+            echo "$name: query effects answered: $(head -3 "$WORK/ea.set")" >>"$WORK/ea.bad"
+            continue
+        fi
+        # (the lists: `=<TAB>LIST` the whole one, then `WORD<TAB>LIST`, LIST
+        # without WORD)
+        awk -F "$TAB" '
+            function list(skip,   i, a, s, t) {
+                a = ""
+                for (i = 1; i <= na; i++) {
+                    if (i != skip) a = a (a == "" ? "" : ", ") al[i]
+                }
+                s = (a == "" ? "" : "alloc(" a ")")
+                if (any && skip != -1) s = "alloc"
+                for (i = 1; i <= nw; i++) {
+                    if (na + i != skip) s = s (s == "" ? "" : ", ") w[i]
+                }
+                return s
+            }
+            {
+                t = $2
+                na = 0; nw = 0; any = 0
+                if (t ~ /^alloc\(/) {
+                    # (the allocators, split at the commas outside <..>)
+                    depth = 0; cur = ""
+                    for (i = 7; i <= length(t); i++) {
+                        c = substr(t, i, 1)
+                        if (c == "<") depth++
+                        if (c == ">") depth--
+                        if (c == ")" && depth == 0) break
+                        if (c == "," && depth == 0) { al[++na] = cur; cur = ""; i++; continue }
+                        cur = cur c
+                    }
+                    al[++na] = cur
+                    t = substr(t, i + 2)
+                } else if (t ~ /^alloc( |$)/) {
+                    any = 1
+                    t = substr(t, 7)
+                }
+                if (t != "none" && t != "") nw = split(t, w, " ")
+                print "=\t" list(0)
+                if (any) print "alloc\t" list(-1)
+                for (i = 1; i <= na; i++) print "alloc(" al[i] ")\t" list(i)
+                for (i = 1; i <= nw; i++) print w[i] "\t" list(na + i)
+            }' "$WORK/ea.set" >"$WORK/ea.lists"
+        while IFS="$TAB" read -r word list; do
+            lists=$((lists + 1))
+            awk -v name="$name" -v list="$list" '
+                /^ *\/\/@ / {
+                    t = $0
+                    sub(/^ *\/\/@ /, "", t)
+                    if (t == name) {
+                        sub(/\/\/@ .*/, "")
+                        print $0 "#[effects(" list ")]"
+                        next
+                    }
+                }
+                { print }' "$prog/main.vl" >"$WORK/ea/main.vl"
+            # shellcheck disable=SC2086
+            VOLE_CACHE=off "$COMPILER" check $target "$WORK/ea/main.vl" >"$WORK/ea.out" 2>&1
+            rc=$?
+            if [ "$word" = "=" ]; then
+                [ $rc -eq 0 ] || echo "$name: #[effects($list)], the query's answer, is refused: $(grep 'error' "$WORK/ea.out" | head -2)" >>"$WORK/ea.bad"
+            elif [ $rc -eq 0 ] || ! grep -q 'error\[effect\]' "$WORK/ea.out"; then
+                echo "$name: #[effects($list)], the query's answer without '$word', is not refused with an effect error: $(grep 'error' "$WORK/ea.out" | head -2)" >>"$WORK/ea.bad"
+            fi
+        done <"$WORK/ea.lists"
+    done <"$WORK/ea.names"
+    ok=0
+    [ "$fns" -ge 10 ] && [ "$lists" -gt "$fns" ] && [ ! -s "$WORK/ea.bad" ] && ok=1
+    check "effects_agree_${prog}_$2" "$ok" "$fns functions, $lists lists; $(cat "$WORK/ea.bad")"
+}
+effects_agree effagree host
+effects_agree effagree aarch64-linux
+effects_agree effagree x86_64-linux
 exit $STATUS

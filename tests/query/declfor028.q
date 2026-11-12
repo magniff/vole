@@ -21,9 +21,9 @@ crate::doubled	none
 crate::back	none
 crate::pairs	panic
 crate::letters	panic diverge
-crate::show	io panic
+crate::show	io static panic
 crate::collect	alloc(Gpa) panic
-crate::main	alloc(Gpa) io panic diverge
+crate::main	alloc(Gpa) io static panic diverge
 $ effects mean --why interior declfor028/main.vl
 crate::mean	none
   (not: interior)

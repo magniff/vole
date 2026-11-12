@@ -164,7 +164,7 @@ std::unicode::ClusterWidth::push	<std>:22516:12	method	pub fn push(&mut self, cp
 std::path::PathBuf::push	<std>:23132:12	method	pub fn push<P: AsRef<str>>(&mut self, p: P)
 std::cli::Matches::push	<std>:22958:8	method	fn push(&mut self, s: i64, text: &'a str, at: i64)
 std::objc::Pool::push	<std>:57063:12	method	pub fn push() -> Pool	effects: io unsafe
-std::window::cocoa::push	<std>:58405:4	fn	fn push(e: Event)	effects: alloc(Gpa, extern) io panic diverge unsafe
+std::window::cocoa::push	<std>:59320:4	fn	fn push(e: Event)	effects: alloc(Gpa, extern) io static panic diverge unsafe
 $ refs Vec::push --count
 2	crate::myvec::Vec::push
 99	std::vec::Vec::push

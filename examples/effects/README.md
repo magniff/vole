@@ -8,7 +8,7 @@ body calls, closures and generic instances included:
 |---|---|
 | `alloc(Gpa)`, `alloc(Arena<Gpa>)`, ... | allocating from that allocator type (`alloc(extern)`: C's `malloc`) |
 | `io` | a C function that reads or writes: `write`, `read`, stdio |
-| `static` | reading or writing a `static mut` (not shown in a set: `--why static`) |
+| `static` | reading or writing a `static mut`; C's `errno`, which a failed write of std's printing reads |
 | `panic` | a checked index, `unwrap`, std's panic |
 | `diverge` | `loop`, a `while` the compiler cannot count, recursion: it may not return |
 | `unsafe` | unsafe operations in its own body |

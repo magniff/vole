@@ -107,7 +107,7 @@ program.
 $ volec query effects crate
 lower_in<&ArenaScope<&Gpa>>	alloc(ArenaScope<&Gpa>) panic diverge
 answer<&ArenaScope<&Gpa>>	alloc(Gpa, Arena<Gpa>, ArenaScope<&Gpa>) panic diverge
-crate::main	alloc(Gpa, Arena<Gpa>, ArenaScope<&Gpa>, &Gpa) io panic diverge
+crate::main	alloc(Gpa, Arena<Gpa>, ArenaScope<&Gpa>, &Gpa) io static panic diverge
 ```
 
 `answer` allocates from all three: `Gpa` (the map grows), the keys'

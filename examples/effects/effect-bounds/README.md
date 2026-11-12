@@ -58,7 +58,7 @@ $ volec query effects crate::table
 map_values<closure(i64) -> i64 at main.vl:17:27>	none
 partition<closure(&Row) -> bool at main.vl:18:34>	panic
 sort_by_key<closure(&Row) -> i64 at main.vl:19:33>	panic diverge
-each<closure(&Row) -> () at main.vl:21:17>	io panic diverge
+each<closure(&Row) -> () at main.vl:21:17>	io static panic
 ```
 
 `map_values` is `none` for this closure (its `rows[i]` is in a counted
@@ -106,7 +106,7 @@ try: volec edit patch main --old '|r| r.value >= 20' --new '|r| r.name.as_bytes(
 $ volec edit patch main --old '|r| r.value >= 20' --new "|r| r.name.as_bytes().first().copied() == Some(b'a')" --show
 patched crate::main	main.vl	+1 -1 lines
 // main.vl:18
-19	    let n = partition(&mut rows, |r| r.name.as_bytes().first().copied() == Some(b'a'));
+18	    let n = partition(&mut rows, |r| r.name.as_bytes().first().copied() == Some(b'a'));
 $ volec main.vl -o table && ./table
 alan      46
 ada       41

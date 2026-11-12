@@ -27,6 +27,6 @@ $ refs Pair
 $ effects apply grow_by_one main
 apply<closure(i64) -> i64 at syntax016/main.vl:47:32>	none
 crate::grow_by_one	alloc(Gpa) panic diverge
-crate::main	alloc(Gpa) io panic diverge unsafe
+crate::main	alloc(Gpa) io static panic diverge unsafe
 $ def Vec::new_in
 std::vec::Vec::new_in	<std>:4854:12	method	pub fn new_in(a: A) -> Vec<T, A>
