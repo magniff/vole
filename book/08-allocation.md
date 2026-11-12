@@ -61,7 +61,7 @@ its first line, without reading its body. The compiler sees it too:
 $ volec query effects crate lengths.vl
 crate::longest	none
 crate::lengths	alloc(Gpa) panic
-crate::main	alloc(Gpa) io panic diverge
+crate::main	alloc(Gpa) io panic
 ```
 
 This line of output for each function is its *effects*, the things

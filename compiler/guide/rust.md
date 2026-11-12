@@ -53,8 +53,8 @@ Vole adds two things to a signature, both checked.
 
 - **Effects**: what a function may do, inferred for every function
   and checked where one is declared: `#[pure]`, `#[no_alloc]`,
-  `#[no_io]`, `#[no_panic]`, `#[effects(io, static, panic, diverge)]`
-  (all it may have: `println`'s four). The effects are `alloc(A)`,
+  `#[no_io]`, `#[no_panic]`, `#[effects(io, static, panic)]`
+  (all it may have: `println`'s three). The effects are `alloc(A)`,
   `io`, `static`, `panic`, `diverge` and `unsafe`; a panic is only
   `panic` (`diverge` is a loop or a recursion that may not end).
   `volec query effects NAME --why io` shows the chain (`guide
