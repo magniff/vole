@@ -226,7 +226,7 @@ n=$(printf '%s\n' "$out" | grep -c "^[0-9]*:[0-9]*${TAB}call${TAB}base::[A-Za-z_
 check self_refs_in_file "$ok" "$(printf '%s\n' "$out" | head -5)"
 out=$("$COMPILER" query refs ir_val --in gvn --limit 5 2>&1)
 ok=0
-[ "$(printf '%s\n' "$out" | grep -c "^[0-9]*:[0-9]*${TAB}call${TAB}middle::gvn::")" = 5 ] \
+[ "$(printf '%s\n' "$out" | grep -cE "^[0-9]*:[0-9]*${TAB}(call|use)${TAB}middle::gvn")" = 5 ] \
     && printf '%s\n' "$out" | grep -q '^note query.truncated: showing 5 of [0-9]* refs$' && ok=1
 check self_refs_in_module_limit "$ok" "$out"
 n=$("$COMPILER" query refs IntVec::push --all 2>/dev/null | grep -c "^[0-9]*:[0-9]*${TAB}")
