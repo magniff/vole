@@ -42,7 +42,7 @@ use crate::back::enc_arm64::{AOp, aop_none, init_a64};
 use crate::back::enc_x86::{XOp, init_x86, xop_none};
 use crate::base::{
     alloc_zeroed, buf_byte, buf_clear, buf_copy, buf_fmt, buf_len, buf_new, buf_ptr, buf_w16,
-    buf_w32, buf_write_file, cstr, die, memcmp, memcpy,
+    buf_w32, buf_write_file, cstr, die, memcpy,
 };
 
 use assemble::{Memo, assemble_begin, assemble_line};
@@ -221,44 +221,11 @@ pub const TAIL_JCC: i64 = 3;
 // them through `&Ctx`, so they are behind a lock; the assembler has them
 // (Asm.raw) while it assembles text on the main thread (assemble_text).
 
-// Appends `bytes` to v, as one block.
-pub fn append_bytes(v: &mut Vec<u8, Comp>, bytes: &[u8]) {
-    let n = bytes.len();
-    v.reserve(n);
-    // UNSAFE: the bytes are copied as a block into the room reserved for
-    // them. std's extend_from_slice pushes one element at a time (a clone,
-    // a bounds check and a growth test each): for the assembler's copy of
-    // its text that was a third of an -O0 build's "data and output"
-    // (measured, 0.29: 6.9 G instructions against 4.5 G).
-    // SAFETY: reserve(n) made the capacity at least len + n, so bytes
-    // [len, len + n) of v's block are allocated; `bytes` has n readable
-    // bytes and is no part of v (a shared borrow beside v's mutable one);
-    // memcpy writes exactly those n bytes, so the new length covers only
-    // initialized bytes, and u8 has nothing to drop.
-    unsafe {
-        memcpy(v.as_mut_ptr().add(v.len()), bytes.ptr, n as u64);
-        v.set_len(v.len() + n);
-    }
-}
-
-// Whether a and b are the same bytes.
-pub fn same_bytes(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    // UNSAFE: C's memcmp over two slices of one length: the slices' `==`
-    // compares a byte at a time, and the assembler compares every line
-    // with its memo and every name with its symbol's.
-    // SAFETY: both slices have a.len() readable bytes (the lengths are
-    // equal, tested above); memcmp reads no more and keeps no pointer.
-    unsafe { memcmp(a.ptr, b.ptr, a.len() as u64) == 0 }
-}
-
 // Appends bytes to the constant data's bytes; returns their offset there.
 pub fn raw_data(bytes: &[u8], pcx: &Ctx<Comp>) -> i64 {
     let mut raw = pcx.obj_raw.lock().unwrap();
     let at = raw.len() as i64;
-    append_bytes(&mut *raw, bytes);
+    raw.extend_from_slice(bytes);
     at
 }
 
@@ -269,7 +236,7 @@ pub fn raw_out(at: i64, n: i64, asm: &mut Asm<Comp>) -> bool {
     if at < 0 || n < 0 || at + n > asm.raw.len() as i64 {
         return false;
     }
-    append_bytes(&mut asm.obj, &asm.raw[at as usize..(at + n) as usize]);
+    asm.obj.extend_from_slice(&asm.raw[at as usize..(at + n) as usize]);
     true
 }
 
@@ -319,9 +286,8 @@ pub fn out16(v: i64, asm: &mut Asm<Comp>) {
 
 // (0.17: the four bytes with one check for room, not four calls)
 pub fn out32(v: i64, asm: &mut Asm<Comp>) {
-    append_bytes(&mut asm.obj,
-        &[(v & 255) as u8, ((v >> 8) & 255) as u8, ((v >> 16) & 255) as u8,
-            ((v >> 24) & 255) as u8]);
+    asm.obj.extend_from_slice(&[(v & 255) as u8, ((v >> 8) & 255) as u8, ((v >> 16) & 255) as u8,
+        ((v >> 24) & 255) as u8]);
 }
 
 pub fn out64(v: i64, asm: &mut Asm<Comp>) {
@@ -400,7 +366,7 @@ fn sym_intern(name: &[u8], syms: &mut Vec<ASym, Comp>, names: &mut Vec<u8, Comp>
         let y = &syms[s as usize];
         // (0.25: the hashes first, then the bytes)
         if y.hash == hash && y.name_len == name.len() as i64
-            && same_bytes(&names[y.name as usize..(y.name + y.name_len) as usize], name) {
+            && &names[y.name as usize..(y.name + y.name_len) as usize] == name {
             return s;
         }
         slot = (slot + 1) & mask;
@@ -410,7 +376,7 @@ fn sym_intern(name: &[u8], syms: &mut Vec<ASym, Comp>, names: &mut Vec<u8, Comp>
         name: names.len() as i64, name_len: name.len() as i64, hash, defined: false,
         global: false, frag: -1, off: 0, sec: -1, in_table: false, index: -1, atom: -1,
     });
-    append_bytes(names, name);
+    names.extend_from_slice(name);
     table[slot as usize] = s + 1;
     s
 }
@@ -714,7 +680,9 @@ fn line_end(text: &[u8], from: usize) -> usize {
     // UNSAFE: C's memchr (0.17: the end of the line by memchr, not byte by
     // byte). The search written over the slice, a byte and a bounds check
     // at a time, cost 0.6 G instructions of an -O0 build's 4.7 G of "data
-    // and output" (measured, 0.29).
+    // and output" (measured, 0.29). std has the search from 0.29
+    // (`[u8]::find_byte`), and this compiler is built by 0.28.0, whose std
+    // has not: from 0.30 this function is `text[from..].find_byte(10)`.
     // SAFETY: rest has rest.len() readable bytes (a slice's); memchr reads
     // no further and returns null or a pointer to one of them, so the
     // difference from rest.ptr is below rest.len(), and from + it is below
@@ -727,7 +695,7 @@ fn line_end(text: &[u8], from: usize) -> usize {
 // which the assembler's functions read by position).
 pub fn assemble_bytes(text: &[u8], asm: &mut Asm<Comp>) {
     asm.text.clear();
-    append_bytes(&mut asm.text, text);
+    asm.text.extend_from_slice(text);
     let n = text.len();
     let mut i: usize = 0;
     while i < n {
