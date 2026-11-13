@@ -480,20 +480,16 @@ pub fn buf_bytes(b: i64, bytes: &[u8]) {
 // - A frozen buffer's bytes: buf_done, `&'static [u8]`, and that is true:
 //   a frozen buffer is never written, moved or freed (buf_freeze), and
 //   every writer stops the compiler at one (frozen_written).
-// - A growing buffer's bytes: buf_slice. Its `&'static` is NOT true and
-//   the type cannot say what is: a buffer is a number, so there is no
-//   owner whose borrow would end the view at the next write. The view is
-//   good until the next write to the same buffer (buf_reserve may move
-//   its block; buf_clear and a writer change the bytes); a growth of the
-//   table (buf_new) does not touch it, the table holds only the headers.
-//   The rule every caller keeps (docs/design/src-buffer.md, "Views of
-//   other storage"): a view is consumed before the next write to its
-//   buffer, or the buffer is frozen first (buf_done). What checks it:
-//   VOLE_STRESS_GROW=1 moves a buffer's block on every growth and
-//   poisons the old one (moved_block), so a view kept across a growth
-//   reads 0xAA and the suite's stress run fails. A buffer as a value
-//   with borrowed views (std's Buf) is the owners' redesign, not done
-//   here: about 1340 callers.
+// - A growing buffer's bytes: there is no borrowed view of them outside
+//   this file. A buffer is a number, so there is no owner whose borrow
+//   would end a view at the next write (buf_reserve may move the block;
+//   buf_clear and every writer change the bytes), and no lifetime a
+//   safe function could give such a slice would be true. What a caller
+//   gets instead: its own copy (buf_copy, a Vec), or the operation done
+//   here on the block, by value: buf_append (into another buffer),
+//   intern_buf (its symbol), buf_eq (a comparison), buf_at, buf_len.
+//   (Until 0.29 buf_slice returned the block as `&'static [u8]`, good
+//   only until the next write to the buffer; about 1380 callers.)
 // - The block's address: buf_ptr, a raw pointer for C (a path for
 //   fopen, bytes for write, room for read). It promises nothing; the
 //   unsafe is at the dereference or the C call, which says why the
@@ -503,22 +499,97 @@ pub fn buf_bytes(b: i64, bytes: &[u8]) {
 // buf_new, ids are never reused and buffers never freed, and BUF_COUNT
 // is the main thread's (get_buf_count), so a task could not read it.
 
-// The bytes of growing buffer b, until the next write to b (above: the
-// lifetime is the caller's to keep; buf_done's is checked).
-pub fn buf_slice(b: i64) -> &'static [u8] {
-    // UNSAFE: a slice over a buffer's block, which base keeps as a raw
-    // pointer and a length in BUFS
-    // SAFETY: b is an id buf_new returned, so its header is live; data
-    // holds len initialized bytes (every writer writes before it adds to
-    // len; buf_zeros fills). The slice does not point into the table, so
-    // buf_new's growth leaves it valid. It is valid until the next write
-    // to b, not for 'static: the caller consumes it before that write
-    // (the rule above, checked by the stress run), and no other thread
-    // writes b meanwhile (a buffer is one context's: get_bufs)
+// The bytes of buffer b for as long as nothing writes b. The one place a
+// buffer's block becomes a slice: base's own readers (buf_copy,
+// buf_append, buf_done, intern_buf, the writers to a descriptor or a
+// file) go through it and end the view before they return or write b.
+// UNSAFE: a slice over a block base keeps as a raw pointer and a length
+// in BUFS; the lifetime 'a is the caller's to keep
+// SAFETY: the caller's: b is an id buf_new returned; no write to b
+// (which may move or change its block) while the result is used, and no
+// other thread writes b meanwhile (a growing buffer is one context's)
+unsafe fn buf_raw<'a>(b: i64) -> &'a [u8] {
+    std::slice::from_raw_parts((*get_bufs().add(b as usize)).data,
+        (*get_bufs().add(b as usize)).len as usize)
+}
+
+// A Vec of these bytes, in one block and one copy.
+fn bytes_vec(bytes: &[u8]) -> Vec<u8, Comp> {
+    let n = bytes.len();
+    let mut copy: Vec<u8, Comp> = Vec::with_capacity_in(n, Comp {});
+    // UNSAFE: memcpy into the Vec's block and set_len, in place of
+    // extend_from_slice, which pushes a byte at a time (14 instructions
+    // each: 3% of `volec check`, which copies std's text, measured)
+    // SAFETY: with_capacity_in made room for n bytes, memcpy fills
+    // exactly those n from a live slice of n bytes in another block,
+    // and only then set_len(n) covers them: no byte is read before it
+    // is written, and n is the capacity asked for
     unsafe {
-        std::slice::from_raw_parts((*get_bufs().add(b as usize)).data.add((0) as usize),
-            ((*get_bufs().add(b as usize)).len - (0)) as usize)
+        if n > 0 {
+            memcpy(copy.as_mut_ptr(), bytes.ptr, n as u64);
+        }
+        copy.set_len(n);
     }
+    copy
+}
+
+// A copy of growing buffer b's bytes, the caller's own: `&buf_copy(b)`
+// where a `&[u8]` is read in one statement, `let t = buf_copy(b);` for
+// more. A write to b after it changes nothing in the copy. (A byte:
+// buf_at; the length: buf_len; into another buffer: buf_append; a
+// buffer written for the last time: buf_done, no copy.)
+pub fn buf_copy(b: i64) -> Vec<u8, Comp> {
+    // UNSAFE: the buffer's block read as a slice (buf_raw)
+    // SAFETY: b is an id buf_new returned; bytes_vec writes the new
+    // Vec's block, never a buffer, and the view ends when it returns
+    unsafe { bytes_vec(buf_raw(b)) }
+}
+
+// A copy of bytes from..to of growing buffer b (checked against its
+// length): a part of a large buffer, without copying the whole.
+pub fn buf_copy_range(b: i64, from: i64, to: i64) -> Vec<u8, Comp> {
+    // UNSAFE: the buffer's block read as a slice (buf_raw)
+    // SAFETY: b is an id buf_new returned; the range is checked by the
+    // slice's index; bytes_vec writes the new Vec's block, never a
+    // buffer, and the view ends when it returns
+    unsafe { bytes_vec(&buf_raw(b)[from as usize..to as usize]) }
+}
+
+// Buffer src's bytes appended to buffer dst (src is not dst).
+pub fn buf_append(dst: i64, src: i64) {
+    if dst == src {
+        die(c"internal: a buffer appended to itself");
+    }
+    // UNSAFE: the source buffer's block read as a slice (buf_raw)
+    // SAFETY: both are ids buf_new returned; buf_bytes writes dst only,
+    // which is another buffer than src (checked above), so src's block
+    // neither moves nor changes under the view, which ends here
+    unsafe { buf_bytes(dst, buf_raw(src)); }
+}
+
+// The symbol of buffer b's bytes (intern).
+pub fn intern_buf(b: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    // UNSAFE: the buffer's block read as a slice (buf_raw)
+    // SAFETY: b is an id buf_new returned; intern writes the context's
+    // symbols and their own blocks, never a buffer (it copies the bytes
+    // of a new symbol), and the view ends when it returns
+    unsafe { intern(buf_raw(b), pcx) }
+}
+
+// The symbol with buffer b's bytes, or -1 (find_sym).
+pub fn find_sym_buf(b: i64, pcx: &Ctx<Comp>) -> i64 {
+    // UNSAFE: the buffer's block read as a slice (buf_raw)
+    // SAFETY: b is an id buf_new returned; find_sym only reads the
+    // context's symbols, and the view ends when it returns
+    unsafe { find_sym(buf_raw(b), pcx) }
+}
+
+// True if buffer b holds exactly these bytes.
+pub fn buf_eq(b: i64, bytes: &[u8]) -> bool {
+    // UNSAFE: the buffer's block read as a slice (buf_raw)
+    // SAFETY: b is an id buf_new returned; nothing is written between
+    // the view and the comparison, which ends it
+    unsafe { buf_raw(b) == bytes }
 }
 
 // The number of bytes in buffer b.
@@ -672,7 +743,12 @@ pub fn buf_freeze(b: i64) {
 // function whose buffer is written for the last time.
 pub fn buf_done(b: i64) -> &'static [u8] {
     buf_freeze(b);
-    buf_slice(b)
+    // UNSAFE: the buffer's block read as a slice (buf_raw)
+    // SAFETY: b is an id buf_new returned and is frozen: every writer
+    // stops the compiler at a frozen buffer (frozen_written), and a
+    // buffer's block is never freed, so its bytes neither move nor
+    // change for the rest of the process, which is what 'static says
+    unsafe { buf_raw(b) }
 }
 
 // A write to frozen buffer b: an internal error, never a write (its id
@@ -808,7 +884,7 @@ pub fn buf_fmt<T: std::fmt::Display>(b: i64, x: T) {
 
 // The bytes of C string s before its NUL.
 // UNSAFE: strlen is C's, and a raw pointer is seen as a slice
-// SAFETY (the caller's): s points at a NUL-terminated string that is
+// SAFETY: the caller's: s points at a NUL-terminated string that is
 // neither written nor freed while the result is used
 pub unsafe fn c_bytes<'a>(s: *mut u8) -> &'a [u8] {
     std::slice::from_raw_parts(s, strlen(s) as usize)
@@ -828,21 +904,34 @@ pub fn cstr(s: *mut u8) -> &'static [u8] {
 // stdout while STDOUT_CAPTURE is a buffer goes to that buffer, for the
 // output budget of `volec query`).
 pub fn buf_write_fd(b: i64, fd: i32) {
+    let capture = get_stdout_capture();
+    if fd == STDOUT && capture >= 0 && b != capture {
+        buf_append(capture, b);
+        return;
+    }
+    // (0.15) --json: what goes to stdout as JSON lines
+    if crate::base::json::get_diag_json() && fd == STDOUT {
+        let j = buf_new();
+        // UNSAFE: the buffer's block read as a slice (buf_raw)
+        // SAFETY: b is an id buf_new returned; json_output writes j, a
+        // buffer made here and so another than b, and the view ends
+        // when it returns
+        unsafe { crate::base::json::json_output(j, buf_raw(b)); }
+        write_all_fd(fd, j);
+        return;
+    }
+    write_all_fd(fd, b);
+}
+
+// Buffer b's bytes written to descriptor fd (one write: what the system
+// does not take is dropped, as before).
+fn write_all_fd(fd: i32, b: i64) {
+    // UNSAFE: write is C's, given the buffer's block (buf_raw)
+    // SAFETY: b is an id buf_new returned; the view is the block's len
+    // initialized bytes and ends with the call, which writes no buffer
     unsafe {
-        if fd == STDOUT && get_stdout_capture() >= 0 && b != get_stdout_capture() {
-            buf_bytes(get_stdout_capture(),
-                std::slice::from_raw_parts((*get_bufs().add(b as usize)).data.add((0) as usize),
-                    ((*get_bufs().add(b as usize)).len - (0)) as usize));
-            return;
-        }
-        // (0.15) --json: what goes to stdout as JSON lines
-        if crate::base::json::get_diag_json() && fd == STDOUT {
-            let j = buf_new();
-            crate::base::json::json_output(j, buf_slice(b));
-            write(fd, (*get_bufs().add(j as usize)).data, (*get_bufs().add(j as usize)).len as u64);
-            return;
-        }
-        write(fd, (*get_bufs().add(b as usize)).data, (*get_bufs().add(b as usize)).len as u64);
+        let bytes: &[u8] = buf_raw(b);
+        write(fd, bytes.ptr, bytes.len() as u64);
     }
 }
 
@@ -1208,7 +1297,7 @@ fn src_reserve(cap: i64) -> *mut u8 {
         buf_int(n, cap);
         buf_str(n, c" bytes for the sources (mmap)");
         buf_byte(n, 0);
-        die2(c"cannot reserve ", buf_slice(n).ptr);
+        die2(c"cannot reserve ", buf_ptr(n));
     }
     p
 }
@@ -1229,7 +1318,7 @@ fn src_put(bytes: &[u8], pcx: &mut Ctx<Comp>) {
         buf_int(m, pcx.src_cap);
         buf_str(m, c" bytes reserved for them (VOLE_SRC_CAP)");
         buf_byte(m, 0);
-        die2(c"the sources pass the ", buf_slice(m).ptr);
+        die2(c"the sources pass the ", buf_ptr(m));
     }
     if n > 0 {
         // UNSAFE: a copy into the region through its base pointer.
@@ -1296,7 +1385,12 @@ pub fn load_sources(paths: *mut *mut u8, count: i64, pcx: &mut Ctx<Comp>) {
             buf_clear(text);
             read_file((*paths.add(i as usize)), text, pcx);
             let start = pcx.src_used;
-            src_put(buf_slice(text), pcx);
+            // UNSAFE: the buffer's block read as a slice (buf_raw)
+            // SAFETY: text is a buffer made above; src_put copies the
+            // bytes into the sources' region and writes no buffer (its
+            // messages, in buffers of their own, end the compiler), and
+            // the view ends when it returns
+            src_put(buf_raw(text), pcx);
             pcx.files.push(SourceFile {
                 path: (*paths.add(i as usize)), start, end: pcx.src_used, module: 0, kind: 0,
             });
@@ -1320,7 +1414,11 @@ pub fn add_source(path: *mut u8, text: i64, pcx: &mut Ctx<Comp>, kind: i64) -> i
     // it ending at the NUL included; each file starts after a newline)
     src_put_byte(b'\n', pcx);
     let start = pcx.src_used;
-    src_put(buf_slice(text), pcx);
+    // UNSAFE: the buffer's block read as a slice (buf_raw)
+    // SAFETY: text is an id buf_new returned; src_put copies the bytes into
+    // the sources' region and writes no buffer (its messages, in buffers
+    // of their own, end the compiler), and the view ends when it returns
+    unsafe { src_put(buf_raw(text), pcx); }
     pcx.files.push(SourceFile { path, start, end: pcx.src_used, module: 0, kind });
     src_put_byte(b'\n', pcx);
     src_put_byte(0, pcx);
@@ -1524,7 +1622,11 @@ pub fn restore_sources(all: i64, files: &[i64], pcx: &mut Ctx<Comp>) {
     }
     // (0.27.6: a new source set, its region's, as load_sources)
     src_begin(pcx);
-    src_put(buf_slice(all), pcx);
+    // UNSAFE: the buffer's block read as a slice (buf_raw)
+    // SAFETY: all is an id buf_new returned; src_put copies the bytes into
+    // the sources' region and writes no buffer (its messages, in buffers
+    // of their own, end the compiler), and the view ends when it returns
+    unsafe { src_put(buf_raw(all), pcx); }
     src_publish(pcx);
 }
 
@@ -1626,7 +1728,7 @@ fn set_stress_grow(v: i64) {
 
 // (0.28.0) BUFS's accessors: every use of it is one of them. (0.29)
 // Private: the rest of the compiler reads a buffer through buf_len,
-// buf_at, buf_slice, buf_done and buf_ptr and writes it through the
+// buf_at, buf_copy, buf_done and buf_ptr and writes it through the
 // buf_* writers above, all in this file.
 fn get_bufs() -> *mut Buf {
     // UNSAFE: base's table of byte buffers, a process-wide static mut; Rust
