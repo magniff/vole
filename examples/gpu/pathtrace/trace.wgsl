@@ -37,6 +37,13 @@ struct LightSample {
 @group(0) @binding(1) var<storage, read_write> accum: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> gbuffer: array<Surface>;
 @group(0) @binding(3) var<storage, read_write> rays: array<vec4<f32>>;
+// A path that scatters just beside the area light, or lands on a grazing
+// emitter, can carry thousands of times a pixel's mean in a single sample.
+// The running average then keeps that pixel white for the rest of the
+// accumulation, more visibly as the sample count grows. Cap one sample's
+// radiance where the tone map already saturates: only the rare tail is
+// touched, and this clamp is the estimator's one deliberate bias.
+const FIREFLY_CAP: f32 = 64.0;
 var<private> qmc_index: u32;
 var<private> qmc_dimension: u32;
 var<private> qmc_seed: u32;
@@ -553,6 +560,8 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, index: u32, sample: u32) -> vec3<f32> {
     if !all(radiance == radiance) || any(abs(radiance) > vec3<f32>(1.0e30)) {
         radiance = vec3<f32>(0.0);
     }
+    let luminance = dot(radiance, vec3<f32>(0.2126, 0.7152, 0.0722));
+    if luminance > FIREFLY_CAP { radiance = radiance * (FIREFLY_CAP / luminance); }
     return max(radiance, vec3<f32>(0.0));
 }
 @compute @workgroup_size(16, 16)

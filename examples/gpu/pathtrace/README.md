@@ -134,12 +134,13 @@ there are deliberately no fabricated BVH counters.
 - **Multiple importance sampling:** a diffuse or glossy event combines
   next-event estimation of the area light with the BSDF-sampled path using the
   balance heuristic, so each technique contributes where its PDF is large; the
-  result stays unbiased and loses most of the fireflies that either technique
-  alone produces on a glossy floor. The rectangle is sampled uniformly by area
-  and converted to solid-angle PDF with both cosines and distance; shadow rays
-  include homogeneous-media transmittance. Rectangle emission is accepted whole
-  after camera or specular events and weighted by MIS after a sampled BSDF
-  event. Object emission is BSDF-sampled and is not also next-event sampled.
+  result is unbiased apart from the firefly clamp below, and loses most of the
+  fireflies that either technique alone produces on a glossy floor. The
+  rectangle is sampled uniformly by area and converted to solid-angle PDF with
+  both cosines and distance; shadow rays include homogeneous-media
+  transmittance. Rectangle emission is accepted whole after camera or specular
+  events and weighted by MIS after a sampled BSDF event. Object emission is
+  BSDF-sampled and is not also next-event sampled.
 - **Stratified camera, white-noise paths:** a pixel's first four random
   numbers (jitter, then the lens, or the first light sample without depth of
   field) are a Cranley–Patterson rotation of a Halton point, fixed per pixel
@@ -149,6 +150,14 @@ there are deliberately no fabricated BVH counters.
   time. Both are deterministic, which is what lets `--headless` reproduce
   sample one exactly. The stratification removes most of the edge crawl at low
   sample counts; MIS does the heavy lifting on the broad low-frequency noise.
+- **Firefly clamp:** `trace` scales any sample whose luminance exceeds 64 down
+  to that luminance. A path that scatters just beside the area light, or lands
+  on a grazing emitter, can otherwise carry thousands of times a pixel's mean in
+  one sample; the running average then keeps that pixel white for the rest of
+  the accumulation, most visibly as the sample count grows. The clamp removes
+  those pixels on the Fog hall without moving the Studio or grid error, and is
+  the estimator's one deliberate bias, applied where the tone map already
+  saturates.
 - **Scene geometry:** `trace.wgsl` selects one of three analytic families from
   the scene index (the fourth preset reuses the studio geometry with the 4×4
   material wall). Shadow rays use the same per-scene blocker list as the camera
@@ -168,12 +177,13 @@ there are deliberately no fabricated BVH counters.
   to 15 nodes for the selected ray. Instrumentation does not require host image
   readback.
 - **Presentation and performance:** compute and rendering are encoded in order
-  on one queue. Interactive frames accumulate four samples but execute only one
-  display pass, so sampling is not capped by the window refresh rate. Static
-  diagnostic modes stop after one sample. The integrator uses 16×16 workgroups,
-  lightweight ID-only candidate hits, early-out any-hit shadow traversal,
-  canceled Smith visibility terms and unbiased Russian roulette from the third
-  path segment, with at most six segments. Swapchain textures remain render
+  on one queue. Interactive frames add four samples to the accumulation (up to
+  2048 per camera view) but execute only one display pass, so sampling is not
+  capped by the window refresh rate. Static diagnostic modes stop after one
+  sample. The integrator uses 16×16 workgroups, lightweight ID-only candidate
+  hits, early-out any-hit shadow traversal, canceled Smith visibility terms and
+  unbiased Russian roulette from the third path segment, with at most six
+  segments. Swapchain textures remain render
   targets, as required by `std::gpu`; the display fragment shader reads storage
   buffers directly. The panel's vertex buffer and atlas are uploaded once per
   frame and drawn in a blended pass that loads the scene target instead of
@@ -221,17 +231,17 @@ state, camera-bounds, scene-switch, panel-hit and immediate-mode widget tests.
 ./pathtrace --benchmark --samples 1024 --size 640x400
 ```
 
-Benchmark mode uses the selected scene (default Studio) and a fixed RNG seed.
-Initialization (including shader compilation) is reported separately.
+Benchmark mode uses the selected scene (default Studio) and a fixed sample
+sequence. Initialization (including shader compilation) is reported separately.
 Steady-state wall time covers uninterrupted offscreen GPU frames plus one final
 readback synchronization; there is no per-frame readback or presentation pacing.
 `--grid`, `--direct`, `--fog`, `--dof` and `--scene` also select benchmark
 workloads. CPU frame interval in the interactive title is not represented as GPU
 execution time: `std::gpu` currently exposes no timestamp queries.
 
-Measured on an Apple M5 with Metal (1024 samples, 640×400): 1.76 ms
-initialization, 0.484 ms/sample wall time, 2065.9 accumulated samples/s and
-528.86 Mpaths/s. These are measurements, not GPU timestamp estimates; rerun the
+Measured on an Apple M5 with Metal (1024 samples, 640×400): 2.92 ms
+initialization, 0.688 ms/sample wall time, 1452.7 accumulated samples/s and
+371.89 Mpaths/s. These are measurements, not GPU timestamp estimates; rerun the
 command above for local numbers.
 
 ## Files
