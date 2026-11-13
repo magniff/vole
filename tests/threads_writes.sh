@@ -68,14 +68,6 @@ front::lexer::STRS	add_const_data: only on const_data'"'"'s serial branch (task_
 front::lexer::STR_COUNT	the same
 gen0::target::STR_ALIGN	the same
 front::lexer::STR_CAP	the same
-back::dwarf::LINE_STARTS	-g, which runs on one thread (parallel::serial_only)
-back::dwarf::SRC_END	-g
-back::dwarf::FILE_NUMBERS	-g
-back::dwarf::FILES_USED	-g
-back::dwarf::DBG_FNS	-g
-back::dwarf::DBG_PREFIX	-g
-back::dwarf::DBG_POS	-g
-back::emit::stats::ST_ALL	--stats, which runs on one thread
 base::BUFS	a task writes its context'"'"'s buffers'"'"' entries; none is made in a task (buf_new: below)
 base::BUF_CAP	buf_new, below
 base::BUF_COUNT	buf_new: the printers of --stats, --print-regalloc, --print-after-all, --verify-* (one thread), and internal errors, which exit
@@ -159,16 +151,10 @@ back::codecache::pack::NEW	own
 base::ctx::Ctx.new_slots	own
 base::ctx::Ctx.pack	own
 back::codecache::pack::USED	own
-back::dwarf::DBG_FNS	off: -g
-back::dwarf::DBG_POS	off: -g
-back::dwarf::DBG_PREFIX	off: -g
+base::ctx::Ctx.dbg	off: -g (and --vec-stats=FN, --trace: the line starts) runs on one thread (serial_only) and the cache is off; the tables of -g, behind a lock
 base::ctx::Ctx.debug_info	off: -g
-back::dwarf::FILES_USED	off: -g
-back::dwarf::FILE_NUMBERS	off: -g
-back::dwarf::LINE_STARTS	off: -g
-back::dwarf::SRC_END	off: -g
 base::ctx::Ctx.stats	off: --stats
-back::emit::stats::ST_ALL	off: --stats
+base::ctx::Ctx.st_all	off: --stats; the totals, behind a lock
 base::ctx::Ctx.print_regalloc	off: --print-regalloc
 base::ctx::Ctx.verify_regalloc	off: --verify-regalloc
 base::ctx::Ctx.x86_alloc_acd	key: options_hash
