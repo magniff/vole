@@ -20,7 +20,7 @@
 #            (but one whose main.vl says `// premerge: broken on purpose`)
 #            (but unsafe.unjustified, a warning in a program that is not the
 #            compiler: the lines a change adds are the unsafe row's)
-#   std      the committed compiler/src/front/stdsrc_rust.vl is what compiler/std/embed.sh
+#   std      the committed compiler/src/front/stdsrc.vl is what compiler/std/embed.sh
 #            makes of the committed std (0.25.3: made by the commit hook and the
 #            merge driver, tools/git-hooks/setup.sh; said when they are not set up)
 #   layout   every tests/examples case names a SOURCE that exists
@@ -99,7 +99,7 @@ if [ -z "$VOLEC" ]; then
     row fmt SKIP "no volec (bootstrap/bootstrap.sh --dev)"
 else
     : > "$TMP/fmt"
-    for f in $(printf '%s\n' "$CHANGED" | grep '\.vl$' | grep -v -e '^tests/' -e '^editors/vscode/test/samples/' | grep -v 'front/stdsrc_rust\.vl$'); do
+    for f in $(printf '%s\n' "$CHANGED" | grep '\.vl$' | grep -v -e '^tests/' -e '^editors/vscode/test/samples/' | grep -v 'front/stdsrc\.vl$'); do
         # (or by the branch's own build: a build before 0.28.0 reads a
         # module of compiler/src alone as the old edition's)
         "$VOLEC" fmt --check "$f" > /dev/null 2>&1 \
@@ -143,18 +143,18 @@ fi
 # HEAD's compiler/std in a copy, so the work tree is left as it is)
 setup=""
 [ -n "$(git config merge.stdsrc.driver)" ] || setup="; the stdsrc merge driver is not set up: tools/git-hooks/setup.sh"
-if printf '%s\n' "$CHANGED" | grep -q -e '^compiler/std/' -e '^compiler/src/front/stdsrc_rust\.vl$'; then
+if printf '%s\n' "$CHANGED" | grep -q -e '^compiler/std/' -e '^compiler/src/front/stdsrc\.vl$'; then
     mkdir -p "$TMP/std/compiler/src/front"
     git archive HEAD compiler/std | tar -xf - -C "$TMP/std"
     # (the committed file, whose index of units embed.sh keeps when no
     # compiler here makes it; this tree's compiler makes it when it can)
-    git show HEAD:compiler/src/front/stdsrc_rust.vl > "$TMP/std/compiler/src/front/stdsrc_rust.vl"
+    git show HEAD:compiler/src/front/stdsrc.vl > "$TMP/std/compiler/src/front/stdsrc.vl"
     if ! VOLE_EMBED_VOLEC="${VOLE_EMBED_VOLEC:-$PWD/target/volec}" sh "$TMP/std/compiler/std/embed.sh" > "$TMP/std.out" 2>&1; then
         row std FAIL "compiler/std/embed.sh failed: $(head -1 "$TMP/std.out")"
-    elif git show HEAD:compiler/src/front/stdsrc_rust.vl | cmp -s - "$TMP/std/compiler/src/front/stdsrc_rust.vl"; then
-        row std PASS "the committed stdsrc_rust.vl matches compiler/std$setup"
+    elif git show HEAD:compiler/src/front/stdsrc.vl | cmp -s - "$TMP/std/compiler/src/front/stdsrc.vl"; then
+        row std PASS "the committed stdsrc.vl matches compiler/std$setup"
     else
-        row std FAIL "the committed stdsrc_rust.vl is stale: compiler/std/embed.sh, then commit it$setup"
+        row std FAIL "the committed stdsrc.vl is stale: compiler/std/embed.sh, then commit it$setup"
     fi
 else
     row std SKIP "compiler/std unchanged$setup"

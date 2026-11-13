@@ -96,7 +96,7 @@ def directives(path):
             d["csource"] += value.split()
         elif key == "FLAGS":
             d["flags"] += value.split()
-        elif key in ("ARGS", "SOURCE", "CHEADER", "EDITION"):
+        elif key in ("ARGS", "SOURCE", "CHEADER"):
             d[key.lower()] = value.strip() if key != "ARGS" else value
         elif key == "TIMEOUT":
             try:
@@ -217,7 +217,7 @@ def inverse_in(s, gpas):
 
 def macros(s):
     """println( -> println!(, a first argument that is no literal printed."""
-    # (std2's free `std::fmt::write(w, x)`, which the translator writes
+    # (std's free `std::fmt::write(w, x)`, which the translator writes
     # qualified (a program's own `write` shadows the prelude's): Rust's is
     # the macro, as for the bare `write(`)
     s = re.sub(r"(?<![\w:])std::fmt::write\(", "write(", s)

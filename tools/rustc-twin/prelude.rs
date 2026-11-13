@@ -138,7 +138,7 @@ mod vole_twin_prelude {
 
     // `it.collect_in(a)`, `it.unzip_in(a)`, `it.partition_in(f, a)`
     pub trait CollectIn: Iterator + Sized {
-        // (two type arguments, std2's: the collection and the allocator,
+        // (two type arguments, std's: the collection and the allocator,
         // `collect_in::<Vec<T, Gpa>, _>(gpa)`)
         fn collect_in<B: FromIterator<Self::Item>, A>(self, _: A) -> B { self.collect() }
         fn unzip_in<X, Y, FX: Default + Extend<X>, FY: Default + Extend<Y>>(self, _: Gpa) -> (FX, FY)
@@ -201,7 +201,7 @@ mod vole_twin_prelude {
         fn lines_in(self, _: Gpa) -> std::io::Lines<std::io::StdinLock<'static>> { self.lines() }
     }
 
-    // `Command::new_in(p, a)`: std's `Command::new(p)` (std2's Command
+    // `Command::new_in(p, a)`: std's `Command::new(p)` (std's Command
     // keeps its strings on a)
     pub trait CommandNewIn {
         fn new_in<S: AsRef<std::ffi::OsStr>>(program: S, a: Gpa) -> Self;

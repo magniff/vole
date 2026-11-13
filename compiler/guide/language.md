@@ -504,7 +504,7 @@ c-interop`.
 | `wildcard imports are not allowed` | `use m::{a, b};` |
 | `borrowck.use_moved: 'v' is used here after it moved` | lend it (`&v`), or pass `v.clone()` |
 | `borrowck.conflict: cannot borrow 'u' as mutable because it is also borrowed as immutable` | use the shared borrow before the change, or take it again after |
-| `edition.lenient: 'n' is a value where a reference goes` | `f(&n)` |
+| `type.ref-value: 'n' is a value where a reference goes` | `f(&n)` |
 | `expected '&mut Vec<i64, Gpa>', got 'Vec<i64, Gpa>'` | `f(&mut v)` |
 | `cannot assign to immutable variable 'x'` | `let mut x` |
 | `cannot infer the type of closure parameter 'x'` | `\|x: i64\| ...`, or pass it where an `Fn` bound or `fn` type gives it |

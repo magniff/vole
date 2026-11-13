@@ -63,7 +63,7 @@ function pick_scalar(    k) {
 function pick_type(depth,    k) {
     # (0.18: the null niche; not in import mode, where C's `uint8_t *` is
     # a *u8)
-    # (0.28: only with -v nonnull=1. std2's NonNull is an ordinary struct
+    # (0.28: only with -v nonnull=1. std's NonNull is an ordinary struct
     # to the rust edition and does not cross to C yet: "type 'NonNull<u8>'
     # of this parameter cannot cross to C"; the forms below are not run.)
     if (!IMPORT && nonnull && rnd(12) == 0) return rnd(2) ? "nn" : "onn"
