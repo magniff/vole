@@ -49,9 +49,9 @@ these first:
 | you want | run |
 |---|---|
 | an unfamiliar item: its source, callers and what it calls, in one call | `target/volec query context NAME` (replaces show + refs + def) |
-| the source of an item; a whole small file | `target/volec query show NAME`; `query show FILE.vl` (a file under 300 lines is cheaper read whole) |
+| the source of an item; a whole small file | `target/volec query show NAME`; `query show FILE` (a `.vl`, a shader's `.wgsl`, a README; a file under 300 lines is cheaper read whole) |
 | every use of a name | `target/volec query refs NAME` (`--count`, `--in FILE`) |
-| change a few lines of an item, checked | `target/volec edit patch NAME --old 'TEXT' --new 'TEXT'` (`--all`: every match, in an item or a FILE) |
+| change a few lines of an item, checked | `target/volec edit patch NAME --old 'TEXT' --new 'TEXT'` (`--all`: every match, in an item or a FILE; a FILE is also a program's `.wgsl`, checked, or a text file git tracks, not checked) |
 | replace, add, remove an item | `target/volec edit replace\|insert\|delete NAME` (`< text`) |
 | rename, move, change a signature, field or variant everywhere | `target/volec refactor rename\|move\|signature\|field\|variant ...` |
 | missing imports, `pub`, `unsafe` blocks | `target/volec fix` |
@@ -70,8 +70,8 @@ the edits in [docs/refactor.md](docs/refactor.md). NAME is `foo`,
 `module::foo`, `Type::method`, `Struct.field` or `FILE:LINE`; a problem
 is one line, `error CODE: message`, then `try:` lines to run as they are.
 The program is the compiler's from the tree's root; an example's (any
-program's) when a FILE or FILE:LINE argument is one of its files, or
-with `--root DIR` (`query context examples/nes/check.vl:232`, `probe
+program's) in its directory or one under it, when a FILE or FILE:LINE
+argument is one of its files, or with `--root DIR` (`query context examples/nes/check.vl:232`, `probe
 examples/nes/check.vl:234 x -- --check`); a NAME the default program
 lacks gets the `try:` of the program that defines it.
 

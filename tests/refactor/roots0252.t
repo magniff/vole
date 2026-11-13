@@ -25,12 +25,12 @@ crate::only_in_beta	beta/main.vl:2:4	fn	fn only_in_beta() -> i64	effects: none
 note query.other-root: not in this directory's program; answered from beta/main.vl (--root beta/main.vl)
 ## A NAME several define: a try: line each, with its --root.
 $ query def main
-error query.no-root: no root (VOLE_ROOT, ./main.vl, ./compiler/src/main.vl)
+error query.no-root: no root (VOLE_ROOT, ./main.vl, a main.vl above, ./compiler/src/main.vl)
 try: volec query def main --root alpha/main.vl
 try: volec query def main --root beta/main.vl
 [exit 2]
 $ query def nowhere_defined
-error query.no-root: no root (VOLE_ROOT, ./main.vl, ./compiler/src/main.vl)
+error query.no-root: no root (VOLE_ROOT, ./main.vl, a main.vl above, ./compiler/src/main.vl)
 try: volec query def nowhere_defined path/to/main.vl
 [exit 2]
 ## edit patch on another program's file; --all replaces every match.

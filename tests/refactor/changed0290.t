@@ -7,6 +7,16 @@
 ## `check` says what it read: the program's files and its shaders.
 $ check
 ok: 0 errors in main.vl (2 files, 1 shader)
+## (0.29) in a directory inside a program (none of its own main.vl), that
+## program is the default one, for check and every other command
+% mkdir notes && cd notes && volec check && volec query def twice && volec edit patch twice --old 'x * 2' --new 'x + x' --dry-run; cd .. && rmdir notes
+crate::util::twice	../util.vl:1:8	fn	pub fn twice(x: i64) -> i64	effects: none
+--- a/../util.vl
++++ b/../util.vl
+@@ -2 +2 @@
+-    x * 2
++    x + x
+ok: 0 errors in ../main.vl (2 files, 1 shader)
 ## nothing changed: said, not passed over
 $ check --changed --since HEAD
 ok: no program to check since HEAD (0 changed files)
