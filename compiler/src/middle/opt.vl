@@ -10,8 +10,12 @@ use crate::base::{IntVec, alloc_array, die, free};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::timer::{
-    T_ATTRS, T_GLOBAL_DCE, T_HEAP, T_INLINE, T_IPCP, T_LICM, T_LOOPS, T_PROMOTE, T_SCALAR, T_SLP,
-    T_TRE, timer_add, timer_now,
+    P_ADCE, P_CONST_SLOTS, P_COPY_ELISION, P_DCE, P_ENTRY_FACTS, P_FN_SIZE, P_GVN, P_HEAP_TO_STACK,
+    P_IF_CONVERT, P_INSTCOMBINE, P_LICM, P_LOOP_EXITS, P_LOOP_ROTATE, P_LOOP_SETUP,
+    P_LOOP_TRANSFORM, P_PROMOTE, P_PURE_CALLS, P_RANGES, P_REDUCE_UNSWITCH, P_RESOLVE, P_SCCP,
+    P_SIMPLIFY_CFG, P_SROA, P_TAIL_RECURSION, P_THREAD_TAGS, P_TRIVIAL_PHIS, P_UNROLL_RUNTIME,
+    P_VECTORIZE, T_ATTRS, T_GLOBAL_DCE, T_HEAP, T_INLINE, T_IPCP, T_LICM, T_LOOPS, T_PROMOTE,
+    T_SCALAR, T_SLP, T_TRE, pass_done, timer_add, timer_now,
 };
 use crate::front::modules::{module_of, within_std};
 use crate::gen0::gen::fn_is_global;
@@ -44,7 +48,7 @@ use crate::middle::loops::{rotate_loops, seal_all};
 use crate::middle::lower::ssa::ssa_undef;
 use crate::middle::lsr::reduce_and_unswitch;
 use crate::middle::parallel::{
-    cleanup_all, optimize_components, parallel_begin, phase_time, simplify_all,
+    P_CLEANUP, P_SLP, cleanup_all, optimize_components, parallel_begin, phase_time, simplify_all,
 };
 use crate::middle::promote::promote_loop_memory;
 use crate::middle::range::fold_by_ranges;
@@ -588,6 +592,7 @@ pub fn cleanup_function(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
     remove_unreachable(cx, fi);
     remove_trivial_phis(cx, fi, pcx);
     resolve_all(cx, fi);
+    pass_done(P_CLEANUP, pcx);
     verify_func(cx, fi, c"lowering, inlining and cleanup", pcx);
 }
 
@@ -605,35 +610,55 @@ pub fn optimize_after_inlining(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
 }
 
 // The scalar pipeline (-O1), twice: constants, peepholes, control flow,
-// value numbering, dead code.
+// value numbering, dead code. (0.29: pass_done after each, for
+// --time-passes=passes.)
 pub fn simplify_function(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
     for round in 0..2 {
         sccp(cx, fi, pcx);
+        pass_done(P_SCCP, pcx);
         verify_func(cx, fi, c"sccp", pcx);
         instcombine(cx, fi, pcx);
+        pass_done(P_INSTCOMBINE, pcx);
         verify_func(cx, fi, c"instcombine", pcx);
-        if round == 0 && elide_copies(cx, fi, pcx) {
-            verify_func(cx, fi, c"copy elision", pcx);
-        }
-        if round == 0 && run_sroa(cx, fi, pcx) {
-            verify_func(cx, fi, c"sroa", pcx);
-        }
-        if round == 0 && promote_constant_slots(cx, fi, pcx) {
-            verify_func(cx, fi, c"constant slots", pcx);
+        if round == 0 {
+            let elided = elide_copies(cx, fi, pcx);
+            pass_done(P_COPY_ELISION, pcx);
+            if elided {
+                verify_func(cx, fi, c"copy elision", pcx);
+            }
+            let replaced = run_sroa(cx, fi, pcx);
+            pass_done(P_SROA, pcx);
+            if replaced {
+                verify_func(cx, fi, c"sroa", pcx);
+            }
+            let promoted = promote_constant_slots(cx, fi, pcx);
+            pass_done(P_CONST_SLOTS, pcx);
+            if promoted {
+                verify_func(cx, fi, c"constant slots", pcx);
+            }
         }
         simplify_cfg(cx, fi, pcx);
+        pass_done(P_SIMPLIFY_CFG, pcx);
         verify_func(cx, fi, c"simplify_cfg", pcx);
         run_gvn(cx, fi, pcx);
+        pass_done(P_GVN, pcx);
         verify_func(cx, fi, c"gvn", pcx);
         eliminate_dead_code(cx, fi, pcx);
+        pass_done(P_DCE, pcx);
         verify_func(cx, fi, c"dead code elimination", pcx);
         simplify_cfg(cx, fi, pcx);
+        pass_done(P_SIMPLIFY_CFG, pcx);
         verify_func(cx, fi, c"simplify_cfg", pcx);
-        if round == 0 && thread_tags(cx, fi, pcx) {
-            verify_func(cx, fi, c"threading on tags", pcx);
+        if round == 0 {
+            let threaded = thread_tags(cx, fi, pcx);
+            pass_done(P_THREAD_TAGS, pcx);
+            if threaded {
+                verify_func(cx, fi, c"threading on tags", pcx);
+            }
         }
     }
     remove_trivial_phis(cx, fi, pcx);
+    pass_done(P_TRIVIAL_PHIS, pcx);
 }
 
 pub fn optimize_program(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
@@ -730,7 +755,9 @@ pub fn optimize_component_function(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp
     unsafe {
         ir_enter(cx, fi, pcx);
         let mut t = timer_now(pcx);
-        if eliminate_tail_recursion(cx, fi, pcx) {
+        let tail = eliminate_tail_recursion(cx, fi, pcx);
+        pass_done(P_TAIL_RECURSION, pcx);
+        if tail {
             cleanup_function(cx, fi, pcx);
             simplify_function(cx, fi, pcx);
         }
@@ -739,14 +766,23 @@ pub fn optimize_component_function(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp
         inline_rounds(cx, fi, pcx);
         // (0.18.1) the checks of its requires, inlined at its entry, as facts
         entry_assumes(cx, fi, pcx);
+        pass_done(P_ENTRY_FACTS, pcx);
         timer_add(T_INLINE, t, pcx);
         t = timer_now(pcx);
-        if heap_to_stack(cx, fi, pcx) {
+        let on_stack = heap_to_stack(cx, fi, pcx);
+        pass_done(P_HEAP_TO_STACK, pcx);
+        if on_stack {
             simplify_function(cx, fi, pcx);
-        } else if repeated_pure_calls(cx, fi, pcx) {
-            // (0.16: merged now that the callees' attributes are known)
-            run_gvn(cx, fi, pcx);
-            eliminate_dead_code(cx, fi, pcx);
+        } else {
+            let repeated = repeated_pure_calls(cx, fi, pcx);
+            pass_done(P_PURE_CALLS, pcx);
+            if repeated {
+                // (0.16: merged now that the callees' attributes are known)
+                run_gvn(cx, fi, pcx);
+                pass_done(P_GVN, pcx);
+                eliminate_dead_code(cx, fi, pcx);
+                pass_done(P_DCE, pcx);
+            }
         }
         timer_add(T_HEAP, t, pcx);
         if inlined_everywhere(fi, pcx) {
@@ -759,6 +795,7 @@ pub fn optimize_component_function(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp
         ir_shrink(cx);
         // (asked before, through a call made direct, it is asked again)
         forget_fn_caches(fi);
+        pass_done(P_FN_SIZE, pcx);
         timer_add(T_ATTRS, t, pcx);
     }
 }
@@ -785,10 +822,13 @@ pub fn slp_function(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
             ir_enter(cx, fi, pcx);
             drop_assumes(cx, fi, pcx);
         }
-        if (*pcx.fn_live.add(fi as usize)) != 0 && slp_vectorize(cx, fi, pcx) {
+        let packed = (*pcx.fn_live.add(fi as usize)) != 0 && slp_vectorize(cx, fi, pcx);
+        pass_done(P_SLP, pcx);
+        if packed {
             ir_enter(cx, fi, pcx);
             resolve_all(cx, fi);
             eliminate_dead_code(cx, fi, pcx);
+            pass_done(P_DCE, pcx);
             verify_func(cx, fi, c"SLP vectorization", pcx);
         }
         timer_add(T_SLP, t, pcx);
@@ -808,8 +848,11 @@ fn loop_pipeline(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
     }
     timer_add(T_LOOPS, t, pcx);
     t = timer_now(pcx);
-    if run_licm(cx, fi, pcx) {
+    let moved = run_licm(cx, fi, pcx);
+    pass_done(P_LICM, pcx);
+    if moved {
         resolve_all(cx, fi);
+        pass_done(P_RESOLVE, pcx);
         verify_func(cx, fi, c"licm", pcx);
         simplify_function(cx, fi, pcx);
     }
@@ -817,7 +860,9 @@ fn loop_pipeline(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
     // After LICM: the addresses of slots and statics are out of the
     // loops by then.
     t = timer_now(pcx);
-    if promote_loop_memory(cx, fi, pcx) {
+    let promoted = promote_loop_memory(cx, fi, pcx);
+    pass_done(P_PROMOTE, pcx);
+    if promoted {
         simplify_function(cx, fi, pcx);
     }
     timer_add(T_PROMOTE, t, pcx);
@@ -829,23 +874,33 @@ fn optimize_loops(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
     ir_enter(cx, fi, pcx);
     resolve_all(cx, fi);
     seal_all(cx, fi);
+    pass_done(P_LOOP_SETUP, pcx);
     simplify_cfg(cx, fi, pcx);
+    pass_done(P_SIMPLIFY_CFG, pcx);
     // Between the passes a light cleanup only; the scalar pipeline runs
     // once after them (in optimize_program).
     let mut changed = false;
-    if count_loop_exits(cx, fi, pcx) {
+    let counted = count_loop_exits(cx, fi, pcx);
+    pass_done(P_LOOP_EXITS, pcx);
+    if counted {
         changed = true;
         light_cleanup(cx, fi, pcx);
     }
-    if rotate_loops(cx, fi, pcx) {
+    let rotated = rotate_loops(cx, fi, pcx);
+    pass_done(P_LOOP_ROTATE, pcx);
+    if rotated {
         changed = true;
         light_cleanup(cx, fi, pcx);
     }
-    if transform_loops(cx, fi, pcx) {
+    let transformed = transform_loops(cx, fi, pcx);
+    pass_done(P_LOOP_TRANSFORM, pcx);
+    if transformed {
         changed = true;
         light_cleanup(cx, fi, pcx);
     }
-    if fold_by_ranges(cx, fi, pcx) {
+    let folded = fold_by_ranges(cx, fi, pcx);
+    pass_done(P_RANGES, pcx);
+    if folded {
         changed = true;
         light_cleanup(cx, fi, pcx);
     }
@@ -855,7 +910,12 @@ fn optimize_loops(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
     // were converted may be a diamond itself then, the tree of an
     // inlined comparator's `<`)
     let mut rounds: i64 = 0;
-    while rounds < 4 && if_convert_loops(cx, fi, pcx) {
+    while rounds < 4 {
+        let converted = if_convert_loops(cx, fi, pcx);
+        pass_done(P_IF_CONVERT, pcx);
+        if !converted {
+            break;
+        }
         changed = true;
         light_cleanup(cx, fi, pcx);
         rounds += 1;
@@ -863,6 +923,7 @@ fn optimize_loops(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
     // (0.10: after the checks the ranges remove, before strength
     // reduction rewrites the addresses)
     let vectorized = vectorize_loops(cx, fi, pcx);
+    pass_done(P_VECTORIZE, pcx);
     if vectorized {
         changed = true;
         light_cleanup(cx, fi, pcx);
@@ -875,24 +936,33 @@ fn optimize_loops(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
         // (and the LCSSA phis of the loops it left)
         resolve_all(cx, fi);
         remove_trivial_phis(cx, fi, pcx);
+        pass_done(P_LOOP_TRANSFORM, pcx);
         changed = true;
         light_cleanup(cx, fi, pcx);
     }
     // (0.11: the loops the vectorizer left, in its frame; the loop forest
     // it found is current when it changed nothing)
-    if unroll_runtime_loops(cx, fi, !vectorized && !unrolled && pcx.vectorize, pcx) {
+    let unrolled_runtime =
+        unroll_runtime_loops(cx, fi, !vectorized && !unrolled && pcx.vectorize, pcx);
+    pass_done(P_UNROLL_RUNTIME, pcx);
+    if unrolled_runtime {
         changed = true;
         light_cleanup(cx, fi, pcx);
     }
-    if reduce_and_unswitch(cx, fi, pcx) {
+    let reduced = reduce_and_unswitch(cx, fi, pcx);
+    pass_done(P_REDUCE_UNSWITCH, pcx);
+    if reduced {
         changed = true;
     }
-    if aggressive_dce(cx, fi, pcx) {
+    let removed = aggressive_dce(cx, fi, pcx);
+    pass_done(P_ADCE, pcx);
+    if removed {
         changed = true;
         verify_func(cx, fi, c"aggressive dead code elimination", pcx);
     }
     if changed {
         resolve_all(cx, fi);
+        pass_done(P_RESOLVE, pcx);
         verify_func(cx, fi, c"loop passes", pcx);
     }
     changed
@@ -901,10 +971,14 @@ fn optimize_loops(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
 // Unused values and trivial control flow, between the loop passes.
 fn light_cleanup(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
     resolve_all(cx, fi);
+    pass_done(P_RESOLVE, pcx);
     eliminate_dead_code(cx, fi, pcx);
+    pass_done(P_DCE, pcx);
     simplify_cfg(cx, fi, pcx);
+    pass_done(P_SIMPLIFY_CFG, pcx);
     remove_trivial_phis(cx, fi, pcx);
     seal_all(cx, fi);
+    pass_done(P_TRIVIAL_PHIS, pcx);
     verify_func(cx, fi, c"cleanup", pcx);
 }
 

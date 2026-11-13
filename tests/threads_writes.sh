@@ -142,6 +142,8 @@ READ='base::SYMS_FROZEN	own: set by pool_run around every phase, the same in eve
 base::ctx::Ctx.time_instructions	off: --time-passes turns the cache off (cc_wanted), set by the options before the tasks
 base::ctx::Ctx.perf_fd	off: the same; opened by counters_open on the main thread before the tasks, read-only after
 base::ctx::Ctx.counters_off	off: the same (counters_open)
+base::ctx::Ctx.time_each_pass	off: the same (--time-passes=passes), set by the options before the tasks
+base::ctx::Ctx.pass_counts	off: the same; atomics a pass'"'"'s end adds to (timer::pass_done) only when time_each_pass, which runs on one thread (serial_only)
 base::ctx::Ctx.vec_stats_fn	off: --vec-stats=FN is an option the cache does not know (ARGS_UNKNOWN), set by the options before the tasks
 base::ctx::Ctx.static_named	output: none; the emission (materialize) reads it only to stop on an internal error, made by statics_named_by_ir before the tasks
 base::ctx::Ctx.vec_tmpl	key: std'"'"'s Vec template, found in the program'"'"'s types (types_hash) by init_vec_facts before the tasks, read-only after

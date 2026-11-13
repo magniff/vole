@@ -3,9 +3,12 @@
 // on macOS and glibc alike). Timing changes nothing the compiler emits.
 // (0.25.5) --time-passes=instructions: the instructions retired instead,
 // which a loaded machine hardly changes, from the system's own counter:
-// macOS's proc_info (proc_pid_rusage's ri_instructions), Linux's
+// macOS's thread_selfcounts (0.29; before it, and where the system has
+// none, proc_info: proc_pid_rusage's ri_instructions), Linux's
 // perf_event_open (user space; where perf_event_paranoid or a container
 // refuses it, the build stops with time.instructions).
+
+use std::sync::atomic::{Atomic, Ordering};
 
 use crate::base::{STDERR, buf_fmt, buf_new, buf_write_fd, cstr};
 use crate::base::comp::Comp;
@@ -27,6 +30,10 @@ extern "C" {
     #[link_name = "getpid"]
     fn timer_getpid() -> i32;
 }
+
+// pcx.perf_fd on macOS, where no file is the counter: the thread's
+// counter is read (thread_instructions), not the process's.
+const PERF_THREAD: i64 = -3;
 
 // Opens the system's counter, on the main thread before any task: false
 // when the system will not count (instructions_retired then says -1).
@@ -59,14 +66,49 @@ pub fn counters_open(pcx: &mut Ctx<Comp>) -> bool {
         let fd = unsafe { timer_syscall(number, attr.as_mut_ptr() as *mut u8, 0, -1, -1, 0) };
         pcx.perf_fd = if fd < 0 { -2 } else { fd };
     }
+    // (0.29) macOS: the thread's counter where the system has it
+    if !off && (host == T_AARCH64_MACOS || host == T_X86_64_MACOS) && thread_instructions() >= 0 {
+        pcx.perf_fd = PERF_THREAD;
+    }
     instructions_retired(pcx) >= 0
 }
 
+// (0.29) macOS: the instructions this thread has retired, or -1 where the
+// system does not count them: thread_selfcounts (system call 186) of kind
+// 1, the instructions and then the cycles. It costs under 2000
+// instructions where proc_info costs 6000 to 30000 (it gathers the whole
+// process's usage), which was a twentieth of a build timed by phase and
+// would be a quarter of one timed by pass; a build that counts runs on
+// one thread (parallel::serial_only), so the thread's count is the
+// build's.
+fn thread_instructions() -> i64 {
+    let mut counts: [u8; 16] = [0; 16];
+    // UNSAFE: a system call (syscall, a C function), with a buffer's
+    // address.
+    // SAFETY: counts has the 16 bytes the call is told it has, and the
+    // kernel writes at most that many.
+    let r = unsafe { timer_syscall(186, 1, counts.as_mut_ptr() as *mut u8, 16) };
+    if r != 0 { -1 } else { le64(&counts[0..8]) }
+}
+
 // The instructions this process has retired, or -1 when the system will
-// not say (or counters_open has not run).
+// not say (or counters_open has not run). (0.29: the counters that need
+// no question of the host first. host_target asks the system and
+// allocates, at every reading: some 25000 instructions, a twentieth of a
+// build timed by phase.)
 pub fn instructions_retired(pcx: &Ctx<Comp>) -> i64 {
     if pcx.counters_off != 2 {
         return -1;
+    }
+    if pcx.perf_fd == PERF_THREAD {
+        return thread_instructions();
+    }
+    if pcx.perf_fd >= 0 {
+        let mut count: [u8; 8] = [0; 8];
+        // UNSAFE: read, a C function, into a buffer by its address.
+        // SAFETY: count has the 8 bytes read is told it may write.
+        let n = unsafe { timer_read(pcx.perf_fd as i32, count.as_mut_ptr() as *mut u8, 8) };
+        return if n != 8 { -1 } else { le64(&count[..]) };
     }
     let host = crate::host_target();
     if host == T_AARCH64_MACOS || host == T_X86_64_MACOS {
@@ -86,14 +128,7 @@ pub fn instructions_retired(pcx: &Ctx<Comp>) -> i64 {
         }
         return le64(&info[248..256]);
     }
-    if pcx.perf_fd < 0 {
-        return -1;
-    }
-    let mut count: [u8; 8] = [0; 8];
-    // UNSAFE: read, a C function, into a buffer by its address.
-    // SAFETY: count has the 8 bytes read is told it may write.
-    let n = unsafe { timer_read(pcx.perf_fd as i32, count.as_mut_ptr() as *mut u8, 8) };
-    if n != 8 { -1 } else { le64(&count[..]) }
+    -1
 }
 
 // A little-endian 64-bit number.
@@ -184,6 +219,182 @@ fn phase_name(k: i64) -> *mut u8 {
     }
 }
 
+// ---- (0.29) --time-passes=passes: the instructions of each pass ----
+//
+// The phases above are few (the loop passes are one, the scalar pipeline
+// is in four of them): which pass pays for a change they do not say. With
+// `passes`, the pipelines mark the end of each pass (pass_done), and the
+// instructions retired since the mark before go to that pass: every
+// instruction of the compilation is in exactly one row, a pass's or the
+// rest of a phase (what the phase ran outside any pass marked, timer_add
+// and timer_sub mark it). A mark reads the system's counter, a system
+// call: the rows are less what the marks themselves cost, measured when
+// the report is made (pass_overhead).
+
+pub const P_SCCP: i64 = 0;
+pub const P_INSTCOMBINE: i64 = 1;
+pub const P_COPY_ELISION: i64 = 2;
+pub const P_SROA: i64 = 3;
+pub const P_CONST_SLOTS: i64 = 4;
+pub const P_SIMPLIFY_CFG: i64 = 5;
+pub const P_GVN: i64 = 6;
+pub const P_DCE: i64 = 7;
+pub const P_THREAD_TAGS: i64 = 8;
+pub const P_TRIVIAL_PHIS: i64 = 9;
+pub const P_CLEANUP: i64 = 10;
+pub const P_TAIL_RECURSION: i64 = 11;
+pub const P_INLINE: i64 = 12;
+pub const P_ENTRY_FACTS: i64 = 13;
+pub const P_HEAP_TO_STACK: i64 = 14;
+pub const P_PURE_CALLS: i64 = 15;
+pub const P_LOOP_SETUP: i64 = 16;
+pub const P_LOOP_EXITS: i64 = 17;
+pub const P_LOOP_ROTATE: i64 = 18;
+pub const P_LOOP_TRANSFORM: i64 = 19;
+pub const P_RANGES: i64 = 20;
+pub const P_IF_CONVERT: i64 = 21;
+pub const P_VECTORIZE: i64 = 22;
+pub const P_UNROLL_RUNTIME: i64 = 23;
+pub const P_REDUCE_UNSWITCH: i64 = 24;
+pub const P_ADCE: i64 = 25;
+pub const P_LICM: i64 = 26;
+pub const P_PROMOTE: i64 = 27;
+pub const P_FN_SIZE: i64 = 28;
+pub const P_SLP: i64 = 29;
+pub const P_ISEL: i64 = 30;
+pub const P_REGALLOC: i64 = 31;
+pub const P_FRAME_LAYOUT: i64 = 32;
+pub const P_EMIT: i64 = 33;
+pub const P_RESOLVE: i64 = 34;
+// The passes; after them a row per phase (its rest), and one for what
+// follows the last phase.
+const P_COUNT: i64 = 35;
+const P_ROWS: i64 = P_COUNT + T_COUNT + 1;
+
+fn pass_name(k: i64) -> &'static str {
+    match k {
+        0 => "sccp",
+        1 => "instcombine",
+        2 => "copy elision",
+        3 => "sroa",
+        4 => "constant slots",
+        5 => "simplify_cfg",
+        6 => "gvn",
+        7 => "dead code elimination",
+        8 => "threading on tags",
+        9 => "trivial phis",
+        10 => "cleanup (resolve, unreachable blocks, trivial phis)",
+        11 => "tail recursion",
+        12 => "inlining (the calls: decisions and copies)",
+        13 => "entry facts",
+        14 => "heap to stack",
+        15 => "repeated pure calls",
+        16 => "loops: resolve, seal",
+        17 => "loops: exit counts",
+        18 => "loops: rotation",
+        19 => "loops: unrolling and the other transforms",
+        20 => "loops: folding by ranges",
+        21 => "loops: if conversion",
+        22 => "loops: vectorization",
+        23 => "loops: runtime unrolling",
+        24 => "loops: strength reduction, unswitching",
+        25 => "aggressive dead code elimination",
+        26 => "licm",
+        27 => "scalar promotion",
+        28 => "function sizes, shrinking the tables",
+        29 => "SLP vectorization",
+        30 => "instruction selection",
+        31 => "register allocation",
+        32 => "frame, shrink wrapping, block layout",
+        33 => "emission",
+        _ => "resolve (between passes)",
+    }
+}
+
+// --time-passes=passes is on: room for the counts (the last mark; each
+// row's instructions; each row's marks), and the first mark.
+pub fn passes_open(pcx: &mut Ctx<Comp>) {
+    pcx.time_each_pass = true;
+    pcx.pass_counts.clear();
+    for i in 0..1 + 2 * P_ROWS {
+        pcx.pass_counts.push(Atomic::new(0));
+    }
+    pcx.pass_counts[0].store(instructions_retired(pcx), Ordering::Relaxed);
+}
+
+// The instructions retired since the last mark go to row k; this is the
+// mark now. (Atomics: the context is shared and not mutable here; one
+// thread runs when passes are timed, parallel::serial_only.)
+fn pass_mark(k: i64, pcx: &Ctx<Comp>) {
+    let t = instructions_retired(pcx);
+    let last = pcx.pass_counts[0].swap(t, Ordering::Relaxed);
+    pcx.pass_counts[(1 + k) as usize].fetch_add(t - last, Ordering::Relaxed);
+    pcx.pass_counts[(1 + P_ROWS + k) as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+// Pass k (P_*) ends here: what ran since the last mark was it.
+pub fn pass_done(k: i64, pcx: &Ctx<Comp>) {
+    if pcx.time_each_pass {
+        pass_mark(k, pcx);
+    }
+}
+
+// What one mark costs: the fewest instructions between two readings of
+// the counter, of a few.
+fn pass_overhead(pcx: &Ctx<Comp>) -> i64 {
+    let mut best: i64 = -1;
+    let mut last = instructions_retired(pcx);
+    for i in 0..32 {
+        let t = instructions_retired(pcx);
+        if best < 0 || t - last < best {
+            best = t - last;
+        }
+        last = t;
+    }
+    best
+}
+
+// The rows of --time-passes=passes, after the phases'. (The front end's
+// phases are taken out of one another, timer_sub, so what a mark of
+// theirs gets is not one phase's: they are one row here.)
+fn passes_report(out: i64, pcx: &Ctx<Comp>) {
+    pass_mark(P_COUNT + T_COUNT, pcx);
+    let each = pass_overhead(pcx);
+    let mut marks: i64 = 0;
+    let mut front: i64 = 0;
+    buf_fmt(out, format_args("passes (instructions retired, each in one row):\n"));
+    for k in 0..P_ROWS {
+        let n = pcx.pass_counts[(1 + P_ROWS + k) as usize].load(Ordering::Relaxed);
+        if n == 0 {
+            continue;
+        }
+        marks += n;
+        let mut v = pcx.pass_counts[(1 + k) as usize].load(Ordering::Relaxed) - n * each;
+        if v < 0 {
+            v = 0;
+        }
+        let frac = (v % 1000000) / 100000;
+        let phase = k - P_COUNT;
+        if k < P_COUNT {
+            buf_fmt(out, format_args("{}.{frac} M  {}\n", v / 1000000, pass_name(k)));
+        } else if phase == T_PARSE || phase == T_CHECK || phase >= T_LOAD && phase < T_COUNT {
+            front += v;
+        } else if phase < T_COUNT {
+            buf_fmt(out,
+                format_args("{}.{frac} M  rest of: {}\n", v / 1000000,
+                    str::from_utf8(cstr(phase_name(phase))).unwrap()));
+        } else {
+            buf_fmt(out, format_args("{}.{frac} M  after the last phase\n", v / 1000000));
+        }
+    }
+    buf_fmt(out,
+        format_args("{}.{} M  the front end (its phases are above)\n", front / 1000000,
+            (front % 1000000) / 100000));
+    buf_fmt(out,
+        format_args("{} M  the {marks} marks themselves ({each} each), not in the rows\n",
+            marks * each / 1000000));
+}
+
 // The time now (0 when not timing).
 pub fn timer_now(pcx: &Ctx<Comp>) -> i64 {
     if pcx.time_passes { now(pcx) } else { 0 }
@@ -198,6 +409,7 @@ pub fn timer_sub(outer: i64, k: i64, start: i64, pcx: &Ctx<Comp>) {
             set_t_totals(t_totals_copy); }
         { let mut t_totals_copy = get_t_totals(); t_totals_copy[outer as usize] -= spent;
             set_t_totals(t_totals_copy); }
+        pass_done(P_COUNT + k, pcx);
     }
 }
 
@@ -206,6 +418,7 @@ pub fn timer_add(k: i64, start: i64, pcx: &Ctx<Comp>) {
     if pcx.time_passes {
         { let mut t_totals_copy = get_t_totals(); t_totals_copy[k as usize] += now(pcx) - start;
             set_t_totals(t_totals_copy); }
+        pass_done(P_COUNT + k, pcx);
     }
 }
 
@@ -237,6 +450,9 @@ pub fn timer_report(pcx: &Ctx<Comp>) {
         buf_fmt(out, format_args("{} M  total (instructions retired)\n", total / unit));
     } else {
         buf_fmt(out, format_args("{} ms  total\n", total / unit));
+    }
+    if pcx.time_each_pass {
+        passes_report(out, pcx);
     }
     if pcx.t_places_bodies[0] >= 0 {
         buf_fmt(out,
