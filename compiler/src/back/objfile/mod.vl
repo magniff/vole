@@ -42,7 +42,7 @@ use crate::back::enc_arm64::{AOp, aop_none, init_a64};
 use crate::back::enc_x86::{XOp, init_x86, xop_none};
 use crate::base::{
     alloc_array, alloc_zeroed, buf_byte, buf_clear, buf_fmt, buf_len, buf_new, buf_ptr, buf_slice,
-    buf_w16, buf_w32, buf_write_file, cstr, die, free, memcpy, realloc, strlen,
+    buf_w16, buf_w32, buf_write_file, cstr, die, free, memcpy, realloc,
 };
 
 use assemble::{Memo, assemble_begin, assemble_line};
@@ -249,6 +249,13 @@ pub fn raw_out(at: i64, n: i64, asm: &mut Asm<Comp>) -> bool {
 
 // Appends bytes to b; returns their offset there.
 pub fn bytes_append(b: &mut ObjBytes, bytes: &[u8]) -> i64 {
+    // UNSAFE: ObjBytes is a malloc'd block grown with realloc and filled with
+    // memcpy (RAW, a static, cannot hold a Vec: its allocator is not const).
+    // SAFETY: b.data is null or a block of b.cap bytes: only this function
+    // writes data and cap, and it sets cap to the size realloc was given
+    // (realloc(null, n) is malloc(n); a failed realloc dies); after the growth
+    // cap >= len + n, so [at, at + n) is inside the block; bytes.ptr has n
+    // bytes (a slice's); the two cannot overlap, b being borrowed mutably.
     unsafe {
         let n = bytes.len() as i64;
         if b.len + n > b.cap {
@@ -516,6 +523,13 @@ pub fn names_get(m: &Names<Comp>, name: &[u8]) -> i64 {
 }
 
 fn name_at(m: NameMap, slot: i64) -> &'static [u8] {
+    // UNSAFE: NameMap keeps each name as a pointer and a length in two raw
+    // tables (it is a static's type, arch::table's INSN_BY_NAME, which cannot
+    // hold a Vec).
+    // SAFETY: the callers (name_put, name_get) pass a slot below m.size, the
+    // tables' length (masked by size - 1), whose value is not 0: name_put
+    // stored there a block of lens[slot] + 1 bytes it allocated and filled,
+    // and no name is ever freed, which is what 'static says.
     unsafe {
         std::slice::from_raw_parts(((*m.ptrs.add(slot as usize)) as *mut u8).add((0) as usize),
             ((*m.lens.add(slot as usize)) - (0)) as usize)
@@ -523,6 +537,15 @@ fn name_at(m: NameMap, slot: i64) -> &'static [u8] {
 }
 
 pub fn name_put(m: &mut NameMap, name: &[u8], value: i64) {
+    // UNSAFE: NameMap's raw tables (see name_at): allocated, indexed and
+    // freed by hand.
+    // SAFETY: ptrs, lens and vals are blocks of m.size entries (alloc_array,
+    // zeroed), or unused while m.size is 0, in which case the first branch
+    // allocates before any read; every index is below size: i < old.size in
+    // the copy, slot masked by size - 1 (a power of two: 256 doubled); the
+    // loop ends because the table is at most half full; the old tables are
+    // freed once, after their names moved, and `old` is not used again; the
+    // copy has n + 1 bytes for name's n.
     unsafe {
         if (m.count + 1) * 2 > m.size {
             let old = *m;
@@ -562,6 +585,10 @@ pub fn name_put(m: &mut NameMap, name: &[u8], value: i64) {
 }
 
 pub fn name_get(m: NameMap, name: &[u8]) -> i64 {
+    // UNSAFE: NameMap's raw tables (see name_at).
+    // SAFETY: size is not 0 here, so vals is a block of size entries; slot is
+    // masked by size - 1; the loop ends at an empty slot, of which a table at
+    // most half full has one.
     unsafe {
         if m.size == 0 {
             return 0;
@@ -697,12 +724,9 @@ fn w64(out: i64, v: i64) {
 }
 
 // A name in a fixed 16-byte field.
-fn wname16(out: i64, name: *mut u8) {
-    unsafe {
-        let n = strlen(name) as i64;
-        for i in 0..16 {
-            w8(out, if i < n { (*name.add(i as usize)) as i64 } else { 0 });
-        }
+fn wname16(out: i64, name: &[u8]) {
+    for i in 0..16 {
+        w8(out, if i < name.len() { name[i] as i64 } else { 0 });
     }
 }
 
@@ -817,6 +841,13 @@ pub fn asm_flush(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
 // (0.18.1) asm_flush on the assembler's thread (middle::threads): the text
 // so far, copied, is handed to it.
 pub fn asm_hand_over(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
+    // UNSAFE: the text goes to the assembler's thread as a malloc'd block
+    // (asm_thread_push's queue holds a pointer and a length; the thread frees
+    // it): a copy made with memcpy.
+    // SAFETY: copy has n + 1 bytes (alloc_zeroed dies when out of memory);
+    // buf_ptr(cx.asm) is the buffer's block of buf_len(cx.asm) = n bytes, and
+    // no buffer call comes between taking the pointer and the copy; this
+    // thread gives the copy away and does not touch it again.
     unsafe {
         if pcx.asm_stream {
             c_module_symbols(cx, pcx);
@@ -831,11 +862,14 @@ pub fn asm_hand_over(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
 
 // ---- Output ----
 
+// UNSAFE: libc's system and unlink, which std does not wrap as the
+// compiler uses them (a shell command line; a path as a C string).
+// SAFETY: the declarations are libc's (int system(const char *), int
+// unlink(const char *)): both read their argument up to its NUL and keep
+// no pointer; each call says why its argument is such a string.
 extern "C" {
     fn system(command: *mut u8) -> i32;
     fn unlink(path: *mut u8) -> i32;
-    fn getenv(name: *mut u8) -> *mut u8;
-    fn memchr(s: *mut u8, c: i32, n: u64) -> *mut u8;
 }
 
 // What the compiler writes: assembly (`-S`, `--emit-asm`, or an output
@@ -847,56 +881,64 @@ pub const OUT_EXECUTABLE: i64 = 2;
 
 // The output mode for `path` when no option chose one.
 pub fn output_mode_of(path: *mut u8) -> i64 {
-    unsafe {
-        let n = strlen(path) as i64;
-        if n >= 2 && (*path.add((n - 2) as usize)) == b'.'
-            && (*path.add((n - 1) as usize)) == b's' {
-            return OUT_ASM;
-        }
-        if n >= 2 && (*path.add((n - 2) as usize)) == b'.'
-            && (*path.add((n - 1) as usize)) == b'o' {
-            return OUT_OBJECT;
-        }
-        OUT_EXECUTABLE
+    let p = cstr(path);
+    if p.ends_with(b".s") {
+        return OUT_ASM;
     }
+    if p.ends_with(b".o") {
+        return OUT_OBJECT;
+    }
+    OUT_EXECUTABLE
 }
 
 // Writes the program (ASM) to `path` as the output mode says.
 pub fn write_output(cx: &mut FnCtx<Comp>, path: *mut u8, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        c_module_symbols(cx, pcx);
-        if pcx.output_mode == OUT_ASM {
-            buf_write_file(cx.asm, path);
-            return;
-        }
-        if pcx.output_mode == OUT_OBJECT {
-            write_object(cx, path, pcx);
-            return;
-        }
-        let obj = buf_new();
-        buf_fmt(obj, format_args("{}.vole.o\0", str::from_utf8(cstr(path)).unwrap()));
-        let obj_path = buf_ptr(obj);
-        write_object(cx, obj_path, pcx);
-        // (0.25.3: the link's inputs first, its failure one error)
-        check_link_inputs(pcx);
-        build_linking(path, pcx);
-        let mut status = link_program(path, obj_path, &mut cx.assembler, pcx) as i32;
-        if status != 0 {
-            unlink(obj_path);
-            link_failed(status as i64, path, pcx);
-        }
-        if status == 0 && pcx.debug_info && !get_elf() {
-            // (-g) On macOS the debug information stays in the object, which
-            // goes: dsymutil gathers it into <path>.dSYM first, as clang does.
-            let dsym = buf_new();
-            buf_fmt(dsym, format_args("dsymutil '{}'\0", str::from_utf8(cstr(path)).unwrap()));
-            status = system(buf_ptr(dsym));
-        }
-        unlink(obj_path);
-        if status != 0 {
-            die(c"dsymutil failed");
-        }
+    c_module_symbols(cx, pcx);
+    if pcx.output_mode == OUT_ASM {
+        buf_write_file(cx.asm, path);
+        return;
     }
+    if pcx.output_mode == OUT_OBJECT {
+        write_object(cx, path, pcx);
+        return;
+    }
+    let obj = buf_new();
+    buf_fmt(obj, format_args("{}.vole.o\0", str::from_utf8(cstr(path)).unwrap()));
+    let obj_path = buf_ptr(obj);
+    write_object(cx, obj_path, pcx);
+    // (0.25.3: the link's inputs first, its failure one error)
+    check_link_inputs(pcx);
+    build_linking(path, pcx);
+    let mut status = link_program(path, obj_path, &mut cx.assembler, pcx) as i32;
+    if status != 0 {
+        remove_object(obj);
+        link_failed(status as i64, path, pcx);
+    }
+    if status == 0 && pcx.debug_info && !get_elf() {
+        // (-g) On macOS the debug information stays in the object, which
+        // goes: dsymutil gathers it into <path>.dSYM first, as clang does.
+        let dsym = buf_new();
+        buf_fmt(dsym, format_args("dsymutil '{}'\0", str::from_utf8(cstr(path)).unwrap()));
+        // UNSAFE: C's system: std has no call that runs a shell command
+        // line.
+        // SAFETY: the command is buffer `dsym`'s bytes, which end in the
+        // NUL the format above wrote; nothing is appended to the buffer
+        // between the format and the call, and system keeps no pointer.
+        status = unsafe { system(buf_ptr(dsym)) };
+    }
+    remove_object(obj);
+    if status != 0 {
+        die(c"dsymutil failed");
+    }
+}
+
+// Removes the temporary object whose path (with its NUL) is buffer `obj`.
+fn remove_object(obj: i64) {
+    // UNSAFE: C's unlink, on the path the linker was given as a C string.
+    // SAFETY: buffer `obj` holds the path and the NUL write_output's
+    // format wrote after it, and is not written again; unlink reads up to
+    // that NUL and keeps no pointer.
+    unsafe { unlink(buf_ptr(obj)); }
 }
 
 // (0.28.0) RAW's accessors: every use of it is one of them.
