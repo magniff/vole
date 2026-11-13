@@ -52,7 +52,10 @@ use crate::gen0::target::{add_const_data, rt_output};
 use crate::middle::ctx::{FnCtx, main_cx};
 use crate::middle::inline::{add_program_size, finish_component_function, ir_callee};
 use crate::middle::ipo::infer_component_attrs;
-use crate::middle::ir::{Block, Op, get_irfuncs, ir_enter, ir_release, rtid_class, rtid_value};
+use crate::middle::ir::{
+    Op, fn_block, fn_block_count, ir_clear_marks, ir_enter, ir_release, ir_stored, rtid_class,
+    rtid_value,
+};
 use crate::middle::opt::{cleanup_function, optimize_component_function, simplify_function};
 use crate::middle::threads::{
     get_pool_ctx, pool_run, pool_run_joined, pool_start, pool_stop, processors,
@@ -394,12 +397,12 @@ pub fn run_task(mut cx: *mut FnCtx<Comp>, kind: i64, task: i64, pcx: &Ctx<Comp>)
         if kind == K_COMPONENT {
             let c = (pcx.parallel_items[task as usize]);
             for i in (*pcx.comp_start.add(c as usize))..(*pcx.comp_end.add(c as usize)) {
-                clear_marks((pcx.scc_order[i as usize]));
+                ir_clear_marks(&mut *cx, (pcx.scc_order[i as usize]), pcx);
             }
             run_component(&mut *cx, c, pcx);
         } else {
             let fi = (pcx.parallel_items[task as usize]);
-            clear_marks(fi);
+            ir_clear_marks(&mut *cx, fi, pcx);
             cx.task_rank = task;
             // (0.18.1: -O2's cleanup and scalar pipeline from the code cache;
             // -O1's cleanup alone costs less than its entry)
@@ -447,7 +450,7 @@ pub fn run_task(mut cx: *mut FnCtx<Comp>, kind: i64, task: i64, pcx: &Ctx<Comp>)
                 }
             }
         }
-        ir_release(&mut *cx);
+        ir_release(&mut *cx, pcx);
         cx.task_phase = 0;
         cx.task_rank = 0;
     }
@@ -456,7 +459,7 @@ pub fn run_task(mut cx: *mut FnCtx<Comp>, kind: i64, task: i64, pcx: &Ctx<Comp>)
 // What a task finds in its context: nothing an earlier task left that it
 // would use without computing it again. The passes' scratch is made anew
 // for each function, or checked by stamps (its functions' marks zeroed
-// first, clear_marks); these caches are keyed by the function, which
+// first, ir_clear_marks); these caches are keyed by the function, which
 // another task on this thread may have changed since:
 // - gvn's param_written (ro_fn, ro_stamp);
 // - vecfacts' vec_header_at (vh_key: by type, and a pool's context outlives
@@ -465,30 +468,6 @@ fn begin_task(cx: &mut FnCtx<Comp>) {
     cx.ro_fn = -1;
     cx.ro_stamp = -1;
     cx.vh_key = [0; 64];
-}
-
-// (0.27.7) The marks of function fi's instructions and blocks, zeroed as
-// a task on it begins. Passes compare marks with their context's stamps
-// (tags_stamp, capture_stamp, sim_stamp, vstamp), which every context
-// counts from the same base: a mark left by the function's task in another
-// context, or installed by the code cache from another run, could equal
-// this context's next stamp, and the code made would depend on which
-// thread ran what before. (A pass's aux is read only where its mark is the
-// pass's stamp.)
-fn clear_marks(fi: i64) {
-    // UNSAFE: IRFUNCS' tables are raw arrays (the IR's own representation).
-    // SAFETY: v and b are below the tables' counts; fi is this task's own
-    // function, current in no context (every task ends with ir_release, the
-    // main thread releases before a phase), so no other thread writes them.
-    unsafe {
-        let t = (*get_irfuncs().add(fi as usize)).t;
-        for v in 0..t.inst_count {
-            (*t.insts.add(v as usize)).mark = 0;
-        }
-        for b in 0..t.block_count {
-            (*(t.blocks as *mut Block<Comp>).add(b as usize)).mark = 0;
-        }
-    }
 }
 
 // (VOLE_FRESH_CONTEXTS) A new context with cx's buffers (each thread
@@ -515,7 +494,7 @@ fn run_tasks(cx: &mut FnCtx<Comp>, kind: i64, first: i64, end: i64, pcx: &mut Ct
 // read is made first (ir_release, prepare_layouts).
 fn task_list(cx: &mut FnCtx<Comp>, kind: i64, first: i64, end: i64, pcx: &mut Ctx<Comp>) -> IntVec {
     unsafe {
-        ir_release(cx);
+        ir_release(cx, pcx);
         prepare_layouts(pcx);
         let mut tasks = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
         let mut i = end;
@@ -541,11 +520,11 @@ fn task_list(cx: &mut FnCtx<Comp>, kind: i64, first: i64, end: i64, pcx: &mut Ct
 fn task_weight(kind: i64, item: i64, pcx: &Ctx<Comp>) -> i64 {
     unsafe {
         if kind != K_COMPONENT {
-            return (*get_irfuncs().add(item as usize)).t.inst_count;
+            return ir_stored(item, pcx).t.insts.len() as i64;
         }
         let mut w: i64 = 0;
         for k in (*pcx.comp_start.add(item as usize))..(*pcx.comp_end.add(item as usize)) {
-            w += (*get_irfuncs().add((pcx.scc_order[k as usize]) as usize)).t.inst_count;
+            w += ir_stored((pcx.scc_order[k as usize]), pcx).t.insts.len() as i64;
         }
         w
     }
@@ -683,7 +662,7 @@ fn build_components(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
                 pcx.level_count = level + 1;
             }
         }
-        ir_release(cx);
+        ir_release(cx, pcx);
         free(calls.data as *mut u8);
     }
 }
@@ -694,8 +673,8 @@ fn callees_and_addresses(cx: &mut FnCtx<Comp>, fi: i64, out: &mut IntVec, pcx: &
     unsafe {
         out.clear();
         ir_enter(cx, fi, pcx);
-        for i in 0..(*get_irfuncs().add(fi as usize)).blocks.len() as i64 {
-            let b = ((*get_irfuncs().add(fi as usize)).blocks[i as usize]);
+        for i in 0..fn_block_count(cx, fi) {
+            let b = (fn_block(cx, fi, i));
             if (cx.blocks[b as usize]).removed != 0 {
                 continue;
             }

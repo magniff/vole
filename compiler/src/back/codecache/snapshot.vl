@@ -8,7 +8,7 @@
 use crate::base::{IntVec, alloc_array, alloc_zeroed, free, memcpy};
 use crate::base::comp::Comp;
 use crate::middle::ctx::FnCtx;
-use crate::middle::ir::{Block, Cond, IRTables, Inst, Op, Slot, Term, get_irfuncs, table_of};
+use crate::middle::ir::{Block, Cond, Inst, Op, Slot, Term, fn_entry, fn_result_ptr};
 use crate::middle::lower::ssa::HMap;
 
 // ---- Bytes ----
@@ -302,13 +302,11 @@ fn get_ref(r: &mut Reader, at: i64) -> i64 {
     at + (((z >> 1) as i64) ^ -((z & 1) as i64))
 }
 
-fn put_ints(b: &mut ByteBuf, v: *mut IntVec) {
-    unsafe {
-        put_u(b, (*v).len() as i64 as u64);
-        put_u(b, (*v).cap as u64);
-        for i in 0..(*v).len() as i64 {
-            put_s(b, ((*v)[i as usize]));
-        }
+fn put_ints(b: &mut ByteBuf, v: &[i64], cap: i64) {
+    put_u(b, v.len() as u64);
+    put_u(b, cap as u64);
+    for x in v.iter() {
+        put_s(b, *x);
     }
 }
 
@@ -355,11 +353,10 @@ fn get_list(r: &mut Reader) -> Vec<i64, Comp> {
 // Writes IR function fi's tables (current in cx) and its IRFUNCS entry.
 pub fn encode_ir(cx: &mut FnCtx<Comp>, fi: i64, b: &mut ByteBuf, rel: *mut Rel) {
     unsafe {
-        let irf = (*get_irfuncs().add(fi as usize));
-        put_s(b, irf.entry);
-        put_s(b, irf.result_ptr);
-        put_ints(b, &mut (*get_irfuncs().add(fi as usize)).blocks);
-        put_ints(b, &mut (*get_irfuncs().add(fi as usize)).slots);
+        put_s(b, fn_entry(cx, fi));
+        put_s(b, fn_result_ptr(cx, fi));
+        put_ints(b, cx.fn_blocks.as_slice(), cx.fn_blocks.capacity() as i64);
+        put_ints(b, cx.fn_slots.as_slice(), cx.fn_slots.capacity() as i64);
         put_u(b, cx.insts.len() as i64 as u64);
         put_u(b, cx.insts.capacity() as u64);
         for i in 0..cx.insts.len() as i64 {
@@ -440,9 +437,41 @@ pub fn encode_ir(cx: &mut FnCtx<Comp>, fi: i64, b: &mut ByteBuf, rel: *mut Rel) 
     }
 }
 
+// (0.29) A read copy's tables, as decode_ir makes them: each a block from
+// C's allocator, its count and its capacity (what middle::ir's IRTables
+// was before it owned its Vecs); install_ir makes them the context's.
+#[derive(Clone, Copy)] pub struct RawTables {
+    pub insts: *mut Inst, pub inst_count: i64, pub inst_cap: i64,
+    // (a `*mut Block<Comp>`, named as bytes: a block owns a Vec, and a Copy
+    // struct may not hold an allocator)
+    pub blocks: *mut u8, pub block_count: i64, pub block_cap: i64,
+    pub slots: *mut Slot, pub slot_count: i64, pub slot_cap: i64,
+    pub args: IntVec, pub argty: IntVec, pub swcases: IntVec, pub inst_loc: IntVec,
+}
+
+// A read copy's table (a pointer, a count and a capacity) as a Vec.
+pub fn table_of<T>(p: *mut T, n: i64, cap: i64) -> Vec<T, Comp> {
+    if cap == 0 {
+        return Vec::new_in(Comp {});
+    }
+    // UNSAFE: decode_ir builds a function's tables as raw blocks (a read
+    // that fails part way frees them: free_copy); the context takes them
+    // as its Vecs.
+    // SAFETY: p is decode_ir's block of cap entries from C's allocator,
+    // Comp's own, the first n written (a block's list there is a Vec of
+    // Comp's); the copy is not used after it is installed or freed, so the
+    // block has one owner.
+    unsafe { Vec::from_raw_parts_in(p, n as usize, cap as usize, Comp {}) }
+}
+
+// The same for a read copy's list (an IntVec is a list's raw parts).
+pub fn ints_of(v: IntVec) -> Vec<i64, Comp> {
+    table_of(v.data, v.count, v.cap)
+}
+
 // A function's IR read back (not yet installed).
 #[derive(Clone, Copy)] pub struct IRCopy {
-    pub entry: i64, pub result_ptr: i64, pub blocks: IntVec, pub slots: IntVec, pub t: IRTables,
+    pub entry: i64, pub result_ptr: i64, pub blocks: IntVec, pub slots: IntVec, pub t: RawTables,
 }
 
 fn sized(cap: i64, n: i64, r: &mut Reader) -> bool {
@@ -623,12 +652,11 @@ pub fn free_copy(c: *mut IRCopy) {
 // field (instruction fields 1.., block fields 100.., the rest 200..).
 pub fn copy_differs(cx: &mut FnCtx<Comp>, fi: i64, c: &mut IRCopy) -> i64 {
     unsafe {
-        let irf = (*get_irfuncs().add(fi as usize));
-        if c.entry != irf.entry || c.result_ptr != irf.result_ptr {
+        if c.entry != fn_entry(cx, fi) || c.result_ptr != fn_result_ptr(cx, fi) {
             return 200;
         }
-        if !same_ints(&mut c.blocks, &mut (*get_irfuncs().add(fi as usize)).blocks)
-            || !same_ints(&mut c.slots, &mut (*get_irfuncs().add(fi as usize)).slots) {
+        if !same_ints(c.blocks.as_slice(), cx.fn_blocks.as_slice())
+            || !same_ints(c.slots.as_slice(), cx.fn_slots.as_slice()) {
             return 201;
         }
         let mut t = c.t;
@@ -681,16 +709,14 @@ pub fn copy_differs(cx: &mut FnCtx<Comp>, fi: i64, c: &mut IRCopy) -> i64 {
     }
 }
 
-fn same_ints(a: *mut IntVec, b: *mut IntVec) -> bool {
-    unsafe {
-        if (*a).len() as i64 != (*b).len() as i64 {
+fn same_ints(a: &[i64], b: &[i64]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for i in 0..a.len() {
+        if a[i] != b[i] {
             return false;
         }
-        for i in 0..(*a).len() as i64 {
-            if ((*a)[i as usize]) != ((*b)[i as usize]) {
-                return false;
-            }
-        }
-        true
     }
+    true
 }

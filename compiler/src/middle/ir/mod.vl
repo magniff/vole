@@ -67,7 +67,7 @@ pub mod atomic;
 use std::alloc::Allocator;
 
 use crate::back::codecache::{R_IR, cc_note};
-use crate::base::{IntVec, free, grow, realloc, sized_table};
+use crate::base::{die, sized_table};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::lexer::Tok;
@@ -203,35 +203,43 @@ pub struct Block<A: Allocator> {
     pub cases: i64, pub ncases: i64, pub succs: i64, pub nsucc: i64,
 }
 
-#[derive(Clone, Copy)] struct IRFunc {
-    pub f: i64, pub item: i64, pub entry: i64,
-    pub blocks: IntVec,
-    pub slots: IntVec,
+// (0.29) A function's IR while it is not the current one of a context:
+// the program's table of them is the compilation context's (Ctx.irfuncs,
+// one entry per IR function, made by ir_new_func on the main thread; the
+// FNS entry and the item of each are Ctx.ir_fn and Ctx.ir_item, which
+// never change). A function is worked on by one context at a time:
+// ir_enter exchanges the entry's parts with the context's (cx.insts,
+// cx.blocks, ..., cx.fn_blocks, cx.fn_slots, cx.fn_entry,
+// cx.fn_result_ptr), which hold nothing while no function is current, and
+// ir_release exchanges them back; `lent` says which side has them.
+pub struct IRFunc<A: Allocator> {
+    pub entry: i64,
+    // Its blocks and frame slots, in the order they were made.
+    pub blocks: Vec<i64, A>,
+    pub slots: Vec<i64, A>,
     // The PARAM holding the result pointer (functions returning a compound
     // value), or 0.
     pub result_ptr: i64,
-    // (0.17) Its tables, while another function is the current one (see
-    // ir_enter).
-    pub t: IRTables,
+    pub t: IRTables<A>,
+    // Whether a context has the function current: the parts above are the
+    // context's then, and the entry's are empty.
+    pub lent: bool,
 }
 
 // (0.17) The IR tables of one function: its instructions, blocks, frame
 // slots, operand lists, switch cases and (-g) source positions. Ids are
 // local to the function (0 is "none" in each table), so a function's IR
 // can be built, optimized, emitted and freed on its own, and, from 0.18,
-// on a thread of its own. The current function's tables are the statics
-// INSTS, BLOCKS, SLOTS, ARGS, ARGTY, SWCASES and INST_LOC (with their
-// counts), where every pass reads them; ir_enter switches to another
-// function's, and the inliner reads a callee's through ir_view.
-#[derive(Clone, Copy)] pub struct IRTables {
-    pub insts: *mut Inst, pub inst_count: i64, pub inst_cap: i64,
-
-    // (0.29) A `*mut Block<Comp>` (see stored_blocks), named as bytes: a
-    // block owns a Vec, and IRFUNCS is a static, whose type may not hold
-    // an allocator.
-    pub blocks: *mut u8, pub block_count: i64, pub block_cap: i64,
-    pub slots: *mut Slot, pub slot_count: i64, pub slot_cap: i64,
-    pub args: IntVec, pub argty: IntVec, pub swcases: IntVec, pub inst_loc: IntVec,
+// on a thread of its own. The current function's tables are the context's
+// insts, blocks, slots, args, argty, swcases and inst_loc, where every
+// pass reads them; ir_enter switches to another function's, and the
+// inliner reads a callee's through ir_view.
+pub struct IRTables<A: Allocator> {
+    pub insts: Vec<Inst, A>,
+    pub blocks: Vec<Block<A>, A>,
+    pub slots: Vec<Slot, A>,
+    pub args: Vec<i64, A>, pub argty: Vec<i64, A>, pub swcases: Vec<i64, A>,
+    pub inst_loc: Vec<i64, A>,
 }
 
 // A frame slot: memory in the function's frame; `ty` is the checker type
@@ -240,75 +248,130 @@ pub struct Block<A: Allocator> {
     pub size: i64, pub align: i64, pub offset: i64, pub escapes: i64, pub ty: i64,
 }
 
-static mut IRFUNCS: *mut IRFunc = 0 as *mut IRFunc;
-
 pub fn init_ir(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
     cx.ir_cur = -1;
     sized_table(&mut pcx.fn_ir, pcx.fns.len() as i64 + 1, 0);
 }
 
-// (0.17) Makes function fi's tables the current ones (INSTS, BLOCKS, ...),
-// and fi the function being built (IRF).
+// (0.17) Makes function fi's tables the current ones (cx.insts,
+// cx.blocks, ...), and fi the function being built (cx.irf).
 pub fn ir_enter(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
-    unsafe {
-        if cx.ir_cur != fi {
-            // (0.18.1: another function's IR, read by a task: for the code
-            // cache, back::codecache)
-            cc_note(cx, R_IR, fi, pcx);
-            ir_save(cx);
-            let t = (*get_irfuncs().add(fi as usize)).t;
-            // The context's last table is its function's (ir_save wrote its
-            // parts back): it is left, not dropped.
-            std::ptr::write(&mut cx.insts, table_of(t.insts, t.inst_count, t.inst_cap));
-            std::ptr::write(&mut cx.blocks,
-                table_of(t.blocks as *mut Block<Comp>, t.block_count, t.block_cap));
-            std::ptr::write(&mut cx.slots, table_of(t.slots, t.slot_count, t.slot_cap));
-            std::ptr::write(&mut cx.args, ints_of(t.args));
-            std::ptr::write(&mut cx.argty, ints_of(t.argty));
-            std::ptr::write(&mut cx.swcases, ints_of(t.swcases));
-            std::ptr::write(&mut cx.inst_loc, ints_of(t.inst_loc));
-            cx.ir_cur = fi;
-        }
-        cx.irf = fi;
+    if cx.ir_cur != fi {
+        // (0.18.1: another function's IR, read by a task: for the code
+        // cache, back::codecache)
+        cc_note(cx, R_IR, fi, pcx);
+        ir_release(cx, pcx);
+        ir_exchange(cx, fi, true, pcx);
+        cx.ir_cur = fi;
+        cx.fn_f = pcx.ir_fn[fi as usize];
+        cx.fn_item = pcx.ir_item[fi as usize];
+    }
+    cx.irf = fi;
+}
+
+// (0.29) Function fi's parts and the context's change places: into the
+// context (`lend`) when it becomes current there, back when it is
+// released. Each side's parts are whole Vecs, so nothing is copied and
+// nothing is freed.
+fn ir_exchange(cx: &mut FnCtx<Comp>, fi: i64, lend: bool, pcx: &Ctx<Comp>) {
+    // UNSAFE: the tasks of a phase each work on functions of their own
+    // while they share the compilation context, which they hold `&`: an
+    // entry of its table is written through the cell's pointer (the thread
+    // boundary of the IR; std's Mutex per entry would put a lock on every
+    // ir_enter for an exclusion the phases' plan already gives).
+    // SAFETY: the cell is an element of Ctx.irfuncs, which grows only in
+    // ir_new_func, on the main thread with `&mut Ctx`, so not while a task
+    // runs: the pointer is to a live, initialized IRFunc. The `&mut` made
+    // here lives to the end of this function and no other reference to
+    // the entry does meanwhile: a function is entered and released only by
+    // the one task that has it in its plan (its own function or component:
+    // middle::parallel's task lists, each function in one task of a
+    // phase), or by the main thread between phases; another function's
+    // entry is otherwise only read, by ir_stored, and only one that no
+    // task of the running phase enters (see there). `lent` is checked
+    // below: a second context entering the function, or a release of one
+    // not entered, stops the compiler instead of exchanging twice.
+    let home = unsafe { &mut *pcx.irfuncs[fi as usize].get() };
+    if home.lent == lend {
+        die(c"internal error: a function's IR is entered twice, or released when not entered");
+    }
+    home.lent = lend;
+    std::mem::swap(&mut cx.insts, &mut home.t.insts);
+    std::mem::swap(&mut cx.blocks, &mut home.t.blocks);
+    std::mem::swap(&mut cx.slots, &mut home.t.slots);
+    std::mem::swap(&mut cx.args, &mut home.t.args);
+    std::mem::swap(&mut cx.argty, &mut home.t.argty);
+    std::mem::swap(&mut cx.swcases, &mut home.t.swcases);
+    std::mem::swap(&mut cx.inst_loc, &mut home.t.inst_loc);
+    std::mem::swap(&mut cx.fn_blocks, &mut home.blocks);
+    std::mem::swap(&mut cx.fn_slots, &mut home.slots);
+    std::mem::swap(&mut cx.fn_entry, &mut home.entry);
+    std::mem::swap(&mut cx.fn_result_ptr, &mut home.result_ptr);
+}
+
+// (0.29) Function g's stored IR, to read: g is not current in any context
+// (the compiler stops otherwise: its parts would be the context's).
+pub fn ir_stored(g: i64, pcx: &Ctx<Comp>) -> &IRFunc<Comp> {
+    // UNSAFE: an entry of the table the tasks share by element is read
+    // through its cell's pointer (see ir_exchange).
+    // SAFETY: the pointer is to a live, initialized IRFunc (ir_exchange).
+    // No `&mut` to the entry lives while this `&` does: one is made only
+    // inside ir_exchange, by the context that enters or releases g, and g
+    // is entered by no task of the running phase when a task reads it
+    // here: (a) -O2's inline_call and ir_view come after should_inline's
+    // fn_facts_ready(g), i.e. g's component is of a lower level, finished
+    // in an earlier pool_run and not entered since; (b) -O1's
+    // inline_leaf_calls reads a small leaf, and every small leaf is
+    // emitted in emit_functions' second range, which starts after the
+    // first range's pool_run_joined returned (leaves make no calls, so the
+    // second range inlines nothing); (c) the main thread reads between
+    // phases, when every task's context has released its function
+    // (run_task's ir_release). `lent` is read before the reference is
+    // given out: a caller that breaks the plan stops here.
+    let home = unsafe { &*pcx.irfuncs[g as usize].get() };
+    if home.lent {
+        die(c"internal error: the IR of a function that is current in a context is read from the table");
+    }
+    home
+}
+
+fn not_current(cx: &FnCtx<Comp>, fi: i64) {
+    if fi != cx.ir_cur {
+        die(c"internal error: the IR of a function that is not the current one is used as the current one's");
     }
 }
 
-// (0.17) Function g's tables, to read (and mark, through aux) while
-// another function is current: the inliner copies a callee g into its
-// caller. g is not the current function.
-pub fn ir_view(g: i64) -> IRTables {
-    unsafe { (*get_irfuncs().add(g as usize)).t }
+// (0.29) The current function's blocks, frame slots, entry block and
+// result pointer (the context's while it is current: ir_enter); fi names
+// it, and is checked.
+pub fn fn_block_count(cx: &FnCtx<Comp>, fi: i64) -> i64 {
+    not_current(cx, fi);
+    cx.fn_blocks.len() as i64
 }
 
-// (0.29) A stored table (IRTables keeps a function's tables as a pointer,
-// a count and a capacity each while another function is current) as the
-// context's Vec.
-pub fn table_of<T>(p: *mut T, n: i64, cap: i64) -> Vec<T, Comp> {
-    if cap == 0 {
-        return Vec::new_in(Comp {});
-    }
-    // UNSAFE: IRTables holds a table as its raw parts until IRFUNCS can
-    // own Vecs (a static may not point at one).
-    // SAFETY: p, n and cap are the parts ir_save took from a Vec<T, Comp>
-    // (or decode_ir's block of cap entries from C's allocator, Comp's own,
-    // the first n written; a block's list there is a Vec of Comp's); the
-    // stored parts are not used while the Vec lives: the function is
-    // current in this context only, and ir_save writes them anew before
-    // another reads them.
-    unsafe { Vec::from_raw_parts_in(p, n as usize, cap as usize, Comp {}) }
+pub fn fn_block(cx: &FnCtx<Comp>, fi: i64, i: i64) -> i64 {
+    not_current(cx, fi);
+    cx.fn_blocks[i as usize]
 }
 
-// The same for a stored list (an IntVec is a list's raw parts), and a
-// list's parts to store.
-pub fn ints_of(v: IntVec) -> Vec<i64, Comp> {
-    table_of(v.data, v.count, v.cap)
+pub fn fn_slot_count(cx: &FnCtx<Comp>, fi: i64) -> i64 {
+    not_current(cx, fi);
+    cx.fn_slots.len() as i64
 }
 
-fn stored_list(v: &mut Vec<i64, Comp>) -> IntVec {
-    if v.capacity() == 0 {
-        return IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-    }
-    IntVec { data: v.as_mut_ptr(), count: v.len() as i64, cap: v.capacity() as i64 }
+pub fn fn_slot(cx: &FnCtx<Comp>, fi: i64, i: i64) -> i64 {
+    not_current(cx, fi);
+    cx.fn_slots[i as usize]
+}
+
+pub fn fn_entry(cx: &FnCtx<Comp>, fi: i64) -> i64 {
+    not_current(cx, fi);
+    cx.fn_entry
+}
+
+pub fn fn_result_ptr(cx: &FnCtx<Comp>, fi: i64) -> i64 {
+    not_current(cx, fi);
+    cx.fn_result_ptr
 }
 
 // (0.17) Gives back the room a table has beyond what it uses, when the
@@ -325,143 +388,103 @@ fn shrink_table<T>(v: &mut Vec<T, Comp>) {
 // predecessor list too): after the function is lowered, and at -O2 once
 // its component is optimized, the IR kept for later is its size.
 pub fn ir_shrink(cx: &mut FnCtx<Comp>) {
-    unsafe {
-        shrink_table(&mut cx.insts);
-        shrink_table(&mut cx.blocks);
-        shrink_table(&mut cx.slots);
-        shrink_table(&mut cx.args);
-        shrink_table(&mut cx.argty);
-        shrink_table(&mut cx.swcases);
-        shrink_table(&mut cx.inst_loc);
-        for b in 0..cx.blocks.len() {
-            shrink_table(&mut cx.blocks[b].preds);
-        }
-        shrink_vec(&mut (*get_irfuncs().add(cx.ir_cur as usize)).blocks);
-        shrink_vec(&mut (*get_irfuncs().add(cx.ir_cur as usize)).slots);
+    shrink_table(&mut cx.insts);
+    shrink_table(&mut cx.blocks);
+    shrink_table(&mut cx.slots);
+    shrink_table(&mut cx.args);
+    shrink_table(&mut cx.argty);
+    shrink_table(&mut cx.swcases);
+    shrink_table(&mut cx.inst_loc);
+    for b in 0..cx.blocks.len() {
+        shrink_table(&mut cx.blocks[b].preds);
+    }
+    if cx.fn_blocks.capacity() > 0 {
+        shrink_table(&mut cx.fn_blocks);
+    }
+    if cx.fn_slots.capacity() > 0 {
+        shrink_table(&mut cx.fn_slots);
     }
 }
 
-// An array of `count` used elements of capacity *cap, reallocated to its
-// size when the room left is worth it.
-fn shrink_array<T>(data: *mut T, count: i64, cap: *mut i64) -> *mut T {
-    unsafe {
-        if *cap <= count + count / 4 + 4 {
-            return data;
-        }
-        let n: i64 = if count < 1 { 1 } else { count };
-        let p = realloc(data as *mut u8, (n * size_of(T)) as u64);
-        if p == 0 as *mut u8 {
-            return data;
-        }
-        *cap = n;
-        p as *mut T
+// The room one function's tables take, in bytes.
+fn tables_bytes(insts: &Vec<Inst, Comp>, blocks: &Vec<Block<Comp>, Comp>, slots: &Vec<Slot, Comp>,
+    lists: i64) -> i64 {
+    let mut total = insts.capacity() as i64 * size_of(Inst)
+        + blocks.capacity() as i64 * size_of(Block<Comp>)
+        + slots.capacity() as i64 * size_of(Slot) + lists * 8;
+    for b in blocks.iter() {
+        total += b.preds.capacity() as i64 * 8;
     }
-}
-
-fn shrink_vec(v: *mut IntVec) {
-    unsafe {
-        if (*v).cap > 0 {
-            (*v).data = shrink_array((*v).data, (*v).len() as i64, &mut (*v).cap);
-        }
-    }
+    total
 }
 
 // (0.17) The room the IR's tables take (every function's, in bytes): for
 // --time-passes.
 pub fn ir_tables_bytes(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        ir_save(cx);
-        let mut total: i64 = 0;
-        for fi in 0..pcx.irfunc_count {
-            let t = (*get_irfuncs().add(fi as usize)).t;
-            total += t.inst_cap * size_of(Inst) + t.block_cap * size_of(Block<Comp>)
-                + t.slot_cap * size_of(Slot)
-                + (t.args.cap + t.argty.cap + t.swcases.cap + t.inst_loc.cap) * 8;
-            for b in 0..t.block_count {
-                total += (*(t.blocks as *mut Block<Comp>).add(b as usize)).preds.capacity() as i64 * 8;
-            }
-            total += (
-                (*get_irfuncs().add(fi as usize)).blocks.cap + (*get_irfuncs().add(fi as usize)).slots.cap) * 8;
-        }
-        total
+    ir_release(cx, pcx);
+    let mut total: i64 = 0;
+    for fi in 0..pcx.irfunc_count {
+        let h = ir_stored(fi, pcx);
+        total += tables_bytes(&h.t.insts, &h.t.blocks, &h.t.slots,
+            (h.t.args.capacity() + h.t.argty.capacity() + h.t.swcases.capacity()
+                + h.t.inst_loc.capacity() + h.blocks.capacity() + h.slots.capacity()) as i64);
     }
-}
-
-// The current function's tables, back into its IRFunc.
-fn ir_save(cx: &mut FnCtx<Comp>) {
-    unsafe {
-        if cx.ir_cur >= 0 {
-            (*get_irfuncs().add(cx.ir_cur as usize)).t = IRTables {
-                insts: if cx.insts.capacity() == 0 { 0 as *mut Inst }
-                    else { cx.insts.as_mut_ptr() },
-                inst_count: cx.insts.len() as i64, inst_cap: cx.insts.capacity() as i64,
-                blocks: if cx.blocks.capacity() == 0 { 0 as *mut u8 }
-                    else { cx.blocks.as_mut_ptr() as *mut u8 },
-                block_count: cx.blocks.len() as i64, block_cap: cx.blocks.capacity() as i64,
-                slots: if cx.slots.capacity() == 0 { 0 as *mut Slot }
-                    else { cx.slots.as_mut_ptr() },
-                slot_count: cx.slots.len() as i64, slot_cap: cx.slots.capacity() as i64,
-                args: stored_list(&mut cx.args), argty: stored_list(&mut cx.argty),
-                swcases: stored_list(&mut cx.swcases), inst_loc: stored_list(&mut cx.inst_loc),
-            };
-        }
-    }
+    total
 }
 
 // (0.18.1) The current function's tables back into its IRFunc, and none
 // current: what a task does when it ends (middle::parallel), and the main
-// thread before a phase, so that no context keeps another's function
-// current (it would read stale tables, and write them back on its next
-// ir_enter).
-pub fn ir_release(cx: &mut FnCtx<Comp>) {
-    ir_save(cx);
-    cx.ir_cur = -1;
-    // UNSAFE: the table is its function's again (ir_save wrote its parts into
-    // IRFUNCS): the context's Vecs are overwritten without being dropped.
-    // SAFETY: the fields are valid places; a Vec written is empty and owns
-    // nothing, and the one it replaces is not used again (its buffer lives
-    // on in IRFUNCS, to be taken up by the next ir_enter).
-    unsafe {
-        std::ptr::write(&mut cx.insts, Vec::new_in(Comp {}));
-        std::ptr::write(&mut cx.blocks, Vec::new_in(Comp {}));
-        std::ptr::write(&mut cx.slots, Vec::new_in(Comp {}));
-        std::ptr::write(&mut cx.args, Vec::new_in(Comp {}));
-        std::ptr::write(&mut cx.argty, Vec::new_in(Comp {}));
-        std::ptr::write(&mut cx.swcases, Vec::new_in(Comp {}));
-        std::ptr::write(&mut cx.inst_loc, Vec::new_in(Comp {}));
+// thread before a phase, so that no context keeps a function another is
+// to enter.
+pub fn ir_release(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
+    if cx.ir_cur >= 0 {
+        ir_exchange(cx, cx.ir_cur, false, pcx);
+        cx.ir_cur = -1;
     }
+}
+
+// (0.27.7) The marks of function fi's instructions and blocks, zeroed as
+// a task on it begins (fi is current in no context: it is entered for
+// this and released, without the code cache's note of a read). Passes
+// compare marks with their context's stamps (tags_stamp, capture_stamp,
+// sim_stamp, vstamp), which every context counts from the same base: a
+// mark left by the function's task in another context, or installed by
+// the code cache from another run, could equal this context's next stamp,
+// and the code made would depend on which thread ran what before. (A
+// pass's aux is read only where its mark is the pass's stamp.)
+pub fn ir_clear_marks(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
+    ir_release(cx, pcx);
+    ir_exchange(cx, fi, true, pcx);
+    for v in cx.insts.iter_mut() {
+        v.mark = 0;
+    }
+    for b in cx.blocks.iter_mut() {
+        b.mark = 0;
+    }
+    ir_exchange(cx, fi, false, pcx);
 }
 
 // (0.17) Frees function fi's IR (once it is emitted, or dropped); fi is
 // not current afterwards.
 pub fn ir_free_func(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
-    unsafe {
-        ir_enter(cx, fi, pcx);
-        free((*get_irfuncs().add(fi as usize)).blocks.data as *mut u8);
-        free((*get_irfuncs().add(fi as usize)).slots.data as *mut u8);
-        (*get_irfuncs().add(fi as usize)).blocks = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        (*get_irfuncs().add(fi as usize)).slots = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        (*get_irfuncs().add(fi as usize)).t = empty_tables();
-        cx.ir_cur = -1;
-        cx.insts = Vec::new_in(Comp {});
-        cx.blocks = Vec::new_in(Comp {});
-        cx.slots = Vec::new_in(Comp {});
-        cx.args = Vec::new_in(Comp {});
-        cx.argty = Vec::new_in(Comp {});
-        cx.swcases = Vec::new_in(Comp {});
-        cx.inst_loc = Vec::new_in(Comp {});
-    }
+    ir_enter(cx, fi, pcx);
+    cx.fn_blocks = Vec::new_in(Comp {});
+    cx.fn_slots = Vec::new_in(Comp {});
+    cx.insts = Vec::new_in(Comp {});
+    cx.blocks = Vec::new_in(Comp {});
+    cx.slots = Vec::new_in(Comp {});
+    cx.args = Vec::new_in(Comp {});
+    cx.argty = Vec::new_in(Comp {});
+    cx.swcases = Vec::new_in(Comp {});
+    cx.inst_loc = Vec::new_in(Comp {});
+    ir_release(cx, pcx);
 }
 
-fn empty_tables() -> IRTables {
+fn empty_tables() -> IRTables<Comp> {
     IRTables {
-        insts: 0 as *mut Inst, inst_count: 0, inst_cap: 0,
-        blocks: 0 as *mut u8, block_count: 0, block_cap: 0,
-        slots: 0 as *mut Slot, slot_count: 0, slot_cap: 0,
-        args: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
-        argty: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
-        swcases: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
-        inst_loc: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
+        insts: Vec::new_in(Comp {}), blocks: Vec::new_in(Comp {}), slots: Vec::new_in(Comp {}),
+        args: Vec::new_in(Comp {}), argty: Vec::new_in(Comp {}), swcases: Vec::new_in(Comp {}),
+        inst_loc: Vec::new_in(Comp {}),
     }
 }
 
@@ -496,33 +519,29 @@ pub fn ir_type(t: i64, pcx: &Ctx<Comp>) -> i64 {
 // A new IR function for FNS entry f (its item: the Fn node), current from
 // now on, with its tables' "none" entries (instruction, block and slot 0).
 pub fn ir_new_func(cx: &mut FnCtx<Comp>, f: i64, item: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        set_irfuncs(grow(get_irfuncs(), pcx.irfunc_count, &mut pcx.irfunc_cap));
-        let id = pcx.irfunc_count;
-        (*get_irfuncs().add(id as usize)) = IRFunc {
-            f: f, item: item, entry: 0,
-            blocks: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
-            slots: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
-            result_ptr: 0,
-            t: empty_tables(),
-        };
-        pcx.irfunc_count += 1;
-        (pcx.fn_ir[f as usize]) = id + 1;
-        ir_enter(cx, id, pcx);
-        cx.insts.push(Inst {
-            op: Op::None, cond: Cond::Eq, ty: 0, a: 0, b: 0, c: 0, imm: 0, imm2: 0, args: 0,
-            nargs: 0,
-            block: 0, prev: 0, next: 0, repl: 0, mark: 0, aux: 0, scale: 0,
-        });
-        if pcx.ir_locs {
-            cx.inst_loc.push(0);
-        }
-        cx.blocks.push(empty_block(0));
-        cx.slots.push(Slot { size: 0, align: 1, offset: 0, escapes: 0, ty: 0 });
-        cx.args.push(0);
-        cx.argty.push(0);
-        id
+    let id = pcx.irfunc_count;
+    pcx.ir_fn.push(f);
+    pcx.ir_item.push(item);
+    pcx.irfuncs.push(std::cell::UnsafeCell::new(IRFunc {
+        entry: 0, blocks: Vec::new_in(Comp {}), slots: Vec::new_in(Comp {}), result_ptr: 0,
+        t: empty_tables(), lent: false,
+    }));
+    pcx.irfunc_count += 1;
+    (pcx.fn_ir[f as usize]) = id + 1;
+    ir_enter(cx, id, pcx);
+    cx.insts.push(Inst {
+        op: Op::None, cond: Cond::Eq, ty: 0, a: 0, b: 0, c: 0, imm: 0, imm2: 0, args: 0,
+        nargs: 0,
+        block: 0, prev: 0, next: 0, repl: 0, mark: 0, aux: 0, scale: 0,
+    });
+    if pcx.ir_locs {
+        cx.inst_loc.push(0);
     }
+    cx.blocks.push(empty_block(0));
+    cx.slots.push(Slot { size: 0, align: 1, offset: 0, escapes: 0, ty: 0 });
+    cx.args.push(0);
+    cx.argty.push(0);
+    id
 }
 
 pub fn ir_new_block(cx: &mut FnCtx<Comp>) -> i64 {
@@ -530,7 +549,8 @@ pub fn ir_new_block(cx: &mut FnCtx<Comp>) -> i64 {
         let b = cx.blocks.len() as i64;
         let block = empty_block(cx.irf);
         cx.blocks.push(block);
-        (*get_irfuncs().add(cx.irf as usize)).blocks.push(b);
+        not_current(cx, cx.irf);
+        cx.fn_blocks.push(b);
         b
     }
 }
@@ -543,7 +563,8 @@ pub fn ir_new_slot(cx: &mut FnCtx<Comp>, size: i64, align: i64) -> i64 {
             a = 1;
         }
         cx.slots.push(Slot { size: size, align: a, offset: 0, escapes: 0, ty: 0 });
-        (*get_irfuncs().add(cx.irf as usize)).slots.push(s);
+        not_current(cx, cx.irf);
+        cx.fn_slots.push(s);
         s
     }
 }
@@ -981,56 +1002,5 @@ pub fn cond_of_token(op: Tok) -> Cond {
         Tok::LtEq => Cond::Le,
         Tok::Gt => Cond::Gt,
         _ => Cond::Ge,
-    }
-}
-
-// (0.28.0) IRFUNCS's accessors: every use of it is one of them.
-pub fn get_irfuncs() -> *mut IRFunc {
-    // UNSAFE: the IR functions table, a process-wide static mut every task
-    // reads and writes; Rust has no safe access to a static mut
-    // SAFETY: the pointer grows only on the main thread (ir_new_func, in no
-    // thread's or the join's reach), so only between phases; in a task the
-    // mutable fields (entry, result_ptr, blocks, slots, t) are written only
-    // for the task's own function (install_ir, ir_free_func, tre,
-    // ir_new_block/ir_new_slot on cx.irf, ir_save on cx.ir_cur, which
-    // run_task's ir_release and task_list's ir_release reset to -1 around
-    // every task and phase); f and item are written only by ir_new_func, so
-    // any task may read them; another function g's mutable fields are read
-    // only (a) by -O2's inline_call/ir_view after should_inline's
-    // fn_facts_ready(g), i.e. g's component is of a lower level, finished
-    // in an earlier pool_run and not written since, (b) by -O1's
-    // inline_leaf_calls of a small leaf, and every small leaf is emitted in
-    // emit_functions' second range, which starts after the first range's
-    // pool_run_joined returned (leaves make no calls, so the second range
-    // inlines nothing), (c) by deciders/decides/callee_flags only on their
-    // unset-entry branch, which a ready callee never takes; no task
-    // ir_enters another function otherwise, so ir_save never writes
-    // another's entry
-    unsafe { IRFUNCS }
-}
-
-pub fn set_irfuncs(v: *mut IRFunc) {
-    // UNSAFE: the IR functions table, a process-wide static mut every task
-    // reads and writes; Rust has no safe access to a static mut
-    // SAFETY: the pointer grows only on the main thread (ir_new_func, in no
-    // thread's or the join's reach), so only between phases; in a task the
-    // mutable fields (entry, result_ptr, blocks, slots, t) are written only
-    // for the task's own function (install_ir, ir_free_func, tre,
-    // ir_new_block/ir_new_slot on cx.irf, ir_save on cx.ir_cur, which
-    // run_task's ir_release and task_list's ir_release reset to -1 around
-    // every task and phase); f and item are written only by ir_new_func, so
-    // any task may read them; another function g's mutable fields are read
-    // only (a) by -O2's inline_call/ir_view after should_inline's
-    // fn_facts_ready(g), i.e. g's component is of a lower level, finished
-    // in an earlier pool_run and not written since, (b) by -O1's
-    // inline_leaf_calls of a small leaf, and every small leaf is emitted in
-    // emit_functions' second range, which starts after the first range's
-    // pool_run_joined returned (leaves make no calls, so the second range
-    // inlines nothing), (c) by deciders/decides/callee_flags only on their
-    // unset-entry branch, which a ready callee never takes; no task
-    // ir_enters another function otherwise, so ir_save never writes
-    // another's entry
-    unsafe {
-        IRFUNCS = v;
     }
 }
