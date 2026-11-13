@@ -25,12 +25,15 @@
 // Nothing is quadratic. Products go through Karatsuba up to 512 limbs and
 // through a three-prime number theoretic transform above that (Montgomery
 // reduction in the butterflies, Garner's reconstruction into base 10^9),
-// O(n log n). The division and the square root use Newton iterations
-// whose precision doubles each step, so their cost is a small multiple
-// of one large product's, not O(n^2). The three primes are independent
-// and run on three threads; the square root, which depends on nothing in
-// the series, runs beside the split. A million digits takes about two
-// seconds on an Apple M-series machine.
+// O(n log n), with the butterflies two at a time in NEON lanes (a scalar
+// path for machines without NEON). The division and the square root use
+// Newton iterations whose precision doubles each step, so their cost is
+// a small multiple of one large product's, not O(n^2). The three primes
+// are independent and run on three threads; the square root, which
+// depends on nothing in the series, runs beside the split, and the final
+// division's reciprocal, which needs only T, beside the numerator's
+// product. A million digits takes about a second and a half on an Apple
+// M-series machine.
 //
 // Every run also computes pi a second, independent way -- Machin's
 // formula pi = 16 arctan(1/5) - 4 arctan(1/239), fixed point with small
@@ -44,6 +47,11 @@ import "time.h" as c;
 
 use std::{env, thread};
 use std::alloc::Allocator;
+use std::arch::detect;
+use std::arch::aarch64::{
+    vadd_u32, vbsl_u32, vcge_u32, vdup_n_u32, vld1_u32, vmlal_u32, vmovn_u64, vmull_u32,
+    vshrq_n_u64, vst1_u32, vsub_u32,
+};
 use std::cli::{Arg, Command};
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter, self};
@@ -248,15 +256,53 @@ fn mont_mul(x: u64, y: u64, m: &Mont) -> u64 {
     if u >= m.p { u - m.p } else { u }
 }
 
+// One stage, two butterflies at a time: the operands are below 2^30, so
+// they live in u32 lanes and the widening NEON multiplies take them
+// straight. Montgomery's reduction is umull, umlal and a shift; the
+// modular add and subtract are u32 lanes again.
+fn ntt_stage_simd(v: &mut [u32], tws: &[u32], n: usize, len: usize, m: &Mont) {
+    let half = len / 2;
+    let pv = vdup_n_u32(m.p as u32);
+    let invv = vdup_n_u32(m.inv as u32);
+    let mut start = 0;
+    while start < n {
+        let mut k = 0;
+        while k + 2 <= half {
+            let u = vld1_u32(v, (start + k) as i64);
+            let w = vld1_u32(tws, k as i64);
+            let y = vld1_u32(v, (start + k + half) as i64);
+            let prod = vmull_u32(y, w);
+            let mm = vmovn_u64(vmull_u32(vmovn_u64(prod), invv));
+            let t = vmovn_u64(vshrq_n_u64(vmlal_u32(prod, mm, pv), 32));
+            let tm = vbsl_u32(vcge_u32(t, pv), vsub_u32(t, pv), t);
+            let sum = vadd_u32(u, tm);
+            vst1_u32(v, (start + k) as i64, vbsl_u32(vcge_u32(sum, pv), vsub_u32(sum, pv), sum));
+            let ge = vcge_u32(u, tm);
+            vst1_u32(v, (start + k + half) as i64,
+                vbsl_u32(ge, vsub_u32(u, tm), vadd_u32(vsub_u32(u, tm), pv)));
+            k += 2;
+        }
+        while k < half {
+            let u = v[start + k] as u64;
+            let t = mont_mul(v[start + k + half] as u64, tws[k] as u64, m);
+            let sum = u + t;
+            v[start + k] = (if sum >= m.p { sum - m.p } else { sum }) as u32;
+            v[start + k + half] = (if u >= t { u - t } else { u + m.p - t }) as u32;
+            k += 1;
+        }
+        start += len;
+    }
+}
+
 // In-place iterative Cooley-Tukey transform; v.len() is a power of two.
 // Values arrive in the ordinary domain and, forward, stay in the
 // Montgomery domain afterwards; the inverse transform converts back.
 // Twiddles are precomputed a stage at a time (n muls in total, not one
 // per butterfly).
-fn ntt(v: &mut [u64], m: &Mont, inverse: bool, gpa: Gpa) {
+fn ntt(v: &mut [u32], m: &Mont, inverse: bool, gpa: Gpa) {
     let p = m.p;
     let n = v.len();
-    if !inverse { for i in 0..n { v[i] = (v[i] << 32) % p; } }
+    if !inverse { for i in 0..n { v[i] = (((v[i] as u64) << 32) % p) as u32; } }
     let mut j = 0;
     for i in 1..n {
         let mut bit = n >> 1;
@@ -279,46 +325,50 @@ fn ntt(v: &mut [u64], m: &Mont, inverse: bool, gpa: Gpa) {
         let mut tw = Vec::with_capacity_in(half, gpa);
         let mut w = 1u64;
         for _ in 0..half {
-            tw.push((w << 32) % p);
+            tw.push(((w << 32) % p) as u32);
             w = w * wlen % p;
         }
         let tws = tw.as_slice();
-        let mut start = 0;
-        while start < n {
-            for k in 0..half {
-                let u = v[start + k];
-                let t = mont_mul(v[start + k + half], tws[k], m);
-                let sum = u + t;
-                v[start + k] = if sum >= p { sum - p } else { sum };
-                v[start + k + half] = if u >= t { u - t } else { u + p - t };
+        if detect("neon") {
+            ntt_stage_simd(v, tws, n, len, m);
+        } else {
+            let mut start = 0;
+            while start < n {
+                for k in 0..half {
+                    let u = v[start + k] as u64;
+                    let t = mont_mul(v[start + k + half] as u64, tws[k] as u64, m);
+                    let sum = u + t;
+                    v[start + k] = (if sum >= p { sum - p } else { sum }) as u32;
+                    v[start + k + half] = (if u >= t { u - t } else { u + p - t }) as u32;
+                }
+                start += len;
             }
-            start += len;
         }
         len *= 2;
     }
     if inverse {
         let ninv = powmod(n as u64, p - 2, p);
-        for i in 0..n { v[i] = mont_mul(v[i], 1, m) * ninv % p; }
+        for i in 0..n { v[i] = (mont_mul(v[i] as u64, 1, m) * ninv % p) as u32; }
     }
 }
 
 // The residues of a * b modulo NTT_PRIMES[pi]: two forward transforms,
 // a pointwise product and an inverse one.
 fn ntt_residues(a: &[u32], b: &[u32], same: bool, pi: usize, l: usize,
-    gpa: Gpa) -> Vec<u64, Gpa> {
+    gpa: Gpa) -> Vec<u32, Gpa> {
     let p = NTT_PRIMES[pi];
-    let mut fa = Vec::from_elem_in(0u64, l, gpa);
-    for i in 0..a.len() { fa[i] = a[i] as u64 % p; }
-    let mut fb = Vec::from_elem_in(0u64, l, gpa);
+    let mut fa = Vec::from_elem_in(0u32, l, gpa);
+    for i in 0..a.len() { fa[i] = (a[i] as u64 % p) as u32; }
+    let mut fb = Vec::from_elem_in(0u32, l, gpa);
     if same {
         for i in 0..a.len() { fb[i] = fa[i]; }
     } else {
-        for i in 0..b.len() { fb[i] = b[i] as u64 % p; }
+        for i in 0..b.len() { fb[i] = (b[i] as u64 % p) as u32; }
     }
     let mont = mont_new(p);
     ntt(fa.as_mut_slice(), &mont, false, gpa);
     ntt(fb.as_mut_slice(), &mont, false, gpa);
-    for i in 0..l { fa[i] = mont_mul(fa[i], fb[i], &mont); }
+    for i in 0..l { fa[i] = mont_mul(fa[i] as u64, fb[i] as u64, &mont) as u32; }
     ntt(fa.as_mut_slice(), &mont, true, gpa);
     fa
 }
@@ -333,7 +383,7 @@ fn mul_ntt(a: &[u32], b: &[u32], r: &mut [u32], gpa: Gpa) {
     let inv13 = powmod(p1, p3 - 2, p3);
     let inv23 = powmod(p2, p3 - 2, p3);
     let same = a == b; // a square needs two transforms, not three
-    let mut res: [Vec<u64, Gpa>; 3] = [Vec::new_in(gpa), Vec::new_in(gpa), Vec::new_in(gpa)];
+    let mut res: [Vec<u32, Gpa>; 3] = [Vec::new_in(gpa), Vec::new_in(gpa), Vec::new_in(gpa)];
     if l >= NTT_THREADS_MIN {
         // The primes are independent: one thread each. Only the big
         // products pay for a thread; below this, spawning costs more
@@ -341,7 +391,7 @@ fn mul_ntt(a: &[u32], b: &[u32], r: &mut [u32], gpa: Gpa) {
         res = thread::scope(|sc| {
             let mut hs = Vec::with_capacity_in(3, gpa);
             for pi in 0..3 { hs.push(sc.spawn(move || ntt_residues(a, b, same, pi, l, gpa))); }
-            let mut out: [Vec<u64, Gpa>; 3] = [Vec::new_in(gpa), Vec::new_in(gpa),
+            let mut out: [Vec<u32, Gpa>; 3] = [Vec::new_in(gpa), Vec::new_in(gpa),
                 Vec::new_in(gpa)];
             let mut pi = 0;
             for h in hs {
@@ -364,9 +414,9 @@ fn mul_ntt(a: &[u32], b: &[u32], r: &mut [u32], gpa: Gpa) {
     let mut out = Vec::with_capacity_in(need + 1, gpa);
     let mut carry: u64 = 0;
     for i in 0..need - 1 {
-        let x1 = r1[i];
-        let x2 = (r2[i] + p2 - x1 % p2) % p2 * inv12 % p2;
-        let t = (r3[i] + p3 - x1 % p3) % p3 * inv13 % p3;
+        let x1 = r1[i] as u64;
+        let x2 = (r2[i] as u64 + p2 - x1 % p2) % p2 * inv12 % p2;
+        let t = (r3[i] as u64 + p3 - x1 % p3) % p3 * inv13 % p3;
         let x3 = (t + p3 - x2 % p3) % p3 * inv23 % p3;
         let low = x1 + p1 * x2; // < 2^57
         let bx = pb * x3; // < 2^63
@@ -671,16 +721,13 @@ fn reciprocal(b: &BigUint<Gpa>, s: usize, gpa: Gpa) -> BigUint<Gpa> {
     r
 }
 
-// a = q b + r with r < b, for large operands.
-fn div_rem_fast(a: &BigUint<Gpa>, b: &BigUint<Gpa>, gpa: Gpa) -> (BigUint<Gpa>, BigUint<Gpa>) {
-    if b.is_zero() { panic("superpi: division by zero"); }
-    if a < b { return (BigUint::zero(gpa), a.clone()); }
+// The quotient of a by b given the reciprocal of b at s limbs, with the
+// correction that makes it exact. Split out so a caller can compute the
+// reciprocal beside something else.
+fn quotient_with_rcp(a: &BigUint<Gpa>, b: &BigUint<Gpa>, rcp: &BigUint<Gpa>, s: usize,
+    gpa: Gpa) -> (BigUint<Gpa>, BigUint<Gpa>) {
     let n = b.limbs.len();
-    let m = a.limbs.len() - n;
-    if n < NEWTON_MIN || m < NEWTON_MIN { return div_rem(a, b, gpa); }
-    let s = m + 4;
-    let rcp = reciprocal(b, s, gpa);
-    let mut q = shr_limbs(&a.times(&rcp), n + s, gpa);
+    let mut q = shr_limbs(&a.times(rcp), n + s, gpa);
     let one = BigUint::from_u64(1, gpa);
     let mut qb = q.times(b);
     let mut steps = 0;
@@ -699,6 +746,18 @@ fn div_rem_fast(a: &BigUint<Gpa>, b: &BigUint<Gpa>, gpa: Gpa) -> (BigUint<Gpa>, 
     }
     if steps >= 100 { return div_rem(a, b, gpa); }
     (q, a.minus(&qb))
+}
+
+// a = q b + r with r < b, for large operands.
+fn div_rem_fast(a: &BigUint<Gpa>, b: &BigUint<Gpa>, gpa: Gpa) -> (BigUint<Gpa>, BigUint<Gpa>) {
+    if b.is_zero() { panic("superpi: division by zero"); }
+    if a < b { return (BigUint::zero(gpa), a.clone()); }
+    let n = b.limbs.len();
+    let m = a.limbs.len() - n;
+    if n < NEWTON_MIN || m < NEWTON_MIN { return div_rem(a, b, gpa); }
+    let s = m + 4;
+    let rcp = reciprocal(b, s, gpa);
+    quotient_with_rcp(a, b, &rcp, s, gpa)
 }
 
 // floor(sqrt(n)): Newton's iteration x' = (x + n/x) / 2 on integers,
@@ -825,9 +884,18 @@ fn chudnovsky(digits: i64, scale: i64, timings: bool, gpa: Gpa) -> BigUint<Gpa> 
     });
     let t1 = now_ns();
     if s.neg { panic("superpi: the series' sum came out negative"); }
-    let mut num = root.times(&s.q);
-    num.mul_small(426880);
-    let (q, _) = div_rem_fast(&num, &s.t, gpa);
+    // The reciprocal needs only T, the numerator only the root and Q, so
+    // they run beside each other. The precision is above the quotient's
+    // length, and more precision only makes the estimate better.
+    let prec = root.limbs.len() + s.q.limbs.len() - s.t.limbs.len() + 5;
+    let divisor = &s.t;
+    let (num, rcp) = thread::scope(|sc| {
+        let h = sc.spawn(move || reciprocal(divisor, prec, gpa));
+        let mut num = root.times(&s.q);
+        num.mul_small(426880);
+        (num, h.join().unwrap())
+    });
+    let (q, _) = quotient_with_rcp(&num, &s.t, &rcp, prec, gpa);
     let t2 = now_ns();
     if timings {
         eprintln("  split and sqrt together {:.1} ms, divide {:.1} ms", ms(t0, t1), ms(t1, t2));

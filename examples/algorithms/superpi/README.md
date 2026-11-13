@@ -62,7 +62,12 @@ shift, never a division), twiddles are precomputed a stage at a time, and
 the three residues are recombined by Garner's algorithm into exact
 coefficients, which are carried back into base 10^9 with plain `u64`
 arithmetic — no bignum is allocated per coefficient. A square needs two
-transforms per prime, not three.
+transforms per prime, not three. The butterflies themselves run two at a
+time in NEON lanes (`std::arch::aarch64`): the operands are below 2^30,
+so they live in u32 lanes, the widening `umull`/`umlal` multiplies do the
+Montgomery reduction, and the modular add and subtract are u32 lanes
+again. That also halves the transform arrays' memory traffic. A scalar
+path remains for machines without NEON (`detect("neon")` chooses).
 
 **Division and square root by Newton, with doubling precision.** The
 reciprocal of the divisor is computed by Newton's iteration at a
@@ -78,10 +83,12 @@ against.
 
 **Threads where they pay.** The three primes of a large transform are
 independent and run on three scoped threads (above 2^16 points; spawning
-costs more than it saves below that). The square root depends on nothing
-in the series, so it runs beside the binary split. Threading the split's
-recursion as well was measured and made things worse: the transform
-threads already use the cores.
+costs more than it saves below that). Two overlaps do the rest: the
+square root depends on nothing in the series, so it runs beside the
+binary split, and the final division's reciprocal depends only on T, so
+it runs beside the numerator's root-times-Q product. Threading the
+split's recursion as well was measured and made things worse: the
+transform threads already use the cores.
 
 **An independent cross-check.** Up to 10000 digits every run also
 evaluates Machin's formula `pi = 16 arctan(1/5) - 4 arctan(1/239)` in
@@ -115,14 +122,20 @@ answer alone (the Machin cross-check is extra where it runs):
 
 | digits | time | what dominates |
 |---|---|---|
-| 1000 | 1.4 ms | schoolbook products |
-| 10000 | 39 ms | Karatsuba and the first NTTs |
-| 100000 | 0.21 s | NTT products, three threads |
-| 1000000 | 2.0 s | the same, transform length 2^19 |
+| 1000 | 0.6 ms | schoolbook products |
+| 10000 | 15 ms | Karatsuba and the first NTTs |
+| 100000 | 0.19 s | NTT products, three threads |
+| 1000000 | 1.5-2.1 s | the same, transform length 2^19 |
+
+(The million-digit figure is the spread over several runs while other
+work was on the machine; the best run was 1.42 s.)
 
 The Machin cross-check adds 0.7 ms at 1000 digits and 72 ms at 10000;
 that is why it stops there. Every stage is linearithmic in the number of
 digits, so these grow at a little worse than linearly. Nothing in the
 computation uses floating point. Getting a million digits under a second
-from here means vectorized (NEON) butterflies and short products for the
-truncated halves of the Newton steps, not a different algorithm.
+from here means short products for the discarded halves of the Newton
+steps (a middle-product NTT) and reusing forward transforms between the
+products that share an operand in the split, not a different algorithm.
+Both were left out: the first is a large, delicate change, the second
+buys about a sixth of the split's transforms.
