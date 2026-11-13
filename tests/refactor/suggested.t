@@ -11,7 +11,7 @@
 $ check
 main.vl:22:13: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: volec fix --suggested main.vl
 main.vl:24:21: error[type error] expected 'u8', got 'i64' | help: only widening is implicit: convert explicitly | try: total(&v) as u8
-main.vl:25:8: error[type error] expected 'bool', got 'i64' | help: a condition is a bool: compare (`x != 0`); bitwise not is `~x` | try: n != 0 | try: volec fix --suggested main.vl
+main.vl:25:8: error[type error] expected 'bool', got 'i64' | help: a condition is a bool: compare (`x != 0`); bitwise not is `!x` | try: n != 0 | try: volec fix --suggested main.vl
 main.vl:28:21: error[type error] expected 'f64', got 'i64' | help: only widening is implicit: convert explicitly | try: n as f64 | try: volec fix --suggested main.vl
 main.vl:30:13: error[alloc.no_in] 'String::from' allocates from nothing: pass the allocator, last, to 'String::from_in' | help: this function's `gpa` is the allocator to pass | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
 main.vl:31:25: error[type error] unknown type 'Rect' | help: add `use crate::lib::shapes::Rect;` | try: volec fix --suggested main.vl

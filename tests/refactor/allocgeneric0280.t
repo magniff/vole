@@ -14,13 +14,13 @@ main.vl:35:13: error[type error] no method 'all' on type 'Ring<i64, Gpa>' | try:
 main.vl:36:13: error[type error] no method 'count' on type 'Ring<i64, Gpa>' | try: volec query items Ring main.vl
 main.vl:37:13: error[type.infer] cannot infer type parameter 'T' of 'same' | help: nothing here says what it is: give the variable a type (`let x: TYPE = ...`), or write the type arguments (try:, with the parameter's type for its name) | try: same::<T, B>(...)
 main.vl:38:13: error[type.infer] cannot infer type parameter 'T' of 'both' | help: nothing here says what it is: give the variable a type (`let x: TYPE = ...`), or write the type arguments (try:, with the parameter's type for its name) | try: both::<T, B, C>(...)
-main.vl:40:22: error[type error] expected 'bool', got 'i32' | help: a condition is a bool: compare (`x != 0`); bitwise not is `~x` | try: 3 != 0 | try: volec fix --suggested main.vl
+main.vl:40:22: error[type error] expected 'bool', got 'i32' | help: a condition is a bool: compare (`x != 0`); bitwise not is `!x` | try: 3 != 0 | try: volec fix --suggested main.vl
 [exit 1]
 $ fix --only alloc
 fixed 7 suggested fixes	main.vl	+7 -7 lines
 main.vl:24:65: error[alloc.default] 'Vec' names no allocator: its 'A' is written, last | help: this item is generic over the allocators 'B' and 'C': write the one this 'Vec' allocates from as its last type argument (`, B`); no fix chooses between them
 main.vl:38:13: error[type.infer] cannot infer type parameter 'C' of 'both' | help: nothing here says what it is: give the variable a type (`let x: TYPE = ...`), or write the type arguments (try:, with the parameter's type for its name) | try: both::<i64, Gpa, C>(...)
-main.vl:40:22: error[type error] expected 'bool', got 'i32' | help: a condition is a bool: compare (`x != 0`); bitwise not is `~x` | try: 3 != 0 | try: volec fix --suggested main.vl
+main.vl:40:22: error[type error] expected 'bool', got 'i32' | help: a condition is a bool: compare (`x != 0`); bitwise not is `!x` | try: 3 != 0 | try: volec fix --suggested main.vl
 note fix.left: 3 errors left (above)
 % cat main.vl
 use std::alloc::Allocator;
@@ -68,5 +68,5 @@ fn main(gpa: Gpa) {
 $ check
 main.vl:24:65: error[alloc.default] 'Vec' names no allocator: its 'A' is written, last | help: this item is generic over the allocators 'B' and 'C': write the one this 'Vec' allocates from as its last type argument (`, B`); no fix chooses between them
 main.vl:38:13: error[type.infer] cannot infer type parameter 'C' of 'both' | help: nothing here says what it is: give the variable a type (`let x: TYPE = ...`), or write the type arguments (try:, with the parameter's type for its name) | try: both::<i64, Gpa, C>(...)
-main.vl:40:22: error[type error] expected 'bool', got 'i32' | help: a condition is a bool: compare (`x != 0`); bitwise not is `~x` | try: 3 != 0 | try: volec fix --suggested main.vl
+main.vl:40:22: error[type error] expected 'bool', got 'i32' | help: a condition is a bool: compare (`x != 0`); bitwise not is `!x` | try: 3 != 0 | try: volec fix --suggested main.vl
 [exit 1]
