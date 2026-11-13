@@ -178,6 +178,7 @@ derived trait and a hand-written impl of it clash: remove one.
 
 ```vole
 use std::collections::HashMap;
+use std::hash::FixedState;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 struct Key { group: i64, id: i64 }
@@ -185,7 +186,7 @@ struct Key { group: i64, id: i64 }
 fn main(gpa: Gpa) -> i32 {
     let mut keys = [Key { group: 2, id: 1 }, Key { group: 1, id: 9 }, Key { group: 1, id: 3 }];
     keys.sort_unstable();                    // by group, then id
-    let mut m: HashMap<Key, i64, Gpa> = HashMap::new_in(gpa);
+    let mut m: HashMap<Key, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     for k in keys { m.insert(k, k.id * 10); }
     let wanted = Key { group: 2, id: 1 };
     println("{:?} {:?} {:?} {}", keys[0], m.get(&wanted), Key::default(), keys[1] < keys[2]);

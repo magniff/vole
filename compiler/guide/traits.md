@@ -8,6 +8,7 @@ generic function is compiled once per type it is called with.
 
 ```vole
 use std::collections::HashMap;
+use std::hash::FixedState;
 use std::ops::Add;
 
 trait Shape {
@@ -49,7 +50,7 @@ fn main(gpa: Gpa) -> i32 {
     report(&Rect { w: 2, h: 5 });
     let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
     if v > (V2 { x: 0, y: 0 }) { print("{}", v.x * 10 + v.y); }
-    let mut seen: HashMap<V2, bool, Gpa> = HashMap::new_in(gpa); // a key: Hash + Eq
+    let mut seen: HashMap<V2, bool, Gpa, FixedState> = HashMap::new_in(gpa); // a key: Hash + Eq
     seen.insert(v, true);
     if seen.contains_key(&V2 { x: 4, y: 6 }) { print(" found "); }
     println("{} {:?}", 21i64.double(), v);

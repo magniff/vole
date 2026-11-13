@@ -485,6 +485,7 @@ many fields, and the compiler can write them for you:
 
 ```vole
 use std::collections::HashMap;
+use std::hash::FixedState;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
 struct Version {
@@ -500,7 +501,7 @@ fn main(gpa: Gpa) {
     versions.sort();
     println("{versions:?}");
 
-    let mut notes: HashMap<Version, &str, Gpa> = HashMap::new_in(gpa);
+    let mut notes: HashMap<Version, &str, Gpa, FixedState> = HashMap::new_in(gpa);
     let current = Version { major: 1, minor: 10 };
     notes.insert(current, "current");
     println("{:?}", notes.get(&current));

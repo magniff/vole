@@ -1683,12 +1683,19 @@ and symbols leave out the trailing arguments equal to their defaults. An
 impl block writes every argument: `impl<T, U> Pair<T, U>`. (0.16 to
 0.26.2, std's allocator parameters had the default `Gpa`, `Vec<T, A:
 Allocator = Gpa>`; from 0.26.3 an allocator parameter has none, and a
-type names its allocator: Allocators, below.)
+type names its allocator: Allocators, below. 0.28.0's `HashMap<K, V, A,
+S = FixedState>` and `HashSet` had std's last defaults on a struct;
+from 0.29.0 the hasher is written too, `HashMap<K, V, Gpa, FixedState>`:
+a type argument left out for a parameter bounded by `BuildHasher` is
+`hash.default`, whose fix writes `FixedState` and its `use`. The
+constructors name the hasher as Rust's do: `HashMap::new_in(a)` is of
+`impl<K, V, A> HashMap<K, V, A, FixedState>`, `with_hasher_in(h, a)` of
+any `S`. std's operator and comparison traits keep `Rhs = Self`.)
 
 ### Allocators
 
 std's containers take their memory from an allocator, a type parameter:
-`Vec<T, A: Allocator>`, `Buf<A>`, `String<A>`, `HashMap<K, V, A>`.
+`Vec<T, A: Allocator>`, `Buf<A>`, `String<A>`, `HashMap<K, V, A, S>`.
 Allocation is explicit: nothing allocates without being given an
 allocator (`Vec::new_in(a)`, `with_capacity_in(n, a)`, `filled_in(n, x,
 a)`, `Buf::new_in(a)`, `HashMap::new_in(a)`, `collect_in(a)`,

@@ -72,6 +72,7 @@ usage: tool [-v] FILE
 
 ```vole
 use std::collections::HashMap;      // imports first, by convention
+use std::hash::FixedState;
 import "stdio.h" as c;              // a C header
 
 const LIMIT: i64 = 100;             // a constant expression
@@ -95,7 +96,7 @@ fn ignore(_: i64) {}                 // `_` ignores an argument
 fn bump(mut n: i64) -> i64 { n += 1; n }  // a mutable copy of the argument
 fn twice(v: &mut Vec<i64, Gpa>) { v.push(v.len() as i64); } // called as twice(&mut v)
 unsafe fn raw(p: *const i64) -> i64 { *p }  // callers need unsafe
-fn hi(m: &mut HashMap<i64, i64, Gpa>) { m.insert(1, 2); } // the `use` above
+fn hi(m: &mut HashMap<i64, i64, Gpa, FixedState>) { m.insert(1, 2); } // the `use`s above
 
 impl Point {
     fn len2(&self) -> i64 { self.x * self.x + self.y * self.y }

@@ -154,7 +154,9 @@ for case_ in "$@"; do
             | sed -E 's/(^|[^A-Za-z0-9_!])println\(/\1println!(/g' >"$rs.0"
         if [ $STD2 -eq 1 ]; then
             # (the capability's inverse, --std2)
-            sed -E -e 's/fn main\(gpa: Gpa\)/fn main()/' -e 's/, Gpa>/>/g' -e 's/<Gpa>//g' \
+            sed -E -e 's/fn main\(gpa: Gpa\)/fn main()/' -e 's/, Gpa, FixedState>/>/g' \
+                -e 's/ ?use std::hash::FixedState;//' -e 's/\{FixedState, /{/' \
+                -e 's/, FixedState([,}])/\1/' -e 's/, Gpa>/>/g' -e 's/<Gpa>//g' \
                 -e 's/format_in\([a-z_]+, /format!(/g' \
                 -e 's/([A-Za-z_][A-Za-z0-9_]*)_in\(gpa\)/\1()/g' \
                 -e 's/([A-Za-z_][A-Za-z0-9_]*)_in\(([^()]*), gpa\)/\1(\2)/g' \

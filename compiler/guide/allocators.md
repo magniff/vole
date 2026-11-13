@@ -59,9 +59,10 @@ error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, 
 
 ## Containers and their allocator
 
-`Vec<T, A: Allocator>`, `String<A>`, `Box<T, A>`, `HashMap<K, V, A>`: the
-allocator is a type parameter, always written (no default,
-`alloc.default`), so `Vec<i64, Gpa>` says it may grow from `Gpa`, which
+`Vec<T, A: Allocator>`, `String<A>`, `Box<T, A>`, `HashMap<K, V, A, S>`:
+the allocator is a type parameter, always written (no default,
+`alloc.default`; a map's hasher `S` likewise, `hash.default`: `guide
+std`), so `Vec<i64, Gpa>` says it may grow from `Gpa`, which
 takes no bytes. Code generic over the allocator names it (`use
 std::alloc::Allocator;`), and changes the container through a `&mut`;
 code that only reads takes a slice:
