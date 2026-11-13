@@ -547,6 +547,17 @@ A reference to an indexable type (`&[T]`, `&Vec<T, A>`, `&[T; N]`) is
 indexed through, as before. MVS keeps its raw-pointer indexing.
 *Anchor:* `front/check/synth_mode.vl: synth_index`.
 
+**F30.4 (a slice has no fields, 0.29).** `s.len` and `s.ptr` of a
+slice (`[T]`, through any reference) are `error type` ("a slice has no
+field 'len'", rustc E0609/E0615), as is any other field name: the
+length is `s.len()`, the pointer `s.as_ptr()` (a `*const T`) or
+`s.as_mut_ptr()` (a `*mut T`, of a `&mut [T]`). Each error carries its
+exact fix (`len()`, `as_ptr()`), which `volec fix --suggested` writes.
+The two words of the reference are read as fields only where the
+methods are made: `len`, `as_ptr` and `as_mut_ptr` of std::slice, and
+the nodes the checker makes itself (a `for` over a slice, `==` of two).
+*Anchor:* `front/check/synth_mode.vl: synth_field, in_std_slice`.
+
 ### F32 Unsize coercion
 
 **F32.1 (the one coercion).** At a *coercion site* — a `let` with an
