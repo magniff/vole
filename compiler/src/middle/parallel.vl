@@ -31,6 +31,7 @@
 // process's), --stats, --verify-ir, the IR printers.
 
 use std::alloc::Allocator;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::host_target;
@@ -432,6 +433,47 @@ impl<A: Allocator> TaskInts<A> {
     }
 }
 
+// (0.29) A table of lists of i64 shared by element as a TaskInts is: a
+// list is written by the task that has its function (or component) and
+// read by others once that task is done. Each list is behind a lock of
+// its own, free but for a moment (one push, one read), so the table is
+// used through `&` in safe code.
+pub struct TaskLists<A: Allocator> {
+    v: Vec<Mutex<Vec<i64, A>>, A>,
+}
+
+pub fn task_lists() -> TaskLists<Comp> {
+    TaskLists { v: Vec::new_in(Comp {}) }
+}
+
+impl TaskLists<Comp> {
+    // n lists, each empty.
+    pub fn reset(&mut self, n: i64) {
+        self.v.clear();
+        for i in 0..n {
+            self.v.push(Mutex::new(Vec::new_in(Comp {})));
+        }
+    }
+
+    pub fn clear(&self, i: i64) {
+        self.v[i as usize].lock().unwrap().clear();
+    }
+
+    pub fn push(&self, i: i64, value: i64) {
+        self.v[i as usize].lock().unwrap().push(value);
+    }
+
+    // The length of list i, and its k-th item.
+    pub fn count(&self, i: i64) -> i64 {
+        self.v[i as usize].lock().unwrap().len() as i64
+    }
+
+    pub fn at(&self, i: i64, k: i64) -> i64 {
+        let list = self.v[i as usize].lock().unwrap();
+        (*list)[k as usize]
+    }
+}
+
 // Runs task `task` of a phase of kind `kind` in context cx (any thread).
 pub fn run_task(mut cx: *mut FnCtx<Comp>, kind: i64, task: i64, pcx: &Ctx<Comp>) {
     unsafe {
@@ -651,8 +693,6 @@ pub fn simplify_all(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
 
 // ---- -O2: the components, bottom up ----
 
-static mut COMP_INLINED: *mut IntVec = 0 as *mut IntVec;
-
 // Builds the components and their levels (main thread).
 fn build_components(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
     unsafe {
@@ -689,7 +729,7 @@ fn build_components(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
         // when it comes before it in SCC_ORDER (0.17 had it done then).
         pcx.comp_level = alloc_array::<i64>(pcx.comp_count + 1);
         pcx.comp_growth.reset(pcx.comp_count + 1, 0);
-        set_comp_inlined(alloc_zeroed((pcx.comp_count + 1) * size_of(IntVec)) as *mut IntVec);
+        pcx.comp_inlined.reset((pcx.comp_count + 1));
         pcx.level_count = 0;
         let mut calls = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
         for c in 0..pcx.comp_count {
@@ -774,8 +814,8 @@ pub fn optimize_components(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
             for k in (*start.add(l as usize))..(*start.add((l + 1) as usize)) {
                 let c = (by_level[k as usize]);
                 add_program_size((pcx.comp_growth.get(c)), pcx);
-                for m in 0..(*get_comp_inlined().add(c as usize)).len() as i64 {
-                    (pcx.fn_calls[((*get_comp_inlined().add(c as usize))[m as usize]) as usize]) -= 1;
+                for m in 0..pcx.comp_inlined.count(c) {
+                    (pcx.fn_calls[(pcx.comp_inlined.at(c, m)) as usize]) -= 1;
                 }
             }
         }
@@ -811,7 +851,7 @@ fn run_component(cx: &mut FnCtx<Comp>, c: i64, pcx: &Ctx<Comp>) {
         }
         pcx.comp_growth.set(c, cx.comp_growth);
         for m in 0..cx.comp_dec.len() as i64 {
-            (*get_comp_inlined().add(c as usize)).push((cx.comp_dec[m as usize]));
+            pcx.comp_inlined.push(c, (cx.comp_dec[m as usize]));
         }
         if pcx.cc_on {
             cc_component_end(cx, c, start, end, pcx);
@@ -1135,37 +1175,6 @@ fn set_fn_consts(v: *mut ConstList) {
     // that entry, never the count or slots an appending task writes
     unsafe {
         FN_CONSTS = v;
-    }
-}
-
-// (0.28.0) COMP_INLINED's accessors: every use of it is one of them.
-pub fn get_comp_inlined() -> *mut IntVec {
-    // UNSAFE: the per-component inlined-callee lists, a process-wide static
-    // mut; Rust has no safe access to a static mut
-    // SAFETY: the pointer is written only by build_components on the main
-    // thread before the bottom-up levels run; entry c is pushed only by
-    // component c's task (run_component, or component_install on a cache
-    // hit) and read by that task (cc_component_end) and by the main thread
-    // after the level's pool_run returned (optimize_components' barrier); a
-    // level's tasks are distinct components (by_level lists each once;
-    // run_task's c = parallel_items[task]), so no two threads touch one
-    // entry at once
-    unsafe { COMP_INLINED }
-}
-
-pub fn set_comp_inlined(v: *mut IntVec) {
-    // UNSAFE: the per-component inlined-callee lists, a process-wide static
-    // mut; Rust has no safe access to a static mut
-    // SAFETY: the pointer is written only by build_components on the main
-    // thread before the bottom-up levels run; entry c is pushed only by
-    // component c's task (run_component, or component_install on a cache
-    // hit) and read by that task (cc_component_end) and by the main thread
-    // after the level's pool_run returned (optimize_components' barrier); a
-    // level's tasks are distinct components (by_level lists each once;
-    // run_task's c = parallel_items[task]), so no two threads touch one
-    // entry at once
-    unsafe {
-        COMP_INLINED = v;
     }
 }
 

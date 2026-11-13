@@ -42,13 +42,13 @@ case "$COMPILER" in /*) ;; *) COMPILER="$(pwd)/$COMPILER" ;; esac
 ALLOWED='base::ctx::Ctx.fn_size	the task'"'"'s own function'"'"'s entry; others read a lower level'"'"'s
 base::ctx::Ctx.fn_rt	the task'"'"'s own function'"'"'s entry (finish_component_function)
 base::ctx::Ctx.fn_deciders_start	the task'"'"'s own function'"'"'s entry
-middle::inline::FN_DECIDERS	the task'"'"'s own function'"'"'s entry
+base::ctx::Ctx.fn_deciders	the task'"'"'s own function'"'"'s entry
 base::ctx::Ctx.opt_deferred	the task'"'"'s own function'"'"'s entry
 base::ctx::Ctx.fn_attrs	the task'"'"'s own component'"'"'s entries
 base::ctx::Ctx.fn_nocapture	the task'"'"'s own component'"'"'s entries
 base::ctx::Ctx.fn_attrs_done	the task'"'"'s own component'"'"'s entries
 base::ctx::Ctx.comp_growth	the task'"'"'s own component'"'"'s entry, read between levels
-middle::parallel::COMP_INLINED	the task'"'"'s own component'"'"'s entry, read between levels
+base::ctx::Ctx.comp_inlined	the task'"'"'s own component'"'"'s entry, read between levels
 middle::parallel::FN_CONSTS	the task'"'"'s own function'"'"'s list; others read its entries made in earlier phases, which never move (chunks)
 middle::parallel::FN_TEXT	the task'"'"'s own function'"'"'s entry, read at the join
 back::codecache::FN_IRH	the task'"'"'s own functions'"'"' entries; others read a lower level'"'"'s or an earlier phase'"'"'s (FN_IRH_OK)
@@ -251,7 +251,7 @@ base::ctx::Ctx.noalias_off	key: options_hash
 base::ctx::Ctx.ifconv	key: options_hash
 base::ctx::Ctx.fn_address	read: R_STATIC (facts_fixed); the key (own_fp)
 base::ctx::Ctx.fn_calls	read: R_CALLS, whether one is left
-middle::inline::FN_DECIDERS	read: R_DEC
+base::ctx::Ctx.fn_deciders	read: R_DEC
 base::ctx::Ctx.fn_deciders_start	read: R_DEC
 base::ctx::Ctx.fn_live	read: R_STATIC; the key
 base::ctx::Ctx.fn_rt	read: R_RT
@@ -287,7 +287,7 @@ base::ctx::Ctx.opt_level	key: options_hash
 base::ctx::Ctx.per_function	key: options_hash
 base::ctx::Ctx.comp_end	key: the component'"'"'s functions
 base::ctx::Ctx.comp_growth	own: an output
-middle::parallel::COMP_INLINED	own: an output
+base::ctx::Ctx.comp_inlined	own: an output
 base::ctx::Ctx.comp_level	read: R_STATIC (ready)
 base::ctx::Ctx.comp_of	read: R_STATIC (ready)
 base::ctx::Ctx.comp_start	key: the component'"'"'s functions
