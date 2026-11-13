@@ -229,7 +229,7 @@ front::cells::FREEZE_MEMO	key: types_hash (each type'"'"'s is_freeze)
 front::cells::SYM_UNSAFE_CELL	key: the same
 base::ctx::Ctx.modules	key: the same (is_within, only from is_freeze: whether a struct is std'"'"'s UnsafeCell)
 base::ctx::Ctx.std_module	key: the same (within_std)
-base::ctx::Ctx.fn_effects	IR: a function'"'"'s effects (fn_canon)
+base::ctx::Ctx.node_fx	IR: a function'"'"'s effects (fn_canon); (0.29) the table itself, fn_effects was its second name
 base::ctx::Ctx.fn_effects_count	IR: the same
 front::effects::builtin::TABLE	IR: by a symbol'"'"'s text; the same in every build of a compiler
 front::lexer::STRS	IR: a string'"'"'s bytes (STR_H)
