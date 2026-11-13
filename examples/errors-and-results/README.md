@@ -175,7 +175,7 @@ suggests for a value that must outlive its source. The fields of a
 - `#[derive(Debug)]`, `impl Display`, `{x:?}`, `{x:<26}`: `volec guide formatting`
 - closures given to `map_err`, `map`, `any`: `volec guide closures`
 - drops, `HashMap`, `lines`, `split_once`, `trim`: `volec guide std`, `volec guide memory`
-- lifetimes on a struct and a `type` alias (`type Fields<'a> = HashMap<&'a str, Field<'a>, Gpa>;`): `volec guide generics`
+- lifetimes on a struct and a `type` alias (`type Fields<'a> = HashMap<&'a str, Field<'a>, Gpa, FixedState>;`): `volec guide generics`
 
 ## Going further
 

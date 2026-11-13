@@ -170,6 +170,8 @@ def translate(src):
         lines.append(line)
     s = "\n".join(lines)
     s = re.sub(r"fn main\(gpa: Gpa\)", "fn main()", s)
+    # (0.29.0) a map's hasher is written, after the allocator: Rust's default
+    s = re.sub(r",\s*Gpa,\s*FixedState>", ">", s)
     s = re.sub(r",\s*Gpa>", ">", s)
     s = re.sub(r"<Gpa>", "", s)
     while True:

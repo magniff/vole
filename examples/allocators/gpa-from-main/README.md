@@ -62,8 +62,8 @@ There are four kinds of function in `main.vl`, by what they are given:
 |---|---|---|
 | `parse_orders` | `(text: &str, gpa: Gpa) -> Vec<Order, Gpa>` | from the `gpa` it is passed |
 | `total` | `(orders: &[Order]) -> i64` | never: a slice and no allocator |
-| `by_customer` | `(orders: &Vec<Order, Gpa>) -> HashMap<&str, i64, Gpa>` | from the allocator the Vec holds: `orders.allocator()` |
-| `count_items` | `<A: Allocator>(orders: &[Order], a: A) -> HashMap<&str, i64, A>` | from whichever allocator the caller picks |
+| `by_customer` | `(orders: &Vec<Order, Gpa>) -> HashMap<&str, i64, Gpa, FixedState>` | from the allocator the Vec holds: `orders.allocator()` |
+| `count_items` | `<A: Allocator>(orders: &[Order], a: A) -> HashMap<&str, i64, A, FixedState>` | from whichever allocator the caller picks |
 
 A container keeps its allocator, and its type names it: `Vec<T, Gpa>`
 (three words: a `Gpa` takes no bytes). Its

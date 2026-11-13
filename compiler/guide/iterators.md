@@ -47,7 +47,7 @@ fn main(gpa: Gpa) -> i32 {
 | `v.iter()`, `s.iter()` (a Vec, a slice, an array variable) | `&T`, each element borrowed |
 | `v.iter_mut()` | `&mut T`: `for x in v.iter_mut() { *x *= 2; }` |
 | `v.into_iter()`, `for x in v` | `T`, the Vec's elements moved out |
-| `m.iter()`, `m.keys()`, `m.values()` (a `HashMap<K, V, A>`) | `(&K, &V)`, `&K`, `&V` |
+| `m.iter()`, `m.keys()`, `m.values()` (a `HashMap<K, V, A, S>`) | `(&K, &V)`, `&K`, `&V` |
 | `a..b`, `a..=b` as a value: `(0..n).map(...)` | the integers; `0..=255u8` ends without overflow |
 | a type with `impl Iterator` | what its `next` returns |
 

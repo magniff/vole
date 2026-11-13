@@ -45,7 +45,9 @@ SERVED = {"new_in", "with_capacity_in", "with_hasher_in", "with_capacity_and_has
           "to_ascii_uppercase_in", "to_ascii_lowercase_in", "replace_in", "replacen_in",
           "lines_in"}
 PRELUDE_NAMES = {"Gpa", "Allocator", "ToStringIn", "CollectIn", "DefaultIn", "CloneIn",
-                 "FromIteratorIn", "ToOwnedIn", "FromIn", "NewIn", "WithCapacityIn"}
+                 "FromIteratorIn", "ToOwnedIn", "FromIn", "NewIn", "WithCapacityIn",
+                 # (0.29.0) a map's hasher type argument, dropped as its `use` is
+                 "FixedState"}
 # left after the changes: the program is outside
 VOLE_ONLY = [r"\bArena\b", r"\bAnyAlloc\b", r"\bFixedBuf\b", r"Formatter::new\b",
              r"(?<![.\w])allocator\(\)", r"\blive_blocks\b", r"\bcheck_leaks\b", r"\bFixedState\b",
@@ -312,6 +314,10 @@ def to_rust(src, alloc_api=False):
                lambda m: drop_uses(m.group(0)) or "", src)
     s = re.sub(CHECK_ATTRS, "", s)
     gpas = gpa_names(s)
+    # (0.29.0) a map's hasher is written, last (`HashMap<K, V, Gpa,
+    # FixedState>`): Rust's default hasher, the argument dropped (a
+    # FixedState left as a value keeps the program outside)
+    s = re.sub(r",\s*FixedState\s*>", ">", s)
     if alloc_api:
         while True:
             t = format_in_alloc(s)

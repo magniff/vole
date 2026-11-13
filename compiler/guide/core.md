@@ -25,6 +25,7 @@ volec try '"42".parse::<i64>()'            # a snippet: its TYPE = VALUE
 import "stdio.h" as c;                 // a C header; its names under c::
 use std::fmt::Write;
 use std::collections::HashMap;         // std items by name (never *)
+use std::hash::FixedState;
 
 struct P { x: i64 }
 
@@ -70,7 +71,7 @@ fn main(gpa: Gpa) -> i32 { // gpa: the program's allocator; 0 = exit status
     write(&mut b, "{}", o.len()).unwrap();
     println("{b}");
     if s == "hi" && !first(s).is_ascii_digit() { println("{}", first(s)); }
-    let mut m: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
+    let mut m: HashMap<&str, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     *m.entry("k").or_insert(0) += 1;
     let z = 0;
     println("{} {} {}", !0u8, 250u8.wrapping_add(7), m["k"]); // x / 0 panics
@@ -109,6 +110,7 @@ reaches the program's module `lexer`.
 
 ```vole
 use std::collections::HashMap;
+use std::hash::FixedState;
 use std::io;
 
 struct Item<'a> { name: &'a str, qty: i64 }    // 'a: the name borrows the input
@@ -119,7 +121,7 @@ fn main(gpa: Gpa) -> i32 {
     let mut toks = lines.next().unwrap().split_whitespace();
     let n: i64 = toks.next().unwrap().parse().unwrap(); // parse: a Result<i64, ParseIntError>
     let mut items: Vec<Item, Gpa> = Vec::new_in(gpa);
-    let mut seen: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
+    let mut seen: HashMap<&str, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     for _ in 0..n {
         let name = toks.next().unwrap();       // Option<&str>: a slice of input
         let qty = toks.next().unwrap_or("").parse().unwrap_or(0);
@@ -168,7 +170,7 @@ with its comment: `volec guide --find split_once`.
 |---|---|
 | `'println!' is a macro call: vole has no macros` | `println("{a}")`, the help's form |
 | `'Vec::new' allocates from nothing` (`alloc.no_in`) | `Vec::new_in(gpa)`: main's `gpa`, passed down; `volec fix --only alloc` |
-| `'Vec' names no allocator` (`alloc.default`) | `Vec<i64, Gpa>`, `HashMap<K, V, Gpa>`; a struct holding one: `struct P<A: Allocator> { v: Vec<i64, A> }`, used as `P<Gpa>` (`volec fix --only alloc` writes both) |
+| `'Vec' names no allocator` (`alloc.default`) | `Vec<i64, Gpa>`; a struct holding one: `struct P<A: Allocator> { v: Vec<i64, A> }`, used as `P<Gpa>` (`volec fix --only alloc` writes both) |
 | `expected 'String<Gpa>', got '&str'` | `String::from_in("..", gpa)`: a String owns its text; a parameter `s: &str` takes literals and a String's `&s` |
 | `cannot assign to immutable variable 'a'` | `let mut a` |
 | `borrowck.borrow_immutable: cannot borrow 'w' as mutable, as it is not declared as mutable` | `let mut w`: `w.push(1)` and `&mut w` change it |

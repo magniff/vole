@@ -9,12 +9,15 @@
 ## header (alloc.default: `impl<T, A: Allocator> Stack<T, A>`), then its own
 ## `Stack<T>` inside it, written with the impl's `A`; a turbofish, `Vec::<i64>`.
 ## Then the codes' explanations (alloc.safe_impl, alloc.static, alloc.field, alloc.last: their tests/run/err_alloc_* cases).
-## Rust edition (0.28.0) gaps this records: `HashMap<K, V>` is an arity error, not
-## alloc.default (std's HashMap<K, V, A, S>); `Stack<T>`'s `Vec<T>` field is not flagged; a
+## (0.29.0) `HashMap<K, V>` names no hasher either (hash.default,
+## tests/refactor/hash0290.t): `fix --only alloc` writes its allocator and
+## leaves the hasher, whose own fix (`fix --suggested`) the error then has.
+## Rust edition (0.28.0) gaps this records: `Stack<T>`'s `Vec<T>` field is not flagged; a
 ## `collect()` is a type error (the fix still writes collect_in).
 $ check
 main.vl:3:14: error[alloc.default] 'Vec' names no allocator: its 'A' is written, last | help: the allocator is part of the type: `Gpa` (the type of main's `gpa`), or a generic `A: Allocator` | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
 main.vl:7:13: error[alloc.default] 'HashMap' names no allocator: its 'A' is written, last | help: the allocator is part of the type: `Gpa` (the type of main's `gpa`), or a generic `A: Allocator` | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
+main.vl:7:13: error[hash.default] 'HashMap' names no hasher: its 'S' is written, last | help: the hasher is part of the type: `FixedState` (`use std::hash::FixedState;`, the one `HashMap::new_in` makes), or a generic `S: BuildHasher`; its fix comes after the allocator's
 main.vl:7:26: error[alloc.default] 'String' names no allocator: its 'A' is written, last | help: the allocator is part of the type: `Gpa` (the type of main's `gpa`), or a generic `A: Allocator` | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
 main.vl:11:48: error[alloc.default] 'Vec' names no allocator: its 'A' is written, last | help: this item is generic over the allocator 'A': write it (`, A`, the fix), or `Gpa` | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
 main.vl:15:13: error[alloc.default] the allocator parameter 'A' has a default: an allocator type is always written (0.26.3) | help: take the default out: each use writes its allocator (`Vec<u8, Gpa>`) | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
@@ -54,9 +57,11 @@ $ fix --only alloc --dry-run
 +    let u = Vec::<i64, Gpa>::new_in(gpa);
 $ fix --only alloc
 fixed 9 suggested fixes	main.vl	+9 -9 lines
+main.vl:7:13: error[hash.default] 'HashMap' names no hasher: its 'S' is written, last | help: the hasher is part of the type: `FixedState` (`use std::hash::FixedState;`, the one `HashMap::new_in` makes), or a generic `S: BuildHasher` | try: volec fix --suggested main.vl
 main.vl:20:5: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'empty' and pass it down | try: volec refactor signature empty --add 'gpa: Gpa = gpa' --fill-calls --no-check main.vl
-note fix.left: 1 error left (above)
+note fix.left: 2 errors left (above)
 $ check
+main.vl:7:13: error[hash.default] 'HashMap' names no hasher: its 'S' is written, last | help: the hasher is part of the type: `FixedState` (`use std::hash::FixedState;`, the one `HashMap::new_in` makes), or a generic `S: BuildHasher` | try: volec fix --suggested main.vl
 main.vl:20:5: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'empty' and pass it down | try: volec refactor signature empty --add 'gpa: Gpa = gpa' --fill-calls --no-check main.vl
 [exit 1]
 $ explain alloc.default
