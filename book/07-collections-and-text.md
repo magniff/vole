@@ -443,7 +443,6 @@ are `String`s, so a new key has to be one too:
 
 ```vole
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 fn main(gpa: Gpa) {
     let mut ages: HashMap<String<Gpa>, i64, Gpa, FixedState> = HashMap::new_in(gpa);
@@ -454,7 +453,7 @@ fn main(gpa: Gpa) {
 
 ```err
 error[type error]: expected 'String<Gpa>', got '&str'
- --> main.vl: line 6, column 17
+ --> main.vl: line 5, column 17
   = help: a String owns its text, on an allocator: `String::from_in(s, gpa)`; a `&str` is a view of one (a `&str` parameter takes both: a literal, a String's `&s`)
   = try: String::from_in("ada", gpa)
 ```
@@ -587,7 +586,6 @@ key quickly, however many there are:
 
 ```vole
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 fn main(gpa: Gpa) {
     let mut ages: HashMap<&str, i64, Gpa, FixedState> = HashMap::new_in(gpa);
@@ -624,7 +622,6 @@ of its own:
 
 ```vole
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 fn main(gpa: Gpa) {
     let mut counts: HashMap<&str, i64, Gpa, FixedState> = HashMap::new_in(gpa);
@@ -677,7 +674,6 @@ over it goes from the smallest key up, and `range` gives part of it:
 ```vole
 use std::collections::BTreeMap;
 use std::collections::HashSet;
-use std::hash::FixedState;
 
 fn main(gpa: Gpa) {
     let mut seen: HashSet<i64, Gpa, FixedState> = HashSet::new_in(gpa);
@@ -722,7 +718,6 @@ punctuation around it ("dog." is "dog") and without caring about case
 ```vole words.vl
 use std::io;
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 // Letters, digits and apostrophes are parts of words. So is every
 // byte of a non-ASCII character (0x80 and up), so "café" stays whole.
@@ -865,7 +860,6 @@ five rows. Here is the complete `words.vl`:
 // Count the words on stdin, and print the most common ones.
 use std::io;
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 // Letters, digits and apostrophes are parts of words. So is every
 // byte of a non-ASCII character (0x80 and up), so "café" stays whole.

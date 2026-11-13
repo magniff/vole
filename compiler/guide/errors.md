@@ -54,9 +54,9 @@ error[hash.default] 'HashMap' names no hasher: its 'S' is written, last
 ```
 The hasher is part of the type too, after the allocator, and has no
 default: `HashMap<i64, i64, Gpa, FixedState>`, `HashSet<T, Gpa,
-FixedState>` (`use std::hash::FixedState;`, what `new_in` makes; in an
-item generic over `S: BuildHasher`, its `S`). `volec fix --suggested`
-writes it, with the `use`.
+FixedState>` (in the prelude, as `Gpa`; what `new_in` makes; in an item
+generic over `S: BuildHasher`, its `S`). `volec fix --suggested` writes
+it.
 
 ```vole
 struct Parser { toks: Vec<u8, Gpa> }
@@ -305,7 +305,7 @@ error[type error] no method 'push_string' on type 'String<Gpa>' | help: did you 
 ```
 
 ```vole
-fn main(gpa: Gpa) -> i32 { let m: HashMap<i64, i64, Gpa, std::hash::FixedState> = HashMap::new_in(gpa); 0 }
+fn main(gpa: Gpa) -> i32 { let m: HashMap<i64, i64, Gpa, FixedState> = HashMap::new_in(gpa); 0 }
 ```
 ```err
 error[type error] unknown type 'HashMap' | help: add `use std::collections::HashMap;`
@@ -317,7 +317,7 @@ error[type error] unknown type 'HashMap' | help: add `use std::collections::Hash
 use std::collections::HashMap;
 struct K { a: i64 }
 fn main(gpa: Gpa) -> i32 {
-    let mut m: HashMap<K, i64, Gpa, std::hash::FixedState> = HashMap::new_in(gpa);
+    let mut m: HashMap<K, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     m.insert(K { a: 1 }, 2);
     0
 }

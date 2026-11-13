@@ -876,7 +876,14 @@ NUL-terminated copy, for C.
 in scope in A only; `else if` and `else if let` chain. Without `else` it
 has type `()`, like `if`. `while let P = e { body }` is
 `loop { match e { P => { body }, _ => break } }`, labels, `break` and
-`continue` included.
+`continue` included. (0.29.0) The temporaries of the scrutinee `e`, and
+what P leaves of its value, are not the `match`'s (dropped at the end
+of its statement) but Rust 2024's: an `if let` drops them before B
+runs, and after A when P matches, at the end of A and not of the
+statement the `if let` is in; so an `else if let` chain holds one
+scrutinee's temporaries at a time, and B may use what a guard in `e`
+borrowed. `let P = e else { B };` drops them before B too (on a match
+they are the `let`'s), and a `while let` at the end of each iteration.
 
 **`defer`.** `defer expr;` or `defer { ... }` in a block runs the deferred
 statement when control leaves the block: at its end, or by `return`,
@@ -1692,7 +1699,8 @@ type names its allocator: Allocators, below. 0.28.0's `HashMap<K, V, A,
 S = FixedState>` and `HashSet` had std's last defaults on a struct;
 from 0.29.0 the hasher is written too, `HashMap<K, V, Gpa, FixedState>`:
 a type argument left out for a parameter bounded by `BuildHasher` is
-`hash.default`, whose fix writes `FixedState` and its `use`. The
+`hash.default`, whose fix writes `FixedState` (in the prelude, as
+`Gpa`). The
 constructors name the hasher as Rust's do: `HashMap::new_in(a)` is of
 `impl<K, V, A> HashMap<K, V, A, FixedState>`, `with_hasher_in(h, a)` of
 any `S`. std's operator and comparison traits keep `Rhs = Self`.)

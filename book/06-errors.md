@@ -27,7 +27,6 @@ library uses it that way everywhere:
 
 ```vole
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 fn main(gpa: Gpa) {
     let line = "port = 8080";
