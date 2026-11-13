@@ -67,7 +67,7 @@ struct Node<K, V> { key: K, value: V, prev: i32, next: i32 }
 
 struct LruCache<K: Hash + Eq + Copy, V: Copy, A: Allocator> {
     capacity: usize,
-    slots: HashMap<K, i32, A>, // key -> its node's index in `nodes`
+    slots: HashMap<K, i32, A, FixedState>, // key -> its node's index in `nodes`
     nodes: Vec<Node<K, V>, A>,
     head: i32, // the most recently used, or NIL
     tail: i32, // the least recently used, or NIL

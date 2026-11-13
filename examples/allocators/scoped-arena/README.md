@@ -97,7 +97,7 @@ match store.values.get_mut(key.as_str()) {
 (`Arena::new_in(gpa)`) and dropped at its end, after the store. The
 `&str` it returns borrows the arena, so it lives as long as the arena,
 and the store's type says so: `Store<'n, M, N>` holds `&'n Arena<N>` and
-a `HashMap<&'n str, i64, M>`. The borrow checker keeps the map from
+a `HashMap<&'n str, i64, M, FixedState>`. The borrow checker keeps the map from
 outliving the arena its keys are in; there is no `unsafe` in the
 program.
 

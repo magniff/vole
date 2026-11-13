@@ -43,7 +43,7 @@ make one program; `mod name;` loads `name.vl`.
 |---|---|
 | `println!("{}", x)`, `format!`, `vec!`, `assert!` | no macros: functions, `println("x = {x:>4} {:?}", v)`, `format_in("..", args, gpa)` (a `String`), `assert(c)`, `panic("..")` (`guide formatting`) |
 | `Vec::new()`, a global allocator | `Vec::new_in(gpa)`: nothing allocates without an allocator; `gpa` comes from `fn main(gpa: Gpa)`, passed down as a parameter (`guide allocators`) |
-| `Vec<T>`, `String`, `HashMap<K, V>`, `Box<T>` | the allocator is in the type: `Vec<T, Gpa>`, `String<Gpa>`, `HashMap<K, V, Gpa>`, `Box<T, Gpa>`; a struct that holds one is generic over it (`struct S<A: Allocator> { v: Vec<u8, A> }`) |
+| `Vec<T>`, `String`, `HashMap<K, V>`, `Box<T>` | the allocator is in the type: `Vec<T, Gpa>`, `String<Gpa>`, `HashMap<K, V, Gpa, FixedState>` (the hasher too: `use std::hash::FixedState;`), `Box<T, Gpa>`; a struct that holds one is generic over it (`struct S<A: Allocator> { v: Vec<u8, A> }`) |
 | `s.to_string()`, `it.collect()`, `s.to_uppercase()` | what allocates has the name with `_in` and takes the allocator last: `to_string_in(gpa)`, `collect_in(gpa)` (`alloc.no_in` names it; `volec fix --only alloc`) |
 | `use m::*;` | not allowed: `use m::{a, b};`, or the path `m::a` |
 | `a as i64` to widen | written or not: an `i32` goes where an `i64` does, losslessly; `a as i32` narrows (`guide conversions`) |
@@ -326,6 +326,7 @@ slices by bytes, `s.chars()` gives its `char`s, `s.as_bytes()` its
 ```vole
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::hash::FixedState;
 
 fn evens(n: i64, gpa: Gpa) -> Vec<i64, Gpa> { // it allocates: it takes an allocator
     (0..n).map(|i| i * 2).collect_in(gpa)
@@ -343,7 +344,7 @@ fn main(gpa: Gpa) -> i32 {                 // the program's allocator
     let last = v.pop();                    // Option<i64>
     println("{}", last.unwrap_or(-1));
 
-    let mut m: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
+    let mut m: HashMap<&str, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     m.insert("a", 1);
     m.insert("b", 2);
     match m.get("a") { Some(x) => println("{x}"), None => println("none") }

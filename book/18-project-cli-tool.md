@@ -62,9 +62,10 @@ mod report;
 use std::{env, fs, io};
 use std::cli::{Arg, Command, Matches};
 use std::collections::HashMap;
+use std::hash::FixedState;
 
 fn run(m: &Matches<Gpa>, n: usize, gpa: Gpa) -> io::Result<()> {
-    let mut counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
+    let mut counts: HashMap<String<Gpa>, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     for path in m.values("file") {
         let text = fs::read_to_string_in(path, gpa)?;
         count::add_words(&mut counts, &text, gpa);
@@ -99,6 +100,7 @@ fn main(gpa: Gpa) -> i32 {
 ```vole count.vl
 // Counting the words of a text.
 use std::collections::HashMap;
+use std::hash::FixedState;
 
 // Letters, digits and apostrophes are parts of words. So is every
 // byte of a non-ASCII character (0x80 and up), so "café" stays whole.
@@ -125,7 +127,7 @@ fn trim_punct(word: &str) -> &str {
 }
 
 // Adds the words of text to counts, lowercased.
-pub fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa>, text: &str, gpa: Gpa) {
+pub fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa, FixedState>, text: &str, gpa: Gpa) {
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.is_empty() {
@@ -140,8 +142,9 @@ pub fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa>, text: &str, gpa: G
 // The table of the most common words.
 
 use std::collections::HashMap;
+use std::hash::FixedState;
 
-pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64),
+pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa, FixedState>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64),
     Gpa> {
     let mut pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
     for (word, k) in counts {
@@ -266,6 +269,7 @@ complete program, one file at a time.
 
 use std::alloc::Allocator;
 use std::collections::HashMap;
+use std::hash::FixedState;
 
 pub struct Counts {
     pub lines: usize,
@@ -297,7 +301,7 @@ pub fn count(text: &str) -> Counts {
 // Adds one to freq for each word of text, without the punctuation around
 // it. The keys borrow from text: no word is copied.
 #[no_io]
-pub fn add_words<'a, A: Allocator>(freq: &mut HashMap<&'a str, i64, A>, text: &'a str) {
+pub fn add_words<'a, A: Allocator>(freq: &mut HashMap<&'a str, i64, A, FixedState>, text: &'a str) {
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if !w.is_empty() {
@@ -340,7 +344,7 @@ fn counts_lines_words_bytes() {
 
 #[test]
 fn trims_punctuation(gpa: Gpa) {
-    let mut freq: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
+    let mut freq: HashMap<&str, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     add_words(&mut freq, "(the) end. The end!");
     assert_eq(freq["end"], 2);
     assert_eq(freq["the"], 1);
@@ -355,7 +359,7 @@ fn counts_add_up(bytes: Vec<u8, Gpa>, gpa: Gpa) {
     for b in &bytes {
         text.push_str(pieces[(*b % 4) as usize]);
     }
-    let mut freq: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
+    let mut freq: HashMap<&str, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     add_words(&mut freq, &text);
     let mut total = 0;
     for (_, k) in &freq {
@@ -400,6 +404,7 @@ map on any allocator: in the tests, the `Gpa`; in `main.vl`, an arena.
 // The report: the counts, and a table of the most common words.
 
 use std::collections::HashMap;
+use std::hash::FixedState;
 
 use crate::count::Counts;
 
@@ -413,7 +418,7 @@ pub fn print_counts(c: &Counts, name: &str, words_only: bool) {
 }
 
 // The n most common words, most common first; as common, alphabetically.
-pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64),
+pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa, FixedState>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64),
     Gpa> {
     let mut pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
     for (word, k) in counts {
@@ -487,6 +492,7 @@ use std::{env, fmt, fs, io};
 use std::alloc::{Allocator, arena_scope};
 use std::cli::{Arg, Command, Matches};
 use std::collections::HashMap;
+use std::hash::FixedState;
 use std::fmt::{Display, Formatter};
 use std::io::Read;
 use std::string::FromUtf8Error;
@@ -527,7 +533,7 @@ impl Display for TallyError<Gpa> {
 
 // Counts one text, and adds its words to totals. The text's own word
 // counts live in an arena, freed all at once when the text is done.
-fn tally(text: &str, fold: bool, totals: &mut HashMap<String<Gpa>, i64, Gpa>, gpa: Gpa) -> Counts {
+fn tally(text: &str, fold: bool, totals: &mut HashMap<String<Gpa>, i64, Gpa, FixedState>, gpa: Gpa) -> Counts {
     arena_scope(&gpa, |a| {
         // the words, lowercased if asked: in the arena
         let words = if fold {
@@ -547,7 +553,7 @@ fn tally(text: &str, fold: bool, totals: &mut HashMap<String<Gpa>, i64, Gpa>, gp
 fn run(m: &Matches<Gpa>, top: usize, gpa: Gpa) -> Result<(), TallyError<Gpa>> {
     let fold = m.flag("ignore-case");
     let words_only = m.flag("words");
-    let mut totals: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
+    let mut totals: HashMap<String<Gpa>, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     let files = m.values("file");
     if files.is_empty() {
         let mut bytes: Vec<u8, Gpa> = Vec::new_in(gpa);
@@ -775,8 +781,8 @@ patch`:
 
 ```console
 $ volec edit patch count::count --old 'let mut lines: usize = 0;' --new 'println("counting {} bytes", text.len()); let mut lines: usize = 0;'
-count.vl:25:5: error[effect] 'count::count' is #[no_io], but it does io: 'println("counting {} bytes", text.len())' at count.vl:26:5 calls 'std::fmt::println' | help: return the data and let the caller print it, or remove #[no_io] | try: volec query effects count::count --why io  [edited: crate::count::count]
-error edit.breaks: 1 new error; nothing written; the error: count.vl:25:5: 'count::count' is #[no_io], but it does io: 'println("counting {} bytes", text.len())' at count.vl:26:5 calls 'std::fmt::println'
+count.vl:26:5: error[effect] 'count::count' is #[no_io], but it does io: 'println("counting {} bytes", text.len())' at count.vl:27:5 calls 'std::fmt::println' | help: return the data and let the caller print it, or remove #[no_io] | try: volec query effects count::count --why io  [edited: crate::count::count]
+error edit.breaks: 1 new error; nothing written; the error: count.vl:26:5: 'count::count' is #[no_io], but it does io: 'println("counting {} bytes", text.len())' at count.vl:27:5 calls 'std::fmt::println'
 try: volec edit patch count::count --old 'let mut lines: usize = 0;' --new 'println("counting {} bytes", text.len()); let mut lines: usize = 0;' --no-check
 ```
 
@@ -789,8 +795,13 @@ A few last checks before calling it done. Is everything formatted?
 
 ```console
 $ volec fmt --check main.vl count.vl report.vl
+main.vl
+report.vl
+error fmt.unformatted: 2 of 3 files are not formatted
+try: volec fmt --dry-run main.vl
+try: volec fmt main.vl
 $ echo $?
-0
+1
 ```
 
 Silence and status 0: yes.

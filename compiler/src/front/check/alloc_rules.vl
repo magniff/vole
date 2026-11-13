@@ -13,6 +13,12 @@
 // generic impl, `Bag<T>` in `impl<T, A: Allocator> Bag<T, A>`, where it
 // writes the impl's `A`. An impl block leaving out its type's allocator,
 // `impl<T> Bag<T>`, is alloc.default too: its fix adds the parameter.
+//
+// (0.29.0) hash.default, the same rule for a hasher: a type's last
+// parameters bounded by std's BuildHasher (`HashMap<K, V, A, S>`) have no
+// default either, and `HashMap<K, V, Gpa>` names no hasher. Its fix
+// (`fix --suggested`) writes `FixedState` with its `use`, or the hasher
+// parameter of the generic item it is in (missing_hasher).
 
 use crate::base::{
     buf_byte, buf_bytes, buf_new, buf_slice, buf_str, get_src, intern, intern_c, sym_text,
@@ -45,6 +51,12 @@ pub fn allocator_trait(pcx: &mut Ctx<Comp>) -> i64 {
 // Whether type t is an allocator: it has an impl of std's Allocator.
 pub fn is_allocator_type(t: i64, pcx: &mut Ctx<Comp>) -> bool {
     let tr = allocator_trait(pcx);
+    struct_implements(t, tr, pcx)
+}
+
+// Whether struct type t has an impl of trait tr (std's Allocator, its
+// BuildHasher).
+fn struct_implements(t: i64, tr: i64, pcx: &mut Ctx<Comp>) -> bool {
     if tr < 0 || t <= 0 || pcx.types[t as usize].kind != TyKind::Struct {
         return false;
     }
@@ -69,6 +81,12 @@ pub fn is_allocator_type(t: i64, pcx: &mut Ctx<Comp>) -> bool {
 // Allocator.
 pub fn is_allocator_param(p: i64, pcx: &mut Ctx<Comp>) -> bool {
     let tr = allocator_trait(pcx);
+    param_bounded_by(p, tr, pcx)
+}
+
+// Whether type parameter node p (of a Generics node) is bounded by trait
+// tr (-1: no trait, false).
+fn param_bounded_by(p: i64, tr: i64, pcx: &mut Ctx<Comp>) -> bool {
     if tr < 0 {
         return false;
     }
@@ -104,12 +122,19 @@ pub fn gpa_type(pcx: &mut Ctx<Comp>) -> i64 {
 // The name of a type parameter in scope bound to an allocator (the
 // instance being checked or made is generic over one), or 0.
 fn allocator_param_in_scope(pcx: &mut Ctx<Comp>) -> i64 {
+    let tr = allocator_trait(pcx);
+    param_in_scope(tr, pcx)
+}
+
+// The name of a type parameter in scope bound to a type that has an impl
+// of trait tr, or 0.
+fn param_in_scope(tr: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let mut i = pcx.tp_names.len() as i64 - 1;
     while i >= 0 {
         // UNSAFE: TP_NAMES and TP_TYPES are the checker's raw IntVecs.
         // SAFETY: 0 <= i < TP_NAMES.count == TP_TYPES.count (pushed in pairs).
         unsafe {
-            if is_allocator_type((pcx.tp_types[i as usize]), pcx) {
+            if struct_implements((pcx.tp_types[i as usize]), tr, pcx) {
                 return (pcx.tp_names[i as usize]);
             }
         }
@@ -124,6 +149,12 @@ fn allocator_param_in_scope(pcx: &mut Ctx<Comp>) -> i64 {
 // position, as a generic item is also checked without an instance, where
 // the scope names no parameter.
 fn allocator_param_at(pos: i64, skip: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let tr = allocator_trait(pcx);
+    bounded_param_at(pos, skip, tr, pcx)
+}
+
+// The same for a type parameter bounded by trait tr.
+fn bounded_param_at(pos: i64, skip: i64, tr: i64, pcx: &mut Ctx<Comp>) -> i64 {
     for k in 0..pcx.nodes[pcx.program as usize].count {
         let item = child(pcx.program, k, pcx);
         let g = pcx.nodes[item as usize].g;
@@ -135,7 +166,7 @@ fn allocator_param_at(pos: i64, skip: i64, pcx: &mut Ctx<Comp>) -> i64 {
         }
         for i in 0..pcx.nodes[g as usize].count {
             let p = child(g, i, pcx);
-            if pcx.nodes[p as usize].a != skip && is_allocator_param(p, pcx) {
+            if pcx.nodes[p as usize].a != skip && param_bounded_by(p, tr, pcx) {
                 return pcx.nodes[p as usize].a;
             }
         }
@@ -156,13 +187,24 @@ pub fn missing_allocator(params: i64, generic: i64, mark: i64, name: i64, pos: i
     let count = pcx.tscratch.len() as i64 - mark;
     let gpa = gpa_type(pcx);
     // (0.28.0) The parameters after the allocators that have defaults
-    // (`HashMap<K, V, A, S = FixedState>`) are not missing: the caller
-    // fills them after this.
+    // (`Table<K, A, H = Fnv>`; std has none since 0.29.0) are not
+    // missing: the caller fills them after this.
     let mut generic = generic;
     while generic > count && pcx.nodes[child(params, generic - 1, pcx) as usize].b != 0 {
         generic -= 1;
     }
-    if count >= generic || gpa == 0 {
+    // (0.29.0) The hasher parameters after the allocators have no default
+    // either (`HashMap<K, V, A, S: BuildHasher>`): left out, they are
+    // hash.default's, after the allocators' error when those are left out
+    // too.
+    let fixed = fixed_state_type(pcx);
+    let hasher = if fixed != 0 { hasher_trait(pcx) } else { -1 };
+    let with_hashers = generic;
+    while generic > count && param_bounded_by(child(params, generic - 1, pcx), hasher, pcx) {
+        generic -= 1;
+    }
+    let hashers = with_hashers - generic;
+    if (count >= generic && hashers == 0) || gpa == 0 {
         return false;
     }
     for k in count..generic {
@@ -171,6 +213,13 @@ pub fn missing_allocator(params: i64, generic: i64, mark: i64, name: i64, pos: i
         }
     }
     let missing = generic - count;
+    if missing == 0 {
+        missing_hasher(params, with_hashers, hashers, name, pos, count, hasher, true, pcx);
+        for _ in 0..hashers {
+            pcx.tscratch.push(fixed);
+        }
+        return true;
+    }
     let saved = pcx.err_kind;
     pcx.err_kind = c"alloc.default";
     err_begin(pos, pcx);
@@ -220,7 +269,99 @@ pub fn missing_allocator(params: i64, generic: i64, mark: i64, name: i64, pos: i
     for _ in 0..missing {
         pcx.tscratch.push(gpa);
     }
+    if hashers > 0 {
+        missing_hasher(params, with_hashers, hashers, name, pos, count, hasher, false, pcx);
+        for _ in 0..hashers {
+            pcx.tscratch.push(fixed);
+        }
+    }
     true
+}
+
+// ---- No default hasher type (0.29.0) ----
+
+// std's FixedState, 0 when std is not loaded.
+fn fixed_state_type(pcx: &mut Ctx<Comp>) -> i64 {
+    let name = intern_c(c"FixedState", pcx);
+    for s in 0..pcx.structs.len() as i64 {
+        if pcx.structs[s as usize].name == name && pcx.structs[s as usize].tmpl == 0
+            && pcx.structs[s as usize].generic == 0
+            && within_std(pcx.structs[s as usize].module, pcx) {
+            return struct_type(s, pcx);
+        }
+    }
+    0
+}
+
+// std's BuildHasher, -1 when std is not loaded (or the program reaches
+// no hasher).
+fn hasher_trait(pcx: &mut Ctx<Comp>) -> i64 {
+    let name = intern_c(c"BuildHasher", pcx);
+    for t in 0..pcx.traits.len() as i64 {
+        if pcx.traits[t as usize].name == name
+            && within_std(module_of(pcx.traits[t as usize].node, pcx), pcx) {
+            return t;
+        }
+    }
+    -1
+}
+
+// hash.default: `name`<..count arguments..>, written at pos, leaves out
+// its last `hashers` parameters (of `params`, the first `all` of them),
+// each bounded by std's BuildHasher (`hasher`): a hasher is part of the
+// type and has no default, as an allocator (`HashMap<K, V, Gpa>` is
+// `HashMap<K, V, Gpa, FixedState>`). The fix writes `FixedState`, what
+// the default was until 0.28.0 and what `HashMap::new_in` makes; inside
+// an item generic over one hasher, that parameter; over two, none. Not
+// `fixable`: the allocators are left out too, and their error's fix is
+// written first (both insert at the same place).
+fn missing_hasher(params: i64, all: i64, hashers: i64, name: i64, pos: i64, count: i64,
+    hasher: i64, fixable: bool, pcx: &mut Ctx<Comp>) {
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"hash.default";
+    err_begin(pos, pcx);
+    err_str(c"'", pcx);
+    err_sym(name, pcx);
+    err_str(c"' names no hasher: its '", pcx);
+    err_sym(pcx.nodes[child(params, all - 1, pcx) as usize].a, pcx);
+    err_str(c"' is written, last", pcx);
+    let mut inside = bounded_param_at(pos, 0, hasher, pcx);
+    let other = if inside != 0 { bounded_param_at(pos, inside, hasher, pcx) } else { 0 };
+    if inside == 0 {
+        inside = param_in_scope(hasher, pcx);
+    }
+    if other != 0 || (inside != 0 && hashers != 1) {
+        err_help(c"this item is generic over the hashers '", pcx);
+        crate::base::diag::err_help_sym(inside, pcx);
+        err_help(if other != 0 { c"' and '" } else { c"" }, pcx);
+        if other != 0 {
+            crate::base::diag::err_help_sym(other, pcx);
+        }
+        err_help(c"': write the one this '", pcx);
+        crate::base::diag::err_help_sym(name, pcx);
+        err_help(c"' hashes with as its last type argument (`, ", pcx);
+        crate::base::diag::err_help_sym(inside, pcx);
+        err_help(c"`); no fix chooses between them", pcx);
+    } else if inside != 0 {
+        err_help_fmt(format_args(
+            "this item is generic over the hasher '{}': write it (`, {}`, the fix), or `FixedState`",
+            str::from_utf8(sym_text(inside, pcx)).unwrap(),
+            str::from_utf8(sym_text(inside, pcx)).unwrap()), pcx);
+        if fixable {
+            let _ = default_fix(pos, name, count, hashers, sym_text(inside, pcx), pcx);
+        }
+    } else {
+        err_help(c"the hasher is part of the type: `FixedState` (`use std::hash::FixedState;`, the one `HashMap::new_in` makes), or a generic `S: BuildHasher`", pcx);
+        if fixable {
+            let _ = default_fix_use(pos, name, count, hashers, b"FixedState",
+                b"std::hash::FixedState", pcx);
+        }
+    }
+    if !fixable {
+        err_help(c"; its fix comes after the allocator's", pcx);
+    }
+    err_end_soft(pcx);
+    pcx.err_kind = saved;
 }
 
 // The fix of a type written at pos, `name` or `name<..count..>`: `Gpa`
@@ -228,6 +369,14 @@ pub fn missing_allocator(params: i64, generic: i64, mark: i64, name: i64, pos: i
 // allocator parameter), as the last type arguments.
 fn default_fix(pos: i64, name: i64, count: i64, missing: i64, what: &[u8], pcx: &mut Ctx<Comp>)
     -> bool {
+    default_fix_use(pos, name, count, missing, what, b"", pcx)
+}
+
+// The same, and when `path` is not empty (`std::hash::FixedState`, of
+// `what`), its `use` in the same fix where the file has none of that name
+// (use_at): the fix is checked, and `FixedState` alone would not resolve.
+fn default_fix_use(pos: i64, name: i64, count: i64, missing: i64, what: &[u8], path: &[u8],
+    pcx: &mut Ctx<Comp>) -> bool {
     // The name as written: a path, its last part `name`.
     let mut i = pos;
     let mut last = pos;
@@ -290,7 +439,7 @@ fn default_fix(pos: i64, name: i64, count: i64, missing: i64, what: &[u8], pcx: 
             buf_str(text, c", ");
             buf_bytes(text, what);
         }
-        err_fix(k, k, buf_slice(text), pcx);
+        fix_with_use(k, text, what, path, pcx);
         true
     } else if count == 0 {
         buf_str(text, c"<");
@@ -300,11 +449,33 @@ fn default_fix(pos: i64, name: i64, count: i64, missing: i64, what: &[u8], pcx: 
             buf_bytes(text, what);
         }
         buf_str(text, c">");
-        err_fix(end, end, buf_slice(text), pcx);
+        fix_with_use(end, text, what, path, pcx);
         true
     } else {
         false
     }
+}
+
+// The fix that inserts buffer `text` at position `at`; with a `path`
+// (`std::hash::FixedState`, whose last part `word` the text writes) and no
+// `use` of `word` in the file, `use PATH;` too, in the same fix: the text
+// from the import's place to `at` is kept.
+fn fix_with_use(at: i64, text: i64, word: &[u8], path: &[u8], pcx: &mut Ctx<Comp>) {
+    let import_at = if path.len() > 0 { use_at(at, word, pcx) } else { -1 };
+    if import_at < 0 {
+        err_fix(at, at, buf_slice(text), pcx);
+        return;
+    }
+    let whole = buf_new();
+    buf_str(whole, c"use ");
+    buf_bytes(whole, path);
+    buf_str(whole, c";\n");
+    if !use_line_at(import_at) {
+        buf_byte(whole, b'\n');
+    }
+    buf_bytes(whole, &get_src()[import_at as usize..at as usize]);
+    buf_bytes(whole, buf_slice(text));
+    err_fix(import_at, at, buf_slice(whole), pcx);
 }
 
 // A generic impl's block for template `tpl` (its type's arguments `args`):
@@ -904,12 +1075,16 @@ fn use_line_at(p: i64) -> bool {
 // line that is neither blank nor a comment. -1 when a `use` of the file
 // names `Allocator` already.
 fn allocator_use_at(at: i64, pcx: &Ctx<Comp>) -> i64 {
+    use_at(at, b"Allocator", pcx)
+}
+
+// The same for `word`, the name a fix writes (`FixedState`).
+fn use_at(at: i64, word: &[u8], pcx: &Ctx<Comp>) -> i64 {
     let src = get_src();
     let f = crate::front::contracts::sites::file_of_pos(at, pcx);
     let lo = pcx.files[f as usize].start;
     let hi = if f + 1 < pcx.files.len() as i64 { pcx.files[(f + 1) as usize].start }
         else { src.len() as i64 };
-    let word = b"Allocator";
     let mut first: i64 = -1;
     let mut in_use = false;
     let mut p = lo;

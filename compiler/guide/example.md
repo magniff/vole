@@ -129,11 +129,12 @@ use command::{Command, Error, Item};
 use std::alloc::Allocator;
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::hash::FixedState;
 
 // A type that holds an allocator is generic over it.
 pub struct Store<'a, A: Allocator> {
     items: Vec<Item<'a>, A>,
-    index: HashMap<&'a str, usize, A>,          // name -> its position in items
+    index: HashMap<&'a str, usize, A, FixedState>, // name -> its position in items
 }
 
 impl<'a> Store<'a, Gpa> {
