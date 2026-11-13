@@ -2892,7 +2892,7 @@ hello world 1.00x, std 0.99x, check of the compiler 1.01x.
 The release gate, macOS only. The gate schedules itself from this
 release (docs/releases.md, "What runs at once"), so it was run whole,
 `gate.sh --release --no-linux -j 4`, with nothing else building, not a
-step at a time as 0.28.0's was: its 37 steps, the heavy ones one at a
+step at a time as 0.28.0's was: its 38 steps, the heavy ones one at a
 time. TODO(gate: the number of runs; what each run stopped at and what
 was fixed; whether every row passed on its first run on the final tree;
 the wall time and the highest load, since this was the scheduler's
