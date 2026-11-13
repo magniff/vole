@@ -9,7 +9,9 @@
 #   fmt      every changed .vl outside tests/ is in the standard style
 #            (by the branch's own target/volec when the last tested build
 #            cannot read it: 0.27.0, a rust-edition file)
-#   check    every program the change touches checks with no error and no warning
+#   check    every program a changed file belongs to (a .vl, a shader it embeds,
+#            a file beside its main.vl) checks with no error and no warning;
+#            SKIP, never PASS, when the change touches no program
 #            (but one whose main.vl says `// premerge: broken on purpose`)
 #            (but unsafe.unjustified: legacy sites are the baseline's, and new
 #            ones the unsafe row's)
@@ -92,32 +94,59 @@ else
     if [ -s "$TMP/fmt" ]; then row fmt FAIL "$(wc -l < "$TMP/fmt" | tr -d ' ') file(s)"; else row fmt PASS "changed .vl files formatted"; fi
 fi
 
-# check: the program roots the change touches
+# check: the programs the change touches. Every changed file counts, not
+# only a .vl: a shader a program embeds, a README beside its main.vl (the
+# nearest main.vl above the file is its program; a .vl that is a program
+# of its own, with `fn main`, is checked alone). Files under tests/ are
+# their suites' (a case names the errors it expects, a tool's fixture is
+# broken on purpose): tests/affected.sh runs them. The row never passes
+# on nothing: with no program it is SKIP and says why.
 if [ -z "$VOLEC" ]; then
-    row check SKIP "no volec"
+    row check SKIP "no volec (bootstrap/bootstrap.sh --dev --no-suite)"
 else
-    : > "$TMP/roots"
-    for f in $(printf '%s\n' "$CHANGED" | grep '\.vl$' | grep -v '^tests/'); do
+    : > "$TMP/roots.all"
+    : > "$TMP/check.tests"
+    : > "$TMP/check.none"
+    printf '%s\n' "$CHANGED" | while read -r f; do
+        [ -n "$f" ] || continue
         case "$f" in
+            tests/*) echo "$f" >> "$TMP/check.tests" ;;
             compiler/src/*|compiler/std/*) echo compiler/src/main.vl ;;
             *) d=$(dirname "$f")
                while [ "$d" != . ] && [ ! -f "$d/main.vl" ]; do d=$(dirname "$d"); done
-               [ -f "$d/main.vl" ] && echo "$d/main.vl" ;;
+               if [ -f "$d/main.vl" ]; then echo "$d/main.vl"
+               elif [ "${f%.vl}" != "$f" ] && grep -q '^\(pub \)\{0,1\}fn main(' "$f"; then echo "$f"
+               else echo "$f" >> "$TMP/check.none"; fi ;;
         esac
-    done | sort -u > "$TMP/roots"
+    done >> "$TMP/roots.all"
+    sort -u "$TMP/roots.all" > "$TMP/roots"
     : > "$TMP/check"
+    checked=0
+    onpurpose=0
     while read -r r; do
         # (a program that fails on purpose, e.g. a walkthrough's: its
         # main.vl has the line `// premerge: broken on purpose (why)`)
-        grep -q '^// premerge: broken on purpose' "$r" && continue
-        out=$( (cd "$(dirname "$r")" && "$VOLEC" check main.vl) 2>&1 )
+        if grep -q '^// premerge: broken on purpose' "$r"; then onpurpose=$((onpurpose + 1)); continue; fi
+        checked=$((checked + 1))
+        out=$( (cd "$(dirname "$r")" && "$VOLEC" check "$(basename "$r")") 2>&1 )
         # (0.25.3: not unsafe.unjustified, the unsafe row's and the baseline's)
         out=$(printf '%s\n' "$out" | grep -v 'warning\[unsafe\.unjustified\]')
         printf '%s\n' "$out" | grep -E '(error|warning)\[|^error ' > /dev/null && \
             printf '  %s:\n%s\n' "$r" "$(printf '%s\n' "$out" | grep -E '(error|warning)\[|^error ' | head -5 | sed 's/^/    /')" >> "$TMP/check"
     done < "$TMP/roots"
-    n=$(wc -l < "$TMP/roots" | tr -d ' ')
-    if [ -s "$TMP/check" ]; then row check FAIL "errors or warnings in the touched programs"; else row check PASS "$n program(s) check clean"; fi
+    nt=$(wc -l < "$TMP/check.tests" | tr -d ' ')
+    nn=$(wc -l < "$TMP/check.none" | tr -d ' ')
+    rest=""
+    [ "$onpurpose" = 0 ] || rest="$rest; $onpurpose broken on purpose"
+    [ "$nt" = 0 ] || rest="$rest; $nt file(s) under tests/: tests/affected.sh"
+    [ "$nn" = 0 ] || rest="$rest; $nn file(s) of no program"
+    if [ -s "$TMP/check" ]; then
+        row check FAIL "errors or warnings in the touched programs"
+    elif [ "$checked" = 0 ]; then
+        row check SKIP "no program to check${rest:-; nothing changed}"
+    else
+        row check PASS "$checked program(s) check clean, shaders included: $(tr '\n' ' ' < "$TMP/roots" | sed 's/ $//')$rest"
+    fi
 fi
 
 # std: the embedded std is up to date, as committed (0.25.3: made from
