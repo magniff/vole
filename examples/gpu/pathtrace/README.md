@@ -179,7 +179,8 @@ there are deliberately no fabricated BVH counters.
   accumulation and never writes it, so the sample count, the variance view, the
   reset check and the estimator itself stay raw; at 2048 spp on the Fog hall it
   drops the caustic band's error against a 16384-sample reference from 2.13 to
-  1.63 and the frame-wide error from 2.00 to 1.42 (255 levels, luminance).
+  1.63 and the frame-wide error from 2.00 to 1.42 (255 levels, luminance), and
+  with the 4096-sample cap the band reaches 1.31 and the frame 1.11.
 - **Volumetric fog:** free-flight distance sampling, Henyey–Greenstein phase
   sampling and next-event area lighting simulate a homogeneous participating
   medium with a per-channel scattering albedo. Multiple scattering is expensive
@@ -191,7 +192,7 @@ there are deliberately no fabricated BVH counters.
   readback.
 - **Presentation and performance:** compute and rendering are encoded in order
   on one queue. Interactive frames add four samples to the accumulation (up to
-  2048 per camera view) but execute only one display pass, so sampling is not
+  4096 per camera view) but execute only one display pass, so sampling is not
   capped by the window refresh rate. Static diagnostic modes stop after one
   sample. The integrator uses 16×16 workgroups, lightweight ID-only candidate
   hits, early-out any-hit shadow traversal, canceled Smith visibility terms and
