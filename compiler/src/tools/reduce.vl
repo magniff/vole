@@ -13,19 +13,22 @@
 
 mod program;
 
-use crate::base::{
-    IntVec, STDOUT, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
-    buf_write_fd,
-};
+use crate::base::{STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::cli::line::{Call, EV_MISSING, EV_WORD, Leaf, is_opt, option, table};
-use crate::tools::ctx::Tcx;
+use crate::tools::ctx::{Tcx, cptrs};
 use crate::tools::proc::{buf_cstr, read_file_if, remove_file, scratch_dir, write_file_if};
 use crate::tools::query::{c_slice, parse_count};
 use crate::tools::query::diagnostics::{diag, write_diags};
 use crate::tools::reduce::program::{program_mode, program_option, program_opts, reduce_program};
 
+// UNSAFE: POSIX's process, signal and descriptor functions: the reducer's
+// command runs in a process group of its own, killed past its time limit.
+// SAFETY: each declaration is the function's C prototype on the targets
+// vole builds for (64-bit macOS and Linux: int and pid_t are i32, size_t
+// u64, ssize_t i64; a mode_t is passed as an int, which both calling
+// conventions pass alike); what a call must hold is said at the call.
 extern "C" {
     fn fork() -> i32;
     fn execvp(file: *mut u8, argv: *mut *mut u8) -> i32;
@@ -95,6 +98,12 @@ fn command_for(cmd: *mut u8, path: *mut u8) -> *mut u8 {
 // Runs `sh -c cmd` (its output dropped) in a process group of its own,
 // killed with it after TIMEOUT seconds: whether it exited with 0.
 fn run_limited(cmd: *mut u8, tcx: &mut Tcx<Comp>) -> bool {
+    // UNSAFE: fork, setpgid, open, dup2, close, execvp, _exit, waitpid, kill
+    // and usleep are C's: the command runs in a process group of its own.
+    // SAFETY: cmd is a C string of the caller's; argv is a list of three C
+    // strings and a null, made in the child and alive until exec; pid > 0
+    // is the child just forked, and the group killed (-pid) is the one the
+    // child made for itself with setpgid(0, 0); status is a local.
     unsafe {
         let pid = fork();
         if pid < 0 {
@@ -108,12 +117,12 @@ fn run_limited(cmd: *mut u8, tcx: &mut Tcx<Comp>) -> bool {
                 dup2(null, 2);
                 close(null);
             }
-            let argv = alloc_array::<*mut u8>(4i64);
-            (*argv.add(0)) = c"sh";
-            (*argv.add(1)) = c"-c";
-            (*argv.add(2)) = cmd;
-            (*argv.add(3)) = 0 as *mut u8;
-            execvp(c"sh", argv);
+            let mut argv = cptrs(4i64);
+            (argv[0]) = c"sh";
+            (argv[1]) = c"-c";
+            (argv[2]) = cmd;
+            (argv[3]) = 0 as *mut u8;
+            execvp(c"sh", argv.as_mut_ptr());
             _exit(127);
         }
         let mut status = 0 as i32;
@@ -141,7 +150,7 @@ fn run_limited(cmd: *mut u8, tcx: &mut Tcx<Comp>) -> bool {
 
 // Whether CMD holds (exits 0) on the lines `keep` of `lines` (each a
 // slice's start and end in text), written to path.
-fn holds(text: &[u8], lines: IntVec, keep: IntVec, path: *mut u8, cmd: *mut u8, tcx: &mut Tcx<Comp>) -> bool {
+fn holds(text: &[u8], lines: &[i64], keep: &[i64], path: *mut u8, cmd: *mut u8, tcx: &mut Tcx<Comp>) -> bool {
     let b = buf_new();
     for i in 0..keep.len() as i64 {
         let l = (keep[i as usize]);
@@ -223,7 +232,7 @@ fn reduce_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> 
     }
     let text = buf_slice(original);
     // The lines: start and end (with its newline) of each.
-    let mut lines = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+    let mut lines: Vec<i64, Comp> = Vec::new_in(Comp {});
     let mut s: i64 = 0;
     for k in 0..text.len() as i64 {
         if text[k as usize] == b'\n' {
@@ -237,13 +246,13 @@ fn reduce_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> 
         lines.push(text.len() as i64);
     }
     let n_lines = lines.len() as i64 / 2;
-    let mut keep = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+    let mut keep: Vec<i64, Comp> = Vec::new_in(Comp {});
     for k in 0..n_lines {
         keep.push(k);
     }
     let path = candidate_path(file, pcx);
     let cmd = command_for(until, path);
-    if !holds(text, lines, keep, path, cmd, tcx) {
+    if !holds(text, lines.as_slice(), keep.as_slice(), path, cmd, tcx) {
         remove_file(path);
         let d = diag(c"error", c"reduce.not-failing", tcx);
         buf_str(d, c"the command does not hold (exit 0) on ");
@@ -260,13 +269,14 @@ fn reduce_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> 
         let mut gone = false;
         let mut start: i64 = 0;
         while start < keep.len() as i64 && tcx.reduce_runs < tcx.reduce_max_runs {
-            let mut rest = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+            let mut rest: Vec<i64, Comp> = Vec::new_in(Comp {});
             for k in 0..keep.len() as i64 {
                 if k < start || k >= start + size {
                     rest.push((keep[k as usize]));
                 }
             }
-            if rest.len() as i64 > 0 && holds(text, lines, rest, path, cmd, tcx) {
+            if rest.len() as i64 > 0
+                && holds(text, lines.as_slice(), rest.as_slice(), path, cmd, tcx) {
                 keep = rest;
                 gone = true;
                 // (the same chunk position holds new lines now)
