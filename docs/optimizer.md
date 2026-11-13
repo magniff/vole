@@ -2925,3 +2925,19 @@ allocation). `--time-passes=instructions` of the self-build counted
 108.9 G with it and counts 100.0 G now, of the 104.0 G the same build
 retires untimed with `-j1` (the phases do not cover the process's
 start and end).
+
+**A test for zero in any spelling is one fact** (`middle/range/mod.vl`,
+`zero_test`, asked by `decide`). Unsigned, `x > 0` and `x >= 1` are `x
+!= 0`, and `x < 1` and `x <= 0` are `x == 0`. The intervals are in the
+signed view, where an unsigned value of unknown sign has no bounds, and
+facts were matched by their operands, so `len > 0` (the check of
+`s[0]`) decided nothing about `len >= 1` (the check of `s[1..]`), and
+`!s.is_empty()` (`len as i64 != 0`) nothing about either: `[T]::
+split_first` kept both checks, and with it every step of a slice's
+iterator. Now `for x in s` and `for x in &v` have no check (the loop is
+a load, an add, a decrement and a branch). Still checked: the
+hand-written `while !r.is_empty() { .. r[0] ..; r = &r[1..]; }`, whose
+tests, once the loop is rotated, are about the header's phi (and one
+against a phi of two zeros, folded only after the ranges).
+tests/run/opt_range_zero_tests.vl.
+
