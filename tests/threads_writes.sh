@@ -58,9 +58,9 @@ back::codecache::OUT_COMP	the task'"'"'s own component'"'"'s entry, read after t
 back::codecache::OUT_EMIT	the task'"'"'s own function'"'"'s entry, read after the phases
 back::codecache::OUT_SCALAR	the task'"'"'s own function'"'"'s entry, read after the phases
 back::codecache::SCALAR_REC	the task'"'"'s own function'"'"'s entry (its cleanup'"'"'s, then its scalar pipeline'"'"'s, a phase after)
-back::codecache::pack::NEW	the task'"'"'s own slot, read when the pack is written
-back::codecache::pack::USED	the entry of the task'"'"'s own key, read when the pack is written (0.27.8: a key is one task'"'"'s but a function'"'"'s that shares its symbol, fn_ambig, whose task does not mark it: mark_used)
-base::ctx::Ctx.pack	read only: an entry'"'"'s body is read through its address
+base::ctx::Ctx.pack_new	the task'"'"'s own slot (behind the slot'"'"'s lock), read when the pack is written
+base::ctx::Ctx.pack_used	the entry of the task'"'"'s own key (an atomic), read when the pack is written (0.27.8: a key is one task'"'"'s but a function'"'"'s that shares its symbol, fn_ambig, whose task does not mark it: mark_used)
+base::ctx::Ctx.pack	read only: an entry'"'"'s body is a slice of it
 base::STRESS_GROW	read by prepare_tasks (stress_grow)
 front::distinct::NICHE	enum_niche: every enum'"'"'s is made before a phase (prepare_layouts)
 front::cells::FREEZE_MEMO	interior_part: every type'"'"'s Freeze fact is made before a phase (prepare_layouts), so a task only reads it (GVN'"'"'s param_class_of)
@@ -152,13 +152,11 @@ base::ctx::Ctx.name_fn	own
 base::ctx::Ctx.name_ir	own
 base::ctx::Ctx.str_h	own: a string'"'"'s bytes
 base::ctx::Ctx.str_h_count	own
-base::ctx::Ctx.entry_at	own
-base::ctx::Ctx.index	own
-base::ctx::Ctx.index_size	own
-back::codecache::pack::NEW	own
-base::ctx::Ctx.new_slots	own
+base::ctx::Ctx.pack_entries	own
+base::ctx::Ctx.pack_index	own
+base::ctx::Ctx.pack_new	own
 base::ctx::Ctx.pack	own
-back::codecache::pack::USED	own
+base::ctx::Ctx.pack_used	own
 base::ctx::Ctx.dbg	off: -g (and --vec-stats=FN, --trace: the line starts) runs on one thread (serial_only) and the cache is off; the tables of -g, behind a lock
 base::ctx::Ctx.debug_info	off: -g
 base::ctx::Ctx.stats	off: --stats
