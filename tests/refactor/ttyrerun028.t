@@ -1,5 +1,5 @@
 ## (0.28.0) A build with errors that read std lazily is made again with
-## std whole (front/modules/std2lazy.vl): the run made again has this
+## std whole (front/modules/stdlazy.vl): the run made again has this
 ## run's form, a terminal's on a terminal (it was the plain form: the
 ## second run took itself for a volec inside a volec).
 % sh tty.sh "$COMPILER" bad.vl -o bad | cat -v | sed 's/in [0-9.]*s/in Ts/'

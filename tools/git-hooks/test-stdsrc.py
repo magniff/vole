@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cases for compiler/src/front/stdsrc_rust.vl as git keeps it (0.25.3):
+"""Cases for compiler/src/front/stdsrc.vl as git keeps it (0.25.3):
 the commit hook makes it from the staged compiler/std (tools/git-hooks/
 pre-commit), and the merge driver (tools/git-hooks/merge-stdsrc,
 .gitattributes) makes it from the merged compiler/std, so that two
@@ -18,7 +18,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
-SRC = "compiler/src/front/stdsrc_rust.vl"
+SRC = "compiler/src/front/stdsrc.vl"
 FAILED = 0
 
 
@@ -70,7 +70,7 @@ def small_std(repo):
 
 def embedded(repo, rev):
     """What embed.sh makes of the std at rev (a commit, or ":" for the
-    index), next to what the commit (or index) holds as stdsrc_rust.vl."""
+    index), next to what the commit (or index) holds as stdsrc.vl."""
     t = tempfile.mkdtemp(prefix="vole-stdsrc-case.")
     try:
         if rev == ":":
@@ -158,7 +158,7 @@ def main():
         r = git(repo, "merge", "-q", "--no-edit", "c")
         out = r.stdout + r.stderr
         case("merge: std itself conflicts, stdsrc.vl's driver says what to run",
-             r.returncode != 0 and "merge-stdsrc: compiler/src/front/stdsrc_rust.vl not merged (compiler/std conflicts" in out
+             r.returncode != 0 and "merge-stdsrc: compiler/src/front/stdsrc.vl not merged (compiler/std conflicts" in out
              and "compiler/std/embed.sh" in out, out)
         write(io, base_io.replace("a += 1;", "a += 3;"))
         git(repo, "add", "compiler/std/io.vl", SRC)
@@ -190,30 +190,30 @@ def main():
         git(repo, "config", "--remove-section", "merge.stdsrc")
         r = git(repo, "merge", "-q", "--no-edit", "a")
         case("no driver set up: stdsrc.vl conflicts as text (setup.sh is needed)",
-             r.returncode != 0 and "stdsrc_rust.vl" in r.stdout + r.stderr, r.stdout + r.stderr)
+             r.returncode != 0 and "stdsrc.vl" in r.stdout + r.stderr, r.stdout + r.stderr)
     finally:
         shutil.rmtree(work)
 
 
-def std2_case():
-    """(0.27.5, Z5.2) stdsrc_rust.vl's index of std2's units, std2_units, is
-    made by a compiler: a commit of a std2 change in a tree whose compilers
+def std_case():
+    """(0.27.5, Z5.2) stdsrc.vl's index of std's units, std_units, is
+    made by a compiler: a commit of a std change in a tree whose compilers
     cannot make it (0.27.4's, as every worktree's target/tools/volec is
     until the release) keeps the index the file has, never an empty one."""
     compiler = os.environ.get("VOLE_TEST_COMPILER") or os.path.join(ROOT, "target/volec")
-    probe = subprocess.run([compiler, "__std2-index", "/dev/null"],
+    probe = subprocess.run([compiler, "__std-index", "/dev/null"],
                            capture_output=True, text=True) if os.path.exists(compiler) else None
-    if probe is None or not probe.stdout.startswith("std2-units "):
-        print("skip std2 index: no compiler of 0.27.5 or later")
+    if probe is None or not probe.stdout.startswith("std-units "):
+        print("skip std index: no compiler of 0.27.5 or later")
         return
-    rsrc = "compiler/src/front/stdsrc_rust.vl"
+    rsrc = "compiler/src/front/stdsrc.vl"
     work = tempfile.mkdtemp(prefix="vole-stdsrc2.")
     repo = os.path.join(work, "repo")
     try:
         small_std(repo)
         os.remove(os.path.join(repo, "compiler/std/io.vl"))
-        std2 = os.path.join(repo, "compiler/std/std.vl")
-        write(std2, "pub fn one() -> i64 {\n    1\n}\n")
+        std = os.path.join(repo, "compiler/std/std.vl")
+        write(std, "pub fn one() -> i64 {\n    1\n}\n")
         for f in ("gpa", "alloc_check", "sys_linux", "sys_macos"):
             write(os.path.join(repo, "compiler/std/rt", f + ".vl"), "pub fn " + f + "() {}\n")
         write(os.path.join(repo, ".gitignore"), "target/\n")
@@ -233,33 +233,33 @@ def std2_case():
         git(repo, "add", "-A")
         r = git(repo, "commit", "-q", "-m", "base", VOLE_EMBED_VOLEC="")
         held = git(repo, "show", "HEAD:" + rsrc).stdout
-        case("std2: a commit with a compiler that makes the index: stdsrc_rust.vl has it",
-             r.returncode == 0 and "std2-units 1 " in held, r.stdout + r.stderr)
+        case("std: a commit with a compiler that makes the index: stdsrc.vl has it",
+             r.returncode == 0 and "std-units 1 " in held, r.stdout + r.stderr)
         # the tree's compiler now one that cannot (0.27.4's: no
-        # __std2-index, the rest as the compiler's)
+        # __std-index, the rest as the compiler's)
         os.remove(volec)
-        write(volec, "#!/bin/sh\nfor a in \"$@\"; do\n    if [ \"$a\" = __std2-index ]; then\n"
-              "        echo \"error cli.not-a-command: '__std2-index' is not a volec command or a file\" >&2\n"
+        write(volec, "#!/bin/sh\nfor a in \"$@\"; do\n    if [ \"$a\" = __std-index ]; then\n"
+              "        echo \"error cli.not-a-command: '__std-index' is not a volec command or a file\" >&2\n"
               "        exit 1\n    fi\ndone\nexec '%s' \"$@\"\n" % compiler)
         os.chmod(volec, 0o755)
-        write(std2, read(std2) + "\npub fn two() -> i64 {\n    2\n}\n")
+        write(std, read(std) + "\npub fn two() -> i64 {\n    2\n}\n")
         git(repo, "add", "compiler/std/std.vl")
         r = git(repo, "commit", "-q", "-m", "two", VOLE_EMBED_VOLEC="")
         after = git(repo, "show", "HEAD:" + rsrc).stdout
         out = r.stdout + r.stderr
-        case("std2: a commit with no compiler that makes the index keeps the one the file has",
-             r.returncode == 0 and "std2-units 1 " in after and "two" in after
-             and after.split("pub fn std2_units")[1].split("\n}\n")[0]
-             == held.split("pub fn std2_units")[1].split("\n}\n")[0], out)
-        case("std2: and says so", "std2_units kept as it was" in out, out)
-        case("std2: the work tree's file is the committed one",
+        case("std: a commit with no compiler that makes the index keeps the one the file has",
+             r.returncode == 0 and "std-units 1 " in after and "two" in after
+             and after.split("pub fn std_units")[1].split("\n}\n")[0]
+             == held.split("pub fn std_units")[1].split("\n}\n")[0], out)
+        case("std: and says so", "std_units kept as it was" in out, out)
+        case("std: the work tree's file is the committed one",
              git(repo, "status", "--porcelain").stdout == "", git(repo, "status", "--porcelain").stdout)
         # a compiler that can: the kept index is stale (it was made for the old text)
         r = run(["sh", "compiler/std/embed.sh", "-c"], repo, VOLE_EMBED_VOLEC=compiler)
-        case("std2: embed.sh -c with a compiler that can make it says the kept index is stale",
+        case("std: embed.sh -c with a compiler that can make it says the kept index is stale",
              r.returncode != 0 and "stale" in r.stderr, r.stdout + r.stderr)
         r = run(["sh", "compiler/std/embed.sh", "-c"], repo, VOLE_EMBED_VOLEC="")
-        case("std2: embed.sh -c with none compares the rest", r.returncode == 0, r.stdout + r.stderr)
+        case("std: embed.sh -c with none compares the rest", r.returncode == 0, r.stdout + r.stderr)
     finally:
         shutil.rmtree(work)
 
@@ -268,5 +268,5 @@ if not shutil.which("git"):
     print("skip test-stdsrc: no git")
     sys.exit(0)
 main()
-std2_case()
+std_case()
 sys.exit(1 if FAILED else 0)

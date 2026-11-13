@@ -190,7 +190,7 @@ load or inherited.
   unformatted `.vl`, or adds an example case whose SOURCE does not
   exist (0.29: of a merge, only what the merge itself adds, the lines
   in neither parent; what a side brings passed on its branch); a commit that changes `compiler/std` gets the
-  `compiler/src/front/stdsrc_rust.vl` made from it, staged by the hook, and a
+  `compiler/src/front/stdsrc.vl` made from it, staged by the hook, and a
   merge makes it from the merged std (no conflict on it). It runs for
   every committer, under any agent harness (Claude Code's hooks do not
   run under opencode or other tools; git's do).

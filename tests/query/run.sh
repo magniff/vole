@@ -344,7 +344,7 @@ check self_similar "$ok" "$(printf '%s\n' "$out" | grep '^// ' | head -8)"
 # static of a std submodule, which `query def` does not take back yet, a
 # 0.20.1 item; aarch64-linux's argv statics showed it; nor, 0.26.1, the
 # places IR's drop shims, `vole.$drop.T`: glue with no item of its own;
-# nor, 0.28.0, std2's methods of the integer types, `vole.Ty.max`: the
+# nor, 0.28.0, std's methods of the integer types, `vole.Ty.max`: the
 # compiler's `#[builtin_impls]` text, `<builtin>`, which the tools do not
 # index yet),
 # each given to `query def` (positions and modules to `show` and `items`).

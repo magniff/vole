@@ -12,7 +12,7 @@ $ show std::mem::swap
 // std::mem::swap	<std>:1392-1406
 // use std::mem::swap;
 // Exchanges the values of two places (MVS: two inout parameters).
-// std2: changed: takes &mut T twice
+// std: changed: takes &mut T twice
 #[effects(unsafe, T)]
 pub fn swap<T>(a: &mut T, b: &mut T) {
     // UNSAFE: raw moves (an assignment would drop the old value).

@@ -26,7 +26,7 @@ To add a std function or method.
 std is `compiler/std/`: the module `std` (`std.vl`) and its modules
 (`std::fmt` in `fmt.vl`, `std::collections::hash_map` in
 `collections/hash_map.vl`); `compiler/std/embed.sh` builds it into the
-compiler (`compiler/src/front/stdsrc_rust.vl`).
+compiler (`compiler/src/front/stdsrc.vl`).
 
 1. Find where it goes: `volec query similar str::trim` (or
    `Vec::swap`) prints its neighbours, with their files
@@ -39,14 +39,14 @@ compiler (`compiler/src/front/stdsrc_rust.vl`).
    program then reads the edited files (`note check.std-files`), every
    function of std.
 3. `compiler/std/embed.sh` (the commit hook runs it too).
-4. A test: `tests/run/std2_NAME.vl` with `// EXPECT:` lines (edge
+4. A test: `tests/run/std_NAME.vl` with `// EXPECT:` lines (edge
    cases: empty, too long, at the ends); see `add-test`.
 5. The guide: a sentence and a `vole` example with its `out` block in
    `compiler/guide/std.md` (the API listing at its end is generated);
    `compiler/guide/embed.sh`.
 6. `bootstrap/bootstrap.sh --dev --no-suite` (the compiler with the new
-   std), then `tests/run.sh std2_NAME guide`, `tests/run.sh -O 0
-   std2_NAME`; before reporting, `tests/affected.sh`.
+   std), then `tests/run.sh std_NAME guide`, `tests/run.sh -O 0
+   std_NAME`; before reporting, `tests/affected.sh`.
 
 ## add-std-module
 
@@ -56,11 +56,11 @@ To add a std module (a file of `compiler/std`).
    `std::a` in `a/`), and its `mod NAME;` (or `pub mod NAME;`) line in
    the parent's file: embed.sh finds the modules by those lines.
 2. A build reads only the units of std a program reaches (the index
-   embed.sh makes with the compiler, `std2_units`); `volec check` reads
+   embed.sh makes with the compiler, `std_units`); `volec check` reads
    all of std. So check with a build too: `bootstrap/bootstrap.sh --dev
    --no-suite`, then `target/volec PROG.vl -o x` of a program that uses
    the module. A build made again with std whole says so (`tests/run.sh`
-   counts them, `lazy std: N build(s)`; `VOLE_STD2_NORERUN=1` shows why).
+   counts them, `lazy std: N build(s)`; `VOLE_STD_NORERUN=1` shows why).
 3. Tests and docs as for `add-std-fn`. `volec guide std`'s index has a
    size limit (`tests/run.sh guide`: guide-std-index); a module with its
    own topic, or one programs seldom name, leaves the index

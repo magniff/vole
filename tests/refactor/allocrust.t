@@ -1,6 +1,6 @@
 ## The allocator rules' fixes on a rust program (0.28.0;
 ## tests/refactor/allocrust/). alloc.field's fix makes the struct generic
-## over `A: Allocator`, and std2's prelude has no Allocator: the fix
+## over `A: Allocator`, and std's prelude has no Allocator: the fix
 ## carries `use std::alloc::Allocator;` (it was refused: "'Allocator' is
 ## not a trait in scope"). A function that names `gpa` without having
 ## one gets the edit that adds the parameter and passes it at each call
