@@ -30,6 +30,10 @@ escape hatch:
 - `&x as *const T` and `&mut x as *mut T` make one, and a `&mut x`
   passed where a `*mut T` is wanted (a C function's parameter) converts
   to it; `c"..."` is a `*const u8` to read-only memory, NUL-terminated.
+- The two are two types, as in Rust: a `*mut T` goes where a `*const T`
+  is wanted, a `*const T` becomes a `*mut T` only by a cast (`p as *mut
+  T`, `p.cast_mut()`), and nothing is written through a `*const T`. A
+  `&x` gives a `*const T` only: `&mut x` for a `*mut T`.
 - In `unsafe` code `&*p` and `&mut *p` make a reference of the pointee:
   the code vouches for it. A raw pointer never becomes a reference by
   itself.

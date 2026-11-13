@@ -138,12 +138,12 @@ fn main() {
 
 ## Pointers and slices
 
-- `*const T` and `*mut T` are one type until 0.29: either goes where
-  the other is wanted, with no cast (`let q: *mut i64 = p;` of a
-  `*const i64`), and diagnostics print it `*T`. A write through a
-  pointer declared `*const T` is still refused.
-- A slice has the fields `ptr` and `len` beside Rust's `as_ptr()` and
-  `len()` (until 0.29).
+- `*const T` and `*mut T` are two types, as in Rust (0.29): a `*mut T`
+  goes where a `*const T` is wanted, the other way needs a cast (`p as
+  *mut T`, `p.cast_mut()`); a `&T` gives a `*const T` only; nothing is
+  written through a `*const T`. A `c"..."` literal is a `*const u8`.
+- A slice has no fields (0.29): its length is `s.len()`, its pointer
+  `s.as_ptr()` or `s.as_mut_ptr()`.
 - Raw pointers are for `unsafe` code, as in Rust (`guide unsafe`).
 
 ## C

@@ -31,14 +31,14 @@ $ edit patch crate::extern --old 'i32' --new 'i64' --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -15 +15 @@
--    fn puts(s: *mut u8) -> i32;
-+    fn puts(s: *mut u8) -> i64;
+-    fn puts(s: *const u8) -> i32;
++    fn puts(s: *const u8) -> i64;
 $ edit patch main::extern --old 'puts' --new 'fputs' --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -15 +15 @@
--    fn puts(s: *mut u8) -> i32;
-+    fn fputs(s: *mut u8) -> i32;
+-    fn puts(s: *const u8) -> i32;
++    fn fputs(s: *const u8) -> i32;
 main.vl:23:9: error[type error] undefined variable 'puts' | help: did you mean 'fputs'? | try: volec fix --suggested main.vl  [in crate::main]
 warning edit.breaks: 1 new error (1 in crate::main, which the edit does not change) (dry run); the error: main.vl:23:9: undefined variable 'puts'
 [exit 1]
@@ -194,7 +194,7 @@ $ refactor rename crate::calc::header top --dry-run
 ## query refs: the uses of string and C-string constants.
 $ query refs GREETING TITLE
 # main.vl
-9:7	def	->GREETING	const GREETING: *mut u8 = c"hello";
+9:7	def	->GREETING	const GREETING: *const u8 = c"hello";
 10:7	def	->TITLE	const TITLE: &str = "totals";
 21:15	read	main	->TITLE	println("{TITLE}: share {}%, twice {}", percent(a, b), twice(a));
 23:14	read	main	->GREETING	puts(GREETING);

@@ -558,6 +558,62 @@ methods are made: `len`, `as_ptr` and `as_mut_ptr` of std::slice, and
 the nodes the checker makes itself (a `for` over a slice, `==` of two).
 *Anchor:* `front/check/synth_mode.vl: synth_field, in_std_slice`.
 
+**F30.5 (`*const T` and `*mut T` are two types, 0.29).** The constness
+of a raw pointer is part of its type, as in rustc: two type ids, one
+layout, one code (`front/types.vl: const_ptr_to`; the mangled name of
+`*const T` is `K<t>`, of `*mut T` `P<t>`). Messages, `query type`, the
+LSP's hover and `--emit-imports` write the two as the source does.
+
+- *Coercion.* A `*mut T` goes where a `*const T` is expected (a `let`,
+  an argument, also a generic function's `p: *const U`, a field, a
+  result, the other operand of `==` after a `*const T`); a `*const T`
+  where a `*mut T` is expected is `error type` ("expected '*mut T', got
+  '*const T'", rustc E0308). Its help names the cast, which is the
+  error's exact fix (`volec fix --suggested`), and, when the value is
+  checked against a written type, the place of that `*mut`. The
+  pointee must be the same type: `*mut *mut T` is no `*const *const T`.
+- *References.* A `&T` coerces to `*const T` only (E0308 where a `*mut
+  T` is expected, whatever made that type: D3.6a read the written type
+  node, which the type now carries); a `&mut T` to both.
+- *Casts.* `as` goes both ways between the two; `&T as *mut T` is
+  `error type.cast` (rustc E0606), `&T as *const T as *mut T` the way
+  to say it; `&mut T as *const T` is a cast.
+- *Writes.* A place behind a `*const T` (`*c`, `(*c).f`, `c.f`,
+  `(*c).a[i]`) is not assigned (rustc E0594) nor borrowed `&mut` or
+  `&raw mut` (E0596); a `*mut T` or a reference met on the way ends
+  that: `*(*c).q = v` writes through `q`. (0.27.0 to 0.28 refused only
+  a write through a local declared `*const T`.)
+- *Methods.* std's `impl<T> *const T` and `impl<T> *mut T` are each
+  their own type's (the pattern impls' headers match by constness, and
+  coherence keeps them apart); `add`, `sub`, `offset` and `cast` give
+  the receiver's kind, `write` is `*mut T`'s, `cast_mut` and
+  `cast_const` go from one to the other. A `*mut T` receiver takes a
+  method only `*const T` has (rustc's probe).
+- *`&raw`.* `&raw const P` is a `*const T`, `&raw mut P` a `*mut T`
+  (F30.2).
+- *Literals.* A `c"..."` literal is a `*const u8`.
+- *C.* A header's `const T *` imports as `*const T`, `T *` and `void *`
+  as `*mut T` (`T *const *` as `*const *mut T`, a `const T a[]`
+  parameter as `*const T`); `--emit-header` writes a `*const T` as
+  `const T *`.
+- *Not done.* The fat raw pointers `*const [T]` and `*mut [T]` (`*const
+  str`) are still one type (their mismatch is read from the written
+  type, D3.6a). An `if` whose branches are a `*mut T` and a `*const T`
+  takes the first branch's type, where rustc takes `*const T` for both
+  orders.
+
+*Anchor:* `front/types.vl: const_ptr_to, raw_const_coerces`;
+`front/check/check_mode.vl: coerce_ref`; `front/check/mod.vl:
+mismatch_help`; `front/check/rust.vl: const_write, behind_const_ptr`;
+`front/check/synth_mode.vl: synth_cast`; `front/check/calls/mod.vl:
+synth_method`; `front/generics/instantiate.vl: match_type`;
+`front/cimport/decls.vl: d_declarator`; `front/cheader.vl:
+h_decl_into`. Cases `rust_f_f30_ptr_const_ok`, `rust_f_f30_ptr_const_err`,
+`rust_f_f30_ptr_const_write_err`, `rust_f_f30_ptr_shared_err`,
+`ptr_const_cstr`, `err_ptr_const_cstr`, `cimport_const_ptr`,
+`err_cimport_const_ptr`, `cheader_const_ptr`; the transcript
+`tests/refactor/ptrconst029`.
+
 ### F32 Unsize coercion
 
 **F32.1 (the one coercion).** At a *coercion site* — a `let` with an
@@ -2210,13 +2266,8 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   trait for any type is accepted where rustc would say E0117/E0210.
 - **FR3 (any `?Sized` self types for inherent impls).** `impl<T> *const
   T`, `impl str` in a program, which rustc reserves to core (E0390).
-- **FR4 (`*const T` and `*mut T` are one type).** vole has one raw
-  pointer type: a `*const T` converts to a `*mut T` with no cast, is
-  passed where a `*mut T` is wanted, and has `*mut T`'s methods
-  (`p.write(x)`, F30.3); rustc keeps the two apart (E0308, and no
-  `write` on `*const T`). Only a write through a local declared `*const`
-  is refused (F30.1's const_write). Whether to split the types is a
-  later decision. Case `rust_f_f30_const_mut_ok`.
+- **FR4 (closed in 0.29).** Until 0.28 `*const T` and `*mut T` were one
+  type. They are two, with rustc's rules: F30.5.
 
 - **FR5 (integer widening).** F29.3: MVS's lossless widening is kept
   in the rust edition: an `i32` where an `i64` goes, a `u8` where a

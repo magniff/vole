@@ -3,8 +3,8 @@
 ## generated files.
 ## A table grown alone is refused; the summary line names the error.
 $ edit patch NAMES --old '[c"one", c"two"]' --new '[c"one", c"two", c"three"]'
-names.vl:4:43: error[type error] array has 3 elements, expected 2  [edited: crate::names::NAMES]
-error edit.breaks: 1 new error; nothing written; the error: names.vl:4:43: array has 3 elements, expected 2
+names.vl:4:45: error[type error] array has 3 elements, expected 2  [edited: crate::names::NAMES]
+error edit.breaks: 1 new error; nothing written; the error: names.vl:4:45: array has 3 elements, expected 2
 note edit.together: several steps are one call, checked at its end: `edit patch NAME --old A --new B --old C --new D` (`--in OTHER` before another item's pairs), `edit apply FILE`; or this step alone with --no-check
 try: volec edit patch NAMES --old '[c"one", c"two"]' --new '[c"one", c"two", c"three"]' --no-check
 [exit 1]
@@ -13,7 +13,7 @@ $ edit patch NAMES --old '[c"one", c"two"]' --new '[c"one", c"two", c"three"]' -
 patched crate::names::NAME_COUNT, crate::names::NAMES	names.vl	+2 -2 lines
 // names.vl:3-4
 3	pub const NAME_COUNT: i64 = 3;
-4	pub static NAMES: [*mut u8; NAME_COUNT] = [c"one", c"two", c"three"];
+4	pub static NAMES: [*const u8; NAME_COUNT] = [c"one", c"two", c"three"];
 $ undo
 undid patched crate::names::NAME_COUNT, crate::names::NAMES	names.vl	+2 -2 lines
 ## --pairs FILE and --old/--new together: the file's blocks before an `@@`
@@ -23,9 +23,9 @@ $ edit patch NAMES --pairs $T/inputs/edit255_names.pairs --in NAME_COUNT --old '
 +++ b/names.vl
 @@ -3,2 +3,2 @@
 -pub const NAME_COUNT: i64 = 2;
--pub static NAMES: [*mut u8; NAME_COUNT] = [c"one", c"two"];
+-pub static NAMES: [*const u8; NAME_COUNT] = [c"one", c"two"];
 +pub const NAME_COUNT: i64 = 3;
-+pub static NAMES: [*mut u8; NAME_COUNT] = [c"one", c"two", c"three"];
++pub static NAMES: [*const u8; NAME_COUNT] = [c"one", c"two", c"three"];
 ## `@@ FILE` blocks: one pairs file over several files.
 $ edit patch --pairs $T/inputs/edit255_files.pairs --dry-run
 --- a/main.vl
@@ -37,9 +37,9 @@ $ edit patch --pairs $T/inputs/edit255_files.pairs --dry-run
 +++ b/names.vl
 @@ -3,2 +3,2 @@
 -pub const NAME_COUNT: i64 = 2;
--pub static NAMES: [*mut u8; NAME_COUNT] = [c"one", c"two"];
+-pub static NAMES: [*const u8; NAME_COUNT] = [c"one", c"two"];
 +pub const NAME_COUNT: i64 = 3;
-+pub static NAMES: [*mut u8; NAME_COUNT] = [c"one", c"two", c"three"];
++pub static NAMES: [*const u8; NAME_COUNT] = [c"one", c"two", c"three"];
 ## OLDs that touch (one ends where the next begins) are fine; overlapping
 ## ones are refused, naming both.
 $ edit patch area --old 'w * h' --new 'h * w' --old ';' --new '; // swapped' --dry-run

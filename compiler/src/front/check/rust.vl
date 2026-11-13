@@ -102,7 +102,7 @@ pub fn place_to_mut(e: i64, pcx: &mut Ctx<Comp>) {
 
 // Whether a value of type t has method `name` (its impls', a trait's
 // impl's among them).
-fn has_method(t: i64, name: *mut u8, pcx: &mut Ctx<Comp>) -> bool {
+fn has_method(t: i64, name: *const u8, pcx: &mut Ctx<Comp>) -> bool {
     t > 0 && (method_of(t, intern_c(name, pcx), pcx) >= 0
         || crate::front::convert::has_generic_trait_fn(t, intern_c(name, pcx), pcx)
         // (0.27.3: an Ω's bounds' methods, `*d` with `D: Deref`, FL11)
@@ -112,7 +112,7 @@ fn has_method(t: i64, name: *mut u8, pcx: &mut Ctx<Comp>) -> bool {
 
 // `e.name(args)`: a MethodCall node at e's span (args: a list made with
 // list_begin's mark, or -1 for none).
-fn method_call(e: i64, name: *mut u8, arg: i64, pcx: &mut Ctx<Comp>) -> i64 {
+fn method_call(e: i64, name: *const u8, arg: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let call = new_node(NodeKind::MethodCall, pcx.nodes[e as usize].start,
         pcx.nodes[e as usize].end, pcx);
     pcx.nodes[call as usize].a = e;
@@ -346,7 +346,7 @@ pub fn autoref_first(n: i64, f0: i64, t: i64, t0: i64, name: i64, pcx: &mut Ctx<
 // argument), at type node t of a rust-edition position where a value
 // goes (`what`: a parameter, a result, a field, a `let`), also as a
 // tuple's or an array's element: error type.unsized (rustc E0277).
-pub fn check_sized(t: i64, what: *mut u8, pcx: &mut Ctx<Comp>) {
+pub fn check_sized(t: i64, what: *const u8, pcx: &mut Ctx<Comp>) {
     if t == 0 {
         return;
     }
@@ -685,16 +685,6 @@ pub fn lenient_error(n: i64, read: bool, pcx: &mut Ctx<Comp>) {
     pcx.err_kind = saved;
 }
 
-// (0.27.0) Local l, declared with type node t: kept when t is `*const T`
-// (front/parser/rust.vl: its TyPtr's c is 1), for const_write.
-pub fn note_const_ptr(l: i64, t: i64, pcx: &mut Ctx<Comp>) {
-    if l >= 0 && t > 0 && pcx.nodes[t as usize].kind == NodeKind::TyPtr
-        && pcx.nodes[t as usize].c == 1
-        && (pcx.nodes[t as usize].p & crate::front::ast::NODE_REF) == 0 {
-        pcx.const_ptrs.push(l);
-    }
-}
-
 // RULE: D3.6a (0.27.7) Whether type node t is written `*mut T` (its
 // TyPtr's c is 2, front/parser/rust.vl: raw_pointer_kind): where a `&T`
 // is rustc's E0308, the types' mutability differing.
@@ -707,7 +697,12 @@ pub fn mut_raw_node(t: i64, pcx: &Ctx<Comp>) -> bool {
 // against type node t: n when n is read in the rust edition and t is
 // written `*mut T`, else 0.
 pub fn raw_mut_value(n: i64, t: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    if n > 0 && mut_raw_node(t, pcx) { n } else { 0 }
+    if n > 0 && mut_raw_node(t, pcx) {
+        pcx.raw_mut_node = t;
+        n
+    } else {
+        0
+    }
 }
 
 // RULE: D3.6a (0.27.7) The type node field `field` of struct s is
@@ -749,46 +744,68 @@ pub fn place_type_node(e: i64, pcx: &Ctx<Comp>) -> i64 {
     0
 }
 
-// (0.27.0) An assignment's target: `*p` (also `(*p).f`, `p[i]`) where p
-// is a local declared `*const T` is refused (rustc E0594). Both raw
-// pointers are one type, `*T`: only a write through a local declared
-// `*const T` is seen.
-pub fn const_write(target: i64, pcx: &mut Ctx<Comp>) {
-    let mut e = target;
+// RULE: F30.5 (0.29) Whether place e is behind a `*const T`: reached by
+// a deref of one, written `*p` or made by a field's or an index's
+// auto-deref (`p.f`, `(*p).f.g`, `(*p).a[i]`), with nothing but fields,
+// tuple fields and array elements between. A deref of any other pointer
+// on the way (`(*p).q.x` with q a `*mut T` or a reference) ends the
+// search: the place is then behind that pointer, not behind p.
+pub fn behind_const_ptr(place: i64, pcx: &Ctx<Comp>) -> bool {
+    let mut e = place;
     for _ in 0..100 {
         let k = pcx.nodes[e as usize].kind;
-        if k == NodeKind::FieldAccess || k == NodeKind::TupleField || k == NodeKind::Index {
-            e = pcx.nodes[e as usize].a;
-        } else {
-            break;
+        if k == NodeKind::Unary && pcx.nodes[e as usize].op == Tok::Star {
+            return crate::front::types::is_const_ptr(pcx.nodes[pcx.nodes[e as usize].b as usize].ty,
+                pcx);
         }
+        if k != NodeKind::FieldAccess && k != NodeKind::TupleField && k != NodeKind::Index {
+            return false;
+        }
+        let base = pcx.nodes[e as usize].a;
+        let bt = pcx.nodes[base as usize].ty;
+        if bt <= 0 {
+            return false;
+        }
+        if pcx.types[bt as usize].kind == TyKind::Ptr {
+            return crate::front::types::is_const_ptr(bt, pcx);
+        }
+        // (an element of a slice or of a container is behind its view)
+        if k == NodeKind::Index && pcx.types[bt as usize].kind != TyKind::Array {
+            return false;
+        }
+        e = base;
     }
-    if pcx.nodes[e as usize].kind != NodeKind::Unary || pcx.nodes[e as usize].op != Tok::Star {
+    false
+}
+
+// RULE: F30.5 (0.29) An assignment's target (`mutably`: a place borrowed
+// `&mut`, `&raw mut`, or the receiver of a `&mut self` method) that is
+// behind a `*const T` is refused, as rustc refuses it (E0594, E0596): a
+// `*const T` is not written through. (0.27.0 to 0.28: only through a
+// local declared `*const T`, the two raw pointers being one type.)
+pub fn const_write(target: i64, mutably: bool, pcx: &mut Ctx<Comp>) {
+    if !behind_const_ptr(target, pcx) {
         return;
     }
-    let p = pcx.nodes[e as usize].b;
-    if pcx.nodes[p as usize].kind != NodeKind::Ident
-        || pcx.nodes[p as usize].res != crate::front::check::Res::Local {
-        return;
+    let text = str::from_utf8(
+        &get_src()[
+            pcx.nodes[target as usize].start as usize..pcx.nodes[target as usize].end as usize]).unwrap();
+    crate::base::diag::err_begin(pcx.nodes[target as usize].start, pcx);
+    if mutably {
+        crate::base::diag::err_fmt(
+            format_args("cannot borrow '{}' as mutable, as it is behind a `*const` pointer", text),
+            pcx);
+        crate::base::diag::err_help(
+            c"a `*const T` is read only: declare the pointer `*mut T` to write through it (rustc E0596)",
+            pcx);
+    } else {
+        crate::base::diag::err_fmt(
+            format_args("cannot assign to '{}', which is behind a `*const` pointer", text), pcx);
+        crate::base::diag::err_help(
+            c"a `*const T` is read only: declare the pointer `*mut T` to write through it (rustc E0594)",
+            pcx);
     }
-    for i in 0..pcx.const_ptrs.len() as i64 {
-        if pcx.const_ptrs[i as usize] == pcx.nodes[p as usize].y {
-            // (0.28.0: refused as rustc refuses it, E0594; it said
-            // edition.later, "comes in 0.27.1")
-            crate::base::diag::err_begin(pcx.nodes[target as usize].start, pcx);
-            crate::base::diag::err_fmt(
-                format_args("cannot assign to '{}', which is behind a `*const` pointer",
-                    str::from_utf8(
-                        &get_src()[
-                            pcx.nodes[target as usize].start as usize..pcx.nodes[target as usize].end as usize]).unwrap()),
-                pcx);
-            crate::base::diag::err_help(
-                c"a `*const T` is read only: declare the pointer `*mut T` to write through it (rustc E0594)",
-                pcx);
-            crate::base::diag::err_end_soft(pcx);
-            return;
-        }
-    }
+    crate::base::diag::err_end_soft(pcx);
 }
 
 // (0.27.0) `&x` given where a value of type t goes, in the rust edition:
@@ -963,7 +980,12 @@ pub fn raw_borrow(n: i64, operand: i64, pcx: &mut Ctx<Comp>) -> i64 {
         err_help(c"bind the value to a variable first, then take its address", pcx);
         err_end_soft(pcx);
     }
-    crate::front::types::ptr_to(ty, pcx)
+    if mutable {
+        const_write(operand, true, pcx);
+    }
+    // (F30.5: `&raw const P` is a `*const T`, `&raw mut P` a `*mut T`)
+    if mutable { crate::front::types::ptr_to(ty, pcx) }
+    else { crate::front::types::const_ptr_to(ty, pcx) }
 }
 
 // RULE: F29.1 Whether cast n is the rust edition's `e as *const _` or `e as
@@ -985,6 +1007,10 @@ pub fn raw_hole_cast(n: i64, pcx: &Ctx<Comp>) -> bool {
 // reference or pointer gives none (rustc E0641).
 pub fn raw_hole_target(n: i64, from: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if from > 0 && pcx.types[from as usize].kind == TyKind::Ptr {
+        // (`as *const _`: its TyPtr's c is 1)
+        if pcx.nodes[pcx.nodes[n as usize].b as usize].c == 1 {
+            return crate::front::types::const_ptr_to(pcx.types[from as usize].a, pcx);
+        }
         return crate::front::types::ptr_to(pcx.types[from as usize].a, pcx);
     }
     if from > 0 && from != pcx.ty_error {

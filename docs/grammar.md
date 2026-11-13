@@ -1047,6 +1047,14 @@ pointer is unsafe: `p` is a `*T` parameter`, with `try: volec fix
 a pointer that is indexed, compared, cast, stored or given to C) and
 `try: volec fix --only unsafe`.
 
+**`*const T` and `*mut T`** (0.29) are two types, with Rust's rules: a
+`*mut T` goes where a `*const T` is expected, the other way is a type
+error whose fix is the cast (`p as *mut T`; std's `p.cast_mut()`,
+`p.cast_const()`); a `&T` coerces and casts to `*const T` only, a `&mut
+T` to both; a place behind a `*const T` is not written nor borrowed
+`&mut`; a `c"..."` literal is a `*const u8`. Until 0.28 the two were
+one type, written `*T` in messages.
+
 **Diagnostics.** An unsafe operation outside unsafe code is an error,
 `error[unsafe]` (each place once, in source order, with the other
 errors; 0.9 reported it as a warning). Options:
@@ -2252,11 +2260,12 @@ What a header declares becomes vole declarations
 
 | C | vole |
 |---|---|
-| `char` (plain), `signed char`, `unsigned char` | `u8`, `i8`, `u8` (`c"..."` strings are `*u8`) |
+| `char` (plain), `signed char`, `unsigned char` | `u8`, `i8`, `u8` (`c"..."` strings are `*const u8`) |
 | `short`, `int`, `long`, `long long`, and the unsigned ones | `i16`, `i32`, `i64`, `i64`, and `u16` ... `u64` |
 | `_Bool`, `float`, `double` | `bool`, `f32`, `f64` |
 | `long double` | `f64` on aarch64-macos; not imported on x86-64 |
-| `void *`, `T *` | `*u8`, `*T` |
+| `void *`, `T *` | `*mut u8`, `*mut T` |
+| `const void *`, `const T *` (0.29) | `*const u8`, `*const T` (`T *const *`: `*const *mut T`; a `const T a[]` parameter: `*const T`) |
 | function pointers | `extern "C" fn(...) -> R` (variadic ones: `*u8`) |
 | `struct`, `union` | `#[repr(C)]` types with C's exact layout: bit-fields become byte arrays (`_bitfield0`); `aligned`, `packed` and `#pragma pack` become `align(N)`, `packed(N)` or padding fields (`_pad0`); anonymous members are fields `_anon0` of types `<Struct>_anon0` |
 | `typedef` | a `type` alias; a typedef of an anonymous struct names it |
