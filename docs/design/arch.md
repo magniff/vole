@@ -762,14 +762,14 @@ use std::arch::detect;
 
 fn crc32c(s: [u8], crc: u32) -> u32 {
     if !detect("crc") { return crc32c_table(s, crc); }    // narrowing: crc known below
-    let mut c = ~crc;
+    let mut c = !crc;
     let mut i = 0;
     while i + 8 <= s.len {
         c = __crc32cd(c, le64(s, i));        // le64: the 8 bytes at i, little-endian (a load at -O2)
         i += 8;
     }
     while i < s.len { c = __crc32cb(c, s[i]); i += 1; }
-    ~c
+    !c
 }
 ```
 
