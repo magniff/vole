@@ -63,6 +63,22 @@ use crate::middle::threads::asm_thread_push;
 use linkfail::{check_link_inputs, link_failed};
 use output::{c_module_symbols, link_program};
 
+// ---- The assembler ----
+
+// (0.29) The assembler's state: the text being assembled and the object
+// being built from it. One per output; it is the function context's
+// (`FnCtx.assembler`: the main thread's, which -O0 lends to the
+// assembler's thread from asm_thread_start to asm_thread_finish), and
+// every function of the assembler takes it.
+pub struct Asm<A: std::alloc::Allocator> {
+    // The text being assembled (assemble_bytes's copy of it).
+    pub text: Vec<u8, A>,
+}
+
+pub fn asm_new() -> Asm<Comp> {
+    Asm { text: Vec::new_in(Comp {}) }
+}
+
 // ---- Sections ----
 
 pub const SEC_TEXT: i64 = 0;
@@ -112,7 +128,7 @@ static mut OPEN: i64 = -1;
 static mut OBJ: ObjBytes = ObjBytes { data: 0 as *mut u8, len: 0, cap: 0 };
 
 // Room for n more bytes in OBJ.
-pub fn obj_reserve(n: i64) {
+pub fn obj_reserve(n: i64, asm: &mut Asm<Comp>) {
     unsafe {
         if get_obj().len + n <= get_obj().cap {
             return;
@@ -167,7 +183,7 @@ pub fn bytes_append(b: &mut ObjBytes, bytes: &[u8]) -> i64 {
     }
 }
 
-fn new_frag(sec: i64) {
+fn new_frag(sec: i64, asm: &mut Asm<Comp>) {
     unsafe {
         if get_open() >= 0 {
             (*get_frags().add(get_open() as usize)).len = get_obj().len - (
@@ -188,47 +204,47 @@ fn new_frag(sec: i64) {
 }
 
 // Ends the open fragment with a tail, and opens the next.
-fn end_frag(tail: i64, arg: i64, sym: i64) {
+fn end_frag(tail: i64, arg: i64, sym: i64, asm: &mut Asm<Comp>) {
     unsafe {
         (*get_frags().add(get_open() as usize)).tail = tail;
         (*get_frags().add(get_open() as usize)).arg = arg;
         (*get_frags().add(get_open() as usize)).sym = sym;
         (*get_frags().add(get_open() as usize)).atom = get_cur_atom()[get_cur_sec() as usize];
     }
-    new_frag(get_cur_sec());
+    new_frag(get_cur_sec(), asm);
 }
 
-fn switch_section(sec: i64) {
+fn switch_section(sec: i64, asm: &mut Asm<Comp>) {
     { let mut sec_used_copy = get_sec_used(); sec_used_copy[sec as usize] = true;
         set_sec_used(sec_used_copy); }
     if sec != get_cur_sec() {
         set_cur_sec(sec);
-        new_frag(sec);
+        new_frag(sec, asm);
     }
 }
 
 // The position (in OBJ_BYTES) of the next byte.
-pub fn here() -> i64 {
+pub fn here(asm: &mut Asm<Comp>) -> i64 {
     get_obj().len
 }
 
-pub fn out8(b: i64) {
+pub fn out8(b: i64, asm: &mut Asm<Comp>) {
     unsafe {
-        obj_reserve(1);
+        obj_reserve(1, asm);
         (*get_obj().data.add(get_obj().len as usize)) = (b & 255) as u8;
         { let mut obj_copy = get_obj(); obj_copy.len += 1; set_obj(obj_copy); }
     }
 }
 
-pub fn out16(v: i64) {
-    out8(v);
-    out8(v >> 8);
+pub fn out16(v: i64, asm: &mut Asm<Comp>) {
+    out8(v, asm);
+    out8(v >> 8, asm);
 }
 
 // (0.17: the four bytes with one check for room, not four buf_byte calls)
-pub fn out32(v: i64) {
+pub fn out32(v: i64, asm: &mut Asm<Comp>) {
     unsafe {
-        obj_reserve(4);
+        obj_reserve(4, asm);
         let at = get_obj().len;
         let d = get_obj().data;
         (*d.add(at as usize)) = (v & 255) as u8;
@@ -239,13 +255,13 @@ pub fn out32(v: i64) {
     }
 }
 
-pub fn out64(v: i64) {
-    out32(v);
-    out32(v >> 32);
+pub fn out64(v: i64, asm: &mut Asm<Comp>) {
+    out32(v, asm);
+    out32(v >> 32, asm);
 }
 
 // Reads and writes a little-endian 32-bit word of OBJ_BYTES.
-fn get32(pos: i64) -> i64 {
+fn get32(pos: i64, asm: &mut Asm<Comp>) -> i64 {
     unsafe {
         let d = get_obj().data;
         ((*d.add(pos as usize)) as i64) | ((*d.add((pos + 1) as usize)) as i64) << 8
@@ -254,7 +270,7 @@ fn get32(pos: i64) -> i64 {
     }
 }
 
-fn put32(pos: i64, v: i64) {
+fn put32(pos: i64, v: i64, asm: &mut Asm<Comp>) {
     unsafe {
         let d = get_obj().data;
         (*d.add(pos as usize)) = (v & 255) as u8;
@@ -294,11 +310,11 @@ static mut ASYM_TABLE_SIZE: i64 = 0;
 // (assemble.vl's memo).
 static mut ASYM_LOOKUPS: i64 = 0;
 
-pub fn asym(name: &[u8]) -> i64 {
+pub fn asym(name: &[u8], asm: &mut Asm<Comp>) -> i64 {
     unsafe {
         set_asym_lookups(get_asym_lookups() + (1));
         if (get_asym_count() + 1) * 2 > get_asym_table_size() {
-            asym_rehash();
+            asym_rehash(asm);
         }
         let n = name.len() as i64;
         let hash = hash_bytes(name.ptr, n);
@@ -334,7 +350,7 @@ pub fn asym(name: &[u8]) -> i64 {
 }
 
 // The table of ASYMS by name (index + 1, open addressing), twice as large.
-fn asym_rehash() {
+fn asym_rehash(asm: &mut Asm<Comp>) {
     unsafe {
         let size: i64 = if get_asym_table_size() == 0 { 1024 } else { get_asym_table_size() * 2 };
         free(get_asym_table() as *mut u8);
@@ -469,13 +485,13 @@ pub fn c_bytes(s: *mut u8) -> &'static [u8] {
 
 // A temporary label (L... on Mach-O, .L... on ELF): never in the symbol
 // table unless a relocation needs it (Mach-O only; ELF uses the section).
-fn is_temp(s: i64) -> bool {
+fn is_temp(s: i64, asm: &mut Asm<Comp>) -> bool {
     let t = unsafe { (*get_asyms().add(s as usize)).text };
     if get_elf() { t.len() >= 2 && t[0] == b'.' && t[1] == b'L' }
     else { t.len() >= 1 && t[0] == b'L' }
 }
 
-fn sym_addr(s: i64) -> i64 {
+fn sym_addr(s: i64, asm: &mut Asm<Comp>) -> i64 {
     unsafe { (*get_frags().add((*get_asyms().add(s as usize)).frag as usize)).addr + (
         *get_asyms().add(s as usize)).off }
 }
@@ -510,7 +526,7 @@ static mut FIXUPS: *mut Fixup = 0 as *mut Fixup;
 static mut FIXUP_COUNT: i64 = 0;
 static mut FIXUP_CAP: i64 = 0;
 
-pub fn fixup(kind: i64, pos: i64, sym: i64, addend: i64, end: i64, rex: bool) {
+pub fn fixup(kind: i64, pos: i64, sym: i64, addend: i64, end: i64, rex: bool, asm: &mut Asm<Comp>) {
     unsafe {
         set_fixups({
             let mut fixup_cap_copy = get_fixup_cap();
@@ -526,8 +542,8 @@ pub fn fixup(kind: i64, pos: i64, sym: i64, addend: i64, end: i64, rex: bool) {
 }
 
 // x86-64 branches whose size layout decides (jmp, jcc to a label).
-pub fn emit_relaxable(tail: i64, cond: i64, sym: i64) {
-    end_frag(tail, cond, sym);
+pub fn emit_relaxable(tail: i64, cond: i64, sym: i64, asm: &mut Asm<Comp>) {
+    end_frag(tail, cond, sym, asm);
 }
 
 // ---- Relocations ----
@@ -546,7 +562,8 @@ fn reloc(sec: i64, offset: i64, rtype: i64, sym: i64, addend: i64, pcrel: bool, 
 }
 
 // A relocation against symbol s itself (a GOT entry's).
-fn reloc_to_symbol(sec: i64, offset: i64, rtype: i64, s: i64, pcrel: bool, pcx: &mut Ctx<Comp>) {
+fn reloc_to_symbol(sec: i64, offset: i64, rtype: i64, s: i64, pcrel: bool, asm: &mut Asm<Comp>,
+    pcx: &mut Ctx<Comp>) {
     unsafe { (*get_asyms().add(s as usize)).in_table = true; }
     reloc(sec, offset, rtype, s, 0, pcrel, 2, pcx);
 }
@@ -554,11 +571,11 @@ fn reloc_to_symbol(sec: i64, offset: i64, rtype: i64, s: i64, pcrel: bool, pcx: 
 // A relocation against symbol s plus `extra`: on ELF a temporary label
 // becomes its section's symbol plus the label's offset.
 fn reloc_to(sec: i64, offset: i64, rtype: i64, s: i64, extra: i64, pcrel: bool, length: i64,
-    pcx: &mut Ctx<Comp>) {
+    asm: &mut Asm<Comp>, pcx: &mut Ctx<Comp>) {
     unsafe {
-        if get_elf() && (*get_asyms().add(s as usize)).defined && is_temp(s) {
-            reloc(sec, offset, rtype, -1 - (*get_asyms().add(s as usize)).sec, extra + sym_addr(s),
-                pcrel, length, pcx);
+        if get_elf() && (*get_asyms().add(s as usize)).defined && is_temp(s, asm) {
+            reloc(sec, offset, rtype, -1 - (*get_asyms().add(s as usize)).sec,
+                extra + sym_addr(s, asm), pcrel, length, pcx);
             return;
         }
         (*get_asyms().add(s as usize)).in_table = true;
@@ -617,56 +634,57 @@ pub fn is_debug(sec: i64) -> bool {
 // assembled yet).
 pub fn write_object(cx: &mut FnCtx<Comp>, path: *mut u8, pcx: &mut Ctx<Comp>) {
     if !pcx.asm_stream {
-        assembler_begin();
+        assembler_begin(&mut cx.assembler);
     }
     assemble_text(cx);
     if pcx.asm_stream {
         buf_clear(cx.asm);
     }
-    new_frag(get_cur_sec());
-    layout();
-    resolve_fixups(cx, pcx);
-    build_sections(pcx);
+    let asm = &mut cx.assembler;
+    new_frag(get_cur_sec(), asm);
+    layout(asm);
+    resolve_fixups(asm, pcx);
+    build_sections(asm, pcx);
     if get_rows().len() as i64 > 0 {
-        line_program(pcx);
+        line_program(asm, pcx);
     }
     if get_cfi_fns().len() as i64 > 0 {
-        compact_unwind(pcx);
+        compact_unwind(asm, pcx);
     }
     if get_elf() {
         { let mut sec_align_copy = get_sec_align(); sec_align_copy[SEC_NOTE as usize] = 0;
             set_sec_align(sec_align_copy); }
-        elf_write(path, pcx);
+        elf_write(path, asm, pcx);
     } else {
-        macho_write(path, pcx);
+        macho_write(path, asm, pcx);
     }
 }
 
 // The assembler's state before the first line.
-fn assembler_begin() {
+fn assembler_begin(asm: &mut Asm<Comp>) {
     set_obj(ObjBytes { data: alloc_zeroed(65536), len: 0, cap: 65536 });
     set_mapping(get_elf() && !get_x86());
     set_hooks(get_mapping());
     set_cur_sec(SEC_TEXT);
     { let mut sec_used_copy = get_sec_used(); sec_used_copy[SEC_TEXT as usize] = true;
         set_sec_used(sec_used_copy); }
-    new_frag(SEC_TEXT);
-    assemble_begin();
+    new_frag(SEC_TEXT, asm);
+    assemble_begin(asm);
     if get_x86() {
-        init_x86();
+        init_x86(asm);
     } else {
-        init_a64();
+        init_a64(asm);
     }
 }
 
 // Assembles the lines in ASM.
 fn assemble_text(cx: &mut FnCtx<Comp>) {
-    assemble_bytes(cx, buf_ptr(cx.asm),
-        buf_len(cx.asm));
+    assemble_bytes(buf_ptr(cx.asm), buf_len(cx.asm),
+        &mut cx.assembler);
 }
 
 // (0.18.1) Assembles the lines of text[0..n] (ATEXT while it runs).
-pub fn assemble_bytes(cx: &mut FnCtx<Comp>, text: *mut u8, n: i64) {
+pub fn assemble_bytes(text: *mut u8, n: i64, asm: &mut Asm<Comp>) {
     unsafe {
         set_atext(text);
         let t = text;
@@ -676,7 +694,7 @@ pub fn assemble_bytes(cx: &mut FnCtx<Comp>, text: *mut u8, n: i64) {
             let nl = memchr(t.add(i as usize), 10, (n - i) as u64);
             let e = if nl == 0 as *mut u8 { n }
                 else { i + (nl as i64 - (t.add(i as usize)) as i64) };
-            assemble_line(cx, i, e);
+            assemble_line(i, e, asm);
             i = e + 1;
         }
     }
@@ -688,10 +706,10 @@ pub fn assemble_bytes(cx: &mut FnCtx<Comp>, text: *mut u8, n: i64) {
 static mut ATEXT: *mut u8 = 0 as *mut u8;
 
 // From the first function on (after the file's header): see ASM_STREAM.
-pub fn asm_stream_begin(pcx: &mut Ctx<Comp>) {
+pub fn asm_stream_begin(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
     if pcx.output_mode != OUT_ASM && !pcx.debug_info {
         pcx.asm_stream = true;
-        assembler_begin();
+        assembler_begin(&mut cx.assembler);
     }
 }
 
@@ -775,7 +793,7 @@ pub fn write_output(cx: &mut FnCtx<Comp>, path: *mut u8, pcx: &mut Ctx<Comp>) {
         // (0.25.3: the link's inputs first, its failure one error)
         check_link_inputs(pcx);
         build_linking(path, pcx);
-        let mut status = link_program(path, obj_path, pcx) as i32;
+        let mut status = link_program(path, obj_path, &mut cx.assembler, pcx) as i32;
         if status != 0 {
             unlink(obj_path);
             link_failed(status as i64, path, pcx);
