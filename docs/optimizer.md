@@ -723,7 +723,8 @@ whose parameter decides a branch, switch or division in g (10 each: the
 copy will fold), minus the call's own cost (the argument moves, the
 call, the result). The threshold is 30, doubled inside a loop and again
 in a loop nest, 0 in a cold block (one that leads only to a panic or a
-call of a `#[cold]` function). A function with a single call site that
+call of a `#[cold]` function). (0.29) The size leaves out g's panic
+blocks, and their calls do not end its being a leaf ("0.29" below). A function with a single call site that
 is not address-taken or global is inlined up to 400 (it is then not
 emitted). Never inlined: calls within one component (recursion), a
 function that calls `setjmp` or the like (or into one), and calls past
@@ -801,7 +802,9 @@ the next (it would need a phi).
 
 **Compile time.** `--time-passes` prints the CPU time of each phase;
 (0.25.5) `--time-passes=instructions` the instructions each retires,
-which a loaded machine hardly changes (the recipe: "0.25.5" below).
+which a loaded machine hardly changes (the recipe: "0.25.5" below);
+(0.29) `--time-passes=passes` those of each optimizer pass too ("0.29"
+below).
 Compiling the compiler itself to assembly at -O2 (Apple M-series, best
 of 7, user + system): 0.5.0 takes 0.63 s, 0.6 (built by itself) 0.50 s;
 at -O0, 0.06 s and 0.03 s. Of 0.6's -O2 time, the interprocedural layer
@@ -2864,3 +2867,151 @@ length when its start is 0, or x - 0 across the signedness of one
 width) changes every program's IR and needs the adversarial tests the
 item asks for (a length changed between the test and the access, a
 mutant): left for later.
+
+## 0.29: what a bounds check costs the optimizer
+
+**Panic blocks are not size.** A bounds check is a compare and a branch
+on the paths that return, and a block that reports the failure
+(`callc rt.panic`, `unreachable`), which runs at most once and is laid
+out away from the rest. The inliner counted that block (`func_size`)
+and its call (`callee_flags`: no leaf), so `fn at(t: &T, i: i64) -> i64
+{ t.v[i as usize] }` was 10 against the 5 of its unchecked form, and no
+small leaf: where the program's budget was spent (the compiler's own
+build) every accessor of a table turned into a `Vec` stayed a call.
+Now (`middle/inline.vl`, `panic_blocks`): a block that ends in
+`unreachable`, and a block all of whose successors are such blocks, is
+a panic block; `func_size` leaves them out, a call in one does not make
+the function a non-leaf (at -O1: a call of the runtime or of C, and
+nothing in the function returns twice). Three limits keep the reports
+from growing: a function with no `ret` has no panic blocks (it is all
+report: `panic` itself, counted as nothing, was inlined into every
+report); a loop, and what leads to one, is never a panic block (whether
+a loop with a check in it ends is not asked); and at a cold call site a
+callee that has panic blocks is not inlined for costing nothing.
+tests/run/opt_inline_panic_blocks.vl, opt_inline_checked_leaf.vl,
+opt_inline_checked_leaf_o1.vl.
+
+**`--time-passes=passes`**: after the phases, the instructions retired
+by each optimizer pass (`base/timer.vl`, `pass_done` at the end of each
+pass in `middle/opt.vl`'s pipelines, the inliner and the back end):
+
+```
+target/volec --no-cache --time-passes=passes -c compiler/src/main.vl -o /dev/null
+...
+passes (instructions retired, each in one row):
+4284.4 M  sccp
+21867.4 M  gvn
+8138.5 M  loops: folding by ranges
+8237.6 M  register allocation
+...
+30.0 M  rest of: inlining (and simplification)
+21130.5 M  the front end (its phases are above)
+2069 M  the 1154626 marks themselves (1792 each), not in the rows
+```
+
+Every instruction is in one row: a pass's (wherever it ran: `gvn` is
+the scalar pipeline's, after inlining and after the loop passes), the
+rest of a phase (what it ran outside a marked pass), or the front
+end's. A mark reads the counter; what the marks cost is measured when
+the report is made and taken out of the rows. To see which pass pays for
+a change, build the compiler before and after it and compare the rows
+of the two on the same input. tests/perf/run.sh `passes`.
+
+The counter is cheaper: on macOS `thread_selfcounts` (the thread's
+instructions; a build that counts runs on one thread), about 1800
+instructions a reading, where `proc_info` took about 30000 here (most
+of it `host_target`, asked at every reading: a `uname` and an
+allocation). `--time-passes=instructions` of the self-build counted
+108.9 G with it and counts 100.0 G now, of the 104.0 G the same build
+retires untimed with `-j1` (the phases do not cover the process's
+start and end).
+
+**A test for zero in any spelling is one fact** (`middle/range/mod.vl`,
+`zero_test`, asked by `decide`). Unsigned, `x > 0` and `x >= 1` are `x
+!= 0`, and `x < 1` and `x <= 0` are `x == 0`. The intervals are in the
+signed view, where an unsigned value of unknown sign has no bounds, and
+facts were matched by their operands, so `len > 0` (the check of
+`s[0]`) decided nothing about `len >= 1` (the check of `s[1..]`), and
+`!s.is_empty()` (`len as i64 != 0`) nothing about either: `[T]::
+split_first` kept both checks, and with it every step of a slice's
+iterator. Now `for x in s` and `for x in &v` have no check (the loop is
+a load, an add, a decrement and a branch). Still checked: the
+hand-written `while !r.is_empty() { .. r[0] ..; r = &r[1..]; }`, whose
+tests, once the loop is rotated, are about the header's phi (and one
+against a phi of two zeros, folded only after the ranges).
+tests/run/opt_range_zero_tests.vl.
+
+**Measured: two experiments** (the plan of the compiler's raw tables
+becoming `Vec`: E2, every index of an IntVec checked through `Index`,
+against its capacity, 4592 sites; E3, `cx.insts` a checked `Vec<Inst,
+A>`, 2810 sites; neither is in the tree). Instructions retired by `volec
+check` and by a cold self-build (`--no-cache`), the fewest of 3, each
+compiler on the same source (the tree before these changes), one
+session at a 1-minute load of 4.7 to 6.9; "before" is the optimizer
+before these changes, "after" with them, each experiment built by the
+optimizer of its row:
+
+| compiler | check | self-build | over its base |
+|---|---:|---:|---|
+| base, before | 21.324 G | 107.023 G | |
+| E2, before | 21.586 G | 115.091 G | +1.2% / +7.5% |
+| E3, before | 21.331 G | 116.699 G | +0.0% / +9.0% |
+| base, after | 21.172 G | 103.443 G | (-0.7% / -3.3% of the base before) |
+| E2, after | 21.661 G | 111.330 G | +2.3% / +7.6% |
+| E3, after | 21.236 G | 109.763 G | +0.3% / +6.1% |
+
+The panic blocks' rule is nearly all of it (the zero tests: check -0.5%,
+self-build -0.1%). The tree itself gained more than the experiments
+lost of their distance: E3 costs 6.3 G where it cost 9.7 G, E2 7.9 G
+where it cost 8.1 G. The price: a program that inlines much of std
+compiles dearer, tests/cost/std_heavy.vl 1225.9 M to 1276.6 M (+4.1%;
+the compile-cost row 1.01x to 1.05x of 0.28.0): more inlined checks,
+each decided again in its caller (`loops: folding by ranges` +21% on
+it, gvn +3.5%); hello, check and regions are the same or cheaper.
+
+By pass (`--time-passes=passes`, after), E3 pays in `loops: folding by
+ranges` (+24%), sccp (+13%), constant slots (+17%), loop rotation
+(+14%), gvn (+5%); E2 in gvn (+12%), the inliner (+22%), scalar
+promotion (+19%), strength reduction (+13%), the ranges (+9%).
+
+**Measured and left** (each on the trees above):
+
+- *After a call that takes the context, the table's pointer and length
+  are read again and the index is checked again* (`range::rem_below` in
+  E3: three accesses of `cx.insts[r]`, two calls between, two checks):
+  the callee takes `&mut FnCtx` and may push. A call that takes `&Cx`
+  costs nothing (the header and the check survive it). What it needs:
+  for each function and reference parameter, whether it (and what it
+  calls with the parameter) stores into a Vec header of the referent;
+  the stores of today's callees go through raw tables of the context,
+  which may point anywhere, so the summary would say "unknown" for
+  nearly all until those tables are Vecs too. This is most of what E3
+  still costs. Not done.
+- *A store to one Vec's element makes the header of another Vec of the
+  same struct be read again* (`t.b[i] = ..` between two `t.a[i]`: two
+  loads and one check more). A third Vec fact, "a Vec's buffer does not
+  hold the object that holds the Vec", is sound by the argument of the
+  second and removes it (12 lines in `vecfacts::vec_apart`, a test).
+  Measured: the self-build +3.0% and check +2.8% (gvn +10.2%: the
+  headers that now survive each store are each asked about again at
+  every later store, through `vec_header_in`'s scan of the struct's
+  fields; licm +6.8%; borrowck's own code +7.3%; 11 more loops
+  vectorized, 73 to 84), and E3 no nearer its base (5.9% against 6.1%).
+  Left out; it will be wanted when a context holds several hot Vecs,
+  with a cheaper `may_alias` for the entries that survive.
+- *The small leaf's limit at 8* (`INLINE_LEAF`, 6): the base 1.8%
+  dearer, E3 1.7% dearer, E2 0.2% cheaper. Left at 6. A checked
+  accessor of a Vec in a struct is 8 without its report (two loads, the
+  compare and branch, shift, add, load, return) and one of a slice 6.
+- *`#[inline]` on E2's `Index` and `IndexMut`* (the source's choice, not
+  the optimizer's): 111.3 G to 108.8 G, +7.6% to +5.2% over the base;
+  without it 2605 of the 4592 sites stay calls of a 7-instruction
+  function, charged to a budget that is spent.
+- *`ir_val`, `ir_arg`, `ir_operand` taking `&mut FnCtx` in place of
+  `*mut FnCtx`* (24 functions take the raw pointer, for which the
+  optimizer has no fact): E3 109.90 G against 109.70 G, nothing: the
+  three are inlined into callers that hold the reference.
+- *`while !r.is_empty() { .. r[0] ..; r = &r[1..]; }`* keeps its two
+  checks (above); and a check after a merge where one arm made a call
+  (a partial redundancy) stays.
+

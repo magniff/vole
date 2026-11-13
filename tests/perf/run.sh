@@ -12,6 +12,12 @@
 #                 retired)`, near what the whole process retired (macOS:
 #                 /usr/bin/time -l); where the system refuses the counter
 #                 (Linux: perf_event_open), the time.instructions error
+#   passes        (0.29) --time-passes=passes at -O2: after the phases, a
+#                 row per optimizer pass that ran (gvn, sccp, register
+#                 allocation ...), the rest of each phase, the front end,
+#                 and what the marks themselves cost; the rows add up to
+#                 the phases' total less the marks (within a tenth); the
+#                 object is the one a build without the option writes
 #   refused       $VOLE_COUNTERS=off: the time.instructions error, its text
 #   bad-value     --time-passes=bogus: `cannot read --time-passes=bogus`
 #   vec-stats     --vec-stats=FN at -O2: a line per loop of FN, vectorized
@@ -163,6 +169,35 @@ elif [ "$(cat err.out)" = "$REFUSED" ]; then
     pass "instructions (the system refuses the counter here)"
 else
     fail instructions "$(cat err.out)"
+fi
+
+# passes
+if build -O2 --time-passes=passes hello.vl -c -o hello_p.o; then
+    total=$(sed -n 's/^\([0-9]*\) M  total (instructions retired)$/\1/p' err.out)
+    rows=$(awk '/^passes \(instructions retired/ { on = 1; next }
+        on && / marks themselves / { on = 0; next }
+        on && /^[0-9]+\.[0-9] M  / { sum += $1 }
+        END { print int(sum) }' err.out)
+    marks=$(sed -n 's/^\([0-9]*\) M  the [0-9]* marks themselves ([0-9]* each), not in the rows$/\1/p' err.out)
+    if [ -z "$total" ] || [ -z "$marks" ]; then
+        fail passes "no total or no marks line: $(cat err.out)"
+    elif ! grep -q '^[0-9]*\.[0-9] M  gvn$' err.out || ! grep -q '^[0-9]*\.[0-9] M  sccp$' err.out \
+        || ! grep -q '^[0-9]*\.[0-9] M  register allocation$' err.out \
+        || ! grep -q '^[0-9]*\.[0-9] M  rest of: lower to SSA$' err.out \
+        || ! grep -q '^[0-9]*\.[0-9] M  the front end (its phases are above)$' err.out; then
+        fail passes "a row is missing (gvn, sccp, register allocation, rest of: lower to SSA, the front end): $(cat err.out)"
+    elif [ $((rows + marks)) -gt $((total + total / 10 + 1)) ] \
+        || [ $((rows + marks + total / 10 + 1)) -lt "$total" ]; then
+        fail passes "the rows add up to $rows M and the marks to $marks M; the phases' total is $total M"
+    elif ! build -O2 hello.vl -c -o hello_q.o || ! cmp -s hello_p.o hello_q.o; then
+        fail passes "the object differs from a build without the option"
+    else
+        pass passes
+    fi
+elif [ "$(cat err.out)" = "$REFUSED" ]; then
+    pass "passes (the system refuses the counter here)"
+else
+    fail passes "$(cat err.out)"
 fi
 
 # refused
