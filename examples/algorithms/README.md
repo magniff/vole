@@ -1,6 +1,6 @@
 # Algorithms in vole
 
-Ten classic algorithms, each a complete program in idiomatic vole
+Eleven classic algorithms, each a complete program in idiomatic vole
 (written for 0.15, in the rust edition since 0.28) with a README that explains the
 problem, the algorithm, its complexity and the code. Every one works on
 a deterministic, generated input (seeded generators, so the output is
@@ -17,6 +17,7 @@ the README says how the two compare.
 | [huffman](huffman/) | Huffman coding: canonical codes, bit packing, table decoder | O(n + k log k) | `#[derive(PartialOrd, Ord, Debug)]`, generic `MinHeap`, `Result` and `?`, tuples in a `Vec`, `zip`/`fold`/`position` | 500 MB/s encode | within 1.2x |
 | [lru-cache](lru-cache/) | LRU cache: `HashMap` + list linked by indices | O(1) per request | generic struct, `HashMap`, custom `Iterator`, `#[derive(Debug)]` | 230 ms, 12M requests | 155 ms |
 | [bigint](bigint/) | big integers: schoolbook and Karatsuba multiplication, fast-doubling Fibonacci | O(n^1.585) multiply | `impl Add/Sub/Mul`, `Ord` by hand (`<`), `Display`, `#[derive(PartialEq, Eq, Clone, Debug)]` | F(10^6) in 44 ms | 24 ms |
+| [superpi](superpi/) | pi to N digits: Chudnovsky's series, binary splitting, Karatsuba, Knuth D division, Newton integer square root, three-prime NTT | O(n log n) products and division | `std::cli` positionals and flags, big-integer division, arithmetic identities as `#[test]` | 10^6 digits in 1.5 s | no C version |
 | [quickselect](quickselect/) | quickselect, median of medians (BFPRT) | O(n) expected; O(n) worst | generic over `T: Ord + Copy`, re-sliced `&mut [T]`, tuple returns, closures capturing a `let mut`, `collect_in` | 26 ms, 2M values | 24 ms |
 | [sudoku](sudoku/) | backtracking over bitmasks, most-constrained cell first | exponential; ~50 ns per node | fixed arrays in structs, `Result` + `#[derive(Debug)]` errors, `let ... else` | 90 ms, 1.9M nodes | 90 ms |
 | [nqueens](nqueens/) | n-queens counting with bitmasks and mirror symmetry | exponential; O(1) per node | unsigned bit tricks, recursion, `const` arrays, `if` as a format argument | 71 ms, n = 1..14 | 70 ms |

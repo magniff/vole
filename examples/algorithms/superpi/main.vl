@@ -1,0 +1,1175 @@
+// superpi: pi to any number of decimal digits, in vole.
+//
+//     volec run examples/algorithms/superpi/main.vl -- 1000
+//     volec examples/algorithms/superpi/main.vl -o superpi && ./superpi 100000
+//
+// The series is Chudnovsky's, the one the record computations use:
+//
+//     1/pi = 12 sum_k (-1)^k (6k)! (13591409 + 545140134 k)
+//                / ((3k)! (k!)^3 640320^(3k + 3/2))
+//
+// Each term adds 14.18 digits, and the sum is evaluated by binary
+// splitting: a range a..b of terms is a triple (P, Q, T) of big integers
+// with T/Q the partial sum, and two halves combine as
+//
+//     P = P1 P2,  Q = Q1 Q2,  T = T1 Q2 + P1 T2
+//
+// so the whole sum costs O(log n) big products per level instead of one
+// division per term. Then
+//
+//     pi = 426880 sqrt(10005) Q / T
+//
+// with the square root and the division done in integers at a scale of
+// 10^(digits + GUARD).
+//
+// Nothing is quadratic. Products go through Karatsuba up to 512 limbs and
+// through a three-prime number theoretic transform above that (Montgomery
+// reduction in the butterflies, Garner's reconstruction into base 10^9),
+// O(n log n), with the butterflies two at a time in NEON lanes (a scalar
+// path for machines without NEON). The division and the square root use
+// Newton iterations whose precision doubles each step, so their cost is
+// a small multiple of one large product's, not O(n^2). The three primes
+// are independent and run on three threads; the square root, which
+// depends on nothing in the series, runs beside the split, and the final
+// division's reciprocal, which needs only T, beside the numerator's
+// product. A million digits takes about a second and a half on an Apple
+// M-series machine.
+//
+// Every run also computes pi a second, independent way -- Machin's
+// formula pi = 16 arctan(1/5) - 4 arctan(1/239), fixed point with small
+// divisors only -- and compares the two digit strings. The digits are
+// truncated, not rounded. Results go to stdout, times to stderr.
+//
+// The limb arithmetic (base 10^9, schoolbook and Karatsuba products) is
+// the one in examples/algorithms/bigint, so a limb product fits a u64.
+
+import "time.h" as c;
+
+use std::{env, thread};
+use std::alloc::Allocator;
+use std::arch::detect;
+use std::arch::aarch64::{
+    vadd_u32, vbsl_u32, vcge_u32, vdup_n_u32, vld1_u32, vmlal_u32, vmovn_u64, vmull_u32,
+    vshrq_n_u64, vst1_u32, vsub_u32,
+};
+use std::cli::{Arg, Command};
+use std::cmp::Ordering;
+use std::fmt::{Display, Formatter, self};
+
+const BASE: u64 = 1_000_000_000;
+
+// Below this many limbs (in the shorter operand), schoolbook is faster.
+const KARATSUBA_MIN: usize = 96;
+
+// Digits computed past the ones asked for, so that truncating the series
+// and the integer square root cannot move the last printed digit.
+const GUARD: i64 = 30;
+
+// Digits one Chudnovsky term is worth (log10 of the term ratio, 14.18).
+const DIGITS_PER_TERM: i64 = 14;
+
+// 640320^3 / 24, the constant in a term's denominator: one term's ratio
+// to the previous is -(6k-5)(2k-1)(6k-1) / (k^3 * C3_OVER_24).
+const C3_OVER_24: u64 = 640320 * 640320 * 640320 / 24;
+
+// Above this many digits the O(n^2) Machin cross-check is skipped unless
+// it is asked for with --check: it is the only quadratic part left, and
+// at 100000 digits it costs seconds against milliseconds for the answer.
+const CHECK_LIMIT: i64 = 10_000;
+
+// ---------------------------------------------------------------- limbs
+//
+// A number is a Vec of limbs in base 10^9, least significant first, with
+// no zero limb at the top (zero has no limbs).
+
+// r = a * b (r zeroed), O(a.len * b.len). Rows are added up in u64
+// columns without carrying, and the carries propagate once every 16 rows.
+fn mul_schoolbook(a: &[u32], b: &[u32], r: &mut [u32], gpa: Gpa) {
+    let mut columns = Vec::from_elem_in(0u64, a.len() + b.len(), gpa);
+    let acc = columns.as_mut_slice();
+    let mut i = 0;
+    while i < a.len() {
+        let end = if i + 16 < a.len() { i + 16 } else { a.len() };
+        for row in i..end {
+            let ai: u64 = a[row];
+            let out = &mut acc[row..row + b.len()];
+            for j in 0..b.len() { out[j] += ai * b[j]; }
+        }
+        let mut carry: u64 = 0;
+        for k in i..acc.len() {
+            let cur = acc[k] + carry;
+            acc[k] = cur % BASE;
+            carry = cur / BASE;
+            if carry == 0 && k >= end + b.len() { break; }
+        }
+        i = end;
+    }
+    for k in 0..acc.len() { r[k] = acc[k] as u32; }
+}
+
+// r[off..] += x; the sum fits in r.
+fn add_at(r: &mut [u32], x: &[u32], off: usize) {
+    let mut carry: u32 = 0;
+    let mut k = off;
+    for limb in x.iter().copied() {
+        let mut s = r[k] + limb + carry;
+        carry = 0;
+        if s >= BASE as u32 { s -= BASE as u32; carry = 1; }
+        r[k] = s;
+        k += 1;
+    }
+    while carry != 0 {
+        let s = r[k] + 1;
+        if s == BASE as u32 { r[k] = 0; } else { r[k] = s; carry = 0; }
+        k += 1;
+    }
+}
+
+// r -= x, where r >= x.
+fn sub_from(r: &mut [u32], x: &[u32]) {
+    let mut borrow: u32 = 0;
+    let mut k = 0;
+    for limb in x.iter().copied() {
+        let sub = limb + borrow;
+        if r[k] >= sub { r[k] -= sub; borrow = 0; }
+        else { r[k] = r[k] + BASE as u32 - sub; borrow = 1; }
+        k += 1;
+    }
+    while borrow != 0 {
+        if r[k] > 0 { r[k] -= 1; borrow = 0; } else { r[k] = BASE as u32 - 1; }
+        k += 1;
+    }
+}
+
+// The slice without its zero limbs at the top.
+fn trimmed(x: &[u32]) -> &[u32] {
+    let mut n = x.len();
+    while n > 0 && x[n - 1] == 0 { n -= 1; }
+    &x[..n]
+}
+
+// a + b, as a new Vec of max(a.len, b.len) + 1 limbs.
+fn sum_of(a: &[u32], b: &[u32], gpa: Gpa) -> Vec<u32, Gpa> {
+    let n = if a.len() > b.len() { a.len() } else { b.len() };
+    let mut s = Vec::from_elem_in(0u32, n + 1, gpa);
+    let out = s.as_mut_slice();
+    add_at(out, a, 0);
+    add_at(out, b, 0);
+    s
+}
+
+// r = a * b (r zeroed), by Karatsuba: three half-size products instead
+// of four, O(n^1.585).
+fn mul_karatsuba(a: &[u32], b: &[u32], r: &mut [u32], gpa: Gpa) {
+    if a.len() < b.len() { return mul_karatsuba(b, a, r, gpa); }
+    if b.len() < KARATSUBA_MIN { return mul_schoolbook(a, b, r, gpa); }
+    if 2 * b.len() <= a.len() {
+        // Lopsided: b times each b.len-limb piece of a.
+        let mut part = Vec::from_elem_in(0u32, 2 * b.len(), gpa);
+        let p = part.as_mut_slice();
+        let mut off = 0;
+        while off < a.len() {
+            let end = if off + b.len() < a.len() { off + b.len() } else { a.len() };
+            for k in 0..p.len() { p[k] = 0; }
+            mul_karatsuba(&a[off..end], b, p, gpa);
+            add_at(r, trimmed(p), off);
+            off = end;
+        }
+        return;
+    }
+    if b.len() >= NTT_MIN && a.len() + b.len() <= NTT_MAX_LEN {
+        return mul_ntt(a, b, r, gpa);
+    }
+    let m = a.len() / 2;
+    let (a0, a1) = (&a[..m], &a[m..]);
+    let (b0, b1) = (&b[..m], &b[m..]);
+    mul_karatsuba(a0, b0, &mut r[..2 * m], gpa); // z0, in place
+    mul_karatsuba(a1, b1, &mut r[2 * m..], gpa); // z2, in place
+    let sa = sum_of(a0, a1, gpa);
+    let sb = sum_of(b0, b1, gpa);
+    let mut prod = Vec::from_elem_in(0u32, sa.len() + sb.len(), gpa);
+    let p = prod.as_mut_slice();
+    mul_karatsuba(&sa, &sb, p, gpa);
+    sub_from(p, &r[..2 * m]);
+    sub_from(p, &r[2 * m..]);
+    add_at(r, trimmed(p), m);
+}
+
+// ------------------------------------------------------------------ NTT
+//
+// Above NTT_MIN limbs a product is a convolution evaluated with the
+// number theoretic transform: O(n log n) modular butterflies instead of
+// O(n^1.585) integer products. Three 32-bit primes with primitive root 3
+// and a large power-of-two factor in p - 1 give transforms of any length
+// up to 2^24 points (75 million digits); every modular product then fits
+// a u64, so no 128-bit arithmetic is needed. The three residues are
+// recombined by Garner's algorithm, and the exact coefficients (below
+// limbs * BASE^2, which the primes' product exceeds) are carried back
+// into base 10^9.
+
+const NTT_PRIMES: [u64; 3] = [469762049, 167772161, 1224736769];
+const NTT_ROOT: u64 = 3;
+
+// 2^32 - 1, the chunk mask of the reconstruction.
+const M32: u64 = 0xFFFF_FFFF;
+
+// Shorter operand, in limbs, from which the transform wins.
+const NTT_MIN: usize = 512;
+
+// The shortest prime's 2-adic limit: 998244353-style lengths are not
+// needed here, 2^24 points is 75 million digits.
+const NTT_MAX_LEN: usize = 1 << 24;
+
+// Transform length from which the three primes run on three threads.
+const NTT_THREADS_MIN: usize = 1 << 16;
+
+fn powmod(x: u64, e: u64, p: u64) -> u64 {
+    let mut r = 1u64;
+    let mut x = x % p;
+    let mut e = e;
+    while e > 0 {
+        if e & 1 == 1 { r = r * x % p; }
+        x = x * x % p;
+        e >>= 1;
+    }
+    r
+}
+
+// Montgomery reduction with R = 2^32: the primes are below 2^30, so
+// x * y is below 2^60 and (x * y + m * p) is below 2^63. A modular
+// product is three machine multiplies and a shift, no division.
+struct Mont { p: u64, inv: u64 }
+
+fn mont_new(p: u64) -> Mont {
+    // -p^-1 mod 2^32, by Newton's iteration on the low bits.
+    let mut x: u64 = 1;
+    for _ in 0..5 { x = x.wrapping_mul(2u64.wrapping_sub(p.wrapping_mul(x))); }
+    Mont { p, inv: 0u64.wrapping_sub(x) & M32 }
+}
+
+// x * y * R^-1 mod p. In the Montgomery domain (values scaled by R) this
+// is an ordinary modular product.
+fn mont_mul(x: u64, y: u64, m: &Mont) -> u64 {
+    let t = x * y;
+    let mm = ((t & M32) * m.inv) & M32;
+    let u = (t + mm * m.p) >> 32;
+    if u >= m.p { u - m.p } else { u }
+}
+
+// One stage, two butterflies at a time: the operands are below 2^30, so
+// they live in u32 lanes and the widening NEON multiplies take them
+// straight. Montgomery's reduction is umull, umlal and a shift; the
+// modular add and subtract are u32 lanes again.
+fn ntt_stage_simd(v: &mut [u32], tws: &[u32], n: usize, len: usize, m: &Mont) {
+    let half = len / 2;
+    let pv = vdup_n_u32(m.p as u32);
+    let invv = vdup_n_u32(m.inv as u32);
+    let mut start = 0;
+    while start < n {
+        let mut k = 0;
+        while k + 2 <= half {
+            let u = vld1_u32(v, (start + k) as i64);
+            let w = vld1_u32(tws, k as i64);
+            let y = vld1_u32(v, (start + k + half) as i64);
+            let prod = vmull_u32(y, w);
+            let mm = vmovn_u64(vmull_u32(vmovn_u64(prod), invv));
+            let t = vmovn_u64(vshrq_n_u64(vmlal_u32(prod, mm, pv), 32));
+            let tm = vbsl_u32(vcge_u32(t, pv), vsub_u32(t, pv), t);
+            let sum = vadd_u32(u, tm);
+            vst1_u32(v, (start + k) as i64, vbsl_u32(vcge_u32(sum, pv), vsub_u32(sum, pv), sum));
+            let ge = vcge_u32(u, tm);
+            vst1_u32(v, (start + k + half) as i64,
+                vbsl_u32(ge, vsub_u32(u, tm), vadd_u32(vsub_u32(u, tm), pv)));
+            k += 2;
+        }
+        while k < half {
+            let u = v[start + k] as u64;
+            let t = mont_mul(v[start + k + half] as u64, tws[k] as u64, m);
+            let sum = u + t;
+            v[start + k] = (if sum >= m.p { sum - m.p } else { sum }) as u32;
+            v[start + k + half] = (if u >= t { u - t } else { u + m.p - t }) as u32;
+            k += 1;
+        }
+        start += len;
+    }
+}
+
+// In-place iterative Cooley-Tukey transform; v.len() is a power of two.
+// Values arrive in the ordinary domain and, forward, stay in the
+// Montgomery domain afterwards; the inverse transform converts back.
+// Twiddles are precomputed a stage at a time (n muls in total, not one
+// per butterfly).
+fn ntt(v: &mut [u32], m: &Mont, inverse: bool, gpa: Gpa) {
+    let p = m.p;
+    let n = v.len();
+    if !inverse { for i in 0..n { v[i] = (((v[i] as u64) << 32) % p) as u32; } }
+    let mut j = 0;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        if i < j {
+            let t = v[i];
+            v[i] = v[j];
+            v[j] = t;
+        }
+    }
+    let mut len = 2;
+    while len <= n {
+        let mut wlen = powmod(NTT_ROOT, (p - 1) / len as u64, p);
+        if inverse { wlen = powmod(wlen, p - 2, p); }
+        let half = len / 2;
+        let mut tw = Vec::with_capacity_in(half, gpa);
+        let mut w = 1u64;
+        for _ in 0..half {
+            tw.push(((w << 32) % p) as u32);
+            w = w * wlen % p;
+        }
+        let tws = tw.as_slice();
+        if detect("neon") {
+            ntt_stage_simd(v, tws, n, len, m);
+        } else {
+            let mut start = 0;
+            while start < n {
+                for k in 0..half {
+                    let u = v[start + k] as u64;
+                    let t = mont_mul(v[start + k + half] as u64, tws[k] as u64, m);
+                    let sum = u + t;
+                    v[start + k] = (if sum >= p { sum - p } else { sum }) as u32;
+                    v[start + k + half] = (if u >= t { u - t } else { u + p - t }) as u32;
+                }
+                start += len;
+            }
+        }
+        len *= 2;
+    }
+    if inverse {
+        let ninv = powmod(n as u64, p - 2, p);
+        for i in 0..n { v[i] = (mont_mul(v[i] as u64, 1, m) * ninv % p) as u32; }
+    }
+}
+
+// The residues of a * b modulo NTT_PRIMES[pi]: two forward transforms,
+// a pointwise product and an inverse one.
+fn ntt_residues(a: &[u32], b: &[u32], same: bool, pi: usize, l: usize,
+    gpa: Gpa) -> Vec<u32, Gpa> {
+    let p = NTT_PRIMES[pi];
+    let mut fa = Vec::from_elem_in(0u32, l, gpa);
+    for i in 0..a.len() { fa[i] = (a[i] as u64 % p) as u32; }
+    let mut fb = Vec::from_elem_in(0u32, l, gpa);
+    if same {
+        for i in 0..a.len() { fb[i] = fa[i]; }
+    } else {
+        for i in 0..b.len() { fb[i] = (b[i] as u64 % p) as u32; }
+    }
+    let mont = mont_new(p);
+    ntt(fa.as_mut_slice(), &mont, false, gpa);
+    ntt(fb.as_mut_slice(), &mont, false, gpa);
+    for i in 0..l { fa[i] = mont_mul(fa[i] as u64, fb[i] as u64, &mont) as u32; }
+    ntt(fa.as_mut_slice(), &mont, true, gpa);
+    fa
+}
+
+// r = a * b (r zeroed), by three NTTs and Garner's reconstruction.
+fn mul_ntt(a: &[u32], b: &[u32], r: &mut [u32], gpa: Gpa) {
+    let need = a.len() + b.len();
+    let mut l = 1usize;
+    while l < need { l *= 2; }
+    let (p1, p2, p3) = (NTT_PRIMES[0], NTT_PRIMES[1], NTT_PRIMES[2]);
+    let inv12 = powmod(p1, p2 - 2, p2);
+    let inv13 = powmod(p1, p3 - 2, p3);
+    let inv23 = powmod(p2, p3 - 2, p3);
+    let same = a == b; // a square needs two transforms, not three
+    let mut res: [Vec<u32, Gpa>; 3] = [Vec::new_in(gpa), Vec::new_in(gpa), Vec::new_in(gpa)];
+    if l >= NTT_THREADS_MIN {
+        // The primes are independent: one thread each. Only the big
+        // products pay for a thread; below this, spawning costs more
+        // than the transform.
+        res = thread::scope(|sc| {
+            let mut hs = Vec::with_capacity_in(3, gpa);
+            for pi in 0..3 { hs.push(sc.spawn(move || ntt_residues(a, b, same, pi, l, gpa))); }
+            let mut out: [Vec<u32, Gpa>; 3] = [Vec::new_in(gpa), Vec::new_in(gpa),
+                Vec::new_in(gpa)];
+            let mut pi = 0;
+            for h in hs {
+                out[pi] = h.join().unwrap();
+                pi += 1;
+            }
+            out
+        });
+    } else {
+        for pi in 0..3 { res[pi] = ntt_residues(a, b, same, pi, l, gpa); }
+    }
+    let (r1, r2, r3) = (res[0].as_slice(), res[1].as_slice(), res[2].as_slice());
+    // Garner: c = pp * x3 + (x1 + p1 * x2), with pp = p1 * p2. A
+    // coefficient is below limbs * BASE^2, hence below 2^77, so it is
+    // assembled in four base-2^32 chunks and carried into base 10^9 with
+    // integer arithmetic only: no bignum is touched per coefficient.
+    let pp = p1 * p2;
+    let pa = pp >> 32;
+    let pb = pp & M32;
+    let mut out = Vec::with_capacity_in(need + 1, gpa);
+    let mut carry: u64 = 0;
+    for i in 0..need - 1 {
+        let x1 = r1[i] as u64;
+        let x2 = (r2[i] as u64 + p2 - x1 % p2) % p2 * inv12 % p2;
+        let t = (r3[i] as u64 + p3 - x1 % p3) % p3 * inv13 % p3;
+        let x3 = (t + p3 - x2 % p3) % p3 * inv23 % p3;
+        let low = x1 + p1 * x2; // < 2^57
+        let bx = pb * x3; // < 2^63
+        let ax = pa * x3; // < 2^56, and it enters shifted one chunk
+        let mut l0 = (low & M32) + (bx & M32) + (carry & M32);
+        let mut l1 = (low >> 32) + (bx >> 32) + (ax & M32) + (carry >> 32);
+        let mut l2 = ax >> 32;
+        l1 += l0 >> 32;
+        l0 &= M32;
+        l2 += l1 >> 32;
+        l1 &= M32;
+        let l3 = l2 >> 32;
+        l2 &= M32;
+        // Divide the chunks by BASE; the quotient is the next carry and
+        // is below 2^57, so accumulating it in a u64 cannot overflow.
+        let mut rem: u64 = 0;
+        let mut q: u64 = 0;
+        for chunk in [l3, l2, l1, l0] {
+            let cur = rem * (M32 + 1) + chunk;
+            q = q * (M32 + 1) + cur / BASE;
+            rem = cur % BASE;
+        }
+        out.push(rem as u32);
+        carry = q;
+    }
+    while carry > 0 {
+        out.push((carry % BASE) as u32);
+        carry /= BASE;
+    }
+    for i in 0..out.len() { r[i] = out[i]; }
+}
+
+// -------------------------------------------------------------- BigUint
+
+#[derive(PartialEq, Eq, Clone, Debug)]
+struct BigUint<A: Allocator> { limbs: Vec<u32, A> }
+
+impl BigUint<Gpa> {
+    fn zero(gpa: Gpa) -> BigUint<Gpa> { BigUint { limbs: Vec::new_in(gpa) } }
+
+    // Takes the Vec, dropping zero limbs at the top.
+    fn from_limbs(v: Vec<u32, Gpa>) -> BigUint<Gpa> {
+        let mut limbs = v;
+        while limbs.last().copied() == Some(0u32) { limbs.pop(); }
+        BigUint { limbs }
+    }
+
+    fn from_u64(x: u64, gpa: Gpa) -> BigUint<Gpa> {
+        let mut limbs: Vec<u32, Gpa> = Vec::new_in(gpa);
+        let mut x = x;
+        while x > 0 {
+            limbs.push((x % BASE) as u32);
+            x /= BASE;
+        }
+        BigUint { limbs }
+    }
+
+    fn is_zero(&self) -> bool { self.limbs.is_empty() }
+
+    // self *= k, in place, for a small k.
+    fn mul_small(&mut self, k: u32) {
+        let s = self.limbs.as_mut_slice();
+        let mut carry: u64 = 0;
+        for i in 0..s.len() {
+            let cur = s[i] * k as u64 + carry;
+            s[i] = (cur % BASE) as u32;
+            carry = cur / BASE;
+        }
+        if carry != 0 { self.limbs.push(carry as u32); }
+    }
+
+    // self /= k, in place, for a small k; the remainder.
+    fn div_small(&mut self, k: u32) -> u32 {
+        let s = self.limbs.as_mut_slice();
+        let mut rem: u64 = 0;
+        for i in (0..s.len()).rev() {
+            let cur = rem * BASE + s[i] as u64;
+            s[i] = (cur / k as u64) as u32;
+            rem = cur % k as u64;
+        }
+        while self.limbs.last().copied() == Some(0u32) { self.limbs.pop(); }
+        rem as u32
+    }
+
+    // The number of decimal digits (1 for zero).
+    fn digits(&self) -> i64 {
+        if self.is_zero() { return 1; }
+        let mut top = self.limbs[self.limbs.len() - 1];
+        let mut d = 0;
+        while top > 0 {
+            d += 1;
+            top /= 10;
+        }
+        9 * (self.limbs.len() as i64 - 1) + d
+    }
+
+    fn plus(&self, other: &BigUint<Gpa>) -> BigUint<Gpa> {
+        BigUint::from_limbs(sum_of(&self.limbs, &other.limbs, *self.limbs.allocator()))
+    }
+
+    // self - other, for self >= other (natural numbers).
+    fn minus(&self, other: &BigUint<Gpa>) -> BigUint<Gpa> {
+        if self < other { panic("BigUint: subtraction below zero"); }
+        let mut r = self.limbs.clone();
+        sub_from(&mut r, &other.limbs);
+        BigUint::from_limbs(r)
+    }
+
+    // self * other, by Karatsuba.
+    fn times(&self, other: &BigUint<Gpa>) -> BigUint<Gpa> {
+        let gpa = *self.limbs.allocator();
+        let mut r = Vec::from_elem_in(0u32, self.limbs.len() + other.limbs.len(), gpa);
+        mul_karatsuba(&self.limbs, &other.limbs, &mut r, gpa);
+        BigUint::from_limbs(r)
+    }
+}
+
+// Longer is larger; at equal lengths, the first limb that differs from
+// the top decides.
+impl Ord for BigUint<Gpa> {
+    fn cmp(&self, other: &BigUint<Gpa>) -> Ordering {
+        let (a, b) = (self.limbs.as_slice(), other.limbs.as_slice());
+        if a.len() != b.len() { return a.len().cmp(&b.len()); }
+        for i in (0..a.len()).rev() {
+            if a[i] != b[i] { return a[i].cmp(&b[i]); }
+        }
+        Ordering::Equal
+    }
+}
+
+impl PartialOrd for BigUint<Gpa> {
+    fn partial_cmp(&self, other: &BigUint<Gpa>) -> Option<Ordering> { Some(self.cmp(other)) }
+}
+
+// Decimal: the top limb as it is, every other one as nine digits.
+impl<A: Allocator> Display for BigUint<A> {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let s = self.limbs.as_slice();
+        if s.is_empty() { return write(f, "0"); }
+        write(f, "{}", s[s.len() - 1])?;
+        for i in (0..s.len() - 1).rev() { write(f, "{:09}", s[i])?; }
+        Ok(())
+    }
+}
+
+// 10^n: one nonzero limb, since the base is a power of ten.
+fn pow10(n: usize, gpa: Gpa) -> BigUint<Gpa> {
+    let mut limbs = Vec::from_elem_in(0u32, n / 9 + 1, gpa);
+    limbs[n / 9] = 10u32.pow((n % 9) as u32);
+    BigUint::from_limbs(limbs)
+}
+
+// ------------------------------------------------------- divide, root
+
+// a = q b + r, with r < b: Knuth's algorithm D in base 10^9. Both
+// operands are scaled by d = BASE / (top of b + 1) first, so the
+// divisor's top limb is at least BASE/2 and the estimated quotient limb
+// is never more than one too large.
+fn div_rem(a: &BigUint<Gpa>, b: &BigUint<Gpa>, gpa: Gpa) -> (BigUint<Gpa>, BigUint<Gpa>) {
+    if b.is_zero() { panic("superpi: division by zero"); }
+    if a < b { return (BigUint::zero(gpa), a.clone()); }
+    if b.limbs.len() == 1 {
+        let mut q = a.clone();
+        let rem = q.div_small(b.limbs[0]);
+        return (q, BigUint::from_u64(rem as u64, gpa));
+    }
+    let d = (BASE / (b.limbs[b.limbs.len() - 1] as u64 + 1)) as u32;
+    let mut u = a.clone();
+    u.mul_small(d); // may grow one limb
+    let un = u.limbs.len();
+    // Algorithm D reads one limb above the dividend's top (u[j + n]), so
+    // there is always a zero there.
+    u.limbs.push(0);
+    let mut v = b.clone();
+    v.mul_small(d); // never grows
+    let n = v.limbs.len();
+    let m = un - n;
+    let mut q = Vec::from_elem_in(0u32, m + 1, gpa);
+    let us = u.limbs.as_mut_slice();
+    let vs = v.limbs.as_slice();
+    let mut j = m;
+    loop {
+        let top = us[j + n] as u64 * BASE + us[j + n - 1] as u64;
+        let mut qhat = top / vs[n - 1] as u64;
+        let mut rhat = top % vs[n - 1] as u64;
+        while qhat >= BASE || qhat * vs[n - 2] as u64 > rhat * BASE + us[j + n - 2] as u64 {
+            qhat -= 1;
+            rhat += vs[n - 1] as u64;
+            if rhat >= BASE { break; }
+        }
+        // u[j..j + n] -= qhat * v, keeping the sign of the top limb.
+        let mut carry: u64 = 0;
+        let mut borrow: i64 = 0;
+        for i in 0..n {
+            let p = qhat * vs[i] as u64 + carry;
+            carry = p / BASE;
+            let sub = (p % BASE) as i64 + borrow;
+            let cur = us[j + i] as i64 - sub;
+            if cur < 0 {
+                us[j + i] = (cur + BASE as i64) as u32;
+                borrow = 1;
+            } else {
+                us[j + i] = cur as u32;
+                borrow = 0;
+            }
+        }
+        let cur = us[j + n] as i64 - carry as i64 - borrow;
+        if cur < 0 {
+            // One too large: put v back and take the quotient limb down.
+            us[j + n] = (cur + BASE as i64) as u32;
+            qhat -= 1;
+            let mut c: u32 = 0;
+            for i in 0..n {
+                let s = us[j + i] + vs[i] + c;
+                if s >= BASE as u32 {
+                    us[j + i] = s - BASE as u32;
+                    c = 1;
+                } else {
+                    us[j + i] = s;
+                    c = 0;
+                }
+            }
+            us[j + n] += c;
+        } else {
+            us[j + n] = cur as u32;
+        }
+        q[j] = qhat as u32;
+        if j == 0 { break; }
+        j -= 1;
+    }
+    let mut rest = Vec::with_capacity_in(n, gpa);
+    for i in 0..n { rest.push(us[i]); }
+    let mut r = BigUint::from_limbs(rest);
+    r.div_small(d); // undo the normalization
+    (BigUint::from_limbs(q), r)
+}
+
+// ------------------------------------------------------- fast division
+//
+// Knuth's algorithm D is O(n * m) in the limbs of divisor and quotient,
+// which is what made 100000 digits take seconds. These helpers do the
+// same job with products: the reciprocal of the divisor by Newton's
+// iteration at a precision that doubles each step, then one product for
+// the quotient and a correction of at most a few units. Every step is
+// checked against exact integer arithmetic, and a step that misbehaves
+// falls back to algorithm D, so the result is exact by construction, not
+// by an error bound.
+
+// x * BASE^k, as a new number.
+fn shl_limbs(x: &BigUint<Gpa>, k: usize, gpa: Gpa) -> BigUint<Gpa> {
+    let mut v = Vec::from_elem_in(0u32, x.limbs.len() + k, gpa);
+    for i in 0..x.limbs.len() { v[i + k] = x.limbs[i]; }
+    BigUint::from_limbs(v)
+}
+
+// floor(x / BASE^k), as a new number.
+fn shr_limbs(x: &BigUint<Gpa>, k: usize, gpa: Gpa) -> BigUint<Gpa> {
+    if k >= x.limbs.len() { return BigUint::zero(gpa); }
+    let mut v = Vec::with_capacity_in(x.limbs.len() - k, gpa);
+    for i in k..x.limbs.len() { v.push(x.limbs[i]); }
+    BigUint::from_limbs(v)
+}
+
+// BASE^k.
+fn pow_base(k: usize, gpa: Gpa) -> BigUint<Gpa> {
+    shl_limbs(&BigUint::from_u64(1, gpa), k, gpa)
+}
+
+// x at exactly k limbs: the low ones dropped, or zero limbs appended.
+fn rescaled(x: &BigUint<Gpa>, k: usize, gpa: Gpa) -> BigUint<Gpa> {
+    if x.limbs.len() >= k { shr_limbs(x, x.limbs.len() - k, gpa) }
+    else { shl_limbs(x, k - x.limbs.len(), gpa) }
+}
+
+// Below this many limbs in divisor or quotient, algorithm D is cheaper.
+const NEWTON_MIN: usize = 64;
+
+// R ~= floor(BASE^(2s) / b_s), where b_s is the divisor at s limbs. At
+// precision t the invariant is R ~= BASE^(2t) / b_t; doubling it first
+// rescales R, then one Newton step R' = 2R - b_u R^2 / BASE^(2u) restores
+// the invariant with twice as many correct limbs.
+fn reciprocal(b: &BigUint<Gpa>, s: usize, gpa: Gpa) -> BigUint<Gpa> {
+    let mut t = if s < NEWTON_MIN { s } else { NEWTON_MIN };
+    let bt = rescaled(b, t, gpa);
+    let (mut r, _) = div_rem(&pow_base(2 * t, gpa), &bt, gpa);
+    while t < s {
+        let u = if 2 * t < s { 2 * t } else { s };
+        r = shl_limbs(&r, u - t, gpa);
+        let bu = rescaled(b, u, gpa);
+        let corr = shr_limbs(&bu.times(&r.times(&r)), 2 * u, gpa);
+        let mut two = r.clone();
+        two.mul_small(2);
+        if corr >= two {
+            // Never expected from below, but exactness is cheap here.
+            let (exact, _) = div_rem(&pow_base(2 * u, gpa), &bu, gpa);
+            r = exact;
+        } else {
+            r = two.minus(&corr);
+        }
+        t = u;
+    }
+    r
+}
+
+// The quotient of a by b given the reciprocal of b at s limbs, with the
+// correction that makes it exact. Split out so a caller can compute the
+// reciprocal beside something else.
+fn quotient_with_rcp(a: &BigUint<Gpa>, b: &BigUint<Gpa>, rcp: &BigUint<Gpa>, s: usize,
+    gpa: Gpa) -> (BigUint<Gpa>, BigUint<Gpa>) {
+    let n = b.limbs.len();
+    let mut q = shr_limbs(&a.times(rcp), n + s, gpa);
+    let one = BigUint::from_u64(1, gpa);
+    let mut qb = q.times(b);
+    let mut steps = 0;
+    // The quotient is a few units off at most; each correction is an
+    // addition, not a product.
+    while qb.cmp(a) == Ordering::Greater && steps < 100 {
+        q = q.minus(&one);
+        qb = qb.minus(b);
+        steps += 1;
+    }
+    while steps < 100 {
+        if a.minus(&qb).cmp(b) == Ordering::Less { break; }
+        q = q.plus(&one);
+        qb = qb.plus(b);
+        steps += 1;
+    }
+    if steps >= 100 { return div_rem(a, b, gpa); }
+    (q, a.minus(&qb))
+}
+
+// a = q b + r with r < b, for large operands.
+fn div_rem_fast(a: &BigUint<Gpa>, b: &BigUint<Gpa>, gpa: Gpa) -> (BigUint<Gpa>, BigUint<Gpa>) {
+    if b.is_zero() { panic("superpi: division by zero"); }
+    if a < b { return (BigUint::zero(gpa), a.clone()); }
+    let n = b.limbs.len();
+    let m = a.limbs.len() - n;
+    if n < NEWTON_MIN || m < NEWTON_MIN { return div_rem(a, b, gpa); }
+    let s = m + 4;
+    let rcp = reciprocal(b, s, gpa);
+    quotient_with_rcp(a, b, &rcp, s, gpa)
+}
+
+// floor(sqrt(n)): Newton's iteration x' = (x + n/x) / 2 on integers,
+// started above the root so the iterates decrease onto it.
+fn isqrt_small(n: &BigUint<Gpa>, gpa: Gpa) -> BigUint<Gpa> {
+    if n.is_zero() { return BigUint::zero(gpa); }
+    let mut x = pow10(((n.digits() + 1) / 2) as usize, gpa);
+    loop {
+        let (q, _) = div_rem(n, &x, gpa);
+        let mut y = q.plus(&x);
+        y.div_small(2);
+        if y >= x { return x; }
+        x = y;
+    }
+}
+
+// floor(sqrt(n)), with the root's precision doubling each step: at t
+// limbs x is the root of n's top 2t limbs, and one Newton step on n at
+// 2u limbs with x scaled up doubles that. Only the last divisions are at
+// full size, and the closing correction compares squares with n itself,
+// so the result is exact.
+fn isqrt(n: &BigUint<Gpa>, gpa: Gpa) -> BigUint<Gpa> {
+    if n.is_zero() { return BigUint::zero(gpa); }
+    let d = n.limbs.len();
+    if d <= 2 * NEWTON_MIN { return isqrt_small(n, gpa); }
+    let target = (d + 1) / 2;
+    let mut t = NEWTON_MIN;
+    let mut x = isqrt_small(&rescaled(n, 2 * t, gpa), gpa);
+    while t < target {
+        let u = if 2 * t < target { 2 * t } else { target };
+        let big_x = shl_limbs(&x, u - t, gpa);
+        let nu = rescaled(n, if 2 * u < d { 2 * u } else { d }, gpa);
+        let (y, _) = div_rem_fast(&nu, &big_x, gpa);
+        x = big_x.plus(&y);
+        x.div_small(2);
+        t = u;
+    }
+    let one = BigUint::from_u64(1, gpa);
+    let mut sq = x.times(&x);
+    let mut steps = 0;
+    while sq.cmp(n) == Ordering::Greater && steps < 100 {
+        // (x - 1)^2 = sq - 2x + 1.
+        let mut twox = x.clone();
+        twox.mul_small(2);
+        sq = sq.plus(&one).minus(&twox);
+        x = x.minus(&one);
+        steps += 1;
+    }
+    while steps < 100 {
+        // (x + 1)^2 = sq + 2x + 1.
+        let mut twox = x.clone();
+        twox.mul_small(2);
+        let next = sq.plus(&twox).plus(&one);
+        if next.cmp(n) == Ordering::Greater { break; }
+        sq = next;
+        x = x.plus(&one);
+        steps += 1;
+    }
+    if steps >= 100 { return isqrt_small(n, gpa); }
+    x
+}
+
+// ------------------------------------------------------------ Chudnovsky
+
+// One range of terms. T is signed: the series alternates.
+struct Split<A: Allocator> {
+    p: BigUint<A>,
+    q: BigUint<A>,
+    t: BigUint<A>,
+    neg: bool,
+}
+
+// a + b with signs, as (magnitude, negative).
+fn signed_add(a: BigUint<Gpa>, aneg: bool, b: BigUint<Gpa>, bneg: bool,
+    gpa: Gpa) -> (BigUint<Gpa>, bool) {
+    if a.is_zero() { return (b, bneg && !b.is_zero()); }
+    if b.is_zero() { return (a, aneg); }
+    if aneg == bneg { return (a.plus(&b), aneg); }
+    if a == b { return (BigUint::zero(gpa), false); }
+    if a > b { (a.minus(&b), aneg) } else { (b.minus(&a), bneg) }
+}
+
+// Terms a..b of the series, as (P, Q, T) with T/Q the partial sum.
+fn binary_split(a: u64, b: u64, gpa: Gpa) -> Split<Gpa> {
+    if b - a == 1 {
+        if a == 0 {
+            return Split {
+                p: BigUint::from_u64(1, gpa),
+                q: BigUint::from_u64(1, gpa),
+                t: BigUint::from_u64(13591409, gpa),
+                neg: false,
+            };
+        }
+        let p = BigUint::from_u64(6 * a - 5, gpa)
+            .times(&BigUint::from_u64(2 * a - 1, gpa))
+            .times(&BigUint::from_u64(6 * a - 1, gpa));
+        let aa = BigUint::from_u64(a, gpa);
+        let q = aa.times(&aa).times(&aa).times(&BigUint::from_u64(C3_OVER_24, gpa));
+        let t = p.times(&BigUint::from_u64(13591409 + 545140134 * a, gpa));
+        return Split { p, q, t, neg: a % 2 == 1 };
+    }
+    let mid = (a + b) / 2;
+    let left = binary_split(a, mid, gpa);
+    let right = binary_split(mid, b, gpa);
+    // T = T1 Q2 + P1 T2, each product with the sign of its T.
+    let tl = left.t.times(&right.q);
+    let tr = left.p.times(&right.t);
+    let (t, neg) = signed_add(tl, left.neg, tr, right.neg, gpa);
+    Split { p: left.p.times(&right.p), q: left.q.times(&right.q), t, neg }
+}
+
+// floor(pi * 10^scale), as a BigUint.
+fn chudnovsky(digits: i64, scale: i64, timings: bool, gpa: Gpa) -> BigUint<Gpa> {
+    let terms = ((digits + GUARD) / DIGITS_PER_TERM + 1) as u64;
+    let t0 = now_ns();
+    // sqrt(10005) at 10^scale: the integer root of 10005 * 10^(2 scale).
+    // It depends on nothing in the series, so it runs beside the split.
+    let mut radicand = pow10((2 * scale) as usize, gpa);
+    radicand.mul_small(10005);
+    let (s, root) = thread::scope(|sc| {
+        let h = sc.spawn(move || isqrt(&radicand, gpa));
+        let s = binary_split(0, terms, gpa);
+        (s, h.join().unwrap())
+    });
+    let t1 = now_ns();
+    if s.neg { panic("superpi: the series' sum came out negative"); }
+    // The reciprocal needs only T, the numerator only the root and Q, so
+    // they run beside each other. The precision is above the quotient's
+    // length, and more precision only makes the estimate better.
+    let prec = root.limbs.len() + s.q.limbs.len() - s.t.limbs.len() + 5;
+    let divisor = &s.t;
+    let (num, rcp) = thread::scope(|sc| {
+        let h = sc.spawn(move || reciprocal(divisor, prec, gpa));
+        let mut num = root.times(&s.q);
+        num.mul_small(426880);
+        (num, h.join().unwrap())
+    });
+    let (q, _) = quotient_with_rcp(&num, &s.t, &rcp, prec, gpa);
+    let t2 = now_ns();
+    if timings {
+        eprintln("  split and sqrt together {:.1} ms, divide {:.1} ms", ms(t0, t1), ms(t1, t2));
+    }
+    q
+}
+
+// floor(pi * 10^scale) from Machin's formula instead: no big division,
+// no square root, only divisors that fit a limb. Used as the reference
+// the Chudnovsky result is checked against.
+fn machin(scale: i64, gpa: Gpa) -> BigUint<Gpa> {
+    let mut a5 = arctan_inverse(5, scale, gpa);
+    a5.mul_small(16);
+    let mut a239 = arctan_inverse(239, scale, gpa);
+    a239.mul_small(4);
+    a5.minus(&a239)
+}
+
+// arctan(1/x) * 10^scale = sum_k (-1)^k 10^scale / ((2k+1) x^(2k+1)).
+fn arctan_inverse(x: u32, scale: i64, gpa: Gpa) -> BigUint<Gpa> {
+    let mut t = pow10(scale as usize, gpa);
+    t.div_small(x);
+    let mut sum = t.clone();
+    let xx = x * x;
+    let mut k: u32 = 1;
+    let mut neg = true;
+    loop {
+        t.div_small(xx);
+        if t.is_zero() { break; }
+        let mut term = t.clone();
+        term.div_small(2 * k + 1);
+        if neg { sum = sum.minus(&term); } else { sum = sum.plus(&term); }
+        neg = !neg;
+        k += 1;
+    }
+    sum
+}
+
+// ---------------------------------------------------------------- output
+
+fn now_ns() -> i64 {
+    let mut ts = c::timespec { tv_sec: 0, tv_nsec: 0 };
+    // UNSAFE: timespec_get is C's, and writes through a pointer.
+    // SAFETY: `&mut ts` is a whole timespec, borrowed for the call.
+    unsafe { c::timespec_get(&mut ts, c::TIME_UTC); }
+    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+}
+
+fn ms(t0: i64, t1: i64) -> f64 { (t1 - t0) as f64 / 1e6 }
+
+// The scaled integer as digits + 1 characters, zero-padded on the left:
+// one digit before the decimal point, then the fractional ones.
+fn scaled_text(x: &BigUint<Gpa>, scale: i64, gpa: Gpa) -> String<Gpa> {
+    let text = format_in("{x}", gpa);
+    let mut out = String::new_in(gpa);
+    for _ in text.len()..(scale + 1) as usize { out.push_str("0"); }
+    out.push_str(text.as_str());
+    out
+}
+
+// "3." then the digits in groups of ten, fifty to a line.
+fn print_digits(text: &str, digits: i64) {
+    print("{}.", &text[..1]);
+    let mut done: i64 = 0;
+    while done < digits {
+        if done > 0 {
+            if done % 50 == 0 { print("\n  "); } else { print(" "); }
+        }
+        let start = (1 + done) as usize;
+        let n = if digits - done < 10 { digits - done } else { 10 };
+        print("{}", &text[start..start + n as usize]);
+        done += n;
+    }
+    println("");
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cmd = Command::new_in("superpi", gpa)
+        .version("1.0")
+        .about("pi to any number of digits: Chudnovsky's series, binary splitting, Karatsuba limbs")
+        .arg(Arg::positional("digits").value_name("N").default("1000")
+            .help("digits after the decimal point"))
+        .arg(Arg::flag("no-check").help("skip the Machin-formula cross-check"))
+        .arg(Arg::flag("check").help("cross-check even above 10000 digits (quadratic)"));
+    let m = cmd.parse_or_exit(env::args());
+    let digits = match m.get_as::<i64>("digits") {
+        Ok(n) => n,
+        Err(e) => cmd.exit(e),
+    };
+    if digits < 0 {
+        eprintln("superpi: digits must not be negative");
+        return 2;
+    }
+    let scale = digits + GUARD;
+    println("superpi: {digits} digits after the decimal point");
+    let t0 = now_ns();
+    let pi = chudnovsky(digits, scale, true, gpa);
+    let t1 = now_ns();
+    let text = scaled_text(&pi, scale, gpa);
+    print_digits(text.as_str(), digits);
+    eprintln("{digits} digits: Chudnovsky {:.1} ms", ms(t0, t1));
+
+    let check = !m.flag("no-check") && (digits <= CHECK_LIMIT || m.flag("check"));
+    if check {
+        let t2 = now_ns();
+        let reference = machin(scale, gpa);
+        let t3 = now_ns();
+        let other = scaled_text(&reference, scale, gpa);
+        let same = text.as_bytes()[..(digits + 1) as usize]
+            == other.as_bytes()[..(digits + 1) as usize];
+        println(
+            "check: Machin 16*arctan(1/5) - 4*arctan(1/239) agrees on all {digits} digits: {same}");
+        eprintln("Machin cross-check: {:.1} ms", ms(t2, t3));
+        if !same { return 1; }
+    } else if m.flag("no-check") {
+        println("check: skipped (--no-check)");
+    } else {
+        println(
+            "check: skipped above {CHECK_LIMIT} digits (Machin is quadratic; --check forces it)");
+    }
+    0
+}
+
+// ----------------------------------------------------------------- tests
+
+// xorshift64*, for the randomized arithmetic checks.
+struct Rng { state: u64 }
+
+impl Rng {
+    fn new(seed: u64) -> Rng { Rng { state: seed | 1 } }
+
+    fn next(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+
+    fn big(&mut self, n: usize, gpa: Gpa) -> BigUint<Gpa> {
+        let mut v: Vec<u32, Gpa> = Vec::with_capacity_in(n, gpa);
+        for _ in 0..n { v.push(((self.next() >> 32) % BASE) as u32); }
+        BigUint::from_limbs(v)
+    }
+}
+
+// Small divisions against u64 arithmetic, including the limb boundaries.
+#[test]
+fn division_small_cases(gpa: Gpa) {
+    let values: [u64; 12] = [0, 1, 9, 10, 999999999, 1000000000, 1000000001, 999999999999999999,
+        1000000000000000000, 123456789123456789, 18446744073709551615, 42];
+    for a in values {
+        for b in values {
+            if b == 0 { continue; }
+            let (q, r) = div_rem(&BigUint::from_u64(a, gpa), &BigUint::from_u64(b, gpa), gpa);
+            assert_eq(q, BigUint::from_u64(a / b, gpa));
+            assert_eq(r, BigUint::from_u64(a % b, gpa));
+        }
+    }
+}
+
+// q * b + r == a and r < b, on random operands of every shape, including
+// a divisor just below a power of the base (the add-back path).
+#[test]
+fn division_identity(gpa: Gpa) {
+    let mut rng = Rng::new(2026);
+    for i in 0..60 {
+        let na = 1 + (rng.next() % 40) as usize;
+        let nb = 1 + (rng.next() % 20) as usize;
+        let a = rng.big(na, gpa);
+        let mut b = rng.big(nb, gpa);
+        if i % 3 == 0 {
+            // Divisor BASE^k - 1: normalization leaves its top limb small.
+            let k = 1 + (rng.next() % 3) as usize;
+            b = pow10(9 * k, gpa);
+            let one = BigUint::from_u64(1, gpa);
+            b = b.minus(&one);
+        }
+        if b.is_zero() { continue; }
+        let (q, r) = div_rem(&a, &b, gpa);
+        assert !(r < b);
+        assert_eq !(q.times(&b).plus(&r), a);
+    }
+}
+
+// The schoolbook product, as the reference the fast paths are checked
+// against (it never dispatches to Karatsuba or the NTT).
+fn mul_reference(a: &BigUint<Gpa>, b: &BigUint<Gpa>, gpa: Gpa) -> BigUint<Gpa> {
+    let mut r = Vec::from_elem_in(0u32, a.limbs.len() + b.limbs.len(), gpa);
+    mul_schoolbook(&a.limbs, &b.limbs, &mut r, gpa);
+    BigUint::from_limbs(r)
+}
+
+// NTT and Karatsuba against schoolbook multiplication, at and around the
+// transform's threshold, including squares and lopsided operands.
+#[test]
+fn products_match_schoolbook(gpa: Gpa) {
+    let mut rng = Rng::new(99);
+    let sizes: [usize; 12] = [1, 7, 95, 96, 200, 511, 512, 513, 700, 1024, 2048, 3000];
+    for n in sizes {
+        let a = rng.big(n, gpa);
+        let b = rng.big(n, gpa);
+        assert_eq !(a.times(&b), mul_reference(&a, &b, gpa));
+        assert_eq !(a.times(&a), mul_reference(&a, &a, gpa));
+    }
+    let a = rng.big(3000, gpa);
+    let b = rng.big(600, gpa);
+    assert_eq !(a.times(&b), mul_reference(&a, &b, gpa));
+    assert_eq !(b.times(&a), mul_reference(&a, &b, gpa));
+}
+
+// The Newton division, on operands large enough to take that path: the
+// identity is exact whatever approximation was used inside.
+#[test]
+fn fast_division_identity(gpa: Gpa) {
+    let mut rng = Rng::new(4242);
+    let shapes: [(usize, usize); 8] = [(200, 70), (300, 65), (400, 200), (1000, 64), (1000, 500),
+        (2000, 1000), (500, 499), (129, 128)];
+    for (na, nb) in shapes {
+        let a = rng.big(na, gpa);
+        let b = rng.big(nb, gpa);
+        let (q, r) = div_rem_fast(&a, &b, gpa);
+        assert !(r < b);
+        assert_eq !(q.times(&b).plus(&r), a);
+        assert_eq !(q, div_rem(&a, &b, gpa).0);
+    }
+}
+
+// isqrt is exact on squares and their neighbours.
+#[test]
+fn square_roots(gpa: Gpa) {
+    for n in 0..2000u64 {
+        assert_eq !(isqrt(&BigUint::from_u64(n, gpa), gpa), BigUint::from_u64(
+            (n as f64).sqrt() as u64, gpa));
+    }
+    let mut rng = Rng::new(7);
+    for _ in 0..10 {
+        let nx = 1 + (rng.next() % 12) as usize;
+        let x = rng.big(nx, gpa);
+        let sq = x.times(&x);
+        assert_eq !(isqrt(&sq, gpa), x);
+        let one = BigUint::from_u64(1, gpa);
+        assert_eq !(isqrt(&sq.plus(&one), gpa), x);
+        if !x.is_zero() { assert_eq !(isqrt(&sq.minus(&one), gpa), x.minus(&one)); }
+    }
+    // Large squares, where the root's precision doubles: exact on the
+    // square and both neighbours, not merely close.
+    for n in [100usize, 300, 1000] {
+        let x = rng.big(n, gpa);
+        let sq = x.times(&x);
+        let one = BigUint::from_u64(1, gpa);
+        assert_eq !(isqrt(&sq, gpa), x);
+        assert_eq !(isqrt(&sq.plus(&one), gpa), x);
+        assert_eq !(isqrt(&sq.minus(&one), gpa), x.minus(&one));
+    }
+}
+
+// The first hundred digits, against the published expansion.
+#[test]
+fn pi_first_hundred(gpa: Gpa) {
+    let pi = chudnovsky(100, 100 + GUARD, false, gpa);
+    let text = scaled_text(&pi, 100 + GUARD, gpa);
+    assert_eq !(&text.as_str()[..101],
+        "31415926535897932384626433832795028841971693993751058209749445923078164062862089986280348253421170679");
+}
+
+// The two formulas agree well past the digits asked for.
+#[test]
+fn machin_agrees(gpa: Gpa) {
+    let scale = 200 + GUARD;
+    let a = chudnovsky(200, scale, false, gpa);
+    let b = machin(scale, gpa);
+    let ta = scaled_text(&a, scale, gpa);
+    let tb = scaled_text(&b, scale, gpa);
+    assert_eq !(&ta.as_str()[..201], &tb.as_str()[..201]);
+}
