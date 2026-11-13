@@ -155,9 +155,10 @@ io::stdin().read_line(&mut b).unwrap() > 0 { ... }` (appends, with the
 `let w = v;`, a struct field or a `return`: `v` is dead after it
 (`borrowck.use_moved`); pass `&v` to lend it, or `v.clone()`. A `Copy`
 value (numbers, `&T`, a struct deriving it) is copied. A temporary is
-dropped at the end of its statement. A slice of `v` (`&v[a..b]`) borrows
-it: `v` does not grow while the slice is used. What allocates has Rust's
-name with `_in` and takes the allocator last: `collect_in(gpa)`,
+dropped at the end of its statement (`if let`'s: before `else`). A
+slice of `v` (`&v[a..b]`) borrows it: `v` does not grow while the slice
+is used. What allocates has Rust's name with `_in` and takes the
+allocator last: `collect_in(gpa)`,
 `to_string_in(gpa)`, `format_in(.., gpa)`. std's most used items:
 `volec guide std`; all, a line each: `volec guide std#the-api`; one name
 with its comment: `volec guide --find split_once`.

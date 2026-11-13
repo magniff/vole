@@ -91,6 +91,16 @@ fn main(gpa: Gpa) {
 - At the end of a scope its owned locals are dropped, last declared
   first, on every exit (`return`, `break`, `?`), not on an `exit` or a
   panic. A moved value is not dropped where it was.
+- A temporary (a call's result that is lent, read or matched and not
+  bound: `total(&make())`, `make().len()`) is dropped at the end of its
+  statement, the last made first; a block's tail expression's before
+  the block's locals; `let r = &make();` keeps it to the end of the
+  block. An `if let`'s scrutinee's are dropped before its `else` block
+  runs, and at the end of the matching block (Rust 2024's rule): in
+  `if let Some(n) = lock(c).peek() { .. } else { c.n += 1; }` the guard
+  is gone in the else block. So are a `let .. else`'s before its else
+  block, and a `while let`'s at each iteration's end. A `match` keeps
+  its scrutinee's to the end of its statement.
 - `impl Drop for T { fn drop(&mut self) { ... } }` runs code at the
   drop; a type without one drops its fields. `drop(x)` drops early,
   `std::mem::forget(x)` never (a leak, safe); calling `x.drop()` is an
