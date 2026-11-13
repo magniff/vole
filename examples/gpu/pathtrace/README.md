@@ -128,13 +128,27 @@ there are deliberately no fabricated BVH counters.
 
 - **PBR materials:** opaque surfaces combine Lambert diffuse and GGX specular
   with Schlick Fresnel and Smith masking. BSDF sampling uses the corresponding
-  diffuse/GGX mixture PDF. Glass uses Fresnel reflection/refraction and
-  Beer–Lambert absorption.
-- **Correct area-light sampling:** the rectangle is sampled uniformly by area
-  and converted to solid-angle PDF with both cosines and distance. Shadow rays
-  include homogeneous-media transmittance. Rectangle emission is accepted after
-  specular events but skipped after NEE-sampled diffuse events, avoiding double
-  counting. Object emission is BSDF-sampled and is not also next-event sampled.
+  diffuse/GGX mixture PDF, weighted toward the specular lobe as metallic rises
+  (10% specular at a dielectric, 100% at metal). Glass uses Fresnel
+  reflection/refraction and Beer–Lambert absorption.
+- **Multiple importance sampling:** a diffuse or glossy event combines
+  next-event estimation of the area light with the BSDF-sampled path using the
+  balance heuristic, so each technique contributes where its PDF is large; the
+  result stays unbiased and loses most of the fireflies that either technique
+  alone produces on a glossy floor. The rectangle is sampled uniformly by area
+  and converted to solid-angle PDF with both cosines and distance; shadow rays
+  include homogeneous-media transmittance. Rectangle emission is accepted whole
+  after camera or specular events and weighted by MIS after a sampled BSDF
+  event. Object emission is BSDF-sampled and is not also next-event sampled.
+- **Stratified camera, white-noise paths:** a pixel's first four random
+  numbers (jitter, then the lens, or the first light sample without depth of
+  field) are a Cranley–Patterson rotation of a Halton point, fixed per pixel
+  and dimension so neighbours stay decorrelated. The rest of the path uses a
+  hash of `(pixel, sample, dimension)`: a radical inverse there buys nothing
+  measurable on a high-dimensional integral and costs about twice the shader
+  time. Both are deterministic, which is what lets `--headless` reproduce
+  sample one exactly. The stratification removes most of the edge crawl at low
+  sample counts; MIS does the heavy lifting on the broad low-frequency noise.
 - **Scene geometry:** `trace.wgsl` selects one of three analytic families from
   the scene index (the fourth preset reuses the studio geometry with the 4×4
   material wall). Shadow rays use the same per-scene blocker list as the camera
