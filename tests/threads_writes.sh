@@ -62,7 +62,6 @@ back::codecache::pack::NEW	the task'"'"'s own slot, read when the pack is writte
 back::codecache::pack::USED	the entry of the task'"'"'s own key, read when the pack is written (0.27.8: a key is one task'"'"'s but a function'"'"'s that shares its symbol, fn_ambig, whose task does not mark it: mark_used)
 base::ctx::Ctx.pack	read only: an entry'"'"'s body is read through its address
 base::STRESS_GROW	read by prepare_tasks (stress_grow)
-front::types::FIELDS	struct_field: a field'"'"'s address, read through in a task (the offsets are compute_layout'"'"'s, the main thread'"'"'s)
 front::distinct::NICHE	enum_niche: every enum'"'"'s is made before a phase (prepare_layouts)
 front::cells::FREEZE_MEMO	interior_part: every type'"'"'s Freeze fact is made before a phase (prepare_layouts), so a task only reads it (GVN'"'"'s param_class_of)
 front::lexer::STRS	add_const_data: only on const_data'"'"'s serial branch (task_phase 0)
@@ -220,8 +219,8 @@ front::lexer::STR_CAP	IR: the same (no string is made in a task)
 front::lexer::STR_COUNT	IR: the same
 base::ctx::Ctx.edition	key: options_hash (0.27.1: a rust body gets no parameter alias facts, gvn noalias_active)
 base::ctx::Ctx.borrowck_verdict	fact: R_ATTRS mixes the verdict in; 0.27.1, gvn noalias_active asks it of a rust body, set per body before the tasks by places/borrowck
-front::types::ENUMS	key: types_hash
-front::types::FIELDS	key: types_hash
+base::ctx::Ctx.enums	key: types_hash
+base::ctx::Ctx.fields	key: types_hash
 base::ctx::Ctx.fns	IR: a function by fn_canon
 base::ctx::Ctx.statics	IR: a static by static_canon
 base::ctx::Ctx.structs	key: types_hash
