@@ -1,9 +1,10 @@
 #!/bin/sh
-# The release gate (docs/roadmap.md) in one command, as parallel as the
-# machine allows: the chain builds the compiler from the working tree
+# The release gate (docs/roadmap.md) in one command, as parallel as -j
+# allows: the chain builds the compiler from the working tree
 # (bootstrap.sh --dev), then the test suite at every level, the random
 # programs in every mode, the C interop fuzzer in every mode, the object
-# and layout checks and the debugger check all run at once, next to the
+# and layout checks and the debugger check run within the -j slots (0.29:
+# "What runs at once", below; the heavy steps one at a time), next to the
 # two Linux containers (x86_64-linux, from its own chain; aarch64-linux,
 # cross-built here). Ends with one table (step, result, time) and the
 # failures' details; exits 1 when a step failed.
@@ -29,7 +30,9 @@
 #                    them
 #   -j N             slots for the macOS (or host) steps, shared by all of
 #                    them through $VOLE_JOBSERVER (default: the number
-#                    of CPUs)
+#                    of CPUs); (0.29) every job of a runner takes one, a
+#                    step that is no runner holds its own while it runs,
+#                    and the heavy steps run one at a time (--plan)
 #   --cpus N         CPUs of each container (default 8, at most docker's)
 #   --fuzz N         random programs per fuzz mode (overrides the mode's)
 #   --abi N          C interop programs per ABI mode (the same)
@@ -44,8 +47,12 @@
 #                    the git common dir, gate.lock; a dead holder's lock is
 #                    taken over)
 #   --list           print the steps, in the order they start, and exit
+#   --plan           (0.29) print the steps as they are scheduled and exit:
+#                    each with whether it is heavy (one at a time), the
+#                    slots it holds itself, and the steps it starts after
 #   --self-test      check the gate's own machinery (the lock, the stall
-#                    check, the steps of each mode) and exit
+#                    check, the steps of each mode, and, 0.29, what runs at
+#                    once: a release gate of stubbed steps) and exit
 #
 # Steps: chain; suite-O0, suite-O1, suite-O2; fuzz-plain, fuzz-loops,
 # fuzz-generics, fuzz-pressure, fuzz-calls, fuzz-lang06, fuzz-vector,
@@ -122,6 +129,30 @@
 # stopped and fails, with the free slots of the pool: a hang (a slot lost
 # by a killed job) is reported, not waited for.
 #
+# (0.29) What runs at once. 0.28.0's release gate at -j 4 started its 37
+# steps together: each suite row starts some twenty runners of its own
+# beside its cases (query's and refactor's transcripts, the book, the
+# walkthroughs, ...), stress-grow two more suites, cachediff four
+# transcripts at once, the chain rows whole compilers; the load was 114
+# and the memory of a 26 GB machine ran out, and the release was gated one
+# `--only STEP` at a time by hand. So:
+# - the heavy steps (the suites, stress-grow, objcheck, threads,
+#   cachediff, compiler-memcheck, examples-checkalloc, std2-check,
+#   chain-diverse, chain-fresh) run one at a time, the longest first;
+# - a step that is no runner (its work takes no slot of the pool by
+#   itself) holds slots while it runs: one for a serial step (layout,
+#   debug, ...), four for cachediff and std2-check (their own -j), all of
+#   them for a chain row, and two for a suite's own runners (one at -j 2,
+#   none at -j 1: its cases need the rest);
+# - std2-check and std2-tests start after the suite rows they read.
+# So at most -j jobs and held slots at once, one heavy step among them:
+# `gate.sh --release --no-linux -j 4` is safe to run whole. The
+# containers' rows take no slot (--cpus bounds them), and inside a
+# container the steps start together as before (its CPUs and memory are
+# the container's). `--plan` prints it; the self-test checks it on a gate
+# whose steps are stubs ($VOLE_GATE_STUB=SECONDS: each step sleeps, a
+# runner through two jobs of the pool; the gate's own tests only).
+#
 # Logs: target/gate/<date>/ (target/gate/last), one STEP.log per step;
 # failing random programs are kept in failures/STEP/ there.
 #
@@ -166,6 +197,7 @@ COMPILER=""
 INSIDE=0
 SEED_BIN=""
 LIST=0
+PLAN=0
 NO_WAIT=0
 SELF_TEST=0
 
@@ -199,6 +231,7 @@ while [ $# -gt 0 ]; do
         --seed) [ $# -ge 2 ] || die "--seed needs a binary"; SEED_BIN=$2; shift ;;
         --inside) INSIDE=1; LINUX=0 ;;
         --list) LIST=1 ;;
+        --plan) PLAN=1 ;;
         --no-wait) NO_WAIT=1 ;;
         --self-test) SELF_TEST=1 ;;
         -h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
@@ -228,6 +261,7 @@ case "$NCPU" in ''|*[!0-9]*) NCPU=4 ;; esac
 # one at a time; more programs waiting made the gate slower. See
 # docs/releases.md, "The gate".)
 [ -n "$JOBS" ] || JOBS=$NCPU
+[ "$JOBS" -ge 1 ] || die "-j needs at least one slot"
 
 # ---- The steps ----
 
@@ -323,6 +357,77 @@ if [ $LIST -eq 1 ]; then
     exit 0
 fi
 
+# ---- What runs at once (0.29) ----
+
+# The heavy steps: one at a time (the header, "What runs at once"). Not
+# inside a container, whose gate starts its steps together.
+HEAVY_STEPS="suite-O0 suite-O1 suite-O2 stress-grow objcheck threads cachediff compiler-memcheck examples-checkalloc std2-check chain-diverse chain-fresh valgrind"
+is_heavy() { # <step>
+    [ $INSIDE -eq 0 ] || return 1
+    case " $HEAVY_STEPS " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+# The runners: their jobs take the pool's slots one each (tests/run.sh,
+# tests/fuzz/run.sh, tests/abi/run.sh, tests/objcheck.sh, tests/threads.sh,
+# tests/incremental.sh, tests/compiler_memcheck.sh, tests/valgrind.sh).
+is_runner() { # <step>
+    case "$1" in
+        suite-*|stress-grow|fuzz-*|abi-*|objcheck|objcheck-*|threads|incremental|compiler-memcheck|examples-checkalloc|std2-tests|valgrind|smoke-*|selftest-*) return 0 ;;
+    esac
+    return 1
+}
+# The slots step $1 holds itself while it runs, for the work of it that
+# takes none from the pool: a serial step is one job; cachediff and
+# std2-check run four at once (their own -j); a chain row builds whole
+# compilers, on the compiler's threads (and chain-fresh the seed, with
+# cargo): all the slots; a suite starts its other runners beside its
+# cases, the long ones of them serial (query's and refactor's
+# transcripts): two, and its cases the rest. A runner with slots of its
+# own leaves one for its jobs; the chain and the benchmarks run alone,
+# and the containers have their own CPUs (--cpus): none.
+held_slots() { # <step>
+    hs=0
+    if [ $INSIDE -eq 0 ]; then
+        case "$1" in
+            suite-*|stress-grow) hs=2 ;;
+            cachediff|std2-check) hs=4 ;;
+            chain-diverse|chain-fresh) hs=$JOBS ;;
+            layout|debug|unsafe-audit|mvs-census|borrowck-twin|voltty-fuzz|compile-cost) hs=1 ;;
+        esac
+    fi
+    hs_max=$JOBS
+    ! is_runner "$1" || hs_max=$((JOBS - 1))
+    [ "$hs" -le "$hs_max" ] || hs=$hs_max
+    echo "$hs"
+}
+# The steps of this gate that step $1 starts after: the suite rows whose
+# case results it reads (suite_results).
+after_of() { # <step>
+    [ $INSIDE -eq 0 ] || return 0
+    case "$1" in
+        std2-check) ao="suite-O0" ;;
+        std2-tests) ao="suite-O0 suite-O2" ;;
+        *) ao="" ;;
+    esac
+    for ao_s in $ao; do
+        case " $STEPS " in *" $ao_s "*) echo "$ao_s" ;; esac
+    done
+}
+if [ $PLAN -eq 1 ]; then
+    echo "gate: $MODE, $JOBS slots: the steps in the order they start; the heavy ones one at a time"
+    [ $CHAIN -eq 0 ] || printf '  %-20s %-6s %s\n' chain alone "before the others"
+    for s in $ORDERED; do
+        case "$s" in
+            linux-*) printf '  %-20s %-6s %s\n' "$s" "" "a container: no slot (--cpus $CPUS)"; continue ;;
+        esac
+        printf '  %-20s %-6s holds %s%s%s\n' "$s" "$(is_heavy "$s" && echo heavy)" "$(held_slots "$s")" \
+            "$(is_runner "$s" && echo ", its jobs one slot each")" \
+            "$(a=$(after_of "$s" | tr '\n' ' '); [ -z "$a" ] || echo "; after ${a% }")"
+    done
+    [ $BENCH -eq 0 ] || printf '  %-20s %-6s %s\n' bench alone "after the others"
+    exit 0
+fi
+
 # ---- The gate's own checks (--self-test) ----
 
 # (0.25.2) The lock, the stall check and the steps of each mode, each
@@ -346,6 +451,43 @@ self_test() {
         *" linux-aarch64 "*) st_row "release: no linux-smoke" pass ;;
         *) st_row "release: no linux-smoke" "FAIL: no linux-aarch64: $q" ;;
     esac
+    # (0.29) What runs at once: a release gate whose steps are stubs
+    # (stub_step), at -j 4 and at -j 1. From its events, in the order they
+    # happened: never more slots taken than -j, never two heavy steps at
+    # once, std2's rows after the suite rows they read, every step run
+    # once and every slot given back; and at -j 4 it is still parallel.
+    # (A short stall time: steps that wait for each other's slots fail
+    # here in seconds.)
+    for j in 4 1; do
+        want=$(sh "$0" --release --no-linux -c /bin/sh --list | tr '\n' ' ')
+        VOLE_GATE_STUB=$([ $j -eq 1 ] && echo 0.05 || echo 0.2) VOLE_GATE_STALL=30 VOLE_GATE_LOCK="$st/gate.lock" \
+            VOLE_GATE_RUNS="$st/stub$j" sh "$0" -c /bin/sh --release --no-linux -j $j >"$st/stub$j.out" 2>&1
+        rc=$?
+        got=$(awk -v jobs=$j -v heavy="$(sh "$0" --release --no-linux -c /bin/sh -j $j --plan | awk '$2 == "heavy" { print $1 }' | tr '\n' ' ')" -v want="$want" '
+            BEGIN { nh = split(heavy, h, " "); for (i = 1; i <= nh; i++) isheavy[h[i]] = 1 }
+            $1 == "+" { held++; if (held > max) max = held; if (held > jobs) bad = bad " " held "-slots-taken" }
+            $1 == "-" { held-- }
+            $1 == "start" {
+                started[$2]++
+                if (++running > maxrun) maxrun = running
+                if ($2 in isheavy) { if (++hv > 1) bad = bad " " $2 "-beside-a-heavy-step" }
+                if ($2 == "std2-check" && !ended["suite-O0"]) bad = bad " std2-check-before-suite-O0"
+                if ($2 == "std2-tests" && !(ended["suite-O0"] && ended["suite-O2"])) bad = bad " std2-tests-before-its-suites"
+            }
+            $1 == "end" { ended[$2]++; running--; if ($2 in isheavy) hv-- }
+            END {
+                n = split(want, w, " ")
+                for (i = 1; i <= n; i++) if (started[w[i]] != 1 || ended[w[i]] != 1) bad = bad " " w[i] "-not-run-once"
+                if (n < 30 || nh < 10) bad = bad " only-" n "-steps-" nh "-heavy"
+                if (held != 0) bad = bad " " held "-slots-not-given-back"
+                if (jobs > 1 && (max < 2 || maxrun < 2)) bad = bad " nothing-ran-at-once"
+                printf "%s%d steps, at most %d of %d slots taken, %d steps running or waiting for a slot\n", (bad == "" ? "" : "BAD:" bad "; "), n, max, jobs, maxrun
+            }' "$st/stub$j/last/stub.events" 2>&1)
+        case "$rc $got" in
+            "0 BAD"*|[!0]*) st_row "-j $j: what runs at once" "FAIL (exit $rc): $got" ;;
+            *) st_row "-j $j: what runs at once" "pass ($got)" ;;
+        esac
+    done
     # A second gate waits for the first, saying whose it is, then runs.
     g --only selftest-sleep >"$st/a.out" 2>&1 &
     first=$!
@@ -607,7 +749,37 @@ suite_results() {
     echo "$RUN/suite-O$1.results"
 }
 
+# (0.29) A step of a gate of stubs ($VOLE_GATE_STUB=SECONDS, the
+# self-test's): it sleeps that long, a runner through two jobs that take
+# their slots from the pool as a runner's do; its start and end, and each
+# slot taken and given back, go to $RUN/stub.events in the order they
+# happen.
+stub_step() { # <step>
+    echo "start $1" >>"$RUN/stub.events"
+    if is_runner "$1"; then
+        exec 3<>"$VOLE_JOBSERVER"
+        for sj in 1 2; do
+            read -r _ <&3
+            (
+                trap 'echo "- $1 job" >>"$RUN/stub.events"; echo >&3' EXIT
+                trap 'exit 1' HUP INT TERM
+                echo "+ $1 job" >>"$RUN/stub.events"
+                sleep "$VOLE_GATE_STUB"
+            ) &
+        done
+        wait
+        exec 3>&-
+    else
+        sleep "$VOLE_GATE_STUB"
+    fi
+    echo "end $1" >>"$RUN/stub.events"
+}
+
 run_step() {
+    case "$1" in
+        selftest-*) ;;
+        *) [ -z "${VOLE_GATE_STUB:-}" ] || { stub_step "$1"; return; } ;;
+    esac
     k="$RUN/failures/$1"
     case "$1" in
         chain)
@@ -656,7 +828,12 @@ run_step() {
         # any host; no x86 CPU needed, so --no-x86 keeps it)
         objcheck-x86-arch) sh "$ROOT/tests/objcheck.sh" -c "$C" -t x86_64-macos arch_ ;;
         layout)
-            (cd "$ROOT" && sh tests/cimport/layout.sh -c "$C" stdio.h stdlib.h string.h math.h \
+            # (0.29) the fewest records these headers give: 0.28.0's import
+            # format changed under the script and it compared 4 records
+            # of macOS's 111 (0.28.0), passing. Linux's count is another
+            # (glibc's headers), its floor a guess well under it.
+            case "$HOST" in *-macos) floor=100 ;; *) floor=30 ;; esac
+            (cd "$ROOT" && sh tests/cimport/layout.sh -c "$C" -m "$floor" stdio.h stdlib.h string.h math.h \
                 time.h fcntl.h unistd.h signal.h sys/stat.h sys/time.h sys/socket.h \
                 netinet/in.h dirent.h pthread.h) ;;
         debug) sh "$ROOT/tests/debug.sh" -c "$C" ;;
@@ -667,7 +844,11 @@ run_step() {
         # (0.28.0) nothing in the tree is read as the old edition
         mvs-census) python3 "$ROOT/tools/mvs-census.py" --no-allow ;;
         # (0.25.3) the tools' answers from their cache, every transcript
-        cachediff) sh "$ROOT/tests/cachediff/run.sh" -c "$C" -j 4 ;;
+        # (0.29) as many transcripts at once as the slots the step holds
+        cachediff)
+            cj=$(held_slots cachediff)
+            [ "$cj" -ge 1 ] || cj=4
+            sh "$ROOT/tests/cachediff/run.sh" -c "$C" -j "$cj" ;;
         # (0.27.1) the borrow checker's corpus against rustc's verdicts
         borrowck-twin) sh "$ROOT/tools/borrowck-twin.sh" --shim "$ROOT"/tests/run/rust_b_*.vl ;;  # (0.27.3: the rustc twin's shim)
         # (0.27.2) std2's bodies through the borrow checker (Z7)
@@ -850,11 +1031,43 @@ GATE_START=$(now)
 STARTED=""
 REPORTED=""
 
+# (0.29) The slots step $1 holds itself ($RUN/$1.held, their number) go
+# back to the pool, once: by its subshell when it ends, however it ends,
+# or by the gate when it stopped the step (stop_step) and the subshell
+# was killed before it could. Whoever moves the count away gives them.
+give_back() { # <step> <who>
+    mv "$RUN/$1.held" "$RUN/$1.held.$2" 2>/dev/null || return 0
+    gb=$(cat "$RUN/$1.held.$2")
+    rm -f "$RUN/$1.held.$2"
+    while [ "${gb:-0}" -gt 0 ]; do
+        [ -z "${VOLE_GATE_STUB:-}" ] || echo "- $1 held" >>"$RUN/stub.events"
+        echo >&9
+        gb=$((gb - 1))
+    done
+}
+
 start() { # <step>
     now >"$RUN/$1.start"
     (
         # (the gate's lock is not this subshell's to release)
         LOCK_HELD=0
+        # (0.29) the slots the step holds itself (held_slots), taken
+        # before it runs: it waits for them as a runner's job does for
+        # its one (to the stall check too: stopped only when nothing
+        # moves). The steps that take several are heavy, one at a time,
+        # so no two wait with a part of what they need each.
+        need=$(held_slots "$1")
+        if [ "$need" -gt 0 ]; then
+            trap "give_back '$1' step" EXIT
+            trap 'exit 1' HUP INT TERM
+            held=0
+            while [ $held -lt "$need" ]; do
+                read -r _ <&9
+                held=$((held + 1))
+                echo $held >"$RUN/$1.held.new" && mv "$RUN/$1.held.new" "$RUN/$1.held"
+                [ -z "${VOLE_GATE_STUB:-}" ] || echo "+ $1 held" >>"$RUN/stub.events"
+            done
+        fi
         s=$(now)
         run_step "$1" </dev/null >"$RUN/$1.log" 2>&1
         rc=$?
@@ -862,6 +1075,28 @@ start() { # <step>
     ) &
     echo $! >"$RUN/$1.pid"
     STARTED="$STARTED $1"
+}
+
+# (0.29) Whether step $1 may start now: the steps it starts after have
+# ended, and, a heavy one, no other heavy step runs.
+can_start() { # <step>
+    for cs_d in $(after_of "$1"); do
+        [ -f "$RUN/$cs_d.status" ] || return 1
+    done
+    is_heavy "$1" || return 0
+    for cs_h in $STARTED; do
+        ! is_heavy "$cs_h" || [ -f "$RUN/$cs_h.status" ] || return 1
+    done
+    return 0
+}
+# Starts the steps of PENDING that may start, in their order.
+PENDING=""
+start_ready() {
+    sr_left=""
+    for sr_s in $PENDING; do
+        if can_start "$sr_s"; then start "$sr_s"; else sr_left="$sr_left $sr_s"; fi
+    done
+    PENDING=$sr_left
 }
 
 # ---- Stalls (0.25.2) ----
@@ -1041,6 +1276,8 @@ stop_step() { # <step> <why>
     # their own last words go to the log too)
     proc_states "$(cat "$RUN/$1.pid")" >"$RUN/$1.procs" 2>&1
     kill_tree "$(cat "$RUN/$1.pid")"
+    # (0.29) the slots it held itself, when its subshell could not
+    give_back "$1" gate
     {
         echo "--- $1: $2"
         echo "--- its processes (pid, parent, state, waiting in, command):"
@@ -1082,11 +1319,17 @@ poll() {
     done
 }
 
+# (0.29) Until every step has run: the pending ones start as they may
+# (start_ready). (A gate of stubs looks more often: its steps are short.)
+TICK=1
+[ -z "${VOLE_GATE_STUB:-}" ] || TICK=0.1
 wait_all() {
+    start_ready
     poll
-    while [ $RUNNING -gt 0 ]; do
-        sleep 1
+    while [ -n "$PENDING" ] || [ $RUNNING -gt 0 ]; do
+        sleep $TICK
         check_stalls
+        start_ready
         poll
     done
 }
@@ -1118,6 +1361,10 @@ trap cleanup INT TERM
     echo "gate: $MODE on $HOST, $JOBS slots${COMPILER:+, compiler $COMPILER}; logs in $RUN"
     echo "  steps: $(echo $([ $CHAIN -eq 1 ] && echo chain) $STEPS $([ $BENCH -eq 1 ] && echo bench))"
 }
+# (0.29) a gate of stubs says so, first and last: its rows test nothing
+STUB_NOTE=""
+[ -z "${VOLE_GATE_STUB:-}" ] || STUB_NOTE="VOLE_GATE_STUB is set: every step is a stub that sleeps, NOTHING IS TESTED (the gate's self-test)"
+[ -z "$STUB_NOTE" ] || echo "gate: $STUB_NOTE"
 
 # On macOS, the first launch of every new executable waits for the
 # system's check of it (syspolicyd and XProtect), unless the program that
@@ -1148,7 +1395,7 @@ if [ $CHAIN -eq 1 ]; then
 fi
 if [ $CHAIN -eq 0 ] || [ "$(result_of chain)" = pass ]; then
     for s in $ORDERED; do
-        [ "$s" = linux-x86_64 ] || start "$s"
+        [ "$s" = linux-x86_64 ] || PENDING="$PENDING $s"
     done
 fi
 wait_all
@@ -1180,7 +1427,13 @@ note_of() {
             elif [ "$(result_of "$1")" != SKIP ]; then
                 grep -E 'error' "$l" | tail -1
             fi ;;
-        bench) grep '^geomean' "$l" | tail -1 ;;
+        # (0.29) failed: bench/run.sh's last line, the program and why
+        bench)
+            if [ "$(result_of bench)" = FAIL ] && grep -q '^bench: ' "$l"; then
+                grep '^bench: ' "$l" | tail -1
+            else
+                grep '^geomean' "$l" | tail -1
+            fi ;;
     esac
     [ "$(result_of "$1")" = SKIP ] && tail -1 "$l"
 }
@@ -1206,7 +1459,8 @@ fi
 echo
 echo "gate: $MODE on $HOST$([ $INSIDE -eq 1 ] && echo " (inside a container)")"
 awk -F'\t' '{ printf "  %-28s %-7s %7s  %s\n", $1, $2, sprintf("%d:%02d", $3 / 60, $3 % 60), $4 }' "$ROWS"
-printf '  %-28s %-7s %7s\n' "total (wall)" "$([ $FAILED -eq 0 ] && echo pass || echo FAIL)" "$(mmss "$GATE_SECS")"
+printf '  %-28s %-7s %7s\n' "total (wall)" "$([ -n "$STUB_NOTE" ] && echo STUBS || { [ $FAILED -eq 0 ] && echo pass || echo FAIL; })" "$(mmss "$GATE_SECS")"
+[ -z "$STUB_NOTE" ] || echo "  $STUB_NOTE"
 [ -z "$LAUNCH_NOTE" ] || echo "  note: $LAUNCH_NOTE"
 
 # The failures' details.
