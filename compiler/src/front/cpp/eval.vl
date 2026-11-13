@@ -8,7 +8,7 @@ use crate::base::ctx::Ctx;
 use crate::front::cimport::{cty_bits, cty_int, cty_signed};
 use crate::front::cimport::ctx::CImportCx;
 use crate::front::cimport::decls::{cdecl_eval_special, cdecl_ident_value};
-use crate::front::cpp::{c_error, ctok_text, is_query_builtin, strtoull};
+use crate::front::cpp::{c_error, c_ull, ctok_bytes, ctok_text, is_query_builtin};
 use crate::front::cpp::CK::{Char, Ident, Num, Punct};
 use crate::front::cpp::directives::is_defined;
 use crate::front::lexer::is_digit;
@@ -20,10 +20,22 @@ use crate::front::lexer::is_digit;
 // casts, sizeof, C's integer types). A value is (bits, C type); EV_FAIL
 // is set when the expression is not an integer constant.
 
+// A token list's entries, as a Vec of its own.
+pub fn list_copy(list: IntVec) -> Vec<i64, Comp> {
+    let mut out: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for i in 0..list.len() {
+        out.push(list[i]);
+    }
+    out
+}
+
 pub fn eval_tokens(list: IntVec, at: i64, decl: bool, ccx: &mut CImportCx<Comp>,
     pcx: &mut Ctx<Comp>) -> (u64, i64) {
-    let saved = (ccx.ev_toks, ccx.ev_n, ccx.ev_pos, ccx.ev_at, ccx.ev_decl);
-    ccx.ev_toks = list.data;
+    // (the list being evaluated is the context's own copy; the one it
+    // replaces waits in `outer`)
+    let mut outer = list_copy(list);
+    std::mem::swap(&mut ccx.ev_toks, &mut outer);
+    let saved = (ccx.ev_n, ccx.ev_pos, ccx.ev_at, ccx.ev_decl);
     ccx.ev_n = list.len() as i64;
     ccx.ev_pos = 0;
     ccx.ev_at = at;
@@ -33,8 +45,8 @@ pub fn eval_tokens(list: IntVec, at: i64, decl: bool, ccx: &mut CImportCx<Comp>,
     if ccx.ev_pos < ccx.ev_n {
         ev_fail(pcx, ccx);
     }
-    let (toks, n, pos, at0, decl0) = saved;
-    ccx.ev_toks = toks;
+    let (n, pos, at0, decl0) = saved;
+    std::mem::swap(&mut ccx.ev_toks, &mut outer);
     ccx.ev_n = n;
     ccx.ev_pos = pos;
     ccx.ev_at = at0;
@@ -51,7 +63,7 @@ fn ev_fail(pcx: &mut Ctx<Comp>, ccx: &mut CImportCx<Comp>) {
 }
 
 pub fn ev_peek(pcx: &Ctx<Comp>, ccx: &CImportCx<Comp>) -> i64 {
-    if ccx.ev_pos < ccx.ev_n { unsafe { (*ccx.ev_toks.add(ccx.ev_pos as usize)) } }
+    if ccx.ev_pos < ccx.ev_n { ccx.ev_toks[ccx.ev_pos as usize] }
     else { pcx.c_eof }
 }
 
@@ -307,78 +319,67 @@ fn ev_primary(ccx: &mut CImportCx<Comp>, pcx: &mut Ctx<Comp>) -> (u64, i64) {
 
 // The value and type of an integer literal (C11 6.4.4.1). 0 type: not one.
 fn ev_number(t: i64, ccx: &mut CImportCx<Comp>, pcx: &mut Ctx<Comp>) -> (u64, i64) {
-    unsafe {
-        let text = sym_name((pcx.ctoks[t as usize]).text, pcx);
-        let n = strlen(text) as i64;
-        let mut end = 0 as *mut u8;
-        let mut base: i64 = 10;
-        let mut digits = text;
-        if n > 1 && (*text.add(0)) == b'0' && ((*text.add(1)) == b'x' || (*text.add(1)) == b'X') {
-            base = 16;
-        }
-        else if n > 1 && (*text.add(0)) == b'0'
-            && ((*text.add(1)) == b'b' || (*text.add(1)) == b'B') {
-            base = 2;
-            digits = text.add(2);
-        } else if (*text.add(0)) == b'0' {
-            base = 8;
-        }
-        let value = strtoull(digits, &mut end, base as i32);
-        // The suffix: u, l, ll in any case and order.
-        let mut unsigned = false;
-        let mut longs: i64 = 0;
-        let mut p = end;
-        while (*p.add(0)) != 0 {
-            let c = (*p.add(0));
-            if c == b'u' || c == b'U' {
-                unsigned = true;
-            } else if c == b'l' || c == b'L' {
-                longs += 1;
-            } else {
-                // A float, or an unknown suffix.
-                ev_fail(pcx, ccx);
-                return (0, 0);
-            }
-            p = p.add(1);
-        }
-        if !ccx.ev_decl {
-            return (value, cty_int(64, !(unsigned || value > 9223372036854775807), ccx));
-        }
-        let fits_int = value <= 2147483647;
-        let fits_uint = value <= 4294967295;
-        let fits_long = value <= 9223372036854775807;
-        let ty = if longs == 0 && !unsigned && fits_int { cty_int(32, true, ccx) }
-            else if longs == 0 && fits_uint && (unsigned || base != 10) { cty_int(32, false, ccx) }
-            else if !unsigned && fits_long { cty_int(64, true, ccx) }
-            else { cty_int(64, false, ccx) };
-        (value, ty)
+    let text = ctok_bytes(t, pcx);
+    let n = text.len();
+    let mut base: u64 = 10;
+    let mut digits: usize = 0;
+    if n > 1 && text[0] == b'0' && (text[1] == b'x' || text[1] == b'X') {
+        base = 16;
     }
+    else if n > 1 && text[0] == b'0' && (text[1] == b'b' || text[1] == b'B') {
+        base = 2;
+        digits = 2;
+    } else if n > 0 && text[0] == b'0' {
+        base = 8;
+    }
+    let (value, read) = c_ull(&text[digits..], base);
+    // The suffix: u, l, ll in any case and order.
+    let mut unsigned = false;
+    let mut longs: i64 = 0;
+    for &c in &text[digits + read..] {
+        if c == b'u' || c == b'U' {
+            unsigned = true;
+        } else if c == b'l' || c == b'L' {
+            longs += 1;
+        } else {
+            // A float, or an unknown suffix.
+            ev_fail(pcx, ccx);
+            return (0, 0);
+        }
+    }
+    if !ccx.ev_decl {
+        return (value, cty_int(64, !(unsigned || value > 9223372036854775807), ccx));
+    }
+    let fits_int = value <= 2147483647;
+    let fits_uint = value <= 4294967295;
+    let fits_long = value <= 9223372036854775807;
+    let ty = if longs == 0 && !unsigned && fits_int { cty_int(32, true, ccx) }
+        else if longs == 0 && fits_uint && (unsigned || base != 10) { cty_int(32, false, ccx) }
+        else if !unsigned && fits_long { cty_int(64, true, ccx) }
+        else { cty_int(64, false, ccx) };
+    (value, ty)
 }
 
+// The value of a character constant, `'a'`, `L'\n'`, `'\x41'` (a
+// character the token lacks reads as 0).
 fn char_value(t: i64, pcx: &Ctx<Comp>) -> u64 {
-    unsafe {
-        let text = sym_name((pcx.ctoks[t as usize]).text, pcx);
-        let mut i: i64 = 0;
-        while (*text.add(i as usize)) != b'\'' {
-            i += 1;
-        }
-        i += 1;
-        let c = (*text.add(i as usize));
-        if c != b'\\' {
-            return (c as i8) as i64 as u64;
-        }
-        let e = (*text.add((i + 1) as usize));
-        let v: i64 = if e == b'n' { 10 } else if e == b't' { 9 } else if e == b'r' { 13 }
-            else if e == b'0' && !is_digit((*text.add((i + 2) as usize))) { 0 }
-            else if e == b'a' { 7 } else if e == b'b' { 8 } else if e == b'f' { 12 }
-            else if e == b'v' { 11 }
-            else if e == b'x' {
-                let mut end = 0 as *mut u8;
-                strtoull(text.add((i + 2) as usize), &mut end, 16) as i64
-            } else if is_digit(e) {
-                let mut end = 0 as *mut u8;
-                strtoull(text.add((i + 1) as usize), &mut end, 8) as i64
-            } else { e as i64 };
-        ((v as u64 as u8) as i8) as i64 as u64
+    let text = ctok_bytes(t, pcx);
+    let mut quote: usize = 0;
+    while quote < text.len() && text[quote] != b'\'' {
+        quote += 1;
     }
+    // (what follows the quote)
+    let body = &text[(quote + 1).min(text.len())..];
+    let c = if body.len() > 0 { body[0] } else { 0 };
+    if c != b'\\' {
+        return (c as i8) as i64 as u64;
+    }
+    let e = if body.len() > 1 { body[1] } else { 0 };
+    let v: i64 = if e == b'n' { 10 } else if e == b't' { 9 } else if e == b'r' { 13 }
+        else if e == b'0' && !(body.len() > 2 && is_digit(body[2])) { 0 }
+        else if e == b'a' { 7 } else if e == b'b' { 8 } else if e == b'f' { 12 }
+        else if e == b'v' { 11 }
+        else if e == b'x' { c_ull(&body[body.len().min(2)..], 16).0 as i64 }
+        else if is_digit(e) { c_ull(&body[1..], 8).0 as i64 } else { e as i64 };
+    ((v as u64 as u8) as i8) as i64 as u64
 }
