@@ -267,7 +267,8 @@ rc=$?
 # (0.18.1: a clean check says so in one line; 0.25.3: but for one
 # unsafe.unjustified warning, the compiler's legacy unsafe, which
 # docs/unsafe-baseline.md counts)
-clean=$(grep -v 'warning\[unsafe\.unjustified\]' "$WORK/check.out" | sed 's/^ok: 0 errors, 1 warning in /ok: 0 errors in /')
+clean=$(grep -v 'warning\[unsafe\.unjustified\]' "$WORK/check.out" | sed -e 's/^ok: 0 errors, 1 warning in /ok: 0 errors in /' -e 's/ ([0-9]* files, 0 shaders)$//')
+# (0.29: the line ends with what was read, ` (N files, 0 shaders)`)
 check self_check "$([ $rc = 0 ] && [ "$clean" = "ok: 0 errors in compiler/src/main.vl" ] && echo 1)" "$(cat "$WORK/check.out")"
 # same-output: the compiler against a copy of itself (identical), and
 # against a wrapper that changes one compilation (different).

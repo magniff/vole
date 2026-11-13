@@ -512,7 +512,7 @@ the program whose fix is exact. Let's run it:
 $ volec fix --suggested
 fixed 1 suggested fix	main.vl	+1 -1 lines
 $ volec check
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (3 files, 0 shaders)
 ```
 
 `fix --suggested` applies all the exact fixes as one checked edit, so

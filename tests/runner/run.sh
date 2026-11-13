@@ -265,4 +265,47 @@ problems=$(awk '
     done)
 [ -z "$problems" ] && ok affected_map || bad affected_map "$(echo $problems)"
 
+# (0.29) tests/affected.sh's plan, in a small repository of its own (the
+# script, the map and run.sh; two examples, one whose README has a
+# session): prose in an example gets the layout checks, and the
+# walkthroughs only when its README is one they run; a file git does not
+# track is named in the plan and not counted, unless --untracked.
+A="$WORK/affected"
+mkdir -p "$A/tests/run" "$A/tests/examples" "$A/examples/plain" "$A/examples/session"
+cp "$ROOT/tests/affected.sh" "$ROOT/tests/affected.map" "$ROOT/tests/run.sh" "$A/tests/"
+printf 'fn main() -> i32 { 0 }\n' >"$A/examples/plain/main.vl"
+cp "$A/examples/plain/main.vl" "$A/examples/session/main.vl"
+printf '# plain\n' >"$A/examples/plain/README.md"
+printf '# session\n\n```console\n$ volec check\n```\n' >"$A/examples/session/README.md"
+printf '// SOURCE: examples/plain/main.vl\n' >"$A/tests/examples/plain.test"
+if (cd "$A" && git init -q -b main . && git add -A \
+    && git -c user.name=t -c user.email=t@t commit -q -m base) >/dev/null 2>&1; then
+    echo more >>"$A/examples/plain/README.md"
+    got=$(cd "$A" && sh tests/affected.sh --list 2>&1)
+    case "$got" in
+        *"examples/plain/README.md) -> @example:=example_layout,=readme_sync"*"suites: example_layout readme_sync (2 of"*)
+            ok affected_readme_prose ;;
+        *) bad affected_readme_prose "$got" ;;
+    esac
+    (cd "$A" && git checkout -q -- . && echo more >>examples/session/README.md)
+    got=$(cd "$A" && sh tests/affected.sh --list 2>&1)
+    case "$got" in
+        *"=example_layout,=readme_sync,=walkthrough"*) ok affected_readme_session ;;
+        *) bad affected_readme_session "$got" ;;
+    esac
+    (cd "$A" && git checkout -q -- . && echo more >>examples/plain/main.vl && mkdir old-output && echo x >old-output/a.ppm)
+    got=$(cd "$A" && sh tests/affected.sh --list 2>&1)
+    case "$got" in
+        *"1 changed paths"*"untracked, not counted: 1 file(s): old-output/a.ppm (git add"*) ok affected_untracked_named ;;
+        *) bad affected_untracked_named "$got" ;;
+    esac
+    got=$(cd "$A" && sh tests/affected.sh --list --untracked 2>&1)
+    case "$got" in
+        *"2 changed paths"*"(1 path: old-output/a.ppm) -> "*"untracked, counted (--untracked): 1 file(s)"*) ok affected_untracked_counted ;;
+        *) bad affected_untracked_counted "$got" ;;
+    esac
+else
+    bad affected_readme_prose "git could not make the repository"
+fi
+
 exit $BAD

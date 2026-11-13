@@ -14,7 +14,7 @@ compiler's own `<std>` and `<C import>` last), then line, then column.
 ```
 volec query def NAME... [--root ROOT] [--exact]
 volec query show NAME... [--root ROOT] [--exact] [--with-comments]
-volec query show FILE.vl... | MODULE::use | MODULE::header | MODULE::extern
+volec query show FILE... | MODULE::use | MODULE::header | MODULE::extern
 volec query context NAME...|MODULE [--budget TOKENS]     (0.15) source, calls, types, callers
 volec query text FILE[:A[-B]]...                         (no program read)
 volec query diff [ROOT]                                  the last journaled edit
@@ -44,6 +44,8 @@ budget](#the-output-budget-015)), and answers about std from any program
 `ROOT` is the program's root file: `--root ROOT`, or (the form of 0.11's
 first query) a last argument ending in `.vl` after the NAMEs (`items
 ROOT` alone too). Without it: `$VOLE_ROOT`, else `./main.vl`, else
+(0.29) the `main.vl` of a directory above the current one, inside the
+checkout (the program the current directory is in), else
 `./compiler/src/main.vl`. Positions are `file:line:col`, 1-based, with
 the file as the module loader names it (relative to the current
 directory when ROOT is).
@@ -59,6 +61,12 @@ edit, refactor, fix, check, probe, test; `tools/query/roots.vl`):
   `edit patch examples/nes/check.vl --old A --new B --all` and `probe
   examples/nes/check.vl:234 x -- --check` work from the root of the
   tree. Their `try:` lines then say `--root examples/nes/main.vl`.
+- (0.29) In a directory inside a program (`examples/nes/`, or a
+  directory under it), that program is the default one for every
+  command: `volec check`, `query show NAME`, `edit patch NAME`, `refactor
+  rename`, `fix` there mean it, with no `--root`. The checkout's top (the
+  directory with `.git`) ends the search upward; there the default is
+  the compiler.
 - A NAME the default program does not define, with no ROOT and no
   `$VOLE_ROOT`, is looked for in the other programs under the current
   directory (`git grep` of its definition, tracked and untracked files):
@@ -122,7 +130,9 @@ tools` the ones a program needs.
 | the item at a compiler error's position | `target/volec query show FILE:LINE` (`--with-comments`: its section comment too) |
 | a module's `use` lines, header comment, extern blocks | `target/volec query show MODULE::use` (`::header`, `::extern`) |
 | change a module's `use` lines or header comment | `target/volec edit patch\|replace MODULE::use` (`MODULE::header`, `MODULE::extern`; `edit insert --after MODULE::use`, `edit delete`) |
-| lines of any file (a test, a fixture, conflict markers), a small file | `target/volec query text FILE:A-B`, `query show FILE.vl` |
+| lines of any file (a test, a fixture, conflict markers), a small file (a source, a shader's `.wgsl`, a README) | `target/volec query text FILE:A-B`, `query show FILE` |
+| text in a file that is no source: a shader a program embeds, a README, a script | `target/volec query grep TEXT --in FILE` (a `.wgsl` of the program: code or comment; another file: as text; a FILE given as a pattern is `query.not-in-program`, never `0 hits`) |
+| change a shader's file, checked; a text file git tracks, not checked | `target/volec edit patch x.wgsl --old A --new B` (the program that embeds it validates it: `--root DIR/main.vl`, or a path under DIR); `edit patch README.md --old A --new B` (exact match, `--nth N`, `--all`, `--dry-run`; `volec undo`) |
 | merge conflicts: the regions, their items, both sides; resolve one | `target/volec query conflicts [FILE] [--show]`; `target/volec edit resolve FILE:LINE\|NAME --ours\|--theirs\|--both` (`< text`, `--all`) |
 | change a few lines inside an item (a condition, a statement; FILE:LINE: a comment between items too) | `target/volec edit patch NAME\|FILE:LINE --old 'TEXT' --new 'TEXT'` (pairs repeat; several lines: `< pairs` or `--pairs FILE`, blocks `<<<<<<< OLD` / `=======` / `>>>>>>> NEW`; `--loose` for other indentation; OLD there several times: `--nth N`, `--all`) |
 | add statements inside an item | `target/volec edit insert --in NAME --after\|--before 'ANCHOR' < text` |
@@ -145,7 +155,8 @@ tools` the ones a program needs.
 | split a module into files | `target/volec refactor split MODULE --plan` (then `--auto`, or `--into M --items a,b`; `--names a,b`; `--reexport` leaves code outside as it is; `--header TEXT`) |
 | several changes, checked once, all or nothing | `target/volec refactor --script steps.txt` (one command per line; `<<END` ... `END` gives one its stdin) |
 | several queries and edits in one call, outputs under `## $ volec ARGS` lines | `target/volec batch < cmds.txt` (one command per line; `--stop` at the first failure) |
-| the errors, one per line (front end only) | `target/volec check` |
+| the errors, one per line (front end only); `ok: 0 errors in ROOT (N files, M shaders)` names what was checked | `target/volec check` (no ROOT: `./main.vl`, else the compiler) |
+| check after edits with no hook: every program the files changed since the branch's base belong to (shaders too), and `fmt --check` of them | `target/volec check --changed` (`--since REV`) |
 | build a program and run it: DIR/main.vl (DIR: `.`), rebuilt only when it changed, kept in volec's cache (0.25.4) | `target/volec run [DIR] [OPTIONS] [-- ARGS]` (a build's options; off a terminal only the program's output, its exit status volec's; `run --help`) |
 | build what changed and run the tests; counts, then each failure | `target/volec test [FILTER...]` (a program: `tests/NAME.in`/`.out`; `--full`, `--budget N`; what tests print: under a failure, every test's with `--show-output`) |
 | a crash's line and callers; values at a line as the program runs; a failing input made small | `target/volec test` (built with `--trace`), `target/volec probe FILE:LINE EXPR... -- ARGS`, `target/volec reduce FILE --until 'CMD'` (`guide debug`) |
@@ -1028,7 +1039,7 @@ when it was given, names quoted for the shell when they need it).
 error query.no-match: no definition 'run_gnv'
 try: target/volec query def crate::middle::gvn::run_gvn
 note query.alias: 'MyVec' is an import alias in crate, for crate::myvec::Vec
-error query.no-root: no root (VOLE_ROOT, ./main.vl, ./compiler/src/main.vl)
+error query.no-root: no root (VOLE_ROOT, ./main.vl, a main.vl above, ./compiler/src/main.vl)
 try: target/volec query def main path/to/main.vl
 warning query.program-errors: 4 errors in the program; results may be incomplete
 try: target/volec --diagnostics=short broken/main.vl -c -o /dev/null

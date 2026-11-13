@@ -249,7 +249,7 @@ $ git add -N fees.vl && git diff --stat
  6 files changed, 29 insertions(+), 27 deletions(-)
 $ volec check && volec main.vl -o library && ./library | diff before.txt - && echo same output
 same output
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (6 files, 0 shaders)
 ok: built library
 ```
 

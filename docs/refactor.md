@@ -18,6 +18,7 @@ volec edit patch TARGET [--loose] < PAIRS   (0.12; see "Edits inside an item")
 volec edit patch TARGET --pairs FILE [--loose]   (0.13)
 volec edit patch [TARGET] --old A --new B --in NAME --old C --new D   (0.15: several targets)
 volec edit patch [TARGET] [--old A --new B]... --pairs FILE   (0.25.5: both; `@@ FILE` blocks)
+volec edit patch FILE --old A --new B   (0.29: FILE a shader's .wgsl of the program, checked; or a text file git tracks, exact match, not checked)
 volec edit patch FILE:LINE --old '' --new TEXT   (0.25.5: TEXT inserted above the line)
 volec edit apply [FILE]                     (0.15) several items' new text, one edit
 volec edit insert --in TARGET --after|--before ANCHOR [--loose] < TEXT

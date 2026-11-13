@@ -4,7 +4,7 @@
 ## refactor extension (a program, or --all; the build compared).
 ## Every mention, in a source's strings and comments, in either case:
 $ query grep --ignore-case --strings --comments tachyon
-error query.no-root: no root (VOLE_ROOT, ./main.vl, ./compiler/src/main.vl)
+error query.no-root: no root (VOLE_ROOT, ./main.vl, a main.vl above, ./compiler/src/main.vl)
 try: volec query grep tachyon path/to/main.vl
 [exit 2]
 ## A dry run with the per-file summary and the diff; an exclusion file

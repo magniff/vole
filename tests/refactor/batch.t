@@ -62,7 +62,7 @@ pub fn clamp(v: i64, lo: i64, hi: i64) -> i64 {
     v
 }
 #> $ volec check
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (2 files, 0 shaders)
 % git checkout -q calc.vl
 $ batch $T/inputs/batch-edit.txt >/dev/null
 [exit 1]

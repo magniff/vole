@@ -42,7 +42,7 @@ $ fix --suggested --dry-run
 $ fix --suggested
 fixed 5 suggested fixes	main.vl	+4 -4 lines
 $ check
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (1 file, 0 shaders)
 $ refactor inline mask
 inlined crate::mask at 1 call, deleted it	main.vl	+1 -5 lines
 $ rewrite '$a & !$b' --list
