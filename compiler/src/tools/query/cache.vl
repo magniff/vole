@@ -31,7 +31,7 @@
 // checker's bck-*.bin is one file of a few KB per compiler and std.
 
 use crate::base::{
-    buf_byte, buf_bytes, buf_freeze, buf_len, buf_new, buf_ptr, buf_reserve, buf_set, buf_slice,
+    buf_byte, buf_bytes, buf_copy, buf_freeze, buf_len, buf_new, buf_ptr, buf_reserve, buf_set,
     buf_str, buf_truncate, buf_zeros, c_bytes, fclose, fopen, fwrite, get_src, memcpy,
     restore_sources, restore_sym, strlen, sym_hash, sym_text,
 };
@@ -98,6 +98,15 @@ fn put(b: i64, v: i64) {
         let at = buf_zeros(b, 8);
         let p = (buf_ptr(b).add(at as usize)) as *mut i64;
         (*p.add(0)) = v;
+    }
+}
+
+// Word k of cache buffer b becomes v (a header's word, known when the
+// body is written): its eight bytes, low first, as put writes a word
+// on the machines the compiler runs on.
+fn set_word(b: i64, k: i64, v: i64) {
+    for j in 0..8 {
+        crate::base::buf_set(b, 8 * k + j, ((v >> (8 * j)) & 255) as u8);
     }
 }
 
@@ -220,8 +229,7 @@ fn embedded_hash(path: &[u8], pcx: &Ctx<Comp>) -> i64 {
     if !read_embedded(path, b, pcx) {
         return -1;
     }
-    let text = buf_slice(b);
-    (hash_region(text.ptr, text.len() as i64) >> 1) as i64
+    (hash_region(buf_ptr(b), buf_len(b)) >> 1) as i64
 }
 
 // The hash of buffer b's words from word `from` on (a cache file's body:
@@ -246,18 +254,17 @@ pub fn ident(pcx: &mut Ctx<Comp>) -> i64 {
             return pcx.ident;
         }
         pcx.ident = 0;
+        let name = if pcx.prog != 0 as *mut u8 { crate::base::cstr(pcx.prog) }
+            else { Vec::new_in(Comp {}) };
         let mut slash = false;
-        let mut i: i64 = 0;
-        while pcx.prog != 0 as *mut u8 && (*pcx.prog.add(i as usize)) != 0 {
-            slash = slash || (*pcx.prog.add(i as usize)) == b'/';
-            i += 1;
+        for &c in name.as_slice() {
+            slash = slash || c == b'/';
         }
         // (0.25.3: `volec` run from $PATH, without a `/`, is the file the
         // shell found; it had no cache before)
         let mut exe = pcx.prog;
         if !slash && pcx.prog != 0 as *mut u8 {
-            exe = crate::tools::proc::find_in_path(
-                std::slice::from_raw_parts(pcx.prog.add((0) as usize), (i - (0)) as usize), pcx);
+            exe = crate::tools::proc::find_in_path(&name, pcx);
         }
         let b = buf_new();
         if exe != 0 as *mut u8 && read_file_if(exe, b) {
@@ -661,9 +668,9 @@ fn restore_tables(tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) {
         tcx.c_keyword.push(tcx_arg);
         for _ in 0..3 {
             let text = get_str(tcx);
-            tcx.c_eff_text.push(buf_slice(tcx.c_eff_buf).len() as i64);
+            tcx.c_eff_text.push(buf_len(tcx.c_eff_buf));
             buf_bytes(tcx.c_eff_buf, text);
-            tcx.c_eff_text.push(buf_slice(tcx.c_eff_buf).len() as i64);
+            tcx.c_eff_text.push(buf_len(tcx.c_eff_buf));
         }
     }
     for _ in 0..get_count(1, tcx) {
@@ -817,7 +824,7 @@ fn write_atomic(b: i64, path: *mut u8) -> bool {
         buf_str(tmp, c".tmp");
         crate::base::buf_int(tmp, getpid() as i64);
         buf_byte(tmp, 0);
-        if !write_file_if(buf_ptr(tmp), buf_slice(b)) {
+        if !write_file_if(buf_ptr(tmp), &buf_copy(b)) {
             crate::tools::proc::remove_file(buf_ptr(tmp));
             return false;
         }
@@ -851,8 +858,7 @@ fn save(root: *mut u8, target: i64, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) {
                     | ((all[(i + 2) as usize]) & 63));
             i += 3;
         }
-        let refs_header = buf_ptr(r) as *mut i64;
-        (*refs_header.add(4)) = body_hash(r, 5);
+        set_word(r, 4, body_hash(r, 5));
         let b = buf_new();
         put(b, MAGIC);
         put(b, VERSION);
@@ -873,7 +879,7 @@ fn save(root: *mut u8, target: i64, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) {
             put(b, pcx.files[f].end);
             put(b, pcx.files[f].module);
             put(b, pcx.files[f].kind);
-            let made = (*path.add(0)) == b'<';
+            let made = crate::base::c_starts(path, b"<");
             put(b, if made { 1 } else { 0 });
             if made {
                 put_str(b, &get_src()[pcx.files[f].start as usize..pcx.files[f].end as usize]);
@@ -892,9 +898,8 @@ fn save(root: *mut u8, target: i64, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) {
         }
         save_tables(b, tcx, pcx);
         // (the number of words, in the header)
-        let header = buf_ptr(b) as *mut i64;
-        (*header.add(3)) = buf_len(b) / 8;
-        (*header.add(4)) = body_hash(b, USED_WORD + 1);
+        set_word(b, 3, buf_len(b) / 8);
+        set_word(b, 4, body_hash(b, USED_WORD + 1));
         // (0.28.0: the .bin first, then the references: a program in the
         // directory always has a .bin, or one being written, with its time,
         // for another process's evict. A reader between the two has a miss:
@@ -958,12 +963,12 @@ fn save_tables(b: i64, tcx: &Tcx<Comp>, pcx: &mut Ctx<Comp>) {
         let set = buf_new();
         let lines = buf_new();
         cache_texts(d, set, lines, tcx, pcx);
-        put_str(b, buf_slice(set));
-        put_str(b, buf_slice(lines));
+        put_str(b, &buf_copy(set));
+        put_str(b, &buf_copy(lines));
         // (0.19: what it needs beyond the build's features)
         let feats = buf_new();
         crate::tools::query::features::def_features_text(feats, d, tcx, pcx);
-        put_str(b, buf_slice(feats));
+        put_str(b, &buf_copy(feats));
     }
     put_ints(b, pcx.mod_def.as_slice());
     put_ints(b, tcx.aliases.as_slice());
@@ -1002,14 +1007,14 @@ fn save_tables(b: i64, tcx: &Tcx<Comp>, pcx: &mut Ctx<Comp>) {
     let mut e: i64 = 0;
     while e < errors.len() as i64 {
         put(b, (errors[e as usize]));
-        put_str(b, buf_slice((errors[(e + 1) as usize])));
+        put_str(b, &buf_copy((errors[(e + 1) as usize])));
         e += 2;
     }
     put(b, warnings.len() as i64 / 3);
     let mut w: i64 = 0;
     while w < warnings.len() as i64 {
         put(b, (warnings[w as usize]));
-        put_str(b, buf_slice((warnings[(w + 1) as usize])));
+        put_str(b, &buf_copy((warnings[(w + 1) as usize])));
         put(b, (warnings[(w + 2) as usize]));
         w += 3;
     }

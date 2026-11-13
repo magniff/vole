@@ -216,11 +216,13 @@ n=$(printf '%s\n' "$out" | grep -c "^compiler/src/[a-z_0-9/]*\.vl${TAB}[0-9]*\$"
     && printf '%s\n' "$err" | head -1 | grep -q '^note query.truncated: [0-9]* refs in [0-9]* files$' \
     && [ "$(printf '%s\n' "$err" | grep -c '^try: .* query refs IntVec::push --')" = 3 ] && ok=1
 check self_refs_budget "$ok" "$(printf '%s\n' "$out" "$err" | tail -6)"
-out=$("$COMPILER" query refs IntVec::push --in compiler/src/base/mod.vl 2>&1)
+# (0.29: buf_reserve, which base/mod.vl still calls; IntVec::push has no
+# caller left there)
+out=$("$COMPILER" query refs base::buf_reserve --in compiler/src/base/mod.vl 2>&1)
 ok=0
 n=$(printf '%s\n' "$out" | grep -c "^[0-9]*:[0-9]*${TAB}call${TAB}base::[A-Za-z_:]*${TAB}")
 [ "$n" -ge 1 ] && printf '%s\n' "$out" | head -1 | grep -q '^# compiler/src/base/mod.vl$' \
-    && printf '%s\n' "$out" | grep -q "^[0-9]*:[0-9]*${TAB}def${TAB}pub fn push(" && ok=1
+    && printf '%s\n' "$out" | grep -q "^[0-9]*:[0-9]*${TAB}def${TAB}pub fn buf_reserve(" && ok=1
 check self_refs_in_file "$ok" "$(printf '%s\n' "$out" | head -5)"
 out=$("$COMPILER" query refs IntVec::push --in gvn --limit 5 2>&1)
 ok=0
