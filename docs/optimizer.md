@@ -2941,3 +2941,77 @@ tests, once the loop is rotated, are about the header's phi (and one
 against a phi of two zeros, folded only after the ranges).
 tests/run/opt_range_zero_tests.vl.
 
+**Measured: two experiments** (the plan of the compiler's raw tables
+becoming `Vec`: E2, every index of an IntVec checked through `Index`,
+against its capacity, 4592 sites; E3, `cx.insts` a checked `Vec<Inst,
+A>`, 2810 sites; neither is in the tree). Instructions retired by `volec
+check` and by a cold self-build (`--no-cache`), the fewest of 3, each
+compiler on the same source (the tree before these changes), one
+session at a 1-minute load of 4.7 to 6.9; "before" is the optimizer
+before these changes, "after" with them, each experiment built by the
+optimizer of its row:
+
+| compiler | check | self-build | over its base |
+|---|---:|---:|---|
+| base, before | 21.324 G | 107.023 G | |
+| E2, before | 21.586 G | 115.091 G | +1.2% / +7.5% |
+| E3, before | 21.331 G | 116.699 G | +0.0% / +9.0% |
+| base, after | 21.172 G | 103.443 G | (-0.7% / -3.3% of the base before) |
+| E2, after | 21.661 G | 111.330 G | +2.3% / +7.6% |
+| E3, after | 21.236 G | 109.763 G | +0.3% / +6.1% |
+
+The panic blocks' rule is nearly all of it (the zero tests: check -0.5%,
+self-build -0.1%). The tree itself gained more than the experiments
+lost of their distance: E3 costs 6.3 G where it cost 9.7 G, E2 7.9 G
+where it cost 8.1 G. The price: a program that inlines much of std
+compiles dearer, tests/cost/std_heavy.vl 1225.9 M to 1276.6 M (+4.1%;
+the compile-cost row 1.01x to 1.05x of 0.28.0): more inlined checks,
+each decided again in its caller (`loops: folding by ranges` +21% on
+it, gvn +3.5%); hello, check and regions are the same or cheaper.
+
+By pass (`--time-passes=passes`, after), E3 pays in `loops: folding by
+ranges` (+24%), sccp (+13%), constant slots (+17%), loop rotation
+(+14%), gvn (+5%); E2 in gvn (+12%), the inliner (+22%), scalar
+promotion (+19%), strength reduction (+13%), the ranges (+9%).
+
+**Measured and left** (each on the trees above):
+
+- *After a call that takes the context, the table's pointer and length
+  are read again and the index is checked again* (`range::rem_below` in
+  E3: three accesses of `cx.insts[r]`, two calls between, two checks):
+  the callee takes `&mut FnCtx` and may push. A call that takes `&Cx`
+  costs nothing (the header and the check survive it). What it needs:
+  for each function and reference parameter, whether it (and what it
+  calls with the parameter) stores into a Vec header of the referent;
+  the stores of today's callees go through raw tables of the context,
+  which may point anywhere, so the summary would say "unknown" for
+  nearly all until those tables are Vecs too. This is most of what E3
+  still costs. Not done.
+- *A store to one Vec's element makes the header of another Vec of the
+  same struct be read again* (`t.b[i] = ..` between two `t.a[i]`: two
+  loads and one check more). A third Vec fact, "a Vec's buffer does not
+  hold the object that holds the Vec", is sound by the argument of the
+  second and removes it (12 lines in `vecfacts::vec_apart`, a test).
+  Measured: the self-build +3.0% and check +2.8% (gvn +10.2%: the
+  headers that now survive each store are each asked about again at
+  every later store, through `vec_header_in`'s scan of the struct's
+  fields; licm +6.8%; borrowck's own code +7.3%; 11 more loops
+  vectorized, 73 to 84), and E3 no nearer its base (5.9% against 6.1%).
+  Left out; it will be wanted when a context holds several hot Vecs,
+  with a cheaper `may_alias` for the entries that survive.
+- *The small leaf's limit at 8* (`INLINE_LEAF`, 6): the base 1.8%
+  dearer, E3 1.7% dearer, E2 0.2% cheaper. Left at 6. A checked
+  accessor of a Vec in a struct is 8 without its report (two loads, the
+  compare and branch, shift, add, load, return) and one of a slice 6.
+- *`#[inline]` on E2's `Index` and `IndexMut`* (the source's choice, not
+  the optimizer's): 111.3 G to 108.8 G, +7.6% to +5.2% over the base;
+  without it 2605 of the 4592 sites stay calls of a 7-instruction
+  function, charged to a budget that is spent.
+- *`ir_val`, `ir_arg`, `ir_operand` taking `&mut FnCtx` in place of
+  `*mut FnCtx`* (24 functions take the raw pointer, for which the
+  optimizer has no fact): E3 109.90 G against 109.70 G, nothing: the
+  three are inlined into callers that hold the reference.
+- *`while !r.is_empty() { .. r[0] ..; r = &r[1..]; }`* keeps its two
+  checks (above); and a check after a merge where one arm made a call
+  (a partial redundancy) stays.
+
