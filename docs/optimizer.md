@@ -3015,3 +3015,117 @@ promotion (+19%), strength reduction (+13%), the ranges (+9%).
   checks (above); and a check after a merge where one arm made a call
   (a partial redundancy) stays.
 
+
+## 0.29: Vec headers across calls
+
+After a call that took the context by `&mut`, a Vec's pointer and
+length were read again and the index checked again: nothing said the
+callee had left the header alone (above, "Measured and left"). Now each
+function has a summary of the Vec headers it may write, and value
+numbering and LICM keep a header across a call whose summary does not
+reach it (`middle/callfacts.vl`, whose first comment is the full
+statement of the rules).
+
+**The summary** is bits of `FN_ATTRS` (`ipo.vl`), so it is inferred
+bottom-up with the attributes, by the same iteration in a recursive
+component (everything assumed, then taken away; not settled in 16
+rounds: unknown), read under `fn_facts_ready`, and part of the code
+cache's `R_ATTRS` fact; no table and no static were added. It says:
+`HW_KNOWN`, every write of the function (and of what it calls) is at a
+place of a known kind; `HW_STATIC`, it may write a Vec header in a
+static; `HW_RESULT`, through its result pointer; a bit for each of its
+first 8 call operands, through that operand; and for the first operand
+that has its bit, the range of offsets (in words) its writes are in.
+`--print-attrs` prints it: `headers()` (it writes none),
+`headers(0@24..48)` (through operand 0, bytes 24 to 48 from it),
+`headers(static result 1)`; nothing when unknown.
+
+A write is classified by its address (`write_at`):
+
+| the address | the summary |
+|---|---|
+| a frame slot of the function, constant data | nothing |
+| a static, plus offsets | `HW_STATIC`, unless the static's type has no Vec header where the write is |
+| a pointer parameter (a reference, a raw pointer, a slice's pointer), plus offsets | the operand's bit and range, unless the parameter is a reference whose referent's type has no Vec header where the write is |
+| the result pointer | `HW_RESULT` |
+| made by additions from the `ptr` loaded from a Vec header that is where a type says (in a reference parameter's referent, a static, a slot): an element | nothing |
+| made by additions from the result of C's allocator in this function (`malloc`, `calloc`, `realloc`; through phis with null and dangling constants) | nothing |
+| a phi of addresses | each one's |
+| anything else: a pointer loaded from memory that no type says is a Vec's buffer, a raw pointer of unknown origin, a number made a pointer | unknown |
+
+An atomic or a fence, an indirect call, a call of a C function that is
+not in std's table (or is variadic, or waits for or starts a thread)
+and a callee whose summary is unknown make the summary unknown. A call
+adds its callee's bits, each operand's where that operand's address is
+by the same table (the callee's range becomes a write of that range at
+the operand). C's table (`front/effects/builtin.vl`) gained a class for
+the functions that write nothing (`strlen`, `memcmp`, ...: `C_READS`);
+the allocator's functions write no header; the other table functions
+write through the pointers they are given. Two things are not counted,
+because nothing after the call can see them: the writes of a block from
+which no `ret` is reached (a failed check's report), and a callee that
+does not return.
+
+**What the caller concludes** (`call_keeps_header`), for a Vec header
+at a place a type names (`header_place`: a reference parameter's
+referent under `noalias_active`, a static of this program, a frame
+slot):
+
+- in a slot: kept unless a marked operand may be that slot (the same
+  slot at an offset the range covers, or an address of unknown origin);
+- in a static: kept unless `HW_STATIC`, or a marked operand may be it;
+- in a reference parameter's referent: the referent is written, while
+  the function runs, only through pointers made from the parameter
+  (0.17's rule, `param_frozen`), so kept unless a marked operand is made
+  from the parameter and its range covers the header, or is of unknown
+  origin.
+
+An element's address (a buffer) is never the header: the buffer is a
+heap block the Vec owns, no static, no slot, and not the object that
+holds the Vec. What unsafe code must keep for this is in `guide unsafe`:
+a Vec's buffer is its allocator's block, and a `&mut` is the only way
+to its memory.
+
+**The cost of asking.** Value numbering asks at every call, for every
+location it knows; an AVAIL entry has a sixth value, whether the
+location is a `header_place`, asked once. And `vec_header_in`, a walk
+of the type's fields that the alias analysis made at every store for
+every known location of the same object (1.3% of the self-build's
+samples before this change), is kept per task by (type, offset, size):
+`vec_header_at` (cleared in `begin_task`: a pool's context outlives a
+program's types).
+
+Tests: `opt_callfacts_keep` (after each kind of callee there is no
+second compare: a scalar field, an element, a push to another Vec of
+the struct, a local Vec, nested callees, recursion, a local Vec lent, a
+reader), `opt_callfacts_reload` (the header is read again: a push, a
+truncation, a raw pointer kept in a struct and written through later, a
+raw pointer parameter, an indirect call, recursion that pushes, a local
+whose address a struct holds, a write through the second operand, bytes
+written through a loaded raw pointer in a loop).
+
+**Measured** (instructions retired, the fewest of 3, `VOLE_CACHE=off`,
+each compiler built by itself, both on the source of the tree before
+the change; the machine shared, a 1-minute load of 7 to 15): `volec
+check` 22.954 G before, 22.913 G after (-0.2%); the cold self-build
+127.498 G before, 126.612 G after (-0.7%). By pass
+(`--time-passes=passes`): licm -32.7% and gvn -1.0%, nearly all of it
+`vec_header_at`; the inference of the summary is +0.2 G (the row its
+phase is counted in, `tail recursion`, +13.5%); the other passes within
+1.5% either way. The compile-cost rows against 0.28.0: hello 1.03x
+before and 1.02x after, std 1.16x and 1.16x (1403.3 M and 1413.0 M),
+check 1.01x and 1.00x, regions 1.01x and 1.00x.
+
+The fact itself gives little yet, and the reason is in the summaries:
+of the compiler's functions with attributes, 3630 have a known summary
+and 2777 of them write no header; the others are unknown for an honest
+reason: 750 make an indirect call, and most of the rest store through
+a raw pointer that no type calls a Vec's buffer (`IntVec::push`,
+`buf_new`, `buf_str`, `intern_c` and what calls them). A callee that
+pushes to an IntVec of the context is unknown; once that field is a
+`Vec`, the same callee is `headers(0@A..B)`, the range of that one
+header, and the context's other Vecs stay known across the call. The
+self-build stays about 18% above 0.28.0's 107 G: what the summary can
+give grows with each raw table that becomes a Vec, and a check whose
+index is data (an operand read from an instruction) stays a compare
+and a branch whatever is known of the header.
