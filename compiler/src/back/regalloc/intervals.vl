@@ -18,7 +18,7 @@ use crate::back::regalloc::prepare::{
     bit_clear, bit_set, is_fused_compare, is_live_use, live_set, term_uses, tracked, use_kind,
 };
 use crate::back::regalloc::scan::{is_allocatable, is_callee_saved_reg};
-use crate::base::{IntVec, alloc_array, die, free, grow, sym_text};
+use crate::base::{alloc_array, die, free, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::target::get_x86;
@@ -31,129 +31,105 @@ use crate::middle::ir::Op::{
 
 // ---- Intervals ----
 
-fn iv_new(cx: &mut FnCtx, t: i64) -> i64 {
-    unsafe {
-        cx.ivs = grow(cx.ivs, cx.iv_count, &mut cx.iv_cap);
-        let i = cx.iv_count;
-        (*cx.ivs.add(i as usize)) = Interval {
-            value: t, reg: UNASSIGNED,
-            ranges: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
-            uses: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
-            next: -1,
-        };
-        cx.iv_count += 1;
-        i
+fn iv_new(cx: &mut FnCtx<Comp>, t: i64) -> i64 {
+    let i = cx.ivs.len() as i64;
+    cx.ivs.push(Interval {
+        value: t, reg: UNASSIGNED,
+        ranges: Vec::new_in(Comp {}),
+        uses: Vec::new_in(Comp {}),
+        next: -1,
+    });
+    i
+}
+
+// Drops every interval (their ranges and uses with them) and empties the
+// fixed ones' ranges, which keep their room for the next function.
+fn iv_reset(cx: &mut FnCtx<Comp>) {
+    cx.ivs.clear();
+    for r in 0..cx.fixed.len() {
+        cx.fixed[r].clear();
     }
 }
 
-// Frees every interval (and the fixed ones' ranges).
-fn iv_reset(cx: &mut FnCtx) {
-    unsafe {
-        for i in 0..cx.iv_count {
-            free((*cx.ivs.add(i as usize)).ranges.data as *mut u8);
-            free((*cx.ivs.add(i as usize)).uses.data as *mut u8);
-        }
-        cx.iv_count = 0;
-        for r in 0..64 {
-            free((*cx.fixed.add(r as usize)).data as *mut u8);
-            (*cx.fixed.add(r as usize)) = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        }
-    }
+pub fn ra_start(cx: &mut FnCtx<Comp>, i: i64) -> i64 {
+    cx.ivs[i as usize].ranges[0]
 }
 
-pub fn ra_start(cx: &mut FnCtx, i: i64) -> i64 {
-    unsafe { (*(*cx.ivs.add(i as usize)).ranges.data.add(0)) }
-}
-
-pub fn ra_end(cx: &mut FnCtx, i: i64) -> i64 {
-    unsafe { (
-        *(*cx.ivs.add(i as usize)).ranges.data.add(
-            ((*cx.ivs.add(i as usize)).ranges.count - 1) as usize)) }
+pub fn ra_end(cx: &mut FnCtx<Comp>, i: i64) -> i64 {
+    let ranges = &cx.ivs[i as usize].ranges;
+    ranges[ranges.len() - 1]
 }
 
 // While building (backwards), ranges and uses are kept in descending
 // order, then reversed.
 
 // Adds [from, to) below the ranges so far (merging with the lowest one).
-fn rev_add_range(list: *mut IntVec, from: i64, to: i64) {
-    unsafe {
-        let n = list.count;
-        if n > 0 && to >= (*list.data.add((n - 2) as usize)) {
-            if from < (*list.data.add((n - 2) as usize)) {
-                (*list.data.add((n - 2) as usize)) = from;
-            }
-            if to > (*list.data.add((n - 1) as usize)) {
-                (*list.data.add((n - 1) as usize)) = to;
-            }
-            return;
+fn rev_add_range(list: &mut Vec<i64, Comp>, from: i64, to: i64) {
+    let n = list.len();
+    if n > 0 && to >= list[n - 2] {
+        if from < list[n - 2] {
+            list[n - 2] = from;
         }
-        list.push(from);
-        list.push(to);
+        if to > list[n - 1] {
+            list[n - 1] = to;
+        }
+        return;
     }
+    list.push(from);
+    list.push(to);
 }
 
-fn rev_add_use(cx: &mut FnCtx, t: i64, pos: i64, kind: i64) {
-    unsafe {
-        let i = (*cx.rv_first.add(t as usize));
-        let n = (*cx.ivs.add(i as usize)).uses.count;
-        if n > 0 && (*(*cx.ivs.add(i as usize)).uses.data.add((n - 2) as usize)) == pos {
-            if kind > (*(*cx.ivs.add(i as usize)).uses.data.add((n - 1) as usize)) {
-                (*(*cx.ivs.add(i as usize)).uses.data.add((n - 1) as usize)) = kind;
-            }
-            return;
+fn rev_add_use(cx: &mut FnCtx<Comp>, t: i64, pos: i64, kind: i64) {
+    let i = cx.rv_first[t as usize];
+    let uses = &mut cx.ivs[i as usize].uses;
+    let n = uses.len();
+    if n > 0 && uses[n - 2] == pos {
+        if kind > uses[n - 1] {
+            uses[n - 1] = kind;
         }
-        (*cx.ivs.add(i as usize)).uses.push(pos);
-        (*cx.ivs.add(i as usize)).uses.push(kind);
+        return;
     }
+    uses.push(pos);
+    uses.push(kind);
 }
 
 // Value t is used at `pos` (in the block starting at `start`).
-fn ra_add_use(cx: &mut FnCtx, t: i64, start: i64, pos: i64, kind: i64, live: *mut u64) {
-    unsafe {
-        let i = (*cx.rv_first.add(t as usize));
-        rev_add_range(&mut (*cx.ivs.add(i as usize)).ranges, start, pos + 1);
-        rev_add_use(cx, t, pos, kind);
-        bit_set(live, t);
-    }
+fn ra_add_use(cx: &mut FnCtx<Comp>, t: i64, start: i64, pos: i64, kind: i64, live: *mut u64) {
+    let i = cx.rv_first[t as usize];
+    rev_add_range(&mut cx.ivs[i as usize].ranges, start, pos + 1);
+    rev_add_use(cx, t, pos, kind);
+    bit_set(live, t);
 }
 
 // Value t is defined at `pos` (in the block starting at `start`).
-fn add_def(cx: &mut FnCtx, t: i64, start: i64, pos: i64, kind: i64, live: *mut u64) {
-    unsafe {
-        let i = (*cx.rv_first.add(t as usize));
-        let n = (*cx.ivs.add(i as usize)).ranges.count;
-        if n > 0 && (*(*cx.ivs.add(i as usize)).ranges.data.add((n - 2) as usize)) == start
-            && (*(*cx.ivs.add(i as usize)).ranges.data.add((n - 1) as usize)) > pos {
-            (*(*cx.ivs.add(i as usize)).ranges.data.add((n - 2) as usize)) = pos;
-        } else {
-            // Never used after: it still needs a place to be written.
-            (*cx.ivs.add(i as usize)).ranges.push(pos);
-            (*cx.ivs.add(i as usize)).ranges.push(pos + 1);
-        }
-        if kind != USE_NONE {
-            rev_add_use(cx, t, pos, kind);
-        }
-        bit_clear(live, t);
+fn add_def(cx: &mut FnCtx<Comp>, t: i64, start: i64, pos: i64, kind: i64, live: *mut u64) {
+    let i = cx.rv_first[t as usize];
+    let ranges = &mut cx.ivs[i as usize].ranges;
+    let n = ranges.len();
+    if n > 0 && ranges[n - 2] == start && ranges[n - 1] > pos {
+        ranges[n - 2] = pos;
+    } else {
+        // Never used after: it still needs a place to be written.
+        ranges.push(pos);
+        ranges.push(pos + 1);
+    }
+    if kind != USE_NONE {
+        rev_add_use(cx, t, pos, kind);
+    }
+    bit_clear(live, t);
+}
+
+fn reverse_pairs(list: &mut Vec<i64, Comp>) {
+    let n = list.len() / 2;
+    for i in 0..n / 2 {
+        let j = n - 1 - i;
+        list.swap(2 * i, 2 * j);
+        list.swap(2 * i + 1, 2 * j + 1);
     }
 }
 
-fn reverse_pairs(list: *mut IntVec) {
-    unsafe {
-        let n = list.count / 2;
-        for i in 0..n / 2 {
-            let j = n - 1 - i;
-            let a = (*list.data.add((2 * i) as usize));
-            let b = (*list.data.add((2 * i + 1) as usize));
-            (*list.data.add((2 * i) as usize)) = (*list.data.add((2 * j) as usize));
-            (*list.data.add((2 * i + 1) as usize)) = (*list.data.add((2 * j + 1) as usize));
-            (*list.data.add((2 * j) as usize)) = a;
-            (*list.data.add((2 * j + 1) as usize)) = b;
-        }
-    }
-}
-
-fn add_fixed(cx: &mut FnCtx, r: i64, from: i64, to: i64) {
-    unsafe { rev_add_range(cx.fixed.add(r as usize), from, to); }
+fn add_fixed(cx: &mut FnCtx<Comp>, r: i64, from: i64, to: i64) {
+    rev_add_range(&mut cx.fixed[r as usize], from, to);
 }
 
 // ---- Calls that return twice ----
@@ -174,7 +150,7 @@ fn sym_is(name: i64, s: &[u8], pcx: &Ctx<Comp>) -> bool {
     sym_text(name, pcx) == s
 }
 
-pub fn is_returns_twice_call(cx: &mut FnCtx, v: i64, pcx: &Ctx<Comp>) -> bool {
+pub fn is_returns_twice_call(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) -> bool {
     unsafe {
         let op = (*cx.insts.add(v as usize)).op;
         let mut name: i64 = 0;
@@ -192,7 +168,7 @@ pub fn is_returns_twice_call(cx: &mut FnCtx, v: i64, pcx: &Ctx<Comp>) -> bool {
     }
 }
 
-pub fn calls_returns_twice(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> bool {
+pub fn calls_returns_twice(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
     unsafe {
         for b in (*get_irfuncs().add(fi as usize)).blocks.items() {
             if (*cx.blocks.add(b as usize)).removed == 0 {
@@ -210,7 +186,7 @@ pub fn calls_returns_twice(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> bool {
 }
 
 // Registers clobbered by the instruction at p (besides its result).
-fn add_clobbers(cx: &mut FnCtx, v: i64, p: i64, pcx: &Ctx<Comp>) {
+fn add_clobbers(cx: &mut FnCtx<Comp>, v: i64, p: i64, pcx: &Ctx<Comp>) {
     unsafe {
         let op = (*cx.insts.add(v as usize)).op;
         if op.is_call() {
@@ -262,7 +238,7 @@ fn add_clobbers(cx: &mut FnCtx, v: i64, p: i64, pcx: &Ctx<Comp>) {
 
 // The pieces of call v's aggregate result (PIECE instructions after it in
 // its block): defined by the call, in its result registers (as hints).
-fn add_piece_defs(cx: &mut FnCtx, v: i64, start: i64, p: i64, live: *mut u64, pcx: &Ctx<Comp>) {
+fn add_piece_defs(cx: &mut FnCtx<Comp>, v: i64, start: i64, p: i64, live: *mut u64, pcx: &Ctx<Comp>) {
     unsafe {
         // (0.17: only a call returning an aggregate has pieces; the scan of
         // the rest of the block for every call was quadratic in its calls)
@@ -282,9 +258,9 @@ fn add_piece_defs(cx: &mut FnCtx, v: i64, start: i64, p: i64, live: *mut u64, pc
                 let t = tracked(cx, w);
                 if t >= 0 {
                     add_def(cx, t, start, p + 2, USE_REG, live);
-                    if (*cx.rv_hreg.add(t as usize)) < 0 {
+                    if cx.rv_hreg[t as usize] < 0 {
                         let call_uses_c_v1 = call_uses_c(cx, v, pcx);
-                        (*cx.rv_hreg.add(t as usize)) = conv_return_piece_reg(cx, call_uses_c_v1,
+                        cx.rv_hreg[t as usize] = conv_return_piece_reg(cx, call_uses_c_v1,
                             (*cx.insts.add(w as usize)).imm, pcx);
                     }
                 }
@@ -295,13 +271,13 @@ fn add_piece_defs(cx: &mut FnCtx, v: i64, start: i64, p: i64, live: *mut u64, pc
 }
 
 // The hints of instruction v (at p): its result's register, its operands'.
-fn add_hints(cx: &mut FnCtx, v: i64, pcx: &Ctx<Comp>) {
+fn add_hints(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) {
     unsafe {
         let op = (*cx.insts.add(v as usize)).op;
         let t = tracked(cx, v);
         if op.is_call() {
-            if t >= 0 && (*cx.rv_hreg.add(t as usize)) < 0 {
-                (*cx.rv_hreg.add(t as usize)) = reg_ret(in_fregs((*cx.insts.add(v as usize)).ty,
+            if t >= 0 && cx.rv_hreg[t as usize] < 0 {
+                cx.rv_hreg[t as usize] = reg_ret(in_fregs((*cx.insts.add(v as usize)).ty,
                     pcx));
             }
             let mut locations: [i64; 64] = [0i64; 64];
@@ -313,9 +289,9 @@ fn add_hints(cx: &mut FnCtx, v: i64, pcx: &Ctx<Comp>) {
                 let ir_arg_v = ir_arg(cx, v, i);
                 let a = tracked(cx, ir_arg_v);
                 if a >= 0 && !xl_is_stack(locations[i as usize])
-                    && (*cx.rv_hreg.add(a as usize)) < 0
+                    && cx.rv_hreg[a as usize] < 0
                     && (*cx.regalloc_uses.add(ir_arg(cx, v, i) as usize)) == 1 {
-                    (*cx.rv_hreg.add(a as usize)) = arg_reg(locations[i as usize]);
+                    cx.rv_hreg[a as usize] = arg_reg(locations[i as usize]);
                 }
             }
             return;
@@ -325,10 +301,10 @@ fn add_hints(cx: &mut FnCtx, v: i64, pcx: &Ctx<Comp>) {
         }
         if op.is_binary() || op == Neg || op == BNot || op == Conv {
             let a = tracked(cx, (*cx.insts.add(v as usize)).a);
-            if a >= 0 && (*cx.rv_hint.add(t as usize)) < 0
+            if a >= 0 && cx.rv_hint[t as usize] < 0
                 && in_fregs((*cx.insts.add((*cx.insts.add(v as usize)).a as usize)).ty, pcx)
                 == in_fregs((*cx.insts.add(v as usize)).ty, pcx) {
-                (*cx.rv_hint.add(t as usize)) = a;
+                cx.rv_hint[t as usize] = a;
             }
         }
         // (0.19) An intrinsic whose instruction overwrites an operand: its
@@ -338,8 +314,8 @@ fn add_hints(cx: &mut FnCtx, v: i64, pcx: &Ctx<Comp>) {
             if k >= 0 {
                 let ir_operand_v = ir_operand(cx, v, k);
                 let a = tracked(cx, ir_operand_v);
-                if a >= 0 && (*cx.rv_hint.add(t as usize)) < 0 {
-                    (*cx.rv_hint.add(t as usize)) = a;
+                if a >= 0 && cx.rv_hint[t as usize] < 0 {
+                    cx.rv_hint[t as usize] = a;
                 }
             }
         }
@@ -350,25 +326,25 @@ fn add_hints(cx: &mut FnCtx, v: i64, pcx: &Ctx<Comp>) {
             // read): the one it replaces, else the other (an inverted cmov);
             // either way no movq first.
             let b = tracked(cx, (*cx.insts.add(v as usize)).b);
-            if b >= 0 && (*cx.rv_hint.add(b as usize)) < 0
+            if b >= 0 && cx.rv_hint[b as usize] < 0
                 && (*cx.regalloc_uses.add((*cx.insts.add(v as usize)).b as usize)) == 1 {
-                (*cx.rv_hint.add(b as usize)) = t;
+                cx.rv_hint[b as usize] = t;
             }
             let a = tracked(cx, (*cx.insts.add(v as usize)).a);
-            if (*cx.rv_hint.add(t as usize)) < 0 {
+            if cx.rv_hint[t as usize] < 0 {
                 if b >= 0 && (*cx.regalloc_uses.add((*cx.insts.add(v as usize)).b as usize)) == 1 {
-                    (*cx.rv_hint.add(t as usize)) = b;
+                    cx.rv_hint[t as usize] = b;
                 }
                 else if a >= 0
                     && (*cx.regalloc_uses.add((*cx.insts.add(v as usize)).a as usize)) == 1 {
-                    (*cx.rv_hint.add(t as usize)) = a;
+                    cx.rv_hint[t as usize] = a;
                 }
             }
         }
     }
 }
 
-pub fn build_intervals(cx: &mut FnCtx, pcx: &Ctx<Comp>) {
+pub fn build_intervals(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
     unsafe {
         iv_reset(cx);
         cx.clobbered.count = 0;
@@ -379,10 +355,10 @@ pub fn build_intervals(cx: &mut FnCtx, pcx: &Ctx<Comp>) {
         }
         cx.split_moves.count = 0;
         for t in 0..cx.ra_vals.count {
-            (*cx.rv_first.add(t as usize)) = iv_new(cx, t);
-            (*cx.rv_slot.add(t as usize)) = -1;
-            (*cx.rv_hint.add(t as usize)) = -1;
-            (*cx.rv_hreg.add(t as usize)) = -1;
+            cx.rv_first[t as usize] = iv_new(cx, t);
+            cx.rv_slot[t as usize] = -1;
+            cx.rv_hint[t as usize] = -1;
+            cx.rv_hreg[t as usize] = -1;
         }
         let live = alloc_array::<u64>(cx.live_words + 1);
         let mut out: [i64; 8] = [0i64; 8];
@@ -400,7 +376,7 @@ pub fn build_intervals(cx: &mut FnCtx, pcx: &Ctx<Comp>) {
                     bits &= bits - 1;
                     let t = w * 64 + bit;
                     rev_add_range(
-                        &mut (*cx.ivs.add((*cx.rv_first.add(t as usize)) as usize)).ranges, start,
+                        &mut (cx.ivs[cx.rv_first[t as usize] as usize]).ranges, start,
                         end + 2);
                 }
             }
@@ -413,10 +389,10 @@ pub fn build_intervals(cx: &mut FnCtx, pcx: &Ctx<Comp>) {
             }
             if (*cx.blocks.add(b as usize)).term == Term::Ret && count > 0 {
                 let t = tracked(cx, out[0]);
-                if t >= 0 && (*cx.rv_hreg.add(t as usize)) < 0
+                if t >= 0 && cx.rv_hreg[t as usize] < 0
                     && !is_compound(pcx.fns[(*get_irfuncs().add(cx.irf as usize)).f as usize].ret,
                         pcx) {
-                    (*cx.rv_hreg.add(t as usize)) = reg_ret(
+                    cx.rv_hreg[t as usize] = reg_ret(
                         in_fregs((*cx.insts.add(out[0] as usize)).ty, pcx));
                 }
                 let pack = (*cx.blocks.add(b as usize)).cond;
@@ -425,8 +401,8 @@ pub fn build_intervals(cx: &mut FnCtx, pcx: &Ctx<Comp>) {
                     conv_classify(cx, fn_uses_c(f, pcx), pcx.fns[f as usize].ret, pcx);
                     for i in 0..count {
                         let a = tracked(cx, out[(2 * i) as usize]);
-                        if a >= 0 && (*cx.rv_hreg.add(a as usize)) < 0 {
-                            (*cx.rv_hreg.add(a as usize)) = conv_return_piece_reg(cx,
+                        if a >= 0 && cx.rv_hreg[a as usize] < 0 {
+                            cx.rv_hreg[a as usize] = conv_return_piece_reg(cx,
                                 fn_uses_c(f, pcx), i, pcx);
                         }
                     }
@@ -478,12 +454,12 @@ pub fn build_intervals(cx: &mut FnCtx, pcx: &Ctx<Comp>) {
         }
         free(live as *mut u8);
         for t in 0..cx.ra_vals.count {
-            let i = (*cx.rv_first.add(t as usize));
-            reverse_pairs(&mut (*cx.ivs.add(i as usize)).ranges);
-            reverse_pairs(&mut (*cx.ivs.add(i as usize)).uses);
+            let i = cx.rv_first[t as usize];
+            reverse_pairs(&mut cx.ivs[i as usize].ranges);
+            reverse_pairs(&mut cx.ivs[i as usize].uses);
         }
         for r in 0..64 {
-            reverse_pairs(cx.fixed.add(r as usize));
+            reverse_pairs(&mut cx.fixed[r as usize]);
         }
         phi_hints(cx);
         param_hints(cx, pcx);
@@ -498,23 +474,23 @@ pub fn build_intervals(cx: &mut FnCtx, pcx: &Ctx<Comp>) {
 // nothing on AArch64, and on x86-64 nothing either when the operation
 // commutes or has one operand (its result in the phi's register costs
 // the same move as in the operand's).
-fn operand_hint_only(cx: &mut FnCtx, w: i64, t: i64) -> bool {
+fn operand_hint_only(cx: &mut FnCtx<Comp>, w: i64, t: i64) -> bool {
     unsafe {
         let op = (*cx.insts.add(w as usize)).op;
         if op == Select && get_x86()
-            && ((*cx.rv_hint.add(t as usize)) == tracked(cx, (*cx.insts.add(w as usize)).a)
-                || (*cx.rv_hint.add(t as usize)) == tracked(cx, (*cx.insts.add(w as usize)).b)) {
+            && (cx.rv_hint[t as usize] == tracked(cx, (*cx.insts.add(w as usize)).a)
+                || cx.rv_hint[t as usize] == tracked(cx, (*cx.insts.add(w as usize)).b)) {
             return true;
         }
         if !(op.is_binary() || op == Neg || op == BNot || op == Conv)
-            || (*cx.rv_hint.add(t as usize)) != tracked(cx, (*cx.insts.add(w as usize)).a) {
+            || cx.rv_hint[t as usize] != tracked(cx, (*cx.insts.add(w as usize)).a) {
             return false;
         }
         !get_x86() || !op.is_binary() || is_commutative(op)
     }
 }
 
-fn phi_hints(cx: &mut FnCtx) {
+fn phi_hints(cx: &mut FnCtx<Comp>) {
     unsafe {
         for k in 0..cx.order.count {
             let mut v = (*cx.blocks.add((*cx.order.data.add(k as usize)) as usize)).first;
@@ -525,8 +501,8 @@ fn phi_hints(cx: &mut FnCtx) {
                         let w = ir_arg(cx, v, i);
                         let a = tracked(cx, w);
                         if a >= 0
-                            && ((*cx.rv_hint.add(a as usize)) < 0 || operand_hint_only(cx, w, a)) {
-                            (*cx.rv_hint.add(a as usize)) = t;
+                            && (cx.rv_hint[a as usize] < 0 || operand_hint_only(cx, w, a)) {
+                            cx.rv_hint[a as usize] = t;
                         }
                     }
                 }
@@ -540,20 +516,20 @@ fn phi_hints(cx: &mut FnCtx) {
             let mut v = (*cx.blocks.add(b as usize)).first;
             while v != 0 && (*cx.insts.add(v as usize)).op == Phi {
                 let t = tracked(cx, v);
-                if t >= 0 && (*cx.rv_hint.add(t as usize)) < 0 {
+                if t >= 0 && cx.rv_hint[t as usize] < 0 {
                     for i in 0..(*cx.insts.add(v as usize)).nargs {
                         let ir_arg_v = ir_arg(cx, v, i);
                         let a = tracked(cx, ir_arg_v);
                         let p = (*(*cx.blocks.add(b as usize)).preds.data.add(i as usize));
                         if a >= 0 && a != t && (*cx.blocks.add(p as usize)).order >= k {
-                            (*cx.rv_hint.add(t as usize)) = a;
+                            cx.rv_hint[t as usize] = a;
                         }
                     }
                     for i in 0..(*cx.insts.add(v as usize)).nargs {
                         let ir_arg_v1 = ir_arg(cx, v, i);
                         let a = tracked(cx, ir_arg_v1);
-                        if a >= 0 && (*cx.rv_hint.add(t as usize)) < 0 {
-                            (*cx.rv_hint.add(t as usize)) = a;
+                        if a >= 0 && cx.rv_hint[t as usize] < 0 {
+                            cx.rv_hint[t as usize] = a;
                         }
                     }
                 }
@@ -564,7 +540,7 @@ fn phi_hints(cx: &mut FnCtx) {
 }
 
 // Parameters would like the register they arrive in.
-fn param_hints(cx: &mut FnCtx, pcx: &Ctx<Comp>) {
+fn param_hints(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
     unsafe {
         let f = (*get_irfuncs().add(cx.irf as usize)).f;
         let mut locations: [i64; 64] = [0i64; 64];
@@ -584,7 +560,7 @@ fn param_hints(cx: &mut FnCtx, pcx: &Ctx<Comp>) {
                 let location = if piece > 0 { pieces[(4 * index + piece - 1) as usize] }
                     else { locations[index as usize] };
                 if piece >= 0 && !xl_is_stack(location) {
-                    (*cx.rv_hreg.add(t as usize)) = arg_reg(location);
+                    cx.rv_hreg[t as usize] = arg_reg(location);
                 }
             }
             v = (*cx.insts.add(v as usize)).next;
@@ -605,81 +581,76 @@ pub fn trailing_zeros(bits: u64) -> i64 {
 }
 
 // The index of the last range of `list` starting at or before pos, or -1.
-fn ra_range_at(list: *mut IntVec, pos: i64) -> i64 {
-    let mut lo: i64 = 0;
-    let mut hi = unsafe { list.count / 2 };
+fn ra_range_at(list: &[i64], pos: i64) -> i64 {
+    let mut lo: usize = 0;
+    let mut hi = list.len() / 2;
     while lo < hi {
         let mid = (lo + hi) / 2;
-        if unsafe { (*list.data.add((2 * mid) as usize)) <= pos } {
+        if list[2 * mid] <= pos {
             lo = mid + 1;
         } else {
             hi = mid;
         }
     }
-    lo - 1
+    lo as i64 - 1
 }
 
-pub fn covers(cx: &mut FnCtx, i: i64, pos: i64) -> bool {
-    unsafe {
-        let r = ra_range_at(&mut (*cx.ivs.add(i as usize)).ranges, pos);
-        r >= 0 && pos < (*(*cx.ivs.add(i as usize)).ranges.data.add((2 * r + 1) as usize))
-    }
+pub fn covers(cx: &mut FnCtx<Comp>, i: i64, pos: i64) -> bool {
+    let ranges = &cx.ivs[i as usize].ranges;
+    let r = ra_range_at(ranges, pos);
+    r >= 0 && pos < ranges[(2 * r + 1) as usize]
 }
 
 // The first position at or after `from` in both range lists, or POS_MAX.
-pub fn next_intersection(a: *mut IntVec, b: *mut IntVec, from: i64) -> i64 {
-    unsafe {
-        let mut i = ra_range_at(a, from);
-        if i < 0 {
-            i = 0;
-        }
-        let mut j = ra_range_at(b, from);
-        if j < 0 {
-            j = 0;
-        }
-        let na = a.count / 2;
-        let nb = b.count / 2;
-        while i < na && j < nb {
-            let lo = max_i64(max_i64((*a.data.add((2 * i) as usize)),
-                (*b.data.add((2 * j) as usize))), from);
-            let hi = min_i64((*a.data.add((2 * i + 1) as usize)),
-                (*b.data.add((2 * j + 1) as usize)));
-            if lo < hi {
-                return lo;
-            }
-            if (*a.data.add((2 * i + 1) as usize)) < (*b.data.add((2 * j + 1) as usize)) {
-                i += 1;
-            } else {
-                j += 1;
-            }
-        }
-        POS_MAX
+pub fn next_intersection(a: &[i64], b: &[i64], from: i64) -> i64 {
+    let mut i = ra_range_at(a, from);
+    if i < 0 {
+        i = 0;
     }
+    let mut j = ra_range_at(b, from);
+    if j < 0 {
+        j = 0;
+    }
+    let mut i = i as usize;
+    let mut j = j as usize;
+    let na = a.len() / 2;
+    let nb = b.len() / 2;
+    while i < na && j < nb {
+        let lo = max_i64(max_i64(a[2 * i], b[2 * j]), from);
+        let hi = min_i64(a[2 * i + 1], b[2 * j + 1]);
+        if lo < hi {
+            return lo;
+        }
+        if a[2 * i + 1] < b[2 * j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    POS_MAX
 }
 
 // The first use of interval i at or after pos needing at least `kind`.
-pub fn next_use(cx: &mut FnCtx, i: i64, pos: i64, kind: i64) -> i64 {
-    unsafe {
-        let uses = &mut (*cx.ivs.add(i as usize)).uses;
-        let n = uses.count / 2;
-        let mut lo: i64 = 0;
-        let mut hi = n;
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if (*uses.data.add((2 * mid) as usize)) < pos {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
+pub fn next_use(cx: &mut FnCtx<Comp>, i: i64, pos: i64, kind: i64) -> i64 {
+    let uses = &cx.ivs[i as usize].uses;
+    let n = uses.len() / 2;
+    let mut lo: usize = 0;
+    let mut hi = n;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if uses[2 * mid] < pos {
+            lo = mid + 1;
+        } else {
+            hi = mid;
         }
-        while lo < n {
-            if (*uses.data.add((2 * lo + 1) as usize)) >= kind {
-                return (*uses.data.add((2 * lo) as usize));
-            }
-            lo += 1;
-        }
-        POS_MAX
     }
+    while lo < n {
+        if uses[2 * lo + 1] >= kind {
+            return uses[2 * lo];
+        }
+        lo += 1;
+    }
+    POS_MAX
 }
 
 pub fn min_i64(a: i64, b: i64) -> i64 {
@@ -687,7 +658,7 @@ pub fn min_i64(a: i64, b: i64) -> i64 {
 }
 
 // The layout index of the block holding position pos.
-pub fn block_at(cx: &mut FnCtx, pos: i64) -> i64 {
+pub fn block_at(cx: &mut FnCtx<Comp>, pos: i64) -> i64 {
     let mut lo: i64 = 0;
     let mut hi = cx.bstart.count;
     while lo < hi {
@@ -701,7 +672,7 @@ pub fn block_at(cx: &mut FnCtx, pos: i64) -> i64 {
     lo - 1
 }
 
-fn is_block_start(cx: &mut FnCtx, pos: i64) -> bool {
+fn is_block_start(cx: &mut FnCtx<Comp>, pos: i64) -> bool {
     let k = block_at(cx, pos);
     unsafe { k >= 0 && (*cx.bstart.data.add(k as usize)) == pos }
 }
@@ -710,66 +681,60 @@ fn is_block_start(cx: &mut FnCtx, pos: i64) -> bool {
 // (returned) the rest. A split inside a block, where the value is live,
 // moves it in the gap at pos (only gaps hold moves: a split anywhere else
 // must leave the rest on the stack).
-pub fn split_at(cx: &mut FnCtx, i: i64, pos: i64) -> i64 {
-    unsafe {
-        let child = iv_new(cx, (*cx.ivs.add(i as usize)).value);
-        let n = (*cx.ivs.add(i as usize)).ranges.count / 2;
-        let mut r: i64 = 0;
-        while r < n && (*(*cx.ivs.add(i as usize)).ranges.data.add((2 * r + 1) as usize)) <= pos {
-            r += 1;
-        }
-        let mut live_across = false;
-        let mut cut: i64 = 0;
-        if r < n && (*(*cx.ivs.add(i as usize)).ranges.data.add((2 * r) as usize)) < pos {
-            live_across = true;
-            (*cx.ivs.add(child as usize)).ranges.push(pos);
-            (*cx.ivs.add(child as usize)).ranges.push(
-                (*(*cx.ivs.add(i as usize)).ranges.data.add((2 * r + 1) as usize)));
-            (*(*cx.ivs.add(i as usize)).ranges.data.add((2 * r + 1) as usize)) = pos;
-            cut = r + 1;
-            r += 1;
-        } else {
-            cut = r;
-        }
-        while r < n {
-            (*cx.ivs.add(child as usize)).ranges.push(
-                (*(*cx.ivs.add(i as usize)).ranges.data.add((2 * r) as usize)));
-            (*cx.ivs.add(child as usize)).ranges.push(
-                (*(*cx.ivs.add(i as usize)).ranges.data.add((2 * r + 1) as usize)));
-            r += 1;
-        }
-        (*cx.ivs.add(i as usize)).ranges.count = 2 * cut;
-        let m = (*cx.ivs.add(i as usize)).uses.count / 2;
-        let mut u: i64 = 0;
-        while u < m && (*(*cx.ivs.add(i as usize)).uses.data.add((2 * u) as usize)) < pos {
-            u += 1;
-        }
-        let keep = u;
-        while u < m {
-            (*cx.ivs.add(child as usize)).uses.push(
-                (*(*cx.ivs.add(i as usize)).uses.data.add((2 * u) as usize)));
-            (*cx.ivs.add(child as usize)).uses.push(
-                (*(*cx.ivs.add(i as usize)).uses.data.add((2 * u + 1) as usize)));
-            u += 1;
-        }
-        (*cx.ivs.add(i as usize)).uses.count = 2 * keep;
-        (*cx.ivs.add(child as usize)).next = (*cx.ivs.add(i as usize)).next;
-        (*cx.ivs.add(i as usize)).next = child;
-        if (*cx.ivs.add(i as usize)).ranges.count == 0
-            || (*cx.ivs.add(child as usize)).ranges.count == 0 {
-            die(c"internal error: empty interval after a split");
-        }
-        if live_across && !is_block_start(cx, pos) && pos % 4 == 3 {
-            cx.split_moves.push(pos);
-            cx.split_moves.push((*cx.ivs.add(i as usize)).value);
-        }
-        child
+pub fn split_at(cx: &mut FnCtx<Comp>, i: i64, pos: i64) -> i64 {
+    let value = cx.ivs[i as usize].value;
+    let next = cx.ivs[i as usize].next;
+    // The rest is built apart and pushed last: the new interval's place
+    // in IVS may move the table, and i's lists are read while it is filled.
+    let mut rest = Interval {
+        value: value, reg: UNASSIGNED,
+        ranges: Vec::new_in(Comp {}),
+        uses: Vec::new_in(Comp {}),
+        next: next,
+    };
+    let part = &mut cx.ivs[i as usize];
+    let n = part.ranges.len() / 2;
+    let mut r: usize = 0;
+    while r < n && part.ranges[2 * r + 1] <= pos {
+        r += 1;
     }
+    let mut live_across = false;
+    let mut cut: usize = 0;
+    if r < n && part.ranges[2 * r] < pos {
+        live_across = true;
+        rest.ranges.push(pos);
+        rest.ranges.push(part.ranges[2 * r + 1]);
+        part.ranges[2 * r + 1] = pos;
+        cut = r + 1;
+        r += 1;
+    } else {
+        cut = r;
+    }
+    rest.ranges.extend_from_slice(&part.ranges[2 * r..]);
+    part.ranges.truncate(2 * cut);
+    let m = part.uses.len() / 2;
+    let mut u: usize = 0;
+    while u < m && part.uses[2 * u] < pos {
+        u += 1;
+    }
+    rest.uses.extend_from_slice(&part.uses[2 * u..]);
+    part.uses.truncate(2 * u);
+    if part.ranges.is_empty() || rest.ranges.is_empty() {
+        die(c"internal error: empty interval after a split");
+    }
+    let child = cx.ivs.len() as i64;
+    cx.ivs[i as usize].next = child;
+    cx.ivs.push(rest);
+    if live_across && !is_block_start(cx, pos) && pos % 4 == 3 {
+        cx.split_moves.push(pos);
+        cx.split_moves.push(value);
+    }
+    child
 }
 
 // The latest position at or before max where a value can move (a gap, or
 // a block start), not before min; -1 if there is none.
-pub fn move_point_before(cx: &mut FnCtx, max: i64, min: i64) -> i64 {
+pub fn move_point_before(cx: &mut FnCtx<Comp>, max: i64, min: i64) -> i64 {
     unsafe {
         let k = block_at(cx, max);
         let start = (*cx.bstart.data.add(k as usize));
@@ -791,7 +756,7 @@ pub fn move_point_before(cx: &mut FnCtx, max: i64, min: i64) -> i64 {
 // register (or change register): the last move point before max, or the
 // start of the outermost block in between when that is less deep in loops
 // (so that reloads leave loops).
-pub fn split_point(cx: &mut FnCtx, min: i64, max: i64) -> i64 {
+pub fn split_point(cx: &mut FnCtx<Comp>, min: i64, max: i64) -> i64 {
     unsafe {
         let kmin = block_at(cx, min);
         let kmax = block_at(cx, max);
