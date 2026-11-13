@@ -89,7 +89,9 @@ elif [ -n "$VOLEC" ] && [ -f tests/unsafe_audit.sh ] && [ -f compiler/src/main.v
 else
     audit=
     [ -s "$TMP/audit" ] && audit="; $(tail -1 "$TMP/audit" | sed 's/^unsafe-audit: //; s/ (.*$//')"
-    row unsafe PASS "$(tail -1 "$TMP/unsafe" | sed 's/^unsafe-diff-check: //; s/^$/no new unsafe/')$audit"
+    # (the diff's check prints nothing when the change adds no unsafe)
+    added=$(tail -1 "$TMP/unsafe" | sed 's/^unsafe-diff-check: //')
+    row unsafe PASS "${added:-no new unsafe}$audit"
 fi
 
 # fmt
