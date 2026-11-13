@@ -406,7 +406,9 @@ if (cd "$WORK/std" && "$COMPILER" query items std --root main.vl) >"$WORK/std/it
     # prints as `pub`, and the two constants of the compiler's tail)
     awk -F '\t' '$3 ~ /^pub / && $3 !~ /^pub mod / && $3 !~ /^pub use / { s = $3; sub(/^pub /, "", s); sub(/ (debug )?(requires|ensures) .*$/, "", s); sub(/ where .*$/, "", s); print s }' "$WORK/std/items" |
         grep -v -e '^fn count_ones(x: u64)' -e '^fn leading_zeros(x: u64)' -e '^fn trailing_zeros(x: u64)' \
-            -e '^const CHECK_ALLOC:' -e '^const TARGET_OS:' -e '^fn int_range_error(' -e '^unsafe fn slice_parts' >"$WORK/std/want"
+            -e '^const CHECK_ALLOC:' -e '^const TARGET_OS:' -e '^fn int_range_error(' -e '^unsafe fn slice_parts' \
+            -e '^fn is_copy<T>()' -e '^fn is_bytewise_eq<T, U>()' -e '^unsafe fn fill_copies<T>(' \
+            -e '^unsafe fn bytes_equal(' -e '^unsafe fn byte_index(' >"$WORK/std/want"
     : >"$WORK/std/missing"
     while IFS= read -r sig; do
         grep -qF -- "$sig" "$WORK/std/every.md" || echo "$sig" >>"$WORK/std/missing"

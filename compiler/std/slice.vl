@@ -540,11 +540,22 @@ impl<T> [T] {
     // Whether an element equals x.
     // mvs: [T]::contains, Vec::contains
     // std2: changed: takes &T
-    #[effects(T)]
+    #[effects(unsafe, T)]
     pub fn contains(&self, x: &T) -> bool
         where
             T: PartialEq,
     {
+        if crate::mem::is_bytewise_eq::<T, T>() && crate::mem::size_of::<T>() == 1 {
+            // UNSAFE: the slice read as its bytes, searched by memchr (a
+            // loop over the elements is a compare and a bounds check each).
+            // SAFETY: T is u8, i8 or bool (is_bytewise_eq, one byte), so the
+            // slice is len() readable bytes, x one byte, and equality is
+            // the byte's.
+            return unsafe {
+                let b = crate::ptr::read(x as *const T as *const u8);
+                crate::ptr::byte_index(self.as_ptr() as *const u8, self.len(), b).is_some()
+            };
+        }
         for y in self.iter() {
             if *y == *x {
                 return true;
@@ -572,7 +583,7 @@ impl<T> [T] {
     }
 
     // Copies src's elements in (the same length, or a panic).
-    #[effects(panic, diverge, T)]
+    #[effects(panic, diverge, unsafe, T)]
     pub fn copy_from_slice(&mut self, src: &[T])
         where
             T: Copy,
@@ -581,15 +592,17 @@ impl<T> [T] {
         let n = self.len();
         crate::panic::assert(n == src.len(),
             "source slice length does not match destination slice length");
-        let mut i: usize = 0;
-        while i < n {
-            self[i] = src[i];
-            i += 1;
-        }
+        // UNSAFE: the elements copied as one block (an assignment and two
+        // bounds checks each otherwise).
+        // SAFETY: both slices have n elements (asserted above); src is a
+        // shared borrow beside &mut self, so the two do not overlap (the
+        // borrow rules: no safe code has both); T is Copy, so its bits are
+        // the value and the old elements have nothing to drop.
+        unsafe { crate::ptr::copy_nonoverlapping(src.as_ptr(), self.as_mut_ptr(), n) };
     }
 
     // Copies the elements in src to dest (they may overlap).
-    #[effects(panic, diverge, T, R)]
+    #[effects(panic, diverge, unsafe, T, R)]
     pub fn copy_within<R: crate::ops::RangeBounds<usize>>(&mut self, src: R, dest: usize)
         where
             T: Copy,
@@ -608,23 +621,16 @@ impl<T> [T] {
         crate::panic::assert(start <= end && end <= n, "src is out of bounds");
         let count = end - start;
         crate::panic::assert(dest <= n - count, "dest is out of bounds");
-        if dest <= start {
-            let mut i: usize = 0;
-            while i < count {
-                self[dest + i] = self[start + i];
-                i += 1;
-            }
-        } else {
-            let mut i = count;
-            while i > 0 {
-                i -= 1;
-                self[dest + i] = self[start + i];
-            }
-        }
+        let p = self.as_mut_ptr();
+        // UNSAFE: the elements moved as one block within the slice.
+        // SAFETY: [start, start + count) and [dest, dest + count) are both
+        // inside the slice (asserted above); ptr::copy allows their
+        // overlap; T is Copy: the overwritten elements have nothing to drop.
+        unsafe { crate::ptr::copy(p.add(start) as *const T, p.add(dest), count) };
     }
 
     // Clones src's elements in (the same length, or a panic).
-    #[effects(panic, diverge, T)]
+    #[effects(panic, diverge, unsafe, T)]
     pub fn clone_from_slice(&mut self, src: &[T])
         where
             T: Clone,
@@ -633,6 +639,15 @@ impl<T> [T] {
         let n = self.len();
         crate::panic::assert(n == src.len(),
             "destination and source slices have different lengths");
+        if crate::mem::is_copy::<T>() {
+            // UNSAFE: as copy_from_slice's block copy.
+            // SAFETY: both slices have n elements (asserted above) and do
+            // not overlap (&mut self beside a shared borrow); T is Copy
+            // (is_copy): its bits are its clone, and the old elements have
+            // nothing to drop.
+            unsafe { crate::ptr::copy_nonoverlapping(src.as_ptr(), self.as_mut_ptr(), n) };
+            return;
+        }
         let mut i: usize = 0;
         while i < n {
             self[i] = src[i].clone();
@@ -642,16 +657,32 @@ impl<T> [T] {
 
     // Every element set to a clone of x.
     // mvs: fill
-    #[effects(panic, diverge, T)]
+    #[effects(panic, diverge, unsafe, T)]
     pub fn fill(&mut self, x: T)
         where
             T: Clone,
     {
+        if crate::mem::is_copy::<T>() {
+            let n = self.len();
+            // UNSAFE: the slice written as one block fill (a clone, an
+            // assignment and a bounds check per element otherwise).
+            // SAFETY: the slice is n writable T's; x is a local, no part of
+            // it; T is Copy (is_copy): its bits may be duplicated, and the
+            // old elements have nothing to drop.
+            unsafe { crate::ptr::fill_copies(self.as_mut_ptr(), n, &x) };
+            return;
+        }
+        // (0.29: x itself is the last element, as Rust's: a clone fewer)
+        let n = self.len();
+        if n == 0 {
+            return;
+        }
         let mut i: usize = 0;
-        while i < self.len() {
+        while i + 1 < n {
             self[i] = x.clone();
             i += 1;
         }
+        self[n - 1] = x;
     }
 
     // A Vec of clones of its elements, on a.
@@ -689,6 +720,22 @@ impl<T> [T] {
     #[effects()]
     pub fn as_mut_ptr(&mut self) -> *mut T {
         self.ptr as *mut T
+    }
+}
+
+// (0.29) What only a slice of bytes has.
+impl [u8] {
+    // The index of the first byte equal to x, or None: C's memchr (the
+    // memchr crate's `memchr(x, s)`, bstr's `find_byte`). The search a
+    // loop or `iter().position(..)` writes costs a compare and a bounds
+    // check per byte; this reads the bytes as words. str's `find`,
+    // `split` and `lines` search with it.
+    #[effects(unsafe)]
+    pub fn find_byte(&self, x: u8) -> Option<usize> {
+        // UNSAFE: C's memchr over the slice's bytes.
+        // SAFETY: the slice is len() readable bytes; byte_index reads no
+        // more and returns an index below len().
+        unsafe { crate::ptr::byte_index(self.as_ptr(), self.len(), x) }
     }
 }
 
@@ -962,6 +1009,25 @@ impl<T: PartialEq<U>, U> PartialEq<[U]> for [T] {
     fn eq(&self, other: &[U]) -> bool {
         if self.len() != other.len() {
             return false;
+        }
+        if crate::mem::is_bytewise_eq::<T, U>() {
+            // UNSAFE: the two slices compared as blocks of bytes (memcmp): a
+            // compare and two bounds checks per element otherwise (the
+            // compiler's assembler compares every line with its memo, every
+            // name with its symbol's). For slices of a few bytes the call
+            // costs about 12 instructions more than the loop did (measured:
+            // bench/std/hash_str's keys of 1 to 4 bytes, 2.6% of the run);
+            // a length test before it, or the call moved out of line, made
+            // the function too large to inline into the table's probe and
+            // cost more.
+            // SAFETY: T and U are one integer type or bool (is_bytewise_eq):
+            // no padding, and equal values are equal bytes; both slices
+            // have len() elements (tested above), so len() * size_of::<T>()
+            // readable bytes each.
+            return unsafe {
+                crate::ptr::bytes_equal(self.as_ptr() as *const u8, other.as_ptr() as *const u8,
+                    self.len() * crate::mem::size_of::<T>())
+            };
         }
         let mut i: usize = 0;
         while i < self.len() {
