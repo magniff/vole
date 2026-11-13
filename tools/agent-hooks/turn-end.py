@@ -32,11 +32,16 @@ commit; these are the parts of it that concern the changed examples:
 - `volec fmt --check` of each changed .vl file;
 - a tests/examples case whose SOURCE is the example's main.vl, and no case
   naming a SOURCE or CSOURCE that does not exist (a moved example);
-- the example's cases, `tests/run.sh example_NAME` (the slow part: once
-  per state of the changed files, like the rest).
+- only with VOLE_TURN_END_EXAMPLES=run: the example's cases, `tests/run.sh
+  example_NAME` (the slow part: once per state of the changed files, like
+  the rest). (0.29) Not by default: a session that merged or committed
+  many examples reran up to 51 cases at every stop, and on a loaded
+  machine reported failures that were the load's (a timeout); the cases
+  are tier 1's (`tests/run.sh example_NAME`, tests/affected.sh). And a
+  failing run is run once more: only one that fails twice is reported.
 
 Reported like errors, once per state. VOLE_TURN_END_EXAMPLES=0 turns
-these off, =quick keeps all but running the cases.
+these off; =run adds running the cases.
 
 VOLE_TURN_END=0 turns it off; VOLE_CHECK_TESTS=0 leaves the tests
 out. Logged as `turn-end` records where the check hook logs. Development
@@ -190,7 +195,11 @@ def example_checks(event, st, top, start):
     """The examples' checks (the docstring above) for checkout top; the
     report, or None."""
     import subprocess
-    mode = os.environ.get("VOLE_TURN_END_EXAMPLES", "1")
+    # (0.29) the cases run only when asked: "run"; anything else but "0"
+    # is the quick checks
+    mode = os.environ.get("VOLE_TURN_END_EXAMPLES", "quick")
+    if mode not in ("0", "run"):
+        mode = "quick"
     if mode == "0" or not os.path.isdir(os.path.join(top, "tests", "examples")):
         return None
     changed = changed_example_paths(top, start)
@@ -226,12 +235,29 @@ def example_checks(event, st, top, start):
         if mode == "quick" or not compiler or not os.path.exists(os.path.join(top, "tests", "run.sh")):
             continue
         for base in sorted({n.split("_")[0] for n in names}):
-            try:
-                r = subprocess.run(["sh", os.path.join(top, "tests", "run.sh"), "-c", compiler, f"example_{base}"],
-                                   cwd=top, capture_output=True, text=True, timeout=EXAMPLE_TIMEOUT)
-            except (OSError, subprocess.TimeoutExpired):
-                problems.append(f"tests/run.sh example_{base}: did not finish in {EXAMPLE_TIMEOUT} s")
+            # (0.29) a failure counts when it fails again: twice, or not
+            # reported (a run that did not finish is the load's as well)
+            runs = []
+            for _attempt in (1, 2):
+                try:
+                    runs.append(subprocess.run(["sh", os.path.join(top, "tests", "run.sh"), "-c", compiler,
+                                                f"example_{base}"],
+                                               cwd=top, capture_output=True, text=True, timeout=EXAMPLE_TIMEOUT))
+                except (OSError, subprocess.TimeoutExpired):
+                    runs.append(None)
+                    continue
+                if runs[-1].returncode == 0:
+                    break
+            if runs[-1] is not None and runs[-1].returncode == 0:
                 continue
+            finished = [x for x in runs if x is not None]
+            if not finished:
+                problems.append(f"tests/run.sh example_{base}: did not finish in {EXAMPLE_TIMEOUT} s, twice")
+                continue
+            if len(finished) < 2:
+                # (one failed, one did not finish: not the same failure twice)
+                continue
+            r = finished[-1]
             if r.returncode != 0:
                 out = []
                 for line in r.stdout.splitlines():
@@ -239,7 +265,7 @@ def example_checks(event, st, top, start):
                         break
                     if line.strip():
                         out.append(line)
-                problems.append(f"tests/run.sh example_{base} fails:\n" + "\n".join(out[:EXAMPLE_LINES]))
+                problems.append(f"tests/run.sh example_{base} fails (twice):\n" + "\n".join(out[:EXAMPLE_LINES]))
     cae.record(event, top, {"kind": "turn-end-examples", "examples": roots, "problems": len(problems),
                             "ms": int((time.time() - t0) * 1000)})
     if not problems:

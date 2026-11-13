@@ -98,7 +98,10 @@ did-you-mean, a conversion, a `use`) it shows under `suggested, not
 applied`, with the ones `fix` refuses and why: check each before
 running `volec fix --suggested`. `check` and a build
 print `ok: ...` when there is no error. `turn-end.py` checks once more when you stop and
-blocks the stop once if errors are left. When a tool falls short, record
+blocks the stop once if errors are left; of the examples you changed it
+checks the format and that each has its case, and does not run the
+cases (0.29; `VOLE_TURN_END_EXAMPLES=run` does, reporting only what
+fails twice): run them yourself, `tests/run.sh example_NAME`. When a tool falls short, record
 it in one line: `tools/agent-feedback "query refs" "misses uses inside
 never-instantiated generic fns"`; `tools/agent-feedback --find WORDS`
 says whether someone has seen it already (`--list`: the last ones).
@@ -150,7 +153,10 @@ never the whole suite or a gate unless its task says so**:
    `target/tools/volec`.
 4. **A release:** one `bootstrap/gate.sh --release`, then `gate.sh
    --only bench` on an idle machine ([docs/releases.md](docs/releases.md),
-   "The gate").
+   "The gate"). The gate keeps to its `-j` slots (0.29): the heavy steps
+   (the suites, objcheck, stress-grow, the chain rows, ...) run one at a
+   time and the rest beside them, so `gate.sh --release --no-linux -j 4`
+   is run whole, not step by step (`--plan` prints the schedule).
 
 A test that fails in the plan is yours until shown otherwise: rerun it
 alone (`tests/run.sh -n NAME`, or `'=NAME'` quoted) before calling it
@@ -166,7 +172,8 @@ load or inherited.
   core.hooksPath and the stdsrc merge driver) refuses a commit that adds
   `unsafe` without its `UNSAFE:`/`SAFETY:` comments, stages an
   unformatted `.vl`, or adds an example case whose SOURCE does not
-  exist; a commit that changes `compiler/std` gets the
+  exist (0.29: of a merge, only what the merge itself adds, the lines
+  in neither parent; what a side brings passed on its branch); a commit that changes `compiler/std` gets the
   `compiler/src/front/stdsrc_rust.vl` made from it, staged by the hook, and a
   merge makes it from the merged std (no conflict on it). It runs for
   every committer, under any agent harness (Claude Code's hooks do not

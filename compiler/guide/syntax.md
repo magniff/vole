@@ -161,7 +161,7 @@ From loosest to tightest (all left-associative except where noted):
 | `+` `-` | |
 | `*` `/` `%` | |
 | `as` | `-x as i64` is `(-x) as i64`; `a * b as f64` is `a * (b as f64)` |
-| prefix `-` `!` `*` `&` `&mut` | `!` is bool's not and an integer's bitwise not (`~` too, vole's); `*r` reads through a reference or a raw pointer |
+| prefix `-` `!` `*` `&` `&mut` | `!` is bool's not and an integer's bitwise not (`~x` is an error); `*r` reads through a reference or a raw pointer |
 | `f()` `a[i]` `a[i..j]` `x.f` `x.0` `x.m()` `e?` | `*p.x` is `*(p.x)` |
 
 No `**` (power: `x.pow(n)`), no ternary (`if c { a } else { b }` is an

@@ -32,6 +32,11 @@
 #                 or the slots of $VOLE_JOBSERVER, see tests/run.sh)
 #   -r REPEATS    the repeated builds (0: none)
 #   FILTER        only the programs whose path contains FILTER
+#
+# (0.29) A repeated program whose -j1 build, the one the repeats are
+# compared with, fails (or which is not there) is one failure that says
+# so, with the compiler's first error: in 0.28.0 the program no longer
+# built, and each of the 96 repeats was reported as "differs".
 
 set -u
 LC_ALL=C
@@ -55,8 +60,8 @@ while [ $# -gt 0 ]; do
         -n) THREADS=$2; shift 2 ;;
         -j) JOBS=$2; shift 2 ;;
         -r) REPEATS=$2; shift 2 ;;
-        -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        -*) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        -h|--help) sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
         *) FILTER=$1; shift ;;
     esac
 done
@@ -133,6 +138,18 @@ repeat_check() { # <file> <target> <n> <reference>
     fi
 }
 
+# (0.29) The -j1 build of repeated program $1 for target $2 into $3, the
+# reference of its repeats; when it fails, one FAIL result saying so (the
+# next of n), and false: no repeat is run against nothing.
+reference_build() { # <file> <target> <out>
+    if "$COMPILER" --target "$2" -O2 -j1 -S "$1" -o "$3" >"$3.log" 2>&1 && [ -s "$3" ]; then
+        return 0
+    fi
+    n=$((n + 1))
+    echo "FAIL $1 $2 -O2 -j1: the reference build of the repeated program failed, no repeat was run: $(grep -m1 -i 'error' "$3.log" || head -1 "$3.log")" >"$WORK/$n.result"
+    return 1
+}
+
 cd "$ROOT" || exit 1
 list="$WORK/list"
 : >"$list"
@@ -180,18 +197,22 @@ if [ -z "$FILTER" ] || echo compiler/src/main.vl | grep -q "$FILTER"; then
     done
 fi
 rp=tests/run/std_gpu_wgsl_reflect.vl
-if [ "$REPEATS" -gt 0 ] && [ -f "$rp" ] && { [ -z "$FILTER" ] || echo "$rp" | grep -q "$FILTER"; }; then
-    "$COMPILER" --target aarch64-linux -O2 -j1 -S "$rp" -o "$WORK/repeat.ref.s" >/dev/null 2>&1
+if [ "$REPEATS" -gt 0 ] && { [ -z "$FILTER" ] || echo "$rp" | grep -q "$FILTER"; }; then
     wait
-    # (in bursts of 32 at once, past the slots: a loaded machine
-    # interleaves the threads' tasks most)
-    r=0
-    while [ "$r" -lt "$REPEATS" ]; do
-        r=$((r + 1))
+    if [ ! -f "$rp" ]; then
         n=$((n + 1))
-        repeat_check "$rp" aarch64-linux "$r" "$WORK/repeat.ref.s" >"$WORK/$n.result" &
-        [ $((r % 32)) -eq 0 ] && wait
-    done
+        echo "FAIL $rp: the repeated program is not there (moved? tests/threads.sh names it)" >"$WORK/$n.result"
+    elif reference_build "$rp" aarch64-linux "$WORK/repeat.ref.s"; then
+        # (in bursts of 32 at once, past the slots: a loaded machine
+        # interleaves the threads' tasks most)
+        r=0
+        while [ "$r" -lt "$REPEATS" ]; do
+            r=$((r + 1))
+            n=$((n + 1))
+            repeat_check "$rp" aarch64-linux "$r" "$WORK/repeat.ref.s" >"$WORK/$n.result" &
+            [ $((r % 32)) -eq 0 ] && wait
+        done
+    fi
 fi
 wait
 # (0.28) The generated program (see the header).
@@ -199,14 +220,15 @@ ag="$WORK/arch-gen"
 rp="$ag/arch_x86_shifts.vl"
 if [ "$REPEATS" -gt 0 ] && { [ -z "$FILTER" ] || echo tests/arch/arch_x86_shifts.vl | grep -q "$FILTER"; }; then
     if sh "$ROOT/tests/arch/gen.sh" -c "$COMPILER" -o "$ag" -r 20 x86_shifts >"$WORK/arch-gen.log" 2>&1 && [ -f "$rp" ]; then
-        "$COMPILER" --target x86_64-macos -O2 -j1 -S "$rp" -o "$WORK/repeat.xref.s" >/dev/null 2>&1
-        r=0
-        while [ "$r" -lt $((REPEATS / 4)) ]; do
-            r=$((r + 1))
-            n=$((n + 1))
-            repeat_check "$rp" x86_64-macos "x$r" "$WORK/repeat.xref.s" >"$WORK/$n.result" &
-            [ $((r % 8)) -eq 0 ] && wait
-        done
+        if reference_build "$rp" x86_64-macos "$WORK/repeat.xref.s"; then
+            r=0
+            while [ "$r" -lt $((REPEATS / 4)) ]; do
+                r=$((r + 1))
+                n=$((n + 1))
+                repeat_check "$rp" x86_64-macos "x$r" "$WORK/repeat.xref.s" >"$WORK/$n.result" &
+                [ $((r % 8)) -eq 0 ] && wait
+            done
+        fi
     else
         n=$((n + 1))
         echo "FAIL tests/arch/gen.sh: $(tail -3 "$WORK/arch-gen.log" | tr '\n' ' ')" >"$WORK/$n.result"
@@ -226,5 +248,5 @@ while [ "$i" -le "$n" ]; do
     fi
     i=$((i + 1))
 done
-echo "threads: $ok of $n compilations the same at -j1 and -j$THREADS ($TARGET)$([ $failed -eq 0 ] || echo ", $failed differ")"
+echo "threads: $ok of $n compilations the same at -j1 and -j$THREADS ($TARGET)$([ $failed -eq 0 ] || echo ", $failed differ or failed")"
 [ $failed -eq 0 ]

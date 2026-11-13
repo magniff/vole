@@ -120,7 +120,8 @@ fn main() {
 - **Overflow** panics at `-O0` (`attempt to add with overflow`) and
   wraps at `-O2`, as Rust's debug and release builds do; `wrapping_add`
   and its family always wrap.
-- `~x` is accepted for `!x` until 0.29.
+- `~x` is an error (`syntax.tilde`): an integer's complement is `!x`;
+  `volec fix --suggested` writes it.
 
 ```vole
 fn main() {

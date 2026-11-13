@@ -30,6 +30,15 @@ block so that new code sits outside it, re-indents it) removes as many
 listed as `moved` (legacy code, the 0.25.4 audit's), not counted. Only the
 unjustified additions beyond the removals of the same file are violations.
 
+(0.29) A merge being committed (--cached while MERGE_HEAD exists: a merge
+with conflicts, resolved by hand) is checked for what the merge itself
+adds: the lines of the index that are in neither parent, added against
+HEAD and against every merged head alike (and as many removals as the
+side with the fewest). What one side brings whole was checked commit by
+commit on its branch; 0.28.0's release merge into main was refused for
+the thousands of lines a mass rewrite had moved on the branch, each of
+whose commits had passed.
+
 Prints one line per site, `FILE:LINE: unsafe without UNSAFE:/SAFETY:
 comments`, and exits 1 when there is one. Stdlib only.
 """
@@ -142,18 +151,22 @@ def heuristic_unjustified(path, mode, lines):
     return bad
 
 
-def main():
-    args = [a for a in sys.argv[1:] if a != "--heuristic"]
-    force_heuristic = "--heuristic" in sys.argv[1:]
-    mode = args[0] if args else None
-    if mode == "--cached":
-        diff = git("diff", "--cached", "-U0", "--", "*.vl")
-    elif mode:
-        diff = git("diff", "-U0", mode + "...HEAD", "--", "*.vl")
-    else:
-        diff = git("diff", "-U0", "HEAD", "--", "*.vl")
-    added_word = {}    # path -> lines added with the word (the heuristic's)
-    added_lines = {}   # path -> every line added
+def merge_heads():
+    """The heads being merged (MERGE_HEAD's lines), none outside a merge."""
+    path = git("rev-parse", "--git-path", "MERGE_HEAD").strip()
+    try:
+        with open(path) as fh:
+            return [line.strip() for line in fh if line.strip()]
+    except OSError:
+        return []
+
+
+def parse_diff(diff):
+    """(added_word, added_lines, removed) of a -U0 diff: per path, the
+    lines added with the word (the heuristic's), every line added, and the
+    number of lines with the word removed."""
+    added_word = {}
+    added_lines = {}
     removed = {}
     path = None
     line_no = 0
@@ -181,6 +194,27 @@ def main():
             if WORD.search(code_part(raw[1:])):
                 added_word.setdefault(path, []).append(line_no)
             line_no += 1
+    return added_word, added_lines, removed
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a != "--heuristic"]
+    force_heuristic = "--heuristic" in sys.argv[1:]
+    mode = args[0] if args else None
+    if mode == "--cached":
+        added_word, added_lines, removed = parse_diff(git("diff", "--cached", "-U0", "--", "*.vl"))
+        # (0.29) a merge: only the lines in neither parent
+        for head in merge_heads():
+            w, a, r = parse_diff(git("diff", "--cached", "-U0", head, "--", "*.vl"))
+            added_lines = {p: added_lines[p] & a[p] for p in added_lines if p in a and added_lines[p] & a[p]}
+            added_word = {p: [n for n in added_word[p] if n in added_lines[p]]
+                          for p in added_word if p in added_lines}
+            added_word = {p: ns for p, ns in added_word.items() if ns}
+            removed = {p: min(removed[p], r[p]) for p in removed if p in r}
+    elif mode:
+        added_word, added_lines, removed = parse_diff(git("diff", "-U0", mode + "...HEAD", "--", "*.vl"))
+    else:
+        added_word, added_lines, removed = parse_diff(git("diff", "-U0", "HEAD", "--", "*.vl"))
     # The compiler's answer for the files it can read as the diff has them.
     volecs = [] if force_heuristic else find_volecs()
     by_tool = {}

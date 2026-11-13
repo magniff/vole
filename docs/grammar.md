@@ -304,7 +304,7 @@ immutable `x`; using a raw pointer is unsafe code (0.9, see "Unsafe code").
 
 ```ebnf
 expr        = pratt(0) ;
-prefix      = ( "-" | "!" | "~" | "*" | "&" ) pratt(25)
+prefix      = ( "-" | "!" | "*" | "&" ) pratt(25)
             | "return" [ expr ]
             | "break" [ ":" ident ] [ expr ]
             | "continue" [ ":" ident ]
@@ -591,8 +591,13 @@ Higher binds tighter. A *non-associative* level reports an error when chained
 | 10    | `+` `-`                                       | left      | 20      | 21       |
 | 11    | `*` `/` `%`                                   | left      | 22      | 23       |
 | 12    | `as` type                                     | left      | 24      | —        |
-| 13    | prefix `-` `!` `~` `*` `&`                    | prefix    | —       | 25       |
+| 13    | prefix `-` `!` `*` `&`                        | prefix    | —       | 25       |
 | 14    | call `()`, index `[]`, field `.f`, tuple `.0` | postfix   | 27      | —        |
+
+`!x` is the logical not of a `bool` and the bitwise not (the complement)
+of an integer, as in Rust. `~` is not an operator (0.29): `~x`, C's
+spelling, read until 0.28, is the error `syntax.tilde` at the `~`, with
+the fix that writes `!` (`volec fix --suggested`).
 
 `return`, `break` and `continue` take the rest of the expression (right bp
 0). Assignment is an expression of type `()`; whether its left side is
@@ -1210,7 +1215,7 @@ vectors: [below](#additions-of-019-vector-types-and-stdarchs-types)).
   lane, `==`, `<`, `<=`, `>`, `>=` are false and `!=` is true. (So
   `a == b` is not a `bool`: `if a == b` is a type error.)
 - `m.select(a, b)`, for a mask `m` (an integer vector) and vectors `a`,
-  `b` whose mask type is `m`'s: `(a & m) | (b & ~m)` on the bits, so a
+  `b` whose mask type is `m`'s: `(a & m) | (b & !m)` on the bits, so a
   lane of `a` where `m`'s is `-1` and of `b` where it is `0`.
 - `+=`, `-=`, `*=`, `/=`, `&=`, `|=`, `^=`: as the operators, on a
   vector place.
