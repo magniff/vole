@@ -604,8 +604,8 @@ completion no longer teach the removed edition's words.
     declared list;
   - first contact: a closure parameter `|&&x|` is not parsed;
     `std::cmp::Reverse(x)` "is a type, not a value"; `volec guide
-    --find Reverse` does not find it; the nested `impl Trait` message
-    still says "it comes in 0.29", which is not true.
+    --find Reverse` does not find it; nested `impl Trait` is still not
+    in the language (its message no longer names a release).
 - **Old spellings in about fifteen messages** (`static var`, `inout
   self` and the like), "rust edition" in some 350 comment lines of the
   compiler, and `--syntax=0.20`, accepted and ignored.
