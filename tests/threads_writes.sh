@@ -39,15 +39,15 @@ done
 case "$COMPILER" in /*) ;; *) COMPILER="$(pwd)/$COMPILER" ;; esac
 
 # static <TAB> why it is no race
-ALLOWED='middle::inline::FN_SIZE	the task'"'"'s own function'"'"'s entry; others read a lower level'"'"'s
-middle::inline::FN_RT	the task'"'"'s own function'"'"'s entry (finish_component_function)
-middle::inline::FN_DECIDERS_START	the task'"'"'s own function'"'"'s entry
+ALLOWED='base::ctx::Ctx.fn_size	the task'"'"'s own function'"'"'s entry; others read a lower level'"'"'s
+base::ctx::Ctx.fn_rt	the task'"'"'s own function'"'"'s entry (finish_component_function)
+base::ctx::Ctx.fn_deciders_start	the task'"'"'s own function'"'"'s entry
 middle::inline::FN_DECIDERS	the task'"'"'s own function'"'"'s entry
-middle::opt::DEFERRED	the task'"'"'s own function'"'"'s entry
-middle::ipo::FN_ATTRS	the task'"'"'s own component'"'"'s entries
-middle::ipo::FN_NOCAPTURE	the task'"'"'s own component'"'"'s entries
-middle::ipo::FN_ATTRS_DONE	the task'"'"'s own component'"'"'s entries
-middle::parallel::COMP_GROWTH	the task'"'"'s own component'"'"'s entry, read between levels
+base::ctx::Ctx.opt_deferred	the task'"'"'s own function'"'"'s entry
+base::ctx::Ctx.fn_attrs	the task'"'"'s own component'"'"'s entries
+base::ctx::Ctx.fn_nocapture	the task'"'"'s own component'"'"'s entries
+base::ctx::Ctx.fn_attrs_done	the task'"'"'s own component'"'"'s entries
+base::ctx::Ctx.comp_growth	the task'"'"'s own component'"'"'s entry, read between levels
 middle::parallel::COMP_INLINED	the task'"'"'s own component'"'"'s entry, read between levels
 middle::parallel::FN_CONSTS	the task'"'"'s own function'"'"'s list; others read its entries made in earlier phases, which never move (chunks)
 middle::parallel::FN_TEXT	the task'"'"'s own function'"'"'s entry, read at the join
@@ -246,17 +246,17 @@ gen0::target::STR_ALIGN	IR: a string'"'"'s alignment (STR_H)
 base::ctx::Ctx.move_copies	IR: FN_MOVES
 base::ctx::Ctx.egraph	key: options_hash
 base::ctx::Ctx.rules	own: the rules, parsed when the context is made (egraph::rules_new), the same in every build of a compiler
-middle::gvn::MEMCPY_SYM	IR: a symbol by its text
+base::ctx::Ctx.memcpy_sym	IR: a symbol by its text
 base::ctx::Ctx.noalias_off	key: options_hash
 base::ctx::Ctx.ifconv	key: options_hash
 base::ctx::Ctx.fn_address	read: R_STATIC (facts_fixed); the key (own_fp)
 base::ctx::Ctx.fn_calls	read: R_CALLS, whether one is left
 middle::inline::FN_DECIDERS	read: R_DEC
-middle::inline::FN_DECIDERS_START	read: R_DEC
+base::ctx::Ctx.fn_deciders_start	read: R_DEC
 base::ctx::Ctx.fn_live	read: R_STATIC; the key
-middle::inline::FN_RT	read: R_RT
+base::ctx::Ctx.fn_rt	read: R_RT
 base::ctx::Ctx.fn_scc	read: R_STATIC, whether in the task'"'"'s SCC
-middle::inline::FN_SIZE	read: R_SIZE; the key
+base::ctx::Ctx.fn_size	read: R_SIZE; the key
 base::ctx::Ctx.leaf_done	read: R_STATIC; the key
 base::ctx::Ctx.leaf_keep	read: R_STATIC; the key
 base::ctx::Ctx.leaf_small	read: R_STATIC; the key
@@ -264,12 +264,12 @@ base::ctx::Ctx.program_budget	read: R_BUDGET, whether within
 base::ctx::Ctx.program_size	read: R_BUDGET
 base::ctx::Ctx.scc_order	key: the component'"'"'s functions
 base::ctx::Ctx.attrs_ready	key: cc_phase
-middle::ipo::CALLOC_SYM	IR: a symbol by its text
-middle::ipo::FN_ATTRS	read: R_ATTRS; the key
-middle::ipo::FN_ATTRS_DONE	read: R_ATTRS, R_STATIC (ready); the key
-middle::ipo::FN_NOCAPTURE	read: R_ATTRS; the key
-middle::ipo::FREE_SYM	IR: a symbol by its text
-middle::ipo::MALLOC_SYM	IR: a symbol by its text
+base::ctx::Ctx.calloc_sym	IR: a symbol by its text
+base::ctx::Ctx.fn_attrs	read: R_ATTRS; the key
+base::ctx::Ctx.fn_attrs_done	read: R_ATTRS, R_STATIC (ready); the key
+base::ctx::Ctx.fn_nocapture	read: R_ATTRS; the key
+base::ctx::Ctx.free_sym	IR: a symbol by its text
+base::ctx::Ctx.malloc_sym	IR: a symbol by its text
 base::ctx::Ctx.fn_ir	IR: fn_canon (whether it has IR)
 base::ctx::Ctx.irfuncs	IR: the task'"'"'s own, which it alone enters (ir_exchange: the entry'"'"'s parts are its context'"'"'s while it works on the function, and change sides under the entry'"'"'s lock); read: R_IR, another'"'"'s (ir_stored)
 base::ctx::Ctx.ir_fn	IR: a function by fn_canon (written once, by ir_new_func on the main thread)
@@ -282,11 +282,11 @@ base::ctx::Ctx.ir_loc	off: the same
 base::ctx::Ctx.ir_locs	off: the same
 base::ctx::Ctx.print_after_all	off: --print-after-all
 base::ctx::Ctx.verify_ir	off: --verify-ir
-middle::opt::DEFERRED	the key (own_fp)
+base::ctx::Ctx.opt_deferred	the key (own_fp)
 base::ctx::Ctx.opt_level	key: options_hash
 base::ctx::Ctx.per_function	key: options_hash
 base::ctx::Ctx.comp_end	key: the component'"'"'s functions
-middle::parallel::COMP_GROWTH	own: an output
+base::ctx::Ctx.comp_growth	own: an output
 middle::parallel::COMP_INLINED	own: an output
 base::ctx::Ctx.comp_level	read: R_STATIC (ready)
 base::ctx::Ctx.comp_of	read: R_STATIC (ready)

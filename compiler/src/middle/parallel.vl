@@ -30,6 +30,9 @@
 // on one thread (serial_only): -g, --time-passes (its clock is the
 // process's), --stats, --verify-ir, the IR printers.
 
+use std::alloc::Allocator;
+use std::sync::atomic::{AtomicI64, Ordering};
+
 use crate::host_target;
 use crate::back::codecache::{
     R_STATIC, cc_component_begin, cc_component_end, cc_emit_begin, cc_emit_end, cc_note, cc_of,
@@ -384,6 +387,51 @@ pub const P_DEFERRED: i64 = 4;
 pub const P_SLP: i64 = 5;
 pub const P_EMIT: i64 = 6;
 
+// (0.29) A table of i64 that the tasks of a phase share by element: per
+// function or per component, an entry is written by the one task that has
+// the function (or the component) in its plan, and read by others only
+// once that task is done (a callee of a lower level, a fact made in an
+// earlier phase: tests/threads_writes.sh says which and why). The entries
+// are atomics, so the table is read and written through `&` in safe code
+// and a read never sees half a value; the order of a write and a later
+// read is the pool's (a phase's end, under its lock), so the loads and
+// stores are relaxed and cost what a plain one does. The main thread makes
+// the table anew between phases (`reset`, with `&mut`).
+pub struct TaskInts<A: Allocator> {
+    v: Vec<AtomicI64, A>,
+}
+
+pub fn task_ints() -> TaskInts<Comp> {
+    TaskInts { v: Vec::new_in(Comp {}) }
+}
+
+impl<A: Allocator> TaskInts<A> {
+    // n entries, each `value`.
+    pub fn reset(&mut self, n: i64, value: i64) {
+        self.v.clear();
+        for i in 0..n {
+            self.v.push(AtomicI64::new(value));
+        }
+    }
+
+    pub fn len(&self) -> i64 {
+        self.v.len() as i64
+    }
+
+    pub fn get(&self, i: i64) -> i64 {
+        self.v[i as usize].load(Ordering::Relaxed)
+    }
+
+    pub fn set(&self, i: i64, value: i64) {
+        self.v[i as usize].store(value, Ordering::Relaxed);
+    }
+
+    // (one writer an entry: a read and a write, not an atomic add)
+    pub fn add(&self, i: i64, d: i64) {
+        self.set(i, self.get(i) + d);
+    }
+}
+
 // Runs task `task` of a phase of kind `kind` in context cx (any thread).
 pub fn run_task(mut cx: *mut FnCtx<Comp>, kind: i64, task: i64, pcx: &Ctx<Comp>) {
     unsafe {
@@ -603,9 +651,6 @@ pub fn simplify_all(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
 
 // ---- -O2: the components, bottom up ----
 
-// Per component: what its inlining added to the program's size, and the
-// callees it inlined (one entry per call); its task writes them.
-static mut COMP_GROWTH: *mut i64 = 0 as *mut i64;
 static mut COMP_INLINED: *mut IntVec = 0 as *mut IntVec;
 
 // Builds the components and their levels (main thread).
@@ -643,7 +688,7 @@ fn build_components(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
         // through the address may be made direct, and the function inlined)
         // when it comes before it in SCC_ORDER (0.17 had it done then).
         pcx.comp_level = alloc_array::<i64>(pcx.comp_count + 1);
-        set_comp_growth(alloc_array::<i64>(pcx.comp_count + 1));
+        pcx.comp_growth.reset(pcx.comp_count + 1, 0);
         set_comp_inlined(alloc_zeroed((pcx.comp_count + 1) * size_of(IntVec)) as *mut IntVec);
         pcx.level_count = 0;
         let mut calls = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
@@ -728,7 +773,7 @@ pub fn optimize_components(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
             // next levels.
             for k in (*start.add(l as usize))..(*start.add((l + 1) as usize)) {
                 let c = (by_level[k as usize]);
-                add_program_size((*get_comp_growth().add(c as usize)), pcx);
+                add_program_size((pcx.comp_growth.get(c)), pcx);
                 for m in 0..(*get_comp_inlined().add(c as usize)).len() as i64 {
                     (pcx.fn_calls[((*get_comp_inlined().add(c as usize))[m as usize]) as usize]) -= 1;
                 }
@@ -764,7 +809,7 @@ fn run_component(cx: &mut FnCtx<Comp>, c: i64, pcx: &Ctx<Comp>) {
         for i in start..end {
             finish_component_function(cx, (pcx.scc_order[i as usize]), pcx);
         }
-        (*get_comp_growth().add(c as usize)) = cx.comp_growth;
+        pcx.comp_growth.set(c, cx.comp_growth);
         for m in 0..cx.comp_dec.len() as i64 {
             (*get_comp_inlined().add(c as usize)).push((cx.comp_dec[m as usize]));
         }
@@ -1090,31 +1135,6 @@ fn set_fn_consts(v: *mut ConstList) {
     // that entry, never the count or slots an appending task writes
     unsafe {
         FN_CONSTS = v;
-    }
-}
-
-// (0.28.0) COMP_GROWTH's accessors: every use of it is one of them.
-pub fn get_comp_growth() -> *mut i64 {
-    // UNSAFE: the per-component growth, a process-wide static mut; Rust has
-    // no safe access to a static mut
-    // SAFETY: allocated by build_components on the main thread before the
-    // levels; COMP_GROWTH[c] written only by component c's task
-    // (run_component, component_install), read by that task
-    // (cc_component_end) and by the main thread after the level's pool_run
-    // (optimize_components); one task per component per level
-    unsafe { COMP_GROWTH }
-}
-
-pub fn set_comp_growth(v: *mut i64) {
-    // UNSAFE: the per-component growth, a process-wide static mut; Rust has
-    // no safe access to a static mut
-    // SAFETY: allocated by build_components on the main thread before the
-    // levels; COMP_GROWTH[c] written only by component c's task
-    // (run_component, component_install), read by that task
-    // (cc_component_end) and by the main thread after the level's pool_run
-    // (optimize_components); one task per component per level
-    unsafe {
-        COMP_GROWTH = v;
     }
 }
 
