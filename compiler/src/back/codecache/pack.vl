@@ -3,13 +3,14 @@
 // cache is), KEY a hash of the root as given, the current directory, the
 // target, the options and the compiler's executable.
 //
-// A pack is 8-byte words: a header (MAGIC, VERSION, the compiler's hash,
-// the options' hash, the file's length, the entries, when it was last
-// used, 0), then the entries, each a word of its body's length, its key
-// (two words), its age (builds since one used it), its body's hash, and
-// the body (padded to a word). It is read whole (mapped), checked, and
-// indexed by key; a body is checked against its hash when its entry is
-// used, and a damaged one is a miss.
+// A pack is 8-byte words (little-endian): a header (MAGIC, VERSION, the
+// compiler's hash, the options' hash, the file's length, the entries, when
+// it was last used, 0), then the entries, each a word of its body's
+// length, its key (two words), its age (builds since one used it), its
+// body's hash, and the body (padded to a word). Its header is read, the
+// rest mapped; the entries are checked and indexed by key; a body is
+// checked against its hash when its entry is used, and a damaged one is a
+// miss.
 //
 // A build that made entries writes a new pack, renamed over the old one
 // (a reader has the old one or the new one, whole): the entries it used,
@@ -17,31 +18,23 @@
 // stays under twice what the build used. Then, when the directory's packs
 // pass LIMIT, the least recently used are deleted.
 
+use std::alloc::Allocator;
+use std::fs::File;
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::sync::Mutex;
+
 use crate::host_target;
 use crate::back::codecache::hash::hash_bytes;
-use crate::back::codecache::snapshot::Reader;
-use crate::base::{alloc_array, alloc_zeroed, free, getenv, memcpy, strlen};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::target::{T_AARCH64_MACOS, T_X86_64_MACOS};
 
+// UNSAFE: mmap is the C library's; std has no file mapping.
+// SAFETY: declared as <sys/mman.h> does (a pointer, a size_t, three ints
+// and an off_t: 64 bits on every target the compiler runs on); map_body
+// is its only caller.
 extern "C" {
-    fn open(path: *mut u8, flags: i32) -> i32;
-    fn close(fd: i32) -> i32;
-    fn lseek(fd: i32, offset: i64, whence: i32) -> i64;
-    fn pwrite(fd: i32, buf: *mut u8, n: u64, offset: i64) -> i64;
-    fn read(fd: i32, buf: *mut u8, n: u64) -> i64;
     fn mmap(addr: *mut u8, len: u64, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
-    fn time(t: *mut i64) -> i64;
-    fn opendir(path: *mut u8) -> *mut u8;
-    fn readdir(dir: *mut u8) -> *mut u8;
-    fn closedir(dir: *mut u8) -> i32;
-    fn unlink(path: *mut u8) -> i32;
-    fn rename(from: *mut u8, to: *mut u8) -> i32;
-    fn fopen(path: *mut u8, mode: *mut u8) -> *mut u8;
-    fn fwrite(buf: *mut u8, size: u64, count: u64, file: *mut u8) -> u64;
-    fn fclose(file: *mut u8) -> i32;
-    fn getpid() -> i32;
 }
 
 // "tachyong", and the version of the format (and of what the keys hold).
@@ -54,149 +47,201 @@ const MAX_AGE: i64 = 3;
 // The directory's packs, at most (bytes; VOLE_CACHE_LIMIT in MB).
 const LIMIT: i64 = 1024 * 1024 * 1024;
 
-// Per entry read: whether this build used it (its own task writes it).
-static mut USED: *mut bool = 0 as *mut bool;
+// An entry of the pack read: where its body is in the mapped bytes
+// (Ctx.pack), its length, key, age and its body's hash.
+#[derive(Clone, Copy)] pub struct PackEntry {
+    at: i64, len: i64, a: u64, b: u64, age: i64, hash: i64,
+}
 
-// The entries this build made: per slot (middle::parallel's tasks own
-// theirs), its body and key.
-#[derive(Clone, Copy)] pub struct NewEntry { body: *mut u8, len: i64, a: u64, b: u64 }
-static mut NEW: *mut NewEntry = 0 as *mut NewEntry;
+// An entry this build made (Ctx.pack_new: per slot, behind its lock;
+// middle::parallel's tasks own theirs): its body and key.
+pub struct NewEntry<A: Allocator> { body: Vec<u8, A>, made: bool, a: u64, b: u64 }
+
+// ---- Words ----
+
+// Word k of b.
+fn word(b: &[u8], k: i64) -> i64 {
+    let w = &b[(8 * k) as usize..(8 * k + 8) as usize];
+    let mut x: u64 = 0;
+    for i in 0..8 {
+        x = x | ((w[i] as u64) << (8 * i) as u64);
+    }
+    x as i64
+}
+
+fn word_bytes(v: i64) -> [u8; 8] {
+    let mut w = [0u8; 8];
+    let x = v as u64;
+    for i in 0..8 {
+        w[i] = (x >> (8 * i) as u64) as u8;
+    }
+    w
+}
+
+// A body's length in the file: padded to a word.
+fn padded(len: i64) -> i64 {
+    (len + 7) / 8 * 8
+}
 
 // ---- Reading ----
 
+// The file's bytes after its header, mapped (the file is `size` bytes).
+fn map_body(f: &File, size: i64) -> Option<&'static [u8]> {
+    let head = HEADER_WORDS * 8;
+    if size <= head {
+        return None;
+    }
+    // UNSAFE: mmap is C's, and what it returns is a raw pointer: the one
+    // view of a cache file's bytes (every read of a pack goes through this
+    // slice).
+    // SAFETY: f is open for reading and size is its length (the caller's,
+    // from its metadata, more than the header), so a result that is not
+    // MAP_FAILED (-1) or null is `size` readable bytes (PROT_READ,
+    // MAP_PRIVATE), and the slice is the `size - head` of them from `head`.
+    // Nothing unmaps it: it lives as long as the process ('static). The
+    // bytes do not change under it: a pack is written whole under another
+    // name and renamed over the old one (pack_save; the mapping keeps the
+    // old file, as it does when evict unlinks it), and the one write in
+    // place is pack_touch's, of header word 6, which is before `head` and
+    // so not in the slice. u8 has no alignment and every byte is a value.
+    unsafe {
+        let p = mmap(0 as *mut u8, size as u64, 1, 2, f.as_raw_fd(), 0);
+        if p == 0 as *mut u8 || p as i64 == -1 {
+            return None;
+        }
+        Some(std::slice::from_raw_parts(p.add(head as usize), (size - head) as usize))
+    }
+}
+
 // Reads the pack at `path` (made by compiler `ident` for options
 // `options`), if there is a whole one; `slots` entries may be made.
-pub fn pack_load(path: *mut u8, ident: i64, options: i64, slots: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        pcx.pack_path = path;
-        pcx.pack_ident = ident;
-        pcx.options = options;
-        pcx.new_slots = slots;
-        set_new(alloc_zeroed((slots + 1) * size_of(NewEntry)) as *mut NewEntry);
-        let fd = open(path, 0);
-        if fd < 0 {
+pub fn pack_load(path: String<Comp>, ident: i64, options: i64, slots: i64, pcx: &mut Ctx<Comp>) {
+    pcx.pack_ident = ident;
+    pcx.options = options;
+    pcx.pack_new.clear();
+    for _ in 0..slots {
+        pcx.pack_new.push(
+            Mutex::new(NewEntry { body: Vec::new_in(Comp {}), made: false, a: 0, b: 0 }));
+    }
+    pcx.pack = "".as_bytes();
+    pcx.pack_entries.clear();
+    pcx.pack_index.clear();
+    pcx.pack_used.reset(0, 0);
+    let opened = File::open(path.as_str());
+    pcx.pack_path = path;
+    let mut f = match opened {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let size = match f.metadata() {
+        Ok(m) => m.len() as i64,
+        Err(_) => return,
+    };
+    let mut head = [0u8; 64];
+    if size < HEADER_WORDS * 8 || size % 8 != 0 || f.read_exact(&mut head).is_err() {
+        return;
+    }
+    if word(&head, 0) != MAGIC || word(&head, 1) != VERSION || word(&head, 2) != ident
+        || word(&head, 3) != options || word(&head, 4) != size {
+        return;
+    }
+    let n = word(&head, 5);
+    if n < 0 || n > size / (ENTRY_WORDS * 8) {
+        return;
+    }
+    let bytes: &'static [u8] = match map_body(&f, size) {
+        Some(b) => b,
+        None => "".as_bytes(),
+    };
+    // (the entries' places, in words of the mapped bytes)
+    let words = bytes.len() as i64 / 8;
+    let mut k: i64 = 0;
+    for e in 0..n {
+        if k + ENTRY_WORDS > words {
+            pcx.pack_entries.clear();
             return;
         }
-        let size = lseek(fd, 0, 2);
-        if size < HEADER_WORDS * 8 || size % 8 != 0 {
-            close(fd);
+        let len = word(bytes, k);
+        if len < 0 || len > 8 * words || k + ENTRY_WORDS + padded(len) / 8 > words {
+            pcx.pack_entries.clear();
             return;
         }
-        // (PROT_READ, MAP_PRIVATE)
-        let p = mmap(0 as *mut u8, size as u64, 1, 2, fd, 0);
-        close(fd);
-        if p == 0 as *mut u8 || p as i64 == -1 {
-            return;
+        pcx.pack_entries.push(PackEntry {
+            at: 8 * (k + ENTRY_WORDS), len, a: word(bytes, k + 1) as u64,
+            b: word(bytes, k + 2) as u64, age: word(bytes, k + 3), hash: word(bytes, k + 4),
+        });
+        k += ENTRY_WORDS + padded(len) / 8;
+    }
+    pcx.pack = bytes;
+    pcx.pack_used.reset(n, 0);
+    let mut size: i64 = 64;
+    while size < 2 * n + 2 {
+        size *= 2;
+    }
+    pcx.pack_index.resize(size as usize, 0);
+    for e in 0..n {
+        let mut s = (pcx.pack_entries[e as usize].a >> 7) as i64 & (size - 1);
+        while pcx.pack_index[s as usize] != 0 {
+            s = (s + 1) & (size - 1);
         }
-        let w = p as *mut i64;
-        if (*w.add(0)) != MAGIC || (*w.add(1)) != VERSION || (*w.add(2)) != ident
-            || (*w.add(3)) != options || (*w.add(4)) != size {
-            return;
-        }
-        let n = (*w.add(5));
-        if n < 0 || n > size / (ENTRY_WORDS * 8) {
-            return;
-        }
-        let at = alloc_array::<i64>(n + 1);
-        let words = size / 8;
-        let mut k = HEADER_WORDS;
-        for e in 0..n {
-            if k + ENTRY_WORDS > words {
-                free(at as *mut u8);
-                return;
-            }
-            let len = (*w.add(k as usize));
-            if len < 0 || k + ENTRY_WORDS + (len + 7) / 8 > words {
-                free(at as *mut u8);
-                return;
-            }
-            (*at.add(e as usize)) = k;
-            k += ENTRY_WORDS + (len + 7) / 8;
-        }
-        pcx.pack = w;
-        pcx.pack_words = words;
-        pcx.entry_at = at;
-        pcx.entry_count = n;
-        set_used(alloc_array::<bool>(n + 1));
-        pcx.index_size = 64;
-        while pcx.index_size < 2 * n + 2 {
-            pcx.index_size *= 2;
-        }
-        pcx.index = alloc_array::<i64>(pcx.index_size);
-        for e in 0..n {
-            let mut s = ((*w.add(((*at.add(e as usize)) + 1) as usize)) as u64 >> 7) as i64
-                & (pcx.index_size - 1);
-            while (*pcx.index.add(s as usize)) != 0 {
-                s = (s + 1) & (pcx.index_size - 1);
-            }
-            (*pcx.index.add(s as usize)) = e + 1;
-        }
+        pcx.pack_index[s as usize] = e + 1;
     }
 }
 
 // The entry with key (a, b), or -1.
 pub fn pack_find(a: u64, b: u64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        if pcx.index_size == 0 {
-            return -1;
-        }
-        let mut s = (a >> 7) as i64 & (pcx.index_size - 1);
-        while (*pcx.index.add(s as usize)) != 0 {
-            let e = (*pcx.index.add(s as usize)) - 1;
-            let k = (*pcx.entry_at.add(e as usize));
-            if (*pcx.pack.add((k + 1) as usize)) as u64 == a
-                && (*pcx.pack.add((k + 2) as usize)) as u64 == b {
-                return e;
-            }
-            s = (s + 1) & (pcx.index_size - 1);
-        }
-        -1
+    let size = pcx.pack_index.len() as i64;
+    if size == 0 {
+        return -1;
     }
+    let mut s = (a >> 7) as i64 & (size - 1);
+    while pcx.pack_index[s as usize] != 0 {
+        let e = pcx.pack_index[s as usize] - 1;
+        let en = pcx.pack_entries[e as usize];
+        if en.a == a && en.b == b {
+            return e;
+        }
+        s = (s + 1) & (size - 1);
+    }
+    -1
 }
 
-// Entry e's body to read, if it is whole (its hash).
-pub fn pack_body(e: i64, r: &mut Reader, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        let k = (*pcx.entry_at.add(e as usize));
-        let len = (*pcx.pack.add(k as usize));
-        let p = (pcx.pack.add((k + ENTRY_WORDS) as usize)) as *mut u8;
-        if hash_bytes(p, len) as i64 != (*pcx.pack.add((k + 4) as usize)) {
-            return false;
-        }
-        r.p = p;
-        r.at = 0;
-        r.end = len;
-        r.bad = false;
-        true
-    }
+// Entry e's body.
+fn body_of(en: PackEntry, pcx: &Ctx<Comp>) -> &[u8] {
+    &pcx.pack[en.at as usize..(en.at + en.len) as usize]
 }
 
-// Entry e's body to read, checked already (pack_body).
-pub fn pack_body_at(e: i64, r: &mut Reader, pcx: &Ctx<Comp>) {
-    unsafe {
-        let k = (*pcx.entry_at.add(e as usize));
-        r.p = (pcx.pack.add((k + ENTRY_WORDS) as usize)) as *mut u8;
-        r.at = 0;
-        r.end = (*pcx.pack.add(k as usize));
-        r.bad = false;
+// Entry e's body, if it is whole (its hash).
+pub fn pack_body(e: i64, pcx: &Ctx<Comp>) -> Option<&[u8]> {
+    let en = pcx.pack_entries[e as usize];
+    let body = body_of(en, pcx);
+    if hash_bytes(body) as i64 != en.hash {
+        return None;
     }
+    Some(body)
+}
+
+// Entry e's body, checked already (pack_body).
+pub fn pack_body_at(e: i64, pcx: &Ctx<Comp>) -> &[u8] {
+    body_of(pcx.pack_entries[e as usize], pcx)
 }
 
 // Entry e was used (by the task that owns its key).
-pub fn pack_used(e: i64) {
-    unsafe { (*get_used().add(e as usize)) = true; }
+pub fn pack_used(e: i64, pcx: &Ctx<Comp>) {
+    pcx.pack_used.set(e, 1);
 }
 
 // A new entry for slot s (its task's own).
-pub fn pack_new(s: i64, a: u64, b: u64, body: *mut u8, len: i64, pcx: &Ctx<Comp>) {
-    unsafe {
-        if s < 0 || s >= pcx.new_slots {
-            free(body);
-            return;
-        }
-        free((*get_new().add(s as usize)).body);
-        (*get_new().add(s as usize)) = NewEntry { body, len, a, b };
+pub fn pack_new(s: i64, a: u64, b: u64, body: &[u8], pcx: &Ctx<Comp>) {
+    if s < 0 || s >= pcx.pack_new.len() as i64 {
+        return;
     }
+    let mut slot = pcx.pack_new[s as usize].lock().unwrap();
+    slot.body.clear();
+    slot.body.extend_from_slice(body);
+    slot.made = true;
+    slot.a = a;
+    slot.b = b;
 }
 
 // ---- Writing ----
@@ -204,165 +249,135 @@ pub fn pack_new(s: i64, a: u64, b: u64, body: *mut u8, len: i64, pcx: &Ctx<Comp>
 // What the build would write: whether anything changed (new entries, or
 // read ones not used).
 pub fn pack_changed(pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        for s in 0..pcx.new_slots {
-            if (*get_new().add(s as usize)).body != 0 as *mut u8 {
-                return true;
-            }
+    for s in 0..pcx.pack_new.len() {
+        if pcx.pack_new[s].lock().unwrap().made {
+            return true;
         }
-        for e in 0..pcx.entry_count {
-            if !(*get_used().add(e as usize)) {
-                return true;
-            }
-        }
-        false
     }
+    for e in 0..pcx.pack_used.len() {
+        if pcx.pack_used.get(e) == 0 {
+            return true;
+        }
+    }
+    false
 }
 
-fn put_word(f: *mut u8, v: i64) {
-    unsafe {
-        let mut w: [i64; 1] = [v];
-        fwrite((&raw mut w[0]) as *mut u8, 8, 1, f);
-    }
+fn put_word(w: &mut BufWriter<File>, v: i64) -> std::io::Result<()> {
+    w.write_all(&word_bytes(v))
 }
 
-fn put_entry(f: *mut u8, body: *mut u8, len: i64, a: u64, b: u64, age: i64, hash: i64) {
-    unsafe {
-        put_word(f, len);
-        put_word(f, a as i64);
-        put_word(f, b as i64);
-        put_word(f, age);
-        put_word(f, hash);
-        if len > 0 {
-            fwrite(body, 1, len as u64, f);
-        }
-        let pad = (8 - len % 8) % 8;
-        let zero: [i64; 1] = [0i64];
-        if pad > 0 {
-            fwrite((&raw const zero[0]) as *mut u8, 1, pad as u64, f);
-        }
-    }
+fn put_entry(w: &mut BufWriter<File>, body: &[u8], a: u64, b: u64, age: i64, hash: i64) -> std::io::Result<()> {
+    let len = body.len() as i64;
+    put_word(w, len)?;
+    put_word(w, a as i64)?;
+    put_word(w, b as i64)?;
+    put_word(w, age)?;
+    put_word(w, hash)?;
+    w.write_all(body)?;
+    let zero = [0u8; 8];
+    w.write_all(&zero[0..(padded(len) - len) as usize])
 }
 
 fn entry_bytes(len: i64) -> i64 {
-    ENTRY_WORDS * 8 + (len + 7) / 8 * 8
+    ENTRY_WORDS * 8 + padded(len)
+}
+
+// Seconds since 1970.
+fn now() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(_) => 0,
+    }
 }
 
 // Writes the new pack (main thread, or the copy of the process that
 // writes it): the entries used and made, then the others young enough
 // while the pack stays under twice the used ones.
 pub fn pack_save(pcx: &Ctx<Comp>) {
-    unsafe {
-        let mut used_bytes: i64 = 0;
-        let mut count: i64 = 0;
-        for s in 0..pcx.new_slots {
-            if (*get_new().add(s as usize)).body != 0 as *mut u8 {
-                used_bytes += entry_bytes((*get_new().add(s as usize)).len);
-                count += 1;
-            }
-        }
-        for e in 0..pcx.entry_count {
-            if (*get_used().add(e as usize)) {
-                used_bytes += entry_bytes(
-                    (*pcx.pack.add((*pcx.entry_at.add(e as usize)) as usize)));
-                count += 1;
-            }
-        }
-        // The others, youngest first, while they fit.
-        let room: i64 = if used_bytes < 16 * 1024 * 1024 { 32 * 1024 * 1024 }
-            else { 2 * used_bytes };
-        let keep = alloc_array::<bool>(pcx.entry_count + 1);
-        let mut total = used_bytes;
-        for age in 0..MAX_AGE {
-            for e in 0..pcx.entry_count {
-                let k = (*pcx.entry_at.add(e as usize));
-                if !(*get_used().add(e as usize)) && (*pcx.pack.add((k + 3) as usize)) == age
-                    && total + entry_bytes((*pcx.pack.add(k as usize))) <= room {
-                    (*keep.add(e as usize)) = true;
-                    total += entry_bytes((*pcx.pack.add(k as usize)));
-                    count += 1;
-                }
-            }
-        }
-        let tmp = tmp_path(pcx.pack_path);
-        let f = fopen(tmp, c"wb");
-        if f == 0 as *mut u8 {
-            return;
-        }
-        put_word(f, MAGIC);
-        put_word(f, VERSION);
-        put_word(f, pcx.pack_ident);
-        put_word(f, pcx.options);
-        put_word(f, HEADER_WORDS * 8 + total);
-        put_word(f, count);
-        put_word(f, time(0 as *mut i64));
-        put_word(f, 0);
-        for s in 0..pcx.new_slots {
-            let n = (*get_new().add(s as usize));
-            if n.body != 0 as *mut u8 {
-                put_entry(f, n.body, n.len, n.a, n.b, 0, hash_bytes(n.body, n.len) as i64);
-            }
-        }
-        for e in 0..pcx.entry_count {
-            let k = (*pcx.entry_at.add(e as usize));
-            if (*get_used().add(e as usize)) || (*keep.add(e as usize)) {
-                put_entry(f, (pcx.pack.add((k + ENTRY_WORDS) as usize)) as *mut u8,
-                    (*pcx.pack.add(k as usize)), (*pcx.pack.add((k + 1) as usize)) as u64,
-                    (*pcx.pack.add((k + 2) as usize)) as u64,
-                    if (*get_used().add(e as usize)) { 0 }
-                    else { (*pcx.pack.add((k + 3) as usize)) + 1 },
-                    (*pcx.pack.add((k + 4) as usize)));
-            }
-        }
-        if fclose(f) != 0 || rename(tmp, pcx.pack_path) != 0 {
-            unlink(tmp);
-            return;
-        }
-        evict(pcx);
+    let tmp = tmp_path(pcx.pack_path.as_str());
+    if write_pack(tmp.as_str(), pcx).is_err()
+        || std::fs::rename(tmp.as_str(), pcx.pack_path.as_str()).is_err() {
+        let _ = std::fs::remove_file(tmp.as_str());
+        return;
     }
+    evict(pcx);
+}
+
+fn write_pack(tmp: &str, pcx: &Ctx<Comp>) -> std::io::Result<()> {
+    let n = pcx.pack_entries.len();
+    let mut used_bytes: i64 = 0;
+    let mut count: i64 = 0;
+    for s in 0..pcx.pack_new.len() {
+        let slot = pcx.pack_new[s].lock().unwrap();
+        if slot.made {
+            used_bytes += entry_bytes(slot.body.len() as i64);
+            count += 1;
+        }
+    }
+    for e in 0..n {
+        if pcx.pack_used.get(e as i64) != 0 {
+            used_bytes += entry_bytes(pcx.pack_entries[e].len);
+            count += 1;
+        }
+    }
+    // The others, youngest first, while they fit.
+    let room: i64 = if used_bytes < 16 * 1024 * 1024 { 32 * 1024 * 1024 }
+        else { 2 * used_bytes };
+    let mut keep: Vec<bool, Comp> = Vec::new_in(Comp {});
+    keep.resize(n, false);
+    let mut total = used_bytes;
+    for age in 0..MAX_AGE {
+        for e in 0..n {
+            let en = pcx.pack_entries[e];
+            if pcx.pack_used.get(e as i64) == 0 && en.age == age
+                && total + entry_bytes(en.len) <= room {
+                keep[e] = true;
+                total += entry_bytes(en.len);
+                count += 1;
+            }
+        }
+    }
+    let mut w = BufWriter::new(File::create(tmp)?);
+    put_word(&mut w, MAGIC)?;
+    put_word(&mut w, VERSION)?;
+    put_word(&mut w, pcx.pack_ident)?;
+    put_word(&mut w, pcx.options)?;
+    put_word(&mut w, HEADER_WORDS * 8 + total)?;
+    put_word(&mut w, count)?;
+    put_word(&mut w, now())?;
+    put_word(&mut w, 0)?;
+    for s in 0..pcx.pack_new.len() {
+        let slot = pcx.pack_new[s].lock().unwrap();
+        if slot.made {
+            put_entry(&mut w, &slot.body, slot.a, slot.b, 0, hash_bytes(&slot.body) as i64)?;
+        }
+    }
+    for e in 0..n {
+        let en = pcx.pack_entries[e];
+        let used = pcx.pack_used.get(e as i64) != 0;
+        if used || keep[e] {
+            put_entry(&mut w, body_of(en, pcx), en.a, en.b, if used { 0 } else { en.age + 1 },
+                en.hash)?;
+        }
+    }
+    w.flush()
 }
 
 // The pack was all used and nothing was made: its time of last use.
 pub fn pack_touch(pcx: &Ctx<Comp>) {
-    unsafe {
-        if pcx.pack == 0 as *mut i64 {
-            return;
-        }
-        let fd = open(pcx.pack_path, 1);
-        if fd >= 0 {
-            let mut now: [i64; 1] = [time(0 as *mut i64)];
-            pwrite(fd, (&raw mut now[0]) as *mut u8, 8, 48);
-            close(fd);
+    // (no pack was read: no index)
+    if pcx.pack_index.len() == 0 {
+        return;
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(pcx.pack_path.as_str()) {
+        if f.seek(SeekFrom::Start(48)).is_ok() {
+            let _ = f.write_all(&word_bytes(now()));
         }
     }
 }
 
-fn tmp_path(path: *mut u8) -> *mut u8 {
-    unsafe {
-        let n = strlen(path) as i64;
-        let p = alloc_zeroed(n + 32);
-        memcpy(p, path, n as u64);
-        let mut k = n;
-        let tail = c".tmp";
-        for i in 0..4 {
-            (*p.add(k as usize)) = (*tail.add(i as usize));
-            k += 1;
-        }
-        let mut pid = getpid() as i64;
-        let mut digits: [u8; 20] = [0; 20];
-        let mut d: i64 = 0;
-        while pid > 0 || d == 0 {
-            digits[d as usize] = (b'0' + (pid % 10) as u8) as u8;
-            pid = pid / 10;
-            d += 1;
-        }
-        while d > 0 {
-            d -= 1;
-            (*p.add(k as usize)) = digits[d as usize];
-            k += 1;
-        }
-        p
-    }
+fn tmp_path(path: &str) -> String<Comp> {
+    format_in("{path}.tmp{}", std::process::id(), Comp {})
 }
 
 // ---- Eviction ----
@@ -370,90 +385,63 @@ fn tmp_path(path: *mut u8) -> *mut u8 {
 // The directory's packs (g-*.pack): when they pass the limit, the least
 // recently used go.
 fn evict(pcx: &Ctx<Comp>) {
-    unsafe {
-        let dir = dir_of(pcx.pack_path);
-        let mut limit = LIMIT;
-        let env = getenv(c"VOLE_CACHE_LIMIT");
-        if env != 0 as *mut u8 {
-            let mut mb: i64 = 0;
-            let mut i: i64 = 0;
-            while (*env.add(i as usize)) >= b'0' && (*env.add(i as usize)) <= b'9' {
-                mb = mb * 10 + ((*env.add(i as usize)) - b'0') as i64;
-                i += 1;
-            }
-            limit = mb * 1024 * 1024;
-        }
-        let d = opendir(dir);
-        if d == 0 as *mut u8 {
-            return;
-        }
-        let at = name_offset();
-        let mut names = 0 as *mut *mut u8;
-        let mut sizes = 0 as *mut i64;
-        let mut times = 0 as *mut i64;
-        let mut n: i64 = 0;
-        let mut cap: i64 = 0;
-        let mut total: i64 = 0;
-        while true {
-            let ent = readdir(d);
-            if ent == 0 as *mut u8 {
+    let dir = dir_of(pcx.pack_path.as_str());
+    let mut limit = LIMIT;
+    if let Ok(env) = std::env::var_in("VOLE_CACHE_LIMIT", Comp {}) {
+        let mut mb: i64 = 0;
+        for &c in env.as_bytes().iter() {
+            if c < b'0' || c > b'9' {
                 break;
             }
-            let name = ent.add(at as usize);
-            if !is_pack_name(name) {
-                continue;
-            }
-            let path = join_path(dir, name);
-            let fd = open(path, 0);
-            if fd < 0 {
-                free(path);
-                continue;
-            }
-            let size = lseek(fd, 0, 2);
-            let mut head: [i64; 8] = [0i64; 8];
-            lseek(fd, 0, 0);
-            let got = read(fd, (&raw mut head[0]) as *mut u8, 64);
-            close(fd);
-            if n == cap {
-                cap = cap * 2 + 16;
-                let nn = alloc_array::<*mut u8>(cap);
-                let ns = alloc_array::<i64>(cap);
-                let nt = alloc_array::<i64>(cap);
-                for i in 0..n {
-                    (*nn.add(i as usize)) = (*names.add(i as usize));
-                    (*ns.add(i as usize)) = (*sizes.add(i as usize));
-                    (*nt.add(i as usize)) = (*times.add(i as usize));
-                }
-                free(names as *mut u8);
-                free(sizes as *mut u8);
-                free(times as *mut u8);
-                names = nn;
-                sizes = ns;
-                times = nt;
-            }
-            (*names.add(n as usize)) = path;
-            (*sizes.add(n as usize)) = size;
-            (*times.add(n as usize)) = if got == 64 && head[0] == MAGIC { head[6] } else { 0 };
-            total += size;
-            n += 1;
+            mb = mb * 10 + (c - b'0') as i64;
         }
-        closedir(d);
-        while total > limit && n > 0 {
-            let mut old: i64 = 0;
-            for i in 1..n {
-                if (*times.add(i as usize)) < (*times.add(old as usize)) {
-                    old = i;
-                }
-            }
-            if !same_path((*names.add(old as usize)), pcx.pack_path) {
-                unlink((*names.add(old as usize)));
-            }
-            total -= (*sizes.add(old as usize));
-            (*names.add(old as usize)) = (*names.add((n - 1) as usize));
-            (*sizes.add(old as usize)) = (*sizes.add((n - 1) as usize));
-            (*times.add(old as usize)) = (*times.add((n - 1) as usize));
-            n -= 1;
+        limit = mb * 1024 * 1024;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let mut names: Vec<String<Comp>, Comp> = Vec::new_in(Comp {});
+    let mut sizes: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut times: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut total: i64 = 0;
+    for ent in entries {
+        let ent = match ent {
+            Ok(e) => e,
+            Err(_) => break,
+        };
+        if !is_pack_name(ent.file_name()) {
+            continue;
         }
+        let mut f = match File::open(ent.path()) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let size = match f.metadata() {
+            Ok(m) => m.len() as i64,
+            Err(_) => 0,
+        };
+        let mut head = [0u8; 64];
+        let whole = f.read_exact(&mut head).is_ok();
+        names.push(String::from_in(ent.path(), Comp {}));
+        sizes.push(size);
+        times.push(if whole && word(&head, 0) == MAGIC { word(&head, 6) } else { 0 });
+        total += size;
+    }
+    while total > limit && names.len() > 0 {
+        let mut old: usize = 0;
+        for i in 1..names.len() {
+            if times[i] < times[old] {
+                old = i;
+            }
+        }
+        if !same_path(names[old].as_str(), pcx.pack_path.as_str()) {
+            let _ = std::fs::remove_file(names[old].as_str());
+        }
+        total -= sizes[old];
+        names.swap_remove(old);
+        sizes.swap_remove(old);
+        times.swap_remove(old);
     }
 }
 
@@ -466,127 +454,25 @@ pub fn name_offset() -> i64 {
     if host == T_AARCH64_MACOS { 21 } else if host == T_X86_64_MACOS { 8 } else { 19 }
 }
 
-fn is_pack_name(name: *mut u8) -> bool {
-    unsafe {
-        let n = strlen(name) as i64;
-        n == 2 + 16 + 5 && (*name.add(0)) == b'g' && (*name.add(1)) == b'-'
-            && (*name.add((n - 5) as usize)) == b'.' && (*name.add((n - 4) as usize)) == b'p'
-            && (*name.add((n - 3) as usize)) == b'a' && (*name.add((n - 2) as usize)) == b'c'
-            && (*name.add((n - 1) as usize)) == b'k'
+// g-, 16 digits, .pack
+fn is_pack_name(name: &str) -> bool {
+    name.len() == 2 + 16 + 5 && name.starts_with("g-") && name.ends_with(".pack")
+}
+
+// The directory of a path: what is before its last '/' ("." without one,
+// "/" for a file of the root).
+fn dir_of(path: &str) -> &str {
+    match path.rfind('/') {
+        None => ".",
+        Some(0) => "/",
+        Some(k) => &path[..k],
     }
 }
 
-fn dir_of(path: *mut u8) -> *mut u8 {
-    unsafe {
-        let n = strlen(path) as i64;
-        let mut k = n;
-        while k > 0 && (*path.add((k - 1) as usize)) != b'/' {
-            k -= 1;
-        }
-        let p = alloc_zeroed(n + 2);
-        if k == 0 {
-            (*p.add(0)) = b'.';
-            return p;
-        }
-        memcpy(p, path, (k - 1) as u64);
-        if k == 1 {
-            (*p.add(0)) = b'/';
-        }
-        p
-    }
-}
-
-fn join_path(dir: *mut u8, name: *mut u8) -> *mut u8 {
-    unsafe {
-        let a = strlen(dir) as i64;
-        let b = strlen(name) as i64;
-        let p = alloc_zeroed(a + b + 2);
-        memcpy(p, dir, a as u64);
-        (*p.add(a as usize)) = b'/';
-        memcpy(p.add((a + 1) as usize), name, b as u64);
-        p
-    }
-}
-
-// Whether two paths of the same directory name the same file (by name).
-fn same_path(a: *mut u8, b: *mut u8) -> bool {
-    unsafe {
-        let na = strlen(a) as i64;
-        let nb = strlen(b) as i64;
-        if na < 23 || nb < 23 {
-            return false;
-        }
-        for i in 0..23 {
-            if (*a.add((na - 1 - i) as usize)) != (*b.add((nb - 1 - i) as usize)) {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-// (0.28.0) USED's accessors: every use of it is one of them.
-fn get_used() -> *mut bool {
-    // UNSAFE: the code cache pack's used marks, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: allocated by pack_load on the main thread; since 0.27.8 a
-    // task marks USED[e] (mark_used, mark_used_fn) only when none of its
-    // functions is fn_ambig; e is the entry whose 128-bit key (a, b) equals
-    // the task's exactly (pack_find); a key mixes each member's fn_nameh,
-    // and names_begin marks fn_ambig every function whose name key another
-    // shares, so two marking tasks of one phase have distinct key inputs
-    // (one IR function per front function: ir_new_func's only caller is
-    // lower_body), and the same e only if two distinct inputs hash to the
-    // same 128-bit key, which the cache already assumes never happens (such
-    // a hit would also install the wrong code); phases are ordered by
-    // MUTEX; pack_changed and pack_save read it on the main thread after
-    // the phases
-    unsafe { USED }
-}
-
-fn set_used(v: *mut bool) {
-    // UNSAFE: the code cache pack's used marks, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: allocated by pack_load on the main thread; since 0.27.8 a
-    // task marks USED[e] (mark_used, mark_used_fn) only when none of its
-    // functions is fn_ambig; e is the entry whose 128-bit key (a, b) equals
-    // the task's exactly (pack_find); a key mixes each member's fn_nameh,
-    // and names_begin marks fn_ambig every function whose name key another
-    // shares, so two marking tasks of one phase have distinct key inputs
-    // (one IR function per front function: ir_new_func's only caller is
-    // lower_body), and the same e only if two distinct inputs hash to the
-    // same 128-bit key, which the cache already assumes never happens (such
-    // a hit would also install the wrong code); phases are ordered by
-    // MUTEX; pack_changed and pack_save read it on the main thread after
-    // the phases
-    unsafe {
-        USED = v;
-    }
-}
-
-// (0.28.0) NEW's accessors: every use of it is one of them.
-fn get_new() -> *mut NewEntry {
-    // UNSAFE: the code cache pack's new entries, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: allocated by pack_load on the main thread before the phases;
-    // slot s = SLOTS_PER_FN * fi + kind - 1 written only by pack_new from
-    // store, called by the task for fi and that kind (cc_component_end for
-    // scc_order[start], cc_emit_end, cc_scalar_end), so each slot has one
-    // writer; pack_changed/pack_save read it on the main thread after the
-    // phases
-    unsafe { NEW }
-}
-
-fn set_new(v: *mut NewEntry) {
-    // UNSAFE: the code cache pack's new entries, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: allocated by pack_load on the main thread before the phases;
-    // slot s = SLOTS_PER_FN * fi + kind - 1 written only by pack_new from
-    // store, called by the task for fi and that kind (cc_component_end for
-    // scc_order[start], cc_emit_end, cc_scalar_end), so each slot has one
-    // writer; pack_changed/pack_save read it on the main thread after the
-    // phases
-    unsafe {
-        NEW = v;
-    }
+// Whether two paths of the same directory name the same file (by name:
+// a pack's name is 23 bytes).
+fn same_path(a: &str, b: &str) -> bool {
+    let x = a.as_bytes();
+    let y = b.as_bytes();
+    x.len() >= 23 && y.len() >= 23 && x[x.len() - 23..] == y[y.len() - 23..]
 }
