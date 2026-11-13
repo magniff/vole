@@ -7,8 +7,8 @@
 $ type types015/main.vl:10:20
 i64	half(v)?
 $ type types015/main.vl:15:18 types015/main.vl:16:9
-i32 (widened to i64)	n
-i32 (widened to i64)	n
+i32	n
+i32	n
 $ type types015/main.vl:23:19 types015/main.vl:23:52 types015/main.vl:23:43
 P	p
 i64	p.x + q.y
@@ -18,9 +18,9 @@ $ refs P
 3:8	def	struct P { x: i64, y: i64 }
 20:13	init	main	let p = P { x: 1, y: 2 };
 $ def P::clone P::cmp
-note query.derived: 'P::clone' is derived, at types015/main.vl:2:26: #[derive] makes it; it has no source of its own
+note query.derived: 'P::clone' is derived, at types015/main.vl:2:49: #[derive] makes it; it has no source of its own
 try: volec query show crate::P
-note query.derived: 'P::cmp' is derived, at types015/main.vl:2:14: #[derive] makes it; it has no source of its own
+note query.derived: 'P::cmp' is derived, at types015/main.vl:2:37: #[derive] makes it; it has no source of its own
 try: volec query show crate::P
 [exit 1]
 $ refs quarter

@@ -49,40 +49,39 @@ back-to-back requests in the same second: 5
 
 **An iterator of our own.** `Iterator` is a prelude trait with one
 required method, `next`, and an associated type, `Item`. `Lines` yields
-the lines of a text as views into it (slices, no copies); once it
-implements `next` it has every adapter (`filter`, `map`, `for_each`...)
-for free:
+the lines of a text as slices of it (no copies; `'a` says that they
+borrow the text); once it implements `next` it has every adapter
+(`filter`, `map`, `for_each`...) for free:
 
 ```tach
-struct Lines { text: [u8], pos: i64 }
+struct Lines<'a> { text: &'a str, pos: usize }
 
-impl Iterator for Lines {
-    type Item = [u8];
+impl<'a> Iterator for Lines<'a> {
+    type Item = &'a str;
 
-    fn next(inout self) -> Option<[u8]> {
+    fn next(&mut self) -> Option<&'a str> {
         if self.pos >= self.text.len() { return None; }
-        let start = self.pos;
-        while self.pos < self.text.len() && self.text[self.pos] != '\n' { self.pos += 1; }
-        let line = self.text[start..self.pos];
-        self.pos += 1; // past the '\n'
-        Some(line)
+        let rest = &self.text[self.pos..];
+        let len = rest.find('\n').unwrap_or(rest.len());
+        self.pos += len + 1; // past the '\n'
+        Some(&rest[..len])
     }
 }
 ```
 
 **Closures that change their surroundings.** Parsing is a `filter` and a
 `for_each`. The second closure pushes onto `entries` and counts `bad`
-lines: both are `var`, so the closure captures them *inout* and its
-changes are seen after the chain. (A plain `let` is captured by a let
-access, read only; `sink |..|` takes what it captures.)
+lines: it borrows both mutably (they are `let mut`), so its changes are
+seen after the chain. (What a closure only reads it borrows shared;
+`move |..|` takes what it captures.)
 
 ```tach
-var entries: Vec<Entry> = Vec::new_in(gpa);
-var bad = 0;
-Lines::new(input.as_slice())
-    .filter(|l| l.len() > 0 && l[0] != '#')
+let mut entries: Vec<Entry, Gpa> = Vec::new_in(gpa);
+let mut bad = 0;
+Lines::new(&input)
+    .filter(|l| !l.is_empty() && !l.starts_with('#'))
     .for_each(|l| {
-        match parse_entry(l, gpa) {
+        match parse_entry(l) {
             Some(e) => entries.push(e),
             None => bad += 1,
         }
@@ -91,14 +90,14 @@ Lines::new(input.as_slice())
 
 `parse_entry` returns an `Option<Entry>` and uses `?` on each field, so
 any missing or malformed field makes the whole line `None`
-(`parse_int(..).ok()?` turns the `Result` into an `Option` first).
+(`.parse().ok()?` turns the `Result` into an `Option` first).
 
 **Consumers** reduce a chain to a value: `count`, `sum`, `min`, `max`
 (an `Option`, empty for no items), and `fold`, here with a tuple
 accumulator destructured in the closure's parameter list:
 
 ```tach
-let total_ms = all.iter().map(|e| e.millis).sum();
+let total_ms: i64 = all.iter().map(|e| e.millis).sum();
 let slowest = all.iter().map(|e| e.millis).max().unwrap_or(0);
 let (ok, failed) = all.iter().fold((0, 0), |(ok, failed), e| {
     if e.status < 400 { (ok + 1, failed) } else { (ok, failed + 1) }
@@ -113,8 +112,8 @@ closure has its own unnamed type, so `count_where` is instantiated once
 per closure and the call is direct, usually inlined:
 
 ```tach
-fn count_where<F: Fn(Entry) -> bool>(entries: [Entry], pred: F) -> i64 {
-    entries.iter().filter(pred).count()
+fn count_where<F: Fn(&Entry) -> bool>(entries: &[Entry], pred: F) -> usize {
+    entries.iter().filter(|e| pred(e)).count()
 }
 
 let errors = count_where(all, |e| e.level == Level::Error);
@@ -122,56 +121,57 @@ let errors = count_where(all, |e| e.level == Level::Error);
 
 Inside the call the closure's parameter type comes from the bound. A
 closure kept in a `let` has no bound to learn from, so its parameter is
-annotated: `let is_slow = |e: Entry| e.millis > limit;`.
+annotated: `let is_slow = |e: &Entry| e.millis > limit;`.
 
 **collect, sort_by, enumerate, take.** `collect_in(gpa)` makes a `Vec`
 of the items (dropped, so freed, at the end of `main`); `sort_by` sorts
-it in place by a comparison of two elements (let: read in place)
-returning negative, zero or positive, so `b.cmp(a)` sorts descending:
+it in place by a comparison of two elements (references to them)
+returning an `Ordering`, so `b.cmp(a)` sorts descending:
 
 ```tach
-var slow = all.iter().filter(is_slow).collect_in(gpa);
-slow.sort_by(|a, b| b.millis.cmp(a.millis)); // slowest first
+let mut slow: Vec<Entry, Gpa> = all.iter().copied().filter(is_slow).collect_in(gpa);
+slow.sort_by(|a, b| b.millis.cmp(&a.millis)); // slowest first
 for (rank, e) in slow.iter().enumerate().take(3) {
     println("  {}. {:>4} ms  {:<5} {}", rank + 1, e.millis, e.service, e.path);
 }
 ```
 
-**Counting with a HashMap.** `get_or_insert(key, 0)` is Rust's
-`entry(key).or_insert(0)`: it returns the value in place, as a
-one-element slice, so `[0] += 1` increments it. The map's `(key, value)`
-pairs are then collected and sorted by count, then by name:
+**Counting with a HashMap.** `entry(key).or_insert(0)` returns a `&mut`
+to the value in place, so `*.. += 1` increments it. The map's `(key,
+value)` pairs are then collected and sorted by count, then by name
+(`then` takes the second comparison when the first says equal):
 
 ```tach
-for e in all { per_service.get_or_insert(e.service, 0)[0] += 1; }
-var ranked = per_service.iter().collect_in(gpa);
-ranked.sort_by(|a, b| {
-    let (name_a, n_a) = a; // a and b read the Vec's elements in place (let)
-    let (name_b, n_b) = b;
-    if n_a != n_b { n_b - n_a } else { name_a.cmp(name_b) }
-});
+for e in all { *per_service.entry(e.service).or_insert(0) += 1; }
+let mut ranked: Vec<(&str, i64), Gpa> = per_service
+    .iter()
+    .map(|(s, n)| (*s, *n))
+    .collect_in(gpa);
+ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
 ```
 
 **zip** walks two iterators in step, ending with the shorter one;
-zipping the entries with `all[1..]` pairs each request with the next.
+zipping the entries with `&all[1..]` pairs each request with the
+next.
 
 ## Language features
 
-- closures, captures (a `var` inout, the rest let), `sink ||`, `Fn`/`FnMut` bounds: `volec guide closures`
+- closures, captures (by reference, `move ||`), `Fn`/`FnMut` bounds: `volec guide closures`
 - `Iterator`, `type Item`, adapters and consumers, `sort_by`: `volec guide iterators`
 - `Option` and `?`, `.ok()`: `volec guide conversions`
-- `HashMap`, `split_whitespace_in`, `parse_int`, `read_stdin_in`: `volec guide std`
-- f-string specs (`{n:>3}`, `{service:<6}`): `volec guide formatting`
-- `#[derive(Eq, Debug)]` on an enum: `volec guide formatting`
+- `HashMap`, `split_whitespace`, `parse`, `io::read_to_string_in`: `volec guide std`
+- format specs (`{n:>3}`, `{service:<6}`): `volec guide formatting`
+- `#[derive(PartialEq, Debug)]` on an enum: `volec guide formatting`
 
 ## Going further
 
-What Rust has that vole does not (yet), and what to write instead:
+The rest of Rust's iterators is there too: `iter_mut`, `rev`, `step_by`,
+`chain`, `flat_map`, `peekable`; `collect_in(gpa)` makes a `HashMap`
+from pairs as it makes a `Vec`; a function may return a closure or an
+iterator (`-> impl Fn(i64) -> i64`, `-> impl Iterator<Item = &i64>`).
+What differs from Rust:
 
-- `iter_mut`: loop over indices, `v[i] *= 2`.
-- `rev`, `step_by`, `chain`, `flat_map`, `peekable`: write the loop, or
-  an iterator of your own like `Lines`.
-- `collect::<HashMap<..>>()`: `collect` always makes a `Vec`; fill a map
-  with a `for` loop.
-- Returning a closure or an iterator built from one (`impl Fn`,
-  `impl Iterator`): pass closures *in* through generic parameters.
+- Collecting allocates, so it names its allocator: `collect_in(gpa)`,
+  not `collect()`.
+- There is no `dyn`: a closure is passed through a generic parameter or
+  `impl Fn`, not as a `Box<dyn Fn>`.

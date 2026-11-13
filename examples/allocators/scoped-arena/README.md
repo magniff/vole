@@ -6,19 +6,19 @@ memory for a moment: its words, its keys in lowercase, the text of its
 response. All of it comes from an arena made for that request and freed,
 at once, when the request is answered:
 
-```tach
-let used = arena_scope(gpa, |scratch| {
-    var out = String::new_in(scratch);
-    answer(&store, line, scratch, &out);
-    println("{line:<24} -> {}", out.as_slice());
+```vole
+let used = arena_scope(&gpa, |scratch| {
+    let mut out = String::new_in(scratch);
+    answer(&mut store, line, scratch, &mut out);
+    println("{line:<24} -> {out}");
     scratch.used()
 });
 ```
 
 What must outlive a request is allocated elsewhere, on purpose: the map
-on `Gpa`, and the bytes of its keys in an `Arena` kept for the whole
-run. The compiler holds the line between the two: nothing that holds the
-scope's arena can leave the scope.
+on `Gpa`, and the text of its keys in an `Arena` kept for the whole
+run. The compiler holds the line between the two: nothing that borrows
+the scope's arena can leave the scope.
 
 Every command below is run by `tests/walkthrough/run.sh` in a copy of
 this directory, and its output is checked against this file;
@@ -36,7 +36,7 @@ GET plums                -> plums is not set
 SUM apples pears plums   -> sum = 12 (not set: plums)
 ADD pears lots           -> not a number: lots
 FLY away                 -> unknown request: FLY away
-8 requests, 2 keys; scratch per request at most 110 bytes
+8 requests, 2 keys; scratch per request at most 185 bytes
 the keys' arena holds 11 bytes
 ok: built store
 ```
@@ -53,23 +53,26 @@ ok: built store-checked
 
 ## How it works
 
-`arena_scope(gpa, f)` makes an arena whose memory comes from `gpa`,
-calls `f` with a handle to it (a `ScopedArena`), and frees the arena
+`arena_scope(&gpa, f)` makes an arena whose memory comes from `gpa`,
+calls `f` with a reference to it (a `&ArenaScope`), and frees the arena
 when `f` returns; it returns what `f` returns. Allocating from it is
 bumping a pointer, and freeing a block inside it is nothing (but for
 the last one, which the pointer gives back): the scope's end frees
-everything. An 8 KB chunk is enough for every request here: the busiest
-one used 110 bytes.
+everything. One chunk is enough for every request here: the busiest
+one used 185 bytes.
 
 `answer` does not know or care what kind of allocator it is given:
 
-```tach
-fn answer<A: Allocator>(store: inout Store, line: [u8], scratch: sink A, out: inout String<A>)
+```vole
+fn answer<A: Allocator + Copy>(
+    store: &mut Store<'_, Gpa, Gpa>, line: &str, scratch: A, out: &mut String<A>,
+)
 ```
 
 Inside, every temporary is made on `scratch`:
-`split_whitespace_in(line, scratch)`, `lower_in(w[1], scratch)` (a
-lowercased copy), a `Vec<u8, A>` listing the missing keys of a `SUM`. Each is
+`line.split_whitespace().collect_in(scratch)`, `lower_in(words[1],
+scratch)` (a lowercased copy), a `String<A>` listing the missing keys of
+a `SUM`. Each is
 dropped at the end of its scope, which on an arena frees nothing: the
 scope's end frees it all. The response is written into `out`, a `String`
 on the same arena.
@@ -78,57 +81,38 @@ A known key's value changes in place, through `get_mut`. A new key must
 outlive the request, so it is copied out of the scratch into the store's
 own arena before it goes into the map:
 
-```tach
-match store.values.get_mut(key.as_slice()) {
+```vole
+match store.values.get_mut(key.as_str()) {
     // A known key: its value changes in place.
-    Some(v) => v[0] = new,
-    // A new key: its bytes go where the map's keys live.
+    Some(v) => *v = new,
+    // A new key: its text goes where the map's keys live. The
+    // copy borrows the arena, not the request's scratch.
     None => {
-        store.values.insert(intern(store.names, key.as_slice()), new);
+        store.values.insert(store.names.alloc_str(key.as_str()), new);
     }
 }
 ```
 
-`intern` copies the bytes into `names`, an `Arena` made once in `main`
-(`Arena::new_in(gpa)`) and freed at the end by a guard, `FreeAll`, whose
-`Drop` calls `unsafe { self.arena.free_all() }` (unsafe because a view
-into it could still be used after). The view
-it returns lives as long as the arena, not as long as the `Vec` that
-copied the bytes there, which safe code cannot say yet (a view of a
-`Vec` ends when the `Vec` is dropped).
-So `intern` forgets the `Vec` and makes the view from its pointer, in
-`unsafe`:
-
-```tach
-fn intern(names: Arena, s: [u8]) -> [u8] {
-    var v: Vec<u8, Arena> = Vec::with_capacity_in(s.len(), names);
-    v.extend_from_slice(s);
-    let p = v.as_slice().ptr;
-    std::forget(v);
-    unsafe { p[0..s.len()] }
-}
-```
+`alloc_str` copies the text into `names`, an `Arena` made once in `main`
+(`Arena::new_in(gpa)`) and dropped at its end, after the store. The
+`&str` it returns borrows the arena, so it lives as long as the arena,
+and the store's type says so: `Store<'n, M, N>` holds `&'n Arena<N>` and
+a `HashMap<&'n str, i64, M>`. The borrow checker keeps the map from
+outliving the arena its keys are in; there is no `unsafe` in the
+program.
 
 ## What the effects say
 
 ```console
 $ volec query effects crate
-<crate::FreeAll as Drop>::drop	alloc(Gpa) panic unsafe
-crate::intern	alloc(Arena) panic unsafe
-lower_in<ScopedArena>	alloc(ScopedArena) panic
-answer<ScopedArena>	alloc(Gpa, Arena, ScopedArena) io panic diverge
-crate::main	alloc(Gpa, Arena) io panic diverge
+lower_in<&ArenaScope<&Gpa>>	alloc(ArenaScope<&Gpa>) panic diverge
+answer<&ArenaScope<&Gpa>>	alloc(Gpa, Arena<Gpa>, ArenaScope<&Gpa>) panic diverge
+crate::main	alloc(Gpa, Arena<Gpa>, ArenaScope<&Gpa>, &Gpa) io static panic diverge
 ```
 
-(The guard's drop gives the keys' arena back to `Gpa`, in its own
-`unsafe` block: `main` has none left.)
-
-`answer<ScopedArena>` allocates from all three: `Gpa` (the map grows),
-`Arena` (a new key is interned), `ScopedArena` (the scratch). In `main`
-the `ScopedArena` is gone: everything allocated from a scope's arena is
-freed when the scope ends, so `arena_scope` takes `alloc(ScopedArena)`
-out of its caller's effects and puts in `alloc(Gpa)`, where the arena's
-memory comes from.
+`answer` allocates from all three: `Gpa` (the map grows), the keys'
+`Arena`, and the request's `ArenaScope` (the scratch). `lower_in`, given
+the scratch, allocates from it alone.
 
 ## What cannot leave the scope
 
@@ -137,72 +121,57 @@ cannot be the scope's value:
 
 ```console
 $ cat > escape.vl <<'EOF'
+> use std::alloc::arena_scope;
+>
 > fn main(gpa: Gpa) -> i32 {
->     let words = arena_scope(gpa, |a| {
->         std::split_whitespace_in("scratch words to keep", a)
+>     let words = arena_scope(&gpa, |a| {
+>         let mut v = Vec::new_in(a);
+>         for w in "scratch words to keep".split_whitespace() {
+>             v.push(w);
+>         }
+>         v
 >     });
->     println(words.len());
+>     println("{}", words.len());
 >     0
 > }
 > EOF
 $ volec check escape.vl
-escape.vl:3:9: error[type error] this arena scope's value holds 'ScopedArena' (Vec<[u8], ScopedArena>): its memory is gone when the scope ends | help: copy it out: 'v.clone_in(gpa)', or return what is computed from it
+escape.vl:5:21: error[borrowck.outlives] lifetime may not live long enough: the lifetime of the closure's parameter 'a' is only the call's, but it flows where a lifetime of the closure's signature, from outside it is required, which lasts longer | help: keep a copy of the value instead of the reference (`*p`, `.clone()`); a closure's result borrows from its parameter only when the bound it is passed for says so (`Fn(&T) -> &T`)
 [exit 1]
 ```
 
 Return what is computed from it instead (`.len()` inside the scope), or
 copy it out to a longer-lived allocator.
 
-Nor can a scope use a container of another scope's arena, even an
-enclosing one (`a.scope(|inner| ...)` makes a scope inside a scope):
-
-```console
-$ cat > capture.vl <<'EOF'
-> fn main(gpa: Gpa) -> i32 {
->     let n = arena_scope(gpa, |outer| {
->         var seen: Vec<i64, ScopedArena> = Vec::new_in(outer);
->         seen.push(1);
->         outer.scope(|inner| {
->             seen.push(2);
->             inner.used()
->         })
->     });
->     println(n);
->     0
-> }
-> EOF
-$ volec check capture.vl
-capture.vl:5:21: error[type error] an arena scope cannot use 'seen': its type holds another scope's arena | help: take a view first: 'let s = seen.as_slice();'
-[exit 1]
-```
-
-(While the inner scope runs, the outer arena is lent to it: allocating
-from `outer` would stop the program with "the arena is lent to a
-scope". The rule makes that a compile error instead.) And no variable
-outside a scope can hold its arena's containers: their type names
-`ScopedArena`, and only a scope makes one.
+No variable outside a scope can hold its arena's containers: their type
+borrows the `ArenaScope`, and the borrow ends with the scope.
 
 ## Nor can a view of it
 
 A slice is a view: it holds no allocator, so its type says nothing about
 where its bytes live. A view of a scope's container returned from the
-scope would point at memory the scope's end freed (0.16 compiled it, and
-only `--check-alloc` caught the read). The view cannot outlive the `Vec`
+scope would point at memory the scope's end freed. The view cannot outlive the `Vec`
 it views, which is dropped when the scope's closure returns:
 
 ```console
 $ cat > view.vl <<'EOF'
+> use std::alloc::arena_scope;
+>
 > fn main(gpa: Gpa) -> i32 {
->     let words = arena_scope(gpa, |a| {
->         let v = std::split_whitespace_in("scratch words to keep", a);
+>     let words = arena_scope(&gpa, |a| {
+>         let mut v = Vec::new_in(a);
+>         for w in "scratch words to keep".split_whitespace() {
+>             v.push(w);
+>         }
 >         v.as_slice()
 >     });
->     println(words[0]);
+>     println("{}", words[0]);
 >     0
 > }
 > EOF
 $ volec check view.vl
-view.vl:4:9: error[own.escape] 'closure(ScopedArena) -> [[u8]] at view.vl:2:34' returns a view of 'v', which is dropped when 'closure(ScopedArena) -> [[u8]] at view.vl:2:34' returns | help: return the owner itself; a caller that wants a view takes '.as_slice()' of it | try: volec edit patch closure(ScopedArena) -> [[u8]] at view.vl:2:34 --old '-> [[u8]]' --new '-> Vec<[u8], ScopedArena>' --old 'v.as_slice()' --new 'v'
+view.vl:4:39: error[borrowck.return_local] a reference to 'v', a local of this function, escapes it (borrowed at view.vl:9:9) | help: return an owned value, or borrow from a parameter
+view.vl:5:21: error[borrowck.outlives] lifetime may not live long enough: the lifetime of the closure's parameter 'a' is only the call's, but it flows where a lifetime of the closure's signature, from outside it is required, which lasts longer | help: keep a copy of the value instead of the reference (`*p`, `.clone()`); a closure's result borrows from its parameter only when the bound it is passed for says so (`Fn(&T) -> &T`)
 [exit 1]
 ```
 

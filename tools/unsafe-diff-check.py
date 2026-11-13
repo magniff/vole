@@ -80,16 +80,19 @@ def worktree_is_new_text(path, mode):
     return git("diff", "--name-only", "HEAD", "--", path).strip() == ""
 
 
-def find_volec():
-    """A volec that answers `query unsafe` (0.25.3 on), or None."""
+def find_volecs():
+    """The volecs that answer `query unsafe` (0.25.3 on), in the order they
+    are asked: a group one of them cannot answer for (a program it does not
+    read, or stops on: 0.27.8's on a rust-edition program) goes to the next."""
+    found = []
     cands = [os.environ.get("VOLEC", ""), "target/tools/volec", "target/volec"]
     for c in cands:
-        if not c or not os.access(c, os.X_OK):
+        if not c or not os.access(c, os.X_OK) or os.path.abspath(c) in found:
             continue
         r = subprocess.run([c, "query", "unsafe", "--help"], capture_output=True, text=True)
         if r.returncode == 0 and "unjustified" in r.stdout + r.stderr:
-            return os.path.abspath(c)
-    return None
+            found.append(os.path.abspath(c))
+    return found
 
 
 def program_groups(paths):
@@ -103,15 +106,18 @@ def program_groups(paths):
     return list(groups.values())
 
 
-def tool_sites(volec, paths):
-    """{path: [(line, justified)]} from the compiler, or None for a group it
-    could not answer for."""
+def tool_sites(volecs, paths):
+    """{path: [(line, justified)]} from the compiler, missing for a group
+    none of volecs could answer for."""
     out = {}
     for group in program_groups(paths):
-        r = subprocess.run([volec, "query", "unsafe", "--json"] + group,
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            # (the program does not read: the heuristic for these files)
+        for volec in volecs:
+            r = subprocess.run([volec, "query", "unsafe", "--json"] + group,
+                               capture_output=True, text=True)
+            if r.returncode == 0:
+                break
+        else:
+            # (no volec reads the program: the heuristic for these files)
             continue
         for line in r.stdout.splitlines():
             try:
@@ -176,13 +182,13 @@ def main():
                 added_word.setdefault(path, []).append(line_no)
             line_no += 1
     # The compiler's answer for the files it can read as the diff has them.
-    volec = None if force_heuristic else find_volec()
+    volecs = [] if force_heuristic else find_volecs()
     by_tool = {}
-    if volec:
+    if volecs:
         readable = [p for p in sorted(added_lines)
                     if os.path.exists(p) and worktree_is_new_text(p, mode)]
         if readable:
-            by_tool = tool_sites(volec, readable)
+            by_tool = tool_sites(volecs, readable)
     bad = []
     moved = 0
     heuristic_files = 0
@@ -209,7 +215,7 @@ def main():
         print(b)
     if heuristic_files:
         why = ("--heuristic" if force_heuristic else
-               "no volec with `query unsafe`" if not volec else
+               "no volec with `query unsafe`" if not volecs else
                "text not in the work tree, or the program does not read")
         print("unsafe-diff-check: %d file%s by the text heuristic (%s)"
               % (heuristic_files, "" if heuristic_files == 1 else "s", why))

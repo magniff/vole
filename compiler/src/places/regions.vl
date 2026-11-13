@@ -17,7 +17,7 @@
 // variance of each user type (D5.3: variance_table) and of each slot of a
 // type (D5.4: slot_variances): what places/borrowck reads.
 
-use crate::base::{buf_int, buf_new, buf_str, sym_text};
+use std::alloc::Allocator; use crate::base::{IntVec, buf_int, buf_new, buf_str, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::{NODE_REF, NODE_REF_MUT, NodeKind, child};
@@ -102,18 +102,18 @@ pub const MAP_STATIC: i64 = -1;
 pub const MAP_NONE: i64 = -2;
 
 // Whether function f is the rust edition's (its node in a file read so).
-pub fn rust_fn(f: i64, pcx: inout Ctx<Comp>) -> bool {
+pub fn rust_fn(f: i64, pcx: &mut Ctx<Comp>) -> bool {
     let node = fn_node(f, pcx);
-    node > 0 && crate::front::rust::rust_at(pcx.nodes[node].start, &pcx)
+    node > 0
 }
 
 // Whether function f's operands follow the rust edition's rules (D8.3):
 // a rust-edition function the program wrote, not one the compiler made
 // from it (a derive's, a contract's companion, a multiversion copy:
 // FN_DERIVED, MVS's rules, checked through what they are made from).
-pub fn rust_operands(f: i64, pcx: inout Ctx<Comp>) -> bool {
+pub fn rust_operands(f: i64, pcx: &mut Ctx<Comp>) -> bool {
     let node = fn_node(f, pcx);
-    rust_fn(f, &pcx) && ((pcx.nodes[node].p & crate::front::ast::FN_DERIVED) == 0
+    rust_fn(f, pcx) && ((pcx.nodes[node as usize].p & crate::front::ast::FN_DERIVED) == 0
         || crate::front::contracts::expand::is_pre_fn(f, pcx))
 }
 
@@ -121,70 +121,76 @@ pub fn rust_operands(f: i64, pcx: inout Ctx<Comp>) -> bool {
 
 // The body held, a rust-edition function's: its region variables made,
 // its locals' slots bound to them (D3.2).
-pub fn assign_regions(pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+pub fn assign_regions(pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
     pbody.regions.clear();
     pbody.slot_at.clear();
     pbody.slot_var.clear();
     pbody.ret_var.clear();
     pbody.ubounds.clear();
-    var sig = sig_new();
-    sig_of(pbody.fn_, &sig, &pcx);
+    let mut sig = sig_new();
+    sig_of(pbody.fn_, &mut sig, pcx);
     if sig.elision > 0 {
-        elision_error(pbody.fn_, sig.elision, &pcx);
+        elision_error(pbody.fn_, sig.elision, pcx);
     }
     // RULE: D4.1 (the universals first: 'static is variable 1)
-    for u in 0..universal_count(sig) {
-        push_row(RO_UNIVERSAL, sig.univ[3 * u], sig.univ[3 * u + 1], sig.univ[3 * u + 2], &pbody);
+    for u in 0..universal_count(&sig) {
+        push_row(RO_UNIVERSAL, sig.univ[(3 * u) as usize], sig.univ[(3 * u + 1) as usize],
+            sig.univ[(3 * u + 2) as usize], pbody);
     }
-    var i = 0;
+    let mut i: i64 = 0;
     while i + 1 < sig.bounds.len() as i64 {
-        pbody.ubounds.push(sig.bounds[i] + 1);
-        pbody.ubounds.push(sig.bounds[i + 1] + 1);
+        pbody.ubounds.push(sig.bounds[i as usize] + 1);
+        pbody.ubounds.push(sig.bounds[(i + 1) as usize] + 1);
         i += 2;
     }
     // RULE: D3.2 (a parameter's slots are its signature's universals; any
     // other local's, variables of their own)
     for l in 0..pbody.locals.len() as i64 {
         pbody.slot_at.push(pbody.slot_var.len() as i64);
-        let n = slot_count(pbody.locals[l].ty, pcx);
+        let n = slot_count(pbody.locals[l as usize].ty, pcx);
         let param = l >= 1 && l <= pbody.params && l < sig.param_at.len() as i64;
-        let base = if param { sig.param_at[l - 1] } else { 0 };
-        let bound = if param { sig.param_at[l] - base } else { 0 };
+        let base: i64 = if param { sig.param_at[(l - 1) as usize] } else { 0 };
+        let bound: i64 = if param { sig.param_at[l as usize] - base } else { 0 };
+        // RULE: D3.2 (0.28.0) a static's slots are 'static: a value stored
+        // in it outlives 'static (rustc's E0597 for `K = s.as_str()`)
+        let fixed = (pbody.locals[l as usize].flags & crate::places::ir::LF_STATIC) != 0;
         for j in 0..n {
-            if j < bound {
-                pbody.slot_var.push(sig.params[base + j] + 1);
+            if fixed {
+                pbody.slot_var.push(1);
+            } else if j < bound {
+                pbody.slot_var.push(sig.params[(base + j) as usize] + 1);
             } else {
-                push_row(RO_LOCAL, l, j, 0, &pbody);
+                push_row(RO_LOCAL, l, j, 0, pbody);
                 pbody.slot_var.push(region_count(pbody));
             }
         }
     }
     pbody.slot_at.push(pbody.slot_var.len() as i64);
     for j in 0..sig.ret.len() as i64 {
-        pbody.ret_var.push(sig.ret[j] + 1);
+        pbody.ret_var.push(sig.ret[j as usize] + 1);
     }
     // RULE: D3.2 (a loan per borrow; n call regions per call, D3.6)
-    var csig = sig_new();
+    let mut csig = sig_new();
     for s in 0..pbody.stmts.len() as i64 {
-        let st = pbody.stmts[s];
+        let st = pbody.stmts[s as usize];
         if st.kind == SK_ASSIGN
             && (st.c == RV_REF && st.d != BK_RAW && st.d != BK_RAW_MUT || st.c == RV_SLICE) {
-            push_row(RO_LOAN, s, 0, 0, &pbody);
-            pbody.stmts[s].e = region_count(pbody);
+            push_row(RO_LOAN, s, 0, 0, pbody);
+            pbody.stmts[s as usize].e = region_count(pbody);
         } else if st.kind == SK_CALL && st.c >= 0 {
             // (a closure value's call, c = -1, gets its signature's in
             // 0.27.1's M2: D10.3)
-            sig_of(st.c, &csig, &pcx);
-            let n = universal_count(csig) - 1;
-            pbody.stmts[s].e = if n > 0 { region_count(pbody) + 1 } else { 0 };
+            sig_of(st.c, &mut csig, pcx);
+            let n = universal_count(&csig) - 1;
+            pbody.stmts[s as usize].e = if n > 0 { region_count(pbody) + 1 } else { 0 };
             for j in 0..n {
-                push_row(RO_CALL, s, j, 0, &pbody);
+                push_row(RO_CALL, s, j, 0, pbody);
             }
         }
     }
 }
 
-fn push_row(origin: i64, a: i64, b: i64, c: i64, pbody: inout Body<Comp>) {
+fn push_row(origin: i64, a: i64, b: i64, c: i64, pbody: &mut Body<Comp>) {
     pbody.regions.push(origin);
     pbody.regions.push(a);
     pbody.regions.push(b);
@@ -192,48 +198,48 @@ fn push_row(origin: i64, a: i64, b: i64, c: i64, pbody: inout Body<Comp>) {
 }
 
 // The number of region variables of the body held.
-pub fn region_count(pbody: Body<Comp>) -> i64 {
+pub fn region_count(pbody: &Body<Comp>) -> i64 {
     pbody.regions.len() as i64 / 4
 }
 
 // Region variable r's origin (RO_*; r counted from 1).
-pub fn region_origin(r: i64, pbody: Body<Comp>) -> i64 {
-    pbody.regions[4 * (r - 1)]
+pub fn region_origin(r: i64, pbody: &Body<Comp>) -> i64 {
+    pbody.regions[(4 * (r - 1)) as usize]
 }
 
 // Region variable r's words: a universal's kind, x and y (U_*); a local's
 // local and slot; a loan's statement; a call's statement and the callee's
 // region (counted from 0, 'static left out).
-pub fn region_word(r: i64, i: i64, pbody: Body<Comp>) -> i64 {
-    pbody.regions[4 * (r - 1) + 1 + i]
+pub fn region_word(r: i64, i: i64, pbody: &Body<Comp>) -> i64 {
+    pbody.regions[(4 * (r - 1) + 1 + i) as usize]
 }
 
 // The text of region variable r's origin (counted from 1).
-pub fn origin_text(r: i64, pbody: Body<Comp>) -> *u8 {
+pub fn origin_text(r: i64, pbody: &Body<Comp>) -> *mut u8 {
     let o = region_origin(r, pbody);
     if o == RO_LOAN { c"loan" } else if o == RO_LOCAL { c"local" }
     else if o == RO_UNIVERSAL { c"universal" } else { c"call" }
 }
 
 // The variable of slot i of local l (counted from 1; 0: none).
-pub fn slot_var(l: i64, i: i64, pbody: Body<Comp>) -> i64 {
+pub fn slot_var(l: i64, i: i64, pbody: &Body<Comp>) -> i64 {
     if l < 0 || l + 1 >= pbody.slot_at.len() as i64 {
         return 0;
     }
-    let at = pbody.slot_at[l] + i;
-    if i < 0 || at >= pbody.slot_at[l + 1] { 0 } else { pbody.slot_var[at] }
+    let at = pbody.slot_at[l as usize] + i;
+    if i < 0 || at >= pbody.slot_at[(l + 1) as usize] { 0 } else { pbody.slot_var[at as usize] }
 }
 
 // The number of slots bound to local l.
-pub fn slots_bound(l: i64, pbody: Body<Comp>) -> i64 {
+pub fn slots_bound(l: i64, pbody: &Body<Comp>) -> i64 {
     if l < 0 || l + 1 >= pbody.slot_at.len() as i64 { 0 }
-    else { pbody.slot_at[l + 1] - pbody.slot_at[l] }
+    else { pbody.slot_at[(l + 1) as usize] - pbody.slot_at[l as usize] }
 }
 
 // Region variable r's line of the dump (docs/design/borrowck.md §16):
 // `region 'r2: universal 'a (_1.0, return.0)`, `region 'r5: local _3.0`,
 // `region 'r7: loan bb0[4]`, `region 'r9: call bb0[12].1`.
-pub fn buf_region(out: i64, r: i64, pbody: Body<Comp>, pcx: Ctx<Comp>) {
+pub fn buf_region(out: i64, r: i64, pbody: &Body<Comp>, pcx: &Ctx<Comp>) {
     buf_str(out, c"    region 'r");
     buf_int(out, r);
     buf_str(out, c": ");
@@ -262,7 +268,7 @@ pub fn buf_region(out: i64, r: i64, pbody: Body<Comp>, pcx: Ctx<Comp>) {
                 buf_int(out, c);
             }
         }
-        var first = true;
+        let mut first = true;
         for l in 0..pbody.locals.len() as i64 {
             for i in 0..slots_bound(l, pbody) {
                 if slot_var(l, i, pbody) == r {
@@ -275,7 +281,7 @@ pub fn buf_region(out: i64, r: i64, pbody: Body<Comp>, pcx: Ctx<Comp>) {
             }
         }
         for j in 0..pbody.ret_var.len() as i64 {
-            if pbody.ret_var[j] == r {
+            if pbody.ret_var[j as usize] == r {
                 buf_str(out, if first { c" (return." } else { c", return." });
                 buf_int(out, j);
                 first = false;
@@ -302,20 +308,20 @@ pub fn buf_region(out: i64, r: i64, pbody: Body<Comp>, pcx: Ctx<Comp>) {
 
 // The universals' bounds of the dump, `bound 'r2: 'r3` ('r2 outlives
 // 'r3).
-pub fn buf_bounds(out: i64, pbody: Body<Comp>) {
-    var i = 0;
+pub fn buf_bounds(out: i64, pbody: &Body<Comp>) {
+    let mut i: i64 = 0;
     while i + 1 < pbody.ubounds.len() as i64 {
         buf_str(out, c"    bound 'r");
-        buf_int(out, pbody.ubounds[i]);
+        buf_int(out, pbody.ubounds[i as usize]);
         buf_str(out, c": 'r");
-        buf_int(out, pbody.ubounds[i + 1]);
+        buf_int(out, pbody.ubounds[(i + 1) as usize]);
         buf_str(out, c"\n");
         i += 2;
     }
 }
 
 // Statement s's location, `bb2[3]`.
-fn buf_location(out: i64, s: i64, pbody: Body<Comp>) {
+fn buf_location(out: i64, s: i64, pbody: &Body<Comp>) {
     for b in 0..block_count(pbody) {
         let start = block_start(b, pbody);
         if start >= 0 && s >= start && s <= start + block_len(b, pbody) {
@@ -332,17 +338,17 @@ fn buf_location(out: i64, s: i64, pbody: Body<Comp>) {
 // (--verify-places) The body held, a rust-edition one: each local has as
 // many variables bound as its type has slots, each a variable of the
 // body (D3.3). The problems found, reported to out.
-pub fn verify_slots(out: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+pub fn verify_slots(out: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
     if pbody.regions.len() == 0 {
         return 0;
     }
-    var bad = 0;
+    let mut bad: i64 = 0;
     if pbody.slot_at.len() as i64 != pbody.locals.len() as i64 + 1 {
         buf_str(out, c"  the slot table does not cover the locals\n");
         return 1;
     }
     for l in 0..pbody.locals.len() as i64 {
-        let want = slot_count(pbody.locals[l].ty, pcx);
+        let want = slot_count(pbody.locals[l as usize].ty, pcx);
         if slots_bound(l, pbody) != want {
             crate::base::buf_fmt(out,
                 format_args("  _{l} has {} region slots bound, its type {want}\n",
@@ -361,14 +367,14 @@ pub fn verify_slots(out: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     // RULE: D3.3 (|regions(P)| = |slots(type(P))|, every place the body
     // names)
     for s in 0..pbody.stmts.len() as i64 {
-        let st = pbody.stmts[s];
+        let st = pbody.stmts[s as usize];
         if (st.kind == SK_ASSIGN || st.kind == SK_CALL) && st.a >= 0 {
-            bad += verify_place(st.a, st.b, out, pbody, &pcx);
+            bad += verify_place(st.a, st.b, out, pbody, pcx);
         }
         for i in 0..st.nops {
             if op_is_place(op_kind(st.ops, i, pbody)) {
                 bad += verify_place(op_a(st.ops, i, pbody), op_b(st.ops, i, pbody), out, pbody,
-                    &pcx);
+                    pcx);
             }
         }
     }
@@ -378,13 +384,13 @@ pub fn verify_slots(out: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
 // (--verify-places) Place (l, p) of the body held: its regions
 // (place_regions) as many as its type's slots, each a variable of the
 // body or none; the problems, reported to out.
-fn verify_place(l: i64, p: i64, out: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+fn verify_place(l: i64, p: i64, out: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
     if l < 0 || l >= pbody.locals.len() as i64 {
         return 0;
     }
-    var regs: Vec<i64, Comp> = Vec::new_in(Comp {});
-    place_regions(l, p, pbody, &regs, &pcx);
-    let want = slot_count(full_place_type(l, p, pbody, &pcx), pcx);
+    let mut regs: Vec<i64, Comp> = Vec::new_in(Comp {});
+    place_regions(l, p, pbody, &mut regs, pcx);
+    let want = slot_count(full_place_type(l, p, pbody, pcx), pcx);
     if regs.len() as i64 != want {
         crate::base::buf_fmt(out, format_args("  a place of _{l} has {} regions, its type {want}\n",
             regs.len()));
@@ -400,7 +406,7 @@ fn verify_place(l: i64, p: i64, out: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp
 // pointee's, the element's; a tuple its elements'; a struct or an enum
 // its declared lifetimes and its type arguments'; a closure its captures'
 // (as its env's fields; by-reference captures are raw until M2: D10.2).
-pub fn slot_count(t: i64, pcx: Ctx<Comp>) -> i64 {
+pub fn slot_count(t: i64, pcx: &Ctx<Comp>) -> i64 {
     slots_in(t, 0, pcx)
 }
 
@@ -410,41 +416,41 @@ pub fn slot_count(t: i64, pcx: Ctx<Comp>) -> i64 {
 // captures are; a rust-edition struct or enum with `#[derive(Copy)]`
 // (its type arguments Copy) or an `impl Copy`; another one (std's) when
 // it has no drop glue and its type arguments are Copy.
-pub fn rust_copy(t: i64, pcx: inout Ctx<Comp>) -> bool {
-    copy_in(t, 0, &pcx)
+pub fn rust_copy(t: i64, pcx: &mut Ctx<Comp>) -> bool {
+    copy_in(t, 0, pcx)
 }
 
-fn copy_in(t: i64, depth: i64, pcx: inout Ctx<Comp>) -> bool {
+fn copy_in(t: i64, depth: i64, pcx: &mut Ctx<Comp>) -> bool {
     if t <= 0 || depth > 16 {
         return true;
     }
-    let k = pcx.types[t].kind;
+    let k = pcx.types[t as usize].kind;
     if k == TyKind::Ptr || k == TyKind::Slice {
-        return pcx.types[t].b != REF_MUT;
+        return pcx.types[t as usize].b != REF_MUT;
     }
     // RULE: D21.3 (0.27.2.1: an `impl Tr` result is Copy iff a bound says so)
     if crate::front::opaque::is_opaque(t, pcx) {
-        let copy = crate::front::traits::std_trait(c"Copy", &pcx);
-        return copy >= 0 && crate::front::opaque::implements(copy, t, &pcx);
+        let copy = crate::front::traits::std_trait(c"Copy", pcx);
+        return copy >= 0 && crate::front::opaque::implements(copy, t, pcx);
     }
     if k == TyKind::Array || k == TyKind::Distinct {
-        return copy_in(pcx.types[t].a, depth + 1, &pcx);
+        return copy_in(pcx.types[t as usize].a, depth + 1, pcx);
     }
     if k == TyKind::Tuple {
-        for i in 0..pcx.types[t].count {
-            if !copy_in(type_elem(t, i, pcx), depth + 1, &pcx) {
+        for i in 0..pcx.types[t as usize].count {
+            if !copy_in(type_elem(t, i, pcx), depth + 1, pcx) {
                 return false;
             }
         }
         return true;
     }
-    if k == TyKind::Struct && pcx.structs[pcx.types[t].a].closure != 0 {
-        let s = pcx.types[t].a;
+    if k == TyKind::Struct && pcx.structs[pcx.types[t as usize].a as usize].closure != 0 {
+        let s = pcx.types[t as usize].a;
         for i in 0..struct_field_count(s, pcx) {
             // (a by-`&mut` capture is not Copy, though its field is a raw
             // pointer)
             if capture_mode(s, i, pcx) == 2
-                || !copy_in(struct_field_ty(s, i, pcx), depth + 1, &pcx) {
+                || !copy_in(struct_field_ty(s, i, pcx), depth + 1, pcx) {
                 return false;
             }
         }
@@ -454,22 +460,22 @@ fn copy_in(t: i64, depth: i64, pcx: inout Ctx<Comp>) -> bool {
         return true;
     }
     let node = adt_node(t, pcx);
-    var derived = false;
-    if node > 0 && crate::front::rust::rust_at(pcx.nodes[node].start, &pcx) {
+    let mut derived = false;
+    if node > 0 {
         for i in 0..pcx.rust_copy.count {
             derived = derived || pcx.rust_copy.get(i) == node;
         }
         if !derived {
             // (an `impl Copy`, its own bounds checked by has_impl)
-            let copy = crate::front::traits::std_trait(c"Copy", &pcx);
-            return copy >= 0 && crate::front::traits::has_impl(copy, t, &pcx);
+            let copy = crate::front::traits::std_trait(c"Copy", pcx);
+            return copy >= 0 && crate::front::traits::has_impl(copy, t, pcx);
         }
-    } else if crate::places::front::type_glue(t, &pcx) {
+    } else if crate::places::front::type_glue(t, pcx) {
         return false;
     }
     // (a derive's `T: Copy` bounds; std's own types' arguments)
     for i in 0..adt_targ_count(t, pcx) {
-        if !copy_in(adt_targ(t, i, pcx), depth + 1, &pcx) {
+        if !copy_in(adt_targ(t, i, pcx), depth + 1, pcx) {
             return false;
         }
     }
@@ -478,23 +484,23 @@ fn copy_in(t: i64, depth: i64, pcx: inout Ctx<Comp>) -> bool {
 
 // RULE: C5 Whether type t holds a raw pointer, itself or in a part (an
 // `old(e)` of such a type is refused).
-pub fn holds_raw(t: i64, pcx: Ctx<Comp>) -> bool {
+pub fn holds_raw(t: i64, pcx: &Ctx<Comp>) -> bool {
     raw_in(t, 0, pcx)
 }
 
-fn raw_in(t: i64, depth: i64, pcx: Ctx<Comp>) -> bool {
+fn raw_in(t: i64, depth: i64, pcx: &Ctx<Comp>) -> bool {
     if t <= 0 || depth > 16 {
         return false;
     }
-    let k = pcx.types[t].kind;
+    let k = pcx.types[t as usize].kind;
     if k == TyKind::Ptr {
-        return pcx.types[t].b == 0 || raw_in(pcx.types[t].a, depth + 1, pcx);
+        return pcx.types[t as usize].b == 0 || raw_in(pcx.types[t as usize].a, depth + 1, pcx);
     }
     if k == TyKind::Slice || k == TyKind::Array || k == TyKind::Distinct {
-        return raw_in(pcx.types[t].a, depth + 1, pcx);
+        return raw_in(pcx.types[t as usize].a, depth + 1, pcx);
     }
     if k == TyKind::Tuple {
-        for i in 0..pcx.types[t].count {
+        for i in 0..pcx.types[t as usize].count {
             if raw_in(type_elem(t, i, pcx), depth + 1, pcx) {
                 return true;
             }
@@ -502,7 +508,7 @@ fn raw_in(t: i64, depth: i64, pcx: Ctx<Comp>) -> bool {
         return false;
     }
     if k == TyKind::Struct {
-        let s = pcx.types[t].a;
+        let s = pcx.types[t as usize].a;
         for i in 0..struct_field_count(s, pcx) {
             if raw_in(struct_field_ty(s, i, pcx), depth + 1, pcx) {
                 return true;
@@ -522,45 +528,46 @@ fn raw_in(t: i64, depth: i64, pcx: Ctx<Comp>) -> bool {
 
 // RULE: C5 Whether an `old(e)` of type t is accepted in the rust edition:
 // t is Copy, holds no region slot and no raw pointer.
-pub fn old_plain(t: i64, pcx: inout Ctx<Comp>) -> bool {
-    rust_copy(t, &pcx) && slot_count(t, pcx) == 0 && !holds_raw(t, pcx)
+pub fn old_plain(t: i64, pcx: &mut Ctx<Comp>) -> bool {
+    rust_copy(t, pcx) && slot_count(t, pcx) == 0 && !holds_raw(t, pcx)
 }
 
-fn slots_in(t: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
+fn slots_in(t: i64, depth: i64, pcx: &Ctx<Comp>) -> i64 {
     if t <= 0 || depth > 16 {
         return 0;
     }
-    let k = pcx.types[t].kind;
+    let k = pcx.types[t as usize].kind;
     if k == TyKind::Ptr {
-        let own = if is_ref_kind(pcx.types[t].b) { 1 } else { 0 };
-        return own + slots_in(pcx.types[t].a, depth + 1, pcx);
+        let own: i64 = if is_ref_kind(pcx.types[t as usize].b) { 1 } else { 0 };
+        return own + slots_in(pcx.types[t as usize].a, depth + 1, pcx);
     }
     if k == TyKind::Slice {
         // RULE: Z9.1 (a fat raw pointer, `*const [T]`, has no region of its
         // own, as a thin one: its pointee's slots)
-        let own = if pcx.types[t].b == REF_RAW { 0 } else { 1 };
-        return own + slots_in(pcx.types[t].a, depth + 1, pcx);
+        let own: i64 = if pcx.types[t as usize].b == REF_RAW { 0 } else { 1 };
+        return own + slots_in(pcx.types[t as usize].a, depth + 1, pcx);
     }
     // RULE: Z9.1c (0.27.4: the place `[T]`/`str` has no region of its own,
     // the reference to it supplies one: its element's slots)
     if k == TyKind::Unsized {
-        let v = pcx.types[t].a;
-        let s = if pcx.types[v].kind == TyKind::Distinct { pcx.types[v].a } else { v };
-        return slots_in(pcx.types[s].a, depth + 1, pcx);
+        let v = pcx.types[t as usize].a;
+        let s = if pcx.types[v as usize].kind == TyKind::Distinct { pcx.types[v as usize].a }
+            else { v };
+        return slots_in(pcx.types[s as usize].a, depth + 1, pcx);
     }
     if k == TyKind::Array || k == TyKind::Distinct {
-        return slots_in(pcx.types[t].a, depth + 1, pcx);
+        return slots_in(pcx.types[t as usize].a, depth + 1, pcx);
     }
     if k == TyKind::Tuple {
-        var n = 0;
-        for i in 0..pcx.types[t].count {
+        let mut n: i64 = 0;
+        for i in 0..pcx.types[t as usize].count {
             n += slots_in(type_elem(t, i, pcx), depth + 1, pcx);
         }
         return n;
     }
-    if k == TyKind::Struct && pcx.structs[pcx.types[t].a].closure != 0 {
-        let s = pcx.types[t].a;
-        var n = 0;
+    if k == TyKind::Struct && pcx.structs[pcx.types[t as usize].a as usize].closure != 0 {
+        let s = pcx.types[t as usize].a;
+        let mut n: i64 = 0;
         for i in 0..struct_field_count(s, pcx) {
             n += capture_slots(s, i, depth, pcx);
         }
@@ -568,7 +575,7 @@ fn slots_in(t: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
         return n + xc_count(s, pcx);
     }
     if k == TyKind::Struct || k == TyKind::Enum {
-        var n = decl_lifetimes(adt_node(t, pcx), pcx);
+        let mut n = decl_lifetimes(adt_node(t, pcx), pcx);
         for i in 0..adt_targ_count(t, pcx) {
             n += slots_in(adt_targ(t, i, pcx), depth + 1, pcx);
         }
@@ -580,38 +587,38 @@ fn slots_in(t: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
 // RULE: D10.2 Capture i of closure struct s: 0 by value, 1 by `&`, 2 by
 // `&mut` (front::closures' capture list); a field after the captures (a
 // drop flag): 0.
-pub fn capture_mode(s: i64, i: i64, pcx: Ctx<Comp>) -> i64 {
-    let c = pcx.structs[s].closure - 1;
-    if c < 0 || i >= pcx.closures[c].capture_count {
+pub fn capture_mode(s: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
+    let c = pcx.structs[s as usize].closure - 1;
+    if c < 0 || i >= pcx.closures[c as usize].capture_count {
         return 0;
     }
-    pcx.capture_list.get(pcx.closures[c].captures + 2 * i + 1)
+    pcx.capture_list.get(pcx.closures[c as usize].captures + 2 * i + 1)
 }
 
 // The slots field i of closure struct s holds (D3.3, D10.2): a
 // by-reference capture's field is a raw pointer, which holds its loan's
 // slot and its pointee's (`&'c T`'s), another field its type's.
-fn capture_slots(s: i64, i: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
+fn capture_slots(s: i64, i: i64, depth: i64, pcx: &Ctx<Comp>) -> i64 {
     let ft = struct_field_ty(s, i, pcx);
     if capture_ref(s, i, pcx) {
-        return 1 + slots_in(pcx.types[ft].a, depth + 1, pcx);
+        return 1 + slots_in(pcx.types[ft as usize].a, depth + 1, pcx);
     }
     slots_in(ft, depth + 1, pcx)
 }
 
 // Whether field i of closure struct s is a by-reference capture (its raw
 // pointer holds a loan's slot).
-fn capture_ref(s: i64, i: i64, pcx: Ctx<Comp>) -> bool {
+fn capture_ref(s: i64, i: i64, pcx: &Ctx<Comp>) -> bool {
     let ft = struct_field_ty(s, i, pcx);
-    capture_mode(s, i, pcx) > 0 && ft > 0 && pcx.types[ft].kind == TyKind::Ptr
+    capture_mode(s, i, pcx) > 0 && ft > 0 && pcx.types[ft as usize].kind == TyKind::Ptr
 }
 
 // RULE: D10.2 Where field k's slots begin among those of closure type t:
 // the aggregate's operand k (`&'c x` for a by-reference capture, its loan
 // slot first) fills the closure's slots from there.
-pub fn capture_offset(t: i64, k: i64, pcx: Ctx<Comp>) -> i64 {
-    let s = pcx.types[t].a;
-    var off = 0;
+pub fn capture_offset(t: i64, k: i64, pcx: &Ctx<Comp>) -> i64 {
+    let s = pcx.types[t as usize].a;
+    let mut off: i64 = 0;
     for i in 0..k {
         off += capture_slots(s, i, 0, pcx);
     }
@@ -620,11 +627,11 @@ pub fn capture_offset(t: i64, k: i64, pcx: Ctx<Comp>) -> i64 {
 
 // RULE: D19.3 Whether closure type t is `FnMut`: its kind (front/closures/
 // kinds.vl), or, before the kinds are known, a by-`&mut` capture (D10.3).
-pub fn closure_writes(t: i64, pcx: Ctx<Comp>) -> bool {
-    let s = pcx.types[t].a;
-    let c = pcx.structs[s].closure - 1;
-    if c >= 0 && pcx.closures[c].kind != 0 {
-        return pcx.closures[c].kind == crate::front::closures::kinds::KIND_FN_MUT;
+pub fn closure_writes(t: i64, pcx: &Ctx<Comp>) -> bool {
+    let s = pcx.types[t as usize].a;
+    let c = pcx.structs[s as usize].closure - 1;
+    if c >= 0 && pcx.closures[c as usize].kind != 0 {
+        return pcx.closures[c as usize].kind == crate::front::closures::kinds::KIND_FN_MUT;
     }
     for i in 0..struct_field_count(s, pcx) {
         if capture_mode(s, i, pcx) == 2 {
@@ -635,28 +642,28 @@ pub fn closure_writes(t: i64, pcx: Ctx<Comp>) -> bool {
 }
 
 // RULE: D19.5 Whether closure type t is `FnOnce` (its env a value).
-pub fn closure_once(t: i64, pcx: Ctx<Comp>) -> bool {
-    let c = pcx.structs[pcx.types[t].a].closure - 1;
-    c >= 0 && pcx.closures[c].kind == crate::front::closures::kinds::KIND_FN_ONCE
+pub fn closure_once(t: i64, pcx: &Ctx<Comp>) -> bool {
+    let c = pcx.structs[pcx.types[t as usize].a as usize].closure - 1;
+    c >= 0 && pcx.closures[c as usize].kind == crate::front::closures::kinds::KIND_FN_ONCE
 }
 
 // ---- A closure's signature regions (D19.1, D19.4, D20.3) ----
 
 // The number of X_C positions of closure struct s (0 before
 // closure_sig_slots, and for an MVS closure).
-fn xc_count(s: i64, pcx: Ctx<Comp>) -> i64 {
-    let id = pcx.structs[s].closure - 1;
-    if id < 0 { 0 } else { pcx.closures[id].xc_n }
+fn xc_count(s: i64, pcx: &Ctx<Comp>) -> i64 {
+    let id = pcx.structs[s as usize].closure - 1;
+    if id < 0 { 0 } else { pcx.closures[id as usize].xc_n }
 }
 
 // The closure whose body is function f (its CLOSURES index), or -1.
-pub fn closure_of_fn(f: i64, pcx: Ctx<Comp>) -> i64 {
+pub fn closure_of_fn(f: i64, pcx: &Ctx<Comp>) -> i64 {
     let node = fn_node(f, pcx);
-    if node <= 0 || (pcx.nodes[node].p & crate::front::ast::FN_CLOSURE) == 0 {
+    if node <= 0 || (pcx.nodes[node as usize].p & crate::front::ast::FN_CLOSURE) == 0 {
         return -1;
     }
     for id in 0..pcx.closures.len() as i64 {
-        if pcx.closures[id].f == f {
+        if pcx.closures[id as usize].f == f {
             return id;
         }
     }
@@ -676,32 +683,32 @@ pub fn closure_of_fn(f: i64, pcx: Ctx<Comp>) -> i64 {
 // has one input region, E2, and else external: a closure's own signature
 // has no elision rule). at[i]: where parameter i's entries begin, at[n]
 // the result's, at[n + 1] the end. Returns |X_C|.
-fn closure_sig_walk(id: i64, bnode: i64, btps: i64, walk: inout Vec<i64, Comp>,
-    at: inout Vec<i64, Comp>, codes: inout Vec<i64, Comp>, inst: i64, self_node: i64,
-    pcx: Ctx<Comp>) -> i64 {
+fn closure_sig_walk(id: i64, bnode: i64, btps: i64, walk: &mut Vec<i64, Comp>,
+    at: &mut Vec<i64, Comp>, codes: &mut Vec<i64, Comp>, inst: i64, self_node: i64,
+    pcx: &Ctx<Comp>) -> i64 {
     walk.clear();
     at.clear();
     codes.clear();
-    let f = pcx.closures[id].f;
-    let n = pcx.closures[id].node;
-    let e0 = if pcx.closures[id].capture_count > 0 { 1 } else { 0 };
-    let tps = if bnode > 0 { btps } else { 0 };
+    let f = pcx.closures[id as usize].f;
+    let n = pcx.closures[id as usize].node;
+    let e0: i64 = if pcx.closures[id as usize].capture_count > 0 { 1 } else { 0 };
+    let tps: i64 = if bnode > 0 { btps } else { 0 };
     let np = fn_param_count(f, pcx);
-    var xc = 0;
-    var groups = 0;
+    let mut xc: i64 = 0;
+    let mut groups: i64 = 0;
     for i in e0..np {
         let start = walk.len() as i64 / 4;
         at.push(start);
         let k = i - e0;
-        var an = 0;
+        let mut an: i64 = 0;
         if bnode > 0 {
-            an = if k < pcx.nodes[bnode].count { child(bnode, k, pcx) } else { 0 };
-        } else if k < pcx.nodes[n].count {
-            an = pcx.nodes[child(n, k, pcx)].b;
+            an = if k < pcx.nodes[bnode as usize].count { child(bnode, k, pcx) } else { 0 };
+        } else if k < pcx.nodes[n as usize].count {
+            an = pcx.nodes[child(n, k, pcx) as usize].b;
         }
-        bind_walk(an, fn_param(f, i, pcx), tps, self_node, -1, &walk, 0, pcx, inst);
+        bind_walk(an, fn_param(f, i, pcx), tps, self_node, -1, walk, 0, pcx, inst);
         for e in start..walk.len() as i64 / 4 {
-            let b = walk[4 * e];
+            let b = walk[(4 * e) as usize];
             if b == B_STATIC {
                 codes.push(-1);
             } else if b == B_ELIDED && an > 0 {
@@ -715,14 +722,14 @@ fn closure_sig_walk(id: i64, bnode: i64, btps: i64, walk: inout Vec<i64, Comp>,
     }
     let inputs = walk.len() as i64 / 4;
     at.push(inputs);
-    let rn = if bnode > 0 { pcx.nodes[bnode].a } else { pcx.nodes[n].b };
-    bind_walk(rn, fn_ret(f, pcx), tps, self_node, -1, &walk, 0, pcx, inst);
+    let rn = if bnode > 0 { pcx.nodes[bnode as usize].a } else { pcx.nodes[n as usize].b };
+    bind_walk(rn, fn_ret(f, pcx), tps, self_node, -1, walk, 0, pcx, inst);
     for e in inputs..walk.len() as i64 / 4 {
-        let b = walk[4 * e];
+        let b = walk[(4 * e) as usize];
         if b == B_STATIC {
             codes.push(-1);
         } else if b == B_ELIDED && bnode > 0 && rn > 0 && inputs == 1 {
-            codes.push(codes[0]);
+            { let at_arg1 = codes[0]; codes.push(at_arg1) };
         } else {
             codes.push(xc);
             xc += 1;
@@ -736,34 +743,35 @@ fn closure_sig_walk(id: i64, bnode: i64, btps: i64, walk: inout Vec<i64, Comp>,
 // count, and each position's variance (D5.2 through `fn(A..) -> R`: a
 // parameter's slot −, the result's +; one position at both: o), kept in
 // CAPTURE_LIST from xc_at.
-pub fn closure_sig_slots(id: i64, pcx: inout Ctx<Comp>) {
-    var walk = Vec::<i64, Comp>::new_in(Comp {});
-    var at = Vec::<i64, Comp>::new_in(Comp {});
-    var codes = Vec::<i64, Comp>::new_in(Comp {});
-    let xc = closure_sig_walk(id, pcx.closures[id].exp_node, pcx.closures[id].exp_tps, &walk, &at,
-        &codes, F_MARK, 0, pcx);
-    let f = pcx.closures[id].f;
-    let e0 = if pcx.closures[id].capture_count > 0 { 1 } else { 0 };
-    var vars = Vec::<i64, Comp>::new_in(Comp {});
+pub fn closure_sig_slots(id: i64, pcx: &mut Ctx<Comp>) {
+    let mut walk = Vec::<i64, Comp>::new_in(Comp {});
+    let mut at = Vec::<i64, Comp>::new_in(Comp {});
+    let mut codes = Vec::<i64, Comp>::new_in(Comp {});
+    let xc = closure_sig_walk(id, pcx.closures[id as usize].exp_node,
+        pcx.closures[id as usize].exp_tps, &mut walk, &mut at, &mut codes, F_MARK, 0, pcx);
+    let f = pcx.closures[id as usize].f;
+    let e0: i64 = if pcx.closures[id as usize].capture_count > 0 { 1 } else { 0 };
+    let mut vars = Vec::<i64, Comp>::new_in(Comp {});
     for i in e0..fn_param_count(f, pcx) {
-        slot_variances(fn_param(f, i, pcx), V_CONTRA, &vars, pcx);
+        slot_variances(fn_param(f, i, pcx), V_CONTRA, &mut vars, pcx);
     }
-    slot_variances(fn_ret(f, pcx), V_CO, &vars, pcx);
-    var vx = Vec::<i64, Comp>::new_in(Comp {});
+    slot_variances(fn_ret(f, pcx), V_CO, &mut vars, pcx);
+    let mut vx = Vec::<i64, Comp>::new_in(Comp {});
     for _ in 0..xc {
         vx.push(V_BI);
     }
     for e in 0..codes.len() as i64 {
-        let q = codes[e];
+        let q = codes[e as usize];
         if q >= 0 {
-            vx[q] = vx[q] | (if e < vars.len() as i64 { vars[e] } else { V_INV });
+            vx[q as usize] = vx[q as usize]
+                | (if e < vars.len() as i64 { vars[e as usize] } else { V_INV });
         }
     }
-    pcx.closures[id].xc_at = pcx.capture_list.count;
+    pcx.closures[id as usize].xc_at = pcx.capture_list.count;
     for q in 0..xc {
-        pcx.capture_list.push(vx[q]);
+        pcx.capture_list.push(vx[q as usize]);
     }
-    pcx.closures[id].xc_n = xc;
+    pcx.closures[id as usize].xc_n = xc;
 }
 
 // RULE: D19.4, D20.3 Σ_β of closure id's body f: 'static; for a reference
@@ -772,77 +780,77 @@ pub fn closure_sig_slots(id: i64, pcx: inout Ctx<Comp>) {
 // the signature; a local one per bound region (U_BOUND); the implied
 // bounds (D4.5) of the env's and the signature's types. No elision rule
 // and no elision error (D20.3).
-fn closure_sig(id: i64, f: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
+fn closure_sig(id: i64, f: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
     sig.closure = id;
-    let nc = slot_count(pcx.closures[id].ty, pcx);
-    let nenv = nc - pcx.closures[id].xc_n;
+    let nc = slot_count(pcx.closures[id as usize].ty, pcx);
+    let nenv = nc - pcx.closures[id as usize].xc_n;
     for j in 0..nc {
-        let u = add_universal(U_CSLOT, id, j, &sig);
+        let u = add_universal(U_CSLOT, id, j, sig);
         sig.cslots.push(u);
     }
-    let e0 = if pcx.closures[id].capture_count > 0 { 1 } else { 0 };
+    let e0: i64 = if pcx.closures[id as usize].capture_count > 0 { 1 } else { 0 };
     if e0 == 1 {
         let t = fn_param(f, 0, pcx);
         sig.param_at.push(0);
         sig.walk.clear();
-        bind_walk(0, t, 0, 0, -1, &sig.walk, 0, pcx, -1);
-        let base = if pcx.types[t].kind == TyKind::Ptr { 1 } else { 0 };
+        bind_walk(0, t, 0, 0, -1, &mut sig.walk, 0, pcx, -1);
+        let base: i64 = if pcx.types[t as usize].kind == TyKind::Ptr { 1 } else { 0 };
         let n = sig.walk.len() as i64 / 4;
         for e in 0..n {
-            var u = 0;
+            let mut u: i64 = 0;
             if e < base {
-                u = add_universal(U_ENV, id, 0, &sig);
+                u = add_universal(U_ENV, id, 0, sig);
             } else if e - base < nc {
-                u = sig.cslots[e - base];
+                u = sig.cslots[(e - base) as usize];
             } else {
-                u = add_universal(U_ELIDED, 1, e, &sig);
+                u = add_universal(U_ELIDED, 1, e, sig);
             }
             sig.params.push(u);
         }
         for e in 0..n {
-            let up = sig.walk[4 * e + 3];
+            let up = sig.walk[(4 * e + 3) as usize];
             if up >= 0 {
-                sig.bounds.push(sig.params[e]);
-                sig.bounds.push(sig.params[up]);
+                sig.bounds.push(sig.params[e as usize]);
+                sig.bounds.push(sig.params[up as usize]);
             }
         }
     }
-    var walk = Vec::<i64, Comp>::new_in(Comp {});
-    var at = Vec::<i64, Comp>::new_in(Comp {});
-    var codes = Vec::<i64, Comp>::new_in(Comp {});
-    let _ = closure_sig_walk(id, pcx.closures[id].exp_node, pcx.closures[id].exp_tps, &walk, &at,
-        &codes, F_MARK, 0, pcx);
+    let mut walk = Vec::<i64, Comp>::new_in(Comp {});
+    let mut at = Vec::<i64, Comp>::new_in(Comp {});
+    let mut codes = Vec::<i64, Comp>::new_in(Comp {});
+    let _ = closure_sig_walk(id, pcx.closures[id as usize].exp_node,
+        pcx.closures[id as usize].exp_tps, &mut walk, &mut at, &mut codes, F_MARK, 0, pcx);
     let np = fn_param_count(f, pcx);
     for i in e0..np {
         let k = i - e0;
         let base = sig.params.len() as i64;
         sig.param_at.push(base);
-        for e in at[k]..at[k + 1] {
-            let u = code_universal(codes[e], i + 1, nenv, &sig);
+        for e in at[k as usize]..at[(k + 1) as usize] {
+            let u = code_universal(codes[e as usize], i + 1, nenv, sig);
             sig.params.push(u);
         }
-        push_decl_bounds(fn_param(f, i, pcx), false, base, &sig, pcx);
-        for e in at[k]..at[k + 1] {
-            let up = walk[4 * e + 3];
+        push_decl_bounds(fn_param(f, i, pcx), false, base, sig, pcx);
+        for e in at[k as usize]..at[(k + 1) as usize] {
+            let up = walk[(4 * e + 3) as usize];
             if up >= 0 {
-                sig.bounds.push(sig.params[base + e - at[k]]);
-                sig.bounds.push(sig.params[base + up - at[k]]);
+                sig.bounds.push(sig.params[(base + e - at[k as usize]) as usize]);
+                sig.bounds.push(sig.params[(base + up - at[k as usize]) as usize]);
             }
         }
     }
     sig.param_at.push(sig.params.len() as i64);
-    let r0 = at[np - e0];
-    let r1 = at[np - e0 + 1];
+    let r0 = at[(np - e0) as usize];
+    let r1 = at[(np - e0 + 1) as usize];
     for e in r0..r1 {
-        let u = code_universal(codes[e], 0, nenv, &sig);
+        let u = code_universal(codes[e as usize], 0, nenv, sig);
         sig.ret.push(u);
     }
-    push_decl_bounds(fn_ret(f, pcx), true, 0, &sig, pcx);
+    push_decl_bounds(fn_ret(f, pcx), true, 0, sig, pcx);
     for e in r0..r1 {
-        let up = walk[4 * e + 3];
+        let up = walk[(4 * e + 3) as usize];
         if up >= 0 {
-            sig.bounds.push(sig.ret[e - r0]);
-            sig.bounds.push(sig.ret[up - r0]);
+            sig.bounds.push(sig.ret[(e - r0) as usize]);
+            sig.bounds.push(sig.ret[(up - r0) as usize]);
         }
     }
 }
@@ -850,81 +858,81 @@ fn closure_sig(id: i64, f: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
 // RULE: D4.5 The declared bounds of the structs and enums in type t
 // (`Scope<'scope, 'env: 'scope>`: 'env outlives 'scope), as pairs of t's
 // slot positions from off (a outlives b; b = -1: 'static), pushed to out.
-fn decl_pairs(t: i64, off: i64, depth: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Comp>) {
+fn decl_pairs(t: i64, off: i64, depth: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
     if t <= 0 || depth > 16 {
         return;
     }
-    let k = pcx.types[t].kind;
+    let k = pcx.types[t as usize].kind;
     if k == TyKind::Ptr {
-        let own = if is_ref_kind(pcx.types[t].b) { 1 } else { 0 };
-        decl_pairs(pcx.types[t].a, off + own, depth + 1, &out, pcx);
+        let own: i64 = if is_ref_kind(pcx.types[t as usize].b) { 1 } else { 0 };
+        decl_pairs(pcx.types[t as usize].a, off + own, depth + 1, out, pcx);
         return;
     }
     if k == TyKind::Slice {
-        let own = if pcx.types[t].b == REF_RAW { 0 } else { 1 };
-        decl_pairs(pcx.types[t].a, off + own, depth + 1, &out, pcx);
+        let own: i64 = if pcx.types[t as usize].b == REF_RAW { 0 } else { 1 };
+        decl_pairs(pcx.types[t as usize].a, off + own, depth + 1, out, pcx);
         return;
     }
     if k == TyKind::Array || k == TyKind::Distinct {
-        decl_pairs(pcx.types[t].a, off, depth + 1, &out, pcx);
+        decl_pairs(pcx.types[t as usize].a, off, depth + 1, out, pcx);
         return;
     }
     if k == TyKind::Tuple {
-        var o = off;
-        for i in 0..pcx.types[t].count {
+        let mut o = off;
+        for i in 0..pcx.types[t as usize].count {
             let e = type_elem(t, i, pcx);
-            decl_pairs(e, o, depth + 1, &out, pcx);
+            decl_pairs(e, o, depth + 1, out, pcx);
             o += slot_count(e, pcx);
         }
         return;
     }
     if k != TyKind::Struct && k != TyKind::Enum
-        || k == TyKind::Struct && pcx.structs[pcx.types[t].a].closure != 0 {
+        || k == TyKind::Struct && pcx.structs[pcx.types[t as usize].a as usize].closure != 0 {
         return;
     }
     let node = adt_node(t, pcx);
-    let lts = if node > 0 { lifetimes_of(node, pcx) } else { 0 };
-    let nl = if lts > 0 { pcx.nodes[lts].count } else { 0 };
+    let lts: i64 = if node > 0 { lifetimes_of(node, pcx) } else { 0 };
+    let nl: i64 = if lts > 0 { pcx.nodes[lts as usize].count } else { 0 };
     for i in 0..nl {
-        let bounds = pcx.nodes[child(lts, i, pcx)].h;
-        for j in 0..(if bounds > 0 { pcx.nodes[bounds].count } else { 0 }) {
-            let bs = pcx.nodes[child(bounds, j, pcx)].a;
+        let bounds = pcx.nodes[child(lts, i, pcx) as usize].h;
+        for j in 0..(if bounds > 0 { pcx.nodes[bounds as usize].count } else { 0 }) {
+            let bs = pcx.nodes[child(bounds, j, pcx) as usize].a;
             if lifetime_binding(bs, pcx) == B_STATIC {
                 out.push(off + i);
                 out.push(-1);
                 continue;
             }
             for m in 0..nl {
-                if pcx.nodes[child(lts, m, pcx)].a == bs {
+                if pcx.nodes[child(lts, m, pcx) as usize].a == bs {
                     out.push(off + i);
                     out.push(off + m);
                 }
             }
         }
     }
-    var o = off + nl;
-    var offs = Vec::<i64, Comp>::new_in(Comp {});
+    let mut o = off + nl;
+    let mut offs = Vec::<i64, Comp>::new_in(Comp {});
     for i in 0..adt_targ_count(t, pcx) {
         let a = adt_targ(t, i, pcx);
         offs.push(o);
-        decl_pairs(a, o, depth + 1, &out, pcx);
+        decl_pairs(a, o, depth + 1, out, pcx);
         o += slot_count(a, pcx);
     }
     // RULE: D4.6 (the declaration's inferred outlives requirements, a
     // parameter's as each of its substitution's slots)
-    var reqs = Vec::<i64, Comp>::new_in(Comp {});
-    adt_reqs(t, depth, &reqs, pcx);
-    var r = 0;
+    let mut reqs = Vec::<i64, Comp>::new_in(Comp {});
+    adt_reqs(t, depth, &mut reqs, pcx);
+    let mut r: i64 = 0;
     while r + 1 < reqs.len() as i64 {
-        let a = reqs[r];
-        let b = if reqs[r + 1] < 0 { -1 } else { off + reqs[r + 1] };
+        let a = reqs[r as usize];
+        let b: i64 = if reqs[(r + 1) as usize] < 0 { -1 } else { off + reqs[(r + 1) as usize] };
         r += 2;
         if a < nl {
             out.push(off + a);
             out.push(b);
         } else if a - nl < offs.len() as i64 {
             for s in 0..slot_count(adt_targ(t, a - nl, pcx), pcx) {
-                out.push(offs[a - nl] + s);
+                out.push(offs[(a - nl) as usize] + s);
                 out.push(b);
             }
         }
@@ -935,13 +943,13 @@ fn decl_pairs(t: i64, off: i64, depth: i64, out: inout Vec<i64, Comp>, pcx: Ctx<
 // declaration (rustc's RFC 2093), from its fields' types: pairs (a, b), a
 // the declaration's lifetime index or, from its lifetime count up, its type
 // parameter's; b a lifetime index or -1 ('static); a outlives b.
-fn adt_reqs(t: i64, depth: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Comp>) {
+fn adt_reqs(t: i64, depth: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
     if t <= 0 || depth > 8 {
         return;
     }
-    let k = pcx.types[t].kind;
+    let k = pcx.types[t as usize].kind;
     if k != TyKind::Struct && k != TyKind::Enum
-        || k == TyKind::Struct && pcx.structs[pcx.types[t].a].closure != 0 {
+        || k == TyKind::Struct && pcx.structs[pcx.types[t as usize].a as usize].closure != 0 {
         return;
     }
     let node = adt_node(t, pcx);
@@ -949,31 +957,33 @@ fn adt_reqs(t: i64, depth: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Comp>) {
         return;
     }
     if k == TyKind::Struct {
-        let s = pcx.types[t].a;
-        for i in 0..pcx.nodes[node].count {
+        let s = pcx.types[t as usize].a;
+        for i in 0..pcx.nodes[node as usize].count {
             let field = child(node, i, pcx);
-            let ft = if i < struct_field_count(s, pcx) { struct_field_ty(s, i, pcx) } else { 0 };
-            req_walk(pcx.nodes[field].b, ft, -2, node, depth, &out, pcx);
+            let ft: i64 = if i < struct_field_count(s, pcx) { struct_field_ty(s, i, pcx) }
+                else { 0 };
+            req_walk(pcx.nodes[field as usize].b, ft, -2, node, depth, out, pcx);
         }
         return;
     }
-    let first = enum_info(pcx.types[t].a, pcx).variants;
-    for i in 0..pcx.nodes[node].count {
+    let first = enum_info(pcx.types[t as usize].a, pcx).variants;
+    for i in 0..pcx.nodes[node as usize].count {
         let vn = child(node, i, pcx);
-        for j in 0..pcx.nodes[vn].count {
+        for j in 0..pcx.nodes[vn as usize].count {
             let f = child(vn, j, pcx);
-            let fast = if is_node(f, NodeKind::Field, pcx) { pcx.nodes[f].b } else { f };
-            let ft = if first >= 0 && j < crate::places::ir::variant_field_count(first + i, pcx) {
+            let fast = if is_node(f, NodeKind::Field, pcx) { pcx.nodes[f as usize].b } else { f };
+            let ft: i64 = if first >= 0
+                && j < crate::places::ir::variant_field_count(first + i, pcx) {
                 variant_field(first + i, j, pcx)
             } else { 0 };
-            req_walk(fast, ft, -2, node, depth, &out, pcx);
+            req_walk(fast, ft, -2, node, depth, out, pcx);
         }
     }
 }
 
 // A lifetime written as sym in declaration dn's fields, as adt_reqs counts
 // it: its index, -1 'static, -2 none (elided, or not the declaration's).
-fn req_lifetime(sym: i64, dn: i64, pcx: Ctx<Comp>) -> i64 {
+fn req_lifetime(sym: i64, dn: i64, pcx: &Ctx<Comp>) -> i64 {
     let b = lifetime_binding(sym, pcx);
     if b == B_STATIC {
         return -1;
@@ -986,7 +996,7 @@ fn req_lifetime(sym: i64, dn: i64, pcx: Ctx<Comp>) -> i64 {
 }
 
 // a outlives b (adt_reqs' pair), when both are known and a is not 'static.
-fn req_push(a: i64, b: i64, out: inout Vec<i64, Comp>) {
+fn req_push(a: i64, b: i64, out: &mut Vec<i64, Comp>) {
     if a >= 0 && b != -2 && a != b {
         out.push(a);
         out.push(b);
@@ -998,43 +1008,44 @@ fn req_push(a: i64, b: i64, out: inout Vec<i64, Comp>) {
 // 'static, -2 none): every lifetime and type parameter n names outlives
 // enc; a reference's or view's lifetime is the new enc below it; a struct
 // or enum named adds its own requirements, read in dn's terms.
-fn req_walk(n: i64, t: i64, enc: i64, dn: i64, depth: i64, out: inout Vec<i64, Comp>,
-    pcx: Ctx<Comp>) {
+fn req_walk(n: i64, t: i64, enc: i64, dn: i64, depth: i64, out: &mut Vec<i64, Comp>,
+    pcx: &Ctx<Comp>) {
     if n <= 0 || depth > 16 {
         return;
     }
-    let k = pcx.nodes[n].kind;
-    let tk = if t > 0 { pcx.types[t].kind } else { TyKind::None };
+    let k = pcx.nodes[n as usize].kind;
+    let tk = if t > 0 { pcx.types[t as usize].kind } else { TyKind::None };
     if k == NodeKind::TyPtr {
-        let inner_t = if tk == TyKind::Ptr { pcx.types[t].a } else { 0 };
-        if (pcx.nodes[n].p & NODE_REF) != 0 {
-            let me = req_lifetime(pcx.nodes[n].c, dn, pcx);
-            req_push(me, enc, &out);
-            req_walk(pcx.nodes[n].a, inner_t, if me == -2 { enc } else { me }, dn, depth + 1, &out,
-                pcx);
+        let inner_t: i64 = if tk == TyKind::Ptr { pcx.types[t as usize].a } else { 0 };
+        if (pcx.nodes[n as usize].p & NODE_REF) != 0 {
+            let me = req_lifetime(pcx.nodes[n as usize].c, dn, pcx);
+            req_push(me, enc, out);
+            req_walk(pcx.nodes[n as usize].a, inner_t, if me == -2 { enc } else { me }, dn,
+                depth + 1, out, pcx);
         } else {
-            req_walk(pcx.nodes[n].a, inner_t, enc, dn, depth + 1, &out, pcx);
+            req_walk(pcx.nodes[n as usize].a, inner_t, enc, dn, depth + 1, out, pcx);
         }
         return;
     }
     if k == NodeKind::TySlice {
-        let me = req_lifetime(pcx.nodes[n].c, dn, pcx);
-        req_push(me, enc, &out);
-        let inner_t = if tk == TyKind::Slice { pcx.types[t].a } else { 0 };
-        req_walk(pcx.nodes[n].a, inner_t, if me == -2 { enc } else { me }, dn, depth + 1, &out,
-            pcx);
+        let me = req_lifetime(pcx.nodes[n as usize].c, dn, pcx);
+        req_push(me, enc, out);
+        let inner_t: i64 = if tk == TyKind::Slice { pcx.types[t as usize].a } else { 0 };
+        req_walk(pcx.nodes[n as usize].a, inner_t, if me == -2 { enc } else { me }, dn, depth + 1,
+            out, pcx);
         return;
     }
     if k == NodeKind::TyArray {
-        let inner_t = if tk == TyKind::Array { pcx.types[t].a } else { 0 };
-        req_walk(pcx.nodes[n].a, inner_t, enc, dn, depth + 1, &out, pcx);
+        let inner_t: i64 = if tk == TyKind::Array { pcx.types[t as usize].a } else { 0 };
+        req_walk(pcx.nodes[n as usize].a, inner_t, enc, dn, depth + 1, out, pcx);
         return;
     }
     if k == NodeKind::TyTuple {
-        for i in 0..pcx.nodes[n].count {
-            let et = if tk == TyKind::Tuple && i < pcx.types[t].count { type_elem(t, i, pcx) }
+        for i in 0..pcx.nodes[n as usize].count {
+            let et: i64 = if tk == TyKind::Tuple
+                && i < pcx.types[t as usize].count { type_elem(t, i, pcx) }
                 else { 0 };
-            req_walk(child(n, i, pcx), et, enc, dn, depth + 1, &out, pcx);
+            req_walk(child(n, i, pcx), et, enc, dn, depth + 1, out, pcx);
         }
         return;
     }
@@ -1042,9 +1053,9 @@ fn req_walk(n: i64, t: i64, enc: i64, dn: i64, depth: i64, out: inout Vec<i64, C
         return;
     }
     let nl = decl_lifetimes(dn, pcx);
-    let sym = pcx.nodes[n].a;
-    if pcx.nodes[n].list == 0 && pcx.nodes[n].g == 0 {
-        let i = param_index(pcx.nodes[dn].g, sym, pcx);
+    let sym = pcx.nodes[n as usize].a;
+    if pcx.nodes[n as usize].list == 0 && pcx.nodes[n as usize].g == 0 {
+        let i = param_index(pcx.nodes[dn as usize].g, sym, pcx);
         if i >= 0 {
             if enc != -2 {
                 out.push(nl + i);
@@ -1052,72 +1063,98 @@ fn req_walk(n: i64, t: i64, enc: i64, dn: i64, depth: i64, out: inout Vec<i64, C
             }
             return;
         }
-        if sym_text(sym, pcx) == "str" {
-            req_push(req_lifetime(pcx.nodes[n].c, dn, pcx), enc, &out);
+        if sym_text(sym, pcx) == b"str" {
+            req_push(req_lifetime(pcx.nodes[n as usize].c, dn, pcx), enc, out);
             return;
         }
     }
-    if pcx.nodes[n].list != 0 {
+    if pcx.nodes[n as usize].list != 0 {
         // (a projection, `U::IntoIter`: rustc's `<U as Tr>::A: 'a`, not
         // read here)
         return;
     }
     let lts = lifetimes_of(n, pcx);
-    let nlts = if lts > 0 { pcx.nodes[lts].count } else { 0 };
+    let nlts: i64 = if lts > 0 { pcx.nodes[lts as usize].count } else { 0 };
     for i in 0..nlts {
-        req_push(req_lifetime(pcx.nodes[child(lts, i, pcx)].a, dn, pcx), enc, &out);
+        req_push(req_lifetime(pcx.nodes[child(lts, i, pcx) as usize].a, dn, pcx), enc, out);
     }
     let adt = t > 0 && (tk == TyKind::Struct || tk == TyKind::Enum);
-    let args = pcx.nodes[n].g;
-    let nargs = if args > 0 { pcx.nodes[args].count } else { 0 };
+    let args = pcx.nodes[n as usize].g;
+    let nargs: i64 = if args > 0 { pcx.nodes[args as usize].count } else { 0 };
     for i in 0..nargs {
-        let at = if adt && i < adt_targ_count(t, pcx) { adt_targ(t, i, pcx) } else { 0 };
-        req_walk(child(args, i, pcx), at, enc, dn, depth + 1, &out, pcx);
+        let at: i64 = if adt && i < adt_targ_count(t, pcx) { adt_targ(t, i, pcx) } else { 0 };
+        req_walk(child(args, i, pcx), at, enc, dn, depth + 1, out, pcx);
     }
     if !adt {
         return;
     }
     // (the named type's own requirements, its lifetimes and parameters
     // replaced by what n writes for them)
-    var sub = Vec::<i64, Comp>::new_in(Comp {});
-    adt_reqs(t, depth + 1, &sub, pcx);
+    let mut sub = Vec::<i64, Comp>::new_in(Comp {});
+    adt_reqs(t, depth + 1, &mut sub, pcx);
     let dm = decl_lifetimes(adt_node(t, pcx), pcx);
-    var r = 0;
+    let mut r: i64 = 0;
     while r + 1 < sub.len() as i64 {
-        let a = sub[r];
-        let b0 = sub[r + 1];
+        let a = sub[r as usize];
+        let b0 = sub[(r + 1) as usize];
         r += 2;
-        let b = if b0 < 0 { -1 } else if b0 < nlts {
-            req_lifetime(pcx.nodes[child(lts, b0, pcx)].a, dn, pcx)
+        let b: i64 = if b0 < 0 { -1 } else if b0 < nlts {
+            req_lifetime(pcx.nodes[child(lts, b0, pcx) as usize].a, dn, pcx)
         } else { -2 };
         if b == -2 {
             continue;
         }
         if a < dm {
             if a < nlts {
-                req_push(req_lifetime(pcx.nodes[child(lts, a, pcx)].a, dn, pcx), b, &out);
+                req_push(req_lifetime(pcx.nodes[child(lts, a, pcx) as usize].a, dn, pcx), b, out);
             }
         } else if a - dm < nargs && a - dm < adt_targ_count(t, pcx) {
-            req_walk(child(args, a - dm, pcx), adt_targ(t, a - dm, pcx), b, dn, depth + 1, &out,
+            req_walk(child(args, a - dm, pcx), adt_targ(t, a - dm, pcx), b, dn, depth + 1, out,
                 pcx);
         }
+    }
+}
+
+// decl_pairs(t, 0, 0) into out, made once per type (pcx.decl_pair_at): a
+// signature's types are read again at every call of its function, and a
+// type's pairs (its fields' requirements, D4.6, through every struct and
+// enum they name) depend on the type alone.
+fn decl_pairs_of(t: i64, out: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
+    if t <= 0 {
+        return;
+    }
+    let mut at = pcx.decl_pair_at.get(t + 1) - 1;
+    if at < 0 {
+        let mut pairs = Vec::<i64, Comp>::new_in(Comp {});
+        decl_pairs(t, 0, 0, &mut pairs, pcx);
+        at = pcx.decl_pair_store.count;
+        pcx.decl_pair_store.push(pairs.len() as i64);
+        for &x in pairs.as_slice() {
+            pcx.decl_pair_store.push(x);
+        }
+        pcx.decl_pair_at.put(t + 1, at + 1);
+    }
+    let n = pcx.decl_pair_store.get(at);
+    for i in 0..n {
+        out.push(pcx.decl_pair_store.get(at + 1 + i));
     }
 }
 
 // The declared bounds of type t (decl_pairs), whose slots are the
 // universals sig.params[base..] (sig.ret[base..] when ret), as bounds of
 // sig.
-fn push_decl_bounds(t: i64, ret: bool, base: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
-    var pairs = Vec::<i64, Comp>::new_in(Comp {});
-    decl_pairs(t, 0, 0, &pairs, pcx);
+fn push_decl_bounds(t: i64, ret: bool, base: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
+    let mut pairs = Vec::<i64, Comp>::new_in(Comp {});
+    decl_pairs_of(t, &mut pairs, pcx);
     let n = if ret { sig.ret.len() as i64 } else { sig.params.len() as i64 };
-    var i = 0;
+    let mut i: i64 = 0;
     while i + 1 < pairs.len() as i64 {
-        let a = base + pairs[i];
-        let b = if pairs[i + 1] < 0 { -1 } else { base + pairs[i + 1] };
+        let a = base + pairs[i as usize];
+        let b: i64 = if pairs[(i + 1) as usize] < 0 { -1 } else { base + pairs[(i + 1) as usize] };
         if a < n && b < n {
-            let ua = if ret { sig.ret[a] } else { sig.params[a] };
-            let ub = if b < 0 { 0 } else if ret { sig.ret[b] } else { sig.params[b] };
+            let ua = if ret { sig.ret[a as usize] } else { sig.params[a as usize] };
+            let ub: i64 = if b < 0 { 0 } else if ret { sig.ret[b as usize] }
+                else { sig.params[b as usize] };
             sig.bounds.push(ua);
             sig.bounds.push(ub);
         }
@@ -1127,14 +1164,14 @@ fn push_decl_bounds(t: i64, ret: bool, base: i64, sig: inout Sig<Comp>, pcx: Ctx
 
 // The universal of a closure signature position of class q
 // (closure_sig_walk's), in parameter local `param` (0: the result).
-fn code_universal(q: i64, param: i64, nenv: i64, sig: inout Sig<Comp>) -> i64 {
+fn code_universal(q: i64, param: i64, nenv: i64, sig: &mut Sig<Comp>) -> i64 {
     if q >= 0 {
-        return sig.cslots[nenv + q];
+        return sig.cslots[(nenv + q) as usize];
     }
     if q == -1 {
         return 0;
     }
-    add_universal(U_BOUND, param, -2 - q, &sig)
+    add_universal(U_BOUND, param, -2 - q, sig)
 }
 
 fn is_ref_kind(b: i64) -> bool {
@@ -1143,47 +1180,51 @@ fn is_ref_kind(b: i64) -> bool {
 
 // A struct or enum type's declaration node (its template's), type
 // arguments.
-fn adt_node(t: i64, pcx: Ctx<Comp>) -> i64 {
-    if pcx.types[t].kind == TyKind::Struct { pcx.structs[pcx.types[t].a].node }
-    else { enum_info(pcx.types[t].a, pcx).node }
+fn adt_node(t: i64, pcx: &Ctx<Comp>) -> i64 {
+    if pcx.types[t as usize].kind
+        == TyKind::Struct { pcx.structs[pcx.types[t as usize].a as usize].node }
+    else { enum_info(pcx.types[t as usize].a, pcx).node }
 }
 
-fn adt_targ_count(t: i64, pcx: Ctx<Comp>) -> i64 {
-    if pcx.types[t].kind == TyKind::Struct { pcx.structs[pcx.types[t].a].targ_count }
-    else { enum_info(pcx.types[t].a, pcx).targ_count }
+fn adt_targ_count(t: i64, pcx: &Ctx<Comp>) -> i64 {
+    if pcx.types[t as usize].kind
+        == TyKind::Struct { pcx.structs[pcx.types[t as usize].a as usize].targ_count }
+    else { enum_info(pcx.types[t as usize].a, pcx).targ_count }
 }
 
-fn adt_targ(t: i64, i: i64, pcx: Ctx<Comp>) -> i64 {
-    let at = if pcx.types[t].kind == TyKind::Struct { pcx.structs[pcx.types[t].a].targs }
-        else { enum_info(pcx.types[t].a, pcx).targs };
+fn adt_targ(t: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
+    let at = if pcx.types[t as usize].kind
+        == TyKind::Struct { pcx.structs[pcx.types[t as usize].a as usize].targs }
+        else { enum_info(pcx.types[t as usize].a, pcx).targs };
     tlist_at(at + i, pcx)
 }
 
 // The number of lifetimes item node n declares (`struct S<'a, 'b>`).
-fn decl_lifetimes(n: i64, pcx: Ctx<Comp>) -> i64 {
+fn decl_lifetimes(n: i64, pcx: &Ctx<Comp>) -> i64 {
     if n <= 0 {
         return 0;
     }
     let h = lifetimes_of(n, pcx);
-    if h > 0 { pcx.nodes[h].count } else { 0 }
+    if h > 0 { pcx.nodes[h as usize].count } else { 0 }
 }
 
 // The number of type parameters of item node n.
-fn decl_type_params(n: i64, pcx: Ctx<Comp>) -> i64 {
-    if n <= 0 || pcx.nodes[n].g <= 0 { 0 } else { pcx.nodes[pcx.nodes[n].g].count }
+fn decl_type_params(n: i64, pcx: &Ctx<Comp>) -> i64 {
+    if n <= 0 || pcx.nodes[n as usize].g <= 0 { 0 }
+    else { pcx.nodes[pcx.nodes[n as usize].g as usize].count }
 }
 
-fn is_node(n: i64, k: NodeKind, pcx: Ctx<Comp>) -> bool {
-    n > 0 && pcx.nodes[n].kind == k
+fn is_node(n: i64, k: NodeKind, pcx: &Ctx<Comp>) -> bool {
+    n > 0 && pcx.nodes[n as usize].kind == k
 }
 
 // The index of the type parameter named sym in generics node g (-1).
-fn param_index(g: i64, sym: i64, pcx: Ctx<Comp>) -> i64 {
+fn param_index(g: i64, sym: i64, pcx: &Ctx<Comp>) -> i64 {
     if g <= 0 {
         return -1;
     }
-    for i in 0..pcx.nodes[g].count {
-        if pcx.nodes[child(g, i, pcx)].a == sym {
+    for i in 0..pcx.nodes[g as usize].count {
+        if pcx.nodes[child(g, i, pcx) as usize].a == sym {
             return i;
         }
     }
@@ -1191,12 +1232,12 @@ fn param_index(g: i64, sym: i64, pcx: Ctx<Comp>) -> i64 {
 }
 
 // The index of the lifetime named sym among the lifetimes holder h's (-1).
-fn lifetime_index(h: i64, sym: i64, pcx: Ctx<Comp>) -> i64 {
+fn lifetime_index(h: i64, sym: i64, pcx: &Ctx<Comp>) -> i64 {
     if h <= 0 || sym == 0 {
         return -1;
     }
-    for i in 0..pcx.nodes[h].count {
-        if pcx.nodes[child(h, i, pcx)].a == sym {
+    for i in 0..pcx.nodes[h as usize].count {
+        if pcx.nodes[child(h, i, pcx) as usize].a == sym {
             return i;
         }
     }
@@ -1205,30 +1246,30 @@ fn lifetime_index(h: i64, sym: i64, pcx: Ctx<Comp>) -> i64 {
 
 // What a lifetime written as sym binds: elided (none written, `'_`),
 // 'static, or the lifetime named.
-fn lifetime_binding(sym: i64, pcx: Ctx<Comp>) -> i64 {
+fn lifetime_binding(sym: i64, pcx: &Ctx<Comp>) -> i64 {
     if sym == 0 {
         return B_ELIDED;
     }
     let text = sym_text(sym, pcx);
-    if text == "'_" || text == "_" {
+    if text == b"'_" || text == b"_" {
         B_ELIDED
-    } else if text == "'static" || text == "static" {
+    } else if text == b"'static" || text == b"static" {
         B_STATIC
     } else {
         B_NAMED
     }
 }
 
-fn push_entry(kind: i64, x: i64, y: i64, up: i64, out: inout Vec<i64, Comp>) {
+fn push_entry(kind: i64, x: i64, y: i64, up: i64, out: &mut Vec<i64, Comp>) {
     out.push(kind);
     out.push(x);
     out.push(y);
     out.push(up);
 }
 
-fn push_lifetime(sym: i64, up: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Comp>) {
+fn push_lifetime(sym: i64, up: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
     let b = lifetime_binding(sym, pcx);
-    push_entry(b, if b == B_NAMED { sym } else { 0 }, 0, up, &out);
+    push_entry(b, if b == B_NAMED { sym } else { 0 }, 0, up, out);
 }
 
 // RULE: D4.2 (the parallel walk) The slots of type t read with the AST
@@ -1237,50 +1278,53 @@ fn push_lifetime(sym: i64, up: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Comp>) {
 // entry (index of out's) of the reference or view whose pointee holds it
 // (-1: none; D4.5's implied bounds). tps is the generics node of the type
 // parameters in scope; self_node the type `Self` names (0: none).
-fn bind_walk(n0: i64, t: i64, tps: i64, self_node: i64, up: i64, out: inout Vec<i64, Comp>,
-    depth: i64, pcx: Ctx<Comp>, f: i64) {
+fn bind_walk(n0: i64, t: i64, tps: i64, self_node: i64, up: i64, out: &mut Vec<i64, Comp>,
+    depth: i64, pcx: &Ctx<Comp>, f: i64) {
     if t <= 0 || depth > 16 {
         return;
     }
-    if f >= 0 && omega_proj(n0, t, tps, up, &out, depth, f, pcx) {
+    if f >= 0 && omega_proj(n0, t, tps, up, out, depth, f, pcx) {
         return;
     }
-    if proj_walk(n0, t, tps, self_node, up, &out, depth, f, pcx) {
+    if proj_walk(n0, t, tps, self_node, up, out, depth, f, pcx) {
         return;
     }
     if f == F_MARK && proj_shape(n0, pcx) {
         for j in 0..slot_count(t, pcx) {
-            push_entry(B_PROJ, 0, j, up, &out);
+            push_entry(B_PROJ, 0, j, up, out);
         }
         return;
     }
-    var n = n0;
-    if is_node(n, NodeKind::TyName, pcx) && pcx.nodes[n].list == 0 && pcx.nodes[n].g == 0 {
-        let k = param_index(tps, pcx.nodes[n].a, pcx);
+    let mut n = n0;
+    if is_node(n, NodeKind::TyName, pcx) && pcx.nodes[n as usize].list == 0
+        && pcx.nodes[n as usize].g == 0 {
+        let k = param_index(tps, pcx.nodes[n as usize].a, pcx);
         if k >= 0 {
             // RULE: D4.4 (a type parameter's substitution: its slots)
             for j in 0..slot_count(t, pcx) {
-                push_entry(B_PARAM, k, j, up, &out);
+                push_entry(B_PARAM, k, j, up, out);
             }
             return;
         }
-        if f >= 0 && sym_text(pcx.nodes[n].a, pcx) == "Self" && !self_is_type(self_node, pcx) {
+        if f >= 0 && sym_text(pcx.nodes[n as usize].a, pcx) == b"Self"
+            && !self_is_type(self_node, pcx) {
             // RULE: D4.6 (c) (`Self` in a trait's default method: a type
             // parameter, its substitution's slots, the U_SUBST of `Self`)
             for j in 0..slot_count(t, pcx) {
-                push_entry(B_SELF, pcx.nodes[n].a, j, up, &out);
+                push_entry(B_SELF, pcx.nodes[n as usize].a, j, up, out);
             }
             return;
         }
-        if self_node > 0 && sym_text(pcx.nodes[n].a, pcx) == "Self" {
+        if self_node > 0 && sym_text(pcx.nodes[n as usize].a, pcx) == b"Self" {
             n = self_node;
             // RULE: D4.4 (`Self` a type parameter, `impl<I: Iterator>
             // IntoIterator for I`: its substitution's slots, as `I`'s)
-            if is_node(n, NodeKind::TyName, pcx) && pcx.nodes[n].list == 0 && pcx.nodes[n].g == 0 {
-                let ks = param_index(tps, pcx.nodes[n].a, pcx);
+            if is_node(n, NodeKind::TyName, pcx) && pcx.nodes[n as usize].list == 0
+                && pcx.nodes[n as usize].g == 0 {
+                let ks = param_index(tps, pcx.nodes[n as usize].a, pcx);
                 if ks >= 0 {
                     for j in 0..slot_count(t, pcx) {
-                        push_entry(B_PARAM, ks, j, up, &out);
+                        push_entry(B_PARAM, ks, j, up, out);
                     }
                     return;
                 }
@@ -1288,72 +1332,78 @@ fn bind_walk(n0: i64, t: i64, tps: i64, self_node: i64, up: i64, out: inout Vec<
             // RULE: D4.6 (b) (an elided lifetime of the impl's header, `impl Ord
             // for str`, is the impl's own lifetime: the same at every `Self`
             // of the signature, slot j of Self the U_SUBST of `Self`'s j)
-            var head = Vec::<i64, Comp>::new_in(Comp {});
-            bind_walk(n, t, tps, 0, -1, &head, depth + 1, pcx, f);
+            let mut head = Vec::<i64, Comp>::new_in(Comp {});
+            bind_walk(n, t, tps, 0, -1, &mut head, depth + 1, pcx, f);
             let at = out.len() as i64 / 4;
             for e in 0..head.len() as i64 / 4 {
-                let u = head[4 * e + 3];
+                let u = head[(4 * e + 3) as usize];
                 let up2 = if u >= 0 { at + u } else { up };
-                if head[4 * e] == B_ELIDED {
-                    push_entry(B_SELF, pcx.nodes[n0].a, e, up2, &out);
+                if head[(4 * e) as usize] == B_ELIDED {
+                    push_entry(B_SELF, pcx.nodes[n0 as usize].a, e, up2, out);
                 } else {
-                    push_entry(head[4 * e], head[4 * e + 1], head[4 * e + 2], up2, &out);
+                    push_entry(head[(4 * e) as usize], head[(4 * e + 1) as usize],
+                        head[(4 * e + 2) as usize], up2, out);
                 }
             }
             return;
         }
     }
-    let k = pcx.types[t].kind;
+    let k = pcx.types[t as usize].kind;
     if k == TyKind::Ptr {
-        let ast = if is_node(n, NodeKind::TyPtr, pcx) { pcx.nodes[n].a } else { 0 };
-        if is_ref_kind(pcx.types[t].b) {
+        let ast: i64 = if is_node(n, NodeKind::TyPtr, pcx) { pcx.nodes[n as usize].a } else { 0 };
+        if is_ref_kind(pcx.types[t as usize].b) {
             let me = out.len() as i64 / 4;
-            let lt = if is_node(n, NodeKind::TyPtr, pcx) && (pcx.nodes[n].p & NODE_REF) != 0 {
-                pcx.nodes[n].c
+            let lt: i64 = if is_node(n, NodeKind::TyPtr, pcx)
+                && (pcx.nodes[n as usize].p & NODE_REF) != 0 {
+                pcx.nodes[n as usize].c
             } else { 0 };
-            push_lifetime(lt, up, &out, pcx);
-            bind_walk(ast, pcx.types[t].a, tps, self_node, me, &out, depth + 1, pcx, f);
+            push_lifetime(lt, up, out, pcx);
+            bind_walk(ast, pcx.types[t as usize].a, tps, self_node, me, out, depth + 1, pcx, f);
         } else {
-            bind_walk(ast, pcx.types[t].a, tps, self_node, up, &out, depth + 1, pcx, f);
+            bind_walk(ast, pcx.types[t as usize].a, tps, self_node, up, out, depth + 1, pcx, f);
         }
         return;
     }
-    if k == TyKind::Slice && pcx.types[t].b == REF_RAW {
+    if k == TyKind::Slice && pcx.types[t as usize].b == REF_RAW {
         // RULE: Z9.1 (a fat raw pointer: no region of its own)
         // (written `*const [T]`: a TyPtr over the TySlice)
-        let sn = if is_node(n, NodeKind::TyPtr, pcx) { pcx.nodes[n].a } else { n };
-        let ast = if is_node(sn, NodeKind::TySlice, pcx) { pcx.nodes[sn].a } else { 0 };
-        bind_walk(ast, pcx.types[t].a, tps, self_node, up, &out, depth + 1, pcx, f);
+        let sn = if is_node(n, NodeKind::TyPtr, pcx) { pcx.nodes[n as usize].a } else { n };
+        let ast: i64 = if is_node(sn, NodeKind::TySlice, pcx) { pcx.nodes[sn as usize].a }
+            else { 0 };
+        bind_walk(ast, pcx.types[t as usize].a, tps, self_node, up, out, depth + 1, pcx, f);
         return;
     }
     if (k == TyKind::Slice || k == TyKind::Distinct) && is_node(n, NodeKind::TyPtr, pcx)
-        && (pcx.nodes[n].p & NODE_REF) != 0 && (pcx.nodes[n].p & NODE_REF_MUT) == 0 {
+        && (pcx.nodes[n as usize].p & NODE_REF) != 0
+        && (pcx.nodes[n as usize].p & NODE_REF_MUT) == 0 {
         // RULE: D4.6 (b) (`&'a T` with T a view, `str`: the reference to it
         // is the view T copied out, its slots T's)
-        var a = pcx.nodes[n].a;
+        let mut a = pcx.nodes[n as usize].a;
         if self_node > 0 && is_node(a, NodeKind::TyName, pcx)
-            && sym_text(pcx.nodes[a].a, pcx) == "Self" {
+            && sym_text(pcx.nodes[a as usize].a, pcx) == b"Self" {
             a = self_node;
         }
-        let pk = if is_node(a, NodeKind::TyName, pcx) && pcx.nodes[a].list == 0
-            && pcx.nodes[a].g == 0 { param_index(tps, pcx.nodes[a].a, pcx) } else { -1 };
-        let targ = if pk >= 0 && f >= 0 { crate::places::front::fn_targ(f, pk, pcx) } else { 0 };
-        if targ > 0 && pcx.types[targ].kind == TyKind::Unsized {
+        let pk: i64 = if is_node(a, NodeKind::TyName, pcx) && pcx.nodes[a as usize].list == 0
+            && pcx.nodes[a as usize].g == 0 { param_index(tps, pcx.nodes[a as usize].a, pcx) }
+            else { -1 };
+        let targ: i64 = if pk >= 0 && f >= 0 { crate::places::front::fn_targ(f, pk, pcx) }
+            else { 0 };
+        if targ > 0 && pcx.types[targ as usize].kind == TyKind::Unsized {
             // RULE: Z9.1c (0.27.5: T the unsized place, `&'a T` the view:
             // its region the reference's, written or elided, and T's
             // slots, the elements', under it; not T's own)
             let me = out.len() as i64 / 4;
-            push_lifetime(pcx.nodes[n].c, up, &out, pcx);
+            push_lifetime(pcx.nodes[n as usize].c, up, out, pcx);
             for j in 1..slot_count(t, pcx) {
-                push_entry(B_PARAM, pk, j - 1, me, &out);
+                push_entry(B_PARAM, pk, j - 1, me, out);
             }
             return;
         }
         if pk >= 0 {
             let at = out.len() as i64;
-            bind_walk(a, t, tps, self_node, up, &out, depth + 1, pcx, f);
-            if out.len() as i64 > at && out[at] == B_PARAM {
-                out[at] = B_PARAM_REF;
+            bind_walk(a, t, tps, self_node, up, out, depth + 1, pcx, f);
+            if out.len() as i64 > at && out[at as usize] == B_PARAM {
+                out[at as usize] = B_PARAM_REF;
             }
             return;
         }
@@ -1364,73 +1414,77 @@ fn bind_walk(n0: i64, t: i64, tps: i64, self_node: i64, up: i64, out: inout Vec<
         let (vn, vlt) = view_node(n, self_node, pcx);
         let me = out.len() as i64 / 4;
         let slice = is_node(vn, NodeKind::TySlice, pcx);
-        push_lifetime(if vlt != 0 { vlt } else if slice { pcx.nodes[vn].c } else { 0 }, up,
-            &out, pcx);
-        bind_walk(if slice { pcx.nodes[vn].a } else { 0 }, pcx.types[t].a, tps, self_node, me,
-            &out, depth + 1, pcx, f);
+        push_lifetime(if vlt != 0 { vlt } else if slice { pcx.nodes[vn as usize].c } else { 0 }, up,
+            out, pcx);
+        bind_walk(if slice { pcx.nodes[vn as usize].a } else { 0 }, pcx.types[t as usize].a, tps,
+            self_node, me, out, depth + 1, pcx, f);
         return;
     }
     if k == TyKind::Distinct {
         // (`str`: a view of bytes; its lifetime is its TyName's c, the
         // parser's for `&'a str`; `&self` on `impl str` the reference's)
-        let u = pcx.types[t].a;
-        if u > 0 && pcx.types[u].kind == TyKind::Slice && pcx.types[u].b != REF_RAW {
+        let u = pcx.types[t as usize].a;
+        if u > 0 && pcx.types[u as usize].kind == TyKind::Slice
+            && pcx.types[u as usize].b != REF_RAW {
             let (vn, vlt) = view_node(n, self_node, pcx);
             let named = is_node(vn, NodeKind::TyName, pcx)
-                && sym_text(pcx.nodes[vn].a, pcx) == "str";
+                && sym_text(pcx.nodes[vn as usize].a, pcx) == b"str";
             let me = out.len() as i64 / 4;
-            push_lifetime(if vlt != 0 { vlt } else if named { pcx.nodes[vn].c } else { 0 }, up,
-                &out, pcx);
-            bind_walk(0, pcx.types[u].a, tps, self_node, me, &out, depth + 1, pcx, f);
+            push_lifetime(if vlt != 0 { vlt } else if named { pcx.nodes[vn as usize].c } else { 0 },
+                up, out, pcx);
+            bind_walk(0, pcx.types[u as usize].a, tps, self_node, me, out, depth + 1, pcx, f);
         } else {
-            bind_walk(0, u, tps, self_node, up, &out, depth + 1, pcx, f);
+            bind_walk(0, u, tps, self_node, up, out, depth + 1, pcx, f);
         }
         return;
     }
     if k == TyKind::Array {
-        let ast = if is_node(n, NodeKind::TyArray, pcx) { pcx.nodes[n].a } else { 0 };
-        bind_walk(ast, pcx.types[t].a, tps, self_node, up, &out, depth + 1, pcx, f);
+        let ast: i64 = if is_node(n, NodeKind::TyArray, pcx) { pcx.nodes[n as usize].a } else { 0 };
+        bind_walk(ast, pcx.types[t as usize].a, tps, self_node, up, out, depth + 1, pcx, f);
         return;
     }
     if k == TyKind::Tuple {
         let tuple = is_node(n, NodeKind::TyTuple, pcx);
-        for i in 0..pcx.types[t].count {
-            let ast = if tuple && i < pcx.nodes[n].count { child(n, i, pcx) } else { 0 };
-            bind_walk(ast, type_elem(t, i, pcx), tps, self_node, up, &out, depth + 1, pcx, f);
+        for i in 0..pcx.types[t as usize].count {
+            let ast: i64 = if tuple && i < pcx.nodes[n as usize].count { child(n, i, pcx) }
+                else { 0 };
+            bind_walk(ast, type_elem(t, i, pcx), tps, self_node, up, out, depth + 1, pcx, f);
         }
         return;
     }
-    if k == TyKind::Struct && pcx.structs[pcx.types[t].a].closure != 0 {
-        let s = pcx.types[t].a;
+    if k == TyKind::Struct && pcx.structs[pcx.types[t as usize].a as usize].closure != 0 {
+        let s = pcx.types[t as usize].a;
         for i in 0..struct_field_count(s, pcx) {
             if capture_ref(s, i, pcx) {
                 // (a by-reference capture: its loan's slot, elided, D10.2)
                 let me = out.len() as i64 / 4;
-                push_lifetime(0, up, &out, pcx);
-                bind_walk(0, pcx.types[struct_field_ty(s, i, pcx)].a, tps, self_node, me, &out,
-                    depth + 1, pcx, f);
+                push_lifetime(0, up, out, pcx);
+                bind_walk(0, pcx.types[struct_field_ty(s, i, pcx) as usize].a, tps, self_node, me,
+                    out, depth + 1, pcx, f);
                 continue;
             }
-            bind_walk(0, struct_field_ty(s, i, pcx), tps, self_node, up, &out, depth + 1, pcx, f);
+            bind_walk(0, struct_field_ty(s, i, pcx), tps, self_node, up, out, depth + 1, pcx, f);
         }
         // RULE: D19.1 (X_C: no AST; under `&'e C` each outlives 'e, D19.4)
         for _ in 0..xc_count(s, pcx) {
-            push_entry(B_ELIDED, 0, 0, up, &out);
+            push_entry(B_ELIDED, 0, 0, up, out);
         }
         return;
     }
     if k == TyKind::Struct || k == TyKind::Enum {
         let name = is_node(n, NodeKind::TyName, pcx);
-        let lts = if name { lifetimes_of(n, pcx) } else { 0 };
+        let lts: i64 = if name { lifetimes_of(n, pcx) } else { 0 };
         for i in 0..decl_lifetimes(adt_node(t, pcx), pcx) {
-            let sym = if lts > 0 && i < pcx.nodes[lts].count { pcx.nodes[child(lts, i, pcx)].a }
+            let sym: i64 = if lts > 0
+                && i < pcx.nodes[lts as usize].count { pcx.nodes[child(lts, i, pcx) as usize].a }
                 else { 0 };
-            push_lifetime(sym, up, &out, pcx);
+            push_lifetime(sym, up, out, pcx);
         }
-        let args = if name { pcx.nodes[n].g } else { 0 };
+        let args: i64 = if name { pcx.nodes[n as usize].g } else { 0 };
         for i in 0..adt_targ_count(t, pcx) {
-            let ast = if args > 0 && i < pcx.nodes[args].count { child(args, i, pcx) } else { 0 };
-            bind_walk(ast, adt_targ(t, i, pcx), tps, self_node, up, &out, depth + 1, pcx, f);
+            let ast: i64 = if args > 0 && i < pcx.nodes[args as usize].count { child(args, i, pcx) }
+                else { 0 };
+            bind_walk(ast, adt_targ(t, i, pcx), tps, self_node, up, out, depth + 1, pcx, f);
         }
     }
 }
@@ -1439,19 +1493,19 @@ fn bind_walk(n0: i64, t: i64, tps: i64, self_node: i64, up: i64, out: inout Vec<
 // `impl<T> [T]` or `impl str`) is Self's node, with 's (0: elided) as the
 // view's lifetime, a `&'s [T]` or `&'s str` the view's; any other node
 // is itself, with 0.
-fn view_node(n: i64, self_node: i64, pcx: Ctx<Comp>) -> (i64, i64) {
-    if !is_node(n, NodeKind::TyPtr, pcx) || (pcx.nodes[n].p & NODE_REF) == 0 {
+fn view_node(n: i64, self_node: i64, pcx: &Ctx<Comp>) -> (i64, i64) {
+    if !is_node(n, NodeKind::TyPtr, pcx) || (pcx.nodes[n as usize].p & NODE_REF) == 0 {
         return (n, 0);
     }
-    let a = pcx.nodes[n].a;
+    let a = pcx.nodes[n as usize].a;
     if self_node > 0 && is_node(a, NodeKind::TyName, pcx)
-        && sym_text(pcx.nodes[a].a, pcx) == "Self" {
-        return (self_node, pcx.nodes[n].c);
+        && sym_text(pcx.nodes[a as usize].a, pcx) == b"Self" {
+        return (self_node, pcx.nodes[n as usize].c);
     }
     // (`&'a T` with T a view is that view: T's, not read here)
     if is_node(a, NodeKind::TySlice, pcx)
-        || is_node(a, NodeKind::TyName, pcx) && sym_text(pcx.nodes[a].a, pcx) == "str" {
-        return (a, pcx.nodes[n].c);
+        || is_node(a, NodeKind::TyName, pcx) && sym_text(pcx.nodes[a as usize].a, pcx) == b"str" {
+        return (a, pcx.nodes[n as usize].c);
     }
     (n, 0)
 }
@@ -1459,13 +1513,13 @@ fn view_node(n: i64, self_node: i64, pcx: Ctx<Comp>) -> (i64, i64) {
 // Whether node s, a function's `Self` (its node's h), is a type written in
 // an impl's header (not none, a trait, or `Self` again: a trait's default
 // method, where Self is a type parameter).
-fn self_is_type(s: i64, pcx: Ctx<Comp>) -> bool {
+fn self_is_type(s: i64, pcx: &Ctx<Comp>) -> bool {
     if s <= 0 {
         return false;
     }
-    let k = pcx.nodes[s].kind;
+    let k = pcx.nodes[s as usize].kind;
     if k == NodeKind::TyName {
-        return sym_text(pcx.nodes[s].a, pcx) != "Self";
+        return sym_text(pcx.nodes[s as usize].a, pcx) != b"Self";
     }
     k == NodeKind::TyPtr || k == NodeKind::TySlice || k == NodeKind::TyArray
         || k == NodeKind::TyTuple || k == NodeKind::TyFn
@@ -1476,46 +1530,46 @@ fn self_is_type(s: i64, pcx: Ctx<Comp>) -> bool {
 // defines, read with that impl's lifetimes and parameters, each of its
 // slots the slot of S it names, as rustc's normalization does; true when
 // written to out, false (no impl found: the walk reads it as elided) else)
-fn proj_walk(n: i64, t: i64, tps: i64, self_node: i64, up: i64, out: inout Vec<i64, Comp>,
-    depth: i64, f: i64, pcx: Ctx<Comp>) -> bool {
+fn proj_walk(n: i64, t: i64, tps: i64, self_node: i64, up: i64, out: &mut Vec<i64, Comp>,
+    depth: i64, f: i64, pcx: &Ctx<Comp>) -> bool {
     if f < 0 || !proj_shape(n, pcx) {
         return false;
     }
     let first = child(n, 0, pcx);
-    let is_self = sym_text(pcx.nodes[first].a, pcx) == "Self";
+    let is_self = sym_text(pcx.nodes[first as usize].a, pcx) == b"Self";
     // (S, and the bindings of S's slots in this signature)
-    var base = Vec::<i64, Comp>::new_in(Comp {});
-    var s = 0;
+    let mut base = Vec::<i64, Comp>::new_in(Comp {});
+    let mut s: i64 = 0;
     if is_self {
         if self_node <= 0 {
             return false;
         }
-        s = pcx.fns[f].self_ty;
-        bind_walk(self_node, s, tps, 0, -1, &base, depth + 1, pcx, f);
+        s = pcx.fns[f as usize].self_ty;
+        bind_walk(self_node, s, tps, 0, -1, &mut base, depth + 1, pcx, f);
     } else {
-        let k = param_index(tps, pcx.nodes[first].a, pcx);
-        if k < 0 || k >= pcx.fns[f].targ_count {
+        let k = param_index(tps, pcx.nodes[first as usize].a, pcx);
+        if k < 0 || k >= pcx.fns[f as usize].targ_count {
             return false;
         }
-        s = tlist_at(pcx.fns[f].targs + k, pcx);
+        s = tlist_at(pcx.fns[f as usize].targs + k, pcx);
         for j in 0..slot_count(s, pcx) {
-            push_entry(B_PARAM, k, j, -1, &base);
+            push_entry(B_PARAM, k, j, -1, &mut base);
         }
     }
     if s <= 0 {
         return false;
     }
-    var blanket = -1;
-    var blanket_c = 0;
-    var blankets = 0;
+    let mut blanket: i64 = -1;
+    let mut blanket_c: i64 = 0;
+    let mut blankets: i64 = 0;
     for i in 0..pcx.traits_impls.len() as i64 {
-        let inode = pcx.traits_impls[i].node;
+        let inode = pcx.traits_impls[i as usize].node;
         // (`Self::A` in the impl the function is in: its own definition,
         // read in this signature's terms)
-        let own = is_self && pcx.nodes[inode].b == self_node;
+        let own = is_self && pcx.nodes[inode as usize].b == self_node;
         if !own && !impl_for(i, s, pcx) {
             if blanket_impl(i, pcx) {
-                let c = assoc_named(pcx.nodes[inode].c, pcx.nodes[n].a, pcx);
+                let c = assoc_named(pcx.nodes[inode as usize].c, pcx.nodes[n as usize].a, pcx);
                 if c != 0 {
                     blanket = i;
                     blanket_c = c;
@@ -1524,22 +1578,22 @@ fn proj_walk(n: i64, t: i64, tps: i64, self_node: i64, up: i64, out: inout Vec<i
             }
             continue;
         }
-        let c = assoc_named(pcx.nodes[inode].c, pcx.nodes[n].a, pcx);
+        let c = assoc_named(pcx.nodes[inode as usize].c, pcx.nodes[n as usize].a, pcx);
         if c == 0 {
             continue;
         }
         if own {
-            bind_walk(pcx.nodes[c].b, t, tps, self_node, up, &out, depth + 1, pcx, f);
+            bind_walk(pcx.nodes[c as usize].b, t, tps, self_node, up, out, depth + 1, pcx, f);
             return true;
         }
-        proj_map(i, pcx.nodes[c].b, t, s, base, up, &out, depth, pcx);
+        proj_map(i, pcx.nodes[c as usize].b, t, s, &base, up, out, depth, pcx);
         return true;
     }
     // RULE: D4.6 (d) (a blanket impl's, `impl<I: Iterator> IntoIterator for I`'s
     // `IntoIter = I`, when it is the one impl defining the name: S's slots
     // as the impl's parameter's)
     if blankets == 1 {
-        proj_map(blanket, pcx.nodes[blanket_c].b, t, s, base, up, &out, depth, pcx);
+        proj_map(blanket, pcx.nodes[blanket_c as usize].b, t, s, &base, up, out, depth, pcx);
         return true;
     }
     false
@@ -1547,55 +1601,58 @@ fn proj_walk(n: i64, t: i64, tps: i64, self_node: i64, up: i64, out: inout Vec<i
 
 // Whether impl i is a blanket impl, its header a bare type parameter of its
 // own (`impl<I: Iterator> IntoIterator for I`).
-fn blanket_impl(i: i64, pcx: Ctx<Comp>) -> bool {
-    let inode = pcx.traits_impls[i].node;
-    let h = pcx.nodes[inode].b;
-    is_node(h, NodeKind::TyName, pcx) && pcx.nodes[h].list == 0 && pcx.nodes[h].g == 0
-        && param_index(pcx.nodes[inode].g, pcx.nodes[h].a, pcx) >= 0
+fn blanket_impl(i: i64, pcx: &Ctx<Comp>) -> bool {
+    let inode = pcx.traits_impls[i as usize].node;
+    let h = pcx.nodes[inode as usize].b;
+    is_node(h, NodeKind::TyName, pcx) && pcx.nodes[h as usize].list == 0
+        && pcx.nodes[h as usize].g == 0
+        && param_index(pcx.nodes[inode as usize].g, pcx.nodes[h as usize].a, pcx) >= 0
 }
 
 // RULE: D4.4 The slots of type node vn (type t) of impl i for type s (an
 // associated type's, a trait argument's), whose slots are base's
 // entries: each slot of vn's type the impl's header
 // names is that entry, 'static itself, any other elided; pushed to out.
-fn proj_map(i: i64, vn: i64, t: i64, s: i64, base: Vec<i64, Comp>, up: i64,
-    out: inout Vec<i64, Comp>, depth: i64, pcx: Ctx<Comp>) {
+fn proj_map(i: i64, vn: i64, t: i64, s: i64, base: &Vec<i64, Comp>, up: i64,
+    out: &mut Vec<i64, Comp>, depth: i64, pcx: &Ctx<Comp>) {
     // RULE: D4.6 (g) (0.27.6: the value itself a projection of an impl
     // parameter, `type Item = I::Item;`: normalized again)
-    if proj_again(i, vn, t, s, base, up, &out, depth, pcx) {
+    if proj_again(i, vn, t, s, base, up, out, depth, pcx) {
         return;
     }
     // RULE: D4.6 (h) (0.27.7: the value a type parameter only another
     // parameter's bound names, `type Item = T;` of Copied)
-    if proj_bound(i, vn, t, s, base, up, &out, depth, pcx) {
+    if proj_bound(i, vn, t, s, base, up, out, depth, pcx) {
         return;
     }
-    let inode = pcx.traits_impls[i].node;
-    let itps = pcx.nodes[inode].g;
-    var head = Vec::<i64, Comp>::new_in(Comp {});
-    bind_walk(pcx.nodes[inode].b, s, itps, 0, -1, &head, depth + 1, pcx, -1);
-    var val = Vec::<i64, Comp>::new_in(Comp {});
-    bind_walk(vn, t, itps, pcx.nodes[inode].b, -1, &val, depth + 1, pcx, -1);
+    let inode = pcx.traits_impls[i as usize].node;
+    let itps = pcx.nodes[inode as usize].g;
+    let mut head = Vec::<i64, Comp>::new_in(Comp {});
+    bind_walk(pcx.nodes[inode as usize].b, s, itps, 0, -1, &mut head, depth + 1, pcx, -1);
+    let mut val = Vec::<i64, Comp>::new_in(Comp {});
+    bind_walk(vn, t, itps, pcx.nodes[inode as usize].b, -1, &mut val, depth + 1, pcx, -1);
     let at = out.len() as i64 / 4;
     for e in 0..val.len() as i64 / 4 {
-        let b = param_kind(val[4 * e]);
-        let u = val[4 * e + 3];
+        let b = param_kind(val[(4 * e) as usize]);
+        let u = val[(4 * e + 3) as usize];
         let up2 = if u >= 0 { at + u } else { up };
-        var j = -1;
+        let mut j: i64 = -1;
         if b == B_NAMED || b == B_PARAM {
             for h in 0..head.len() as i64 / 4 {
-                if j < 0 && param_kind(head[4 * h]) == b && head[4 * h + 1] == val[4 * e + 1]
-                    && head[4 * h + 2] == val[4 * e + 2] {
+                if j < 0 && param_kind(head[(4 * h) as usize]) == b
+                    && head[(4 * h + 1) as usize] == val[(4 * e + 1) as usize]
+                    && head[(4 * h + 2) as usize] == val[(4 * e + 2) as usize] {
                     j = h;
                 }
             }
         }
         if b == B_STATIC {
-            push_entry(B_STATIC, 0, 0, up2, &out);
+            push_entry(B_STATIC, 0, 0, up2, out);
         } else if j >= 0 && j < base.len() as i64 / 4 {
-            push_entry(base[4 * j], base[4 * j + 1], base[4 * j + 2], up2, &out);
+            push_entry(base[(4 * j) as usize], base[(4 * j + 1) as usize],
+                base[(4 * j + 2) as usize], up2, out);
         } else {
-            push_entry(B_ELIDED, 0, 0, up2, &out);
+            push_entry(B_ELIDED, 0, 0, up2, out);
         }
     }
 }
@@ -1606,34 +1663,35 @@ fn proj_map(i: i64, vn: i64, t: i64, s: i64, base: Vec<i64, Comp>, up: i64,
 // for the type the header binds P to in s, its slots base's through the
 // header (Skip<Split<'a, char>>: Split's `&'a str`); pushed to out. False
 // when vn is not such a projection or no impl defines it.
-fn proj_again(i: i64, vn: i64, t: i64, s: i64, base: Vec<i64, Comp>, up: i64,
-    out: inout Vec<i64, Comp>, depth: i64, pcx: Ctx<Comp>) -> bool {
+fn proj_again(i: i64, vn: i64, t: i64, s: i64, base: &Vec<i64, Comp>, up: i64,
+    out: &mut Vec<i64, Comp>, depth: i64, pcx: &Ctx<Comp>) -> bool {
     if depth > 12 || !proj_shape(vn, pcx) {
         return false;
     }
-    let inode = pcx.traits_impls[i].node;
-    let itps = pcx.nodes[inode].g;
-    let k = param_index(itps, pcx.nodes[child(vn, 0, pcx)].a, pcx);
+    let inode = pcx.traits_impls[i as usize].node;
+    let itps = pcx.nodes[inode as usize].g;
+    let k = param_index(itps, pcx.nodes[child(vn, 0, pcx) as usize].a, pcx);
     if k < 0 {
         return false;
     }
-    let sub = header_param_type(pcx.nodes[inode].b, s, itps, k, 0, pcx);
+    let sub = header_param_type(pcx.nodes[inode as usize].b, s, itps, k, 0, pcx);
     if sub <= 0 {
         return false;
     }
-    var head = Vec::<i64, Comp>::new_in(Comp {});
-    bind_walk(pcx.nodes[inode].b, s, itps, 0, -1, &head, depth + 1, pcx, -1);
-    var inner = Vec::<i64, Comp>::new_in(Comp {});
-    param_base(k, sub, head, base, &inner, pcx);
+    let mut head = Vec::<i64, Comp>::new_in(Comp {});
+    bind_walk(pcx.nodes[inode as usize].b, s, itps, 0, -1, &mut head, depth + 1, pcx, -1);
+    let mut inner = Vec::<i64, Comp>::new_in(Comp {});
+    param_base(k, sub, &head, base, &mut inner, pcx);
     for i2 in 0..pcx.traits_impls.len() as i64 {
         if !impl_for(i2, sub, pcx) {
             continue;
         }
-        let c = assoc_named(pcx.nodes[pcx.traits_impls[i2].node].c, pcx.nodes[vn].a, pcx);
+        let c = assoc_named(pcx.nodes[pcx.traits_impls[i2 as usize].node as usize].c,
+            pcx.nodes[vn as usize].a, pcx);
         if c == 0 {
             continue;
         }
-        proj_map(i2, pcx.nodes[c].b, t, sub, inner, up, &out, depth + 1, pcx);
+        proj_map(i2, pcx.nodes[c as usize].b, t, sub, &inner, up, out, depth + 1, pcx);
         return true;
     }
     false
@@ -1648,8 +1706,8 @@ fn proj_again(i: i64, vn: i64, t: i64, s: i64, base: Vec<i64, Comp>, up: i64,
 // the header (Copied<Iter<'r, &'s str>>: Iter's `&'a T`, at T its T, so
 // `&'s str`); pushed to out. False when vn is not such a parameter or no
 // bound reaches it.
-fn proj_bound(i: i64, vn: i64, t: i64, s: i64, base: Vec<i64, Comp>, up: i64,
-    out: inout Vec<i64, Comp>, depth: i64, pcx: Ctx<Comp>) -> bool {
+fn proj_bound(i: i64, vn: i64, t: i64, s: i64, base: &Vec<i64, Comp>, up: i64,
+    out: &mut Vec<i64, Comp>, depth: i64, pcx: &Ctx<Comp>) -> bool {
     if depth > 12 {
         return false;
     }
@@ -1657,43 +1715,45 @@ fn proj_bound(i: i64, vn: i64, t: i64, s: i64, base: Vec<i64, Comp>, up: i64,
     if k < 0 {
         return false;
     }
-    let inode = pcx.traits_impls[i].node;
-    let itps = pcx.nodes[inode].g;
-    var head = Vec::<i64, Comp>::new_in(Comp {});
-    bind_walk(pcx.nodes[inode].b, s, itps, 0, -1, &head, depth + 1, pcx, -1);
-    for q in 0..pcx.nodes[itps].count {
-        let bounds = pcx.nodes[child(itps, q, pcx)].h;
+    let inode = pcx.traits_impls[i as usize].node;
+    let itps = pcx.nodes[inode as usize].g;
+    let mut head = Vec::<i64, Comp>::new_in(Comp {});
+    bind_walk(pcx.nodes[inode as usize].b, s, itps, 0, -1, &mut head, depth + 1, pcx, -1);
+    for q in 0..pcx.nodes[itps as usize].count {
+        let bounds = pcx.nodes[child(itps, q, pcx) as usize].h;
         if q == k || bounds <= 0 {
             continue;
         }
-        let sq = header_param_type(pcx.nodes[inode].b, s, itps, q, 0, pcx);
+        let sq = header_param_type(pcx.nodes[inode as usize].b, s, itps, q, 0, pcx);
         if sq <= 0 {
             continue;
         }
-        for bi in 0..pcx.nodes[bounds].count {
+        for bi in 0..pcx.nodes[bounds as usize].count {
             let b = child(bounds, bi, pcx);
-            let holder = if is_node(b, NodeKind::TyName, pcx) { pcx.nodes[b].h } else { 0 };
+            let holder: i64 = if is_node(b, NodeKind::TyName, pcx) { pcx.nodes[b as usize].h }
+                else { 0 };
             if holder <= 0 {
                 continue;
             }
-            for ci in 0..pcx.nodes[holder].count {
+            for ci in 0..pcx.nodes[holder as usize].count {
                 let c = child(holder, ci, pcx);
                 for i2 in 0..pcx.traits_impls.len() as i64 {
                     if !impl_for(i2, sq, pcx) {
                         continue;
                     }
-                    let ac = assoc_named(pcx.nodes[pcx.traits_impls[i2].node].c, pcx.nodes[c].a,
-                        pcx);
+                    let ac = assoc_named(pcx.nodes[pcx.traits_impls[i2 as usize].node as usize].c,
+                        pcx.nodes[c as usize].a, pcx);
                     if ac == 0 {
                         continue;
                     }
-                    let n = bound_at(pcx.nodes[c].b, pcx.nodes[ac].b, itps, k, 0, pcx);
+                    let n = bound_at(pcx.nodes[c as usize].b, pcx.nodes[ac as usize].b, itps, k, 0,
+                        pcx);
                     if n <= 0 {
                         break;
                     }
-                    var inner = Vec::<i64, Comp>::new_in(Comp {});
-                    param_base(q, sq, head, base, &inner, pcx);
-                    proj_map(i2, n, t, sq, inner, up, &out, depth + 1, pcx);
+                    let mut inner = Vec::<i64, Comp>::new_in(Comp {});
+                    param_base(q, sq, &head, base, &mut inner, pcx);
+                    proj_map(i2, n, t, sq, &inner, up, out, depth + 1, pcx);
                     return true;
                 }
             }
@@ -1705,17 +1765,18 @@ fn proj_bound(i: i64, vn: i64, t: i64, s: i64, base: Vec<i64, Comp>, up: i64,
 // (proj_bound, direct_impl) The index of impl i's type parameter that type
 // node vn is, when i's header does not name it (at s): Copied's `T` of
 // `type Item = T;`; -1 otherwise.
-fn unnamed_param(i: i64, vn: i64, s: i64, pcx: Ctx<Comp>) -> i64 {
-    if !is_node(vn, NodeKind::TyName, pcx) || pcx.nodes[vn].list != 0 || pcx.nodes[vn].g != 0 {
+fn unnamed_param(i: i64, vn: i64, s: i64, pcx: &Ctx<Comp>) -> i64 {
+    if !is_node(vn, NodeKind::TyName, pcx) || pcx.nodes[vn as usize].list != 0
+        || pcx.nodes[vn as usize].g != 0 {
         return -1;
     }
-    let inode = pcx.traits_impls[i].node;
-    let itps = pcx.nodes[inode].g;
+    let inode = pcx.traits_impls[i as usize].node;
+    let itps = pcx.nodes[inode as usize].g;
     if itps <= 0 {
         return -1;
     }
-    let k = param_index(itps, pcx.nodes[vn].a, pcx);
-    if k < 0 || header_param_type(pcx.nodes[inode].b, s, itps, k, 0, pcx) > 0 {
+    let k = param_index(itps, pcx.nodes[vn as usize].a, pcx);
+    if k < 0 || header_param_type(pcx.nodes[inode as usize].b, s, itps, k, 0, pcx) > 0 {
         return -1;
     }
     k
@@ -1724,29 +1785,30 @@ fn unnamed_param(i: i64, vn: i64, s: i64, pcx: Ctx<Comp>) -> i64 {
 // (proj_bound) The node of v, an impl's value, at the place where the bound's
 // type node x has type parameter k of generics tps, walking both alike
 // (references, slices, arrays, a type's arguments); 0 where they part.
-fn bound_at(x: i64, v: i64, tps: i64, k: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
+fn bound_at(x: i64, v: i64, tps: i64, k: i64, depth: i64, pcx: &Ctx<Comp>) -> i64 {
     if x <= 0 || v <= 0 || depth > 8 {
         return 0;
     }
-    let kx = pcx.nodes[x].kind;
-    if kx == NodeKind::TyName && pcx.nodes[x].list == 0 && pcx.nodes[x].g == 0
-        && param_index(tps, pcx.nodes[x].a, pcx) == k {
+    let kx = pcx.nodes[x as usize].kind;
+    if kx == NodeKind::TyName && pcx.nodes[x as usize].list == 0 && pcx.nodes[x as usize].g == 0
+        && param_index(tps, pcx.nodes[x as usize].a, pcx) == k {
         return v;
     }
-    if kx != pcx.nodes[v].kind {
+    if kx != pcx.nodes[v as usize].kind {
         return 0;
     }
     if kx == NodeKind::TyPtr || kx == NodeKind::TySlice || kx == NodeKind::TyArray {
-        return bound_at(pcx.nodes[x].a, pcx.nodes[v].a, tps, k, depth + 1, pcx);
+        return bound_at(pcx.nodes[x as usize].a, pcx.nodes[v as usize].a, tps, k, depth + 1, pcx);
     }
-    if kx == NodeKind::TyName && pcx.nodes[x].a == pcx.nodes[v].a && pcx.nodes[x].g > 0
-        && pcx.nodes[v].g > 0 {
-        let gx = pcx.nodes[x].g;
-        let gv = pcx.nodes[v].g;
-        if pcx.nodes[gx].count != pcx.nodes[gv].count {
+    if kx == NodeKind::TyName && pcx.nodes[x as usize].a == pcx.nodes[v as usize].a
+        && pcx.nodes[x as usize].g > 0
+        && pcx.nodes[v as usize].g > 0 {
+        let gx = pcx.nodes[x as usize].g;
+        let gv = pcx.nodes[v as usize].g;
+        if pcx.nodes[gx as usize].count != pcx.nodes[gv as usize].count {
             return 0;
         }
-        for j in 0..pcx.nodes[gx].count {
+        for j in 0..pcx.nodes[gx as usize].count {
             let r = bound_at(child(gx, j, pcx), child(gv, j, pcx), tps, k, depth + 1, pcx);
             if r > 0 {
                 return r;
@@ -1761,72 +1823,73 @@ fn bound_at(x: i64, v: i64, tps: i64, k: i64, depth: i64, pcx: Ctx<Comp>) -> i64
 // `A = X` names at it (X read alone: its named lifetimes the caller's,
 // B_OUTER), 'static, or a region of its own (B_FREE); true when written
 // to out)
-fn omega_proj(n: i64, t: i64, tps: i64, up: i64, out: inout Vec<i64, Comp>, depth: i64, f: i64,
-    pcx: Ctx<Comp>) -> bool {
+fn omega_proj(n: i64, t: i64, tps: i64, up: i64, out: &mut Vec<i64, Comp>, depth: i64, f: i64,
+    pcx: &Ctx<Comp>) -> bool {
     if !proj_shape(n, pcx) {
         return false;
     }
     let first = child(n, 0, pcx);
-    var s = 0;
-    if sym_text(pcx.nodes[first].a, pcx) == "Self" {
-        s = pcx.fns[f].self_ty;
+    let mut s: i64 = 0;
+    if sym_text(pcx.nodes[first as usize].a, pcx) == b"Self" {
+        s = pcx.fns[f as usize].self_ty;
     } else {
-        let k = param_index(tps, pcx.nodes[first].a, pcx);
-        if k < 0 || k >= pcx.fns[f].targ_count {
+        let k = param_index(tps, pcx.nodes[first as usize].a, pcx);
+        if k < 0 || k >= pcx.fns[f as usize].targ_count {
             return false;
         }
-        s = tlist_at(pcx.fns[f].targs + k, pcx);
+        s = tlist_at(pcx.fns[f as usize].targs + k, pcx);
     }
     if s <= 0 || !crate::front::opaque::is_omega(s, pcx) {
         return false;
     }
-    let x = omega_binding(s, pcx.nodes[n].a, pcx);
+    let x = omega_binding(s, pcx.nodes[n as usize].a, pcx);
     if x <= 0 {
         return false;
     }
-    var w = Vec::<i64, Comp>::new_in(Comp {});
-    bind_walk(x, t, 0, 0, -1, &w, depth + 1, pcx, -1);
+    let mut w = Vec::<i64, Comp>::new_in(Comp {});
+    bind_walk(x, t, 0, 0, -1, &mut w, depth + 1, pcx, -1);
     let count = slot_count(t, pcx);
     let read = w.len() as i64 == 4 * count;
     let me = out.len() as i64 / 4;
     for j in 0..count {
-        var kind = B_FREE;
-        var sym = 0;
-        var u = up;
+        let mut kind = B_FREE;
+        let mut sym: i64 = 0;
+        let mut u = up;
         if read {
-            if w[4 * j] == B_STATIC {
+            if w[(4 * j) as usize] == B_STATIC {
                 kind = B_STATIC;
-            } else if w[4 * j] == B_NAMED {
+            } else if w[(4 * j) as usize] == B_NAMED {
                 kind = B_OUTER;
-                sym = w[4 * j + 1];
+                sym = w[(4 * j + 1) as usize];
             }
-            if w[4 * j + 3] >= 0 {
-                u = me + w[4 * j + 3];
+            if w[(4 * j + 3) as usize] >= 0 {
+                u = me + w[(4 * j + 3) as usize];
             }
         }
-        push_entry(kind, sym, j, u, &out);
+        push_entry(kind, sym, j, u, out);
     }
     true
 }
 
 // The type node X of Ω s's bound `Tr<name = X>` (0: none).
-fn omega_binding(s: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
-    let pn = pcx.types[s].b;
-    let bounds = if pn > 0 { pcx.nodes[pn].h } else { 0 };
+fn omega_binding(s: i64, name: i64, pcx: &Ctx<Comp>) -> i64 {
+    let pn = pcx.types[s as usize].b;
+    let bounds: i64 = if pn > 0 { pcx.nodes[pn as usize].h } else { 0 };
     if bounds <= 0 {
         return 0;
     }
-    for bi in 0..pcx.nodes[bounds].count {
+    for bi in 0..pcx.nodes[bounds as usize].count {
         let b = child(bounds, bi, pcx);
-        let holder = if is_node(b, NodeKind::TyName, pcx) { pcx.nodes[b].h } else { 0 };
+        let holder: i64 = if is_node(b, NodeKind::TyName, pcx) { pcx.nodes[b as usize].h }
+            else { 0 };
         if holder <= 0 {
             continue;
         }
-        for ci in 0..pcx.nodes[holder].count {
+        for ci in 0..pcx.nodes[holder as usize].count {
             let c = child(holder, ci, pcx);
-            if is_node(c, NodeKind::AssocType, pcx) && pcx.nodes[c].a == name
-                && pcx.nodes[c].b > 0 {
-                return pcx.nodes[c].b;
+            if is_node(c, NodeKind::AssocType, pcx) && pcx.nodes[c as usize].a == name
+                && pcx.nodes[c as usize].b > 0 {
+                return pcx.nodes[c as usize].b;
             }
         }
     }
@@ -1835,34 +1898,36 @@ fn omega_binding(s: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
 
 // Whether type node n is a projection's, `Self::Item` or `I::Item` (one
 // segment before the name, no arguments, not `<T as Tr>::A`).
-fn proj_shape(n: i64, pcx: Ctx<Comp>) -> bool {
-    is_node(n, NodeKind::TyName, pcx) && pcx.nodes[n].count == 1 && pcx.nodes[n].g == 0
-        && (pcx.nodes[n].p & crate::front::ast::NODE_QPATH) == 0
+fn proj_shape(n: i64, pcx: &Ctx<Comp>) -> bool {
+    is_node(n, NodeKind::TyName, pcx) && pcx.nodes[n as usize].count == 1
+        && pcx.nodes[n as usize].g == 0
+        && (pcx.nodes[n as usize].p & crate::front::ast::NODE_QPATH) == 0
         && is_node(child(n, 0, pcx), NodeKind::Ident, pcx)
 }
 
 // Whether impl i is a direct impl for type s: s itself, or an instance
 // of the impl's template (a pattern impl, a blanket one, is not).
-fn impl_for(i: i64, s: i64, pcx: Ctx<Comp>) -> bool {
-    let ty = pcx.traits_impls[i].ty;
+fn impl_for(i: i64, s: i64, pcx: &Ctx<Comp>) -> bool {
+    let ty = pcx.traits_impls[i as usize].ty;
     if ty != 0 {
         return ty == s;
     }
-    let tpl = pcx.traits_impls[i].tpl;
+    let tpl = pcx.traits_impls[i as usize].tpl;
     tpl != crate::front::generics::TPL_NONE && tpl != crate::front::generics::TPL_PATTERN
         && crate::front::generics::instance_of(s, tpl, pcx)
 }
 
 // The associated type `name` (an AssocType node with a type) in impl
 // items holder h, or 0.
-fn assoc_named(h: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
+fn assoc_named(h: i64, name: i64, pcx: &Ctx<Comp>) -> i64 {
     if h == 0 {
         return 0;
     }
-    for i in 0..pcx.nodes[h].count {
+    for i in 0..pcx.nodes[h as usize].count {
         let c = child(h, i, pcx);
-        if is_node(c, NodeKind::AssocType, pcx) && pcx.nodes[c].a == name
-            && pcx.nodes[c].b != 0 && (pcx.nodes[c].p & crate::front::ast::NODE_ASSOC_CONST) == 0 {
+        if is_node(c, NodeKind::AssocType, pcx) && pcx.nodes[c as usize].a == name
+            && pcx.nodes[c as usize].b != 0
+            && (pcx.nodes[c as usize].p & crate::front::ast::NODE_ASSOC_CONST) == 0 {
             return c;
         }
     }
@@ -1906,22 +1971,23 @@ pub fn sig_new() -> Sig<Comp> {
 }
 
 // The number of universals of sig ('static counted).
-pub fn universal_count(sig: Sig<Comp>) -> i64 {
+pub fn universal_count(sig: &Sig<Comp>) -> i64 {
     sig.univ.len() as i64 / 3
 }
 
-fn add_universal(kind: i64, x: i64, y: i64, sig: inout Sig<Comp>) -> i64 {
+fn add_universal(kind: i64, x: i64, y: i64, sig: &mut Sig<Comp>) -> i64 {
     if kind == U_BOUND {
         // (one per bound region, whatever position names it first)
         for u in 0..universal_count(sig) {
-            if sig.univ[3 * u] == U_BOUND && sig.univ[3 * u + 2] == y {
+            if sig.univ[(3 * u) as usize] == U_BOUND && sig.univ[(3 * u + 2) as usize] == y {
                 return u;
             }
         }
     }
     if kind == U_NAMED || kind == U_SUBST || kind == U_OUTER {
         for u in 0..universal_count(sig) {
-            if sig.univ[3 * u] == kind && sig.univ[3 * u + 1] == x && sig.univ[3 * u + 2] == y {
+            if sig.univ[(3 * u) as usize] == kind && sig.univ[(3 * u + 1) as usize] == x
+                && sig.univ[(3 * u + 2) as usize] == y {
                 return u;
             }
         }
@@ -1932,11 +1998,58 @@ fn add_universal(kind: i64, x: i64, y: i64, sig: inout Sig<Comp>) -> i64 {
     universal_count(sig) - 1
 }
 
-// RULE: D4.1 Function f's signature regions, into sig. A rust-edition
+// Function f's signature regions, into sig: made once (sig_compute),
+// then copied from pcx.sig_memo. The borrow checker reads a callee's at
+// every call; a signature depends on the function alone.
+pub fn sig_of(f: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
+    let mut at = pcx.sig_memo_at.get(f + 1) - 1;
+    if at < 0 {
+        sig_compute(f, sig, pcx);
+        at = pcx.sig_memo.count;
+        memo_push(&sig.univ, &mut pcx.sig_memo);
+        memo_push(&sig.param_at, &mut pcx.sig_memo);
+        memo_push(&sig.params, &mut pcx.sig_memo);
+        memo_push(&sig.ret, &mut pcx.sig_memo);
+        memo_push(&sig.bounds, &mut pcx.sig_memo);
+        memo_push(&sig.cslots, &mut pcx.sig_memo);
+        pcx.sig_memo.push(sig.elision);
+        pcx.sig_memo.push(sig.closure);
+        pcx.sig_memo_at.put(f + 1, at + 1);
+        return;
+    }
+    memo_load(&mut sig.univ, &mut at, pcx.sig_memo);
+    memo_load(&mut sig.param_at, &mut at, pcx.sig_memo);
+    memo_load(&mut sig.params, &mut at, pcx.sig_memo);
+    memo_load(&mut sig.ret, &mut at, pcx.sig_memo);
+    memo_load(&mut sig.bounds, &mut at, pcx.sig_memo);
+    memo_load(&mut sig.cslots, &mut at, pcx.sig_memo);
+    sig.elision = pcx.sig_memo.get(at);
+    sig.closure = pcx.sig_memo.get(at + 1);
+}
+
+// v's length, then its words, onto out (sig_of's memo).
+fn memo_push(v: &Vec<i64, Comp>, out: &mut IntVec) {
+    out.push(v.len() as i64);
+    for &x in v.as_slice() {
+        out.push(x);
+    }
+}
+
+// v from the memo's words at `at` (memo_push's), at moved past them.
+fn memo_load(v: &mut Vec<i64, Comp>, at: &mut i64, memo: IntVec) {
+    v.clear();
+    let n = memo.get(*at);
+    for i in 0..n {
+        v.push(memo.get(*at + 1 + i));
+    }
+    *at += n + 1;
+}
+
+// RULE: D4.1 Function f's signature regions, into sig (sig_of: once). A rust-edition
 // function's are read from its signature's lifetimes (the parallel walk,
 // D4.2); any other's (std's, a closure body's: D10.5) are a universal
 // per slot (E1; §12's bridge relates a std result's).
-pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
+fn sig_compute(f: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
     sig.univ.clear();
     sig.param_at.clear();
     sig.params.clear();
@@ -1945,30 +2058,28 @@ pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
     sig.elision = 0;
     sig.closure = -1;
     sig.cslots.clear();
-    let _ = add_universal(U_STATIC, 0, 0, &sig);
+    let _ = add_universal(U_STATIC, 0, 0, sig);
     // (an instance's node is a clone without its generics and lifetimes:
     // its template's is read, with the instance's types)
     let tf = crate::places::front::fn_template(f, pcx);
     let node = fn_node(tf, pcx);
     let np = fn_param_count(f, pcx);
     let cid = closure_of_fn(f, pcx);
-    if cid >= 0 && pcx.closures[cid].env_struct >= 0
-        && crate::front::rust::rust_at(pcx.nodes[node].start, &pcx) {
-        closure_sig(cid, f, &sig, pcx);
+    if cid >= 0 && pcx.closures[cid as usize].env_struct >= 0 {
+        closure_sig(cid, f, sig, pcx);
         return;
     }
-    if !(is_node(node, NodeKind::Fn, pcx)
-        && crate::front::rust::rust_at(pcx.nodes[node].start, &pcx)) {
+    if !(is_node(node, NodeKind::Fn, pcx)) {
         for i in 0..np {
             sig.param_at.push(sig.params.len() as i64);
             for j in 0..slot_count(fn_param(f, i, pcx), pcx) {
-                let u = add_universal(U_ELIDED, i + 1, j, &sig);
+                let u = add_universal(U_ELIDED, i + 1, j, sig);
                 sig.params.push(u);
             }
         }
         sig.param_at.push(sig.params.len() as i64);
         for j in 0..slot_count(fn_ret(f, pcx), pcx) {
-            let u = add_universal(U_ELIDED, 0, j, &sig);
+            let u = add_universal(U_ELIDED, 0, j, sig);
             sig.ret.push(u);
         }
         return;
@@ -1979,36 +2090,36 @@ pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
         lifetimes_of(crate::front::parser::rust::where_key(node), pcx)];
     for h in holders {
         if h > 0 {
-            for i in 0..pcx.nodes[h].count {
-                let sym = pcx.nodes[child(h, i, pcx)].a;
+            for i in 0..pcx.nodes[h as usize].count {
+                let sym = pcx.nodes[child(h, i, pcx) as usize].a;
                 if lifetime_binding(sym, pcx) == B_NAMED {
-                    let _ = add_universal(U_NAMED, sym, 0, &sig);
+                    let _ = add_universal(U_NAMED, sym, 0, sig);
                 }
             }
         }
     }
-    let tps = pcx.nodes[node].g;
-    let self_node = pcx.nodes[node].h;
-    var inputs = 0;
-    var only = -1;
-    var self_u = -1;
+    let tps = pcx.nodes[node as usize].g;
+    let self_node = pcx.nodes[node as usize].h;
+    let mut inputs: i64 = 0;
+    let mut only: i64 = -1;
+    let mut self_u: i64 = -1;
     for i in 0..np {
         let base = sig.params.len() as i64;
         sig.param_at.push(base);
-        let pn = if i < pcx.nodes[node].count { child(node, i, pcx) } else { 0 };
-        let tn = if is_node(pn, NodeKind::Param, pcx) { pcx.nodes[pn].b } else { 0 };
+        let pn: i64 = if i < pcx.nodes[node as usize].count { child(node, i, pcx) } else { 0 };
+        let tn: i64 = if is_node(pn, NodeKind::Param, pcx) { pcx.nodes[pn as usize].b } else { 0 };
         let t = fn_param(f, i, pcx);
         sig.walk.clear();
-        bind_walk(tn, t, tps, self_node, -1, &sig.walk, 0, pcx, f);
-        bind_entries(i + 1, tps, &sig, pcx);
-        push_decl_bounds(t, false, base, &sig, pcx);
+        bind_walk(tn, t, tps, self_node, -1, &mut sig.walk, 0, pcx, f);
+        bind_entries(i + 1, tps, sig, pcx);
+        push_decl_bounds(t, false, base, sig, pcx);
         let count = sig.params.len() as i64 - base;
         for e in 0..count {
-            let up = sig.walk[4 * e + 3];
+            let up = sig.walk[(4 * e + 3) as usize];
             if up >= 0 {
                 // RULE: D4.5 (`&'a τ`: every region of τ outlives 'a)
-                sig.bounds.push(sig.params[base + e]);
-                sig.bounds.push(sig.params[base + up]);
+                sig.bounds.push(sig.params[(base + e) as usize]);
+                sig.bounds.push(sig.params[(base + up) as usize]);
             }
         }
         // RULE: D4.2 (E2 counts the lifetimes written in the inputs, elided
@@ -2016,30 +2127,31 @@ pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
         // T) -> &T` borrows from a)
         // (D4.6 (f): an Ω's projection's slots are not one either)
         for e in 0..count {
-            let b = sig.walk[4 * e];
+            let b = sig.walk[(4 * e) as usize];
             if b != B_PARAM && b != B_SELF && b != B_OUTER && b != B_FREE {
                 if only < 0 {
-                    only = sig.params[base + e];
+                    only = sig.params[(base + e) as usize];
                 }
                 inputs += 1;
             }
         }
         // RULE: D4.2 (E3: `&self`'s, `&mut self`'s reference region)
-        if pn > 0 && self_u < 0 && count > 0 && sym_text(pcx.nodes[pn].a, pcx) == "self"
-            && (pcx.types[t].kind == TyKind::Ptr && is_ref_kind(pcx.types[t].b)
-                || pcx.types[t].kind == TyKind::Slice && pcx.types[t].b != REF_RAW) {
-            self_u = sig.params[base];
+        if pn > 0 && self_u < 0 && count > 0 && sym_text(pcx.nodes[pn as usize].a, pcx) == b"self"
+            && (pcx.types[t as usize].kind == TyKind::Ptr && is_ref_kind(pcx.types[t as usize].b)
+                || pcx.types[t as usize].kind == TyKind::Slice
+                && pcx.types[t as usize].b != REF_RAW) {
+            self_u = sig.params[base as usize];
         }
     }
     sig.param_at.push(sig.params.len() as i64);
     // RULE: D21.3 (0.27.2.1: an `impl Tr` result, front/opaque.vl: each
     // slot a universal that every input region outlives, Rust 2024's
     // capture of them all; no elision)
-    if crate::front::opaque::is_opaque_node(pcx.nodes[node].b, pcx) {
+    if crate::front::opaque::is_opaque_node(pcx.nodes[node as usize].b, pcx) {
         let inputs_end = universal_count(sig);
         let n = slot_count(fn_ret(f, pcx), pcx);
         for e in 0..n {
-            let u = add_universal(U_OPAQUE, 0, e, &sig);
+            let u = add_universal(U_OPAQUE, 0, e, sig);
             sig.ret.push(u);
             for v in 1..inputs_end {
                 sig.bounds.push(v);
@@ -2052,19 +2164,20 @@ pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
         for i in 0..n {
             for j in 0..n {
                 if i != j {
-                    sig.bounds.push(sig.ret[i]);
-                    sig.bounds.push(sig.ret[j]);
+                    sig.bounds.push(sig.ret[i as usize]);
+                    sig.bounds.push(sig.ret[j as usize]);
                 }
             }
         }
     } else {
         // the result: an elided region is E2's, E3's, else E4's error
         sig.walk.clear();
-        bind_walk(pcx.nodes[node].b, fn_ret(f, pcx), tps, self_node, -1, &sig.walk, 0, pcx, f);
+        bind_walk(pcx.nodes[node as usize].b, fn_ret(f, pcx), tps, self_node, -1, &mut sig.walk, 0,
+            pcx, f);
         let n = sig.walk.len() as i64 / 4;
         for e in 0..n {
-            let b = sig.walk[4 * e];
-            var u = 0;
+            let b = sig.walk[(4 * e) as usize];
+            let mut u: i64 = 0;
             if b == B_ELIDED {
                 // RULE: D4.2 (E2, E3, E4)
                 if inputs == 1 {
@@ -2073,41 +2186,41 @@ pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
                     u = self_u;
                 } else {
                     if sig.elision == 0 {
-                        sig.elision = if pcx.nodes[node].b
-                            > 0 { pcx.nodes[pcx.nodes[node].b].start }
-                            else { pcx.nodes[node].start };
+                        sig.elision = if pcx.nodes[node as usize].b
+                            > 0 { pcx.nodes[pcx.nodes[node as usize].b as usize].start }
+                            else { pcx.nodes[node as usize].start };
                     }
-                    u = add_universal(U_ELIDED, 0, e, &sig);
+                    u = add_universal(U_ELIDED, 0, e, sig);
                 }
             } else {
-                u = entry_universal(e, -1, tps, &sig, pcx);
+                u = entry_universal(e, -1, tps, sig, pcx);
             }
             sig.ret.push(u);
         }
         for e in 0..n {
-            let up = sig.walk[4 * e + 3];
+            let up = sig.walk[(4 * e + 3) as usize];
             if up >= 0 {
-                sig.bounds.push(sig.ret[e]);
-                sig.bounds.push(sig.ret[up]);
+                sig.bounds.push(sig.ret[e as usize]);
+                sig.bounds.push(sig.ret[up as usize]);
             }
         }
-        push_decl_bounds(fn_ret(f, pcx), true, 0, &sig, pcx);
+        push_decl_bounds(fn_ret(f, pcx), true, 0, sig, pcx);
     }
     // RULE: D4.5 (declared: `'b: 'a` in the generics, the impl's and the
     // function's)
     for h in holders {
         if h > 0 {
-            for i in 0..pcx.nodes[h].count {
+            for i in 0..pcx.nodes[h as usize].count {
                 let ln = child(h, i, pcx);
-                let bounds = pcx.nodes[ln].h;
-                if bounds > 0 && lifetime_binding(pcx.nodes[ln].a, pcx) == B_NAMED {
-                    let a = add_universal(U_NAMED, pcx.nodes[ln].a, 0, &sig);
-                    for j in 0..pcx.nodes[bounds].count {
-                        let bs = pcx.nodes[child(bounds, j, pcx)].a;
+                let bounds = pcx.nodes[ln as usize].h;
+                if bounds > 0 && lifetime_binding(pcx.nodes[ln as usize].a, pcx) == B_NAMED {
+                    let a = add_universal(U_NAMED, pcx.nodes[ln as usize].a, 0, sig);
+                    for j in 0..pcx.nodes[bounds as usize].count {
+                        let bs = pcx.nodes[child(bounds, j, pcx) as usize].a;
                         let kind = lifetime_binding(bs, pcx);
                         if kind != B_ELIDED {
-                            let b = if kind == B_STATIC { 0 }
-                                else { add_universal(U_NAMED, bs, 0, &sig) };
+                            let b: i64 = if kind == B_STATIC { 0 }
+                                else { add_universal(U_NAMED, bs, 0, sig) };
                             sig.bounds.push(a);
                             sig.bounds.push(b);
                         }
@@ -2119,10 +2232,10 @@ pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
     // RULE: D4.5, D20.6 (declared `T: 'a`, in the generics or a `where`:
     // every slot of T's substitution outlives 'a; `F: 'scope` of a closure
     // type, each capture's and X_C's)
-    for k in 0..(if tps > 0 { pcx.nodes[tps].count } else { 0 }) {
+    for k in 0..(if tps > 0 { pcx.nodes[tps as usize].count } else { 0 }) {
         let p = child(tps, k, pcx);
-        let sym = pcx.nodes[p].a;
-        var i = 0;
+        let sym = pcx.nodes[p as usize].a;
+        let mut i: i64 = 0;
         loop {
             let lt = crate::front::parser::rust::outlives_of(p, i, pcx);
             if lt == 0 {
@@ -2133,45 +2246,46 @@ pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
             if kind == B_ELIDED {
                 continue;
             }
-            let b = if kind == B_STATIC { 0 } else { add_universal(U_NAMED, lt, 0, &sig) };
+            let b: i64 = if kind == B_STATIC { 0 } else { add_universal(U_NAMED, lt, 0, sig) };
             for e in 0..universal_count(sig) {
-                if sig.univ[3 * e] == U_SUBST && sig.univ[3 * e + 1] == sym {
+                if sig.univ[(3 * e) as usize] == U_SUBST && sig.univ[(3 * e + 1) as usize] == sym {
                     sig.bounds.push(e);
                     sig.bounds.push(b);
                 }
             }
         }
     }
-    subst_requirements(f, tps, &sig, pcx);
-    bound_ties(f, tps, self_node, &sig, &pcx);
+    subst_requirements(f, tps, sig, pcx);
+    bound_ties(f, tps, self_node, sig, pcx);
 }
 
 // RULE: D19.10 (4) In an instance whose type parameter is a closure type C,
 // C's requirements are bounds of the universals of its substitution
 // (as a declared `'b: 'a` of a struct's would be).
-fn subst_requirements(f: i64, tps: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
-    let nt = pcx.fns[f].targ_count;
-    if nt <= 0 || pcx.fns[f].tmpl < 0 || tps <= 0 {
+fn subst_requirements(f: i64, tps: i64, sig: &mut Sig<Comp>, pcx: &Ctx<Comp>) {
+    let nt = pcx.fns[f as usize].targ_count;
+    if nt <= 0 || pcx.fns[f as usize].tmpl < 0 || tps <= 0 {
         return;
     }
     for k in 0..nt {
-        let t = tlist_at(pcx.fns[f].targs + k, pcx);
-        if t <= 0 || pcx.types[t].kind != TyKind::Struct || k >= pcx.nodes[tps].count {
+        let t = tlist_at(pcx.fns[f as usize].targs + k, pcx);
+        if t <= 0 || pcx.types[t as usize].kind != TyKind::Struct
+            || k >= pcx.nodes[tps as usize].count {
             continue;
         }
-        let id = pcx.structs[pcx.types[t].a].closure - 1;
+        let id = pcx.structs[pcx.types[t as usize].a as usize].closure - 1;
         if id < 0 {
             continue;
         }
-        let sym = pcx.nodes[child(tps, k, pcx)].a;
+        let sym = pcx.nodes[child(tps, k, pcx) as usize].a;
         // RULE: D4.5 (and C's implied bounds: a capture's `&'c τ` gives
         // `'t ⊒ 'c` for τ's slots, as in the closure's own body)
         sig.walk.clear();
-        bind_walk(0, t, 0, 0, -1, &sig.walk, 0, pcx, -1);
+        bind_walk(0, t, 0, 0, -1, &mut sig.walk, 0, pcx, -1);
         for e in 0..sig.walk.len() as i64 / 4 {
-            let up = sig.walk[4 * e + 3];
+            let up = sig.walk[(4 * e + 3) as usize];
             let a = find_universal(U_SUBST, sym, e, sig);
-            let b = if up >= 0 { find_universal(U_SUBST, sym, up, sig) } else { -1 };
+            let b: i64 = if up >= 0 { find_universal(U_SUBST, sym, up, sig) } else { -1 };
             if a >= 0 && b >= 0 {
                 sig.bounds.push(a);
                 sig.bounds.push(b);
@@ -2187,40 +2301,44 @@ fn subst_requirements(f: i64, tps: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
         // checked at the call)
         let bnode = crate::front::closures::fn_bounds::fn_bound_of(tps, k, pcx);
         if bnode > 0 {
-            var walk = Vec::<i64, Comp>::new_in(Comp {});
-            var at = Vec::<i64, Comp>::new_in(Comp {});
-            var codes = Vec::<i64, Comp>::new_in(Comp {});
-            let _ = closure_sig_walk(id, pcx.closures[id].exp_node, pcx.closures[id].exp_tps,
-                &walk, &at, &codes, F_MARK, 0, pcx);
-            var read = Vec::<i64, Comp>::new_in(Comp {});
-            var at2 = Vec::<i64, Comp>::new_in(Comp {});
-            var codes2 = Vec::<i64, Comp>::new_in(Comp {});
-            let self_node = pcx.nodes[fn_node(crate::places::front::fn_template(f, pcx), pcx)].h;
-            let _ = closure_sig_walk(id, bnode, tps, &read, &at2, &codes2, f, self_node, pcx);
-            let nenv = slot_count(t, pcx) - pcx.closures[id].xc_n;
+            let mut walk = Vec::<i64, Comp>::new_in(Comp {});
+            let mut at = Vec::<i64, Comp>::new_in(Comp {});
+            let mut codes = Vec::<i64, Comp>::new_in(Comp {});
+            let _ = closure_sig_walk(id, pcx.closures[id as usize].exp_node,
+                pcx.closures[id as usize].exp_tps, &mut walk, &mut at, &mut codes, F_MARK, 0, pcx);
+            let mut read = Vec::<i64, Comp>::new_in(Comp {});
+            let mut at2 = Vec::<i64, Comp>::new_in(Comp {});
+            let mut codes2 = Vec::<i64, Comp>::new_in(Comp {});
+            let self_node = pcx.nodes[
+                fn_node(crate::places::front::fn_template(f, pcx), pcx) as usize].h;
+            let _ = closure_sig_walk(id, bnode, tps, &mut read, &mut at2, &mut codes2, f, self_node,
+                pcx);
+            let nenv = slot_count(t, pcx) - pcx.closures[id as usize].xc_n;
             if read.len() == walk.len() {
                 for e in 0..codes.len() as i64 {
-                    let q = codes[e];
+                    let q = codes[e as usize];
                     if q < 0 {
                         continue;
                     }
-                    let rb = read[4 * e];
-                    let b = if rb == B_STATIC { 0 }
-                        else if rb == B_NAMED { find_universal(U_NAMED, read[4 * e + 1], 0, sig) }
+                    let rb = read[(4 * e) as usize];
+                    let b: i64 = if rb == B_STATIC { 0 }
+                        else if rb
+                        == B_NAMED { find_universal(U_NAMED, read[(4 * e + 1) as usize], 0, sig) }
                         else if param_kind(rb) == B_PARAM
-                        && read[4 * e + 1] < pcx.nodes[tps].count {
-                        find_universal(U_SUBST, pcx.nodes[child(tps, read[4 * e + 1], pcx)].a,
-                            read[4 * e + 2], sig)
+                        && read[(4 * e + 1) as usize] < pcx.nodes[tps as usize].count {
+                        find_universal(U_SUBST,
+                            pcx.nodes[child(tps, read[(4 * e + 1) as usize], pcx) as usize].a,
+                            read[(4 * e + 2) as usize], sig)
                     } else { -1 };
-                    tie_universals(find_universal(U_SUBST, sym, nenv + q, sig), b, &sig);
+                    tie_universals(find_universal(U_SUBST, sym, nenv + q, sig), b, sig);
                 }
             }
         }
-        for q in 0..pcx.closures[id].req_n {
-            let i = pcx.capture_list.get(pcx.closures[id].req_at + 2 * q);
-            let j = pcx.capture_list.get(pcx.closures[id].req_at + 2 * q + 1);
+        for q in 0..pcx.closures[id as usize].req_n {
+            let i = pcx.capture_list.get(pcx.closures[id as usize].req_at + 2 * q);
+            let j = pcx.capture_list.get(pcx.closures[id as usize].req_at + 2 * q + 1);
             let a = find_universal(U_SUBST, sym, i, sig);
-            let b = if j < 0 { 0 } else { find_universal(U_SUBST, sym, j, sig) };
+            let b: i64 = if j < 0 { 0 } else { find_universal(U_SUBST, sym, j, sig) };
             if a >= 0 && b >= 0 {
                 sig.bounds.push(a);
                 sig.bounds.push(b);
@@ -2233,28 +2351,29 @@ fn subst_requirements(f: i64, tps: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
 // own implied bounds hold of its slots: `&'m mut Copied<Iter<'x, T>>`
 // gives `'x ⊒ 'm`, and its declarations' requirements (D4.6 (a)), each
 // slot the U_SUBST of k's.
-fn subst_wf(k: i64, s: i64, tps: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
+fn subst_wf(k: i64, s: i64, tps: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
     if s <= 0 {
         return;
     }
-    let sym = pcx.nodes[child(tps, k, pcx)].a;
-    var w = Vec::<i64, Comp>::new_in(Comp {});
-    bind_walk(0, s, 0, 0, -1, &w, 0, pcx, -1);
+    let sym = pcx.nodes[child(tps, k, pcx) as usize].a;
+    let mut w = Vec::<i64, Comp>::new_in(Comp {});
+    bind_walk(0, s, 0, 0, -1, &mut w, 0, pcx, -1);
     for e in 0..w.len() as i64 / 4 {
-        let up = w[4 * e + 3];
+        let up = w[(4 * e + 3) as usize];
         if up >= 0 {
-            let a = add_universal(U_SUBST, sym, e, &sig);
-            let b = add_universal(U_SUBST, sym, up, &sig);
+            let a = add_universal(U_SUBST, sym, e, sig);
+            let b = add_universal(U_SUBST, sym, up, sig);
             sig.bounds.push(a);
             sig.bounds.push(b);
         }
     }
-    var pairs = Vec::<i64, Comp>::new_in(Comp {});
-    decl_pairs(s, 0, 0, &pairs, pcx);
-    var i = 0;
+    let mut pairs = Vec::<i64, Comp>::new_in(Comp {});
+    decl_pairs_of(s, &mut pairs, pcx);
+    let mut i: i64 = 0;
     while i + 1 < pairs.len() as i64 {
-        let a = add_universal(U_SUBST, sym, pairs[i], &sig);
-        let b = if pairs[i + 1] < 0 { 0 } else { add_universal(U_SUBST, sym, pairs[i + 1], &sig) };
+        let a = add_universal(U_SUBST, sym, pairs[i as usize], sig);
+        let b: i64 = if pairs[(i + 1) as usize] < 0 { 0 }
+            else { add_universal(U_SUBST, sym, pairs[(i + 1) as usize], sig) };
         sig.bounds.push(a);
         sig.bounds.push(b);
         i += 2;
@@ -2266,79 +2385,80 @@ fn subst_wf(k: i64, s: i64, tps: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
 // (proj_map, in P's slots), and the same slot of X are one region, both
 // ways (rustc's `Extend<T>::extend<I: IntoIterator<Item = T>>` pushes an
 // I::Item where a T is required).
-fn bound_ties(f: i64, tps: i64, self_node: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
-    if tps <= 0 || pcx.fns[f].tmpl < 0 {
+fn bound_ties(f: i64, tps: i64, self_node: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
+    if tps <= 0 || pcx.fns[f as usize].tmpl < 0 {
         return;
     }
-    for k in 0..pcx.nodes[tps].count {
-        if k >= pcx.fns[f].targ_count {
+    for k in 0..pcx.nodes[tps as usize].count {
+        if k >= pcx.fns[f as usize].targ_count {
             break;
         }
-        subst_wf(k, tlist_at(pcx.fns[f].targs + k, pcx), tps, &sig, pcx);
-        let bounds = pcx.nodes[child(tps, k, pcx)].h;
+        subst_wf(k, tlist_at(pcx.fns[f as usize].targs + k, pcx), tps, sig, pcx);
+        let bounds = pcx.nodes[child(tps, k, pcx) as usize].h;
         if bounds <= 0 {
             continue;
         }
-        let s = tlist_at(pcx.fns[f].targs + k, pcx);
+        let s = tlist_at(pcx.fns[f as usize].targs + k, pcx);
         if s <= 0 {
             continue;
         }
-        for bi in 0..pcx.nodes[bounds].count {
+        for bi in 0..pcx.nodes[bounds as usize].count {
             let b = child(bounds, bi, pcx);
             if !is_node(b, NodeKind::TyName, pcx) {
                 continue;
             }
-            let holder = pcx.nodes[b].h;
-            let args = pcx.nodes[b].g;
-            let tr = crate::front::traits::bound_trait(b, &pcx);
+            let holder = pcx.nodes[b as usize].h;
+            let args = pcx.nodes[b as usize].g;
+            let tr = crate::front::traits::bound_trait(b, pcx);
             if tr < 0 {
                 continue;
             }
             // RULE: L14 (the impl chosen for s, its own equality bounds)
-            var sbase = Vec::<i64, Comp>::new_in(Comp {});
+            let mut sbase = Vec::<i64, Comp>::new_in(Comp {});
             for j in 0..slot_count(s, pcx) {
-                push_entry(B_PARAM, k, j, -1, &sbase);
+                push_entry(B_PARAM, k, j, -1, &mut sbase);
             }
-            impl_bound_ties(s, sbase, tr, tps, 0, &sig, &pcx);
+            impl_bound_ties(s, &sbase, tr, tps, 0, sig, pcx);
             if holder <= 0 && args <= 0 {
                 continue;
             }
             if args > 0 {
-                trait_arg_ties(k, s, tr, args, tps, self_node, f, &sig, &pcx);
+                trait_arg_ties(k, s, tr, args, tps, self_node, f, sig, pcx);
             }
             if holder <= 0 {
                 continue;
             }
-            for ci in 0..pcx.nodes[holder].count {
+            for ci in 0..pcx.nodes[holder as usize].count {
                 let c = child(holder, ci, pcx);
-                if !is_node(c, NodeKind::AssocType, pcx) || pcx.nodes[c].b <= 0 {
+                if !is_node(c, NodeKind::AssocType, pcx) || pcx.nodes[c as usize].b <= 0 {
                     continue;
                 }
-                let name = pcx.nodes[c].a;
-                let gt = crate::front::assoc::super_projection(tr, s, name, pcx.nodes[c].start,
-                    &pcx);
+                let name = pcx.nodes[c as usize].a;
+                let gt = crate::front::assoc::super_projection(tr, s, name,
+                    pcx.nodes[c as usize].start, pcx);
                 let i = direct_impl(pcx.found_impl, s, name, pcx);
                 if gt <= 0 || i < 0 {
                     continue;
                 }
-                let ac = assoc_named(pcx.nodes[pcx.traits_impls[i].node].c, name, pcx);
+                let ac = assoc_named(pcx.nodes[pcx.traits_impls[i as usize].node as usize].c, name,
+                    pcx);
                 if ac == 0 {
                     continue;
                 }
-                var base = Vec::<i64, Comp>::new_in(Comp {});
+                let mut base = Vec::<i64, Comp>::new_in(Comp {});
                 for j in 0..slot_count(s, pcx) {
-                    push_entry(B_PARAM, k, j, -1, &base);
+                    push_entry(B_PARAM, k, j, -1, &mut base);
                 }
-                var proj = Vec::<i64, Comp>::new_in(Comp {});
-                proj_map(i, pcx.nodes[ac].b, gt, s, base, -1, &proj, 0, pcx);
-                var want = Vec::<i64, Comp>::new_in(Comp {});
-                bind_walk(pcx.nodes[c].b, gt, tps, self_node, -1, &want, 0, pcx, f);
+                let mut proj = Vec::<i64, Comp>::new_in(Comp {});
+                proj_map(i, pcx.nodes[ac as usize].b, gt, s, &base, -1, &mut proj, 0, pcx);
+                let mut want = Vec::<i64, Comp>::new_in(Comp {});
+                bind_walk(pcx.nodes[c as usize].b, gt, tps, self_node, -1, &mut want, 0, pcx, f);
                 if proj.len() != want.len() {
                     continue;
                 }
                 for e in 0..proj.len() as i64 / 4 {
-                    tie_universals(walk_universal(proj, e, tps, &sig, pcx),
-                        walk_universal(want, e, tps, &sig, pcx), &sig);
+                    tie_universals(walk_universal(&proj, e, tps, sig, pcx),
+                        walk_universal(&want, e, tps, sig, pcx), sig);
                 }
             }
         }
@@ -2352,14 +2472,14 @@ fn bound_ties(f: i64, tps: i64, self_node: i64, sig: inout Sig<Comp>, pcx: inout
 // too, `B::Item`'s and `A::Item`'s slot by slot one region, both ways; and
 // so on for the impls its parameters' substitutions meet their bounds by
 // (`Rev<Chain<..>>`'s `I: DoubleEndedIterator`, Chain's impl of it).
-fn impl_bound_ties(s: i64, base: Vec<i64, Comp>, tr: i64, tps: i64, depth: i64,
-    sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
+fn impl_bound_ties(s: i64, base: &Vec<i64, Comp>, tr: i64, tps: i64, depth: i64,
+    sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
     if s <= 0 || depth > 6 {
         return;
     }
-    var found = -1;
+    let mut found: i64 = -1;
     for i in 0..pcx.traits_impls.len() as i64 {
-        if pcx.traits_impls[i].tr == tr && impl_for(i, s, pcx) {
+        if pcx.traits_impls[i as usize].tr == tr && impl_for(i, s, pcx) {
             if found >= 0 {
                 return;
             }
@@ -2370,7 +2490,7 @@ fn impl_bound_ties(s: i64, base: Vec<i64, Comp>, tr: i64, tps: i64, depth: i64,
     // s meets it through its own bound)
     if found < 0 {
         for i in 0..pcx.traits_impls.len() as i64 {
-            if pcx.traits_impls[i].tr == tr && blanket_impl(i, pcx) {
+            if pcx.traits_impls[i as usize].tr == tr && blanket_impl(i, pcx) {
                 if found >= 0 {
                     return;
                 }
@@ -2381,63 +2501,63 @@ fn impl_bound_ties(s: i64, base: Vec<i64, Comp>, tr: i64, tps: i64, depth: i64,
     if found < 0 {
         return;
     }
-    let inode = pcx.traits_impls[found].node;
-    let itps = pcx.nodes[inode].g;
+    let inode = pcx.traits_impls[found as usize].node;
+    let itps = pcx.nodes[inode as usize].g;
     if itps <= 0 {
         return;
     }
-    var head = Vec::<i64, Comp>::new_in(Comp {});
-    bind_walk(pcx.nodes[inode].b, s, itps, 0, -1, &head, 0, pcx, -1);
-    for q in 0..pcx.nodes[itps].count {
-        let bounds = pcx.nodes[child(itps, q, pcx)].h;
+    let mut head = Vec::<i64, Comp>::new_in(Comp {});
+    bind_walk(pcx.nodes[inode as usize].b, s, itps, 0, -1, &mut head, 0, pcx, -1);
+    for q in 0..pcx.nodes[itps as usize].count {
+        let bounds = pcx.nodes[child(itps, q, pcx) as usize].h;
         if bounds <= 0 {
             continue;
         }
-        let sq = header_param_type(pcx.nodes[inode].b, s, itps, q, 0, pcx);
+        let sq = header_param_type(pcx.nodes[inode as usize].b, s, itps, q, 0, pcx);
         if sq <= 0 {
             continue;
         }
-        var bq = Vec::<i64, Comp>::new_in(Comp {});
-        param_base(q, sq, head, base, &bq, pcx);
-        impl_fn_ties(found, q, sq, bq, s, head, base, tps, &sig, &pcx);
-        for bi in 0..pcx.nodes[bounds].count {
+        let mut bq = Vec::<i64, Comp>::new_in(Comp {});
+        param_base(q, sq, &head, base, &mut bq, pcx);
+        impl_fn_ties(found, q, sq, &bq, s, &head, base, tps, sig, pcx);
+        for bi in 0..pcx.nodes[bounds as usize].count {
             let b = child(bounds, bi, pcx);
             if !is_node(b, NodeKind::TyName, pcx) {
                 continue;
             }
-            let tr2 = crate::front::traits::bound_trait(b, &pcx);
+            let tr2 = crate::front::traits::bound_trait(b, pcx);
             if tr2 < 0 {
                 continue;
             }
-            impl_bound_ties(sq, bq, tr2, tps, depth + 1, &sig, &pcx);
-            let holder = pcx.nodes[b].h;
-            let count = if holder > 0 { pcx.nodes[holder].count } else { 0 };
+            impl_bound_ties(sq, &bq, tr2, tps, depth + 1, sig, pcx);
+            let holder = pcx.nodes[b as usize].h;
+            let count: i64 = if holder > 0 { pcx.nodes[holder as usize].count } else { 0 };
             for ci in 0..count {
                 let c = child(holder, ci, pcx);
-                let x = pcx.nodes[c].b;
+                let x = pcx.nodes[c as usize].b;
                 if !is_node(c, NodeKind::AssocType, pcx) || x <= 0 || !proj_shape(x, pcx) {
                     continue;
                 }
-                let q2 = param_index(itps, pcx.nodes[child(x, 0, pcx)].a, pcx);
+                let q2 = param_index(itps, pcx.nodes[child(x, 0, pcx) as usize].a, pcx);
                 if q2 < 0 {
                     continue;
                 }
-                let s2 = header_param_type(pcx.nodes[inode].b, s, itps, q2, 0, pcx);
+                let s2 = header_param_type(pcx.nodes[inode as usize].b, s, itps, q2, 0, pcx);
                 if s2 <= 0 {
                     continue;
                 }
-                var b2 = Vec::<i64, Comp>::new_in(Comp {});
-                param_base(q2, s2, head, base, &b2, pcx);
-                var have = Vec::<i64, Comp>::new_in(Comp {});
-                var want = Vec::<i64, Comp>::new_in(Comp {});
-                if !param_proj(found, q, tr2, pcx.nodes[c].a, sq, bq, &have, &pcx)
-                    || !param_proj(found, q2, -1, pcx.nodes[x].a, s2, b2, &want, &pcx)
+                let mut b2 = Vec::<i64, Comp>::new_in(Comp {});
+                param_base(q2, s2, &head, base, &mut b2, pcx);
+                let mut have = Vec::<i64, Comp>::new_in(Comp {});
+                let mut want = Vec::<i64, Comp>::new_in(Comp {});
+                if !param_proj(found, q, tr2, pcx.nodes[c as usize].a, sq, &bq, &mut have, pcx)
+                    || !param_proj(found, q2, -1, pcx.nodes[x as usize].a, s2, &b2, &mut want, pcx)
                     || have.len() != want.len() {
                     continue;
                 }
                 for e in 0..have.len() as i64 / 4 {
-                    tie_universals(walk_universal(have, e, tps, &sig, pcx),
-                        walk_universal(want, e, tps, &sig, pcx), &sig);
+                    tie_universals(walk_universal(&have, e, tps, sig, pcx),
+                        walk_universal(&want, e, tps, sig, pcx), sig);
                 }
             }
         }
@@ -2451,102 +2571,106 @@ fn impl_bound_ties(s: i64, base: Vec<i64, Comp>, tr: i64, tps: i64, depth: i64,
 // position of C to the bound's slot there (an impl parameter's, a
 // projection's of one); so does this body, through s's slots (base's
 // entries, head the header's walk of s).
-fn impl_fn_ties(i: i64, q: i64, sq: i64, bq: Vec<i64, Comp>, s: i64, head: Vec<i64, Comp>,
-    base: Vec<i64, Comp>, tps: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
-    if pcx.types[sq].kind != TyKind::Struct {
+fn impl_fn_ties(i: i64, q: i64, sq: i64, bq: &Vec<i64, Comp>, s: i64, head: &Vec<i64, Comp>,
+    base: &Vec<i64, Comp>, tps: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
+    if pcx.types[sq as usize].kind != TyKind::Struct {
         return;
     }
-    let id = pcx.structs[pcx.types[sq].a].closure - 1;
-    let inode = pcx.traits_impls[i].node;
-    let itps = pcx.nodes[inode].g;
-    let bnode = if id >= 0 { crate::front::closures::fn_bounds::fn_bound_of(itps, q, pcx) }
+    let id = pcx.structs[pcx.types[sq as usize].a as usize].closure - 1;
+    let inode = pcx.traits_impls[i as usize].node;
+    let itps = pcx.nodes[inode as usize].g;
+    let bnode: i64 = if id >= 0 { crate::front::closures::fn_bounds::fn_bound_of(itps, q, pcx) }
         else { 0 };
     if bnode <= 0 {
         return;
     }
-    var walk = Vec::<i64, Comp>::new_in(Comp {});
-    var at = Vec::<i64, Comp>::new_in(Comp {});
-    var codes = Vec::<i64, Comp>::new_in(Comp {});
-    let _ = closure_sig_walk(id, pcx.closures[id].exp_node, pcx.closures[id].exp_tps, &walk, &at,
-        &codes, F_MARK, 0, pcx);
-    var read = Vec::<i64, Comp>::new_in(Comp {});
-    var at2 = Vec::<i64, Comp>::new_in(Comp {});
-    var codes2 = Vec::<i64, Comp>::new_in(Comp {});
-    let _ = closure_sig_walk(id, bnode, itps, &read, &at2, &codes2, F_MARK, pcx.nodes[inode].b,
-        pcx);
-    let nenv = slot_count(sq, pcx) - pcx.closures[id].xc_n;
+    let mut walk = Vec::<i64, Comp>::new_in(Comp {});
+    let mut at = Vec::<i64, Comp>::new_in(Comp {});
+    let mut codes = Vec::<i64, Comp>::new_in(Comp {});
+    let _ = closure_sig_walk(id, pcx.closures[id as usize].exp_node,
+        pcx.closures[id as usize].exp_tps, &mut walk, &mut at, &mut codes, F_MARK, 0, pcx);
+    let mut read = Vec::<i64, Comp>::new_in(Comp {});
+    let mut at2 = Vec::<i64, Comp>::new_in(Comp {});
+    let mut codes2 = Vec::<i64, Comp>::new_in(Comp {});
+    let _ = closure_sig_walk(id, bnode, itps, &mut read, &mut at2, &mut codes2, F_MARK,
+        pcx.nodes[inode as usize].b, pcx);
+    let nenv = slot_count(sq, pcx) - pcx.closures[id as usize].xc_n;
     if read.len() != walk.len() || nenv < 0 {
         return;
     }
     let np = at2.len() as i64 - 2;
     for e in 0..codes.len() as i64 {
-        let x = codes[e];
+        let x = codes[e as usize];
         if x < 0 || nenv + x >= bq.len() as i64 / 4 {
             continue;
         }
-        let rb = param_kind(read[4 * e]);
-        var u = -1;
+        let rb = param_kind(read[(4 * e) as usize]);
+        let mut u: i64 = -1;
         if rb == B_STATIC {
             u = 0;
         } else if rb == B_PARAM || rb == B_PROJ {
             // (the entry's parameter or result: its node in the bound)
-            var a = 0;
-            while a + 1 < at2.len() as i64 && at2[a + 1] <= e {
+            let mut a: i64 = 0;
+            while a + 1 < at2.len() as i64 && at2[(a + 1) as usize] <= e {
                 a += 1;
             }
-            var an = if a < np { child(bnode, a, pcx) } else { pcx.nodes[bnode].a };
+            let mut an = if a < np { child(bnode, a, pcx) } else { pcx.nodes[bnode as usize].a };
             // (`FnMut(&I::Item)`: the projection under the references, each
             // one slot before it)
-            var off = 0;
+            let mut off: i64 = 0;
             while rb == B_PROJ && is_node(an, NodeKind::TyPtr, pcx)
-                && (pcx.nodes[an].p & crate::front::ast::NODE_REF) != 0 {
+                && (pcx.nodes[an as usize].p & crate::front::ast::NODE_REF) != 0 {
                 off += 1;
-                an = pcx.nodes[an].a;
+                an = pcx.nodes[an as usize].a;
             }
-            var got = Vec::<i64, Comp>::new_in(Comp {});
-            var q2 = -1;
+            let mut got = Vec::<i64, Comp>::new_in(Comp {});
+            let mut q2: i64 = -1;
             if rb == B_PARAM {
-                q2 = read[4 * e + 1];
+                q2 = read[(4 * e + 1) as usize];
             } else if an > 0 && proj_shape(an, pcx) {
-                q2 = param_index(itps, pcx.nodes[child(an, 0, pcx)].a, pcx);
+                q2 = param_index(itps, pcx.nodes[child(an, 0, pcx) as usize].a, pcx);
             }
-            let s2 = if q2 >= 0 { header_param_type(pcx.nodes[inode].b, s, itps, q2, 0, pcx) }
+            let s2: i64 = if q2
+                >= 0 { header_param_type(pcx.nodes[inode as usize].b, s, itps, q2, 0, pcx) }
                 else { 0 };
             if s2 > 0 {
-                var b2 = Vec::<i64, Comp>::new_in(Comp {});
-                param_base(q2, s2, head, base, &b2, pcx);
+                let mut b2 = Vec::<i64, Comp>::new_in(Comp {});
+                param_base(q2, s2, head, base, &mut b2, pcx);
                 if rb == B_PARAM {
                     got = b2;
                 } else {
-                    let _ = param_proj(i, q2, -1, pcx.nodes[an].a, s2, b2, &got, &pcx);
+                    let _ = param_proj(i, q2, -1, pcx.nodes[an as usize].a, s2, &b2, &mut got, pcx);
                 }
             }
-            let j = if rb == B_PARAM { read[4 * e + 2] } else { e - at2[a] - off };
+            let j = if rb == B_PARAM { read[(4 * e + 2) as usize] }
+                else { e - at2[a as usize] - off };
             if j >= 0 && j < got.len() as i64 / 4 {
-                u = walk_universal(got, j, tps, &sig, pcx);
+                u = walk_universal(&got, j, tps, sig, pcx);
             }
         }
-        tie_universals(walk_universal(bq, nenv + x, tps, &sig, pcx), u, &sig);
+        tie_universals(walk_universal(bq, nenv + x, tps, sig, pcx), u, sig);
     }
 }
 
 // The entries of the slots of sq, impl type parameter q's substitution,
 // read from the header's walk head of s (whose slots are base's); pushed
 // to out, one per slot of sq (elided where the header does not name it).
-fn param_base(q: i64, sq: i64, head: Vec<i64, Comp>, base: Vec<i64, Comp>,
-    out: inout Vec<i64, Comp>, pcx: Ctx<Comp>) {
+fn param_base(q: i64, sq: i64, head: &Vec<i64, Comp>, base: &Vec<i64, Comp>,
+    out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
     for j in 0..slot_count(sq, pcx) {
-        var e = -1;
+        let mut e: i64 = -1;
         for h in 0..head.len() as i64 / 4 {
-            if e < 0 && param_kind(head[4 * h]) == B_PARAM && head[4 * h + 1] == q
-                && head[4 * h + 2] == j {
+            if e < 0 && param_kind(head[(4 * h) as usize]) == B_PARAM
+                && head[(4 * h + 1) as usize] == q
+                && head[(4 * h + 2) as usize] == j {
                 e = h;
             }
         }
         if e >= 0 && e < base.len() as i64 / 4 {
-            push_entry(base[4 * e], base[4 * e + 1], base[4 * e + 2], -1, &out);
+            push_entry(base[(4 * e) as usize], base[(4 * e + 1) as usize],
+                base[(4 * e + 2) as usize], -1, out);
         } else {
-            push_entry(B_ELIDED, 0, 0, -1, &out);
+            push_entry(B_ELIDED, 0, 0, -1, out);
         }
     }
 }
@@ -2559,17 +2683,18 @@ fn param_base(q: i64, sq: i64, head: Vec<i64, Comp>, base: Vec<i64, Comp>,
 // walk does. i itself otherwise (`Copied<I>`'s `type Item = T;`, T bound
 // by I's `Item = &'a T`, is read through Copied's own impl too: proj_map's
 // proj_bound, 0.27.7; another value keeps the impl it resolved to).
-fn direct_impl(i: i64, s: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
+fn direct_impl(i: i64, s: i64, name: i64, pcx: &Ctx<Comp>) -> i64 {
     if i < 0 || s <= 0 || impl_for(i, s, pcx) {
         return i;
     }
     for i2 in 0..pcx.traits_impls.len() as i64 {
-        if pcx.traits_impls[i2].tr != pcx.traits_impls[i].tr || !impl_for(i2, s, pcx) {
+        if pcx.traits_impls[i2 as usize].tr != pcx.traits_impls[i as usize].tr
+            || !impl_for(i2, s, pcx) {
             continue;
         }
-        let c = assoc_named(pcx.nodes[pcx.traits_impls[i2].node].c, name, pcx);
+        let c = assoc_named(pcx.nodes[pcx.traits_impls[i2 as usize].node as usize].c, name, pcx);
         if c != 0 {
-            let v = pcx.nodes[c].b;
+            let v = pcx.nodes[c as usize].b;
             return if proj_shape(v, pcx) || unnamed_param(i2, v, s, pcx) >= 0 { i2 } else { i };
         }
     }
@@ -2579,23 +2704,23 @@ fn direct_impl(i: i64, s: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
 // The slots of `Q::name` (Q impl i's type parameter q, substitution sq
 // whose slots are bq's entries; tr its trait, -1: the one of Q's bounds
 // that defines it, through supertraits); pushed to out. Whether found.
-fn param_proj(i: i64, q: i64, tr: i64, name: i64, sq: i64, bq: Vec<i64, Comp>,
-    out: inout Vec<i64, Comp>, pcx: inout Ctx<Comp>) -> bool {
-    let inode = pcx.traits_impls[i].node;
-    let itps = pcx.nodes[inode].g;
-    let pos = pcx.nodes[inode].start;
-    var gt = 0;
+fn param_proj(i: i64, q: i64, tr: i64, name: i64, sq: i64, bq: &Vec<i64, Comp>,
+    out: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) -> bool {
+    let inode = pcx.traits_impls[i as usize].node;
+    let itps = pcx.nodes[inode as usize].g;
+    let pos = pcx.nodes[inode as usize].start;
+    let mut gt: i64 = 0;
     if tr >= 0 {
-        gt = crate::front::assoc::super_projection(tr, sq, name, pos, &pcx);
+        gt = crate::front::assoc::super_projection(tr, sq, name, pos, pcx);
     } else {
-        let bounds = pcx.nodes[child(itps, q, pcx)].h;
-        let count = if bounds > 0 { pcx.nodes[bounds].count } else { 0 };
+        let bounds = pcx.nodes[child(itps, q, pcx) as usize].h;
+        let count: i64 = if bounds > 0 { pcx.nodes[bounds as usize].count } else { 0 };
         for bi in 0..count {
             let b = child(bounds, bi, pcx);
             if gt <= 0 && is_node(b, NodeKind::TyName, pcx) {
-                let t = crate::front::traits::bound_trait(b, &pcx);
+                let t = crate::front::traits::bound_trait(b, pcx);
                 if t >= 0 {
-                    gt = crate::front::assoc::super_projection(t, sq, name, pos, &pcx);
+                    gt = crate::front::assoc::super_projection(t, sq, name, pos, pcx);
                 }
             }
         }
@@ -2604,32 +2729,33 @@ fn param_proj(i: i64, q: i64, tr: i64, name: i64, sq: i64, bq: Vec<i64, Comp>,
     if gt <= 0 || i2 < 0 {
         return false;
     }
-    let ac = assoc_named(pcx.nodes[pcx.traits_impls[i2].node].c, name, pcx);
+    let ac = assoc_named(pcx.nodes[pcx.traits_impls[i2 as usize].node as usize].c, name, pcx);
     if ac == 0 {
         return false;
     }
-    proj_map(i2, pcx.nodes[ac].b, gt, sq, bq, -1, &out, 0, pcx);
+    proj_map(i2, pcx.nodes[ac as usize].b, gt, sq, bq, -1, out, 0, pcx);
     true
 }
 
 // The type impl header node n (type t) has at its type parameter q (of
 // generics itps), or 0: `Chain<A, B>` at Chain<Iter<i64>, Rev<..>> gives B
 // Rev<..>.
-fn header_param_type(n: i64, t: i64, itps: i64, q: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
+fn header_param_type(n: i64, t: i64, itps: i64, q: i64, depth: i64, pcx: &Ctx<Comp>) -> i64 {
     if n <= 0 || t <= 0 || depth > 8 {
         return 0;
     }
-    let k = pcx.nodes[n].kind;
-    if k == NodeKind::TyName && pcx.nodes[n].count == 0 && pcx.nodes[n].g == 0 {
-        return if param_index(itps, pcx.nodes[n].a, pcx) == q { t } else { 0 };
+    let k = pcx.nodes[n as usize].kind;
+    if k == NodeKind::TyName && pcx.nodes[n as usize].count == 0 && pcx.nodes[n as usize].g == 0 {
+        return if param_index(itps, pcx.nodes[n as usize].a, pcx) == q { t } else { 0 };
     }
-    if k == NodeKind::TyName && pcx.nodes[n].g > 0
-        && (pcx.types[t].kind == TyKind::Struct || pcx.types[t].kind == TyKind::Enum) {
-        let g = pcx.nodes[n].g;
-        if pcx.nodes[g].count != adt_targ_count(t, pcx) {
+    if k == NodeKind::TyName && pcx.nodes[n as usize].g > 0
+        && (pcx.types[t as usize].kind == TyKind::Struct
+            || pcx.types[t as usize].kind == TyKind::Enum) {
+        let g = pcx.nodes[n as usize].g;
+        if pcx.nodes[g as usize].count != adt_targ_count(t, pcx) {
             return 0;
         }
-        for i in 0..pcx.nodes[g].count {
+        for i in 0..pcx.nodes[g as usize].count {
             let r = header_param_type(child(g, i, pcx), adt_targ(t, i, pcx), itps, q, depth + 1,
                 pcx);
             if r > 0 {
@@ -2639,9 +2765,10 @@ fn header_param_type(n: i64, t: i64, itps: i64, q: i64, depth: i64, pcx: Ctx<Com
         return 0;
     }
     if (k == NodeKind::TyPtr || k == NodeKind::TySlice || k == NodeKind::TyArray)
-        && (pcx.types[t].kind == TyKind::Ptr || pcx.types[t].kind == TyKind::Slice
-            || pcx.types[t].kind == TyKind::Array) {
-        return header_param_type(pcx.nodes[n].a, pcx.types[t].a, itps, q, depth + 1, pcx);
+        && (pcx.types[t as usize].kind == TyKind::Ptr || pcx.types[t as usize].kind == TyKind::Slice
+            || pcx.types[t as usize].kind == TyKind::Array) {
+        return header_param_type(pcx.nodes[n as usize].a, pcx.types[t as usize].a, itps, q,
+            depth + 1, pcx);
     }
     0
 }
@@ -2652,10 +2779,10 @@ fn header_param_type(n: i64, t: i64, itps: i64, q: i64, depth: i64, pcx: Ctx<Com
 // its own trait argument, read in s's slots; each slot of the two is one
 // region, both ways.
 fn trait_arg_ties(k: i64, s: i64, tr: i64, args: i64, tps: i64, self_node: i64, f: i64,
-    sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
-    var found = -1;
+    sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
+    let mut found: i64 = -1;
     for i in 0..pcx.traits_impls.len() as i64 {
-        if pcx.traits_impls[i].tr == tr && impl_for(i, s, pcx) {
+        if pcx.traits_impls[i as usize].tr == tr && impl_for(i, s, pcx) {
             if found >= 0 {
                 return;
             }
@@ -2665,60 +2792,61 @@ fn trait_arg_ties(k: i64, s: i64, tr: i64, args: i64, tps: i64, self_node: i64, 
     if found < 0 {
         return;
     }
-    let iargs = pcx.nodes[pcx.nodes[pcx.traits_impls[found].node].a].g;
-    if iargs <= 0 || pcx.nodes[iargs].count != pcx.nodes[args].count {
+    let iargs = pcx.nodes[pcx.nodes[pcx.traits_impls[found as usize].node as usize].a as usize].g;
+    if iargs <= 0 || pcx.nodes[iargs as usize].count != pcx.nodes[args as usize].count {
         return;
     }
-    let ta = crate::front::traits::impl_targs_for(found, s, &pcx);
+    let ta = crate::front::traits::impl_targs_for(found, s, pcx);
     if ta < 0 {
         return;
     }
-    var base = Vec::<i64, Comp>::new_in(Comp {});
+    let mut base = Vec::<i64, Comp>::new_in(Comp {});
     for j in 0..slot_count(s, pcx) {
-        push_entry(B_PARAM, k, j, -1, &base);
+        push_entry(B_PARAM, k, j, -1, &mut base);
     }
-    for a in 0..pcx.nodes[args].count {
+    for a in 0..pcx.nodes[args as usize].count {
         let t = tlist_at(ta + a, pcx);
         if t <= 0 {
             continue;
         }
-        var have = Vec::<i64, Comp>::new_in(Comp {});
-        proj_map(found, child(iargs, a, pcx), t, s, base, -1, &have, 0, pcx);
-        var want = Vec::<i64, Comp>::new_in(Comp {});
-        bind_walk(child(args, a, pcx), t, tps, self_node, -1, &want, 0, pcx, f);
+        let mut have = Vec::<i64, Comp>::new_in(Comp {});
+        proj_map(found, child(iargs, a, pcx), t, s, &base, -1, &mut have, 0, pcx);
+        let mut want = Vec::<i64, Comp>::new_in(Comp {});
+        bind_walk(child(args, a, pcx), t, tps, self_node, -1, &mut want, 0, pcx, f);
         if have.len() != want.len() {
             continue;
         }
         for e in 0..have.len() as i64 / 4 {
-            tie_universals(walk_universal(have, e, tps, &sig, pcx),
-                walk_universal(want, e, tps, &sig, pcx), &sig);
+            tie_universals(walk_universal(&have, e, tps, sig, pcx),
+                walk_universal(&want, e, tps, sig, pcx), sig);
         }
     }
 }
 
 // The universal walk entry e of w binds, when it names one (an elided or
 // unresolved entry: -1).
-fn walk_universal(w: Vec<i64, Comp>, e: i64, tps: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>)
+fn walk_universal(w: &Vec<i64, Comp>, e: i64, tps: i64, sig: &mut Sig<Comp>, pcx: &Ctx<Comp>)
     -> i64 {
-    let b = w[4 * e];
+    let b = w[(4 * e) as usize];
     if b == B_STATIC {
         return 0;
     }
     if b == B_NAMED {
-        return add_universal(U_NAMED, w[4 * e + 1], 0, &sig);
+        return add_universal(U_NAMED, w[(4 * e + 1) as usize], 0, sig);
     }
     if b == B_SELF {
-        return add_universal(U_SUBST, w[4 * e + 1], w[4 * e + 2], &sig);
+        return add_universal(U_SUBST, w[(4 * e + 1) as usize], w[(4 * e + 2) as usize], sig);
     }
-    if param_kind(b) == B_PARAM && w[4 * e + 1] < pcx.nodes[tps].count {
-        return add_universal(U_SUBST, pcx.nodes[child(tps, w[4 * e + 1], pcx)].a, w[4 * e + 2],
-            &sig);
+    if param_kind(b) == B_PARAM && w[(4 * e + 1) as usize] < pcx.nodes[tps as usize].count {
+        return add_universal(U_SUBST,
+            pcx.nodes[child(tps, w[(4 * e + 1) as usize], pcx) as usize].a, w[(4 * e + 2) as usize],
+            sig);
     }
     -1
 }
 
 // Universals a and b of sig outlive each other (-1: none, nothing added).
-fn tie_universals(a: i64, b: i64, sig: inout Sig<Comp>) {
+fn tie_universals(a: i64, b: i64, sig: &mut Sig<Comp>) {
     if a >= 0 && b >= 0 {
         sig.bounds.push(a);
         sig.bounds.push(b);
@@ -2728,9 +2856,10 @@ fn tie_universals(a: i64, b: i64, sig: inout Sig<Comp>) {
 }
 
 // Universal (kind, x, y) of sig, or -1.
-fn find_universal(kind: i64, x: i64, y: i64, sig: Sig<Comp>) -> i64 {
+fn find_universal(kind: i64, x: i64, y: i64, sig: &Sig<Comp>) -> i64 {
     for u in 0..universal_count(sig) {
-        if sig.univ[3 * u] == kind && sig.univ[3 * u + 1] == x && sig.univ[3 * u + 2] == y {
+        if sig.univ[(3 * u) as usize] == kind && sig.univ[(3 * u + 1) as usize] == x
+            && sig.univ[(3 * u + 2) as usize] == y {
             return u;
         }
     }
@@ -2740,50 +2869,51 @@ fn find_universal(kind: i64, x: i64, y: i64, sig: Sig<Comp>) -> i64 {
 // The walk's entries (sig.walk) of parameter `param` (its local), bound
 // to universals, pushed to sig.params: an elided one a fresh universal
 // (E1).
-fn bind_entries(param: i64, tps: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) {
+fn bind_entries(param: i64, tps: i64, sig: &mut Sig<Comp>, pcx: &Ctx<Comp>) {
     let n = sig.walk.len() as i64 / 4;
     for e in 0..n {
-        let u = entry_universal(e, param, tps, &sig, pcx);
+        let u = entry_universal(e, param, tps, sig, pcx);
         sig.params.push(u);
     }
 }
 
 // The universal walk entry e binds (elided: a fresh one of parameter
 // `param`'s; -1: of the result, never asked so).
-fn entry_universal(e: i64, param: i64, tps: i64, sig: inout Sig<Comp>, pcx: Ctx<Comp>) -> i64 {
-    let b = sig.walk[4 * e];
+fn entry_universal(e: i64, param: i64, tps: i64, sig: &mut Sig<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    let b = sig.walk[(4 * e) as usize];
     if b == B_STATIC {
         return 0;
     }
     if b == B_NAMED {
-        return add_universal(U_NAMED, sig.walk[4 * e + 1], 0, &sig);
+        return add_universal(U_NAMED, sig.walk[(4 * e + 1) as usize], 0, sig);
     }
     if b == B_SELF {
-        return add_universal(U_SUBST, sig.walk[4 * e + 1], sig.walk[4 * e + 2], &sig);
+        return add_universal(U_SUBST, sig.walk[(4 * e + 1) as usize],
+            sig.walk[(4 * e + 2) as usize], sig);
     }
     if b == B_OUTER {
-        return add_universal(U_OUTER, sig.walk[4 * e + 1], 0, &sig);
+        return add_universal(U_OUTER, sig.walk[(4 * e + 1) as usize], 0, sig);
     }
     if param_kind(b) == B_PARAM {
-        let sym = pcx.nodes[child(tps, sig.walk[4 * e + 1], pcx)].a;
-        return add_universal(U_SUBST, sym, sig.walk[4 * e + 2], &sig);
+        let sym = pcx.nodes[child(tps, sig.walk[(4 * e + 1) as usize], pcx) as usize].a;
+        return add_universal(U_SUBST, sym, sig.walk[(4 * e + 2) as usize], sig);
     }
-    add_universal(U_ELIDED, if param >= 0 { param } else { 0 }, e, &sig)
+    add_universal(U_ELIDED, if param >= 0 { param } else { 0 }, e, sig)
 }
 
 // RULE: D4.2 (E4) error borrowck.elision at function f's result (at pos):
 // an elided output region with no input region to take.
-fn elision_error(f: i64, pos: i64, pcx: inout Ctx<Comp>) {
+fn elision_error(f: i64, pos: i64, pcx: &mut Ctx<Comp>) {
     let node = fn_node(crate::places::front::fn_template(f, pcx), pcx);
     let saved = pcx.err_kind;
     pcx.err_kind = c"borrowck.elision";
-    crate::base::diag::err_begin(pos, &pcx);
+    crate::base::diag::err_begin(pos, pcx);
     crate::base::diag::err_fmt(
         format_args("the result of '{}' borrows, but from which parameter is not said: it has no single reference parameter and no `&self`",
-            sym_text(pcx.nodes[node].a, pcx)),
+            str::from_utf8(sym_text(pcx.nodes[node as usize].a, pcx)).unwrap()),
         pcx);
     crate::base::diag::err_help(c"name the lifetime the result borrows from: `fn f<'a>(x: &'a T, y: &U) -> &'a T` (rustc E0106)", pcx);
-    crate::base::diag::err_end_soft(&pcx);
+    crate::base::diag::err_end_soft(pcx);
     pcx.err_kind = saved;
 }
 
@@ -2796,62 +2926,62 @@ fn elision_error(f: i64, pos: i64, pcx: inout Ctx<Comp>) {
 // (D1.4: its region dropped) keep the pointee's, the element's; an index
 // of an array or a raw pointer's buffer the element's (all of them); a
 // field the field's, mapped from the parent's (field_map).
-pub fn place_regions(l: i64, p: i64, pbody: Body<Comp>, out: inout Vec<i64, Comp>,
-    pcx: inout Ctx<Comp>) {
-    var path: Vec<i64, Comp> = Vec::new_in(Comp {});
-    var q = p;
+pub fn place_regions(l: i64, p: i64, pbody: &Body<Comp>, out: &mut Vec<i64, Comp>,
+    pcx: &mut Ctx<Comp>) {
+    let mut path: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut q = p;
     while q > 0 {
         path.push(q);
-        q = pbody.projs[q].parent;
+        q = pbody.projs[q as usize].parent;
     }
-    var cur: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut cur: Vec<i64, Comp> = Vec::new_in(Comp {});
     for i in 0..slots_bound(l, pbody) {
         cur.push(slot_var(l, i, pbody));
     }
-    var next: Vec<i64, Comp> = Vec::new_in(Comp {});
-    var map: Vec<i64, Comp> = Vec::new_in(Comp {});
-    var parent = 0;
-    var i = path.len() as i64 - 1;
+    let mut next: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut map: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut parent: i64 = 0;
+    let mut i = path.len() as i64 - 1;
     while i >= 0 {
-        let pj = path[i];
-        let kind = pbody.projs[pj].kind;
-        let val = pbody.projs[pj].val;
-        let bt = full_place_type(l, parent, pbody, &pcx);
-        let st = full_place_type(l, pj, pbody, &pcx);
+        let pj = path[i as usize];
+        let kind = pbody.projs[pj as usize].kind;
+        let val = pbody.projs[pj as usize].val;
+        let bt = full_place_type(l, parent, pbody, pcx);
+        let st = full_place_type(l, pj, pbody, pcx);
         next.clear();
         if kind == PJ_DEREF || kind == PJ_INDEX || kind == PJ_CONST {
             // (the pointee's, the element's: the last of them)
             let keep = slot_count(st, pcx);
             let from = cur.len() as i64 - keep;
             for j in 0..keep {
-                next.push(if from + j >= 0 { cur[from + j] } else { 0 });
+                next.push(if from + j >= 0 { cur[(from + j) as usize] } else { 0 });
             }
         } else if kind == PJ_FIELD || kind == PJ_UNION {
-            let variant = if parent > 0 && pbody.projs[parent].kind == PJ_VARIANT {
-                pbody.projs[parent].val
+            let variant: i64 = if parent > 0 && pbody.projs[parent as usize].kind == PJ_VARIANT {
+                pbody.projs[parent as usize].val
             } else { -1 };
             map.clear();
-            field_map(bt, val, variant, &map, pcx);
+            field_map(bt, val, variant, &mut map, pcx);
             for j in 0..map.len() as i64 {
-                let m = map[j];
-                next.push(if m == MAP_STATIC { 1 } else if m >= 0 && m < cur.len() as i64 { cur[m] }
-                    else { 0 });
+                let m = map[j as usize];
+                next.push(if m == MAP_STATIC { 1 }
+                    else if m >= 0 && m < cur.len() as i64 { cur[m as usize] } else { 0 });
             }
         } else {
             // (PJ_VARIANT: the enum's, for the field after it)
             for j in 0..cur.len() as i64 {
-                next.push(cur[j]);
+                next.push(cur[j as usize]);
             }
         }
         cur.clear();
         for j in 0..next.len() as i64 {
-            cur.push(next[j]);
+            cur.push(next[j as usize]);
         }
         parent = pj;
         i -= 1;
     }
     for j in 0..cur.len() as i64 {
-        out.push(cur[j]);
+        out.push(cur[j as usize]);
     }
 }
 
@@ -2861,26 +2991,27 @@ pub fn place_regions(l: i64, p: i64, pbody: Body<Comp>, out: inout Vec<i64, Comp
 // argument: its place among the arguments'), MAP_STATIC or MAP_NONE,
 // pushed to out. A tuple's or a closure's field: its range of the owner's
 // slots.
-pub fn field_map(t0: i64, k: i64, v: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Comp>) {
-    var t = t0;
-    while t > 0 && pcx.types[t].kind == TyKind::Distinct {
-        t = pcx.types[t].a;
+pub fn field_map(t0: i64, k: i64, v: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
+    let mut t = t0;
+    while t > 0 && pcx.types[t as usize].kind == TyKind::Distinct {
+        t = pcx.types[t as usize].a;
     }
     if t <= 0 {
         return;
     }
-    let tk = pcx.types[t].kind;
-    if tk == TyKind::Tuple || tk == TyKind::Struct && pcx.structs[pcx.types[t].a].closure != 0 {
-        let count = if tk == TyKind::Tuple { pcx.types[t].count }
-            else { struct_field_count(pcx.types[t].a, pcx) };
-        var off = 0;
+    let tk = pcx.types[t as usize].kind;
+    if tk == TyKind::Tuple
+        || tk == TyKind::Struct && pcx.structs[pcx.types[t as usize].a as usize].closure != 0 {
+        let count = if tk == TyKind::Tuple { pcx.types[t as usize].count }
+            else { struct_field_count(pcx.types[t as usize].a, pcx) };
+        let mut off: i64 = 0;
         for i in 0..count {
             let ft = if tk == TyKind::Tuple { type_elem(t, i, pcx) }
-                else { struct_field_ty(pcx.types[t].a, i, pcx) };
+                else { struct_field_ty(pcx.types[t as usize].a, i, pcx) };
             // (a by-reference capture: its loan's slot first, which the
             // field's raw pointer type does not hold, D10.2)
             let n = if tk == TyKind::Tuple { slot_count(ft, pcx) }
-                else { capture_slots(pcx.types[t].a, i, 0, pcx) };
+                else { capture_slots(pcx.types[t as usize].a, i, 0, pcx) };
             let skip = n - slot_count(ft, pcx);
             if i == k {
                 for j in skip..n {
@@ -2891,12 +3022,21 @@ pub fn field_map(t0: i64, k: i64, v: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Co
         }
         return;
     }
+    if tk == TyKind::Array {
+        // RULE: D3.3 (0.28.0) an element of an array: the array's slots,
+        // its element type's (`[s.as_str(), "x"]` holds the loan of s; 0.27.8
+        // mapped none, so the loan did not reach the array)
+        for j in 0..slot_count(pcx.types[t as usize].a, pcx) {
+            out.push(j);
+        }
+        return;
+    }
     if tk == TyKind::Slice {
         // (a view's parts: its data pointer, the element's slots; its length)
         // (Z9.1: a fat raw pointer has no region of its own)
-        let own = if pcx.types[t].b == REF_RAW { 0 } else { 1 };
+        let own: i64 = if pcx.types[t as usize].b == REF_RAW { 0 } else { 1 };
         if k == 0 {
-            for j in 0..slot_count(pcx.types[t].a, pcx) {
+            for j in 0..slot_count(pcx.types[t as usize].a, pcx) {
                 out.push(own + j);
             }
         }
@@ -2906,48 +3046,49 @@ pub fn field_map(t0: i64, k: i64, v: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Co
         return;
     }
     let node = adt_node(t, pcx);
-    var fty = 0;
-    var fast = 0;
+    let mut fty: i64 = 0;
+    let mut fast: i64 = 0;
     if tk == TyKind::Struct {
-        let s = pcx.types[t].a;
+        let s = pcx.types[t as usize].a;
         if k < 0 || k >= struct_field_count(s, pcx) {
             return;
         }
         fty = struct_field_ty(s, k, pcx);
-        if is_node(node, NodeKind::Struct, pcx) && k < pcx.nodes[node].count {
-            fast = pcx.nodes[child(node, k, pcx)].b;
+        if is_node(node, NodeKind::Struct, pcx) && k < pcx.nodes[node as usize].count {
+            fast = pcx.nodes[child(node, k, pcx) as usize].b;
         }
     } else {
         if v < 0 || k < 0 || k >= crate::places::ir::variant_field_count(v, pcx) {
             return;
         }
         fty = variant_field(v, k, pcx);
-        let vn = pcx.variants[v].node;
-        if is_node(vn, NodeKind::Variant, pcx) && k < pcx.nodes[vn].count {
+        let vn = pcx.variants[v as usize].node;
+        if is_node(vn, NodeKind::Variant, pcx) && k < pcx.nodes[vn as usize].count {
             let f = child(vn, k, pcx);
-            fast = if is_node(f, NodeKind::Field, pcx) { pcx.nodes[f].b } else { f };
+            fast = if is_node(f, NodeKind::Field, pcx) { pcx.nodes[f as usize].b } else { f };
         }
     }
-    let lts = if node > 0 { lifetimes_of(node, pcx) } else { 0 };
+    let lts: i64 = if node > 0 { lifetimes_of(node, pcx) } else { 0 };
     let m = decl_lifetimes(node, pcx);
-    var walk: Vec<i64, Comp> = Vec::new_in(Comp {});
-    bind_walk(fast, fty, if node > 0 { pcx.nodes[node].g } else { 0 }, 0, -1, &walk, 0, pcx, -1);
+    let mut walk: Vec<i64, Comp> = Vec::new_in(Comp {});
+    bind_walk(fast, fty, if node > 0 { pcx.nodes[node as usize].g } else { 0 }, 0, -1, &mut walk, 0,
+        pcx, -1);
     for e in 0..walk.len() as i64 / 4 {
-        let b = walk[4 * e];
+        let b = walk[(4 * e) as usize];
         if b == B_STATIC {
             out.push(MAP_STATIC);
         } else if b == B_NAMED {
-            let i = lifetime_index(lts, walk[4 * e + 1], pcx);
+            let i = lifetime_index(lts, walk[(4 * e + 1) as usize], pcx);
             out.push(if i >= 0 { i } else { MAP_NONE });
         } else if param_kind(b) == B_PARAM {
-            var off = m;
-            let a = walk[4 * e + 1];
+            let mut off = m;
+            let a = walk[(4 * e + 1) as usize];
             for i in 0..a {
                 if i < adt_targ_count(t, pcx) {
                     off += slot_count(adt_targ(t, i, pcx), pcx);
                 }
             }
-            out.push(off + walk[4 * e + 2]);
+            out.push(off + walk[(4 * e + 2) as usize]);
         } else {
             out.push(MAP_NONE);
         }
@@ -2958,22 +3099,22 @@ pub fn field_map(t0: i64, k: i64, v: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Co
 // regions the annotation tn of local l writes: pairs (l's slot variable,
 // the variable it must contain: 'static's, 1, or a named lifetime's
 // universal) pushed to out. An elided region writes nothing.
-pub fn annot_regions(l: i64, tn: i64, pbody: Body<Comp>, out: inout Vec<i64, Comp>, pcx: Ctx<Comp>) {
-    var walk = Vec::<i64, Comp>::new_in(Comp {});
-    bind_walk(tn, pbody.locals[l].ty, 0, 0, -1, &walk, 0, pcx, -1);
+pub fn annot_regions(l: i64, tn: i64, pbody: &Body<Comp>, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
+    let mut walk = Vec::<i64, Comp>::new_in(Comp {});
+    bind_walk(tn, pbody.locals[l as usize].ty, 0, 0, -1, &mut walk, 0, pcx, -1);
     let n = walk.len() as i64 / 4;
     if n != slots_bound(l, pbody) {
         return;
     }
     for j in 0..n {
-        let b = walk[4 * j];
-        var target = 0;
+        let b = walk[(4 * j) as usize];
+        let mut target: i64 = 0;
         if b == B_STATIC {
             target = 1;
         } else if b == B_NAMED {
             for r in 1..region_count(pbody) + 1 {
                 if region_origin(r, pbody) == RO_UNIVERSAL && region_word(r, 0, pbody) == U_NAMED
-                    && region_word(r, 1, pbody) == walk[4 * j + 1] {
+                    && region_word(r, 1, pbody) == walk[(4 * j + 1) as usize] {
                     target = r;
                 }
             }
@@ -3007,17 +3148,18 @@ pub fn xform(c: i64, w: i64) -> i64 {
 
 // The variance table's index of the declaration of struct or enum type t
 // (its template's), or -1.
-fn decl_index(t: i64, pcx: Ctx<Comp>) -> i64 {
-    if pcx.types[t].kind == TyKind::Struct {
-        let s = pcx.types[t].a;
-        if pcx.structs[s].closure != 0 {
+fn decl_index(t: i64, pcx: &Ctx<Comp>) -> i64 {
+    if pcx.types[t as usize].kind == TyKind::Struct {
+        let s = pcx.types[t as usize].a;
+        if pcx.structs[s as usize].closure != 0 {
             return -1;
         }
-        return if pcx.structs[s].tmpl != 0 { pcx.structs[s].tmpl - 1 } else { s };
+        return if pcx.structs[s as usize].tmpl != 0 { pcx.structs[s as usize].tmpl - 1 } else { s };
     }
-    if pcx.types[t].kind == TyKind::Enum {
-        let e = enum_info(pcx.types[t].a, pcx);
-        return pcx.structs.len() as i64 + if e.tmpl != 0 { e.tmpl - 1 } else { pcx.types[t].a };
+    if pcx.types[t as usize].kind == TyKind::Enum {
+        let e = enum_info(pcx.types[t as usize].a, pcx);
+        return pcx.structs.len() as i64 + if e.tmpl != 0 { e.tmpl - 1 }
+            else { pcx.types[t as usize].a };
     }
     -1
 }
@@ -3025,7 +3167,7 @@ fn decl_index(t: i64, pcx: Ctx<Comp>) -> i64 {
 // The variance of declared parameter i (lifetimes first, then the type
 // parameters) of declaration d (decl_index's): invariant when it has no
 // entry (made after the table, or not walked).
-pub fn decl_variance(d: i64, i: i64, pcx: Ctx<Comp>) -> i64 {
+pub fn decl_variance(d: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
     if d < 0 || d >= pcx.variance_at.count {
         return V_INV;
     }
@@ -3035,73 +3177,74 @@ pub fn decl_variance(d: i64, i: i64, pcx: Ctx<Comp>) -> i64 {
 
 // RULE: D5.4 The variance of each slot of type t under context c, pushed
 // to out (parallel to t's slots).
-pub fn slot_variances(t: i64, c: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Comp>) {
-    slot_variances_in(t, c, 0, &out, pcx);
+pub fn slot_variances(t: i64, c: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
+    slot_variances_in(t, c, 0, out, pcx);
 }
 
-fn slot_variances_in(t: i64, c: i64, depth: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Comp>) {
+fn slot_variances_in(t: i64, c: i64, depth: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
     if t <= 0 || depth > 16 {
         return;
     }
-    let k = pcx.types[t].kind;
+    let k = pcx.types[t as usize].kind;
     if k == TyKind::Ptr {
         // RULE: D5.2 (`&'a T`: 'a +, T +; `&'a mut T`: T o; the one raw
         // `*T` of v0.27.0: o)
-        if is_ref_kind(pcx.types[t].b) {
+        if is_ref_kind(pcx.types[t as usize].b) {
             out.push(c);
-            let inner = if pcx.types[t].b == REF_MUT { xform(c, V_INV) } else { c };
-            slot_variances_in(pcx.types[t].a, inner, depth + 1, &out, pcx);
+            let inner = if pcx.types[t as usize].b == REF_MUT { xform(c, V_INV) } else { c };
+            slot_variances_in(pcx.types[t as usize].a, inner, depth + 1, out, pcx);
         } else {
-            slot_variances_in(pcx.types[t].a, xform(c, V_INV), depth + 1, &out, pcx);
+            slot_variances_in(pcx.types[t as usize].a, xform(c, V_INV), depth + 1, out, pcx);
         }
         return;
     }
-    if k == TyKind::Slice && pcx.types[t].b == REF_RAW {
+    if k == TyKind::Slice && pcx.types[t as usize].b == REF_RAW {
         // RULE: Z9.1, D5.2 (a fat raw pointer: no region of its own; its
         // pointee o, as a thin raw pointer's)
-        slot_variances_in(pcx.types[t].a, xform(c, V_INV), depth + 1, &out, pcx);
+        slot_variances_in(pcx.types[t as usize].a, xform(c, V_INV), depth + 1, out, pcx);
         return;
     }
     if k == TyKind::Slice {
         out.push(c);
-        let inner = if pcx.types[t].b == REF_MUT { xform(c, V_INV) } else { c };
-        slot_variances_in(pcx.types[t].a, inner, depth + 1, &out, pcx);
+        let inner = if pcx.types[t as usize].b == REF_MUT { xform(c, V_INV) } else { c };
+        slot_variances_in(pcx.types[t as usize].a, inner, depth + 1, out, pcx);
         return;
     }
     if k == TyKind::Unsized {
         // RULE: Z9.1c (0.27.4: the place: its element's, as slots_in)
-        let v = pcx.types[t].a;
-        let s = if pcx.types[v].kind == TyKind::Distinct { pcx.types[v].a } else { v };
-        slot_variances_in(pcx.types[s].a, c, depth + 1, &out, pcx);
+        let v = pcx.types[t as usize].a;
+        let s = if pcx.types[v as usize].kind == TyKind::Distinct { pcx.types[v as usize].a }
+            else { v };
+        slot_variances_in(pcx.types[s as usize].a, c, depth + 1, out, pcx);
         return;
     }
     if k == TyKind::Array || k == TyKind::Distinct {
-        slot_variances_in(pcx.types[t].a, c, depth + 1, &out, pcx);
+        slot_variances_in(pcx.types[t as usize].a, c, depth + 1, out, pcx);
         return;
     }
     if k == TyKind::Tuple {
-        for i in 0..pcx.types[t].count {
-            slot_variances_in(type_elem(t, i, pcx), c, depth + 1, &out, pcx);
+        for i in 0..pcx.types[t as usize].count {
+            slot_variances_in(type_elem(t, i, pcx), c, depth + 1, out, pcx);
         }
         return;
     }
-    if k == TyKind::Struct && pcx.structs[pcx.types[t].a].closure != 0 {
-        let s = pcx.types[t].a;
+    if k == TyKind::Struct && pcx.structs[pcx.types[t as usize].a as usize].closure != 0 {
+        let s = pcx.types[t as usize].a;
         for i in 0..struct_field_count(s, pcx) {
             if capture_ref(s, i, pcx) {
                 // (a by-reference capture: `&'c T` or `&'c mut T`, D10.2)
                 out.push(c);
                 let inner = if capture_mode(s, i, pcx) == 2 { xform(c, V_INV) } else { c };
-                slot_variances_in(pcx.types[struct_field_ty(s, i, pcx)].a, inner, depth + 1, &out,
-                    pcx);
+                slot_variances_in(pcx.types[struct_field_ty(s, i, pcx) as usize].a, inner,
+                    depth + 1, out, pcx);
                 continue;
             }
-            slot_variances_in(struct_field_ty(s, i, pcx), c, depth + 1, &out, pcx);
+            slot_variances_in(struct_field_ty(s, i, pcx), c, depth + 1, out, pcx);
         }
         // RULE: D19.1 (X_C: its variance in `fn(A..) -> R`)
-        let id = pcx.structs[s].closure - 1;
+        let id = pcx.structs[s as usize].closure - 1;
         for q in 0..xc_count(s, pcx) {
-            out.push(xform(c, pcx.capture_list.get(pcx.closures[id].xc_at + q)));
+            out.push(xform(c, pcx.capture_list.get(pcx.closures[id as usize].xc_at + q)));
         }
         return;
     }
@@ -3113,7 +3256,7 @@ fn slot_variances_in(t: i64, c: i64, depth: i64, out: inout Vec<i64, Comp>, pcx:
         }
         for i in 0..adt_targ_count(t, pcx) {
             slot_variances_in(adt_targ(t, i, pcx), xform(c, decl_variance(d, m + i, pcx)),
-                depth + 1, &out, pcx);
+                depth + 1, out, pcx);
         }
     }
 }
@@ -3123,14 +3266,14 @@ fn slot_variances_in(t: i64, c: i64, depth: i64, out: inout Vec<i64, Comp>, pcx:
 // (each starts bivariant); a parameter of a rust-edition type left
 // bivariant is error borrowck.unused_param. Once a program, before its
 // bodies (run_places, a rust-edition program's).
-pub fn variance_table(pcx: inout Ctx<Comp>) {
+pub fn variance_table(pcx: &mut Ctx<Comp>) {
     let ns = pcx.structs.len() as i64;
     let total = ns + pcx.enum_count;
     pcx.variance_at.count = 0;
     pcx.variances.count = 0;
     // (a generic declaration is walked with an instance's field types, the
     // first one's: they resolve the names of its fields' types)
-    var inst: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut inst: Vec<i64, Comp> = Vec::new_in(Comp {});
     for _ in 0..total {
         inst.push(-1);
     }
@@ -3138,8 +3281,8 @@ pub fn variance_table(pcx: inout Ctx<Comp>) {
         let (_, tmpl, closure) = decl_record(d, pcx);
         if tmpl != 0 && !closure {
             let td = if d < ns { tmpl - 1 } else { ns + tmpl - 1 };
-            if td >= 0 && td < total && inst[td] < 0 {
-                inst[td] = d;
+            if td >= 0 && td < total && inst[td as usize] < 0 {
+                inst[td as usize] = d;
             }
         }
     }
@@ -3152,8 +3295,8 @@ pub fn variance_table(pcx: inout Ctx<Comp>) {
     for d in 0..total {
         let (node, tmpl, closure) = decl_record(d, pcx);
         if tmpl != 0 || closure || node <= 0
-            || !whole && inst[d] < 0 && decl_type_params(node, pcx) > 0
-            && !crate::front::conv::user_at(pcx.nodes[node].start, &pcx) {
+            || !whole && inst[d as usize] < 0 && decl_type_params(node, pcx) > 0
+            && !crate::front::conv::user_at(pcx.nodes[node as usize].start, pcx) {
             pcx.variance_at.push(-1);
             continue;
         }
@@ -3167,16 +3310,16 @@ pub fn variance_table(pcx: inout Ctx<Comp>) {
             pcx.variances.push(V_BI);
         }
     }
-    var changed = true;
-    var rounds = 0;
+    let mut changed = true;
+    let mut rounds: i64 = 0;
     while changed && rounds < 64 {
         changed = false;
         rounds += 1;
         for d in 0..total {
             if pcx.variance_at.get(d) >= 0 {
-                let typed = if decl_type_params(decl_record(d, pcx).0, pcx) > 0 { inst[d] }
+                let typed = if decl_type_params(decl_record(d, pcx).0, pcx) > 0 { inst[d as usize] }
                     else { d };
-                if walk_decl(d, typed, &pcx) {
+                if walk_decl(d, typed, pcx) {
                     changed = true;
                 }
             }
@@ -3185,9 +3328,9 @@ pub fn variance_table(pcx: inout Ctx<Comp>) {
     let out = buf_new();
     for d in 0..total {
         if pcx.variance_at.get(d) >= 0 {
-            unused_params(d, &pcx);
+            unused_params(d, pcx);
             if pcx.emit_places > 0 {
-                buf_variance(out, d, &pcx);
+                buf_variance(out, d, pcx);
             }
         }
     }
@@ -3196,23 +3339,21 @@ pub fn variance_table(pcx: inout Ctx<Comp>) {
 
 // (--emit-places) Declaration d's variances, a rust-edition one's: `variance
 // W: 'a +, T o` (D5.1's signs, `*` bivariant).
-fn buf_variance(out: i64, d: i64, pcx: inout Ctx<Comp>) {
+fn buf_variance(out: i64, d: i64, pcx: &mut Ctx<Comp>) {
     let node = decl_record(d, pcx).0;
-    if !crate::front::rust::rust_at(pcx.nodes[node].start, &pcx) {
-        return;
-    }
     buf_str(out, c"variance ");
-    crate::base::buf_bytes(out, sym_text(pcx.nodes[node].a, pcx));
+    crate::base::buf_bytes(out, sym_text(pcx.nodes[node as usize].a, pcx));
     buf_str(out, c":");
     let lts = lifetimes_of(node, pcx);
     let m = decl_lifetimes(node, pcx);
     for i in 0..m + decl_type_params(node, pcx) {
-        let pn = if i < m { child(lts, i, pcx) } else { child(pcx.nodes[node].g, i - m, pcx) };
+        let pn = if i < m { child(lts, i, pcx) }
+            else { child(pcx.nodes[node as usize].g, i - m, pcx) };
         buf_str(out, if i == 0 { c" " } else { c", " });
         if i < m {
             buf_str(out, c"'");
         }
-        crate::base::buf_bytes(out, sym_text(pcx.nodes[pn].a, pcx));
+        crate::base::buf_bytes(out, sym_text(pcx.nodes[pn as usize].a, pcx));
         let v = decl_variance(d, i, pcx);
         buf_str(out, if v == V_CO { c" +" } else if v == V_CONTRA { c" -" }
             else if v == V_INV { c" o" } else { c" *" });
@@ -3222,10 +3363,11 @@ fn buf_variance(out: i64, d: i64, pcx: inout Ctx<Comp>) {
 
 // Declaration d's (variance table index) node, template (+1) and whether
 // it is a closure's env.
-fn decl_record(d: i64, pcx: Ctx<Comp>) -> (i64, i64, bool) {
+fn decl_record(d: i64, pcx: &Ctx<Comp>) -> (i64, i64, bool) {
     let ns = pcx.structs.len() as i64;
     if d < ns {
-        return (pcx.structs[d].node, pcx.structs[d].tmpl, pcx.structs[d].closure != 0);
+        return (pcx.structs[d as usize].node, pcx.structs[d as usize].tmpl,
+            pcx.structs[d as usize].closure != 0);
     }
     let e = enum_info(d - ns, pcx);
     (e.node, e.tmpl, false)
@@ -3234,17 +3376,17 @@ fn decl_record(d: i64, pcx: Ctx<Comp>) -> (i64, i64, bool) {
 // One round of D5.3 over declaration d's fields (their types read with
 // declaration `typed`'s, an instance's, -1: none): whether a variance
 // changed.
-fn walk_decl(d: i64, typed: i64, pcx: inout Ctx<Comp>) -> bool {
+fn walk_decl(d: i64, typed: i64, pcx: &mut Ctx<Comp>) -> bool {
     let ns = pcx.structs.len() as i64;
     let node = decl_record(d, pcx).0;
-    var changed = false;
+    let mut changed = false;
     if d < ns {
-        for k in 0..pcx.nodes[node].count {
+        for k in 0..pcx.nodes[node as usize].count {
             let field = child(node, k, pcx);
-            let ft = if typed >= 0
+            let ft: i64 = if typed >= 0
                 && k < struct_field_count(typed, pcx) { struct_field_ty(typed, k, pcx) }
                 else { 0 };
-            if var_walk(pcx.nodes[field].b, ft, V_CO, d, node, 0, &pcx) {
+            if var_walk(pcx.nodes[field as usize].b, ft, V_CO, d, node, 0, pcx) {
                 changed = true;
             }
         }
@@ -3252,16 +3394,17 @@ fn walk_decl(d: i64, typed: i64, pcx: inout Ctx<Comp>) -> bool {
     }
     // (an enum: every variant's fields; the typed instance's variants are
     // in the same order)
-    let first = if typed >= 0 { enum_info(typed - ns, pcx).variants } else { -1 };
-    for i in 0..pcx.nodes[node].count {
+    let first: i64 = if typed >= 0 { enum_info(typed - ns, pcx).variants } else { -1 };
+    for i in 0..pcx.nodes[node as usize].count {
         let vn = child(node, i, pcx);
-        for k in 0..pcx.nodes[vn].count {
+        for k in 0..pcx.nodes[vn as usize].count {
             let f = child(vn, k, pcx);
-            let fast = if is_node(f, NodeKind::Field, pcx) { pcx.nodes[f].b } else { f };
-            let ft = if first >= 0 && k < crate::places::ir::variant_field_count(first + i, pcx) {
+            let fast = if is_node(f, NodeKind::Field, pcx) { pcx.nodes[f as usize].b } else { f };
+            let ft: i64 = if first >= 0
+                && k < crate::places::ir::variant_field_count(first + i, pcx) {
                 variant_field(first + i, k, pcx)
             } else { 0 };
-            if var_walk(fast, ft, V_CO, d, node, 0, &pcx) {
+            if var_walk(fast, ft, V_CO, d, node, 0, pcx) {
                 changed = true;
             }
         }
@@ -3271,7 +3414,7 @@ fn walk_decl(d: i64, typed: i64, pcx: inout Ctx<Comp>) -> bool {
 
 // Parameter i of declaration d (node dn) occurs at context c: its
 // variance met with c; whether it changed.
-fn meet(d: i64, i: i64, c: i64, pcx: inout Ctx<Comp>) -> bool {
+fn meet(d: i64, i: i64, c: i64, pcx: &mut Ctx<Comp>) -> bool {
     let at = pcx.variance_at.get(d) + i;
     let old = pcx.variances.get(at);
     if (old | c) == old {
@@ -3280,119 +3423,121 @@ fn meet(d: i64, i: i64, c: i64, pcx: inout Ctx<Comp>) -> bool {
     // UNSAFE: IntVec's words are its raw data (it has no setter)
     // SAFETY: at is below variances.count: d's entry has its parameters'
     // count of words, and i is one of them
-    unsafe { pcx.variances.data[at] = old | c; }
+    unsafe { (*pcx.variances.data.add(at as usize)) = old | c; }
     true
 }
 
 // A lifetime written as sym at context c, in declaration d's (node dn)
 // fields.
-fn lifetime_at(sym: i64, c: i64, d: i64, dn: i64, pcx: inout Ctx<Comp>) -> bool {
+fn lifetime_at(sym: i64, c: i64, d: i64, dn: i64, pcx: &mut Ctx<Comp>) -> bool {
     let i = lifetime_index(lifetimes_of(dn, pcx), sym, pcx);
-    i >= 0 && meet(d, i, c, &pcx)
+    i >= 0 && meet(d, i, c, pcx)
 }
 
 // The walk of a field's type node n (with its checker type t, 0: unknown)
 // at context c, for declaration d (node dn): D5.2's constructors, D5.3's
 // user types (their variance as it is so far).
-fn var_walk(n: i64, t: i64, c: i64, d: i64, dn: i64, depth: i64, pcx: inout Ctx<Comp>) -> bool {
+fn var_walk(n: i64, t: i64, c: i64, d: i64, dn: i64, depth: i64, pcx: &mut Ctx<Comp>) -> bool {
     if n <= 0 || c == V_BI || depth > 16 {
         return false;
     }
-    let k = pcx.nodes[n].kind;
-    let tk = if t > 0 { pcx.types[t].kind } else { TyKind::None };
-    var changed = false;
+    let k = pcx.nodes[n as usize].kind;
+    let tk = if t > 0 { pcx.types[t as usize].kind } else { TyKind::None };
+    let mut changed = false;
     if k == NodeKind::TyPtr {
-        let inner_t = if tk == TyKind::Ptr { pcx.types[t].a } else { 0 };
-        var inner = c;
-        if (pcx.nodes[n].p & NODE_REF) != 0 {
-            changed = lifetime_at(pcx.nodes[n].c, c, d, dn, &pcx);
-            if (pcx.nodes[n].p & NODE_REF_MUT) != 0 {
+        let inner_t: i64 = if tk == TyKind::Ptr { pcx.types[t as usize].a } else { 0 };
+        let mut inner = c;
+        if (pcx.nodes[n as usize].p & NODE_REF) != 0 {
+            changed = lifetime_at(pcx.nodes[n as usize].c, c, d, dn, pcx);
+            if (pcx.nodes[n as usize].p & NODE_REF_MUT) != 0 {
                 inner = xform(c, V_INV);
             }
-        } else if pcx.nodes[n].c == 2 {
+        } else if pcx.nodes[n as usize].c == 2 {
             // (`*mut T`: o; `*const T`, and MVS's `*T`, an owner's pointer
             // in std's containers: +)
             inner = xform(c, V_INV);
         }
-        return var_walk(pcx.nodes[n].a, inner_t, inner, d, dn, depth + 1, &pcx) || changed;
+        return var_walk(pcx.nodes[n as usize].a, inner_t, inner, d, dn, depth + 1, pcx) || changed;
     }
     if k == NodeKind::TySlice {
-        changed = lifetime_at(pcx.nodes[n].c, c, d, dn, &pcx);
-        let inner = if (pcx.nodes[n].p & NODE_REF_MUT) != 0 { xform(c, V_INV) } else { c };
-        let inner_t = if tk == TyKind::Slice { pcx.types[t].a } else { 0 };
-        return var_walk(pcx.nodes[n].a, inner_t, inner, d, dn, depth + 1, &pcx) || changed;
+        changed = lifetime_at(pcx.nodes[n as usize].c, c, d, dn, pcx);
+        let inner = if (pcx.nodes[n as usize].p & NODE_REF_MUT) != 0 { xform(c, V_INV) } else { c };
+        let inner_t: i64 = if tk == TyKind::Slice { pcx.types[t as usize].a } else { 0 };
+        return var_walk(pcx.nodes[n as usize].a, inner_t, inner, d, dn, depth + 1, pcx) || changed;
     }
     if k == NodeKind::TyArray {
-        let inner_t = if tk == TyKind::Array { pcx.types[t].a } else { 0 };
-        return var_walk(pcx.nodes[n].a, inner_t, c, d, dn, depth + 1, &pcx);
+        let inner_t: i64 = if tk == TyKind::Array { pcx.types[t as usize].a } else { 0 };
+        return var_walk(pcx.nodes[n as usize].a, inner_t, c, d, dn, depth + 1, pcx);
     }
     if k == NodeKind::TyTuple {
-        for i in 0..pcx.nodes[n].count {
-            let et = if tk == TyKind::Tuple && i < pcx.types[t].count { type_elem(t, i, pcx) }
+        for i in 0..pcx.nodes[n as usize].count {
+            let et: i64 = if tk == TyKind::Tuple
+                && i < pcx.types[t as usize].count { type_elem(t, i, pcx) }
                 else { 0 };
-            if var_walk(child(n, i, pcx), et, c, d, dn, depth + 1, &pcx) {
+            if var_walk(child(n, i, pcx), et, c, d, dn, depth + 1, pcx) {
                 changed = true;
             }
         }
         return changed;
     }
     if k == NodeKind::TyFn {
-        for i in 0..pcx.nodes[n].count {
-            if var_walk(child(n, i, pcx), 0, xform(c, V_CONTRA), d, dn, depth + 1, &pcx) {
+        for i in 0..pcx.nodes[n as usize].count {
+            if var_walk(child(n, i, pcx), 0, xform(c, V_CONTRA), d, dn, depth + 1, pcx) {
                 changed = true;
             }
         }
-        return var_walk(pcx.nodes[n].a, 0, c, d, dn, depth + 1, &pcx) || changed;
+        return var_walk(pcx.nodes[n as usize].a, 0, c, d, dn, depth + 1, pcx) || changed;
     }
     if k != NodeKind::TyName {
         return false;
     }
-    let sym = pcx.nodes[n].a;
+    let sym = pcx.nodes[n as usize].a;
     let m = decl_lifetimes(dn, pcx);
-    if pcx.nodes[n].list == 0 && pcx.nodes[n].g == 0 {
-        let i = param_index(pcx.nodes[dn].g, sym, pcx);
+    if pcx.nodes[n as usize].list == 0 && pcx.nodes[n as usize].g == 0 {
+        let i = param_index(pcx.nodes[dn as usize].g, sym, pcx);
         if i >= 0 {
-            return meet(d, m + i, c, &pcx);
+            return meet(d, m + i, c, pcx);
         }
-        if sym_text(sym, pcx) == "str" {
-            return lifetime_at(pcx.nodes[n].c, c, d, dn, &pcx);
+        if sym_text(sym, pcx) == b"str" {
+            return lifetime_at(pcx.nodes[n as usize].c, c, d, dn, pcx);
         }
     }
     // RULE: D5.3 (a projection of a parameter, `U::IntoIter`: U is used,
     // invariant there, as rustc reads it)
-    if pcx.nodes[n].list != 0 && pcx.nodes[n].count > 0 {
+    if pcx.nodes[n as usize].list != 0 && pcx.nodes[n as usize].count > 0 {
         let first = child(n, 0, pcx);
-        let i = if pcx.nodes[first].kind == NodeKind::Ident {
-            param_index(pcx.nodes[dn].g, pcx.nodes[first].a, pcx)
+        let i: i64 = if pcx.nodes[first as usize].kind == NodeKind::Ident {
+            param_index(pcx.nodes[dn as usize].g, pcx.nodes[first as usize].a, pcx)
         } else { -1 };
         if i >= 0 {
-            return meet(d, m + i, xform(c, V_INV), &pcx);
+            return meet(d, m + i, xform(c, V_INV), pcx);
         }
     }
     // a constructor applied: its parameters' variance, D5.2's or as its
     // declaration's is so far; unknown (no checker type): invariant
     let name = sym_text(sym, pcx);
-    let cell = name == "Cell" || name == "UnsafeCell" || name == "RefCell";
-    let phantom = name == "PhantomData";
-    let dd = if t > 0 && (tk == TyKind::Struct || tk == TyKind::Enum) { decl_index(t, pcx) }
+    let cell = name == b"Cell" || name == b"UnsafeCell" || name == b"RefCell";
+    let phantom = name == b"PhantomData";
+    let dd: i64 = if t > 0 && (tk == TyKind::Struct || tk == TyKind::Enum) { decl_index(t, pcx) }
         else { -1 };
-    let dm = if dd >= 0 { decl_lifetimes(adt_node(t, pcx), pcx) } else { 0 };
+    let dm: i64 = if dd >= 0 { decl_lifetimes(adt_node(t, pcx), pcx) } else { 0 };
     let lts = lifetimes_of(n, pcx);
     if lts > 0 {
-        for i in 0..pcx.nodes[lts].count {
+        for i in 0..pcx.nodes[lts as usize].count {
             let w = if dd >= 0 { decl_variance(dd, i, pcx) } else { V_INV };
-            if lifetime_at(pcx.nodes[child(lts, i, pcx)].a, xform(c, w), d, dn, &pcx) {
+            if lifetime_at(pcx.nodes[child(lts, i, pcx) as usize].a, xform(c, w), d, dn, pcx) {
                 changed = true;
             }
         }
     }
-    let args = pcx.nodes[n].g;
+    let args = pcx.nodes[n as usize].g;
     if args > 0 {
-        for i in 0..pcx.nodes[args].count {
+        for i in 0..pcx.nodes[args as usize].count {
             let w = if phantom { V_CO } else if cell { V_INV }
                 else if dd >= 0 { decl_variance(dd, dm + i, pcx) } else { V_INV };
-            let at = if dd >= 0 && i < adt_targ_count(t, pcx) { adt_targ(t, i, pcx) } else { 0 };
-            if var_walk(child(args, i, pcx), at, xform(c, w), d, dn, depth + 1, &pcx) {
+            let at: i64 = if dd >= 0 && i < adt_targ_count(t, pcx) { adt_targ(t, i, pcx) }
+                else { 0 };
+            if var_walk(child(args, i, pcx), at, xform(c, w), d, dn, depth + 1, pcx) {
                 changed = true;
             }
         }
@@ -3402,15 +3547,12 @@ fn var_walk(n: i64, t: i64, c: i64, d: i64, dn: i64, depth: i64, pcx: inout Ctx<
 
 // RULE: D5.3 error borrowck.unused_param for each parameter of
 // declaration d, a rust-edition one, its fields never name (rustc E0392).
-fn unused_params(d: i64, pcx: inout Ctx<Comp>) {
+fn unused_params(d: i64, pcx: &mut Ctx<Comp>) {
     let node = decl_record(d, pcx).0;
-    if !crate::front::rust::rust_at(pcx.nodes[node].start, &pcx) {
-        return;
-    }
     // (the known item phantom_data, std2's PhantomData: built in, its
     // parameter the marker's; rustc's is a lang item)
-    if sym_text(pcx.nodes[node].a, pcx) == "PhantomData" {
-        let key = crate::front::known::std2_key(pcx.nodes[node].a, &pcx);
+    if sym_text(pcx.nodes[node as usize].a, pcx) == b"PhantomData" {
+        let key = crate::front::known::std2_key(pcx.nodes[node as usize].a, pcx);
         if key >= 0 && crate::front::types::item_node_of(key, pcx) == node {
             return;
         }
@@ -3421,20 +3563,22 @@ fn unused_params(d: i64, pcx: inout Ctx<Comp>) {
         if decl_variance(d, i, pcx) != V_BI {
             continue;
         }
-        let pn = if i < m { child(lts, i, pcx) } else { child(pcx.nodes[node].g, i - m, pcx) };
+        let pn = if i < m { child(lts, i, pcx) }
+            else { child(pcx.nodes[node as usize].g, i - m, pcx) };
         let saved = pcx.err_kind;
         pcx.err_kind = c"borrowck.unused_param";
-        crate::base::diag::err_begin(pcx.nodes[pn].start, &pcx);
+        crate::base::diag::err_begin(pcx.nodes[pn as usize].start, pcx);
         crate::base::diag::err_fmt(
             format_args("the parameter '{}' of '{}' is never used in its fields",
-                sym_text(pcx.nodes[pn].a, pcx), sym_text(pcx.nodes[node].a, pcx)),
+                str::from_utf8(sym_text(pcx.nodes[pn as usize].a, pcx)).unwrap(),
+                str::from_utf8(sym_text(pcx.nodes[node as usize].a, pcx)).unwrap()),
             pcx);
         crate::base::diag::err_help(if i < m {
             c"use it in a field, or add a field `PhantomData<&'a ()>` (rustc E0392)"
         } else {
             c"use it in a field, or add a field `PhantomData<T>` (rustc E0392)"
         }, pcx);
-        crate::base::diag::err_end_soft(&pcx);
+        crate::base::diag::err_end_soft(pcx);
         pcx.err_kind = saved;
     }
 }

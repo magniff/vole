@@ -31,40 +31,43 @@ differences.
 - `-O2` does them all. It's the default, so `volec prog.vl -o prog`
   already means `-O2`.
 
-Every level gives the same results. This is a direct consequence of
-safe vole having no undefined behaviour (chapter 15): in languages
-where some programs are "undefined", the optimizer is allowed to
-assume they never happen, and a program with a hidden bug can behave
-differently at `-O2` than at `-O0`. In vole, integer overflow wraps,
-an index is either checked or proven in range, and nothing else is
-left for the optimizer to assume. Turning optimization up changes how
-fast the program runs, never what it prints. `volec test` relies on this:
-it builds your tests at both `-O0` and `-O2` and compares the results.
+Every level gives the same results, with the one exception chapter 3
+showed: an integer overflow stops a `-O0` build and wraps in an
+optimized one (`--overflow-checks=on` or `off` makes them agree). This
+is a direct consequence of safe vole having no undefined behaviour
+(chapter 15): in languages where some programs are "undefined", the
+optimizer is allowed to assume they never happen, and a program with a
+hidden bug can behave differently at `-O2` than at `-O0`. In vole, an
+index is either checked or proven in range, and nothing is left for the
+optimizer to assume. Turning optimization up changes how fast the
+program runs, not what it prints. `volec test` relies on this: it
+builds your tests at both `-O0` and `-O2` and compares the results.
 
 ## Measuring
 
 Here's our starting point. Save it as `lines.vl`:
 
 ```vole lines.vl
-use std::{env, time};
+use std::env;
+use std::time::{Duration, Instant};
 
 // n bytes of made-up text: letters, spaces, and a newline now and then.
 fn make_text(n: usize, gpa: Gpa) -> Vec<u8, Gpa> {
-    var v: Vec<u8, Gpa> = Vec::with_capacity_in(n, gpa);
-    var x: u64 = 0x9e3779b97f4a7c15;
+    let mut v: Vec<u8, Gpa> = Vec::with_capacity_in(n, gpa);
+    let mut x: u64 = 0x9e3779b97f4a7c15;
     for _ in 0..n {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
         let r = x % 64;
-        v.push(if r == 0 { '\n' } else if r < 10 { ' ' } else { 'a' + (r % 26) as u8 });
+        v.push(if r == 0 { b'\n' } else if r < 10 { b' ' } else { b'a' + (r % 26) as u8 });
     }
     v
 }
 
 // How many times b occurs in s, a byte at a time.
-fn count_loop(s: [u8], b: u8) -> usize {
-    var n: usize = 0;
+fn count_loop(s: &[u8], b: u8) -> usize {
+    let mut n = 0;
     for i in 0..s.len() {
         if s[i] == b {
             n += 1;
@@ -74,34 +77,33 @@ fn count_loop(s: [u8], b: u8) -> usize {
 }
 
 // The same, as an iterator chain.
-fn count_iter(s: [u8], b: u8) -> usize {
-    s.iter().filter(|c| c == b).count()
+fn count_iter(s: &[u8], b: u8) -> usize {
+    s.iter().filter(|c| **c == b).count()
 }
 
 // Runs f on s five times; prints its result and the fastest time.
-fn time_it(name: str, f: fn([u8], u8) -> usize, s: [u8]) {
-    var best = time::Duration::max_value();
-    var result: usize = 0;
+fn time_it(name: &str, f: fn(&[u8], u8) -> usize, s: &[u8]) {
+    let mut best = Duration::MAX;
+    let mut result = 0;
     for _ in 0..5 {
-        let start = time::monotonic_now();
-        result = f(s, '\n');
-        let took = time::monotonic_now().abs_diff(start);
-        if took.cmp(best) < 0 {
+        let start = Instant::now();
+        result = f(s, b'\n');
+        let took = start.elapsed();
+        if took < best {
             best = took;
         }
     }
-    println("{name:<5} {result} lines in {:.1} ms", best.as_millis_f64());
+    println("{name:<5} {result} lines in {:.1} ms", best.as_secs_f64() * 1000.0);
 }
 
 fn main(gpa: Gpa) {
     let size: usize = 64 << 20; // 64 MiB
     let text = make_text(size, gpa);
-    let s = text.as_slice();
     if env::args().len() > 1 {
-        time_it("loop", count_loop, s);
-        time_it("iter", count_iter, s);
+        time_it("loop", count_loop, &text);
+        time_it("iter", count_iter, &text);
     } else {
-        println("{} {}", count_loop(s, '\n'), count_iter(s, '\n'));
+        println("{} {}", count_loop(&text, b'\n'), count_iter(&text, b'\n'));
     }
 }
 ```
@@ -118,9 +120,9 @@ the two versions agree:
 matters: a benchmark over a file of one repeated line can measure
 something quite different from real text.
 
-Timing is `time_it`'s job. `time::monotonic_now()` reads a clock that
-only moves forward, as a `Duration`; the difference of two readings,
-`abs_diff`, is how long the work in between took. A few habits make the
+Timing is `time_it`'s job. `Instant::now()` reads a clock that only
+moves forward, and `start.elapsed()` is the time since that reading, a
+`Duration`: how long the work in between took. A few habits make the
 numbers worth having:
 
 - **Repeat, and keep the fastest.** The first run pays for things the
@@ -140,28 +142,29 @@ Here's a run on one machine (an Apple M-series laptop, at the default
 
 ```text
 $ ./lines time
-loop  1046799 lines in 25.1 ms
-iter  1046799 lines in 30.7 ms
+loop  1046799 lines in 10.3 ms
+iter  1046799 lines in 31.6 ms
 ```
 
-That's about 2.7 GB a second: each byte is loaded, compared and
-counted in well under a nanosecond. The difference between the two is
-within the noise on this machine, which was busy with other work:
-run it again and the order can flip.
+The loop goes through about 6 GB a second: each byte is loaded,
+compared and counted in a fraction of a nanosecond. The chain is three
+times slower here, on a machine that was busy with other work. That
+isn't the price of an iterator: chapter 10's chain ran as fast as its
+loop. It's this release's optimizer, which gets more out of the index
+loop than out of `filter(..).count()`; we'll see how in a moment.
 
 ## What's cheap, and what isn't
 
-The two versions run at the same speed, give or take the noise,
-because they compile to the same machine code (we'll look at it in a
-moment). That's worth knowing, because it's true of a lot of
-vole:
+A lot of what looks expensive in vole isn't:
 
 - **Iterator chains** like `s.iter().filter(..).count()` (chapter 10)
   are inlined into plain loops; the closure disappears into the loop
-  body.
+  body. What the optimizer then makes of that loop can differ from the
+  hand-written one, as it just did, so measure the ones that matter.
 - **Generic functions** are compiled once for each type they're used
-  with (chapter 9), so a `Vec<u8>` method runs code written for `u8`.
-- **Views** (chapter 4) are a pointer and a length: passing `s` to
+  with (chapter 9), so a `Vec<u8, Gpa>` method runs code written for
+  `u8`.
+- **Slices** (chapter 4) are a pointer and a length: passing `&text` to
   `count_loop` copies 16 bytes, not 64 MiB.
 - **Plain values**, numbers and small structs, live in registers.
 - **Dropping** a value is decided at compile time: there's no garbage
@@ -182,7 +185,7 @@ What does cost:
   from unrolling or vectorizing a loop. We'll see below how to
   find the ones that remain.
 - **Calls the compiler can't see through**: calls through a `fn`
-  value, like `time_it`'s `f(s, '\n')`, and calls into C.
+  value, like `time_it`'s `f(s, b'\n')`, and calls into C.
 
 ## Looking at the output
 
@@ -223,7 +226,9 @@ There's no branch on the byte either: `csel` picks 1 or 0 without
 jumping, so a random mix of letters and newlines costs the same as any
 other. And the loop handles four bytes per round, with four separate
 counts, so the processor can work on them in parallel. Look at
-`_vole.count_iter` and you'll find the same loop.
+`_vole.count_iter` and you'll find, in this release, a longer loop
+that takes one byte per round and branches on it: that is where its
+time goes.
 
 `--emit-ir` prints the compiler's own intermediate form after
 optimization, one block of instructions per function, for every
@@ -240,8 +245,8 @@ and it removes the check. Here's a function where it can't. Save it as `window.v
 ```vole window.vl
 // How many times b occurs in v[lo..hi].
 #[inline(never)]
-fn count_window(v: Vec<u8, Gpa>, lo: usize, hi: usize, b: u8) -> i64 {
-    var n = 0;
+fn count_window(v: &Vec<u8, Gpa>, lo: usize, hi: usize, b: u8) -> i64 {
+    let mut n = 0;
     for i in lo..hi {
         if v[i] == b {
             n += 1;
@@ -251,11 +256,9 @@ fn count_window(v: Vec<u8, Gpa>, lo: usize, hi: usize, b: u8) -> i64 {
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<u8, Gpa> = Vec::new_in(gpa);
-    for c in "one\ntwo\nthree\nfour\n" {
-        v.push(c);
-    }
-    println("{} {}", count_window(v, 0, 8, '\n'), count_window(v, 8, v.len(), '\n'));
+    let mut v: Vec<u8, Gpa> = Vec::new_in(gpa);
+    v.extend_from_slice(b"one\ntwo\nthree\nfour\n");
+    println("{} {}", count_window(&v, 0, 8, b'\n'), count_window(&v, 8, v.len(), b'\n'));
 }
 ```
 
@@ -284,10 +287,10 @@ a window that's inside `v`. Chapter 13 showed how to say that, with a
 ```vole window.vl
 // How many times b occurs in v[lo..hi].
 #[inline(never)]
-fn count_window(v: Vec<u8, Gpa>, lo: usize, hi: usize, b: u8) -> i64
+fn count_window(v: &Vec<u8, Gpa>, lo: usize, hi: usize, b: u8) -> i64
     requires lo <= hi && hi <= v.len()
 {
-    var n = 0;
+    let mut n = 0;
     for i in lo..hi {
         if v[i] == b {
             n += 1;
@@ -297,11 +300,9 @@ fn count_window(v: Vec<u8, Gpa>, lo: usize, hi: usize, b: u8) -> i64
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<u8, Gpa> = Vec::new_in(gpa);
-    for c in "one\ntwo\nthree\nfour\n" {
-        v.push(c);
-    }
-    println("{} {}", count_window(v, 0, 8, '\n'), count_window(v, 8, v.len(), '\n'));
+    let mut v: Vec<u8, Gpa> = Vec::new_in(gpa);
+    v.extend_from_slice(b"one\ntwo\nthree\nfour\n");
+    println("{} {}", count_window(&v, 0, 8, b'\n'), count_window(&v, 8, v.len(), b'\n'));
 }
 ```
 
@@ -325,7 +326,7 @@ you meant.
 
 The analysis that removes checks has limits, and they change between
 releases. In this release, for example, the same function taking a
-`[u8]` slice instead of a `Vec<u8>` keeps its check. So don't guess:
+`&[u8]` slice instead of a `&Vec<u8, Gpa>` keeps its check. So don't guess:
 when a loop matters, ask `query checks`.
 
 > **If you know C:** there's no `-ffast-math` and no optimization based
@@ -344,8 +345,8 @@ on all sixteen *lanes* at once:
 
 ```vole simd.vl
 // How many times b occurs in s, a byte at a time.
-fn count_loop(s: [u8], b: u8) -> usize {
-    var n: usize = 0;
+fn count_loop(s: &[u8], b: u8) -> usize {
+    let mut n = 0;
     for i in 0..s.len() {
         if s[i] == b {
             n += 1;
@@ -355,22 +356,22 @@ fn count_loop(s: [u8], b: u8) -> usize {
 }
 
 // The same, 16 bytes at a time.
-fn count_simd(s: [u8], b: u8) -> usize {
+fn count_simd(s: &[u8], b: u8) -> usize {
     let needle = v16u8::splat(b);
     let one = v16u8::splat(1);
-    var n: usize = 0;
-    var i: usize = 0;
+    let mut n: usize = 0;
+    let mut i: usize = 0;
     while i + 16 <= s.len() {
         let eq = v16u8::load(s, i as i64) == needle; // 0xff where equal, else 0
         n += (eq & one).sum() as usize;
         i += 16;
     }
-    n + count_loop(s[i..s.len()], b)
+    n + count_loop(&s[i..], b)
 }
 
 fn main() {
-    let text = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
-    println("{} {}", count_loop(text, '\n'), count_simd(text, '\n'));
+    let text: &[u8] = b"one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
+    println("{} {}", count_loop(text, b'\n'), count_simd(text, b'\n'));
 }
 ```
 
@@ -401,13 +402,13 @@ before:
 
 ```text
 $ ./lines time
-loop  1046799 lines in 25.1 ms
-iter  1046799 lines in 30.7 ms
-simd  1046799 lines in 2.3 ms
+loop  1046799 lines in 10.3 ms
+iter  1046799 lines in 31.6 ms
+simd  1046799 lines in 2.1 ms
 ```
 
-About ten times faster on this machine, from a function a dozen lines
-long. That's not the limit (summing the lanes on every round is wasted
+About five times faster than the loop on this machine, from a function
+a dozen lines long. That's not the limit (summing the lanes on every round is wasted
 work, and a good implementation keeps sixteen counts in a vector and
 adds them up only now and then), but it's typical of what SIMD gives a
 simple byte loop.
@@ -425,16 +426,16 @@ checksum, a byte at a time, in one instruction. Save this as `crc.vl` (on macOS:
 use std::arch::aarch64::__crc32cb;
 
 // CRC-32C of s, a byte at a time, by the CPU's crc instruction.
-fn crc32c_hw(s: [u8]) -> u32 {
-    var c: u32 = 0xffffffff;
-    for b in s {
+fn crc32c_hw(s: &[u8]) -> u32 {
+    let mut c: u32 = 0xffffffff;
+    for &b in s {
         c = __crc32cb(c, b);
     }
-    ~c
+    !c
 }
 
 fn main() {
-    println("{:08x}", crc32c_hw("123456789"));
+    println("{:08x}", crc32c_hw(b"123456789"));
 }
 ```
 
@@ -471,32 +472,32 @@ use std::arch::detect;
 use std::arch::aarch64::__crc32cb;
 
 // CRC-32C of s, a byte at a time, by the CPU's crc instruction.
-fn crc32c_hw(s: [u8]) -> u32 {
-    var c: u32 = 0xffffffff;
-    for b in s {
+fn crc32c_hw(s: &[u8]) -> u32 {
+    let mut c: u32 = 0xffffffff;
+    for &b in s {
         c = __crc32cb(c, b);
     }
-    ~c
+    !c
 }
 
 // The same, bit by bit: for CPUs without crc.
-fn crc32c_portable(s: [u8]) -> u32 {
-    var c: u32 = 0xffffffff;
-    for b in s {
+fn crc32c_portable(s: &[u8]) -> u32 {
+    let mut c: u32 = 0xffffffff;
+    for &b in s {
         c ^= b as u32;
         for _ in 0..8 {
             c = if (c & 1) != 0 { (c >> 1) ^ 0x82f63b78 } else { c >> 1 };
         }
     }
-    ~c
+    !c
 }
 
-fn crc32c(s: [u8]) -> u32 {
+fn crc32c(s: &[u8]) -> u32 {
     if detect("crc") { crc32c_hw(s) } else { crc32c_portable(s) }
 }
 
 fn main() {
-    println("{:08x} (crc: {})", crc32c("123456789"), detect("crc"));
+    println("{:08x} (crc: {})", crc32c(b"123456789"), detect("crc"));
 }
 ```
 
@@ -564,12 +565,13 @@ vole compiler itself.
 
 ## Summary
 
-- `-O0`, `-O1` and `-O2` (the default) give the same results; only the
-  speed differs.
-- Time with `std::time::monotonic_now()`: repeat, keep the fastest,
-  use the result, and compare like with like.
-- Iterator chains, generics and views cost nothing extra; allocating in
-  a hot loop and unremovable bounds checks do.
+- `-O0`, `-O1` and `-O2` (the default) give the same results, integer
+  overflow aside; only the speed differs.
+- Time with `std::time::Instant`: repeat, keep the fastest, use the
+  result, and compare like with like.
+- Generics and slices cost nothing extra, and iterator chains become
+  plain loops; allocating in a hot loop and unremovable bounds checks
+  do cost. Measure the loops that matter.
 - `requires` can move bounds checks out of a loop; `volec query
   checks FN` shows what's left. Nothing is assumed without a check.
 - `-S` and `--emit-ir` show what the compiler produced.

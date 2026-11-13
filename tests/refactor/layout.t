@@ -18,7 +18,7 @@ pub const LIMIT: i64 = 9;
 pub const EDGES: i64 = SIDES;
 
 // A point of the plane.
-pub struct Point {
+#[derive(Clone, Copy)] pub struct Point {
     pub x: i64,
 $ refactor move crate::shapes::LIMIT --to crate::tables --before HITS
 moved crate::shapes::LIMIT to crate::tables	3 files	+4 -3 lines

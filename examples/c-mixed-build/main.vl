@@ -9,14 +9,14 @@
 // usage: c-mixed-build [WINDOW] < readings
 import "./ring.h" as c;
 
-use std::{Scanner, env, read_stdin_in};
+use std::{env, io};
 use std::cli::{Arg, Command};
 
 // ---- what C calls --------------------------------------------------------
 
 // Counted by ring.c (`EVICTIONS++`): an `extern "C" static` has an
 // unmangled symbol C can link against, as an `extern "C" fn` does.
-extern "C" static var EVICTIONS: i64 = 0;
+extern "C" static mut EVICTIONS: i64 = 0;
 
 // ring.c calls this by name when the window is full and a reading falls
 // out of it.
@@ -30,20 +30,24 @@ struct Stats { count: i64, sum: i64, min: i64, max: i64 }
 
 // A C callback: an `extern "C" fn` (a closure cannot be one; it would
 // need a place for what it captures, which is what `ctx` is for).
-extern "C" fn accumulate(value: i64, ctx: *u8) -> i32 {
-    let stats = ctx as *Stats;
-    unsafe {
-        stats.count += 1;
-        stats.sum += value;
-        if value < stats.min { stats.min = value; }
-        if value > stats.max { stats.max = value; }
-    }
+extern "C" fn accumulate(value: i64, ctx: *mut u8) -> i32 {
+    // UNSAFE: `ctx` is C's `void *`: a raw pointer, read back as what it was.
+    // SAFETY: ring_each passes the `ctx` it was given, and `stats` gives
+    // it a `&mut Stats` that lives for the call and is used nowhere else.
+    let stats = unsafe { &mut *(ctx as *mut Stats) };
+    stats.count += 1;
+    stats.sum += value;
+    if value < stats.min { stats.min = value; }
+    if value > stats.max { stats.max = value; }
     0 // keep going
 }
 
 // Stops at the first reading above the limit in `ctx`.
-extern "C" fn above(value: i64, ctx: *u8) -> i32 {
-    let limit = unsafe { *(ctx as *i64) };
+extern "C" fn above(value: i64, ctx: *mut u8) -> i32 {
+    // UNSAFE: `ctx` is C's `void *`: a raw pointer, read back as what it was.
+    // SAFETY: ring_each passes the `ctx` it was given, and `first_above`
+    // gives it a pointer to an i64 that lives for the call.
+    let limit = unsafe { *(ctx as *const i64) };
     if value > limit { 1 } else { 0 }
 }
 
@@ -52,10 +56,13 @@ extern "C" fn above(value: i64, ctx: *u8) -> i32 {
 // Owns a C Ring; every unsafe call is in here, behind methods whose
 // arguments cannot break it. Its Drop frees the ring, which also makes
 // a Window move-only: no copy of the pointer can outlive the free.
-struct Window { ring: *c::Ring }
+struct Window { ring: *mut c::Ring }
 
 impl Drop for Window {
-    fn drop(inout self) {
+    fn drop(&mut self) {
+        // UNSAFE: ring_free is C's.
+        // SAFETY: `ring` came from ring_new and is freed once: a Window
+        // is dropped once, and nothing else holds the pointer.
         unsafe { c::ring_free(self.ring); }
     }
 }
@@ -65,50 +72,67 @@ impl Window {
         if cap <= 0 {
             return None;
         }
+        // UNSAFE: ring_new is C's.
+        // SAFETY: `cap` is positive, as ring_new asks; its result is null
+        // or a ring this Window now owns.
         let ring = unsafe { c::ring_new(cap as u64) };
-        if ring == 0 as *c::Ring { None } else { Some(Window { ring: ring }) }
+        if ring.is_null() { None } else { Some(Window { ring }) }
     }
 
-    fn push(inout self, value: i64) {
+    fn push(&mut self, value: i64) {
+        // UNSAFE: ring_push is C's.
+        // SAFETY: `ring` is a live ring (new checked it, drop is the only free).
         unsafe { c::ring_push(self.ring, value); }
     }
 
     // The C struct's fields, read directly: the header gave them.
-    fn len(self) -> i64 {
+    fn len(&self) -> i64 {
+        // UNSAFE: a field read through a raw pointer.
+        // SAFETY: `ring` is a live ring, and its struct is ring.h's.
         unsafe { (*self.ring).len as i64 }
     }
 
-    fn pushed(self) -> i64 {
+    fn pushed(&self) -> i64 {
+        // UNSAFE: a field read through a raw pointer.
+        // SAFETY: `ring` is a live ring, and its struct is ring.h's.
         unsafe { (*self.ring).pushed as i64 }
     }
 
-    fn get(self, i: i64) -> i64 {
+    fn get(&self, i: i64) -> i64 {
         if i < 0 || i >= self.len() {
             return 0;
         }
+        // UNSAFE: ring_get is C's.
+        // SAFETY: `ring` is a live ring and 0 <= i < len, checked above.
         unsafe { c::ring_get(self.ring, i as u64) }
     }
 
-    fn stats(self) -> Stats {
-        var s = Stats { count: 0, sum: 0, min: i64::MAX, max: i64::MIN };
-        unsafe { c::ring_each(self.ring, accumulate, &s as *u8); }
+    fn stats(&self) -> Stats {
+        let mut s = Stats { count: 0, sum: 0, min: i64::MAX, max: i64::MIN };
+        // UNSAFE: ring_each is C's, and calls back with an untyped pointer.
+        // SAFETY: `ring` is a live ring; `accumulate` reads `ctx` as the
+        // Stats it is, and `s` outlives the call.
+        unsafe { c::ring_each(self.ring, accumulate, &mut s as *mut Stats as *mut u8); }
         s
     }
 
     // How many readings, oldest first, up to and including the first one
     // above `limit`; None if none is.
-    fn first_above(self, limit: i64) -> Option<i64> {
-        var l = limit;
-        let visited = unsafe { c::ring_each(self.ring, above, &l as *u8) } as i64;
+    fn first_above(&self, limit: i64) -> Option<i64> {
+        let mut l = limit;
+        // UNSAFE: ring_each is C's, and calls back with an untyped pointer.
+        // SAFETY: `ring` is a live ring; `above` reads `ctx` as the i64
+        // it is, and `l` outlives the call.
+        let visited = unsafe { c::ring_each(self.ring, above, &mut l as *mut i64 as *mut u8) } as i64;
         if visited == self.len() && self.get(visited - 1) <= limit { None } else { Some(visited) }
     }
 }
 
 // FNV-1a in vole, to check C's: the same bits from both languages.
-fn fnv1a(data: [u8]) -> u32 {
-    var h: u32 = 2166136261;
+fn fnv1a(data: &[u8]) -> u32 {
+    let mut h: u32 = 2166136261;
     for b in data {
-        h ^= b;
+        h ^= *b as u32;
         h = h.wrapping_mul(16777619);
     }
     h
@@ -124,7 +148,7 @@ fn main(gpa: Gpa) -> i32 {
         Ok(n) => n,
         Err(e) => cmd.exit(e),
     };
-    var window = match Window::new(size) {
+    let mut window = match Window::new(size) {
         Some(w) => w,
         None => {
             eprintln("bad window size {size}");
@@ -132,10 +156,11 @@ fn main(gpa: Gpa) -> i32 {
         }
     };
 
-    let input = read_stdin_in(gpa).unwrap();
-    var sc = Scanner::new(input.as_slice());
+    let input = io::read_to_string_in(io::stdin(), gpa).unwrap();
     println("a window of {size} readings");
-    while let Ok(reading) = sc.next_int() {
+    for token in input.split_whitespace() {
+        // the readings end at the first word that is not a number
+        let Ok(reading) = token.parse::<i64>() else { break };
         window.push(reading);
         let s = window.stats();
         let mean = s.sum as f64 / s.count as f64;
@@ -143,6 +168,8 @@ fn main(gpa: Gpa) -> i32 {
     }
 
     let held = window.len();
+    // UNSAFE: a mutable static, which C writes too.
+    // SAFETY: one thread; ring.c only counts in it during ring_push.
     let evictions = unsafe { EVICTIONS };
     println("pushed {}, holding {held}, dropped {evictions}", window.pushed());
     match window.first_above(50) {
@@ -153,7 +180,9 @@ fn main(gpa: Gpa) -> i32 {
 
     // A vole slice to C: its pointer and its length (no NUL needed).
     let word = "vole";
-    let from_c = unsafe { c::fnv1a(word.ptr, word.len() as u64) };
-    println("fnv1a(\"{word}\"): C {from_c:08x}, vole {:08x}", fnv1a(word));
+    // UNSAFE: fnv1a is C's, and reads through a pointer.
+    // SAFETY: the pointer and the length are `word`'s own.
+    let from_c = unsafe { c::fnv1a(word.as_ptr(), word.len() as u64) };
+    println("fnv1a(\"{word}\"): C {from_c:08x}, vole {:08x}", fnv1a(word.as_bytes()));
     0
 }

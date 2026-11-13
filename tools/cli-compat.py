@@ -57,7 +57,6 @@ main.vl -o
 --stats=x main.vl
 --cache=maybe main.vl
 --emit-ir=1 main.vl
---values=bogus main.vl
 --syntax=mixed main.vl
 --allow-unsafe main.vl
 --version

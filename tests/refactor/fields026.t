@@ -5,30 +5,46 @@
 ## `#[sealed]` is that rule: attr.obsolete, which fix --only
 ## obsolete-attr deletes.
 $ check
-geometry.vl:1:1: warning[attr.obsolete] '#[sealed]' is the default from 0.26: every field not marked 'pub' is private to its module | help: delete it (`volec fix --only obsolete-attr` deletes every one) | try: volec fix --only obsolete-attr main.vl
+geometry.vl:1:24: warning[attr.obsolete] '#[sealed]' is the default from 0.26: every field not marked 'pub' is private to its module | help: delete it (`volec fix --only obsolete-attr` deletes every one) | try: volec fix --only obsolete-attr main.vl
 main.vl:7:15: error[field.literal-private] cannot make a 'Rect' here: its field 'w' is private to module 'geometry' | help: make one with its constructor: 'Rect::new'
 main.vl:8:6: error[field.private] field 'w' of 'Rect' is private to module 'geometry' | help: make it public: 'pub w: i64' at geometry.vl:2:19 | try: volec fix --suggested main.vl
 [exit 1]
 ## query context says a field's visibility.
 $ query context Rect.w
 // crate::geometry::Rect.w	geometry.vl:1-2	private to module geometry
-#[sealed]
+#[derive(Clone, Copy)] #[sealed]
 pub struct Rect { w: i64, pub h: i64 }
 // used by (4)
 geometry::Rect::new	geometry.vl:6:16	Rect { w: w, h: h }
 geometry::Rect::area	geometry.vl:10:14	self.w * self.h
 main	main.vl:7:22	let lit = Rect { w: 1, h: 2 };
 main	main.vl:8:8	(r.w + r.h + lit.area()) as i32
+// std::window::objc::Rect.w	<std>:48501-48501	pub field
+    pub w: f64,
+// used by (5)
+std::window::cocoa::view_size	<std>:46616:18	Size { w: (b.w * s + 0.5) as i64, h: (b.h * s + 0.5) as i64, scale: s }
+std::window::cocoa::imp_first_rect	<std>:46975:39	return Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+std::window::cocoa::imp_first_rect	<std>:46983:60	let local = Rect { x: d.ime_x / s, y: d.ime_y / s, w: d.ime_w / s, h: d.ime_h / s };
+<std::window::cocoa::Cocoa as Backend>::open_window	<std>:47670:47	let rect = Rect { x: 0.0, y: 0.0, w: desc.w as f64, h: desc.h as f64 };
+<std::window::cocoa::Cocoa as Backend>::open_window	<std>:47703:40	Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }, 0x01 | 0x02 | 0x80 | 0x200, view,
 warning query.program-errors: 2 errors in the program; results may be incomplete
 try: volec --diagnostics=short main.vl -c -o /dev/null
 $ query context Rect.h
 // crate::geometry::Rect.h	geometry.vl:1-2	pub field
-#[sealed]
+#[derive(Clone, Copy)] #[sealed]
 pub struct Rect { w: i64, pub h: i64 }
 // used by (3)
 geometry::Rect::new	geometry.vl:6:22	Rect { w: w, h: h }
 geometry::Rect::area	geometry.vl:10:23	self.w * self.h
 main	main.vl:8:14	(r.w + r.h + lit.area()) as i32
+// std::window::objc::Rect.h	<std>:48502-48502	pub field
+    pub h: f64,
+// used by (5)
+std::window::cocoa::view_size	<std>:46616:45	Size { w: (b.w * s + 0.5) as i64, h: (b.h * s + 0.5) as i64, scale: s }
+std::window::cocoa::imp_first_rect	<std>:46975:47	return Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+std::window::cocoa::imp_first_rect	<std>:46983:76	let local = Rect { x: d.ime_x / s, y: d.ime_y / s, w: d.ime_w / s, h: d.ime_h / s };
+<std::window::cocoa::Cocoa as Backend>::open_window	<std>:47670:65	let rect = Rect { x: 0.0, y: 0.0, w: desc.w as f64, h: desc.h as f64 };
+<std::window::cocoa::Cocoa as Backend>::open_window	<std>:47703:48	Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }, 0x01 | 0x02 | 0x80 | 0x200, view,
 warning query.program-errors: 2 errors in the program; results may be incomplete
 try: volec --diagnostics=short main.vl -c -o /dev/null
 $ fix --only pub --dry-run
@@ -41,11 +57,12 @@ $ fix --only pub
 fixed 1 pub	geometry.vl	+1 -1 lines
 ## Then only the warning is left, and its fix.
 $ check
-geometry.vl:1:1: warning[attr.obsolete] '#[sealed]' is the default from 0.26: every field not marked 'pub' is private to its module | help: delete it (`volec fix --only obsolete-attr` deletes every one) | try: volec fix --only obsolete-attr main.vl
+geometry.vl:1:24: warning[attr.obsolete] '#[sealed]' is the default from 0.26: every field not marked 'pub' is private to its module | help: delete it (`volec fix --only obsolete-attr` deletes every one) | try: volec fix --only obsolete-attr main.vl
 ok: 0 errors, 1 warning in main.vl
 $ fix --only obsolete-attr
-fixed 1 obsolete attribute	geometry.vl	+0 -1 lines
+fixed 1 obsolete attribute	geometry.vl	+1 -1 lines
 % cat geometry.vl
+#[derive(Clone, Copy)]
 pub struct Rect { pub w: i64, pub h: i64 }
 
 impl Rect {

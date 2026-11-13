@@ -165,15 +165,13 @@ case("read a program outside tests", blocked("cat /home/u/proj/src/main.vl")[0],
 st, err, recs = bash("grep -n atomic ../../examples/gpu/fluid2d/main.vl ../../examples/gpu/fluid2d/sim.vl")
 case("grep of an example's large files: read-program", (st, [r["kind"] for r in recs]), (0, ["read-program"]))
 
-# (0.14) Test data under tests/ (cases, fixtures, eval tasks): read freely, logged.
+# (0.14) Test data under tests/ (cases, fixtures): read freely, logged.
 st, err, recs = bash("sed -n '120,180p' tests/run/loops.vl")
 case("read test case", (st, [r["kind"] for r in recs]), (0, ["read-fixture"]))
 case("read head fixture", blocked("head -40 tests/refactor/patch/calc.vl")[0], False)
 case("read cat fixture", blocked("cat tests/refactor/patch/main.vl")[0], False)
-case("read eval task data", blocked("cat tests/agent-eval/tasks/07-fix-bugs/tach/main.vl")[0], False)
-case("grep eval task data", blocked("grep -n 'fn main' tests/agent-eval/tasks/*/tach/*.vl")[0], False)
 case("grep -r test cases", blocked("grep -rn 'EXPECT' tests/run")[0], False)
-case("read fixture after cd", blocked("cd tests/agent-eval/tasks/02-rpn && cat tach/main.vl")[0], False)
+case("read fixture after cd", blocked("cd tests/refactor/patch && cat main.vl")[0], False)
 case("read absolute fixture", blocked("cat " + os.path.join(os.path.dirname(os.path.dirname(HERE)),
                                                             "tests/run/loops.vl"))[0], False)
 case("fixture and source: blocked", blocked("cat tests/run/a.vl compiler/src/main.vl")[0], True)
@@ -334,7 +332,7 @@ case("python -c after an echo", blocked(
     "echo hi; python3 -c \"open('compiler/src/a.vl', 'w').write('x')\"")[0], True)
 case("read with 2>&1", blocked("grep -n fn compiler/src/a.vl 2>&1")[0], True)
 
-# (0.25.2.1) The 0.25.2 eval (evals/tasks/0.25.2/*/ANALYSIS.md): lines the
+# (0.25.2.1) The 0.25.2 eval (its tree, evals/, was deleted at 0.28.0): lines the
 # hook blocked then, verbatim but for the checkout's path; reads of the
 # agents' own programs and of the examples now run, the compiler's own
 # source is still read and rewritten through the tools, and a blocked
@@ -631,7 +629,7 @@ with tempfile.TemporaryDirectory() as tmp:
         "compiler/src/middle/egraph.vl": BIG,
         "compiler/src/middle/ir/mod.vl": "pub mod cfg;\nuse crate::base::IntVec;\n" + BIG,
         "compiler/src/front/patterns/usefulness.vl": BIG,
-        "compiler/std/io.vl": BIG.replace("// line 250\n", "    pub fn next_line(self: *Scanner) -> [u8] {\n"),
+        "compiler/std/io.vl": BIG.replace("// line 250\n", "    pub fn next_line(&mut self) -> &[u8] {\n"),
         "compiler/std/std.vl": BIG,
     }
     for name, text in files.items():

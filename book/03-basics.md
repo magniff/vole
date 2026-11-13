@@ -4,9 +4,9 @@ The guessing game in chapter 2 used a little of everything. This
 chapter slows down and goes through the building blocks one at a time:
 variables, numbers and the other simple types, functions, blocks, and
 loops. None of it is exotic, and much of it will look familiar from
-other languages, but vole has a few habits of its own (Rust's checked
-integers, `as` for conversions, labels without quotes), and it's worth
-meeting them early.
+other languages, but vole has a few habits of its own (integers that
+are checked, `as` for conversions, blocks that have a value), and it's
+worth meeting them early.
 
 Our running example is a small unit converter that grows as the
 chapter goes: a function, then a table, then a loop that asks how long
@@ -15,12 +15,12 @@ savings take to double, and finally a little prime counter.
 ## Variables
 
 You met both kinds of variable in chapter 2. A `let` gives a name to a
-value that won't change; a `var` makes one that can:
+value that won't change; a `let mut` makes one that can:
 
 ```vole
 fn main() {
     let rate = 3;
-    var total = 0;
+    let mut total = 0;
     total += rate;
     total += rate;
     println("{total}");
@@ -47,7 +47,7 @@ fn main() {
 ```err
 error[type error]: cannot assign to immutable variable 'total'
  --> main.vl: line 3, column 5
-  = help: make it mutable: `var total`
+  = help: make it mutable: `let mut total`
 ```
 
 ### Shadowing
@@ -72,19 +72,21 @@ fn main() {
 Each `let width` is a separate variable, and the second one even has a
 different type: the first is text, the others are numbers. Shadowing is
 handy when you transform a value in steps and the old steps are no
-longer interesting. It's not the same as changing a `var`: nothing is
-changed, a new name is made.
+longer interesting. It's not the same as changing a `let mut`: nothing
+is changed, a new variable is made.
 
 ### Every variable starts with a value
 
-There's no way to declare a variable now and give it a value later.
-`let x;` is an error. When you don't know the value yet, that's usually
-a sign to compute it with an expression, like the `if` and `match`
-expressions you'll see below. This rule means a vole program can never
-read a variable that was never set.
+Give a variable its value where you declare it. When you don't know the
+value yet, that's usually a sign to compute it with an expression, like
+the `if` and `match` expressions you'll see below, and not a reason for
+a `let mut` that each branch sets.
 
-> **If you know Rust:** `var` is `let mut`, and `let mut` is an error
-> whose `try:` line rewrites it to `var`.
+A `let total: i64;` without a value is allowed, as long as the variable
+is assigned before it is read, on every path that reaches the read. The
+compiler checks it: reading a variable that may not have its value yet
+is an error (`borrowck.use_uninit`), so a vole program can never read a
+variable that was never set.
 
 ## Numbers
 
@@ -93,23 +95,32 @@ Vole has signed integers `i8`, `i16`, `i32`, `i64` and unsigned ones
 and `usize`, which are the size of a pointer (64 bits on every platform
 vole runs on). Floating-point numbers are `f32` and `f64`.
 
-You'll use two of these most of the time: `i64` for whole numbers and
-`f64` for fractional ones. They are what vole picks when nothing says
-otherwise:
+When nothing says otherwise, a whole number is an `i32` and a
+fractional one an `f64`. An `i32` holds a little over two billion in
+either direction; when a number can be bigger than that, say `i64`:
 
-```console
-$ volec try '6 * 7'
-i64 = 42
-$ volec try '7.0 / 2.0'
-f64 = 3.5
+```vole
+fn main() {
+    let answer = 6 * 7;
+    let half = 7.0 / 2.0;
+    let people: i64 = 8_100_000_000;
+    println("{answer} {half} {people}");
+}
 ```
 
-Lengths and indexes are `usize`. A list's `len()` is a `usize`, and
-you index with a `usize` (an `i64` works too). A literal is an `i64`
-unless something gives it a type, so a counter that walks a list says
-its type, `var i: usize = 0;`, and a `usize` and an `i64` don't mix in
-arithmetic: the error names the conversion to write, such as
-`v.len() as i64`.
+```out
+42 3.5 8100000000
+```
+
+`answer` is an `i32` and `half` an `f64`. Without its `: i64`, the
+third line would be an error: `integer literal 8100000000 does not fit
+in type 'i32'`. This book writes `i64` for most of its whole numbers,
+so that an example never has to wonder how big they get.
+
+Lengths and indexes are `usize`. A list's `len()` is a `usize`, and you
+index with a `usize`: an `i64` index is converted, `v[i as usize]`. A
+`usize` and an `i64` don't mix in arithmetic: the error names the
+conversion to write, such as `v.len() as i64`.
 
 ### Literals
 
@@ -180,6 +191,9 @@ as i32;`. `volec fix --suggested`, which makes most fixes for you, leaves
 this one to you, because the conversion may lose the value: whether it
 can is yours to judge.
 
+> **If you know Rust:** widening without `as` is vole's own. Rust wants
+> `i64::from(x)` there, which vole accepts too.
+
 `as` also converts between integers and floats. Converting a float to
 an integer drops the fraction:
 
@@ -227,10 +241,10 @@ fn main() {
 
 Line by line:
 
-- `big + 1` overflows. In a debug build (`-O0`, and every `volec test`)
-  the program stops there, with `main.vl:4:20: attempt to add with
-  overflow` and exit status 101; in an optimized build (`-O1`, `-O2`)
-  it wraps, as the hardware does. `--overflow-checks=on` or `off`
+- `big + 1` would overflow. In a debug build (`-O0`, and every `volec
+  test`) the program stops there, with `attempt to add with overflow`
+  and exit status 101; in an optimized build (`-O1`, `-O2`) it wraps,
+  as the hardware does. `--overflow-checks=on` or `off`
   chooses for any level. When wrapping is what you mean, as in hashes
   and checksums, say so: `wrapping_add` wraps at every level, and
   `saturating_add` stops at the largest value. `checked_add` gives
@@ -251,25 +265,22 @@ build, check for it (`checked_add`), or state it as a requirement
 (chapter 6 shows a first `requires`).
 
 `i64::MAX`, `i64::MIN`, `u8::MAX` and so on are constants, one pair for
-each integer type. Numbers have few methods, though: `x.abs()` and
-`x.pow(2)` don't exist. Write the expression instead (`if x < 0 { -x }
-else { x }`), or a small function of your own.
-
-> **If you know Rust:** overflow never panics, in debug builds or
-> release ones; `x / 0` is 0; lengths are `usize`, as yours are.
+each integer type. Numbers have methods too: `x.abs()`, `x.pow(2)`,
+`x.min(y)` and `x.max(y)` for integers, and `x.sqrt()` and friends for
+floats.
 
 ## Other simple types
 
 ### bool
 
 `bool` is `true` or `false`. Comparisons (`==`, `!=`, `<`, `<=`, `>`,
-`>=`) give one, and `&&`, `||` and `!` combine them. `!` works only on
-a `bool`; flipping the bits of an integer is `~`:
+`>=`) give one, and `&&`, `||` and `!` combine them. On an integer, `!`
+flips every bit:
 
 ```vole
 fn main() {
     let warm = 25 > 20;
-    println("{} {}", warm && !false, ~5);
+    println("{} {}", warm && !false, !5);
 }
 ```
 
@@ -281,21 +292,27 @@ A condition must be a `bool`: `if count { ... }` is an error, write `if
 count != 0`. Comparisons don't chain either: `0 < x < 10` is an error,
 write `0 < x && x < 10`.
 
-### Characters are bytes
+### Characters and bytes
 
-`'a'` is a `u8`: one byte, the character's ASCII code. Vole has no
-`char` type yet; text is UTF-8, and chapter 7 shows how to work with
-it. A byte prints as a number, unless you format it with `:c`:
+`'a'` is a `char`: one Unicode character, whichever alphabet it comes
+from. `b'a'` is a `u8`: one byte, the character's ASCII code. Text is
+stored as bytes (UTF-8), and chapter 7 shows how to work with it; for
+now, a `char` prints as itself and a byte as a number, and `as`
+converts between them:
 
 ```vole
 fn main() {
     let letter = 'a';
-    println("{letter} {letter:c} {:c}", (letter + 1));
+    let accent = 'é';
+    let byte = b'a';
+    println("{letter} {accent} {byte}");
+    println("{} {} {}", accent as u32, (byte + 1) as char, accent.is_alphabetic());
 }
 ```
 
 ```out
-97 a b
+a é 97
+233 b true
 ```
 
 ### Tuples
@@ -325,13 +342,13 @@ fields reads better (chapter 5).
 ### Arrays
 
 An array holds a fixed number of values of one type. `[31, 28, 31, 30]`
-is an array of four `i64`s, of type `[i64; 4]`, and `[0; 8]` is eight
+is an array of four `i32`s, of type `[i32; 4]`, and `[0; 8]` is eight
 zeros. Index it with `[i]`, starting from 0:
 
 ```vole
 fn main() {
     let days = [31, 28, 31, 30];
-    var leap = days;
+    let mut leap = days;
     leap[1] = 29;
     println("{} {} {}", days[1], leap[1], days.len());
 }
@@ -341,7 +358,7 @@ fn main() {
 28 29 4
 ```
 
-An array is a value, like a number. `var leap = days;` copies all four
+An array is a value, like a number. `let mut leap = days;` copies all four
 elements, so changing `leap` leaves `days` alone. (Chapter 4 is all
 about what `=` does, and this is the simple case.)
 
@@ -414,20 +431,19 @@ fn sign(n: i64) -> i64 {
 Functions can be declared in any order, and they're always declared at
 the top level of a file: there are no functions inside functions.
 
-### Default and named arguments
+### More than one parameter
 
-A parameter can have a default value, used when the caller leaves the
-argument out. Let's add a question to the converter: at a given
-interest rate, how many years until savings double?
+Let's add a question to the converter: at a given interest rate, how
+many years until savings double?
 
 ```vole convert.vl
 fn celsius_to_fahrenheit(c: f64) -> f64 {
     c * 9.0 / 5.0 + 32.0
 }
 
-fn years_to_double(start: f64, rate: f64 = 0.05) -> i64 {
-    var balance = start;
-    var years = 0;
+fn years_to_double(start: f64, rate: f64) -> i64 {
+    let mut balance = start;
+    let mut years = 0;
     while balance < 2.0 * start {
         balance = balance * (1.0 + rate);
         years += 1;
@@ -437,8 +453,8 @@ fn years_to_double(start: f64, rate: f64 = 0.05) -> i64 {
 
 fn main() {
     println("37 C is {} F", celsius_to_fahrenheit(37.0));
-    println("at 5%: {} years", years_to_double(1000.0));
-    println("at 7%: {} years", years_to_double(1000.0, rate: 0.07));
+    println("at 5%: {} years", years_to_double(1000.0, 0.05));
+    println("at 7%: {} years", years_to_double(1000.0, 0.07));
 }
 ```
 
@@ -448,20 +464,19 @@ at 5%: 15 years
 at 7%: 11 years
 ```
 
-The first call leaves `rate` out, so it is 0.05. The second names it:
-`rate: 0.07`. Naming an argument is optional, but it makes a call with
-several numbers much easier to read. Named arguments come after the
-positional ones, in the order the parameters are declared.
+Arguments are matched to parameters by position: the first is `start`,
+the second `rate`.
 
 (The `while` loop is new; we'll come to it in a moment.)
 
 ### Parameters are read-only
 
-Inside `years_to_double`, `start` and `rate` can't be changed: a
-parameter is read-only unless the function says otherwise. That's why
-the loop keeps its running total in a `var balance` of its own. How a
-function can change what it's given, or take it over completely, is the
-subject of the next chapter.
+Inside `years_to_double`, `start` and `rate` can't be assigned: a
+parameter is like a `let`. That's why the loop keeps its running total
+in a `let mut balance` of its own. (`mut start: f64` would make the
+parameter a `let mut`; either way the caller's value isn't touched.)
+How a function can change what it's given, or take it over completely,
+is the subject of the next chapter.
 
 ## Blocks are expressions
 
@@ -492,7 +507,7 @@ stay inside 63
 
 `if` picks a branch, and the value of that branch is the value of the
 whole `if`. So `advice` gets one of the three strings, and there's no
-need for a `var` set in each branch. Each branch has to give a value of
+need for a `let mut` set in each branch. Each branch has to give a value of
 the same type, and the `else` is required (without it, what would the
 value be when the condition is false?).
 
@@ -570,12 +585,11 @@ fn main() {
 right-aligned in four columns, and `{f:>6.1}` prints `f` in six columns
 with one decimal. (Chapter 7 has the rest of the format specs.)
 
-To count down, reverse the range with `.rev()` (`1..4` is 1, 2 and 3;
-for now `.rev()` works on `a..b` ranges, not on `a..=b` ones):
+To count down, reverse the range with `.rev()`:
 
 ```vole
 fn main() {
-    for i in (1..4).rev() {
+    for i in (1..=3).rev() {
         print("{i}... ");
     }
     println("go!");
@@ -590,7 +604,7 @@ The same `for` goes through an array's elements:
 
 ```vole
 fn main() {
-    var total = 0;
+    let mut total = 0;
     for d in [31, 28, 31] {
         total += d;
     }
@@ -610,7 +624,7 @@ whole `loop` an expression:
 
 ```vole
 fn main() {
-    var n = 1;
+    let mut n = 1;
     let first = loop {
         n += 1;
         if n * n > 200 {
@@ -628,23 +642,23 @@ fn main() {
 ### Labels
 
 `break` and `continue` act on the innermost loop. To act on an outer
-one, give it a *label*: a name and a colon before the loop. Then `break
-:name` or `continue :name` refers to it. Here's the last piece of our
+one, give it a *label*: a name that starts with `'`, and a colon,
+before the loop. Then `break 'name` or `continue 'name` refers to it. Here's the last piece of our
 example, a prime counter. For each candidate, an inner loop tries
 divisors; finding one means the candidate isn't prime, so we skip
 straight to the next candidate:
 
 ```vole primes.vl
 fn main() {
-    var count = 0;
-    var largest = 0;
-    candidates: for n in 2..50 {
+    let mut count = 0;
+    let mut largest = 0;
+    'candidates: for n in 2..50 {
         for d in 2..n {
             if d * d > n {
                 break;
             }
             if n % d == 0 {
-                continue :candidates;
+                continue 'candidates;
             }
         }
         count += 1;
@@ -659,13 +673,9 @@ fn main() {
 ```
 
 The plain `break` leaves the inner loop: once `d * d > n`, there's no
-point trying bigger divisors. The `continue :candidates` abandons the
+point trying bigger divisors. The `continue 'candidates` abandons the
 inner loop and the rest of the outer body, and goes on to the next `n`,
 so `count += 1` runs only for primes.
-
-> **If you know Rust:** labels have no quote. Rust's `'outer: for` and
-> `break 'outer` are `outer: for` and `break :outer` in vole; the quoted
-> form gets an error whose `try:` line respells it.
 
 ## Comments and constants
 
@@ -700,25 +710,27 @@ file, before or after it is declared. Use constants for the numbers
 that would otherwise be unexplained in your code: `const MAX_GUESS: i64
 = 100;` reads better than a bare `100` in three places.
 
-There is also `static var`, a variable that lives as long as the
-program and is visible to every function. It is rarely what you want:
-a value passed as a parameter is easier to follow, and chapter 14
-explains why threads and statics don't mix.
+There is also `static`, written like a `const`, for a value that has
+one place in memory for the whole run of the program. It is rarely what
+you want: a `const`, or a value passed as a parameter, is easier to
+follow.
 
 ## Summary
 
 This chapter went through the basics:
 
-- `let` for values that don't change, `var` for ones that do, and
+- `let` for values that don't change, `let mut` for ones that do, and
   shadowing with a second `let`;
-- the integer and float types, `i64` and `f64` as the defaults, and
-  `usize` for lengths and indexes;
+- the integer and float types, `i32` and `f64` as the defaults, `i64`
+  for anything that can grow, and `usize` for lengths and indexes;
 - literals with underscores, `0x`, `0b` and suffixes, widening, and `as`
   for every other conversion;
-- defined behaviour for every operation: wrapping, `x / 0 == 0`,
+- defined behaviour for every operation: overflow that stops a debug
+  build and wraps an optimized one, division by zero that stops both,
   saturating conversions;
-- `bool`, bytes as `u8`, tuples, arrays with checked indexing, and `()`;
-- functions, their results, default and named arguments;
+- `bool`, `char` and bytes, tuples, arrays with checked indexing, and
+  `()`;
+- functions, their parameters and results;
 - blocks and `if` as expressions, and the stray semicolon;
 - `while`, `for` over ranges and arrays, `loop` with `break value`, and
   labels;
@@ -733,8 +745,7 @@ is the chapter that makes vole different from what you know.
 
 - Add `fahrenheit_to_celsius` to the converter, and print a second table
   going the other way, from 0 to 100 F in steps of 20.
-- Give `years_to_double` a third parameter, `target: f64 = 2.0`, so it
-  can answer "how long until my savings triple?", and call it with a
-  named argument.
-- Change the prime counter to stop (with a `break :candidates`) as soon
+- Give `years_to_double` a third parameter, `target: f64`, so it can
+  answer "how long until my savings triple?".
+- Change the prime counter to stop (with a `break 'candidates`) as soon
   as it has found ten primes, and print the tenth.

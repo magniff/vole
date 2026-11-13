@@ -6,13 +6,13 @@ holds them to it:
 
 | function | promise | meaning |
 |---|---|---|
-| `score` | `#[pure]` | no allocation, no I/O, no statics (it may panic, loop, and write through its inout parameters) |
+| `score` | `#[pure]` | no allocation, no I/O, no statics (it may panic, loop, and write through its `&mut` parameters) |
 | `histogram` | `#[no_alloc]` | allocates nothing: it fills memory its caller gives it |
 | `peak` | `#[no_panic]` | cannot stop the program: no index that may be out of range, no `unwrap` |
 
 A promise covers everything the function calls, however deep. The
 compiler infers what every function may do (its *effects*: `alloc`,
-`io`, `global`, `panic`, `diverge`, `unsafe`), from its body and its
+`io`, `static`, `panic`, `diverge`, `unsafe`), from its body and its
 callees', and checks each declaration against that. Break a promise
 three calls down, and the error is at the promise, with the line that
 broke it.
@@ -44,13 +44,13 @@ crate::bucket	none
 crate::histogram	panic
 crate::peak	none
 crate::outliers	alloc(Gpa) panic
-crate::main	alloc(Gpa) io panic
+crate::main	alloc(Gpa) io static panic
 ```
 
 `clamp`, `scaled` and `bucket` do nothing but compute: `none`.
 `smoothed` indexes (`s[i + 1]` may be out of range: `panic`), and so
 does `score`, which calls it; `#[pure]` allows that. `peak` is `none`:
-it reads its slice with `get(0)` (an `Option`) and `for x in s`, neither
+it reads its slice with `get(0)` (an `Option`) and `for &x in s`, neither
 of which can fail. `outliers` takes no allocator, yet it is `alloc(Gpa)`:
 it pushes onto a `Vec` it was given, and `push` grows the Vec with the
 allocator the Vec holds. `main` prints: `io`.
@@ -74,10 +74,10 @@ try: volec edit patch clamp --old '    if x < lo {' --new '    println("clamp {x
 
 The edit is refused, and nothing is written: the edit tools check the
 program with the change first. The error is the compiler's, at `score`
-(line 36 with the edit's new line in it), and names the first step of
-the chain from it to the print; `query effects --why` gives the whole
-chain. To see it, write the change anyway (`--no-check`, as the `try:`
-line says):
+(line 37 with the edit's new line in it), and names the first step of
+the chain from it to the print; `query effects --why`, asked of that
+step, gives the rest. To see it, write the change anyway (`--no-check`,
+as the `try:` line says):
 
 ```console
 $ volec edit patch clamp --old '    if x < lo {' --new '    println("clamp {x}");
@@ -86,9 +86,8 @@ main.vl:36:1: error[effect] 'score' is #[pure], but it does io: 'smoothed(s, i, 
 patched crate::clamp	main.vl	+1 -0 lines
 warning edit.breaks: 1 new error (1 in crate::score, which the edit does not change); written anyway (--no-check); the error: main.vl:36:1: 'score' is #[pure], but it does io: 'smoothed(s, i, gain)' at main.vl:39:14 calls 'smoothed'
 try: volec check
-$ volec query effects score --why io | head -5
-crate::score	io panic
-  'smoothed(s, i, gain)' at main.vl:39:14 calls 'smoothed'
+$ volec query effects smoothed --why io | head -4
+crate::smoothed	io static panic
   'scaled(s[i], gain)' at main.vl:29:6 calls 'scaled'
   'clamp(x * gain / 10, 0, 1000)' at main.vl:23:5 calls 'clamp'
   'println("clamp {x}")' at main.vl:12:5 calls 'std::fmt::println'
@@ -125,21 +124,21 @@ only writes.
 
 ## `#[no_panic]`
 
-`peak` reads its first element with `s.get(0)?`, an `Option`. With an
+`peak` reads its first element with `*s.get(0)?`, through an `Option`. With an
 index instead:
 
 ```console
-$ volec edit patch peak --old 'var best = s.get(0)?;' --new 'var best = s[0];'
-main.vl:74:1: error[effect] 'peak' is #[no_panic], but it may panic: 's[0]' at main.vl:75:16 is a checked index | help: iterate ('for x in s'), or 's.get(i)' (an Option), or remove #[no_panic] | try: volec query effects peak --why panic  [edited: crate::peak]
-error edit.breaks: 1 new error; nothing written; the error: main.vl:74:1: 'peak' is #[no_panic], but it may panic: 's[0]' at main.vl:75:16 is a checked index
-try: volec edit patch peak --old 'var best = s.get(0)?;' --new 'var best = s[0];' --no-check
+$ volec edit patch peak --old 'let mut best = *s.get(0)?;' --new 'let mut best = s[0];'
+main.vl:74:1: error[effect] 'peak' is #[no_panic], but it may panic: 's[0]' at main.vl:75:20 is a checked index | help: iterate ('for x in s'), or 's.get(i)' (an Option), or remove #[no_panic] | try: volec query effects peak --why panic  [edited: crate::peak]
+error edit.breaks: 1 new error; nothing written; the error: main.vl:74:1: 'peak' is #[no_panic], but it may panic: 's[0]' at main.vl:75:20 is a checked index
+try: volec edit patch peak --old 'let mut best = *s.get(0)?;' --new 'let mut best = s[0];' --no-check
 [exit 1]
 ```
 
 `s[0]` may be out of range (for an empty slice it is), so it may stop
 the program. A counted `for i in 0..s.len()` loop's `s[i]` is known to be
 in range and is no `panic`; so are a constant index into an array of
-that length, and `for x in s`.
+that length, and `for &x in s`.
 
 ## Why promise
 
@@ -160,5 +159,5 @@ that length, and `for x in s`.
 - `volec guide effects`: the effects, `query effects`, the
   declarations (`#[no_io]` and `#[effects(...)]` too).
 - [effect-bounds](../effect-bounds/): promises asked of closures.
-- [trait-purity](../trait-purity/): std's `Hash`, `Eq` and `Ord` are
+- [trait-purity](../trait-purity/): std's `PartialEq` and `Ord` are
   `#[pure]`, and bind every impl.

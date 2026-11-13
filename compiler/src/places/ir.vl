@@ -104,10 +104,12 @@
 // there are no cleanup edges. Unwinding, when it comes, makes SK_CALL and
 // SK_DROP terminators with a cleanup edge.
 
-use crate::base::comp::Comp;
+use std::mem; use std::alloc::Allocator; use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::REPR_UNION;
-use crate::front::types::{ENUMS, TY_I64, TY_UNIT, TyKind, struct_field, type_elem, variant_field};
+use crate::front::types::{
+    TY_I64, TY_UNIT, TyKind, get_enums, struct_field, type_elem, variant_field,
+};
 
 // Projection kinds.
 pub const PJ_FIELD: i64 = 1;
@@ -136,6 +138,12 @@ pub const LF_USER: i64 = 128;
 // temporary, never borrowed, written whole once and read whole once, by a
 // later statement of the same block, and mentioned nowhere else.
 pub const LF_SSA: i64 = 256;
+// (0.28.0) PROMOTED: a promotable rvalue's temporary of the body's storage
+// (build.vl shared_place, D2.8), for the borrow checker's messages.
+pub const LF_PROMOTED: i64 = 512;
+// (0.28.0) A `let` with no value, `let y: i64;`: assigned later
+// (borrowck/moves.vl, unassigned_reads).
+pub const LF_DEFERRED: i64 = 1024;
 
 // Operand kinds.
 pub const OK_COPY: i64 = 1;
@@ -202,7 +210,7 @@ pub const UO_NOT: i64 = 2;
 pub const UO_BITNOT: i64 = 3;
 
 // The text of binary operator op.
-pub fn bo_text(op: i64) -> *u8 {
+pub fn bo_text(op: i64) -> *mut u8 {
     match op {
         1 => c"+",
         2 => c"-",
@@ -224,7 +232,7 @@ pub fn bo_text(op: i64) -> *u8 {
     }
 }
 
-pub fn uo_text(op: i64) -> *u8 {
+pub fn uo_text(op: i64) -> *mut u8 {
     if op == UO_NEG { c"-" } else if op == UO_NOT { c"!" } else if op == UO_BITNOT { c"~" }
     else { c"?" }
 }
@@ -292,15 +300,19 @@ pub const DS_REMOVED: i64 = 2;
 pub const DS_FLAG: i64 = 3;
 pub const DS_OPEN: i64 = 4;
 
-pub struct PLocal { pub ty: i64, pub flags: i64, pub src: i64, pub node: i64 }
-pub struct PProj { pub parent: i64, pub kind: i64, pub val: i64, pub first: i64, pub next: i64 }
+#[derive(Clone, Copy)] pub struct PLocal {
+    pub ty: i64, pub flags: i64, pub src: i64, pub node: i64,
+}
+#[derive(Clone, Copy)] pub struct PProj {
+    pub parent: i64, pub kind: i64, pub val: i64, pub first: i64, pub next: i64,
+}
 
-pub struct PStmt {
+#[derive(Clone, Copy)] pub struct PStmt {
     pub kind: i64, pub a: i64, pub b: i64, pub c: i64, pub d: i64, pub e: i64, pub ops: i64,
     pub nops: i64, pub node: i64,
 }
 
-pub struct PBlock { pub start: i64, pub len: i64 }
+#[derive(Clone, Copy)] pub struct PBlock { pub start: i64, pub len: i64 }
 
 // (0.26.4) The body held, and its control-flow graph (cfg.vl): the
 // context passed down to every function that reads or builds one, made
@@ -385,7 +397,7 @@ pub fn body_new() -> Body<Comp> {
 
 // A new body for function f (node item): the tables emptied, projection 0
 // (none) made.
-pub fn body_begin(f: i64, item: i64, pbody: inout Body<Comp>) {
+pub fn body_begin(f: i64, item: i64, pbody: &mut Body<Comp>) {
     pbody.fn_ = f;
     pbody.node = item;
     pbody.params = 0;
@@ -414,64 +426,66 @@ pub fn body_begin(f: i64, item: i64, pbody: inout Body<Comp>) {
 
 // ---- Locals ----
 
-pub fn new_local(ty: i64, flags: i64, src: i64, node: i64, pbody: inout Body<Comp>) -> i64 {
+pub fn new_local(ty: i64, flags: i64, src: i64, node: i64, pbody: &mut Body<Comp>) -> i64 {
     pbody.locals.push(PLocal { ty, flags, src, node });
     pbody.locals.len() as i64 - 1
 }
 
-pub fn local_count(pbody: Body<Comp>) -> i64 {
+pub fn local_count(pbody: &Body<Comp>) -> i64 {
     pbody.locals.len() as i64
 }
 
-pub fn local_ty(l: i64, pbody: Body<Comp>) -> i64 {
-    pbody.locals[l].ty
+pub fn local_ty(l: i64, pbody: &Body<Comp>) -> i64 {
+    pbody.locals[l as usize].ty
 }
 
-pub fn local_flags(l: i64, pbody: Body<Comp>) -> i64 {
-    pbody.locals[l].flags
+pub fn local_flags(l: i64, pbody: &Body<Comp>) -> i64 {
+    pbody.locals[l as usize].flags
 }
 
-pub fn has_flag(l: i64, flag: i64, pbody: Body<Comp>) -> bool {
-    (pbody.locals[l].flags & flag) != 0
+pub fn has_flag(l: i64, flag: i64, pbody: &Body<Comp>) -> bool {
+    (pbody.locals[l as usize].flags & flag) != 0
 }
 
 // ---- Projections ----
 
 // The projection list `parent` followed by (kind, val), interned: the same
 // list is the same number.
-pub fn proj(parent: i64, kind: i64, val: i64, pbody: inout Body<Comp>) -> i64 {
-    var c = pbody.projs[parent].first;
+pub fn proj(parent: i64, kind: i64, val: i64, pbody: &mut Body<Comp>) -> i64 {
+    let mut c = pbody.projs[parent as usize].first;
     while c != 0 {
-        if pbody.projs[c].kind == kind && pbody.projs[c].val == val {
+        if pbody.projs[c as usize].kind == kind && pbody.projs[c as usize].val == val {
             return c;
         }
-        c = pbody.projs[c].next;
+        c = pbody.projs[c as usize].next;
     }
     let id = pbody.projs.len() as i64;
-    pbody.projs.push(PProj { parent, kind, val, first: 0, next: pbody.projs[parent].first });
-    pbody.projs[parent].first = id;
+    pbody.projs.push(PProj {
+        parent, kind, val, first: 0, next: pbody.projs[parent as usize].first,
+    });
+    pbody.projs[parent as usize].first = id;
     id
 }
 
-pub fn proj_parent(p: i64, pbody: Body<Comp>) -> i64 {
-    pbody.projs[p].parent
+pub fn proj_parent(p: i64, pbody: &Body<Comp>) -> i64 {
+    pbody.projs[p as usize].parent
 }
 
-pub fn proj_kind(p: i64, pbody: Body<Comp>) -> i64 {
-    pbody.projs[p].kind
+pub fn proj_kind(p: i64, pbody: &Body<Comp>) -> i64 {
+    pbody.projs[p as usize].kind
 }
 
-pub fn proj_val(p: i64, pbody: Body<Comp>) -> i64 {
-    pbody.projs[p].val
+pub fn proj_val(p: i64, pbody: &Body<Comp>) -> i64 {
+    pbody.projs[p as usize].val
 }
 
 // The number of steps of projection list p.
-pub fn proj_depth(p: i64, pbody: Body<Comp>) -> i64 {
-    var n = 0;
-    var q = p;
+pub fn proj_depth(p: i64, pbody: &Body<Comp>) -> i64 {
+    let mut n: i64 = 0;
+    let mut q = p;
     while q > 0 {
         n += 1;
-        q = pbody.projs[q].parent;
+        q = pbody.projs[q as usize].parent;
     }
     n
 }
@@ -479,46 +493,46 @@ pub fn proj_depth(p: i64, pbody: Body<Comp>) -> i64 {
 // Whether list p has a `*` or an index step: such a place has no move path
 // (§3.8). (PJ_CONST is made for arrays only, a part of the array itself; a
 // constant index into a slice or a buffer is a PJ_INDEX of a temporary.)
-pub fn proj_indirect(p: i64, pbody: Body<Comp>) -> bool {
-    var q = p;
+pub fn proj_indirect(p: i64, pbody: &Body<Comp>) -> bool {
+    let mut q = p;
     while q > 0 {
-        let k = pbody.projs[q].kind;
+        let k = pbody.projs[q as usize].kind;
         if k == PJ_DEREF || k == PJ_INDEX {
             return true;
         }
-        q = pbody.projs[q].parent;
+        q = pbody.projs[q as usize].parent;
     }
     false
 }
 
 // The type of a place: local l's type through projection list p (0 when a
 // step does not apply, which the verifier reports).
-pub fn place_type(l: i64, p: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+pub fn place_type(l: i64, p: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
     if p == 0 {
-        return pbody.locals[l].ty;
+        return pbody.locals[l as usize].ty;
     }
-    let base = place_type(l, pbody.projs[p].parent, pbody, &pcx);
-    step_type(base, pbody.projs[p].kind, pbody.projs[p].val, &pcx)
+    let base = place_type(l, pbody.projs[p as usize].parent, pbody, pcx);
+    step_type(base, pbody.projs[p as usize].kind, pbody.projs[p as usize].val, pcx)
 }
 
 // The type a projection step (kind, val) gives from a place of type t.
-pub fn step_type(t0: i64, kind: i64, val: i64, pcx: inout Ctx<Comp>) -> i64 {
+pub fn step_type(t0: i64, kind: i64, val: i64, pcx: &mut Ctx<Comp>) -> i64 {
     // (a distinct type is its underlying one: `str` over `[u8]`, until the
     // erasure)
-    var t = t0;
-    while t > 0 && pcx.types[t].kind == TyKind::Distinct {
-        t = pcx.types[t].a;
+    let mut t = t0;
+    while t > 0 && pcx.types[t as usize].kind == TyKind::Distinct {
+        t = pcx.types[t as usize].a;
     }
     if t <= 0 {
         return 0;
     }
-    let tk = pcx.types[t].kind;
+    let tk = pcx.types[t as usize].kind;
     if kind == PJ_DEREF {
-        return if tk == TyKind::Ptr { pcx.types[t].a } else { 0 };
+        return if tk == TyKind::Ptr { pcx.types[t as usize].a } else { 0 };
     }
     if kind == PJ_INDEX || kind == PJ_CONST {
         return if tk == TyKind::Array || tk == TyKind::Slice || tk == TyKind::Ptr {
-            pcx.types[t].a
+            pcx.types[t as usize].a
         } else {
             0
         };
@@ -530,16 +544,17 @@ pub fn step_type(t0: i64, kind: i64, val: i64, pcx: inout Ctx<Comp>) -> i64 {
         return 0;
     }
     if tk == TyKind::Struct {
-        let s = pcx.types[t].a;
+        let s = pcx.types[t as usize].a;
         return if val >= 0 && val < struct_field_count(s, pcx) { struct_field_ty(s, val, pcx) }
             else { 0 };
     }
     if tk == TyKind::Tuple {
-        return if val >= 0 && val < pcx.types[t].count { type_elem(t, val, pcx) } else { 0 };
+        return if val >= 0 && val < pcx.types[t as usize].count { type_elem(t, val, pcx) }
+            else { 0 };
     }
     if tk == TyKind::Slice {
         return if val == 0 {
-            crate::front::types::ptr_to(pcx.types[t].a, &pcx)
+            crate::front::types::ptr_to(pcx.types[t as usize].a, pcx)
         } else if val == 1 {
             TY_I64
         } else {
@@ -551,10 +566,10 @@ pub fn step_type(t0: i64, kind: i64, val: i64, pcx: inout Ctx<Comp>) -> i64 {
 
 // Type t, a distinct type's underlying one (`str` is `[u8]`, until the
 // erasure).
-pub fn undistinct(t: i64, pcx: Ctx<Comp>) -> i64 {
-    var u = t;
-    while u > 0 && pcx.types[u].kind == TyKind::Distinct {
-        u = pcx.types[u].a;
+pub fn undistinct(t: i64, pcx: &Ctx<Comp>) -> i64 {
+    let mut u = t;
+    while u > 0 && pcx.types[u as usize].kind == TyKind::Distinct {
+        u = pcx.types[u as usize].a;
     }
     u
 }
@@ -562,14 +577,14 @@ pub fn undistinct(t: i64, pcx: Ctx<Comp>) -> i64 {
 // ---- The checker's tables, read ----
 
 // The number of fields of struct s (STRUCTS).
-pub fn struct_field_count(s: i64, pcx: Ctx<Comp>) -> i64 {
+pub fn struct_field_count(s: i64, pcx: &Ctx<Comp>) -> i64 {
     // UNSAFE: STRUCTS is the checker's raw table of structs.
     // SAFETY: s is a struct type's struct, below STRUCT_COUNT.
-    unsafe { pcx.structs[s].field_count }
+    unsafe { pcx.structs[s as usize].field_count }
 }
 
 // The type of field k of struct s.
-pub fn struct_field_ty(s: i64, k: i64, pcx: Ctx<Comp>) -> i64 {
+pub fn struct_field_ty(s: i64, k: i64, pcx: &Ctx<Comp>) -> i64 {
     // UNSAFE: struct_field gives a pointer into the checker's raw FIELDS.
     // SAFETY: 0 <= k < s's field count (the callers check), so it points to
     // one of s's fields.
@@ -577,16 +592,16 @@ pub fn struct_field_ty(s: i64, k: i64, pcx: Ctx<Comp>) -> i64 {
 }
 
 // The number of fields of variant v (VARIANTS).
-pub fn variant_field_count(v: i64, pcx: Ctx<Comp>) -> i64 {
+pub fn variant_field_count(v: i64, pcx: &Ctx<Comp>) -> i64 {
     // UNSAFE: VARIANTS is the checker's raw table of enum variants.
     // SAFETY: v is a variant the checker resolved, below VARIANT_COUNT.
-    unsafe { pcx.variants[v].field_count }
+    unsafe { pcx.variants[v as usize].field_count }
 }
 
 // The type of field k of variant v's payload (PJ_VARIANT v, then PJ_FIELD
 // k): place_type gives the enum for the PJ_VARIANT step, and the field's
 // type is asked here.
-pub fn variant_part_type(v: i64, k: i64, pcx: Ctx<Comp>) -> i64 {
+pub fn variant_part_type(v: i64, k: i64, pcx: &Ctx<Comp>) -> i64 {
     if k < 0 || k >= variant_field_count(v, pcx) {
         return 0;
     }
@@ -595,90 +610,92 @@ pub fn variant_part_type(v: i64, k: i64, pcx: Ctx<Comp>) -> i64 {
 
 // The type of place (l, p), with variant payloads: a PJ_FIELD after a
 // PJ_VARIANT is the variant's field.
-pub fn full_place_type(l: i64, p: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+pub fn full_place_type(l: i64, p: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
     if p == 0 {
-        return pbody.locals[l].ty;
+        return pbody.locals[l as usize].ty;
     }
-    let parent = pbody.projs[p].parent;
-    if pbody.projs[p].kind == PJ_FIELD && parent > 0 && pbody.projs[parent].kind == PJ_VARIANT {
-        return variant_part_type(pbody.projs[parent].val, pbody.projs[p].val, pcx);
+    let parent = pbody.projs[p as usize].parent;
+    if pbody.projs[p as usize].kind == PJ_FIELD && parent > 0
+        && pbody.projs[parent as usize].kind == PJ_VARIANT {
+        return variant_part_type(pbody.projs[parent as usize].val, pbody.projs[p as usize].val,
+            pcx);
     }
-    step_type(full_place_type(l, parent, pbody, &pcx), pbody.projs[p].kind, pbody.projs[p].val,
-        &pcx)
+    step_type(full_place_type(l, parent, pbody, pcx), pbody.projs[p as usize].kind,
+        pbody.projs[p as usize].val, pcx)
 }
 
 // Whether struct type t is a closure's env.
-pub fn struct_closure(t: i64, pcx: Ctx<Comp>) -> bool {
-    if t <= 0 || pcx.types[t].kind != TyKind::Struct {
+pub fn struct_closure(t: i64, pcx: &Ctx<Comp>) -> bool {
+    if t <= 0 || pcx.types[t as usize].kind != TyKind::Struct {
         return false;
     }
     // UNSAFE: STRUCTS is the checker's raw table of structs.
     // SAFETY: t is a struct type, so TYPES[t].a is below STRUCT_COUNT.
-    unsafe { pcx.structs[pcx.types[t].a].closure != 0 }
+    unsafe { pcx.structs[pcx.types[t as usize].a as usize].closure != 0 }
 }
 
 // Whether struct type t is a union.
-pub fn is_union_type(t: i64, pcx: Ctx<Comp>) -> bool {
-    if t <= 0 || pcx.types[t].kind != TyKind::Struct {
+pub fn is_union_type(t: i64, pcx: &Ctx<Comp>) -> bool {
+    if t <= 0 || pcx.types[t as usize].kind != TyKind::Struct {
         return false;
     }
     // UNSAFE: STRUCTS is the checker's raw table of structs.
     // SAFETY: t is a struct type, so TYPES[t].a is below STRUCT_COUNT.
-    unsafe { (pcx.structs[pcx.types[t].a].repr & REPR_UNION) != 0 }
+    unsafe { (pcx.structs[pcx.types[t as usize].a as usize].repr & REPR_UNION) != 0 }
 }
 
 // Whether enum type t keeps its payloads in memory (some variant has
 // fields).
-pub fn enum_has_fields(t: i64, pcx: Ctx<Comp>) -> bool {
-    if t <= 0 || pcx.types[t].kind != TyKind::Enum {
+pub fn enum_has_fields(t: i64, pcx: &Ctx<Comp>) -> bool {
+    if t <= 0 || pcx.types[t as usize].kind != TyKind::Enum {
         return false;
     }
     // UNSAFE: ENUMS is the checker's raw table of enums.
     // SAFETY: t is an enum type, so TYPES[t].a is below ENUM_COUNT.
-    unsafe { ENUMS[pcx.types[t].a].has_fields }
+    unsafe { (*get_enums().add(pcx.types[t as usize].a as usize)).has_fields }
 }
 
 // ---- Blocks and statements ----
 
 // A new block, not entered yet (its range starts when it is).
-pub fn new_block(pbody: inout Body<Comp>) -> i64 {
+pub fn new_block(pbody: &mut Body<Comp>) -> i64 {
     pbody.blocks.push(PBlock { start: -1, len: 0 });
     pbody.blocks.len() as i64 - 1
 }
 
-pub fn block_count(pbody: Body<Comp>) -> i64 {
+pub fn block_count(pbody: &Body<Comp>) -> i64 {
     pbody.blocks.len() as i64
 }
 
 // Statements go to block b from now on; it must not have been entered.
-pub fn enter_block(b: i64, pbody: inout Body<Comp>) {
-    pbody.blocks[b].start = pbody.stmts.len() as i64;
-    pbody.blocks[b].len = 0;
+pub fn enter_block(b: i64, pbody: &mut Body<Comp>) {
+    pbody.blocks[b as usize].start = pbody.stmts.len() as i64;
+    pbody.blocks[b as usize].len = 0;
     pbody.cur_block = b;
 }
 
-pub fn block_start(b: i64, pbody: Body<Comp>) -> i64 {
-    pbody.blocks[b].start
+pub fn block_start(b: i64, pbody: &Body<Comp>) -> i64 {
+    pbody.blocks[b as usize].start
 }
 
-pub fn block_len(b: i64, pbody: Body<Comp>) -> i64 {
-    pbody.blocks[b].len
+pub fn block_len(b: i64, pbody: &Body<Comp>) -> i64 {
+    pbody.blocks[b as usize].len
 }
 
 // The location of block b's terminator.
-pub fn block_term(b: i64, pbody: Body<Comp>) -> i64 {
-    pbody.blocks[b].start + pbody.blocks[b].len
+pub fn block_term(b: i64, pbody: &Body<Comp>) -> i64 {
+    pbody.blocks[b as usize].start + pbody.blocks[b as usize].len
 }
 
 // Whether a block is open (statements go somewhere).
-pub fn reachable(pbody: Body<Comp>) -> bool {
+pub fn reachable(pbody: &Body<Comp>) -> bool {
     pbody.cur_block >= 0
 }
 
 // Appends a statement to the current block: its index (-1 when no block
 // is open: the code after a `return` or a `break`, never run).
 pub fn emit(kind: i64, a: i64, b: i64, c: i64, d: i64, e: i64, ops: i64, nops: i64,
-    node: i64, pbody: inout Body<Comp>) -> i64 {
+    node: i64, pbody: &mut Body<Comp>) -> i64 {
     if pbody.cur_block < 0 {
         return -1;
     }
@@ -689,25 +706,25 @@ pub fn emit(kind: i64, a: i64, b: i64, c: i64, d: i64, e: i64, ops: i64, nops: i
 // The six tables of a body replaced whole (keep.vl load_body: a kept
 // body's, taken, not copied).
 pub fn set_tables(
-    l: sink Vec<PLocal, Comp>, p: sink Vec<PProj, Comp>, s: sink Vec<PStmt, Comp>,
-    b: sink Vec<PBlock, Comp>, o: sink Vec<i64, Comp>, t: sink Vec<i64, Comp>,
-    pbody: inout Body<Comp>) {
-    let _ = std::replace(&pbody.locals, l);
-    let _ = std::replace(&pbody.projs, p);
-    let _ = std::replace(&pbody.stmts, s);
-    let _ = std::replace(&pbody.blocks, b);
-    let _ = std::replace(&pbody.ops, o);
-    let _ = std::replace(&pbody.targets, t);
+    l: Vec<PLocal, Comp>, p: Vec<PProj, Comp>, s: Vec<PStmt, Comp>,
+    b: Vec<PBlock, Comp>, o: Vec<i64, Comp>, t: Vec<i64, Comp>,
+    pbody: &mut Body<Comp>) {
+    let _ = mem::replace(&mut pbody.locals, l);
+    let _ = mem::replace(&mut pbody.projs, p);
+    let _ = mem::replace(&mut pbody.stmts, s);
+    let _ = mem::replace(&mut pbody.blocks, b);
+    let _ = mem::replace(&mut pbody.ops, o);
+    let _ = mem::replace(&mut pbody.targets, t);
 }
 
 // Ends the current block with terminator `kind` (its fields as emit's);
 // no block is open after it.
 pub fn terminate(kind: i64, a: i64, b: i64, c: i64, ops: i64, nops: i64, node: i64,
-    pbody: inout Body<Comp>) {
+    pbody: &mut Body<Comp>) {
     if pbody.cur_block < 0 {
         return;
     }
-    close_block(&pbody);
+    close_block(pbody);
     pbody.stmts.push(PStmt { kind, a, b, c, d: 0, e: 0, ops, nops, node });
     pbody.cur_block = -1;
 }
@@ -715,32 +732,33 @@ pub fn terminate(kind: i64, a: i64, b: i64, c: i64, ops: i64, nops: i64, node: i
 // The current block's length set: its statements so far (each terminator
 // calls it, before it is pushed). An open block's length is not kept
 // while statements are emitted.
-pub fn close_block(pbody: inout Body<Comp>) {
-    pbody.blocks[pbody.cur_block].len = pbody.stmts.len() as i64 - pbody.blocks[pbody.cur_block].start;
+pub fn close_block(pbody: &mut Body<Comp>) {
+    { let at_ix = pbody.cur_block as usize;
+        pbody.blocks[at_ix].len = pbody.stmts.len() as i64 - pbody.blocks[pbody.cur_block as usize].start };
 }
 
 // The operand triples of a statement start at the end of P_OPS: push them
 // with push_op, then emit with ops = the mark, nops = their count.
-pub fn ops_mark(pbody: Body<Comp>) -> i64 {
+pub fn ops_mark(pbody: &Body<Comp>) -> i64 {
     pbody.ops.len() as i64
 }
 
-pub fn push_op(kind: i64, a: i64, b: i64, pbody: inout Body<Comp>) {
+pub fn push_op(kind: i64, a: i64, b: i64, pbody: &mut Body<Comp>) {
     pbody.ops.push(kind);
     pbody.ops.push(a);
     pbody.ops.push(b);
 }
 
-pub fn op_kind(at: i64, i: i64, pbody: Body<Comp>) -> i64 {
-    pbody.ops[at + 3 * i]
+pub fn op_kind(at: i64, i: i64, pbody: &Body<Comp>) -> i64 {
+    pbody.ops[(at + 3 * i) as usize]
 }
 
-pub fn op_a(at: i64, i: i64, pbody: Body<Comp>) -> i64 {
-    pbody.ops[at + 3 * i + 1]
+pub fn op_a(at: i64, i: i64, pbody: &Body<Comp>) -> i64 {
+    pbody.ops[(at + 3 * i + 1) as usize]
 }
 
-pub fn op_b(at: i64, i: i64, pbody: Body<Comp>) -> i64 {
-    pbody.ops[at + 3 * i + 2]
+pub fn op_b(at: i64, i: i64, pbody: &Body<Comp>) -> i64 {
+    pbody.ops[(at + 3 * i + 2) as usize]
 }
 
 // Whether operand kind k is of a place.
@@ -753,25 +771,25 @@ pub fn is_terminator(kind: i64) -> bool {
 }
 
 // The successors of block b's terminator: their count, then each.
-pub fn succ_count(b: i64, pbody: Body<Comp>) -> i64 {
+pub fn succ_count(b: i64, pbody: &Body<Comp>) -> i64 {
     let t = block_term(b, pbody);
-    let k = pbody.stmts[t].kind;
+    let k = pbody.stmts[t as usize].kind;
     if k == TK_GOTO {
         return 1;
     }
     if k == TK_SWITCH {
-        return pbody.stmts[t].b + 1;
+        return pbody.stmts[t as usize].b + 1;
     }
     0
 }
 
-pub fn succ(b: i64, i: i64, pbody: Body<Comp>) -> i64 {
+pub fn succ(b: i64, i: i64, pbody: &Body<Comp>) -> i64 {
     let t = block_term(b, pbody);
-    let s = pbody.stmts[t];
+    let s = pbody.stmts[t as usize];
     if s.kind == TK_GOTO {
         return s.a;
     }
-    if i < s.b { pbody.targets[s.a + 2 * i + 1] } else { s.c }
+    if i < s.b { pbody.targets[(s.a + 2 * i + 1) as usize] } else { s.c }
 }
 
 // ---- Points (§3.6) ----

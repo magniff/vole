@@ -2,16 +2,16 @@
 ## (tests/refactor/shorthand015/): a field shorthand `S { x }` is both
 ## the field and the value, so a renamed field writes `S { y: x }` and a
 ## renamed local, parameter or const `S { x: y }`; inline puts `x: ARG`;
-## --add with --fill-calls (or before a parameter without a default)
-## writes the value into the calls, with a note; extract-function and
+## --add writes the value into the calls (0.28.0: always; no parameter
+## has a default value); extract-function and
 ## inline refuse `?`, which may return from the function (the program has
 ## the `?` stub's error).
 $ refactor field P --rename x px --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -4 +4 @@
--struct P { x: i64, y: i64 }
-+struct P { px: i64, y: i64 }
+-#[derive(Clone, Copy)] struct P { x: i64, y: i64 }
++#[derive(Clone, Copy)] struct P { px: i64, y: i64 }
 @@ -10 +10 @@
 -    P { x, y }
 +    P { px: x, y }
@@ -76,7 +76,6 @@ $ refactor signature make --add 'z: i64 = 5' --at 0 --dry-run
 @@ -22 +22 @@
 -    let p = make(1, 2);
 +    let p = make(5, 1, 2);
-note refactor.fill-calls: the calls get the value (a default is on trailing parameters only, and a later one has none)
 $ refactor extract-function half --lines 30-31 --to part --dry-run
 error refactor.escapes: line 30 may return (`?`) from crate::half: out of lines 30-31, which NEW cannot do for its caller
 try: volec query show main.vl:30
@@ -85,12 +84,6 @@ $ refactor inline half --dry-run
 error refactor.escapes: crate::half may return early (`?`), on line 30: inline takes a function that ends with its value
 try: volec query show main.vl:30
 [exit 1]
-$ explain refactor.fill-calls
-refactor.fill-calls: note, exit 0
-`refactor signature FN --add 'x: T = V'` (0.15) declares V as x's default and leaves the calls as they are; but with --fill-calls, for a trait's function (which has no defaults) or before a parameter without one (defaults are on trailing parameters only), every call gets V, as in 0.14: by position, or `x: V` when a parameter before x is left to its default.
-fix: Nothing to fix; leave out --fill-calls, or add x after the parameters without a default (--at), to declare a default instead.
-example:
-    note refactor.fill-calls: the calls get the value (a trait's function has no defaults)
 ## (0.16) A tool's name with its `-` lists its codes; a subcommand's own
 ## help.
 $ explain same-output

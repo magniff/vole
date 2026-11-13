@@ -20,15 +20,13 @@ reads it and prints it back:
 
 ```vole guess.vl
 use std::io;
-use std::io::BufReader;
 
 fn main(gpa: Gpa) {
     println("Guess the number!");
     println("Please input your guess.");
 
-    var input = BufReader::new(io::stdin());
-    var line = String::new_in(gpa);
-    input.read_line(&line).unwrap();
+    let mut line = String::new_in(gpa);
+    io::stdin().read_line(&mut line).unwrap();
 
     println("You guessed: {}", line.trim());
 }
@@ -55,14 +53,13 @@ There is quite a lot in these few lines. Let's go through them.
 
 ```vole skip
 use std::io;
-use std::io::BufReader;
 ```
 
 Vole comes with a standard library, `std`, organized in modules.
-`std::io` is the module for input and output. The first line makes it
+`std::io` is the module for input and output. This line makes it
 available under its last name, `io`, so we can write `io::stdin()`.
-The second brings one item from that module, `BufReader`, into scope by
-name.
+A `use` line can also bring one item of a module into scope by name:
+after `use std::io::stdin;` the call would be just `stdin()`.
 
 In chapter 1 we used `println` without any `use` line, because it's in
 the prelude, the handful of names every file gets for free. Everything
@@ -94,22 +91,16 @@ a program that needs memory starts.
 ### Variables
 
 ```vole skip
-    var input = BufReader::new(io::stdin());
-    var line = String::new_in(gpa);
+    let mut line = String::new_in(gpa);
 ```
 
-These two lines make variables. A variable made with `var` can change
-later; one made with `let` cannot. We'll be changing both of these, so
-they are `var`s.
-
-`io::stdin()` is the program's standard input: what you type, or what
-another program sends it. `BufReader::new` wraps it in a reader that
-reads in large blocks and hands out a line at a time. (`Type::name` is
-how you call a function that belongs to a type; `new` is the usual name
-for one that makes a value.)
+This line makes a variable. A variable made with `let mut` can change
+later; one made with a plain `let` cannot. We'll be changing this one,
+so it is a `let mut`.
 
 `line` is a `String`, a growable piece of text. `String::new_in(gpa)`
-makes an empty one that gets its memory from `gpa`. The `_in` at the end
+makes an empty one that gets its memory from `gpa`. (`Type::name` is
+how you call a function that belongs to a type.) The `_in` at the end
 of the name is a convention you'll see all over the standard library:
 it marks a function that allocates, and it takes the allocator as its
 last argument.
@@ -118,76 +109,73 @@ What happens if you forget the allocator? Here's a program that tries:
 
 ```vole
 fn main() {
-    var line = String::new();
+    let mut line = String::new();
     line.push_str("hi");
-    println(line);
+    println("{line}");
 }
 ```
 
 ```err
 error[alloc.no_in]: 'String::new' allocates from nothing: pass the allocator, last, to 'String::new_in'
- --> main.vl: line 2, column 16
+ --> main.vl: line 2, column 20
   = help: main takes the allocator: `fn main(gpa: Gpa)`, passed down as a parameter
-  = try: volec fix --only alloc main.vl
 ```
 
 The error says what to write instead, and its `help:` line says where
-the allocator comes from. Many vole errors end with `try:` lines like
-these. They are meant to be used as they are: either code to put where
+the allocator comes from. Many vole errors also end with `try:`
+lines. They are meant to be used as they are: either code to put where
 the error is, or a command to run. `volec fix` is a command that
 rewrites code for you; we'll meet it properly in chapter 17.
 
 ### Reading the line
 
 ```vole skip
-    input.read_line(&line).unwrap();
+    io::stdin().read_line(&mut line).unwrap();
 ```
 
-`read_line` reads one line from the input and appends it to `line`.
+`io::stdin()` is the program's standard input: what you type, or what
+another program sends it. `read_line` reads one line from it and
+appends it to `line`.
 
-Look at the `&` in `&line`. In vole, a function can't change a value
-you pass it unless it says so in its signature, and when it does, the
-call site says so too, with `&`. Reading this line, you know that
-`read_line` will change `line`, and that's the only argument it may
-change. Leave the `&` out and the compiler stops you:
+Look at the `&mut` in `&mut line`. In vole, a function can't change a
+value you pass it unless it says so in its signature, and when it does,
+the call says so too, with `&mut`: the function *borrows* `line` for
+the length of the call, with permission to change it. Reading this
+line, you know that `read_line` will change `line`, and that's the
+only argument it may change. A plain `&line` lends the value for
+reading only. Write that here and the compiler stops you:
 
 ```vole guess.vl
 use std::io;
-use std::io::BufReader;
 
 fn main(gpa: Gpa) {
     println("Guess the number!");
     println("Please input your guess.");
 
-    var input = BufReader::new(io::stdin());
-    var line = String::new_in(gpa);
-    input.read_line(line).unwrap();
+    let mut line = String::new_in(gpa);
+    io::stdin().read_line(&line).unwrap();
 
     println("You guessed: {}", line.trim());
 }
 ```
 
 ```err
-error[conv.marker]: 'line' is lent inout here (the callee may change it): mark it '&line'
- --> guess.vl: line 10, column 20
-  = help: an inout parameter takes '&place'; when the callee never changes it, take it let: 'volec refactor signature F --convention x let'
-  = try: volec edit patch guess.vl:10 --old '(line' --new '(&line'
+error[type error]: expected '&mut String<Gpa>', got '&String<Gpa>'
+ --> guess.vl: line 8, column 27
+  = help: the types differ in mutability (rustc E0308): the parameter takes an exclusive reference, `&mut x`
+  = try: &mut line
   = try: volec fix --suggested guess.vl
 ```
 
-"Inout" is vole's word for a parameter the function may change. The
-error also says how to fix it: put the `&` back. (The first `try:` line
-is a command that makes exactly that edit; the second fixes every
-error in the file that has an exact fix.)
+The error says what `read_line` expects, a `&mut String<Gpa>` (a
+`String` whose memory comes from a `Gpa`), and what it got. It also
+says how to fix it: the first `try:` line is the code to write there,
+and the second is a command that fixes every error in the file that has
+an exact fix.
 
 This idea, that functions say what they do with their arguments, is at
-the heart of vole. Chapter 4 explains it, along with `let` and `var`.
-
-> **If you know Rust:** `&line` here is not a reference. Vole has no
-> references to store or lifetimes to write. A parameter is read
-> (the default), changed (`inout`, marked `&` at the call) or taken
-> (`sink`). Rust's `&mut line` would be an error with a `try:` line
-> that writes `&line`.
+the heart of vole. Chapter 3 has more on `let` and `let mut`, and
+chapter 4 explains borrowing.
 
 Reading can fail: the input might be closed, or a disk might fail.
 So `read_line` doesn't return the number of bytes it read directly. It
@@ -217,18 +205,16 @@ last step; a fixed number makes the game much easier to test.
 
 ```vole guess.vl
 use std::io;
-use std::io::BufReader;
 
 fn main(gpa: Gpa) {
     println("Guess the number!");
     let secret = 42;
 
     println("Please input your guess.");
-    var input = BufReader::new(io::stdin());
-    var line = String::new_in(gpa);
-    input.read_line(&line).unwrap();
+    let mut line = String::new_in(gpa);
+    io::stdin().read_line(&mut line).unwrap();
 
-    let guess = line.trim().parse::<i64>().unwrap();
+    let guess = line.trim().parse::<i32>().unwrap();
     println("You guessed: {guess}");
 
     if guess < secret {
@@ -255,17 +241,17 @@ Too big!
 ```
 
 `let secret = 42;` makes a variable that never changes, so it's a
-`let`. Its type is `i64`, a 64-bit signed integer: vole picks `i64` for
+`let`. Its type is `i32`, a 32-bit signed integer: vole picks `i32` for
 a whole number unless something says otherwise.
 
 The line we read is text, and we want to compare numbers, so we
 convert it:
 
 ```vole skip
-    let guess = line.trim().parse::<i64>().unwrap();
+    let guess = line.trim().parse::<i32>().unwrap();
 ```
 
-`parse::<i64>()` reads the text as an `i64`. The `::<i64>` part says
+`parse::<i32>()` reads the text as an `i32`. The `::<i32>` part says
 which type to parse into; you'll see this form, called a *turbofish*,
 whenever a function needs to be told a type. Parsing can fail too (what
 if the user types "seven"?), so `parse` returns a `Result` as well, and
@@ -286,13 +272,14 @@ ok: built guess
 $ echo seven | ./guess
 Guess the number!
 Please input your guess.
-guess.vl:13:17: called unwrap on Err
+guess.vl:11:17: called `Result::unwrap()` on an `Err` value: ParseIntError { kind: InvalidDigit }
 $ echo $?
 101
 ```
 
 `parse` returned an `Err`, and `unwrap` stopped the program. The message
-gives the file, line and column of the `unwrap` that failed, and the
+starts with the file, line and column of the `unwrap` that failed. Then
+it says what went wrong: `unwrap` was called on an `Err`. The
 program exits with status 101, which in vole always means "stopped by
 a failed check". A failure like this is called a *panic*.
 
@@ -308,25 +295,23 @@ right, and deal with input that isn't a number instead of stopping:
 
 ```vole guess.vl
 use std::io;
-use std::io::BufReader;
 
 fn main(gpa: Gpa) {
     println("Guess the number!");
     let secret = 42;
 
-    var input = BufReader::new(io::stdin());
-    var line = String::new_in(gpa);
-    var tries = 0;
+    let mut line = String::new_in(gpa);
+    let mut tries = 0;
 
     loop {
         println("Please input your guess.");
         line.clear();
-        if input.read_line(&line).unwrap() == 0 {
+        if io::stdin().read_line(&mut line).unwrap() == 0 {
             println("Giving up? The number was {secret}.");
             return;
         }
 
-        let guess = match line.trim().parse::<i64>() {
+        let guess = match line.trim().parse::<i32>() {
             Ok(n) => n,
             Err(_) => {
                 println("That's not a number. Try again.");
@@ -403,7 +388,7 @@ check, the loop would ask forever, so we print the secret and leave.
 ### match
 
 ```vole skip
-        let guess = match line.trim().parse::<i64>() {
+        let guess = match line.trim().parse::<i32>() {
             Ok(n) => n,
             Err(_) => {
                 println("That's not a number. Try again.");
@@ -430,9 +415,9 @@ with.
 
 ### Counting tries
 
-`var tries = 0;` starts a counter, and `tries += 1;` adds one to it.
-Because it changes, it's a `var`. If you made it a `let`, the compiler
-would tell you:
+`let mut tries = 0;` starts a counter, and `tries += 1;` adds one to
+it. Because it changes, it's a `let mut`. If you left the `mut` out,
+the compiler would tell you:
 
 ```vole
 fn main() {
@@ -445,7 +430,7 @@ fn main() {
 ```err
 error[type error]: cannot assign to immutable variable 'tries'
  --> main.vl: line 3, column 5
-  = help: make it mutable: `var tries`
+  = help: make it mutable: `let mut tries`
 ```
 
 ## Step 4: a random secret
@@ -456,27 +441,25 @@ finished game:
 
 ```vole guess.vl
 use std::io;
-use std::io::BufReader;
 use std::random::Xoshiro256pp;
 
 fn main(gpa: Gpa) {
     println("Guess the number!");
-    var rng = Xoshiro256pp::from_entropy();
+    let mut rng = Xoshiro256pp::from_entropy();
     let secret = rng.random_range_i64(1, 101);
 
-    var input = BufReader::new(io::stdin());
-    var line = String::new_in(gpa);
-    var tries = 0;
+    let mut line = String::new_in(gpa);
+    let mut tries = 0;
 
     loop {
         println("Please input your guess.");
         line.clear();
-        if input.read_line(&line).unwrap() == 0 {
+        if io::stdin().read_line(&mut line).unwrap() == 0 {
             println("Giving up? The number was {secret}.");
             return;
         }
 
-        let guess = match line.trim().parse::<i64>() {
+        let guess = match line.trim().parse::<i32>() {
             Ok(n) => n,
             Err(_) => {
                 println("That's not a number. Try again.");
@@ -500,7 +483,7 @@ fn main(gpa: Gpa) {
 Only two lines changed, besides the new `use` line:
 
 ```vole skip
-    var rng = Xoshiro256pp::from_entropy();
+    let mut rng = Xoshiro256pp::from_entropy();
     let secret = rng.random_range_i64(1, 101);
 ```
 
@@ -510,7 +493,7 @@ random data the operating system provides, so every game is different.
 `random_range_i64(1, 101)` gives a number from 1 up to, but not
 including, 101.
 
-`rng` is a `var` because drawing a number changes the generator's
+`rng` is a `let mut` because drawing a number changes the generator's
 state, so the next number is different.
 
 Here's one game. Yours will have a different secret, of course:
@@ -542,13 +525,13 @@ compiler works out what each function may do, and it will tell you:
 
 ```console
 $ volec query effects main guess.vl
-crate::main	alloc(Gpa) io panic diverge
+crate::main	alloc(Gpa, extern) io static panic diverge
 ```
 
-That one line says `main` allocates memory from a `Gpa`, does
-input and output, uses some global state (`read_line` keeps its input
-buffer in one), may panic (all those `unwrap`s), and may never return
-(the `loop`). You never wrote any of that down: the compiler worked it
+That one line says `main` allocates memory from a `Gpa` (and
+`extern`: seeding the random numbers asks the operating system, through
+C code that has its own allocator), does input and output, may panic
+(all those `unwrap`s), and may never return (the `loop`). You never wrote any of that down: the compiler worked it
 out from the code. Chapter 12 shows how to use this, and how to make the compiler
 hold a function to a promise such as "this never allocates".
 
@@ -559,8 +542,8 @@ You wrote a complete program, and on the way you met:
 - `use` lines, which bring standard library names into scope by name;
 - `fn main(gpa: Gpa)`, the allocator, and the `_in` functions that use
   it;
-- `let` for values that stay put, `var` for ones that change;
-- `&` at a call, marking the argument the function may change;
+- `let` for values that stay put, `let mut` for ones that change;
+- `&mut` at a call, marking the argument the function may change;
 - `Result`, `unwrap`, and `match` on `Ok` and `Err`;
 - format strings;
 - `if`/`else`, `loop`, `break`, `continue` and `return`;

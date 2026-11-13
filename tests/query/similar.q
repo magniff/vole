@@ -34,7 +34,7 @@ $ similar Square::perimeter Square
     }
 // 1 of 1 structs like crate::shapes::Square, nearest first; a new one beside it: volec edit insert --after crate::shapes::Square < new.vl
 // crate::shapes::Circle	similar/shapes.vl:3-5
-pub struct Circle {
+#[derive(Clone, Copy)] pub struct Circle {
     pub r: i64,
 }
 // 2 methods (with their lines and whole contracts: query items crate::shapes::Circle)
@@ -46,8 +46,8 @@ try: volec query items
 [exit 1]
 ## `query examples` lists the kinds (they name the compiler's items).
 $ examples
-std-fn	a std function: compiler/std/*.vl, by its section (guide how add-std-fn)
-std-method	a method of a std type: its impl in compiler/std/*.vl (guide how add-std-fn)
+std-fn	a std function: compiler/std/*.vl (a rust program's: compiler/std/*.vl), by its section (guide how add-std-fn)
+std-method	a method of a std type: its impl in compiler/std/*.vl (a rust program's: compiler/std/*.vl) (guide how add-std-fn)
 peephole	an instruction-combining rule: compiler/src/middle/fold/mod.vl, called from combine (guide how add-peephole)
 egraph-rule	a rewrite rule of the e-graph: a line of rule_text, middle/egraph.vl (guide how add-peephole)
 pass	an optimization pass: fn(fi: i64) -> bool, called from middle/opt.vl (guide how add-pass)

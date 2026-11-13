@@ -302,17 +302,17 @@ function intrinsic(    i, j, p, np, ps, nt, pn, pt, m, mlist, cm, e, call, ninpu
         if ((SEM_kind == "lane") != (R_kind != "scalar" && R_kind != "none")) { ERR = "the semantics gives " (SEM_kind == "lane" ? "lanes" : "one value") ", the result is " (R_kind == "scalar" ? "one value" : "a vector"); return 0 }
         BODY = BODY "// " NAME ": " SEM "\n"
         BODY = BODY "fn " ref "(" ref_params() ") " (R_kind == "none" ? "" : "-> " ldom(R_lt) " ") "{\n"
-        if (SEM_kind == "lane" || SEM_kind == "scalar") BODY = BODY "    (" SEM_expr ") as " ldom(R_lt) "\n"
+        if (SEM_kind == "lane" || SEM_kind == "scalar") BODY = BODY "    (" wide(ix(SEM_expr), ldom(R_lt)) ") as " ldom(R_lt) "\n"
         else if (SEM_kind == "reduce") {
             j = first_vector()
             if (j == 0) { ERR = "a reduction over k without a vector parameter"; return 0 }
-            BODY = BODY "    var acc = { let k: i64 = 0; " SEM_expr " };\n"
+            BODY = BODY "    let mut acc = { let k: i64 = 0; " ix(SEM_expr) " };\n"
             BODY = BODY "    for k in 1.." P_n[j] " {\n"
-            if (SEM_op == "sum") BODY = BODY "        acc = acc + (" SEM_expr ");\n"
-            else BODY = BODY "        acc = " SEM_op "(acc, " SEM_expr ");\n"
+            if (SEM_op == "sum") BODY = BODY "        acc = acc + (" ix(SEM_expr) ");\n"
+            else BODY = BODY "        acc = " SEM_op "(acc, " ix(SEM_expr) ");\n"
             BODY = BODY "    }\n    acc as " ldom(R_lt) "\n"
         } else {
-            BODY = BODY "    for k in 0.." MLN " {\n        " SEM_slice "[" SEM_index "] = (" SEM_expr ") as " ldom(P_lt[MS]) ";\n    }\n"
+            BODY = BODY "    for k in 0.." MLN " {\n        " SEM_slice "[(" ix(SEM_index) ") as usize] = (" ix(SEM_expr) ") as " ldom(P_lt[MS]) ";\n    }\n"
         }
         BODY = BODY "}\n\n"
     } else if (hasref) {
@@ -363,24 +363,24 @@ function intrinsic(    i, j, p, np, ps, nt, pn, pt, m, mlist, cm, e, call, ninpu
 
     # check_N: the result o against the reference.
     sfx = NTEST
-    code = "fn check_" sfx "(" check_params() "o: [" (R_kind == "none" ? P_lt[MS] : CAST ? "u8" : R_lt) "], nbad: i64) -> i64 {\n"
+    code = "fn check_" sfx "(" check_params() "o: &[" (R_kind == "none" ? P_lt[MS] : CAST ? "u8" : R_lt) "], nbad: i64) -> i64 {\n"
     if (CAST) {
-        code = code "    for k in 0.." (P_n[1] * lbits(P_lt[1]) / 8) " {\n        if x[k] != o[k] {\n"
-        code = code fail_lines("k", "o[k]", "x[k]") "            return 1;\n        }\n    }\n    0\n}\n\n"
+        code = code "    for k in 0.." (P_n[1] * lbits(P_lt[1]) / 8) " {\n        if x[k as usize] != o[k as usize] {\n"
+        code = code fail_lines("k", "o[k as usize]", "x[k as usize]") "            return 1;\n        }\n    }\n    0\n}\n\n"
     } else if (R_kind == "none") {
-        code = code "    var e: [" ldom(P_lt[MS]) "; " ML "] = [" lzero(P_lt[MS]) "; " ML "];\n"
-        code = code "    for j in 0.." ML " { e[j] = " pv(MS) "[j]; }\n"
-        code = code "    " ref "(" ref_args("&e[..]", "") ");\n"
-        code = code "    for j in 0.." ML " {\n        if !" same(P_lt[MS], "e[j]", "o[j]") " {\n"
-        code = code fail_lines("j", "o[j]", "e[j] as " P_lt[MS]) "            return 1;\n        }\n    }\n    0\n}\n\n"
+        code = code "    let mut e: [" ldom(P_lt[MS]) "; " ML "] = [" lzero(P_lt[MS]) "; " ML "];\n"
+        code = code "    for j in 0.." ML " { e[j as usize] = " pv(MS) "[j as usize]; }\n"
+        code = code "    " ref "(" ref_args("&mut e[..]", "") ");\n"
+        code = code "    for j in 0.." ML " {\n        if !" same(P_lt[MS], "e[j as usize]", "o[j as usize]") " {\n"
+        code = code fail_lines("j", "o[j as usize]", "e[j as usize] as " P_lt[MS]) "            return 1;\n        }\n    }\n    0\n}\n\n"
     } else if (R_kind == "scalar") {
         code = code "    let want = " ref "(" ref_args("", "") ");\n"
         code = code "    if !" same(R_lt, "want", "o[0]") " {\n"
         code = code fail_lines("0", "o[0]", "want as " R_lt) "        return 1;\n    }\n    0\n}\n\n"
     } else {
         code = code "    for k in 0.." R_n " {\n        let want = " ref "(" ref_args("", "k") ");\n"
-        code = code "        if !" same(R_lt, "want", "o[k]") " {\n"
-        code = code fail_lines("k", "o[k]", "want as " R_lt) "            return 1;\n        }\n    }\n    0\n}\n\n"
+        code = code "        if !" same(R_lt, "want", "o[k as usize]") " {\n"
+        code = code fail_lines("k", "o[k as usize]", "want as " R_lt) "            return 1;\n        }\n    }\n    0\n}\n\n"
     }
     BODY = BODY code
 
@@ -389,14 +389,14 @@ function intrinsic(    i, j, p, np, ps, nt, pn, pt, m, mlist, cm, e, call, ninpu
     code = "fn run_" sfx "(q: i64, " run_params() "nbad: i64) -> i64 {\n"
     for (p = 1; p <= NP; p++) {
         if (P_kind[p] == "const" || P_kind[p] == "index") continue
-        code = code "    var t" p ": [" P_lt[p] "; " P_n[p] "] = [" lzero(P_lt[p]) "; " P_n[p] "];\n"
+        code = code "    let mut t" p ": [" P_lt[p] "; " P_n[p] "] = [" lzero(P_lt[p]) "; " P_n[p] "];\n"
         code = code "    for k in 0.." P_n[p] " { t" p "[k] = " pv(p) "[k] as " P_lt[p] "; }\n"
     }
-    if (CAST) code = code "    var x: [u8; " (P_n[1] * lbits(P_lt[1]) / 8) "] = [0; " (P_n[1] * lbits(P_lt[1]) / 8) "];\n    " bytes_of(P_n[1] * lbits(P_lt[1]) / 8, build(1, "t1[..]")) ".store(&x[..], 0);\n"
-    if (R_kind != "none") code = code "    var o: [" (CAST ? "u8" : R_lt) "; " out_n() "] = [" (CAST ? "0" : lzero(R_lt)) "; " out_n() "];\n"
+    if (CAST) code = code "    let mut x: [u8; " (P_n[1] * lbits(P_lt[1]) / 8) "] = [0; " (P_n[1] * lbits(P_lt[1]) / 8) "];\n    " bytes_of(P_n[1] * lbits(P_lt[1]) / 8, build(1, "&t1[..]")) ".store(&mut x[..], 0);\n"
+    if (R_kind != "none") code = code "    let mut o: [" (CAST ? "u8" : R_lt) "; " out_n() "] = [" (CAST ? "0" : lzero(R_lt)) "; " out_n() "];\n"
     for (q = 0; q < nq; q++) {
         args = call_args(q, "run")
-        code = code "    if q == " q " {\n" store_result(MOD NAME "(" args ")", "        ") "        return check_" sfx "(" check_args(q, "run") (R_kind == "none" ? "t" MS "[..]" : "o[..]") ", nbad);\n    }\n"
+        code = code "    if q == " q " {\n" store_result(MOD NAME "(" args ")", "        ") "        return check_" sfx "(" check_args(q, "run") (R_kind == "none" ? "&t" MS "[..]" : "&o[..]") ", nbad);\n    }\n"
     }
     code = code "    0\n}\n\n"
     BODY = BODY code
@@ -405,7 +405,7 @@ function intrinsic(    i, j, p, np, ps, nt, pn, pt, m, mlist, cm, e, call, ninpu
     # the edges (all lanes alike), then random lanes; the first, middle
     # and last combination of constants.
     nlit = 0
-    code = "fn fold_" sfx "(nbad: i64) -> i64 {\n    var bad: i64 = 0;\n"
+    code = "fn fold_" sfx "(nbad: i64) -> i64 {\n    let mut bad: i64 = 0;\n"
     if (MEMK == "") {
         split("0 7 4 7 -1 -1 -1", lits, " ")
         split("0 1 3 7 -1 -1 -1", lits2, " ")
@@ -429,10 +429,10 @@ function intrinsic(    i, j, p, np, ps, nt, pn, pt, m, mlist, cm, e, call, ninpu
                     }
                     code = code "        let " pv(p) ": [" ldom(P_lt[p]) "; " P_n[p] "] = [" dargs "];\n"
                 }
-                if (CAST) code = code "        var x: [u8; " (P_n[1] * lbits(P_lt[1]) / 8) "] = [0; " (P_n[1] * lbits(P_lt[1]) / 8) "];\n        " bytes_of(P_n[1] * lbits(P_lt[1]) / 8, lit_build(1)) ".store(&x[..], 0);\n"
-                code = code "        var o: [" (CAST ? "u8" : R_lt) "; " out_n() "] = [" (CAST ? "0" : lzero(R_lt)) "; " out_n() "];\n"
+                if (CAST) code = code "        let mut x: [u8; " (P_n[1] * lbits(P_lt[1]) / 8) "] = [0; " (P_n[1] * lbits(P_lt[1]) / 8) "];\n        " bytes_of(P_n[1] * lbits(P_lt[1]) / 8, lit_build(1)) ".store(&mut x[..], 0);\n"
+                code = code "        let mut o: [" (CAST ? "u8" : R_lt) "; " out_n() "] = [" (CAST ? "0" : lzero(R_lt)) "; " out_n() "];\n"
                 code = code store_result(MOD NAME "(" call_args(q, "lit") ")", "        ")
-                code = code "        bad += check_" sfx "(" check_args(q, "lit") "o[..], nbad + bad);\n    }\n"
+                code = code "        bad += check_" sfx "(" check_args(q, "lit") "&o[..], nbad + bad);\n    }\n"
                 nlit++
             }
         }
@@ -441,10 +441,10 @@ function intrinsic(    i, j, p, np, ps, nt, pn, pt, m, mlist, cm, e, call, ninpu
     BODY = BODY code
 
     # test_N: the run-time cases, then the constant ones.
-    code = "fn test_" sfx "() -> i64 {\n    var rng = Rng { s: " (hash(NAME) + 1) " };\n    var bad: i64 = 0;\n    var cases: i64 = 0;\n"
+    code = "fn test_" sfx "() -> i64 {\n    let mut rng = Rng { s: " (hash(NAME) + 1) " };\n    let mut bad: i64 = 0;\n    let mut cases: i64 = 0;\n"
     for (p = 1; p <= NP; p++) {
         if (P_kind[p] == "const" || P_kind[p] == "index") continue
-        code = code "    var " pv(p) ": [" ldom(P_lt[p]) "; " P_n[p] "] = [" lzero(P_lt[p]) "; " P_n[p] "];\n"
+        code = code "    let mut " pv(p) ": [" ldom(P_lt[p]) "; " P_n[p] "] = [" lzero(P_lt[p]) "; " P_n[p] "];\n"
     }
     code = code "    for c in 0.." ncase " {\n"
     for (p = 1; p <= NP; p++) {
@@ -463,6 +463,44 @@ function intrinsic(    i, j, p, np, ps, nt, pn, pt, m, mlist, cm, e, call, ninpu
 
 function pv(p) { return "p_" P_name[p] }
 
+# An `if` whose arms are literals, `if C { 0xffffffff } else { 0 }`, has
+# no type but the literals' own, an i32: a hex literal of eight digits or
+# more that is an arm by itself gets the reference's type.
+function wide(e, dom,    out, lit) {
+    if (e !~ /^if / || dom != "i64") return e
+    out = ""
+    while (match(e, /\{ 0x[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]+ \}/)) {
+        lit = substr(e, RSTART + 2, RLENGTH - 4)
+        out = out substr(e, 1, RSTART - 1) "{ " lit dom " }"
+        e = substr(e, RSTART + RLENGTH)
+    }
+    return out e
+}
+
+# Expression e with every index of a parameter, `NAME[E]`, as `NAME[(E)
+# as usize]`: a reference computes in i64, an index is a usize.
+function ix(e,    out, i, c, j, depth, m) {
+    out = ""
+    i = 1
+    while (i <= length(e)) {
+        c = substr(e, i, 1)
+        if (c == "[" && match(out, /[A-Za-z_][A-Za-z_0-9]*$/) && (substr(out, RSTART) in PIDX)) {
+            depth = 1
+            for (j = i + 1; j <= length(e) && depth > 0; j++) {
+                m = substr(e, j, 1)
+                if (m == "[") depth++
+                else if (m == "]") depth--
+            }
+            out = out "[(" ix(substr(e, i + 1, j - i - 2)) ") as usize]"
+            i = j
+            continue
+        }
+        out = out c
+        i++
+    }
+    return out
+}
+
 function first_vector(    p) {
     for (p = 1; p <= NP; p++) if (P_kind[p] == "vec" || P_kind[p] == "opaque" || P_kind[p] == "tuple") return p
     return 0
@@ -470,17 +508,17 @@ function first_vector(    p) {
 
 function out_n() { return CAST ? R_n * lbits(R_lt) / 8 : R_kind == "scalar" ? 1 : R_n }
 
-# The reference's parameters: a vector or a slice is its lanes ([D]), a
+# The reference's parameters: a vector or a slice is its lanes (&[D]), a
 # scalar its value (D), a constant or an index an i64; the store's slice
-# is `&[D]`; then `k: i64` for a vector result.
+# is `&mut [D]`; then `k: i64` for a vector result.
 function ref_params(    p, s) {
     s = ""
     for (p = 1; p <= NP; p++) {
         s = s (p > 1 ? ", " : "") P_name[p] ": "
         if (P_kind[p] == "const" || P_kind[p] == "index") s = s "i64"
         else if (P_kind[p] == "scalar") s = s ldom(P_lt[p])
-        else if (P_kind[p] == "slice" && R_kind == "none") s = s "inout [" ldom(P_lt[p]) "]"
-        else s = s "[" ldom(P_lt[p]) "]"
+        else if (P_kind[p] == "slice" && R_kind == "none") s = s "&mut [" ldom(P_lt[p]) "]"
+        else s = s "&[" ldom(P_lt[p]) "]"
     }
     if (R_kind != "none" && R_kind != "scalar") s = s (NP ? ", " : "") "k: i64"
     return s
@@ -507,9 +545,9 @@ function check_params(    p, s) {
     s = ""
     for (p = 1; p <= NP; p++) {
         if (P_kind[p] == "const" || P_kind[p] == "index") s = s pv(p) ": i64, "
-        else s = s pv(p) ": [" ldom(P_lt[p]) "], "
+        else s = s pv(p) ": &[" ldom(P_lt[p]) "], "
     }
-    if (CAST) s = s "x: [u8], "
+    if (CAST) s = s "x: &[u8], "
     return s
 }
 function check_args(q, how,    p, s, j) {
@@ -517,9 +555,9 @@ function check_args(q, how,    p, s, j) {
     for (p = 1; p <= NP; p++) {
         if (P_kind[p] == "const") s = s const_value(q, p) ", "
         else if (P_kind[p] == "index") s = s pv(p) ", "
-        else s = s pv(p) (how == "lit" ? "[..]" : "") ", "
+        else s = s (how == "lit" ? "&" pv(p) "[..]" : pv(p)) ", "
     }
-    if (CAST) s = s "x[..], "
+    if (CAST) s = s "&x[..], "
     return s
 }
 function const_value(q, p,    j) {
@@ -533,7 +571,7 @@ function run_params(    p, s) {
     for (p = 1; p <= NP; p++) {
         if (P_kind[p] == "const") continue
         if (P_kind[p] == "index") s = s pv(p) ": i64, "
-        else s = s pv(p) ": [" ldom(P_lt[p]) "], "
+        else s = s pv(p) ": &[" ldom(P_lt[p]) "], "
     }
     return s
 }
@@ -542,7 +580,7 @@ function run_args(    p, s) {
     for (p = 1; p <= NP; p++) {
         if (P_kind[p] == "const") continue
         if (P_kind[p] == "index") s = s pv(p) ", "
-        else s = s pv(p) "[..], "
+        else s = s "&" pv(p) "[..], "
     }
     return s
 }
@@ -580,22 +618,22 @@ function call_args(q, how,    p, s) {
         s = s (p > 1 ? ", " : "")
         if (P_kind[p] == "const") s = s const_value(q, p)
         else if (P_kind[p] == "index") s = s pv(p)
-        else if (P_kind[p] == "slice") s = s (MEMK == "store" ? "&t" p "[..]" : "t" p "[..]")
+        else if (P_kind[p] == "slice") s = s (MEMK == "store" ? "&mut t" p "[..]" : "&t" p "[..]")
         else if (P_kind[p] == "scalar") s = s (how == "lit" ? LITLANES[p] : "t" p "[0]")
-        else s = s (how == "lit" ? lit_build(p) : build(p, "t" p "[..]"))
+        else s = s (how == "lit" ? lit_build(p) : build(p, "&t" p "[..]"))
     }
     return s
 }
 
 # The statement keeping the result c in o.
 function store_result(c, ind,    j, s) {
-    if (CAST) return ind bytes_of(R_n * lbits(R_lt) / 8, c) ".store(&o[..], 0);\n"
+    if (CAST) return ind bytes_of(R_n * lbits(R_lt) / 8, c) ".store(&mut o[..], 0);\n"
     if (R_kind == "none") return ind c ";\n"
     if (R_kind == "scalar") return ind "o[0] = " c ";\n"
-    if (R_kind == "vec") return ind c ".store(&o[..], 0);\n"
-    if (R_kind == "opaque") return ind R_vt "::from_bits(" c ").store(&o[..], 0);\n"
+    if (R_kind == "vec") return ind c ".store(&mut o[..], 0);\n"
+    if (R_kind == "opaque") return ind R_vt "::from_bits(" c ").store(&mut o[..], 0);\n"
     s = ind "let r = " c ";\n"
-    for (j = 0; j < R_tm; j++) s = s ind "r." j ".store(&o[..], " (j * R_vn) ");\n"
+    for (j = 0; j < R_tm; j++) s = s ind "r." j ".store(&mut o[..], " (j * R_vn) ");\n"
     return s
 }
 
@@ -621,7 +659,7 @@ function fail_lines(k, got, want,    p, s) {
 function fill_call(p, c, ne, nr, x8, n8, lx,    lt, f) {
     lt = P_lt[p]
     f = lfloat(lt) ? "fill_float" : ldom(lt) == "u64" ? "fill_u64" : "fill_int"
-    return f "(&rng, " c ", " (p - 1) ", &" pv(p) "[..], " lbits(lt) ", " (lsigned(lt) ? "true" : "false") ", " ne ", " nr ", " x8 ", " n8 ", " (lx ? lx : 1) ")"
+    return f "(&mut rng, " c ", " (p - 1) ", &mut " pv(p) "[..], " lbits(lt) ", " (lsigned(lt) ? "true" : "false") ", " ne ", " nr ", " x8 ", " n8 ", " (lx ? lx : 1) ")"
 }
 
 # ---- Programs ----
@@ -645,7 +683,7 @@ function flush(    f, i, r, u, ot) {
         print "" >f
     }
     printf "%s", BODY >f
-    print "fn main() -> i32 {\n    var bad: i64 = 0;" >f
+    print "fn main() -> i32 {\n    let mut bad: i64 = 0;" >f
     for (i = 0; i < NTESTS; i++) print MAINS[i] >f
     print "    if bad != 0 {\n        println(\"" PREFIX "_" FAMILY ": {bad} failing\");\n        return 1;\n    }\n    0\n}" >f
     close(f)
@@ -672,37 +710,37 @@ BEGIN {
     FAMILY = "all"; FAMILY_TITLE = "std::arch"; PART = 1
     # The prelude: the random inputs, the edges, the comparisons.
     PRELUDE = "struct Rng { s: u64 }\n\n" \
-        "fn next(r: inout Rng) -> u64 {\n    var x = r.s;\n    x = x ^ (x << 13);\n    x = x ^ (x >> 7);\n    x = x ^ (x << 17);\n    r.s = x;\n    x\n}\n\n" \
-        "fn max<T>(a: T, b: T) -> T { if a > b { a } else { b } }\n" \
-        "fn min<T>(a: T, b: T) -> T { if a < b { a } else { b } }\n" \
+        "fn next(r: &mut Rng) -> u64 {\n    let mut x = r.s;\n    x = x ^ (x << 13);\n    x = x ^ (x >> 7);\n    x = x ^ (x << 17);\n    r.s = x;\n    x\n}\n\n" \
+        "fn max<T: PartialOrd>(a: T, b: T) -> T { if a > b { a } else { b } }\n" \
+        "fn min<T: PartialOrd>(a: T, b: T) -> T { if a < b { a } else { b } }\n" \
         "fn abs(a: i64) -> i64 { if a < 0 { -a } else { a } }\n" \
         "fn clamp(a: i64, lo: i64, hi: i64) -> i64 { if a < lo { lo } else if a > hi { hi } else { a } }\n\n" \
-        "fn show<T>(xs: [T]) {\n    print(\"[\");\n    for k in 0..xs.len as i64 {\n        if k > 0 { print(\" \"); }\n        print(\"{}\", xs[k]);\n    }\n    print(\"]\");\n}\n\n" \
+        "fn show<T: std::fmt::Display>(xs: &[T]) {\n    print(\"[\");\n    for k in 0..xs.len() {\n        if k > 0 { print(\" \"); }\n        print(\"{}\", xs[k]);\n    }\n    print(\"]\");\n}\n\n" \
         "// The integer edges: 0, 1, 2, MAX, MIN, MIN + 1, -2, -1, 0x55.., 0x33..\n" \
         "fn edge_bits(e: i64, bits: i64) -> u64 {\n    let ones: u64 = if bits == 64 { 0xffffffffffffffffu64 } else { (1u64 << bits) - 1 };\n    let top: u64 = 1u64 << (bits - 1);\n" \
         "    if e == 0 { return 0; }\n    if e == 1 { return 1; }\n    if e == 2 { return 2; }\n    if e == 3 { return top - 1; }\n    if e == 4 { return top; }\n    if e == 5 { return top + 1; }\n    if e == 6 { return ones - 1; }\n    if e == 7 { return ones; }\n    if e == 8 { return ones / 3; }\n    ones / 5\n}\n\n" \
         "// The float edges: 0, -0, 1, -1, inf, -inf, NaN, the least denormal, MAX, the least normal.\n" \
         "fn float_edge(e: i64, bits: i64) -> u64 {\n    let f32s: [u64; 10] = [0, 0x80000000, 0x3f800000, 0xbf800000, 0x7f800000, 0xff800000, 0x7fc00000, 1, 0x7f7fffff, 0x00800000];\n" \
         "    let f64s: [u64; 10] = [0, 0x8000000000000000, 0x3ff0000000000000, 0xbff0000000000000, 0x7ff0000000000000, 0xfff0000000000000, 0x7ff8000000000000, 1, 0x7fefffffffffffff, 0x0010000000000000];\n" \
-        "    if bits == 32 { f32s[e] } else { f64s[e] }\n}\n\n" \
-        "fn float_of(x: u64, bits: i64) -> f64 {\n    if bits == 32 {\n        let t: [i32; 4] = [x as i32; 4];\n        var o: [f32; 4] = [0.0; 4];\n        v4f32::from_bits(v4i32::load(t[..], 0)).store(&o[..], 0);\n        return o[0] as f64;\n    }\n" \
-        "    let t: [i64; 2] = [x as i64; 2];\n    var o: [f64; 2] = [0.0; 2];\n    v2f64::from_bits(v2i64::load(t[..], 0)).store(&o[..], 0);\n    o[0]\n}\n\n" \
+        "    if bits == 32 { f32s[e as usize] } else { f64s[e as usize] }\n}\n\n" \
+        "fn float_of(x: u64, bits: i64) -> f64 {\n    if bits == 32 {\n        let t: [i32; 4] = [x as i32; 4];\n        let mut o: [f32; 4] = [0.0; 4];\n        v4f32::from_bits(v4i32::load(&t[..], 0)).store(&mut o[..], 0);\n        return o[0] as f64;\n    }\n" \
+        "    let t: [i64; 2] = [x as i64; 2];\n    let mut o: [f64; 2] = [0.0; 2];\n    v2f64::from_bits(v2i64::load(&t[..], 0)).store(&mut o[..], 0);\n    o[0]\n}\n\n" \
         "fn same_float(want: f64, got: f64) -> bool {\n    if want != want { return got != got; }\n    if want == 0.0 && got == 0.0 { return 1.0 / want == 1.0 / got; }\n    want == got\n}\n\n" \
         "// Lane k of input p in case c: below ne an edge (every pair of the\n// first two inputs), then four cases of mixed edges, nr random ones\n// (an edge, a small value or any), then every 8-bit value (n8 = 1) or\n// pair (n8 = 2) of the 8-bit inputs (x8 = 0, 1; -1: random).\n" \
-        "fn case_bits(rng: inout Rng, c: i64, p: i64, k: i64, n: i64, bits: i64, ne: i64, nr: i64, x8: i64, n8: i64, lx: i64) -> u64 {\n" \
+        "fn case_bits(rng: &mut Rng, c: i64, p: i64, k: i64, n: i64, bits: i64, ne: i64, nr: i64, x8: i64, n8: i64, lx: i64) -> u64 {\n" \
         "    if c < ne {\n        if p == 0 { return edge_bits(c % 10, bits); }\n        if p == 1 { return edge_bits((c / 10) % 10, bits); }\n        return edge_bits((c + p) % 10, bits);\n    }\n" \
         "    if c < ne + 4 { return edge_bits((k + 3 * p + c) % 10, bits); }\n" \
         "    if c >= ne + 4 + nr && x8 >= 0 {\n        let j = (c - ne - 4 - nr) * lx + k;\n        if n8 == 1 || x8 == 1 { return (j & 255) as u64; }\n        return ((j >> 8) & 255) as u64;\n    }\n" \
-        "    let r = next(&rng);\n    if r & 3 == 0 { return edge_bits(((r >> 8) % 10) as i64, bits); }\n    if r & 3 == 1 { return (r >> 8) % ((2 * n + 2) as u64); }\n    next(&rng)\n}\n\n" \
-        "fn fill_int(rng: inout Rng, c: i64, p: i64, dst: inout [i64], bits: i64, signed: bool, ne: i64, nr: i64, x8: i64, n8: i64, lx: i64) {\n" \
-        "    let n = dst.len as i64;\n    for k in 0..n {\n        let x = case_bits(&rng, c, p, k, n, bits, ne, nr, x8, n8, lx);\n" \
-        "        if bits == 64 {\n            dst[k] = x as i64;\n        } else {\n            let m = x & ((1u64 << bits) - 1);\n            if signed && (m >> (bits - 1)) != 0 {\n                dst[k] = (m as i64) - (1i64 << bits);\n            } else {\n                dst[k] = m as i64;\n            }\n        }\n    }\n}\n\n" \
-        "fn fill_u64(rng: inout Rng, c: i64, p: i64, dst: inout [u64], bits: i64, signed: bool, ne: i64, nr: i64, x8: i64, n8: i64, lx: i64) {\n" \
-        "    let n = dst.len as i64;\n    for k in 0..n { dst[k] = case_bits(&rng, c, p, k, n, bits, ne, nr, x8, n8, lx); }\n}\n\n" \
-        "fn fill_float(rng: inout Rng, c: i64, p: i64, dst: inout [f64], bits: i64, signed: bool, ne: i64, nr: i64, x8: i64, n8: i64, lx: i64) {\n" \
-        "    let n = dst.len as i64;\n    for k in 0..n {\n        var e: i64 = -1;\n        if c < ne { e = if p == 0 { c % 10 } else if p == 1 { (c / 10) % 10 } else { (c + p) % 10 }; }\n" \
-        "        else if c < ne + 4 { e = (k + 3 * p + c) % 10; }\n        if e >= 0 {\n            dst[k] = float_of(float_edge(e, bits), bits);\n        } else {\n" \
-        "            let r = next(&rng);\n            if r & 3 == 0 {\n                dst[k] = float_of(float_edge(((r >> 8) % 10) as i64, bits), bits);\n            } else if r & 3 == 1 {\n                dst[k] = ((r >> 8) % 64) as f64 - 32.0;\n            } else {\n                dst[k] = float_of(next(&rng), bits);\n            }\n        }\n    }\n}\n\n"
+        "    let r = next(rng);\n    if r & 3 == 0 { return edge_bits(((r >> 8) % 10) as i64, bits); }\n    if r & 3 == 1 { return (r >> 8) % ((2 * n + 2) as u64); }\n    next(rng)\n}\n\n" \
+        "fn fill_int(rng: &mut Rng, c: i64, p: i64, dst: &mut [i64], bits: i64, signed: bool, ne: i64, nr: i64, x8: i64, n8: i64, lx: i64) {\n" \
+        "    let n = dst.len() as i64;\n    for k in 0..n {\n        let x = case_bits(rng, c, p, k, n, bits, ne, nr, x8, n8, lx);\n" \
+        "        if bits == 64 {\n            dst[k as usize] = x as i64;\n        } else {\n            let m = x & ((1u64 << bits) - 1);\n            if signed && (m >> (bits - 1)) != 0 {\n                dst[k as usize] = (m as i64) - (1i64 << bits);\n            } else {\n                dst[k as usize] = m as i64;\n            }\n        }\n    }\n}\n\n" \
+        "fn fill_u64(rng: &mut Rng, c: i64, p: i64, dst: &mut [u64], bits: i64, signed: bool, ne: i64, nr: i64, x8: i64, n8: i64, lx: i64) {\n" \
+        "    let n = dst.len() as i64;\n    for k in 0..n { dst[k as usize] = case_bits(rng, c, p, k, n, bits, ne, nr, x8, n8, lx); }\n}\n\n" \
+        "fn fill_float(rng: &mut Rng, c: i64, p: i64, dst: &mut [f64], bits: i64, signed: bool, ne: i64, nr: i64, x8: i64, n8: i64, lx: i64) {\n" \
+        "    let n = dst.len() as i64;\n    for k in 0..n {\n        let mut e: i64 = -1;\n        if c < ne { e = if p == 0 { c % 10 } else if p == 1 { (c / 10) % 10 } else { (c + p) % 10 }; }\n" \
+        "        else if c < ne + 4 { e = (k + 3 * p + c) % 10; }\n        if e >= 0 {\n            dst[k as usize] = float_of(float_edge(e, bits), bits);\n        } else {\n" \
+        "            let r = next(rng);\n            if r & 3 == 0 {\n                dst[k as usize] = float_of(float_edge(((r >> 8) % 10) as i64, bits), bits);\n            } else if r & 3 == 1 {\n                dst[k as usize] = ((r >> 8) % 64) as f64 - 32.0;\n            } else {\n                dst[k as usize] = float_of(next(rng), bits);\n            }\n        }\n    }\n}\n\n"
 }
 
 /^[ \t]*#[ \t]*----/ {

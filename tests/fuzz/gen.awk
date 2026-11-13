@@ -25,7 +25,9 @@
 # every one of them live until the end, and more statements (so more
 # calls, inside loops too).
 # lang06=1 (the 0.6 language) adds functions with guards (a Drop; 0.6 to
-# 0.26.1: defer) on every way out of their blocks (a log of what ran is printed at the end), if let and
+# 0.26.1: defer) on every way out of their blocks (a log of what ran is
+# printed at the end; 0.17 to 0.27 run.sh built with --values=off, no
+# Drop ran and the log was 0), if let and
 # while let over the prelude's Option, string slices, and structural ==
 # on structs, tuples, arrays and enums with fields.
 # calls=1 (for the vole calling convention of 0.5) adds functions of 3
@@ -36,6 +38,13 @@
 # nonzero=1 makes every divisor positive and odd, for comparing with the
 # seed, whose division traps on 0 and on MIN / -1, and leaves out what the
 # seed does not have (the 0.3 language).
+#
+# The programs are in the rust edition (0.28). The seed subset (what
+# nonzero=1 writes; tests/seed-compat.awk turns it into the seed's
+# dialect): `let mut`, `mut p: T`, `*const u8`, `&mut a[i]`, an index
+# `[(E) as usize]`, a typed range `0i64..n`, `~x` (the seed's spelling
+# of an integer's complement; the rust edition reads it and `!x`).
+# Anything else a mode adds stays outside nonzero=1.
 
 function rnd(n) { return int(rand() * n) }
 
@@ -157,7 +166,7 @@ function expr(t, depth,    k, v, u, op, ops, lhs, amount) {
     }
     if (k == 7 && NA > 0) {
         v = rnd(NA)
-        if (AT[v] == t) return AN[v] "[(" expr("u64", depth - 2) ") % " AL[v] "u64]"
+        if (AT[v] == t) return AN[v] "[((" expr("u64", depth - 2) ") % " AL[v] "u64) as usize]"
     }
     if (k == 7 && rnd(2)) {
         # Integers from floats (saturating, NaN is 0) at 64 bits.
@@ -195,26 +204,26 @@ function expr(t, depth,    k, v, u, op, ops, lhs, amount) {
 # ---- The 0.6 language ----
 
 function lang06_defs() {
-    print "static var DLOG: u64 = 0;"
+    print "static mut DLOG: u64 = 0;"
     print ""
-    print "fn dnote(d: u64) { DLOG = DLOG * 31 + d; }"
+    print "fn dnote(d: u64) { unsafe { DLOG = DLOG * 31 + d; } }"
     print ""
     print "struct DNote { d: u64 }"
     print ""
-    print "impl Drop for DNote { fn drop(inout self) { dnote(self.d); } }"
+    print "impl Drop for DNote { fn drop(&mut self) { dnote(self.d); } }"
     print ""
     print "fn dfn(x: i64, n: i64) -> i64 {"
     print "    let _d1 = DNote { d: 1 };"
-    print "    var acc = x;"
-    print "    var i = 0;"
-    print "    outer: while i < n {"
+    print "    let mut acc = x;"
+    print "    let mut i = 0;"
+    print "    'outer: while i < n {"
     print "        let _d2 = DNote { d: 2 };"
     print "        i += 1;"
     print "        if acc % 3 == 0 { acc += 1; continue; }"
     print "        for j in 0..2 {"
     print "            let _d4 = DNote { d: 4 };"
-    print "            if acc > 1000 { break :outer; }"
-    print "            if j == 1 && acc % 5 == 0 { continue :outer; }"
+    print "            if acc > 1000 { break 'outer; }"
+    print "            if j == 1 && acc % 5 == 0 { continue 'outer; }"
     print "        }"
     print "        let _d3 = DNote { d: 3 };"
     print "        acc = acc * 2 + i;"
@@ -228,27 +237,27 @@ function lang06_defs() {
     print "fn iflet(x: i64) -> i64 { if let Some(v) = opt_of(x) { v } else if let 5 = x { 50 } else { -x } }"
     print ""
     print "fn wlet(x: i64) -> i64 {"
-    print "    var v = x;"
-    print "    var n = 0;"
+    print "    let mut v = x;"
+    print "    let mut n = 0;"
     print "    while let Some(h) = opt_of(v) { v = h; n += 1; if n > 60 { break; } }"
     print "    n * 100 + v"
     print "}"
     print ""
-    print "fn streq(a: [u8], b: [u8]) -> bool {"
-    print "    if a.len != b.len { return false; }"
-    print "    for i in 0..a.len { if a[i] != b[i] { return false; } }"
+    print "fn streq(a: &[u8], b: &[u8]) -> bool {"
+    print "    if a.len() != b.len() { return false; }"
+    print "    for i in 0..a.len() { if a[i] != b[i] { return false; } }"
     print "    true"
     print "}"
     print ""
-    print "struct Q { a: i64, b: u8, c: (i32, bool) }"
+    print "#[derive(Clone, Copy, PartialEq)]\nstruct Q { a: i64, b: u8, c: (i32, bool) }"
     print ""
-    print "enum R { P(i64, u8), Z, T(Q) }"
+    print "#[derive(Clone, Copy, PartialEq)]\nenum R { P(i64, u8), Z, T(Q) }"
     print ""
 }
 
 # A small i64 expression (so that comparisons are sometimes equal).
 function small06(depth) {
-    if (depth <= 0 || rnd(2)) return rnd(3)
+    if (depth <= 0 || rnd(2)) return rnd(3) "i64"
     return "(" expr("i64", depth - 1) " % 3)"
 }
 
@@ -281,9 +290,9 @@ function lang06_expr(t, depth,    k, w, n, lo, hi, words) {
     if (k == 6) {
         lo = rnd(n + 1)
         hi = lo + rnd(n - lo + 1)
-        return "(\"" w "\"[" lo ".." hi "].len as " t ")"
+        return "(\"" w "\"[" lo ".." hi "].len() as " t ")"
     }
-    if (k == 7) return "(streq(\"" w "\", \"" words[1 + rnd(5)] "\") as " t ")"
+    if (k == 7) return "(streq(\"" w "\".as_bytes(), \"" words[1 + rnd(5)] "\".as_bytes()) as " t ")"
     return "(((" small06(depth) ", " bool06() ") != (" small06(depth) ", " bool06() ")) as " t ")"
 }
 
@@ -300,9 +309,9 @@ function generic_defs() {
     print ""
     print "impl<T> GB<T> {"
     print "    fn new(v: T, w: T) -> GB<T> { GB { v: v, w: w } }"
-    print "    fn swap(self: GB<T>) -> GB<T> { GB::new(self.w, self.v) }"
+    print "    fn swap(self) -> GB<T> { GB::new(self.w, self.v) }"
     print "    fn first(self) -> T { self.v }"
-    print "    fn pick<U>(self, c: bool, u: sink U, other: sink U) -> U { if c { u } else { other } }"
+    print "    fn pick<U>(self, c: bool, u: U, other: U) -> U { if c { u } else { other } }"
     print "}"
     print ""
     print "enum GM<T> { No, Yes(T) }"
@@ -438,7 +447,7 @@ function type_defs(    s, i, n) {
     NS = 1 + rnd(2)
     for (s = 0; s < NS; s++) {
         SNF[s] = 1 + rnd(4)
-        line = "struct S" s " {"
+        line = "#[derive(Clone, Copy)]\nstruct S" s " {"
         for (i = 0; i < SNF[s]; i++) {
             SFT[s, i] = pick_type()
             if (i > 0) line = line ","
@@ -450,11 +459,11 @@ function type_defs(    s, i, n) {
         print line " }"
         print ""
         print "impl S" s " {"
-        print "    fn m0(inout self, x: " SFT[s, 0] ") {"
+        print "    fn m0(&mut self, x: " SFT[s, 0] ") {"
         print "        self.f0 = self.f0 ^ x;"
         print "    }"
-        print "    fn m1(self: S" s ") -> u64 {"
-        line = "        var h: u64 = 7;"
+        print "    fn m1(self) -> u64 {"
+        line = "        let mut h: u64 = 7;"
         print line
         for (i = 0; i < SNF[s]; i++) {
             if (is_float(SFT[s, i])) print "        h = h * 31 + ((self.f" i " * 4.0) as i64 as u64);"
@@ -463,7 +472,7 @@ function type_defs(    s, i, n) {
         print "        h"
         print "    }"
         print "    fn g(v: Self, k: i64) -> Self {"
-        print "        var w = v;"
+        print "        let mut w = v;"
         print "        w.f0 = w.f0 ^ (k as " SFT[s, 0] ");"
         print "        w"
         print "    }"
@@ -471,9 +480,9 @@ function type_defs(    s, i, n) {
         print ""
     }
     ET0 = pick_int_type(); ET1 = pick_int_type(); ET2 = pick_int_type()
-    print "enum E { V0(" ET0 "), V1(" ET1 ", " ET2 "), V2 }"
+    print "#[derive(Clone, Copy)]\nenum E { V0(" ET0 "), V1(" ET1 ", " ET2 "), V2 }"
     print ""
-    print "enum C { A, B, C, D }"
+    print "#[derive(Clone, Copy)]\nenum C { A, B, C, D }"
     print ""
 }
 
@@ -484,25 +493,25 @@ function feature_locals(    i, s) {
     for (i = 0; i < n; i++) {
         s = rnd(NS)
         SVN[NSV] = "s" i; SVS[NSV] = s
-        print "    var s" i ": S" s " = " struct_value(s, 1) ";"
+        print "    let mut s" i ": S" s " = " struct_value(s, 1) ";"
         NSV++
     }
     n = rnd(3)
     for (i = 0; i < n; i++) {
         EVN[NEV] = "e" i
-        print "    var e" i ": E = " enum_value(1) ";"
+        print "    let mut e" i ": E = " enum_value(1) ";"
         NEV++
     }
     n = rnd(2)
     for (i = 0; i < n; i++) {
         CVN[NCV] = "c" i
-        print "    var c" i ": C = " c_value() ";"
+        print "    let mut c" i ": C = " c_value() ";"
         NCV++
     }
 }
 
 # A statement on the new types, or nothing.
-function feature_statement(level,    k, v, w, s, f, op) {
+function feature_statement(level,    k, v, w, s, f, op, i, e) {
     k = rnd(6)
     if (k == 0 && NSV > 0) {
         v = rnd(NSV)
@@ -532,11 +541,18 @@ function feature_statement(level,    k, v, w, s, f, op) {
         return
     }
     if (k == 5 && NA > 0 && NSV > 0) {
-        # Writes through a slice.
+        # Writes through a slice. (0.28: a value that reads the array is
+        # taken first: the array is lent to the slice.)
         v = rnd(NA)
+        i = rnd(AL[v] - 1)
+        e = expr(AT[v], 2)
         print indent(level) "{"
-        print indent(level + 1) "let sl = " AN[v] "[1..];"
-        print indent(level + 1) "sl[" rnd(AL[v] - 1) "] = " expr(AT[v], 2) ";"
+        if (index(e, AN[v])) {
+            print indent(level + 1) "let x = " e ";"
+            e = "x"
+        }
+        print indent(level + 1) "let sl = &mut " AN[v] "[1..];"
+        print indent(level + 1) "sl[" i "] = " e ";"
         print indent(level) "}"
     }
 }
@@ -599,12 +615,12 @@ function statement(level, loops,    k, v, t, a, op, ops, n, lim, saved) {
     }
     if (k == 4 && NA > 0) {
         a = rnd(NA)
-        print indent(level) AN[a] "[(" expr("u64", 2) ") % " AL[a] "u64] = " expr(AT[a], 2) ";"
+        print indent(level) AN[a] "[((" expr("u64", 2) ") % " AL[a] "u64) as usize] = " expr(AT[a], 2) ";"
         return
     }
     if (k == 5 && NA > 0) {
         a = rnd(NA)
-        print indent(level) "*(&" AN[a] "[" rnd(AL[a]) "]) " (rnd(2) ? "=" : "+=") " " expr(AT[a], 2) ";"
+        print indent(level) "*(&mut " AN[a] "[" rnd(AL[a]) "]) " (rnd(2) ? "=" : "+=") " " expr(AT[a], 2) ";"
         return
     }
     if (k == 6 && level < 4) {
@@ -620,7 +636,7 @@ function statement(level, loops,    k, v, t, a, op, ops, n, lim, saved) {
     if (k == 7 && loops < 2 && level < 4) {
         n = NV
         lim = 1 + rnd(7)
-        print indent(level) "for i" level " in 0.." lim " {"
+        print indent(level) "for i" level " in 0i64.." lim " {"
         VN[NV] = "i" level; VT[NV] = "i64"; VM[NV] = 0; NV++
         LOOPS++
         INFOR[LOOPS] = 1
@@ -633,7 +649,7 @@ function statement(level, loops,    k, v, t, a, op, ops, n, lim, saved) {
     if (k == 8 && loops < 2 && level < 4) {
         # A while loop with its own counter.
         COUNTER++
-        print indent(level) "var w" COUNTER ": i32 = 0;"
+        print indent(level) "let mut w" COUNTER ": i32 = 0;"
         print indent(level) "while w" COUNTER " < " (1 + rnd(6)) " {"
         saved = COUNTER
         LOOPS++
@@ -653,7 +669,7 @@ function statement(level, loops,    k, v, t, a, op, ops, n, lim, saved) {
 }
 
 # The loop mode's statements: more loops, exits, slices, test chains.
-function loop_statement(level, loops,    k, n, t, lo, hi, step, start, bound, a, x, i, m, v, saved) {
+function loop_statement(level, loops,    k, n, t, lo, hi, step, start, bound, a, x, i, m, v, saved, sl, r, e) {
     k = rnd(9)
     if (level >= 4 || loops >= 3) k = 8
     if (k == 0) {
@@ -682,17 +698,17 @@ function loop_statement(level, loops,    k, n, t, lo, hi, step, start, bound, a,
         if (k == 1) {
             bound = start - 3 + rnd(40)
             if (!signed(t) && bound < 0) bound = 0
-            print indent(level) "var w" saved ": " t " = " start ";"
+            print indent(level) "let mut w" saved ": " t " = " start ";"
             print indent(level) "while w" saved " < " bound " {"
         } else if (k == 2) {
             bound = signed(t) ? start - rnd(30) : step - 1 + rnd(5)
             if (start < bound) start = bound + rnd(30)
-            print indent(level) "var w" saved ": " t " = " start ";"
+            print indent(level) "let mut w" saved ": " t " = " start ";"
             print indent(level) "while w" saved " > " bound " {"
         } else {
             step = 1
             bound = start + rnd(25)
-            print indent(level) "var w" saved ": " t " = " start ";"
+            print indent(level) "let mut w" saved ": " t " = " start ";"
             print indent(level) "while w" saved " != " bound " {"
         }
         n = NV
@@ -717,18 +733,46 @@ function loop_statement(level, loops,    k, n, t, lo, hi, step, start, bound, a,
         hi = lo + rnd(AL[a] - lo + 1)
         COUNTER++
         saved = COUNTER
+        # (0.28) Read: a `&` slice. Written: a `&mut` slice for the whole
+        # loop when the value does not read the array; when it does, the
+        # borrow checker refuses that, and each turn takes the value,
+        # then the slice anew for the one store (the same checks).
+        sl = "sl" saved
+        r = AN[a] "[" lo ".." hi "]"
         print indent(level) "{"
-        print indent(level + 1) "let sl" saved " = " AN[a] "[" lo ".." hi "];"
         x = rnd(16) == 0 ? " + 1" : ""
         if (rnd(2)) {
-            print indent(level + 1) "for j in 0..(sl" saved ".len as i64" x ") {"
             v = assignable()
-            if (rnd(2) || v < 0 || is_float(VT[v]) || is_float(AT[a])) print indent(level + 2) "sl" saved "[j] = " expr(AT[a], 1) ";"
-            else print indent(level + 2) VN[v] " ^= sl" saved "[j] as " VT[v] ";"
+            if (rnd(2) || v < 0 || is_float(VT[v]) || is_float(AT[a])) {
+                e = expr(AT[a], 1)
+                if (index(e, AN[a])) {
+                    print indent(level + 1) "let n" saved " = " r ".len();"
+                    print indent(level + 1) "for j in 0..(n" saved " as i64" x ") {"
+                    print indent(level + 2) "let x = " e ";"
+                    print indent(level + 2) "(&mut " r ")[j as usize] = x;"
+                } else {
+                    print indent(level + 1) "let " sl " = &mut " r ";"
+                    print indent(level + 1) "for j in 0..(" sl ".len() as i64" x ") {"
+                    print indent(level + 2) sl "[j as usize] = " e ";"
+                }
+            } else {
+                print indent(level + 1) "let " sl " = &" r ";"
+                print indent(level + 1) "for j in 0..(" sl ".len() as i64" x ") {"
+                print indent(level + 2) VN[v] " ^= " sl "[j as usize] as " VT[v] ";"
+            }
         } else {
-            print indent(level + 1) "var j: u64 = 0;"
-            print indent(level + 1) "while j < (sl" saved ".len" x ") as u64 {"
-            print indent(level + 2) "sl" saved "[j] = " expr(AT[a], 1) ";"
+            e = expr(AT[a], 1)
+            print indent(level + 1) "let mut j: u64 = 0;"
+            if (index(e, AN[a])) {
+                print indent(level + 1) "let n" saved " = " r ".len();"
+                print indent(level + 1) "while j < (n" saved x ") as u64 {"
+                print indent(level + 2) "let x = " e ";"
+                print indent(level + 2) "(&mut " r ")[j as usize] = x;"
+            } else {
+                print indent(level + 1) "let " sl " = &mut " r ";"
+                print indent(level + 1) "while j < (" sl ".len()" x ") as u64 {"
+                print indent(level + 2) sl "[j as usize] = " e ";"
+            }
             print indent(level + 2) "j += 1;"
         }
         print indent(level + 1) "}"
@@ -753,7 +797,7 @@ function loop_statement(level, loops,    k, n, t, lo, hi, step, start, bound, a,
     if (k == 7) {
         # A counted loop with a constant trip count (unrolled).
         n = NV
-        print indent(level) "for i" level " in " rnd(3) ".." rnd(20) " {"
+        print indent(level) "for i" level " in " rnd(3) "i64.." rnd(20) " {"
         VN[NV] = "i" level; VT[NV] = "i64"; VM[NV] = 0; NV++
         LOOPS++
         INFOR[LOOPS] = 1
@@ -781,27 +825,27 @@ function function_def(f,    i, n, t, line) {
         t = pick_type()
         FPT[f, i] = t
         if (i > 0) line = line ", "
-        line = line "p" i ": sink " t
+        line = line "mut p" i ": " t
         VN[NV] = "p" i; VT[NV] = t; VM[NV] = 1; NV++
     }
     print line ") -> u64 {"
     n = PRESSURE ? 12 + rnd(14) : 2 + rnd(4)
     for (i = 0; i < n; i++) {
         t = pick_type()
-        print "    var v" i ": " t " = " expr(t, 2) ";"
+        print "    let mut v" i ": " t " = " expr(t, 2) ";"
         VN[NV] = "v" i; VT[NV] = t; VM[NV] = 1; NV++
     }
     n = rnd(3)
     for (i = 0; i < n; i++) {
         t = pick_type()
         AN[NA] = "a" i; AT[NA] = t; AL[NA] = 2 + rnd(7)
-        print "    var a" i ": [" t "; " AL[NA] "] = [" literal(t) "; " AL[NA] "];"
+        print "    let mut a" i ": [" t "; " AL[NA] "] = [" literal(t) "; " AL[NA] "];"
         NA++
     }
     if (FEAT) feature_locals()
     statements(1, 0, PRESSURE ? 8 + rnd(10) : 4 + rnd(8))
     # The result mixes every variable and array element.
-    print "    var h: u64 = 1469598103934665603;"
+    print "    let mut h: u64 = 1469598103934665603;"
     for (i = 0; i < NV; i++) {
         if (is_float(VT[i])) print "    h = (h ^ ((" VN[i] " * 1000.0) as i64 as u64)) * 1099511628211;"
         else print "    h = (h ^ (" VN[i] " as u64)) * 1099511628211;"
@@ -835,7 +879,7 @@ BEGIN {
     print "// Generated by tests/fuzz/gen.awk, seed " seed "."
     # (run.sh gives the seed the 0.2 form, with tests/seed-compat.awk; 0.9:
     # the C calls are in unsafe blocks, which it makes plain blocks.)
-    print "extern \"C\" { fn printf(format: *u8, ...) -> i32; }"
+    print "extern \"C\" { fn printf(format: *const u8, ...) -> i32; }"
     print ""
     if (FEAT) type_defs()
     if (GEN) generic_defs()
@@ -948,7 +992,7 @@ function calls_defs(    g, i, line) {
             line = line "p" i ": " agg_type(GPT[g, i])
         }
         print line ") -> " agg_type(GR[g]) " {"
-        print "    var h: u64 = " (g + 3) ";"
+        print "    let mut h: u64 = " (g + 3) ";"
         for (i = 0; i < GNP[g]; i++) print "    h = (h ^ " agg_hash(GPT[g, i], "p" i) ") * 1099511628211;"
         print "    " agg_from(GR[g])
         print "}"

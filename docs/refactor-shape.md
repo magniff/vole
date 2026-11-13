@@ -20,7 +20,6 @@ volec rewrite 'PATTERN' 'REPLACEMENT' [--where '$x: T']... [--subst 'P' 'R']... 
 volec rewrite 'PATTERN' --list [--where ...] [--in FILE|MODULE|ITEM]   (0.16)
 volec refactor extract-function FN --lines A-B --to NEW          (0.13)
 volec refactor inline FN [--at FILE:LINE] [--keep]                 (0.13)
-volec refactor table X [--count X_COUNT] [--cap X_CAP] [--alloc PATH] (0.25.4)
 volec refactor --script FILE
 ```
 
@@ -59,14 +58,11 @@ added parameter scale: i64 to crate::geom::area, 2 calls→2 files→+2 -2 lines
 
 - `--add 'x: T = VALUE'`: the parameter, at the end or before parameter
   N (`--at N`, counting from 0, `self` included: a method's first
-  position is 1). (0.15) VALUE is the parameter's default, and the calls
-  are left as they are. The calls get VALUE instead (as written; checked
-  in each caller), as 0.14 did, with `--fill-calls`, for a trait's
-  function (it has no defaults) and before a parameter without a default
-  (defaults are on trailing parameters only): `note refactor.fill-calls`
-  says why (not for --fill-calls). A call that leaves a parameter before
-  x to its default gets `x: VALUE`, among its labelled arguments in
-  order. Without `= VALUE` only when there is no call.
+  position is 1). VALUE is written into every call (as written;
+  checked in each caller): no parameter has a default value (0.28.0;
+  `--fill-calls` is still taken and changes nothing). A call with
+  labelled arguments gets `x: VALUE` among them, in order.
+  Without `= VALUE` only when there is no call.
 - `--remove x`: refused while x is used in a body (`refactor.used`); each
   call loses the argument, given by position or (0.15) by its label;
   a call that leaves x to its default is unchanged (`warning
@@ -117,82 +113,6 @@ accesses.
 
 A `#[repr(C)]` struct's layout changes with --add, --remove and --type:
 `warning refactor.layout` (C code sharing it must change too).
-
-## refactor table (0.25.4)
-
-A table kept the way compiler/src kept them before vole had generics, a
-raw pointer, a count and a capacity grown by `base::grow`,
-
-```
-static var X: *T = 0 as *T;
-static var X_COUNT: i64 = 0;
-static var X_CAP: i64 = 0;
-```
-
-becomes `static var X: Vec<T, Comp> = Vec::new_in(Comp {});`
-(docs/design/modernize-0254.md, step 3), with every use the checker
-resolved, in every module:
-
-| before | after |
-|---|---|
-| `X = grow(X, X_COUNT, &X_CAP);` (or in `if X_COUNT >= X_CAP { ... }`) | gone |
-| `X[X_COUNT] = v; ... X_COUNT += 1;` (the increment after the unsafe block the store is in, too) | `X.push(v); ...`; a read of X_COUNT between them is `X.len() - 1` (`X_COUNT + 1`: `X.len()`) |
-| `let n = X_COUNT; ... X[n] = v;` (`n = X_COUNT;` too) | `let n = X.len(); ... X.push(v);` |
-| `let n = X_COUNT; ... X_COUNT += 1; ... X[n] = v;` | `X.push(v)`; a read between the increment and the store's end is `X.len() + 1` |
-| `X = reserve(X, &X_CAP, n);` | `X.reserve(n - X.len());` |
-| `X_COUNT` read | `X.len()` (a path keeps its prefix: `crate::m::X.len()`) |
-| `X_COUNT = 0` | `X.clear()` |
-| `X_COUNT -= k` | `X.truncate(X.len() - k)` |
-| `let m = X_COUNT; ... X_COUNT = m` (0.25.5: a rollback; m a `let` of the function set to the count, its one binding there, assigned nowhere) | `let m = X.len(); ... X.truncate(m)` |
-| `X[i]`, `X[i].f`, `X[i] = v`, `X[a..b]` | as they are |
-
-X_COUNT's and X_CAP's statics go, with their names in `use` lines (and
-`grow`'s, `reserve`'s where no call of them is left); the table's import
-is added where a file read only its count. X_COUNT's default is X without
-its trailing S, then X, with `_COUNT` (NODES: NODE_COUNT; HS: HS_COUNT),
-X_CAP's the same with `_CAP`: a static of X's module, or the one of that
-name below it; `--count` and `--cap` name others. `--alloc` names the
-allocator type (default `Comp`, crate::base::comp's).
-
-A use it cannot place refuses the whole refactor, nothing written
-(`refactor.table-use`): each one on a line, `FILE:LINE:COL: `CODE`:
-why`, then with more than three a count by reason (`refactor.table-why`):
-
-- `&X[i]` (`&X[i].f`): a raw pointer into the table, which a push may
-  move (the stress-grow gate row finds such pointers kept past a grow);
-- X itself: passed, assigned, cast, compared, freed (`elem_at(X, i)`,
-  `free(X as *u8)`, `let p = X;`);
-- X_CAP read anywhere but in the grow or its guard;
-- X_COUNT written otherwise (`X_COUNT = n`, `+= 1` with no store next to
-  it, `&X_COUNT`);
-- between a store and its increment: a `return`, `?`, a `break` or
-  `continue` out of the span, or a call that reaches code naming X_COUNT
-  (through every call the checker resolved; a call it cannot follow is
-  refused too): the count would change at another time than before;
-- (0.25.5) a call in the index of `X[i]` that may grow X (one reaching a
-  write of X or X_COUNT, through every call the checker resolved; one it
-  cannot follow too): `X[t_node(..)]` reads X's buffer and length before
-  it calls, so the element would be read through the header X had before
-  the call (a new element is refused by the bounds check, an old one read
-  from a buffer since freed). Take the index into a `let` first.
-
-Change those by hand (an index instead of a pointer; the increment moved
-next to the store), then run it again. Afterwards indexing X is safe:
-`note refactor.table-unsafe` gives the `try:` line, `fix --only
-unneeded-unsafe`, that takes away the unsafe blocks only the table's
-indexing needed; `fix --only unneeded-justified` (0.25.5) also takes the
-ones whose `// UNSAFE:` and `// SAFETY:` comments named the table, with
-those comments. `--dry-run` prints the diff, or the refusals.
-
-(0.27.0) X may be a struct's field: `refactor table Ctx.items` takes
-`items: *T` with `item_count` (the singular's, or `items_count`) and
-`item_cap` beside it in the same struct, as the compilation context
-(base::ctx::Ctx) keeps its tables. The field becomes `items: Vec<T, A>`
-(A the struct's last type parameter, `--alloc`'s when it has none), its
-value in each literal of the struct `Vec::new_in(Comp {})`; the count's
-and the capacity's fields go, with the comment lines right above them and
-their initializers, and every use is placed as a static's, its base kept
-(`cx.item_count` is `cx.items.len() as i64`). tests/refactor/table270.t.
 
 ## refactor variant
 
@@ -551,7 +471,6 @@ as it changes the program through the edit engine (`edit_replace`,
 | `refactor.unchecked` | warning | 0 | calls in code the checker did not see are not changed | |
 | `refactor.range` | error | 1 | extract-function: the lines cut a statement, or are not in FN's body | the whole statements' lines |
 | `refactor.escapes` | error | 1 | extract-function: a return, break, continue, defer or (0.15) `?` leaves the lines; inline: FN returns early or has a `?` | the lines before it; `query show FILE:LINE` |
-| `refactor.fill-calls` | note | 0 | signature --add (0.15): the calls get VALUE, not a default (a trait's function, a later parameter without a default) | |
 | `refactor.results` | error | 1 | extract-function: results NEW cannot give back | `query show FILE:LINE` |
 | `refactor.closure` | error | 1 | extract-function (0.14): a parameter or result of NEW would be a closure, whose type has no name | the lines from the closure's `let`; `query show FILE:LINE` |
 | `refactor.self`, `refactor.receiver` | error | 1 | self in a trait impl's function; a borrowed receiver used as `self` | |

@@ -6,13 +6,28 @@ in [docs/releases.md](docs/releases.md) and
 [docs/roadmap.md](docs/roadmap.md); the language in
 [docs/grammar.md](docs/grammar.md).
 
+**There is one language, with Rust's surface** (0.28.0; `target/volec
+guide rust`: where vole differs from Rust): `&T`, `&mut T`, `let mut`,
+`&'static [u8]`, Rust's meanings. An `// EDITION: rust` line is a
+comment: write it in no new file (the bootstrap's 0.27.8 still reads it
+in compiler/src/main.vl, the one file that keeps it); `--edition rust`
+is accepted and ignored (deprecated: it goes in 0.29); an error code
+`edition.*` is an ordinary error (renamed in 0.29). A static of
+compiler/src is read and written only through its accessors at its
+file's end (`get_x()`, `set_x(v)`); their `unsafe` blocks' UNSAFE:/
+SAFETY: lines (from the review in tools/statics/statics.tsv, with
+its evidence) say which functions and threads write
+and read it: a change to who writes or reads a static keeps them true.
+
 **New to vole? Run `target/volec guide` first**: the language in
-about 2k tokens, for a reader who knows Rust (where it looks like Rust
+about 2.5k tokens (10k bytes), for a reader who knows Rust (where it looks like Rust
 and means something else, std's most used items, the first errors and
 their fixes). Before using a construct you are unsure of, fetch the
 lines on it: `target/volec guide --find WORDS` or `guide
-TOPIC#SECTION` (`guide --list`: the topics; `guide --full`: the long
-form). The text is `compiler/guide/*.md`; every example in it is
+TOPIC#SECTION` (`guide --list`: the topics with their sizes; a shell
+tool that shows 30k bytes cuts `guide --full`, `guide std --whole` and
+`guide std#every-item`: send those to a file, or ask for a section or
+`--find NAME`). The text is `compiler/guide/*.md`; every example in it is
 compiled and run by `tests/run.sh guide`.
 
 ## Read source through the compiler
@@ -48,8 +63,8 @@ the edits in [docs/refactor.md](docs/refactor.md). NAME is `foo`,
 is one line, `error CODE: message`, then `try:` lines to run as they are.
 The program is the compiler's from the tree's root; an example's (any
 program's) when a FILE or FILE:LINE argument is one of its files, or
-with `--root DIR` (`query context examples/nes/check.vl:233`, `probe
-examples/nes/check.vl:235 x -- --check`); a NAME the default program
+with `--root DIR` (`query context examples/nes/check.vl:232`, `probe
+examples/nes/check.vl:234 x -- --check`); a NAME the default program
 lacks gets the `try:` of the program that defines it.
 
 **Query and edit with `target/tools/volec` while you change the
@@ -72,10 +87,9 @@ no-query: need the comment above run_gvn, show omits it` (or `# no-tool:
 every Write/Edit of a `.vl` file and every writing `volec` command:
 what changed since the last check (new errors, how many fixed) is added
 to that call's result; nothing added means no change, so do not run
-`check` after an edit. It makes only the mechanical exact fixes itself
-(a call's `&` marker, Rust's spellings, an import unused at two checks)
-and shows each change, `changed FILE:LINE: OLD -> NEW` (repeats in one
-line), then `the hook rewrote FILE: ...`, all it wrote (`volec undo`
+`check` after an edit. It makes one fix itself (it removes an import
+unused at two checks)
+and shows each change, `changed FILE:LINE: OLD -> NEW`, then `the hook rewrote FILE: ...`, all it wrote (`volec undo`
 takes it back; `VOLE_HOOK_FIX=0`: off); a new `.vl` file you Write
 outside compiler/src and compiler/std it formats (`volec fmt`) and names
 the same way; it says once when another file you changed is not
@@ -88,6 +102,18 @@ blocks the stop once if errors are left. When a tool falls short, record
 it in one line: `tools/agent-feedback "query refs" "misses uses inside
 never-instantiated generic fns"`; `tools/agent-feedback --find WORDS`
 says whether someone has seen it already (`--list`: the last ones).
+
+**Without those hooks** (opencode and other agent harnesses: only git's
+hooks run there) nothing blocks a shell read, checks an edit or stops
+you with errors left, so do it by hand: read the compiler's source with
+`target/tools/volec query context|show|grep` (a `grep` or `cat` of
+compiler/src floods the context); after every edit of a `.vl` file run
+`target/volec check` (the compiler from the tree's root; `target/volec
+check FILE.vl` a program of your own) until it prints `ok: 0 errors`;
+look at what `target/volec fix --suggested --dry-run` would write
+before running it; `target/volec fmt FILE` each `.vl` you wrote; and
+`tools/premerge.sh` before a commit. The commit hook below still
+applies (`tools/git-hooks/setup.sh` once per clone).
 
 ## The inner loop
 
@@ -141,7 +167,7 @@ load or inherited.
   `unsafe` without its `UNSAFE:`/`SAFETY:` comments, stages an
   unformatted `.vl`, or adds an example case whose SOURCE does not
   exist; a commit that changes `compiler/std` gets the
-  `compiler/src/front/stdsrc.vl` made from it, staged by the hook, and a
+  `compiler/src/front/stdsrc_rust.vl` made from it, staged by the hook, and a
   merge makes it from the merged std (no conflict on it). It runs for
   every committer, under any agent harness (Claude Code's hooks do not
   run under opencode or other tools; git's do).

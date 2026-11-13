@@ -1,8 +1,8 @@
 # 12. Effects: what a function may do
 
 A function's signature tells you a lot: what it takes, what it returns,
-which arguments it may change (`inout`) and which it takes for good
-(`sink`). It doesn't tell you what else a call might do. Will it
+which arguments it may change (`&mut`) and which it takes for good
+(by value). It doesn't tell you what else a call might do. Will it
 allocate memory? Print something? Read a global variable? Stop the
 program? In most languages you find out by reading the function, and
 everything it calls, and everything those call.
@@ -14,19 +14,19 @@ never allocates", and see what happens when a later change breaks one.
 ## What an effect is
 
 An *effect* is something a call may do beyond computing its result and
-changing its `inout` arguments. The compiler knows six of them:
+changing its `&mut` arguments. The compiler knows six of them:
 
 | effect | what it means | where it comes from |
 |---|---|---|
 | `alloc(Gpa)` | allocates memory, from a `Gpa` | `Vec::push`, `String::from_in`, anything `_in` |
 | `io` | reads or writes outside the program | printing, files, stdin |
-| `static` | touches a `static mut` or a C static (not shown in a set: `--why static`) | a `static var`, std's stdin buffer |
+| `static` | touches a `static mut` or a C static | a `static mut`, C's `errno` |
 | `panic` | may stop the program | a checked index, `unwrap`, `assert` |
-| `diverge` | may never return | `loop`, `while`, recursion |
+| `diverge` | may never return | `loop`, a `while` with no count, recursion |
 | `unsafe` | does unsafe operations itself | chapter 15 |
 
 The allocator's type is part of the effect: a function that allocates
-from `arena_scope`'s arena (chapter 8) is `alloc(ScopedArena)`. Threads add three more,
+from `arena_scope`'s arena (chapter 8) has the arena's type there. Threads add three more,
 `sync`, `thread` and `tls`, which chapter 14 shows.
 
 The compiler *infers* every function's effects, from its body and
@@ -41,10 +41,11 @@ between 0 and 2, between 2 and 4, and so on.
 
 ```vole stats.vl
 // stats: the mean and a histogram of the numbers on stdin.
+use std::io;
 
-fn mean(xs: [f64]) -> f64 {
-    var total = 0.0;
-    for x in xs {
+fn mean(xs: &[f64]) -> f64 {
+    let mut total = 0.0;
+    for &x in xs {
         total += x;
     }
     total / xs.len() as f64
@@ -55,25 +56,24 @@ fn bucket(x: f64, lo: f64, hi: f64, n: usize) -> usize {
     if i < 0 { 0 } else if i >= n as i64 { n - 1 } else { i as usize }
 }
 
-fn histogram(xs: [f64], lo: f64, hi: f64, buckets: inout [i64]) {
-    for x in xs {
+fn histogram(xs: &[f64], lo: f64, hi: f64, buckets: &mut [i64]) {
+    for &x in xs {
         let i = bucket(x, lo, hi, buckets.len());
         buckets[i] += 1;
     }
 }
 
 fn main(gpa: Gpa) {
-    let input = read_stdin_in(gpa).unwrap();
-    let text = String::from_utf8(input).unwrap();
-    var xs: Vec<f64, Gpa> = Vec::new_in(gpa);
+    let text = io::read_to_string_in(io::stdin(), gpa).unwrap();
+    let mut xs: Vec<f64, Gpa> = Vec::new_in(gpa);
     for word in text.split_whitespace() {
         xs.push(word.parse::<f64>().unwrap());
     }
-    println("mean: {:.2}", mean(xs));
-    var buckets = [0; 5];
-    histogram(xs, 0.0, 10.0, &buckets);
-    for i in 0..5 {
-        println("{:>2} to {:>2}: {}", i * 2, i * 2 + 2, buckets[i]);
+    println("mean: {:.2}", mean(&xs));
+    let mut buckets = [0i64; 5];
+    histogram(&xs, 0.0, 10.0, &mut buckets);
+    for (i, n) in buckets.iter().enumerate() {
+        println("{:>2} to {:>2}: {}", i * 2, i * 2 + 2, n);
     }
 }
 ```
@@ -108,7 +108,7 @@ $ volec query effects crate stats.vl
 crate::mean	none
 crate::bucket	none
 crate::histogram	panic
-crate::main	alloc(Gpa) io panic diverge
+crate::main	alloc(Gpa) io static panic diverge
 ```
 
 Each line is a function and its effects. Let's read them.
@@ -119,31 +119,34 @@ Each line is a function and its effects. Let's read them.
   the program if `i` is out of range. (`bucket` keeps `i` in range, but
   the compiler doesn't follow the arithmetic that far.)
 - `main` does everything: it allocates (the `Vec`, the `String`), does
-  I/O (stdin and printing), touches a static (std keeps its stdin buffer
-  in one: `--why static` shows it), may panic (the `unwrap`s), and may not return.
+  I/O (stdin and printing), touches a C static (`static`: a write that
+  fails reads C's `errno`), may panic (the `unwrap`s), and may not
+  return.
 
 That last one is surprising: `main` has no loop that could run forever.
 When an effect surprises you, ask *why*:
 
 ```console
 $ volec query effects main --why diverge stats.vl
-crate::main	alloc(Gpa) io panic diverge
-  'read_stdin_in(gpa)' at stats.vl:24:17 calls 'std::io::read_stdin_in'
-...
+crate::main	alloc(Gpa) io static panic diverge
+  'io::read_to_string_in(io::stdin(), gpa)' at stats.vl:25:16 calls 'std::io::read_to_string_in'
+  'r.read_to_string(&mut s)' at <std>:23969:5 calls 'Stdin::read_to_string'
+  'self.read_to_end(v)' at <std>:23475:17 calls 'Stdin::read_to_end'
+  'loop { ..' at <std>:23453:9 is a 'loop'
 ```
 
 `--why` prints the chain of calls from the function down to the line
-that has the effect. Here `main` calls `read_stdin_in`, and the chain
-goes on into the standard library, which reads in a `loop` until the
-input ends. The compiler can't know the input ends, so reading all of
-stdin may not return.
+that has the effect. Here `main` calls `read_to_string_in`, and the
+chain goes on into the standard library (`<std>` and a line of it),
+which reads in a `loop` until the input ends. The compiler can't know
+the input ends, so reading all of stdin may not return.
 
 `--why` works for any effect. Where does the I/O come from?
 
 ```console
 $ volec query effects main --why io stats.vl | head -2
-crate::main	alloc(Gpa) io panic diverge
-  'read_stdin_in(gpa)' at stats.vl:24:17 calls 'std::io::read_stdin_in'
+crate::main	alloc(Gpa) io static panic diverge
+  'io::read_to_string_in(io::stdin(), gpa)' at stats.vl:25:16 calls 'std::io::read_to_string_in'
 ```
 
 And `--has` turns the question around, listing the functions in a
@@ -151,7 +154,7 @@ module that have an effect:
 
 ```console
 $ volec query effects crate --has 'alloc(Gpa)' stats.vl
-crate::main	alloc(Gpa) io panic diverge
+crate::main	alloc(Gpa) io static panic diverge
 ```
 
 If you use the editor extension from chapter 1, hovering over a
@@ -170,12 +173,13 @@ touch a global, so let's say so:
 
 ```vole stats.vl
 // stats: the mean and a histogram of the numbers on stdin.
+use std::io;
 
 #[pure]
 #[no_panic]
-fn mean(xs: [f64]) -> f64 {
-    var total = 0.0;
-    for x in xs {
+fn mean(xs: &[f64]) -> f64 {
+    let mut total = 0.0;
+    for &x in xs {
         total += x;
     }
     total / xs.len() as f64
@@ -187,25 +191,24 @@ fn bucket(x: f64, lo: f64, hi: f64, n: usize) -> usize {
 }
 
 #[pure]
-fn histogram(xs: [f64], lo: f64, hi: f64, buckets: inout [i64]) {
-    for x in xs {
+fn histogram(xs: &[f64], lo: f64, hi: f64, buckets: &mut [i64]) {
+    for &x in xs {
         let i = bucket(x, lo, hi, buckets.len());
         buckets[i] += 1;
     }
 }
 
 fn main(gpa: Gpa) {
-    let input = read_stdin_in(gpa).unwrap();
-    let text = String::from_utf8(input).unwrap();
-    var xs: Vec<f64, Gpa> = Vec::new_in(gpa);
+    let text = io::read_to_string_in(io::stdin(), gpa).unwrap();
+    let mut xs: Vec<f64, Gpa> = Vec::new_in(gpa);
     for word in text.split_whitespace() {
         xs.push(word.parse::<f64>().unwrap());
     }
-    println("mean: {:.2}", mean(xs));
-    var buckets = [0; 5];
-    histogram(xs, 0.0, 10.0, &buckets);
-    for i in 0..5 {
-        println("{:>2} to {:>2}: {}", i * 2, i * 2 + 2, buckets[i]);
+    println("mean: {:.2}", mean(&xs));
+    let mut buckets = [0i64; 5];
+    histogram(&xs, 0.0, 10.0, &mut buckets);
+    for (i, n) in buckets.iter().enumerate() {
+        println("{:>2} to {:>2}: {}", i * 2, i * 2 + 2, n);
     }
 }
 ```
@@ -227,8 +230,8 @@ The attributes above a function are its *declared* effects, and the
 compiler checks them on every build:
 
 - `#[pure]` means no `alloc`, no `io`, no `static`. A pure function may
-  still panic, loop, and change its `inout` parameters: those are in its
-  signature, and every call marks them with `&`. That's why `histogram`
+  still panic, loop, and change its `&mut` parameters: those are in its
+  signature, and every call marks them with `&mut`. That's why `histogram`
   can be pure while it fills in `buckets`.
 - `#[no_alloc]`, `#[no_io]` and `#[no_panic]` each rule out one effect.
   `mean` promises both `#[pure]` and `#[no_panic]`.
@@ -258,8 +261,8 @@ fn bucket(x: f64, lo: f64, hi: f64, n: usize) -> usize {
 }
 
 #[pure]
-fn histogram(xs: [f64], lo: f64, hi: f64, buckets: inout [i64]) {
-    for x in xs {
+fn histogram(xs: &[f64], lo: f64, hi: f64, buckets: &mut [i64]) {
+    for &x in xs {
         let i = bucket(x, lo, hi, buckets.len());
         buckets[i] += 1;
     }
@@ -267,8 +270,8 @@ fn histogram(xs: [f64], lo: f64, hi: f64, buckets: inout [i64]) {
 
 fn main() {
     let xs = [1.0, 9.5];
-    var buckets = [0; 5];
-    histogram(xs, 0.0, 10.0, &buckets);
+    let mut buckets = [0i64; 5];
+    histogram(&xs, 0.0, 10.0, &mut buckets);
     println("{} {}", buckets[0], buckets[4]);
 }
 ```
@@ -291,8 +294,8 @@ allocate, but pushes onto a `Vec` it was given:
 
 ```vole
 #[no_alloc]
-fn above(xs: [f64], limit: f64, out: inout Vec<f64, Gpa>) {
-    for x in xs {
+fn above(xs: &[f64], limit: f64, out: &mut Vec<f64, Gpa>) {
+    for &x in xs {
         if x > limit {
             out.push(x);
         }
@@ -301,8 +304,8 @@ fn above(xs: [f64], limit: f64, out: inout Vec<f64, Gpa>) {
 
 fn main(gpa: Gpa) {
     let xs = [1.0, 9.5];
-    var big: Vec<f64, Gpa> = Vec::new_in(gpa);
-    above(xs, 5.0, &big);
+    let mut big: Vec<f64, Gpa> = Vec::new_in(gpa);
+    above(&xs, 5.0, &mut big);
     println("{}", big.len());
 }
 ```
@@ -326,16 +329,16 @@ A function that takes a closure can't know what the closure will do. It
 can say what it allows, in the closure's bound, with `+ effects(...)`:
 
 ```vole
-fn rescale<F: Fn(f64) -> f64 + effects(panic)>(xs: inout [f64], f: F) {
+fn rescale<F: Fn(f64) -> f64 + effects(panic)>(xs: &mut [f64], f: F) {
     for i in 0..xs.len() {
         xs[i] = f(xs[i]);
     }
 }
 
 fn main() {
-    var xs = [1.0, 2.0, 3.0];
-    rescale(&xs, |x| x * 10.0);
-    rescale(&xs, |x| {
+    let mut xs = [1.0, 2.0, 3.0];
+    rescale(&mut xs, |x| x * 10.0);
+    rescale(&mut xs, |x| {
         println("scaling {x}");
         x / 2.0
     });
@@ -358,16 +361,16 @@ whatever the closure does.
 ## Effects on traits
 
 A promise on a trait's method binds every implementation of it. The
-standard library uses this: the methods of `Eq`, `Ord` and `Hash` are
-`#[pure]`. Here's an `Eq` that prints:
+standard library uses this: the methods of `PartialEq` and `Ord` are
+`#[pure]`. Here's a `PartialEq` that prints:
 
 ```vole
 struct Word {
-    text: str,
+    text: &'static str,
 }
 
-impl Eq for Word {
-    fn eq(self, other: Word) -> bool {
+impl PartialEq for Word {
+    fn eq(&self, other: &Word) -> bool {
         println("comparing");
         self.text == other.text
     }
@@ -380,17 +383,17 @@ fn main() {
 ```
 
 ```err
-error[effect]: 'Word::eq' implements 'Eq::eq', which is #[pure], but it does io: 'println("comparing")' at main.vl: line 7, column 9 calls 'std::fmt::println'
+error[effect]: 'Word::eq' implements 'PartialEq::eq', which is #[pure], but it does io: 'println("comparing")' at main.vl: line 7, column 9 calls 'std::fmt::println'
  --> main.vl: line 6, column 5
   = help: return the data and let the caller print it, or remove #[pure] (the trait's)
   = try: volec query effects Word::eq --why io
 ```
 
 Why insist? Because a `HashMap` or a sort decides how often it calls
-`eq`, `cmp` and `hash`, and in what order; that changes when their
-insides change. An `eq` that printed, or a `hash` that counted its
-calls in a global, would make a program's behaviour depend on the
-container's internals. Pure methods make that impossible. The help's
+`eq` and `cmp`, and in what order; that changes when their insides
+change. An `eq` that printed, or a `cmp` that counted its calls in a
+global, would make a program's behaviour depend on the container's
+internals. Pure methods make that impossible. The help's
 "remove #[pure] (the trait's)" applies to your own traits; for std's,
 the way out is the first one.
 
@@ -427,7 +430,7 @@ isn't used.
 
 ## Summary
 
-- An effect is what a call may do beyond its result and its `inout`
+- An effect is what a call may do beyond its result and its `&mut`
   arguments: `alloc(A)`, `io`, `static`, `panic`, `diverge`, `unsafe`,
   and the thread effects `sync`, `thread` and `tls`.
 - The compiler infers every function's effects. `volec query effects`
@@ -437,7 +440,7 @@ isn't used.
   `#[effects(...)]` declare an upper bound, checked on every build,
   through every call.
 - A closure's bound can limit what it does (`+ effects(panic)`), and a
-  trait method's promise binds every impl; std's `Eq`, `Ord` and `Hash`
+  trait method's promise binds every impl; std's `PartialEq` and `Ord`
   are pure.
 
 Effects say what a function may *do*. The next chapter is about what it
@@ -447,9 +450,9 @@ that check them.
 ## Try it yourself
 
 - Add `#[no_panic]` to `histogram`. Read the error, then make it go
-  away without removing the promise. (Hint: `buckets.get(i)` and
-  `set`, or a counted loop, or think about what `bucket` returns.)
-- Write a `fn median(xs: [f64], gpa: Gpa) -> f64` that sorts a copy.
+  away without removing the promise. (Hint: `buckets.get_mut(i)`,
+  or a counted loop, or think about what `bucket` returns.)
+- Write a `fn median(xs: &[f64], gpa: Gpa) -> f64` that sorts a copy.
   What are its effects? Try `#[effects(alloc(Gpa), panic)]` on it.
 - Run `volec query effects crate --has io` on chapter 11's word
   counter. Which functions print, and which only compute?

@@ -130,7 +130,9 @@ base::STRESS_GROW	read by asm_thread_start before the thread starts (stress_grow
 # as main grew BUFS (it reads INSN_TEXT now, a view taken before the thread
 # starts).
 ASM_EXITS='back::objfile::assemble::asm_error back::objfile::debug::dwarf_file'
-ASM_READS='base::STRESS_GROW	base::stress_grow	set by asm_thread_start before the thread starts (stress_grow); main writes it only while it is unset'
+ASM_READS='base::STRESS_GROW	base::stress_grow	set by asm_thread_start before the thread starts (stress_grow); main writes it only while it is unset
+base::STRESS_GROW	base::get_stress_grow	(0.28.0) stress_grow'"'"'s read of it, the same
+base::STRESS_GROW	base::set_stress_grow	(0.28.0) stress_grow'"'"'s write of it, the same: only while it is unset'
 
 # Every static task code reads or writes: static <TAB> how the code cache
 # covers it (key: in the entry's key; read: recorded, cc_note; IR: in
@@ -231,7 +233,6 @@ front::effects::builtin::TABLE	IR: by a symbol'"'"'s text; the same in every bui
 front::lexer::STRS	IR: a string'"'"'s bytes (STR_H)
 front::lexer::STR_CAP	IR: the same (no string is made in a task)
 front::lexer::STR_COUNT	IR: the same
-base::ctx::Ctx.own_mode	key: options_hash
 base::ctx::Ctx.edition	key: options_hash (0.27.1: a rust body gets no parameter alias facts, gvn noalias_active)
 base::ctx::Ctx.borrowck_verdict	fact: R_ATTRS mixes the verdict in; 0.27.1, gvn noalias_active asks it of a rust body, set per body before the tasks by places/borrowck
 front::types::ENUMS	key: types_hash

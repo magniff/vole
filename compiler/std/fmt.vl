@@ -1,1225 +1,1033 @@
-// std::fmt: printing, Display and Debug, and Fmt, the formatter (0.20: from flat/fmt.vl).
+// std::fmt: Display, Debug, Formatter<'a>, fmt::Write, and the print
+// functions. Rust's shape (`fn fmt(&self, f: &mut Formatter<'_>) ->
+// fmt::Result`), with two differences that come from having no `dyn`
+// (plan §3): a Formatter is one concrete type over an erased sink (a data
+// pointer and a write function, as AnyAlloc erases an allocator), not a
+// `&mut dyn Write`, so a Debug impl is compiled once, not once per sink;
+// and the builders' `field` and `entry` are generic over the value's type
+// instead of taking a `&dyn Debug`. There are no macros: a format literal
+// at a `T: Display` parameter (`println("{x} {y:>5}")`, `format_in("{n}",
+// a)`) is checked by the compiler and made a value that displays it
+// (`edition.later: format_fns`); `write(w, "..")` and `writeln` are the
+// compiler's for `w.write_fmt("..")`, fmt::Write's or io::Write's.
 
-use std::{Allocator, Buf, Gpa, Vec, decimal_len, memcpy, panic_str, put_decimal, strlen, write};
-use std::cell::UnsafeCell;
-use std::num::{FloatFmt, write_f32, write_f64};
-use std::sync::RawLock;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use crate::alloc::Allocator;
+use crate::iter::IntoIterator;
+use crate::marker::PhantomData;
+use crate::option::Option;
+use crate::string::String;
 
-// UNSAFE: C. SAFETY: stdio.h's, stdlib.h's and pthread.h's prototypes.
-extern "C" {
+// What fmt returns: Err when the sink failed (a closed pipe), not when
+// the value cannot be shown.
+pub type Result = crate::result::Result<(), Error>;
+
+// A sink's failure. It carries nothing: the sink knows why.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+pub struct Error;
+
+// How a value shows to a user: `{x}`.
+// std2: changed: fmt(&self, &mut Formatter) -> Result (MVS: fmt(self, inout Fmt))
+#[builtin_impls(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, f64, bool)]
+pub trait Display {
+    // std2: changed: takes &self and a Formatter, returns a Result
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result;
+}
+
+// How a value shows to a programmer: `{x:?}`, `{x:#?}` (pretty).
+// std2: changed: fmt(&self, &mut Formatter) -> Result (MVS: fmt_debug(self, inout Fmt))
+#[builtin_impls(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, f64, bool)]
+pub trait Debug {
+    // mvs: Debug::fmt_debug
+    // std2: renamed
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result;
+}
+
+// `{x:x}`: lower-case hexadecimal (integers' impls built in, as each of
+// these traits'; bodies in 0.27.2).
+#[builtin_impls(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize)]
+pub trait LowerHex {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result;
+}
+
+// `{x:X}`.
+#[builtin_impls(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize)]
+pub trait UpperHex {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result;
+}
+
+// `{x:o}`.
+#[builtin_impls(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize)]
+pub trait Octal {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result;
+}
+
+// `{x:b}`.
+#[builtin_impls(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize)]
+pub trait Binary {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result;
+}
+
+// `{x:e}`: floats in scientific notation.
+#[builtin_impls(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, f64)]
+pub trait LowerExp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result;
+}
+
+// `{x:E}`.
+#[builtin_impls(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, f64)]
+pub trait UpperExp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result;
+}
+
+// `{p:p}`: a pointer's address.
+pub trait Pointer {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result;
+}
+
+// A sink of text: what `write(w, "..")` writes into when w is a String
+// (or any type that implements it). Never fails for a String.
+pub trait Write {
+    fn write_str(&mut self, s: &str) -> Result;
+
+    fn write_char(&mut self, c: char) -> Result {
+        self.write_str(c.encode_utf8(&mut [0u8; 4]))
+    }
+
+    // x written as its Display shows it (a format literal: the compiler's
+    // `write(w, "..")`).
+    fn write_fmt<T: Display>(&mut self, x: T) -> Result {
+        let mut f = Formatter::new(self);
+        crate::fmt::Display::fmt(&x, &mut f)
+    }
+}
+
+// A Formatter is a sink of text too (Rust's `impl Write for Formatter`):
+// `write(f, "..")` in a Display impl writes through it.
+impl<'a> Write for Formatter<'a> {
+    fn write_str(&mut self, s: &str) -> Result {
+        Formatter::write_str(self, s)
+    }
+}
+
+// A reference displays and debugs as what it refers to.
+impl<T: Display + ?Sized> Display for &T {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        Display::fmt(&**self, f)
+    }
+}
+
+impl<T: Debug + ?Sized> Debug for &T {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        Debug::fmt(&**self, f)
+    }
+}
+
+impl<T: Display + ?Sized> Display for &mut T {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        Display::fmt(&**self, f)
+    }
+}
+
+impl<T: Debug + ?Sized> Debug for &mut T {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        Debug::fmt(&**self, f)
+    }
+}
+
+impl Debug for () {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        f.pad("()")
+    }
+}
+
+// Tuples debug as Rust's do: `(1, "a")`, a one-tuple `(1,)` (core's
+// tuple impls, up to 12 elements).
+// std2: new
+impl<A: Debug> Debug for (A,) {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        let mut t = f.debug_tuple("");
+        t.field(&self.0);
+        t.finish()
+    }
+}
+
+impl<A: Debug, B: Debug> Debug for (A, B) {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        let mut t = f.debug_tuple("");
+        t.field(&self.0);
+        t.field(&self.1);
+        t.finish()
+    }
+}
+
+impl<A: Debug, B: Debug, C: Debug> Debug for (A, B, C) {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        let mut t = f.debug_tuple("");
+        t.field(&self.0);
+        t.field(&self.1);
+        t.field(&self.2);
+        t.finish()
+    }
+}
+
+impl<A: Debug, B: Debug, C: Debug, D: Debug> Debug for (A, B, C, D) {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        let mut t = f.debug_tuple("");
+        t.field(&self.0);
+        t.field(&self.1);
+        t.field(&self.2);
+        t.field(&self.3);
+        t.finish()
+    }
+}
+
+impl<A: Debug, B: Debug, C: Debug, D: Debug, E: Debug> Debug for (A, B, C, D, E) {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        let mut t = f.debug_tuple("");
+        t.field(&self.0);
+        t.field(&self.1);
+        t.field(&self.2);
+        t.field(&self.3);
+        t.field(&self.4);
+        t.finish()
+    }
+}
+
+impl<A: Debug, B: Debug, C: Debug, D: Debug, E: Debug, F: Debug> Debug for (A, B, C, D, E, F) {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        let mut t = f.debug_tuple("");
+        t.field(&self.0);
+        t.field(&self.1);
+        t.field(&self.2);
+        t.field(&self.3);
+        t.field(&self.4);
+        t.field(&self.5);
+        t.finish()
+    }
+}
+
+impl<A: Debug, B: Debug, C: Debug, D: Debug, E: Debug, F: Debug, G: Debug> Debug for (A, B, C, D, E,
+    F, G) {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        let mut t = f.debug_tuple("");
+        t.field(&self.0);
+        t.field(&self.1);
+        t.field(&self.2);
+        t.field(&self.3);
+        t.field(&self.4);
+        t.field(&self.5);
+        t.field(&self.6);
+        t.finish()
+    }
+}
+
+impl<A: Debug, B: Debug, C: Debug, D: Debug, E: Debug, F: Debug, G: Debug, H: Debug> Debug for (A,
+    B, C, D, E, F, G, H) {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        let mut t = f.debug_tuple("");
+        t.field(&self.0);
+        t.field(&self.1);
+        t.field(&self.2);
+        t.field(&self.3);
+        t.field(&self.4);
+        t.field(&self.5);
+        t.field(&self.6);
+        t.field(&self.7);
+        t.finish()
+    }
+}
+
+impl<A: Debug, B: Debug, C: Debug, D: Debug, E: Debug, F: Debug, G: Debug, H: Debug,
+    I: Debug> Debug for (A, B, C, D, E, F, G, H, I) {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        let mut t = f.debug_tuple("");
+        t.field(&self.0);
+        t.field(&self.1);
+        t.field(&self.2);
+        t.field(&self.3);
+        t.field(&self.4);
+        t.field(&self.5);
+        t.field(&self.6);
+        t.field(&self.7);
+        t.field(&self.8);
+        t.finish()
+    }
+}
+
+impl<A: Debug, B: Debug, C: Debug, D: Debug, E: Debug, F: Debug, G: Debug, H: Debug, I: Debug,
+    J: Debug> Debug for (A, B, C, D, E, F, G, H, I, J) {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        let mut t = f.debug_tuple("");
+        t.field(&self.0);
+        t.field(&self.1);
+        t.field(&self.2);
+        t.field(&self.3);
+        t.field(&self.4);
+        t.field(&self.5);
+        t.field(&self.6);
+        t.field(&self.7);
+        t.field(&self.8);
+        t.field(&self.9);
+        t.finish()
+    }
+}
+
+impl<A: Debug, B: Debug, C: Debug, D: Debug, E: Debug, F: Debug, G: Debug, H: Debug, I: Debug,
+    J: Debug, K: Debug> Debug for (A, B, C, D, E, F, G, H, I, J, K) {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        let mut t = f.debug_tuple("");
+        t.field(&self.0);
+        t.field(&self.1);
+        t.field(&self.2);
+        t.field(&self.3);
+        t.field(&self.4);
+        t.field(&self.5);
+        t.field(&self.6);
+        t.field(&self.7);
+        t.field(&self.8);
+        t.field(&self.9);
+        t.field(&self.10);
+        t.finish()
+    }
+}
+
+impl<A: Debug, B: Debug, C: Debug, D: Debug, E: Debug, F: Debug, G: Debug, H: Debug, I: Debug,
+    J: Debug, K: Debug, L: Debug> Debug for (A, B, C, D, E, F, G, H, I, J, K, L) {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        let mut t = f.debug_tuple("");
+        t.field(&self.0);
+        t.field(&self.1);
+        t.field(&self.2);
+        t.field(&self.3);
+        t.field(&self.4);
+        t.field(&self.5);
+        t.field(&self.6);
+        t.field(&self.7);
+        t.field(&self.8);
+        t.field(&self.9);
+        t.field(&self.10);
+        t.field(&self.11);
+        t.finish()
+    }
+}
+
+// Where a padded value sits in its width.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Alignment {
+    Left,
+    Right,
+    Center,
+}
+
+// What a value is written into, with its hole's spec ({:>8.3}): the sink
+// erased (no dyn), the width, precision, fill, alignment and flags.
+// Its fill is a char (`edition.later: char`).
+// mvs: Fmt
+// std2: renamed
+// later: char
+pub struct Formatter<'a> {
+    out: *mut u8,
+    write: fn(*mut u8, &str) -> Result,
+    width: Option<usize>,
+    precision: Option<usize>,
+    fill: char,
+    align: Option<Alignment>,
+    flags: u32,
+    // a write failed: every later one fails too, so the last write of a
+    // format literal (`write(w, ..)`'s value) reports an earlier error,
+    // as Rust's write! stops at the first
+    failed: bool,
+    marker: PhantomData<&'a mut ()>,
+}
+
+impl<'a> Formatter<'a> {
+    // A Formatter over any fmt::Write, with an empty spec (what
+    // `write(w, ..)` makes).
+    // What a Formatter writes is its maker's effect (E4.3a): W's write_str.
+    #[effects(W)]
+    pub fn new<W: Write>(w: &'a mut W) -> Formatter<'a> {
+        Formatter {
+            out: w as *mut W as *mut u8,
+            write: write_erased::<W>,
+            width: Option::None,
+            precision: Option::None,
+            fill: ' ',
+            align: Option::None,
+            flags: 0,
+            failed: false,
+            marker: PhantomData {},
+        }
+    }
+
+    // s, as it is (no padding).
+    // mvs: Fmt::str
+    // std2: renamed
     #[effects()]
-    fn snprintf(buf: *u8, n: u64, format: *u8, ...) -> i32;
-    #[effects()]
-    fn strtod(s: *u8, end: **u8) -> f64;
-    #[effects()]
-    fn strtof(s: *u8, end: **u8) -> f32;
-    #[link_name = "pthread_self"]
-    #[effects()]
-    fn fmt_c_thread_self() -> u64;
-}
-
-// ---- Printing ----
-
-// (0.21) Printing from several threads: once a thread was started
-// (std::thread::spawn sets FMT_THREADED), each print holds a lock while it
-// fills std's buffer and writes it, so lines do not mix and the buffer is
-// never shared. A print inside a print (a Display that prints) on the
-// thread holding it takes nothing more. (0.25.5) A Fmt to a file
-// descriptor a program makes itself (Fmt::to_fd) takes the lock at its
-// first write and keeps it to its flush (fmt_guard): 0.25.4 let it use the
-// buffer without the lock, a data race with any other thread's print.
-static FMT_THREADED: AtomicU32 = AtomicU32::new(0);
-static FMT_LOCK: RawLock = RawLock::new();
-static FMT_OWNER: AtomicU64 = AtomicU64::new(0);
-// (0.26.1) Sync by std's vouch (threads.vl): reached by the lock's holder
-// (fmt_guard), or the main thread before threads run. depth: the holder's
-// holds (lazy: a Fmt::to_fd's); out: len bytes for fd, done before them.
-// (0.26.2) All zero at the start, so that the static is in bss, not 4 KiB
-// of a program's data: fd 0 owns the empty buffer, and every write to it
-// sets fd first (fmt_fd_room, fmt_str_fd, spec).
-struct PrintState { depth: i64, lazy: bool, len: i64, fd: i32, done: i64, out: [u8; 4096] }
-struct PrintCell { s: UnsafeCell<PrintState> }
-static PRINTING: PrintCell = PrintCell { s: UnsafeCell::new(PrintState {
-    depth: 0, lazy: false, len: 0, fd: 0, done: 0, out: [0; 4096],
-}) };
-
-#[inline]
-fn ps() -> *PrintState { PRINTING.s.get() }
-
-// The holds changed by d; their count after.
-#[inline]
-fn hold(d: i64) -> i64 {
-    // UNSAFE: PRINTING. SAFETY: see PrintState.
-    inout st = unsafe { &*ps() };
-    st.depth += d;
-    st.depth
-}
-
-// Called before the first thread starts.
-pub fn print_threads_started() {
-    // (0.25.5) A thread started inside a print (a Display that starts one):
-    // that print holds the lock from here on.
-    if FMT_THREADED.load(Ordering::Relaxed) == 0 && hold(0) > 0 {
-        FMT_LOCK.lock();
-        FMT_OWNER.store(fmt_thread_self(), Ordering::Relaxed);
-    }
-    FMT_THREADED.store(1, Ordering::Release);
-}
-
-#[inline]
-fn fmt_thread_self() -> u64 {
-    // UNSAFE: C. SAFETY: pthread_self takes nothing.
-    unsafe { fmt_c_thread_self() }
-}
-
-#[inline]
-fn print_acquire() {
-    if FMT_THREADED.load(Ordering::Relaxed) != 0 {
-        print_acquire_held();
-    } else {
-        hold(1);
-    }
-}
-
-#[inline(never)]
-fn print_acquire_held() {
-    let me = fmt_thread_self();
-    if FMT_OWNER.load(Ordering::Relaxed) != me {
-        FMT_LOCK.lock();
-        FMT_OWNER.store(me, Ordering::Relaxed);
-    }
-    hold(1);
-}
-
-#[inline]
-fn print_release() {
-    if FMT_THREADED.load(Ordering::Relaxed) != 0 {
-        print_release_held();
-    } else {
-        hold(-1);
-    }
-}
-
-#[inline(never)]
-fn print_release_held() {
-    if FMT_OWNER.load(Ordering::Relaxed) != fmt_thread_self() {
-        return;
-    }
-    fmt_let_go();
-}
-
-// One hold of the holder given back; the lock with the last.
-fn fmt_let_go() {
-    if hold(-1) == 0 {
-        FMT_OWNER.store(0, Ordering::Relaxed);
-        FMT_LOCK.unlock();
-    }
-}
-
-// (0.25.5) Before a Fmt to a file descriptor touches std's buffer (its
-// statics): once threads run, this thread holds the lock, taken here when
-// it did not (a Fmt::to_fd's writes; a print's holds it already) and kept
-// until a flush gives it back (fmt_unguard). Every function that reads or
-// writes the print state calls it first.
-#[inline]
-fn fmt_guard() {
-    if FMT_THREADED.load(Ordering::Relaxed) != 0 {
-        fmt_guard_held();
-    }
-}
-
-#[inline(never)]
-fn fmt_guard_held() {
-    // UNSAFE: PRINTING. SAFETY: see PrintState.
-    inout st = unsafe { &*ps() };
-    let me = fmt_thread_self();
-    if FMT_OWNER.load(Ordering::Relaxed) != me {
-        FMT_LOCK.lock();
-        FMT_OWNER.store(me, Ordering::Relaxed);
-        st.depth += 1;
-        st.lazy = true;
-    }
-}
-
-// After a flush: the hold fmt_guard took, if any, given back.
-#[inline]
-fn fmt_unguard() {
-    if FMT_THREADED.load(Ordering::Relaxed) != 0 {
-        fmt_unguard_held();
-    }
-}
-
-#[inline(never)]
-fn fmt_unguard_held() {
-    // UNSAFE: PRINTING. SAFETY: see PrintState.
-    inout st = unsafe { &*ps() };
-    if FMT_OWNER.load(Ordering::Relaxed) != fmt_thread_self() || !st.lazy {
-        return;
-    }
-    st.lazy = false;
-    fmt_let_go();
-}
-
-// What `print("{x}...")` and its kin compile to (front/check/interp.vl):
-// `let mut __out = std::__print_begin(1); WRITES; std::__print_end(&mut
-// __out);`. Not for programs to call.
-#[inline]
-pub fn __print_begin(fd: i32) -> Fmt {
-    print_acquire();
-    Fmt::to_fd(fd)
-}
-
-#[inline]
-pub fn __print_end(f: inout Fmt) {
-    f.flush();
-    print_release();
-}
-
-// x's Display (`print("text")`, `print("{a} {b:?}")`): one `write`.
-pub fn print<T: Display>(x: T) {
-    print_acquire();
-    var f = Fmt::to_fd(1);
-    x.fmt(&f);
-    f.flush();
-    print_release();
-}
-
-pub fn println<T: Display>(x: T) {
-    print_acquire();
-    var f = Fmt::to_fd(1);
-    x.fmt(&f);
-    f.byte('\n');
-    f.flush();
-    print_release();
-}
-
-#[inline(never)]
-pub fn print_int(v: i64) {
-    print_acquire();
-    var f = Fmt::to_fd(1);
-    // (decimal only: not Fmt::int, whose hex and binary every program
-    // using print_int would compile)
-    let negative = v < 0;
-    fmt_decimal(&f, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative);
-    f.flush();
-    print_release();
-}
-
-// A C string (up to its NUL).
-// UNSAFE: a C string. SAFETY: the caller's: s is NUL-ended.
-pub unsafe fn print_cstr(s: *u8) {
-    print_acquire();
-    var f = Fmt::to_fd(1);
-    f.str(s[0..strlen(s) as i64]);
-    f.flush();
-    print_release();
-}
-
-// ---- Display, Debug and Fmt (0.15) ----
-
-// x's Display on stderr.
-pub fn eprint<T: Display>(x: T) {
-    print_acquire();
-    var f = Fmt::to_fd(2);
-    x.fmt(&f);
-    f.flush();
-    print_release();
-}
-
-pub fn eprintln<T: Display>(x: T) {
-    print_acquire();
-    var f = Fmt::to_fd(2);
-    x.fmt(&f);
-    f.byte('\n');
-    f.flush();
-    print_release();
-}
-
-// (0.17) What the compiler writes for a format literal passed to
-// format_in, push_fmt, print, println, eprint or eprintln
-// (front/check/interp.vl): the holes' values, then the writes of
-// the text in place, with no closure. `format_in("..", a)` is (0.26.3:
-// a String; compilers before it make a Buf, with __fmt_in_end)
-//
-//   { let __f0 = e0; ...; let __a = a; let mut __b = std::string::String::new_in(__a);
-//     let mut __t = [0u8; 256]; let mut __out = std::__fmt_tmp(&mut __t);
-//     loop { WRITES; if std::__fmt_str_end(&mut __b, &mut __out) { break; } }
-//     __b }
-//
-// and `b.push_fmt("..")` is `{ let __r = &b; let __f0 = e0; ...; let mut
-// __out = std::__buf_fmt(&mut *__r); loop { WRITES; if
-// std::__buf_fmt_end(&mut *__r, &mut __out) { break; } } }`. Not for programs to call.
-
-// A Fmt writing into tmp (format_in's first pass).
-#[inline]
-#[views(tmp)]
-pub fn __fmt_tmp(tmp: inout [u8; 256]) -> Fmt {
-    var f = Fmt::to_fd(-1);
-    f.out = tmp[..];
-    f
-}
-
-// A Fmt writing into b's room (push_fmt).
-#[inline]
-#[views(b)]
-pub fn __buf_fmt<A: Allocator>(b: inout Buf<A>) -> Fmt {
-    fmt_to_vec(&b.bytes)
-}
-
-// The text f wrote is b's (true), or did not fit: b grows, f starts again.
-#[inline]
-pub fn __buf_fmt_end<A: Allocator>(b: inout Buf<A>, f: inout Fmt) -> bool {
-    fmt_end_vec(&b.bytes, &f)
-}
-
-// A pass of format_in ended: f's text (on the stack, from __fmt_tmp)
-// copied to v when it fit (true), else v grows and f writes into its room.
-fn fmt_in_end_vec<A: Allocator>(v: inout Vec<u8, A>, f: inout Fmt) -> bool {
-    if f.out.ptr == v.ptr {
-        return fmt_end_vec(&v, &f);
-    }
-    if f.need == 0 {
-        v.reserve(f.len as usize);
-        v.extend_from_slice(f.out[0..f.len]);
-        return true;
-    }
-    v.reserve(f.need as usize);
-    f = fmt_to_vec(&v);
-    false
-}
-
-// (format's, and 0.26.2's format_in)
-pub fn __fmt_in_end<A: Allocator>(b: inout Buf<A>, f: inout Fmt) -> bool {
-    fmt_in_end_vec(&b.bytes, &f)
-}
-
-impl<A: Allocator> Buf<A> {
-    // Appends x's Display: `b.push_fmt("{k}={v};")`. (0.16: into the room
-    // the Buf has; when the text does not fit, the Buf grows and x's
-    // Display runs again.)
-    pub fn push_fmt<T: Display>(inout self, x: sink T) {
-        var f = __buf_fmt(&self);
-        loop {
-            x.fmt(&f);
-            if __buf_fmt_end(&self, &f) {
-                return;
-            }
+    pub fn write_str(&mut self, s: &str) -> Result {
+        if self.failed {
+            return crate::result::Result::Err(Error);
         }
-    }
-}
-
-// A Fmt writing into v's room.
-#[inline]
-pub fn fmt_to_vec<A: Allocator>(v: inout Vec<u8, A>) -> Fmt {
-    var f = Fmt::to_fd(-1);
-    // UNSAFE: v's room as a slice. SAFETY: v.ptr has cap bytes (Vec's
-    // invariant); the Fmt only writes past len, and v is lent inout.
-    f.out = unsafe { v.ptr[0..v.cap] };
-    f.len = v.len;
-    f
-}
-
-// The text f wrote into v's room is v's (true), or did not fit: v grows to
-// fit it, f starts again (false).
-pub fn fmt_end_vec<A: Allocator>(v: inout Vec<u8, A>, f: inout Fmt) -> bool {
-    if f.need == 0 {
-        v.len = f.len;
-        return true;
-    }
-    v.reserve((f.need - v.len) as usize);
-    f = fmt_to_vec(&v);
-    false
-}
-
-// (0.20) x's Display written into out: its length, or -1 when it did not
-// fit (std::io's write_fmt).
-pub fn __fmt_into_len<T: Display>(out: inout [u8], x: T) -> i64 {
-    var f = Fmt::to_fd(-1);
-    f.out = out;
-    x.fmt(&f);
-    if f.need == 0 { f.len } else { -1 }
-}
-
-// (0.20) Writes out what print and println have buffered (std::io's
-// stdout() writes after it).
-pub fn __flush_print() {
-    fmt_flush();
-    fmt_unguard();
-}
-
-// `{x}` in an f-string, and what print writes.
-pub trait Display { fn fmt(self, f: inout Fmt); }
-
-// `{x:?}`: as the code that makes it.
-pub trait Debug { fn fmt_debug(self, f: inout Fmt); }
-
-// A spec's flags (front/ast.vl's FMT_*): `<`, `>`, `0`, `x`, `X`, `b`,
-// `c`; spec adds FMT_PAD to a hole with a width or a precision, and a
-// number written first in such a hole adds FMT_NUM (right-aligned,
-// zero-padded after its sign, not cut by the precision).
-const FMT_LEFT: i64 = 1;
-const FMT_RIGHT: i64 = 2;
-const FMT_ZERO: i64 = 4;
-const FMT_HEX: i64 = 8;
-const FMT_UPPER: i64 = 16;
-const FMT_BIN: i64 = 32;
-const FMT_CHAR: i64 = 64;
-const FMT_NUM: i64 = 128;
-const FMT_PAD: i64 = 256;
-// (0.26.2) `^` `+` `#` `o`; a fill byte from bit 16 (0: a space)
-const FMT_CENTER: i64 = 1024;
-const FMT_PLUS: i64 = 2048;
-const FMT_ALT: i64 = 4096;
-const FMT_OCT: i64 = 8192;
-const FMT_FILL_SHIFT: i64 = 16;
-
-// The size of the buffer of stdout and stderr (PrintState.out).
-const FMT_CAP: i64 = 4096;
-
-// Writes the buffer out.
-#[inline(never)]
-fn fmt_flush() {
-    // UNSAFE: PRINTING. SAFETY: see PrintState.
-    inout st = unsafe { &*ps() };
-    fmt_guard();
-    var i = 0;
-    // (each round writes a byte at least)
-    for _ in 0..st.len {
-        if i >= st.len {
-            break;
+        let r = (self.write)(self.out, s);
+        if r.is_err() {
+            self.failed = true;
         }
-        let rest = st.out[i..st.len];
-        // UNSAFE: C. SAFETY: rest is a slice of the static buffer.
-        let n = unsafe { write(st.fd, rest.ptr, rest.len as u64) };
-        if n <= 0 {
-            break;
+        r
+    }
+
+    // mvs: Fmt::byte
+    // std2: renamed
+    #[effects(panic)]
+    pub fn write_char(&mut self, c: char) -> Result {
+        self.write_str(c.encode_utf8(&mut [0u8; 4]))
+    }
+
+    // x as its Display shows it (a format literal inside a Display impl:
+    // `write(f, "({x}, {y})")`).
+    // mvs: Fmt::write, Fmt::display, Fmt::debug
+    // std2: renamed
+    #[effects(T)]
+    pub fn write_fmt<T: Display>(&mut self, x: T) -> Result {
+        crate::fmt::Display::fmt(&x, self)
+    }
+
+    // s padded to the width with the fill, as the alignment says (Left by
+    // default), and cut to the precision: what str's Display does.
+    #[effects(panic)]
+    pub fn pad(&mut self, s: &str) -> Result {
+        // (0.28.0: a hole with no width and no precision, the most, writes
+        // s as it is; the rest out of line, so that a format literal's
+        // closure holds a write per hole and not pad's every case)
+        if self.width.is_none() && self.precision.is_none() {
+            return self.write_str(s);
         }
-        i += n;
-    }
-    st.done += st.len;
-    st.len = 0;
-}
-
-// (0.26.1) n bytes of the buffer, taken: they fit.
-#[inline]
-fn fmt_take(n: i64) -> [u8] {
-    let st = ps();
-    // UNSAFE: PRINTING. SAFETY: see PrintState; a view of the static.
-    unsafe {
-        let at = st.len;
-        st.len = at + n;
-        st.out[at..at + n]
-    }
-}
-
-// The next n bytes of f's destination, taken, when they fit (the Buf has
-// the room, the buffer holds st.fd's bytes); else an empty slice.
-#[inline]
-fn fmt_room(f: inout Fmt, n: i64) -> [u8] {
-    // UNSAFE: PRINTING. SAFETY: see PrintState.
-    inout st = unsafe { &*ps() };
-    let at = f.len;
-    if at + n <= f.out.len as i64 {
-        f.len = at + n;
-        // UNSAFE: f's room by pointer. SAFETY: at + n <= f.out.len (checked).
-        return unsafe { f.out.ptr[at..at + n] };
-    }
-    if f.fd >= 0 {
-        fmt_guard();
-        if f.fd == st.fd && st.len + n <= FMT_CAP {
-            return fmt_take(n);
-        }
-    }
-    ""
-}
-
-// fmt_room when they do not fit (n: at most FMT_CAP): the buffer written
-// out first; to a Buf, an empty slice, the n bytes counted (fmt_lost). (A
-// Fmt's file descriptor or Buf is chosen inline, so that print compiles
-// only the file descriptor's functions.)
-#[inline]
-fn fmt_make_room(f: inout Fmt, n: i64) -> [u8] {
-    if f.fd >= 0 { fmt_fd_room(f.fd, n) } else { fmt_lost(&f, n) }
-}
-
-#[inline(never)]
-fn fmt_fd_room(fd: i32, n: i64) -> [u8] {
-    // UNSAFE: PRINTING. SAFETY: see PrintState.
-    inout st = unsafe { &*ps() };
-    fmt_guard();
-    if fd != st.fd || st.len + n > FMT_CAP {
-        fmt_flush();
-        st.fd = fd;
-    }
-    fmt_take(n)
-}
-
-// n bytes to a Buf that has no room for them: counted, not written (the
-// text is written again, push_fmt).
-#[inline(never)]
-fn fmt_lost(f: inout Fmt, n: i64) -> [u8] {
-    let end = f.len + n;
-    if end > f.need {
-        f.need = end;
-    }
-    f.len = end;
-    ""
-}
-
-// Fmt::str (a call: an f-string's text is one).
-#[inline]
-fn fmt_str(f: inout Fmt, s: [u8]) {
-    if f.fd >= 0 {
-        fmt_str_fd(f.fd, s);
-    } else {
-        fmt_str_buf(&f, s);
-    }
-}
-
-#[inline(never)]
-fn fmt_str_fd(fd: i32, s: [u8]) {
-    // UNSAFE: PRINTING. SAFETY: see PrintState.
-    inout st = unsafe { &*ps() };
-    fmt_guard();
-    let n = s.len as i64;
-    var out: [u8] = "";
-    if fd == st.fd && st.len + n <= FMT_CAP {
-        out = fmt_take(n);
-    } else if n > FMT_CAP {
-        // (written directly)
-        fmt_flush();
-        st.fd = fd;
-        var i = 0;
-        for _ in 0..n {
-            if i >= n {
-                break;
-            }
-            let rest = s[i..n];
-            // UNSAFE: C. SAFETY: rest is a slice of s.
-            let k = unsafe { write(fd, rest.ptr, rest.len as u64) };
-            if k <= 0 {
-                break;
-            }
-            i += k;
-        }
-        st.done += n;
-        return;
-    } else {
-        out = fmt_fd_room(fd, n);
-    }
-    // UNSAFE: memcpy. SAFETY: out is n bytes of room (taken above), apart from s.
-    unsafe {
-        memcpy(out.ptr, s.ptr, n as u64);
-    }
-}
-
-#[inline(never)]
-fn fmt_str_buf(f: inout Fmt, s: [u8]) {
-    let at = f.len;
-    let n = s.len as i64;
-    if at + n <= f.out.len as i64 {
-        // UNSAFE: memcpy. SAFETY: at + n <= f.out.len (checked), apart from s.
-        unsafe {
-            memcpy(&f.out.ptr[at], s.ptr, n as u64);
-        }
-        f.len = at + n;
-    } else {
-        fmt_lost(&f, n);
-    }
-}
-
-// Fmt::byte when it does not fit.
-#[inline]
-fn fmt_byte(f: inout Fmt, b: u8) {
-    let out = fmt_make_room(&f, 1);
-    if out.len as i64 == 1 {
-        // UNSAFE: f's room by pointer. SAFETY: out.len == 1 (checked).
-        unsafe { out.ptr[0] = b; } // (the Fmt's room: not a read-only view)
-    }
-}
-
-// u's decimal digits, after a '-' when negative.
-#[inline]
-fn fmt_decimal(f: inout Fmt, u: u64, negative: bool) {
-    let len = if negative { decimal_len(u) + 1 } else { decimal_len(u) };
-    var out = fmt_room(&f, len);
-    if out.len as i64 != len {
-        out = fmt_make_room(&f, len);
-        if out.len as i64 != len {
-            return;
-        }
-    }
-    // UNSAFE: put_decimal's raw writes. SAFETY: out.len == len (checked).
-    unsafe {
-        put_decimal(out.ptr, len, u, negative);
-    }
-}
-
-// What Display and Debug write to: a file descriptor `fd` (through std's
-// buffer: `flush` writes it out), or (fd -1) the room out[len..] of a
-// Buf, `need` the length the text reached when it did not fit (0: it
-// fits). (0.17) A view: `out`, the Buf's room, so a Buf cannot change while
-// a Fmt writes into it. `width`, `prec` (-1: none) and `flags` are the spec of the hole
-// being written, `mark` the position it started at. (its fields are private; std's
-// functions make one.)
-pub struct Fmt {
-    out: [u8], len: i64, need: i64, fd: i32, width: i64, prec: i64, flags: i64,
-    mark: i64,
-}
-
-impl Fmt {
-    #[inline]
-    #[views()]
-    pub fn to_fd(fd: i32) -> Fmt {
-        Fmt {
-            out: "", len: 0, need: 0, fd: fd, width: -1, prec: -1, flags: 0, mark: 0,
-        }
+        self.pad_spec(s)
     }
 
-    #[inline]
-    pub fn str(inout self, s: [u8]) {
-        fmt_str(&self, s);
-    }
-
-    #[inline]
-    pub fn byte(inout self, b: u8) {
-        // UNSAFE: PRINTING. SAFETY: see PrintState.
-        inout st = unsafe { &*ps() };
-        let at = self.len;
-        if at < self.out.len as i64 {
-            // UNSAFE: f's room by pointer. SAFETY: at < out.len (checked).
-            unsafe {
-                self.out.ptr[at] = b;
-            }
-            self.len = at + 1;
-            return;
-        }
-        if self.fd < 0 {
-            fmt_byte(&self, b);
-            return;
-        }
-        fmt_guard();
-        if self.fd == st.fd && st.len < FMT_CAP {
-            let out: *u8 = &st.out[0];
-            // UNSAFE: the static by pointer. SAFETY: st.len < FMT_CAP (checked).
-            unsafe {
-                out[st.len] = b;
-            }
-            st.len += 1;
-            return;
-        }
-        fmt_byte(&self, b);
-    }
-
-    // Writes out what a Fmt to a file descriptor has buffered (print does).
-    #[inline]
-    pub fn flush(inout self) {
-        if self.fd >= 0 {
-            fmt_flush();
-            fmt_unguard();
-        }
-    }
-
-    // x's Display: `f.write("({}, {})", self.x, self.y)` in a Display impl.
-    #[inline]
-    pub fn write<T: Display>(inout self, x: sink T) {
-        x.fmt(&self);
-    }
-
-    #[inline]
-    pub fn display<T: Display>(inout self, x: T) {
-        x.fmt(&self);
-    }
-
-    #[inline]
-    pub fn debug<T: Debug>(inout self, x: T) {
-        x.fmt_debug(&self);
-    }
-
-    // (0.25.3) `{s:?}` of a slice whose elements have Debug: `[1, 2, 3]`,
-    // as a Vec of them (an f-string calls it; `[u8]` has its own, quoted)
-    pub fn debug_slice<T: Debug>(inout self, s: [T]) {
-        debug_list(&self, s);
-    }
-
-    // The position written to.
-    fn pos(inout self) -> i64 {
-        // UNSAFE: PRINTING. SAFETY: see PrintState.
-        inout st = unsafe { &*ps() };
-        if self.fd < 0 {
-            return self.len;
-        }
-        fmt_guard();
-        st.done + st.len
-    }
-
-    // Starts a hole with a spec (width w, precision p, -1: none; FMT_*
-    // flags): what is written up to end_spec, given the result, is padded
-    // to w. The buffer is first written out unless w bytes fit in it, so
-    // the hole's text is either all in it or at least w long.
-    #[inline]
-    pub fn spec(inout self, w: i64, p: i64, flags: i64) -> FmtSpec {
-        // UNSAFE: PRINTING. SAFETY: see PrintState.
-        inout st = unsafe { &*ps() };
-        let old = FmtSpec {
-            width: self.width, prec: self.prec, flags: self.flags, mark: self.mark,
+    #[inline(never)]
+    fn pad_spec(&mut self, s: &str) -> Result {
+        let s = match self.precision {
+            Option::Some(p) => match s.char_indices().nth(p) {
+                Option::Some((i, _)) => &s[..i],
+                Option::None => s,
+            },
+            Option::None => s,
         };
+        match self.width {
+            Option::Some(w) => {
+                let n = s.chars().count();
+                if n >= w {
+                    return self.write_str(s);
+                }
+                let (pre, post) = self.padding(w - n, Alignment::Left);
+                self.write_fill(pre)?;
+                self.write_str(s)?;
+                self.write_fill(post)
+            }
+            Option::None => self.write_str(s),
+        }
+    }
+
+    // An integer's digits, padded: the sign, `#`'s prefix, `0`'s zeros.
+    #[effects(panic)]
+    pub fn pad_integral(&mut self, is_nonnegative: bool, prefix: &str, digits: &str) -> Result {
+        let mut width = digits.len();
+        let sign: &str = if !is_nonnegative {
+            "-"
+        } else if self.sign_plus() {
+            "+"
+        } else {
+            ""
+        };
+        width += sign.len();
+        let prefix: &str = if self.alternate() { prefix } else { "" };
+        width += prefix.chars().count();
+        let min = match self.width {
+            Option::Some(min) => min,
+            Option::None => 0,
+        };
+        if width >= min {
+            self.write_str(sign)?;
+            self.write_str(prefix)?;
+            return self.write_str(digits);
+        }
+        if self.sign_aware_zero_pad() {
+            // `0`: the zeros go after the sign and the prefix, whatever
+            // the fill and the alignment.
+            self.write_str(sign)?;
+            self.write_str(prefix)?;
+            for _ in 0..min - width {
+                self.write_str("0")?;
+            }
+            return self.write_str(digits);
+        }
+        let (pre, post) = self.padding(min - width, Alignment::Right);
+        self.write_fill(pre)?;
+        self.write_str(sign)?;
+        self.write_str(prefix)?;
+        self.write_str(digits)?;
+        self.write_fill(post)
+    }
+
+    // The hole's spec, which the compiler's lowering of a format literal
+    // sets before the value's fmt and clears after (`{:>8.3}`, `{:#?}`,
+    // `{:+}`, `{:*^9}`): a width and a precision (< 0: none), the fill (a
+    // code point), the alignment (0: none, 1: left, 2: right, 3: center)
+    // and the flags (1 `+`, 4 `#`, 8 `0`). Not Rust's: its macros set
+    // them through format_args's private Arguments.
+    #[effects()]
+    pub fn __spec(&mut self, width: i64, precision: i64, fill: u32, align: i64, flags: u32) {
+        self.width = if width < 0 { Option::None } else { Option::Some(width as usize) };
+        self.precision = if precision < 0 { Option::None }
+            else { Option::Some(precision as usize) };
+        self.fill = match char::from_u32(fill) {
+            Option::Some(c) => c,
+            Option::None => ' ',
+        };
+        self.align = if align == 1 { Option::Some(Alignment::Left) }
+            else if align == 2 { Option::Some(Alignment::Right) }
+            else if align == 3 { Option::Some(Alignment::Center) }
+            else { Option::None };
         self.flags = flags;
-        if w > 0 || p >= 0 {
-            if self.fd >= 0 {
-                fmt_guard();
-                if self.fd != st.fd || FMT_CAP - st.len < w {
-                    fmt_flush();
-                    st.fd = self.fd;
-                }
-            }
-            self.width = w;
-            self.prec = p;
-            self.flags = flags | FMT_PAD;
-            self.mark = self.pos();
-        }
-        old
     }
 
-    // Ends the hole `spec` started (`old`: what it returned).
-    #[inline]
-    pub fn end_spec(inout self, old: FmtSpec) {
-        if (self.flags & FMT_PAD) != 0 {
-            fmt_pad(&self);
-        }
-        self.width = old.width;
-        self.prec = old.prec;
-        self.flags = old.flags;
-        self.mark = old.mark;
+    // The hole's width ({:8}), its precision ({:.3}), its fill ({:*^8}),
+    // its alignment, its flags.
+    #[effects()]
+    pub fn width(&self) -> Option<usize> {
+        self.width
     }
 
-    // v in decimal (x, X, b: in hex or binary, as a u64; c: its low byte).
-    #[inline(never)]
-    pub fn int(inout self, v: i64) {
-        if self.flags != 0 {
-            if (self.flags & (FMT_HEX | FMT_BIN | FMT_CHAR | FMT_OCT)) != 0 {
-                fmt_radix(&self, v as u64);
+    #[effects()]
+    pub fn precision(&self) -> Option<usize> {
+        self.precision
+    }
+
+    #[effects()]
+    pub fn fill(&self) -> char {
+        self.fill
+    }
+
+    #[effects()]
+    pub fn align(&self) -> Option<Alignment> {
+        self.align
+    }
+
+    // `#`: Debug's pretty form, `0x` for hex.
+    #[effects()]
+    pub fn alternate(&self) -> bool {
+        self.flags & 4 != 0
+    }
+
+    // `+`.
+    #[effects()]
+    pub fn sign_plus(&self) -> bool {
+        self.flags & 1 != 0
+    }
+
+    // `-`.
+    #[effects()]
+    pub fn sign_minus(&self) -> bool {
+        self.flags & 2 != 0
+    }
+
+    // `0`.
+    #[effects()]
+    pub fn sign_aware_zero_pad(&self) -> bool {
+        self.flags & 8 != 0
+    }
+
+    // pad's fill: the pad fills before and after a value for this
+    // alignment (default when the hole gives none).
+    fn padding(&self, pad: usize, default: Alignment) -> (usize, usize) {
+        let align = match self.align {
+            Option::Some(a) => a,
+            Option::None => default,
+        };
+        match align {
+            Alignment::Left => (0, pad),
+            Alignment::Right => (pad, 0),
+            Alignment::Center => (pad / 2, (pad + 1) / 2),
+        }
+    }
+
+    // n fill chars.
+    fn write_fill(&mut self, n: usize) -> Result {
+        for _ in 0..n {
+            self.write_char(self.fill)?;
+        }
+        Result::Ok(())
+    }
+
+    // The hole's spec, to give a Formatter over another sink (the pretty
+    // builders' PadAdapter), and taking it.
+    fn spec(&self) -> (Option<usize>, Option<usize>, char, Option<Alignment>, u32) {
+        (self.width, self.precision, self.fill, self.align, self.flags)
+    }
+
+    fn set_spec(&mut self, spec: (Option<usize>, Option<usize>, char, Option<Alignment>, u32)) {
+        let (width, precision, fill, align, flags) = spec;
+        self.width = width;
+        self.precision = precision;
+        self.fill = fill;
+        self.align = align;
+        self.flags = flags;
+    }
+
+    // `Name { a: 1, b: 2 }`, field by field.
+    #[effects()]
+    pub fn debug_struct<'b>(&'b mut self, name: &str) -> DebugStruct<'b, 'a> {
+        let result = self.write_str(name);
+        DebugStruct { fmt: self, result: result, has_fields: false }
+    }
+
+    // `Name(1, 2)`.
+    #[effects()]
+    pub fn debug_tuple<'b>(&'b mut self, name: &str) -> DebugTuple<'b, 'a> {
+        let result = self.write_str(name);
+        DebugTuple { fmt: self, result: result, fields: 0, empty_name: name.is_empty() }
+    }
+
+    // `[1, 2]`.
+    // mvs: debug_list, Fmt::debug_slice
+    // std2: changed: a builder (MVS: debug_list(f, s) of a slice)
+    #[effects()]
+    pub fn debug_list<'b>(&'b mut self) -> DebugList<'b, 'a> {
+        let result = self.write_str("[");
+        DebugList { fmt: self, result: result, has_entries: false }
+    }
+
+    // `{1, 2}`.
+    #[effects()]
+    pub fn debug_set<'b>(&'b mut self) -> DebugSet<'b, 'a> {
+        let result = self.write_str("{");
+        DebugSet { fmt: self, result: result, has_entries: false }
+    }
+
+    // `{k: v, ...}`.
+    #[effects()]
+    pub fn debug_map<'b>(&'b mut self) -> DebugMap<'b, 'a> {
+        let result = self.write_str("{");
+        DebugMap { fmt: self, result: result, has_entries: false, has_key: false }
+    }
+}
+
+// Formatter::debug_struct's builder.
+pub struct DebugStruct<'a, 'b> {
+    fmt: &'a mut Formatter<'b>,
+    result: Result,
+    has_fields: bool,
+}
+
+impl<'a, 'b> DebugStruct<'a, 'b> {
+    #[effects(T)]
+    pub fn field<T: Debug + ?Sized>(&mut self, name: &str, value: &T) -> &mut DebugStruct<'a, 'b> {
+        if self.result.is_ok() {
+            self.result = if self.fmt.alternate() {
+                write_pretty(self.fmt, if self.has_fields { "" } else { " {\n" },
+                    Option::Some(name), value)
             } else {
-                let negative = v < 0;
-                fmt_spec_decimal(&self, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 },
-                    negative);
-            }
-            return;
+                write_plain(self.fmt, if self.has_fields { ", " } else { " { " },
+                    Option::Some(name), value)
+            };
         }
-        let negative = v < 0;
-        fmt_decimal(&self, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative);
+        self.has_fields = true;
+        self
     }
 
-    // v in decimal, hex (x, X), binary (b), or as a byte (c).
-    #[inline(never)]
-    pub fn uint(inout self, v: u64) {
-        if self.flags != 0 {
-            if (self.flags & (FMT_HEX | FMT_BIN | FMT_CHAR | FMT_OCT)) != 0 {
-                fmt_radix(&self, v);
+    // `Name { a: 1, .. }`.
+    #[effects()]
+    pub fn finish_non_exhaustive(&mut self) -> Result {
+        if self.result.is_ok() {
+            self.result = if !self.has_fields {
+                self.fmt.write_str(" { .. }")
+            } else if self.fmt.alternate() {
+                self.fmt.write_str("    ..\n}")
             } else {
-                fmt_spec_decimal(&self, v, false);
-            }
-            return;
+                self.fmt.write_str(", .. }")
+            };
         }
-        fmt_decimal(&self, v, false);
+        self.result
+    }
+
+    #[effects()]
+    pub fn finish(&mut self) -> Result {
+        if self.result.is_ok() && self.has_fields {
+            self.result = self.fmt.write_str(if self.fmt.alternate() { "}" } else { " }" });
+        }
+        self.result
     }
 }
 
-// Fmt::int and Fmt::uint with a spec of a decimal: u, after a '-' when
-// negative.
-#[inline(never)]
-fn fmt_spec_decimal(f: inout Fmt, u: u64, negative: bool) {
-    fmt_number_start(&f);
-    if (f.flags & FMT_PLUS) != 0 && !negative {
-        f.byte('+');
-    }
-    fmt_decimal(&f, u, negative);
+// Formatter::debug_tuple's builder.
+pub struct DebugTuple<'a, 'b> {
+    fmt: &'a mut Formatter<'b>,
+    result: Result,
+    fields: usize,
+    empty_name: bool,
 }
 
-// A number starts here: when nothing of the hole is written yet, the hole
-// is a number's (right-aligned, zero-padded after the sign).
-fn fmt_number_start(f: inout Fmt) {
-    if (f.flags & FMT_PAD) != 0 && f.pos() == f.mark {
-        f.flags |= FMT_NUM;
-    }
-}
-
-// v in hex or binary, or its low byte (c).
-#[inline(never)]
-fn fmt_radix(f: inout Fmt, v: u64) {
-    let flags = f.flags;
-    if (flags & FMT_CHAR) != 0 {
-        f.byte(v as u8);
-        return;
-    }
-    fmt_number_start(&f);
-    let shift: u64 = if (flags & FMT_HEX) != 0 { 4 } else if (flags & FMT_OCT) != 0 { 3 }
-        else { 1 };
-    if (flags & FMT_ALT) != 0 {
-        f.str(if shift == 4 { "0x" } else if shift == 3 { "0o" } else { "0b" });
-    }
-    let mask = (1u64 << shift) - 1;
-    let digits = if (flags & FMT_UPPER) != 0 { "0123456789ABCDEF" } else { "0123456789abcdef" };
-    var n = 1;
-    var bits = shift;
-    for _ in 0..64 {
-        if bits >= 64 || (v >> bits) == 0 {
-            break;
-        }
-        n += 1;
-        bits += shift;
-    }
-    var out = fmt_room(&f, n);
-    if out.len as i64 != n {
-        out = fmt_make_room(&f, n);
-        if out.len as i64 != n {
-            return;
-        }
-    }
-    var u = v;
-    // UNSAFE: raw writes. SAFETY: out.len == n (checked); digits has 16 bytes,
-    // and u & mask < 16.
-    unsafe {
-        let p = out.ptr;
-        for k in 0..n {
-            p[n - 1 - k] = digits.ptr[(u & mask) as i64];
-            u = u >> shift;
-        }
-    }
-}
-
-// A signed integer of `bits` bits: in hex or binary as its unsigned value
-// of that size (Rust's `{:x}` of -1i8 is ff).
-pub fn fmt_signed(f: inout Fmt, v: i64, bits: u64) {
-    if v < 0 && (f.flags & (FMT_HEX | FMT_BIN | FMT_OCT)) != 0 {
-        f.uint((v as u64) & ((1u64 << bits) - 1));
-    } else {
-        f.int(v);
-    }
-}
-
-// The padding and truncation of the hole f.spec started.
-#[inline(never)]
-fn fmt_pad(f: inout Fmt) {
-    // UNSAFE: PRINTING. SAFETY: see PrintState.
-    inout st = unsafe { &*ps() };
-    let flags = f.flags;
-    let start = f.mark;
-    var end = f.pos();
-    let number = (flags & FMT_NUM) != 0;
-    // (0.25.5: the hole's text still in the buffer, and the room spec made
-    // for the width still there: always, but for a Fmt::to_fd flushed inside
-    // its hole, after which other threads may have written)
-    let reach = if f.fd >= 0 {
-        fmt_guard();
-        start >= st.done && f.fd == st.fd && end <= st.done + st.len
-            && st.len + (f.width - (end - start)) <= FMT_CAP
-    } else {
-        true
-    };
-    // (a precision cuts text)
-    if f.prec >= 0 && !number && end - start > f.prec && reach {
-        end = start + f.prec;
-        if f.fd >= 0 {
-            st.len = end - st.done;
-        } else {
-            f.len = end;
-        }
-    }
-    let total = f.width - (end - start);
-    if total <= 0 {
-        return;
-    }
-    // (0.26.2) Rust's: `0` pads a number after its sign and prefix; else
-    // `<` `^` `>`, a number right by default
-    let zeros = number && (flags & FMT_ZERO) != 0;
-    var fill = ((flags >> FMT_FILL_SHIFT) & 255) as u8;
-    if fill == 0 {
-        fill = ' ';
-    }
-    var pad = total;
-    if !zeros && (flags & FMT_CENTER) != 0 {
-        pad = total / 2;
-    } else if !zeros && ((flags & FMT_LEFT) != 0 || (flags & FMT_RIGHT) == 0 && !number) {
-        pad = 0;
-    }
-    if pad == 0 {
-        for i in 0..total {
-            f.byte(fill);
-        }
-        return;
-    }
-    if !reach {
-        return;
-    }
-    // Right-aligned (or centred): the text moves right by pad, after the
-    // sign when zeros fill.
-    var text: *u8 = 0 as *u8;
-    var base = 0;
-    if f.fd >= 0 {
-        // (spec made room for the width)
-        text = &st.out[0];
-        base = st.done;
-        st.len += pad;
-    } else {
-        // (when the text was lost or the room is short: counted)
-        if f.need != 0 || f.len + pad > f.out.len as i64 {
-            fmt_lost(&f, pad);
-            return;
-        }
-        text = f.out.ptr;
-        f.len += pad;
-    }
-    var at = start - base;
-    // UNSAFE: raw moves. SAFETY: start..end and the pad bytes after it are the
-    // destination's (room taken above: spec's for the width, or checked); the
-    // prefix's two bytes are in it (checked).
-    unsafe {
-        if zeros && end > start && (text[at] == '-' || text[at] == '+') {
-            at += 1;
-        }
-        if zeros && (flags & FMT_ALT) != 0 && (flags & (FMT_HEX | FMT_OCT | FMT_BIN)) != 0
-            && end - base - at >= 2 && text[at] == '0' {
-            at += 2;
-        }
-        let count = end - base - at;
-        for k in 0..count {
-            let i = count - 1 - k;
-            text[at + pad + i] = text[at + i];
-        }
-        for k in 0..pad {
-            text[at + k] = if zeros { '0' } else { fill };
-        }
-    }
-    for i in pad..total {
-        f.byte(fill);
-    }
-}
-
-// Text in quotes, escaped as Rust's Debug of a str does.
-#[inline(never)]
-pub fn fmt_quoted(f: inout Fmt, s: [u8]) {
-    f.byte('"');
-    var from = 0;
-    for i in 0..s.len as i64 {
-        let c = s[i];
-        if c == '"' || c == '\\' || c < 32 || c == 127 {
-            f.str(s[from..i]);
-            from = i + 1;
-            f.byte('\\');
-            if c == '\n' {
-                f.byte('n');
-            } else if c == '\t' {
-                f.byte('t');
-            } else if c == '\r' {
-                f.byte('r');
-            } else if c == 0 {
-                f.byte('0');
-            } else if c == '"' || c == '\\' {
-                f.byte(c);
+impl<'a, 'b> DebugTuple<'a, 'b> {
+    #[effects(T)]
+    pub fn field<T: Debug + ?Sized>(&mut self, value: &T) -> &mut DebugTuple<'a, 'b> {
+        if self.result.is_ok() {
+            self.result = if self.fmt.alternate() {
+                write_pretty(self.fmt, if self.fields > 0 { "" } else { "(\n" }, Option::None,
+                    value)
             } else {
-                let hex = "0123456789abcdef";
-                f.str("u{");
-                if c >= 16 {
-                    f.byte(hex[(c >> 4) as i64]);
-                }
-                f.byte(hex[(c & 15) as i64]);
-                f.byte('}');
+                write_plain(self.fmt, if self.fields > 0 { ", " } else { "(" }, Option::None, value)
+            };
+        }
+        self.fields += 1;
+        self
+    }
+
+    // `(x,)` for a one-field tuple with no name, as Rust's.
+    #[effects()]
+    pub fn finish(&mut self) -> Result {
+        if self.result.is_ok() && self.fields > 0 {
+            if self.fields == 1 && self.empty_name && !self.fmt.alternate() {
+                self.result = self.fmt.write_str(",");
+            }
+            if self.result.is_ok() {
+                self.result = self.fmt.write_str(")");
             }
         }
-    }
-    f.str(s[from..s.len as i64]);
-    f.byte('"');
-}
-
-// The elements of s, as Debug writes a Vec: `[1, 2, 3]`.
-pub fn debug_list<T: Debug>(f: inout Fmt, s: [T]) {
-    f.byte('[');
-    for i in 0..s.len as i64 {
-        if i > 0 {
-            f.str(", ");
-        }
-        f.debug(s[i]);
-    }
-    f.byte(']');
-}
-
-// An f-string's value: its holes' values, and a closure that writes the
-// text.
-pub struct Interp<F> { f: F }
-
-impl<F: Fn(inout Fmt)> Display for Interp<F> {
-    #[inline]
-    fn fmt(self, out: inout Fmt) {
-        (self.f)(&out);
+        self.result
     }
 }
 
-// ---- Fmt's holes (0.16) ----
-
-// The spec of the hole a Fmt was writing, which Fmt::spec saves and
-// end_spec puts back (0.16).
-pub struct FmtSpec { width: i64, prec: i64, flags: i64, mark: i64 }
-
-impl Fmt {
-    // An f-string's hole of a decimal integer with a spec of width w and
-    // flags (`{n:>5}`, `{n:05}`): what spec, int and end_spec write, in one
-    // pass (0.16).
-    #[inline]
-    pub fn int_hole(inout self, v: i64, w: i64, flags: i64) {
-        let negative = v < 0;
-        fmt_hole(&self, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative, w,
-            flags);
-    }
-
-    #[inline]
-    pub fn uint_hole(inout self, v: u64, w: i64, flags: i64) {
-        fmt_hole(&self, v, false, w, flags);
-    }
-}
-
-// Fmt::int_hole: u (after a '-' when negative) padded to w: with spaces
-// before it (after it: FMT_LEFT), or zeros after its sign (FMT_ZERO).
-#[inline(never)]
-fn fmt_hole(f: inout Fmt, u: u64, negative: bool, w: i64, flags: i64) {
-    let n = if negative { decimal_len(u) + 1 } else { decimal_len(u) };
-    let pad = w - n;
-    if pad <= 0 {
-        fmt_decimal(&f, u, negative);
-        return;
-    }
-    if w > FMT_CAP {
-        // (as spec and end_spec do)
-        let old = f.spec(w, -1, flags);
-        fmt_number_start(&f);
-        fmt_decimal(&f, u, negative);
-        f.end_spec(old);
-        return;
-    }
-    var out = fmt_room(&f, w);
-    if out.len as i64 != w {
-        out = fmt_make_room(&f, w);
-        if out.len as i64 != w {
-            return;
-        }
-    }
-    // UNSAFE: raw writes. SAFETY: out.len == w (checked); n + pad == w.
-    unsafe {
-        let p = out.ptr;
-        if (flags & FMT_LEFT) != 0 {
-            put_decimal(p, n, u, negative);
-            for k in n..w {
-                p[k] = ' ';
-            }
-        } else {
-            put_decimal(&p[pad], n, u, negative);
-            let fill: u8 = if (flags & FMT_ZERO) != 0 { '0' } else { ' ' };
-            for k in 0..pad {
-                p[k] = fill;
-            }
-            if negative && fill == '0' {
-                p[0] = '-';
-                p[pad] = '0';
-            }
-        }
-    }
-}
-
-// ---- Display and Debug of floats (0.20) ----
-
-// (A section of its own, read only by programs that have floats: a float
-// literal, `f64` or `f32`, an `import` (front/modules/stdsections.vl);
-// with it the shortest digits and the powers of ten.)
-
-impl Display for f64 {
-    #[inline]
-    fn fmt(self, f: inout Fmt) { fmt_float(&f, self, false, false); }
-}
-
-impl Debug for f64 {
-    #[inline]
-    fn fmt_debug(self, f: inout Fmt) { fmt_float(&f, self, false, true); }
-}
-
-impl Display for f32 {
-    #[inline]
-    fn fmt(self, f: inout Fmt) { fmt_float(&f, self as f64, true, false); }
-}
-
-impl Debug for f32 {
-    #[inline]
-    fn fmt_debug(self, f: inout Fmt) { fmt_float(&f, self as f64, true, true); }
-}
-
-impl Fmt {
-    // v as Display writes it: the shortest decimal that reads back as v,
-    // never with an exponent; with a precision, that many decimals.
-    pub fn float(inout self, v: f64) {
-        fmt_float(&self, v, false, false);
-    }
-}
-
-// (0.20) `{:e}`, `{:E}` (with FMT_UPPER; fmt.vl's FMT_ flags): a
-// float's exponent form (fmt_float).
-const FMT_EXP: i64 = 512;
-
-// v in decimal (single: an f32's value): the shortest digits that read
-// back as v (Schubfach, 0.20), never with an exponent for Display; Debug
-// as Rust writes it (`1.0`, `1e16`, `1e-7`); `{:e}`, `{:E}` (FMT_EXP) as
-// Rust's LowerExp and UpperExp (`1.5e3`). With a precision, that many
-// decimals (C's %.Nf; with `e`, %.Ne in Rust's layout).
-#[inline(never)]
-fn fmt_float(f: inout Fmt, v: f64, single: bool, debug: bool) {
-    if f.flags != 0 {
-        fmt_number_start(&f);
-        // (0.26.2: `{x:+}`: a sign on a number that has none, `+inf` too,
-        // not on NaN nor -0)
-        if (f.flags & FMT_PLUS) != 0 && (v > 0.0 || v == 0.0 && 1.0 / v > 0.0) {
-            f.byte('+');
-        }
-    }
-    if f.prec >= 0 && v == v && v - v == 0.0 {
-        fmt_float_prec(&f, v);
-        return;
-    }
-    var mode = if debug { FloatFmt::Debug } else { FloatFmt::Display };
-    if (f.flags & FMT_EXP) != 0 {
-        mode = if (f.flags & FMT_UPPER) != 0 { FloatFmt::UpperExp } else { FloatFmt::LowerExp };
-    }
-    var tmp: [u8; 48] = [0; 48];
-    let n = if single { write_f32(v as f32, mode, &tmp[..]) } else { write_f64(v, mode, &tmp[..]) };
-    if n <= 48 {
-        f.str(tmp[0..n]);
+// The entries of a list or a set: `[a, b]`, `{a, b}`; pretty, one a line.
+fn write_entry<T: Debug + ?Sized>(f: &mut Formatter<'_>, has_entries: bool, value: &T) -> Result {
+    if f.alternate() {
+        write_pretty(f, if has_entries { "" } else { "\n" }, Option::None, value)
     } else {
-        fmt_float_long(&f, v, single, mode);
+        write_plain(f, if has_entries { ", " } else { "" }, Option::None, value)
     }
 }
 
-// fmt_float's text of more than 48 bytes (Display of 1e300).
-#[inline(never)]
-fn fmt_float_long(f: inout Fmt, v: f64, single: bool, mode: FloatFmt) {
-    var tmp: [u8; 336] = [0; 336];
-    let n = if single { write_f32(v as f32, mode, &tmp[..]) } else { write_f64(v, mode, &tmp[..]) };
-    f.str(tmp[0..n]);
+// Formatter::debug_list's builder.
+pub struct DebugList<'a, 'b> {
+    fmt: &'a mut Formatter<'b>,
+    result: Result,
+    has_entries: bool,
 }
 
-// fmt_float with a precision, v finite: C's %.*f (FMT_EXP: %.*e, its
-// exponent then written as Rust's, `1.50e3`).
-#[inline(never)]
-fn fmt_float_prec(f: inout Fmt, v: f64) {
-    if (f.flags & FMT_EXP) == 0 {
-        var tmp: [u8; 64] = [0; 64];
-        // UNSAFE: C. SAFETY: tmp has the 64 bytes given.
-        let n = unsafe { snprintf(&tmp[0], 64, c"%.*f", f.prec as i32, v) } as i64;
-        if n < 64 {
-            f.str(tmp[0..n]);
-        } else {
-            fmt_fixed_long(&f, v);
+impl<'a, 'b> DebugList<'a, 'b> {
+    #[effects(T)]
+    pub fn entry<T: Debug + ?Sized>(&mut self, value: &T) -> &mut DebugList<'a, 'b> {
+        if self.result.is_ok() {
+            self.result = write_entry(self.fmt, self.has_entries, value);
         }
-        return;
+        self.has_entries = true;
+        self
     }
-    // (a double's exact digits end before the 770th: zeros after 1100)
-    let prec = if f.prec > 1100 { 1100 } else { f.prec };
-    var tmp: [u8; 1200] = [0; 1200];
-    // UNSAFE: C. SAFETY: tmp has the 1200 bytes given.
-    let n = unsafe { snprintf(&tmp[0], 1200, c"%.*e", prec as i32, v) } as i64;
-    var i = 0;
-    while i < n && tmp[i] != 'e' {
-        i += 1;
-    }
-    f.str(tmp[0..i]);
-    for _ in prec..f.prec {
-        f.byte('0');
-    }
-    f.byte(if (f.flags & FMT_UPPER) != 0 { 'E' } else { 'e' });
-    // e+05 is 5, e-05 is -5
-    var j = i + 1;
-    if j < n && tmp[j] == '-' {
-        f.byte('-');
-    }
-    j += 1;
-    while j + 1 < n && tmp[j] == '0' {
-        j += 1;
-    }
-    f.str(tmp[j..n]);
-}
 
-// v with f's precision, of 64 bytes or more: C's %.*f into a buffer on
-// the stack (a double has at most 309 digits before the point and 1074
-// after it: from 1100 decimals on they are zeros, written after).
-#[inline(never)]
-fn fmt_fixed_long(f: inout Fmt, v: f64) {
-    let prec = if f.prec > 1100 { 1100 } else { f.prec };
-    var tmp: [u8; 1424] = [0; 1424];
-    // UNSAFE: C. SAFETY: tmp has the 1424 bytes given.
-    let n = unsafe { snprintf(&tmp[0], 1424, c"%.*f", prec as i32, v) } as i64;
-    f.str(tmp[0..if n < 1424 { n } else { 1423 }]);
-    for _ in prec..f.prec {
-        f.byte('0');
+    #[effects(D, I)]
+    pub fn entries<D: Debug, I: IntoIterator<Item = D>>(&mut self, entries: I) -> &mut DebugList<'a,
+        'b> {
+        for e in entries {
+            self.entry(&e);
+        }
+        self
+    }
+
+    #[effects()]
+    pub fn finish(&mut self) -> Result {
+        if self.result.is_ok() {
+            self.result = self.fmt.write_str("]");
+        }
+        self.result
     }
 }
 
-// ---- Format literals (0.26.2) ----
+// Formatter::debug_set's builder.
+pub struct DebugSet<'a, 'b> {
+    fmt: &'a mut Formatter<'b>,
+    result: Result,
+    has_entries: bool,
+}
 
-// (0.26.2) `format_args("{} {x}", a)`, Rust's `format_args!`: the
-// format literal and its arguments as one value that writes them (a
-// `std::Interp`, Display), for a function of the program that takes a `T:
-// Display` (the compiler makes the value: front/check/format.vl).
-#[inline]
-pub fn format_args<T: Display>(x: sink T) -> T {
+impl<'a, 'b> DebugSet<'a, 'b> {
+    #[effects(T)]
+    pub fn entry<T: Debug + ?Sized>(&mut self, value: &T) -> &mut DebugSet<'a, 'b> {
+        if self.result.is_ok() {
+            self.result = write_entry(self.fmt, self.has_entries, value);
+        }
+        self.has_entries = true;
+        self
+    }
+
+    #[effects(diverge, D, I)]
+    pub fn entries<D: Debug, I: IntoIterator<Item = D>>(&mut self, entries: I) -> &mut DebugSet<'a,
+        'b> {
+        for e in entries {
+            self.entry(&e);
+        }
+        self
+    }
+
+    #[effects()]
+    pub fn finish(&mut self) -> Result {
+        if self.result.is_ok() {
+            self.result = self.fmt.write_str("}");
+        }
+        self.result
+    }
+}
+
+// Formatter::debug_map's builder.
+pub struct DebugMap<'a, 'b> {
+    fmt: &'a mut Formatter<'b>,
+    result: Result,
+    has_entries: bool,
+    has_key: bool,
+}
+
+impl<'a, 'b> DebugMap<'a, 'b> {
+    #[effects(K, V)]
+    pub fn entry<K: Debug + ?Sized,
+        V: Debug + ?Sized>(&mut self, key: &K, value: &V) -> &mut DebugMap<'a, 'b> {
+        self.key(key).value(value)
+    }
+
+    // The key of an entry whose value comes next (`value`); panics when a
+    // key is waiting for its value.
+    #[effects(panic, K)]
+    pub fn key<K: Debug + ?Sized>(&mut self, key: &K) -> &mut DebugMap<'a, 'b> {
+        if self.has_key {
+            let msg: &str = "attempted to begin a new map entry without completing the previous one";
+            crate::panic::panic(msg);
+        }
+        if self.result.is_ok() {
+            self.result = write_key(self.fmt, self.has_entries, key);
+        }
+        self.has_key = true;
+        self
+    }
+
+    // The value of the entry `key` began; panics when there is no key.
+    #[effects(panic, V)]
+    pub fn value<V: Debug + ?Sized>(&mut self, value: &V) -> &mut DebugMap<'a, 'b> {
+        if !self.has_key {
+            let msg: &str = "attempted to format a map value before its key";
+            crate::panic::panic(msg);
+        }
+        if self.result.is_ok() {
+            self.result = write_value(self.fmt, value);
+        }
+        self.has_key = false;
+        self.has_entries = true;
+        self
+    }
+
+    #[effects(diverge, K, V, I)]
+    pub fn entries<K: Debug, V: Debug,
+        I: IntoIterator<Item = (K, V)>>(&mut self, entries: I) -> &mut DebugMap<'a, 'b> {
+        for (k, v) in entries {
+            self.entry(&k, &v);
+        }
+        self
+    }
+
+    // Panics when a key is waiting for its value.
+    #[effects(panic)]
+    pub fn finish(&mut self) -> Result {
+        if self.has_key {
+            let msg: &str = "attempted to finish a map with a partial entry";
+            crate::panic::panic(msg);
+        }
+        if self.result.is_ok() {
+            self.result = self.fmt.write_str("}");
+        }
+        self.result
+    }
+}
+
+// A map's key: `k: `, after a comma or (pretty) on a line of its own.
+fn write_key<K: Debug + ?Sized>(f: &mut Formatter<'_>, has_entries: bool, key: &K) -> Result {
+    if f.alternate() {
+        if !has_entries {
+            f.write_str("\n")?;
+        }
+        write_padded(f, true, key)?;
+    } else {
+        write_plain(f, if has_entries { ", " } else { "" }, Option::None, key)?;
+    }
+    f.write_str(": ")
+}
+
+// A map's value, after its key (pretty: ending the line).
+fn write_value<V: Debug + ?Sized>(f: &mut Formatter<'_>, value: &V) -> Result {
+    if f.alternate() {
+        write_padded(f, false, value)?;
+        f.write_str(",\n")
+    } else {
+        crate::fmt::Debug::fmt(value, f)
+    }
+}
+
+// The builders' plain form: prefix, `name: ` when there is a name, and
+// the value's Debug.
+fn write_plain<T: Debug + ?Sized>(f: &mut Formatter<'_>, prefix: &str, name: Option<&str>,
+    value: &T) -> Result {
+    f.write_str(prefix)?;
+    if let Option::Some(n) = name {
+        f.write_str(n)?;
+        f.write_str(": ")?;
+    }
+    crate::fmt::Debug::fmt(value, f)
+}
+
+// The builders' pretty form (`{:#?}`): open (the first entry's bracket),
+// then `name: value,` on a line of its own, indented one level more than f's.
+fn write_pretty<T: Debug + ?Sized>(f: &mut Formatter<'_>, open: &str, name: Option<&str>, value: &T) -> Result {
+    f.write_str(open)?;
+    let spec = f.spec();
+    let mut pad = PadAdapter { fmt: f, on_newline: true };
+    let mut inner = Formatter::new(&mut pad);
+    inner.set_spec(spec);
+    if let Option::Some(n) = name {
+        inner.write_str(n)?;
+        inner.write_str(": ")?;
+    }
+    crate::fmt::Debug::fmt(value, &mut inner)?;
+    inner.write_str(",\n")
+}
+
+// value's Debug indented one level more than f's (a map's key, then its
+// value: on_newline is true at a line's start only).
+fn write_padded<T: Debug + ?Sized>(f: &mut Formatter<'_>, on_newline: bool, value: &T) -> Result {
+    let spec = f.spec();
+    let mut pad = PadAdapter { fmt: f, on_newline: on_newline };
+    let mut inner = Formatter::new(&mut pad);
+    inner.set_spec(spec);
+    crate::fmt::Debug::fmt(value, &mut inner)
+}
+
+// A sink that indents every line written through it by four spaces: what
+// the pretty builders write a nested value into.
+struct PadAdapter<'a, 'b> {
+    fmt: &'a mut Formatter<'b>,
+    on_newline: bool,
+}
+
+impl<'a, 'b> Write for PadAdapter<'a, 'b> {
+    // terminates: every pass takes a line of at least one byte off rest.
+    #[terminates]
+    fn write_str(&mut self, s: &str) -> Result {
+        let mut rest = s;
+        while !rest.is_empty() {
+            if self.on_newline {
+                self.fmt.write_str("    ")?;
+            }
+            let nl: &str = "\n";
+            let n = match rest.find(nl) {
+                Option::Some(i) => i + 1,
+                Option::None => rest.len(),
+            };
+            let (line, tail) = rest.split_at(n);
+            self.on_newline = line.ends_with(nl);
+            self.fmt.write_str(line)?;
+            rest = tail;
+        }
+        Result::Ok(())
+    }
+}
+
+// Formatter::new's write function for a W: out is the &mut W it erased.
+fn write_erased<W: Write>(out: *mut u8, s: &str) -> Result {
+    // UNSAFE: the sink is erased to a data pointer (no dyn: plan §3), so
+    // it is read back through a raw pointer.
+    // SAFETY: out is the `&'a mut W` Formatter::new took, cast; the
+    // Formatter<'a> holding it keeps that borrow alive and is its only
+    // user, so the &mut is valid and unaliased for this call.
+    let w = unsafe { &mut *(out as *mut W) };
+    w.write_str(s)
+}
+
+// ---- The print functions (Rust's macros) ----
+
+// x on stdout (`print("{x}")`); stdout is line-buffered when a terminal.
+// later: format_fns
+#[effects(panic, T)]
+pub fn print<T: Display>(x: T) {
+    let mut out = crate::io::stdout();
+    if crate::io::Write::write_fmt(&mut out, x).is_err() {
+        let msg: &str = "failed printing to stdout";
+        crate::panic::panic(msg);
+    }
+}
+
+// x and a newline on stdout.
+// later: format_fns
+#[effects(io, static, panic, T)]
+pub fn println<T: Display>(x: T) {
+    let mut out = crate::io::stdout();
+    if crate::io::Write::write_fmt(&mut out, x).is_err()
+        || crate::io::Write::write_all(&mut out, "\n".as_bytes()).is_err()
+        {
+        let msg: &str = "failed printing to stdout";
+        crate::panic::panic(msg);
+    }
+}
+
+// x on stderr.
+// later: format_fns
+#[effects(panic, T)]
+pub fn eprint<T: Display>(x: T) {
+    let mut out = crate::io::stderr();
+    if crate::io::Write::write_fmt(&mut out, x).is_err() {
+        let msg: &str = "failed printing to stderr";
+        crate::panic::panic(msg);
+    }
+}
+
+// later: format_fns
+#[effects(io, static, panic, T)]
+pub fn eprintln<T: Display>(x: T) {
+    let mut out = crate::io::stderr();
+    if crate::io::Write::write_fmt(&mut out, x).is_err()
+        || crate::io::Write::write_all(&mut out, "\n".as_bytes()).is_err()
+        {
+        let msg: &str = "failed printing to stderr";
+        crate::panic::panic(msg);
+    }
+}
+
+// x as a String on a (Rust's `format!`, allocator last: plan §2).
+// std2: changed: takes x by value and the allocator
+// later: format_fns
+#[effects(T, A)]
+pub fn format_in<T: Display, A: Allocator>(x: T, a: A) -> String<A> {
+    let mut s = String::new_in(a);
+    let _ = s.write_fmt(x);
+    s
+}
+
+// x written into w (Rust's `write!(w, ..)`: `write(f, "({}, {})", a, b)`
+// in a Display impl, `write(s, "{x}")` into a String): the compiler makes
+// the format literal x's Display value, as print's (F16.1). An io::Write
+// writer comes in 0.27.3 (its write_fmt).
+// later: format_fns
+#[effects(W, T)]
+pub fn write<W: Write + ?Sized, T: Display>(w: &mut W, x: T) -> Result {
+    w.write_fmt(x)
+}
+
+// x and a newline written into w (Rust's `writeln!`).
+// later: format_fns
+#[effects(W, T)]
+pub fn writeln<W: Write + ?Sized, T: Display>(w: &mut W, x: T) -> Result {
+    match w.write_fmt(x) {
+        Result::Ok(()) => w.write_str("\n"),
+        Result::Err(e) => Result::Err(e),
+    }
+}
+
+// A format literal as a value (`format_args("{a}-{b}").to_string_in(gpa)`):
+// the literal's Display value, passed through.
+// later: format_fns
+#[effects()]
+pub fn format_args<T: Display>(x: T) -> T {
     x
-}
-
-// (0.26.2) What `panic("bad {x}")` (a message with holes) compiles to: the
-// message written into 256 bytes on the stack, cut there, so that a
-// #[no_alloc] function panics with one too (decision 5); `at` as
-// panic_str's. Not for programs to call.
-pub fn __panic_fmt<T: Display>(x: T, at: [u8] = "") -> ! {
-    var tmp: [u8; 256] = [0; 256];
-    var f = __fmt_tmp(&tmp);
-    x.fmt(&f);
-    // (a piece that did not fit is left out: what was written is the
-    // bytes before the zeros left)
-    var n = if f.need != 0 || f.len > 256 { 256 } else { f.len };
-    while f.need != 0 && n > 0 && tmp[n - 1] == 0 {
-        n -= 1;
-    }
-    panic_str(tmp[0..n], at)
-}
-
-// (0.26.2) `assert(c, "bad {x}")`: `c` must hold, else __panic_fmt.
-pub fn __assert_fmt<T: Display>(ok: bool, x: T, at: [u8] = "") {
-    if !ok {
-        __panic_fmt(x, at)
-    }
-}
-
-// ---- format_in (0.26.3) ----
-
-// (Its own section, read by a program that names format_in: it is the
-// one part of fmt that makes a String.)
-
-// x's Display in a new String on allocator a, of its length (the caller
-// frees it): `format_in("{x:>8}", gpa)`. (0.16: up to 256 bytes, x's
-// Display runs once, into a buffer on the stack. 0.26.3: a String, as
-// Rust's format! makes; 0.16 to 0.26.2 made a Buf.)
-pub fn format_in<T: Display, A: Allocator>(x: T, a: sink A) -> String<A> {
-    var s: String<A> = String::new_in(a);
-    var tmp: [u8; 256] = [0; 256];
-    var f = __fmt_tmp(&tmp);
-    // (one call of x's Display in the code: first to tmp, then, when the
-    // text did not fit, to s's room)
-    loop {
-        x.fmt(&f);
-        if __fmt_str_end(&s, &f) {
-            return s;
-        }
-    }
-}
-
-// The end of a pass of format_in (fmt_in_end_vec), on s's bytes: the text
-// is a Display's, as String::push_fmt writes it.
-pub fn __fmt_str_end<A: Allocator>(s: inout String<A>, f: inout Fmt) -> bool {
-    fmt_in_end_vec(&s.bytes, &f)
 }

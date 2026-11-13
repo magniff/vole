@@ -19,17 +19,23 @@
 //   drawables, errors) are retained inside an autorelease pool scoped to
 //   the call.
 
+use crate::mem;
+use crate::alloc::Allocator;
+use crate::sync::atomic::{Atomic, Ordering};
 pub mod bindings;
 
-use std::gpu::hal::{Api, Caps, MAPPED_READ, MAPPED_WRITE, RawSurface, Render};
-use std::gpu::shader::{Binding, EntryPoint, ShaderKind, ShaderSource};
-use std::gpu::types::{
+use crate::gpu::hal::{Api, Caps, MAPPED_READ, MAPPED_WRITE, RawSurface, Render};
+use crate::gpu::shader::{Binding, EntryPoint, ShaderKind, ShaderSource};
+use crate::gpu::types::{
     AddressMode, BlendFactor, BlendOp, Color, Compare, Cull, Filter, Format, FrontFace, IndexFormat,
-    Load, PipelineState, SamplerDesc, ShaderStage, StepMode, TextureDesc, TextureUsage, Topology,
-    VertexFormat,
+    Load, PipelineState,
 };
-use std::objc::{Id, Ref};
-use std::objc::foundation::{NSArray, NSError};
+use crate::gpu::types::SamplerDesc; use crate::gpu::types::ShaderStage;
+use crate::gpu::types::StepMode; use crate::gpu::types::TextureDesc;
+use crate::gpu::types::TextureUsage; use crate::gpu::types::Topology;
+use crate::gpu::types::VertexFormat;
+use crate::objc::{Id, Ref};
+use crate::objc::foundation::{NSArray, NSError};
 
 use bindings::{
     CAMetalDrawable, CAMetalLayer, CGSize, MTLBlitCommandEncoder, MTLBuffer, MTLClearColor,
@@ -49,21 +55,24 @@ use bindings::{
 // SAFETY: the prototypes are objc/runtime.h's: id objc_retain(id), void objc_release(id).
 #[link(lib = "objc")]
 extern "C" {
-    fn objc_retain(o: *u8) -> *u8;
-    fn objc_release(o: *u8);
+    #[effects(io)]
+    fn objc_retain(o: *mut u8) -> *mut u8;
+    #[effects(io)]
+    fn objc_release(o: *mut u8);
 }
 
 // UNSAFE: the C library's memcpy, for copies into a buffer's shared memory, which only a raw
 // pointer reaches.
 // SAFETY: the prototype is string.h's; each call states its bounds.
 extern "C" {
-    fn memcpy(dst: *u8, src: *u8, n: u64) -> *u8;
+    #[effects()]
+    fn memcpy(dst: *mut u8, src: *mut u8, n: u64) -> *mut u8;
 }
 
 // ---- GPU on Metal: devices, memory, resources (0.22) ----
 
 /// The Metal implementation of hal::Api and hal::Render.
-pub struct Metal {}
+#[derive(Clone, Copy)] pub struct Metal {}
 
 pub struct Adapter {
     pub dev: Id<MTLDevice>,
@@ -76,7 +85,7 @@ pub struct Device {
 
 // (0.25.4) Another handle to the same device and queue (a retain each).
 impl Clone for Device {
-    fn clone(self) -> Device {
+    fn clone(&self) -> Device {
         Device { dev: self.dev.clone(), queue: self.queue.clone() }
     }
 }
@@ -91,7 +100,7 @@ pub struct Queue {
 /// map state (0.25.3, `map_state`), which every handle of it sees.
 pub struct Buffer {
     pub raw: Id<MTLBuffer>,
-    pub ptr: *u8,
+    pub ptr: *mut u8,
     pub size: i64,
 }
 
@@ -107,11 +116,11 @@ fn state_offset(size: i64) -> i64 {
     if size < 4 { 4 } else { size }
 }
 
-fn set_map_state(b: inout Buffer, state: i64) {
+fn set_map_state(b: &mut Buffer, state: i64) {
     let at = state_offset(b.size);
     // UNSAFE: the state is in the MTLBuffer's own shared memory, which only its contents pointer reaches (Metal has no field to keep it in, and a table beside the buffers would outlive the ones dropped while mapped)
     // SAFETY: create_buffer made the MTLBuffer state_offset(size) + STATE_BYTES bytes long, b.ptr is its contents and b.raw keeps it alive, so b.ptr[at] is in it; one byte, no alignment; the GPU never writes there (std::gpu's contracts keep copies and bindings below size)
-    unsafe { b.ptr[at] = state as u8; }
+    unsafe { (*b.ptr.add(at as usize)) = state as u8; }
 }
 
 pub struct Texture {
@@ -145,12 +154,12 @@ pub struct RenderPipeline {
 
 /// One resource of a bind group, with its slot in each stage (-1: none).
 /// `obj` is retained by the group.
-pub struct Bound {
+#[derive(Clone, Copy)] pub struct Bound {
     pub kind: i64,
     pub vs: i64,
     pub fs: i64,
     pub cs: i64,
-    pub obj: *u8,
+    pub obj: *mut u8,
     pub offset: u64,
 }
 
@@ -167,12 +176,12 @@ pub struct BindGroup {
 }
 
 impl Drop for BindGroup {
-    fn drop(inout self) {
+    fn drop(&mut self) {
         for i in 0..self.count {
             // UNSAFE: objc_release is a C call; the group's objects are raw pointers (Bound.obj).
             // SAFETY: items[0..count] were made by `bound`, which retained each obj once; this
             // drop releases each once and then sets count to 0, so none is released twice.
-            unsafe { objc_release(self.items[i].obj); }
+            unsafe { objc_release(self.items[i as usize].obj); }
         }
         self.count = 0;
     }
@@ -184,8 +193,8 @@ pub struct CommandBuffer {
 }
 
 impl Drop for CommandBuffer {
-    fn drop(inout self) {
-        end_blit(&self);
+    fn drop(&mut self) {
+        end_blit(self);
     }
 }
 
@@ -195,7 +204,7 @@ pub struct ComputeEncoder {
 }
 
 impl Drop for ComputeEncoder {
-    fn drop(inout self) {
+    fn drop(&mut self) {
         if !self.enc.is_nil() { self.enc.r().end_encoding(); }
     }
 }
@@ -210,7 +219,7 @@ pub struct RenderEncoder {
 }
 
 impl Drop for RenderEncoder {
-    fn drop(inout self) {
+    fn drop(&mut self) {
         if !self.enc.is_nil() { self.enc.r().end_encoding(); }
     }
 }
@@ -351,21 +360,21 @@ fn origin3(x: i64, y: i64, z: i64) -> MTLOrigin {
 }
 
 /// Appends an NSError's description (or `what` when there is none).
-fn push_error<A: Allocator>(err: inout String<A>, e: Option<Ref<NSError>>, what: str) {
+fn push_error<A: Allocator>(err: &mut String<A>, e: Option<Ref<NSError>>, what: &str) {
     match e {
-        Some(r) => std::objc::push_ns_string(&err, r.localized_description()),
+        Some(r) => crate::objc::push_ns_string(err, r.localized_description()),
         None => err.push_str(what),
     }
 }
 
-fn function<A: Allocator>(s: Shader, e: EntryPoint, err: inout String<A>) -> Option<Id<MTLFunction>> {
-    let name = std::objc::ns_string(e.native);
+fn function<A: Allocator>(s: &Shader, e: EntryPoint<'_>, err: &mut String<A>) -> Option<Id<MTLFunction>> {
+    let name = crate::objc::ns_string(e.native);
     let f = s.lib.r().new_function_with_name(name.r());
     if f.is_none() {
         err.push_str("no function '");
-        err.push_fmt(e.native);
+        err.push_str(e.native);
         err.push_str("' in the MSL (entry point '");
-        err.push_fmt(e.name);
+        err.push_str(e.name);
         err.push_str("')");
     }
     f
@@ -373,58 +382,62 @@ fn function<A: Allocator>(s: Shader, e: EntryPoint, err: inout String<A>) -> Opt
 
 #[repr(C)]
 union CFn0 {
-    p: *u8,
-    f: extern "C" fn() -> *u8,
+    p: *mut u8,
+    f: extern "C" fn() -> *mut u8,
 }
 
 /// Calls a C function `*u8 f(void)` of an opened framework (Metal's device
 /// functions; nil when it is not there).
-fn call_c0(name: *u8) -> *u8 {
+fn call_c0(name: *mut u8) -> *mut u8 {
     // UNSAFE: a C symbol's address made a function pointer (a union field) and called: neither
     // the lookup nor the call can be checked.
     // SAFETY: the callers pass NUL-terminated c"" literals that name Metal functions declared
     // `id f(void)` (MTLCopyAllDevices, MTLCreateSystemDefaultDevice), so the union reads a
     // function pointer of exactly that type; a missing symbol (null) is never called.
     unsafe {
-        let p = std::objc::symbol(name);
-        if p.is_null() { return 0 as *u8; }
+        let p = crate::objc::symbol(name);
+        if p.is_null() { return 0 as *mut u8; }
         let f = CFn0 { p: p }.f;
         f()
     }
 }
 
-static var OPENED: bool = false;
+// Whether Metal was opened (1), an atomic and not a `static mut`: two
+// threads that both find 0 open the frameworks twice, which dlopen allows.
+static OPENED: Atomic<usize> = Atomic::new(0);
 
 fn open_frameworks() -> bool {
-    if !OPENED {
-        std::objc::init();
-        OPENED = std::objc::framework("Metal");
-        std::objc::framework("QuartzCore");
+    if OPENED.load(Ordering::Relaxed) == 0 {
+        crate::objc::init();
+        if crate::objc::framework("Metal") {
+            OPENED.store(1, Ordering::Relaxed);
+        }
+        crate::objc::framework("QuartzCore");
     }
-    OPENED
+    OPENED.load(Ordering::Relaxed) != 0
 }
 
 // ---- GPU on Metal: recording helpers (0.22) ----
 
 fn begin_on(q: Ref<MTLCommandQueue>) -> CommandBuffer {
-    let cb = std::objc::pool(|| match q.command_buffer() {
+    let cb = crate::objc::pool(|| match q.command_buffer() {
         Some(c) => c.retain(),
         None => Id::<MTLCommandBuffer>::nil(),
     });
     CommandBuffer { cb: cb, blit: Id::<MTLBlitCommandEncoder>::nil() }
 }
 
-fn end_blit(cb: inout CommandBuffer) {
+fn end_blit(cb: &mut CommandBuffer) {
     if !cb.blit.is_nil() {
         cb.blit.r().end_encoding();
         cb.blit = Id::<MTLBlitCommandEncoder>::nil();
     }
 }
 
-fn blit(cb: inout CommandBuffer) -> Ref<MTLBlitCommandEncoder> {
+fn blit(cb: &mut CommandBuffer) -> Ref<MTLBlitCommandEncoder> {
     if cb.blit.is_nil() {
         let raw = cb.cb.r();
-        cb.blit = std::objc::pool(|| match raw.blit_command_encoder() {
+        cb.blit = crate::objc::pool(|| match raw.blit_command_encoder() {
             Some(e) => e.retain(),
             None => Id::<MTLBlitCommandEncoder>::nil(),
         });
@@ -432,7 +445,7 @@ fn blit(cb: inout CommandBuffer) -> Ref<MTLBlitCommandEncoder> {
     cb.blit.r()
 }
 
-fn bound(kind: i64, b: Binding, obj: *u8, offset: u64) -> Bound {
+fn bound(kind: i64, b: Binding, obj: *mut u8, offset: u64) -> Bound {
     // UNSAFE: objc_retain is a C call on a raw object pointer.
     // SAFETY: the callers pass the pointer of a live buffer, texture or sampler (an Id they
     // hold), or nil, which retain ignores; BindGroup's drop releases this retain once.
@@ -499,7 +512,7 @@ impl Api for Metal {
     type CommandBuffer = CommandBuffer;
     type ComputeEncoder = ComputeEncoder;
 
-    fn adapters<A: Allocator>(out: inout Vec<Adapter, A>) {
+    fn adapters<A: Allocator>(out: &mut Vec<Adapter, A>) {
         if !open_frameworks() { return; }
         // UNSAFE: the result of a C function taken over as an owned Id.
         // SAFETY: MTLCopyAllDevices returns a +1 NSArray of id<MTLDevice> (the Copy rule), or
@@ -526,22 +539,22 @@ impl Api for Metal {
         }
     }
 
-    fn adapter_name<A: Allocator>(a: Adapter, out: inout String<A>) {
-        let _pool = std::objc::Pool::push();
-        std::objc::push_ns_string(&out, a.dev.r().name());
+    fn adapter_name<A: Allocator>(a: &Adapter, out: &mut String<A>) {
+        let _pool = crate::objc::Pool::push();
+        crate::objc::push_ns_string(out, a.dev.r().name());
     }
 
-    fn adapter_low_power(a: Adapter) -> bool {
+    fn adapter_low_power(a: &Adapter) -> bool {
         a.dev.r().is_low_power()
     }
 
-    fn adapter_max_buffer_size(a: Adapter) -> i64 {
+    fn adapter_max_buffer_size(a: &Adapter) -> i64 {
         // (less the bytes of the map state, create_buffer's STATE_BYTES)
         let n = a.dev.r().max_buffer_length() - STATE_BYTES as u64;
         if n > 9223372036854775807u64 { 9223372036854775807 } else { n as i64 }
     }
 
-    fn open(a: Adapter) -> Option<(Device, Queue)> {
+    fn open(a: &Adapter) -> Option<(Device, Queue)> {
         let q = match a.dev.r().new_command_queue() {
             Some(q) => q,
             None => return None,
@@ -550,7 +563,7 @@ impl Api for Metal {
         Some((dev, Queue { q: q, last: Id::<MTLCommandBuffer>::nil() }))
     }
 
-    fn caps(d: Device) -> Caps {
+    fn caps(d: &Device) -> Caps {
         Caps {
             compute: true,
             render: true,
@@ -562,11 +575,11 @@ impl Api for Metal {
         }
     }
 
-    fn device_wait_idle(d: Device) {
+    fn device_wait_idle(d: &Device) {
         // an empty command buffer completes after everything committed
         // before it on the same queue
         let q = d.queue.r();
-        std::objc::pool(|| match q.command_buffer() {
+        crate::objc::pool(|| match q.command_buffer() {
             Some(cb) => {
                 cb.commit();
                 cb.wait_until_completed();
@@ -575,7 +588,7 @@ impl Api for Metal {
         });
     }
 
-    fn create_buffer(d: Device, size: i64, init: [u8]) -> Option<Buffer> {
+    fn create_buffer(d: &Device, size: i64, init: &[u8]) -> Option<Buffer> {
         // the buffer's bytes, then its map state (STATE_BYTES)
         let n = state_offset(size) + STATE_BYTES;
         match d.dev
@@ -591,48 +604,46 @@ impl Api for Metal {
                     // a new buffer and a slice do not overlap.
                     unsafe { memcpy(p, init.ptr, init.len() as u64); }
                 }
-                var out = Buffer { raw: b, ptr: p, size: size };
-                set_map_state(&out, 0);
+                let mut out = Buffer { raw: b, ptr: p, size: size };
+                set_map_state(&mut out, 0);
                 Some(out)
             }
             None => None,
         }
     }
 
-    fn buffer_handle(b: Buffer) -> Buffer {
+    fn buffer_handle(b: &Buffer) -> Buffer {
         Buffer { raw: b.raw.clone(), ptr: b.ptr, size: b.size }
     }
 
-    fn map_state(b: Buffer) -> i64 {
+    fn map_state(b: &Buffer) -> i64 {
         // UNSAFE: the state is in the MTLBuffer's own memory (set_map_state's reason)
         // SAFETY: as set_map_state: b.ptr[state_offset(size)] is inside the MTLBuffer that b.raw keeps alive, a byte the GPU never writes
-        unsafe { b.ptr[state_offset(b.size)] as i64 }
+        unsafe { (*b.ptr.add(state_offset(b.size) as usize)) as i64 }
     }
 
-    #[views(b)]
-    fn map_read(d: Device, b: inout Buffer) -> [u8] {
-        set_map_state(&b, MAPPED_READ);
+    fn map_read<'a>(d: &Device, b: &'a mut Buffer) -> &'a [u8] {
+        set_map_state(b, MAPPED_READ);
         // UNSAFE: a view of the MTLBuffer's shared memory, reached by its raw contents pointer.
         // SAFETY: b.ptr is the contents of an MTLBuffer of at least size bytes that b.raw keeps
-        // alive; #[views(b)] ties the view to b; the map state set above makes std::gpu's
+        // alive; the view's lifetime is b's borrow; the map state set above makes std::gpu's
         // contracts refuse GPU writes to it while it is mapped.
-        unsafe { b.ptr[0..b.size] }
+        unsafe { crate::slice::from_raw_parts(b.ptr, b.size as usize) }
     }
 
-    #[views(b)]
-    fn map_write(d: Device, b: inout Buffer) -> inout [u8] {
-        set_map_state(&b, MAPPED_WRITE);
+    fn map_write<'a>(d: &Device, b: &'a mut Buffer) -> &'a mut [u8] {
+        set_map_state(b, MAPPED_WRITE);
         // UNSAFE: a writable view of the MTLBuffer's shared memory (its raw contents pointer).
         // SAFETY: as map_read: size bytes inside the MTLBuffer that b.raw keeps, the view tied to
-        // b (inout, so no other access while it lives) by #[views(b)].
-        unsafe { &b.ptr[0..b.size] }
+        // b's `&mut` borrow (no other access while it lives).
+        unsafe { crate::slice::from_raw_parts_mut(b.ptr, b.size as usize) }
     }
 
-    fn unmap(d: Device, b: inout Buffer) {
-        set_map_state(&b, 0);
+    fn unmap(d: &Device, b: &mut Buffer) {
+        set_map_state(b, 0);
     }
 
-    fn create_texture(d: Device, desc: TextureDesc) -> Option<Texture> {
+    fn create_texture(d: &Device, desc: TextureDesc) -> Option<Texture> {
         let td = MTLTextureDescriptor::new();
         let t = td.r();
         t.set_texture_type(if desc.layers > 1 { bindings::MTLTextureType2DArray }
@@ -642,7 +653,7 @@ impl Api for Metal {
         t.set_height(desc.height as u64);
         t.set_array_length(desc.layers as u64);
         t.set_mipmap_level_count(desc.mips as u64);
-        var usage: u64 = bindings::MTLTextureUsagePixelFormatView;
+        let mut usage: u64 = bindings::MTLTextureUsagePixelFormatView;
         if desc.usage & TextureUsage::TEXTURE_BINDING
             != 0 { usage = usage | bindings::MTLTextureUsageShaderRead; }
         if desc.usage & TextureUsage::STORAGE_BINDING != 0 {
@@ -659,7 +670,7 @@ impl Api for Metal {
         }
     }
 
-    fn create_view(t: Texture, format: Format, same_format: bool) -> Option<TextureView> {
+    fn create_view(t: &Texture, format: Format, same_format: bool) -> Option<TextureView> {
         if same_format {
             return Some(TextureView { raw: t.raw.clone() });
         }
@@ -669,7 +680,7 @@ impl Api for Metal {
         }
     }
 
-    fn create_sampler(d: Device, desc: SamplerDesc) -> Option<Sampler> {
+    fn create_sampler(d: &Device, desc: SamplerDesc) -> Option<Sampler> {
         let sd = MTLSamplerDescriptor::new();
         let s = sd.r();
         s.set_min_filter(filter(desc.min));
@@ -692,23 +703,24 @@ impl Api for Metal {
         }
     }
 
-    fn create_shader<A: Allocator>(d: Device, src: ShaderSource<Gpa>, err: inout String<A>) -> Option<Shader> {
+    fn create_shader<A: Allocator>(d: &Device, src: &ShaderSource<'_, Gpa>, err: &mut String<A>) -> Option<Shader> {
         if src.kind != ShaderKind::Msl {
             err.push_str("Metal takes MSL (ShaderKind::Msl)");
             return None;
         }
-        let _pool = std::objc::Pool::push();
+        let _pool = crate::objc::Pool::push();
         let opts = MTLCompileOptions::new();
         opts.r().set_language_version(bindings::MTLLanguageVersion3_0);
-        let source = std::objc::ns_string(src.code);
-        var e: *u8 = 0 as *u8;
+        let source = crate::objc::ns_string(src.code);
+        let mut e: *mut u8 = 0 as *mut u8;
         // UNSAFE: the generated wrapper takes an NSError ** out-parameter as a raw pointer.
         // SAFETY: &e is a writable *u8 slot, a local that outlives the call; Metal stores an
         // autoreleased NSError (or nothing) there, alive until _pool drops.
         let lib = unsafe {
             d.dev
                 .r()
-                .new_library_with_source_options_error(source.r(), Some(opts.r()), &e as *u8)
+                .new_library_with_source_options_error(source.r(), Some(opts.r()),
+                    &raw mut e as *mut u8)
         };
         match lib {
             Some(l) => Some(Shader { lib: l }),
@@ -716,110 +728,112 @@ impl Api for Metal {
                 // UNSAFE: the raw NSError ** out-value made a Ref, which no type checks.
                 // SAFETY: e is nil or the autoreleased NSError Metal stored, alive until _pool
                 // (a local of this function) drops, after push_error has read it.
-                push_error(&err, unsafe { Ref::<NSError>::from_global_opt(e) },
+                push_error(err, unsafe { Ref::<NSError>::from_global_opt(e) },
                     "the MSL did not compile");
                 None
             }
         }
     }
 
-    fn create_compute_pipeline<A: Allocator>(d: Device, s: Shader, entry: EntryPoint,
-        err: inout String<A>) -> Option<ComputePipeline> {
-        let f = match function(s, entry, &err) {
+    fn create_compute_pipeline<A: Allocator>(d: &Device, s: &Shader, entry: EntryPoint<'_>,
+        err: &mut String<A>) -> Option<ComputePipeline> {
+        let f = match function(s, entry, err) {
             Some(f) => f,
             None => return None,
         };
         let wg = size3(entry.workgroup[0], entry.workgroup[1], entry.workgroup[2]);
-        let _pool = std::objc::Pool::push();
-        var e: *u8 = 0 as *u8;
+        let _pool = crate::objc::Pool::push();
+        let mut e: *mut u8 = 0 as *mut u8;
         // UNSAFE: the generated wrapper takes an NSError ** out-parameter as a raw pointer.
         // SAFETY: &e is a writable *u8 slot, a local that outlives the call (as create_shader).
         match unsafe {
-            d.dev.r().new_compute_pipeline_state_with_function_error(f.r(), &e as *u8)
+            d.dev.r().new_compute_pipeline_state_with_function_error(f.r(), &raw mut e as *mut u8)
         } {
             Some(p) => Some(ComputePipeline { raw: p, workgroup: wg }),
             None => {
                 // UNSAFE: the raw NSError ** out-value made a Ref, which no type checks.
                 // SAFETY: e is nil or the autoreleased NSError Metal stored, alive until _pool
                 // (a local of this function) drops, after push_error has read it.
-                push_error(&err, unsafe { Ref::<NSError>::from_global_opt(e) },
+                push_error(err, unsafe { Ref::<NSError>::from_global_opt(e) },
                     "Metal rejected the compute pipeline");
                 None
             }
         }
     }
 
-    fn bind_group_new(d: Device) -> BindGroup {
-        let empty = Bound { kind: BIND_BUFFER, vs: -1, fs: -1, cs: -1, obj: 0 as *u8, offset: 0 };
+    fn bind_group_new(d: &Device) -> BindGroup {
+        let empty = Bound {
+            kind: BIND_BUFFER, vs: -1, fs: -1, cs: -1, obj: 0 as *mut u8, offset: 0,
+        };
         BindGroup { items: [empty; 16], count: 0 }
     }
 
-    fn bind_group_buffer(g: inout BindGroup, b: Binding, buf: Buffer, offset: i64, size: i64) {
-        g.items[g.count] = bound(BIND_BUFFER, b, buf.raw.ptr, offset as u64);
+    fn bind_group_buffer(g: &mut BindGroup, b: Binding, buf: &Buffer, offset: i64, size: i64) {
+        g.items[g.count as usize] = bound(BIND_BUFFER, b, buf.raw.ptr, offset as u64);
         g.count += 1;
     }
 
-    fn bind_group_texture(g: inout BindGroup, b: Binding, v: TextureView) {
-        g.items[g.count] = bound(BIND_TEXTURE, b, v.raw.ptr, 0);
+    fn bind_group_texture(g: &mut BindGroup, b: Binding, v: &TextureView) {
+        g.items[g.count as usize] = bound(BIND_TEXTURE, b, v.raw.ptr, 0);
         g.count += 1;
     }
 
-    fn bind_group_sampler(g: inout BindGroup, b: Binding, s: Sampler) {
-        g.items[g.count] = bound(BIND_SAMPLER, b, s.raw.ptr, 0);
+    fn bind_group_sampler(g: &mut BindGroup, b: Binding, s: &Sampler) {
+        g.items[g.count as usize] = bound(BIND_SAMPLER, b, s.raw.ptr, 0);
         g.count += 1;
     }
 
-    fn begin(d: Device) -> CommandBuffer {
+    fn begin(d: &Device) -> CommandBuffer {
         begin_on(d.queue.r())
     }
 
-    fn copy_buffer(cb: inout CommandBuffer, src: Buffer, src_offset: i64, dst: Buffer,
+    fn copy_buffer(cb: &mut CommandBuffer, src: &Buffer, src_offset: i64, dst: &Buffer,
         dst_offset: i64, size: i64) {
-        blit(&cb).copy_from_buffer_source_offset_to_buffer_destination_offset_size(src.raw.r(),
+        blit(cb).copy_from_buffer_source_offset_to_buffer_destination_offset_size(src.raw.r(),
             src_offset as u64, dst.raw.r(), dst_offset as u64, size as u64);
     }
 
-    fn copy_texture_to_buffer(cb: inout CommandBuffer, src: Texture, layer: i64, x: i64, y: i64,
-        w: i64, h: i64, dst: Buffer, offset: i64, bytes_per_row: i64) {
-        blit(&cb).copy_texture_to_buffer(src.raw.r(), layer as u64, 0, origin3(x, y, 0),
+    fn copy_texture_to_buffer(cb: &mut CommandBuffer, src: &Texture, layer: i64, x: i64, y: i64,
+        w: i64, h: i64, dst: &Buffer, offset: i64, bytes_per_row: i64) {
+        blit(cb).copy_texture_to_buffer(src.raw.r(), layer as u64, 0, origin3(x, y, 0),
             size3(w, h, 1), dst.raw.r(), offset as u64, bytes_per_row as u64,
             (bytes_per_row * h) as u64);
     }
 
-    fn copy_buffer_to_texture(cb: inout CommandBuffer, src: Buffer, offset: i64, bytes_per_row: i64,
-        dst: Texture, layer: i64, x: i64, y: i64, w: i64, h: i64) {
-        blit(&cb).copy_buffer_to_texture(src.raw.r(), offset as u64, bytes_per_row as u64,
+    fn copy_buffer_to_texture(cb: &mut CommandBuffer, src: &Buffer, offset: i64, bytes_per_row: i64,
+        dst: &Texture, layer: i64, x: i64, y: i64, w: i64, h: i64) {
+        blit(cb).copy_buffer_to_texture(src.raw.r(), offset as u64, bytes_per_row as u64,
             (bytes_per_row * h) as u64, size3(w, h, 1), dst.raw.r(), layer as u64, 0,
             origin3(x, y, 0));
     }
 
-    fn begin_compute(cb: inout CommandBuffer) -> ComputeEncoder {
-        end_blit(&cb);
+    fn begin_compute(cb: &mut CommandBuffer) -> ComputeEncoder {
+        end_blit(cb);
         let raw = cb.cb.r();
-        let e = std::objc::pool(|| match raw.compute_command_encoder() {
+        let e = crate::objc::pool(|| match raw.compute_command_encoder() {
             Some(e) => e.retain(),
             None => Id::<MTLComputeCommandEncoder>::nil(),
         });
         ComputeEncoder { enc: e, workgroup: size3(1, 1, 1) }
     }
 
-    fn compute_set_pipeline(e: inout ComputeEncoder, p: ComputePipeline) {
+    fn compute_set_pipeline(e: &mut ComputeEncoder, p: &ComputePipeline) {
         e.enc.r().set_compute_pipeline_state(p.raw.r());
         e.workgroup = p.workgroup;
     }
 
-    fn compute_set_bind_group(e: inout ComputeEncoder, g: BindGroup) {
+    fn compute_set_bind_group(e: &mut ComputeEncoder, g: &BindGroup) {
         let enc = e.enc.r();
         for i in 0..g.count {
-            apply_compute(enc, g.items[i]);
+            apply_compute(enc, g.items[i as usize]);
         }
     }
 
-    fn dispatch(e: inout ComputeEncoder, x: i64, y: i64, z: i64) {
+    fn dispatch(e: &mut ComputeEncoder, x: i64, y: i64, z: i64) {
         e.enc.r().dispatch_threadgroups_threads_per_threadgroup(size3(x, y, z), e.workgroup);
     }
 
-    fn compute_set_bytes(e: inout ComputeEncoder, bytes: [u8], slot: i64) {
+    fn compute_set_bytes(e: &mut ComputeEncoder, bytes: &[u8], slot: i64) {
         // UNSAFE: setBytes:length:atIndex: takes the bytes as a raw pointer.
         // SAFETY: bytes.ptr is valid for bytes.len() bytes, the length passed, for the call;
         // Metal copies them before it returns.
@@ -828,18 +842,18 @@ impl Api for Metal {
         }
     }
 
-    fn end_compute(e: inout ComputeEncoder) {
+    fn end_compute(e: &mut ComputeEncoder) {
         e.enc.r().end_encoding();
         e.enc = Id::<MTLComputeCommandEncoder>::nil();
     }
 
-    fn submit(q: inout Queue, cb: inout CommandBuffer) {
-        end_blit(&cb);
+    fn submit(q: &mut Queue, cb: &mut CommandBuffer) {
+        end_blit(cb);
         cb.cb.r().commit();
-        q.last = std::replace(&cb.cb, Id::<MTLCommandBuffer>::nil());
+        q.last = mem::replace(&mut cb.cb, Id::<MTLCommandBuffer>::nil());
     }
 
-    fn write_buffer(q: inout Queue, b: Buffer, offset: i64, data: [u8]) {
+    fn write_buffer(q: &mut Queue, b: &Buffer, offset: i64, data: &[u8]) {
         if data.len() == 0 { return; }
         let idle = q.last.is_nil()
             || q.last.r().status() >= bindings::MTLCommandBufferStatusCompleted;
@@ -849,7 +863,7 @@ impl Api for Metal {
             // so the range is inside the buffer b.raw keeps; no submitted work is reading it
             // (idle); data is another allocation, so they do not overlap.
             unsafe {
-                memcpy(b.ptr[offset..offset + data.len() as i64].ptr, data.ptr, data.len() as u64);
+                memcpy(b.ptr.add(offset as usize), data.ptr, data.len() as u64);
             }
             return;
         }
@@ -865,14 +879,14 @@ impl Api for Metal {
             Some(s) => s,
             None => return,
         };
-        var cb = begin_on(q.q.r());
-        blit(&cb).copy_from_buffer_source_offset_to_buffer_destination_offset_size(staging.r(),
+        let mut cb = begin_on(q.q.r());
+        blit(&mut cb).copy_from_buffer_source_offset_to_buffer_destination_offset_size(staging.r(),
             0, b.raw.r(), offset as u64, data.len() as u64);
-        Metal::submit(&q, &cb);
+        Metal::submit(q, &mut cb);
     }
 
-    fn write_texture(q: inout Queue, t: Texture, layer: i64, x: i64, y: i64, w: i64, h: i64,
-        data: [u8], bytes_per_row: i64) {
+    fn write_texture(q: &mut Queue, t: &Texture, layer: i64, x: i64, y: i64, w: i64, h: i64,
+        data: &[u8], bytes_per_row: i64) {
         let dev = q.q.r().device();
         // UNSAFE: newBufferWithBytes:length:options: takes the bytes as a raw pointer.
         // SAFETY: data.ptr is valid for data.len() bytes, the length passed; Metal copies them;
@@ -884,14 +898,14 @@ impl Api for Metal {
             Some(s) => s,
             None => return,
         };
-        var cb = begin_on(q.q.r());
-        blit(&cb).copy_buffer_to_texture(staging.r(), 0, bytes_per_row as u64,
+        let mut cb = begin_on(q.q.r());
+        blit(&mut cb).copy_buffer_to_texture(staging.r(), 0, bytes_per_row as u64,
             (bytes_per_row * h) as u64, size3(w, h, 1), t.raw.r(), layer as u64, 0,
             origin3(x, y, 0));
-        Metal::submit(&q, &cb);
+        Metal::submit(q, &mut cb);
     }
 
-    fn queue_wait_idle(q: inout Queue) -> bool {
+    fn queue_wait_idle(q: &mut Queue) -> bool {
         if q.last.is_nil() { return true; }
         let last = q.last.r();
         last.wait_until_completed();
@@ -901,13 +915,13 @@ impl Api for Metal {
     // (0.25.4) The command buffer keeps its MTLCommandBuffer (a retain),
     // whose GPUStartTime and GPUEndTime are the host clock's seconds once
     // it has completed.
-    fn submit_timed(q: inout Queue, cb: inout CommandBuffer) {
-        end_blit(&cb);
+    fn submit_timed(q: &mut Queue, cb: &mut CommandBuffer) {
+        end_blit(cb);
         cb.cb.r().commit();
         q.last = cb.cb.clone();
     }
 
-    fn gpu_times(cb: inout CommandBuffer) -> Option<(u64, u64)> {
+    fn gpu_times(cb: &mut CommandBuffer) -> Option<(u64, u64)> {
         if cb.cb.is_nil() { return None; }
         let c = cb.cb.r();
         c.wait_until_completed();
@@ -924,20 +938,20 @@ impl Api for Metal {
 impl Render<Metal> for Metal {
     type RenderPipeline = RenderPipeline;
     type RenderEncoder = RenderEncoder;
-    type PassDesc = PassDesc;
+    type PassDesc = PassDesc<'_>;
     type Surface = Surface;
     type Frame = Frame;
 
-    fn create_render_pipeline(d: Device, vs: Shader, vs_entry: EntryPoint, fs: Shader,
-        fs_entry: EntryPoint, has_fs: bool, state: PipelineState,
-        err: inout String<Gpa>) -> Option<RenderPipeline> {
-        let vf = match function(vs, vs_entry, &err) {
+    fn create_render_pipeline(d: &Device, vs: &Shader, vs_entry: EntryPoint<'_>, fs: &Shader,
+        fs_entry: EntryPoint<'_>, has_fs: bool, state: PipelineState,
+        err: &mut String<Gpa>) -> Option<RenderPipeline> {
+        let vf = match function(vs, vs_entry, err) {
             Some(f) => f,
             None => return None,
         };
-        var ff = Id::<MTLFunction>::nil();
+        let mut ff = Id::<MTLFunction>::nil();
         if has_fs {
-            ff = match function(fs, fs_entry, &err) {
+            ff = match function(fs, fs_entry, err) {
                 Some(f) => f,
                 None => return None,
             };
@@ -948,7 +962,7 @@ impl Render<Metal> for Metal {
         if has_fs { p.set_fragment_function(Some(ff.r())); }
         let colors = p.color_attachments();
         for i in 0..state.target_count {
-            let t = state.targets[i];
+            let t = state.targets[i as usize];
             let c = colors.object_at_indexed_subscript(i as u64);
             c.set_pixel_format(pixel_format(t.format));
             c.set_write_mask(t.write_mask as u64);
@@ -970,7 +984,7 @@ impl Render<Metal> for Metal {
             let attrs = vd.r().attributes();
             let layouts = vd.r().layouts();
             for i in 0..state.buffer_count {
-                let l = state.buffers[i];
+                let l = state.buffers[i as usize];
                 let index = vertex_buffer_index(i);
                 let lay = layouts.object_at_indexed_subscript(index);
                 lay.set_stride(l.stride as u64);
@@ -979,7 +993,7 @@ impl Render<Metal> for Metal {
                     else { bindings::MTLVertexStepFunctionPerVertex });
                 lay.set_step_rate(1);
                 for k in 0..l.count {
-                    let a = l.attributes[k];
+                    let a = l.attributes[k as usize];
                     let ad = attrs.object_at_indexed_subscript(a.location as u64);
                     ad.set_format(vertex_format(a.format));
                     ad.set_offset(a.offset as u64);
@@ -988,7 +1002,7 @@ impl Render<Metal> for Metal {
             }
             p.set_vertex_descriptor(Some(vd.r()));
         }
-        var depth = Id::<MTLDepthStencilState>::nil();
+        let mut depth = Id::<MTLDepthStencilState>::nil();
         match state.depth {
             Some(ds) => {
                 p.set_depth_attachment_pixel_format(pixel_format(ds.format));
@@ -1002,11 +1016,13 @@ impl Render<Metal> for Metal {
             }
             None => {}
         }
-        let _pool = std::objc::Pool::push();
-        var e: *u8 = 0 as *u8;
+        let _pool = crate::objc::Pool::push();
+        let mut e: *mut u8 = 0 as *mut u8;
         // UNSAFE: the generated wrapper takes an NSError ** out-parameter as a raw pointer.
         // SAFETY: &e is a writable *u8 slot, a local that outlives the call (as create_shader).
-        match unsafe { d.dev.r().new_render_pipeline_state_with_descriptor_error(p, &e as *u8) } {
+        match unsafe {
+            d.dev.r().new_render_pipeline_state_with_descriptor_error(p, &raw mut e as *mut u8)
+        } {
             Some(raw) => {
                 let primitive = match state.topology {
                     Topology::PointList => bindings::MTLPrimitiveTypePoint,
@@ -1033,18 +1049,19 @@ impl Render<Metal> for Metal {
                 // UNSAFE: the raw NSError ** out-value made a Ref, which no type checks.
                 // SAFETY: e is nil or the autoreleased NSError Metal stored, alive until _pool
                 // (a local of this function) drops, after push_error has read it.
-                push_error(&err, unsafe { Ref::<NSError>::from_global_opt(e) },
+                push_error(err, unsafe { Ref::<NSError>::from_global_opt(e) },
                     "Metal rejected the render pipeline");
                 None
             }
         }
     }
 
-    fn pass_new() -> PassDesc {
+    fn pass_new() -> PassDesc<'static> {
         PassDesc { raw: MTLRenderPassDescriptor::new() }
     }
 
-    fn pass_color(p: inout PassDesc, i: i64, v: TextureView, load: Load, clear: Color, store: bool) {
+    fn pass_color(p: &mut PassDesc<'_>, i: i64, v: &TextureView, load: Load, clear: Color,
+        store: bool) {
         let a = p.raw.r().color_attachments().object_at_indexed_subscript(i as u64);
         a.set_texture(Some(v.raw.r()));
         a.set_load_action(load_action(load));
@@ -1055,7 +1072,7 @@ impl Render<Metal> for Metal {
             else { bindings::MTLStoreActionDontCare });
     }
 
-    fn pass_depth(p: inout PassDesc, v: TextureView, load: Load, clear: f64, store: bool) {
+    fn pass_depth(p: &mut PassDesc<'_>, v: &TextureView, load: Load, clear: f64, store: bool) {
         let a = p.raw.r().depth_attachment();
         a.set_texture(Some(v.raw.r()));
         a.set_load_action(load_action(load));
@@ -1064,11 +1081,11 @@ impl Render<Metal> for Metal {
             else { bindings::MTLStoreActionDontCare });
     }
 
-    fn begin_render(cb: inout CommandBuffer, p: PassDesc) -> RenderEncoder {
-        end_blit(&cb);
+    fn begin_render(cb: &mut CommandBuffer, p: &PassDesc<'_>) -> RenderEncoder {
+        end_blit(cb);
         let raw = cb.cb.r();
         let desc = p.raw.r();
-        let e = std::objc::pool(|| match raw.render_command_encoder_with_descriptor(desc) {
+        let e = crate::objc::pool(|| match raw.render_command_encoder_with_descriptor(desc) {
             Some(e) => e.retain(),
             None => Id::<MTLRenderCommandEncoder>::nil(),
         });
@@ -1078,7 +1095,7 @@ impl Render<Metal> for Metal {
         }
     }
 
-    fn render_set_pipeline(e: inout RenderEncoder, p: RenderPipeline) {
+    fn render_set_pipeline(e: &mut RenderEncoder, p: &RenderPipeline) {
         let enc = e.enc.r();
         enc.set_render_pipeline_state(p.raw.r());
         enc.set_cull_mode(p.cull);
@@ -1089,14 +1106,14 @@ impl Render<Metal> for Metal {
         e.primitive = p.primitive;
     }
 
-    fn render_set_bind_group(e: inout RenderEncoder, g: BindGroup) {
+    fn render_set_bind_group(e: &mut RenderEncoder, g: &BindGroup) {
         let enc = e.enc.r();
         for i in 0..g.count {
-            apply_render(enc, g.items[i]);
+            apply_render(enc, g.items[i as usize]);
         }
     }
 
-    fn render_set_bytes(e: inout RenderEncoder, stage: u32, bytes: [u8], slot: i64) {
+    fn render_set_bytes(e: &mut RenderEncoder, stage: u32, bytes: &[u8], slot: i64) {
         let enc = e.enc.r();
         // UNSAFE: set{Vertex,Fragment}Bytes:length:atIndex: take the bytes as a raw pointer.
         // SAFETY: bytes.ptr is valid for bytes.len() bytes, the length passed, for the call;
@@ -1111,14 +1128,14 @@ impl Render<Metal> for Metal {
         }
     }
 
-    fn render_set_vertex_buffer(e: inout RenderEncoder, slot: i64, b: Buffer, offset: i64) {
+    fn render_set_vertex_buffer(e: &mut RenderEncoder, slot: i64, b: &Buffer, offset: i64) {
         e.enc
             .r()
             .set_vertex_buffer_offset_at_index(Some(b.raw.r()), offset as u64,
                 vertex_buffer_index(slot));
     }
 
-    fn render_set_index_buffer(e: inout RenderEncoder, b: Buffer, format: IndexFormat, offset: i64) {
+    fn render_set_index_buffer(e: &mut RenderEncoder, b: &Buffer, format: IndexFormat, offset: i64) {
         e.index = b.raw.clone();
         e.index_type = if format == IndexFormat::Uint32 { bindings::MTLIndexTypeUInt32 }
             else { bindings::MTLIndexTypeUInt16 };
@@ -1126,7 +1143,7 @@ impl Render<Metal> for Metal {
         e.index_offset = offset;
     }
 
-    fn render_set_viewport(e: inout RenderEncoder, x: f32, y: f32, w: f32, h: f32, min_depth: f32,
+    fn render_set_viewport(e: &mut RenderEncoder, x: f32, y: f32, w: f32, h: f32, min_depth: f32,
         max_depth: f32) {
         e.enc
             .r()
@@ -1136,7 +1153,7 @@ impl Render<Metal> for Metal {
             });
     }
 
-    fn render_set_scissor(e: inout RenderEncoder, x: i64, y: i64, w: i64, h: i64) {
+    fn render_set_scissor(e: &mut RenderEncoder, x: i64, y: i64, w: i64, h: i64) {
         e.enc
             .r()
             .set_scissor_rect(MTLScissorRect {
@@ -1144,13 +1161,13 @@ impl Render<Metal> for Metal {
             });
     }
 
-    fn render_set_blend_constant(e: inout RenderEncoder, c: Color) {
+    fn render_set_blend_constant(e: &mut RenderEncoder, c: Color) {
         e.enc
             .r()
             .set_blend_color_red_green_blue_alpha(c.r as f32, c.g as f32, c.b as f32, c.a as f32);
     }
 
-    fn draw(e: inout RenderEncoder, first_vertex: i64, vertices: i64, first_instance: i64,
+    fn draw(e: &mut RenderEncoder, first_vertex: i64, vertices: i64, first_instance: i64,
         instances: i64) {
         e.enc
             .r()
@@ -1158,24 +1175,24 @@ impl Render<Metal> for Metal {
                 first_vertex as u64, vertices as u64, instances as u64, first_instance as u64);
     }
 
-    fn draw_indexed(e: inout RenderEncoder, first_index: i64, indices: i64, base_vertex: i64,
+    fn draw_indexed(e: &mut RenderEncoder, first_index: i64, indices: i64, base_vertex: i64,
         first_instance: i64, instances: i64) {
         let offset = e.index_offset + first_index * e.index_size;
         e.enc.r().draw_indexed_primitives_index_count_index_type_index_buffer_index_buffer_offset_instance_count_base_vertex_base_instance(e.primitive, indices as u64, e.index_type, e.index.r(), offset as u64, instances as u64, base_vertex, first_instance as u64);
     }
 
-    fn end_render(e: inout RenderEncoder) {
+    fn end_render(e: &mut RenderEncoder) {
         e.enc.r().end_encoding();
         e.enc = Id::<MTLRenderCommandEncoder>::nil();
     }
 
-    fn create_surface(d: Device, raw: RawSurface) -> Option<Surface> {
+    fn create_surface(d: &Device, raw: RawSurface) -> Option<Surface> {
         if !open_frameworks() { return None; }
         let layer = match raw {
             // (0.25.4) null: a scripted window's (std::window, VOLE_WINDOW_SCRIPT),
             // offscreen like Headless
-            RawSurface::MetalLayer(p) if p == 0 as *u8 => {
-                std::objc::pool(|| CAMetalLayer::layer().retain())
+            RawSurface::MetalLayer(p) if p == 0 as *mut u8 => {
+                crate::objc::pool(|| CAMetalLayer::layer().retain())
             }
             RawSurface::MetalLayer(p) => {
                 // UNSAFE: the window library's layer arrives as a raw pointer.
@@ -1185,14 +1202,14 @@ impl Render<Metal> for Metal {
                 r.retain()
             }
             // an unattached layer: its drawables are offscreen
-            RawSurface::Headless => std::objc::pool(|| CAMetalLayer::layer().retain()),
+            RawSurface::Headless => crate::objc::pool(|| CAMetalLayer::layer().retain()),
         };
         if layer.is_nil() { return None; }
         layer.r().set_device(Some(d.dev.r()));
         Some(Surface { layer: layer })
     }
 
-    fn configure(s: inout Surface, d: Device, width: i64, height: i64, format: Format, vsync: bool) {
+    fn configure(s: &mut Surface, d: &Device, width: i64, height: i64, format: Format, vsync: bool) {
         let l = s.layer.r();
         l.set_device(Some(d.dev.r()));
         l.set_pixel_format(pixel_format(format));
@@ -1202,9 +1219,9 @@ impl Render<Metal> for Metal {
         l.set_display_sync_enabled(vsync);
     }
 
-    fn next_frame(s: inout Surface) -> Option<(Frame, Texture)> {
+    fn next_frame(s: &mut Surface) -> Option<(Frame, Texture)> {
         let l = s.layer.r();
-        let _pool = std::objc::Pool::push();
+        let _pool = crate::objc::Pool::push();
         match l.next_drawable() {
             Some(dr) => {
                 let tex = dr.texture().retain();
@@ -1214,13 +1231,13 @@ impl Render<Metal> for Metal {
         }
     }
 
-    fn present(q: inout Queue, f: Frame) {
-        var cb = begin_on(q.q.r());
+    fn present(q: &mut Queue, f: &Frame) {
+        let mut cb = begin_on(q.q.r());
         // UNSAFE: a cast between protocols, which the table does not relate.
         // SAFETY: CAMetalDrawable is declared `@protocol CAMetalDrawable <MTLDrawable>`, so
         // every CAMetalDrawable is an MTLDrawable; f.drawable keeps it alive.
         let d = unsafe { f.drawable.r().cast::<bindings::MTLDrawable>() };
         cb.cb.r().present_drawable(d);
-        Metal::submit(&q, &cb);
+        Metal::submit(q, &mut cb);
     }
 }

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.28.0 (vole 0.28.0)
+
+- The grammar is the rust edition's: the scopes of `inout`, `sink`,
+  `var` and `static var` are gone (they are ordinary names now);
+  lifetimes (`'a`, `'static`, `'_`: `storage.modifier.lifetime.vole`),
+  loop labels (`'outer:`, `break 'outer`), `mut` in `let mut`, `&mut T`
+  and `*mut T` (`storage.modifier.mut.vole`), `where`
+  (`keyword.other.where.vole`), `dyn`, `ref`; `&` is
+  `keyword.operator.borrow.vole`; `str`, `char`, `String`, `Box` and
+  the comparison traits are known types.
+- `defer` is an ordinary name too (it was `keyword.control.vole`). The
+  samples have no edition line: there is one edition, and no file says
+  it.
+
 ## Unreleased (vole 0.25.2)
 
 - Settings `vole.includePaths` (the build's `-I` directories, for

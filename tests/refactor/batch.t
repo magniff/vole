@@ -7,7 +7,7 @@ $ batch $T/inputs/batch-queries.txt | sed 's/^## /#> /'
 # crate::calc	calc.vl
 4	fn	pub fn clamp(v: i64, lo: i64, hi: i64) -> i64
 15	fn	pub fn sum_to(n: i64) -> i64
-#> $ volec query show clamp
+#> $ volec query show calc::clamp
 // crate::calc::clamp	calc.vl:3-12	effects: none
 // v, kept within [lo, hi].
 pub fn clamp(v: i64, lo: i64, hi: i64) -> i64 {
@@ -19,14 +19,14 @@ pub fn clamp(v: i64, lo: i64, hi: i64) -> i64 {
     }
     v
 }
-#> $ volec query refs clamp --count
+#> $ volec query refs calc::clamp --count
 3
 $ batch < $T/inputs/batch-queries.txt | sed 's/^## /#> /'
 #> $ volec query items calc
 # crate::calc	calc.vl
 4	fn	pub fn clamp(v: i64, lo: i64, hi: i64) -> i64
 15	fn	pub fn sum_to(n: i64) -> i64
-#> $ volec query show clamp
+#> $ volec query show calc::clamp
 // crate::calc::clamp	calc.vl:3-12	effects: none
 // v, kept within [lo, hi].
 pub fn clamp(v: i64, lo: i64, hi: i64) -> i64 {
@@ -38,7 +38,7 @@ pub fn clamp(v: i64, lo: i64, hi: i64) -> i64 {
     }
     v
 }
-#> $ volec query refs clamp --count
+#> $ volec query refs calc::clamp --count
 3
 ## An edit is written; the commands after it see it. A failing command
 ## does not end the batch; the first failing status is the batch's.
@@ -49,7 +49,7 @@ patched crate::calc::clamp	calc.vl	+1 -1 lines
 error query.no-match: no definition 'nosuchthing'
 try: volec query items
 #> exit 1
-#> $ volec query show clamp
+#> $ volec query show calc::clamp
 // crate::calc::clamp	calc.vl:3-12	effects: none
 // v, kept within [lo, hi].
 pub fn clamp(v: i64, lo: i64, hi: i64) -> i64 {
@@ -87,8 +87,8 @@ error batch.usage: cannot read 'no-such.pairs'
 // crate::calc::sum_to	calc.vl:14-24	effects: diverge
 // 1 + 2 + ... + n.
 pub fn sum_to(n: i64) -> i64 {
-    var total = 0;
-    var i = 1;
+    let mut total: i64 = 0;
+    let mut i: i64 = 1;
     while i <= n {
         total += i;
         i += 1;

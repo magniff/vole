@@ -8,13 +8,14 @@
 // universal: a constraint into one is checked after the fixpoint
 // (D6.2.1: borrowck.outlives).
 
+use crate::back::regalloc::intervals::trailing_zeros;
 use crate::base::{buf_new, buf_slice, buf_str, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::report_error_tries;
-use crate::front::own::glue::has_glue;
 use crate::front::types::{TyKind, type_elem};
-use crate::places::borrowck::{Bck, LOAN_WORDS, bit_on};
+use crate::places::borrowck::{Bck, LOAN_WORDS, bit_on, zero_fill};
+use crate::places::glue::has_glue;
 use crate::places::ir::{Body, LF_STATIC, has_flag, local_ty, undistinct};
 use crate::places::regions::{
     RO_LOAN, RO_LOCAL, RO_UNIVERSAL, U_BOUND, U_CSLOT, U_ELIDED, U_ENV, U_NAMED, U_OPAQUE, U_STATIC,
@@ -22,116 +23,179 @@ use crate::places::regions::{
 };
 
 // RULE: D6.1
-pub fn solve(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+pub fn solve(bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
     let nbits = bck.npts + bck.nuniv;
     bck.nw_p = (nbits + 63) / 64;
     if bck.nw_p < 1 {
         bck.nw_p = 1;
     }
     let nw = bck.nw_p;
-    bck.val.clear();
-    for _ in 0..(bck.nreg + 1) * nw {
-        bck.val.push(0);
+    zero_fill(&mut bck.val, (bck.nreg + 1) * nw);
+    universal_order(bck, pbody);
+    dropck_slots(bck, pbody, pcx);
+    // (the drop-liveness only when a region needs it, or the dump shows it)
+    let mut drops = crate::places::borrowck::emit_regions();
+    for r in 0..bck.nreg {
+        if bck.dropck[r as usize] != 0 {
+            drops = true;
+        }
     }
-    universal_order(&bck, pbody);
-    dropck_slots(&bck, pbody, &pcx);
+    if drops {
+        crate::places::borrowck::liveness::drop_liveness(bck, pbody);
+    }
     // (Liveness) and (Universal)
+    live_rows(drops, bck);
     for r in 1..bck.nreg + 1 {
-        let o = bck.origin[r - 1];
+        let o = bck.origin[(r - 1) as usize];
         if o == RO_UNIVERSAL {
-            for p in 0..bck.npts {
-                set_bit(r, p, &bck);
-            }
-            let u = bck.univ[r - 1];
+            set_first_bits(r, bck.npts, bck);
+            let u = bck.univ[(r - 1) as usize];
             for v in 0..bck.nuniv {
                 if outlives(u, v, bck) {
-                    set_bit(r, bck.npts + v, &bck);
+                    set_bit(r, bck.npts + v, bck);
                 }
             }
         } else if o == RO_LOAN && static_loan(r, bck, pbody) {
             // RULE: D6.2.5 (a loan of a static: every point and every end)
-            for p in 0..bck.npts + bck.nuniv {
-                set_bit(r, p, &bck);
-            }
+            set_first_bits(r, bck.npts + bck.nuniv, bck);
         } else if o == RO_LOCAL {
-            let l = bck.of[r - 1];
-            let needed = bck.dropck[r - 1] != 0;
-            for p in 0..bck.npts {
-                if bit_on(bck.live, p * bck.nw_l, l)
-                    || needed && bit_on(bck.dlive, p * bck.nw_l, l) {
-                    set_bit(r, p, &bck);
+            // (the points where its local is use-live, or drop-live when
+            // its drop needs it: live_rows, a word at a time)
+            let l = bck.of[(r - 1) as usize];
+            let needed = bck.dropck[(r - 1) as usize] != 0;
+            if l < 0 || l >= bck.nlocal {
+                continue;
+            }
+            for w in 0..nw {
+                let mut x = bck.live_rows[(l * nw + w) as usize];
+                if needed {
+                    x = x | bck.dlive_rows[(l * nw + w) as usize];
                 }
+                bck.val[(r * nw + w) as usize] = bck.val[(r * nw + w) as usize] | x;
             }
         }
     }
     // (Outlives): the adjacency sub -> sups, then the worklist
-    adjacency(&bck);
+    adjacency(bck);
     bck.queue.clear();
     bck.inq.clear();
     for _ in 0..bck.nreg + 1 {
         bck.queue.push(0);
         bck.inq.push(0);
     }
-    var head = 0;
-    var tail = 0;
+    let mut head: i64 = 0;
+    let mut tail: i64 = 0;
     let cap = bck.nreg + 1;
     for r in 1..bck.nreg + 1 {
-        bck.queue[tail] = r;
+        bck.queue[tail as usize] = r;
         tail = (tail + 1) % cap;
-        bck.inq[r] = 1;
+        bck.inq[r as usize] = 1;
     }
     while head != tail {
-        let r = bck.queue[head];
+        let r = bck.queue[head as usize];
         head = (head + 1) % cap;
-        bck.inq[r] = 0;
-        for i in bck.adj_at[r]..bck.adj_at[r + 1] {
-            let sup = bck.adj[i];
-            if bck.origin[sup - 1] == RO_UNIVERSAL {
+        bck.inq[r as usize] = 0;
+        for i in bck.adj_at[r as usize]..bck.adj_at[(r + 1) as usize] {
+            let sup = bck.adj[i as usize];
+            if bck.origin[(sup - 1) as usize] == RO_UNIVERSAL {
                 continue;
             }
-            var grew = false;
+            let mut grew = false;
             for w in 0..nw {
-                let nv = bck.val[sup * nw + w] | bck.val[r * nw + w];
-                if nv != bck.val[sup * nw + w] {
-                    bck.val[sup * nw + w] = nv;
+                let nv = bck.val[(sup * nw + w) as usize] | bck.val[(r * nw + w) as usize];
+                if nv != bck.val[(sup * nw + w) as usize] {
+                    bck.val[(sup * nw + w) as usize] = nv;
                     grew = true;
                 }
             }
-            if grew && bck.inq[sup] == 0 {
-                bck.queue[tail] = sup;
+            if grew && bck.inq[sup as usize] == 0 {
+                bck.queue[tail as usize] = sup;
                 tail = (tail + 1) % cap;
-                bck.inq[sup] = 1;
+                bck.inq[sup as usize] = 1;
             }
         }
     }
-    universal_violations(&bck, pbody, &pcx);
-    opaque_choice(bck, pbody, &pcx);
+    universal_violations(bck, pbody, pcx);
+    opaque_choice(bck, pbody, pcx);
 }
 
-fn set_bit(r: i64, bit: i64, bck: inout Bck<Comp>) {
+fn set_bit(r: i64, bit: i64, bck: &mut Bck<Comp>) {
     let w = r * bck.nw_p + (bit >> 6);
-    bck.val[w] = bck.val[w] | (1 << (bit & 63));
+    bck.val[w as usize] = bck.val[w as usize] | (1 << (bit & 63));
+}
+
+// Bits 0..n of region r's value set: whole words, then the last one's
+// bits.
+fn set_first_bits(r: i64, n: i64, bck: &mut Bck<Comp>) {
+    let full = n >> 6;
+    for w in 0..full {
+        { let at_ix = (r * bck.nw_p + w) as usize; bck.val[at_ix] = -1 };
+    }
+    for p in full * 64..n {
+        set_bit(r, p, bck);
+    }
+}
+
+// live and dlive (a point's live locals) transposed: per local, the
+// points where it is use-live and drop-live, nw_p words each
+// (bck.live_rows, dlive_rows), so that a region's value takes its local's
+// a word at a time.
+fn live_rows(drops: bool, bck: &mut Bck<Comp>) {
+    let nw = bck.nw_p;
+    let nwl = bck.nw_l;
+    zero_fill(&mut bck.live_rows, bck.nlocal * nw);
+    if drops {
+        zero_fill(&mut bck.dlive_rows, bck.nlocal * nw);
+    } else {
+        bck.dlive_rows.clear();
+    }
+    for p in 0..bck.npts {
+        let bit = 1 << (p & 63);
+        for w in 0..nwl {
+            let mut x = bck.live[(p * nwl + w) as usize] as u64;
+            while x != 0 {
+                let l = w * 64 + trailing_zeros(x);
+                x = x & x.wrapping_sub(1u64);
+                if l < bck.nlocal {
+                    bck.live_rows[(l * nw + (p >> 6)) as usize] = bck.live_rows[
+                        (l * nw + (p >> 6)) as usize] | bit;
+                }
+            }
+            if !drops {
+                continue;
+            }
+            let mut y = bck.dlive[(p * nwl + w) as usize] as u64;
+            while y != 0 {
+                let l = w * 64 + trailing_zeros(y);
+                y = y & y.wrapping_sub(1u64);
+                if l < bck.nlocal {
+                    bck.dlive_rows[(l * nw + (p >> 6)) as usize] = bck.dlive_rows[(l * nw + (p
+                        >> 6)) as usize] | bit;
+                }
+            }
+        }
+    }
 }
 
 // Whether region r is the loan of a static's place (an LF_STATIC root).
-fn static_loan(r: i64, bck: Bck<Comp>, pbody: Body<Comp>) -> bool {
+fn static_loan(r: i64, bck: &Bck<Comp>, pbody: &Body<Comp>) -> bool {
     for j in 0..bck.loans.len() as i64 / LOAN_WORDS {
-        if bck.loans[LOAN_WORDS * j + 1] == r {
-            return has_flag(bck.loans[LOAN_WORDS * j + 3], LF_STATIC, pbody);
+        if bck.loans[(LOAN_WORDS * j + 1) as usize] == r {
+            return has_flag(bck.loans[(LOAN_WORDS * j + 3) as usize], LF_STATIC, pbody);
         }
     }
     false
 }
 
 // The words a universal's row of the order takes.
-fn nwu(bck: Bck<Comp>) -> i64 {
+fn nwu(bck: &Bck<Comp>) -> i64 {
     let n = (bck.nuniv + 63) / 64;
     if n < 1 { 1 } else { n }
 }
 
 // RULE: D4.5 (the order: 'static outlives every universal, each itself,
 // the body's bounds, closed transitively)
-fn universal_order(bck: inout Bck<Comp>, pbody: Body<Comp>) {
+fn universal_order(bck: &mut Bck<Comp>, pbody: &Body<Comp>) {
     let n = bck.nuniv;
     let w = nwu(bck);
     bck.outlives.clear();
@@ -139,19 +203,19 @@ fn universal_order(bck: inout Bck<Comp>, pbody: Body<Comp>) {
         bck.outlives.push(0);
     }
     for u in 0..n {
-        set_outlives(u, u, &bck);
+        set_outlives(u, u, bck);
         if u == 0 {
             for v in 0..n {
-                set_outlives(0, v, &bck);
+                set_outlives(0, v, bck);
             }
         }
     }
-    var i = 0;
+    let mut i: i64 = 0;
     while i + 1 < pbody.ubounds.len() as i64 {
-        let a = pbody.ubounds[i] - 1;
-        let b = pbody.ubounds[i + 1] - 1;
+        let a = pbody.ubounds[i as usize] - 1;
+        let b = pbody.ubounds[(i + 1) as usize] - 1;
         if a >= 0 && a < n && b >= 0 && b < n {
-            set_outlives(a, b, &bck);
+            set_outlives(a, b, bck);
         }
         i += 2;
     }
@@ -160,7 +224,7 @@ fn universal_order(bck: inout Bck<Comp>, pbody: Body<Comp>) {
             if outlives(a, k, bck) {
                 for b in 0..n {
                     if outlives(k, b, bck) {
-                        set_outlives(a, b, &bck);
+                        set_outlives(a, b, bck);
                     }
                 }
             }
@@ -168,15 +232,15 @@ fn universal_order(bck: inout Bck<Comp>, pbody: Body<Comp>) {
     }
 }
 
-fn set_outlives(u: i64, v: i64, bck: inout Bck<Comp>) {
+fn set_outlives(u: i64, v: i64, bck: &mut Bck<Comp>) {
     let w = u * nwu(bck) + (v >> 6);
-    bck.outlives[w] = bck.outlives[w] | (1 << (v & 63));
+    bck.outlives[w as usize] = bck.outlives[w as usize] | (1 << (v & 63));
 }
 
 // Whether universal u outlives universal v (indexes from 0, 'static 0).
-pub fn outlives(u: i64, v: i64, bck: Bck<Comp>) -> bool {
+pub fn outlives(u: i64, v: i64, bck: &Bck<Comp>) -> bool {
     u >= 0 && v >= 0 && u < bck.nuniv && v < bck.nuniv
-        && (bck.outlives[u * nwu(bck) + (v >> 6)] >> (v & 63)) & 1 != 0
+        && (bck.outlives[(u * nwu(bck) + (v >> 6)) as usize] >> (v & 63)) & 1 != 0
 }
 
 // RULE: D21.2 (0.27.2.1) The member choice of each slot 'o of an `impl Tr`
@@ -186,11 +250,11 @@ pub fn outlives(u: i64, v: i64, bck: Bck<Comp>) -> bool {
 // opaque.ambiguous (rustc E0700: the hidden type captures a lifetime that
 // is none of them). A local's loan reaching the result is
 // borrowck.return_local.
-fn opaque_choice(bck: Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+fn opaque_choice(bck: &Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
     let ne = bck.edges.len() as i64 / 3;
-    var reached = Vec::<i64, Comp>::new_in(Comp {});
-    var seen = Vec::<i64, Comp>::new_in(Comp {});
-    var stack = Vec::<i64, Comp>::new_in(Comp {});
+    let mut reached = Vec::<i64, Comp>::new_in(Comp {});
+    let mut seen = Vec::<i64, Comp>::new_in(Comp {});
+    let mut stack = Vec::<i64, Comp>::new_in(Comp {});
     for o in 0..bck.nuniv {
         let ro = universal_var(o, bck);
         if ro <= 0 || region_word(ro, 0, pbody) != U_OPAQUE {
@@ -208,14 +272,14 @@ fn opaque_choice(bck: Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
             }
             stack.clear();
             stack.push(r);
-            seen[r] = 1;
-            var hit = false;
+            seen[r as usize] = 1;
+            let mut hit = false;
             while stack.len() > 0 && !hit {
                 let x = stack.pop().unwrap();
                 for e in 0..ne {
-                    let sub = bck.edges[3 * e + 1];
-                    if bck.edges[3 * e] == x && seen[sub] == 0 {
-                        seen[sub] = 1;
+                    let sub = bck.edges[(3 * e + 1) as usize];
+                    if bck.edges[(3 * e) as usize] == x && seen[sub as usize] == 0 {
+                        seen[sub as usize] = 1;
                         hit = hit || sub == ro;
                         stack.push(sub);
                     }
@@ -225,7 +289,7 @@ fn opaque_choice(bck: Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
                 reached.push(v);
             }
         }
-        if reached.len() < 2 || has_member(reached, bck, pbody) {
+        if reached.len() < 2 || has_member(&reached, bck, pbody) {
             continue;
         }
         let m = buf_new();
@@ -234,25 +298,25 @@ fn opaque_choice(bck: Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
         buf_str(m, c" and ");
         buf_universal(m, reached[1], bck, pbody, pcx);
         buf_str(m, c" in one place, and neither outlives the other: its hidden type's lifetime is ambiguous (rustc E0700)");
-        let node = pcx.nodes[pbody.node].b;
-        report_error_tries(pcx.nodes[if node > 0 { node } else { pbody.node }].start,
+        let node = pcx.nodes[pbody.node as usize].b;
+        report_error_tries(pcx.nodes[(if node > 0 { node } else { pbody.node }) as usize].start,
             3000 + 63 * 64, c"opaque.ambiguous", buf_slice(m).ptr,
             c"name one lifetime on the references it returns (`x: &'a T, y: &'a T`), or add the bound `'b: 'a`",
-            "", false, &pcx);
+            b"", false, pcx);
         return;
     }
 }
 
 // Whether one input universal (or 'static) is outlived by every universal
 // of `reached`.
-fn has_member(reached: Vec<i64, Comp>, bck: Bck<Comp>, pbody: Body<Comp>) -> bool {
+fn has_member(reached: &Vec<i64, Comp>, bck: &Bck<Comp>, pbody: &Body<Comp>) -> bool {
     for m in 0..bck.nuniv {
         let r = universal_var(m, bck);
         if m > 0 && (r <= 0 || region_word(r, 0, pbody) == U_OPAQUE) {
             continue;
         }
-        var all = true;
-        for v in reached.as_slice() {
+        let mut all = true;
+        for &v in reached.as_slice() {
             if !outlives(v, m, bck) {
                 all = false;
             }
@@ -264,29 +328,46 @@ fn has_member(reached: Vec<i64, Comp>, bck: Bck<Comp>, pbody: Body<Comp>) -> boo
     false
 }
 
+// RULE: D4.4 (g) (0.28.0) Whether u ⊒ v is between regions of an
+// instance's type arguments (either a substitution's): not this body's
+// to say. rustc checks the template, where a type parameter has no
+// region; an instance's universals are one per slot of each argument,
+// and which of them the caller wrote as one lifetime (an item's and a
+// closure's parameter's, `filter(|e| e.s == key)`) is not in them. The
+// template's opaque instance (D4.4 (d)) is where such a flow is an error.
+fn substitution_pair(u: i64, v: i64, bck: &Bck<Comp>, pbody: &Body<Comp>, pcx: &Ctx<Comp>) -> bool {
+    if pbody.fn_ < 0 || pcx.fns[pbody.fn_ as usize].tmpl == 0 {
+        return false;
+    }
+    let ru = universal_var(u, bck);
+    let rv = universal_var(v, bck);
+    ru > 0 && region_word(ru, 0, pbody) == crate::places::regions::U_SUBST
+        || rv > 0 && region_word(rv, 0, pbody) == crate::places::regions::U_SUBST
+}
+
 // RULE: D6.2.1 (a constraint into a universal that holds an `end` the
 // universal does not outlive: borrowck.outlives, once per pair)
-fn universal_violations(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+fn universal_violations(bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
     let ne = bck.edges.len() as i64 / 3;
     bck.reported.clear();
     bck.reqs.clear();
-    var locals = Vec::<i64, Comp>::new_in(Comp {});
+    let mut locals = Vec::<i64, Comp>::new_in(Comp {});
     for e in 0..ne {
-        let sup = bck.edges[3 * e];
-        let sub = bck.edges[3 * e + 1];
-        let loc = bck.edges[3 * e + 2];
-        if bck.origin[sup - 1] != RO_UNIVERSAL {
+        let sup = bck.edges[(3 * e) as usize];
+        let sub = bck.edges[(3 * e + 1) as usize];
+        let loc = bck.edges[(3 * e + 2) as usize];
+        if bck.origin[(sup - 1) as usize] != RO_UNIVERSAL {
             continue;
         }
-        let u = bck.univ[sup - 1];
+        let u = bck.univ[(sup - 1) as usize];
         for v in 0..bck.nuniv {
-            if !bit_on(bck.val, sub * bck.nw_p, bck.npts + v) || outlives(u, v, bck) {
+            if !bit_on(&bck.val, sub * bck.nw_p, bck.npts + v) || outlives(u, v, bck) {
                 continue;
             }
-            var seen = false;
-            var i = 0;
+            let mut seen = false;
+            let mut i: i64 = 0;
             while i < bck.reported.len() as i64 {
-                if bck.reported[i] == u && bck.reported[i + 1] == v {
+                if bck.reported[i as usize] == u && bck.reported[(i + 1) as usize] == v {
                     seen = true;
                 }
                 i += 2;
@@ -300,65 +381,68 @@ fn universal_violations(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<
                 locals.push(u);
                 locals.push(v);
                 locals.push(loc);
-            } else if !requirement(u, v, &bck, pbody) {
-                report_outlives(u, v, loc, bck, pbody, &pcx);
+            } else if !requirement(u, v, bck, pbody) && !substitution_pair(u, v, bck, pbody, pcx) {
+                report_outlives(u, v, loc, bck, pbody, pcx);
             }
         }
     }
     // RULE: D19.10 (1) (a local universal of a closure body: one error for
     // it, the one naming a capture first, then the signature, rustc's)
-    var i = 0;
+    let mut i: i64 = 0;
     while i + 2 < locals.len() as i64 {
-        let u = locals[i];
-        var best = i;
-        var first = true;
-        var j = 0;
+        let u = locals[i as usize];
+        let mut best = i;
+        let mut first = true;
+        let mut j: i64 = 0;
         while j + 2 < locals.len() as i64 {
-            if locals[j] == u {
+            if locals[j as usize] == u {
                 if j < i {
                     first = false;
                 }
-                if rank(locals[j + 1], bck, pbody, pcx) > rank(locals[best + 1], bck, pbody, pcx) {
+                if rank(locals[(j + 1) as usize], bck, pbody, pcx)
+                    > rank(locals[(best + 1) as usize], bck, pbody, pcx) {
                     best = j;
                 }
             }
             j += 3;
         }
         if first {
-            report_outlives(u, locals[best + 1], locals[best + 2], bck, pbody, &pcx);
+            report_outlives(u, locals[(best + 1) as usize], locals[(best + 2) as usize], bck, pbody,
+                pcx);
         }
         i += 3;
     }
     // RULE: D19.10 (2) (kept with the closure, for its creator and its calls)
-    var k = 0;
+    let mut k: i64 = 0;
     while k + 2 < bck.reqs.len() as i64 {
-        let id = bck.reqs[k];
-        if pcx.closures[id].req_n == 0 {
-            pcx.closures[id].req_at = pcx.capture_list.count;
+        let id = bck.reqs[k as usize];
+        if pcx.closures[id as usize].req_n == 0 {
+            pcx.closures[id as usize].req_at = pcx.capture_list.count;
         }
-        pcx.capture_list.push(bck.reqs[k + 1]);
-        pcx.capture_list.push(bck.reqs[k + 2]);
-        pcx.closures[id].req_n += 1;
+        pcx.capture_list.push(bck.reqs[(k + 1) as usize]);
+        pcx.capture_list.push(bck.reqs[(k + 2) as usize]);
+        pcx.closures[id as usize].req_n += 1;
         k += 3;
     }
 }
 
 // Whether universal u of a closure body is local (D19.4: a bound region,
 // the env's 'e).
-fn local_universal(u: i64, bck: Bck<Comp>, pbody: Body<Comp>) -> bool {
+fn local_universal(u: i64, bck: &Bck<Comp>, pbody: &Body<Comp>) -> bool {
     let r = universal_var(u, bck);
     r > 0 && (region_word(r, 0, pbody) == U_BOUND || region_word(r, 0, pbody) == U_ENV)
 }
 
 // What a violation of a local universal names, by preference: 2 a
 // capture's slot, 1 a slot of the signature (X_C), 0 another.
-fn rank(v: i64, bck: Bck<Comp>, pbody: Body<Comp>, pcx: Ctx<Comp>) -> i64 {
+fn rank(v: i64, bck: &Bck<Comp>, pbody: &Body<Comp>, pcx: &Ctx<Comp>) -> i64 {
     let r = universal_var(v, bck);
     if r == 0 || region_word(r, 0, pbody) != U_CSLOT {
         return 0;
     }
     let id = region_word(r, 1, pbody);
-    if region_word(r, 2, pbody) < slot_count(pcx.closures[id].ty, pcx) - pcx.closures[id].xc_n {
+    if region_word(r, 2, pbody)
+        < slot_count(pcx.closures[id as usize].ty, pcx) - pcx.closures[id as usize].xc_n {
         2
     } else {
         1
@@ -371,7 +455,7 @@ fn rank(v: i64, bck: Bck<Comp>, pbody: Body<Comp>, pcx: Ctx<Comp>) -> i64 {
 // for the creator (constraints.vl, at the closure's aggregate): v itself
 // when it is external, else the ⊒-minimal external universals that
 // outlive v (never none: 'static). True when recorded.
-fn requirement(u: i64, v: i64, bck: inout Bck<Comp>, pbody: Body<Comp>) -> bool {
+fn requirement(u: i64, v: i64, bck: &mut Bck<Comp>, pbody: &Body<Comp>) -> bool {
     let ru = universal_var(u, bck);
     if ru == 0 || region_word(ru, 0, pbody) != U_CSLOT {
         return false;
@@ -379,14 +463,14 @@ fn requirement(u: i64, v: i64, bck: inout Bck<Comp>, pbody: Body<Comp>) -> bool 
     let id = region_word(ru, 1, pbody);
     let i = region_word(ru, 2, pbody);
     if external(v, bck, pbody) {
-        push_req(id, i, slot_pos(v, bck, pbody), &bck);
+        push_req(id, i, slot_pos(v, bck, pbody), bck);
         return true;
     }
     for z in 0..bck.nuniv {
         if !external(z, bck, pbody) || !outlives(z, v, bck) {
             continue;
         }
-        var minimal = true;
+        let mut minimal = true;
         for z2 in 0..bck.nuniv {
             if z2 != z && external(z2, bck, pbody) && outlives(z2, v, bck) && outlives(z, z2, bck)
                 && !outlives(z2, z, bck) {
@@ -394,7 +478,7 @@ fn requirement(u: i64, v: i64, bck: inout Bck<Comp>, pbody: Body<Comp>) -> bool 
             }
         }
         if minimal {
-            push_req(id, i, slot_pos(z, bck, pbody), &bck);
+            push_req(id, i, slot_pos(z, bck, pbody), bck);
         }
     }
     true
@@ -402,7 +486,7 @@ fn requirement(u: i64, v: i64, bck: inout Bck<Comp>, pbody: Body<Comp>) -> bool 
 
 // Whether universal u of a closure body is external (D19.4: 'static or a
 // slot of C).
-fn external(u: i64, bck: Bck<Comp>, pbody: Body<Comp>) -> bool {
+fn external(u: i64, bck: &Bck<Comp>, pbody: &Body<Comp>) -> bool {
     if u == 0 {
         return true;
     }
@@ -411,17 +495,18 @@ fn external(u: i64, bck: Bck<Comp>, pbody: Body<Comp>) -> bool {
 }
 
 // The position in slots(C) of external universal u (-1: 'static).
-fn slot_pos(u: i64, bck: Bck<Comp>, pbody: Body<Comp>) -> i64 {
+fn slot_pos(u: i64, bck: &Bck<Comp>, pbody: &Body<Comp>) -> i64 {
     if u == 0 {
         return -1;
     }
     region_word(universal_var(u, bck), 2, pbody)
 }
 
-fn push_req(id: i64, i: i64, j: i64, bck: inout Bck<Comp>) {
-    var k = 0;
+fn push_req(id: i64, i: i64, j: i64, bck: &mut Bck<Comp>) {
+    let mut k: i64 = 0;
     while k + 2 < bck.reqs.len() as i64 {
-        if bck.reqs[k] == id && bck.reqs[k + 1] == i && bck.reqs[k + 2] == j {
+        if bck.reqs[k as usize] == id && bck.reqs[(k + 1) as usize] == i
+            && bck.reqs[(k + 2) as usize] == j {
             return;
         }
         k += 3;
@@ -432,9 +517,9 @@ fn push_req(id: i64, i: i64, j: i64, bck: inout Bck<Comp>) {
 }
 
 // The region variable of universal u.
-fn universal_var(u: i64, bck: Bck<Comp>) -> i64 {
+fn universal_var(u: i64, bck: &Bck<Comp>) -> i64 {
     for r in 1..bck.nreg + 1 {
-        if bck.origin[r - 1] == RO_UNIVERSAL && bck.univ[r - 1] == u {
+        if bck.origin[(r - 1) as usize] == RO_UNIVERSAL && bck.univ[(r - 1) as usize] == u {
             return r;
         }
     }
@@ -443,7 +528,7 @@ fn universal_var(u: i64, bck: Bck<Comp>) -> i64 {
 
 // Universal u as the user names it: `'static`, `'a`, the lifetime of a
 // parameter's reference, the lifetime in a type parameter.
-fn buf_universal(m: i64, u: i64, bck: Bck<Comp>, pbody: Body<Comp>, pcx: Ctx<Comp>) {
+fn buf_universal(m: i64, u: i64, bck: &Bck<Comp>, pbody: &Body<Comp>, pcx: &Ctx<Comp>) {
     let r = universal_var(u, bck);
     if r == 0 {
         buf_str(m, c"a region");
@@ -472,17 +557,17 @@ fn buf_universal(m: i64, u: i64, bck: Bck<Comp>, pbody: Body<Comp>, pcx: Ctx<Com
         // (a capture's: the variable captured; X_C's: the signature)
         let id = x;
         let y = region_word(r, 2, pbody);
-        var k = 0;
-        let t = pcx.closures[id].ty;
-        while k + 1 < pcx.closures[id].capture_count
+        let mut k: i64 = 0;
+        let t = pcx.closures[id as usize].ty;
+        while k + 1 < pcx.closures[id as usize].capture_count
             && crate::places::regions::capture_offset(t, k + 1, pcx) <= y {
             k += 1;
         }
-        if pcx.closures[id].capture_count > 0
-            && y < slot_count(t, pcx) - pcx.closures[id].xc_n {
-            let local = pcx.capture_list.get(pcx.closures[id].captures + 2 * k);
+        if pcx.closures[id as usize].capture_count > 0
+            && y < slot_count(t, pcx) - pcx.closures[id as usize].xc_n {
+            let local = pcx.capture_list.get(pcx.closures[id as usize].captures + 2 * k);
             buf_str(m, c"the lifetime in captured '");
-            crate::base::buf_bytes(m, sym_text(pcx.locals[local].name, pcx));
+            crate::base::buf_bytes(m, sym_text(pcx.locals[local as usize].name, pcx));
             buf_str(m, c"'");
         } else {
             buf_str(m, c"a lifetime of the closure's signature, from outside it");
@@ -494,17 +579,17 @@ fn buf_universal(m: i64, u: i64, bck: Bck<Comp>, pbody: Body<Comp>, pcx: Ctx<Com
     }
 }
 
-fn report_outlives(u: i64, v: i64, loc: i64, bck: Bck<Comp>, pbody: Body<Comp>,
-    pcx: inout Ctx<Comp>) {
-    var node = pbody.stmts[loc].node;
+fn report_outlives(u: i64, v: i64, loc: i64, bck: &Bck<Comp>, pbody: &Body<Comp>,
+    pcx: &mut Ctx<Comp>) {
+    let mut node = pbody.stmts[loc as usize].node;
     if node == 0 {
         node = pbody.node;
     }
     let m = buf_new();
     let ru = universal_var(u, bck);
     let rv = universal_var(v, bck);
-    let ku = if ru > 0 { region_word(ru, 0, pbody) } else { 0 };
-    let kv = if rv > 0 { region_word(rv, 0, pbody) } else { 0 };
+    let ku: i64 = if ru > 0 { region_word(ru, 0, pbody) } else { 0 };
+    let kv: i64 = if rv > 0 { region_word(rv, 0, pbody) } else { 0 };
     if ku == U_BOUND || ku == U_ENV {
         // RULE: D19.10 (1) (a local universal of a closure body: rustc's
         // words, E0521 for a parameter stored into a capture)
@@ -522,10 +607,15 @@ fn report_outlives(u: i64, v: i64, loc: i64, bck: Bck<Comp>, pbody: Body<Comp>,
         if rank(v, bck, pbody, pcx) == 2 && ku == U_BOUND {
             buf_str(m, c" (rustc E0521)");
         }
-        report_error_tries(pcx.nodes[node].start, 3000 + u * 64 + v, c"borrowck.outlives",
+        // (0.28.0: once a position for a parameter and what it flows to,
+        // as the message names them: a parameter with two regions, `a:
+        // &ArenaScope<P>`, said the same line twice)
+        let named = if ru > 0 { region_word(ru, 1, pbody) } else { u };
+        report_error_tries(pcx.nodes[node as usize].start,
+            3000 + named * 64 + rank(v, bck, pbody, pcx) * 8 + ku, c"borrowck.outlives",
             buf_slice(m).ptr,
             c"keep a copy of the value instead of the reference (`*p`, `.clone()`); a closure's result borrows from its parameter only when the bound it is passed for says so (`Fn(&T) -> &T`)",
-            "", false, &pcx);
+            b"", false, pcx);
         return;
     }
     // (u is the constraint's 'sup: it must outlive v, D6.2.1)
@@ -535,20 +625,20 @@ fn report_outlives(u: i64, v: i64, loc: i64, bck: Bck<Comp>, pbody: Body<Comp>,
     buf_str(m, c": a reference of the first flows where the second is required, and the signature does not say it lasts as long");
     // RULE: section 14.1 (the try: names one lifetime on the signature when
     // both regions are elided parameters')
-    var tr = -1;
+    let mut tr: i64 = -1;
     if ru > 0 && rv > 0 && region_word(ru, 0, pbody) == U_ELIDED
         && region_word(rv, 0, pbody) == U_ELIDED {
         tr = crate::places::borrowck::diag::try_name_lifetime(pbody.node, pcx);
     }
-    report_error_tries(pcx.nodes[node].start, 3000 + u * 64 + v, c"borrowck.outlives",
+    report_error_tries(pcx.nodes[node as usize].start, 3000 + u * 64 + v, c"borrowck.outlives",
         buf_slice(m).ptr,
         c"name one lifetime on both (`fn f<'a>(x: &'a T, y: &'a T) -> &'a T`), or add the bound (`'b: 'a`)",
-        if tr >= 0 { buf_slice(tr) } else { "" }, false, &pcx);
+        if tr >= 0 { buf_slice(tr) } else { b"" }, false, pcx);
 }
 
 // The edges as adjacency lists: adj[adj_at[sub] .. adj_at[sub + 1]] the
 // sups of sub.
-fn adjacency(bck: inout Bck<Comp>) {
+fn adjacency(bck: &mut Bck<Comp>) {
     let n = bck.nreg + 2;
     bck.adj_at.clear();
     for _ in 0..n + 1 {
@@ -556,11 +646,11 @@ fn adjacency(bck: inout Bck<Comp>) {
     }
     let ne = bck.edges.len() as i64 / 3;
     for e in 0..ne {
-        let sub = bck.edges[3 * e + 1];
-        bck.adj_at[sub + 1] += 1;
+        let sub = bck.edges[(3 * e + 1) as usize];
+        bck.adj_at[(sub + 1) as usize] += 1;
     }
     for i in 0..n {
-        bck.adj_at[i + 1] += bck.adj_at[i];
+        bck.adj_at[(i + 1) as usize] += bck.adj_at[i as usize];
     }
     bck.adj.clear();
     for _ in 0..ne {
@@ -568,12 +658,13 @@ fn adjacency(bck: inout Bck<Comp>) {
     }
     bck.tmp.clear();
     for i in 0..n + 1 {
-        bck.tmp.push(bck.adj_at[i]);
+        bck.tmp.push(bck.adj_at[i as usize]);
     }
     for e in 0..ne {
-        let sub = bck.edges[3 * e + 1];
-        bck.adj[bck.tmp[sub]] = bck.edges[3 * e];
-        bck.tmp[sub] += 1;
+        let sub = bck.edges[(3 * e + 1) as usize];
+        { let at_ix = bck.tmp[sub as usize] as usize;
+            bck.adj[at_ix] = bck.edges[(3 * e) as usize] };
+        bck.tmp[sub as usize] += 1;
     }
 }
 
@@ -583,42 +674,42 @@ fn adjacency(bck: inout Bck<Comp>) {
 // every slot of its, except the compiler-known containers (Q3: the
 // table), whose requirement is their type arguments' each.
 // RULE: D9.1
-fn dropck_slots(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+fn dropck_slots(bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
     bck.dropck.clear();
     for _ in 0..bck.nreg {
         bck.dropck.push(0);
     }
     for l in 0..bck.nlocal {
-        if bck.nslots[l] == 0 {
+        if bck.nslots[l as usize] == 0 {
             continue;
         }
         let t = local_ty(l, pbody);
-        if has_glue(t, &pcx) {
-            mark_dropck(t, l, 0, &bck, pbody, &pcx);
+        if has_glue(t, pcx) {
+            mark_dropck(t, l, 0, bck, pbody, pcx);
         }
     }
 }
 
 // Type t's dropck slots marked, t's slots being local l's from off.
-fn mark_dropck(t0: i64, l: i64, off: i64, bck: inout Bck<Comp>, pbody: Body<Comp>,
-    pcx: inout Ctx<Comp>) {
+fn mark_dropck(t0: i64, l: i64, off: i64, bck: &mut Bck<Comp>, pbody: &Body<Comp>,
+    pcx: &mut Ctx<Comp>) {
     let t = undistinct(t0, pcx);
-    if t <= 0 || !has_glue(t, &pcx) {
+    if t <= 0 || !has_glue(t, pcx) {
         return;
     }
-    let k = pcx.types[t].kind;
+    let k = pcx.types[t as usize].kind;
     if k == TyKind::Ptr || k == TyKind::Slice {
         return;
     }
     if k == TyKind::Array {
-        mark_dropck(pcx.types[t].a, l, off, &bck, pbody, &pcx);
+        mark_dropck(pcx.types[t as usize].a, l, off, bck, pbody, pcx);
         return;
     }
     if k == TyKind::Tuple {
-        var o = off;
-        for i in 0..pcx.types[t].count {
+        let mut o = off;
+        for i in 0..pcx.types[t as usize].count {
             let e = type_elem(t, i, pcx);
-            mark_dropck(e, l, o, &bck, pbody, &pcx);
+            mark_dropck(e, l, o, bck, pbody, pcx);
             o += slot_count(e, pcx);
         }
         return;
@@ -626,14 +717,14 @@ fn mark_dropck(t0: i64, l: i64, off: i64, bck: inout Bck<Comp>, pbody: Body<Comp
     if (k == TyKind::Struct || k == TyKind::Enum) && container(t, pcx) {
         // (the type arguments' slots come after the declared lifetimes')
         let n = targ_count(t, pcx);
-        var args = 0;
+        let mut args: i64 = 0;
         for i in 0..n {
             args += slot_count(targ(t, i, pcx), pcx);
         }
-        var o = off + slot_count(t, pcx) - args;
+        let mut o = off + slot_count(t, pcx) - args;
         for i in 0..n {
             let a = targ(t, i, pcx);
-            mark_dropck(a, l, o, &bck, pbody, &pcx);
+            mark_dropck(a, l, o, bck, pbody, pcx);
             o += slot_count(a, pcx);
         }
         return;
@@ -642,33 +733,34 @@ fn mark_dropck(t0: i64, l: i64, off: i64, bck: inout Bck<Comp>, pbody: Body<Comp
     for i in 0..slot_count(t, pcx) {
         let r = slot_var(l, off + i, pbody);
         if r > 0 {
-            bck.dropck[r - 1] = 1;
+            bck.dropck[(r - 1) as usize] = 1;
         }
     }
 }
 
 // RULE: D9.1 (Q3: the containers whose drop reaches only their elements
 // and their allocator: std's, by name)
-fn container(t: i64, pcx: Ctx<Comp>) -> bool {
-    if pcx.types[t].kind != TyKind::Struct {
+fn container(t: i64, pcx: &Ctx<Comp>) -> bool {
+    if pcx.types[t as usize].kind != TyKind::Struct {
         return false;
     }
-    let s = pcx.types[t].a;
-    if !crate::front::modules::within_std(pcx.structs[s].module, pcx) {
+    let s = pcx.types[t as usize].a;
+    if !crate::front::modules::within_std(pcx.structs[s as usize].module, pcx) {
         return false;
     }
     // (an instance's `tmpl` is its template + 1)
-    let tmpl = if pcx.structs[s].tmpl > 0 { pcx.structs[s].tmpl - 1 } else { s };
-    let name = sym_text(pcx.structs[tmpl].name, pcx);
-    name == "Vec" || name == "String" || name == "HashMap" || name == "HashSet"
-        || name == "BTreeMap" || name == "BTreeSet" || name == "BinaryHeap" || name == "MinHeap"
-        || name == "VecDeque" || name == "Box"
+    let tmpl = if pcx.structs[s as usize].tmpl > 0 { pcx.structs[s as usize].tmpl - 1 } else { s };
+    let name = sym_text(pcx.structs[tmpl as usize].name, pcx);
+    name == b"Vec" || name == b"String" || name == b"HashMap" || name == b"HashSet"
+        || name == b"BTreeMap" || name == b"BTreeSet" || name == b"BinaryHeap" || name == b"MinHeap"
+        || name == b"VecDeque" || name == b"Box"
 }
 
-fn targ_count(t: i64, pcx: Ctx<Comp>) -> i64 {
-    if pcx.types[t].kind == TyKind::Struct { pcx.structs[pcx.types[t].a].targ_count } else { 0 }
+fn targ_count(t: i64, pcx: &Ctx<Comp>) -> i64 {
+    if pcx.types[t as usize].kind
+        == TyKind::Struct { pcx.structs[pcx.types[t as usize].a as usize].targ_count } else { 0 }
 }
 
-fn targ(t: i64, i: i64, pcx: Ctx<Comp>) -> i64 {
-    crate::places::front::tlist_at(pcx.structs[pcx.types[t].a].targs + i, pcx)
+fn targ(t: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
+    crate::places::front::tlist_at(pcx.structs[pcx.types[t as usize].a as usize].targs + i, pcx)
 }

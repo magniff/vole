@@ -11,7 +11,7 @@ FAIL bad: stdout differs at line 2 (3 lines expected, 3 printed)
 FAIL crash: exit 3 (expected 0)
   stdout: line 1: a
 FAIL hang: no exit after 1 s (--timeout S): stopped by signal 14 (SIGALRM: a time limit)
-  trace: main.vl:12 main
+  trace: main.vl:13 main
 (outputs: .volec/test/O2/case-NAME.got, .err; test-NAME.got, .err)
 [exit 1]
 ## (0.25.5) $VOLE_TEST_CASE_TIMEOUT: the time limit's default (a runner's
@@ -19,7 +19,7 @@ FAIL hang: no exit after 1 s (--timeout S): stopped by signal 14 (SIGALRM: a tim
 % VOLE_TEST_CASE_TIMEOUT=1 volec test hang
 test main.vl: 0 passed, 1 failed (1 case; -O0 and -O2 agree)
 FAIL hang: no exit after 1 s (--timeout S): stopped by signal 14 (SIGALRM: a time limit)
-  trace: main.vl:12 main
+  trace: main.vl:13 main
 (outputs: .volec/test/O2/case-NAME.got, .err; test-NAME.got, .err)
 [exit 1]
 % VOLE_TEST_CASE_TIMEOUT=30 volec test hang --timeout 1 | head -2
@@ -63,7 +63,7 @@ line 3: c
 test main.vl: ran on -: exit 0, 1 line of output
 line 1: x
 ## the program is built again when a source changes
-% printf 'use std::println;\n\nfn main() -> i32 {\n    println("x");\n    0\n}\n' > main.vl
+% printf 'fn main() -> i32 {\n    println("x");\n    0\n}\n' > main.vl
 $ test ok
 test main.vl: 0 passed, 1 failed (1 case; -O0 and -O2 agree)
 FAIL ok: stdout differs at line 1 (3 lines expected, 1 printed)
@@ -92,5 +92,5 @@ test main.vl: builds; no tests in tests/ (a case: NAME.in, its stdin, and NAME.o
 % printf 'fn main() {\n    let x: i64 = "s";\n}\n' > main.vl
 $ test
 test main.vl: does not build (1 error)
-main.vl:2:18: error[type error] expected 'i64', got '[u8]'
+main.vl:2:18: error[type error] expected 'i64', got '&str'
 [exit 1]

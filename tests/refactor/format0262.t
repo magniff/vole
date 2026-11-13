@@ -18,10 +18,16 @@ $ fix --suggested --dry-run
 +    println("{{ text }}");
 $ explain format.syntax
 format.syntax: error
-(0.26.2) A format literal (a plain string literal that is the first argument of println, print, eprintln, eprint, format_in, format_args, push_fmt, Fmt::write, panic, the message of assert and debug_assert, or a contract's `else`) whose braces do not make holes: a `{` never closed, a `}` with no `{`. Its grammar is Rust's std::fmt: `{}`, `{0}`, `{name}`, each with an optional `:spec`, and `{{` and `}}` for a brace of the text. Before 0.26.2 a plain literal was printed as it is, braces and all (`warning[format]` said so).
-fix: Double the braces of the text: `println("{{")` prints `{` (`volec fix --suggested` writes it; `volec fix --only fstring` doubles them in a whole program).
+(0.26.2) A format literal (a plain string literal that is the first argument of println, print, eprintln, eprint, format_in, format_args, write, writeln, panic, the message of assert and debug_assert, or a contract's `else`) whose braces do not make holes: a `{` never closed, a `}` with no `{`. Its grammar is Rust's std::fmt: `{}`, `{0}`, `{name}`, each with an optional `:spec`, and `{{` and `}}` for a brace of the text.
+fix: Double the braces of the text: `println("{{")` prints `{` (`volec fix --suggested` writes it).
 example:
-    error[format.syntax] unmatched '}' in a format string | help: a '}' of the text is written '}}'
+    fn main() {
+        println("done }");
+    }
+    
+    main.vl:2:19: error[format.syntax] unmatched '}' in a format string
+      help: a '}' of the text is written '}}'
+      try: volec fix --suggested main.vl
 $ explain format.spec
 format.spec: error
 (0.26.2) A hole's spec, after its `:`, that is not Rust's: `[[fill]align][sign]['#']['0'][width]['.' precision][type]`, align `<` `^` `>`, sign `+`, width and precision an integer, `N$` or `name$` (precision also `*`), type `?` `x?` `X?` `x` `X` `o` `b` `e` `E` `p`, and vole's `c` (a u8 as its byte). `{:#?}`, Rust's Debug over several lines, is not in this release.
@@ -36,7 +42,16 @@ example:
     error[format.args] this argument is never used: no hole of the format string takes it | help: write a hole for it, '{}', or remove it
 $ explain format.expr-hole
 format.expr-hole: error
-(0.26.2) A hole of a format literal holding an expression, `{p.a}`, `{x + 1}`, `{v.len()}`: a hole names a local, a parameter, a `const` or a `static` (Rust 2021's inline captures), or takes the next argument. (An f-string's hole, `f"{p.a}"`, held any expression; f-strings are removed in 0.26.3, `syntax.fstring`.)
+(0.26.2) A hole of a format literal holding an expression, `{p.a}`, `{x + 1}`, `{v.len()}`: a hole names a local, a parameter, a `const` or a `static` (Rust 2021's inline captures), or takes the next argument.
 fix: Write `{}` and pass the expression after the literal: `println("{}", p.a)` (`volec fix --suggested` moves it).
 example:
-    error[format.expr-hole] '{p.a}': a hole of a format string holds a name, not an expression | help: write '{}' and pass the expression after the format string, as Rust does: 'println("{} {x}", a.b)'
+    struct P { a: i64 }
+    
+    fn main() {
+        let p = P { a: 1 };
+        println("a = {p.a}");
+    }
+    
+    main.vl:5:19: error[format.expr-hole] '{p.a}': a hole of a format string holds a name, not an expression
+      help: write '{}' and pass the expression after the format string, as Rust does: 'println("{} {x}", a.b)'
+      try: volec fix --suggested main.vl

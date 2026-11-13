@@ -5,10 +5,10 @@
 ## (a call of one argument too), none in a list on one line (but a tuple
 ## of one, `(x,)`); idempotent: a second fmt changes nothing.
 $ fmt
-formatted	2 files	+14 -11 lines
+formatted	2 files	+13 -11 lines
 % cat main.vl
 mod shapes;
-use std::{Vec, print, println};
+use std::{cmp, fmt, mem};
 
 use crate::shapes::Point;
 
@@ -28,7 +28,7 @@ fn main(gpa: Gpa) {
         p.y,
     );
     let v = [
-        1, 2,
+        1i64, 2,
         3,
     ];
     let w = area(
@@ -38,22 +38,21 @@ fn main(gpa: Gpa) {
         1 => 10,
         _ => 20,
     };
-    var xs: Vec<i64, Gpa> = Vec::new_in(gpa);
+    let mut xs: Vec<i64, Gpa> = Vec::new_in(gpa);
     xs.push(one.0 + r + w + v[0]);
     print("{} ", t.1);
-    println(xs.len());
+    println("{}", xs.len());
 }
 % cat shapes/mod.vl
-use std::println;
+use std::mem;
 
 use super::twice;
-
-pub struct Point {
+#[derive(Clone, Copy)] pub struct Point {
     pub x: i64,
     pub y: i64,
 }
 
-pub fn area(p: Point) -> i64 { println(twice(p.x)); p.x * p.y }
+pub fn area(p: Point) -> i64 { println("{}", twice(p.x)); p.x * p.y }
 $ fmt --check
 $ fmt
 note fmt.none: 2 files formatted already

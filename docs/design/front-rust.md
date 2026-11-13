@@ -977,6 +977,19 @@ trait.unconstrained` (E0207) at the impl. *Anchor:* `collect_impl`
 (today: parameters must be the self type's arguments in order:
 `later_impl`), `front/check/calls/paths.vl: impl_param_count,
 bind_impl_params`.
+In an instance, a parameter of a pattern impl that the receiver's type
+and the arguments leave free is taken from the bound of the receiver's
+type parameter that names the impl's trait: `r.start_bound()` with `R:
+RangeBounds<K>`, `R = RangeFull`, is `impl<T> RangeBounds<T> for
+RangeFull` with `T = K` (0.28.0: `m.range(..)`, `v.drain(..)`).
+In an instance a receiver `*a` of `a: &T` is a `T`: when no impl of
+what `T` points to takes the call, `T`'s own does, as the generic body
+resolved it by `T`'s bound (`<&u8 as PartialEq<&u8>>::eq` in
+`Option<&u8>::eq`); and a receiver that is a reference to a view, `k:
+&K` with `K = &str`, is the view's own impl, not its place's (`K:
+Borrow<K>` is the reflexive impl; 0.28.0, gap 59). *Anchor:*
+`front/convert: unify_recv_bound, dispatch`. Cases
+`rust_t_bound_blanket_impl`, `rust_t_borrow_reflexive`.
 
 **F14.2 (positional binding).** An instance's arguments bind a template
 impl's parameters by position only when the header names them in order
@@ -1609,8 +1622,19 @@ Add<&str> for String`).
 When the operand is a view (`[T]`, `str`, Z9.1, where `&str` is the view
 too), an impl whose argument is written `&..` yields to one that is not:
 `PartialEq<str>` and `PartialEq<&'a str>` compare alike (0.27.2.1).
-*Anchor:* `front/check/synth_mode.vl: synth_operands`,
-`front/convert: by_view_rhs`. Case `rust_f_f26_cmp_rhs_ok`.
+A comparison whose left type has exactly one impl of the operator's
+trait (a derive's `PartialEq for Option<T>`) gives the right operand
+that type as its expected type, as rustc's inference does: `a ==
+Some(0)` of an `Option<i64>`, `v.last() == Some(&0)`; and a left operand
+that is a call holding a literal without a suffix (`Some(0) == a`) is
+read after the right one, with its type expected (0.28.0, gap 103).
+A comparison of two references with no impl of their own is of what
+they refer to, level by level (Rust's `impl PartialEq<&B> for &A`):
+`&a == &b` of two `&u8`, `a == b` of `a: &T` with `T = &u8`; never of
+the addresses (0.28.0; a raw pointer compares its address).
+*Anchor:* `front/check/synth_mode.vl: synth_operands, binary_result`,
+`front/convert: by_view_rhs, one_generic_trait_fn`. Cases
+`rust_f_f26_cmp_rhs_ok`, `rust_t_ref_eq_instance`.
 
 ### F27 Patterns in `let` and parameters
 
@@ -1880,6 +1904,51 @@ elements' types from the impl's index type, as one literal does
 *Anchor:* `front/convert: literal_kind, literal_tuple_fits`. Case
 `rust_f_f20_tuple_index_ok`.
 
+**F20.7 (an index through Deref, 0.28.0).** `g[i]` of a type that has
+Deref and no Index (a `MutexGuard<Vec<T>>`, an `Arc<Vec<T>>`, a `Box<[T;
+N]>`, a struct with its own Deref), or of a reference to one, is
+`(*g)[i]`: rustc's autoderef of an index's base. The `*g` is checked as
+one written, so a place written goes through `deref_mut` (a guard not
+declared `mut` is E0596). *Anchor:* `check/synth_mode.vl: synth_index`.
+Cases `rust_t_index_deref`, `rust_b_err_index_deref_mut`.
+
+**F20.8 (an index is a `usize`, 0.28.0).** The index of `a[i]` and the
+ends of `a[i..j]`, of an array, a slice, a `str` or a Vec, are `usize`
+and nothing else, as rustc's `SliceIndex` impls (E0277, `the type [T]
+cannot be indexed by i64`): no other integer type, and no widening to
+it (FR5 stops here: a `u8` index is converted as an `i64` one is). An
+untyped literal and an open local take `usize` from the index (F18.5).
+The error is `an index is a 'usize', got 'i64'`; its fix (`volec fix
+--suggested`) writes `i as usize`, `(i + 1) as usize`, or, of an index
+that is a cast of an integer, the cast's type (`(b >> 4) as i64` becomes
+`(b >> 4) as usize`). `fix` makes it although an `i64` holds values a
+`usize` does not: such an index is out of bounds before the conversion
+and after it. Until 0.28.0 any integer type indexed (the divergence FR6,
+removed). A reference to a `usize` is still read through (`keys[a]` of
+an `a: &usize`). *Anchor:* `check/synth_mode.vl: check_index_type`,
+`tools/fix/verify.vl: index_operand`. Cases `err_index_usize`,
+`rust_t_index_usize`; the transcript `tests/refactor/indexusize.t`.
+
+**F33.1 (no default values; named arguments stay, 0.28.0).** A parameter
+has no default value: `fn f(a: i64, b: i64 = 2)` is a parse error at the
+`=` (`syntax.default-arg`: "a parameter has no default value; pass it at
+each call"), with the
+fix that removes ` = value` (`volec fix --suggested`). Named arguments
+are kept, a documented divergence from Rust: `f(1, b: 3)`, after the
+positional ones and in parameter order. One exception, by name and not
+by syntax: std's macro-like panic functions, Rust's macros of the same
+names, take their message `msg` (and the position `at` the compiler
+fills) as an empty string when a call leaves it out: `assert`,
+`assert_eq`, `assert_ne`, `debug_assert`, `unreachable`, `todo`,
+`unimplemented`, and `__assert_fmt` (what an `assert` with a format
+message becomes). The set is fixed in the checker; their declarations
+in std's panic.vl carry no default, and no other function, in std or in a
+program, can ask for it. `contract_check` gets its three values from the
+compiler (0 for those a message does not show). *Anchor:*
+`parser/items/params.vl: parse_param`, `check/args.vl: macro_message,
+normalize_args`, `contracts/expand.vl: check_call`. Cases
+`err_args_defaults`, `args_defaults`, `err_args_named`.
+
 ## 6. The bound-only rule (D22.3's front side; U1)
 
 **D22.3 (restated for the front).** In a rust-edition generic body
@@ -2144,10 +2213,6 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   wider (`x + n` with `x: i64`, `n: i32`); rustc says E0308. The
   translator's output never needs it; a hand-written program may lean on
   it.
-- **FR6 (an index of any integer type).** `a[i]` takes an `i`
-  of any integer type, as MVS's; rustc indexes by `usize` only (E0277,
-  `the type [T] cannot be indexed by i64`). Case
-  `rust_t_iter_for_control` writes `names[k as usize]`.
 
 **Strict (vole rejects what rustc accepts).**
 - **FL1 (deferred inference by the first constraining use; 0.27.4).**

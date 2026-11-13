@@ -21,7 +21,7 @@ formatted	2 files	+18 -13 lines
 mod util;
 use util::{Kind, Pair, sum, twice};
 
-struct Point { x: i64, y: i64 }
+#[derive(Clone, Copy)] struct Point { x: i64, y: i64 }
 
 fn area(p: Point) -> i64 {
     let w = p.x * 2; // the width
@@ -41,7 +41,7 @@ fn describe(k: Kind) -> i64 {
 fn main() -> i32 {
     let p = Point { x: 3, y: -4 };
     let pair: Pair<i64> = Pair {
-        first: area(p), second: describe(Kind::Large(2)) + describe(Kind::Small),
+        first: area(p), second: describe(Kind::Large(2i64)) + describe(Kind::Small),
     };
 
     /* a block comment
@@ -49,12 +49,12 @@ fn main() -> i32 {
     let total = pair.first + pair.second + twice(twice(twice(1))) + sum(sum(1, 2), sum(3, 4)) - 2;
     let s = "a string \
         continued";
-    if total != 2469 || s.len != 18 { return 1; }
+    if total != 2469 || s.len() != 18 { return 1; }
     0
 }
 % cat util.vl
-pub struct Pair<T> { pub first: T, pub second: T }
-pub enum Kind { Small, Large(i64) }
+#[derive(Clone, Copy)] pub struct Pair<T> { pub first: T, pub second: T }
+#[derive(Clone, Copy)] pub enum Kind { Small, Large(i64) }
 
 pub fn twice(n: i64) -> i64 { n * 2 }
 
@@ -101,8 +101,8 @@ formatted	2 files	+18 -13 lines
 $ edit replace sum < $T/inputs/fmt_helper.vl
 replaced crate::util::sum	util.vl	+1 -0 lines
 % cat util.vl
-pub struct Pair<T> { pub first: T, pub second: T }
-pub enum Kind { Small, Large(i64) }
+#[derive(Clone, Copy)] pub struct Pair<T> { pub first: T, pub second: T }
+#[derive(Clone, Copy)] pub enum Kind { Small, Large(i64) }
 
 pub fn twice(n: i64) -> i64 { n * 2 }
 

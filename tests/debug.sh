@@ -47,10 +47,10 @@ trap 'exit 130' INT TERM
 # breakpoint in each file (with its frame), then the frames of the crash.
 cat >"$WORK/expect" <<'EOF'
 total.* at .*helper.vl:10
-poke.* at .*crash.vl:13
-poke.* at .*crash.vl:13
-outer.* at .*crash.vl:20
-main.* at .*crash.vl:26
+poke.* at .*crash.vl:12
+poke.* at .*crash.vl:12
+outer.* at .*crash.vl:19
+main.* at .*crash.vl:25
 EOF
 
 failed=0
@@ -63,7 +63,7 @@ for o in 0 2; do
     fi
     # Three runs: stopped at each breakpoint, then the crash.
     : >"$WORK/log$o"
-    for stop in helper.vl:10 crash.vl:13 crash; do
+    for stop in helper.vl:10 crash.vl:12 crash; do
         if [ "$DEBUGGER" = lldb ]; then
             if [ "$stop" = crash ]; then
                 printf 'run\nbt\nquit\n' >"$WORK/cmds"

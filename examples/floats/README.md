@@ -32,12 +32,12 @@ extern "C" {
 ```
 
 Calling it is `unsafe`, as every call into C is: the compiler cannot
-check what C does. The method reads `self` and `other`: a parameter
-with no convention is `let`, read-only, so `a.distance(b)` copies
-nothing and changes neither point:
+check what C does, so the block says, in its `// SAFETY:` comment, why
+the call is sound. The method borrows `self` and `other` (`&self`,
+`&Point`), so `a.distance(&b)` copies nothing and changes neither point:
 
 ```tach
-fn distance(self, other: Point) -> f64 {
+fn distance(&self, other: &Point) -> f64 {
     let dx = self.x - other.x;
     let dy = self.y - other.y;
     let dz = self.z - other.z;
@@ -48,15 +48,16 @@ fn distance(self, other: Point) -> f64 {
 The result is printed with six decimals, as C's `printf("%f")` would:
 
 ```tach
-println("{:.6}", a.distance(b));
+println("{:.6}", a.distance(&b));
 ```
 
-Without a precision, an f-string prints the shortest text that reads back
-as the same float (`1.7320508075688772`).
+Without a precision, `{}` prints the shortest text that reads back as
+the same float (`1.7320508075688772`). std has the function too, with no
+`unsafe`: `(dx * dx + dy * dy + dz * dz).sqrt()` (`volec guide math`).
 
 ## Language features
 
 - `f64`, float literals: `volec guide types`
-- structs and methods, `self` (let): `volec guide syntax`
+- structs and methods, `&self`: `volec guide syntax`
 - `extern "C"` declarations, `unsafe` calls: `volec guide c-interop`
 - format specs (`:.6`): `volec guide formatting`

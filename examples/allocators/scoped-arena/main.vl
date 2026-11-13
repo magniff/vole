@@ -1,132 +1,110 @@
 // A small key-value store answering one request per line of stdin:
 // `SET key n`, `ADD key n`, `GET key`, `SUM key...`. Each request gets
-// scratch memory of its own, `arena_scope(gpa, |scratch| ...)`: its words,
+// scratch memory of its own, `arena_scope(&gpa, |scratch| ...)`: its words,
 // its lowercased keys and its response are allocated there, by bumping a
 // pointer, and all of it is freed at once when the request is answered.
 // What outlives a request is allocated elsewhere: the map on Gpa, the
-// keys' bytes in an arena kept for the whole run.
-use std::HashMap;
-use std::string::String;
+// keys' text in an arena kept for the whole run.
+use std::io;
+use std::alloc::{Allocator, Arena, arena_scope};
+use std::collections::HashMap;
 
-// What lives for the whole run.
-struct Store<M: Allocator, N: Allocator> { values: HashMap<[u8], i64, M>, names: N }
-
-// The keys' arena, freed (all of it) when the guard is dropped: at the
-// end of main, before the store it was made after.
-struct FreeAll<A: Allocator> { arena: A }
-
-impl Drop for FreeAll<Arena> {
-    fn drop(inout self) {
-        // UNSAFE: free_all gives back blocks that views (the map's keys) may still point into.
-        // SAFETY: the guard is made after the store and dropped before it, at the end of
-        // main, when no key is read again; the map's drop frees its table, not the keys.
-        unsafe { self.arena.free_all() };
-    }
+// What lives for the whole run. The keys borrow from the names arena,
+// so the arena outlives the map: the lifetime 'n says so.
+struct Store<'n, M: Allocator, N: Allocator> {
+    values: HashMap<&'n str, i64, M>,
+    names: &'n Arena<N>,
 }
 
-// A copy of s in the store's names arena: the keys of the map must
-// outlive the request that brought them. The arena owns the bytes, not
-// the Vec: the Vec is forgotten, and the view is made from its pointer,
-// valid as long as the arena (which safe code cannot say yet: a view
-// of a Vec ends with the Vec).
-fn intern(names: Arena, s: [u8]) -> [u8] {
-    var v: Vec<u8, Arena> = Vec::with_capacity_in(s.len() as usize, names);
-    v.extend_from_slice(s);
-    let p = v.as_slice().ptr;
-    std::forget(v);
-    unsafe { p[0..s.len()] }
-}
-
-// s in lowercase, a new Vec on the allocator a (here: the request's
+// s in lowercase, a new String on the allocator a (here: the request's
 // scratch arena).
-fn lower_in<A: Allocator>(s: [u8], a: sink A) -> Vec<u8, A> {
-    var v: Vec<u8, A> = Vec::with_capacity_in(s.len() as usize, a);
-    for b in s {
-        v.push(if b >= 'A' && b <= 'Z' { b + 32 } else { b });
+fn lower_in<A: Allocator>(s: &str, a: A) -> String<A> {
+    let mut out = String::with_capacity_in(s.len(), a);
+    for c in s.chars() {
+        out.push(c.to_ascii_lowercase());
     }
-    v
+    out
 }
 
 // Answers one request into `out`; every allocation but the store's is on
 // `scratch`, whatever its type: the caller decides how long it lives.
-fn answer<A: Allocator>(store: inout Store<Gpa, Arena>, line: [u8], scratch: sink A,
-    out: inout String<A>) {
-    let words = std::split_whitespace_in(line, scratch);
-    if words.len() == 0 {
+fn answer<A: Allocator + Copy>(
+    store: &mut Store<'_, Gpa, Gpa>, line: &str, scratch: A, out: &mut String<A>,
+) {
+    let words: Vec<&str, A> = line.split_whitespace().collect_in(scratch);
+    if words.is_empty() {
         out.push_str("empty request");
         return;
     }
-    let w = words.as_slice();
-    let cmd = lower_in(w[0], scratch);
-    let cmd = cmd.as_slice();
-    if (cmd == "set" || cmd == "add") && w.len() == 3 {
-        let key = lower_in(w[1], scratch);
-        let n = match std::parse_int(w[2]) {
+    let cmd = lower_in(words[0], scratch);
+    let cmd = cmd.as_str();
+    if (cmd == "set" || cmd == "add") && words.len() == 3 {
+        let key = lower_in(words[1], scratch);
+        let n = match words[2].parse::<i64>() {
             Ok(n) => n,
             Err(_) => {
-                out.push_fmt("not a number: {}", w[2]);
+                write(out, "not a number: {}", words[2]).unwrap();
                 return;
             }
         };
-        let old = store.values.get(key.as_slice()).unwrap_or(0);
+        let old = store.values.get(key.as_str()).copied().unwrap_or(0);
         let new = if cmd == "set" { n } else { old + n };
-        match store.values.get_mut(key.as_slice()) {
+        match store.values.get_mut(key.as_str()) {
             // A known key: its value changes in place.
-            Some(v) => v[0] = new,
-            // A new key: its bytes go where the map's keys live.
+            Some(v) => *v = new,
+            // A new key: its text goes where the map's keys live. The
+            // copy borrows the arena, not the request's scratch.
             None => {
-                store.values.insert(intern(store.names, key.as_slice()), new);
+                store.values.insert(store.names.alloc_str(key.as_str()), new);
             }
         }
-        out.push_str(format_in("{} = {new}", key.as_slice(), scratch).as_str());
-    } else if cmd == "get" && w.len() == 2 {
-        let key = lower_in(w[1], scratch);
-        match store.values.get(key.as_slice()) {
-            Some(n) => out.push_str(format_in("{} = {n}", key.as_slice(), scratch).as_str()),
-            None => out.push_str(format_in("{} is not set", key.as_slice(), scratch).as_str()),
+        write(out, "{key} = {new}").unwrap();
+    } else if cmd == "get" && words.len() == 2 {
+        let key = lower_in(words[1], scratch);
+        match store.values.get(key.as_str()) {
+            Some(n) => write(out, "{key} = {n}").unwrap(),
+            None => write(out, "{key} is not set").unwrap(),
         }
-    } else if cmd == "sum" && w.len() >= 2 {
-        var total = 0;
-        var missing: Vec<u8, A> = Vec::new_in(scratch);
-        for name in w[1..] {
+    } else if cmd == "sum" && words.len() >= 2 {
+        let mut total = 0;
+        let mut missing = String::new_in(scratch);
+        for name in &words[1..] {
             let key = lower_in(name, scratch);
-            match store.values.get(key.as_slice()) {
-                Some(n) => total += n,
+            match store.values.get(key.as_str()) {
+                Some(n) => total += *n,
                 None => {
                     missing.push(' ');
-                    missing.extend_from_slice(key.as_slice());
+                    missing.push_str(key.as_str());
                 }
             }
         }
-        out.push_fmt("sum = {total}");
-        if missing.len() > 0 {
-            out.push_fmt(" (not set:{})", missing.as_slice());
+        write(out, "sum = {total}").unwrap();
+        if !missing.is_empty() {
+            write(out, " (not set:{missing})").unwrap();
         }
     } else {
-        out.push_fmt("unknown request: {line}");
+        write(out, "unknown request: {line}").unwrap();
     }
 }
 
 fn main(gpa: Gpa) -> i32 {
-    let input = std::read_stdin_in(gpa).unwrap();
-    var store: Store<Gpa, Arena> = Store {
-        values: HashMap::new_in(gpa), names: Arena::new_in(gpa),
-    };
-    let _names = FreeAll { arena: store.names };
+    let input = io::read_to_string_in(io::stdin(), gpa).unwrap();
+    // The keys' arena is made before the store and dropped after it.
+    let names = Arena::new_in(gpa);
+    let mut store = Store { values: HashMap::new_in(gpa), names: &names };
 
-    var requests = 0;
-    var peak = 0;
-    let lines = std::split_in(input.as_slice(), '\n', gpa);
-    for line in lines.iter() {
-        if line.len() == 0 {
+    let mut requests = 0;
+    let mut peak = 0;
+    for line in input.lines() {
+        if line.is_empty() {
             continue;
         }
         // The request's scratch: an arena of its own, from gpa, freed
-        // (all of it) when the closure returns. Only an i64 leaves it.
-        let used = arena_scope(gpa, |scratch| {
-            var out = String::new_in(scratch);
-            answer(&store, line, scratch, &out);
-            println("{line:<24} -> {}", out.as_slice());
+        // (all of it) when the closure returns. Only a usize leaves it.
+        let used = arena_scope(&gpa, |scratch| {
+            let mut out = String::new_in(scratch);
+            answer(&mut store, line, scratch, &mut out);
+            println("{line:<24} -> {out}");
             scratch.used()
         });
         requests += 1;
@@ -137,6 +115,6 @@ fn main(gpa: Gpa) -> i32 {
     println(
         "{requests} requests, {} keys; scratch per request at most {peak} bytes",
         store.values.len());
-    println("the keys' arena holds {} bytes", store.names.used());
+    println("the keys' arena holds {} bytes", names.used());
     0
 }

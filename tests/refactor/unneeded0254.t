@@ -19,7 +19,9 @@ main.vl:43	block	crate::three	other	justified	none (unneeded)
 main.vl:47	block	crate::three	other	missing both	none (unneeded)
 main.vl:48	block	crate::three	other	missing both	none (unneeded)
 main.vl:57	block	crate::main	other	missing both	none (unneeded)
-sites: 14 (13 blocks, 0 unsafe fns, 1 extern blocks); unjustified: 13; unneeded: 12
+main.vl:66	block	crate::bump	raw-pointer	justified	other
+main.vl:74	block	crate::count	raw-pointer	justified	other
+sites: 16 (15 blocks, 0 unsafe fns, 1 extern blocks); unjustified: 13; unneeded: 12
 try: volec fix --only unneeded-unsafe
 $ fix --only unneeded-unsafe --diff
 fixed 9 unneeded unsafe blocks, 2 left as they are (query unsafe lists them)	main.vl	+12 -20 lines
@@ -28,42 +30,42 @@ fixed 9 unneeded unsafe blocks, 2 left as they are (query unsafe lists them)	mai
 @@ -11,5 +11,3 @@
 -    unsafe {
 -        let y = x + 1;
--        COUNT += y;
+-        bump(y);
 -        y
 -    }
 +    let y = x + 1;
-+    COUNT += y;
++    bump(y);
 +    y
 @@ -20,5 +18,3 @@
 -    unsafe {
--        COUNT += 1;
+-        bump(1);
 -    }
--    let c = unsafe { COUNT };
--    if unsafe { COUNT > 3 } {
-+    COUNT += 1;
-+    let c = COUNT;
-+    if COUNT > 3 {
+-    let c = unsafe { count() };
+-    if unsafe { count() > 3 } {
++    bump(1);
++    let c = count();
++    if count() > 3 {
 @@ -28,2 +24,2 @@
 -    let d = 2 * unsafe { c + x };
--    unsafe { COUNT += d; }
+-    unsafe { bump(d); }
 +    let d = 2 * (c + x);
-+    COUNT += d;
++    bump(d);
 @@ -37 +33 @@
 -    unsafe { if x > 0 { d } else { n } }
 +    if x > 0 { d } else { n }
 @@ -48,4 +44 @@
 -        unsafe {
--            COUNT += 2;
+-            bump(2);
 -        }
--        COUNT
-+        COUNT += 2;
+-        count()
++        bump(2);
 @@ -52,0 +46 @@
-+    COUNT
++    count()
 @@ -57,3 +51 @@
 -    unsafe {
--        println("{s} {COUNT}");
+-        println("{s} {}", count());
 -    }
-+    println("{s} {COUNT}");
++    println("{s} {}", count());
 $ fix --only unneeded-unsafe
 fixed 1 unneeded unsafe block, 1 left as it is (query unsafe lists it)	main.vl	+1 -3 lines
 $ fix --only unneeded-unsafe
@@ -75,7 +77,9 @@ main.vl:5	extern	crate::extern	ffi	missing both	1 C function
 main.vl:27	block	crate::two	other	missing both	none (unneeded)
 main.vl:32	block	crate::two	ffi	missing both	c-call(strlen)
 main.vl:39	block	crate::three	other	justified	none (unneeded)
-sites: 4 (3 blocks, 0 unsafe fns, 1 extern blocks); unjustified: 3; unneeded: 2
+main.vl:56	block	crate::bump	raw-pointer	justified	other
+main.vl:64	block	crate::count	raw-pointer	justified	other
+sites: 6 (5 blocks, 0 unsafe fns, 1 extern blocks); unjustified: 3; unneeded: 2
 try: volec fix --only unneeded-unsafe
 ## (0.25.5) `--only unneeded-justified`: the justified one too, with the
 ## comments above it (they say why a block no longer needed was).
@@ -87,14 +91,16 @@ fixed 1 unneeded unsafe block, 1 left as it is (query unsafe lists it)	main.vl	+
 -    // UNSAFE: kept: its comments say why, a reader's to judge.
 -    // SAFETY: nothing to it.
 -    unsafe {
--        COUNT += 1;
+-        bump(1);
 -    }
-+    COUNT += 1;
++    bump(1);
 % "$COMPILER" main.vl -o c >/dev/null 2>&1 && ./c
 33 21
 $ query unsafe main.vl
 main.vl:5	extern	crate::extern	ffi	missing both	1 C function
 main.vl:27	block	crate::two	other	missing both	none (unneeded)
 main.vl:32	block	crate::two	ffi	missing both	c-call(strlen)
-sites: 3 (2 blocks, 0 unsafe fns, 1 extern blocks); unjustified: 3; unneeded: 1
+main.vl:52	block	crate::bump	raw-pointer	justified	other
+main.vl:60	block	crate::count	raw-pointer	justified	other
+sites: 5 (4 blocks, 0 unsafe fns, 1 extern blocks); unjustified: 3; unneeded: 1
 try: volec fix --only unneeded-unsafe

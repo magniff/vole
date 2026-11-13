@@ -4,11 +4,11 @@
 operations take closures, and each closure parameter's bound says what
 the closure may do, with `+ effects(...)` after the `Fn` type:
 
-```tach
-pub fn map_values<F: Fn(i64) -> i64 + effects(panic)>(rows: inout [Row], f: F)
-pub fn partition<F: Fn(let Row) -> bool + effects()>(rows: inout [Row], keep: F) -> i64
-pub fn sort_by_key<F: Fn(let Row) -> i64 + effects(panic)>(rows: inout [Row], key: F)
-pub fn each<F: FnMut(let Row)>(rows: [Row], f: sink F)
+```vole
+pub fn map_values<F: Fn(i64) -> i64 + effects(panic)>(rows: &mut [Row], f: F)
+pub fn partition<F: Fn(&Row) -> bool + effects()>(rows: &mut [Row], keep: F) -> usize
+pub fn sort_by_key<F: Fn(&Row) -> i64 + effects(panic)>(rows: &mut [Row], key: F)
+pub fn each<F: FnMut(&Row)>(rows: &[Row], mut f: F)
 ```
 
 A library that calls your closure decides how often, and in which
@@ -47,7 +47,7 @@ ok: built table
 bonus` (it captures `bonus`, and only reads it), `|r| r.value >= 20`,
 `|r| -r.value`. The closure for `each` prints, and counts the rows it
 printed in a local it captures (`shown += 1`): state of the caller's
-own is not an effect, only statics are (`global`).
+own is not an effect, only statics are (`static`).
 
 ## Each instance's effects
 
@@ -56,9 +56,9 @@ A generic function's effects are its instances': one per closure.
 ```console
 $ volec query effects crate::table
 map_values<closure(i64) -> i64 at main.vl:17:27>	none
-partition<closure(Row) -> bool at main.vl:18:34>	panic
-sort_by_key<closure(Row) -> i64 at main.vl:19:29>	none
-each<closure(Row) -> () at main.vl:21:20>	io panic
+partition<closure(&Row) -> bool at main.vl:18:34>	panic
+sort_by_key<closure(&Row) -> i64 at main.vl:19:33>	panic diverge
+each<closure(&Row) -> () at main.vl:21:17>	io static panic
 ```
 
 `map_values` is `none` for this closure (its `rows[i]` is in a counted
@@ -88,24 +88,25 @@ the library) widen the bound.
 
 ## A closure that may panic, where nothing may
 
-`r.name[0]` is a checked index: an empty name would stop the program.
+`r.name.as_bytes()[0]` is a checked index: an empty name would stop the
+program.
 `partition`'s bound is `effects()`:
 
 ```console
-$ volec edit patch main --old '|r| r.value >= 20' --new "|r| r.name[0] == 'a'"
-main.vl:18:13: error[effect] the closure for 'F' of 'table::partition' may panic ('r.name[0]' at main.vl:18:38 is a checked index); 'F: Fn(let Row) -> bool + effects()' allows none only | help: do only what the bound allows in the closure, or allow 'panic' in the bound  [edited: crate::main]
-error edit.breaks: 1 new error; nothing written; the error: main.vl:18:13: the closure for 'F' of 'table::partition' may panic ('r.name[0]' at main.vl:18:38 is a checked index); 'F: Fn(let Row) -> bool + effects()' allows none only
-try: volec edit patch main --old '|r| r.value >= 20' --new '|r| r.name[0] == 'a'' --no-check
+$ volec edit patch main --old '|r| r.value >= 20' --new "|r| r.name.as_bytes()[0] == b'a'"
+main.vl:18:13: error[effect] the closure for 'F' of 'table::partition' may panic ('r.name.as_bytes()[0]' at main.vl:18:38 is a checked index); 'F: Fn(&Row) -> bool + effects()' allows none only | help: do only what the bound allows in the closure, or allow 'panic' in the bound  [edited: crate::main]
+error edit.breaks: 1 new error; nothing written; the error: main.vl:18:13: the closure for 'F' of 'table::partition' may panic ('r.name.as_bytes()[0]' at main.vl:18:38 is a checked index); 'F: Fn(&Row) -> bool + effects()' allows none only
+try: volec edit patch main --old '|r| r.value >= 20' --new '|r| r.name.as_bytes()[0] == b'a'' --no-check
 [exit 1]
 ```
 
-`get` returns an `Option` instead, which cannot fail:
+`first` returns an `Option` instead, which cannot fail:
 
 ```console
-$ volec edit patch main --old '|r| r.value >= 20' --new "|r| r.name.get(0) == Some('a')" --show
+$ volec edit patch main --old '|r| r.value >= 20' --new "|r| r.name.as_bytes().first().copied() == Some(b'a')" --show
 patched crate::main	main.vl	+1 -1 lines
 // main.vl:18
-18	    let n = partition(&rows[..], |r| r.name.get(0) == Some('a'));
+18	    let n = partition(&mut rows, |r| r.name.as_bytes().first().copied() == Some(b'a'));
 $ volec main.vl -o table && ./table
 alan      46
 ada       41
@@ -119,12 +120,13 @@ ok: built table
 ## What the bound is not
 
 - It is an upper bound on the closure, not on the library: `sort_by_key`
-  may do whatever its own body does (here it calls std's `sort_by`).
+  may do whatever its own body does (here it calls std's
+  `sort_unstable_by`).
 - A function given as a value (`fn` type) is checked the same way: its
   effects are those of every function of that type whose address the
   program takes.
-- Effects name kinds, not values: `effects(alloc(Arena))` would let the
-  closure allocate from any arena, not only one the library chose.
+- Effects name kinds, not values: `effects(alloc(Arena<Gpa>))` would let the
+  closure allocate from any such arena, not only one the library chose.
 
 ## Read more
 

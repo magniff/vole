@@ -6,23 +6,19 @@
 $ type fstring017/main.vl:9:13
 Interp<closure(*Fmt) -> () at fstring017/main.vl:9:13>	"n = {n}"
 $ type fstring017/main.vl:10:10
-Interp<closure(inout Fmt) -> () at fstring017/main.vl:10:22>	format_args("n = {n}")
+Interp<closure(&mut Formatter) -> () at fstring017/main.vl:10:22>	format_args("n = {n}")
 $ type fstring017/main.vl:9:19
 i64	n
-$ type fstring017/main.vl:12:16
-Interp<closure(inout Fmt) -> () at fstring017/main.vl:12:16>	"[{n}]"
-$ refs println push_fmt format_in --in fstring017/main.vl
+$ type fstring017/main.vl:12:29
+Interp<closure(*Fmt) -> () at fstring017/main.vl:12:29>	"[{n}]"
+$ refs println std::fmt::write format_in --in fstring017/main.vl
 # fstring017/main.vl
-1:30	use	crate	->std::fmt::format_in	use std::{Buf, Display, Gpa, format_in, println};
-1:41	use	crate	->std::fmt::println	use std::{Buf, Display, Gpa, format_in, println};
-4:5	call	show	->std::fmt::println	println(x);
+4:5	call	show	->std::fmt::println	println("{}", x);
 9:5	call	main	->std::fmt::println	println("n = {n}");
-12:7	call	main	->std::string::String::push_fmt	b.push_fmt("[{n}]");
-13:13	call	main	->std::fmt::format_in	var t = format_in("{n}!", gpa);
-14:5	call	main	->std::fmt::println	println(t.as_slice());
+12:5	call	main	->std::fmt::write	std::fmt::write(&mut b, "[{n}]").unwrap();
+13:17	call	main	->std::fmt::format_in	let mut t = format_in("{n}!", gpa);
+14:5	call	main	->std::fmt::println	println("{}", str::from_utf8(t.as_bytes()).unwrap());
 $ effects main --why io
-crate::main	alloc(Gpa) io panic diverge
+crate::main	alloc(Gpa) io static panic diverge
   'println("n = {n}")' at fstring017/main.vl:9:5 calls 'std::fmt::println'
-  'print_acquire()' at <std>:10886:5 calls 'std::fmt::print_acquire'
-  'print_acquire_held()' at <std>:10847:9 calls 'std::fmt::print_acquire_held'
   (no source found)

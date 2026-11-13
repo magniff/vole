@@ -14,9 +14,9 @@
 #   -j N      cases at once (default 4)
 #   -r RUSTC  the rustc to run (default: rustc on PATH, else
 #             ~/.cargo/bin/rustc); none found: exit 77 (a gate SKIP)
-#   --guide   also the guide's rust-edition programs: the blocks of
-#             compiler/guide/*.md whose first line is `// EDITION: rust`
-#             and that have an out block (tests/guide/run.sh --split)
+#   --guide   also the guide's programs: the blocks of
+#             compiler/guide/*.md that have an out block
+#             (tests/guide/run.sh --split)
 #   --alloc-api
 #             Rust's own allocator_api instead of the stable shim: rustc run
 #             as nightly (RUSTC_BOOTSTRAP=1, -Zcrate-attr=feature(
@@ -41,7 +41,9 @@
 #             (in the case, plan-0271 Q8), or a line `NAME<TAB>WHY` of
 #             tools/rustc-twin/divergences.tsv (for a program that has no
 #             case of its own: a guide block, a translation)
-#   stale     it is named and agrees: the marker is wrong
+#   stale     it is named and agrees: the marker is wrong (not a reason
+#             that starts with `unordered:`: Rust's own output varies by
+#             run, a HashMap's iteration order)
 #   outside   the shim cannot make it Rust: a vole-only item is left, or
 #             rustc rejects the text (its first error), or the case says
 #             `// RUSTC: none WHY`, or its ERROR is vole's alone (an effect
@@ -116,7 +118,7 @@ if GUIDE:
     for b in sorted(os.listdir(bdir)):
         p = os.path.join(bdir, b)
         src = open(os.path.join(p, "prog.vl")).read()
-        if not src.startswith("// EDITION: rust") or not os.path.isfile(os.path.join(p, "out")):
+        if not os.path.isfile(os.path.join(p, "out")):
             continue
         if [f for f in os.listdir(p) if f.endswith(".vl") and f != "prog.vl"]:
             continue  # (a program of several files: outside the twin)
@@ -170,13 +172,31 @@ def run(prog):
         return name, ("named" if named else "differ"), "no exit after 60 s"
     got = p.stdout.decode("utf-8", errors="replace")
     if merged:  # (the guide's out block: each line's trailing blanks aside)
-        got = "\n".join(l.rstrip() for l in got.split("\n"))
+        # (0.28.0: a panic's frame, rustc's alone: its `thread 'main'
+        # panicked at FILE:L:C:` line, the blank line before it and the
+        # backtrace note; the message, which the vole program prints too,
+        # stays)
+        kept = []
+        for l in got.split("\n"):
+            l = l.rstrip()
+            if re.match(r"thread '[^']*'( \(\d+\))? panicked at .*:$", l):
+                while kept and not kept[-1]:
+                    kept.pop()
+                continue
+            if not l.startswith("note: run with `RUST_BACKTRACE=1`"):
+                kept.append(l)
+        got = "\n".join(kept)
         want = "\n".join(l.rstrip() for l in want.split("\n"))
     diff = stdout_differs(want, got)
     if not diff and p.returncode != wexit:
         diff = f"exit {p.returncode}, expected {wexit}"
     if diff:
         return name, ("named" if named else "differ"), diff + (f" (named: {named})" if named else "")
+    # (0.28.0: a reason that starts with `unordered:` names an output Rust
+    # itself varies from run to run, a HashMap's iteration order (its
+    # RandomState): agreeing by chance is not a wrong marker)
+    if named and named.startswith("unordered:"):
+        return name, "named", f"it agrees this run (named: {named})"
     if named:
         return name, "stale", f"named ({named}), and it agrees"
     return name, "agree", ""

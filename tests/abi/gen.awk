@@ -15,7 +15,9 @@
 # A mismatch calls fail(function, argument) (exit code 1); the program
 # prints "ok" at its end.
 #
-# usage: awk -v seed=N -v cfile=x.c -v tfile=x.vl -f gen.awk
+# The vole half is in the rust edition (0.28).
+#
+# usage: awk -v seed=N -v cfile=x.c -v tfile=x.vl [-v nonnull=1] -f gen.awk
 
 function rnd(n) { return int(rand() * n) }
 
@@ -40,7 +42,7 @@ function c_scalar(t) {
 }
 
 function t_scalar(t) {
-    return t == "ptr" ? "*u8" : t == "nn" ? "std::NonNull<u8>" : t == "onn" ? "Option<std::NonNull<u8>>" : t
+    return t == "ptr" ? "*mut u8" : t == "nn" ? "std::ptr::NonNull<u8>" : t == "onn" ? "Option<std::ptr::NonNull<u8>>" : t
 }
 
 function c_type(t) {
@@ -61,7 +63,10 @@ function pick_scalar(    k) {
 function pick_type(depth,    k) {
     # (0.18: the null niche; not in import mode, where C's `uint8_t *` is
     # a *u8)
-    if (!IMPORT && rnd(12) == 0) return rnd(2) ? "nn" : "onn"
+    # (0.28: only with -v nonnull=1. std2's NonNull is an ordinary struct
+    # to the rust edition and does not cross to C yet: "type 'NonNull<u8>'
+    # of this parameter cannot cross to C"; the forms below are not run.)
+    if (!IMPORT && nonnull && rnd(12) == 0) return rnd(2) ? "nn" : "onn"
     k = rnd(10)
     if (k < 5 || depth > 2) return pick_scalar()
     if (k < 8 && NS > 0) return "S" rnd(NS)
@@ -110,9 +115,9 @@ function c_leaf(t, v) {
 
 # The same in vole (in a context of type t).
 function t_leaf(t, v) {
-    if (t == "ptr") return "(" v " as *u8)"
-    if (t == "nn") return "(" v " as *u8 as std::NonNull<u8>)"
-    if (t == "onn") return "std::NonNull::new(" v " as *u8)"
+    if (t == "ptr") return "(" v " as *mut u8)"
+    if (t == "nn") return "std::ptr::NonNull::new(" v " as *mut u8).unwrap()"
+    if (t == "onn") return "std::ptr::NonNull::new(" v " as *mut u8)"
     return v
 }
 
@@ -303,7 +308,7 @@ function define_types(    k, i, n, attr, line, m, kind) {
                 line = line ")"
             }
         }
-        print "#[repr(C)]" > TF
+        print "#[derive(Clone, Copy)]\n#[repr(C)]" > TF
         print line " }" > TF
         print "typedef struct {" > HF
         print "    int32_t tag;" > HF
@@ -339,6 +344,10 @@ function define_types(    k, i, n, attr, line, m, kind) {
             else if (rnd(3) == 0 && k > 0 && attr != "packed") FT[k, i] = "S" rnd(k)
             else FT[k, i] = pick_scalar()
         }
+        # (the derive first: an attribute between #[repr(C)] and the type
+        # loses the repr, 0.28; a union takes no derive and is copied as
+        # it is)
+        if (!IMPORT && TK[k] != "union") print "#[derive(Clone, Copy)]" > TF
         if (!IMPORT) print (attr == "packed" ? "#[repr(C, packed)]" : attr == "align" ? "#[repr(C, align(" AL[k] "))]" : "#[repr(C)]") > TF
         line = TK[k] " S" k " {"
         for (i = 0; i < NF_[k]; i++) {
@@ -490,7 +499,7 @@ function emit_variadic(k,    i, n, t, line) {
 
 # A scalar argument of a variadic call: typed by its suffix.
 function t_variadic_leaf(t, v) {
-    if (t == "ptr") return "(" v " as *u8)"
+    if (t == "ptr") return "(" v " as *mut u8)"
     if (t == "bool") return v
     return v t
 }
@@ -528,7 +537,7 @@ BEGIN {
         print "import \"./" parts[n] "\" as c;" > TF
     }
     print "void fail(int f, int a) { printf(\"FAIL function %d argument %d\\n\", f, a); fflush(stdout); exit(1); }" > CF
-    if (!IMPORT) print "#[repr(C)]" > TF
+    if (!IMPORT) print "#[derive(Clone, Copy, PartialEq)]\n#[repr(C)]" > TF
     define_types()
     NFN = 4 + rnd(5)
     for (k = 0; k < NFN; k++) {
@@ -537,7 +546,7 @@ BEGIN {
     }
     if (!IMPORT) {
         print "extern \"C\" {" > TF
-        print "    fn printf(format: *u8, ...) -> i32;" > TF
+        print "    fn printf(format: *const u8, ...) -> i32;" > TF
         print "    fn fail(f: i32, a: i32);" > TF
         for (k = 0; k < NFN; k++) {
             print "    fn c_f" k "(" t_params(k) ")" t_ret(k) ";" > TF

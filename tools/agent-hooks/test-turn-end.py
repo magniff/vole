@@ -232,7 +232,7 @@ try:
     os.makedirs(os.path.join(sc, ".git"))
     write(os.path.join(sc, "compiler", "std", "std.vl"), "mod sys;\n")
     write(os.path.join(sc, "compiler", "std", "embed.sh"), "")
-    sysf = os.path.join(sc, "compiler", "std", "sys", "linux.vl" if sys.platform.startswith("linux") else "macos.vl")
+    sysf = os.path.join(sc, "compiler", "std", "rt", "sys_linux.vl" if sys.platform.startswith("linux") else "sys_macos.vl")
     write(sysf, "pub fn sys_c_strerror_r() -> i32 { 0 }\n")
     write(os.path.join(sc, "ex", "main.vl"), "fn main() {\n    std::sys_c_strerror_r();\n}\n")
     old_std = os.path.join(sc, "target", "tools", "volec")

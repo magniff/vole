@@ -6,16 +6,18 @@ $ items crate shapes --comments
 # crate	complete/main.vl
 6	mod	mod shapes
 10-28	section	State
-12	static	static var COUNT: i64 = 0
+12	static	static mut COUNT: i64 = 0
 15	struct	pub struct Counter
 19	impl	impl Counter
 20	method	pub fn new() -> Self
-24	method	pub fn bump(inout self) -> i64
-30-56	section	Shapes
+24	method	pub fn bump(&mut self) -> i64
+30-67	section	Shapes
 32-32	comment	(the shapes come from shapes.vl)
 34	fn	fn make(k: i64) -> Shape
-42	fn	fn twice_area<T>(x: sink T, s: Shape) -> i64
+42	fn	fn twice_area<T>(x: T, s: Shape) -> i64
 47	fn	fn main() -> i32
+59	fn	fn get_count() -> i64
+63	fn	fn set_count(v: i64)
 # crate::shapes	complete/shapes.vl
 3	enum	pub enum Shape
 8-16	section	Areas
@@ -24,10 +26,10 @@ $ show main::section State
 // crate::section State	complete/main.vl:10-28
 // ---- State ----
 
-static var COUNT: i64 = 0;
+static mut COUNT: i64 = 0;
 
 // A counter: how many shapes were made.
-pub struct Counter {
+#[derive(Clone, Copy)] pub struct Counter {
     n: i64,
 }
 
@@ -36,7 +38,7 @@ impl Counter {
         Self { n: 0 }
     }
 
-    pub fn bump(inout self) -> i64 {
+    pub fn bump(&mut self) -> i64 {
         self.n += 1;
         self.n
     }
@@ -52,26 +54,26 @@ pub fn area_of(s: Shape) -> i64 {
         Shape::Circle(r) => 3 * r * r,
     }
 }
-// crate::section Shapes	complete/main.vl:30-56
+// crate::section Shapes	complete/main.vl:30-67
 // ---- Shapes ----
 
 // (the shapes come from shapes.vl)
 
 fn make(k: i64) -> Shape {
     unsafe {
-        COUNT = COUNT + 1;
+        set_count(get_count() + 1);
     }
-    if k == 0 { Shape::Square(2) } else { Shape::Circle(1) }
+    if k == 0 { Shape::Square(2i64) } else { Shape::Circle(1i64) }
 }
 
 // Never instantiated: its references are found all the same.
-fn twice_area<T>(x: sink T, s: Shape) -> i64 {
+fn twice_area<T>(x: T, s: Shape) -> i64 {
     let c = Counter::new();
-    area(s) + area(s) + unsafe { COUNT }
+    area(s) + area(s) + unsafe { get_count() }
 }
 
 fn main() -> i32 {
-    var c = Counter::new();
+    let mut c = Counter::new();
     let s = make(0);
     let label = "area of the shape";
     let r = match s {
@@ -79,6 +81,17 @@ fn main() -> i32 {
         Shape::Circle(_) => area(s),
     };
     r as i32
+}
+
+// (0.28.0) COUNT's accessors: every use of it is one of them.
+fn get_count() -> i64 {
+    unsafe { COUNT }
+}
+
+fn set_count(v: i64) {
+    unsafe {
+        COUNT = v;
+    }
 }
 $ show crate::section Nope
 error query.no-match: no section 'Nope' in crate
@@ -92,9 +105,9 @@ $ grep area
 # complete/main.vl
 8:21	code	crate	use shapes::{Shape, area_of as area};
 8:32	code	crate	use shapes::{Shape, area_of as area};
-42:10	code	twice_area	fn twice_area<T>(x: sink T, s: Shape) -> i64 {
-44:5	code	twice_area	area(s) + area(s) + unsafe { COUNT }
-44:15	code	twice_area	area(s) + area(s) + unsafe { COUNT }
+42:10	code	twice_area	fn twice_area<T>(x: T, s: Shape) -> i64 {
+44:5	code	twice_area	area(s) + area(s) + unsafe { get_count() }
+44:15	code	twice_area	area(s) + area(s) + unsafe { get_count() }
 50:18	string	main	let label = "area of the shape";
 53:29	code	main	Shape::Circle(_) => area(s),
 # complete/shapes.vl
@@ -108,15 +121,15 @@ $ grep area --strings --comments
 $ grep area --code --word
 # complete/main.vl
 8:32	code	crate	use shapes::{Shape, area_of as area};
-44:5	code	twice_area	area(s) + area(s) + unsafe { COUNT }
-44:15	code	twice_area	area(s) + area(s) + unsafe { COUNT }
+44:5	code	twice_area	area(s) + area(s) + unsafe { get_count() }
+44:15	code	twice_area	area(s) + area(s) + unsafe { get_count() }
 53:29	code	main	Shape::Circle(_) => area(s),
 $ grep COUNT --in shapes
 note query.empty: 0 hits in shapes
 $ grep shape --count
 6
 $ type main.vl:44 complete/main.vl:44:5 main.vl:49 main.vl:52:30 main.vl:42:28 main.vl:999
-i64	area(s) + area(s) + unsafe { COUNT }
+i64	area(s) + area(s) + unsafe { get_count() }
 i64	area(s)
 Shape	make(0)
 i64	c.bump()
@@ -126,24 +139,23 @@ error query.no-match: complete/main.vl has no line 999
 [exit 1]
 $ refs Counter COUNT
 # complete/main.vl
-12:12	def	->COUNT	static var COUNT: i64 = 0;
-15:12	def	->Counter	pub struct Counter {
+12:12	def	->COUNT	static mut COUNT: i64 = 0;
+15:35	def	->Counter	#[derive(Clone, Copy)] pub struct Counter {
 19:6	type	crate	->Counter	impl Counter {
 20:21	type	Counter::new	->Counter	pub fn new() -> Self {
 21:9	init	Counter::new	->Counter	Self { n: 0 }
-24:23	type	Counter::bump	->Counter	pub fn bump(inout self) -> i64 {
-36:9	write	make	->COUNT	COUNT = COUNT + 1;
-36:17	read	make	->COUNT	COUNT = COUNT + 1;
+24:22	type	Counter::bump	->Counter	pub fn bump(&mut self) -> i64 {
 43:13	type	twice_area	->Counter	let c = Counter::new();
-44:34	read	twice_area	->COUNT	area(s) + area(s) + unsafe { COUNT }
-48:13	type	main	->Counter	var c = Counter::new();
+48:17	type	main	->Counter	let mut c = Counter::new();
+60:14	read	get_count	->COUNT	unsafe { COUNT }
+65:9	write	set_count	->COUNT	COUNT = v;
 $ refs Counter.n Shape::Square
 # complete/main.vl
 16:5	def	->Counter.n	n: i64,
 21:16	init	Counter::new	->Counter.n	Self { n: 0 }
 25:14	write	Counter::bump	->Counter.n	self.n += 1;
 26:14	read	Counter::bump	->Counter.n	self.n
-38:24	init	make	->shapes::Shape::Square	if k == 0 { Shape::Square(2) } else { Shape::Circle(1) }
+38:24	init	make	->shapes::Shape::Square	if k == 0 { Shape::Square(2i64) } else { Shape::Circle(1i64) }
 52:16	pat	main	->shapes::Shape::Square	Shape::Square(n) => c.bump() + n,
 # complete/shapes.vl
 4:5	def	->shapes::Shape::Square	Square(i64),
@@ -151,8 +163,8 @@ $ refs Counter.n Shape::Square
 $ refs area
 # complete/main.vl
 8:21	use	crate	use shapes::{Shape, area_of as area};
-44:5	call	twice_area	area(s) + area(s) + unsafe { COUNT }
-44:15	call	twice_area	area(s) + area(s) + unsafe { COUNT }
+44:5	call	twice_area	area(s) + area(s) + unsafe { get_count() }
+44:15	call	twice_area	area(s) + area(s) + unsafe { get_count() }
 53:29	call	main	Shape::Circle(_) => area(s),
 # complete/shapes.vl
 10:8	def	pub fn area_of(s: Shape) -> i64 {
@@ -166,6 +178,6 @@ try: volec query items
 [exit 1]
 $ callers area_of
 # complete/main.vl
-44:5	call	twice_area	area(s) + area(s) + unsafe { COUNT }
-44:15	call	twice_area	area(s) + area(s) + unsafe { COUNT }
+44:5	call	twice_area	area(s) + area(s) + unsafe { get_count() }
+44:15	call	twice_area	area(s) + area(s) + unsafe { get_count() }
 53:29	call	main	Shape::Circle(_) => area(s),

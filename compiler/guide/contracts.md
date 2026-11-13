@@ -8,17 +8,19 @@ release switch; `debug` clauses are the ones only test builds check.
 ## requires and ensures
 
 ```vole
+use std::alloc::Allocator;
+
 struct Stack<A: Allocator> { items: Vec<i64, A> }
 
 impl Stack<Gpa> {
-    fn top(self, i: i64) -> i64
+    fn top(&self, i: i64) -> i64
         requires 0 <= i && i < self.items.len() as i64 else "no item {i}"
-        ensures result == self.items.get(i as usize)
+        ensures result == self.items[i as usize]
     {
-        self.items.get(i as usize)
+        self.items[i as usize]
     }
 
-    fn pop(inout self) -> i64
+    fn pop(&mut self) -> i64
         requires self.items.len() > 0 else "pop on an empty stack"
     {
         self.items.pop().unwrap()
@@ -26,7 +28,7 @@ impl Stack<Gpa> {
 }
 
 fn main(gpa: Gpa) -> i32 {
-    var s = Stack { items: Vec::new_in(gpa) };
+    let mut s = Stack { items: Vec::new_in(gpa) };
     s.items.push(4);
     println("{} {}", s.top(0), s.pop());
     println("{}", s.pop());
@@ -35,7 +37,7 @@ fn main(gpa: Gpa) -> i32 {
 ```
 ```out (exit 101)
 4 4
-main.vl:22:19: pop on an empty stack: self.items.len() = 0
+main.vl:24:19: pop on an empty stack: self.items.len() = 0
 ```
 
 - `requires COND` is checked at the call, after the arguments: a failure
@@ -68,25 +70,28 @@ Owned parameters are read in place, never moved or dropped.
 
 An ensures runs after the body, so (`contract.old`):
 
-- a parameter taken by value and owned (a `Vec`, a `Buf`) is gone:
-  write `old(v.len())` (or `old(v.clone())`), or take it by `&`;
-- `old(e)` must not keep a view (`old(v.as_slice())`) of what the body
-  may change: take a plain part, `old(v.len())`.
+- a parameter taken by value that is not `Copy` (a `Vec`, a `String`)
+  is gone: write `old(v.len())` (or `old(v.clone())`), or take it by `&`;
+- `old(e)` must not keep a borrow (`old(v.as_slice())`) of what the body
+  may change: take a `Copy` part, `old(v.len())`.
 
 `result` in a requires, or in an ensures of a function that returns
 nothing, is `contract.result`.
 
 ## Assertions
 
-`assert(c)`, `assert(c, "message")`, `assert_eq(a, b)`, `assert_ne(a,
-b)` and `debug_assert(c)` are in the prelude; `assert!(..)` and the other
-bang spellings are accepted. Each operand is evaluated once; the
-message is `assertion failed: 'COND'` (or the message given) and the
-values:
+`assert(c)`, `assert(c, "message")`, `assert_eq(a, b)`,
+`assert_ne(a, b)` and `debug_assert(c)` are in the prelude, as
+functions (Rust's macros; `assert!(..)` is accepted too).
+A failure prints the call's place, then Rust's message, and exits with
+101: the message given, or `assertion failed` with the condition's
+text, then the values of the names the condition compares; for
+`assert_eq` `` assertion `left == right` failed `` with a `left:` and
+a `right:` line.
 
 ```vole
 fn main() -> i32 {
-    let k = std::parse_int("3").unwrap_or(0);
+    let k = "3".parse::<i64>().unwrap_or(0);
     assert_eq(k * 2, 6);
     assert(k > 5, "k is small");
     0
@@ -98,8 +103,9 @@ main.vl:4:5: k is small: k = 3
 
 ## The failure line
 
-Every run-time check prints one line, `FILE:LINE:COL: message`, and
-exits with 101: bounds, `as E`, `unwrap`, contracts, assertions.
+Every run-time check of the compiler prints one line, `FILE:LINE:COL:
+message`, and exits with 101: bounds, `as E`, contracts, and std's
+requires (`unwrap` of a `None`), a `panic` and the assertions.
 `--trace` adds the calls that led there (`volec test` builds with
 it; guide debug).
 
@@ -110,9 +116,9 @@ body needs no bounds check, where the call is inlined and (0.18.1, -O2)
 in a function no caller inlines, since every direct call checks first.
 Nothing is assumed: a fact comes only from a check that ran, so a
 function whose address is taken (an indirect call does not check its
-requires) or that C calls keeps its own checks. Integers wrap: `i + 4
-<= v.len()` holds for an i near `i64::MAX`, so it does not prove
-`v[i + 1]`; `x % n` with `requires n > 0` is in `0..n`. `volec
+requires) or that C calls keeps its own checks. Integers wrap where
+overflow is not checked (-O1 and above): `i + 4 <= v.len()` holds for
+an i near `i64::MAX`, so it does not prove `v[i + 1]`; `x % n` with `requires n > 0` is in `0..n`. `volec
 query checks FN` lists the checks left after the optimizer and the ones
 it removed.
 

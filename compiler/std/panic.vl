@@ -1,0 +1,235 @@
+// std::panic: panic, assert and the other functions Rust spells as
+// macros (vole has none: plan §3). A panic formats its message into a
+// fixed buffer, truncating it, so it never allocates and is callable
+// from #[no_alloc] code; it then exits with 101, with no unwinding
+// (decisions 5 and 18). A message is a format literal (`panic("bad
+// {x}")`): the compiler checks it and builds its Display value
+// (`edition.later: format_fns`); the default parameters are std's own.
+
+use crate::cmp::PartialEq;
+use crate::fmt::{Debug, Display, Formatter, Write};
+use crate::result::Result;
+
+// UNSAFE: write(2) and exit(3), the way out: the message goes to stderr
+// and the program ends with 101, as MVS's panic_str.
+// SAFETY: write is passed a buffer's pointer and its own length; exit
+// takes a code and does not return.
+// (0.28.0, as MVS's: their effect is `panic`, not the io of writing a
+// message and exiting; docs/design/effects-allocation.md §2.2)
+extern "C" {
+    #[link_name = "write"]
+    #[effects(panic)]
+    fn panic_write(fd: i32, buf: *const u8, n: usize) -> isize;
+    #[link_name = "exit"]
+    #[effects(panic)]
+    fn panic_exit(code: i32) -> !;
+}
+
+// The bytes a panic's message is formatted into: fixed, so a panic never
+// allocates; a longer message is cut at a char boundary.
+const PANIC_BUF: usize = 1024;
+
+struct PanicBuf {
+    buf: [u8; 1024],
+    len: usize,
+}
+
+impl Write for PanicBuf {
+    fn write_str(&mut self, s: &str) -> crate::fmt::Result {
+        let mut n = s.len();
+        if n > PANIC_BUF - self.len {
+            n = PANIC_BUF - self.len;
+            while n > 0 && !s.is_char_boundary(n) {
+                n -= 1;
+            }
+        }
+        let b = s.as_bytes();
+        let mut i: usize = 0;
+        while i < n {
+            self.buf[self.len + i] = b[i];
+            i += 1;
+        }
+        self.len += n;
+        Result::Ok(())
+    }
+}
+
+impl PanicBuf {
+    fn new() -> PanicBuf {
+        PanicBuf { buf: [0; 1024], len: 0 }
+    }
+
+    // The message, a newline, and exit 101.
+    fn emit(&self) -> ! {
+        // UNSAFE: the extern write above.
+        // SAFETY: buf is valid for len bytes (len <= PANIC_BUF); the
+        // newline literal for one.
+        unsafe {
+            panic_write(2, &self.buf[0] as *const u8, self.len);
+            panic_write(2, "\n".as_ptr(), 1);
+        }
+        panic_note();
+        // UNSAFE: the extern exit above.
+        // SAFETY: it takes a status and does not return.
+        unsafe { panic_exit(101) }
+    }
+}
+
+// The lines after a failure's message: none. In a program built with
+// --trace the compiler makes this call one of its trace runtime's, which
+// prints the calls that led to the failure (compiler/src/middle/trace.vl).
+// mvs: panic_note
+fn panic_note() {}
+
+// left and right as Rust's assert_eq and assert_ne show them, then the
+// way out.
+fn assert_failed<T: Debug>(op: &str, a: &T, b: &T, msg: &str) -> ! {
+    let mut w = PanicBuf::new();
+    let head: &str = "assertion `left ";
+    let _ = w.write_str(head);
+    let _ = w.write_str(op);
+    let tail: &str = " right` failed";
+    let _ = w.write_str(tail);
+    if msg.len() > 0 {
+        let sep: &str = ": ";
+        let _ = w.write_str(sep);
+        let _ = w.write_str(msg);
+    }
+    let left: &str = "\n  left: ";
+    let _ = w.write_str(left);
+    {
+        let mut f = Formatter::new(&mut w);
+        let _ = crate::fmt::Debug::fmt(a, &mut f);
+    }
+    let right: &str = "\n right: ";
+    let _ = w.write_str(right);
+    {
+        let mut f = Formatter::new(&mut w);
+        let _ = crate::fmt::Debug::fmt(b, &mut f);
+    }
+    w.emit()
+}
+
+// Ends the program with msg on stderr, the caller's place and exit 101.
+// MVS's panic (a C string, unsafe) and panic_str are gone into it.
+// mvs: panic_str, panic
+// std2: renamed
+// later: format_fns
+#[effects(panic, diverge, M)]
+pub fn panic<M: Display>(msg: M) -> ! {
+    let mut w = PanicBuf::new();
+    {
+        let mut f = Formatter::new(&mut w);
+        let _ = crate::fmt::Display::fmt(&msg, &mut f);
+    }
+    w.emit()
+}
+
+// Panics when ok is false, with msg.
+// later: format_fns
+#[effects(panic)]
+pub fn assert(ok: bool, msg: &str) {
+    if !ok {
+        if msg.len() == 0 {
+            let m: &str = "assertion failed";
+            panic(m);
+        }
+        panic(msg);
+    }
+}
+
+// `assert(ok, "..{}..", ..)`, a message with holes: formatted only when
+// ok is false, after `at`, the call's `FILE:LINE:COL`. The compiler makes
+// the call (front/check/format.vl: panic_call), not programs.
+#[effects(panic, diverge, M)]
+pub fn __assert_fmt<M: Display>(ok: bool, msg: M, at: &str) {
+    if !ok {
+        let mut w = PanicBuf::new();
+        if at.len() > 0 {
+            let _ = w.write_str(at);
+            let sep: &str = ": ";
+            let _ = w.write_str(sep);
+        }
+        {
+            let mut f = Formatter::new(&mut w);
+            let _ = crate::fmt::Display::fmt(&msg, &mut f);
+        }
+        w.emit();
+    }
+}
+
+// `a == b` must hold, as `assert(a == b)`: the compiler makes the call that
+// check (front/contracts/desugar.vl), which compares the two in place
+// (neither is moved, as with Rust's macro) and reports the condition and
+// both values after the call's FILE:LINE:COL.
+// later: format_fns
+#[effects(panic, T)]
+pub fn assert_eq<T: PartialEq + Debug>(a: T, b: T, msg: &str) {
+    if !(a == b) {
+        let op: &str = "==";
+        assert_failed(op, &a, &b, msg);
+    }
+}
+
+// `a != b` must hold, as `assert(a != b)` (see assert_eq).
+// later: format_fns
+#[effects(panic)]
+pub fn assert_ne<T: PartialEq + Debug>(a: T, b: T, msg: &str) {
+    if a == b {
+        let op: &str = "!=";
+        assert_failed(op, &a, &b, msg);
+    }
+}
+
+// assert, only in debug builds (-O0, or with debug assertions).
+// later: format_fns
+// (The compiler drops the call outside test builds, as MVS's.)
+#[effects(panic)]
+pub fn debug_assert(ok: bool, msg: &str) {
+    if !ok {
+        if msg.len() == 0 {
+            let m: &str = "assertion failed";
+            panic(m);
+        }
+        panic(msg);
+    }
+}
+
+// Code that cannot be reached: panics if it is, with Rust's text,
+// "internal error: entered unreachable code" (and `: msg`), after `at`,
+// the call's `FILE:LINE:COL`, which the compiler gives a call in the
+// program (front/contracts/desugar.vl: panic_site).
+// std2: changed: a format literal for its message
+// later: format_fns
+#[effects(panic)]
+pub fn unreachable(msg: &str, at: &str) -> ! {
+    if at.len() == 0 {
+        if msg.len() == 0 {
+            let m: &str = "internal error: entered unreachable code";
+            panic(m);
+        }
+        panic("internal error: entered unreachable code: {msg}");
+    }
+    if msg.len() == 0 {
+        panic("{at}: internal error: entered unreachable code");
+    }
+    panic("{at}: internal error: entered unreachable code: {msg}")
+}
+
+// Code not written yet: panics with "not yet implemented". The spec
+// tree's bodies are this. Until format_fns the message is a &str: a
+// type parameter is not fixed by its default argument.
+// later: format_fns
+#[effects(panic)]
+pub fn todo(msg: &str) -> ! {
+    let m: &str = "not yet implemented";
+    panic(m)
+}
+
+// Code that will not be written: panics with "not implemented".
+// later: format_fns
+#[effects(panic)]
+pub fn unimplemented(msg: &str) -> ! {
+    let m: &str = "not implemented";
+    panic(m)
+}

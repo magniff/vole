@@ -12,26 +12,31 @@
 // one it runs on.
 
 use std::env;
+use std::alloc::Allocator;
 use std::cli::{Arg, Command};
 
+// UNSAFE: the C library's functions, declared by hand (no headers: the
+// program is built for Linux and macOS from either).
+// SAFETY: the signatures are POSIX's, the same on both systems; each
+// call says why its arguments are valid.
 extern "C" {
     fn socket(domain: i32, kind: i32, protocol: i32) -> i32;
-    fn setsockopt(fd: i32, level: i32, name: i32, value: *u8, len: u32) -> i32;
-    fn bind(fd: i32, addr: *u8, len: u32) -> i32;
+    fn setsockopt(fd: i32, level: i32, name: i32, value: *const u8, len: u32) -> i32;
+    fn bind(fd: i32, addr: *const u8, len: u32) -> i32;
     fn listen(fd: i32, backlog: i32) -> i32;
-    fn accept(fd: i32, addr: *u8, len: *u32) -> i32;
-    fn read(fd: i32, buf: *u8, count: u64) -> i64;
-    fn write(fd: i32, buf: *u8, count: u64) -> i64;
-    fn open(path: *u8, flags: i32, ...) -> i32;
+    fn accept(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
+    fn read(fd: i32, buf: *mut u8, count: u64) -> i64;
+    fn write(fd: i32, buf: *const u8, count: u64) -> i64;
+    fn open(path: *const u8, flags: i32, ...) -> i32;
     fn close(fd: i32) -> i32;
     fn lseek(fd: i32, offset: i64, whence: i32) -> i64;
-    fn opendir(path: *u8) -> *u8;
-    fn readdir(dir: *u8) -> *u8;
-    fn closedir(dir: *u8) -> i32;
-    fn strlen(s: *u8) -> u64;
-    fn getcwd(buf: *u8, size: u64) -> *u8;
-    fn realpath(path: *u8, resolved: *u8) -> *u8;
-    fn uname(names: *u8) -> i32;
+    fn opendir(path: *const u8) -> *mut u8;
+    fn readdir(dir: *mut u8) -> *const u8;
+    fn closedir(dir: *mut u8) -> i32;
+    fn strlen(s: *const u8) -> u64;
+    fn getcwd(buf: *mut u8, size: u64) -> *mut u8;
+    fn realpath(path: *const u8, resolved: *mut u8) -> *mut u8;
+    fn uname(names: *mut u8) -> i32;
 }
 
 const PORT: u16 = 8000;
@@ -45,7 +50,7 @@ const PATH_MAX: i64 = 4096;
 struct Fd { fd: i32 }
 
 impl Drop for Fd {
-    fn drop(inout self) {
+    fn drop(&mut self) {
         // UNSAFE: close(2) is the C library's, declared above; std has no descriptor type.
         // SAFETY: the descriptor is an open one (checked by the caller), held by this
         // guard alone, and closed once, here.
@@ -54,10 +59,10 @@ impl Drop for Fd {
 }
 
 // An open directory, closed when the guard is dropped.
-struct Dir { dir: *u8 }
+struct Dir { dir: *mut u8 }
 
 impl Drop for Dir {
-    fn drop(inout self) {
+    fn drop(&mut self) {
         // UNSAFE: closedir(3) is the C library's, declared above.
         // SAFETY: the pointer is the one opendir() returned, not null, held by this guard
         // alone, and closed once, here.
@@ -70,24 +75,30 @@ impl Drop for Dir {
 // ============================================================================
 
 mod sys {
+    use std::mem::size_of;
+
     use super::{bind, close, listen, setsockopt, socket, strlen, uname};
 
     // The system the program runs on. Intel Macs keep the old struct
     // dirent under readdir's plain name.
+    #[derive(Clone, Copy, PartialEq)]
     pub enum System { Linux, MacArm, MacIntel }
 
-    fn starts_with(s: [u8], prefix: [u8]) -> bool {
-        s.len() >= prefix.len() && s[..prefix.len()] == prefix
+    fn starts_with(s: &[u8], prefix: &[u8]) -> bool {
+        s.len() >= prefix.len() && &s[..prefix.len()] == prefix
     }
 
     pub fn detect() -> System {
         // struct utsname: five fields of 256 bytes on macOS (the machine
         // last), six of 65 on Linux; the system's name comes first.
-        var names: [u8; 1280] = [0; 1280];
-        if unsafe { uname(&names as *u8) != 0 || !starts_with(names[..], "Darwin") } {
+        let mut names: [u8; 1280] = [0; 1280];
+        // UNSAFE: uname(2) is the C library's, and writes through a pointer.
+        // SAFETY: `names` is larger than either system's struct utsname.
+        let failed = unsafe { uname(names.as_mut_ptr()) != 0 };
+        if failed || !starts_with(&names[..], b"Darwin") {
             return System::Linux;
         }
-        if starts_with(names[1024..], "arm64") { System::MacArm } else { System::MacIntel }
+        if starts_with(&names[1024..], b"arm64") { System::MacArm } else { System::MacIntel }
     }
 
     // struct sockaddr_in: BSD puts the length before the family.
@@ -110,7 +121,9 @@ mod sys {
 
     // A TCP socket listening on addr:port (in host order), with
     // SO_REUSEADDR; or the message of what failed.
-    pub fn listen_tcp(system: System, addr: u32, port: u16) -> Result<i32, [u8]> {
+    pub fn listen_tcp(system: System, addr: u32, port: u16) -> Result<i32, &'static str> {
+        // UNSAFE: socket(2) is the C library's.
+        // SAFETY: it takes three numbers.
         let fd = unsafe { socket(AF_INET, SOCK_STREAM, 0) };
         if fd < 0 {
             return Err("error: socket() failed\n");
@@ -120,29 +133,55 @@ mod sys {
         let level: i32 = if linux { 1 } else { 0xffff };
         let name: i32 = if linux { 2 } else { 4 };
         let one: i32 = 1;
-        unsafe { setsockopt(fd, level, name, &one as *u8, size_of(i32) as u32); }
+        // UNSAFE: setsockopt(2) is the C library's, and reads through a pointer.
+        // SAFETY: the value is `one`, an i32 that lives past the call, with its size.
+        unsafe {
+            setsockopt(fd, level, name, &one as *const i32 as *const u8, size_of::<i32>() as u32);
+        }
 
         let bound = if linux {
             let sa = SockaddrIn {
                 family: AF_INET as u16, port: swap16(port), addr: swap32(addr), zero: [0; 8],
             };
-            unsafe { bind(fd, &sa as *u8, size_of(SockaddrIn) as u32) }
+            // UNSAFE: bind(2) is the C library's, and reads through a pointer.
+            // SAFETY: `sa` is Linux's struct sockaddr_in (repr(C)), passed with its
+            // size, and lives past the call.
+            unsafe {
+                bind(fd, &sa as *const SockaddrIn as *const u8, size_of::<SockaddrIn>() as u32)
+            }
         } else {
             let sa = SockaddrInBsd {
-                len: size_of(SockaddrInBsd) as u8,
+                len: size_of::<SockaddrInBsd>() as u8,
                 family: AF_INET as u8,
                 port: swap16(port),
                 addr: swap32(addr),
                 zero: [0; 8],
             };
-            unsafe { bind(fd, &sa as *u8, size_of(SockaddrInBsd) as u32) }
+            // UNSAFE: bind(2) is the C library's, and reads through a pointer.
+            // SAFETY: `sa` is BSD's struct sockaddr_in (repr(C)), passed with its
+            // size, and lives past the call.
+            unsafe {
+                bind(fd, &sa as *const SockaddrInBsd as *const u8,
+                    size_of::<SockaddrInBsd>() as u32)
+            }
         };
         if bound < 0 {
-            unsafe { close(fd); }
+            // UNSAFE: close(2) is the C library's.
+            // SAFETY: fd is the socket opened above, closed once on this path.
+            unsafe {
+                close(fd);
+            }
             return Err("error: bind() failed (port 8000 in use?)\n");
         }
-        if unsafe { listen(fd, 128) < 0 } {
-            unsafe { close(fd); }
+        // UNSAFE: listen(2) is the C library's.
+        // SAFETY: fd is the bound socket.
+        let listening = unsafe { listen(fd, 128) };
+        if listening < 0 {
+            // UNSAFE: close(2) is the C library's.
+            // SAFETY: fd is the socket opened above, closed once on this path.
+            unsafe {
+                close(fd);
+            }
             return Err("error: listen() failed\n");
         }
         Ok(fd)
@@ -172,30 +211,34 @@ mod sys {
     // The name (NUL-terminated) and the d_type of the entry readdir
     // returned.
     //
-    // Unsafe: `entry` must point to a struct dirent of this system.
-    pub unsafe fn dirent(system: System, entry: *u8) -> (*u8, u8) {
+    // UNSAFE: it reads a struct dirent through a raw pointer.
+    // SAFETY: the caller's promise: `entry` points to a struct dirent of
+    // this system. Only the address of its name is taken (the struct is as
+    // long as the name, often shorter than the declared array).
+    pub unsafe fn dirent(system: System, entry: *const u8) -> (*const u8, u8) {
         match system {
             System::Linux => {
-                let d = entry as *DirentLinux;
-                (&d.name as *u8, d.r#type)
+                let d = entry as *const DirentLinux;
+                (&raw const (*d).name as *const u8, (*d).r#type)
             }
             System::MacArm => {
-                let d = entry as *DirentMac;
-                (&d.name as *u8, d.r#type)
+                let d = entry as *const DirentMac;
+                (&raw const (*d).name as *const u8, (*d).r#type)
             }
             System::MacIntel => {
-                let d = entry as *DirentMacOld;
-                (&d.name as *u8, d.r#type)
+                let d = entry as *const DirentMacOld;
+                (&raw const (*d).name as *const u8, (*d).r#type)
             }
         }
     }
 
     // The bytes of a C string.
     //
-    // Unsafe: `s` must point to a NUL-terminated string that outlives the
-    // slice.
-    pub unsafe fn cstr(s: *u8) -> [u8] {
-        s[0..strlen(s) as i64]
+    // UNSAFE: it reads C's string through a raw pointer.
+    // SAFETY: the caller's promise: `s` points to a NUL-terminated string
+    // that outlives the slice.
+    pub unsafe fn cstr<'a>(s: *const u8) -> &'a [u8] {
+        std::slice::from_raw_parts(s, strlen(s) as usize)
     }
 }
 
@@ -205,57 +248,67 @@ use sys::System;
 // Bytes and paths
 // ============================================================================
 
-fn ends_with(s: [u8], suffix: [u8]) -> bool {
-    s.len() >= suffix.len() && s[s.len() - suffix.len()..] == suffix
+fn ends_with(s: &[u8], suffix: &[u8]) -> bool {
+    s.len() >= suffix.len() && &s[s.len() - suffix.len()..] == suffix
 }
 
-// A path for C: its bytes and a NUL (the Buf is freed when the Path is
+// A path for C: its bytes and a NUL (the Vec is freed when the Path is
 // dropped).
 struct Path<A: Allocator> { buf: Vec<u8, A> }
 
 impl Path<Gpa> {
     // dir/name, without doubling the slash between them.
-    fn join(dir: [u8], name: [u8], gpa: Gpa) -> Path<Gpa> {
-        var buf = Vec::<u8, Gpa>::new_in(gpa);
+    fn join(dir: &[u8], name: &[u8], gpa: Gpa) -> Path<Gpa> {
+        let mut buf = Vec::<u8, Gpa>::new_in(gpa);
         buf.extend_from_slice(dir);
-        let dir_slash = ends_with(dir, "/");
-        let name_slash = name.len() > 0 && name[0] == '/';
+        let dir_slash = ends_with(dir, b"/");
+        let name_slash = name.len() > 0 && name[0] == b'/';
         if dir_slash && name_slash {
-            buf.extend_from_slice(name[1..]);
+            buf.extend_from_slice(&name[1..]);
         } else {
             if !dir_slash && !name_slash {
-                buf.push('/');
+                buf.push(b'/');
             }
             buf.extend_from_slice(name);
         }
         buf.push(0);
-        Path { buf: buf }
+        Path { buf }
     }
 
-    fn c(self) -> *u8 {
-        self.buf.as_slice().ptr
+    fn c(&self) -> *const u8 {
+        self.buf.as_ptr()
     }
 
-    fn bytes(self) -> [u8] {
-        let s = self.buf.as_slice();
-        s[..s.len() - 1]
+    fn bytes(&self) -> &[u8] {
+        &self.buf[..self.buf.len() - 1]
     }
 }
 
 // What a path names.
+#[derive(PartialEq)]
 enum Kind { Missing, Dir, File(i64) }
 
-fn probe(system: System, path: Path<Gpa>) -> Kind {
+fn probe(system: System, path: &Path<Gpa>) -> Kind {
+    // UNSAFE: opendir(3) is the C library's.
+    // SAFETY: the path is NUL-terminated (Path::join) and lives past the call.
     let dir = unsafe { opendir(path.c()) };
-    if dir as u64 != 0 {
-        unsafe { closedir(dir); }
+    if !dir.is_null() {
+        // UNSAFE: closedir(3) is the C library's.
+        // SAFETY: `dir` is the open directory, not null, closed once.
+        unsafe {
+            closedir(dir);
+        }
         return Kind::Dir;
     }
+    // UNSAFE: open(2) is the C library's.
+    // SAFETY: the path is NUL-terminated and lives past the call.
     let fd = unsafe { open(path.c(), O_RDONLY | sys::o_nonblock(system)) };
     if fd < 0 {
         return Kind::Missing;
     }
     let _fd = Fd { fd };
+    // UNSAFE: lseek(2) is the C library's.
+    // SAFETY: fd is open until `_fd` is dropped.
     unsafe { Kind::File(lseek(fd, 0, SEEK_END)) }
 }
 
@@ -265,20 +318,20 @@ fn probe(system: System, path: Path<Gpa>) -> Kind {
 
 fn hex_val(ch: u8) -> Option<u8> {
     match ch {
-        '0'..='9' => Some(ch - '0'),
-        'A'..='F' => Some(ch - 'A' + 10),
-        'a'..='f' => Some(ch - 'a' + 10),
+        b'0'..=b'9' => Some(ch - b'0'),
+        b'A'..=b'F' => Some(ch - b'A' + 10),
+        b'a'..=b'f' => Some(ch - b'a' + 10),
         _ => None,
     }
 }
 
-fn url_decode(s: [u8], gpa: Gpa) -> Vec<u8, Gpa> {
-    var out = Vec::<u8, Gpa>::new_in(gpa);
-    var r = 0;
-    while r < s.len() as i64 {
+fn url_decode(s: &[u8], gpa: Gpa) -> Vec<u8, Gpa> {
+    let mut out = Vec::<u8, Gpa>::new_in(gpa);
+    let mut r = 0usize;
+    while r < s.len() {
         let ch = s[r];
         r += 1;
-        if ch == '%' && r + 1 < s.len() as i64 {
+        if ch == b'%' && r + 1 < s.len() {
             if let Some(hi) = hex_val(s[r]) {
                 if let Some(lo) = hex_val(s[r + 1]) {
                     out.push(hi * 16 + lo);
@@ -287,7 +340,7 @@ fn url_decode(s: [u8], gpa: Gpa) -> Vec<u8, Gpa> {
                 }
             }
         }
-        out.push(if ch == '+' { ' ' } else { ch });
+        out.push(if ch == b'+' { b' ' } else { ch });
     }
     out
 }
@@ -296,9 +349,9 @@ fn url_decode(s: [u8], gpa: Gpa) -> Vec<u8, Gpa> {
 // MIME type detection (minimal, by extension)
 // ============================================================================
 
-struct Mime { ext: [u8], kind: [u8] }
+struct Mime { ext: &'static str, kind: &'static str }
 
-fn guess_mime(path: [u8]) -> [u8] {
+fn guess_mime(path: &[u8]) -> &'static str {
     let types = [
         Mime { ext: ".html", kind: "text/html; charset=utf-8" },
         Mime { ext: ".htm", kind: "text/html; charset=utf-8" },
@@ -324,7 +377,7 @@ fn guess_mime(path: [u8]) -> [u8] {
         Mime { ext: ".mp3", kind: "audio/mpeg" },
     ];
     for m in types {
-        if ends_with(path, m.ext) {
+        if ends_with(path, m.ext.as_bytes()) {
             return m.kind;
         }
     }
@@ -335,13 +388,13 @@ fn guess_mime(path: [u8]) -> [u8] {
 // HTML-escape a string for safe display (handles &, <, >, ")
 // ============================================================================
 
-fn push_escaped(out: inout Vec<u8, Gpa>, s: [u8]) {
-    for ch in s {
+fn push_escaped(out: &mut Vec<u8, Gpa>, s: &[u8]) {
+    for &ch in s {
         match ch {
-            '&' => out.extend_from_slice("&amp;"),
-            '<' => out.extend_from_slice("&lt;"),
-            '>' => out.extend_from_slice("&gt;"),
-            '"' => out.extend_from_slice("&quot;"),
+            b'&' => out.extend_from_slice(b"&amp;"),
+            b'<' => out.extend_from_slice(b"&lt;"),
+            b'>' => out.extend_from_slice(b"&gt;"),
+            b'"' => out.extend_from_slice(b"&quot;"),
             _ => out.push(ch),
         }
     }
@@ -351,48 +404,51 @@ fn push_escaped(out: inout Vec<u8, Gpa>, s: [u8]) {
 // HTTP responses
 // ============================================================================
 
-fn send_all(fd: i32, s: [u8]) {
-    var sent = 0;
-    while sent < s.len() as i64 {
-        let n = unsafe { write(fd, &s[sent], (s.len() as i64 - sent) as u64) };
+fn send_all(fd: i32, s: &[u8]) {
+    let mut sent = 0usize;
+    while sent < s.len() {
+        // UNSAFE: write(2) is the C library's.
+        // SAFETY: s[sent..] is the caller's slice, and the count is its length.
+        let n = unsafe { write(fd, s[sent..].as_ptr(), (s.len() - sent) as u64) };
         if n <= 0 {
             break;
         }
-        sent += n;
+        sent += n as usize;
     }
 }
 
 // The headers, with a Content-Length when it is known.
-fn send_headers(fd: i32, status: [u8], content_type: [u8], length: Option<i64>, gpa: Gpa) {
-    var h = String::new_in(gpa);
-    h.push_fmt("HTTP/1.0 {status}\r\nContent-Type: {content_type}");
+fn send_headers(fd: i32, status: &str, content_type: &str, length: Option<i64>, gpa: Gpa) {
+    let mut h = format_in("HTTP/1.0 {status}\r\nContent-Type: {content_type}", gpa);
     if let Some(n) = length {
-        h.push_fmt("\r\nContent-Length: {n}");
+        h.push_str(format_in("\r\nContent-Length: {n}", gpa).as_str());
     }
     h.push_str("\r\nConnection: close\r\n\r\n");
-    send_all(fd, h.as_slice());
+    send_all(fd, h.as_bytes());
 }
 
-fn send_html(fd: i32, status: [u8], body: Vec<u8, Gpa>, gpa: Gpa) {
+fn send_html(fd: i32, status: &str, body: Vec<u8, Gpa>, gpa: Gpa) {
     let bytes = body.as_slice();
     send_headers(fd, status, "text/html; charset=utf-8", Some(bytes.len() as i64), gpa);
     send_all(fd, bytes);
 }
 
-fn send_404(fd: i32, path: [u8], gpa: Gpa) {
-    var body = Vec::<u8, Gpa>::new_in(gpa);
-    body.extend_from_slice("<!DOCTYPE html><html><head><title>404 Not Found</title>");
-    body.extend_from_slice("<style>body{font-family:sans-serif;margin:40px}</style></head>");
-    body.extend_from_slice("<body><h1>404 Not Found</h1><p>The path <code>");
-    push_escaped(&body, path);
-    body.extend_from_slice("</code> was not found on this server.</p></body></html>");
+fn send_404(fd: i32, path: &[u8], gpa: Gpa) {
+    let mut body = Vec::<u8, Gpa>::new_in(gpa);
+    body.extend_from_slice(b"<!DOCTYPE html><html><head><title>404 Not Found</title>");
+    body.extend_from_slice(b"<style>body{font-family:sans-serif;margin:40px}</style></head>");
+    body.extend_from_slice(b"<body><h1>404 Not Found</h1><p>The path <code>");
+    push_escaped(&mut body, path);
+    body.extend_from_slice(b"</code> was not found on this server.</p></body></html>");
     send_html(fd, "404 Not Found", body, gpa);
 }
 
-fn send_redirect(fd: i32, location: [u8], gpa: Gpa) {
-    var h = String::new_in(gpa);
-    h.push_fmt(
-        "HTTP/1.0 301 Moved Permanently\r\nLocation: {location}\r\nConnection: close\r\n\r\n");
+// (the location is the request's bytes, which need not be UTF-8)
+fn send_redirect(fd: i32, location: &[u8], gpa: Gpa) {
+    let mut h = Vec::<u8, Gpa>::new_in(gpa);
+    h.extend_from_slice(b"HTTP/1.0 301 Moved Permanently\r\nLocation: ");
+    h.extend_from_slice(location);
+    h.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
     send_all(fd, h.as_slice());
 }
 
@@ -400,96 +456,107 @@ fn send_redirect(fd: i32, location: [u8], gpa: Gpa) {
 // Directory listing
 // ============================================================================
 
-fn push_style(out: inout Vec<u8, Gpa>) {
-    out.extend_from_slice("<style>\n");
-    out.extend_from_slice("body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; ");
-    out.extend_from_slice("margin: 0; padding: 20px 40px; background: #fafafa; color: #333; }\n");
+fn push_style(out: &mut Vec<u8, Gpa>) {
+    out.extend_from_slice(b"<style>\n");
+    out.extend_from_slice(b"body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; ");
+    out.extend_from_slice(b"margin: 0; padding: 20px 40px; background: #fafafa; color: #333; }\n");
     out.extend_from_slice(
-        "h1 { font-weight: 400; border-bottom: 1px solid #ddd; padding-bottom: 10px; }\n");
-    out.extend_from_slice("table { border-collapse: collapse; width: 100%; max-width: 800px; }\n");
-    out.extend_from_slice("th, td { text-align: left; padding: 8px 16px; }\n");
-    out.extend_from_slice("th { background: #eee; font-weight: 600; font-size: 0.85em; ");
-    out.extend_from_slice("text-transform: uppercase; letter-spacing: 0.05em; }\n");
-    out.extend_from_slice("tr:hover { background: #f0f0f0; }\n");
-    out.extend_from_slice("a { color: #0066cc; text-decoration: none; }\n");
-    out.extend_from_slice("a:hover { text-decoration: underline; }\n");
-    out.extend_from_slice(".dir { font-weight: 600; }\n");
-    out.extend_from_slice(".size { font-variant-numeric: tabular-nums; color: #666; }\n");
-    out.extend_from_slice(".icon { width: 20px; }\n");
-    out.extend_from_slice("</style>\n");
+        b"h1 { font-weight: 400; border-bottom: 1px solid #ddd; padding-bottom: 10px; }\n");
+    out.extend_from_slice(b"table { border-collapse: collapse; width: 100%; max-width: 800px; }\n");
+    out.extend_from_slice(b"th, td { text-align: left; padding: 8px 16px; }\n");
+    out.extend_from_slice(b"th { background: #eee; font-weight: 600; font-size: 0.85em; ");
+    out.extend_from_slice(b"text-transform: uppercase; letter-spacing: 0.05em; }\n");
+    out.extend_from_slice(b"tr:hover { background: #f0f0f0; }\n");
+    out.extend_from_slice(b"a { color: #0066cc; text-decoration: none; }\n");
+    out.extend_from_slice(b"a:hover { text-decoration: underline; }\n");
+    out.extend_from_slice(b".dir { font-weight: 600; }\n");
+    out.extend_from_slice(b".size { font-variant-numeric: tabular-nums; color: #666; }\n");
+    out.extend_from_slice(b".icon { width: 20px; }\n");
+    out.extend_from_slice(b"</style>\n");
 }
 
-fn serve_directory(fd: i32, system: System, dir_path: Path<Gpa>, url: [u8], gpa: Gpa) {
+fn serve_directory(fd: i32, system: System, dir_path: &Path<Gpa>, url: &[u8], gpa: Gpa) {
+    // UNSAFE: opendir(3) is the C library's.
+    // SAFETY: the path is NUL-terminated (Path::join) and lives past the call.
     let dir = unsafe { opendir(dir_path.c()) };
-    if dir as u64 == 0 {
+    if dir.is_null() {
         send_404(fd, url, gpa);
         return;
     }
     let _dir = Dir { dir };
 
-    var body = Vec::<u8, Gpa>::new_in(gpa);
-    body.extend_from_slice("<!DOCTYPE html>\n<html>\n<head>\n");
-    body.extend_from_slice("<meta charset=\"utf-8\">\n");
-    body.extend_from_slice("<title>Directory listing for ");
-    push_escaped(&body, url);
-    body.extend_from_slice("</title>\n");
-    push_style(&body);
-    body.extend_from_slice("</head>\n<body>\n");
-    body.extend_from_slice("<h1>Directory listing for ");
-    push_escaped(&body, url);
-    body.extend_from_slice("</h1>\n");
+    let mut body = Vec::<u8, Gpa>::new_in(gpa);
+    body.extend_from_slice(b"<!DOCTYPE html>\n<html>\n<head>\n");
+    body.extend_from_slice(b"<meta charset=\"utf-8\">\n");
+    body.extend_from_slice(b"<title>Directory listing for ");
+    push_escaped(&mut body, url);
+    body.extend_from_slice(b"</title>\n");
+    push_style(&mut body);
+    body.extend_from_slice(b"</head>\n<body>\n");
+    body.extend_from_slice(b"<h1>Directory listing for ");
+    push_escaped(&mut body, url);
+    body.extend_from_slice(b"</h1>\n");
     if url.len() > 1 {
-        body.extend_from_slice("<p><a href=\"..\">Parent directory</a></p>\n");
+        body.extend_from_slice(b"<p><a href=\"..\">Parent directory</a></p>\n");
     }
     body.extend_from_slice(
-        "<table>\n<tr><th class=\"icon\"></th><th>Name</th><th>Size</th></tr>\n");
+        b"<table>\n<tr><th class=\"icon\"></th><th>Name</th><th>Size</th></tr>\n");
 
     loop {
+        // UNSAFE: readdir(3) is the C library's.
+        // SAFETY: `dir` is open until `_dir` is dropped.
         let entry = unsafe { readdir(dir) };
-        if entry as u64 == 0 {
+        if entry.is_null() {
             break;
         }
-        let (cname, dtype) = unsafe { sys::dirent(system, entry) };
-        let name = unsafe { sys::cstr(cname) };
-        if ends_with(name, ".") && (name.len() == 1 || name.len() == 2 && name[0] == '.') {
+        // UNSAFE: the entry and its name are read through raw pointers.
+        // SAFETY: `entry` is this system's struct dirent, as readdir returned
+        // it, and its name is NUL-terminated; both live until the next
+        // readdir on `dir`, at the next turn of the loop, after `name`'s last use.
+        let (name, dtype) = unsafe {
+            let (cname, dtype) = sys::dirent(system, entry);
+            (sys::cstr(cname), dtype)
+        };
+        if ends_with(name, b".") && (name.len() == 1 || name.len() == 2 && name[0] == b'.') {
             continue;
         }
 
         let path = Path::join(dir_path.bytes(), name, gpa);
-        let kind = probe(system, path);
+        let kind = probe(system, &path);
         // d_type is DT_UNKNOWN on file systems that do not keep it
         let is_dir = if dtype == sys::DT_UNKNOWN { kind == Kind::Dir }
             else { dtype == sys::DT_DIR };
 
-        body.extend_from_slice("<tr><td class=\"icon\">");
-        body.extend_from_slice("</td><td><a ");
+        body.extend_from_slice(b"<tr><td class=\"icon\">");
+        body.extend_from_slice(b"</td><td><a ");
         if is_dir {
-            body.extend_from_slice("class=\"dir\" ");
+            body.extend_from_slice(b"class=\"dir\" ");
         }
-        body.extend_from_slice("href=\"");
-        push_escaped(&body, name);
+        body.extend_from_slice(b"href=\"");
+        push_escaped(&mut body, name);
         if is_dir {
-            body.push('/');
+            body.push(b'/');
         }
-        body.extend_from_slice("\">");
-        push_escaped(&body, name);
+        body.extend_from_slice(b"\">");
+        push_escaped(&mut body, name);
         if is_dir {
-            body.push('/');
+            body.push(b'/');
         }
-        body.extend_from_slice("</a></td><td class=\"size\">");
+        body.extend_from_slice(b"</a></td><td class=\"size\">");
         match kind {
-            _ if is_dir => body.push('-'),
-            Kind::File(size) if size
-                >= 0 => body.extend_from_slice(format_in("{}", size, body.allocator()).as_bytes()),
-            _ => body.push('?'),
+            _ if is_dir => body.push(b'-'),
+            Kind::File(size) if size >= 0 => {
+                body.extend_from_slice(format_in("{}", size, gpa).as_bytes())
+            }
+            _ => body.push(b'?'),
         }
-        body.extend_from_slice("</td></tr>\n");
+        body.extend_from_slice(b"</td></tr>\n");
     }
 
-    body.extend_from_slice("</table>\n");
-    body.extend_from_slice("<hr><p style=\"color:#999;font-size:0.85em\">");
-    body.extend_from_slice("Vole HTTP Server</p>\n");
-    body.extend_from_slice("</body>\n</html>\n");
+    body.extend_from_slice(b"</table>\n");
+    body.extend_from_slice(b"<hr><p style=\"color:#999;font-size:0.85em\">");
+    body.extend_from_slice(b"Vole HTTP Server</p>\n");
+    body.extend_from_slice(b"</body>\n</html>\n");
     send_html(fd, "200 OK", body, gpa);
 }
 
@@ -497,8 +564,10 @@ fn serve_directory(fd: i32, system: System, dir_path: Path<Gpa>, url: [u8], gpa:
 // File serving
 // ============================================================================
 
-fn serve_file(fd: i32, system: System, path: Path<Gpa>, size: i64, gpa: Gpa) {
+fn serve_file(fd: i32, system: System, path: &Path<Gpa>, size: i64, gpa: Gpa) {
     // (not to wait for a writer if it is a FIFO)
+    // UNSAFE: open(2) is the C library's.
+    // SAFETY: the path is NUL-terminated and lives past the call.
     let file = unsafe { open(path.c(), O_RDONLY | sys::o_nonblock(system)) };
     if file < 0 {
         send_404(fd, path.bytes(), gpa);
@@ -509,13 +578,15 @@ fn serve_file(fd: i32, system: System, path: Path<Gpa>, size: i64, gpa: Gpa) {
     // (a FIFO or a device has no size)
     let length: Option<i64> = if size >= 0 { Some(size) } else { None };
     send_headers(fd, "200 OK", guess_mime(path.bytes()), length, gpa);
-    var chunk: [u8; 8192] = [0; 8192];
+    let mut chunk: [u8; 8192] = [0; 8192];
     loop {
-        let n = unsafe { read(file, &chunk as *u8, 8192) };
+        // UNSAFE: read(2) is the C library's, and writes through a pointer.
+        // SAFETY: `chunk` is ours to write and 8192 bytes long.
+        let n = unsafe { read(file, chunk.as_mut_ptr(), 8192) };
         if n <= 0 {
             break;
         }
-        send_all(fd, chunk[..n]);
+        send_all(fd, &chunk[..n as usize]);
     }
 }
 
@@ -524,73 +595,79 @@ fn serve_file(fd: i32, system: System, path: Path<Gpa>, size: i64, gpa: Gpa) {
 // ============================================================================
 
 // The method and the path (without the query) of a request line.
-fn parse_request(req: [u8]) -> Option<([u8], [u8])> {
-    var i = 0;
-    while i < req.len() as i64 && req[i] != ' ' {
+fn parse_request(req: &[u8]) -> Option<(&[u8], &[u8])> {
+    let mut i = 0usize;
+    while i < req.len() && req[i] != b' ' {
         i += 1;
     }
-    if i == req.len() as i64 {
+    if i == req.len() {
         return None;
     }
-    let method = req[..i];
+    let method = &req[..i];
     let start = i + 1;
     i = start;
-    while i < req.len() as i64 && req[i] != ' ' && req[i] != '?' {
+    while i < req.len() && req[i] != b' ' && req[i] != b'?' {
         i += 1;
     }
     if i == start {
         return None;
     }
-    Some((method, req[start..i]))
+    Some((method, &req[start..i]))
 }
 
-fn handle_request(fd: i32, system: System, root: [u8], gpa: Gpa) {
+fn handle_request(fd: i32, system: System, root: &[u8], gpa: Gpa) {
     let _connection = Fd { fd };
-    var request: [u8; 8192] = [0; 8192];
-    let n = unsafe { read(fd, &request as *u8, 8191) };
+    let mut request: [u8; 8192] = [0; 8192];
+    // UNSAFE: read(2) is the C library's, and writes through a pointer.
+    // SAFETY: `request` is ours to write, and longer than the count.
+    let n = unsafe { read(fd, request.as_mut_ptr(), 8191) };
     if n <= 0 {
         return;
     }
-    let (method, raw_path) = if let Some(parts) = parse_request(request[..n]) {
+    let (method, raw_path) = if let Some(parts) = parse_request(&request[..n as usize]) {
         parts
     } else {
-        send_404(fd, "/", gpa);
+        send_404(fd, b"/", gpa);
         return;
     };
 
     let decoded = url_decode(raw_path, gpa);
     let url = decoded.as_slice();
 
-    // log the request on stderr
-    eprint("{method} {url}");
+    // log the request on stderr (its bytes as they came)
+    let mut log = Vec::<u8, Gpa>::new_in(gpa);
+    log.extend_from_slice(method);
+    log.push(b' ');
+    log.extend_from_slice(url);
+    send_all(2, log.as_slice());
 
     let path = Path::join(root, url, gpa);
-    match probe(system, path) {
+    match probe(system, &path) {
         Kind::Missing => {
             eprintln(" 404");
             send_404(fd, url, gpa);
         }
         Kind::File(size) => {
             eprintln(" 200 ({})", guess_mime(path.bytes()));
-            serve_file(fd, system, path, size, gpa);
+            serve_file(fd, system, &path, size, gpa);
         }
         Kind::Dir => {
-            if !ends_with(url, "/") {
-                var location = Vec::<u8, Gpa>::new_in(gpa);
+            if !ends_with(url, b"/") {
+                let mut location = Vec::<u8, Gpa>::new_in(gpa);
                 location.extend_from_slice(url);
-                location.push('/');
+                location.push(b'/');
                 eprintln(" 301");
                 send_redirect(fd, location.as_slice(), gpa);
                 return;
             }
-            let index = Path::join(path.bytes(), "index.html", gpa);
-            if let Kind::File(size) = probe(system, index) {
+            let index = Path::join(path.bytes(), b"index.html", gpa);
+            if let Kind::File(size) = probe(system, &index) {
                 eprintln(" 200 (index.html)");
-                serve_file(fd, system, index, size, gpa);
+                serve_file(fd, system, &index, size, gpa);
                 return;
             }
             eprintln(" 200 (dir)");
-            serve_directory(fd, system, path, url, gpa);
+            serve_directory(fd, system, &path, url, gpa);
         }
     }
 }
@@ -607,35 +684,46 @@ fn main(gpa: Gpa) -> i32 {
     let system = sys::detect();
 
     // the directory made absolute, else the current directory
-    var root_buf: [u8; 4096] = [0; 4096];
-    let root_c = &root_buf as *u8;
-    var resolved = false;
+    let mut root_buf: [u8; 4096] = [0; 4096];
+    let mut resolved = false;
     if let Some(dir) = m.get("directory") {
-        // (C wants the path NUL-terminated: a slice is not)
-        var dir_c = String::new_in(gpa);
+        // (C wants the path NUL-terminated: a &str is not)
+        let mut dir_c = String::new_in(gpa);
         dir_c.push_str(dir);
-        dir_c.push(0);
-        resolved = unsafe { realpath(dir_c.as_slice().ptr, root_c) } as u64 != 0;
+        dir_c.push('\0');
+        // UNSAFE: realpath(3) is the C library's, and writes through a pointer.
+        // SAFETY: `dir_c` is NUL-terminated and lives past the call;
+        // `root_buf` has PATH_MAX bytes, all realpath writes.
+        resolved = unsafe { !realpath(dir_c.as_ptr(), root_buf.as_mut_ptr()).is_null() };
     }
     if !resolved {
-        if unsafe { getcwd(root_c, PATH_MAX as u64) as u64 == 0 } {
+        // UNSAFE: getcwd(3) is the C library's, and writes through a pointer.
+        // SAFETY: `root_buf` is ours to write, and PATH_MAX bytes long.
+        let cwd = unsafe { getcwd(root_buf.as_mut_ptr(), PATH_MAX as u64) };
+        if cwd.is_null() {
             eprintln("error: cannot get cwd");
             return 1;
         }
     }
-    let root = unsafe { sys::cstr(root_c) };
+    // UNSAFE: the C string in `root_buf` is read through a pointer.
+    // SAFETY: realpath or getcwd left a NUL-terminated path in `root_buf`,
+    // which lives, unchanged, to the end of main.
+    let root = unsafe { sys::cstr(root_buf.as_ptr()) };
 
-    eprintln("Serving {root}");
+    eprintln("Serving {}", String::from_utf8_lossy_in(root, gpa));
 
     match sys::listen_tcp(system, LOCALHOST, PORT) {
         Err(message) => {
-            eprint(message);
+            eprint("{message}");
             1
         }
         Ok(server) => {
             eprintln("Serving HTTP on http://127.0.0.1:8000/ ...");
             loop {
-                let fd = unsafe { accept(server, 0 as *u8, 0 as *u32) };
+                // UNSAFE: accept(2) is the C library's.
+                // SAFETY: `server` is the listening socket; the peer's address
+                // is not asked for (two null pointers, as accept allows).
+                let fd = unsafe { accept(server, std::ptr::null_mut(), std::ptr::null_mut()) };
                 if fd >= 0 {
                     handle_request(fd, system, root, gpa);
                 }

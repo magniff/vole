@@ -5,18 +5,18 @@
 ## Off a terminal nothing changes: a pipe and --color=never give the same
 ## text, the one-line form of 0.25.2.
 $ bad.vl -o bad
-bad.vl:2:18: error[type error] expected 'i32', got '[u8]'
+bad.vl:2:18: error[type error] expected 'i32', got '&str'
 bad.vl:3:13: error[type error] undefined variable 'undefined_name'
 [exit 1]
 $ --color=never bad.vl -o bad
-bad.vl:2:18: error[type error] expected 'i32', got '[u8]'
+bad.vl:2:18: error[type error] expected 'i32', got '&str'
 bad.vl:3:13: error[type error] undefined variable 'undefined_name'
 [exit 1]
 ## --color=always gives a terminal's form anywhere: the phases, each
 ## diagnostic with its source line and a caret, the summary, in colour
 ## (cat -v shows the escapes; the time and the target vary).
 % "$COMPILER" --color=always bad.vl -o bad 2>&1 | cat -v | sed 's/in [0-9.]*s/in Ts/'
-^[[1;31merror[type error]^[[0m^[[1m: expected 'i32', got '[u8]'^[[0m
+^[[1;31merror[type error]^[[0m^[[1m: expected 'i32', got '&str'^[[0m
  ^[[1;34m-->^[[0m bad.vl:2:18
   ^[[1;34m|^[[0m
 ^[[1;34m2 |^[[0m     let x: i32 = "a";
@@ -35,7 +35,7 @@ bad.vl:3:13: error[type error] undefined variable 'undefined_name'
      ^[[1;32mLinking^[[0m prog
     ^[[1;32mFinished^[[0m prog in Ts
 % "$COMPILER" --color=always check bad.vl 2>&1 | cat -v | sed 's/in [0-9.]*s/in Ts/'
-^[[1;31merror[type error]^[[0m^[[1m: expected 'i32', got '[u8]'^[[0m
+^[[1;31merror[type error]^[[0m^[[1m: expected 'i32', got '&str'^[[0m
  ^[[1;34m-->^[[0m bad.vl:2:18
   ^[[1;34m|^[[0m
 ^[[1;34m2 |^[[0m     let x: i32 = "a";
@@ -57,7 +57,7 @@ error: unknown option (expected --color=auto, always or never): --color=sometime
 ## On a terminal (a pseudo-terminal, script(1)): colour by default; none
 ## with NO_COLOR; --color=never is the terminal's form of 0.25.2.
 % sh tty.sh "$COMPILER" bad.vl -o bad | cat -v | sed 's/in [0-9.]*s/in Ts/'
-^[[1;31merror[type error]^[[0m^[[1m: expected 'i32', got '[u8]'^[[0m
+^[[1;31merror[type error]^[[0m^[[1m: expected 'i32', got '&str'^[[0m
  ^[[1;34m-->^[[0m bad.vl:2:18
   ^[[1;34m|^[[0m
 ^[[1;34m2 |^[[0m     let x: i32 = "a";
@@ -70,7 +70,7 @@ error: unknown option (expected --color=auto, always or never): --color=sometime
     ^[[1;32mChecking^[[0m bad.vl ... ^[[31m2 errors^[[0m
       ^[[1;31mFailed^[[0m bad: 2 errors in Ts
 % NO_COLOR=1 sh tty.sh "$COMPILER" bad.vl -o bad | sed 's/in [0-9.]*s/in Ts/'
-error[type error]: expected 'i32', got '[u8]'
+error[type error]: expected 'i32', got '&str'
  --> bad.vl:2:18
   |
 2 |     let x: i32 = "a";
@@ -83,7 +83,7 @@ error[type error]: undefined variable 'undefined_name'
     Checking bad.vl ... 2 errors
       Failed bad: 2 errors in Ts
 % sh tty.sh "$COMPILER" --color=never bad.vl -o bad
-error[type error]: expected 'i32', got '[u8]'
+error[type error]: expected 'i32', got '&str'
  --> bad.vl: line 2, column 18
 error[type error]: undefined variable 'undefined_name'
  --> bad.vl: line 3, column 13

@@ -26,15 +26,17 @@ value may simply not be there, and that's nothing unusual. The standard
 library uses it that way everywhere:
 
 ```vole
+use std::collections::HashMap;
+
 fn main(gpa: Gpa) {
-    let line: str = "port = 8080";
+    let line = "port = 8080";
     println("{:?} {:?}", line.find("="), line.find("#"));
 
-    var defaults: HashMap<str, i64, Gpa> = HashMap::new_in(gpa);
+    let mut defaults: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
     defaults.insert("port", 80);
     defaults.insert("workers", 4);
-    let port = defaults.get("port").unwrap_or(0);
-    let timeout = defaults.get("timeout").unwrap_or(30);
+    let port = defaults.get("port").copied().unwrap_or(0);
+    let timeout = defaults.get("timeout").copied().unwrap_or(30);
     println("{port} {timeout}");
 
     if let Some(w) = defaults.get("workers") {
@@ -50,10 +52,11 @@ Some(5) None
 ```
 
 `line.find("=")` is the position of the first `=`, if there is one.
-`defaults.get(key)` is the value stored under `key`, if there is one (a
-`HashMap` is a table from keys to values; chapter 7 has more). Neither
-is an error when the answer is "nowhere": it's one of the two expected
-outcomes.
+`defaults.get(key)` is a reference to the value stored under `key`, if
+there is one, and `copied()` makes that an `Option` of the number
+itself (a `HashMap` is a table from keys to values; chapter 7 has
+more). Neither is an error when the answer is "nowhere": it's one of
+the two expected outcomes.
 
 You've now seen three ways to get at what's inside an `Option`:
 
@@ -77,8 +80,8 @@ failure. Parsing a number is the classic example:
 
 ```vole
 fn main() {
-    let good: str = "8080";
-    let bad: str = "80x80";
+    let good = "8080";
+    let bad = "80x80";
     match good.parse::<i64>() {
         Ok(n) => println("got {n}"),
         Err(e) => println("error: {e}"),
@@ -92,13 +95,13 @@ fn main() {
 
 ```out
 got 8080
-error: invalid digit at byte 2
+error: invalid digit found in string
 ```
 
 `parse::<i64>()` returns a `Result<i64, ParseIntError>`. `ParseIntError`
-is the standard library's enum of the ways parsing an integer can fail:
-an empty string, a byte that isn't a digit, or a number too big for the
-type. It knows how to print itself, which is what `{e}` did.
+is the standard library's type for the ways parsing an integer can fail:
+an empty string, a character that isn't a digit, or a number too big for
+the type. It knows how to print itself, which is what `{e}` did.
 
 Option means absent, Result means failed. The standard library follows
 this rule throughout, and your code should too. A key missing from a
@@ -112,7 +115,7 @@ error enum, with one variant for each way, and the facts a user would
 need to fix the file:
 
 ```vole settings.vl
-use std::ParseIntError;
+use std::num::ParseIntError;
 
 enum ConfigError {
     MissingEquals(i64),
@@ -120,12 +123,12 @@ enum ConfigError {
     Unknown(i64),
 }
 
-enum Setting {
+enum Setting<'a> {
     Port(i64),
-    Name(str),
+    Name(&'a str),
 }
 
-fn parse_line(s: str, number: i64) -> Result<Setting, ConfigError> {
+fn parse_line(s: &str, number: i64) -> Result<Setting, ConfigError> {
     let Some((key, value)) = s.split_once("=") else {
         return Err(ConfigError::MissingEquals(number));
     };
@@ -143,7 +146,7 @@ fn parse_line(s: str, number: i64) -> Result<Setting, ConfigError> {
     }
 }
 
-fn report(line: str, number: i64) {
+fn report(line: &str, number: i64) {
     match parse_line(line, number) {
         Ok(Setting::Port(p)) => println("port {p}"),
         Ok(Setting::Name(n)) => println("name {n}"),
@@ -163,11 +166,13 @@ fn main() {
 
 ```out
 port 8080
-bad number: invalid digit at byte 2
+bad number: invalid digit found in string
 line 3: no '='
 line 4: unknown setting
 ```
 
+`Setting<'a>` has a lifetime, as `Command<'a>` had in chapter 5: a
+`Name` borrows its text from the line it was parsed from.
 `MissingEquals` and `Unknown` carry the line number. `BadNumber`
 carries the `ParseIntError` itself, so nothing about the failure is
 lost. And the `match` in `report` must handle every variant, so a caller
@@ -196,7 +201,7 @@ Put `?` after a `Result`, and:
 Here's `load` with it:
 
 <!-- vole-hidden
-use std::ParseIntError;
+use std::num::ParseIntError;
 
 enum ConfigError {
     MissingEquals(i64),
@@ -204,12 +209,12 @@ enum ConfigError {
     Unknown(i64),
 }
 
-enum Setting {
+enum Setting<'a> {
     Port(i64),
-    Name(str),
+    Name(&'a str),
 }
 
-fn parse_line(s: str, number: i64) -> Result<Setting, ConfigError> {
+fn parse_line(s: &str, number: i64) -> Result<Setting, ConfigError> {
     let Some((key, value)) = s.split_once("=") else {
         return Err(ConfigError::MissingEquals(number));
     };
@@ -228,11 +233,11 @@ fn parse_line(s: str, number: i64) -> Result<Setting, ConfigError> {
 }
 -->
 ```vole
-struct Config { port: i64, name: str }
+struct Config<'a> { port: i64, name: &'a str }
 
-fn load(text: str) -> Result<Config, ConfigError> {
-    var config = Config { port: 80, name: "unnamed" };
-    var number = 0;
+fn load(text: &str) -> Result<Config, ConfigError> {
+    let mut config = Config { port: 80, name: "unnamed" };
+    let mut number = 0;
     for line in text.lines() {
         number += 1;
         if line.trim() == "" {
@@ -284,7 +289,7 @@ Look back at `parse_line`. It still has a `match` to turn the
 there too? Let's try:
 
 ```vole
-use std::ParseIntError;
+use std::num::ParseIntError;
 
 enum ConfigError {
     MissingEquals(i64),
@@ -292,7 +297,7 @@ enum ConfigError {
     Unknown(i64),
 }
 
-fn parse_port(value: str) -> Result<i64, ConfigError> {
+fn parse_port(value: &str) -> Result<i64, ConfigError> {
     let port = value.parse::<i64>()?;
     Ok(port)
 }
@@ -317,7 +322,7 @@ tell it with an `impl From`, and the help line has written it out for
 you:
 
 <!-- vole-hidden
-use std::ParseIntError;
+use std::num::ParseIntError;
 
 enum ConfigError {
     MissingEquals(i64),
@@ -351,7 +356,7 @@ one place, convert by hand. `map_err` changes the error inside a
 error a `None` is:
 
 <!-- vole-hidden
-use std::ParseIntError;
+use std::num::ParseIntError;
 
 enum ConfigError {
     MissingEquals(i64),
@@ -359,13 +364,13 @@ enum ConfigError {
     Unknown(i64),
 }
 
-enum Setting {
+enum Setting<'a> {
     Port(i64),
-    Name(str),
+    Name(&'a str),
 }
 -->
 ```vole
-fn parse_port_line(s: str, number: i64) -> Result<Setting, ConfigError> {
+fn parse_port_line(s: &str, number: i64) -> Result<Setting, ConfigError> {
     let (key, value) = s.split_once("=").ok_or(ConfigError::MissingEquals(number))?;
     if key.trim() != "port" {
         return Err(ConfigError::Unknown(number));
@@ -384,8 +389,8 @@ the type needs `#[derive(Debug)]`, as in chapter 5. Here's the whole
 program, reading the settings from standard input:
 
 ```vole settings.vl
-use std::{ParseIntError, io};
-use std::io::BufReader;
+use std::io;
+use std::num::ParseIntError;
 
 #[derive(Debug)]
 enum ConfigError {
@@ -400,14 +405,14 @@ impl From<ParseIntError> for ConfigError {
     }
 }
 
-enum Setting {
+enum Setting<'a> {
     Port(i64),
-    Name(str),
+    Name(&'a str),
 }
 
-struct Config { port: i64, name: str }
+struct Config<'a> { port: i64, name: &'a str }
 
-fn parse_line(s: str, number: i64) -> Result<Setting, ConfigError> {
+fn parse_line(s: &str, number: i64) -> Result<Setting, ConfigError> {
     let Some((key, value)) = s.split_once("=") else {
         return Err(ConfigError::MissingEquals(number));
     };
@@ -422,9 +427,9 @@ fn parse_line(s: str, number: i64) -> Result<Setting, ConfigError> {
     }
 }
 
-fn load(text: str) -> Result<Config, ConfigError> {
-    var config = Config { port: 80, name: "unnamed" };
-    var number = 0;
+fn load(text: &str) -> Result<Config, ConfigError> {
+    let mut config = Config { port: 80, name: "unnamed" };
+    let mut number = 0;
     for line in text.lines() {
         number += 1;
         if line.trim() == "" {
@@ -439,16 +444,14 @@ fn load(text: str) -> Result<Config, ConfigError> {
 }
 
 fn main(gpa: Gpa) -> Result<(), ConfigError> {
-    var input = BufReader::new(io::stdin());
-    var text = String::new_in(gpa);
-    while input.read_line(&text).unwrap() > 0 {}
+    let mut text = String::new_in(gpa);
+    while io::stdin().read_line(&mut text).unwrap() > 0 {}
     let config = load(text.as_str())?;
     println("serving {} on port {}", config.name, config.port);
     Ok(())
 }
 ```
 
-The first `use` line imports two names from `std` at once.
 `read_line` adds each line to the end of `text`, so the empty `while`
 loop reads the whole input. (Reading can fail too; we `unwrap` it here,
 and the first exercise fixes that.) A good settings file:
@@ -469,7 +472,7 @@ And a few bad ones:
 $ volec settings.vl -o settings
 ok: built settings
 $ printf 'port = 80x80\n' | ./settings
-Error: BadNumber(InvalidDigit(2))
+Error: BadNumber(ParseIntError { kind: InvalidDigit })
 $ echo $?
 1
 $ printf 'name = vole\ncolour = red\n' | ./settings
@@ -504,11 +507,11 @@ thought impossible: those are bugs in the program. For them, vole
 status 101. You've seen panics already:
 
 ```vole port.vl
-fn port_of(value: str) -> i64 {
+fn port_of(value: &str) -> i64 {
     value.parse::<i64>().unwrap()
 }
 
-fn show(value: str) {
+fn show(value: &str) {
     println("port {}", port_of(value));
 }
 
@@ -520,11 +523,11 @@ fn main() {
 
 ```out exit=101
 port 8080
-port.vl:2:5: called unwrap on Err
+port.vl:2:5: called `Result::unwrap()` on an `Err` value: ParseIntError { kind: InvalidDigit }
 ```
 
-The line names the position of the failing call: line 2, the `unwrap`
-in `port_of`. When the function that failed is called from many
+The line names the position of the failing call (line 2, the `unwrap`
+in `port_of`) and what went wrong: an `unwrap` of an `Err`. When the function that failed is called from many
 places, you'll also want to know how the program got there. Build with
 `--trace`, and a panic prints the calls that led to it, innermost
 first:
@@ -534,7 +537,7 @@ $ volec port.vl -o port --trace
 ok: built port
 $ ./port
 port 8080
-port.vl:2:5: called unwrap on Err
+port.vl:2:5: called `Result::unwrap()` on an `Err` value: ParseIntError { kind: InvalidDigit }
 trace, innermost call first:
   port.vl:2  port_of
   port.vl:6  show
@@ -553,7 +556,7 @@ fn main() {
         1 => "odd",
         _ => unreachable(),
     };
-    println(parity);
+    println("{parity}");
 }
 ```
 
@@ -562,7 +565,7 @@ odd
 ```
 
 (The remainder of a positive number divided by 2 is 0 or 1, but the
-compiler only knows it's an `i64`, so the `match` needs the last arm.)
+compiler only knows it's an `i32`, so the `match` needs the last arm.)
 
 A panic is not a crash. Nothing goes on running in a broken state:
 vole checks, and stops cleanly at the first sign of trouble, before a

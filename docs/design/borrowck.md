@@ -381,9 +381,19 @@ kind `BK_MUT`, a two-phase autoref `&mut self` included) only if it is
   `mut r`); a deferred `let x;`'s first assignment is M7's, not this
   rule's;
 - `P.f`, `P[i]`, `P[k]` of an array, a variant's field: as `P`;
-- `*P` with `P: &mut T` (or an exclusive view `&mut [T]`): mutable
-  (it needs `P` uniquely reachable, which D2.5's loans check, not `P`
-  declared `mut`);
+- `*P` with `P: &mut T` (or an exclusive view `&mut [T]`): as `P`'s
+  own path, with the local allowed whether or not it is `mut`. (0.28.0:
+  0.27.2 to 0.27.8 said "mutable" here and stopped, so the path to the
+  `&mut` was never read: with `&self` and a field `v: &mut i64`,
+  `*self.v += 1` and `&mut *self.v` were accepted, and one `&G` gave
+  out any number of `&mut i64` to one value. rustc's `is_mutable`
+  recurses into the base of a `&mut` deref for exactly this: a `&mut`
+  is unique only if the way to it is. The walk now goes on past a
+  `&mut`; a `&T` or a shared view anywhere on the path makes the place
+  immutable (E0594 for a write, E0596 for a `&mut` borrow); when the
+  walk ends at the local, the place is mutable.) *Anchor:*
+  `places/borrowck/moves.vl: immutable_why`. *Cases:*
+  `rust_b_err_mut_behind_shared`, `rust_b_reborrow_result`;
 - `*P` with `P: &T` (or a shared view `[T]`, `&str`): **not** mutable;
 - `*P` with `P: *mut T`: mutable; with `P: *const T`: not (R1: what
   happens through it is `unsafe`'s, but rustc refuses the write to a
@@ -735,6 +745,65 @@ str>`, the opaque instance's `'b must outlive 'a` is reported, and not
 lifetime. A region-free instance is not held: the opaque instance
 reuses its verdict (b, d). *Anchor:* `places/borrowck/mod.vl:
 check_body, release_held`. *Case:* `rust_b_err_proj_item_bound`.
+0.28.0 adds (g): in a concrete instance, a violated `'u ⊒ 'v` with
+either side a substitution's universal is not reported. An instance has
+one universal per slot of each type argument, and which of them the
+caller wrote as one lifetime is not in them: in `v.iter().copied()
+.filter(|e| e.s == key)` the item's lifetime and the closure's
+parameter's are one in the caller, two in `Iterator::find`'s instance,
+where the item flows into the closure. rustc checks the template, where
+a type parameter has no region; the opaque instance (d) does the same
+here, and a flow between two parameters' types is an error there, as a
+type error or by a bound's equalities (D4.6 (d)). The instance's other
+errors (moves, a `&mut` through a `&`, a local returned) are reported
+as before. *Anchor:* `places/borrowck/solve.vl: substitution_pair`.
+*Case:* `rust_b_subst_adapter_regions`.
+
+*Why the template's check covers the instance (g).* Let `f<T₁..Tₙ>` be a
+template and `f<τ₁..τₙ>` an instance, with `Sub(Tᵢ)` the universals of
+`τᵢ`'s slots. Claim: if the opaque instance of `f` (each `Tᵢ` an Ω with
+no slots, D4.4 (d)) is clean, then every execution of the instance
+respects the lifetimes its caller gave it, whatever outlives relations
+hold among the `Sub(Tᵢ)`.
+1. *Parametricity.* The body of `f` is type-checked once per instance,
+   but against the same text. A value whose type is `Tᵢ`, or holds `Tᵢ`,
+   can reach a place of type `Tⱼ`, or one that holds `Tⱼ`, in three
+   ways only: `i = j` by the type's own identity; through a call whose
+   signature relates them (a bound's method, `P: FnMut(&I::Item)`, a
+   bound's equality `Extend<T>::extend<I: IntoIterator<Item = T>>`); or
+   through a concrete type the body names, which has no `Sub` region.
+   The checker refuses anything else as a type error in the opaque
+   instance, where `Tᵢ` and `Tⱼ` are distinct opaque types.
+2. *The first way needs no bound.* Every occurrence of `Tᵢ` has the same
+   universals (D4.4), so the flow is `'s ⊒ 's`.
+3. *The second way is the caller's obligation, and it was checked
+   there.* A call `g(x)` in the body, with `g`'s signature saying its
+   parameter is `&Tᵢ::Item` or `Tⱼ`, is well-typed in the instance only
+   because the caller's substitution made the two types equal: the
+   caller wrote one type for both, lifetimes included, and D3.6 checked
+   the call of `f` against `f`'s signature and where-clauses with the
+   caller's regions. Inside the instance the two sides are different
+   universals only because slots are numbered per type argument; in the
+   caller they are one region or regions the caller's own check related.
+   D4.6 (d) and (e) recover some of these equalities; (g) says the rest
+   are not this body's to refuse.
+4. *What (g) does not cover, and stays reported.* A violation between
+   two universals neither of which is a substitution's (named lifetimes,
+   elided inputs, `'static`: the template says the same and reports it,
+   D4.4 (e)); every error that is not an outlives between universals: a
+   loan that conflicts, a move, a `&mut` through a `&`, a local's
+   reference returned or stored (those read loans and paths, and
+   an instance can have them where the opaque one cannot: an `FnMut`
+   closure's captures behind `&F`, E0596).
+5. *The cost.* A flow from a named lifetime into a substitution's region
+   (`'a ⊒ 's`) is also left to the template. There it is a flow of a
+   `&'a X` into a `T`-typed place, which step 1 makes a type error unless
+   a bound says `T` is that reference type, and then D4.6 (d) ties the
+   regions. So no program is accepted by (g) that the opaque instance
+   and the caller's check together refuse. The two things assumed are
+   D3.6 (the call of `f` is checked against its signature in the caller)
+   and D4.4 (d) (every template has its opaque instance solved); std2's
+   are solved when the compiler is built (Z7).
 
 **D4.5 (implied and declared bounds; the order ⊒).** `⊒` is the least
 preorder on `U` containing: `'static ⊒ 'u` for every `'u`; every
@@ -1096,6 +1165,15 @@ unless named, at the access's statement.
   (`MaybeUninit` at the loop head by the back edge); the message adds
   "in a previous iteration of the loop" when the move's location is
   reachable from the use's.
+- (M8, 0.28.0) A read of a deferred `let y: T;` whose local has no move
+  path (a plain value: an integer, a reference, which M1's paths do not
+  follow) requires it assigned on every path to the read: a forward
+  dataflow of the deferred locals maybe unassigned, set at the local's
+  StorageLive, cleared by an assignment to it or to a part of it
+  (`borrowck.use_uninit`, rustc E0381 "used binding isn't
+  initialized"). Before it `let y: i64; println("{y}")` printed 0.
+  *Anchor:* `places/borrowck/moves.vl: unassigned_reads`. *Case:*
+  `rust_b_err_use_uninit`.
 - (M7) An assignment (`WA`) to a whole local `L` (`(L, 0)`) that is
   not `mut` (no `LF_MUT`) requires `¬MaybeInit(path(L), 2·loc)`: a
   deferred `let x;` / `let x: T;` is assigned once on every path
@@ -1605,6 +1683,7 @@ where a `try:` is named, a case in `tests/borrowck-try/NAME/main.vl`
 | `borrowck.use_moved` | M1, M5 | E0382 | `.clone()` when `Clone` (as `own.moved`'s) |
 | `borrowck.assign_moved_part` | M2 | E0381 | none |
 | `borrowck.assign_twice` | M7 | E0384 | `let mut x;` on the deferred declaration |
+| `borrowck.use_uninit` | M8 | E0381 | none |
 | `borrowck.assign_immutable` | D2.7 | E0594 | `let mut x` on the local; `&mut` in the reference's type |
 | `borrowck.borrow_immutable` | D2.7 | E0596 | as `assign_immutable`'s |
 | `borrowck.move_out` | M3 | E0507, E0508 | `.clone()`, or `&` the place (as `own.move_out`'s) |

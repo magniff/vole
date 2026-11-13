@@ -35,12 +35,14 @@ use crate::base::diag::{buf_file_line, report_error_once};
 use crate::front::ast::{CLOSURE_MOVE, NODE_CAPTURE, NODE_REF_MUT, NodeKind, child};
 use crate::front::closures::closure_of_type;
 use crate::front::effects::{EFF_RAW_GLOBAL, EFF_UNKNOWN, fn_effects};
-use crate::front::lexer::Tok;
-use crate::front::modules::within_std;
-use crate::front::own::kinds::{
+use crate::front::kinds::{
     P_MUT, P_MUT_VIEW, P_RAW, is_owned_type, is_plain_type, is_view_type, param_mode,
 };
-use crate::front::types::{ENUMS, REF_MUT, REF_SHARED, TyKind, buf_type, enum_variant, struct_field};
+use crate::front::lexer::Tok;
+use crate::front::modules::within_std;
+use crate::front::types::{
+    REF_MUT, REF_SHARED, TyKind, buf_type, enum_variant, get_enums, struct_field,
+};
 use crate::middle::lower::ssa::HMap;
 
 // Why a type fails (F_WHY), and where: the type holding the part (F_IN, a
@@ -58,7 +60,7 @@ const M_SEND: i64 = 0;
 const M_SEND_VIEWS: i64 = 1;
 const M_SYNC: i64 = 2;
 
-fn fail(why: i64, part: i64, thcx: inout ThreadsCx) -> bool {
+fn fail(why: i64, part: i64, thcx: &mut ThreadsCx) -> bool {
     if thcx.f_why == 0 {
         thcx.f_why = why;
         thcx.f_part = part;
@@ -67,28 +69,28 @@ fn fail(why: i64, part: i64, thcx: inout ThreadsCx) -> bool {
 }
 
 // The base name of std struct s (its template's), or "" outside std.
-pub fn std_name(s: i64, pcx: Ctx<Comp>) -> [u8] {
-    let t = if pcx.structs[s].tmpl != 0 { pcx.structs[s].tmpl - 1 } else { s };
-    if !within_std(pcx.structs[t].module, pcx) {
-        return "";
+pub fn std_name(s: i64, pcx: &Ctx<Comp>) -> &'static [u8] {
+    let t = if pcx.structs[s as usize].tmpl != 0 { pcx.structs[s as usize].tmpl - 1 } else { s };
+    if !within_std(pcx.structs[t as usize].module, pcx) {
+        return b"";
     }
-    sym_text(pcx.structs[t].name, pcx)
+    sym_text(pcx.structs[t as usize].name, pcx)
 }
 
 // std's types whose raw fields are their own business: Send (and Sync)
 // by their type arguments.
-pub fn vouched_container(name: [u8]) -> bool {
-    name == "Vec" || name == "Buf" || name == "HashMap" || name == "HashSet" || name == "BTreeMap"
-        || name == "BTreeSet" || name == "BinaryHeap" || name == "MinHeap" || name == "Sender"
-        || name == "Receiver"
+pub fn vouched_container(name: &[u8]) -> bool {
+    name == b"Vec" || name == b"Buf" || name == b"HashMap" || name == b"HashSet"
+        || name == b"BTreeMap" || name == b"BTreeSet" || name == b"BinaryHeap" || name == b"MinHeap"
+        || name == b"Sender" || name == b"Receiver"
 }
 
-fn targs_hold(s: i64, mode: i64, thcx: inout ThreadsCx, pcx: Ctx<Comp>) -> bool {
+fn targs_hold(s: i64, mode: i64, thcx: &mut ThreadsCx, pcx: &Ctx<Comp>) -> bool {
     unsafe {
-        for i in 0..pcx.structs[s].targ_count {
-            let a = pcx.tlists.data[pcx.structs[s].targs + i];
+        for i in 0..pcx.structs[s as usize].targ_count {
+            let a = (*pcx.tlists.data.add((pcx.structs[s as usize].targs + i) as usize));
             // (an allocator argument, Gpa: plain)
-            if !holds(a, mode, &thcx, pcx) {
+            if !holds(a, mode, thcx, pcx) {
                 return false;
             }
         }
@@ -98,7 +100,7 @@ fn targs_hold(s: i64, mode: i64, thcx: inout ThreadsCx, pcx: Ctx<Comp>) -> bool 
 
 // Whether type t holds the fact `mode` (M_SEND, M_SEND_VIEWS: Send, views
 // of Sync data allowed; M_SYNC).
-pub fn holds(t: i64, mode: i64, thcx: inout ThreadsCx, pcx: Ctx<Comp>) -> bool {
+pub fn holds(t: i64, mode: i64, thcx: &mut ThreadsCx, pcx: &Ctx<Comp>) -> bool {
     if t <= 0 {
         return true;
     }
@@ -109,71 +111,74 @@ pub fn holds(t: i64, mode: i64, thcx: inout ThreadsCx, pcx: Ctx<Comp>) -> bool {
     }
     if known == 2 {
         // (the reason was recorded the first time; record it again)
-        return decide(t, mode, &thcx, pcx);
+        return decide(t, mode, thcx, pcx);
     }
     thcx.memo.put(key, 3);
-    let ok = decide(t, mode, &thcx, pcx);
+    let ok = decide(t, mode, thcx, pcx);
     thcx.memo.put(key, if ok { 1 } else { 2 });
     ok
 }
 
-fn decide(t: i64, mode: i64, thcx: inout ThreadsCx, pcx: Ctx<Comp>) -> bool {
+fn decide(t: i64, mode: i64, thcx: &mut ThreadsCx, pcx: &Ctx<Comp>) -> bool {
     unsafe {
-        let kind = pcx.types[t].kind;
+        let kind = pcx.types[t as usize].kind;
         if kind == TyKind::Prim || kind == TyKind::Vector || kind == TyKind::None {
             return true;
         }
         if kind == TyKind::Fn {
-            return fail(W_FN, t, &thcx);
+            return fail(W_FN, t, thcx);
         }
         if kind == TyKind::Ptr {
-            let r = pcx.types[t].b;
+            let r = pcx.types[t as usize].b;
             if r != REF_SHARED && r != REF_MUT {
-                return fail(W_RAW, t, &thcx);
+                return fail(W_RAW, t, thcx);
             }
             if mode == M_SYNC {
-                return holds(pcx.types[t].a, M_SYNC, &thcx, pcx);
+                return holds(pcx.types[t as usize].a, M_SYNC, thcx, pcx);
             }
             if mode == M_SEND {
-                return fail(W_VIEW, t, &thcx);
+                return fail(W_VIEW, t, thcx);
             }
             if r == REF_MUT {
-                return fail(W_VIEW_MUT, t, &thcx);
+                return fail(W_VIEW_MUT, t, thcx);
             }
-            return holds(pcx.types[t].a, M_SYNC, &thcx, pcx);
+            return holds(pcx.types[t as usize].a, M_SYNC, thcx, pcx);
         }
         if kind == TyKind::Slice {
             if mode == M_SYNC {
-                return holds(pcx.types[t].a, M_SYNC, &thcx, pcx);
+                return holds(pcx.types[t as usize].a, M_SYNC, thcx, pcx);
             }
             if mode == M_SEND {
-                return fail(W_VIEW, t, &thcx);
+                return fail(W_VIEW, t, thcx);
             }
-            if pcx.types[t].b == REF_MUT {
-                return fail(W_VIEW_MUT, t, &thcx);
+            if pcx.types[t as usize].b == REF_MUT {
+                return fail(W_VIEW_MUT, t, thcx);
             }
-            return holds(pcx.types[t].a, M_SYNC, &thcx, pcx);
+            return holds(pcx.types[t as usize].a, M_SYNC, thcx, pcx);
         }
         if kind == TyKind::Array {
-            return holds(pcx.types[t].a, mode, &thcx, pcx);
+            return holds(pcx.types[t as usize].a, mode, thcx, pcx);
         }
         if kind == TyKind::Distinct {
-            return holds(pcx.types[t].a, mode, &thcx, pcx);
+            return holds(pcx.types[t as usize].a, mode, thcx, pcx);
         }
         if kind == TyKind::Tuple {
-            for i in 0..pcx.types[t].count {
-                if !holds(pcx.tlists.data[pcx.types[t].list + i], mode, &thcx, pcx) {
+            for i in 0..pcx.types[t as usize].count {
+                if !holds((*pcx.tlists.data.add((pcx.types[t as usize].list + i) as usize)), mode,
+                    thcx, pcx) {
                     return false;
                 }
             }
             return true;
         }
         if kind == TyKind::Enum {
-            let e = pcx.types[t].a;
-            for i in 0..ENUMS[e].variant_count {
+            let e = pcx.types[t as usize].a;
+            for i in 0..(*get_enums().add(e as usize)).variant_count {
                 let v = enum_variant(e, i);
-                for k in 0..pcx.variants[v].field_count {
-                    if !holds(pcx.tlists.data[pcx.variants[v].fields + k], mode, &thcx, pcx) {
+                for k in 0..pcx.variants[v as usize].field_count {
+                    if !holds(
+                        (*pcx.tlists.data.add((pcx.variants[v as usize].fields + k) as usize)),
+                        mode, thcx, pcx) {
                         return false;
                     }
                 }
@@ -183,31 +188,32 @@ fn decide(t: i64, mode: i64, thcx: inout ThreadsCx, pcx: Ctx<Comp>) -> bool {
         if kind != TyKind::Struct {
             return true;
         }
-        let s = pcx.types[t].a;
+        let s = pcx.types[t as usize].a;
         if crate::front::cells::is_unsafe_cell_struct(s, pcx) {
             // (0.26.1: the negative leaf; Cell and what holds one follow
             // structurally)
             if mode == M_SYNC {
-                return fail(W_CELL, t, &thcx);
+                return fail(W_CELL, t, thcx);
             }
-            return targs_hold(s, mode, &thcx, pcx);
+            return targs_hold(s, mode, thcx, pcx);
         }
         let name = std_name(s, pcx);
         // (0.26.1: PrintCell, std::fmt's print state, which FMT_LOCK guards)
-        if name == "Atomic" || name == "RawLock" || name == "JoinHandle" || name == "PrintCell" {
+        if name == b"Atomic" || name == b"RawLock" || name == b"JoinHandle"
+            || name == b"PrintCell" {
             return true;
         }
-        if name == "Mutex" {
+        if name == b"Mutex" {
             // (Sync and Send when its data may move)
-            return targs_hold(s, M_SEND, &thcx, pcx);
+            return targs_hold(s, M_SEND, thcx, pcx);
         }
         if vouched_container(name) {
-            return targs_hold(s, mode, &thcx, pcx);
+            return targs_hold(s, mode, thcx, pcx);
         }
-        for i in 0..pcx.structs[s].field_count {
+        for i in 0..pcx.structs[s as usize].field_count {
             let f = struct_field(s, i, pcx);
             let before = thcx.f_why;
-            if !holds((*f).ty, mode, &thcx, pcx) {
+            if !holds((*f).ty, mode, thcx, pcx) {
                 if before == 0 && thcx.f_in == 0 {
                     thcx.f_in = t;
                     thcx.f_field = (*f).name;
@@ -219,7 +225,7 @@ fn decide(t: i64, mode: i64, thcx: inout ThreadsCx, pcx: Ctx<Comp>) -> bool {
     }
 }
 
-fn reset_fault(thcx: inout ThreadsCx) {
+fn reset_fault(thcx: &mut ThreadsCx) {
     thcx.f_why = 0;
     thcx.f_in = 0;
     thcx.f_field = 0;
@@ -228,12 +234,12 @@ fn reset_fault(thcx: inout ThreadsCx) {
 
 // ---- Diagnostics ----
 
-fn local_name(l: i64, pcx: Ctx<Comp>) -> [u8] {
-    sym_text(pcx.locals[l].name, pcx)
+fn local_name(l: i64, pcx: &Ctx<Comp>) -> &'static [u8] {
+    sym_text(pcx.locals[l as usize].name, pcx)
 }
 
 // Appends the reason a type failed, from F_*.
-fn buf_reason(out: i64, t: i64, thcx: ThreadsCx, pcx: Ctx<Comp>) {
+fn buf_reason(out: i64, t: i64, thcx: &ThreadsCx, pcx: &Ctx<Comp>) {
     buf_type(out, t, pcx);
     if thcx.f_in != 0 && thcx.f_in != t {
         buf_str(out, c" holds ");
@@ -268,18 +274,19 @@ fn buf_reason(out: i64, t: i64, thcx: ThreadsCx, pcx: Ctx<Comp>) {
     }
 }
 
-fn report(pos: i64, code: *u8, msg: i64, help: i64, pcx: inout Ctx<Comp>) {
+fn report(pos: i64, code: *mut u8, msg: i64, help: i64, pcx: &mut Ctx<Comp>) {
     buf_byte(msg, 0);
     buf_byte(help, 0);
-    report_error_once(pos, 3000, code, buf_slice(msg).ptr, buf_slice(help).ptr, "", &pcx);
+    report_error_once(pos, 3000, code, buf_slice(msg).ptr, buf_slice(help).ptr, b"", pcx);
 }
 
 // ---- The checks ----
 
-fn find_std_fn(text: [u8], pcx: Ctx<Comp>) -> i64 {
+fn find_std_fn(text: &[u8], pcx: &Ctx<Comp>) -> i64 {
     for f in 0..pcx.fns.len() as i64 {
-        if pcx.fns[f].tmpl == 0 && pcx.fns[f].generic != 0 && within_std(pcx.fns[f].module, pcx)
-            && sym_text(pcx.fns[f].name, pcx) == text {
+        if pcx.fns[f as usize].tmpl == 0 && pcx.fns[f as usize].generic != 0
+            && within_std(pcx.fns[f as usize].module, pcx)
+            && sym_text(pcx.fns[f as usize].name, pcx) == text {
             return f;
         }
     }
@@ -288,12 +295,12 @@ fn find_std_fn(text: [u8], pcx: Ctx<Comp>) -> i64 {
 
 // The thread functions' templates, found once: thread::spawn (std2's
 // spawn_in), thread::scope and Scope::spawn.
-fn find_thread_fns(thcx: inout ThreadsCx, pcx: Ctx<Comp>) {
+fn find_thread_fns(thcx: &mut ThreadsCx, pcx: &Ctx<Comp>) {
     if thcx.spawn_fn == -2 {
-        thcx.spawn_fn = find_std_fn(if crate::front::known::on_std2(pcx) { "std.thread.spawn_in" }
-            else { "std.thread.spawn" }, pcx);
-        thcx.scope_fn = find_std_fn("std.thread.scope", pcx);
-        thcx.scope_spawn_fn = find_std_fn("std.thread.Scope.spawn", pcx);
+        thcx.spawn_fn = find_std_fn(if crate::front::known::on_std2(pcx) { b"std.thread.spawn_in" }
+            else { b"std.thread.spawn" }, pcx);
+        thcx.scope_fn = find_std_fn(b"std.thread.scope", pcx);
+        thcx.scope_spawn_fn = find_std_fn(b"std.thread.Scope.spawn", pcx);
     }
 }
 
@@ -301,57 +308,58 @@ fn find_thread_fns(thcx: inout ThreadsCx, pcx: Ctx<Comp>) {
 // Scope::spawn): its bounds (`F: Send + 'scope`, AT3) and the borrow
 // checker decide what it may borrow and change; what is left of 0.21's
 // checks is the shared-static rule.
-fn check_std2_thread(f: i64, name: *u8, pcx: inout Ctx<Comp>) {
+fn check_std2_thread(f: i64, name: *mut u8, pcx: &mut Ctx<Comp>) {
     // UNSAFE: TLISTS is the checker's raw table of type lists.
     // SAFETY: f is an instance with at least one type argument (its F), at targs.
-    let c = closure_id(unsafe { pcx.tlists.data[pcx.fns[f].targs] }, pcx);
+    let c = closure_id(unsafe { (*pcx.tlists.data.add(pcx.fns[f as usize].targs as usize)) }, pcx);
     if c >= 0 && reaches_static(c, pcx) {
-        report_static(call_pos(f, pcx), name, &pcx);
+        report_static(call_pos(f, pcx), name, pcx);
     }
 }
 
-pub fn check_threads(thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
+pub fn check_threads(thcx: &mut ThreadsCx, pcx: &mut Ctx<Comp>) {
     unsafe {
-        find_thread_fns(&thcx, pcx);
+        find_thread_fns(thcx, pcx);
         let std2 = crate::front::known::on_std2(pcx);
         if thcx.spawn_fn < 0 && thcx.scope_fn < 0 {
             return;
         }
         thcx.scope_closures.count = 0;
         for f in 0..pcx.fns.len() as i64 {
-            if pcx.fns[f].tmpl != 0 && pcx.fns[f].tmpl - 1 == thcx.scope_fn {
-                let c = closure_id(pcx.tlists.data[pcx.fns[f].targs], pcx);
+            if pcx.fns[f as usize].tmpl != 0 && pcx.fns[f as usize].tmpl - 1 == thcx.scope_fn {
+                let c = closure_id((*pcx.tlists.data.add(pcx.fns[f as usize].targs as usize)), pcx);
                 if c >= 0 {
                     thcx.scope_closures.push(c);
                 }
             }
         }
         for f in 0..pcx.fns.len() as i64 {
-            if pcx.fns[f].tmpl == 0 || pcx.fns[f].targ_count < 2 {
+            if pcx.fns[f as usize].tmpl == 0 || pcx.fns[f as usize].targ_count < 2 {
                 continue;
             }
-            let t = pcx.fns[f].tmpl - 1;
+            let t = pcx.fns[f as usize].tmpl - 1;
             // (std's generics checked alone, with error types: no call)
-            if pcx.fns[f].origin <= 0 || pcx.tlists.data[pcx.fns[f].targs] == pcx.ty_error {
+            if pcx.fns[f as usize].origin <= 0
+                || (*pcx.tlists.data.add(pcx.fns[f as usize].targs as usize)) == pcx.ty_error {
                 continue;
             }
             // (std's own calls: Scope::spawn's of spawn)
-            let p = pcx.fns[f].parent - 1;
-            if p >= 0 && within_std(pcx.fns[p].module, pcx) {
+            let p = pcx.fns[f as usize].parent - 1;
+            if p >= 0 && within_std(pcx.fns[p as usize].module, pcx) {
                 continue;
             }
             if std2 {
                 if t == thcx.spawn_fn {
-                    check_std2_thread(f, c"'thread::spawn_in'", &pcx);
+                    check_std2_thread(f, c"'thread::spawn_in'", pcx);
                 } else if t == thcx.scope_spawn_fn {
-                    check_std2_thread(f, c"'s.spawn'", &pcx);
+                    check_std2_thread(f, c"'s.spawn'", pcx);
                 }
             } else if t == thcx.spawn_fn {
-                check_spawn(f, &thcx, &pcx);
+                check_spawn(f, thcx, pcx);
             } else if t == thcx.scope_fn {
-                check_scope(f, &thcx, &pcx);
+                check_scope(f, thcx, pcx);
             } else if t == thcx.scope_spawn_fn {
-                check_scoped_spawn(f, &thcx, &pcx);
+                check_scoped_spawn(f, thcx, pcx);
             }
         }
     }
@@ -359,54 +367,55 @@ pub fn check_threads(thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
 
 // Whether the program starts a thread (an instance of thread::spawn or
 // thread::scope): then the effects are inferred for the checks.
-pub fn uses_threads(thcx: inout ThreadsCx, pcx: Ctx<Comp>) -> bool {
-    find_thread_fns(&thcx, pcx);
+pub fn uses_threads(thcx: &mut ThreadsCx, pcx: &Ctx<Comp>) -> bool {
+    find_thread_fns(thcx, pcx);
     if thcx.spawn_fn < 0 && thcx.scope_fn < 0 {
         return false;
     }
     for f in 0..pcx.fns.len() as i64 {
-        if pcx.fns[f].tmpl != 0
-            && (pcx.fns[f].tmpl - 1 == thcx.spawn_fn || pcx.fns[f].tmpl - 1 == thcx.scope_fn) {
+        if pcx.fns[f as usize].tmpl != 0
+            && (pcx.fns[f as usize].tmpl - 1 == thcx.spawn_fn
+                || pcx.fns[f as usize].tmpl - 1 == thcx.scope_fn) {
             return true;
         }
     }
     false
 }
 
-fn call_pos(f: i64, pcx: Ctx<Comp>) -> i64 {
-    let o = pcx.fns[f].origin;
-    if o > 0 { pcx.nodes[o].start } else { 0 }
+fn call_pos(f: i64, pcx: &Ctx<Comp>) -> i64 {
+    let o = pcx.fns[f as usize].origin;
+    if o > 0 { pcx.nodes[o as usize].start } else { 0 }
 }
 
 // The closure (its id) whose type t is, or -1.
-fn closure_id(t: i64, pcx: Ctx<Comp>) -> i64 {
+fn closure_id(t: i64, pcx: &Ctx<Comp>) -> i64 {
     closure_of_type(t, pcx) - 1
 }
 
 // Whether closure c's body (its function's), with what it calls, reaches
 // a static mut.
-fn reaches_static(c: i64, pcx: Ctx<Comp>) -> bool {
-    let e = fn_effects(pcx.closures[c].f, pcx);
+fn reaches_static(c: i64, pcx: &Ctx<Comp>) -> bool {
+    let e = fn_effects(pcx.closures[c as usize].f, pcx);
     (e.bits & EFF_RAW_GLOBAL) != 0 && (e.bits & EFF_UNKNOWN) == 0
 }
 
-fn report_static(pos: i64, what: *u8, pcx: inout Ctx<Comp>) {
+fn report_static(pos: i64, what: *mut u8, pcx: &mut Ctx<Comp>) {
     let msg = buf_new();
     let help = buf_new();
     buf_str(msg, what);
     buf_str(msg, c" runs a closure on another thread, but it reaches a static var (its effects have `global`): a static var is for the main thread");
     buf_str(help, c"make the static an atomic or a Mutex, not `var` (`static N: AtomicI64 = AtomicI64 { v: 0 };`), a #[thread_local], or pass the data in | try: volec query effects ");
-    buf_file_line(help, pos, &pcx);
+    buf_file_line(help, pos, pcx);
     buf_str(help, c" --why global");
-    report(pos, c"sync.global", msg, help, &pcx);
+    report(pos, c"sync.global", msg, help, pcx);
 }
 
 // thread::spawn(f).
-fn check_spawn(f: i64, thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
+fn check_spawn(f: i64, thcx: &mut ThreadsCx, pcx: &mut Ctx<Comp>) {
     unsafe {
         let pos = call_pos(f, pcx);
-        let ft = pcx.tlists.data[pcx.fns[f].targs];
-        let rt = pcx.tlists.data[pcx.fns[f].targs + 1];
+        let ft = (*pcx.tlists.data.add(pcx.fns[f as usize].targs as usize));
+        let rt = (*pcx.tlists.data.add((pcx.fns[f as usize].targs + 1) as usize));
         let c = closure_id(ft, pcx);
         if c < 0 {
             let msg = buf_new();
@@ -414,14 +423,15 @@ fn check_spawn(f: i64, thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
             buf_str(msg, c"'thread::spawn' takes a closure written at the call, not ");
             buf_type(msg, ft, pcx);
             buf_str(help, c"wrap the function: `thread::spawn(sink || work(x))`");
-            report(pos, c"sync.spawn_closure", msg, help, &pcx);
+            report(pos, c"sync.spawn_closure", msg, help, pcx);
             return;
         }
-        let moving = (pcx.nodes[pcx.closures[c].node].c & CLOSURE_MOVE) != 0;
-        for k in 0..pcx.closures[c].capture_count {
-            let l = pcx.capture_list.data[pcx.closures[c].captures + 2 * k];
-            let t = pcx.locals[l].ty;
-            reset_fault(&thcx);
+        let moving = (pcx.nodes[pcx.closures[c as usize].node as usize].c & CLOSURE_MOVE) != 0;
+        for k in 0..pcx.closures[c as usize].capture_count {
+            let l = (
+                *pcx.capture_list.data.add((pcx.closures[c as usize].captures + 2 * k) as usize));
+            let t = pcx.locals[l as usize].ty;
+            reset_fault(thcx);
             if !moving {
                 let msg = buf_new();
                 let help = buf_new();
@@ -429,18 +439,18 @@ fn check_spawn(f: i64, thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
                 buf_bytes(msg, local_name(l, pcx));
                 buf_str(msg, c"', but the thread may outlive it");
                 buf_str(help, c"move it into the thread (`sink ||`), or start the thread in thread::scope, which ends before it does | try: volec edit patch ");
-                buf_file_line(help, pos, &pcx);
+                buf_file_line(help, pos, pcx);
                 buf_str(help, c" --old 'spawn(||' --new 'spawn(sink ||'");
-                report(pos, c"sync.borrow_escapes", msg, help, &pcx);
+                report(pos, c"sync.borrow_escapes", msg, help, pcx);
                 return;
             }
-            if !holds(t, M_SEND, &thcx, pcx) {
-                spawn_fault(pos, l, t, thcx, &pcx);
+            if !holds(t, M_SEND, thcx, pcx) {
+                spawn_fault(pos, l, t, thcx, pcx);
                 return;
             }
         }
-        reset_fault(&thcx);
-        if !holds(rt, M_SEND, &thcx, pcx) {
+        reset_fault(thcx);
+        if !holds(rt, M_SEND, thcx, pcx) {
             let msg = buf_new();
             let help = buf_new();
             buf_str(msg, c"the thread's result, ");
@@ -449,16 +459,16 @@ fn check_spawn(f: i64, thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
             buf_str(help, c"return an owned value (a Buf, a Vec), or use thread::scope");
             report(pos,
                 if thcx.f_why == W_VIEW || thcx.f_why == W_VIEW_MUT { c"sync.borrow_escapes" }
-                else { c"sync.not_send" }, msg, help, &pcx);
+                else { c"sync.not_send" }, msg, help, pcx);
             return;
         }
         if reaches_static(c, pcx) {
-            report_static(pos, c"'thread::spawn'", &pcx);
+            report_static(pos, c"'thread::spawn'", pcx);
         }
     }
 }
 
-fn spawn_fault(pos: i64, l: i64, t: i64, thcx: ThreadsCx, pcx: inout Ctx<Comp>) {
+fn spawn_fault(pos: i64, l: i64, t: i64, thcx: &ThreadsCx, pcx: &mut Ctx<Comp>) {
     let msg = buf_new();
     let help = buf_new();
     let view = thcx.f_why == W_VIEW || thcx.f_why == W_VIEW_MUT;
@@ -469,7 +479,7 @@ fn spawn_fault(pos: i64, l: i64, t: i64, thcx: ThreadsCx, pcx: inout Ctx<Comp>) 
     if view {
         buf_str(msg, c") to a thread that may outlive what it views");
         buf_str(help, c"give the thread an owned copy (`.to_vec_in(gpa)`, a Buf), or start it in thread::scope, which ends before the data does");
-        report(pos, c"sync.borrow_escapes", msg, help, &pcx);
+        report(pos, c"sync.borrow_escapes", msg, help, pcx);
     } else {
         buf_str(msg, c") to another thread, which may alias memory this one still uses");
         buf_str(help, c"hold the data in std's owned containers (Vec, Buf, HashMap), or share it in thread::scope, through a Mutex or an atomic");
@@ -477,7 +487,7 @@ fn spawn_fault(pos: i64, l: i64, t: i64, thcx: ThreadsCx, pcx: inout Ctx<Comp>) 
             buf_str(help, c" | try: volec query def ");
             buf_type(help, thcx.f_in, pcx);
         }
-        report(pos, c"sync.not_send", msg, help, &pcx);
+        report(pos, c"sync.not_send", msg, help, pcx);
     }
 }
 
@@ -485,78 +495,81 @@ fn spawn_fault(pos: i64, l: i64, t: i64, thcx: ThreadsCx, pcx: inout Ctx<Comp>) 
 // before `mark` that it captured by reference (0: none): an assignment to
 // it or a part of it, a `&mut` (or raw) borrow of it, a call taking it as
 // a `&mut` or raw argument; the closures inside n too.
-fn capture_write(n: i64, mark: i64, thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) -> i64 {
+fn capture_write(n: i64, mark: i64, thcx: &mut ThreadsCx, pcx: &mut Ctx<Comp>) -> i64 {
     unsafe {
         if n == 0 {
             return 0;
         }
-        let k = pcx.nodes[n].kind;
+        let k = pcx.nodes[n as usize].kind;
         if k == NodeKind::Assign {
-            if written(captured_root(pcx.nodes[n].b, &pcx), mark, thcx) {
+            if written(captured_root(pcx.nodes[n as usize].b, pcx), mark, thcx) {
                 return n;
             }
             // (`v.as_mut_slice()[i] = x`: the call making the target)
-            let wt = capture_write(pcx.nodes[n].b, mark, &thcx, &pcx);
+            let wt = capture_write(pcx.nodes[n as usize].b, mark, thcx, pcx);
             if wt != 0 {
                 return wt;
             }
-            let w = capture_write(pcx.nodes[n].c, mark, &thcx, &pcx);
+            let w = capture_write(pcx.nodes[n as usize].c, mark, thcx, pcx);
             if w != 0 {
                 return w;
             }
-            if pcx.nodes[pcx.nodes[n].b].kind == NodeKind::Index {
-                return capture_write(pcx.nodes[pcx.nodes[n].b].b, mark, &thcx, &pcx);
+            if pcx.nodes[pcx.nodes[n as usize].b as usize].kind == NodeKind::Index {
+                return capture_write(pcx.nodes[pcx.nodes[n as usize].b as usize].b, mark, thcx,
+                    pcx);
             }
             return 0;
         }
-        if k == NodeKind::Unary && pcx.nodes[n].op == Tok::Amp {
-            let t = pcx.nodes[n].ty;
+        if k == NodeKind::Unary && pcx.nodes[n as usize].op == Tok::Amp {
+            let t = pcx.nodes[n as usize].ty;
             let exclusive = t > 0
-                && (pcx.types[t].kind == TyKind::Ptr || pcx.types[t].kind == TyKind::Slice)
-                && pcx.types[t].b != REF_SHARED;
-            if exclusive && written(captured_root(pcx.nodes[n].b, &pcx), mark, thcx) {
+                && (pcx.types[t as usize].kind == TyKind::Ptr
+                    || pcx.types[t as usize].kind == TyKind::Slice)
+                && pcx.types[t as usize].b != REF_SHARED;
+            if exclusive && written(captured_root(pcx.nodes[n as usize].b, pcx), mark, thcx) {
                 return n;
             }
-            return capture_write(pcx.nodes[n].b, mark, &thcx, &pcx);
+            return capture_write(pcx.nodes[n as usize].b, mark, thcx, pcx);
         }
         if k == NodeKind::Call || k == NodeKind::MethodCall {
-            let f = pcx.nodes[n].x - 1;
-            for i in 0..pcx.nodes[n].count {
+            let f = pcx.nodes[n as usize].x - 1;
+            for i in 0..pcx.nodes[n as usize].count {
                 let a = child(n, i, pcx);
-                if f >= 0 && i < pcx.fns[f].param_count {
+                if f >= 0 && i < pcx.fns[f as usize].param_count {
                     // (`&place`, `&a[..]`, a coerced `&v`, an array or a
                     // slice receiver of an inout method, `a.sort()`, an
                     // access passed on)
                     let m = param_mode(f, i, pcx);
-                    let amp = pcx.nodes[a].kind == NodeKind::Unary && pcx.nodes[a].op == Tok::Amp;
+                    let amp = pcx.nodes[a as usize].kind == NodeKind::Unary
+                        && pcx.nodes[a as usize].op == Tok::Amp;
                     if (m == P_MUT || m == P_MUT_VIEW || m == P_RAW && amp)
-                        && written(captured_root(a, &pcx), mark, thcx) {
+                        && written(captured_root(a, pcx), mark, thcx) {
                         return a;
                     }
                 }
-                let w = capture_write(a, mark, &thcx, &pcx);
+                let w = capture_write(a, mark, thcx, pcx);
                 if w != 0 {
                     return w;
                 }
             }
             if k == NodeKind::MethodCall || f < 0 {
-                return capture_write(pcx.nodes[n].a, mark, &thcx, &pcx);
+                return capture_write(pcx.nodes[n as usize].a, mark, thcx, pcx);
             }
             return 0;
         }
         if k == NodeKind::Block {
-            for i in 0..pcx.nodes[n].count {
-                let w = capture_write(child(n, i, pcx), mark, &thcx, &pcx);
+            for i in 0..pcx.nodes[n as usize].count {
+                let w = capture_write(child(n, i, pcx), mark, thcx, pcx);
                 if w != 0 {
                     return w;
                 }
             }
-            return capture_write(pcx.nodes[n].a, mark, &thcx, &pcx);
+            return capture_write(pcx.nodes[n as usize].a, mark, thcx, pcx);
         }
         if k == NodeKind::Tuple || k == NodeKind::Array || k == NodeKind::StructLit
             || k == NodeKind::VariantLit {
-            for i in 0..pcx.nodes[n].count {
-                let w = capture_write(child(n, i, pcx), mark, &thcx, &pcx);
+            for i in 0..pcx.nodes[n as usize].count {
+                let w = capture_write(child(n, i, pcx), mark, thcx, pcx);
                 if w != 0 {
                     return w;
                 }
@@ -564,17 +577,17 @@ fn capture_write(n: i64, mark: i64, thcx: inout ThreadsCx, pcx: inout Ctx<Comp>)
             return 0;
         }
         if k == NodeKind::Match {
-            let w = capture_write(pcx.nodes[n].a, mark, &thcx, &pcx);
+            let w = capture_write(pcx.nodes[n as usize].a, mark, thcx, pcx);
             if w != 0 {
                 return w;
             }
-            for i in 0..pcx.nodes[n].count {
+            for i in 0..pcx.nodes[n as usize].count {
                 let arm = child(n, i, pcx);
-                let w2 = capture_write(pcx.nodes[arm].b, mark, &thcx, &pcx);
+                let w2 = capture_write(pcx.nodes[arm as usize].b, mark, thcx, pcx);
                 if w2 != 0 {
                     return w2;
                 }
-                let w3 = capture_write(pcx.nodes[arm].c, mark, &thcx, &pcx);
+                let w3 = capture_write(pcx.nodes[arm as usize].c, mark, thcx, pcx);
                 if w3 != 0 {
                     return w3;
                 }
@@ -582,33 +595,33 @@ fn capture_write(n: i64, mark: i64, thcx: inout ThreadsCx, pcx: inout Ctx<Comp>)
             return 0;
         }
         if k == NodeKind::For {
-            let w = capture_write(pcx.nodes[n].c, mark, &thcx, &pcx);
+            let w = capture_write(pcx.nodes[n as usize].c, mark, thcx, pcx);
             if w != 0 {
                 return w;
             }
-            return capture_write(pcx.nodes[n].d, mark, &thcx, &pcx);
+            return capture_write(pcx.nodes[n as usize].d, mark, thcx, pcx);
         }
         if k == NodeKind::Closure {
             // (its env takes the captured variables' addresses: no write;
             // its body may write them)
-            let id = closure_id(pcx.nodes[n].ty, pcx);
+            let id = closure_id(pcx.nodes[n as usize].ty, pcx);
             // (once per closure: after an error, a closure's type may be the
             // one being scanned, whose body holds n)
             if id < 0 {
                 return 0;
             }
             for i in 0..thcx.cw_stack.count {
-                if thcx.cw_stack.data[i] == id {
+                if (*thcx.cw_stack.data.add(i as usize)) == id {
                     return 0;
                 }
             }
             thcx.cw_stack.push(id);
-            let w = capture_write(body_of(id, pcx), mark, &thcx, &pcx);
+            let w = capture_write(body_of(id, pcx), mark, thcx, pcx);
             thcx.cw_stack.count -= 1;
             return w;
         }
         if k == NodeKind::Try || k == NodeKind::Interp {
-            return capture_write(pcx.nodes[n].y, mark, &thcx, &pcx);
+            return capture_write(pcx.nodes[n as usize].y, mark, thcx, pcx);
         }
         // (a Path left unresolved after an error, `Ordering::Relaxed` with no
         // `use`: its a and b are symbols, not nodes)
@@ -617,47 +630,47 @@ fn capture_write(n: i64, mark: i64, thcx: inout ThreadsCx, pcx: inout Ctx<Comp>)
             || k == NodeKind::Bool || k == NodeKind::Char || k == NodeKind::Float {
             return 0;
         }
-        var w = 0;
+        let mut w: i64 = 0;
         if k == NodeKind::Binary || k == NodeKind::While || k == NodeKind::If {
             if k == NodeKind::If {
-                w = capture_write(pcx.nodes[n].a, mark, &thcx, &pcx);
+                w = capture_write(pcx.nodes[n as usize].a, mark, thcx, pcx);
             }
             if w == 0 {
-                w = capture_write(pcx.nodes[n].b, mark, &thcx, &pcx);
+                w = capture_write(pcx.nodes[n as usize].b, mark, thcx, pcx);
             }
             if w == 0 {
-                w = capture_write(pcx.nodes[n].c, mark, &thcx, &pcx);
+                w = capture_write(pcx.nodes[n as usize].c, mark, thcx, pcx);
             }
             return w;
         }
         if k == NodeKind::Let {
-            return capture_write(pcx.nodes[n].c, mark, &thcx, &pcx);
+            return capture_write(pcx.nodes[n as usize].c, mark, thcx, pcx);
         }
         if k == NodeKind::Loop || k == NodeKind::FieldInit || k == NodeKind::Break
             || k == NodeKind::Unary {
-            return capture_write(pcx.nodes[n].b, mark, &thcx, &pcx);
+            return capture_write(pcx.nodes[n as usize].b, mark, thcx, pcx);
         }
-        if k == NodeKind::Index && (pcx.nodes[n].p & NODE_REF_MUT) != 0
-            && written(captured_root(pcx.nodes[n].a, &pcx), mark, thcx) {
+        if k == NodeKind::Index && (pcx.nodes[n as usize].p & NODE_REF_MUT) != 0
+            && written(captured_root(pcx.nodes[n as usize].a, pcx), mark, thcx) {
             // an exclusive slicing of it, `&a[..]`, `&v[i..j]` (what an inout
             // `[T]` is given; `&v` for a Vec, a Buf or an array becomes `&v[..]`)
             return n;
         }
         if k == NodeKind::Index || k == NodeKind::Repeat || k == NodeKind::Range {
-            w = capture_write(pcx.nodes[n].a, mark, &thcx, &pcx);
+            w = capture_write(pcx.nodes[n as usize].a, mark, thcx, pcx);
             if w == 0 {
-                w = capture_write(pcx.nodes[n].b, mark, &thcx, &pcx);
+                w = capture_write(pcx.nodes[n as usize].b, mark, thcx, pcx);
             }
             return w;
         }
-        capture_write(pcx.nodes[n].a, mark, &thcx, &pcx)
+        capture_write(pcx.nodes[n as usize].a, mark, thcx, pcx)
     }
 }
 
 // Whether local l (captured_root's) is one of the variables checked:
 // declared before `mark`, and, while SHARED_ONLY is set (a scope's own
 // body), one its threads share (SHARED).
-fn written(l: i64, mark: i64, thcx: ThreadsCx) -> bool {
+fn written(l: i64, mark: i64, thcx: &ThreadsCx) -> bool {
     unsafe {
         if l < 0 || l >= mark {
             return false;
@@ -666,7 +679,7 @@ fn written(l: i64, mark: i64, thcx: ThreadsCx) -> bool {
             return true;
         }
         for i in 0..thcx.shared.count {
-            if thcx.shared.data[i] == l {
+            if (*thcx.shared.data.add(i as usize)) == l {
                 return true;
             }
         }
@@ -676,27 +689,30 @@ fn written(l: i64, mark: i64, thcx: ThreadsCx) -> bool {
 
 // Adds closure g's captures to SHARED; false when one is a view (what it
 // views is not known here: then every write counts).
-fn share_captures(g: i64, depth: i64, thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) -> bool {
+fn share_captures(g: i64, depth: i64, thcx: &mut ThreadsCx, pcx: &mut Ctx<Comp>) -> bool {
     unsafe {
         if depth > 8 {
             return false;
         }
-        for k in 0..pcx.closures[g].capture_count {
-            let l = pcx.capture_list.data[pcx.closures[g].captures + 2 * k];
-            let by_ref = pcx.capture_list.data[pcx.closures[g].captures + 2 * k + 1] != 0;
-            let t = pcx.locals[l].ty;
+        for k in 0..pcx.closures[g as usize].capture_count {
+            let l = (
+                *pcx.capture_list.data.add((pcx.closures[g as usize].captures + 2 * k) as usize));
+            let by_ref = (
+                *pcx.capture_list.data.add(
+                    (pcx.closures[g as usize].captures + 2 * k + 1) as usize)) != 0;
+            let t = pcx.locals[l as usize].ty;
             let inner = closure_id(t, pcx);
             if inner >= 0 {
                 thcx.shared.push(l);
-                if !share_captures(inner, depth + 1, &thcx, &pcx) {
+                if !share_captures(inner, depth + 1, thcx, pcx) {
                     return false;
                 }
                 continue;
             }
-            if is_view_type(t, &pcx) {
+            if is_view_type(t, pcx) {
                 return false;
             }
-            if by_ref || !is_plain_type(t, &pcx) {
+            if by_ref || !is_plain_type(t, pcx) {
                 thcx.shared.push(l);
             }
         }
@@ -706,43 +722,43 @@ fn share_captures(g: i64, depth: i64, thcx: inout ThreadsCx, pcx: inout Ctx<Comp
 
 // The node that changes local l: an assignment's target, else the place
 // written (`&v`, `&a[..]`, `v.as_mut_slice()`, a receiver).
-fn write_root(w: i64, pcx: inout Ctx<Comp>) -> i64 {
-    if pcx.nodes[w].kind == NodeKind::Assign {
-        return captured_root(pcx.nodes[w].b, &pcx);
+fn write_root(w: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    if pcx.nodes[w as usize].kind == NodeKind::Assign {
+        return captured_root(pcx.nodes[w as usize].b, pcx);
     }
-    let r = captured_root(w, &pcx);
-    if r < 0 && pcx.nodes[w].kind == NodeKind::Call && pcx.nodes[w].count > 0 {
-        return captured_root(child(w, 0, pcx), &pcx);
+    let r = captured_root(w, pcx);
+    if r < 0 && pcx.nodes[w as usize].kind == NodeKind::Call && pcx.nodes[w as usize].count > 0 {
+        return captured_root(child(w, 0, pcx), pcx);
     }
     r
 }
 
 // The local a place expression changes when it is a variable a closure
 // captured by reference (its rewritten form `*(*env).x`), else -1.
-fn captured_root(e: i64, pcx: inout Ctx<Comp>) -> i64 {
-    var x = e;
+fn captured_root(e: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let mut x = e;
     loop {
         if x == 0 {
             return -1;
         }
-        if (pcx.nodes[x].p & NODE_CAPTURE) != 0 {
-            if pcx.nodes[x].kind == NodeKind::Unary {
-                return pcx.nodes[x].d - 1;
+        if (pcx.nodes[x as usize].p & NODE_CAPTURE) != 0 {
+            if pcx.nodes[x as usize].kind == NodeKind::Unary {
+                return pcx.nodes[x as usize].d - 1;
             }
             // (0.25) a view captured by copy: what changes through the
             // copy is what the caller's view views (`s.sort()`, `s[0] = 1`)
-            let l = pcx.nodes[x].d - 1;
-            return if l >= 0 && is_view_type(pcx.locals[l].ty, &pcx) { l } else { -1 };
+            let l = pcx.nodes[x as usize].d - 1;
+            return if l >= 0 && is_view_type(pcx.locals[l as usize].ty, pcx) { l } else { -1 };
         }
-        let k = pcx.nodes[x].kind;
+        let k = pcx.nodes[x as usize].kind;
         if k == NodeKind::FieldAccess || k == NodeKind::TupleField || k == NodeKind::Index {
-            x = pcx.nodes[x].a;
-        } else if k == NodeKind::Unary && pcx.nodes[x].op == Tok::Amp {
+            x = pcx.nodes[x as usize].a;
+        } else if k == NodeKind::Unary && pcx.nodes[x as usize].op == Tok::Amp {
             // (`&place`: what an inout parameter is given)
-            x = pcx.nodes[x].b;
+            x = pcx.nodes[x as usize].b;
         }
-        else if k == NodeKind::Call && pcx.nodes[x].count > 0
-            && exclusive_type(pcx.nodes[x].ty, pcx) {
+        else if k == NodeKind::Call && pcx.nodes[x as usize].count > 0
+            && exclusive_type(pcx.nodes[x as usize].ty, pcx) {
             // (an access a method makes of its receiver: `v[i]` is
             // `v.as_mut_slice()[i]` when written, `m.get_or_insert(k, 0)`)
             x = child(x, 0, pcx);
@@ -754,25 +770,25 @@ fn captured_root(e: i64, pcx: inout Ctx<Comp>) -> i64 {
 
 // Whether t is an exclusive access: `inout T` (a `&mut T`) or `inout [T]`, or
 // an Option of one (`get_mut`).
-fn exclusive_type(t: i64, pcx: Ctx<Comp>) -> bool {
+fn exclusive_type(t: i64, pcx: &Ctx<Comp>) -> bool {
     unsafe {
         if t <= 0 {
             return false;
         }
-        let k = pcx.types[t].kind;
-        if (k == TyKind::Ptr || k == TyKind::Slice) && pcx.types[t].b == REF_MUT {
+        let k = pcx.types[t as usize].kind;
+        if (k == TyKind::Ptr || k == TyKind::Slice) && pcx.types[t as usize].b == REF_MUT {
             return true;
         }
         if k == TyKind::Enum {
-            let e = pcx.types[t].a;
-            for i in 0..ENUMS[e].variant_count {
+            let e = pcx.types[t as usize].a;
+            for i in 0..(*get_enums().add(e as usize)).variant_count {
                 let v = enum_variant(e, i);
-                for j in 0..pcx.variants[v].field_count {
-                    let ft = pcx.tlists.data[pcx.variants[v].fields + j];
+                for j in 0..pcx.variants[v as usize].field_count {
+                    let ft = (*pcx.tlists.data.add((pcx.variants[v as usize].fields + j) as usize));
                     if ft > 0
-                        && (pcx.types[ft].kind == TyKind::Ptr
-                            || pcx.types[ft].kind == TyKind::Slice)
-                        && pcx.types[ft].b == REF_MUT {
+                        && (pcx.types[ft as usize].kind == TyKind::Ptr
+                            || pcx.types[ft as usize].kind == TyKind::Slice)
+                        && pcx.types[ft as usize].b == REF_MUT {
                         return true;
                     }
                 }
@@ -782,15 +798,15 @@ fn exclusive_type(t: i64, pcx: Ctx<Comp>) -> bool {
     }
 }
 
-fn body_of(c: i64, pcx: Ctx<Comp>) -> i64 {
-    pcx.nodes[pcx.fns[pcx.closures[c].f].node].c
+fn body_of(c: i64, pcx: &Ctx<Comp>) -> i64 {
+    pcx.nodes[pcx.fns[pcx.closures[c as usize].f as usize].node as usize].c
 }
 
 // thread::scope(|s| BODY): BODY changes nothing it borrows.
-fn check_scope(f: i64, thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
+fn check_scope(f: i64, thcx: &mut ThreadsCx, pcx: &mut Ctx<Comp>) {
     unsafe {
         let pos = call_pos(f, pcx);
-        let ft = pcx.tlists.data[pcx.fns[f].targs];
+        let ft = (*pcx.tlists.data.add(pcx.fns[f as usize].targs as usize));
         let c = closure_id(ft, pcx);
         if c < 0 {
             let msg = buf_new();
@@ -798,7 +814,7 @@ fn check_scope(f: i64, thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
             buf_str(msg, c"'thread::scope' takes a closure written at the call, not ");
             buf_type(msg, ft, pcx);
             buf_str(help, c"write it there: `thread::scope(|s| { s.spawn(|| ...); })`");
-            report(pos, c"sync.spawn_closure", msg, help, &pcx);
+            report(pos, c"sync.spawn_closure", msg, help, pcx);
             return;
         }
         // (0.25) the body may change what no thread of the scope shares (a
@@ -807,18 +823,18 @@ fn check_scope(f: i64, thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
         thcx.shared.count = 0;
         thcx.shared_only = true;
         for s in 0..pcx.fns.len() as i64 {
-            if pcx.fns[s].tmpl != 0 && pcx.fns[s].tmpl - 1 == thcx.scope_spawn_fn
-                && pcx.fns[s].targ_count >= 1 {
-                let g = closure_id(pcx.tlists.data[pcx.fns[s].targs], pcx);
+            if pcx.fns[s as usize].tmpl != 0 && pcx.fns[s as usize].tmpl - 1 == thcx.scope_spawn_fn
+                && pcx.fns[s as usize].targ_count >= 1 {
+                let g = closure_id((*pcx.tlists.data.add(pcx.fns[s as usize].targs as usize)), pcx);
                 if g >= 0 && scope_closure_of(g, thcx, pcx) == c
-                    && !share_captures(g, 0, &thcx, &pcx) {
+                    && !share_captures(g, 0, thcx, pcx) {
                     thcx.shared_only = false;
                 }
             }
         }
         // (0.25) its value holds no Scope and no handle of a thread started
         // in it: they end with the scope
-        let rt = pcx.fns[pcx.closures[c].f].ret;
+        let rt = pcx.fns[pcx.closures[c as usize].f as usize].ret;
         let held = scope_part(rt, 0, pcx);
         if held != 0 {
             let msg = buf_new();
@@ -832,12 +848,12 @@ fn check_scope(f: i64, thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
             buf_str(msg,
                 c": its threads are joined and its Scope is gone when thread::scope returns");
             buf_str(help, c"join the threads inside and return their results: `thread::scope(|s| s.spawn(|| ...).join())`");
-            report(scope_value_pos(c, pcx), c"sync.scope_escape", msg, help, &pcx);
+            report(scope_value_pos(c, pcx), c"sync.scope_escape", msg, help, pcx);
         }
-        let w = capture_write(body_of(c, pcx), pcx.closures[c].mark, &thcx, &pcx);
+        let w = capture_write(body_of(c, pcx), pcx.closures[c as usize].mark, thcx, pcx);
         thcx.shared_only = false;
         if w != 0 {
-            let l = write_root(w, &pcx);
+            let l = write_root(w, pcx);
             let msg = buf_new();
             let help = buf_new();
             buf_str(msg, c"the closure given to 'thread::scope' changes '");
@@ -846,25 +862,27 @@ fn check_scope(f: i64, thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
             }
             buf_str(msg, c"', which its threads may read at the same time");
             buf_str(help, c"change it before or after thread::scope; inside, give each thread its own data, or share a Mutex or an atomic");
-            report(pcx.nodes[w].start, c"sync.scope_write", msg, help, &pcx);
+            report(pcx.nodes[w as usize].start, c"sync.scope_write", msg, help, pcx);
         }
     }
 }
 
 // The part of type t that is std's Scope or a ScopedJoinHandle (a type),
 // in a field, an element, a variant or behind a pointer; 0: none.
-fn scope_part(t: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
+fn scope_part(t: i64, depth: i64, pcx: &Ctx<Comp>) -> i64 {
     unsafe {
         if t <= 0 || t == pcx.ty_error || depth > 16 {
             return 0;
         }
-        let kind = pcx.types[t].kind;
+        let kind = pcx.types[t as usize].kind;
         if kind == TyKind::Ptr || kind == TyKind::Slice || kind == TyKind::Array {
-            return scope_part(pcx.types[t].a, depth + 1, pcx);
+            return scope_part(pcx.types[t as usize].a, depth + 1, pcx);
         }
         if kind == TyKind::Tuple {
-            for i in 0..pcx.types[t].count {
-                let p = scope_part(pcx.tlists.data[pcx.types[t].list + i], depth + 1, pcx);
+            for i in 0..pcx.types[t as usize].count {
+                let p = scope_part(
+                    (*pcx.tlists.data.add((pcx.types[t as usize].list + i) as usize)), depth + 1,
+                    pcx);
                 if p != 0 {
                     return p;
                 }
@@ -872,9 +890,9 @@ fn scope_part(t: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
             return 0;
         }
         if kind == TyKind::Enum {
-            let e = pcx.types[t].a;
-            for i in 0..ENUMS[e].variant_count {
-                let p = scope_part(pcx.variants[enum_variant(e, i)].shape, depth + 1, pcx);
+            let e = pcx.types[t as usize].a;
+            for i in 0..(*get_enums().add(e as usize)).variant_count {
+                let p = scope_part(pcx.variants[enum_variant(e, i) as usize].shape, depth + 1, pcx);
                 if p != 0 {
                     return p;
                 }
@@ -884,22 +902,23 @@ fn scope_part(t: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
         if kind != TyKind::Struct {
             return 0;
         }
-        let s = pcx.types[t].a;
+        let s = pcx.types[t as usize].a;
         let name = std_name(s, pcx);
-        if name == "Scope" || name == "ScopedJoinHandle" {
+        if name == b"Scope" || name == b"ScopedJoinHandle" {
             return t;
         }
-        if pcx.structs[s].closure != 0 {
+        if pcx.structs[s as usize].closure != 0 {
             return 0;
         }
         // (a container's elements: its type arguments)
-        for i in 0..pcx.structs[s].targ_count {
-            let p = scope_part(pcx.tlists.data[pcx.structs[s].targs + i], depth + 1, pcx);
+        for i in 0..pcx.structs[s as usize].targ_count {
+            let p = scope_part((*pcx.tlists.data.add((pcx.structs[s as usize].targs + i) as usize)),
+                depth + 1, pcx);
             if p != 0 {
                 return p;
             }
         }
-        for i in 0..pcx.structs[s].field_count {
+        for i in 0..pcx.structs[s as usize].field_count {
             let p = scope_part((*struct_field(s, i, pcx)).ty, depth + 1, pcx);
             if p != 0 {
                 return p;
@@ -910,29 +929,32 @@ fn scope_part(t: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
 }
 
 // Where closure c's value is: its body's tail, else the closure.
-fn scope_value_pos(c: i64, pcx: Ctx<Comp>) -> i64 {
+fn scope_value_pos(c: i64, pcx: &Ctx<Comp>) -> i64 {
     let body = body_of(c, pcx);
-    if body > 0 && pcx.nodes[body].kind == NodeKind::Block && pcx.nodes[body].a > 0 {
-        return pcx.nodes[pcx.nodes[body].a].start;
+    if body > 0 && pcx.nodes[body as usize].kind == NodeKind::Block
+        && pcx.nodes[body as usize].a > 0 {
+        return pcx.nodes[pcx.nodes[body as usize].a as usize].start;
     }
-    if body > 0 && pcx.nodes[body].kind != NodeKind::Block {
-        return pcx.nodes[body].start;
+    if body > 0 && pcx.nodes[body as usize].kind != NodeKind::Block {
+        return pcx.nodes[body as usize].start;
     }
-    pcx.nodes[pcx.closures[c].node].start
+    pcx.nodes[pcx.closures[c as usize].node as usize].start
 }
 
 // The closure given to thread::scope that closure g is written in (its
 // node inside that closure's), or -1.
-fn scope_closure_of(g: i64, thcx: ThreadsCx, pcx: Ctx<Comp>) -> i64 {
+fn scope_closure_of(g: i64, thcx: &ThreadsCx, pcx: &Ctx<Comp>) -> i64 {
     unsafe {
-        let gn = pcx.closures[g].node;
-        var best = -1;
+        let gn = pcx.closures[g as usize].node;
+        let mut best: i64 = -1;
         for i in 0..thcx.scope_closures.count {
-            let c = thcx.scope_closures.data[i];
-            let cn = pcx.closures[c].node;
-            if c != g && pcx.nodes[gn].start >= pcx.nodes[cn].start
-                && pcx.nodes[gn].end <= pcx.nodes[cn].end
-                && (best < 0 || pcx.nodes[cn].start >= pcx.nodes[pcx.closures[best].node].start) {
+            let c = (*thcx.scope_closures.data.add(i as usize));
+            let cn = pcx.closures[c as usize].node;
+            if c != g && pcx.nodes[gn as usize].start >= pcx.nodes[cn as usize].start
+                && pcx.nodes[gn as usize].end <= pcx.nodes[cn as usize].end
+                && (best < 0
+                    || pcx.nodes[cn as usize].start
+                    >= pcx.nodes[pcx.closures[best as usize].node as usize].start) {
                 best = c;
             }
         }
@@ -941,11 +963,11 @@ fn scope_closure_of(g: i64, thcx: ThreadsCx, pcx: Ctx<Comp>) -> i64 {
 }
 
 // Scope::spawn(g), called in the closure c given to thread::scope.
-fn check_scoped_spawn(f: i64, thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
+fn check_scoped_spawn(f: i64, thcx: &mut ThreadsCx, pcx: &mut Ctx<Comp>) {
     unsafe {
         let pos = call_pos(f, pcx);
-        let gt = pcx.tlists.data[pcx.fns[f].targs];
-        let rt = pcx.tlists.data[pcx.fns[f].targs + 1];
+        let gt = (*pcx.tlists.data.add(pcx.fns[f as usize].targs as usize));
+        let rt = (*pcx.tlists.data.add((pcx.fns[f as usize].targs + 1) as usize));
         let g = closure_id(gt, pcx);
         if g < 0 {
             let msg = buf_new();
@@ -953,7 +975,7 @@ fn check_scoped_spawn(f: i64, thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
             buf_str(msg, c"'s.spawn' takes a closure written at the call, not ");
             buf_type(msg, gt, pcx);
             buf_str(help, c"wrap the function: `s.spawn(|| work(x))`");
-            report(pos, c"sync.spawn_closure", msg, help, &pcx);
+            report(pos, c"sync.spawn_closure", msg, help, pcx);
             return;
         }
         let c = scope_closure_of(g, thcx, pcx);
@@ -962,41 +984,44 @@ fn check_scoped_spawn(f: i64, thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
             let help = buf_new();
             buf_str(msg, c"'s.spawn' is called outside the closure given to 'thread::scope'");
             buf_str(help, c"call it directly in that closure (`thread::scope(|s| { s.spawn(|| ...); })`): what its threads borrow is checked there");
-            report(pos, c"sync.scope_spawn", msg, help, &pcx);
+            report(pos, c"sync.scope_spawn", msg, help, pcx);
             return;
         }
-        let moving = (pcx.nodes[pcx.closures[g].node].c & CLOSURE_MOVE) != 0;
-        let mark = pcx.closures[c].mark;
-        for k in 0..pcx.closures[g].capture_count {
-            let l = pcx.capture_list.data[pcx.closures[g].captures + 2 * k];
-            let by_ref = pcx.capture_list.data[pcx.closures[g].captures + 2 * k + 1] != 0;
-            let t = pcx.locals[l].ty;
-            reset_fault(&thcx);
+        let moving = (pcx.nodes[pcx.closures[g as usize].node as usize].c & CLOSURE_MOVE) != 0;
+        let mark = pcx.closures[c as usize].mark;
+        for k in 0..pcx.closures[g as usize].capture_count {
+            let l = (
+                *pcx.capture_list.data.add((pcx.closures[g as usize].captures + 2 * k) as usize));
+            let by_ref = (
+                *pcx.capture_list.data.add(
+                    (pcx.closures[g as usize].captures + 2 * k + 1) as usize)) != 0;
+            let t = pcx.locals[l as usize].ty;
+            reset_fault(thcx);
             if l >= mark {
                 // (a local of the scope's closure: it ends before the join)
-                if !moving || is_view_type(t, &pcx) {
+                if !moving || is_view_type(t, pcx) {
                     let msg = buf_new();
                     let help = buf_new();
                     buf_str(msg, c"a thread of 'thread::scope' ");
                     buf_str(msg, if moving { c"moves '" } else { c"borrows '" });
                     buf_bytes(msg, local_name(l, pcx));
-                    buf_str(msg, if is_view_type(t, &pcx) {
+                    buf_str(msg, if is_view_type(t, pcx) {
                         c"', a view made inside the scope's closure, which ends before the thread is joined"
                     } else {
                         c"', made inside the scope's closure, which ends before the thread is joined"
                     });
                     buf_str(help, c"make it before thread::scope, or move an owned value into the thread (`sink ||`)");
-                    report(pos, c"sync.scope_local", msg, help, &pcx);
+                    report(pos, c"sync.scope_local", msg, help, pcx);
                     return;
                 }
-                if !holds(t, M_SEND, &thcx, pcx) {
-                    spawn_fault(pos, l, t, thcx, &pcx);
+                if !holds(t, M_SEND, thcx, pcx) {
+                    spawn_fault(pos, l, t, thcx, pcx);
                     return;
                 }
                 continue;
             }
             // (the caller's: frozen while the scope runs)
-            if moving && is_owned_type(t, &pcx) {
+            if moving && is_owned_type(t, pcx) {
                 let msg = buf_new();
                 let help = buf_new();
                 buf_str(msg, c"a thread of 'thread::scope' moves '");
@@ -1004,11 +1029,11 @@ fn check_scoped_spawn(f: i64, thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
                 buf_str(msg, c"', which belongs to the caller");
                 buf_str(help,
                     c"let the thread borrow it (drop `move`), or move it into thread::spawn");
-                report(pos, c"sync.scope_local", msg, help, &pcx);
+                report(pos, c"sync.scope_local", msg, help, pcx);
                 return;
             }
-            let ok = if by_ref || !moving && is_owned_type(t, &pcx) { holds(t, M_SYNC, &thcx, pcx) }
-                else { holds(t, M_SEND_VIEWS, &thcx, pcx) };
+            let ok = if by_ref || !moving && is_owned_type(t, pcx) { holds(t, M_SYNC, thcx, pcx) }
+                else { holds(t, M_SEND_VIEWS, thcx, pcx) };
             if !ok {
                 let msg = buf_new();
                 let help = buf_new();
@@ -1028,55 +1053,55 @@ fn check_scoped_spawn(f: i64, thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
                     c"hold the data in std's containers, a Mutex or atomics"
                 });
                 report(pos, if view_mut { c"sync.scope_shared_write" } else { c"sync.not_sync" },
-                    msg, help, &pcx);
+                    msg, help, pcx);
                 return;
             }
         }
-        let w = capture_write(body_of(g, pcx), mark, &thcx, &pcx);
+        let w = capture_write(body_of(g, pcx), mark, thcx, pcx);
         if w != 0 {
             let msg = buf_new();
             let help = buf_new();
-            let l = write_root(w, &pcx);
+            let l = write_root(w, pcx);
             buf_str(msg, c"a thread of 'thread::scope' changes '");
             if l >= 0 {
                 buf_bytes(msg, local_name(l, pcx));
             }
             buf_str(msg, c"', which the scope's other code may use at the same time");
             buf_str(help, c"scoped threads only read what they borrow (0.21.0): return the result from the thread (`h.join()`), or use a Mutex or an atomic");
-            report(pcx.nodes[w].start, c"sync.scope_shared_write", msg, help, &pcx);
+            report(pcx.nodes[w as usize].start, c"sync.scope_shared_write", msg, help, pcx);
             return;
         }
-        reset_fault(&thcx);
-        if !holds(rt, M_SEND_VIEWS, &thcx, pcx) {
+        reset_fault(thcx);
+        if !holds(rt, M_SEND_VIEWS, thcx, pcx) {
             let msg = buf_new();
             let help = buf_new();
             buf_str(msg, c"the thread's result, ");
             buf_reason(msg, rt, thcx, pcx);
             buf_str(msg, c", cannot come back from another thread");
             buf_str(help, c"return an owned value, or plain data");
-            report(pos, c"sync.not_send", msg, help, &pcx);
+            report(pos, c"sync.not_send", msg, help, pcx);
             return;
         }
         if reaches_static(g, pcx) {
-            report_static(pos, c"'s.spawn'", &pcx);
+            report_static(pos, c"'s.spawn'", pcx);
         }
     }
 }
 
-pub fn check_sync_items(thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
-    check_static_cells(&thcx, &pcx);
+pub fn check_sync_items(thcx: &mut ThreadsCx, pcx: &mut Ctx<Comp>) {
+    check_static_cells(thcx, pcx);
     unsafe {
         if thcx.channel_fn == -2 {
-            thcx.channel_fn = find_std_fn("std.sync.mpsc.channel_in", pcx);
-            thcx.mutex_new_fn = find_std_fn("std.sync.Mutex.new", pcx);
-            thcx.atomic_new_fn = find_std_fn("std.sync.atomic.Atomic.new", pcx);
-            thcx.cell_new_fn = find_std_fn("std.cell.Cell.new", pcx);
-            thcx.unsafe_cell_new_fn = find_std_fn("std.cell.UnsafeCell.new", pcx);
+            thcx.channel_fn = find_std_fn(b"std.sync.mpsc.channel_in", pcx);
+            thcx.mutex_new_fn = find_std_fn(b"std.sync.Mutex.new", pcx);
+            thcx.atomic_new_fn = find_std_fn(b"std.sync.atomic.Atomic.new", pcx);
+            thcx.cell_new_fn = find_std_fn(b"std.cell.Cell.new", pcx);
+            thcx.unsafe_cell_new_fn = find_std_fn(b"std.cell.UnsafeCell.new", pcx);
             thcx.with_fns.count = 0;
-            thcx.with_fns.push(find_std_fn("std.sync.Mutex.with", pcx));
-            thcx.with_fns.push(find_std_fn("std.sync.Mutex.try_with", pcx));
-            thcx.with_fns.push(find_std_fn("std.sync.MutexGuard.with", pcx));
-            thcx.with_fns.push(find_std_fn("std.sync.Condvar.wait_then", pcx));
+            thcx.with_fns.push(find_std_fn(b"std.sync.Mutex.with", pcx));
+            thcx.with_fns.push(find_std_fn(b"std.sync.Mutex.try_with", pcx));
+            thcx.with_fns.push(find_std_fn(b"std.sync.MutexGuard.with", pcx));
+            thcx.with_fns.push(find_std_fn(b"std.sync.Condvar.wait_then", pcx));
         }
         if thcx.channel_fn < 0 && thcx.mutex_new_fn < 0 && thcx.atomic_new_fn < 0
             && thcx.cell_new_fn < 0
@@ -1084,13 +1109,14 @@ pub fn check_sync_items(thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
             return;
         }
         for f in 0..pcx.fns.len() as i64 {
-            if pcx.fns[f].tmpl == 0 || pcx.fns[f].targ_count < 1 || pcx.fns[f].origin <= 0 {
+            if pcx.fns[f as usize].tmpl == 0 || pcx.fns[f as usize].targ_count < 1
+                || pcx.fns[f as usize].origin <= 0 {
                 continue;
             }
-            let t = pcx.fns[f].tmpl - 1;
-            var with = false;
+            let t = pcx.fns[f as usize].tmpl - 1;
+            let mut with = false;
             for i in 0..thcx.with_fns.count {
-                if thcx.with_fns.data[i] == t && t >= 0 {
+                if (*thcx.with_fns.data.add(i as usize)) == t && t >= 0 {
                     with = true;
                 }
             }
@@ -1099,17 +1125,19 @@ pub fn check_sync_items(thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
                 && !with {
                 continue;
             }
-            let p = pcx.fns[f].parent - 1;
-            if p >= 0 && within_std(pcx.fns[p].module, pcx) {
+            let p = pcx.fns[f as usize].parent - 1;
+            if p >= 0 && within_std(pcx.fns[p as usize].module, pcx) {
                 continue;
             }
             // (with's R: its second type argument, after the Mutex's T or
             // wait_then's T)
-            if with && pcx.fns[f].targ_count < 2 {
+            if with && pcx.fns[f as usize].targ_count < 2 {
                 continue;
             }
-            let item = pcx.tlists.data[pcx.fns[f].targs + if with { 1 } else { 0 }];
-            if item <= 0 || item == pcx.ty_error || !is_view_type(item, &pcx) {
+            let item = (
+                *pcx.tlists.data.add(
+                    (pcx.fns[f as usize].targs + if with { 1 } else { 0 }) as usize));
+            if item <= 0 || item == pcx.ty_error || !is_view_type(item, pcx) {
                 continue;
             }
             let pos = call_pos(f, pcx);
@@ -1121,7 +1149,7 @@ pub fn check_sync_items(thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
                 // regions: Cell<&'a T>)
                 buf_str(msg, c"a cell of ");
                 buf_type(msg, item, pcx);
-                let ik = pcx.types[item].kind;
+                let ik = pcx.types[item as usize].kind;
                 buf_str(msg, if ik == TyKind::Slice || ik == TyKind::Ptr || ik == TyKind::Distinct {
                     c", a view: "
                 } else {
@@ -1129,7 +1157,7 @@ pub fn check_sync_items(thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
                 });
                 buf_str(msg, c"a write through a shared reference to the cell would store a view the borrow rules do not follow");
                 buf_str(help, c"keep owned or plain values in a cell: a copy of the view (`s.to_vec_in(gpa)`), or an index into the data it views | try: volec explain cell.view_item");
-                report(pos, c"cell.view_item", msg, help, &pcx);
+                report(pos, c"cell.view_item", msg, help, pcx);
                 continue;
             }
             if with {
@@ -1139,7 +1167,7 @@ pub fn check_sync_items(thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
                     else if t == thcx.mutex_new_fn { c"a Mutex of " } else { c"an atomic of " });
             }
             buf_type(msg, item, pcx);
-            let k = pcx.types[item].kind;
+            let k = pcx.types[item as usize].kind;
             buf_str(msg, if k == TyKind::Slice || k == TyKind::Ptr || k == TyKind::Distinct {
                 c", a view: "
             } else {
@@ -1156,7 +1184,7 @@ pub fn check_sync_items(thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
                 });
                 buf_str(help, c"send and store owned values: a copy of the view (`s.to_vec_in(gpa)`, `s.to_string_in(gpa)`, a Buf), or an index into data the threads share | try: volec explain sync.view_item");
             }
-            report(pos, c"sync.view_item", msg, help, &pcx);
+            report(pos, c"sync.view_item", msg, help, pcx);
         }
     }
 }
@@ -1167,31 +1195,32 @@ pub fn check_sync_items(thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
 // may reach it and write it at once. A `static var` and a
 // `#[thread_local] static var` may hold a cell. (Rust's whole rule, that
 // every immutable static is Sync, is 0.27's, with the auto traits.)
-fn check_static_cells(thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
+fn check_static_cells(thcx: &mut ThreadsCx, pcx: &mut Ctx<Comp>) {
     // UNSAFE: STATICS and NODES are the checker's raw tables.
     // SAFETY: s < STATIC_COUNT; STATICS[s].node is its item's node.
     unsafe {
         for s in 0..pcx.statics.len() as i64 {
-            let t = pcx.statics[s].ty;
-            if pcx.statics[s].mutable || pcx.statics[s].linkage != 0 || t <= 0 || t == pcx.ty_error
+            let t = pcx.statics[s as usize].ty;
+            if pcx.statics[s as usize].mutable || pcx.statics[s as usize].linkage != 0 || t <= 0
+                || t == pcx.ty_error
                 || crate::front::cells::is_freeze(t, pcx) {
                 continue;
             }
-            reset_fault(&thcx);
-            if holds(t, M_SYNC, &thcx, pcx) {
+            reset_fault(thcx);
+            if holds(t, M_SYNC, thcx, pcx) {
                 continue;
             }
-            let node = pcx.statics[s].node;
-            let pos = pcx.nodes[node].start;
+            let node = pcx.statics[s as usize].node;
+            let pos = pcx.nodes[node as usize].start;
             let msg = buf_new();
             let help = buf_new();
             buf_str(msg, c"the static '");
-            buf_bytes(msg, sym_text(pcx.nodes[node].a, pcx));
+            buf_bytes(msg, sym_text(pcx.nodes[node as usize].a, pcx));
             buf_str(msg, c"' is not Sync: ");
             buf_reason(msg, t, thcx, pcx);
             buf_str(msg, c"; every thread may reach it and write through it at once");
             buf_str(help, c"make it a `static var` (one thread's, the main one's) or a `#[thread_local] static var`, or hold an atomic or a Mutex instead | try: volec explain sync.static");
-            report(pos, c"sync.static", msg, help, &pcx);
+            report(pos, c"sync.static", msg, help, pcx);
         }
     }
 }
@@ -1201,7 +1230,7 @@ fn check_static_cells(thcx: inout ThreadsCx, pcx: inout Ctx<Comp>) {
 // (gen0's gen_data) and a lock lends it (own::calls::lends_interior).
 // (0.26.1) What is not Freeze: it holds a std::cell::UnsafeCell by value,
 // as std's Atomic, Mutex and the locks do (front/cells.vl).
-pub fn is_interior_type(t: i64, pcx: Ctx<Comp>) -> bool {
+pub fn is_interior_type(t: i64, pcx: &Ctx<Comp>) -> bool {
     t > 0 && !crate::front::cells::is_freeze(t, pcx)
 }
 
@@ -1270,26 +1299,26 @@ pub fn threads_cx_new() -> ThreadsCx {
         atomic_new_fn: -2,
         cell_new_fn: -2,
         channel_fn: -2,
-        cw_stack: crate::base::IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        cw_stack: crate::base::IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
         f_field: 0,
         f_in: 0,
         f_part: 0,
         f_why: 0,
-        memo: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
+        memo: HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 },
         mutex_new_fn: -2,
-        scope_closures: crate::base::IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        scope_closures: crate::base::IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
         scope_fn: -2,
         scope_spawn_fn: -2,
-        shared: crate::base::IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        shared: crate::base::IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
         shared_only: false,
         spawn_fn: -2,
         unsafe_cell_new_fn: -2,
-        with_fns: crate::base::IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        with_fns: crate::base::IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
     }
 }
 
 // Owned (a Drop of its own, which does nothing), so that a let
 // parameter lends the context instead of copying it.
 impl Drop for ThreadsCx {
-    fn drop(inout self) {}
+    fn drop(&mut self) {}
 }

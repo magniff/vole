@@ -23,32 +23,30 @@ In a program of your own:
 
 To add a std function or method.
 
-std is `compiler/std/`: the module `std` (`std.vl` and the files of
-`flat/`) and its modules (`std::fmt` in `fmt.vl`, `std::collections::hash_map`
-in `collections/hash_map.vl`); `compiler/std/embed.sh` builds it into the compiler (`compiler/src/front/stdsrc.vl`).
+std is `compiler/std/`: the module `std` (`std.vl`) and its modules
+(`std::fmt` in `fmt.vl`, `std::collections::hash_map` in
+`collections/hash_map.vl`); `compiler/std/embed.sh` builds it into the
+compiler (`compiler/src/front/stdsrc_rust.vl`).
 
-1. Find where it goes: `volec query similar std::trim` (or
+1. Find where it goes: `volec query similar str::trim` (or
    `Vec::swap`) prints its neighbours, with their files
-   (`compiler/std/flat/io.vl:28`); `volec query examples std-fn`.
-2. Add it by name, next to its kin:
-   `volec edit insert --after std::trim < new.vl` (a method:
-   `--after Vec::swap`). The edit is made in std's file and checked with
-   the edited std, every function of it (a generic one with `i64` for
-   its type parameters); then embed.sh runs (`note edit.std`). Inside
-   std the prelude is as everywhere (0.17): `None`, `Ok(x)`. A function
-   that allocates takes its allocator, `NAME_in(..., a: A)`, and has an
-   `#[ambient]` wrapper without it, like `split_whitespace` and
-   `split_whitespace_in`.
-3. A test: `tests/run/std_NAME.vl` with `// EXPECT:` lines (edge
+   (`compiler/std/str.vl:333`); `volec query examples std-fn`.
+2. Add it in its file, next to its kin, with an editor (std is one text
+   to the compiler, `<std>`: `volec edit` does not write its files),
+   then `volec fmt FILE`. A function that allocates takes its
+   allocator: a constructor or an `_in` function with the allocator
+   last (`Vec::new_in(a)`, `s.to_vec_in(a)`). `volec check` of any
+   program then reads the edited files (`note check.std-files`), every
+   function of std.
+3. `compiler/std/embed.sh` (the commit hook runs it too).
+4. A test: `tests/run/std2_NAME.vl` with `// EXPECT:` lines (edge
    cases: empty, too long, at the ends); see `add-test`.
-4. The guide: a sentence and a `vole` example with its `out` block in
+5. The guide: a sentence and a `vole` example with its `out` block in
    `compiler/guide/std.md` (the API listing at its end is generated);
    `compiler/guide/embed.sh`.
-5. `bootstrap/bootstrap.sh --dev --no-suite` (the compiler with the new
-   std), then `tests/run.sh std_NAME guide`, `tests/run.sh -O 0
-   std_NAME`; before reporting, `tests/affected.sh`.
-
-`volec undo` takes a std edit back (and embeds again).
+6. `bootstrap/bootstrap.sh --dev --no-suite` (the compiler with the new
+   std), then `tests/run.sh std2_NAME guide`, `tests/run.sh -O 0
+   std2_NAME`; before reporting, `tests/affected.sh`.
 
 ## add-std-module
 
@@ -57,33 +55,17 @@ To add a std module (a file of `compiler/std`).
 1. The file, `compiler/std/NAME.vl` (or `NAME/mod.vl`; a child of
    `std::a` in `a/`), and its `mod NAME;` (or `pub mod NAME;`) line in
    the parent's file: embed.sh finds the modules by those lines.
-2. Its sections: a banner `// ---- Title (0.X) ----` starts one. The
-   file's header comment and `use` lines are in its first section,
-   which every program reads: keep the header short, or put the long
-   part below the first banner. Its items before the first banner are
-   the section `std::NAME`. A section not in `compiler/std/index.awk`'s
-   LAZY is core: every program reads it. List each new section's title
-   (and `std::NAME`) in LAZY; `compiler/std/embed.sh --core` prints the
-   core sections and why each is core.
-3. A module that only programs naming it reach (std::gpu, std::window,
-   std::cli) is behind a gate: `GATES["std::a::NAME"] = "a"` in
-   index.awk, its sections then load only for a program that names the
-   gate word. A closed gate (`CLOSED`: gpu, window) is used by no other
-   module of std, so two closed gates cannot name each other: what both
-   need goes into a lazy module without a gate (std::capture).
-4. Check with a build, not only `volec check`: check reads std's edited
-   files whole (every section), a build reads std through the index. A
-   new section left core, or not behind its module's gate, can name a
-   gated module's type that the build does not load: `check` is clean
-   and `bootstrap/bootstrap.sh --dev --no-suite` fails in build1 with
-   `<std>:N:C: error[type error] unknown type 'KeyCode'`. So after the
-   index, `bootstrap/bootstrap.sh --dev --no-suite`, then
-   `target/volec PROG.vl -o x` of a program that uses the module.
-5. Tests and docs as for `add-std-fn`. `volec guide std`'s index has a
+2. A build reads only the units of std a program reaches (the index
+   embed.sh makes with the compiler, `std2_units`); `volec check` reads
+   all of std. So check with a build too: `bootstrap/bootstrap.sh --dev
+   --no-suite`, then `target/volec PROG.vl -o x` of a program that uses
+   the module. A build made again with std whole says so (`tests/run.sh`
+   counts them, `lazy std: N build(s)`; `VOLE_STD2_NORERUN=1` shows why).
+3. Tests and docs as for `add-std-fn`. `volec guide std`'s index has a
    size limit (`tests/run.sh guide`: guide-std-index); a module with its
-   own topic leaves the index (compiler/src/guide/stdapi.vl:
-   `unindexed_section`).
-6. The transcripts: `tests/run.sh query refactor walkthrough lsp stdpos`.
+   own topic, or one programs seldom name, leaves the index
+   (compiler/src/guide/stdapi.vl: `index_hides`).
+4. The transcripts: `tests/run.sh query refactor walkthrough lsp stdpos`.
    They compare std's positions, counts and list of modules normalized
    (tests/stdpos.awk), so only one about std itself (`## exact-std`) or
    one whose output names the new items fails; rewrite it with its
@@ -103,7 +85,8 @@ block for the second target, or `volec edit apply`). `volec --check-rules` tests
 random values (the suite runs it).
 
 Anything else (a select, a negated comparison, an address): a function
-`combine_X(v: i64) -> bool` in `compiler/src/middle/fold/mod.vl`,
+`combine_X(cx: &mut FnCtx, v: i64, pcx: &Ctx<Comp>) -> bool` in
+`compiler/src/middle/fold/mod.vl`,
 section "Instruction combining", called from `combine` on the
 instruction's op; true when it changed `v` (in place, or with
 `replace_same_type`, `make_const`, `op_before`). Templates: `volec
@@ -118,13 +101,13 @@ Test: `tests/run/opt_NAME.vl`, a program with `// EXPECT:` and
 To add an optimization pass.
 
 1. `volec edit new-file compiler/src/middle/NAME.vl < text` (adds
-   the `mod` line): `pub fn NAME(fi: i64) -> bool`, true when it
-   changed function `fi`. Templates: `volec query examples pass`
+   the `mod` line): `pub fn NAME(cx: &mut FnCtx, fi: i64, pcx:
+   &Ctx<Comp>) -> bool`, true when it changed function `fi`. Templates: `volec query examples pass`
    (`elide_copies`, `thread_tags`).
 2. Call it in `compiler/src/middle/opt.vl`: in `simplify_function`
-   (scalar, -O1 and -O2) as `if round == 0 && NAME(fi) { verify_func(fi,
-   c"NAME"); }`, or in `optimize_loops` (-O2) as `if NAME(fi) { changed =
-   true; light_cleanup(fi); }`. `verify_func` checks the IR under
+   (scalar, -O1 and -O2) as `if round == 0 && NAME(cx, fi, pcx) {
+   verify_func(cx, fi, c"NAME", pcx); }`, or in `optimize_loops` (-O2) as
+   `if NAME(cx, fi, pcx) { changed = true; light_cleanup(cx, fi, pcx); }`. `verify_func` checks the IR under
    `--verify-ir` and prints it under `--print-after-all`.
 3. Test: `tests/run/opt_NAME.vl` with `// CHECK:` lines (see
    `add-peephole`); `tests/run.sh opt_`; `tests/fuzz/run.sh` (random
@@ -147,15 +130,17 @@ To add an optimization pass.
 To add a compiler error, or a tool diagnostic with a code.
 
 A compiler error (`error[type error] ... | help: ...`), where the
-checker finds it: `err_begin(pos); err_str(c"..."); err_sym(name);
-err_help(c"try ..."); err_end();` (`err_end_soft()` goes on checking).
+checker finds it: `err_begin(pos, pcx); err_str(c"...", pcx);
+err_sym(name, pcx); err_help(c"try ...", pcx); err_end(pcx);`
+(`err_end_soft(pcx)` goes on checking; `pcx` is the compiler's context,
+a parameter of every function that reports).
 Templates: `volec query examples diagnostic`. Test:
 `tests/run/err_NAME.vl` with `// ERROR: text` lines, the help line
 too (`// ERROR: help: ...`).
 
 A tool diagnostic (`error edit.not-source: ...` then `try:` lines):
-`let d = diag(c"error", c"tool.code"); buf_str(d, c"...\n");` then
-`try_end(try_begin(c"cmd", name, true))`: a command that runs as it is
+`let d = diag(c"error", c"tool.code", tcx); buf_str(d, c"...\n");` then
+`try_end(try_begin(c"cmd", name, true, tcx, pcx))`: a command that runs as it is
 written. Then its `explain` entry: an `Explain { code, severity,
 means, fix, example }` in `crate::tools::explain::tools_table::TOOLS_TABLE`
 (or `refactor_table`), `TOOLS_COUNT` and the array's length one more,
@@ -200,13 +185,14 @@ To add a test case.
 To add a volec command, or a query command.
 
 A command (`volec NAME ...`): its arguments, `pub fn NAME_leaf(gpa:
-Gpa) -> Leaf` (a table of `flag`s and `option`s, `cli::line`), and `pub
-fn run_NAME(c: Call) -> i64` reading `c.evs` (its arguments in the
-line's order) or `c.m` (their Matches); diagnostics with `diag`, written
-with `write_diags()` before it returns. Its name in `tops` and its leaf
+Gpa) -> Leaf<'static, Gpa>` (a table of `flag`s and `option`s,
+`cli::line`), and `pub fn run_NAME(c: &Call<'_, Gpa>, tcx: &mut
+Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64` reading `c.evs` (its arguments
+in the line's order) or `c.m` (their Matches); diagnostics with `diag`,
+written with `write_diags(tcx)` before it returns. Its name in `tops` and its leaf
 in `leaf_of` (`compiler/src/cli/tree.vl`, volec's Command tree), and its
 line in `run_call` (`compiler/src/tools/commands.vl`): `if name ==
-"NAME" { return run_NAME(c); }` (`batch` runs it too). Its `--help`: a
+"NAME" { return run_NAME(c, tcx, pcx); }` (`batch` runs it too). Its `--help`: a
 `Help { cmd: "NAME", text: "..." }` row in `compiler/src/tools/help.vl`
 (15 lines at most; `HELP_COUNT` and the array's length one more), and
 the command in the list `tests/guide/run.sh` checks `--help` for.

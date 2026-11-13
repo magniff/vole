@@ -87,8 +87,705 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.6 | `v0.27.6` | 0.27.5 | aarch64-macos | gate 3 has no type errors (76 borrowck left); std::gpu::wgsl in std2; a method in a generic body is the one it names (Z9.1c); const fn and constants made at each use; octal, `let ref`; a 0.27.5 wrong-output fix (constants' names) and an -O0 link fix |
 | 0.27.7 | `v0.27.7` | 0.27.6 | aarch64-macos | gate 3 is 0 (no type or borrowck error); SRC a view valid for the process, frozen buffers; the translator's last shapes; a copied/cloned iterator's items; two rust-edition wrong-value fixes (a let-bound literal shift typed i32) |
 | 0.27.8 | `v0.27.8` | 0.27.7 | aarch64-macos | open integer locals one variable (a wrong-value fix); a unit-only enum's derives by its discriminant (rustc's order and hash; one compare); three data races of released compilers fixed; `&mut` to raw pointer reborrowed, fat raw pointer coercions |
+| 0.28.0 | `v0.28.0` | 0.27.8 | aarch64-macos | one language: the MVS edition, the translator, the own pass and the old std removed (compiler/std2 is compiler/std); no default arguments; an index is a `usize`; a panic is only `panic`, `#[terminates]`, `Hash::hash` `#[pure]`, the tools name `static`; six bugs of 0.27.8 fixed (an endless loop compiled away, a `&mut` field written through `&self`); the tools' cache bounded |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.28.0
+
+One language. vole has Rust's surface and nothing else: the MVS edition
+is removed from the compiler, from std, from every test, example, guide
+topic and Book chapter, with the translator (`fix --edition rust`), the
+own pass, the migration fixers and the edition switch. `--edition mvs`
+is refused; `--edition rust` is accepted and ignored, deprecated, and
+goes in 0.29; the `// EDITION: rust` line is a comment, removed from
+5786 files. compiler/std2 is compiler/std, and the old std is deleted.
+A program 0.27.8 compiled in the rust edition compiles as before but
+for these: no parameter has a default value (named arguments stay); an
+index is a `usize` and nothing else ("an index is a 'usize', got
+'i64'", with an exact fix; about 215 places in the tree); a panic is
+only `panic` in an effect list; printing is `io static panic`, without
+`diverge` (std's own `#[terminates]`) and with the `static` the tools
+left out and now print; a list lacking `tls`, `thread` or `sync` is
+reported outside std; `Hash::hash` is `#[pure]`. Six bugs that 0.27.8
+has are fixed: an endless loop compiled away at -O2, `!` of a literal
+typed `i32`, a `&mut` field written and reborrowed through `&self`, a
+`_` parameter of a type with a destructor, no `--trace` for a program's
+own panic, references compared by address. The tools' cache is bounded
+(1 GB, `VOLE_CACHE_LIMIT`). An MVS program does not compile: translate
+it with 0.27.8 first, the last compiler that can. Known regressions:
+std's text functions and iterator chains are slower than the old
+edition's (measured once, under load; investigated in 0.30), and
+`usize` indexing has holes (0.29). Built and tested on aarch64-macos
+only; the Linux targets were cross-built, not run.
+
+#### What is gone
+
+- **The MVS edition.** `--edition mvs` and `VOLE_EDITION=mvs` are
+  refused: "the MVS edition is gone (0.28.0): there is one edition,
+  Rust's surface (volec guide rust); 0.27.8's `volec fix --edition
+  rust` translates a program". The front's MVS branches are deleted:
+  the compiler has no edition field and no test of one (95 files, 727
+  lines added, 2432 deleted), and the sources the compiler writes
+  itself (std::arch's modules, the `--check-unsafe`,
+  `--profile-generate` and `--trace` runtimes, a C import) are in the
+  one language.
+- **The edition switch.** There is no edition to choose. The `//
+  EDITION: rust` line is a comment like any other (case
+  `edition_line_comment`). It was removed from 5786 files of the tree
+  and is kept in compiler/src/main.vl and in tests/cost's programs,
+  for the previous release's sake: 0.27.8 builds the first and
+  measures the second. `--edition rust`, `--edition=rust` and
+  `VOLE_EDITION=rust` are accepted and ignored, silently; the option
+  tables call the flag deprecated, and it goes in 0.29 (case
+  `edition_flag_ignored`). Any other value: "unknown edition
+  (--edition rust is the only one, deprecated and ignored: leave the
+  option out)".
+- **The translator**: `volec fix --edition rust`, its rewrite table's
+  use in the compiler, gate 3 (compiler/src a fixed point of the
+  translator), the flip rehearsal and their tests.
+- **The own pass**: front/own, `--values`, `query own`, `query views`,
+  the `own.*` codes (all but `own.interior_copy`, which the cell check
+  still raises) and tests/own-try. Ownership is the borrow
+  checker's (`borrowck.*`, rustc's rules, checked against rustc by the
+  twin).
+- **The old std** (compiler/std, 94 source files, and its embedded
+  text): deleted. compiler/std2 is `std` now, at compiler/std, and
+  tests/std2 is tests/std; the `VOLE_STD2` switch is gone with it. In
+  a vole repository the tools name std's files again (`query def
+  str::trim` answers compiler/std/str.vl). Names inside the compiler
+  and the tests still say std2 (the `std2_*` cases, the `VOLE_STD2_*`
+  debugging variables, `--std2-check`, the gate's std2 rows): renamed
+  in 0.29.
+- **The migration fixers**: `fix --only buf, casts, fstring, rawptr,
+  statics, std015, usize, values, conventions` and the `conv.rust`
+  fixes (91 files, 13.5k lines); the refactor table; `refactor
+  signature --convention`; six `explain` entries of codes only MVS
+  raised (`conv.marker`, `conv.marker_extra`, `own.readonly`,
+  `syntax.defer`, `type.impl-position`, `where.unsupported`); the
+  fuzz-sem gate row with tools/semfuzz and tools/sinksweep.
+- **evals/ and tests/agent-eval/** (1209 files, 260 of them MVS
+  programs). They may come back in the one language.
+- **MVS in the VS Code extension**: editors/vscode 0.28.0's grammar is
+  the one language's: no `inout`/`sink`/`var`/`defer` keywords;
+  lifetimes, `&mut`, `dyn`, `impl` in types.
+
+#### What changes for a program
+
+- **No default arguments; named arguments stay.** `fn f(x: i64 = 3)` is
+  the error `syntax.default-arg` (it has an `explain` entry and a
+  fix). A call may still name its arguments, `f(x: 3)`, in the declared
+  order: a documented difference from Rust (`volec guide rust`).
+  Defaults may return later. std::gpu's four long calls are split
+  instead: `write_texture` / `write_texture_region`,
+  `copy_texture_to_buffer` / `copy_texture_to_buffer_region`, `texture`
+  / `texture_array`, `Reflection::bind` / `bind_sized`. *Cases:*
+  `err_args_defaults`, `args_named`, `err_args_named`.
+- **Indexing takes `usize` only.** `v[i]` with `i: i64` (or any other
+  integer type, a `u8` too) is a type error, as in Rust, and so is an
+  end of `v[a..b]`: "an index is a 'usize', got 'i64'". The fix is
+  exact: `volec fix --suggested` writes `i as usize`; where the
+  variable is only an index, declaring it `usize` is the better change.
+  An integer literal or an open local used as an index is typed
+  `usize`. 0.27.8's rust edition took any integer (the divergence FR6
+  of front-rust.md, replaced by rule F20.8); about 215 places in the
+  tree were changed (std 42, the examples about 158, the tests, the
+  guide and the Book the rest; compiler/src and bench none). Known
+  holes: "Known regressions and limits". *Cases:* `err_index_usize`,
+  `rust_t_index_usize`, `rust_t_index_types_open_local`, the transcript
+  tests/refactor/indexusize.t.
+- **A panic is `panic`, and nothing more.** In a declared effect list a
+  function that may panic has `panic`; it no longer has `diverge` for
+  that. `diverge` means only: may loop forever or recurse without
+  bound. A function declared `#[effects(panic)]` that only asserts
+  checks. A `while` with a bound that cannot change and a loop over one
+  of std's iterators that end by themselves are counted, not
+  `diverge`. *Cases:* `rust_t_effects_counted_while`,
+  `rust_t_err_effects_counted_while`.
+- **Printing is `io static panic`.** std has a std-only attribute,
+  `#[terminates]`, for a function whose loop ends for a reason the
+  checker cannot see (a write retried only when interrupted, the digit
+  loops of the number formats); each use has its `// terminates:`
+  comment, and no code is compiled on the promise. It removes `diverge`
+  from printing: `println`, `print`, `eprintln` and `eprint` were `io
+  panic diverge` on this std. A value whose own `Display` loops still
+  brings `diverge`. A program cannot write `#[terminates]`: "unknown
+  attribute 'terminates' (#[terminates] is std's own: ...)". *Cases:*
+  `rust_t_effects_terminates`, `rust_t_err_effects_terminates`,
+  `rust_t_err_effects_terminates_arg`.
+- **The tools name `static`.** `query effects`, `query show`,
+  `--print-effects` and the LSP's hover left `static` out of a set's
+  text while the checker compared it, so a function that prints was
+  shown as `io panic` and `#[effects(io, panic)]` on it was refused.
+  They print what the checker enforces: a printing function is `io
+  static panic` (a failed write reads errno, a C static), and that is
+  the list `#[effects(...)]` must have. The effect is kept, not
+  exempted: std will stop reading errno in 0.29 and `static` leaves
+  printing then. *Case:* `effects_agree` (tests/query/effagree: 21
+  functions, each answer accepted as a list and refused with any word
+  removed, for the host and both Linux targets).
+- **A list lacking `tls`, `thread` or `sync` is reported.** The checker
+  accepted a declared list without these three; it reports them now in
+  a program's functions. std's own lists are exempt for the three
+  until they are regenerated in 0.29.
+- **`Hash::hash` is `#[pure]`** again, so an impl is checked for it and
+  a `#[pure]` function may hash. An impl that prints, allocates or
+  reads a static is refused for every Hasher; what the Hasher's own
+  methods do is not the impl's. *Cases:* `rust_t_effects_hash_pure`,
+  `rust_t_err_effects_hash_pure`.
+- **Effect declarations are checked** in every program (`#[no_io]`,
+  `#[no_panic]`, `#[pure]`, `#[effects(..)]`): what comes through a fn
+  value, a closure or a Drop counts; a Formatter's effect is its
+  sink's (a `format_in` allocates, a `println` is io). See the front's
+  entries below.
+- **A collection type without its allocator** (`Vec<i64>`,
+  `HashMap<K, V>`, `HashSet`, `BTreeMap`, `String`) is `alloc.default`,
+  "'Vec' names no allocator: its 'A' is written, last", with a fix
+  (`fix --suggested` writes `, Gpa`); a HashMap was reported as a wrong
+  count of type arguments before.
+- **std::arch's `has` and `detect` take a `&str`**; `raw::` loads take
+  `*const T` and stores `*mut T` (a store given `&x` is refused).
+- **Messages print Rust's types**: `&T`, `&mut T`, `&[T]`, `&str` (not
+  'let T', 'inout T', '[T]'). A value given where `&mut T` goes gets
+  the help and the fix `&mut x`.
+- **Stricter, as rustc** (programs 0.27.8 accepted): a statement's
+  temporaries end with the statement (E0716); a `static mut` of a
+  reference holds only `'static` (E0597, E0521); an array of references
+  keeps its loans (E0502); a `&mut` field is not writable through
+  `&self` (E0594, E0596, below); each operand of `&&` and `||` drops
+  its temporaries before the next.
+
+#### Bugs fixed that 0.27.8 has
+
+1. **An endless loop could be compiled away** (-O2, the default level;
+   both editions). Dead code elimination (middle/adce) gave a block
+   that reaches no exit no control dependence, so the branch into a
+   loop with no exit was rewritten to its other arm and the program
+   ran into a trap: exit 133. examples/httpd died after "Serving ...".
+   A branch into an endless loop is live now. *Case:*
+   `rust_t_endless_loop_c_call`.
+2. **`!` on a literal was typed `i32`.** `x & !(1 << 40)` with `x: i64`
+   cleared bit 8, not bit 40: the operand of `!` was typed by itself,
+   not by the expression it is in. It has the type its use gives it, as
+   rustc's `{integer}`. *Case:* `rust_t_not_literal_context`.
+3. **A `&mut` field could be written and reborrowed through `&self`.**
+   With `v: &mut i64` in a struct, `*self.v += 1` and `&mut *self.v`
+   were accepted in a `&self` method: any number of `&mut` to one value
+   from one shared reference. The mutability check follows the whole
+   path now (rustc's E0594 and E0596). A soundness hole of every 0.27
+   release's borrow checker. *Cases:* `rust_b_err_mut_behind_shared`,
+   `rust_b_reborrow_result`.
+4. **A `_` parameter of a droppable type crashed**: `fn f(_: Vec<T,
+   A>)` segfaulted at run time: -O1 and -O2's lowering skipped the
+   parameter, -O0 gave it no slot of its own, and its drop read
+   nothing. *Case:* `rust_t_underscore_param_drop`.
+5. **A program's own panic printed no trace under `--trace`** on the
+   std that is now the only one: only the compiler's checks did. Every
+   panic prints it: `panic`, `unwrap`, `expect`, an index out of
+   bounds. *Cases:* `trace_std2_unwrap`, `trace_std2_expect`,
+   `trace_std2_option_expect`, and `trace_unwrap`, `trace_bounds` on
+   the one std.
+6. **`&a == &b` compared addresses.** Two `&u8` (any references with no
+   impl of their own) compared with `==` compared the pointers; they
+   compare the values, as in Rust; `std::ptr::eq` compares addresses.
+   *Case:* `rust_t_ref_eq_instance`.
+
+Also fixed, not in a released compiler's default path: the three
+borrow-checker gaps, `#[thread_local] static mut` on the new std, a
+`&mut` moved into a C variadic (their entries below); `SYS_O_DIRECTORY`
+was aarch64-linux's value, 0x4000, on both Linux targets and is
+x86_64-linux's own there now, 0x10000 (case `sys_o_directory_target`).
+
+#### std
+
+std is the std that 0.27.2 began as std2, with Rust's names and
+shapes. The old std's 3402 public items were compared with it one by
+one (2132 the same item, by name; the rest by decision):
+
+- **Renamed or moved to Rust's shape** (0.27.8's translator rewrote
+  the calls): std::math's functions are methods of `f32` and `f64`
+  (`x.sin()`), its constants `std::f64::consts::NAME`; std::num's
+  limits are `i64::MAX`; `count_ones`, `leading_zeros`, `to_bits`,
+  `from_bits`, `from_str_radix`, the `wrapping_*`, `checked_*`,
+  `overflowing_*` and `saturating_*` families are the integers' own
+  methods; `parse_int`, `parse_f64` are `s.parse::<T>()`; `trim`,
+  `split`, `split_whitespace` are `str`'s methods and iterators (no
+  allocator); `CodePoints` is `s.chars()` and `s.char_indices()`;
+  the `atomic_*` functions are `AtomicT::{load, store, swap,
+  compare_exchange, fetch_*}`; `Mutex::with` is `m.lock().unwrap()`
+  with a guard, `Condvar::wait(guard)`; the sorts are `[T]::sort_by`,
+  `sort_unstable_by`, `sort_by_key`; `Duration::ZERO`, `Duration::MAX`;
+  `BTreeMap::range(a..=b)`; `Vec::try_reserve` for `try_push`.
+- **Gone on purpose**: `eq_of`, `cmp_of`, `clone_of`, `hash_of`,
+  `Freeze`, `AllocFree`, `Buf`, `Vec::set` and every `free` (a value is
+  dropped: Drop), `fmt_to_vec`, `print_int`, `io::writeln`,
+  `time::sleep`, `fs::append`, `fs::SeekFrom` (64 items, each with a
+  replacement in std); the implementation modules that were public
+  only because the old std had no private ones (raw_table, group,
+  btree_node, the unicode and num tables); `std::num::Int` and
+  `std::math::Float` (generic code takes the `std::ops` traits);
+  `FmtSpec` and `Interp` (a hole's spec is the `Formatter`'s);
+  `Pattern`'s methods (a pattern is a `char`, a `&str`, a closure or a
+  slice of chars).
+- **New in 0.28.0**: std::path (`Path<'a>`, `PathBuf<A>`), std::random
+  (xoshiro256++), std::sys (the OS layer), std::capture, std::unicode
+  public (graphemes, widths); `u64::carrying_mul`;
+  `std::num::Wrapping<T>`; `str::floor_char_boundary` and
+  `ceil_char_boundary`; u8's ASCII methods (`is_ascii_digit`,
+  `to_ascii_uppercase`, `eq_ignore_ascii_case`, ...);
+  `Instant::as_nanos`; float formatting rounds ties as Rust's; a
+  blanket impl through a bound (`m.range(..)`, `v.drain(..)`),
+  `K: Borrow<K>` with `&str` keys, `Option<&T> ==`.
+- **Cheaper to build**: std::collections and std::unicode are read
+  only by a program that names them; std's own names (`__rt`,
+  `__assert_fmt`) are in no listing and no completion.
+- **Still missing** (each a decision for after 0.28): `std::Scanner`;
+  `hash_u64`, `hash_mix`; number-to-bytes without a Formatter
+  (`fmt_i64`, `write_f64`, `f64_shortest`); a streaming UTF-8 decoder;
+  `memrchr` and the UTF-8 byte helpers; `env::var_is_set`; `Default`
+  for `Vec` and `String` (no allocator to default to); BTreeMap's
+  `iter_mut`, `values_mut`, `retain`, `append`, `split_off` and the
+  sets' `union`, `intersection`, `difference`; exact `str::graphemes`
+  and `width` (std::unicode has them).
+- Linux: the effect lists of std::sync's locks, `sys_errno`,
+  `sys_environ` and `fs::remove_dir_all` were wrong for Linux builds;
+  fixed, and the suite's effect cases build for both Linux targets.
+
+Known divergences from Rust kept in 0.28.0 (`volec guide rust`): named
+arguments; allocators are explicit (`Vec::new_in(gpa)`, `gpa: Gpa` from
+`main`); `*const T` and `*mut T` are one type and a slice has `.ptr` /
+`.len` in unsafe code (both go with 0.29's raw-pointer work); no
+user-defined unsized types (`Path<'a>` is a sized view); no rvalue
+static promotion.
+
+#### Tests, tools, docs
+
+- tests/run: every case is in the one language. Of the 2872 MVS cases
+  at the start, 1900 were translated and pass, 819 were translated and
+  marked `// XFAIL: gap N`, 126 deleted, 27 rewritten by hand later.
+  XFAIL now: 732 (131 in 0.27.8). The gate's suite on the final tree,
+  at each of -O0, -O1 and -O2: 6273 passed, 732 xfail, 0 failed, 1
+  skipped (no spirv-val).
+- The transcripts (tests/query, tests/refactor, the LSP sessions, the
+  walkthroughs), the guide (`volec guide`: every block compiled), the
+  Book, `explain`, the examples (all of examples/, with their cases:
+  `tests/run.sh example example_build`), bench (bench/gpu's two draw
+  programs included, with build cases `bench-gpu-draws` and
+  `bench-gpu-draws-hal`), tests/wgsl, tests/gpu and the fuzz and ABI
+  generators are in the one language.
+- `tools/mvs-census.py --no-allow` is a gate row (`mvs-census`): 0
+  entries, and no allow list.
+- **The tools' cache is bounded.** `check FILE` and the queries wrote
+  about 12 MB per program into target/volec-cache and never removed
+  any: a suite left 80 to 100 GB. The cache is held to 1 GB
+  (`VOLE_CACHE_LIMIT`, in MB), the least recently used files going
+  first, and tests/run.sh runs without it (`VOLE_CACHE=off` unless
+  set).
+- **First contact.** The help texts and the guide were checked by a
+  fresh-reader pass: eight small programs written from `volec guide`
+  and the errors alone. Fixed from it: helps and `try:` lines that
+  named the old edition's words (`inout`, `sink`, `var`, the old std's
+  items) or that failed when run; the macro and `dyn` helps;
+  `"x".into()`, `&5`, `join`/`concat`, `Stdin::lock`; `explain`'s
+  `conv.*` and `edition.*` entries; the guide's std index (under 30k
+  bytes). What is left: "Known regressions and limits".
+- AGENTS.md, docs/query.md and the guide describe one language; the
+  hooks (tools/agent-hooks, tools/git-hooks) and tools/premerge.sh
+  pass no edition. AGENTS.md has a paragraph for harnesses without the
+  hooks (only git's hooks run there): what to run by hand after an
+  edit and before a commit.
+- compile-cost's rows are hello, std, check, rust and regions, each
+  against 0.27.8's build of the same program, and hello-0.27: the
+  hello world against 0.27.8's build of it as an MVS program, at most
+  2.00x (the row retires itself with the next release).
+- The VS Code extension is 0.28.0.
+
+#### Known regressions and limits
+
+- **std's text functions are slower than the old std's.** Measured
+  once each, on a loaded machine, so orders of magnitude only
+  (bench/std has the programs; MB/s, old std then 0.28.0): UTF-8
+  validation 63072 to 4258 on ASCII and about 14700 to 1100-1700 on
+  other kinds of text (`std::str::from_utf8` against the old
+  `validate_utf8`, which had a SIMD fast path for ASCII); counting
+  chars 2873 to 298 and 1183 to 257 (`s.chars().count()`); width 4579
+  to 2125; the terminal's feed 3194 to 1736; graphemes 1339 to 861 on
+  source text (equal on non-ASCII kinds). **An iterator chain is about
+  3x slower than the index loop**: `s.iter().filter(|c| **c ==
+  b).count()` over 64 MiB took 31.6 ms against the loop's 10.3 ms (the
+  SIMD form: 2.1 ms); the old edition had the two equal, and the
+  Book's chapter 16 says the chain is slower. Not fixed in 0.28 or
+  0.29: 0.30 has a deep investigation of both (measured on an idle
+  machine first; lost SIMD paths, adaptors that do not collapse,
+  bounds and overflow checks).
+- **`usize` indexing has holes** (0.29): an index that is the value of
+  a `match`, a loop or a closure is still widened (`a[match x { _ =>
+  k_u8 }]` passes); `keys[a]` with `a: &usize` is read through;
+  raw-pointer indexing inside std::ptr takes any integer; std's bodies
+  are checked when instantiated, so a generic body of std that no
+  program in the tree instantiates could still hold another integer
+  type.
+- **std is exempt from the `tls`, `thread`, `sync` check.** Its own
+  lists lack `sync` in more than 50 places; they are regenerated in
+  0.29 and the exemption goes. `thread::scope`'s set names
+  `alloc(CHeap)`, a private type no program's list can spell (bare
+  `alloc` admits it). For a function declared with a wider list, the
+  query prints the declaration, not the smallest list its body would
+  accept.
+- **Loops over `s.chars()`, `.bytes()`, `.lines()` and
+  `.char_indices()` are counted as `diverge`** in a program (the rule
+  for std's ending iterators reaches only the generic ones), and so is
+  printing a HashMap, HashSet or BTreeMap with `{:?}`, or an
+  `io::Error`. 0.29.
+- **First-contact rough edges left** (0.29):
+  - after an `alloc.default` in a generic item, the rest of the check
+    still assumes `Gpa` for it;
+  - `#[derive(Clone)]` over an `Option<&mut T>` field is refused with
+    no help of the derive's own;
+  - `.collect()` on an adapter over a program's own iterator says "no
+    method 'collect'", with no hint of `collect_in`;
+  - `std::cmp::Reverse(x)` written by its path "is a type, not a
+    value";
+  - a closure parameter `|&&x|` is not parsed;
+  - `volec guide --find Reverse` prints only a budget note;
+  - five `explain` entries (`conv.place`, `conv.sink_type`,
+    `conv.extern`, `edition.std_copy`, `edition.std_by_value`) say
+    "not raised": their dead sites and the entries go together;
+  - docs/grammar.md still describes 0.26's language in places.
+- **Residue of the old edition in names**: `--edition` (ignored), the
+  `edition.*` codes (ordinary errors, renamed in 0.29), std2 in the
+  names of cases, variables and gate rows.
+- **The gate has no value-semantics fuzz.** The fuzz-sem row (drops and
+  leaks against a model) generated the old edition's programs; it is
+  dropped until its port in 0.29. The fuzz generators lost the slices
+  written while their array is read (the borrow checker refuses them;
+  35 of 460 written loops) and gained the borrow check, the noalias
+  facts and the drops.
+- **Not tested on Linux in this release.** Hosts: aarch64-macos. The
+  Linux targets were cross-built only (the cases marked `CROSS` build
+  for aarch64-linux and x86_64-linux; the effect checks were run with
+  `check --target`); no program was run on Linux and no container row
+  ran.
+
+#### Numbers
+
+- Files the edition line was removed from: 5786 (5768 lines in 5735
+  files, 20 in strings of 12 files, and the positions that moved in
+  1197 transcripts and expectations).
+- `git diff --shortstat v0.27.8 v0.28.0`: 8057 files changed, 237,534
+  insertions, 1,672,151 deletions (evals/ and tests/agent-eval/
+  1,380,820 of the deletions; the old std with its tools and tests
+  69,967; the translator 18,602; the own pass 12,759). compiler/src:
+  508 files and 287,037 lines in 0.27.8, 473 and 264,948 now.
+- Places where an index became a `usize`: about 215.
+- The suite: 6273 cases pass at -O0, -O1 and -O2, 732 XFAIL (0.27.8:
+  7027 and 131).
+- Compile cost against v0.27.8, in instructions: a hello world 172.5 M
+  (0.98x), std 1214.5 M (0.97x), check of the compiler 21,199.8 M
+  (0.13x), regions 1203.7 M (0.13x). The hello world against the MVS
+  hello world of 0.27 (98.0 M): 1.76x, at most 2.00x. The `rust` row is
+  gone: every row is the one language.
+- The compiler's binary: 11,904,376 bytes (13,678,200 in 0.27.8). Its
+  own check, 21,199.8 M instructions, is the baseline 0.29 is held to.
+- unsafe-audit: 2573 unjustified sites in compiler/src (2769 in
+  0.27.8), 0 in std.
+- bench (`gate.sh --only bench`, idle machine, time against `cc -O2`
+  = 1, geomean): -O2 1.162, -O1 2.282, -O0 13.375; 0.27.8 building the
+  same programs: 1.185. **The row fails its iterator check**: iterchain
+  takes 2.37 times iterloop (the limit is 1.05; 2.29 with 0.27.8 on the
+  same sources), so std's iterator chains are not zero cost. Known, and
+  the first item of the speed work in 0.30. Eight bench programs
+  multiplied and added past 64 bits in generators and checksums, a
+  panic at -O0 in the one language; they say `wrapping_mul` and
+  `wrapping_add` now and print what they printed.
+- Found by the gate and fixed before the tag: at -O2 with threads, the
+  phi ranges' tables were emptied when they grew, and whether they grew
+  in the middle of an analysis depended on what the thread had compiled
+  before, so a large function's code could depend on the schedule
+  (objcheck's x86 row: 1 of 260 differed). As old as 0.18.1; the new
+  std's code showed it. `tests/threads.sh` repeats that program. The
+  layout check compared 4 records for 111 (it lost a record whose C
+  name is followed by a derive line), and the thread check's repeated
+  program did not build (a stale XFAIL).
+
+---
+
+#### During the release
+
+The entries below were written as the work went. Where one compares
+with MVS or names std2, the old edition and the old std were still in
+the tree; both are gone at the tag, and std2 is std.
+
+Indexing:
+
+- **An index is a `usize`.** `a[i]` and the ends of `a[i..j]`, of an
+  array, a slice, a `str` or a Vec, take a `usize` and nothing else, as
+  in Rust (rustc E0277): no other integer type, and no widening to it
+  (a `u8` index is converted too). Until now any integer type indexed,
+  the divergence FR6 of front-rust.md, which is removed (F20.8 there).
+  An untyped literal and an open local still take `usize` from the
+  index. The error, `an index is a 'usize', got 'i64'`, has an exact
+  fix: `volec fix --suggested` writes `i as usize`, `(i + 1) as usize`,
+  and of an index that is itself a cast of an integer changes the
+  cast's type (`hex[(b >> 4) as i64]` becomes `hex[(b >> 4) as
+  usize]`). `fix` makes these although the type converted from holds
+  values a `usize` does not: an index out of range before the
+  conversion is out of range after it, the same panic. Where the
+  variable is only an index, declaring it `usize` is the better change.
+  std2's fmath (42 indices of signed counters), nine examples and one
+  case were converted. *Cases:* `err_index_usize`,
+  `rust_t_index_usize`, the transcript `tests/refactor/indexusize.t`.
+
+The places IR:
+
+- **A condition's `&&` and `||` are control flow.** In `if`, `while`, a
+  match guard and a `!` of one, the rust edition now branches on each
+  operand in turn: `a && b` sends `a`'s false edge to the else branch
+  and its true edge to `b`, and `!` swaps the targets (places::build
+  cond_into). MVS's lowering and rustc's MIR do the same. 0.27.8 made
+  the bool first, assigned on each path, then branched on it: a phi and
+  a branch the optimizer did not thread, at every such `if` and `while`.
+  In the flipped compiler that was most of what remained of its gap to
+  the MVS build, after derive278: ir_val, a `while r != 0 && ..` loop,
+  was 168 bytes against 104 and was no longer inlined, and form_lcssa
+  and simplify_cfg were four to five times their MVS size. With it, the
+  flipped compiler on the MVS tree took 9.04 G instructions to check
+  (9.74 G before) and 99.4 G to build itself (108.5 G), against 8.55 G
+  and 96.4 G for the MVS build. A `let`'s `a && b`, a value, is built as
+  before.
+  *Cases:* `rust_f_short_circuit_ir` (no phi in an `if` of `&&`, `||`
+  and `!`), `rust_f_short_circuit_order` (a rustc twin: the operands'
+  effects in order, the right one only when the left does not decide).
+- **Each operand of `&&` and `||` is a terminating scope**,
+  as in rustc. An operand's temporaries are dropped before the other
+  operand runs, both in a condition and in a value (`let v = a && b`).
+  0.27.8 dropped them at the end of the condition or the statement, so
+  `l.lock().a() > 0 && l.lock().b() > 1` held both guards at once, a
+  deadlock with a real lock. In a condition, an operand's value is kept
+  in a temporary, its scope ends, and only then does the branch read
+  it. *Case:* `rust_f_short_circuit_drops`, a rustc twin with 47 lines
+  of drop order: `if`, `while`, a match guard, `!`, `let` values, and
+  two guards of one lock.
+
+std2:
+
+- **`Vec::push` is inline.** Its `ensures` clauses made every push a
+  call of `push$body`, out of line. They are `debug ensures` now, which
+  `volec test` checks. The fast path is a compare, one copy of the
+  element into its slot and an increment, and the growth is
+  `grow_one`, out of line. The flipped compiler's check of its own tree
+  went from 51.5 G instructions to 47.6 G.
+- `ptr::read` and `ptr::write` are `#[inline]`, as rustc's are. A copy
+  of a large element was a call; measured alone, the gain is in the
+  noise.
+
+The translator and the migration of tests/run:
+
+- **tests/run's MVS cases move to the rust edition.** There were 2872
+  cases without `// EDITION: rust`:
+  - 1900 are translated by `fix --edition rust`, or by hand where its
+    output fell short, and pass at -O0 and -O2. An error case's `ERROR`
+    lines name the rust edition's code at the translation's position. An
+    ownership case is kept only where rustc rejects it too, with the
+    same code (the borrowck twin).
+  - 819 are translated and marked `// XFAIL: gap N: REASON`. N names
+    what they wait on: the translator, the front or std2 (the groups
+    are in the case's line). An XFAIL case that comes to pass fails the
+    run (XPASS), so the line goes as soon as its gap closes. Where rustc
+    disagrees with the rust edition's code, the case expects rustc's.
+  - 126 are deleted. They are MVS-only checks (own.readonly through a
+    `let`, MVS's type and parser errors that Rust allows,
+    sync.scope_shared_write, item.deprecated), or rustc accepts their
+    translation.
+  - 27 were left for a rewrite by hand (readme_example, and 26 whose
+    translation rustc rejects for its shape); all are rewritten or
+    deleted by the end of the release.
+- **`collect_in`'s turbofish names both type arguments.** std2's
+  collect_in takes the collection and the allocator; `fix --edition
+  rust` wrote `collect_in::<Vec<_, _>>(a)`, one of the two. Where the
+  value goes to a written type (a let's annotation, the function's
+  result: rewrite.tsv's new `use=typed` condition) the call is
+  `collect_in(a)`; elsewhere `collect_in::<C, _>(a)`, with C, the
+  collection, in full (rewrite.tsv's `$T`), because the front does not
+  infer a `Vec<_, _>` from FromIteratorIn's impls.
+  *Transcript:* `tests/refactor/edition0280m1`.
+- **A call of a closure, a fn pointer or an `F: Fn(..)` borrows its
+  `let` arguments.** Before, only a call of one of the program's
+  functions borrowed them (`&e`). A value's call passed them by value,
+  which is a type error where the parameter became `&T`. A closure's
+  parameter written `let T`, and a `let` position of a parameter's
+  `fn(let T)` type or of its `F: Fn(let T)` bound, take `&arg` now.
+  *Transcript:* `tests/refactor/edition0280m2`.
+- **A field of reference type written through gets its `*`**, as a
+  reference binding does where Rust does not dereference it itself. One
+  example is `*c.n += 10` for MVS's `n: inout i64`; a copy's read is
+  another. *Transcript:* `tests/refactor/edition0280m3`.
+- **An inout view given as a value is `&mut v[a..b]`.** That covers a
+  `-> inout [T]` result and a let's view; both kept a `&`, a `&[T]`
+  where `&mut [T]` goes. *Transcript:* `tests/refactor/edition0280m4`.
+- **Two more byte values print as text.** They are what a function
+  written `-> Option<[u8]>` gives, unwrapped, and a Vec element taken by
+  `get`, `first`, `last` or `pop`. *Transcript:*
+  `tests/refactor/edition0280m5`.
+- **MVS's `{x:c}` prints a character.** The rust edition has no `c`
+  spec and printed the number. The value is `x as char` (`x as u8 as
+  char` for a wider integer). A positional argument is wrapped; a named
+  hole is `{x_c}`, with `x_c = x as char` added to the call once.
+  *Transcript:* `tests/refactor/edition0280m6`.
+- **An `embed wgsl` block derives nothing, and imports go after a
+  file's leading blocks.** The translator wrote `#[derive(Clone, Copy)]`
+  inside the block's declaration, because the checker makes a struct of
+  it. A file starting with a block got its imports on the block's line,
+  and fmt then formatted the WGSL as vole. The imports now go on the
+  line of the first item after the blocks. *Transcript:*
+  `tests/refactor/edition0280m7`.
+- The borrowck twin checks type-error cases: an `ERROR` naming no
+  borrowck code agrees with a rustc rejection by a code the borrowck
+  table does not map (E0308, E0277). The shim's `collect_in` takes two
+  type arguments.
+
+Two crashes in the rust edition:
+
+- **`#[thread_local] static mut` works.** std2 had no
+  `std::thread::__tls_addr`, which the compiler calls for every access
+  of a thread-local. An executable build stopped with "internal error: a
+  thread-local without std::thread", and an object build crashed. std2's
+  thread module now has it, kept the same way MVS std's is: C's
+  thread-specific data, with one key per thread-local found by its
+  initial value's address in a lock-free table, and each thread's copy
+  made from the initial value at that thread's first access and freed
+  when the thread ends. A program that writes `thread_local` asks the
+  lazy std2 build for `__tls_addr`, since no source names it. *Case:*
+  `rust_f_thread_local_std2` (two scoped threads and main, each with its
+  own copy).
+- **A `&mut` given to a C variadic's `...` is moved**, as in rustc.
+  Nothing there coerces it, so it is not reborrowed. 0.27.8 copied it,
+  and `--verify-places` refused the body (I7). A later use is
+  `borrowck.use_moved` (rustc E0382, checked by hand, since the twin
+  tools skip an `extern` block), and its `try:` is the reborrow `&mut
+  *r`, not `.clone()`. *Cases:* `rust_b_variadic_mut_ref` (with
+  `--verify-places`; sscanf writes through it),
+  `rust_b_variadic_mut_ref_moved_err`.
+
+The borrow checker: three gaps that accepted programs rustc
+rejects and that used memory after it was freed (mig28's soundness
+group, 12 cases of the views audit):
+
+- **A statement's temporaries end with the statement.** A `let` kept
+  its initializer's temporaries to the block's end whenever its type
+  was a view. Now, as rustc's rule, only an extending initializer keeps
+  them: `&e`, or a tuple, array, braced struct or cast of one. `let w =
+  v[0].clone().as_str();` borrows a temporary that is dropped at the
+  `;`, and a later use of `w` is `borrowck.dropped_borrowed`, "a temporary value
+  is dropped at the end of its statement" (rustc E0716). *Cases:*
+  `rust_b_temp_dropped_err`, `rust_b_temp_extended_ok`.
+- **A static's slots are `'static`.** A `static mut` of a reference
+  had a free region, so storing a local's borrow there was accepted,
+  directly or through a function. It is `dropped_borrowed` (E0597) now,
+  or `outlives` through a parameter (E0521). *Cases:*
+  `rust_b_static_holds_local_err`, `rust_b_static_holds_static_ok`.
+- **An array's elements have regions.** An array of references had
+  none, so its loans ended at once, and a write to what they borrow was
+  accepted (E0502 in rustc). *Cases:* `rust_b_array_of_refs_err`,
+  `rust_b_array_of_refs_ok`. `rust_b_err_dk_array_glue` passes now
+  (no XFAIL).
+- Gate 3 found one true positive in the flipped tree. `base::src_copy`'s
+  result was tied to its parameter and stored into `SRC`, which is
+  `&'static`. The copy is in a mapping of its own that is never
+  unmapped or written again, so the translator now lists it as a
+  `'static` result (translate/sig.vl static_result). std2-check and
+  gate 3 are both at 0 errors, as before.
+- Known gap: there is no rvalue static promotion yet (D6.2.2). `&7` and
+  `[&7]` have the body's storage, not `'static`, so
+  `rust_b_unsized_err_raw_slice_invariant` borrows a static instead.
+
+The front for the rust edition:
+
+- **Types print the way rustc spells them.** A rust-edition program's
+  messages printed MVS's words: `&T` as 'let T', `&mut T` as 'inout
+  T', and the views `&[T]` and `&str` as '[T]' and 'str'. They now print
+  `&T`, `&mut T`, `&[T]`, `&mut [T]`, `&str` and `&mut str`, and an
+  unsized `[T]` or `str` prints without the `&` (front/types.vl
+  buf_type). Two gaps remain:
+  a raw pointer still prints as `*T`, because the type does not record
+  const or mut, and no reference prints `&'a T`, because a lifetime is
+  the borrow checker's and not part of the type. 15 cases' `ERROR`
+  lines moved to the new spelling.
+- **Effect declarations are checked in a rust program.** A rust
+  program's `#[no_io]`, `#[no_panic]`, `#[pure]` and `#[effects(..)]`
+  let through whatever came by a fn value: a `println`, a Drop that
+  prints and is reached through a Vec's drop, or a closure the body
+  makes. Each is now the function's own, as in MVS (E3.3b). A panic is
+  `panic diverge`, not io: its message goes out through its own buffer,
+  as MVS's `panic_str` (E1.6). So std2's lists that named io only
+  because they panic were written again by `fix --only effects-std`
+  (181 out, 168 back, 61 of them with io). `fix` takes `--check-alloc`
+  for that run. std2's `assert(true)` is no effect, and its
+  `debug_assert` is dropped outside test builds. `PartialEq::eq` and
+  `Ord::cmp` are `#[pure]`, and `Allocator::deallocate` carries MVS's
+  `Allocator::free` list, so an impl is checked against them, as in
+  MVS.
+- **A Formatter's sink is its maker's effect.** std's `Formatter`
+  writes through a fn value, so every write was the join over every
+  sink of the program: a `println` allocated in any program that
+  formatted into a `String`, a `#[no_io]` function using `format_in`
+  was refused in any program that printed, and a `println("text")`
+  with no hole passed `#[no_io]` and `#[pure]`. Now the effect is
+  counted where the Formatter is made (E4.3a): a print is io, a
+  `format_in` allocates from its allocator, a write into a program's
+  sink does what its `write_str` does, and a `Display` impl has its own
+  body's effects, whatever it is written into. `Formatter::new` is
+  declared `#[effects(W)]`; `print` and `eprint` say `io, static` as
+  `println` does.
+
+std2 gets the rest of MVS's std:
+
+- **std::path.** `Path` and `PathBuf<A>`, with Rust's names and
+  results. That covers components (`Component::RootDir`, `CurDir`,
+  `ParentDir`, `Normal`, from both ends), `iter`, `ancestors`, `parent`,
+  `file_name`, `file_stem`, `extension`, `starts_with`, `ends_with`,
+  `strip_prefix`, `join_in`, `with_extension_in`, `with_file_name_in`,
+  `push`, `pop`, `set_extension`, `set_file_name`, `exists`, `is_dir`,
+  `is_file`, and equality by components. A named divergence: Rust's
+  `Path` is an unsized newtype reached as `&Path`. The rust edition has
+  no user-defined DSTs yet (cut to 0.29), so `Path<'a>` is a sized,
+  copyable view of a `&'a str`, written `Path<'_>` (or `Path`, elided)
+  where Rust writes `&Path`. A component is a `&str` where Rust's is an
+  `&OsStr`, and paths are UTF-8. `PathBuf` derefs to `str` and has
+  Path's methods itself. When unsized newtypes come, `Path<'a>` becomes
+  `&'a Path`. std::fs and `env::set_current_dir` take a path as
+  `P: AsRef<str>`, Rust's `AsRef<Path>` (a `&str`, a `&String`, a `Path`
+  or a `&PathBuf`), not a `&str`. `DirEntry::path` stays a `&str`.
+  *Cases:* `std2_path_path` (a rustc twin: every result on 19 paths, as
+  Rust's), `std2_path_pathbuf`. The ten `sem_views_pth_*` cases run
+  without XFAIL, nine of them as rustc's borrowck errors.
+- **std::random.** MVS's xoshiro256++ generator, vole's own API, since
+  Rust's std has none: `Xoshiro256pp` (seeded from a number through
+  splitmix64, from a state or from the system's entropy), its ranges by
+  Lemire's method, `unit_f64`, `random_bool`, `fill_bytes` and `jump`,
+  plus `shuffle` and `fill_bytes_os`. The outputs are MVS's (and
+  rand_xoshiro's) on the same seeds. *Cases:* `std2_random_xoshiro`,
+  `std2_random_empty_range`.
+- **std::sys.** MVS's OS layer, vole's own at the libc crate's level,
+  with the `sys_` names and `Result<T, i32>` errnos MVS's had. It has
+  files and descriptors, stat, directories, the environment,
+  posix_spawn, signals, waitpid, pseudo-terminals, termios, poll,
+  clocks and getentropy. Rust's std::sys is private, and std::fs,
+  process and env are Rust's API above it. A path, a name or written
+  data is a `P: AsRef<[u8]>`, so a text literal goes where MVS's `[u8]`
+  went. Pointers C only reads are `*const`. The target's numbers
+  (O_NONBLOCK, the TIOC requests, ...) and strerror_r are in
+  std2/rt/sys_macos.vl and sys_linux.vl. *Cases:* `sys_files`,
+  `sys_process`, `sys_pty`, `sys_layout` (struct layouts against the C
+  headers), run without XFAIL and under `--check-alloc`.
+- **std::capture.** The frame-capture request that std::window's
+  scripted loop makes (`shot FILE`) and std::gpu serves when a frame is
+  presented: `capture_next_frame(&str)`, `capture_pending`,
+  `capture_cancel` and `take_capture(&mut String<A>)`. The request is a
+  `static mut`, guarded by an AtomicBool spin lock, so any thread may
+  make or serve one. *Case:* `std2_capture_request`.
+- tools/std2-checklist.py compared std2's items with the old std's.
+  With the old std deleted it is retired, with its tsv files.
 
 ### What's new in 0.27.8
 

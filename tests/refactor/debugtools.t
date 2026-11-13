@@ -3,7 +3,7 @@
 ## where the program was.
 $ test --timeout 1
 test main.vl: 1 passed, 2 failed (3 cases; -O0 and -O2 agree)
-FAIL crash: exit 101 (expected 0): stats.vl:44:13: index out of bounds: index 0, length 0
+FAIL crash: exit 101 (expected 0): stats.vl:44:17: index out of bounds: index 0, length 0
   trace: stats.vl:44 stats::best < main.vl:25 main
   stdout: a best 7
 FAIL hang: no exit after 1 s (--timeout S): stopped by signal 14 (SIGALRM: a time limit)
@@ -18,7 +18,7 @@ ok: built prog
 % ./prog < tests/crash.in; echo "exit $?"
 a best 7
 exit 101
-stats.vl:44:13: index out of bounds: index 0, length 0
+stats.vl:44:17: index out of bounds: index 0, length 0
 trace, innermost call first:
   stats.vl:44  stats::best
   main.vl:25  main
@@ -27,7 +27,7 @@ ok: built plain
 % ./plain < tests/crash.in; echo "exit $?"
 a best 7
 exit 101
-stats.vl:44:13: index out of bounds: index 0, length 0
+stats.vl:44:17: index out of bounds: index 0, length 0
 ## probe: values at a line, the source unchanged. Before the statement
 ## that begins the line; after a `let` (its names visible); in a loop's
 ## body each time round; at the start of a block that the line opens.
@@ -41,19 +41,19 @@ run: exit 0; stdout 4 lines (target/scratch/probe/main.vl/out)
   | a best 7
   | ###
 $ probe stats.vl:44 v --input tests/crash.in
-probe stats.vl:44 (after `var m = v[0];`): 1 time
+probe stats.vl:44 (after `let mut m = v[0];`): 1 time
   #1  v = [3, 7]
 run: exit 101; stdout 1 line (target/scratch/probe/main.vl/out)
   | a best 7
 stderr:
-  stats.vl:44:13: index out of bounds: index 0, length 0
+  stats.vl:44:17: index out of bounds: index 0, length 0
   trace, innermost call first:
     stats.vl:44  stats::best
     main.vl:25  main
 $ probe stats.vl:35 i 'keys[i]' key 'values[i]' --input tests/ok.in --max 2
 probe stats.vl:35 (before `if keys[i] == key && values[i] > 0 {`): 9 times, the first 2 (--max N)
-  #1  i = 0  keys[i] = "a"  key = "a"  values[i] = 3
-  #2  i = 1  keys[i] = "b"  key = "a"  values[i] = 5
+  #1  i = 0  keys[i] = [97]  key = [97]  values[i] = 3
+  #2  i = 1  keys[i] = [98]  key = [97]  values[i] = 5
 run: exit 0; stdout 4 lines (target/scratch/probe/main.vl/out)
   | a best 7
   | b best 5
@@ -77,6 +77,18 @@ run: exit 0; stdout 4 lines (target/scratch/probe/main.vl/out)
   | b best 5
   | a best 7
   | ###
+## (0.28.0) probes in two files of one run (each file's report function
+## has its own name: the two were one symbol, defined twice)
+$ probe main.vl:23 i stats.vl:46 m --input tests/ok.in --max 1
+probe main.vl:23 (each time round `while i < keys.len() as i64 {`): 3 times, the first 1 (--max N)
+  #1  i = 0
+probe stats.vl:46 (before `if v[i] > m {`): 2 times, the first 1 (--max N)
+  #1  m = 3
+run: exit 0; stdout 4 lines (target/scratch/probe/main.vl/out)
+  | a best 7
+  | b best 5
+  | a best 7
+  | ###
 ## --count: how often a line runs
 $ probe --count stats.vl:46 --count stats.vl:36 --input tests/ok.in
 probe stats.vl:46 (before `if v[i] > m {`): 2 times
@@ -87,10 +99,10 @@ run: exit 0; stdout 4 lines (target/scratch/probe/main.vl/out)
   | a best 7
   | ###
 ## the values by type: structs field by field, Option, tuples, slices
-% printf 'struct P { x: i64, name: [u8] }\n\nfn main() -> i32 {\n    let p = P { x: 3, name: "ab" };\n    let o: Option<i64> = Some(2);\n    let t = (1, true);\n    let a = [1, 2, 3];\n    std::print_int(p.x);\n    0\n}\n' > one.vl
-$ probe one.vl:8 p o t 'a[1..]' 'a[0] == a[0]' --root one.vl
-probe one.vl:8 (before `std::print_int(p.x);`): 1 time
-  #1  p = P { x: 3, name: "ab" }  o = Some(2)  t = (1, true)  a[1..] = [2, 3]  a[0] == a[0] = true
+% printf '#[derive(Debug)]\nstruct P { x: i64, name: &'"'"'static str }\n\nfn main() -> i32 {\n    let p = P { x: 3, name: "ab" };\n    let o: Option<i64> = Some(2);\n    let t = (1, true);\n    let a = [1, 2, 3];\n    print("{}", p.x);\n    0\n}\n' > one.vl
+$ probe one.vl:9 p o t '&a[1..]' 'a[0] == a[0]' --root one.vl
+probe one.vl:9 (before `print("{}", p.x);`): 1 time
+  #1  p = P { x: 3, name: "ab" }  o = Some(2)  t = (1, true)  &a[1..] = [2, 3]  a[0] == a[0] = true
 run: exit 0; stdout 1 line (target/scratch/probe/one.vl/out)
   | 3
 ## mistakes

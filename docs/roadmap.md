@@ -2887,6 +2887,50 @@ unsafe-audit 2775 unjustified (baseline 2775, from 3057) and 0 in std,
 chain-diverse, chain-fresh 40 releases. compile-cost against v0.26.5: a
 hello world 1.00x, std 0.99x, check of the compiler 1.01x.
 
+### 0.28.0
+
+The release gate, macOS only (the steps of `gate.sh --list --release
+--no-linux`, run one at a time, `gate.sh --only STEP -j 4`, with
+nothing else building: started together the steps overloaded the
+machine, and gate.sh bounds its parallel steps from 0.29). It took
+three runs. The first stopped at unsafe-audit: nine `unsafe` items of
+std's allocators had no justification (the baseline had counted the old
+std); they got their comments. The second failed four rows: layout and
+threads on their own scripts (the old raw-pointer spelling and a record
+lost behind a derive line; STRESS_GROW's two accessors unknown to the
+list), suite-O1 on an XPASS of `thread_print` (its known race), and
+objcheck-x86-arch on a real fault: at -O2 with threads the phi ranges'
+tables were emptied when they grew, so a large function's code could
+depend on the schedule (1 of 260 compilations differed; as old as
+0.18.1). That was fixed, `tests/threads.sh` repeats the program, and
+its other repeated program, which no longer built behind a stale XFAIL,
+builds again. On the third run, of the whole gate on the fixed tree,
+every row passed on its first run. The rows: the suite 6273 at -O0, -O1
+and -O2 (732 XFAIL; SKIPPED: no spirv-val), std2-tests 1541 at -O0 and
+-O2 under --check-alloc (15 XFAIL, gate 1: 1000), std2-check 3964
+bodies (3962 clean, 0 with borrowck errors, 2 not solved; 1549 cases, 0
+with borrowck errors), threads 15808, incremental 172 series, objcheck
+12808 (and 260 for x86_64-macos), layout 111 records and 582 fields,
+compiler-memcheck 727, examples-checkalloc 185, every fuzz and ABI row,
+voltty-fuzz 1821 scripts, stress-grow, cachediff 1373 lines (422 from
+the cache), borrowck-twin 460 cases (417 agree, 10 named divergences,
+33 outside the subset, 0 mismatches), unsafe-audit 2573 unjustified
+(baseline 2769) and 0 in std, chain-fresh (50 releases from the seed),
+chain-diverse, mvs-census 0 entries (new: the tree holds nothing of the
+old edition). Gone with the release: the translate row and the gate3
+row (the translator is deleted), and fuzz-sem, dropped until its port
+in 0.29. compile-cost against v0.27.8: a hello world 0.98x, std 0.97x,
+check of the compiler 0.13x, regions 0.13x; hello-0.27 1.76x (at most
+2.00x). The bench row, run after the gate on the idle machine, fails
+its iterator check (iterchain 2.37 times iterloop, limit 1.05; 2.29
+with 0.27.8 on the same sources): left to 0.30; the geomean against
+`cc -O2` is 1.162 at -O2 (0.27.8 on the same programs: 1.185). Eight
+bench programs were changed for it (explicit wrapping arithmetic), and
+objcheck and threads, whose corpus holds them, were run again after
+that change and passed. Not run: any Linux row. For a bisect: commit
+c61343438 (a merge on the way to usize-only indexing) does not build by
+itself; the next commit repairs it.
+
 ### 0.27.8
 
 The release gate (`gate.sh --release --no-linux -j 4`), macOS only, at

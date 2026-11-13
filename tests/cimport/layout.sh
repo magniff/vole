@@ -54,7 +54,8 @@ BEGIN {
     print "import \"stdio.h\" as c;\nfn main() -> i32 {\nunsafe {" > tfile
 }
 /^\/\/ C: / { pending = substr($0, 7); next }
-/^#\[repr/ { next }
+# (0.28.0: a record also carries #[derive(Clone, Copy)])
+/^#\[(repr|derive)/ { next }
 /^(struct|union) [^ ]+ \{$/ {
     if (pending != "") { tname = $2; rec_c = pending; active = 1; nf = 0 }
     pending = ""
@@ -68,7 +69,7 @@ active && /^    [^ ]+: / {
 }
 active && /^\}$/ {
     printf "    printf(\"%s %%zu %%zu\", sizeof(%s), _Alignof(%s));\n", tname, rec_c, rec_c > cfile
-    printf "    let p%d = 4096 as *c::%s;\n", ++k, tname > tfile
+    printf "    let p%d = 4096 as *mut c::%s;\n", ++k, tname > tfile
     printf "    c::printf(c\"%s %%zu %%zu\", size_of(c::%s), align_of(c::%s));\n", tname, tname, tname > tfile
     for (i = 1; i <= nf; i++) {
         cf = fields[i]; sub(/^r#/, "", cf)

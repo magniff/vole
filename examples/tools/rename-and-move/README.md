@@ -43,32 +43,32 @@ prints the word, and comments use it. A text search sees all of them:
 
 ```console
 $ grep -n count *.vl
-catalog.vl:9:    pub count: i64,
-catalog.vl:25:        self.books.push(Book { id: id as i64, title: title, author: author, count: n, owned: n });
-catalog.vl:39:            if cat.books[i].count == 0 {
-catalog.vl:42:            cat.books[i].count -= 1;
-catalog.vl:52:        cat.books[i].count += 1;
-loans.vl:38:    ms.list[i].count += 1;
-loans.vl:64:                ms.list[i].count -= 1;
-members.vl:6:    // the count of books held now
-members.vl:7:    pub count: i64,
-members.vl:24:        self.list.push(Member { id: id as i64, name: name, count: 0, limit: limit, owed: 0 });
-members.vl:35:    m.count < m.limit && m.owed == 0
+catalog.vl:11:    pub count: i64,
+catalog.vl:27:        self.books.push(Book { id: id as i64, title: title, author: author, count: n, owned: n });
+catalog.vl:41:            if cat.books[i].count == 0 {
+catalog.vl:44:            cat.books[i].count -= 1;
+catalog.vl:54:        cat.books[i].count += 1;
+loans.vl:39:    ms.list[i].count += 1;
+loans.vl:65:                ms.list[i].count -= 1;
+members.vl:8:    // the count of books held now
+members.vl:9:    pub count: i64,
+members.vl:26:        self.list.push(Member { id: id as i64, name: name, count: 0, limit: limit, owed: 0 });
+members.vl:37:    m.count < m.limit && m.owed == 0
 report.vl:10:        println("  {:<28} {:<18} count {}/{}", b.title, b.author, b.count, b.owned);
 report.vl:17:        println("  {:<10} holds {} of {}, owes {} cents", m.name, m.count, m.limit, m.owed);
 ```
 
 The compiler knows which ones are `Book`'s field, including the use
-inside an f-string hole and the one in a struct literal:
+among a `println`'s arguments and the one in a struct literal:
 
 ```console
 $ volec query refs Book.count
 # catalog.vl
-9:9	def	pub count: i64,
-25:77	init	catalog::Catalog::add	self.books.push(Book { id: id as i64, title: title, author: author, count: n, owned: n });
-39:29	read	catalog::take	if cat.books[i].count == 0 {
-42:26	write	catalog::take	cat.books[i].count -= 1;
-52:22	write	catalog::put_back	cat.books[i].count += 1;
+11:9	def	pub count: i64,
+27:77	init	catalog::Catalog::add	self.books.push(Book { id: id as i64, title: title, author: author, count: n, owned: n });
+41:29	read	catalog::take	if cat.books[i].count == 0 {
+44:26	write	catalog::take	cat.books[i].count -= 1;
+54:22	write	catalog::put_back	cat.books[i].count += 1;
 # report.vl
 10:69	read	report::shelf	println("  {:<28} {:<18} count {}/{}", b.title, b.author, b.count, b.owned);
 ```
@@ -79,16 +79,16 @@ comments and the report's label alone:
 ```console
 $ volec refactor rename Book.count copies --show
 renamed crate::catalog::Book.count to copies	2 files	+6 -6 lines
-// catalog.vl:9
-9	    pub copies: i64,
-// catalog.vl:25
-25	        self.books.push(Book { id: id as i64, title: title, author: author, copies: n, owned: n });
-// catalog.vl:39
-39	            if cat.books[i].copies == 0 {
-// catalog.vl:42
-42	            cat.books[i].copies -= 1;
-// catalog.vl:52
-52	        cat.books[i].copies += 1;
+// catalog.vl:11
+11	    pub copies: i64,
+// catalog.vl:27
+27	        self.books.push(Book { id: id as i64, title: title, author: author, copies: n, owned: n });
+// catalog.vl:41
+41	            if cat.books[i].copies == 0 {
+// catalog.vl:44
+44	            cat.books[i].copies -= 1;
+// catalog.vl:54
+54	        cat.books[i].copies += 1;
 // report.vl:10
 10	        println("  {:<28} {:<18} count {}/{}", b.title, b.author, b.copies, b.owned);
 ```
@@ -117,20 +117,20 @@ plain `book_index(cat, id)` inside `catalog.vl`, and the qualified
 ```console
 $ volec refactor rename crate::catalog::find book_index --show
 renamed crate::catalog::find to book_index	catalog.vl	+3 -3 lines
-// catalog.vl:31
-31	pub fn book_index(cat: Catalog<Gpa>, id: i64) -> Option<i64> {
-// catalog.vl:37
-37	    match book_index(cat, id) {
-// catalog.vl:51
-51	    if let Some(i) = book_index(cat, id) {
+// catalog.vl:33
+33	pub fn book_index(cat: &Catalog<Gpa>, id: i64) -> Option<usize> {
+// catalog.vl:39
+39	    match book_index(cat, id) {
+// catalog.vl:53
+53	    if let Some(i) = book_index(cat, id) {
 $ volec refactor rename crate::members::find member_index --show
 renamed crate::members::find to member_index	2 files	+3 -3 lines
-// loans.vl:28
-28	    let i = match crate::members::member_index(ms, member) {
-// loans.vl:63
-63	            if let Some(i) = crate::members::member_index(ms, member) {
-// members.vl:30
-30	pub fn member_index(ms: Members<Gpa>, id: i64) -> Option<i64> {
+// loans.vl:29
+29	    let i = match crate::members::member_index(ms, member) {
+// loans.vl:64
+64	            if let Some(i) = crate::members::member_index(ms, member) {
+// members.vl:32
+32	pub fn member_index(ms: &Members<Gpa>, id: i64) -> Option<usize> {
 ```
 
 ## 3. A local and a parameter
@@ -143,17 +143,17 @@ backquotes) follows it:
 ```console
 $ volec refactor rename give_back::d days_late --show
 renamed local d to days_late in crate::loans::give_back, 1 use	loans.vl	+2 -2 lines
-// loans.vl:61-62
-61	            let days_late = today - l.due;
-62	            let fee = late_fee(days_late);
+// loans.vl:62-63
+62	            let days_late = today - l.due;
+63	            let fee = late_fee(days_late);
 $ volec refactor rename late_fee::d days_late --show
 renamed parameter d to days_late in crate::loans::late_fee, 2 uses	loans.vl	+4 -4 lines
-// loans.vl:44-46
-44	// The fee for a book returned `days_late` days after it was due.
-45	pub fn late_fee(days_late: i64) -> i64 {
-46	    if days_late <= 0 {
-// loans.vl:49
-49	    let fee = days_late * FEE_PER_DAY;
+// loans.vl:45-47
+45	// The fee for a book returned `days_late` days after it was due.
+46	pub fn late_fee(days_late: i64) -> i64 {
+47	    if days_late <= 0 {
+// loans.vl:50
+50	    let fee = days_late * FEE_PER_DAY;
 ```
 
 ## 4. The fee rules move to a module of their own
@@ -171,7 +171,7 @@ moved 3 items to crate::fees	2 files	+14 -13 lines
 // loans.vl:4
 4	use crate::fees::late_fee;
 // loans.vl:8: 4 lines removed after line 8
-// loans.vl:38: 9 lines removed after line 38
+// loans.vl:39: 9 lines removed after line 39
 // fees.vl:1-13
 1	// cents per day late
 2	pub const FEE_PER_DAY: i64 = 25;
@@ -206,18 +206,18 @@ $ volec query diff
 # renamed crate::members::Member to Patron	members.vl	+4 -4 lines
 --- a/members.vl
 +++ b/members.vl
-@@ -3 +3 @@
+@@ -5 +5 @@
 -pub struct Member {
 +pub struct Patron {
-@@ -14 +14 @@
+@@ -16 +16 @@
 -    pub list: Vec<Member, A>,
 +    pub list: Vec<Patron, A>,
-@@ -24 +24 @@
+@@ -26 +26 @@
 -        self.list.push(Member { id: id as i64, name: name, count: 0, limit: limit, owed: 0 });
 +        self.list.push(Patron { id: id as i64, name: name, count: 0, limit: limit, owed: 0 });
-@@ -34 +34 @@
--pub fn can_borrow(m: Member) -> bool {
-+pub fn can_borrow(m: Patron) -> bool {
+@@ -36 +36 @@
+-pub fn can_borrow(m: &Member) -> bool {
++pub fn can_borrow(m: &Patron) -> bool {
 $ volec undo
 undid renamed crate::members::Member to Patron	members.vl	+4 -4 lines
 $ volec query refs Member --count

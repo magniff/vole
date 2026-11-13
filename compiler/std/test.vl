@@ -1,0 +1,1470 @@
+// std::test: what `#[property]` tests and `#[fuzz]` targets draw their
+// values from, and the runtime of a test build (0.28.0: MVS's
+// compiler/std/flat/test.vl and fuzz.vl in std2's spellings). `volec
+// test` builds the program with `--test-build`: the compiler
+// (front/tests) writes a `main` that runs the test its arguments name,
+// and a generator for each property's parameters, built from their types
+// (an `impl Arbitrary` where there is one). A value is drawn from a
+// choice sequence of u64s, and smaller choices make simpler values (0: 0,
+// false, empty, None, the first variant): a failing case is shrunk by
+// shortening and lowering its sequence, then replaying it.
+//
+// A program names Arbitrary, Gen and assert_snapshot; the rest is what
+// the compiler's test code calls (test_begin, run_property, ...). A
+// property's cases each run in a child process (fork), one at a time, on
+// the runner's one thread: the runtime's statics are that thread's.
+// mvs: std::Arbitrary, std::Gen, std::assert_snapshot
+
+use crate::alloc::{Allocator, Gpa};
+use crate::fmt::Debug;
+use crate::option::Option;
+use crate::result::Result;
+use crate::string::String;
+use crate::vec::Vec;
+
+// A type's own generator, used in place of the structural one.
+pub trait Arbitrary {
+    fn arbitrary(g: &mut Gen<Gpa>) -> Self;
+}
+
+// A case's choices and where it is in them.
+// std2: changed: the choices are the Gen's own Vec (MVS: a view)
+pub struct Gen<A: Allocator> {
+    choices: Vec<u64, A>,
+    at: usize,
+    size: usize,
+    gpa: A,
+    depth: usize,
+    showing: bool,
+    report: i32,
+    raw: bool,
+}
+
+impl Gen<Gpa> {
+    // An integer: 0, -1, 1, -2, 2, ... as the choice grows (the edges,
+    // i64::MIN and i64::MAX, are the largest choices).
+    pub fn int(&mut self) -> i64 {
+        let c = self.draw();
+        ((c >> 1) as i64) ^ -((c & 1) as i64)
+    }
+
+    // An integer in lo..=hi (lo first).
+    pub fn int_in(&mut self, lo: i64, hi: i64) -> i64 {
+        let c = self.draw();
+        if hi <= lo {
+            return lo;
+        }
+        let span = (hi - lo) as u64 + 1;
+        if span == 0 {
+            return lo + c as i64;
+        }
+        lo + (c % span) as i64
+    }
+
+    // One of 0..n.
+    // std2: changed: usize
+    pub fn choose(&mut self, n: usize) -> usize {
+        let c = self.draw();
+        if n <= 1 { 0 } else { (c % n as u64) as usize }
+    }
+
+    pub fn bool(&mut self) -> bool {
+        self.draw() % 2 == 1
+    }
+
+    // The size this case may grow to (it grows with the case number).
+    // std2: changed: usize
+    pub fn size(&mut self) -> usize {
+        self.size
+    }
+
+    // A text byte: letters and digits first, then spaces, punctuation,
+    // newlines and the rest.
+    pub fn text_byte(&mut self) -> u8 {
+        let c = self.draw();
+        let common = "abcdefghijklmnopqrstuvwxyz0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ\n.,-_:;()+*/="
+            .as_bytes();
+        if c < 200 {
+            return common[(c % common.len() as u64) as usize];
+        }
+        (c % 256) as u8
+    }
+
+    // A text character: text_byte's, ASCII only.
+    pub fn text_char(&mut self) -> char {
+        let b = self.text_byte();
+        if b < 128 { b as char } else { (b'a' + b % 26) as char }
+    }
+
+    // The next choice: 0 past the end of the sequence (the simplest).
+    pub fn draw(&mut self) -> u64 {
+        let k = self.at;
+        self.at += 1;
+        if k >= self.choices.len() {
+            return 0;
+        }
+        self.choices[k]
+    }
+
+    // Whether a collection of `len` elements gets one more.
+    // std2: changed: usize
+    pub fn more(&mut self, len: usize) -> bool {
+        if len >= self.size || self.depth > 4 {
+            return false;
+        }
+        self.draw() % 4 != 0
+    }
+
+    // How deep a recursive type's generator is.
+    // std2: changed: usize
+    pub fn depth(&mut self) -> usize {
+        self.depth
+    }
+
+    // The allocator generated containers use.
+    pub fn gpa(&mut self) -> Gpa {
+        self.gpa
+    }
+
+    // Whether this run is the replay of a failure (its inputs printed).
+    pub fn showing(&mut self) -> bool {
+        self.showing
+    }
+
+    // The choices used so far, told to the runner (the generators are
+    // done; the property runs next).
+    pub fn generated(&mut self) {
+        if self.report >= 0 {
+            let used = i64_bytes(self.at as i64);
+            let _ = crate::io::sys_write(self.report, &used);
+            close(self.report);
+            self.report = -1;
+        }
+    }
+
+    // A recursive type's generator goes one level down (shallower values
+    // past a depth).
+    pub fn enter(&mut self) {
+        self.depth += 1;
+    }
+
+    pub fn leave(&mut self) {
+        self.depth -= 1;
+    }
+}
+
+// The generator of T: its `impl Arbitrary` (std's for the numbers and
+// bool, the compiler's for a test's structs and enums).
+pub fn arbitrary_of<T: Arbitrary>(g: &mut Gen<Gpa>) -> T {
+    T::arbitrary(g)
+}
+
+pub fn gen_vec<T, F: Fn(&mut Gen<Gpa>) -> T>(g: &mut Gen<Gpa>, f: F) -> Vec<T, Gpa> {
+    let mut v: Vec<T, Gpa> = Vec::new_in(g.gpa);
+    g.enter();
+    while g.more(v.len()) {
+        v.push(f(g));
+    }
+    g.leave();
+    v
+}
+
+pub fn gen_option<T, F: Fn(&mut Gen<Gpa>) -> T>(g: &mut Gen<Gpa>, f: F) -> Option<T> {
+    if g.draw() % 2 == 0 { Option::None } else { Option::Some(f(g)) }
+}
+
+pub fn gen_result<T, E, F: Fn(&mut Gen<Gpa>) -> T, G: Fn(&mut Gen<Gpa>) -> E>(g: &mut Gen<Gpa>,
+    f: F, e: G) -> Result<T, E> {
+    if g.draw() % 2 == 0 { Result::Ok(f(g)) } else { Result::Err(e(g)) }
+}
+
+// Text, as bytes.
+pub fn gen_text(g: &mut Gen<Gpa>) -> Vec<u8, Gpa> {
+    let mut v: Vec<u8, Gpa> = Vec::new_in(g.gpa);
+    while g.more(v.len()) {
+        v.push(g.text_byte());
+    }
+    v
+}
+
+// Text, as a String (a `&str` or `String` parameter).
+pub fn gen_string(g: &mut Gen<Gpa>) -> String<Gpa> {
+    let mut s: String<Gpa> = String::new_in(g.gpa);
+    while g.more(s.len()) {
+        s.push(g.text_char());
+    }
+    s
+}
+
+pub fn gen_f64(g: &mut Gen<Gpa>) -> f64 {
+    let c = g.draw();
+    if c < 6 {
+        let edges = [0.0, 1.0, -1.0, -0.0, 1.0 / 0.0, -1.0 / 0.0];
+        return edges[c as usize];
+    }
+    let n = ((c >> 1) as i64) ^ -((c & 1) as i64);
+    (n as f64) / 8.0
+}
+
+// An input's bytes: all of them when the choices are an input's
+// (fuzzing, a saved input), else a generated text of bytes.
+pub fn gen_bytes(g: &mut Gen<Gpa>) -> Vec<u8, Gpa> {
+    let mut v: Vec<u8, Gpa> = Vec::new_in(g.gpa);
+    if g.raw {
+        while g.at < g.choices.len() {
+            v.push(g.draw() as u8);
+        }
+        return v;
+    }
+    while g.more(v.len()) {
+        v.push(g.draw() as u8);
+    }
+    v
+}
+
+impl Arbitrary for i64 {
+    fn arbitrary(g: &mut Gen<Gpa>) -> i64 { g.int() }
+}
+
+impl Arbitrary for i32 {
+    fn arbitrary(g: &mut Gen<Gpa>) -> i32 { g.int() as i32 }
+}
+
+impl Arbitrary for i16 {
+    fn arbitrary(g: &mut Gen<Gpa>) -> i16 { g.int() as i16 }
+}
+
+impl Arbitrary for i8 {
+    fn arbitrary(g: &mut Gen<Gpa>) -> i8 { g.int() as i8 }
+}
+
+impl Arbitrary for u64 {
+    fn arbitrary(g: &mut Gen<Gpa>) -> u64 { g.draw() }
+}
+
+impl Arbitrary for usize {
+    fn arbitrary(g: &mut Gen<Gpa>) -> usize { g.draw() as usize }
+}
+
+impl Arbitrary for isize {
+    fn arbitrary(g: &mut Gen<Gpa>) -> isize { g.int() as isize }
+}
+
+impl Arbitrary for u32 {
+    fn arbitrary(g: &mut Gen<Gpa>) -> u32 { g.draw() as u32 }
+}
+
+impl Arbitrary for u16 {
+    fn arbitrary(g: &mut Gen<Gpa>) -> u16 { g.draw() as u16 }
+}
+
+impl Arbitrary for u8 {
+    fn arbitrary(g: &mut Gen<Gpa>) -> u8 { g.draw() as u8 }
+}
+
+impl Arbitrary for bool {
+    fn arbitrary(g: &mut Gen<Gpa>) -> bool { g.bool() }
+}
+
+impl Arbitrary for f64 {
+    fn arbitrary(g: &mut Gen<Gpa>) -> f64 { gen_f64(g) }
+}
+
+impl Arbitrary for f32 {
+    fn arbitrary(g: &mut Gen<Gpa>) -> f32 { gen_f64(g) as f32 }
+}
+
+impl Arbitrary for char {
+    fn arbitrary(g: &mut Gen<Gpa>) -> char { g.text_char() }
+}
+
+// x's `{:?}` text against tests/snapshots/MODULE__TEST__N.snap: a missing
+// file is written (a new snapshot, the test passes), a different one
+// fails with its first differing line; `volec test --accept` writes
+// the current text.
+// std2: changed: the text and the file are read into 64 KiB on the stack
+// (no allocator: a larger one fails)
+pub fn assert_snapshot<T: Debug>(x: T) {
+    let mut s = state();
+    s.snap_count += 1;
+    set_state(s);
+    let mut text = Snap::new();
+    let _ = crate::fmt::write(&mut text, "{x:?}");
+    text.put(b"\n");
+    let mut path = Short::new();
+    let mut shown = Short::new();
+    if s.snapshots_set {
+        path.put(s.snapshots.as_bytes());
+        path.put(b"/");
+    } else {
+        path.put(b"tests/");
+    }
+    shown.put(b"tests/");
+    // (the tests directory, then its snapshots/; an existing one kept)
+    let _ = crate::fs::create_dir(path.text());
+    path.put(b"snapshots");
+    let _ = crate::fs::create_dir(path.text());
+    let mut file = Short::new();
+    file.put(b"/");
+    let module = s.module.as_bytes();
+    let mut i: usize = 0;
+    while i < module.len() {
+        if module[i] == b':' {
+            file.put(b"__");
+            i += 2;
+        } else {
+            file.put(&module[i..i + 1]);
+            i += 1;
+        }
+    }
+    if module.len() > 0 {
+        file.put(b"__");
+    }
+    file.put(s.name.as_bytes());
+    file.put(b"__");
+    let n = s.snap_count;
+    let _ = crate::fmt::write(&mut file, "{n}");
+    file.put(b".snap");
+    path.put(file.bytes());
+    shown.put(b"snapshots");
+    shown.put(file.bytes());
+    if text.over || path.over || shown.over {
+        crate::fmt::eprintln("snapshot {}: over 64 KiB, or its path over 1 KiB", shown.text());
+        c_exit(101);
+    }
+    let mut old = Snap::new();
+    let had = old.read(path.text());
+    if had && old.bytes() == text.bytes() {
+    } else if !had || s.accept {
+        if crate::fs::write(path.text(), text.bytes()).is_err() {
+            crate::fmt::eprintln("snapshot {}: cannot write {}", shown.text(), path.text());
+            c_exit(101);
+        }
+        crate::fmt::println("vole-test: snapshot {} {}", if had { "accepted" } else { "new" },
+            shown.text());
+    } else {
+        let mut k: usize = 0;
+        while line_of(old.bytes(), k) == line_of(text.bytes(), k) {
+            k += 1;
+        }
+        crate::fmt::eprintln("snapshot differs: {} line {}: '{}' expected, got '{}'",
+            shown.text(), k + 1, text_of(line_of(old.bytes(), k)),
+            text_of(line_of(text.bytes(), k)));
+        c_exit(101);
+    }
+}
+
+// A snapshot's text, or a file's: 64 KiB at most (`over` past it).
+struct Snap {
+    len: usize,
+    over: bool,
+    buf: [u8; 65536],
+}
+
+impl Snap {
+    fn new() -> Snap {
+        Snap { len: 0, over: false, buf: [0; 65536] }
+    }
+
+    fn put(&mut self, b: &[u8]) {
+        let mut i: usize = 0;
+        while i < b.len() {
+            if self.len == 65536 {
+                self.over = true;
+                return;
+            }
+            self.buf[self.len] = b[i];
+            self.len += 1;
+            i += 1;
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    // The file at path, its first 64 KiB; false when it cannot be opened.
+    fn read(&mut self, path: &str) -> bool {
+        let mut f = match crate::fs::File::open(path) {
+            Result::Ok(f) => f,
+            Result::Err(_) => return false,
+        };
+        loop {
+            if self.len == 65536 {
+                self.over = true;
+                return true;
+            }
+            let at = self.len;
+            match crate::io::Read::read(&mut f, &mut self.buf[at..]) {
+                Result::Ok(0) => return true,
+                Result::Ok(n) => self.len += n,
+                Result::Err(_) => return true,
+            }
+        }
+    }
+}
+
+impl crate::fmt::Write for Snap {
+    fn write_str(&mut self, s: &str) -> crate::fmt::Result {
+        self.put(s.as_bytes());
+        Result::Ok(())
+    }
+}
+
+// A path: 1 KiB at most.
+struct Short {
+    len: usize,
+    over: bool,
+    buf: [u8; 1024],
+}
+
+impl Short {
+    fn new() -> Short {
+        Short { len: 0, over: false, buf: [0; 1024] }
+    }
+
+    fn put(&mut self, b: &[u8]) {
+        let mut i: usize = 0;
+        while i < b.len() {
+            if self.len == 1024 {
+                self.over = true;
+                return;
+            }
+            self.buf[self.len] = b[i];
+            self.len += 1;
+            i += 1;
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    fn text(&self) -> &str {
+        text_of(self.bytes())
+    }
+}
+
+impl crate::fmt::Write for Short {
+    fn write_str(&mut self, s: &str) -> crate::fmt::Result {
+        self.put(s.as_bytes());
+        Result::Ok(())
+    }
+}
+
+// ---- The test runtime (the compiler's test code calls these) ----
+
+// UNSAFE: C functions std has no safe form of: fork, pipe, dup2, close,
+// open, waitpid, atexit, _exit.
+// SAFETY: the prototypes are unistd.h's, fcntl.h's, sys/wait.h's and
+// stdlib.h's (open variadic, as declared); each call says why it is
+// sound.
+extern "C" {
+    #[link_name = "fork"]
+    #[effects(io)]
+    fn test_c_fork() -> i32;
+    #[link_name = "pipe"]
+    fn test_c_pipe(fds: *mut i32) -> i32;
+    #[link_name = "dup2"]
+    fn test_c_dup2(fd: i32, to: i32) -> i32;
+    #[link_name = "close"]
+    fn test_c_close(fd: i32) -> i32;
+    #[link_name = "open"]
+    fn test_c_open(path: *const u8, flags: i32, ...) -> i32;
+    #[link_name = "waitpid"]
+    #[effects(io)]
+    fn test_c_waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+    #[link_name = "atexit"]
+    fn test_c_atexit(f: extern "C" fn()) -> i32;
+    #[link_name = "_exit"]
+    fn test_c_exit_now(code: i32) -> !;
+}
+
+// What `volec test` passes to a test binary (`--vole-test NAME`, else
+// `--vole-list`; `--cases N`, `--seed S`, `--snapshots DIR`, `--accept`;
+// for fuzzing `--fuzz-time S`, `--fuzz-dir DIR`, `--replay FILE`
+// repeated), and the test being run. The strings are views of argv's,
+// which live as long as the process.
+#[derive(Clone, Copy)]
+struct TestState {
+    cases: usize,
+    seed: u64,
+    seed_set: bool,
+    snapshots: &'static str,
+    snapshots_set: bool,
+    accept: bool,
+    module: &'static str,
+    name: &'static str,
+    snap_count: usize,
+    fuzz_time: u64,
+    fuzz_dir: &'static str,
+    fuzz_dir_set: bool,
+    replays: usize,
+    // (whether the choices are an input's bytes)
+    raw: bool,
+    // (a test that ends the process, a failed check, ends it at once: the
+    // leaks it leaves are not listed after its failure)
+    running: bool,
+    handler: bool,
+    exit_code: i32,
+    fuzz_words: usize,
+}
+
+static mut TEST_STATE: TestState = TestState {
+    cases: 100,
+    seed: 0,
+    seed_set: false,
+    snapshots: "",
+    snapshots_set: false,
+    accept: false,
+    module: "",
+    name: "",
+    snap_count: 0,
+    fuzz_time: 0,
+    fuzz_dir: "",
+    fuzz_dir_set: false,
+    replays: 0,
+    raw: false,
+    running: false,
+    handler: false,
+    exit_code: 101,
+    fuzz_words: 0,
+};
+static mut TEST_REPLAY: [&'static str; 256] = [""; 256];
+// (the program's text constants a mutation may put in an input: the
+// compiler gives them, front/tests)
+static mut FUZZ_WORDS: [&'static [u8]; 64] = [b""; 64];
+
+fn state() -> TestState {
+    // UNSAFE: a static mut, read by value.
+    // SAFETY: the runtime runs on the runner's one thread (a forked case
+    // has its own copy); nothing borrows the static.
+    unsafe { TEST_STATE }
+}
+
+fn set_state(s: TestState) {
+    // UNSAFE: a static mut, written by value. SAFETY: as state's.
+    unsafe {
+        TEST_STATE = s;
+    }
+}
+
+fn replay(k: usize) -> &'static str {
+    // UNSAFE: a static mut's element, read by value. SAFETY: as state's;
+    // k < 256 is checked by the index.
+    unsafe { TEST_REPLAY[k] }
+}
+
+fn fuzz_word_at(k: usize) -> &'static [u8] {
+    // UNSAFE: a static mut's element, read by value. SAFETY: as state's;
+    // the index is checked.
+    unsafe { FUZZ_WORDS[k] }
+}
+
+// The exit status of a property case whose `requires` failed (discarded).
+const DISCARD: i32 = 77;
+
+// i64 <-> its 8 bytes (little-endian), for what a case reports on its pipe.
+fn i64_bytes(x: i64) -> [u8; 8] {
+    let mut b: [u8; 8] = [0; 8];
+    let mut k: usize = 0;
+    while k < 8 {
+        b[k] = ((x >> (8 * k)) & 255) as u8;
+        k += 1;
+    }
+    b
+}
+
+fn bytes_i64(b: [u8; 8]) -> i64 {
+    let mut x: i64 = 0;
+    let mut k: usize = 0;
+    while k < 8 {
+        x = x | ((b[k] as i64) << (8 * k));
+        k += 1;
+    }
+    x
+}
+
+fn number(t: &str) -> u64 {
+    let s = t.as_bytes();
+    let mut n: u64 = 0;
+    let mut i: usize = 0;
+    let mut base: u64 = 10;
+    if s.len() > 2 && s[0] == b'0' && (s[1] == b'x' || s[1] == b'X') {
+        base = 16;
+        i = 2;
+    }
+    while i < s.len() {
+        let c = s[i];
+        let d = if c >= b'0' && c <= b'9' { (c - b'0') as u64 }
+            else if c >= b'a' && c <= b'f' { (c - b'a') as u64 + 10 }
+            else if c >= b'A' && c <= b'F' { (c - b'A') as u64 + 10 }
+            else { 99 };
+        if d >= base {
+            break;
+        }
+        n = n * base + d;
+        i += 1;
+    }
+    n
+}
+
+// A test binary's arguments: the test to run (empty: list them).
+pub fn test_args() -> &'static str {
+    let mut s = state();
+    let mut name: &'static str = "";
+    let mut args = crate::env::args();
+    let _ = args.next();
+    let mut next = args.next();
+    loop {
+        let a = match next {
+            Option::Some(x) => x,
+            Option::None => break,
+        };
+        let after = args.next();
+        let has_value = after.is_some();
+        let value = after.unwrap_or("");
+        // (whether the flag took `value`)
+        let mut took = has_value;
+        if a == "--vole-test" && has_value {
+            name = value;
+        } else if a == "--cases" && has_value {
+            s.cases = number(value) as usize;
+        } else if a == "--seed" && has_value {
+            s.seed = number(value);
+            s.seed_set = true;
+        } else if a == "--snapshots" && has_value {
+            s.snapshots = value;
+            s.snapshots_set = true;
+        } else if a == "--fuzz-time" && has_value {
+            s.fuzz_time = number(value);
+        } else if a == "--fuzz-dir" && has_value {
+            s.fuzz_dir = value;
+            s.fuzz_dir_set = true;
+        } else if a == "--replay" && has_value {
+            if s.replays < 256 {
+                // UNSAFE: a static mut's element, written by value. SAFETY:
+                // as state's; s.replays < 256.
+                unsafe {
+                    TEST_REPLAY[s.replays] = value;
+                }
+                s.replays += 1;
+            }
+        } else {
+            if a == "--accept" {
+                s.accept = true;
+            }
+            took = false;
+        }
+        next = if took { args.next() } else { after };
+    }
+    set_state(s);
+    name
+}
+
+// A test of module `module` (its path, `a::tests`) starts.
+pub fn test_begin(module: &'static str, name: &'static str, gpa: Gpa) {
+    let mut s = state();
+    s.module = module;
+    s.name = name;
+    s.snap_count = 0;
+    set_state(s);
+    // (an allocation first: --check-alloc's handler at exit is then
+    // registered before at_exit, which runs before it)
+    let mut first: Vec<u8, Gpa> = Vec::new_in(gpa);
+    first.push(0);
+    crate::mem::drop(first);
+    running();
+}
+
+// C's exit: the atexit handlers run (at_exit, --check-alloc's), as a
+// test's end has always been.
+fn c_exit(code: i32) -> ! {
+    crate::process::exit(code)
+}
+
+// C's _exit: the process ends at once, no atexit handler.
+fn quit(code: i32) -> ! {
+    // UNSAFE: C's _exit, a C call.
+    // SAFETY: any int is a valid status; it does not return and touches
+    // no vole state.
+    unsafe { test_c_exit_now(code) }
+}
+
+extern "C" fn at_exit() {
+    let s = state();
+    if s.running {
+        quit(s.exit_code);
+    }
+}
+
+// This process ends with `code`, before --check-alloc lists what it
+// leaves allocated (a runner's, not the test's).
+fn exit_with(code: i32) -> ! {
+    running();
+    let mut s = state();
+    s.exit_code = code;
+    set_state(s);
+    c_exit(code)
+}
+
+fn running() {
+    let mut s = state();
+    if !s.handler {
+        // UNSAFE: C's atexit, a C call taking a function pointer.
+        // SAFETY: at_exit is an `extern "C" fn()` that lives as long as
+        // the program; `handler` registers it once (atexit's limit is 32
+        // or more).
+        unsafe {
+            test_c_atexit(at_exit);
+        }
+        s.handler = true;
+    }
+    s.running = true;
+    set_state(s);
+}
+
+// A #[test] returned.
+pub fn test_done() {
+    let mut s = state();
+    s.running = false;
+    set_state(s);
+}
+
+// A test left blocks allocated (with --check-alloc, which test builds
+// use; they are listed): it fails.
+pub fn test_leaked() -> ! {
+    c_exit(101)
+}
+
+// A `#[test]` that returned Err(e): the error, exit 101.
+pub fn test_err<E: Debug>(e: E) -> ! {
+    crate::fmt::eprintln("test returned Err({e:?})");
+    c_exit(101)
+}
+
+pub fn test_unknown(name: &str) -> i32 {
+    crate::fmt::eprintln("no test '{name}' in this program (--vole-list lists them)");
+    2
+}
+
+// A property case whose `requires` does not hold: not a failure.
+pub fn test_discard() -> ! {
+    quit(DISCARD)
+}
+
+// The line that begins an input's value, when a failure is replayed.
+pub fn test_input(name: &str) {
+    crate::fmt::print("vole-test: input {name} = ");
+}
+
+pub fn test_input_end() {
+    crate::fmt::println("");
+}
+
+// The choices of a case (splitmix64 from the state): mostly small, some
+// edges, some anything.
+fn next_of(st: &mut u64) -> u64 {
+    *st = st.wrapping_add(0x9e3779b97f4a7c15);
+    let mut z = *st;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^ (z >> 31)
+}
+
+fn choice(st: &mut u64, size: usize) -> u64 {
+    let r = next_of(st);
+    let pick = r % 20;
+    if pick == 0 {
+        // (the edges: i64::MIN, i64::MAX, u64::MAX, a byte's)
+        let e = next_of(st) % 5;
+        return if e == 0 { 0xffffffffffffffff } else if e == 1 { 0xfffffffffffffffe }
+            else if e == 2 { 255 } else if e == 3 { 256 } else { 0x8000000000000000 };
+    }
+    if pick < 3 {
+        return next_of(st);
+    }
+    next_of(st) % (2 * size as u64 + 4)
+}
+
+fn seed_of(name: &str) -> u64 {
+    let s = state();
+    if s.seed_set {
+        return s.seed;
+    }
+    let b = name.as_bytes();
+    let mut h: u64 = 14695981039346656037;
+    let mut i: usize = 0;
+    while i < b.len() {
+        h = (h ^ b[i] as u64).wrapping_mul(1099511628211);
+        i += 1;
+    }
+    h
+}
+
+#[derive(Clone, Copy)]
+struct CaseRun {
+    status: i32,
+    used: usize,
+}
+
+fn close(fd: i32) {
+    // UNSAFE: C's close. SAFETY: any int; a bad fd is an error, ignored.
+    unsafe {
+        test_c_close(fd);
+    }
+}
+
+// A pipe, (read end, write end); none stops the runner (exit 2).
+fn pipe() -> (i32, i32) {
+    let mut fds: [i32; 2] = [0, 0];
+    // UNSAFE: C's pipe. SAFETY: fds is two writable i32s.
+    let r = unsafe { test_c_pipe(&mut fds[0] as *mut i32) };
+    if r != 0 {
+        crate::fmt::eprintln("vole-test: cannot make a pipe");
+        c_exit(2);
+    }
+    (fds[0], fds[1])
+}
+
+// fork(2): 0 in the child, the child's pid in the parent.
+fn fork() -> i32 {
+    // UNSAFE: fork is a C call std has no safe form of: the child is a
+    // copy of this process.
+    // SAFETY: the runner forks from its one thread (a property's cases run
+    // one at a time, the runner starts no thread), so the child's copy of
+    // every lock and buffer is consistent; the child runs one case and
+    // ends with _exit (quit), never returning into the runner.
+    unsafe { test_c_fork() }
+}
+
+// A case's stdout and stderr to /dev/null.
+fn quiet() {
+    // UNSAFE: C's open, dup2 and close.
+    // SAFETY: the path is a NUL-ended literal; O_WRONLY is 1 on both
+    // systems; the fds are ints, a bad one an error.
+    unsafe {
+        let null = test_c_open("/dev/null\0".as_ptr(), 1);
+        if null >= 0 {
+            test_c_dup2(null, 1);
+            test_c_dup2(null, 2);
+            test_c_close(null);
+        }
+    }
+}
+
+// The 8 bytes of an i64 a child reports on fd; -1 when it reports nothing.
+fn read_i64(fd: i32) -> i64 {
+    let mut b: [u8; 8] = [0; 8];
+    match crate::io::sys_read(fd, &mut b) {
+        Result::Ok(n) => if n == 8 { bytes_i64(b) } else { -1 },
+        Result::Err(_) => -1,
+    }
+}
+
+// Waits for child pid: its exit code, 128 + the signal that ended it.
+fn wait(pid: i32) -> i32 {
+    let mut st: i32 = 0;
+    // UNSAFE: C's waitpid. SAFETY: st is a writable i32.
+    let r = unsafe { test_c_waitpid(pid, &mut st as *mut i32, 0) };
+    if r < 0 {
+        return 0;
+    }
+    if (st & 127) == 0 { (st >> 8) & 255 } else { 128 + (st & 127) }
+}
+
+fn fails(r: CaseRun) -> bool {
+    r.status != 0 && r.status != DISCARD
+}
+
+// The case's values are dropped by the time f returns, so a block it
+// allocated and left is a leak (--check-alloc): it fails.
+fn run_case<F: Fn(&mut Gen<Gpa>)>(f: &F, g: &mut Gen<Gpa>) {
+    let mark = crate::__gpa::check_alloc_mark();
+    f(g);
+    if crate::__gpa::check_alloc_leaks_since(mark) > 0 {
+        quit(101);
+    }
+}
+
+fn copy_of(gpa: Gpa, v: &Vec<u64, Gpa>) -> Vec<u64, Gpa> {
+    let mut c: Vec<u64, Gpa> = Vec::new_in(gpa);
+    c.extend_from_slice(v.as_slice());
+    c
+}
+
+// The runner's Gen, which each case's child takes as its own copy: no
+// allocation for it (a case's block numbers are its own allocations').
+fn runner_gen(gpa: Gpa) -> Gen<Gpa> {
+    Gen {
+        choices: Vec::new_in(gpa), at: 0, size: 0, gpa: gpa, depth: 0, showing: false, report: -1,
+        raw: false,
+    }
+}
+
+// Runs one case in a child process: its exit status (0 passed, DISCARD
+// discarded, else failed) and the choices it used. The choices are g's
+// for the run (swapped in and back).
+fn case<F: Fn(&mut Gen<Gpa>)>(f: &F, g: &mut Gen<Gpa>, choices: &mut Vec<u64, Gpa>, size: usize,
+    quiet_run: bool) -> CaseRun {
+    let n = choices.len();
+    let (rd, wr) = pipe();
+    crate::mem::swap(&mut g.choices, choices);
+    let pid = fork();
+    if pid == 0 {
+        close(rd);
+        if quiet_run {
+            quiet();
+        }
+        running();
+        g.at = 0;
+        g.size = size;
+        g.depth = 0;
+        g.showing = !quiet_run;
+        g.report = wr;
+        g.raw = state().raw;
+        run_case(f, g);
+        quit(0);
+    }
+    crate::mem::swap(&mut g.choices, choices);
+    close(wr);
+    let used = read_i64(rd);
+    close(rd);
+    CaseRun { status: wait(pid), used: if used >= 0 { used as usize } else { n } }
+}
+
+// Candidate `c` replaces `best` when it fails too (cut to what it used).
+fn attempt<F: Fn(&mut Gen<Gpa>)>(f: &F, g: &mut Gen<Gpa>, best: &mut Vec<u64, Gpa>,
+    c: &mut Vec<u64, Gpa>, size: usize, steps: &mut usize) -> bool {
+    let r = case(f, g, c, size, true);
+    if !fails(r) {
+        return false;
+    }
+    *steps += 1;
+    best.clear();
+    let n = if r.used < c.len() { r.used } else { c.len() };
+    let mut i: usize = 0;
+    while i < n {
+        best.push(c[i]);
+        i += 1;
+    }
+    true
+}
+
+// The failing choices `best` made smaller: chunks deleted, choices set to
+// zero, halved, lowered by one, neighbours put in order; to a fixpoint (or
+// 2000 candidates).
+fn shrink<F: Fn(&mut Gen<Gpa>)>(f: &F, g: &mut Gen<Gpa>, best: &mut Vec<u64, Gpa>, size: usize)
+    -> usize {
+    let mut steps: usize = 0;
+    let mut tries: usize = 0;
+    let mut c: Vec<u64, Gpa> = Vec::new_in(g.gpa);
+    let mut changed = true;
+    let chunks: [usize; 4] = [8, 4, 2, 1];
+    while changed && tries < 2000 {
+        changed = false;
+        let mut ki: usize = 0;
+        while ki < 4 {
+            let k = chunks[ki];
+            ki += 1;
+            if best.len() < k {
+                continue;
+            }
+            let mut i = (best.len() - k) as i64;
+            while i >= 0 && tries < 2000 {
+                c.clear();
+                let mut j: usize = 0;
+                while j < best.len() {
+                    if (j as i64) < i || j as i64 >= i + k as i64 {
+                        c.push(best[j]);
+                    }
+                    j += 1;
+                }
+                tries += 1;
+                if attempt(f, g, best, &mut c, size, &mut steps) {
+                    changed = true;
+                }
+                i -= 1;
+                let top = best.len() as i64 - k as i64;
+                if i > top {
+                    i = top;
+                }
+            }
+        }
+        let mut i: usize = 0;
+        while i < best.len() && tries < 2000 {
+            // lowered: to 0, else the smallest that still fails, by halves
+            let mut lo: u64 = 0;
+            let mut first = true;
+            while i < best.len() && best[i] > lo && tries < 2000 {
+                let v = best[i];
+                let w = if first { 0 } else { lo + (v - lo) / 2 };
+                first = false;
+                c.clear();
+                let mut j: usize = 0;
+                while j < best.len() {
+                    c.push(if j == i { w } else { best[j] });
+                    j += 1;
+                }
+                tries += 1;
+                if attempt(f, g, best, &mut c, size, &mut steps) {
+                    changed = true;
+                } else if w == lo {
+                    lo = w + 1;
+                } else {
+                    lo = w;
+                }
+            }
+            if i + 1 < best.len() && best[i] > best[i + 1] {
+                c.clear();
+                let mut j: usize = 0;
+                while j < best.len() {
+                    c.push(if j == i { best[i + 1] } else if j == i + 1 { best[i] }
+                        else { best[j] });
+                    j += 1;
+                }
+                tries += 1;
+                if attempt(f, g, best, &mut c, size, &mut steps) {
+                    changed = true;
+                }
+            }
+            i += 1;
+        }
+    }
+    steps
+}
+
+// A property: the cases (the first all zeros: the simplest values), each
+// in a child process; the first failure is shrunk, then replayed with its
+// inputs printed; exit 1. `vole-test:` lines on stdout tell `volec test`
+// the case and the steps.
+pub fn run_property<F: Fn(&mut Gen<Gpa>)>(gpa: Gpa, name: &str, f: F) {
+    property(gpa, name, &f);
+}
+
+fn property<F: Fn(&mut Gen<Gpa>)>(gpa: Gpa, name: &str, f: &F) {
+    // (the cases run in children; this process ends normally)
+    test_done();
+    let seed = seed_of(name);
+    let cases = if state().cases > 0 { state().cases } else { 1 };
+    let mut st = seed;
+    let mut choices: Vec<u64, Gpa> = Vec::new_in(gpa);
+    let mut g = runner_gen(gpa);
+    let mut discarded: usize = 0;
+    let mut n: usize = 0;
+    while n < cases {
+        // (sizes grow over 100 cases, whatever --cases: -O0 runs the first
+        // 20 of -O2's)
+        let size = 1 + (if n < 100 { n } else { 99 }) * 30 / 100;
+        choices.clear();
+        if n > 0 {
+            let mut k: usize = 0;
+            while k < 512 {
+                choices.push(choice(&mut st, size));
+                k += 1;
+            }
+        }
+        let r = case(f, &mut g, &mut choices, size, true);
+        if r.status == DISCARD {
+            discarded += 1;
+            n += 1;
+            continue;
+        }
+        if r.status != 0 {
+            let keep = if r.used < choices.len() { r.used } else { choices.len() };
+            choices.truncate(keep);
+            let steps = shrink(f, &mut g, &mut choices, size);
+            let at = n + 1;
+            let word = if steps == 1 { "step" } else { "steps" };
+            crate::fmt::println(
+                "vole-test: property case {at} of {cases}, shrunk in {steps} {word}, seed {seed:x}");
+            case(f, &mut g, &mut choices, size, false);
+            exit_with(1);
+        }
+        n += 1;
+    }
+    if discarded * 10 > cases * 9 {
+        crate::fmt::println("vole-test: discarded {discarded} of {cases}");
+        crate::fmt::eprintln(
+            "the generator rarely satisfies the requires: {discarded} of {cases} cases discarded (write an impl Arbitrary for the parameter's type)");
+        exit_with(1);
+    }
+}
+
+// The line `k` (from 0) of s.
+fn line_of(s: &[u8], k: usize) -> &[u8] {
+    let mut at: usize = 0;
+    let mut line: usize = 0;
+    while at <= s.len() {
+        let mut e = at;
+        while e < s.len() && s[e] != b'\n' {
+            e += 1;
+        }
+        if line == k {
+            return &s[at..e];
+        }
+        line += 1;
+        at = e + 1;
+    }
+    &s[0..0]
+}
+
+fn text_of(b: &[u8]) -> &str {
+    match crate::str::from_utf8(b) {
+        Result::Ok(s) => s,
+        Result::Err(_) => "(not UTF-8)",
+    }
+}
+
+// ---- The fuzzer ----
+
+// `#[fuzz]` functions: a property whose choice sequence is an input's
+// bytes, one choice per byte. `volec fuzz NAME` runs it on inputs it
+// mutates and keeps those that reach new code (--coverage's counters,
+// std::COVERAGE_MAP); `volec test` runs it as a property and on its
+// saved inputs. A `&[u8]` parameter is the input itself (gen_bytes).
+
+// The counters (all zero in a program built without --coverage).
+pub fn coverage() -> &'static [u8] {
+    // UNSAFE: the counters' static, viewed.
+    // SAFETY: the program's blocks only ever add to it, on this thread;
+    // the view is read before the next block runs (the coverage anchor
+    // returns it to the fuzzer's caller).
+    unsafe { &*(&raw const crate::COVERAGE_MAP) }
+}
+
+fn coverage_reset() {
+    let mut i: usize = 0;
+    while i < 65536 {
+        // UNSAFE: the counters' static, written by value. SAFETY: on this
+        // thread; i < 65536.
+        unsafe {
+            crate::COVERAGE_MAP[i] = 0;
+        }
+        i += 1;
+    }
+}
+
+pub fn fuzz_word(w: &'static [u8]) {
+    let mut s = state();
+    if s.fuzz_words < 64 && w.len() > 0 && w.len() <= 32 {
+        // UNSAFE: a static mut's element, written by value. SAFETY: as
+        // state's; s.fuzz_words < 64.
+        unsafe {
+            FUZZ_WORDS[s.fuzz_words] = w;
+        }
+        s.fuzz_words += 1;
+        set_state(s);
+    }
+}
+
+// A run of one input in a child process: its status, the choices it used,
+// and (when it returned) its coverage, into `cov`.
+fn fuzz_exec<F: Fn(&mut Gen<Gpa>)>(f: &F, g: &mut Gen<Gpa>, input: &mut Vec<u64, Gpa>,
+    cov: &mut [u8]) -> CaseRun {
+    let n = input.len();
+    let (rd, wr) = pipe();
+    let (crd, cwr) = pipe();
+    crate::mem::swap(&mut g.choices, input);
+    let pid = fork();
+    if pid == 0 {
+        close(rd);
+        close(crd);
+        quiet();
+        running();
+        coverage_reset();
+        g.at = 0;
+        g.size = 64;
+        g.depth = 0;
+        g.showing = false;
+        g.report = wr;
+        g.raw = true;
+        run_case(f, g);
+        let _ = crate::io::sys_write(cwr, coverage());
+        quit(0);
+    }
+    crate::mem::swap(&mut g.choices, input);
+    close(wr);
+    close(cwr);
+    let used = read_i64(rd);
+    close(rd);
+    let mut i: usize = 0;
+    while i < 65536 {
+        cov[i] = 0;
+        i += 1;
+    }
+    let mut got: usize = 0;
+    loop {
+        let k = match crate::io::sys_read(crd, &mut cov[got..65536]) {
+            Result::Ok(k) => k,
+            Result::Err(_) => 0,
+        };
+        if k == 0 {
+            break;
+        }
+        got += k;
+        if got >= 65536 {
+            break;
+        }
+    }
+    close(crd);
+    CaseRun { status: wait(pid), used: if used >= 0 { used as usize } else { n } }
+}
+
+// AFL's buckets of a count: 1, 2, 3, 4-7, 8-15, 16-31, 32-127, 128-255.
+fn bucket(c: u8) -> u8 {
+    if c == 0 { 0 } else if c == 1 { 1 } else if c == 2 { 2 } else if c == 3 { 4 }
+    else if c < 8 { 8 } else if c < 16 { 16 } else if c < 32 { 32 } else if c < 128 { 64 }
+    else { 128 }
+}
+
+// Whether `cov` reaches a block (or a block's count) `seen` has not seen;
+// `seen` takes it in.
+fn new_coverage(cov: &[u8], seen: &mut [u8]) -> bool {
+    let mut new = false;
+    let mut i: usize = 0;
+    while i < 65536 {
+        let c = cov[i];
+        if c != 0 {
+            let b = bucket(c);
+            if (b & !seen[i]) != 0 {
+                seen[i] = seen[i] | b;
+                new = true;
+            }
+        }
+        i += 1;
+    }
+    new
+}
+
+// One mutation of `v` (bytes as choices), from the random state; `other`
+// is another input of the corpus (for a splice).
+fn mutate(v: &mut Vec<u64, Gpa>, other: &Vec<u64, Gpa>, st: &mut u64) {
+    let len = v.len();
+    let r = next_of(st);
+    let how = r % 10;
+    let at = if len > 0 { ((r >> 8) % len as u64) as usize } else { 0 };
+    if len == 0 || how == 0 {
+        // a byte inserted
+        let b = next_of(st) % 256;
+        if len >= 4096 {
+            return;
+        }
+        v.insert(at, b);
+    } else if how == 1 {
+        // a bit flipped
+        v[at] = v[at] ^ (1 << (next_of(st) % 8));
+    } else if how == 2 {
+        let interesting: [u64; 10] = [0, 1, 0x7f, 0x80, 0xff, 48, 97, 32, 10, 255];
+        v[at] = interesting[(next_of(st) % 10) as usize];
+    } else if how == 3 {
+        v[at] = next_of(st) % 256;
+    } else if how == 4 {
+        // a run deleted
+        let n = 1 + (next_of(st) % 4) as usize;
+        let mut k: usize = 0;
+        while k < n && at < v.len() {
+            v.remove(at);
+            k += 1;
+        }
+    } else if how == 5 {
+        // a byte changed by a little
+        let d = next_of(st) % 16;
+        v[at] = (v[at] + d + 240) % 256;
+    } else if how == 6 && other.len() > 0 {
+        // a splice: this input's start, the other's end
+        let cut = (next_of(st) % other.len() as u64) as usize;
+        v.truncate(at);
+        let mut i = cut;
+        while i < other.len() {
+            if v.len() < 4096 {
+                v.push(other[i]);
+            }
+            i += 1;
+        }
+    } else if how == 7 && state().fuzz_words > 0 {
+        // a text constant of the program
+        let w = fuzz_word_at((next_of(st) % state().fuzz_words as u64) as usize);
+        let mut i: usize = 0;
+        while i < w.len() {
+            if v.len() < 4096 {
+                v.insert(at + i, w[i] as u64);
+            }
+            i += 1;
+        }
+    } else if how == 8 && len < 4096 {
+        // a run repeated
+        let n = 1 + (next_of(st) % 8) as usize;
+        let mut k: usize = 0;
+        while k < n && at + k < len && v.len() < 4096 {
+            let to = if at + n + k < v.len() { at + n + k } else { v.len() };
+            let x = v[at + k];
+            v.insert(to, x);
+            k += 1;
+        }
+    } else {
+        v[at] = next_of(st) % 256;
+    }
+}
+
+fn fuzz_hash(v: &Vec<u64, Gpa>) -> u64 {
+    let mut h: u64 = 14695981039346656037;
+    let mut i: usize = 0;
+    while i < v.len() {
+        h = (h ^ v[i]).wrapping_mul(1099511628211);
+        i += 1;
+    }
+    h
+}
+
+// Input v saved as DIR/PREFIXHASH (bytes): its path.
+fn fuzz_save(gpa: Gpa, v: &Vec<u64, Gpa>, prefix: &str) -> String<Gpa> {
+    let s = state();
+    let mut path: String<Gpa> = String::new_in(gpa);
+    if s.fuzz_dir_set {
+        path.push_str(s.fuzz_dir);
+        path.push('/');
+    }
+    path.push_str(prefix);
+    let h = fuzz_hash(v);
+    let digits = "0123456789abcdef".as_bytes();
+    let mut k: u64 = 0;
+    while k < 16 {
+        path.push(digits[((h >> (60 - 4 * k)) & 15) as usize] as char);
+        k += 1;
+    }
+    let mut bytes: Vec<u8, Gpa> = Vec::new_in(gpa);
+    let mut i: usize = 0;
+    while i < v.len() {
+        bytes.push(v[i] as u8);
+        i += 1;
+    }
+    let _ = crate::fs::write(path.as_str(), bytes.as_slice());
+    path
+}
+
+fn fuzz_load(gpa: Gpa, path: &str, into: &mut Vec<u64, Gpa>) -> bool {
+    into.clear();
+    match crate::fs::read_in(path, gpa) {
+        Result::Ok(b) => {
+            let mut i: usize = 0;
+            while i < b.len() {
+                into.push(b[i] as u64);
+                i += 1;
+            }
+            true
+        }
+        Result::Err(_) => false,
+    }
+}
+
+// A failing input: shrunk, saved, replayed with its inputs printed; exit 1.
+fn fuzz_failed<F: Fn(&mut Gen<Gpa>)>(f: &F, g: &mut Gen<Gpa>, input: &mut Vec<u64, Gpa>,
+    runs: usize) -> ! {
+    let gpa = g.gpa;
+    let mut s = state();
+    s.raw = true;
+    set_state(s);
+    let steps = shrink(f, g, input, 64);
+    let path = fuzz_save(gpa, input, "crash-");
+    let word = if steps == 1 { "step" } else { "steps" };
+    crate::fmt::println("vole-test: property after {runs} runs, shrunk in {steps} {word}");
+    crate::fmt::println("vole-test: saved {}", path.as_str());
+    case(f, g, input, 64, false);
+    exit_with(1)
+}
+
+// A fuzz target: fuzzed for --fuzz-time seconds (volec fuzz), else run
+// on its saved inputs (--replay), then as a property.
+pub fn run_fuzz_target<F: Fn(&mut Gen<Gpa>)>(gpa: Gpa, name: &str, f: F) {
+    test_done();
+    let mut g = runner_gen(gpa);
+    let mut input: Vec<u64, Gpa> = Vec::new_in(gpa);
+    let replays = state().replays;
+    if state().fuzz_time == 0 {
+        let mut s = state();
+        s.raw = true;
+        set_state(s);
+        let mut k: usize = 0;
+        while k < replays {
+            let at = replay(k);
+            k += 1;
+            if !fuzz_load(gpa, at, &mut input) {
+                continue;
+            }
+            let r = case(&f, &mut g, &mut input, 64, true);
+            if fails(r) {
+                crate::fmt::println("vole-test: property input {at}");
+                case(&f, &mut g, &mut input, 64, false);
+                exit_with(1);
+            }
+        }
+        let mut s = state();
+        s.raw = false;
+        set_state(s);
+        property(gpa, name, &f);
+        return;
+    }
+    // the corpus: the saved inputs, and the empty one
+    let mut corpus: Vec<Vec<u64, Gpa>, Gpa> = Vec::new_in(gpa);
+    let mut seen: Vec<u8, Gpa> = Vec::new_in(gpa);
+    let mut cov: Vec<u8, Gpa> = Vec::new_in(gpa);
+    let mut i: usize = 0;
+    while i < 65536 {
+        seen.push(0);
+        cov.push(0);
+        i += 1;
+    }
+    corpus.push(Vec::new_in(gpa));
+    let mut k: usize = 0;
+    while k < replays {
+        let mut v: Vec<u64, Gpa> = Vec::new_in(gpa);
+        if fuzz_load(gpa, replay(k), &mut v) {
+            corpus.push(v);
+        }
+        k += 1;
+    }
+    let mut runs: usize = 0;
+    let mut k: usize = 0;
+    while k < corpus.len() {
+        let r = fuzz_exec(&f, &mut g, &mut corpus[k], cov.as_mut_slice());
+        runs += 1;
+        if fails(r) {
+            let mut v = copy_of(gpa, &corpus[k]);
+            fuzz_failed(&f, &mut g, &mut v, runs);
+        }
+        k += 1;
+        new_coverage(cov.as_slice(), seen.as_mut_slice());
+    }
+    let mut st = seed_of(name);
+    let start = crate::time::Instant::now();
+    let limit = state().fuzz_time;
+    let mut kept: usize = 0;
+    let mut child: Vec<u64, Gpa> = Vec::new_in(gpa);
+    while start.elapsed().as_secs() < limit {
+        let p = (next_of(&mut st) % corpus.len() as u64) as usize;
+        let o = (next_of(&mut st) % corpus.len() as u64) as usize;
+        child.clear();
+        child.extend_from_slice(corpus[p].as_slice());
+        let stack = 1 + next_of(&mut st) % 4;
+        let mut m: u64 = 0;
+        while m < stack {
+            mutate(&mut child, &corpus[o], &mut st);
+            m += 1;
+        }
+        let r = fuzz_exec(&f, &mut g, &mut child, cov.as_mut_slice());
+        runs += 1;
+        if fails(r) {
+            fuzz_failed(&f, &mut g, &mut child, runs);
+        }
+        if r.status == 0 && new_coverage(cov.as_slice(), seen.as_mut_slice()) {
+            let keep = copy_of(gpa, &child);
+            let _ = fuzz_save(gpa, &keep, "corpus-");
+            corpus.push(keep);
+            kept += 1;
+        }
+    }
+    let size = corpus.len();
+    crate::fmt::println("vole-test: fuzz {runs} runs, {kept} inputs kept, {size} in the corpus");
+    exit_with(0)
+}

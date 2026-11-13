@@ -1,0 +1,230 @@
+// std::sync::Arc: a value several owners share, across threads: an atomic
+// count of the owners beside the value, in one block of the allocator
+// given (`Arc::new_in(x, a)`; Rust's `Arc::new(x)`); the last owner
+// dropped drops the value and frees the block. `clone` makes another
+// owner. The value is shared, so it is read-only (`*arc`): put a Mutex or
+// an atomic inside to change it. There is no Weak: a cycle of Arcs is
+// never freed.
+
+use crate::alloc::{Allocator, Layout};
+use crate::borrow::Borrow;
+use crate::boxed::Box;
+use crate::clone::Clone;
+use crate::cmp::{Eq, Ord, PartialEq, PartialOrd};
+use crate::cmp::Ordering as CmpOrdering;
+use crate::convert::AsRef;
+use crate::fmt::{Debug, Display, Formatter};
+use crate::hash::{Hash, Hasher};
+use crate::ops::{Deref, Drop};
+use crate::option::Option;
+use crate::ptr::NonNull;
+use crate::result::Result;
+use crate::sync::atomic::{AtomicUsize, Ordering, fence};
+
+// What the owners share: how many they are, and the value.
+struct ArcInner<T> {
+    strong: AtomicUsize,
+    data: T,
+}
+
+// An owner of a shared T on A.
+pub struct Arc<T, A: Allocator> {
+    ptr: NonNull<ArcInner<T>>,
+    alloc: A,
+}
+
+// UNSAFE: an Arc's pointer is a NonNull (neither Send nor Sync): stated, as
+// Rust's.
+// SAFETY: an Arc sent to another thread lets it read the T (T: Sync) and,
+// as the last owner, drop it there (T: Send); the count is an atomic; the
+// allocator goes with the Arc (A: Send).
+unsafe impl<T: Send + Sync, A: Allocator + Send> Send for Arc<T, A> {}
+// UNSAFE: as Send's, above.
+// SAFETY: `&Arc` gives `&T` (T: Sync) and can be cloned into another
+// owner on that thread (T: Send, and the clone reads the allocator: A:
+// Sync).
+unsafe impl<T: Send + Sync, A: Allocator + Sync> Sync for Arc<T, A> {}
+
+impl<T, A: Allocator> Arc<T, A> {
+    // x moved to a block of a, with one owner; out of memory panics.
+    #[effects(panic, T, A)]
+    pub fn new_in(x: T, a: A) -> Arc<T, A> {
+        let b = Box::new_in(ArcInner { strong: AtomicUsize::new(1), data: x }, a);
+        let (p, a) = Box::into_raw_with_allocator(b);
+        match NonNull::new(p) {
+            Option::Some(ptr) => Arc { ptr: ptr, alloc: a },
+            Option::None => crate::panic::unreachable(),
+        }
+    }
+
+    fn inner(&self) -> &ArcInner<T> {
+        // UNSAFE: the shared block through the Arc's raw pointer.
+        // SAFETY: this owner is counted, so the block is live and holds
+        // an initialized ArcInner until the Arc is dropped; the & lives no
+        // longer than the Arc's borrow, and the block is only read
+        // through & (the count is an atomic).
+        unsafe { self.ptr.as_ref() }
+    }
+
+    // How many owners the value has now.
+    #[effects(sync, panic, T, A)]
+    pub fn strong_count(this: &Arc<T, A>) -> usize {
+        this.inner().strong.load(Ordering::Relaxed)
+    }
+
+    // The value's address.
+    pub fn as_ptr(this: &Arc<T, A>) -> *const T {
+        &this.inner().data as *const T
+    }
+
+    // Whether the two own the same value (the same block).
+    #[effects(T)]
+    pub fn ptr_eq(this: &Arc<T, A>, other: &Arc<T, A>) -> bool {
+        this.ptr.as_ptr() == other.ptr.as_ptr()
+    }
+
+    // The value, to change, when this is its only owner.
+    #[effects(sync, panic, unsafe, T, A)]
+    pub fn get_mut(this: &mut Arc<T, A>) -> Option<&mut T> {
+        if this.inner().strong.load(Ordering::Acquire) != 1 {
+            return Option::None;
+        }
+        // UNSAFE: a &mut into the shared block.
+        // SAFETY: the count is 1 and `this` is borrowed mutably, so no
+        // other owner exists and none can be made (a clone needs a & of
+        // this Arc) while the &mut lives.
+        unsafe {
+            let d: *mut T = &mut (*this.ptr.as_ptr()).data;
+            Option::Some(&mut *d)
+        }
+    }
+
+    // The value, moved out, when this is its only owner; else the Arc
+    // back.
+    #[effects(alloc(A), sync, panic, unsafe, T, A)]
+    pub fn try_unwrap(this: Arc<T, A>) -> Result<T, Arc<T, A>> {
+        if this.inner().strong.compare_exchange(1, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err() {
+            return Result::Err(this);
+        }
+        let p = this.ptr.as_ptr();
+        let this_block = this.ptr.cast::<u8>();
+        // UNSAFE: the value and the allocator are moved out bit for bit and
+        // the block is given back.
+        // SAFETY: the count went from 1 to 0, so this was the only owner
+        // and nothing else reaches the block; the Arc is forgotten, so its
+        // Drop does not run: the value is moved out once, the allocator
+        // once (dropped at the end of this function), and the block, which
+        // Box::new_in took from this allocator with this layout, is freed
+        // once.
+        unsafe {
+            let x = crate::ptr::read(&(*p).data as *const T);
+            let a = crate::ptr::read(&this.alloc as *const A);
+            crate::mem::forget(this);
+            a.deallocate(this_block, Layout::new::<ArcInner<T>>());
+            Result::Ok(x)
+        }
+    }
+
+    // The value when this is its only owner (else the Arc is dropped).
+    #[effects(T, A)]
+    pub fn into_inner(this: Arc<T, A>) -> Option<T> {
+        match Arc::try_unwrap(this) {
+            Result::Ok(x) => Option::Some(x),
+            Result::Err(_) => Option::None,
+        }
+    }
+
+    // The allocator its block is from.
+    pub fn allocator(this: &Arc<T, A>) -> &A {
+        &this.alloc
+    }
+}
+
+// Another owner of the same value.
+impl<T, A: Allocator + Clone> Clone for Arc<T, A> {
+    fn clone(&self) -> Arc<T, A> {
+        // (Relaxed, as Rust's: the new owner comes from a live one)
+        self.inner().strong.fetch_add(1, Ordering::Relaxed);
+        Arc { ptr: self.ptr, alloc: self.alloc.clone() }
+    }
+}
+
+impl<T, A: Allocator> Deref for Arc<T, A> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.inner().data
+    }
+}
+
+impl<T, A: Allocator> Drop for Arc<T, A> {
+    fn drop(&mut self) {
+        if self.inner().strong.fetch_sub(1, Ordering::Release) != 1 {
+            return;
+        }
+        // (the last owner: every other owner's use of the value comes
+        // before its drop)
+        fence(Ordering::Acquire);
+        let p = self.ptr.as_ptr();
+        // UNSAFE: drops the value in place and gives the block back.
+        // SAFETY: the count reached 0, so no other owner exists; the block
+        // holds an initialized ArcInner that Box::new_in took from this
+        // allocator with this layout; it is dropped and freed once (an
+        // Arc is dropped once, and only the last one gets here).
+        unsafe {
+            crate::ptr::drop_in_place(p);
+            self.alloc.deallocate(self.ptr.cast::<u8>(), Layout::new::<ArcInner<T>>());
+        }
+    }
+}
+
+impl<T, A: Allocator> AsRef<T> for Arc<T, A> {
+    fn as_ref(&self) -> &T {
+        self.deref()
+    }
+}
+
+impl<T, A: Allocator> Borrow<T> for Arc<T, A> {
+    fn borrow(&self) -> &T {
+        self.deref()
+    }
+}
+
+impl<T: Debug, A: Allocator> Debug for Arc<T, A> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        Debug::fmt(self.deref(), f)
+    }
+}
+
+impl<T: Display, A: Allocator> Display for Arc<T, A> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        Display::fmt(self.deref(), f)
+    }
+}
+
+impl<T: PartialEq, A: Allocator> PartialEq for Arc<T, A> {
+    fn eq(&self, other: &Arc<T, A>) -> bool {
+        self.deref() == other.deref()
+    }
+}
+
+impl<T: Eq, A: Allocator> Eq for Arc<T, A> {}
+
+impl<T: PartialOrd, A: Allocator> PartialOrd for Arc<T, A> {
+    fn partial_cmp(&self, other: &Arc<T, A>) -> Option<CmpOrdering> {
+        self.deref().partial_cmp(other.deref())
+    }
+}
+
+impl<T: Ord, A: Allocator> Ord for Arc<T, A> {
+    fn cmp(&self, other: &Arc<T, A>) -> CmpOrdering {
+        self.deref().cmp(other.deref())
+    }
+}
+
+impl<T: Hash, A: Allocator> Hash for Arc<T, A> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.deref().hash(state);
+    }
+}

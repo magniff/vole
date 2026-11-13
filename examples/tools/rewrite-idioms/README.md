@@ -2,9 +2,9 @@
 
 `wordstat` counts the lines and words of a text, its commonest words and
 a histogram of word lengths. It was written before std had
-`Buf::push_str` and iterators, so it calls helpers from `compat.vl`
-(`buf_add(&b, s)`, `buf_add_int(&b, n)`, `vec_at(v, i)`, each marked
-deprecated) and walks slices with index loops. Five files, about 260
+`String::push_str` and iterators, so it calls helpers from `compat.vl`
+(`buf_add(b, s)`, `buf_add_int(b, n)`, `vec_at(v, i)`, each marked
+deprecated) and walks slices with index loops. Five files, about 270
 lines; `poem.txt` is the input.
 
 The session replaces each old idiom with the new one across the whole
@@ -36,59 +36,46 @@ word lengths:
    8 ##
 longest line: 3 (37 bytes): And sings the tune without the words,
 --
-main.vl:9:11: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-main.vl:29:13: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-compat.vl:4:10: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-compat.vl:7:25: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-compat.vl:12:29: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:3:10: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:8:17: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:14:25: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:30:27: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:44:27: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:58:25: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:69:24: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
 ok: built wordstat
 ```
 
 ## 1. A deprecated helper becomes a method
 
-`buf_add(&$b, $s)` matches any call of `buf_add` with two arguments,
-the first lent inout (`&b`), and `$b.push_str($s)` puts each argument's
-exact text back where its hole is (a method call lends its receiver
-itself, so the `&` goes). `--dry-run` prints the diff without writing it:
+`buf_add($b, $s)` matches any call of `buf_add` with two arguments, and
+`$b.push_str($s)` puts each argument's exact text back where its hole
+is. `--dry-run` prints the diff without writing it:
 
 ```console
-$ volec rewrite 'buf_add(&$b, $s)' '$b.push_str($s)' --dry-run | head -12
+$ volec rewrite 'buf_add($b, $s)' '$b.push_str($s)' --dry-run | head -12
 --- a/report.vl
 +++ b/report.vl
-@@ -5 +5 @@
+@@ -3 +3 @@
 -use crate::compat::{buf_add, buf_add_int, vec_at};
 +use crate::compat::{buf_add_int, vec_at};
-@@ -10 +10 @@
--        buf_add(&b, "#");
+@@ -8 +8 @@
+-        buf_add(b, "#");
 +        b.push_str("#");
-@@ -15 +15 @@
--    buf_add(&b, "lines ");
+@@ -13 +13 @@
+-    buf_add(b, "lines ");
 +    b.push_str("lines ");
-@@ -17 +17 @@
+@@ -15 +15 @@
 note rewrite.imports: removed 1 import the rewrite left unused
-$ volec rewrite 'buf_add(&$b, $s)' '$b.push_str($s)'
+$ volec rewrite 'buf_add($b, $s)' '$b.push_str($s)'
 rewrote 24 sites in 1 file	report.vl	+25 -25 lines
 note rewrite.imports: removed 1 import the rewrite left unused
-$ volec rewrite 'buf_add_int(&$b, $n)' '$b.push_int($n)'
+$ volec rewrite 'buf_add_int($b, $n)' 'write($b, "{}", $n).unwrap()'
 rewrote 10 sites in 1 file	report.vl	+11 -11 lines
 note rewrite.imports: removed 1 import the rewrite left unused
 $ volec rewrite 'vec_at($v, $i)' '$v[$i]' --show
 rewrote 3 sites in 2 files	2 files	+3 -6 lines
-// report.vl:4: 1 line removed after line 4
-// report.vl:32
-32	        let c = top[i as i64];
+// report.vl:2: 1 line removed after line 2
+// report.vl:30
+30	        let c = top[i];
 // stats.vl:4: 2 lines removed after line 4
-// stats.vl:64
-64	        out.push(v[i]);
-// stats.vl:73
-73	        if v[i as i64].n == 1 {
+// stats.vl:66
+66	        out.push(v[i]);
+// stats.vl:75
+75	        if v[i].n == 1 {
 note rewrite.imports: removed 2 imports the rewrite left unused
 ```
 
@@ -106,9 +93,9 @@ functions are left; `query unused` lists them:
 
 ```console
 $ volec query unused
-crate::compat::buf_add	compat.vl:7:8	fn
-crate::compat::buf_add_int	compat.vl:12:8	fn
-crate::compat::vec_at	compat.vl:17:8	fn
+crate::compat::buf_add	compat.vl:6:8	fn
+crate::compat::buf_add_int	compat.vl:11:8	fn
+crate::compat::vec_at	compat.vl:16:8	fn
 ```
 
 The module goes with `edit delete`: its `mod` line and its file, in one
@@ -116,23 +103,25 @@ edit (`undo` brings both back):
 
 ```console
 $ volec edit delete compat
-deleted crate::compat	2 files	+0 -20 lines
+deleted crate::compat	2 files	+0 -19 lines
 ```
 
 ## 3. A rewrite that only fits some types
 
-`v.len() == 0` is `v.is_empty()` for a `Vec`, but `Buf` has no
-`is_empty`. Asked to rewrite every site, the tool makes the change,
-checks the program, finds the site it would break, and writes nothing;
-the hole has two types at the sites, and each gets a command:
+`v.len() == 0` is `v.is_empty()` for a `Vec` or a `String`, but the
+program's `Histogram` has a `len` and no `is_empty`. Asked to rewrite
+every site, the tool makes the change, checks the program, finds the
+site it would break, and writes nothing; the hole has three types at
+the sites, and each gets a command:
 
 ```console
 $ volec rewrite '$v.len() == 0' '$v.is_empty()'
-report.vl:69:8: error[type error] no method 'is_empty' on type 'Buf<Gpa>' | help: no `is_empty`: `x.len() == 0` | try: volec query items Buf main.vl  [edited: crate::report::finish]
-error edit.breaks: 1 new error; nothing written; the error: report.vl:69:8: no method 'is_empty' on type 'Buf<Gpa>'
-note rewrite.where: $v has 2 types at the sites: Vec<[u8],Gpa> (1 site), Buf<Gpa> (1 site); --where takes the ones the replacement fits
-try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8],Gpa>'
-try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Buf<Gpa>'
+report.vl:42:8: error[type error] no method 'is_empty' on type '&Histogram' | try: volec query items Histogram main.vl  [edited: crate::report::histogram]
+error edit.breaks: 1 new error; nothing written; the error: report.vl:42:8: no method 'is_empty' on type '&Histogram'
+note rewrite.where: $v has 3 types at the sites: Vec<&str, Gpa> (1 site), &Histogram (1 site), &mut String<Gpa> (1 site); --where takes the ones the replacement fits
+try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<&str, Gpa>'
+try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: &Histogram'
+try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: &mut String<Gpa>'
 try: volec rewrite '$v.len() == 0' '$v.is_empty()' --no-check
 [exit 1]
 ```
@@ -141,31 +130,33 @@ try: volec rewrite '$v.len() == 0' '$v.is_empty()' --no-check
 it skipped is reported with its type, and a command for it:
 
 ```console
-$ volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8]>' --show
+$ volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<&str>' --show
 note rewrite.none: nothing matches '$v.len() == 0'
-note rewrite.types: 2 sites match but for --where; first: $v is Vec<[u8], Gpa> at main.vl:17:8
-try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8], Gpa>' --dry-run
+note rewrite.types: 3 sites match but for --where; first: $v is Vec<&str, Gpa> at main.vl:17:8
+try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<&str, Gpa>' --dry-run
 ```
 
 ## 4. Index loops become `for x in v`
 
 A pattern can hold statements: `$s...` stands for the rest of a block.
 This one matches a loop over the indices of `$v` whose first statement
-reads `$v[$i]`, and writes a loop over the elements:
+reads `$v[$i]`, and writes a loop over copies of the elements:
 
 ```console
-$ volec rewrite 'for $i in 0..$v.len { let $x = $v[$i]; $s... }' 'for $x in $v { $s... }' --show
-rewrote 4 sites in 2 files	2 files	+4 -8 lines
-// stats.vl:12
-12	    for w in ws {
-// stats.vl:41
-41	    for w in ws {
-// stats.vl:50
-50	    for w in ws {
-// text.vl:18
-18	    for c in text {
-note rewrite.dropped: 1 site is left: the replacement drops $i, which the code it keeps uses; first: text.vl:42:18
-try: volec query show text.vl:42
+$ volec rewrite 'for $i in 0..$v.len() { let $x = $v[$i]; $s... }' 'for $x in $v.iter().copied() { $s... }' --show
+rewrote 5 sites in 3 files	3 files	+5 -10 lines
+// report.vl:29
+29	    for c in top.iter().copied() {
+// stats.vl:13
+13	    for w in ws.iter().copied() {
+// stats.vl:43
+43	    for w in ws.iter().copied() {
+// stats.vl:52
+52	    for w in ws.iter().copied() {
+// text.vl:16
+16	    for c in text.iter().copied() {
+note rewrite.dropped: 1 site is left: the replacement drops $i, which the code it keeps uses; first: text.vl:40:18
+try: volec query show text.vl:40
 ```
 
 One loop was left: `longest_line` uses the index `i` after reading
@@ -173,17 +164,17 @@ One loop was left: `longest_line` uses the index `i` after reading
 would drop `i`. The tool leaves such a site as it is and says where:
 
 ```console
-$ volec query show text.vl:42
-// crate::text::longest_line	text.vl:33-45	effects: none
+$ volec query show text.vl:40
+// crate::text::longest_line	text.vl:31-43	effects: none
 // The length of the longest line, and its index.
-pub fn longest_line(ls: [[u8]]) -> (i64, i64) {
-    var best = 0;
-    var at = 0;
-    for i in 0..ls.len {
+pub fn longest_line(ls: &[&str]) -> (usize, usize) {
+    let mut best = 0;
+    let mut at = 0;
+    for i in 0..ls.len() {
         let l = ls[i];
-        if l.len as i64 > best {
-            best = l.len as i64;
-            at = i as i64;
+        if l.len() > best {
+            best = l.len();
+            at = i;
         }
     }
     (best, at)
@@ -195,31 +186,13 @@ pub fn longest_line(ls: [[u8]]) -> (i64, i64) {
 ```console
 $ volec check && volec main.vl -o wordstat && ./wordstat < poem.txt | diff before.txt - && echo same output
 same output
-main.vl:8:11: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-main.vl:28:13: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:3:10: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:7:17: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:13:25: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:29:27: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:43:27: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:57:25: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:68:24: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-ok: 0 errors, 9 warnings in main.vl
-main.vl:8:11: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-main.vl:28:13: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:3:10: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:7:17: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:13:25: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:29:27: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:43:27: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:57:25: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-report.vl:68:24: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+ok: 0 errors in main.vl
 ok: built wordstat
 $ git diff HEAD --stat
- compat.vl | 19 -----------------
+ compat.vl | 18 ----------------
  main.vl   |  1 -
- report.vl | 71 +++++++++++++++++++++++++++++++--------------------------------
- stats.vl  | 15 +++++---------
+ report.vl | 72 +++++++++++++++++++++++++++++++--------------------------------
+ stats.vl  | 15 +++++--------
  text.vl   |  3 +--
  5 files changed, 41 insertions(+), 68 deletions(-)
 ```
@@ -231,7 +204,7 @@ $ git diff HEAD --stat
   which it also matches. The rewrite's holes are whole expressions,
   parsed by the compiler.
 - A text replacement has no types: `len() == 0` to `is_empty()` would
-  have broken `finish`, found at the next build. The rewrite was
+  have broken `histogram`, found at the next build. The rewrite was
   checked first and refused, and `--where` said which sites to take.
 - The loop rewrite is a change of structure (the loop header, the `let`
   in its body, the variable) that no line-based tool can make, and it

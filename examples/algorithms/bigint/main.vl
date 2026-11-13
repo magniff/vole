@@ -15,12 +15,15 @@
 
 import "time.h" as c;
 
-use std::Fmt;
+use std::alloc::Allocator;
+use std::cmp::Ordering;
+use std::fmt::{Display, Formatter, self};
+use std::ops::{Add, Mul, Sub};
 
 const BASE: u64 = 1_000_000_000;
 
 // Below this many limbs (in the shorter operand), schoolbook is faster.
-const KARATSUBA_MIN: i64 = 96;
+const KARATSUBA_MIN: usize = 96;
 
 // ---------------------------------------------------------------- limbs
 //
@@ -31,23 +34,23 @@ const KARATSUBA_MIN: i64 = 96;
 // and a u64 holds 18 of them, so the rows are added up in u64 columns
 // without carrying, and the carries are propagated once every 16 rows:
 // the inner loop is a multiply and an add.
-fn mul_schoolbook(a: [u32], b: [u32], r: inout [u32], gpa: Gpa) {
-    var columns = Vec::filled_in(a.len() as usize + b.len() as usize, 0u64, gpa);
+fn mul_schoolbook(a: &[u32], b: &[u32], r: &mut [u32], gpa: Gpa) {
+    let mut columns = Vec::from_elem_in(0u64, a.len() + b.len(), gpa);
     let acc = columns.as_mut_slice();
-    var i = 0;
-    while i < a.len() as i64 {
-        let end = if i + 16 < a.len() as i64 { i + 16 } else { a.len() as i64 };
+    let mut i = 0;
+    while i < a.len() {
+        let end = if i + 16 < a.len() { i + 16 } else { a.len() };
         for row in i..end {
             let ai: u64 = a[row];
-            inout out = &acc[row..row + b.len() as i64];
+            let out = &mut acc[row..row + b.len()];
             for j in 0..b.len() { out[j] += ai * b[j]; }
         }
-        var carry: u64 = 0; // each column back below BASE
-        for k in i..acc.len() as i64 {
+        let mut carry: u64 = 0; // each column back below BASE
+        for k in i..acc.len() {
             let cur = acc[k] + carry;
             acc[k] = cur % BASE;
             carry = cur / BASE;
-            if carry == 0 && k >= end + b.len() as i64 { break; }
+            if carry == 0 && k >= end + b.len() { break; }
         }
         i = end;
     }
@@ -55,11 +58,11 @@ fn mul_schoolbook(a: [u32], b: [u32], r: inout [u32], gpa: Gpa) {
 }
 
 // r[off..] += x; the sum fits in r.
-fn add_at(r: inout [u32], x: [u32], off: i64) {
-    var carry: u32 = 0;
-    var k = off;
-    for limb in x {
-        var s = r[k] + limb + carry;
+fn add_at(r: &mut [u32], x: &[u32], off: usize) {
+    let mut carry: u32 = 0;
+    let mut k = off;
+    for limb in x.iter().copied() {
+        let mut s = r[k] + limb + carry;
         carry = 0;
         if s >= BASE as u32 { s -= BASE as u32; carry = 1; }
         r[k] = s;
@@ -73,10 +76,10 @@ fn add_at(r: inout [u32], x: [u32], off: i64) {
 }
 
 // r -= x, where r >= x.
-fn sub_from(r: inout [u32], x: [u32]) {
-    var borrow: u32 = 0;
-    var k = 0;
-    for limb in x {
+fn sub_from(r: &mut [u32], x: &[u32]) {
+    let mut borrow: u32 = 0;
+    let mut k = 0;
+    for limb in x.iter().copied() {
         let sub = limb + borrow;
         if r[k] >= sub { r[k] -= sub; borrow = 0; }
         else { r[k] = r[k] + BASE as u32 - sub; borrow = 1; }
@@ -89,16 +92,16 @@ fn sub_from(r: inout [u32], x: [u32]) {
 }
 
 // The slice without its zero limbs at the top.
-fn trimmed(x: [u32]) -> [u32] {
-    var n = x.len();
+fn trimmed(x: &[u32]) -> &[u32] {
+    let mut n = x.len();
     while n > 0 && x[n - 1] == 0 { n -= 1; }
-    x[..n]
+    &x[..n]
 }
 
 // a + b, as a new Vec of max(a.len, b.len) + 1 limbs.
-fn sum_of(a: [u32], b: [u32], gpa: Gpa) -> Vec<u32, Gpa> {
+fn sum_of(a: &[u32], b: &[u32], gpa: Gpa) -> Vec<u32, Gpa> {
     let n = if a.len() > b.len() { a.len() } else { b.len() };
-    var s = Vec::filled_in(n as usize + 1, 0u32, gpa);
+    let mut s = Vec::from_elem_in(0u32, n + 1, gpa);
     let out = s.as_mut_slice();
     add_at(out, a, 0);
     add_at(out, b, 0);
@@ -110,64 +113,61 @@ fn sum_of(a: [u32], b: [u32], gpa: Gpa) -> Vec<u32, Gpa> {
 //     a b = z2 B^2m + (p - z2 - z0) B^m + z0
 // where z0 = a0 b0, z2 = a1 b1, p = (a0 + a1)(b0 + b1): three products of
 // half the size.
-fn mul_karatsuba(a: [u32], b: [u32], r: inout [u32], gpa: Gpa) {
+fn mul_karatsuba(a: &[u32], b: &[u32], r: &mut [u32], gpa: Gpa) {
     if a.len() < b.len() { return mul_karatsuba(b, a, r, gpa); }
-    if b.len() as i64 < KARATSUBA_MIN {
-        return mul_schoolbook(a, b, r, gpa);
-    }
+    if b.len() < KARATSUBA_MIN { return mul_schoolbook(a, b, r, gpa); }
     if 2 * b.len() <= a.len() {
         // Lopsided: b times each b.len-limb piece of a.
-        var part = Vec::filled_in(2 * b.len() as usize, 0u32, gpa);
+        let mut part = Vec::from_elem_in(0u32, 2 * b.len(), gpa);
         let p = part.as_mut_slice();
-        var off = 0;
-        while off < a.len() as i64 {
-            let end = if off + b.len() as i64 < a.len() as i64 { off + b.len() as i64 }
-                else { a.len() as i64 };
+        let mut off = 0;
+        while off < a.len() {
+            let end = if off + b.len() < a.len() { off + b.len() } else { a.len() };
             for k in 0..p.len() { p[k] = 0; }
-            mul_karatsuba(a[off..end], b, p, gpa);
+            mul_karatsuba(&a[off..end], b, p, gpa);
             add_at(r, trimmed(p), off);
             off = end;
         }
         return;
     }
     let m = a.len() / 2; // b.len > m: both halves are there
-    let (a0, a1) = (a[..m], a[m..]);
-    let (b0, b1) = (b[..m], b[m..]);
-    mul_karatsuba(a0, b0, &r[..2 * m], gpa); // z0, in place
-    mul_karatsuba(a1, b1, &r[2 * m..], gpa); // z2, in place
+    let (a0, a1) = (&a[..m], &a[m..]);
+    let (b0, b1) = (&b[..m], &b[m..]);
+    mul_karatsuba(a0, b0, &mut r[..2 * m], gpa); // z0, in place
+    mul_karatsuba(a1, b1, &mut r[2 * m..], gpa); // z2, in place
     let sa = sum_of(a0, a1, gpa);
     let sb = sum_of(b0, b1, gpa);
-    var prod = Vec::filled_in(sa.len() + sb.len(), 0u32, gpa);
+    let mut prod = Vec::from_elem_in(0u32, sa.len() + sb.len(), gpa);
     let p = prod.as_mut_slice();
-    mul_karatsuba(sa.as_slice(), sb.as_slice(), p, gpa);
-    sub_from(p, r[..2 * m]); // p - z0
-    sub_from(p, r[2 * m..]); // p - z0 - z2 = a0 b1 + a1 b0
-    add_at(r, trimmed(p), m as i64);
+    mul_karatsuba(&sa, &sb, p, gpa);
+    sub_from(p, &r[..2 * m]); // p - z0
+    sub_from(p, &r[2 * m..]); // p - z0 - z2 = a0 b1 + a1 b0
+    add_at(r, trimmed(p), m);
 }
 
 // -------------------------------------------------------------- BigUint
 
-// The derived Eq compares the limb Vecs by contents; Clone copies them
+// The derived PartialEq compares the limb Vecs by contents; Clone copies them
 // (a deep copy); Debug shows the limbs.
-#[derive(Eq, Clone, Debug)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 struct BigUint<A: Allocator> { limbs: Vec<u32, A> }
 
 impl BigUint<Gpa> {
     fn zero(gpa: Gpa) -> BigUint<Gpa> { BigUint { limbs: Vec::new_in(gpa) } }
 
     // Takes the Vec, dropping zero limbs at the top.
-    fn from_limbs(v: sink Vec<u32, Gpa>) -> BigUint<Gpa> {
-        var limbs = v;
-        while limbs.len() > 0 && limbs.get(limbs.len() - 1) == 0 { limbs.pop(); }
-        BigUint { limbs: limbs }
+    fn from_limbs(v: Vec<u32, Gpa>) -> BigUint<Gpa> {
+        let mut limbs = v;
+        while limbs.last().copied() == Some(0u32) { limbs.pop(); }
+        BigUint { limbs }
     }
 
-    fn is_zero(self) -> bool { self.limbs.is_empty() }
+    fn is_zero(&self) -> bool { self.limbs.is_empty() }
 
     // self *= k, in place, for a small k.
-    fn mul_small(inout self, k: u32) {
+    fn mul_small(&mut self, k: u32) {
         let s = self.limbs.as_mut_slice();
-        var carry: u64 = 0;
+        let mut carry: u64 = 0;
         for i in 0..s.len() {
             let cur = s[i] * k as u64 + carry;
             s[i] = (cur % BASE) as u32;
@@ -177,10 +177,10 @@ impl BigUint<Gpa> {
     }
 
     // The number of decimal digits (1 for zero).
-    fn digits(self) -> i64 {
+    fn digits(&self) -> i64 {
         if self.is_zero() { return 1; }
-        var top = self.limbs.get(self.limbs.len() - 1);
-        var d = 0;
+        let mut top = self.limbs[self.limbs.len() - 1];
+        let mut d = 0;
         while top > 0 {
             d += 1;
             top /= 10;
@@ -188,10 +188,10 @@ impl BigUint<Gpa> {
         9 * (self.limbs.len() as i64 - 1) + d
     }
 
-    fn digit_sum(self) -> i64 {
+    fn digit_sum(&self) -> i64 {
         self.limbs.iter().map(|limb| {
-            var x = limb;
-            var s = 0;
+            let mut x = *limb;
+            let mut s = 0i64;
             while x > 0 {
                 s += (x % 10) as i64;
                 x /= 10;
@@ -201,92 +201,89 @@ impl BigUint<Gpa> {
     }
 
     // The schoolbook product, for checking Karatsuba.
-    fn mul_slow(self, other: BigUint<Gpa>, gpa: Gpa) -> BigUint<Gpa> {
-        var r = Vec::filled_in(self.limbs.len() + other.limbs.len(), 0u32, gpa);
-        mul_schoolbook(self.limbs.as_slice(), other.limbs.as_slice(), r.as_mut_slice(), gpa);
+    fn mul_slow(&self, other: &BigUint<Gpa>, gpa: Gpa) -> BigUint<Gpa> {
+        let mut r = Vec::from_elem_in(0u32, self.limbs.len() + other.limbs.len(), gpa);
+        mul_schoolbook(&self.limbs, &other.limbs, &mut r, gpa);
         BigUint::from_limbs(r)
     }
 
     // self + other, a new number; the operands stay as they are.
-    fn plus(self, other: BigUint<Gpa>) -> BigUint<Gpa> {
-        BigUint::from_limbs(sum_of(self.limbs.as_slice(), other.limbs.as_slice(),
-            self.limbs.allocator()))
+    fn plus(&self, other: &BigUint<Gpa>) -> BigUint<Gpa> {
+        BigUint::from_limbs(sum_of(&self.limbs, &other.limbs, *self.limbs.allocator()))
     }
 
     // self - other, for self >= other (natural numbers).
-    fn minus(self, other: BigUint<Gpa>) -> BigUint<Gpa> {
+    fn minus(&self, other: &BigUint<Gpa>) -> BigUint<Gpa> {
         if self < other { panic("BigUint: subtraction below zero"); }
-        var r = self.limbs.clone();
-        sub_from(r.as_mut_slice(), other.limbs.as_slice());
+        let mut r = self.limbs.clone();
+        sub_from(&mut r, &other.limbs);
         BigUint::from_limbs(r)
     }
 
     // self * other, by Karatsuba.
-    fn times(self, other: BigUint<Gpa>) -> BigUint<Gpa> {
+    fn times(&self, other: &BigUint<Gpa>) -> BigUint<Gpa> {
         // (the result is allocated where self's limbs are)
-        let gpa = self.limbs.allocator();
-        var r = Vec::filled_in(self.limbs.len() + other.limbs.len(), 0u32, gpa);
-        mul_karatsuba(self.limbs.as_slice(), other.limbs.as_slice(), r.as_mut_slice(), gpa);
+        let gpa = *self.limbs.allocator();
+        let mut r = Vec::from_elem_in(0u32, self.limbs.len() + other.limbs.len(), gpa);
+        mul_karatsuba(&self.limbs, &other.limbs, &mut r, gpa);
         BigUint::from_limbs(r)
     }
 }
 
 impl BigUint<Gpa> {
     fn from_u64(x: u64, gpa: Gpa) -> BigUint<Gpa> {
-        var limbs: Vec<u32, Gpa> = Vec::new_in(gpa);
-        var x = x;
+        let mut limbs: Vec<u32, Gpa> = Vec::new_in(gpa);
+        let mut x = x;
         while x > 0 {
             limbs.push((x % BASE) as u32);
             x /= BASE;
         }
-        BigUint { limbs: limbs }
+        BigUint { limbs }
     }
 }
 
 // Longer is larger; at equal lengths, the first limb that differs from
 // the top decides.
 impl Ord for BigUint<Gpa> {
-    fn cmp(self, other: BigUint<Gpa>) -> i64 {
+    fn cmp(&self, other: &BigUint<Gpa>) -> Ordering {
         let (a, b) = (self.limbs.as_slice(), other.limbs.as_slice());
-        if a.len() != b.len() { return a.len() as i64 - b.len() as i64; }
-        var i = a.len() as i64 - 1;
-        while i >= 0 {
-            if a[i] != b[i] { return a[i] as i64 - b[i] as i64; }
-            i -= 1;
+        if a.len() != b.len() { return a.len().cmp(&b.len()); }
+        for i in (0..a.len()).rev() {
+            if a[i] != b[i] { return a[i].cmp(&b[i]); }
         }
-        0
+        Ordering::Equal
     }
 }
 
-// The operators take their operands let, as the traits say (0.20):
-// `a * b` reads a and b, as plus, minus and times do; the operators are
-// those methods under another name.
+impl PartialOrd for BigUint<Gpa> {
+    fn partial_cmp(&self, other: &BigUint<Gpa>) -> Option<Ordering> { Some(self.cmp(other)) }
+}
+
+// The operators take their operands by value, as the traits say: `a * b`
+// consumes a and b, where plus, minus and times borrow them.
 impl Add for BigUint<Gpa> {
-    fn add(self, other: BigUint<Gpa>) -> BigUint<Gpa> { self.plus(other) }
+    type Output = BigUint<Gpa>;
+    fn add(self, other: BigUint<Gpa>) -> BigUint<Gpa> { self.plus(&other) }
 }
 
 impl Sub for BigUint<Gpa> {
-    fn sub(self, other: BigUint<Gpa>) -> BigUint<Gpa> { self.minus(other) }
+    type Output = BigUint<Gpa>;
+    fn sub(self, other: BigUint<Gpa>) -> BigUint<Gpa> { self.minus(&other) }
 }
 
 impl Mul for BigUint<Gpa> {
-    fn mul(self, other: BigUint<Gpa>) -> BigUint<Gpa> { self.times(other) }
+    type Output = BigUint<Gpa>;
+    fn mul(self, other: BigUint<Gpa>) -> BigUint<Gpa> { self.times(&other) }
 }
 
 // Decimal: the top limb as it is, every other one as nine digits.
-impl Display for BigUint<Gpa> {
-    fn fmt(self, f: inout Fmt) {
+impl<A: Allocator> Display for BigUint<A> {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         let s = self.limbs.as_slice();
-        if s.len() == 0 {
-            f.str("0");
-            return;
-        }
-        f.write("{}", s[s.len() - 1]);
-        var i = s.len() as i64 - 2;
-        while i >= 0 {
-            f.write("{:09}", s[i]);
-            i -= 1;
-        }
+        if s.is_empty() { return write(f, "0"); }
+        write(f, "{}", s[s.len() - 1])?;
+        for i in (0..s.len() - 1).rev() { write(f, "{:09}", s[i])?; }
+        Ok(())
     }
 }
 
@@ -294,7 +291,7 @@ impl Display for BigUint<Gpa> {
 
 // n!, one small multiplication at a time.
 fn factorial(n: u32, gpa: Gpa) -> BigUint<Gpa> {
-    var f = BigUint::from_u64(1, gpa);
+    let mut f = BigUint::from_u64(1, gpa);
     for k in 2..=n { f.mul_small(k); }
     f
 }
@@ -303,7 +300,7 @@ fn factorial(n: u32, gpa: Gpa) -> BigUint<Gpa> {
 // stay balanced, so the big products go through Karatsuba.
 fn product(lo: u64, hi: u64, gpa: Gpa) -> BigUint<Gpa> {
     if hi - lo < 8 {
-        var p = BigUint::from_u64(lo, gpa);
+        let mut p = BigUint::from_u64(lo, gpa);
         for k in lo + 1..=hi { p.mul_small(k as u32); }
         return p;
     }
@@ -313,10 +310,10 @@ fn product(lo: u64, hi: u64, gpa: Gpa) -> BigUint<Gpa> {
 
 // F(n) by adding: n additions.
 fn fib_iterative(n: i64, gpa: Gpa) -> BigUint<Gpa> {
-    var a = BigUint::zero(gpa);
-    var b = BigUint::from_u64(1, gpa);
+    let mut a = BigUint::zero(gpa);
+    let mut b = BigUint::from_u64(1, gpa);
     for _ in 0..n {
-        let next = a.plus(b);
+        let next = a.plus(&b);
         a = b; // the old a is dropped
         b = next;
     }
@@ -326,19 +323,19 @@ fn fib_iterative(n: i64, gpa: Gpa) -> BigUint<Gpa> {
 // F(n) by fast doubling, O(log n) multiplications:
 //     F(2k) = F(k) (2 F(k+1) - F(k)),  F(2k+1) = F(k)^2 + F(k+1)^2
 fn fib_doubling(n: i64, gpa: Gpa) -> BigUint<Gpa> {
-    var a = BigUint::zero(gpa); // F(k), k = 0
-    var b = BigUint::from_u64(1, gpa); // F(k + 1)
-    var bit = 62;
+    let mut a = BigUint::zero(gpa); // F(k), k = 0
+    let mut b = BigUint::from_u64(1, gpa); // F(k + 1)
+    let mut bit = 62;
     while bit >= 0 && (n >> bit) & 1 == 0 { bit -= 1; }
     while bit >= 0 {
-        let twice = b.plus(b);
-        let diff = twice.minus(a);
-        let sq_a = a.times(a);
-        let sq_b = b.times(b);
-        let even = a.times(diff); // F(2k)
-        let odd = sq_a.plus(sq_b); // F(2k + 1)
+        let twice = b.plus(&b);
+        let diff = twice.minus(&a);
+        let sq_a = a.times(&a);
+        let sq_b = b.times(&b);
+        let even = a.times(&diff); // F(2k)
+        let odd = sq_a.plus(&sq_b); // F(2k + 1)
         if (n >> bit) & 1 == 1 {
-            b = even.plus(odd);
+            b = even.plus(&odd);
             a = odd; // k becomes 2k + 1
         } else {
             a = even; // k becomes 2k
@@ -357,8 +354,8 @@ struct Rng { state: u64 }
 impl Rng {
     fn new(seed: u64) -> Rng { Rng { state: seed | 1 } }
 
-    fn next(inout self) -> u64 {
-        var x = self.state;
+    fn next(&mut self) -> u64 {
+        let mut x = self.state;
         x ^= x >> 12;
         x ^= x << 25;
         x ^= x >> 27;
@@ -367,8 +364,8 @@ impl Rng {
     }
 
     // A number of n random limbs.
-    fn big(inout self, n: i64, gpa: Gpa) -> BigUint<Gpa> {
-        var v: Vec<u32, Gpa> = Vec::with_capacity_in(n as usize, gpa);
+    fn big(&mut self, n: usize, gpa: Gpa) -> BigUint<Gpa> {
+        let mut v: Vec<u32, Gpa> = Vec::with_capacity_in(n, gpa);
         for _ in 0..n { v.push(((self.next() >> 32) % BASE) as u32); }
         BigUint::from_limbs(v)
     }
@@ -377,8 +374,10 @@ impl Rng {
 // --------------------------------------------------------------- output
 
 fn now_ns() -> i64 {
-    var ts = c::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { c::timespec_get(&ts, c::TIME_UTC); }
+    let mut ts = c::timespec { tv_sec: 0, tv_nsec: 0 };
+    // UNSAFE: timespec_get is C's, and writes through a pointer.
+    // SAFETY: `&mut ts` is a whole timespec, borrowed for the call.
+    unsafe { c::timespec_get(&mut ts, c::TIME_UTC); }
     ts.tv_sec * 1_000_000_000 + ts.tv_nsec
 }
 
@@ -387,13 +386,13 @@ fn ms(t0: i64, t1: i64) -> f64 { (t1 - t0) as f64 / 1e6 }
 
 // A one-line summary: the number of digits, the first and last ones, the
 // digit sum.
-fn describe(name: [u8], x: BigUint<Gpa>, gpa: Gpa) {
+fn describe(name: &str, x: &BigUint<Gpa>, gpa: Gpa) {
     let text = format_in("{x}", gpa);
-    let s = text.as_slice();
+    let s = text.as_str();
     if s.len() <= 60 {
         println("{name} = {s}");
     } else {
-        println("{name} = {}...{}", s[..20], s[s.len() - 20..]);
+        println("{name} = {}...{}", &s[..20], &s[s.len() - 20..]);
     }
     println("    {} digits, digit sum {}", x.digits(), x.digit_sum());
 }
@@ -401,14 +400,14 @@ fn describe(name: [u8], x: BigUint<Gpa>, gpa: Gpa) {
 fn main(gpa: Gpa) -> i32 {
     // Small ones, and what a number looks like inside.
     let f30 = factorial(30, gpa);
-    describe("30!", f30, gpa);
+    describe("30!", &f30, gpa);
     println("    as limbs: {f30:?}");
 
     // 1000!, two ways.
     let f1000 = factorial(1000, gpa);
-    describe("1000!", f1000, gpa);
+    describe("1000!", &f1000, gpa);
     let text = format_in("{f1000}", gpa);
-    let zeros = text.as_slice().iter().fold(0, |n, d| if d == '0' { n + 1 } else { 0 });
+    let zeros = text.as_bytes().iter().fold(0, |n, d| if *d == b'0' { n + 1 } else { 0 });
     println("    {zeros} trailing zeros");
     let tree = product(1, 1000, gpa);
     println("    product tree (Karatsuba) == one at a time: {}", tree == f1000);
@@ -416,36 +415,36 @@ fn main(gpa: Gpa) -> i32 {
     // Fibonacci numbers, two ways.
     let fib_a = fib_iterative(10_000, gpa);
     let fib_b = fib_doubling(10_000, gpa);
-    describe("F(10000)", fib_a, gpa);
+    describe("F(10000)", &fib_a, gpa);
     println("    fast doubling == additions: {}", fib_a == fib_b);
     let t0 = now_ns();
     let big = fib_doubling(1_000_000, gpa);
     let t1 = now_ns();
-    describe("F(1000000)", big, gpa);
+    describe("F(1000000)", &big, gpa);
     eprintln("F(1000000) by fast doubling: {:.1} ms", ms(t0, t1));
 
     // Karatsuba against schoolbook on random operands.
-    var rng = Rng::new(2026);
-    var agree = 0;
+    let mut rng = Rng::new(2026);
+    let mut agree = 0;
     let trials = 30;
     for _ in 0..trials {
-        let nx = 1 + (rng.next() % 600) as i64;
+        let nx = 1 + (rng.next() % 600) as usize;
         let x = rng.big(nx, gpa);
-        let ny = 1 + (rng.next() % 600) as i64;
+        let ny = 1 + (rng.next() % 600) as usize;
         let y = rng.big(ny, gpa);
-        let fast = x.times(y);
-        let slow = x.mul_slow(y, gpa);
+        let fast = x.times(&y);
+        let slow = x.mul_slow(&y, gpa);
         if fast == slow { agree += 1; }
     }
     println("karatsuba == schoolbook on {agree} of {trials} random pairs");
 
-    let n = 5000;
+    let n = 5000usize;
     let x = rng.big(n, gpa);
     let y = rng.big(n, gpa);
     let t2 = now_ns();
-    let slow = x.mul_slow(y, gpa);
+    let slow = x.mul_slow(&y, gpa);
     let t3 = now_ns();
-    let fast = x.times(y);
+    let fast = x.times(&y);
     let t4 = now_ns();
     println(
         "{n} x {n} limbs ({} digits each): equal {}, digit sum {}", 9 * n, slow == fast,

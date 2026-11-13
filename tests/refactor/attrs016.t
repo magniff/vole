@@ -21,16 +21,16 @@ fn middle(a: i64, b: i64, c: i64) -> i64 {
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
-    grow(&v);
-    println(middle(2, 10, 0) + (v.len() as i64) * 2 + util::one());
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
+    grow(&mut v);
+    println("{}", middle(2, 10, 0) + (v.len() as i64) * 2 + util::one());
 }
 pub fn one() -> i64 {
     1
 }
 
 #[effects(alloc(Gpa), panic)]
-pub fn grow(v: inout Vec<i64, Gpa>) {
+pub fn grow(v: &mut Vec<i64, Gpa>) {
     v.push(1);
 }
 % "$COMPILER" main.vl -o prog && ./prog

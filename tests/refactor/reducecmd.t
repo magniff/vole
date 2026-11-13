@@ -5,13 +5,13 @@
 % VOLE_PLANT_MISCOMPILE=1 "$COMPILER" reduce main.vl --differs
 reduced main.vl: 428 lines to 12 in 307 runs; written to main.min.vl
 fn f17(x: i64) -> i64 {
-    var t = x;
+    let mut t = x;
     t = t + 12345;
     t
 }
 
 fn main() -> i32 {
-    var total = 0;
+    let mut total: i64 = 0;
     total += f17(total % 1000);
     println("{total}");
     0
@@ -21,13 +21,13 @@ fn main() -> i32 {
 ## --fails TEXT: its build or run prints TEXT
 $ reduce crash.vl --fails 'index out of bounds'
 reduced crash.vl: 21 lines to 9 in 35 runs; written to crash.min.vl
-fn last(v: [i64]) -> i64 {
-    v[v.len]
+fn last(v: &[i64]) -> i64 {
+    v[v.len()]
 }
 
 fn main() -> i32 {
     let b = [4, 5];
-    println("{}", last(b[..]));
+    println("{}", last(&b[..]));
     0
 }
 ## nothing to keep

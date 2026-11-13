@@ -23,13 +23,15 @@ file. Make a directory for the program, and in it three files. First
 mod count;
 mod report;
 
+use std::io;
+use std::collections::HashMap;
+
 fn main(gpa: Gpa) {
-    let input = read_stdin_in(gpa).unwrap();
-    let text = String::from_utf8(input).unwrap();
-    var counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
-    count::add_words(&counts, text, gpa);
-    let top = report::top(counts, 5, gpa);
-    report::print_table(top);
+    let text = io::read_to_string_in(io::stdin(), gpa).unwrap();
+    let mut counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
+    count::add_words(&mut counts, &text, gpa);
+    let top = report::top(&counts, 5, gpa);
+    report::print_table(&top);
 }
 ```
 
@@ -37,38 +39,40 @@ Then `count.vl`, the counting:
 
 ```vole count.vl
 // Counting the words of a text.
+use std::collections::HashMap;
 
 // Letters, digits and apostrophes are parts of words. So is every
 // byte of a non-ASCII character (0x80 and up), so "café" stays whole.
 fn is_word_byte(b: u8) -> bool {
     match b {
-        'a'..='z' | 'A'..='Z' | '0'..='9' | '\'' => true,
+        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'\'' => true,
         0x80..=0xff => true,
         _ => false,
     }
 }
 
 // The word without the punctuation around it: "end!" is "end".
-fn trim_punct(word: str) -> str {
-    var start: usize = 0;
-    var end = word.len();
-    while start < end && !is_word_byte(word[start]) {
+fn trim_punct(word: &str) -> &str {
+    let bytes = word.as_bytes();
+    let mut start = 0;
+    let mut end = bytes.len();
+    while start < end && !is_word_byte(bytes[start]) {
         start += 1;
     }
-    while end > start && !is_word_byte(word[end - 1]) {
+    while end > start && !is_word_byte(bytes[end - 1]) {
         end -= 1;
     }
-    word[start..end]
+    &word[start..end]
 }
 
 // Adds the words of text to counts, lowercased.
-pub fn add_words(counts: inout HashMap<String<Gpa>, i64, Gpa>, text: str, gpa: Gpa) {
+pub fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa>, text: &str, gpa: Gpa) {
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.is_empty() {
             continue;
         }
-        counts.get_or_insert(w.to_lowercase_in(gpa), 0)[0] += 1;
+        *counts.entry(w.to_lowercase_in(gpa)).or_insert(0) += 1;
     }
 }
 ```
@@ -78,18 +82,19 @@ And `report.vl`, the table:
 ```vole report.vl
 // The table of the most common words.
 
-pub fn top(counts: HashMap<String<Gpa>, i64, Gpa>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64),
-    Gpa> {
-    var pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
-    for (word, k) in counts.iter() {
-        pairs.push((word.clone(), k));
+use std::collections::HashMap;
+
+pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64), Gpa> {
+    let mut pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
+    for (word, k) in counts {
+        pairs.push((word.clone(), *k));
     }
-    pairs.sort_by(|a, b| if a.1 != b.1 { b.1 - a.1 } else { a.0.cmp(b.0) });
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     pairs.truncate(n);
     pairs
 }
 
-pub fn print_table(rows: [(String<Gpa>, i64)]) {
+pub fn print_table(rows: &[(String<Gpa>, i64)]) {
     for row in rows {
         println("{:<12}{:>5}", row.0, row.1);
     }
@@ -192,26 +197,30 @@ off:
 ```vole main.vl
 mod count;
 
+use std::collections::HashMap;
+
 fn main(gpa: Gpa) {
-    var counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
-    count::add_words(&counts, "the cat and the hat", gpa);
+    let mut counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
+    count::add_words(&mut counts, "the cat and the hat", gpa);
     println("{} different words", counts.len());
 }
 ```
 
 ```vole count.vl
-fn add_words(counts: inout HashMap<String<Gpa>, i64, Gpa>, text: str, gpa: Gpa) {
+use std::collections::HashMap;
+
+fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa>, text: &str, gpa: Gpa) {
     for word in text.split_whitespace() {
         let w = word.to_lowercase_in(gpa);
-        counts.get_or_insert(w, 0)[0] += 1;
+        *counts.entry(w).or_insert(0) += 1;
     }
 }
 ```
 
 ```err
 error[item.private]: 'add_words' is private
- --> main.vl: line 5, column 5
-  = help: make it public: `pub fn add_words` at count.vl: line 1, column 1
+ --> main.vl: line 7, column 5
+  = help: make it public: `pub fn add_words` at count.vl: line 3, column 1
   = try: volec fix --suggested main.vl
 ```
 
@@ -229,8 +238,9 @@ is seen only by the struct's module and the modules inside it. Another
 module reads `r.w` only when the field is `pub w: i64`, and builds the
 struct with a literal only when every field is `pub`; otherwise it
 calls a function of the struct's module (`Rect::new(3, 4)`), which keeps
-the fields meaning what they should. Methods are visible wherever their
-type is. (Until 0.26 every field was as visible as its struct.)
+the fields meaning what they should. The functions and methods of an
+`impl` are items like any other: `Rect::new` and `r.area()` are called
+from another module only when they are `pub fn`.
 
 ## Paths and use
 
@@ -346,19 +356,20 @@ The `try:` line adds it. For a whole program that's missing several,
 `volec fix --only imports main.vl` writes every `use` line it can work
 out, for your own modules' items and for the standard library's.
 
-> **If you know Rust:** `mod`, `use`, `pub`, `crate`, `self` and
-> `super` work as you expect, without `pub(crate)` or `extern crate`.
-> There is no Cargo and no package manager yet: a program is the files
-> its root names, and `std`. That's a gap a pre-1.0 language still has
-> to fill.
+> **If you know Rust:** `mod`, `use`, `pub`, `pub(crate)`, `crate`,
+> `self` and `super` work as you expect. Two differences: a path may
+> start with a sibling module without `crate::`, and there are no
+> wildcard imports. There is no Cargo and no package manager yet: a
+> program is the files its root names, and `std`. That's a gap a
+> pre-1.0 language still has to fill.
 
 ## The prelude
 
 A few names work in every file without a `use`: `println` and `print`,
-`Vec`, `String`, `HashMap`, `Option` with `Some` and `None`, `Result`
-with `Ok` and `Err`, `Gpa`, `read_stdin_in`, `assert`, `panic`, and a
-few dozen more. They are the *prelude*. Everything else in the standard
-library you import, like `use std::fs;`, or write as a path,
+`Vec`, `String`, `Option` with `Some` and `None`, `Result` with `Ok`
+and `Err`, `Gpa`, `assert`, `panic`, and a few dozen more. They are the
+*prelude*. Everything else in the standard library you import, like
+`use std::fs;` or `use std::collections::HashMap;`, or write as a path,
 `std::fs::read_to_string_in(...)`.
 
 If your program defines a name the prelude also has, yours wins in that
@@ -380,20 +391,21 @@ mod report;
 use std::env;
 use std::fs;
 use std::io;
+use std::collections::HashMap;
 
 fn run(gpa: Gpa) -> io::Result<()> {
-    let args: Vec<str, Gpa> = env::args().collect_in(gpa);
-    var counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
-    for path in args[1..] {
+    let args: Vec<&str, Gpa> = env::args().collect_in(gpa);
+    let mut counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
+    for path in &args[1..] {
         let text = fs::read_to_string_in(path, gpa)?;
-        count::add_words(&counts, text, gpa);
+        count::add_words(&mut counts, &text, gpa);
     }
-    let n = match env::get_in("WC_TOP", gpa) {
+    let n = match env::var_in("WC_TOP", gpa) {
         Ok(s) => s.parse::<usize>().unwrap_or(5),
         Err(_) => 5,
     };
-    let top = report::top(counts, n, gpa);
-    report::print_table(top);
+    let top = report::top(&counts, n, gpa);
+    report::print_table(&top);
     Ok(())
 }
 
@@ -410,38 +422,40 @@ fn main(gpa: Gpa) -> i32 {
 
 ```vole count.vl
 // Counting the words of a text.
+use std::collections::HashMap;
 
 // Letters, digits and apostrophes are parts of words. So is every
 // byte of a non-ASCII character (0x80 and up), so "café" stays whole.
 fn is_word_byte(b: u8) -> bool {
     match b {
-        'a'..='z' | 'A'..='Z' | '0'..='9' | '\'' => true,
+        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'\'' => true,
         0x80..=0xff => true,
         _ => false,
     }
 }
 
 // The word without the punctuation around it: "end!" is "end".
-fn trim_punct(word: str) -> str {
-    var start: usize = 0;
-    var end = word.len();
-    while start < end && !is_word_byte(word[start]) {
+fn trim_punct(word: &str) -> &str {
+    let bytes = word.as_bytes();
+    let mut start = 0;
+    let mut end = bytes.len();
+    while start < end && !is_word_byte(bytes[start]) {
         start += 1;
     }
-    while end > start && !is_word_byte(word[end - 1]) {
+    while end > start && !is_word_byte(bytes[end - 1]) {
         end -= 1;
     }
-    word[start..end]
+    &word[start..end]
 }
 
 // Adds the words of text to counts, lowercased.
-pub fn add_words(counts: inout HashMap<String<Gpa>, i64, Gpa>, text: str, gpa: Gpa) {
+pub fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa>, text: &str, gpa: Gpa) {
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.is_empty() {
             continue;
         }
-        counts.get_or_insert(w.to_lowercase_in(gpa), 0)[0] += 1;
+        *counts.entry(w.to_lowercase_in(gpa)).or_insert(0) += 1;
     }
 }
 ```
@@ -449,17 +463,19 @@ pub fn add_words(counts: inout HashMap<String<Gpa>, i64, Gpa>, text: str, gpa: G
 ```vole report.vl
 // The table of the most common words.
 
-pub fn top(counts: HashMap<String<Gpa>, i64, Gpa>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64), Gpa> {
-    var pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
-    for (word, k) in counts.iter() {
-        pairs.push((word.clone(), k));
+use std::collections::HashMap;
+
+pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64), Gpa> {
+    let mut pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
+    for (word, k) in counts {
+        pairs.push((word.clone(), *k));
     }
-    pairs.sort_by(|a, b| if a.1 != b.1 { b.1 - a.1 } else { a.0.cmp(b.0) });
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     pairs.truncate(n);
     pairs
 }
 
-pub fn print_table(rows: [(String<Gpa>, i64)]) {
+pub fn print_table(rows: &[(String<Gpa>, i64)]) {
     for row in rows {
         println("{:<12}{:>5}", row.0, row.1);
     }
@@ -487,14 +503,14 @@ environment.
 ### The command line
 
 ```vole skip
-    let args: Vec<str, Gpa> = env::args().collect_in(gpa);
+    let args: Vec<&str, Gpa> = env::args().collect_in(gpa);
 ```
 
 `std::env` is the module for what a program gets from whoever started
 it. `env::args()` gives the command-line arguments one at a time, each a
-`str`; `collect_in(gpa)` keeps them in a `Vec`. The first argument is
+`&str`; `collect_in(gpa)` keeps them in a `Vec`. The first argument is
 the program's own name (`./wc`), so the loop starts at the second:
-`args[1..]` is the slice of all the others.
+`&args[1..]` is the slice of all the others.
 
 ### Reading a file
 
@@ -514,7 +530,7 @@ file couldn't be read. The `?` passes an error up to `run`'s caller
 
 The *environment* is a set of named strings every program inherits
 from whoever started it: `HOME`, `PATH`, and any you set yourself.
-`env::get_in(name, gpa)` reads one, as a `Result`, because it may not be
+`env::var_in(name, gpa)` reads one, as a `Result`, because it may not be
 set. The word counter reads `WC_TOP`, how many rows to print, and falls
 back to 5 when it's missing or isn't a number. Set it for one run:
 
@@ -581,26 +597,27 @@ a `BufWriter`, which read and write in large blocks:
 
 ```vole files.vl
 use std::fs;
-use std::fs::File;
 use std::io;
-use std::io::{BufReader, BufWriter, writeln};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter};
 
 fn main(gpa: Gpa) -> io::Result<()> {
     fs::write("notes.txt", "first line\n")?;
-    fs::append("notes.txt", "second line\n")?;
+    let mut notes = OpenOptions::new().append(true).open("notes.txt")?;
+    writeln(&mut notes, "second line")?;
     {
-        var w = BufWriter::new(File::create("squares.txt")?);
+        let mut w = BufWriter::new(File::create("squares.txt")?);
         for i in 1..4 {
-            writeln(&w, format_args("{i} squared is {}", i * i))?;
+            writeln(&mut w, "{i} squared is {}", i * i)?;
         }
     }
-    var r = BufReader::new(File::open("squares.txt")?);
+    let r = BufReader::new(File::open("squares.txt")?);
     for line in r.lines_in(gpa) {
         let line = line?;
         println("read: {line}");
     }
     let notes = fs::read_to_string_in("notes.txt", gpa)?;
-    print(notes);
+    print("{notes}");
     Ok(())
 }
 ```
@@ -613,14 +630,18 @@ first line
 second line
 ```
 
-`fs::write` replaces a file's contents and `fs::append` adds to them.
-`File::create` makes a file (or empties one that exists), and
-`writeln(&w, ...)` writes a line to it; the `&` is there because writing
-changes the writer. The writer lives in a block of its own: at the end
-of the block it is dropped, which writes out what's left in its buffer
-and closes the file, before we open the file again to read it.
-`lines_in` gives the lines one at a time, each a `Result`, because
-reading can fail halfway through.
+`fs::write` replaces a file's contents. To add to them, open the file
+with `OpenOptions`, which says how (`append(true)`). `File::create`
+makes a file (or empties one that exists), and `writeln(&mut w, ...)`
+writes a formatted line to a file or a writer; the `&mut` is there
+because writing changes it. The writer
+lives in a block of its own: at the end of the block it is dropped,
+which writes out what's left in its buffer and closes the file, before
+we open the file again to read it. `lines_in` gives the lines one at a
+time, each a `Result`, because reading can fail halfway through.
+
+Of the `use std::io::{...}` names, `BufRead` is a trait (chapter 9):
+`lines_in` is one of its methods.
 
 ### Directories
 
@@ -631,16 +652,16 @@ use std::fs;
 use std::io;
 
 fn main(gpa: Gpa) -> io::Result<()> {
-    var names: Vec<String<Gpa>, Gpa> = Vec::new_in(gpa);
+    let mut names: Vec<String<Gpa>, Gpa> = Vec::new_in(gpa);
     for entry in fs::read_dir(".")? {
         let entry = entry?;
-        let name = entry.file_name() as str;
+        let name = entry.file_name();
         if name.ends_with(".txt") {
             names.push(String::from_in(name, gpa));
         }
     }
     names.sort();
-    for n in names {
+    for n in &names {
         println("{n}");
     }
     Ok(())
@@ -657,10 +678,10 @@ b.txt
 ```
 
 A directory's entries come in whatever order the file system keeps
-them, so we sort the names. `file_name()` gives a `Path`, the standard
-library's type for file names, and `as str` reads it as text.
-`std::path` has the rest of what you do with paths: `extension()`,
-`parent()`, `join_in(other, gpa)` and so on.
+them, so we sort the names. `file_name()` gives the name as a `&str`
+borrowed from the entry, so to keep it past the loop's turn we copy it
+into a `String`. A path is plain text here; `std::path` has `Path` and
+`PathBuf` for taking paths apart and joining them.
 
 ## Running other programs
 
@@ -670,16 +691,12 @@ library's type for file names, and `as str` reads it as text.
 use std::process::Command;
 
 fn main(gpa: Gpa) {
-    var c = Command::new("echo");
-    c.arg("hello");
-    c.arg("from echo");
-    let out = c.output_in(gpa).unwrap();
+    let out = Command::new_in("echo", gpa).arg("hello").arg("from echo").output().unwrap();
     println("echo exited with {:?}", out.status.code());
     let text = String::from_utf8(out.stdout).unwrap();
     print("it printed: {text}");
 
-    var f = Command::new("false");
-    let st = f.status().unwrap();
+    let st = Command::new_in("false", gpa).status().unwrap();
     println("false succeeded: {}", st.success());
 }
 ```
@@ -690,40 +707,14 @@ it printed: hello from echo
 false succeeded: false
 ```
 
-`Command::new` names the program, and each `arg` adds one argument.
-`output_in` runs it, collects what it printed (so it needs an
-allocator), and gives back its exit status and its output as bytes;
-`String::from_utf8` checks that they are text. `status()` runs a
+`Command::new_in` names the program; a command keeps its arguments in
+memory, so it takes the allocator. Each `arg` adds one argument and
+gives the command back, so the calls chain. `output` runs it, collects
+what it printed, and gives back its exit status and its output as
+bytes; `String::from_utf8` checks that they are text. `status()` runs a
 program and only waits for its exit status, letting its output go
 straight to yours. Both return a `Result`, because the program might
 not exist.
-
-Notice that `c` is a `var`, and the arguments are added one statement
-at a time. `arg` changes the command and returns nothing, so calls
-can't be chained:
-
-```vole
-use std::process::Command;
-
-fn main(gpa: Gpa) {
-    let out = Command::new("echo").arg("hi").output_in(gpa).unwrap();
-    print(String::from_utf8(out.stdout).unwrap());
-}
-```
-
-```err
-error[type error]: no method 'output_in' on type '()'
- --> main.vl: line 4, column 15
-```
-
-The message is about the symptom: `.arg("hi")` returned `()`, the empty
-value, and `()` has no `output_in`. When you see a method missing on
-`()`, look at the call before it.
-
-> **If you know Rust:** the names are Rust's (`Command`, `arg`,
-> `output`, `status`), but there is no builder chaining: a method that
-> changes its value takes it `inout` and returns nothing, so
-> `Command::new(p).arg(a)` doesn't give you the command back.
 
 ## Summary
 
@@ -739,7 +730,7 @@ saw:
 - the prelude, the names every file has;
 - `fs::read_to_string_in`, `fs::write`, `File`, `BufReader`,
   `BufWriter`, `writeln` and `fs::read_dir`, all returning `io::Result`;
-- `env::args()` and `env::get_in` for the command line and the
+- `env::args()` and `env::var_in` for the command line and the
   environment, and `Command` for running other programs;
 - the exit status, from `main`'s `i32` or from `main` returning a
   `Result`.
@@ -755,6 +746,6 @@ each function may do, and how to make it hold a function to a promise.
   `fs::read_to_string_in(...)` instead of using `?`.)
 - With no file names on the command line, make `wc` read stdin, as it
   did at the start of the chapter.
-- Add a module `filter.vl` with a `pub fn is_boring(word: str) -> bool`
+- Add a module `filter.vl` with a `pub fn is_boring(word: &str) -> bool`
   that's true for "the", "a" and "and", and leave those words out of
   the count.

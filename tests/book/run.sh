@@ -61,6 +61,11 @@
 set -u
 LC_ALL=C
 export LC_ALL
+# (0.28.0) std is the compiler's own text here, `<std>`, wherever the
+# runner's programs are: not the files of a vole repository around them
+# (front/stdtree.vl: find_std_tree), which the tools would name instead.
+VOLE_STD_TREE=none
+export VOLE_STD_TREE
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -348,6 +353,12 @@ check_unit() {
                 rc=$?
                 trimmed "$d/build/run.out" >"$d/got"
                 trimmed "$d/out" >"$d/want"
+                # (0.28) a panic's line may name a position in std (`unwrap`'s
+                # requires): compared normalized, as a session's is
+                if grep -q '<std>:' "$d/want" && ! grep -q '^<!-- exact-std -->' "$ROOT/book/${name%%:*}.md" 2>/dev/null; then
+                    awk -f "$ROOT/tests/stdpos.awk" "$d/got" >"$d/got.n" && mv "$d/got.n" "$d/got"
+                    awk -f "$ROOT/tests/stdpos.awk" "$d/want" >"$d/want.n" && mv "$d/want.n" "$d/want"
+                fi
                 want_rc=$(cat "$d/exit")
                 if ! cmp -s "$d/got" "$d/want"; then
                     { echo "FAIL $name: output differs"; echo "    --- the book says"; sed 's/^/    /' "$d/want"; echo

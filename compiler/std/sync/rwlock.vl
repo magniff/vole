@@ -1,0 +1,225 @@
+// std::sync::RwLock: data many threads read at once, or one writes. Rust's
+// API; no poisoning (see std::sync). The lock is one word: 0 free, n for n
+// readers, u32::MAX for a writer; waiters sleep on it and are all woken
+// when it becomes free. A writer waits while readers keep arriving: there
+// is no queue.
+
+use crate::cell::UnsafeCell;
+use crate::fmt::{Debug, Formatter};
+use crate::ops::{Deref, DerefMut, Drop};
+use crate::result::Result;
+use crate::sync::{LockResult, TryLockError, TryLockResult};
+use crate::sync::atomic::{AtomicU32, Ordering};
+
+const WRITER: u32 = 0xffffffff;
+
+pub struct RwLock<T> {
+    state: AtomicU32,
+    // The threads asleep on state (or about to be): an unlock wakes only
+    // when there are some.
+    waiters: AtomicU32,
+    data: UnsafeCell<T>,
+}
+
+// UNSAFE: an RwLock holds an UnsafeCell, which is not Sync: stated, as
+// Rust's.
+// SAFETY: the data is read through read guards, which exist only while
+// the word counts them and no writer holds it, and written through the one
+// write guard: readers share a &T (T: Sync), and a writer has the T as if
+// it was moved to its thread (T: Send).
+unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
+// UNSAFE: stated with Sync, as Rust's.
+// SAFETY: moving an RwLock moves its T (T: Send); the words are atomics.
+unsafe impl<T: Send> Send for RwLock<T> {}
+
+impl<T> RwLock<T> {
+    #[effects(T)]
+    pub fn new(v: T) -> RwLock<T> {
+        RwLock { state: AtomicU32::new(0), waiters: AtomicU32::new(0), data: UnsafeCell::new(v) }
+    }
+
+    fn try_read_once(&self) -> bool {
+        let mut s = self.state.load(Ordering::Relaxed);
+        // (WRITER - 1 readers is the most the word counts)
+        while s < WRITER - 1 {
+            match self.state.compare_exchange(s, s + 1, Ordering::Acquire, Ordering::Relaxed) {
+                Result::Ok(_) => return true,
+                Result::Err(now) => s = now,
+            }
+        }
+        false
+    }
+
+    fn try_write_once(&self) -> bool {
+        self.state.compare_exchange(0, WRITER, Ordering::Acquire, Ordering::Relaxed).is_ok()
+    }
+
+    // Sleeps while the word is `seen`.
+    fn sleep(&self, seen: u32) {
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        // UNSAFE: the system sleeps on a raw address.
+        // SAFETY: the address is self.state's, a live AtomicU32 while self
+        // is borrowed.
+        unsafe { crate::__sys::futex_wait(self.state.as_ptr(), seen) };
+        self.waiters.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn wake(&self) {
+        if self.waiters.load(Ordering::SeqCst) != 0 {
+            // UNSAFE: the system wakes the sleepers on a raw address.
+            // SAFETY: the address is self.state's, live while self is
+            // borrowed.
+            unsafe { crate::__sys::futex_wake(self.state.as_ptr(), true) };
+        }
+    }
+
+    // Waits until no writer holds the lock; the guard reads the data.
+    #[effects(sync, panic, diverge, T)]
+    pub fn read(&self) -> LockResult<RwLockReadGuard<'_, T>> {
+        while !self.try_read_once() {
+            let s = self.state.load(Ordering::Relaxed);
+            if s >= WRITER - 1 {
+                self.sleep(s);
+            }
+        }
+        Result::Ok(RwLockReadGuard { lock: self })
+    }
+
+    // Waits until nothing holds the lock; the guard writes the data.
+    #[effects(sync, panic, diverge, T)]
+    pub fn write(&self) -> LockResult<RwLockWriteGuard<'_, T>> {
+        while !self.try_write_once() {
+            let s = self.state.load(Ordering::Relaxed);
+            if s != 0 {
+                self.sleep(s);
+            }
+        }
+        Result::Ok(RwLockWriteGuard { lock: self })
+    }
+
+    #[effects(T)]
+    pub fn try_read(&self) -> TryLockResult<RwLockReadGuard<'_, T>> {
+        if self.try_read_once() {
+            Result::Ok(RwLockReadGuard { lock: self })
+        } else {
+            Result::Err(TryLockError::WouldBlock)
+        }
+    }
+
+    #[effects(T)]
+    pub fn try_write(&self) -> TryLockResult<RwLockWriteGuard<'_, T>> {
+        if self.try_write_once() {
+            Result::Ok(RwLockWriteGuard { lock: self })
+        } else {
+            Result::Err(TryLockError::WouldBlock)
+        }
+    }
+
+    // Always false: there is no poisoning.
+    pub fn is_poisoned(&self) -> bool {
+        false
+    }
+
+    // The data, when nothing else can reach the lock.
+    #[effects(T)]
+    pub fn into_inner(self) -> LockResult<T> {
+        Result::Ok(self.data.into_inner())
+    }
+
+    // The data, through the unique borrow (no locking needed).
+    #[effects(T)]
+    pub fn get_mut(&mut self) -> LockResult<&mut T> {
+        Result::Ok(self.data.get_mut())
+    }
+}
+
+impl<T: Debug> Debug for RwLock<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        match self.try_read() {
+            Result::Ok(g) => {
+                f.write_str("RwLock { data: ")?;
+                Debug::fmt(g.deref(), f)?;
+                f.write_str(", poisoned: false, .. }")
+            }
+            Result::Err(_) => f.write_str("RwLock { data: <locked>, poisoned: false, .. }"),
+        }
+    }
+}
+
+// A read lock held: the data through `*g`; dropping it lets go.
+pub struct RwLockReadGuard<'a, T> {
+    lock: &'a RwLock<T>,
+}
+
+impl<'a, T> !Send for RwLockReadGuard<'a, T> {}
+
+impl<'a, T> Deref for RwLockReadGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // UNSAFE: the data is behind the lock's UnsafeCell, a raw pointer.
+        // SAFETY: a read guard exists only while the word counts it, so no
+        // writer holds the lock: the data is only read, by this & and the
+        // other readers'; the & lives no longer than the guard's borrow.
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<'a, T> Drop for RwLockReadGuard<'a, T> {
+    fn drop(&mut self) {
+        // (the last reader out wakes the writers waiting)
+        // (SeqCst, as waiters': an unlock and a sleeper's count cannot
+        // both miss each other)
+        if self.lock.state.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.lock.wake();
+        }
+    }
+}
+
+impl<'a, T: Debug> Debug for RwLockReadGuard<'a, T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        Debug::fmt(self.deref(), f)
+    }
+}
+
+// The write lock held: the data through `*g`; dropping it lets go.
+pub struct RwLockWriteGuard<'a, T> {
+    lock: &'a RwLock<T>,
+}
+
+impl<'a, T> !Send for RwLockWriteGuard<'a, T> {}
+
+impl<'a, T> Deref for RwLockWriteGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // UNSAFE: the data is behind the lock's UnsafeCell, a raw pointer.
+        // SAFETY: the write guard exists only while the word is WRITER:
+        // no other guard does, so nothing else reaches the data; the &
+        // lives no longer than the guard's borrow.
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<'a, T> DerefMut for RwLockWriteGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // UNSAFE: as deref's.
+        // SAFETY: as deref's, and `&mut self` makes this the guard's one
+        // access.
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<'a, T> Drop for RwLockWriteGuard<'a, T> {
+    fn drop(&mut self) {
+        // (SeqCst: see the read guard's)
+        self.lock.state.store(0, Ordering::SeqCst);
+        self.lock.wake();
+    }
+}
+
+impl<'a, T: Debug> Debug for RwLockWriteGuard<'a, T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        Debug::fmt(self.deref(), f)
+    }
+}

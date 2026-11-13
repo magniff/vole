@@ -19,13 +19,13 @@ time.
 
 Let's recall what the earlier chapters showed. In safe vole:
 
-- arithmetic on integers wraps around instead of overflowing into
-  nonsense (chapter 3);
+- arithmetic on integers stops the program or wraps around, and never
+  overflows into nonsense (chapter 3);
 - every index into an array, a `Vec` or a slice is checked, and a bad
   one stops the program with a panic (chapter 7);
-- every variable is set before it's used;
-- a view of a value can't outlive the value or see it change underneath
-  it (chapter 4).
+- a reference to a value can't outlive the value or see it change
+  underneath it (chapter 4);
+- every variable is set before it's read (chapter 3).
 
 Together these mean safe code has no *undefined behaviour*: there is
 no program you can write in safe vole whose meaning is "whatever the
@@ -114,28 +114,24 @@ functions.
 
 ## What unsafe allows
 
-An `unsafe` block doesn't turn the checks off. It allows five more
+An `unsafe` block doesn't turn the checks off. It allows three more
 operations, each one something the compiler can't check:
 
 - **calling a C function or an `unsafe fn`**: the compiler can't see
-  what the other side does;
-- **dereferencing a raw pointer** (`*p`, or `p.field` through one): the
+  what the other side does, or can't check what it asks of its caller;
+- **dereferencing a raw pointer** (`*p`, or a field through one): the
   pointer could point anywhere;
-- **indexing a raw pointer** (`p[i]`): there's no length to check
-  against;
-- **casting an integer to a pointer**: the compiler can't know there's
-  anything at that address;
 - **reading a field of a `union`**: the compiler can't know which field
   was last written.
 
 Everything else stays checked, inside `unsafe` too. Indexing a `Vec` in
-an unsafe block is still checked, arithmetic still wraps, and a view
-still can't outlive its value. Here's an index past the end of a `Vec`,
-inside `unsafe`:
+an unsafe block is still checked, arithmetic is still defined, and a
+reference still can't outlive its value. Here's an index past the end
+of a `Vec`, inside `unsafe`:
 
 ```vole
 fn main(gpa: Gpa) {
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
     v.push(1);
     let i = v.len() + 2;
     unsafe {
@@ -151,24 +147,24 @@ main.vl:6:23: index out of bounds: index 3, length 1
 So `unsafe` is narrow on purpose: it's a short list of things you take
 responsibility for, not a switch that turns vole into C.
 
-> **If you know Rust:** this is Rust's model, with the same five
-> operations. Two things look different: pointer arithmetic is indexing
-> (`p[i]` instead of `p.add(i)`), and there's no bindgen step, because
-> vole reads C headers itself (you'll see `import` below).
+> **If you know Rust:** this is Rust's model. One thing looks
+> different: there's no bindgen step, because vole reads C headers
+> itself (you'll see `import` below).
 
 ## Raw pointers
 
-A *raw pointer* is an address and a type: `*i64` is "the address of an
-`i64`, maybe". It's vole's equivalent of a C pointer, and nothing
-checks what it points to.
+A *raw pointer* is an address and a type: `*const i64` is "the address
+of an `i64`, maybe", to read through, and `*mut i64` one to write
+through as well. They are vole's equivalent of C pointers, and nothing
+checks what they point to.
 
 ```vole pointers.vl
 fn main() {
     let xs: [i64; 4] = [10, 20, 30, 40];
-    let p = &xs as *i64; // a raw pointer to the first element
-    let null = 0 as *i64;
+    let p = xs.as_ptr(); // a raw pointer to the first element
+    let null: *const i64 = std::ptr::null();
     println("{} {}", p.is_null(), null.is_null());
-    let third = unsafe { p[2] };
+    let third = unsafe { *p.add(2) };
     println("{third}");
 }
 ```
@@ -178,12 +174,13 @@ false true
 30
 ```
 
-Making a pointer is safe: `&xs as *i64` takes the address of `xs`, and
-`0 as *i64` is the *null pointer*, the address that points at nothing.
-Comparing pointers and asking `is_null()` are safe too. Only using a
-pointer to reach memory needs `unsafe`, as `p[2]` does here. It reads
-the `i64` two places after the one `p` points to, with no bounds check:
-`p` doesn't know how many elements there are.
+Making a pointer is safe: `xs.as_ptr()` is the address of the array's
+first element, and `std::ptr::null()` is the *null pointer*, the
+address that points at nothing. Comparing pointers and asking
+`is_null()` are safe too. Only using a pointer to reach memory needs
+`unsafe`, as `*p.add(2)` does here. `p.add(2)` is the address two
+`i64`s after the one `p` points to, and `*` reads what is there, with
+no bounds check: `p` doesn't know how many elements there are.
 
 That's the danger. Change the `2` to `7`, and the program still builds
 and runs. It reads 8 bytes from beyond the end of the array, whatever
@@ -191,37 +188,30 @@ happens to be there, and prints a number that can differ from run to
 run, or between `-O0` and `-O2`. That is undefined behaviour, and it's
 exactly what safe code rules out.
 
-Casting any integer other than `0` to a pointer is unsafe, since
-there's rarely anything you can know about an address you made up:
+Forget the `unsafe`, and the compiler says which operation needs it:
 
 ```vole
 fn main() {
-    let p = 4096 as *u8;
-    println("{}", p.is_null());
+    let xs: [i64; 4] = [10, 20, 30, 40];
+    let p = xs.as_ptr();
+    println("{}", *p);
 }
 ```
 
 ```err
-error[unsafe]: casting an integer to a pointer is unsafe
- --> main.vl: line 2, column 13
+error[unsafe]: dereference of a raw pointer is unsafe
+ --> main.vl: line 4, column 19
   = help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place)
   = try: volec fix --only unsafe main.vl
 ```
 
-When a pointer can never be null, say so with `std::NonNull<T>`.
+When a pointer can never be null, say so with `std::ptr::NonNull<T>`.
 `NonNull::new(p)` returns `None` for a null pointer and `Some` for any
 other, and an `Option<NonNull<T>>` takes no more room than the pointer
 itself: `None` is stored as null. It's the usual type for a link in a
 hand-built list or tree, and for a C pointer that may be null.
 Dereferencing a `NonNull` is still unsafe; it promises only "not null",
 not "valid".
-
-> **If you know Rust:** the `&` in `&xs as *i64` isn't a reference
-> being cast. Vole has no references to store. `&place` is the marker
-> for "the callee may change this", and where a raw pointer is wanted,
-> it is simply the place's address. It takes no inout access, so it
-> works on a `let`; writing through it to a `let` would be the unsafe
-> code's mistake.
 
 ## unsafe fn and its contract
 
@@ -236,8 +226,8 @@ import "string.h" as c;
 //
 // Unsafe: `p` must point to a NUL-terminated string, which must stay
 // alive and unchanged while the result is used.
-unsafe fn c_text(p: *u8) -> [u8] {
-    p[0..c::strlen(p) as i64]
+unsafe fn c_text<'a>(p: *const u8) -> &'a [u8] {
+    std::slice::from_raw_parts(p, c::strlen(p) as usize)
 }
 
 fn main() {
@@ -250,8 +240,11 @@ fn main() {
 section explains it. `c"hello"` is a C string.)
 
 The body of an `unsafe fn` is unsafe code, so it can call `strlen` and
-slice the pointer without a block of its own. In exchange, every call
-of `c_text` is an unsafe operation:
+`std::slice::from_raw_parts`, which makes a slice from a pointer and a
+length, without a block of its own. The slice's lifetime, `'a`, is tied
+to nothing: a raw pointer has no lifetime to borrow from, so how long
+the slice stays good is part of the promise in the comment. In
+exchange, every call of `c_text` is an unsafe operation:
 
 ```err
 error[unsafe]: calling an `unsafe fn` is unsafe
@@ -277,8 +270,8 @@ Vole can read C's header files instead:
 import "math.h" as m;
 
 fn main() {
-    var exp: i32 = 0;
-    let frac = unsafe { m::frexp(48.0, &exp) };
+    let mut exp: i32 = 0;
+    let frac = unsafe { m::frexp(48.0, &mut exp) };
     let e = unsafe { m::erf(0.5) };
     println("48 = {frac} * 2^{exp}");
     println("erf(0.5) = {e:.6}");
@@ -294,13 +287,12 @@ erf(0.5) = 0.520500
 and makes its functions available under `m::`. Their types come from
 the header: C's `int` is `i32`, `long` and `int64_t` are `i64`,
 `double` is `f64`, `size_t` is `u64`, and any pointer to bytes, `char
-*` or `void *`, is `*u8`.
+*` or `void *`, is `*mut u8` (`*const u8` when C says `const`).
 
 `frexp` splits a number into a fraction and a power of two, and returns
 the power through a pointer: its C signature is `double frexp(double x,
-int *exp)`. We pass `&exp`, which converts to the address of `exp`
-where a `*i32` is wanted. As always, `&` marks the argument that may
-change.
+int *exp)`. We pass `&mut exp`: a reference converts to the raw pointer
+of its kind, here a `*mut i32`, where one is wanted.
 
 Headers can't give everything. C macros that look like functions,
 `static inline` functions and `errno` aren't functions the linker can
@@ -310,10 +302,10 @@ your own (below), or look for the real function behind the macro.
 ### C strings
 
 C's text is a pointer to bytes ending with a zero byte, a
-*NUL-terminated* string. Vole's `str` and `[u8]` are a pointer and a
+*NUL-terminated* string. Vole's `&str` and `&[u8]` are a pointer and a
 length, with no zero at the end, so they can't be passed to C as they
-are. For C, write the literal with a `c` in front: `c"HOME"` is a `*u8`
-to the bytes `HOME` and a zero.
+are. For C, write the literal with a `c` in front: `c"HOME"` is a
+`*const u8` to the bytes `HOME` and a zero.
 
 ```vole env.vl
 import "stdlib.h" as c;
@@ -339,13 +331,14 @@ PATH is set: true
 check before using the result. (Two headers can share one name, `c`
 here: all of a program's headers go into one C module.)
 
-To turn a C string into vole text, slice the pointer up to its length,
-as `c_text` did above: `p[0..c::strlen(p) as i64]`. In the other
-direction, a vole slice `s` is `s.ptr` and `s.len()`, which is exactly
-what C functions that take a pointer and a length want.
+To turn a C string into vole text, make a slice from the pointer and
+its length, as `c_text` did above, then check it with
+`std::str::from_utf8` (chapter 7). In the other direction, a vole slice
+`s` is `s.as_ptr()` and `s.len()`, which is exactly what C functions
+that take a pointer and a length want.
 
 > **If you know C:** for reading the environment, there's a safe
-> `std::env::get_in(name, gpa)`; std wraps the common C calls this way,
+> `std::env::var_in(name, gpa)`; std wraps the common C calls this way,
 > so you rarely need `getenv` itself. This chapter calls C directly to
 > show how it works.
 
@@ -359,7 +352,7 @@ import "stdio.h" as c;
 
 fn main() {
     unsafe {
-        c::printf(c"%s has %ld letters, pi is about %.3f\n", c"vole", 4, 3.14159);
+        c::printf(c"%s has %ld letters, pi is about %.3f\n", c"vole", 4i64, 3.14159);
     }
 }
 ```
@@ -368,9 +361,10 @@ fn main() {
 vole has 4 letters, pi is about 3.142
 ```
 
-The format has to match: `%ld` for an `i64`, `%d` for an `i32` or a
-`bool`, `%f` for an `f64`, `%s` for a `*u8`. Nothing checks this; it's
-part of what the `unsafe` block vouches for.
+The format has to match: `%ld` for an `i64` (hence `4i64`: a plain `4`
+is an `i32`), `%d` for an `i32` or a `bool`, `%f` for an `f64`, `%s`
+for a C string. Nothing checks this; it's part of what the `unsafe`
+block vouches for.
 
 One practical warning: C's `printf` and vole's `println` each keep
 their own output buffer. When the output goes to a pipe or a file,
@@ -440,7 +434,9 @@ enum Color {
 }
 
 fn main() {
-    println("{} {} {}", size_of(Header), size_of(Packed), size_of(Color));
+    let header = std::mem::size_of::<Header>();
+    let packed = std::mem::size_of::<Packed>();
+    println("{header} {packed} {}", std::mem::size_of::<Color>());
     println("{}", Color::Blue as u8);
 }
 ```
@@ -503,23 +499,23 @@ struct Score {
 
 // qsort's comparison: negative, zero or positive, as C expects.
 // Highest points first.
-extern "C" fn by_points(a: *u8, b: *u8) -> i32 {
-    let x = unsafe { (*(a as *Score)).points };
-    let y = unsafe { (*(b as *Score)).points };
+extern "C" fn by_points(a: *const u8, b: *const u8) -> i32 {
+    let x = unsafe { (*(a as *const Score)).points };
+    let y = unsafe { (*(b as *const Score)).points };
     if x > y { -1 } else if x < y { 1 } else { 0 }
 }
 
 fn main() {
-    var scores = [
+    let mut scores = [
         Score { player: 1, points: 40 },
         Score { player: 2, points: 75 },
         Score { player: 3, points: 10 },
         Score { player: 4, points: 55 },
     ];
     let n = scores.len() as u64;
-    let size = size_of(Score) as u64;
-    unsafe { c::qsort(&scores as *u8, n, size, by_points); }
-    for s in scores {
+    let size = std::mem::size_of::<Score>() as u64;
+    unsafe { c::qsort(scores.as_mut_ptr() as *mut u8, n, size, by_points); }
+    for s in &scores {
         println("player {}: {}", s.player, s.points);
     }
 }
@@ -533,11 +529,11 @@ player 3: 10
 ```
 
 `qsort` only knows it has `n` elements of `size` bytes each, at some
-address. It hands our comparison two `void *` pointers, which arrive
-as `*u8`, and the comparison casts them back to `*Score`, the type it
-knows the array holds. `Score` is `#[repr(C)]` because C moves its
-bytes around; `size_of(Score)` tells `qsort` how many bytes an element
-is.
+address. It hands our comparison two `const void *` pointers, which
+arrive as `*const u8`, and the comparison casts them back to `*const
+Score`, the type it knows the array holds. `Score` is `#[repr(C)]`
+because C moves its bytes around; `std::mem::size_of::<Score>()` tells
+`qsort` how many bytes an element is.
 
 An `extern "C" fn` is an ordinary function you can call from vole too.
 It just has C's calling convention and a name C can link to, which a
@@ -620,55 +616,55 @@ is built and kept safe.)
 
 ```vole ints.vl
 extern "C" {
-    fn realloc(p: *u8, n: u64) -> *u8;
-    fn free(p: *u8);
+    fn realloc(p: *mut u8, n: usize) -> *mut u8;
+    fn free(p: *mut u8);
 }
 
 // A growable list of i64s, on C's heap.
 struct Ints {
-    data: *i64,
-    len: i64,
-    cap: i64,
+    data: *mut i64,
+    len: usize,
+    cap: usize,
 }
 
 impl Ints {
     fn new() -> Ints {
-        Ints { data: 0 as *i64, len: 0, cap: 0 }
+        Ints { data: std::ptr::null_mut(), len: 0, cap: 0 }
     }
 
-    fn push(inout self, x: i64) {
+    fn push(&mut self, x: i64) {
         if self.len == self.cap {
             let cap = if self.cap == 0 { 4 } else { self.cap * 2 };
-            let p = unsafe { realloc(self.data as *u8, (cap * 8) as u64) };
+            let p = unsafe { realloc(self.data as *mut u8, cap * 8) };
             if p.is_null() {
                 panic("out of memory");
             }
-            self.data = p as *i64;
+            self.data = p as *mut i64;
             self.cap = cap;
         }
         // in bounds: len < cap, and data holds cap i64s
-        unsafe { self.data[self.len] = x; }
+        unsafe { *self.data.add(self.len) = x; }
         self.len += 1;
     }
 
-    fn get(self, i: i64) -> i64 {
-        assert(i >= 0 && i < self.len);
-        unsafe { self.data[i] }
+    fn get(&self, i: usize) -> i64 {
+        assert(i < self.len);
+        unsafe { *self.data.add(i) }
     }
 
-    fn len(self) -> i64 {
+    fn len(&self) -> usize {
         self.len
     }
 }
 
 impl Drop for Ints {
-    fn drop(inout self) {
-        unsafe { free(self.data as *u8); }
+    fn drop(&mut self) {
+        unsafe { free(self.data as *mut u8); }
     }
 }
 
 fn main() {
-    var xs = Ints::new();
+    let mut xs = Ints::new();
     for i in 0..10 {
         xs.push(i * i);
     }
@@ -686,19 +682,21 @@ and each relies on something the safe code around it made true:
 - `push` writes `data[len]` only after making sure `len < cap`, and
   `data` always has room for `cap` numbers;
 - `get` checks the index itself, with `assert`, before reading,
-  because a raw pointer won't;
+  because a raw pointer won't (`add` is an `unsafe fn` for that
+  reason: its caller promises the result stays inside the block);
 - `drop` frees the memory exactly once, when the list goes away.
 
 `main` contains no `unsafe` at all. Whoever uses `Ints` can't break it:
 `get` with a bad index panics just like indexing a `Vec` does.
 
-`impl Drop` does more than free the memory. A type with a `Drop` is
-owned, as chapter 4 showed, even when its fields are plain numbers and
-pointers: assigning it moves it, and the old name can't be used
+An `Ints` is moved, not copied, as chapter 4 showed for every struct
+that doesn't derive `Copy`, even though its fields are plain numbers
+and a pointer: assigning it moves it, and the old name can't be used
 again. That matters here. If `Ints` could be copied, two copies would
 hold the same `data` pointer; one `push` could move the numbers to a
 new block and free the old one, leaving the other copy pointing at
-freed memory. Because it's owned, the compiler stops that:
+freed memory. The compiler stops that, and a type with a `Drop` can't
+derive `Copy` at all:
 
 ```vole skip
     let ys = xs;
@@ -706,8 +704,9 @@ freed memory. Because it's owned, the compiler stops that:
 ```
 
 ```text
-error[own.moved]: 'xs' is used here after it moved at 54:14
- --> ints.vl: line 55, column 16
+error[borrowck.use_moved]: 'xs' is used here after it moved (moved at ints.vl: line 55, column 14)
+ --> ints.vl: line 56, column 22
+  = help: use it before the move, pass a clone where it moves, or take it by reference
 ```
 
 Those are the rules unsafe code has to keep, so that the safe code
@@ -716,10 +715,10 @@ around it stays safe:
 - every pointer or slice it hands to safe code points at live memory
   of the right type, for as long as it's used;
 - it never makes a second way to change a value while something else
-  has the right to change it (an `inout` parameter is the only way to
-  its value while the call runs, and the optimizer relies on that);
+  has the right to change it (a `&mut` is the only way to its value
+  while it's in use, and the optimizer relies on that);
 - a type that manages memory through raw pointers implements `Drop`,
-  which makes it owned, so it is moved, never copied.
+  and is moved, never copied.
 
 `volec guide unsafe` has them in full.
 
@@ -736,55 +735,55 @@ bytes. Here's the same program with that one change:
 
 ```vole ints.vl
 extern "C" {
-    fn realloc(p: *u8, n: u64) -> *u8;
-    fn free(p: *u8);
+    fn realloc(p: *mut u8, n: usize) -> *mut u8;
+    fn free(p: *mut u8);
 }
 
 // A growable list of i64s, on C's heap.
 struct Ints {
-    data: *i64,
-    len: i64,
-    cap: i64,
+    data: *mut i64,
+    len: usize,
+    cap: usize,
 }
 
 impl Ints {
     fn new() -> Ints {
-        Ints { data: 0 as *i64, len: 0, cap: 0 }
+        Ints { data: std::ptr::null_mut(), len: 0, cap: 0 }
     }
 
-    fn push(inout self, x: i64) {
+    fn push(&mut self, x: i64) {
         if self.len == self.cap {
             let cap = if self.cap == 0 { 4 } else { self.cap * 2 };
-            let p = unsafe { realloc(self.data as *u8, (cap * 4) as u64) };
+            let p = unsafe { realloc(self.data as *mut u8, cap * 4) };
             if p.is_null() {
                 panic("out of memory");
             }
-            self.data = p as *i64;
+            self.data = p as *mut i64;
             self.cap = cap;
         }
         // in bounds: len < cap, and data holds cap i64s
-        unsafe { self.data[self.len] = x; }
+        unsafe { *self.data.add(self.len) = x; }
         self.len += 1;
     }
 
-    fn get(self, i: i64) -> i64 {
-        assert(i >= 0 && i < self.len);
-        unsafe { self.data[i] }
+    fn get(&self, i: usize) -> i64 {
+        assert(i < self.len);
+        unsafe { *self.data.add(i) }
     }
 
-    fn len(self) -> i64 {
+    fn len(&self) -> usize {
         self.len
     }
 }
 
 impl Drop for Ints {
-    fn drop(inout self) {
-        unsafe { free(self.data as *u8); }
+    fn drop(&mut self) {
+        unsafe { free(self.data as *mut u8); }
     }
 }
 
 fn main() {
-    var xs = Ints::new();
+    let mut xs = Ints::new();
     for i in 0..10 {
         xs.push(i * i);
     }
@@ -833,13 +832,13 @@ the `Vec` grows:
 
 ```vole stale.vl
 fn main(gpa: Gpa) {
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
     v.push(7);
-    let p = v.as_slice().ptr; // a raw pointer to the first element
+    let p = v.as_ptr(); // a raw pointer to the first element
     for i in 0..100 {
         v.push(i); // the Vec grows: its elements move to a new block
     }
-    let first = unsafe { p[0] };
+    let first = unsafe { *p };
     println("{first}");
 }
 ```
@@ -866,8 +865,7 @@ exercises your unsafe code gets this checking for free.
 
 - Safe vole has no undefined behaviour; `unsafe` marks the few
   operations the compiler can't check: calling C or an `unsafe fn`,
-  using a raw pointer, casting an integer to a pointer, reading a
-  union.
+  dereferencing a raw pointer, reading a union.
 - Everything else stays checked inside `unsafe`. Keep the blocks small,
   and give every `unsafe fn` a comment saying what its caller must
   promise.
@@ -878,7 +876,7 @@ exercises your unsafe code gets this checking for free.
   function C's calling convention, for callbacks and for C calling vole;
   `--emit-header` writes the C declarations.
 - Wrap unsafe code in a safe type; one that owns raw memory implements
-  `Drop`, which also makes it owned: moved, never copied.
+  `Drop`, and is moved, never copied.
 - `--check-unsafe` and `--check-alloc` find out-of-bounds accesses and
   uses after free at run time.
 
@@ -887,10 +885,10 @@ the compiler did with your code.
 
 ## Try it yourself
 
-- Add a `pop(inout self) -> Option<i64>` method to `Ints`. Which parts
+- Add a `pop(&mut self) -> Option<i64>` method to `Ints`. Which parts
   of it need `unsafe`?
 - Call `qsort` on the `Ints` list's memory directly, with a comparison
-  for `i64`s, from inside a new `sort(inout self)` method.
-- Import `time.h` and print the result of C's `time(0 as *i64)`. What
+  for `i64`s, from inside a new `sort(&mut self)` method.
+- Import `time.h` and print the result of C's `time(std::ptr::null_mut())`. What
   does `volec --emit-imports prog.vl -o decls.vl` show the header
   declares?

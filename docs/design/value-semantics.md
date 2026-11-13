@@ -1,5 +1,9 @@
 # vole 0.17 design: memory safety by mutable value semantics
 
+(0.28.0: history. The own pass this document designs, `--values`, `query
+own`, `query views` and the `own.*` codes are gone with the MVS edition;
+the borrow checker, [borrowck.md](borrowck.md), checks moves and views.)
+
 I read the language from `/Users/magniff/workspace/vole/.claude/worktrees/integ-0.15` (release-0.15) using `volec guide memory|unsafe|types`, `query show/items/grep/refs`, `try`, docs/grammar.md ("Indexing", "Undefined behaviour", "Additions of 0.9", "Escape"), docs/optimizer.md, the commits c51304d/7229534 (the index-order fix), docs/design/closures-iterators.md and errors-formatting.md. The decided 0.16 design comes from `/Users/magniff/workspace/vole/.claude/worktrees/design-016/docs/design/effects-allocation.md`. I modified nothing.
 
 ## Revision 1 (2026-10-15): after the prototype

@@ -23,21 +23,21 @@ manager), Windows, a stable language or a track record.
 ## An example
 
 ```rust
-// Quicksort, in place: `inout` lends the slice for writing, nothing is copied.
+// Quicksort, in place: `&mut` lends the slice for writing, nothing is copied.
 #[no_alloc] // checked: sorting allocates nothing
-fn quicksort<T: Ord>(xs: inout [T]) {
-    if xs.len <= 1 { return; }
-    let p = partition(&xs);
-    quicksort(&xs[0..p]); // the two halves are disjoint places
-    quicksort(&xs[p + 1..xs.len]);
+fn quicksort<T: Ord>(xs: &mut [T]) {
+    if xs.len() <= 1 { return; }
+    let p = partition(xs);
+    quicksort(&mut xs[..p]); // one half, then the other
+    quicksort(&mut xs[p + 1..]);
 }
 
-fn partition<T: Ord>(xs: inout [T]) -> usize
-    ensures result < xs.len
+fn partition<T: Ord>(xs: &mut [T]) -> usize
+    ensures result < xs.len()
 {
-    let last = xs.len - 1;
+    let last = xs.len() - 1;
     xs.swap(last / 2, last); // the middle element is the pivot
-    var store: usize = 0;
+    let mut store = 0;
     for i in 0..last {
         if xs[i] < xs[last] {
             xs.swap(i, store);
@@ -49,9 +49,9 @@ fn partition<T: Ord>(xs: inout [T]) -> usize
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa); // the allocator is explicit
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa); // the allocator is explicit
     for x in [5, 3, 9, 1, 4, 8, 2, 7, 6] { v.push(x); }
-    quicksort(&v); // & marks what the callee may change
+    quicksort(&mut v); // &mut marks what the callee may change
     println("{v:?}"); // [1, 2, 3, 4, 5, 6, 7, 8, 9]
 }
 ```
@@ -60,34 +60,34 @@ fn main(gpa: Gpa) {
 index may fail its check, and the recursion may not end; no `alloc`, as
 `#[no_alloc]` checks.
 
-## Why this is not Rust
+## Where it differs from Rust
 
-It looks like Rust on purpose, so a model's habits get it most of the
-way, but it means different things:
+Its surface is Rust's (syntax, ownership, `&T` and `&mut T` under a
+borrow checker, lifetimes, traits, generics, std's names), so a model's
+habits carry over. It differs in these places:
 
 | | Rust | vole |
 |---|---|---|
-| parameters | `&T`, `&mut T`, `T` | `let` (the default: read in place), `inout` (the call writes `&x`), `sink` (taken); `var` for `let mut` |
-| borrows | lifetimes, the borrow checker | no lifetimes to write: views (slices, structs holding one) are second-class, checked to stay inside what they view |
-| Rust's spellings | | `&mut T`, `let mut`, `*x`, `move \|\|` are the error `conv.rust` with a `try:` fix; `volec fix --only conventions` rewrites a program |
-| allocation | a global allocator, `Box`, `Rc`, `Arc` | explicit: `fn main(gpa: Gpa)`, `Vec::new_in(gpa)`, arenas, fixed buffers |
-| effects | none | inferred: `alloc(A)`, `io`, `global`, `panic`, `diverge`, `unsafe`, `thread`, `sync`, `tls`, CPU features; `query effects --why`; `#[pure]`, `#[no_alloc]`, `#[effects(..)]` are checked bounds |
-| contracts | crates | `requires`, `ensures`: checked at run time in every build, and used by the optimizer |
-| arithmetic | overflow panics in debug, `x / 0` panics | integers always wrap, `x / 0 == 0`, indexing checked: no undefined behaviour in safe code; raw `*T` and C calls need `unsafe` |
-| macros, imports | `macro_rules!`, `use x::*` | neither: `println("{x}")` is a function; every name is declared, imported by name or written with its path |
-| generics | monomorphized or `dyn`; `where` | monomorphized only: no `dyn`, no `where`; lengths are `usize`, text `str` or `[u8]` |
-| C | `extern "C"`, `#[repr(C)]` | the same, and `import "stdio.h" as c;` reads a header into `c::` |
+| allocation | a global allocator: `Vec::new()`, `Box::new(x)` | a capability: `fn main(gpa: Gpa)`, `Vec<T, Gpa>`, `Vec::new_in(gpa)`; what returns owned memory ends in `_in`; arenas |
+| effects | none | inferred: `alloc(A)`, `io`, `static`, `panic`, `diverge`, `unsafe`; `query effects --why`; `#[pure]`, `#[no_alloc]`, `#[effects(..)]` are checked bounds |
+| contracts | `assert!` in the body | `requires`, `ensures` on a signature: a caller that breaks one stops at its own line |
+| macros | `println!`, `vec!`, `macro_rules!` | none: `println("{x}")`, `format_in`, `assert` are functions |
+| arguments | positional | also named, `f(10, by: 3)`; no default arguments |
+| numbers | every conversion written | lossless integer widening is implicit (`i32` to `i64`), except to an index, a `usize` |
+| dispatch | monomorphized or `dyn` | monomorphized only: no `dyn`, no const generics, no `async` |
+| C | `extern "C"`, `#[repr(C)]`, bindgen | the same, and `import "stdio.h" as c;` reads a header into `c::` |
+| libraries | crates | std only: a program is its root file and its `mod` files |
 
-The whole mapping is `volec guide rust`; the grammar is
-[docs/grammar.md](docs/grammar.md).
+Every difference, checked against the compiler: `volec guide rust`; the
+grammar is [docs/grammar.md](docs/grammar.md).
 
 ## Tools
 
 | | |
 |---|---|
-| `volec guide` | the language in about 2k tokens; `--find WORDS`, `guide TOPIC` |
+| `volec guide` | the language in about 2.5k tokens; `--find WORDS`, `guide TOPIC` |
 | `volec check`, `explain CODE` | every error on one line, with a stable code and `try:` lines |
-| `volec query context NAME` | an item's source, its callees and callers; also `refs`, `effects`, `views` |
+| `volec query context NAME` | an item's source, its callees and callers; also `refs`, `effects` |
 | `volec edit patch`, `refactor rename` | checked edits (one that adds an error writes nothing), `undo` |
 | `volec fix --suggested` | the errors' exact fixes; `fix` adds imports, `pub`, `unsafe` |
 | `volec test`, `volec fuzz` | `#[test]`, `#[property]`, `#[fuzz]`, at -O0 and -O2 |
@@ -99,11 +99,11 @@ and [docs/lsp.md](docs/lsp.md).
 
 ## Maturity
 
-Vole is at 0.25, before 1.0: no users yet, no stability promise, and
+Vole is at 0.28, before 1.0: no users yet, no stability promise, and
 releases break programs (with a `volec fix` migration where one can be
 written). The language is still being designed: expect it to change.
 
-- **Works:** the self-hosting compiler (191k lines of vole, built by a
+- **Works:** the self-hosting compiler (280k lines of vole, built by a
   chain of every release from a frozen Rust seed, each reaching a
   byte-identical fixpoint); std with collections, text, I/O, threads,
   atomics, `std::arch`, `std::gpu` (Metal), `std::window` (Cocoa) and
@@ -114,9 +114,8 @@ written). The language is still being designed: expect it to change.
 - **Speed:** 0.24's code took 0.89 of `cc -O2`'s time (geometric mean,
   one Apple silicon machine) on our own small suite with C twins; it
   says little about large programs.
-- **Known gaps:** a closure's by-value parameters leak; a stopgap
-  (`own.move_out`) refuses more iterator uses than it must; no Linux
-  backend for std::window; std::gpu is Metal only.
+- **Known gaps:** no Linux backend for std::window; std::gpu is Metal
+  only.
 
 ## Build and start
 

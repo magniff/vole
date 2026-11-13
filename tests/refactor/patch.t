@@ -10,7 +10,7 @@ $ edit patch clamp --old 'v > hi' --new 'v >= hi'
 patched crate::calc::clamp	calc.vl	+1 -1 lines
 % git diff
 diff --git a/calc.vl b/calc.vl
-index 92630d6..fc2d91b 100644
+index 10b99a1..7bf2f11 100644
 --- a/calc.vl
 +++ b/calc.vl
 @@ -5,7 +5,7 @@ pub fn clamp(v: i64, lo: i64, hi: i64) -> i64 {
@@ -53,12 +53,12 @@ error patch.no-match: OLD 1 is not in crate::calc::clamp; no line is near it
 try: volec query show clamp
 [exit 1]
 ## Several pairs: one edit; when one fails nothing is written.
-$ edit patch sum_to --old 'var total = 0;' --new 'var total = n * 0;' --old 'total += i;' --new 'total = total + i;'
+$ edit patch sum_to --old 'let mut total = 0;' --new 'let mut total = n * 0;' --old 'total += i;' --new 'total = total + i;'
 patched crate::calc::sum_to	calc.vl	+2 -2 lines
 % git diff --stat
  calc.vl | 6 +++---
  1 file changed, 3 insertions(+), 3 deletions(-)
-$ edit patch sum_to --old 'var i = 1;' --new 'var i = 2;' --old 'no such text' --new 'x'
+$ edit patch sum_to --old 'let mut i = 1;' --new 'let mut i = 2;' --old 'no such text' --new 'x'
 error patch.no-match: OLD 2 is not in crate::calc::sum_to; no line is near it
 try: volec query show sum_to
 [exit 1]
@@ -68,10 +68,10 @@ error edit.breaks: 1 new error; nothing written; the error: calc.vl:6:16: expect
 note edit.together: several steps are one call, checked at its end: `edit patch NAME --old A --new B --old C --new D` (`--in OTHER` before another item's pairs), `edit apply FILE`; or this step alone with --no-check
 try: volec edit patch clamp --old 'return lo;' --new 'return true;' --no-check
 [exit 1]
-$ edit patch sum_to --old 'var' --new 'let' --old 'var total' --new 'let total'
+$ edit patch sum_to --old 'let mut' --new 'let' --old 'let mut total' --new 'let total'
 error patch.ambiguous: OLD 1 occurs 2 times in crate::calc::sum_to, lines 16, 17; give more of the text around it, or --nth N (--all: every one)
-try: volec edit patch sum_to --old 'var total = n * 0;' --new 'let total = n * 0;' --old 'var total' --new 'let total'
-try: volec edit patch sum_to --old 'var i = 1;' --new 'let i = 1;' --old 'var total' --new 'let total'
+try: volec edit patch sum_to --old 'let mut total = n * 0;' --new 'let total = n * 0;' --old 'let mut total' --new 'let total'
+try: volec edit patch sum_to --old 'let mut i = 1;' --new 'let i = 1;' --old 'let mut total' --new 'let total'
 [exit 1]
 % git diff --stat
  calc.vl | 6 +++---
@@ -115,7 +115,7 @@ patched crate::calc::clamp	calc.vl	+1 -0 lines
 note patch.loose: OLD 1 matched with other indentation at line 8; NEW re-indented like it (--loose)
 % git diff
 diff --git a/calc.vl b/calc.vl
-index 92630d6..768545e 100644
+index 10b99a1..be3ff3d 100644
 --- a/calc.vl
 +++ b/calc.vl
 @@ -6,6 +6,7 @@ pub fn clamp(v: i64, lo: i64, hi: i64) -> i64 {
@@ -149,8 +149,8 @@ $ edit replace calc.vl:15 --dry-run < $T/inputs/sum_to_short.vl
 --- a/calc.vl
 +++ b/calc.vl
 @@ -16,7 +16 @@
--    var total = 0;
--    var i = 1;
+-    let mut total = 0;
+-    let mut i = 1;
 -    while i <= n {
 -        total += i;
 -        i += 1;
@@ -192,11 +192,11 @@ $ edit insert --in sum_to --before 'i += 1;' < $T/inputs/stmt.vl
 inserted in crate::calc::sum_to	calc.vl	+3 -0 lines
 % git diff
 diff --git a/calc.vl b/calc.vl
-index 92630d6..5ce629b 100644
+index 10b99a1..2c6ae04 100644
 --- a/calc.vl
 +++ b/calc.vl
 @@ -17,6 +17,9 @@ pub fn sum_to(n: i64) -> i64 {
-     var i = 1;
+     let mut i = 1;
      while i <= n {
          total += i;
 +        if i == 3 {
@@ -207,10 +207,10 @@ index 92630d6..5ce629b 100644
      total
 $ undo
 undid inserted in crate::calc::sum_to	calc.vl	+3 -0 lines
-$ edit insert --in sum_to --before 'var' < $T/inputs/stmt.vl
+$ edit insert --in sum_to --before 'let mut' < $T/inputs/stmt.vl
 error patch.ambiguous: ANCHOR occurs 2 times in crate::calc::sum_to, lines 16, 17; give more of the text around it, or --nth N
-try: volec edit insert --in sum_to --before 'var total = 0;' < text.vl
-try: volec edit insert --in sum_to --before 'var i = 1;' < text.vl
+try: volec edit insert --in sum_to --before 'let mut total = 0;' < text.vl
+try: volec edit insert --in sum_to --before 'let mut i = 1;' < text.vl
 [exit 1]
 ## (0.13: an anchor that is a whole line somewhere names that line)
 $ edit insert --in sum_to --before 'total' --dry-run < $T/inputs/stmt.vl
@@ -294,8 +294,8 @@ pub fn clamp(v: i64, lo: i64, hi: i64) -> i64 {
 
 // 1 + 2 + ... + n.
 pub fn sum_to(n: i64) -> i64 {
-    var total = 0;
-    var i = 1;
+    let mut total = 0;
+    let mut i = 1;
     if i == 3 {
         total += 0;
     }

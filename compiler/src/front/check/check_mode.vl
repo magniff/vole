@@ -4,12 +4,11 @@
 // arithmetic operands are checked against it; everything else is
 // synthesized and compared with it.
 
-use crate::base::{BUFS, SRC, buf_bytes, buf_new, buf_slice, buf_str, buf_uint, intern_c, sym_text};
+use crate::base::{buf_new, buf_slice, buf_uint, intern_c};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{
-    err_begin, err_end, err_end_soft, err_fix, err_fmt, err_help, err_help_fmt, err_int, err_str,
-    err_sym, err_try_fmt, err_try_tool,
+    err_begin, err_end, err_end_soft, err_help, err_help_fmt, err_int, err_str, err_sym,
 };
 use crate::front::ast::{
     NODE_CHECKED, NODE_IMPLICIT, NODE_REF_MUT, NodeKind, REPR_UNION, child, list_begin, list_end,
@@ -44,7 +43,7 @@ use crate::front::convert::into_call;
 use crate::front::distinct::{is_view_distinct, strip_distinct};
 use crate::front::generics::{check_arg, env_lookup};
 use crate::front::generics::instantiate::infer_struct_literal;
-use crate::front::lexer::{SUF_NONE, Tok, is_ident_byte};
+use crate::front::lexer::{SUF_NONE, Tok};
 use crate::front::modules::within_std;
 use crate::front::modules::lookup::{
     B_ITEM, B_PRIVATE, access_error, binding_kind, binding_value, lookup_item, note_c_use,
@@ -57,7 +56,7 @@ use crate::front::types::{
     struct_field, struct_type, type_elem,
 };
 
-fn passes_expected_to_operands(op: Tok, ex: i64, pcx: Ctx<Comp>) -> bool {
+fn passes_expected_to_operands(op: Tok, ex: i64, pcx: &Ctx<Comp>) -> bool {
     // (0.18: a distinct type over a number, as the number)
     let expected = strip_distinct(ex, pcx);
     if op == Tok::Plus || op == Tok::Minus || op == Tok::Star || op == Tok::Slash
@@ -72,85 +71,77 @@ fn passes_expected_to_operands(op: Tok, ex: i64, pcx: Ctx<Comp>) -> bool {
 
 // Checks `n` against `expected`; returns `expected`, or `!` when the
 // expression diverges.
-pub fn check_expr(n: i64, expected: i64, pcx: inout Ctx<Comp>) -> i64 {
+pub fn check_expr(n: i64, expected: i64, pcx: &mut Ctx<Comp>) -> i64 {
     // (0.20) `&x` where nothing changes it, in a 0.20 file: conv.marker_extra
-    crate::front::conv::extra_marker(n, expected, &pcx);
-    fold_layout_query(n, &pcx);
+    crate::front::conv::extra_marker(n, expected, pcx);
+    fold_layout_query(n, pcx);
     pcx.hint_node = n;
     pcx.hint_ty = expected;
-    // (0.17: the own pass's record of the types and loans a function has,
-    // front/own/fast.vl; its fast path reads it instead of the nodes)
-    let mark = crate::front::own::fast::expr_enter(n, &pcx);
-    crate::front::own::fast::check_node(n, &pcx);
     // (0.20) `&x` of a 0.20 or mixed file where an exclusive reference
     // is expected: the inout marker (front/conv), exclusive
     // RULE: F18.4 (0.27.6: not in the rust edition, where `&x` is shared as
     // written, and one where `&mut` goes is rustc's E0308)
-    if expected > 0 && crate::front::conv::inout_marker(n, pcx) && pcx.types[expected].b == REF_MUT
-        && (pcx.types[expected].kind == TyKind::Ptr || pcx.types[expected].kind == TyKind::Slice)
-        && !crate::front::check::rust::rust_node(n, &pcx) {
-        pcx.nodes[n].p |= NODE_REF_MUT;
-    }
-    let actual0 = check_expr_inner(n, expected, &pcx);
+    let actual0 = check_expr_inner(n, expected, pcx);
     // RULE: F18.6 (with the type variables solved so far)
-    let actual = if pcx.infer_live { crate::front::check::infer::resolve(actual0, &pcx) }
+    let actual = if pcx.infer_live { crate::front::check::infer::resolve(actual0, pcx) }
         else { actual0 };
-    pcx.nodes[n].ty = if pcx.infer_live { crate::front::check::infer::settle(n, expected, &pcx) }
+    pcx.nodes[n as usize].ty = if pcx.infer_live {
+        crate::front::check::infer::settle(n, expected, pcx)
+    }
         else { expected };
     // (0.18: as synth_expr's)
-    if pcx.nodes[n].kind == NodeKind::Call {
-        desugar_call(n, &pcx);
+    if pcx.nodes[n as usize].kind == NodeKind::Call {
+        desugar_call(n, pcx);
     }
-    crate::front::own::fast::check_exit(n, expected, mark, &pcx);
     actual
 }
 
-fn check_expr_inner(n: i64, expected: i64, pcx: inout Ctx<Comp>) -> i64 {
+fn check_expr_inner(n: i64, expected: i64, pcx: &mut Ctx<Comp>) -> i64 {
     // RULE: F18.5 (a) (an open local where a type goes takes it)
     if pcx.open_lets.count > 0 {
-        crate::front::check::literals::open_expected(n, expected, &pcx);
+        crate::front::check::literals::open_expected(n, expected, pcx);
     }
     // RULE: F18.6 (a) (a value where a free type variable goes gives it its
     // type)
     if pcx.infer_live && crate::front::check::infer::is_free_var(expected, pcx) {
-        let actual = synth_expr(n, &pcx);
+        let actual = synth_expr(n, pcx);
         if actual != TY_NEVER {
-            crate::front::check::infer::unify(actual, expected, &pcx);
+            crate::front::check::infer::unify(actual, expected, pcx);
         }
         return actual;
     }
     // RULE: F1.2 (a rust-edition character literal where a `char` goes:
     // the char; a `char` is not an integer, so nowhere else)
-    if pcx.nodes[n].kind == NodeKind::Char && pcx.nodes[n].b == 1 && expected > 0
+    if pcx.nodes[n as usize].kind == NodeKind::Char && pcx.nodes[n as usize].b == 1 && expected > 0
         && expected == pcx.char_type {
         return expected;
     }
     // (0.18: a literal where a distinct type over a number goes)
-    if distinct_literal(n, expected, &pcx) {
+    if distinct_literal(n, expected, pcx) {
         return expected;
     }
     // RULE: F7.3 (a unit struct where a value goes takes its type
     // arguments from the expected type: `PhantomData`)
-    if pcx.nodes[n].kind == NodeKind::Ident && pcx.edition != 0 && pcx.nodes[n].count == 0
-        && lookup_local(pcx.nodes[n].a, pcx).is_none() {
-        let key = crate::front::check::resolve::type_name_key(n, &pcx);
-        if key >= 0 && crate::front::check::rust::unit_struct_value(n, key, &pcx) {
-            check_struct_literal(n, expected, &pcx);
+    if pcx.nodes[n as usize].kind == NodeKind::Ident
+        && pcx.nodes[n as usize].count == 0
+        && lookup_local(pcx.nodes[n as usize].a, pcx).is_none() {
+        let key = crate::front::check::resolve::type_name_key(n, pcx);
+        if key >= 0 && crate::front::check::rust::unit_struct_value(n, key, pcx) {
+            check_struct_literal(n, expected, pcx);
             return expected;
         }
     }
-    if pcx.nodes[n].kind == NodeKind::Call && pcx.edition != 0
-        && crate::front::check::rust::rust_node(n, &pcx) {
+    if pcx.nodes[n as usize].kind == NodeKind::Call {
         // RULE: F8.2 (`Default::default()`: Self from the expected type)
-        crate::front::check::calls::paths::trait_assoc_self(n, expected, &pcx);
+        crate::front::check::calls::paths::trait_assoc_self(n, expected, pcx);
         // RULE: F7.2 (a tuple struct's constructor, as its literal)
-        if expected > 0 && crate::front::check::rust::tuple_struct_expected(n, &pcx) {
-            return check_expr_inner(n, expected, &pcx);
+        if expected > 0 && crate::front::check::rust::tuple_struct_expected(n, pcx) {
+            return check_expr_inner(n, expected, pcx);
         }
     }
-    match pcx.nodes[n].kind {
-        Int if pcx.nodes[n].b == SUF_NONE && is_integer(expected) => {
-            check_int_fits(n, pcx.nodes[n].a as u64, expected, &pcx);
+    match { pcx.nodes[n as usize].kind } {
+        Int if pcx.nodes[n as usize].b == SUF_NONE && is_integer(expected) => {
+            check_int_fits(n, pcx.nodes[n as usize].a as u64, expected, pcx);
             return expected;
         }
         // (0.27.7) an untyped integer literal where the error type goes, an
@@ -158,213 +149,221 @@ fn check_expr_inner(n: i64, expected: i64, pcx: inout Ctx<Comp>) -> i64 {
         // error type, not the i32 fallback and a second error (rustc
         // reports the first only: `value > 9223372036854775807` after
         // `let value = parse(&end)` failed)
-        Int if pcx.nodes[n].b == SUF_NONE && expected == pcx.ty_error && expected > 0
-            && crate::front::check::rust::rust_node(n, &pcx) => {
+        Int if pcx.nodes[n as usize].b == SUF_NONE && expected == pcx.ty_error && expected > 0 => {
             return expected;
         }
         // RULE: F1.2, F23.2 (a rust-edition character literal is a char, a
         // byte literal a u8: neither takes another integer type, and a char
         // is no integer, rustc E0308)
-        Char if is_integer(expected) && (pcx.nodes[n].b == 0
-            || pcx.nodes[n].b == 2 && expected == TY_U8
-            || pcx.nodes[n].b == 1 && expected == crate::front::types::TY_U32
+        Char if is_integer(expected) && (pcx.nodes[n as usize].b == 0
+            || pcx.nodes[n as usize].b == 2 && expected == TY_U8
+            || pcx.nodes[n as usize].b == 1 && expected == crate::front::types::TY_U32
             && pcx.char_scalar) => {
-            check_int_fits(n, pcx.nodes[n].a as u64, expected, &pcx);
+            check_int_fits(n, pcx.nodes[n as usize].a as u64, expected, pcx);
             return expected;
         }
-        Float if pcx.nodes[n].b == SUF_NONE && is_float(expected) => {
+        Float if pcx.nodes[n as usize].b == SUF_NONE && is_float(expected) => {
             return expected;
         }
-        Tuple if pcx.types[expected].kind == TyKind::Tuple => {
-            check_tuple(n, expected, &pcx);
+        Tuple if pcx.types[expected as usize].kind == TyKind::Tuple => {
+            check_tuple(n, expected, pcx);
             return expected;
         }
-        Array if pcx.types[expected].kind == TyKind::Array => {
-            check_array(n, expected, &pcx);
+        Array if pcx.types[expected as usize].kind == TyKind::Array => {
+            check_array(n, expected, pcx);
             return expected;
         }
         // (0.25.2.1) an array literal where a slice of numbers is wanted
         // takes the slice's element type, `let xs: [u32] = [1, 2, 3];`,
         // `sum([1, 2])` for `xs: [u32]`, and is viewed as one as before
         // (coerce_ref's elements_view; it was `[i64; 3]`)
-        Array if pcx.types[expected].kind == TyKind::Slice && pcx.types[expected].b == 0
-            && pcx.nodes[n].count > 0 && is_numeric(pcx.types[expected].a) => {
-            let at = array_of(pcx.types[expected].a, pcx.nodes[n].count, &pcx);
-            check_array(n, at, &pcx);
-            pcx.nodes[n].ty = at;
-            if coerce_ref(n, at, expected, &pcx) {
+        Array if pcx.types[expected as usize].kind == TyKind::Slice
+            && pcx.types[expected as usize].b == 0
+            && pcx.nodes[n as usize].count > 0 && is_numeric(pcx.types[expected as usize].a) => {
+            let at = array_of(pcx.types[expected as usize].a, pcx.nodes[n as usize].count, pcx);
+            check_array(n, at, pcx);
+            pcx.nodes[n as usize].ty = at;
+            if coerce_ref(n, at, expected, pcx) {
                 return expected;
             }
-            mismatch_error(n, expected, at, &pcx);
+            mismatch_error(n, expected, at, pcx);
         }
-        Repeat if pcx.types[expected].kind == TyKind::Array => {
-            check_expr(pcx.nodes[n].a, pcx.types[expected].a, &pcx);
-            let count = eval_array_len(pcx.nodes[n].b, &pcx);
-            if count != pcx.types[expected].b {
-                err_begin(pcx.nodes[pcx.nodes[n].b].start, &pcx);
+        Repeat if pcx.types[expected as usize].kind == TyKind::Array => {
+            check_expr(pcx.nodes[n as usize].a, pcx.types[expected as usize].a, pcx);
+            let count = eval_array_len(pcx.nodes[n as usize].b, pcx);
+            if count != pcx.types[expected as usize].b {
+                err_begin(pcx.nodes[pcx.nodes[n as usize].b as usize].start, pcx);
                 err_str(c"array repeat count is ", pcx);
                 err_int(count, pcx);
                 err_str(c", expected ", pcx);
-                err_int(pcx.types[expected].b, pcx);
-                err_end(&pcx);
+                err_int(pcx.types[expected as usize].b, pcx);
+                err_end(pcx);
             }
             return expected;
         }
         StructLit => {
             // (0.17: `E::V { a: x }`, a struct-like variant's literal)
-            if variant_literal(n, &pcx) {
-                return check_expr_inner(n, expected, &pcx);
+            if variant_literal(n, pcx) {
+                return check_expr_inner(n, expected, pcx);
             }
-            check_struct_literal(n, expected, &pcx);
+            check_struct_literal(n, expected, pcx);
             return expected;
         }
-        Closure => return check_closure(n, expected, &pcx),
+        Closure => return check_closure(n, expected, pcx),
         // (0.15)
-        NodeKind::Try => return check_try(n, expected, &pcx),
-        NodeKind::Interp => return check_interp(n, expected, &pcx),
-        NodeKind::MethodCall if pcx.nodes[n].count == 0
-            && sym_is_c(pcx.nodes[n].b, c"into", &pcx) => {
-            let t = into_call(n, expected, &pcx);
+        NodeKind::Try => return check_try(n, expected, pcx),
+        NodeKind::Interp => return check_interp(n, expected, pcx),
+        NodeKind::MethodCall if pcx.nodes[n as usize].count == 0
+            && sym_is_c(pcx.nodes[n as usize].b, c"into", pcx) => {
+            let t = into_call(n, expected, pcx);
             if t >= 0 {
                 return t;
             }
         }
-        NodeKind::MethodCall if pcx.nodes[n].count == 0
-            && sym_is_c(pcx.nodes[n].b, c"try_into", &pcx)
-            && crate::front::check::rust::rust_node(n, &pcx) => {
-            let t = crate::front::convert::try_into_call(n, expected, &pcx);
+        NodeKind::MethodCall if pcx.nodes[n as usize].count == 0
+            && sym_is_c(pcx.nodes[n as usize].b, c"try_into", pcx) => {
+            let t = crate::front::convert::try_into_call(n, expected, pcx);
             if t >= 0 {
                 return t;
             }
         }
-        Range => return range_value(n, expected, &pcx),
-        If => return check_if(n, expected, &pcx),
-        Match => return check_match(n, expected, &pcx),
-        Block => return check_branch(n, expected, &pcx),
-        Loop => return check_loop(n, expected, &pcx),
-        Binary if passes_expected_to_operands(pcx.nodes[n].op, expected, pcx) => {
+        Range => return range_value(n, expected, pcx),
+        If => return check_if(n, expected, pcx),
+        Match => return check_match(n, expected, pcx),
+        Block => return check_branch(n, expected, pcx),
+        Loop => return check_loop(n, expected, pcx),
+        Binary if passes_expected_to_operands(pcx.nodes[n as usize].op, expected, pcx) => {
             let saved = pcx.binary_node;
             pcx.binary_node = n;
-            check_expr(pcx.nodes[n].b, expected, &pcx);
-            check_expr(pcx.nodes[n].c, expected, &pcx);
+            check_expr(pcx.nodes[n as usize].b, expected, pcx);
+            check_expr(pcx.nodes[n as usize].c, expected, pcx);
             pcx.binary_node = saved;
             return expected;
         }
-        Binary if (pcx.nodes[n].op == Tok::Shl || pcx.nodes[n].op == Tok::Shr)
+        Binary if (pcx.nodes[n as usize].op == Tok::Shl || pcx.nodes[n as usize].op == Tok::Shr)
             && is_integer(expected) => {
-            check_expr(pcx.nodes[n].b, expected, &pcx);
-            check_shift_amount(pcx.nodes[n].c, &pcx);
+            check_expr(pcx.nodes[n as usize].b, expected, pcx);
+            check_shift_amount(pcx.nodes[n as usize].c, pcx);
             return expected;
         }
-        Unary if pcx.nodes[n].op == Tok::Minus && is_numeric(expected)
-            && !suffixed_int(pcx.nodes[n].b, pcx) => {
-            check_negation(n, expected, &pcx);
+        Unary if pcx.nodes[n as usize].op == Tok::Minus && is_numeric(expected)
+            && !suffixed_int(pcx.nodes[n as usize].b, pcx) => {
+            check_negation(n, expected, pcx);
             return expected;
         }
         // RULE: Z9.2 (0.27.2: `&[a, b]`, `&[]` where `&[T]` is expected: an
         // array of T, coerced to the slice)
-        Unary if pcx.nodes[n].op == Tok::Amp && (pcx.nodes[n].p & NODE_REF_MUT) == 0
-            && pcx.types[expected].kind == TyKind::Slice && pcx.types[expected].b == 0
-            && (pcx.nodes[pcx.nodes[n].b].kind == NodeKind::Array
-                || pcx.nodes[pcx.nodes[n].b].kind == NodeKind::Repeat)
-            && crate::front::check::rust::rust_node(n, &pcx) => {
+        Unary if pcx.nodes[n as usize].op == Tok::Amp
+            && (pcx.nodes[n as usize].p & NODE_REF_MUT) == 0
+            && pcx.types[expected as usize].kind == TyKind::Slice
+            && pcx.types[expected as usize].b == 0
+            && (pcx.nodes[pcx.nodes[n as usize].b as usize].kind == NodeKind::Array
+                || pcx.nodes[pcx.nodes[n as usize].b as usize].kind == NodeKind::Repeat) => {
             // (0.27.3: `&[0; 5]` too)
-            let inner = pcx.nodes[n].b;
-            let len = if pcx.nodes[inner].kind == NodeKind::Repeat {
-                eval_array_len(pcx.nodes[inner].b, &pcx) } else { pcx.nodes[inner].count };
-            let at = array_of(pcx.types[expected].a, len, &pcx);
-            check_expr(inner, at, &pcx);
-            pcx.nodes[inner].p |= NODE_CHECKED;
-            let t = synth_expr(n, &pcx);
-            if coerce_ref(n, t, expected, &pcx) {
+            let inner = pcx.nodes[n as usize].b;
+            let len = if pcx.nodes[inner as usize].kind == NodeKind::Repeat {
+                eval_array_len(pcx.nodes[inner as usize].b, pcx) }
+                else { pcx.nodes[inner as usize].count };
+            let at = array_of(pcx.types[expected as usize].a, len, pcx);
+            check_expr(inner, at, pcx);
+            pcx.nodes[inner as usize].p |= NODE_CHECKED;
+            let t = synth_expr(n, pcx);
+            if coerce_ref(n, t, expected, pcx) {
                 return expected;
             }
-            mismatch_error(n, expected, t, &pcx);
+            mismatch_error(n, expected, t, pcx);
         }
         // RULE: F18.3 (0.27.3: `&1` where `&T` of a number goes, rust edition:
         // the literal is a T, `m.get(&1)`, `s.contains(&2)`, `x.total_cmp(&0.0)`)
-        Unary if pcx.nodes[n].op == Tok::Amp && (pcx.nodes[n].p & NODE_REF_MUT) == 0
-            && pcx.types[expected].kind == TyKind::Ptr && pcx.types[expected].b == REF_SHARED
-            && crate::front::check::literals::ref_literal_takes(pcx.nodes[n].b,
-                pcx.types[expected].a, pcx)
-            && crate::front::check::rust::rust_node(n, &pcx) => {
-            let inner = pcx.nodes[n].b;
-            check_expr(inner, pcx.types[expected].a, &pcx);
-            pcx.nodes[inner].p |= NODE_CHECKED;
-            let t = synth_expr(n, &pcx);
-            if t == expected || coerce_ref(n, t, expected, &pcx) {
+        Unary if pcx.nodes[n as usize].op == Tok::Amp
+            && (pcx.nodes[n as usize].p & NODE_REF_MUT) == 0
+            && pcx.types[expected as usize].kind == TyKind::Ptr
+            && pcx.types[expected as usize].b == REF_SHARED
+            && crate::front::check::literals::ref_literal_takes(pcx.nodes[n as usize].b,
+                pcx.types[expected as usize].a, pcx) => {
+            let inner = pcx.nodes[n as usize].b;
+            check_expr(inner, pcx.types[expected as usize].a, pcx);
+            pcx.nodes[inner as usize].p |= NODE_CHECKED;
+            let t = synth_expr(n, pcx);
+            if t == expected || coerce_ref(n, t, expected, pcx) {
                 return expected;
             }
-            mismatch_error(n, expected, t, &pcx);
+            mismatch_error(n, expected, t, pcx);
         }
         // RULE: F18.4 (0.27.5: `&[1, 2]`, `&[0; 4]`, `&(7, true)` where `&U`
         // of their kind goes, no `let` hoisting it: a branch's, a tail's)
-        Unary if pcx.nodes[n].op == Tok::Amp && (pcx.nodes[n].p & NODE_REF_MUT) == 0
-            && pcx.types[expected].kind == TyKind::Ptr && pcx.types[expected].b == REF_SHARED
-            && crate::front::check::literals::ref_aggregate_takes(pcx.nodes[n].b,
-                pcx.types[expected].a, pcx)
-            && crate::front::check::rust::rust_node(n, &pcx) => {
-            let inner = pcx.nodes[n].b;
-            check_expr(inner, pcx.types[expected].a, &pcx);
-            pcx.nodes[inner].p |= NODE_CHECKED;
-            let t = synth_expr(n, &pcx);
-            if t == expected || coerce_ref(n, t, expected, &pcx) {
+        Unary if pcx.nodes[n as usize].op == Tok::Amp
+            && (pcx.nodes[n as usize].p & NODE_REF_MUT) == 0
+            && pcx.types[expected as usize].kind == TyKind::Ptr
+            && pcx.types[expected as usize].b == REF_SHARED
+            && crate::front::check::literals::ref_aggregate_takes(pcx.nodes[n as usize].b,
+                pcx.types[expected as usize].a, pcx) => {
+            let inner = pcx.nodes[n as usize].b;
+            check_expr(inner, pcx.types[expected as usize].a, pcx);
+            pcx.nodes[inner as usize].p |= NODE_CHECKED;
+            let t = synth_expr(n, pcx);
+            if t == expected || coerce_ref(n, t, expected, pcx) {
                 return expected;
             }
-            mismatch_error(n, expected, t, &pcx);
+            mismatch_error(n, expected, t, pcx);
         }
         // RULE: F18.4 (0.27.5: `&[1, 2, 3][1..]` where `&[U]` goes: the
         // array literal sliced is a `[U; N]`, below; 0.27.6: where `&mut
         // [U]` goes, the slice checked as `[U]` and the reference as
         // written: `&mut [1, 2, 3][..]` taken, a `&` refused, coerce_ref)
-        Unary if pcx.nodes[n].op == Tok::Amp && pcx.types[expected].kind == TyKind::Slice
-            && pcx.nodes[pcx.nodes[n].b].kind == NodeKind::Index
-            && pcx.nodes[pcx.nodes[pcx.nodes[n].b].b].kind == NodeKind::Range
-            && (pcx.nodes[pcx.nodes[pcx.nodes[n].b].a].kind == NodeKind::Array
-                || pcx.nodes[pcx.nodes[pcx.nodes[n].b].a].kind == NodeKind::Repeat)
-            && crate::front::check::rust::rust_node(n, &pcx) => {
-            let inner = pcx.nodes[n].b;
+        Unary if pcx.nodes[n as usize].op == Tok::Amp
+            && pcx.types[expected as usize].kind == TyKind::Slice
+            && pcx.nodes[pcx.nodes[n as usize].b as usize].kind == NodeKind::Index
+            && pcx.nodes[pcx.nodes[pcx.nodes[n as usize].b as usize].b as usize].kind
+            == NodeKind::Range
+            && (pcx.nodes[pcx.nodes[pcx.nodes[n as usize].b as usize].a as usize].kind
+                == NodeKind::Array
+                || pcx.nodes[pcx.nodes[pcx.nodes[n as usize].b as usize].a as usize].kind
+                == NodeKind::Repeat) => {
+            let inner = pcx.nodes[n as usize].b;
             let mut_expected = is_mut_slice(expected, pcx);
-            check_expr(inner, if mut_expected { decay_ref(expected, &pcx) } else { expected },
-                &pcx);
-            pcx.nodes[inner].p |= NODE_CHECKED;
-            let t = synth_expr(n, &pcx);
-            if t == expected || coerce_ref(n, t, expected, &pcx) {
+            check_expr(inner, if mut_expected { decay_ref(expected, pcx) } else { expected },
+                pcx);
+            pcx.nodes[inner as usize].p |= NODE_CHECKED;
+            let t = synth_expr(n, pcx);
+            if t == expected || coerce_ref(n, t, expected, pcx) {
                 return expected;
             }
-            mismatch_error(n, expected, t, &pcx);
+            mismatch_error(n, expected, t, pcx);
         }
-        NodeKind::Index if crate::front::check::rust::rust_node(n, &pcx)
-            && pcx.types[expected].kind == TyKind::Slice
-            && pcx.nodes[pcx.nodes[n].b].kind == NodeKind::Range
-            && (pcx.nodes[pcx.nodes[n].a].kind == NodeKind::Array
-                || pcx.nodes[pcx.nodes[n].a].kind == NodeKind::Repeat) => {
-            let inner = pcx.nodes[n].a;
-            let len = if pcx.nodes[inner].kind == NodeKind::Repeat {
-                eval_array_len(pcx.nodes[inner].b, &pcx) } else { pcx.nodes[inner].count };
-            check_expr(inner, array_of(pcx.types[expected].a, len, &pcx), &pcx);
-            pcx.nodes[inner].p |= NODE_CHECKED;
-            let t = synth_expr(n, &pcx);
+        NodeKind::Index if pcx.types[expected as usize].kind == TyKind::Slice
+            && pcx.nodes[pcx.nodes[n as usize].b as usize].kind == NodeKind::Range
+            && (pcx.nodes[pcx.nodes[n as usize].a as usize].kind == NodeKind::Array
+                || pcx.nodes[pcx.nodes[n as usize].a as usize].kind == NodeKind::Repeat) => {
+            let inner = pcx.nodes[n as usize].a;
+            let len = if pcx.nodes[inner as usize].kind == NodeKind::Repeat {
+                eval_array_len(pcx.nodes[inner as usize].b, pcx) }
+                else { pcx.nodes[inner as usize].count };
+            check_expr(inner, array_of(pcx.types[expected as usize].a, len, pcx), pcx);
+            pcx.nodes[inner as usize].p |= NODE_CHECKED;
+            let t = synth_expr(n, pcx);
             if t == expected {
                 return expected;
             }
-            mismatch_error(n, expected, t, &pcx);
+            mismatch_error(n, expected, t, pcx);
         }
-        Unary if pcx.nodes[n].op == Tok::Tilde && is_integer(expected) => {
-            check_expr(pcx.nodes[n].b, expected, &pcx);
+        Unary if pcx.nodes[n as usize].op == Tok::Tilde && is_integer(expected) => {
+            check_expr(pcx.nodes[n as usize].b, expected, pcx);
             return expected;
         }
         // (0.27.2) `!a` of an integer type, the rust edition's. RULE: F26.1
-        Unary if pcx.nodes[n].op == Tok::Bang && is_integer(expected)
-            && pcx.nodes[pcx.nodes[n].b].kind == Int
-            && crate::front::check::rust::rust_node(n, &pcx) => {
-            pcx.nodes[n].op = Tok::Tilde;
-            check_expr(pcx.nodes[n].b, expected, &pcx);
+        // (0.28.0: whatever its operand: `x & !(1 << 40)` with x an i64
+        // typed `1 << 40` an i32 by itself, 0, and cleared no bit; rustc
+        // types it by what `!` is expected to be)
+        Unary if pcx.nodes[n as usize].op == Tok::Bang && is_integer(expected)
+            && expected != pcx.char_type => {
+            pcx.nodes[n as usize].op = Tok::Tilde;
+            check_expr(pcx.nodes[n as usize].b, expected, pcx);
             return expected;
         }
         _ => {}
     }
-    let actual = synth_expr(n, &pcx);
+    let actual = synth_expr(n, pcx);
     if actual == TY_NEVER {
         return actual;
     }
@@ -375,29 +374,29 @@ fn check_expr_inner(n: i64, expected: i64, pcx: inout Ctx<Comp>) -> i64 {
         // type there)
         if pcx.infer_live && (crate::front::check::infer::mentions(actual, true, pcx)
             || crate::front::check::infer::mentions(expected, true, pcx)) {
-            if crate::front::check::infer::unify(actual, expected, &pcx) {
+            if crate::front::check::infer::unify(actual, expected, pcx) {
                 return expected;
             }
         }
         // (0.15: a narrower integer)
-        if try_widen(n, actual, expected, &pcx) {
+        if try_widen(n, actual, expected, pcx) {
             return expected;
         }
-        if coerce_closure(n, expected, &pcx) {
+        if coerce_closure(n, expected, pcx) {
             return expected;
         }
-        if crate::front::check::rust::coerce_unsafe_fn(actual, expected, &pcx) {
+        if crate::front::check::rust::coerce_unsafe_fn(actual, expected, pcx) {
             return expected;
         }
         // (0.17: references)
-        if coerce_ref(n, actual, expected, &pcx) {
+        if coerce_ref(n, actual, expected, pcx) {
             return expected;
         }
         // (0.20: str, and the deref coercions to text and slices)
-        if coerce_text(n, actual, expected, &pcx) {
+        if coerce_text(n, actual, expected, pcx) {
             return expected;
         }
-        mismatch_error(n, expected, actual, &pcx);
+        mismatch_error(n, expected, actual, pcx);
     }
     expected
 }
@@ -408,12 +407,12 @@ fn check_expr_inner(n: i64, expected: i64, pcx: inout Ctx<Comp>) -> i64 {
 // a reference to an array as its slice, `&a[..]` (the unsizing
 // coercion). A shared one where `*mut [T]` is written does not (rustc
 // E0308; pcx.raw_mut_at, mismatch_help).
-fn fat_raw_coerce(n: i64, actual: i64, expected: i64, pcx: inout Ctx<Comp>) -> bool {
+fn fat_raw_coerce(n: i64, actual: i64, expected: i64, pcx: &mut Ctx<Comp>) -> bool {
     let to_mut = n == pcx.raw_mut_at && n > 0;
     let view = crate::front::distinct::strip_distinct(actual, pcx);
-    if view > 0 && pcx.types[view].kind == TyKind::Slice {
+    if view > 0 && pcx.types[view as usize].kind == TyKind::Slice {
         let shared = !crate::front::types::is_mut_slice(actual, pcx);
-        if crate::front::types::raw_view_of(actual, &pcx) != expected || shared && to_mut {
+        if crate::front::types::raw_view_of(actual, pcx) != expected || shared && to_mut {
             return false;
         }
         if to_mut {
@@ -422,20 +421,20 @@ fn fat_raw_coerce(n: i64, actual: i64, expected: i64, pcx: inout Ctx<Comp>) -> b
         }
         return true;
     }
-    if pcx.types[actual].kind != TyKind::Ptr || pcx.types[actual].b == 0
-        || pcx.types[expected].kind != TyKind::Slice {
+    if pcx.types[actual as usize].kind != TyKind::Ptr || pcx.types[actual as usize].b == 0
+        || pcx.types[expected as usize].kind != TyKind::Slice {
         return false;
     }
-    let arr = pcx.types[actual].a;
-    let elem = if arr > 0 && pcx.types[arr].kind == TyKind::Array {
+    let arr = pcx.types[actual as usize].a;
+    let elem: i64 = if arr > 0 && pcx.types[arr as usize].kind == TyKind::Array {
         crate::front::conv::container_elem(arr, pcx) } else { 0 };
-    let shared = pcx.types[actual].b != REF_MUT;
-    if elem <= 0 || elem != pcx.types[expected].a || shared && to_mut {
+    let shared = pcx.types[actual as usize].b != REF_MUT;
+    if elem <= 0 || elem != pcx.types[expected as usize].a || shared && to_mut {
         return false;
     }
     let slice = crate::front::types::make_type(TyKind::Slice, elem,
-        if shared { 0 } else { REF_MUT }, pcx.tscratch.count, &pcx);
-    elements_view(n, actual, slice, &pcx)
+        if shared { 0 } else { REF_MUT }, pcx.tscratch.count, pcx);
+    elements_view(n, actual, slice, pcx)
 }
 
 // (0.17, docs/design/value-semantics.md §2.3) Value n of type `actual`
@@ -443,212 +442,204 @@ fn fat_raw_coerce(n: i64, actual: i64, expected: i64, pcx: inout Ctx<Comp>) -> b
 // `&T` and `&mut T` become a raw `*T` (dereferencing one stays unsafe),
 // `&mut T` a `&T`, `&mut [T]` a `[T]`; a reference to a slice is the slice
 // (`f(&s)` for `s: [T]`, `&mut s` for a `&mut [T]`), n rewritten to read it.
-pub fn coerce_ref(n: i64, actual: i64, expected: i64, pcx: inout Ctx<Comp>) -> bool {
+pub fn coerce_ref(n: i64, actual: i64, expected: i64, pcx: &mut Ctx<Comp>) -> bool {
     if actual <= 0 || expected <= 0 {
         return false;
     }
-    let ak = pcx.types[actual].kind;
-    let ek = pcx.types[expected].kind;
+    let ak = pcx.types[actual as usize].kind;
+    let ek = pcx.types[expected as usize].kind;
     if crate::front::types::is_raw_view(expected, pcx)
-        && !crate::front::types::is_raw_view(actual, pcx)
-        && crate::front::check::rust::rust_node(n, &pcx) {
-        return fat_raw_coerce(n, actual, expected, &pcx);
+        && !crate::front::types::is_raw_view(actual, pcx) {
+        return fat_raw_coerce(n, actual, expected, pcx);
     }
     // RULE: F32.1 (0.27.2: Rust's deref coercion of a reference to a shared
     // reference, `&&str` where a `&str` goes, `&&[T]` a `&[T]`, `&&T` a `&T`:
     // the inner reference read, `*n`; a `&str` type argument is the view, so
     // `&T` of it, in std2's generic bodies, is a reference to the view)
-    var through = actual;
-    var levels = 0;
-    while pcx.types[through].kind == TyKind::Ptr && pcx.types[through].b != 0
-        && pcx.types[through].a > 0 && levels < 8 {
-        through = pcx.types[through].a;
+    let mut through = actual;
+    let mut levels: i64 = 0;
+    while pcx.types[through as usize].kind == TyKind::Ptr && pcx.types[through as usize].b != 0
+        && pcx.types[through as usize].a > 0 && levels < 8 {
+        through = pcx.types[through as usize].a;
         levels += 1;
         if through == expected {
             break;
         }
     }
-    let shared_target = ek == TyKind::Slice && pcx.types[expected].b == 0
-        || ek == TyKind::Ptr && pcx.types[expected].b == REF_SHARED
+    let shared_target = ek == TyKind::Slice && pcx.types[expected as usize].b == 0
+        || ek == TyKind::Ptr && pcx.types[expected as usize].b == REF_SHARED
         || crate::front::distinct::is_view_distinct(expected, pcx) && !is_mut_slice(expected, pcx);
-    if ak == TyKind::Ptr && through == expected && levels > 1 && shared_target
-        && crate::front::check::rust::rust_node(n, &pcx) {
+    if ak == TyKind::Ptr && through == expected && levels > 1 && shared_target {
         // (`&&&str`: as many reads as it takes)
         for k in 0..levels {
-            var t = actual;
+            let mut t = actual;
             for _ in 0..k + 1 {
-                t = pcx.types[t].a;
+                t = pcx.types[t as usize].a;
             }
-            wrap_unary(n, Tok::Star, t, &pcx);
+            wrap_unary(n, Tok::Star, t, pcx);
         }
         return true;
     }
-    if ak == TyKind::Ptr && pcx.types[actual].b != 0 && pcx.types[actual].a == expected
-        && (ek == TyKind::Slice && pcx.types[expected].b == 0
-            || ek == TyKind::Ptr && pcx.types[expected].b == REF_SHARED
+    if ak == TyKind::Ptr && pcx.types[actual as usize].b != 0
+        && pcx.types[actual as usize].a == expected
+        && (ek == TyKind::Slice && pcx.types[expected as usize].b == 0
+            || ek == TyKind::Ptr && pcx.types[expected as usize].b == REF_SHARED
             || crate::front::distinct::is_view_distinct(expected, pcx)
-            && !is_mut_slice(expected, pcx))
-        && crate::front::check::rust::rust_node(n, &pcx) {
-        wrap_unary(n, Tok::Star, expected, &pcx);
+            && !is_mut_slice(expected, pcx)) {
+        wrap_unary(n, Tok::Star, expected, pcx);
         return true;
     }
-    if ek == TyKind::Slice && elements_view(n, actual, expected, &pcx) {
+    if ek == TyKind::Slice && elements_view(n, actual, expected, pcx) {
         return true;
     }
-    if crate::front::check::rust::deref_coerce(n, actual, expected, &pcx) {
+    if crate::front::check::rust::deref_coerce(n, actual, expected, pcx) {
         return true;
     }
     // RULE: F0.1 (0.27.2: a `&mut str` where a `&str` is expected, as
     // `&mut [T]` a `[T]`; never the other way)
     if ak == TyKind::Distinct && ek == TyKind::Distinct && is_mut_slice(actual, pcx)
-        && !is_mut_slice(expected, pcx) && decay_ref(actual, &pcx) == expected {
+        && !is_mut_slice(expected, pcx) && decay_ref(actual, pcx) == expected {
         return true;
     }
     if ak == TyKind::Slice && ek == TyKind::Slice {
-        if pcx.types[actual].a != pcx.types[expected].a {
+        if pcx.types[actual as usize].a != pcx.types[expected as usize].a {
             return false;
         }
-        if pcx.types[actual].b == REF_MUT && pcx.types[expected].b == 0 {
+        if pcx.types[actual as usize].b == REF_MUT && pcx.types[expected as usize].b == 0 {
             return true;
         }
         // A `[T]` where `&mut [T]` is expected (`sort(a[..])`,
         // `sort(v.as_slice())`, `sort(s)`): own.readonly (0.19.1; 0.17's
         // legacy slice rule took it as the exclusive view), the call
         // checked as if it were one
-        if pcx.types[actual].b == 0 && pcx.types[expected].b == REF_MUT {
+        if pcx.types[actual as usize].b == 0 && pcx.types[expected as usize].b == REF_MUT {
             // RULE: F18.4 (0.27.6: in the rust edition rustc's E0308, a type
             // error, not MVS's own.readonly)
-            if crate::front::check::rust::rust_node(n, &pcx) {
-                mismatch_error(n, expected, actual, &pcx);
-            } else {
-                readonly_slice_arg(n, actual, &pcx);
-            }
+            mismatch_error(n, expected, actual, pcx);
             return true;
         }
         return false;
     }
-    if ek == TyKind::Ptr && pcx.types[expected].b == REF_SHARED && pcx.types[expected].a == actual
+    if ek == TyKind::Ptr && pcx.types[expected as usize].b == REF_SHARED
+        && pcx.types[expected as usize].a == actual
         && (is_place(n, pcx)
-            || pcx.nodes[n].kind == NodeKind::Ident && (pcx.nodes[n].p & NODE_TEMP) != 0) {
+            || pcx.nodes[n as usize].kind == NodeKind::Ident
+            && (pcx.nodes[n as usize].p & NODE_TEMP) != 0) {
         // (0.18.1) a place where `&T` is expected is borrowed, as a
         // `self: &T` receiver is: `f(it)` for `f(x: &Item)` with `it`
         // from `for it in v.iter()`; a temporary slice, `&x.text()`,
         // where `&[T]` is (`cmp_of(&a.text(), &b.text())`). (0.27.1: a
         // place written so is edition.lenient in the rust edition, R5)
-        if (pcx.nodes[n].p & NODE_TEMP) == 0 && n == pcx.rust_arg && n > 0 {
-            crate::front::check::rust::lenient_error(n, false, &pcx);
+        if (pcx.nodes[n as usize].p & NODE_TEMP) == 0 && n == pcx.rust_arg && n > 0 {
+            crate::front::check::rust::lenient_error(n, false, pcx);
         }
-        wrap_unary(n, Tok::Amp, expected, &pcx);
+        wrap_unary(n, Tok::Amp, expected, pcx);
         return true;
     }
-    if ek == TyKind::Ptr && pcx.types[expected].b == REF_SHARED && pcx.types[expected].a == actual
-        && n == pcx.let_arg && pcx.let_arg > 0 && lendable_value(n, actual, &pcx) {
+    if ek == TyKind::Ptr && pcx.types[expected as usize].b == REF_SHARED
+        && pcx.types[expected as usize].a == actual
+        && n == pcx.let_arg && pcx.let_arg > 0 && lendable_value(n, actual, pcx) {
         // (0.25) a value given to a let parameter that borrows is lent
         // as a temporary of its statement (LET_ARG); (0.27.1) given to a
         // rust-edition function, edition.lenient (R5)
         if n == pcx.rust_arg && n > 0 {
-            crate::front::check::rust::lenient_error(n, false, &pcx);
+            crate::front::check::rust::lenient_error(n, false, pcx);
         }
-        wrap_unary(n, Tok::Amp, expected, &pcx);
-        pcx.nodes[n].p |= NODE_TEMP;
+        wrap_unary(n, Tok::Amp, expected, pcx);
+        pcx.nodes[n as usize].p |= NODE_TEMP;
         return true;
     }
-    if ek == TyKind::Ptr && pcx.types[expected].b == REF_SHARED && pcx.types[expected].a == actual
-        && pcx.nodes[n].kind == NodeKind::Closure
-        && (pcx.nodes[n].c & crate::front::ast::CLOSURE_MOVE) == 0 {
+    if ek == TyKind::Ptr && pcx.types[expected as usize].b == REF_SHARED
+        && pcx.types[expected as usize].a == actual
+        && pcx.nodes[n as usize].kind == NodeKind::Closure
+        && (pcx.nodes[n as usize].c & crate::front::ast::CLOSURE_MOVE) == 0 {
         // (0.20) a closure, made here, given to a let parameter that
         // borrows it (one that captures an inout access, so is no copy):
         // its environment is the caller's, lent for the call; it owns
         // nothing (it captures by reference), so nothing drops
-        wrap_unary(n, Tok::Amp, expected, &pcx);
+        wrap_unary(n, Tok::Amp, expected, pcx);
         return true;
     }
-    if ek == TyKind::Ptr && pcx.types[expected].b == REF_MUT && pcx.types[expected].a == actual
-        && pcx.nodes[n].start == pcx.nodes[n].end && crate::front::check::assign::is_place(n, pcx) {
+    if ek == TyKind::Ptr && pcx.types[expected as usize].b == REF_MUT
+        && pcx.types[expected as usize].a == actual
+        && pcx.nodes[n as usize].start == pcx.nodes[n as usize].end
+        && crate::front::check::assign::is_place(n, pcx) {
         // (0.20) a place the checker passes on where an exclusive
         // reference is wanted (a contract's companion given an inout
         // parameter, which is the value it designates): lent again
-        wrap_unary(n, Tok::Amp, expected, &pcx);
-        pcx.nodes[n].p |= NODE_REF_MUT;
+        wrap_unary(n, Tok::Amp, expected, pcx);
+        pcx.nodes[n as usize].p |= NODE_REF_MUT;
         return true;
     }
-    if ek == TyKind::Ptr && pcx.types[expected].b == REF_MUT && ak == TyKind::Ptr
-        && pcx.types[actual].b == REF_SHARED && pcx.types[actual].a == pcx.types[expected].a
-        && crate::front::conv::inout_marker(n, pcx)
-        && !crate::front::check::rust::rust_node(n, &pcx) {
-        // (0.20) the inout marker `&x` checked before its parameter was
-        // known (an argument of a generic function, inferred from):
-        // exclusive, the place checked again as one
-        pcx.nodes[n].p |= NODE_REF_MUT;
-        return crate::front::check::synth_mode::synth_expr(n, &pcx) == expected;
-    }
-    if ak != TyKind::Ptr || pcx.types[actual].b == 0 {
+    if ak != TyKind::Ptr || pcx.types[actual as usize].b == 0 {
         return false;
     }
-    let pointee = pcx.types[actual].a;
+    let pointee = pcx.types[actual as usize].a;
     if pointee == expected && (is_numeric(expected) || expected == TY_BOOL
-        || crate::front::own::kinds::is_plain_type(expected, &pcx)) {
+        || crate::front::kinds::is_plain_type(expected, pcx)) {
         // (0.18.1) a reference to a plain value (a number, a struct of
         // numbers: a pattern's binding on a reference, a closure's
         // parameter) where the value is expected: read through it, as
         // `*n`, a copy. (0.27.1: a reference given so to a rust-edition
         // function or a `let`'s written type is edition.lenient, R5)
         if n == pcx.rust_arg && n > 0 {
-            crate::front::check::rust::lenient_error(n, true, &pcx);
+            crate::front::check::rust::lenient_error(n, true, pcx);
         }
-        wrap_unary(n, Tok::Star, expected, &pcx);
+        wrap_unary(n, Tok::Star, expected, pcx);
         return true;
     }
-    if ek == TyKind::Ptr && pcx.types[expected].b != 0 && is_ref(pointee, pcx)
-        && pointee_fits(pcx.types[pointee].a, pcx.types[expected].a, pcx)
-        && (pcx.types[expected].b == REF_SHARED || pcx.types[pointee].b == REF_MUT) {
+    if ek == TyKind::Ptr && pcx.types[expected as usize].b != 0 && is_ref(pointee, pcx)
+        && pointee_fits(pcx.types[pointee as usize].a, pcx.types[expected as usize].a, pcx)
+        && (pcx.types[expected as usize].b == REF_SHARED
+            || pcx.types[pointee as usize].b == REF_MUT) {
         // (0.18.1) `&&T` where `&T` is expected (`let tr = &t;` of a
         // `t: &T`): the reference it holds
-        wrap_unary(n, Tok::Star, pointee, &pcx);
+        wrap_unary(n, Tok::Star, pointee, pcx);
         return true;
     }
-    if ek == TyKind::Ptr && pointee_fits(pointee, pcx.types[expected].a, pcx) {
+    if ek == TyKind::Ptr && pointee_fits(pointee, pcx.types[expected as usize].a, pcx) {
         // RULE: D3.6a (0.27.7: in the rust edition a `&T` coerces to
         // `*const T`, not to a written `*mut T`: rustc E0308, mismatch_help)
-        if pcx.types[expected].b == 0 && n == pcx.raw_mut_at && n > 0
-            && pcx.types[actual].b == REF_SHARED {
+        if pcx.types[expected as usize].b == 0 && n == pcx.raw_mut_at && n > 0
+            && pcx.types[actual as usize].b == REF_SHARED {
             return false;
         }
-        if pcx.types[expected].b == 0 && n == pcx.raw_mut_at && n > 0 {
+        if pcx.types[expected as usize].b == 0 && n == pcx.raw_mut_at && n > 0 {
             // RULE: D3.6 (0.27.7: a `&mut` made `*mut T` is `&raw mut`, a
             // write; made `*const T`, `&raw const`, a read: places::build)
             pcx.raw_mut_coerced.push(n);
         }
-        if pcx.types[expected].b == 0 {
+        if pcx.types[expected as usize].b == 0 {
             // (0.20: a reference that converts to a raw pointer, for
             // `fix --only conventions`: an access is its value, so its
             // address is `&x` then)
             pcx.raw_from_ref.push(n);
         }
-        return pcx.types[expected].b == 0 || pcx.types[expected].b == REF_SHARED;
+        return pcx.types[expected as usize].b == 0 || pcx.types[expected as usize].b == REF_SHARED;
     }
-    if ek == TyKind::Slice && pcx.types[pointee].kind == TyKind::Slice
-        && pcx.types[pointee].a == pcx.types[expected].a
-        && (pcx.types[expected].b == 0 || pcx.types[actual].b == REF_MUT) {
-        if pcx.nodes[n].kind == Unary && pcx.nodes[n].op == Tok::Amp {
+    if ek == TyKind::Slice && pcx.types[pointee as usize].kind == TyKind::Slice
+        && pcx.types[pointee as usize].a == pcx.types[expected as usize].a
+        && (pcx.types[expected as usize].b == 0 || pcx.types[actual as usize].b == REF_MUT) {
+        if pcx.nodes[n as usize].kind == Unary && pcx.nodes[n as usize].op == Tok::Amp {
             // `&s`: s itself
-            let operand = pcx.nodes[n].b;
-            let flags = pcx.nodes[n].p;
+            let operand = pcx.nodes[n as usize].b;
+            let flags = pcx.nodes[n as usize].p;
             // (0.20: the `&`, for `fix --only conventions`)
-            pcx.slice_amps.push(pcx.nodes[n].start);
-            pcx.slice_amps.push(pcx.nodes[operand].start);
-            pcx.nodes[n] = pcx.nodes[operand];
-            pcx.nodes[n].p |= flags & NODE_REF_MUT;
+            pcx.slice_amps.push(pcx.nodes[n as usize].start);
+            pcx.slice_amps.push(pcx.nodes[operand as usize].start);
+            pcx.nodes[n as usize] = pcx.nodes[operand as usize];
+            pcx.nodes[n as usize].p |= flags & NODE_REF_MUT;
         } else {
             // `*r`
-            let inner = new_node(Unary, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
-            pcx.nodes[inner] = pcx.nodes[n];
-            pcx.nodes[n].kind = Unary;
-            pcx.nodes[n].op = Tok::Star;
-            pcx.nodes[n].b = inner;
-            pcx.nodes[n].a = 0;
-            pcx.nodes[n].count = 0;
-            pcx.nodes[n].p = 0;
+            let inner = new_node(Unary, pcx.nodes[n as usize].start, pcx.nodes[n as usize].end,
+                pcx);
+            pcx.nodes[inner as usize] = pcx.nodes[n as usize];
+            pcx.nodes[n as usize].kind = Unary;
+            pcx.nodes[n as usize].op = Tok::Star;
+            pcx.nodes[n as usize].b = inner;
+            pcx.nodes[n as usize].a = 0;
+            pcx.nodes[n as usize].count = 0;
+            pcx.nodes[n as usize].p = 0;
         }
         return true;
     }
@@ -659,78 +650,87 @@ pub fn coerce_ref(n: i64, actual: i64, expected: i64, pcx: inout Ctx<Comp>) -> b
 // elements is wanted: `sort(&v)` for `s: inout [T]` is `sort(&v[..])`,
 // `sum(v)` for `s: [T]` is `sum(v[..])`. n (of type actual) becomes the
 // slicing, checked again.
-fn elements_view(n: i64, actual: i64, expected: i64, pcx: inout Ctx<Comp>) -> bool {
-    let mutable = pcx.types[expected].b == REF_MUT;
-    var place = n;
-    var container = actual;
-    var reborrow = false;
+fn elements_view(n: i64, actual: i64, expected: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let mutable = pcx.types[expected as usize].b == REF_MUT;
+    let mut place = n;
+    let mut container = actual;
+    let mut reborrow = false;
     if mutable {
-        if pcx.nodes[n].kind != NodeKind::Unary || pcx.nodes[n].op != Tok::Amp
-            || (pcx.nodes[n].p & NODE_REF_MUT) == 0 || pcx.types[actual].kind != TyKind::Ptr {
+        if pcx.nodes[n as usize].kind != NodeKind::Unary || pcx.nodes[n as usize].op != Tok::Amp
+            || (pcx.nodes[n as usize].p & NODE_REF_MUT) == 0
+            || pcx.types[actual as usize].kind != TyKind::Ptr {
             return false;
         }
-        place = pcx.nodes[n].b;
-        container = pcx.types[actual].a;
-    } else if crate::front::check::rust::rust_node(n, &pcx) && pcx.nodes[n].kind == NodeKind::Unary
-        && pcx.nodes[n].op == Tok::Amp && (pcx.nodes[n].p & NODE_REF_MUT) == 0
-        && pcx.types[actual].kind == TyKind::Ptr {
+        place = pcx.nodes[n as usize].b;
+        container = pcx.types[actual as usize].a;
+    }
+    else if pcx.nodes[n as usize].kind == NodeKind::Unary && pcx.nodes[n as usize].op == Tok::Amp
+        && (pcx.nodes[n as usize].p & NODE_REF_MUT) == 0
+        && pcx.types[actual as usize].kind == TyKind::Ptr {
         // RULE: Z9.2, F20.2 (0.27.2: the rust edition's unsized coercion,
         // `&a` of an array, a Vec, where `&[T]` is expected: `&a[..]`)
-        place = pcx.nodes[n].b;
-        container = pcx.types[actual].a;
+        place = pcx.nodes[n as usize].b;
+        container = pcx.types[actual as usize].a;
         reborrow = true;
     } else if !crate::front::check::assign::is_place(n, pcx) && !temporary_container(n, pcx) {
         return false;
     }
     let elem = crate::front::conv::container_elem(container, pcx);
-    if elem <= 0 || elem != pcx.types[expected].a {
+    if elem <= 0 || elem != pcx.types[expected as usize].a {
         return false;
     }
-    let range = new_node(NodeKind::Range, pcx.nodes[place].start, pcx.nodes[place].start, &pcx);
-    let inner = new_node(NodeKind::None, pcx.nodes[place].start, pcx.nodes[place].end, &pcx);
-    pcx.nodes[inner] = pcx.nodes[place];
-    pcx.nodes[inner].p |= NODE_CHECKED;
-    pcx.nodes[inner].ty = container;
+    // RULE: R5 (0.28.0: an array or a Vec given, with no `&`, to a rust
+    // function's `&[T]`: rustc E0308; it was lent as its slice)
+    if !mutable && !reborrow && n == pcx.rust_arg && n > 0 {
+        crate::front::check::rust::lenient_error(n, false, pcx);
+    }
+    let range = new_node(NodeKind::Range, pcx.nodes[place as usize].start,
+        pcx.nodes[place as usize].start, pcx);
+    let inner = new_node(NodeKind::None, pcx.nodes[place as usize].start,
+        pcx.nodes[place as usize].end, pcx);
+    pcx.nodes[inner as usize] = pcx.nodes[place as usize];
+    pcx.nodes[inner as usize].p |= NODE_CHECKED;
+    pcx.nodes[inner as usize].ty = container;
     // (the place's node becomes the slicing, as a closure's use of a
     // captured name is that node: closures::rewrite_use finds it under)
     let index = place;
-    pcx.nodes[index].kind = NodeKind::Index;
-    pcx.nodes[index].a = inner;
-    pcx.nodes[index].b = range;
-    pcx.nodes[index].c = 0;
-    pcx.nodes[index].count = 0;
-    pcx.nodes[index].list = 0;
-    pcx.nodes[index].p = 0;
-    pcx.nodes[index].ty = 0;
+    pcx.nodes[index as usize].kind = NodeKind::Index;
+    pcx.nodes[index as usize].a = inner;
+    pcx.nodes[index as usize].b = range;
+    pcx.nodes[index as usize].c = 0;
+    pcx.nodes[index as usize].count = 0;
+    pcx.nodes[index as usize].list = 0;
+    pcx.nodes[index as usize].p = 0;
+    pcx.nodes[index as usize].ty = 0;
     if mutable || reborrow {
-        pcx.nodes[n].ty = 0;
-        pcx.nodes[n].p &= ~NODE_CHECKED;
+        pcx.nodes[n as usize].ty = 0;
+        pcx.nodes[n as usize].p &= ~NODE_CHECKED;
     }
-    crate::front::check::synth_mode::synth_expr(n, &pcx) == expected
+    crate::front::check::synth_mode::synth_expr(n, pcx) == expected
 }
 
 // (0.25) Whether n makes a new container (an array literal, a call's
 // result), whose slice a let parameter may view for the call: `sum([1, 2])`,
 // `sum(make(gpa))`, as `sum([1, 2][..])` (the temporary lives to the end of
 // the statement).
-fn temporary_container(n: i64, pcx: Ctx<Comp>) -> bool {
-    let k = pcx.nodes[n].kind;
+fn temporary_container(n: i64, pcx: &Ctx<Comp>) -> bool {
+    let k = pcx.nodes[n as usize].kind;
     k == NodeKind::Array || k == NodeKind::Repeat || k == NodeKind::Call
         || k == NodeKind::MethodCall
 }
 
 // Whether value n (of type t) may be lent as a temporary: no place, and a
 // new value (front/own/drops::fresh) or one without glue.
-pub fn lendable_value(n: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
+pub fn lendable_value(n: i64, t: i64, pcx: &mut Ctx<Comp>) -> bool {
     !crate::front::check::assign::is_place(n, pcx)
-        && (crate::front::own::byref::fresh(n, &pcx) || !crate::front::own::glue::has_glue(t, &pcx))
+        && (crate::front::byref::fresh(n, pcx) || !crate::places::glue::has_glue(t, pcx))
 }
 
 // (0.25) Value n, checked, lent as a temporary of its statement where the
 // reference `expected` goes: `&n` (NODE_TEMP).
-pub fn lend_temporary(n: i64, expected: i64, pcx: inout Ctx<Comp>) {
-    wrap_unary(n, Tok::Amp, expected, &pcx);
-    pcx.nodes[n].p |= NODE_TEMP;
+pub fn lend_temporary(n: i64, expected: i64, pcx: &mut Ctx<Comp>) {
+    wrap_unary(n, Tok::Amp, expected, pcx);
+    pcx.nodes[n as usize].p |= NODE_TEMP;
 }
 
 // (0.20, docs/design/collections-text-io.md §2.3 L3) Value n of type
@@ -739,226 +739,120 @@ pub fn lend_temporary(n: i64, expected: i64, pcx: inout Ctx<Comp>) {
 // String where `str` or `[u8]` goes, and `&b` of a Buf or `&v` of a Vec
 // where its slice goes, are Rust's deref coercions: n becomes
 // `(&s).as_str()` (`as_bytes`, `as_slice`).
-pub fn coerce_text(n: i64, actual: i64, expected: i64, pcx: inout Ctx<Comp>) -> bool {
+pub fn coerce_text(n: i64, actual: i64, expected: i64, pcx: &mut Ctx<Comp>) -> bool {
     if actual <= 0 || expected <= 0 {
         return false;
     }
     // RULE: F0.6 (0.27.5: the rust edition has no such view: a `&str` where
     // a `&[u8]` goes is a mismatch, rustc E0308; `s.as_bytes()`, `b".."`)
     // (a literal the compiler reads as its bytes, Ctx.text_bytes, is one)
-    let rust = crate::front::check::rust::rust_node(n, &pcx)
-        && !(pcx.text_bytes > 0 && pcx.nodes[n].kind == NodeKind::Str);
-    if is_view_distinct(actual, pcx) && pcx.types[actual].a == expected {
+    let rust = !(pcx.text_bytes > 0 && pcx.nodes[n as usize].kind == NodeKind::Str);
+    if is_view_distinct(actual, pcx) && pcx.types[actual as usize].a == expected {
         return !rust;
     }
     // (0.20, conventions.md §6.1, as a Vec where its slice goes: in a
     // 0.20 file the owner itself, `f(s)` for `x: str`, a let argument
     // that lends s; `&` marks an inout one)
-    let owner_place = pcx.types[actual].kind == TyKind::Struct
-        && crate::front::conv::strict_at(pcx.nodes[n].start, &pcx)
-        && crate::front::check::assign::is_place(n, pcx);
-    if !owner_place && (pcx.types[actual].kind != TyKind::Ptr || pcx.types[actual].b == 0) {
+    if (pcx.types[actual as usize].kind != TyKind::Ptr || pcx.types[actual as usize].b == 0) {
         return false;
     }
-    let pointee = if owner_place { actual } else { pcx.types[actual].a };
-    if pointee <= 0 || pcx.types[pointee].kind != TyKind::Struct
-        || !within_std(pcx.structs[pcx.types[pointee].a].module, pcx) {
+    let pointee = pcx.types[actual as usize].a;
+    if pointee <= 0 || pcx.types[pointee as usize].kind != TyKind::Struct
+        || !within_std(pcx.structs[pcx.types[pointee as usize].a as usize].module, pcx) {
         return false;
     }
-    let to_slice = pcx.types[expected].kind == TyKind::Slice && pcx.types[expected].b == 0;
+    let to_slice = pcx.types[expected as usize].kind == TyKind::Slice
+        && pcx.types[expected as usize].b == 0;
     let text_owner = is_std_named(pointee, c"String", pcx)
         || is_std_named(pointee, c"PathBuf", pcx);
     let method = if text_owner {
         if is_view_distinct(expected, pcx) && is_mut_slice(expected, pcx) {
             // RULE: F0.1 (0.27.2: `&mut s` of a String where a `&mut str`
             // goes, DerefMut's coercion; only from a `&mut`)
-            if is_std_named(pointee, c"String", pcx) && pcx.types[actual].kind == TyKind::Ptr
-                && pcx.types[actual].b == REF_MUT { c"as_mut_str" } else { 0 as *u8 }
+            if is_std_named(pointee, c"String", pcx)
+                && pcx.types[actual as usize].kind == TyKind::Ptr
+                && pcx.types[actual as usize].b == REF_MUT { c"as_mut_str" } else { 0 as *mut u8 }
         } else if is_view_distinct(expected, pcx) {
             if is_std_named(pointee, c"String", pcx) { c"as_str" } else { c"as_path" }
             // (F0.6: not in the rust edition, where a String derefs to str only)
-        } else if to_slice && !rust { c"as_bytes" } else { 0 as *u8 }
+        } else if to_slice && !rust { c"as_bytes" } else { 0 as *mut u8 }
     }
         else if (is_std_named(pointee, c"Vec", pcx) || is_std_named(pointee, c"Buf", pcx))
         && to_slice {
         c"as_slice"
     } else {
-        0 as *u8
+        0 as *mut u8
     };
-    if method == 0 as *u8 {
+    if method == 0 as *mut u8 {
         return false;
     }
-    let inner = new_node(Unary, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
-    pcx.nodes[inner] = pcx.nodes[n];
-    pcx.nodes[inner].p |= NODE_CHECKED;
-    let call = new_node(NodeKind::MethodCall, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
-    pcx.nodes[call].a = inner;
-    pcx.nodes[call].b = intern_c(method, &pcx);
+    let inner = new_node(Unary, pcx.nodes[n as usize].start, pcx.nodes[n as usize].end, pcx);
+    pcx.nodes[inner as usize] = pcx.nodes[n as usize];
+    pcx.nodes[inner as usize].p |= NODE_CHECKED;
+    let call = new_node(NodeKind::MethodCall, pcx.nodes[n as usize].start,
+        pcx.nodes[n as usize].end, pcx);
+    pcx.nodes[call as usize].a = inner;
+    pcx.nodes[call as usize].b = intern_c(method, pcx);
     let mark = list_begin(pcx);
-    list_end(call, mark, &pcx);
-    if synth_expr(call, &pcx) != expected {
+    list_end(call, mark, pcx);
+    if synth_expr(call, pcx) != expected {
         return false;
     }
-    pcx.nodes[n] = pcx.nodes[call];
+    pcx.nodes[n as usize] = pcx.nodes[call as usize];
     true
-}
-
-// (0.19.1) own.readonly: `[T]` value n (a read-only view) where `&mut [T]`
-// is expected, a parameter the callee writes through (`sort(v.as_slice())`,
-// `vst1q_u8(out[..], ...)`): the view must be exclusive. The fix, exact
-// where it is one (`fix --suggested`): `&mut a[..]`, `v.as_mut_slice()`;
-// a `[T]` parameter passed on is retyped (`refactor signature`).
-fn readonly_slice_arg(n: i64, actual: i64, pcx: inout Ctx<Comp>) {
-    unsafe {
-        let text = SRC[pcx.nodes[n].start..pcx.nodes[n].end];
-        let saved = pcx.err_kind;
-        pcx.err_kind = c"own.readonly";
-        err_begin(pcx.nodes[n].start, &pcx);
-        err_fmt(format_args("'{text}', a '"), pcx);
-        err_type(actual, pcx);
-        err_str(c"', is read-only where 'inout [", pcx);
-        err_type(pcx.types[actual].a, pcx);
-        err_str(c"]' is expected: the callee writes through it", pcx);
-        err_help(c"pass it inout: '&a[..]', '&v', or an 'inout [T]' parameter passed on as '&s'",
-            pcx);
-        let new = buf_new();
-        // `sort(v.as_slice())`, `sort(a[..])`: the method, `v.sort()`
-        let s = pcx.nodes[n].start;
-        let e = pcx.nodes[n].end;
-        let whole = if text.len > 11
-            && text[text.len as i64 - 11..] == ".as_slice()" { 11 }
-            else if text.len > 4
-            && text[text.len as i64 - 4..] == "[..]" { 4 } else { 0 };
-        if whole > 0 && s >= 5 && SRC[s - 5..s] == "sort(" && SRC[e] == ')'
-            && (s == 5 || !is_ident_byte(SRC[s - 6]) && SRC[s - 6] != '.' && SRC[s - 6] != ':') {
-            let call = buf_new();
-            buf_bytes(call, text[0..text.len as i64 - whole]);
-            buf_str(call, c".sort()");
-            err_try_fmt(buf_slice(call), pcx);
-            err_fix(s - 5, e + 1, buf_slice(call), &pcx);
-        } else if pcx.nodes[n].kind == NodeKind::Index && fresh_slice(n, &pcx) {
-            buf_str(new, c"&");
-            buf_bytes(new, text);
-        }
-        else if text.len > 11
-            && text[text.len as i64 - 11..] == ".as_slice()" {
-            buf_bytes(new, text[0..text.len as i64 - 10]);
-            buf_str(new, c"as_mut_slice()");
-        }
-        if BUFS[new].len > 0 {
-            err_try_fmt(buf_slice(new), pcx);
-            err_fix(pcx.nodes[n].start, pcx.nodes[n].end, buf_slice(new), &pcx);
-        } else if pcx.nodes[n].kind == NodeKind::Ident && pcx.cur_fn >= 0 {
-            let l = lookup_local(pcx.nodes[n].a, pcx);
-            if l.is_some() && pcx.locals[l.unwrap()].is_param {
-                let a = buf_new();
-                buf_str(a, c"refactor signature ");
-                // (a generic function's template: its name without `<...>`)
-                let name = sym_text(pcx.fns[pcx.cur_fn].display, pcx);
-                var cut = 0;
-                while cut < name.len as i64 && name[cut] != '<' {
-                    cut += 1;
-                }
-                buf_bytes(a, name[0..cut]);
-                buf_str(a, c" --type ");
-                buf_bytes(a, text);
-                // (the parameter's type as written: `[T]` in a generic one)
-                let fnode = pcx.fns[pcx.cur_fn].node;
-                var written = 0;
-                for i in 0..pcx.nodes[fnode].count {
-                    let p = child(fnode, i, pcx);
-                    if pcx.nodes[p].kind == NodeKind::Param && pcx.nodes[p].a == pcx.nodes[n].a
-                        && pcx.nodes[p].b > 0 {
-                        written = pcx.nodes[p].b;
-                    }
-                }
-                if written == 0 {
-                    // (a closure's parameter: no signature to retype)
-                    err_end_soft(&pcx);
-                    pcx.err_kind = saved;
-                    return;
-                }
-                buf_str(a, c" 'inout ");
-                if written > 0 {
-                    buf_bytes(a, SRC[pcx.nodes[written].start..pcx.nodes[written].end]);
-                } else {
-                    buf_str(a, c"[");
-                    buf_type(a, pcx.types[actual].a, pcx);
-                    buf_str(a, c"]");
-                }
-                buf_str(a, c"'");
-                err_try_tool(buf_slice(a), false, pcx);
-            }
-        }
-        err_end_soft(&pcx);
-        pcx.err_kind = saved;
-    }
 }
 
 // (0.18.1) Node n becomes `op n` (`&` or `*`) of type ty: what it was
 // moves to a new node under it.
-fn wrap_unary(n: i64, op: Tok, ty: i64, pcx: inout Ctx<Comp>) {
-    let inner = new_node(NodeKind::Ident, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
-    pcx.nodes[inner] = pcx.nodes[n];
-    pcx.nodes[n].kind = Unary;
-    pcx.nodes[n].op = op;
-    pcx.nodes[n].b = inner;
-    pcx.nodes[n].a = 0;
-    pcx.nodes[n].c = 0;
-    pcx.nodes[n].count = 0;
-    pcx.nodes[n].p = 0;
-    pcx.nodes[n].res = Res::None;
-    pcx.nodes[n].x = 0;
-    pcx.nodes[n].y = 0;
-    pcx.nodes[n].ty = ty;
-    crate::front::own::fast::note_synthetic(n, &pcx);
-}
-
-// (0.17) Whether n makes a slice of a place: `a[x..y]`, `v.as_slice()` (a
-// call of std's as_slice, once checked) (coerce_ref's legacy slice rule).
-fn fresh_slice(n: i64, pcx: inout Ctx<Comp>) -> bool {
-    if pcx.nodes[n].kind == NodeKind::Index {
-        return pcx.nodes[pcx.nodes[n].b].kind == NodeKind::Range;
-    }
-    if pcx.nodes[n].kind == NodeKind::MethodCall {
-        return pcx.nodes[n].count == 0 && pcx.nodes[n].b == intern_c(c"as_slice", &pcx);
-    }
-    let f = pcx.nodes[n].x - 1;
-    pcx.nodes[n].kind == NodeKind::Call && f >= 0 && within_std(pcx.fns[f].module, pcx)
-        && pcx.nodes[pcx.fns[f].node].a == intern_c(c"as_slice", &pcx)
+fn wrap_unary(n: i64, op: Tok, ty: i64, pcx: &mut Ctx<Comp>) {
+    let inner = new_node(NodeKind::Ident, pcx.nodes[n as usize].start, pcx.nodes[n as usize].end,
+        pcx);
+    pcx.nodes[inner as usize] = pcx.nodes[n as usize];
+    pcx.nodes[n as usize].kind = Unary;
+    pcx.nodes[n as usize].op = op;
+    pcx.nodes[n as usize].b = inner;
+    pcx.nodes[n as usize].a = 0;
+    pcx.nodes[n as usize].c = 0;
+    pcx.nodes[n as usize].count = 0;
+    pcx.nodes[n as usize].p = 0;
+    pcx.nodes[n as usize].res = Res::None;
+    pcx.nodes[n as usize].x = 0;
+    pcx.nodes[n as usize].y = 0;
+    pcx.nodes[n as usize].ty = ty;
 }
 
 // Whether a pointer to `a` converts to a pointer to `e`: the same type, or
 // pointers all the way where e's are raw (`&&T` to `**T`).
-fn pointee_fits(a: i64, e: i64, pcx: Ctx<Comp>) -> bool {
+fn pointee_fits(a: i64, e: i64, pcx: &Ctx<Comp>) -> bool {
     if a == e {
         return true;
     }
-    pcx.types[a].kind == TyKind::Ptr && pcx.types[e].kind == TyKind::Ptr && pcx.types[e].b == 0
-        && pointee_fits(pcx.types[a].a, pcx.types[e].a, pcx)
+    pcx.types[a as usize].kind == TyKind::Ptr && pcx.types[e as usize].kind == TyKind::Ptr
+        && pcx.types[e as usize].b == 0
+        && pointee_fits(pcx.types[a as usize].a, pcx.types[e as usize].a, pcx)
 }
 
-fn check_int_fits(n: i64, value: u64, ty: i64, pcx: inout Ctx<Comp>) {
+fn check_int_fits(n: i64, value: u64, ty: i64, pcx: &mut Ctx<Comp>) {
     if value > int_max(ty) {
-        err_begin(pcx.nodes[n].start, &pcx);
+        err_begin(pcx.nodes[n as usize].start, pcx);
         err_str(c"integer literal ", pcx);
         buf_uint(pcx.err, value);
         err_str(c" does not fit in type '", pcx);
         err_type(ty, pcx);
         err_str(c"'", pcx);
         int_range_help(ty, pcx);
-        err_end(&pcx);
+        err_end(pcx);
     }
 }
 
 // (0.17) The help of a literal out of integer type ty's range: the range,
 // and what to write instead.
-pub fn int_range_help(ty: i64, pcx: Ctx<Comp>) {
+pub fn int_range_help(ty: i64, pcx: &Ctx<Comp>) {
     let max = int_max(ty);
     let b = buf_new();
     buf_type(b, ty, pcx);
     err_help(c"'", pcx);
-    err_help_fmt(buf_slice(b), pcx);
+    err_help_fmt(str::from_utf8(buf_slice(b)).unwrap(), pcx);
     err_help(c"' holds ", pcx);
     if is_signed(ty) {
         err_help(c"-", pcx);
@@ -969,225 +863,228 @@ pub fn int_range_help(ty: i64, pcx: Ctx<Comp>) {
     err_help(c"..=", pcx);
     err_help_fmt(max, pcx);
     err_help(c": a wider type (`i64`), or the literal's low bits with `as` (`LITERAL as ", pcx);
-    err_help_fmt(buf_slice(b), pcx);
+    err_help_fmt(str::from_utf8(buf_slice(b)).unwrap(), pcx);
     err_help(c"`)", pcx);
 }
 
-fn check_tuple(n: i64, expected: i64, pcx: inout Ctx<Comp>) {
-    let count = pcx.nodes[n].count;
-    if count != pcx.types[expected].count {
-        err_begin(pcx.nodes[n].start, &pcx);
+fn check_tuple(n: i64, expected: i64, pcx: &mut Ctx<Comp>) {
+    let count = pcx.nodes[n as usize].count;
+    if count != pcx.types[expected as usize].count {
+        err_begin(pcx.nodes[n as usize].start, pcx);
         err_str(c"tuple has ", pcx);
         err_int(count, pcx);
         err_str(c" elements, expected ", pcx);
-        err_int(pcx.types[expected].count, pcx);
-        err_end(&pcx);
+        err_int(pcx.types[expected as usize].count, pcx);
+        err_end(pcx);
     }
     for i in 0..count {
-        check_expr(child(n, i, pcx), type_elem(expected, i, pcx), &pcx);
+        check_expr(child(n, i, pcx), type_elem(expected, i, pcx), pcx);
     }
 }
 
-fn check_array(n: i64, expected: i64, pcx: inout Ctx<Comp>) {
-    let count = pcx.nodes[n].count;
-    if count != pcx.types[expected].b {
-        err_begin(pcx.nodes[n].start, &pcx);
+fn check_array(n: i64, expected: i64, pcx: &mut Ctx<Comp>) {
+    let count = pcx.nodes[n as usize].count;
+    if count != pcx.types[expected as usize].b {
+        err_begin(pcx.nodes[n as usize].start, pcx);
         err_str(c"array has ", pcx);
         err_int(count, pcx);
         err_str(c" elements, expected ", pcx);
-        err_int(pcx.types[expected].b, pcx);
-        err_end(&pcx);
+        err_int(pcx.types[expected as usize].b, pcx);
+        err_end(pcx);
     }
     for i in 0..count {
-        check_expr(child(n, i, pcx), pcx.types[expected].a, &pcx);
+        check_expr(child(n, i, pcx), pcx.types[expected as usize].a, pcx);
     }
 }
 
 // The struct a struct literal names (`Self` included; through its module
 // path, h), or -1. A generic struct's template is returned as it is.
-fn struct_of_literal(n: i64, pcx: inout Ctx<Comp>) -> i64 {
+fn struct_of_literal(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     unsafe {
-        let name = pcx.nodes[n].a;
-        if pcx.nodes[n].h == 0 {
+        let name = pcx.nodes[n as usize].a;
+        if pcx.nodes[n as usize].h == 0 {
             if name == pcx.self_type_sym && pcx.self_type != 0
-                && pcx.types[pcx.self_type].kind == TyKind::Struct {
-                return pcx.types[pcx.self_type].a;
+                && pcx.types[pcx.self_type as usize].kind == TyKind::Struct {
+                return pcx.types[pcx.self_type as usize].a;
             }
             let param = env_lookup(name, pcx);
-            if param != 0 && pcx.types[param].kind == TyKind::Struct {
-                return pcx.types[param].a;
+            if param != 0 && pcx.types[param as usize].kind == TyKind::Struct {
+                return pcx.types[param as usize].a;
             }
         }
-        let m = if pcx.nodes[n].h
-            != 0 { path_module(pcx.nodes[n].h, pcx.nodes[pcx.nodes[n].h].count, &pcx) }
+        let m = if pcx.nodes[n as usize].h
+            != 0 {
+            path_module(pcx.nodes[n as usize].h, pcx.nodes[pcx.nodes[n as usize].h as usize].count,
+                pcx)
+        }
             else { pcx.cur_mod };
-        let b = lookup_item(m, name, pcx.cur_mod, &pcx);
-        if pcx.nodes[n].h == 0 {
-            note_c_use(pcx.nodes[n].start, name, b, &pcx);
+        let b = lookup_item(m, name, pcx.cur_mod, pcx);
+        if pcx.nodes[n as usize].h == 0 {
+            note_c_use(pcx.nodes[n as usize].start, name, b, pcx);
         }
         if binding_kind(b) == B_PRIVATE {
-            access_error(b, pcx.nodes[n].start, name, &pcx);
+            access_error(b, pcx.nodes[n as usize].start, name, pcx);
         }
         if binding_kind(b) != B_ITEM {
             return -1;
         }
         let key = binding_value(b);
-        if pcx.sym_struct[key] != 0 {
-            return pcx.sym_struct[key] - 1;
+        if (*pcx.sym_struct.add(key as usize)) != 0 {
+            return (*pcx.sym_struct.add(key as usize)) - 1;
         }
-        if pcx.sym_alias[key] != 0 {
-            let t = resolve_alias(key, pcx.nodes[n].start, &pcx);
-            if pcx.types[t].kind == TyKind::Struct {
-                return pcx.types[t].a;
+        if (*pcx.sym_alias.add(key as usize)) != 0 {
+            let t = resolve_alias(key, pcx.nodes[n as usize].start, pcx);
+            if pcx.types[t as usize].kind == TyKind::Struct {
+                return pcx.types[t as usize].a;
             }
         }
         -1
     }
 }
 
-fn check_struct_literal(n: i64, expected: i64, pcx: inout Ctx<Comp>) {
-    let actual = check_struct_fields(n, expected, &pcx);
+fn check_struct_literal(n: i64, expected: i64, pcx: &mut Ctx<Comp>) {
+    let actual = check_struct_fields(n, expected, pcx);
     if actual != expected {
-        if pcx.types[expected].kind == TyKind::Struct
-            && pcx.types[actual].kind == TyKind::Struct {
-            err_begin(pcx.nodes[n].start, &pcx);
+        if pcx.types[expected as usize].kind == TyKind::Struct
+            && pcx.types[actual as usize].kind == TyKind::Struct {
+            err_begin(pcx.nodes[n as usize].start, pcx);
             err_str(c"expected struct '", pcx);
-            err_sym(pcx.structs[pcx.types[expected].a].name, pcx);
+            err_sym(pcx.structs[pcx.types[expected as usize].a as usize].name, pcx);
             err_str(c"', got constructor for '", pcx);
-            err_sym(pcx.structs[pcx.types[actual].a].name, pcx);
+            err_sym(pcx.structs[pcx.types[actual as usize].a as usize].name, pcx);
             err_str(c"'", pcx);
-            err_end(&pcx);
+            err_end(pcx);
         }
-        mismatch_error(n, expected, actual, &pcx);
+        mismatch_error(n, expected, actual, pcx);
     }
 }
 
 // The fields of `Name { ... }`: each exactly once, with its declared type.
 // `expected` (0: none) may give a generic struct's type arguments.
-pub fn check_struct_fields(n: i64, expected: i64, pcx: inout Ctx<Comp>) -> i64 {
+pub fn check_struct_fields(n: i64, expected: i64, pcx: &mut Ctx<Comp>) -> i64 {
     unsafe {
-        let name = pcx.nodes[n].a;
+        let name = pcx.nodes[n as usize].a;
         // (0.15: `P { x }` with no `x`)
-        check_shorthands(n, &pcx);
-        var s = struct_of_literal(n, &pcx);
+        check_shorthands(n, pcx);
+        let mut s = struct_of_literal(n, pcx);
         if s < 0 {
-            unknown_name_error(pcx.nodes[n].start, c"unknown struct '", name, &pcx);
+            unknown_name_error(pcx.nodes[n as usize].start, c"unknown struct '", name, pcx);
         }
-        if pcx.structs[s].generic > 0 {
-            s = infer_struct_literal(s, n, expected, &pcx);
-        } else if pcx.nodes[n].g != 0 {
-            name_error(pcx.nodes[n].start, c"struct '", name, c"' is not generic", &pcx);
+        if pcx.structs[s as usize].generic > 0 {
+            s = infer_struct_literal(s, n, expected, pcx);
+        } else if pcx.nodes[n as usize].g != 0 {
+            name_error(pcx.nodes[n as usize].start, c"struct '", name, c"' is not generic", pcx);
         }
         // (0.16: a #[sealed] struct's literals)
-        if !check_literal(n, s, &pcx) {
-            return struct_type(s, &pcx);
+        if !check_literal(n, s, pcx) {
+            return struct_type(s, pcx);
         }
-        for i in 0..pcx.nodes[n].count {
+        for i in 0..pcx.nodes[n as usize].count {
             let init = child(n, i, pcx);
             for j in 0..i {
-                if pcx.nodes[child(n, j, pcx)].a == pcx.nodes[init].a {
-                    name_error(pcx.nodes[init].start, c"duplicate field '", pcx.nodes[init].a,
-                        c"' in constructor", &pcx);
+                if pcx.nodes[child(n, j, pcx) as usize].a == pcx.nodes[init as usize].a {
+                    name_error(pcx.nodes[init as usize].start, c"duplicate field '",
+                        pcx.nodes[init as usize].a, c"' in constructor", pcx);
                 }
             }
-            let field = find_field(s, pcx.nodes[init].a, pcx);
+            let field = find_field(s, pcx.nodes[init as usize].a, pcx);
             if field < 0 {
-                err_begin(pcx.nodes[init].start, &pcx);
+                err_begin(pcx.nodes[init as usize].start, pcx);
                 err_str(c"unknown field '", pcx);
-                err_sym(pcx.nodes[init].a, pcx);
+                err_sym(pcx.nodes[init as usize].a, pcx);
                 err_str(c"' in struct '", pcx);
-                err_sym(pcx.structs[s].name, pcx);
+                err_sym(pcx.structs[s as usize].name, pcx);
                 err_str(c"'", pcx);
-                help_near_field(s, pcx.nodes[init].a, &pcx);
-                err_end(&pcx);
+                help_near_field(s, pcx.nodes[init as usize].a, pcx);
+                err_end(pcx);
             }
-            pcx.nodes[init].x = field;
+            pcx.nodes[init as usize].x = field;
             // RULE: D3.6a (0.27.7: a field declared `*mut T` takes no `&T`)
             let saved_raw = pcx.raw_mut_at;
-            pcx.raw_mut_at = crate::front::check::rust::raw_mut_value(pcx.nodes[init].b,
-                crate::front::check::rust::field_type_node(s, field, pcx), &pcx);
-            check_arg(pcx.nodes[init].b, (*struct_field(s, field, pcx)).ty, &pcx);
+            pcx.raw_mut_at = crate::front::check::rust::raw_mut_value(pcx.nodes[init as usize].b,
+                crate::front::check::rust::field_type_node(s, field, pcx), pcx);
+            check_arg(pcx.nodes[init as usize].b, (*struct_field(s, field, pcx)).ty, pcx);
             pcx.raw_mut_at = saved_raw;
         }
-        if (pcx.structs[s].repr & REPR_UNION) != 0 {
-            if pcx.nodes[n].count != 1 {
-                err_begin(pcx.nodes[n].start, &pcx);
+        if (pcx.structs[s as usize].repr & REPR_UNION) != 0 {
+            if pcx.nodes[n as usize].count != 1 {
+                err_begin(pcx.nodes[n as usize].start, pcx);
                 err_str(c"a literal of union '", pcx);
-                err_sym(pcx.structs[s].name, pcx);
+                err_sym(pcx.structs[s as usize].name, pcx);
                 err_str(c"' sets exactly one field", pcx);
-                err_end(&pcx);
+                err_end(pcx);
             }
-            return struct_type(s, &pcx);
+            return struct_type(s, pcx);
         }
-        for f in 0..pcx.structs[s].field_count {
-            var found = false;
-            for i in 0..pcx.nodes[n].count {
-                if pcx.nodes[child(n, i, pcx)].x == f {
+        for f in 0..pcx.structs[s as usize].field_count {
+            let mut found = false;
+            for i in 0..pcx.nodes[n as usize].count {
+                if pcx.nodes[child(n, i, pcx) as usize].x == f {
                     found = true;
                 }
             }
             // (0.26.0: the compiler's own literal, main's `Gpa {}`, is whole as made)
-            if !found && (pcx.nodes[n].p & NODE_IMPLICIT) == 0 {
-                err_begin(pcx.nodes[n].start, &pcx);
+            if !found && (pcx.nodes[n as usize].p & NODE_IMPLICIT) == 0 {
+                err_begin(pcx.nodes[n as usize].start, pcx);
                 err_str(c"missing field '", pcx);
                 err_sym((*struct_field(s, f, pcx)).name, pcx);
                 err_str(c"' in struct '", pcx);
-                err_sym(pcx.structs[s].name, pcx);
+                err_sym(pcx.structs[s as usize].name, pcx);
                 err_str(c"' constructor", pcx);
-                err_end(&pcx);
+                err_end(pcx);
             }
         }
-        struct_type(s, &pcx)
+        struct_type(s, pcx)
     }
 }
 
-fn check_negation(n: i64, expected: i64, pcx: inout Ctx<Comp>) {
-    let operand = pcx.nodes[n].b;
+fn check_negation(n: i64, expected: i64, pcx: &mut Ctx<Comp>) {
+    let operand = pcx.nodes[n as usize].b;
     // RULE: F18.3 (0.27.3: the rust edition negates no unsigned integer,
     // `unwrap_or(-1)` of an `Option<usize>`, rustc E0600)
-    if is_integer(expected) && !is_signed(expected) && expected != pcx.char_type
-        && crate::front::check::rust::rust_node(n, &pcx) {
-        err_begin(pcx.nodes[n].start, &pcx);
+    if is_integer(expected) && !is_signed(expected) && expected != pcx.char_type {
+        err_begin(pcx.nodes[n as usize].start, pcx);
         err_str(c"cannot apply unary operator '-' to type '", pcx);
         err_type(expected, pcx);
         err_str(c"'", pcx);
         err_help(c"an unsigned integer has no negative values: a signed type, or `0 - x` with its overflow check", pcx);
-        err_end_soft(&pcx);
+        err_end_soft(pcx);
         return;
     }
-    if pcx.nodes[operand].kind == Int && pcx.nodes[operand].b == SUF_NONE && is_signed(expected) {
-        let value = pcx.nodes[operand].a as u64;
+    if pcx.nodes[operand as usize].kind == Int && pcx.nodes[operand as usize].b == SUF_NONE
+        && is_signed(expected) {
+        let value = pcx.nodes[operand as usize].a as u64;
         let magnitude: u64 = if value == 0 { 0 } else { value - 1 };
         if magnitude > int_max(expected) {
-            err_begin(pcx.nodes[n].start, &pcx);
+            err_begin(pcx.nodes[n as usize].start, pcx);
             err_str(c"integer literal -", pcx);
             buf_uint(pcx.err, value);
             err_str(c" does not fit in type '", pcx);
             err_type(expected, pcx);
             err_str(c"'", pcx);
             int_range_help(expected, pcx);
-            err_end(&pcx);
+            err_end(pcx);
         }
-        pcx.nodes[operand].ty = expected;
+        pcx.nodes[operand as usize].ty = expected;
         return;
     }
-    check_expr(operand, expected, &pcx);
+    check_expr(operand, expected, pcx);
 }
 
 // Whether n is an integer literal with a suffix (`-128i8` is checked as
 // written: synth_unary allows the negated literal its sign).
-fn suffixed_int(n: i64, pcx: Ctx<Comp>) -> bool {
-    pcx.nodes[n].kind == Int && pcx.nodes[n].b != SUF_NONE
+fn suffixed_int(n: i64, pcx: &Ctx<Comp>) -> bool {
+    pcx.nodes[n as usize].kind == Int && pcx.nodes[n as usize].b != SUF_NONE
 }
 
-pub fn check_shift_amount(amount: i64, pcx: inout Ctx<Comp>) {
+pub fn check_shift_amount(amount: i64, pcx: &mut Ctx<Comp>) {
     // RULE: F18.5 (0.28.0: its open locals kept, open_kept)
     let ty = if crate::front::check::literals::open_shape(amount, false, pcx) {
-        crate::front::check::literals::open_kept(amount, &pcx)
+        crate::front::check::literals::open_kept(amount, pcx)
     } else {
-        synth_expr(amount, &pcx)
+        synth_expr(amount, pcx)
     };
     if !is_integer(ty) {
-        type_error_got(amount, c"shift amount must be integer", ty, &pcx);
+        type_error_got(amount, c"shift amount must be integer", ty, pcx);
     }
 }

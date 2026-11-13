@@ -47,100 +47,15 @@ crate::graph	graph.vl	10
 crate::heap	heap.vl	6
 crate::network	network.vl	2
 crate::route	route.vl	7
-std::ops	<std>	5
-std::iter	<std>	68
-std::slice	<std>	37
-std::slice::unstable	<std>	16
-std::slice::stable	<std>	22
-std::slice::search	<std>	4
-std::slice::algo	<std>	12
-std::collections	<std>	12
-std::collections::hash_map	<std>	27
-std::collections::hash_set	<std>	18
-std::collections::raw_table	<std>	46
-std::collections::btree_node	<std>	56
-std::collections::btree_map	<std>	45
-std::collections::group	<std>	20
-std::io	<std>	12
-std::io::error	<std>	17
-std::io::buffered	<std>	37
-std::fmt	<std>	95
-std::num	<std>	140
-std::num::tables	<std>	4
-std::num::wrapping	<std>	348
-std::math	<std>	260
-std::convert	<std>	2
-std::clone	<std>	1
-std::random	<std>	17
-std::sys	<std>	191
-std::time	<std>	40
-std::hash	<std>	6
-std::hash::fold	<std>	26
-std::hash::sip	<std>	14
-std::hash::state	<std>	18
-std::str	<std>	67
-std::unicode	<std>	74
-std::unicode::tables	<std>	27
-std::cell	<std>	19
-std::sync	<std>	29
-std::sync::atomic	<std>	48
-std::sync::mpsc	<std>	24
-std::thread	<std>	43
-std::objc	<std>	50
-std::objc::foundation	<std>	67
-std::gpu	<std>	180
-std::gpu::capture	<std>	5
-std::gpu::hal	<std>	9
-std::gpu::hal::metal	<std>	118
-std::gpu::hal::metal::bindings	<std>	776
-std::gpu::shader	<std>	26
-std::gpu::timing	<std>	15
-std::gpu::types	<std>	51
-std::gpu::types::BufferUsage	<std>	10
-std::gpu::types::TextureUsage	<std>	5
-std::gpu::types::ShaderStage	<std>	3
-std::gpu::wgsl	<std>	30
-std::gpu::wgsl::ir	<std>	270
-std::gpu::wgsl::names	<std>	241
-std::gpu::wgsl::lex	<std>	61
-std::gpu::wgsl::front	<std>	95
-std::gpu::wgsl::expr	<std>	39
-std::gpu::wgsl::builtins	<std>	35
-std::gpu::wgsl::entry	<std>	8
-std::gpu::wgsl::bounds	<std>	10
-std::gpu::wgsl::uniformity	<std>	1
-std::gpu::wgsl::msl	<std>	88
-std::gpu::wgsl::spirv	<std>	1
-std::gpu::wgsl::interp	<std>	89
-std::gpu::wgsl::dump	<std>	12
-std::gpu::wgsl::job	<std>	13
-std::gpu::wgsl::api	<std>	30
-std::string	<std>	153
-std::path	<std>	34
-std::fs	<std>	59
-std::env	<std>	21
-std::process	<std>	36
-std::window	<std>	52
-std::window::cocoa	<std>	131
-std::window::keys	<std>	27
-std::window::objc	<std>	88
-std::window::script	<std>	37
-std::capture	<std>	6
-std::cli	<std>	110
-std::arch	<std::arch>	3
-std::arch::aarch64	<std::arch::aarch64>	138
-std::arch::x86_64	<std::arch::x86_64>	6
-std::arch::aarch64::raw	<std::arch::aarch64::raw>	110
-std::arch::x86_64::raw	<std::arch::x86_64::raw>	6
 $ volec query items route
 # crate::route	route.vl
-8	const	pub const TRANSFER_MINUTES: i64 = 5
-10	struct	pub struct Leg
-17	struct	pub struct Route<A: Allocator>
-23	struct	struct Step
-30	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64
-34	fn	pub fn quickest(g: Graph<Gpa>, from: i64, to: i64, gpa: Gpa) -> Option<Route<Gpa>>
-68	fn	fn legs_to(how: Vec<Step, Gpa>, from: i64, to: i64, gpa: Gpa) -> Vec<Leg, Gpa>
+10	const	pub const TRANSFER_MINUTES: i64 = 5
+12	struct	pub struct Leg
+19	struct	pub struct Route<A: Allocator>
+26	struct	struct Step
+33	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64
+37	fn	pub fn quickest(g: &Graph<Gpa>, from: usize, to: usize, gpa: Gpa) -> Option<Route<Gpa>>
+70	fn	fn legs_to(how: &Vec<Step, Gpa>, from: usize, to: usize, gpa: Gpa) -> Vec<Leg, Gpa>
 ```
 
 ## 2. The function that computes the total
@@ -152,18 +67,17 @@ fit is counted, with the commands that print it:
 
 ```console
 $ volec query context quickest --budget 600
-// crate::route::quickest	route.vl:34-64	effects: alloc(Gpa) panic diverge
-pub fn quickest(g: Graph<Gpa>, from: i64, to: i64, gpa: Gpa) -> Option<Route<Gpa>> {
+// crate::route::quickest	route.vl:37-66	effects: alloc(Gpa) panic diverge
+pub fn quickest(g: &Graph<Gpa>, from: usize, to: usize, gpa: Gpa) -> Option<Route<Gpa>> {
     let n = size(g);
-    var best: Vec<i64, Gpa> = Vec::filled_in(n as usize, i64::MAX, gpa);
-    var how: Vec<Step, Gpa> = Vec::filled_in(n as usize, Step { from: -1, line: 0, minutes: 0 },
-        gpa);
-    var h = new_heap(gpa);
+    let mut best: Vec<i64, Gpa> = Vec::from_elem_in(i64::MAX, n, gpa);
+    let mut how: Vec<Step, Gpa> = Vec::from_elem_in(Step { from, line: 0, minutes: 0 }, n, gpa);
+    let mut h = new_heap(gpa);
 
     best[from] = 0;
-    push(&h, Entry { cost: 0, node: from, line: 0 });
-    while !is_empty(h) {
-        let cur = pop(&h).unwrap();
+    push(&mut h, Entry { cost: 0, node: from, line: 0 });
+    while !is_empty(&h) {
+        let cur = pop(&mut h).unwrap();
         if cur.cost > best[cur.node] {
             continue;
         }
@@ -175,32 +89,31 @@ pub fn quickest(g: Graph<Gpa>, from: i64, to: i64, gpa: Gpa) -> Option<Route<Gpa
             if cost < best[e.to] {
                 best[e.to] = cost;
                 how[e.to] = Step { from: cur.node, line: e.line, minutes: e.minutes };
-                push(&h, Entry { cost: cost, node: e.to, line: e.line });
+                push(&mut h, Entry { cost, node: e.to, line: e.line });
             }
         }
     }
     if best[to] == i64::MAX {
         return None;
     }
-    Some(Route { legs: legs_to(how, from, to, gpa), total: best[to] })
+    Some(Route { legs: legs_to(&how, from, to, gpa), total: best[to] })
 }
-// calls (13)
-crate::route::ride_cost	route.vl:30:4	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64
-crate::route::legs_to	route.vl:68:4	fn	fn legs_to(how: Vec<Step, Gpa>, from: i64, to: i64, gpa: Gpa) -> Vec<Leg, Gpa>
-crate::graph::size	graph.vl:21:8	fn	pub fn size(g: Graph<Gpa>) -> i64
-crate::heap::new_heap	heap.vl:14:8	fn	pub fn new_heap(gpa: Gpa) -> Heap<Gpa>
-crate::heap::is_empty	heap.vl:18:8	fn	pub fn is_empty(h: Heap<Gpa>) -> bool
-crate::heap::pop	heap.vl:35:8	fn	pub fn pop(h: inout Heap<Gpa>) -> Option<Entry>
-crate::graph::edges_from	graph.vl:53:8	fn	pub fn edges_from(g: Graph<Gpa>, i: i64) -> [Edge]
-crate::heap::push	heap.vl:22:8	fn	pub fn push(h: inout Heap<Gpa>, e: Entry)
-std::Vec::filled_in	<std>:1613:12	method	pub fn filled_in(n: usize, x: sink T, a: sink A) -> Vec<T, A>
-std::Option::unwrap	<std>:131:12	method	pub fn unwrap(sink self) -> T requires self.is_some() else "called unwrap on None"
-<std::Vec as Drop>::drop	<std>:436:8	method	fn drop(inout self)
-std::Vec::as_mut_slice	<std>:396:12	method	pub fn as_mut_slice(inout self) -> inout [T]
-std::Vec::as_slice	<std>:390:12	method	pub fn as_slice(self) -> [T]
-// callers (1)
-plan	main.vl:20:11	match quickest(g, a, b, gpa) {
-note query.budget: over the budget of 600 tokens, left out: types or uses 8
+// calls (15)
+crate::route::ride_cost	route.vl:33:4	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64
+crate::route::legs_to	route.vl:70:4	fn	fn legs_to(how: &Vec<Step, Gpa>, from: usize, to: usize, gpa: Gpa) -> Vec<Leg, Gpa>
+crate::graph::size	graph.vl:24:8	fn	pub fn size(g: &Graph<Gpa>) -> usize
+crate::heap::new_heap	heap.vl:17:8	fn	pub fn new_heap(gpa: Gpa) -> Heap<Gpa>
+crate::heap::is_empty	heap.vl:21:8	fn	pub fn is_empty(h: &Heap<Gpa>) -> bool
+crate::heap::pop	heap.vl:38:8	fn	pub fn pop(h: &mut Heap<Gpa>) -> Option<Entry>
+crate::graph::edges_from	graph.vl:56:8	fn	pub fn edges_from(g: &Graph<Gpa>, i: usize) -> &[Edge]
+crate::heap::push	heap.vl:25:8	fn	pub fn push(h: &mut Heap<Gpa>, e: Entry)
+<std::vec::Vec as Drop>::drop	<std>:5547:8	method	fn drop(&mut self)
+std::vec::Vec::from_elem_in	<std>:5483:12	method	pub fn from_elem_in(x: T, n: usize, a: A) -> Vec<T, A>
+std::option::Option::unwrap	<std>:2771:12	method	pub fn unwrap(self) -> T requires self.is_some() else "called `Option::unwrap()` on a `None` value"
+<&'a [T] as IntoIterator>::into_iter	<std>:7095:8	method	fn into_iter(self) -> Iter<'a, T>
+<std::slice::Iter as Iterator>::next	<std>:7131:8	method	fn next(&mut self) -> Option<&'a T>
+note query.budget: over the budget of 600 tokens, left out: calls 2, types or uses 8, callers 1
+try: volec query callers quickest
 try: volec query context quickest --budget 1800
 ```
 
@@ -209,15 +122,15 @@ The context of `ride_cost` is small enough to print whole:
 
 ```console
 $ volec query context ride_cost
-// crate::route::ride_cost	route.vl:29-32	effects: none
+// crate::route::ride_cost	route.vl:32-35	effects: none
 // What a ride on `e` costs, arriving at its start on `here_line`.
 fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64 {
     if line != here_line { minutes + TRANSFER_MINUTES } else { minutes }
 }
 // uses (1)
-crate::route::TRANSFER_MINUTES	route.vl:8:11	const	pub const TRANSFER_MINUTES: i64 = 5
+crate::route::TRANSFER_MINUTES	route.vl:10:11	const	pub const TRANSFER_MINUTES: i64 = 5
 // callers (1)
-route::quickest	route.vl:52:35	let cost = cur.cost + ride_cost(cur.line, e.minutes, e.line);
+route::quickest	route.vl:54:35	let cost = cur.cost + ride_cost(cur.line, e.minutes, e.line);
 ```
 
 `ride_cost` adds a transfer whenever the ride's line differs from the
@@ -233,8 +146,8 @@ function. `--kind` keeps some kinds:
 ```console
 $ volec query refs Entry.line --kind init
 # route.vl
-42:43	init	route::quickest	push(&h, Entry { cost: 0, node: from, line: 0 });
-56:58	init	route::quickest	push(&h, Entry { cost: cost, node: e.to, line: e.line });
+44:47	init	route::quickest	push(&mut h, Entry { cost: 0, node: from, line: 0 });
+58:56	init	route::quickest	push(&mut h, Entry { cost, node: e.to, line: e.line });
 ```
 
 The first state is `Entry { ..., line: 0 }`. A search of the comments
@@ -244,19 +157,19 @@ the field `Entry.line` and the function `ride_cost`):
 ```console
 $ volec query grep start --comments
 # heap.vl
-6:48	comment	heap::Entry.line	// the line the state arrived on; 0 at the start
+9:48	comment	heap::Entry.line	// the line the state arrived on; 0 at the start
 # route.vl
-29:46	comment	route::ride_cost	// What a ride on `e` costs, arriving at its start on `here_line`.
+32:46	comment	route::ride_cost	// What a ride on `e` costs, arriving at its start on `here_line`.
 ```
 
 And `query type` gives the type of the expression at a position (here
-`cur`, on line 43, and the `e.minutes` passed to `ride_cost`):
+`cur`, on line 47, and the `e.minutes` passed to `ride_cost`):
 
 ```console
-$ volec query type route.vl:43:13
-bool	is_empty(h)
-$ volec query type route.vl:51:57
-()	{ let cost = cur.cost + ride_cost(cur.line, e.minutes, e.line); if cost < best[e.to] { best[e.to] =…
+$ volec query type route.vl:46:13
+Entry	cur
+$ volec query type route.vl:54:57
+i64	e.minutes
 ```
 
 So at the start `cur.line` is 0, which is no line, and `ride_cost`
@@ -264,7 +177,7 @@ charges a transfer for the first ride. That is the bug.
 
 ## 4. Two side questions, answered without leaving the terminal
 
-`main.vl` prints the line with `{l.line:c}`. What does `:c` do? The
+`main.vl` prints a station with `{:<10}`. What does `:<10` do? The
 guide answers from its own text:
 
 ```console
@@ -272,14 +185,14 @@ $ volec guide --find 'spec width align' --budget 900 | head -11
 # formatting#format-strings
 `{name:spec}`, `spec = [[fill]align][+][#][0][width][.precision][type]`:
 `<` `^` `>` align (numbers go right by default, text left) with any fill
-byte (`{s:*^9}`), `+` signs a number, `#` writes `0x`/`0o`/`0b` (and `0`
-pads after them), `0` pads a number with zeros after its sign, the width
-and the precision are digits, `N$`, `name$` (precision also `*`: the
-next argument), `.N` gives a float N decimals and cuts text to N; the
-type is `?` Debug (`x?`, `X?` with hex numbers), `x`/`X` hex, `o` octal,
-`b` binary, `e`/`E` an exponent (`1.5e3`), `p` a pointer as `0x..`, and
-vole's `c`, a `u8` as its byte (a `u8` is a number otherwise). `{:#?}`,
-Debug over several lines, is not in this release.
+character (`{s:*^9}`), `+` signs a number, `#` writes `0x`/`0o`/`0b`
+(and `0` pads after them), `0` pads a number with zeros after its sign,
+the width and the precision are digits (precision also `*`: the next
+argument), `.N` gives a float N decimals and cuts text to N; the type is
+`?` Debug (`x?`, `X?` with hex numbers; `#?` over several lines),
+`x`/`X` hex, `o` octal, `b` binary, `e`/`E` an exponent (`1.5e3`).
+A width from an argument (`w$`, `1$`) is not read yet.
+```vole
 ```
 
 And the fix's condition, tried on a snippet before it goes in (`try`
@@ -287,8 +200,8 @@ runs statements with std imported and prints the last value with its
 type):
 
 ```console
-$ volec try 'println("[{:c}] [{}]", 65u8, 65u8)'
-[A] [65]
+$ volec try 'println("[{:<4}] [{:>4}]", "A", 65u8)'
+[A   ] [  65]
 $ volec try 'let here: u8 = 0; let line = 65u8; here != 0 && line != here'
 bool = false
 ```
@@ -300,7 +213,7 @@ lists the calls by file, `query callers` each call:
 
 ```console
 $ volec query impact ride_cost
-crate::route::ride_cost	route.vl:30:4	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64	effects: none
+crate::route::ride_cost	route.vl:33:4	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64	effects: none
 route.vl	1	0	route::quickest
 total	1	0	1 file
 ```
@@ -310,8 +223,8 @@ One call, in the same module. The fix is one condition, changed by name:
 ```console
 $ volec edit patch ride_cost --old 'if line != here_line' --new 'if here_line != 0 && line != here_line' --show
 patched crate::route::ride_cost	route.vl	+1 -1 lines
-// route.vl:31
-31	    if here_line != 0 && line != here_line { minutes + TRANSFER_MINUTES } else { minutes }
+// route.vl:34
+34	    if here_line != 0 && line != here_line { minutes + TRANSFER_MINUTES } else { minutes }
 $ volec main.vl -o transit && ./transit
 Airport -> Museum: 16 min
   line A  Airport    -> Museum      16 min
@@ -337,7 +250,7 @@ writes the line. Here every answer was exact and short:
   one answer of a known size, instead of three files opened to follow
   the calls;
 - `query refs --kind init` found the struct literals that set the
-  field, which no text search for `line` (31 matches: fields of four
+  field, which no text search for `line` (33 matches: fields of four
   structs, two parameters, comments, a format string) separates from
   the rest;
 - `query type` and `try` answered questions that a reader would

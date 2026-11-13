@@ -142,16 +142,15 @@ test_seed() {
             "$SEED" build --target "$SEED_TARGET" "$exe.vl" -o "$exe" >"$exe.log" 2>&1 \
                 || { why="the seed failed to compile it"; break; }
         else
-            # (0.17: --values=off. The programs are 0.16 code: slices
-            # written through `let sl = a[..]` while a is read, and
-            # genvec.awk's kernels aliased on purpose, for the run-time
-            # alias checks; the own pass is not what they test, and they
-            # hold no owned or reference values, so their code is the
-            # default's)
+            # (0.28: the programs are in the rust edition and are
+            # built as any program is: borrow-checked, their drops run,
+            # reference parameters known apart. 0.17 to 0.27 built them
+            # with --values=off: slices written while their array was
+            # read, and no Drop ran.)
             # (0.26.3, decision 6: the programs' arithmetic wraps, at
             # every level, with the overflow checks off; -O0 would check
             # it. tests/run's ovf_ cases test the checks.)
-            "$COMPILER" --target "$TARGET" "-$level" --overflow-checks=off --deny-warnings --verify-ir --values=off "$program" -o "$exe.o" >"$exe.log" 2>&1 \
+            "$COMPILER" --target "$TARGET" "-$level" --overflow-checks=off --deny-warnings --verify-ir "$program" -o "$exe.o" >"$exe.log" 2>&1 \
                 || { why="-$level failed to compile it: $(head -3 "$exe.log")"; break; }
             # shellcheck disable=SC2086
             cc_run $ARCH -o "$exe" "$exe.o" >>"$exe.log" 2>&1 || { why="-$level: cc failed"; break; }

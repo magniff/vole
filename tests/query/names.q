@@ -27,23 +27,23 @@ $ show geom.vl:16:9 clash/main.vl:33 --root clash/main.vl
     }
 // crate::main	clash/main.vl:30-52	effects: alloc(Gpa) io panic unsafe
 fn main(gpa: Gpa) -> i32 {
-    let helper = 3;
+    let helper: i64 = 3;
     let n = a_helper() + b::helper() + helper;
     let p = a::Point { x: Point(n) };
     let s = sys::SockaddrIn { port: p.x };
     let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
     let sq = Square { side: 2 };
-    var std_vec: Vec<i64, Gpa> = Vec::new_in(gpa);
+    let mut std_vec: Vec<i64, Gpa> = Vec::new_in(gpa);
     std_vec.push(s.port);
-    var mine = MyVec { n: 0 };
+    let mut mine = MyVec { n: 0 };
     mine.push(v.len());
     mine.add(1);
-    let shape = Shape::Circle(2);
+    let shape = Shape::Circle(2i64);
     let r = match shape {
         Shape::Circle(k) => k,
         Shape::Dot => 0,
     };
-    let total = twice_generic(sq) + twice_generic(v) + sq.twice() + mine.len() + printf(r);
+    let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
     unsafe {
         c::printf(c"%d\n", total as i32);
     }

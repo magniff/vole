@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # (0.27.2.1, docs/design/contracts-effects.md E3.6) Writes the effect
-# declarations `volec fix --only effects-std` prints into compiler/std2.
+# declarations `volec fix --only effects-std` prints into compiler/std.
 #
 # std2 is built into the compiler (compiler/src/front/stdsrc_rust.vl, made
-# by compiler/std/embed.sh --edition rust), so fix prints std's lines as
+# by compiler/std/embed.sh), so fix prints std's lines as
 # `<std>:LINE<TAB>THE LINE TO INSERT`, LINE in the built-in text. This
 # reads that text and its file map back from stdsrc_rust.vl, takes the
 # union of the declarations each input gives one line (a generic item's
@@ -20,7 +20,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STDSRC = os.path.join(ROOT, "compiler/src/front/stdsrc_rust.vl")
-STD2 = os.path.join(ROOT, "compiler/std2")
+STD2 = os.path.join(ROOT, "compiler/std")
 ORDER = ["io", "static", "tls", "thread", "sync", "panic", "diverge", "unsafe"]
 
 

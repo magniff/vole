@@ -7,18 +7,18 @@ formatted	main.vl	+8 -7 lines
 % cat main.vl
 extern "C" {
     #[link_name = "write"] #[effects(io)]
-    fn out_write(fd: i32, data: *u8, count: u64) -> i64;
+    fn out_write(fd: i32, data: *mut u8, count: u64) -> i64;
 }
 
 #[effects(alloc(Gpa, extern), panic)]
-fn grow(v: inout Vec<i64, Gpa>) {
+fn grow(v: &mut Vec<i64, Gpa>) {
     v.push(1);
 }
 
 #[sealed] #[scoped]
 struct Handle { id: i64 }
 
-struct Pair<T, U = i64> { a: T, b: U }
+#[derive(Clone, Copy)] struct Pair<T, U = i64> { a: T, b: U }
 
 enum E<T = i64, U = Vec<T>> { A(T), B(U) }
 
@@ -29,13 +29,13 @@ fn apply<F: Fn(i64) -> i64 + effects(panic),
 }
 
 trait Shape {
-    #[pure] fn area(self: *Self) -> i64;
+    #[pure] fn area(self: *mut Self) -> i64;
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
-    grow(&v);
-    let p: Pair<i64> = Pair { a: 1, b: 2 };
-    println(apply(|x| x + 1, |x| x, p.a) + v.len() as i64);
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
+    grow(&mut v);
+    let p: Pair<i64> = Pair { a: 1i64, b: 2i64 };
+    println("{}", apply(|x| x + 1, |x| x, p.a) + v.len() as i64);
 }
 $ fmt --check

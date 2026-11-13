@@ -1,50 +1,108 @@
-// std::capture (0.25.4): the request for a frame capture (below).
+// std::capture (0.25.4; std2 0.28.0): a request to write the next frame
+// presented to a file, which std::window's scripted event loop makes (its
+// `shot FILE` command) and std::gpu serves (Frame::present). It is a
+// module of its own so that neither of those needs the other. A program
+// reaches it as std::gpu::capture_next_frame. vole's own: Rust's std has
+// no windows.
+//
+// The request is a static, so any thread may make or serve one: a spin
+// lock (an AtomicBool) guards the path's bytes and length, which are only
+// read or written while it is held.
+// mvs: std::capture
 
-// ---- Frame capture (0.25.4) ----
+use crate::alloc::Allocator;
+use crate::result::Result;
+use crate::string::String;
+use crate::sync::atomic::{AtomicBool, Ordering};
 
-// std::capture (0.25.4): a request to write the next frame presented to
-// a file, which std::window's scripted event loop makes (its `shot FILE`
-// command) and std::gpu serves (Frame::present). It is a module of its
-// own because std::window and std::gpu are each read only by the programs
-// that name them (compiler/std/index.awk): neither can name the other. A
-// program reaches it as std::gpu::capture_next_frame.
+// The longest path a request takes, in bytes.
+pub const MAX_PATH: usize = 1024;
 
+// Held while PATH and LEN are read or written.
+static LOCK: AtomicBool = AtomicBool::new(false);
 // The file the next presented frame goes to (LEN < 0: none asked for).
-static var PATH: [u8; 1024] = [0u8; 1024];
-static var LEN: i64 = -1;
+static mut PATH: [u8; 1024] = [0; 1024];
+static mut LEN: i64 = -1;
 
-/// The next frame presented (std::gpu's `Frame::present`) is also written
-/// to path, a binary PPM. A new request replaces one not yet served;
-/// false (and nothing is asked) when path is longer than 1024 bytes.
-pub fn capture_next_frame(path: [u8]) -> bool {
-    if path.len() > 1024 {
+fn lock() {
+    while LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {}
+}
+
+fn unlock() {
+    LOCK.store(false, Ordering::Release);
+}
+
+// The next frame presented (std::gpu's `Frame::present`) is also written
+// to path, a binary PPM. A new request replaces one not yet served; false
+// (and nothing is asked) when path is longer than MAX_PATH bytes.
+// std2: changed: path a &str (MVS: [u8])
+#[effects(static, sync, panic, diverge)]
+pub fn capture_next_frame(path: &str) -> bool {
+    let b = path.as_bytes();
+    if b.len() > MAX_PATH {
         return false;
     }
-    for i in 0..path.len() {
-        PATH[i] = path[i];
+    lock();
+    // UNSAFE: writes the static mut request.
+    // SAFETY: the lock is held, so no other thread reads or writes PATH or
+    // LEN; i < b.len() <= 1024, PATH's length; no reference to either is
+    // made (place writes only).
+    unsafe {
+        for i in 0..b.len() {
+            PATH[i] = b[i];
+        }
+        LEN = b.len() as i64;
     }
-    LEN = path.len() as i64;
+    unlock();
     true
 }
 
-/// A capture is asked for, and no frame was presented since.
+// A capture is asked for, and no frame was presented since.
+#[effects(static, sync, panic, diverge)]
 pub fn capture_pending() -> bool {
-    LEN >= 0
+    lock();
+    // UNSAFE: reads the static mut LEN.
+    // SAFETY: the lock is held: no thread writes LEN meanwhile; a copy of
+    // the value, no reference.
+    let pending = unsafe { LEN >= 0 };
+    unlock();
+    pending
 }
 
-/// Forgets the capture asked for, if any.
+// Forgets the capture asked for, if any.
+#[effects(static, sync, panic, diverge)]
 pub fn capture_cancel() {
-    LEN = -1;
+    lock();
+    // UNSAFE: writes the static mut LEN.
+    // SAFETY: the lock is held: no other thread reads or writes it.
+    unsafe {
+        LEN = -1;
+    }
+    unlock();
 }
 
-/// The file asked for, appended to out, and the request forgotten; false
-/// when none was asked for.
-pub fn take_capture<A: Allocator>(out: inout String<A>) -> bool {
-    if LEN < 0 {
+// The file asked for, appended to out, and the request forgotten; false
+// (out unchanged) when none was asked for.
+// std2: changed: out a &mut String<A>
+#[effects(static, sync, panic, diverge, A)]
+pub fn take_capture<A: Allocator>(out: &mut String<A>) -> bool {
+    lock();
+    // UNSAFE: reads and clears the static mut request.
+    // SAFETY: the lock is held: no other thread reads or writes PATH or
+    // LEN; both are copied out by value (no reference to a static mut).
+    let (bytes, len) = unsafe {
+        let r = (PATH, LEN);
+        LEN = -1;
+        r
+    };
+    unlock();
+    if len < 0 {
         return false;
     }
-    // (0.26.3: a String; the path is the text it was asked with)
-    out.push_fmt(PATH[0..LEN]);
-    LEN = -1;
+    // (the bytes were a &str's: capture_next_frame's argument)
+    match crate::str::from_utf8(&bytes[0..len as usize]) {
+        Result::Ok(s) => out.push_str(s),
+        Result::Err(_) => crate::panic::unreachable(),
+    }
     true
 }

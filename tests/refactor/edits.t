@@ -15,7 +15,7 @@ replaced crate::geom::area	geom.vl	+2 -1 lines
 % cat geom.vl
 // Points.
 
-pub struct Point {
+#[derive(Clone, Copy)] pub struct Point {
     pub x: i64,
     pub y: i64,
 }
@@ -37,16 +37,16 @@ impl Point {
     }
 }
 
-pub enum Corner { Low, High }
+#[derive(Clone, Copy, PartialEq, Eq)] pub enum Corner { Low, High }
 ## The new text starts with a comment: the comment is replaced too.
 $ edit replace geom::area < $T/inputs/area_doc.vl
 replaced crate::geom::area	geom.vl	+2 -3 lines
 % git diff
 diff --git a/geom.vl b/geom.vl
-index 92df3fe..65fc83f 100644
+index fb6a2be..c350b38 100644
 --- a/geom.vl
 +++ b/geom.vl
-@@ -5,7 +5,7 @@ pub struct Point {
+@@ -5,7 +5,7 @@
      pub y: i64,
  }
  
@@ -62,12 +62,8 @@ $ edit replace Point::sum --dry-run < $T/inputs/sum_unindented.vl
 @@ -19,2 +19,2 @@
 -    pub fn sum(self) -> i64 {
 -        self.x + self.y
-+    pub fn sum(self: *Point) -> i64 {
++    pub fn sum(&self) -> i64 {
 +        self.y + self.x
-geom.vl:20:9: error[unsafe] access to a field through a raw pointer is unsafe: `self` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `self` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: volec fix --values main.vl | try: volec fix --only unsafe main.vl  [edited: crate::geom::Point::sum]
-geom.vl:20:18: error[unsafe] access to a field through a raw pointer is unsafe: `self` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `self` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: volec fix --values main.vl | try: volec fix --only unsafe main.vl  [edited: crate::geom::Point::sum]
-warning edit.breaks: 2 new errors (dry run); the first: geom.vl:20:9: access to a field through a raw pointer is unsafe: `self` is a `*T` parameter
-[exit 1]
 ## The text as `query show` prints it: its header line is dropped.
 $ edit replace geom::scale --dry-run < $T/inputs/scale_shown.vl
 --- a/geom.vl
@@ -89,14 +85,10 @@ $ edit insert --before Point::sum --dry-run < $T/inputs/diag.vl
 --- a/geom.vl
 +++ b/geom.vl
 @@ -17,0 +18,4 @@
-+    pub fn diag(self: *Point) -> i64 {
++    pub fn diag(&self) -> i64 {
 +        self.x - self.y
 +    }
 +
-geom.vl:19:9: error[unsafe] access to a field through a raw pointer is unsafe: `self` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `self` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: volec fix --values main.vl | try: volec fix --only unsafe main.vl  [edited]
-geom.vl:19:18: error[unsafe] access to a field through a raw pointer is unsafe: `self` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `self` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: volec fix --values main.vl | try: volec fix --only unsafe main.vl  [edited]
-warning edit.breaks: 2 new errors (dry run); the first: geom.vl:19:9: access to a field through a raw pointer is unsafe: `self` is a `*T` parameter
-[exit 1]
 ## Deleting: an item with one blank line; a variant of a one-line enum;
 ## a field (the struct literals need it: refused).
 $ edit delete geom::Corner --dry-run
@@ -104,13 +96,13 @@ $ edit delete geom::Corner --dry-run
 +++ b/geom.vl
 @@ -23,2 +22,0 @@
 -
--pub enum Corner { Low, High }
+-#[derive(Clone, Copy, PartialEq, Eq)] pub enum Corner { Low, High }
 $ edit delete Corner::High --dry-run
 --- a/geom.vl
 +++ b/geom.vl
 @@ -24 +24 @@
--pub enum Corner { Low, High }
-+pub enum Corner { Low }
+-#[derive(Clone, Copy, PartialEq, Eq)] pub enum Corner { Low, High }
++#[derive(Clone, Copy, PartialEq, Eq)] pub enum Corner { Low }
 $ edit delete Point.y
 main.vl:13:27: error[type error] unknown field 'y' in struct 'Point'  [in crate::main]
 main.vl:14:33: error[type error] unknown field 'y' in struct 'Point'  [in crate::main]

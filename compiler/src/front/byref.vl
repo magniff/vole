@@ -1,0 +1,508 @@
+// Borrowed copies (0.26.0, moved out of drops.vl for the places IR,
+// docs/design/places-ir.md §5): the predicates that say which bindings and
+// values are bit copies of a value owned elsewhere, never dropped and
+// never moved out of: std's copying getters (borrowed_call), a borrowing
+// iterator's items (copies_owned_items), a generic result made of what
+// its arguments keep (parametric_copy), the locals bound by reference
+// (BYREF) and the match scrutinees reached through one (MATCH_BYREF).
+// drops.vl places the drops with them; places/ reads them, and never
+// drops.vl.
+
+use crate::base::{intern_c, sym_text};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::ast::{NODE_RAW, NodeKind, child, list_begin, list_push};
+use crate::front::check::Res;
+use crate::front::kinds::{is_moved_type, is_owned_type};
+use crate::front::lexer::Tok;
+use crate::front::modules::within_std;
+use crate::front::types::{REF_MUT, REF_SHARED, TyKind, fn_param};
+use crate::places::glue::has_glue;
+
+// Whether a value of type t is an iterator (or an adapter of one, to depth
+// 4) that copies a borrowed container's non-copyable elements.
+pub fn copies_owned_items(t: i64, depth: i64, pcx: &mut Ctx<Comp>) -> bool {
+    copies_items(t, depth, false, pcx)
+}
+
+// copies_owned_items, or (interior) whether the items it copies are not
+// Freeze (0.26.1: each copy is another cell, own.interior_copy).
+pub fn copies_items(t: i64, depth: i64, interior: bool, pcx: &mut Ctx<Comp>) -> bool {
+    // UNSAFE: STRUCTS and TLISTS' data are the checker's raw tables (*StructInfo, *i64).
+    // SAFETY: t > 0 is a struct type, so TYPES[t].a < STRUCT_COUNT; its targs are
+    // targ_count entries of TLISTS.
+    unsafe {
+        if t <= 0 || depth > 4 || pcx.types[t as usize].kind != TyKind::Struct {
+            return false;
+        }
+        let s = pcx.types[t as usize].a;
+        if !within_std(pcx.structs[s as usize].module, pcx)
+            || pcx.structs[s as usize].targ_count == 0 {
+            return false;
+        }
+        let a0 = (*pcx.tlists.data.add(pcx.structs[s as usize].targs as usize));
+        let a1: i64 = if pcx.structs[s as usize].targ_count
+            > 1 { (*pcx.tlists.data.add((pcx.structs[s as usize].targs + 1) as usize)) }
+            else { 0 };
+        // (0.25: a set's iter, HashSetIter and BTreeSetIter, too)
+        if crate::front::check::is_std_named(t, c"SliceIter", pcx)
+            || crate::front::check::is_std_named(t, c"Keys", pcx)
+            || crate::front::check::is_std_named(t, c"HashSetIter", pcx)
+            || crate::front::check::is_std_named(t, c"BTreeSetIter", pcx) {
+            return copied(a0, interior, pcx);
+        }
+        if crate::front::check::is_std_named(t, c"Values", pcx) {
+            return copied(a1, interior, pcx);
+        }
+        if crate::front::check::is_std_named(t, c"HashMapIter", pcx)
+            || crate::front::check::is_std_named(t, c"BTreeIter", pcx) {
+            return copied(a0, interior, pcx) || copied(a1, interior, pcx);
+        }
+        // (a map's items are its closure's results, made from borrowed ones)
+        if crate::front::check::is_std_named(t, c"Map", pcx)
+            || crate::front::check::is_std_named(t, c"FilterMap", pcx) {
+            return false;
+        }
+        for i in 0..pcx.structs[s as usize].targ_count {
+            if copies_items((*pcx.tlists.data.add((pcx.structs[s as usize].targs + i) as usize)),
+                depth + 1, interior, pcx) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// Whether an item of type t is a copy that matters: one with drop glue
+// (owned twice), or (interior) one that is not Freeze (another cell).
+fn copied(t: i64, interior: bool, pcx: &mut Ctx<Comp>) -> bool {
+    if interior { !crate::front::cells::is_freeze(t, pcx) } else { has_glue(t, pcx) }
+}
+
+pub const MATCH_BYREF: i64 = 1 << 58;
+
+// The bindings of pattern p (PatBind nodes) onto SCRATCH.
+pub fn push_bindings(p: i64, pcx: &mut Ctx<Comp>) {
+    if p == 0 {
+        return;
+    }
+    let k = pcx.nodes[p as usize].kind;
+    if k == NodeKind::PatBind {
+        list_push(p, pcx);
+        return;
+    }
+    if k == NodeKind::PatOr {
+        // (every alternative binds the same names)
+        if pcx.nodes[p as usize].count > 0 {
+            push_bindings(child(p, 0, pcx), pcx);
+        }
+        return;
+    }
+    if k == NodeKind::PatTuple || k == NodeKind::PatVariant {
+        for i in 0..pcx.nodes[p as usize].count {
+            push_bindings(child(p, i, pcx), pcx);
+        }
+    }
+}
+
+// The last word of a function's display name: `get` of `Vec<T>::get`.
+pub fn method_word(d: &[u8]) -> &[u8] {
+    let mut i = d.len() as i64;
+    while i > 0 && d[(i - 1) as usize] != b':' && d[(i - 1) as usize] != b'.' {
+        i -= 1;
+    }
+    &d[i as usize..]
+}
+
+// Whether call e gives a copy of an element its shared receiver keeps:
+// std's accessors (`v.get(i)`, `v.last()`, `m.get(k)`, `key_at`,
+// `value_at`; 0.18.1: a heap's `peek`) return a `T`, not a `&T`, until references are type
+// arguments (0.17.1), and through `unwrap`, `expect`, `unwrap_or`. The copy
+// is borrowed: a binding of it is not dropped, and moving it is
+// own.move_out (it would be dropped twice). (0.26.1) A copy of a value
+// that is not Freeze, with or without a drop, is another cell: a write
+// through it would be lost, own.interior_copy (front/cells.vl).
+pub fn borrowed_call(e: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let r = borrowed_copy(e, false, pcx);
+    if e > 0 && !crate::front::cells::is_freeze(pcx.nodes[e as usize].ty, pcx)
+        && (r || borrowed_copy(e, true, pcx)) {
+        crate::front::cells::interior_copy(e, pcx);
+    }
+    r
+}
+
+// borrowed_call's shapes; interior: of a value that is not Freeze, glue or
+// not, instead of one with glue.
+fn borrowed_copy(e: i64, interior: bool, pcx: &mut Ctx<Comp>) -> bool {
+    // UNSAFE: FNS is the checker's raw table of functions (*FnInfo).
+    // SAFETY: f = NODES[e].x - 1 >= 0 is the call's resolved function, below FN_COUNT.
+    unsafe {
+        // (0.18: through a requires check's block to its call)
+        let wrapped = crate::front::contracts::expand::requires_tail(e, pcx);
+        if wrapped > 0 {
+            return borrowed_copy(wrapped, interior, pcx);
+        }
+        // (0.25: `e?`, the payload of a borrowed Option: `v.last()?`)
+        if e > 0 && pcx.nodes[e as usize].kind == NodeKind::Try {
+            return borrowed_copy(pcx.nodes[e as usize].a, interior, pcx);
+        }
+        // (0.25: `let Some(t) = v.last() else { .. };`, its match: parser::let_else)
+        if e > 0 && pcx.nodes[e as usize].kind == NodeKind::Match
+            && pcx.nodes[e as usize].count == 2
+            && (pcx.nodes[child(e, 1, pcx) as usize].p & crate::front::ast::ARM_LET_ELSE) != 0 {
+            return borrowed_copy(pcx.nodes[e as usize].a, interior, pcx);
+        }
+        if e <= 0 || pcx.nodes[e as usize].kind != NodeKind::Call
+            || pcx.nodes[e as usize].count == 0 {
+            return false;
+        }
+        let f = pcx.nodes[e as usize].x - 1;
+        if f < 0 || !within_std(pcx.fns[f as usize].module, pcx)
+            || (if interior { crate::front::cells::is_freeze(pcx.nodes[e as usize].ty, pcx) }
+                else { !has_glue(pcx.nodes[e as usize].ty, pcx) }) {
+            return false;
+        }
+        let name = method_word(sym_text(pcx.fns[f as usize].display, pcx));
+        let p0 = fn_param(f, 0, pcx);
+        if p0 <= 0 {
+            return false;
+        }
+        if name == b"get" || name == b"last" || name == b"first" || name == b"key_at"
+            || name == b"value_at" || name == b"peek" || name == b"first_key_value"
+            || name == b"last_key_value" {
+            // (a shared receiver: `&self`, or a slice)
+            return pcx.types[p0 as usize].kind == TyKind::Slice
+                && pcx.types[p0 as usize].b != REF_MUT
+                || pcx.types[p0 as usize].kind == TyKind::Ptr
+                && pcx.types[p0 as usize].b == REF_SHARED;
+        }
+        // (0.24: a borrowing iterator's items, copies of elements its
+        // container keeps, moves::copies_owned_items: in std's adapters,
+        // `count`, `filter`, an item looked at and passed over is not dropped)
+        if (name == b"next" || name == b"next_back" || name == b"at" || name == b"find"
+            || name == b"last" || name == b"nth" || name == b"min" || name == b"max")
+            && copies_items(if pcx.types[p0 as usize].kind
+                == TyKind::Ptr { pcx.types[p0 as usize].a } else { p0 }, 0,
+                interior, pcx) {
+            return true;
+        }
+        if name == b"unwrap" || name == b"expect" || name == b"unwrap_or" {
+            return borrowed_copy(crate::front::contracts::desugar::requires_arg(child(e, 0, pcx),
+                pcx),
+                interior, pcx);
+        }
+        false
+    }
+}
+
+// Whether pattern p binds local l.
+pub fn binds(p: i64, l: i64, pcx: &mut Ctx<Comp>) -> bool {
+    // UNSAFE: SCRATCH.data is IntVec's raw buffer, read by index.
+    // SAFETY: mark <= i < SCRATCH.count, the entries push_bindings pushed.
+    unsafe {
+        let mark = list_begin(pcx);
+        push_bindings(p, pcx);
+        let mut found = false;
+        for i in mark..pcx.scratch.count {
+            if pcx.nodes[(*pcx.scratch.data.add(i as usize)) as usize].x == l {
+                found = true;
+            }
+        }
+        pcx.scratch.count = mark;
+        found
+    }
+}
+
+// Whether value expression e (a branch's, an arm's: pat its pattern, or
+// 0) is new: made by e, or a local that dies with it.
+fn fresh_value(e: i64, pat: i64, pcx: &mut Ctx<Comp>) -> bool {
+    if e == 0 {
+        return false;
+    }
+    let k = pcx.nodes[e as usize].kind;
+    // (0.25.2.1: a `return`, `break` or `continue`, as `Err(e) =>
+    // return Err(e)`, makes no value: its type is not always never)
+    if pcx.nodes[e as usize].ty == crate::front::types::TY_NEVER || k == NodeKind::Return
+        || k == NodeKind::Break || k == NodeKind::Continue {
+        return true;
+    }
+    if k == NodeKind::Block {
+        let t = pcx.nodes[e as usize].a;
+        if t == 0 {
+            return false;
+        }
+        if fresh_value(t, pat, pcx) {
+            return true;
+        }
+        if pcx.nodes[t as usize].kind == NodeKind::Ident && pcx.nodes[t as usize].res == Res::Local
+            && pcx.nodes[t as usize].y >= 0 {
+            let l = pcx.nodes[t as usize].y;
+            for i in 0..pcx.nodes[e as usize].count {
+                let s = child(e, i, pcx);
+                if pcx.nodes[s as usize].kind == NodeKind::Let && pcx.nodes[s as usize].a != 0
+                    && binds(pcx.nodes[s as usize].a, l, pcx) {
+                    return pcx.byref.get(l + 1) == 0;
+                }
+            }
+        }
+        return false;
+    }
+    if k == NodeKind::Ident {
+        return pat != 0 && pcx.nodes[e as usize].res == Res::Local && pcx.nodes[e as usize].y >= 0
+            && binds(pat, pcx.nodes[e as usize].y, pcx)
+            && pcx.byref.get(pcx.nodes[e as usize].y + 1) == 0;
+    }
+    fresh(e, pcx)
+}
+
+// Whether expression e makes a new owned value (not a place's, not a copy
+// a collection keeps: borrowed_call).
+pub fn fresh(e: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let k = pcx.nodes[e as usize].kind;
+    if k == NodeKind::Call || k == NodeKind::Try && borrowed_call(e, pcx) {
+        return !borrowed_call(e, pcx) && !parametric_copy(e, pcx);
+    }
+    if k == NodeKind::MethodCall || k == NodeKind::StructLit || k == NodeKind::Tuple
+        || k == NodeKind::Array || k == NodeKind::VariantLit || k == NodeKind::Repeat
+        || k == NodeKind::Try || k == NodeKind::Interp {
+        return true;
+    }
+    if k == NodeKind::Block {
+        return fresh_value(e, 0, pcx);
+    }
+    if k == NodeKind::If {
+        return pcx.nodes[e as usize].c != 0 && fresh_value(pcx.nodes[e as usize].b, 0, pcx)
+            && fresh_value(pcx.nodes[e as usize].c, 0, pcx);
+    }
+    if k == NodeKind::Match {
+        if pcx.nodes[e as usize].count == 0 {
+            return false;
+        }
+        for i in 0..pcx.nodes[e as usize].count {
+            let arm = child(e, i, pcx);
+            if !fresh_value(pcx.nodes[arm as usize].c, pcx.nodes[arm as usize].a, pcx) {
+                return false;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+// Whether call e may give a copy of a value its arguments keep: a generic
+// result made of its type parameters (summary::ret_parametric) from a
+// callee that neither consumes nor changes an argument (`second<T>(p: *T)
+// -> T { p[1] }` reads one through a raw pointer; `unwrap(sink self)`,
+// std's `pop(inout self)` give one up; outside std a function that
+// changes an argument may still return a copy through a raw pointer).
+pub fn parametric_copy(e: i64, pcx: &mut Ctx<Comp>) -> bool {
+    // UNSAFE: FNS and TLISTS' data are the checker's raw tables (*FnInfo, *i64).
+    // SAFETY: f >= 0 is the call's resolved function, below FN_COUNT; its targs are
+    // targ_count entries of TLISTS.
+    unsafe {
+        let f = pcx.nodes[e as usize].x - 1;
+        if f < 0 || crate::front::byref::ret_parametric(f, pcx) == 0 {
+            return false;
+        }
+        // (0.25: `clone` makes a new value, `v.clone().len()`; a result
+        // whose type arguments have no glue holds no copy that matters,
+        // `String::from_in("x", gpa)`)
+        if method_word(sym_text(pcx.fns[f as usize].display, pcx)) == b"clone" {
+            return false;
+        }
+        let mut glue_arg = false;
+        for i in 0..pcx.fns[f as usize].targ_count {
+            if has_glue((*pcx.tlists.data.add((pcx.fns[f as usize].targs + i) as usize)), pcx) {
+                glue_arg = true;
+            }
+        }
+        if !glue_arg {
+            return false;
+        }
+        for i in 0..pcx.fns[f as usize].param_count {
+            let m = crate::front::kinds::param_mode(f, i, pcx);
+            let t = fn_param(f, i, pcx);
+            // (an owned argument consumed, or one changed in place)
+            if m == crate::front::kinds::P_VALUE && is_owned_type(t, pcx)
+                || within_std(pcx.fns[f as usize].module, pcx)
+                && m == crate::front::kinds::P_MUT && t > 0
+                && pcx.types[t as usize].b == REF_MUT
+                && is_owned_type(pcx.types[t as usize].a, pcx) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// A node flag (0.17, T1): on a `let` the checker writes whose binding
+// borrows nothing (an f-string call's value, moved out by its block's
+// tail; a statement temporary's `__own_tv`): let_drops leaves it.
+pub const NO_DROP: i64 = 1 << 59;
+
+// (0.25) The receiver of `v.as_mut_slice()` that the checker made of a
+// Vec's or a Buf's `v[i]` written (check/synth_mode.vl: synth_index), when
+// it is call e; else 0.
+pub fn slice_receiver(e: i64, pcx: &Ctx<Comp>) -> i64 {
+    if pcx.nodes[e as usize].kind == NodeKind::MethodCall {
+        let name = sym_text(pcx.nodes[e as usize].b, pcx);
+        return if name == b"as_mut_slice" { pcx.nodes[e as usize].a } else { 0 };
+    }
+    if pcx.nodes[e as usize].kind != NodeKind::Call || pcx.nodes[e as usize].count != 1 {
+        return 0;
+    }
+    let f = pcx.nodes[e as usize].x - 1;
+    if f < 0 {
+        return 0;
+    }
+    // UNSAFE: FNS is the checker's raw table of functions.
+    // SAFETY: f is the function the checker resolved call e to (its x),
+    // below FN_COUNT.
+    let (module, display) = unsafe { (pcx.fns[f as usize].module, pcx.fns[f as usize].display) };
+    if !within_std(module, pcx) || method_word(sym_text(display, pcx)) != b"as_mut_slice" {
+        return 0;
+    }
+    let mut r = child(e, 0, pcx);
+    if pcx.nodes[r as usize].kind == NodeKind::Unary && pcx.nodes[r as usize].op == Tok::Amp {
+        r = pcx.nodes[r as usize].b;
+    }
+    r
+}
+
+// (0.25) Whether place e (an assignment's target) is one copy_place copies
+// once its indexes are names: names, fields, `*` and indexes, no call.
+pub fn indexable_place(e: i64, pcx: &Ctx<Comp>) -> bool {
+    if e == 0 || (pcx.nodes[e as usize].p & NODE_RAW) != 0 {
+        return false;
+    }
+    let k = pcx.nodes[e as usize].kind;
+    if k == NodeKind::Ident {
+        return pcx.nodes[e as usize].res == Res::Local || pcx.nodes[e as usize].res == Res::Static;
+    }
+    if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+        return indexable_place(pcx.nodes[e as usize].a, pcx);
+    }
+    if k == NodeKind::Unary && pcx.nodes[e as usize].op == Tok::Star {
+        return indexable_place(pcx.nodes[e as usize].b, pcx);
+    }
+    if k == NodeKind::Index {
+        let i = pcx.nodes[e as usize].b;
+        let r = slice_receiver(pcx.nodes[e as usize].a, pcx);
+        return i != 0 && pcx.nodes[i as usize].kind != NodeKind::Range
+            && indexable_place(if r != 0 { r } else { pcx.nodes[e as usize].a }, pcx);
+    }
+    false
+}
+
+pub fn pattern_binds_owned(p: i64, pcx: &mut Ctx<Comp>) -> bool {
+    if p == 0 {
+        return false;
+    }
+    let k = pcx.nodes[p as usize].kind;
+    if k == NodeKind::PatBind {
+        return pcx.nodes[p as usize].x >= 0
+            && is_moved_type(pcx.locals[pcx.nodes[p as usize].x as usize].ty, pcx);
+    }
+    if k == NodeKind::PatTuple || k == NodeKind::PatVariant || k == NodeKind::PatOr {
+        for i in 0..pcx.nodes[p as usize].count {
+            if pattern_binds_owned(child(p, i, pcx), pcx) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// Whether generic function instance f's result type is made of its type
+// parameters only (§2.4, parametric results): 0: not; 1: T values (`T`,
+// `Option<T>`, `Result<T, E>`, `(K, V)`, an owned `Vec<T>`); 2: views of
+// T storage (`[T]`, `*T`, another generic type such as `SliceIter<T>`).
+pub fn ret_parametric(f: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    if f < 0 || pcx.fns[f as usize].tmpl == 0 {
+        return 0;
+    }
+    let tn = pcx.fns[(pcx.fns[f as usize].tmpl - 1) as usize].node;
+    if tn == 0 || pcx.nodes[tn as usize].g == 0 || pcx.nodes[tn as usize].b == 0 {
+        return 0;
+    }
+    params_only(pcx.nodes[tn as usize].b, pcx.nodes[tn as usize].g, pcx)
+}
+
+pub fn is_generic_name(sym: i64, gens: i64, pcx: &Ctx<Comp>) -> bool {
+    for i in 0..pcx.nodes[gens as usize].count {
+        if pcx.nodes[child(gens, i, pcx) as usize].a == sym {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether sym names a primitive type (no views of its own).
+fn is_primitive_name(sym: i64, pcx: &Ctx<Comp>) -> bool {
+    let s = sym_text(sym, pcx);
+    let names: [&[u8]; 14] = [b"i8", b"i16", b"i32", b"i64", b"u8", b"u16", b"u32", b"u64", b"f32",
+        b"f64", b"bool", b"usize", b"isize", b"char"];
+    for k in 0..14 {
+        if s == names[k as usize] {
+            return true;
+        }
+    }
+    false
+}
+
+fn params_only(t: i64, gens: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    if pcx.sym_option == 0 {
+        pcx.sym_option = intern_c(c"Option", pcx);
+        pcx.sym_result = intern_c(c"Result", pcx);
+        pcx.summary_sym_vec = intern_c(c"Vec", pcx);
+        pcx.summary_sym_hashmap = intern_c(c"HashMap", pcx);
+    }
+    let k = pcx.nodes[t as usize].kind;
+    let mut r: i64 = 1;
+    if k == NodeKind::TyName {
+        let args = pcx.nodes[t as usize].g;
+        let name = pcx.nodes[t as usize].a;
+        if args == 0 {
+            if is_generic_name(name, gens, pcx) || is_primitive_name(name, pcx) {
+                return 1;
+            }
+            // (a type of its own, which may view anything: not made
+            // of the parameters)
+            return 0;
+        }
+        for i in 0..pcx.nodes[args as usize].count {
+            let a = params_only(child(args, i, pcx), gens, pcx);
+            if a == 0 {
+                return 0;
+            }
+            if a > r {
+                r = a;
+            }
+        }
+        if name == pcx.sym_option || name == pcx.sym_result || name == pcx.summary_sym_vec
+            || name == pcx.summary_sym_hashmap {
+            return r;
+        }
+        // (another generic type: it may view its arguments' storage)
+        return 2;
+    }
+    if k == NodeKind::TyTuple {
+        for i in 0..pcx.nodes[t as usize].count {
+            let a = params_only(child(t, i, pcx), gens, pcx);
+            if a == 0 {
+                return 0;
+            }
+            if a > r {
+                r = a;
+            }
+        }
+        return r;
+    }
+    if k == NodeKind::TySlice || k == NodeKind::TyPtr {
+        if params_only(pcx.nodes[t as usize].a, gens, pcx) == 0 {
+            return 0;
+        }
+        return 2;
+    }
+    if k == NodeKind::TyUnit || k == NodeKind::TyNever { 1 } else { 0 }
+}

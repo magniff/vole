@@ -39,6 +39,11 @@
 set -u
 LC_ALL=C
 export LC_ALL
+# (0.28.0) std is the compiler's own text here, `<std>`, wherever the
+# runner's programs are: not the files of a vole repository around them
+# (front/stdtree.vl: find_std_tree), which the tools would name instead.
+VOLE_STD_TREE=none
+export VOLE_STD_TREE
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -363,8 +368,4 @@ while IFS= read -r code; do
 done <"$WORK/codes"
 check self_explain "$([ "$(wc -l <"$WORK/codes")" -ge 90 ] && [ -z "$missing$extra$bad" ] && echo 1)" \
     "$(wc -l <"$WORK/codes") codes; no entry:$(echo $missing); not a code:$(echo $extra); bad:$bad"
-# The own pass (0.17, front/own): compiler/src walks clean under
-# --values=report (the default only walks when its findings are printed).
-out=$(VOLE_CACHE="$WORK/owncache" "$COMPILER" check --values=report compiler/src/main.vl 2>&1)
-check own_report_compiler "$(printf '%s\n' "$out" | grep -q '^own: 0 findings' && echo 1)" "$out"
 exit $STATUS

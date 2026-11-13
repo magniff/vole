@@ -53,15 +53,18 @@ instructions per call and per loop iteration: the compiler runs about
 `--trace`, a failure is one line, its position and message:
 
 ```vole
+fn pick(v: &[i64], i: usize) -> i64 {
+    v[i]
+}
+
 fn main() -> i32 {
     let v = [1, 2, 3];
-    let i = v.len() as i64;
-    std::print_int(v[i]);
+    println("{}", pick(&v, v.len()));
     0
 }
 ```
 ```out (exit 101)
-main.vl:4:20: index out of bounds: index 3, length 3
+main.vl:2:5: index out of bounds: index 3, length 3
 ```
 
 `volec test` builds with `--trace` (`--no-trace` turns it off). A
@@ -91,7 +94,7 @@ depends on the line:
 | opens a block (`} else {`, `X => {`, `fn f(x: T) {`) | runs at the start of that block |
 
 Values are printed by type. Integers, floats and bool print as values,
-`[u8]` quoted, arrays and slices up to 16 elements, `Option` and tuples
+`&str` and `String` quoted, arrays and slices up to 16 elements, `Option` and tuples
 element by element, pointers as addresses. A struct uses Debug when it
 has it, else prints field by field. The program is built from copies of
 its files with the probes written in (`--overlay`), so line numbers stay
@@ -114,8 +117,8 @@ arguments come after `--`. From the root of the tree, an example run with
 its own flags:
 
 ```text
-$ volec probe examples/nes/check.vl:235 mode1 prg power -- --check
-probe examples/nes/check.vl:235 (before `cart.cpu_write(0x8000, 0x00);`): 1 time
+$ volec probe examples/nes/check.vl:234 mode1 prg power -- --check
+probe examples/nes/check.vl:234 (before `cart.cpu_write(0x8000, 0x00);`): 1 time
   #1  mode1 = true  prg = true  power = true
 run: exit 0; stdout 1 line (target/scratch/probe/examples-nes-main.vl/out)
   | ok: 21 NES checks passed

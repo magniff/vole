@@ -38,7 +38,7 @@ command that shows the way out:
 
 ```console
 $ volec lint --max-lines 170
-error lint.max-lines: shop.vl: 381 lines (at most 170)
+error lint.max-lines: shop.vl: 385 lines (at most 170)
 try: volec query deps crate::shop --max-lines 170
 [exit 1]
 ```
@@ -48,11 +48,11 @@ The file already has sections, marked with banner comments; `query items
 
 ```console
 $ volec query items shop --comments | grep section
-7-72	section	Products and stock
-74-138	section	Carts
-140-215	section	Prices and discounts
-217-277	section	Receipts
-279-381	section	Commands
+7-73	section	Products and stock
+75-140	section	Carts
+142-219	section	Prices and discounts
+221-280	section	Receipts
+282-385	section	Commands
 ```
 
 ## 2. What uses what
@@ -63,10 +63,10 @@ and fit the size. The groups alone:
 
 ```console
 $ volec query deps shop --max-lines 170 | grep -v '^[A-Za-z_]*	'
-# crate::shop	shop.vl	329 lines	37 items
-group 1	149	Product Store new_store add_product find_sku product in_stock restock take_stock print_stock Command number parse_command run
-group 2	136	Line Cart new_cart line_index add_to_cart remove_from_cart qty_of items_in clear_cart Total subtotal total money pad_to receipt_line print_receipt checkout
-group 3	44	TAX_PERMILLE Coupon parse_coupon discount round_div tax_on
+# crate::shop	shop.vl	333 lines	37 items
+group 1	151	Product Store new_store add_product find_sku product in_stock restock take_stock print_stock Command number parse_command run
+group 2	137	Line Cart new_cart line_index add_to_cart remove_from_cart qty_of items_in clear_cart Total subtotal total money pad_to receipt_line print_receipt checkout
+group 3	45	TAX_PERMILLE Coupon parse_coupon discount round_div tax_on
 ```
 
 The full table answers "can I move `money` without dragging half the
@@ -88,15 +88,15 @@ outside stays in `shop` itself:
 
 ```console
 $ volec refactor split shop --plan --max-lines 170
-# crate::shop	381 lines	5 parts of at most 170 lines
-# commands: banner '// ---- Commands ----': 4 of 4 items, 85 of 85 lines
+# crate::shop	385 lines	5 parts of at most 170 lines
+# commands: banner '// ---- Commands ----': 4 of 4 items, 86 of 86 lines
 volec refactor split crate::shop --into crate::shop::commands --items Command,number,parse_command,run
-# carts: banner '// ---- Carts ----': 9 of 11 items, 55 of 76 lines
+# carts: banner '// ---- Carts ----': 9 of 11 items, 56 of 77 lines
 volec refactor split crate::shop --into crate::shop::carts --items Line,Cart,new_cart,line_index,add_to_cart,remove_from_cart,qty_of,items_in,clear_cart,subtotal,checkout
 # stays in crate::shop: the part most used from other modules
-# receipts: banner '// ---- Receipts ----': 4 of 6 items, 47 of 60 lines
+# receipts: banner '// ---- Receipts ----': 4 of 6 items, 46 of 60 lines
 volec refactor split crate::shop --into crate::shop::receipts --items Total,total,money,pad_to,receipt_line,print_receipt
-# prices_discounts: banner '// ---- Prices and discounts ----': 6 of 6 items, 44 of 44 lines
+# prices_discounts: banner '// ---- Prices and discounts ----': 6 of 6 items, 45 of 45 lines
 volec refactor split crate::shop --into crate::shop::prices_discounts --items TAX_PERMILLE,Coupon,parse_coupon,discount,round_div,tax_on
 note refactor.plan: the same in one edit: --auto (other names: --names a,b)
 try: volec refactor split crate::shop --auto --max-lines 170
@@ -109,15 +109,15 @@ the parts other names, in the plan's order; `prices_discounts` becomes
 
 ```console
 $ volec refactor split shop --auto --max-lines 170 --names commands,carts,receipts,pricing
-split crate::shop into 4 modules	6 files	+325 -302 lines
+split crate::shop into 4 modules	6 files	+329 -304 lines
 $ volec query stats
-96	4	shop/commands.vl
-92	11	shop/carts.vl
-86	10	shop/mod.vl
+95	4	shop/commands.vl
+95	11	shop/carts.vl
+89	10	shop/mod.vl
 73	6	shop/receipts.vl
-54	6	shop/pricing.vl
+55	6	shop/pricing.vl
 31	1	main.vl
-432	38	total
+438	38	total
 $ volec lint --max-lines 170 && echo every file fits
 every file fits
 ```
@@ -129,7 +129,9 @@ items another file uses became `pub` where privacy required it:
 
 ```console
 $ volec query show shop::carts::use shop::carts::header
-// crate::shop::carts::use	shop/carts.vl:3-5
+// crate::shop::carts::use	shop/carts.vl:3-3
+use std::alloc::Allocator;
+// crate::shop::carts::use	shop/carts.vl:5-7
 use crate::shop::{Store, in_stock, product, take_stock};
 use crate::shop::pricing::Coupon;
 use crate::shop::receipts::{print_receipt, total};
@@ -141,16 +143,16 @@ $ volec query items shop
 6	mod	pub mod carts
 7	mod	pub mod receipts
 8	mod	mod pricing
-14	struct	pub struct Product
-22	struct	pub struct Store<A: Allocator>
-28	fn	pub fn new_store(gpa: Gpa) -> Store<Gpa>
-32	fn	pub fn add_product(st: inout Store<Gpa>, sku: i64, name: [u8], price: i64, stock: i64)
-37	fn	pub fn find_sku(st: Store<Gpa>, sku: i64) -> Option<i64>
-41	fn	pub fn product(st: Store<Gpa>, sku: i64) -> Option<Product>
-48	fn	pub fn in_stock(st: Store<Gpa>, sku: i64) -> i64
-56	fn	pub fn restock(st: inout Store<Gpa>, sku: i64, n: i64) -> bool
-67	fn	fn take_stock(st: inout Store<Gpa>, sku: i64, n: i64) -> i64
-79	fn	pub fn print_stock(st: Store<Gpa>, gpa: Gpa)
+17	struct	pub struct Product
+25	struct	pub struct Store<A: Allocator>
+31	fn	pub fn new_store(gpa: Gpa) -> Store<Gpa>
+35	fn	pub fn add_product(st: &mut Store<Gpa>, sku: i64, name: &'static str, price: i64, stock: i64)
+40	fn	pub fn find_sku(st: &Store<Gpa>, sku: i64) -> Option<usize>
+44	fn	pub fn product(st: &Store<Gpa>, sku: i64) -> Option<Product>
+51	fn	pub fn in_stock(st: &Store<Gpa>, sku: i64) -> i64
+59	fn	pub fn restock(st: &mut Store<Gpa>, sku: i64, n: i64) -> bool
+70	fn	fn take_stock(st: &mut Store<Gpa>, sku: i64, n: i64) -> i64
+82	fn	pub fn print_stock(st: &Store<Gpa>, gpa: Gpa)
 ```
 
 Code outside the module was changed too: `main.vl` imports from where
@@ -159,7 +161,7 @@ the items are now.
 ```console
 $ git diff main.vl
 diff --git a/main.vl b/main.vl
-index e5a0161..ecc6b62 100644
+index a599df1..e4b7d1e 100644
 --- a/main.vl
 +++ b/main.vl
 @@ -2,7 +2,10 @@
@@ -173,7 +175,7 @@ index e5a0161..ecc6b62 100644
 +use shop::receipts::money;
  
  fn main(gpa: Gpa) -> i32 {
-     var st: Store<Gpa> = new_store(gpa);
+     let mut st: Store<Gpa> = new_store(gpa);
 ```
 
 (`--reexport` does the opposite: it leaves the code outside as it is,
@@ -194,7 +196,7 @@ The split was one edit: one `undo` puts `shop.vl` back whole.
 
 ```console
 $ volec undo
-undid split crate::shop into 4 modules	6 files	+325 -302 lines
+undid split crate::shop into 4 modules	6 files	+329 -304 lines
 $ ls *.vl
 main.vl
 shop.vl

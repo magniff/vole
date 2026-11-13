@@ -67,16 +67,16 @@ extern "C" {
     fn putchar(c: i32) -> i32;
 }
 
-static var N: i64 = 3;
+static mut N: i64 = 3;
 
 #[inline(never)]
-fn kernels(a: inout [i64; 1024], idx: [i64; 1024], f: inout [f64; 1024]) -> i64 {
-    var s = 0;
+fn kernels(a: &mut [i64; 1024], idx: &[i64; 1024], f: &mut [f64; 1024]) -> i64 {
+    let mut s = 0;
     for i in 0..1024 {
         s += a[i];
     }
     for i in 0..1024 {
-        s += a[idx[i] & 1023];
+        s += a[(idx[i] & 1023) as usize];
     }
     for i in 0..1024 {
         if a[i] > 5 {
@@ -84,18 +84,18 @@ fn kernels(a: inout [i64; 1024], idx: [i64; 1024], f: inout [f64; 1024]) -> i64 
         }
         a[i] = a[i] + 1;
     }
-    var k = 0;
-    while k < N {
+    let mut k = 0;
+    while k < unsafe { N } {
         unsafe {
             putchar(65);
         }
         k += 1;
     }
-    var p = 1;
-    while p < N * 100 {
-        p = p * 3 + a[p & 1023];
+    let mut p = 1;
+    while p < unsafe { N } * 100 {
+        p = p * 3 + a[(p & 1023) as usize];
     }
-    var fs = 0.0;
+    let mut fs = 0.0;
     for i in 0..1024 {
         fs += f[i];
     }
@@ -103,13 +103,13 @@ fn kernels(a: inout [i64; 1024], idx: [i64; 1024], f: inout [f64; 1024]) -> i64 
 }
 
 fn main() {
-    var a: [i64; 1024] = [1; 1024];
-    var idx: [i64; 1024] = [0; 1024];
-    var f: [f64; 1024] = [0.5; 1024];
+    let mut a: [i64; 1024] = [1; 1024];
+    let mut idx: [i64; 1024] = [0; 1024];
+    let mut f: [f64; 1024] = [0.5; 1024];
     for i in 0..1024 {
-        idx[i] = (i * 7) & 1023;
+        idx[i] = ((i * 7) & 1023) as i64;
     }
-    println("{}", kernels(&a, idx, &f));
+    println("{}", kernels(&mut a, &idx, &mut f));
 }
 EOF
 cat >loops.want <<'EOF'
@@ -119,7 +119,7 @@ vec-stats: kernels, loop at line 14: not vectorized: an address computed from a 
 vec-stats: kernels, loop at line 17: not vectorized: a branch in its body that is no bounds check (an if, a break)
 vec-stats: kernels, loop at line 31: not vectorized: an unknown trip count: not a loop over a counter to a bound
 vec-stats: kernels, loop at line 35: not vectorized: a float carried from one iteration to the next (a float sum: lanes would add in another order) (phi)
-vector loops 1, overlap tests 0, tests dropped by noalias 0
+vector loops 3, overlap tests 0, tests dropped by noalias 0
 EOF
 REFUSED="error[time.instructions] the instructions retired cannot be read here | help: the system's counter refused this process (Linux: perf_event_open, which /proc/sys/kernel/perf_event_paranoid above 2 or a container's seccomp profile forbids); --time-passes counts CPU time | try: volec --time-passes FILE.vl -c -o /dev/null"
 
@@ -191,9 +191,10 @@ else
     fail vec-stats "$(diff loops.want err.out 2>&1 | head -20)"
 fi
 
-# vec-counts
+# vec-counts (the program's loops, std's too: kernels' one, and two
+# in what println brings in, 0.28)
 if build -O2 --vec-stats loops.vl -c -o loops.o \
-    && [ "$(cat err.out)" = "vector loops 1, overlap tests 0, tests dropped by noalias 0" ] \
+    && [ "$(cat err.out)" = "vector loops 3, overlap tests 0, tests dropped by noalias 0" ] \
     && build -O0 --vec-stats=kernels loops.vl -c -o loops.o && ! grep -q 'loop at' err.out; then
     pass vec-counts
 else

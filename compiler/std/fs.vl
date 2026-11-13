@@ -1,470 +1,947 @@
-// std::fs (0.20, docs/design/collections-text-io.md §2.6.3, task B6):
-// files and directories with Rust's names. A path is any `[u8]`: a
-// literal, a `str`, a Path, `&s` of a String or PathBuf. It reaches C as a
-// NUL-ended copy on the stack (std::sys: InvalidInput when it is longer
-// than the system's PATH_MAX or holds a NUL), so nothing here allocates
-// but what returns a Vec or a String, on the allocator given.
+// std::fs: files and directories, Rust's. A path is a `P: AsRef<str>`
+// (Rust's `AsRef<Path>`: a &str, a &String, a std::path::Path or a
+// &PathBuf; 0.28.0, std::path's named divergence); it reaches C as a NUL-ended copy on the stack, so nothing here allocates
+// but what returns a Vec or a String, on the allocator given. A path that
+// holds a NUL is InvalidInput, one longer than the system's PATH_MAX the
+// OS's ENAMETOOLONG (Rust passes it to the OS, which says the same).
+// mvs: std::fs
 
-use std::{Allocator, Drop, Iterator, Option, Vec};
-use std::io::buffered::{Read, Write};
-use std::io::error::{ErrorKind, Result, __io_error, __os_error};
-use std::path::{Path, PathBuf};
-use std::string::{String, str};
-use std::sys::{
-    FileStat, SYS_DT_DIR, SYS_DT_LNK, SYS_DT_REG, SYS_EEXIST, SYS_O_APPEND, SYS_O_CLOEXEC,
-    SYS_O_CREAT, SYS_O_EXCL, SYS_O_RDONLY, SYS_O_RDWR, SYS_O_TRUNC, SYS_O_WRONLY, SYS_SEEK_CUR,
-    SYS_SEEK_END, SYS_SEEK_SET, SysDir, sys_close, sys_closedir, sys_fstat, sys_fsync,
-    sys_ftruncate, sys_lseek, sys_lstat, sys_mkdir, sys_open, sys_opendir, sys_read,
-    sys_readdir_into, sys_rename, sys_rmdir, sys_stat, sys_unlink, sys_write,
-};
+use crate::alloc::Allocator;
+use crate::convert::AsRef;
+use crate::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom, Write};
+use crate::iter::Iterator;
+use crate::ops::Drop;
+use crate::option::Option;
+use crate::string::String;
+use crate::time::SystemTime;
+use crate::vec::Vec;
 
-// ---- Files (0.20) ----
+// UNSAFE: the OS's file and directory calls, which take NUL-ended paths
+// and buffers as raw pointers.
+// SAFETY: POSIX's prototypes (fcntl.h, unistd.h, sys/stat.h, dirent.h,
+// stdio.h); open's mode is variadic, as declared. The callers pass a
+// CPath's buffer (NUL-ended), a StatBuf's words (larger than either
+// system's struct stat) and a DIR * that opendir returned.
+extern "C" {
+    #[link_name = "open"]
+    fn fs_c_open(path: *const u8, flags: i32, ...) -> i32;
+    #[link_name = "close"]
+    fn fs_c_close(fd: i32) -> i32;
+    #[link_name = "lseek"]
+    fn fs_c_lseek(fd: i32, off: i64, whence: i32) -> i64;
+    #[link_name = "ftruncate"]
+    #[effects(io)]
+    fn fs_c_ftruncate(fd: i32, len: i64) -> i32;
+    #[link_name = "fsync"]
+    fn fs_c_fsync(fd: i32) -> i32;
+    #[link_name = "fchmod"]
+    #[effects(io)]
+    fn fs_c_fchmod(fd: i32, mode: u32) -> i32;
+    #[link_name = "fstat"]
+    fn fs_c_fstat(fd: i32, buf: *mut u64) -> i32;
+    #[link_name = "stat"]
+    fn fs_c_stat(path: *const u8, buf: *mut u64) -> i32;
+    #[link_name = "lstat"]
+    #[effects(io)]
+    fn fs_c_lstat(path: *const u8, buf: *mut u64) -> i32;
+    #[link_name = "mkdir"]
+    fn fs_c_mkdir(path: *const u8, mode: u32) -> i32;
+    #[link_name = "rmdir"]
+    fn fs_c_rmdir(path: *const u8) -> i32;
+    #[link_name = "unlink"]
+    fn fs_c_unlink(path: *const u8) -> i32;
+    #[link_name = "rename"]
+    fn fs_c_rename(from: *const u8, to: *const u8) -> i32;
+    #[link_name = "opendir"]
+    #[effects(io)]
+    fn fs_c_opendir(path: *const u8) -> *mut u8;
+    #[link_name = "readdir"]
+    #[effects(io)]
+    fn fs_c_readdir(dir: *mut u8) -> *const u8;
+    #[link_name = "closedir"]
+    #[effects(io)]
+    fn fs_c_closedir(dir: *mut u8) -> i32;
+}
 
-// An open file; dropping it closes it.
-pub struct File { fd: i32 }
+const O_RDONLY: i32 = 0;
+const O_WRONLY: i32 = 1;
+const O_RDWR: i32 = 2;
+const S_IFMT: u32 = 0xf000;
+const S_IFDIR: u32 = 0x4000;
+const S_IFREG: u32 = 0x8000;
+const S_IFLNK: u32 = 0xa000;
+const DT_DIR: u8 = 4;
+const DT_REG: u8 = 8;
+const DT_LNK: u8 = 10;
+const EINVAL: i32 = 22;
 
-impl Drop for File {
-    fn drop(inout self) {
-        if self.fd >= 0 {
-            let _ = sys_close(self.fd);
-            self.fd = -1;
-        }
+// A path and its NUL, as C takes it.
+struct CPath {
+    buf: [u8; crate::__sys::PATH_MAX],
+}
+
+impl CPath {
+    fn ptr(&self) -> *const u8 {
+        &self.buf[0] as *const u8
     }
 }
 
-// The Result of a sys call, its errno an io::Error.
-#[inline]
-fn os<T>(r: sink std::Result<T, i32>) -> Result<T> {
-    match r {
-        Ok(v) => Ok(v),
-        Err(e) => Err(__os_error(e)),
+// path as C takes it: InvalidInput when it holds a NUL, ENAMETOOLONG when
+// it does not fit.
+fn cpath(path: &str) -> Result<CPath> {
+    let b = path.as_bytes();
+    let mut p = CPath { buf: [0u8; crate::__sys::PATH_MAX] };
+    if b.len() >= p.buf.len() {
+        return crate::result::Result::Err(Error::from_raw_os_error(crate::__sys::ENAMETOOLONG));
+    }
+    let mut i: usize = 0;
+    while i < b.len() {
+        if b[i] == 0 {
+            return crate::result::Result::Err(Error::new(ErrorKind::InvalidInput,
+                "file name contained an unexpected NUL byte"));
+        }
+        p.buf[i] = b[i];
+        i += 1;
+    }
+    crate::result::Result::Ok(p)
+}
+
+// A C call's -1 as the io::Error errno says.
+fn cvt(r: i32) -> Result<()> {
+    if r < 0 {
+        crate::result::Result::Err(Error::last_os_error())
+    } else {
+        crate::result::Result::Ok(())
+    }
+}
+
+fn open_c(path: &str, flags: i32, mode: u32) -> Result<File> {
+    let p = cpath(path)?;
+    // UNSAFE: C's open. SAFETY: p is NUL-ended and lives past the call;
+    // the mode is the variadic int open reads when it creates the file.
+    let fd = unsafe { fs_c_open(p.ptr(), flags | crate::__sys::O_CLOEXEC, mode as i32) };
+    if fd < 0 {
+        return crate::result::Result::Err(Error::last_os_error());
+    }
+    crate::result::Result::Ok(File { fd: fd })
+}
+
+// Room for either system's struct stat (144 bytes on macOS, 128 on Linux).
+struct StatBuf {
+    words: [u64; 20],
+}
+
+fn metadata_of(b: &StatBuf) -> Metadata {
+    let (mode, size, mtime, mtime_nsec) = crate::__sys::stat_fields(&b.words);
+    Metadata { mode: mode, size: size, mtime: mtime, mtime_nsec: mtime_nsec }
+}
+
+// stat, or lstat (follow false), of the file at path.
+fn stat_at(path: &str, follow: bool) -> Result<Metadata> {
+    let p = cpath(path)?;
+    let mut b = StatBuf { words: [0u64; 20] };
+    // UNSAFE: C's stat and lstat. SAFETY: p is NUL-ended; b.words is 160
+    // bytes, 8-aligned, more than either system's struct stat.
+    let r = unsafe {
+        if follow {
+            fs_c_stat(p.ptr(), &mut b.words[0] as *mut u64)
+        } else {
+            fs_c_lstat(p.ptr(), &mut b.words[0] as *mut u64)
+        }
+    };
+    cvt(r)?;
+    crate::result::Result::Ok(metadata_of(&b))
+}
+
+// ---- Files ----
+
+// An open file; dropping it closes it.
+pub struct File {
+    fd: i32,
+}
+
+impl Drop for File {
+    fn drop(&mut self) {
+        // UNSAFE: C's close. SAFETY: fd is this File's own descriptor,
+        // closed once (here).
+        let _ = unsafe { fs_c_close(self.fd) };
     }
 }
 
 impl File {
     // Opens path for reading.
-    pub fn open(path: [u8]) -> Result<File> {
-        let fd = os(sys_open(path, SYS_O_RDONLY | SYS_O_CLOEXEC, 0))?;
-        Ok(File { fd: fd })
+    #[effects(io, static, panic, diverge)]
+    pub fn open<P: AsRef<str>>(path: P) -> Result<File> {
+        let path = path.as_ref();
+        open_c(path, O_RDONLY, 0x1b6)
     }
 
-    // Opens path for writing: made if it is not there, emptied if it is.
-    pub fn create(path: [u8]) -> Result<File> {
-        let fd = os(sys_open(path, SYS_O_WRONLY | SYS_O_CREAT | SYS_O_TRUNC | SYS_O_CLOEXEC,
-            0x1b6))?;
-        Ok(File { fd: fd })
+    // Opens path for writing: made when it is not there, emptied when it is.
+    #[effects(io, static, panic, diverge)]
+    pub fn create<P: AsRef<str>>(path: P) -> Result<File> {
+        let path = path.as_ref();
+        open_c(path, O_WRONLY | crate::__sys::O_CREAT | crate::__sys::O_TRUNC, 0x1b6)
     }
 
-    // Makes path and opens it for writing: AlreadyExists when it is there.
-    pub fn create_new(path: [u8]) -> Result<File> {
-        let fd = os(sys_open(path, SYS_O_WRONLY | SYS_O_CREAT | SYS_O_EXCL | SYS_O_CLOEXEC,
-            0x1b6))?;
-        Ok(File { fd: fd })
+    // Makes path and opens it for reading and writing: AlreadyExists when
+    // it is there.
+    #[effects(io, static, panic, diverge)]
+    pub fn create_new<P: AsRef<str>>(path: P) -> Result<File> {
+        let path = path.as_ref();
+        open_c(path, O_RDWR | crate::__sys::O_CREAT | crate::__sys::O_EXCL, 0x1b6)
     }
 
-    // The options to open a file with: `OpenOptions::new().append(true)`.
+    // The options to open a file with: `File::options().append(true)`.
+    #[effects()]
     pub fn options() -> OpenOptions {
         OpenOptions::new()
     }
 
     // Its file descriptor.
-    pub fn as_raw_fd(self) -> i32 {
+    // std2: changed: File's own (Rust's: std::os::fd::AsRawFd)
+    #[effects()]
+    pub fn as_raw_fd(&self) -> i32 {
         self.fd
     }
 
-    pub fn metadata(self) -> Result<Metadata> {
-        let st = os(sys_fstat(self.fd))?;
-        Ok(Metadata { st: st })
+    #[effects(io, static, unsafe)]
+    pub fn metadata(&self) -> Result<Metadata> {
+        let mut b = StatBuf { words: [0u64; 20] };
+        // UNSAFE: C's fstat. SAFETY: b.words as in stat_at.
+        cvt(unsafe { fs_c_fstat(self.fd, &mut b.words[0] as *mut u64) })?;
+        crate::result::Result::Ok(metadata_of(&b))
     }
 
-    // Its length becomes n (cut, or zeros after).
-    pub fn set_len(self, n: i64) -> Result<()> {
-        os(sys_ftruncate(self.fd, n))
+    // Its length becomes size (cut, or zeros after).
+    // std2: changed: u64 (MVS: i64)
+    #[effects(io, static, unsafe)]
+    pub fn set_len(&self, size: u64) -> Result<()> {
+        if size > i64::MAX as u64 {
+            return crate::result::Result::Err(Error::from_raw_os_error(EINVAL));
+        }
+        // UNSAFE: C's ftruncate. SAFETY: integers only.
+        cvt(unsafe { fs_c_ftruncate(self.fd, size as i64) })
     }
 
-    // Writes what the system holds of it to the disk.
-    pub fn sync_all(self) -> Result<()> {
-        os(sys_fsync(self.fd))
-    }
-
-    // Moves the position: to `off` from the start (Rust's
-    // `seek(SeekFrom::Start(off))`); the new position.
-    pub fn seek(inout self, pos: SeekFrom) -> Result<i64> {
-        let r = match pos {
-            SeekFrom::Start(o) => sys_lseek(self.fd, o, SYS_SEEK_SET),
-            SeekFrom::End(o) => sys_lseek(self.fd, o, SYS_SEEK_END),
-            SeekFrom::Current(o) => sys_lseek(self.fd, o, SYS_SEEK_CUR),
-        };
-        os(r)
+    // What the system holds of it, written to the disk.
+    #[effects(io, static, unsafe)]
+    pub fn sync_all(&self) -> Result<()> {
+        // UNSAFE: C's fsync. SAFETY: an int only.
+        cvt(unsafe { fs_c_fsync(self.fd) })
     }
 }
 
-// Where File::seek moves to.
-#[derive(Eq, Debug, Clone)]
-pub enum SeekFrom { Start(i64), End(i64), Current(i64) }
+// `File { fd: 3 }`.
+// std2: changed: the descriptor only (Rust's adds the path and the mode)
+impl crate::fmt::Debug for File {
+    fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
+        f.debug_struct("File").field("fd", &self.fd).finish()
+    }
+}
 
 impl Read for File {
-    fn read(inout self, buf: inout [u8]) -> Result<i64> {
-        os(sys_read(self.fd, buf))
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        crate::io::sys_read(self.fd, buf)
     }
 }
 
 impl Write for File {
-    fn write(inout self, buf: [u8]) -> Result<i64> {
-        os(sys_write(self.fd, buf))
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        crate::io::sys_write(self.fd, buf)
     }
 
-    fn flush(inout self) -> Result<()> {
-        Ok(())
+    fn flush(&mut self) -> Result<()> {
+        crate::result::Result::Ok(())
     }
 }
 
-// How File::open... opens a file (Rust's OpenOptions):
+// A shared File reads and writes too (the OS keeps its position).
+impl Read for &File {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        crate::io::sys_read((*self).fd, buf)
+    }
+}
+
+impl Write for &File {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        crate::io::sys_write((*self).fd, buf)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        crate::result::Result::Ok(())
+    }
+}
+
+// mvs: File::seek
+impl Seek for File {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        let (off, whence) = match pos {
+            SeekFrom::Start(o) => {
+                if o > i64::MAX as u64 {
+                    return crate::result::Result::Err(Error::from_raw_os_error(EINVAL));
+                }
+                (o as i64, 0)
+            }
+            SeekFrom::Current(o) => (o, 1),
+            SeekFrom::End(o) => (o, 2),
+        };
+        // UNSAFE: C's lseek. SAFETY: integers only.
+        let r = unsafe { fs_c_lseek(self.fd, off, whence) };
+        if r < 0 {
+            return crate::result::Result::Err(Error::last_os_error());
+        }
+        crate::result::Result::Ok(r as u64)
+    }
+}
+
+// How File::open opens a file, Rust's builder:
 // `OpenOptions::new().append(true).create(true).open(p)?`.
-#[derive(Eq, Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct OpenOptions {
-    read: bool, write: bool, append: bool, truncate: bool, create: bool, create_new: bool,
-    mode: i32,
+    read: bool,
+    write: bool,
+    append: bool,
+    truncate: bool,
+    create: bool,
+    create_new: bool,
+    mode: u32,
 }
 
 impl OpenOptions {
+    // Every option off (open fails until read, write or append is on).
+    #[effects()]
     pub fn new() -> OpenOptions {
         OpenOptions { read: false, write: false, append: false, truncate: false, create: false,
             create_new: false, mode: 0x1b6 }
     }
 
-    pub fn read(self, on: bool) -> OpenOptions {
-        var o = self;
-        o.read = on;
-        o
+    // std2: changed: &mut self, as Rust's (MVS: by value)
+    #[effects()]
+    pub fn read(&mut self, read: bool) -> &mut OpenOptions {
+        self.read = read;
+        self
     }
 
-    pub fn write(self, on: bool) -> OpenOptions {
-        var o = self;
-        o.write = on;
-        o
+    // std2: changed: &mut self, as Rust's (MVS: by value)
+    #[effects()]
+    pub fn write(&mut self, write: bool) -> &mut OpenOptions {
+        self.write = write;
+        self
     }
 
-    pub fn append(self, on: bool) -> OpenOptions {
-        var o = self;
-        o.append = on;
-        o
+    // Writes go to the end (write is implied).
+    // std2: changed: &mut self, as Rust's (MVS: by value)
+    #[effects()]
+    pub fn append(&mut self, append: bool) -> &mut OpenOptions {
+        self.append = append;
+        self
     }
 
-    pub fn truncate(self, on: bool) -> OpenOptions {
-        var o = self;
-        o.truncate = on;
-        o
+    // std2: changed: &mut self, as Rust's (MVS: by value)
+    #[effects()]
+    pub fn truncate(&mut self, truncate: bool) -> &mut OpenOptions {
+        self.truncate = truncate;
+        self
     }
 
-    pub fn create(self, on: bool) -> OpenOptions {
-        var o = self;
-        o.create = on;
-        o
+    // std2: changed: &mut self, as Rust's (MVS: by value)
+    #[effects()]
+    pub fn create(&mut self, create: bool) -> &mut OpenOptions {
+        self.create = create;
+        self
     }
 
-    pub fn create_new(self, on: bool) -> OpenOptions {
-        var o = self;
-        o.create_new = on;
-        o
+    // std2: changed: &mut self, as Rust's (MVS: by value)
+    #[effects()]
+    pub fn create_new(&mut self, create_new: bool) -> &mut OpenOptions {
+        self.create_new = create_new;
+        self
     }
 
     // The permission bits a file it makes gets (0x1b6 before the umask).
-    pub fn mode(self, bits: i32) -> OpenOptions {
-        var o = self;
-        o.mode = bits;
-        o
+    // std2: changed: OpenOptions' own, a u32 (Rust's:
+    // std::os::unix::fs::OpenOptionsExt)
+    #[effects()]
+    pub fn mode(&mut self, mode: u32) -> &mut OpenOptions {
+        self.mode = mode;
+        self
     }
 
-    pub fn open(self, path: [u8]) -> Result<File> {
-        let writes = self.write || self.append;
-        var flags = if self.read && writes { SYS_O_RDWR } else if writes { SYS_O_WRONLY }
-            else { SYS_O_RDONLY };
-        if self.append {
-            flags |= SYS_O_APPEND;
+    // Opens path with these options: InvalidInput (EINVAL) for none of
+    // read, write and append, or a create or truncate without a write, as
+    // Rust's.
+    #[effects(io, static, panic, diverge)]
+    pub fn open<P: AsRef<str>>(&self, path: P) -> Result<File> {
+        let path = path.as_ref();
+        let access = if self.append {
+            (if self.read { O_RDWR } else { O_WRONLY }) | crate::__sys::O_APPEND
+        } else if self.read && self.write {
+            O_RDWR
+        } else if self.write {
+            O_WRONLY
+        } else if self.read {
+            O_RDONLY
+        } else {
+            return crate::result::Result::Err(Error::from_raw_os_error(EINVAL));
+        };
+        if !self.write && !self.append && (self.truncate || self.create || self.create_new) {
+            return crate::result::Result::Err(Error::from_raw_os_error(EINVAL));
         }
-        if self.truncate {
-            flags |= SYS_O_TRUNC;
+        if self.append && self.truncate && !self.create_new {
+            return crate::result::Result::Err(Error::from_raw_os_error(EINVAL));
         }
-        if self.create_new {
-            flags |= SYS_O_CREAT | SYS_O_EXCL;
-        } else if self.create {
-            flags |= SYS_O_CREAT;
-        }
-        let fd = os(sys_open(path, flags | SYS_O_CLOEXEC, self.mode))?;
-        Ok(File { fd: fd })
+        let creation = if self.create_new {
+            crate::__sys::O_CREAT | crate::__sys::O_EXCL
+        } else {
+            (if self.create { crate::__sys::O_CREAT } else { 0 })
+                | (if self.truncate { crate::__sys::O_TRUNC } else { 0 })
+        };
+        open_c(path, access | creation, self.mode)
     }
 }
 
 // What stat says of a file.
-#[derive(Eq, Debug)]
-pub struct Metadata { st: FileStat }
+#[derive(Clone)]
+pub struct Metadata {
+    mode: u32,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
 
 impl Metadata {
     // The size in bytes.
-    pub fn len(self) -> u64 {
-        self.st.size as u64
+    #[effects()]
+    pub fn len(&self) -> u64 {
+        self.size
     }
 
-    pub fn is_dir(self) -> bool {
-        self.st.is_dir()
+    #[effects()]
+    pub fn file_type(&self) -> FileType {
+        FileType { fmt: self.mode & S_IFMT }
     }
 
-    pub fn is_file(self) -> bool {
-        self.st.is_file()
+    #[effects()]
+    pub fn is_dir(&self) -> bool {
+        self.mode & S_IFMT == S_IFDIR
     }
 
-    pub fn is_symlink(self) -> bool {
-        self.st.is_symlink()
+    #[effects()]
+    pub fn is_file(&self) -> bool {
+        self.mode & S_IFMT == S_IFREG
     }
 
-    // The permission bits (0x1ed: 0o755, ...).
-    pub fn mode(self) -> u32 {
-        self.st.permissions()
+    #[effects()]
+    pub fn is_symlink(&self) -> bool {
+        self.mode & S_IFMT == S_IFLNK
     }
 
-    // When it was last changed: since the Unix epoch.
-    pub fn modified(self) -> std::time::Duration {
-        std::time::Duration::new(self.st.mtime_sec as u64, self.st.mtime_nsec as u32)
+    #[effects()]
+    pub fn permissions(&self) -> Permissions {
+        Permissions { mode: self.mode }
     }
-}
 
-// ---- Whole files (0.20) ----
-
-// The bytes of the file at path, in a new Vec on allocator a.
-pub fn read_in<A: Allocator>(path: [u8], a: sink A) -> Result<Vec<u8, A>> {
-    var f = File::open(path)?;
-    let size = match f.metadata() {
-        Ok(m) => m.len() as i64,
-        Err(_) => 0,
-    };
-    var v: Vec<u8, A> = Vec::with_capacity_in(size as usize + 1, a);
-    f.read_to_end(&v)?;
-    Ok(v)
-}
-
-// The text of the file at path, in a new String on allocator a
-// (InvalidData when it is not UTF-8).
-pub fn read_to_string_in<A: Allocator>(path: [u8], a: sink A) -> Result<String<A>> {
-    let v = read_in(path, a)?;
-    match String::from_utf8(v) {
-        Ok(s) => Ok(s),
-        Err(_) => Err(__io_error(ErrorKind::InvalidData, "stream did not contain valid UTF-8")),
-    }
-}
-
-// The file at path holds data: made, or emptied first.
-pub fn write(path: [u8], data: [u8]) -> Result<()> {
-    var f = File::create(path)?;
-    f.write_all(data)
-}
-
-// data at the end of the file at path (made when it is not there).
-pub fn append(path: [u8], data: [u8]) -> Result<()> {
-    var f = OpenOptions::new().append(true).create(true).open(path)?;
-    f.write_all(data)
-}
-
-// Copies the file at `from` to `to` (made, or emptied): the bytes copied.
-pub fn copy(from: [u8], to: [u8]) -> Result<i64> {
-    var src = File::open(from)?;
-    var dst = File::create(to)?;
-    var buf: [u8; 65536] = [0; 65536];
-    var total = 0;
-    loop {
-        let n = src.read(&buf[..])?;
-        if n == 0 {
-            return Ok(total);
+    // When it was last written (UNIX_EPOCH for a time before it).
+    // mvs: Metadata::modified
+    // std2: changed: an io::Result<SystemTime>, as Rust's (MVS: a
+    // Duration since the epoch)
+    #[effects(panic)]
+    pub fn modified(&self) -> Result<SystemTime> {
+        let epoch = crate::time::UNIX_EPOCH;
+        if self.mtime < 0 {
+            return crate::result::Result::Ok(epoch);
         }
-        dst.write_all(buf[..n])?;
-        total += n;
+        let d = crate::time::Duration::new(self.mtime as u64, self.mtime_nsec as u32);
+        match epoch.checked_add(d) {
+            Option::Some(t) => crate::result::Result::Ok(t),
+            Option::None => crate::result::Result::Ok(epoch),
+        }
     }
 }
 
-// What stat says of the file at path (through a symlink).
-pub fn metadata(path: [u8]) -> Result<Metadata> {
-    let st = os(sys_stat(path))?;
-    Ok(Metadata { st: st })
-}
-
-// As metadata, of a symlink itself.
-pub fn symlink_metadata(path: [u8]) -> Result<Metadata> {
-    let st = os(sys_lstat(path))?;
-    Ok(Metadata { st: st })
-}
-
-// Whether something is at path.
-pub fn exists(path: [u8]) -> bool {
-    match sys_stat(path) {
-        Ok(_) => true,
-        Err(_) => false,
+// `Metadata { file_type: .., len: 6, .. }`.
+// std2: changed: the kind and the length (Rust's adds the permissions and
+// the times)
+impl crate::fmt::Debug for Metadata {
+    fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
+        f.debug_struct("Metadata").field("file_type", &self.file_type()).field("len", &self.size)
+            .finish_non_exhaustive()
     }
 }
 
-pub fn remove_file(path: [u8]) -> Result<()> {
-    os(sys_unlink(path))
+// A file's kind: a directory, a file, a symbolic link (or another).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileType {
+    fmt: u32,
 }
 
-// Removes the empty directory at path.
-pub fn remove_dir(path: [u8]) -> Result<()> {
-    os(sys_rmdir(path))
-}
-
-pub fn rename(from: [u8], to: [u8]) -> Result<()> {
-    os(sys_rename(from, to))
-}
-
-pub fn create_dir(path: [u8]) -> Result<()> {
-    os(sys_mkdir(path, 0x1ff))
-}
-
-// Makes the directory at path and the ones above it that are missing
-// (Ok when it is there).
-pub fn create_dir_all(path: [u8]) -> Result<()> {
-    if path.len as i64 == 0 {
-        return Ok(());
+impl FileType {
+    #[effects()]
+    pub fn is_dir(&self) -> bool {
+        self.fmt == S_IFDIR
     }
-    match sys_mkdir(path, 0x1ff) {
-        Ok(_) => return Ok(()),
-        Err(e) => {
-            if e == SYS_EEXIST {
-                return if is_dir_at(path) { Ok(()) } else { Err(__os_error(e)) };
+
+    #[effects()]
+    pub fn is_file(&self) -> bool {
+        self.fmt == S_IFREG
+    }
+
+    #[effects()]
+    pub fn is_symlink(&self) -> bool {
+        self.fmt == S_IFLNK
+    }
+}
+
+// `FileType { is_file: true, is_dir: false, is_symlink: false, .. }`, as
+// Rust's.
+impl crate::fmt::Debug for FileType {
+    fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
+        f.debug_struct("FileType").field("is_file", &self.is_file()).field("is_dir", &self.is_dir())
+            .field("is_symlink", &self.is_symlink()).finish_non_exhaustive()
+    }
+}
+
+// A file's permission bits.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Permissions {
+    mode: u32,
+}
+
+impl Permissions {
+    // Whether no one may write it.
+    #[effects()]
+    pub fn readonly(&self) -> bool {
+        self.mode & 0x92 == 0
+    }
+
+    // st_mode: the kind's bits and the permission bits (0x81a4, 0o100644).
+    // mvs: Metadata::mode
+    // std2: changed: Permissions' own, st_mode as Rust's (Rust's:
+    // std::os::unix::fs::PermissionsExt; MVS: Metadata's, the low 12 bits)
+    #[effects()]
+    pub fn mode(&self) -> u32 {
+        self.mode
+    }
+}
+
+// ---- Whole files ----
+
+// The bytes of the file at path, in a new Vec on a.
+// std2: changed: an allocator; the path an AsRef<str> (Rust's
+// fs::read)
+#[effects(io, static, panic, diverge, P, A)]
+pub fn read_in<P: AsRef<str>, A: Allocator>(path: P, a: A) -> Result<Vec<u8, A>> {
+    let path = path.as_ref();
+    let mut f = File::open(path)?;
+    let size = match f.metadata() {
+        crate::result::Result::Ok(m) => m.len() as usize,
+        crate::result::Result::Err(_) => 0,
+    };
+    let mut v: Vec<u8, A> = Vec::with_capacity_in(size, a);
+    f.read_to_end(&mut v)?;
+    crate::result::Result::Ok(v)
+}
+
+// The text of the file at path, in a new String on a (InvalidData when it
+// is not UTF-8).
+// std2: changed: an allocator; the path an AsRef<str> (Rust's
+// fs::read_to_string)
+#[effects(io, static, panic, diverge, P, A)]
+pub fn read_to_string_in<P: AsRef<str>, A: Allocator>(path: P, a: A) -> Result<String<A>> {
+    let path = path.as_ref();
+    let mut f = File::open(path)?;
+    let mut s = String::new_in(a);
+    f.read_to_string(&mut s)?;
+    crate::result::Result::Ok(s)
+}
+
+// The file at path holds contents: made, or emptied first.
+// std2: changed: the path an AsRef<str> (Rust: AsRef<Path>)
+#[effects(io, static, panic, diverge, P, C)]
+pub fn write<P: AsRef<str>, C: AsRef<[u8]>>(path: P, contents: C) -> Result<()> {
+    let path = path.as_ref();
+    let mut f = File::create(path)?;
+    // (the path call: `contents.as_ref()` where a &[u8] is expected picks
+    // a wrong instance of AsRef for &T, 0.27.5's front gap)
+    f.write_all(AsRef::<[u8]>::as_ref(&contents))
+}
+
+// Copies the file at from to to (made, or emptied), its permission bits
+// too: the bytes copied.
+// std2: changed: the paths AsRef<str> (Rust: AsRef<Path>); a u64 (MVS: i64)
+#[effects(io, static, panic, diverge, unsafe, P, Q)]
+pub fn copy<P: AsRef<str>, Q: AsRef<str>>(from: P, to: Q) -> Result<u64> {
+    let from = from.as_ref();
+    let to = to.as_ref();
+    let mut src = File::open(from)?;
+    let m = src.metadata()?;
+    if !m.is_file() {
+        return crate::result::Result::Err(Error::new(ErrorKind::InvalidInput,
+            "the source path is neither a regular file nor a symlink to a regular file"));
+    }
+    let mut dst = open_c(to, O_WRONLY | crate::__sys::O_CREAT | crate::__sys::O_TRUNC,
+        m.mode & 0xfff)?;
+    // UNSAFE: C's fchmod. SAFETY: integers only.
+    cvt(unsafe { fs_c_fchmod(dst.fd, m.mode & 0xfff) })?;
+    let mut buf = [0u8; 65536];
+    let mut total: u64 = 0;
+    loop {
+        let n = match src.read(&mut buf) {
+            crate::result::Result::Ok(0) => return crate::result::Result::Ok(total),
+            crate::result::Result::Ok(n) => n,
+            crate::result::Result::Err(e) => {
+                if e.kind() == ErrorKind::Interrupted {
+                    continue;
+                }
+                return crate::result::Result::Err(e);
+            }
+        };
+        dst.write_all(&buf[..n])?;
+        total += n as u64;
+    }
+}
+
+// What stat says of the file at path (through a symbolic link).
+// std2: changed: the path an AsRef<str> (Rust: AsRef<Path>)
+#[effects(io, static, panic, diverge)]
+pub fn metadata<P: AsRef<str>>(path: P) -> Result<Metadata> {
+    let path = path.as_ref();
+    stat_at(path, true)
+}
+
+// As metadata, of a symbolic link itself.
+// std2: changed: the path an AsRef<str> (Rust: AsRef<Path>)
+#[effects(io, static, panic, diverge)]
+pub fn symlink_metadata<P: AsRef<str>>(path: P) -> Result<Metadata> {
+    let path = path.as_ref();
+    stat_at(path, false)
+}
+
+// Whether something is at path (through a symbolic link): Ok(false) when
+// nothing is, an error when the OS cannot say (Rust's fs::exists).
+// std2: changed: an io::Result<bool>, as Rust's (MVS: a bool); the path an
+// AsRef<str> (Rust: AsRef<Path>)
+#[effects(io, static, panic, diverge)]
+pub fn exists<P: AsRef<str>>(path: P) -> Result<bool> {
+    let path = path.as_ref();
+    match stat_at(path, true) {
+        crate::result::Result::Ok(_) => crate::result::Result::Ok(true),
+        crate::result::Result::Err(e) => {
+            if e.kind() == ErrorKind::NotFound {
+                crate::result::Result::Ok(false)
+            } else {
+                crate::result::Result::Err(e)
             }
         }
     }
-    // (the parents first, then this one)
-    var end = path.len as i64;
-    while end > 0 && path[end - 1] == '/' {
+}
+
+// std2: changed: the path an AsRef<str> (Rust: AsRef<Path>)
+#[effects(io, static, panic, diverge, unsafe)]
+pub fn remove_file<P: AsRef<str>>(path: P) -> Result<()> {
+    let path = path.as_ref();
+    let p = cpath(path)?;
+    // UNSAFE: C's unlink. SAFETY: p is NUL-ended.
+    cvt(unsafe { fs_c_unlink(p.ptr()) })
+}
+
+// Removes the empty directory at path.
+// std2: changed: the path an AsRef<str> (Rust: AsRef<Path>)
+#[effects(io, static, panic, diverge, unsafe)]
+pub fn remove_dir<P: AsRef<str>>(path: P) -> Result<()> {
+    let path = path.as_ref();
+    let p = cpath(path)?;
+    // UNSAFE: C's rmdir. SAFETY: p is NUL-ended.
+    cvt(unsafe { fs_c_rmdir(p.ptr()) })
+}
+
+// std2: changed: the paths AsRef<str> (Rust: AsRef<Path>)
+#[effects(io, static, panic, diverge, unsafe)]
+pub fn rename<P: AsRef<str>, Q: AsRef<str>>(from: P, to: Q) -> Result<()> {
+    let from = from.as_ref();
+    let to = to.as_ref();
+    let a = cpath(from)?;
+    let b = cpath(to)?;
+    // UNSAFE: C's rename. SAFETY: a and b are NUL-ended.
+    cvt(unsafe { fs_c_rename(a.ptr(), b.ptr()) })
+}
+
+// std2: changed: the path an AsRef<str> (Rust: AsRef<Path>)
+#[effects(io, static, panic, diverge, unsafe)]
+pub fn create_dir<P: AsRef<str>>(path: P) -> Result<()> {
+    let path = path.as_ref();
+    let p = cpath(path)?;
+    // UNSAFE: C's mkdir. SAFETY: p is NUL-ended.
+    cvt(unsafe { fs_c_mkdir(p.ptr(), 0x1ff) })
+}
+
+// Whether path is a directory (through a symbolic link).
+fn is_dir_at(path: &str) -> bool {
+    match stat_at(path, true) {
+        crate::result::Result::Ok(m) => m.is_dir(),
+        crate::result::Result::Err(_) => false,
+    }
+}
+
+// path's parent as Rust's Path::parent has it: "" for a relative name,
+// None for the root (or "").
+fn parent_of(path: &str) -> Option<&str> {
+    let b = path.as_bytes();
+    let mut end = b.len();
+    while end > 0 && b[end - 1] == 47 {
         end -= 1;
     }
-    var k = end;
-    while k > 0 && path[k - 1] != '/' {
+    if end == 0 {
+        return Option::None;
+    }
+    while end > 0 && b[end - 1] != 47 {
+        end -= 1;
+    }
+    if end == 0 {
+        return Option::Some(&path[..0]);
+    }
+    let mut k = end;
+    while k > 0 && b[k - 1] == 47 {
         k -= 1;
     }
-    if k > 1 {
-        create_dir_all(path[..k - 1])?;
+    if k == 0 { Option::Some(&path[..1]) } else { Option::Some(&path[..k]) }
+}
+
+// Makes the directory at path and those above it that are missing: Ok
+// when it is there (Rust's, step for step).
+// std2: changed: the path an AsRef<str> (Rust: AsRef<Path>)
+#[effects(alloc(extern), io, static, panic, diverge, P)]
+pub fn create_dir_all<P: AsRef<str>>(path: P) -> Result<()> {
+    let path = path.as_ref();
+    if path.is_empty() {
+        return crate::result::Result::Ok(());
     }
-    match sys_mkdir(path, 0x1ff) {
-        Ok(_) => Ok(()),
-        Err(e) => if e == SYS_EEXIST && is_dir_at(path) { Ok(()) } else { Err(__os_error(e)) },
+    match create_dir(path) {
+        crate::result::Result::Ok(()) => return crate::result::Result::Ok(()),
+        crate::result::Result::Err(e) => {
+            if e.kind() != ErrorKind::NotFound {
+                return if is_dir_at(path) {
+                    crate::result::Result::Ok(())
+                } else {
+                    crate::result::Result::Err(e)
+                };
+            }
+        }
+    }
+    match parent_of(path) {
+        Option::Some(p) => create_dir_all(p)?,
+        Option::None => {
+            return crate::result::Result::Err(Error::other("failed to create whole tree"));
+        }
+    }
+    match create_dir(path) {
+        crate::result::Result::Ok(()) => crate::result::Result::Ok(()),
+        crate::result::Result::Err(e) => {
+            if is_dir_at(path) {
+                crate::result::Result::Ok(())
+            } else {
+                crate::result::Result::Err(e)
+            }
+        }
     }
 }
 
-fn is_dir_at(path: [u8]) -> bool {
-    match sys_stat(path) {
-        Ok(st) => st.is_dir(),
-        Err(_) => false,
+// Removes the directory at path and all it holds; a symbolic link is
+// removed, not followed.
+// std2: changed: the path an AsRef<str> (Rust: AsRef<Path>)
+#[effects(io, static, panic, diverge, P)]
+pub fn remove_dir_all<P: AsRef<str>>(path: P) -> Result<()> {
+    let path = path.as_ref();
+    let m = symlink_metadata(path)?;
+    if m.is_symlink() {
+        return remove_file(path);
     }
+    if !m.is_dir() {
+        return crate::result::Result::Err(Error::from_raw_os_error(20));
+    }
+    remove_tree(path)
 }
 
-// Removes the directory at path and all it holds (symlinks are removed,
-// not followed).
-pub fn remove_dir_all(path: [u8]) -> Result<()> {
-    var stack: [u8; 4096] = [0; 4096];
-    if path.len as i64 >= 4096 {
-        return Err(__io_error(ErrorKind::InvalidInput, "path too long"));
-    }
-    for i in 0..path.len as i64 {
-        stack[i] = path[i];
-    }
-    remove_tree(&stack, path.len as i64)
-}
-
-// Removes the tree at buf[..n], which it extends with each entry's name.
-fn remove_tree(buf: inout [u8; 4096], n: i64) -> Result<()> {
-    let st = os(sys_lstat(buf[..n]))?;
-    if !st.is_dir() {
-        return os(sys_unlink(buf[..n]));
-    }
-    var dir = read_dir(buf[..n])?;
+// Removes the directory at path and everything under it.
+fn remove_tree(path: &str) -> Result<()> {
+    let mut dir = read_dir(path)?;
     loop {
         let e = match dir.next() {
             Option::Some(r) => r?,
             Option::None => break,
         };
-        let name = e.name[..e.len];
-        if n + 1 + name.len as i64 >= 4096 {
-            return Err(__io_error(ErrorKind::InvalidInput, "path too long"));
+        if e.file_type()?.is_dir() {
+            remove_tree(e.path())?;
+        } else {
+            remove_file(e.path())?;
         }
-        buf[n] = '/';
-        for i in 0..name.len as i64 {
-            buf[n + 1 + i] = name[i];
-        }
-        remove_tree(&buf, n + 1 + name.len as i64)?;
     }
-    os(sys_rmdir(buf[..n]))
+    remove_dir(path)
 }
 
-// ---- Directories (0.20) ----
+// ---- Directories ----
 
 // The entries of the directory at path ("." and ".." left out), in the
 // order the file system gives them.
-pub fn read_dir(path: [u8]) -> Result<ReadDir> {
-    let d = os(sys_opendir(path))?;
-    Ok(ReadDir { dir: d })
+// std2: changed: the path an AsRef<str> (Rust: AsRef<Path>)
+#[effects(io, static, panic, diverge, unsafe)]
+pub fn read_dir<P: AsRef<str>>(path: P) -> Result<ReadDir> {
+    let path = path.as_ref();
+    let p = cpath(path)?;
+    // UNSAFE: C's opendir. SAFETY: p is NUL-ended.
+    let d = unsafe { fs_c_opendir(p.ptr()) };
+    if d.is_null() {
+        return crate::result::Result::Err(Error::last_os_error());
+    }
+    let mut root = [0u8; crate::__sys::PATH_MAX];
+    let b = path.as_bytes();
+    let mut i: usize = 0;
+    while i < b.len() {
+        root[i] = b[i];
+        i += 1;
+    }
+    crate::result::Result::Ok(ReadDir { dir: d, root: root, root_len: b.len() })
 }
 
 // `fs::read_dir(p)?`: each item an io::Result<DirEntry>. Dropping it
 // closes the directory.
-pub struct ReadDir { dir: SysDir }
+pub struct ReadDir {
+    dir: *mut u8,
+    root: [u8; crate::__sys::PATH_MAX],
+    root_len: usize,
+}
 
 impl Drop for ReadDir {
-    fn drop(inout self) {
-        let _ = sys_closedir(&self.dir);
+    fn drop(&mut self) {
+        // UNSAFE: C's closedir. SAFETY: dir is the DIR * opendir returned,
+        // non-null (read_dir checks), closed once (here).
+        let _ = unsafe { fs_c_closedir(self.dir) };
     }
 }
 
 impl Iterator for ReadDir {
     type Item = Result<DirEntry>;
 
-    fn next(inout self) -> Option<Result<DirEntry>> {
+    fn next(&mut self) -> Option<Result<DirEntry>> {
         loop {
-            var e = DirEntry { name: [0; 256], len: 0, kind: 0 };
-            match sys_readdir_into(&self.dir, &e.name) {
-                Ok(Option::Some(x)) => {
-                    e.len = x.name_len;
-                    e.kind = x.kind;
-                    let nm = e.name[..e.len];
-                    if nm == "." || nm == ".." {
-                        continue;
+            let mut e = DirEntry {
+                path: [0u8; crate::__sys::PATH_MAX], len: 0, name_at: 0, kind: 0,
+            };
+            // UNSAFE: errno cleared, then C's readdir on the DIR *, and its
+            // struct dirent read through the pointer readdir returns.
+            // SAFETY: errno_location is this thread's errno; dir is open
+            // (Drop closes it, after the last next); a non-null entry is a
+            // struct dirent of this system (its d_type and d_name at the
+            // offsets std::__sys gives), valid until the next readdir of
+            // dir, and d_name is NUL-ended within it: its bytes are copied
+            // out before this returns.
+            let ok = unsafe {
+                *crate::__sys::errno_location() = 0;
+                let d = fs_c_readdir(self.dir);
+                if d.is_null() {
+                    let err = *crate::__sys::errno_location();
+                    if err == 0 {
+                        return Option::None;
                     }
-                    return Option::Some(Ok(e));
+                    return Option::Some(crate::result::Result::Err(Error::from_raw_os_error(err)));
                 }
-                Ok(Option::None) => return Option::None,
-                Err(err) => return Option::Some(Err(__os_error(err))),
+                e.kind = *d.add(crate::__sys::DIRENT_TYPE);
+                let name = d.add(crate::__sys::DIRENT_NAME);
+                let mut n: usize = 0;
+                while *name.add(n) != 0 {
+                    n += 1;
+                }
+                let nm = crate::slice::from_raw_parts(name, n);
+                if nm == b"." || nm == b".." {
+                    continue;
+                }
+                e.fill(&self.root[..self.root_len], nm)
+            };
+            if !ok {
+                return Option::Some(crate::result::Result::Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "a directory entry's name is not UTF-8 or the path is too long")));
             }
+            return Option::Some(crate::result::Result::Ok(e));
         }
     }
 }
 
-// A directory's entry: its name (inline, up to 256 bytes) and kind.
-pub struct DirEntry { name: [u8; 256], len: i64, kind: u8 }
+// A directory's entry: its path (the directory's, then its name), kept
+// inline, and its kind as the directory says it.
+pub struct DirEntry {
+    path: [u8; crate::__sys::PATH_MAX],
+    len: usize,
+    name_at: usize,
+    kind: u8,
+}
 
 impl DirEntry {
-    // Its name, a view of the entry.
-    // (0.24: self is a borrow, as its result views it: conv::let_by_ref)
-    pub fn file_name(self) -> Path {
-        self.name[..self.len] as Path
+    // root, a "/" unless root ends with one, and name: false when it does
+    // not fit or is not UTF-8.
+    fn fill(&mut self, root: &[u8], name: &[u8]) -> bool {
+        let slash: usize = if root.is_empty() || root[root.len() - 1] == 47 { 0 } else { 1 };
+        if root.len() + slash + name.len() > self.path.len()
+            || crate::str::from_utf8(name).is_err()
+            {
+            return false;
+        }
+        self.path[..root.len()].copy_from_slice(root);
+        if slash == 1 {
+            self.path[root.len()] = 47;
+        }
+        self.name_at = root.len() + slash;
+        self.len = self.name_at + name.len();
+        self.path[self.name_at..self.len].copy_from_slice(name);
+        true
     }
 
-    // dir's path with the name after it, on allocator a.
-    pub fn path_in<A: Allocator>(self, dir: [u8], a: sink A) -> PathBuf<A> {
-        var p: PathBuf<A> = PathBuf::from_in(dir, a);
-        p.push(self.name[..self.len]);
-        p
+    fn text(&self, from: usize) -> &str {
+        let b = match self.path.get(from..self.len) {
+            Option::Some(b) => b,
+            Option::None => return "",
+        };
+        match crate::str::from_utf8(b) {
+            crate::result::Result::Ok(s) => s,
+            crate::result::Result::Err(_) => "",
+        }
     }
 
-    // Whether the file system says it is a directory (false when it does
-    // not say: fs::metadata knows).
-    pub fn is_dir(self) -> bool {
-        self.kind == SYS_DT_DIR
+    // The directory's path joined with the entry's name.
+    // mvs: DirEntry::path_in
+    // std2: changed: a &str, a view of the entry (Rust's: a PathBuf; MVS:
+    // a PathBuf on an allocator; path_in could make one on an allocator)
+    #[effects(panic, diverge)]
+    pub fn path(&self) -> &str {
+        self.text(0)
     }
 
-    pub fn is_file(self) -> bool {
-        self.kind == SYS_DT_REG
+    // Its name.
+    // std2: changed: a &str, a view of the entry, until std::ffi (Rust's:
+    // an OsString; a name that is not UTF-8 is read_dir's InvalidData)
+    #[effects(panic, diverge)]
+    pub fn file_name(&self) -> &str {
+        self.text(self.name_at)
     }
 
-    pub fn is_symlink(self) -> bool {
-        self.kind == SYS_DT_LNK
+    // What lstat says of it.
+    #[effects(io, static, panic, diverge)]
+    pub fn metadata(&self) -> Result<Metadata> {
+        stat_at(self.path(), false)
+    }
+
+    // Its kind as the directory says it (lstat's when the file system does
+    // not say).
+    #[effects(io, static, panic, diverge)]
+    pub fn file_type(&self) -> Result<FileType> {
+        if self.kind == DT_DIR {
+            crate::result::Result::Ok(FileType { fmt: S_IFDIR })
+        } else if self.kind == DT_REG {
+            crate::result::Result::Ok(FileType { fmt: S_IFREG })
+        } else if self.kind == DT_LNK {
+            crate::result::Result::Ok(FileType { fmt: S_IFLNK })
+        } else {
+            crate::result::Result::Ok(self.metadata()?.file_type())
+        }
     }
 }

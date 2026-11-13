@@ -16,6 +16,10 @@ alternatives, `"..."` is a literal token.
 whitespace   = " " | "\t" | "\r" | "\n" ;
 comment      = "//" { any - "\n" }
              | "/*" { any | comment } "*/" ;          (* block comments nest *)
+                                                       (* (0.28.0) `// EDITION: rust`, the line 0.27 read as a
+                                                          program's edition, is an ordinary comment: there is one
+                                                          edition. `--edition rust` is accepted and ignored
+                                                          (deprecated; it goes in 0.29), `--edition mvs` refused. *)
 ident        = ( "_" | ascii_letter ) { "_" | ascii_letter | digit } ;
                                                        (* "_" alone is the wildcard pattern *)
 raw_ident    = "r#" ident ;                            (* (0.4) an identifier even if a keyword: r#type *)
@@ -82,8 +86,8 @@ directly by other letters (`3e` and `1foo` are errors).
 if impl import in let loop match mod mut pub return static struct trait true
 type union unsafe use while move where` (`import` and `use` since 0.4, `pub` and
 `mod` since 0.5, `defer` since 0.6, `unsafe` and `trait` since 0.9, `move`
-since 0.14, `where` since 0.26.2). `defer` is a keyword with no statement
-since 0.26.2: `syntax.defer`, which names it.
+since 0.14, `where` since 0.26.2). `defer` had no statement from 0.26.2
+(`syntax.defer`) and is an ordinary name from 0.28.0.
 
 **Reserved** (an error if used): the keyword `dyn` (and `move` until
 0.14, `where` until 0.26.2, keywords since), and the
@@ -161,14 +165,14 @@ enum's or trait's generics, or before an impl's `{`, adds the bounds to
 those written inline: `fn f<T>(x: T) where T: Display` is `fn f<T:
 Display>(x: T)`. A method's `where` may bound its impl's parameters too.
 The left side is a type parameter of the item; a bound on another type
-(`I::Item: Display`, `Vec<T>: Debug`) is `where.unsupported` until the
-rust edition (bound a parameter instead: `I: Iterator<Item = X>, X:
-Display`). A parameter's type `impl B + C` (also `impl Fn(i64) -> i64`,
+(`I::Item: Display`, `Vec<T>: Debug`) was `where.unsupported` before
+0.28.0 and is checked as Rust's now. A parameter's type `impl B + C` (also `impl Fn(i64) -> i64`,
 after a mode: `f: inout impl FnMut(i64)`) is a hidden type parameter
 with those bounds, after the written ones: messages name it by its text,
 `impl Display`, and a turbofish gives only the written ones
-(`pick::<i64>(t, u)`). `impl Trait` anywhere else (a result, a field, a
-`let`) is `type.impl-position`.
+(`pick::<i64>(t, u)`). `impl Trait` at the top of a result is Rust's (0.27.2.1); inside a
+result's type, a trait method's result or a `let` it is `edition.later`
+(0.29); before 0.28.0 every other position was `type.impl-position`.
 
 Items may refer to each other in any order. Constants and statics are
 initialized by constant expressions: literals, other constants, unary and
@@ -276,7 +280,8 @@ bound so may be read, not changed or moved). There is no `&pat` pattern.
 block       = "{" { stmt } [ expr ] "}" ;
 stmt        = ";"                                      (* empty statement *)
             | "let" pattern [ ":" type ] "=" expr ";"
-            | "defer" ( block [ ";" ] | expr ";" )    (* (0.6; 0.26.2: error syntax.defer) *)
+                                                       (* (0.6 to 0.26.1: "defer" ( block | expr ";" ); gone,
+                                                          0.28.0: `defer` is a name) *)
             | block_like [ ";" ]
             | expr ";" ;
 block_like  = block | "unsafe" block | if_expr | match_expr | loop_expr | while_expr | for_expr ;
@@ -487,9 +492,8 @@ valid for its length while it is used. The same holds for memory a
 slice views: a slice of an array is valid while the array lives, and one
 from `Vec::as_slice` until the vector grows or is freed. Until 0.17,
 using a view after its storage was gone was the one way safe code could
-still reach undefined behaviour; from 0.17 the own pass rejects it under
-`--values=error`, the default (its opt-outs `warn`, `report` and `off`
-do not; std's types also assume their fields are changed by their
+still reach undefined behaviour; the borrow checker rejects it (std's
+types also assume their fields are changed by their
 methods only: from 0.26 their fields are private to std). A view need not have a name: a slice argument (or a
 receiver taken by value) is a copy made before the later arguments run
 (`take(v.as_slice(), grow(&v))`); the base of an index that is not a
@@ -665,7 +669,7 @@ builtins, and no item may have those names.)
 the address of the bytes (`const PROMPT: *u8 = c"> ";`).
 
 **Slices.** `s.len` is `usize` (0.26.2; it was `i64`, and `u64` before
-that), as std's lengths are. Indexing takes any integer type. `for x in s` iterates a
+that), as std's lengths are. Indexing takes a `usize` (0.28.0; any integer type before). `for x in s` iterates a
 slice or an array by value (the sequence is evaluated once; `break`,
 `continue` and labels work as in other loops).
 
@@ -879,8 +883,8 @@ change the value already taken from it. A deferred statement sees the
 bindings made before it; it may not `return`, nor `break`/`continue` out
 of itself (loops inside it are fine). Deferred statements do not run when
 the program ends by a failed check (exit 101), `exit`, or a `longjmp` past
-them. (0.26.2: removed, as Rust has none. `defer` is `error
-syntax.defer`; a guard, a value whose `Drop` does what the deferred
+them. (0.26.2: removed, as Rust has none: `defer` was `error
+syntax.defer` until 0.28.0, where it is an ordinary name; a guard, a value whose `Drop` does what the deferred
 statement did, is made where it stood and dropped on the same ways out,
 last first, the value leaving the block computed before.)
 
@@ -1461,7 +1465,6 @@ fstring     = 'f"' { text | "{{" | "}}" | "{" expr [ ":" spec ] "}" } '"'
 spec        = [ "<" | ">" ] [ "0" ] [ digits ] [ "." digits ] [ "?" | "x" | "X" | "b" | "c" ]
 args        = [ arg { "," arg } [ "," ] ]
 arg         = expr | ident ":" expr                      (* named: after every positional one *)
-param      += ... [ "=" expr ]                           (* fn items and inherent methods only *)
 field_init  = ident ":" expr | ident                     (* `ident` alone: shorthand *)
 attr       += "#[" "derive" "(" path { "," path } [ "," ] ")" "]"   (* before struct, enum *)
 trait       = "trait" ident [ "<" tparam { "," tparam } ">" ] "{" { trait_item } "}"
@@ -1585,15 +1588,12 @@ bytes on the stack, a piece that does not fit left out, so that a
 `#[no_alloc]` function can panic with one.
 
 Until 0.26.1 a plain literal at a format position was printed as it is,
-braces and all; `volec fix --only fstring` doubles such a literal's
-braces, so that its output stays the same.
+braces and all.
 
 **f-strings** (`f"..."`, 0.15 to 0.26.2) are removed (0.26.3): an
 f-string is `error syntax.fstring`, once per file, at its first, with
-how many the file has; its `try:` line is `volec fix --only fstring
---keep-braces FILE`. The lexer and the parser still read the form, so
-that the rest of the file is checked and the fix rewrites it, as
-below. An f-string was an expression of the same `std::Interp` type. Its text takes the escapes of
+how many the file has. The lexer and the parser still read the form, so
+that the rest of the file is checked. An f-string was an expression of the same `std::Interp` type. Its text takes the escapes of
 a string literal; `{{` and `}}` are braces; `{expr}` is a hole holding
 any expression, `{expr:spec}` one with a spec (the same specs). The lexer
 reads it as pieces: `f"text{` (FHead), the hole's tokens, `:spec}text{`
@@ -1603,25 +1603,25 @@ outside brackets that is not `::`, so an expression with a top-level `:`
 needs parentheses; string literals may appear in holes; f-strings do not
 nest; a hole may not be empty, and a lone `}` in the text is an error.
 The holes are evaluated where the f-string is, once each, left to right;
-the value holds copies of them. `volec fix --only fstring` rewrites an
-f-string as a format literal (at a format position) or as
-`format_args(..)` (anywhere else).
+the value holds copies of them. An f-string is written as a format
+literal (at a format position) or as `format_args(..)` (anywhere else).
 
-### Named arguments, defaults, shorthand
+### Named arguments, shorthand
 
-A trailing run of a function's parameters may have defaults, `b: i64 =
-2`, on `fn` items and inherent methods; not on trait functions (nor the
-functions of trait impls), extern functions, closures or `fn` types. A
-default may not name a parameter or a local; it is checked against the
-parameter's type once, and evaluated at each call that leaves it out, in
-the callee's module (a fresh `Vec::new()` each time).
+A parameter has no default value (0.28.0; 0.15 to 0.27 had them on a
+trailing run of parameters): `fn f(a: i64, b: i64 = 2)` is `error
+syntax.default-arg` at its `=`, with the fix that removes the value, and
+every call passes every argument. A function that is called two ways is
+two functions (std::gpu's `write_texture` and `write_texture_region`).
+The one exception is not in the language: std's `assert`, `assert_eq`,
+`assert_ne`, `debug_assert`, `unreachable`, `todo` and `unimplemented`
+may leave their message out, as Rust's macros do; the checker fills it.
 
 At a call, the positional arguments come first, then `name: value`
 arguments, in the order of the parameters (so arguments are evaluated
 in the written order). Each parameter is given once; `self` cannot be
 named; calls of trait functions take positional arguments only. A
-function used as a value has its whole signature (its defaults do not
-come with it). `f(label: loop { .. })` is a named argument: an argument
+function used as a value has its whole signature. `f(label: loop { .. })` is a named argument: an argument
 cannot be a labelled loop (parenthesize it).
 
 In a struct literal, a field written alone, `P { x, y: 0 }`, is `x: x`.
@@ -1720,7 +1720,7 @@ allocate from is in its signature. The rules, each an error with its
 - `alloc.field`: a struct or enum that holds an allocator names it in
   its parameters, `struct P<A: Allocator> { v: Vec<u8, A> }`, used as
   `P<Gpa>`; a literal infers it from its fields.
-  (0.27.2) In the rust edition a raw pointer is not looked through: a
+  (0.27.2) A raw pointer is not looked through: a
   field `*mut Node<Gpa>` holds no allocator, as a raw pointer carries no
   ownership (front-rust.md F33.1).
 - `alloc.static`: a static's type holds no allocator (it is `AllocFree`,
@@ -1785,12 +1785,9 @@ attributes `#[views(a, *b)]` and `#[stores(c)]` declare a view summary.
 an owned type (a `Vec`, `Buf`, `HashMap`, a type with `Drop`, a struct
 holding one) moves on `=`, a by-value argument and `return`, and is
 dropped at the end of its scope; views (slices, references) cannot
-outlive or alias against what they view. These checks and the drops are
-on by default: `--values=error` (the default since T7, which moved the
-tests, examples and evals over with `volec fix --values`).
-`--values=warn` and `--values=report` keep 0.16's semantics (no drops)
-and only warn or list; `--values=off` turns the pass off. They are
-opt-outs for 0.17 only. `v.free()` stays legal (`free` frees now and
+outlive or alias against what they view. These checks (the borrow
+checker's) and the drops are always on (0.28.0: `--values` and its
+opt-outs are gone with the own pass). `v.free()` stays legal (`free` frees now and
 leaves the container empty) and is no longer needed.
 
 **The prelude** gains `Buf`, `HashMap`, `read_line`, `read_stdin_in`,
@@ -1932,8 +1929,8 @@ let_stmt += "let" pattern "=" expr "else" block ";" ;     (* let-else *)
   `cannot take address of non-lvalue expression`, whose `try:` names the
   value first. `&e` of a slice value is still the slice; where `&[T]` is
   expected, the temporary's reference (`cmp_of(&a.text(), &b.text())`).
-- **An index** may be a reference to an integer (`keys[a]` with `a:
-  &i64`, a `sort_by` closure's parameter): it is read through.
+- **An index** may be a reference to a `usize` (`keys[a]` with `a:
+  &usize`, a `sort_by` closure's parameter): it is read through.
 - **References where values are expected, and back.** A place (a
   local, a field) where `&T` is expected is borrowed, as a `self: &T`
   receiver is: `f(it)` for `f(x: &Item)`. A reference to a plain value
@@ -2149,7 +2146,7 @@ match_expr += "match" "&" expr "{" arms "}" ;           (* binds inout accesses 
   argument, `conv.place` on a temporary). A `sink` parameter owns its
   value and is mutable; an owned argument moves into it. Receivers are
   `self`, `inout self` and `sink self` and are lent without `&`.
-  Defaults are allowed on let and sink parameters. In `extern "C"`
+  In `extern "C"`
   signatures `inout` and `sink` are `conv.extern`.
 - **Accesses are used as their values.** A let or inout parameter, an
   `inout x = &place;` local, a `let x = part;` that borrows, and an
@@ -2170,8 +2167,7 @@ match_expr += "match" "&" expr "{" arms "}" ;           (* binds inout accesses 
   is `conv.set`, and `sink T` outside a parameter `conv.sink_type`.
   Rust's spellings (`&T`, `&mut T`, `&mut x`, `&self`, `let mut`, `mut
   x`, `static mut`, `move`, `*r` on an access) are `conv.rust`, each
-  with the new form in a `try:` line; `volec fix --only conventions`
-  rewrites a program.
+  with the new form in a `try:` line.
 - Not yet: results that are accesses (`-> let T`, `-> inout T`,
   `Option<inout V>`) and `for inout x in &v`; until they land,
   `get_or_insert(k, v)` and `get_mut(k)` give one-element views

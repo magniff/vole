@@ -1,18 +1,18 @@
-# Formatting and derive (0.15)
+# Formatting and derive
 
-Format strings, the `Display` and `Debug` traits, the generic `print`
-family, and `#[derive]`.
+Format strings, the `Display` and `Debug` traits, the `print` family,
+and `#[derive]`.
 
 ## Format strings
 
-(0.26.2) Rust's `format!` family without the `!`: a plain literal that is
-the first argument of `print`, `println`, `eprint`, `eprintln` (stderr),
-`format_in(.., gpa)` (a new `String<A>` on allocator `gpa`, the allocator last), `format_args`,
-`b.push_fmt(..)` (appends to a `Buf` or a `String`), `f.write(..)`
-(inside a Display impl), `panic`, `assert`'s message or a contract's
-`else` is a format string, its arguments after it:
-`println("{} has {n:>4}", p.name)`. The grammar and the output are
-Rust's std::fmt, byte for byte (`guide formatting#the-spec`).
+Rust's `format!` family without the `!` (vole has no macros: `println!`
+is an error naming `println`): a literal that is the first argument of
+`print`, `println`, `eprint`, `eprintln` (stderr), `format_in(..,
+gpa)` (a new `String<A>` on allocator `gpa`, the allocator last),
+`format_args`, `write(w, ..)` and `writeln` (into a `fmt::Write`, a
+Formatter inside a Display impl), `panic` or `assert`'s message is a
+format string, its arguments after it: `println("{} has {n:>4}",
+p.name)`. The grammar and the output are Rust's std::fmt.
 
 - `{}` takes the next argument, `{0}` argument 0, `{name}` a named
   argument (`name = expr`) or a local, a parameter, a `const` or a
@@ -22,226 +22,180 @@ Rust's std::fmt, byte for byte (`guide formatting#the-spec`).
 - Each argument is evaluated once, left to right, before anything is
   written; one no hole takes, or a hole with no argument, is
   `format.args`.
-- A first argument that is no literal is a value: `println(s)` prints
-  `s`, braces and all.
-- `format_args("..", args)` is the formatted text as a value (an
-  `std::Interp`, Rust's `format_args!`), for a function of your own
-  taking `T: Display`; it holds copies of the arguments, so it can be
-  stored and printed later.
 - Floats print the shortest text that reads back as the same value
   (`2.5`, `0.1`), byte for byte as Rust prints them (#numbers).
 - Passed straight to the printing functions, a format string is written
-  in place: no closure, no `Interp`, no copy of the function, at every
-  `-O` level. Through a function of your own taking `T: Display`, each
-  `format_args` is a new copy of that function (and of what it calls).
-- `panic("bad {x}")` formats into 256 bytes on the stack (a piece that
-  does not fit is left out), so a `#[no_alloc]` function may panic with
-  one.
-- f-strings, `f"{p.x + 1}"` (0.15 to 0.26.2), are removed: error
-  `syntax.fstring` (0.26.3), once per file. `volec fix --only fstring
-  --keep-braces FILE` rewrites them as format strings, once: a name hole
-  stays, an expression becomes `{}` and an argument. (Without
-  `--keep-braces` it also doubles the braces of a plain literal, for
-  code from before 0.26.2, which printed them as they are.)
+  in place: no allocation, at every `-O` level.
+- `format_args("..", args)` is the formatted text as a value, for a
+  function of your own taking `T: Display`.
+- An f-string, `f"{p.x + 1}"`, is not vole (`syntax.fstring`): write
+  the format string without the `f`, the expression as an argument.
 
 ### The spec
 
 `{name:spec}`, `spec = [[fill]align][+][#][0][width][.precision][type]`:
 `<` `^` `>` align (numbers go right by default, text left) with any fill
-byte (`{s:*^9}`), `+` signs a number, `#` writes `0x`/`0o`/`0b` (and `0`
-pads after them), `0` pads a number with zeros after its sign, the width
-and the precision are digits, `N$`, `name$` (precision also `*`: the
-next argument), `.N` gives a float N decimals and cuts text to N; the
-type is `?` Debug (`x?`, `X?` with hex numbers), `x`/`X` hex, `o` octal,
-`b` binary, `e`/`E` an exponent (`1.5e3`), `p` a pointer as `0x..`, and
-vole's `c`, a `u8` as its byte (a `u8` is a number otherwise). `{:#?}`,
-Debug over several lines, is not in this release.
+character (`{s:*^9}`), `+` signs a number, `#` writes `0x`/`0o`/`0b`
+(and `0` pads after them), `0` pads a number with zeros after its sign,
+the width and the precision are digits (precision also `*`: the next
+argument), `.N` gives a float N decimals and cuts text to N; the type is
+`?` Debug (`x?`, `X?` with hex numbers; `#?` over several lines),
+`x`/`X` hex, `o` octal, `b` binary, `e`/`E` an exponent (`1.5e3`).
+A width from an argument (`w$`, `1$`) is not read yet.
 
 ```vole
-fn main() {
+fn next(c: &mut i64) -> i64 {
+    *c += 1;
+    *c
+}
+
+fn main(gpa: Gpa) -> i32 {
     let n = 42;
     let s = "hi";
     println("[{n:^8}] [{n:+}] [{n:#x}] [{n:o}] [{n:#010x}] [{s:*^7}]");
-    println("[{:>w$}] [{:.*}] [{0:?}] [{:e}]", 9, 2, 1.25, 1500.0, w = 5);
+    println("[{:>5}] [{:.*}] [{0:?}] [{:e}]", 9, 2, 1.25, 1500.0);
+    let name = "vole";
+    let x = 2.5;
+    println("{name} has {n} and {x}");
+    println("[{n:>6}] [{n:<6}] [{n:06}] [{n:x}] [{n:X}] [{n:b}]");
+    println("[{name:>9}] [{x:.3}] [{}] {{braces}} {}", 'A', n * 2 + 1);
+    let t = format_in("{n}-{}", n + 1, gpa); // a String, dropped at the end
+    eprintln("to stderr: {}", t);
+    let mut c = 0;
+    println("{} {}", next(&mut c), next(&mut c)); // left to right: 1, then 2
+    println("{:#?}", (1, "a"));
+    0
 }
 ```
 ```out
 [   42   ] [+42] [0x2a] [52] [0x0000002a] [**hi***]
 [    9] [1.25] [9] [1.5e3]
-```
-
-```vole
-fn main(gpa: Gpa) -> i32 {
-    let name = "vole";
-    let n = 42;
-    let x = 2.5;
-    println("{name} has {n} and {x}");
-    println("[{n:>6}] [{n:<6}] [{n:06}] [{n:x}] [{n:X}] [{n:b}]");
-    println("[{name:>9}] [{x:.3}] [{:c}] {{braces}} {}", 'A', n * 2 + 1);
-    let s = format_in("{n}-{}", n + 1, gpa); // a String, dropped at the end
-    eprintln("to stderr: {}", s.as_slice());
-    0
-}
-```
-```out
 vole has 42 and 2.5
 [    42] [42    ] [000042] [2a] [2A] [101010]
 [     vole] [2.500] [A] {braces} 85
 to stderr: 42-43
-```
-
-```vole
-fn next(c: inout i64) -> i64 {
-    c += 1;
-    c
-}
-
-fn main() -> i32 {
-    var c = 0;
-    let line = format_args("{} {}", next(&c), next(&c)); // evaluated here: 1, then 2
-    c = 100;
-    println(line);
-    println(line);
-    std::print_int(c);
-    println("");
-    0
-}
-```
-```out
 1 2
-1 2
-100
+(
+    1,
+    "a",
+)
 ```
 
 Printing writes through a static 4 KB buffer, one `write` per call, no
-heap. Rust's `println!("{}", x)` is `println("{}", x)`, `format!` is
-`format_in("...", args, gpa)`; there are no macros.
+heap.
 
 ## Numbers
 
-(0.20) A float's `{}`, `{:?}`, `{:e}` and `{:E}` are Rust's text, byte for
+A float's `{}`, `{:?}`, `{:e}` and `{:E}` are Rust's text, byte for
 byte: the shortest digits that read back as the value (Schubfach), `{}`
 never with an exponent, `{:?}` with one below 1e-4 and from 1e16 on.
-`std::num` reads text back, as Rust's `s.parse()` does, and writes it
-without a Fmt:
-
-| call | is |
-|---|---|
-| `parse_f64(s) -> Result<f64, ParseFloatError>`, `parse_f32` | Rust's `f64::from_str`: `-1.5e3`, `.5`, `inf`, `NaN`; no spaces; correctly rounded |
-| `parse_i64_radix(s, 16) -> Result<i64, ParseIntError>`, `parse_u64_radix` | Rust's `from_str_radix` (radix 2 to 36) |
-| `write_f64(v, FloatFmt::Debug, &out) -> i64`, `write_f32` | the text into `out` (an `inout [u8]`) (`FLOAT_TEXT_MAX` bytes always fit): its length |
-| `fmt_u64(v, &out) -> i64`, `fmt_i64` | the digits at the end of a `[u8; 20]`: where they start |
-| `fmt_f64(v, decimals, &out) -> i64` (0.25.4) | `{v:.N}`'s text at the end of a `[u8; 32]`, no allocation: where it starts (`guide text#numbers-as-text-without-an-allocator`) |
-| `f64_to_bits(v)`, `f64_from_bits(u)`, `f32_...` | the IEEE bits (Rust's `to_bits`) |
+`s.parse::<f64>()` reads text back as Rust's does (`-1.5e3`, `.5`,
+`inf`, `NaN`; no spaces; correctly rounded), and `to_bits`,
+`from_bits` give the IEEE bits; `i64::from_str_radix(s, 16)` reads an
+integer in another base. Text without an allocator: `guide
+text#numbers-as-text-without-an-allocator`.
 
 ```vole
-use std::num::{FloatFmt, parse_f64, parse_i64_radix, write_f64};
-
 fn main() -> i32 {
-    let x = parse_f64("0.1").unwrap() + parse_f64("2e-1").unwrap();
+    let x = "0.1".parse::<f64>().unwrap() + "2e-1".parse::<f64>().unwrap();
     println("{x} {x:?} {x:e} {:?} {} {}", 1e16, 1e-7, 0.1f32);
-    var out: [u8; 32] = [0; 32];
-    let n = write_f64(1234.5, FloatFmt::LowerExp, &out[..]);
-    println(out[0..n]);
-    println("{:?} {}", parse_i64_radix("-ff", 16), parse_f64("1,5").is_err());
+    println("{:?} {} {:x}", i64::from_str_radix("-ff", 16), "1,5".parse::<f64>().is_err(), 1.5f64.to_bits());
+    println("{} {:?} {}", f64::from_bits(0x3ff8000000000000), "inf".parse::<f64>(), b'A' as char);
     0
 }
 ```
 ```out
 0.30000000000000004 0.30000000000000004 3.0000000000000004e-1 1e16 0.0000001 0.1
-1.2345e3
-Ok(-255) true
+Ok(-255) true 3ff8000000000000
+1.5 Ok(inf) A
 ```
 
 ## Display and Debug
 
+Rust's traits, `std::fmt::Display` and `std::fmt::Debug`:
+
 ```text
-trait Display { fn fmt(self, f: inout Fmt); }
-trait Debug { fn fmt_debug(self, f: inout Fmt); }
+trait Display { fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result; }
+trait Debug { fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result; }
 ```
 
-Write `impl Display for T` (no derive: the text is yours) with the
-methods of `std::Fmt`: `f.str(s)` (a `[u8]`), `f.byte(b)`, `f.write(x)`
-(any Display value, `format_args(..)` too), `f.display(x)`, `f.debug(x)`.
-`self` is read (let), `f` is changed (inout); there is no result to
-return. Display is in std for the numbers, `[u8]` and the
-error enums; Debug for those (a `[u8]` quoted and
-escaped: `"a\n"`), `Vec<T, A>`, `Option`, `Result` and `HashMap` (`[1, 2]`,
-`Some(5)`, `{1: 2}`). `{s:?}` of a slice `[T]` whose T has Debug
-writes it as a Vec's, `[1, 2]` (0.25.3); the slice has no Debug impl of
-its own (it would clash with `[u8]`'s), so a Debug impl writes one with
-`std::debug_list(f, s)`.
+Write `impl Display for T` (no derive: the text is yours) with `write(f,
+"..", args)`, or `f.write_str(s)`. Display is in std for the numbers,
+`char`, `str`, `String` and std's errors; Debug for those (text quoted
+and escaped: `"a\n"`), slices, arrays, `Vec<T, A>`, tuples, `Option`,
+`Result` and `HashMap` (`[1, 2]`, `Some(5)`, `{1: 2}`).
 
 ```vole
-#[derive(Debug, Clone)]
+use std::fmt;
+
+#[derive(Debug, Clone, Copy)]
 struct Point { x: i64, y: i64 }
 
 #[derive(Debug)]
 enum Shape { Circle(i64), Rect(Point, Point), Line { from: Point, len: i64 }, Empty }
 
-impl Display for Point {
-    fn fmt(self, f: inout Fmt) {
-        f.write("({}, {})", self.x, self.y);
+impl fmt::Display for Point {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write(f, "({}, {})", self.x, self.y)
     }
 }
 
 fn main(gpa: Gpa) -> i32 {
     let p = Point { x: 1, y: 2 };
-    var q = p.clone();
+    let mut q = p.clone();
     q.x = 5;
-    println("{p} {q:?}");
+    println("{p} {q:?} [{p:>8}]");
     let shapes = [Shape::Circle(3), Shape::Rect(p, q), Shape::Line { from: p, len: 4 }, Shape::Empty];
-    for s in shapes { println("{s:?}"); }
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
+    for s in &shapes { println("{s:?}"); }
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
     v.push(1);
     v.push(2);
-    println("{v:?} {:?} {:?}", v.last(), "hi");
+    println("{v:?} {:?} {:?} {:?}", v.last(), "hi\n", &v[..1]);
     0
 }
 ```
 ```out
-(1, 2) Point { x: 5, y: 2 }
+(1, 2) Point { x: 5, y: 2 } [(1, 2)]
 Circle(3)
 Rect(Point { x: 1, y: 2 }, Point { x: 5, y: 2 })
 Line { from: Point { x: 1, y: 2 }, len: 4 }
 Empty
-[1, 2] Some(2) "hi"
+[1, 2] Some(2) "hi\n" [1]
 ```
+
+A `write(f, ..)` in `fmt` ignores the caller's width (`{p:>8}` above),
+as in Rust; `f.pad(s)` honours it.
 
 ## derive
 
-`#[derive(Eq, Ord, Hash, Debug, Clone)]` before a struct or an enum
-(with `#[repr]` if it has one) writes the impls:
-
-| trait | what it is |
-|---|---|
-| `Eq` | the structural `==` it already has; an error if a field has no `==` |
-| `Ord` | field by field, in declaration order; an enum by variant order, then payload |
-| `Hash` | the fields' hashes mixed (`std::hash_mix`), an enum's variant first |
-| `Debug` | Rust's text: `P { x: 1, y: 2 }`, `Circle(3)`, `Empty` |
-| `Clone` | field by field (`std::clone_of`): a `Vec` field is copied deep |
-
-On a generic type each parameter gets the trait as a bound: `#[derive(Ord)]
+`#[derive(..)]` before a struct or an enum writes Rust's impls:
+`Clone`, `Copy`, `PartialEq`, `Eq`, `PartialOrd`, `Ord` (field by field,
+in declaration order; an enum by variant order, then payload), `Hash`,
+`Debug` (`P { x: 1, y: 2 }`, `Circle(3)`, `Empty`) and `Default`. On a
+generic type each parameter gets the trait as a bound: `#[derive(Ord)]
 struct P<T>` is `impl<T: Ord> Ord for P<T>`. Display has no derive. A
 derived trait and a hand-written impl of it clash: remove one.
-`x.clone()` of a plain value (numbers, pointers, fieldless enums,
-tuples of them) is a copy. `Clone` is in std for `Vec` (deep), `Buf`,
-`HashMap`, `Option`, `Result` and the primitives.
 
 ```vole
-#[derive(Eq, Ord, Hash, Debug)]
+use std::collections::HashMap;
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 struct Key { group: i64, id: i64 }
 
 fn main(gpa: Gpa) -> i32 {
-    var keys = [Key { group: 2, id: 1 }, Key { group: 1, id: 9 }, Key { group: 1, id: 3 }];
-    sort(&keys[..]);                         // by group, then id
-    var m: HashMap<Key, i64, Gpa> = HashMap::new_in(gpa);
+    let mut keys = [Key { group: 2, id: 1 }, Key { group: 1, id: 9 }, Key { group: 1, id: 3 }];
+    keys.sort_unstable();                    // by group, then id
+    let mut m: HashMap<Key, i64, Gpa> = HashMap::new_in(gpa);
     for k in keys { m.insert(k, k.id * 10); }
     let wanted = Key { group: 2, id: 1 };
-    println("{:?} {:?}", keys[0], m.get(wanted));
+    println("{:?} {:?} {:?} {}", keys[0], m.get(&wanted), Key::default(), keys[1] < keys[2]);
     0
 }
 ```
 ```out
-Key { group: 1, id: 3 } Some(10)
+Key { group: 1, id: 3 } Some(10) Key { group: 0, id: 0 } true
 ```
+
+`sort` of a slice or an array is stable and allocates its buffer:
+`a.sort_in(gpa)` (a Vec's `v.sort()` takes the Vec's allocator);
+`sort_unstable` allocates nothing.

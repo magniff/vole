@@ -10,13 +10,13 @@ $ type fmtlit0262/main.vl:6:13
 Interp<closure(*Fmt) -> () at fmtlit0262/main.vl:6:13>	"{count} items, {count:>width$} of {LIMIT}"
 $ refs fmtlit0262/main.vl:4:9
 # fmtlit0262/main.vl
-4:9	def	let count = 3;
+4:9	def	let count: i64 = 3;
 6:15	read	main	println("{count} items, {count:>width$} of {LIMIT}");
 6:30	read	main	println("{count} items, {count:>width$} of {LIMIT}");
 7:19	read	main	println("{}", count);
 $ refs fmtlit0262/main.vl:5:9
 # fmtlit0262/main.vl
-5:9	def	let width = 6;
+5:9	def	let width: i64 = 6;
 6:37	read	main	println("{count} items, {count:>width$} of {LIMIT}");
 $ refs LIMIT --in fmtlit0262/main.vl
 # fmtlit0262/main.vl

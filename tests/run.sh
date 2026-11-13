@@ -10,8 +10,7 @@
 # tests/voltty/run.sh (the terminal's core against its oracle, 0.23),
 # tests/walkthrough/run.sh (the sessions of examples/tools/*/README.md,
 # 0.15, and of every examples/GROUP/NAME/README.md with one, 0.16) and
-# tests/own-try/run.sh (the own pass's try: lines run, 0.17) and
-# tests/borrowck-try/run.sh (the borrow checker's, 0.27.1) and
+# tests/borrowck-try/run.sh (the borrow checker's try: lines run, 0.27.1) and
 # tests/lsp/run.sh (`volec lsp`'s sessions, 0.24) and tests/book/run.sh
 # (the book's examples and sessions, 0.25) and tests/link/run.sh
 # (the link without cc, 0.25) and tests/perf/run.sh (--time-passes=instructions
@@ -122,12 +121,14 @@
 #                        ASM(T)s' lines
 #   // TIMEOUT: n why   (0.22) the case may run n times the time limit (a
 #                        long one at -O0, under the gate's load)
-#   // CROSS: T          (0.19) the case is also compiled for target T (at the
+#   // CROSS: T...       (0.19) the case is also compiled for target T (at the
 #                        suite's level, to an object: the compiler's own
 #                        assembler; then -S at the CHECK-OPT level, matched
 #                        against its ASM(T) and ASM-NOT(T) lines), nothing of
 #                        it run: x86-64's intrinsics are checked so on an arm
-#                        host. Skipped when T is the target tested.
+#                        host. Skipped when T is the target tested. (0.28.0)
+#                        Several targets: each in turn (std's effect lists
+#                        are checked for the target of the build).
 #   // FIXIMPORTS: why   (0.8) a copy of the case (its directory, for a
 #                        main.vl) is rewritten by volec --fix-imports,
 #                        which must then find nothing more to do; the copy
@@ -183,6 +184,12 @@ export LC_ALL
 # program and compiler would fill target/volec-cache.
 VOLE_CODE_CACHE=${VOLE_CODE_CACHE:-off}
 export VOLE_CODE_CACHE
+# (0.28) And without the tools' cache (tools::query::cache), unless the
+# caller says: `check FILE` writes about 12 MB per program, which nothing
+# removes, and a whole suite left over 80 GB in target/volec-cache. The
+# cases about the cache name their own directory.
+VOLE_CACHE=${VOLE_CACHE:-off}
+export VOLE_CACHE
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 COMPILER="$ROOT/target/volec"
@@ -288,7 +295,7 @@ want() {
 # NAME)` is below (tests/runner/run.sh checks the two agree): what -l
 # lists. LEVELED: the ones that take -O (the others are the same at
 # every level).
-SUITES="query refactor guide book fmt walkthrough wgsl voltty own-try borrowck-try std-own std-moves runner embed-checks stdpos cachediff lsp link gpu hooks arch-gen arch-enc voltty_render window example_layout example_build readme_sync perf"
+SUITES="query refactor guide book fmt walkthrough wgsl voltty borrowck-try runner embed-checks stdpos cachediff lsp link gpu hooks arch-gen arch-enc voltty_render window example_layout example_build readme_sync perf"
 LEVELED="gpu arch-gen"
 if [ "$LIST" = 1 ]; then
     all_cases | select_names | awk '{ print "case " $1 }'
@@ -335,6 +342,11 @@ trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 FAILURES="$WORK/failures"
 TALLY="$WORK/tally"
+# (0.28.0) A build whose lazy read of std failed and whose whole read passed
+# (a rerun: three or four times the work) says so on stderr and is listed
+# here (front/modules/std2lazy.vl: rerun_note); the summary counts them.
+RERUNS="${VOLE_STD2_RERUN_NOTE:-$WORK/reruns}"
+export VOLE_STD2_RERUN_NOTE="$RERUNS"
 # (0.25.2) The skipped checks that say why (a `skip NAME: why` line of a
 # runner below, like the window tests' without a display giving frames):
 # printed before the summary, `SKIP NAME: why`, and counted apart.
@@ -863,21 +875,24 @@ check_asm() {
 # suite's level and to assembly at the CHECK level, the assembly matched
 # against its ASM lines for that target; nothing run.
 check_cross() {
-    cross=$(cat "$2/cross")
-    # shellcheck disable=SC2086
-    if ! "$COMPILER" --target "$cross" $OPT $FLAGS "$1" -c -o "$2/cross.o" >"$2/compile.out" 2>&1; then
-        { echo "compile for $cross failed:"; cat "$2/compile.out"; } >"$2/why"
+    # (0.28.0) one target or several, each in turn
+    for cross in $(cat "$2/cross"); do
+        # shellcheck disable=SC2086
+        if ! "$COMPILER" --target "$cross" $OPT $FLAGS "$1" -c -o "$2/cross.o" >"$2/compile.out" 2>&1; then
+            { echo "compile for $cross failed:"; cat "$2/compile.out"; } >"$2/why"
+            return 1
+        fi
+        # shellcheck disable=SC2086
+        if ! "$COMPILER" --target "$cross" "-O$(cat "$2/checkopt")" $FLAGS "$1" -S -o "$2/cross.s" >"$2/compile.out" 2>&1; then
+            { echo "compile for $cross (-S) failed:"; cat "$2/compile.out"; } >"$2/why"
+            return 1
+        fi
+        [ -s "$2/crossasms.$cross" ] || continue
+        match_checks "$2/cross.s" "$2/crossasms.$cross" "$2/check.out" && continue
+        { cat "$2/check.out"; echo "--- assembly for $cross:"; cat "$2/cross.s"; } >"$2/why"
         return 1
-    fi
-    # shellcheck disable=SC2086
-    if ! "$COMPILER" --target "$cross" "-O$(cat "$2/checkopt")" $FLAGS "$1" -S -o "$2/cross.s" >"$2/compile.out" 2>&1; then
-        { echo "compile for $cross (-S) failed:"; cat "$2/compile.out"; } >"$2/why"
-        return 1
-    fi
-    [ -s "$2/crossasms" ] || return 0
-    match_checks "$2/cross.s" "$2/crossasms" "$2/check.out" && return 0
-    { cat "$2/check.out"; echo "--- assembly for $cross:"; cat "$2/cross.s"; } >"$2/why"
-    return 1
+    done
+    return 0
 }
 
 # Matches the checks in file $2 (+text: a line containing text, after the
@@ -939,17 +954,9 @@ run_case() {
     fi >"$dir/status"
 }
 
-# The standard library built into the compiler must be its source's (0.5).
-if [ -x "$ROOT/compiler/std/embed.sh" ] && ! "$ROOT/compiler/std/embed.sh" -c; then
-    exit 1
-fi
-# (0.27.2) And std2's, the rust edition's (embed.sh --edition rust;
-# 0.27.5: its index of units, std2_units, made by the compiler tested)
-if [ -x "$ROOT/compiler/std/embed.sh" ] && ! VOLE_EMBED_VOLEC="$COMPILER" "$ROOT/compiler/std/embed.sh" --edition rust -c; then
-    exit 1
-fi
-# (0.21.1) std's core, the sections every program reads, stays small.
-if [ -x "$ROOT/tests/std/core_sections.sh" ] && ! "$ROOT/tests/std/core_sections.sh" >/dev/null; then
+# The standard library built into the compiler must be its source's (0.5;
+# 0.27.5: its index of units, std2_units, made by the compiler tested).
+if [ -x "$ROOT/compiler/std/embed.sh" ] && ! VOLE_EMBED_VOLEC="$COMPILER" "$ROOT/compiler/std/embed.sh" -c; then
     exit 1
 fi
 # (0.19) The intrinsic tables, compiler/arch/*.def, as tables.vl has them.
@@ -1002,21 +1009,9 @@ esac
 case $(want voltty) in
     y) "$ROOT/tests/voltty/run.sh" -c "$COMPILER" -n 20 >"$WORK/voltty.out" 2>&1 & ;;
 esac
-case $(want own-try) in
-    y) "$ROOT/tests/own-try/run.sh" -c "$COMPILER" >"$WORK/own-try.out" 2>&1 & ;;
-esac
 # (0.27.1) the borrow checker's try: lines (tests/borrowck-try/run.sh)
 case $(want borrowck-try) in
     y) sh "$ROOT/tests/borrowck-try/run.sh" -c "$COMPILER" >"$WORK/borrowck-try.out" 2>&1 & ;;
-esac
-# (0.22) std through the own pass (tests/std/own.sh): category "std-own".
-case $(want std-own) in
-    y) sh "$ROOT/tests/std/own.sh" -c "$COMPILER" >"$WORK/std-own.out" 2>&1 & ;;
-esac
-# (0.25.2) std's moves checked as a program's (tests/std/moves.sh):
-# category "std-moves".
-case $(want std-moves) in
-    y) sh "$ROOT/tests/std/moves.sh" -c "$COMPILER" >"$WORK/std-moves.out" 2>&1 & ;;
 esac
 # (0.25.3) Text blocks in a CRLF file and the caches seeing an embedded
 # file change (tests/embed/run.sh): category "embed-checks".
@@ -1548,27 +1543,9 @@ case $(want walkthrough) in
         ;;
 esac
 
-# The try: lines of the own pass's diagnostics (0.17): tests/own-try/run.sh
-# (run above), each tests/own-try/NAME/ checked under --values=error and
-# each try: of its first error run; category "own-try".
-case $(want own-try) in
-    y)
-        while read -r status _; do
-            case "$status" in
-                pass) echo "own-try pass" >>"$TALLY"; count=$((count + 1)) ;;
-                xfail) echo "own-try xfail" >>"$TALLY"; count=$((count + 1)) ;;
-                FAIL) echo "own-try fail" >>"$TALLY"; count=$((count + 1)) ;;
-            esac
-        done <"$WORK/own-try.out"
-        if ! grep -q '^pass\|^xfail' "$WORK/own-try.out"; then
-            echo "own-try fail" >>"$TALLY"
-            count=$((count + 1))
-        fi
-        grep '^FAIL' "$WORK/own-try.out" >>"$FAILURES"
-        ;;
-esac
-# The borrow checker's try: lines (0.27.1, run above): tests/borrowck-try/,
-# the same runner; category "borrowck-try".
+# The borrow checker's try: lines (0.27.1, run above): each
+# tests/borrowck-try/NAME/ checked and each try: of its first error run;
+# category "borrowck-try".
 case $(want borrowck-try) in
     y)
         while read -r status _; do
@@ -1583,32 +1560,6 @@ case $(want borrowck-try) in
             count=$((count + 1))
         fi
         grep '^FAIL' "$WORK/borrowck-try.out" >>"$FAILURES"
-        ;;
-esac
-# std's own functions through the own pass (0.22, run above): one case,
-# "std-own"; its findings must be in tests/std/own.allowed.
-case $(want std-own) in
-    y)
-        if grep -q '^pass std-own' "$WORK/std-own.out"; then
-            echo "std-own pass" >>"$TALLY"
-        else
-            echo "std-own fail" >>"$TALLY"
-            { echo "FAIL std-own:"; sed 's/^/    /' "$WORK/std-own.out"; } >>"$FAILURES"
-        fi
-        count=$((count + 1))
-        ;;
-esac
-# std's moves outside its containers (0.25.2, run above): one case,
-# "std-moves".
-case $(want std-moves) in
-    y)
-        if grep -q '^pass std-moves' "$WORK/std-moves.out"; then
-            echo "std-moves pass" >>"$TALLY"
-        else
-            echo "std-moves fail" >>"$TALLY"
-            { echo "FAIL std-moves:"; sed 's/^/    /' "$WORK/std-moves.out"; } >>"$FAILURES"
-        fi
-        count=$((count + 1))
         ;;
 esac
 
@@ -1781,6 +1732,15 @@ awk '
 if [ -s "$WORK/failed-cases" ]; then
     n=$(wc -l <"$WORK/failed-cases" | tr -d ' ')
     echo "try: tests/run.sh $(head -5 "$WORK/failed-cases" | sed 's/^/-n /' | tr '\n' ' ' | sed 's/ $//')   (the failing case$( [ "$n" -gt 1 ] && echo s) alone$( [ "$n" -gt 5 ] && echo ", the first 5 of $n"))"
+fi
+if [ "$RERUNS" != 1 ] && [ -s "$RERUNS" ]; then
+    n=$(wc -l <"$RERUNS" | tr -d ' ')
+    # (0.28.0) the programs, each once: a program is built by its case and,
+    # in the whole suite, twice more by the fmt suite (as it is and
+    # formatted), so two programs made again on purpose
+    # (rust_f_f15_prim_impl_bound_ok, _unnamed_ok) are six builds
+    progs=$(grep -o '[^ ]*\.vl' "$RERUNS" | sed 's|.*/||' | sort -u)
+    echo "lazy std: $n build(s) of $(echo "$progs" | wc -l | tr -d ' ') program(s) were made again with std whole (VOLE_STD2_NORERUN=1 shows why; a word or a seed is missing in front/modules/std2lazy.vl); the first: $(echo "$progs" | head -8 | tr '\n' ' ' | sed 's/ $//')"
 fi
 if grep -q ' fail$' "$TALLY"; then
     exit 1

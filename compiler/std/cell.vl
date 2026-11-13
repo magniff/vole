@@ -1,156 +1,181 @@
-// std::cell (0.26.1): see Cell.
+// std::cell: Cell and UnsafeCell, Rust's API. A Cell is written through a
+// shared reference (`&self`): it is how an Arena bumps its pointer behind
+// the `&'a Arena<P>` every container holds (plan §2.1). Neither is Sync.
+// RefCell and its guards wait for 0.29 (plan §6, the cuts).
 
-use std::Default;
+use crate::clone::Clone;
+use crate::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd};
+use crate::default::Default;
+use crate::fmt::{Debug, Formatter};
+use crate::option::Option;
 
-// ---- Cells: UnsafeCell (0.26.1) ----
-
-// Not Sync; get: see Cell.
-pub struct UnsafeCell<T> { value: T }
+// The one way to write through a & in safe code's types: what Cell, the
+// allocators' counters and Atomic are made of. `get` gives a raw pointer;
+// writing through it while a & to the value is live is undefined.
+#[repr(transparent)]
+pub struct UnsafeCell<T: ?Sized> {
+    value: T,
+}
 
 impl<T> UnsafeCell<T> {
-    #[inline]
-    pub fn new(v: sink T) -> UnsafeCell<T> { UnsafeCell { value: v } }
+    #[effects()]
+    pub fn new(value: T) -> UnsafeCell<T> {
+        UnsafeCell { value: value }
+    }
 
-    #[inline]
-    pub fn get(self) -> *T { &self.value as *T }
-
-    #[inline]
-    pub fn into_inner(sink self) -> T {
-        let c = self;
-        c.value
+    #[effects()]
+    pub fn into_inner(self) -> T {
+        self.value
     }
 }
 
-// ---- Cells: Cell (0.26.1) ----
+impl<T: ?Sized> UnsafeCell<T> {
+    // A pointer to the value, writable through a &self.
+    // std2: changed: returns *mut T
+    #[effects()]
+    pub fn get(&self) -> *mut T {
+        &self.value as *const T as *mut T
+    }
 
-// Rust's UnsafeCell and Cell, under mutable value semantics (docs/grammar.md,
-// "Interior mutability").
-//
-// A cell is owned (move-only, as Rust's Cell is not Copy) and has no drop
-// of its own: `let d = c` moves it, `needs_drop::<Cell<i64>>()` is false.
-// Being owned makes a `let` parameter, and `let self`, of a cell a shared
-// reference to the caller's place, so a write through it reaches the
-// caller's value:
-//
-//     fn bump(c: Cell<i64>) { c.set(c.get() + 1); }
-//     let c = Cell::new(1);
-//     bump(c);                     // c.get() == 2
-//
-// A type that holds an UnsafeCell by value is not `Freeze` (the compiler's
-// auto trait, std::Freeze): the optimizer keeps no fact about it across a
-// call, an immutable static of it lives in writable data, and it is not
-// Sync (an immutable `static` of it is sync.static). A copy of a cell
-// would be another cell: where the compiler would make one (std's copying
-// getters, `v.get(i)`) it is own.interior_copy instead.
-//
-// UnsafeCell::get gives the value's address, the caller's place (`self` is
-// a reference); into_inner, the value when nothing else can reach it.
+    // The value, through an exclusive borrow: no unsafe needed.
+    #[effects()]
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+}
 
-// A value changed through a shared reference, one thread at a time (Cell
-// is Send when T is, never Sync). `get` copies the value out (T: Copy);
-// `set`, `replace`, `take` and `swap` move values in and out, so no
-// reference into the cell is ever made.
-pub struct Cell<T> { value: UnsafeCell<T> }
+// A value set and read through a &: by copy (`get`, T: Copy) or by moving
+// it in and out (`set`, `replace`, `take`); never a reference into it.
+#[repr(transparent)]
+pub struct Cell<T: ?Sized> {
+    value: UnsafeCell<T>,
+}
 
-// Each `unsafe` below reads or writes *self.value.get(), the cell's own
-// value: valid and aligned for T, reached by no reference (only values move
-// in and out), and by one thread (Cell is not Sync).
+// A Cell changes through `&self`, with no synchronization: never Sync
+// (its UnsafeCell says the same; stated, as Rust's). Send when T is.
+impl<T: ?Sized> !Sync for Cell<T> {}
+
 impl<T> Cell<T> {
-    #[inline]
-    pub fn new(v: sink T) -> Cell<T> { Cell { value: UnsafeCell::new(v) } }
-
-    // Puts v in, dropping the old value.
-    #[inline]
-    pub fn set(self, v: sink T) {
-        let old = self.replace(v);
-        drop(old);
+    #[effects(T)]
+    pub fn new(value: T) -> Cell<T> {
+        Cell { value: UnsafeCell::new(value) }
     }
 
-    // Puts v in; the old value.
-    #[inline]
-    pub fn replace(self, v: sink T) -> T {
-        let p = self.value.get();
-        // UNSAFE: a raw move out of and into the cell (an assignment would drop).
-        // SAFETY: see impl; the old value moves out and v in, neither dropped nor doubled.
-        unsafe {
-            let old = *p;
-            *p = v;
-            old
-        }
+    // Stores v (the old value is dropped).
+    #[effects(T)]
+    pub fn set(&self, v: T) {
+        drop(self.replace(v));
     }
 
-    // The value, when nothing else can reach the cell.
-    #[inline]
-    pub fn into_inner(sink self) -> T {
-        let c = self;
-        c.value.into_inner()
-    }
-
-    // The value's address (a write through it is the caller's business).
-    #[inline]
-    pub fn as_ptr(self) -> *T { self.value.get() }
-
-    // Exchanges the values of two cells; nothing when they are one cell.
-    pub fn swap(self, other: Cell<T>) {
-        let a = self.value.get();
-        let b = other.value.get();
-        if a == b {
+    // Exchanges the values of two cells.
+    // std2: changed: takes &Cell<T>
+    #[effects(unsafe, T)]
+    pub fn swap(&self, other: &Cell<T>) {
+        if crate::ptr::eq(self as *const Cell<T>, other as *const Cell<T>) {
             return;
         }
-        // UNSAFE: raw moves between the two cells (an assignment would drop).
-        // SAFETY: see impl; a != b, so the two values are distinct and each ends
-        // in exactly one cell.
-        unsafe {
-            let t = *a;
-            *a = *b;
-            *b = t;
-        }
+        // UNSAFE: writes both cells' values through their UnsafeCells.
+        // SAFETY: a Cell never hands out a reference into its value, and it
+        // is not Sync: no other access to either value is live during the
+        // swap, and the two are distinct (checked above).
+        unsafe { crate::mem::swap(&mut *self.value.get(), &mut *other.value.get()) }
+    }
+
+    // Stores v and returns the old value.
+    #[effects(unsafe, T)]
+    pub fn replace(&self, v: T) -> T {
+        // UNSAFE: writes the value through the UnsafeCell.
+        // SAFETY: a Cell never hands out a reference into its value, and it
+        // is not Sync: this is the one access to it.
+        crate::mem::replace(unsafe { &mut *self.value.get() }, v)
+    }
+
+    #[effects(T)]
+    pub fn into_inner(self) -> T {
+        self.value.into_inner()
     }
 }
 
 impl<T: Copy> Cell<T> {
     // A copy of the value.
-    #[inline]
-    pub fn get(self) -> T {
-        // UNSAFE: a read of the cell's value. SAFETY: see impl; T is Copy.
+    #[effects(unsafe, T)]
+    pub fn get(&self) -> T {
+        // UNSAFE: a read of the value through the UnsafeCell.
+        // SAFETY: no &mut to the value exists (a Cell makes none); T is Copy.
         unsafe { *self.value.get() }
     }
 
-    // Puts f(the value) in.
-    #[inline]
-    pub fn update<F: Fn(T) -> T>(self, f: F) {
-        let v = f(self.get());
-        self.set(v);
+    // Stores f(old value) (`c.update(|n| n + 1)`).
+    // std2: changed: FnOnce, returns nothing (Rust 1.88)
+    #[effects(T, F)]
+    pub fn update<F: FnOnce(T) -> T>(&self, f: F) {
+        self.set(f(self.get()));
+    }
+}
+
+impl<T: ?Sized> Cell<T> {
+    // A pointer to the value.
+    // std2: changed: returns *mut T
+    #[effects(T)]
+    pub fn as_ptr(&self) -> *mut T {
+        self.value.get()
+    }
+
+    // The value, through an exclusive borrow.
+    #[effects(T)]
+    pub fn get_mut(&mut self) -> &mut T {
+        self.value.get_mut()
     }
 }
 
 impl<T: Default> Cell<T> {
-    // The value, leaving T's empty value.
-    #[inline]
-    pub fn take(self) -> T { self.replace(T::default()) }
-}
-
-// A new cell with a copy of the value.
-impl<T: Copy> Clone for Cell<T> {
-    fn clone(self) -> Cell<T> { Cell::new(self.get()) }
-}
-
-impl<T: Default> Default for Cell<T> {
-    fn default() -> Cell<T> { Cell::new(T::default()) }
-}
-
-impl<T: Debug + Copy> Debug for Cell<T> {
-    fn fmt_debug(self, f: inout Fmt) {
-        f.str("Cell { value: ");
-        f.debug(self.get());
-        f.str(" }");
+    // Moves the value out, leaving its Default.
+    #[effects(T)]
+    pub fn take(&self) -> T {
+        self.replace(T::default())
     }
 }
 
-impl<T: Eq + Copy> Eq for Cell<T> {
-    fn eq(self, other: Cell<T>) -> bool { self.get().eq(other.get()) }
+impl<T: Copy> Clone for Cell<T> {
+    fn clone(&self) -> Cell<T> {
+        Cell::new(self.get())
+    }
+}
+
+impl<T: Default> Default for Cell<T> {
+    fn default() -> Cell<T> {
+        Cell::new(T::default())
+    }
+}
+
+impl<T: PartialEq + Copy> PartialEq for Cell<T> {
+    fn eq(&self, other: &Cell<T>) -> bool {
+        self.get() == other.get()
+    }
+}
+
+impl<T: Eq + Copy> Eq for Cell<T> {}
+
+impl<T: PartialOrd + Copy> PartialOrd for Cell<T> {
+    fn partial_cmp(&self, other: &Cell<T>) -> Option<Ordering> {
+        self.get().partial_cmp(&other.get())
+    }
 }
 
 impl<T: Ord + Copy> Ord for Cell<T> {
-    fn cmp(self, other: Cell<T>) -> i64 { self.get().cmp(other.get()) }
+    fn cmp(&self, other: &Cell<T>) -> Ordering {
+        self.get().cmp(&other.get())
+    }
+}
+
+impl<T: Debug + Copy> Debug for Cell<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> crate::fmt::Result {
+        f.debug_struct("Cell").field("value", &self.get()).finish()
+    }
+}
+
+impl<T> From<T> for Cell<T> {
+    fn from(value: T) -> Cell<T> {
+        Cell::new(value)
+    }
 }

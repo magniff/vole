@@ -7,13 +7,14 @@
 ## start of its region. Run with guard malloc where there is one (macOS:
 ## every allocation right after an unmapped page, so the read before it
 ## always faults); elsewhere plainly.
+## (0.28.0, the rust edition) The name is std::collections's re-export of
+## HashMap; the fix names its module, std::collections::hash_map.
 % if [ -r /usr/lib/libgmalloc.dylib ]; then export DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib MALLOC_PROTECT_BEFORE=1 MALLOC_ALLOW_LARGE_REQUESTS=1; fi; "$COMPILER" fix --dry-run 2>&1 | grep -v '^GuardMalloc'
 --- a/main.vl
 +++ b/main.vl
-@@ -1 +1 @@
--use std::max;
-+use std::{I64_MIN, max};
+@@ -1,0 +2 @@
++use std::collections::HashMap;
 $ fix
-fixed 1 missing import	main.vl	+1 -1 lines
+fixed 1 missing import	main.vl	+1 -0 lines
 $ check
 ok: 0 errors in main.vl

@@ -7,7 +7,7 @@
 //   target is a block that was entered, and no block is left open;
 // - its places: each operand's local exists and its projections apply to
 //   the type they are taken of; an index is a local;
-// - the copy rule (§3.3), under --values=error: a `copy` of a place whose
+// - the copy rule (§3.3): a `copy` of a place whose
 //   type needs drop only as the value of a BORROWED local or of a
 //   BORROWED local's place (a borrowed copy of a borrowed copy), and no
 //   `move` out of a BORROWED local;
@@ -25,10 +25,9 @@
 use crate::base::{STDERR, buf_int, buf_new, buf_str, buf_write_fd};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
-use crate::front::own::drops::drops_on;
-use crate::front::own::glue::has_glue;
 use crate::front::types::{REF_MUT, REF_SHARED, TyKind};
 use crate::places::cfg::{compute_idom, compute_preds, compute_rpo, in_graph};
+use crate::places::glue::has_glue;
 use crate::places::ir::{
     Body, DS_FLAG, DS_KEPT, LF_BORROWED, LF_PARAM, LF_RETURN, LF_STATIC, OK_COPY, OK_MOVE, PJ_INDEX,
     PJ_VARIANT, RV_CAST, RV_DISCR, RV_USE, SK_ASSIGN, SK_CALL, SK_DEAD, SK_DROP, SK_INTRINSIC,
@@ -37,7 +36,7 @@ use crate::places::ir::{
     place_type, proj_kind, proj_parent, proj_val, succ, succ_count, undistinct,
 };
 
-fn problem(what: [u8], pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+fn problem(what: &[u8], pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
     if !pcx.report {
         return;
     }
@@ -56,19 +55,19 @@ fn problem(what: [u8], pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
 }
 
 // Checks the body held.
-pub fn verify_body(pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+pub fn verify_body(pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
     pcx.report = true;
     pcx.at_block = -1;
     pcx.at_stmt = -1;
     if pbody.cur_block >= 0 {
-        problem("a block is left open (no terminator)", pbody, &pcx);
+        problem(b"a block is left open (no terminator)", pbody, pcx);
     }
-    if !verify_form(pbody, &pcx) {
+    if !verify_form(pbody, pcx) {
         return;
     }
-    compute_preds(&pbody);
-    compute_rpo(&pbody);
-    compute_idom(&pbody);
+    compute_preds(pbody);
+    compute_rpo(pbody);
+    compute_idom(pbody);
     for b in 0..block_count(pbody) {
         if !in_graph(b, pbody) {
             continue;
@@ -77,15 +76,15 @@ pub fn verify_body(pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
         let start = block_start(b, pbody);
         for s in start..start + block_len(b, pbody) + 1 {
             pcx.at_stmt = s - start;
-            verify_stmt(s, b, pbody, &pcx);
+            verify_stmt(s, b, pbody, pcx);
         }
     }
-    verify_storage(pbody, &pcx);
-    verify_mut_copies(pbody, &pcx);
+    verify_storage(pbody, pcx);
+    verify_mut_copies(pbody, pcx);
     // (0.27.1) a rust-edition body's region slots, one variable bound to
     // each slot of each local's type (D3.3)
     let slots = buf_new();
-    let bad = crate::places::regions::verify_slots(slots, pbody, &pcx);
+    let bad = crate::places::regions::verify_slots(slots, pbody, pcx);
     if bad > 0 && pcx.report {
         pcx.verify_errors += bad;
         let out = buf_new();
@@ -100,9 +99,9 @@ pub fn verify_body(pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
 // (0.27.1, borrowck.md I7) In a rust-edition body no operand copies a
 // whole `&mut T`: it moves or is reborrowed (D3.6); a mutable view given
 // to a call, or into a shared view, is copied, which D3.6 reads as its
-// reborrow.
-fn verify_mut_copies(pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
-    if pbody.fn_ < 0 || !crate::places::regions::rust_operands(pbody.fn_, &pcx) {
+// reborrow; an intrinsic (std::arch's loads and stores) is a call in this.
+fn verify_mut_copies(pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+    if pbody.fn_ < 0 || !crate::places::regions::rust_operands(pbody.fn_, pcx) {
         return;
     }
     for b in 0..block_count(pbody) {
@@ -113,37 +112,46 @@ fn verify_mut_copies(pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
         let start = block_start(b, pbody);
         for s in start..start + block_len(b, pbody) + 1 {
             pcx.at_stmt = s - start;
-            let st = pbody.stmts[s];
+            let st = pbody.stmts[s as usize];
             for i in 0..st.nops {
                 if op_kind(st.ops, i, pbody) != OK_COPY {
                     continue;
                 }
                 let t = undistinct(place_type(op_a(st.ops, i, pbody), op_b(st.ops, i, pbody),
-                    pbody, &pcx), pcx);
-                if t <= 0 || pcx.types[t].b != REF_MUT {
+                    pbody, pcx), pcx);
+                if t <= 0 || pcx.types[t as usize].b != REF_MUT {
                     continue;
                 }
-                let k = pcx.types[t].kind;
+                let k = pcx.types[t as usize].kind;
                 // (a mutable view copied into a shared one is its shared
                 // reborrow, `let s: &[T] = s;`)
-                let dt = if st.kind == SK_ASSIGN && st.a >= 0 {
-                    undistinct(place_type(st.a, st.b, pbody, &pcx), pcx)
+                let dt: i64 = if st.kind == SK_ASSIGN && st.a >= 0 {
+                    undistinct(place_type(st.a, st.b, pbody, pcx), pcx)
                 } else { 0 };
-                let shared_dest = dt > 0 && pcx.types[dt].kind == TyKind::Slice
-                    && pcx.types[dt].b != REF_MUT;
+                let shared_dest = dt > 0 && pcx.types[dt as usize].kind == TyKind::Slice
+                    && pcx.types[dt as usize].b != REF_MUT;
                 // RULE: R1 (`w as *mut W`: a cast to a raw pointer reads the
                 // reference, as rustc's `&raw mut *w`; no loan, no copy of it
                 // lives on as a reference)
                 let raw_cast = st.kind == SK_ASSIGN && st.c == RV_CAST && dt > 0
-                    && (pcx.types[dt].kind == TyKind::Ptr && pcx.types[dt].b != REF_MUT
-                        && pcx.types[dt].b != REF_SHARED
-                        || pcx.types[dt].kind == TyKind::Slice && pcx.types[dt].b != REF_MUT
-                        && pcx.types[dt].b != REF_SHARED && pcx.types[dt].b != 0);
-                if !raw_cast
+                    && (pcx.types[dt as usize].kind == TyKind::Ptr
+                        && pcx.types[dt as usize].b != REF_MUT
+                        && pcx.types[dt as usize].b != REF_SHARED
+                        || pcx.types[dt as usize].kind == TyKind::Slice
+                        && pcx.types[dt as usize].b != REF_MUT
+                        && pcx.types[dt as usize].b != REF_SHARED && pcx.types[dt as usize].b != 0);
+                // RULE: C3.2 (a `requires` clause's `$pre` companion reads its
+                // arguments in place, lower_call: the `&mut` it is given is
+                // read through before the call reborrows it, and no copy
+                // of it lives past the companion's return)
+                let pre_read = st.kind == SK_CALL && st.c >= 0
+                    && crate::front::contracts::expand::is_pre_fn(st.c, pcx);
+                if !raw_cast && !pre_read
                     && (k == TyKind::Ptr
-                        || k == TyKind::Slice && st.kind != SK_CALL && !shared_dest) {
-                    problem("a copy of an exclusive reference (I7: it moves or is reborrowed)",
-                        pbody, &pcx);
+                        || k == TyKind::Slice && st.kind != SK_CALL && st.kind != SK_INTRINSIC
+                        && !shared_dest) {
+                    problem(b"a copy of an exclusive reference (I7: it moves or is reborrowed)",
+                        pbody, pcx);
                 }
             }
         }
@@ -152,13 +160,13 @@ fn verify_mut_copies(pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
 
 // The form: ranges, terminators, targets. False when it is broken (the
 // rest would read past it).
-fn verify_form(pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> bool {
+fn verify_form(pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> bool {
     let n = pbody.stmts.len() as i64;
     pcx.owner.clear();
     for _ in 0..n {
         pcx.owner.push(-1);
     }
-    var ok = true;
+    let mut ok = true;
     for b in 0..block_count(pbody) {
         let start = block_start(b, pbody);
         if start < 0 {
@@ -168,24 +176,24 @@ fn verify_form(pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> bool {
         pcx.at_stmt = -1;
         let end = start + block_len(b, pbody);
         if end >= n {
-            problem("the block has no terminator", pbody, &pcx);
+            problem(b"the block has no terminator", pbody, pcx);
             ok = false;
             continue;
         }
         for s in start..end + 1 {
             pcx.at_stmt = s - start;
-            if pcx.owner[s] >= 0 {
-                problem("the statement is in two blocks", pbody, &pcx);
+            if pcx.owner[s as usize] >= 0 {
+                problem(b"the statement is in two blocks", pbody, pcx);
                 ok = false;
             }
-            pcx.owner[s] = b;
-            let term = is_terminator(pbody.stmts[s].kind);
+            pcx.owner[s as usize] = b;
+            let term = is_terminator(pbody.stmts[s as usize].kind);
             if s < end && term {
-                problem("a terminator inside the block", pbody, &pcx);
+                problem(b"a terminator inside the block", pbody, pcx);
                 ok = false;
             }
             if s == end && !term {
-                problem("the block does not end in a terminator", pbody, &pcx);
+                problem(b"the block does not end in a terminator", pbody, pcx);
                 ok = false;
             }
         }
@@ -195,35 +203,35 @@ fn verify_form(pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> bool {
         for i in 0..succ_count(b, pbody) {
             let t = succ(b, i, pbody);
             if !in_graph(t, pbody) {
-                problem("a target block that was never entered", pbody, &pcx);
+                problem(b"a target block that was never entered", pbody, pcx);
                 ok = false;
             }
         }
     }
     if block_count(pbody) > 0 && !in_graph(0, pbody) {
         pcx.at_block = 0;
-        problem("bb0 was never entered", pbody, &pcx);
+        problem(b"bb0 was never entered", pbody, pcx);
         ok = false;
     }
     ok
 }
 
 // Whether place (l, p) is well formed: its local exists, each step applies.
-fn check_place(l: i64, p: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> bool {
+fn check_place(l: i64, p: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> bool {
     if l < 0 || l >= local_count(pbody) {
-        problem("a place of a local that does not exist", pbody, &pcx);
+        problem(b"a place of a local that does not exist", pbody, pcx);
         return false;
     }
-    if full_place_type(l, p, pbody, &pcx) <= 0 {
-        problem("a projection that does not apply to its type", pbody, &pcx);
+    if full_place_type(l, p, pbody, pcx) <= 0 {
+        problem(b"a projection that does not apply to its type", pbody, pcx);
         return false;
     }
-    var q = p;
+    let mut q = p;
     while q > 0 {
         if proj_kind(q, pbody) == PJ_INDEX {
             let i = proj_val(q, pbody);
             if i < 0 || i >= local_count(pbody) {
-                problem("an index that is not a local", pbody, &pcx);
+                problem(b"an index that is not a local", pbody, pcx);
                 return false;
             }
         }
@@ -232,16 +240,20 @@ fn check_place(l: i64, p: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> bool 
     true
 }
 
-fn verify_stmt(s: i64, b: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
-    let st = pbody.stmts[s];
+fn verify_stmt(s: i64, b: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+    let st = pbody.stmts[s as usize];
     let k = st.kind;
     if k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC || k == SK_DROP || k == SK_MENTION {
-        let placed = check_place(st.a, st.b, pbody, &pcx);
+        let placed = check_place(st.a, st.b, pbody, pcx);
         if placed && k == SK_DROP && (st.c == DS_KEPT || st.c == DS_FLAG) {
-            let t = full_place_type(st.a, st.b, pbody, &pcx);
-            if has_glue(t, &pcx) && !crate::places::shim::shim_found(t, &pcx) {
-                problem("a drop that runs whose type, erased, finds no shim (shim.vl shim_key)",
-                    pbody, &pcx);
+            let t = full_place_type(st.a, st.b, pbody, pcx);
+            // RULE: D22.2 (an opaque instance's drop of a type that holds
+            // an Ω asks for no shim, as ask_shims asks for none: the shim
+            // would call a `drop` no instance made)
+            if has_glue(t, pcx) && !crate::front::opaque::holds_omega(t, pcx)
+                && !crate::places::shim::shim_found(t, pcx) {
+                problem(b"a drop that runs whose type, erased, finds no shim (shim.vl shim_key)",
+                    pbody, pcx);
             }
         }
     }
@@ -252,34 +264,34 @@ fn verify_stmt(s: i64, b: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
         }
         let l = op_a(st.ops, i, pbody);
         let p = op_b(st.ops, i, pbody);
-        if !check_place(l, p, pbody, &pcx) {
+        if !check_place(l, p, pbody, pcx) {
             continue;
         }
         if ok == OK_MOVE && has_flag(l, LF_BORROWED, pbody) {
-            problem("a move out of a borrowed local", pbody, &pcx);
+            problem(b"a move out of a borrowed local", pbody, pcx);
         }
-        if ok == OK_COPY && drops_on(pcx) && has_glue(full_place_type(l, p, pbody, &pcx), &pcx) {
+        if ok == OK_COPY && has_glue(full_place_type(l, p, pbody, pcx), pcx) {
             // (the copy rule: only into a borrowed local or temporary, or
             // of a borrowed local's place, itself a borrowed copy)
             let into_borrowed = k == SK_ASSIGN && st.c == RV_USE && st.b == 0
                 && has_flag(st.a, LF_BORROWED, pbody);
             if !into_borrowed && !has_flag(l, LF_BORROWED, pbody) {
-                problem("a copy of a value that needs drop, not into a borrowed local", pbody,
-                    &pcx);
+                problem(b"a copy of a value that needs drop, not into a borrowed local", pbody,
+                    pcx);
             }
         }
-        check_variants(l, p, b, pbody, &pcx);
+        check_variants(l, p, b, pbody, pcx);
     }
 }
 
 // Each `as V` step of place (l, p) is dominated by a switch on the
 // discriminant of the place it is taken of.
-fn check_variants(l: i64, p: i64, b: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
-    var q = p;
+fn check_variants(l: i64, p: i64, b: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+    let mut q = p;
     while q > 0 {
         if proj_kind(q, pbody) == PJ_VARIANT
             && !switch_dominates(l, proj_parent(q, pbody), b, pbody) {
-            problem("an 'as V' not dominated by a switch on its discriminant", pbody, &pcx);
+            problem(b"an 'as V' not dominated by a switch on its discriminant", pbody, pcx);
         }
         q = proj_parent(q, pbody);
     }
@@ -287,17 +299,17 @@ fn check_variants(l: i64, p: i64, b: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp
 
 // Whether a block that dominates b ends in a switch on `discriminant (l,
 // p)` (the switch's operand a local assigned it in that block).
-fn switch_dominates(l: i64, p: i64, b: i64, pbody: Body<Comp>) -> bool {
-    if pbody.rpo_index[b] < 0 {
+fn switch_dominates(l: i64, p: i64, b: i64, pbody: &Body<Comp>) -> bool {
+    if pbody.rpo_index[b as usize] < 0 {
         // (an unreachable block: nothing to dominate it)
         return true;
     }
-    var d = b;
+    let mut d = b;
     while true {
         if discr_switch(d, l, p, pbody) && (d != b) {
             return true;
         }
-        let up = pbody.idom[d];
+        let up = pbody.idom[d as usize];
         if up < 0 || up == d {
             return false;
         }
@@ -306,21 +318,21 @@ fn switch_dominates(l: i64, p: i64, b: i64, pbody: Body<Comp>) -> bool {
     false
 }
 
-fn discr_switch(d: i64, l: i64, p: i64, pbody: Body<Comp>) -> bool {
+fn discr_switch(d: i64, l: i64, p: i64, pbody: &Body<Comp>) -> bool {
     let t = block_term(d, pbody);
-    if pbody.stmts[t].kind != TK_SWITCH {
+    if pbody.stmts[t as usize].kind != TK_SWITCH {
         return false;
     }
-    let ops = pbody.stmts[t].ops;
+    let ops = pbody.stmts[t as usize].ops;
     let k = op_kind(ops, 0, pbody);
     if k != OK_COPY && k != OK_MOVE || op_b(ops, 0, pbody) != 0 {
         return false;
     }
     let dl = op_a(ops, 0, pbody);
     let start = block_start(d, pbody);
-    var s = t - 1;
+    let mut s = t - 1;
     while s >= start {
-        let st = pbody.stmts[s];
+        let st = pbody.stmts[s as usize];
         if st.kind == SK_ASSIGN && st.a == dl && st.b == 0 {
             return st.c == RV_DISCR && op_a(st.ops, 0, pbody) == l && op_b(st.ops, 0, pbody) == p;
         }
@@ -331,83 +343,84 @@ fn discr_switch(d: i64, l: i64, p: i64, pbody: Body<Comp>) -> bool {
 
 // ---- Storage ----
 
-fn word_get(v: Vec<i64, Comp>, at: i64, l: i64) -> bool {
-    (v[at + l / 64] >> (l % 64) & 1) != 0
+fn word_get(v: &Vec<i64, Comp>, at: i64, l: i64) -> bool {
+    (v[(at + l / 64) as usize] >> (l % 64) & 1) != 0
 }
 
-fn dead_set(l: i64, on: bool, pcx: inout Ctx<Comp>) {
+fn dead_set(l: i64, on: bool, pcx: &mut Ctx<Comp>) {
     let w = l / 64;
     let bit = 1 << (l % 64);
     if on {
-        pcx.dead[w] = pcx.dead[w] | bit;
+        pcx.dead[w as usize] = pcx.dead[w as usize] | bit;
     } else {
-        pcx.dead[w] = pcx.dead[w] & ~bit;
+        pcx.dead[w as usize] = pcx.dead[w as usize] & ~bit;
     }
 }
 
-fn use_local(l: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
-    if l >= 0 && l < local_count(pbody) && word_get(pcx.tracked, 0, l) && word_get(pcx.dead, 0, l) {
-        problem("a use of a local outside its storage", pbody, &pcx);
+fn use_local(l: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+    if l >= 0 && l < local_count(pbody) && word_get(&pcx.tracked, 0, l)
+        && word_get(&pcx.dead, 0, l) {
+        problem(b"a use of a local outside its storage", pbody, pcx);
     }
 }
 
-fn use_place(l: i64, p: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
-    use_local(l, pbody, &pcx);
-    var q = p;
+fn use_place(l: i64, p: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+    use_local(l, pbody, pcx);
+    let mut q = p;
     while q > 0 {
         if proj_kind(q, pbody) == PJ_INDEX {
-            use_local(proj_val(q, pbody), pbody, &pcx);
+            use_local(proj_val(q, pbody), pbody, pcx);
         }
         q = proj_parent(q, pbody);
     }
 }
 
 // One block's statements over DEAD (its state at the entry).
-fn storage_block(b: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+fn storage_block(b: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
     let start = block_start(b, pbody);
     for s in start..start + block_len(b, pbody) + 1 {
         pcx.at_stmt = s - start;
-        let st = pbody.stmts[s];
+        let st = pbody.stmts[s as usize];
         let k = st.kind;
         if k == SK_LIVE {
             if st.a >= 0 && st.a < local_count(pbody) {
-                dead_set(st.a, false, &pcx);
+                dead_set(st.a, false, pcx);
             }
             continue;
         }
         if k == SK_DEAD {
             if st.a >= 0 && st.a < local_count(pbody) {
-                dead_set(st.a, true, &pcx);
+                dead_set(st.a, true, pcx);
             }
             continue;
         }
         for i in 0..st.nops {
             if op_is_place(op_kind(st.ops, i, pbody)) {
-                use_place(op_a(st.ops, i, pbody), op_b(st.ops, i, pbody), pbody, &pcx);
+                use_place(op_a(st.ops, i, pbody), op_b(st.ops, i, pbody), pbody, pcx);
             }
         }
         if k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC || k == SK_DROP
             || k == SK_MENTION {
-            use_place(st.a, st.b, pbody, &pcx);
+            use_place(st.a, st.b, pbody, pcx);
         }
     }
 }
 
 // Maybe-dead, forward, to a fixed point; then reported once.
-fn verify_storage(pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+fn verify_storage(pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
     let n = local_count(pbody);
     pcx.verify_words = n / 64 + 1;
     pcx.tracked.clear();
     for _ in 0..pcx.verify_words {
         pcx.tracked.push(0);
     }
-    var any = false;
+    let mut any = false;
     for s in 0..pbody.stmts.len() {
         if pbody.stmts[s].kind == SK_LIVE {
             let l = pbody.stmts[s].a;
             if l >= 0 && l < n && !has_flag(l, LF_PARAM, pbody) && !has_flag(l, LF_RETURN, pbody)
                 && !has_flag(l, LF_STATIC, pbody) {
-                pcx.tracked[l / 64] = pcx.tracked[l / 64] | 1 << (l % 64);
+                pcx.tracked[(l / 64) as usize] = pcx.tracked[(l / 64) as usize] | 1 << (l % 64);
                 any = true;
             }
         }
@@ -420,7 +433,7 @@ fn verify_storage(pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     for b in 0..nb {
         for w in 0..pcx.verify_words {
             // (bb0: every tracked local dead; the others: nothing known yet)
-            pcx.dead_in.push(if b == 0 { pcx.tracked[w] } else { 0 });
+            pcx.dead_in.push(if b == 0 { pcx.tracked[w as usize] } else { 0 });
         }
     }
     pcx.dead.clear();
@@ -428,24 +441,25 @@ fn verify_storage(pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
         pcx.dead.push(0);
     }
     pcx.report = false;
-    var changed = true;
-    var rounds = 0;
+    let mut changed = true;
+    let mut rounds: i64 = 0;
     while changed && rounds < 64 {
         changed = false;
         rounds += 1;
         for k in 0..pbody.rpo.len() {
             let b = pbody.rpo[k];
             for w in 0..pcx.verify_words {
-                pcx.dead[w] = pcx.dead_in[b * pcx.verify_words + w];
+                pcx.dead[w as usize] = pcx.dead_in[(b * pcx.verify_words + w) as usize];
             }
-            storage_block(b, pbody, &pcx);
+            storage_block(b, pbody, pcx);
             for i in 0..succ_count(b, pbody) {
                 let t = succ(b, i, pbody);
                 for w in 0..pcx.verify_words {
-                    let old = pcx.dead_in[t * pcx.verify_words + w];
-                    let new = old | pcx.dead[w];
+                    let old = pcx.dead_in[(t * pcx.verify_words + w) as usize];
+                    let new = old | pcx.dead[w as usize];
                     if new != old {
-                        pcx.dead_in[t * pcx.verify_words + w] = new;
+                        { let at_ix = (t * pcx.verify_words + w) as usize;
+                            pcx.dead_in[at_ix] = new };
                         changed = true;
                     }
                 }
@@ -457,8 +471,8 @@ fn verify_storage(pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
         let b = pbody.rpo[k];
         pcx.at_block = b;
         for w in 0..pcx.verify_words {
-            pcx.dead[w] = pcx.dead_in[b * pcx.verify_words + w];
+            pcx.dead[w as usize] = pcx.dead_in[(b * pcx.verify_words + w) as usize];
         }
-        storage_block(b, pbody, &pcx);
+        storage_block(b, pbody, pcx);
     }
 }

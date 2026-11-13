@@ -49,7 +49,7 @@ longest run 20
 $ volec refactor rename adler32::a low --show
 renamed local a to low in crate::adler::adler32, 4 uses	adler.vl	+4 -4 lines
 // adler.vl:4
-4	    var low: u64 = 1;
+4	    let mut low: u64 = 1;
 // adler.vl:7-8
 7	        low = (low + x as u64) % 65521;
 8	        b = (b + low) % 65521;
@@ -120,10 +120,10 @@ $ volec fmt rle.vl
 formatted	rle.vl	+4 -4 lines
 $ volec query show run_at
 // crate::rle::run_at	rle.vl:4-9	effects: panic diverge
-fn run_at(s: [u8], i: i64) -> i64 {
-    var n = 1;
+fn run_at(s: &[u8], i: usize) -> usize {
+    let mut n = 1;
     // a run ends at the end of s, at another byte, or at 255 (one count byte)
-    while i + n < s.len as i64 && s[i + n] == s[i] && n < 255 { n += 1; }
+    while i + n < s.len() && s[i + n] == s[i] && n < 255 { n += 1; }
     n
 }
 $ volec main.vl --no-positions -o after.s && cmp before.s after.s && echo same assembly
@@ -141,19 +141,19 @@ parameters (in the order of their first use), the one they define and
 `main` uses after them its result:
 
 ```console
-$ volec refactor extract-function main --lines 22-25 --to round_trips --show
-extracted lines 22-25 of crate::main into round_trips(out, gpa, s) -> bool	main.vl	+9 -4 lines
-// main.vl:22
-22	    let ok = round_trips(out, gpa, s);
-// main.vl:36-43
-36	}
-37	
-38	fn round_trips(out: [u8], gpa: Gpa, s: [u8]) -> bool {
-39	    let ok = match rle::decode(out, gpa) {
-40	        Some(back) => back.as_slice() == s,
-41	        None => false,
-42	    };
-43	    ok
+$ volec refactor extract-function main --lines 23-26 --to round_trips --show
+extracted lines 23-26 of crate::main into round_trips(out, gpa, s) -> bool	main.vl	+9 -4 lines
+// main.vl:23
+23	    let ok = round_trips(out, gpa, s);
+// main.vl:38-45
+38	}
+39	
+40	fn round_trips(out: &[u8], gpa: Gpa, s: &[u8]) -> bool {
+41	    let ok = match rle::decode(out, gpa) {
+42	        Some(back) => back.as_slice() == s,
+43	        None => false,
+44	    };
+45	    ok
 ```
 
 The compiled code changes now (there is a new function), so the

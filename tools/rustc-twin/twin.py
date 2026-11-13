@@ -1,8 +1,7 @@
 """The rustc twin (0.27.3, plan-0271 §2.2): a rust-edition vole program
 turned into Rust, built by stable rustc with the shim's prelude
 (tools/rustc-twin/prelude.rs) and run. Used by tools/rustc-twin.sh (cases
-with EXPECT lines) and tests/translate.sh --twin (the round trip's
-translations).
+with EXPECT lines).
 
 The text's changes, all the shim does not do as Rust items:
   - main: `fn main(gpa: Gpa) -> i32` becomes `fn vole_twin_main(..)`,
@@ -58,8 +57,7 @@ VOLE_ONLY = [r"\bArena\b", r"\bAnyAlloc\b", r"\bFixedBuf\b", r"Formatter::new\b"
 CHECK_ATTRS = r"(?m)^[ \t]*#\[(effects\([^)]*\)|pure|no_alloc|no_panic|total)\][ \t]*$"
 
 
-# (the cases' directives and their stdout's comparison, tests/run.sh's;
-# tests/translate.sh's too)
+# (the cases' directives and their stdout's comparison, tests/run.sh's)
 def directives(path):
     """tests/directives.awk's reading: a `//` line's KEY: VALUE."""
     d = {"expect": [], "stdin": [], "env": [], "stderr": [], "csource": [], "flags": [],
@@ -305,6 +303,10 @@ def to_rust(src, alloc_api=False):
     m = re.search(r"^\s*// RUSTC: none(.*)$", src, re.M)
     if m:
         return src, "RUSTC: none " + (m.group(1).strip() or "(no reason)")
+    # (0.28.0: a `volec test` build, its #[test] functions run by vole's
+    # runner with its own arguments and output: no `fn main` for rustc)
+    if re.search(r"^\s*// FLAGS:.*--test-build\b", src, re.M):
+        return src, "a `volec test` build (--test-build): the runner is vole's"
     # (a `use` anywhere in a line: the translator keeps a line's items on it)
     s = re.sub(r"(?<![\w:])(pub\s+)?use\s+[^;{}]*(\{[^{}]*\})?[^;{}]*;",
                lambda m: drop_uses(m.group(0)) or "", src)

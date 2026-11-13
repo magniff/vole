@@ -13,7 +13,7 @@
 #   --split DIR   (0.27.3) check nothing: write the blocks of every
 #                 compiler/guide/*.md to DIR/blocks/TOPIC-LINE/ (prog.vl
 #                 as compiled, and its in, out, exit or err), for
-#                 tests/translate.sh and tools/rustc-twin.sh
+#                 tools/rustc-twin.sh
 #
 # The code blocks of every topic (`volec guide NAME`), by the fence's
 # language:
@@ -43,13 +43,7 @@
 
 set -u
 LC_ALL=C
-# (0.27.2) The rust edition's examples are written against MVS's std
-# until they migrate to std2 (front-rust.md Z1): read with it, as the
-# cases marked `// ENV: VOLE_STD2=0` are. Gone by the release.
-VOLE_STD2=0
-export VOLE_STD2
 export LC_ALL
-
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 COMPILER="$ROOT/target/volec"
@@ -330,7 +324,7 @@ if ! "$COMPILER" guide --list >"$WORK/list" 2>&1; then
     result FAIL guide-list "volec guide --list failed:" "$(cat "$WORK/list")"
 fi
 missing=""
-for t in core language rust syntax types std errors unsafe c-interop arch modules generics traits closures iterators conversions formatting memory views tools gpu; do
+for t in core language rust syntax types std errors unsafe c-interop arch modules generics traits closures iterators conversions formatting memory tools gpu; do
     awk -F '\t' -v t="$t" '$1 == t { found = 1 } END { exit !found }' "$WORK/list" || missing="$missing $t"
 done
 if [ -n "$missing" ]; then
@@ -369,8 +363,8 @@ fi
 # --full (0.17) is the long form, topic language, with std's API in it.
 "$COMPILER" guide --full >"$WORK/full.md" 2>&1
 if [ "$(head -1 "$WORK/full.md")" = "$(head -1 "$WORK/topic-language.md")" ]; then
-    if grep -qF 'fn new_in(a: sink A) -> Vec<T, A>' "$WORK/full.md" \
-        && ! grep -qF 'fn new_in(a: sink A) -> Vec<T, A>' "$WORK/topic-language.md" \
+    if grep -qF 'fn new_in(a: A) -> Vec<T, A>' "$WORK/full.md" \
+        && ! grep -qF 'fn new_in(a: A) -> Vec<T, A>' "$WORK/topic-language.md" \
         && ! grep -q '@STD-API' "$WORK/full.md" "$WORK/topic-language.md"; then
         result pass guide-full
     else
@@ -407,7 +401,12 @@ printf 'fn main(gpa: Gpa) -> i32 {\n    let v: Vec<i64, Gpa> = Vec::new_in(gpa);
 if (cd "$WORK/std" && "$COMPILER" query items std --root main.vl) >"$WORK/std/items" 2>&1; then
     # (0.18: the index's signatures leave std's clauses out; 0.25.2.1: a
     # re-export, `pub use NAME = PATH`, is its item's, listed there)
-    awk -F '\t' '$3 ~ /^pub / && $3 !~ /^pub mod / && $3 !~ /^pub use / { s = $3; sub(/^pub /, "", s); sub(/ (debug )?(requires|ensures) .*$/, "", s); print s }' "$WORK/std/items" >"$WORK/std/want"
+    # (0.28.0: a `where` clause is on the signature's next line, not in the
+    # listing; left out here: the `pub(crate)` items, which `query items`
+    # prints as `pub`, and the two constants of the compiler's tail)
+    awk -F '\t' '$3 ~ /^pub / && $3 !~ /^pub mod / && $3 !~ /^pub use / { s = $3; sub(/^pub /, "", s); sub(/ (debug )?(requires|ensures) .*$/, "", s); sub(/ where .*$/, "", s); print s }' "$WORK/std/items" |
+        grep -v -e '^fn count_ones(x: u64)' -e '^fn leading_zeros(x: u64)' -e '^fn trailing_zeros(x: u64)' \
+            -e '^const CHECK_ALLOC:' -e '^const TARGET_OS:' -e '^fn int_range_error(' -e '^unsafe fn slice_parts' >"$WORK/std/want"
     : >"$WORK/std/missing"
     while IFS= read -r sig; do
         grep -qF -- "$sig" "$WORK/std/every.md" || echo "$sig" >>"$WORK/std/missing"
@@ -431,7 +430,13 @@ fi
 # the heaps' section, Vec's sort_by_key, retain, contains, first; 0.25:
 # 21500, std::min, max, clamp, abs and `(a..=b).rev()`; 0.26.2: 22000,
 # TryFrom and its impls, usize's and isize's; 0.27.0: 22400, Deref,
-# DerefMut, Index and IndexMut, for the rust edition);
+# DerefMut, Index and IndexMut; 0.28.0: 37000,
+# the one std, Rust's shape: the index leaves out whole modules
+# (stdapi.vl: index_hides), the types that borrow, the Debug builders and
+# the trait impls; std#the-api, the section the core guide names, is
+# under the 30000 characters again, without the traits Rust has the same
+# (std::ops, convert, clone, default), and the whole topic, 35000 at
+# most, says its size where it is named);
 # std#every-item is not in it. (0.18.1) `guide std` alone is its first
 # page: the most used names and where the rest is (std#the-api), 4500
 # bytes at most (the 0.18 eval's agents read all 18k of it before
@@ -439,22 +444,23 @@ fi
 "$COMPILER" guide std >"$WORK/std-page.md" 2>&1
 size=$(wc -c <"$WORK/topic-std.md" | tr -d ' ')
 page=$(wc -c <"$WORK/std-page.md" | tr -d ' ')
-if [ "$size" -le 22400 ] && [ "$page" -le 4500 ] \
+api=$("$COMPILER" guide 'std#the-api' 2>/dev/null | wc -c | tr -d ' ')
+if [ "$size" -le 35000 ] && [ "$api" -le 30000 ] && [ "$page" -le 4500 ] \
     && head -1 "$WORK/std-page.md" | grep -q '^# std$' \
     && grep -q '^## The most used$' "$WORK/std-page.md" \
-    && grep -qF 'Vec::new_in(gpa) -> Vec<T>' "$WORK/std-page.md" \
-    && grep -qF 'volec guide std#the-api' "$WORK/std-page.md" && grep -qF 'MinHeap::new_in(gpa)' "$WORK/std-page.md" \
+    && grep -qF 'Vec::new_in(gpa) -> Vec<T, Gpa>' "$WORK/std-page.md" \
+    && grep -qF 'volec guide std#the-api' "$WORK/std-page.md" && grep -qF 'HashMap::new_in(gpa)' "$WORK/std-page.md" \
     && ! grep -q '^## Overview$' "$WORK/std-page.md" && ! grep -q '@PAGE-END@' "$WORK/std-page.md" "$WORK/topic-std.md" \
-    && grep -q '^## Overview$' "$WORK/topic-std.md" && grep -qF 'fn push(inout self, x: sink T)' "$WORK/topic-std.md" \
-    && grep -qF 'fn split_in<A: Allocator>(s: [u8], sep: u8, a: sink A) -> Vec<[u8], A>' "$WORK/topic-std.md" \
-    && "$COMPILER" guide 'std#the-api' 2>&1 | grep -qF 'fn push(inout self, x: sink T)' \
+    && grep -q '^## Overview$' "$WORK/topic-std.md" && grep -qF 'fn push(&mut self, x: T)' "$WORK/topic-std.md" \
+    && grep -qF "fn split_whitespace(&self) -> SplitWhitespace<'_>" "$WORK/topic-std.md" \
+    && "$COMPILER" guide 'std#the-api' 2>&1 | grep -qF 'fn push(&mut self, x: T)' \
     && ! grep -q '^## Every item' "$WORK/topic-std.md" \
     && ! grep -qF 'fn __' "$WORK/topic-std.md" \
     && ! grep -qF 'live_blocks' "$WORK/topic-std.md" \
     && grep -q '^## Every item with its comment$' "$WORK/std/every.md"; then
     result pass guide-std-index
 else
-    result FAIL guide-std-index "volec guide std --whole is $size bytes (22400 at most), its first page $page (4500 at most), or not the index (most used first, then std#the-api)"
+    result FAIL guide-std-index "volec guide std --whole is $size bytes (35000 at most), std#the-api $api (30000 at most), its first page $page (4500 at most), or not the index (most used first, then std#the-api)"
 fi
 
 # (0.25.2) The GPU words agents searched for find guide gpu first: its
@@ -484,8 +490,8 @@ fi
 # section; TOPIC# the sections; --budget cuts any of it, with a note.
 "$COMPILER" guide --find read a line >"$WORK/find.out" 2>"$WORK/find.err"
 rc=$?
-if [ $rc -eq 0 ] && head -1 "$WORK/find.out" | grep -q '^# std#input$' \
-    && grep -q 'read_line(&buf)' "$WORK/find.out" \
+if [ $rc -eq 0 ] && head -1 "$WORK/find.out" | grep -q '^# conversions#reading-input$' \
+    && grep -qF 'read_line(&mut s)' "$WORK/find.out" \
     && [ "$(wc -c <"$WORK/find.out" | tr -d ' ')" -le 4000 ]; then
     result pass guide-find
 else
@@ -495,18 +501,18 @@ fi
 # command that prints its section.
 "$COMPILER" guide --find read a line --budget 5 >"$WORK/over.out" 2>"$WORK/over.err"
 rc=$?
-if [ $rc -eq 0 ] && [ "$(cat "$WORK/over.out")" = "# std#input" ] \
-    && grep -q '^try: .* guide std#input$' "$WORK/over.err"; then
+if [ $rc -eq 0 ] && [ "$(cat "$WORK/over.out")" = "# conversions#reading-input" ] \
+    && grep -q '^try: .* guide conversions#reading-input$' "$WORK/over.err"; then
     result pass guide-find-over
 else
     result FAIL guide-find-over "exit $rc:" "$(cat "$WORK/over.out")" "$(cat "$WORK/over.err")"
 fi
 # (0.17) A word naming a std item: its signature and comment first.
-"$COMPILER" guide --find split_in >"$WORK/finditem.out" 2>"$WORK/finditem.err"
+"$COMPILER" guide --find split_whitespace >"$WORK/finditem.out" 2>"$WORK/finditem.err"
 rc=$?
 if [ $rc -eq 0 ] && head -1 "$WORK/finditem.out" | grep -q '^# std#every-item$' \
-    && grep -qF 'fn split_in<A: Allocator>(s: [u8], sep: u8, a: sink A) -> Vec<[u8], A>' "$WORK/finditem.out" \
-    && grep -q '^// The parts of s' "$WORK/finditem.out" \
+    && grep -qF "fn split_whitespace(&self) -> SplitWhitespace<'_>" "$WORK/finditem.out" \
+    && grep -q '^    // The pieces between runs of Unicode white space' "$WORK/finditem.out" \
     && [ "$(wc -c <"$WORK/finditem.out" | tr -d ' ')" -le 4000 ]; then
     result pass guide-find-item
 else
@@ -514,7 +520,7 @@ else
 fi
 "$COMPILER" guide --find vec::push >"$WORK/findm.out" 2>&1
 if grep -q '^impl<T, A: Allocator> Vec<T, A> {$' "$WORK/findm.out" \
-    && grep -qF '    fn push(inout self, x: sink T)' "$WORK/findm.out" \
+    && grep -qF '    fn push(&mut self, x: T)' "$WORK/findm.out" \
     && ! grep -qF 'fn pop' "$WORK/findm.out"; then
     result pass guide-find-method
 else
@@ -531,13 +537,13 @@ if [ -z "$missed" ]; then
 else
     result FAIL guide-find-arch "not first on guide arch:$missed"
 fi
-# (0.20) The words of the parameter conventions, and Rust's for them,
-# land on the sections that teach them.
+# (0.20) The words of borrowing land on the sections that teach them
+# (0.28.0: memory's borrowing, `&T` and `&mut T`; the old parameter
+# conventions are gone from it).
 missed=""
-# (a Rust spelling: memory's conventions or rust's mapping of them)
-for pair in 'inout:memory#conventions' 'sink:memory#conventions' 'borrow:memory#conventions' \
-    'mutable reference:(memory#conventions|rust#parameters)' '&mut:(memory#conventions|rust#parameters)' \
-    'let mut:(memory#conventions|rust#parameters)' 'move closure:closures#sink-closures'; do
+for pair in 'borrows:memory#borrowing' \
+    'mutable reference:memory#borrowing' '&mut:memory#borrowing' \
+    'let mut:(memory#borrowing|core#the-language-in-one-program)' 'move closure:closures#move-closures'; do
     w=${pair%%:*}
     want=${pair#*:}
     "$COMPILER" guide --find $w 2>/dev/null | head -1 >"$WORK/findconv.out"
@@ -601,35 +607,38 @@ for c in "" edit "edit patch" refactor "refactor signature" fix fmt check undo e
 done
 result pass help
 
-# volec try (0.15): a snippet run with std; its last value and type,
-# its output, its errors at the snippet's lines, its exit code.
-try_case() { # <name> <expected output> <snippet...>
+# volec try (0.15; 0.28.0: a rust snippet, on std2): a snippet run with
+# std; its last value (printed by Debug; a type with none, its type
+# alone) and type, its output, its errors at the snippet's lines, its
+# exit code.
+rust_try_case() { # <name> <expected output> <snippet...>
     n=$1
     want=$2
     shift 2
     got=$("$COMPILER" try "$@" 2>&1)
     if [ "$got" = "$want" ]; then
-        result pass "try-$n"
+        result pass "try-rust-$n"
     else
-        result FAIL "try-$n" "expected:" "$want" "got:" "$got"
+        result FAIL "try-rust-$n" "expected:" "$want" "got:" "$got"
     fi
 }
-try_case int 'i64 = 3' '1 + 2'
-try_case std 'Option<i64> = Some(42)' 'parse_int("42").ok()'
-try_case vec 'Vec<i64, Gpa> = [4, 5]' 'var v: Vec<i64, Gpa> = Vec::new_in(gpa); v.push(4); v.push(5); v'
-try_case output "hi
-[u8] = \"abc\"" 'println("hi"); "abc"'
-try_case item 'i64 = 49' 'fn sq(x: i64) -> i64 { x * x } sq(7)'
-try_case tuple '(i64, bool) = (1, true)' '(1, true)'
-try_case unit '' 'let x = 3;'
-try_case error "snippet:2:5: error[type error] expected 'i64', got '[u8]'" 'let a = 1;
+rust_try_case int 'i32 = 3' '1 + 2'
+rust_try_case std 'Option<i64> = Some(42)' '"42".parse::<i64>().ok()'
+rust_try_case vec 'Vec<i64, Gpa> = [4, 5]' 'let mut v: Vec<i64, Gpa> = Vec::new_in(gpa); v.push(4); v.push(5); v'
+rust_try_case tuple '(u8, Option<bool>) = (2, Some(true))' '(2u8, Some(true))'
+rust_try_case output "hi
+f64 = 1.5" 'println("hi"); 1.5'
+rust_try_case nodebug 'P' 'struct P { x: i32 } P { x: 1 }'
+rust_try_case item 'i64 = 49' 'fn sq(x: i64) -> i64 { x * x } sq(7)'
+rust_try_case unit '' 'let x = 3;'
+rust_try_case error "snippet:2:1: error[type error] expected '&str', got 'i32'" 'let a = 1;
 a + "b"'
-try_case panic 'snippet:1:42: index out of bounds: index 3, length 0
-exit 101' 'let v: Vec<i64, Gpa> = Vec::new_in(gpa); v.get(3)'
+rust_try_case panic 'snippet:1:42: index out of bounds: index 3, length 0
+exit 101' 'let v: Vec<i64, Gpa> = Vec::new_in(gpa); v[3]'
 printf 'struct P { x: i64 }\n\nlet p = P { x: 4 };\np.x * 10\n' >"$WORK/snip.vl"
-try_case file 'i64 = 40' --file "$WORK/snip.vl"
-got=$(printf '7\n' | "$COMPILER" try 'var b = String::new_in(gpa); read_line(&b).unwrap(); parse_int(b.as_slice()).ok()' 2>&1)
-if [ "$got" = 'Option<i64> = Some(7)' ]; then result pass try-stdin; else result FAIL try-stdin "$got"; fi
+rust_try_case file 'i64 = 40' --file "$WORK/snip.vl"
+got=$(printf '7\n' | "$COMPILER" try 'let mut b = String::new_in(gpa); std::io::stdin().read_line(&mut b).unwrap(); b.trim().parse::<i64>().ok()' 2>&1)
+if [ "$got" = 'Option<i64> = Some(7)' ]; then result pass try-rust-stdin; else result FAIL try-rust-stdin "$got"; fi
 "$COMPILER" try >"$WORK/try.out" 2>&1
 rc=$?
 if [ $rc -eq 2 ] && grep -q '^error try.usage: ' "$WORK/try.out" && grep -q "^try: .* try 'let v" "$WORK/try.out"; then

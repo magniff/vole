@@ -12,23 +12,25 @@
 // - The first error stops the translation: it is recorded, and from then
 //   on every token reads as the end of the file, so the parse unwinds.
 
-use std::{Buf, ScopedArena, Vec};
+use crate::mem;
+use crate::alloc::Allocator;
 
-use ir::{
+use super::{entry, ir, lex, names};
+use super::ir::{
     ACC_READ, ACC_RW, ACC_WRITE, BIND_BUILTIN, BIND_LOCATION, Binding, E_ARG, E_CALL_RESULT,
     E_GLOBAL, E_LOCAL, Entry, Function, Global, INTERP_FLAT, INTERP_LINEAR, INTERP_PERSPECTIVE,
     Local, Module, Param, SK_BOOL, SK_F32, SK_I32, SK_U32, SP_FUNCTION, SP_HANDLE, SP_PRIVATE,
     SP_STORAGE, SP_UNIFORM, SP_WORKGROUP, STAGE_COMPUTE, STAGE_FRAGMENT, STAGE_VERTEX, S_BLOCK,
     S_BREAK, S_CALL, S_CONTINUE, S_EMIT, S_IF, S_KILL, S_LOOP, S_RETURN, S_STORE, S_SWITCH,
     StructMember, TK_ARRAY, TK_ATOMIC, TK_MATRIX, TK_POINTER, TK_SAMPLER, TK_SCALAR, TK_STRUCT,
-    TK_TEXTURE, TK_VECTOR, T_BOOL, T_F32, T_I32, T_U32, V, new_function, no_binding,
+    TK_TEXTURE, TK_VECTOR, T_BOOL, T_F32, T_I32, T_U32, new_function, no_binding,
 };
-use lex::{
+use super::lex::{
     T_ARROW, T_AT, T_COLON, T_COMMA, T_EOF, T_EQ, T_GT, T_IDENT, T_LBRACE, T_LBRACKET, T_LPAREN,
     T_LT, T_MINUSMINUS, T_PLUSPLUS, T_RBRACE, T_RBRACKET, T_RPAREN, T_SEMI, T_SHR, T_UNDERSCORE,
     Tokens, token_text,
 };
-use names::{
+use super::names::{
     K_ALIAS, K_ALIGN, K_BINDING, K_BREAK, K_BUILTIN, K_CASE, K_CENTER, K_CENTROID, K_COMPUTE,
     K_CONST, K_CONST_ASSERT, K_CONTINUE, K_CONTINUING, K_DEFAULT, K_DIAGNOSTIC, K_DISCARD, K_ELSE,
     K_ENABLE, K_FLAT, K_FN, K_FOR, K_FRAGMENT, K_GROUP, K_ID, K_IF, K_INTERPOLATE, K_INVARIANT,
@@ -39,53 +41,60 @@ use names::{
 // ---- Shader compiler implementation, front: Values (0.22) ----
 
 // an IR expression's value
-pub const VK_VALUE: u8 = 0;
+pub(crate) const VK_VALUE: u8 = 0;
 // a reference: `e` is a pointer, read by the Load Rule where a value is needed
-pub const VK_REF: u8 = 1;
+pub(crate) const VK_REF: u8 = 1;
 // a constant scalar not yet in the IR: iv (bool, integers) or fv (floats);
 // sk may be abstract; ty is its type, -1 when abstract
-pub const VK_CONST: u8 = 2;
+pub(crate) const VK_CONST: u8 = 2;
 // a module-scope or local name that is a type (in a constructor call)
-pub const VK_TYPE: u8 = 3;
+pub(crate) const VK_TYPE: u8 = 3;
 // no value (a call of a function without a result)
-pub const VK_VOID: u8 = 4;
+pub(crate) const VK_VOID: u8 = 4;
 
-pub struct Val { pub k: u8, pub sk: u8, pub e: i64, pub ty: i64, pub iv: i64, pub fv: f64 }
+#[derive(Clone, Copy)] pub struct Val {
+    pub k: u8, pub sk: u8, pub e: i64, pub ty: i64, pub iv: i64, pub fv: f64,
+}
 
-pub fn val(e: i64, ty: i64) -> Val { Val { k: VK_VALUE, sk: 0, e: e, ty: ty, iv: 0, fv: 0.0 } }
+#[effects()]
+pub(crate) fn val(e: i64, ty: i64) -> Val {
+    Val { k: VK_VALUE, sk: 0, e: e, ty: ty, iv: 0, fv: 0.0 }
+}
 
-pub fn cint(sk: u8, ty: i64, v: i64) -> Val {
+#[effects()]
+pub(crate) fn cint(sk: u8, ty: i64, v: i64) -> Val {
     Val { k: VK_CONST, sk: sk, e: -1, ty: ty, iv: v, fv: 0.0 }
 }
 
-pub fn cfloat(sk: u8, ty: i64, v: f64) -> Val {
+#[effects()]
+pub(crate) fn cfloat(sk: u8, ty: i64, v: f64) -> Val {
     Val { k: VK_CONST, sk: sk, e: -1, ty: ty, iv: 0, fv: v }
 }
 
 // ---- Shader compiler implementation, front: Declarations (0.22) ----
 
-pub const D_FN: u8 = 0;
-pub const D_STRUCT: u8 = 1;
-pub const D_VAR: u8 = 2;
-pub const D_CONST: u8 = 3;
-pub const D_ALIAS: u8 = 4;
+pub(crate) const D_FN: u8 = 0;
+pub(crate) const D_STRUCT: u8 = 1;
+pub(crate) const D_VAR: u8 = 2;
+pub(crate) const D_CONST: u8 = 3;
+pub(crate) const D_ALIAS: u8 = 4;
 
-pub const DS_TODO: u8 = 0;
-pub const DS_BUSY: u8 = 1;
-pub const DS_DONE: u8 = 2;
+pub(crate) const DS_TODO: u8 = 0;
+pub(crate) const DS_BUSY: u8 = 1;
+pub(crate) const DS_DONE: u8 = 2;
 
 // tok: the token after the attributes (the keyword); attr: the first
 // attribute's token; h: the type, global or function once resolved; cv:
 // a constant's value once known (scalars)
-pub struct Decl {
-    pub kind: u8, state: u8, sym: i64, tok: i64, attr: i64, pub h: i64, pub cv: Val,
-    pub has_cv: bool,
+#[derive(Clone, Copy)] pub struct Decl {
+    pub(crate) kind: u8, state: u8, sym: i64, tok: i64, attr: i64, pub h: i64, pub cv: Val,
+    pub(crate) has_cv: bool,
 }
 
 // A name in a function's scopes.
-pub struct ScopeEntry { pub sym: i64, pub v: Val, mutable: bool }
+#[derive(Clone, Copy)] pub struct ScopeEntry { pub sym: i64, pub v: Val, mutable: bool }
 
-pub struct Attrs {
+#[derive(Clone, Copy)] pub struct Attrs {
     stage: i64,
     wg: [i64; 3],
     group: i64,
@@ -96,27 +105,27 @@ pub struct Attrs {
     pos: i64,
 }
 
-pub struct Front<A: Allocator> {
-    pub src: [u8],
-    pub tk: Tokens<A>,
-    pub p: i64,
-    pub m: Module<A>,
-    pub a: A,
+pub struct Front<'a, A: Allocator> {
+    pub(crate) src: &'a [u8],
+    pub(crate) tk: Tokens<'a, A>,
+    pub(crate) p: i64,
+    pub m: Module<'a, A>,
+    pub(crate) a: A,
     pub failed: bool,
-    pub err_code: [u8],
+    pub err_code: &'static [u8],
     pub err_pos: i64,
-    pub emsg: Buf<A>,
-    pub ehelp: Buf<A>,
-    pub decls: Vec<Decl, A>,
+    pub emsg: Vec<u8, A>,
+    pub ehelp: Vec<u8, A>,
+    pub(crate) decls: Vec<Decl, A>,
     // symbol -> its declaration, or -1
-    pub decl_of: Vec<i64, A>,
+    pub(crate) decl_of: Vec<i64, A>,
     // the function being lowered
-    pub f: Function<A>,
-    pub fh: i64,
-    pub pending: Vec<i64, A>,
+    pub(crate) f: Function<'a, A>,
+    pub(crate) fh: i64,
+    pub(crate) pending: Vec<i64, A>,
     emit_start: i64,
-    pub scopes: Vec<ScopeEntry, A>,
-    pub scope_floor: i64,
+    pub(crate) scopes: Vec<ScopeEntry, A>,
+    pub(crate) scope_floor: i64,
     // global -> its E_GLOBAL in f, or -1
     gexpr: Vec<i64, A>,
     loop_depth: i64,
@@ -124,23 +133,24 @@ pub struct Front<A: Allocator> {
     in_continuing: bool,
     // the start of each loop's body scope (for `continuing`'s check)
     // the stage of the entry point being lowered (255: a plain function)
-    pub stage: i64,
+    pub(crate) stage: i64,
     // the compare-exchange result types: [i32's, u32's], -1 until made
-    pub cmpxchg_ty: [i64; 2],
-    pub tmp: Buf<A>,
+    pub(crate) cmpxchg_ty: [i64; 2],
+    pub(crate) tmp: Vec<u8, A>,
     // the expected type of the expression being parsed (for inferred
     // constructors of abstract numbers), or -1
-    pub hint: i64,
+    pub(crate) hint: i64,
     // the token after the last call's `)`, and whether a statement was one
-    pub last_call_end: i64,
-    pub last_was_call: bool,
+    pub(crate) last_call_end: i64,
+    pub(crate) last_was_call: bool,
     // call arguments being parsed, with their positions; lowered ones
-    pub astack: Vec<Val, A>,
-    pub apos: Vec<i64, A>,
-    pub estack: Vec<i64, A>,
+    pub(crate) astack: Vec<Val, A>,
+    pub(crate) apos: Vec<i64, A>,
+    pub(crate) estack: Vec<i64, A>,
 }
 
-pub fn new_front(src: [u8], a: ScopedArena) -> Front<ScopedArena> {
+#[effects(A)]
+pub fn new_front<'a, A: Allocator + Copy>(src: &'a [u8], a: A) -> Front<'a, A> {
     let tk = lex::lex(src, a);
     Front {
         src: src,
@@ -149,13 +159,13 @@ pub fn new_front(src: [u8], a: ScopedArena) -> Front<ScopedArena> {
         m: Module::new(a),
         a: a,
         failed: false,
-        err_code: "",
+        err_code: b"",
         err_pos: 0,
-        emsg: Buf::new_in(a),
-        ehelp: Buf::new_in(a),
+        emsg: Vec::new_in(a),
+        ehelp: Vec::new_in(a),
         decls: Vec::new_in(a),
         decl_of: Vec::new_in(a),
-        f: new_function("", a),
+        f: new_function(b"", a),
         fh: -1,
         pending: Vec::new_in(a),
         emit_start: 0,
@@ -167,7 +177,7 @@ pub fn new_front(src: [u8], a: ScopedArena) -> Front<ScopedArena> {
         in_continuing: false,
         stage: 255,
         cmpxchg_ty: [-1, -1],
-        tmp: Buf::new_in(a),
+        tmp: Vec::new_in(a),
         hint: -1,
         last_call_end: -1,
         last_was_call: false,
@@ -177,12 +187,13 @@ pub fn new_front(src: [u8], a: ScopedArena) -> Front<ScopedArena> {
     }
 }
 
-impl Front<ScopedArena> {
+impl<'a, A: Allocator + Copy> Front<'a, A> {
     // ---- Errors ----
 
     // Records an error at byte `pos` with `code`; true when it is the
     // first (the caller then writes the message into emsg).
-    pub fn err(inout self, pos: i64, code: [u8]) -> bool {
+    #[effects()]
+    pub(crate) fn err(&mut self, pos: i64, code: &'static [u8]) -> bool {
         if self.failed {
             return false;
         }
@@ -192,31 +203,35 @@ impl Front<ScopedArena> {
         true
     }
 
-    pub fn fail(inout self, pos: i64, code: [u8], msg: [u8]) {
+    #[effects(A)]
+    pub(crate) fn fail(&mut self, pos: i64, code: &'static [u8], msg: &[u8]) {
         if self.err(pos, code) {
-            self.emsg.push_str(msg);
+            self.emsg.extend_from_slice(msg);
         }
     }
 
-    pub fn help(inout self, h: [u8]) {
+    #[effects(A)]
+    pub(crate) fn help(&mut self, h: &[u8]) {
         if self.ehelp.len() as i64 == 0 {
-            self.ehelp.push_str(h);
+            self.ehelp.extend_from_slice(h);
         }
     }
 
-    pub fn ty_str(inout self, t: i64) {
-        self.m.type_name(t, &self.emsg);
+    #[effects(A)]
+    pub(crate) fn ty_str(&mut self, t: i64) {
+        self.m.type_name(t, &mut self.emsg);
     }
 
     // The type of a value as WGSL writes it, into emsg.
-    pub fn val_str(inout self, v: Val) {
+    #[effects(A)]
+    pub(crate) fn val_str(&mut self, v: Val) {
         if v.k == VK_CONST && v.ty < 0 {
-            self.emsg.push_str(ir::scalar_name(v.sk));
+            self.emsg.extend_from_slice(ir::scalar_name(v.sk));
         } else if v.k == VK_REF {
-            self.emsg.push_str("ref to ");
+            self.emsg.extend_from_slice(b"ref to ");
             self.ty_str(self.m.pointee(v.ty));
         } else if v.k == VK_VOID {
-            self.emsg.push_str("nothing (a call without a result)");
+            self.emsg.extend_from_slice(b"nothing (a call without a result)");
         } else {
             self.ty_str(v.ty);
         }
@@ -224,39 +239,46 @@ impl Front<ScopedArena> {
 
     // ---- Tokens ----
 
-    pub fn kind(self) -> u8 {
+    #[effects(panic, A)]
+    pub(crate) fn kind(&self) -> u8 {
         if self.failed {
             T_EOF
         } else {
-            self.tk.kinds[self.p]
+            self.tk.kinds[self.p as usize]
         }
     }
 
-    pub fn kind_at(self, i: i64) -> u8 {
+    #[effects(panic, A)]
+    pub(crate) fn kind_at(&self, i: i64) -> u8 {
         if self.failed || i >= self.tk.kinds.len() as i64 {
             T_EOF
         } else {
-            self.tk.kinds[i]
+            self.tk.kinds[i as usize]
         }
     }
 
-    pub fn sym(self) -> i64 {
+    pub(crate) fn sym(&self) -> i64 {
         if self.failed {
             -1
         } else {
-            self.tk.syms[self.p]
+            self.tk.syms[self.p as usize]
         }
     }
 
-    pub fn pos(self) -> i64 { self.tk.starts[self.p] }
+    #[effects(panic, A)]
+    pub(crate) fn pos(&self) -> i64 { self.tk.starts[self.p as usize] }
 
-    pub fn text(self, i: i64) -> [u8] { self.src[self.tk.starts[i]..self.tk.ends[i]] }
+    #[effects(panic, A)]
+    pub(crate) fn text(&self, i: i64) -> &'a [u8] { &self.src[
+        self.tk.starts[i as usize] as usize..self.tk.ends[i as usize] as usize] }
 
-    pub fn is_kw(self, k: i64) -> bool {
-        self.kind() == T_IDENT && self.tk.syms[self.p] == k
+    #[effects(panic, A)]
+    pub(crate) fn is_kw(&self, k: i64) -> bool {
+        self.kind() == T_IDENT && self.tk.syms[self.p as usize] == k
     }
 
-    pub fn eat(inout self, k: u8) -> bool {
+    #[effects(A)]
+    pub(crate) fn eat(&mut self, k: u8) -> bool {
         if self.kind() == k {
             self.p += 1;
             true
@@ -265,7 +287,8 @@ impl Front<ScopedArena> {
         }
     }
 
-    pub fn eat_kw(inout self, k: i64) -> bool {
+    #[effects(A)]
+    pub(crate) fn eat_kw(&mut self, k: i64) -> bool {
         if self.is_kw(k) {
             self.p += 1;
             true
@@ -274,7 +297,8 @@ impl Front<ScopedArena> {
         }
     }
 
-    pub fn expect(inout self, k: u8) {
+    #[effects(panic, diverge, A)]
+    pub(crate) fn expect(&mut self, k: u8) {
         if self.kind() == k {
             self.p += 1;
             return;
@@ -283,29 +307,31 @@ impl Front<ScopedArena> {
             return;
         }
         let got = self.kind();
-        if self.err(self.pos(), "wgsl.syntax") {
-            self.emsg.push_fmt("expected {}, got ", token_text(k));
+        if self.err(self.pos(), b"wgsl.syntax") {
+            write(self.emsg, "expected {}, got ", str::from_utf8(token_text(k)).unwrap()).unwrap();
             if got == T_IDENT {
-                self.emsg.push_fmt("'{}'", self.text(self.p));
+                write(self.emsg, "'{}'", str::from_utf8(self.text(self.p)).unwrap()).unwrap();
             } else {
-                self.emsg.push_str(token_text(got));
+                self.emsg.extend_from_slice(token_text(got));
             }
         }
     }
 
     // `>` closing a template list; a `>>` token gives one `>` and leaves one.
-    pub fn expect_gt(inout self) {
+    #[effects(panic, A)]
+    pub(crate) fn expect_gt(&mut self) {
         if self.kind() == T_SHR {
-            self.tk.kinds[self.p] = T_GT;
-            self.tk.starts[self.p] += 1;
+            self.tk.kinds[self.p as usize] = T_GT;
+            self.tk.starts[self.p as usize] += 1;
             return;
         }
         self.expect(T_GT);
     }
 
-    pub fn ident(inout self) -> i64 {
+    #[effects(panic, A)]
+    pub(crate) fn ident(&mut self) -> i64 {
         if self.kind() == T_IDENT {
-            let s = self.tk.syms[self.p];
+            let s = self.tk.syms[self.p as usize];
             self.p += 1;
             return s;
         }
@@ -313,17 +339,19 @@ impl Front<ScopedArena> {
         -1
     }
 
-    pub fn name_of(self, sym: i64) -> [u8] {
+    #[effects(panic, A)]
+    pub(crate) fn name_of(&self, sym: i64) -> &'a [u8] {
         if sym < 0 {
-            "_"
+            b"_"
         } else {
-            self.tk.names[sym]
+            self.tk.names[sym as usize]
         }
     }
 
     // ---- Statements of the function being built ----
 
-    pub fn flush(inout self) {
+    #[effects(A)]
+    pub(crate) fn flush(&mut self) {
         let n = self.f.exprs.len() as i64;
         if n > self.emit_start {
             let s = self.f.stmt(S_EMIT, self.emit_start, n, 0, 0);
@@ -332,7 +360,8 @@ impl Front<ScopedArena> {
         }
     }
 
-    pub fn push_stmt(inout self, op: u8, a: i64, b: i64, c: i64, d: i64) -> i64 {
+    #[effects(A)]
+    pub(crate) fn push_stmt(&mut self, op: u8, a: i64, b: i64, c: i64, d: i64) -> i64 {
         self.flush();
         let s = self.f.stmt(op, a, b, c, d);
         self.pending.push(s);
@@ -340,29 +369,31 @@ impl Front<ScopedArena> {
     }
 
     // An expression made outside every emit range (a call's result).
-    pub fn unemitted(inout self, op: u8, ty: i64) -> i64 {
+    #[effects(A)]
+    pub(crate) fn unemitted(&mut self, op: u8, ty: i64) -> i64 {
         self.flush();
         let e = self.f.expr(op, ty, 0, 0, 0);
         self.emit_start = self.f.exprs.len() as i64;
         e
     }
 
-    pub fn global_expr(inout self, g: i64) -> i64 {
-        if self.gexpr[g] >= 0 {
-            return self.gexpr[g];
+    #[effects(panic, A)]
+    pub(crate) fn global_expr(&mut self, g: i64) -> i64 {
+        if self.gexpr[g as usize] >= 0 {
+            return self.gexpr[g as usize];
         }
-        let gl = self.m.globals[g];
+        let gl = self.m.globals[g as usize];
         let ty = if gl.space == SP_HANDLE { gl.ty }
             else { self.m.ptr_ty(gl.ty, gl.space, gl.access) };
         let e = self.f.expr(E_GLOBAL, ty, g, 0, 0);
-        self.gexpr[g] = e;
+        self.gexpr[g as usize] = e;
         e
     }
 
     // ---- The module ----
 
     // Finds every module-scope declaration, without resolving any.
-    fn skim(inout self) {
+    fn skim(&mut self) {
         for _ in 0..self.tk.names.len() as i64 {
             self.decl_of.push(-1);
         }
@@ -378,28 +409,31 @@ impl Front<ScopedArena> {
                 }
                 self.p += 1;
                 let what = self.text(self.p);
-                if self.err(at, "wgsl.unsupported") {
-                    self.emsg.push_fmt(
-                        "'{what}' is not in the WGSL subset of this release (no extensions)");
-                    self.help("remove the directive; f16 and the other extensions come later");
+                if self.err(at, b"wgsl.unsupported") {
+                    {
+                        let what = str::from_utf8(what).unwrap();
+                        write(self.emsg,
+                            "'{what}' is not in the WGSL subset of this release (no extensions)").unwrap();
+                    }
+                    self.help(b"remove the directive; f16 and the other extensions come later");
                 }
                 return;
             }
             if self.is_kw(K_CONST_ASSERT) {
-                self.fail(self.pos(), "wgsl.unsupported",
-                    "'const_assert' is not in the WGSL subset of this release");
+                self.fail(self.pos(), b"wgsl.unsupported",
+                    b"'const_assert' is not in the WGSL subset of this release");
                 return;
             }
             if self.is_kw(K_OVERRIDE) {
-                self.fail(self.pos(), "wgsl.unsupported",
-                    "'override' constants are not in the WGSL subset of this release");
-                self.help("use a 'const', or a uniform buffer");
+                self.fail(self.pos(), b"wgsl.unsupported",
+                    b"'override' constants are not in the WGSL subset of this release");
+                self.help(b"use a 'const', or a uniform buffer");
                 return;
             }
             if self.eat(T_SEMI) {
                 continue;
             }
-            var kind = D_FN;
+            let mut kind = D_FN;
             if self.is_kw(K_FN) {
                 kind = D_FN;
             } else if self.is_kw(K_STRUCT) {
@@ -411,18 +445,18 @@ impl Front<ScopedArena> {
             } else if self.is_kw(K_ALIAS) {
                 kind = D_ALIAS;
             } else {
-                if self.kind() == T_IDENT && self.text(self.p) == "let" {
-                    self.fail(self.pos(), "wgsl.syntax", "'let' is not allowed at module scope");
-                    self.help("use 'const' for a module-scope constant");
+                if self.kind() == T_IDENT && self.text(self.p) == b"let" {
+                    self.fail(self.pos(), b"wgsl.syntax", b"'let' is not allowed at module scope");
+                    self.help(b"use 'const' for a module-scope constant");
                     return;
                 }
-                if self.err(self.pos(), "wgsl.syntax") {
-                    self.emsg.push_str(
-                        "expected a declaration ('fn', 'struct', 'var', 'const', 'alias'), got ");
+                if self.err(self.pos(), b"wgsl.syntax") {
+                    self.emsg.extend_from_slice(
+                        b"expected a declaration ('fn', 'struct', 'var', 'const', 'alias'), got ");
                     if self.kind() == T_IDENT {
-                        self.emsg.push_fmt("'{}'", self.text(self.p));
+                        write(self.emsg, "'{}'", str::from_utf8(self.text(self.p)).unwrap()).unwrap();
                     } else {
-                        self.emsg.push_str(token_text(self.kind()));
+                        self.emsg.extend_from_slice(token_text(self.kind()));
                     }
                 }
                 return;
@@ -434,14 +468,14 @@ impl Front<ScopedArena> {
             let at = self.pos();
             let sym = self.ident();
             if sym >= 0 {
-                if self.decl_of[sym] >= 0 {
-                    if self.err(at, "wgsl.redefined") {
-                        self.emsg.push_fmt(
-                            "'{}' is declared twice at module scope", self.name_of(sym));
+                if self.decl_of[sym as usize] >= 0 {
+                    if self.err(at, b"wgsl.redefined") {
+                        write(self.emsg, "'{}' is declared twice at module scope",
+                            str::from_utf8(self.name_of(sym)).unwrap()).unwrap();
                     }
                     return;
                 }
-                self.decl_of[sym] = self.decls.len() as i64;
+                self.decl_of[sym as usize] = self.decls.len() as i64;
             }
             self.decls.push(Decl {
                 kind: kind, state: DS_TODO, sym: sym, tok: tok, attr: attr, h: -1,
@@ -461,7 +495,7 @@ impl Front<ScopedArena> {
         }
     }
 
-    fn skip_attrs(inout self) {
+    fn skip_attrs(&mut self) {
         while self.kind() == T_AT {
             self.p += 1;
             self.ident();
@@ -472,8 +506,8 @@ impl Front<ScopedArena> {
     }
 
     // Skips a bracketed group from its opening token.
-    fn skip_balanced(inout self) {
-        var depth = 0;
+    fn skip_balanced(&mut self) {
+        let mut depth: i64 = 0;
         loop {
             let k = self.kind();
             if k == T_EOF {
@@ -491,8 +525,8 @@ impl Front<ScopedArena> {
         }
     }
 
-    fn skip_template(inout self) {
-        var depth = 0;
+    fn skip_template(&mut self) {
+        let mut depth: i64 = 0;
         loop {
             let k = self.kind();
             if k == T_EOF {
@@ -512,7 +546,7 @@ impl Front<ScopedArena> {
         }
     }
 
-    fn skip_to_semi(inout self) {
+    fn skip_to_semi(&mut self) {
         while self.kind() != T_SEMI && self.kind() != T_EOF {
             let k = self.kind();
             if k == T_LPAREN || k == T_LBRACE || k == T_LBRACKET {
@@ -525,16 +559,18 @@ impl Front<ScopedArena> {
     }
 
     // Resolves the whole module: types, globals, signatures, then bodies.
-    pub fn module(inout self) {
+    #[effects(panic, diverge, A)]
+    pub fn module(&mut self) {
         if self.tk.open_comment >= 0 {
-            self.fail(self.tk.open_comment, "wgsl.syntax", "this block comment is not closed");
+            self.fail(self.tk.open_comment, b"wgsl.syntax", b"this block comment is not closed");
             return;
         }
         for i in 0..self.tk.kinds.len() as i64 {
-            if self.tk.kinds[i] == lex::T_BAD {
+            if self.tk.kinds[i as usize] == lex::T_BAD {
                 self.p = i;
-                if self.err(self.pos(), "wgsl.syntax") {
-                    self.emsg.push_fmt("unexpected character '{}'", self.text(i));
+                if self.err(self.pos(), b"wgsl.syntax") {
+                    write(self.emsg, "unexpected character '{}'",
+                        str::from_utf8(self.text(i)).unwrap()).unwrap();
                 }
                 return;
             }
@@ -545,15 +581,15 @@ impl Front<ScopedArena> {
         }
         // function handles, in declaration order
         for i in 0..self.decls.len() as i64 {
-            if self.decls[i].kind == D_FN {
-                self.decls[i].h = self.m.functions.len() as i64;
-                let f = new_function(self.name_of(self.decls[i].sym), self.a);
+            if self.decls[i as usize].kind == D_FN {
+                self.decls[i as usize].h = self.m.functions.len() as i64;
+                let f = new_function(self.name_of(self.decls[i as usize].sym), self.a);
                 self.m.functions.push(f);
             }
         }
-        self.f = std::replace(&self.m.consts, new_function("", self.a));
+        self.f = mem::replace(&mut self.m.consts, new_function(b"", self.a));
         for i in 0..self.decls.len() as i64 {
-            let k = self.decls[i].kind;
+            let k = self.decls[i as usize].kind;
             if k == D_STRUCT || k == D_ALIAS {
                 self.resolve_type_decl(i);
             } else if k == D_VAR {
@@ -565,9 +601,9 @@ impl Front<ScopedArena> {
                 return;
             }
         }
-        self.m.consts = std::replace(&self.f, new_function("", self.a));
+        self.m.consts = mem::replace(&mut self.f, new_function(b"", self.a));
         for i in 0..self.decls.len() as i64 {
-            if self.decls[i].kind == D_FN {
+            if self.decls[i as usize].kind == D_FN {
                 self.signature(i);
             }
             if self.failed {
@@ -575,7 +611,7 @@ impl Front<ScopedArena> {
             }
         }
         for i in 0..self.decls.len() as i64 {
-            if self.decls[i].kind == D_FN {
+            if self.decls[i as usize].kind == D_FN {
                 self.lower_fn(i);
             }
             if self.failed {
@@ -587,19 +623,20 @@ impl Front<ScopedArena> {
 
     // ---- Attributes ----
 
-    fn const_int_arg(inout self) -> i64 {
+    fn const_int_arg(&mut self) -> i64 {
         let at = self.pos();
         let v = self.parse_expr();
         if v.k != VK_CONST || v.sk == SK_F32 || v.sk == ir::SK_AFLOAT || v.sk == SK_BOOL {
-            self.fail(at, "wgsl.type", "expected a constant integer");
+            self.fail(at, b"wgsl.type", b"expected a constant integer");
             return 0;
         }
         v.iv
     }
 
-    pub fn parse_attrs(inout self) -> Attrs {
-        var at = Attrs {
-            stage: -1, wg: [0, 0, 0], group: -1, binding: -1, loc: -1, builtin: -1, interp: -1,
+    #[effects(panic, diverge, A)]
+    pub(crate) fn parse_attrs(&mut self) -> Attrs {
+        let mut at = Attrs {
+            stage: -1, wg: [0i64, 0, 0], group: -1, binding: -1, loc: -1, builtin: -1, interp: -1,
             pos: self.pos(),
         };
         while self.kind() == T_AT {
@@ -614,15 +651,15 @@ impl Front<ScopedArena> {
                 at.stage = STAGE_COMPUTE as i64;
             } else if s == K_WORKGROUP_SIZE {
                 self.expect(T_LPAREN);
-                at.wg = [1, 1, 1];
-                var i = 0;
+                at.wg = [1i64, 1, 1];
+                let mut i: i64 = 0;
                 while i < 3 && self.kind() != T_RPAREN && self.kind() != T_EOF {
                     let p = self.pos();
                     let n = self.const_int_arg();
                     if n < 1 || n > 1024 {
-                        self.fail(p, "wgsl.attr", "a workgroup size is 1 to 1024");
+                        self.fail(p, b"wgsl.attr", b"a workgroup size is 1 to 1024");
                     }
-                    at.wg[i] = n;
+                    at.wg[i as usize] = n;
                     i += 1;
                     if !self.eat(T_COMMA) {
                         break;
@@ -630,7 +667,7 @@ impl Front<ScopedArena> {
                 }
                 self.expect(T_RPAREN);
                 if at.wg[0] * at.wg[1] * at.wg[2] > 1024 {
-                    self.fail(apos, "wgsl.attr", "a workgroup has at most 1024 invocations");
+                    self.fail(apos, b"wgsl.attr", b"a workgroup has at most 1024 invocations");
                 }
             } else if s == K_GROUP || s == K_BINDING || s == K_LOCATION {
                 self.expect(T_LPAREN);
@@ -639,7 +676,7 @@ impl Front<ScopedArena> {
                 self.eat(T_COMMA);
                 self.expect(T_RPAREN);
                 if n < 0 {
-                    self.fail(p, "wgsl.attr", "expected a non-negative integer");
+                    self.fail(p, b"wgsl.attr", b"expected a non-negative integer");
                 }
                 if s == K_GROUP {
                     at.group = n;
@@ -656,8 +693,9 @@ impl Front<ScopedArena> {
                 self.expect(T_RPAREN);
                 if b >= names::K_POSITION && b <= names::K_NUM_WORKGROUPS {
                     at.builtin = b - names::K_POSITION;
-                } else if self.err(bp, "wgsl.attr") {
-                    self.emsg.push_fmt("unknown builtin value '{}'", self.name_of(b));
+                } else if self.err(bp, b"wgsl.attr") {
+                    write(self.emsg, "unknown builtin value '{}'",
+                        str::from_utf8(self.name_of(b)).unwrap()).unwrap();
                 }
             } else if s == K_INTERPOLATE {
                 self.expect(T_LPAREN);
@@ -670,14 +708,14 @@ impl Front<ScopedArena> {
                 } else if k == K_PERSPECTIVE {
                     at.interp = INTERP_PERSPECTIVE as i64;
                 } else {
-                    self.fail(ip, "wgsl.attr", "expected 'flat', 'linear' or 'perspective'");
+                    self.fail(ip, b"wgsl.attr", b"expected 'flat', 'linear' or 'perspective'");
                 }
                 if self.eat(T_COMMA) && self.kind() == T_IDENT {
                     let smp = self.ident();
                     if smp != K_CENTER {
                         if smp == K_CENTROID || smp == K_SAMPLE {
-                            self.fail(ip, "wgsl.unsupported",
-                                "only 'center' sampling is in the WGSL subset of this release");
+                            self.fail(ip, b"wgsl.unsupported",
+                                b"only 'center' sampling is in the WGSL subset of this release");
                         }
                     }
                     self.eat(T_COMMA);
@@ -685,18 +723,19 @@ impl Front<ScopedArena> {
                 self.expect(T_RPAREN);
             } else if s == K_MUST_USE {
             } else if s == K_INVARIANT || s == K_ALIGN || s == K_SIZE || s == K_ID {
-                if self.err(apos, "wgsl.unsupported") {
-                    self.emsg.push_fmt(
-                        "'@{}' is not in the WGSL subset of this release", self.name_of(s));
+                if self.err(apos, b"wgsl.unsupported") {
+                    write(self.emsg, "'@{}' is not in the WGSL subset of this release",
+                        str::from_utf8(self.name_of(s)).unwrap()).unwrap();
                 }
-            } else if self.err(apos, "wgsl.attr") {
-                self.emsg.push_fmt("unknown attribute '@{}'", self.name_of(s));
+            } else if self.err(apos, b"wgsl.attr") {
+                write(self.emsg, "unknown attribute '@{}'",
+                    str::from_utf8(self.name_of(s)).unwrap()).unwrap();
             }
         }
         at
     }
 
-    fn binding_of(self, at: Attrs) -> Binding {
+    fn binding_of(&self, at: Attrs) -> Binding {
         if at.builtin >= 0 {
             return Binding { kind: BIND_BUILTIN, interp: INTERP_PERSPECTIVE, value: at.builtin };
         }
@@ -709,22 +748,23 @@ impl Front<ScopedArena> {
 
     // ---- Types ----
 
-    fn resolve_type_decl(inout self, d: i64) -> i64 {
-        let dd = self.decls[d];
+    fn resolve_type_decl(&mut self, d: i64) -> i64 {
+        let dd = self.decls[d as usize];
         if dd.state == DS_DONE {
             return dd.h;
         }
         if dd.state == DS_BUSY {
             self.p = dd.tok;
-            if self.err(self.pos(), "wgsl.cycle") {
-                self.emsg.push_fmt("'{}' refers to itself", self.name_of(dd.sym));
+            if self.err(self.pos(), b"wgsl.cycle") {
+                write(self.emsg, "'{}' refers to itself",
+                    str::from_utf8(self.name_of(dd.sym)).unwrap()).unwrap();
             }
             return T_I32;
         }
-        self.decls[d].state = DS_BUSY;
+        self.decls[d as usize].state = DS_BUSY;
         let saved = self.p;
         self.p = dd.tok + 2;
-        var h = T_I32;
+        let mut h = T_I32;
         if dd.kind == D_ALIAS {
             self.expect(T_EQ);
             h = self.parse_type();
@@ -733,14 +773,14 @@ impl Front<ScopedArena> {
             h = self.struct_body(dd.sym);
         }
         self.p = saved;
-        self.decls[d].state = DS_DONE;
-        self.decls[d].h = h;
+        self.decls[d as usize].state = DS_DONE;
+        self.decls[d as usize].h = h;
         h
     }
 
-    fn struct_body(inout self, sym: i64) -> i64 {
+    fn struct_body(&mut self, sym: i64) -> i64 {
         self.expect(T_LBRACE);
-        var list: V<StructMember> = Vec::new_in(self.a);
+        let mut list: Vec<StructMember<'a>, A> = Vec::new_in(self.a);
         while self.kind() != T_RBRACE && self.kind() != T_EOF {
             let at = self.parse_attrs();
             let mpos = self.pos();
@@ -749,20 +789,21 @@ impl Front<ScopedArena> {
             let tpos = self.pos();
             let ty = self.parse_type();
             for i in 0..list.len() as i64 {
-                if list[i].name == self.name_of(ms) {
-                    if self.err(mpos, "wgsl.redefined") {
-                        self.emsg.push_fmt("member '{}' is declared twice", self.name_of(ms));
+                if list[i as usize].name == self.name_of(ms) {
+                    if self.err(mpos, b"wgsl.redefined") {
+                        write(self.emsg, "member '{}' is declared twice",
+                            str::from_utf8(self.name_of(ms)).unwrap()).unwrap();
                     }
                 }
             }
             if self.m.is_runtime_sized(ty) && self.kind() != T_RBRACE
                 && !(self.kind() == T_COMMA && self.kind_at(self.p + 1) == T_RBRACE) {
-                self.fail(tpos, "wgsl.type",
-                    "a runtime-sized array must be the last member of a struct");
+                self.fail(tpos, b"wgsl.type",
+                    b"a runtime-sized array must be the last member of a struct");
             }
             if !self.storable(ty) {
-                if self.err(tpos, "wgsl.type") {
-                    self.emsg.push_str("a struct member cannot have type ");
+                if self.err(tpos, b"wgsl.type") {
+                    self.emsg.extend_from_slice(b"a struct member cannot have type ");
                     self.ty_str(ty);
                 }
             }
@@ -775,23 +816,24 @@ impl Front<ScopedArena> {
         }
         self.expect(T_RBRACE);
         if list.len() as i64 == 0 {
-            self.fail(self.pos(), "wgsl.type", "a struct has at least one member");
+            self.fail(self.pos(), b"wgsl.type", b"a struct has at least one member");
         }
         let start = self.m.members.len() as i64;
         for i in 0..list.len() as i64 {
-            self.m.members.push(list[i]);
+            self.m.members.push(list[i as usize]);
         }
         self.m.struct_ty(self.name_of(sym), start, list.len() as i64)
     }
 
     // Whether values of t can live in memory (not pointers, textures, samplers).
-    pub fn storable(self, t: i64) -> bool {
-        let k = self.m.types[t].kind;
+    #[effects(panic, A)]
+    pub(crate) fn storable(&self, t: i64) -> bool {
+        let k = self.m.types[t as usize].kind;
         k != TK_POINTER && k != TK_TEXTURE && k != TK_SAMPLER
     }
 
     // An optional `<T>` after vecN / matCxR: T, else -1.
-    fn template_scalar(inout self) -> i64 {
+    fn template_scalar(&mut self) -> i64 {
         if self.kind() != T_LT {
             return -1;
         }
@@ -803,24 +845,26 @@ impl Front<ScopedArena> {
 
     // Whether the identifier at the cursor starts a type (for `T(...)`
     // constructors and template lists in expressions).
-    pub fn is_type_name(self, s: i64) -> bool {
+    #[effects(panic, A)]
+    pub(crate) fn is_type_name(&self, s: i64) -> bool {
         if s >= names::K_BOOL && s <= names::K_TEXTURE_STORAGE_2D_ARRAY {
             return true;
         }
-        if s >= 0 && self.decl_of[s] >= 0 {
-            let k = self.decls[self.decl_of[s]].kind;
+        if s >= 0 && self.decl_of[s as usize] >= 0 {
+            let k = self.decls[self.decl_of[s as usize] as usize].kind;
             return k == D_STRUCT || k == D_ALIAS;
         }
         false
     }
 
-    pub fn parse_type(inout self) -> i64 {
+    #[effects(panic, diverge, A)]
+    pub(crate) fn parse_type(&mut self) -> i64 {
         let at = self.pos();
         if self.kind() != T_IDENT {
             self.expect(T_IDENT);
             return T_I32;
         }
-        let s = self.tk.syms[self.p];
+        let s = self.tk.syms[self.p as usize];
         self.p += 1;
         if s == names::K_BOOL {
             return T_BOOL;
@@ -835,24 +879,24 @@ impl Front<ScopedArena> {
             return T_F32;
         }
         if s == names::K_F16 || (s >= names::K_VEC2H && s <= names::K_VEC4H) {
-            self.fail(at, "wgsl.unsupported", "'f16' is not in the WGSL subset of this release");
-            self.help("use f32");
+            self.fail(at, b"wgsl.unsupported", b"'f16' is not in the WGSL subset of this release");
+            self.help(b"use f32");
             return T_F32;
         }
         if s >= names::K_VEC2 && s <= names::K_VEC4 {
             let n = s - names::K_VEC2 + 2;
             if self.kind() != T_LT {
-                self.fail(at, "wgsl.type",
-                    "a vector type needs its component type, as in 'vec3<f32>' or 'vec3f'");
+                self.fail(at, b"wgsl.type",
+                    b"a vector type needs its component type, as in 'vec3<f32>' or 'vec3f'");
                 return T_F32;
             }
             let c = self.template_scalar();
-            let k = self.m.types[c].kind;
+            let k = self.m.types[c as usize].kind;
             if k != TK_SCALAR {
-                self.fail(at, "wgsl.type", "a vector's components are bool, i32, u32 or f32");
+                self.fail(at, b"wgsl.type", b"a vector's components are bool, i32, u32 or f32");
                 return T_F32;
             }
-            return ir::vec_ty(self.m.types[c].scalar, n);
+            return ir::vec_ty(self.m.types[c as usize].scalar, n);
         }
         if s >= names::K_VEC2I && s <= names::K_VEC4F {
             let i = s - names::K_VEC2I;
@@ -863,50 +907,50 @@ impl Front<ScopedArena> {
             let i = (s - names::K_MAT2X2) % 9;
             if s <= names::K_MAT4X4 {
                 if self.kind() != T_LT {
-                    self.fail(at, "wgsl.type",
-                        "a matrix type needs its component type, as in 'mat4x4<f32>' or 'mat4x4f'");
+                    self.fail(at, b"wgsl.type",
+                        b"a matrix type needs its component type, as in 'mat4x4<f32>' or 'mat4x4f'");
                     return T_F32;
                 }
                 let c = self.template_scalar();
                 if c != T_F32 {
-                    self.fail(at, "wgsl.type",
-                        "matrices have f32 components in the WGSL subset of this release");
+                    self.fail(at, b"wgsl.type",
+                        b"matrices have f32 components in the WGSL subset of this release");
                 }
             }
             return ir::mat_ty(i / 3 + 2, i % 3 + 2);
         }
         if s == names::K_ARRAY {
             if self.kind() != T_LT {
-                self.fail(at, "wgsl.type",
-                    "an array type needs its element type, as in 'array<f32, 4>'");
+                self.fail(at, b"wgsl.type",
+                    b"an array type needs its element type, as in 'array<f32, 4>'");
                 return T_I32;
             }
             self.p += 1;
             let ep = self.pos();
             let el = self.parse_type();
-            var n = 0;
+            let mut n: i64 = 0;
             if self.eat(T_COMMA) {
                 let np = self.pos();
                 let saved_f = self.save_scope_floor();
                 let v = self.parse_shift();
                 self.scope_floor = saved_f;
                 if v.k != VK_CONST || v.sk == SK_F32 || v.sk == ir::SK_AFLOAT || v.sk == SK_BOOL {
-                    self.fail(np, "wgsl.type", "an array's length is a constant integer");
+                    self.fail(np, b"wgsl.type", b"an array's length is a constant integer");
                     self.help(
-                        "a runtime-sized array is written 'array<T>' and lives in a storage buffer");
+                        b"a runtime-sized array is written 'array<T>' and lives in a storage buffer");
                 } else if v.iv < 1 {
-                    self.fail(np, "wgsl.type", "an array's length is at least 1");
+                    self.fail(np, b"wgsl.type", b"an array's length is at least 1");
                 } else {
                     n = v.iv;
                 }
             }
             self.expect_gt();
             if self.m.is_runtime_sized(el) {
-                self.fail(ep, "wgsl.type", "an array's element cannot be runtime-sized");
+                self.fail(ep, b"wgsl.type", b"an array's element cannot be runtime-sized");
             }
             if !self.storable(el) {
-                self.fail(ep, "wgsl.type",
-                    "an array's element cannot be a pointer, texture or sampler");
+                self.fail(ep, b"wgsl.type",
+                    b"an array's element cannot be a pointer, texture or sampler");
             }
             return self.m.array_ty(el, n);
         }
@@ -915,17 +959,17 @@ impl Front<ScopedArena> {
             let c = self.parse_type();
             self.expect_gt();
             if c != T_I32 && c != T_U32 {
-                self.fail(at, "wgsl.type", "an atomic holds an i32 or a u32");
+                self.fail(at, b"wgsl.type", b"an atomic holds an i32 or a u32");
                 return self.m.atomic_ty(SK_U32);
             }
-            return self.m.atomic_ty(self.m.types[c].scalar);
+            return self.m.atomic_ty(self.m.types[c as usize].scalar);
         }
         if s == names::K_PTR {
             self.expect(T_LT);
             let sp = self.address_space();
             self.expect(T_COMMA);
             let t = self.parse_type();
-            var acc = if sp == SP_STORAGE || sp == SP_UNIFORM { ACC_READ } else { ACC_RW };
+            let mut acc = if sp == SP_STORAGE || sp == SP_UNIFORM { ACC_READ } else { ACC_RW };
             if self.eat(T_COMMA) {
                 acc = self.access_mode();
             }
@@ -946,10 +990,10 @@ impl Front<ScopedArena> {
             let c = self.parse_type();
             self.expect_gt();
             if c != T_F32 && c != T_I32 && c != T_U32 {
-                self.fail(at, "wgsl.type", "a texture's sampled type is f32, i32 or u32");
+                self.fail(at, b"wgsl.type", b"a texture's sampled type is f32, i32 or u32");
             }
             let dim = if s == names::K_TEXTURE_2D { ir::TEX_2D } else { ir::TEX_2D_ARRAY };
-            return self.m.intern(TK_TEXTURE, self.m.types[c].scalar, dim, 0, -1, 0, 0);
+            return self.m.intern(TK_TEXTURE, self.m.types[c as usize].scalar, dim, 0, -1, 0, 0);
         }
         if s == names::K_TEXTURE_DEPTH_2D {
             return self.m.intern(TK_TEXTURE, SK_F32, ir::TEX_DEPTH_2D, 0, -1, 0, 0);
@@ -958,21 +1002,21 @@ impl Front<ScopedArena> {
             self.expect(T_LT);
             let fp = self.pos();
             let f = self.ident();
-            var fmt = 0;
+            let mut fmt: i64 = 0;
             if f >= names::K_RGBA8UNORM && f <= names::K_RGBA32UINT {
                 fmt = f - names::K_RGBA8UNORM;
             } else if f >= names::K_RGBA16FLOAT && f <= names::K_RG32FLOAT {
                 fmt = ir::FMT_RGBA16FLOAT + (f - names::K_RGBA16FLOAT);
             } else {
                 // (gpu::Format::is_storable says the same formats)
-                self.fail(fp, "wgsl.unsupported", "storage textures in this release are rgba8unorm, rgba8uint, rgba16float, rgba32float, rgba32uint, rg32float, r32float, r32uint or r32sint");
+                self.fail(fp, b"wgsl.unsupported", b"storage textures in this release are rgba8unorm, rgba8uint, rgba16float, rgba32float, rgba32uint, rg32float, r32float, r32uint or r32sint");
             }
             self.expect(T_COMMA);
             let ap = self.pos();
             let acc = self.access_mode();
             if acc != ACC_WRITE {
-                self.fail(ap, "wgsl.unsupported",
-                    "storage textures are write-only in this release");
+                self.fail(ap, b"wgsl.unsupported",
+                    b"storage textures are write-only in this release");
             }
             self.expect_gt();
             let sk = if fmt == ir::FMT_R32UINT || fmt == ir::FMT_RGBA32UINT
@@ -986,32 +1030,32 @@ impl Front<ScopedArena> {
             return self.m.intern(TK_TEXTURE, sk, ir::TEX_STORAGE_2D, fmt, -1, 0, ACC_WRITE);
         }
         if s >= names::K_TEXTURE_1D && s <= names::K_TEXTURE_STORAGE_2D_ARRAY {
-            if self.err(at, "wgsl.unsupported") {
-                self.emsg.push_fmt(
-                    "'{}' is not in the WGSL subset of this release", self.name_of(s));
-                self.help("2D textures are: texture_2d, texture_2d_array, texture_depth_2d, texture_storage_2d");
+            if self.err(at, b"wgsl.unsupported") {
+                write(self.emsg, "'{}' is not in the WGSL subset of this release",
+                    str::from_utf8(self.name_of(s)).unwrap()).unwrap();
+                self.help(b"2D textures are: texture_2d, texture_2d_array, texture_depth_2d, texture_storage_2d");
             }
             return T_F32;
         }
-        if self.decl_of[s] >= 0 {
-            let d = self.decl_of[s];
-            let k = self.decls[d].kind;
+        if self.decl_of[s as usize] >= 0 {
+            let d = self.decl_of[s as usize];
+            let k = self.decls[d as usize].kind;
             if k == D_STRUCT || k == D_ALIAS {
                 return self.resolve_type_decl(d);
             }
-            if self.err(at, "wgsl.type") {
-                self.emsg.push_fmt("'{}' is not a type", self.name_of(s));
+            if self.err(at, b"wgsl.type") {
+                write(self.emsg, "'{}' is not a type", str::from_utf8(self.name_of(s)).unwrap()).unwrap();
             }
             return T_I32;
         }
-        if self.err(at, "wgsl.name") {
-            self.emsg.push_fmt("unknown type '{}'", self.name_of(s));
-            self.help("the types are bool, i32, u32, f32, vecN<T>, matCxR<f32>, array<T, N>, atomic<T>, structs");
+        if self.err(at, b"wgsl.name") {
+            write(self.emsg, "unknown type '{}'", str::from_utf8(self.name_of(s)).unwrap()).unwrap();
+            self.help(b"the types are bool, i32, u32, f32, vecN<T>, matCxR<f32>, array<T, N>, atomic<T>, structs");
         }
         T_I32
     }
 
-    fn address_space(inout self) -> u8 {
+    fn address_space(&mut self) -> u8 {
         let at = self.pos();
         let s = self.ident();
         if s == names::K_FUNCTION {
@@ -1025,15 +1069,16 @@ impl Front<ScopedArena> {
         } else if s == names::K_STORAGE {
             SP_STORAGE
         } else {
-            if self.err(at, "wgsl.syntax") {
-                self.emsg.push_fmt("unknown address space '{}'", self.name_of(s));
-                self.help("the address spaces are function, private, workgroup, uniform, storage");
+            if self.err(at, b"wgsl.syntax") {
+                write(self.emsg, "unknown address space '{}'",
+                    str::from_utf8(self.name_of(s)).unwrap()).unwrap();
+                self.help(b"the address spaces are function, private, workgroup, uniform, storage");
             }
             SP_PRIVATE
         }
     }
 
-    fn access_mode(inout self) -> u8 {
+    fn access_mode(&mut self) -> u8 {
         let at = self.pos();
         let s = self.ident();
         if s == names::K_READ {
@@ -1043,8 +1088,9 @@ impl Front<ScopedArena> {
         } else if s == names::K_READ_WRITE {
             ACC_RW
         } else {
-            if self.err(at, "wgsl.syntax") {
-                self.emsg.push_fmt("unknown access mode '{}'", self.name_of(s));
+            if self.err(at, b"wgsl.syntax") {
+                write(self.emsg, "unknown access mode '{}'",
+                    str::from_utf8(self.name_of(s)).unwrap()).unwrap();
             }
             ACC_READ
         }
@@ -1052,15 +1098,15 @@ impl Front<ScopedArena> {
 
     // ---- Globals and constants ----
 
-    fn resolve_global(inout self, d: i64) {
-        let dd = self.decls[d];
+    fn resolve_global(&mut self, d: i64) {
+        let dd = self.decls[d as usize];
         let saved = self.p;
         self.p = dd.attr;
         let at = self.parse_attrs();
         self.p = dd.tok + 1;
-        var sp = SP_HANDLE;
-        var acc = ACC_READ;
-        var explicit_space = false;
+        let mut sp = SP_HANDLE;
+        let mut acc = ACC_READ;
+        let mut explicit_space = false;
         if self.eat(T_LT) {
             explicit_space = true;
             sp = self.address_space();
@@ -1069,28 +1115,28 @@ impl Front<ScopedArena> {
                 let ap = self.pos();
                 acc = self.access_mode();
                 if sp != SP_STORAGE {
-                    self.fail(ap, "wgsl.type", "only storage variables have an access mode");
+                    self.fail(ap, b"wgsl.type", b"only storage variables have an access mode");
                 }
                 if acc == ACC_WRITE {
-                    self.fail(ap, "wgsl.type", "storage variables are 'read' or 'read_write'");
+                    self.fail(ap, b"wgsl.type", b"storage variables are 'read' or 'read_write'");
                 }
             }
             self.expect_gt();
         }
         let npos = self.pos();
         self.ident();
-        var ty = T_I32;
-        var have_ty = false;
+        let mut ty = T_I32;
+        let mut have_ty = false;
         if self.eat(T_COLON) {
             ty = self.parse_type();
             have_ty = true;
         }
-        var init = -1;
+        let mut init: i64 = -1;
         if self.eat(T_EQ) {
             let ip = self.pos();
             if sp != SP_PRIVATE {
-                self.fail(ip, "wgsl.type",
-                    "only 'var<private>' may have an initializer at module scope");
+                self.fail(ip, b"wgsl.type",
+                    b"only 'var<private>' may have an initializer at module scope");
             }
             let v = self.parse_expr_hint(if have_ty { ty } else { -1 });
             if !have_ty {
@@ -1099,55 +1145,55 @@ impl Front<ScopedArena> {
             }
             init = self.materialize(v, ty, ip);
             if !self.is_const_expr(init) {
-                self.fail(ip, "wgsl.type",
-                    "a module-scope initializer must be a constant expression");
+                self.fail(ip, b"wgsl.type",
+                    b"a module-scope initializer must be a constant expression");
             }
         }
         self.eat(T_SEMI);
         if !have_ty {
-            self.fail(npos, "wgsl.type", "a module-scope 'var' needs a type");
+            self.fail(npos, b"wgsl.type", b"a module-scope 'var' needs a type");
         }
-        let tk = self.m.types[ty].kind;
+        let tk = self.m.types[ty as usize].kind;
         if !explicit_space {
             if tk != TK_TEXTURE && tk != TK_SAMPLER {
-                self.fail(npos, "wgsl.type", "a module-scope 'var' needs an address space, as in 'var<private>' or 'var<storage, read_write>'");
+                self.fail(npos, b"wgsl.type", b"a module-scope 'var' needs an address space, as in 'var<private>' or 'var<storage, read_write>'");
             }
         } else if tk == TK_TEXTURE || tk == TK_SAMPLER {
-            self.fail(npos, "wgsl.type", "a texture or sampler is declared without an address space: 'var t: texture_2d<f32>;'");
+            self.fail(npos, b"wgsl.type", b"a texture or sampler is declared without an address space: 'var t: texture_2d<f32>;'");
         }
         if sp == SP_UNIFORM || sp == SP_STORAGE || sp == SP_HANDLE {
             if at.group < 0 || at.binding < 0 {
-                self.fail(npos, "wgsl.binding", "a resource needs '@group(G) @binding(B)'");
+                self.fail(npos, b"wgsl.binding", b"a resource needs '@group(G) @binding(B)'");
             }
         } else if at.group >= 0 || at.binding >= 0 {
-            self.fail(npos, "wgsl.binding",
-                "only uniform, storage, texture and sampler variables have a group and binding");
+            self.fail(npos, b"wgsl.binding",
+                b"only uniform, storage, texture and sampler variables have a group and binding");
         }
         if sp == SP_UNIFORM && self.m.is_runtime_sized(ty) {
-            self.fail(npos, "wgsl.type", "a uniform buffer cannot hold a runtime-sized array");
+            self.fail(npos, b"wgsl.type", b"a uniform buffer cannot hold a runtime-sized array");
         }
         if sp != SP_STORAGE && self.m.is_runtime_sized(ty) {
-            self.fail(npos, "wgsl.type", "a runtime-sized array lives only in a storage buffer");
+            self.fail(npos, b"wgsl.type", b"a runtime-sized array lives only in a storage buffer");
         }
         if self.m.has_atomic(ty) && sp != SP_STORAGE && sp != SP_WORKGROUP {
-            self.fail(npos, "wgsl.type", "atomics live in storage or workgroup memory");
+            self.fail(npos, b"wgsl.type", b"atomics live in storage or workgroup memory");
         }
         if self.m.has_atomic(ty) && sp == SP_STORAGE && acc != ACC_RW {
-            self.fail(npos, "wgsl.type", "atomics need 'var<storage, read_write>'");
+            self.fail(npos, b"wgsl.type", b"atomics need 'var<storage, read_write>'");
         }
         if (sp == SP_UNIFORM || sp == SP_STORAGE) && !self.host_shareable(ty) {
-            self.fail(npos, "wgsl.type", "a buffer's type cannot hold bool, pointers or textures");
+            self.fail(npos, b"wgsl.type",
+                b"a buffer's type cannot hold bool, pointers or textures");
         }
         if sp == SP_UNIFORM {
             self.check_uniform_layout(ty, npos);
         }
         for i in 0..self.m.globals.len() as i64 {
-            let o = self.m.globals[i];
+            let o = self.m.globals[i as usize];
             if o.group >= 0 && o.group == at.group && o.binding == at.binding {
-                if self.err(npos, "wgsl.binding") {
-                    self.emsg.push_fmt(
-                        "@group({}) @binding({}) is also '{}': two variables of one module never share a binding, even when different entry points use them", at.group, at.binding, o.name);
-                    self.help("give each kernel its own module (one dev.shader_wgsl each; the shared declarations can be a common prefix of their texts), or give the variables distinct bindings");
+                if self.err(npos, b"wgsl.binding") {
+                    write(self.emsg, "@group({}) @binding({}) is also '{}': two variables of one module never share a binding, even when different entry points use them", at.group, at.binding, str::from_utf8(o.name).unwrap()).unwrap();
+                    self.help(b"give each kernel its own module (one dev.shader_wgsl each; the shared declarations can be a common prefix of their texts), or give the variables distinct bindings");
                 }
             }
         }
@@ -1162,13 +1208,14 @@ impl Front<ScopedArena> {
             pos: npos,
         };
         self.m.globals.push(g);
-        self.decls[d].h = self.m.globals.len() as i64 - 1;
-        self.decls[d].state = DS_DONE;
+        self.decls[d as usize].h = self.m.globals.len() as i64 - 1;
+        self.decls[d as usize].state = DS_DONE;
         self.p = saved;
     }
 
-    pub fn host_shareable(self, t: i64) -> bool {
-        let ty = self.m.types[t];
+    #[effects(panic, A)]
+    pub(crate) fn host_shareable(&self, t: i64) -> bool {
+        let ty = self.m.types[t as usize];
         if ty.kind == TK_SCALAR || ty.kind == TK_VECTOR {
             return ty.scalar != SK_BOOL;
         }
@@ -1180,7 +1227,7 @@ impl Front<ScopedArena> {
         }
         if ty.kind == TK_STRUCT {
             for i in ty.mstart..ty.mstart + ty.mcount {
-                if !self.host_shareable(self.m.members[i].ty) {
+                if !self.host_shareable(self.m.members[i as usize].ty) {
                     return false;
                 }
             }
@@ -1191,31 +1238,30 @@ impl Front<ScopedArena> {
 
     // The uniform address space's extra rules: array strides and struct
     // alignments are multiples of 16.
-    fn check_uniform_layout(inout self, t: i64, pos: i64) {
-        let ty = self.m.types[t];
+    fn check_uniform_layout(&mut self, t: i64, pos: i64) {
+        let ty = self.m.types[t as usize];
         if ty.kind == TK_ARRAY {
             if ty.stride % 16 != 0 {
-                if self.err(pos, "wgsl.layout") {
-                    self.emsg.push_str(
-                        "in a uniform buffer an array's stride is a multiple of 16; ");
+                if self.err(pos, b"wgsl.layout") {
+                    self.emsg.extend_from_slice(
+                        b"in a uniform buffer an array's stride is a multiple of 16; ");
                     self.ty_str(t);
-                    self.emsg.push_fmt(" has {}", ty.stride);
-                    self.help("use vec4 elements, or a storage buffer");
+                    write(self.emsg, " has {}", ty.stride).unwrap();
+                    self.help(b"use vec4 elements, or a storage buffer");
                 }
             }
             self.check_uniform_layout(ty.base, pos);
         } else if ty.kind == TK_STRUCT {
             for i in ty.mstart..ty.mstart + ty.mcount {
-                let mt = self.m.members[i].ty;
-                let mk = self.m.types[mt].kind;
+                let mt = self.m.members[i as usize].ty;
+                let mk = self.m.types[mt as usize].kind;
                 if mk == TK_STRUCT && i > ty.mstart {
-                    let prev = self.m.members[i - 1];
-                    let prev_end = prev.offset + self.m.types[prev.ty].size;
-                    if self.m.members[i].offset - prev_end < 0
-                        || self.m.members[i].offset % 16 != 0 {
-                        if self.err(pos, "wgsl.layout") {
-                            self.emsg.push_fmt(
-                                "in a uniform buffer the struct member '{}' must start at a multiple of 16", self.m.members[i].name);
+                    let prev = self.m.members[(i - 1) as usize];
+                    let prev_end = prev.offset + self.m.types[prev.ty as usize].size;
+                    if self.m.members[i as usize].offset - prev_end < 0
+                        || self.m.members[i as usize].offset % 16 != 0 {
+                        if self.err(pos, b"wgsl.layout") {
+                            write(self.emsg, "in a uniform buffer the struct member '{}' must start at a multiple of 16", str::from_utf8(self.m.members[i as usize].name).unwrap()).unwrap();
                         }
                     }
                 }
@@ -1226,66 +1272,70 @@ impl Front<ScopedArena> {
 
     // A constant's value, evaluated once when it is a scalar; composites
     // are re-made at each use, in the using function.
-    pub fn const_value(inout self, d: i64) -> Val {
-        let dd = self.decls[d];
+    #[effects(panic, diverge, A)]
+    pub(crate) fn const_value(&mut self, d: i64) -> Val {
+        let dd = self.decls[d as usize];
         if dd.has_cv {
             return dd.cv;
         }
         if dd.state == DS_BUSY {
             self.p = dd.tok;
-            if self.err(self.pos(), "wgsl.cycle") {
-                self.emsg.push_fmt("'{}' refers to itself", self.name_of(dd.sym));
+            if self.err(self.pos(), b"wgsl.cycle") {
+                write(self.emsg, "'{}' refers to itself",
+                    str::from_utf8(self.name_of(dd.sym)).unwrap()).unwrap();
             }
             return cint(ir::SK_AINT, -1, 0);
         }
-        self.decls[d].state = DS_BUSY;
+        self.decls[d as usize].state = DS_BUSY;
         let saved = self.p;
         let saved_floor = self.save_scope_floor();
         self.p = dd.tok + 2;
-        var ty = -1;
+        let mut ty: i64 = -1;
         if self.eat(T_COLON) {
             ty = self.parse_type();
         }
         self.expect(T_EQ);
         let ip = self.pos();
-        var v = self.parse_expr_hint(ty);
+        let mut v = self.parse_expr_hint(ty);
         if ty >= 0 {
             v = self.convert_to(v, ty, ip);
         }
         if v.k == VK_REF {
-            self.fail(ip, "wgsl.type", "a 'const' is a constant expression; this reads memory");
+            self.fail(ip, b"wgsl.type", b"a 'const' is a constant expression; this reads memory");
         } else if v.k == VK_VALUE && !self.is_const_expr(v.e) {
-            self.fail(ip, "wgsl.type", "a 'const' is a constant expression");
+            self.fail(ip, b"wgsl.type", b"a 'const' is a constant expression");
         }
         self.scope_floor = saved_floor;
         self.p = saved;
-        self.decls[d].state = DS_DONE;
+        self.decls[d as usize].state = DS_DONE;
         if v.k == VK_CONST {
-            self.decls[d].cv = v;
-            self.decls[d].has_cv = true;
+            self.decls[d as usize].cv = v;
+            self.decls[d as usize].has_cv = true;
         }
         v
     }
 
     // Lookups see only module-scope names until the floor is restored.
-    pub fn save_scope_floor(inout self) -> i64 {
+    #[effects(A)]
+    pub(crate) fn save_scope_floor(&mut self) -> i64 {
         let s = self.scope_floor;
         self.scope_floor = self.scopes.len() as i64;
         s
     }
 
     // Whether e is made of literals, zero values and compositions only.
-    pub fn is_const_expr(self, e: i64) -> bool {
+    #[effects(panic, A)]
+    pub(crate) fn is_const_expr(&self, e: i64) -> bool {
         if e < 0 {
             return true;
         }
-        let x = self.f.exprs[e];
+        let x = self.f.exprs[e as usize];
         if x.op == ir::E_LITERAL || x.op == ir::E_ZERO {
             return true;
         }
         if x.op == ir::E_COMPOSE {
             for i in x.a..x.a + x.b {
-                if !self.is_const_expr(self.f.args[i]) {
+                if !self.is_const_expr(self.f.args[i as usize]) {
                     return false;
                 }
             }
@@ -1299,13 +1349,13 @@ impl Front<ScopedArena> {
 
     // ---- Functions ----
 
-    fn signature(inout self, d: i64) {
-        let dd = self.decls[d];
+    fn signature(&mut self, d: i64) {
+        let dd = self.decls[d as usize];
         let h = dd.h;
         let saved = self.p;
         self.p = dd.tok + 2;
         self.expect(T_LPAREN);
-        var params: V<Param> = Vec::new_in(self.a);
+        let mut params: Vec<Param<'a>, A> = Vec::new_in(self.a);
         while self.kind() != T_RPAREN && self.kind() != T_EOF {
             let at = self.parse_attrs();
             let ppos = self.pos();
@@ -1313,20 +1363,21 @@ impl Front<ScopedArena> {
             self.expect(T_COLON);
             let tp = self.pos();
             let ty = self.parse_type();
-            let tk = self.m.types[ty].kind;
+            let tk = self.m.types[ty as usize].kind;
             if tk == TK_POINTER {
-                let sp = self.m.types[ty].space;
+                let sp = self.m.types[ty as usize].space;
                 if sp != SP_FUNCTION && sp != SP_PRIVATE {
-                    self.fail(tp, "wgsl.unsupported", "pointer parameters are 'ptr<function, T>' or 'ptr<private, T>' in this release");
+                    self.fail(tp, b"wgsl.unsupported", b"pointer parameters are 'ptr<function, T>' or 'ptr<private, T>' in this release");
                 }
             } else if self.m.is_runtime_sized(ty) || self.m.has_atomic(ty) {
-                self.fail(tp, "wgsl.type",
-                    "a parameter cannot hold a runtime-sized array or an atomic");
+                self.fail(tp, b"wgsl.type",
+                    b"a parameter cannot hold a runtime-sized array or an atomic");
             }
             for i in 0..params.len() as i64 {
-                if params[i].name == self.name_of(ps) {
-                    if self.err(ppos, "wgsl.redefined") {
-                        self.emsg.push_fmt("parameter '{}' is declared twice", self.name_of(ps));
+                if params[i as usize].name == self.name_of(ps) {
+                    if self.err(ppos, b"wgsl.redefined") {
+                        write(self.emsg, "parameter '{}' is declared twice",
+                            str::from_utf8(self.name_of(ps)).unwrap()).unwrap();
                     }
                 }
             }
@@ -1336,8 +1387,8 @@ impl Front<ScopedArena> {
             }
         }
         self.expect(T_RPAREN);
-        var result = -1;
-        var rb = no_binding();
+        let mut result: i64 = -1;
+        let mut rb = no_binding();
         if self.eat(T_ARROW) {
             let at = self.parse_attrs();
             let rp = self.pos();
@@ -1345,43 +1396,44 @@ impl Front<ScopedArena> {
             rb = self.binding_of(at);
             if !self.storable(result) || self.m.is_runtime_sized(result)
                 || self.m.has_atomic(result) {
-                self.fail(rp, "wgsl.type", "a function cannot return a pointer, texture, sampler, atomic or runtime-sized array");
+                self.fail(rp, b"wgsl.type", b"a function cannot return a pointer, texture, sampler, atomic or runtime-sized array");
             }
         }
-        self.m.functions[h].params = params;
-        self.m.functions[h].result = result;
-        self.m.functions[h].result_binding = rb;
-        self.m.functions[h].pos = self.tk.starts[dd.tok + 1];
+        self.m.functions[h as usize].params = params;
+        self.m.functions[h as usize].result = result;
+        self.m.functions[h as usize].result_binding = rb;
+        self.m.functions[h as usize].pos = self.tk.starts[(dd.tok + 1) as usize];
         // entry point?
         self.p = dd.attr;
         let at = self.parse_attrs();
         if at.stage >= 0 {
             if at.stage == STAGE_COMPUTE as i64 && at.wg[0] == 0 {
-                self.fail(self.tk.starts[dd.tok + 1], "wgsl.entry",
-                    "a compute entry point needs '@workgroup_size(X, Y, Z)'");
-                self.help("for example '@compute @workgroup_size(64)'");
+                self.fail(self.tk.starts[(dd.tok + 1) as usize], b"wgsl.entry",
+                    b"a compute entry point needs '@workgroup_size(X, Y, Z)'");
+                self.help(b"for example '@compute @workgroup_size(64)'");
             }
-            let wg = if at.stage == STAGE_COMPUTE as i64 { at.wg } else { [0, 0, 0] };
+            let wg = if at.stage == STAGE_COMPUTE as i64 { at.wg } else { [0i64, 0, 0] };
             self.m.entries.push(Entry {
                 stage: at.stage as u8, name: self.name_of(dd.sym), func: h, wg: wg,
                 early_depth: false,
             });
-            entry::check_interface(&self, self.m.entries.len() as i64 - 1);
+            entry::check_interface(self, self.m.entries.len() as i64 - 1);
         } else if at.wg[0] != 0 {
-            self.fail(at.pos, "wgsl.attr", "'@workgroup_size' belongs to a '@compute' entry point");
+            self.fail(at.pos, b"wgsl.attr",
+                b"'@workgroup_size' belongs to a '@compute' entry point");
         }
         self.p = saved;
     }
 
-    fn lower_fn(inout self, d: i64) {
-        let dd = self.decls[d];
+    fn lower_fn(&mut self, d: i64) {
+        let dd = self.decls[d as usize];
         let h = dd.h;
         self.fh = h;
-        self.f = std::replace(&self.m.functions[h], new_function("", self.a));
+        self.f = mem::replace(&mut self.m.functions[h as usize], new_function(b"", self.a));
         self.stage = 255;
         for i in 0..self.m.entries.len() as i64 {
-            if self.m.entries[i].func == h {
-                self.stage = self.m.entries[i].stage as i64;
+            if self.m.entries[i as usize].func == h {
+                self.stage = self.m.entries[i as usize].stage as i64;
             }
         }
         self.gexpr.clear();
@@ -1398,15 +1450,15 @@ impl Front<ScopedArena> {
         // the parameters
         self.p = dd.tok + 2;
         self.expect(T_LPAREN);
-        var i = 0;
+        let mut i: i64 = 0;
         while self.kind() != T_RPAREN && self.kind() != T_EOF {
             self.parse_attrs();
             let ps = self.ident();
             self.expect(T_COLON);
             self.parse_type();
-            let ty = self.f.params[i].ty;
+            let ty = self.f.params[i as usize].ty;
             let e = self.f.expr(E_ARG, ty, i, 0, 0);
-            self.f.names[e] = self.name_of(ps);
+            self.f.names[e as usize] = self.name_of(ps);
             self.scopes.push(ScopeEntry { sym: ps, v: val(e, ty), mutable: false });
             i += 1;
             if !self.eat(T_COMMA) {
@@ -1426,39 +1478,39 @@ impl Front<ScopedArena> {
         self.expect(T_RBRACE);
         self.flush();
         if self.f.result >= 0 && !self.block_returns(base) {
-            if self.err(end, "wgsl.return") {
-                self.emsg.push_fmt(
-                    "function '{}' can reach its end without returning a value", self.f.name);
-                self.help("end it with a 'return'");
+            if self.err(end, b"wgsl.return") {
+                write(self.emsg, "function '{}' can reach its end without returning a value",
+                    str::from_utf8(self.f.name).unwrap()).unwrap();
+                self.help(b"end it with a 'return'");
             }
         }
         let _ = bpos;
-        self.f.body = self.f.block_of(&self.pending, base);
-        self.m.functions[h] = std::replace(&self.f, new_function("", self.a));
+        self.f.body = self.f.block_of(&mut self.pending, base);
+        self.m.functions[h as usize] = mem::replace(&mut self.f, new_function(b"", self.a));
     }
 
     // Whether the statements pending[from ..] always return (or discard).
-    fn block_returns(self, from: i64) -> bool {
+    fn block_returns(&self, from: i64) -> bool {
         for i in from..self.pending.len() as i64 {
-            if self.stmt_returns(self.pending[i]) {
+            if self.stmt_returns(self.pending[i as usize]) {
                 return true;
             }
         }
         false
     }
 
-    fn list_returns(self, blk: i64) -> bool {
-        let b = self.f.blocks[blk];
+    fn list_returns(&self, blk: i64) -> bool {
+        let b = self.f.blocks[blk as usize];
         for i in b.start..b.start + b.count {
-            if self.stmt_returns(self.f.items[i]) {
+            if self.stmt_returns(self.f.items[i as usize]) {
                 return true;
             }
         }
         false
     }
 
-    fn stmt_returns(self, s: i64) -> bool {
-        let st = self.f.stmts[s];
+    fn stmt_returns(&self, s: i64) -> bool {
+        let st = self.f.stmts[s as usize];
         if st.op == S_RETURN || st.op == S_KILL {
             return true;
         }
@@ -1470,7 +1522,7 @@ impl Front<ScopedArena> {
         }
         if st.op == S_SWITCH {
             for i in st.b..st.b + st.c {
-                if !self.list_returns(self.f.cases[i].body) {
+                if !self.list_returns(self.f.cases[i as usize].body) {
                     return false;
                 }
             }
@@ -1483,10 +1535,10 @@ impl Front<ScopedArena> {
         false
     }
 
-    fn has_break(self, blk: i64, depth: i64) -> bool {
-        let b = self.f.blocks[blk];
+    fn has_break(&self, blk: i64, depth: i64) -> bool {
+        let b = self.f.blocks[blk as usize];
         for i in b.start..b.start + b.count {
-            let st = self.f.stmts[self.f.items[i]];
+            let st = self.f.stmts[self.f.items[i as usize] as usize];
             if st.op == S_BREAK && depth == 0 {
                 return true;
             }
@@ -1498,7 +1550,7 @@ impl Front<ScopedArena> {
             }
             if st.op == S_SWITCH {
                 for k in st.b..st.b + st.c {
-                    if self.has_break(self.f.cases[k].body, depth + 1) {
+                    if self.has_break(self.f.cases[k as usize].body, depth + 1) {
                         return true;
                     }
                 }
@@ -1512,27 +1564,27 @@ impl Front<ScopedArena> {
     }
 
     // No recursion: WGSL's call graph is acyclic.
-    fn check_calls(inout self) {
+    fn check_calls(&mut self) {
         let n = self.m.functions.len() as i64;
-        var state: V<u8> = Vec::filled_in(n as usize, 0u8, self.a);
+        let mut state: Vec<u8, A> = Vec::from_elem_in(0u8, (n as usize), self.a);
         for i in 0..n {
-            if !self.visit_calls(i, &state) {
+            if !self.visit_calls(i, &mut state) {
                 return;
             }
         }
         for e in 0..self.m.entries.len() as i64 {
-            let fh = self.m.entries[e].func;
+            let fh = self.m.entries[e as usize].func;
             for i in 0..n {
-                for s in 0..self.m.functions[i].stmts.len() as i64 {
-                    let st = self.m.functions[i].stmts[s];
+                for s in 0..self.m.functions[i as usize].stmts.len() as i64 {
+                    let st = self.m.functions[i as usize].stmts[s as usize];
                     if st.op == S_CALL && st.a == fh {
-                        let pos = self.m.functions[i].pos;
-                        if self.err(pos, "wgsl.call") {
-                            self.emsg.push('\'');
-                            self.emsg.push_str(self.m.functions[i].name);
-                            self.emsg.push_str("' calls the entry point '");
-                            self.emsg.push_str(self.m.entries[e].name);
-                            self.emsg.push('\'');
+                        let pos = self.m.functions[i as usize].pos;
+                        if self.err(pos, b"wgsl.call") {
+                            self.emsg.push(b'\'');
+                            self.emsg.extend_from_slice(self.m.functions[i as usize].name);
+                            self.emsg.extend_from_slice(b"' calls the entry point '");
+                            self.emsg.extend_from_slice(self.m.entries[e as usize].name);
+                            self.emsg.push(b'\'');
                         }
                         return;
                     }
@@ -1541,39 +1593,39 @@ impl Front<ScopedArena> {
         }
     }
 
-    fn visit_calls(inout self, i: i64, state: inout V<u8>) -> bool {
-        if state[i] == 2 {
+    fn visit_calls(&mut self, i: i64, state: &mut Vec<u8, A>) -> bool {
+        if state[i as usize] == 2 {
             return true;
         }
-        if state[i] == 1 {
-            let pos = self.m.functions[i].pos;
-            if self.err(pos, "wgsl.recursion") {
-                self.emsg.push('\'');
-                self.emsg.push_str(self.m.functions[i].name);
-                self.emsg.push_str("' calls itself, directly or through other functions");
-                self.help("WGSL has no recursion: write it as a loop");
+        if state[i as usize] == 1 {
+            let pos = self.m.functions[i as usize].pos;
+            if self.err(pos, b"wgsl.recursion") {
+                self.emsg.push(b'\'');
+                self.emsg.extend_from_slice(self.m.functions[i as usize].name);
+                self.emsg.extend_from_slice(b"' calls itself, directly or through other functions");
+                self.help(b"WGSL has no recursion: write it as a loop");
             }
             return false;
         }
-        state[i] = 1;
-        for s in 0..self.m.functions[i].stmts.len() as i64 {
-            let st = self.m.functions[i].stmts[s];
+        state[i as usize] = 1;
+        for s in 0..self.m.functions[i as usize].stmts.len() as i64 {
+            let st = self.m.functions[i as usize].stmts[s as usize];
             if st.op == S_CALL {
-                if !self.visit_calls(st.a, &state) {
+                if !self.visit_calls(st.a, state) {
                     return false;
                 }
             }
         }
-        state[i] = 2;
+        state[i as usize] = 2;
         true
     }
 
     // ---- Statements ----
 
-    fn lookup(self, sym: i64) -> i64 {
-        var i = self.scopes.len() as i64 - 1;
+    fn lookup(&self, sym: i64) -> i64 {
+        let mut i = self.scopes.len() as i64 - 1;
         while i >= self.scope_floor {
-            if self.scopes[i].sym == sym {
+            if self.scopes[i as usize].sym == sym {
                 return i;
             }
             i -= 1;
@@ -1581,7 +1633,7 @@ impl Front<ScopedArena> {
         -1
     }
 
-    fn statements(inout self) {
+    fn statements(&mut self) {
         while self.kind() != T_RBRACE && self.kind() != T_EOF {
             if self.in_continuing_end() {
                 return;
@@ -1591,10 +1643,10 @@ impl Front<ScopedArena> {
     }
 
     // In a loop body, `continuing` ends the body.
-    fn in_continuing_end(self) -> bool { self.is_kw(K_CONTINUING) && self.loop_depth > 0 }
+    fn in_continuing_end(&self) -> bool { self.is_kw(K_CONTINUING) && self.loop_depth > 0 }
 
     // A `{ ... }` block with a scope of its own: its block handle.
-    fn compound(inout self) -> i64 {
+    fn compound(&mut self) -> i64 {
         self.flush();
         let base = self.pending.len() as i64;
         let scope = self.scopes.len() as i64;
@@ -1603,16 +1655,16 @@ impl Front<ScopedArena> {
         self.expect(T_RBRACE);
         self.flush();
         self.scopes.truncate(scope as usize);
-        self.f.block_of(&self.pending, base)
+        self.f.block_of(&mut self.pending, base)
     }
 
-    fn statements_plain(inout self) {
+    fn statements_plain(&mut self) {
         while self.kind() != T_RBRACE && self.kind() != T_EOF {
             self.statement();
         }
     }
 
-    fn statement(inout self) {
+    fn statement(&mut self) {
         let at = self.pos();
         let k = self.kind();
         if k == T_SEMI {
@@ -1625,12 +1677,12 @@ impl Front<ScopedArena> {
             return;
         }
         if k == T_AT {
-            self.fail(at, "wgsl.unsupported",
-                "attributes on statements are not in the WGSL subset of this release");
+            self.fail(at, b"wgsl.unsupported",
+                b"attributes on statements are not in the WGSL subset of this release");
             return;
         }
         if k == T_IDENT {
-            let s = self.tk.syms[self.p];
+            let s = self.tk.syms[self.p as usize];
             if s == K_LET || s == K_CONST {
                 self.p += 1;
                 self.let_decl(s == K_CONST);
@@ -1677,15 +1729,15 @@ impl Front<ScopedArena> {
             if s == K_BREAK {
                 self.p += 1;
                 if self.is_kw(K_IF) {
-                    self.fail(at, "wgsl.syntax",
-                        "'break if' is the last statement of a 'continuing' block");
+                    self.fail(at, b"wgsl.syntax",
+                        b"'break if' is the last statement of a 'continuing' block");
                     return;
                 }
                 if self.loop_depth == 0 && self.switch_depth == 0 {
-                    self.fail(at, "wgsl.syntax", "'break' outside a loop or switch");
+                    self.fail(at, b"wgsl.syntax", b"'break' outside a loop or switch");
                 } else if self.in_continuing && self.switch_depth == 0 {
-                    self.fail(at, "wgsl.syntax",
-                        "'break' in 'continuing'; end it with 'break if COND;'");
+                    self.fail(at, b"wgsl.syntax",
+                        b"'break' in 'continuing'; end it with 'break if COND;'");
                 }
                 self.push_stmt(S_BREAK, 0, 0, 0, 0);
                 self.expect(T_SEMI);
@@ -1694,9 +1746,9 @@ impl Front<ScopedArena> {
             if s == K_CONTINUE {
                 self.p += 1;
                 if self.loop_depth == 0 {
-                    self.fail(at, "wgsl.syntax", "'continue' outside a loop");
+                    self.fail(at, b"wgsl.syntax", b"'continue' outside a loop");
                 } else if self.in_continuing {
-                    self.fail(at, "wgsl.syntax", "'continue' in a 'continuing' block");
+                    self.fail(at, b"wgsl.syntax", b"'continue' in a 'continuing' block");
                 }
                 self.push_stmt(S_CONTINUE, 0, 0, 0, 0);
                 self.expect(T_SEMI);
@@ -1705,27 +1757,27 @@ impl Front<ScopedArena> {
             if s == K_DISCARD {
                 self.p += 1;
                 if self.stage != STAGE_FRAGMENT as i64 && self.stage != 255 {
-                    self.fail(at, "wgsl.stage", "'discard' is only for fragment shaders");
+                    self.fail(at, b"wgsl.stage", b"'discard' is only for fragment shaders");
                 }
                 self.push_stmt(S_KILL, 0, 0, 0, 0);
                 self.expect(T_SEMI);
                 return;
             }
             if s == K_CONST_ASSERT {
-                self.fail(at, "wgsl.unsupported",
-                    "'const_assert' is not in the WGSL subset of this release");
+                self.fail(at, b"wgsl.unsupported",
+                    b"'const_assert' is not in the WGSL subset of this release");
                 return;
             }
             if s == K_CONTINUING {
-                self.fail(at, "wgsl.syntax", "'continuing' belongs at the end of a 'loop'");
+                self.fail(at, b"wgsl.syntax", b"'continuing' belongs at the end of a 'loop'");
                 return;
             }
             if s == K_ELSE {
-                self.fail(at, "wgsl.syntax", "'else' without 'if'");
+                self.fail(at, b"wgsl.syntax", b"'else' without 'if'");
                 return;
             }
             if s == K_CASE || s == K_DEFAULT {
-                self.fail(at, "wgsl.syntax", "'case' outside a 'switch'");
+                self.fail(at, b"wgsl.syntax", b"'case' outside a 'switch'");
                 return;
             }
         }
@@ -1734,14 +1786,14 @@ impl Front<ScopedArena> {
     }
 
     // An assignment, increment, call or phony assignment (no `;`).
-    fn simple_stmt(inout self) {
+    fn simple_stmt(&mut self) {
         let at = self.pos();
         if self.kind() == T_UNDERSCORE {
             self.p += 1;
             self.expect(T_EQ);
             let v = self.parse_expr();
             if v.k == VK_VOID {
-                self.fail(at, "wgsl.type", "a function without a result has no value to assign");
+                self.fail(at, b"wgsl.type", b"a function without a result has no value to assign");
             }
             let _ = self.value(v, at);
             return;
@@ -1754,7 +1806,7 @@ impl Front<ScopedArena> {
             self.p += 1;
             let rp = self.pos();
             let ptr = self.lhs_ptr(lhs, at);
-            let pointee = self.m.pointee(self.f.exprs[ptr].ty);
+            let pointee = self.m.pointee(self.f.exprs[ptr as usize].ty);
             let rhs = self.parse_expr_hint(pointee);
             let e = self.materialize(rhs, pointee, rp);
             self.push_stmt(S_STORE, ptr, e, 0, 0);
@@ -1765,9 +1817,9 @@ impl Front<ScopedArena> {
             let op = compound_op(k);
             let rp = self.pos();
             let ptr = self.lhs_ptr(lhs, at);
-            let pointee = self.m.pointee(self.f.exprs[ptr].ty);
+            let pointee = self.m.pointee(self.f.exprs[ptr as usize].ty);
             let cur = self.value(Val {
-                k: VK_REF, sk: 0, e: ptr, ty: self.f.exprs[ptr].ty, iv: 0, fv: 0.0,
+                k: VK_REF, sk: 0, e: ptr, ty: self.f.exprs[ptr as usize].ty, iv: 0, fv: 0.0,
             }, at);
             let rhs = self.parse_expr();
             let r = self.binary(op, cur, rhs, rp);
@@ -1778,13 +1830,13 @@ impl Front<ScopedArena> {
         if k == T_PLUSPLUS || k == T_MINUSMINUS {
             self.p += 1;
             let ptr = self.lhs_ptr(lhs, at);
-            let pointee = self.m.pointee(self.f.exprs[ptr].ty);
+            let pointee = self.m.pointee(self.f.exprs[ptr as usize].ty);
             if pointee != T_I32 && pointee != T_U32 {
-                self.fail(at, "wgsl.type", "'++' and '--' apply to i32 and u32 variables");
+                self.fail(at, b"wgsl.type", b"'++' and '--' apply to i32 and u32 variables");
                 return;
             }
             let cur = self.value(Val {
-                k: VK_REF, sk: 0, e: ptr, ty: self.f.exprs[ptr].ty, iv: 0, fv: 0.0,
+                k: VK_REF, sk: 0, e: ptr, ty: self.f.exprs[ptr as usize].ty, iv: 0, fv: 0.0,
             }, at);
             let one = cint(ir::SK_AINT, -1, 1);
             let r = self.binary(if k == T_PLUSPLUS { ir::OP_ADD } else { ir::OP_SUB }, cur, one,
@@ -1797,104 +1849,108 @@ impl Front<ScopedArena> {
         let _ = start_exprs;
         let _ = start_stmts;
         if !self.last_was_call {
-            if self.err(at, "wgsl.syntax") {
-                self.emsg.push_str(
-                    "expected a statement: an assignment, a call, 'let', 'var', 'if', 'for', ...");
+            if self.err(at, b"wgsl.syntax") {
+                self.emsg.extend_from_slice(
+                    b"expected a statement: an assignment, a call, 'let', 'var', 'if', 'for', ...");
             }
         }
     }
 
     // The pointer an assignment writes through.
-    fn lhs_ptr(inout self, lhs: Val, at: i64) -> i64 {
+    fn lhs_ptr(&mut self, lhs: Val, at: i64) -> i64 {
         if lhs.k != VK_REF {
-            if self.err(at, "wgsl.assign") {
-                self.emsg.push_str("cannot assign to this: it is a value, not a variable");
+            if self.err(at, b"wgsl.assign") {
+                self.emsg.extend_from_slice(
+                    b"cannot assign to this: it is a value, not a variable");
                 self.help(
-                    "assign to a 'var' (a 'let' is immutable), a member or element of one, or '*p'");
+                    b"assign to a 'var' (a 'let' is immutable), a member or element of one, or '*p'");
             }
             return self.dummy_ptr();
         }
-        let pt = self.m.types[lhs.ty];
+        let pt = self.m.types[lhs.ty as usize];
         if pt.access & ACC_WRITE == 0 {
-            if self.err(at, "wgsl.access") {
-                self.emsg.push_fmt(
-                    "cannot write to a read-only {} variable", ir::space_name(pt.space));
+            if self.err(at, b"wgsl.access") {
+                write(self.emsg, "cannot write to a read-only {} variable",
+                    str::from_utf8(ir::space_name(pt.space)).unwrap()).unwrap();
                 if pt.space == SP_STORAGE {
-                    self.help("declare it 'var<storage, read_write>'");
+                    self.help(b"declare it 'var<storage, read_write>'");
                 }
             }
         }
         if self.m.has_atomic(pt.base) {
-            self.fail(at, "wgsl.type", "an atomic is written with atomicStore");
+            self.fail(at, b"wgsl.type", b"an atomic is written with atomicStore");
         }
         lhs.e
     }
 
-    pub fn dummy_ptr(inout self) -> i64 {
+    #[effects(A)]
+    pub(crate) fn dummy_ptr(&mut self) -> i64 {
         let ty = self.m.ptr_ty(T_I32, SP_FUNCTION, ACC_RW);
         self.f.expr(ir::E_ZERO, ty, 0, 0, 0)
     }
 
-    fn let_decl(inout self, is_const: bool) {
+    fn let_decl(&mut self, is_const: bool) {
         let npos = self.pos();
         let s = self.ident();
-        var ty = -1;
+        let mut ty: i64 = -1;
         if self.eat(T_COLON) {
             ty = self.parse_type();
         }
         self.expect(T_EQ);
         let ip = self.pos();
         if is_const {
-            var v = self.parse_expr_hint(ty);
+            let mut v = self.parse_expr_hint(ty);
             if ty >= 0 {
                 v = self.convert_to(v, ty, ip);
             }
             if v.k == VK_REF || (v.k == VK_VALUE && !self.is_const_expr(v.e)) {
-                self.fail(ip, "wgsl.type", "a 'const' is a constant expression");
+                self.fail(ip, b"wgsl.type", b"a 'const' is a constant expression");
             }
             self.scopes.push(ScopeEntry { sym: s, v: v, mutable: false });
             return;
         }
         let v = self.parse_expr_hint(ty);
         if v.k == VK_VOID {
-            self.fail(ip, "wgsl.type", "this call has no result to bind");
+            self.fail(ip, b"wgsl.type", b"this call has no result to bind");
             return;
         }
         let t = if ty >= 0 { ty } else { self.concrete_type_of(v) };
         if self.m.has_atomic(t) || self.m.is_runtime_sized(t) {
-            self.fail(ip, "wgsl.type", "a 'let' cannot hold an atomic or a runtime-sized array");
+            self.fail(ip, b"wgsl.type", b"a 'let' cannot hold an atomic or a runtime-sized array");
         }
         let e = self.materialize(v, t, ip);
         let _ = npos;
-        let eop = self.f.exprs[e].op;
-        if self.f.names[e].len as i64 == 0 && eop != E_ARG && eop != E_LOCAL && eop != E_GLOBAL {
-            self.f.names[e] = self.name_of(s);
+        let eop = self.f.exprs[e as usize].op;
+        if self.f.names[e as usize].len() as i64 == 0 && eop != E_ARG && eop != E_LOCAL
+            && eop != E_GLOBAL {
+            self.f.names[e as usize] = self.name_of(s);
         }
         self.scopes.push(ScopeEntry { sym: s, v: val(e, t), mutable: false });
     }
 
-    fn var_decl(inout self) {
+    fn var_decl(&mut self) {
         if self.kind() == T_LT {
             let ap = self.pos();
             self.p += 1;
             let sp = self.address_space();
             self.expect_gt();
             if sp != SP_FUNCTION {
-                self.fail(ap, "wgsl.type", "a variable in a function is 'var' or 'var<function>'");
+                self.fail(ap, b"wgsl.type",
+                    b"a variable in a function is 'var' or 'var<function>'");
             }
         }
         let npos = self.pos();
         let s = self.ident();
-        var ty = -1;
+        let mut ty: i64 = -1;
         if self.eat(T_COLON) {
             ty = self.parse_type();
         }
-        var init = -1;
+        let mut init: i64 = -1;
         if self.eat(T_EQ) {
             let ip = self.pos();
             let v = self.parse_expr_hint(ty);
             if v.k == VK_VOID {
-                self.fail(ip, "wgsl.type", "this call has no result");
+                self.fail(ip, b"wgsl.type", b"this call has no result");
                 return;
             }
             if ty < 0 {
@@ -1903,12 +1959,12 @@ impl Front<ScopedArena> {
             init = self.materialize(v, ty, ip);
         }
         if ty < 0 {
-            self.fail(npos, "wgsl.type", "a 'var' needs a type or an initializer");
+            self.fail(npos, b"wgsl.type", b"a 'var' needs a type or an initializer");
             return;
         }
         if !self.storable(ty) || self.m.has_atomic(ty) || self.m.is_runtime_sized(ty) {
-            if self.err(npos, "wgsl.type") {
-                self.emsg.push_str("a function variable cannot have type ");
+            if self.err(npos, b"wgsl.type") {
+                self.emsg.extend_from_slice(b"a function variable cannot have type ");
                 self.ty_str(ty);
             }
             return;
@@ -1929,12 +1985,12 @@ impl Front<ScopedArena> {
         });
     }
 
-    fn condition(inout self) -> i64 {
+    fn condition(&mut self) -> i64 {
         let at = self.pos();
         let v = self.parse_expr();
         if self.concrete_type_of(v) != T_BOOL {
-            if self.err(at, "wgsl.type") {
-                self.emsg.push_str("a condition is a bool, not ");
+            if self.err(at, b"wgsl.type") {
+                self.emsg.extend_from_slice(b"a condition is a bool, not ");
                 self.val_str(v);
             }
             return self.f.expr(ir::E_LITERAL, T_BOOL, 0, 0, 0);
@@ -1942,17 +1998,17 @@ impl Front<ScopedArena> {
         self.materialize(v, T_BOOL, at)
     }
 
-    fn if_stmt(inout self) {
+    fn if_stmt(&mut self) {
         let c = self.condition();
         self.flush();
         let then_b = self.compound();
-        var else_b = -1;
+        let mut else_b: i64 = -1;
         if self.eat_kw(K_ELSE) {
             if self.eat_kw(K_IF) {
                 let base = self.pending.len() as i64;
                 self.if_stmt();
                 self.flush();
-                else_b = self.f.block_of(&self.pending, base);
+                else_b = self.f.block_of(&mut self.pending, base);
             } else {
                 else_b = self.compound();
             }
@@ -1962,14 +2018,14 @@ impl Front<ScopedArena> {
         self.push_stmt(S_IF, c, then_b, else_b, 0);
     }
 
-    fn return_stmt(inout self, at: i64) {
+    fn return_stmt(&mut self, at: i64) {
         let rt = self.f.result;
         if self.kind() == T_SEMI {
             if rt >= 0 {
-                if self.err(at, "wgsl.return") {
-                    self.emsg.push_str("this function returns ");
+                if self.err(at, b"wgsl.return") {
+                    self.emsg.extend_from_slice(b"this function returns ");
                     self.ty_str(rt);
-                    self.emsg.push_str(": 'return' needs a value");
+                    self.emsg.extend_from_slice(b": 'return' needs a value");
                 }
             }
             self.push_stmt(S_RETURN, -1, 0, 0, 0);
@@ -1978,7 +2034,7 @@ impl Front<ScopedArena> {
         let vp = self.pos();
         let v = self.parse_expr_hint(rt);
         if rt < 0 {
-            self.fail(vp, "wgsl.return", "this function has no result: 'return;'");
+            self.fail(vp, b"wgsl.return", b"this function has no result: 'return;'");
             return;
         }
         let e = self.materialize(v, rt, vp);
@@ -1986,7 +2042,7 @@ impl Front<ScopedArena> {
     }
 
     // The body of a loop (from its `{`), then `continuing` and `break if`.
-    fn loop_stmt(inout self) {
+    fn loop_stmt(&mut self) {
         self.flush();
         let base = self.pending.len() as i64;
         let scope = self.scopes.len() as i64;
@@ -1996,9 +2052,9 @@ impl Front<ScopedArena> {
         self.switch_depth = 0;
         self.statements();
         self.flush();
-        let body = self.f.block_of(&self.pending, base);
-        var cont = -1;
-        var break_if = -1;
+        let body = self.f.block_of(&mut self.pending, base);
+        let mut cont: i64 = -1;
+        let mut break_if: i64 = -1;
         if self.eat_kw(K_CONTINUING) {
             // the continuing block sees the body's names
             let cbase = self.pending.len() as i64;
@@ -2007,13 +2063,13 @@ impl Front<ScopedArena> {
             self.expect(T_LBRACE);
             while self.kind() != T_RBRACE && self.kind() != T_EOF {
                 if self.is_kw(K_BREAK) && self.kind_at(self.p + 1) == T_IDENT
-                    && self.tk.syms[self.p + 1] == K_IF {
+                    && self.tk.syms[(self.p + 1) as usize] == K_IF {
                     self.p += 2;
                     break_if = self.condition();
                     self.expect(T_SEMI);
                     if self.kind() != T_RBRACE {
-                        self.fail(self.pos(), "wgsl.syntax",
-                            "'break if' is the last statement of 'continuing'");
+                        self.fail(self.pos(), b"wgsl.syntax",
+                            b"'break if' is the last statement of 'continuing'");
                     }
                     break;
                 }
@@ -2022,7 +2078,7 @@ impl Front<ScopedArena> {
             self.expect(T_RBRACE);
             self.flush();
             self.in_continuing = saved_cont;
-            cont = self.f.block_of(&self.pending, cbase);
+            cont = self.f.block_of(&mut self.pending, cbase);
         } else {
             cont = self.f.empty_block();
         }
@@ -2034,17 +2090,17 @@ impl Front<ScopedArena> {
     }
 
     // `if !cond { break; }` at the head of a loop body.
-    fn break_unless(inout self, c: i64) {
+    fn break_unless(&mut self, c: i64) {
         self.flush();
         let then_b = self.f.empty_block();
         let base = self.pending.len() as i64;
         let s = self.f.stmt(S_BREAK, 0, 0, 0, 0);
         self.pending.push(s);
-        let else_b = self.f.block_of(&self.pending, base);
+        let else_b = self.f.block_of(&mut self.pending, base);
         self.push_stmt(S_IF, c, then_b, else_b, 0);
     }
 
-    fn for_stmt(inout self) {
+    fn for_stmt(&mut self) {
         self.expect(T_LPAREN);
         self.flush();
         let outer = self.pending.len() as i64;
@@ -2076,7 +2132,7 @@ impl Front<ScopedArena> {
         self.expect(T_SEMI);
         // the update is parsed after the body, so remember where it is
         let upd = self.p;
-        var depth = 0;
+        let mut depth: i64 = 0;
         while self.kind() != T_EOF {
             let k = self.kind();
             if k == T_LPAREN {
@@ -2093,7 +2149,7 @@ impl Front<ScopedArena> {
         let b = self.compound();
         self.push_stmt(S_BLOCK, b, 0, 0, 0);
         self.flush();
-        let body = self.f.block_of(&self.pending, base);
+        let body = self.f.block_of(&mut self.pending, base);
         let after = self.p;
         self.p = upd;
         let cbase = self.pending.len() as i64;
@@ -2104,18 +2160,18 @@ impl Front<ScopedArena> {
         }
         self.in_continuing = saved_cont;
         self.flush();
-        let cont = self.f.block_of(&self.pending, cbase);
+        let cont = self.f.block_of(&mut self.pending, cbase);
         self.p = after;
         self.loop_depth -= 1;
         self.switch_depth = saved_switch;
         self.push_stmt(S_LOOP, body, cont, -1, 0);
         self.flush();
         self.scopes.truncate(scope as usize);
-        let blk = self.f.block_of(&self.pending, outer);
+        let blk = self.f.block_of(&mut self.pending, outer);
         self.push_stmt(S_BLOCK, blk, 0, 0, 0);
     }
 
-    fn while_stmt(inout self) {
+    fn while_stmt(&mut self) {
         self.flush();
         let base = self.pending.len() as i64;
         self.loop_depth += 1;
@@ -2126,20 +2182,20 @@ impl Front<ScopedArena> {
         let b = self.compound();
         self.push_stmt(S_BLOCK, b, 0, 0, 0);
         self.flush();
-        let body = self.f.block_of(&self.pending, base);
+        let body = self.f.block_of(&mut self.pending, base);
         self.loop_depth -= 1;
         self.switch_depth = saved_switch;
         let cont = self.f.empty_block();
         self.push_stmt(S_LOOP, body, cont, -1, 0);
     }
 
-    fn switch_stmt(inout self, at: i64) {
+    fn switch_stmt(&mut self, at: i64) {
         let sp = self.pos();
         let sel = self.parse_expr();
         let st = self.concrete_type_of(sel);
         if st != T_I32 && st != T_U32 {
-            if self.err(sp, "wgsl.type") {
-                self.emsg.push_str("a switch selector is an i32 or a u32, not ");
+            if self.err(sp, b"wgsl.type") {
+                self.emsg.extend_from_slice(b"a switch selector is an i32 or a u32, not ");
                 self.val_str(sel);
             }
             return;
@@ -2147,13 +2203,13 @@ impl Front<ScopedArena> {
         let se = self.materialize(sel, st, sp);
         self.flush();
         self.expect(T_LBRACE);
-        var clauses: V<ir::Case> = Vec::new_in(self.a);
-        var seen: V<i64> = Vec::new_in(self.a);
-        var defaults = 0;
+        let mut clauses: Vec<ir::Case, A> = Vec::new_in(self.a);
+        let mut seen: Vec<i64, A> = Vec::new_in(self.a);
+        let mut defaults: i64 = 0;
         self.switch_depth += 1;
         while self.kind() != T_RBRACE && self.kind() != T_EOF {
             let cp = self.pos();
-            var is_default = false;
+            let mut is_default = false;
             let vstart = self.f.vals.len() as i64;
             if self.eat_kw(K_DEFAULT) {
                 is_default = true;
@@ -2166,12 +2222,12 @@ impl Front<ScopedArena> {
                         let v = self.parse_expr();
                         let c = self.convert_to(v, st, vp);
                         if c.k != VK_CONST {
-                            self.fail(vp, "wgsl.type", "a case selector is a constant");
+                            self.fail(vp, b"wgsl.type", b"a case selector is a constant");
                         }
                         for i in 0..seen.len() as i64 {
-                            if seen[i] == c.iv {
-                                if self.err(vp, "wgsl.switch") {
-                                    self.emsg.push_fmt("case {} appears twice", c.iv);
+                            if seen[i as usize] == c.iv {
+                                if self.err(vp, b"wgsl.switch") {
+                                    write(self.emsg, "case {} appears twice", c.iv).unwrap();
                                 }
                             }
                         }
@@ -2183,15 +2239,15 @@ impl Front<ScopedArena> {
                     }
                 }
             } else {
-                if self.err(cp, "wgsl.syntax") {
-                    self.emsg.push_str("expected 'case' or 'default' in a switch");
+                if self.err(cp, b"wgsl.syntax") {
+                    self.emsg.extend_from_slice(b"expected 'case' or 'default' in a switch");
                 }
                 return;
             }
             if is_default {
                 defaults += 1;
                 if defaults > 1 {
-                    self.fail(cp, "wgsl.switch", "a switch has one 'default'");
+                    self.fail(cp, b"wgsl.switch", b"a switch has one 'default'");
                 }
             }
             self.eat(T_COLON);
@@ -2204,19 +2260,20 @@ impl Front<ScopedArena> {
         self.switch_depth -= 1;
         self.expect(T_RBRACE);
         if defaults == 0 {
-            self.fail(at, "wgsl.switch", "a switch needs a 'default' clause");
-            self.help("add 'default: {}'");
+            self.fail(at, b"wgsl.switch", b"a switch needs a 'default' clause");
+            self.help(b"add 'default: {}'");
         }
         let cstart = self.f.cases.len() as i64;
         for i in 0..clauses.len() as i64 {
-            self.f.cases.push(clauses[i]);
+            self.f.cases.push(clauses[i as usize]);
         }
         self.push_stmt(S_SWITCH, se, cstart, clauses.len() as i64, 0);
     }
 
     // A call as a statement: S_CALL is pushed by the call's lowering.
-    pub fn call_stmt(inout self, fh: i64, args_start: i64, n: i64) -> Val {
-        let rt = if fh == self.fh { self.f.result } else { self.m.functions[fh].result };
+    #[effects(panic, A)]
+    pub(crate) fn call_stmt(&mut self, fh: i64, args_start: i64, n: i64) -> Val {
+        let rt = if fh == self.fh { self.f.result } else { self.m.functions[fh as usize].result };
         if rt < 0 {
             self.push_stmt(S_CALL, fh, args_start, n, -1);
             return Val { k: VK_VOID, sk: 0, e: -1, ty: -1, iv: 0, fv: 0.0 };

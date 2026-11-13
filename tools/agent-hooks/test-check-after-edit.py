@@ -336,9 +336,10 @@ try:
     # --suggested` make the hook run it (a fake: `fix` writes fixed.out's
     # lines and a mark; `fix --dry-run` writes dry.out's; check then
     # prints after.out), check again, and say what it fixed before what
-    # is left. (0.25.2.1) Only the mechanical classes (conv.marker,
-    # conv.rust), each change shown `FILE:LINE: OLD -> NEW`; the other
-    # exact fixes (a did-you-mean, a `use`) are shown, not made.
+    # is left. (0.25.2.1) The exact fixes (a did-you-mean, a `use`) are
+    # shown, not made; (0.28.0) the mechanical class the hook made itself,
+    # a call's `&` marker, went with the old edition: its one fix is an
+    # import unused at two checks.
     fdir3 = os.path.join(tmp, "fake3")
     os.makedirs(fdir3)
     fake3 = os.path.join(fdir3, "volec")
@@ -349,10 +350,6 @@ try:
                  "cat \"$d/check.out\" >&2\n[ -s \"$d/check.out\" ] && exit 1\nexit 0\n" % fdir3)
     os.chmod(fake3, 0o755)
     sug = "volec fix --suggested main.vl"
-    marker = dict(diag("main.vl", 2, "'ui' is lent inout here (the callee may change it): mark it '&ui'",
-                       code="conv.marker"), **{"try": [sug]})
-    spell = dict(diag("main.vl", 3, "'let mut' is Rust's spelling; a mutable binding is 'var x'", code="conv.rust"),
-                 **{"try": [sug]})
     typo = dict(diag("main.vl", 4, "undefined variable 'prinln'", help=["did you mean 'println'?"]), **{"try": [sug]})
     other = diag("main.vl", 5, "expected '[u8]', got 'i64'")
 
@@ -372,74 +369,22 @@ try:
     def fix_calls():
         p = os.path.join(fdir3, "fix.calls")
         return open(p).read().strip().split("\n") if os.path.exists(p) else []
-    head = ("volec fix main.vl, run by the hook (only mechanical fixes: a call's `&`, Rust's spellings, an import "
-            "unused at two checks; volec undo takes it back; positions as before it):")
+    head = ("volec fix main.vl, run by the hook (only an import unused at two checks; volec undo takes it "
+            "back; positions as before it):")
     # (0.25.2.2) each file the hook rewrote, once, after its changes
     tail1 = "\nthe hook rewrote main.vl: the change above, nothing else (read it again before an Edit)"
-    tail2 = "\nthe hook rewrote main.vl: the 2 changes above, nothing else (read it again before an Edit)"
     shown = ("suggested, not applied (check each: a name, a conversion or an import can change what the code "
              "means; " + fake3 + " fix --suggested main.vl makes the changes, not the refused):")
-    diff = [["--- a/main.vl"], ["+++ b/main.vl"], ["@@ -2,2 +2,2 @@"], ["-    bump(ui);"], ["-    let mut u = 0;"],
-            ["+    bump(&ui);"], ["+    var u = 0;"]]
-    fake3_says([marker, spell, typo, other], [["fixed 2 suggested fixes", "main.vl", "+2 -2 lines"]] + diff,
-               [dict(typo, line=4), dict(other, line=6)],
+    fake3_says([typo, other], [["fixed 1 suggested fix", "main.vl", "+1 -1 lines"]], [],
                [["--- a/main.vl"], ["+++ b/main.vl"], ["@@ -4 +4 @@"], ["-    prinln(\"x\");"], ["+    println(\"x\");"]])
     got = ctx_of(run(ev, fake3)[1])
-    case("hook fix: the mechanical ones applied, each change shown; the others shown, not made",
+    case("hook fix: an exact fix is shown, not made",
          (fix_calls(), got),
-         (["fix --suggested --codes conv.marker,conv.marker_extra,conv.rust --diff main.vl --json",
-           "fix --suggested --dry-run main.vl --json"],
-          head + "\nchanged main.vl:2: bump(ui); -> bump(&ui);\nchanged main.vl:3: let mut u = 0; -> var u = 0;"
-          "\nfixed main.vl:2:5: 'ui' is lent inout here (the callee may change it): mark it '&ui' | its exact fix"
-          "\nfixed main.vl:3:5: 'let mut' is Rust's spelling; a mutable binding is 'var x' | its exact fix"
-          + tail2 + "\nvolec check main.vl: 2 errors\ntry: volec fix --suggested main.vl   (1 of the errors: their exact "
+         (["fix --suggested --dry-run main.vl --json"],
+          "volec check main.vl: 2 errors\ntry: volec fix --suggested main.vl   (1 of the errors: their exact "
           "fixes, one checked edit)\nmain.vl:4:5: error[type error] undefined variable 'prinln' | help: did you "
-          "mean 'println'?\nmain.vl:6:5: error[type error] expected '[u8]', got 'i64'\n"
+          "mean 'println'?\nmain.vl:5:5: error[type error] expected '[u8]', got 'i64'\n"
           + shown + "\n  main.vl:4: prinln(\"x\"); -> println(\"x\");"))
-    fake3_says([marker], [["fixed 1 suggested fix", "main.vl", "+1 -1 lines"]] + diff[:4] + [diff[5]], [])
-    case("hook fix: all fixed, clean", ctx_of(run(ev, fake3)[1]),
-         head + "\nchanged main.vl:2: bump(ui); -> bump(&ui);"
-         "\nfixed main.vl:2:5: 'ui' is lent inout here (the callee may change it): mark it '&ui' | its exact fix"
-         + tail1 + "\nvolec check main.vl: 0 errors")
-    # (0.25.2.2) Repeats of one fix in one line, not a line each (the
-    # 0.25.2.1 eval's sdftext: about 20 `&mut` lines).
-    rust = [dict(diag("main.vl", 10 + k, "'&mut %s' is Rust's spelling; an inout argument (the callee may change "
-                      "it) is marked '&x'" % v, code="conv.rust"),
-                 **{"try": ["volec edit patch main.vl:%d --old '&mut %s' --new '&%s'" % (10 + k, v, v), sug]})
-            for k, v in enumerate("abc")]
-    rdiff = [["--- a/main.vl"], ["+++ b/main.vl"], ["@@ -10,3 +10,3 @@"]] + \
-        [["-    f(&mut %s);" % v] for v in "abc"] + [["+    f(&%s);" % v] for v in "abc"]
-    fake3_says(rust + [spell], [["fixed 4 suggested fixes", "main.vl", "+4 -4 lines"]] + rdiff +
-               [["@@ -3 +3 @@"], ["-    let mut u = 0;"], ["+    var u = 0;"]], [])
-    # (0.25.3) each change still a `changed` line: what the file now has
-    case("hook fix: repeats in one line, each change shown, each file once", ctx_of(run(ev, fake3)[1]),
-         head + "\nchanged main.vl:10: f(&mut a); -> f(&a);\nchanged main.vl:11: f(&mut b); -> f(&b);"
-         "\nchanged main.vl:12: f(&mut c); -> f(&c);\nchanged main.vl:3: let mut u = 0; -> var u = 0;"
-         "\nfixed main.vl:3:5: 'let mut' is Rust's spelling; a mutable binding is 'var x' | its exact fix"
-         "\nfixed 3 '&mut x' to '&x' (conv.rust) in main.vl: lines 10, 11, 12"
-         "\nthe hook rewrote main.vl: the 4 changes above, nothing else (read it again before an Edit)"
-         "\nvolec check main.vl: 0 errors")
-    # (0.25.3) past MAX_SHOWN changes, the repeats' lines are left to
-    # their summary line, and said so
-    many = [dict(diag("main.vl", 20 + k, "'&mut v%d' is Rust's spelling; an inout argument (the callee may change "
-                      "it) is marked '&x'" % k, code="conv.rust"),
-                 **{"try": ["volec edit patch main.vl:%d --old '&mut v%d' --new '&v%d'" % (20 + k, k, k), sug]})
-            for k in range(12)]
-    mdiff = [["--- a/main.vl"], ["+++ b/main.vl"], ["@@ -20,12 +20,12 @@"]] + \
-        [["-    f(&mut v%d);" % k] for k in range(12)] + [["+    f(&v%d);" % k] for k in range(12)]
-    fake3_says(many, [["fixed 12 suggested fixes", "main.vl", "+12 -12 lines"]] + mdiff, [])
-    got = ctx_of(run(ev, fake3)[1]).split("\n")
-    case("hook fix: many repeats, the first changes shown, the rest summed",
-         ([x for x in got if x.startswith("changed")][-2:], got[-3:-1]),
-         (["changed main.vl:29: f(&mut v9); -> f(&v9);",
-           "changed: 2 more, on the lines the `fixed N ...` lines below name"],
-          ["fixed 12 '&mut x' to '&x' (conv.rust) in main.vl: lines 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31",
-           "the hook rewrote main.vl: the 12 changes above, nothing else (read it again before an Edit)"]))
-    case("fix pattern: a lent argument", hook.fix_pattern(dict(marker, **{"try": [
-        "volec edit patch main.vl:2 --old '(ui' --new '(&ui'"]})), ("x", "&x"))
-    case("fix pattern: a spelling", hook.fix_pattern(dict(spell, **{"try": [
-        "volec edit patch main.vl:3 --old 'let mut' --new 'var'"]})), ("let mut", "var"))
-    case("fix pattern: from the message", hook.fix_pattern(rust[0] | {"try": []}), ("&mut x", "&x"))
     # (0.25.2.1) a did-you-mean is not made (the gpu2521 agent's
     # `readback` made `read_back`, the function the call was in); the
     # compiler's refusal is shown with the rest
@@ -456,12 +401,12 @@ try:
     fake3_says([other], [["fixed 1 suggested fix", "main.vl", "+1 -1 lines"]], [])
     case("hook fix: not without an exact fix", (ctx_of(run(ev, fake3)[1]), fix_calls()),
          ("volec check main.vl: 1 error\nmain.vl:5:5: error[type error] expected '[u8]', got 'i64'", []))
-    fake3_says([marker], [], [])
-    case("hook fix: refused or nothing done, named as before", ctx_of(run(ev, fake3)[1]),
+    fake3_says([typo], [], [])
+    case("hook fix: nothing to show, named as before", ctx_of(run(ev, fake3)[1]),
          "volec check main.vl: 1 error\ntry: volec fix --suggested main.vl   (the error: their exact fixes, "
-         "one checked edit)\nmain.vl:2:5: error[conv.marker] 'ui' is lent inout here (the callee may change it): "
-         "mark it '&ui'")
-    fake3_says([marker], [["fixed 1 suggested fix", "main.vl", "+1 -1 lines"]], [])
+         "one checked edit)\nmain.vl:4:5: error[type error] undefined variable 'prinln' | help: did you mean "
+         "'println'?")
+    fake3_says([typo], [["fixed 1 suggested fix", "main.vl", "+1 -1 lines"]], [])
     os.environ["VOLE_HOOK_FIX"] = "0"
     got = ctx_of(run(ev, fake3)[1])
     del os.environ["VOLE_HOOK_FIX"]
@@ -470,7 +415,7 @@ try:
     # (0.19) A test case meant to fail (`// ERROR:` lines) is left as it
     # is: its fixes are named, not applied.
     write(os.path.join(prog, "main.vl"), "// ERROR: undefined variable 'prinln'\nfn main() {}\n")
-    fake3_says([marker], [["fixed 1 suggested fix", "main.vl", "+1 -1 lines"]], [])
+    fake3_says([typo], [["fixed 1 suggested fix", "main.vl", "+1 -1 lines"]], [])
     got = ctx_of(run(ev, fake3)[1])
     write(os.path.join(prog, "main.vl"), "mod util;\nfn main() {}\n")
     case("hook fix: not in an ERROR test case", (fix_calls(), got.split("\n")[1]),
@@ -495,7 +440,7 @@ try:
          ["x.vl:3: a -> A", "x.vl:4: b -> B", "x.vl:4: + C", "x.vl:9: - z"])
     with open(log) as fh:
         recs = [json.loads(x) for x in fh if x.strip()]
-    case("hook fix: logged", [r.get("hook_fixed") for r in recs if "hook_fixed" in r][:2], [2, 1])
+    case("hook fix: logged", [r.get("hook_fixed") for r in recs if "hook_fixed" in r][:1], [1])
 
     # (0.17) A worktree's file edited from a session in the main checkout:
     # the worktree's root and compiler, check run in the worktree (check
@@ -577,6 +522,11 @@ try:
     case("stale-std: target/volec reads the tree's: checked with it",
          (use, "checked with target/volec instead" in line), (os.path.join(srepo, "target", "volec"), True))
     case("stale-std: a reader is used as it is", hook.current_std(reader, srepo, {}), (reader, ""))
+    # (0.28.0) the tree's version from a rust-edition compiler/src, `-> *mut u8`
+    vr = os.path.join(tmp, "vr")
+    write(os.path.join(vr, "compiler", "src", "main.vl"),
+          'fn main() {}\n\npub fn version() -> *mut u8 {\n    c"0.28.0"\n}\n')
+    case("tree_version: the rust edition's version()", hook.tree_version(vr), "0.28.0")
     write(os.path.join(srepo, "ex", "main.vl"), "fn main() {}\n")
     sev = {"hook_event_name": "PostToolUse", "tool_name": "Edit", "cwd": srepo, "session_id": "stalestd",
            "tool_input": {"file_path": os.path.join(srepo, "ex", "main.vl")}}
@@ -643,19 +593,6 @@ try:
     del os.environ["VOLE_TEST_DEBOUNCE"]
     shutil.rmtree(os.path.join(prog, "tests"))
 
-    # (0.27.2) A test case's options, as tests/run.sh gives them: its
-    # FLAGS' edition and its ENV's VOLE_STD2 (the compiler's too); none
-    # for a file without them, or check's default.
-    rc = os.path.join(tmp, "rcase.vl")
-    write(rc, "fn main() {}\n// FLAGS: --edition rust\n// ENV: VOLE_STD2=0\n// ENV: OTHER=1\n")
-    case("case options: FLAGS and ENV", hook.case_options(rc), (["--edition", "rust"], {"VOLE_STD2": "0"}))
-    write(rc, "fn main() {}\n// FLAGS: --deny-warnings --edition=rust\n")
-    case("case options: --edition=rust", hook.case_options(rc), (["--edition", "rust"], {}))
-    write(rc, "// EDITION: rust\nfn main() {}\n")
-    case("case options: the root line is the compiler's", hook.case_options(rc), ([], {}))
-    case("case options: no root", hook.case_options(None), ([], {}))
-    os.remove(rc)
-
     # The real compiler, when it has --json (0.15): a clean program is
     # silent, an error is reported; and the latency on a cache hit.
     # (0.25.2.1) The compiler under test when tests/run.sh says which
@@ -672,28 +609,25 @@ try:
         st, out = run(ev2, real)
         case("real: the error", json.loads(out)["hookSpecificOutput"]["additionalContext"] if out else "",
              "volec check main.vl: 1 error\nmain.vl:2:18: error[type error] undefined variable 'q'")
-        # (0.18.1) the hook applies the exact fix: the file is changed;
-        # (0.25.2.1) a mechanical one only: a did-you-mean is shown
-        write(os.path.join(prog, "main.vl"), "fn main() {\n    prinln(\"x\");\n    let mut y = 1 + \"a\";\n}\n")
+        # (0.25.2.1) an error's exact fix is shown, not made: the file is
+        # as it was written
+        typo_text = "fn main() {\n    prinln(\"x\");\n    let mut w = 2;\n    w += 1;\n}\n"
+        write(os.path.join(prog, "main.vl"), typo_text)
         got = ctx_of(run(ev2, real)[1])
         with open(os.path.join(prog, "main.vl")) as fh:
             now = fh.read()
         lines = got.split("\n")
-        case("real: the hook's exact fix", ([x for x in lines if x.startswith(("changed", "fixed", "  main"))],
-                                            "var y" in now, "println(\"x\")" in now),
-             (["changed main.vl:3: let mut y = 1 + \"a\"; -> var y = 1 + \"a\";",
-               "fixed main.vl:3:5: 'let mut' is Rust's spelling; a mutable binding is 'var x' | its exact fix",
-               "  main.vl:2: prinln(\"x\"); -> println(\"x\");"], True, False))
-        # (0.27.2) A rust case whose edition is its `// FLAGS:` line is
-        # checked in it: its Rust spellings are not "fixed" into MVS's.
+        case("real: an exact fix shown, not made", ([x for x in lines if x.startswith(("changed", "fixed", "  main"))],
+                                                   now == typo_text),
+             (["  main.vl:2: prinln(\"x\"); -> println(\"x\");"], True))
+        # (0.27.2) A case with a `// FLAGS:` line: nothing is rewritten.
         rust = ("fn incr(r: &mut i64) {\n    *r += 1;\n}\n\nfn main() {\n    let mut n = 41;\n"
-                "    incr(&mut n);\n}\n// FLAGS: --edition rust\n")
+                "    incr(&mut n);\n}\n// FLAGS: --deny-warnings\n")
         write(os.path.join(prog, "main.vl"), rust)
         got = ctx_of(run(ev2, real)[1])
         with open(os.path.join(prog, "main.vl")) as fh:
             now = fh.read()
-        case("real: a rust case's FLAGS, kept", (now == rust, "conv.rust" in got, "changed main.vl" in got),
-             (True, False, False))
+        case("real: a case's FLAGS line, nothing rewritten", (now == rust, "changed main.vl" in got), (True, False))
         # (0.25.2.2) A file the call left unformatted: said once, until
         # it is formatted; the hook formats nothing.
         write(os.path.join(prog, "main.vl"), "fn main() {\n    let x: i64 =   1;\n    let y = x + 1;\n}\n")
@@ -736,16 +670,18 @@ try:
         # (0.25.3) The hook's rewrites are its fixes' changes, each named:
         # the file differs from what was written by those lines alone (an
         # unformatted line stays as it was; the hook formats nothing).
-        before = "fn main() {\n    let   z  =  3;\n    let mut y = z + 1;\n    println(\"{y}\");\n}\n"
+        # (0.28.0) Its one fix: an import unused at two checks.
+        before = "use std::collections::HashMap;\n\nfn main() {\n    let   z  =  3;\n    println(\"{z}\");\n}\n"
         write(os.path.join(prog, "main.vl"), before)
-        got = ctx_of(run(ev2, real, tempfile.mkdtemp(dir=tmp))[1])
+        rst = tempfile.mkdtemp(dir=tmp)
+        first = ctx_of(run(ev2, real, rst)[1])
+        got = ctx_of(run(ev2, real, rst)[1])
         with open(os.path.join(prog, "main.vl")) as fh:
             now = fh.read()
-        differ = [f"main.vl:{k + 1}: {a.strip()} -> {b.strip()}"
-                  for k, (a, b) in enumerate(zip(before.split("\n"), now.split("\n"))) if a != b]
         case("real: the hook's rewrites, each a changed line, nothing else",
-             ([x[len("changed "):] for x in got.split("\n") if x.startswith("changed ")], differ),
-             (["main.vl:3: let mut y = z + 1; -> var y = z + 1;"], ["main.vl:3: let mut y = z + 1; -> var y = z + 1;"]))
+             ("changed " in first, [x[len("changed "):] for x in got.split("\n") if x.startswith("changed ")],
+              now == before[len("use std::collections::HashMap;\n\n"):]),
+             (False, ["main.vl:1: - use std::collections::HashMap;", "main.vl:2: - "], True))
         # (0.27.2.1) The check after the fixes timed out (a loaded machine:
         # 0.27.2's gate at load 150): the rewrites are said all the same.
         # (0.27.3) The third call (that check) never ends before the hook's
@@ -757,22 +693,31 @@ try:
         # the hook's words when it fails.
         slow = os.path.join(tmp, "slow-volec")
         count = os.path.join(tmp, "slow-count")
+        at = os.path.join(tmp, "slow-at")
         write(count, "0\n")
+        write(at, "0\n")
         write(slow, f"#!/bin/sh\nn=$(cat '{count}'); n=$((n + 1)); echo $n > '{count}'\n"
-                    f"[ $n -eq 3 ] && exec sleep 100\nexec '{real}' \"$@\"\n")
+                    f"[ $n -eq $(cat '{at}') ] && exec sleep 100\nexec '{real}' \"$@\"\n")
         os.chmod(slow, 0o755)
         write(os.path.join(prog, "main.vl"), before)
         os.environ["VOLE_HOOK_TIMEOUT"] = "8"
-        got = ctx_of(run(ev2, slow, tempfile.mkdtemp(dir=tmp))[1])
+        sst2 = tempfile.mkdtemp(dir=tmp)
+        # (the first check: the import is unused once; the second run's
+        # third call is the check after the fix)
+        run(ev2, slow, sst2)
+        with open(count) as fh:
+            calls0 = int(fh.read().strip())
+        write(at, f"{calls0 + 3}\n")
+        got = ctx_of(run(ev2, slow, sst2)[1])
         del os.environ["VOLE_HOOK_TIMEOUT"]
         with open(count) as fh:
-            calls = fh.read().strip()
+            calls = str(int(fh.read().strip()) - calls0)
         # (the calls made, and what the hook said: a failure shows which
         # call timed out)
         case("real: the check after the fixes timed out, the rewrites said",
              ([x[len("changed "):] for x in got.split("\n") if x.startswith("changed ")], calls,
               got if "changed " not in got else ""),
-             (["main.vl:3: let mut y = z + 1; -> var y = z + 1;"], "4", ""))
+             (["main.vl:1: - use std::collections::HashMap;", "main.vl:2: - "], "4", ""))
         # (0.25.3) An agent's own `volec fmt`: its summary counts lines, the
         # hook names them (from the journal, `volec query diff`); no check.
         write(os.path.join(prog, "main.vl"), "fn main() {\n    let   z  =  3;\n    let y = z+1;\n    println(\"{y}\");\n}\n")
@@ -792,20 +737,26 @@ try:
             nrepo = os.path.join(tmp, "newstd")
             os.makedirs(os.path.join(nrepo, ".git"))
             shutil.copytree(os.path.join(REPO, "compiler", "std"), os.path.join(nrepo, "compiler", "std"))
+            # (0.28.0: the system's file is std::__sys, std's own; an item a
+            # program names is added to a module's file)
             with open(os.path.join(nrepo, "compiler", "std", hook.SYS_FILE), "a") as fh:
                 fh.write("pub fn zz_hook_probe() -> i64 { 7 }\n")
             with open(os.path.join(nrepo, "compiler", "std", "str.vl"), "a") as fh:
-                fh.write("pub fn zz_hook_probe2() -> i64 { 8 }\n")
+                fh.write("pub fn zz_hook_probe2() -> i64 { 8 + crate::__sys::zz_hook_probe() }\n")
             write(os.path.join(nrepo, "ex", "a", "deep", "er", "main.vl"),
-                  "fn main() {\n    let x = std::zz_hook_probe() + std::str::zz_hook_probe2();\n    println(\"{x}\");\n}\n")
+                  "fn main() {\n    let x = std::str::zz_hook_probe2();\n    println(\"{x}\");\n}\n")
             nev = {"hook_event_name": "PostToolUse", "tool_name": "Edit", "cwd": os.path.join(nrepo, "ex", "a", "deep", "er"),
                    "tool_input": {"file_path": os.path.join(nrepo, "ex", "a", "deep", "er", "main.vl")}}
             case("real: a std item added in the tree, its system file too", run(nev, real), (0, ""))
-            with open(os.path.join(nrepo, "compiler", "std", hook.SYS_FILE), "a") as fh:
+            with open(os.path.join(nrepo, "compiler", "std", "str.vl"), "a") as fh:
                 fh.write("pub fn zz_bad() -> i64 { true }\n")
+            write(os.path.join(nrepo, "ex", "a", "deep", "er", "main.vl"),
+                  "fn main() {\n    let x = std::str::zz_bad();\n    println(\"{x}\");\n}\n")
             got = ctx_of(run(nev, real)[1])
-            case("real: an error in the tree's system file, at its line",
-                 f"compiler/std/{hook.SYS_FILE}:" in got and "expected 'i64', got 'bool'" in got, True)
+            # (std is one text: the error is at `<std>:LINE`, in what the
+            # program reaches)
+            case("real: an error in the tree's std, in an item the program calls",
+                 "expected 'i64', got 'bool'" in got, True)
         write(os.path.join(prog, "main.vl"), "fn main() {\n    let x: i64 = q;\n}\n")
         ms = []
         for _ in range(5):
@@ -815,7 +766,7 @@ try:
         print(f"note: the hook on a cache hit takes {sorted(ms)[2]:.0f} ms (median of 5, Python's start included)")
         # (0.17) With tests: the real `volec test` after a clean check.
         if "volec test" in subprocess.run([real, "test", "--help"], capture_output=True, text=True).stdout:
-            write(os.path.join(prog, "main.vl"), "use std::println;\n\nfn main() {\n    println(\"1\");\n}\n")
+            write(os.path.join(prog, "main.vl"), "fn main() {\n    println(\"1\");\n}\n")
             write(os.path.join(prog, "tests", "one.out"), "1\n")
             write(os.path.join(prog, "tests", "two.in"), "x\n")
             write(os.path.join(prog, "tests", "two.out"), "2\n")
@@ -826,7 +777,7 @@ try:
                  "1 printed)\n  - 2\n  + 1")
             ms = []
             for k in range(5):
-                write(os.path.join(prog, "main.vl"), "use std::println;\n\nfn main() {\n    println(\"1\");\n}\n" + "\n" * k)
+                write(os.path.join(prog, "main.vl"), "fn main() {\n    println(\"1\");\n}\n" + "\n" * k)
                 t0 = time.time()
                 run(ev2, real)
                 ms.append((time.time() - t0) * 1000)

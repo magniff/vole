@@ -2,34 +2,33 @@
 
 ## str and String
 
-`str` is UTF-8 text, a view (`&str` is `str`, as `&[T]` is `[T]`); a
-string literal is one where a `str` goes, and a `str` goes where a `[u8]`
-does, for free. `String` owns its text, on an allocator:
+`str` is UTF-8 text, Rust's: `&str` borrows it (a string literal is a
+`&'static str`), and `String<A>` owns its text, on an allocator:
 `String::new_in(gpa)`, `String::from_in("x", gpa)`, `s.push_str("..")`,
-`s.push(c)` (a code point, a `u32`: vole has no `char` yet),
-`s.push_fmt("{x}")`, `to_string_in(format_args("..", y), gpa)`. A String has its
-`str`'s methods (`s.trim()`), and `&s` goes where a `str` or `[u8]` does.
-The methods are Rust's, and what they return views the text: `len`,
-`chars()` (code points; `.rev()`), `char_indices()`, `bytes()`,
-`lines()`, `split(p)`, `splitn(n, p)`, `split_once(p)`, `rsplit_once`,
-`split_whitespace()`, `trim()` (and `_start`, `_end`, `_matches`),
-`strip_prefix(p)`, `starts_with(p)`, `ends_with`, `contains`, `find(p)`
-(an `Option<i64>`, a byte index), `rfind`, `matches(p)`, `parse::<T>()`
-(numbers, `bool`), `width()` (terminal columns), `graphemes(true)`. A
-pattern `p` is a `str` (`", "`), a byte (`','`) or a code point (`0x4e16
-as u32`). What allocates takes an allocator, Rust's name with `_in`:
-`to_uppercase_in(gpa)`, `to_lowercase_in`, `replace_in(a, b, gpa)`,
-`repeat_in(n, gpa)`, `to_string_in(gpa)`, `.collect_in(gpa)`; the Rust
-forms are errors naming them. Bytes become a `str` checked:
-`str::from_utf8(b)?`, `String::from_utf8(v)?` (a `Vec<u8, Gpa>`),
-`String::from_buf(b)?`, `String::from_utf8_lossy_in(b, gpa)`; back:
-`s.as_bytes()`, `s.into_bytes()`, `s.into_buf()`. (0.25.5) Bytes (any
-slice whose elements have `==`) have `starts_with(p)` and `ends_with(p)`
-too: `name.ends_with(".vl")` of a `[u8]`.
+`s.push(c)` (a `char`), `format_in("..", args, gpa)`, `x.to_string_in(gpa)`.
+`&s` of a String goes where a `&str` does (Deref), and a String has its
+`str`'s methods. The methods are Rust's, and what they return borrows
+the text: `len` (bytes), `chars()` (`.rev()`), `char_indices()`,
+`bytes()`, `lines()`, `split(p)`, `splitn(n, p)`, `split_once(p)`,
+`rsplit_once`, `split_whitespace()`, `trim()` (and `_start`, `_end`,
+`_matches`), `strip_prefix(p)`, `starts_with(p)`, `ends_with`,
+`contains`, `find(p)` (an `Option<usize>`, a byte index), `rfind`,
+`matches(p)`, `parse::<T>()` (numbers, `bool`), `width()` (terminal
+columns), `graphemes(true)`. A pattern `p` is a `&str`, a `char` or a
+closure `|c: char| ..`. What allocates takes an allocator, Rust's name
+with `_in`: `to_uppercase_in(gpa)`, `to_lowercase_in`,
+`to_ascii_uppercase_in`, `replace_in(a, b, gpa)`, `repeat_in(n, gpa)`,
+`to_string_in(gpa)`, `to_owned_in(gpa)`, `.collect_in(gpa)`; the Rust
+form is `alloc.no_in`, which names the `_in` one (`volec fix --only
+alloc` writes it). Bytes become text checked: `std::str::from_utf8(b)`
+(a `Result<&str, _>`), `String::from_utf8(v)` (a `Vec<u8, A>`),
+`String::from_utf8_lossy_in(b, gpa)`; back: `s.as_bytes()`,
+`s.into_bytes()`. A byte slice has `starts_with` and `ends_with` too:
+`b"name.vl".ends_with(b".vl")`.
 
 ```vole
-fn initials(name: str, gpa: Gpa) -> String<Gpa> {
-    var out = String::new_in(gpa);
+fn initials(name: &str, gpa: Gpa) -> String<Gpa> {
+    let mut out = String::new_in(gpa);
     for w in name.split_whitespace() {
         out.push(w.chars().next().unwrap());
     }
@@ -37,13 +36,13 @@ fn initials(name: str, gpa: Gpa) -> String<Gpa> {
 }
 
 fn main(gpa: Gpa) -> i32 {
-    let line: str = "  ada lovelace, 1815 ";
+    let line = "  ada lovelace, 1815 ";
     let (name, year) = line.trim().split_once(", ").unwrap();
     let born = year.parse::<i64>().unwrap();
     let up = name.to_uppercase_in(gpa);
     let short = initials(name, gpa);
     println("{up} {short} {} {}", 2026 - born, name.contains('l'));
-    let parts: Vec<str, Gpa> = "a,b,,c".split(',').collect_in(gpa);
+    let parts: Vec<&str, Gpa> = "a,b,,c".split(',').collect_in(gpa);
     println("{parts:?} {}", parts.len());
     0
 }
@@ -55,50 +54,45 @@ ADA LOVELACE al 211 true
 
 ## String constants
 
-String constants come in four forms:
-
 | form | what it is |
 |---|---|
-| `const X: str = "...";` | text, a value: each use is the literal (0.25.4); a text block too |
-| `const X: [u8] = "...";` | bytes; a text block (`"""`, `guide syntax#lexical`), `include_str("f.wgsl")` and `include_bytes("f.bin")` too |
-| `static X: str = "...";` | text in a place, one address for every use, as any static |
-| `static X: [str; N] = ["a", "b"];` | an array of them (`const` too): `X[i]` is one, `X[..]` the slice; `[str]`, without the length, is refused |
+| `const X: &str = "...";` | text: each use is the literal |
+| `const X: &[u8] = b"...";` | bytes; `include_str("f.wgsl")` is a file's text, a `&'static str` |
+| `static X: &str = "...";` | text in a place, one address for every use, as any static |
+| `static X: [&str; N] = ["a", "b"];` | an array of them (`const` too): `X[i]` is one, `&X[..]` the slice |
 
 What turns one form into another:
 
 | you have | you want | write |
 |---|---|---|
-| a `str` (a literal, a static) | `[u8]` | nothing: a `str` goes where a `[u8]` does; `s.as_bytes()` says so |
-| `[u8]` | `str` | `str::from_utf8(b)?`: checked, a `Result` |
-| `Vec<T, A>`, `Buf` | `[T]`, `[u8]` | `v.as_slice()`, a view, no copy; a `String`: `s.as_str()` |
-| a format string | its text | `format_in("..", args, gpa)`, a `String<A>` (`.as_str()` views it; 0.26.3: a `Buf` before); `to_string_in(x, gpa)` for one value |
-| a slice | appended | `v.extend_from_slice(s)` to a `Vec`; `push_str(s)` to a `Buf` or `String` |
+| a `&str` | `&[u8]` | `s.as_bytes()` |
+| `&[u8]` | `&str` | `std::str::from_utf8(b)?`: checked, a `Result` |
+| `Vec<T, A>` | `&[T]` | `&v`, `v.as_slice()`, a borrow, no copy; a `String`: `s.as_str()` |
+| a format string | its text | `format_in("..", args, gpa)`, a `String<A>`; `x.to_string_in(gpa)` for one value |
+| a slice | appended | `v.extend_from_slice(s)` to a `Vec`; `push_str(s)` to a `String` |
 
-`print`, `println` and `eprintln` take any `T: Display`: a number, a
-`str`, a `[u8]`, `format_args(..)`, with no allocator; a literal first
-is a format string, its arguments after it. (0.26.2) `panic("bad {x}")`
-and `assert(c, "bad {}", x)` format their message too, on the stack, with
-no allocator; a message that is no literal is a `[u8]` (a `str` too).
+`print`, `println` and `eprintln` take a format literal and its
+arguments, any `T: Display`, with no allocator; `panic("bad {x}")`
+formats its message the same way, and so does `assert(c, "bad {}",
+x)`.
 
 ```vole
-const SHADER: [u8] = """
-    @compute @workgroup_size(1)
-    fn main() {}
-    """;
-const NAME: str = "vole";
-static DAYS: [str; 3] = ["mon", "tue", "wed"];
+const SHADER: &str = "@compute @workgroup_size(1)\nfn main() {}\n";
+const NAME: &str = "vole";
+static DAYS: [&str; 3] = ["mon", "tue", "wed"];
 
 fn main(gpa: Gpa) {
-    let bytes: [u8] = NAME; // a str goes where [u8] does
-    let text: str = str::from_utf8(SHADER).unwrap(); // bytes to str: checked
-    var v: Vec<u8, Gpa> = Vec::new_in(gpa);
+    let bytes: &[u8] = NAME.as_bytes();
+    let text = std::str::from_utf8(SHADER.as_bytes()).unwrap(); // checked
+    let mut v: Vec<u8, Gpa> = Vec::new_in(gpa);
     v.extend_from_slice(NAME.as_bytes());
-    v.extend_from_slice(DAYS[1]);
+    v.extend_from_slice(DAYS[1].as_bytes());
     let msg = format_in("{NAME}: {} days, {} bytes", DAYS.len(), v.len(), gpa); // a String
-    println(msg.as_slice());
-    println("{} {} {}", bytes.len, text.lines().count(), DAYS[..].len());
-    if v.len() != 7 {
-        panic(msg.as_slice()); // a [u8]: no format string
+    println("{}", msg);
+    println("{} {} {}", bytes.len(), text.lines().count(), DAYS[..].len());
+    let s = String::from_utf8(v).unwrap();
+    if s.len() != 7 {
+        panic("{}", msg);
     }
 }
 ```
@@ -110,32 +104,38 @@ vole: 3 days, 7 bytes
 ## Numbers as text without an allocator
 
 `format_in("{v:.2}", gpa)` allocates a `String`; a loop that writes a
-number every frame (a UI's label) writes it into a stack array instead.
-`std::num::fmt_f64(v, decimals, &out)` (0.25.4) writes `{v:.N}`'s text
-byte for byte at the end of a `[u8; 32]` and returns where it starts:
-the exact value rounded to the nearest, a tie to the even digit (`2.5`
-to 0 decimals is `2`, as C's `%.0f` and Rust's `{:.0}`), `-0.00`,
-`NaN`, `inf`; `decimals` from 0 to `FIXED_DECIMALS_MAX` (20); a text
-longer than 32 bytes is `{v:e}`'s. An `f32` is `fmt_f64(x as f64, ..)`.
-`fmt_i64(v, &out)` and `fmt_u64` do the same for integers into a
-`[u8; 20]` (`guide formatting#numbers`).
+number every frame (a UI's label) writes it into a stack buffer instead,
+through `std::fmt::Write`, Rust's: a type with `write_str` takes
+`write(&mut w, "..", args)`, and the formatting itself allocates
+nothing. `{:.0}` rounds a tie to the even digit (`2.5` is `2`), as
+Rust's.
 
 ```vole
-use std::num::{fmt_f64, fmt_i64};
+use std::fmt::{self, Write};
+
+// A label's text in a stack buffer: no allocator.
+struct Label { buf: [u8; 32], len: usize }
+
+impl Write for Label {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let b = s.as_bytes();
+        if self.len + b.len() > 32 { return Err(fmt::Error); }
+        self.buf[self.len..self.len + b.len()].copy_from_slice(b);
+        self.len += b.len();
+        Ok(())
+    }
+}
+
+impl Label {
+    fn as_str(&self) -> &str { std::str::from_utf8(&self.buf[..self.len]).unwrap() }
+}
 
 fn main() {
-    var out: [u8; 32] = [0; 32];
-    let at = fmt_f64(3.14159, 2, &out);
-    println(out[at..32]);
-    let at2 = fmt_f64(-0.5, 0, &out);
-    println(out[at2..32]);
-    var digits: [u8; 20] = [0; 20];
-    let i = fmt_i64(-42, &digits);
-    println(digits[i..20]);
+    let mut l = Label { buf: [0; 32], len: 0 };
+    write(&mut l, "{:.2} {:.0} {}", 3.14159, 2.5, -42).unwrap();
+    println("{}", l.as_str());
 }
 ```
 ```out
-3.14
--0
--42
+3.14 2 -42
 ```

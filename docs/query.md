@@ -23,14 +23,12 @@ volec query callers NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE]
 volec query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]   (0.16)
 volec query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (0.16) the inferred effects
 volec query unsafe [FILE...|DIR|std] [--no-std] [--unjustified] [--summary] [--json]   (0.25.3) every unsafe site
-volec query views NAME...|MODULE [--why]   (0.17) what results and `&mut` parameters view
 volec query features NAME... [--why FEATURE] [-C OPTION]   (0.19) what a function needs of the CPU
 volec query arch WORDS... [--feature F] [--arch A] [--equiv NAME]   (0.19) the intrinsic tables (also `intrinsics`; no program read)
 volec query items [MODULE|TYPE...] [--root ROOT] [--comments] [--find WORD] [--kind KIND,...] [--names]
 volec query show MODULE::section TITLE                   (0.13)
 volec query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--ignore-case] [--count] [--limit N] [--all]
 volec query type FILE:LINE[:COL]...                      (0.13)
-volec query own FILE:LINE:COL...                         (0.17)
 volec query drops FILE:LINE...                           (0.26.1)
 volec query stats [MODULE|FILE] [--over N] [--all]      (refactor.md)
 volec query deps MODULE [--max-lines N]                 (refactor.md)
@@ -57,9 +55,9 @@ edit, refactor, fix, check, probe, test; `tools/query/roots.vl`):
   (a `mod NAME;` of a main.vl above it declares it) is that program's
   main.vl, and `query items FILE` lists that module.
 - With no ROOT, a `FILE` or `FILE:LINE` argument of another program than
-  the default one names it: `query context examples/nes/check.vl:233`,
+  the default one names it: `query context examples/nes/check.vl:232`,
   `edit patch examples/nes/check.vl --old A --new B --all` and `probe
-  examples/nes/check.vl:235 x -- --check` work from the root of the
+  examples/nes/check.vl:234 x -- --check` work from the root of the
   tree. Their `try:` lines then say `--root examples/nes/main.vl`.
 - A NAME the default program does not define, with no ROOT and no
   `$VOLE_ROOT`, is looked for in the other programs under the current
@@ -68,8 +66,8 @@ edit, refactor, fix, check, probe, test; `tools/query/roots.vl`):
   most 3: the program the current directory is in first, when it is in
   one's subdirectory, then the examples', then the rest; (0.25.2.2) never
   one under evals/, tests/, target/ or a dot directory, nor anything from
-  under evals/: the 0.25.2.1 eval's `try:` lines named other agents'
-  programs). A std path (`std::window::Surface::frame`) never goes to
+  under a directory evals/: the 0.25.2.1 eval's `try:` lines named other
+  agents' programs; that tree was deleted at 0.28.0). A std path (`std::window::Surface::frame`) never goes to
   another program: std is every program's, and its nearest names answer
   (`try: volec query show std::gpu::Surface::frame`). When one program defines it, a
   question of `query` is answered from there, with `note
@@ -114,7 +112,6 @@ tools` the ones a program needs.
 | text that is not a name (a message, a comment), with its item | `target/volec query grep TEXT` (`--comments`, `--strings`, `--code`, `--word`, `--ignore-case`, `--in`) |
 | a module's section banners; one section | `target/volec query items MODULE --comments`, `query show MODULE::section TITLE` |
 | the type of an expression | `target/volec query type FILE:LINE:COL` |
-| each local's kind, moves and views at a position (0.17) | `target/volec query own FILE:LINE:COL` |
 | a function's drops, each decided (kept, removed, flagged, opened) and where it runs (0.26.1) | `target/volec query drops FILE:LINE` |
 | what a function may do (allocate, io, panic, loop forever) | `target/volec query effects NAME\|MODULE` (`--why EFFECT`: the chain; `--has alloc(Gpa)`: which still allocate) |
 | every unsafe site: what it does, its class, whether it says why | `target/volec query unsafe [FILE...\|std]` (`--unjustified`, `--summary`, `--json`) |
@@ -138,7 +135,6 @@ tools` the ones a program needs.
 | add, remove, rename, reorder or retype a parameter, with every call | `target/volec refactor signature FN --add 'x: i64 = 0'` (`--remove x`, `--rename-param a b`, `--reorder b,a`, `--type x T --default '$x as T'`) |
 | add, remove, rename or retype a field, with every literal and access | `target/volec refactor field STRUCT --add 'g: i64 = 0'` (`--remove g`, `--rename g h`, `--type g T`) |
 | add a variant (an arm in each match that needs one), remove, rename one | `target/volec refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match; `--remove V`, `--rename V W`) |
-| a raw table (`static var X: *T`, X_COUNT, X_CAP, grown by `grow`) to a `Vec<T, Comp>`, every use (0.25.4) | `target/volec refactor table X --dry-run` (`--count N`, `--cap C`, `--alloc PATH`; refused, nothing changed, each use it cannot place listed: `&X[i]`, X passed, X_CAP read, X_COUNT written; then `fix --only unneeded-unsafe`) |
 | move lines of a function into a new one, parameters and result computed | `target/volec refactor extract-function FN --lines A-B --to NEW` |
 | put a small function's body where it is called (and delete it) | `target/volec refactor inline FN` (`--at FILE:LINE`: one call) |
 | replace an idiom everywhere, typed | `target/volec rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: &mut IntVec' --dry-run` (`--list`: the sites and their holes; `--subst 'P' 'R'`: inside the holes' code; `--where '$v: name ~ RE'`; `--in FN\|MODULE\|FILE`, repeated) |
@@ -749,34 +745,6 @@ $ volec query show vqtbl1q_u8
 pub fn vqtbl1q_u8(t: uint8x16_t, idx: uint8x16_t) -> uint8x16_t;
 ```
 
-## views (0.17)
-
-`views NAME...` prints each function's view summary
-(docs/design/value-semantics.md §2.4): which parameters its result
-points into, and what its `&mut` parameters may come to hold. `p` is
-what the argument p points into (the referent of `p: &T`, the storage of
-`p: [T]`), `*p` what the views p holds point into: `Vec::as_slice` is
-`views(self)`, a parser method returning a token's text `views(*self)`,
-`intern(names: &mut Vec<[u8]>, word: [u8])` `views() stores(word)`.
-After it, how it is known: `inferred` (from the body, callees first),
-`declared` (`#[views(..)]`, `#[stores(..)]`), `parametric` (a generic
-result made of its type parameters: by its type), `assumed` (a body that
-did not check: every parameter). A MODULE gives its functions whose
-summary is not `views()`.
-
-- `--why` adds, under each function's line, the `return` or tail that
-  makes each source, and the callee's summary when the value is a call.
-
-`def`, `show` and `context` add `views: SUMMARY` after the effects when
-it is not `views()`; `--print-views` prints every function's summary
-after checking, as `--print-effects` does.
-
-```
-$ volec query views Parser --why
-crate::Parser::name→views(*self) inferred
-  why: parse.vl:4:83 't.text': views what 'self' holds
-```
-
 ## context (0.15)
 
 `query context NAME` answers in one call what takes three to five
@@ -841,8 +809,8 @@ not, and where there is no program at all (a directory without
 (`compiler/std/*.vl`, found from the current directory or one of the
 three above it) and are the std built into the compiler, std's
 positions are those files' lines: `query def std::trim` prints
-`compiler/std/io.vl:102:8`, not `<std>:2075:8`; a FILE:LINE in one of
-them (`query show compiler/std/io.vl:102`, `--in
+`compiler/std/io.vl:101:8`, not `<std>:2075:8`; a FILE:LINE in one of
+them (`query show compiler/std/io.vl:101`, `--in
 compiler/std/io.vl`) reads std from its files. Elsewhere std is the
 compiler's text, `<std>`. The edits of std items: refactor.md, "Editing
 std by name".
@@ -860,7 +828,7 @@ its module, its file's first.
 ```
 $ volec query similar std::trim --limit 1
 // 1 of 135 fns like std::trim, nearest first; a new one beside it: volec edit insert --after std::trim < new.vl
-// std::is_digit→compiler/std/io.vl:96-99→effects: none
+// std::is_digit→compiler/std/io.vl:95-98→effects: none
 ...
 ```
 
@@ -985,28 +953,6 @@ gives the f-string's type. What the compiler writes for an f-string or a
 `?` (the hidden locals `__f0`, `__out`, the match a `?` is) is never
 shown.
 
-## own (0.17)
-
-`own FILE:LINE:COL` shows the own pass's state at a position
-(docs/design/value-semantics.md §2.9): the position and its function,
-then a line per local in scope there (parameters first, then in the
-order they are declared), its name, type and kind (`plain`, `owned`,
-`view`, `owned view`), and, from the own pass's walk of the function
-(front/own/observe.vl), whether it is moved (where, into what) and the
-views it holds (what they view, where they were taken, what invalidated
-them). Without the walk (a template never instantiated, or before the
-checker has it), the kinds alone:
-
-```
-main.vl:16:17 in crate::main
-gpa    Gpa       plain
-v      Vec<i64>  owned
-first  [i64]     view
-```
-
-A `let`'s names are in scope after the `let`. A position in no function
-the checker saw: `error query.no-match`, `try:` the item at that line.
-
 ## drops (0.26.1)
 
 `drops FILE:LINE` shows the drops of the function at that line as the
@@ -1121,8 +1067,7 @@ the model, which reads the text form as well and in fewer tokens.
   the end.
 
 tools/agent-hooks/check-after-edit.py (the check after every edit, in
-AGENTS.md) and the agent eval's `final_check` (tests/agent-eval) read
-`check --json`. tests/refactor/json.t has a transcript.
+AGENTS.md) reads `check --json`. tests/refactor/json.t has a transcript.
 
 ## Programs with errors
 
@@ -1202,6 +1147,12 @@ sample in the suite, all of it in the gate's `cachediff` step).
   file of the program), one that could not be parsed. A damaged or
   partly written file is not read (a hash of its contents; written
   through a new file renamed over the old).
+- Bounded (0.28.0): whoever writes a cache then removes the programs
+  least recently used (a hit is a use: the time in the `.bin`'s header)
+  while the directory's `q-KEY.*` files pass 1 GB (`$VOLE_CACHE_LIMIT`,
+  in MB: the code cache's limit too), about 85 small programs at 12 MB
+  each; never a file with another name, and a command that only reads
+  does not read the directory. A cache removed under a reader is a miss.
 - (0.18.1) Beside it, a build's code cache, `g-KEY.pack`: each
   function's optimized code at -O1 and -O2, reused by a rebuild where an
   edit did not change it ([optimizer.md](optimizer.md), "0.18.1:
@@ -1409,10 +1360,9 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
   FIX` line per error it fixed, then the errors left. A refused fix
   leaves the report as before, with its `try:`; VOLE_HOOK_FIX=0 turns
   it off; the record says `hook_fixed`. (The 0.18 eval: the `try:` was
-  offered 43 times and run once.) (0.25.2.1) Only the mechanical
-  classes are made: `fix --suggested --codes
-  conv.marker,conv.marker_extra,conv.rust --diff` (a call's `&`
-  marker, Rust's spellings), and `fix --only unused --in FILE` for an
+  offered 43 times and run once.) (0.25.2.1) Only a fix that
+  changes no meaning is made; (0.28.0) there is one, `fix --only unused
+  --in FILE` for an
   import unused at this check and the last (not one just written); each
   change is a `changed FILE:LINE: OLD -> NEW` line after the head. The
   other exact fixes (a did-you-mean, a conversion, a `use`, a path: the
@@ -1491,7 +1441,7 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
   (untracked, staged, or added by a commit no release-* branch nor main
   has) is the agent's own: read and rewritten with any tool; a file of
   another kind under compiler/src or compiler/std (`tables/*.objc`,
-  index.awk; a `grep -r --include '*.objc'`) is not vole source; a
+  `embed.sh`; a `grep -r --include '*.objc'`) is not vole source; a
   Python script is a rewrite only when a file it opens for writing is
   compiler source, its target followed through the script's assignments
   (`out = os.path.join(scratch, 'x')` is not; a target from `sys.argv`,

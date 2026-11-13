@@ -24,38 +24,42 @@ by looking at what the new thread gets:
 
 - an owned value, such as a `Vec`, may *move* into a thread, which then
   has it to itself;
-- a view, such as a slice, may go only to a *scoped* thread, one that is
-  guaranteed to finish before the data it views goes away;
-- a scoped thread may read the caller's data, but not change it, unless
-  the change goes through a lock or an atomic;
-- a raw pointer never goes to another thread, and no thread but the
-  main one may touch a `static var`.
+- a reference, such as a slice, may go only to a *scoped* thread, one
+  that is guaranteed to finish before the data it borrows goes away;
+- scoped threads may read the caller's data together, but they may not
+  all change it, unless the change goes through a lock or an atomic;
+- a raw pointer never goes to another thread, and a `static`, which
+  every thread can reach, must be of a type that threads can share.
 
 Safe code that follows these rules can't have a data race. The rest of
 the chapter shows each rule, and the error you get when you break it.
 
 ## spawn and join
 
-`thread::spawn` starts a thread that runs a closure. Save this as
-`spawn.vl`:
+`thread::spawn_in` starts a thread that runs a closure. It takes an
+allocator too, for the memory the closure and its result live in until
+the thread is joined. Save this as `spawn.vl`:
 
 ```vole spawn.vl
 use std::thread;
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 1..=100 {
         v.push(i);
     }
-    let h = thread::spawn(sink || {
-        var total = 0;
-        for x in v {
-            total += x;
-        }
-        total
-    });
+    let h = thread::spawn_in(
+        move || {
+            let mut total = 0;
+            for x in v {
+                total += x;
+            }
+            total
+        },
+        gpa,
+    );
     println("started a thread");
-    let total = h.join();
+    let total = h.join().unwrap();
     println("the thread says: {total}");
 }
 ```
@@ -65,68 +69,76 @@ started a thread
 the thread says: 5050
 ```
 
-`spawn` returns a *handle*, `h`, right away; the new thread runs on
+`spawn_in` returns a *handle*, `h`, right away; the new thread runs on
 its own while `main` carries on and prints its first line. `h.join()`
-waits for the thread to finish and gives back the closure's result.
+waits for the thread to finish and gives back the closure's result, in
+a `Result` that we `unwrap` (more on that in a moment).
 
-The closure is a `sink` closure: it takes what it uses. A spawned
+The closure is a `move` closure: it takes what it uses. A spawned
 thread may run longer than the function that started it, so it can't
 borrow that function's variables, which might be gone by then. `v`
-moves into the thread, and after the `spawn`, `main` can't use `v` any
-more; the compiler says so if you try.
+moves into the thread, and after the `spawn_in`, `main` can't use `v`
+any more; the compiler says so if you try.
 
-Views can't go to a spawned thread at all, even in a `sink` closure,
-because the data they view stays behind:
+References can't go to a spawned thread at all, even in a `move`
+closure, because the data they borrow stays behind:
 
 ```vole
 use std::thread;
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..10 {
         v.push(i);
     }
     let xs = v.as_slice();
-    let h = thread::spawn(sink || xs.len());
-    println("{}", h.join());
+    let h = thread::spawn_in(move || xs.len(), gpa);
+    println("{}", h.join().unwrap());
 }
 ```
 
 ```err
-error[sync.borrow_escapes]: 'thread::spawn' moves 'xs' ([i64] is a view) to a thread that may outlive what it views
- --> main.vl: line 9, column 13
-  = help: give the thread an owned copy (`.to_vec_in(gpa)`, a Buf), or start it in thread::scope, which ends before the data does
+error[borrowck.dropped_borrowed]: 'v' is dropped while it is still borrowed (dropped at main.vl: line 3, column 19) (borrowed at main.vl: line 8, column 14)
+ --> main.vl: line 8, column 14
+  = help: declare it before what borrows it, so it is dropped after
 ```
 
-The help gives the two ways out: give the thread its own copy, or use a
-scoped thread, which is the next section.
+`xs` borrows `v`, and `v` is dropped at the end of `main`, while the
+thread may still be running: the borrow checker's error from chapter 4.
+There are two ways out: give the thread its own copy
+(`xs.to_vec_in(gpa)`), or use a scoped thread, which is the next
+section.
 
 If any thread panics, the whole program stops, with the usual message
-and exit status 101. That's why `join` gives the result directly, not a
-`Result` to check: if the thread failed, `join` is never reached.
+and exit status 101. So the `Result` that `join` returns is always an
+`Ok`, and `unwrap` on it can't fail: if the thread failed, `join` is
+never reached.
 
 ```vole
 use std::thread;
 
-fn main() {
-    let h = thread::spawn(sink || {
-        let v = [1, 2, 3];
-        let i = 3;
-        v[i]
-    });
-    println("{}", h.join());
+fn main(gpa: Gpa) {
+    let h = thread::spawn_in(
+        || {
+            let v = [1, 2, 3];
+            let i = 3;
+            v[i]
+        },
+        gpa,
+    );
+    println("{}", h.join().unwrap());
     println("not reached");
 }
 ```
 
 ```out exit=101
-main.vl:7:9: index out of bounds: index 3, length 3
+main.vl:8:13: index out of bounds: index 3, length 3
 ```
 
-> **If you know Rust:** `sink ||` is `move ||`. There is no `Send` or
-> `Sync` to write: the compiler works out from the types what may cross
-> to another thread. `join` returns the value, not a `Result`, because
-> a panic stops every thread.
+> **If you know Rust:** `spawn_in` is `spawn` with the allocator. `Send`
+> and `Sync` are worked out from the types, as Rust's auto traits are,
+> and checked where a thread starts. `join` returns a `Result` as in
+> Rust, but a panic stops every thread, so it is never an `Err`.
 
 ## Scoped threads
 
@@ -138,16 +150,16 @@ Save this as `sum.vl`:
 use std::thread;
 use std::thread::ScopedJoinHandle;
 
-fn sum(xs: [i64]) -> i64 {
-    var total = 0;
+fn sum(xs: &[i64]) -> i64 {
+    let mut total = 0;
     for x in xs {
-        total += x;
+        total += *x;
     }
     total
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..1000000 {
         v.push(i % 1000);
     }
@@ -155,24 +167,24 @@ fn main(gpa: Gpa) {
 
     let half = xs.len() / 2;
     let total = thread::scope(|s| {
-        let a = s.spawn(|| sum(xs[..half]));
-        let b = s.spawn(|| sum(xs[half..]));
-        a.join() + b.join()
+        let a = s.spawn(|| sum(&xs[..half]));
+        let b = s.spawn(|| sum(&xs[half..]));
+        a.join().unwrap() + b.join().unwrap()
     });
     println("two threads: {total}");
 
-    let n = thread::available_parallelism() as usize;
+    let n = thread::available_parallelism();
     let chunk = (xs.len() + n - 1) / n;
     let total = thread::scope(|s| {
-        var handles: Vec<ScopedJoinHandle<i64>, Gpa> = Vec::new_in(gpa);
+        let mut handles: Vec<ScopedJoinHandle<i64>, Gpa> = Vec::new_in(gpa);
         for k in 0..n {
             let lo = k * chunk;
             let hi = if lo + chunk < xs.len() { lo + chunk } else { xs.len() };
-            handles.push(s.spawn(sink || sum(xs[lo..hi])));
+            handles.push(s.spawn(move || sum(&xs[lo..hi])));
         }
-        var t = 0;
+        let mut t = 0;
         for h in handles {
-            t += h.join();
+            t += h.join().unwrap();
         }
         t
     });
@@ -189,17 +201,17 @@ one thread per core: 499500000
 started with `s.spawn` belong to it. Before `scope` returns, it waits
 for every one of them. So the threads can't outlive anything that
 existed before the scope started, and they may borrow it: both threads
-read `xs`, a view of `v`, with no copying.
+read `xs`, a slice of `v`, with no copying.
 
 The first part splits the numbers in two. The second asks
 `thread::available_parallelism()` how many threads the machine can run
-at once, and gives each a chunk. Its threads are `sink` closures: `lo`
-and `hi` are made inside the loop and change on each trip, so each
-thread takes its own copy of them. (`xs`, a view, is copied too, which
-copies nothing but its position and length.)
+at once, and gives each a chunk. Its threads are `move` closures: `lo`
+and `hi` are made inside the loop and are gone at the end of each trip,
+so each thread takes its own copy of them. (`xs`, a reference, is
+copied too, which copies nothing but its position and length.)
 
 While the threads run, the scope's own closure must not change what
-they read. That's the other half of the bargain, and the compiler
+they read. That's the other half of the bargain, and the borrow checker
 checks it.
 
 ## Sharing changes: Mutex
@@ -214,7 +226,7 @@ fn is_prime(n: i64) -> bool {
     if n < 2 {
         return false;
     }
-    var d = 2;
+    let mut d = 2;
     while d * d <= n {
         if n % d == 0 {
             return false;
@@ -225,23 +237,23 @@ fn is_prime(n: i64) -> bool {
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..100000 {
         v.push(i);
     }
     let xs = v.as_slice();
     let half = xs.len() / 2;
-    var primes = 0;
+    let mut primes = 0;
     thread::scope(|s| {
         s.spawn(|| {
-            for x in xs[..half] {
+            for &x in &xs[..half] {
                 if is_prime(x) {
                     primes += 1;
                 }
             }
         });
         s.spawn(|| {
-            for x in xs[half..] {
+            for &x in &xs[half..] {
                 if is_prime(x) {
                     primes += 1;
                 }
@@ -253,22 +265,21 @@ fn main(gpa: Gpa) {
 ```
 
 ```err
-error[sync.scope_shared_write]: a thread of 'thread::scope' changes 'primes', which the scope's other code may use at the same time
- --> shared.vl: line 29, column 21
-  = help: scoped threads only read what they borrow (0.21.0): return the result from the thread (`h.join()`), or use a Mutex or an atomic
-error[sync.scope_shared_write]: a thread of 'thread::scope' changes 'primes', which the scope's other code may use at the same time
- --> shared.vl: line 36, column 21
-  = help: scoped threads only read what they borrow (0.21.0): return the result from the thread (`h.join()`), or use a Mutex or an atomic
+error[borrowck.mut_twice]: cannot borrow 'primes' as mutable more than once at a time (mutably borrowed at shared.vl: line 26, column 17)
+ --> shared.vl: line 33, column 17
+  = help: finish the first borrow's uses before the second, or reborrow once and pass it on
 ```
 
 `primes += 1` reads the counter, adds one, and writes it back. If both
 threads do that at the same moment, they both read the same number and
 one of the additions is lost. In a language that allows it, this
 program prints a different wrong count on each run. Vole doesn't
-compile it.
+compile it, and the rule that stops it is one you know: each closure
+that changes `primes` borrows it mutably, and there can be only one
+mutable borrow of a value at a time (chapter 4).
 
-The help lists three fixes. The best is usually the first, the one
-`sum.vl` already uses: each thread counts its own half, returns its
+There are three fixes. The best is usually the one `sum.vl` already
+uses: each thread counts its own half, returns its
 count, and `join` brings the counts together. Nothing is shared, so
 nothing can race.
 
@@ -278,15 +289,15 @@ use an *atomic*, a number whose operations can't be interrupted
 halfway. Here are both, in `count.vl`:
 
 ```vole count.vl
-use std::thread;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::thread;
 
 fn is_prime(n: i64) -> bool {
     if n < 2 {
         return false;
     }
-    var d = 2;
+    let mut d = 2;
     while d * d <= n {
         if n % d == 0 {
             return false;
@@ -297,7 +308,7 @@ fn is_prime(n: i64) -> bool {
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..100000 {
         v.push(i);
     }
@@ -307,33 +318,33 @@ fn main(gpa: Gpa) {
     let primes = Mutex::new(0);
     thread::scope(|s| {
         s.spawn(|| {
-            for x in xs[..half] {
+            for &x in &xs[..half] {
                 if is_prime(x) {
-                    primes.with(|n| n += 1);
+                    *primes.lock().unwrap() += 1;
                 }
             }
         });
         s.spawn(|| {
-            for x in xs[half..] {
+            for &x in &xs[half..] {
                 if is_prime(x) {
-                    primes.with(|n| n += 1);
+                    *primes.lock().unwrap() += 1;
                 }
             }
         });
     });
-    println("primes (mutex): {}", primes.with(|n| n));
+    println("primes (mutex): {}", primes.lock().unwrap());
 
     let count = AtomicI64::new(0);
     thread::scope(|s| {
         s.spawn(|| {
-            for x in xs[..half] {
+            for &x in &xs[..half] {
                 if is_prime(x) {
                     count.fetch_add(1, Ordering::Relaxed);
                 }
             }
         });
         s.spawn(|| {
-            for x in xs[half..] {
+            for &x in &xs[half..] {
                 if is_prime(x) {
                     count.fetch_add(1, Ordering::Relaxed);
                 }
@@ -350,24 +361,31 @@ primes (atomic): 9592
 ```
 
 A `Mutex` owns its data: the `0` inside `primes` can only be reached
-through it. `primes.with(|n| n += 1)` locks the mutex, runs the closure
-with the data, and unlocks it again, so the read, the add and the write
-happen while no other thread can get in. The closure's result is
-`with`'s result, which is how `primes.with(|n| n)` reads the count at
-the end. `try_with` is the same, but gives up at once, returning `None`,
-if another thread holds the lock.
+through it. `primes.lock()` waits until no other thread holds the lock,
+and returns a *guard*. The data is `*guard`, and when the guard is
+dropped, here at the end of the statement, the mutex is unlocked. So
+the read, the add and the write of `*primes.lock().unwrap() += 1`
+happen while no other thread can get in. `lock` returns a `Result`,
+which is always `Ok` here, so we `unwrap` it. `try_lock` is the same,
+but gives up at once, with an `Err`, if another thread holds the lock.
 
-Both threads use `primes` without a `sink`: a scoped thread may borrow a
-mutex, because the mutex does the ordering itself.
+Both threads use `primes` without a `move`: a scoped thread may borrow a
+mutex, and the two shared borrows are fine, because the mutex does the
+ordering itself.
+
+A thread started with `spawn_in` can't borrow the mutex. To share one
+with it, put the mutex in an `Arc`, a pointer to a value that counts
+its owners: `Arc::new_in(Mutex::new(0), gpa)` makes one, `clone()`
+makes another pointer to the same mutex for the thread to take, and
+the value is dropped when its last `Arc` is.
 
 The scoped threads here return nothing, so we don't keep their handles.
 The scope waits for them anyway.
 
-> **If you know Rust:** there are no lock guards yet. `with` is the way
-> to reach the data, and there's no poisoning: a panic stops the program
-> rather than leaving a poisoned lock behind. That may change once
-> guards are safe to expose. There's no `Arc` either, because scoped
-> threads borrow the mutex directly.
+> **If you know Rust:** `Mutex` and its guard, `RwLock`, `Condvar`,
+> `Once` and `Arc` (`Arc::new_in`) are Rust's, in `std::sync`. There's
+> no poisoning: a panic stops the program rather than leaving a
+> poisoned lock behind, so `lock()` never returns an `Err`.
 
 ## Atomics
 
@@ -404,31 +422,31 @@ each taking every third line, and send their results to the main
 thread, which collects them. Save it as `hash.vl`:
 
 ```vole hash.vl
-use std::thread;
+use std::io;
 use std::sync::mpsc;
+use std::thread;
 
 // FNV-1a, a simple hash of a line's bytes.
-fn hash(line: str) -> u64 {
-    var h: u64 = 0xcbf29ce484222325;
+fn hash(line: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
     for b in line.bytes() {
-        h = (h ^ b as u64) * 0x100000001b3;
+        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
     }
     h
 }
 
 fn main(gpa: Gpa) {
-    let input = read_stdin_in(gpa).unwrap();
-    let text = String::from_utf8(input).unwrap();
-    let all: Vec<str, Gpa> = text.lines().collect_in(gpa);
+    let text = io::read_to_string_in(io::stdin(), gpa).unwrap();
+    let all: Vec<&str, Gpa> = text.lines().collect_in(gpa);
     let lines = all.as_slice();
     let workers: usize = 3;
 
-    var results = thread::scope(|s| {
-        let (tx, rx) = mpsc::channel_in::<(usize, u64)>(gpa);
+    let mut results = thread::scope(|s| {
+        let (tx, rx) = mpsc::channel_in(gpa);
         for w in 0..workers {
             let tx = tx.clone();
-            s.spawn(sink || {
-                var i = w;
+            s.spawn(move || {
+                let mut i = w;
                 while i < lines.len() {
                     tx.send((i, hash(lines[i]))).unwrap();
                     i += workers;
@@ -436,7 +454,7 @@ fn main(gpa: Gpa) {
             });
         }
         drop(tx);
-        var got: Vec<(usize, u64), Gpa> = Vec::new_in(gpa);
+        let mut got: Vec<(usize, u64), Gpa> = Vec::new_in(gpa);
         for r in rx.iter() {
             got.push(r);
         }
@@ -472,7 +490,7 @@ grape    32ec8b2977fe3c70
 `mpsc::channel_in(gpa)` makes a channel; it allocates its queue, so it
 takes an allocator. ("mpsc" stands for "multiple producers, single
 consumer": many senders, one receiver.) Each worker gets its own clone
-of the sender, `tx.clone()`, and takes it with `sink`.
+of the sender, `tx.clone()`, and takes it with `move`.
 
 `for r in rx.iter()` receives until the channel is empty and every
 sender is gone. A sender is gone when it's dropped, which for the
@@ -497,60 +515,69 @@ sender is gone and nothing is left.
 
 ## Globals and thread-locals
 
-A `static var` is a single variable shared by the whole program.
-Threads would race on it, so only the main thread may use one:
+A `static` is a single value shared by the whole program, and every
+thread can reach it. So its type must be one that threads can share:
+an atomic or a mutex, which order their own changes, or data that never
+changes.
 
 ```vole
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::thread;
 
-static var COUNT: i64 = 0;
+static COUNT: AtomicI64 = AtomicI64::new(0);
+static LOG: Mutex<i64> = Mutex::new(0);
 
 fn bump() {
-    COUNT += 1;
+    COUNT.fetch_add(1, Ordering::Relaxed);
+    *LOG.lock().unwrap() += 10;
 }
 
-fn main() {
-    let h = thread::spawn(sink || {
-        bump();
-        0
-    });
+fn main(gpa: Gpa) {
+    let h = thread::spawn_in(|| bump(), gpa);
     bump();
-    println("{} {COUNT}", h.join());
+    h.join().unwrap();
+    println("{} {}", COUNT.load(Ordering::Relaxed), LOG.lock().unwrap());
 }
 ```
 
-```err
-error[sync.global]: 'thread::spawn' runs a closure on another thread, but it reaches a static var (its effects have `global`): a static var is for the main thread
- --> main.vl: line 10, column 13
-  = help: make the static an atomic or a Mutex, not `var` (`static N: AtomicI64 = AtomicI64 { v: 0 };`), a #[thread_local], or pass the data in | try: volec query effects main.vl:10 --why global
+```out
+2 20
 ```
 
-The compiler uses the closure's effects (chapter 12) to find this: the
-closure calls `bump`, `bump` has the `global` effect, and that's
-enough, however deep the call.
+Both threads call `bump`, and nothing is lost: the atomic and the mutex
+see to it. A `static` of a type that isn't safe to share is an error
+(`sync.static`).
 
-The help lists the fixes. A `static` atomic or mutex, without `var`,
-can be shared, since it orders its own changes. Or the variable can be a
+A `static mut` is a plain variable that the whole program can change.
+The compiler can't tell which threads use it, so reading or writing one
+takes `unsafe` (chapter 15), and keeping threads apart is then up to
+you. One kind is safe to use from any thread, though, a
 *thread-local*: each thread gets its own copy, which starts from the
-initial value the first time that thread uses it:
+initial value the first time that thread uses it. It is still a `static
+mut`, so the `unsafe` stays:
 
 ```vole
 use std::thread;
 
 #[thread_local]
-static var CALLS: i64 = 0;
+static mut CALLS: i64 = 0;
 
 fn work() -> i64 {
     for _ in 0..3 {
-        CALLS += 1;
+        unsafe {
+            CALLS += 1;
+        }
     }
-    CALLS
+    unsafe { CALLS }
 }
 
-fn main() {
-    let h = thread::spawn(sink || work());
-    CALLS = 100;
-    println("the thread counted {}, main has {CALLS}", h.join());
+fn main(gpa: Gpa) {
+    let h = thread::spawn_in(|| work(), gpa);
+    unsafe {
+        CALLS = 100;
+    }
+    println("the thread counted {}, main has {}", h.join().unwrap(), unsafe { CALLS });
 }
 ```
 
@@ -570,13 +597,15 @@ starting one, `sync` for an atomic, a lock, a join or a channel, and
 ```console
 $ volec query effects crate main.vl
 crate::work	tls
-crate::main	alloc(extern) io tls thread sync panic
+crate::main	alloc(Gpa, extern) io static tls thread sync panic diverge
 ```
 
-`work` uses a thread-local, which is `tls`, not `global`. `main` starts
-a thread and joins it. It's also `alloc(extern)`: starting a thread
-allocates a little memory for it from the C library's allocator, which
-the compiler reports like any other allocation. A `#[pure]` function
+`work` uses a thread-local, which is `tls`, not `static`. `main` starts
+a thread and joins it. It's also `alloc(Gpa, extern)`: `spawn_in` keeps
+the thread's result in memory from the `Gpa` it was given, and the C
+library allocates the thread itself with its own allocator, which the
+compiler reports like any other allocation. And it's `diverge`: `join`
+waits for as long as the thread runs. A `#[pure]` function
 can do none of these things, so a pure function is also one you can
 call from any thread.
 
@@ -589,36 +618,37 @@ it:
 ```vole
 use std::thread;
 
-fn main() {
-    var x = 5;
-    let p: *i64 = &x;
-    let h = thread::spawn(sink || unsafe { *p });
-    println("{}", h.join());
+fn main(gpa: Gpa) {
+    let x = 5;
+    let p: *const i64 = &raw const x;
+    let h = thread::spawn_in(move || unsafe { *p }, gpa);
+    println("{}", h.join().unwrap());
 }
 ```
 
 ```err
-error[sync.not_send]: 'thread::spawn' moves 'p' (*i64 is a raw pointer) to another thread, which may alias memory this one still uses
+error[sync.not_send]: the closure cannot be sent between threads (it is not Send): it captures 'p', '*const i64', which is not Send; '*const i64' is a raw pointer, neither Send nor Sync
  --> main.vl: line 6, column 13
-  = help: hold the data in std's owned containers (Vec, Buf, HashMap), or share it in thread::scope, through a Mutex or an atomic
+  = help: required by the bound 'F: Send' of 'std::thread::spawn_in'
 ```
 
 ## Summary
 
-- `thread::spawn(sink || ...)` starts a thread that owns what it uses;
-  `join` waits for it and gives its result. A panic in any thread stops
-  the program.
+- `thread::spawn_in(move || ..., gpa)` starts a thread that owns what
+  it uses; `join` waits for it and gives its result. A panic in any
+  thread stops the program.
 - `thread::scope(|s| ...)` starts threads with `s.spawn` that may
-  borrow the caller's data, views included, because the scope waits for
-  them all before it returns.
+  borrow the caller's data, because the scope waits for them all before
+  it returns.
 - Threads read shared data freely, but change it only through a `Mutex`
-  (`with`) or an atomic; better still, each thread returns its own
-  result.
+  (`lock`) or an atomic; better still, each thread returns its own
+  result. An `Arc` shares a value with threads that can't borrow it.
 - Channels (`mpsc::channel_in`) pass values from threads to a receiver,
   and close when every sender is dropped.
-- The compiler checks all of this when a thread starts, with the
-  `sync.*` errors: no views escaping into spawned threads, no shared
-  writes, no `static var` and no raw pointers on another thread.
+- The compiler checks all of this when a thread starts, with the borrow
+  checker and the `sync.*` errors: no borrows escaping into spawned
+  threads, no shared writes, no raw pointers on another thread, and no
+  `static` that threads can't share.
 
 The next chapter goes where these checks can't follow: unsafe code,
 raw pointers, and calling C.

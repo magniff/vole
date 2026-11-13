@@ -13,10 +13,11 @@ corruption (docs/design/gpu.md, §2.9 and R1).
 | `metal.objc` | `compiler/std/gpu/hal/metal/bindings.vl` (`std::gpu::hal::metal::bindings`) |
 
 ```sh
-cc=cc; volec tools/objcgen/main.vl -o objcgen.o && $cc objcgen.o -o objcgen -lobjc
-./objcgen lib/objc/tables/metal.objc > lib/gpu/metal/sys.vl   # generate
-./objcgen --check lib/objc/tables/metal.objc                    # against the runtime
-./objcgen --c-check lib/objc/tables/metal.objc > c.m && clang -fsyntax-only -x objective-c c.m
+volec tools/objcgen/main.vl -o objcgen
+./objcgen compiler/std/objc/tables/foundation.objc > compiler/std/objc/foundation.vl   # generate
+volec fmt compiler/std/objc/foundation.vl                                     # the standard style
+./objcgen --check compiler/std/objc/tables/foundation.objc                    # against the runtime
+./objcgen --c-check compiler/std/objc/tables/foundation.objc > c.m && clang -fsyntax-only -x objective-c c.m
 ```
 
 `tests/gpu/run.sh` runs all three for every table and fails when a
@@ -28,7 +29,7 @@ checked-in module differs from its table's output.
 
 | line | meaning |
 |---|---|
-| `objc PATH` | where `Id`, `Ref`, `Object` and `opt_ptr` are (default `crate::objc`; `std::objc` once it is in std) |
+| `objc PATH` | where `Id`, `Ref`, `Object` and `opt_ptr` are (default `crate::objc`: the tables are std's own) |
 | `framework NAME` | opened by `--check` (`/System/Library/Frameworks/NAME.framework/NAME`), so that its classes and protocols are registered |
 | `header H` | imported by `--c-check`'s file (`#import <H>`) |
 | `use PATH::{A, B}` | copied to the module; A and B become object types the table may use |
@@ -47,12 +48,15 @@ A method line:
 - The parameters match the selector's colons.
 - Types: `u8 i8 u16 i16 u32 i32 u64 i64 bool f32 f64` (NSUInteger and the
   Metal enums are `u64`, NSInteger `i64`, BOOL `bool`), `*u8` (any pointer,
-  `void *`, `NSError **`: the wrapper is then an `unsafe fn`), `sel`,
+  `void *`, `NSError **`; `*mut u8` in the module: the wrapper is then an
+  `unsafe fn`), `sel`,
   `class`, a struct of the table, `id`, or a class or protocol name.
 - Object results: `own T` is a +1 reference (the `alloc`, `new`, `copy`,
   `mutableCopy` families), returned as `Id<T>`; without `own` it is +0,
-  returned as `Ref<T>`. `?` marks nil as possible: `Option<Id<T>>`,
-  `Option<Ref<T>>`; a nullable parameter takes `Option<Ref<T>>`.
+  returned as `Ref<'a, T>`: of the receiver's lifetime for an instance
+  method, `'static` for a class method (the class or the pool keeps it).
+  `?` marks nil as possible: `Option<Id<T>>`, `Option<Ref<'a, T>>`; a
+  nullable parameter takes `Option<Ref<'_, T>>`.
 - `as NAME` names the wrapper; by default it is the selector in snake case
   (`newBufferWithLength:options:` is `new_buffer_with_length_options`).
   Two methods of one type with one name are an error.
@@ -61,16 +65,17 @@ A method line:
 
 - `pub struct NAME {}`: a marker type per class and protocol, so that
   `Ref<MTLBuffer>` and `Ref<MTLTexture>` do not mix.
-- `pub trait NAMEMethods`: the instance methods, implemented for `Ref<NAME>`
-  and for `Ref<X>` of every class or protocol X that derives from NAME in
-  the table (`protocol MTLBuffer : MTLResource` gives `Ref<MTLBuffer>`
-  `set_label`). Callers write `buf.r().contents()`; the trait need not be
-  imported.
+- `pub trait NAMEMethods<'a>`: the instance methods, implemented for
+  `Ref<'a, NAME>` and for `Ref<'a, X>` of every class or protocol X that
+  derives from NAME in the table (`protocol MTLBuffer : MTLResource` gives
+  `Ref<MTLBuffer>` `set_label`). Callers write `buf.r().contents()`, with
+  the trait imported (`use std::objc::foundation::NSStringMethods;`).
 - `impl NAME`: the class methods (`MTLTextureDescriptor::new()`) and the
   init family, whose receiver is an `Id<NAME>` that the call consumes
   (`NSString::init_with_bytes_length_encoding(NSString::alloc(), ...)`).
 - One `objc_msgSend` declaration per ABI shape (`msg_v_p_u64_u64`), and a
-  static per selector and class, filled on first use.
+  static per selector and class (an `Atomic<usize>`), filled on first use
+  by `objc::cached_selector` and `objc::cached_class`.
 
 ## The checks
 

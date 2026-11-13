@@ -37,35 +37,36 @@ when it takes those too). The runtime makes the one `Gpa` a program has
 and passes it in; a program whose `main` takes none cannot allocate at
 all (see [fixed-buffer](../fixed-buffer/)).
 
-```tach
+```vole
 fn main(gpa: Gpa) -> i32 {
-    let input = read_stdin_in(gpa).unwrap();
-    let orders = parse_orders(input.as_slice(), gpa);
+    let input = io::read_to_string_in(io::stdin(), gpa).unwrap();
+    let orders = parse_orders(&input, gpa);
 ```
 
 Each standard-library function that allocates has an `_in` form taking
-the allocator last: `Vec::new_in(gpa)`, `Buf::new_in(gpa)`,
-`HashMap::new_in(gpa)`, `read_stdin_in(gpa)`, `split_in(s, sep, gpa)`,
-`format_in(x, gpa)`, `it.collect_in(gpa)`. A function of the program
+the allocator last: `Vec::new_in(gpa)`, `String::new_in(gpa)`,
+`HashMap::new_in(gpa)`, `io::read_to_string_in(r, gpa)`,
+`format_in("..", gpa)`, `it.collect_in(gpa)`. A function of the program
 that allocates takes it the same way and passes it on:
 
-```tach
-fn parse_orders(text: [u8], gpa: Gpa) -> Vec<Order> {
-    var orders: Vec<Order> = Vec::new_in(gpa);
-    let lines = split_in(text, '\n', gpa);
+```vole
+fn parse_orders<'a>(text: &'a str, gpa: Gpa) -> Vec<Order<'a>, Gpa> {
+    let mut orders: Vec<Order<'a>, Gpa> = Vec::new_in(gpa);
+    for line in text.lines() {
+        let w: Vec<&str, Gpa> = line.split_whitespace().collect_in(gpa);
 ```
 
 There are four kinds of function in `main.vl`, by what they are given:
 
 | function | signature | allocates |
 |---|---|---|
-| `parse_orders` | `(text: [u8], gpa: Gpa) -> Vec<Order>` | from the `gpa` it is passed |
-| `total` | `(orders: [Order]) -> i64` | never: a slice and no allocator |
-| `by_customer` | `(orders: Vec<Order>) -> HashMap<[u8], i64>` | from the allocator the Vec holds: `orders.allocator()` |
-| `count_items` | `<A: Allocator>(orders: [Order], a: sink A) -> HashMap<[u8], i64, A>` | from whichever allocator the caller picks |
+| `parse_orders` | `(text: &str, gpa: Gpa) -> Vec<Order, Gpa>` | from the `gpa` it is passed |
+| `total` | `(orders: &[Order]) -> i64` | never: a slice and no allocator |
+| `by_customer` | `(orders: &Vec<Order, Gpa>) -> HashMap<&str, i64, Gpa>` | from the allocator the Vec holds: `orders.allocator()` |
+| `count_items` | `<A: Allocator>(orders: &[Order], a: A) -> HashMap<&str, i64, A>` | from whichever allocator the caller picks |
 
-A container keeps its allocator: `Vec<T>` is short for `Vec<T, Gpa>`
-(and costs three words, as before: a `Gpa` takes no bytes), and its
+A container keeps its allocator, and its type names it: `Vec<T, Gpa>`
+(three words: a `Gpa` takes no bytes). Its
 `push`, `clone` and drop use the allocator it holds. That is why
 `by_customer` needs no allocator parameter: it makes its map on the one
 the orders' Vec was made with. And it is why `total`, which takes a
@@ -78,33 +79,29 @@ body and everything it calls (`volec guide effects`):
 
 ```console
 $ volec query effects crate
-crate::parse_orders	alloc(Gpa) io panic diverge
+crate::parse_orders	alloc(Gpa) io static panic diverge
 crate::total	none
-crate::by_customer	alloc(Gpa) panic
-count_items<Gpa>	alloc(Gpa) panic
-crate::main	alloc(Gpa) io panic diverge
+crate::by_customer	alloc(Gpa) panic diverge
+count_items<Gpa>	alloc(Gpa) panic diverge
+crate::main	alloc(Gpa) io static panic diverge
 ```
 
 `total` is `none`: no allocation, no I/O, no statics, and not even a
 possible panic. `count_items` is generic, so its effects are its
 instances': here only `Gpa`. `parse_orders` does I/O (`eprintln` of a
-bad line) and may not terminate (`diverge`: std's
-`split_whitespace_in` loops with `while let`); `query effects
-parse_orders --why diverge` shows the chain.
+bad line). For any effect in a set, `query effects parse_orders --why
+io` (or `--why diverge`) shows the chain of calls it comes from.
 
 ## Forgetting the allocator
 
-A program written before 0.26.3 named no allocator in its types and
-called the forms that took one from nowhere. Here is one: `main` has
-the allocator and `shout` takes it, but the calls and the types do not
-say so:
+A type that names no allocator, or a call that takes one from nowhere,
+is an error. Here `main` has the allocator and `shout` takes it, but
+the calls and the types do not say so:
 
 ```console
 $ cat > old.vl <<'EOF'
-> use std::Buf;
->
-> fn shout(words: [[u8]], gpa: Gpa) -> Buf {
->     var b = Buf::new();
+> fn shout(words: &[&str], gpa: Gpa) -> String {
+>     let mut b = String::new();
 >     for w in words {
 >         if b.len() > 0 {
 >             b.push_str(" ");
@@ -116,20 +113,20 @@ $ cat > old.vl <<'EOF'
 > }
 >
 > fn main(gpa: Gpa) -> i32 {
->     let words: Vec<[u8]> = std::split_whitespace("hello explicit allocation");
+>     let mut words: Vec<&str> = Vec::new();
+>     for w in "hello explicit allocation".split_whitespace() {
+>         words.push(w);
+>     }
 >     let b = shout(words.as_slice(), gpa);
->     println(b.as_slice());
+>     println("{b}");
 >     0
 > }
 > EOF
 $ volec check old.vl
-old.vl:1:10: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-old.vl:3:38: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-old.vl:4:13: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-old.vl:3:38: error[alloc.default] 'Buf' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
-old.vl:4:13: error[alloc.no_in] 'Buf::new' allocates from nothing: pass the allocator, last, to 'Buf::new_in' | help: this function's `gpa` is the allocator to pass | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
-old.vl:16:16: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
-old.vl:16:28: error[alloc.no_in] 'std::split_whitespace' allocates from nothing: pass the allocator, last, to 'std::split_whitespace_in' | help: this function's `gpa` is the allocator to pass | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
+old.vl:1:39: error[alloc.default] 'String' names no allocator: its 'A' is written, last | help: the allocator is part of the type: `Gpa` (the type of main's `gpa`), or a generic `A: Allocator` | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
+old.vl:2:17: error[alloc.no_in] 'String::new' allocates from nothing: pass the allocator, last, to 'String::new_in' | help: this function's `gpa` is the allocator to pass | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
+old.vl:14:20: error[alloc.default] 'Vec' names no allocator: its 'A' is written, last | help: the allocator is part of the type: `Gpa` (the type of main's `gpa`), or a generic `A: Allocator` | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
+old.vl:14:32: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in' | help: this function's `gpa` is the allocator to pass | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
 [exit 1]
 ```
 
@@ -143,34 +140,28 @@ every type names it:
 $ volec fix --only alloc --dry-run old.vl
 --- a/old.vl
 +++ b/old.vl
-@@ -3,2 +3,2 @@
--fn shout(words: [[u8]], gpa: Gpa) -> Buf {
--    var b = Buf::new();
-+fn shout(words: [[u8]], gpa: Gpa) -> Buf<Gpa> {
-+    var b = Buf::new_in(gpa);
-@@ -16 +16 @@
--    let words: Vec<[u8]> = std::split_whitespace("hello explicit allocation");
-+    let words: Vec<[u8], Gpa> = std::split_whitespace_in("hello explicit allocation", gpa);
+@@ -1,2 +1,2 @@
+-fn shout(words: &[&str], gpa: Gpa) -> String {
+-    let mut b = String::new();
++fn shout(words: &[&str], gpa: Gpa) -> String<Gpa> {
++    let mut b = String::new_in(gpa);
+@@ -14 +14 @@
+-    let mut words: Vec<&str> = Vec::new();
++    let mut words: Vec<&str, Gpa> = Vec::new_in(gpa);
 $ volec fix --only alloc old.vl
 fixed 4 suggested fixes	old.vl	+3 -3 lines
 $ volec old.vl -o old && ./old
 hello! explicit! allocation!
-old.vl:1:10: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-old.vl:3:38: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-old.vl:4:13: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
 ok: built old
 ```
 
-It compiles and runs, and frees what it allocated: since 0.17 `words`
+It compiles and runs, and frees what it allocated: `words`
 and `b` are dropped at the end of `main`, so `--check-alloc` (below)
 finds nothing left:
 
 ```console
 $ volec --check-alloc old.vl -o old && ./old
 hello! explicit! allocation!
-old.vl:1:10: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-old.vl:3:38: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
-old.vl:4:13: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
 ok: built old
 ```
 
@@ -179,18 +170,18 @@ one: `gpa` is a name like any other, and here it is not in scope.
 
 ```console
 $ cat > count.vl <<'EOF'
-> fn count(text: [u8]) -> usize {
->     let words = std::split_whitespace_in(text, gpa);
+> fn count(text: &str) -> usize {
+>     let words: Vec<&str, Gpa> = text.split_whitespace().collect_in(gpa);
 >     words.len()
 > }
 >
 > fn main(gpa: Gpa) -> i32 {
->     println(count("one two three"));
+>     println("{}", count("one two three"));
 >     0
 > }
 > EOF
 $ volec check count.vl
-count.vl:2:48: error[type error] undefined variable 'gpa' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'count' and pass it down
+count.vl:2:68: error[type error] undefined variable 'gpa' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'count' and pass it down | try: volec refactor signature count --add 'gpa: Gpa = gpa' --fill-calls --no-check count.vl
 [exit 1]
 ```
 
@@ -212,7 +203,7 @@ static's type may hold no allocator (`alloc.static`).
 
 ```console
 $ cat > forge.vl <<'EOF'
-> static var CACHE: Vec<i64, Gpa> = Vec::new_in(Gpa {});
+> static mut CACHE: Vec<i64, Gpa> = Vec::new_in(Gpa {});
 >
 > fn main() -> i32 {
 >     let mine = Gpa {};
@@ -221,15 +212,15 @@ $ cat > forge.vl <<'EOF'
 > EOF
 $ volec check forge.vl
 forge.vl:1:1: error[alloc.static] the static 'CACHE' holds an allocator, 'Gpa' (in its type 'Vec<i64, Gpa>'): a static's type may not hold one | help: any function could allocate through it with nothing in its signature saying so: keep the value in main and pass it down (or what it allocates, as a slice)
-forge.vl:1:47: error[field.literal-private] cannot make a 'Gpa' here: its field '_private' is private to module 'std' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
-forge.vl:4:16: error[field.literal-private] cannot make a 'Gpa' here: its field '_private' is private to module 'std' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
+forge.vl:1:47: error[field.literal-private] cannot make a 'Gpa' here: its field 'sealed' is private to module 'std::alloc' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
+forge.vl:4:16: error[field.literal-private] cannot make a 'Gpa' here: its field 'sealed' is private to module 'std::alloc' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
 [exit 1]
 ```
 
 So the rule the effects state holds for every program: **a function
 allocates only from allocators it was given** (its parameters, what it
 captures, the containers it was handed) **or reaches through statics**
-(and then it has the effect `global` too).
+(and then it has the effect `static` too).
 
 ## Checking the frees
 
@@ -250,7 +241,7 @@ skipped: bob apples one 120
 
 - `volec guide allocators`: the `_in` forms, containers and their
   allocator, arenas, `--check-alloc`, `fix --only alloc`.
-- `volec guide effects`: what `alloc(Gpa)`, `io`, `global`, `panic`,
+- `volec guide effects`: what `alloc(Gpa)`, `io`, `static`, `panic`,
   `diverge` mean, and how to promise them.
 - [arena-parser](../arena-parser/), [scoped-arena](../scoped-arena/) and
   [fixed-buffer](../fixed-buffer/): the other allocators.

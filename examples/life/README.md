@@ -41,43 +41,42 @@ name on both, so the program compares the first bytes:
 
 ```tach
 fn on_macos() -> bool {
-    var names: [u8; 1280] = [0; 1280];
-    if unsafe { uname(&names as *u8) != 0 } {
+    let mut names: [u8; 1280] = [0; 1280];
+    if unsafe { uname(names.as_mut_ptr()) != 0 } {
         return false;
     }
-    names[0..6] == "Darwin"
+    names.starts_with(b"Darwin")
 }
 ```
 
-`==` on two `[u8]` compares their bytes.
+`b"Darwin"` is a byte string, and `starts_with` compares bytes.
 
 **The world** is two `Vec<Cell>`s, the current generation and the next;
 `step` computes one from the other and swaps them. A `Vec` owns its
-cells, so `step` cannot copy one out of `self` (it would have two owners):
-it takes the current one, leaving an empty `Vec` in its place, and trades
-it for the next. A `Vec` moves as three words (a pointer, a length, a
-capacity), not the cells:
+cells, so `step` cannot move one out of `self` (it would leave a hole):
+`std::mem::swap` trades the two in place. A `Vec` moves as three words
+(a pointer, a length, a capacity), not the cells:
 
 ```tach
-let old = self.cells.take();
-self.cells = std::replace(&self.next, old);
+std::mem::swap(&mut self.cells, &mut self.next);
 ```
 
 The edges wrap around (a torus): `(x + width) % width`.
 
-**One write per frame.** Each frame is built in a `std::Buf` (escape
+**One write per frame.** Each frame is built in a `String` (escape
 codes to set the background colour, a space per cell) and written with
-one `write`. The colour of a dead cell is an f-string appended with
-`push_fmt`:
+one `write`. The colour of a dead cell is a format string appended with
+the prelude's `write` (which is why C's `write` is declared under
+another name, `#[link_name = "write"] fn c_write(..)`):
 
 ```tach
 let color = 255 - cell.age as i64;
-out.push_fmt("\x1B[48;2;{};{};{color}m ", color / 2, color / 5);
+write(out, "\x1B[48;2;{};{};{color}m ", color / 2, color / 5).unwrap();
 ```
 
 ## Language features
 
 - `#[repr(C)]` structs, variadic `extern "C"` functions: `volec guide c-interop`
-- a `Vec` that owns its cells, `take` and `std::replace`, `Buf`: `volec guide memory`, `volec guide std`
-- slices compared with `==`: `volec guide types`
-- f-strings appended to a `Buf` (`push_fmt`): `volec guide formatting`
+- a `Vec` that owns its cells, `std::mem::swap`, `String`: `volec guide memory`, `volec guide std`
+- byte strings and slices: `volec guide text`
+- format strings appended to a `String` (`write`): `volec guide formatting`

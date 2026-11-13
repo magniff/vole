@@ -82,12 +82,19 @@ END {
     printf "%s", requires > (dir "/requires")
     printf "%d", (tmult > 0 ? tmult : 1) > (dir "/timeout")
     # (0.19: the CROSS target and its ASM lines)
-    crossasms = ""
-    if (cross != "" && cross != target)
+    # (0.28.0: several targets on the line, each with its own ASM lines in
+    # crossasms.T: std's effect lists are checked for each Linux target)
+    ncross = split(cross, crosses, " ")
+    crosslist = ""
+    for (c = 1; c <= ncross; c++) {
+        if (crosses[c] == target) continue
+        crossasms = ""
         for (i = 0; i < nall; i++) {
-            if (allkey[i] == "ASM(" cross ")") crossasms = crossasms "+" allval[i] "\n"
-            else if (allkey[i] == "ASM-NOT(" cross ")") crossasms = crossasms "-" allval[i] "\n"
+            if (allkey[i] == "ASM(" crosses[c] ")") crossasms = crossasms "+" allval[i] "\n"
+            else if (allkey[i] == "ASM-NOT(" crosses[c] ")") crossasms = crossasms "-" allval[i] "\n"
         }
-    printf "%s", (cross == target ? "" : cross) > (dir "/cross")
-    printf "%s", crossasms > (dir "/crossasms")
+        crosslist = crosslist (crosslist == "" ? "" : " ") crosses[c]
+        printf "%s", crossasms > (dir "/crossasms." crosses[c])
+    }
+    printf "%s", crosslist > (dir "/cross")
 }

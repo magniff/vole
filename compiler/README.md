@@ -73,7 +73,7 @@ compiler/src/
 | folder | its modules ([base](src/base/README.md), [front](src/front/README.md), [middle](src/middle/README.md), [back](src/back/README.md), [gen0](src/gen0/README.md), [tools](src/tools/README.md)) |
 |---|---|
 | `base/` | `mod.vl` (C library, arrays, buffers, symbols, files), `diag.vl`, `target.vl`, `timer.vl` |
-| `front/` | `lexer.vl`, `cpp/`, `cimport/`, `cheader.vl`, `stdsrc.vl`, `ast.vl`, `parser/`, `modules/`, `types.vl`, `check/`, `consteval.vl`, `patterns/`, `generics/`, `traits.vl` |
+| `front/` | `lexer.vl`, `cpp/`, `cimport/`, `cheader.vl`, `stdsrc_rust.vl`, `ast.vl`, `parser/`, `modules/`, `types.vl`, `check/`, `consteval.vl`, `patterns/`, `generics/`, `traits.vl` |
 | `middle/` | `ir/`, `lower/`, `opt.vl` (the pipeline), `fold.vl`, `gvn.vl`, `egraph.vl`, `sroa.vl`, `adce.vl`, `inline.vl`, `ipo.vl`, `tre.vl`, `loops.vl`, `scev.vl`, `range/`, `vectorize/`, `slp.vl`, `lsr.vl`, `licm.vl`, `promote.vl`, `profile.vl`, `unsafecheck.vl` |
 | `back/` | `isel/`, `regalloc/`, `layout.vl`, `emit/`, `mc_arm64/`, `mc_x86_64/`, `abi.vl`, `objfile/`, `enc_arm64.vl`, `enc_x86.vl`, `dwarf.vl` |
 | `gen0/` | `gen/` (the driver and -O0's generator), `target.vl`, `arm64.vl`, `x86_64.vl` |

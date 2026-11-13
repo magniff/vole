@@ -38,60 +38,62 @@ embed wgsl DRAW {
 }
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
-    var app = match App::new_in(gpa) {
+    let mut app = match App::new_in(gpa) {
         Ok(a) => a,
         Err(_) => return Ok(()), // no display (ssh, CI)
     };
-    var win = match app.window(WindowDesc::new("skeleton", 640, 480)) {
+    let mut win = match app.window(WindowDesc::new("skeleton", 640, 480)) {
         Ok(w) => w,
         Err(_) => return Ok(()),
     };
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, var queue) = inst.adapter()?.device()?;
-    var surf = inst.surface(dev, RawSurface::MetalLayer(win.raw_surface()))?;
+    let (dev, mut queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
+    let mut surf = inst.surface(&dev, RawSurface::MetalLayer(win.raw_surface()))?;
     let px = win.size();
-    surf.configure(dev, px.w, px.h); // Format::Bgra8Unorm, vsync
+    surf.configure(&dev, px.w, px.h, Format::Bgra8Unorm, true); // Format::Bgra8Unorm, vsync
     let cells = dev.buffer(64 * 4, BufferUsage::STORAGE | BufferUsage::COPY_SRC);
     let step = dev.compute_pipeline(dev.shader_wgsl(STEP.src)?, STEP.main)?;
     let draw_shader = dev.shader_wgsl(DRAW.src)?;
-    let draw = dev.render_pipeline(RenderDesc::new(draw_shader, DRAW.vs, DRAW.fs, Format::Bgra8Unorm))?;
-    let sgroup = dev.bind_group(step.bind_layout(0), [gpu::bind(0, cells)][..]);
-    let dgroup = dev.bind_group(draw.bind_layout(0), [gpu::bind(0, cells)][..]);
-    var frames = 0;
+    let draw = dev.render_pipeline(RenderDesc::new(&draw_shader, DRAW.vs, DRAW.fs,
+        Format::Bgra8Unorm))?;
+    let sgroup = dev.bind_group(step.bind_layout(0), &[gpu::bind(0, &cells)][..]);
+    let dgroup = dev.bind_group(draw.bind_layout(0), &[gpu::bind(0, &cells)][..]);
+    let mut frames = 0;
     win.request_frame();
     while frames < 120 {
         match app.wait() {
             Ok(Event::Frame(_)) => {
                 if let Ok(frame) = surf.frame() {
                     let target = frame.texture.view();
-                    var enc = dev.encoder();
+                    let mut enc = dev.encoder();
                     enc.compute_pass(|pass| {
-                        pass.set_pipeline(step);
-                        pass.set_bind_group(0, sgroup);
-                        pass.dispatch(1); // one workgroup of 64
+                        pass.set_pipeline(&step);
+                        pass.set_bind_group(0, &sgroup);
+                        pass.dispatch(1, 1, 1); // one workgroup of 64
                     });
-                    enc.render_pass(PassDesc::color(target), |pass| {
-                        pass.set_pipeline(draw);
-                        pass.set_bind_group(0, dgroup);
+                    enc.render_pass(PassDesc::color(&target, gpu::Color::black(),
+                        gpu::Load::Clear), |pass| {
+                        pass.set_pipeline(&draw);
+                        pass.set_bind_group(0, &dgroup);
                         pass.draw(0..3, 0..1); // one triangle over the frame
                     });
                     queue.submit(enc.finish());
-                    frame.present(&queue);
+                    frame.present(&mut queue);
                 }
                 frames += 1;
                 win.request_frame();
             }
-            Ok(Event::Resize(_, s)) => surf.configure(dev, s.w, s.h),
+            Ok(Event::Resize(_, s)) => surf.configure(&dev, s.w, s.h, Format::Bgra8Unorm, true),
             Ok(Event::Close(_)) | Ok(Event::Quit) => break,
             _ => {}
         }
     }
     // the readback: a copy into a MAP_READ | COPY_DST buffer, mapped
-    var rb = dev.buffer(64 * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
-    var enc = dev.encoder();
-    enc.copy_buffer(cells, 0, rb, 0, 64 * 4);
+    let mut rb = dev.buffer(64 * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    let mut enc = dev.encoder();
+    enc.copy_buffer(&cells, 0, &rb, 0, 64 * 4);
     queue.submit(enc.finish());
-    let v = gpu::f32s(rb.map_read(dev));
+    let v = gpu::f32s(rb.map_read(&dev));
     println("{frames} frames, v[0] = {}", v[0]);
     Ok(())
 }
@@ -103,7 +105,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
   there and `read` in the render module.
 - Per frame: `queue.write_buffer` the uniforms (`COPY_DST`), take
   `surf.frame()`, record the passes into one encoder, `submit`, then
-  `frame.present(&queue)`; `win.request_frame()` asks for the next
+  `frame.present(&mut queue)`; `win.request_frame()` asks for the next
   `Event::Frame`, and `Event::Resize` configures the surface again
   (`guide window`).
 - The handles (`dev`, `cells`, `step`, ...) move: keep them in one
@@ -117,37 +119,33 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
 
 std::gpu's objects are owned values (`guide memory`): each has one
 owner, and `let w = v;`, a struct literal, a tuple, `Vec::push` or a
-`sink` parameter moves it; none has `.clone()`. Which move and which
-copy (`volec query own FILE:LINE:COL` says it of each local):
+parameter taken by value moves it; none has `.clone()`. Which move and
+which copy:
 
 | kind | types |
 |---|---|
 | owned: moves | `Adapter`, `Device`, `Queue`, `Buffer`, `Texture`, `TextureView`, `Sampler`, `Shader`, `ComputePipeline`, `RenderPipeline`, `BindGroup`, `Encoder`, `Commands`, `Surface`, `Frame` |
-| plain: copies | `Instance`, `BindLayout` (`pipe.bind_layout(g)`), `Limits`, `Caps`, `Format`, `Color`, `SamplerDesc`, `VertexLayout`, the usage flags (`u32`) |
-| view | `RenderDesc` (of its shader), `PassDesc` (of its texture views): made where they are used |
+| `Copy` | `Instance`, `BindLayout` (`pipe.bind_layout(g)`), `Limits`, `Caps`, `Format`, `Color`, `SamplerDesc`, `VertexLayout`, the usage flags (`u32`) |
+| made where it is used | `RenderDesc` (`RenderDesc::new(&shader, ..)`, moved into `dev.render_pipeline(desc)`), `PassDesc` (`PassDesc::color(&view, gpu::Color::black(), gpu::Load::Clear)`, moved into `enc.render_pass(desc, ..)`) |
 
-- Lending a handle moves nothing. A function that reads one takes it
-  let, `fn draw(dev: gpu::Device, pipe: gpu::RenderPipeline)`, called
-  `draw(dev, pipe)`; `inout` where it changes (`queue: inout
-  gpu::Queue` to `submit`, `buf: inout gpu::Buffer` to `map_read`);
-  `sink` only to keep it.
-- Keep them in a struct, made by a constructor that takes them `sink`
+- Lending a handle moves nothing. A function that reads one takes a
+  reference, `fn draw(dev: &gpu::Device<Gpa>, pipe:
+  &gpu::RenderPipeline)`, called `draw(&dev, &pipe)`; `&mut` where it
+  changes (`queue: &mut gpu::Queue` to `submit`, `buf: &mut
+  gpu::Buffer` to `map_read`); by value only to keep it.
+- Keep them in a struct, made by a constructor that takes them by value
   (`Gpu::new(dev, queue, gpa)` below); from then on they are `g.dev`,
   `self.queue`. Many of a kind: a `Vec` (`bufs.push(b)` moves `b`;
-  `bufs[i]` and `bufs.get(i)` read it in place) or an array,
-  `[gpu::BindGroup; 2]`.
-- In a closure (`enc.compute_pass(|pass| ..)`) name the field itself,
-  `self.pipe`, or a let local of it, `let pipe = self.pipe;`: a let of
-  a field or an element views it (`guide memory#moves-and-drops`) and
-  moves nothing. A tuple moves: `let (a, b) = (self.a, self.b);` is
-  `own.move_out`.
-- One of two by a flag: `let g = if odd { self.g1 } else { self.g0 };`
-  moves too (`own.move_out`). Call in each branch, `if odd {
-  pass.set_bind_group(0, self.g1); } else { pass.set_bind_group(0,
-  self.g0); }`, or keep the two in an array and index it,
-  `self.groups[k]`:
+  `&bufs[i]` borrows it in place) or an array, `[gpu::BindGroup; 2]`.
+- In a closure (`enc.compute_pass(|pass| ..)`) borrow the field,
+  `&self.pipe`, or a local of that, `let pipe = &self.pipe;`. Without
+  the `&`, `let pipe = self.pipe;` moves the field out of `self`
+  (`borrowck.move_out`).
+- One of two by a flag: `let g = if odd { &self.g1 } else { &self.g0 };`,
+  or keep the two in an array and index it, `&self.groups[k]`:
 
 ```vole
+use std::alloc::Allocator;
 use std::gpu;
 use std::gpu::BufferUsage;
 
@@ -168,48 +166,48 @@ struct Gpu<A: Allocator> {
 }
 
 impl Gpu<Gpa> {
-    fn new(dev: sink gpu::Device<Gpa>, queue: sink gpu::Queue, gpa: Gpa) -> Result<Gpu<Gpa>,
+    fn new(dev: gpu::Device<Gpa>, queue: gpu::Queue, gpa: Gpa) -> Result<Gpu<Gpa>,
         gpu::Error<Gpa>> {
         let pipe = dev.compute_pipeline(dev.shader_wgsl(ADD.src)?, ADD.main)?;
-        var bufs: Vec<gpu::Buffer, Gpa> = Vec::new_in(gpa);
+        let mut bufs: Vec<gpu::Buffer, Gpa> = Vec::new_in(gpa);
         for _ in 0..2 {
             bufs.push(dev.buffer(64 * 4, BufferUsage::STORAGE | BufferUsage::COPY_SRC));
         }
         let layout = pipe.bind_layout(0); // plain: a copy
         let groups = [
-            dev.bind_group(layout, [gpu::bind(0, bufs[0])][..]),
-            dev.bind_group(layout, [gpu::bind(0, bufs[1])][..]),
+            dev.bind_group(layout, &[gpu::bind(0, &bufs[0])][..]),
+            dev.bind_group(layout, &[gpu::bind(0, &bufs[1])][..]),
         ];
-        Ok(Gpu { dev: dev, queue: queue, pipe: pipe, bufs: bufs, groups: groups })
+        Ok(Gpu { dev, queue, pipe, bufs, groups })
     }
 
     // Adds 1 to buffer k's elements, n times.
-    fn add(inout self, k: i64, n: i64) {
-        let pipe = self.pipe; // views the field: nothing moves
-        var enc = self.dev.encoder();
+    fn add(&mut self, k: usize, n: i64) {
+        let pipe = &self.pipe; // borrows the field: nothing moves
+        let mut enc = self.dev.encoder();
         enc.compute_pass(|pass| {
             pass.set_pipeline(pipe);
             for _ in 0..n {
-                pass.set_bind_group(0, self.groups[k]); // the field itself
-                pass.dispatch(1);
+                pass.set_bind_group(0, &self.groups[k]); // the field itself
+                pass.dispatch(1, 1, 1);
             }
         });
         self.queue.submit(enc.finish());
     }
 
-    fn first(inout self, k: i64) -> u32 {
-        var rb = self.dev.buffer(4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
-        var enc = self.dev.encoder();
-        enc.copy_buffer(self.bufs[k], 0, rb, 0, 4);
+    fn first(&mut self, k: usize) -> u32 {
+        let mut rb = self.dev.buffer(4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        let mut enc = self.dev.encoder();
+        enc.copy_buffer(&self.bufs[k], 0, &rb, 0, 4);
         self.queue.submit(enc.finish());
-        gpu::u32s(rb.map_read(self.dev))[0]
+        gpu::u32s(rb.map_read(&self.dev))[0]
     }
 }
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa); // plain
-    let (dev, queue) = inst.adapter()?.device()?;
-    var g = Gpu::new(dev, queue, gpa)?; // dev and queue moved: g.dev from here
+    let (dev, queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
+    let mut g = Gpu::new(dev, queue, gpa)?; // dev and queue moved: g.dev from here
     g.add(0, 3);
     g.add(1, 5);
     println("{} {}", g.first(0), g.first(1));
@@ -229,12 +227,12 @@ keeps it alive). There is no `free`.
 
 | object | made by | used by |
 |---|---|---|
-| `Device`, `Queue` | `inst.adapter()?.device()?` | everything below; `queue.submit(cmds)` |
-| `Buffer` | `dev.buffer(size, usage)`, `dev.buffer_init(bytes, usage)` | bind groups, copies, `map_read(dev)`, `map_write(dev)` + `unmap(dev)` |
+| `Device`, `Queue` | `inst.adapter(gpu::Power::High)?.device(Limits::default())?` | everything below; `queue.submit(cmds)` |
+| `Buffer` | `dev.buffer(size, usage)`, `dev.buffer_init(bytes, usage)` | bind groups, copies, `map_read(&dev)`, `map_write(&dev)` + `unmap(&dev)` |
 | `Texture`, `TextureView` | `dev.texture(w, h, format, usage: ..)`, `tex.view()` | bind groups, render passes, copies |
-| `Shader` | `dev.shader_wgsl(wgsl)?` (WGSL text), or `dev.shader(src)?` with `src` a `ShaderSource::msl(code, reflection)` | pipelines |
-| `ComputePipeline`, `RenderPipeline` | `dev.compute_pipeline(shader, "main")?`, `dev.render_pipeline(desc)?` | passes; `pipe.bind_layout(0)` |
-| `BindGroup` | `dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, buf)][..])` | `pass.set_bind_group(0, g)` |
+| `Shader` | `dev.shader_wgsl(wgsl)?` (WGSL text), or `dev.shader(&src)?` with `src` a `ShaderSource::msl(code, reflection)` | pipelines |
+| `ComputePipeline`, `RenderPipeline` | `dev.compute_pipeline(&shader, "main")?`, `dev.render_pipeline(desc)?` | passes; `pipe.bind_layout(0)` |
+| `BindGroup` | `dev.bind_group(pipe.bind_layout(0), &[gpu::bind(0, &buf)][..])` | `pass.set_bind_group(0, &g)` |
 | `Encoder`, `Commands` | `dev.encoder()`, `enc.finish()` | `enc.compute_pass(\|pass\| ..)`, `enc.render_pass(desc, \|pass\| ..)`, copies |
 
 A mappable buffer is reached by copies only (WebGPU's rule, `gpu.usage`
@@ -243,25 +241,26 @@ at `dev.buffer`, 0.25.3): `MAP_READ` goes with `COPY_DST` alone,
 COPY_SRC` buffer, copied (`enc.copy_buffer`) into a `MAP_READ |
 COPY_DST` one that is mapped (the compute examples below).
 
-A mapped buffer is a view (`guide views`): `let b = buf.map_read(dev);`
-waits for the GPU and views the buffer's bytes (`gpu::f32s(b)`,
-`u32s`, `i32s`: the same bytes as numbers, still a view of `buf`). The
-buffer stays **mapped until `buf.unmap(dev)`**, and nothing writes a
-mapped buffer, so a view never changes under the program: a copy into
-it (or `queue.write_buffer`) stops with `gpu.state`, when it is
+A mapped buffer is borrowed: `let b = buf.map_read(&dev);` waits for
+the GPU and gives the buffer's bytes, a `&[u8]` (`gpu::f32s(b)`,
+`u32s`, `i32s`: the same bytes as numbers, still a borrow of `buf`).
+The buffer stays **mapped until `buf.unmap(&dev)`**, and nothing writes
+a mapped buffer, so the bytes never change under the program: a copy
+into it (or `queue.write_buffer`) stops with `gpu.state`, when it is
 recorded, or at `queue.submit` when it was recorded before the
-`map_read`. `unmap` takes the buffer `inout`, so it is refused
-(`own.conflict`) while a view of it is still used: read what you need,
-`unmap`, then copy into it again (the atomics example below). Mapping
-again while mapped is fine. `buf.map_read_copy_in(dev, gpa)` maps,
-copies the bytes into a `Vec<u8, Gpa>` (`gpu::f32s(v.as_slice())`) and
-unmaps: the buffer can be written again at once, and the copy outlives
-it. A view lives no longer than the buffer: a function may return
-`buf.map_read(dev)` when `buf` is its caller's (an `inout` parameter),
-not when the buffer is a local of its own (`own.escape`); then return
-`map_read_copy_in`'s copy. A function of your own that returns
-`gpu::f32s(buf.map_read(dev))` of an `inout` parameter views `buf`
-too (inferred, `volec query views NAME`).
+`map_read`. `map_read` and `unmap` take the buffer `&mut`, so `unmap`
+is refused (`borrowck.mut_twice`) while the slice is still used: read
+what you need, `unmap`, then copy into it again (the atomics example
+below). Mapping again while mapped is fine. `buf.map_read_copy_in(&dev,
+gpa)` maps, copies the bytes into a `Vec<u8, Gpa>`
+(`gpu::f32s(v.as_slice())`) and unmaps: the buffer can be written again
+at once, and the copy outlives it. The slice lives no longer than the
+buffer: a function may return `buf.map_read(dev)` when `buf` is its
+caller's, `fn bytes<'a>(dev: &gpu::Device<Gpa>, buf: &'a mut
+gpu::Buffer) -> &'a [u8]` (the lifetime names the parameter the result
+borrows from: `borrowck.elision` without it), not when the buffer is a
+local of its own (`borrowck.return_local`); then return
+`map_read_copy_in`'s copy.
 
 Shaders come from the shader compiler as a `ShaderSource`: the code
 for the device's `caps().shader_kind` (MSL on Metal) and its
@@ -279,29 +278,30 @@ use std::gpu::{BindingType, BufferUsage, Reflection, ShaderSource};
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, var queue) = inst.adapter()?.device()?;
+    let (dev, mut queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
     let code = "kernel void k(device uint* xs [[buffer(0)]], uint i [[thread_position_in_grid]]) { xs[i] = xs[i] * xs[i]; }";
-    var refl = Reflection::new_in(gpa);
-    refl.compute("main", "k", 64);                         // entry, its MSL name, workgroup
-    refl.bind(0, 0, BindingType::Storage, compute: 0);     // @group(0) @binding(0): buffer(0)
+    let mut refl = Reflection::new_in(gpa);
+    refl.compute("main", "k", 64, 1, 1);                         // entry, its MSL name, workgroup
+    refl.bind(0, 0, BindingType::Storage,
+        gpu::StageSlots::compute(0));     // @group(0) @binding(0): buffer(0)
     let src = ShaderSource::msl(code, refl);
-    let shader = dev.shader(src)?;
-    let pipe = dev.compute_pipeline(shader, "main")?;
-    var xs: Vec<u32, Gpa> = Vec::new_in(gpa);
+    let shader = dev.shader(&src)?;
+    let pipe = dev.compute_pipeline(&shader, "main")?;
+    let mut xs: Vec<u32, Gpa> = Vec::new_in(gpa);
     for i in 0..64 { xs.push(i as u32); }
     let buf = dev.buffer_init(gpu::bytes_of_u32(xs.as_slice()),
         BufferUsage::STORAGE | BufferUsage::COPY_SRC);
-    var out = dev.buffer(64 * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST); // the readback
-    let group = dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, buf)][..]);
-    var enc = dev.encoder();
+    let mut out = dev.buffer(64 * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST); // the readback
+    let group = dev.bind_group(pipe.bind_layout(0), &[gpu::bind(0, &buf)][..]);
+    let mut enc = dev.encoder();
     enc.compute_pass(|pass| {
-        pass.set_pipeline(pipe);
-        pass.set_bind_group(0, group);
-        pass.dispatch(1); // one workgroup of 64
+        pass.set_pipeline(&pipe);
+        pass.set_bind_group(0, &group);
+        pass.dispatch(1, 1, 1); // one workgroup of 64
     });
-    enc.copy_buffer(buf, 0, out, 0, 64 * 4);
+    enc.copy_buffer(&buf, 0, &out, 0, 64 * 4);
     queue.submit(enc.finish());
-    let squares = gpu::u32s(out.map_read(dev));
+    let squares = gpu::u32s(out.map_read(&dev));
     println("{} {}", squares[3], squares[63]);
     Ok(())
 }
@@ -327,24 +327,24 @@ embed wgsl SQUARE {
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, var queue) = inst.adapter()?.device()?;
+    let (dev, mut queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
     let shader = dev.shader_wgsl(SQUARE.src)?;
-    let pipe = dev.compute_pipeline(shader, SQUARE.main)?;
-    var xs: Vec<u32, Gpa> = Vec::new_in(gpa);
+    let pipe = dev.compute_pipeline(&shader, SQUARE.main)?;
+    let mut xs: Vec<u32, Gpa> = Vec::new_in(gpa);
     for i in 0..64 { xs.push(i as u32); }
     let buf = dev.buffer_init(gpu::bytes_of_u32(xs.as_slice()),
         BufferUsage::STORAGE | BufferUsage::COPY_SRC);
-    var out = dev.buffer(64 * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
-    let group = dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, buf)][..]);
-    var enc = dev.encoder();
+    let mut out = dev.buffer(64 * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    let group = dev.bind_group(pipe.bind_layout(0), &[gpu::bind(0, &buf)][..]);
+    let mut enc = dev.encoder();
     enc.compute_pass(|pass| {
-        pass.set_pipeline(pipe);
-        pass.set_bind_group(0, group);
-        pass.dispatch(1);
+        pass.set_pipeline(&pipe);
+        pass.set_bind_group(0, &group);
+        pass.dispatch(1, 1, 1);
     });
-    enc.copy_buffer(buf, 0, out, 0, 64 * 4);
+    enc.copy_buffer(&buf, 0, &out, 0, 64 * 4);
     queue.submit(enc.finish());
-    let squares = gpu::u32s(out.map_read(dev));
+    let squares = gpu::u32s(out.map_read(&dev));
     println("{} {}", squares[3], squares[63]);
     Ok(())
 }
@@ -399,27 +399,28 @@ embed wgsl REVERSE {
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, var queue) = inst.adapter()?.device()?;
+    let (dev, mut queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
     let fill = dev.compute_pipeline(dev.shader_wgsl(FILL.src)?, FILL.main)?;
     let reverse = dev.compute_pipeline(dev.shader_wgsl(REVERSE.src)?, REVERSE.main)?;
     let xs = dev.buffer(256 * 4, BufferUsage::STORAGE);
     let ys = dev.buffer(256 * 4, BufferUsage::STORAGE | BufferUsage::COPY_SRC);
-    let fgroup = dev.bind_group(fill.bind_layout(0), [gpu::bind(0, xs)][..]);
-    let rgroup = dev.bind_group(reverse.bind_layout(0), [gpu::bind(0, xs), gpu::bind(1, ys)][..]);
-    var rb = dev.buffer(256 * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
-    var enc = dev.encoder();
+    let fgroup = dev.bind_group(fill.bind_layout(0), &[gpu::bind(0, &xs)][..]);
+    let rgroup = dev.bind_group(reverse.bind_layout(0),
+        &[gpu::bind(0, &xs), gpu::bind(1, &ys)][..]);
+    let mut rb = dev.buffer(256 * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    let mut enc = dev.encoder();
     enc.compute_pass(|pass| {
-        pass.set_pipeline(fill);
-        pass.set_bind_group(0, fgroup);
-        pass.dispatch(4);
-        pass.set_pipeline(reverse); // runs after the fill, seeing all it wrote
-        pass.set_bind_group(0, rgroup);
-        pass.dispatch(4);
+        pass.set_pipeline(&fill);
+        pass.set_bind_group(0, &fgroup);
+        pass.dispatch(4, 1, 1);
+        pass.set_pipeline(&reverse); // runs after the fill, seeing all it wrote
+        pass.set_bind_group(0, &rgroup);
+        pass.dispatch(4, 1, 1);
     });
-    enc.copy_buffer(ys, 0, rb, 0, 256 * 4); // after the pass
+    enc.copy_buffer(&ys, 0, &rb, 0, 256 * 4); // after the pass
     queue.submit(enc.finish());
-    let got = gpu::u32s(rb.map_read(dev));
-    var wrong = 0;
+    let got = gpu::u32s(rb.map_read(&dev));
+    let mut wrong = 0;
     for i in 0..256 {
         if got[i] != ((255 - i) * (255 - i)) as u32 { wrong += 1; }
     }
@@ -445,11 +446,11 @@ defaults are wgpu's.
 
 | struct | made by | fields / methods |
 |---|---|---|
-| `RenderDesc` | `gpu::RenderDesc::new(shader, "vs", "fs", format)`; `RenderDesc::depth_only(shader, "vs", format: Format::Depth32Float, compare: Compare::Less)` | `vertex`, `vs`, `fragment`, `fs`, `has_fs`, `state: PipelineState`; `.vertex_buffer(layout)`, `.target(format)` (another color target), `.blend(Blend::alpha(), target: 0)`, `.depth(format, compare, write)`, `.topology(Topology::LineList)`, `.cull(Cull::Back, front: FrontFace::Ccw)`, `.no_fragment()` (no fragment stage, no color target) |
+| `RenderDesc` | `gpu::RenderDesc::new(&shader, "vs", "fs", format)`; `RenderDesc::depth_only(&shader, "vs", format: Format::Depth32Float, compare: Compare::Less)` | `vertex`, `vs`, `fragment`, `fs`, `has_fs`, `state: PipelineState`; `.vertex_buffer(layout)`, `.target(format)` (another color target), `.blend(Blend::alpha(), target: 0)`, `.depth(format, compare, write)`, `.topology(Topology::LineList)`, `.cull(Cull::Back, front: FrontFace::Ccw)`, `.no_fragment()` (no fragment stage, no color target) |
 | `PipelineState` | inside `RenderDesc` | `topology`, `cull`, `front_face`, `buffers`/`buffer_count`, `targets`/`target_count` (`ColorTarget { format, blend, write_mask }`), `depth: Option<DepthState { format, write, compare }>` |
 | `VertexLayout` | `VertexLayout::new(stride, step: StepMode::Vertex)` | `.attribute(location, VertexFormat::Float32x2, offset)`: `@location(n)` reads it (at most 8 attributes, 8 buffers) |
-| `PassDesc` | `PassDesc::color(view, clear: Color::rgba(r, g, b, a), load: Load::Clear)`; `PassDesc::depth_only(view, clear: 1.0, store: true)` | `.with_color(view, clear, load)` (the next color attachment, up to 8), `.with_depth(view, clear: 1.0, store: false)`; `colors: [Option<ColorAttachment>; 8]` and `color_count` (`ColorAttachment { view, load, clear, store }`; `Load::Clear`, `Keep`, `DontCare`), `depth: Option<DepthAttachment>` |
-| `TextureDesc` | `dev.texture(w, h, format, usage: .., layers: 1, mips: 1)` | `width`, `height`, `layers`, `mips`, `format`, `usage` |
+| `PassDesc` | `PassDesc::color(&view, clear: Color::rgba(r, g, b, a), load: Load::Clear)`; `PassDesc::depth_only(&view, clear: 1.0, store: true)` | `.with_color(&view, clear, load)` (the next color attachment, up to 8), `.with_depth(&view, clear: 1.0, store: false)`; `colors: [Option<ColorAttachment>; 8]` and `color_count` (`ColorAttachment { view, load, clear, store }`; `Load::Clear`, `Keep`, `DontCare`), `depth: Option<DepthAttachment>` |
+| `TextureDesc` | `dev.texture(w, h, format, usage)`; `dev.texture_array(w, h, format, usage, layers, mips)` | `width`, `height`, `layers`, `mips`, `format`, `usage` |
 | `SamplerDesc` | `SamplerDesc::nearest()`, `::linear()` | `mag`, `min`, `mip` (`Filter`), `address_u/v/w` (`AddressMode`), `lod_min`, `lod_max`, `compare: Option<Compare>`, `anisotropy` (1..16) |
 | `Limits` | `Limits::default()`, `adapter.limits()` (the most it takes), `dev.limits()`; `adapter.device(limits)` | wgpu's names: `max_buffer_size`, `max_bind_groups`, `max_bindings_per_group`, `min_uniform_buffer_offset_alignment`, `max_compute_workgroup_size_x`.., `max_compute_invocations_per_workgroup`, `max_compute_workgroups_per_dimension`.. (Buffer sizes, below) |
 
@@ -475,8 +476,8 @@ defaults are wgpu's.
   Storage textures are written only (`write`), never read: a kernel that
   reads its last frame reads it as a `texture_2d` (bound beside, from
   another texture).
-- **Surface formats**: `surf.configure(dev, w, h, format, vsync: true)`
-  takes `Format::Bgra8Unorm` (the default), `Bgra8UnormSrgb` or
+- **Surface formats**: `surf.configure(&dev, w, h, format, vsync: true)`
+  takes `Format::Bgra8Unorm` (what a window shows as it is), `Bgra8UnormSrgb` or
   `Rgba16Float`; a pipeline drawing into the frame names the same one.
 - **Texture formats** (`Format::`): `R8Unorm`, `R8Uint`, `Rg8Unorm`,
   `R16Float`, `R32Uint`, `R32Sint`, `R32Float`, `Rg16Float`,
@@ -490,16 +491,16 @@ defaults are wgpu's.
 ## Bind groups
 
 A shader's `@group(g) @binding(b)` resources are given as a bind group
-for group g: `dev.bind_group(pipe.bind_layout(g), entries)`, one entry
-per binding of the layout, any order, then `pass.set_bind_group(g, group)`
+for group g: `dev.bind_group(pipe.bind_layout(g), entries)` (`entries` a slice, `&[..][..]`), one entry
+per binding of the layout, any order, then `pass.set_bind_group(g, &group)`
 before the draw or dispatch.
 
 | WGSL | entry |
 |---|---|
-| `var<uniform> u: U;` | `gpu::bind(b, buf)` (`UNIFORM`), or `gpu::bind_range(b, buf, offset, size)` (offset a multiple of `dev.align_uniform(1)`, 256) |
-| `var<storage, read> xs: array<T>;`, `read_write` | `gpu::bind(b, buf)` (`STORAGE`); a runtime-sized array is bounds-checked against the bound bytes |
-| `var t: texture_2d<f32>;`, `texture_storage_2d<..>` | `gpu::bind_texture(b, tex.view())` |
-| `var s: sampler;` | `gpu::bind_sampler(b, dev.sampler(SamplerDesc::linear()))` |
+| `var<uniform> u: U;` | `gpu::bind(b, &buf)` (`UNIFORM`), or `gpu::bind_range(b, &buf, offset, size)` (offset a multiple of `dev.align_uniform(1)`, 256) |
+| `var<storage, read> xs: array<T>;`, `read_write` | `gpu::bind(b, &buf)` (`STORAGE`); a runtime-sized array is bounds-checked against the bound bytes |
+| `var t: texture_2d<f32>;`, `texture_storage_2d<..>` | `gpu::bind_texture(b, &tex.view())` |
+| `var s: sampler;` | `gpu::bind_sampler(b, &sampler)` (`dev.sampler(SamplerDesc::linear())`) |
 
 Groups are 0..3, 16 bindings a group. A layout comes from the pipeline,
 so a group made for one pipeline fits another only with the same
@@ -529,7 +530,7 @@ an error at its line in the `.vl` file (0.26.2: in a block's `.wgsl`
 file, at `x.wgsl:L:C`, which the LSP and `query grep` know as a file of
 the program). `NAME` is a static: `NAME.src`
 is the text, for `dev.shader_wgsl(NAME.src)?`, and each entry point is a
-field holding its name, for `dev.compute_pipeline(shader, NAME.step)`; a
+field holding its name, for `dev.compute_pipeline(&shader, NAME.step)`; a
 name the block has no entry point for is `gpu.entry`, listing the ones
 it has. `volec fmt` keeps the block's text as it is.
 
@@ -562,7 +563,7 @@ embed wgsl BAD {
 }
 
 fn main() {
-    println(BAD.main);
+    println("{}", BAD.main);
 }
 ```
 ```err
@@ -626,7 +627,7 @@ module as WGSL (`gpu#shared-constants-and-structs`).
 
 ## Index buffers, instancing, indirect draws
 
-An index buffer (`INDEX`) is set with `pass.set_index_buffer(buf,
+An index buffer (`INDEX`) is set with `pass.set_index_buffer(&buf,
 IndexFormat::Uint16 or Uint32, offset)` and drawn with
 `pass.draw_indexed(indices, base_vertex, instances)`; instances are the
 second range of `draw` and `draw_indexed` (`@builtin(instance_index)`,
@@ -645,32 +646,32 @@ embed wgsl QUAD {
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, var queue) = inst.adapter()?.device()?;
+    let (dev, mut queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
     let shader = dev.shader_wgsl(QUAD.src)?;
-    var desc = gpu::RenderDesc::new(shader, QUAD.vs, QUAD.fs, Format::Rgba8Unorm);
-    var layout = VertexLayout::new(8); // a vec2<f32> per vertex
+    let mut desc = gpu::RenderDesc::new(&shader, QUAD.vs, QUAD.fs, Format::Rgba8Unorm);
+    let mut layout = VertexLayout::new(8, gpu::StepMode::Vertex); // a vec2<f32> per vertex
     layout.attribute(0, VertexFormat::Float32x2, 0); // @location(0) at offset 0
     desc.vertex_buffer(layout);
     let pipe = dev.render_pipeline(desc)?;
     // four corners, two triangles: 0 1 2 and 2 1 3
     let corners: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
-    let vb = dev.buffer_init(gpu::bytes_of_f32(corners[..]), BufferUsage::VERTEX);
+    let vb = dev.buffer_init(gpu::bytes_of_f32(&corners[..]), BufferUsage::VERTEX);
     let idx: [u32; 6] = [0, 1, 2, 2, 1, 3];
-    let ib = dev.buffer_init(gpu::bytes_of_u32(idx[..]), BufferUsage::INDEX);
+    let ib = dev.buffer_init(gpu::bytes_of_u32(&idx[..]), BufferUsage::INDEX);
     let tex = dev.texture(8, 8, Format::Rgba8Unorm,
-        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
     let view = tex.view();
-    var out = dev.buffer(256 * 8, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
-    var enc = dev.encoder();
-    enc.render_pass(PassDesc::color(view), |pass| {
-        pass.set_pipeline(pipe);
-        pass.set_vertex_buffer(0, vb);
-        pass.set_index_buffer(ib, IndexFormat::Uint32);
+    let mut out = dev.buffer(256 * 8, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    let mut enc = dev.encoder();
+    enc.render_pass(PassDesc::color(&view, gpu::Color::black(), gpu::Load::Clear), |pass| {
+        pass.set_pipeline(&pipe);
+        pass.set_vertex_buffer(0, &vb, 0);
+        pass.set_index_buffer(&ib, IndexFormat::Uint32, 0);
         pass.draw_indexed(0..6, 0, 0..1); // indices, base vertex, instances
     });
-    enc.copy_texture_to_buffer(tex, out, 256);
+    enc.copy_texture_to_buffer(&tex, &out, 256);
     queue.submit(enc.finish());
-    let px = out.map_read(dev);
+    let px = out.map_read(&dev);
     println("{} {} {} {}", px[0], px[1], px[2], px[256 * 7 + 4 * 7 + 1]);
     Ok(())
 }
@@ -745,24 +746,24 @@ embed wgsl SHADER {
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, var queue) = inst.adapter()?.device()?;
+    let (dev, mut queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
     let shader = dev.shader_wgsl(SHADER.src)?;
-    let pipe = dev.compute_pipeline(shader, SHADER.main)?;
+    let pipe = dev.compute_pipeline(&shader, SHADER.main)?;
     // the struct as WGSL lays it out: 48 bytes, 12 f32s
     let u: [f32; 12] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0, 7.0, 8.0, 9.0, 10.0];
-    let ubuf = dev.buffer_init(gpu::bytes_of_f32(u[..]), BufferUsage::UNIFORM);
+    let ubuf = dev.buffer_init(gpu::bytes_of_f32(&u[..]), BufferUsage::UNIFORM);
     let out = dev.buffer(16, BufferUsage::STORAGE | BufferUsage::COPY_SRC);
-    var rb = dev.buffer(16, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
-    let group = dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, ubuf), gpu::bind(1, out)][..]);
-    var enc = dev.encoder();
+    let mut rb = dev.buffer(16, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    let group = dev.bind_group(pipe.bind_layout(0), &[gpu::bind(0, &ubuf), gpu::bind(1, &out)][..]);
+    let mut enc = dev.encoder();
     enc.compute_pass(|pass| {
-        pass.set_pipeline(pipe);
-        pass.set_bind_group(0, group);
-        pass.dispatch(1);
+        pass.set_pipeline(&pipe);
+        pass.set_bind_group(0, &group);
+        pass.dispatch(1, 1, 1);
     });
-    enc.copy_buffer(out, 0, rb, 0, 16);
+    enc.copy_buffer(&out, 0, &rb, 0, 16);
     queue.submit(enc.finish());
-    let r = gpu::f32s(rb.map_read(dev));
+    let r = gpu::f32s(rb.map_read(&dev));
     println("{} {} {} {}", r[0], r[1], r[2], r[3]);
     Ok(())
 }
@@ -802,8 +803,8 @@ embed wgsl SIM with Params, STEPS {
 }
 
 fn main() {
-    println("{} {}", size_of(Params), align_of(Params));
-    println(SIM.src.len() > 0);
+    println("{} {}", size_of::<Params>(), align_of::<Params>());
+    println("{}", SIM.src.len() > 0);
 }
 ```
 ```out
@@ -813,7 +814,7 @@ true
 
 The bytes for `queue.write_buffer` come from the struct's memory; std
 has no safe view of a struct's bytes yet, so it is an `unsafe` slice of
-`size_of(Params)` bytes from `&p`, sound when the struct has no padding
+`size_of::<Params>()` bytes from `&p`, sound when the struct has no padding
 (no uninitialized byte), as here (examples/gpu/fluid2d's `set_params`).
 
 ## Workgroups
@@ -845,10 +846,10 @@ use std::gpu::{BufferUsage, Limits};
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
-    let adapter = inst.adapter()?;
-    var lim = Limits::default();
+    let adapter = inst.adapter(gpu::Power::High)?;
+    let mut lim = Limits::default();
     lim.max_buffer_size = 2 << 30; // 2 GiB
-    let (dev, var _queue) = adapter.device(lim)?;
+    let (dev, _queue) = adapter.device(lim)?;
     println("{} GiB, the adapter's {}", dev.limits().max_buffer_size >> 30,
         adapter.limits().max_buffer_size >= 2 << 30);
     let _small = dev.buffer(1 << 20, BufferUsage::STORAGE); // 1 MiB
@@ -901,42 +902,43 @@ embed wgsl CLEAR with BINS {
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, var queue) = inst.adapter()?.device()?;
+    let (dev, mut queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
     let deposit = dev.compute_pipeline(dev.shader_wgsl(DEPOSIT.src)?, DEPOSIT.main)?;
     let clear = dev.compute_pipeline(dev.shader_wgsl(CLEAR.src)?, CLEAR.main)?;
-    var xs: Vec<u32, Gpa> = Vec::new_in(gpa);
+    let mut xs: Vec<u32, Gpa> = Vec::new_in(gpa);
     for i in 0..256 { xs.push(i as u32); }
     let xb = dev.buffer_init(gpu::bytes_of_u32(xs.as_slice()), BufferUsage::STORAGE);
     let bins = dev.buffer(16, BufferUsage::STORAGE | BufferUsage::COPY_SRC);
-    var rb = dev.buffer(16, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    let mut rb = dev.buffer(16, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
     // each module's layout has the bindings it uses: two, and one
-    let dgroup = dev.bind_group(deposit.bind_layout(0), [gpu::bind(0, bins), gpu::bind(1, xb)][..]);
-    let cgroup = dev.bind_group(clear.bind_layout(0), [gpu::bind(0, bins)][..]);
+    let dgroup = dev.bind_group(deposit.bind_layout(0),
+        &[gpu::bind(0, &bins), gpu::bind(1, &xb)][..]);
+    let cgroup = dev.bind_group(clear.bind_layout(0), &[gpu::bind(0, &bins)][..]);
     println("layouts: {} and {}", deposit.bind_layout(0).count, clear.bind_layout(0).count);
-    var enc = dev.encoder();
+    let mut enc = dev.encoder();
     enc.compute_pass(|pass| {
-        pass.set_pipeline(deposit);
-        pass.set_bind_group(0, dgroup);
-        pass.dispatch(4); // 256 items deposit
-        pass.dispatch(4); // and again: 128 a bin
+        pass.set_pipeline(&deposit);
+        pass.set_bind_group(0, &dgroup);
+        pass.dispatch(4, 1, 1); // 256 items deposit
+        pass.dispatch(4, 1, 1); // and again: 128 a bin
     });
-    enc.copy_buffer(bins, 0, rb, 0, 16);
+    enc.copy_buffer(&bins, 0, &rb, 0, 16);
     queue.submit(enc.finish());
-    let twice = gpu::u32s(rb.map_read(dev));
+    let twice = gpu::u32s(rb.map_read(&dev));
     println("{} {} {} {}", twice[0], twice[1], twice[2], twice[3]);
-    rb.unmap(dev); // twice is done: rb can be copied into again
-    var enc2 = dev.encoder();
+    rb.unmap(&dev); // twice is done: rb can be copied into again
+    let mut enc2 = dev.encoder();
     enc2.compute_pass(|pass| {
-        pass.set_pipeline(clear);
-        pass.set_bind_group(0, cgroup);
-        pass.dispatch(1);
-        pass.set_pipeline(deposit);
-        pass.set_bind_group(0, dgroup);
-        pass.dispatch(4);
+        pass.set_pipeline(&clear);
+        pass.set_bind_group(0, &cgroup);
+        pass.dispatch(1, 1, 1);
+        pass.set_pipeline(&deposit);
+        pass.set_bind_group(0, &dgroup);
+        pass.dispatch(4, 1, 1);
     });
-    enc2.copy_buffer(bins, 0, rb, 0, 16);
+    enc2.copy_buffer(&bins, 0, &rb, 0, 16);
     queue.submit(enc2.finish());
-    let once = gpu::u32s(rb.map_read(dev));
+    let once = gpu::u32s(rb.map_read(&dev));
     println("{} {} {} {}", once[0], once[1], once[2], once[3]);
     Ok(())
 }
@@ -980,6 +982,7 @@ buffer.
 
 ```vole
 use std::gpu;
+use std::mem;
 use std::gpu::BufferUsage;
 
 const N: i64 = 256;
@@ -999,41 +1002,42 @@ embed wgsl BLUR {
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, var queue) = inst.adapter()?.device()?;
+    let (dev, mut queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
     let pipe = dev.compute_pipeline(dev.shader_wgsl(BLUR.src)?, BLUR.main)?;
-    var start: Vec<u32, Gpa> = Vec::new_in(gpa);
+    let mut start: Vec<u32, Gpa> = Vec::new_in(gpa);
     for i in 0..N { start.push((i * i % 97) as u32); }
     let usage = BufferUsage::STORAGE | BufferUsage::COPY_SRC;
     let bufs = [dev.buffer_init(gpu::bytes_of_u32(start.as_slice()), usage), dev.buffer(N * 4, usage)];
     let layout = pipe.bind_layout(0);
     let groups = [ // groups[k] reads bufs[k], writes bufs[1 - k]
-        dev.bind_group(layout, [gpu::bind(0, bufs[0]), gpu::bind(1, bufs[1])][..]),
-        dev.bind_group(layout, [gpu::bind(0, bufs[1]), gpu::bind(1, bufs[0])][..]),
+        dev.bind_group(layout, &[gpu::bind(0, &bufs[0]), gpu::bind(1, &bufs[1])][..]),
+        dev.bind_group(layout, &[gpu::bind(0, &bufs[1]), gpu::bind(1, &bufs[0])][..]),
     ];
-    var enc = dev.encoder();
+    let mut enc = dev.encoder();
     enc.compute_pass(|pass| {
-        pass.set_pipeline(pipe);
+        pass.set_pipeline(&pipe);
         for s in 0..STEPS {
-            pass.set_bind_group(0, groups[s % 2]); // the parity
-            pass.dispatch((N + 63) / 64); // reads what the last one wrote
+            pass.set_bind_group(0, &groups[(s % 2) as usize]); // the parity
+            pass.dispatch((N + 63) / 64, 1, 1); // reads what the last one wrote
         }
     });
-    let last = STEPS % 2; // step STEPS - 1 wrote bufs[1 - (STEPS - 1) % 2]
-    var rb = dev.buffer(N * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
-    enc.copy_buffer(bufs[last], 0, rb, 0, N * 4);
+    let last = (STEPS % 2) as usize; // step STEPS - 1 wrote bufs[1 - (STEPS - 1) % 2]
+    let mut rb = dev.buffer(N * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    enc.copy_buffer(&bufs[last], 0, &rb, 0, N * 4);
     queue.submit(enc.finish());
     // the same steps on the CPU: the reference
-    var cur = start.clone();
-    var next = start.clone();
+    let n = N as usize;
+    let mut cur = start.clone();
+    let mut next = start.clone();
     for _ in 0..STEPS {
-        for i in 0..N {
-            next[i] = (cur[(i + N - 1) % N] + cur[i] + cur[(i + 1) % N]) % 251;
+        for i in 0..n {
+            next[i] = (cur[(i + n - 1) % n] + cur[i] + cur[(i + 1) % n]) % 251;
         }
-        std::swap(&cur, &next);
+        mem::swap(&mut cur, &mut next);
     }
-    let got = gpu::u32s(rb.map_read(dev));
-    var differ = 0;
-    for i in 0..N {
+    let got = gpu::u32s(rb.map_read(&dev));
+    let mut differ = 0;
+    for i in 0..n {
         if got[i] != cur[i] { differ += 1; }
     }
     println(
@@ -1057,11 +1061,12 @@ values, and what each costs:
 | way | cost |
 |---|---|
 | `write_buffer`, then a submit, each step | a submit a step (tens of microseconds, and a staging copy while the GPU is busy): fine for a few steps a frame, seconds of overhead at 40,000 |
-| a uniform range a step: one buffer of `steps * dev.align_uniform(size)` bytes, written once, and a bind group a step binding its range (`gpu::bind_range(b, ubuf, s * stride, size)`) | 256 bytes and a bind group a step, made before the pass: for a count of steps known in advance |
+| a uniform range a step: one buffer of `steps * dev.align_uniform(size)` bytes, written once, and a bind group a step binding its range (`gpu::bind_range(b, &ubuf, s * stride, size)`) | 256 bytes and a bind group a step, made before the pass: for a count of steps known in advance |
 | a storage buffer of the parameters, `array<P>`, indexed by a step number the GPU counts: a kernel of one invocation adds 1 after each step (below) | one more dispatch a step (microseconds) and two bind groups whatever the count; an earlier kernel may compute the parameters too |
 
 ```vole
 use std::gpu;
+use std::mem;
 use std::gpu::BufferUsage;
 
 const N: i64 = 64;
@@ -1089,48 +1094,53 @@ embed wgsl TICK {
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, var queue) = inst.adapter()?.device()?;
+    let (dev, mut queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
     let step = dev.compute_pipeline(dev.shader_wgsl(STEP.src)?, STEP.main)?;
     let tick = dev.compute_pipeline(dev.shader_wgsl(TICK.src)?, TICK.main)?;
-    var start: Vec<u32, Gpa> = Vec::new_in(gpa);
-    var params: Vec<u32, Gpa> = Vec::new_in(gpa);
+    let mut start: Vec<u32, Gpa> = Vec::new_in(gpa);
+    let mut params: Vec<u32, Gpa> = Vec::new_in(gpa);
     for i in 0..N { start.push((i * i % 97) as u32); }
     for s in 0..STEPS { params.push((s * 7 % 11) as u32); } // any values, one a step
     let usage = BufferUsage::STORAGE | BufferUsage::COPY_SRC;
     let bufs = [dev.buffer_init(gpu::bytes_of_u32(start.as_slice()), usage), dev.buffer(N * 4, usage)];
-    let ctl = dev.buffer_init(gpu::bytes_of_u32([0u32][..]), BufferUsage::STORAGE);
+    let ctl = dev.buffer_init(gpu::bytes_of_u32(&[0u32][..]), BufferUsage::STORAGE);
     let pbuf = dev.buffer_init(gpu::bytes_of_u32(params.as_slice()), BufferUsage::STORAGE);
     let l = step.bind_layout(0);
     let groups = [
-        dev.bind_group(l, [gpu::bind(0, ctl), gpu::bind(1, pbuf), gpu::bind(2, bufs[0]), gpu::bind(3, bufs[1])][..]),
-        dev.bind_group(l, [gpu::bind(0, ctl), gpu::bind(1, pbuf), gpu::bind(2, bufs[1]), gpu::bind(3, bufs[0])][..]),
+        dev.bind_group(l,
+            &[gpu::bind(0, &ctl), gpu::bind(1, &pbuf), gpu::bind(2, &bufs[0]),
+                gpu::bind(3, &bufs[1])][..]),
+        dev.bind_group(l,
+            &[gpu::bind(0, &ctl), gpu::bind(1, &pbuf), gpu::bind(2, &bufs[1]),
+                gpu::bind(3, &bufs[0])][..]),
     ];
-    let tgroup = dev.bind_group(tick.bind_layout(0), [gpu::bind(0, ctl)][..]);
-    var enc = dev.encoder();
+    let tgroup = dev.bind_group(tick.bind_layout(0), &[gpu::bind(0, &ctl)][..]);
+    let mut enc = dev.encoder();
     enc.compute_pass(|pass| {
         for s in 0..STEPS {
-            pass.set_pipeline(step);
-            pass.set_bind_group(0, groups[s % 2]);
-            pass.dispatch((N + 63) / 64);
-            pass.set_pipeline(tick);
-            pass.set_bind_group(0, tgroup);
-            pass.dispatch(1);
+            pass.set_pipeline(&step);
+            pass.set_bind_group(0, &groups[(s % 2) as usize]);
+            pass.dispatch((N + 63) / 64, 1, 1);
+            pass.set_pipeline(&tick);
+            pass.set_bind_group(0, &tgroup);
+            pass.dispatch(1, 1, 1);
         }
     });
-    var rb = dev.buffer(N * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
-    enc.copy_buffer(bufs[STEPS % 2], 0, rb, 0, N * 4);
+    let mut rb = dev.buffer(N * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    enc.copy_buffer(&bufs[(STEPS % 2) as usize], 0, &rb, 0, N * 4);
     queue.submit(enc.finish());
-    var cur = start.clone();
-    var next = start.clone();
-    for s in 0..STEPS {
-        for i in 0..N {
-            next[i] = (cur[(i + N - 1) % N] + cur[(i + 1) % N] + params[s]) % 251;
+    let mut cur = start.clone();
+    let mut next = start.clone();
+    let n = N as usize;
+    for s in 0..STEPS as usize {
+        for i in 0..n {
+            next[i] = (cur[(i + n - 1) % n] + cur[(i + 1) % n] + params[s]) % 251;
         }
-        std::swap(&cur, &next);
+        mem::swap(&mut cur, &mut next);
     }
-    let got = gpu::u32s(rb.map_read(dev));
-    var differ = 0;
-    for i in 0..N {
+    let got = gpu::u32s(rb.map_read(&dev));
+    let mut differ = 0;
+    for i in 0..n {
         if got[i] != cur[i] { differ += 1; }
     }
     println("{STEPS} steps, one submit, {differ} of {N} differ from the CPU");
@@ -1147,9 +1157,9 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
 own time for a pass, which the load of other processes on the CPU does
 not change: a `QuerySet` (`dev.query_set(n)`), passes that write two of
 its timestamps when their work begins and ends
-(`enc.compute_pass_timed(set, begin, end, |pass| ...)`,
-`enc.render_pass_timed(desc, set, begin, end, |pass| ...)`; -1: not
-that one), `enc.resolve_query_set(set, first, count, buf, offset)` into
+(`enc.compute_pass_timed(&set, begin, end, |pass| ...)`,
+`enc.render_pass_timed(desc, &set, begin, end, |pass| ...)`; -1: not
+that one), `enc.resolve_query_set(&set, first, count, &buf, offset)` into
 a buffer made with `BufferUsage::QUERY_RESOLVE` (copy it into a
 `MAP_READ` one to read; the offset a multiple of 256), a `u64` a
 timestamp, and `queue.timestamp_period()`, the ns of a tick:
@@ -1169,23 +1179,23 @@ embed wgsl STEP {
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
-    let (dev, var queue) = inst.adapter()?.device()?;
+    let (dev, mut queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
     let pipe = dev.compute_pipeline(dev.shader_wgsl(STEP.src)?, STEP.main)?;
     let xs = dev.buffer(1024 * 64 * 4, BufferUsage::STORAGE);
-    let group = dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, xs)][..]);
+    let group = dev.bind_group(pipe.bind_layout(0), &[gpu::bind(0, &xs)][..]);
     let set = dev.query_set(2);
     let resolved = dev.buffer(256, BufferUsage::QUERY_RESOLVE | BufferUsage::COPY_SRC);
-    var out = dev.buffer(16, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
-    var enc = dev.encoder();
-    enc.compute_pass_timed(set, 0, 1, |pass| { // 0: its beginning, 1: its end
-        pass.set_pipeline(pipe);
-        pass.set_bind_group(0, group);
-        pass.dispatch(1024);
+    let mut out = dev.buffer(16, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    let mut enc = dev.encoder();
+    enc.compute_pass_timed(&set, 0, 1, |pass| { // 0: its beginning, 1: its end
+        pass.set_pipeline(&pipe);
+        pass.set_bind_group(0, &group);
+        pass.dispatch(1024, 1, 1);
     });
-    enc.resolve_query_set(set, 0, 2, resolved, 0);
-    enc.copy_buffer(resolved, 0, out, 0, 16);
+    enc.resolve_query_set(&set, 0, 2, &resolved, 0);
+    enc.copy_buffer(&resolved, 0, &out, 0, 16);
     queue.submit(enc.finish()); // returns when the timed pass has finished
-    let t = gpu::u32s(out.map_read(dev)); // two u64s, little-endian
+    let t = gpu::u32s(out.map_read(&dev)); // two u64s, little-endian
     let begin = t[0] as u64 | (t[1] as u64) << 32;
     let end = t[2] as u64 | (t[3] as u64) << 32;
     let ns = (end - begin) as f64 * queue.timestamp_period();
@@ -1216,18 +1226,18 @@ a frame costs the program; timestamps are what the GPU spends:
 ```vole
 use std::gpu;
 
-fn timed(dev: gpu::Device<Gpa>, queue: inout gpu::Queue, pipe: gpu::ComputePipeline,
-    group: gpu::BindGroup, groups: i64) -> Result<f64, gpu::Error<Gpa>> {
-    let t0 = std::time::monotonic_now();
-    var enc = dev.encoder();
+fn timed(dev: &gpu::Device<Gpa>, queue: &mut gpu::Queue, pipe: &gpu::ComputePipeline,
+    group: &gpu::BindGroup, groups: i64) -> Result<f64, gpu::Error<Gpa>> {
+    let t0 = std::time::Instant::now();
+    let mut enc = dev.encoder();
     enc.compute_pass(|pass| {
         pass.set_pipeline(pipe);
         pass.set_bind_group(0, group);
-        pass.dispatch(groups);
+        pass.dispatch(groups, 1, 1);
     });
     queue.submit(enc.finish());
     queue.wait_idle()?; // until the GPU has finished
-    Ok(std::time::monotonic_now().saturating_sub(t0).as_millis_f64())
+    Ok(t0.elapsed().as_secs_f64() * 1000.0)
 }
 ```
 
@@ -1303,10 +1313,10 @@ is (no adapter, a shader the driver rejects) is a `gpu::Error`.
 | `gpu.format` | a format that does not fit: target, view, storage, shader kind | the pipeline's target format |
 | `gpu.limits` | a size or count above `dev.limits()` (what a shader asks, its workgroup size or bindings, is an `Err` instead); the message names the limit as `dev.limits().NAME` | smaller, or a larger `max_buffer_size` at `adapter.device(lim)` |
 | `gpu.unwritten` | a submit reads a uniform buffer nothing wrote (0.25.2.2) | `queue.write_buffer` before the submit, or `dev.buffer_init` |
-| `gpu.state` | a buffer written while mapped for reading (a copy into it or `write_buffer`: at the copy, or at `queue.submit` when recorded before `map_read`), or used while mapped for writing | `buf.unmap(dev)` when its view is done, or `map_read_copy_in` |
+| `gpu.state` | a buffer written while mapped for reading (a copy into it or `write_buffer`: at the copy, or at `queue.submit` when recorded before `map_read`), or used while mapped for writing | `buf.unmap(&dev)` when its bytes are read, or `map_read_copy_in` |
 | `gpu.unsupported` | a capability the device lacks | check `dev.caps()` |
 
-Surfaces (`inst.surface(dev, RawSurface::MetalLayer(layer))`,
-`surf.configure(..)`, `surf.frame()?`, `frame.present(&queue)`) are
+Surfaces (`inst.surface(&dev, RawSurface::MetalLayer(layer))`,
+`surf.configure(..)`, `surf.frame()?`, `frame.present(&mut queue)`) are
 what std::window draws into; `RawSurface::Headless` gives frames without
 a window (to check a window's pixels: `window#checking-the-pixels-headless`).

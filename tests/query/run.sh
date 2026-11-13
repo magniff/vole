@@ -32,6 +32,11 @@
 set -u
 LC_ALL=C
 export LC_ALL
+# (0.28.0) std is the compiler's own text here, `<std>`, wherever the
+# runner's programs are: not the files of a vole repository around them
+# (front/stdtree.vl: find_std_tree), which the tools would name instead.
+VOLE_STD_TREE=none
+export VOLE_STD_TREE
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -215,7 +220,7 @@ out=$("$COMPILER" query refs IntVec::push --in compiler/src/base/mod.vl 2>&1)
 ok=0
 n=$(printf '%s\n' "$out" | grep -c "^[0-9]*:[0-9]*${TAB}call${TAB}base::[A-Za-z_:]*${TAB}")
 [ "$n" -ge 1 ] && printf '%s\n' "$out" | head -1 | grep -q '^# compiler/src/base/mod.vl$' \
-    && printf '%s\n' "$out" | grep -q "^[0-9]*:[0-9]*${TAB}def${TAB}fn push(" && ok=1
+    && printf '%s\n' "$out" | grep -q "^[0-9]*:[0-9]*${TAB}def${TAB}pub fn push(" && ok=1
 check self_refs_in_file "$ok" "$(printf '%s\n' "$out" | head -5)"
 out=$("$COMPILER" query refs IntVec::push --in gvn --limit 5 2>&1)
 ok=0
@@ -237,7 +242,7 @@ check self_def_variant "$ok" "$out"
 out=$("$COMPILER" query items gvn 2>&1)
 ok=0
 printf '%s\n' "$out" | head -1 | grep -q "^# crate::middle::gvn${TAB}compiler/src/middle/gvn.vl\$" \
-    && printf '%s\n' "$out" | grep -q "^[0-9]*${TAB}fn${TAB}pub fn run_gvn(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool\$" && ok=1
+    && printf '%s\n' "$out" | grep -q "^[0-9]*${TAB}fn${TAB}pub fn run_gvn(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> bool\$" && ok=1
 check self_items "$ok" "$(printf '%s\n' "$out" | head -5)"
 # More than 5 definitions for show: their paths, and an error.
 out=$("$COMPILER" query show .name 2>&1)
@@ -277,32 +282,33 @@ ok=0
 check default_root "$ok" "$out"
 # std where there is no program (0.15): its API by `items std` (no
 # private item), an item by a name std defines. (0.20: all of it, past the
-# default budget: std::io comes after std::slice.)
+# default budget: std::io comes after std::slice. 0.28: the rust edition's
+# std, named until the edition is the only one.)
 mkdir -p "$WORK/empty"
 out=$(cd "$WORK/empty" && "$COMPILER" query items std --budget 40000 2>&1)
 ok=0
 [ "$(printf '%s\n' "$out" | wc -l)" -ge 100 ] && printf '%s\n' "$out" | head -1 | grep -q "^# std${TAB}<std>\$" \
-    && printf '%s\n' "$out" | grep -q "${TAB}pub fn read_line<A: Allocator>(line: inout String<A>) -> std::Result<bool, IoError>\$" \
+    && printf '%s\n' "$out" | grep -q "${TAB}pub fn read_line<A: Allocator>(&self, buf: &mut String<A>) -> Result<usize>\$" \
     && ! printf '%s\n' "$out" | grep -q 'fn malloc' && ok=1
 check std_items_no_program "$ok" "$(printf '%s\n' "$out" | head -5)"
 # (0.17: a name outside the prelude, which needs no `use`)
 out=$(cd "$WORK/empty" && "$COMPILER" query show FixedBuf::used 2>&1)
 ok=0
-printf '%s\n' "$out" | head -2 | grep -q '^// use std::FixedBuf;$' && ok=1
+printf '%s\n' "$out" | head -2 | grep -q '^// use std::alloc::FixedBuf;$' && ok=1
 check std_show_no_program "$ok" "$(printf '%s\n' "$out" | head -5)"
 
 # (0.17) In the repository, std's items are where its files have them,
 # every function of std checks with them, and the "add an X" queries
 # answer: `query examples` for every kind (its items still exist),
 # `query similar`.
-out=$("$COMPILER" query def std::trim 2>&1)
-loc=$(printf '%s\n' "$out" | awk -F "$TAB" '$1 == "std::trim" { print $2 }')
+out=$(env -u VOLE_STD_TREE "$COMPILER" query def str::trim 2>&1)
+loc=$(printf '%s\n' "$out" | awk -F "$TAB" '$1 == "str::trim" { print $2 }')
 ok=0
 case "$loc" in compiler/std/*.vl:*) ok=1 ;; esac
 check std_def_in_repo "$ok" "$out"
-out=$("$COMPILER" query show "${loc%:*}" 2>&1)
+out=$(env -u VOLE_STD_TREE "$COMPILER" query show "${loc%:*}" 2>&1)
 ok=0
-printf '%s\n' "$out" | head -1 | grep -q '^// std::trim' && ok=1
+printf '%s\n' "$out" | head -1 | grep -q '^// str::trim' && ok=1
 check std_show_by_file "$ok" "$(printf '%s\n' "$out" | head -3)"
 out=$("$COMPILER" check --std-tree compiler/std 2>&1)
 rc=$?
@@ -322,7 +328,7 @@ n=$("$COMPILER" query examples | wc -l)
 ok=0
 [ -z "$bad" ] && [ "$n" -ge 8 ] && ok=1
 check self_examples "$ok" "$n kinds; failing:$bad"
-out=$("$COMPILER" query similar std::trim crate::middle::fold::combine_not 2>&1)
+out=$("$COMPILER" query similar std::mem::swap crate::middle::fold::combine_not 2>&1)
 ok=0
 [ "$(printf '%s\n' "$out" | grep -c '^// 3 of [0-9]* fns like ')" = 2 ] && ok=1
 check self_similar "$ok" "$(printf '%s\n' "$out" | grep '^// ' | head -8)"
@@ -334,7 +340,10 @@ check self_similar "$ok" "$(printf '%s\n' "$out" | grep '^// ' | head -8)"
 # runtime's, nor std's statics: 0.20.0 names `vole.static.std.X` for a
 # static of a std submodule, which `query def` does not take back yet, a
 # 0.20.1 item; aarch64-linux's argv statics showed it; nor, 0.26.1, the
-# places IR's drop shims, `vole.$drop.T`: glue with no item of its own),
+# places IR's drop shims, `vole.$drop.T`: glue with no item of its own;
+# nor, 0.28.0, std2's methods of the integer types, `vole.Ty.max`: the
+# compiler's `#[builtin_impls]` text, `<builtin>`, which the tools do not
+# index yet),
 # each given to `query def` (positions and modules to `show` and `items`).
 cd "$HERE" || exit 2
 roundtrip() { # <program dir> <seed names...>
@@ -351,7 +360,7 @@ roundtrip() { # <program dir> <seed names...>
         "$COMPILER" query items 2>/dev/null | awk -F "$TAB" '{ print "items " $1; print "items " $2 }'
         "$COMPILER" check --diagnostics=short "$prog/main.vl" 2>&1 | awk '/^[^ ]*:[0-9]+:[0-9]+:/ { print "show " $1 }'
         "$COMPILER" "$prog/main.vl" -O0 -S -o "$WORK/rt.s" >/dev/null 2>&1 \
-            && awk '/^_?vole\.[^ \t]*:$/ && !/^_?vole\.rt\./ && !/^_?vole\.static\.std\./ && !/^_?vole\.\$drop\./ { sub(/:$/, ""); print "def " $0 }' "$WORK/rt.s"
+            && awk '/^_?vole\.[^ \t]*:$/ && !/^_?vole\.rt\./ && !/^_?vole\.static\.std\./ && !/^_?vole\.\$drop\./ && !/^_?vole\.T[asilhtjmyx]\./ { sub(/:$/, ""); print "def " $0 }' "$WORK/rt.s"
     } | sort -u >"$WORK/rt.names"
     : >"$WORK/rt.bad"
     n=0
@@ -368,4 +377,100 @@ roundtrip() { # <program dir> <seed names...>
 }
 roundtrip clash a::helper geom::V2::len main Shape::Circle MyVec::push
 roundtrip closures double apply main
+# (0.28.0) A set's text is the list its function may declare, no more
+# and no less (the effects' rule: the lists are honest). For each
+# function of program $1 named by a `//@ NAME` line, the answer of
+# `query effects NAME`, written there as `#[effects(..)]`, is accepted by
+# `volec check` (for target $2, or the host's), and the list without any
+# one of its words (an allocator of `alloc(..)` is a word) is refused
+# with an effect error. The set is the host's: where another target's
+# differs, its check says so here.
+effects_agree() { # <program dir> <host|TARGET>
+    prog=$1
+    target=
+    [ "$2" = host ] || target="--target $2"
+    mkdir -p "$WORK/ea"
+    : >"$WORK/ea.bad"
+    fns=0
+    lists=0
+    sed -n 's|^ *//@ ||p' "$prog/main.vl" >"$WORK/ea.names"
+    while IFS= read -r name; do
+        fns=$((fns + 1))
+        VOLE_CACHE=off "$COMPILER" query effects "$name" --root "$prog/main.vl" >"$WORK/ea.set" 2>&1
+        if [ "$(wc -l <"$WORK/ea.set")" -ne 1 ] || ! grep -q "$TAB" "$WORK/ea.set" \
+            || grep -q '(unknown)' "$WORK/ea.set"; then
+            echo "$name: query effects answered: $(head -3 "$WORK/ea.set")" >>"$WORK/ea.bad"
+            continue
+        fi
+        # (the lists: `=<TAB>LIST` the whole one, then `WORD<TAB>LIST`, LIST
+        # without WORD)
+        awk -F "$TAB" '
+            function list(skip,   i, a, s, t) {
+                a = ""
+                for (i = 1; i <= na; i++) {
+                    if (i != skip) a = a (a == "" ? "" : ", ") al[i]
+                }
+                s = (a == "" ? "" : "alloc(" a ")")
+                if (any && skip != -1) s = "alloc"
+                for (i = 1; i <= nw; i++) {
+                    if (na + i != skip) s = s (s == "" ? "" : ", ") w[i]
+                }
+                return s
+            }
+            {
+                t = $2
+                na = 0; nw = 0; any = 0
+                if (t ~ /^alloc\(/) {
+                    # (the allocators, split at the commas outside <..>)
+                    depth = 0; cur = ""
+                    for (i = 7; i <= length(t); i++) {
+                        c = substr(t, i, 1)
+                        if (c == "<") depth++
+                        if (c == ">") depth--
+                        if (c == ")" && depth == 0) break
+                        if (c == "," && depth == 0) { al[++na] = cur; cur = ""; i++; continue }
+                        cur = cur c
+                    }
+                    al[++na] = cur
+                    t = substr(t, i + 2)
+                } else if (t ~ /^alloc( |$)/) {
+                    any = 1
+                    t = substr(t, 7)
+                }
+                if (t != "none" && t != "") nw = split(t, w, " ")
+                print "=\t" list(0)
+                if (any) print "alloc\t" list(-1)
+                for (i = 1; i <= na; i++) print "alloc(" al[i] ")\t" list(i)
+                for (i = 1; i <= nw; i++) print w[i] "\t" list(na + i)
+            }' "$WORK/ea.set" >"$WORK/ea.lists"
+        while IFS="$TAB" read -r word list; do
+            lists=$((lists + 1))
+            awk -v name="$name" -v list="$list" '
+                /^ *\/\/@ / {
+                    t = $0
+                    sub(/^ *\/\/@ /, "", t)
+                    if (t == name) {
+                        sub(/\/\/@ .*/, "")
+                        print $0 "#[effects(" list ")]"
+                        next
+                    }
+                }
+                { print }' "$prog/main.vl" >"$WORK/ea/main.vl"
+            # shellcheck disable=SC2086
+            VOLE_CACHE=off "$COMPILER" check $target "$WORK/ea/main.vl" >"$WORK/ea.out" 2>&1
+            rc=$?
+            if [ "$word" = "=" ]; then
+                [ $rc -eq 0 ] || echo "$name: #[effects($list)], the query's answer, is refused: $(grep 'error' "$WORK/ea.out" | head -2)" >>"$WORK/ea.bad"
+            elif [ $rc -eq 0 ] || ! grep -q 'error\[effect\]' "$WORK/ea.out"; then
+                echo "$name: #[effects($list)], the query's answer without '$word', is not refused with an effect error: $(grep 'error' "$WORK/ea.out" | head -2)" >>"$WORK/ea.bad"
+            fi
+        done <"$WORK/ea.lists"
+    done <"$WORK/ea.names"
+    ok=0
+    [ "$fns" -ge 10 ] && [ "$lists" -gt "$fns" ] && [ ! -s "$WORK/ea.bad" ] && ok=1
+    check "effects_agree_${prog}_$2" "$ok" "$fns functions, $lists lists; $(cat "$WORK/ea.bad")"
+}
+effects_agree effagree host
+effects_agree effagree aarch64-linux
+effects_agree effagree x86_64-linux
 exit $STATUS

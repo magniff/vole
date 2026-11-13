@@ -7,31 +7,41 @@
 // (99) and keeps it, so a read of the old storage shows as 99.
 // (0.16: the tables are statics on an arena, set up in main; 0.26.3:
 // main's, reached through a static's address.)
-// FLAGS: --values=off
-// (0.17 rejects re-taking a static's view after a call that grows it,
-// own.static: err_own_static_readonly; --values=off keeps 0.16's
-// semantics, where the evaluation order is what keeps it right.)
+// (0.28, the rust edition: the tables are main's, on the Gpa, reached
+// through a static's address as plain bytes; every view is re-taken through
+// raw pointers, in unsafe, since the borrow checker refuses a view kept
+// across the call that moves its table: that the order holds there is the
+// point. The stores go through a `&mut [i64]` view of their own. A raw
+// pointer has no index: `*p.add(i)` is a method call, whose receiver is read
+// before its argument as in Rust, so the 0.14 raw-pointer rows are gone.)
+use std::alloc::Allocator;
 
-// (0.26.3: a static holds no allocator, alloc.static: the tables are
-// main's, in one struct on its arena, and reset and move_table reach them
-// through the address a static keeps, as plain bytes; the views and the
-// pointer the indexes read stay statics.)
 struct Tables<A: Allocator> {
     arena: A, v: Vec<i64, A>, old: Vec<Vec<i64, A>, A>, bytes: Vec<u8, A>,
+    oldb: Vec<Vec<u8, A>, A>,
 }
 
-static var TB: *u8 = 0 as *u8;
-static var S: [u8] = "";
-static var SS: [[u8]; 2] = ["", ""];
-static var P: *u8 = 0 as *u8;
+static mut TB: *mut u8 = 0 as *mut u8;
+static mut S: &[u8] = b"";
+static mut SS: [&[u8]; 2] = [b"", b""];
+static mut MT: *mut u8 = 0 as *mut u8;
 
-struct Table { view: [i64], pad: i64 }
+#[derive(Clone, Copy)] struct Table<'a> { view: &'a [i64], pad: i64 }
 
-fn tb() -> *Tables<Arena> {
-    TB as *Tables<Arena>
+// The view the stores go through (0.28: a `&[i64]` is not written through).
+struct Written<'a> { view: &'a mut [i64] }
+
+fn written() -> *mut Written<'static> {
+    // UNSAFE: a static mut read.
+    // SAFETY: one thread; MT is set once, first thing in main.
+    (unsafe { MT }) as *mut Written<'static>
 }
 
-fn reset(t: *Table) {
+fn tb() -> *mut Tables<Gpa> {
+    (unsafe { TB }) as *mut Tables<Gpa>
+}
+
+fn reset(t: *mut Table<'_>) {
     // UNSAFE: main's tables, through TB, and t's view.
     // SAFETY: TB is main's `tables`, set first and live for the whole run;
     // t is main's Table.
@@ -42,143 +52,128 @@ fn reset(t: *Table) {
         (*m).bytes = Vec::new_in((*m).arena);
         for x in 0..8 { (*m).bytes.push(20 + x as u8); }
         t.view = (*m).v.as_slice();
+        (*written()).view = std::slice::from_raw_parts_mut((*m).v.as_mut_ptr(), (*m).v.len());
         S = (*m).bytes.as_slice();
         SS[1] = (*m).bytes.as_slice();
-        P = (*m).bytes.as_slice().ptr;
     }
 }
 
 // Moves the tables (the old storage poisoned and kept), re-takes every
 // view of them; returns k.
-fn move_table(t: *Table, k: i64) -> i64 {
+fn move_table(t: *mut Table<'_>, k: i64) -> i64 {
     // UNSAFE: main's tables, through TB, and t's view.
     // SAFETY: as in reset.
     unsafe {
         let m = tb();
-        var w: Vec<i64, Arena> = Vec::new_in((*m).arena);
-        for x in (*m).v { w.push(x); }
-        for i in 0..(*m).v.len() { (*m).v.set(i, 99); }
-        (*m).old.push((*m).v);
-        (*m).v = w;
+        let mut w: Vec<i64, Gpa> = Vec::new_in((*m).arena);
+        for x in (*m).v.iter() { w.push(*x); }
+        for i in 0..(*m).v.len() { (*m).v[i] = 99i64; }
+        let tabs: &mut Tables<Gpa> = &mut *m;
+        tabs.old.push(std::mem::replace(&mut tabs.v, w));
         t.view = (*m).v.as_slice();
-        var b: Vec<u8, Arena> = Vec::new_in((*m).arena);
-        for x in (*m).bytes { b.push(x); }
-        for i in 0..(*m).bytes.len() { (*m).bytes.set(i, 99); }
-        (*m).bytes = b;
+        (*written()).view = std::slice::from_raw_parts_mut((*m).v.as_mut_ptr(), (*m).v.len());
+        let mut b: Vec<u8, Gpa> = Vec::new_in((*m).arena);
+        for x in (*m).bytes.iter() { b.push(*x); }
+        for i in 0..(*m).bytes.len() { (*m).bytes[i] = 99u8; }
+        tabs.oldb.push(std::mem::replace(&mut tabs.bytes, b));
         S = (*m).bytes.as_slice();
         SS[1] = (*m).bytes.as_slice();
-        P = (*m).bytes.as_slice().ptr;
     }
     k
 }
 
-fn via_param(t: *Table) -> i64 { unsafe { t.view[move_table(t, 2)] } }
+fn via_param(t: *mut Table<'_>) -> i64 { unsafe { t.view[move_table(t, 2) as usize] } }
 
 fn main(gpa: Gpa) -> i32 {
-    let arena = Arena::new_in(gpa);
-    var tables: Tables<Arena> = Tables {
+    let arena = gpa;
+    let mut tables: Tables<Gpa> = Tables {
         arena: arena, v: Vec::new_in(arena), old: Vec::new_in(arena),
-        bytes: Vec::new_in(arena),
+        bytes: Vec::new_in(arena), oldb: Vec::new_in(arena),
     };
     // UNSAFE: tables' address kept in the static, as bytes.
     // SAFETY: tables lives to the end of main, past every use of TB.
-    unsafe { TB = &tables as *Tables<Arena> as *u8; }
-    var out = String::new_in(gpa);
-    var t = Table { view: tables.v.as_slice(), pad: 0 };
-    reset(&t);
-    out.push_fmt(t.view[move_table(&t, 1)]);
-    reset(&t);
-    out.push(' ');
-    out.push_fmt(via_param(&t));
-    reset(&t);
-    t.view[move_table(&t, 3)] = 7;
-    out.push(' ');
-    out.push_fmt(tables.v.get(3));
-    reset(&t);
-    t.view[move_table(&t, 4)] += 100;
-    out.push(' ');
-    out.push_fmt(tables.v.get(4));
-    println(out.as_slice());
+    unsafe { TB = &mut tables as *mut Tables<Gpa> as *mut u8; }
+    let mut none = [0i64; 1];
+    let mut wr = Written { view: &mut none };
+    let w = &mut wr as *mut Written<'_>;
+    // UNSAFE: wr's address kept in the static, as bytes.
+    // SAFETY: wr lives to the end of main, past every use of MT.
+    unsafe { MT = w as *mut u8; }
+    let mut out = String::new_in(gpa);
+    let mut t = Table { view: tables.v.as_slice(), pad: 0 };
+    reset(&mut t);
+    std::fmt::write(&mut out, t.view[move_table(&mut t, 1) as usize]).unwrap();
+    reset(&mut t);
+    out.push(char::from_u32(' ' as u32).unwrap());
+    std::fmt::write(&mut out, via_param(&mut t)).unwrap();
+    reset(&mut t);
+    // UNSAFE: the written view is reached through the pointer the static keeps.
+    // SAFETY: w is main's `wr`, live here; move_table re-took its view.
+    unsafe { (*w).view[move_table(&mut t, 3) as usize] = 7; }
+    out.push(char::from_u32(' ' as u32).unwrap());
+    std::fmt::write(&mut out, tables.v[3usize]).unwrap();
+    reset(&mut t);
+    // UNSAFE: the written view is reached through the pointer the static keeps.
+    // SAFETY: w is main's `wr`, live here; move_table re-took its view.
+    unsafe { (*w).view[move_table(&mut t, 4) as usize] += 100; }
+    out.push(char::from_u32(' ' as u32).unwrap());
+    std::fmt::write(&mut out, tables.v[4usize]).unwrap();
+    println("{}", str::from_utf8(out.as_bytes()).unwrap());
     out.clear();
 
     // Slicing: the bounds, then the slice.
-    reset(&t);
-    out.push_fmt(S[move_table(&t, 1)..][0] as i64);
-    reset(&t);
-    out.push(' ');
-    out.push_fmt(S[..move_table(&t, 3)][2] as i64);
-    reset(&t);
-    out.push(' ');
-    out.push_fmt(S[move_table(&t, 1)..move_table(&t, 4)][1] as i64);
-    reset(&t);
-    out.push(' ');
-    out.push_fmt(t.view[move_table(&t, 2)..=5][0]);
-    reset(&t);
-    out.push(' ');
-    out.push_fmt(SS[1][move_table(&t, 5)] as i64);
-    reset(&t);
-    out.push(' ');
-    out.push_fmt(SS[1][move_table(&t, 5)..][1] as i64);
-    println(out.as_slice());
+    reset(&mut t);
+    std::fmt::write(&mut out, (unsafe { S[move_table(&mut t, 1) as usize..][0] } as i64)).unwrap();
+    reset(&mut t);
+    out.push(char::from_u32(' ' as u32).unwrap());
+    std::fmt::write(&mut out, (unsafe { S[..move_table(&mut t, 3) as usize][2] } as i64)).unwrap();
+    reset(&mut t);
+    out.push(char::from_u32(' ' as u32).unwrap());
+    std::fmt::write(&mut out,
+        (unsafe { S[move_table(&mut t, 1) as usize..move_table(&mut t, 4) as usize][1] } as i64)).unwrap();
+    reset(&mut t);
+    out.push(char::from_u32(' ' as u32).unwrap());
+    std::fmt::write(&mut out, t.view[move_table(&mut t, 2) as usize..=5][0]).unwrap();
+    reset(&mut t);
+    out.push(char::from_u32(' ' as u32).unwrap());
+    std::fmt::write(&mut out, (unsafe { SS[1][move_table(&mut t, 5) as usize] } as i64)).unwrap();
+    reset(&mut t);
+    out.push(char::from_u32(' ' as u32).unwrap());
+    std::fmt::write(&mut out, (unsafe { SS[1][move_table(&mut t, 5) as usize..][1] } as i64)).unwrap();
+    println("{}", str::from_utf8(out.as_bytes()).unwrap());
     out.clear();
 
     // A local view re-taken inside the index.
-    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
+    let mut v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for x in 0..4 { v.push(x); }
-    var s = v.as_slice();
+    let mut s = v.as_slice();
     let a = s[{
         for x in 0..1000 { v.push(x); }
         s = v.as_slice();
         3
-    }];
+    } as usize];
     let b = s[{
         for x in 0..1000 { v.push(x); }
         s = v.as_slice();
         1
-    } ..3][1];
-    out.push_fmt(a);
-    out.push(' ');
-    out.push_fmt(b);
-    println(out.as_slice());
+    } as usize..3][1];
+    std::fmt::write(&mut out, a).unwrap();
+    out.push(char::from_u32(' ' as u32).unwrap());
+    std::fmt::write(&mut out, b).unwrap();
+    println("{}", str::from_utf8(out.as_bytes()).unwrap());
     out.clear();
 
     // Vector loads and stores: s, the index, then s's pointer and length.
-    reset(&t);
-    out.push_fmt(v2i64::load(t.view, move_table(&t, 2)).sum());
-    reset(&t);
-    v2i64::splat(5).store(t.view, move_table(&t, 6));
-    out.push(' ');
-    out.push_fmt(tables.v.get(6) + tables.v.get(7));
-    println(out.as_slice());
+    reset(&mut t);
+    std::fmt::write(&mut out, (v2i64::load(t.view, move_table(&mut t, 2)).sum())).unwrap();
+    reset(&mut t);
+    v2i64::splat(5).store(t.view, move_table(&mut t, 6));
+    out.push(char::from_u32(' ' as u32).unwrap());
+    std::fmt::write(&mut out, (tables.v[6usize] + tables.v[7usize])).unwrap();
+    println("{}", str::from_utf8(out.as_bytes()).unwrap());
     out.clear();
-
-    // Raw pointers (unsafe code) the same: the pointer is read after the index.
-    reset(&t);
-    out.push_fmt(unsafe { P[move_table(&t, 3)] } as i64);
-    reset(&t);
-    unsafe { P[move_table(&t, 0)] = 1; }
-    out.push(' ');
-    out.push_fmt(tables.bytes.get(0) as i64);
-    reset(&t);
-    unsafe { P[move_table(&t, 1)] += 1; }
-    out.push(' ');
-    out.push_fmt(tables.bytes.get(1) as i64);
-    reset(&t);
-    out.push(' ');
-    out.push_fmt(unsafe { P[move_table(&t, 2)..move_table(&t, 4)] } [1] as i64);
-    var q = tables.bytes.as_slice().ptr;
-    out.push(' ');
-    out.push_fmt(unsafe {
-        q[{
-            move_table(&t, 0);
-            q = tables.bytes.as_slice().ptr;
-            5
-        }]
-    } as i64);
-    println(out.as_slice());
-    // (--values=off: nothing drops)
-    v.free();
-    out.free();
+    drop(v);
+    drop(out);
     0
 }
 
@@ -186,4 +181,3 @@ fn main(gpa: Gpa) -> i32 {
 // EXPECT: 21 22 22 12 25 26
 // EXPECT: 3 2
 // EXPECT: 25 10
-// EXPECT: 23 1 22 23 25

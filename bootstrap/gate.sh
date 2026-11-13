@@ -51,8 +51,9 @@
 # fuzz-generics, fuzz-pressure, fuzz-calls, fuzz-lang06, fuzz-vector,
 # fuzz-div, fuzz-range, fuzz-arch (0.19: intrinsics), fuzz-guard (0.25:
 # guarded accesses, never run where the program does not), fuzz-seed
-# (against the Rust seed), fuzz-sem (0.25: value semantics, drops and
-# leaks against tools/semfuzz/semfuzz.py's model); abi-plain,
+# (against the Rust seed; 0.25 to 0.27: fuzz-sem, value semantics, drops
+# and leaks against a model, whose programs were the old edition's: its
+# port to the rust edition is 0.29's); abi-plain,
 # abi-import, abi-header; objcheck; layout (tests/cimport/layout.sh); debug (tests/debug.sh);
 # objcheck-x86-arch (0.19: the std::arch cases for x86_64-macos, compiled
 # and assembled both ways, nothing run);
@@ -67,10 +68,15 @@
 # unsafe-audit (tests/unsafe_audit.sh, 0.25.3: the unsafe sites of
 # compiler/src and std without // UNSAFE: and // SAFETY:, `volec query
 # unsafe`, no more than docs/unsafe-baseline.md counts; --quick too);
+# mvs-census (tools/mvs-census.py --no-allow, 0.28.0: nothing in the tree
+# is read as the old edition or names one: no program, generator, guide
+# topic or Book chapter in it, no `// EDITION:` line but the ones the
+# previous release reads, no use of the edition option; 0 entries, no
+# allow-list; --quick too);
 # borrowck-twin (tools/borrowck-twin.sh, 0.27.1: every rust_b_ case's
 # verdict against rustc's, accept or reject, and its code; a divergence
 # only when the case names its class; skipped without rustc; --quick too);
-# std2-check (tests/std2/check.sh, 0.27.2, borrowck.md Z7: every std2 body
+# std2-check (tests/std/check.sh, 0.27.2, borrowck.md Z7: every std2 body
 # type-checked and solved by the borrow checker, 0 errors; 0.27.2.1: with
 # suite-O0 in the gate, only the std2 cases that row did not pass are
 # compiled again);
@@ -98,17 +104,6 @@
 # chain-fresh (bootstrap/chain-fresh.sh: the seed and every release
 # rebuilt from their tags into an empty cache, compared with
 # bootstrap/chain-hashes/, 0.25; --release);
-# translate (tests/translate.sh, 0.27.3, gate 2: the examples, bench and
-# tests/run's MVS run cases translated by `volec fix --edition rust`,
-# built in the rust edition and run, against the MVS output; one count per
-# set and the total, and the rustc twin of what round-trips (the stable
-# shim, tools/rustc-twin/); informational until 0.27.4: it prints both
-# N's and never fails; --release);
-# gate3 (tests/gate3.sh, 0.27.4, gate 3: a copy of compiler/src
-# translated by `volec fix --edition rust` and checked in the rust
-# edition, its N errors by code; informational, N goes into every
-# release's notes and 0.28 starts at 0: it fails only when the translator
-# or the check cannot run; --release);
 # linux-x86_64 (bootstrap/linux-check.sh); linux-aarch64
 # (bootstrap/aarch64-linux-check.sh: in the container, the fixpoint,
 # the suite at -O0 and -O2 (0.25.2: not -O1; the optimizer is the same
@@ -247,22 +242,15 @@ case "$MODE" in
     default) FZ=30; AB=30; XFZ=25; XAB=20; AFZ=100; AAB=60 ;;
     release) FZ=60; AB=100; XFZ=50; XAB=40; AFZ=300; AAB=150 ;;
 esac
-# (0.25) fuzz-sem's programs (tools/semfuzz/semfuzz.py: value semantics
-# against its own model; each program is built five times)
-case "$MODE" in
-    quick) SFZ=20 ;;
-    default) SFZ=60 ;;
-    release) SFZ=300 ;;
-esac
-[ -z "$FUZZ_N" ] || { FZ=$FUZZ_N; XFZ=$FUZZ_N; AFZ=$FUZZ_N; SFZ=$FUZZ_N; }
+[ -z "$FUZZ_N" ] || { FZ=$FUZZ_N; XFZ=$FUZZ_N; AFZ=$FUZZ_N; }
 [ -z "$ABI_N" ] || { AB=$ABI_N; XAB=$ABI_N; AAB=$ABI_N; }
 
-FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-guard fuzz-seed fuzz-sem"
+FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-guard fuzz-seed"
 ABI_STEPS="abi-plain abi-import abi-header"
-HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost unsafe-audit borrowck-twin std2-check std2-tests cachediff"
+HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost unsafe-audit mvs-census borrowck-twin std2-check std2-tests cachediff"
 # (0.25) the chain's integrity, by --release (or --only): slow, and they
 # rebuild compilers rather than test one
-RELEASE_STEPS="chain-diverse chain-fresh translate gate3"
+RELEASE_STEPS="chain-diverse chain-fresh"
 LINUX_STEPS="linux-x86_64 linux-aarch64"
 # (0.25.2) --quick's container row, and the steps it runs in the
 # container (gate.sh --inside --only 'smoke-*'; run_step says what they
@@ -276,7 +264,7 @@ OTHER_STEPS="valgrind $INSIDE_SMOKE_STEPS"
 [ "$X86" = 1 ] || LINUX_STEPS="linux-aarch64"
 case "$MODE" in
     quick)
-        STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch voltty-fuzz compile-cost unsafe-audit borrowck-twin std2-tests cachediff"
+        STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch voltty-fuzz compile-cost unsafe-audit mvs-census borrowck-twin std2-tests cachediff"
         [ $LINUX -eq 1 ] && STEPS="$SMOKE_STEPS $STEPS" ;;
     *) STEPS="$HOST_STEPS"; [ $LINUX -eq 1 ] && STEPS="$STEPS $LINUX_STEPS" ;;
 esac
@@ -436,7 +424,7 @@ self_test() {
     if [ $st_failed -eq 0 ]; then echo "gate: self-test: ok"; else echo "gate: self-test: FAIL (outputs in $st)"; trap - EXIT; fi
     exit $st_failed
 }
-[ $SELF_TEST -eq 0 ] || self_test
+[ "${SELF_TEST:-0}" -eq 0 ] || self_test
 
 # ---- One gate at a time ----
 
@@ -653,10 +641,6 @@ run_step() {
         # 0.25.2.1: and with --try-args (arguments that may return, `?`
         # or a match's arm, in calls whose result is `?`'d); 0.25.3: and
         # with --closure-params (closures taking a T by value)
-        fuzz-sem) python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" \
-            && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --assign-calls \
-            && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --try-args \
-            && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --closure-params ;;
         fuzz-seed)
             seed=$(find_seed)
             if [ -z "$seed" ]; then
@@ -680,6 +664,8 @@ run_step() {
         incremental) sh "$ROOT/tests/incremental.sh" -c "$C" ;;
         # (0.25.3) the unsafe sites without justification, against the baseline
         unsafe-audit) sh "$ROOT/tests/unsafe_audit.sh" -c "$C" ;;
+        # (0.28.0) nothing in the tree is read as the old edition
+        mvs-census) python3 "$ROOT/tools/mvs-census.py" --no-allow ;;
         # (0.25.3) the tools' answers from their cache, every transcript
         cachediff) sh "$ROOT/tests/cachediff/run.sh" -c "$C" -j 4 ;;
         # (0.27.1) the borrow checker's corpus against rustc's verdicts
@@ -689,9 +675,9 @@ run_step() {
             # (0.27.2.1) the cases' part from the suite-O0 row's builds of
             # them when this gate runs that row (suite_results)
             if r=$(suite_results 0 std2-check); then
-                sh "$ROOT/tests/std2/check.sh" -c "$C" -r "$r"
+                sh "$ROOT/tests/std/check.sh" -c "$C" -r "$r"
             else
-                sh "$ROOT/tests/std2/check.sh" -c "$C"
+                sh "$ROOT/tests/std/check.sh" -c "$C"
             fi ;;
         std2-tests)
             # (0.27.2, gate 1) std2's cases at -O0 and -O2: the runner builds
@@ -754,15 +740,6 @@ run_step() {
             previous=$(find_previous_release)
             sh "$ROOT/bootstrap/chain-diverse.sh" ${previous:+-p "$previous"} -w "$RUN/chain-diverse" ;;
         chain-fresh) sh "$ROOT/bootstrap/chain-fresh.sh" -w "$RUN/chain-fresh" --history "$HISTORY" ;;
-        translate)
-            # (0.27.3, gate 2) informational until 0.27.4: the count, never
-            # a failure; with the stable shim's rustc twin of what round-trips
-            # (tools/rustc-twin/; --alloc-api is a manual mode)
-            sh "$ROOT/tests/translate.sh" -c "$C" -j 4 --twin || true ;;
-        gate3)
-            # (0.27.4, gate 3) informational: N, the errors the rust-edition
-            # check finds in the translated copy of compiler/src, by code
-            sh "$ROOT/tests/gate3.sh" -c "$C" -k "$RUN/gate3" ;;
         compile-cost)
             previous=$(find_previous_release)
             sh "$ROOT/tests/compile_cost.sh" -c "$C" ${previous:+-p "$previous"} ;;
@@ -1192,8 +1169,8 @@ note_of() {
     case "$1" in
         chain) awk '/^  head / { sub(/^  head +/, ""); print; exit }' "$l" ;;
         suite-*|smoke-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed%s\n", $2, $3, $4, ($5 > 0 ? ", " $5 " SKIPPED" : "") }' "$l" ;;
-        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*|unsafe-audit|borrowck-twin|std2-check|std2-tests|cachediff|translate|gate3)
-            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh|unsafe-audit|borrowck-twin|std2-check|std2-tests|cachediff|translate|gate3):' "$l" | tail -1 ;;
+        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*|unsafe-audit|mvs-census|borrowck-twin|std2-check|std2-tests|cachediff)
+            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh|unsafe-audit|census|borrowck-twin|std2-check|std2-tests|cachediff):' "$l" | tail -1 ;;
         voltty-fuzz) grep -E '^(pass|FAIL|skip) oracle' "$l" | tail -1 ;;
         compile-cost) awk '$2 ~ /^[0-9.]+$/ && $3 == "M" { printf "%s%s %s M %s", sep, $1, $2, $8; sep = ", " } END { print "" }' "$l" ;;
         # (no rows: it failed before the container's steps, e.g. docker)
