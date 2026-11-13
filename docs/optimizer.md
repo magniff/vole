@@ -3129,3 +3129,21 @@ self-build stays about 18% above 0.28.0's 107 G: what the summary can
 give grows with each raw table that becomes a Vec, and a check whose
 index is data (an operand read from an instruction) stays a compare
 and a branch whatever is known of the header.
+
+## 0.29: the inliner's decisions, logged
+
+`VOLE_INLINE_LOG=FILE volec --no-cache -j1 ...` writes a line for each
+call the -O2 inliner decides (`middle/inline.vl`: `should_inline` asks
+`inline_rule`, which names the rule that decided, and `log_decision`
+writes it): the caller, the callee, the callee's size, the rule (`hint`,
+`tiny`, `closure-once`, `cold-free`, `once`, `hot`, `small`, or
+`no:returns-twice`, `no:never-or-cold-fn`, `no:caller-big`, `no:budget`,
+`no:cold-site`, `no:big`), the site's loop depth, the caller's size
+then, the level of the caller's component, the program's size as the
+component sees it, and the budget. One thread and no code cache, so the
+lines are in the same order in every build of the same program (a cached
+function is not optimized, and decides nothing); the decisions
+themselves do not depend on the number of threads. `tools/inline-log-diff.py
+A.log B.log` compares two: totals by rule, where the budget was first
+found spent, the levels, callees and callers that differ, and with
+`-f CALLER` one caller's decisions.
