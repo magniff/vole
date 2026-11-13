@@ -6238,8 +6238,11 @@ at a time. Now the gate schedules its steps:
   runs.
 - **A step that is no runner holds slots of the pool while it runs**, for
   the work of it that would take none: one for a serial step (`layout`,
-  `debug`, `voltty-fuzz`, `compile-cost`, `unsafe-audit`, `mvs-census`,
-  `borrowck-twin`); four for `cachediff` and `std2-check` (their own
+  `debug`, `voltty-fuzz`, `compile-cost`, `unsafe-audit`,
+  `borrowck-twin`; 0.28.0's `mvs-census` row is gone in 0.29 with
+  tools/mvs-census.py: it counted what the tree still read as the old
+  edition or named one, was 0 at 0.28.0, and 0.29 removed the option
+  and the line it watched for, so its job is done); four for `cachediff` and `std2-check` (their own
   `-j`; cachediff is given the number it holds); all of them for
   `chain-diverse` and `chain-fresh`; and two for a suite row and
   `stress-grow`, for the runners a suite starts beside its cases (one at

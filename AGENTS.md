@@ -15,11 +15,7 @@ your build does not). For an example or a test alone either one does.
 
 **There is one language, with Rust's surface** (0.28.0; `target/volec
 guide rust`: where vole differs from Rust): `&T`, `&mut T`, `let mut`,
-`&'static [u8]`, Rust's meanings. An `// EDITION: rust` line is a
-comment: write it in no new file (the bootstrap's 0.27.8 still reads it
-in compiler/src/main.vl, the one file that keeps it); `--edition rust`
-is accepted and ignored (deprecated: it goes in 0.29); an error code
-`edition.*` is an ordinary error (renamed in 0.29). A static of
+`&'static [u8]`, Rust's meanings. A static of
 compiler/src is read and written only through its accessors at its
 file's end (`get_x()`, `set_x(v)`); their `unsafe` blocks' UNSAFE:/
 SAFETY: lines (from the review in tools/statics/statics.tsv, with

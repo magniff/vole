@@ -675,7 +675,7 @@ fn main() -> i32 { let mut q = 1i64; bump(q); q as i32 }
 error[type error] expected '&mut i64', got 'i64'
 ```
 `bump(&mut q)`: the call shows what may change. Where a `&T` goes, a
-value is `edition.lenient: 'q' is a value where a reference goes`: pass
+value is `type.ref-value: 'q' is a value where a reference goes`: pass
 `&q`.
 
 ```vole

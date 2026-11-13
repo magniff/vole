@@ -96,7 +96,7 @@ def directives(path):
             d["csource"] += value.split()
         elif key == "FLAGS":
             d["flags"] += value.split()
-        elif key in ("ARGS", "SOURCE", "CHEADER", "EDITION"):
+        elif key in ("ARGS", "SOURCE", "CHEADER"):
             d[key.lower()] = value.strip() if key != "ARGS" else value
         elif key == "TIMEOUT":
             try:
