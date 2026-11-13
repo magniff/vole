@@ -4,6 +4,8 @@
 // do not know themselves. compiler/arch/README.md gives the formats; a
 // malformed line is an internal error (the tables are the compiler's).
 
+use std::sync::atomic::{Atomic, Ordering};
+
 use crate::arch::{
     ARCH_AARCH64, ARCH_PORTABLE, ARCH_X86_64, FEAT_DETECT, FEAT_HAS, FIELD_COUNT, FORM_BITS,
     FORM_CAST, FORM_FEAT, FORM_HINT, FORM_INTR, FORM_INTR_MEM, FORM_LOAD, FORM_LOAD_DUP, FORM_STORE,
@@ -13,22 +15,14 @@ use crate::arch::{
 };
 use crate::arch::features::feature_bit_in;
 use crate::arch::tables::{insn_a64_source, insn_x86_source, intrinsics_source};
-use crate::back::objfile::{NameMap, name_get, name_put};
-use crate::base::{IntVec, buf_at, buf_done, buf_freeze, buf_len, buf_new, buf_ptr, die, intern};
+use crate::base::{buf_done, buf_new, die, intern};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::target::get_x86;
+use crate::front::lexer::find_byte;
 use crate::middle::ir::{BITS_LEADING, BITS_ONES, BITS_TRAILING, Cond, Op};
 
 const PARAM_WIDTH: i64 = 5;
-
-// UNSAFE: C's memchr, which finds a field's or a line's end in the embedded instruction table.
-// SAFETY: the declaration is memchr's C prototype on the targets vole builds for (64-bit macOS
-// and Linux: int is i32, size_t u64, long and long long i64, a pointer 8 bytes); what a call
-// must hold (n readable bytes at s) is said at the call.
-extern "C" {
-    fn memchr(s: *mut u8, c: i32, n: u64) -> *mut u8;
-}
 
 pub fn param_entry(p: i64, k: i64, pcx: &Ctx<Comp>) -> i64 {
     (pcx.params[(p * PARAM_WIDTH + k) as usize])
@@ -41,7 +35,7 @@ pub fn param_type_text(p: i64, pcx: &Ctx<Comp>) -> &[u8] {
 }
 
 fn byte(i: i64, pcx: &Ctx<Comp>) -> u8 {
-    unsafe { (*pcx.table_text.add(i as usize)) }
+    pcx.table_text[i as usize]
 }
 
 fn text(a: i64, b: i64, pcx: &Ctx<Comp>) -> &'static [u8] {
@@ -121,75 +115,70 @@ fn trim_end(a: i64, b: i64, pcx: &Ctx<Comp>) -> i64 {
 }
 
 // Splits the line [a, b) at " | " into FIELDS (want fields); false when it
-// has another count. (0.25: the '|'s found by memchr)
+// has another count. (0.25: the '|'s found by find_byte)
 fn split_fields(a: i64, b: i64, want: i64, pcx: &mut Ctx<Comp>) -> bool {
-    unsafe {
-        let t = pcx.table_text;
-        let mut start = a;
-        let mut n: i64 = 0;
-        while true {
-            // (the next " | " from start, else b)
-            let mut sep = b;
-            let mut q = start + 1;
-            while q + 1 < b {
-                let bar = memchr(t.add(q as usize), b'|' as i32, (b - 1 - q) as u64);
-                if bar == 0 as *mut u8 {
-                    break;
-                }
-                q += bar as i64 - (t.add(q as usize)) as i64;
-                if (*t.add((q - 1) as usize)) == b' ' && (*t.add((q + 1) as usize)) == b' ' {
-                    sep = q - 1;
-                    break;
-                }
-                q += 1;
+    let t = pcx.table_text;
+    let mut start = a;
+    let mut n: i64 = 0;
+    loop {
+        // (the next " | " from start, else b)
+        let mut sep = b;
+        let mut q = start + 1;
+        while q + 1 < b {
+            match find_byte(&t[q as usize..(b - 1) as usize], b'|') {
+                Some(at) => q += at as i64,
+                None => break,
             }
-            pcx.table_fields.push(trim_start(start, sep, pcx));
-            pcx.table_fields.push(trim_end(start, sep, pcx));
-            n += 1;
-            if sep == b {
+            if t[(q - 1) as usize] == b' ' && t[(q + 1) as usize] == b' ' {
+                sep = q - 1;
                 break;
             }
-            start = sep + 3;
+            q += 1;
         }
-        n == want
+        pcx.table_fields.push(trim_start(start, sep, pcx));
+        pcx.table_fields.push(trim_end(start, sep, pcx));
+        n += 1;
+        if sep == b {
+            break;
+        }
+        start = sep + 3;
     }
+    n == want
 }
 
 // The table, parsed on the first call.
 pub fn load_table(pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if pcx.table_buf >= 0 {
-            return;
+    if pcx.table_buf >= 0 {
+        return;
+    }
+    pcx.table_buf = buf_new();
+    intrinsics_source(pcx.table_buf);
+    // (0.27.7: written once, here, then frozen: its bytes are never moved
+    // or written again, so table_text and the readers' views stay valid)
+    let t = buf_done(pcx.table_buf);
+    pcx.table_text = t;
+    init_name_table(pcx);
+    let len = t.len() as i64;
+    let mut arch = ARCH_PORTABLE;
+    let mut a: i64 = 0;
+    while a < len {
+        // (the end of the line, by find_byte)
+        let b = match find_byte(&t[a as usize..], b'\n') {
+            Some(at) => a + at as i64,
+            None => len,
+        };
+        if byte(a, pcx) == b'=' {
+            arch = if is(a + 2, b, b"aarch64", pcx) { ARCH_AARCH64 }
+                else if is(a + 2, b, b"x86_64", pcx) { ARCH_X86_64 } else { ARCH_PORTABLE };
+        } else {
+            parse_intrinsic(a, b, arch, pcx);
         }
-        pcx.table_buf = buf_new();
-        intrinsics_source(pcx.table_buf);
-        // (0.27.7: written once, here; its bytes are then never moved or
-        // written, so table_text and the readers' views stay valid)
-        buf_freeze(pcx.table_buf);
-        init_name_table(pcx);
-        let len = buf_len(pcx.table_buf);
-        let t = buf_ptr(pcx.table_buf);
-        pcx.table_text = t;
-        let mut arch = ARCH_PORTABLE;
-        let mut a: i64 = 0;
-        while a < len {
-            // (the end of the line, by memchr)
-            let nl = memchr(t.add(a as usize), b'\n' as i32, (len - a) as u64);
-            let b = if nl == 0 as *mut u8 { len }
-                else { a + (nl as i64 - (t.add(a as usize)) as i64) };
-            if byte(a, pcx) == b'=' {
-                arch = if is(a + 2, b, b"aarch64", pcx) { ARCH_AARCH64 }
-                    else if is(a + 2, b, b"x86_64", pcx) { ARCH_X86_64 } else { ARCH_PORTABLE };
-            } else {
-                parse_intrinsic(a, b, arch, pcx);
-            }
-            a = b + 1;
-        }
-        crate::arch::template::reserve_slot_names(pcx);
-        for id in 0..pcx.intrs.len() as i64 {
-            if (pcx.intrs[id as usize]).form == FORM_INTR_MEM {
-                link_parts(id, pcx);
-            }
+        a = b + 1;
+    }
+    crate::arch::template::reserve_slot_names(pcx);
+    for id in 0..pcx.intrs.len() as i64 {
+        if (pcx.intrs[id as usize]).form == FORM_INTR_MEM {
+            link_parts(id, pcx);
         }
     }
 }
@@ -502,64 +491,85 @@ fn parse_memory(id: i64, a: i64, b: i64, pcx: &mut Ctx<Comp>) {
 // (INSN_WIDTH each). Loaded by the front end (load_insns, from
 // virtual.vl) when a program names std::arch; read-only after.
 
-static mut INSN_BUF: i64 = -1;
-static mut INSN_BY_NAME: NameMap = NameMap {
-    ptrs: 0 as *mut i64, lens: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0,
-};
-static mut INSN_FIELDS: IntVec = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-// (0.27.8) The tables' text, a view of INSN_BUF's bytes taken when they
-// are loaded (by the front end, before the assembler's thread starts):
-// insn_text reads it, not BUFS, which the main thread grows meanwhile
-// (gen0's messages at -O0, buf_new); the bytes never change or move after.
-static mut INSN_TEXT: &[u8] = b"";
 const INSN_WIDTH: i64 = 12;
 
-fn insn_byte(i: i64) -> u8 {
-    buf_at(get_insn_buf(), i)
+// The loaded tables: their text (a frozen buffer's bytes), each line's
+// fields (INSN_WIDTH entries: a start and an end in the text, a field)
+// and, sorted by mnemonic, the first line of each. Made once by
+// load_insns and never changed or freed after.
+struct InsnTable {
+    text: &'static [u8], fields: &'static [i64], by_name: &'static [i64],
+}
+
+// The address of the loaded tables, null before load_insns. An atomic:
+// the front end stores it (Release) before code generation starts any
+// thread, and the assembler, on a thread of its own at -O0, loads it
+// (Acquire).
+static INSNS: Atomic<*mut InsnTable> = Atomic::new(0 as *mut InsnTable);
+
+// The loaded tables, or None before load_insns (no program named
+// std::arch).
+fn insns() -> Option<&'static InsnTable> {
+    let table = INSNS.load(Ordering::Acquire);
+    if table == 0 as *mut InsnTable {
+        return None;
+    }
+    // UNSAFE: the tables are published as an address (an atomic holds no
+    // reference), read here through it
+    // SAFETY: a non-null INSNS is the address load_insns stored, of an
+    // InsnTable in a block of its own that `leak` gave the process's life;
+    // it was filled before the address was stored (Release, loaded with
+    // Acquire) and nothing writes or frees it after, so a shared
+    // reference for 'static is true
+    Some(unsafe { &*table })
+}
+
+// The mnemonic of instruction line k of a table's fields.
+fn insn_mnemonic(text: &'static [u8], fields: &[i64], k: i64) -> &'static [u8] {
+    let at = (k * INSN_WIDTH) as usize;
+    &text[fields[at] as usize..fields[at + 1] as usize]
 }
 
 pub fn load_insns() {
-    if get_insn_buf() >= 0 {
+    if insns().is_some() {
         return;
     }
     // (the target's table only: the two architectures share mnemonics,
     // crc32b among them; set_target runs before the modules load)
-    set_insn_buf(buf_new());
+    let buf = buf_new();
     if get_x86() {
-        insn_x86_source(get_insn_buf());
+        insn_x86_source(buf);
     } else {
-        insn_a64_source(get_insn_buf());
+        insn_a64_source(buf);
     }
-    // (0.29: written once, here, then frozen: INSN_TEXT and the
-    // mnemonics INSN_BY_NAME keeps are views of it for the process)
-    buf_freeze(get_insn_buf());
-    let len = buf_len(get_insn_buf());
+    // (0.29: written once, here, then frozen: the table's text is a view
+    // of it for the process)
+    let text = buf_done(buf);
+    let len = text.len() as i64;
+    let mut fields: Vec<i64, Comp> = Vec::new_in(Comp {});
     let mut a: i64 = 0;
     while a < len {
         let mut b = a;
-        while b < len && insn_byte(b) != b'\n' {
+        while b < len && text[b as usize] != b'\n' {
             b += 1;
         }
-        let base = get_insn_fields().len() as i64;
         let mut start = a;
         let mut n: i64 = 0;
         let mut i = a;
         while i <= b && n < INSN_WIDTH / 2 {
-            let at_sep = i + 2 < b && insn_byte(i) == b' ' && insn_byte(i + 1) == b'|'
-                && insn_byte(i + 2) == b' ';
+            let at_sep = i + 2 < b && text[i as usize] == b' ' && text[(i + 1) as usize] == b'|'
+                && text[(i + 2) as usize] == b' ';
             if i == b || at_sep {
                 let mut s = start;
-                while s < i && insn_byte(s) == b' ' {
+                while s < i && text[s as usize] == b' ' {
                     s += 1;
                 }
                 let mut e = i;
-                while e > s && insn_byte(e - 1) == b' ' {
+                while e > s && text[(e - 1) as usize] == b' ' {
                     e -= 1;
                 }
-                { let mut insn_fields_copy = get_insn_fields(); insn_fields_copy.push(s);
-                    set_insn_fields(insn_fields_copy); }
-                { let mut insn_fields_copy = get_insn_fields(); insn_fields_copy.push(e);
-                    set_insn_fields(insn_fields_copy); }
+                fields.push(s);
+                fields.push(e);
                 n += 1;
                 if i == b {
                     break;
@@ -571,46 +581,74 @@ pub fn load_insns() {
             i += 1;
         }
         while n < INSN_WIDTH / 2 {
-            { let mut insn_fields_copy = get_insn_fields(); insn_fields_copy.push(b);
-                set_insn_fields(insn_fields_copy); }
-            { let mut insn_fields_copy = get_insn_fields(); insn_fields_copy.push(b);
-                set_insn_fields(insn_fields_copy); }
+            fields.push(b);
+            fields.push(b);
             n += 1;
-        }
-        // (a mnemonic of several lines: its first, the encoder tries the
-        // next ones)
-        let mn = &buf_done(get_insn_buf())[
-            (get_insn_fields()[base as usize]) as usize..(
-                get_insn_fields()[(base + 1) as usize]) as usize];
-        if name_get(get_insn_by_name(), mn) == 0 {
-            { let mut insn_by_name_copy = get_insn_by_name();
-                name_put(&mut insn_by_name_copy, mn, base / INSN_WIDTH + 1);
-                set_insn_by_name(insn_by_name_copy); }
         }
         a = b + 1;
     }
-    set_insn_text(
-        buf_done(get_insn_buf()));
+    // (a mnemonic of several lines: its first, the encoder tries the next
+    // ones; the sort keeps equal mnemonics in the lines' order)
+    let lines = fields.len() as i64 / INSN_WIDTH;
+    let mut order: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for k in 0..lines {
+        order.push(k);
+    }
+    order.sort_by(|x, y| {
+        insn_mnemonic(text, &fields, *x).cmp(insn_mnemonic(text, &fields, *y)).then(x.cmp(y))
+    });
+    let mut by_name: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for i in 0..order.len() {
+        if i == 0
+            || insn_mnemonic(text, &fields, order[i])
+            != insn_mnemonic(text, &fields, order[i - 1]) {
+            by_name.push(order[i]);
+        }
+    }
+    let fields: &'static [i64] = fields.leak();
+    let by_name: &'static [i64] = by_name.leak();
+    let table: &'static mut InsnTable =
+        Box::leak(Box::new_in(InsnTable { text, fields, by_name }, Comp {}));
+    INSNS.store(table as *mut InsnTable, Ordering::Release);
 }
 
 // The line of mnemonic `name` in the instruction tables, or -1 (also
 // before the front end loaded them: no program named std::arch).
 pub fn insn_named(name: &[u8]) -> i64 {
-    if get_insn_buf() < 0 {
-        return -1;
+    let t = match insns() {
+        Some(t) => t,
+        None => return -1,
+    };
+    let mut lo: usize = 0;
+    let mut hi = t.by_name.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let have = insn_mnemonic(t.text, t.fields, t.by_name[mid]);
+        if have == name {
+            return t.by_name[mid];
+        }
+        if have < name {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
     }
-    name_get(get_insn_by_name(), name) - 1
+    -1
 }
 
 // Field f of instruction line k, as text.
 pub fn insn_text(k: i64, f: i64) -> &'static [u8] {
+    let t = match insns() {
+        Some(t) => t,
+        None => return b"",
+    };
     // (past the last line: no mnemonic, which ends a run of lines)
-    if k < 0 || (k + 1) * INSN_WIDTH > get_insn_fields().len() as i64 {
+    if k < 0 || (k + 1) * INSN_WIDTH > t.fields.len() as i64 {
         return b"";
     }
-    let s = (get_insn_fields()[(k * INSN_WIDTH + 2 * f) as usize]);
-    let e = (get_insn_fields()[(k * INSN_WIDTH + 2 * f + 1) as usize]);
-    &get_insn_text()[s as usize..e as usize]
+    let s = t.fields[(k * INSN_WIDTH + 2 * f) as usize];
+    let e = t.fields[(k * INSN_WIDTH + 2 * f + 1) as usize];
+    &t.text[s as usize..e as usize]
 }
 
 // Field f of instruction line k as a hexadecimal number (`0x2e202c00`,
@@ -634,112 +672,4 @@ pub fn insn_hex(k: i64, f: i64) -> i64 {
         i += 1;
     }
     v
-}
-
-// (0.28.0) INSN_BUF's accessors: every use of it is one of them.
-fn get_insn_buf() -> i64 {
-    // UNSAFE: the instruction tables' buffer id, a process-wide static mut
-    // the assembler thread reads; Rust has no safe access to a static mut
-    // SAFETY: written only by load_insns (once: it returns when INSN_BUF >=
-    // 0), on the main thread in the front end (build -> load_modules ->
-    // load_arch_modules) or in volec assemble, both before code generation
-    // starts any thread (pool_start, asm_thread_start come later in
-    // compile_program); every later access is a read. (The value is safe;
-    // reading the buffer it names through base::BUFS is not: see BUFS's
-    // race row)
-    unsafe { INSN_BUF }
-}
-
-fn set_insn_buf(v: i64) {
-    // UNSAFE: the instruction tables' buffer id, a process-wide static mut
-    // the assembler thread reads; Rust has no safe access to a static mut
-    // SAFETY: written only by load_insns (once: it returns when INSN_BUF >=
-    // 0), on the main thread in the front end (build -> load_modules ->
-    // load_arch_modules) or in volec assemble, both before code generation
-    // starts any thread (pool_start, asm_thread_start come later in
-    // compile_program); every later access is a read. (The value is safe;
-    // reading the buffer it names through base::BUFS is not: see BUFS's
-    // race row)
-    unsafe {
-        INSN_BUF = v;
-    }
-}
-
-// (0.28.0) INSN_BY_NAME's accessors: every use of it is one of them.
-fn get_insn_by_name() -> NameMap {
-    // UNSAFE: the instruction tables' name map, a process-wide static mut
-    // the assembler reads; Rust has no safe access to a static mut
-    // SAFETY: filled only by load_insns, once, on the main thread in the
-    // front end before any code generation thread starts (pthread_create
-    // orders it before the assembler thread's reads); read-only afterwards
-    unsafe { INSN_BY_NAME }
-}
-
-fn set_insn_by_name(v: NameMap) {
-    // UNSAFE: the instruction tables' name map, a process-wide static mut
-    // the assembler reads; Rust has no safe access to a static mut
-    // SAFETY: filled only by load_insns, once, on the main thread in the
-    // front end before any code generation thread starts (pthread_create
-    // orders it before the assembler thread's reads); read-only afterwards
-    unsafe {
-        INSN_BY_NAME = v;
-    }
-}
-
-// (0.28.0) INSN_FIELDS's accessors: every use of it is one of them.
-fn get_insn_fields() -> IntVec {
-    // UNSAFE: the instruction tables' field offsets, a process-wide static
-    // mut the assembler reads; Rust has no safe access to a static mut
-    // SAFETY: pushed only by load_insns, once, on the main thread in the
-    // front end before any code generation thread starts; read-only
-    // afterwards (insn_text); the IntVec never grows again, so its data
-    // never moves under a reader
-    unsafe { INSN_FIELDS }
-}
-
-fn set_insn_fields(v: IntVec) {
-    // UNSAFE: the instruction tables' field offsets, a process-wide static
-    // mut the assembler reads; Rust has no safe access to a static mut
-    // SAFETY: pushed only by load_insns, once, on the main thread in the
-    // front end before any code generation thread starts; read-only
-    // afterwards (insn_text); the IntVec never grows again, so its data
-    // never moves under a reader
-    unsafe {
-        INSN_FIELDS = v;
-    }
-}
-
-// (0.28.0) INSN_TEXT's accessors: every use of it is one of them.
-fn get_insn_text() -> &'static [u8] {
-    // UNSAFE: the instruction tables' text, a view the assembler reads
-    // through a process-wide static mut; Rust has no safe access to a
-    // static mut
-    // SAFETY: written only by load_insns (once: it returns when INSN_BUF >=
-    // 0), on the main thread in the front end (build -> load_modules ->
-    // load_arch_modules) or in volec assemble, before code generation
-    // starts any thread (pthread_create orders it before the assembler
-    // thread's reads); read-only afterwards (insn_text); the bytes it views
-    // are INSN_BUF's buffer's data block, which nothing writes after
-    // load_insns (INSN_BUF's only other uses are insn_byte during the load
-    // and insn_named's test), and growing BUFS moves the Buf records, not
-    // the data block, so the view stays valid for the process
-    unsafe { INSN_TEXT }
-}
-
-fn set_insn_text(v: &'static [u8]) {
-    // UNSAFE: the instruction tables' text, a view the assembler reads
-    // through a process-wide static mut; Rust has no safe access to a
-    // static mut
-    // SAFETY: written only by load_insns (once: it returns when INSN_BUF >=
-    // 0), on the main thread in the front end (build -> load_modules ->
-    // load_arch_modules) or in volec assemble, before code generation
-    // starts any thread (pthread_create orders it before the assembler
-    // thread's reads); read-only afterwards (insn_text); the bytes it views
-    // are INSN_BUF's buffer's data block, which nothing writes after
-    // load_insns (INSN_BUF's only other uses are insn_byte during the load
-    // and insn_named's test), and growing BUFS moves the Buf records, not
-    // the data block, so the view stays valid for the process
-    unsafe {
-        INSN_TEXT = v;
-    }
 }

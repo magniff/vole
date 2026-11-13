@@ -15,6 +15,8 @@
 //   copy of a value that is not Freeze (std's copying getters), it is
 //   own.interior_copy (interior_copy, below).
 
+use std::sync::atomic::Ordering;
+
 use crate::base::{
     buf_byte, buf_bytes, buf_copy, buf_int, buf_new, buf_ptr, buf_str, find_sym, get_src, sym_text,
 };
@@ -23,19 +25,13 @@ use crate::base::ctx::Ctx;
 use crate::base::diag::report_error_once;
 use crate::front::modules::{file_made, file_of_pos, within_std};
 use crate::front::types::{TyKind, buf_type, enum_variant, struct_field, type_elem, variant_field};
-use crate::middle::lower::ssa::HMap;
-
-static mut SYM_UNSAFE_CELL: i64 = 0;
-
-// Per type id + 1: the UnsafeCell type it holds + 1 (1: none, Freeze).
-static mut FREEZE_MEMO: HMap = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
 
 // Whether struct s (an instance: its template's) is std::cell::UnsafeCell.
 pub fn is_unsafe_cell_struct(s: i64, pcx: &Ctx<Comp>) -> bool {
     // (0.27.0: read, as a task may ask: find_cell_sym keeps it; a
     // name no symbol is names no struct)
-    let cell = if get_sym_unsafe_cell() != 0 { get_sym_unsafe_cell() }
-        else { find_sym(b"UnsafeCell", pcx) };
+    let kept = pcx.sym_unsafe_cell.load(Ordering::Relaxed);
+    let cell = if kept != 0 { kept } else { find_sym(b"UnsafeCell", pcx) };
     let t = if pcx.structs[s as usize].tmpl != 0 { pcx.structs[s as usize].tmpl - 1 }
         else { s };
     cell >= 0 && pcx.structs[t as usize].name == cell
@@ -46,10 +42,10 @@ pub fn is_unsafe_cell_struct(s: i64, pcx: &Ctx<Comp>) -> bool {
 // is one (after parsing, the main thread's: front::types::init_types,
 // middle::parallel's prepare_tasks).
 pub fn find_cell_sym(pcx: &Ctx<Comp>) {
-    if get_sym_unsafe_cell() == 0 {
+    if pcx.sym_unsafe_cell.load(Ordering::Relaxed) == 0 {
         let sym = find_sym(b"UnsafeCell", pcx);
         if sym >= 0 {
-            set_sym_unsafe_cell(sym);
+            pcx.sym_unsafe_cell.store(sym, Ordering::Relaxed);
         }
     }
 }
@@ -83,16 +79,17 @@ pub fn interior_part(t: i64, pcx: &Ctx<Comp>) -> i64 {
     if t <= 0 || t == pcx.ty_error {
         return 0;
     }
-    let known = get_freeze_memo().get(t + 1);
+    // (an entry per type, add_type's; Relaxed: every writer stores the
+    // same fact, and prepare_layouts decides every type before a phase)
+    let memo = &pcx.freeze_memo[t as usize];
+    let known = memo.load(Ordering::Relaxed);
     if known != 0 {
         return known - 1;
     }
     // (a type reached again while it is decided: Freeze there)
-    { let mut freeze_memo_copy = get_freeze_memo(); freeze_memo_copy.put(t + 1, 1);
-        set_freeze_memo(freeze_memo_copy); }
+    memo.store(1, Ordering::Relaxed);
     let r = interior_of(t, pcx);
-    { let mut freeze_memo_copy = get_freeze_memo(); freeze_memo_copy.put(t + 1, r + 1);
-        set_freeze_memo(freeze_memo_copy); }
+    memo.store(r + 1, Ordering::Relaxed);
     r
 }
 
@@ -228,12 +225,10 @@ fn text_of(n: i64, pcx: &Ctx<Comp>) -> &'static [u8] {
 // error at pos, into out; nothing in std or for text a shell word cannot
 // hold.
 fn buf_patch(out: i64, pos: i64, old: &[u8], new: &[u8], pcx: &Ctx<Comp>) {
-    // UNSAFE: FILES is the loader's raw table of source files.
-    // SAFETY: f = file_of_pos(pos) is the file holding pos, below FILE_COUNT.
-    unsafe {
+    {
         let f = file_of_pos(pos, pcx);
         let path = pcx.files[f as usize].path;
-        if (*path.add(0)) == b'<' || old.contains(&b'\'') || new.contains(&b'\'')
+        if crate::base::c_first(path) == b'<' || old.contains(&b'\'') || new.contains(&b'\'')
             || old.contains(&b'\n')
             || new.contains(&b'\n') {
             return;
@@ -245,8 +240,7 @@ fn buf_patch(out: i64, pos: i64, old: &[u8], new: &[u8], pcx: &Ctx<Comp>) {
             }
         }
         buf_str(out, c"edit patch ");
-        buf_str(out,
-            if (*path.add(0)) == b'.' && (*path.add(1)) == b'/' { path.add(2) } else { path });
+        buf_str(out, crate::base::c_plain_path(path));
         buf_bytes(out, b":");
         buf_int(out, line);
         buf_bytes(out, b" --old '");
@@ -322,54 +316,4 @@ pub fn interior_items(n: i64, t: i64, pcx: &mut Ctx<Comp>) {
     buf_byte(msg, 0);
     report_error_once(pos, KEY_INTERIOR_COPY, c"own.interior_copy", buf_ptr(msg),
         c"loop over the elements, places: `for c in v.iter() { c.set(x); }`", b"", pcx);
-}
-
-// (0.28.0) SYM_UNSAFE_CELL's accessors: every use of it is one of them.
-fn get_sym_unsafe_cell() -> i64 {
-    // UNSAFE: the UnsafeCell symbol, a process-wide static mut the tasks
-    // read; Rust has no safe access to a static mut
-    // SAFETY: written only by find_cell_sym (only while 0), whose callers
-    // are init_types (front end) and prepare_tasks, both on the main thread
-    // before pool_start's pthread_create; tasks only read it
-    // (is_unsafe_cell_struct)
-    unsafe { SYM_UNSAFE_CELL }
-}
-
-fn set_sym_unsafe_cell(v: i64) {
-    // UNSAFE: the UnsafeCell symbol, a process-wide static mut the tasks
-    // read; Rust has no safe access to a static mut
-    // SAFETY: written only by find_cell_sym (only while 0), whose callers
-    // are init_types (front end) and prepare_tasks, both on the main thread
-    // before pool_start's pthread_create; tasks only read it
-    // (is_unsafe_cell_struct)
-    unsafe {
-        SYM_UNSAFE_CELL = v;
-    }
-}
-
-// (0.28.0) FREEZE_MEMO's accessors: every use of it is one of them.
-fn get_freeze_memo() -> HMap {
-    // UNSAFE: the Freeze facts memo, a process-wide static mut the tasks
-    // read; Rust has no safe access to a static mut
-    // SAFETY: interior_part puts into it only on a miss; prepare_layouts
-    // (main thread, in prepare_tasks and in every task_list before a
-    // phase's pool_run) calls is_freeze (= interior_part) of every type
-    // below pcx.types.len(), so each type's entry exists before the phase;
-    // tasks get the context let and cannot add a type, so a task's
-    // interior_part(t) always hits and only reads the map
-    unsafe { FREEZE_MEMO }
-}
-
-fn set_freeze_memo(v: HMap) {
-    // UNSAFE: the Freeze facts memo, a process-wide static mut the tasks
-    // read; Rust has no safe access to a static mut
-    // SAFETY: interior_part puts into it only on a miss; prepare_layouts
-    // (main thread, in prepare_tasks and in every task_list before a
-    // phase's pool_run) calls is_freeze (= interior_part) of every type
-    // below pcx.types.len(), so each type's entry exists before the phase;
-    // tasks get the context let and cannot add a type, so a task's
-    // interior_part(t) always hits and only reads the map
-    unsafe {
-        FREEZE_MEMO = v;
-    }
 }

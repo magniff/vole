@@ -60,12 +60,8 @@ base::ctx::Ctx.pack_new	the task'"'"'s own slot (behind the slot'"'"'s lock), re
 base::ctx::Ctx.pack_used	the entry of the task'"'"'s own key (an atomic), read when the pack is written (0.27.8: a key is one task'"'"'s but a function'"'"'s that shares its symbol, fn_ambig, whose task does not mark it: mark_used)
 base::ctx::Ctx.pack	read only: an entry'"'"'s body is a slice of it
 base::STRESS_GROW	read by prepare_tasks (stress_grow)
-front::distinct::NICHE	enum_niche: every enum'"'"'s is made before a phase (prepare_layouts)
-front::cells::FREEZE_MEMO	interior_part: every type'"'"'s Freeze fact is made before a phase (prepare_layouts), so a task only reads it (GVN'"'"'s param_class_of)
-front::lexer::STRS	add_const_data: only on const_data'"'"'s serial branch (task_phase 0)
-front::lexer::STR_COUNT	the same
-gen0::target::STR_ALIGN	the same
-front::lexer::STR_CAP	the same
+base::ctx::Ctx.niche	enum_niche: an atomic per enum; every enum'"'"'s is made before a phase (prepare_layouts), and a task that stores stores the same fact
+base::ctx::Ctx.freeze_memo	interior_part: an atomic per type; every type'"'"'s Freeze fact is made before a phase (prepare_layouts), so a task only reads it (GVN'"'"'s param_class_of)
 base::BUFS	a task writes its context'"'"'s buffers'"'"' entries; none is made in a task (buf_new: below)
 base::BUF_CAP	buf_new, below
 base::BUF_COUNT	buf_new: the printers of --stats, --print-regalloc, --print-after-all, --verify-* (one thread), and internal errors, which exit
@@ -175,18 +171,16 @@ base::ctx::Ctx.t_totals	off: --time-passes (atomics, one a phase)
 base::ctx::Ctx.nodes	IR: a closure'"'"'s mark (fn_canon), a distinct type'"'"'s name (types_hash); -g
 base::ctx::Ctx.locals	own: a task makes variables above LOCAL_COUNT (ssa::new_synth_var), never reads a local'"'"'s (locals.len(): the same)
 base::ctx::Ctx.any_distinct	key: options_hash
-front::distinct::NICHE	key: types_hash (enum_niche)
+base::ctx::Ctx.niche	key: types_hash (enum_niche)
 base::ctx::Ctx.niche_aliases	key: types_hash
-front::cells::FREEZE_MEMO	key: types_hash (each type'"'"'s is_freeze)
-front::cells::SYM_UNSAFE_CELL	key: the same
+base::ctx::Ctx.freeze_memo	key: types_hash (each type'"'"'s is_freeze)
+base::ctx::Ctx.sym_unsafe_cell	key: the same
 base::ctx::Ctx.modules	key: the same (is_within, only from is_freeze: whether a struct is std'"'"'s UnsafeCell)
 base::ctx::Ctx.std_module	key: the same (within_std)
 base::ctx::Ctx.node_fx	IR: a function'"'"'s effects (fn_canon); (0.29) the table itself, fn_effects was its second name
 base::ctx::Ctx.fn_effects_count	IR: the same
-front::effects::builtin::TABLE	IR: by a symbol'"'"'s text; the same in every build of a compiler
-front::lexer::STRS	IR: a string'"'"'s bytes (STR_H)
-front::lexer::STR_CAP	IR: the same (no string is made in a task)
-front::lexer::STR_COUNT	IR: the same
+base::ctx::Ctx.c_effects	IR: by a symbol'"'"'s text; the same in every build of a compiler
+base::ctx::Ctx.strs	IR: a string'"'"'s bytes and alignment (STR_H); behind a lock, and no string is made in a task (add_const_data: only on const_data'"'"'s serial branch, task_phase 0)
 base::ctx::Ctx.edition	key: options_hash (0.27.1: a rust body gets no parameter alias facts, gvn noalias_active)
 base::ctx::Ctx.borrowck_verdict	fact: R_ATTRS mixes the verdict in; 0.27.1, gvn noalias_active asks it of a rust body, set per body before the tasks by places/borrowck
 base::ctx::Ctx.enums	key: types_hash
@@ -209,9 +203,8 @@ base::ctx::Ctx.ty_v8i16	key: types_hash (a fixed id)
 base::ctx::Ctx.variants	key: types_hash
 base::ctx::Ctx.main_sym	IR: a symbol by its text
 base::ctx::Ctx.link_names	IR: fn_canon
-gen0::target::RT_PANIC_SYM	IR: a symbol by its text
-gen0::target::RT_NOTE_SYM	IR: a symbol by its text
-gen0::target::STR_ALIGN	IR: a string'"'"'s alignment (STR_H)
+base::ctx::Ctx.rt_panic_sym	IR: a symbol by its text
+base::ctx::Ctx.rt_note_sym	IR: a symbol by its text
 base::ctx::Ctx.move_copies	IR: FN_MOVES
 base::ctx::Ctx.egraph	key: options_hash
 base::ctx::Ctx.rules	own: the rules, parsed when the context is made (egraph::rules_new), the same in every build of a compiler
