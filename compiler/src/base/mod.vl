@@ -109,15 +109,58 @@ pub fn elem_at<T>(data: *mut T, i: i64) -> *mut T {
 // from a capacity of 1, and the old block is filled with 0xAA bytes and
 // kept (never freed, never reused), so such a read finds garbage. The
 // gate's stress-grow step runs the suite and a self-compile with it.
-static mut STRESS_GROW: i64 = -1;
+static STRESS_GROW: Atomic<i64> = Atomic::new(-1);
 
 pub fn stress_grow() -> bool {
+    if get_stress_grow() < 0 {
+        set_stress_grow(if env_first_byte(c"VOLE_STRESS_GROW") == b'1' { 1 } else { 0 });
+    }
+    get_stress_grow() == 1
+}
+
+// ---- The environment (0.29) ----
+//
+// getenv returns a pointer into the environment, good until the next
+// setenv: no safe function can give it a lifetime. These read it at
+// once and give the value back by value (a byte, a number) or copied.
+
+// The first byte of environment variable `name` (a C string), 0 when it
+// is unset or empty. It allocates nothing: stress_grow asks before any
+// table exists.
+pub fn env_first_byte(name: *mut u8) -> u8 {
+    // UNSAFE: getenv is C's, and its result a raw pointer
+    // SAFETY: name is a NUL-terminated literal of the caller's; the
+    // result is null or a NUL-terminated string, so its first byte can
+    // be read, and it is read before anything could change the
+    // environment (nothing is called between)
     unsafe {
-        if get_stress_grow() < 0 {
-            let value = getenv(c"VOLE_STRESS_GROW");
-            set_stress_grow(if value != 0 as *mut u8 && *value == b'1' { 1 } else { 0 });
+        let value = getenv(name);
+        if value == 0 as *mut u8 { 0 } else { *value }
+    }
+}
+
+// Whether environment variable `name` (a C string) is set.
+pub fn env_is_set(name: *mut u8) -> bool {
+    // UNSAFE: getenv is C's
+    // SAFETY: name is a NUL-terminated literal of the caller's; the
+    // result is only compared with null
+    unsafe { getenv(name) != 0 as *mut u8 }
+}
+
+// The value of environment variable `name` (a C string), copied: empty
+// when it is unset (env_is_set tells the two apart).
+pub fn env_var(name: *mut u8) -> Vec<u8, Comp> {
+    // UNSAFE: getenv is C's, and its result is seen as a slice (c_bytes)
+    // SAFETY: name is a NUL-terminated literal of the caller's; the
+    // result is null (checked) or a NUL-terminated string that stays
+    // until the environment changes, and bytes_vec copies it before
+    // anything else runs: the view ends in this block
+    unsafe {
+        let value = getenv(name);
+        if value == 0 as *mut u8 {
+            return Vec::new_in(Comp {});
         }
-        get_stress_grow() == 1
+        bytes_vec(c_bytes(value))
     }
 }
 
@@ -386,84 +429,159 @@ impl IntVec {
 // ---- Byte buffers ----
 
 // Buffers are referred to by id; `BUFS[id]` holds the bytes.
+//
+// What every unsafe block below relies on (the buffers' invariants):
+// (B1) BUFS points at a malloc'ed table of at least BUF_COUNT headers,
+//      and ids 0..BUF_COUNT are the buffers made (buf_new); buf_hdr
+//      checks an id against BUF_COUNT, so a header's address is in the
+//      table. Buffers are never freed and ids never reused.
+// (B2) A header's data is a malloc'ed block of cap bytes (-1 - cap when
+//      frozen) whose first len bytes are initialized, 0 <= len <= cap:
+//      every writer makes room (buf_reserve) and writes before it adds
+//      to len.
+// (B3) A growing buffer is one context's: only the thread that runs
+//      with that context reads or writes its header and block (a task
+//      its cx.asm, cx.code, cx.scratch_buf; the main thread the
+//      program's). A frozen buffer is only read.
+// (B4) The table moves only in buf_new, and while another thread runs
+//      only the main thread calls buf_new, at a time when no other
+//      thread is inside a buf_* function: at -O0 the assembler thread
+//      never touches BUFS (its one path to it, dwarf_file, needs -g,
+//      which starts no thread), and at -O1+ no worker calls buf_new
+//      outside the serial-only modes, the joining main thread calls it
+//      only via dwarf_file (-g), and between phases the hand-over under
+//      the pool's mutex orders the main thread's buf_new before the
+//      tasks' reads of the table (tests/threads_writes.sh keeps the
+//      lists). So a header's address taken in a buf_* function stays
+//      good until that function returns.
 #[derive(Clone, Copy)] struct Buf { data: *mut u8, len: i64, cap: i64 }
 
-static mut BUFS: *mut Buf = 0 as *mut Buf;
-static mut BUF_COUNT: i64 = 0;
-static mut BUF_CAP: i64 = 0;
+// (0.29) Atomics, Relaxed (static muts before): the address of the
+// table, the number of buffers and the table's room. The order between
+// threads is B4's, not the atomics'.
+static BUFS: Atomic<*mut Buf> = Atomic::new(0 as *mut Buf);
+static BUF_COUNT: Atomic<i64> = Atomic::new(0);
+static BUF_CAP: Atomic<i64> = Atomic::new(0);
+
+// The header of buffer b, checked: an id that is no buffer's stops the
+// compiler (-1, "no buffer", passed to a writer).
+#[inline]
+fn buf_hdr(b: i64) -> *mut Buf {
+    if b as u64 >= BUF_COUNT.load(Ordering::Relaxed) as u64 {
+        buf_bad_id();
+    }
+    // UNSAFE: the address of an entry of base's raw table of buffers
+    // SAFETY: b < BUF_COUNT was checked (as u64: a negative id is out of
+    // range too), and the table holds BUF_COUNT headers (B1), so the
+    // address is inside its block; nothing is dereferenced here
+    unsafe { BUFS.load(Ordering::Relaxed).add(b as usize) }
+}
+
+// An id that is no buffer's: an internal error, never an access.
+fn buf_bad_id() -> ! {
+    die(c"internal: a buffer id out of range")
+}
 
 pub fn buf_new() -> i64 {
+    let id = BUF_COUNT.load(Ordering::Relaxed);
+    let mut cap = BUF_CAP.load(Ordering::Relaxed);
+    let table = grow(BUFS.load(Ordering::Relaxed), id, &mut cap);
+    BUF_CAP.store(cap, Ordering::Relaxed);
+    BUFS.store(table, Ordering::Relaxed);
+    // UNSAFE: a header written into base's raw table of buffers
+    // SAFETY: grow made room for entry `id` (id < cap) in the table it
+    // returned; the entry is written whole before BUF_COUNT covers it,
+    // and no other thread uses the table meanwhile (B4)
     unsafe {
-        set_bufs({
-            let mut buf_cap_copy = get_buf_cap();
-            let r_copy = grow(get_bufs(), get_buf_count(), &mut buf_cap_copy);
-            set_buf_cap(buf_cap_copy); r_copy
-        });
-        let id = get_buf_count();
-        (*get_bufs().add(id as usize)) = Buf { data: alloc_zeroed(256), len: 0, cap: 256 };
-        set_buf_count(get_buf_count() + (1));
-        id
+        *table.add(id as usize) = Buf { data: alloc_zeroed(256), len: 0, cap: 256 };
     }
+    BUF_COUNT.store(id + 1, Ordering::Relaxed);
+    id
 }
 
 pub fn buf_reserve(b: i64, extra: i64) {
+    let h = buf_hdr(b);
+    // UNSAFE: b's header read and written through its address; realloc
+    // is C's
+    // SAFETY: h is b's header (buf_hdr, B4), this thread's (B3). data is
+    // a malloc'ed block of cap bytes holding len initialized ones (B2):
+    // realloc (or moved_block, under stress) gives a block of new_cap >=
+    // len + extra bytes with the same first len, and the header gets
+    // both together; a frozen buffer stops before either
     unsafe {
-        let needed = (*get_bufs().add(b as usize)).len + extra;
-        if needed <= (*get_bufs().add(b as usize)).cap {
+        let needed = (*h).len + extra;
+        if needed <= (*h).cap {
             return;
         }
         // (0.27.7: a frozen buffer, cap stored as -1 - cap, is never written
         // again; every writer comes here when it is: src-buffer.md)
-        if (*get_bufs().add(b as usize)).cap < 0 {
+        if (*h).cap < 0 {
             frozen_written(b);
         }
         if stress_grow() {
-            let new_cap = stress_cap((*get_bufs().add(b as usize)).cap, needed);
-            (*get_bufs().add(b as usize)).data = moved_block((*get_bufs().add(b as usize)).data,
-                (*get_bufs().add(b as usize)).len, new_cap);
-            (*get_bufs().add(b as usize)).cap = new_cap;
+            let new_cap = stress_cap((*h).cap, needed);
+            (*h).data = moved_block((*h).data, (*h).len, new_cap);
+            (*h).cap = new_cap;
             return;
         }
-        let mut new_cap = (*get_bufs().add(b as usize)).cap * 2;
+        let mut new_cap = (*h).cap * 2;
         while new_cap < needed {
             new_cap *= 2;
         }
-        (*get_bufs().add(b as usize)).data = realloc((*get_bufs().add(b as usize)).data,
-            new_cap as u64);
-        (*get_bufs().add(b as usize)).cap = new_cap;
+        let grown = realloc((*h).data, new_cap as u64);
+        if grown == 0 as *mut u8 {
+            die(c"out of memory");
+        }
+        (*h).data = grown;
+        (*h).cap = new_cap;
     }
 }
 
 pub fn buf_clear(b: i64) {
-    // UNSAFE: BUFS is base's raw table of buffers
-    // SAFETY: b is an id buf_new returned; a frozen buffer stops here, so
-    // no view of one sees its length change
+    let h = buf_hdr(b);
+    // UNSAFE: b's header read and written through its address
+    // SAFETY: h is b's header (buf_hdr, B4), this thread's (B3); a frozen
+    // buffer stops here, so no view of one sees its length change
     unsafe {
-        if (*get_bufs().add(b as usize)).cap < 0 {
+        if (*h).cap < 0 {
             frozen_written(b);
         }
-        (*get_bufs().add(b as usize)).len = 0;
+        (*h).len = 0;
     }
 }
 
 pub fn buf_byte(b: i64, c: u8) {
+    let h = buf_hdr(b);
+    // UNSAFE: b's header and block written through raw pointers
+    // SAFETY: h is b's header (buf_hdr, B4), this thread's (B3). After
+    // the check len < cap (buf_reserve made room, and stopped at a
+    // frozen buffer, whose negative cap comes here too), so data[len] is
+    // inside the block (B2); it is written before len covers it
     unsafe {
-        // (>=: a frozen buffer's negative cap reaches buf_reserve too)
-        if (*get_bufs().add(b as usize)).len >= (*get_bufs().add(b as usize)).cap {
+        if (*h).len >= (*h).cap {
             buf_reserve(b, 1);
         }
-        (*(*get_bufs().add(b as usize)).data.add((*get_bufs().add(b as usize)).len as usize)) = c;
-        (*get_bufs().add(b as usize)).len += 1;
+        *(*h).data.add((*h).len as usize) = c;
+        (*h).len += 1;
     }
 }
 
 pub fn buf_bytes(b: i64, bytes: &[u8]) {
     let n = bytes.len() as i64;
     buf_reserve(b, n);
+    let h = buf_hdr(b);
+    // UNSAFE: memcpy into b's block; its header written through its
+    // address
+    // SAFETY: h is b's header (buf_hdr, B4), this thread's (B3);
+    // buf_reserve made room for n bytes after len (and stopped at a
+    // frozen buffer), so data[len..len + n] is inside the block (B2);
+    // bytes is a live slice of n bytes that is not in b's block beyond
+    // len (no view of a growing buffer exists outside this file, and
+    // base's own readers pass another buffer's: buf_append checks),
+    // and len covers the bytes only after they are written
     unsafe {
-        memcpy((*get_bufs().add(b as usize)).data.add((*get_bufs().add(b as usize)).len as usize),
-            bytes.ptr, bytes.len() as u64);
-        (*get_bufs().add(b as usize)).len += n;
+        memcpy((*h).data.add((*h).len as usize), bytes.ptr, n as u64);
+        (*h).len += n;
     }
 }
 
@@ -505,12 +623,13 @@ pub fn buf_bytes(b: i64, bytes: &[u8]) {
 // file) go through it and end the view before they return or write b.
 // UNSAFE: a slice over a block base keeps as a raw pointer and a length
 // in BUFS; the lifetime 'a is the caller's to keep
-// SAFETY: the caller's: b is an id buf_new returned; no write to b
-// (which may move or change its block) while the result is used, and no
-// other thread writes b meanwhile (a growing buffer is one context's)
+// SAFETY: the caller's: no write to b (which may move or change its
+// block) while the result is used, and no other thread writes b
+// meanwhile (B3). Here: h is b's header (buf_hdr, B4), and data holds
+// len initialized bytes (B2)
 unsafe fn buf_raw<'a>(b: i64) -> &'a [u8] {
-    std::slice::from_raw_parts((*get_bufs().add(b as usize)).data,
-        (*get_bufs().add(b as usize)).len as usize)
+    let h = buf_hdr(b);
+    std::slice::from_raw_parts((*h).data, (*h).len as usize)
 }
 
 // A Vec of these bytes, in one block and one copy.
@@ -595,10 +714,11 @@ pub fn buf_eq(b: i64, bytes: &[u8]) -> bool {
 // The number of bytes in buffer b.
 #[inline]
 pub fn buf_len(b: i64) -> i64 {
-    // UNSAFE: BUFS is base's raw table of buffers
-    // SAFETY: b is an id buf_new returned, so its header is live; the
-    // length is read by value, nothing is kept
-    unsafe { (*get_bufs().add(b as usize)).len }
+    let h = buf_hdr(b);
+    // UNSAFE: b's header read through its address
+    // SAFETY: h is b's header (buf_hdr, B4); the length is read by value
+    // on the buffer's thread (B3), nothing is kept
+    unsafe { (*h).len }
 }
 
 // An index outside a buffer: an internal error, never an access.
@@ -609,48 +729,54 @@ fn buf_bad_index() -> ! {
 // Byte i of buffer b.
 #[inline]
 pub fn buf_at(b: i64, i: i64) -> u8 {
-    // UNSAFE: BUFS is base's raw table of buffers
-    // SAFETY: b is an id buf_new returned; i is checked against the
-    // length (as u64: a negative i is out of range too), and data holds
-    // len initialized bytes; the byte is read by value
+    let h = buf_hdr(b);
+    // UNSAFE: b's header and block read through raw pointers
+    // SAFETY: h is b's header (buf_hdr, B4), this thread's (B3); i is
+    // checked against the length (as u64: a negative i is out of range
+    // too), and data holds len initialized bytes (B2); the byte is read
+    // by value
     unsafe {
-        if i as u64 >= (*get_bufs().add(b as usize)).len as u64 {
+        if i as u64 >= (*h).len as u64 {
             buf_bad_index();
         }
-        *(*get_bufs().add(b as usize)).data.add(i as usize)
+        *(*h).data.add(i as usize)
     }
 }
 
 // Byte i of buffer b becomes c (i below the length: buf_byte appends).
 pub fn buf_set(b: i64, i: i64, c: u8) {
-    // UNSAFE: BUFS is base's raw table of buffers
-    // SAFETY: b is an id buf_new returned; a frozen buffer stops here, so
-    // no view of one sees a byte change; i is checked against the length
+    let h = buf_hdr(b);
+    // UNSAFE: b's header read and its block written through raw pointers
+    // SAFETY: h is b's header (buf_hdr, B4), this thread's (B3); a frozen
+    // buffer stops here, so no view of one sees a byte change; i is
+    // checked against the length, and data holds len bytes (B2)
     unsafe {
-        if (*get_bufs().add(b as usize)).cap < 0 {
+        if (*h).cap < 0 {
             frozen_written(b);
         }
-        if i as u64 >= (*get_bufs().add(b as usize)).len as u64 {
+        if i as u64 >= (*h).len as u64 {
             buf_bad_index();
         }
-        *(*get_bufs().add(b as usize)).data.add(i as usize) = c;
+        *(*h).data.add(i as usize) = c;
     }
 }
 
 // Buffer b cut to its first n bytes (n at most its length).
 pub fn buf_truncate(b: i64, n: i64) {
-    // UNSAFE: BUFS is base's raw table of buffers
-    // SAFETY: b is an id buf_new returned; a frozen buffer stops here, so
-    // no view of one sees its length change; n is checked against the
-    // length, so the length never covers bytes that were not written
+    let h = buf_hdr(b);
+    // UNSAFE: b's header read and written through its address
+    // SAFETY: h is b's header (buf_hdr, B4), this thread's (B3); a frozen
+    // buffer stops here, so no view of one sees its length change; n is
+    // checked against the length, so the length never covers bytes that
+    // were not written (B2)
     unsafe {
-        if (*get_bufs().add(b as usize)).cap < 0 {
+        if (*h).cap < 0 {
             frozen_written(b);
         }
-        if n as u64 > (*get_bufs().add(b as usize)).len as u64 {
+        if n as u64 > (*h).len as u64 {
             buf_bad_index();
         }
-        (*get_bufs().add(b as usize)).len = n;
+        (*h).len = n;
     }
 }
 
@@ -662,14 +788,17 @@ pub fn buf_zeros(b: i64, n: i64) -> i64 {
         buf_bad_index();
     }
     buf_reserve(b, n);
-    // UNSAFE: BUFS is base's raw table of buffers; memset is C
-    // SAFETY: b is an id buf_new returned; buf_reserve made room for n
-    // bytes after the length (and stopped at a frozen buffer), which
-    // memset fills before the length covers them
+    let h = buf_hdr(b);
+    // UNSAFE: memset is C's, into b's block; its header written through
+    // its address
+    // SAFETY: h is b's header (buf_hdr, B4), this thread's (B3);
+    // buf_reserve made room for n bytes after the length (and stopped at
+    // a frozen buffer), which memset fills before the length covers them
+    // (B2)
     unsafe {
-        let at = (*get_bufs().add(b as usize)).len;
-        memset((*get_bufs().add(b as usize)).data.add(at as usize), 0, n as u64);
-        (*get_bufs().add(b as usize)).len = at + n;
+        let at = (*h).len;
+        memset((*h).data.add(at as usize), 0, n as u64);
+        (*h).len = at + n;
         at
     }
 }
@@ -679,27 +808,28 @@ pub fn buf_zeros(b: i64, n: i64) -> i64 {
 // it is taken where it is used.
 #[inline]
 pub fn buf_ptr(b: i64) -> *mut u8 {
-    // UNSAFE: BUFS is base's raw table of buffers
-    // SAFETY: b is an id buf_new returned, so its header is live; the
+    let h = buf_hdr(b);
+    // UNSAFE: b's header read through its address
+    // SAFETY: h is b's header (buf_hdr, B4), this thread's (B3); the
     // pointer is read by value and not dereferenced here
-    unsafe { (*get_bufs().add(b as usize)).data }
+    unsafe { (*h).data }
 }
 
 // v's low 16 bits appended to buffer b, little-endian (the object
 // writers' w16: the bytes with one check for room, not a call each).
 pub fn buf_w16(b: i64, v: i64) {
     buf_reserve(b, 2);
-    // UNSAFE: BUFS is base's raw table of buffers; the bytes go into the
-    // buffer's own block
-    // SAFETY: b is an id buf_new returned; buf_reserve made room for 2
-    // bytes after the length (and stopped at a frozen buffer), written
-    // before the length covers them
+    let h = buf_hdr(b);
+    // UNSAFE: b's header and block written through raw pointers
+    // SAFETY: h is b's header (buf_hdr, B4), this thread's (B3);
+    // buf_reserve made room for 2 bytes after the length (and stopped at
+    // a frozen buffer), written before the length covers them (B2)
     unsafe {
-        let at = (*get_bufs().add(b as usize)).len;
-        let d = (*get_bufs().add(b as usize)).data;
+        let at = (*h).len;
+        let d = (*h).data;
         (*d.add(at as usize)) = (v & 255) as u8;
         (*d.add((at + 1) as usize)) = ((v >> 8) & 255) as u8;
-        (*get_bufs().add(b as usize)).len = at + 2;
+        (*h).len = at + 2;
     }
 }
 
@@ -707,19 +837,19 @@ pub fn buf_w16(b: i64, v: i64) {
 // with one check for room, not a call each).
 pub fn buf_w32(b: i64, v: i64) {
     buf_reserve(b, 4);
-    // UNSAFE: BUFS is base's raw table of buffers; the bytes go into the
-    // buffer's own block
-    // SAFETY: b is an id buf_new returned; buf_reserve made room for 4
-    // bytes after the length (and stopped at a frozen buffer), written
-    // before the length covers them
+    let h = buf_hdr(b);
+    // UNSAFE: b's header and block written through raw pointers
+    // SAFETY: h is b's header (buf_hdr, B4), this thread's (B3);
+    // buf_reserve made room for 4 bytes after the length (and stopped at
+    // a frozen buffer), written before the length covers them (B2)
     unsafe {
-        let at = (*get_bufs().add(b as usize)).len;
-        let d = (*get_bufs().add(b as usize)).data;
+        let at = (*h).len;
+        let d = (*h).data;
         (*d.add(at as usize)) = (v & 255) as u8;
         (*d.add((at + 1) as usize)) = ((v >> 8) & 255) as u8;
         (*d.add((at + 2) as usize)) = ((v >> 16) & 255) as u8;
         (*d.add((at + 3) as usize)) = ((v >> 24) & 255) as u8;
-        (*get_bufs().add(b as usize)).len = at + 4;
+        (*h).len = at + 4;
     }
 }
 
@@ -729,12 +859,14 @@ pub fn buf_w32(b: i64, v: i64) {
 // away (buffers are never freed, ids never reused), so a slice of it is
 // valid for the rest of the process (src-buffer.md: frozen buffers).
 pub fn buf_freeze(b: i64) {
-    // UNSAFE: BUFS is base's raw table of buffers
-    // SAFETY: b is an id buf_new returned (0 <= b < BUF_COUNT): its slot is
-    // live; only the cap word changes, which no view reads
+    let h = buf_hdr(b);
+    // UNSAFE: b's header read and written through its address
+    // SAFETY: h is b's header (buf_hdr, B4), written by the thread that
+    // owns b while it still grows (B3); only the cap word changes,
+    // which no view reads
     unsafe {
-        if (*get_bufs().add(b as usize)).cap >= 0 {
-            (*get_bufs().add(b as usize)).cap = -1 - (*get_bufs().add(b as usize)).cap;
+        if (*h).cap >= 0 {
+            (*h).cap = -1 - (*h).cap;
         }
     }
 }
@@ -781,47 +913,63 @@ pub fn freeze_selftest() -> i64 {
 }
 
 pub fn buf_str(b: i64, s: *mut u8) {
+    let h = buf_hdr(b);
+    // UNSAFE: a C string read through its pointer; b's header and block
+    // written through raw pointers
+    // SAFETY: s is a NUL-terminated string (the callers' literals, names
+    // and paths: this function's contract, as C's strlen), read up to
+    // its NUL and no further (the loop stops at it; c_bytes measures the
+    // rest only when 16 bytes without one were read). h is b's header
+    // (buf_hdr, B4), this thread's (B3); after the check there is room
+    // for 16 bytes after len (buf_reserve, which stops at a frozen
+    // buffer, whose negative cap fails the check), so data[at + i], i <
+    // 16, is inside the block (B2), written before len covers it
     unsafe {
         // (0.25) A short string (the code generator's `    `, `, `, `ldr x`)
         // copied byte by byte with one check for room, not by strlen,
         // buf_reserve and memcpy; a longer one's rest by them.
-        if (*get_bufs().add(b as usize)).len + 16 > (*get_bufs().add(b as usize)).cap {
+        if (*h).len + 16 > (*h).cap {
             buf_reserve(b, 16);
         }
-        let d = (*get_bufs().add(b as usize)).data;
-        let at = (*get_bufs().add(b as usize)).len;
+        let d = (*h).data;
+        let at = (*h).len;
         let mut i: i64 = 0;
         while i < 16 {
             let c = (*s.add(i as usize));
             if c == 0 {
-                (*get_bufs().add(b as usize)).len = at + i;
+                (*h).len = at + i;
                 return;
             }
             (*d.add((at + i) as usize)) = c;
             i += 1;
         }
-        (*get_bufs().add(b as usize)).len = at + 16;
-        let rest = s.add(16);
-        buf_bytes(b,
-            c_bytes(rest));
+        (*h).len = at + 16;
+        buf_bytes(b, c_bytes(s.add(16)));
     }
 }
 
 pub fn buf_uint(b: i64, value: u64) {
+    // (0.25: the digits counted, then written in place with one check for
+    // room; the code generator writes 54 MB of assembly with them)
+    let mut n: i64 = 1;
+    let mut t = value;
+    while t >= 10 {
+        t /= 10;
+        n += 1;
+    }
+    let h = buf_hdr(b);
+    // UNSAFE: b's header and block written through raw pointers
+    // SAFETY: h is b's header (buf_hdr, B4), this thread's (B3); after
+    // the check there is room for n bytes after len (buf_reserve, which
+    // stops at a frozen buffer, whose negative cap fails the check), so
+    // data[at + k], k < n, is inside the block (B2); all n are written
+    // before len covers them
     unsafe {
-        // (0.25: the digits counted, then written in place with one check for
-        // room; the code generator writes 54 MB of assembly with them)
-        let mut n: i64 = 1;
-        let mut t = value;
-        while t >= 10 {
-            t /= 10;
-            n += 1;
-        }
-        if (*get_bufs().add(b as usize)).len + n > (*get_bufs().add(b as usize)).cap {
+        if (*h).len + n > (*h).cap {
             buf_reserve(b, n);
         }
-        let at = (*get_bufs().add(b as usize)).len;
-        let d = (*get_bufs().add(b as usize)).data;
+        let at = (*h).len;
+        let d = (*h).data;
         let mut v = value;
         let mut k = n;
         while k > 0 {
@@ -830,7 +978,7 @@ pub fn buf_uint(b: i64, value: u64) {
             (*d.add((at + k) as usize)) = b'0' + (v - q * 10) as u8;
             v = q;
         }
-        (*get_bufs().add(b as usize)).len = at + n;
+        (*h).len = at + n;
     }
 }
 
@@ -936,16 +1084,22 @@ fn write_all_fd(fd: i32, b: i64) {
 }
 
 // (0.15) The buffer stdout's writes go to (buf_write_fd), or -1.
-static mut STDOUT_CAPTURE: i64 = -1;
+static STDOUT_CAPTURE: Atomic<i64> = Atomic::new(-1);
 
 pub fn buf_write_file(b: i64, path: *mut u8) {
+    // UNSAFE: fopen, fwrite and fclose are C's, given the buffer's block
+    // (buf_raw)
+    // SAFETY: path is a NUL-terminated string (the callers': a path made
+    // in a buffer with its NUL, or a word of the command line); the file
+    // is checked before it is used and closed once; the view is b's len
+    // initialized bytes and ends with fwrite, which writes no buffer
     unsafe {
         let file = fopen(path, c"wb");
         if file == 0 as *mut u8 {
             die2(c"cannot write ", path);
         }
-        fwrite((*get_bufs().add(b as usize)).data, 1, (*get_bufs().add(b as usize)).len as u64,
-            file);
+        let bytes: &[u8] = buf_raw(b);
+        fwrite(bytes.ptr, 1, bytes.len() as u64, file);
         fclose(file);
     }
 }
@@ -1221,17 +1375,23 @@ pub fn overlay_of(path: *mut u8, pcx: &Ctx<Comp>) -> *mut u8 {
 }
 
 pub fn read_file(path: *mut u8, out: i64, pcx: &Ctx<Comp>) {
+    // UNSAFE: fopen, fread and fclose are C's; fread fills the buffer's
+    // block
+    // SAFETY: path is a NUL-terminated string (the callers': a source
+    // file's path); the file is checked before it is used and closed
+    // once. Each round buf_zeros appends 65536 zero bytes at `at`, so
+    // the block (buf_ptr, taken after it, no write between) has that
+    // room for fread, which writes at most 65536 bytes there; the
+    // buffer is then cut to what was read
     unsafe {
         let file = fopen(overlay_of(path, pcx), c"rb");
         if file == 0 as *mut u8 {
             die2(c"cannot read ", path);
         }
         loop {
-            buf_reserve(out, 65536);
-            let got = fread(
-                (*get_bufs().add(out as usize)).data.add(
-                    (*get_bufs().add(out as usize)).len as usize), 1, 65536, file);
-            (*get_bufs().add(out as usize)).len += got as i64;
+            let at = buf_zeros(out, 65536);
+            let got = fread(buf_ptr(out).add(at as usize), 1, 65536, file) as i64;
+            buf_truncate(out, at + got);
             if got == 0 {
                 break;
             }
@@ -1269,19 +1429,15 @@ fn src_map_flags() -> i32 {
 
 // The capacity a source set reserves: VOLE_SRC_CAP's, else SRC_CAP.
 fn src_cap_wanted() -> i64 {
-    unsafe {
-        let value = getenv(c"VOLE_SRC_CAP");
-        if value == 0 as *mut u8 {
-            return SRC_CAP;
+    let value = env_var(c"VOLE_SRC_CAP");
+    let mut n: i64 = 0;
+    for &c in value.as_slice() {
+        if c < b'0' || c > b'9' || n >= SRC_CAP {
+            break;
         }
-        let mut n: i64 = 0;
-        let mut i: i64 = 0;
-        while (*value.add(i as usize)) >= b'0' && (*value.add(i as usize)) <= b'9' && n < SRC_CAP {
-            n = n * 10 + ((*value.add(i as usize)) - b'0') as i64;
-            i += 1;
-        }
-        if n > 0 && n < SRC_CAP { n } else { SRC_CAP }
+        n = n * 10 + (c - b'0') as i64;
     }
+    if n > 0 && n < SRC_CAP { n } else { SRC_CAP }
 }
 
 // A fresh region of cap bytes, never unmapped; the compiler stops when
@@ -1394,6 +1550,7 @@ pub fn load_sources(paths: *mut *mut u8, count: i64, pcx: &mut Ctx<Comp>) {
             pcx.files.push(SourceFile {
                 path: (*paths.add(i as usize)), start, end: pcx.src_used, module: 0, kind: 0,
             });
+            pcx.out_paths.push(Atomic::new(-1));
             src_put_byte(b'\n', pcx);
         }
         src_put_byte(0, pcx);
@@ -1420,187 +1577,205 @@ pub fn add_source(path: *mut u8, text: i64, pcx: &mut Ctx<Comp>, kind: i64) -> i
     // of their own, end the compiler), and the view ends when it returns
     unsafe { src_put(buf_raw(text), pcx); }
     pcx.files.push(SourceFile { path, start, end: pcx.src_used, module: 0, kind });
+    pcx.out_paths.push(Atomic::new(-1));
     src_put_byte(b'\n', pcx);
     src_put_byte(0, pcx);
     src_publish(pcx);
     start
 }
 
-// (0.18) Source file paths as the compiler writes them into what it makes
-// (run-time failure positions, --trace, --check-alloc and --check-unsafe
-// sites, the test runner's labels, -g's line table), by file: relative
-// to the root file's directory, so that the output is the same whatever
-// the current directory and however the root's path is spelled
-// (`main.vl`, `./main.vl`, an absolute path). A file the compiler
-// made (`<std>`) keeps its name; one outside the root's directory is
-// `../`-relative. OUT_PATHS holds each file's, made when first asked.
-static mut OUT_PATHS: IntVec = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-static mut ROOT_DIR: *mut u8 = 0 as *mut u8;
-
-// The absolute directory of the root file (FILES[0]), resolved once; the
-// empty string when it cannot be.
-pub fn root_dir(pcx: &Ctx<Comp>) -> *mut u8 {
-    unsafe {
-        if get_root_dir() == 0 as *mut u8 {
-            set_root_dir(c"");
-            if pcx.files.len() > 0 {
-                let abs = realpath(pcx.files[0].path, 0 as *mut u8);
-                if abs != 0 as *mut u8 {
-                    let mut cut = strlen(abs) as i64;
-                    while cut > 0 && (*abs.add((cut - 1) as usize)) != b'/' {
-                        cut -= 1;
-                    }
-                    // (the root at "/x.vl": its directory is "/")
-                    (*abs.add((if cut > 1 { cut - 1 } else { cut }) as usize)) = 0;
-                    set_root_dir(abs);
-                }
-            }
-        }
-        get_root_dir()
-    }
+// The path of source file `file`: a C string the context keeps for the
+// process (the command line's, a module's made once, the cache's).
+fn source_path<'a>(file: i64, pcx: &'a Ctx<Comp>) -> &'a [u8] {
+    // UNSAFE: a SourceFile's path is a raw C string, seen as a slice
+    // SAFETY: load_sources, add_source and restore_sources are given
+    // NUL-terminated paths that are never freed or written (a word of
+    // the command line, a path made once in a block of its own), and
+    // the entry stays in pcx.files, which the result borrows
+    unsafe { c_bytes(pcx.files[file as usize].path) }
 }
 
-// (0.18) The root's directory as out_path compares with (normal_path's,
-// once), and the current directory, read once.
-static mut ROOT_LEX: *mut u8 = 0 as *mut u8;
+// Buffer b's block as a C string for the rest of the process: a NUL is
+// appended and b frozen, so the block never moves or changes again.
+fn buf_frozen_cstr(b: i64) -> *mut u8 {
+    buf_byte(b, 0);
+    buf_freeze(b);
+    buf_ptr(b)
+}
 
-static mut ROOT_LEX_ABS: bool = false;
-static mut CWD: *mut u8 = 0 as *mut u8;
+// The absolute directory of the root file (FILES[0]), resolved once; the
+// empty string when it cannot be. (0.29: kept in the context, as the
+// number of the frozen buffer that holds it.)
+pub fn root_dir(pcx: &Ctx<Comp>) -> *mut u8 {
+    let kept = pcx.root_dir.load(Ordering::Relaxed);
+    if kept >= 0 {
+        return buf_ptr(kept);
+    }
+    let dir = buf_new();
+    if pcx.files.len() > 0 {
+        // UNSAFE: realpath and free are C's; realpath's result is seen
+        // as a slice (c_bytes)
+        // SAFETY: the root's path is a NUL-terminated string
+        // (source_path); with a null second argument realpath returns
+        // null (checked) or a NUL-terminated string in a malloc'ed block
+        // of its own, which is read here, copied into the buffer, and
+        // freed once: no view of it is left
+        unsafe {
+            let abs = realpath(pcx.files[0].path, 0 as *mut u8);
+            if abs != 0 as *mut u8 {
+                let text: &[u8] = c_bytes(abs);
+                let mut cut = text.len();
+                while cut > 0 && text[cut - 1] != b'/' {
+                    cut -= 1;
+                }
+                // (the root at "/x.vl": its directory is "/")
+                buf_bytes(dir, &text[0..if cut > 1 { cut - 1 } else { cut }]);
+                free(abs);
+            }
+        }
+    }
+    let made = buf_frozen_cstr(dir);
+    pcx.root_dir.store(dir, Ordering::Relaxed);
+    made
+}
+
+// The current directory, read once (0.29: kept in the context, as the
+// number of the frozen buffer that holds it); "/" when it cannot be read.
+fn current_dir(pcx: &Ctx<Comp>) -> &'static [u8] {
+    let kept = pcx.cwd.load(Ordering::Relaxed);
+    if kept >= 0 {
+        return buf_done(kept);
+    }
+    let b = buf_new();
+    buf_zeros(b, 4096);
+    // UNSAFE: getcwd is C's, given the buffer's block
+    // SAFETY: buf_zeros made 4096 zero bytes in b's block, which no
+    // write has moved since (buf_ptr is taken here); getcwd writes at
+    // most 4096 bytes there, a NUL-terminated path, or returns null
+    let ok = unsafe { getcwd(buf_ptr(b), 4096) != 0 as *mut u8 };
+    let mut n: i64 = 0;
+    while ok && n < 4096 && buf_at(b, n) != 0 {
+        n += 1;
+    }
+    if !ok || n == 0 {
+        buf_set(b, 0, b'/');
+        n = 1;
+    }
+    buf_truncate(b, n);
+    pcx.cwd.store(b, Ordering::Relaxed);
+    buf_done(b)
+}
 
 // path normal by its text: empty and "." components dropped, ".."
 // taking the component before it away (kept at the start of a relative
 // path). With `absolute`, a relative path is first put after the current
 // directory (read once). Symbolic links are not followed, so two
 // spellings of a file through the same links agree.
-fn normal_path(path: *mut u8, absolute: bool) -> *mut u8 {
-    unsafe {
-        let full = buf_new();
-        if absolute && (*path.add(0)) != b'/' {
-            if get_cwd() == 0 as *mut u8 {
-                let b = alloc_zeroed(4096);
-                set_cwd(if getcwd(b, 4096) != 0 as *mut u8 { b } else { c"/" });
-            }
-            buf_str(full, get_cwd());
-            buf_byte(full, b'/');
-        }
-        buf_str(full, path);
-        let s = (*get_bufs().add(full as usize)).data;
-        let n = (*get_bufs().add(full as usize)).len;
-        let rooted = (*s.add(0)) == b'/';
-        let out = buf_new();
-        // where each kept component starts in out, and whether it is ".."
-        let mut starts = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut ups = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut i: i64 = 0;
-        while i < n {
-            while i < n && (*s.add(i as usize)) == b'/' {
-                i += 1;
-            }
-            let a = i;
-            while i < n && (*s.add(i as usize)) != b'/' {
-                i += 1;
-            }
-            let len = i - a;
-            if len == 0 || (len == 1 && (*s.add(a as usize)) == b'.') {
-                continue;
-            }
-            let up = len == 2 && (*s.add(a as usize)) == b'.' && (*s.add((a + 1) as usize)) == b'.';
-            if up && starts.len() as i64 > 0 && (ups[(ups.len() as i64 - 1) as usize]) == 0 {
-                (*get_bufs().add(out as usize)).len = (starts[(starts.len() as i64 - 1) as usize]);
-                starts.pop();
-                ups.pop();
-                continue;
-            }
-            if up && rooted {
-                continue;
-            }
-            starts.push((*get_bufs().add(out as usize)).len);
-            ups.push(if up { 1 } else { 0 });
-            if rooted || (*get_bufs().add(out as usize)).len > 0 {
-                buf_byte(out, b'/');
-            }
-            buf_bytes(out, std::slice::from_raw_parts(s.add((a) as usize), (i - (a)) as usize));
-        }
-        if rooted && (*get_bufs().add(out as usize)).len == 0 {
-            buf_byte(out, b'/');
-        }
-        buf_byte(out, 0);
-        free(starts.data as *mut u8);
-        free(ups.data as *mut u8);
-        (*get_bufs().add(out as usize)).data
+fn normal_path(path: &[u8], absolute: bool, pcx: &Ctx<Comp>) -> Vec<u8, Comp> {
+    let mut full: Vec<u8, Comp> = Vec::new_in(Comp {});
+    if absolute && (path.len() == 0 || path[0] != b'/') {
+        full.extend_from_slice(current_dir(pcx));
+        full.push(b'/');
     }
-}
-
-// The path of file `file` relative to the root's directory (see
-// OUT_PATHS). Both are made normal by their text (normal_path): no
-// call of realpath or getcwd per file, which walk the directories above
-// the current one on some systems.
-pub fn out_path(file: i64, pcx: &Ctx<Comp>) -> *mut u8 {
-    unsafe {
-        let path = pcx.files[file as usize].path;
-        if (*path.add(0)) == b'<' {
-            return path;
-        }
-        while get_out_paths().len() as i64 <= file {
-            { let mut out_paths_copy = get_out_paths(); out_paths_copy.push(0);
-                set_out_paths(out_paths_copy); }
-        }
-        if (get_out_paths()[file as usize]) != 0 {
-            return (get_out_paths()[file as usize]) as *mut u8;
-        }
-        // Both relative (the usual case: the modules' paths are made from
-        // the root's) need no current directory; else both absolute.
-        let absolute = (*pcx.files[0].path.add(0)) == b'/' || (*path.add(0)) == b'/';
-        if get_root_lex() == 0 as *mut u8 || get_root_lex_abs() != absolute {
-            // the root's directory: its normal path up to the last '/'
-            // ("/" for a root at the top, "" for one in the current
-            // directory)
-            let r = normal_path(pcx.files[0].path, absolute);
-            let mut cut = strlen(r) as i64;
-            while cut > 0 && (*r.add(cut as usize)) != b'/' {
-                cut -= 1;
-            }
-            if (*r.add(cut as usize)) != b'/' {
-                (*r.add(0)) = 0;
-            } else {
-                (*r.add((if cut > 0 { cut } else { 1 }) as usize)) = 0;
-            }
-            set_root_lex(r);
-            set_root_lex_abs(absolute);
-        }
-        let dir = get_root_lex();
-        let abs = normal_path(path, absolute);
-        // the longest common prefix of whole components
-        let mut i: i64 = 0;
-        let mut last: i64 = 0;
-        while (*abs.add(i as usize)) != 0 && (*abs.add(i as usize)) == (*dir.add(i as usize)) {
-            if (*abs.add(i as usize)) == b'/' {
-                last = i + 1;
-            }
+    full.extend_from_slice(path);
+    let s = full.as_slice();
+    let n = s.len();
+    let rooted = n > 0 && s[0] == b'/';
+    let mut out: Vec<u8, Comp> = Vec::new_in(Comp {});
+    // where each kept component starts in out, and whether it is ".."
+    let mut starts: Vec<usize, Comp> = Vec::new_in(Comp {});
+    let mut ups: Vec<bool, Comp> = Vec::new_in(Comp {});
+    let mut i: usize = 0;
+    while i < n {
+        while i < n && s[i] == b'/' {
             i += 1;
         }
-        let out = buf_new();
-        if (*dir.add(i as usize)) == 0 && (*abs.add(i as usize)) == b'/' {
-            // under the root's directory
+        let a = i;
+        while i < n && s[i] != b'/' {
+            i += 1;
+        }
+        let part = &s[a..i];
+        if part.len() == 0 || part == b"." {
+            continue;
+        }
+        let up = part == b"..";
+        if up && starts.len() > 0 && !ups[ups.len() - 1] {
+            out.truncate(starts[starts.len() - 1]);
+            starts.pop();
+            ups.pop();
+            continue;
+        }
+        if up && rooted {
+            continue;
+        }
+        starts.push(out.len());
+        ups.push(up);
+        if rooted || out.len() > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(part);
+    }
+    if rooted && out.len() == 0 {
+        out.push(b'/');
+    }
+    out
+}
+
+// The path of file `file` relative to the root's directory (0.18: as
+// the compiler writes it into what it makes). Both are made normal by
+// their text (normal_path): no call of realpath or getcwd per file,
+// which walk the directories above the current one on some systems.
+// Each file's is made when first asked and kept in the context
+// (pcx.out_paths: the number of the frozen buffer that holds it).
+pub fn out_path(file: i64, pcx: &Ctx<Comp>) -> *mut u8 {
+    let path = source_path(file, pcx);
+    if path.len() > 0 && path[0] == b'<' {
+        return pcx.files[file as usize].path;
+    }
+    let kept = pcx.out_paths[file as usize].load(Ordering::Relaxed);
+    if kept >= 0 {
+        return buf_ptr(kept);
+    }
+    // Both relative (the usual case: the modules' paths are made from
+    // the root's) need no current directory; else both absolute.
+    let root = source_path(0, pcx);
+    let absolute = (root.len() > 0 && root[0] == b'/') || (path.len() > 0 && path[0] == b'/');
+    // the root's directory: its normal path up to the last '/' ("/" for
+    // a root at the top, "" for one in the current directory)
+    let r = normal_path(root, absolute, pcx);
+    let mut cut = r.len();
+    while cut > 0 && r[cut - 1] != b'/' {
+        cut -= 1;
+    }
+    let dir = &r[0..if cut > 1 { cut - 1 } else { cut }];
+    let abs = normal_path(path, absolute, pcx);
+    // the longest common prefix of whole components
+    let mut i: usize = 0;
+    let mut last: usize = 0;
+    while i < abs.len() && i < dir.len() && abs[i] == dir[i] {
+        if abs[i] == b'/' {
             last = i + 1;
-        } else if (*dir.add(last as usize)) != 0 {
-            // one "../" for each component of dir after the common prefix
-            // (last <= i: within dir)
-            buf_str(out, c"../");
-            let mut k = last;
-            while (*dir.add(k as usize)) != 0 {
-                if (*dir.add(k as usize)) == b'/' {
-                    buf_str(out, c"../");
-                }
-                k += 1;
+        }
+        i += 1;
+    }
+    let out = buf_new();
+    if i == dir.len() && i < abs.len() && abs[i] == b'/' {
+        // under the root's directory
+        last = i + 1;
+    } else if last < dir.len() {
+        // one "../" for each component of dir after the common prefix
+        // (last <= i: within dir)
+        buf_str(out, c"../");
+        for k in last..dir.len() {
+            if dir[k] == b'/' {
+                buf_str(out, c"../");
             }
         }
-        buf_str(out, abs.add(last as usize));
-        buf_byte(out, 0);
-        let made = (*get_bufs().add(out as usize)).data;
-        (get_out_paths()[file as usize]) = made as i64;
-        made
     }
+    buf_bytes(out, &abs[last..]);
+    let made = buf_frozen_cstr(out);
+    pcx.out_paths[file as usize].store(out, Ordering::Relaxed);
+    made
 }
 
 // The sources as the tools' cache read them (0.13): buffer `all` holds
@@ -1618,6 +1793,7 @@ pub fn restore_sources(all: i64, files: &[i64], pcx: &mut Ctx<Comp>) {
             module: (files[(i + 3) as usize]),
             kind: (files[(i + 4) as usize]),
         });
+        pcx.out_paths.push(Atomic::new(-1));
         i += 5;
     }
     // (0.27.6: a new source set, its region's, as load_sources)
@@ -1676,167 +1852,50 @@ const ENV_NAMES: [*mut u8; 27] = [
 // is copied to VOLE_X, so that it is read as that one, and wins over it;
 // the children inherit both.
 pub fn env_aliases() {
-    unsafe {
-        for k in 0..27 {
-            let n = ENV_NAMES[k as usize];
-            let vole = buf_new();
-            buf_str(vole, c"VOLE_");
-            buf_str(vole, n);
-            buf_byte(vole, 0);
-            let v = getenv((*get_bufs().add(vole as usize)).data);
-            if v != 0 as *mut u8 {
-                let tach = buf_new();
-                buf_str(tach, c"VOLE_");
-                buf_str(tach, n);
-                buf_byte(tach, 0);
-                base_setenv((*get_bufs().add(tach as usize)).data, v, 1);
-            }
+    for k in 0..27 {
+        let name = buf_new();
+        buf_str(name, c"VOLE_");
+        buf_str(name, ENV_NAMES[k as usize]);
+        buf_byte(name, 0);
+        if !env_is_set(buf_ptr(name)) {
+            continue;
         }
+        let value = buf_new();
+        buf_bytes(value, &env_var(buf_ptr(name)));
+        buf_byte(value, 0);
+        // UNSAFE: setenv is C's
+        // SAFETY: both are NUL-terminated strings in blocks of their own
+        // (each buffer ends with the 0 pushed above and is not written
+        // after its pointer is taken); setenv copies them, and no other
+        // thread exists yet (main calls this first)
+        unsafe { base_setenv(buf_ptr(name), buf_ptr(value), 1); }
     }
 }
 
 use std::sync::atomic::{Atomic, Ordering};
 
 // (0.28.0) STRESS_GROW's accessors: every use of it is one of them.
+// (0.29) An atomic, Relaxed: stress_grow writes it only while it is -1,
+// and every thread that finds -1 writes the same value (the
+// environment's), so no order between them matters.
 fn get_stress_grow() -> i64 {
-    // UNSAFE: the stress-grow mode, a process-wide static mut read by every
-    // thread; Rust has no safe access to a static mut
-    // SAFETY: stress_grow writes it only while it is -1 (its first call),
-    // and the main thread makes that call long before any thread starts:
-    // the first buf_new (grow with count 0 = cap 0 reaches stress_grow) is
-    // in build before compile_program, and explicitly prepare_tasks (before
-    // pool_start) and asm_thread_start (before pthread_create) call
-    // stress_grow; after that every thread only reads it (pthread_create
-    // orders the write before their reads)
-    unsafe { STRESS_GROW }
+    STRESS_GROW.load(Ordering::Relaxed)
 }
 
 fn set_stress_grow(v: i64) {
-    // UNSAFE: the stress-grow mode, a process-wide static mut read by every
-    // thread; Rust has no safe access to a static mut
-    // SAFETY: stress_grow writes it only while it is -1 (its first call),
-    // and the main thread makes that call long before any thread starts:
-    // the first buf_new (grow with count 0 = cap 0 reaches stress_grow) is
-    // in build before compile_program, and explicitly prepare_tasks (before
-    // pool_start) and asm_thread_start (before pthread_create) call
-    // stress_grow; after that every thread only reads it (pthread_create
-    // orders the write before their reads)
-    unsafe {
-        STRESS_GROW = v;
-    }
-}
-
-// (0.28.0) BUFS's accessors: every use of it is one of them. (0.29)
-// Private: the rest of the compiler reads a buffer through buf_len,
-// buf_at, buf_copy, buf_done and buf_ptr and writes it through the
-// buf_* writers above, all in this file.
-fn get_bufs() -> *mut Buf {
-    // UNSAFE: base's table of byte buffers, a process-wide static mut; Rust
-    // has no safe access to a static mut
-    // SAFETY: the table pointer is written only by buf_new, and while
-    // another thread runs only the main thread calls buf_new: at -O0 the
-    // assembler thread never touches BUFS (its one path to it, dwarf_file,
-    // needs -g, which starts no thread), and at -O1+ no worker calls
-    // buf_new outside serial-only modes and the joining main thread calls
-    // it only via dwarf_file (-g); each thread writes only entries of its
-    // own buffers (a task its context's cx.asm, cx.code, cx.scratch_buf;
-    // the join the program context's), and between phases the hand-over
-    // under MUTEX orders the main thread's buf_new before the tasks' reads
-    // of the pointer; accessed through the accessor's raw pointer, no
-    // reference kept
-    unsafe { BUFS }
-}
-
-fn set_bufs(v: *mut Buf) {
-    // UNSAFE: base's table of byte buffers, a process-wide static mut; Rust
-    // has no safe access to a static mut
-    // SAFETY: the table pointer is written only by buf_new, and while
-    // another thread runs only the main thread calls buf_new: at -O0 the
-    // assembler thread never touches BUFS (its one path to it, dwarf_file,
-    // needs -g, which starts no thread), and at -O1+ no worker calls
-    // buf_new outside serial-only modes and the joining main thread calls
-    // it only via dwarf_file (-g); each thread writes only entries of its
-    // own buffers (a task its context's cx.asm, cx.code, cx.scratch_buf;
-    // the join the program context's), and between phases the hand-over
-    // under MUTEX orders the main thread's buf_new before the tasks' reads
-    // of the pointer; accessed through the accessor's raw pointer, no
-    // reference kept
-    unsafe {
-        BUFS = v;
-    }
-}
-
-// (0.28.0) BUF_COUNT's accessors: every use of it is one of them.
-fn get_buf_count() -> i64 {
-    // UNSAFE: base's buffer count, a process-wide static mut; Rust has no
-    // safe access to a static mut
-    // SAFETY: read and written only in buf_new, which runs on one thread at
-    // a time (the main thread; other threads reach it only in serial-only
-    // modes or under -g, when they do not exist)
-    unsafe { BUF_COUNT }
-}
-
-fn set_buf_count(v: i64) {
-    // UNSAFE: base's buffer count, a process-wide static mut; Rust has no
-    // safe access to a static mut
-    // SAFETY: read and written only in buf_new, which runs on one thread at
-    // a time (the main thread; other threads reach it only in serial-only
-    // modes or under -g, when they do not exist)
-    unsafe {
-        BUF_COUNT = v;
-    }
-}
-
-// (0.28.0) BUF_CAP's accessors: every use of it is one of them.
-fn get_buf_cap() -> i64 {
-    // UNSAFE: base's buffer table capacity, a process-wide static mut; Rust
-    // has no safe access to a static mut
-    // SAFETY: written only in buf_new (via grow), and buf_new runs on one
-    // thread at a time: the main thread, except that a worker or the
-    // joining main thread reach it only in serial-only modes (no other
-    // thread then) and the -O0 assembler thread only via dwarf_file under
-    // -g (no assembler thread then)
-    unsafe { BUF_CAP }
-}
-
-fn set_buf_cap(v: i64) {
-    // UNSAFE: base's buffer table capacity, a process-wide static mut; Rust
-    // has no safe access to a static mut
-    // SAFETY: written only in buf_new (via grow), and buf_new runs on one
-    // thread at a time: the main thread, except that a worker or the
-    // joining main thread reach it only in serial-only modes (no other
-    // thread then) and the -O0 assembler thread only via dwarf_file under
-    // -g (no assembler thread then)
-    unsafe {
-        BUF_CAP = v;
-    }
+    STRESS_GROW.store(v, Ordering::Relaxed);
 }
 
 // (0.28.0) STDOUT_CAPTURE's accessors: every use of it is one of them.
+// (0.29) An atomic, Relaxed: written only by volec query (run_query's
+// begin_output/end_output, module_context), which starts no thread;
+// the threads of a build read its initial -1.
 pub fn get_stdout_capture() -> i64 {
-    // UNSAFE: the stdout capture buffer of volec query, a process-wide
-    // static mut the threads read in buf_write_fd; Rust has no safe access
-    // to a static mut
-    // SAFETY: written only by volec query (run_query's
-    // begin_output/end_output, module_context), whose transitive callees
-    // never reach pool_start or asm_thread_start; threads exist only under
-    // build -> compile_program, where it keeps its initial -1, so the
-    // threads only ever read a value no thread changes
-    unsafe { STDOUT_CAPTURE }
+    STDOUT_CAPTURE.load(Ordering::Relaxed)
 }
 
 pub fn set_stdout_capture(v: i64) {
-    // UNSAFE: the stdout capture buffer of volec query, a process-wide
-    // static mut the threads read in buf_write_fd; Rust has no safe access
-    // to a static mut
-    // SAFETY: written only by volec query (run_query's
-    // begin_output/end_output, module_context), whose transitive callees
-    // never reach pool_start or asm_thread_start; threads exist only under
-    // build -> compile_program, where it keeps its initial -1, so the
-    // threads only ever read a value no thread changes
-    unsafe {
-        STDOUT_CAPTURE = v;
-    }
+    STDOUT_CAPTURE.store(v, Ordering::Relaxed);
 }
 
 // (0.28.0) SYMS_FROZEN's accessors: every use of it is one of them.
@@ -1881,114 +1940,5 @@ pub fn set_src(v: &'static [u8]) {
     // writes
     unsafe {
         SRC = v;
-    }
-}
-
-// (0.28.0) OUT_PATHS's accessors: every use of it is one of them.
-fn get_out_paths() -> IntVec {
-    // UNSAFE: the output path cache, a process-wide static mut; Rust has no
-    // safe access to a static mut
-    // SAFETY: written and read by out_path; a task reaches out_path only
-    // via back::dwarf::dbg_loc, i.e. only under -g, which makes the compile
-    // serial (parallel::serial_only); so it is never used by two threads
-    unsafe { OUT_PATHS }
-}
-
-fn set_out_paths(v: IntVec) {
-    // UNSAFE: the output path cache, a process-wide static mut; Rust has no
-    // safe access to a static mut
-    // SAFETY: written and read by out_path; a task reaches out_path only
-    // via back::dwarf::dbg_loc, i.e. only under -g, which makes the compile
-    // serial (parallel::serial_only); so it is never used by two threads
-    unsafe {
-        OUT_PATHS = v;
-    }
-}
-
-// (0.28.0) ROOT_DIR's accessors: every use of it is one of them.
-fn get_root_dir() -> *mut u8 {
-    // UNSAFE: the program root cache, a process-wide static mut; Rust has
-    // no safe access to a static mut
-    // SAFETY: written and read by root_dir; a task reaches root_dir only
-    // via back::dwarf::dbg_loc (-g), which makes the compile serial; never
-    // used by two threads
-    unsafe { ROOT_DIR }
-}
-
-fn set_root_dir(v: *mut u8) {
-    // UNSAFE: the program root cache, a process-wide static mut; Rust has
-    // no safe access to a static mut
-    // SAFETY: written and read by root_dir; a task reaches root_dir only
-    // via back::dwarf::dbg_loc (-g), which makes the compile serial; never
-    // used by two threads
-    unsafe {
-        ROOT_DIR = v;
-    }
-}
-
-// (0.28.0) ROOT_LEX's accessors: every use of it is one of them.
-fn get_root_lex() -> *mut u8 {
-    // UNSAFE: the lexical root cache of out_path, a process-wide static
-    // mut; Rust has no safe access to a static mut
-    // SAFETY: written and read only in out_path, which a task reaches only
-    // via dbg_loc under -g, which makes the compile serial; never used by
-    // two threads
-    unsafe { ROOT_LEX }
-}
-
-fn set_root_lex(v: *mut u8) {
-    // UNSAFE: the lexical root cache of out_path, a process-wide static
-    // mut; Rust has no safe access to a static mut
-    // SAFETY: written and read only in out_path, which a task reaches only
-    // via dbg_loc under -g, which makes the compile serial; never used by
-    // two threads
-    unsafe {
-        ROOT_LEX = v;
-    }
-}
-
-// (0.28.0) ROOT_LEX_ABS's accessors: every use of it is one of them.
-fn get_root_lex_abs() -> bool {
-    // UNSAFE: the lexical root flag of out_path, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: written and read only in out_path, reached on a task only via
-    // dbg_loc under -g (serial compile); never used by two threads
-    unsafe { ROOT_LEX_ABS }
-}
-
-fn set_root_lex_abs(v: bool) {
-    // UNSAFE: the lexical root flag of out_path, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: written and read only in out_path, reached on a task only via
-    // dbg_loc under -g (serial compile); never used by two threads
-    unsafe {
-        ROOT_LEX_ABS = v;
-    }
-}
-
-// (0.28.0) CWD's accessors: every use of it is one of them.
-fn get_cwd() -> *mut u8 {
-    // UNSAFE: the working directory cache, a process-wide static mut; Rust
-    // has no safe access to a static mut
-    // SAFETY: a thread other than main reaches its only writer/reader
-    // normal_path only through out_path <- back::dwarf::dbg_loc, which a
-    // task reaches only under -g (dbg_function_begin and emit_loc are gated
-    // by debug_info), and -g makes the compile serial
-    // (parallel::serial_only: one thread, no assembler thread); the join
-    // and the assembler thread do not reach it
-    unsafe { CWD }
-}
-
-fn set_cwd(v: *mut u8) {
-    // UNSAFE: the working directory cache, a process-wide static mut; Rust
-    // has no safe access to a static mut
-    // SAFETY: a thread other than main reaches its only writer/reader
-    // normal_path only through out_path <- back::dwarf::dbg_loc, which a
-    // task reaches only under -g (dbg_function_begin and emit_loc are gated
-    // by debug_info), and -g makes the compile serial
-    // (parallel::serial_only: one thread, no assembler thread); the join
-    // and the assembler thread do not reach it
-    unsafe {
-        CWD = v;
     }
 }
