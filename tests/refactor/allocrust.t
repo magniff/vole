@@ -39,7 +39,7 @@ main.vl:8:49: error[type error] undefined variable 'gpa' | help: a 'gpa: Gpa' co
 $ refactor signature split_path --add 'gpa: Gpa = gpa' --fill-calls
 added parameter gpa: Gpa to crate::split_path, 1 call	main.vl	+2 -2 lines
 $ check
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (1 file, 0 shaders)
 % volec main.vl -o prog && ./prog
 0 ["", "users", "ada"]
 ok: built prog

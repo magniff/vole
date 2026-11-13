@@ -31,7 +31,7 @@
 use std::alloc::Allocator;
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::back::objfile::assemble_bytes;
+use crate::back::objfile::{Asm, asm_new, assemble_bytes};
 use crate::base::{die, free, set_syms_frozen};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -383,29 +383,35 @@ struct AsmState<A: Allocator> {
     queue: Vec<AsmText, A>,
     head: usize,
     stop: bool,
-    // The thread's context, made by asm_thread_start.
-    cx: *mut FnCtx<A>,
 }
 
 pub struct AsmThread<A: Allocator> {
     state: Mutex<AsmState<A>>,
     wake: Condvar,
+    // The assembler (its state, the object begun by asm_stream_begin),
+    // lent by the main thread's context while the thread runs
+    // (asm_thread_start, asm_thread_finish); the thread holds its lock for
+    // as long as it runs.
+    assembler: Mutex<Asm<A>>,
 }
 
 pub fn asm_thread_new() -> Arc<AsmThread<Comp>, Comp> {
     Arc::new_in(AsmThread {
         state: Mutex::new(AsmState {
-            queue: Vec::new_in(Comp {}), head: 0, stop: false, cx: 0 as *mut FnCtx<Comp>,
+            queue: Vec::new_in(Comp {}), head: 0, stop: false,
         }),
         wake: Condvar::new(),
+        assembler: Mutex::new(asm_new()),
     }, Comp {})
 }
 
-pub fn asm_thread_start(pcx: &mut Ctx<Comp>) {
+pub fn asm_thread_start(pcx: &mut Ctx<Comp>, cx: &mut FnCtx<Comp>) {
     let asm = pcx.asm.clone();
+    // (0.29) The assembler is lent to the thread: until asm_thread_finish
+    // the main thread's context holds an empty one.
+    std::mem::swap(&mut cx.assembler, &mut *asm.assembler.lock().unwrap());
     {
         let mut st = asm.state.lock().unwrap();
-        st.cx = fnctx_new();
         st.queue.clear();
         st.head = 0;
         st.stop = false;
@@ -426,10 +432,12 @@ pub fn asm_thread_push(text: *mut u8, n: i64, pcx: &Ctx<Comp>) {
 }
 
 // Waits until the assembler has taken every text, and stops it.
-pub fn asm_thread_finish(pcx: &Ctx<Comp>) {
+pub fn asm_thread_finish(pcx: &Ctx<Comp>, cx: &mut FnCtx<Comp>) {
     pcx.asm.state.lock().unwrap().stop = true;
     pcx.asm.wake.notify_all();
     join_thread(pcx.a_thread);
+    // (the thread has ended: the assembler is the main thread's again)
+    std::mem::swap(&mut cx.assembler, &mut *pcx.asm.assembler.lock().unwrap());
 }
 
 // The assembler's thread: its argument is its queue.
@@ -441,8 +449,8 @@ extern "C" fn asm_thread_main(arg: *mut u8) -> *mut u8 {
     // (asm_thread_finish joins it); it is shared `&`, its state behind its
     // lock.
     let asm = unsafe { &*(arg as *const AsmThread<Comp>) };
+    let mut assembler = asm.assembler.lock().unwrap();
     let mut st = asm.state.lock().unwrap();
-    let cx = st.cx;
     loop {
         while st.head == st.queue.len() && !st.stop {
             st = asm.wake.wait(st).unwrap();
@@ -453,16 +461,14 @@ extern "C" fn asm_thread_main(arg: *mut u8) -> *mut u8 {
         let t = st.queue[st.head];
         st.head += 1;
         drop(st);
-        // UNSAFE: the thread's context and a handed-over text are raw: the
-        // context is made as a zeroed block (fnctx_new), the text is the
-        // code generator's copy, sized by the caller.
-        // SAFETY: cx is asm_thread_start's fnctx_new, used by this thread
-        // alone (the main thread keeps no reference to it); t.text is
-        // asm_hand_over's block of t.n + 1 bytes from C's allocator, the
-        // first t.n written, which only this thread has after the push: it
-        // is read here and freed once.
+        // UNSAFE: a handed-over text is raw: the code generator's copy, a
+        // block from C's allocator sized by the caller.
+        // SAFETY: t.text is asm_hand_over's block of t.n + 1 bytes, the
+        // first t.n written, which only this thread has after the push: the
+        // slice of t.n bytes lives for the call, and the block is freed
+        // once, after it.
         unsafe {
-            assemble_bytes(&mut *cx, t.text, t.n);
+            assemble_bytes(std::slice::from_raw_parts(t.text, t.n as usize), &mut *assembler);
             free(t.text);
         }
         st = asm.state.lock().unwrap();

@@ -32,7 +32,7 @@ $ fix --only pub --dry-run
 $ fix --only pub
 fixed 4 pubs	main.vl	+4 -4 lines
 $ check
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (1 file, 0 shaders)
 $ explain item.private
 item.private: error
 (0.26.2) An item (a function, a type, a constant, a static, a module) used outside the module that declares it, where it is not visible (Rust's E0603): an item not marked `pub` is private to its module and the modules inside it; one marked `pub(crate)`, `pub(super)` or `pub(in path)` is visible only up to that module (the message says which: `crate 'std'`, `module 'a::b'`). Until 0.26.2 this was a `type error`.

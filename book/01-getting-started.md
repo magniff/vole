@@ -201,7 +201,8 @@ hello.vl:3:5: error[parser error] expected ';' or '}' after expression, got 'pri
 `check` prints each error on a single line, `FILE:LINE:COLUMN:` first,
 which is handy when there are many of them. It's also the form editors
 and other tools read. Put the semicolon back and run it again, and it
-answers `ok: 0 errors in hello.vl`.
+answers `ok: 0 errors in hello.vl (1 file, 0 shaders)`: the program
+it checked, and what it read.
 
 ## Exit status
 

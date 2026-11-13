@@ -16,6 +16,8 @@ struct Params {
     materials: array<Material, 4>,
     // the scene and the fog's scattering albedo (used by the tracer)
     fog: vec4<f32>,
+    // x: the display filter is on (see filter below); yzw: unused.
+    display: vec4<f32>,
 }
 struct Surface {
     normal: vec4<f32>,
@@ -64,6 +66,47 @@ fn segment_distance(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
     let t = clamp(dot(p - a, ab) / max(0.0001, dot(ab, ab)), 0.0, 1.0);
     return length(p - (a + ab * t));
 }
+// A display-only joint bilateral filter over the accumulation: 5x5 taps that
+// only see the same primary-hit surface (material id, normal within 18
+// degrees, depth within 3%, albedo within 0.12), so silhouettes, checker
+// edges and wall corners keep their hard edge. The range term, relative to the
+// centre pixel, rejects the rare sample that is far brighter than its
+// neighbours, which is what a lone firefly looks like. It never writes to the
+// accumulation: the variance view, the comparison split and --no-denoise all
+// show the raw average, and a reset does not depend on it.
+fn filter(index: u32, center: vec3<f32>) -> vec3<f32> {
+    let width = u32(u.dims.x);
+    let height = u32(u.dims.y);
+    let x = i32(index % width);
+    let y = i32(index / width);
+    let g0 = gbuffer[index];
+    let lum0 = dot(center, vec3<f32>(0.3333333333));
+    let sigma = max(0.30 * lum0, 0.008);
+    let count = max(1.0, u.dims.z + 1.0);
+    var sum = center;
+    var total = 1.0;
+    for (var dy: i32 = -2; dy <= 2; dy += 1) {
+        for (var dx: i32 = -2; dx <= 2; dx += 1) {
+            if dx == 0 && dy == 0 { continue; }
+            let sx = x + dx;
+            let sy = y + dy;
+            if sx < 0 || sy < 0 || sx >= i32(width) || sy >= i32(height) { continue; }
+            let j = u32(sy) * width + u32(sx);
+            let g = gbuffer[j];
+            if g.albedo.w != g0.albedo.w { continue; }
+            if dot(g.normal.xyz, g0.normal.xyz) < 0.95 { continue; }
+            if abs(g.normal.w - g0.normal.w) > 0.08 * max(0.001, g0.normal.w) { continue; }
+            let da = g.albedo.xyz - g0.albedo.xyz;
+            if max(abs(da.x), max(abs(da.y), abs(da.z))) > 0.12 { continue; }
+            let value = accum[j * 3u].xyz / count;
+            let ln = dot(value, vec3<f32>(0.3333333333));
+            let weight = exp(-abs(ln - lum0) / sigma);
+            sum += value * weight;
+            total += weight;
+        }
+    }
+    return sum / total;
+}
 @fragment fn fs(v: Vertex) -> @location(0) vec4<f32> {
     let width = u32(u.dims.x);
     let height = u32(u.dims.y);
@@ -72,13 +115,14 @@ fn segment_distance(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
     let index = y * width + x;
     let count = max(1.0, u.dims.z + 1.0);
     let average = accum[index * 3u].xyz / count;
+    let mode = u32(u.flags.x + 0.5);
     var linear = average;
     if u.env.w > 0.5 && v.uv.x < 0.5 { linear = accum[index * 3u + 2u].xyz; }
+    if u.display.x > 0.5 && mode == 0u && u.env.w < 0.5 { linear = filter(index, linear); }
     var color = tone(linear);
     if u.env.w > 0.5 && abs(v.uv.x - 0.5) * u.dims.x < 0.7 {
         color = vec3<f32>(0.8, 0.9, 1.0);
     }
-    let mode = u32(u.flags.x + 0.5);
     if mode == 1u { color = gbuffer[index].normal.xyz * 0.5 + vec3<f32>(0.5); }
     if mode == 2u { color = tone(gbuffer[index].albedo.xyz); }
     if mode == 3u { color = heat(1.0 - exp(-gbuffer[index].normal.w * 0.075)); }

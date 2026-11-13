@@ -36,6 +36,6 @@ fn main() -> i32 {
 $ refactor rename Cmd::Move Go
 renamed crate::Cmd::Move to Go	main.vl	+4 -4 lines
 $ check
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (1 file, 0 shaders)
 $ query type main.vl:16:13
 Cmd	Cmd::Go { y: 2, x: 1 }

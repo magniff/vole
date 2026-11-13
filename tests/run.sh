@@ -45,12 +45,12 @@
 #   -f FILE       (0.25.2) more FILTERs, one per line (# comments)
 #   -l            (0.25.2) list what the FILTERs select, `case NAME` and
 #                 `suite NAME` (`leveled`: it takes -O), and run nothing
-#   -n NAME       (0.25.5) only NAME, as '=NAME' (repeatable): zsh expands
-#                 an unquoted =NAME to a path, and then nothing runs
+#   -n NAME       (0.25.5) only the case, suite or check named NAME exactly
+#                 (repeatable)
 #   FILTER...     run only the cases (and the suites and checks below)
-#                 whose name contains a FILTER; '=NAME': only NAME (0.25.2:
-#                 several of them, and -f, select the union; quote it in
-#                 zsh, or use -n NAME)
+#                 whose name contains a FILTER (`tests/run.sh pathtrace`:
+#                 every case of the path tracer); several of them, -n
+#                 and -f select the union
 #
 # Environment: CC is the linker (and the assembler with -a; default cc).
 # VOLE_JOBSERVER (0.11), when -j is not given, names a FIFO holding

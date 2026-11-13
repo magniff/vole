@@ -112,7 +112,7 @@ pub fn scale(s: Shape, k: i64) -> Shape {
 $ check
 main.vl:4:27: warning[use.unused] unused import 'perimeter': nothing in this file names it | help: remove it (`volec fix` removes every unused import) | try: volec fix --only unused main.vl
 main.vl:4:38: warning[use.unused] unused import 'scale': nothing in this file names it | help: remove it (`volec fix` removes every unused import) | try: volec fix --only unused main.vl
-ok: 0 errors, 2 warnings in main.vl
+ok: 0 errors, 2 warnings in main.vl (2 files, 0 shaders)
 ## Undo, resolve by resolve.
 $ undo
 undid resolved main.vl:4-8 (text)	main.vl	+1 -5 lines
