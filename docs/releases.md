@@ -363,9 +363,9 @@ static promotion.
 - tests/run: every case is in the one language. Of the 2872 MVS cases
   at the start, 1900 were translated and pass, 819 were translated and
   marked `// XFAIL: gap N`, 126 deleted, 27 rewritten by hand later.
-  XFAIL now: TODO(gate: XFAIL count; 131 in 0.27.8). The last full
-  suite on the final tree, before the last polish of help texts:
-  6268 passed, 733 xfail, 0 failed, 1 skipped (no spirv-val).
+  XFAIL now: 732 (131 in 0.27.8). The gate's suite on the final tree,
+  at each of -O0, -O1 and -O2: 6273 passed, 732 xfail, 0 failed, 1
+  skipped (no spirv-val).
 - The transcripts (tests/query, tests/refactor, the LSP sessions, the
   walkthroughs), the guide (`volec guide`: every block compiled), the
   Book, `explain`, the examples (all of examples/, with their cases:
@@ -472,20 +472,41 @@ static promotion.
 - Files the edition line was removed from: 5786 (5768 lines in 5735
   files, 20 in strings of 12 files, and the positions that moved in
   1197 transcripts and expectations).
-- `git diff --shortstat v0.27.8 v0.28.0`: 8050 files changed, 236,601
-  insertions, 1,672,074 deletions (evals/ and tests/agent-eval/
+- `git diff --shortstat v0.27.8 v0.28.0`: 8057 files changed, 237,534
+  insertions, 1,672,151 deletions (evals/ and tests/agent-eval/
   1,380,820 of the deletions; the old std with its tools and tests
   69,967; the translator 18,602; the own pass 12,759). compiler/src:
-  508 files and 287,037 lines in 0.27.8, 473 and 264,826 now.
+  508 files and 287,037 lines in 0.27.8, 473 and 264,948 now.
 - Places where an index became a `usize`: about 215.
-- The suite: TODO(gate: cases at -O0, -O1, -O2 and the XFAIL count;
-  0.27.8: 7027 and 131).
-- Compile cost against v0.27.8: TODO(gate: hello, std, check, rust,
-  regions, hello-0.27 at most 2.00x).
-- TODO(gate: the binary's size; the compiler's own check and build in
-  instructions, the baseline 0.29 is held to).
-- TODO(gate: unsafe-audit's unjustified count; 2769 in 0.27.8).
-- TODO(gate: bench geomean against 0.27.8, idle machine).
+- The suite: 6273 cases pass at -O0, -O1 and -O2, 732 XFAIL (0.27.8:
+  7027 and 131).
+- Compile cost against v0.27.8, in instructions: a hello world 172.5 M
+  (0.98x), std 1214.5 M (0.97x), check of the compiler 21,199.8 M
+  (0.13x), regions 1203.7 M (0.13x). The hello world against the MVS
+  hello world of 0.27 (98.0 M): 1.76x, at most 2.00x. The `rust` row is
+  gone: every row is the one language.
+- The compiler's binary: 11,904,376 bytes (13,678,200 in 0.27.8). Its
+  own check, 21,199.8 M instructions, is the baseline 0.29 is held to.
+- unsafe-audit: 2573 unjustified sites in compiler/src (2769 in
+  0.27.8), 0 in std.
+- bench (`gate.sh --only bench`, idle machine, time against `cc -O2`
+  = 1, geomean): -O2 1.162, -O1 2.282, -O0 13.375; 0.27.8 building the
+  same programs: 1.185. **The row fails its iterator check**: iterchain
+  takes 2.37 times iterloop (the limit is 1.05; 2.29 with 0.27.8 on the
+  same sources), so std's iterator chains are not zero cost. Known, and
+  the first item of the speed work in 0.30. Eight bench programs
+  multiplied and added past 64 bits in generators and checksums, a
+  panic at -O0 in the one language; they say `wrapping_mul` and
+  `wrapping_add` now and print what they printed.
+- Found by the gate and fixed before the tag: at -O2 with threads, the
+  phi ranges' tables were emptied when they grew, and whether they grew
+  in the middle of an analysis depended on what the thread had compiled
+  before, so a large function's code could depend on the schedule
+  (objcheck's x86 row: 1 of 260 differed). As old as 0.18.1; the new
+  std's code showed it. `tests/threads.sh` repeats that program. The
+  layout check compared 4 records for 111 (it lost a record whose C
+  name is followed by a derive line), and the thread check's repeated
+  program did not build (a stale XFAIL).
 
 ---
 
