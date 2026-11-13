@@ -30,6 +30,10 @@
 // on one thread (serial_only): -g, --time-passes (its clock is the
 // process's), --stats, --verify-ir, the IR printers.
 
+use std::alloc::Allocator;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
+
 use crate::host_target;
 use crate::back::codecache::{
     R_STATIC, cc_component_begin, cc_component_end, cc_emit_begin, cc_emit_end, cc_note, cc_of,
@@ -52,10 +56,13 @@ use crate::gen0::target::{add_const_data, rt_output};
 use crate::middle::ctx::{FnCtx, main_cx};
 use crate::middle::inline::{add_program_size, finish_component_function, ir_callee};
 use crate::middle::ipo::infer_component_attrs;
-use crate::middle::ir::{Block, Op, get_irfuncs, ir_enter, ir_release, rtid_class, rtid_value};
+use crate::middle::ir::{
+    Op, fn_block, fn_block_count, ir_clear_marks, ir_enter, ir_release, ir_stored, rtid_class,
+    rtid_value,
+};
 use crate::middle::opt::{cleanup_function, optimize_component_function, simplify_function};
 use crate::middle::threads::{
-    get_pool_ctx, pool_run, pool_run_joined, pool_start, pool_stop, processors,
+    pool_context, pool_run, pool_run_joined, pool_start, pool_stop, processors,
 };
 
 extern "C" {
@@ -172,9 +179,10 @@ fn monotonic_ns() -> i64 {
 pub fn vec_stat(k: i64, pcx: &mut Ctx<Comp>) -> i64 {
     unsafe {
         let mut n = vec_stat_of(&mut *main_cx(pcx), k);
-        if get_pool_ctx() != 0 as *mut *mut FnCtx<Comp> {
-            for i in 0..pcx.pool_contexts {
-                n += vec_stat_of(&mut *(*get_pool_ctx().add(i as usize)), k);
+        for i in 0..pcx.pool_contexts {
+            let cx = pool_context(i, pcx);
+            if cx != 0 as *mut FnCtx<Comp> {
+                n += vec_stat_of(&mut *cx, k);
             }
         }
         n
@@ -380,6 +388,92 @@ pub const P_DEFERRED: i64 = 4;
 pub const P_SLP: i64 = 5;
 pub const P_EMIT: i64 = 6;
 
+// (0.29) A table of i64 that the tasks of a phase share by element: per
+// function or per component, an entry is written by the one task that has
+// the function (or the component) in its plan, and read by others only
+// once that task is done (a callee of a lower level, a fact made in an
+// earlier phase: tests/threads_writes.sh says which and why). The entries
+// are atomics, so the table is read and written through `&` in safe code
+// and a read never sees half a value; the order of a write and a later
+// read is the pool's (a phase's end, under its lock), so the loads and
+// stores are relaxed and cost what a plain one does. The main thread makes
+// the table anew between phases (`reset`, with `&mut`).
+pub struct TaskInts<A: Allocator> {
+    v: Vec<AtomicI64, A>,
+}
+
+pub fn task_ints() -> TaskInts<Comp> {
+    TaskInts { v: Vec::new_in(Comp {}) }
+}
+
+impl<A: Allocator> TaskInts<A> {
+    // n entries, each `value`.
+    pub fn reset(&mut self, n: i64, value: i64) {
+        self.v.clear();
+        for i in 0..n {
+            self.v.push(AtomicI64::new(value));
+        }
+    }
+
+    pub fn len(&self) -> i64 {
+        self.v.len() as i64
+    }
+
+    pub fn get(&self, i: i64) -> i64 {
+        self.v[i as usize].load(Ordering::Relaxed)
+    }
+
+    pub fn set(&self, i: i64, value: i64) {
+        self.v[i as usize].store(value, Ordering::Relaxed);
+    }
+
+    // (one writer an entry: a read and a write, not an atomic add)
+    pub fn add(&self, i: i64, d: i64) {
+        self.set(i, self.get(i) + d);
+    }
+}
+
+// (0.29) A table of lists of i64 shared by element as a TaskInts is: a
+// list is written by the task that has its function (or component) and
+// read by others once that task is done. Each list is behind a lock of
+// its own, free but for a moment (one push, one read), so the table is
+// used through `&` in safe code.
+pub struct TaskLists<A: Allocator> {
+    v: Vec<Mutex<Vec<i64, A>>, A>,
+}
+
+pub fn task_lists() -> TaskLists<Comp> {
+    TaskLists { v: Vec::new_in(Comp {}) }
+}
+
+impl TaskLists<Comp> {
+    // n lists, each empty.
+    pub fn reset(&mut self, n: i64) {
+        self.v.clear();
+        for i in 0..n {
+            self.v.push(Mutex::new(Vec::new_in(Comp {})));
+        }
+    }
+
+    pub fn clear(&self, i: i64) {
+        self.v[i as usize].lock().unwrap().clear();
+    }
+
+    pub fn push(&self, i: i64, value: i64) {
+        self.v[i as usize].lock().unwrap().push(value);
+    }
+
+    // The length of list i, and its k-th item.
+    pub fn count(&self, i: i64) -> i64 {
+        self.v[i as usize].lock().unwrap().len() as i64
+    }
+
+    pub fn at(&self, i: i64, k: i64) -> i64 {
+        let list = self.v[i as usize].lock().unwrap();
+        (*list)[k as usize]
+    }
+}
+
 // Runs task `task` of a phase of kind `kind` in context cx (any thread).
 pub fn run_task(mut cx: *mut FnCtx<Comp>, kind: i64, task: i64, pcx: &Ctx<Comp>) {
     unsafe {
@@ -394,12 +488,12 @@ pub fn run_task(mut cx: *mut FnCtx<Comp>, kind: i64, task: i64, pcx: &Ctx<Comp>)
         if kind == K_COMPONENT {
             let c = (pcx.parallel_items[task as usize]);
             for i in (*pcx.comp_start.add(c as usize))..(*pcx.comp_end.add(c as usize)) {
-                clear_marks((pcx.scc_order[i as usize]));
+                ir_clear_marks(&mut *cx, (pcx.scc_order[i as usize]), pcx);
             }
             run_component(&mut *cx, c, pcx);
         } else {
             let fi = (pcx.parallel_items[task as usize]);
-            clear_marks(fi);
+            ir_clear_marks(&mut *cx, fi, pcx);
             cx.task_rank = task;
             // (0.18.1: -O2's cleanup and scalar pipeline from the code cache;
             // -O1's cleanup alone costs less than its entry)
@@ -447,7 +541,7 @@ pub fn run_task(mut cx: *mut FnCtx<Comp>, kind: i64, task: i64, pcx: &Ctx<Comp>)
                 }
             }
         }
-        ir_release(&mut *cx);
+        ir_release(&mut *cx, pcx);
         cx.task_phase = 0;
         cx.task_rank = 0;
     }
@@ -456,7 +550,7 @@ pub fn run_task(mut cx: *mut FnCtx<Comp>, kind: i64, task: i64, pcx: &Ctx<Comp>)
 // What a task finds in its context: nothing an earlier task left that it
 // would use without computing it again. The passes' scratch is made anew
 // for each function, or checked by stamps (its functions' marks zeroed
-// first, clear_marks); these caches are keyed by the function, which
+// first, ir_clear_marks); these caches are keyed by the function, which
 // another task on this thread may have changed since:
 // - gvn's param_written (ro_fn, ro_stamp);
 // - vecfacts' vec_header_at (vh_key: by type, and a pool's context outlives
@@ -465,30 +559,6 @@ fn begin_task(cx: &mut FnCtx<Comp>) {
     cx.ro_fn = -1;
     cx.ro_stamp = -1;
     cx.vh_key = [0; 64];
-}
-
-// (0.27.7) The marks of function fi's instructions and blocks, zeroed as
-// a task on it begins. Passes compare marks with their context's stamps
-// (tags_stamp, capture_stamp, sim_stamp, vstamp), which every context
-// counts from the same base: a mark left by the function's task in another
-// context, or installed by the code cache from another run, could equal
-// this context's next stamp, and the code made would depend on which
-// thread ran what before. (A pass's aux is read only where its mark is the
-// pass's stamp.)
-fn clear_marks(fi: i64) {
-    // UNSAFE: IRFUNCS' tables are raw arrays (the IR's own representation).
-    // SAFETY: v and b are below the tables' counts; fi is this task's own
-    // function, current in no context (every task ends with ir_release, the
-    // main thread releases before a phase), so no other thread writes them.
-    unsafe {
-        let t = (*get_irfuncs().add(fi as usize)).t;
-        for v in 0..t.inst_count {
-            (*t.insts.add(v as usize)).mark = 0;
-        }
-        for b in 0..t.block_count {
-            (*(t.blocks as *mut Block<Comp>).add(b as usize)).mark = 0;
-        }
-    }
 }
 
 // (VOLE_FRESH_CONTEXTS) A new context with cx's buffers (each thread
@@ -502,7 +572,7 @@ fn fresh_context(cx: &mut FnCtx<Comp>) -> *mut FnCtx<Comp> {
 fn run_tasks(cx: &mut FnCtx<Comp>, kind: i64, first: i64, end: i64, pcx: &mut Ctx<Comp>) {
     unsafe {
         let mut tasks = task_list(cx, kind, first, end, pcx);
-        pool_run(kind, tasks, pcx);
+        pool_run(kind, tasks.as_slice(), pcx);
         free(tasks.data as *mut u8);
     }
 }
@@ -515,7 +585,7 @@ fn run_tasks(cx: &mut FnCtx<Comp>, kind: i64, first: i64, end: i64, pcx: &mut Ct
 // read is made first (ir_release, prepare_layouts).
 fn task_list(cx: &mut FnCtx<Comp>, kind: i64, first: i64, end: i64, pcx: &mut Ctx<Comp>) -> IntVec {
     unsafe {
-        ir_release(cx);
+        ir_release(cx, pcx);
         prepare_layouts(pcx);
         let mut tasks = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
         let mut i = end;
@@ -541,11 +611,11 @@ fn task_list(cx: &mut FnCtx<Comp>, kind: i64, first: i64, end: i64, pcx: &mut Ct
 fn task_weight(kind: i64, item: i64, pcx: &Ctx<Comp>) -> i64 {
     unsafe {
         if kind != K_COMPONENT {
-            return (*get_irfuncs().add(item as usize)).t.inst_count;
+            return ir_stored(item, pcx).t.insts.len() as i64;
         }
         let mut w: i64 = 0;
         for k in (*pcx.comp_start.add(item as usize))..(*pcx.comp_end.add(item as usize)) {
-            w += (*get_irfuncs().add((pcx.scc_order[k as usize]) as usize)).t.inst_count;
+            w += ir_stored((pcx.scc_order[k as usize]), pcx).t.insts.len() as i64;
         }
         w
     }
@@ -623,11 +693,6 @@ pub fn simplify_all(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
 
 // ---- -O2: the components, bottom up ----
 
-// Per component: what its inlining added to the program's size, and the
-// callees it inlined (one entry per call); its task writes them.
-static mut COMP_GROWTH: *mut i64 = 0 as *mut i64;
-static mut COMP_INLINED: *mut IntVec = 0 as *mut IntVec;
-
 // Builds the components and their levels (main thread).
 fn build_components(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
     unsafe {
@@ -663,8 +728,8 @@ fn build_components(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
         // through the address may be made direct, and the function inlined)
         // when it comes before it in SCC_ORDER (0.17 had it done then).
         pcx.comp_level = alloc_array::<i64>(pcx.comp_count + 1);
-        set_comp_growth(alloc_array::<i64>(pcx.comp_count + 1));
-        set_comp_inlined(alloc_zeroed((pcx.comp_count + 1) * size_of(IntVec)) as *mut IntVec);
+        pcx.comp_growth.reset(pcx.comp_count + 1, 0);
+        pcx.comp_inlined.reset((pcx.comp_count + 1));
         pcx.level_count = 0;
         let mut calls = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
         for c in 0..pcx.comp_count {
@@ -683,7 +748,7 @@ fn build_components(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
                 pcx.level_count = level + 1;
             }
         }
-        ir_release(cx);
+        ir_release(cx, pcx);
         free(calls.data as *mut u8);
     }
 }
@@ -694,8 +759,8 @@ fn callees_and_addresses(cx: &mut FnCtx<Comp>, fi: i64, out: &mut IntVec, pcx: &
     unsafe {
         out.clear();
         ir_enter(cx, fi, pcx);
-        for i in 0..(*get_irfuncs().add(fi as usize)).blocks.len() as i64 {
-            let b = ((*get_irfuncs().add(fi as usize)).blocks[i as usize]);
+        for i in 0..fn_block_count(cx, fi) {
+            let b = (fn_block(cx, fi, i));
             if (cx.blocks[b as usize]).removed != 0 {
                 continue;
             }
@@ -748,9 +813,9 @@ pub fn optimize_components(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
             // next levels.
             for k in (*start.add(l as usize))..(*start.add((l + 1) as usize)) {
                 let c = (by_level[k as usize]);
-                add_program_size((*get_comp_growth().add(c as usize)), pcx);
-                for m in 0..(*get_comp_inlined().add(c as usize)).len() as i64 {
-                    (pcx.fn_calls[((*get_comp_inlined().add(c as usize))[m as usize]) as usize]) -= 1;
+                add_program_size((pcx.comp_growth.get(c)), pcx);
+                for m in 0..pcx.comp_inlined.count(c) {
+                    (pcx.fn_calls[(pcx.comp_inlined.at(c, m)) as usize]) -= 1;
                 }
             }
         }
@@ -784,9 +849,9 @@ fn run_component(cx: &mut FnCtx<Comp>, c: i64, pcx: &Ctx<Comp>) {
         for i in start..end {
             finish_component_function(cx, (pcx.scc_order[i as usize]), pcx);
         }
-        (*get_comp_growth().add(c as usize)) = cx.comp_growth;
+        pcx.comp_growth.set(c, cx.comp_growth);
         for m in 0..cx.comp_dec.len() as i64 {
-            (*get_comp_inlined().add(c as usize)).push((cx.comp_dec[m as usize]));
+            pcx.comp_inlined.push(c, (cx.comp_dec[m as usize]));
         }
         if pcx.cc_on {
             cc_component_end(cx, c, start, end, pcx);
@@ -861,9 +926,9 @@ fn emit_range(cx: &mut FnCtx<Comp>, first: i64, end: i64, pcx: &mut Ctx<Comp>) {
         let mut tasks = task_list(cx, K_EMIT, first, end, pcx);
         let mut next = first;
         if pcx.pool_threads > 1 {
-            next = pool_run_joined(K_EMIT, tasks, first, end, pcx);
+            next = pool_run_joined(K_EMIT, tasks.as_slice(), first, end, pcx);
         } else {
-            pool_run(K_EMIT, tasks, pcx);
+            pool_run(K_EMIT, tasks.as_slice(), pcx);
         }
         free(tasks.data as *mut u8);
         resolve_consts(pcx);
@@ -1055,7 +1120,6 @@ fn prepare_tasks(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
     crate::middle::ipo::init_syms(pcx);
     crate::front::cells::find_cell_sym(pcx);
     crate::front::effects::builtin::fill_c_table(pcx);
-    crate::middle::egraph::init_rules();
     prepare_layouts(pcx);
 }
 
@@ -1111,62 +1175,6 @@ fn set_fn_consts(v: *mut ConstList) {
     // that entry, never the count or slots an appending task writes
     unsafe {
         FN_CONSTS = v;
-    }
-}
-
-// (0.28.0) COMP_GROWTH's accessors: every use of it is one of them.
-pub fn get_comp_growth() -> *mut i64 {
-    // UNSAFE: the per-component growth, a process-wide static mut; Rust has
-    // no safe access to a static mut
-    // SAFETY: allocated by build_components on the main thread before the
-    // levels; COMP_GROWTH[c] written only by component c's task
-    // (run_component, component_install), read by that task
-    // (cc_component_end) and by the main thread after the level's pool_run
-    // (optimize_components); one task per component per level
-    unsafe { COMP_GROWTH }
-}
-
-pub fn set_comp_growth(v: *mut i64) {
-    // UNSAFE: the per-component growth, a process-wide static mut; Rust has
-    // no safe access to a static mut
-    // SAFETY: allocated by build_components on the main thread before the
-    // levels; COMP_GROWTH[c] written only by component c's task
-    // (run_component, component_install), read by that task
-    // (cc_component_end) and by the main thread after the level's pool_run
-    // (optimize_components); one task per component per level
-    unsafe {
-        COMP_GROWTH = v;
-    }
-}
-
-// (0.28.0) COMP_INLINED's accessors: every use of it is one of them.
-pub fn get_comp_inlined() -> *mut IntVec {
-    // UNSAFE: the per-component inlined-callee lists, a process-wide static
-    // mut; Rust has no safe access to a static mut
-    // SAFETY: the pointer is written only by build_components on the main
-    // thread before the bottom-up levels run; entry c is pushed only by
-    // component c's task (run_component, or component_install on a cache
-    // hit) and read by that task (cc_component_end) and by the main thread
-    // after the level's pool_run returned (optimize_components' barrier); a
-    // level's tasks are distinct components (by_level lists each once;
-    // run_task's c = parallel_items[task]), so no two threads touch one
-    // entry at once
-    unsafe { COMP_INLINED }
-}
-
-pub fn set_comp_inlined(v: *mut IntVec) {
-    // UNSAFE: the per-component inlined-callee lists, a process-wide static
-    // mut; Rust has no safe access to a static mut
-    // SAFETY: the pointer is written only by build_components on the main
-    // thread before the bottom-up levels run; entry c is pushed only by
-    // component c's task (run_component, or component_install on a cache
-    // hit) and read by that task (cc_component_end) and by the main thread
-    // after the level's pool_run returned (optimize_components' barrier); a
-    // level's tasks are distinct components (by_level lists each once;
-    // run_task's c = parallel_items[task]), so no two threads touch one
-    // entry at once
-    unsafe {
-        COMP_INLINED = v;
     }
 }
 

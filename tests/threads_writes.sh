@@ -39,17 +39,16 @@ done
 case "$COMPILER" in /*) ;; *) COMPILER="$(pwd)/$COMPILER" ;; esac
 
 # static <TAB> why it is no race
-ALLOWED='middle::inline::FN_SIZE	the task'"'"'s own function'"'"'s entry; others read a lower level'"'"'s
-middle::inline::FN_RT	the task'"'"'s own function'"'"'s entry (finish_component_function)
-middle::inline::FN_DECIDERS_START	the task'"'"'s own function'"'"'s entry
-middle::inline::FN_DECIDERS	the task'"'"'s own function'"'"'s entry
-middle::opt::DEFERRED	the task'"'"'s own function'"'"'s entry
-middle::ir::IRFUNCS	the task'"'"'s own function'"'"'s entry (ir_save, ir_free_func, tail recursion)
-middle::ipo::FN_ATTRS	the task'"'"'s own component'"'"'s entries
-middle::ipo::FN_NOCAPTURE	the task'"'"'s own component'"'"'s entries
-middle::ipo::FN_ATTRS_DONE	the task'"'"'s own component'"'"'s entries
-middle::parallel::COMP_GROWTH	the task'"'"'s own component'"'"'s entry, read between levels
-middle::parallel::COMP_INLINED	the task'"'"'s own component'"'"'s entry, read between levels
+ALLOWED='base::ctx::Ctx.fn_size	the task'"'"'s own function'"'"'s entry; others read a lower level'"'"'s
+base::ctx::Ctx.fn_rt	the task'"'"'s own function'"'"'s entry (finish_component_function)
+base::ctx::Ctx.fn_deciders_start	the task'"'"'s own function'"'"'s entry
+base::ctx::Ctx.fn_deciders	the task'"'"'s own function'"'"'s entry
+base::ctx::Ctx.opt_deferred	the task'"'"'s own function'"'"'s entry
+base::ctx::Ctx.fn_attrs	the task'"'"'s own component'"'"'s entries
+base::ctx::Ctx.fn_nocapture	the task'"'"'s own component'"'"'s entries
+base::ctx::Ctx.fn_attrs_done	the task'"'"'s own component'"'"'s entries
+base::ctx::Ctx.comp_growth	the task'"'"'s own component'"'"'s entry, read between levels
+base::ctx::Ctx.comp_inlined	the task'"'"'s own component'"'"'s entry, read between levels
 middle::parallel::FN_CONSTS	the task'"'"'s own function'"'"'s list; others read its entries made in earlier phases, which never move (chunks)
 middle::parallel::FN_TEXT	the task'"'"'s own function'"'"'s entry, read at the join
 back::codecache::FN_IRH	the task'"'"'s own functions'"'"' entries; others read a lower level'"'"'s or an earlier phase'"'"'s (FN_IRH_OK)
@@ -63,23 +62,6 @@ back::codecache::pack::NEW	the task'"'"'s own slot, read when the pack is writte
 back::codecache::pack::USED	the entry of the task'"'"'s own key, read when the pack is written (0.27.8: a key is one task'"'"'s but a function'"'"'s that shares its symbol, fn_ambig, whose task does not mark it: mark_used)
 base::ctx::Ctx.pack	read only: an entry'"'"'s body is read through its address
 base::STRESS_GROW	read by prepare_tasks (stress_grow)
-middle::egraph::P_KIND	the rules, parsed by prepare_tasks (init_rules)
-middle::egraph::P_OP	the rules
-middle::egraph::P_COND	the rules
-middle::egraph::P_A	the rules
-middle::egraph::P_B	the rules
-middle::egraph::P_VAL	the rules
-middle::egraph::R_LHS	the rules
-middle::egraph::R_RHS	the rules
-middle::egraph::R_GUARD	the rules
-middle::egraph::R_VARS	the rules
-middle::egraph::RULES_READY	the rules
-middle::egraph::PT	the rules
-middle::egraph::PP	the rules
-middle::egraph::PVARS	the rules
-middle::egraph::R_VARS_NOW	the rules
-middle::egraph::R_BY_OP	the rules
-middle::egraph::R_BY_OP_START	the rules
 front::distinct::NICHE	enum_niche: every enum'"'"'s is made before a phase (prepare_layouts)
 front::cells::FREEZE_MEMO	interior_part: every type'"'"'s Freeze fact is made before a phase (prepare_layouts), so a task only reads it (GVN'"'"'s param_class_of)
 front::lexer::STRS	add_const_data: only on const_data'"'"'s serial branch (task_phase 0)
@@ -262,34 +244,18 @@ gen0::target::RT_NOTE_SYM	IR: a symbol by its text
 gen0::target::STR_ALIGN	IR: a string'"'"'s alignment (STR_H)
 base::ctx::Ctx.move_copies	IR: FN_MOVES
 base::ctx::Ctx.egraph	key: options_hash
-middle::egraph::PP	own: the rules, the same in every build of a compiler
-middle::egraph::PT	own: the same
-middle::egraph::PVARS	own: the same
-middle::egraph::P_A	own: the same
-middle::egraph::P_B	own: the same
-middle::egraph::P_COND	own: the same
-middle::egraph::P_KIND	own: the same
-middle::egraph::P_OP	own: the same
-middle::egraph::P_VAL	own: the same
-middle::egraph::RULES_READY	own: the same
-middle::egraph::R_BY_OP	own: the same
-middle::egraph::R_BY_OP_START	own: the same
-middle::egraph::R_GUARD	own: the same
-middle::egraph::R_LHS	own: the same
-middle::egraph::R_RHS	own: the same
-middle::egraph::R_VARS	own: the same
-middle::egraph::R_VARS_NOW	own: the same
-middle::gvn::MEMCPY_SYM	IR: a symbol by its text
+base::ctx::Ctx.rules	own: the rules, parsed when the context is made (egraph::rules_new), the same in every build of a compiler
+base::ctx::Ctx.memcpy_sym	IR: a symbol by its text
 base::ctx::Ctx.noalias_off	key: options_hash
 base::ctx::Ctx.ifconv	key: options_hash
 base::ctx::Ctx.fn_address	read: R_STATIC (facts_fixed); the key (own_fp)
 base::ctx::Ctx.fn_calls	read: R_CALLS, whether one is left
-middle::inline::FN_DECIDERS	read: R_DEC
-middle::inline::FN_DECIDERS_START	read: R_DEC
+base::ctx::Ctx.fn_deciders	read: R_DEC
+base::ctx::Ctx.fn_deciders_start	read: R_DEC
 base::ctx::Ctx.fn_live	read: R_STATIC; the key
-middle::inline::FN_RT	read: R_RT
+base::ctx::Ctx.fn_rt	read: R_RT
 base::ctx::Ctx.fn_scc	read: R_STATIC, whether in the task'"'"'s SCC
-middle::inline::FN_SIZE	read: R_SIZE; the key
+base::ctx::Ctx.fn_size	read: R_SIZE; the key
 base::ctx::Ctx.leaf_done	read: R_STATIC; the key
 base::ctx::Ctx.leaf_keep	read: R_STATIC; the key
 base::ctx::Ctx.leaf_small	read: R_STATIC; the key
@@ -297,14 +263,16 @@ base::ctx::Ctx.program_budget	read: R_BUDGET, whether within
 base::ctx::Ctx.program_size	read: R_BUDGET
 base::ctx::Ctx.scc_order	key: the component'"'"'s functions
 base::ctx::Ctx.attrs_ready	key: cc_phase
-middle::ipo::CALLOC_SYM	IR: a symbol by its text
-middle::ipo::FN_ATTRS	read: R_ATTRS; the key
-middle::ipo::FN_ATTRS_DONE	read: R_ATTRS, R_STATIC (ready); the key
-middle::ipo::FN_NOCAPTURE	read: R_ATTRS; the key
-middle::ipo::FREE_SYM	IR: a symbol by its text
-middle::ipo::MALLOC_SYM	IR: a symbol by its text
+base::ctx::Ctx.calloc_sym	IR: a symbol by its text
+base::ctx::Ctx.fn_attrs	read: R_ATTRS; the key
+base::ctx::Ctx.fn_attrs_done	read: R_ATTRS, R_STATIC (ready); the key
+base::ctx::Ctx.fn_nocapture	read: R_ATTRS; the key
+base::ctx::Ctx.free_sym	IR: a symbol by its text
+base::ctx::Ctx.malloc_sym	IR: a symbol by its text
 base::ctx::Ctx.fn_ir	IR: fn_canon (whether it has IR)
-middle::ir::IRFUNCS	IR: the task'"'"'s own; read: R_IR, another'"'"'s
+base::ctx::Ctx.irfuncs	IR: the task'"'"'s own, which it alone enters (ir_exchange: the entry'"'"'s parts are its context'"'"'s while it works on the function, and change sides under the entry'"'"'s lock); read: R_IR, another'"'"'s (ir_stored)
+base::ctx::Ctx.ir_fn	IR: a function by fn_canon (written once, by ir_new_func on the main thread)
+base::ctx::Ctx.ir_item	IR: the function'"'"'s item, written once with ir_fn (the trace'"'"'s and the profile'"'"'s positions)
 base::ctx::Ctx.fn_rtids	IR: an RTID value by its function and place, its class (the number is the join'"'"'s)
 base::ctx::Ctx.irfunc_count	own
 base::ctx::Ctx.ir_call_locs	off: --trace
@@ -313,12 +281,12 @@ base::ctx::Ctx.ir_loc	off: the same
 base::ctx::Ctx.ir_locs	off: the same
 base::ctx::Ctx.print_after_all	off: --print-after-all
 base::ctx::Ctx.verify_ir	off: --verify-ir
-middle::opt::DEFERRED	the key (own_fp)
+base::ctx::Ctx.opt_deferred	the key (own_fp)
 base::ctx::Ctx.opt_level	key: options_hash
 base::ctx::Ctx.per_function	key: options_hash
 base::ctx::Ctx.comp_end	key: the component'"'"'s functions
-middle::parallel::COMP_GROWTH	own: an output
-middle::parallel::COMP_INLINED	own: an output
+base::ctx::Ctx.comp_growth	own: an output
+base::ctx::Ctx.comp_inlined	own: an output
 base::ctx::Ctx.comp_level	read: R_STATIC (ready)
 base::ctx::Ctx.comp_of	read: R_STATIC (ready)
 base::ctx::Ctx.comp_start	key: the component'"'"'s functions
