@@ -210,7 +210,7 @@ load or inherited.
   called done: `tests/affected.sh --linux` (colima must run). The whole
   container row (`bootstrap/gate.sh --only linux-aarch64`) is tier 3's.
 - **Before reporting (tier 2):** `tools/premerge.sh` in the branch's
-  worktree (base contained, unsafe justified, fmt, every touched program
+  worktree (base contained, unsafe justified and none unneeded, fmt, every touched program
   checks clean, the embedded std up to date, example cases' sources
   exist) prints `premerge: ok`, and `tests/affected.sh` passes; report
   its plan line (`plan: N of M cases; ...`) and result. No full suite,
@@ -244,4 +244,13 @@ load or inherited.
   ```
 
   The same goes for an `unsafe fn` and an `extern` block. Never add
-  `unsafe` (or let `volec fix` add it) to silence an error.
+  `unsafe` (or let `volec fix` add it) to silence an error. In
+  compiler/src and std this is an error, not a warning (0.29): a site
+  without both comments, and in compiler/src an unsafe block with
+  nothing unsafe inside, fails `tools/premerge.sh` (its unsafe row) and
+  the gate (`tests/unsafe_audit.sh`: the count is 0 and stays 0), each
+  named with its position; `volec check --deny=unsafe` reports them as
+  errors where they are (the edit hook checks the compiler so), and
+  `volec fix --only unneeded-unsafe` takes an unneeded block away.
+  Another program's unjustified site is a warning
+  (`unsafe.unjustified`).

@@ -78,6 +78,22 @@ ALONE = """fn main() -> i32 {
 }
 """
 
+# (0.29) A stand-in for the compiler's own source: the unsafe row holds
+# compiler/src to no unsafe site without its comments and no unsafe block
+# with nothing unsafe inside (tests/unsafe_audit.sh).
+COMPILER_MAIN = """fn first(v: &[i64]) -> i64 {
+    let p = v.as_ptr();
+    // UNSAFE: a read through a raw pointer.
+    // SAFETY: main passes a slice of three numbers: p points to the first.
+    unsafe { *p }
+}
+
+fn main() -> i32 {
+    println("{}", first(&[1, 2, 3]));
+    0
+}
+"""
+
 tmp = os.path.realpath(tempfile.mkdtemp())
 try:
     repo = os.path.join(tmp, "r")
@@ -94,6 +110,11 @@ try:
     write(os.path.join(repo, "docs", "notes.md"), "notes\n")
     write(os.path.join(repo, "tests", "examples", "shade.test"), "// SOURCE: examples/shade/main.vl\n")
     write(os.path.join(repo, "tests", "run", "err_x.vl"), "// ERROR: unknown name\nfn main() -> i32 { y }\n")
+    shutil.copy(os.path.join(ROOT, "tests", "unsafe_audit.sh"), os.path.join(repo, "tests"))
+    write(os.path.join(repo, "compiler", "src", "main.vl"), COMPILER_MAIN)
+    os.makedirs(os.path.join(repo, "docs"), exist_ok=True)
+    r = run(["sh", "tests/unsafe_audit.sh", "-c", "target/volec", "-u"], repo)
+    case("the audit writes its baseline for a tree with none unjustified", r.returncode == 0, r.stdout + r.stderr)
     run(["git", "init", "-q", "-b", "release-0.0"], repo)
     run(["git", "add", "-A"], repo)
     r = run(["git", "commit", "-q", "-m", "base"], repo)
@@ -149,6 +170,43 @@ try:
     })
     case("a program broken on purpose is not counted as checked",
          rc == 0 and verdict == "SKIP" and "on purpose" in text, out)
+
+    # (0.29) the unsafe row: the whole of compiler/src, not only the lines
+    # a change adds
+    def unsafe_row(out):
+        rows = [line.split(None, 2) for line in out.splitlines() if line.startswith("  unsafe ")]
+        return rows[0][1] if rows else "?"
+
+    rc, verdict, text, out = premerge({"compiler/src/main.vl": COMPILER_MAIN.replace("{ *p }", "{ *p.add(1) }")})
+    case("the compiler's source changed, every site justified: the unsafe row passes",
+         rc == 0 and unsafe_row(out) == "PASS" and "0 unjustified" in out, out)
+
+    # (the comments taken away: no line with `unsafe` is added, so the
+    # diff's check passes; the audit names the site)
+    bare = "\n".join(line for line in COMPILER_MAIN.split("\n") if "UNSAFE:" not in line and "SAFETY:" not in line)
+    rc, verdict, text, out = premerge({"compiler/src/main.vl": bare})
+    case("a site of the compiler's source left without its comments fails the unsafe row, with its position",
+         rc == 1 and unsafe_row(out) == "FAIL" and "compiler/src/main.vl:3" in out
+         and ("error[unsafe.unjustified]" in out or "missing both" in out), out)
+
+    spare = COMPILER_MAIN.replace("    0\n", "    // UNSAFE: none.\n    // SAFETY: none.\n    unsafe { 0 }\n")
+    rc, verdict, text, out = premerge({"compiler/src/main.vl": spare})
+    case("an unsafe block of the compiler's source with nothing unsafe inside fails it too, with its position",
+         rc == 1 and unsafe_row(out) == "FAIL" and "compiler/src/main.vl:12" in out
+         and ("error[unsafe.unneeded]" in out or "none (unneeded)" in out), out)
+
+    r = run(["sh", "tests/unsafe_audit.sh", "-c", "target/volec"], repo)
+    case("the audit alone passes on the tree as committed", r.returncode == 0 and "0 unjustified, 0 unneeded" in r.stdout, r.stdout + r.stderr)
+    write(os.path.join(repo, "compiler", "src", "main.vl"), bare)
+    r = run(["sh", "tests/unsafe_audit.sh", "-c", "target/volec"], repo)
+    case("the audit alone fails on an unjustified site and names it",
+         r.returncode == 1 and "compiler/src/main.vl:3" in r.stdout and "1 unjustified" in r.stdout, r.stdout + r.stderr)
+    r = run(["sh", "tests/unsafe_audit.sh", "-c", "target/volec", "-u"], repo)
+    case("and -u writes no baseline but 0",
+         r.returncode == 1 and "not written" in r.stdout
+         and "baseline compiler/src unjustified: 0" in open(os.path.join(repo, "docs", "unsafe-baseline.md")).read(),
+         r.stdout + r.stderr)
+    run(["git", "checkout", "-q", "--", "."], repo)
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 

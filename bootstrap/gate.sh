@@ -74,7 +74,8 @@
 # without cargo);
 # unsafe-audit (tests/unsafe_audit.sh, 0.25.3: the unsafe sites of
 # compiler/src and std without // UNSAFE: and // SAFETY:, `volec query
-# unsafe`, no more than docs/unsafe-baseline.md counts; --quick too);
+# unsafe`; 0.29: none of them, and no unsafe block of compiler/src with
+# nothing unsafe inside, each one named; --quick too);
 # mvs-census (tools/mvs-census.py --no-allow, 0.28.0: nothing in the tree
 # is read as the old edition or names one: no program, generator, guide
 # topic or Book chapter in it, no `// EDITION:` line but the ones the
