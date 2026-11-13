@@ -11,11 +11,12 @@ use crate::base::{IntVec, alloc_array, find_sym, free, intern_c, table_reset};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::types::{REF_MUT, REF_SHARED, TY_U64, TyKind, fn_param, is_integer, type_size};
+use crate::middle::callfacts::{call_keeps_header, header_place, header_writes};
 use crate::middle::ctx::FnCtx;
 use crate::middle::egraph::{egraph_rewrite, egraph_start};
 use crate::middle::fold::is_const;
 use crate::middle::gvn_calls::{call_numbering, inherit_into};
-use crate::middle::ipo::{call_reads, call_writes};
+use crate::middle::ipo::{ATTR_READNONE, ATTR_READONLY, call_attrs, call_writes};
 use crate::middle::ir::{
     Cond, Op, Term, get_irfuncs, ir_arg, ir_insert_before, ir_make, ir_operand, ir_operand_count,
     ir_replace, ir_resolve_operands, ir_set_operand, ir_unlink, ir_val,
@@ -420,7 +421,7 @@ pub fn call_may_write(cx: &mut FnCtx<Comp>, base: i64, pcx: &Ctx<Comp>) -> bool 
 
 // Parameter classes (param_class).
 pub const PC_NONE: i64 = 0;
-const PC_EXCLUSIVE: i64 = 1;
+pub const PC_EXCLUSIVE: i64 = 1;
 pub const PC_SHARED: i64 = 2;
 
 // Whether function f's reference parameters' facts may be used: the own
@@ -683,6 +684,10 @@ pub fn may_alias(cx: &mut FnCtx<Comp>, base1: i64, off1: i64, size1: i64, base2:
 // what is neither private nor constant.
 
 const AVAIL_MAX: i64 = 256;
+// The values of an AVAIL entry: the five, and (0.29) whether the location
+// is a Vec header a call's summary can speak of (callfacts::header_place:
+// 0 not asked yet, 1 it is, 2 it is not).
+const AVAIL_W: i64 = 6;
 
 // Removes entry i (of `width` values) from list l.
 fn list_remove(l: &mut Vec<i64, Comp>, i: i64, width: i64) {
@@ -699,9 +704,9 @@ fn avail_kill(cx: &mut FnCtx<Comp>, base: i64, offset: i64, size: i64, pcx: &Ctx
         let (b, o, s) = (cx.avail[i as usize], cx.avail[(i + 1) as usize],
             cx.avail[(i + 2) as usize]);
         if may_alias(cx, base, offset, size, b, o, s, pcx) {
-            list_remove(&mut cx.avail, i, 5);
+            list_remove(&mut cx.avail, i, AVAIL_W);
         } else {
-            i += 5;
+            i += AVAIL_W;
         }
     }
     i = 0;
@@ -720,13 +725,28 @@ fn avail_kill(cx: &mut FnCtx<Comp>, base: i64, offset: i64, size: i64, pcx: &Ctx
 }
 
 // A call may write any memory but private slots and constants.
-fn avail_kill_call(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
+// (0.29) Unless call v's callee leaves a Vec's header there: `hw` is its
+// summary (callfacts::header_writes; 0 when nothing is known of it, and for
+// a barrier).
+fn avail_kill_call(cx: &mut FnCtx<Comp>, v: i64, hw: i64, pcx: &Ctx<Comp>) {
     let mut i: i64 = 0;
     while i < cx.avail.len() as i64 {
-        if call_may_write(cx, (cx.avail[i as usize]), pcx) {
-            list_remove(&mut cx.avail, i, 5);
+        let base = cx.avail[i as usize];
+        let mut kill = call_may_write(cx, base, pcx);
+        if kill && hw != 0 {
+            let off = cx.avail[(i + 1) as usize];
+            let size = cx.avail[(i + 2) as usize];
+            let mut place = cx.avail[(i + 5) as usize];
+            if place == 0 {
+                place = if header_place(cx, base, off, size, pcx) { 1 } else { 2 };
+                cx.avail[(i + 5) as usize] = place;
+            }
+            kill = place != 1 || !call_keeps_header(cx, v, base, off, size, hw, pcx);
+        }
+        if kill {
+            list_remove(&mut cx.avail, i, AVAIL_W);
         } else {
-            i += 5;
+            i += AVAIL_W;
         }
     }
     i = 0;
@@ -744,14 +764,15 @@ fn avail_kill_call(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
 }
 
 fn avail_add(cx: &mut FnCtx<Comp>, base: i64, offset: i64, size: i64, ty: i64, value: i64) {
-    if cx.avail.len() as i64 >= AVAIL_MAX * 5 {
-        list_remove(&mut cx.avail, 0, 5);
+    if cx.avail.len() as i64 >= AVAIL_MAX * AVAIL_W {
+        list_remove(&mut cx.avail, 0, AVAIL_W);
     }
     cx.avail.push(base);
     cx.avail.push(offset);
     cx.avail.push(size);
     cx.avail.push(ty);
     cx.avail.push(value);
+    cx.avail.push(0);
 }
 
 fn avail_find(cx: &mut FnCtx<Comp>, base: i64, offset: i64, ty: i64) -> i64 {
@@ -761,7 +782,7 @@ fn avail_find(cx: &mut FnCtx<Comp>, base: i64, offset: i64, ty: i64) -> i64 {
             && cx.avail[(i + 3) as usize] == ty {
             return cx.avail[(i + 4) as usize];
         }
-        i += 5;
+        i += AVAIL_W;
     }
     0
 }
@@ -891,7 +912,8 @@ fn memory_step(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) -> bool {
             // It may read anything but private slots (unless its attributes
             // say it reads nothing), and write it (unless they say it writes
             // nothing; see ipo.vl).
-            if call_reads(cx, v, pcx) {
+            let attrs = call_attrs(cx, v, pcx);
+            if attrs & ATTR_READNONE == 0 {
                 let mut i: i64 = 0;
                 while i < cx.pending.len() as i64 {
                     if !is_private_slot(cx, (cx.pending[i as usize])) {
@@ -901,8 +923,8 @@ fn memory_step(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) -> bool {
                     }
                 }
             }
-            if call_writes(cx, v, pcx) {
-                avail_kill_call(cx, pcx);
+            if attrs & ATTR_READONLY == 0 {
+                avail_kill_call(cx, v, header_writes(attrs), pcx);
             }
         }
         if is_barrier(cx, v) {
@@ -917,7 +939,7 @@ fn memory_step(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) -> bool {
                     i += 4;
                 }
             }
-            avail_kill_call(cx, pcx);
+            avail_kill_call(cx, 0, 0, pcx);
         }
         false
     }
@@ -942,8 +964,13 @@ pub fn apply_block_kills(cx: &mut FnCtx<Comp>, b: i64, pcx: &Ctx<Comp>) {
                 let base = address_base(cx, ir_val_v1, &mut offset);
                 let copy_size_v = copy_size(cx, v);
                 avail_kill(cx, base, offset, copy_size_v, pcx);
-            } else if op.is_call() && call_writes(cx, v, pcx) || is_barrier(cx, v) {
-                avail_kill_call(cx, pcx);
+            } else if op.is_call() {
+                let attrs = call_attrs(cx, v, pcx);
+                if attrs & ATTR_READONLY == 0 {
+                    avail_kill_call(cx, v, header_writes(attrs), pcx);
+                }
+            } else if is_barrier(cx, v) {
+                avail_kill_call(cx, 0, 0, pcx);
             }
             v = (cx.insts[v as usize]).next;
         }

@@ -100,6 +100,10 @@ defined:
 - it makes no pointer into a Vec's header from the Vec's own buffer
   pointer, nor puts a Vec inside its own buffer (the optimizer takes a
   store to an element as never reaching that Vec's header);
+- it gives a Vec no buffer that is a static, a local, or the struct the
+  Vec is a field of (`from_raw_parts` takes a block of the Vec's
+  allocator): the optimizer keeps a Vec's pointer and length across a
+  call whose callee only writes elements, of any Vec;
 - a type whose safe methods manage memory through raw pointers (a
   growable buffer of its own) implements `Drop`: that keeps it from
   being `Copy`, so a copy cannot outlive a reallocation.
