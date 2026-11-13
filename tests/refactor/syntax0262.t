@@ -37,4 +37,4 @@ fn main() -> i32 {
 $ fmt
 note fmt.none: 1 file formatted already
 $ check
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (1 file, 0 shaders)

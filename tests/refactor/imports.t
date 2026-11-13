@@ -98,4 +98,4 @@ fixed 1 unused import	main.vl	+1 -1 lines
 $ fix --only reexports,tidy-imports
 note fix.none: nothing to fix
 $ check
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (5 files, 0 shaders)

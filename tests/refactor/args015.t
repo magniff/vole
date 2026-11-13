@@ -6,7 +6,7 @@
 ## label or position; --reorder writes a call with labels in the new
 ## order; inline puts in labelled arguments by parameter.
 $ check
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (1 file, 0 shaders)
 $ refactor signature area --add 'scale: i64 = 2' --dry-run
 --- a/main.vl
 +++ b/main.vl

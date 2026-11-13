@@ -6,4 +6,4 @@
 error: the sources pass the 4096 bytes reserved for them (VOLE_SRC_CAP)
 [exit 1]
 % volec check main.vl
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (1 file, 0 shaders)

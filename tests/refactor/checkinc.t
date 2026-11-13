@@ -4,6 +4,6 @@ $ check
 main.vl:1:8: error[C import] header not found: widget.h
 [exit 1]
 $ check -I inc
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (1 file, 0 shaders)
 $ check -Iinc
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (1 file, 0 shaders)

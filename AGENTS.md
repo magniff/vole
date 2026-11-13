@@ -73,6 +73,16 @@ compiler**: only a build whose suite passed goes there (`bootstrap.sh
 checkout's when the worktree has none), so it always works (your own
 builds replace `target/volec`, and a broken one breaks `query`).
 
+**No hooks in your harness?** The hooks below are Claude Code's: under
+another harness nothing checks after an edit, and a shader edit is
+checked by no hook at all. After your edits run `target/volec check
+--changed`: every program a file changed since the branch's base
+belongs to (a `.vl`, a `.wgsl` it embeds, a file beside its `main.vl`)
+is checked and its changed files compared with `fmt`'s layout; each
+program answers `ok: 0 errors in ROOT (N files, M shaders)` and the
+last line counts what was checked (`no program to check` when it was
+nothing). `tools/premerge.sh`'s check row is the same command.
+
 **Hooks.** `tools/agent-hooks/query-first.py` blocks shell commands that
 read or rewrite the compiler's `.vl` source (compiler/src, compiler/std:
 grep, sed, `sed -i`, Python writing it) and suggests the query or `edit

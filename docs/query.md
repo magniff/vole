@@ -145,7 +145,8 @@ tools` the ones a program needs.
 | split a module into files | `target/volec refactor split MODULE --plan` (then `--auto`, or `--into M --items a,b`; `--names a,b`; `--reexport` leaves code outside as it is; `--header TEXT`) |
 | several changes, checked once, all or nothing | `target/volec refactor --script steps.txt` (one command per line; `<<END` ... `END` gives one its stdin) |
 | several queries and edits in one call, outputs under `## $ volec ARGS` lines | `target/volec batch < cmds.txt` (one command per line; `--stop` at the first failure) |
-| the errors, one per line (front end only) | `target/volec check` |
+| the errors, one per line (front end only); `ok: 0 errors in ROOT (N files, M shaders)` names what was checked | `target/volec check` (no ROOT: `./main.vl`, else the compiler) |
+| check after edits with no hook: every program the files changed since the branch's base belong to (shaders too), and `fmt --check` of them | `target/volec check --changed` (`--since REV`) |
 | build a program and run it: DIR/main.vl (DIR: `.`), rebuilt only when it changed, kept in volec's cache (0.25.4) | `target/volec run [DIR] [OPTIONS] [-- ARGS]` (a build's options; off a terminal only the program's output, its exit status volec's; `run --help`) |
 | build what changed and run the tests; counts, then each failure | `target/volec test [FILTER...]` (a program: `tests/NAME.in`/`.out`; `--full`, `--budget N`; what tests print: under a failure, every test's with `--show-output`) |
 | a crash's line and callers; values at a line as the program runs; a failing input made small | `target/volec test` (built with `--trace`), `target/volec probe FILE:LINE EXPR... -- ARGS`, `target/volec reduce FILE --until 'CMD'` (`guide debug`) |

@@ -58,7 +58,7 @@ fixed 1 pub	geometry.vl	+1 -1 lines
 ## Then only the warning is left, and its fix.
 $ check
 geometry.vl:1:24: warning[attr.obsolete] '#[sealed]' is the default from 0.26: every field not marked 'pub' is private to its module | help: delete it (`volec fix --only obsolete-attr` deletes every one) | try: volec fix --only obsolete-attr main.vl
-ok: 0 errors, 1 warning in main.vl
+ok: 0 errors, 1 warning in main.vl (2 files, 0 shaders)
 $ fix --only obsolete-attr
 fixed 1 obsolete attribute	geometry.vl	+1 -1 lines
 % cat geometry.vl
@@ -75,7 +75,7 @@ impl Rect {
     }
 }
 $ check
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (2 files, 0 shaders)
 $ explain field.private
 field.private: error
 (0.26.0) A field not marked `pub` is read, written or borrowed outside the module that declares its struct (and the modules inside it), Rust's E0616. A field marked `pub` is visible wherever its struct is; until 0.26 every field was.

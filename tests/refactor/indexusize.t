@@ -22,7 +22,7 @@ fixed 5 suggested fixes	main.vl	+4 -4 lines
 // main.vl:17
 17	    println("{} {} {}", a[k as usize], digit(b"0123456789abcdef", 0x4f), wide);
 $ check
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (1 file, 0 shaders)
 % volec main.vl -o prog && ./prog
 3 52 13
 ok: built prog

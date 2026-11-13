@@ -4,7 +4,7 @@
 ## volec fmt keeps a format literal's bytes; an import named only in a
 ## literal's hole is used (no use.unused).
 $ check
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (2 files, 0 shaders)
 $ fmt --dry-run
 --- a/main.vl
 +++ b/main.vl

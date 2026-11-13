@@ -12,4 +12,4 @@ fn main() -> i32 {
     util::twice(2) as i32
 }
 $ check
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (2 files, 0 shaders)

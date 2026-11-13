@@ -154,7 +154,7 @@ kg  pounds
  1       2
 50     110
 70     154
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (2 files, 0 shaders)
 ok: built units
 $ git commit -q -a -m 'Merge rounding' && git log --format=%s
 Merge rounding

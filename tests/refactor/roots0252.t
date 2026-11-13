@@ -18,7 +18,7 @@ $ query items --root beta
 crate	beta/main.vl	2
 std	<std>	87
 $ check alpha/util.vl
-ok: 0 errors in alpha/main.vl
+ok: 0 errors in alpha/main.vl (2 files, 0 shaders)
 ## A NAME one program defines: answered from it, with a note.
 $ query def only_in_beta
 crate::only_in_beta	beta/main.vl:2:4	fn	fn only_in_beta() -> i64	effects: none

@@ -28,7 +28,7 @@ $ fix --suggested --dry-run
 $ fix --suggested
 fixed 5 suggested fixes	main.vl	+5 -5 lines
 $ check
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (1 file, 0 shaders)
 $ main.vl -o prog
 ok: built prog
 % ./prog
