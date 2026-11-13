@@ -13,8 +13,8 @@ pub mod embedded;
 // (Numbered as in 0.3: the keywords and the punctuation are kept in the
 // ranges the token dump of the seed expects.)
 use crate::base::{
-    buf_at, buf_byte, buf_clear, buf_fmt, buf_hex, buf_len, buf_new, buf_slice, buf_str, elem_at,
-    get_src, intern, intern_c, strtod, sym_name, sym_text,
+    buf_at, buf_byte, buf_clear, buf_fmt, buf_hex, buf_len, buf_new, buf_slice, buf_str, get_src,
+    intern, intern_c, strtod, sym_name, sym_text,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -96,15 +96,22 @@ pub const SUF_F64: i64 = 12;
     pub kind: Tok, pub start: i64, pub end: i64, pub value: u64, pub suffix: i64, pub joint: bool,
 }
 
-// String literals: their bytes, by id.
-static mut STRS: *mut &'static [u8] = 0 as *mut &'static [u8];
-static mut STR_COUNT: i64 = 0;
-static mut STR_CAP: i64 = 0;
+// The program's string literals and constant data, by id: each one's
+// bytes (a copy kept for the process, a NUL after it) and its alignment
+// (0: a string literal's; gen0::target::add_const_data gives the
+// optimizer's data theirs). The context keeps the table behind a lock:
+// the optimizer adds constant data through a shared context.
+pub struct StrTable<A: std::alloc::Allocator> {
+    pub texts: Vec<&'static [u8], A>, pub aligns: Vec<i64, A>,
+}
 
-// String literal id's bytes: STRS[id] by its address (0.17: `STRS[id]`
-// would index the first slice).
-pub fn str_at(id: i64) -> &'static [u8] {
-    unsafe { *elem_at(get_strs(), id) }
+pub fn str_table_new() -> StrTable<Comp> {
+    StrTable { texts: Vec::new_in(Comp {}), aligns: Vec::new_in(Comp {}) }
+}
+
+// String literal id's bytes.
+pub fn str_at(id: i64, pcx: &Ctx<Comp>) -> &'static [u8] {
+    pcx.strs.read().unwrap().texts[id as usize]
 }
 
 // The symbols that can be keywords: the lexer interns its words first
@@ -1050,10 +1057,10 @@ pub fn dump_tokens(out: i64, base: i64, pcx: &Ctx<Comp>) {
     }
 }
 
-fn dump_hex_bytes(out: i64, id: i64) {
+fn dump_hex_bytes(out: i64, id: i64, pcx: &Ctx<Comp>) {
     unsafe {
-        for i in 0..str_at(id).len() {
-            buf_hex(out, str_at(id)[i] as u64, 2);
+        for i in 0..str_at(id, pcx).len() {
+            buf_hex(out, str_at(id, pcx)[i] as u64, 2);
         }
     }
 }
@@ -1071,18 +1078,18 @@ fn dump_token_text(out: i64, tok: Token, pcx: &Ctx<Comp>) {
             buf_fmt(out, format_args("char {value}"));
         } else if kind == Str {
             buf_str(out, c"str ");
-            dump_hex_bytes(out, value as i64);
+            dump_hex_bytes(out, value as i64, pcx);
         } else if kind == CStr {
             buf_str(out, c"cstr ");
-            dump_hex_bytes(out, value as i64);
+            dump_hex_bytes(out, value as i64, pcx);
         } else if kind == Tok::FHead || kind == Tok::FMid || kind == Tok::FTail {
             // (0.15: an f-string's pieces, the spec after the text)
             buf_str(out, if kind == Tok::FHead { c"fhead " } else if kind == Tok::FMid { c"fmid " }
                 else { c"ftail " });
-            dump_hex_bytes(out, value as i64);
+            dump_hex_bytes(out, value as i64, pcx);
             if kind != Tok::FHead && tok.suffix >= 0 {
                 buf_str(out, c" spec ");
-                dump_hex_bytes(out, tok.suffix);
+                dump_hex_bytes(out, tok.suffix, pcx);
             }
             return;
         } else if kind == Ident {
@@ -1100,75 +1107,7 @@ fn dump_token_text(out: i64, tok: Token, pcx: &Ctx<Comp>) {
     }
 }
 
-// (0.28.0) STRS's accessors: every use of it is one of them.
-pub fn get_strs() -> *mut &'static [u8] {
-    // UNSAFE: the program's string table, a process-wide static mut; Rust
-    // has no safe access to a static mut
-    // SAFETY: a task reaches its only writer add_string only through
-    // gen0::target::add_const_data from parallel::const_data's serial
-    // branch (task_phase == 0); every task sets cx.task_phase non-zero
-    // before it can make constant data (run_task: P_CLEANUP, P_SIMPLIFY;
-    // run_component: P_COMPONENT; emit_task: P_DEFERRED, P_SLP, P_EMIT; the
-    // cache's replays set the recorded phase), so add_const_data runs only
-    // on the main thread outside phases (register_consts, after the phase)
-    // and serial code
-    unsafe { STRS }
-}
-
-pub fn set_strs(v: *mut &'static [u8]) {
-    // UNSAFE: the program's string table, a process-wide static mut; Rust
-    // has no safe access to a static mut
-    // SAFETY: a task reaches its only writer add_string only through
-    // gen0::target::add_const_data from parallel::const_data's serial
-    // branch (task_phase == 0); every task sets cx.task_phase non-zero
-    // before it can make constant data (run_task: P_CLEANUP, P_SIMPLIFY;
-    // run_component: P_COMPONENT; emit_task: P_DEFERRED, P_SLP, P_EMIT; the
-    // cache's replays set the recorded phase), so add_const_data runs only
-    // on the main thread outside phases (register_consts, after the phase)
-    // and serial code
-    unsafe {
-        STRS = v;
-    }
-}
-
-// (0.28.0) STR_COUNT's accessors: every use of it is one of them.
-pub fn get_str_count() -> i64 {
-    // UNSAFE: the string table's count, a process-wide static mut; Rust has
-    // no safe access to a static mut
-    // SAFETY: written only by add_string, which no task runs (STRS); the
-    // joining main thread reads it in give_id while tasks run, but no task
-    // writes it, and the main thread's own writes (register_consts) come
-    // after the phase
-    unsafe { STR_COUNT }
-}
-
-pub fn set_str_count(v: i64) {
-    // UNSAFE: the string table's count, a process-wide static mut; Rust has
-    // no safe access to a static mut
-    // SAFETY: written only by add_string, which no task runs (STRS); the
-    // joining main thread reads it in give_id while tasks run, but no task
-    // writes it, and the main thread's own writes (register_consts) come
-    // after the phase
-    unsafe {
-        STR_COUNT = v;
-    }
-}
-
-// (0.28.0) STR_CAP's accessors: every use of it is one of them.
-fn get_str_cap() -> i64 {
-    // UNSAFE: the string table's capacity, a process-wide static mut; Rust
-    // has no safe access to a static mut
-    // SAFETY: written only by add_string, which no task runs (see STRS:
-    // const_data's serial branch only); the join does not reach add_string
-    unsafe { STR_CAP }
-}
-
-fn set_str_cap(v: i64) {
-    // UNSAFE: the string table's capacity, a process-wide static mut; Rust
-    // has no safe access to a static mut
-    // SAFETY: written only by add_string, which no task runs (see STRS:
-    // const_data's serial branch only); the join does not reach add_string
-    unsafe {
-        STR_CAP = v;
-    }
+// How many strings the program has (their ids are below it).
+pub fn get_str_count(pcx: &Ctx<Comp>) -> i64 {
+    pcx.strs.read().unwrap().texts.len() as i64
 }
