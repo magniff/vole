@@ -25,7 +25,6 @@ volec try '"42".parse::<i64>()'            # a snippet: its TYPE = VALUE
 import "stdio.h" as c;                 // a C header; its names under c::
 use std::fmt::Write;
 use std::collections::HashMap;         // std items by name (never *)
-use std::hash::FixedState;
 
 struct P { x: i64 }
 
@@ -99,18 +98,17 @@ needs them, `Box<T, A>`; no `dyn`. A struct is moved unless it derives
 `Clone, Copy`. A reference is used as in Rust: `*x` reads or writes
 through it, a field or method needs no `*` (`p.x`, `v.len()`), and
 `match e` on an `e: &E` binds references (`E::A(n) => *n + 1`). The
-prelude (no `use`) is Rust's plus `Gpa`: `Option`, `Result`, `Vec`,
-`String`, `Box`, the common traits, and as functions Rust's macros:
-`print`, `println`, `eprintln`, `format_in`, `write`, `writeln`,
-`panic`, `assert`, `assert_eq`, `unreachable`, `todo`. The rest of std
-is `use std::...` (`std::collections::HashMap`); `use crate::lexer::Tok;`
-reaches the program's module `lexer`.
+prelude (no `use`) is Rust's plus `Gpa`, `FixedState`: `Option`,
+`Result`, `Vec`, `String`, `Box`, the common traits, and as functions
+Rust's macros: `print`, `println`, `eprintln`, `format_in`, `write`,
+`writeln`, `panic`, `assert`, `assert_eq`, `unreachable`, `todo`. The
+rest of std is `use std::...` (`std::collections::HashMap`); `use
+crate::lexer::Tok;` reaches the program's module `lexer`.
 
 ## std: what programs use most
 
 ```vole
 use std::collections::HashMap;
-use std::hash::FixedState;
 use std::io;
 
 struct Item<'a> { name: &'a str, qty: i64 }    // 'a: the name borrows the input
@@ -170,7 +168,7 @@ with its comment: `volec guide --find split_once`.
 |---|---|
 | `'println!' is a macro call: vole has no macros` | `println("{a}")`, the help's form |
 | `'Vec::new' allocates from nothing` (`alloc.no_in`) | `Vec::new_in(gpa)`: main's `gpa`, passed down; `volec fix --only alloc` |
-| `'Vec' names no allocator` (`alloc.default`) | `Vec<i64, Gpa>`; a struct holding one: `struct P<A: Allocator> { v: Vec<i64, A> }`, used as `P<Gpa>` (`volec fix --only alloc` writes both) |
+| `'Vec' names no allocator` (`alloc.default`) | `Vec<i64, Gpa>`, `HashMap<K, V, Gpa, FixedState>`; a struct holding one: `struct P<A: Allocator> { v: Vec<i64, A> }`, used as `P<Gpa>` (`volec fix --only alloc` writes both) |
 | `expected 'String<Gpa>', got '&str'` | `String::from_in("..", gpa)`: a String owns its text; a parameter `s: &str` takes literals and a String's `&s` |
 | `cannot assign to immutable variable 'a'` | `let mut a` |
 | `borrowck.borrow_immutable: cannot borrow 'w' as mutable, as it is not declared as mutable` | `let mut w`: `w.push(1)` and `&mut w` change it |

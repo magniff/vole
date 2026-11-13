@@ -72,7 +72,6 @@ usage: tool [-v] FILE
 
 ```vole
 use std::collections::HashMap;      // imports first, by convention
-use std::hash::FixedState;
 import "stdio.h" as c;              // a C header
 
 const LIMIT: i64 = 100;             // a constant expression

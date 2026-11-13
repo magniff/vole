@@ -1692,7 +1692,8 @@ type names its allocator: Allocators, below. 0.28.0's `HashMap<K, V, A,
 S = FixedState>` and `HashSet` had std's last defaults on a struct;
 from 0.29.0 the hasher is written too, `HashMap<K, V, Gpa, FixedState>`:
 a type argument left out for a parameter bounded by `BuildHasher` is
-`hash.default`, whose fix writes `FixedState` and its `use`. The
+`hash.default`, whose fix writes `FixedState` (in the prelude, as
+`Gpa`). The
 constructors name the hasher as Rust's do: `HashMap::new_in(a)` is of
 `impl<K, V, A> HashMap<K, V, A, FixedState>`, `with_hasher_in(h, a)` of
 any `S`. std's operator and comparison traits keep `Rhs = Self`.)
