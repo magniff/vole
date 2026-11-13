@@ -12,7 +12,9 @@
 // left out: they hold what a pass left (stamps), which no later pass
 // reads before writing.
 
-use crate::base::{IntVec, alloc_array, free, sized_table};
+use std::alloc::Allocator;
+
+use crate::base::{IntVec, sized_table};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::FN_CLOSURE;
@@ -172,27 +174,13 @@ pub fn names_begin(moves: IntVec, pcx: &mut Ctx<Comp>) {
     }
 }
 
-// STR_H for every string made so far (main thread, between phases: the
-// strings grow only then).
+// Ctx.str_h for every string made so far (main thread, between phases:
+// the strings grow only then).
 pub fn strings_begin(pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if get_str_count() > pcx.str_h_cap {
-            let cap = get_str_count() + get_str_count() / 2 + 64;
-            let n = alloc_array::<i64>(cap);
-            for i in 0..pcx.str_h_count {
-                (*n.add(i as usize)) = (*pcx.str_h.add(i as usize));
-            }
-            free(pcx.str_h as *mut u8);
-            pcx.str_h = n;
-            pcx.str_h_cap = cap;
-        }
-        while pcx.str_h_count < get_str_count() {
-            let s = str_at(pcx.str_h_count);
-            (*pcx.str_h.add(pcx.str_h_count as usize)) = mix(hash_bytes(s),
-                str_align(pcx.str_h_count) as u64)
-                as i64;
-            pcx.str_h_count += 1;
-        }
+    while (pcx.str_h.len() as i64) < get_str_count() {
+        let k = pcx.str_h.len() as i64;
+        let h = mix(hash_bytes(str_at(k)), str_align(k) as u64) as i64;
+        pcx.str_h.push(h);
     }
 }
 
@@ -365,13 +353,13 @@ fn fn_ref(h: &mut H2, f: i64, pcx: &Ctx<Comp>) {
 // with `extra` mixed in first. Its strings (the distinct ids of its
 // SADDRs of strings, in instruction order) are appended to `strs`; a
 // string made after the last strings_begin poisons (false).
-pub fn ir_hash(cx: &mut FnCtx<Comp>, fi: i64, extra: u64, strs: *mut IntVec, out: &mut H2,
-    pcx: &Ctx<Comp>) -> bool {
-    unsafe {
+pub fn ir_hash(cx: &mut FnCtx<Comp>, fi: i64, extra: u64, marks: &mut StrMarks<Comp>,
+    strs: &mut Vec<i64, Comp>, out: &mut H2, pcx: &Ctx<Comp>) -> bool {
+    {
         let mut ok = true;
         let mut h = h2_new(extra);
-        let stamp = str_stamp(cx, pcx);
-        let first = (*strs).len() as i64;
+        let stamp = str_stamp(marks, pcx);
+        let first = strs.len() as i64;
         h2_puti(&mut h, fn_entry(cx, fi));
         h2_puti(&mut h, fn_result_ptr(cx, fi));
         h2_puti(&mut h, fn_block_count(cx, fi));
@@ -393,17 +381,17 @@ pub fn ir_hash(cx: &mut FnCtx<Comp>, fi: i64, extra: u64, strs: *mut IntVec, out
             h2_puti(&mut h, v.c);
             if op == Op::SAddr {
                 if v.imm >= 0 {
-                    if v.imm >= pcx.str_h_count {
+                    if v.imm >= pcx.str_h.len() as i64 {
                         ok = false;
                     } else {
-                        let cc = cx.cc;
-                        if (*(*cc).str_seen.add(v.imm as usize)) != stamp {
-                            (*(*cc).str_seen.add(v.imm as usize)) = stamp;
-                            (*(*cc).str_k.add(v.imm as usize)) = (*strs).len() as i64 - first;
-                            (*strs).push(v.imm);
+                        let id = v.imm as usize;
+                        if marks.seen[id] != stamp {
+                            marks.seen[id] = stamp;
+                            marks.k[id] = strs.len() as i64 - first;
+                            strs.push(v.imm);
                         }
-                        h2_puti(&mut h, (*(*cc).str_k.add(v.imm as usize)));
-                        h2_puti(&mut h, (*pcx.str_h.add(v.imm as usize)));
+                        h2_puti(&mut h, marks.k[id]);
+                        h2_puti(&mut h, pcx.str_h[id]);
                     }
                 } else {
                     h2_put(&mut h, const_canon(v.imm, pcx));
@@ -483,18 +471,22 @@ fn hash_ints(h: &mut H2, v: &[i64]) {
     }
 }
 
-// A new stamp for cx's string marks (sized to the strings).
-fn str_stamp(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let cc = crate::back::codecache::cc_of(cx);
-        if (*cc).str_cap < pcx.str_h_count {
-            free((*cc).str_seen as *mut u8);
-            free((*cc).str_k as *mut u8);
-            (*cc).str_cap = pcx.str_h_count + pcx.str_h_count / 2 + 64;
-            (*cc).str_seen = alloc_array::<i64>((*cc).str_cap);
-            (*cc).str_k = alloc_array::<i64>((*cc).str_cap);
-        }
-        (*cc).str_stamp += 1;
-        (*cc).str_stamp
+// Scratch for ir_hash's strings (a task's, in its cache state): per
+// string, the stamp of the hash that listed it and its place in that
+// list.
+pub struct StrMarks<A: Allocator> { seen: Vec<i64, A>, k: Vec<i64, A>, stamp: i64 }
+
+pub fn str_marks() -> StrMarks<Comp> {
+    StrMarks { seen: Vec::new_in(Comp {}), k: Vec::new_in(Comp {}), stamp: 0 }
+}
+
+// A new stamp for the string marks (sized to the strings).
+fn str_stamp(m: &mut StrMarks<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    let n = pcx.str_h.len();
+    if m.seen.len() < n {
+        m.seen.resize(n + n / 2 + 64, 0);
+        m.k.resize(n + n / 2 + 64, 0);
     }
+    m.stamp += 1;
+    m.stamp
 }

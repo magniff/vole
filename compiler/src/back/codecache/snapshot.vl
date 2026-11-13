@@ -5,7 +5,8 @@
 // function), which are indices into the entry's tables (Rel), mapped back
 // to this compilation's ids when the entry is used.
 
-use crate::base::{IntVec, alloc_array, alloc_zeroed, free, memcpy};
+use std::alloc::Allocator;
+
 use crate::base::comp::Comp;
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{Block, Cond, Inst, Op, Slot, Term, fn_entry, fn_result_ptr};
@@ -13,114 +14,80 @@ use crate::middle::lower::ssa::HMap;
 
 // ---- Bytes ----
 
-#[derive(Clone, Copy)] pub struct ByteBuf { pub data: *mut u8, pub len: i64, cap: i64 }
+// An entry's bytes being written are a `Vec<u8, Comp>`.
 
-pub fn bb_new() -> ByteBuf {
-    ByteBuf { data: 0 as *mut u8, len: 0, cap: 0 }
-}
-
-pub fn bb_reserve(b: &mut ByteBuf, extra: i64) {
-    unsafe {
-        if b.len + extra <= b.cap {
-            return;
-        }
-        let mut cap = b.cap * 2;
-        if cap < b.len + extra {
-            cap = b.len + extra;
-        }
-        if cap < 256 {
-            cap = 256;
-        }
-        let n = alloc_zeroed(cap);
-        if b.len > 0 {
-            memcpy(n, b.data, b.len as u64);
-        }
-        free(b.data);
-        b.data = n;
-        b.cap = cap;
+pub fn put_u(b: &mut Vec<u8, Comp>, x: u64) {
+    let mut v = x;
+    while v >= 128 {
+        b.push(((v & 127) | 128) as u8);
+        v = v >> 7;
     }
-}
-
-pub fn put_u(b: &mut ByteBuf, x: u64) {
-    unsafe {
-        bb_reserve(b, 10);
-        let mut v = x;
-        let p = b.data;
-        let mut n = b.len;
-        while v >= 128 {
-            (*p.add(n as usize)) = ((v & 127) | 128) as u8;
-            v = v >> 7;
-            n += 1;
-        }
-        (*p.add(n as usize)) = v as u8;
-        b.len = n + 1;
-    }
+    b.push(v as u8);
 }
 
 // A signed number (zigzag).
-pub fn put_s(b: &mut ByteBuf, x: i64) {
+pub fn put_s(b: &mut Vec<u8, Comp>, x: i64) {
     put_u(b, ((x << 1) ^ (x >> 63)) as u64);
 }
 
-pub fn put_bytes(b: &mut ByteBuf, p: *mut u8, n: i64) {
-    unsafe {
-        put_u(b, n as u64);
-        bb_reserve(b, n);
-        if n > 0 {
-            memcpy(b.data.add(b.len as usize), p, n as u64);
-        }
-        b.len += n;
-    }
+pub fn put_bytes(b: &mut Vec<u8, Comp>, bytes: &[u8]) {
+    put_u(b, bytes.len() as u64);
+    b.extend_from_slice(bytes);
 }
 
 // Bytes being read: `bad` once a read went past the end (every read
 // after gives 0).
-#[derive(Clone, Copy)] pub struct Reader {
-    pub p: *mut u8, pub at: i64, pub end: i64, pub bad: bool,
+pub struct Reader<'a> {
+    pub b: &'a [u8], pub at: i64, pub bad: bool,
 }
 
-pub fn get_u(r: &mut Reader) -> u64 {
-    unsafe {
-        let mut x: u64 = 0;
-        let mut shift: u64 = 0;
-        while r.at < r.end && shift < 64 {
-            let c = (*r.p.add(r.at as usize)) as u64;
-            r.at += 1;
-            x = x | ((c & 127) << shift);
-            if c < 128 {
-                return x;
-            }
-            shift += 7;
+pub fn reader(b: &[u8]) -> Reader<'_> {
+    Reader { b, at: 0, bad: false }
+}
+
+pub fn get_u(r: &mut Reader<'_>) -> u64 {
+    let mut x: u64 = 0;
+    let mut shift: u64 = 0;
+    let end = r.b.len() as i64;
+    while r.at < end && shift < 64 {
+        let c = r.b[r.at as usize] as u64;
+        r.at += 1;
+        x = x | ((c & 127) << shift);
+        if c < 128 {
+            return x;
         }
-        r.bad = true;
-        0
+        shift += 7;
     }
+    r.bad = true;
+    0
 }
 
-pub fn get_s(r: &mut Reader) -> i64 {
+pub fn get_s(r: &mut Reader<'_>) -> i64 {
     let u = get_u(r);
     ((u >> 1) as i64) ^ -((u & 1) as i64)
 }
 
 // A count of at most what is left (each item at least a byte).
-pub fn get_count(r: &mut Reader) -> i64 {
+pub fn get_count(r: &mut Reader<'_>) -> i64 {
     let n = get_u(r);
-    if n > (r.end - r.at) as u64 {
+    let left = r.b.len() as i64 - r.at;
+    if left < 0 || n > left as u64 {
         r.bad = true;
         return 0;
     }
     n as i64
 }
 
-// Bytes in place: their start (and *n their length).
-pub fn get_bytes(r: &mut Reader, n: &mut i64) -> *mut u8 {
-    unsafe {
-        let len = get_count(r);
-        let p = r.p.add(r.at as usize);
-        r.at += len;
-        *n = len;
-        p
+// Bytes in place (none once the reader is bad).
+pub fn get_bytes<'a>(r: &mut Reader<'a>) -> &'a [u8] {
+    let len = get_count(r);
+    let b: &'a [u8] = r.b;
+    if r.bad {
+        return &b[0..0];
     }
+    let from = r.at as usize;
+    r.at += len;
+    &b[from..from + len as usize]
 }
 
 // ---- The entry's tables ----
@@ -130,37 +97,41 @@ pub fn get_bytes(r: &mut Reader, n: &mut i64) -> *mut u8 {
 // come from (`src` a function whose strings the task read, `k` the place
 // among its strings); constant data, by placeholder; symbols; functions
 // (FNS).
-#[derive(Clone, Copy)] pub struct Rel {
-    str_map: HMap, pub strs: IntVec,
-    const_map: HMap, pub consts: IntVec,
-    sym_map: HMap, pub syms: IntVec,
-    fn_map: HMap, pub fns: IntVec,
+pub struct Rel<A: Allocator> {
+    str_map: HMap, pub strs: Vec<i64, A>,
+    const_map: HMap, pub consts: Vec<i64, A>,
+    sym_map: HMap, pub syms: Vec<i64, A>,
+    fn_map: HMap, pub fns: Vec<i64, A>,
     // (0.18.1) RTID values (middle::ir::ir_rtid's imm).
-    rtid_map: HMap, pub rtids: IntVec,
+    rtid_map: HMap, pub rtids: Vec<i64, A>,
     // A string id: (src << 32 | k) + 1, from the lists the task read.
     src_map: HMap,
     // Whether an output had an id none of the lists has.
     pub bad: bool,
 }
 
-pub fn rel_new() -> Rel {
+pub fn no_map() -> HMap {
+    HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 }
+}
+
+pub fn rel_new() -> Rel<Comp> {
     Rel {
-        str_map: HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 },
-        strs: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
-        const_map: HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 },
-        consts: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
-        sym_map: HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 },
-        syms: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
-        fn_map: HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 },
-        fns: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
-        rtid_map: HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 },
-        rtids: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
-        src_map: HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 },
+        str_map: no_map(),
+        strs: Vec::new_in(Comp {}),
+        const_map: no_map(),
+        consts: Vec::new_in(Comp {}),
+        sym_map: no_map(),
+        syms: Vec::new_in(Comp {}),
+        fn_map: no_map(),
+        fns: Vec::new_in(Comp {}),
+        rtid_map: no_map(),
+        rtids: Vec::new_in(Comp {}),
+        src_map: no_map(),
         bad: false,
     }
 }
 
-pub fn rel_clear(r: &mut Rel) {
+pub fn rel_clear(r: &mut Rel<Comp>) {
     r.str_map.clear();
     r.strs.clear();
     r.const_map.clear();
@@ -182,7 +153,7 @@ fn id_key(id: i64) -> i64 {
 
 // The strings of function `src` (as the task read them): string list[k]
 // is (src, k), unless an earlier list has it.
-pub fn rel_add_source(r: &mut Rel, src: i64, list: &[i64]) {
+pub fn rel_add_source(r: &mut Rel<Comp>, src: i64, list: &[i64]) {
     for k in 0..list.len() as i64 {
         let key = id_key(list[k as usize]);
         if r.src_map.get(key) == 0 {
@@ -191,99 +162,79 @@ pub fn rel_add_source(r: &mut Rel, src: i64, list: &[i64]) {
     }
 }
 
-fn table_index(map: *mut HMap, list: *mut IntVec, id: i64) -> i64 {
-    unsafe {
-        let key = id_key(id);
-        let i = (*map).get(key);
-        if i > 0 {
-            return i - 1;
-        }
-        (*list).push(id);
-        (*map).put(key, (*list).len() as i64);
-        (*list).len() as i64 - 1
+fn table_index(map: &mut HMap, list: &mut Vec<i64, Comp>, id: i64) -> i64 {
+    let key = id_key(id);
+    let i = map.get(key);
+    if i > 0 {
+        return i - 1;
     }
+    list.push(id);
+    map.put(key, list.len() as i64);
+    list.len() as i64 - 1
 }
 
 // A SADDR's id: (index << 1) | 1 for constant data a task made, index
 // << 1 for a string.
-pub fn rel_saddr(r: *mut Rel, id: i64) -> i64 {
-    unsafe {
-        if id < 0 {
-            return (table_index(&mut (*r).const_map, &mut (*r).consts, id) << 1) | 1;
-        }
-        if (*r).src_map.get(id_key(id)) == 0 {
-            (*r).bad = true;
-        }
-        table_index(&mut (*r).str_map, &mut (*r).strs, id) << 1
+pub fn rel_saddr(r: &mut Rel<Comp>, id: i64) -> i64 {
+    if id < 0 {
+        return (table_index(&mut r.const_map, &mut r.consts, id) << 1) | 1;
     }
+    if r.src_map.get(id_key(id)) == 0 {
+        r.bad = true;
+    }
+    table_index(&mut r.str_map, &mut r.strs, id) << 1
 }
 
-pub fn rel_sym(r: &mut Rel, sym: i64) -> i64 {
+pub fn rel_sym(r: &mut Rel<Comp>, sym: i64) -> i64 {
     table_index(&mut r.sym_map, &mut r.syms, sym)
 }
 
-pub fn rel_fn(r: *mut Rel, f: i64) -> i64 {
-    unsafe { table_index(&mut (*r).fn_map, &mut (*r).fns, f) }
+pub fn rel_fn(r: &mut Rel<Comp>, f: i64) -> i64 {
+    table_index(&mut r.fn_map, &mut r.fns, f)
 }
 
-pub fn rel_rtid(r: *mut Rel, imm: i64) -> i64 {
-    unsafe { table_index(&mut (*r).rtid_map, &mut (*r).rtids, imm) }
+pub fn rel_rtid(r: &mut Rel<Comp>, imm: i64) -> i64 {
+    table_index(&mut r.rtid_map, &mut r.rtids, imm)
 }
 
 // The string at table index i: (src << 32 | k).
-pub fn rel_str_source(r: Rel, i: i64) -> i64 {
-    r.src_map.get(id_key((r.strs[i as usize]))) - 1
+pub fn rel_str_source(r: &Rel<Comp>, i: i64) -> i64 {
+    r.src_map.get(id_key(r.strs[i as usize])) - 1
 }
 
 // The tables mapped to this compilation's ids (the entry's, read).
-#[derive(Clone, Copy)] pub struct Ids {
-    pub strs: *mut i64, pub nstrs: i64, pub consts: *mut i64, pub nconsts: i64, pub syms: *mut i64,
-    pub nsyms: i64,
-    pub fns: *mut i64, pub nfns: i64, pub rtids: *mut i64, pub nrtids: i64,
+pub struct Ids<A: Allocator> {
+    pub strs: Vec<i64, A>, pub consts: Vec<i64, A>, pub syms: Vec<i64, A>, pub fns: Vec<i64, A>,
+    pub rtids: Vec<i64, A>,
 }
 
-pub fn ids_free(t: Ids) {
-    unsafe {
-        free(t.strs as *mut u8);
-        free(t.consts as *mut u8);
-        free(t.syms as *mut u8);
-        free(t.fns as *mut u8);
-        free(t.rtids as *mut u8);
+pub fn ids_new() -> Ids<Comp> {
+    Ids {
+        strs: Vec::new_in(Comp {}), consts: Vec::new_in(Comp {}), syms: Vec::new_in(Comp {}),
+        fns: Vec::new_in(Comp {}), rtids: Vec::new_in(Comp {}),
     }
 }
 
 // SADDR's id from its index, or 0 with *bad set.
-pub fn ids_saddr(t: Ids, x: i64, bad: &mut bool) -> i64 {
-    unsafe {
-        let i = x >> 1;
-        if (x & 1) != 0 {
-            if i < 0 || i >= t.nconsts {
-                *bad = true;
-                return 0;
-            }
-            return (*t.consts.add(i as usize));
-        }
-        if i < 0 || i >= t.nstrs {
-            *bad = true;
-            return 0;
-        }
-        (*t.strs.add(i as usize))
+pub fn ids_saddr(t: &Ids<Comp>, x: i64, bad: &mut bool) -> i64 {
+    let i = x >> 1;
+    if (x & 1) != 0 {
+        return ids_at(&t.consts, i, bad);
     }
+    ids_at(&t.strs, i, bad)
 }
 
-pub fn ids_at(p: *mut i64, n: i64, i: i64, bad: &mut bool) -> i64 {
-    unsafe {
-        if i < 0 || i >= n {
-            *bad = true;
-            return 0;
-        }
-        (*p.add(i as usize))
+pub fn ids_at(p: &[i64], i: i64, bad: &mut bool) -> i64 {
+    if i < 0 || i >= p.len() as i64 {
+        *bad = true;
+        return 0;
     }
+    p[i as usize]
 }
 
 // ---- A function's IR ----
 
-fn put_ref(b: &mut ByteBuf, at: i64, x: i64) {
+fn put_ref(b: &mut Vec<u8, Comp>, at: i64, x: i64) {
     // (an instruction: 0 for none, else 1 + how far from `at`, zigzag)
     if x == 0 {
         put_u(b, 0);
@@ -293,7 +244,7 @@ fn put_ref(b: &mut ByteBuf, at: i64, x: i64) {
     }
 }
 
-fn get_ref(r: &mut Reader, at: i64) -> i64 {
+fn get_ref(r: &mut Reader<'_>, at: i64) -> i64 {
     let u = get_u(r);
     if u == 0 {
         return 0;
@@ -302,7 +253,7 @@ fn get_ref(r: &mut Reader, at: i64) -> i64 {
     at + (((z >> 1) as i64) ^ -((z & 1) as i64))
 }
 
-fn put_ints(b: &mut ByteBuf, v: &[i64], cap: i64) {
+fn put_ints(b: &mut Vec<u8, Comp>, v: &[i64], cap: usize) {
     put_u(b, v.len() as u64);
     put_u(b, cap as u64);
     for x in v.iter() {
@@ -310,37 +261,11 @@ fn put_ints(b: &mut ByteBuf, v: &[i64], cap: i64) {
     }
 }
 
-fn get_ints(r: &mut Reader) -> IntVec {
+// A list read back: its count, its capacity as written, its items.
+fn get_list(r: &mut Reader<'_>) -> Vec<i64, Comp> {
     let n = get_count(r);
     let cap = get_u(r) as i64;
-    if cap < n || cap > n + n + 64 {
-        r.bad = true;
-        return IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-    }
-    let mut v = IntVec { data: 0 as *mut i64, count: n, cap: cap };
-    if cap > 0 {
-        v.data = alloc_array::<i64>(cap);
-    }
-    for i in 0..n {
-        (v[i as usize]) = get_s(r);
-    }
-    v
-}
-
-// A block's predecessor list, in put_ints's form (count, capacity, items).
-fn put_list(b: &mut ByteBuf, v: &Vec<i64, Comp>) {
-    put_u(b, v.len() as u64);
-    put_u(b, v.capacity() as u64);
-    for i in 0..v.len() {
-        put_s(b, v[i]);
-    }
-}
-
-fn get_list(r: &mut Reader) -> Vec<i64, Comp> {
-    let n = get_count(r);
-    let cap = get_u(r) as i64;
-    if cap < n || cap > n + n + 64 {
-        r.bad = true;
+    if !sized(cap, n, r) {
         return Vec::new_in(Comp {});
     }
     let mut v = Vec::with_capacity_in(cap as usize, Comp {});
@@ -351,12 +276,12 @@ fn get_list(r: &mut Reader) -> Vec<i64, Comp> {
 }
 
 // Writes IR function fi's tables (current in cx) and its IRFUNCS entry.
-pub fn encode_ir(cx: &mut FnCtx<Comp>, fi: i64, b: &mut ByteBuf, rel: *mut Rel) {
-    unsafe {
+pub fn encode_ir(cx: &mut FnCtx<Comp>, fi: i64, b: &mut Vec<u8, Comp>, rel: &mut Rel<Comp>) {
+    {
         put_s(b, fn_entry(cx, fi));
         put_s(b, fn_result_ptr(cx, fi));
-        put_ints(b, cx.fn_blocks.as_slice(), cx.fn_blocks.capacity() as i64);
-        put_ints(b, cx.fn_slots.as_slice(), cx.fn_slots.capacity() as i64);
+        put_ints(b, cx.fn_blocks.as_slice(), cx.fn_blocks.capacity());
+        put_ints(b, cx.fn_slots.as_slice(), cx.fn_slots.capacity());
         put_u(b, cx.insts.len() as i64 as u64);
         put_u(b, cx.insts.capacity() as u64);
         for i in 0..cx.insts.len() as i64 {
@@ -370,7 +295,7 @@ pub fn encode_ir(cx: &mut FnCtx<Comp>, fi: i64, b: &mut ByteBuf, rel: *mut Rel) 
             if op == Op::SAddr {
                 put_s(b, rel_saddr(rel, v.imm));
             } else if op == Op::GAddr || op == Op::CallC {
-                put_s(b, rel_sym(&mut *rel, v.imm));
+                put_s(b, rel_sym(rel, v.imm));
             } else if op == Op::Call || op == Op::FAddr {
                 put_s(b, rel_fn(rel, v.imm));
             } else if op == Op::RtId {
@@ -395,7 +320,7 @@ pub fn encode_ir(cx: &mut FnCtx<Comp>, fi: i64, b: &mut ByteBuf, rel: *mut Rel) 
             let k = &cx.blocks[i as usize];
             put_s(b, k.first);
             put_s(b, k.last);
-            put_list(b, &cx.blocks[i as usize].preds);
+            put_ints(b, &cx.blocks[i as usize].preds, cx.blocks[i as usize].preds.capacity());
             put_u(b, k.term as i64 as u64);
             put_s(b, k.cond);
             put_s(b, k.s0);
@@ -404,7 +329,7 @@ pub fn encode_ir(cx: &mut FnCtx<Comp>, fi: i64, b: &mut ByteBuf, rel: *mut Rel) 
             put_s(b, k.incomplete);
             // (its function: this one, or 0 for block 0)
             if k.func != fi && k.func != 0 {
-                (*rel).bad = true;
+                rel.bad = true;
             }
             put_s(b, if k.func == fi { -1 } else { k.func });
             put_s(b, k.removed);
@@ -430,51 +355,23 @@ pub fn encode_ir(cx: &mut FnCtx<Comp>, fi: i64, b: &mut ByteBuf, rel: *mut Rel) 
             put_s(b, s.escapes);
             put_s(b, s.ty);
         }
-        put_list(b, &cx.args);
-        put_list(b, &cx.argty);
-        put_list(b, &cx.swcases);
-        put_list(b, &cx.inst_loc);
+        put_ints(b, &cx.args, cx.args.capacity());
+        put_ints(b, &cx.argty, cx.argty.capacity());
+        put_ints(b, &cx.swcases, cx.swcases.capacity());
+        put_ints(b, &cx.inst_loc, cx.inst_loc.capacity());
     }
 }
 
-// (0.29) A read copy's tables, as decode_ir makes them: each a block from
-// C's allocator, its count and its capacity (what middle::ir's IRTables
-// was before it owned its Vecs); install_ir makes them the context's.
-#[derive(Clone, Copy)] pub struct RawTables {
-    pub insts: *mut Inst, pub inst_count: i64, pub inst_cap: i64,
-    // (a `*mut Block<Comp>`, named as bytes: a block owns a Vec, and a Copy
-    // struct may not hold an allocator)
-    pub blocks: *mut u8, pub block_count: i64, pub block_cap: i64,
-    pub slots: *mut Slot, pub slot_count: i64, pub slot_cap: i64,
-    pub args: IntVec, pub argty: IntVec, pub swcases: IntVec, pub inst_loc: IntVec,
+// A function's IR read back (not yet installed): the tables a context
+// holds for it, each with the capacity it had when the entry was made.
+pub struct IRCopy<A: Allocator> {
+    pub entry: i64, pub result_ptr: i64, pub fn_blocks: Vec<i64, A>, pub fn_slots: Vec<i64, A>,
+    pub insts: Vec<Inst, A>, pub blocks: Vec<Block<A>, A>, pub slots: Vec<Slot, A>,
+    pub args: Vec<i64, A>, pub argty: Vec<i64, A>, pub swcases: Vec<i64, A>,
+    pub inst_loc: Vec<i64, A>,
 }
 
-// A read copy's table (a pointer, a count and a capacity) as a Vec.
-pub fn table_of<T>(p: *mut T, n: i64, cap: i64) -> Vec<T, Comp> {
-    if cap == 0 {
-        return Vec::new_in(Comp {});
-    }
-    // UNSAFE: decode_ir builds a function's tables as raw blocks (a read
-    // that fails part way frees them: free_copy); the context takes them
-    // as its Vecs.
-    // SAFETY: p is decode_ir's block of cap entries from C's allocator,
-    // Comp's own, the first n written (a block's list there is a Vec of
-    // Comp's); the copy is not used after it is installed or freed, so the
-    // block has one owner.
-    unsafe { Vec::from_raw_parts_in(p, n as usize, cap as usize, Comp {}) }
-}
-
-// The same for a read copy's list (an IntVec is a list's raw parts).
-pub fn ints_of(v: IntVec) -> Vec<i64, Comp> {
-    table_of(v.data, v.count, v.cap)
-}
-
-// A function's IR read back (not yet installed).
-#[derive(Clone, Copy)] pub struct IRCopy {
-    pub entry: i64, pub result_ptr: i64, pub blocks: IntVec, pub slots: IntVec, pub t: RawTables,
-}
-
-fn sized(cap: i64, n: i64, r: &mut Reader) -> bool {
+fn sized(cap: i64, n: i64, r: &mut Reader<'_>) -> bool {
     if cap < n || cap > n + n + 64 {
         r.bad = true;
         return false;
@@ -483,189 +380,169 @@ fn sized(cap: i64, n: i64, r: &mut Reader) -> bool {
 }
 
 // Reads a function's IR, for IR function fi, with the entry's ids mapped
-// by `ids`; *bad when it does not read whole.
-pub fn decode_ir(r: &mut Reader, fi: i64, ids: &mut Ids, out: *mut IRCopy) -> bool {
-    unsafe {
-        let mut bad = false;
-        (*out).entry = get_s(r);
-        (*out).result_ptr = get_s(r);
-        (*out).blocks = get_ints(r);
-        (*out).slots = get_ints(r);
-        let n = get_count(r);
-        let cap = get_u(r) as i64;
-        if !sized(cap, n, r) || r.bad {
-            return false;
-        }
-        let insts = alloc_array::<Inst>(if cap > 0 { cap } else { 1 });
-        (*out).t.insts = insts;
-        (*out).t.inst_count = n;
-        // The block's size: insts_of makes a Vec of these parts.
-        (*out).t.inst_cap = if cap > 0 { cap } else { 1 };
-        for i in 0..n {
-            let opc = get_u(r) as i64;
-            let op = (opc & 255) as Op;
-            (*insts.add(i as usize)).op = op;
-            (*insts.add(i as usize)).cond = ((opc >> 8) & 255) as Cond;
-            (*insts.add(i as usize)).ty = get_s(r);
-            (*insts.add(i as usize)).a = get_ref(r, i);
-            (*insts.add(i as usize)).b = get_ref(r, i);
-            (*insts.add(i as usize)).c = get_ref(r, i);
-            let imm = get_s(r);
-            if op == Op::SAddr {
-                (*insts.add(i as usize)).imm = ids_saddr(*ids, imm, &mut bad);
-            } else if op == Op::GAddr || op == Op::CallC {
-                (*insts.add(i as usize)).imm = ids_at(ids.syms, ids.nsyms, imm, &mut bad);
-            } else if op == Op::Call || op == Op::FAddr {
-                (*insts.add(i as usize)).imm = ids_at(ids.fns, ids.nfns, imm, &mut bad);
-            } else if op == Op::RtId {
-                (*insts.add(i as usize)).imm = ids_at(ids.rtids, ids.nrtids, imm, &mut bad);
-            } else {
-                (*insts.add(i as usize)).imm = imm;
-            }
-            (*insts.add(i as usize)).imm2 = get_s(r);
-            (*insts.add(i as usize)).args = get_s(r);
-            (*insts.add(i as usize)).nargs = get_s(r);
-            (*insts.add(i as usize)).block = get_s(r);
-            (*insts.add(i as usize)).prev = get_ref(r, i);
-            (*insts.add(i as usize)).next = get_ref(r, i);
-            (*insts.add(i as usize)).repl = get_ref(r, i);
-            (*insts.add(i as usize)).mark = get_s(r);
-            (*insts.add(i as usize)).aux = get_s(r);
-            (*insts.add(i as usize)).scale = get_s(r);
-        }
-        let nb = get_count(r);
-        let bcap = get_u(r) as i64;
-        if !sized(bcap, nb, r) || r.bad {
-            return false;
-        }
-        let blocks = alloc_array::<Block<Comp>>(if bcap > 0 { bcap } else { 1 });
-        (*out).t.blocks = blocks as *mut u8;
-        (*out).t.block_count = nb;
-        (*out).t.block_cap = if bcap > 0 { bcap } else { 1 };
-        for i in 0..nb {
-            (*blocks.add(i as usize)).first = get_s(r);
-            (*blocks.add(i as usize)).last = get_s(r);
-            // The entry is fresh memory: the list is written, not assigned
-            // (an assignment would drop what was there as a Vec).
-            std::ptr::write(&mut (*blocks.add(i as usize)).preds, get_list(r));
-            (*blocks.add(i as usize)).term = (get_u(r) as i64) as Term;
-            (*blocks.add(i as usize)).cond = get_s(r);
-            (*blocks.add(i as usize)).s0 = get_s(r);
-            (*blocks.add(i as usize)).s1 = get_s(r);
-            (*blocks.add(i as usize)).sealed = get_s(r);
-            (*blocks.add(i as usize)).incomplete = get_s(r);
-            let func = get_s(r);
-            (*blocks.add(i as usize)).func = if func == -1 { fi } else { func };
-            (*blocks.add(i as usize)).removed = get_s(r);
-            (*blocks.add(i as usize)).order = get_s(r);
-            (*blocks.add(i as usize)).idom = get_s(r);
-            (*blocks.add(i as usize)).mark = get_s(r);
-            (*blocks.add(i as usize)).aux = get_s(r);
-            (*blocks.add(i as usize)).loop_depth = get_s(r);
-            (*blocks.add(i as usize)).novec = get_s(r);
-            (*blocks.add(i as usize)).count = get_s(r);
-            (*blocks.add(i as usize)).cases = get_s(r);
-            (*blocks.add(i as usize)).ncases = get_s(r);
-            (*blocks.add(i as usize)).succs = get_s(r);
-            (*blocks.add(i as usize)).nsucc = get_s(r);
-        }
-        let ns = get_count(r);
-        let scap = get_u(r) as i64;
-        if !sized(scap, ns, r) || r.bad {
-            return false;
-        }
-        let slots = alloc_array::<Slot>(if scap > 0 { scap } else { 1 });
-        (*out).t.slots = slots;
-        (*out).t.slot_count = ns;
-        (*out).t.slot_cap = if scap > 0 { scap } else { 1 };
-        for i in 0..ns {
-            (*slots.add(i as usize)).size = get_s(r);
-            (*slots.add(i as usize)).align = get_s(r);
-            (*slots.add(i as usize)).offset = get_s(r);
-            (*slots.add(i as usize)).escapes = get_s(r);
-            (*slots.add(i as usize)).ty = get_s(r);
-        }
-        (*out).t.args = get_ints(r);
-        (*out).t.argty = get_ints(r);
-        (*out).t.swcases = get_ints(r);
-        (*out).t.inst_loc = get_ints(r);
-        !bad && !r.bad && valid_copy(*out)
+// by `ids`; None when it does not read whole.
+pub fn decode_ir(r: &mut Reader<'_>, fi: i64, ids: &Ids<Comp>) -> Option<IRCopy<Comp>> {
+    let mut bad = false;
+    let entry = get_s(r);
+    let result_ptr = get_s(r);
+    let fn_blocks = get_list(r);
+    let fn_slots = get_list(r);
+    let n = get_count(r);
+    let cap = get_u(r) as i64;
+    if !sized(cap, n, r) || r.bad {
+        return None;
     }
+    let mut insts: Vec<Inst, Comp> = Vec::with_capacity_in(cap as usize, Comp {});
+    for i in 0..n {
+        let opc = get_u(r) as i64;
+        let op = (opc & 255) as Op;
+        let cond = ((opc >> 8) & 255) as Cond;
+        let ty = get_s(r);
+        let a = get_ref(r, i);
+        let b = get_ref(r, i);
+        let c = get_ref(r, i);
+        let raw = get_s(r);
+        let imm = if op == Op::SAddr {
+            ids_saddr(ids, raw, &mut bad)
+        } else if op == Op::GAddr || op == Op::CallC {
+            ids_at(&ids.syms, raw, &mut bad)
+        } else if op == Op::Call || op == Op::FAddr {
+            ids_at(&ids.fns, raw, &mut bad)
+        } else if op == Op::RtId {
+            ids_at(&ids.rtids, raw, &mut bad)
+        } else {
+            raw
+        };
+        let imm2 = get_s(r);
+        let args = get_s(r);
+        let nargs = get_s(r);
+        let block = get_s(r);
+        let prev = get_ref(r, i);
+        let next = get_ref(r, i);
+        let repl = get_ref(r, i);
+        let mark = get_s(r);
+        let aux = get_s(r);
+        let scale = get_s(r);
+        insts.push(Inst {
+            op, cond, ty, a, b, c, imm, imm2, args, nargs, block, prev, next, repl, mark, aux,
+            scale,
+        });
+    }
+    let nb = get_count(r);
+    let bcap = get_u(r) as i64;
+    if !sized(bcap, nb, r) || r.bad {
+        return None;
+    }
+    let mut blocks: Vec<Block<Comp>, Comp> = Vec::with_capacity_in(bcap as usize, Comp {});
+    for i in 0..nb {
+        let first = get_s(r);
+        let last = get_s(r);
+        let preds = get_list(r);
+        let term = (get_u(r) as i64) as Term;
+        let cond = get_s(r);
+        let s0 = get_s(r);
+        let s1 = get_s(r);
+        let sealed = get_s(r);
+        let incomplete = get_s(r);
+        let func = get_s(r);
+        let removed = get_s(r);
+        let order = get_s(r);
+        let idom = get_s(r);
+        let mark = get_s(r);
+        let aux = get_s(r);
+        let loop_depth = get_s(r);
+        let novec = get_s(r);
+        let count = get_s(r);
+        let cases = get_s(r);
+        let ncases = get_s(r);
+        let succs = get_s(r);
+        let nsucc = get_s(r);
+        blocks.push(Block {
+            first, last, preds, term, cond, s0, s1, sealed, incomplete,
+            func: if func == -1 { fi } else { func },
+            removed, order, idom, mark, aux, loop_depth, novec, count, cases, ncases, succs,
+            nsucc,
+        });
+    }
+    let ns = get_count(r);
+    let scap = get_u(r) as i64;
+    if !sized(scap, ns, r) || r.bad {
+        return None;
+    }
+    let mut slots: Vec<Slot, Comp> = Vec::with_capacity_in(scap as usize, Comp {});
+    for i in 0..ns {
+        let size = get_s(r);
+        let align = get_s(r);
+        let offset = get_s(r);
+        let escapes = get_s(r);
+        let ty = get_s(r);
+        slots.push(Slot { size, align, offset, escapes, ty });
+    }
+    let args = get_list(r);
+    let argty = get_list(r);
+    let swcases = get_list(r);
+    let inst_loc = get_list(r);
+    let copy = IRCopy {
+        entry, result_ptr, fn_blocks, fn_slots, insts, blocks, slots, args, argty, swcases,
+        inst_loc,
+    };
+    if bad || r.bad || !valid_copy(&copy) {
+        return None;
+    }
+    Some(copy)
 }
 
 // Whether the ids a read copy holds are within its tables (a damaged
 // entry is a miss, not a crash later).
-fn valid_copy(c: IRCopy) -> bool {
-    unsafe {
-        let n = c.t.inst_count;
-        let nb = c.t.block_count;
-        if n < 1 || nb < 1 || c.entry < 0 || c.entry >= nb || c.result_ptr < 0
-            || c.result_ptr >= n {
+fn valid_copy(c: &IRCopy<Comp>) -> bool {
+    let n = c.insts.len() as i64;
+    let nb = c.blocks.len() as i64;
+    if n < 1 || nb < 1 || c.entry < 0 || c.entry >= nb || c.result_ptr < 0 || c.result_ptr >= n {
+        return false;
+    }
+    for &b in c.fn_blocks.iter() {
+        if b < 0 || b >= nb {
             return false;
         }
-        for i in 0..c.blocks.len() as i64 {
-            let b = (c.blocks[i as usize]);
-            if b < 0 || b >= nb {
-                return false;
-            }
-        }
-        for i in 0..n {
-            let v = (*c.t.insts.add(i as usize));
-            if v.a < 0 || v.a >= n || v.b < 0 || v.b >= n || v.c < 0 || v.c >= n || v.prev < 0
-                || v.prev >= n || v.next < 0 || v.next >= n || v.repl < 0 || v.repl >= n
-                || v.block < 0 || v.block >= nb {
-                return false;
-            }
-        }
-        for i in 0..nb {
-            let b = &*(c.t.blocks as *mut Block<Comp>).add(i as usize);
-            if b.first < 0 || b.first >= n || b.last < 0 || b.last >= n {
-                return false;
-            }
-            for k in 0..b.preds.len() as i64 {
-                if (b.preds[k as usize]) < 0 || (b.preds[k as usize]) >= nb {
-                    return false;
-                }
-            }
-        }
-        true
     }
-}
-
-pub fn free_copy(c: *mut IRCopy) {
-    unsafe {
-        free((*c).blocks.data as *mut u8);
-        free((*c).slots.data as *mut u8);
-        // The blocks' lists go with the table.
-        drop(table_of((*c).t.blocks as *mut Block<Comp>, (*c).t.block_count, (*c).t.block_cap));
-        free((*c).t.insts as *mut u8);
-        free((*c).t.slots as *mut u8);
-        free((*c).t.args.data as *mut u8);
-        free((*c).t.argty.data as *mut u8);
-        free((*c).t.swcases.data as *mut u8);
-        free((*c).t.inst_loc.data as *mut u8);
+    for v in c.insts.iter() {
+        if v.a < 0 || v.a >= n || v.b < 0 || v.b >= n || v.c < 0 || v.c >= n || v.prev < 0
+            || v.prev >= n || v.next < 0 || v.next >= n || v.repl < 0 || v.repl >= n
+            || v.block < 0 || v.block >= nb {
+            return false;
+        }
     }
+    for b in c.blocks.iter() {
+        if b.first < 0 || b.first >= n || b.last < 0 || b.last >= n {
+            return false;
+        }
+        for &p in b.preds.iter() {
+            if p < 0 || p >= nb {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 // (testing, $VOLE_CACHE_CHECK) Where a read copy differs from IR
 // function fi's tables (current in cx): 0 nowhere, else a code of the
 // field (instruction fields 1.., block fields 100.., the rest 200..).
-pub fn copy_differs(cx: &mut FnCtx<Comp>, fi: i64, c: &mut IRCopy) -> i64 {
-    unsafe {
+pub fn copy_differs(cx: &mut FnCtx<Comp>, fi: i64, c: &IRCopy<Comp>) -> i64 {
+    {
         if c.entry != fn_entry(cx, fi) || c.result_ptr != fn_result_ptr(cx, fi) {
             return 200;
         }
-        if !same_ints(c.blocks.as_slice(), cx.fn_blocks.as_slice())
-            || !same_ints(c.slots.as_slice(), cx.fn_slots.as_slice()) {
+        if !same_ints(&c.fn_blocks, &cx.fn_blocks)
+            || !same_ints(&c.fn_slots, &cx.fn_slots) {
             return 201;
         }
-        let mut t = c.t;
-        if t.inst_count != cx.insts.len() as i64 || t.block_count != cx.blocks.len() as i64
-            || t.slot_count != cx.slots.len() as i64 {
+        if c.insts.len() != cx.insts.len() || c.blocks.len() != cx.blocks.len()
+            || c.slots.len() != cx.slots.len() {
             return 202;
         }
-        for i in 0..t.inst_count {
-            let a = (*t.insts.add(i as usize));
+        for i in 0..c.insts.len() as i64 {
+            let a = c.insts[i as usize];
             let b = (cx.insts[i as usize]);
             if a.op != b.op { return 1; }
             if a.cond != b.cond { return 2; }
@@ -680,8 +557,8 @@ pub fn copy_differs(cx: &mut FnCtx<Comp>, fi: i64, c: &mut IRCopy) -> i64 {
             if a.mark != b.mark || a.aux != b.aux { return 11; }
             if a.scale != b.scale { return 12; }
         }
-        for i in 0..t.block_count {
-            let a = &*(t.blocks as *mut Block<Comp>).add(i as usize);
+        for i in 0..c.blocks.len() as i64 {
+            let a = &c.blocks[i as usize];
             let b = &cx.blocks[i as usize];
             if a.first != b.first || a.last != b.last { return 101; }
             if a.preds != b.preds { return 102; }
@@ -695,16 +572,16 @@ pub fn copy_differs(cx: &mut FnCtx<Comp>, fi: i64, c: &mut IRCopy) -> i64 {
             if a.novec != b.novec || a.count != b.count || a.cases != b.cases
                 || a.ncases != b.ncases || a.succs != b.succs || a.nsucc != b.nsucc { return 106; }
         }
-        for i in 0..t.slot_count {
-            let a = (*t.slots.add(i as usize));
+        for i in 0..c.slots.len() as i64 {
+            let a = c.slots[i as usize];
             let b = (cx.slots[i as usize]);
             if a.size != b.size || a.align != b.align || a.offset != b.offset
                 || a.escapes != b.escapes || a.ty != b.ty { return 203; }
         }
-        if t.args.as_slice() != cx.args.as_slice() { return 204; }
-        if t.argty.as_slice() != cx.argty.as_slice() { return 205; }
-        if t.swcases.as_slice() != cx.swcases.as_slice() { return 206; }
-        if t.inst_loc.as_slice() != cx.inst_loc.as_slice() { return 207; }
+        if !same_ints(&c.args, &cx.args) { return 204; }
+        if !same_ints(&c.argty, &cx.argty) { return 205; }
+        if !same_ints(&c.swcases, &cx.swcases) { return 206; }
+        if !same_ints(&c.inst_loc, &cx.inst_loc) { return 207; }
         0
     }
 }

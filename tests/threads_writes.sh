@@ -51,13 +51,13 @@ base::ctx::Ctx.comp_growth	the task'"'"'s own component'"'"'s entry, read betwee
 base::ctx::Ctx.comp_inlined	the task'"'"'s own component'"'"'s entry, read between levels
 middle::parallel::FN_CONSTS	the task'"'"'s own function'"'"'s list; others read its entries made in earlier phases, which never move (chunks)
 middle::parallel::FN_TEXT	the task'"'"'s own function'"'"'s entry, read at the join
-back::codecache::FN_IRH	the task'"'"'s own functions'"'"' entries; others read a lower level'"'"'s or an earlier phase'"'"'s (FN_IRH_OK)
-back::codecache::FN_IRH_OK	the same
-back::codecache::FN_STRS	the same
-back::codecache::OUT_COMP	the task'"'"'s own component'"'"'s entry, read after the phases (the counts)
-back::codecache::OUT_EMIT	the task'"'"'s own function'"'"'s entry, read after the phases
-back::codecache::OUT_SCALAR	the task'"'"'s own function'"'"'s entry, read after the phases
-back::codecache::SCALAR_REC	the task'"'"'s own function'"'"'s entry (its cleanup'"'"'s, then its scalar pipeline'"'"'s, a phase after)
+base::ctx::Ctx.cc_irh_a	the task'"'"'s own functions'"'"' entries (atomics); others read a lower level'"'"'s or an earlier phase'"'"'s (cc_irh_ok)
+base::ctx::Ctx.cc_irh_b	the same
+base::ctx::Ctx.cc_irh_ok	the same
+base::ctx::Ctx.cc_strs	the same (lists, each behind its lock)
+base::ctx::Ctx.cc_out_comp	the task'"'"'s own component'"'"'s entry (an atomic), read after the phases (the counts)
+base::ctx::Ctx.cc_out_emit	the task'"'"'s own function'"'"'s entry (an atomic), read after the phases
+base::ctx::Ctx.cc_out_scalar	the task'"'"'s own function'"'"'s entry (an atomic), read after the phases
 base::ctx::Ctx.pack_new	the task'"'"'s own slot (behind the slot'"'"'s lock), read when the pack is written
 base::ctx::Ctx.pack_used	the entry of the task'"'"'s own key (an atomic), read when the pack is written (0.27.8: a key is one task'"'"'s but a function'"'"'s that shares its symbol, fn_ambig, whose task does not mark it: mark_used)
 base::ctx::Ctx.pack	read only: an entry'"'"'s body is a slice of it
@@ -136,13 +136,14 @@ base::ctx::Ctx.needs_count	IR: the same
 base::ctx::Ctx.cc_on	own
 base::ctx::Ctx.check	own (testing)
 base::ctx::Ctx.codecache_env	own: the key'"'"'s program hash
-back::codecache::FN_IRH	own: read R_IR
-back::codecache::FN_IRH_OK	own
-back::codecache::FN_STRS	own: the strings of a read IR
-back::codecache::OUT_COMP	own
-back::codecache::OUT_EMIT	own
-back::codecache::OUT_SCALAR	own
-back::codecache::SCALAR_REC	own: a function'"'"'s recording, from its cleanup to its scalar pipeline
+base::ctx::Ctx.cc_irh_a	own: read R_IR
+base::ctx::Ctx.cc_irh_b	own: the same
+base::ctx::Ctx.cc_irh_ok	own
+base::ctx::Ctx.cc_strs	own: the strings of a read IR
+base::ctx::Ctx.cc_out_comp	own
+base::ctx::Ctx.cc_out_emit	own
+base::ctx::Ctx.cc_out_scalar	own
+base::ctx::Ctx.cc_scalar	own: a function'"'"'s recording, from its cleanup to its scalar pipeline (the task'"'"'s own function'"'"'s, behind its lock)
 base::ctx::Ctx.why	own (testing)
 base::ctx::Ctx.fn_ambig	own
 base::ctx::Ctx.fn_canon	own: what IR names a function by
@@ -151,7 +152,6 @@ base::ctx::Ctx.fn_nameh	own
 base::ctx::Ctx.name_fn	own
 base::ctx::Ctx.name_ir	own
 base::ctx::Ctx.str_h	own: a string'"'"'s bytes
-base::ctx::Ctx.str_h_count	own
 base::ctx::Ctx.pack_entries	own
 base::ctx::Ctx.pack_index	own
 base::ctx::Ctx.pack_new	own
