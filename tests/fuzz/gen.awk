@@ -42,8 +42,10 @@
 # The programs are in the rust edition (0.28). The seed subset (what
 # nonzero=1 writes; tests/seed-compat.awk turns it into the seed's
 # dialect): `let mut`, `mut p: T`, `*const u8`, `&mut a[i]`, an index
-# `[(E) as usize]`, a typed range `0i64..n`, `~x` (the seed's spelling
-# of an integer's complement; the rust edition reads it and `!x`).
+# `[(E) as usize]`, a typed range `0i64..n`, and an integer's complement
+# written `(! E)`, with a space (0.29: `!x`, the language's one spelling;
+# the seed's is `~x`, and the space tells seed-compat.awk the complement
+# from a condition's `(!C)`, which the seed spells the same).
 # Anything else a mode adds stays outside nonzero=1.
 
 function rnd(n) { return int(rand() * n) }
@@ -178,7 +180,7 @@ function expr(t, depth,    k, v, u, op, ops, lhs, amount) {
     }
     if (k == 9) {
         if (signed(t)) return "(-" expr(t, depth - 1) ")"
-        return "(~" expr(t, depth - 1) ")"
+        return "(! " expr(t, depth - 1) ")"
     }
     if (k == 10 && NA > 0) {
         v = rnd(NA)

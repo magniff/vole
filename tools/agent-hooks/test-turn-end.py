@@ -154,15 +154,38 @@ try:
     write(os.path.join(co, "examples", "demo", "main.vl"), "fn main() {  }\n")
     write(os.path.join(fdir, "fmt.bad"), "")
     write(os.path.join(fdir, "run.out"), "FAIL example_demo:\n    stdout mismatch\n\ntests for x:\n  total 0 0 1\n")
+    # (0.29) by default the cases are not run: the quick checks only
     st, out, ms = hook("turn-end.py", ex_stop)
-    case("examples: a changed example, unformatted and failing", (reason(out) or "").split("\n"),
+    case("examples: a changed example, unformatted (its failing cases are not run)", (reason(out) or "").split("\n"),
+         ["turn-end: changed examples (examples/demo): 1 problem the suite would report",
+          "examples/demo/main.vl is not formatted; try: volec fmt examples/demo/main.vl"])
+    case("examples: no case is run by default", os.path.exists(os.path.join(fdir, "runs")), False)
+    print(f"note: the turn-end hook with an example's quick checks takes {ms:.0f} ms (fakes)")
+    case("examples: the same state, not twice", hook("turn-end.py", ex_stop)[1], "")
+    # VOLE_TURN_END_EXAMPLES=run: the cases too; a failure is reported
+    # when it fails twice
+    st, out, ms = hook("turn-end.py", ex_stop, VOLE_TURN_END_EXAMPLES="run")
+    case("examples: =run, unformatted and failing twice", (reason(out) or "").split("\n"),
          ["turn-end: changed examples (examples/demo): 2 problems the suite would report",
           "examples/demo/main.vl is not formatted; try: volec fmt examples/demo/main.vl",
-          "tests/run.sh example_demo fails:", "FAIL example_demo:", "    stdout mismatch"])
+          "tests/run.sh example_demo fails (twice):", "FAIL example_demo:", "    stdout mismatch"])
     with open(os.path.join(fdir, "runs")) as fh:
-        case("examples: its cases run once, by their common name", fh.read(), "example_demo\n")
-    print(f"note: the turn-end hook with an example's checks takes {ms:.0f} ms (fakes)")
-    case("examples: the same state, not twice", hook("turn-end.py", ex_stop)[1], "")
+        case("examples: =run, a failing run is run once more, by the cases' common name", fh.read(),
+             "example_demo\nexample_demo\n")
+    case("examples: =run, the same state, not twice",
+         hook("turn-end.py", ex_stop, VOLE_TURN_END_EXAMPLES="run")[1], "")
+    # a failure that does not happen again (the load's) is not reported:
+    # the fake run.sh fails once, then passes
+    os.remove(os.path.join(fdir, "fmt.bad"))
+    os.remove(os.path.join(fdir, "runs"))
+    write(os.path.join(co, "tests", "run.sh"), "echo \"$3\" >>'%s/runs'\n"
+          "[ \"$(wc -l <'%s/runs')\" -ge 2 ] && exit 0\ncat '%s/run.out'\nexit 1\n" % (fdir, fdir, fdir))
+    write(os.path.join(co, "examples", "demo", "main.vl"), "fn main() {   }\n")
+    case("examples: =run, a failure that does not repeat is not reported",
+         hook("turn-end.py", ex_stop, VOLE_TURN_END_EXAMPLES="run")[1], "")
+    with open(os.path.join(fdir, "runs")) as fh:
+        case("examples: =run, it was run twice", fh.read(), "example_demo\nexample_demo\n")
+    write(os.path.join(fdir, "fmt.bad"), "")
     os.remove(os.path.join(fdir, "fmt.bad"))
     write(os.path.join(fdir, "run.out"), "")
     write(os.path.join(co, "examples", "demo", "main.vl"), "fn main() {}\n")
