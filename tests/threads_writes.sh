@@ -146,6 +146,7 @@ base::ctx::Ctx.time_each_pass	off: the same (--time-passes=passes), set by the o
 base::ctx::Ctx.pass_counts	off: the same; atomics a pass'"'"'s end adds to (timer::pass_done) only when time_each_pass, which runs on one thread (serial_only)
 base::ctx::Ctx.vec_stats_fn	off: --vec-stats=FN is an option the cache does not know (ARGS_UNKNOWN), set by the options before the tasks
 base::ctx::Ctx.static_named	output: none; the emission (materialize) reads it only to stop on an internal error, made by statics_named_by_ir before the tasks
+base::ctx::Ctx.inline_log	output: none; VOLE_INLINE_LOG'"'"'s buffer, made by inline_log_start on the main thread before the tasks and written to only at -j1 (a cached function decides nothing and logs nothing: the log is read with --no-cache)
 base::ctx::Ctx.vec_tmpl	key: std'"'"'s Vec template, found in the program'"'"'s types (types_hash) by init_vec_facts before the tasks, read-only after
 base::ctx::Ctx.wraps	key: the same (std'"'"'s Vec wrappers)
 base::ctx::Ctx.a64_lse_flag	key: --atomics= is in the options hash (codecache::arg_kind), set by main before the tasks

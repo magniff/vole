@@ -3137,13 +3137,84 @@ call the -O2 inliner decides (`middle/inline.vl`: `should_inline` asks
 `inline_rule`, which names the rule that decided, and `log_decision`
 writes it): the caller, the callee, the callee's size, the rule (`hint`,
 `tiny`, `closure-once`, `cold-free`, `once`, `hot`, `small`, or
-`no:returns-twice`, `no:never-or-cold-fn`, `no:caller-big`, `no:budget`,
-`no:cold-site`, `no:big`), the site's loop depth, the caller's size
-then, the level of the caller's component, the program's size as the
-component sees it, and the budget. One thread and no code cache, so the
+`no:returns-twice`, `no:never-or-cold-fn`, `no:caller-big`, `no:room`
+(`no:budget` while the program had a budget), `no:cold-site`, `no:big`),
+the site's loop depth, the caller's size then, the level of the
+caller's component, the program's size as the component sees it, and
+the size the caller may grow to (the program's budget, before the room). One thread and no code cache, so the
 lines are in the same order in every build of the same program (a cached
 function is not optimized, and decides nothing); the decisions
 themselves do not depend on the number of threads. `tools/inline-log-diff.py
-A.log B.log` compares two: totals by rule, where the budget was first
-found spent, the levels, callees and callers that differ, and with
+A.log B.log` compares two: totals by rule, the first level a call was
+refused for room, the levels, callees and callers that differ, and with
 `-f CALLER` one caller's decisions.
+
+## 0.29: the inliner's room is each function's own
+
+**What the log showed.** Until now the program had one growth budget,
+half its size again (`start_inlining_budget`), and the components spent
+it bottom-up, a level of the call graph at a time. On the compiler
+itself (release tree, 254663 decisions on about 55 levels) it was gone
+at level 10: 109621 decisions, 43%, were `no:budget`, and from there up
+a call was inlined only when the callee was tiny, hinted, a closure
+called once, or a leaf of at most 6 instructions. So whether a function
+got any inlining depended on its depth in the call graph, and that
+depth changes with what it calls:
+
+- the constant lattice's lists became Vecs (commit "the constant
+  lattice's work lists are Vecs"): `sccp_eval`'s component went from
+  level 6 to level 18, std's Vec methods being a deeper chain than the
+  IntVec's; its calls of `lat_of` (12), `lat_value` (13) and `lat_set`
+  (37 to 49), inlined before by `small` and `once`, were all
+  `no:budget` after; the sccp row went from 5488 M to 8024 M (+46%);
+- the Vec header summary changed the sizes of functions by an
+  instruction or two: with the same source, 1271 of 12956 callers
+  decided differently, at level 10 (where the budget ran out) 341 calls
+  were inlined in one build and 1325 in the other, at level 15 3100 and
+  423; the self-build moved by 6.4%;
+- 600 lines added to the middle end moved `volec check`, whose code was
+  not touched, by 2%.
+
+**The rule now** (`inline_rule`): no budget of the program. What a
+caller takes in is bounded by its own room, `INLINE_ROOM` (40) more
+than its size before inlining, counted for the calls that are charged:
+not a tiny callee, a hinted one, a closure called once, a small callee
+(at most `INLINE_LEAF`, now 16, and a leaf or called in a loop), a
+profile's hot call, nor the only call of a callee of at most
+`INLINE_ONCE_FREE` (120: it is moved, not copied). The thresholds by
+loop depth and the cold-site rule are as they were. A decision depends
+on the call, the callee and the caller, and on nothing another function
+did: the order of the components, the levels and the number of threads
+cannot change it.
+
+**How the numbers were chosen** (each policy built into a compiler by
+itself, on one source; self-build and check in G instructions, the std
+row's program in M, the object the compiler emits for itself in MB, and
+the geometric mean of the instructions of bench/*.vl built by it, 23
+programs, against the budget's):
+
+| policy | self-build | check | std | object | bench |
+|---|---:|---:|---:|---:|---:|
+| the program's budget (before) | 127.3 | 22.47 | 1444 | 14.14 | 1.000 |
+| no budget, no room | 289.0 | 20.35 | | 19.99 | |
+| no budget, thresholds 8/16/30 for leaves, 4/8/16 others | 147.2 | 21.35 | | 13.90 | |
+| room 40 + size/4, leaf 6 | 122.1 | 20.58 | 1064 | 13.88 | 1.014 |
+| room 40, leaf 6 | 111.3 | 20.91 | 1007 | 13.28 | 1.024 |
+| room 40, leaf 16 | 109.2 | 20.60 | 1005 | 13.31 | 1.005 |
+| room 40, leaf 16, only call free up to 400 | 138.5 | 20.84 | 1858 | 12.75 | 1.003 |
+| room 40, leaf 16, only call free up to 120 | 117.6 | 20.65 | 1307 | 12.82 | 1.001 |
+| the same, and small callees in loops free (chosen) | 118.8 | 20.64 | 1316 | 12.95 | 1.000 |
+| room 40 + 150 per loop depth, leaf 6 | 137.2 | 20.54 | 1185 | 14.76 | 1.004 |
+
+Without any bound the compiler's front end is 9% faster and the
+self-build more than twice as dear (the loop passes and value numbering
+are worse than linear in a function's size); the room keeps most of the
+first for none of the second. The benchmarks that the chosen rule
+leaves slower than the budget did (a small program never spent its
+budget, and took in everything under the thresholds): interp 1.12,
+wordcount 1.11, fannkuch and sort 1.06, json 1.04; faster: fmtloop
+0.76, fmtints 0.88.
+
+tests/run/opt_inline_room.vl: the room (of six calls of a callee that
+is charged, one is inlined), small leaves and a small callee in a loop
+not charged, a function's only call inlined after the room is used.

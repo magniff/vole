@@ -6,14 +6,14 @@
 // callee's size, less a bonus for the constant arguments that decide
 // something in it and the cost of the call itself, against a threshold
 // that grows with the call site's loop depth and is zero in cold blocks;
-// a function's only call site takes up to INLINE_ONCE. Inlining iterates:
+// a function's only call site takes up to INLINE_ONCE; and what a caller
+// takes in is bounded by its own room (INLINE_ROOM), so that a decision
+// depends on the call, the callee and the caller alone. Inlining iterates:
 // the inlined copies' calls are considered again once the copies are
 // simplified (see inline_rounds).
 
 use crate::back::abi::{AbiClass, conv_classify, conv_returns_through_pointer, fn_uses_c};
-use crate::back::codecache::{
-    R_DEC, R_IR, R_RT, R_SIZE, R_STATIC, cc_note, cc_note_budget, cc_note_calls,
-};
+use crate::back::codecache::{R_DEC, R_IR, R_RT, R_SIZE, R_STATIC, cc_note, cc_note_calls};
 use crate::back::regalloc::intervals::calls_returns_twice;
 use crate::base::{
     IntVec, alloc_array, alloc_zeroed, buf_byte, buf_int, buf_new, buf_str, free, memset, sym_name,
@@ -552,9 +552,21 @@ const RT_RETURNS_TWICE: i64 = 1;
 const RT_CALLS: i64 = 2;
 // (0.29) It has panic blocks, which its size leaves out (func_size).
 const RT_PANICS: i64 = 4;
-// (0.17) A leaf this small is inlined whatever the program's budget (see
-// should_inline).
-const INLINE_LEAF: i64 = 6;
+// (0.17) A leaf this small is not charged to its caller's room (see
+// inline_rule). (0.29: 16, from 6: a checked accessor of a Vec in a
+// struct is 8 without its report, one that also tests its argument 12.)
+const INLINE_LEAF: i64 = 16;
+// (0.29) What a function may grow by through the calls charged to it
+// (inline_rule, caller_room): the callees that are neither tiny, nor
+// hinted, nor small leaves, nor its only call of a callee of at most
+// INLINE_ONCE_FREE. The room is the function's own: what other functions
+// inlined, and in which order the program's functions are optimized, does
+// not change it. (Until 0.29 the program had one budget, half its size
+// again, spent by the components bottom-up: in a large program it was
+// gone a fifth of the way up the call graph, and whether a function got
+// any inlining depended on its depth there.)
+const INLINE_ROOM: i64 = 40;
+const INLINE_ONCE_FREE: i64 = 120;
 
 // (0.29) The rules of inline_rule: above 0 the call is inlined, below it
 // stays; what VOLE_INLINE_LOG's lines name (rule_name).
@@ -570,7 +582,7 @@ const R_NOT_READY: i64 = -2;
 const R_RETURNS_TWICE: i64 = -3;
 const R_NEVER: i64 = -4;
 const R_CALLER_BIG: i64 = -5;
-const R_BUDGET: i64 = -6;
+const R_ROOM: i64 = -6;
 const R_COLD: i64 = -7;
 const R_BIG: i64 = -8;
 
@@ -585,7 +597,7 @@ fn rule_name(rule: i64) -> *mut u8 {
     else if rule == R_RETURNS_TWICE { c"no:returns-twice" }
     else if rule == R_NEVER { c"no:never-or-cold-fn" }
     else if rule == R_CALLER_BIG { c"no:caller-big" }
-    else if rule == R_BUDGET { c"no:budget" }
+    else if rule == R_ROOM { c"no:room" }
     else if rule == R_COLD { c"no:cold-site" }
     else if rule == R_BIG { c"no:big" }
     else { c"no:other" }
@@ -624,7 +636,7 @@ fn inline_rule(cx: &mut FnCtx<Comp>, fi: i64, g: i64, call: i64, pcx: &Ctx<Comp>
         // (0.17: computed once; it scans the callee for what each constant
         // argument decides)
         let cost = inline_cost(cx, g, call, pcx);
-        if cost <= INLINE_TINY && budget_allows(cx, (*get_fn_size().add(g as usize)), pcx) {
+        if cost <= INLINE_TINY {
             return R_TINY;
         }
         let b = (cx.insts[call as usize]).block;
@@ -637,21 +649,34 @@ fn inline_rule(cx: &mut FnCtx<Comp>, fi: i64, g: i64, call: i64, pcx: &Ctx<Comp>
         if once && is_closure_fn(g, pcx) {
             return R_CLOSURE_ONCE;
         }
-        // (0.17) A small leaf is not charged to the program's budget: its
+        // (0.17) A small leaf is not charged to the caller's room: its
         // code is about its call's (the arguments' moves, the call, the
-        // caller-saved registers it clobbers), and the program's callers,
-        // last in the order, found the budget spent.
+        // caller-saved registers it clobbers). (0.29) Nor a callee as small
+        // called in a loop, leaf or not (`gen.push(c)` at each character).
         let small_leaf = (*get_fn_size().add(g as usize)) <= INLINE_LEAF
-            && callee_is_leaf(cx, g, pcx);
+            && (callee_is_leaf(cx, g, pcx) || site_depth(cx, b) >= 1);
         if (*get_fn_size().add(fi as usize)) + (*get_fn_size().add(g as usize)) > INLINE_BUDGET {
             return R_CALLER_BIG;
         }
-        if !budget_allows(cx, (*get_fn_size().add(g as usize)), pcx) && !small_leaf {
-            return R_BUDGET;
+        // (0.29) Nor is the only call of a function that is not large: it
+        // is moved, not copied.
+        if once && (*get_fn_size().add(g as usize)) <= INLINE_ONCE_FREE {
+            return R_ONCE;
         }
-        // (0.10: with a profile, a call that never ran is cold, and a hot one
-        // takes a callee up to INLINE_HOT)
-        if site_cold(cx, b) || is_cold_block(cx, b, pcx) {
+        // (0.10: with a profile, a hot call takes a callee up to INLINE_HOT,
+        // whatever the caller's room)
+        let cold = site_cold(cx, b) || is_cold_block(cx, b, pcx);
+        if !cold && is_hot_count((cx.blocks[b as usize]).count, pcx) && cost <= INLINE_HOT {
+            return R_HOT;
+        }
+        // (0.29) The rest is charged to the caller's own room.
+        if !small_leaf
+            && (*get_fn_size().add(fi as usize)) + (*get_fn_size().add(g as usize))
+            > cx.inl_size0 + INLINE_ROOM {
+            return R_ROOM;
+        }
+        // (0.10: with a profile, a call that never ran is cold)
+        if cold {
             // In a cold block, only when that makes the program no bigger
             // (0.29: so not a callee with panic blocks, whose size says
             // nothing of them: the report of a failed check would take in
@@ -664,9 +689,6 @@ fn inline_rule(cx: &mut FnCtx<Comp>, fi: i64, g: i64, call: i64, pcx: &Ctx<Comp>
         }
         if once && (*get_fn_size().add(g as usize)) <= INLINE_ONCE {
             return R_ONCE;
-        }
-        if is_hot_count((cx.blocks[b as usize]).count, pcx) && cost <= INLINE_HOT {
-            return R_HOT;
         }
         let depth = site_depth(cx, b);
         let mut threshold = INLINE_SMALL;
@@ -746,7 +768,7 @@ fn log_decision(cx: &mut FnCtx<Comp>, fi: i64, g: i64, call: i64, rule: i64, pcx
         buf_byte(out, b'\t');
         buf_int(out, program_size(cx, pcx));
         buf_byte(out, b'\t');
-        buf_int(out, pcx.program_budget);
+        buf_int(out, cx.inl_size0 + INLINE_ROOM);
         buf_byte(out, b'\n');
     }
 }
@@ -884,6 +906,9 @@ fn set_site(cx: &mut FnCtx<Comp>, b: i64, depth: i64, cold: bool) {
 pub fn inline_rounds(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
     unsafe {
         let mut any = false;
+        // (0.29) What the function may grow to through the calls charged
+        // to it (INLINE_ROOM).
+        cx.inl_size0 = (*get_fn_size().add(fi as usize));
         for round in 0..INLINE_ROUNDS {
             let inlined = inline_calls(cx, fi, pcx);
             pass_done(P_INLINE, pcx);
@@ -905,7 +930,8 @@ pub fn inline_rounds(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
     }
 }
 
-// The program's size now, and its growth budget.
+// The program's size now (for VOLE_INLINE_LOG; until 0.29 its growth
+// budget was made from it).
 pub fn start_inlining_budget(pcx: &mut Ctx<Comp>) {
     unsafe {
         pcx.program_size = 0;
@@ -914,7 +940,6 @@ pub fn start_inlining_budget(pcx: &mut Ctx<Comp>) {
                 pcx.program_size += (*get_fn_size().add(fi as usize));
             }
         }
-        pcx.program_budget = pcx.program_size + pcx.program_size / 2 + 2000;
     }
 }
 
@@ -1228,15 +1253,6 @@ fn inline_maps(cx: &mut FnCtx<Comp>, blocks: i64, insts: i64) {
 // made the decisions depend on the order the components were done in).
 fn program_size(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) -> i64 {
     pcx.program_size + cx.comp_growth
-}
-
-// (0.18.1) Whether the program, grown by n more, is within the inlining
-// budget as the component being optimized sees it (the code cache keeps
-// the answer, not the size: back::codecache).
-fn budget_allows(cx: &mut FnCtx<Comp>, n: i64, pcx: &Ctx<Comp>) -> bool {
-    let within = program_size(cx, pcx) + n <= pcx.program_budget;
-    cc_note_budget(cx, cx.comp_growth + n, within);
-    within
 }
 
 fn program_grows(cx: &mut FnCtx<Comp>, n: i64) {

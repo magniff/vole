@@ -5,10 +5,10 @@
 usage: tools/inline-log-diff.py A.log B.log [-n COUNT] [-f CALLER]
 
 A line of a log: caller, callee, callee's size, rule, loop depth, caller's
-size, level, program size, budget (tab separated). Prints:
+size, level, program size, the size the caller may grow to (tab separated). Prints:
   - each log's totals: decisions, calls inlined, by rule; the level and the
-    program size at which the budget was first found spent;
-  - by level: calls inlined and refused for the budget, in A and in B;
+    program size at which a call was first refused for the caller's room;
+  - by level: calls inlined and refused for room, in A and in B;
   - the callees whose number of inlined calls differs most (-n, default 20);
   - the callers whose decisions differ most;
   - with -f CALLER: that caller's decisions that differ, callee by callee.
@@ -35,16 +35,16 @@ def inlined(rule):
 def totals(name, rows):
     rules = Counter(r[3] for r in rows)
     n = sum(1 for r in rows if inlined(r[3]))
-    print(f"{name}: {len(rows)} decisions, {n} inlined, budget {rows[0][8] if rows else 0}")
+    print(f"{name}: {len(rows)} decisions, {n} inlined")
     for rule, c in sorted(rules.items(), key=lambda x: (-x[1], x[0])):
         print(f"    {c:8} {rule}")
-    spent = [r for r in rows if r[3] == "no:budget"]
+    spent = [r for r in rows if r[3] == "no:room"]
     if spent:
         first = min(spent, key=lambda r: r[6])
-        print(f"    budget first spent at level {first[6]} (program size {first[7]}),"
+        print(f"    the caller's room first refused at level {first[6]} (program size {first[7]}),"
               f" {len(spent)} calls refused for it")
     else:
-        print("    budget never spent")
+        print("    no call refused for room")
 
 
 def main():
@@ -74,13 +74,13 @@ def main():
                           f" level {r[6]}, program {r[7]})")
         return
 
-    print("by level (inlined A / B, refused for the budget A / B):")
+    print("by level (inlined A / B, refused for room A / B):")
     lv = defaultdict(lambda: [0, 0, 0, 0])
     for k, rows in ((0, a), (1, b)):
         for r in rows:
             if inlined(r[3]):
                 lv[r[6]][k] += 1
-            elif r[3] == "no:budget":
+            elif r[3] == "no:room":
                 lv[r[6]][2 + k] += 1
     for level in sorted(lv):
         x = lv[level]
