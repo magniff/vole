@@ -31,9 +31,9 @@
 // checker's bck-*.bin is one file of a few KB per compiler and std.
 
 use crate::base::{
-    buf_byte, buf_bytes, buf_freeze, buf_new, buf_reserve, buf_slice, buf_str, fclose, fopen,
-    fwrite, get_bufs, get_src, memcpy, memset, restore_sources, restore_sym, strlen, sym_hash,
-    sym_text,
+    buf_byte, buf_bytes, buf_freeze, buf_len, buf_new, buf_ptr, buf_reserve, buf_set, buf_slice,
+    buf_str, buf_truncate, buf_zeros, c_bytes, fclose, fopen, fwrite, get_src, memcpy,
+    restore_sources, restore_sym, strlen, sym_hash, sym_text,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -90,37 +90,25 @@ const VERSION: i64 = 11;
 fn put(b: i64, v: i64) {
     // UNSAFE: a word is written into the buffer's own block (BUFS, base's
     // raw table of buffers).
-    // SAFETY: buf_reserve made room for 8 bytes past the buffer's len; the
-    // word is written there and len grows by 8. A cache buffer holds only
+    // SAFETY: buf_zeros appended 8 bytes at offset `at`, where the word is
+    // written before anything else writes b. A cache buffer holds only
     // words and padded strings, so len is a multiple of 8 and the block
     // (malloc's) is aligned for an i64.
     unsafe {
-        buf_reserve(b, 8);
-        let p = ((*get_bufs().add(b as usize)).data.add((*get_bufs().add(b as usize)).len as usize)) as *mut i64;
+        let at = buf_zeros(b, 8);
+        let p = (buf_ptr(b).add(at as usize)) as *mut i64;
         (*p.add(0)) = v;
-        (*get_bufs().add(b as usize)).len += 8;
     }
 }
 
 fn put_str(b: i64, s: &[u8]) {
-    // UNSAFE: memset and memcpy are C's, into the buffer's own block (BUFS).
-    // SAFETY: buf_reserve made room for words * 8 bytes past the buffer's
-    // len, all zeroed; n < words * 8, so the string's n bytes and a 0 byte
-    // after them fit; memcpy is not called for an empty slice; len grows by
-    // what was written.
-    unsafe {
-        let n = s.len() as i64;
-        put(b, n);
-        let words = (n + 8) / 8;
-        buf_reserve(b, words * 8);
-        let dst = (*get_bufs().add(b as usize)).data.add(
-            (*get_bufs().add(b as usize)).len as usize);
-        memset(dst, 0, (words * 8) as u64);
-        if n > 0 {
-            memcpy(dst, s.ptr, n as u64);
-        }
-        (*get_bufs().add(b as usize)).len += words * 8;
-    }
+    // (the string's n bytes, then zeros up to words * 8: at least one,
+    // n < words * 8; nothing here is unsafe any more)
+    let n = s.len() as i64;
+    put(b, n);
+    let words = (n + 8) / 8;
+    buf_bytes(b, s);
+    buf_zeros(b, words * 8 - n);
 }
 
 fn put_cstr(b: i64, s: *mut u8) {
@@ -129,22 +117,15 @@ fn put_cstr(b: i64, s: *mut u8) {
     // the call; the slice covers its bytes before the 0.
     unsafe {
         put_str(b,
-            std::slice::from_raw_parts(s.add((0) as usize), (strlen(s) as i64 - (0)) as usize));
+            c_bytes(s));
     }
 }
 
 fn read_words(b: i64, tcx: &mut Tcx<Comp>) {
-    // UNSAFE: the reader's words are the buffer's block seen as i64s, kept
-    // as a raw pointer in the context (BUFS is base's raw table).
-    // SAFETY: b is the file just read, frozen by restore before this call
-    // (its block does not move or go for the process); rd_n is its whole
-    // words, and a length that is not a multiple of 8 sets rd_bad.
-    unsafe {
-        tcx.rd = (*get_bufs().add(b as usize)).data as *mut i64;
-        tcx.rd_at = 0;
-        tcx.rd_n = (*get_bufs().add(b as usize)).len / 8;
-        tcx.rd_bad = (*get_bufs().add(b as usize)).len % 8 != 0;
-    }
+    tcx.rd = buf_ptr(b) as *mut i64;
+    tcx.rd_at = 0;
+    tcx.rd_n = buf_len(b) / 8;
+    tcx.rd_bad = buf_len(b) % 8 != 0;
 }
 
 fn get(tcx: &mut Tcx<Comp>) -> i64 {
@@ -251,11 +232,11 @@ fn body_hash(b: i64, from: i64) -> i64 {
     // SAFETY: len >= from * 8 (checked above), so the region hashed is in
     // the block.
     unsafe {
-        if (*get_bufs().add(b as usize)).len < from * 8 {
+        if buf_len(b) < from * 8 {
             return -1;
         }
-        (hash_region((*get_bufs().add(b as usize)).data.add((from * 8) as usize),
-            (*get_bufs().add(b as usize)).len - from * 8) >> 1) as i64
+        (hash_region(buf_ptr(b).add((from * 8) as usize),
+            buf_len(b) - from * 8) >> 1) as i64
     }
 }
 
@@ -280,8 +261,8 @@ pub fn ident(pcx: &mut Ctx<Comp>) -> i64 {
         }
         let b = buf_new();
         if exe != 0 as *mut u8 && read_file_if(exe, b) {
-            pcx.ident = (hash_region((*get_bufs().add(b as usize)).data,
-                (*get_bufs().add(b as usize)).len) >> 1) as i64;
+            pcx.ident = (hash_region(buf_ptr(b),
+                buf_len(b)) >> 1) as i64;
             if pcx.ident == 0 {
                 pcx.ident = 1;
             }
@@ -344,52 +325,41 @@ fn cwd() -> *mut u8 {
     unsafe {
         let b = buf_new();
         buf_reserve(b, 4096);
-        if getcwd((*get_bufs().add(b as usize)).data, 4096) == 0 as *mut u8 {
-            (*(*get_bufs().add(b as usize)).data.add(0)) = 0;
+        if getcwd(buf_ptr(b), 4096) == 0 as *mut u8 {
+            (*buf_ptr(b).add(0)) = 0;
         }
-        (*get_bufs().add(b as usize)).data
+        buf_ptr(b)
     }
 }
 
 // The KEY of the cache of root and target: the hash its files are named by.
 fn cache_key(root: *mut u8, target: i64, pcx: &mut Ctx<Comp>) -> u64 {
-    // UNSAFE: hash_region reads the key buffer's bytes by pointer.
-    // SAFETY: `k` is this call's buffer; its data and len are the bytes
-    // put and put_cstr appended, whole words.
-    unsafe {
-        let k = buf_new();
-        put_cstr(k, root);
-        put_cstr(k, cwd());
-        put(k, target);
+    let k = buf_new();
+    put_cstr(k, root);
+    put_cstr(k, cwd());
+    put(k, target);
 
-        // (0.25.3: and the compiler as it was run, which the errors' `try:`
-        // lines kept in the cache name: `target/volec check`, then `volec
-        // edit ...` from $PATH, read them as other errors, new ones, and
-        // refused the edit; `volec check` printed `try: target/volec ...`)
-        put_cstr(k, if pcx.diag_prog == 0 as *mut u8 { c"volec" } else { pcx.diag_prog });
-        hash_region((*get_bufs().add(k as usize)).data, (*get_bufs().add(k as usize)).len)
-    }
+    // (0.25.3: and the compiler as it was run, which the errors' `try:`
+    // lines kept in the cache name: `target/volec check`, then `volec
+    // edit ...` from $PATH, read them as other errors, new ones, and
+    // refused the edit; `volec check` printed `try: target/volec ...`)
+    put_cstr(k, if pcx.diag_prog == 0 as *mut u8 { c"volec" } else { pcx.diag_prog });
+    hash_region(buf_ptr(k), buf_len(k))
 }
 
 // The cache's file for root and target, with suffix `ext`.
 fn cache_file(root: *mut u8, target: i64, ext: *mut u8, pcx: &mut Ctx<Comp>) -> *mut u8 {
-    // UNSAFE: the path is a C string for fopen and rename, the bytes of a
-    // base buffer (BUFS has no safe view that outlives the call).
-    // SAFETY: `out` is this call's buffer, ended with a NUL; BUFS are not
-    // freed, so the pointer holds for the run.
-    unsafe {
-        let h = cache_key(root, target, pcx);
-        let out = buf_new();
-        buf_str(out, cache_dir(pcx));
-        buf_str(out, c"/q-");
-        for i in 0..16 {
-            let d = ((h >> ((15 - i) * 4) as u64) & 15) as u8;
-            buf_byte(out, if d < 10 { b'0' + d } else { b'a' + d - 10 });
-        }
-        buf_str(out, ext);
-        buf_byte(out, 0);
-        (*get_bufs().add(out as usize)).data
+    let h = cache_key(root, target, pcx);
+    let out = buf_new();
+    buf_str(out, cache_dir(pcx));
+    buf_str(out, c"/q-");
+    for i in 0..16 {
+        let d = ((h >> ((15 - i) * 4) as u64) & 15) as u8;
+        buf_byte(out, if d < 10 { b'0' + d } else { b'a' + d - 10 });
     }
+    buf_str(out, ext);
+    buf_byte(out, 0);
+    buf_ptr(out)
 }
 
 // Whether the cache can be used at all: a directory, and the compiler
@@ -520,8 +490,7 @@ fn restore(root: *mut u8, target: i64, refs: bool, next: bool, tcx: &mut Tcx<Com
         }
         let used = get(tcx);
         if !same(get_str(tcx),
-            std::slice::from_raw_parts(root.add((0) as usize),
-                (strlen(root) as i64 - (0)) as usize)) || get(tcx) != target {
+            c_bytes(root)) || get(tcx) != target {
             return false;
         }
         let stamp = get(tcx);
@@ -532,7 +501,7 @@ fn restore(root: *mut u8, target: i64, refs: bool, next: bool, tcx: &mut Tcx<Com
         }
         // The files, read again where they were.
         let all = buf_new();
-        buf_reserve(all, src_len + 16);
+        buf_zeros(all, src_len + 16);
         let mut files: Vec<i64, Comp> = Vec::new_in(Comp {});
         let mut at: i64 = 0;
         for _ in 0..n_files {
@@ -548,10 +517,10 @@ fn restore(root: *mut u8, target: i64, refs: bool, next: bool, tcx: &mut Tcx<Com
                 return false;
             }
             if start == at + 2 {
-                (*(*get_bufs().add(all as usize)).data.add(at as usize)) = 0;
-                (*(*get_bufs().add(all as usize)).data.add((at + 1) as usize)) = b'\n';
+                buf_set(all, at, 0);
+                buf_set(all, at + 1, b'\n');
             }
-            let dst = (*get_bufs().add(all as usize)).data.add(start as usize);
+            let dst = buf_ptr(all).add(start as usize);
             if made != 0 {
                 let text = get_str(tcx);
                 if tcx.rd_bad || text.len() as i64 != end - start {
@@ -561,7 +530,7 @@ fn restore(root: *mut u8, target: i64, refs: bool, next: bool, tcx: &mut Tcx<Com
             } else if !read_exact(path.ptr, dst, end - start) {
                 return false;
             }
-            (*(*get_bufs().add(all as usize)).data.add(end as usize)) = b'\n';
+            buf_set(all, end, b'\n');
             at = end + 1;
             files.push(path.ptr as i64);
             files.push(start);
@@ -572,9 +541,9 @@ fn restore(root: *mut u8, target: i64, refs: bool, next: bool, tcx: &mut Tcx<Com
         if at != src_len {
             return false;
         }
-        (*(*get_bufs().add(all as usize)).data.add(at as usize)) = 0;
-        (*get_bufs().add(all as usize)).len = at + 1;
-        if (hash_region((*get_bufs().add(all as usize)).data, src_len) >> 1) as i64 != stamp {
+        buf_set(all, at, 0);
+        buf_truncate(all, at + 1);
+        if (hash_region(buf_ptr(all), src_len) >> 1) as i64 != stamp {
             return false;
         }
         let n_probes = get_count(1, tcx);
@@ -598,12 +567,12 @@ fn restore(root: *mut u8, target: i64, refs: bool, next: bool, tcx: &mut Tcx<Com
             if !read_file_if(cache_file(root, target, if next { c".next.refs" } else { c".refs" },
                 pcx),
                 r)
-                || (*get_bufs().add(r as usize)).len % 8 != 0
-                || (*get_bufs().add(r as usize)).len < 40 {
+                || buf_len(r) % 8 != 0
+                || buf_len(r) < 40 {
                 return false;
             }
-            words = (*get_bufs().add(r as usize)).data as *mut i64;
-            n_refs = (*get_bufs().add(r as usize)).len / 8 - 5;
+            words = buf_ptr(r) as *mut i64;
+            n_refs = buf_len(r) / 8 - 5;
             if (*words.add(0)) != MAGIC || (*words.add(1)) != ident(pcx) || (*words.add(2)) != stamp
                 || (*words.add(3)) != n_refs
                 || (*words.add(4)) != body_hash(r, 5) {
@@ -848,11 +817,11 @@ fn write_atomic(b: i64, path: *mut u8) -> bool {
         buf_str(tmp, c".tmp");
         crate::base::buf_int(tmp, getpid() as i64);
         buf_byte(tmp, 0);
-        if !write_file_if((*get_bufs().add(tmp as usize)).data, buf_slice(b)) {
-            crate::tools::proc::remove_file((*get_bufs().add(tmp as usize)).data);
+        if !write_file_if(buf_ptr(tmp), buf_slice(b)) {
+            crate::tools::proc::remove_file(buf_ptr(tmp));
             return false;
         }
-        rename_file((*get_bufs().add(tmp as usize)).data, path)
+        rename_file(buf_ptr(tmp), path)
     }
 }
 
@@ -882,7 +851,7 @@ fn save(root: *mut u8, target: i64, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) {
                     | ((all[(i + 2) as usize]) & 63));
             i += 3;
         }
-        let refs_header = (*get_bufs().add(r as usize)).data as *mut i64;
+        let refs_header = buf_ptr(r) as *mut i64;
         (*refs_header.add(4)) = body_hash(r, 5);
         let b = buf_new();
         put(b, MAGIC);
@@ -923,8 +892,8 @@ fn save(root: *mut u8, target: i64, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) {
         }
         save_tables(b, tcx, pcx);
         // (the number of words, in the header)
-        let header = (*get_bufs().add(b as usize)).data as *mut i64;
-        (*header.add(3)) = (*get_bufs().add(b as usize)).len / 8;
+        let header = buf_ptr(b) as *mut i64;
+        (*header.add(3)) = buf_len(b) / 8;
         (*header.add(4)) = body_hash(b, USED_WORD + 1);
         // (0.28.0: the .bin first, then the references: a program in the
         // directory always has a .bin, or one being written, with its time,
@@ -1246,12 +1215,12 @@ fn evict(own: u64, pcx: &mut Ctx<Comp>) {
             if kind == 0 {
                 continue;
             }
-            let off = (*get_bufs().add(paths as usize)).len;
+            let off = buf_len(paths);
             buf_str(paths, dir);
             buf_byte(paths, b'/');
             buf_str(paths, name);
             buf_byte(paths, 0);
-            let fd = open((*get_bufs().add(paths as usize)).data.add(off as usize), 0);
+            let fd = open(buf_ptr(paths).add(off as usize), 0);
             if fd < 0 {
                 continue;
             }
@@ -1310,7 +1279,7 @@ fn evict(own: u64, pcx: &mut Ctx<Comp>) {
                 // its NUL; `paths` is not changed after the directory was
                 // read.
                 let path = unsafe {
-                    (*get_bufs().add(paths as usize)).data.add(files[f as usize] as usize)
+                    buf_ptr(paths).add(files[f as usize] as usize)
                 };
                 remove_file(path);
             }

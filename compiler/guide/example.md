@@ -129,7 +129,6 @@ use command::{Command, Error, Item};
 use std::alloc::Allocator;
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::hash::FixedState;
 
 // A type that holds an allocator is generic over it.
 pub struct Store<'a, A: Allocator> {

@@ -178,7 +178,6 @@ derived trait and a hand-written impl of it clash: remove one.
 
 ```vole
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 struct Key { group: i64, id: i64 }

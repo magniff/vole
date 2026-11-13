@@ -10,7 +10,8 @@ locals, by-reference matches), by-value parameters, drops at scope end in
 reverse declaration order (the guards' too), a struct's fields and an
 enum's payload in their order, parameters after the body's locals,
 temporaries at the end of their statement (a tail expression's before the
-block's locals), drop flags of conditionally moved locals and fields,
+block's locals; an `if let` scrutinee's before its else block and at the
+end of the matching block), drop flags of conditionally moved locals and fields,
 early returns, `break`, `?`. The interpreter gives the expected output:
 every observation the program prints (`o<N> ...`) and every drop of a
 Tracked value (`d<id>`), in order, and at the end `live 0`. The program
@@ -45,7 +46,8 @@ usage: tools/semfuzz/semfuzz.py [-c VOLEC] [-n COUNT] [-f FIRST] [-k DIR]
                 (model), and a program volec rejects that rustc accepts
                 says so. Not in the gate: it checks the fuzzer.
   --rustc-edition E  rustc's edition (default 2024, whose order of a tail
-                expression's temporaries is volec's)
+                expression's and of an `if let` scrutinee's temporaries is
+                volec's)
   --assign-calls  (0.25.2) assignments whose right side is a call of the
                 header's functions, often taking the assigned variable
                 itself (`t3 = f1(gpa, t3, mk(2))`: moved, `&t3`, `&mut
@@ -1691,12 +1693,16 @@ class MatchOpt(S_):
     """`if let Some(t) = x { .. } else { .. }`, its match form, or the same
     on a Result<T, i64> (`Ok(t)`, `Err(n)`); x is an owned local (which
     moves) or a call (a temporary). `while let Some(t) = w.pop() { .. }`
-    with form 'while'."""
+    with form 'while'. Kind 'C' (0.29): `chk(&temporary, k)`, a
+    Result<i64, i64> whose scrutinee lends an owned temporary; an `if
+    let` drops it before the else block, and at the end of the matching
+    block (rustc's rule from its 2024 edition), a `match` at the end of
+    its statement."""
     def __init__(self, x, kind, name, then, ename, els, form, by=None):
         self.x = x
         self.by = by         # 'ref', 'mut': x a place, `&x` or `&mut x`;
         #                      the binding a `&T` or `&mut T` into it
-        self.kind = kind     # 'O' or 'R'
+        self.kind = kind     # 'O', 'R' or 'C'
         self.name = name
         self.then = then
         self.ename = ename   # the Err binding (R)
@@ -1746,6 +1752,20 @@ class MatchOpt(S_):
             if v.val is not None:
                 self.then.run(it, fr, pre=[(self.name, AliasCell(AttrPlace(v, 'val')))])
             else:
+                self.els.run(it, fr)
+            return
+        if self.kind == 'C' and self.form == 'iflet':
+            # (the scrutinee's temporaries: before the else block, or at
+            # the end of the matching block, a `return` out of it too)
+            it.temps.append([])
+            try:
+                v = self.x.ev(it, fr)
+                if v.ok:
+                    self.then.run(it, fr, pre=[(self.name, Cell(v.val))])
+            finally:
+                for t in reversed(it.temps.pop()):
+                    it.drop(t)
+            if not v.ok:
                 self.els.run(it, fr)
             return
         v = self.x.ev(it, fr)
@@ -3289,8 +3309,12 @@ class Gen:
             if not vp:
                 return None
             x, kind = Call('pop', [], method=True, recv=self.r.choice(vp)), 'O'
-        elif r < 0.85:
+        elif r < 0.75:
             x, kind = Call('tchk', [Arg('sink', self.texpr(c, 1)), Arg('val', Lit(self.r.randint(0, 12)))]), 'R'
+        elif r < 0.88:
+            # (0.29) `if let Ok(n) = chk(&ident(t), 5) { .. } else { .. }`:
+            # an owned temporary lent in the scrutinee
+            x, kind = Call('chk', [Arg('let', self.temp_t(c, set())), Arg('val', Lit(self.r.randint(0, 12)))]), 'C'
         else:
             # `if o.is_some() { let mut t = o.unwrap(); .. }`: a conditional move
             os_ = self.movable(c, 'O')
@@ -3306,11 +3330,12 @@ class Gen:
             inner = Decl(n, True, None, Call('unwrap', [], method=True, recv=Move(PVar(v.name)), recv_conv='sink'))
             return If(Call('is_some', [], method=True, recv=PVar(v.name)), Block([inner] + body.stmts), None)
         snap = self.snapshot(c)
-        n = self.name('t')
-        en = self.name('n') if kind == 'R' else None
-        t, st = self.sub_block(c, self.r.randint(0, 3), pre=[(n, 'T', False, 'local')])
+        n = self.name('n' if kind == 'C' else 't')
+        en = self.name('n') if kind != 'O' else None
+        t, st = self.sub_block(c, self.r.randint(0, 3),
+                               pre=[(n, 'i' if kind == 'C' else 'T', False, 'local')])
         self.restore(c, snap)
-        epre = [(en, 'i', False, 'local')] if kind == 'R' and form == 'match' else None
+        epre = [(en, 'i', False, 'local')] if kind != 'O' and form == 'match' else None
         e, se = self.sub_block(c, self.r.randint(0, 2), pre=epre)
         self.branch_join(c, snap, [st, se])
         return MatchOpt(x, kind, n, t, en, e, form)

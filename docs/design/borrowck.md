@@ -1517,7 +1517,15 @@ outside the holes named below.
   drops `mk()`'s value before the block). MVS keeps them to the end of
   the statement. Still the statement's in both editions: a match arm's
   body and a lazy `&&`/`||`'s right operand, which Rust also ends at
-  their own evaluation.
+  their own evaluation. (0.29.0) An `if let`'s scrutinee is Rust 2024's
+  ("if let temporary scope"): its temporaries drop before the `else`
+  block, and at the end of the matching block; a let-else's before its
+  else block (every edition's rule). A borrow a scrutinee's guard holds
+  ends there: `if let Some(n) = lock(c).peek() { .. } else { c.n += 1; }`
+  is accepted (case `rust_b_iflet_else_temp_borrow`), and a value of
+  the matching block that borrows from a scrutinee temporary is
+  `borrowck.dropped_borrowed`, rustc 2024's E0716. A `match` keeps its
+  scrutinee's temporaries to the end of its statement.
 - L4 NLL only: problem case 3 (a conditional return of a borrow) is
   rejected as rustc's NLL does; the location-sensitive solve is
   0.27.4's. Also rustc's NLL limitations shared on purpose: one region

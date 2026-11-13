@@ -41,8 +41,8 @@ mod link_macho;
 use crate::back::enc_arm64::init_a64;
 use crate::back::enc_x86::init_x86;
 use crate::base::{
-    alloc_array, alloc_zeroed, buf_byte, buf_fmt, buf_new, buf_reserve, buf_write_file, cstr, die,
-    free, get_bufs, grow, memcmp, memcpy, realloc, strlen,
+    alloc_array, alloc_zeroed, buf_byte, buf_clear, buf_fmt, buf_len, buf_new, buf_ptr, buf_w16,
+    buf_w32, buf_write_file, cstr, die, free, grow, memcmp, memcpy, realloc, strlen,
 };
 
 use assemble::{assemble_begin, assemble_line, get_mapping, set_hooks, set_mapping};
@@ -459,7 +459,12 @@ pub fn name_get(m: NameMap, name: &[u8]) -> i64 {
 
 // A C string's bytes.
 pub fn c_bytes(s: *mut u8) -> &'static [u8] {
-    unsafe { std::slice::from_raw_parts(s.add((0) as usize), (strlen(s) as i64 - (0)) as usize) }
+    // UNSAFE: a C string seen as a slice (base::c_bytes)
+    // SAFETY: not checked here: s must be a C string that is never freed
+    // or written again (the object writer passes symbol and section
+    // names, which are literals or kept for the process); the 'static
+    // is that promise, as cstr's
+    unsafe { crate::base::c_bytes(s) }
 }
 
 // A temporary label (L... on Mach-O, .L... on ELF): never in the symbol
@@ -568,28 +573,12 @@ fn w8(out: i64, v: i64) {
 }
 
 fn w16(out: i64, v: i64) {
-    unsafe {
-        buf_reserve(out, 2);
-        let at = (*get_bufs().add(out as usize)).len;
-        let d = (*get_bufs().add(out as usize)).data;
-        (*d.add(at as usize)) = (v & 255) as u8;
-        (*d.add((at + 1) as usize)) = ((v >> 8) & 255) as u8;
-        (*get_bufs().add(out as usize)).len = at + 2;
-    }
+    buf_w16(out, v);
 }
 
-// (0.25: the bytes with one check for room, not a call each)
+// (0.25: the bytes with one check for room, not a call each: buf_w32)
 fn w32(out: i64, v: i64) {
-    unsafe {
-        buf_reserve(out, 4);
-        let at = (*get_bufs().add(out as usize)).len;
-        let d = (*get_bufs().add(out as usize)).data;
-        (*d.add(at as usize)) = (v & 255) as u8;
-        (*d.add((at + 1) as usize)) = ((v >> 8) & 255) as u8;
-        (*d.add((at + 2) as usize)) = ((v >> 16) & 255) as u8;
-        (*d.add((at + 3) as usize)) = ((v >> 24) & 255) as u8;
-        (*get_bufs().add(out as usize)).len = at + 4;
-    }
+    buf_w32(out, v);
 }
 
 fn w64(out: i64, v: i64) {
@@ -608,7 +597,7 @@ fn wname16(out: i64, name: *mut u8) {
 }
 
 fn pad_to(out: i64, size: i64) {
-    while unsafe { (*get_bufs().add(out as usize)).len < size } {
+    while buf_len(out) < size {
         buf_byte(out, 0);
     }
 }
@@ -627,31 +616,29 @@ pub fn is_debug(sec: i64) -> bool {
 // Assembles ASM into an object file at `path` (what asm_flush has not
 // assembled yet).
 pub fn write_object(cx: &mut FnCtx<Comp>, path: *mut u8, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if !pcx.asm_stream {
-            assembler_begin();
-        }
-        assemble_text(cx);
-        if pcx.asm_stream {
-            (*get_bufs().add(cx.asm as usize)).len = 0;
-        }
-        new_frag(get_cur_sec());
-        layout();
-        resolve_fixups(cx, pcx);
-        build_sections(pcx);
-        if get_rows().len() as i64 > 0 {
-            line_program(pcx);
-        }
-        if get_cfi_fns().len() as i64 > 0 {
-            compact_unwind(pcx);
-        }
-        if get_elf() {
-            { let mut sec_align_copy = get_sec_align(); sec_align_copy[SEC_NOTE as usize] = 0;
-                set_sec_align(sec_align_copy); }
-            elf_write(path, pcx);
-        } else {
-            macho_write(path, pcx);
-        }
+    if !pcx.asm_stream {
+        assembler_begin();
+    }
+    assemble_text(cx);
+    if pcx.asm_stream {
+        buf_clear(cx.asm);
+    }
+    new_frag(get_cur_sec());
+    layout();
+    resolve_fixups(cx, pcx);
+    build_sections(pcx);
+    if get_rows().len() as i64 > 0 {
+        line_program(pcx);
+    }
+    if get_cfi_fns().len() as i64 > 0 {
+        compact_unwind(pcx);
+    }
+    if get_elf() {
+        { let mut sec_align_copy = get_sec_align(); sec_align_copy[SEC_NOTE as usize] = 0;
+            set_sec_align(sec_align_copy); }
+        elf_write(path, pcx);
+    } else {
+        macho_write(path, pcx);
     }
 }
 
@@ -674,10 +661,8 @@ fn assembler_begin() {
 
 // Assembles the lines in ASM.
 fn assemble_text(cx: &mut FnCtx<Comp>) {
-    unsafe {
-        assemble_bytes(cx, (*get_bufs().add(cx.asm as usize)).data,
-            (*get_bufs().add(cx.asm as usize)).len);
-    }
+    assemble_bytes(cx, buf_ptr(cx.asm),
+        buf_len(cx.asm));
 }
 
 // (0.18.1) Assembles the lines of text[0..n] (ATEXT while it runs).
@@ -713,16 +698,14 @@ pub fn asm_stream_begin(pcx: &mut Ctx<Comp>) {
 // Assembles the text written so far (whole lines: a function's), when
 // streaming.
 pub fn asm_flush(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
-    unsafe {
-        if pcx.asm_stream {
-            // (its time is the output's, as when the text is assembled at
-            // the end, not the code generation's that runs it)
-            let t = timer_now(pcx);
-            c_module_symbols(cx, pcx);
-            assemble_text(cx);
-            (*get_bufs().add(cx.asm as usize)).len = 0;
-            timer_sub(T_CODEGEN, T_OUTPUT, t, pcx);
-        }
+    if pcx.asm_stream {
+        // (its time is the output's, as when the text is assembled at
+        // the end, not the code generation's that runs it)
+        let t = timer_now(pcx);
+        c_module_symbols(cx, pcx);
+        assemble_text(cx);
+        buf_clear(cx.asm);
+        timer_sub(T_CODEGEN, T_OUTPUT, t, pcx);
     }
 }
 
@@ -732,11 +715,11 @@ pub fn asm_hand_over(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
     unsafe {
         if pcx.asm_stream {
             c_module_symbols(cx, pcx);
-            let n = (*get_bufs().add(cx.asm as usize)).len;
+            let n = buf_len(cx.asm);
             let copy = alloc_zeroed(n + 1);
-            memcpy(copy, (*get_bufs().add(cx.asm as usize)).data, n as u64);
+            memcpy(copy, buf_ptr(cx.asm), n as u64);
             asm_thread_push(copy, n);
-            (*get_bufs().add(cx.asm as usize)).len = 0;
+            buf_clear(cx.asm);
         }
     }
 }
@@ -787,7 +770,7 @@ pub fn write_output(cx: &mut FnCtx<Comp>, path: *mut u8, pcx: &mut Ctx<Comp>) {
         }
         let obj = buf_new();
         buf_fmt(obj, format_args("{}.vole.o\0", str::from_utf8(cstr(path)).unwrap()));
-        let obj_path = (*get_bufs().add(obj as usize)).data;
+        let obj_path = buf_ptr(obj);
         write_object(cx, obj_path, pcx);
         // (0.25.3: the link's inputs first, its failure one error)
         check_link_inputs(pcx);
@@ -802,7 +785,7 @@ pub fn write_output(cx: &mut FnCtx<Comp>, path: *mut u8, pcx: &mut Ctx<Comp>) {
             // goes: dsymutil gathers it into <path>.dSYM first, as clang does.
             let dsym = buf_new();
             buf_fmt(dsym, format_args("dsymutil '{}'\0", str::from_utf8(cstr(path)).unwrap()));
-            status = system((*get_bufs().add(dsym as usize)).data);
+            status = system(buf_ptr(dsym));
         }
         unlink(obj_path);
         if status != 0 {

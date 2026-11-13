@@ -118,7 +118,8 @@ fn main() -> i32 {
 - Name resolution: a local binding, then the module's own items, then
   its imports, then the prelude. A program's own `Vec` (or `trim`) hides
   the prelude's.
-- The prelude, std's names used without a `use`, is Rust's plus `Gpa`:
+- The prelude, std's names used without a `use`, is Rust's plus `Gpa` and
+  `FixedState` (a map's hasher):
   `Option Some None Result Ok Err Vec String Box Clone Copy Default Drop
   drop PartialEq Eq PartialOrd Ord From Into TryFrom TryInto AsRef AsMut
   Iterator IntoIterator DoubleEndedIterator ExactSizeIterator Extend`,

@@ -6,16 +6,19 @@
 // callee's size, less a bonus for the constant arguments that decide
 // something in it and the cost of the call itself, against a threshold
 // that grows with the call site's loop depth and is zero in cold blocks;
-// a function's only call site takes up to INLINE_ONCE. Inlining iterates:
+// a function's only call site takes up to INLINE_ONCE; and what a caller
+// takes in is bounded by its own room (INLINE_ROOM), so that a decision
+// depends on the call, the callee and the caller alone. Inlining iterates:
 // the inlined copies' calls are considered again once the copies are
 // simplified (see inline_rounds).
 
 use crate::back::abi::{AbiClass, conv_classify, conv_returns_through_pointer, fn_uses_c};
-use crate::back::codecache::{
-    R_DEC, R_IR, R_RT, R_SIZE, R_STATIC, cc_note, cc_note_budget, cc_note_calls,
-};
+use crate::back::codecache::{R_DEC, R_IR, R_RT, R_SIZE, R_STATIC, cc_note, cc_note_calls};
 use crate::back::regalloc::intervals::calls_returns_twice;
-use crate::base::{IntVec, alloc_array, alloc_zeroed, free, table_reset};
+use crate::base::{
+    IntVec, alloc_array, alloc_zeroed, buf_byte, buf_int, buf_new, buf_str, free, sym_name,
+    table_reset,
+};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::timer::{P_FN_SIZE, P_INLINE, pass_done};
@@ -190,15 +193,13 @@ pub fn panic_blocks(cx: &mut FnCtx<Comp>, fi: i64) -> Vec<bool, Comp> {
 
 // The IR function called by direct call v, or -1.
 pub fn ir_callee(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        if (cx.insts[v as usize]).op != Op::Call {
-            return -1;
-        }
-        let g = (pcx.fn_ir[(cx.insts[v as usize]).imm as usize]) - 1;
-        // (0.18.1: what the task saw of g, for the code cache)
-        cc_note(cx, R_STATIC, g, pcx);
-        g
+    if (cx.insts[v as usize]).op != Op::Call {
+        return -1;
     }
+    let g = (pcx.fn_ir[(cx.insts[v as usize]).imm as usize]) - 1;
+    // (0.18.1: what the task saw of g, for the code cache)
+    cc_note(cx, R_STATIC, g, pcx);
+    g
 }
 
 // Counts the call sites and address uses of every function.
@@ -354,20 +355,18 @@ pub fn compute_sccs(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
 // Whether block b is cold: it leads only to a panic (it ends in UNREACH),
 // or it calls a #[cold] function.
 fn block_is_cold(cx: &mut FnCtx<Comp>, b: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        if (cx.blocks[b as usize]).term == Term::Unreach {
+    if (cx.blocks[b as usize]).term == Term::Unreach {
+        return true;
+    }
+    let mut v = (cx.blocks[b as usize]).first;
+    while v != 0 {
+        if (cx.insts[v as usize]).op == Op::Call
+            && fn_attr_cold((cx.insts[v as usize]).imm, pcx) {
             return true;
         }
-        let mut v = (cx.blocks[b as usize]).first;
-        while v != 0 {
-            if (cx.insts[v as usize]).op == Op::Call
-                && fn_attr_cold((cx.insts[v as usize]).imm, pcx) {
-                return true;
-            }
-            v = (cx.insts[v as usize]).next;
-        }
-        false
+        v = (cx.insts[v as usize]).next;
     }
+    false
 }
 
 fn mark_call_sites(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
@@ -493,11 +492,11 @@ fn deciders(cx: &mut FnCtx<Comp>, g: i64, pcx: &Ctx<Comp>) -> *mut IntVec {
 }
 
 fn site_depth(cx: &mut FnCtx<Comp>, b: i64) -> i64 {
-    if b < cx.site_nblocks { unsafe { (cx.site_depth[b as usize]) } } else { 0 }
+    if b < cx.site_nblocks { (cx.site_depth[b as usize]) } else { 0 }
 }
 
 fn site_cold(cx: &mut FnCtx<Comp>, b: i64) -> bool {
-    unsafe { b < cx.site_nblocks && (cx.site_cold[b as usize]) != 0 }
+    b < cx.site_nblocks && (cx.site_cold[b as usize]) != 0
 }
 
 // Whether optimized function g calls a function that returns twice (see
@@ -550,34 +549,83 @@ const RT_RETURNS_TWICE: i64 = 1;
 const RT_CALLS: i64 = 2;
 // (0.29) It has panic blocks, which its size leaves out (func_size).
 const RT_PANICS: i64 = 4;
-// (0.17) A leaf this small is inlined whatever the program's budget (see
-// should_inline).
-const INLINE_LEAF: i64 = 6;
+// (0.17) A leaf this small is not charged to its caller's room (see
+// inline_rule). (0.29: 16, from 6: a checked accessor of a Vec in a
+// struct is 8 without its report, one that also tests its argument 12.)
+const INLINE_LEAF: i64 = 16;
+// (0.29) What a function may grow by through the calls charged to it
+// (inline_rule, caller_room): the callees that are neither tiny, nor
+// hinted, nor small leaves, nor its only call of a callee of at most
+// INLINE_ONCE_FREE. The room is the function's own: what other functions
+// inlined, and in which order the program's functions are optimized, does
+// not change it. (Until 0.29 the program had one budget, half its size
+// again, spent by the components bottom-up: in a large program it was
+// gone a fifth of the way up the call graph, and whether a function got
+// any inlining depended on its depth there.)
+const INLINE_ROOM: i64 = 40;
+const INLINE_ONCE_FREE: i64 = 120;
 
-fn should_inline(cx: &mut FnCtx<Comp>, fi: i64, g: i64, call: i64, pcx: &Ctx<Comp>) -> bool {
+// (0.29) The rules of inline_rule: above 0 the call is inlined, below it
+// stays; what VOLE_INLINE_LOG's lines name (rule_name).
+const R_HINT: i64 = 1;
+const R_TINY: i64 = 2;
+const R_CLOSURE_ONCE: i64 = 3;
+const R_COLD_FREE: i64 = 4;
+const R_ONCE: i64 = 5;
+const R_HOT: i64 = 6;
+const R_SMALL: i64 = 7;
+const R_SAME: i64 = -1;
+const R_NOT_READY: i64 = -2;
+const R_RETURNS_TWICE: i64 = -3;
+const R_NEVER: i64 = -4;
+const R_CALLER_BIG: i64 = -5;
+const R_ROOM: i64 = -6;
+const R_COLD: i64 = -7;
+const R_BIG: i64 = -8;
+
+fn rule_name(rule: i64) -> *mut u8 {
+    if rule == R_HINT { c"hint" }
+    else if rule == R_TINY { c"tiny" }
+    else if rule == R_CLOSURE_ONCE { c"closure-once" }
+    else if rule == R_COLD_FREE { c"cold-free" }
+    else if rule == R_ONCE { c"once" }
+    else if rule == R_HOT { c"hot" }
+    else if rule == R_SMALL { c"small" }
+    else if rule == R_RETURNS_TWICE { c"no:returns-twice" }
+    else if rule == R_NEVER { c"no:never-or-cold-fn" }
+    else if rule == R_CALLER_BIG { c"no:caller-big" }
+    else if rule == R_ROOM { c"no:room" }
+    else if rule == R_COLD { c"no:cold-site" }
+    else if rule == R_BIG { c"no:big" }
+    else { c"no:other" }
+}
+
+// The rule that decides whether call `call` of function fi, to g, is
+// inlined (one of the R_ constants).
+fn inline_rule(cx: &mut FnCtx<Comp>, fi: i64, g: i64, call: i64, pcx: &Ctx<Comp>) -> i64 {
     unsafe {
         if g == fi || (pcx.fn_scc[g as usize]) == (pcx.fn_scc[fi as usize])
             || (pcx.fn_live[g as usize]) == 0 {
-            return false;
+            return R_SAME;
         }
         // (0.18.1) Only a callee whose component is done (below this one: a
         // call made direct may call any function).
         if !fn_facts_ready(cx, g, true, pcx) {
-            return false;
+            return R_NOT_READY;
         }
         cc_note(cx, R_SIZE, g, pcx);
         // A function calling setjmp (or the like) keeps its own frame, and
         // its callers theirs (see regalloc.vl).
         if cx.caller_rt || callee_returns_twice(cx, g, pcx) {
-            return false;
+            return R_RETURNS_TWICE;
         }
         let gf = (*get_irfuncs().add(g as usize)).f;
         let hint = fn_attr_inline(gf, pcx);
         if hint == HINT_NEVER || fn_attr_cold(gf, pcx) {
-            return false;
+            return R_NEVER;
         }
         if hint == HINT_ALWAYS {
-            return true;
+            return R_HINT;
         }
         // (0.14) A callee about as big as its call is inlined whatever the
         // caller's size: the chain of small closures an iterator chain calls,
@@ -585,8 +633,8 @@ fn should_inline(cx: &mut FnCtx<Comp>, fi: i64, g: i64, call: i64, pcx: &Ctx<Com
         // (0.17: computed once; it scans the callee for what each constant
         // argument decides)
         let cost = inline_cost(cx, g, call, pcx);
-        if cost <= INLINE_TINY && budget_allows(cx, (*get_fn_size().add(g as usize)), pcx) {
-            return true;
+        if cost <= INLINE_TINY {
+            return R_TINY;
         }
         let b = (cx.insts[call as usize]).block;
         let once = calls_left(cx, g, pcx) == 1 && (pcx.fn_address[g as usize]) == 0
@@ -596,32 +644,48 @@ fn should_inline(cx: &mut FnCtx<Comp>, fi: i64, g: i64, call: i64, pcx: &Ctx<Com
         // loads through it) says little of what it becomes (a closure
         // calling closures, the fold of an iterator chain).
         if once && is_closure_fn(g, pcx) {
-            return true;
+            return R_CLOSURE_ONCE;
         }
-        // (0.17) A small leaf is not charged to the program's budget: its
+        // (0.17) A small leaf is not charged to the caller's room: its
         // code is about its call's (the arguments' moves, the call, the
-        // caller-saved registers it clobbers), and the program's callers,
-        // last in the order, found the budget spent.
+        // caller-saved registers it clobbers). (0.29) Nor a callee as small
+        // called in a loop, leaf or not (`gen.push(c)` at each character).
         let small_leaf = (*get_fn_size().add(g as usize)) <= INLINE_LEAF
-            && callee_is_leaf(cx, g, pcx);
-        if (*get_fn_size().add(fi as usize)) + (*get_fn_size().add(g as usize)) > INLINE_BUDGET
-            || (!budget_allows(cx, (*get_fn_size().add(g as usize)), pcx) && !small_leaf) {
-            return false;
+            && (callee_is_leaf(cx, g, pcx) || site_depth(cx, b) >= 1);
+        if (*get_fn_size().add(fi as usize)) + (*get_fn_size().add(g as usize)) > INLINE_BUDGET {
+            return R_CALLER_BIG;
         }
-        // (0.10: with a profile, a call that never ran is cold, and a hot one
-        // takes a callee up to INLINE_HOT)
-        if site_cold(cx, b) || is_cold_block(cx, b, pcx) {
+        // (0.29) Nor is the only call of a function that is not large: it
+        // is moved, not copied.
+        if once && (*get_fn_size().add(g as usize)) <= INLINE_ONCE_FREE {
+            return R_ONCE;
+        }
+        // (0.10: with a profile, a hot call takes a callee up to INLINE_HOT,
+        // whatever the caller's room)
+        let cold = site_cold(cx, b) || is_cold_block(cx, b, pcx);
+        if !cold && is_hot_count((cx.blocks[b as usize]).count, pcx) && cost <= INLINE_HOT {
+            return R_HOT;
+        }
+        // (0.29) The rest is charged to the caller's own room.
+        if !small_leaf
+            && (*get_fn_size().add(fi as usize)) + (*get_fn_size().add(g as usize))
+            > cx.inl_size0 + INLINE_ROOM {
+            return R_ROOM;
+        }
+        // (0.10: with a profile, a call that never ran is cold)
+        if cold {
             // In a cold block, only when that makes the program no bigger
             // (0.29: so not a callee with panic blocks, whose size says
             // nothing of them: the report of a failed check would take in
             // the functions it calls, and those theirs).
-            return once || (cost <= 0 && (callee_flags(cx, g, pcx) & RT_PANICS) == 0);
+            if once {
+                return R_ONCE;
+            }
+            return if cost <= 0 && (callee_flags(cx, g, pcx) & RT_PANICS) == 0 { R_COLD_FREE }
+                else { R_COLD };
         }
         if once && (*get_fn_size().add(g as usize)) <= INLINE_ONCE {
-            return true;
-        }
-        if is_hot_count((cx.blocks[b as usize]).count, pcx) && cost <= INLINE_HOT {
-            return true;
+            return R_ONCE;
         }
         let depth = site_depth(cx, b);
         let mut threshold = INLINE_SMALL;
@@ -631,8 +695,89 @@ fn should_inline(cx: &mut FnCtx<Comp>, fi: i64, g: i64, call: i64, pcx: &Ctx<Com
         if depth >= 2 {
             threshold *= 2;
         }
-        cost <= threshold
+        if cost <= threshold { R_SMALL } else { R_BIG }
     }
+}
+
+// (0.29) VOLE_INLINE_LOG=FILE, with -j1 and no code cache: a line for each
+// call the inliner decides at -O2, in the order it decides them (one
+// thread: the same in every build of the same program), tab separated:
+// the caller, the callee, the callee's size, the rule (rule_name), the
+// site's loop depth, the caller's size then, the caller's component's
+// level, the program's size as the component sees it, and the budget.
+// tools/inline-log-diff.py compares two.
+pub fn inline_log_start(pcx: &mut Ctx<Comp>) {
+    pcx.inline_log = -1;
+    // UNSAFE: C's getenv, and the first byte of its string.
+    // SAFETY: the name is a NUL-terminated literal; getenv gives null or a
+    // NUL-terminated string, read only when not null, which the program
+    // does not change afterwards (the path is kept for inline_log_end).
+    let path = unsafe {
+        let p = crate::base::getenv(c"VOLE_INLINE_LOG");
+        if p == 0 as *mut u8 || *p == 0 { 0 as *mut u8 } else { p }
+    };
+    if path == 0 as *mut u8 {
+        return;
+    }
+    pcx.inline_log_path = path;
+    if pcx.jobs != 1 {
+        buf_write_fd_str(c"note: VOLE_INLINE_LOG is written with -j1 only (and --no-cache)\n");
+        return;
+    }
+    pcx.inline_log = buf_new();
+}
+
+fn buf_write_fd_str(s: *mut u8) {
+    let b = buf_new();
+    buf_str(b, s);
+    crate::base::buf_write_fd(b, crate::base::STDERR);
+}
+
+// Writes the log (after the bottom-up phase).
+pub fn inline_log_end(pcx: &Ctx<Comp>) {
+    if pcx.inline_log >= 0 {
+        crate::base::buf_write_file(pcx.inline_log, pcx.inline_log_path);
+    }
+}
+
+fn log_decision(cx: &mut FnCtx<Comp>, fi: i64, g: i64, call: i64, rule: i64, pcx: &Ctx<Comp>) {
+    let out = pcx.inline_log;
+    // UNSAFE: IRFUNCS, FN_SIZE and the components' levels are raw tables.
+    // SAFETY: fi and g are IR functions of the program (the caller being
+    // optimized and a callee whose facts are ready), so their entries
+    // exist; cur_comp is the caller's component when it is not -1.
+    unsafe {
+        buf_str(out, sym_name(pcx.fns[(*get_irfuncs().add(fi as usize)).f as usize].name, pcx));
+        buf_byte(out, b'\t');
+        buf_str(out, sym_name(pcx.fns[(*get_irfuncs().add(g as usize)).f as usize].name, pcx));
+        buf_byte(out, b'\t');
+        buf_int(out, (*get_fn_size().add(g as usize)));
+        buf_byte(out, b'\t');
+        buf_str(out, rule_name(rule));
+        buf_byte(out, b'\t');
+        let b = (cx.insts[call as usize]).block;
+        buf_int(out, site_depth(cx, b));
+        buf_byte(out, b'\t');
+        buf_int(out, (*get_fn_size().add(fi as usize)));
+        buf_byte(out, b'\t');
+        buf_int(out,
+            if cx.cur_comp >= 0 { (*pcx.comp_level.add(cx.cur_comp as usize)) } else { -1 });
+        buf_byte(out, b'\t');
+        buf_int(out, program_size(cx, pcx));
+        buf_byte(out, b'\t');
+        buf_int(out, cx.inl_size0 + INLINE_ROOM);
+        buf_byte(out, b'\n');
+    }
+}
+
+// Whether call `call` of function fi, to g, is inlined. (0.29) The rule
+// that decided is logged when VOLE_INLINE_LOG is set (inline_log_start).
+fn should_inline(cx: &mut FnCtx<Comp>, fi: i64, g: i64, call: i64, pcx: &Ctx<Comp>) -> bool {
+    let rule = inline_rule(cx, fi, g, call, pcx);
+    if pcx.inline_log >= 0 && rule != R_NOT_READY && rule != R_SAME {
+        log_decision(cx, fi, g, call, rule, pcx);
+    }
+    rule > 0
 }
 
 // Whether inlining function g is charged to the budgets only for what it
@@ -723,23 +868,21 @@ fn scaled_count(count: i64, site: i64, entry: i64) -> i64 {
 // only when they covered it already, which depended on the largest
 // function optimized before, on this thread.)
 fn set_site(cx: &mut FnCtx<Comp>, b: i64, depth: i64, cold: bool) {
-    unsafe {
-        let need = (b + 1) as usize;
-        if cx.site_depth.len() < need || cx.site_cold.len() < need {
-            // (what they hold is kept; the new entries are 0)
-            cx.site_depth.resize(need * 2, 0);
-            cx.site_cold.resize(need * 2, 0);
-        }
-        if b >= cx.site_nblocks {
-            for x in cx.site_nblocks..b + 1 {
-                (cx.site_depth[x as usize]) = 0;
-                (cx.site_cold[x as usize]) = 0;
-            }
-            cx.site_nblocks = b + 1;
-        }
-        (cx.site_depth[b as usize]) = depth;
-        (cx.site_cold[b as usize]) = if cold { 1 } else { 0 };
+    let need = (b + 1) as usize;
+    if cx.site_depth.len() < need || cx.site_cold.len() < need {
+        // (what they hold is kept; the new entries are 0)
+        cx.site_depth.resize(need * 2, 0);
+        cx.site_cold.resize(need * 2, 0);
     }
+    if b >= cx.site_nblocks {
+        for x in cx.site_nblocks..b + 1 {
+            (cx.site_depth[x as usize]) = 0;
+            (cx.site_cold[x as usize]) = 0;
+        }
+        cx.site_nblocks = b + 1;
+    }
+    (cx.site_depth[b as usize]) = depth;
+    (cx.site_cold[b as usize]) = if cold { 1 } else { 0 };
 }
 
 // Inlining in function fi, in rounds: each round inlines, then simplifies
@@ -749,6 +892,9 @@ fn set_site(cx: &mut FnCtx<Comp>, b: i64, depth: i64, cold: bool) {
 pub fn inline_rounds(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
     unsafe {
         let mut any = false;
+        // (0.29) What the function may grow to through the calls charged
+        // to it (INLINE_ROOM).
+        cx.inl_size0 = (*get_fn_size().add(fi as usize));
         for round in 0..INLINE_ROUNDS {
             let inlined = inline_calls(cx, fi, pcx);
             pass_done(P_INLINE, pcx);
@@ -770,7 +916,8 @@ pub fn inline_rounds(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
     }
 }
 
-// The program's size now, and its growth budget.
+// The program's size now (for VOLE_INLINE_LOG; until 0.29 its growth
+// budget was made from it).
 pub fn start_inlining_budget(pcx: &mut Ctx<Comp>) {
     unsafe {
         pcx.program_size = 0;
@@ -779,7 +926,6 @@ pub fn start_inlining_budget(pcx: &mut Ctx<Comp>) {
                 pcx.program_size += (*get_fn_size().add(fi as usize));
             }
         }
-        pcx.program_budget = pcx.program_size + pcx.program_size / 2 + 2000;
     }
 }
 
@@ -787,7 +933,7 @@ pub fn start_inlining_budget(pcx: &mut Ctx<Comp>) {
 
 // The copy of value `v` of the callee (cx.inl_imap; its aux until 0.18.1).
 fn mapped(cx: &mut FnCtx<Comp>, v: i64) -> i64 {
-    if v == 0 { 0 } else { unsafe { (cx.inl_imap[v as usize]) } }
+    if v == 0 { 0 } else { (cx.inl_imap[v as usize]) }
 }
 
 // Inlines callee g at call `call` of function fi. Returns the continuation
@@ -996,39 +1142,37 @@ fn inline_call(cx: &mut FnCtx<Comp>, fi: i64, call: i64, g: i64, pcx: &Ctx<Comp>
 // the call, now in `cont`) become the pieces the inlined returns pack (a
 // phi of them when there are several); the packs go.
 fn replace_pieces(cx: &mut FnCtx<Comp>, call: i64, cont: i64, returns: IntVec, pcx: &Ctx<Comp>) {
-    unsafe {
-        let mut v = (cx.blocks[cont as usize]).first;
-        while v != 0 {
-            let next = (cx.insts[v as usize]).next;
-            if (cx.insts[v as usize]).op == Op::Piece
-                && (cx.insts[v as usize]).a == call {
-                let k = (cx.insts[v as usize]).imm;
-                let ty = (cx.insts[v as usize]).ty;
-                let mut result: i64 = 0;
-                if returns.len() as i64 == 0 {
-                    result = ssa_undef(cx, ty, pcx);
-                } else if returns.len() as i64 == 1 {
-                    result = ir_arg(cx, (returns[0]), k);
-                } else {
-                    result = ir_make(cx, Op::Phi, ty, 0, 0, 0, pcx);
-                    (cx.insts[result as usize]).args = cx.args.len() as i64;
-                    (cx.insts[result as usize]).nargs = returns.len() as i64;
-                    for r in 0..returns.len() as i64 {
-                        let ir_arg_v = ir_arg(cx, (returns[r as usize]), k);
-                        cx.args.push(ir_arg_v);
-                        cx.argty.push(0);
-                    }
-                    ir_prepend(cx, cont, result);
+    let mut v = (cx.blocks[cont as usize]).first;
+    while v != 0 {
+        let next = (cx.insts[v as usize]).next;
+        if (cx.insts[v as usize]).op == Op::Piece
+            && (cx.insts[v as usize]).a == call {
+            let k = (cx.insts[v as usize]).imm;
+            let ty = (cx.insts[v as usize]).ty;
+            let mut result: i64 = 0;
+            if returns.len() as i64 == 0 {
+                result = ssa_undef(cx, ty, pcx);
+            } else if returns.len() as i64 == 1 {
+                result = ir_arg(cx, (returns[0]), k);
+            } else {
+                result = ir_make(cx, Op::Phi, ty, 0, 0, 0, pcx);
+                (cx.insts[result as usize]).args = cx.args.len() as i64;
+                (cx.insts[result as usize]).nargs = returns.len() as i64;
+                for r in 0..returns.len() as i64 {
+                    let ir_arg_v = ir_arg(cx, (returns[r as usize]), k);
+                    cx.args.push(ir_arg_v);
+                    cx.argty.push(0);
                 }
-                ir_replace(cx, v, result);
+                ir_prepend(cx, cont, result);
             }
-            v = next;
+            ir_replace(cx, v, result);
         }
-        for r in 0..returns.len() as i64 {
-            let pack = (returns[r as usize]);
-            if pack != 0 && (cx.insts[pack as usize]).op == Op::Pack {
-                ir_unlink(cx, pack);
-            }
+        v = next;
+    }
+    for r in 0..returns.len() as i64 {
+        let pack = (returns[r as usize]);
+        if pack != 0 && (cx.insts[pack as usize]).op == Op::Pack {
+            ir_unlink(cx, pack);
         }
     }
 }
@@ -1070,10 +1214,8 @@ pub fn never_inlined(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
 // (0.18.1) Room in cx's maps from a callee's blocks and instructions to
 // their copies for `blocks` and `insts` ids, all 0 (inline_call).
 fn inline_maps(cx: &mut FnCtx<Comp>, blocks: i64, insts: i64) {
-    unsafe {
-        table_reset(&mut cx.inl_bmap, blocks as usize, 0);
-        table_reset(&mut cx.inl_imap, insts as usize, 0);
-    }
+    table_reset(&mut cx.inl_bmap, blocks as usize, 0);
+    table_reset(&mut cx.inl_imap, insts as usize, 0);
 }
 
 // (0.18.1) The program's size as the component being optimized sees it:
@@ -1082,15 +1224,6 @@ fn inline_maps(cx: &mut FnCtx<Comp>, blocks: i64, insts: i64) {
 // made the decisions depend on the order the components were done in).
 fn program_size(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) -> i64 {
     pcx.program_size + cx.comp_growth
-}
-
-// (0.18.1) Whether the program, grown by n more, is within the inlining
-// budget as the component being optimized sees it (the code cache keeps
-// the answer, not the size: back::codecache).
-fn budget_allows(cx: &mut FnCtx<Comp>, n: i64, pcx: &Ctx<Comp>) -> bool {
-    let within = program_size(cx, pcx) + n <= pcx.program_budget;
-    cc_note_budget(cx, cx.comp_growth + n, within);
-    within
 }
 
 fn program_grows(cx: &mut FnCtx<Comp>, n: i64) {
@@ -1106,19 +1239,17 @@ pub fn add_program_size(n: i64, pcx: &mut Ctx<Comp>) {
 // (0.18.1) The calls of g left as the component being optimized sees them:
 // those before the bottom-up phase, less the ones it inlined itself.
 fn calls_left(cx: &mut FnCtx<Comp>, g: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let mut n = (pcx.fn_calls[g as usize]);
-        let mut own: i64 = 0;
-        for i in 0..cx.comp_dec.len() as i64 {
-            if (cx.comp_dec[i as usize]) == g {
-                own += 1;
-            }
+    let mut n = (pcx.fn_calls[g as usize]);
+    let mut own: i64 = 0;
+    for i in 0..cx.comp_dec.len() as i64 {
+        if (cx.comp_dec[i as usize]) == g {
+            own += 1;
         }
-        n -= own;
-        // (0.18.1: the code cache keeps whether it is one, not the count)
-        cc_note_calls(cx, g, own, n == 1, pcx);
-        n
     }
+    n -= own;
+    // (0.18.1: the code cache keeps whether it is one, not the count)
+    cc_note_calls(cx, g, own, n == 1, pcx);
+    n
 }
 
 fn note_inlined(cx: &mut FnCtx<Comp>, g: i64) {
