@@ -1,0 +1,352 @@
+// mandelbulb: an interactive distance-estimated fractal, ray-marched on
+// the GPU. Orbit it, zoom into it, change its power and palette, and let
+// the step governor keep the frame rate up while you explore.
+//
+//   drag / arrows      orbit
+//   scroll             zoom
+//   [ / ]              lower / raise the power (2 .. 16)
+//   - / =              fewer / more march steps (manual quality)
+//   0                  automatic quality on / off
+//   c                  palette
+//   s / a              soft shadows / ambient occlusion on / off
+//   space              pause the slow rotation
+//   , / .              slower / faster rotation
+//   r                  reset camera and quality
+//   f                  fullscreen
+//   q or Esc           quit
+//
+//   target/volec -O2 examples/gpu/mandelbulb/main.vl -o mandelbulb
+//
+// --headless renders the same shader without a window and checks the
+// image; --out writes a PPM, --frames N also measures the frame cost.
+
+mod check;
+mod render;
+
+use std::{env, gpu, thread};
+use std::cli::{Arg, Command};
+use std::gpu::RawSurface;
+use std::time::{Duration, Instant};
+use std::window::{App, Button, Event, MouseAction, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use render::{Camera, Quality, default_camera, default_quality, renderer_new};
+
+fn parse_size(s: &str) -> (i64, i64) {
+    let (ws, hs) = match s.split_once("x") {
+        Some(pair) => pair,
+        None => ("320", "200"),
+    };
+    (ws.parse::<i64>().unwrap_or(320), hs.parse::<i64>().unwrap_or(200))
+}
+
+fn palette_name(palette: i64) -> &'static str {
+    match palette {
+        1 => "lagoon",
+        2 => "orchid",
+        3 => "ivory",
+        _ => "ember",
+    }
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("mandelbulb", gpa)
+        .version("0.1")
+        .about("a Mandelbulb ray marcher on the GPU")
+        .arg(Arg::flag("headless").help("render and check without opening a window"))
+        .arg(Arg::option("size").value_name("WxH").default("320x200")
+            .help("headless: frame size"))
+        .arg(Arg::option("out").value_name("FILE.ppm").default("")
+            .help("headless: write the frame as a PPM"))
+        .arg(Arg::option("frames").value_name("N").default("2")
+            .help("headless: frames to render and time"))
+        .arg(Arg::option("scale").value_name("F").default("1.0")
+            .help("render scale, 0.25 through 1.0 (dynamic while the governor is on)"))
+        .arg(Arg::option("power").value_name("N").default("8")
+            .help("fractal power, 2 through 16"))
+        .arg(Arg::option("steps").value_name("N").default("112")
+            .help("maximum march steps per ray"))
+        .arg(Arg::option("palette").value_name("N").default("0")
+            .help("0 ember, 1 lagoon, 2 orchid, 3 ivory"))
+        .arg(Arg::option("yaw").value_name("R").default("0.60")
+            .help("initial camera yaw, radians"))
+        .arg(Arg::option("pitch").value_name("R").default("0.45")
+            .help("initial camera pitch, radians"))
+        .arg(Arg::option("dist").value_name("D").default("3.0")
+            .help("initial camera distance"))
+        .arg(Arg::option("fov").value_name("D").default("42")
+            .help("vertical field of view, degrees"));
+    let m = cli.parse_or_exit(env::args());
+    let (width, height) = parse_size(m.get("size").unwrap_or("320x200"));
+    let frames = m.get_as::<i64>("frames").unwrap_or(2);
+    let mut power = m.get_as::<i64>("power").unwrap_or(8).clamp(2, 16);
+    let steps = m.get_as::<i64>("steps").unwrap_or(112).clamp(24, 256);
+    let palette = m.get_as::<i64>("palette").unwrap_or(0).clamp(0, 3);
+    let scale = m.get_as::<f64>("scale").unwrap_or(1.0).clamp(0.25, 1.0);
+    let mut camera = default_camera();
+    camera.yaw = m.get_as::<f64>("yaw").unwrap_or(0.60);
+    camera.pitch = m.get_as::<f64>("pitch").unwrap_or(0.45);
+    camera.dist = m.get_as::<f64>("dist").unwrap_or(3.0);
+    camera.fov = m.get_as::<f64>("fov").unwrap_or(42.0).clamp(20.0, 100.0);
+    let out = m.get("out").unwrap_or("");
+    if m.flag("headless") {
+        if width < 8 || height < 8 || frames < 1 {
+            eprintln("mandelbulb: --size wants at least 8x8 and --frames at least 1");
+            return 2;
+        }
+        let mut quality = default_quality();
+        quality.steps = steps;
+        quality.palette = palette;
+        return check::run(width, height, frames, camera, power, quality, scale, out, gpa);
+    }
+
+    let mut app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("mandelbulb: no window server on this display (try --headless)");
+            return 1;
+        }
+    };
+    let mut win = match app.window(WindowDesc::new("mandelbulb", 1100, 720)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("mandelbulb: no window");
+            return 1;
+        }
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    let opened = match inst.adapter(std::gpu::Power::High) {
+        Ok(a) => a.device(std::gpu::Limits::default()),
+        Err(e) => Err(e),
+    };
+    let (dev, mut queue) = match opened {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln("mandelbulb: no GPU: {e}");
+            return 1;
+        }
+    };
+    let mut renderer = match renderer_new(&dev) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln("mandelbulb: renderer: {e}");
+            return 1;
+        }
+    };
+    let mut surf = match inst.surface(&dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln("mandelbulb: no surface: {e}");
+            return 1;
+        }
+    };
+    let pixels = win.size();
+    // Uncapped: a vsync interval is not a render-cost measurement, and a
+    // governor cannot aim for 120 fps from a capped one.
+    surf.configure(&dev, pixels.w, pixels.h, gpu::Format::Bgra8Unorm, false);
+
+    let mut quality = default_quality();
+    quality.steps = steps;
+    quality.palette = palette;
+    let mut auto = true;
+    let mut render_scale = scale;
+    // Aim a little inside a 120 Hz interval, not right at its edge.
+    let target_ms = 8.0;
+    let mut paused = false;
+    let mut rotation_speed = 0.10;
+    let mut dragging = false;
+    let (mut last_x, mut last_y) = (0.0, 0.0);
+    let mut last_clock = Instant::now();
+    let start = last_clock;
+    let mut cost_ms = target_ms;
+    let mut tune_clock = Instant::now();
+    let mut recovery_clock = Instant::now();
+    let mut title_clock = Instant::now();
+    let mut drawn = 0;
+    let (mut shown_w, mut shown_h) = (pixels.w, pixels.h);
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                let now = Instant::now();
+                let mut gpu_ms = cost_ms;
+                let dt = now.saturating_duration_since(last_clock).as_secs_f64().min(0.1);
+                last_clock = now;
+                if !paused { camera.yaw += rotation_speed * dt; }
+                match surf.frame() {
+                    Ok(frame) => {
+                        let view = frame.texture.view();
+                        shown_w = ((surf.width as f64 * render_scale) as i64).max(8);
+                        shown_h = ((surf.height as f64 * render_scale) as i64).max(8);
+                        let draw_clock = Instant::now();
+                        renderer.draw(&dev, &mut queue, &view, surf.width, surf.height, shown_w,
+                            shown_h, camera, power, quality, start.elapsed().as_secs_f64());
+                        // Do not mistake a queue of unfinished frames for
+                        // an expensive shader: measure this frame's GPU
+                        // work itself before presenting it.
+                        if queue.wait_idle().is_err() {
+                            eprintln("mandelbulb: GPU submission failed");
+                            break;
+                        }
+                        gpu_ms = draw_clock.elapsed().as_secs_f64() * 1000.0;
+                        frame.present(&mut queue);
+                        drawn += 1;
+                    }
+                    Err(_) => {}
+                }
+                cost_ms = cost_ms * 0.82 + gpu_ms * 0.18;
+                // Presentation is capped at 120 even when a lower film
+                // resolution is cheap. GPU cost, not this sleep, drives the
+                // governor, so pacing cannot mask a slow shader.
+                let remaining = target_ms / 1000.0 - now.elapsed().as_secs_f64();
+                if remaining > 0.0005 {
+                    std::thread::sleep(Duration::from_micros((remaining * 1e6) as u64));
+                }
+                if auto && tune_clock.elapsed().as_millis() >= 400 {
+                    let previous_scale = render_scale;
+                    let previous_steps = quality.steps;
+                    let previous_effects = quality.shadow_steps + quality.ao_steps;
+                    if cost_ms > target_ms * 1.025 {
+                        // Drop quickly when over budget. Recovery is slow
+                        // on purpose: stable 120 is worth more than chasing
+                        // a higher resolution every other frame.
+                        if render_scale > 0.25 {
+                            let factor = (target_ms / cost_ms).sqrt().max(0.80);
+                            render_scale = (render_scale * factor).max(0.25);
+                        } else if quality.steps > 48 {
+                            quality.steps = (quality.steps - 16).max(48);
+                        } else if quality.shadow_steps > 0 {
+                            quality.shadow_steps = 0;
+                        } else if quality.ao_steps > 0 {
+                            quality.ao_steps = 0;
+                        }
+                        recovery_clock = Instant::now();
+                    } else if cost_ms < target_ms * 0.70
+                        && recovery_clock.elapsed().as_millis() >= 2000 {
+                        // Only after two cheap seconds: 1% resolution or
+                        // two march steps, never a quality seesaw.
+                        if render_scale <= 0.26 && quality.steps < 112 {
+                            quality.steps += 2;
+                        } else if render_scale < 1.0 {
+                            render_scale = (render_scale * 1.01).min(1.0);
+                        } else if quality.steps < 192 {
+                            quality.steps += 2;
+                        }
+                        recovery_clock = Instant::now();
+                    }
+                    if render_scale != previous_scale || quality.steps != previous_steps
+                        || quality.shadow_steps + quality.ao_steps != previous_effects {
+                        let next_w = ((surf.width as f64 * render_scale) as i64).max(8);
+                        let next_h = ((surf.height as f64 * render_scale) as i64).max(8);
+                        eprintln("quality: {:.0}% ({}x{}), {} steps, {:.1} ms",
+                            render_scale * 100.0, next_w, next_h, quality.steps, cost_ms);
+                    }
+                    tune_clock = Instant::now();
+                }
+                if title_clock.elapsed().as_millis() >= 750 {
+                    let fps = drawn as f64 / title_clock.elapsed().as_secs_f64();
+                    let title = format_in(
+                        "mandelbulb — {fps:.0} fps — power {power} — {} steps — {} — {:.1} ms — dist {:.2} — {}x{}",
+                        quality.steps, palette_name(quality.palette), cost_ms, camera.dist,
+                        shown_w, shown_h, gpa);
+                    win.set_title(title.as_str());
+                    title_clock = Instant::now();
+                    drawn = 0;
+                }
+                win.request_frame();
+            }
+            Ok(Event::Resize(_, size)) => {
+                if size.w > 0 && size.h > 0 {
+                    surf.configure(&dev, size.w, size.h, gpu::Format::Bgra8Unorm, false);
+                }
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && !k.ime {
+                    match k.key {
+                        Logical::Named(Named::Escape) => {
+                            win.close();
+                            break;
+                        }
+                        Logical::Named(Named::ArrowLeft) => camera.yaw -= 0.08,
+                        Logical::Named(Named::ArrowRight) => camera.yaw += 0.08,
+                        Logical::Named(Named::ArrowUp) => {
+                            camera.pitch = (camera.pitch + 0.06).min(1.50);
+                        }
+                        Logical::Named(Named::ArrowDown) => {
+                            camera.pitch = (camera.pitch - 0.06).max(-1.50);
+                        }
+                        Logical::Char(c) => {
+                            if c == 'q' as u32 {
+                                win.close();
+                                break;
+                            }
+                            if c == ' ' as u32 { paused = !paused; }
+                            if c == ',' as u32 { rotation_speed *= 0.6; }
+                            if c == '.' as u32 { rotation_speed *= 1.6; }
+                            if c == '[' as u32 { power = (power - 1).max(2); }
+                            if c == ']' as u32 { power = (power + 1).min(16); }
+                            if c == '-' as u32 {
+                                quality.steps = (quality.steps - 16).max(24);
+                                auto = false;
+                                render_scale = 1.0;
+                            }
+                            if c == '=' as u32 {
+                                quality.steps = (quality.steps + 16).min(256);
+                                auto = false;
+                                render_scale = 1.0;
+                            }
+                            if c == '0' as u32 { auto = !auto; }
+                            if c == 'c' as u32 { quality.palette = (quality.palette + 1) % 4; }
+                            if c == 's' as u32 {
+                                quality.shadow_steps = if quality.shadow_steps == 0 { 20 }
+                                    else { 0 };
+                            }
+                            if c == 'a' as u32 {
+                                quality.ao_steps = if quality.ao_steps == 0 { 4 } else { 0 };
+                            }
+                            if c == 'r' as u32 {
+                                camera = default_camera();
+                                quality = default_quality();
+                                auto = true;
+                                render_scale = 1.0;
+                            }
+                            if c == 'f' as u32 { win.set_fullscreen(!win.is_fullscreen()); }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Mouse(mouse)) => {
+                match mouse.action {
+                    MouseAction::Press => {
+                        if let Button::Left = mouse.button {
+                            dragging = true;
+                            last_x = mouse.x;
+                            last_y = mouse.y;
+                        }
+                    }
+                    MouseAction::Release => dragging = false,
+                    MouseAction::Move => {
+                        if dragging {
+                            camera.yaw -= (mouse.x - last_x) * 0.008;
+                            camera.pitch = (camera.pitch + (mouse.y - last_y) * 0.008)
+                                .clamp(-1.50, 1.50);
+                            last_x = mouse.x;
+                            last_y = mouse.y;
+                        }
+                    }
+                }
+            }
+            Ok(Event::Scroll(wheel)) => {
+                camera.dist = (camera.dist * 0.92f64.powf(wheel.dy)).clamp(1.35, 16.0);
+            }
+            Ok(Event::Close(_)) | Ok(Event::Quit) => {
+                win.close();
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    0
+}
