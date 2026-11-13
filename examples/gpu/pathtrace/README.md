@@ -35,7 +35,7 @@ the laboratory.
 | **Camera** | field of view, depth of field and aperture, focus distance, focus on the selected sphere, reset view |
 | **Atmosphere** | volumetric fog on/off, density, anisotropy, fog color, environment, light intensity and height, light color, global illumination |
 | **Material** | M1–M4 picker, base color, roughness, metallic, index of refraction, transmission, absorption tint and density, emission |
-| **Display** | debug view, comparison split, render size, frame time, mode |
+| **Display** | debug view, comparison split, denoiser, render size, frame time, mode |
 
 The footer has **PAUSE**, **CLEAR** (accumulation) and **RESET ALL** (the whole
 scene). Drag the title bar to move the panel, **HIDE** to collapse it to a
@@ -73,6 +73,7 @@ scene, with margins from the side walls, back wall and floor.
 | space | pause / resume accumulation |
 | `r` | reset accumulation |
 | `b` | split-screen one-sample / converged comparison |
+| `p` | toggle the display denoiser (raw / filtered) |
 | F1 / F2 | decrease / increase exposure without invalidating samples |
 | Backspace | restore the current scene's defaults |
 | Tab | hide / show the panel |
@@ -128,13 +129,36 @@ there are deliberately no fabricated BVH counters.
 
 - **PBR materials:** opaque surfaces combine Lambert diffuse and GGX specular
   with Schlick Fresnel and Smith masking. BSDF sampling uses the corresponding
-  diffuse/GGX mixture PDF. Glass uses Fresnel reflection/refraction and
-  Beer–Lambert absorption.
-- **Correct area-light sampling:** the rectangle is sampled uniformly by area
-  and converted to solid-angle PDF with both cosines and distance. Shadow rays
-  include homogeneous-media transmittance. Rectangle emission is accepted after
-  specular events but skipped after NEE-sampled diffuse events, avoiding double
-  counting. Object emission is BSDF-sampled and is not also next-event sampled.
+  diffuse/GGX mixture PDF, weighted toward the specular lobe as metallic rises
+  (10% specular at a dielectric, 100% at metal). Glass uses Fresnel
+  reflection/refraction and Beer–Lambert absorption.
+- **Multiple importance sampling:** a diffuse or glossy event combines
+  next-event estimation of the area light with the BSDF-sampled path using the
+  balance heuristic, so each technique contributes where its PDF is large; the
+  result is unbiased apart from the firefly clamp below, and loses most of the
+  fireflies that either technique alone produces on a glossy floor. The
+  rectangle is sampled uniformly by area and converted to solid-angle PDF with
+  both cosines and distance; shadow rays include homogeneous-media
+  transmittance. Rectangle emission is accepted whole after camera or specular
+  events and weighted by MIS after a sampled BSDF event. Object emission is
+  BSDF-sampled and is not also next-event sampled.
+- **Stratified camera, white-noise paths:** a pixel's first four random
+  numbers (jitter, then the lens, or the first light sample without depth of
+  field) are a Cranley–Patterson rotation of a Halton point, fixed per pixel
+  and dimension so neighbours stay decorrelated. The rest of the path uses a
+  hash of `(pixel, sample, dimension)`: a radical inverse there buys nothing
+  measurable on a high-dimensional integral and costs about twice the shader
+  time. Both are deterministic, which is what lets `--headless` reproduce
+  sample one exactly. The stratification removes most of the edge crawl at low
+  sample counts; MIS does the heavy lifting on the broad low-frequency noise.
+- **Firefly clamp:** `trace` scales any sample whose luminance exceeds 64 down
+  to that luminance. A path that scatters just beside the area light, or lands
+  on a grazing emitter, can otherwise carry thousands of times a pixel's mean in
+  one sample; the running average then keeps that pixel white for the rest of
+  the accumulation, most visibly as the sample count grows. The clamp removes
+  those pixels on the Fog hall without moving the Studio or grid error, and is
+  the estimator's one deliberate bias, applied where the tone map already
+  saturates.
 - **Scene geometry:** `trace.wgsl` selects one of three analytic families from
   the scene index (the fourth preset reuses the studio geometry with the 4×4
   material wall). Shadow rays use the same per-scene blocker list as the camera
@@ -144,6 +168,19 @@ there are deliberately no fabricated BVH counters.
   relative standard error from those moments, not brightness. `b` compares the
   saved first sample with the current average. Adaptive sampling is not enabled;
   the estimate is diagnostic rather than an arbitrary stopping heuristic.
+- **Display denoiser:** `display.wgsl` filters the accumulation with a 5×5
+  joint bilateral pass before tone mapping. A tap counts only if it shares the
+  centre's material ID, normal (within 18°), depth (within 8%) and albedo
+  (within 0.12), so silhouettes, checker edges and wall corners keep their hard
+  edge; the range term `exp(-|L-L0| / max(0.30 L0, 0.008))` down-weights a tap
+  far brighter than its neighbours, which is what a lone firefly looks like.
+  `p` and the DISPLAY panel's toggle switch it, `--no-denoise` renders raw, and
+  it is off in every debug mode and in the comparison split. It reads the
+  accumulation and never writes it, so the sample count, the variance view, the
+  reset check and the estimator itself stay raw; at 2048 spp on the Fog hall it
+  drops the caustic band's error against a 16384-sample reference from 2.13 to
+  1.63 and the frame-wide error from 2.00 to 1.42 (255 levels, luminance), and
+  with the 4096-sample cap the band reaches 1.31 and the frame 1.11.
 - **Volumetric fog:** free-flight distance sampling, Henyey–Greenstein phase
   sampling and next-event area lighting simulate a homogeneous participating
   medium with a per-channel scattering albedo. Multiple scattering is expensive
@@ -154,12 +191,13 @@ there are deliberately no fabricated BVH counters.
   to 15 nodes for the selected ray. Instrumentation does not require host image
   readback.
 - **Presentation and performance:** compute and rendering are encoded in order
-  on one queue. Interactive frames accumulate four samples but execute only one
-  display pass, so sampling is not capped by the window refresh rate. Static
-  diagnostic modes stop after one sample. The integrator uses 16×16 workgroups,
-  lightweight ID-only candidate hits, early-out any-hit shadow traversal,
-  canceled Smith visibility terms and unbiased Russian roulette from the third
-  path segment, with at most six segments. Swapchain textures remain render
+  on one queue. Interactive frames add four samples to the accumulation (up to
+  4096 per camera view) but execute only one display pass, so sampling is not
+  capped by the window refresh rate. Static diagnostic modes stop after one
+  sample. The integrator uses 16×16 workgroups, lightweight ID-only candidate
+  hits, early-out any-hit shadow traversal, canceled Smith visibility terms and
+  unbiased Russian roulette from the third path segment, with at most six
+  segments. Swapchain textures remain render
   targets, as required by `std::gpu`; the display fragment shader reads storage
   buffers directly. The panel's vertex buffer and atlas are uploaded once per
   frame and drawn in a blended pass that loads the scene target instead of
@@ -194,6 +232,8 @@ checks and optional PPM output:
 `--ui` draws the actual panel over the final frame through the window's own UI
 pipeline; `--ui-section N` opens a section and `--ui-scale S` sets physical
 pixels per UI point, so the HiDPI layout can be checked without a display.
+PPM output goes through the same display pass as the window, so it includes the
+denoiser unless `--no-denoise` asks for the raw accumulation.
 
 Checks cover non-empty changing output, decreasing local pixel noise for
 progressive scenes, and exact reproduction of sample one after reset. Diagnostic
@@ -220,17 +260,17 @@ state, camera-bounds, scene-switch, panel-hit and immediate-mode widget tests.
 ./pathtrace --benchmark --samples 1024 --size 640x400
 ```
 
-Benchmark mode uses the selected scene (default Studio) and a fixed RNG seed.
-Initialization (including shader compilation) is reported separately.
+Benchmark mode uses the selected scene (default Studio) and a fixed sample
+sequence. Initialization (including shader compilation) is reported separately.
 Steady-state wall time covers uninterrupted offscreen GPU frames plus one final
 readback synchronization; there is no per-frame readback or presentation pacing.
 `--grid`, `--direct`, `--fog`, `--dof` and `--scene` also select benchmark
 workloads. CPU frame interval in the interactive title is not represented as GPU
 execution time: `std::gpu` currently exposes no timestamp queries.
 
-Measured on an Apple M5 with Metal (1024 samples, 640×400): 1.76 ms
-initialization, 0.484 ms/sample wall time, 2065.9 accumulated samples/s and
-528.86 Mpaths/s. These are measurements, not GPU timestamp estimates; rerun the
+Measured on an Apple M5 with Metal (1024 samples, 640×400): 2.92 ms
+initialization, 0.688 ms/sample wall time, 1452.7 accumulated samples/s and
+371.89 Mpaths/s. These are measurements, not GPU timestamp estimates; rerun the
 command above for local numbers.
 
 ## Files

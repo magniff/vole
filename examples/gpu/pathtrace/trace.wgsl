@@ -16,6 +16,8 @@ struct Params {
     materials: array<Material, 4>,
     // fog.rgb is the medium's single-scattering albedo; fog.w the scene.
     fog: vec4<f32>,
+    // x: the display filter is on. Written for display.wgsl; unused here.
+    display: vec4<f32>,
 }
 struct Hit {
     t: f32,
@@ -37,15 +39,56 @@ struct LightSample {
 @group(0) @binding(1) var<storage, read_write> accum: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> gbuffer: array<Surface>;
 @group(0) @binding(3) var<storage, read_write> rays: array<vec4<f32>>;
-var<private> rng_state: u32;
+// A path that scatters just beside the area light, or lands on a grazing
+// emitter, can carry thousands of times a pixel's mean in a single sample.
+// The running average then keeps that pixel white for the rest of the
+// accumulation, more visibly as the sample count grows. Cap one sample's
+// radiance where the tone map already saturates: only the rare tail is
+// touched, and this clamp is the estimator's one deliberate bias.
+const FIREFLY_CAP: f32 = 64.0;
+var<private> qmc_index: u32;
+var<private> qmc_dimension: u32;
+var<private> qmc_seed: u32;
 var<private> intersection_tests: u32;
 var<private> recording: bool;
 var<private> path_nodes: u32;
+
+// A pixel's first four random numbers are the camera's: pixel jitter, then
+// the lens (or the first light sample when depth of field is off), where a
+// stratified point visibly removes edge noise. Every dimension after those is
+// part of a high-dimensional path integral, where the radical inverse buys
+// nothing measurable and a white-noise hash is as accurate and much cheaper.
+// The sequence is fixed per (pixel, sample, dimension), so sample n is always
+// the same point, which is what makes reset reproduce sample one.
+const QMC_BASES: array<u32, 4> = array<u32, 4>(2u, 3u, 5u, 7u);
+
+fn hash_u32(input: u32) -> u32 {
+    var state = input * 747796405u + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+fn radical_inverse(base: u32, index: u32) -> f32 {
+    var i = index;
+    var inverse = 1.0 / f32(base);
+    var place = inverse;
+    var result = 0.0;
+    loop {
+        result = result + place * f32(i % base);
+        i = i / base;
+        if i == 0u { break; }
+        place = place * inverse;
+    }
+    return result;
+}
 fn rand() -> f32 {
-    rng_state = rng_state * 747796405u + 2891336453u;
-    var word = ((rng_state >> ((rng_state >> 28u) + 4u)) ^ rng_state) * 277803737u;
-    word = (word >> 22u) ^ word;
-    return f32(word) * 2.3283064365386963e-10;
+    let dimension = qmc_dimension;
+    qmc_dimension = dimension + 1u;
+    if dimension < 4u {
+        let shift = f32(hash_u32(qmc_seed ^ (dimension * 2654435769u))) * 2.3283064365386963e-10;
+        return fract(radical_inverse(QMC_BASES[dimension], qmc_index) + shift);
+    }
+    return f32(hash_u32(qmc_seed ^ (qmc_index * 2246822519u) ^ (dimension * 2654435769u)))
+        * 2.3283064365386963e-10;
 }
 fn unit_vector() -> vec3<f32> {
     let z = rand() * 2.0 - 1.0;
@@ -285,6 +328,17 @@ fn sample_light(p: vec3<f32>) -> LightSample {
 fn transmittance(distance: f32) -> vec3<f32> {
     return exp(vec3<f32>(-u.env.y * distance));
 }
+// Solid-angle density of the rectangle's uniform-area sampling for a ray
+// from `from` that met the light at `at`. The same expression as
+// sample_light's pdf, in the direction of a BSDF-sampled hit.
+fn light_pdf(from: vec3<f32>, at: vec3<f32>) -> f32 {
+    let delta = at - from;
+    let distance2 = dot(delta, delta);
+    let distance = sqrt(distance2);
+    let wi = delta / distance;
+    let cosine = max(0.0001, dot(vec3<f32>(0.0, -1.0, 0.0), -wi));
+    return distance2 / (u.light_size.x * u.light_size.y * cosine);
+}
 fn fresnel(f0: vec3<f32>, cosine: f32) -> vec3<f32> {
     let one = 1.0 - cosine;
     let squared = one * one;
@@ -312,13 +366,34 @@ fn eval_bsdf(n: vec3<f32>, wo: vec3<f32>, wi: vec3<f32>, mat: Material) -> vec3<
     let diffuse = (vec3<f32>(1.0) - f) * (1.0 - mat.params.x) * mat.albedo.xyz / 3.14159265359;
     return specular + diffuse;
 }
+fn bsdf_pdf(n: vec3<f32>, wo: vec3<f32>, wi: vec3<f32>, mat: Material) -> f32 {
+    let nol = max(0.0, dot(n, wi));
+    let specular_probability = 0.10 + 0.90 * mat.params.x;
+    let half_sum = wo + wi;
+    // A grazing pair can sum to (nearly) zero; dividing by its length would
+    // turn the MIS weight into a NaN, so fall back to the diffuse lobe.
+    let half_length2 = dot(half_sum, half_sum);
+    if half_length2 == 0.0 { return nol / 3.14159265359; }
+    let half = half_sum / sqrt(half_length2);
+    let noh = max(0.0, dot(n, half));
+    let voh = max(0.0001, dot(wo, half));
+    let specular_pdf = ggx_d(noh, mat.albedo.w) * noh / (4.0 * voh);
+    let diffuse_pdf = nol / 3.14159265359;
+    return specular_probability * specular_pdf + (1.0 - specular_probability) * diffuse_pdf;
+}
 fn direct_surface(p: vec3<f32>, n: vec3<f32>, wo: vec3<f32>, mat: Material) -> vec3<f32> {
     let light = sample_light(p);
     let nol = max(0.0, dot(n, light.wi));
     if nol == 0.0 { return vec3<f32>(0.0); }
     if !visible(p + n * 0.001, light.wi, light.distance) { return vec3<f32>(0.0); }
     let brdf = eval_bsdf(n, wo, light.wi, mat);
-    return brdf * u.light_color.xyz * (u.light_pos.w * nol / light.pdf) * transmittance(light.distance);
+    // MIS (balance heuristic) against the BSDF-sampled path: where the BRDF
+    // is close to the sampled direction the light sample is redundant, and
+    // where it is broad (diffuse) the light sample carries the estimate.
+    let pdf_bsdf = bsdf_pdf(n, wo, light.wi, mat);
+    let weight = light.pdf / (light.pdf + pdf_bsdf);
+    return brdf * u.light_color.xyz * (u.light_pos.w * nol * weight / light.pdf)
+        * transmittance(light.distance);
 }
 fn phase(cosine: f32) -> f32 {
     let g = u.env.z;
@@ -356,8 +431,12 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, index: u32, sample: u32) -> vec3<f32> {
     var direction = rd;
     var radiance = vec3<f32>(0.0);
     var throughput = vec3<f32>(1.0);
-    var specular = false;
     var depth_traced = 0u;
+    // The BSDF pdf of the last sampled direction: 0 means the next light hit
+    // is taken whole (camera or a specular event, which did no light
+    // sampling); a negative value means the previous event already counted
+    // the light by next-event estimation and the hit must not be added again.
+    var last_pdf_bsdf = 0.0;
     intersection_tests = 0u;
     if recording {
         path_nodes = 1u;
@@ -379,7 +458,7 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, index: u32, sample: u32) -> vec3<f32> {
             direction = sample_phase(direction);
             throughput *= u.fog.xyz;
             origin = p + direction * 0.001;
-            specular = false;
+            last_pdf_bsdf = -1.0;
             record_point(p, 4.0);
         } else {
             if h.t > 1.0e19 {
@@ -396,7 +475,13 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, index: u32, sample: u32) -> vec3<f32> {
                 gbuffer[index].albedo = vec4<f32>(mat.albedo.xyz, f32(h.id));
             }
             if h.id == 9u {
-                if bounce == 0u || specular { radiance += throughput * mat.absorption.xyz; }
+                if bounce == 0u || last_pdf_bsdf == 0.0 {
+                    radiance += throughput * mat.absorption.xyz;
+                } else if last_pdf_bsdf > 0.0 {
+                    let pdf_light = light_pdf(origin, h.p);
+                    radiance += throughput * mat.absorption.xyz
+                        * (last_pdf_bsdf / (last_pdf_bsdf + pdf_light));
+                }
                 record_point(h.p, 2.0);
                 break;
             }
@@ -430,7 +515,7 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, index: u32, sample: u32) -> vec3<f32> {
                 }
                 direction = normalize(direction);
                 throughput *= mat.albedo.xyz;
-                specular = true;
+                last_pdf_bsdf = 0.0;
             } else {
                 let wo = normalize(-direction);
                 radiance += throughput * direct_surface(h.p, n, wo, mat);
@@ -438,7 +523,7 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, index: u32, sample: u32) -> vec3<f32> {
                     record_point(h.p, 1.0);
                     break;
                 }
-                let specular_probability = 0.25 + 0.75 * mat.params.x;
+                let specular_probability = 0.10 + 0.90 * mat.params.x;
                 var next = normalize(n + unit_vector());
                 if rand() < specular_probability {
                     let micro_normal = sample_ggx(n, mat.albedo.w);
@@ -455,7 +540,7 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, index: u32, sample: u32) -> vec3<f32> {
                 let pdf = specular_probability * specular_pdf + (1.0 - specular_probability) * diffuse_pdf;
                 throughput *= eval_bsdf(n, wo, next, mat) * (nol / max(0.0001, pdf));
                 direction = next;
-                specular = false;
+                last_pdf_bsdf = pdf;
                 record_point(h.p, 1.0);
             }
             origin = h.p + direction * 0.001;
@@ -470,6 +555,15 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, index: u32, sample: u32) -> vec3<f32> {
         gbuffer[index].info = vec4<f32>(f32(intersection_tests), f32(depth_traced), 0.0, 0.0);
     }
     if recording { rays[17] = vec4<f32>(f32(path_nodes), 0.0, 0.0, 0.0); }
+    // A degenerate sample (a normalized zero vector at a grazing
+    // reflection, a division at a singular configuration) must not poison
+    // the pixel's running sum: one NaN or infinity would stay white for
+    // every later sample.
+    if !all(radiance == radiance) || any(abs(radiance) > vec3<f32>(1.0e30)) {
+        radiance = vec3<f32>(0.0);
+    }
+    let luminance = dot(radiance, vec3<f32>(0.2126, 0.7152, 0.0722));
+    if luminance > FIREFLY_CAP { radiance = radiance * (FIREFLY_CAP / luminance); }
     return max(radiance, vec3<f32>(0.0));
 }
 @compute @workgroup_size(16, 16)
@@ -478,7 +572,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let height = u32(u.dims.y);
     if gid.x >= width || gid.y >= height { return; }
     let sample = u32(u.dims.z);
-    rng_state = (gid.x * 1973u + gid.y * 9277u + sample * 26699u) ^ 0x9E3779B9u;
+    qmc_index = sample;
+    qmc_dimension = 0u;
+    qmc_seed = hash_u32(gid.x * 1973u + gid.y * 9277u + 0x9E3779B9u);
     let aspect = u.dims.x / u.dims.y;
     let forward = normalize(u.target.xyz - u.eye.xyz);
     let right = normalize(cross(forward, vec3<f32>(0.0, 1.0, 0.0)));
@@ -490,6 +586,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var origin = u.eye.xyz;
     var direction = normalize(forward + right * sx + up * sy);
     if u.config.y > 0.0 {
+        // After the pixel jitter (dimensions 0 and 1) the lens takes the
+        // next two, so a pixel's first four dimensions are always screen
+        // space and lens; the path's own dimensions follow.
         let focal = origin + direction * (u.config.z / max(0.001, dot(direction, forward)));
         let angle = rand() * 6.28318530718;
         let radius = sqrt(rand()) * u.config.y;
