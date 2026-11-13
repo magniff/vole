@@ -1,0 +1,374 @@
+// A file that is no file of the program (0.29): a README, a script, a
+// note, a shader no block embeds. `query show FILE` prints it
+// (query_text.vl, show_files), `query grep PATTERN --in FILE` searches it
+// and `edit patch FILE --old A --new B` changes it, here: the same
+// commands as for a source, so that a search of such a file never
+// answers `0 hits` for a file it did not read, and an edit of one is
+// journaled for `volec undo` as any other.
+//
+// A file is searched and patched as text: a hit's place is `text` and it
+// has no enclosing item; a patch has the exact-match rules of `edit
+// patch` (OLD as written, once in the file, else --nth N or --all) and
+// no check, which the summary says. Only a file git tracks is patched
+// (an edit of anything else under the tree is not this tool's to make).
+
+use crate::base::{STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::cpp::directives::file_exists;
+use crate::front::lexer::is_ident_byte;
+use crate::tools::ctx::Tcx;
+use crate::tools::fmt::is_dir;
+use crate::tools::proc::{exec_words, read_file_if, run_capture};
+use crate::tools::query::c_slice;
+use crate::tools::query::diagnostics::{diag, diags, put_cword, put_word, try_end};
+use crate::tools::query::grep::lower;
+use crate::tools::textual::{is_text, write_edit};
+
+// Whether `path` names a file on disk that is no vole source and no
+// directory: one these commands read as text.
+pub fn plain_file(path: *mut u8, pcx: &Ctx<Comp>) -> bool {
+    let p = c_slice(path);
+    let mut pathlike = false;
+    for i in 0..p.len() {
+        if p[i] == b'.' || p[i] == b'/' {
+            pathlike = true;
+        }
+    }
+    pathlike && p[0] != b'-' && !crate::base::is_source_path(path) && file_exists(path, pcx)
+        && !is_dir(path)
+}
+
+// Whether git tracks `path`.
+fn tracked(path: *mut u8) -> bool {
+    let out = buf_new();
+    let argv = exec_words(
+        &[c"git" as i64, c"ls-files" as i64, c"--error-unmatch" as i64, c"--" as i64, path as i64]);
+    run_capture(argv.as_slice(), out) == 0
+}
+
+// The text of `path` into a new buffer, or -1 after the diagnostic (it
+// cannot be read, or is not text).
+fn text_of(path: *mut u8, tcx: &mut Tcx<Comp>) -> i64 {
+    let b = buf_new();
+    if !read_file_if(path, b) {
+        let d = diag(c"error", c"query.no-file", tcx);
+        buf_str(d, c"cannot read ");
+        buf_str(d, path);
+        buf_byte(d, b'\n');
+        return -1;
+    }
+    if !is_text(buf_slice(b)) {
+        let d = diag(c"error", c"query.not-text", tcx);
+        buf_str(d, path);
+        buf_str(d, c" is not a text file (it holds a NUL byte)\n");
+        return -1;
+    }
+    b
+}
+
+// Whether pat is at t[pos..] (with --ignore-case: in any case; with
+// --word: not inside a longer identifier).
+fn hit(t: &[u8], pos: i64, pat: &[u8], tcx: &Tcx<Comp>) -> bool {
+    if pos + pat.len() as i64 > t.len() as i64 {
+        return false;
+    }
+    for k in 0..pat.len() as i64 {
+        let a = t[(pos + k) as usize];
+        let b = pat[k as usize];
+        if a != b && !(tcx.opt_nocase && lower(a) == lower(b)) {
+            return false;
+        }
+    }
+    if tcx.opt_word {
+        if pos > 0 && is_ident_byte(t[(pos - 1) as usize]) {
+            return false;
+        }
+        let e = pos + pat.len() as i64;
+        if e < t.len() as i64 && is_ident_byte(t[e as usize]) {
+            return false;
+        }
+    }
+    true
+}
+
+// The number of the line holding t[pos], from 1.
+fn line_at(t: &[u8], pos: i64) -> i64 {
+    let mut n: i64 = 1;
+    for i in 0..pos {
+        if t[i as usize] == b'\n' {
+            n += 1;
+        }
+    }
+    n
+}
+
+// `query grep PATTERN... --in FILE`, FILE a text file that is no file of
+// the program: each hit as a hit in a source is printed, `LINE:COL`,
+// `text` for its place, `-` for the item no text is in, the line. The
+// exit status (0, also for no hit; 1 when the file cannot be read).
+pub fn grep_text(pats: &[i64], path: *mut u8, tcx: &mut Tcx<Comp>) -> i64 {
+    let b = text_of(path, tcx);
+    if b < 0 {
+        return 1;
+    }
+    let t = buf_slice(b);
+    let out = buf_new();
+    let mut total: i64 = 0;
+    let mut shown: i64 = 0;
+    let mut pos: i64 = 0;
+    let mut line: i64 = 1;
+    let mut line_start: i64 = 0;
+    while pos < t.len() as i64 {
+        let mut found = false;
+        for k in 0..pats.len() as i64 {
+            let pat = c_slice(pats[k as usize] as *mut u8);
+            if pat.len() > 0 && hit(t, pos, pat, tcx) {
+                found = true;
+            }
+        }
+        if found {
+            total += 1;
+            if !tcx.opt_count && (tcx.opt_limit < 0 || shown < tcx.opt_limit) {
+                if shown == 0 {
+                    buf_str(out, c"# ");
+                    buf_str(out, path);
+                    buf_byte(out, b'\n');
+                }
+                shown += 1;
+                buf_int(out, line);
+                buf_byte(out, b':');
+                buf_int(out, pos - line_start + 1);
+                buf_str(out, c"\ttext\t-\t");
+                let mut e = line_start;
+                while e < t.len() as i64 && t[e as usize] != b'\n' {
+                    e += 1;
+                }
+                let mut s = line_start;
+                while s < e && (t[s as usize] == b' ' || t[s as usize] == b'\t') {
+                    s += 1;
+                }
+                buf_bytes(out, &t[s as usize..e as usize]);
+                buf_byte(out, b'\n');
+            }
+        }
+        if t[pos as usize] == b'\n' {
+            line += 1;
+            line_start = pos + 1;
+        }
+        pos += 1;
+    }
+    if tcx.opt_count {
+        buf_int(out, total);
+        buf_byte(out, b'\n');
+    }
+    buf_write_fd(out, STDOUT);
+    if total == 0 && !tcx.opt_count {
+        let d = diag(c"note", c"query.empty", tcx);
+        buf_str(d, c"0 hits in ");
+        buf_str(d, path);
+        buf_str(d, c" (a text file, searched as text)\n");
+    } else if shown < total && !tcx.opt_count {
+        let d = diag(c"note", c"query.truncated", tcx);
+        buf_int(d, total);
+        buf_str(d, c" hits in ");
+        buf_str(d, path);
+        buf_str(d, c"; --limit N shows more\n");
+    }
+    0
+}
+
+// A pattern of `query grep` that names a file on disk, with no --in: the
+// file was not searched (a pattern is text looked for in the program),
+// and the answer must not read as "the text is absent". The diagnostic
+// and its `try:`, the same search in that file.
+pub fn not_searched(pats: &[i64], k: i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) {
+    let path = pats[k as usize] as *mut u8;
+    let d = diag(c"error", c"query.not-in-program", tcx);
+    buf_str(d, path);
+    buf_str(d,
+        c" is a file, not a pattern, and it was not searched: --in FILE names the file to search\n");
+    let out = diags(tcx);
+    buf_str(out, c"try:");
+    put_cword(out, pcx.prog);
+    buf_str(out, c" query grep");
+    for j in 0..pats.len() as i64 {
+        if j != k {
+            put_cword(out, pats[j as usize] as *mut u8);
+        }
+    }
+    buf_str(out, c" --in");
+    put_cword(out, path);
+    try_end(out);
+}
+
+// The lines of text s (a last line without its line break counts).
+fn lines_of(s: &[u8]) -> i64 {
+    let mut n: i64 = 0;
+    for i in 0..s.len() {
+        if s[i] == b'\n' {
+            n += 1;
+        }
+    }
+    if s.len() > 0 && s[s.len() - 1] != b'\n' {
+        n += 1;
+    }
+    n
+}
+
+// `edit patch FILE --old A --new B...`, FILE a text file git tracks that
+// is no file of the program: each OLD, as written, once in the file
+// (--nth N: its Nth occurrence; --all: every one), replaced by its NEW;
+// all of them or nothing. Not checked (there is nothing to check a text
+// with), journaled as one edit for `volec undo`. The exit status.
+pub fn patch_text(path: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    if !tracked(path) {
+        let d = diag(c"error", c"edit.not-tracked", tcx);
+        buf_str(d, path);
+        buf_str(d, c" is no file of the program and git does not track it: edit patch changes a program's files and the text files of the checkout\n");
+        return 1;
+    }
+    let b = text_of(path, tcx);
+    if b < 0 {
+        return 1;
+    }
+    let t = buf_slice(b);
+    // each pair's matches in the text as it is, in the file's order
+    let mut starts: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut pairs: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for k in 0..tcx.olds.len() as i64 {
+        let old = buf_slice(tcx.olds[k as usize]);
+        let mut at: Vec<i64, Comp> = Vec::new_in(Comp {});
+        let mut pos: i64 = 0;
+        while pos + old.len() as i64 <= t.len() as i64 {
+            if &t[pos as usize..(pos + old.len() as i64) as usize] == old {
+                at.push(pos);
+                pos += old.len() as i64;
+            } else {
+                pos += 1;
+            }
+        }
+        let n = at.len() as i64;
+        if n == 0 {
+            let d = diag(c"error", c"patch.no-match", tcx);
+            buf_str(d, c"OLD ");
+            buf_int(d, k + 1);
+            buf_str(d, c" is not in ");
+            buf_str(d, path);
+            buf_str(d,
+                c" as written (a text file: the match is exact, blanks and line breaks too)\n");
+            let out = diags(tcx);
+            buf_str(out, c"try:");
+            put_cword(out, pcx.prog);
+            buf_str(out, c" query show");
+            put_cword(out, path);
+            try_end(out);
+            return 1;
+        }
+        if n > 1 && tcx.nth == 0 {
+            let d = diag(c"error", c"patch.ambiguous", tcx);
+            buf_str(d, c"OLD ");
+            buf_int(d, k + 1);
+            buf_str(d, c" occurs ");
+            buf_int(d, n);
+            buf_str(d, c" times in ");
+            buf_str(d, path);
+            buf_str(d, c", lines ");
+            for j in 0..n {
+                if j > 0 {
+                    buf_str(d, c", ");
+                }
+                if j == 8 {
+                    buf_str(d, c"...");
+                    break;
+                }
+                buf_int(d, line_at(t, at[j as usize]));
+            }
+            buf_str(d, c"; give more of the text around it, or --nth N (--all: every one)\n");
+            return 1;
+        }
+        if tcx.nth > n {
+            let d = diag(c"error", c"patch.nth", tcx);
+            buf_str(d, c"OLD ");
+            buf_int(d, k + 1);
+            buf_str(d, c" occurs ");
+            buf_int(d, n);
+            buf_str(d, if n == 1 { c" time in " } else { c" times in " });
+            buf_str(d, path);
+            buf_str(d, c": no occurrence ");
+            buf_int(d, tcx.nth);
+            buf_byte(d, b'\n');
+            return 1;
+        }
+        for j in 0..n {
+            if tcx.nth <= 0 || tcx.nth == j + 1 {
+                starts.push(at[j as usize]);
+                pairs.push(k);
+            }
+        }
+    }
+    // in the file's order; two that overlap are refused
+    for a in 1..starts.len() as i64 {
+        let mut i = a;
+        while i > 0 && starts[(i - 1) as usize] > starts[i as usize] {
+            let s = starts[i as usize];
+            starts[i as usize] = starts[(i - 1) as usize];
+            starts[(i - 1) as usize] = s;
+            let p = pairs[i as usize];
+            pairs[i as usize] = pairs[(i - 1) as usize];
+            pairs[(i - 1) as usize] = p;
+            i -= 1;
+        }
+    }
+    let after = buf_new();
+    let mut from: i64 = 0;
+    let mut added: i64 = 0;
+    let mut removed: i64 = 0;
+    for i in 0..starts.len() as i64 {
+        let s = starts[i as usize];
+        let old = buf_slice(tcx.olds[pairs[i as usize] as usize]);
+        let new = buf_slice(tcx.news[pairs[i as usize] as usize]);
+        if s < from {
+            let d = diag(c"error", c"patch.overlap", tcx);
+            buf_str(d, c"OLD ");
+            buf_int(d, pairs[i as usize] + 1);
+            buf_str(d, c" overlaps another OLD in ");
+            buf_str(d, path);
+            buf_str(d, c", line ");
+            buf_int(d, line_at(t, s));
+            buf_str(d, c"; nothing written\n");
+            return 1;
+        }
+        buf_bytes(after, &t[from as usize..s as usize]);
+        buf_bytes(after, new);
+        from = s + old.len() as i64;
+        added += lines_of(new);
+        removed += lines_of(old);
+    }
+    buf_bytes(after, &t[from as usize..]);
+    let out = buf_new();
+    buf_str(out, if tcx.dry_run { c"would patch " } else { c"patched " });
+    buf_str(out, path);
+    buf_byte(out, b'\t');
+    buf_str(out, path);
+    buf_str(out, c"\t+");
+    buf_int(out, added);
+    buf_str(out, c" -");
+    buf_int(out, removed);
+    buf_str(out, c" lines (a text file: not checked)\n");
+    if tcx.dry_run {
+        buf_write_fd(out, STDOUT);
+        return 0;
+    }
+    tcx.w_path.push(path as i64);
+    tcx.w_before.push(b);
+    tcx.w_after.push(after);
+    let summary = buf_new();
+    buf_str(summary, c"patched");
+    put_word(summary, c_slice(path));
+    if !write_edit(buf_slice(summary), c".", tcx, pcx) {
+        return 1;
+    }
+    buf_write_fd(out, STDOUT);
+    0
+}

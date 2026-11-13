@@ -9,9 +9,12 @@ section, `volec guide gpu#compute`, or `volec guide --find WORDS`).
 
 A shader is WGSL in an `embed wgsl` item: a block, `embed wgsl NAME {
 .. }`, or a file beside the source, `embed wgsl NAME from "x.wgsl";`.
-`volec query grep 'embed wgsl' --root DIR/main.vl` lists a program's,
-and `query grep TEXT --in x.wgsl` finds a line of one (a `.wgsl` file
-is a file of the program that embeds it).
+`volec query grep 'embed wgsl' --root DIR/main.vl` lists a program's.
+A `.wgsl` file is a file of the program that embeds it: `volec query
+show x.wgsl` prints it (a long one: `query text x.wgsl:A-B`), `query
+grep TEXT --in x.wgsl` finds a line, and `volec edit patch x.wgsl
+--old A --new B` changes it, checked: an edit that breaks the shader
+is refused with its error.
 
 ## Check after every shader edit
 
