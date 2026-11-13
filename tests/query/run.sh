@@ -315,10 +315,9 @@ check std_show_by_file "$ok" "$(printf '%s\n' "$out" | head -3)"
 out=$("$COMPILER" check --std-tree compiler/std 2>&1)
 rc=$?
 ok=0
-# (0.18.1: a clean check says so in one line; 0.25.3: but for one
-# unsafe.unjustified warning, the compiler's legacy unsafe, which
-# docs/unsafe-baseline.md counts)
-clean=$(printf '%s\n' "$out" | grep -v 'warning\[unsafe\.unjustified\]' | sed -e 's/^ok: 0 errors, 1 warning in /ok: 0 errors in /' -e 's/ ([0-9]* files, 0 shaders)$//')
+# (0.18.1: a clean check says so in one line; 0.29: with no warning: the
+# compiler's source has no unsafe site without its comments)
+clean=$(printf '%s\n' "$out" | sed -e 's/ ([0-9]* files, 0 shaders)$//')
 # (0.29: the line ends with what was read, ` (N files, 0 shaders)`)
 [ $rc -eq 0 ] && [ "$clean" = "ok: 0 errors in compiler/src/main.vl" ] && printf '%s\n' "$out" | grep -q '^ok: .* in compiler/src/main.vl ([0-9]* files, 0 shaders)$' && ok=1
 check std_tree_checks "$ok" "$out"

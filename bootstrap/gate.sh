@@ -74,7 +74,8 @@
 # without cargo);
 # unsafe-audit (tests/unsafe_audit.sh, 0.25.3: the unsafe sites of
 # compiler/src and std without // UNSAFE: and // SAFETY:, `volec query
-# unsafe`, no more than docs/unsafe-baseline.md counts; --quick too);
+# unsafe`; 0.29: none of them, and no unsafe block of compiler/src with
+# nothing unsafe inside, each one named; --quick too);
 # borrowck-twin (tools/borrowck-twin.sh, 0.27.1: every rust_b_ case's
 # verdict against rustc's, accept or reject, and its code; a divergence
 # only when the case names its class; skipped without rustc; --quick too);

@@ -107,16 +107,24 @@ pub fn report_warning(pos: i64, key: i64, kind: *mut u8, message: *mut u8, help:
     if pcx.allowed.len() as i64 > 0 && allowed(kind, pcx) {
         return;
     }
-    let mut i: i64 = 0;
-    while i < pcx.warnings.len() as i64 {
-        if (pcx.warnings[i as usize]) == pos
-            && (pcx.warnings[(i + 2) as usize]) == key {
+    // (0.29) `--deny=CODE`: an error, as any other
+    let listed = !pcx.deny_warnings && pcx.denied.len() as i64 > 0 && denied(&cstr(kind), pcx);
+    if listed {
+        if error_keyed(pos, key, pcx) || pcx.error_count >= pcx.max_errors {
             return;
         }
-        i += 3;
+    } else {
+        let mut i: i64 = 0;
+        while i < pcx.warnings.len() as i64 {
+            if (pcx.warnings[i as usize]) == pos
+                && (pcx.warnings[(i + 2) as usize]) == key {
+                return;
+            }
+            i += 3;
+        }
     }
     let out = buf_new();
-    buf_str(out, if pcx.deny_warnings { c"error[" } else { c"warning[" });
+    buf_str(out, if pcx.deny_warnings || listed { c"error[" } else { c"warning[" });
     buf_fmt(out,
         format_args("{}]: {}\n --> ", str::from_utf8(&cstr(kind)).unwrap(),
             str::from_utf8(&cstr(message)).unwrap()));
@@ -124,6 +132,12 @@ pub fn report_warning(pos: i64, key: i64, kind: *mut u8, message: *mut u8, help:
     buf_byte(out, b'\n');
     if help != 0 as *mut u8 {
         buf_fmt(out, format_args("  = help: {}\n", str::from_utf8(&cstr(help)).unwrap()));
+    }
+    if listed {
+        pcx.errors.push(pos);
+        pcx.errors.push(out);
+        pcx.error_count += 1;
+        return;
     }
     pcx.warnings.push(pos);
     pcx.warnings.push(out);
@@ -168,8 +182,9 @@ pub fn allow_option(arg: &str, pcx: &mut Ctx<Comp>) -> bool {
     for i in 0..list.len() + 1 {
         if i == list.len() || list[i] == b',' {
             if i > from {
-                pcx.allowed.push(list[from..i].ptr as i64);
-                pcx.allowed.push((i - from) as i64);
+                let b = buf_new();
+                buf_bytes(b, &list[from..i]);
+                pcx.allowed.push(b);
             }
             from = i + 1;
         }
@@ -177,31 +192,55 @@ pub fn allow_option(arg: &str, pcx: &mut Ctx<Comp>) -> bool {
     true
 }
 
-// Whether a warning of kind `kind` is allowed (`--allow`).
-fn allowed(kind: *mut u8, pcx: &Ctx<Comp>) -> bool {
-    // UNSAFE: the code is a C string the diagnostic's caller gives, and the
-    // allowed codes are pieces of the command line's words, kept as
-    // (pointer, length) pairs in an IntVec.
-    // SAFETY: kind is NUL-terminated (a literal); each allowed piece points
-    // into a word of the command line, which lives as long as the process,
-    // and its length is within the word.
-    unsafe {
-        let mut i: i64 = 0;
-        while i + 1 < pcx.allowed.len() as i64 {
-            let p = (pcx.allowed[i as usize]) as *mut u8;
-            let n = (pcx.allowed[(i + 1) as usize]);
-            let mut j: i64 = 0;
-            while j < n && (*kind.add(j as usize)) != 0
-                && (*kind.add(j as usize)) == (*p.add(j as usize)) {
-                j += 1;
-            }
-            if j == n && ((*kind.add(j as usize)) == 0 || (*kind.add(j as usize)) == b'.') {
-                return true;
-            }
-            i += 2;
-        }
-        false
+// (0.29) `--deny=CODE[,CODE...]`, rustc's `-D`, repeatable: a warning of
+// that code, or of that family (`--deny=unsafe`: every `unsafe.*`), is an
+// error, and `volec check` reports each one where it is (unsafe.unjustified
+// is else one line with a count past five sites; unsafe.unneeded is
+// reported only when denied). False when arg is not that option.
+pub fn deny_option(arg: &str, pcx: &mut Ctx<Comp>) -> bool {
+    if !arg.starts_with("--deny=") {
+        return false;
     }
+    let list = &arg.as_bytes()["--deny=".len()..];
+    let mut from: usize = 0;
+    for i in 0..list.len() + 1 {
+        if i == list.len() || list[i] == b',' {
+            if i > from {
+                let b = buf_new();
+                buf_bytes(b, &list[from..i]);
+                pcx.denied.push(b);
+            }
+            from = i + 1;
+        }
+    }
+    true
+}
+
+// Whether a warning of code `kind` is denied (`--deny`): its code or its
+// family is listed.
+pub fn denied(kind: &[u8], pcx: &Ctx<Comp>) -> bool {
+    listed(pcx.denied.as_slice(), kind)
+}
+
+// Whether the code `kind`, or its family (what is before its first `.`
+// or any later one), is one of `codes`, a buffer each (allow_option's,
+// deny_option's).
+fn listed(codes: &[i64], kind: &[u8]) -> bool {
+    for &b in codes {
+        let d = buf_copy(b);
+        let n = d.len();
+        if kind.len() >= n && &kind[0..n] == d.as_slice()
+            && (kind.len() == n || kind[n] == b'.') {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether a warning of code `kind` is allowed (`--allow`): its code or
+// its family is listed.
+fn allowed(kind: *mut u8, pcx: &Ctx<Comp>) -> bool {
+    listed(pcx.allowed.as_slice(), &cstr(kind))
 }
 
 // Whether an error of kind `key` at `pos` was reported; records it if not
@@ -256,6 +295,9 @@ pub fn report_error_once(pos: i64, key: i64, kind: *mut u8, message: *mut u8, he
 // `  = try:` line.
 pub fn report_error_tries(pos: i64, key: i64, kind: *mut u8, message: *mut u8, help: *mut u8,
     tries: &[u8], warning: bool, pcx: &mut Ctx<Comp>) {
+    // (0.29) `--deny=CODE`: an error, as any other
+    let warning = warning
+        && (pcx.deny_warnings || pcx.denied.len() as i64 == 0 || !denied(&cstr(kind), pcx));
     if warning {
         let mut i: i64 = 0;
         while i < pcx.warnings.len() as i64 {
@@ -1244,66 +1286,58 @@ pub fn file_line_col(file: i64, pos: i64, col: &mut i64, pcx: &mut Ctx<Comp>) ->
 // mark at or before p (the marks read on first use); 0 when the marks do
 // not fit the text (file_line_col counts then).
 fn std_line_col(start: i64, p: i64, col: &mut i64, pcx: &mut Ctx<Comp>) -> i64 {
-    // UNSAFE: the compiler's static variables (STD_MARKS, SRC) and C's
-    // memchr, as in file_line_col.
-    // SAFETY: the front end runs on one thread; marks are read below
-    // STD_MARKS.count; SRC is read below p (at most SRC_LEN, file_line_col)
-    // and at a mark's byte before, a mark at or before p - start.
-    unsafe {
-        if pcx.std_marks.len() as i64 == 0 {
-            let b = buf_new();
-            std_line_marks(b);
-            let s = buf_copy(b);
-            let mut n: i64 = 0;
-            let mut digits = false;
-            for i in 0..s.len() {
-                let c = s[i];
-                if c >= b'0' && c <= b'9' {
-                    n = n * 10 + (c - b'0') as i64;
-                    digits = true;
-                } else if digits {
-                    pcx.std_marks.push(n);
-                    n = 0;
-                    digits = false;
-                }
-            }
-            if digits {
+    if pcx.std_marks.len() as i64 == 0 {
+        let b = buf_new();
+        std_line_marks(b);
+        let s = buf_copy(b);
+        let mut n: i64 = 0;
+        let mut digits = false;
+        for i in 0..s.len() {
+            let c = s[i];
+            if c >= b'0' && c <= b'9' {
+                n = n * 10 + (c - b'0') as i64;
+                digits = true;
+            } else if digits {
                 pcx.std_marks.push(n);
-            }
-            buf_clear(b);
-        }
-        let marks = pcx.std_marks.data;
-        let mut lo: i64 = 0;
-        let mut hi = pcx.std_marks.len() as i64;
-        if hi == 0 {
-            return 0;
-        }
-        while hi - lo > 1 {
-            let mid = (lo + hi) / 2;
-            if (*marks.add(mid as usize)) <= p - start {
-                lo = mid;
-            } else {
-                hi = mid;
+                n = 0;
+                digits = false;
             }
         }
-        if lo > 0
-            && (*get_src().ptr.add((start + (*marks.add(lo as usize)) - 1) as usize)) != b'\n' {
-            return 0;
+        if digits {
+            pcx.std_marks.push(n);
         }
-        let mut line = lo * STD_MARK_LINES + 1;
-        let mut at = start + (*marks.add(lo as usize));
-        while at < p {
-            let found = memchr(get_src().ptr.add(at as usize), b'\n' as i32, (p - at) as u64);
-            if found == 0 as *mut u8 {
-                break;
-            }
-            at = at + (found as i64 - get_src().ptr.add(at as usize) as i64) + 1;
-            line += 1;
-        }
-        // (at: the start of p's line)
-        *col = p - at + 1;
-        line
+        buf_clear(b);
     }
+    let mut lo: i64 = 0;
+    let mut hi = pcx.std_marks.len() as i64;
+    if hi == 0 {
+        return 0;
+    }
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if pcx.std_marks[mid as usize] <= p - start {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo > 0
+        && get_src()[(start + pcx.std_marks[lo as usize] - 1) as usize] != b'\n' {
+        return 0;
+    }
+    let mut line = lo * STD_MARK_LINES + 1;
+    let mut at = start + pcx.std_marks[lo as usize];
+    while at < p {
+        let found = newline_in(at, p);
+        if found < 0 {
+            break;
+        }
+        at = found + 1;
+        line += 1;
+    }
+    // (at: the start of p's line)
+    *col = p - at + 1;
+    line
 }
 
 // `<file>: line <line>, column <column>` of position pos.

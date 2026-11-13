@@ -6153,7 +6153,19 @@ numbers with their ratios; added after 0.20's std made a hello world 5.5
 times dearer unnoticed: std's index made 660 KB of std core;
 `compiler/std/embed.sh --core` lists the core sections, each with the
 section and the name that pull it in, and `tests/std/core_sections.sh`,
-run by the suite, bounds their bytes); and the two containers: `linux-x86_64`
+run by the suite, bounds their bytes); `unsafe-audit` (0.25.3, in
+`--quick` too: `tests/unsafe_audit.sh`, the unsafe sites of compiler/src
+and of std as `volec query unsafe` lists them. From 0.29 the rule is
+none, not a count that may only fall: it fails on any site of either
+without `// UNSAFE:` and `// SAFETY:` right above it, and on any unsafe
+block of compiler/src with nothing unsafe inside, and names each one
+with its position, compiler/src's as `volec check --deny=unsafe` reports
+them, as errors; docs/unsafe-baseline.md records the counts by class,
+module and file, its three baseline lines 0. `tools/premerge.sh` runs
+the same script in its unsafe row, so a branch fails before the gate
+does. std's unneeded count is printed and not judged: `query unsafe`
+says `none (unneeded)` of a block in a generic function of std that the
+compiler never instantiates); and the two containers: `linux-x86_64`
 (`bootstrap/linux-check.sh`, which builds its own chain and so starts at
 once) and `linux-aarch64` (`bootstrap/aarch64-linux-check.sh --compiler`:
 the chain's compiler cross-compiles the tree; 0.25.2: the suite at -O0
