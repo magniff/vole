@@ -443,12 +443,151 @@ pub fn buf_bytes(b: i64, bytes: &[u8]) {
     }
 }
 
-// The bytes of buffer b.
+// ---- Reading and cutting a buffer from outside base (0.29) ----
+//
+// BUFS is touched only in this file. What the rest of the compiler needs
+// of a buffer, and what each form promises:
+//
+// - By value, nothing to outlive: buf_len, buf_at (a byte, checked
+//   against the length), buf_set (a byte below the length, checked),
+//   buf_truncate (a shorter length, checked), buf_zeros (n zero bytes
+//   appended). These read the table and the buffer at the call and keep
+//   nothing, so a growth of either before or after cannot be seen.
+// - A frozen buffer's bytes: buf_done, `&'static [u8]`, and that is true:
+//   a frozen buffer is never written, moved or freed (buf_freeze), and
+//   every writer stops the compiler at one (frozen_written).
+// - A growing buffer's bytes: buf_slice. Its `&'static` is NOT true and
+//   the type cannot say what is: a buffer is a number, so there is no
+//   owner whose borrow would end the view at the next write. The view is
+//   good until the next write to the same buffer (buf_reserve may move
+//   its block; buf_clear and a writer change the bytes); a growth of the
+//   table (buf_new) does not touch it, the table holds only the headers.
+//   The rule every caller keeps (docs/design/src-buffer.md, "Views of
+//   other storage"): a view is consumed before the next write to its
+//   buffer, or the buffer is frozen first (buf_done). What checks it:
+//   VOLE_STRESS_GROW=1 moves a buffer's block on every growth and
+//   poisons the old one (moved_block), so a view kept across a growth
+//   reads 0xAA and the suite's stress run fails. A buffer as a value
+//   with borrowed views (std's Buf) is the owners' redesign, not done
+//   here: about 1340 callers.
+// - The block's address: buf_ptr, a raw pointer for C (a path for
+//   fopen, bytes for write, room for read). It promises nothing; the
+//   unsafe is at the dereference or the C call, which says why the
+//   pointer is still the block's (no write to the buffer since).
+//
+// None of them checks b against BUF_COUNT: an id comes only from
+// buf_new, ids are never reused and buffers never freed, and BUF_COUNT
+// is the main thread's (get_buf_count), so a task could not read it.
+
+// The bytes of growing buffer b, until the next write to b (above: the
+// lifetime is the caller's to keep; buf_done's is checked).
 pub fn buf_slice(b: i64) -> &'static [u8] {
+    // UNSAFE: a slice over a buffer's block, which base keeps as a raw
+    // pointer and a length in BUFS
+    // SAFETY: b is an id buf_new returned, so its header is live; data
+    // holds len initialized bytes (every writer writes before it adds to
+    // len; buf_zeros fills). The slice does not point into the table, so
+    // buf_new's growth leaves it valid. It is valid until the next write
+    // to b, not for 'static: the caller consumes it before that write
+    // (the rule above, checked by the stress run), and no other thread
+    // writes b meanwhile (a buffer is one context's: get_bufs)
     unsafe {
         std::slice::from_raw_parts((*get_bufs().add(b as usize)).data.add((0) as usize),
             ((*get_bufs().add(b as usize)).len - (0)) as usize)
     }
+}
+
+// The number of bytes in buffer b.
+#[inline]
+pub fn buf_len(b: i64) -> i64 {
+    // UNSAFE: BUFS is base's raw table of buffers
+    // SAFETY: b is an id buf_new returned, so its header is live; the
+    // length is read by value, nothing is kept
+    unsafe { (*get_bufs().add(b as usize)).len }
+}
+
+// An index outside a buffer: an internal error, never an access.
+fn buf_bad_index() -> ! {
+    die(c"internal: a buffer index out of range")
+}
+
+// Byte i of buffer b.
+#[inline]
+pub fn buf_at(b: i64, i: i64) -> u8 {
+    // UNSAFE: BUFS is base's raw table of buffers
+    // SAFETY: b is an id buf_new returned; i is checked against the
+    // length (as u64: a negative i is out of range too), and data holds
+    // len initialized bytes; the byte is read by value
+    unsafe {
+        if i as u64 >= (*get_bufs().add(b as usize)).len as u64 {
+            buf_bad_index();
+        }
+        *(*get_bufs().add(b as usize)).data.add(i as usize)
+    }
+}
+
+// Byte i of buffer b becomes c (i below the length: buf_byte appends).
+pub fn buf_set(b: i64, i: i64, c: u8) {
+    // UNSAFE: BUFS is base's raw table of buffers
+    // SAFETY: b is an id buf_new returned; a frozen buffer stops here, so
+    // no view of one sees a byte change; i is checked against the length
+    unsafe {
+        if (*get_bufs().add(b as usize)).cap < 0 {
+            frozen_written(b);
+        }
+        if i as u64 >= (*get_bufs().add(b as usize)).len as u64 {
+            buf_bad_index();
+        }
+        *(*get_bufs().add(b as usize)).data.add(i as usize) = c;
+    }
+}
+
+// Buffer b cut to its first n bytes (n at most its length).
+pub fn buf_truncate(b: i64, n: i64) {
+    // UNSAFE: BUFS is base's raw table of buffers
+    // SAFETY: b is an id buf_new returned; a frozen buffer stops here, so
+    // no view of one sees its length change; n is checked against the
+    // length, so the length never covers bytes that were not written
+    unsafe {
+        if (*get_bufs().add(b as usize)).cap < 0 {
+            frozen_written(b);
+        }
+        if n as u64 > (*get_bufs().add(b as usize)).len as u64 {
+            buf_bad_index();
+        }
+        (*get_bufs().add(b as usize)).len = n;
+    }
+}
+
+// n zero bytes appended to buffer b: room to fill through buf_set or,
+// for C, through buf_ptr (fread, readlink), then cut to what was filled
+// (buf_truncate). Returns the offset of the first.
+pub fn buf_zeros(b: i64, n: i64) -> i64 {
+    if n < 0 {
+        buf_bad_index();
+    }
+    buf_reserve(b, n);
+    // UNSAFE: BUFS is base's raw table of buffers; memset is C
+    // SAFETY: b is an id buf_new returned; buf_reserve made room for n
+    // bytes after the length (and stopped at a frozen buffer), which
+    // memset fills before the length covers them
+    unsafe {
+        let at = (*get_bufs().add(b as usize)).len;
+        memset((*get_bufs().add(b as usize)).data.add(at as usize), 0, n as u64);
+        (*get_bufs().add(b as usize)).len = at + n;
+        at
+    }
+}
+
+// The address of buffer b's block, for C. A raw pointer: it promises
+// nothing, and the next write to b may move the block (buf_reserve), so
+// it is taken where it is used.
+#[inline]
+pub fn buf_ptr(b: i64) -> *mut u8 {
+    // UNSAFE: BUFS is base's raw table of buffers
+    // SAFETY: b is an id buf_new returned, so its header is live; the
+    // pointer is read by value and not dereferenced here
+    unsafe { (*get_bufs().add(b as usize)).data }
 }
 
 // (0.27.7) Freezes buffer b, written for the last time: its cap word is
