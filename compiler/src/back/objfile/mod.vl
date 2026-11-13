@@ -38,15 +38,15 @@ pub mod output;
 pub mod linkfail;
 mod link_macho;
 
-use crate::back::enc_arm64::init_a64;
-use crate::back::enc_x86::init_x86;
+use crate::back::enc_arm64::{AOp, aop_none, init_a64};
+use crate::back::enc_x86::{XOp, init_x86, xop_none};
 use crate::base::{
     alloc_array, alloc_zeroed, buf_byte, buf_clear, buf_fmt, buf_len, buf_new, buf_ptr, buf_slice,
     buf_w16, buf_w32, buf_write_file, cstr, die, free, memcpy, realloc, strlen,
 };
 
 use assemble::{Memo, assemble_begin, assemble_line};
-use debug::{compact_unwind, get_cfi_fns, get_rows, line_program};
+use debug::{compact_unwind, line_program};
 use elf::elf_write;
 use macho::macho_write;
 use resolve::{build_sections, layout, resolve_fixups};
@@ -128,6 +128,32 @@ pub struct Asm<A: std::alloc::Allocator> {
     pub memo_table: Vec<i64, A>,
     pub memo_text: Vec<u8, A>,
     pub memo_hash: u64,
+    // The encoders' (enc_arm64, enc_x86): the operands of the instruction
+    // being encoded, parsed; the mnemonics' codes and x86-64's registers
+    // by name.
+    pub a64: [AOp; 8],
+    pub x86: [XOp; 8],
+    pub mn: Names<A>,
+    pub xmn: Names<A>,
+    pub xregs: Names<A>,
+    // (-g, debug.vl) Call frame information: per function its start and
+    // end (fragment, offset) each; the directives seen in the open one.
+    pub cfi_fns: Vec<i64, A>,
+    pub cfi_ops: i64,
+    // (-g) The position a `.loc` gave for the next instruction; the line
+    // table's rows: (fragment, offset, file, line, column) each.
+    pub loc_pending: bool,
+    pub loc_file: i64,
+    pub loc_line: i64,
+    pub loc_col: i64,
+    pub rows: Vec<i64, A>,
+    // (-g) Per file number: its directory (an index in dirs + 1, 0 for
+    // none) and name, as the system assemblers split a path; a name is
+    // name_copy's, in dbg_names.
+    pub file_dir: Vec<i64, A>,
+    pub file_name: Vec<i64, A>,
+    pub dirs: Vec<i64, A>,
+    pub dbg_names: Vec<u8, A>,
 }
 
 pub fn asm_new() -> Asm<Comp> {
@@ -140,6 +166,11 @@ pub fn asm_new() -> Asm<Comp> {
         op_class: [0u8; 256], mapping: false, hooks: false, map_state: [0i64; 9],
         maps: Vec::new_in(Comp {}), memos: Vec::new_in(Comp {}), memo_table: Vec::new_in(Comp {}),
         memo_text: Vec::new_in(Comp {}), memo_hash: 0,
+        a64: [aop_none(); 8], x86: [xop_none(); 8], mn: names_new(), xmn: names_new(),
+        xregs: names_new(), cfi_fns: Vec::new_in(Comp {}), cfi_ops: 0, loc_pending: false,
+        loc_file: 0, loc_line: 0, loc_col: 0, rows: Vec::new_in(Comp {}),
+        file_dir: Vec::new_in(Comp {}), file_name: Vec::new_in(Comp {}),
+        dirs: Vec::new_in(Comp {}), dbg_names: Vec::new_in(Comp {}),
     }
 }
 
@@ -412,6 +443,70 @@ pub fn hash_bytes(b: &[u8]) -> u64 {
     h ^ (h >> 32)
 }
 
+// (0.29) A table from names to values (0: none) that owns its names:
+// the assembler's mnemonics and registers (Asm.mn, xmn, xregs). `bytes`:
+// the names, one after the other; a slot's name is `lens[slot]` bytes of
+// it from `offs[slot]`; `vals[slot]` 0: an empty slot (open addressing;
+// the slots' number a power of two, or 0 before the first name).
+pub struct Names<A: std::alloc::Allocator> {
+    bytes: Vec<u8, A>, offs: Vec<i64, A>, lens: Vec<i64, A>, vals: Vec<i64, A>, count: usize,
+}
+
+pub fn names_new() -> Names<Comp> {
+    Names {
+        bytes: Vec::new_in(Comp {}), offs: Vec::new_in(Comp {}), lens: Vec::new_in(Comp {}),
+        vals: Vec::new_in(Comp {}), count: 0,
+    }
+}
+
+// The slot of `name` in m (its own, or the empty one it would take); m
+// has slots.
+fn names_slot(m: &Names<Comp>, name: &[u8]) -> usize {
+    let mask = (m.vals.len() - 1) as u64;
+    let mut slot = (name_hash(name) & mask) as usize;
+    while m.vals[slot] != 0
+        && &m.bytes[m.offs[slot] as usize..(m.offs[slot] + m.lens[slot]) as usize] != name {
+        slot = (slot + 1) & mask as usize;
+    }
+    slot
+}
+
+pub fn names_put(m: &mut Names<Comp>, name: &[u8], value: i64) {
+    if (m.count + 1) * 2 > m.vals.len() {
+        // Twice the slots, the names put again.
+        let size: usize = if m.vals.len() == 0 { 256 } else { m.vals.len() * 2 };
+        let mut grown = Names {
+            bytes: Vec::new_in(Comp {}), offs: Vec::new_in(Comp {}), lens: Vec::new_in(Comp {}),
+            vals: Vec::new_in(Comp {}), count: 0,
+        };
+        grown.offs.resize(size, 0);
+        grown.lens.resize(size, 0);
+        grown.vals.resize(size, 0);
+        for i in 0..m.vals.len() {
+            if m.vals[i] != 0 {
+                names_put(&mut grown,
+                    &m.bytes[m.offs[i] as usize..(m.offs[i] + m.lens[i]) as usize], m.vals[i]);
+            }
+        }
+        *m = grown;
+    }
+    let slot = names_slot(m, name);
+    if m.vals[slot] == 0 {
+        m.offs[slot] = m.bytes.len() as i64;
+        m.lens[slot] = name.len() as i64;
+        m.bytes.extend_from_slice(name);
+        m.count += 1;
+    }
+    m.vals[slot] = value;
+}
+
+pub fn names_get(m: &Names<Comp>, name: &[u8]) -> i64 {
+    if m.vals.len() == 0 {
+        return 0;
+    }
+    m.vals[names_slot(m, name)]
+}
+
 // (0.18.1) A table from names to values (0: none): the assembler's own
 // (its mnemonics, registers), so that it reads no table the rest of the
 // compiler grows while it runs on a thread of its own. A name is its
@@ -643,10 +738,10 @@ pub fn write_object(cx: &mut FnCtx<Comp>, path: *mut u8, pcx: &mut Ctx<Comp>) {
     layout(asm);
     resolve_fixups(asm, pcx);
     build_sections(asm, pcx);
-    if get_rows().len() as i64 > 0 {
+    if asm.rows.len() as i64 > 0 {
         line_program(asm, pcx);
     }
-    if get_cfi_fns().len() as i64 > 0 {
+    if asm.cfi_fns.len() as i64 > 0 {
         compact_unwind(asm, pcx);
     }
     if get_elf() {
@@ -659,6 +754,8 @@ pub fn write_object(cx: &mut FnCtx<Comp>, path: *mut u8, pcx: &mut Ctx<Comp>) {
 
 // The assembler's state before the first line.
 fn assembler_begin(asm: &mut Asm<Comp>) {
+    // (a new object: nothing of an earlier one)
+    *asm = asm_new();
     asm.obj.reserve(65536);
     asm.mapping = get_elf() && !get_x86();
     asm.hooks = asm.mapping;
