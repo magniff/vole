@@ -24,7 +24,9 @@ alloc` writes it). Bytes become text checked: `std::str::from_utf8(b)`
 (a `Result<&str, _>`), `String::from_utf8(v)` (a `Vec<u8, A>`),
 `String::from_utf8_lossy_in(b, gpa)`; back: `s.as_bytes()`,
 `s.into_bytes()`. A byte slice has `starts_with` and `ends_with` too:
-`b"name.vl".ends_with(b".vl")`.
+`b"name.vl".ends_with(b".vl")`, and `find_byte(x)` (an `Option<usize>`:
+where the first byte `x` is, C's memchr; search bytes with it, not with
+a loop or `iter().position(..)`).
 
 ```vole
 fn initials(name: &str, gpa: Gpa) -> String<Gpa> {
@@ -44,12 +46,14 @@ fn main(gpa: Gpa) -> i32 {
     println("{up} {short} {} {}", 2026 - born, name.contains('l'));
     let parts: Vec<&str, Gpa> = "a,b,,c".split(',').collect_in(gpa);
     println("{parts:?} {}", parts.len());
+    println("{:?} {:?}", b"key=value".find_byte(b'='), b"key".find_byte(b'='));
     0
 }
 ```
 ```out
 ADA LOVELACE al 211 true
 ["a", "b", "", "c"] 4
+Some(3) None
 ```
 
 ## String constants
