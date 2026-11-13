@@ -16,6 +16,8 @@ struct Params {
     materials: array<Material, 4>,
     // fog.rgb is the medium's single-scattering albedo; fog.w the scene.
     fog: vec4<f32>,
+    // x: the display filter is on. Written for display.wgsl; unused here.
+    display: vec4<f32>,
 }
 struct Hit {
     t: f32,

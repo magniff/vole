@@ -35,7 +35,7 @@ the laboratory.
 | **Camera** | field of view, depth of field and aperture, focus distance, focus on the selected sphere, reset view |
 | **Atmosphere** | volumetric fog on/off, density, anisotropy, fog color, environment, light intensity and height, light color, global illumination |
 | **Material** | M1–M4 picker, base color, roughness, metallic, index of refraction, transmission, absorption tint and density, emission |
-| **Display** | debug view, comparison split, render size, frame time, mode |
+| **Display** | debug view, comparison split, denoiser, render size, frame time, mode |
 
 The footer has **PAUSE**, **CLEAR** (accumulation) and **RESET ALL** (the whole
 scene). Drag the title bar to move the panel, **HIDE** to collapse it to a
@@ -73,6 +73,7 @@ scene, with margins from the side walls, back wall and floor.
 | space | pause / resume accumulation |
 | `r` | reset accumulation |
 | `b` | split-screen one-sample / converged comparison |
+| `p` | toggle the display denoiser (raw / filtered) |
 | F1 / F2 | decrease / increase exposure without invalidating samples |
 | Backspace | restore the current scene's defaults |
 | Tab | hide / show the panel |
@@ -167,6 +168,18 @@ there are deliberately no fabricated BVH counters.
   relative standard error from those moments, not brightness. `b` compares the
   saved first sample with the current average. Adaptive sampling is not enabled;
   the estimate is diagnostic rather than an arbitrary stopping heuristic.
+- **Display denoiser:** `display.wgsl` filters the accumulation with a 5×5
+  joint bilateral pass before tone mapping. A tap counts only if it shares the
+  centre's material ID, normal (within 18°), depth (within 8%) and albedo
+  (within 0.12), so silhouettes, checker edges and wall corners keep their hard
+  edge; the range term `exp(-|L-L0| / max(0.30 L0, 0.008))` down-weights a tap
+  far brighter than its neighbours, which is what a lone firefly looks like.
+  `p` and the DISPLAY panel's toggle switch it, `--no-denoise` renders raw, and
+  it is off in every debug mode and in the comparison split. It reads the
+  accumulation and never writes it, so the sample count, the variance view, the
+  reset check and the estimator itself stay raw; at 2048 spp on the Fog hall it
+  drops the caustic band's error against a 16384-sample reference from 2.13 to
+  1.63 and the frame-wide error from 2.00 to 1.42 (255 levels, luminance).
 - **Volumetric fog:** free-flight distance sampling, Henyey–Greenstein phase
   sampling and next-event area lighting simulate a homogeneous participating
   medium with a per-channel scattering albedo. Multiple scattering is expensive
@@ -218,6 +231,8 @@ checks and optional PPM output:
 `--ui` draws the actual panel over the final frame through the window's own UI
 pipeline; `--ui-section N` opens a section and `--ui-scale S` sets physical
 pixels per UI point, so the HiDPI layout can be checked without a display.
+PPM output goes through the same display pass as the window, so it includes the
+denoiser unless `--no-denoise` asks for the raw accumulation.
 
 Checks cover non-empty changing output, decreasing local pixel noise for
 progressive scenes, and exact reproduction of sample one after reset. Diagnostic
