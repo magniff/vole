@@ -82,7 +82,7 @@ active && /^\}$/ {
     for (i = 1; i <= nf; i++) {
         cf = fields[i]; sub(/^r#/, "", cf)
         printf "    printf(\" %%zu\", offsetof(%s, %s));\n", rec_c, cf > cfile
-        printf "    c::printf(c\" %%zu\", (&(*p%d).%s) as u64 - 4096);\n", k, fields[i] > tfile
+        printf "    c::printf(c\" %%zu\", &raw const (*p%d).%s as usize as u64 - 4096);\n", k, fields[i] > tfile
         nfields++
     }
     print "    printf(\"\\n\");" > cfile
