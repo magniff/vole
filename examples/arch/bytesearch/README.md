@@ -64,7 +64,7 @@ $ volec query def find_byte_neon find_byte_sse2 find_byte
 crate::find_byte_neon	main.vl:32:4	fn	fn find_byte_neon(s: &[u8], b: u8, from: i64) -> i64	effects: panic diverge
 crate::find_byte_sse2	main.vl:58:4	fn	fn find_byte_sse2(s: &[u8], b: u8, from: i64) -> i64	effects: panic diverge	features: sse2 (inferred)
 crate::find_byte	main.vl:74:4	fn	fn find_byte(s: &[u8], b: u8) -> i64	effects: panic diverge
-std::str::find_byte	<std>:9271:4	fn	fn find_byte(b: &[u8], x: u8) -> Option<usize>	effects: panic
+[u8]::find_byte	<std>:6874:12	method	pub fn find_byte(&self, x: u8) -> Option<usize>	effects: unsafe
 ```
 
 ## Timings
