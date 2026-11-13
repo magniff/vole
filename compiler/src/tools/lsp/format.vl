@@ -9,8 +9,8 @@
 // does).
 
 use crate::base::{
-    IntVec, STDERR, _setjmp, alloc_array, alloc_zeroed, buf_byte, buf_bytes, buf_clear, buf_fmt,
-    buf_new, buf_slice, buf_str, load_sources,
+    STDERR, _setjmp, alloc_zeroed, buf_byte, buf_bytes, buf_clear, buf_fmt, buf_new, buf_slice,
+    buf_str, load_sources,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -19,12 +19,19 @@ use crate::base::json::buf_json_str;
 use crate::front::ast::init_ast;
 use crate::front::lexer::{init_lexer, lex_range};
 use crate::front::parser::parse_program;
-use crate::tools::ctx::Tcx;
+use crate::tools::ctx::{Tcx, cptrs};
 use crate::tools::fmt::{format_ranges, format_source, generated};
 use crate::tools::fmt::pieces::{bad_message, set_bad_message};
 use crate::tools::lsp::{now_us, write_all};
 use crate::tools::proc::{buf_cstr, write_file_if};
 
+// UNSAFE: POSIX's fork, pipe, read, waitpid, unlink, getpid and _exit:
+// formatting runs in a child, so that a text that does not parse cannot
+// end the server.
+// SAFETY: each declaration is the function's C prototype on the targets
+// vole builds for (64-bit macOS and Linux: int and pid_t are i32, size_t
+// u64, ssize_t i64; a mode_t is passed as an int, which both calling
+// conventions pass alike); what a call must hold is said at the call.
 extern "C" {
     fn fork() -> i32;
     fn pipe(fds: *mut i32) -> i32;
@@ -136,15 +143,23 @@ pub fn put_edits(out: i64, old: &[u8], new: &[u8], utf8: bool) {
 // Whether text parses as a file of a program (alone: the modules it
 // names are not read), the file at path holding it.
 fn parses(path: *mut u8, pcx: &mut Ctx<Comp>) -> bool {
+    // UNSAFE: the front end's fatal errors return through setjmp/longjmp (a
+    // C call) to the block pcx.err_bail names; load_sources takes the paths
+    // as a raw array.
+    // SAFETY: the jmp_buf is a new block of 512 bytes, more than a jmp_buf
+    // on the targets vole builds for; this runs in the formatter's child,
+    // which ends after it; done, the one local written after setjmp, is read
+    // as false on the path a jump takes (it is written last); paths is a
+    // list of one C string, alive for the call that copies it.
     unsafe {
         pcx.query = true;
         pcx.err_bail = alloc_zeroed(512);
         let mut done = false;
         if _setjmp(pcx.err_bail) == 0 {
             pcx.err_kind = c"tokenizer error";
-            let paths = alloc_array::<*mut u8>(1i64);
-            (*paths.add(0)) = path;
-            load_sources(paths, 1, pcx);
+            let mut paths = cptrs(1i64);
+            (paths[0]) = path;
+            load_sources(paths.as_mut_ptr(), 1, pcx);
             init_lexer(pcx);
             lex_range(pcx.files[0].start, pcx.files[0].end, false, pcx);
             lex_range(pcx.files[0].end, pcx.files[0].end, true, pcx);
@@ -160,8 +175,10 @@ fn parses(path: *mut u8, pcx: &mut Ctx<Comp>) -> bool {
 // The formatted text into out (`1` then the text), or why there is none
 // (`0` then the reason); ranges: byte offsets, in pairs (none: all).
 // fmt's own entry points: format_source (a whole text), format_ranges.
-fn format_in_child(text: &[u8], ranges: *mut IntVec, scratch: &[u8], out: i64, tcx: &mut Tcx<Comp>,
+fn format_in_child(text: &[u8], ranges: &[i64], scratch: &[u8], out: i64, tcx: &mut Tcx<Comp>,
     pcx: &mut Ctx<Comp>) {
+    // UNSAFE: getpid and unlink are C's.
+    // SAFETY: buf_cstr gives the scratch file's path as a C string.
     unsafe {
         if generated(text) {
             buf_str(out, c"0generated");
@@ -178,7 +195,7 @@ fn format_in_child(text: &[u8], ranges: *mut IntVec, scratch: &[u8], out: i64, t
             return;
         }
         set_bad_message(b"", tcx);
-        let whole = ranges == 0 as *mut IntVec || (*ranges).len() as i64 == 0;
+        let whole = ranges.len() == 0;
         let r = if whole { format_source(text, tcx, pcx) }
             else { format_ranges(text, ranges, tcx, pcx) };
         if r < 0 {
@@ -195,29 +212,36 @@ fn format_in_child(text: &[u8], ranges: *mut IntVec, scratch: &[u8], out: i64, t
 // The edits formatting text (ranges: byte offsets in pairs, none: the
 // whole text) into out, a JSON array; `[]` when nothing changes or it
 // cannot be formatted. scratch: a directory for the child's file.
-pub fn put_formatting(out: i64, text: &[u8], ranges: *mut IntVec, scratch: &[u8], utf8: bool,
+pub fn put_formatting(out: i64, text: &[u8], ranges: &[i64], scratch: &[u8], utf8: bool,
     tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) {
+    // UNSAFE: pipe, fork, close, read, waitpid and _exit are C's: the text
+    // is formatted in a child that writes the result to a pipe.
+    // SAFETY: fds is a local of two i32s that pipe fills; each end is closed
+    // once in the process that does not use it; the child ends with _exit;
+    // chunk is a new block of 65536 bytes, read writes at most 65536 into
+    // it, and from_raw_parts covers the n bytes it wrote (n > 0 there),
+    // copied before the next read; st is a local that waitpid writes.
     unsafe {
         let t0 = now_us(pcx);
-        let fds = alloc_array::<i32>(2i64);
-        if pipe(fds) != 0 {
+        let mut fds = [0 as i32, 0 as i32];
+        if pipe(&mut fds[0]) != 0 {
             buf_str(out, c"[]");
             return;
         }
         let pid = fork();
         if pid == 0 {
-            close((*fds.add(0)));
+            close((fds[0]));
             let r = buf_new();
             format_in_child(text, ranges, scratch, r, tcx, pcx);
-            write_all((*fds.add(1)), buf_slice(r));
+            write_all((fds[1]), buf_slice(r));
             _exit(0);
         }
-        close((*fds.add(1)));
+        close((fds[1]));
         let got = buf_new();
         if pid > 0 {
             let chunk = alloc_zeroed(65536);
             loop {
-                let n = read((*fds.add(0)), chunk, 65536);
+                let n = read((fds[0]), chunk, 65536);
                 if n <= 0 {
                     break;
                 }
@@ -227,7 +251,7 @@ pub fn put_formatting(out: i64, text: &[u8], ranges: *mut IntVec, scratch: &[u8]
             let mut st = 0 as i32;
             waitpid(pid, &mut st, 0);
         }
-        close((*fds.add(0)));
+        close((fds[0]));
         let r = buf_slice(got);
         if r.len() > 0 && r[0] == b'1' {
             put_edits(out, text, &r[1..r.len()], utf8);

@@ -4,14 +4,20 @@
 // whole and renamed into place, directories, absolute paths).
 
 use crate::base::{
-    IntVec, alloc_array, buf_byte, buf_bytes, buf_new, buf_reserve, buf_slice, buf_str,
-    buf_write_fd, cstr, fclose, fopen, fread, fwrite, get_bufs, getenv, strlen,
+    buf_byte, buf_bytes, buf_new, buf_reserve, buf_slice, buf_str, buf_write_fd, cstr, fclose,
+    fopen, fread, fwrite, get_bufs, getenv, strlen,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
-use crate::cli::line::c_word_at;
 use crate::tools::ctx::Tcx;
 
+// UNSAFE: POSIX's process, pipe, descriptor and file functions: the tools
+// run other programs with their output captured, and move, link and make
+// files and directories; std's process and fs do not cover these.
+// SAFETY: each declaration is the function's C prototype on the targets
+// vole builds for (64-bit macOS and Linux: int and pid_t are i32, size_t
+// u64, ssize_t i64; a mode_t is passed as an int, which both calling
+// conventions pass alike); what a call must hold is said at the call.
 extern "C" {
     fn fork() -> i32;
     fn execvp(file: *mut u8, argv: *mut *mut u8) -> i32;
@@ -40,18 +46,14 @@ extern "C" {
     fn signal(sig: i32, handler: *mut u8) -> *mut u8;
 }
 
-// words (C strings) as the array exec takes: their pointers, then a null.
-pub fn exec_words(words: IntVec) -> *mut *mut u8 {
-    let n = words.len() as i64;
-    let out = alloc_array::<*mut u8>(n + 1);
-    for k in 0..n {
-        let w = c_word_at(words, k);
-        // UNSAFE: exec's array is C's, a raw pointer to its elements.
-        // SAFETY: out has n + 1 elements (alloc_array, zeroed: the null
-        // after them), and 0 <= k < n.
-        unsafe { (*out.add(k as usize)) = w; }
+// words (C strings) as the list exec takes: their pointers, then a null.
+pub fn exec_words(words: &[i64]) -> Vec<*mut u8, Comp> {
+    let mut argv: Vec<*mut u8, Comp> = Vec::new_in(Comp {});
+    for &w in words {
+        argv.push(w as *mut u8);
     }
-    out
+    argv.push(0 as *mut u8);
+    argv
 }
 
 // The status of a process as waitpid gives it: its exit code, or 128 +
@@ -64,10 +66,18 @@ fn exit_code(status: i32) -> i64 {
 // Runs argv (argv[0] found as a shell finds it; argv ends with 0), its
 // stdout and stderr into buffer `out`; returns its exit status (127 when
 // it could not be run).
-pub fn run_capture(argv: *mut *mut u8, out: i64) -> i64 {
+pub fn run_capture(argv: &[*mut u8], out: i64) -> i64 {
+    // UNSAFE: pipe, fork, dup2, close, execvp, read and waitpid are C's: a
+    // child with its output on a pipe; the bytes are read into the buffer's
+    // own block (BUFS, base's raw table).
+    // SAFETY: fds is a local of two i32s that pipe fills; argv is a list of C
+    // strings ending with a null (exec_words, argv_of, cptrs), borrowed for
+    // the call; the child calls only dup2, close, execvp and _exit;
+    // buf_reserve made room for 65536 bytes past the buffer's len before each
+    // read, and len grows by what read returned; status is a local.
     unsafe {
-        let fds = alloc_array::<i32>(2i64);
-        if pipe(fds) != 0 {
+        let mut fds = [0 as i32, 0 as i32];
+        if pipe(&mut fds[0]) != 0 {
             return 127;
         }
         let pid = fork();
@@ -75,17 +85,17 @@ pub fn run_capture(argv: *mut *mut u8, out: i64) -> i64 {
             return 127;
         }
         if pid == 0 {
-            dup2((*fds.add(1)), 1);
-            dup2((*fds.add(1)), 2);
-            close((*fds.add(0)));
-            close((*fds.add(1)));
-            execvp((*argv.add(0)), argv);
+            dup2((fds[1]), 1);
+            dup2((fds[1]), 2);
+            close((fds[0]));
+            close((fds[1]));
+            execvp(argv[0], argv.as_ptr() as *mut *mut u8);
             _exit(127);
         }
-        close((*fds.add(1)));
+        close((fds[1]));
         loop {
             buf_reserve(out, 65536);
-            let got = read((*fds.add(0)),
+            let got = read((fds[0]),
                 (*get_bufs().add(out as usize)).data.add(
                     (*get_bufs().add(out as usize)).len as usize), 65536);
             if got <= 0 {
@@ -93,7 +103,7 @@ pub fn run_capture(argv: *mut *mut u8, out: i64) -> i64 {
             }
             (*get_bufs().add(out as usize)).len += got;
         }
-        close((*fds.add(0)));
+        close((fds[0]));
         let mut status = 0 as i32;
         waitpid(pid, &mut status, 0);
         exit_code(status)
@@ -102,7 +112,12 @@ pub fn run_capture(argv: *mut *mut u8, out: i64) -> i64 {
 
 // Starts argv with its stdout and stderr into file `path` (made anew);
 // returns its process id, or -1.
-pub fn spawn_to_file(argv: *mut *mut u8, path: *mut u8) -> i64 {
+pub fn spawn_to_file(argv: &[*mut u8], path: *mut u8) -> i64 {
+    // UNSAFE: fork, creat, dup2, close, execvp and _exit are C's: a child
+    // with its output on a file.
+    // SAFETY: path is a C string of the caller's; argv is a list of C strings
+    // ending with a null, borrowed for the call; the child calls only these
+    // functions before exec, and _exit ends it when exec fails.
     unsafe {
         let pid = fork();
         if pid < 0 {
@@ -115,7 +130,7 @@ pub fn spawn_to_file(argv: *mut *mut u8, path: *mut u8) -> i64 {
                 dup2(fd, 2);
                 close(fd);
             }
-            execvp((*argv.add(0)), argv);
+            execvp(argv[0], argv.as_ptr() as *mut *mut u8);
             _exit(127);
         }
         pid as i64
@@ -125,14 +140,18 @@ pub fn spawn_to_file(argv: *mut *mut u8, path: *mut u8) -> i64 {
 // Runs argv (argv[0] found as a shell finds it; argv ends with 0) with
 // this process's stdin, stdout and stderr: its exit status (127 when it
 // could not be run).
-pub fn run_inherit(argv: *mut *mut u8) -> i64 {
+pub fn run_inherit(argv: &[*mut u8]) -> i64 {
+    // UNSAFE: fork, execvp, _exit and waitpid are C's.
+    // SAFETY: argv is a list of C strings ending with a null, borrowed for the
+    // call; the child calls only execvp and _exit; status is a local that
+    // waitpid writes.
     unsafe {
         let pid = fork();
         if pid < 0 {
             return 127;
         }
         if pid == 0 {
-            execvp((*argv.add(0)), argv);
+            execvp(argv[0], argv.as_ptr() as *mut *mut u8);
             _exit(127);
         }
         let mut status = 0 as i32;
@@ -146,7 +165,7 @@ pub fn run_inherit(argv: *mut *mut u8) -> i64 {
 // stdout and stderr, volec ignoring ^C and ^\ (SIGINT, SIGQUIT) meanwhile,
 // which the program gets from the terminal as before. Its exit status, 128
 // + N when signal N ended it, 127 when it could not be run.
-pub fn run_foreground(argv: *mut *mut u8) -> i64 {
+pub fn run_foreground(argv: &[*mut u8]) -> i64 {
     // UNSAFE: fork, execvp, waitpid and signal are C's (POSIX): std::process
     // takes at most 32 arguments and cannot leave a signal to the child.
     // SAFETY: argv is exec_words' null-ended array of NUL-terminated
@@ -159,7 +178,7 @@ pub fn run_foreground(argv: *mut *mut u8) -> i64 {
             return 127;
         }
         if pid == 0 {
-            execvp((*argv.add(0)), argv);
+            execvp(argv[0], argv.as_ptr() as *mut *mut u8);
             _exit(127);
         }
         let int_was = signal(2, 1 as *mut u8);
@@ -173,7 +192,13 @@ pub fn run_foreground(argv: *mut *mut u8) -> i64 {
 }
 
 // run_inherit, with stdin the bytes of buffer b when b >= 0 (a pipe).
-pub fn run_with_stdin(argv: *mut *mut u8, b: i64) -> i64 {
+pub fn run_with_stdin(argv: &[*mut u8], b: i64) -> i64 {
+    // UNSAFE: pipe, fork, close, dup2, execvp, _exit and waitpid are C's: a
+    // child with its stdin on a pipe.
+    // SAFETY: fds is a local of two i32s that pipe fills; argv is a list of C
+    // strings ending with a null, borrowed for the call; the child calls only
+    // close, dup2, execvp and _exit; each end of the pipe is closed once;
+    // status is a local.
     unsafe {
         if b < 0 {
             return run_inherit(argv);
@@ -190,7 +215,7 @@ pub fn run_with_stdin(argv: *mut *mut u8, b: i64) -> i64 {
             close(fds[1]);
             dup2(fds[0], 0);
             close(fds[0]);
-            execvp((*argv.add(0)), argv);
+            execvp(argv[0], argv.as_ptr() as *mut *mut u8);
             _exit(127);
         }
         close(fds[0]);
@@ -205,17 +230,25 @@ pub fn run_with_stdin(argv: *mut *mut u8, b: i64) -> i64 {
 // Starts a copy of this process (fork): 0 in the copy, its process id in
 // the caller, -1 on failure.
 pub fn fork_worker() -> i64 {
+    // UNSAFE: fork is C's.
+    // SAFETY: it takes no argument; the copy goes on as this program and
+    // ends with worker_exit.
     unsafe { fork() as i64 }
 }
 
 // Ends a copy made by fork_worker.
 pub fn worker_exit(code: i64) -> ! {
+    // UNSAFE: _exit is C's: a forked copy ends without running the exit
+    // handlers it shares with its parent.
+    // SAFETY: it takes an int and does not return.
     unsafe { _exit(code as i32) }
 }
 
 // Waits for any child: its process id (-1: none left), its exit status in
 // *status.
 pub fn wait_any(status: &mut i64) -> i64 {
+    // UNSAFE: waitpid is C's.
+    // SAFETY: st is a local i32 that waitpid writes.
     unsafe {
         let mut st = 0 as i32;
         let pid = waitpid(-1, &mut st, 0);
@@ -226,6 +259,11 @@ pub fn wait_any(status: &mut i64) -> i64 {
 
 // Reads file `path` into buffer `out`; false when it cannot be read.
 pub fn read_file_if(path: *mut u8, out: i64) -> bool {
+    // UNSAFE: fopen, fread and fclose are C's, and the bytes are read into
+    // the buffer's own block (BUFS, base's raw table).
+    // SAFETY: path is a C string of the caller's; file is checked not null
+    // and closed once; buf_reserve made room for 65536 bytes past the
+    // buffer's len before each fread, and len grows by what fread returned.
     unsafe {
         let file = fopen(path, c"rb");
         if file == 0 as *mut u8 {
@@ -248,6 +286,10 @@ pub fn read_file_if(path: *mut u8, out: i64) -> bool {
 
 // Writes bytes to file `path` (made anew); false when it cannot.
 pub fn write_file_if(path: *mut u8, bytes: &[u8]) -> bool {
+    // UNSAFE: fopen, fwrite and fclose are C's.
+    // SAFETY: path is a C string of the caller's; file is checked not null
+    // and closed once; fwrite reads bytes.len() bytes from the slice's
+    // pointer, and is not called for an empty slice.
     unsafe {
         let file = fopen(path, c"wb");
         if file == 0 as *mut u8 {
@@ -279,6 +321,8 @@ pub fn rename_file(from: *mut u8, to: *mut u8) -> bool {
 // (0.21) Gives file `onto` (a copy written to replace `of`) the
 // executable bit of `of`, as git tracks it: 755 when `of` can be run.
 pub fn keep_mode(of: *mut u8, onto: *mut u8) {
+    // UNSAFE: access and chmod are C's.
+    // SAFETY: `of` and `onto` are C strings of the caller's.
     unsafe {
         if proc_access(of, 1) == 0 {
             chmod(onto, 493);
@@ -289,6 +333,11 @@ pub fn keep_mode(of: *mut u8, onto: *mut u8) {
 // (0.24) The target of symbolic link `path`, a new buffer; -1 when path
 // is no link.
 pub fn link_target(path: *mut u8) -> i64 {
+    // UNSAFE: readlink is C's, and writes into the buffer's own block (BUFS,
+    // base's raw table).
+    // SAFETY: path is a C string of the caller's; buf_reserve made room for
+    // 4096 bytes in the new buffer b, readlink writes at most 4096, and len
+    // is set to what it wrote (checked not negative).
     unsafe {
         let b = buf_new();
         buf_reserve(b, 4096);
@@ -303,19 +352,31 @@ pub fn link_target(path: *mut u8) -> i64 {
 
 // (0.24) Makes `path` a symbolic link to `target` (path must not exist).
 pub fn make_link(target: *mut u8, path: *mut u8) -> bool {
+    // UNSAFE: symlink is C's.
+    // SAFETY: target and path are C strings of the caller's.
     unsafe { symlink(target, path) == 0 }
 }
 
 pub fn remove_file(path: *mut u8) -> bool {
+    // UNSAFE: unlink is C's.
+    // SAFETY: path is a C string of the caller's.
     unsafe { unlink(path) == 0 }
 }
 
 pub fn remove_dir(path: *mut u8) -> bool {
+    // UNSAFE: rmdir is C's.
+    // SAFETY: path is a C string of the caller's.
     unsafe { rmdir(path) == 0 }
 }
 
 // Makes directory `path` and its parents (`mkdir -p`); whether it exists.
 pub fn make_dirs(path: *mut u8) -> bool {
+    // UNSAFE: strlen, mkdir and realpath are C's; path is a C string, read
+    // byte by byte, and mkdir is given the buffer's own block (BUFS).
+    // SAFETY: path is a C string of the caller's, read below its strlen; b
+    // ends with a 0 byte (buf_byte) each time its block is passed as a C
+    // string, and len is taken back by the one byte just written; realpath
+    // with a null buffer returns a new string or null, compared only.
     unsafe {
         let n = strlen(path) as i64;
         let b = buf_new();
@@ -340,6 +401,13 @@ pub fn make_dirs(path: *mut u8) -> bool {
 // The absolute path of `path`, which exists (its directory, when it does
 // not); the path itself when neither does.
 pub fn absolute_path(path: *mut u8) -> *mut u8 {
+    // UNSAFE: realpath and strlen are C's; path is a C string, read byte by
+    // byte and returned as one.
+    // SAFETY: path is a C string of the caller's, read below its strlen (i
+    // is -1 or the index of a '/' in it); from_raw_parts covers its first i
+    // bytes, i >= 0 there; dir and out end with a 0 byte before their blocks
+    // are used as C strings; out is not freed here, and its block is what
+    // is returned.
     unsafe {
         let r = realpath(path, 0 as *mut u8);
         if r != 0 as *mut u8 {
@@ -474,6 +542,11 @@ pub fn scratch_dir(anchor: *mut u8, kind: &[u8], pcx: &Ctx<Comp>) -> *mut u8 {
 // Reads all of stdin into `out`; false when stdin is a terminal (nothing
 // was piped in).
 pub fn read_stdin(out: i64, tcx: &mut Tcx<Comp>) -> bool {
+    // UNSAFE: isatty and read are C's, and the bytes are read into the
+    // buffer's own block (BUFS, base's raw table).
+    // SAFETY: buf_reserve made room for 65536 bytes past the buffer's len
+    // before each read, and len grows by what read returned (checked
+    // positive).
     unsafe {
         if isatty(0) != 0 {
             return false;
