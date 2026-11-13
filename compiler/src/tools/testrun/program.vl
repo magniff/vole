@@ -8,15 +8,16 @@
 // compiler's bug (the program has no undefined behaviour to blame). The
 // summary comes first, then one line per failure.
 
+use std::alloc::Allocator;
+
 use crate::base::{
-    IntVec, STDOUT, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
-    buf_write_fd, getenv, streq,
+    STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd, getenv, streq,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::target::{T_AARCH64_MACOS, T_X86_64_MACOS};
 use crate::front::cpp::directives::file_exists;
-use crate::tools::ctx::Tcx;
+use crate::tools::ctx::{Tcx, zeros};
 use crate::tools::proc::{buf_cstr, read_file_if, rename_file, write_file_if};
 use crate::tools::query::c_slice;
 use crate::tools::query::diagnostics::{diag, put_cword, try_begin, try_end};
@@ -26,6 +27,13 @@ use crate::tools::testrun::{
     selected, shown_path, starts, traced,
 };
 
+// UNSAFE: POSIX's process, descriptor and environment functions: each
+// test runs in a child with its output on files and a time limit; wait4
+// gives the time a child ran.
+// SAFETY: each declaration is the function's C prototype on the targets
+// vole builds for (64-bit macOS and Linux: int and pid_t are i32, size_t
+// u64, ssize_t i64; a mode_t is passed as an int, which both calling
+// conventions pass alike); what a call must hold is said at the call.
 extern "C" {
     fn fork() -> i32;
     fn execvp(file: *mut u8, argv: *mut *mut u8) -> i32;
@@ -54,32 +62,28 @@ const LEVEL_CASES: i64 = 20;
 // stderr into files; its exit status (128 + a signal, -1 past the time
 // limit); reruns: the times it was run again after its time limit passed
 // while it was waiting, not running (run_jobs).
-#[derive(Clone, Copy)] pub struct Job {
-    argv: *mut *mut u8, input: *mut u8, pub out: *mut u8, pub err: *mut u8, pid: i32,
+pub struct Job<A: Allocator> {
+    argv: Vec<*mut u8, A>, input: *mut u8, pub out: *mut u8, pub err: *mut u8, pid: i32,
     pub status: i64, reruns: i64,
 }
 
-pub fn add_job(argv: *mut *mut u8, input: *mut u8, out: *mut u8, err: *mut u8, tcx: &mut Tcx<Comp>) -> i64 {
-    unsafe {
-        if tcx.job_count == tcx.job_cap {
-            let cap: i64 = if tcx.job_cap == 0 { 64 } else { tcx.job_cap * 2 };
-            let bigger = alloc_array::<Job>(cap);
-            for i in 0..tcx.job_count {
-                (*bigger.add(i as usize)) = (*tcx.jobs.add(i as usize));
-            }
-            tcx.jobs = bigger;
-            tcx.job_cap = cap;
-        }
-        { let at_ix = tcx.job_count as usize;
-            (*tcx.jobs.add(at_ix)) = Job { argv, input, out, err, pid: 0, status: 0, reruns: 0 } };
-        tcx.job_count += 1;
-        tcx.job_count - 1
-    }
+pub fn add_job(argv: Vec<*mut u8, Comp>, input: *mut u8, out: *mut u8, err: *mut u8,
+    tcx: &mut Tcx<Comp>) -> i64 {
+    tcx.jobs.push(Job { argv, input, out, err, pid: 0, status: 0, reruns: 0 });
+    tcx.jobs.len() as i64 - 1
 }
 
 fn start_job(j: i64, tcx: &mut Tcx<Comp>) {
-    unsafe {
-        let job = (*tcx.jobs.add(j as usize));
+    // UNSAFE: fork, open, dup2, creat, alarm, execvp and _exit are C's: a
+    // child process with its stdin, stdout and stderr on files has no std
+    // function here.
+    // SAFETY: the job's paths are C strings (add_job's callers make them
+    // with buf_cstr or a literal); its argv is a list the job owns, of C
+    // strings and a null after the last (argv_of), alive for the call;
+    // the child only calls these async-signal-safe functions before exec,
+    // and _exit ends it when exec fails.
+    let pid = unsafe {
+        let job = &tcx.jobs[j as usize];
         let pid = fork();
         if pid == 0 {
             let fd = open(if job.input != 0 as *mut u8 { job.input } else { c"/dev/null" }, 0);
@@ -98,13 +102,14 @@ fn start_job(j: i64, tcx: &mut Tcx<Comp>) {
                 close(e);
             }
             alarm(tcx.testrun_timeout as u32);
-            execvp((*job.argv.add(0)), job.argv);
+            execvp(job.argv[0], job.argv.as_ptr() as *mut *mut u8);
             _exit(127);
         }
-        (*tcx.jobs.add(j as usize)).pid = pid;
-        if pid < 0 {
-            (*tcx.jobs.add(j as usize)).status = 127;
-        }
+        pid
+    };
+    tcx.jobs[j as usize].pid = pid;
+    if pid < 0 {
+        tcx.jobs[j as usize].status = 127;
     }
 }
 
@@ -120,14 +125,17 @@ pub fn run_jobs(from: i64, tcx: &mut Tcx<Comp>) {
         || host == T_X86_64_MACOS);
     // (struct rusage, 144 bytes on both: ru_utime and ru_stime first, each
     // a struct timeval of an i64 tv_sec and a tv_usec in the low 32 bits)
-    let usage = alloc_array::<i64>(18i64);
+    let mut usage = zeros(18i64);
+    // UNSAFE: wait4 is C's; no std function gives a child's resource usage.
+    // SAFETY: usage holds 18 i64s, the 144 bytes of struct rusage on macOS
+    // and Linux (64-bit), alive for the call; status is a local i32.
     unsafe {
         let mut next = from;
         let mut running: i64 = 0;
-        while next < tcx.job_count || running > 0 {
-            while next < tcx.job_count && running < most {
+        while next < tcx.jobs.len() as i64 || running > 0 {
+            while next < tcx.jobs.len() as i64 && running < most {
                 start_job(next, tcx);
-                if (*tcx.jobs.add(next as usize)).pid > 0 {
+                if (tcx.jobs[next as usize]).pid > 0 {
                     running += 1;
                 }
                 next += 1;
@@ -136,29 +144,26 @@ pub fn run_jobs(from: i64, tcx: &mut Tcx<Comp>) {
                 break;
             }
             let mut status = 0 as i32;
-            // UNSAFE: wait4 is C's; no std function gives a child's resource usage.
-            // SAFETY: usage holds 18 i64s, the 144 bytes of struct rusage on
-            // macOS and Linux (64-bit); status is a local i32.
-            let pid = wait4(-1, &mut status, 0, usage);
+            let pid = wait4(-1, &mut status, 0, usage.as_mut_ptr());
             if pid <= 0 {
                 break;
             }
             for j in from..next {
-                if (*tcx.jobs.add(j as usize)).pid == pid {
+                if (tcx.jobs[j as usize]).pid == pid {
                     let s = status as i64;
-                    (*tcx.jobs.add(j as usize)).status = if (s & 127) == 14 { -1 }
+                    (tcx.jobs[j as usize]).status = if (s & 127) == 14 { -1 }
                         else if (s & 127) == 0 { (s >> 8) & 255 } else { 128 + (s & 127) };
-                    (*tcx.jobs.add(j as usize)).pid = 0;
+                    (tcx.jobs[j as usize]).pid = 0;
                     running -= 1;
-                    let ran_us = ((*usage.add(0)) + (*usage.add(2))) * 1000000 + ((*usage.add(1))
+                    let ran_us = ((usage[0]) + (usage[2])) * 1000000 + ((usage[1])
                         & 0xffffffff) + (
-                            (*usage.add(3)) & 0xffffffff);
-                    if (*tcx.jobs.add(j as usize)).status == -1
-                        && (*tcx.jobs.add(j as usize)).reruns < 2
+                            (usage[3]) & 0xffffffff);
+                    if (tcx.jobs[j as usize]).status == -1
+                        && (tcx.jobs[j as usize]).reruns < 2
                         && ran_us * 2 < tcx.testrun_timeout * 1000000 {
-                        (*tcx.jobs.add(j as usize)).reruns += 1;
+                        (tcx.jobs[j as usize]).reruns += 1;
                         start_job(j, tcx);
-                        if (*tcx.jobs.add(j as usize)).pid > 0 {
+                        if (tcx.jobs[j as usize]).pid > 0 {
                             running += 1;
                         }
                     }
@@ -168,15 +173,14 @@ pub fn run_jobs(from: i64, tcx: &mut Tcx<Comp>) {
     }
 }
 
-pub fn argv_of(words: IntVec) -> *mut *mut u8 {
-    unsafe {
-        let argv = alloc_array::<*mut u8>(words.len() as i64 + 1);
-        for i in 0..words.len() as i64 {
-            (*argv.add(i as usize)) = (words[i as usize]) as *mut u8;
-        }
-        (*argv.add(words.len() as i64 as usize)) = 0 as *mut u8;
-        argv
+// words (C strings) as the list exec takes: their pointers, then a null.
+pub fn argv_of(words: &[i64]) -> Vec<*mut u8, Comp> {
+    let mut argv: Vec<*mut u8, Comp> = Vec::new_in(Comp {});
+    for &w in words {
+        argv.push(w as *mut u8);
     }
+    argv.push(0 as *mut u8);
+    argv
 }
 
 pub fn file_text(path: *mut u8) -> &'static [u8] {
@@ -238,12 +242,12 @@ fn failure_start(err: &[u8], last: bool) -> i64 {
 // (0.25.3) The program's own stdout of a job (a test's: not the runtime's
 // `vole-test:` lines) and its own stderr (a failed test's: before the
 // runtime's report, failure_start).
-fn own_stdout(kind: i64, job: Job) -> &'static [u8] {
+fn own_stdout(kind: i64, job: &Job<Comp>) -> &'static [u8] {
     let got = file_text(job.out);
     if kind == CASE { normal(got) } else { program_lines(got) }
 }
 
-fn own_stderr(kind: i64, job: Job) -> &'static [u8] {
+fn own_stderr(kind: i64, job: &Job<Comp>) -> &'static [u8] {
     let err = normal(file_text(job.err));
     if job.status == 0 || job.status == -1 {
         return err;
@@ -271,8 +275,8 @@ fn put_output(block: i64, label: &[u8], s: &[u8], path: *mut u8, tcx: &Tcx<Comp>
 // item at its first level (job a), and at the other (job b, when
 // two_levels) when it printed something else there, each block then named
 // with its level.
-fn put_shown_output(out: i64, kind: i64, name: &[u8], a: Job, b: Job, two_levels: bool, la: *mut u8,
-    lb: *mut u8, tcx: &Tcx<Comp>) {
+fn put_shown_output(out: i64, kind: i64, name: &[u8], a: &Job<Comp>, b: &Job<Comp>,
+    two_levels: bool, la: *mut u8, lb: *mut u8, tcx: &Tcx<Comp>) {
     let o = own_stdout(kind, a);
     let e = own_stderr(kind, a);
     let differs = two_levels && (own_stdout(kind, b) != o || own_stderr(kind, b) != e);
@@ -282,8 +286,8 @@ fn put_shown_output(out: i64, kind: i64, name: &[u8], a: Job, b: Job, two_levels
     }
 }
 
-fn put_output_block(out: i64, kind: i64, name: &[u8], level: *mut u8, job: Job, o: &[u8], e: &[u8],
-    tcx: &Tcx<Comp>) {
+fn put_output_block(out: i64, kind: i64, name: &[u8], level: *mut u8, job: &Job<Comp>, o: &[u8],
+    e: &[u8], tcx: &Tcx<Comp>) {
     buf_bytes(out, b"OUTPUT ");
     buf_bytes(out, name);
     if level != 0 as *mut u8 {
@@ -330,7 +334,7 @@ pub fn runtime_line<'a>(s: &'a [u8], word: &'a [u8], nth: i64) -> &'a [u8] {
 // Whether a source file under dir has a test: `#[test]`, `#[property]`,
 // `#[fuzz]` or `ensures`.
 fn has_tests(dir: *mut u8) -> bool {
-    let words = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+    let words: Vec<i64, Comp> = Vec::new_in(Comp {});
     let mut w = words;
     w.push(c"grep" as i64);
     w.push(c"-rlE" as i64);
@@ -339,7 +343,7 @@ fn has_tests(dir: *mut u8) -> bool {
     w.push(c"#\\[(test|property|fuzz)\\]|ensures" as i64);
     w.push(dir as i64);
     let out = buf_new();
-    crate::tools::proc::run_capture(argv_of(w), out);
+    crate::tools::proc::run_capture(argv_of(w.as_slice()).as_slice(), out);
     buf_slice(out).len() > 0
 }
 
@@ -373,6 +377,8 @@ pub fn install(built: *mut u8, prog: *mut u8, key_path: *mut u8, key: &[u8]) {
 // errors in out, when it does not build.
 pub fn build(root: *mut u8, src_dir: *mut u8, work: u8, prog: *mut u8, level: *mut u8, test: bool,
     out: i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>, coverage: bool) -> bool {
+    // UNSAFE: getenv is C's.
+    // SAFETY: the name is a literal; the result is only compared with null.
     unsafe {
         let key_file = buf_new();
         buf_str(key_file, prog);
@@ -402,7 +408,7 @@ pub fn build(root: *mut u8, src_dir: *mut u8, work: u8, prog: *mut u8, level: *m
         buf_str(built, prog);
         buf_bytes(built, b".build");
         let built_path = buf_cstr(built);
-        let words = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+        let words: Vec<i64, Comp> = Vec::new_in(Comp {});
         let mut w = words;
         w.push(pcx.prog as i64);
         w.push(root as i64);
@@ -424,7 +430,7 @@ pub fn build(root: *mut u8, src_dir: *mut u8, work: u8, prog: *mut u8, level: *m
             }
         }
         let log = buf_new();
-        let rc = crate::tools::proc::run_capture(argv_of(w), log);
+        let rc = crate::tools::proc::run_capture(argv_of(w.as_slice()).as_slice(), log);
         if rc != 0 {
             let l = buf_slice(log);
             let mut errors: i64 = 0;
@@ -471,14 +477,14 @@ pub fn build(root: *mut u8, src_dir: *mut u8, work: u8, prog: *mut u8, level: *m
 
 // The items of a test binary (`--vole-list`): kinds, names (buffers)
 // and positions (buffers).
-pub fn list_tests(tbin: *mut u8, kinds: &mut IntVec, names: &mut IntVec, positions: &mut IntVec,
-    tcx: &Tcx<Comp>) {
-    let words = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+pub fn list_tests(tbin: *mut u8, kinds: &mut Vec<i64, Comp>, names: &mut Vec<i64, Comp>,
+    positions: &mut Vec<i64, Comp>, tcx: &Tcx<Comp>) {
+    let words: Vec<i64, Comp> = Vec::new_in(Comp {});
     let mut w = words;
     w.push(tbin as i64);
     w.push(c"--vole-list" as i64);
     let out = buf_new();
-    crate::tools::proc::run_capture(argv_of(w), out);
+    crate::tools::proc::run_capture(argv_of(w.as_slice()).as_slice(), out);
     let s = buf_slice(out);
     let mut i: i64 = 0;
     while i < s.len() as i64 {
@@ -528,9 +534,9 @@ pub fn level_dir(work: *mut u8, level: *mut u8) -> *mut u8 {
 // A fuzz target's saved inputs, as `--replay FILE` words: tests/fuzz/NAME/
 // and the crashes `volec fuzz` saved (--accept copies those into
 // tests/fuzz/NAME/).
-fn put_replays(words: &mut IntVec, src_dir: *mut u8, tests: *mut u8, name: &[u8], tcx: &Tcx<Comp>,
-    pcx: &Ctx<Comp>) {
-    let mut crashes = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+fn put_replays(words: &mut Vec<i64, Comp>, src_dir: *mut u8, tests: *mut u8, name: &[u8],
+    tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) {
+    let mut crashes: Vec<i64, Comp> = Vec::new_in(Comp {});
     crate::tools::testrun::fuzz::files_in(crate::tools::testrun::fuzz::fuzz_dir(src_dir, name),
         b"crash-", &mut crashes, pcx);
     let b = buf_new();
@@ -549,7 +555,7 @@ fn put_replays(words: &mut IntVec, src_dir: *mut u8, tests: *mut u8, name: &[u8]
             write_file_if(join(kept, &s[base as usize..]), file_text(path));
         }
     }
-    let mut inputs = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+    let mut inputs: Vec<i64, Comp> = Vec::new_in(Comp {});
     crate::tools::testrun::fuzz::files_in(kept, b"", &mut inputs, pcx);
     for k in 0..crashes.len() as i64 {
         inputs.push((crashes[k as usize]));
@@ -567,7 +573,7 @@ fn put_replays(words: &mut IntVec, src_dir: *mut u8, tests: *mut u8, name: &[u8]
 pub fn run_all(root: *mut u8, src_dir: *mut u8, tests: *mut u8, shown: *mut u8, work: *mut u8,
     out: i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
     unsafe {
-        let levels = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+        let levels: Vec<i64, Comp> = Vec::new_in(Comp {});
         let mut lv = levels;
         if tcx.testrun_opt != 0 as *mut u8 {
             lv.push(tcx.testrun_opt as i64);
@@ -576,13 +582,13 @@ pub fn run_all(root: *mut u8, src_dir: *mut u8, tests: *mut u8, shown: *mut u8, 
             lv.push(c"-O2" as i64);
             lv.push(c"-O0" as i64);
         }
-        let mut cases = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+        let mut cases: Vec<i64, Comp> = Vec::new_in(Comp {});
         let listed = list_cases(tests, &mut cases, tcx);
         let with_tests = has_tests(src_dir);
         // the builds
-        let progs = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+        let progs: Vec<i64, Comp> = Vec::new_in(Comp {});
         let mut pv = progs;
-        let tbins = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+        let tbins: Vec<i64, Comp> = Vec::new_in(Comp {});
         let mut tv = tbins;
         for l in 0..lv.len() as i64 {
             let level = (lv[l as usize]) as *mut u8;
@@ -602,9 +608,9 @@ pub fn run_all(root: *mut u8, src_dir: *mut u8, tests: *mut u8, shown: *mut u8, 
             }
         }
         // the items: the cases, then the tests
-        let mut kinds = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut names = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut positions = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+        let mut kinds: Vec<i64, Comp> = Vec::new_in(Comp {});
+        let mut names: Vec<i64, Comp> = Vec::new_in(Comp {});
+        let mut positions: Vec<i64, Comp> = Vec::new_in(Comp {});
         for k in 0..cases.len() as i64 {
             kinds.push(CASE);
             names.push((cases[k as usize]));
@@ -634,15 +640,15 @@ pub fn run_all(root: *mut u8, src_dir: *mut u8, tests: *mut u8, shown: *mut u8, 
             return 0;
         }
         // the runs: each level's, all at once (one level after the other)
-        let first_job = tcx.job_count;
+        let first_job = tcx.jobs.len() as i64;
         let n = kinds.len() as i64;
         for l in 0..lv.len() as i64 {
             let level = (lv[l as usize]) as *mut u8;
             let dir = level_dir(work, level);
-            let from = tcx.job_count;
+            let from = tcx.jobs.len() as i64;
             for k in 0..n {
                 let name = buf_slice((names[k as usize]));
-                let w = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+                let w: Vec<i64, Comp> = Vec::new_in(Comp {});
                 let mut words = w;
                 let mut input = 0 as *mut u8;
                 if (kinds[k as usize]) == CASE {
@@ -682,19 +688,19 @@ pub fn run_all(root: *mut u8, src_dir: *mut u8, tests: *mut u8, shown: *mut u8, 
                     if (kinds[k as usize]) == CASE { b"case-" } else { b"test-" });
                 buf_bytes(base, name);
                 let b = buf_slice(base);
-                add_job(argv_of(words), input, case_file(dir, b, b".got"),
+                add_job(argv_of(words.as_slice()), input, case_file(dir, b, b".got"),
                     case_file(dir, b, b".err"), tcx);
             }
             run_jobs(from, tcx);
         }
         // the results
-        let mut blocks = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut failed = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+        let mut blocks: Vec<i64, Comp> = Vec::new_in(Comp {});
+        let mut failed: Vec<i64, Comp> = Vec::new_in(Comp {});
         let mut passed: i64 = 0;
         let mut diffs: i64 = 0;
         let mut new_snaps: i64 = 0;
         let mut counts = [0i64, 0, 0, 0, 0];
-        let mut passed_first = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+        let mut passed_first: Vec<i64, Comp> = Vec::new_in(Comp {});
         for k in 0..n {
             counts[(kinds[k as usize]) as usize] += 1;
             let main_job = first_job + k;
@@ -703,7 +709,7 @@ pub fn run_all(root: *mut u8, src_dir: *mut u8, tests: *mut u8, shown: *mut u8, 
                 buf_slice((names[k as usize])), main_job, tests, shown, root, tcx, pcx);
             passed_first.push(if ok { 1 } else { 0 });
             // the snapshots made new (at the first level)
-            let got = file_text((*tcx.jobs.add(main_job as usize)).out);
+            let got = file_text((tcx.jobs[main_job as usize]).out);
             let mut s: i64 = 0;
             while runtime_line(got, b"snapshot", s).len() > 0 {
                 if starts(runtime_line(got, b"snapshot", s), b"new ") {
@@ -776,7 +782,7 @@ pub fn run_all(root: *mut u8, src_dir: *mut u8, tests: *mut u8, shown: *mut u8, 
             buf_bytes(out, b" only)\n");
         }
         if blocks.len() as i64 > 0 {
-            put_failures(out, blocks, failed, tcx, pcx);
+            put_failures(out, blocks.as_slice(), failed.as_slice(), tcx, pcx);
         }
         // (0.25.3) --show-output: what each item printed (a failed one's
         // is under its failure)
@@ -787,7 +793,7 @@ pub fn run_all(root: *mut u8, src_dir: *mut u8, tests: *mut u8, shown: *mut u8, 
                     let other = if two { first_job + n + k } else { first_job + k };
                     put_shown_output(out, (kinds[k as usize]),
                         buf_slice((names[k as usize])),
-                        (*tcx.jobs.add((first_job + k) as usize)), (*tcx.jobs.add(other as usize)),
+                        &(tcx.jobs[(first_job + k) as usize]), &(tcx.jobs[other as usize]),
                         two, (lv[0]) as *mut u8,
                         if two { (lv[1]) as *mut u8 } else { 0 as *mut u8 }, tcx);
                 }
@@ -853,7 +859,7 @@ fn put_trace(block: i64, err: &[u8], tcx: &Tcx<Comp>) {
 fn judge(block: i64, kind: i64, name: &[u8], j: i64, tests: *mut u8, shown: *mut u8, root: *mut u8,
     tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
     unsafe {
-        let job = (*tcx.jobs.add(j as usize));
+        let job = &tcx.jobs[j as usize];
         let status = job.status;
         let got = file_text(job.out);
         let err = normal(file_text(job.err));
@@ -1038,12 +1044,12 @@ fn put_level_difference(block: i64, kind: i64, name: &[u8], a: i64, b: i64, la: 
     lb: *mut u8, root: *mut u8, tests: *mut u8, shown: *mut u8, tcx: &Tcx<Comp>,
     pcx: &Ctx<Comp>) -> bool {
     unsafe {
-        let ga = file_text((*tcx.jobs.add(a as usize)).out);
-        let gb = file_text((*tcx.jobs.add(b as usize)).out);
-        let ea = first_line(normal(file_text((*tcx.jobs.add(a as usize)).err)));
-        let eb = first_line(normal(file_text((*tcx.jobs.add(b as usize)).err)));
-        let sa = (*tcx.jobs.add(a as usize)).status;
-        let sb = (*tcx.jobs.add(b as usize)).status;
+        let ga = file_text((tcx.jobs[a as usize]).out);
+        let gb = file_text((tcx.jobs[b as usize]).out);
+        let ea = first_line(normal(file_text((tcx.jobs[a as usize]).err)));
+        let eb = first_line(normal(file_text((tcx.jobs[b as usize]).err)));
+        let sa = (tcx.jobs[a as usize]).status;
+        let sb = (tcx.jobs[b as usize]).status;
         if sa == -1 || sb == -1 {
             // (a time limit: the levels need not stop at the same place)
             return true;

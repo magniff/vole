@@ -20,9 +20,7 @@
 
 use std::alloc::Arena;
 
-use crate::base::{
-    IntVec, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, streq,
-};
+use crate::base::{buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, streq};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::cli::line::{Call, EV_OPTION, EV_WORD, Leaf, Line, option, word_of};
@@ -40,6 +38,12 @@ use crate::tools::query::command_line::load_program;
 use crate::tools::query::defs::bytes_eq;
 use crate::tools::query::diagnostics::{diag, program_errors, put_root, write_diags};
 
+// UNSAFE: POSIX's open, dup2 and close: a step's stdin is a file put on
+// descriptor 0 for the command run in this process.
+// SAFETY: each declaration is the function's C prototype on the targets
+// vole builds for (64-bit macOS and Linux: int and pid_t are i32, size_t
+// u64, ssize_t i64; a mode_t is passed as an int, which both calling
+// conventions pass alike); what a call must hold is said at the call.
 extern "C" {
     fn open(path: *mut u8, flags: i32) -> i32;
     fn dup2(from: i32, to: i32) -> i32;
@@ -69,7 +73,7 @@ fn usage(message: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
 // The words of a line, as sh splits them (`'...'`, `"..."` with `\"` and
 // `\\`; a word starting with `#` starts a comment), into `words` (C
 // strings). False when a quote is not closed.
-fn split_words(line: &[u8], words: *mut IntVec) -> bool {
+fn split_words(line: &[u8], words: &mut Vec<i64, Comp>) -> bool {
     unsafe {
         let mut i: i64 = 0;
         while i < line.len() as i64 {
@@ -173,8 +177,13 @@ fn remove_all_copies(tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) {
 
 // Runs step `words` (stdin from `input`, when not 0) in a copy of this
 // process: its exit status.
-fn run_step(words: *mut IntVec, input: *mut u8, root: *mut u8, report: *mut u8, gpa: Gpa,
+fn run_step(words: &[i64], input: *mut u8, root: *mut u8, report: *mut u8, gpa: Gpa,
     tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>, wgx: &mut WgslCx<Arena<Gpa>>) -> i64 {
+    // UNSAFE: open, dup2 and close are C's: the step's stdin is a file, in
+    // the forked copy that runs it.
+    // SAFETY: input is checked not null, a C string of the script's words;
+    // fd is checked before dup2 puts it on descriptor 0 and is closed once;
+    // this runs in the copy only (pid == 0), which ends in worker_exit.
     unsafe {
         let pid = fork_worker();
         if pid < 0 {
@@ -204,11 +213,11 @@ fn run_step(words: *mut IntVec, input: *mut u8, root: *mut u8, report: *mut u8, 
                 dup2(fd, 0);
                 close(fd);
             }
-            let n = (*words).len() as i64;
+            let n = words.len() as i64;
             let mut w: Vec<&str, Gpa> = Vec::new_in(gpa);
             w.push(word_of(pcx.prog));
             for i in 0..n {
-                w.push(word_of((*words).get(i) as *mut u8));
+                w.push(word_of(words[i as usize] as *mut u8));
             }
             w.push("--root");
             w.push(word_of(root));
@@ -285,16 +294,16 @@ fn script_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
             return 2;
         }
         // The steps: the words of each line, its stdin, its line number.
-        let mut steps = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut inputs = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut bodies = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut numbers = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+        let mut steps: Vec<Vec<i64, Comp>, Comp> = Vec::new_in(Comp {});
+        let mut inputs: Vec<i64, Comp> = Vec::new_in(Comp {});
+        let mut bodies: Vec<i64, Comp> = Vec::new_in(Comp {});
+        let mut numbers: Vec<i64, Comp> = Vec::new_in(Comp {});
         if !read_commands(buf_slice(text), file, c"refactor.script", &mut steps, &mut inputs,
             &mut bodies, &mut numbers, tcx) {
             return 2;
         }
         for k in 0..steps.len() as i64 {
-            let w = (steps[k as usize]) as *mut IntVec;
+            let w = &steps[k as usize];
             let first = ((*w)[0]) as *mut u8;
             if !is_tool(word_of(first))
                 || ((*w).len() as i64 > 1 && streq(first, c"refactor")
@@ -347,7 +356,7 @@ fn script_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
                 }
                 input = stdin_path;
             }
-            let status = run_step((steps[k as usize]) as *mut IntVec, input, root, report,
+            let status = run_step(steps[k as usize].as_slice(), input, root, report,
                 gpa, tcx, pcx, wgx);
             if (bodies[k as usize]) >= 0 {
                 remove_file(stdin_path);
@@ -363,7 +372,7 @@ fn script_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
                 buf_str(d, c": the command failed (exit ");
                 buf_int(d, status);
                 buf_str(d, c"):");
-                let w = (steps[k as usize]) as *mut IntVec;
+                let w = &steps[k as usize];
                 for x in 0..(*w).len() as i64 {
                     crate::tools::query::diagnostics::put_word(d,
                         c_slice(((*w)[x as usize]) as *mut u8));
@@ -426,12 +435,13 @@ fn line_error(file: *mut u8, line: i64, message: *mut u8, tcx: &mut Tcx<Comp>) -
 
 // The commands of text t (of FILE, for messages), one per line, as typed
 // after `volec` (0.15: refactor --script's and batch's): per command
-// its words (an IntVec of C strings, as split_words splits them), its
+// its words (a list of C strings, as split_words splits them), its
 // stdin (`< PATH`: the path; `<<WORD`: WORD), the text after `<<WORD` (a
 // buffer, else -1) and its line. False after the diagnostic (`code`:
 // refactor.script, batch.format).
-pub fn read_commands(t: &[u8], file: *mut u8, code: *mut u8, steps: &mut IntVec,
-    inputs: &mut IntVec, bodies: &mut IntVec, numbers: &mut IntVec, tcx: &mut Tcx<Comp>) -> bool {
+pub fn read_commands(t: &[u8], file: *mut u8, code: *mut u8, steps: &mut Vec<Vec<i64, Comp>, Comp>,
+    inputs: &mut Vec<i64, Comp>, bodies: &mut Vec<i64, Comp>, numbers: &mut Vec<i64, Comp>,
+    tcx: &mut Tcx<Comp>) -> bool {
     unsafe {
         let mut p: i64 = 0;
         let mut line_no: i64 = 0;
@@ -441,11 +451,10 @@ pub fn read_commands(t: &[u8], file: *mut u8, code: *mut u8, steps: &mut IntVec,
                 e += 1;
             }
             line_no += 1;
-            let words = alloc_array::<IntVec>(1i64);
-            (*words.add(0)) = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-            let ok = split_words(&t[p as usize..e as usize], words.add(0));
+            let mut words: Vec<i64, Comp> = Vec::new_in(Comp {});
+            let ok = split_words(&t[p as usize..e as usize], &mut words);
             p = e + 1;
-            let w = words.add(0) as *mut IntVec;
+            let w = &mut words;
             if !ok {
                 format_error(code, file, line_no, c"a quote is not closed", tcx);
                 return false;
@@ -463,10 +472,10 @@ pub fn read_commands(t: &[u8], file: *mut u8, code: *mut u8, steps: &mut IntVec,
             let mut word = 0 as *mut u8;
             if n >= 2 && streq(((*w)[(n - 2) as usize]) as *mut u8, c"<<") {
                 word = last;
-                (*w).truncate(n - 2);
+                (*w).truncate((n - 2) as usize);
             } else if (*last.add(0)) == b'<' && (*last.add(1)) == b'<' && (*last.add(2)) != 0 {
                 word = last.add(2);
-                (*w).truncate(n - 1);
+                (*w).truncate((n - 1) as usize);
             }
             if word != 0 as *mut u8 {
                 input = word;
@@ -506,18 +515,18 @@ pub fn read_commands(t: &[u8], file: *mut u8, code: *mut u8, steps: &mut IntVec,
                 }
             } else if n >= 2 && streq(((*w)[(n - 2) as usize]) as *mut u8, c"<") {
                 input = ((*w)[(n - 1) as usize]) as *mut u8;
-                (*w).truncate(n - 2);
+                (*w).truncate((n - 2) as usize);
             }
             else if ((*w)[(n - 1) as usize]) as *mut u8 != 0 as *mut u8
                 && (*(((*w)[(n - 1) as usize]) as *mut u8).add(0)) == b'<' {
                 input = (((*w)[(n - 1) as usize]) as *mut u8).add(1);
-                (*w).truncate(n - 1);
+                (*w).truncate((n - 1) as usize);
             }
             if (*w).len() as i64 == 0 {
                 format_error(code, file, cmd_line, c"stdin is given, but no command", tcx);
                 return false;
             }
-            steps.push(w as i64);
+            steps.push(words);
             inputs.push(input as i64);
             bodies.push(body);
             numbers.push(cmd_line);
