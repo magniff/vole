@@ -68,6 +68,12 @@ so they live in u32 lanes, the widening `umull`/`umlal` multiplies do the
 Montgomery reduction, and the modular add and subtract are u32 lanes
 again. That also halves the transform arrays' memory traffic. A scalar
 path remains for machines without NEON (`detect("neon")` chooses).
+Twiddles cost nothing per butterfly: one table of roots per prime and
+product is built once, every stage reads a stride through it (the last
+stage reads it directly, so the largest table is never even copied), and
+all three transforms of a product share it. The split's combine computes
+`P1 P2` with `P1 T2` and `Q1 Q2` with `T1 Q2`, so each of those pairs
+shares one operand's forward transform instead of transforming it twice.
 
 **Division and square root by Newton, with doubling precision.** The
 reciprocal of the divisor is computed by Newton's iteration at a
@@ -124,18 +130,18 @@ answer alone (the Machin cross-check is extra where it runs):
 |---|---|---|
 | 1000 | 0.6 ms | schoolbook products |
 | 10000 | 15 ms | Karatsuba and the first NTTs |
-| 100000 | 0.19 s | NTT products, three threads |
-| 1000000 | 1.5-2.1 s | the same, transform length 2^19 |
+| 100000 | 0.13-0.19 s | NTT products, three threads |
+| 1000000 | 1.0-1.5 s | the same, transform length 2^19 |
 
 (The million-digit figure is the spread over several runs while other
-work was on the machine; the best run was 1.42 s.)
+work was on the machine; the best run was 0.97 s.)
 
 The Machin cross-check adds 0.7 ms at 1000 digits and 72 ms at 10000;
 that is why it stops there. Every stage is linearithmic in the number of
 digits, so these grow at a little worse than linearly. Nothing in the
-computation uses floating point. Getting a million digits under a second
-from here means short products for the discarded halves of the Newton
-steps (a middle-product NTT) and reusing forward transforms between the
-products that share an operand in the split, not a different algorithm.
-Both were left out: the first is a large, delicate change, the second
-buys about a sixth of the split's transforms.
+computation uses floating point. The next step down is short products: the Newton steps
+discard half to two-thirds of the limbs of each product they compute,
+and a middle-product NTT would recover that. It is a much larger change
+than anything here, as is replacing the three primes with a floating
+point FFT, whose correctness would rest on rounding analysis rather than
+on exact modular arithmetic.
