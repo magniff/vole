@@ -2887,6 +2887,55 @@ unsafe-audit 2775 unjustified (baseline 2775, from 3057) and 0 in std,
 chain-diverse, chain-fresh 40 releases. compile-cost against v0.26.5: a
 hello world 1.00x, std 0.99x, check of the compiler 1.01x.
 
+### 0.29.0
+
+The release gate, macOS only. The gate schedules itself from this
+release (docs/releases.md, "What runs at once"), so it was run whole,
+`gate.sh --release --no-linux -j 4`, with nothing else building, not a
+step at a time as 0.28.0's was: its 37 steps, the heavy ones one at a
+time. TODO(gate: the number of runs; what each run stopped at and what
+was fixed; whether every row passed on its first run on the final tree;
+the wall time and the highest load, since this was the scheduler's
+first whole run). Against 0.28.0's rows: fuzz-sem is back (the semantic
+fuzzer, ported to the one language: four runs of 300 programs);
+std2-check and std2-tests are std-check and std-tests; mvs-census is
+gone with its tools (it was 0 and what it watched for is deleted);
+compile-cost has no hello-0.27 row, and its std row is skipped, since
+0.28.0 cannot build that program (it names `FixedState` from the
+prelude); unsafe-audit no longer compares with a baseline: it fails on
+any unjustified site of compiler/src or std and on any unneeded block
+of compiler/src. The rows: the suite TODO(gate: passed at -O0, -O1 and
+-O2, XFAIL, skipped; 0.28.0: 6273, 732 XFAIL, SKIPPED: no spirv-val),
+std-tests TODO(gate: passed at -O0 and -O2 under --check-alloc, XFAIL;
+0.28.0: 1541, 15 XFAIL), std-check TODO(gate: bodies, clean, with
+borrowck errors, not solved; 0.28.0: 3964 bodies, 3962 clean, 0, 2),
+threads TODO(gate; 0.28.0: 15808), incremental TODO(gate; 0.28.0: 172
+series), objcheck TODO(gate; 0.28.0: 12808, and 260 for x86_64-macos),
+layout TODO(gate; 0.28.0: 111 records and 582 fields; the floor is 100
+records), compiler-memcheck TODO(gate; 0.28.0: 727),
+examples-checkalloc TODO(gate; 0.28.0: 185), every fuzz and ABI row
+TODO(gate: all passed?), fuzz-sem TODO(gate: 4 runs of 300 programs,
+failures), voltty-fuzz TODO(gate; 0.28.0: 1821 scripts), stress-grow
+TODO(gate), cachediff TODO(gate; 0.28.0: 1373 lines, 422 from the
+cache), borrowck-twin TODO(gate; 0.28.0: 460 cases, 417 agree, 10 named
+divergences, 33 outside the subset, 0 mismatches), unsafe-audit
+TODO(gate: sites of compiler/src and of std, unjustified and unneeded
+0; 0.28.0: 2573 unjustified against a baseline of 2769, 0 in std; 316
+sites and 911 in std before the raw-pointer work merged), chain-fresh
+TODO(gate; 0.28.0: 50 releases from the seed), chain-diverse
+TODO(gate). compile-cost against v0.28.0: TODO(gate: hello, check and
+regions with their ratios; 0.28.0 against 0.27.8: 0.98x, 0.13x, 0.13x;
+std skipped). The bench row, run after the gate on the idle machine:
+TODO(gate: whether its iterator check still fails, iterchain against
+iterloop, limit 1.05; the geomean against `cc -O2` at -O2; 0.28.0: 2.37
+and 1.162). The self-build and the compiler's own check against
+0.28.0, each compiler on its own source: TODO(gate: both in
+instructions; 0.28.0: about 107 G and 21.2 G). Not run: any Linux row.
+For a bisect: three commits in the history of the release are a side
+branch's (an example's, merged with the release branch into it, so
+`git log --first-parent` leaves the release branch there for a few
+merges).
+
 ### 0.28.0
 
 The release gate, macOS only (the steps of `gate.sh --list --release

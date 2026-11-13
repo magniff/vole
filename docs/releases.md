@@ -88,8 +88,559 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.7 | `v0.27.7` | 0.27.6 | aarch64-macos | gate 3 is 0 (no type or borrowck error); SRC a view valid for the process, frozen buffers; the translator's last shapes; a copied/cloned iterator's items; two rust-edition wrong-value fixes (a let-bound literal shift typed i32) |
 | 0.27.8 | `v0.27.8` | 0.27.7 | aarch64-macos | open integer locals one variable (a wrong-value fix); a unit-only enum's derives by its discriminant (rustc's order and hash; one compare); three data races of released compilers fixed; `&mut` to raw pointer reborrowed, fat raw pointer coercions |
 | 0.28.0 | `v0.28.0` | 0.27.8 | aarch64-macos | one language: the MVS edition, the translator, the own pass and the old std removed (compiler/std2 is compiler/std); no default arguments; an index is a `usize`; a panic is only `panic`, `#[terminates]`, `Hash::hash` `#[pure]`, the tools name `static`; six bugs of 0.27.8 fixed (an endless loop compiled away, a `&mut` field written through `&self`); the tools' cache bounded |
+| 0.29.0 | `v0.29.0` | 0.28.0 | aarch64-macos | the safety release: the compiler's unsafe sites 3281 to 316, each justified, none unneeded, no `static mut` (its tables are `Vec`s, the global ones a compilation context's), and unjustified unsafe an error for its source (`check --deny=unsafe`); `*const T` and `*mut T` two types, a slice without fields; `~x` refused; a map's hasher written (`FixedState` in the prelude); if-let temporaries by Rust 2024's rule; a generic call's temporary dropped (a leak) and three checker holes closed; `--edition` and the std2 name gone; the inliner's room per caller, std's block copies; the gate schedules itself, fuzz-sem back; the self-build dearer than 0.28.0's |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.29.0
+
+The safety release: the compiler is made safer, and little is added to
+the language. The compiler's own source had 3281 unsafe sites at
+0.28.0, 2573 of them without a justification; it has 316, each with
+its `// UNSAFE:` and `// SAFETY:` comments, none with nothing unsafe
+inside, and no `static mut`. Its tables are `Vec`s, indexed and
+checked; the global ones belong to a compilation context. A site
+without its comments, or an unsafe block that needs none, is now an
+error for the compiler's source (the gate, the pre-merge check, `volec
+check --deny=unsafe`). What is left is C and system calls, the
+allocator, the thread boundary, the mapped cache file and the
+recovery points; two hand-rolled containers are still raw inside
+("Known regressions and limits"). The price is speed: the compiler
+builds itself with more instructions than 0.28.0 (TODO(gate: the
+final figure, self-build and check, each compiler on its own source,
+idle machine; 0.28.0: about 107 G and 21.2 G)); checked accesses were
+kept and the loss accepted rather than made up with unchecked ones. For
+a program: `*const T` and `*mut T` are two types and a slice has no
+fields; `~x` is refused; a map's hasher is written, as its allocator
+is (`FixedState`, in the prelude); an `if let`'s temporaries are
+dropped before its `else` (Rust 2024's rule); a generic call's
+temporary is owned and dropped (it leaked); a reference cast to an
+integer, `Copy` over a field that is not, and a name imported and
+defined are errors; `--edition` is an unknown option. The semantic
+fuzzer is back in the gate, and the gate schedules its own steps.
+Built and tested on aarch64-macos only; no Linux row ran.
+
+#### What changes for a program
+
+Each of these is refused or behaves differently where 0.28.0 accepted
+it. The error's code and its fix:
+
+- **`*const T` and `*mut T` are two types**, with Rust's rules (rule
+  F30.5; they were one type, the divergence FR4). A `*mut T` goes where
+  a `*const T` is wanted; the other way is "expected '*mut i64', got
+  '*const i64'" (a type error, rustc's E0308), whose help names the
+  cast and where the `*mut` is declared, and the cast is the exact fix
+  (`volec fix --suggested` writes `c as *mut i64`). A `&T` gives a
+  `*const T` only ("a `*mut T` takes an exclusive reference, `&mut x`;
+  a `&T` coerces to `*const T` only"); nothing is written through a
+  `*const T`: "cannot assign to '*c', which is behind a `*const`
+  pointer" (E0594), nor borrowed `&mut` (E0596). A `c"..."` literal is
+  a `*const u8`, `&raw const P` a `*const T`. std has `impl<T> *const
+  T` and `impl<T> *mut T` apart, with `cast_mut` and `cast_const`,
+  `write` on `*mut T` only. A C header's `const T *` imports as
+  `*const T`, and `--emit-header` writes one back. Messages, `query
+  type` and the hover print `*const T` and `*mut T`, never `*T`. An
+  extern declaration that takes a literal now says `*const u8` (250
+  files of the tests, examples and bench were changed for it). Three
+  gaps: "Known regressions and limits". *Cases:*
+  `rust_f_f30_ptr_const_ok`, `rust_f_f30_ptr_const_err`,
+  `rust_f_f30_ptr_const_write_err`, `rust_f_f30_ptr_shared_err`,
+  `ptr_const_cstr`, `cimport_const_ptr`, `cheader_const_ptr`, the
+  transcript tests/refactor/ptrconst029.
+- **A slice has no fields** (rule F30.4). `s.len` and `s.ptr`, vole's
+  own spellings until 0.28, are "a slice has no field 'len'", with the
+  help "call its method: '.len()'" ('.as_ptr()', '.as_mut_ptr()' for
+  `ptr`) and the exact fix. A `&str`'s too. *Cases:* `err_slice_field`,
+  `slice_methods_only`, tests/refactor/slicefield029.
+- **`~x` is refused**: `syntax.tilde`, "`~` is not an operator; an
+  integer's complement is `!x`", at each `~`, with the fix that writes
+  `!` (0.28.0 took `~x` for `!x`). *Cases:* `err_tilde`,
+  tests/refactor/tilde029.
+- **A map's hasher is written**, as its allocator is: `HashMap<K, V,
+  Gpa, FixedState>`, `HashSet<T, Gpa, FixedState>`. Left out it is
+  `hash.default`, "'HashMap' names no hasher: its 'S' is written,
+  last", and the fix writes `, FixedState` (in an item generic over
+  one `S: BuildHasher`, that `S`). `FixedState` is in the prelude, as
+  `Gpa`. The constructors are as before: `HashMap::new_in(gpa)` makes
+  a `FixedState` map, `with_hasher_in` any other. No struct of std has
+  a defaulted type parameter now; the 24 defaulted parameters of its
+  traits (`PartialEq<Rhs = Self>`, the operators, `Sum`, `Product`)
+  stay, as Rust's surface. *Cases:* `err_hash_default`,
+  `std_hash_hasher_written`, tests/refactor/hash0290.
+- **An `if let`'s temporaries are dropped before its `else`**, and at
+  the end of the matching block (Rust 2024's rule; 0.28.0 kept them to
+  the end of the whole `if let .. else`, Rust 2021's, while a block's
+  tail followed 2024). In `if let Some(n) = lock(c).peek() { .. } else
+  { .. }` the guard is gone in the else block; a program that printed
+  "else" and then the guard's drop prints them the other way round. A
+  `let .. else`'s are dropped before its else block too, and `let
+  Some(x) = &f() else { .. };` is accepted (it was refused). A matching
+  block's value that borrows a scrutinee temporary is
+  `borrowck.dropped_borrowed` (E0716). A `match` keeps its scrutinee's
+  to the end of its statement. *Cases:* `drop_temp_iflet_else`,
+  `_chain`, `_exits`, `drop_temp_let_else`, `drop_temp_while_let`,
+  `rust_b_iflet_else_temp_borrow`, `rust_b_err_iflet_temp_escapes`.
+- **A generic call's temporary is owned and dropped.** The result of
+  `dup<X: Clone>(x: &X) -> X`, lent (`obs(&dup(&t))`) or read
+  (`dup(&t).v`) without a `let`, was never dropped: a leak at every
+  level ("Bugs fixed"). The rule that caused it took such a result for
+  a bitwise copy of what the arguments keep, which is what `second<T>(p:
+  *const T) -> T` reads through a raw pointer. So generic code that
+  reads an owned value out of a raw pointer now has two owners, and
+  must `std::mem::forget` the second itself, as in Rust; no error says
+  so: the second drop is a double free. *Cases:*
+  `drop_temp_generic_result`, `_method`, `_assoc`, `_closure`, `_try`,
+  `_match`, `_iflet`; `familiar_vec_ptr_generic` is the forget.
+- **A reference casts to no integer**: `p as usize` with `p: &i64` is
+  `type.cast`, "cannot cast the reference '&i64' to the integer
+  'usize'" (rustc E0606); the help gives both meanings, the address
+  (`p as *const T as usize`) and the value (`*p`). 0.28.0 gave the
+  address without a word, so a loop over `v.iter()` that meant the
+  element summed addresses. *Case:* `err_cast_ref_to_int`.
+- **`Copy` only over `Copy` fields**: `#[derive(Clone, Copy)]` on a
+  type that holds a `Vec`, a `String` or a struct that is moved is
+  "the trait `Copy` cannot be implemented for type `S<Gpa>`: its field
+  'v' of type 'Vec<i64, Gpa>' is not Copy" (rustc E0204), at the
+  field; take `Copy` out of the derive. 0.28.0 accepted it, and a copy
+  was a second owner of the field's memory. *Case:*
+  `err_derive_copy_field`.
+- **A name imported and defined in one module is an error**: "the name
+  'max' is defined multiple times: this import, and the module's own
+  function or constant" (rustc E0255). The module's own was the one
+  its code reached and the import was dead, silently. Import under
+  another name, rename, or delete the import. *Case:*
+  `err_import_shadowed`.
+- **`[T]::fill` moves its value into the last element**, as Rust's: n-1
+  clones and a move, where 0.28.0 cloned n times and dropped the value.
+  A `Clone` that counts or changes what it copies shows it.
+- **`--edition` is gone.** In either form it is "unknown option
+  '--edition': there is one language (0.28.0) and no edition to choose;
+  leave the option out" (0.28.0 ignored `--edition rust`);
+  `VOLE_EDITION` is not read. The `edition.*` codes are named for what
+  they say: `edition.later` is `syntax.later`, `edition.lenient` is
+  `type.ref-value`; no alias is kept, so a script that matched the old
+  names must change. `edition.std_copy` and `edition.std_by_value`,
+  which only the old std raised, are gone with `conv.place`,
+  `conv.sink_type`, `conv.extern` and seven `sync.*` codes of the old
+  std's thread checks. `var`, `inout`, `sink` and `defer` are ordinary
+  names. *Cases:* `names_once_keywords`, tests/refactor/editiongone.
+- **std2 is std in every name**: `--std2-check` is `--std-check`, the
+  `VOLE_STD2_*` variables are `VOLE_STD_*`, the cases `std2_*` are
+  `std_*`.
+
+#### The compiler's safety
+
+The numbers are `volec query unsafe compiler/src --no-std --summary`:
+a site is an `unsafe { }` block, an `unsafe fn` or an `extern` block.
+
+| | sites | unjustified | unneeded | `static mut` |
+|---|---:|---:|---:|---:|
+| 0.28.0 | 3281 | 2573 | 150 | 151 |
+| 0.29.0 | 316 | 0 | 0 | 0 |
+
+(TODO(gate: the unsafe-audit row's counts on the final tree; 316 was
+counted before the raw-pointer work was merged; 0.28.0: 2573
+unjustified, baseline 2769).) By class, then and now: raw-pointer 2652
+and 82, ffi 325 and 205, other 163 and 18, alloc 141 and 11. By
+module now: the tools 140, base 102, the front end 30, the back end
+20, the middle end 18, the rest 6. The goal was under 400.
+
+- **The raw tables are `Vec`s.** The IR's instructions, blocks, slots
+  and argument tables; the function context's hundred lists and its 35
+  scratch tables; the front end's tokens, macros, nodes, symbols,
+  functions, enums and fields; the register allocator's intervals; the
+  assembler's tables; the debug tables, the output code and the Mach-O
+  linker; the tools' tables. Each was a block from `malloc` indexed
+  through a raw pointer with no check; each index is checked now. The
+  98 local lists of the middle end and their 95 hand-written frees
+  became `Vec`s that drop.
+- **No `static mut`.** The global tables (the IR's functions, the
+  thread pool, the rewrite rules, the code cache's tables, the string
+  table, the buffers, the debug tables) belong to the compilation
+  context, behind a `Mutex`, an `RwLock` or atomics where tasks share
+  them; the pool is an `Arc` behind std's `Mutex` and `Condvar`; the
+  assembler's state is a value, `Asm`. The 52 statics left have no
+  `mut`: tables of constants, and atomics.
+- **A growing buffer has no borrowed view.** `buf_slice` gave a
+  growing buffer's block as `&'static [u8]`, true only until the next
+  write. It is gone: a reader copies (`buf_copy`), freezes
+  (`buf_done`, whose `'static` is true) or asks base to do the
+  operation (docs/design/src-buffer.md). C strings are copied where
+  they were walked through a pointer.
+- **Unjustified unsafe is an error for the compiler's source.**
+  tests/unsafe_audit.sh, the gate's unsafe-audit row, failed when a
+  count rose above its baseline; the rule is none now: any site of
+  compiler/src or of std without both comments, and any unsafe block
+  of compiler/src with nothing unsafe inside, fails it, named with its
+  position. tools/premerge.sh's unsafe row runs the same script, so a
+  branch fails before the gate does. `volec check --deny=unsafe`
+  (`--deny=CODE`, as rustc's `-D`) reports each as an error where it
+  is: `unsafe.unjustified`, "unsafe block without `// UNSAFE:` and `//
+  SAFETY:` comments", and `unsafe.unneeded`, "unsafe block with nothing
+  unsafe inside"; a program checked without the option keeps the
+  warning. `volec query unsafe --unneeded` lists the second kind, and
+  `fix --only unneeded-unsafe` now takes away the blocks written over
+  several lines; a block it leaves gets a note that says why
+  (`fix.unneeded-left`).
+- **std**: 911 sites (TODO(gate: std's count on the final tree)), 0
+  unjustified, as at 0.28.0; std is held to the same rule for
+  justification. Its count rose with the block copies below.
+- **What stays unsafe, and why.** Calls of C and of the system (205
+  sites: files, processes, time, `mmap`, the LSP's and the test
+  runner's pipes); the allocator and the two containers built on it
+  in base (82 sites in base/mod.vl); the thread boundary (a task is
+  handed its context as a raw pointer at `run_task`, and the main and
+  runtime contexts are raw pointers); the code cache's file, mapped
+  and read through one view; the checker's recovery points
+  (`setjmp`); a few bytes of machine code and object data written in
+  place.
+- **Found on the way**: two functions of the checker grew a list by
+  writing its count (`restore_check_state`, `errors_forget`), which the
+  checked index stopped; the LSP's completion wrote through a view's
+  pointer; tests/threads_writes.sh counted four statics shared with
+  -O0's assembler thread, and counts none.
+
+Not done, said plainly: "Known regressions and limits" has the two
+containers that are still raw inside, the weak justifications, the
+audit's false count in std and a hole of the checker's own unsafe
+rule.
+
+#### std
+
+- **Copies, compares, searches and fills are blocks.**
+  `Vec::extend_from_slice` pushed one element at a time, a slice's
+  `==` compared one at a time, `resize` pushed every element (about 14
+  instructions each) and there was no fast byte search. For `Copy`
+  elements `extend_from_slice`, `extend_from_within`, `resize`,
+  `clone`, `String::push_str`, `[T]::copy_from_slice`, `copy_within`,
+  `clone_from_slice` and `fill` move a block (`memcpy`, `memmove`,
+  `memset`); `==` on slices of integers and of `bool` is one `memcmp`
+  (so `starts_with`, `ends_with`, `str`, `Vec` and arrays); floats and
+  types with their own `PartialEq` compare as before. Two functions
+  the compiler folds choose the path in one body, since vole has no
+  specialization: `std::mem::is_copy::<T>()` and
+  `is_bytewise_eq::<T, U>()` (private to std).
+- **New: `[u8]::find_byte`** (`memchr`); `[T]::contains` uses it for
+  one-byte elements, and `str`'s `lines`, `find`, `split` and the
+  other pattern searches for the needle's first byte,
+  `BufRead::read_until` for its delimiter. **`cast_mut` and
+  `cast_const`** on the raw pointers.
+- **Measured** (bench/std, instructions): `read_lines` runs in a
+  third (8.73 G to 2.88 G), `parse_int` 13% fewer, `fmt_int` fewer;
+  **`hash_str` about 5% more** (4.6%: keys of 1 to 4 bytes, where the
+  `memcmp` call in the table's probe costs more than the loop of a few
+  bytes it replaced; six variants were tried against it and none won).
+- **The hasher** of `HashMap` and `HashSet` is a written type
+  parameter and `FixedState` is in the prelude ("What changes for a
+  program").
+- A block copy is no `diverge`: the loops of `ptr::copy`,
+  `copy_nonoverlapping` and the fill are counted, so a function
+  declared `#[effects(alloc(Gpa), panic)]` that formats a `String`
+  still checks.
+- std's generated Objective-C bindings keep `*mut u8` where the
+  pointer is read only (their tables cannot say const); the five
+  callers cast.
+
+Not done in std, and promised for 0.29 by 0.28.0's notes: `static` in
+printing's effects, the `sync` lists and the exemption, the `diverge`
+of `chars()` loops ("Known regressions and limits").
+
+#### The optimizer
+
+The work here paid for a part of what the checked tables cost
+(docs/optimizer.md, the four "0.29" sections).
+
+- **Panic blocks are not size.** The inliner counted a bounds check's
+  report (`callc rt.panic`, `unreachable`) and its call, so a checked
+  accessor was 10 against the 5 of its unchecked form and no small
+  leaf. A block that ends in `unreachable`, and one all of whose
+  successors are such, is left out of a function's size and does not
+  end its being a leaf. *Cases:* `opt_inline_panic_blocks`,
+  `opt_inline_checked_leaf`, `opt_inline_checked_leaf_o1`.
+- **A test for zero in any spelling is one fact**: unsigned, `x > 0`,
+  `x >= 1` and `x != 0` are the same test to the ranges. `for x in s`
+  over a slice and `for x in &v` have no check left (a load, an add, a
+  decrement and a branch). The hand-written `while !r.is_empty() { ..
+  r[0] ..; r = &r[1..]; }` keeps its two. *Case:*
+  `opt_range_zero_tests`.
+- **Vec headers across calls.** After a call that took the context by
+  `&mut`, a Vec's pointer and length were read again and the index
+  checked again. Each function now has a summary of the Vec headers it
+  may write (`--print-attrs` prints it: `headers()`,
+  `headers(0@24..48)`), and value numbering and LICM keep a header
+  across a call whose summary does not reach it. What unsafe code must
+  keep for it is in `volec guide unsafe`: a Vec's buffer is its
+  allocator's block, never a static, a local or the struct that holds
+  the Vec. *Cases:* `opt_callfacts_keep`, `opt_callfacts_reload`.
+- **The inliner's room is each function's own.** The program had one
+  growth budget, half its size again, spent bottom-up by call-graph
+  level; on the compiler it ran out at level 10 of about 55, and 43%
+  of the decisions were refused for it. So whether a function got any
+  inlining depended on its depth, and an unrelated change moved the
+  numbers: a list made a `Vec` cost one pass 46%, 600 lines added
+  elsewhere moved `check` by 2%. Now a caller may grow by 40
+  instructions over its own size, small leaves (16) and a function's
+  only call (to 120) are not charged, and a decision depends on the
+  call, the callee and the caller alone. Measured on the release tree
+  at that point: **`check` 7.3% cheaper, the compiler's binary 5.5%
+  smaller, the self-build the same (+0.3%)**. **Five benchmarks are
+  slower by instructions**: interp 1.12, wordcount 1.11, fannkuch and
+  sort 1.06, json 1.04 (a small program never spent the old budget and
+  took in everything under the thresholds); two are faster, fmtloop
+  0.76 and fmtints 0.88; the geomean of 23 is 1.000. *Case:*
+  `opt_inline_room`.
+- **Tools for it**: `--time-passes=passes` prints the instructions
+  retired by each optimizer pass, every instruction in one row (its
+  counter is about 1800 instructions a reading, from about 30000);
+  `VOLE_INLINE_LOG=FILE` writes a line for each call the inliner
+  decides, with the rule that decided, and tools/inline-log-diff.py
+  compares two logs.
+- Measured and left out: a third Vec fact (a store to one Vec's
+  element makes the header of another Vec of the same struct be read
+  again; it cost more than it gave), one cold report block per
+  function rather than per site, the loop forms.
+
+#### Tools and first contact
+
+A first-contact trial gave a reader new to the tree a task in a GPU
+example (examples/gpu/pathtrace), with the tools and the guide alone.
+What it tripped over, and what changed:
+
+- **`check` says what it checked.** After editing a shader, `volec
+  check` at the tree's root answered `ok: 0 errors`: for the compiler,
+  not for the program that embeds the shader, and nothing said so. The
+  line ends with what was read: `ok: 0 errors in compiler/src/main.vl
+  (476 files, 0 shaders)`, the program's own files and the shaders it
+  embeds.
+- **`volec check --changed [--since REV]`** checks every program a
+  file changed since the branch's base belongs to (a `.vl` by the
+  main.vl that declares it, a shader or another file by the nearest
+  main.vl above it), each with its own `ok:` line, then `fmt --check`
+  of their changed files; with nothing to check it says so: `ok: no
+  program to check since ...`. It skips files under tests/ (about 70
+  fixtures fail a check on purpose and carry no marker).
+  tools/premerge.sh's check row is this command; the row passed on
+  "0 program(s)" when only a shader had changed.
+- **`volec guide gpu-workflow`**, under 900 tokens: where a shader
+  lives, that `check` validates it and how to tell it did, the build,
+  the headless run, sweeping a parameter without editing the shader.
+  The reader had not found that `check` validates shaders; the topic
+  it was pointed at, `guide gpu`, is 15k tokens. `guide --find shader`
+  leads to the short one first.
+- **`query show`, `query grep --in` and `edit patch` work on a shader
+  and on text.** `query show trace.wgsl` answered `no definition
+  'trace.wgsl'`; it prints the file. `edit patch x.wgsl --old A --new
+  B` patches the shader as a file of its program, and the edit is
+  checked: one that breaks the shader is refused at the shader's line.
+  A text file git tracks (a README) is patched as text, with no check;
+  one git does not track is `edit.not-tracked`. `query grep TEXT
+  README.md` took the file for a second pattern and answered `0 hits`;
+  it is `query.not-in-program` with the `try:` that searches it
+  (`--in README.md`). *Transcripts:* tests/query/textfile0290,
+  tests/refactor/textfile0290, tests/refactor/changed0290.
+- **The default program is the nearest one.** In an example's own
+  directory the tools meant the example; one directory below they
+  answered `no root`. The default program is the main.vl of the
+  nearest directory above the current one, inside the checkout, for
+  check, query, edit, refactor and fix alike.
+- pathtrace's `--headless` runs from one sample and one pixel (it
+  refused `--samples 1` and sizes under 8x8), the cheapest look at a
+  shader change; tests/affected.sh names untracked files and leaves
+  them out of the plan (two leftovers made one example's plan 3079 of
+  5270 cases); a change to an example's README plans the layout checks
+  only.
+
+Also: the tools' unsafe commands above (`check --deny`, `query unsafe
+--unneeded`, the fixer's new shapes); the LSP's keyword texts and
+completion no longer teach the removed edition's words.
+
+#### Bugs fixed that 0.28.0 has
+
+1. **A generic call's temporary leaked.** `obs(&dup(&t))` and
+   `dup(&t).v`, with `dup<X: Clone>(x: &X) -> X`, never dropped the
+   result: memory and a missing `Drop`, at every level, since 0.26.1.
+   The same for a trait method called through a bound, a generic
+   type's method that returns its parameter, a closure's result
+   returned by a generic function, and such a call as a `match` or `if
+   let` scrutinee. The fuzzer found it. *Cases:*
+   `drop_temp_generic_*`.
+2. **A reference cast to an integer gave its address**, with no word
+   (`p as usize`, `p: &i64`). An error now ("What changes").
+3. **`#[derive(Clone, Copy)]` was accepted over a field that owns**
+   (a `Vec`, a `String`): a copy was a second owner, a double free.
+   An error now. In the compiler itself it found a context over an
+   arena and the C importer's unions derived `Copy` wrongly.
+4. **A module's own function silently took an imported one's place**
+   when both had one name: the program built and called the wrong
+   one, and `check` said nothing. An error now.
+5. **`HashMap::<K, V, A, S>::new_in(a)` was "no associated function
+   'new_in'"**: a function of an impl for a partly written type
+   (`impl<K, V, A> HashMap<K, V, A, FixedState>`) was not found by the
+   type written whole.
+6. **A function type's array parameter was read as a reference**:
+   `fn([u8; 4], &[u8]) -> &[u8]` was `fn(&[u8; 4], ..)`, and no
+   function had that type (a rule of the old edition's parameter
+   conventions, left behind for function types and `Fn` bounds).
+   *Case:* `rust_fn_type_array_param`.
+7. **`let Some(x) = &f() else { .. };` was refused**, and a let-else's
+   temporaries were dropped after its else block, not before (rustc's
+   rule in every edition).
+8. **A list typed only by a comparison was refused**: an element
+   compared with a literal, with nothing else to type the list, was
+   "equality requires ..., got '_'"; the literal types the element.
+   *Cases:* `infer_vec_by_comparison`, `err_infer_vec_untyped`.
+
+#### Tests and tooling
+
+- **The gate schedules itself.** 0.28.0's `gate.sh --release -j 4`
+  started its 37 steps together; the load reached 114, a 26 GB machine
+  ran out of memory, and that release was gated by hand, a step at a
+  time. The heavy steps now run one at a time, the longest first, and
+  a step that is no runner holds slots of the pool; `gate.sh --plan`
+  prints the schedule and `--self-test` checks it on gates of stubbed
+  steps. `bootstrap/gate.sh --release --no-linux -j 4` is run whole
+  (docs/releases.md, "The gate": "What runs at once").
+- **fuzz-sem is back**: tools/semfuzz, the value-semantics fuzzer
+  (moves, clones, drops and leaks against a model), ported to the one
+  language; four runs of 300 programs in a release gate. Its model was
+  checked against rustc (edition 2024) on 1600 programs. It found the
+  leak above and the two temporaries' rules that disagreed; one
+  finding is kept as a divergence (a closure captures the whole
+  variable, not the place its body uses: rustc accepts what vole
+  refuses).
+- **Rows renamed or gone**: `std2-check` and `std2-tests` are
+  `std-check` and `std-tests` (tests/run's 1550 `std2_*` cases are
+  `std_*`); `mvs-census` is gone with its tools (it was 0 and what it
+  watched for is deleted); compile-cost's `hello-0.27` row is gone
+  (the previous release has no old edition), and its `std` row is
+  skipped in this release: 0.28.0 cannot build tests/cost/std_heavy.vl
+  (it names `FixedState` from the prelude).
+- **Guards**: the layout row has a floor of records (100 on macOS; 4
+  agreed of 111 once and it passed); tests/threads.sh fails once, with
+  the compiler's error, when its reference build fails;
+  bench/run.sh ends a failed run with one line that says why.
+- **The commit hook reads a merge for what the merge itself adds**
+  (0.28.0's release merge was refused for lines its branch had only
+  moved); the hook after a stop no longer reruns the examples' cases.
+- tests/run's `std_*` cases are all built with `--check-alloc`, the
+  47 older cases of that name too.
+- **Examples**: examples/algorithms/superpi, pi to any number of
+  decimal digits in one file (a million in about two seconds), with
+  two cases; examples/gpu/pathtrace accumulates to 4096 samples a
+  view, with multiple importance sampling and a filtered display.
+- docs/grammar.md says there is one language and has a short account
+  of the removed parameter conventions; some passages still describe
+  older releases.
+- The suite: TODO(gate: cases passed at each of -O0, -O1 and -O2, and
+  XFAIL; 0.28.0: 6273 passed, 732 xfail, 0 failed, 1 skipped). During
+  the release the last whole run had 6358 passed and 731 xfail.
+
+#### Known regressions and limits
+
+- **The compiler is slower at building itself than 0.28.0.** TODO(gate:
+  the self-build and `check` in instructions against 0.28.0, each
+  compiler on its own source, idle machine; 0.28.0: 107.0 G and 21.2
+  G). The figures taken during the release, on a shared machine and
+  on each tree's source of the day, put the self-build between 118 G
+  and 131 G: 10% to 22% more. The cause is the checked tables: an
+  index that is data (an operand read from an instruction) is a
+  compare and a branch whatever the optimizer knows. The goal was
+  "within a few percent"; it is not met for the self-build, and the
+  decision was to keep every check rather than win the time back with
+  unchecked accesses. The compile-cost `check` row was 0.92x of
+  0.28.0 after the inliner's change; later merges added a few percent
+  to it.
+- **The inliner's change made five benchmarks slower** (interp 12%,
+  wordcount 11%, fannkuch and sort 6%, json 4%, by instructions), and
+  a program that inlines much of std compiles dearer (the compile-cost
+  `std` program was 1.07x of 0.28.0 when last comparable).
+- **`bench/std/hash_str` is about 5% slower** (the block compare on
+  keys of 1 to 4 bytes).
+- **The bench row still fails its iterator check.** An iterator chain
+  is not zero cost: iterchain against iterloop was 1.72 by
+  instructions during the release (the limit is 1.05; 0.28.0: 2.37 by
+  time). TODO(gate: the bench row's ratio and geomean). std's text
+  functions were not made faster except where a block search or copy
+  did it (`lines`, `find`, `split`, `push_str`). 0.30.
+- **Two hand-rolled containers are still raw inside.** `IntVec` (172
+  references) and `HMap` (374) are `Copy` headers over raw
+  arrays: IntVec's indexing is checked against its count and the
+  unsafe of both is justified, but a copy of the header kept across a
+  growth or a rehash is stale and no type prevents it. Converting
+  them is tree-wide; it was left for 0.30. The tools hold a probe by
+  address, and the main and runtime function contexts are raw
+  pointers.
+- **About fifteen justifications are weak.** A review of the comments
+  found ones that cannot be checked from the code beside them (a
+  `'static` promised for a view in two places; "a C string of the
+  caller's" with nothing that says how long it lives, in seven) and a
+  few sites that std's `env` functions could make safe; fifteen more
+  repeat one sentence about base's buffer table. They pass the rule,
+  which asks for the comments, not for their truth.
+- **The audit calls 19 of std's blocks unneeded, falsely.** `query
+  unsafe` says `none (unneeded)` of a block in a generic function of
+  std that the program asked about never instantiates; those blocks
+  hold C calls and `ptr::write`. std's unneeded count is printed and
+  not judged, so a truly empty block of std would pass too.
+- **The checker accepts `&u.field` of a union outside unsafe** (a read
+  of a union's field needs `unsafe`; taking its address and reading
+  through the reference does not, and should). The audit also misreads
+  a second `unsafe { }` on one statement.
+- **Raw pointers, three gaps**: the fat raw pointers `*const [T]` and
+  `*mut [T]` are still one type; an `if` whose branches are a `*mut T`
+  and a `*const T` takes the first branch's type (rustc takes `*const
+  T` in both orders); std's generated Objective-C bindings keep `*mut
+  u8` for read-only pointers.
+- **Closures capture the whole variable**, not the place the body uses
+  (rustc 2021's disjoint captures): a program rustc accepts can be
+  refused.
+- **Carried from 0.28.0, not done** though its notes said 0.29:
+  - `usize` indexing's holes: an index that is the value of a `match`
+    is still widened (`a[match x { _ => k_u8 }]` passes), and `a[r]`
+    with `r: &usize` is read through;
+  - printing is still `io static panic` (std still reads errno), and
+    std is still exempt from the `tls`, `thread`, `sync` check;
+  - loops over `s.chars()` and its kin are still `diverge` in a
+    declared list;
+  - first contact: a closure parameter `|&&x|` is not parsed;
+    `std::cmp::Reverse(x)` "is a type, not a value"; `volec guide
+    --find Reverse` does not find it; the nested `impl Trait` message
+    still says "it comes in 0.29", which is not true.
+- **Old spellings in about fifteen messages** (`static var`, `inout
+  self` and the like), "rust edition" in some 350 comment lines of the
+  compiler, and `--syntax=0.20`, accepted and ignored.
+- **`volec check --changed` skips tests/**, and every edit of a source
+  is a miss of the tools' cache (one whole front end): an incremental
+  front end is 0.30's.
+- **Not tested on Linux in this release.** Hosts: aarch64-macos. The
+  pool and the assembler thread now wait on std's `Mutex` and
+  `Condvar`; that was run on macOS only.
+
+#### Numbers
+
+- Unsafe sites in compiler/src: 3281 to 316; unjustified 2573 to 0;
+  unneeded 150 to 0; `static mut` 151 to 0. std: 911 sites, 0
+  unjustified. TODO(gate: the unsafe-audit row on the final tree).
+- The self-build and the compiler's own check, instructions, against
+  0.28.0: TODO(gate: both figures; 0.28.0's check, 21,199.8 M, is the
+  baseline this release was held to).
+- Compile cost against v0.28.0, in instructions: TODO(gate: the rows
+  hello, check and regions with their ratios; 0.28.0 against 0.27.8:
+  hello 172.5 M (0.98x), check 21,199.8 M (0.13x), regions 1203.7 M
+  (0.13x)). The `std` row is skipped (0.28.0 cannot build its
+  program); `hello-0.27` is gone.
+- The compiler's binary: TODO(gate: bytes; 0.28.0: 11,904,376).
+- bench (`gate.sh --only bench`, idle machine, time against `cc -O2` =
+  1, geomean): TODO(gate: -O2, -O1, -O0 and the iterator check;
+  0.28.0: 1.162, 2.282, 13.375, iterchain 2.37 times iterloop).
+- The suite: TODO(gate: passed at -O0, -O1, -O2 and XFAIL; 0.28.0:
+  6273 and 732).
+- `git diff --shortstat v0.28.0 v0.29.0`: TODO(gate: files,
+  insertions, deletions; 0.28.0's against 0.27.8: 8057 files, 237,534
+  insertions, 1,672,151 deletions). compiler/src: 473 files and
+  264,948 lines in 0.28.0; TODO(gate: files and lines at the tag).
+- Found by the gate and fixed before the tag: TODO(gate: what the
+  gate found, or "nothing").
 
 ### What's new in 0.28.0
 
