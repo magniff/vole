@@ -6108,8 +6108,9 @@ once, `suite-O0`, `suite-O1`, `suite-O2`; `fuzz-plain`, `fuzz-loops`,
 `fuzz-vector`, `fuzz-div`, `fuzz-range`, `fuzz-arch` (0.19: the
 intrinsics, `tests/fuzz/run.sh -A`), `fuzz-guard` (0.25: guarded
 accesses far out of bounds and calls of 2^62 steps under conditions
-that never hold, in loops, `-G`) and `fuzz-seed` (the seed as a third
-oracle); `abi-plain`, `abi-import`, `abi-header`; `objcheck`;
+that never hold, in loops, `-G`), `fuzz-seed` (the seed as a third
+oracle) and `fuzz-sem` (0.25, not in 0.28, in the one language from
+0.29: `tools/semfuzz/semfuzz.py`, ownership against a model); `abi-plain`, `abi-import`, `abi-header`; `objcheck`;
 `layout` (`tests/cimport/layout.sh` on the system headers); `debug`
 (`tests/debug.sh`); `stress-grow` (0.14, not in `--quick`: the compiler
 run with `VOLE_STRESS_GROW=1`, under which every growth of its tables,
@@ -6327,6 +6328,7 @@ Nothing else is trusted: no binary built before, no cache.
 | `compiler-memcheck` | the same set on macOS, two ways. With the compiler built `--check-alloc`, a use after free or double free of Gpa memory stops it. Under Guard Malloc, the same for the memory it takes from malloc itself. The objects must be the plain compiler's | every gate but `--quick` |
 | `stress-grow` | with every table growth moving and poisoning the old block, the self-compile is the same and the suite passes | every gate but `--quick` |
 | `fuzz-seed` | random programs give the same output from the seed, the oracle written in Rust, as from HEAD | every gate |
+| `fuzz-sem` | random programs over owned values (moves, borrows, drops and their order, temporaries, `?`, closures) print what `tools/semfuzz/semfuzz.py`'s model of the ownership rules says, drop every value once and leak nothing, at -O0, -O1 and -O2 with `--check-alloc`; four runs: plain, `--assign-calls`, `--try-args`, `--closure-params`. The model and the generator are themselves checked against rustc with `--rustc` (not in the gate). What it found and is not fixed: `tools/semfuzz/findings/` | every gate |
 
 **chain-fresh's record.** A release adds its line when it is tagged, with
 `bootstrap/chain-fresh.sh --record`. The first record (0.25) was written
