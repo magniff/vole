@@ -66,13 +66,6 @@ front::lexer::STRS	add_const_data: only on const_data'"'"'s serial branch (task_
 front::lexer::STR_COUNT	the same
 gen0::target::STR_ALIGN	the same
 front::lexer::STR_CAP	the same
-base::CWD	-g (dbg_loc'"'"'s paths, out_path)
-base::OUT_PATHS	-g
-base::ROOT_DIR	-g
-base::ROOT_LEX	-g
-base::ROOT_LEX_ABS	-g
-tools::query::checks::REMOVED	query checks (--print-checks), which runs on one thread
-base::timer::T_TOTALS	--time-passes, which runs on one thread (timer_add writes only then)
 base::BUFS	a task writes its context'"'"'s buffers'"'"' entries; none is made in a task (buf_new: below)
 base::BUF_CAP	buf_new, below
 base::BUF_COUNT	buf_new: the printers of --stats, --print-regalloc, --print-after-all, --verify-* (one thread), and internal errors, which exit
@@ -82,8 +75,7 @@ base::diag::ERR_POISONED	the IR printers (one thread)'
 JOINED='base::BUFS	the join writes the program'"'"'s buffers'"'"' entries, a task its context'"'"'s
 base::BUF_COUNT	asm_error, which exits
 base::BUF_CAP	asm_error, which exits
-base::STRESS_GROW	read by prepare_tasks (stress_grow)
-base::timer::T_TOTALS	--time-passes, which runs on one thread'
+base::STRESS_GROW	read by prepare_tasks (stress_grow)'
 
 # The assembler thread's and -O0's main thread's: static <TAB> why
 ASSEMBLER='base::BUFS	asm_error (an internal error, which exits) and dwarf_file (-g, which does not stream: no thread)
@@ -165,12 +157,10 @@ base::ctx::Ctx.x86_alloc_acd	key: options_hash
 base::BUFS	own: the context'"'"'s buffers
 base::BUF_CAP	own: buf_new on internal errors and printers
 base::BUF_COUNT	own: the same
-base::CWD	off: -g (out_path)
+base::ctx::Ctx.cwd	off: -g (out_path: the current directory, made when first asked; an atomic)
 base::ctx::Ctx.files	off: -g (dbg_loc, out_path)
-base::OUT_PATHS	off: -g
-base::ROOT_DIR	off: -g
-base::ROOT_LEX	off: -g
-base::ROOT_LEX_ABS	off: -g
+base::ctx::Ctx.out_paths	off: -g (out_path; atomics, one a file)
+base::ctx::Ctx.root_dir	off: -g (root_dir; an atomic)
 base::SRC	off: -g
 base::STDOUT_CAPTURE	own: messages
 base::STRESS_GROW	key: options_hash (stress_grow)
@@ -183,7 +173,7 @@ base::ctx::Ctx.apple_a64	key: options_hash
 base::target::ELF	key: options_hash
 base::target::X86	key: options_hash
 base::ctx::Ctx.time_passes	off: --time-passes
-base::timer::T_TOTALS	off: --time-passes
+base::ctx::Ctx.t_totals	off: --time-passes (atomics, one a phase)
 base::ctx::Ctx.nodes	IR: a closure'"'"'s mark (fn_canon), a distinct type'"'"'s name (types_hash); -g
 base::ctx::Ctx.locals	own: a task makes variables above LOCAL_COUNT (ssa::new_synth_var), never reads a local'"'"'s (locals.len(): the same)
 base::ctx::Ctx.any_distinct	key: options_hash
@@ -281,7 +271,7 @@ base::ctx::Ctx.slp	key: options_hash
 base::ctx::Ctx.vectorize	key: options_hash
 base::ctx::Ctx.unroll_runtime	key: options_hash
 base::ctx::Ctx.print_checks	off: --print-checks
-tools::query::checks::REMOVED	off: --print-checks'
+base::ctx::Ctx.checks_removed	off: --print-checks (behind its lock)'
 
 cd "$ROOT" || exit 1
 WORK="$ROOT/target/threads"
