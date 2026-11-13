@@ -16,21 +16,27 @@
 //   volec try --file snippet.vl      (`-`: from stdin)
 
 use crate::base::{
-    IntVec, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd,
-    get_bufs, intern, strlen,
+    STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd, get_bufs,
+    intern, strlen,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::cli::line::{Call, EV_WORD, Leaf, flag, is_flag, is_missing, is_opt, option, table};
 use crate::front::modules::lookup::is_prelude_name;
 use crate::front::stdsrc_rust::std2_source;
-use crate::tools::ctx::Tcx;
+use crate::tools::ctx::{Tcx, cptrs};
 use crate::tools::proc::{
     buf_cstr, make_dirs, read_file_if, read_stdin, remove_dir, remove_file, run_capture,
     write_file_if,
 };
 use crate::tools::query::diagnostics::{diag, put_word, try_begin, try_end, write_diags};
 
+// UNSAFE: POSIX's getenv, getpid, mkdir, kill and chmod: the snippets'
+// scratch directories and their slots, held by live processes.
+// SAFETY: each declaration is the function's C prototype on the targets
+// vole builds for (64-bit macOS and Linux: int and pid_t are i32, size_t
+// u64, ssize_t i64; a mode_t is passed as an int, which both calling
+// conventions pass alike); what a call must hold is said at the call.
 extern "C" {
     fn getenv(name: *mut u8) -> *mut u8;
     fn getpid() -> i32;
@@ -46,6 +52,11 @@ fn mark() -> &'static [u8] {
 }
 
 fn c_slice(s: *mut u8) -> &'static [u8] {
+    // UNSAFE: strlen is C's, and a C string is seen as a slice.
+    // SAFETY: s must be a C string that is never freed or written again
+    // (literals, the command line's words, blocks of buffers that are not
+    // freed); the slice covers the bytes before its 0. The 'static is that
+    // promise of the caller's, not checked.
     unsafe { std::slice::from_raw_parts(s.add((0) as usize), (strlen(s) as i64 - (0)) as usize) }
 }
 
@@ -166,7 +177,7 @@ fn skip_blank(s: &[u8], i0: i64) -> i64 {
 
 // The snippet's leading items, as (start, end) pairs into items; the
 // start of its statements.
-fn split_items(s: &[u8], items: &mut IntVec) -> i64 {
+fn split_items(s: &[u8], items: &mut Vec<i64, Comp>) -> i64 {
     let mut i = skip_blank(s, 0);
     while i < s.len() as i64 && item_at(s, i) {
         let e = item_end(s, i);
@@ -180,7 +191,7 @@ fn split_items(s: &[u8], items: &mut IntVec) -> i64 {
 // ---- Imports ----
 
 // The names std's source defines at its top level, `pub`.
-fn std_names(out: &mut IntVec, pcx: &mut Ctx<Comp>) {
+fn std_names(out: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
     let b = buf_new();
     std2_source(b);
     let s = buf_slice(b);
@@ -218,7 +229,7 @@ fn std_names(out: &mut IntVec, pcx: &mut Ctx<Comp>) {
     }
 }
 
-fn has(v: IntVec, x: i64) -> bool {
+fn has(v: &[i64], x: i64) -> bool {
     for i in 0..v.len() as i64 {
         if (v[i as usize]) == x {
             return true;
@@ -229,11 +240,11 @@ fn has(v: IntVec, x: i64) -> bool {
 
 // `use std::{...};` for the std names the snippet uses (not after `.` or
 // `::`), but the prelude's, those it defines and those it imports.
-fn std_imports(s: &[u8], items: IntVec, out: i64, pcx: &mut Ctx<Comp>) {
-    let mut std = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+fn std_imports(s: &[u8], items: &[i64], out: i64, pcx: &mut Ctx<Comp>) {
+    let mut std: Vec<i64, Comp> = Vec::new_in(Comp {});
     std_names(&mut std, pcx);
     // (what the snippet's items define or import)
-    let mut own = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+    let mut own: Vec<i64, Comp> = Vec::new_in(Comp {});
     let mut k: i64 = 0;
     while k < items.len() as i64 {
         let t = &s[
@@ -267,7 +278,7 @@ fn std_imports(s: &[u8], items: IntVec, out: i64, pcx: &mut Ctx<Comp>) {
         }
         k += 2;
     }
-    let mut names = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+    let mut names: Vec<i64, Comp> = Vec::new_in(Comp {});
     let mut i: i64 = 0;
     while i < s.len() as i64 {
         let l = skip_literal(s, i);
@@ -288,7 +299,8 @@ fn std_imports(s: &[u8], items: IntVec, out: i64, pcx: &mut Ctx<Comp>) {
             let after_path = (b >= 1 && s[(b - 1) as usize] == b'.')
                 || (b >= 2 && s[(b - 1) as usize] == b':' && s[(b - 2) as usize] == b':');
             let n = intern(&s[i as usize..e as usize], pcx);
-            if !after_path && has(std, n) && !has(own, n) && !has(names, n)
+            if !after_path && has(std.as_slice(), n) && !has(own.as_slice(), n)
+                && !has(names.as_slice(), n)
                 && !is_prelude_name(n, pcx) {
                 names.push(n);
             }
@@ -315,7 +327,7 @@ fn std_imports(s: &[u8], items: IntVec, out: i64, pcx: &mut Ctx<Comp>) {
 // Appends text (a part of the snippet starting at offset `from`) to the
 // program, its first line indented to its column in the snippet, each
 // line's snippet line into lines (1-based; 0 for the wrapper's).
-fn put_part(prog: i64, lines: &mut IntVec, s: &[u8], from: i64, to: i64) {
+fn put_part(prog: i64, lines: &mut Vec<i64, Comp>, s: &[u8], from: i64, to: i64) {
     let mut col = from;
     while col > 0 && s[(col - 1) as usize] != b'\n' {
         col -= 1;
@@ -340,7 +352,7 @@ fn put_part(prog: i64, lines: &mut IntVec, s: &[u8], from: i64, to: i64) {
     lines.push(line);
 }
 
-fn put_line(prog: i64, lines: &mut IntVec, text: &[u8]) {
+fn put_line(prog: i64, lines: &mut Vec<i64, Comp>, text: &[u8]) {
     buf_bytes(prog, text);
     buf_byte(prog, b'\n');
     lines.push(0);
@@ -533,6 +545,9 @@ fn put_seq(out: i64, expr: &[u8], suffix: &[u8], len: &[u8], v: &[u8], i: &[u8],
 
 // The scratch directory, made anew.
 fn scratch_dir() -> *mut u8 {
+    // UNSAFE: getenv and getpid are C's; the variable's first byte is read.
+    // SAFETY: the name is a literal; tmp is checked not null before its
+    // first byte is read.
     unsafe {
         let b = buf_new();
         let tmp = getenv(c"TMPDIR");
@@ -562,21 +577,21 @@ fn path_in(dir: *mut u8, name: *mut u8) -> *mut u8 {
 
 // Runs PROG with the arguments (a 0-ended list), its stdout and stderr
 // into out: its exit status.
-fn run_self(args: *mut *mut u8, n: i64, out: i64, pcx: &Ctx<Comp>) -> i64 {
+fn run_self(args: &[*mut u8], n: i64, out: i64, pcx: &Ctx<Comp>) -> i64 {
     unsafe {
-        let argv = crate::base::alloc_array::<*mut u8>(n + 2);
-        (*argv.add(0)) = pcx.prog;
+        let mut argv = cptrs(n + 2);
+        (argv[0]) = pcx.prog;
         for k in 0..n {
-            (*argv.add((k + 1) as usize)) = (*args.add(k as usize));
+            (argv[(k + 1) as usize]) = args[k as usize];
         }
-        (*argv.add((n + 1) as usize)) = 0 as *mut u8;
-        run_capture(argv, out)
+        (argv[(n + 1) as usize]) = 0 as *mut u8;
+        run_capture(argv.as_slice(), out)
     }
 }
 
 // The compiler's diagnostics about the program (path `file`), its
 // positions as the snippet's (`name:LINE:COL`, by lines), into out.
-fn put_mapped(out: i64, text: &[u8], file: &[u8], name: &[u8], lines: IntVec) {
+fn put_mapped(out: i64, text: &[u8], file: &[u8], name: &[u8], lines: &[i64]) {
     let mut i: i64 = 0;
     while i < text.len() as i64 {
         let mut e = i;
@@ -652,6 +667,9 @@ fn slot_path(base: *mut u8, k: i64, ext: *mut u8) -> *mut u8 {
 // The slots' directory, $TMPDIR/volec-try (made once); 0 when it
 // cannot be made.
 fn slots_dir() -> *mut u8 {
+    // UNSAFE: getenv is C's; the variable's first byte is read.
+    // SAFETY: the name is a literal; tmp is checked not null before its
+    // first byte is read.
     unsafe {
         let b = buf_new();
         let tmp = getenv(c"TMPDIR");
@@ -671,6 +689,11 @@ fn slots_dir() -> *mut u8 {
 
 // Takes a slot: its number, or -1 when none is free.
 fn take_slot(base: *mut u8) -> i64 {
+    // UNSAFE: mkdir, kill and getpid are C's: a slot is a directory made
+    // atomically, held by a live process.
+    // SAFETY: lock is a C string (slot_path); kill with signal 0 sends
+    // nothing, it asks whether the process exists, and only for a pid > 0
+    // read from the slot's file.
     unsafe {
         for k in 0..SLOTS {
             let lock = slot_path(base, k, c".lock");
@@ -714,6 +737,8 @@ fn release_slot(base: *mut u8, k: i64) {
 // The binary `bin` as the executable to run: copied over slot k's file
 // in place (made executable).
 fn into_slot(bin: *mut u8, slot: *mut u8) -> bool {
+    // UNSAFE: chmod is C's.
+    // SAFETY: slot is a C string of the caller's.
     unsafe {
         let bytes = buf_new();
         if !read_file_if(bin, bytes) || !write_file_if(slot, buf_slice(bytes)) {
@@ -795,7 +820,7 @@ fn try_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64
     }
     let name = if file != 0 as *mut u8 { c_slice(file) } else { b"snippet" };
     // The program: imports, the items, main around the statements.
-    let mut items = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+    let mut items: Vec<i64, Comp> = Vec::new_in(Comp {});
     let body = split_items(s, &mut items);
     let mut whole = false;
     let mut j: i64 = 0;
@@ -808,9 +833,9 @@ fn try_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64
         j += 2;
     }
     let head = buf_new();
-    let mut lines = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+    let mut lines: Vec<i64, Comp> = Vec::new_in(Comp {});
     let imports = buf_new();
-    std_imports(s, items, imports, pcx);
+    std_imports(s, items.as_slice(), imports, pcx);
     if buf_slice(imports).len() > 0 {
         put_line(head, &mut lines, buf_slice(imports));
     }
@@ -835,7 +860,7 @@ fn try_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64
     let dir = scratch_dir();
     let src = path_in(dir, c"snippet.vl");
     let bin = path_in(dir, c"snippet");
-    let status = check_and_run(head, lines, whole, value_line, src, bin, name, tcx, pcx);
+    let status = check_and_run(head, lines.as_slice(), whole, value_line, src, bin, name, tcx, pcx);
     if keep {
         let d = diag(c"note", c"try.kept", tcx);
         buf_str(d, c"the program and its binary: ");
@@ -873,7 +898,7 @@ fn put_printing(b: i64, shows: bool, printed: bool, whole: bool, print: &[u8], t
 // Checks the program (head, then `}` for a snippet), asks its value's
 // type, builds it with the value printed, runs it, prints what it did:
 // the exit status.
-fn check_and_run(head: i64, lines: IntVec, whole: bool, value_line: i64, src: *mut u8, bin: *mut u8,
+fn check_and_run(head: i64, lines: &[i64], whole: bool, value_line: i64, src: *mut u8, bin: *mut u8,
     name: &[u8], tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
     unsafe {
         let a = buf_new();
@@ -889,10 +914,10 @@ fn check_and_run(head: i64, lines: IntVec, whole: bool, value_line: i64, src: *m
             return 1;
         }
         let errs = buf_new();
-        let args = crate::base::alloc_array::<*mut u8>(6i64);
-        (*args.add(0)) = c"check";
-        (*args.add(1)) = src;
-        let checked = run_self(args, 2, errs, pcx);
+        let mut args = cptrs(6i64);
+        (args[0]) = c"check";
+        (args[1]) = src;
+        let checked = run_self(args.as_slice(), 2, errs, pcx);
         if buf_slice(errs).len() > 0 {
             let out = buf_new();
             put_mapped(out, buf_slice(errs), c_slice(src), name, lines);
@@ -909,13 +934,13 @@ fn check_and_run(head: i64, lines: IntVec, whole: bool, value_line: i64, src: *m
             buf_byte(at, b':');
             buf_int(at, value_line);
             buf_str(at, c":22");
-            (*args.add(0)) = c"query";
-            (*args.add(1)) = c"type";
-            (*args.add(2)) = buf_cstr(at);
-            (*args.add(3)) = c"--root";
-            (*args.add(4)) = src;
+            (args[0]) = c"query";
+            (args[1]) = c"type";
+            (args[2]) = buf_cstr(at);
+            (args[3]) = c"--root";
+            (args[4]) = src;
             let got = buf_new();
-            if run_self(args, 5, got, pcx) == 0 {
+            if run_self(args.as_slice(), 5, got, pcx) == 0 {
                 let g = buf_slice(got);
                 let mut e: i64 = 0;
                 while e < g.len() as i64 && g[e as usize] != b'\t' && g[e as usize] != b'\n' {
@@ -937,11 +962,11 @@ fn check_and_run(head: i64, lines: IntVec, whole: bool, value_line: i64, src: *m
         put_printing(b, shows, printed, whole, buf_slice(print), tcx);
         write_file_if(src, buf_slice(b));
         let mut built = buf_new();
-        (*args.add(0)) = src;
-        (*args.add(1)) = c"-o";
-        (*args.add(2)) = bin;
-        (*args.add(3)) = c"--diagnostics=short";
-        let mut status = run_self(args, 4, built, pcx);
+        (args[0]) = src;
+        (args[1]) = c"-o";
+        (args[2]) = bin;
+        (args[3]) = c"--diagnostics=short";
+        let mut status = run_self(args.as_slice(), 4, built, pcx);
         if status != 0 && printed {
             // (the value has no Debug: its type alone, as for a type the
             // old edition has no printer for)
@@ -951,7 +976,7 @@ fn check_and_run(head: i64, lines: IntVec, whole: bool, value_line: i64, src: *m
             put_printing(again, shows, printed, whole, buf_slice(print), tcx);
             write_file_if(src, buf_slice(again));
             built = buf_new();
-            status = run_self(args, 4, built, pcx);
+            status = run_self(args.as_slice(), 4, built, pcx);
         }
         if status != 0 {
             let out = buf_new();
@@ -961,15 +986,15 @@ fn check_and_run(head: i64, lines: IntVec, whole: bool, value_line: i64, src: *m
         }
         // Run it (from a slot, when one is free: see SLOTS).
         let ran = buf_new();
-        let run = crate::base::alloc_array::<*mut u8>(2i64);
-        (*run.add(0)) = bin;
-        (*run.add(1)) = 0 as *mut u8;
+        let mut run = cptrs(2i64);
+        (run[0]) = bin;
+        (run[1]) = 0 as *mut u8;
         let base = slots_dir();
         let k: i64 = if base != 0 as *mut u8 { take_slot(base) } else { -1 };
         if k >= 0 && into_slot(bin, slot_path(base, k, c"")) {
-            (*run.add(0)) = slot_path(base, k, c"");
+            (run[0]) = slot_path(base, k, c"");
         }
-        let rc = run_capture(run, ran);
+        let rc = run_capture(run.as_slice(), ran);
         if k >= 0 {
             release_slot(base, k);
         }
