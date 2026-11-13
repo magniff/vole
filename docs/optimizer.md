@@ -3218,3 +3218,23 @@ wordcount 1.11, fannkuch and sort 1.06, json 1.04; faster: fmtloop
 tests/run/opt_inline_room.vl: the room (of six calls of a callee that
 is charged, one is inlined), small leaves and a small callee in a loop
 not charged, a function's only call inlined after the room is used.
+
+**Measured on the release tree** (each compiler built by itself; all on
+the release tree's source; the fewest of 3; a shared machine, a
+1-minute load of 8 to 13):
+
+| compiler | self-build | check | std row's program | hello | object it emits | its binary |
+|---|---:|---:|---:|---:|---:|---:|
+| release tree (the budget) | 118.60 G | 22.35 G | 1436.7 M | 179.3 M | 13.73 MB | 12.02 MB |
+| the room, the Vec header facts inferred but not used | 119.21 G | 20.67 G | 1331.3 M | 169.3 M | 13.08 MB | 11.38 MB |
+| the room and the facts in use | 118.95 G | 20.71 G | 1305.6 M | 168.8 M | 13.05 MB | 11.36 MB |
+
+`check` is 7.3% cheaper and the compiler 5.5% smaller; the self-build is
+the same (+0.3%): its optimizer has more to do where it now inlines
+(sccp +8.9%, gvn +12.0%, the ranges +11.8%, simplify_cfg +21.9%) and
+less where functions stayed small (unrolling -40.6%, vectorization
+-32.1%, strength reduction -32.9%, register allocation -7.0%), and its
+front end is 7.3% cheaper. With the room, using the facts or not moves
+the self-build by 0.2% (under the budget it was 6.4%). The compile-cost
+rows against 0.28.0, release tree and this: hello 1.02x and 0.97x, std
+1.17x and 1.07x, check 1.00x and 0.92x, regions 1.00x and 0.90x.
