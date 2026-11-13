@@ -345,8 +345,9 @@ function define_types(    k, i, n, attr, line, m, kind) {
             else FT[k, i] = pick_scalar()
         }
         # (the derive first: an attribute between #[repr(C)] and the type
-        # loses the repr, 0.28; a union takes no derive and is copied as
-        # it is)
+        # loses the repr, 0.28; a union takes no derive: its Clone and
+        # Copy are written out after it, as the C importer writes them,
+        # 0.29, when a struct that derives Copy must have Copy fields)
         if (!IMPORT && TK[k] != "union") print "#[derive(Clone, Copy)]" > TF
         if (!IMPORT) print (attr == "packed" ? "#[repr(C, packed)]" : attr == "align" ? "#[repr(C, align(" AL[k] "))]" : "#[repr(C)]") > TF
         line = TK[k] " S" k " {"
@@ -355,6 +356,10 @@ function define_types(    k, i, n, attr, line, m, kind) {
             else line = line (i ? "," : "") " f" i ": " t_type(FT[k, i])
         }
         if (!IMPORT) print line " }" > TF
+        if (!IMPORT && TK[k] == "union") {
+            print "impl Clone for S" k " { fn clone(&self) -> S" k " { *self } }" > TF
+            print "impl Copy for S" k " {}" > TF
+        }
         line = "typedef " TK[k] (attr == "packed" ? " __attribute__((packed))" : attr == "align" ? " __attribute__((aligned(" AL[k] ")))" : "") " {"
         for (i = 0; i < NF_[k]; i++) {
             if (FT[k, i] ~ /^A/) line = line " " c_scalar(array_elem(FT[k, i])) " f" i "[" array_len(FT[k, i]) "];"
