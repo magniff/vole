@@ -44,17 +44,24 @@ common=$(git -C "$caller" rev-parse --path-format=absolute --git-common-dir 2>/d
 case "$common" in */.git) main_tree=${common%/.git} ;; esac
 cd "$(dirname "$0")/../.."
 out=compiler/src/front/stdsrc_rust.vl
-# (next to the output: writable in a sandbox that only allows the tree, and mv is a rename)
-# (0.28.0: removed on every way out, also an error's and a signal's: a
-# run that was killed, or failed before the end, left it in the tree)
+# (0.29) The text is made in the temporary directory, outside the tree,
+# and is in the tree only for the last step: a copy beside the output
+# (the same file system, so that mv is a rename and a reader never sees
+# half a file), renamed at once. Before, the file being made sat beside
+# the output for the whole run (seconds, with a compiler making the
+# index), and a run killed outright (SIGKILL: a hook's timeout; no trap
+# runs) left `stdsrc*.vl.XXXXXX` under compiler/src, which the tools then
+# took for a changed source (tests/affected.sh: a broad plan).
+# (0.28.0: removed on every way out, also an error's and a signal's)
 tmp=
+new=
 work=
-trap 'rm -rf "$work"; rm -f "$tmp"' EXIT
+trap 'rm -rf "$work"; [ -z "$new" ] || rm -f "$new"' EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
-tmp=$(mktemp "$out.XXXXXX")
 work=$(mktemp -d "${TMPDIR:-/tmp}/vole-embed.XXXXXX")
+tmp=$work/stdsrc.out
 # std's root module: this file.
 ROOT_FILES=std
 dir=compiler/std
@@ -203,4 +210,7 @@ if [ "${1:-}" = "-c" ]; then
     echo "$out is stale: run compiler/std/embed.sh" >&2
     exit 1
 fi
-mv "$tmp" "$out"
+new=$out.new.$$
+cp "$tmp" "$new"
+mv "$new" "$out"
+new=
