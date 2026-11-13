@@ -1,5 +1,10 @@
 # `*const T` and `*mut T` as two types (for 0.29)
 
+*Done in 0.29: the rules are front-rust.md's F30.5 (the pointers) and
+F30.4 (a slice has no fields). What follows is the plan as it was
+written at 0.28.0; the type's word is the `count` of the pointer's type
+record, and the fat raw pointers are left one type.*
+
 At 0.28.0 the checker has one raw pointer type: `*const T` and `*mut T`
 are the same type, messages and `--emit-imports` print `*T`, and `let
 q: *mut u8 = p` of a `p: *const u8` is accepted (rustc E0308). It is a

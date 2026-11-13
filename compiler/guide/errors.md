@@ -635,10 +635,22 @@ then `f(5)`. `fix --suggested` drops the `&`.
 fn first(p: *const i64) -> i64 { p[1] }
 ```
 ```err
-error[type error] cannot index into a value of type '*i64' | help: a raw pointer is not indexed: offset it and read, `unsafe { *p.add(i) }`
+error[type error] cannot index into a value of type '*const i64' | help: a raw pointer is not indexed: offset it and read, `unsafe { *p.add(i) }`
 ```
 A pointer is one value; for many, take a slice `&[i64]`: a slice or a
 Vec indexes its elements, checked and safe.
+
+```vole
+fn bump(p: *mut i64) {}
+fn main() { let x = 1i64; let c: *const i64 = &x; bump(c); }
+```
+```err
+error[type error] expected '*mut i64', got '*const i64' | help: the types differ in mutability (rustc E0308): a `*const T` does not convert to a `*mut T`; cast it, if what it points to may be written through it
+```
+`*const T` and `*mut T` are two types, as in Rust. A `*mut T` goes where
+a `*const T` is wanted; the other way is a cast, `c as *mut i64` (`fix
+--suggested` writes it), or the parameter declared `*const i64` when it
+only reads. A `&x` gives a `*const T`: `&mut x` for a `*mut T`.
 
 ```vole
 fn read(x: *const i64) -> i64 { *x }

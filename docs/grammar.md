@@ -378,7 +378,8 @@ guards) must cover every value, and every arm must be reachable; a missing
 value is named in the error (`non-exhaustive match: 'Shape::Empty' is not
 covered`). A match is an expression, typed like `if`.
 
-**Slices** *(0.3)* `[T]` are a pointer and a length (`s.ptr`, `s.len`), made
+**Slices** *(0.3)* `[T]` are a pointer and a length (`s.as_ptr()`, `s.len()`;
+the fields `s.ptr` and `s.len` until 0.28: 0.29 has the methods only), made
 by slicing an array or a slice (checked: `lo <= hi <= len`), or a raw
 pointer (`p[lo..hi]`, unchecked). Indexing a slice is checked, and so is
 indexing a fixed array *(0.7)*. Like
@@ -672,7 +673,7 @@ builtins, and no item may have those names.)
 **Strings.** `c"..."` initializes a `const` or a `static` of type `*u8`:
 the address of the bytes (`const PROMPT: *u8 = c"> ";`).
 
-**Slices.** `s.len` is `usize` (0.26.2; it was `i64`, and `u64` before
+**Slices.** `s.len()` is `usize` (0.26.2; it was `i64`, and `u64` before
 that), as std's lengths are. Indexing takes a `usize` (0.28.0; any integer type before). `for x in s` iterates a
 slice or an array by value (the sequence is evaluated once; `break`,
 `continue` and labels work as in other loops).
@@ -916,7 +917,7 @@ of them too) is an error naming it. std's `Vec`, `Buf` and `HashMap` compare
 their contents (0.15, through their `impl Eq`): Vecs element by element, a
 Buf by bytes, maps by length and each key's value, in any order; `==` on a
 `Vec<T>` needs `==` on `T`. Whether two are the same Vec is a comparison
-of pointers, `a.as_slice().ptr == b.as_slice().ptr`.
+of pointers, `a.as_ptr() == b.as_ptr()`.
 
 **The prelude.** Every module sees `Option`, `Some`, `None`, `Result`,
 `Ok`, `Err`, `Vec`, `print` and `println` (from `std`) without `use`. The
@@ -1044,6 +1045,14 @@ pointer is unsafe: `p` is a `*T` parameter`, with `try: volec fix
 --values` (parameters to `&T` / `&mut T`, with their calls; it keeps raw
 a pointer that is indexed, compared, cast, stored or given to C) and
 `try: volec fix --only unsafe`.
+
+**`*const T` and `*mut T`** (0.29) are two types, with Rust's rules: a
+`*mut T` goes where a `*const T` is expected, the other way is a type
+error whose fix is the cast (`p as *mut T`; std's `p.cast_mut()`,
+`p.cast_const()`); a `&T` coerces and casts to `*const T` only, a `&mut
+T` to both; a place behind a `*const T` is not written nor borrowed
+`&mut`; a `c"..."` literal is a `*const u8`. Until 0.28 the two were
+one type, written `*T` in messages.
 
 **Diagnostics.** An unsafe operation outside unsafe code is an error,
 `error[unsafe]` (each place once, in source order, with the other
@@ -1874,9 +1883,12 @@ take `self: &mut [T]`, called on a slice (`s.swap(i, j)`, `s.sort()`).
 `*S` is `(*p).x`: safe when `p` is a borrow (`&T`, `&mut T`, `&x`),
 `unsafe` on a raw pointer.
 
-**`len()`.** `s.len()` on a slice is its field `s.len`; `a.len()` on
+**`len()`.** `s.len()` on a slice is its length; `a.len()` on
 an array (a variable, constant, static or a field of one) is its
-length; both are a `usize` (0.26.2), as the field is. The field stays. The other way round, `a.len` on such
+length; both are a `usize` (0.26.2). (0.29) A slice has no fields, as
+in Rust: `s.len` and `s.ptr` are errors that name the methods
+(`s.len()`, `s.as_ptr()`, `s.as_mut_ptr()`), and `volec fix
+--suggested` writes them. The other way round, `a.len` on such
 an array is its length, and `v.len` on std's `Vec`, `Buf` and `HashMap`
 (whose `len` field is private, or which have none) is `v.len()`: a read
 only; `v.len = n` and `&v.len` are still errors.
@@ -2204,11 +2216,12 @@ What a header declares becomes vole declarations
 
 | C | vole |
 |---|---|
-| `char` (plain), `signed char`, `unsigned char` | `u8`, `i8`, `u8` (`c"..."` strings are `*u8`) |
+| `char` (plain), `signed char`, `unsigned char` | `u8`, `i8`, `u8` (`c"..."` strings are `*const u8`) |
 | `short`, `int`, `long`, `long long`, and the unsigned ones | `i16`, `i32`, `i64`, `i64`, and `u16` ... `u64` |
 | `_Bool`, `float`, `double` | `bool`, `f32`, `f64` |
 | `long double` | `f64` on aarch64-macos; not imported on x86-64 |
-| `void *`, `T *` | `*u8`, `*T` |
+| `void *`, `T *` | `*mut u8`, `*mut T` |
+| `const void *`, `const T *` (0.29) | `*const u8`, `*const T` (`T *const *`: `*const *mut T`; a `const T a[]` parameter: `*const T`) |
 | function pointers | `extern "C" fn(...) -> R` (variadic ones: `*u8`) |
 | `struct`, `union` | `#[repr(C)]` types with C's exact layout: bit-fields become byte arrays (`_bitfield0`); `aligned`, `packed` and `#pragma pack` become `align(N)`, `packed(N)` or padding fields (`_pad0`); anonymous members are fields `_anon0` of types `<Struct>_anon0` |
 | `typedef` | a `type` alias; a typedef of an anonymous struct names it |

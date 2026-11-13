@@ -15,8 +15,8 @@ use crate::base::diag::{
     err_int, err_str, err_sym, err_try_fmt, report_warning,
 };
 use crate::front::ast::{
-    NODE_CHECKED, NODE_RAW, NODE_REF_MUT, NodeKind, REPR_UNION, child, list_begin, list_end,
-    list_push, new_node,
+    NODE_CHECKED, NODE_IMPLICIT, NODE_RAW, NODE_REF_MUT, NodeKind, REPR_UNION, child, list_begin,
+    list_end, list_push, new_node,
 };
 use crate::front::ast::NodeKind::{
     Arm, Array, Assign, Binary, Block, Bool, Break, CStr, Call, Cast, Char, Closure, Continue,
@@ -115,7 +115,9 @@ fn synth_expr_inner(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         Str => if pcx.str_type > 0
             && pcx.nodes[n as usize].b != 2 { pcx.str_type }
             else { pcx.ty_string },
-        CStr => pcx.ty_u8_ptr,
+        // RULE: F30.5 (0.29: a `c"..."` literal is a `*const u8`: its bytes
+        // are read only)
+        CStr => pcx.ty_cstr,
         Ident => synth_name(n, pcx),
         EnumPanic => {
             synth_expr(pcx.nodes[n as usize].a, pcx);
@@ -339,6 +341,24 @@ fn synth_cast(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         } else {
             err_help(c"a reference is not a number: its address is a raw pointer's, `p as *const T as usize`; the value it refers to is `*p`", pcx);
         }
+        err_end_soft(pcx);
+        pcx.err_kind = saved_kind;
+        return to_ty;
+    }
+    // RULE: F30.5 (0.29: a `&T` casts to `*const T`, not to `*mut T`,
+    // rustc E0606; a `&mut T` to either)
+    if from > 0 && to > 0
+        && pcx.types[from as usize].kind == TyKind::Ptr && pcx.types[from as usize].b == REF_SHARED
+        && crate::front::types::is_mut_ptr(to, pcx) {
+        let saved_kind = pcx.err_kind;
+        pcx.err_kind = c"type.cast";
+        err_begin(pcx.nodes[operand as usize].start, pcx);
+        err_str(c"cannot cast '", pcx);
+        err_type(from_ty, pcx);
+        err_str(c"' to '", pcx);
+        err_type(to_ty, pcx);
+        err_str(c"'", pcx);
+        err_help(c"a shared reference casts to `*const T` only (rustc E0606): borrow it `&mut` to write through the pointer, or cast the `*const T` (`r as *const T as *mut T`) when something else makes the write sound", pcx);
         err_end_soft(pcx);
         pcx.err_kind = saved_kind;
         return to_ty;
@@ -736,14 +756,13 @@ fn synth_index(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     pcx.types[base_ty as usize].a
 }
 
-// (0.27.2) Whether position pos is in std's `ptr` module, where the raw
-// pointers' own primitives (`read`, `write`, `slice_parts`) are written
-// with MVS's raw indexing: std::ptr of a program on std, or the file
-// compiler/std/ptr.vl of std's own check. RULE: F30.3
-fn in_std_ptr(pos: i64, pcx: &Ctx<Comp>) -> bool {
+// Whether position pos is in std's module `name` (a child of std's
+// root): that module of a program's std, or std's file `tail` when std
+// itself is checked.
+fn in_std_module(pos: i64, name: &[u8], tail: &[u8], pcx: &Ctx<Comp>) -> bool {
     let m = pcx.cur_mod;
     if m >= 0 && pcx.std_module >= 0 && pcx.modules[m as usize].parent == pcx.std_module
-        && crate::base::sym_text(pcx.modules[m as usize].name, pcx) == b"ptr" {
+        && crate::base::sym_text(pcx.modules[m as usize].name, pcx) == name {
         return true;
     }
     let f = crate::front::modules::file_of_pos(pos, pcx);
@@ -751,8 +770,42 @@ fn in_std_ptr(pos: i64, pcx: &Ctx<Comp>) -> bool {
         return false;
     }
     let path = crate::front::modules::file_path(f, pcx);
-    let tail = b"std/ptr.vl";
     path.len() >= tail.len() && &path[path.len() - tail.len()..] == tail
+}
+
+// (0.27.2) Whether position pos is in std's `ptr` module, where the raw
+// pointers' own primitives (`read`, `write`, `slice_parts`) are written
+// with MVS's raw indexing: std::ptr of a program on std, or the file
+// compiler/std/ptr.vl of std's own check. RULE: F30.3
+fn in_std_ptr(pos: i64, pcx: &Ctx<Comp>) -> bool {
+    in_std_module(pos, b"ptr", b"std/ptr.vl", pcx)
+}
+
+// (0.29) Whether position pos is in one of std::slice's three methods
+// that read the two words of a slice reference, `len`, `as_ptr` and
+// `as_mut_ptr`: there the words are the fields `len` and `ptr`, the
+// built-in form those methods are made of, which no other code may
+// write (rustc has no such fields). RULE: F30.4
+fn in_std_slice(pos: i64, pcx: &Ctx<Comp>) -> bool {
+    if pcx.cur_fn < 0 || !in_std_module(pos, b"slice", b"std/slice.vl", pcx) {
+        return false;
+    }
+    let name = crate::base::sym_text(pcx.fns[pcx.cur_fn as usize].display, pcx);
+    ends_with_name(name, b"len") || ends_with_name(name, b"as_ptr")
+        || ends_with_name(name, b"as_mut_ptr")
+}
+
+// Whether the path `text` ends with the name `last` (`[T]::len` with
+// `len`, not `byte_len`).
+fn ends_with_name(text: &[u8], last: &[u8]) -> bool {
+    if text.len() < last.len() || &text[text.len() - last.len()..] != last {
+        return false;
+    }
+    if text.len() == last.len() {
+        return true;
+    }
+    let c = text[text.len() - last.len() - 1];
+    c == b':' || c == b'.' || c == b'>' || c == b' '
 }
 
 // (0.17) Whether a value of type t (a struct) is indexed through its
@@ -905,20 +958,47 @@ fn synth_field(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     }
     if pcx.types[base_ty as usize].kind == TyKind::Slice {
         pcx.nodes[n as usize].y = 2;
-        if name == intern_c(c"len", pcx) {
+        let is_len = name == intern_c(c"len", pcx);
+        let is_ptr = name == intern_c(c"ptr", pcx);
+        // RULE: F30.4 (0.29: a slice has no fields, as rustc; its length
+        // and its pointer are the methods `len()`, `as_ptr()` and
+        // `as_mut_ptr()`. The two words are read as fields only by those
+        // methods in std::slice and by the nodes the checker makes)
+        if !is_len && !is_ptr {
+            err_begin(pcx.nodes[n as usize].start, pcx);
+            err_str(c"a slice has no field '", pcx);
+            err_sym(name, pcx);
+            err_str(c"'", pcx);
+            err_help(c"a slice has methods only: '.len()', '.as_ptr()', '.first()', ...", pcx);
+            err_end(pcx);
+        }
+        if (pcx.nodes[n as usize].p & NODE_IMPLICIT) == 0
+            && !in_std_slice(pcx.nodes[n as usize].start, pcx) {
+            let end = pcx.nodes[n as usize].end;
+            err_begin(pcx.nodes[n as usize].start, pcx);
+            err_str(c"a slice has no field '", pcx);
+            err_sym(name, pcx);
+            err_str(c"'", pcx);
+            if is_len {
+                err_help(c"call its method: '.len()'", pcx);
+                if end > pcx.nodes[n as usize].start && get_src()[(end - 1) as usize] == b'n' {
+                    err_fix(end, end, b"()", pcx);
+                }
+            } else {
+                err_help(c"call its method: '.as_ptr()' ('.as_mut_ptr()' for a '*mut T')", pcx);
+                if end - 3 > pcx.nodes[n as usize].start && get_src()[(end - 1) as usize] == b'r' {
+                    err_fix(end - 3, end, b"as_ptr()", pcx);
+                }
+            }
+            err_end_soft(pcx);
+        }
+        if is_len {
             // usize (0.26.2, as Rust; i64 from 0.4, u64 before)
             pcx.nodes[n as usize].x = 1;
             return TY_USIZE;
         }
-        if name == intern_c(c"ptr", pcx) {
-            pcx.nodes[n as usize].x = 0;
-            return ptr_to(pcx.types[base_ty as usize].a, pcx);
-        }
-        err_begin(pcx.nodes[n as usize].start, pcx);
-        err_str(c"slices have the fields 'ptr' and 'len', not '", pcx);
-        err_sym(name, pcx);
-        err_str(c"'", pcx);
-        err_end(pcx);
+        pcx.nodes[n as usize].x = 0;
+        return ptr_to(pcx.types[base_ty as usize].a, pcx);
     }
     // (0.17) `v.len` on std's Vec, Buf or HashMap (its field sealed, or
     // none) reads as `v.len()`, and `a.len` on an array place as
@@ -1843,6 +1923,10 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     // RULE: F30.1 (0.28.0: the rust edition's `&mut (*p).f`, `&(*p).v[i]`
     // is a reference, as `&*p` is and as rustc types it; `&raw mut` is
     // the raw pointer)
+    // RULE: F30.5 (0.29: no `&mut` of a place behind a `*const T`)
+    if mutable {
+        crate::front::check::rust::const_write(operand, true, pcx);
+    }
     ref_to(ty, if mutable { REF_MUT } else { REF_SHARED }, pcx)
 }
 
@@ -1898,7 +1982,7 @@ fn is_word_char(c: u8) -> bool {
 // `&f` or `*f` (node n) of a function value f (operand): a function's name
 // is a `fn(..) -> ..` value, a pointer to its code already; it is called
 // as it is (`f(10)`). The fix (fix --suggested) writes f alone.
-fn fn_value_error(n: i64, operand: i64, what: *mut u8, pcx: &mut Ctx<Comp>) {
+fn fn_value_error(n: i64, operand: i64, what: *const u8, pcx: &mut Ctx<Comp>) {
     let ty = pcx.nodes[operand as usize].ty;
     let f = &get_src()[
         pcx.nodes[operand as usize].start as usize..pcx.nodes[operand as usize].end as usize];
