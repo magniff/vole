@@ -5,6 +5,8 @@
 // thread has its own (docs/optimizer.md, "0.18.1: threads"). Every
 // function that reaches one takes `cx`; serial code passes main_cx().
 
+use std::alloc::Allocator;
+
 use crate::back::codecache::CcCtx;
 use crate::back::regalloc::Interval;
 use crate::base::{IntVec, alloc_zeroed, buf_new};
@@ -14,7 +16,7 @@ use crate::middle::fold::lattice::Lattice;
 use crate::middle::ir::{Block, Inst, Slot};
 use crate::middle::lower::ssa::HMap;
 
-#[derive(Clone, Copy)] pub struct FnCtx {
+pub struct FnCtx<A: Allocator> {
     // middle::loops
     pub lp_header: IntVec,
     pub lp_parent: IntVec,
@@ -357,18 +359,16 @@ use crate::middle::lower::ssa::HMap;
     pub ldepth: IntVec,
     // Allocated values: value ids by dense index (INSTS[v].aux = index + 1).
     pub ra_vals: IntVec,
-    pub ivs: *mut Interval,
-    pub iv_count: i64,
+    pub ivs: Vec<Interval<A>, A>,
     // Per dense index: the first interval, the spill slot (-1: never on the
     // stack), the value whose register it would like (-1), the register it
     // would like (-1).
-    pub rv_first: *mut i64,
-    pub rv_slot: *mut i64,
-    pub rv_hint: *mut i64,
-    pub rv_hreg: *mut i64,
-    pub rv_cap: i64,
+    pub rv_first: Vec<i64, A>,
+    pub rv_slot: Vec<i64, A>,
+    pub rv_hint: Vec<i64, A>,
+    pub rv_hreg: Vec<i64, A>,
     // Fixed intervals: per register, the ranges where it is not available.
-    pub fixed: *mut IntVec,
+    pub fixed: Vec<Vec<i64, A>, A>,
     // Moves inside blocks: (gap, dense index) pairs, sorted by gap.
     pub split_moves: IntVec,
     pub spill_count: i64,
@@ -623,8 +623,6 @@ use crate::middle::lower::ssa::HMap;
     // (0.18.1) A buffer for a pass's scratch bytes (base::buf_new makes the
     // program's, which a task must not).
     pub scratch_buf: i64,
-    // back::regalloc's IVS capacity (IV_CAP until 0.18.1).
-    pub iv_cap: i64,
     // (0.18.1) What the code cache records of the task running here
     // (back::codecache; made when first needed).
     pub cc: *mut CcCtx,
@@ -636,9 +634,9 @@ use crate::middle::lower::ssa::HMap;
 
 // A context with every field at the static's initial value, and no
 // buffers yet (-1).
-fn fnctx_fields() -> *mut FnCtx {
+fn fnctx_fields() -> *mut FnCtx<Comp> {
     unsafe {
-        let cx = alloc_zeroed(size_of(FnCtx)) as *mut FnCtx;
+        let cx = alloc_zeroed(size_of(FnCtx<Comp>)) as *mut FnCtx<Comp>;
         cx.lp_header = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
         cx.lp_parent = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
         cx.lp_depth = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
@@ -830,14 +828,15 @@ fn fnctx_fields() -> *mut FnCtx {
         cx.bend = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
         cx.ldepth = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
         cx.ra_vals = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        cx.ivs = 0 as *mut Interval;
-        cx.iv_count = 0;
-        cx.rv_first = 0 as *mut i64;
-        cx.rv_slot = 0 as *mut i64;
-        cx.rv_hint = 0 as *mut i64;
-        cx.rv_hreg = 0 as *mut i64;
-        cx.rv_cap = 0;
-        cx.fixed = 0 as *mut IntVec;
+        // The fields that own their memory: the block is zeroed, not yet
+        // a Vec, so each is written in place (an assignment would drop the
+        // zero bytes as a Vec).
+        std::ptr::write(&mut cx.ivs, Vec::new_in(Comp {}));
+        std::ptr::write(&mut cx.rv_first, Vec::new_in(Comp {}));
+        std::ptr::write(&mut cx.rv_slot, Vec::new_in(Comp {}));
+        std::ptr::write(&mut cx.rv_hint, Vec::new_in(Comp {}));
+        std::ptr::write(&mut cx.rv_hreg, Vec::new_in(Comp {}));
+        std::ptr::write(&mut cx.fixed, Vec::new_in(Comp {}));
         cx.split_moves = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
         cx.spill_count = 0;
         cx.spill_vectors = false;
@@ -951,7 +950,6 @@ fn fnctx_fields() -> *mut FnCtx {
         cx.inl_imap = 0 as *mut i64;
         cx.inl_imap_cap = 0;
         cx.scratch_buf = -1;
-        cx.iv_cap = 0;
         cx.cc = 0 as *mut CcCtx;
         cx.text_rtids = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
         cx
@@ -960,7 +958,7 @@ fn fnctx_fields() -> *mut FnCtx {
 
 // A new context: its fields at the statics' initial values, and buffers
 // of its own (serial code only: buf_new grows the program's table).
-pub fn fnctx_new() -> *mut FnCtx {
+pub fn fnctx_new() -> *mut FnCtx<Comp> {
     unsafe {
         let cx = fnctx_fields();
         cx.code = buf_new();
@@ -972,7 +970,7 @@ pub fn fnctx_new() -> *mut FnCtx {
 
 // (testing, middle::parallel) A new context with cx's buffers and scratch
 // text: one per task, made while other tasks run (so without buf_new).
-pub fn fnctx_new_with(cx: &mut FnCtx) -> *mut FnCtx {
+pub fn fnctx_new_with(cx: &mut FnCtx<Comp>) -> *mut FnCtx<Comp> {
     unsafe {
         let code = cx.code;
         let asm = cx.asm;
@@ -987,8 +985,8 @@ pub fn fnctx_new_with(cx: &mut FnCtx) -> *mut FnCtx {
     }
 }
 
-pub fn main_cx(pcx: &mut Ctx<Comp>) -> *mut FnCtx {
-    if pcx.main_cx == 0 as *mut FnCtx {
+pub fn main_cx(pcx: &mut Ctx<Comp>) -> *mut FnCtx<Comp> {
+    if pcx.main_cx == 0 as *mut FnCtx<Comp> {
         pcx.main_cx = fnctx_new();
     }
     pcx.main_cx
