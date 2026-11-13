@@ -25,8 +25,8 @@ use crate::back::abi::returns_through_pointer;
 use crate::back::codecache::cc_text_string;
 use crate::back::objfile::{OUT_ASM, raw_data};
 use crate::base::{
-    IntVec, buf_byte, buf_bytes, buf_clear, buf_fmt, buf_int, buf_new, buf_slice, buf_str, buf_uint,
-    c_bytes, cstr, find_sym, free, intern_c, out_path, strlen, sym_text,
+    buf_append, buf_byte, buf_bytes, buf_clear, buf_copy, buf_fmt, buf_int, buf_new, buf_str,
+    buf_uint, c_len, cstr, find_sym, intern_c, out_path, sym_text,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -188,17 +188,15 @@ pub fn o_str_label(cx: &mut FnCtx<Comp>, id: i64) {
 // "<prefix><name>"; a C symbol (prefix "_" or none) may be renamed by
 // #[link_name].
 pub fn emit_symbol_ref(cx: &mut FnCtx<Comp>, sym_prefix: *mut u8, name: i64, pcx: &Ctx<Comp>) {
-    unsafe {
-        o(cx, sym_prefix);
-        if strlen(sym_prefix) <= 1 {
-            let link = pcx.link_names.get(name + 1);
-            if link != 0 {
-                buf_bytes(cx.code, sym_text(link - 1, pcx));
-                return;
-            }
+    o(cx, sym_prefix);
+    if c_len(sym_prefix) <= 1 {
+        let link = pcx.link_names.get(name + 1);
+        if link != 0 {
+            buf_bytes(cx.code, sym_text(link - 1, pcx));
+            return;
         }
-        buf_bytes(cx.code, sym_text(name, pcx));
     }
+    buf_bytes(cx.code, sym_text(name, pcx));
 }
 
 // log2 of a power of two.
@@ -236,34 +234,31 @@ fn data_raw(pcx: &Ctx<Comp>) -> bool {
 
 // `.byte` lines for `n` bytes at `p`.
 pub fn data_bytes(bytes: &[u8], pcx: &Ctx<Comp>) {
-    unsafe {
-        let n = bytes.len() as i64;
-        let p = bytes.ptr;
-        if (0i64..n).all(|i| (*p.add(i as usize)) == 0) {
-            if n > 0 {
-                buf_fmt(pcx.data, format_args("    .space {n}\n"));
+    let n = bytes.len() as i64;
+    if bytes.iter().all(|&b| b == 0) {
+        if n > 0 {
+            buf_fmt(pcx.data, format_args("    .space {n}\n"));
+        }
+        return;
+    }
+    if data_raw(pcx) {
+        let at = raw_data(bytes, pcx);
+        buf_fmt(pcx.data, format_args("    .vole_data {at}, {n}\n"));
+        return;
+    }
+    let mut i: i64 = 0;
+    while i < n {
+        buf_str(pcx.data, c"    .byte ");
+        let mut j: i64 = 0;
+        while j < 16 && i < n {
+            if j > 0 {
+                buf_byte(pcx.data, b',');
             }
-            return;
+            buf_uint(pcx.data, bytes[i as usize] as u64);
+            i += 1;
+            j += 1;
         }
-        if data_raw(pcx) {
-            let at = raw_data(bytes);
-            buf_fmt(pcx.data, format_args("    .vole_data {at}, {n}\n"));
-            return;
-        }
-        let mut i: i64 = 0;
-        while i < n {
-            buf_str(pcx.data, c"    .byte ");
-            let mut j: i64 = 0;
-            while j < 16 && i < n {
-                if j > 0 {
-                    buf_byte(pcx.data, b',');
-                }
-                buf_uint(pcx.data, (*p.add(i as usize)) as u64);
-                i += 1;
-                j += 1;
-            }
-            buf_byte(pcx.data, b'\n');
-        }
+        buf_byte(pcx.data, b'\n');
     }
 }
 
@@ -291,42 +286,36 @@ pub fn data_align(align: i64, pcx: &Ctx<Comp>) {
     buf_fmt(pcx.data, format_args("{}\n", log2(align)));
 }
 
-// The alignment of each string literal or constant data (0: none).
-static mut STR_ALIGN: IntVec = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-
 // Read-only data made by the optimizer (as a string, so that it is
 // addressed like one): returns its id.
-pub fn add_const_data(bytes: &[u8], align: i64) -> i64 {
-    let id = add_string(bytes);
-    while get_str_align().len() as i64 <= id {
-        { let mut str_align_copy = get_str_align(); str_align_copy.push(0);
-            set_str_align(str_align_copy); }
-    }
-    (get_str_align()[id as usize]) = align;
+pub fn add_const_data(bytes: &[u8], align: i64, pcx: &Ctx<Comp>) -> i64 {
+    let id = add_string(bytes, pcx);
+    pcx.strs.write().unwrap().aligns[id as usize] = align;
     id
 }
 
 // (0.18.1, back::codecache) The alignment of string or constant data id
 // (0: a string literal's).
-pub fn str_align(id: i64) -> i64 {
-    if id < get_str_align().len() as i64 { (get_str_align()[id as usize]) } else { 0 }
+pub fn str_align(id: i64, pcx: &Ctx<Comp>) -> i64 {
+    let table = pcx.strs.read().unwrap();
+    if id < table.aligns.len() as i64 { table.aligns[id as usize] } else { 0 }
 }
 
 pub fn data_string(id: i64, pcx: &Ctx<Comp>) {
-    if id < get_str_align().len() as i64 && (get_str_align()[id as usize]) > 1 {
-        data_align((get_str_align()[id as usize]), pcx);
+    if str_align(id, pcx) > 1 {
+        data_align(str_align(id, pcx), pcx);
     }
     buf_fmt(pcx.data,
-        format_args("{}str.{id}:\n", str::from_utf8(cstr(local_prefix())).unwrap()));
+        format_args("{}str.{id}:\n", str::from_utf8(&cstr(local_prefix())).unwrap()));
     if data_raw(pcx) {
         // (0.25) the bytes and their 0 in one line
-        let s = str_at(id);
-        let at = raw_data(s);
-        raw_data(b"\0");
+        let s = str_at(id, pcx);
+        let at = raw_data(s, pcx);
+        raw_data(b"\0", pcx);
         buf_fmt(pcx.data, format_args("    .vole_data {at}, {}\n", s.len() as i64 + 1));
         return;
     }
-    data_bytes(str_at(id), pcx);
+    data_bytes(str_at(id, pcx), pcx);
     buf_str(pcx.data, c"    .byte 0\n");
 }
 
@@ -679,8 +668,6 @@ pub const PANIC_INDEX_UNSIGNED: i64 = 1;
 pub const PANIC_RANGE_SIGNED: i64 = 2;
 pub const PANIC_RANGE_UNSIGNED: i64 = 3;
 
-static mut RT_PANIC_SYM: i64 = 0;
-
 pub fn enum_panic_kind(e: i64, pcx: &mut Ctx<Comp>) -> i64 {
     for i in 0..pcx.enum_panics.len() as i64 {
         if (pcx.enum_panics[i as usize]) == e {
@@ -694,32 +681,30 @@ pub fn enum_panic_kind(e: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // The symbol of the runtime's panic entry, made the first time (the main
 // thread's: lowering, gen0, middle::parallel's prepare_tasks).
 pub fn make_rt_panic_sym(pcx: &mut Ctx<Comp>) -> i64 {
-    if get_rt_panic_sym() == 0 {
-        set_rt_panic_sym(intern_c(c"rt.panic", pcx));
+    if pcx.rt_panic_sym == 0 {
+        pcx.rt_panic_sym = intern_c(c"rt.panic", pcx);
     }
-    get_rt_panic_sym()
+    pcx.rt_panic_sym
 }
 
 // (0.27.0) The same, read (a task's: prepare_tasks made it); -1 while no
 // symbol is the name.
 pub fn rt_panic_sym(pcx: &Ctx<Comp>) -> i64 {
-    if get_rt_panic_sym() != 0 { get_rt_panic_sym() } else { find_sym(b"rt.panic", pcx) }
+    if pcx.rt_panic_sym != 0 { pcx.rt_panic_sym } else { find_sym(b"rt.panic", pcx) }
 }
-
-static mut RT_NOTE_SYM: i64 = 0;
 
 // The symbol of the runtime's note entry (--trace), made as
 // make_rt_panic_sym makes its.
 pub fn make_rt_note_sym(pcx: &mut Ctx<Comp>) -> i64 {
-    if get_rt_note_sym() == 0 {
-        set_rt_note_sym(intern_c(c"rt.note", pcx));
+    if pcx.rt_note_sym == 0 {
+        pcx.rt_note_sym = intern_c(c"rt.note", pcx);
     }
-    get_rt_note_sym()
+    pcx.rt_note_sym
 }
 
 // (0.27.0) The same, read, as rt_panic_sym.
 pub fn rt_note_sym(pcx: &Ctx<Comp>) -> i64 {
-    if get_rt_note_sym() != 0 { get_rt_note_sym() } else { find_sym(b"rt.note", pcx) }
+    if pcx.rt_note_sym != 0 { pcx.rt_note_sym } else { find_sym(b"rt.note", pcx) }
 }
 
 // Calls the helper with a = R_ACC, b = R_SECOND, c = R_ADDR. (0.18) site:
@@ -797,121 +782,119 @@ pub fn panic_note_text() -> &'static [u8] {
 // one per ENUM_PANICS entry: an enum's, or a message text's), the
 // sites' table (front/contracts/sites.vl) and the files' names.
 pub fn emit_runtime(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if !pcx.panic_used {
-            return;
-        }
-        let out = cx.code;
-        buf_clear(cx.code);
-        if get_x86() { x64_runtime(cx, pcx); } else { a64_runtime(cx, pcx); }
-        // (0.26.3, measuring) $VOLE_OVF_CENSUS: rt.note too
-        if pcx.ovf_census && !get_x86() {
-            a64_note_runtime(cx, pcx);
-        }
-        buf_bytes(cx.asm, buf_slice(cx.code));
-        cx.code = out;
-        // (0.17) each message with a note on --trace, without --trace (with
-        // it, the trace follows them).
-        let note = if trace_dump_fn(pcx) >= 0 { b"" } else { panic_note_text() };
-        let lp = cstr(local_prefix());
-        data_section(writable: false, pcx: pcx);
-        // (0.18.1) -O1 and -O2: the kinds and sites as the join numbered them
-        // (rt_output), those of the code emitted; -O0: the front end's.
-        let kinds = if pcx.rt_renumbered { pcx.out_kinds.len() as i64 }
-            else { pcx.enum_panics.len() as i64 };
-        let count = 4 + kinds;
+    if !pcx.panic_used {
+        return;
+    }
+    let out = cx.code;
+    buf_clear(cx.code);
+    if get_x86() { x64_runtime(cx, pcx); } else { a64_runtime(cx, pcx); }
+    // (0.26.3, measuring) $VOLE_OVF_CENSUS: rt.note too
+    if pcx.ovf_census && !get_x86() {
+        a64_note_runtime(cx, pcx);
+    }
+    buf_append(cx.asm, cx.code);
+    cx.code = out;
+    // (0.17) each message with a note on --trace, without --trace (with
+    // it, the trace follows them).
+    let note = if trace_dump_fn(pcx) >= 0 { b"" } else { panic_note_text() };
+    let lp = cstr(local_prefix());
+    data_section(writable: false, pcx: pcx);
+    // (0.18.1) -O1 and -O2: the kinds and sites as the join numbered them
+    // (rt_output), those of the code emitted; -O0: the front end's.
+    let kinds = if pcx.rt_renumbered { pcx.out_kinds.len() as i64 }
+        else { pcx.enum_panics.len() as i64 };
+    let count = 4 + kinds;
+    buf_fmt(pcx.data,
+        { let lp = str::from_utf8(&lp).unwrap();
+            format_args(".p2align 2\n{lp}rt.messages:\n") });
+    for i in 0..count {
         buf_fmt(pcx.data,
-            { let lp = str::from_utf8(lp).unwrap();
-                format_args(".p2align 2\n{lp}rt.messages:\n") });
-        for i in 0..count {
-            buf_fmt(pcx.data,
-                { let lp = str::from_utf8(lp).unwrap();
-                    format_args("    .long {lp}rt.m{i} - {lp}rt.messages\n") });
+            { let lp = str::from_utf8(&lp).unwrap();
+                format_args("    .long {lp}rt.m{i} - {lp}rt.messages\n") });
+    }
+    let messages: [*mut u8; 4] = [
+        c"index out of bounds: index %lld, length %llu\n",
+        c"index out of bounds: index %llu, length %llu\n",
+        c"slice range out of bounds: %lld..%lld, length %llu\n",
+        c"slice range out of bounds: %llu..%llu, length %llu\n",
+    ];
+    for i in 0..4 {
+        let text = messages[i as usize];
+        buf_fmt(pcx.data,
+            { let lp = str::from_utf8(&lp).unwrap(); format_args("{lp}rt.m{i}:\n") });
+        data_bytes(&cstr(text), pcx);
+        data_bytes(note, pcx);
+        data_bytes(b"\0", pcx);
+    }
+    for i in 0..kinds {
+        buf_fmt(pcx.data,
+            { let lp = str::from_utf8(&lp).unwrap(); format_args("{lp}rt.m{}:\n", 4 + i) });
+        let m = buf_new();
+        let e = (
+            pcx.enum_panics[(if pcx.rt_renumbered { (pcx.out_kinds[i as usize]) - 4 }
+                else { i }) as usize]);
+        if e >= 0 {
+            buf_str(m, c"invalid value %lld for enum ");
+            buf_bytes(m, sym_text((pcx.enums[e as usize]).name, pcx));
+            buf_byte(m, b'\n');
+        } else {
+            // (0.18) a check's message, made by front/contracts.
+            buf_bytes(m, message_text(-1 - e, pcx));
         }
-        let messages: [*mut u8; 4] = [
-            c"index out of bounds: index %lld, length %llu\n",
-            c"index out of bounds: index %llu, length %llu\n",
-            c"slice range out of bounds: %lld..%lld, length %llu\n",
-            c"slice range out of bounds: %llu..%llu, length %llu\n",
-        ];
-        for i in 0..4 {
-            let text = messages[i as usize];
+        buf_bytes(m, note);
+        buf_byte(m, 0);
+        data_bytes(&buf_copy(m), pcx);
+    }
+    buf_fmt(pcx.data, { let lp = str::from_utf8(&lp).unwrap(); format_args("{lp}rt.at:\n") });
+    data_bytes(b"%s:%u:%u: \0", pcx);
+    // (0.18) The sites: (line, file << 16 | column) each, from 1; the
+    // files their checks are in, by name.
+    buf_fmt(pcx.data,
+        { let lp = str::from_utf8(&lp).unwrap();
+            format_args(".p2align 2\n{lp}rt.sites:\n    .long 0, 0\n") });
+    let sites = if pcx.rt_renumbered { pcx.out_sites.len() as i64 + 1 }
+        else { site_count(pcx) };
+    let mut used: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for f in 0..pcx.files.len() {
+        used.push(0);
+    }
+    for o in 1..sites {
+        let s = if pcx.rt_renumbered { (pcx.out_sites[(o - 1) as usize]) } else { o };
+        let col: i64 = if (pcx.site_col[s as usize]) > 65535 { 65535 }
+            else { (pcx.site_col[s as usize]) };
+        buf_fmt(pcx.data,
+            format_args("    .long {}, {}\n", (pcx.site_line[s as usize]),
+                (pcx.site_file[s as usize]) * 65536 + col));
+        (used[(pcx.site_file[s as usize]) as usize]) = 1;
+    }
+    buf_fmt(pcx.data,
+        { let lp = str::from_utf8(&lp).unwrap(); format_args("{lp}rt.files:\n") });
+    for f in 0..pcx.files.len() as i64 {
+        if (used[f as usize]) != 0 {
             buf_fmt(pcx.data,
-                { let lp = str::from_utf8(lp).unwrap(); format_args("{lp}rt.m{i}:\n") });
-            data_bytes(c_bytes(text), pcx);
-            data_bytes(note, pcx);
+                { let lp = str::from_utf8(&lp).unwrap();
+                    format_args("    .long {lp}rt.f{f} - {lp}rt.files\n") });
+        } else {
+            buf_fmt(pcx.data,
+                { let lp = str::from_utf8(&lp).unwrap();
+                    format_args("    .long {lp}rt.at - {lp}rt.files\n") });
+        }
+    }
+    for f in 0..pcx.files.len() as i64 {
+        if (used[f as usize]) != 0 {
+            buf_fmt(pcx.data,
+                { let lp = str::from_utf8(&lp).unwrap(); format_args("{lp}rt.f{f}:\n") });
+            let path = out_path(f, pcx);
+            data_bytes(&cstr(path), pcx);
             data_bytes(b"\0", pcx);
         }
-        for i in 0..kinds {
-            buf_fmt(pcx.data,
-                { let lp = str::from_utf8(lp).unwrap(); format_args("{lp}rt.m{}:\n", 4 + i) });
-            let m = buf_new();
-            let e = (
-                pcx.enum_panics[(if pcx.rt_renumbered { (pcx.out_kinds[i as usize]) - 4 }
-                    else { i }) as usize]);
-            if e >= 0 {
-                buf_str(m, c"invalid value %lld for enum ");
-                buf_bytes(m, sym_text((pcx.enums[e as usize]).name, pcx));
-                buf_byte(m, b'\n');
-            } else {
-                // (0.18) a check's message, made by front/contracts.
-                buf_bytes(m, message_text(-1 - e, pcx));
-            }
-            buf_bytes(m, note);
-            buf_byte(m, 0);
-            data_bytes(buf_slice(m), pcx);
-        }
-        buf_fmt(pcx.data, { let lp = str::from_utf8(lp).unwrap(); format_args("{lp}rt.at:\n") });
-        data_bytes(b"%s:%u:%u: \0", pcx);
-        // (0.18) The sites: (line, file << 16 | column) each, from 1; the
-        // files their checks are in, by name.
+    }
+    if pcx.ovf_census && !get_x86() {
+        data_section(writable: true, pcx: pcx);
+        let seen = sites + 1;
         buf_fmt(pcx.data,
-            { let lp = str::from_utf8(lp).unwrap();
-                format_args(".p2align 2\n{lp}rt.sites:\n    .long 0, 0\n") });
-        let sites = if pcx.rt_renumbered { pcx.out_sites.len() as i64 + 1 }
-            else { site_count(pcx) };
-        let mut used = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        for f in 0..pcx.files.len() {
-            used.push(0);
-        }
-        for o in 1..sites {
-            let s = if pcx.rt_renumbered { (pcx.out_sites[(o - 1) as usize]) } else { o };
-            let col: i64 = if (pcx.site_col[s as usize]) > 65535 { 65535 }
-                else { (pcx.site_col[s as usize]) };
-            buf_fmt(pcx.data,
-                format_args("    .long {}, {}\n", (pcx.site_line[s as usize]),
-                    (pcx.site_file[s as usize]) * 65536 + col));
-            (used[(pcx.site_file[s as usize]) as usize]) = 1;
-        }
-        buf_fmt(pcx.data, { let lp = str::from_utf8(lp).unwrap(); format_args("{lp}rt.files:\n") });
-        for f in 0..pcx.files.len() as i64 {
-            if (used[f as usize]) != 0 {
-                buf_fmt(pcx.data,
-                    { let lp = str::from_utf8(lp).unwrap();
-                        format_args("    .long {lp}rt.f{f} - {lp}rt.files\n") });
-            } else {
-                buf_fmt(pcx.data,
-                    { let lp = str::from_utf8(lp).unwrap();
-                        format_args("    .long {lp}rt.at - {lp}rt.files\n") });
-            }
-        }
-        for f in 0..pcx.files.len() as i64 {
-            if (used[f as usize]) != 0 {
-                buf_fmt(pcx.data,
-                    { let lp = str::from_utf8(lp).unwrap(); format_args("{lp}rt.f{f}:\n") });
-                let path = out_path(f, pcx);
-                data_bytes(c_bytes(path), pcx);
-                data_bytes(b"\0", pcx);
-            }
-        }
-        unsafe { free(used.data as *mut u8); }
-        if pcx.ovf_census && !get_x86() {
-            data_section(writable: true, pcx: pcx);
-            let seen = sites + 1;
-            buf_fmt(pcx.data,
-                { let lp = str::from_utf8(lp).unwrap();
-                    format_args("{lp}rt.seen:\n    .space {seen}\n") });
-        }
+            { let lp = str::from_utf8(&lp).unwrap();
+                format_args("{lp}rt.seen:\n    .space {seen}\n") });
     }
 }
 
@@ -980,73 +963,4 @@ pub fn rt_output(class: i64, value: i64, pcx: &mut Ctx<Comp>) -> i64 {
     pcx.out_kinds.push(value);
     pcx.out_kind_of.put(value + 1, 3 + pcx.out_kinds.len() as i64);
     3 + pcx.out_kinds.len() as i64
-}
-
-// (0.28.0) STR_ALIGN's accessors: every use of it is one of them.
-fn get_str_align() -> IntVec {
-    // UNSAFE: the strings' alignments, a process-wide static mut; Rust has
-    // no safe access to a static mut
-    // SAFETY: pushed only by add_const_data, which no task runs (only
-    // const_data's task_phase == 0 branch reaches it, see STRS)
-    unsafe { STR_ALIGN }
-}
-
-fn set_str_align(v: IntVec) {
-    // UNSAFE: the strings' alignments, a process-wide static mut; Rust has
-    // no safe access to a static mut
-    // SAFETY: pushed only by add_const_data, which no task runs (only
-    // const_data's task_phase == 0 branch reaches it, see STRS)
-    unsafe {
-        STR_ALIGN = v;
-    }
-}
-
-// (0.28.0) RT_PANIC_SYM's accessors: every use of it is one of them.
-fn get_rt_panic_sym() -> i64 {
-    // UNSAFE: the runtime panic symbol, a process-wide static mut the tasks
-    // read; Rust has no safe access to a static mut
-    // SAFETY: make_rt_panic_sym writes it only while it is 0, and
-    // prepare_tasks calls make_rt_panic_sym on the main thread before
-    // pool_start's pthread_create, so every later call (gen0's
-    // a64_panic/x64_panic/runtime, lowering's rt_panic_call, all
-    // main-thread code outside phases) only reads it; tasks read it through
-    // rt_panic_sym, which never writes
-    unsafe { RT_PANIC_SYM }
-}
-
-fn set_rt_panic_sym(v: i64) {
-    // UNSAFE: the runtime panic symbol, a process-wide static mut the tasks
-    // read; Rust has no safe access to a static mut
-    // SAFETY: make_rt_panic_sym writes it only while it is 0, and
-    // prepare_tasks calls make_rt_panic_sym on the main thread before
-    // pool_start's pthread_create, so every later call (gen0's
-    // a64_panic/x64_panic/runtime, lowering's rt_panic_call, all
-    // main-thread code outside phases) only reads it; tasks read it through
-    // rt_panic_sym, which never writes
-    unsafe {
-        RT_PANIC_SYM = v;
-    }
-}
-
-// (0.28.0) RT_NOTE_SYM's accessors: every use of it is one of them.
-fn get_rt_note_sym() -> i64 {
-    // UNSAFE: the runtime note symbol, a process-wide static mut the tasks
-    // read; Rust has no safe access to a static mut
-    // SAFETY: make_rt_note_sym writes it only while it is 0, and
-    // prepare_tasks calls it on the main thread before pool_start; later
-    // calls (a64_note_runtime, rt_panic_call: main thread, outside phases)
-    // only read it; tasks only read it (rt_note_sym)
-    unsafe { RT_NOTE_SYM }
-}
-
-fn set_rt_note_sym(v: i64) {
-    // UNSAFE: the runtime note symbol, a process-wide static mut the tasks
-    // read; Rust has no safe access to a static mut
-    // SAFETY: make_rt_note_sym writes it only while it is 0, and
-    // prepare_tasks calls it on the main thread before pool_start; later
-    // calls (a64_note_runtime, rt_panic_call: main thread, outside phases)
-    // only read it; tasks only read it (rt_note_sym)
-    unsafe {
-        RT_NOTE_SYM = v;
-    }
 }

@@ -41,13 +41,13 @@ use crate::back::emit::stats::print_stats;
 use crate::back::isel::select_instructions;
 use crate::back::objfile::{asm_flush, asm_hand_over, asm_stream_begin, write_output};
 use crate::base::{
-    STDOUT, buf_bytes, buf_clear, buf_fmt, buf_len, buf_new, buf_ptr, buf_slice, buf_str,
-    buf_write_fd, buf_write_file, cstr, intern_c, out_path, sym_text,
+    STDOUT, buf_append, buf_clear, buf_copy, buf_fmt, buf_len, buf_new, buf_ptr, buf_str,
+    buf_write_fd, buf_write_file, c_eq, cstr, intern_c, out_path, sym_text,
 };
 use crate::base::timer::{
     T_CHECK, T_CODEGEN, T_ISEL, T_LOWER, T_OUTPUT, T_PARSE, timer_add, timer_now, timer_report,
 };
-use crate::front::ast::{NodeKind, child, init_ast, kids};
+use crate::front::ast::{NodeKind, child, init_ast};
 use crate::front::ast::NodeKind::{CStr, Fn};
 use crate::front::cheader::emit_c_header;
 use crate::front::check::check_program;
@@ -167,40 +167,32 @@ pub fn is_static_named(s: i64, pcx: &Ctx<Comp>) -> bool {
 // lowered, which -O1's optimizer only takes from), and std::arch::detect's word, which
 // instruction selection addresses later (back::isel::arch).
 pub fn statics_named_by_ir(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
-    // UNSAFE: the IR's tables (IRFUNCS, a function's blocks and
-    // instructions in cx) and SYM_STATIC are the compiler's raw arrays.
-    // SAFETY: fi < IRFUNC_COUNT; ir_enter makes cx's tables fi's, which
-    // hold its blocks and their instruction lists (first, next: 0 ends);
-    // a GADDR's imm is a static's symbol (materialize reads SYM_STATIC so),
-    // and so is ARCH_WORD_SYM when not 0.
-    unsafe {
-        for fi in 0..pcx.irfunc_count {
-            // (-O1 optimizes each function as it emits it: every one
-            // lowered, as its inlining may take any)
-            if (pcx.fn_live[fi as usize]) == 0 && !pcx.per_function {
+    for fi in 0..pcx.irfunc_count {
+        // (-O1 optimizes each function as it emits it: every one
+        // lowered, as its inlining may take any)
+        if (pcx.fn_live[fi as usize]) == 0 && !pcx.per_function {
+            continue;
+        }
+        ir_enter(cx, fi, pcx);
+        for bix in 0..fn_block_count(cx, fi) {
+            let b = fn_block(cx, fi, bix);
+            if (cx.blocks[b as usize]).removed != 0 {
                 continue;
             }
-            ir_enter(cx, fi, pcx);
-            for bix in 0..fn_block_count(cx, fi) {
-                let b = fn_block(cx, fi, bix);
-                if (cx.blocks[b as usize]).removed != 0 {
-                    continue;
+            let mut v = (cx.blocks[b as usize]).first;
+            while v != 0 {
+                if (cx.insts[v as usize]).op == Op::GAddr {
+                    static_named(
+                        (pcx.sym_static[(cx.insts[v as usize]).imm as usize]) - 1,
+                        pcx);
                 }
-                let mut v = (cx.blocks[b as usize]).first;
-                while v != 0 {
-                    if (cx.insts[v as usize]).op == Op::GAddr {
-                        static_named(
-                            (pcx.sym_static[(cx.insts[v as usize]).imm as usize]) - 1,
-                            pcx);
-                    }
-                    v = (cx.insts[v as usize]).next;
-                }
+                v = (cx.insts[v as usize]).next;
             }
         }
-        let word = pcx.arch_word_sym;
-        if word > 0 && (pcx.sym_static[word as usize]) > 0 {
-            static_named((pcx.sym_static[word as usize]) - 1, pcx);
-        }
+    }
+    let word = pcx.arch_word_sym;
+    if word > 0 && (pcx.sym_static[word as usize]) > 0 {
+        static_named((pcx.sym_static[word as usize]) - 1, pcx);
     }
 }
 
@@ -331,7 +323,8 @@ pub fn compile_program(cx: &mut FnCtx<Comp>, output: *mut u8, pcx: &mut Ctx<Comp
         // (0.26.1: from the kept bodies, gen0's places.vl, and the drop
         // shims those call; 0.26.2: only; an atomic intrinsic's body is its
         // instructions, gen_atomic_function)
-        for item in kids(program, pcx) {
+        for k in 0..pcx.nodes[program as usize].count {
+            let item = child(program, k, pcx);
             if pcx.nodes[item as usize].kind == Fn {
                 let f = pcx.nodes[item as usize].x - 1;
                 if !places::gen_places_function(cx, item, f, &mut pbody, pcx) {
@@ -380,10 +373,10 @@ pub fn compile_program(cx: &mut FnCtx<Comp>, output: *mut u8, pcx: &mut Ctx<Comp
     crate::back::isel::arch::emit_arch_runtime(cx, pcx);
     dbg_text_end(cx, pcx);
     gen_data(pcx);
-    buf_bytes(cx.asm, buf_slice(pcx.data));
+    buf_append(cx.asm, pcx.data);
     if pcx.debug_info {
         let producer = buf_new();
-        buf_fmt(producer, format_args("volec {}\0", str::from_utf8(cstr(version())).unwrap()));
+        buf_fmt(producer, format_args("volec {}\0", str::from_utf8(&cstr(version())).unwrap()));
         dbg_sections(cx, out_path(0, pcx), buf_ptr(producer), pcx);
     }
     emit_file_trailer(cx);
@@ -399,18 +392,16 @@ pub fn compile_program(cx: &mut FnCtx<Comp>, output: *mut u8, pcx: &mut Ctx<Comp
 // (0.18.1) An --emit-ir or --emit-mir dump: to stdout when the output is
 // `-` (no -o given), else to the file.
 fn write_dump(b: i64, output: *mut u8) {
-    unsafe {
-        if (*output.add(0)) == b'-' && (*output.add(1)) == 0 {
-            buf_write_fd(b, STDOUT);
-        } else {
-            buf_write_file(b, output);
-        }
+    if c_eq(output, b"-") {
+        buf_write_fd(b, STDOUT);
+    } else {
+        buf_write_file(b, output);
     }
 }
 
 fn gen_data(pcx: &mut Ctx<Comp>) {
     data_section(writable: false, pcx: pcx);
-    for id in 0..get_str_count() {
+    for id in 0..get_str_count(pcx) {
         data_string(id, pcx);
     }
     let scratch = buf_new();
@@ -435,13 +426,13 @@ fn gen_data(pcx: &mut Ctx<Comp>) {
             data_align(8, pcx);
             if pcx.statics[s as usize].linkage == 2 {
                 buf_fmt(pcx.data,
-                    format_args(".globl {}{}\n", str::from_utf8(cstr(global_prefix())).unwrap(),
+                    format_args(".globl {}{}\n", str::from_utf8(&cstr(global_prefix())).unwrap(),
                         str::from_utf8(sym_text(pcx.nodes[item as usize].a, pcx)).unwrap()));
             }
             data_label(static_symbol_prefix(s, pcx), pcx.nodes[item as usize].a, pcx);
             buf_fmt(pcx.data,
                 format_args("    .quad {}str.{}\n",
-                    str::from_utf8(cstr(local_prefix())).unwrap(), pcx.nodes[init as usize].a));
+                    str::from_utf8(&cstr(local_prefix())).unwrap(), pcx.nodes[init as usize].a));
             continue;
         }
         const_emit(init, ty, scratch, pcx);
@@ -452,7 +443,7 @@ fn gen_data(pcx: &mut Ctx<Comp>) {
         let writable = pcx.statics[s as usize].mutable || relocs || is_interior_type(ty, pcx);
         // (0.25.5: all zero, it takes no room in the object)
         if writable && !relocs && buf_len(scratch) > 0
-            && all_zero(buf_slice(scratch)) {
+            && all_zero(&buf_copy(scratch)) {
             bss_section(pcx);
         } else {
             data_section(writable, pcx);
@@ -460,11 +451,11 @@ fn gen_data(pcx: &mut Ctx<Comp>) {
         data_align(type_align(ty, pcx), pcx);
         if pcx.statics[s as usize].linkage == 2 {
             buf_fmt(pcx.data,
-                format_args(".globl {}{}\n", str::from_utf8(cstr(global_prefix())).unwrap(),
+                format_args(".globl {}{}\n", str::from_utf8(&cstr(global_prefix())).unwrap(),
                     str::from_utf8(sym_text(pcx.nodes[item as usize].a, pcx)).unwrap()));
         }
         data_label(static_symbol_prefix(s, pcx), pcx.nodes[item as usize].a, pcx);
-        let bytes = buf_slice(scratch);
+        let bytes = buf_copy(scratch);
         let mut done: i64 = 0;
         let mut r: i64 = 0;
         while r < pcx.const_relocs.len() as i64 {
@@ -472,7 +463,7 @@ fn gen_data(pcx: &mut Ctx<Comp>) {
             data_bytes(&bytes[done as usize..at as usize], pcx);
             buf_fmt(pcx.data,
                 format_args("    .quad {}str.{}\n",
-                    str::from_utf8(cstr(local_prefix())).unwrap(),
+                    str::from_utf8(&cstr(local_prefix())).unwrap(),
                     (pcx.const_relocs[(r + 1) as usize])));
             done = at + 8;
             r += 2;
@@ -511,7 +502,7 @@ fn gen_atomic_function(cx: &mut FnCtx<Comp>, item: i64, pcx: &mut Ctx<Comp>) {
     emit_label(cx, pcx.return_label);
     emit_epilogue(cx);
     emit_frame_reserve(cx, pcx.frame_size);
-    buf_bytes(cx.asm, buf_slice(cx.code));
+    buf_append(cx.asm, cx.code);
     dbg_function_end(cx, pcx);
 }
 

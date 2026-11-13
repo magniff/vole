@@ -7,7 +7,9 @@ use crate::back::objfile::{
     SEC_NOTE, SEC_TEXT, SEC_UNWIND, align_up, asym, is_debug, is_temp, pad_to, sym_addr, sym_name,
     w16, w32, w64, w8, wname16,
 };
-use crate::base::{IntVec, buf_bytes, buf_fmt, buf_len, buf_new, buf_set, buf_slice, buf_write_file};
+use crate::base::{
+    IntVec, buf_append, buf_bytes, buf_copy, buf_fmt, buf_len, buf_new, buf_set, buf_write_file,
+};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::target::get_x86;
@@ -27,255 +29,254 @@ fn macho_segname(sec: i64) -> &'static [u8] {
 }
 
 pub fn macho_write(path: *mut u8, asm: &mut Asm<Comp>, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        // Sections present: text always, the others when used.
-        let mut ord: [i64; 9] = [0i64; 9];
-        let mut secs: [i64; 9] = [0i64; 9];
-        let mut nsect: i64 = 0;
-        for sec in 0..SEC_COUNT {
-            if sec != SEC_NOTE
-                && (sec == SEC_TEXT || buf_len(pcx.sec_buf[sec as usize]) > 0
-                    || asm.sec_used[sec as usize]) {
-                secs[nsect as usize] = sec;
-                nsect += 1;
-                ord[sec as usize] = nsect;
-            }
+    // Sections present: text always, the others when used.
+    let mut ord: [i64; 9] = [0i64; 9];
+    let mut secs: [i64; 9] = [0i64; 9];
+    let mut nsect: i64 = 0;
+    for sec in 0..SEC_COUNT {
+        if sec != SEC_NOTE
+            && (sec == SEC_TEXT || buf_len(pcx.sec_buf[sec as usize]) > 0
+                || asm.sec_used[sec as usize]) {
+            secs[nsect as usize] = sec;
+            nsect += 1;
+            ord[sec as usize] = nsect;
         }
-        let mut vm: i64 = 0;
-        // (0.25.5) the end of the sections in the file: all but the
-        // zerofill one, which is last
-        let mut filled: i64 = 0;
-        for k in 0..nsect {
-            let sec = secs[k as usize];
-            vm = align_up(vm, 1 << asm.sec_align[sec as usize]);
-            pcx.sec_addr[sec as usize] = vm;
-            vm += buf_len(pcx.sec_buf[sec as usize]);
-            if sec != SEC_BSS {
-                filled = vm;
-            }
-        }
-        // On AArch64 LLVM marks the start of every section (but the debug
-        // ones) with a local symbol (ltmp0, ltmp1, ...): the linker keeps a
-        // section, even an empty one, by its symbols. The same here.
-        if !get_x86() {
-            let mut number: i64 = 0;
-            for k in 0..nsect {
-                let sec = secs[k as usize];
-                if is_debug(sec) {
-                    continue;
-                }
-                let name = buf_new();
-                buf_fmt(name, format_args("ltmp{number}"));
-                number += 1;
-                let s = asym(buf_slice(name), asm);
-                let mut first: i64 = 0;
-                while asm.frags[first as usize].sec != sec {
-                    first += 1;
-                }
-                asm.syms[s as usize].defined = true;
-                asm.syms[s as usize].sec = sec;
-                asm.syms[s as usize].frag = first;
-                asm.syms[s as usize].off = 0;
-            }
-        }
-        // Symbols: locals (labels that are not temporary, and temporaries a
-        // relocation needs), then defined globals, then undefined ones.
-        let mut order = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        for pass in 0..3 {
-            for s in 0..(asm.syms.len() as i64) {
-                let def = asm.syms[s as usize].defined;
-                let local = def && !asm.syms[s as usize].global
-                    && (!is_temp(s, asm) || asm.syms[s as usize].in_table);
-                let ext = def && asm.syms[s as usize].global;
-                let undef = !def
-                    && (asm.syms[s as usize].in_table
-                        || asm.syms[s as usize].global);
-                if (pass == 0 && local) || (pass == 1 && ext) || (pass == 2 && undef) {
-                    asm.syms[s as usize].index = order.len() as i64;
-                    order.push(s);
-                }
-            }
-        }
-        let mut nlocal: i64 = 0;
-        let mut next: i64 = 0;
-        for s in order.items() {
-            if asm.syms[s as usize].defined && !asm.syms[s as usize].global {
-                nlocal += 1;
-            } else if asm.syms[s as usize].defined {
-                next += 1;
-            }
-        }
-        let nundef = order.len() as i64 - nlocal - next;
-        // Relocations per section.
-        let ncmds: i64 = 4;
-        let seg_size = 72 + 80 * nsect;
-        let cmds_size = seg_size + 24 + 24 + 80;
-        // The contents mirror the addresses, as LLVM lays them out (0.11:
-        // aligned in the file as in memory, so that the segment's size in
-        // the file is its size in memory, which dsymutil checks).
-        let mut sec_off: [i64; 9] = [0i64; 9];
-        for k in 0..nsect {
-            let sec = secs[k as usize];
-            sec_off[sec as usize] = if sec == SEC_BSS { 0 }
-                else { 32 + cmds_size + pcx.sec_addr[sec as usize] };
-        }
-        let content_end = 32 + cmds_size + filled;
-        let mut off = content_end;
-        off = align_up(off, 8);
-        let mut rel_off: [i64; 9] = [0i64; 9];
-        let mut rel_n: [i64; 9] = [0i64; 9];
-        for k in 0..nsect {
-            let sec = secs[k as usize];
-            rel_off[sec as usize] = off;
-            for r in 0..pcx.relocs.len() as i64 {
-                if pcx.relocs[r as usize].sec == sec {
-                    rel_n[sec as usize] += 1;
-                }
-            }
-            off += 8 * rel_n[sec as usize];
-        }
-        let sym_off = off;
-        off += 16 * order.len() as i64;
-        let str_off = off;
-        let strs = buf_new();
-        w8(strs, 0);
-        let mut strx = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        for i in 0..order.len() as i64 {
-            strx.push(buf_len(strs));
-            buf_bytes(strs, sym_name(order[i as usize], asm));
-            w8(strs, 0);
-        }
-        pad_to(strs, align_up(buf_len(strs), 8));
-        let out = buf_new();
-        // Header.
-        w32(out, 0xfeedfacf);
-        w32(out, if get_x86() { 0x01000007 } else { 0x0100000c });
-        w32(out, if get_x86() { 3 } else { 0 });
-        w32(out, 1);
-        w32(out, ncmds);
-        w32(out, cmds_size);
-        w32(out, 0);
-        w32(out, 0);
-        // The segment and its sections.
-        w32(out, 0x19);
-        w32(out, seg_size);
-        wname16(out, b"");
-        w64(out, 0);
-        w64(out, vm);
-        w64(out, 32 + cmds_size);
-        w64(out, content_end - (32 + cmds_size));
-        w32(out, 7);
-        w32(out, 7);
-        w32(out, nsect);
-        w32(out, 0);
-        for k in 0..nsect {
-            let sec = secs[k as usize];
-            wname16(out, macho_sectname(sec));
-            wname16(out, macho_segname(sec));
-            w64(out, pcx.sec_addr[sec as usize]);
-            w64(out, buf_len(pcx.sec_buf[sec as usize]));
-            w32(out, sec_off[sec as usize]);
-            w32(out, asm.sec_align[sec as usize]);
-            w32(out, if rel_n[sec as usize] > 0 { rel_off[sec as usize] } else { 0 });
-            w32(out, rel_n[sec as usize]);
-            w32(out,
-                if sec == SEC_TEXT { 0x80000400 }
-                else if is_debug(sec) || sec == SEC_UNWIND { 0x02000000 }
-                else if sec == SEC_BSS { 1 } else { 0 });
-            w32(out, 0);
-            w32(out, 0);
-            w32(out, 0);
-        }
-        // LC_BUILD_VERSION: macOS 11.0 (arm64) or 10.13 (x86-64).
-        w32(out, 0x32);
-        w32(out, 24);
-        w32(out, 1);
-        w32(out, if get_x86() { 0x000a0d00 } else { 0x000b0000 });
-        w32(out, 0);
-        w32(out, 0);
-        // LC_SYMTAB.
-        w32(out, 2);
-        w32(out, 24);
-        w32(out, sym_off);
-        w32(out, order.len() as i64);
-        w32(out, str_off);
-        w32(out, buf_len(strs));
-        // LC_DYSYMTAB.
-        w32(out, 0xb);
-        w32(out, 80);
-        w32(out, 0);
-        w32(out, nlocal);
-        w32(out, nlocal);
-        w32(out, next);
-        w32(out, nlocal + next);
-        w32(out, nundef);
-        for i in 0..12 {
-            w32(out, 0);
-        }
-        // Contents (a section-relative relocation holds the address in the
-        // object's address space: its section's address added).
-        for k in 0..nsect {
-            let sec = secs[k as usize];
-            if sec == SEC_BSS {
-                continue;
-            }
-            pad_to(out, sec_off[sec as usize]);
-            let start = buf_len(out);
-            buf_bytes(out, buf_slice(pcx.sec_buf[sec as usize]));
-            if !is_debug(sec) && sec != SEC_UNWIND {
-                continue;
-            }
-            for r in 0..pcx.relocs.len() as i64 {
-                if pcx.relocs[r as usize].sec == sec && pcx.relocs[r as usize].sym < 0 {
-                    let at = start + pcx.relocs[r as usize].offset;
-                    let target = pcx.sec_addr[(-1 - pcx.relocs[r as usize].sym) as usize] + pcx.relocs[r as usize].addend;
-                    for i in 0..8 {
-                        buf_set(out, (at + i), ((target
-                            >> (8 * i)) & 255) as u8)
-                            ;
-                    }
-                }
-            }
-        }
-        pad_to(out, align_up(buf_len(out), 8));
-        for k in 0..nsect {
-            let sec = secs[k as usize];
-            pad_to(out, rel_off[sec as usize]);
-            for r in 0..pcx.relocs.len() as i64 {
-                if pcx.relocs[r as usize].sec == sec {
-                    let rl = pcx.relocs[r as usize];
-                    w32(out, rl.offset);
-                    let pcrel: i64 = if rl.pcrel { 1 } else { 0 };
-                    if rl.sym < 0 {
-                        w32(out,
-                            ord[(-1 - rl.sym) as usize] | pcrel << 24 | rl.length << 25
-                                | rl.rtype << 28);
-                    } else {
-                        w32(out,
-                            asm.syms[rl.sym as usize].index | pcrel << 24
-                                | rl.length << 25 | 1 << 27 | rl.rtype << 28);
-                    }
-                }
-            }
-        }
-        pad_to(out, sym_off);
-        for i in 0..order.len() as i64 {
-            let s = (order[i as usize]);
-            w32(out, (strx[i as usize]));
-            if asm.syms[s as usize].defined {
-                w8(out, if asm.syms[s as usize].global { 0x0f } else { 0x0e });
-                w8(out, ord[asm.syms[s as usize].sec as usize]);
-                w16(out, 0);
-                w64(out,
-                    pcx.sec_addr[asm.syms[s as usize].sec as usize] + sym_addr(s, asm));
-            } else {
-                w8(out, 0x01);
-                w8(out, 0);
-                w16(out, 0);
-                w64(out, 0);
-            }
-        }
-        buf_bytes(out, buf_slice(strs));
-        buf_write_file(out, path);
     }
+    let mut vm: i64 = 0;
+    // (0.25.5) the end of the sections in the file: all but the
+    // zerofill one, which is last
+    let mut filled: i64 = 0;
+    for k in 0..nsect {
+        let sec = secs[k as usize];
+        vm = align_up(vm, 1 << asm.sec_align[sec as usize]);
+        pcx.sec_addr[sec as usize] = vm;
+        vm += buf_len(pcx.sec_buf[sec as usize]);
+        if sec != SEC_BSS {
+            filled = vm;
+        }
+    }
+    // On AArch64 LLVM marks the start of every section (but the debug
+    // ones) with a local symbol (ltmp0, ltmp1, ...): the linker keeps a
+    // section, even an empty one, by its symbols. The same here.
+    if !get_x86() {
+        let mut number: i64 = 0;
+        for k in 0..nsect {
+            let sec = secs[k as usize];
+            if is_debug(sec) {
+                continue;
+            }
+            let name = buf_new();
+            buf_fmt(name, format_args("ltmp{number}"));
+            number += 1;
+            let s = asym(&buf_copy(name), asm);
+            let mut first: i64 = 0;
+            while asm.frags[first as usize].sec != sec {
+                first += 1;
+            }
+            asm.syms[s as usize].defined = true;
+            asm.syms[s as usize].sec = sec;
+            asm.syms[s as usize].frag = first;
+            asm.syms[s as usize].off = 0;
+        }
+    }
+    // Symbols: locals (labels that are not temporary, and temporaries a
+    // relocation needs), then defined globals, then undefined ones.
+    let mut order = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+    for pass in 0..3 {
+        for s in 0..(asm.syms.len() as i64) {
+            let def = asm.syms[s as usize].defined;
+            let local = def && !asm.syms[s as usize].global
+                && (!is_temp(s, asm) || asm.syms[s as usize].in_table);
+            let ext = def && asm.syms[s as usize].global;
+            let undef = !def
+                && (asm.syms[s as usize].in_table
+                    || asm.syms[s as usize].global);
+            if (pass == 0 && local) || (pass == 1 && ext) || (pass == 2 && undef) {
+                asm.syms[s as usize].index = order.len() as i64;
+                order.push(s);
+            }
+        }
+    }
+    let mut nlocal: i64 = 0;
+    let mut next: i64 = 0;
+    for s in order.items() {
+        if asm.syms[s as usize].defined && !asm.syms[s as usize].global {
+            nlocal += 1;
+        } else if asm.syms[s as usize].defined {
+            next += 1;
+        }
+    }
+    let nundef = order.len() as i64 - nlocal - next;
+    // Relocations per section.
+    let ncmds: i64 = 4;
+    let seg_size = 72 + 80 * nsect;
+    let cmds_size = seg_size + 24 + 24 + 80;
+    // The contents mirror the addresses, as LLVM lays them out (0.11:
+    // aligned in the file as in memory, so that the segment's size in
+    // the file is its size in memory, which dsymutil checks).
+    let mut sec_off: [i64; 9] = [0i64; 9];
+    for k in 0..nsect {
+        let sec = secs[k as usize];
+        sec_off[sec as usize] = if sec == SEC_BSS { 0 }
+            else { 32 + cmds_size + pcx.sec_addr[sec as usize] };
+    }
+    let content_end = 32 + cmds_size + filled;
+    let mut off = content_end;
+    off = align_up(off, 8);
+    let mut rel_off: [i64; 9] = [0i64; 9];
+    let mut rel_n: [i64; 9] = [0i64; 9];
+    for k in 0..nsect {
+        let sec = secs[k as usize];
+        rel_off[sec as usize] = off;
+        for r in 0..pcx.relocs.len() as i64 {
+            if pcx.relocs[r as usize].sec == sec {
+                rel_n[sec as usize] += 1;
+            }
+        }
+        off += 8 * rel_n[sec as usize];
+    }
+    let sym_off = off;
+    off += 16 * order.len() as i64;
+    let str_off = off;
+    let strs = buf_new();
+    w8(strs, 0);
+    let mut strx = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+    for i in 0..order.len() as i64 {
+        strx.push(buf_len(strs));
+        buf_bytes(strs, sym_name(order[i as usize], asm));
+        w8(strs, 0);
+    }
+    pad_to(strs, align_up(buf_len(strs), 8));
+    let out = buf_new();
+    // Header.
+    w32(out, 0xfeedfacf);
+    w32(out, if get_x86() { 0x01000007 } else { 0x0100000c });
+    w32(out, if get_x86() { 3 } else { 0 });
+    w32(out, 1);
+    w32(out, ncmds);
+    w32(out, cmds_size);
+    w32(out, 0);
+    w32(out, 0);
+    // The segment and its sections.
+    w32(out, 0x19);
+    w32(out, seg_size);
+    wname16(out, b"");
+    w64(out, 0);
+    w64(out, vm);
+    w64(out, 32 + cmds_size);
+    w64(out, content_end - (32 + cmds_size));
+    w32(out, 7);
+    w32(out, 7);
+    w32(out, nsect);
+    w32(out, 0);
+    for k in 0..nsect {
+        let sec = secs[k as usize];
+        wname16(out, macho_sectname(sec));
+        wname16(out, macho_segname(sec));
+        w64(out, pcx.sec_addr[sec as usize]);
+        w64(out, buf_len(pcx.sec_buf[sec as usize]));
+        w32(out, sec_off[sec as usize]);
+        w32(out, asm.sec_align[sec as usize]);
+        w32(out, if rel_n[sec as usize] > 0 { rel_off[sec as usize] } else { 0 });
+        w32(out, rel_n[sec as usize]);
+        w32(out,
+            if sec == SEC_TEXT { 0x80000400 }
+            else if is_debug(sec) || sec == SEC_UNWIND { 0x02000000 }
+            else if sec == SEC_BSS { 1 } else { 0 });
+        w32(out, 0);
+        w32(out, 0);
+        w32(out, 0);
+    }
+    // LC_BUILD_VERSION: macOS 11.0 (arm64) or 10.13 (x86-64).
+    w32(out, 0x32);
+    w32(out, 24);
+    w32(out, 1);
+    w32(out, if get_x86() { 0x000a0d00 } else { 0x000b0000 });
+    w32(out, 0);
+    w32(out, 0);
+    // LC_SYMTAB.
+    w32(out, 2);
+    w32(out, 24);
+    w32(out, sym_off);
+    w32(out, order.len() as i64);
+    w32(out, str_off);
+    w32(out, buf_len(strs));
+    // LC_DYSYMTAB.
+    w32(out, 0xb);
+    w32(out, 80);
+    w32(out, 0);
+    w32(out, nlocal);
+    w32(out, nlocal);
+    w32(out, next);
+    w32(out, nlocal + next);
+    w32(out, nundef);
+    for i in 0..12 {
+        w32(out, 0);
+    }
+    // Contents (a section-relative relocation holds the address in the
+    // object's address space: its section's address added).
+    for k in 0..nsect {
+        let sec = secs[k as usize];
+        if sec == SEC_BSS {
+            continue;
+        }
+        pad_to(out, sec_off[sec as usize]);
+        let start = buf_len(out);
+        buf_append(out, pcx.sec_buf[sec as usize]);
+        if !is_debug(sec) && sec != SEC_UNWIND {
+            continue;
+        }
+        for r in 0..pcx.relocs.len() as i64 {
+            if pcx.relocs[r as usize].sec == sec && pcx.relocs[r as usize].sym < 0 {
+                let at = start + pcx.relocs[r as usize].offset;
+                let target = pcx.sec_addr[(-1 - pcx.relocs[r as usize].sym) as usize] + pcx.relocs[
+                    r as usize].addend;
+                for i in 0..8 {
+                    buf_set(out, (at + i), ((target
+                        >> (8 * i)) & 255) as u8)
+                        ;
+                }
+            }
+        }
+    }
+    pad_to(out, align_up(buf_len(out), 8));
+    for k in 0..nsect {
+        let sec = secs[k as usize];
+        pad_to(out, rel_off[sec as usize]);
+        for r in 0..pcx.relocs.len() as i64 {
+            if pcx.relocs[r as usize].sec == sec {
+                let rl = pcx.relocs[r as usize];
+                w32(out, rl.offset);
+                let pcrel: i64 = if rl.pcrel { 1 } else { 0 };
+                if rl.sym < 0 {
+                    w32(out,
+                        ord[(-1 - rl.sym) as usize] | pcrel << 24 | rl.length << 25
+                            | rl.rtype << 28);
+                } else {
+                    w32(out,
+                        asm.syms[rl.sym as usize].index | pcrel << 24
+                            | rl.length << 25 | 1 << 27 | rl.rtype << 28);
+                }
+            }
+        }
+    }
+    pad_to(out, sym_off);
+    for i in 0..order.len() as i64 {
+        let s = (order[i as usize]);
+        w32(out, (strx[i as usize]));
+        if asm.syms[s as usize].defined {
+            w8(out, if asm.syms[s as usize].global { 0x0f } else { 0x0e });
+            w8(out, ord[asm.syms[s as usize].sec as usize]);
+            w16(out, 0);
+            w64(out,
+                pcx.sec_addr[asm.syms[s as usize].sec as usize] + sym_addr(s, asm));
+        } else {
+            w8(out, 0x01);
+            w8(out, 0);
+            w16(out, 0);
+            w64(out, 0);
+        }
+    }
+    buf_append(out, strs);
+    buf_write_file(out, path);
 }

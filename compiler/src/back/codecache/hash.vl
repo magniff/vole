@@ -12,7 +12,9 @@
 // left out: they hold what a pass left (stamps), which no later pass
 // reads before writing.
 
-use crate::base::{IntVec, alloc_array, free, getenv, sized_table};
+use std::alloc::Allocator;
+
+use crate::base::{IntVec, sized_table};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::FN_CLOSURE;
@@ -40,26 +42,27 @@ pub fn mix2(h: u64, x: u64) -> u64 {
     v ^ (v >> 31)
 }
 
-// The hash of n bytes at p.
-pub fn hash_bytes(p: *mut u8, n: i64) -> u64 {
-    unsafe {
-        let mut h: u64 = mix(0x6279746573, n as u64);
-        let mut i: i64 = 0;
-        while i + 8 <= n {
-            let mut w: u64 = 0;
-            for k in 0..8 {
-                w = w | (((*p.add((i + k) as usize)) as u64) << (8 * k) as u64);
-            }
-            h = mix(h, w);
-            i += 8;
+// The hash of bytes b: its length, its words (little-endian), then the
+// bytes left.
+pub fn hash_bytes(b: &[u8]) -> u64 {
+    let n = b.len();
+    let mut h: u64 = mix(0x6279746573, n as u64);
+    let mut i: usize = 0;
+    while i + 8 <= n {
+        let c = &b[i..i + 8];
+        let mut w: u64 = 0;
+        for k in 0..8 {
+            w = w | ((c[k] as u64) << (8 * k) as u64);
         }
-        let mut t: u64 = 0;
-        while i < n {
-            t = (t << 8) | (*p.add(i as usize)) as u64;
-            i += 1;
-        }
-        mix(h, t)
+        h = mix(h, w);
+        i += 8;
     }
+    let mut t: u64 = 0;
+    while i < n {
+        t = (t << 8) | b[i] as u64;
+        i += 1;
+    }
+    mix(h, t)
 }
 
 // A 128-bit hash, two lanes of 64.
@@ -104,7 +107,7 @@ pub fn fn_nameh(f: i64, pcx: &Ctx<Comp>) -> i64 {
 
 // The symbol hash of IR function g.
 pub fn ir_nameh(g: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe { (pcx.fn_nameh[pcx.ir_fn[g as usize] as usize]) }
+    (pcx.fn_nameh[pcx.ir_fn[g as usize] as usize])
 }
 
 // The FNS index of the function with symbol hash h, or -1 (none, or
@@ -122,76 +125,61 @@ pub fn ir_of_name(h: i64, pcx: &Ctx<Comp>) -> i64 {
 
 // The tables above, for the program as lowered (main thread, once).
 pub fn names_begin(moves: IntVec, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        pcx.canon_count = pcx.fns.len() as i64;
-        sized_table(&mut pcx.fn_nameh, pcx.fns.len() as i64 + 1, 0);
-        sized_table(&mut pcx.fn_canon, pcx.fns.len() as i64 + 1, 0);
-        sized_table(&mut pcx.fn_ambig, pcx.fns.len() as i64 + 1, false);
-        for f in 0..pcx.fns.len() as i64 {
-            (pcx.fn_nameh[f as usize]) = fn_nameh(f, pcx);
-            let k = name_key((pcx.fn_nameh[f as usize]));
-            let was = pcx.name_fn.get(k);
-            if was == 0 {
-                pcx.name_fn.put(k, f + 1);
-            } else {
-                pcx.name_fn.put(k, -1);
-                if was > 0 {
-                    (pcx.fn_ambig[(was - 1) as usize]) = true;
-                }
-                (pcx.fn_ambig[f as usize]) = true;
+    pcx.canon_count = pcx.fns.len() as i64;
+    sized_table(&mut pcx.fn_nameh, pcx.fns.len() as i64 + 1, 0);
+    sized_table(&mut pcx.fn_canon, pcx.fns.len() as i64 + 1, 0);
+    sized_table(&mut pcx.fn_ambig, pcx.fns.len() as i64 + 1, false);
+    for f in 0..pcx.fns.len() as i64 {
+        (pcx.fn_nameh[f as usize]) = fn_nameh(f, pcx);
+        let k = name_key((pcx.fn_nameh[f as usize]));
+        let was = pcx.name_fn.get(k);
+        if was == 0 {
+            pcx.name_fn.put(k, f + 1);
+        } else {
+            pcx.name_fn.put(k, -1);
+            if was > 0 {
+                (pcx.fn_ambig[(was - 1) as usize]) = true;
             }
+            (pcx.fn_ambig[f as usize]) = true;
         }
-        for f in 0..pcx.fns.len() as i64 {
-            (pcx.fn_canon[f as usize]) = fn_canon(f, pcx) as i64;
-            if (pcx.fn_ambig[f as usize]) && getenv(c"VOLE_CACHE_CHECK") != 0 as *mut u8 {
-                eprintln(
-                    "code cache check: two functions are {} ({f})",
-                    str::from_utf8(crate::base::cstr(crate::base::sym_name(pcx.fns[f as usize].name,
-                        pcx))).unwrap());
-            }
-        }
-        for g in 0..pcx.irfunc_count {
-            let k = name_key((pcx.fn_nameh[pcx.ir_fn[g as usize] as usize]));
-            let v: i64 = if pcx.name_ir.get(k) == 0 { g + 1 } else { -1 };
-            pcx.name_ir.put(k, v);
-        }
-        sized_table(&mut pcx.fn_moves, pcx.irfunc_count + 1, 0);
-        let mut i: i64 = 0;
-        while i + 1 < moves.len() as i64 {
-            let fi = (moves[i as usize]);
-            if fi >= 0 && fi < pcx.irfunc_count {
-                (pcx.fn_moves[fi as usize]) = mix(mix((pcx.fn_moves[fi as usize]) as u64,
-                    0x6d6f7665),
-                    (moves[(i + 1) as usize]) as u64)
-                    as i64;
-            }
-            i += 2;
-        }
-        strings_begin(pcx);
     }
+    for f in 0..pcx.fns.len() as i64 {
+        (pcx.fn_canon[f as usize]) = fn_canon(f, pcx) as i64;
+        if (pcx.fn_ambig[f as usize]) && std::env::var_in("VOLE_CACHE_CHECK", Comp {}).is_ok() {
+            eprintln(
+                "code cache check: two functions are {} ({f})",
+                str::from_utf8(
+                    &crate::base::cstr(crate::base::sym_name(pcx.fns[f as usize].name,
+                        pcx))).unwrap());
+        }
+    }
+    for g in 0..pcx.irfunc_count {
+        let k = name_key((pcx.fn_nameh[pcx.ir_fn[g as usize] as usize]));
+        let v: i64 = if pcx.name_ir.get(k) == 0 { g + 1 } else { -1 };
+        pcx.name_ir.put(k, v);
+    }
+    sized_table(&mut pcx.fn_moves, pcx.irfunc_count + 1, 0);
+    let mut i: i64 = 0;
+    while i + 1 < moves.len() as i64 {
+        let fi = (moves[i as usize]);
+        if fi >= 0 && fi < pcx.irfunc_count {
+            (pcx.fn_moves[fi as usize]) = mix(mix((pcx.fn_moves[fi as usize]) as u64,
+                0x6d6f7665),
+                (moves[(i + 1) as usize]) as u64)
+                as i64;
+        }
+        i += 2;
+    }
+    strings_begin(pcx);
 }
 
-// STR_H for every string made so far (main thread, between phases: the
-// strings grow only then).
+// Ctx.str_h for every string made so far (main thread, between phases:
+// the strings grow only then).
 pub fn strings_begin(pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if get_str_count() > pcx.str_h_cap {
-            let cap = get_str_count() + get_str_count() / 2 + 64;
-            let n = alloc_array::<i64>(cap);
-            for i in 0..pcx.str_h_count {
-                (*n.add(i as usize)) = (*pcx.str_h.add(i as usize));
-            }
-            free(pcx.str_h as *mut u8);
-            pcx.str_h = n;
-            pcx.str_h_cap = cap;
-        }
-        while pcx.str_h_count < get_str_count() {
-            let s = str_at(pcx.str_h_count);
-            (*pcx.str_h.add(pcx.str_h_count as usize)) = mix(hash_bytes(s.ptr, s.len() as i64),
-                str_align(pcx.str_h_count) as u64)
-                as i64;
-            pcx.str_h_count += 1;
-        }
+    while (pcx.str_h.len() as i64) < get_str_count(pcx) {
+        let k = pcx.str_h.len() as i64;
+        let h = mix(hash_bytes(str_at(k, pcx)), str_align(k, pcx) as u64) as i64;
+        pcx.str_h.push(h);
     }
 }
 
@@ -266,61 +254,57 @@ pub fn types_hash(pcx: &Ctx<Comp>) -> u64 {
 }
 
 fn struct_hash(s: i64, pcx: &Ctx<Comp>) -> u64 {
-    unsafe {
-        // (not its name nor its symbol prefix: a closure's struct, and an
-        // instance whose type arguments name a closure, are named by where
-        // the closure is, which a line added above changes; the methods'
-        // symbols are the functions')
-        let st = pcx.structs[s as usize];
-        let mut h: u64 = 0x737472;
-        h = mix(h, st.field_count as u64);
-        for i in 0..st.field_count {
-            let fd = (pcx.fields[(st.fields + i) as usize]);
-            h = mix(h, sym_h(fd.name, pcx));
-            h = mix(h, fd.ty as u64);
-            h = mix(h, fd.offset as u64);
-        }
-        h = mix(h, st.layout_state as u64);
-        h = mix(h, st.repr as u64);
-        h = mix(h, st.align as u64);
-        h = mix(h, st.generic as u64);
-        h = mix(h, st.tmpl as u64);
-        h = mix(h, st.targ_count as u64);
-        for i in 0..st.targ_count {
-            h = mix(h, (pcx.tlists[(st.targs + i) as usize]) as u64);
-        }
-        mix(h, if st.closure != 0 { 1 } else { 0 })
+    // (not its name nor its symbol prefix: a closure's struct, and an
+    // instance whose type arguments name a closure, are named by where
+    // the closure is, which a line added above changes; the methods'
+    // symbols are the functions')
+    let st = pcx.structs[s as usize];
+    let mut h: u64 = 0x737472;
+    h = mix(h, st.field_count as u64);
+    for i in 0..st.field_count {
+        let fd = (pcx.fields[(st.fields + i) as usize]);
+        h = mix(h, sym_h(fd.name, pcx));
+        h = mix(h, fd.ty as u64);
+        h = mix(h, fd.offset as u64);
     }
+    h = mix(h, st.layout_state as u64);
+    h = mix(h, st.repr as u64);
+    h = mix(h, st.align as u64);
+    h = mix(h, st.generic as u64);
+    h = mix(h, st.tmpl as u64);
+    h = mix(h, st.targ_count as u64);
+    for i in 0..st.targ_count {
+        h = mix(h, (pcx.tlists[(st.targs + i) as usize]) as u64);
+    }
+    mix(h, if st.closure != 0 { 1 } else { 0 })
 }
 
 fn enum_hash(e: i64, pcx: &Ctx<Comp>) -> u64 {
-    unsafe {
-        let en = (pcx.enums[e as usize]);
-        let mut h: u64 = 0x656e756d;
-        h = mix(h, en.variant_count as u64);
-        for i in 0..en.variant_count {
-            let v = pcx.variants[(en.variants + i) as usize];
-            h = mix(h, sym_h(v.name, pcx));
-            h = mix(h, v.discr as u64);
-            h = mix(h, v.field_count as u64);
-            for k in 0..v.field_count {
-                h = mix(h, (pcx.tlists[(v.fields + k) as usize]) as u64);
-            }
-            h = mix(h, v.shape as u64);
+    let en = (pcx.enums[e as usize]);
+    let mut h: u64 = 0x656e756d;
+    h = mix(h, en.variant_count as u64);
+    for i in 0..en.variant_count {
+        let v = pcx.variants[(en.variants + i) as usize];
+        h = mix(h, sym_h(v.name, pcx));
+        h = mix(h, v.discr as u64);
+        h = mix(h, v.field_count as u64);
+        for k in 0..v.field_count {
+            h = mix(h, (pcx.tlists[(v.fields + k) as usize]) as u64);
         }
-        h = mix(h, en.tag as u64);
-        h = mix(h, if en.has_fields { 1 } else { 0 });
-        h = mix(h, en.layout_state as u64);
-        h = mix(h, en.repr as u64);
-        h = mix(h, en.payload as u64);
-        h = mix(h, en.generic as u64);
-        h = mix(h, en.tmpl as u64);
-        h = mix(h, en.targ_count as u64);
-        for i in 0..en.targ_count {
-            h = mix(h, (pcx.tlists[(en.targs + i) as usize]) as u64);
-        }
-        mix(h, if e < pcx.enum_count && enum_niche(e, pcx) { 2 } else { 1 })
+        h = mix(h, v.shape as u64);
     }
+    h = mix(h, en.tag as u64);
+    h = mix(h, if en.has_fields { 1 } else { 0 });
+    h = mix(h, en.layout_state as u64);
+    h = mix(h, en.repr as u64);
+    h = mix(h, en.payload as u64);
+    h = mix(h, en.generic as u64);
+    h = mix(h, en.tmpl as u64);
+    h = mix(h, en.targ_count as u64);
+    for i in 0..en.targ_count {
+        h = mix(h, (pcx.tlists[(en.targs + i) as usize]) as u64);
+    }
+    mix(h, if e < pcx.enum_count && enum_niche(e, pcx) { 2 } else { 1 })
 }
 
 // ---- A function's IR ----
@@ -348,7 +332,7 @@ pub fn const_canon(id: i64, pcx: &Ctx<Comp>) -> u64 {
     const_data_copy(id, &mut bytes, pcx);
     let mut h: u64 = mix(0x636f6e, ir_nameh(owner, pcx) as u64);
     h = mix(h, k as u64);
-    h = mix(h, hash_bytes(bytes.as_slice().ptr, bytes.len() as i64));
+    h = mix(h, hash_bytes(&bytes));
     mix(h, const_data_align(id, pcx) as u64)
 }
 
@@ -365,13 +349,13 @@ fn fn_ref(h: &mut H2, f: i64, pcx: &Ctx<Comp>) {
 // with `extra` mixed in first. Its strings (the distinct ids of its
 // SADDRs of strings, in instruction order) are appended to `strs`; a
 // string made after the last strings_begin poisons (false).
-pub fn ir_hash(cx: &mut FnCtx<Comp>, fi: i64, extra: u64, strs: *mut IntVec, out: &mut H2,
-    pcx: &Ctx<Comp>) -> bool {
-    unsafe {
+pub fn ir_hash(cx: &mut FnCtx<Comp>, fi: i64, extra: u64, marks: &mut StrMarks<Comp>,
+    strs: &mut Vec<i64, Comp>, out: &mut H2, pcx: &Ctx<Comp>) -> bool {
+    {
         let mut ok = true;
         let mut h = h2_new(extra);
-        let stamp = str_stamp(cx, pcx);
-        let first = (*strs).len() as i64;
+        let stamp = str_stamp(marks, pcx);
+        let first = strs.len() as i64;
         h2_puti(&mut h, fn_entry(cx, fi));
         h2_puti(&mut h, fn_result_ptr(cx, fi));
         h2_puti(&mut h, fn_block_count(cx, fi));
@@ -393,17 +377,17 @@ pub fn ir_hash(cx: &mut FnCtx<Comp>, fi: i64, extra: u64, strs: *mut IntVec, out
             h2_puti(&mut h, v.c);
             if op == Op::SAddr {
                 if v.imm >= 0 {
-                    if v.imm >= pcx.str_h_count {
+                    if v.imm >= pcx.str_h.len() as i64 {
                         ok = false;
                     } else {
-                        let cc = cx.cc;
-                        if (*(*cc).str_seen.add(v.imm as usize)) != stamp {
-                            (*(*cc).str_seen.add(v.imm as usize)) = stamp;
-                            (*(*cc).str_k.add(v.imm as usize)) = (*strs).len() as i64 - first;
-                            (*strs).push(v.imm);
+                        let id = v.imm as usize;
+                        if marks.seen[id] != stamp {
+                            marks.seen[id] = stamp;
+                            marks.k[id] = strs.len() as i64 - first;
+                            strs.push(v.imm);
                         }
-                        h2_puti(&mut h, (*(*cc).str_k.add(v.imm as usize)));
-                        h2_puti(&mut h, (*pcx.str_h.add(v.imm as usize)));
+                        h2_puti(&mut h, marks.k[id]);
+                        h2_puti(&mut h, pcx.str_h[id]);
                     }
                 } else {
                     h2_put(&mut h, const_canon(v.imm, pcx));
@@ -483,18 +467,22 @@ fn hash_ints(h: &mut H2, v: &[i64]) {
     }
 }
 
-// A new stamp for cx's string marks (sized to the strings).
-fn str_stamp(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let cc = crate::back::codecache::cc_of(cx);
-        if (*cc).str_cap < pcx.str_h_count {
-            free((*cc).str_seen as *mut u8);
-            free((*cc).str_k as *mut u8);
-            (*cc).str_cap = pcx.str_h_count + pcx.str_h_count / 2 + 64;
-            (*cc).str_seen = alloc_array::<i64>((*cc).str_cap);
-            (*cc).str_k = alloc_array::<i64>((*cc).str_cap);
-        }
-        (*cc).str_stamp += 1;
-        (*cc).str_stamp
+// Scratch for ir_hash's strings (a task's, in its cache state): per
+// string, the stamp of the hash that listed it and its place in that
+// list.
+pub struct StrMarks<A: Allocator> { seen: Vec<i64, A>, k: Vec<i64, A>, stamp: i64 }
+
+pub fn str_marks() -> StrMarks<Comp> {
+    StrMarks { seen: Vec::new_in(Comp {}), k: Vec::new_in(Comp {}), stamp: 0 }
+}
+
+// A new stamp for the string marks (sized to the strings).
+fn str_stamp(m: &mut StrMarks<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    let n = pcx.str_h.len();
+    if m.seen.len() < n {
+        m.seen.resize(n + n / 2 + 64, 0);
+        m.k.resize(n + n / 2 + 64, 0);
     }
+    m.stamp += 1;
+    m.stamp
 }

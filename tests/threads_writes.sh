@@ -49,30 +49,19 @@ base::ctx::Ctx.fn_nocapture	the task'"'"'s own component'"'"'s entries
 base::ctx::Ctx.fn_attrs_done	the task'"'"'s own component'"'"'s entries
 base::ctx::Ctx.comp_growth	the task'"'"'s own component'"'"'s entry, read between levels
 base::ctx::Ctx.comp_inlined	the task'"'"'s own component'"'"'s entry, read between levels
-back::codecache::FN_IRH	the task'"'"'s own functions'"'"' entries; others read a lower level'"'"'s or an earlier phase'"'"'s (FN_IRH_OK)
-back::codecache::FN_IRH_OK	the same
-back::codecache::FN_STRS	the same
-back::codecache::OUT_COMP	the task'"'"'s own component'"'"'s entry, read after the phases (the counts)
-back::codecache::OUT_EMIT	the task'"'"'s own function'"'"'s entry, read after the phases
-back::codecache::OUT_SCALAR	the task'"'"'s own function'"'"'s entry, read after the phases
-back::codecache::SCALAR_REC	the task'"'"'s own function'"'"'s entry (its cleanup'"'"'s, then its scalar pipeline'"'"'s, a phase after)
-back::codecache::pack::NEW	the task'"'"'s own slot, read when the pack is written
-back::codecache::pack::USED	the entry of the task'"'"'s own key, read when the pack is written (0.27.8: a key is one task'"'"'s but a function'"'"'s that shares its symbol, fn_ambig, whose task does not mark it: mark_used)
-base::ctx::Ctx.pack	read only: an entry'"'"'s body is read through its address
+base::ctx::Ctx.cc_irh_a	the task'"'"'s own functions'"'"' entries (atomics); others read a lower level'"'"'s or an earlier phase'"'"'s (cc_irh_ok)
+base::ctx::Ctx.cc_irh_b	the same
+base::ctx::Ctx.cc_irh_ok	the same
+base::ctx::Ctx.cc_strs	the same (lists, each behind its lock)
+base::ctx::Ctx.cc_out_comp	the task'"'"'s own component'"'"'s entry (an atomic), read after the phases (the counts)
+base::ctx::Ctx.cc_out_emit	the task'"'"'s own function'"'"'s entry (an atomic), read after the phases
+base::ctx::Ctx.cc_out_scalar	the task'"'"'s own function'"'"'s entry (an atomic), read after the phases
+base::ctx::Ctx.pack_new	the task'"'"'s own slot (behind the slot'"'"'s lock), read when the pack is written
+base::ctx::Ctx.pack_used	the entry of the task'"'"'s own key (an atomic), read when the pack is written (0.27.8: a key is one task'"'"'s but a function'"'"'s that shares its symbol, fn_ambig, whose task does not mark it: mark_used)
+base::ctx::Ctx.pack	read only: an entry'"'"'s body is a slice of it
 base::STRESS_GROW	read by prepare_tasks (stress_grow)
-front::distinct::NICHE	enum_niche: every enum'"'"'s is made before a phase (prepare_layouts)
-front::cells::FREEZE_MEMO	interior_part: every type'"'"'s Freeze fact is made before a phase (prepare_layouts), so a task only reads it (GVN'"'"'s param_class_of)
-front::lexer::STRS	add_const_data: only on const_data'"'"'s serial branch (task_phase 0)
-front::lexer::STR_COUNT	the same
-gen0::target::STR_ALIGN	the same
-front::lexer::STR_CAP	the same
-base::CWD	-g (dbg_loc'"'"'s paths, out_path)
-base::OUT_PATHS	-g
-base::ROOT_DIR	-g
-base::ROOT_LEX	-g
-base::ROOT_LEX_ABS	-g
-tools::query::checks::REMOVED	query checks (--print-checks), which runs on one thread
-base::timer::T_TOTALS	--time-passes, which runs on one thread (timer_add writes only then)
+base::ctx::Ctx.niche	enum_niche: an atomic per enum; every enum'"'"'s is made before a phase (prepare_layouts), and a task that stores stores the same fact
+base::ctx::Ctx.freeze_memo	interior_part: an atomic per type; every type'"'"'s Freeze fact is made before a phase (prepare_layouts), so a task only reads it (GVN'"'"'s param_class_of)
 base::BUFS	a task writes its context'"'"'s buffers'"'"' entries; none is made in a task (buf_new: below)
 base::BUF_CAP	buf_new, below
 base::BUF_COUNT	buf_new: the printers of --stats, --print-regalloc, --print-after-all, --verify-* (one thread), and internal errors, which exit
@@ -82,8 +71,7 @@ base::diag::ERR_POISONED	the IR printers (one thread)'
 JOINED='base::BUFS	the join writes the program'"'"'s buffers'"'"' entries, a task its context'"'"'s
 base::BUF_COUNT	asm_error, which exits
 base::BUF_CAP	asm_error, which exits
-base::STRESS_GROW	read by prepare_tasks (stress_grow)
-base::timer::T_TOTALS	--time-passes, which runs on one thread'
+base::STRESS_GROW	read by prepare_tasks (stress_grow)'
 
 # The assembler thread's and -O0's main thread's: static <TAB> why
 ASSEMBLER='base::BUFS	asm_error (an internal error, which exits) and dwarf_file (-g, which does not stream: no thread)
@@ -132,13 +120,14 @@ base::ctx::Ctx.needs_count	IR: the same
 base::ctx::Ctx.cc_on	own
 base::ctx::Ctx.check	own (testing)
 base::ctx::Ctx.codecache_env	own: the key'"'"'s program hash
-back::codecache::FN_IRH	own: read R_IR
-back::codecache::FN_IRH_OK	own
-back::codecache::FN_STRS	own: the strings of a read IR
-back::codecache::OUT_COMP	own
-back::codecache::OUT_EMIT	own
-back::codecache::OUT_SCALAR	own
-back::codecache::SCALAR_REC	own: a function'"'"'s recording, from its cleanup to its scalar pipeline
+base::ctx::Ctx.cc_irh_a	own: read R_IR
+base::ctx::Ctx.cc_irh_b	own: the same
+base::ctx::Ctx.cc_irh_ok	own
+base::ctx::Ctx.cc_strs	own: the strings of a read IR
+base::ctx::Ctx.cc_out_comp	own
+base::ctx::Ctx.cc_out_emit	own
+base::ctx::Ctx.cc_out_scalar	own
+base::ctx::Ctx.cc_scalar	own: a function'"'"'s recording, from its cleanup to its scalar pipeline (the task'"'"'s own function'"'"'s, behind its lock)
 base::ctx::Ctx.why	own (testing)
 base::ctx::Ctx.fn_ambig	own
 base::ctx::Ctx.fn_canon	own: what IR names a function by
@@ -147,14 +136,11 @@ base::ctx::Ctx.fn_nameh	own
 base::ctx::Ctx.name_fn	own
 base::ctx::Ctx.name_ir	own
 base::ctx::Ctx.str_h	own: a string'"'"'s bytes
-base::ctx::Ctx.str_h_count	own
-base::ctx::Ctx.entry_at	own
-base::ctx::Ctx.index	own
-base::ctx::Ctx.index_size	own
-back::codecache::pack::NEW	own
-base::ctx::Ctx.new_slots	own
+base::ctx::Ctx.pack_entries	own
+base::ctx::Ctx.pack_index	own
+base::ctx::Ctx.pack_new	own
 base::ctx::Ctx.pack	own
-back::codecache::pack::USED	own
+base::ctx::Ctx.pack_used	own
 base::ctx::Ctx.dbg	off: -g (and --vec-stats=FN, --trace: the line starts) runs on one thread (serial_only) and the cache is off; the tables of -g, behind a lock
 base::ctx::Ctx.debug_info	off: -g
 base::ctx::Ctx.stats	off: --stats
@@ -165,12 +151,10 @@ base::ctx::Ctx.x86_alloc_acd	key: options_hash
 base::BUFS	own: the context'"'"'s buffers
 base::BUF_CAP	own: buf_new on internal errors and printers
 base::BUF_COUNT	own: the same
-base::CWD	off: -g (out_path)
+base::ctx::Ctx.cwd	off: -g (out_path: the current directory, made when first asked; an atomic)
 base::ctx::Ctx.files	off: -g (dbg_loc, out_path)
-base::OUT_PATHS	off: -g
-base::ROOT_DIR	off: -g
-base::ROOT_LEX	off: -g
-base::ROOT_LEX_ABS	off: -g
+base::ctx::Ctx.out_paths	off: -g (out_path; atomics, one a file)
+base::ctx::Ctx.root_dir	off: -g (root_dir; an atomic)
 base::SRC	off: -g
 base::STDOUT_CAPTURE	own: messages
 base::STRESS_GROW	key: options_hash (stress_grow)
@@ -183,22 +167,20 @@ base::ctx::Ctx.apple_a64	key: options_hash
 base::target::ELF	key: options_hash
 base::target::X86	key: options_hash
 base::ctx::Ctx.time_passes	off: --time-passes
-base::timer::T_TOTALS	off: --time-passes
+base::ctx::Ctx.t_totals	off: --time-passes (atomics, one a phase)
 base::ctx::Ctx.nodes	IR: a closure'"'"'s mark (fn_canon), a distinct type'"'"'s name (types_hash); -g
 base::ctx::Ctx.locals	own: a task makes variables above LOCAL_COUNT (ssa::new_synth_var), never reads a local'"'"'s (locals.len(): the same)
 base::ctx::Ctx.any_distinct	key: options_hash
-front::distinct::NICHE	key: types_hash (enum_niche)
+base::ctx::Ctx.niche	key: types_hash (enum_niche)
 base::ctx::Ctx.niche_aliases	key: types_hash
-front::cells::FREEZE_MEMO	key: types_hash (each type'"'"'s is_freeze)
-front::cells::SYM_UNSAFE_CELL	key: the same
+base::ctx::Ctx.freeze_memo	key: types_hash (each type'"'"'s is_freeze)
+base::ctx::Ctx.sym_unsafe_cell	key: the same
 base::ctx::Ctx.modules	key: the same (is_within, only from is_freeze: whether a struct is std'"'"'s UnsafeCell)
 base::ctx::Ctx.std_module	key: the same (within_std)
 base::ctx::Ctx.node_fx	IR: a function'"'"'s effects (fn_canon); (0.29) the table itself, fn_effects was its second name
 base::ctx::Ctx.fn_effects_count	IR: the same
-front::effects::builtin::TABLE	IR: by a symbol'"'"'s text; the same in every build of a compiler
-front::lexer::STRS	IR: a string'"'"'s bytes (STR_H)
-front::lexer::STR_CAP	IR: the same (no string is made in a task)
-front::lexer::STR_COUNT	IR: the same
+base::ctx::Ctx.c_effects	IR: by a symbol'"'"'s text; the same in every build of a compiler
+base::ctx::Ctx.strs	IR: a string'"'"'s bytes and alignment (STR_H); behind a lock, and no string is made in a task (add_const_data: only on const_data'"'"'s serial branch, task_phase 0)
 base::ctx::Ctx.edition	key: options_hash (0.27.1: a rust body gets no parameter alias facts, gvn noalias_active)
 base::ctx::Ctx.borrowck_verdict	fact: R_ATTRS mixes the verdict in; 0.27.1, gvn noalias_active asks it of a rust body, set per body before the tasks by places/borrowck
 base::ctx::Ctx.enums	key: types_hash
@@ -221,9 +203,8 @@ base::ctx::Ctx.ty_v8i16	key: types_hash (a fixed id)
 base::ctx::Ctx.variants	key: types_hash
 base::ctx::Ctx.main_sym	IR: a symbol by its text
 base::ctx::Ctx.link_names	IR: fn_canon
-gen0::target::RT_PANIC_SYM	IR: a symbol by its text
-gen0::target::RT_NOTE_SYM	IR: a symbol by its text
-gen0::target::STR_ALIGN	IR: a string'"'"'s alignment (STR_H)
+base::ctx::Ctx.rt_panic_sym	IR: a symbol by its text
+base::ctx::Ctx.rt_note_sym	IR: a symbol by its text
 base::ctx::Ctx.move_copies	IR: FN_MOVES
 base::ctx::Ctx.egraph	key: options_hash
 base::ctx::Ctx.rules	own: the rules, parsed when the context is made (egraph::rules_new), the same in every build of a compiler
@@ -281,7 +262,7 @@ base::ctx::Ctx.slp	key: options_hash
 base::ctx::Ctx.vectorize	key: options_hash
 base::ctx::Ctx.unroll_runtime	key: options_hash
 base::ctx::Ctx.print_checks	off: --print-checks
-tools::query::checks::REMOVED	off: --print-checks'
+base::ctx::Ctx.checks_removed	off: --print-checks (behind its lock)'
 
 cd "$ROOT" || exit 1
 WORK="$ROOT/target/threads"

@@ -41,8 +41,8 @@ mod link_macho;
 use crate::back::enc_arm64::{AOp, aop_none, init_a64};
 use crate::back::enc_x86::{XOp, init_x86, xop_none};
 use crate::base::{
-    alloc_array, alloc_zeroed, buf_byte, buf_clear, buf_fmt, buf_len, buf_new, buf_ptr, buf_slice,
-    buf_w16, buf_w32, buf_write_file, cstr, die, free, memcmp, memcpy, realloc,
+    alloc_zeroed, buf_byte, buf_clear, buf_copy, buf_fmt, buf_len, buf_new, buf_ptr, buf_w16,
+    buf_w32, buf_write_file, cstr, die, memcmp, memcpy,
 };
 
 use assemble::{Memo, assemble_begin, assemble_line};
@@ -85,6 +85,9 @@ pub struct Asm<A: std::alloc::Allocator> {
     pub open: i64,
     // (0.18.1) The assembled bytes.
     pub obj: Vec<u8, A>,
+    // (0.29) The constant data's bytes (Ctx.obj_raw), here while text is
+    // assembled on the main thread (assemble_text); empty otherwise.
+    pub raw: Vec<u8, A>,
     // Mach-O's atoms: a label that is not temporary starts one, which
     // runs to the next. LLVM resolves a pc-relative reference only within
     // one atom (else the linker could move them apart): the current atom
@@ -159,7 +162,8 @@ pub struct Asm<A: std::alloc::Allocator> {
 pub fn asm_new() -> Asm<Comp> {
     Asm {
         text: Vec::new_in(Comp {}), cur_sec: 0, sec_align: [0i64; 9], sec_used: [false; 9],
-        frags: Vec::new_in(Comp {}), open: -1, obj: Vec::new_in(Comp {}), cur_atom: [-1; 9],
+        frags: Vec::new_in(Comp {}), open: -1, obj: Vec::new_in(Comp {}),
+        raw: Vec::new_in(Comp {}), cur_atom: [-1; 9],
         syms: Vec::new_in(Comp {}), sym_names: Vec::new_in(Comp {}),
         sym_table: Vec::new_in(Comp {}), lookups: 0, fixups: Vec::new_in(Comp {}),
         line_start: 0, line_end: 0, op_start: [0i64; 8], op_end: [0i64; 8], op_count: 0,
@@ -209,16 +213,13 @@ pub const TAIL_JCC: i64 = 3;
     pub long: bool, pub addr: i64, pub atom: i64,
 }
 
-// (0.18.1) Bytes that grow: RAW's and the assembler's memo's.
-#[derive(Clone, Copy)] pub struct ObjBytes { data: *mut u8, len: i64, cap: i64 }
-
-// (0.25) Constant data's bytes, put here by the code generator when the
-// output is an object (gen0::target's data_bytes): the text names a run
-// of them, `.vole_data OFFSET, LENGTH`, instead of spelling it in `.byte`
-// lines (12 MB of text for the compiler's 2.9 MB of constants), and the
-// assembler copies it. Written and read on the main thread only, after
-// the code generation's threads.
-static mut RAW: ObjBytes = ObjBytes { data: 0 as *mut u8, len: 0, cap: 0 };
+// (0.25) Constant data's bytes (Ctx.obj_raw), put there by the code
+// generator when the output is an object (gen0::target's data_bytes): the
+// text names a run of them, `.vole_data OFFSET, LENGTH`, instead of
+// spelling it in `.byte` lines (12 MB of text for the compiler's 2.9 MB
+// of constants), and the assembler copies it. The code generator writes
+// them through `&Ctx`, so they are behind a lock; the assembler has them
+// (Asm.raw) while it assembles text on the main thread (assemble_text).
 
 // Appends `bytes` to v, as one block.
 pub fn append_bytes(v: &mut Vec<u8, Comp>, bytes: &[u8]) {
@@ -253,61 +254,23 @@ pub fn same_bytes(a: &[u8], b: &[u8]) -> bool {
     unsafe { memcmp(a.ptr, b.ptr, a.len() as u64) == 0 }
 }
 
-// Appends bytes to RAW; returns their offset there.
-pub fn raw_data(bytes: &[u8]) -> i64 {
-    { let mut raw_copy = get_raw(); let r_copy = bytes_append(&mut raw_copy, bytes);
-        set_raw(raw_copy); r_copy }
+// Appends bytes to the constant data's bytes; returns their offset there.
+pub fn raw_data(bytes: &[u8], pcx: &Ctx<Comp>) -> i64 {
+    let mut raw = pcx.obj_raw.lock().unwrap();
+    let at = raw.len() as i64;
+    append_bytes(&mut *raw, bytes);
+    at
 }
 
-// Appends bytes [at, at + n) of RAW to the object's bytes; false when RAW
-// has no such bytes.
+// Appends bytes [at, at + n) of the constant data's bytes to the object's
+// bytes; false when there are no such bytes (or the assembler was not
+// given them: the text of -O0's assembler thread names none).
 pub fn raw_out(at: i64, n: i64, asm: &mut Asm<Comp>) -> bool {
-    let raw = get_raw();
-    if at < 0 || n < 0 || at + n > raw.len {
+    if at < 0 || n < 0 || at + n > asm.raw.len() as i64 {
         return false;
     }
-    // UNSAFE: RAW is a malloc'd block behind a raw pointer (a static the
-    // code generator fills through `&Ctx`); a slice of it has to be made
-    // from the pointer.
-    // SAFETY: [at, at + n) is inside [0, raw.len), checked above, and
-    // bytes_append keeps raw.data a block of at least raw.len initialized
-    // bytes; RAW is written only by raw_data on the main thread before the
-    // text that names its bytes is assembled (write_object, after the
-    // assembler's thread has ended), so nothing moves it while the slice
-    // lives, which is this call.
-    let bytes = unsafe { std::slice::from_raw_parts(raw.data.add(at as usize), n as usize) };
-    append_bytes(&mut asm.obj, bytes);
+    append_bytes(&mut asm.obj, &asm.raw[at as usize..(at + n) as usize]);
     true
-}
-
-// Appends bytes to b; returns their offset there.
-pub fn bytes_append(b: &mut ObjBytes, bytes: &[u8]) -> i64 {
-    // UNSAFE: ObjBytes is a malloc'd block grown with realloc and filled with
-    // memcpy (RAW, a static, cannot hold a Vec: its allocator is not const).
-    // SAFETY: b.data is null or a block of b.cap bytes: only this function
-    // writes data and cap, and it sets cap to the size realloc was given
-    // (realloc(null, n) is malloc(n); a failed realloc dies); after the growth
-    // cap >= len + n, so [at, at + n) is inside the block; bytes.ptr has n
-    // bytes (a slice's); the two cannot overlap, b being borrowed mutably.
-    unsafe {
-        let n = bytes.len() as i64;
-        if b.len + n > b.cap {
-            let mut cap: i64 = if b.cap == 0 { 65536 } else { b.cap * 2 };
-            while cap < b.len + n {
-                cap *= 2;
-            }
-            let grown = realloc(b.data, cap as u64);
-            if grown == 0 as *mut u8 {
-                die(c"out of memory");
-            }
-            b.data = grown;
-            b.cap = cap;
-        }
-        let at = b.len;
-        memcpy(b.data.add(at as usize), bytes.ptr, n as u64);
-        b.len = at + n;
-        at
-    }
 }
 
 fn new_frag(sec: i64, asm: &mut Asm<Comp>) {
@@ -547,97 +510,6 @@ pub fn names_get(m: &Names<Comp>, name: &[u8]) -> i64 {
     m.vals[names_slot(m, name)]
 }
 
-// (0.18.1) A table from names to values (0: none): the assembler's own
-// (its mnemonics, registers), so that it reads no table the rest of the
-// compiler grows while it runs on a thread of its own. A name is its
-// bytes' address and length.
-#[derive(Clone, Copy)] pub struct NameMap {
-    pub ptrs: *mut i64, pub lens: *mut i64, pub vals: *mut i64, pub size: i64, pub count: i64,
-}
-
-fn name_at(m: NameMap, slot: i64) -> &'static [u8] {
-    // UNSAFE: NameMap keeps each name as a pointer and a length in two raw
-    // tables (it is a static's type, arch::table's INSN_BY_NAME, which cannot
-    // hold a Vec).
-    // SAFETY: the callers (name_put, name_get) pass a slot below m.size, the
-    // tables' length (masked by size - 1), whose value is not 0: name_put
-    // stored there a block of lens[slot] + 1 bytes it allocated and filled,
-    // and no name is ever freed, which is what 'static says.
-    unsafe {
-        std::slice::from_raw_parts(((*m.ptrs.add(slot as usize)) as *mut u8).add((0) as usize),
-            ((*m.lens.add(slot as usize)) - (0)) as usize)
-    }
-}
-
-pub fn name_put(m: &mut NameMap, name: &[u8], value: i64) {
-    // UNSAFE: NameMap's raw tables (see name_at): allocated, indexed and
-    // freed by hand.
-    // SAFETY: ptrs, lens and vals are blocks of m.size entries (alloc_array,
-    // zeroed), or unused while m.size is 0, in which case the first branch
-    // allocates before any read; every index is below size: i < old.size in
-    // the copy, slot masked by size - 1 (a power of two: 256 doubled); the
-    // loop ends because the table is at most half full; the old tables are
-    // freed once, after their names moved, and `old` is not used again; the
-    // copy has n + 1 bytes for name's n.
-    unsafe {
-        if (m.count + 1) * 2 > m.size {
-            let old = *m;
-            m.size = if old.size == 0 { 256 } else { old.size * 2 };
-            m.ptrs = alloc_array::<i64>(m.size);
-            m.lens = alloc_array::<i64>(m.size);
-            m.vals = alloc_array::<i64>(m.size);
-            m.count = 0;
-            for i in 0..old.size {
-                if (*old.vals.add(i as usize)) != 0 {
-                    name_put(m,
-                        std::slice::from_raw_parts(
-                            ((*old.ptrs.add(i as usize)) as *mut u8).add((0) as usize),
-                            ((*old.lens.add(i as usize)) - (0)) as usize),
-                        (*old.vals.add(i as usize)));
-                }
-            }
-            free(old.ptrs as *mut u8);
-            free(old.lens as *mut u8);
-            free(old.vals as *mut u8);
-        }
-        let mask = (m.size - 1) as u64;
-        let mut slot = name_hash(name) & mask;
-        while (*m.vals.add(slot as usize)) != 0 && name_at(*m, slot as i64) != name {
-            slot = (slot + 1) & mask;
-        }
-        if (*m.vals.add(slot as usize)) == 0 {
-            let n = name.len() as i64;
-            let copy = alloc_zeroed(n + 1);
-            memcpy(copy, name.ptr, n as u64);
-            (*m.ptrs.add(slot as usize)) = copy as i64;
-            (*m.lens.add(slot as usize)) = n;
-            m.count += 1;
-        }
-        (*m.vals.add(slot as usize)) = value;
-    }
-}
-
-pub fn name_get(m: NameMap, name: &[u8]) -> i64 {
-    // UNSAFE: NameMap's raw tables (see name_at).
-    // SAFETY: size is not 0 here, so vals is a block of size entries; slot is
-    // masked by size - 1; the loop ends at an empty slot, of which a table at
-    // most half full has one.
-    unsafe {
-        if m.size == 0 {
-            return 0;
-        }
-        let mask = (m.size - 1) as u64;
-        let mut slot = name_hash(name) & mask;
-        while (*m.vals.add(slot as usize)) != 0 {
-            if name_at(m, slot as i64) == name {
-                return (*m.vals.add(slot as usize));
-            }
-            slot = (slot + 1) & mask;
-        }
-        0
-    }
-}
-
 // A C string's bytes.
 pub fn c_bytes(s: *mut u8) -> &'static [u8] {
     // UNSAFE: a C string seen as a slice (base::c_bytes)
@@ -717,7 +589,7 @@ fn reloc(sec: i64, offset: i64, rtype: i64, sym: i64, addend: i64, pcrel: bool, 
 // A relocation against symbol s itself (a GOT entry's).
 fn reloc_to_symbol(sec: i64, offset: i64, rtype: i64, s: i64, pcrel: bool, asm: &mut Asm<Comp>,
     pcx: &mut Ctx<Comp>) {
-    unsafe { asm.syms[s as usize].in_table = true; }
+    asm.syms[s as usize].in_table = true;
     reloc(sec, offset, rtype, s, 0, pcrel, 2, pcx);
 }
 
@@ -725,15 +597,13 @@ fn reloc_to_symbol(sec: i64, offset: i64, rtype: i64, s: i64, pcrel: bool, asm: 
 // becomes its section's symbol plus the label's offset.
 fn reloc_to(sec: i64, offset: i64, rtype: i64, s: i64, extra: i64, pcrel: bool, length: i64,
     asm: &mut Asm<Comp>, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if get_elf() && asm.syms[s as usize].defined && is_temp(s, asm) {
-            reloc(sec, offset, rtype, -1 - asm.syms[s as usize].sec,
-                extra + sym_addr(s, asm), pcrel, length, pcx);
-            return;
-        }
-        asm.syms[s as usize].in_table = true;
-        reloc(sec, offset, rtype, s, extra, pcrel, length, pcx);
+    if get_elf() && asm.syms[s as usize].defined && is_temp(s, asm) {
+        reloc(sec, offset, rtype, -1 - asm.syms[s as usize].sec,
+            extra + sym_addr(s, asm), pcrel, length, pcx);
+        return;
     }
+    asm.syms[s as usize].in_table = true;
+    reloc(sec, offset, rtype, s, extra, pcrel, length, pcx);
 }
 
 // ---- Output helpers ----
@@ -786,7 +656,7 @@ pub fn write_object(cx: &mut FnCtx<Comp>, path: *mut u8, pcx: &mut Ctx<Comp>) {
     if !pcx.asm_stream {
         assembler_begin(&mut cx.assembler);
     }
-    assemble_text(cx);
+    assemble_text(cx, pcx);
     if pcx.asm_stream {
         buf_clear(cx.asm);
     }
@@ -828,8 +698,13 @@ fn assembler_begin(asm: &mut Asm<Comp>) {
 }
 
 // Assembles the lines in ASM.
-fn assemble_text(cx: &mut FnCtx<Comp>) {
-    assemble_bytes(buf_slice(cx.asm), &mut cx.assembler);
+fn assemble_text(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
+    // (the constant data's bytes are the assembler's while it runs: the
+    // lock is held, so nothing is added to them meanwhile)
+    let mut raw = pcx.obj_raw.lock().unwrap();
+    std::mem::swap(&mut *raw, &mut cx.assembler.raw);
+    assemble_bytes(&buf_copy(cx.asm), &mut cx.assembler);
+    std::mem::swap(&mut *raw, &mut cx.assembler.raw);
 }
 
 // The position of the first newline of text at or after `from`, or
@@ -878,7 +753,7 @@ pub fn asm_flush(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
         // the end, not the code generation's that runs it)
         let t = timer_now(pcx);
         c_module_symbols(cx, pcx);
-        assemble_text(cx);
+        assemble_text(cx, pcx);
         buf_clear(cx.asm);
         timer_sub(T_CODEGEN, T_OUTPUT, t, pcx);
     }
@@ -952,7 +827,7 @@ pub fn write_output(cx: &mut FnCtx<Comp>, path: *mut u8, pcx: &mut Ctx<Comp>) {
         return;
     }
     let obj = buf_new();
-    buf_fmt(obj, format_args("{}.vole.o\0", str::from_utf8(cstr(path)).unwrap()));
+    buf_fmt(obj, format_args("{}.vole.o\0", str::from_utf8(&cstr(path)).unwrap()));
     let obj_path = buf_ptr(obj);
     write_object(cx, obj_path, pcx);
     // (0.25.3: the link's inputs first, its failure one error)
@@ -967,7 +842,7 @@ pub fn write_output(cx: &mut FnCtx<Comp>, path: *mut u8, pcx: &mut Ctx<Comp>) {
         // (-g) On macOS the debug information stays in the object, which
         // goes: dsymutil gathers it into <path>.dSYM first, as clang does.
         let dsym = buf_new();
-        buf_fmt(dsym, format_args("dsymutil '{}'\0", str::from_utf8(cstr(path)).unwrap()));
+        buf_fmt(dsym, format_args("dsymutil '{}'\0", str::from_utf8(&cstr(path)).unwrap()));
         // UNSAFE: C's system: std has no call that runs a shell command
         // line.
         // SAFETY: the command is buffer `dsym`'s bytes, which end in the
@@ -988,43 +863,4 @@ fn remove_object(obj: i64) {
     // format wrote after it, and is not written again; unlink reads up to
     // that NUL and keeps no pointer.
     unsafe { unlink(buf_ptr(obj)); }
-}
-
-// (0.28.0) RAW's accessors: every use of it is one of them.
-pub fn get_raw() -> ObjBytes {
-    // UNSAFE: the assembler's state, a process-wide static mut that the
-    // main thread and the assembler thread use in turn; Rust has no safe
-    // access to a static mut
-    // SAFETY: one thread at a time uses it: the main thread before
-    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
-    // it in compile_program) and after asm_thread_finish's pthread_join,
-    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
-    // pthread_create and pthread_join order the hand-overs; no worker
-    // reaches it, the -O0 main thread's code generation between start and
-    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
-    // the loop around them) touches none of it, and at -O1+ there is no
-    // assembler thread (only the main thread assembles, in join_task's
-    // asm_flush); accessed through the accessor's raw pointer, no reference
-    // kept
-    unsafe { RAW }
-}
-
-pub fn set_raw(v: ObjBytes) {
-    // UNSAFE: the assembler's state, a process-wide static mut that the
-    // main thread and the assembler thread use in turn; Rust has no safe
-    // access to a static mut
-    // SAFETY: one thread at a time uses it: the main thread before
-    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
-    // it in compile_program) and after asm_thread_finish's pthread_join,
-    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
-    // pthread_create and pthread_join order the hand-overs; no worker
-    // reaches it, the -O0 main thread's code generation between start and
-    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
-    // the loop around them) touches none of it, and at -O1+ there is no
-    // assembler thread (only the main thread assembles, in join_task's
-    // asm_flush); accessed through the accessor's raw pointer, no reference
-    // kept
-    unsafe {
-        RAW = v;
-    }
 }
