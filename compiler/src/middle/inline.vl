@@ -93,13 +93,19 @@ pub fn forget_fn_caches(fi: i64) {
     }
 }
 
-// The number of instructions that turn into code.
+// The number of instructions that turn into code on the paths that
+// return. (0.29) Not the panic blocks' (panic_blocks): a bounds check is
+// its compare and branch here, and what reports the failure is code the
+// function runs at most once, laid out away from the rest. Counted, it
+// made a checked accessor (`t.v[i]`: 8) twice its unchecked form, and a
+// table turned into a Vec lost the inlining of every accessor of it.
 pub fn func_size(cx: &mut FnCtx<Comp>, fi: i64) -> i64 {
     let mut size: i64 = 0;
+    let panics = panic_blocks(cx, fi);
     unsafe {
         for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
             let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
-            if (*cx.blocks.add(b as usize)).removed != 0 {
+            if (*cx.blocks.add(b as usize)).removed != 0 || panics[b as usize] {
                 continue;
             }
             let mut v = (*cx.blocks.add(b as usize)).first;
@@ -114,6 +120,71 @@ pub fn func_size(cx: &mut FnCtx<Comp>, fi: i64) -> i64 {
         }
     }
     size
+}
+
+// (0.29) The blocks of function fi (the current one) that only lead to a
+// panic, by block id: a block that ends in UNREACH (after a call that does
+// not return: a failed check's report, `panic`, `exit`), and a block
+// every successor of which is one. They are cold and run at most once:
+// the inliner counts neither their instructions (func_size) nor their
+// calls (callee_flags, has_calls). Not a loop, nor what leads to one:
+// whether a loop with a check in it ever ends is not asked. And none in a
+// function that never returns (it has no RET): that one is all report,
+// and its size is what a call of it brings (counted as nothing, `panic`
+// itself would be inlined into every report).
+pub fn panic_blocks(cx: &mut FnCtx<Comp>, fi: i64) -> Vec<bool, Comp> {
+    let mut panics: Vec<bool, Comp> = Vec::new_in(Comp {});
+    panics.resize(cx.block_count as usize + 1, false);
+    // UNSAFE: the function's block list and the blocks are raw tables
+    // (IRFUNCS, cx.blocks), read by index.
+    // SAFETY: fi is the current function (ir_enter), so its block list
+    // holds ids below cx.block_count, the size of cx.blocks; a block's
+    // successors are blocks of the same function.
+    unsafe {
+        let mut returns = false;
+        let mut changed = false;
+        for b in (*get_irfuncs().add(fi as usize)).blocks.items() {
+            if (*cx.blocks.add(b as usize)).removed != 0 {
+                continue;
+            }
+            if (*cx.blocks.add(b as usize)).term == Term::Ret {
+                returns = true;
+            } else if (*cx.blocks.add(b as usize)).term == Term::Unreach {
+                panics[b as usize] = true;
+                changed = true;
+            }
+        }
+        if !returns {
+            panics.clear();
+            panics.resize(cx.block_count as usize + 1, false);
+            return panics;
+        }
+        while changed {
+            changed = false;
+            let mut i = (*get_irfuncs().add(fi as usize)).blocks.count;
+            // (backwards: a block is mostly after the ones that reach it)
+            while i > 0 {
+                i -= 1;
+                let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
+                let n = succ_count(cx, b);
+                if (*cx.blocks.add(b as usize)).removed != 0 || panics[b as usize] || n == 0 {
+                    continue;
+                }
+                let mut all = true;
+                for k in 0..n {
+                    if !panics[succ(cx, b, k) as usize] {
+                        all = false;
+                        break;
+                    }
+                }
+                if all {
+                    panics[b as usize] = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+    panics
 }
 
 // The IR function called by direct call v, or -1.
@@ -434,7 +505,8 @@ fn callee_returns_twice(cx: &mut FnCtx<Comp>, g: i64, pcx: &Ctx<Comp>) -> bool {
     (callee_flags(cx, g, pcx) & RT_RETURNS_TWICE) != 0
 }
 
-// Whether optimized function g calls nothing (0.17: see should_inline).
+// Whether optimized function g calls nothing on a path that returns
+// (0.17: see should_inline; 0.29: its panic blocks may call).
 fn callee_is_leaf(cx: &mut FnCtx<Comp>, g: i64, pcx: &Ctx<Comp>) -> bool {
     (callee_flags(cx, g, pcx) & RT_CALLS) == 0
 }
@@ -446,8 +518,16 @@ fn callee_flags(cx: &mut FnCtx<Comp>, g: i64, pcx: &Ctx<Comp>) -> i64 {
             let back = cx.ir_cur;
             ir_enter(cx, g, pcx);
             let mut flags: i64 = if calls_returns_twice(cx, g, pcx) { RT_RETURNS_TWICE } else { 0 };
+            // (0.29) A call in a panic block does not end leafness: the
+            // report of a failed check is not on any path that returns.
+            let panics = panic_blocks(cx, g);
             for b in (*get_irfuncs().add(g as usize)).blocks.items() {
-                if (*cx.blocks.add(b as usize)).removed == 0 {
+                if (*cx.blocks.add(b as usize)).removed != 0 {
+                    continue;
+                }
+                if panics[b as usize] {
+                    flags = flags | RT_PANICS;
+                } else {
                     let mut v = (*cx.blocks.add(b as usize)).first;
                     while v != 0 {
                         if (*cx.insts.add(v as usize)).op.is_call() {
@@ -467,6 +547,8 @@ fn callee_flags(cx: &mut FnCtx<Comp>, g: i64, pcx: &Ctx<Comp>) -> i64 {
 
 const RT_RETURNS_TWICE: i64 = 1;
 const RT_CALLS: i64 = 2;
+// (0.29) It has panic blocks, which its size leaves out (func_size).
+const RT_PANICS: i64 = 4;
 // (0.17) A leaf this small is inlined whatever the program's budget (see
 // should_inline).
 const INLINE_LEAF: i64 = 6;
@@ -528,8 +610,11 @@ fn should_inline(cx: &mut FnCtx<Comp>, fi: i64, g: i64, call: i64, pcx: &Ctx<Com
         // (0.10: with a profile, a call that never ran is cold, and a hot one
         // takes a callee up to INLINE_HOT)
         if site_cold(cx, b) || is_cold_block(cx, b, pcx) {
-            // In a cold block, only when that makes the program no bigger.
-            return once || cost <= 0;
+            // In a cold block, only when that makes the program no bigger
+            // (0.29: so not a callee with panic blocks, whose size says
+            // nothing of them: the report of a failed check would take in
+            // the functions it calls, and those theirs).
+            return once || (cost <= 0 && (callee_flags(cx, g, pcx) & RT_PANICS) == 0);
         }
         if once && (*get_fn_size().add(g as usize)) <= INLINE_ONCE {
             return true;
@@ -1188,10 +1273,19 @@ pub fn leaf_kept(fi: i64, pcx: &Ctx<Comp>) -> bool {
     unsafe { pcx.leaf_small != 0 as *mut i64 && (*pcx.leaf_small.add(fi as usize)) != 0 }
 }
 
-// Whether function fi makes a call (direct or not).
+// Whether function fi makes a call (direct or not) on a path that
+// returns. (0.29) A call in a panic block (panic_blocks) is not one when
+// it is the runtime's or C's and nothing in fi returns twice: the report
+// of a failed check, which left `s[i]` in a small function a call at -O1.
+// (An IR function's call there still counts: a leaf's own calls are not
+// inlined, and a small leaf called only from one would be dropped with
+// its call left, leaf_dropped. And a leaf's copies go into callers that
+// looked for setjmp and the like only in themselves, inline_leaf_calls.)
 fn has_calls(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
     unsafe {
         ir_enter(cx, fi, pcx);
+        let panics = panic_blocks(cx, fi);
+        let mut in_panics = false;
         for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
             let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
             if (*cx.blocks.add(b as usize)).removed != 0 {
@@ -1200,12 +1294,15 @@ fn has_calls(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
             let mut v = (*cx.blocks.add(b as usize)).first;
             while v != 0 {
                 if (*cx.insts.add(v as usize)).op.is_call() {
-                    return true;
+                    if !panics[b as usize] || (*cx.insts.add(v as usize)).op != Op::CallC {
+                        return true;
+                    }
+                    in_panics = true;
                 }
                 v = (*cx.insts.add(v as usize)).next;
             }
         }
-        false
+        in_panics && calls_returns_twice(cx, fi, pcx)
     }
 }
 
