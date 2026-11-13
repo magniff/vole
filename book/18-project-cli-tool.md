@@ -62,7 +62,6 @@ mod report;
 use std::{env, fs, io};
 use std::cli::{Arg, Command, Matches};
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 fn run(m: &Matches<Gpa>, n: usize, gpa: Gpa) -> io::Result<()> {
     let mut counts: HashMap<String<Gpa>, i64, Gpa, FixedState> = HashMap::new_in(gpa);
@@ -100,7 +99,6 @@ fn main(gpa: Gpa) -> i32 {
 ```vole count.vl
 // Counting the words of a text.
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 // Letters, digits and apostrophes are parts of words. So is every
 // byte of a non-ASCII character (0x80 and up), so "café" stays whole.
@@ -142,7 +140,6 @@ pub fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa, FixedState>, text: 
 // The table of the most common words.
 
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa, FixedState>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64),
     Gpa> {
@@ -269,7 +266,6 @@ complete program, one file at a time.
 
 use std::alloc::Allocator;
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 pub struct Counts {
     pub lines: usize,
@@ -404,7 +400,6 @@ map on any allocator: in the tests, the `Gpa`; in `main.vl`, an arena.
 // The report: the counts, and a table of the most common words.
 
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 use crate::count::Counts;
 
@@ -492,7 +487,6 @@ use std::{env, fmt, fs, io};
 use std::alloc::{Allocator, arena_scope};
 use std::cli::{Arg, Command, Matches};
 use std::collections::HashMap;
-use std::hash::FixedState;
 use std::fmt::{Display, Formatter};
 use std::io::Read;
 use std::string::FromUtf8Error;
@@ -781,8 +775,8 @@ patch`:
 
 ```console
 $ volec edit patch count::count --old 'let mut lines: usize = 0;' --new 'println("counting {} bytes", text.len()); let mut lines: usize = 0;'
-count.vl:26:5: error[effect] 'count::count' is #[no_io], but it does io: 'println("counting {} bytes", text.len())' at count.vl:27:5 calls 'std::fmt::println' | help: return the data and let the caller print it, or remove #[no_io] | try: volec query effects count::count --why io  [edited: crate::count::count]
-error edit.breaks: 1 new error; nothing written; the error: count.vl:26:5: 'count::count' is #[no_io], but it does io: 'println("counting {} bytes", text.len())' at count.vl:27:5 calls 'std::fmt::println'
+count.vl:25:5: error[effect] 'count::count' is #[no_io], but it does io: 'println("counting {} bytes", text.len())' at count.vl:26:5 calls 'std::fmt::println' | help: return the data and let the caller print it, or remove #[no_io] | try: volec query effects count::count --why io  [edited: crate::count::count]
+error edit.breaks: 1 new error; nothing written; the error: count.vl:25:5: 'count::count' is #[no_io], but it does io: 'println("counting {} bytes", text.len())' at count.vl:26:5 calls 'std::fmt::println'
 try: volec edit patch count::count --old 'let mut lines: usize = 0;' --new 'println("counting {} bytes", text.len()); let mut lines: usize = 0;' --no-check
 ```
 
@@ -795,11 +789,10 @@ A few last checks before calling it done. Is everything formatted?
 
 ```console
 $ volec fmt --check main.vl count.vl report.vl
-main.vl
 report.vl
-error fmt.unformatted: 2 of 3 files are not formatted
-try: volec fmt --dry-run main.vl
-try: volec fmt main.vl
+error fmt.unformatted: 1 of 3 files are not formatted
+try: volec fmt --dry-run report.vl
+try: volec fmt report.vl
 $ echo $?
 1
 ```

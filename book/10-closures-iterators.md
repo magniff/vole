@@ -492,7 +492,6 @@ as `logs.vl`:
 ```vole logs.vl
 use std::io;
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 struct Request<'a> {
     status: i64,
