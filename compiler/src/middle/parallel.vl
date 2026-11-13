@@ -31,7 +31,7 @@
 // process's), --stats, --verify-ir, the IR printers.
 
 use std::alloc::Allocator;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::host_target;
@@ -42,10 +42,7 @@ use crate::back::codecache::{
 use crate::back::emit::function::emit_task;
 use crate::back::emit::machine::m_load_imm;
 use crate::back::objfile::asm_flush;
-use crate::base::{
-    IntVec, alloc_array, alloc_zeroed, buf_append, buf_bytes, buf_clear, buf_int, buf_len, buf_ptr,
-    cstr, die, free, memcpy,
-};
+use crate::base::{buf_append, buf_bytes, buf_clear, buf_int, cstr, die, sized_table};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::target::{T_AARCH64_MACOS, T_X86_64_MACOS};
@@ -65,11 +62,6 @@ use crate::middle::threads::{
     pool_context, pool_run, pool_run_joined, pool_start, pool_stop, processors,
 };
 
-extern "C" {
-    fn memchr(s: *mut u8, c: i32, n: u64) -> *mut u8;
-    fn clock_gettime(clock: i32, ts: *mut i64) -> i32;
-}
-
 // ---- Options ----
 
 // The default -j: the processors, at most 8 (more threads than the
@@ -81,16 +73,15 @@ pub fn default_jobs() -> i64 {
 }
 
 // The number in text s (-j's), or -1.
-pub fn parse_jobs(s: *mut u8) -> i64 {
-    unsafe {
-        let mut n: i64 = 0;
-        let mut i: i64 = 0;
-        while (*s.add(i as usize)) >= b'0' && (*s.add(i as usize)) <= b'9' && n < 100000 {
-            n = n * 10 + ((*s.add(i as usize)) - b'0') as i64;
-            i += 1;
-        }
-        if i == 0 || (*s.add(i as usize)) != 0 { -1 } else { n }
+pub fn parse_jobs(s: &str) -> i64 {
+    let mut n: i64 = 0;
+    let mut i: usize = 0;
+    let b = s.as_bytes();
+    while i < b.len() && b[i] >= b'0' && b[i] <= b'9' && n < 100000 {
+        n = n * 10 + (b[i] - b'0') as i64;
+        i += 1;
     }
+    if i == 0 || i < b.len() { -1 } else { n }
 }
 
 // Whether this compilation must run on one thread: a mode that keeps the
@@ -130,10 +121,9 @@ pub fn assembler_thread_wanted(pcx: &Ctx<Comp>) -> bool {
 pub fn parallel_begin(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
     unsafe {
         prepare_tasks(cx, pcx);
-        set_fn_consts(alloc_zeroed((pcx.irfunc_count + 1) * size_of(ConstList)) as *mut ConstList);
-        set_fn_text(alloc_zeroed((pcx.irfunc_count + 1) * size_of(FnText)) as *mut FnText);
-        let fresh = crate::base::getenv(c"VOLE_FRESH_CONTEXTS");
-        pcx.fresh_contexts = fresh != 0 as *mut u8 && *fresh == b'1';
+        pcx.fn_consts.reset(pcx.irfunc_count + 1);
+        pcx.fn_texts.reset(pcx.irfunc_count + 1);
+        pcx.fresh_contexts = env_on("VOLE_FRESH_CONTEXTS");
         pool_start(threads_for(pcx.irfunc_count, pcx), pcx);
     }
 }
@@ -149,8 +139,7 @@ pub fn parallel_end(pcx: &mut Ctx<Comp>) {
 pub fn phase_time(name: *mut u8, pcx: &mut Ctx<Comp>) {
     unsafe {
         if pcx.phase_times == 0 {
-            let on = crate::base::getenv(c"VOLE_PHASE_TIMES");
-            pcx.phase_times = if on != 0 as *mut u8 && *on == b'1' { 1 } else { -1 };
+            pcx.phase_times = if env_on("VOLE_PHASE_TIMES") { 1 } else { -1 };
             pcx.phase_mark = monotonic_ns();
         }
         if pcx.phase_times < 0 || name == 0 as *mut u8 {
@@ -163,20 +152,30 @@ pub fn phase_time(name: *mut u8, pcx: &mut Ctx<Comp>) {
     }
 }
 
+// Whether environment variable `name` is set to a text that begins with 1.
+fn env_on(name: &str) -> bool {
+    match std::env::var_in(name, Comp {}) {
+        Ok(v) => v.as_bytes().len() > 0 && v.as_bytes()[0] == b'1',
+        Err(_) => false,
+    }
+}
+
 // Nanoseconds of the monotonic clock.
 fn monotonic_ns() -> i64 {
-    unsafe {
-        let mut ts: [i64; 2] = [0i64; 2];
-        let host = host_target();
-        let clock: i64 = if host == T_AARCH64_MACOS || host == T_X86_64_MACOS { 6 } else { 1 };
-        clock_gettime(clock as i32, &mut ts[0]);
-        ts[0] * 1000000000 + ts[1]
-    }
+    std::time::Instant::now().as_nanos() as i64
 }
 
 // (0.18.1) --vec-stats's counts (0 vector loops, 1 overlap tests, 2 tests
 // the facts dropped), summed over the contexts that made them.
 pub fn vec_stat(k: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    // UNSAFE: the function contexts are kept as raw pointers (the main
+    // one in the compilation context, the threads' in the pool: run_task
+    // says why).
+    // SAFETY: main_cx makes the main context when there is none, and a
+    // pool context is checked for null; none is ever freed. The one
+    // caller is main.vl's build, on the main thread after compile_program
+    // returned: the phases are over and pool_stop has joined the workers,
+    // so no task uses a context, and each `&mut` ends with its call.
     unsafe {
         let mut n = vec_stat_of(&mut *main_cx(pcx), k);
         for i in 0..pcx.pool_contexts {
@@ -198,179 +197,205 @@ fn vec_stat_of(cx: &mut FnCtx<Comp>, k: i64) -> i64 {
 // Constant data a task made for function `owner` (sroa.vl's constant
 // slots): its bytes, alignment, where it was made (phase and rank: the
 // order one thread makes them in) and its id once numbered (-1 before).
-#[derive(Clone, Copy)] struct PendingConst {
-    data: *mut u8, len: i64, align: i64, phase: i64, rank: i64, id: i64,
+struct PendingConst<A: Allocator> {
+    data: Vec<u8, A>, align: i64, phase: i64, rank: i64, id: i64,
 }
-// A function's: in chunks of CHUNK entries that never move (another
-// function's task reads the entries made before its phase while this one
-// adds more), through a table of CHUNKS chunks made with the first.
-#[derive(Clone, Copy)] struct ConstList { chunks: *mut *mut PendingConst, count: i64 }
-const CHUNK: i64 = 64;
-const CHUNKS: i64 = 1024;
 
-// Per IR function: the constant data made while it was optimized (its
-// own task writes it).
-static mut FN_CONSTS: *mut ConstList = 0 as *mut ConstList;
+// (0.29) Per IR function, the constant data made while it was optimized,
+// in the compilation context: each function's list behind a lock of its
+// own. List fi is appended by the task that has fi (const_data's callers
+// pass the pass's own fi); another function's task reads the entries made
+// before its phase (a placeholder of g reaches another function's IR only
+// by inlining g's IR: g of a finished lower level, or an -O1 small leaf,
+// whose constants are made serially and have real ids); the main thread
+// numbers them between phases (resolve_consts) and at the join
+// (number_consts, for the joined function, whose task is done). A lock is
+// held for one push or one read, so the table is used through `&` in safe
+// code.
+pub struct ConstLists<A: Allocator> {
+    v: Vec<Mutex<Vec<PendingConst<A>, A>>, A>,
+}
+
+pub fn const_lists() -> ConstLists<Comp> {
+    ConstLists { v: Vec::new_in(Comp {}) }
+}
+
+impl ConstLists<Comp> {
+    // n lists, each empty (main thread, before the pool starts).
+    pub fn reset(&mut self, n: i64) {
+        self.v.clear();
+        for i in 0..n {
+            self.v.push(Mutex::new(Vec::new_in(Comp {})));
+        }
+    }
+}
+
+// The most constant data one function's tasks make.
+const MAX_CONSTS: i64 = 65536;
+
 pub const OWNER_SHIFT: i64 = 20;
+
+// The function that made placeholder `id`, and its place in that
+// function's list.
+fn const_owner(id: i64) -> usize {
+    ((-id - 1) >> OWNER_SHIFT) as usize
+}
+
+fn const_index(id: i64) -> usize {
+    ((-id - 1) & ((1 << OWNER_SHIFT) - 1)) as usize
+}
 
 // The id of constant data `bytes` made by function fi's pipeline: in
 // serial code its id (gen0::add_const_data); in a task a placeholder,
 // -(1 + fi << OWNER_SHIFT + k), numbered at the end of the phase.
-pub fn const_data(cx: &mut FnCtx<Comp>, fi: i64, bytes: &[u8], align: i64) -> i64 {
-    unsafe {
-        if cx.task_phase == 0 {
-            return add_const_data(bytes, align);
-        }
-        let list = get_fn_consts().add(fi as usize) as *mut ConstList;
-        let k = (*list).count;
-        if k == 0 {
-            (*list).chunks = alloc_zeroed(CHUNKS * 8) as *mut *mut PendingConst;
-        }
-        if k == CHUNK * CHUNKS {
-            die(c"internal error: a function makes too much constant data");
-        }
-        if k % CHUNK == 0 {
-            (*(*list).chunks.add((k / CHUNK) as usize)) = alloc_zeroed(
-                CHUNK * size_of(PendingConst))
-                as *mut PendingConst;
-        }
-        let n = bytes.len() as i64;
-        let copy = alloc_zeroed(n + 1);
-        memcpy(copy, bytes.ptr, n as u64);
-        (*(*(*list).chunks.add((k / CHUNK) as usize)).add((k % CHUNK) as usize)) = PendingConst {
-            data: copy, len: n, align, phase: cx.task_phase, rank: cx.task_rank, id: -1,
-        };
-        (*list).count = k + 1;
-        -(1 + (fi << OWNER_SHIFT) + k)
+pub fn const_data(cx: &mut FnCtx<Comp>, fi: i64, bytes: &[u8], align: i64, pcx: &Ctx<Comp>) -> i64 {
+    if cx.task_phase == 0 {
+        return add_const_data(bytes, align);
     }
-}
-
-fn pending(id: i64) -> *mut PendingConst {
-    unsafe {
-        let m = -id - 1;
-        let k = m & ((1 << OWNER_SHIFT) - 1);
-        (*(*get_fn_consts().add((m >> OWNER_SHIFT) as usize)).chunks.add((k / CHUNK) as usize)).add(
-            (k % CHUNK) as usize)
+    let mut list = pcx.fn_consts.v[fi as usize].lock().unwrap();
+    let k = list.len() as i64;
+    if k == MAX_CONSTS {
+        die(c"internal error: a function makes too much constant data");
     }
+    let mut data: Vec<u8, Comp> = Vec::new_in(Comp {});
+    data.extend_from_slice(bytes);
+    list.push(PendingConst { data, align, phase: cx.task_phase, rank: cx.task_rank, id: -1 });
+    -(1 + (fi << OWNER_SHIFT) + k)
 }
 
 // The id of string or constant data `id` (a placeholder's once numbered;
 // -1 before).
-pub fn const_data_id(id: i64) -> i64 {
-    unsafe {
-        if id >= 0 { id } else { (*pending(id)).id }
+pub fn const_data_id(id: i64, pcx: &Ctx<Comp>) -> i64 {
+    if id >= 0 {
+        return id;
     }
+    let list = pcx.fn_consts.v[const_owner(id)].lock().unwrap();
+    (*list)[const_index(id)].id
 }
 
-// The bytes of string or constant data `id`.
-pub fn const_data_bytes(id: i64) -> &'static [u8] {
-    unsafe {
-        if id >= 0 {
-            return str_at(id);
-        }
-        let p = pending(id);
-        std::slice::from_raw_parts((*p).data.add((0) as usize), ((*p).len - (0)) as usize)
+// The `size` bytes (at most 8) at `offset` of string or constant data
+// `id`, as a little-endian number; None when they are not all within it.
+pub fn const_data_word(id: i64, offset: i64, size: i64, pcx: &Ctx<Comp>) -> Option<u64> {
+    if id >= 0 {
+        return word_at(str_at(id), offset, size);
     }
+    let list = pcx.fn_consts.v[const_owner(id)].lock().unwrap();
+    word_at((*list)[const_index(id)].data.as_slice(), offset, size)
+}
+
+fn word_at(bytes: &[u8], offset: i64, size: i64) -> Option<u64> {
+    if size > 8 || offset < 0 || offset + size > bytes.len() as i64 {
+        return Option::None;
+    }
+    let mut bits: u64 = 0;
+    for i in 0..size {
+        bits |= (bytes[(offset + i) as usize] as u64) << (8 * i) as u64;
+    }
+    Option::Some(bits)
+}
+
+// (back::codecache) The bytes of constant data `id` a task made (a
+// placeholder), added to `out`.
+pub fn const_data_copy(id: i64, out: &mut Vec<u8, Comp>, pcx: &Ctx<Comp>) {
+    let list = pcx.fn_consts.v[const_owner(id)].lock().unwrap();
+    out.extend_from_slice((*list)[const_index(id)].data.as_slice());
 }
 
 // (0.18.1, back::codecache) The alignment of constant data `id` a task
 // made (a placeholder).
-pub fn const_data_align(id: i64) -> i64 {
-    unsafe { (*pending(id)).align }
+pub fn const_data_align(id: i64, pcx: &Ctx<Comp>) -> i64 {
+    let list = pcx.fn_consts.v[const_owner(id)].lock().unwrap();
+    (*list)[const_index(id)].align
 }
 
 // (back::codecache) The constant data function fi's tasks made so far
 // (its own task, or a phase after).
-pub fn const_data_count(fi: i64) -> i64 {
-    unsafe { (*get_fn_consts().add(fi as usize)).count }
+pub fn const_data_count(fi: i64, pcx: &Ctx<Comp>) -> i64 {
+    pcx.fn_consts.v[fi as usize].lock().unwrap().len() as i64
 }
 
-// (back::codecache) Function fi's k-th constant data: its bytes, and its
-// phase, rank and alignment in *phase, *rank, *align.
-pub fn const_data_entry(fi: i64, k: i64, phase: &mut i64, rank: &mut i64, align: &mut i64) -> &'static [
-    u8] {
-    unsafe {
-        let p = (*(*get_fn_consts().add(fi as usize)).chunks.add((k / CHUNK) as usize)).add(
-            (k % CHUNK) as usize);
-        *phase = (*p).phase;
-        *rank = (*p).rank;
-        *align = (*p).align;
-        std::slice::from_raw_parts((*p).data.add((0) as usize), ((*p).len - (0)) as usize)
-    }
+// (back::codecache) Function fi's k-th constant data: its bytes added to
+// `out`, and its phase, rank and alignment in *phase, *rank, *align.
+pub fn const_data_entry(fi: i64, k: i64, phase: &mut i64, rank: &mut i64, align: &mut i64,
+    out: &mut Vec<u8, Comp>, pcx: &Ctx<Comp>) {
+    let list = pcx.fn_consts.v[fi as usize].lock().unwrap();
+    let p = &(*list)[k as usize];
+    *phase = p.phase;
+    *rank = p.rank;
+    *align = p.align;
+    out.extend_from_slice(p.data.as_slice());
 }
 
 // Numbers the constant data the phase's tasks made (main thread, between
 // phases): in the order of (phase, rank, then each function's order),
 // which is the order one thread makes them in.
 fn resolve_consts(pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let mut found = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        for fi in 0..pcx.irfunc_count {
-            for k in 0..(*get_fn_consts().add(fi as usize)).count {
-                let id = -(1 + (fi << OWNER_SHIFT) + k);
-                if (*pending(id)).id < 0 {
-                    found.push(id);
-                }
+    // (phase, rank, placeholder) of each one not numbered yet
+    let mut found: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for fi in 0..pcx.irfunc_count {
+        let list = pcx.fn_consts.v[fi as usize].lock().unwrap();
+        for k in 0..list.len() as i64 {
+            let p = &(*list)[k as usize];
+            if p.id < 0 {
+                found.push(p.phase);
+                found.push(p.rank);
+                found.push(-(1 + (fi << OWNER_SHIFT) + k));
             }
         }
-        // (few: insertion sort)
-        for i in 1..found.len() as i64 {
-            let mut j = i;
-            while j > 0
-                && const_before((found[j as usize]), (found[(j - 1) as usize])) {
-                let t = (found[j as usize]);
-                (found[j as usize]) = (found[(j - 1) as usize]);
-                (found[(j - 1) as usize]) = t;
-                j -= 1;
-            }
-        }
-        for i in 0..found.len() as i64 {
-            give_id(pending((found[i as usize])), pcx);
-        }
-        free(found.data as *mut u8);
-        register_consts(pcx);
     }
+    // (few: insertion sort)
+    let n = found.len() / 3;
+    for i in 1..n {
+        let mut j = i;
+        while j > 0 && const_before(&found[3 * j..3 * j + 3], &found[3 * j - 3..3 * j]) {
+            for m in 0..3 {
+                found.swap(3 * j + m, 3 * j - 3 + m);
+            }
+            j -= 1;
+        }
+    }
+    for i in 0..n {
+        give_id(found[3 * i + 2], pcx);
+    }
+    register_consts(pcx);
 }
 
-fn give_id(p: *mut PendingConst, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if pcx.to_register.len() as i64 == 0 {
-            pcx.next_const_id = get_str_count();
-        }
-        (*p).id = pcx.next_const_id;
-        pcx.next_const_id += 1;
-        pcx.to_register.push(p as i64);
+fn give_id(id: i64, pcx: &mut Ctx<Comp>) {
+    if pcx.to_register.len() as i64 == 0 {
+        pcx.next_const_id = get_str_count();
     }
+    {
+        let mut list = pcx.fn_consts.v[const_owner(id)].lock().unwrap();
+        (*list)[const_index(id)].id = pcx.next_const_id;
+    }
+    pcx.next_const_id += 1;
+    pcx.to_register.push(id);
 }
 
 // Adds the constants given ids to the program's strings (main thread,
 // between phases).
 fn register_consts(pcx: &mut Ctx<Comp>) {
-    unsafe {
-        for i in 0..pcx.to_register.len() as i64 {
-            let p = (pcx.to_register[i as usize]) as *mut PendingConst;
-            if add_const_data(std::slice::from_raw_parts((*p).data.add((0) as usize),
-                ((*p).len - (0)) as usize), (*p).align) != (*p).id {
-                die(c"internal error: constant data numbered out of order");
-            }
+    for i in 0..pcx.to_register.len() as i64 {
+        let id = pcx.to_register[i as usize];
+        let list = pcx.fn_consts.v[const_owner(id)].lock().unwrap();
+        let p = &(*list)[const_index(id)];
+        if add_const_data(p.data.as_slice(), p.align) != p.id {
+            die(c"internal error: constant data numbered out of order");
         }
-        pcx.to_register.clear();
     }
+    pcx.to_register.clear();
 }
 
-fn const_before(a: i64, b: i64) -> bool {
-    unsafe {
-        let p = pending(a);
-        let q = pending(b);
-        if (*p).phase != (*q).phase {
-            return (*p).phase < (*q).phase;
-        }
-        if (*p).rank != (*q).rank {
-            return (*p).rank < (*q).rank;
-        }
-        // (one function's, in its order)
-        a > b
+// Whether constant a (its phase, rank and placeholder) is numbered before b.
+fn const_before(a: &[i64], b: &[i64]) -> bool {
+    if a[0] != b[0] {
+        return a[0] < b[0];
     }
+    if a[1] != b[1] {
+        return a[1] < b[1];
+    }
+    // (one function's, in its order)
+    a[2] > b[2]
 }
 
 // ---- Tasks ----
@@ -474,20 +499,42 @@ impl TaskLists<Comp> {
     }
 }
 
-// Runs task `task` of a phase of kind `kind` in context cx (any thread).
-pub fn run_task(mut cx: *mut FnCtx<Comp>, kind: i64, task: i64, pcx: &Ctx<Comp>) {
-    unsafe {
-        if pcx.fresh_contexts {
-            // (the code cache's state, kept: fnctx_new_with)
-            if pcx.cc_on {
-                cc_of(&mut *cx);
-            }
-            cx = fresh_context(&mut *cx);
+// Runs task `task` of a phase of kind `kind` in the context at cx (any
+// thread): the pool's entry, where a thread's context is still a raw
+// pointer.
+pub fn run_task(cx: *mut FnCtx<Comp>, kind: i64, task: i64, pcx: &Ctx<Comp>) {
+    // UNSAFE: a thread's function context reaches its tasks as a raw
+    // pointer: the pool keeps the contexts (threads.vl's contexts) and each
+    // thread takes its own across the thread boundary, where no borrow can
+    // be written.
+    // SAFETY: cx is the pool's context of the calling thread: contexts[0]
+    // for the main thread (pool_run, pool_run_joined), contexts[index] for
+    // worker `index` (take_tasks; the index is given once, under the
+    // pool's lock). pool_start made each with fnctx_new and none is freed;
+    // a thread runs one task at a time and no other thread uses its
+    // context while the pool runs (--vec-stats reads them after the
+    // phases). So this is the only reference to it during the task.
+    let cx = unsafe { &mut *cx };
+    if pcx.fresh_contexts {
+        // (the code cache's state, kept: fnctx_new_with)
+        if pcx.cc_on {
+            cc_of(cx);
         }
+        // (kept, as before 0.29: what the task leaves may name it)
+        let fresh = Box::leak(fresh_context(cx));
+        run_task_in(fresh, kind, task, pcx);
+        return;
+    }
+    run_task_in(cx, kind, task, pcx);
+}
+
+// The task, in its context.
+fn run_task_in(cx: &mut FnCtx<Comp>, kind: i64, task: i64, pcx: &Ctx<Comp>) {
+    unsafe {
         begin_task(&mut *cx);
         if kind == K_COMPONENT {
             let c = (pcx.parallel_items[task as usize]);
-            for i in (*pcx.comp_start.add(c as usize))..(*pcx.comp_end.add(c as usize)) {
+            for i in (pcx.comp_start[c as usize])..(pcx.comp_end[c as usize]) {
                 ir_clear_marks(&mut *cx, (pcx.scc_order[i as usize]), pcx);
             }
             run_component(&mut *cx, c, pcx);
@@ -522,17 +569,13 @@ pub fn run_task(mut cx: *mut FnCtx<Comp>, kind: i64, task: i64, pcx: &Ctx<Comp>)
                 if !cached || !cc_emit_begin(&mut *cx, fi, task, pcx) {
                     cx.text_rtids.clear();
                     emit_task(&mut *cx, fi, task, pcx);
-                    let t = get_fn_text().add(fi as usize) as *mut FnText;
-                    (*t).len = buf_len(cx.asm);
-                    (*t).data = alloc_zeroed((*t).len + 1);
-                    memcpy((*t).data, buf_ptr(cx.asm), (*t).len as u64);
-                    (*t).labels = cx.label_count;
-                    let nr = cx.text_rtids.len() as i64;
-                    (*t).rtids = alloc_array::<i64>(nr + 1);
-                    for k in 0..nr {
-                        (*(*t).rtids.add(k as usize)) = (cx.text_rtids[k as usize]);
+                    {
+                        let mut t = pcx.fn_texts.lock(fi);
+                        crate::base::buf_copy_into(cx.asm, &mut t.data);
+                        t.labels = cx.label_count;
+                        t.rtids.clear();
+                        t.rtids.extend_from_slice(cx.text_rtids.as_slice());
                     }
-                    (*t).nrtids = nr;
                     buf_clear(cx.asm);
                     if cached {
                         cc_emit_end(&mut *cx, fi, task, pcx);
@@ -562,9 +605,8 @@ fn begin_task(cx: &mut FnCtx<Comp>) {
 
 // (VOLE_FRESH_CONTEXTS) A new context with cx's buffers (each thread
 // keeps its own).
-fn fresh_context(cx: &mut FnCtx<Comp>) -> *mut FnCtx<Comp> {
-    let n = crate::middle::ctx::fnctx_new_with(cx);
-    n
+fn fresh_context(cx: &mut FnCtx<Comp>) -> Box<FnCtx<Comp>, Comp> {
+    crate::middle::ctx::fnctx_new_with(cx)
 }
 
 // Runs tasks first..end of ITEMS (a phase, or a level of one).
@@ -572,7 +614,6 @@ fn run_tasks(cx: &mut FnCtx<Comp>, kind: i64, first: i64, end: i64, pcx: &mut Ct
     unsafe {
         let mut tasks = task_list(cx, kind, first, end, pcx);
         pool_run(kind, tasks.as_slice(), pcx);
-        free(tasks.data as *mut u8);
     }
 }
 
@@ -582,24 +623,24 @@ fn run_tasks(cx: &mut FnCtx<Comp>, kind: i64, first: i64, end: i64, pcx: &mut Ct
 // function started last would keep the others waiting), but emission's in
 // order (its texts are joined in order as they are done). What the tasks
 // read is made first (ir_release, prepare_layouts).
-fn task_list(cx: &mut FnCtx<Comp>, kind: i64, first: i64, end: i64, pcx: &mut Ctx<Comp>) -> IntVec {
+fn task_list(cx: &mut FnCtx<Comp>, kind: i64, first: i64, end: i64, pcx: &mut Ctx<Comp>) -> Vec<i64,
+    Comp> {
     unsafe {
         ir_release(cx, pcx);
         prepare_layouts(pcx);
-        let mut tasks = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+        let mut tasks: Vec<i64, Comp> = Vec::new_in(Comp {});
         let mut i = end;
         while i > first {
             i -= 1;
             tasks.push(i);
         }
         if pcx.pool_threads > 1 && kind != K_EMIT {
-            let weight = alloc_array::<i64>(end + 1);
+            let mut weight: Vec<i64, Comp> = Vec::new_in(Comp {});
+            weight.resize((end + 1) as usize, 0);
             for k in first..end {
-                (*weight.add(k as usize)) = task_weight(kind,
-                    (pcx.parallel_items[k as usize]), pcx);
+                weight[k as usize] = task_weight(kind, (pcx.parallel_items[k as usize]), pcx);
             }
-            sort_tasks(tasks, weight);
-            free(weight as *mut u8);
+            sort_tasks(&mut tasks, &weight);
         }
         tasks
     }
@@ -613,7 +654,7 @@ fn task_weight(kind: i64, item: i64, pcx: &Ctx<Comp>) -> i64 {
             return ir_stored(item, pcx).t.insts.len() as i64;
         }
         let mut w: i64 = 0;
-        for k in (*pcx.comp_start.add(item as usize))..(*pcx.comp_end.add(item as usize)) {
+        for k in (pcx.comp_start[item as usize])..(pcx.comp_end[item as usize]) {
             w += ir_stored((pcx.scc_order[k as usize]), pcx).t.insts.len() as i64;
         }
         w
@@ -621,14 +662,14 @@ fn task_weight(kind: i64, item: i64, pcx: &Ctx<Comp>) -> i64 {
 }
 
 // Sorts the task list by weight[task], ascending, stably (a merge sort).
-fn sort_tasks(tasks: IntVec, weight: *mut i64) {
+fn sort_tasks(tasks: &mut [i64], weight: &[i64]) {
     unsafe {
-        let n = tasks.len() as i64;
-        let a = tasks.data;
-        let b = alloc_array::<i64>(n + 1);
-        let mut width: i64 = 1;
+        let n = tasks.len();
+        let mut b: Vec<i64, Comp> = Vec::new_in(Comp {});
+        b.resize(n, 0);
+        let mut width: usize = 1;
         while width < n {
-            let mut lo: i64 = 0;
+            let mut lo: usize = 0;
             while lo < n {
                 let mid = if lo + width < n { lo + width } else { n };
                 let hi = if lo + 2 * width < n { lo + 2 * width } else { n };
@@ -637,13 +678,11 @@ fn sort_tasks(tasks: IntVec, weight: *mut i64) {
                 let mut k = lo;
                 while k < hi {
                     if i < mid
-                        && (j >= hi
-                            || (*weight.add((*a.add(i as usize)) as usize))
-                            <= (*weight.add((*a.add(j as usize)) as usize))) {
-                        (*b.add(k as usize)) = (*a.add(i as usize));
+                        && (j >= hi || weight[tasks[i] as usize] <= weight[tasks[j] as usize]) {
+                        b[k] = tasks[i];
                         i += 1;
                     } else {
-                        (*b.add(k as usize)) = (*a.add(j as usize));
+                        b[k] = tasks[j];
                         j += 1;
                     }
                     k += 1;
@@ -651,11 +690,10 @@ fn sort_tasks(tasks: IntVec, weight: *mut i64) {
                 lo = hi;
             }
             for k in 0..n {
-                (*a.add(k as usize)) = (*b.add(k as usize));
+                tasks[k] = b[k];
             }
             width *= 2;
         }
-        free(b as *mut u8);
     }
 }
 
@@ -696,12 +734,9 @@ pub fn simplify_all(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
 fn build_components(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
     unsafe {
         let n = pcx.scc_order.len() as i64;
-        pcx.comp_start = alloc_array::<i64>(n + 1);
-        pcx.comp_end = alloc_array::<i64>(n + 1);
-        pcx.comp_of = alloc_array::<i64>(pcx.irfunc_count + 1);
-        for fi in 0..pcx.irfunc_count {
-            (*pcx.comp_of.add(fi as usize)) = -1;
-        }
+        sized_table(&mut pcx.comp_start, n + 1, 0);
+        sized_table(&mut pcx.comp_end, n + 1, 0);
+        sized_table(&mut pcx.comp_of, pcx.irfunc_count + 1, -1);
         pcx.comp_count = 0;
         let mut i: i64 = 0;
         while i < n {
@@ -713,10 +748,10 @@ fn build_components(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
             }
             // (a component's functions reach each other: all live or none)
             if (pcx.fn_live[(pcx.scc_order[i as usize]) as usize]) != 0 {
-                (*pcx.comp_start.add(pcx.comp_count as usize)) = i;
-                (*pcx.comp_end.add(pcx.comp_count as usize)) = j;
+                (pcx.comp_start[pcx.comp_count as usize]) = i;
+                (pcx.comp_end[pcx.comp_count as usize]) = j;
                 for k in i..j {
-                    (*pcx.comp_of.add((pcx.scc_order[k as usize]) as usize)) = pcx.comp_count;
+                    (pcx.comp_of[(pcx.scc_order[k as usize]) as usize]) = pcx.comp_count;
                 }
                 pcx.comp_count += 1;
             }
@@ -726,35 +761,34 @@ fn build_components(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
         // A function whose address it takes counts as one it calls (a call
         // through the address may be made direct, and the function inlined)
         // when it comes before it in SCC_ORDER (0.17 had it done then).
-        pcx.comp_level = alloc_array::<i64>(pcx.comp_count + 1);
+        sized_table(&mut pcx.comp_level, pcx.comp_count + 1, 0);
         pcx.comp_growth.reset(pcx.comp_count + 1, 0);
         pcx.comp_inlined.reset((pcx.comp_count + 1));
         pcx.level_count = 0;
-        let mut calls = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+        let mut calls: Vec<i64, Comp> = Vec::new_in(Comp {});
         for c in 0..pcx.comp_count {
             let mut level: i64 = 0;
-            for k in (*pcx.comp_start.add(c as usize))..(*pcx.comp_end.add(c as usize)) {
+            for k in (pcx.comp_start[c as usize])..(pcx.comp_end[c as usize]) {
                 callees_and_addresses(cx, (pcx.scc_order[k as usize]), &mut calls, pcx);
                 for m in 0..calls.len() as i64 {
-                    let d = (*pcx.comp_of.add((calls[m as usize]) as usize));
-                    if d >= 0 && d < c && (*pcx.comp_level.add(d as usize)) + 1 > level {
-                        level = (*pcx.comp_level.add(d as usize)) + 1;
+                    let d = (pcx.comp_of[(calls[m as usize]) as usize]);
+                    if d >= 0 && d < c && (pcx.comp_level[d as usize]) + 1 > level {
+                        level = (pcx.comp_level[d as usize]) + 1;
                     }
                 }
             }
-            (*pcx.comp_level.add(c as usize)) = level;
+            (pcx.comp_level[c as usize]) = level;
             if level + 1 > pcx.level_count {
                 pcx.level_count = level + 1;
             }
         }
         ir_release(cx, pcx);
-        free(calls.data as *mut u8);
     }
 }
 
 // The IR functions fi calls directly or takes the address of (with
 // repeats), in `out`.
-fn callees_and_addresses(cx: &mut FnCtx<Comp>, fi: i64, out: &mut IntVec, pcx: &Ctx<Comp>) {
+fn callees_and_addresses(cx: &mut FnCtx<Comp>, fi: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
     unsafe {
         out.clear();
         ir_enter(cx, fi, pcx);
@@ -785,32 +819,34 @@ pub fn optimize_components(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
         build_components(cx, pcx);
         cc_phase(K_COMPONENT, pcx);
         // The components of each level, in SCC_ORDER.
-        let mut by_level = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let start = alloc_array::<i64>(pcx.level_count + 2);
+        let mut by_level: Vec<i64, Comp> = Vec::new_in(Comp {});
+        let mut start: Vec<i64, Comp> = Vec::new_in(Comp {});
+        start.resize((pcx.level_count + 2) as usize, 0);
         for c in 0..pcx.comp_count {
-            (*start.add(((*pcx.comp_level.add(c as usize)) + 1) as usize)) += 1;
+            (start[((pcx.comp_level[c as usize]) + 1) as usize]) += 1;
         }
         for l in 0..pcx.level_count {
-            (*start.add((l + 1) as usize)) += (*start.add(l as usize));
+            (start[(l + 1) as usize]) += (start[l as usize]);
         }
-        let fill = alloc_array::<i64>(pcx.level_count + 1);
+        let mut fill: Vec<i64, Comp> = Vec::new_in(Comp {});
+        fill.resize((pcx.level_count + 1) as usize, 0);
         for c in 0..pcx.comp_count {
             by_level.push(0);
         }
         for c in 0..pcx.comp_count {
-            let l = (*pcx.comp_level.add(c as usize));
-            (by_level[((*start.add(l as usize)) + (*fill.add(l as usize))) as usize]) = c;
-            (*fill.add(l as usize)) += 1;
+            let l = (pcx.comp_level[c as usize]);
+            (by_level[((start[l as usize]) + (fill[l as usize])) as usize]) = c;
+            (fill[l as usize]) += 1;
         }
         for l in 0..pcx.level_count {
             pcx.parallel_items.clear();
-            for k in (*start.add(l as usize))..(*start.add((l + 1) as usize)) {
+            for k in (start[l as usize])..(start[(l + 1) as usize]) {
                 pcx.parallel_items.push((by_level[k as usize]));
             }
             run_tasks(cx, K_COMPONENT, 0, pcx.parallel_items.len() as i64, pcx);
             // The barrier: the level's growth and inlined calls, for the
             // next levels.
-            for k in (*start.add(l as usize))..(*start.add((l + 1) as usize)) {
+            for k in (start[l as usize])..(start[(l + 1) as usize]) {
                 let c = (by_level[k as usize]);
                 add_program_size((pcx.comp_growth.get(c)), pcx);
                 for m in 0..pcx.comp_inlined.count(c) {
@@ -818,9 +854,6 @@ pub fn optimize_components(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
                 }
             }
         }
-        free(start as *mut u8);
-        free(fill as *mut u8);
-        free(by_level.data as *mut u8);
         resolve_consts(pcx);
     }
 }
@@ -833,8 +866,8 @@ fn run_component(cx: &mut FnCtx<Comp>, c: i64, pcx: &Ctx<Comp>) {
         cx.comp_dec.clear();
         cx.comp_growth = 0;
         cx.task_phase = P_COMPONENT;
-        let start = (*pcx.comp_start.add(c as usize));
-        let end = (*pcx.comp_end.add(c as usize));
+        let start = (pcx.comp_start[c as usize]);
+        let end = (pcx.comp_end[c as usize]);
         // (0.18.1: its outputs from the code cache, back::codecache)
         if pcx.cc_on && cc_component_begin(cx, c, start, end, pcx) {
             cx.cur_comp = -1;
@@ -872,8 +905,8 @@ pub fn fn_facts_ready(cx: &mut FnCtx<Comp>, g: i64, done: bool, pcx: &Ctx<Comp>)
         if cx.cur_comp < 0 {
             return done;
         }
-        let d = (*pcx.comp_of.add(g as usize));
-        d >= 0 && (*pcx.comp_level.add(d as usize)) < (*pcx.comp_level.add(cx.cur_comp as usize))
+        let d = (pcx.comp_of[g as usize]);
+        d >= 0 && (pcx.comp_level[d as usize]) < (pcx.comp_level[cx.cur_comp as usize])
     }
 }
 
@@ -881,226 +914,239 @@ pub fn fn_facts_ready(cx: &mut FnCtx<Comp>, g: i64, done: bool, pcx: &Ctx<Comp>)
 // phase (-1: none, or another phase).
 pub fn comp_of(g: i64, pcx: &Ctx<Comp>) -> i64 {
     unsafe {
-        if pcx.comp_of == 0 as *mut i64 {
+        if pcx.comp_of.is_empty() {
             return -1;
         }
-        (*pcx.comp_of.add(g as usize))
+        (pcx.comp_of[g as usize])
     }
 }
 
 // ---- Emission ----
 
-// Per IR function: its text (emit_task's), its local labels.
-#[derive(Clone, Copy)] pub struct FnText {
-    pub data: *mut u8, pub len: i64, pub labels: i64, pub relocs: *mut i64, pub nrelocs: i64,
-    // (0.18.1) its RTID values, by index (join_text)
-    pub rtids: *mut i64, pub nrtids: i64,
+// A function's text (emit_task's), its local labels, (with the code
+// cache) the strings and constants its text names by index (str.\x03<i>)
+// and its RTID values, by index (join_text).
+pub struct FnText<A: Allocator> {
+    pub data: Vec<u8, A>, pub labels: i64, pub relocs: Vec<i64, A>, pub rtids: Vec<i64, A>,
 }
 
-static mut FN_TEXT: *mut FnText = 0 as *mut FnText;
+fn no_text() -> FnText<Comp> {
+    FnText {
+        data: Vec::new_in(Comp {}), labels: 0, relocs: Vec::new_in(Comp {}),
+        rtids: Vec::new_in(Comp {}),
+    }
+}
+
+// (0.29) Per IR function, its text, in the compilation context: each
+// behind a lock of its own. Entry fi is written by fi's emission task
+// (run_task's K_EMIT, cc_emit_end, emit_install: fi is
+// parallel_items[task], one task per function) and taken by the main
+// thread at the join (join_task), once the pool marked the task done or
+// the phase's tasks are all done.
+pub struct FnTexts<A: Allocator> {
+    v: Vec<Mutex<FnText<A>>, A>,
+}
+
+pub fn fn_texts() -> FnTexts<Comp> {
+    FnTexts { v: Vec::new_in(Comp {}) }
+}
+
+impl FnTexts<Comp> {
+    // n entries, each empty (main thread, before the pool starts).
+    pub fn reset(&mut self, n: i64) {
+        self.v.clear();
+        for i in 0..n {
+            self.v.push(Mutex::new(no_text()));
+        }
+    }
+
+    // Entry fi, to read or write while the guard lives.
+    pub fn lock(&self, fi: i64) -> MutexGuard<'_, FnText<Comp>> {
+        self.v[fi as usize].lock().unwrap()
+    }
+
+    // Entry fi, an empty one left in its place.
+    pub fn take(&self, fi: i64) -> FnText<Comp> {
+        let mut t = self.v[fi as usize].lock().unwrap();
+        std::mem::replace(&mut *t, no_text())
+    }
+}
 
 // Emits the functions in `order` (IR functions, program order): those
 // before `split` first, then the rest (-O1's small leaves, which the
 // others inline as the middle end left them), and joins their texts into
 // cx's (the program's) in that order: as they are done, beside the
 // emission (pool_run_joined); with one thread, after it.
-pub fn emit_functions(cx: &mut FnCtx<Comp>, order: IntVec, split: i64, pcx: &mut Ctx<Comp>) {
+pub fn emit_functions(cx: &mut FnCtx<Comp>, order: &[i64], split: i64, pcx: &mut Ctx<Comp>) {
     pcx.parallel_items.clear();
     for i in 0..order.len() as i64 {
         pcx.parallel_items.push((order[i as usize]));
     }
-    pcx.join_cx = cx;
     pcx.rt_renumbered = true;
     if pcx.rt_cx == 0 as *mut FnCtx<Comp> {
         pcx.rt_cx = crate::middle::ctx::fnctx_new();
     }
     cc_phase(K_EMIT, pcx);
-    emit_range(&mut *cx, 0, split, pcx);
-    emit_range(&mut *cx, split, pcx.parallel_items.len() as i64, pcx);
+    emit_range(cx, 0, split, pcx);
+    emit_range(cx, split, pcx.parallel_items.len() as i64, pcx);
     phase_time(c"emission, join and assembly", pcx);
 }
 
 fn emit_range(cx: &mut FnCtx<Comp>, first: i64, end: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let mut tasks = task_list(cx, K_EMIT, first, end, pcx);
-        let mut next = first;
-        if pcx.pool_threads > 1 {
-            next = pool_run_joined(K_EMIT, tasks.as_slice(), first, end, pcx);
-        } else {
-            pool_run(K_EMIT, tasks.as_slice(), pcx);
-        }
-        free(tasks.data as *mut u8);
-        resolve_consts(pcx);
-        while next < end {
-            join_task(next, pcx);
-            next += 1;
-        }
+    let tasks = task_list(cx, K_EMIT, first, end, pcx);
+    let mut next = first;
+    if pcx.pool_threads > 1 {
+        next = pool_run_joined(K_EMIT, tasks.as_slice(), first, end, cx, pcx);
+    } else {
+        pool_run(K_EMIT, tasks.as_slice(), pcx);
+    }
+    resolve_consts(pcx);
+    while next < end {
+        join_task(next, cx, pcx);
+        next += 1;
     }
 }
 
-// Joins the text of task i (ITEMS' position i) to the program's (main
-// thread): false when it names constant data its phase has not numbered
-// yet (that waits for the phase's end, resolve_consts).
-pub fn join_task(i: i64, pcx: &mut Ctx<Comp>) -> bool {
-    unsafe {
-        let fi = (pcx.parallel_items[i as usize]);
-        let t = get_fn_text().add(fi as usize) as *mut FnText;
-        // -O1 optimizes each function in its emission task, the only
-        // constant data made then: one thread numbers it in the emission's
-        // order, which is the join's, so it is numbered here.
-        if pcx.per_function {
-            number_consts(fi, pcx);
-        }
-        if (*t).len > 0 {
-            if !consts_numbered(*t) {
-                return false;
-            }
-            join_text(&mut *pcx.join_cx, *t, pcx);
-            pcx.join_cx.label_count += (*t).labels;
-            asm_flush(&mut *pcx.join_cx, pcx);
-        }
-        free((*t).data);
-        free((*t).relocs as *mut u8);
-        free((*t).rtids as *mut u8);
-        (*t).rtids = 0 as *mut i64;
-        (*t).nrtids = 0;
-        (*t).data = 0 as *mut u8;
-        (*t).len = 0;
-        (*t).relocs = 0 as *mut i64;
-        (*t).nrelocs = 0;
-        true
+// Joins the text of task i (ITEMS' position i) to the program's, cx's
+// (main thread): false when it names constant data its phase has not
+// numbered yet (that waits for the phase's end, resolve_consts).
+pub fn join_task(i: i64, cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) -> bool {
+    let fi = (pcx.parallel_items[i as usize]);
+    // -O1 optimizes each function in its emission task, the only
+    // constant data made then: one thread numbers it in the emission's
+    // order, which is the join's, so it is numbered here.
+    if pcx.per_function {
+        number_consts(fi, pcx);
     }
+    let t = pcx.fn_texts.take(fi);
+    if t.data.len() > 0 {
+        if !consts_numbered(&t, pcx) {
+            let mut slot = pcx.fn_texts.lock(fi);
+            *slot = t;
+            return false;
+        }
+        // UNSAFE: the context whose code buffer takes the loads of run-time
+        // numbers (rt_cx) is kept in the compilation context as a raw
+        // pointer, as every function context is (ctx.vl's fnctx_new).
+        // SAFETY: emit_functions made it with fnctx_new before the first
+        // join and it is never freed; only the join uses it (this function,
+        // on the main thread, one call at a time), so the `&mut` is the
+        // only reference to it while join_text runs.
+        let rt = unsafe { &mut *pcx.rt_cx };
+        join_text(cx, rt, &t, pcx);
+        cx.label_count += t.labels;
+        asm_flush(cx, pcx);
+    }
+    true
 }
 
 // Numbers function fi's constant data not numbered yet, in its order.
 fn number_consts(fi: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        for k in 0..(*get_fn_consts().add(fi as usize)).count {
-            let p = pending(-(1 + (fi << OWNER_SHIFT) + k));
-            if (*p).id < 0 {
-                give_id(p, pcx);
-            }
+    for k in 0..const_data_count(fi, pcx) {
+        let id = -(1 + (fi << OWNER_SHIFT) + k);
+        if const_data_id(id, pcx) < 0 {
+            give_id(id, pcx);
         }
     }
 }
 
 // Whether every constant a text names (str.\x02<n>, or str.\x03<i> with
 // the code cache: its relocs[i]) has its id.
-fn consts_numbered(t: FnText) -> bool {
-    unsafe {
-        let text = t.data;
-        let len = t.len;
-        let mut at = next_marker(text, 0, len, 2);
-        while at < len {
-            let mut j = at + 1;
-            let mut n: i64 = 0;
-            while j < len && (*text.add(j as usize)) >= b'0' && (*text.add(j as usize)) <= b'9' {
-                n = n * 10 + ((*text.add(j as usize)) - b'0') as i64;
-                j += 1;
-            }
-            if const_data_id(-(n + 1)) < 0 {
-                return false;
-            }
-            at = next_marker(text, j, len, 2);
+fn consts_numbered(t: &FnText<Comp>, pcx: &Ctx<Comp>) -> bool {
+    let text = t.data.as_slice();
+    let len = text.len() as i64;
+    let mut at: i64 = 0;
+    while at < len {
+        if text[at as usize] != 2 {
+            at += 1;
+            continue;
         }
-        for i in 0..t.nrelocs {
-            if const_data_id((*t.relocs.add(i as usize))) < 0 {
-                return false;
-            }
+        let mut j = at + 1;
+        let mut n: i64 = 0;
+        while j < len && text[j as usize] >= b'0' && text[j as usize] <= b'9' {
+            n = n * 10 + (text[j as usize] - b'0') as i64;
+            j += 1;
         }
-        true
+        if const_data_id(-(n + 1), pcx) < 0 {
+            return false;
+        }
+        at = j;
     }
+    for &id in t.relocs.as_slice() {
+        if const_data_id(id, pcx) < 0 {
+            return false;
+        }
+    }
+    true
 }
 
 // Appends a task's text to cx's assembly: L\x01<n> becomes L<n + the
 // labels before>, str.\x02<n> the constant's id, str.\x03<i> (with the
 // code cache) the id of the text's string or constant i, the line
 // \x04<r>,<i> (0.18.1) the load into register r of the program's number
-// for the text's RTID value i (gen0::target::rt_output).
-fn join_text(cx: &mut FnCtx<Comp>, t: FnText, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let text = t.data;
-        let len = t.len;
-        let base = cx.label_count;
-        let mut i: i64 = 0;
-        let mut one = next_marker(text, 0, len, 1);
-        let mut two = next_marker(text, 0, len, 2);
-        let mut three = if t.nrelocs > 0 { next_marker(text, 0, len, 3) } else { len };
-        let mut four = if t.nrtids > 0 { next_marker(text, 0, len, 4) } else { len };
-        while i < len {
-            let mut at = if one < two { one } else { two };
-            if three < at {
-                at = three;
-            }
-            if four < at {
-                at = four;
-            }
-            if at >= len {
-                buf_bytes(cx.asm,
-                    std::slice::from_raw_parts(text.add((i) as usize), (len - (i)) as usize));
-                return;
-            }
-            buf_bytes(cx.asm,
-                std::slice::from_raw_parts(text.add((i) as usize), (at - (i)) as usize));
-            let mut j = at + 1;
-            let mut n: i64 = 0;
-            while j < len && (*text.add(j as usize)) >= b'0' && (*text.add(j as usize)) <= b'9' {
-                n = n * 10 + ((*text.add(j as usize)) - b'0') as i64;
-                j += 1;
-            }
-            if (*text.add(at as usize)) == 1 {
-                buf_int(cx.asm, base + n);
-                one = next_marker(text, j, len, 1);
-            } else if (*text.add(at as usize)) == 4 {
-                // (\x04<r>,<i> and its newline: the load, its own line)
-                let mut k: i64 = 0;
-                j += 1;
-                while j < len && (*text.add(j as usize)) >= b'0'
-                    && (*text.add(j as usize)) <= b'9' {
-                    k = k * 10 + ((*text.add(j as usize)) - b'0') as i64;
-                    j += 1;
-                }
-                if k >= t.nrtids || j >= len || (*text.add(j as usize)) != b'\n' {
-                    die(c"internal error: a text names a run-time number it has not");
-                }
-                j += 1;
-                let v = (*t.rtids.add(k as usize));
-                m_load_imm(&mut *pcx.rt_cx, n,
-                    rt_output(rtid_class(v, pcx), rtid_value(v, pcx), pcx) as u64);
-                buf_append(cx.asm, pcx.rt_cx.code);
-                buf_clear(pcx.rt_cx.code);
-                four = next_marker(text, j, len, 4);
-            } else if (*text.add(at as usize)) == 3 {
-                if n >= t.nrelocs {
-                    die(c"internal error: a text names a string it has not");
-                }
-                let id = const_data_id((*t.relocs.add(n as usize)));
-                if id < 0 {
-                    die(c"internal error: constant data without an id");
-                }
-                buf_int(cx.asm, id);
-                three = next_marker(text, j, len, 3);
-            } else {
-                let id = const_data_id(-(n + 1));
-                if id < 0 {
-                    die(c"internal error: constant data without an id");
-                }
-                buf_int(cx.asm, id);
-                two = next_marker(text, j, len, 2);
-            }
-            i = j;
+// for the text's RTID value i (gen0::target::rt_output), made in rt's
+// code buffer. (A text without strings by index, or without RTID values,
+// has no \x03, or no \x04: such a byte is text.)
+fn join_text(cx: &mut FnCtx<Comp>, rt: &mut FnCtx<Comp>, t: &FnText<Comp>, pcx: &mut Ctx<Comp>) {
+    let text = t.data.as_slice();
+    let len = text.len() as i64;
+    let base = cx.label_count;
+    let nrelocs = t.relocs.len() as i64;
+    let nrtids = t.rtids.len() as i64;
+    // (text[i..at] is not copied yet)
+    let mut i: i64 = 0;
+    let mut at: i64 = 0;
+    while at < len {
+        let mark = text[at as usize];
+        if mark == 0 || mark > 4 || (mark == 3 && nrelocs == 0) || (mark == 4 && nrtids == 0) {
+            at += 1;
+            continue;
         }
-    }
-}
-
-fn next_marker(text: *mut u8, from: i64, len: i64, byte: i32) -> i64 {
-    unsafe {
-        if from >= len {
-            return len;
+        buf_bytes(cx.asm, &text[i as usize..at as usize]);
+        let mut j = at + 1;
+        let mut n: i64 = 0;
+        while j < len && text[j as usize] >= b'0' && text[j as usize] <= b'9' {
+            n = n * 10 + (text[j as usize] - b'0') as i64;
+            j += 1;
         }
-        let p = memchr(text.add(from as usize), byte, (len - from) as u64);
-        if p == 0 as *mut u8 { len } else { (p as i64) - (text as i64) }
+        if mark == 1 {
+            buf_int(cx.asm, base + n);
+        } else if mark == 4 {
+            // (\x04<r>,<i> and its newline: the load, its own line)
+            let mut k: i64 = 0;
+            j += 1;
+            while j < len && text[j as usize] >= b'0' && text[j as usize] <= b'9' {
+                k = k * 10 + (text[j as usize] - b'0') as i64;
+                j += 1;
+            }
+            if k >= nrtids || j >= len || text[j as usize] != b'\n' {
+                die(c"internal error: a text names a run-time number it has not");
+            }
+            j += 1;
+            let v = t.rtids[k as usize];
+            m_load_imm(rt, n, rt_output(rtid_class(v, pcx), rtid_value(v, pcx), pcx) as u64);
+            buf_append(cx.asm, rt.code);
+            buf_clear(rt.code);
+        } else if mark == 3 {
+            if n >= nrelocs {
+                die(c"internal error: a text names a string it has not");
+            }
+            let id = const_data_id(t.relocs[n as usize], pcx);
+            if id < 0 {
+                die(c"internal error: constant data without an id");
+            }
+            buf_int(cx.asm, id);
+        } else {
+            let id = const_data_id(-(n + 1), pcx);
+            if id < 0 {
+                die(c"internal error: constant data without an id");
+            }
+            buf_int(cx.asm, id);
+        }
+        i = j;
+        at = j;
     }
+    buf_bytes(cx.asm, &text[i as usize..]);
 }
 
 // ---- What the tasks read, made first ----
@@ -1135,71 +1181,5 @@ fn prepare_layouts(pcx: &mut Ctx<Comp>) {
     }
     for e in 0..pcx.enum_count {
         enum_niche(e, pcx);
-    }
-}
-
-// (0.28.0) FN_CONSTS's accessors: every use of it is one of them.
-fn get_fn_consts() -> *mut ConstList {
-    // UNSAFE: the per-function constant data lists, a process-wide static
-    // mut every task reads and writes; Rust has no safe access to a static
-    // mut
-    // SAFETY: allocated by parallel_begin before pool_start; list fi is
-    // appended only by the task for fi (const_data's callers pass the
-    // pass's own fi), and an entry's fields are written once, before its
-    // placeholder exists, in chunks that never move; ids are written only
-    // by the main thread (resolve_consts between phases; number_consts in
-    // join_task for the joined function, whose task is done); a placeholder
-    // of g reaches another function's IR only by inlining g's IR, i.e. g of
-    // a finished lower level (-O2) or an -O1 small leaf, whose constants
-    // are made serially (simplify_inlining_leaves, task_phase 0, real ids);
-    // a reader of an old entry (pending) touches the chunks pointer and
-    // that entry, never the count or slots an appending task writes
-    unsafe { FN_CONSTS }
-}
-
-fn set_fn_consts(v: *mut ConstList) {
-    // UNSAFE: the per-function constant data lists, a process-wide static
-    // mut every task reads and writes; Rust has no safe access to a static
-    // mut
-    // SAFETY: allocated by parallel_begin before pool_start; list fi is
-    // appended only by the task for fi (const_data's callers pass the
-    // pass's own fi), and an entry's fields are written once, before its
-    // placeholder exists, in chunks that never move; ids are written only
-    // by the main thread (resolve_consts between phases; number_consts in
-    // join_task for the joined function, whose task is done); a placeholder
-    // of g reaches another function's IR only by inlining g's IR, i.e. g of
-    // a finished lower level (-O2) or an -O1 small leaf, whose constants
-    // are made serially (simplify_inlining_leaves, task_phase 0, real ids);
-    // a reader of an old entry (pending) touches the chunks pointer and
-    // that entry, never the count or slots an appending task writes
-    unsafe {
-        FN_CONSTS = v;
-    }
-}
-
-// (0.28.0) FN_TEXT's accessors: every use of it is one of them.
-pub fn get_fn_text() -> *mut FnText {
-    // UNSAFE: the per-function emitted texts, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: allocated by parallel_begin on the main thread before
-    // pool_start; entry fi is written only by fi's emission task (run_task
-    // K_EMIT, cc_emit_end, emit_install: fi = parallel_items[task], one
-    // task per function), and read and freed by the main thread in
-    // join_task only after it saw JOINED[i] set holding MUTEX (set after
-    // the task's writes) or after the phase's tasks are all done
-    unsafe { FN_TEXT }
-}
-
-pub fn set_fn_text(v: *mut FnText) {
-    // UNSAFE: the per-function emitted texts, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: allocated by parallel_begin on the main thread before
-    // pool_start; entry fi is written only by fi's emission task (run_task
-    // K_EMIT, cc_emit_end, emit_install: fi = parallel_items[task], one
-    // task per function), and read and freed by the main thread in
-    // join_task only after it saw JOINED[i] set holding MUTEX (set after
-    // the task's writes) or after the phase's tasks are all done
-    unsafe {
-        FN_TEXT = v;
     }
 }
