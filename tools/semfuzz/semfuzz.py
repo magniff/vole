@@ -1,25 +1,34 @@
 #!/usr/bin/env python3
-"""The semantics fuzzer (0.25): random well-typed vole programs over owned
-values, each with the outcome its value semantics give, computed here.
+"""The semantics fuzzer (0.25; 0.29: its programs in the one language):
+random well-typed vole programs over owned values, each with the outcome
+the language's ownership gives, computed here.
 
 A program is generated as a tree (the classes below) that is both printed
-as vole and run by a small interpreter of the value semantics: moves,
-copies, clones, inout accesses, sink parameters, drops at scope end in
-reverse declaration order (with the `defer`s), temporaries at the end of
-their statement, drop flags of conditionally moved locals and fields,
+as vole and run by a small interpreter of the ownership rules: moves,
+copies, clones, shared and mutable borrows (`&T`, `&mut T` parameters and
+locals, by-reference matches), by-value parameters, drops at scope end in
+reverse declaration order (the guards' too), a struct's fields and an
+enum's payload in their order, parameters after the body's locals,
+temporaries at the end of their statement (a tail expression's before the
+block's locals), drop flags of conditionally moved locals and fields,
 early returns, `break`, `?`. The interpreter gives the expected output:
 every observation the program prints (`o<N> ...`) and every drop of a
-Tracked value (`d<id>`), in order where the order is specified (an
-enum's payload is a set), and at the end `live 0`. The program is then
-compiled at -O0, -O1 and -O2, at -j1 and -j8, with --check-alloc (and
-once without), run, and compared with the expectation. A program the
-checker rejects is a possible OVERSTRICT finding (or a generator bug).
+Tracked value (`d<id>`), in order, and at the end `live 0`. The program
+is then compiled at -O0, -O1 and -O2, at -j1 and -j8, with --check-alloc
+(and once without), run, and compared with the expectation. A program
+the checker rejects is a possible OVERSTRICT finding (or a generator
+bug): --rustc says which, and checks the model itself against rustc.
 Failing programs are shrunk (statements and functions deleted while the
 failure stays the same) and kept, with their expected output.
+
+In the tree, a parameter's or an argument's convention keeps its first
+name: 'let' is `&T` (the argument `&place`, or `&temporary`), 'inout' is
+`&mut T` (`&mut place`), 'sink' is by value.
 
 usage: tools/semfuzz/semfuzz.py [-c VOLEC] [-n COUNT] [-f FIRST] [-k DIR]
                                 [-j JOBS] [--known] [--no-shrink]
                                 [--print SEED] [--shrink SEED] [--size N]
+                                [--rustc [RUSTC]]
 
   -c VOLEC      the compiler (default: target/volec)
   -n COUNT      programs (default 100); -f FIRST: the first seed (default 1)
@@ -29,19 +38,27 @@ usage: tools/semfuzz/semfuzz.py [-c VOLEC] [-n COUNT] [-f FIRST] [-k DIR]
   --print SEED  print the program of SEED and its expected output
   --shrink SEED check SEED, and print it shrunk if it fails
   --size N      statements in run's body, about (default 24)
+  --rustc [RUSTC]  each program also as Rust (tools/rustc-twin's shim),
+                built by rustc (default: the one on PATH) and run: a
+                program rustc rejects is the generator's bug (notrust), one
+                that prints something else under rustc is the model's
+                (model), and a program volec rejects that rustc accepts
+                says so. Not in the gate: it checks the fuzzer.
+  --rustc-edition E  rustc's edition (default 2024, whose order of a tail
+                expression's temporaries is volec's)
   --assign-calls  (0.25.2) assignments whose right side is a call of the
                 header's functions, often taking the assigned variable
-                itself (`t3 = f1(gpa, t3, mk(2))`: moved, lent, `&t3`),
-                and owned temporaries lent to its let parameters (as
-                --known's temp_let_arg) where a place could be
+                itself (`t3 = f1(gpa, t3, mk(2))`: moved, `&t3`, `&mut
+                t3`), and more owned temporaries lent to its `&T`
+                parameters where a place could be
   --try-args    (0.25.2.1) arguments that may return: `x?` or `match x {
-                Ok(q) => q, Err(q) => return Err(q) }` lent to a let
-                parameter or moved to a sink one, in a call whose own
-                result is `?`'d or not (`chk(tchk(t, 3)?, 5)?`), and a
+                Ok(q) => q, Err(q) => return Err(q) }` lent to a `&T`
+                parameter or moved to a by-value one, in a call whose own
+                result is `?`'d or not (`chk(&tchk(t, 3)?, 5)?`), and a
                 later argument that returns after an owned one is moved
-  --closure-params  (0.25.3) closures that take a T by value: `|t: sink
-                T|` called with a moved local (read, returned, moved on to
-                a sink fn on one path), one given to an FnMut(sink T)
+  --closure-params  (0.25.3) closures that take a T by value: `|t: T|`
+                called with a moved local (read, returned, moved on to a
+                by-value fn on one path), one given to an FnMut(T) -> i64
                 bound, and Option::map's; each parameter is dropped at the
                 end of the closure's body unless moved out (a leak before)
 
@@ -62,6 +79,7 @@ import tempfile
 import threading
 
 MASK = (1 << 64) - 1
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def wrap(x):
@@ -80,18 +98,16 @@ def cmod(a, b):
     return wrap(a - b * q)
 
 
-# Known bugs: constructs the generator leaves out unless --known, each a
-# tests/run/sem_fuzz_*.vl case with its XFAIL.
+# Known bugs: constructs the generator leaves out unless --known, each
+# with its file in tools/semfuzz/findings/. (0.25's four are fixed, and
+# generated always: a by-value match that binds part of the payload, an
+# owned temporary lent to a `&T` parameter, `w[i] = x`. `let t =
+# w.last()?;` is gone: the binding is a `&T` that borrows w, not a T.)
 KNOWN = {
-    # `?` on a borrowed Option (Vec::last) drops the element
-    'last_question': 'sem_fuzz_last_question_double_drop',
-    # a by-value match that binds only part of the payload leaks the rest
-    'match_wild': 'sem_fuzz_match_wildcard_leak',
-    # an owned temporary passed to a let parameter lives to the end of the
-    # block, not of its statement (and two such in a statement are rejected)
-    'temp_let_arg': 'sem_fuzz_temp_let_arg',
-    # `w[i] = x` and `w.set(i, x)` do not drop the old element
-    'index_assign': 'sem_fuzz_index_assign_leak',
+    # the temporary a generic function returns, its type inferred from a
+    # reference argument (`dup(&t)`), lent or read (`obs(&dup(&t))`,
+    # `dup(&t).v`) is never dropped
+    'generic_ref_temp': 'generic_ref_temp_leak',
 }
 
 
@@ -187,7 +203,7 @@ class StrV:
 
 
 class CloV:
-    """A sink closure: its capture is its own."""
+    """A move closure: its capture is its own."""
     __slots__ = ('cap', 'k')
 
     def __init__(self, cap, k):
@@ -233,8 +249,8 @@ class Cell:
 
 
 class AliasCell:
-    """A let or inout parameter, an inout local: the place it accesses,
-    never dropped here."""
+    """A `&T` or `&mut T` parameter, local or binding: the place it
+    borrows, never dropped here."""
     __slots__ = ('place', 'owned')
 
     def __init__(self, place):
@@ -720,8 +736,8 @@ class Call(E):
 FN_NAMES = {'std::swap': 'std::mem::swap', 'std::replace': 'std::mem::replace'}
 
 # The header's functions, in the model. A let (`&T`) argument is a place
-# (or a temporary's cell), an inout (`&mut T`) one a place, a sink (by
-# value) one the value.
+# (or a temporary's cell), an 'inout' (`&mut T`) one a place, a 'sink'
+# (by value) one the value.
 
 def h_obs(it, r, t):
     return val(t).v
@@ -885,7 +901,7 @@ def h_drop(it, r, x):
     it.drop(x)
 
 
-# methods: recv is a place (let, inout) or a value (sink)
+# methods: recv is a place (`&self`, `&mut self`) or a value (`self`)
 
 def m_get(it, r):
     return rd(r.get()).v
@@ -913,12 +929,6 @@ def m_push(it, r, x):
 def m_pop(it, r):
     w = rd(r.get())
     return OV(w.pop() if w else None)
-
-
-def m_last(it, r):
-    # (for --known: a borrowed copy; the model gives the element)
-    w = rd(r.get())
-    return OV(w[-1] if w else None)
 
 
 def m_remove(it, r, i):
@@ -953,15 +963,6 @@ def m_swap(it, r, i, j):
     if i >= len(w) or j >= len(w):
         raise Invalid('swap out of bounds (unguarded)')
     w[i], w[j] = w[j], w[i]
-
-
-def m_set(it, r, i, x):
-    w = rd(r.get())
-    if i >= len(w):
-        raise Invalid('set out of bounds (unguarded)')
-    old = w[i]
-    w[i] = x
-    it.drop(old)
 
 
 def m_len(it, r):
@@ -1031,9 +1032,9 @@ HELPERS = {
     'vssig': h_vssig, 'std::swap': h_swap, 'std::replace': h_replace,
     'drop': h_drop,
     'get': m_get, 'add': m_add, 'into_v': m_into_v, 'clone': m_clone,
-    'push': m_push, 'pop': m_pop, 'last': m_last, 'remove': m_remove,
+    'push': m_push, 'pop': m_pop, 'remove': m_remove,
     'insert': m_insert, 'truncate': m_truncate, 'clear': m_clear,
-    'swap': m_swap, 'set': m_set, 'len': m_len, 'is_empty': m_is_empty,
+    'swap': m_swap, 'len': m_len, 'is_empty': m_is_empty,
     'is_some': m_is_some, 'unwrap': m_unwrap, 'unwrap_or': m_unwrap_or,
     'push_str': m_push_str, 'take': m_take, 'tv': m_tv, 'grow': m_grow,
     'into_t': m_into_t,
@@ -1464,7 +1465,16 @@ class Block(S_):
                     for v in reversed(it.temps.pop()):
                         it.drop(v)
             if self.tail is not None:
-                r = self.tail.ev(it, fr)
+                # (a tail expression's temporaries are dropped before the
+                # block's locals: "at the end of its statement", and
+                # rustc's rule from its 2024 edition; before it, after
+                # the locals)
+                it.temps.append([])
+                try:
+                    r = self.tail.ev(it, fr)
+                finally:
+                    for v in reversed(it.temps.pop()):
+                        it.drop(v)
         finally:
             fr.scopes.pop()
             it.drop_scope(sc)
@@ -1604,13 +1614,21 @@ class Question(S_):
 
 class MatchE(S_):
     """`match e { E::One(a) => {..}, E::Two(a, b) => {..}, E::Nada => {..} }`
-    on an owned local: e moves, the arm's bindings are its own."""
-    def __init__(self, p, arms):
+    on an owned local: e moves, the arm's bindings are its own. by: 'ref'
+    or 'mut', `match &e` or `match &mut e`: nothing moves, the bindings
+    are `&T` or `&mut T` into e (the default binding modes)."""
+    def __init__(self, p, arms, by=None):
         self.p = p
         self.arms = arms   # tag -> (names or None for `_`, Block)
+        self.by = by
 
     def emit(self, out, ind):
-        out.append('%smatch %s {' % (ind, self.p.code()))
+        if self.by:
+            for names, _ in self.arms.values():
+                for nm in names or []:
+                    refs()[nm] = 'let' if self.by == 'ref' else 'inout'
+        by = {None: '', 'ref': '&', 'mut': '&mut '}[self.by]
+        out.append('%smatch %s%s {' % (ind, by, self.p.code()))
         for tag in ('One', 'Two', 'Nada'):
             if tag not in self.arms:
                 continue
@@ -1631,7 +1649,12 @@ class MatchE(S_):
     def run(self, it, fr):
         pl = self.p.place(it, fr)
         v = rd(pl.get())
-        if v.tag in self.arms:
+        if v.tag in self.arms and self.by:
+            names, blk = self.arms[v.tag]
+            pre = [(nm, AliasCell(IdxPlace(v.items, i)))
+                   for i, nm in enumerate(names or []) if nm != '_']
+            blk.run(it, fr, pre=pre)
+        elif v.tag in self.arms:
             names, blk = self.arms[v.tag]
             pre = []
             moved_all = True
@@ -2150,8 +2173,8 @@ class Gen:
                 and (v.loop == c.loop or ty in ('P', 'i'))]
 
     def assignable(self, c, ty):
-        # a var (or a sink parameter) of any state, an inout parameter
-        # (live); a moved one only outside loops it was declared out of
+        # a `let mut` (or a by-value parameter) of any state, a `&mut T`
+        # one (live); a moved one only outside loops it was declared out of
         out = []
         for v in self.all_vars(c):
             if v.ty != ty or not v.mut or v.st == 'X' or v.name in c.frozen:
@@ -2306,6 +2329,17 @@ class Gen:
                 return Mk(Call('len', [], method=True, recv=self.r.choice(ws)))
         return Mk(self.int_k(c))
 
+    def temp_t(self, c, used):
+        """An owned T that is a temporary where it is lent (`&x` of a
+        variable would borrow it, not move it: `&ident(x)`)."""
+        x = self.texpr(c, 1, used)
+        if isinstance(x, Move):
+            return Call('ident', [Arg('sink', x)])
+        if isinstance(x, Call) and x.name == 'dup' and not self.known:
+            # (KNOWN generic_ref_temp)
+            return Call('ident', [Arg('sink', x)])
+        return x
+
     def vexpr(self, c, used=None):
         used = used if used is not None else set()
         r = self.r.random()
@@ -2338,8 +2372,9 @@ class Gen:
                     return call
         return NewVec()
 
-    def obs_expr(self, c, used, ints=True):
-        """An i64 observing a live value (no change); None if nothing.
+    def obs_expr(self, c, used, ints=True, temp=True):
+        """An i64 observing a live value (no change, but temp: or an owned
+        temporary, which may move a variable); None if nothing.
         ints=False: also a bool or a String's text."""
         opts = []
         tp = self.t_places(c)
@@ -2368,8 +2403,11 @@ class Gen:
             opts += ['gk']
         if self.readable(c, 'VS'):
             opts += ['vssig', 'vslen']
-        if not opts:
+        if not opts and not temp:
             return None
+        if not opts or (temp and self.chance(0.06)):
+            # (an owned temporary, lent: dropped at the end of the statement)
+            return Call('obs', [Arg('let', self.temp_t(c, used))])
         o = self.r.choice(opts)
         if o in ('tv', 'tid', 'obs', 'get', 'total', 'apply'):
             p = self.r.choice(tp)
@@ -2486,12 +2524,14 @@ class Gen:
                     ps = [p for p in self.v_places(c) if p.root() not in used]
                 else:
                     ps = [PVar(v.name) for v in self.readable(c, ty) if v.name not in used]
-                if ps and not (self.in_assign and ty == 'T' and self.chance(0.4)):
+                if ps and not (ty == 'T' and self.chance(0.4 if self.in_assign else 0.12)):
                     p = self.r.choice(ps)
                     used.add(p.root())
                     args.append(Arg('let', p))
                     continue
-                if (self.known or self.in_assign) and ty == 'T':
+                if ty == 'T':
+                    # (an owned temporary, lent: dropped at the end of
+                    # the statement)
                     args.append(Arg('let', Mk(self.int_k(c))))
                     continue
                 return None
@@ -2508,7 +2548,7 @@ class Gen:
                 used.add(p.root())
                 args.append(Arg('inout', p))
                 continue
-            # sink
+            # by value
             if ty == 'T':
                 args.append(Arg('sink', self.texpr(c, 1, used)))
             elif ty == 'V':
@@ -2665,7 +2705,7 @@ class Gen:
         return Decl(n, mut, 'E', x)
 
     def st_copy(self, c):
-        """`var b = a;`: a moves (owned) or is copied (plain)."""
+        """`let mut b = a;`: a moves (owned) or is copied (plain)."""
         ty = self.r.choice(['T', 'T', 'V', 'O', 'P', 'Str', 'S', 'Tu', 'A', 'G', 'E'])
         mv = self.movable(c, ty)
         if not mv:
@@ -2731,7 +2771,10 @@ class Gen:
         used = set()
         holes = []
         for _ in range(self.r.randint(1, 3)):
-            x = self.obs_expr(c, used, ints=False)
+            # (only the first hole moves or changes a variable: rustc's
+            # println! borrows every argument to the end of the call,
+            # where volec's println, a function, has read the earlier ones)
+            x = self.obs_expr(c, used, ints=False, temp=not holes)
             if x is None:
                 break
             holes.append(x)
@@ -2811,14 +2854,11 @@ class Gen:
             i, j = self.r.randint(0, 2), self.r.randint(0, 2)
             return If(Bin(lenp, '>', Lit(max(i, j))),
                       Block([Do(Call('swap', [Arg('val', Lit(i)), Arg('val', Lit(j))], method=True, recv=p))]), None)
-        if r < 0.80 and self.known:
+        if r < 0.80:
+            # (`w[i] = x` drops the element it replaces)
             i = self.r.randint(0, 2)
             x = self.guarded(c, lambda: self.texpr(c, 1, used))
-            if self.chance(0.5):
-                inner = Assign(PIdx(p, i), x)
-            else:
-                inner = Do(Call('set', [Arg('val', Lit(i)), Arg('sink', x)], method=True, recv=p))
-            return If(Bin(lenp, '>', Lit(i)), Block([inner]), None)
+            return If(Bin(lenp, '>', Lit(i)), Block([Assign(PIdx(p, i), x)]), None)
         if r < 0.87:
             return ForEachObs(p, self.obsn())
         if r < 0.93 and isinstance(p, PVar) and c.loop < 2:
@@ -3010,13 +3050,6 @@ class Gen:
                 q = Question(n, Call('pop', [], method=True, recv=self.r.choice(vp)))
                 self.declare(c, n, 'T', False)
                 return q
-            if self.known:
-                vp = self.v_places(c)
-                if vp:
-                    n = self.name('t')
-                    q = Question(n, Call('last', [], method=True, recv=self.r.choice(vp)))
-                    self.declare(c, n, 'T', False)
-                    return q
             return None
         # RI
         if self.try_args and self.chance(0.85):
@@ -3042,7 +3075,7 @@ class Gen:
         lim = lambda: Lit(self.r.randint(0, 12))
         form = self.r.randint(0, 3)
         if form == 3:
-            # `let t = tchk(x, chk(p, 4)?)?;`: x moved in, then the second
+            # `let t = tchk(x, chk(&p, 4)?)?;`: x moved in, then the second
             # argument returns
             tp = self.t_places(c)
             if not tp:
@@ -3056,18 +3089,18 @@ class Gen:
             return q
         inner = Q(Call('tchk', [Arg('sink', self.texpr(c, 1)), Arg('val', lim())]), self.chance(0.4))
         if form == 0:
-            # `let n = chk(tchk(x, 3)?, 5)?;`: lent to a let parameter
+            # `let n = chk(&tchk(x, 3)?, 5)?;`: lent to a `&T` parameter
             n = self.name('n')
             q = Question(n, Call('chk', [Arg('let', inner), Arg('val', lim())]))
             self.declare(c, n, 'i', False)
             return q
         if form == 1:
-            # `let t = tchk(tchk(x, 3)?, 5)?;`: moved to a sink one
+            # `let t = tchk(tchk(x, 3)?, 5)?;`: moved to a by-value one
             n = self.name('t')
             q = Question(n, Call('tchk', [Arg('sink', inner), Arg('val', lim())]))
             self.declare(c, n, 'T', False)
             return q
-        # `let n = obs(tchk(x, 3)?);`: the call's result not `?`'d
+        # `let n = obs(&tchk(x, 3)?);`: the call's result not `?`'d
         n = self.name('n')
         q = Decl(n, False, None, Call('obs', [Arg('let', inner)]))
         self.declare(c, n, 'i', False)
@@ -3103,22 +3136,34 @@ class Gen:
                 return CloBlock('sink', m.p, self.small(), self.obsn(), self.name('f'))
         m = self.take_var(c, 'T', set())
         if m is not None:
-            # a sink closure kept as a local
+            # a move closure kept as a local
             n = self.name('f')
             self.declare(c, n, 'F', False)
             return Decl(n, False, None, NewClo(m.p, self.small()))
         return None
 
     def st_match(self, c):
-        es = self.movable(c, 'E')
+        by = self.r.choice([None, None, None, 'ref', 'mut'])
+        es = (self.movable(c, 'E') if by is None else self.readable(c, 'E') if by == 'ref'
+              else self.mutable(c, 'E'))
         if not es:
             return None
         v = self.r.choice(es)
-        self.mark_moved(c, PVar(v.name))
+        thaw = False
+        if by is None:
+            self.mark_moved(c, PVar(v.name))
+        elif by == 'ref':
+            # (borrowed in the arms: read, not changed or moved)
+            thaw = v.name not in c.frozen
+            c.frozen.add(v.name)
+        else:
+            # (borrowed mutably: not used at all)
+            v.st = 'X'
         snap = self.snapshot(c)
         arms = {}
         ends = []
-        wild = self.known and self.chance(0.3)
+        wild = self.chance(0.3)
+        bkind = {None: 'local', 'ref': 'let', 'mut': 'inout'}[by]
         for tag, k in (('One', 1), ('Two', 2), ('Nada', 0)):
             if wild and tag != 'One' and self.chance(0.5):
                 continue
@@ -3131,7 +3176,7 @@ class Gen:
                 else:
                     nm = self.name('t')
                     names.append(nm)
-                    pre.append((nm, 'T', False, 'local'))
+                    pre.append((nm, 'T', by == 'mut', bkind))
             b, s = self.sub_block(c, self.r.randint(0, 3), pre=pre)
             arms[tag] = (names, b)
             ends.append(s)
@@ -3141,9 +3186,14 @@ class Gen:
             arms['_'] = (None, b)
             ends.append(s)
         self.branch_join(c, snap, ends)
-        if wild:
+        if by == 'ref':
+            if thaw:
+                c.frozen.discard(v.name)
+        elif by == 'mut':
+            v.st = 'L'
+        elif wild:
             v.st = 'X'
-        return MatchE(PVar(v.name), arms)
+        return MatchE(PVar(v.name), arms, by)
 
     def st_option(self, c):
         r = self.r.random()
@@ -3161,7 +3211,7 @@ class Gen:
         elif r < 0.85:
             x, kind = Call('tchk', [Arg('sink', self.texpr(c, 1)), Arg('val', Lit(self.r.randint(0, 12)))]), 'R'
         else:
-            # `if o.is_some() { var t = o.unwrap(); .. }`: a conditional move
+            # `if o.is_some() { let mut t = o.unwrap(); .. }`: a conditional move
             os_ = self.movable(c, 'O')
             if not os_:
                 return None
@@ -3250,7 +3300,7 @@ class Gen:
         v = self.r.choice(arrs)
         i = self.r.randint(0, 1)
         if v.mut and v.name not in c.frozen:
-            if self.known and self.chance(0.3):
+            if self.chance(0.3):
                 return Assign(PIdx(PVar(v.name), i), self.texpr(c, 1, {v.name}))
             return Do(Call('bump', [Arg('inout', PIdx(PVar(v.name), i)), Arg('val', self.int_k(c))]))
         return Print(self.obsn(), [Read(PField(PIdx(PVar(v.name), i), 'v'))])
@@ -3327,7 +3377,7 @@ class Gen:
         return Decl(n, True, None, Call('clone', [], method=True, recv=PVar(v.name)))
 
     def st_inout(self, c):
-        """`{ inout r = &place; .. }`: r used as the place itself."""
+        """`{ let r = &mut place; .. }`: r used as the place itself."""
         ps = self.t_places(c, need_mut=True, elems=False)
         if not ps:
             return None
@@ -3448,10 +3498,49 @@ def run_cmd(cmd, timeout=60):
         return 124, '', 'timeout'
 
 
-def check_program(volec, prog, work, tag, configs=CONFIGS):
+# rustc's edition for --rustc. 2024: a tail expression's temporaries are
+# dropped before the block's locals, as volec drops them (2021: after).
+RUSTC_EDITION = '2024'
+
+
+def rustc_twin(rustc, text, events, work, tag):
+    """The program as Rust (tools/rustc-twin: the shim's prelude for Gpa
+    and the `_in` functions), built by rustc and run: None when rustc
+    accepts it and it prints what the model says, else (kind, detail):
+    notrust (rustc rejects it: the generator made what Rust does not
+    allow), model (rustc's program prints something else: the model is
+    not Rust's semantics), twin (the shim cannot make it Rust)."""
+    sys.path.insert(0, os.path.join(ROOT, 'tools', 'rustc-twin'))
+    import twin
+    rs, why = twin.to_rust(text)
+    if why is not None:
+        return ('twin', why)
+    src = os.path.join(work, tag + '.rs')
+    exe = os.path.join(work, tag + '.rustc')
+    with open(src, 'w') as f:
+        f.write(rs)
+    err = twin.rustc_build(rustc, src, exe, edition=RUSTC_EDITION)
+    if err is not None:
+        return ('notrust', 'rustc: ' + err)
+    rc, out, err = run_cmd([exe], timeout=20)
+    try:
+        os.unlink(exe)
+    except OSError:
+        pass
+    if rc != 0:
+        return ('model', 'rustc\'s program exits %d: %s' % (rc, err.strip().splitlines()[0] if err.strip() else ''))
+    d = compare(events, out.rstrip('\n').split('\n') if out else [])
+    if d is not None:
+        return ('model', 'rustc\'s program: ' + d)
+    return None
+
+
+def check_program(volec, prog, work, tag, configs=CONFIGS, rustc=None):
     """('ok', None) or (kind, detail): invalid (the model's), reject (the
     checker's: OVERSTRICT or a generator bug), crash, exit, alloc
-    (--check-alloc's report), oracle (not the expected output)."""
+    (--check-alloc's report), oracle (not the expected output); with a
+    rustc, first rustc_twin's kinds (notrust, model, twin), and a reject
+    says that rustc accepts the program."""
     try:
         events = prog.expect()
     except Invalid as e:
@@ -3459,15 +3548,26 @@ def check_program(volec, prog, work, tag, configs=CONFIGS):
     except RecursionError:
         return ('invalid', 'recursion')
     src = os.path.join(work, tag + '.vl')
+    text = prog.code()
     with open(src, 'w') as f:
-        f.write(prog.code())
+        f.write(text)
+    rs = rustc_twin(rustc, text, events, work, tag) if rustc else None
     rc, out, err = run_cmd([volec, 'check', src])
     if rc != 0:
         msg = (out + err).strip().splitlines()
         first = next((l for l in msg if 'error' in l), msg[0] if msg else 'no message')
         if rc != 1:
             return ('crash', 'volec check exit %d: %s' % (rc, first))
-        return ('reject', first.replace(src, 'p.vl'))
+        first = first.replace(src, 'p.vl')
+        if rs is not None and rs[0] == 'notrust':
+            return ('notrust', '%s; volec: %s' % (rs[1], first))
+        if rustc and rs is None:
+            return ('reject', 'rustc accepts it; volec: ' + first)
+        return ('reject', first)
+    if rs is not None:
+        if rs[0] == 'notrust':
+            return ('notrust', rs[1] + '; volec accepts it')
+        return rs
     for name, flags in configs:
         exe = os.path.join(work, '%s.%s' % (tag, name))
         rc, out, err = run_cmd([volec] + flags + [src, '-o', exe], timeout=120)
@@ -3526,16 +3626,21 @@ def blocks_of(prog):
     return out
 
 
-def shrink(volec, prog, kind, work, budget=600):
+def shrink(volec, prog, kind, work, budget=600, rustc=None):
     """Deletes statements (and functions) while check_program keeps giving
     `kind`; an if is also replaced by one of its blocks."""
-    state = {'n': 0}
+    state = {'n': 0, 'accepts': False}
+    if kind == 'notrust':
+        state['accepts'] = 'volec accepts' in check_program(volec, prog, work, 'shrink0', rustc=rustc)[1]
 
     def still(p):
         state['n'] += 1
         if state['n'] > budget:
             return False
-        k, _ = check_program(volec, p, work, 'shrink%d' % state['n'])
+        k, d = check_program(volec, p, work, 'shrink%d' % state['n'], rustc=rustc)
+        if kind == 'notrust' and k == kind:
+            # (the same two verdicts: rustc's alone, or both's)
+            return ('volec accepts' in d) == state['accepts']
         return k == kind
     progress = True
     while progress and state['n'] <= budget:
@@ -3636,9 +3741,12 @@ class Slots:
 
 
 def main():
+    global RUSTC_EDITION
     ap = argparse.ArgumentParser(add_help=False)
-    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    root = ROOT
     ap.add_argument('-c', default=os.path.join(root, 'target', 'volec'))
+    ap.add_argument('--rustc', nargs='?', const='', default=None)
+    ap.add_argument('--rustc-edition', default=RUSTC_EDITION)
     ap.add_argument('-n', type=int, default=100)
     ap.add_argument('-f', type=int, default=1)
     ap.add_argument('-k', default=os.path.join(root, 'tests', 'fuzz', 'failures', 'sem'))
@@ -3668,16 +3776,23 @@ def main():
     if not os.access(volec, os.X_OK):
         print('sem-fuzz: no compiler at %s' % volec)
         return 2
+    RUSTC_EDITION = a.rustc_edition
+    rustc = None
+    if a.rustc is not None:
+        rustc = a.rustc or shutil.which('rustc') or os.path.expanduser('~/.cargo/bin/rustc')
+        if not os.access(rustc, os.X_OK):
+            print('sem-fuzz: no rustc at %s' % rustc)
+            return 2
     work = tempfile.mkdtemp(prefix='vole-semfuzz.')
     if a.shrink is not None:
         prog = Gen(a.shrink, a.known, a.size, a.assign_calls, a.try_args, a.closure_params).program()
-        kind, detail = check_program(volec, prog, work, 'p')
+        kind, detail = check_program(volec, prog, work, 'p', rustc=rustc)
         print('// %s: %s' % (kind, detail))
         if kind not in ('ok', 'invalid'):
-            small = shrink(volec, prog, kind, work, budget=2000)
+            small = shrink(volec, prog, kind, work, budget=2000, rustc=rustc)
             print(small.code())
             print('// expected:\n' + ''.join('// ' + l + '\n' for l in render(small.expect()).splitlines()))
-            print('// %s: %s' % check_program(volec, small, work, 'q'))
+            print('// %s: %s' % check_program(volec, small, work, 'q', rustc=rustc))
         shutil.rmtree(work, ignore_errors=True)
         return 0
     slots = Slots(a.j)
@@ -3689,7 +3804,7 @@ def main():
         d = os.path.join(work, 's%d' % seed)
         os.makedirs(d, exist_ok=True)
         with slots:
-            kind, detail = check_program(volec, prog, d, 'p')
+            kind, detail = check_program(volec, prog, d, 'p', rustc=rustc)
         if kind != 'ok':
             os.makedirs(a.k, exist_ok=True)
             base = os.path.join(a.k, 'sem%d' % seed)
@@ -3702,11 +3817,14 @@ def main():
                 pass
             if kind != 'invalid' and not a.no_shrink:
                 with slots:
-                    small = shrink(volec, Gen(seed, a.known, a.size, a.assign_calls, a.try_args, a.closure_params).program(), kind, d)
+                    small = shrink(volec, Gen(seed, a.known, a.size, a.assign_calls, a.try_args, a.closure_params).program(), kind, d, rustc=rustc)
                 with open(base + '.min.vl', 'w') as f:
                     f.write(small.code())
-                with open(base + '.min.expect', 'w') as f:
-                    f.write(render(small.expect()))
+                try:
+                    with open(base + '.min.expect', 'w') as f:
+                        f.write(render(small.expect()))
+                except Invalid:
+                    pass
         shutil.rmtree(d, ignore_errors=True)
         with lock:
             results[seed] = (kind, detail)
