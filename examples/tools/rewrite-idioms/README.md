@@ -71,11 +71,11 @@ rewrote 3 sites in 2 files	2 files	+3 -6 lines
 // report.vl:2: 1 line removed after line 2
 // report.vl:30
 30	        let c = top[i];
-// stats.vl:5: 2 lines removed after line 5
-// stats.vl:67
-67	        out.push(v[i]);
-// stats.vl:76
-76	        if v[i].n == 1 {
+// stats.vl:4: 2 lines removed after line 4
+// stats.vl:66
+66	        out.push(v[i]);
+// stats.vl:75
+75	        if v[i].n == 1 {
 note rewrite.imports: removed 2 imports the rewrite left unused
 ```
 
@@ -147,12 +147,12 @@ $ volec rewrite 'for $i in 0..$v.len() { let $x = $v[$i]; $s... }' 'for $x in $v
 rewrote 5 sites in 3 files	3 files	+5 -10 lines
 // report.vl:29
 29	    for c in top.iter().copied() {
-// stats.vl:14
-14	    for w in ws.iter().copied() {
-// stats.vl:44
-44	    for w in ws.iter().copied() {
-// stats.vl:53
-53	    for w in ws.iter().copied() {
+// stats.vl:13
+13	    for w in ws.iter().copied() {
+// stats.vl:43
+43	    for w in ws.iter().copied() {
+// stats.vl:52
+52	    for w in ws.iter().copied() {
 // text.vl:16
 16	    for c in text.iter().copied() {
 note rewrite.dropped: 1 site is left: the replacement drops $i, which the code it keeps uses; first: text.vl:40:18

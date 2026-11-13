@@ -25,7 +25,6 @@ mod report;
 
 use std::io;
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 fn main(gpa: Gpa) {
     let text = io::read_to_string_in(io::stdin(), gpa).unwrap();
@@ -41,7 +40,6 @@ Then `count.vl`, the counting:
 ```vole count.vl
 // Counting the words of a text.
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 // Letters, digits and apostrophes are parts of words. So is every
 // byte of a non-ASCII character (0x80 and up), so "café" stays whole.
@@ -85,7 +83,6 @@ And `report.vl`, the table:
 // The table of the most common words.
 
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa, FixedState>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64), Gpa> {
     let mut pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
@@ -201,7 +198,6 @@ off:
 mod count;
 
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 fn main(gpa: Gpa) {
     let mut counts: HashMap<String<Gpa>, i64, Gpa, FixedState> = HashMap::new_in(gpa);
@@ -212,7 +208,6 @@ fn main(gpa: Gpa) {
 
 ```vole count.vl
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa, FixedState>, text: &str, gpa: Gpa) {
     for word in text.split_whitespace() {
@@ -224,8 +219,8 @@ fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa, FixedState>, text: &str
 
 ```err
 error[item.private]: 'add_words' is private
- --> main.vl: line 8, column 5
-  = help: make it public: `pub fn add_words` at count.vl: line 4, column 1
+ --> main.vl: line 7, column 5
+  = help: make it public: `pub fn add_words` at count.vl: line 3, column 1
   = try: volec fix --suggested main.vl
 ```
 
@@ -397,7 +392,6 @@ use std::env;
 use std::fs;
 use std::io;
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 fn run(gpa: Gpa) -> io::Result<()> {
     let args: Vec<&str, Gpa> = env::args().collect_in(gpa);
@@ -429,7 +423,6 @@ fn main(gpa: Gpa) -> i32 {
 ```vole count.vl
 // Counting the words of a text.
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 // Letters, digits and apostrophes are parts of words. So is every
 // byte of a non-ASCII character (0x80 and up), so "café" stays whole.
@@ -471,7 +464,6 @@ pub fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa, FixedState>, text: 
 // The table of the most common words.
 
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa, FixedState>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64), Gpa> {
     let mut pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);

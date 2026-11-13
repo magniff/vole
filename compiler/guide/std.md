@@ -40,7 +40,8 @@ threads`).
 ## Overview
 
 The standard library is the module `std`, built into the compiler. The
-prelude is Rust's (`guide modules` lists it) plus `Gpa`; anything else
+prelude is Rust's (`guide modules` lists it) plus `Gpa` and
+`FixedState`; anything else
 is used by path (`std::mem::swap(&mut a, &mut b)`) or imported by name
 (`use std::collections::HashMap;`).
 
@@ -57,9 +58,10 @@ is used by path (`std::mem::swap(&mut a, &mut b)`) or imported by name
   order, not insertion order.
 - A `HashMap` is a Swiss table (hashbrown's design). Its hasher is its
   last type parameter and, as the allocator, always written (no
-  default, `hash.default`): `HashMap<K, V, Gpa, FixedState>`, with `use
-  std::hash::FixedState;` (foldhash with a fixed seed: the slot order is
-  the same in every run and on every target).
+  default, `hash.default`): `HashMap<K, V, Gpa, FixedState>`
+  (`std::hash::FixedState`, in the prelude as `Gpa`: foldhash with a
+  fixed seed, the slot order is the same in every run and on every
+  target).
 - The constructors say which hasher, as Rust's: `HashMap::new_in(gpa)`
   and `with_capacity_in(n, gpa)` make a `FixedState` map, K and V from
   the variable's type or from `HashMap::<K, V, Gpa,
@@ -74,7 +76,6 @@ is used by path (`std::mem::swap(&mut a, &mut b)`) or imported by name
 
 ```vole
 use std::collections::{HashMap, HashSet};
-use std::hash::FixedState;
 
 fn main(gpa: Gpa) -> i32 {
     let mut counts: HashMap<&str, i64, Gpa, FixedState> = HashMap::new_in(gpa);

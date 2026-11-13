@@ -22,7 +22,7 @@ and the compiler's errors for Rust habits name vole's form on their
 |---|---|---|
 | `println!`, `vec!`, `assert!`, macros | functions: `println("{x}")`, `assert(c)`, `assert_eq(a, b)`; there are no macros | 1, 13 |
 | `Vec::new()`, `String::new()`, `collect()`, `format!` | `Vec::new_in(gpa)`, `String::new_in(gpa)`, `collect_in(gpa)`, `format_in("{x}", gpa)`: allocation is explicit, the allocator goes last | 8 |
-| `Vec<T>`, `String`, `HashMap<K, V>` | `Vec<T, Gpa>`, `String<Gpa>`, `HashMap<K, V, Gpa, FixedState>`: the allocator is part of the type, and there is no default; a map's hasher too (`use std::hash::FixedState;`) | 8 |
+| `Vec<T>`, `String`, `HashMap<K, V>` | `Vec<T, Gpa>`, `String<Gpa>`, `HashMap<K, V, Gpa, FixedState>`: the allocator is part of the type, and there is no default; a map's hasher too (`FixedState`, in the prelude as `Gpa`) | 8 |
 | a struct holding a `Vec` | names the allocator: `struct Log<A: Allocator> { lines: Vec<String<A>, A> }` | 8, 9 |
 | `fn main()` | `fn main(gpa: Gpa)`, for a program that allocates | 2, 8 |
 | `x as i64` to widen an `i32` | nothing: an `i32` goes where an `i64` is wanted; narrowing still takes `as` | 3 |

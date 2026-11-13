@@ -49,7 +49,6 @@ use std::env;
 use std::fs;
 use std::io;
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 fn run(gpa: Gpa) -> io::Result<()> {
     let args: Vec<&str, Gpa> = env::args().collect_in(gpa);
@@ -81,7 +80,6 @@ fn main(gpa: Gpa) -> i32 {
 ```vole count.vl
 // Counting the words of a text.
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 // Letters, digits and apostrophes are parts of words. So is every
 // byte of a non-ASCII character (0x80 and up), so "café" stays whole.
@@ -124,7 +122,6 @@ pub fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa, FixedState>, text: 
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 // The order of the table's rows.
 pub enum Order {
@@ -185,7 +182,7 @@ it? `volec query context` answers all three at once:
 
 ```console
 $ volec query context report::top
-// crate::report::top	report.vl:13-25	effects: alloc(Gpa) panic diverge
+// crate::report::top	report.vl:12-24	effects: alloc(Gpa) panic diverge
 pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa, FixedState>, n: usize, order: Order, gpa: Gpa) -> Vec<(
     String<Gpa>, i64), Gpa> {
     let mut pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
@@ -200,7 +197,7 @@ pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa, FixedState>, n: usize, order:
     pairs
 }
 // calls (9)
-crate::report::by_count	report.vl:28:4	fn	fn by_count(a: &(String<Gpa>, i64), b: &(String<Gpa>, i64)) -> Ordering
+crate::report::by_count	report.vl:27:4	fn	fn by_count(a: &(String<Gpa>, i64), b: &(String<Gpa>, i64)) -> Ordering
 <&'a HashMap<K, V, A, S> as IntoIterator>::into_iter	<std>:L:C	method	fn into_iter(self) -> Iter<'a, K, V>
 <std::string::String as Clone>::clone	<std>:L:C	method	fn clone(&self) -> String<A>
 std::vec::Vec::sort_by	<std>:L:C	method	pub fn sort_by<F: FnMut(&T, &T) -> Ordering>(&mut self, compare: F)
@@ -210,7 +207,7 @@ std::vec::Vec::truncate	<std>:L:C	method	pub fn truncate(&mut self, n: usize) en
 std::vec::Vec::new_in	<std>:L:C	method	pub fn new_in(a: A) -> Vec<T, A>
 std::vec::Vec::push	<std>:L:C	method	pub fn push(&mut self, x: T) debug ensures self.len() == old(self.len()) + 1 debug ensures self.len() <= self.capacity()
 // types (7)
-crate::report::Order	report.vl:8:10	enum	pub enum Order { ByCount, Alphabetical, }
+crate::report::Order	report.vl:7:10	enum	pub enum Order { ByCount, Alphabetical, }
 std::hash::FixedState	<std>:L:C	struct	pub struct FixedState { seed: u64, }
 std::alloc::Gpa	<std>:L:C	struct	pub struct Gpa { sealed: (), }
 std::collections::hash_map::HashMap	<std>:L:C	struct	pub struct HashMap<K, V, A: Allocator, S: BuildHasher> { table: RawTable<(K, V), A>, hasher: S, }
@@ -218,7 +215,7 @@ std::string::String	<std>:L:C	struct	pub struct String<A: Allocator> { vec: Vec<
 std::option::Option	<std>:L:C	enum	pub enum Option<T> { None, Some(T), }
 std::vec::Vec	<std>:L:C	struct	pub struct Vec<T, A: Allocator> { ptr: NonNull<T>, cap: usize, len: usize, alloc: A, }
 // callers (1)
-run	main.vl:22:23	let top = report::top(&counts, n, report::Order::ByCount, gpa);
+run	main.vl:21:23	let top = report::top(&counts, n, report::Order::ByCount, gpa);
 ```
 
 The first line is the item's full name, where it is (`report.vl`,
@@ -258,15 +255,15 @@ of use and the function it's in:
 ```console
 $ volec query refs Order
 # report.vl
-8:10	def	pub enum Order {
-13:82	type	report::top	pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa, FixedState>, n: usize, order: Order, gpa: Gpa) -…
-20:9	type	report::top	Order::ByCount => pairs.sort_by(by_count),
-21:9	type	report::top	Order::Alphabetical => pairs.sort_by(|a, b| a.0.cmp(&b.0)),
+7:10	def	pub enum Order {
+12:82	type	report::top	pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa, FixedState>, n: usize, order: Order, gpa: Gpa) -…
+19:9	type	report::top	Order::ByCount => pairs.sort_by(by_count),
+20:9	type	report::top	Order::Alphabetical => pairs.sort_by(|a, b| a.0.cmp(&b.0)),
 # main.vl
-22:47	type	run	let top = report::top(&counts, n, report::Order::ByCount, gpa);
+21:47	type	run	let top = report::top(&counts, n, report::Order::ByCount, gpa);
 $ volec query callers add_words
 # main.vl
-16:16	call	run	count::add_words(&mut counts, &text, gpa);
+15:16	call	run	count::add_words(&mut counts, &text, gpa);
 ```
 
 Each line is `LINE:COLUMN`, then the kind (`def` for the definition,
@@ -305,7 +302,7 @@ says:
 
 ```console
 $ volec edit patch print_table --old '{:>4}' --new '{:>6}'
-error patch.no-match: OLD 1 is not in crate::report::print_table; nearest, line 34: println("{:<12}{:>5}", row.0, row.1);
+error patch.no-match: OLD 1 is not in crate::report::print_table; nearest, line 33: println("{:<12}{:>5}", row.0, row.1);
 try: volec edit patch print_table --old '{:>5}' --new '{:>6}'
 ```
 
@@ -332,8 +329,8 @@ exist:
 
 ```console
 $ volec edit patch print_table --old '{:>6}' --new '{:>6} {share}'
-report.vl:34:31: error[type error] undefined variable 'share'  [edited: crate::report::print_table]
-error edit.breaks: 1 new error; nothing written; the error: report.vl:34:31: undefined variable 'share'
+report.vl:33:31: error[type error] undefined variable 'share'  [edited: crate::report::print_table]
+error edit.breaks: 1 new error; nothing written; the error: report.vl:33:31: undefined variable 'share'
 note edit.together: several steps are one call, checked at its end: `edit patch NAME --old A --new B --old C --new D` (`--in OTHER` before another item's pairs), `edit apply FILE`; or this step alone with --no-check
 try: volec edit patch print_table --old '{:>6}' --new '{:>6} {share}' --no-check
 ```
@@ -368,9 +365,9 @@ $ volec refactor rename count::add_words count_words
 renamed crate::count::add_words to count_words	2 files	+2 -2 lines
 $ volec query refs count_words
 # count.vl
-30:8	def	pub fn count_words(counts: &mut HashMap<String<Gpa>, i64, Gpa, FixedState>, text: &str, gpa: Gpa) {
+29:8	def	pub fn count_words(counts: &mut HashMap<String<Gpa>, i64, Gpa, FixedState>, text: &str, gpa: Gpa) {
 # main.vl
-16:16	call	run	count::count_words(&mut counts, &text, gpa);
+15:16	call	run	count::count_words(&mut counts, &text, gpa);
 ```
 
 Both the definition and the call changed. A rename changes the uses the
@@ -393,7 +390,7 @@ $ volec refactor signature count::count_words --add 'min_len: usize = 1' --fill-
 added parameter min_len: usize to crate::count::count_words, 1 call	2 files	+3 -2 lines
 $ volec query callers count_words
 # main.vl
-16:16	call	run	count::count_words(&mut counts, &text, gpa, 1);
+15:16	call	run	count::count_words(&mut counts, &text, gpa, 1);
 ```
 
 The call in `run` now passes `1`, which keeps every word, as before.
@@ -407,7 +404,7 @@ $ volec refactor signature count::count_words --reorder counts,text,min_len,gpa
 reordered the parameters of crate::count::count_words, 1 call	2 files	+3 -3 lines
 $ volec query callers count_words
 # main.vl
-16:16	call	run	count::count_words(&mut counts, &text, 1, gpa);
+15:16	call	run	count::count_words(&mut counts, &text, 1, gpa);
 ```
 
 Now the body can use `min_len`. The loop already skips a word that
@@ -419,7 +416,7 @@ same):
 $ volec edit patch count_words --old 'if w.is_empty() {' --new 'if w.len() < min_len {'
 patched crate::count::count_words	count.vl	+1 -1 lines
 $ volec query show count_words
-// crate::count::count_words	count.vl:29-39	effects: alloc(Gpa) panic diverge
+// crate::count::count_words	count.vl:28-38	effects: alloc(Gpa) panic diverge
 // Adds the words of text to counts, lowercased.
 pub fn count_words(counts: &mut HashMap<String<Gpa>, i64, Gpa, FixedState>, text: &str,
     min_len: usize, gpa: Gpa) {
@@ -447,7 +444,7 @@ variant and an arm to each match, with the expression you give:
 $ volec refactor variant report::Order --add 'Longest' --arm 'pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()))'
 added variant Longest to crate::report::Order, an arm in 1 match	report.vl	+2 -0 lines
 $ volec query show report::top
-// crate::report::top	report.vl:14-27	effects: alloc(Gpa) panic diverge
+// crate::report::top	report.vl:13-26	effects: alloc(Gpa) panic diverge
 pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa, FixedState>, n: usize, order: Order, gpa: Gpa) -> Vec<(
     String<Gpa>, i64), Gpa> {
     let mut pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
@@ -499,12 +496,12 @@ into a plain `&`, which may not change the map (chapter 4):
 
 ```console
 $ volec edit patch run --old '(&mut counts' --new '(&counts' --no-check
-main.vl:16:28: error[type error] expected '&mut HashMap<String<Gpa>, i64, Gpa, FixedState>', got '&HashMap<String<Gpa>, i64, Gpa, FixedState>' | help: the types differ in mutability (rustc E0308): the parameter takes an exclusive reference, `&mut x` | try: &mut counts | try: volec fix --suggested main.vl  [edited: crate::run]
+main.vl:15:28: error[type error] expected '&mut HashMap<String<Gpa>, i64, Gpa, FixedState>', got '&HashMap<String<Gpa>, i64, Gpa, FixedState>' | help: the types differ in mutability (rustc E0308): the parameter takes an exclusive reference, `&mut x` | try: &mut counts | try: volec fix --suggested main.vl  [edited: crate::run]
 patched crate::run	main.vl	+1 -1 lines
-warning edit.breaks: 1 new error; written anyway (--no-check); the error: main.vl:16:28: expected '&mut HashMap<String<Gpa>, i64, Gpa, FixedState>', got '&HashMap<String<Gpa>, i64, Gpa, FixedState>'
+warning edit.breaks: 1 new error; written anyway (--no-check); the error: main.vl:15:28: expected '&mut HashMap<String<Gpa>, i64, Gpa, FixedState>', got '&HashMap<String<Gpa>, i64, Gpa, FixedState>'
 try: volec check
 $ volec check
-main.vl:16:28: error[type error] expected '&mut HashMap<String<Gpa>, i64, Gpa, FixedState>', got '&HashMap<String<Gpa>, i64, Gpa, FixedState>' | help: the types differ in mutability (rustc E0308): the parameter takes an exclusive reference, `&mut x` | try: &mut counts | try: volec fix --suggested main.vl
+main.vl:15:28: error[type error] expected '&mut HashMap<String<Gpa>, i64, Gpa, FixedState>', got '&HashMap<String<Gpa>, i64, Gpa, FixedState>' | help: the types differ in mutability (rustc E0308): the parameter takes an exclusive reference, `&mut x` | try: &mut counts | try: volec fix --suggested main.vl
 ```
 
 `volec check` reports the error with two `try:` lines: the first is

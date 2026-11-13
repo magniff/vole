@@ -9,8 +9,8 @@ use crate::back::codecache::{R_ATTRS, R_STATIC, cc_note};
 use crate::back::regalloc::intervals::calls_returns_twice;
 use crate::back::regalloc::prepare::layout_order;
 use crate::base::{
-    IntVec, STDERR, alloc_array, buf_byte, buf_int, buf_new, buf_str, buf_write_fd, free, intern_c,
-    sym_name,
+    IntVec, STDERR, alloc_array, buf_byte, buf_int, buf_new, buf_str, buf_write_fd, find_sym, free,
+    intern_c, sym_name,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -18,10 +18,16 @@ use crate::front::effects::{
     EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC, EFF_RAW_DIVERGE, EFF_RAW_PANIC,
     EFF_SYNC, EFF_THREAD, EFF_TLS, EFF_UNKNOWN, Effects, fn_effects,
 };
-use crate::front::effects::builtin::known_c_effects;
+use crate::front::effects::builtin::{
+    C_ALLOC, C_GLOBAL, C_IO, C_NONE, C_READS, c_class, c_symbol, known_c_effects,
+};
 use crate::front::types::{TY_BOOL, TY_U64, TY_U8, is_float, is_integer};
 use crate::gen0::gen::fn_is_global;
 use crate::gen0::target::rt_panic_sym;
+use crate::middle::callfacts::{
+    HW_ARGS, HW_ARG_SHIFT, HW_FAR, HW_KNOWN, HW_RESULT, HW_STATIC, mark_returning, no_writes,
+    note_writes, writes_bits, writes_hi, writes_lo,
+};
 use crate::middle::ctx::FnCtx;
 use crate::middle::fold::is_const;
 use crate::middle::gvn::{
@@ -137,11 +143,55 @@ pub fn front_attrs(f: i64, pcx: &Ctx<Comp>) -> i64 {
     if table {
         attrs = c_lib_bounded(attrs);
     }
+    // (0.29) What a C function of the table writes (middle::callfacts).
+    if pcx.fns[f as usize].is_extern && pcx.fns[f as usize].effect_decl == 0 {
+        attrs = attrs | c_header_writes(f, pcx);
+    }
     if pcx.fns[f as usize].is_extern && (attrs & ATTR_WILLRETURN) == 0 {
         // (A C function that may not return may exit: `exit`, `abort`.)
         attrs = attrs & !ATTR_NOPANIC;
     }
     attrs
+}
+
+// (0.29) The Vec headers C function f (undeclared effects: std's table)
+// may write, as callfacts' bits: HW_KNOWN alone for one that writes no
+// memory of the program (strlen; C's allocator, which writes its own
+// blocks and tables), with the bit of each pointer parameter for one that
+// writes through the pointers it is given (memcpy, read, posix_memalign's
+// result); 0 (unknown) for the rest: a function not in the table, a
+// variadic one, one that waits for or starts a thread.
+fn c_header_writes(f: i64, pcx: &Ctx<Comp>) -> i64 {
+    let sym = c_symbol(f, pcx);
+    let class = c_class(sym);
+    if class == C_READS || class == C_ALLOC && sym != find_sym(b"posix_memalign", pcx) {
+        return HW_KNOWN;
+    }
+    if class != C_NONE && class != C_ALLOC && class != C_IO && class != C_GLOBAL
+        || pcx.fns[f as usize].variadic {
+        return 0;
+    }
+    let mut bits = HW_KNOWN;
+    for k in 0..pcx.fns[f as usize].param_count {
+        let t = (pcx.tlists[(pcx.fns[f as usize].params + k) as usize]);
+        if !is_integer(t) && !is_float(t) && t != TY_BOOL {
+            if k >= HW_ARGS {
+                return 0;
+            }
+            bits = bits | (1 << (HW_ARG_SHIFT + k));
+        }
+    }
+    bits
+}
+
+// (0.29) Whether C function f (undeclared effects) returns a block of C's
+// allocator (malloc, calloc, realloc...; not posix_memalign, whose result
+// is a status).
+pub fn c_allocates(f: i64, pcx: &Ctx<Comp>) -> bool {
+    pcx.fns[f as usize].is_extern && pcx.fns[f as usize].effect_decl == 0 && {
+        let sym = c_symbol(f, pcx);
+        c_class(sym) == C_ALLOC && sym != find_sym(b"posix_memalign", pcx)
+    }
 }
 
 // The attribute bits effects e give (READNONE too when `readnone_ok`: a C
@@ -185,16 +235,14 @@ fn numeric_params(f: i64, pcx: &Ctx<Comp>) -> bool {
 // What C library function `sym` called by the lowering (CALLC v) does:
 // builtin.vl's table, READNONE when every argument is a float.
 fn c_lib_attrs(cx: &mut FnCtx<Comp>, v: i64, sym: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let mut floats = true;
-        for i in 0..(cx.insts[v as usize]).nargs {
-            if !is_float((cx.argty[((cx.insts[v as usize]).args + i) as usize])) {
-                floats = false;
-            }
+    let mut floats = true;
+    for i in 0..(cx.insts[v as usize]).nargs {
+        if !is_float((cx.argty[((cx.insts[v as usize]).args + i) as usize])) {
+            floats = false;
         }
-        let attrs = effects_attrs(known_c_effects(sym, pcx), floats);
-        if (attrs & ATTR_WILLRETURN) == 0 { 0 } else { c_lib_bounded(attrs) }
     }
+    let attrs = effects_attrs(known_c_effects(sym, pcx), floats);
+    if (attrs & ATTR_WILLRETURN) == 0 { 0 } else { c_lib_bounded(attrs) }
 }
 
 // (0.25) A C library function of builtin.vl's table that reads no memory
@@ -230,7 +278,7 @@ pub fn call_removable(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) -> bool {
 
 // Whether instruction v must stay even when its value is unused.
 pub fn has_effect(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) -> bool {
-    let op = unsafe { (cx.insts[v as usize]).op };
+    let op = (cx.insts[v as usize]).op;
     if op.is_call() {
         return !call_removable(cx, v, pcx);
     }
@@ -248,10 +296,13 @@ fn compute_attrs(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> i64 {
         }
         find_escaping_slots(cx, fi, pcx);
         layout_order(cx, fi);
+        mark_returning(cx);
         let mut attrs = ATTR_ALL;
         let mut returns = false;
         // (0.25) Its instructions and its callees' costs, for BOUNDED.
         let mut cost: i64 = 0;
+        // (0.29) The Vec headers it may write (middle::callfacts).
+        let mut hw = no_writes();
         for i in 0..cx.order.len() as i64 {
             let b = (cx.order[i as usize]);
             if (cx.blocks[b as usize]).term == Term::Ret {
@@ -272,6 +323,9 @@ fn compute_attrs(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> i64 {
                 if op != Const {
                     cost += 1;
                 }
+                // (0.29) A call's callee's attributes, for the Vec headers
+                // it may write (middle::callfacts).
+                let mut callee: i64 = 0;
                 if op == Load {
                     if reads_shared(cx, (cx.insts[v as usize]).a) {
                         attrs = attrs & !ATTR_READNONE;
@@ -307,6 +361,7 @@ fn compute_attrs(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> i64 {
                             cx.used_component = true;
                         }
                     }
+                    callee = known;
                     if known & ATTR_READNONE == 0 {
                         attrs = attrs & !ATTR_READNONE;
                     }
@@ -329,6 +384,10 @@ fn compute_attrs(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> i64 {
                         }
                     }
                 }
+                // (a block that reaches no RET: its writes are not seen)
+                if (cx.blocks[b as usize]).mark == 2 {
+                    note_writes(cx, fi, v, callee, &mut hw, pcx);
+                }
                 v = (cx.insts[v as usize]).next;
             }
         }
@@ -345,7 +404,7 @@ fn compute_attrs(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> i64 {
             }
         }
         (*get_fn_nocapture().add(fi as usize)) = compute_nocapture(cx, fi, pcx);
-        attrs
+        attrs | writes_bits(&hw)
     }
 }
 
@@ -354,9 +413,7 @@ fn compute_attrs(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> i64 {
 fn reads_shared(cx: &mut FnCtx<Comp>, a: i64) -> bool {
     let ir_val_v = ir_val(cx, a);
     let root = root_of(cx, ir_val_v);
-    unsafe {
-        !is_private_root(cx, root) && !(root != 0 && (cx.insts[root as usize]).op == SAddr)
-    }
+    !is_private_root(cx, root) && !(root != 0 && (cx.insts[root as usize]).op == SAddr)
 }
 
 // Whether a store to address a may write memory other than private slots.
@@ -473,7 +530,7 @@ pub fn infer_component_attrs(cx: &mut FnCtx<Comp>, start: i64, end: i64, pcx: &C
     unsafe {
         for i in start..end {
             let fi = (pcx.scc_order[i as usize]);
-            (*get_fn_attrs().add(fi as usize)) = ATTR_ALL & !ATTR_NORETURN;
+            (*get_fn_attrs().add(fi as usize)) = (ATTR_ALL & !ATTR_NORETURN) | HW_KNOWN;
             (*get_fn_nocapture().add(fi as usize)) = -1;
         }
         let mut changed = true;
@@ -539,6 +596,37 @@ pub fn print_attrs(pcx: &Ctx<Comp>) {
             if a & ATTR_BOUNDED != 0 {
                 buf_str(out, c" bounded(");
                 buf_int(out, bounded_cost(a));
+                buf_str(out, c")");
+            }
+            // (0.29) The Vec headers it may write (middle::callfacts): none,
+            // or where (a static's, the result's, an operand's).
+            if a & HW_KNOWN != 0 {
+                buf_str(out, c" headers(");
+                let mut sep = false;
+                if a & HW_STATIC != 0 {
+                    buf_str(out, c"static");
+                    sep = true;
+                }
+                if a & HW_RESULT != 0 {
+                    buf_str(out, if sep { c" result" } else { c"result" });
+                    sep = true;
+                }
+                for k in 0..HW_ARGS {
+                    if a & (1 << (HW_ARG_SHIFT + k)) != 0 {
+                        if sep {
+                            buf_byte(out, b' ');
+                        }
+                        buf_int(out, k);
+                        // (the first one's range, in bytes)
+                        if writes_hi(a, k) != HW_FAR {
+                            buf_byte(out, b'@');
+                            buf_int(out, writes_lo(a, k) * 8);
+                            buf_str(out, c"..");
+                            buf_int(out, writes_hi(a, k) * 8);
+                        }
+                        sep = true;
+                    }
+                }
                 buf_str(out, c")");
             }
             let nc = (*get_fn_nocapture().add(fi as usize));
@@ -842,44 +930,40 @@ static mut FREE_SYM: i64 = 0;
 
 // The C function called by v (a symbol), or 0.
 fn c_callee_name(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        if (cx.insts[v as usize]).op == Call
-            && (pcx.fn_ir[(cx.insts[v as usize]).imm as usize]) == 0 {
-            return pcx.fns[(cx.insts[v as usize]).imm as usize].name;
-        }
-        0
+    if (cx.insts[v as usize]).op == Call
+        && (pcx.fn_ir[(cx.insts[v as usize]).imm as usize]) == 0 {
+        return pcx.fns[(cx.insts[v as usize]).imm as usize].name;
     }
+    0
 }
 
 // The constant size of allocation call v (malloc or calloc of constant
 // sizes), or -1.
 fn allocation_size(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let name = c_callee_name(cx, v, pcx);
-        if name == get_malloc_sym() && (cx.insts[v as usize]).nargs == 1 {
-            let ir_arg_v = ir_arg(cx, v, 0);
-            let n = ir_val(cx, ir_arg_v);
-            if is_const(cx, n) && (cx.insts[n as usize]).imm > 0
-                && (cx.insts[n as usize]).imm <= HEAP_TO_STACK_MAX {
-                return (cx.insts[n as usize]).imm;
-            }
+    let name = c_callee_name(cx, v, pcx);
+    if name == get_malloc_sym() && (cx.insts[v as usize]).nargs == 1 {
+        let ir_arg_v = ir_arg(cx, v, 0);
+        let n = ir_val(cx, ir_arg_v);
+        if is_const(cx, n) && (cx.insts[n as usize]).imm > 0
+            && (cx.insts[n as usize]).imm <= HEAP_TO_STACK_MAX {
+            return (cx.insts[n as usize]).imm;
         }
-        if name == get_calloc_sym() && (cx.insts[v as usize]).nargs == 2 {
-            let ir_arg_v1 = ir_arg(cx, v, 0);
-            let n = ir_val(cx, ir_arg_v1);
-            let ir_arg_v2 = ir_arg(cx, v, 1);
-            let m = ir_val(cx, ir_arg_v2);
-            if is_const(cx, n) && is_const(cx, m) && (cx.insts[n as usize]).imm > 0
-                && (cx.insts[m as usize]).imm > 0
-                && (cx.insts[n as usize]).imm <= CALLOC_TO_STACK_MAX
-                && (cx.insts[m as usize]).imm <= CALLOC_TO_STACK_MAX
-                && (cx.insts[n as usize]).imm * (cx.insts[m as usize]).imm
-                <= CALLOC_TO_STACK_MAX {
-                return (cx.insts[n as usize]).imm * (cx.insts[m as usize]).imm;
-            }
-        }
-        -1
     }
+    if name == get_calloc_sym() && (cx.insts[v as usize]).nargs == 2 {
+        let ir_arg_v1 = ir_arg(cx, v, 0);
+        let n = ir_val(cx, ir_arg_v1);
+        let ir_arg_v2 = ir_arg(cx, v, 1);
+        let m = ir_val(cx, ir_arg_v2);
+        if is_const(cx, n) && is_const(cx, m) && (cx.insts[n as usize]).imm > 0
+            && (cx.insts[m as usize]).imm > 0
+            && (cx.insts[n as usize]).imm <= CALLOC_TO_STACK_MAX
+            && (cx.insts[m as usize]).imm <= CALLOC_TO_STACK_MAX
+            && (cx.insts[n as usize]).imm * (cx.insts[m as usize]).imm
+            <= CALLOC_TO_STACK_MAX {
+            return (cx.insts[n as usize]).imm * (cx.insts[m as usize]).imm;
+        }
+    }
+    -1
 }
 
 // Whether the pointer p made by an allocation in function fi stays in fi:
@@ -1003,7 +1087,7 @@ fn zero_fill(cx: &mut FnCtx<Comp>, addr: i64, size: i64, at: i64, pcx: &Ctx<Comp
         let zero = ir_make(cx, Const, ty, 0, 0, 0, pcx);
         ir_insert_before(cx, at, zero);
         let st = ir_make(cx, Store, 0, addr, zero, offset, pcx);
-        unsafe { (cx.insts[st as usize]).imm2 = ty; }
+        (cx.insts[st as usize]).imm2 = ty;
         ir_insert_before(cx, at, st);
         offset += width;
     }
@@ -1011,16 +1095,14 @@ fn zero_fill(cx: &mut FnCtx<Comp>, addr: i64, size: i64, at: i64, pcx: &Ctx<Comp
 
 // Inserts instruction v in block b after its PARAMs.
 fn ir_append_after_params(cx: &mut FnCtx<Comp>, b: i64, v: i64) {
-    unsafe {
-        let mut w = (cx.blocks[b as usize]).first;
-        while w != 0 && (cx.insts[w as usize]).op == Param {
-            w = (cx.insts[w as usize]).next;
-        }
-        if w == 0 {
-            ir_append(cx, b, v);
-        } else {
-            ir_insert_before(cx, w, v);
-        }
+    let mut w = (cx.blocks[b as usize]).first;
+    while w != 0 && (cx.insts[w as usize]).op == Param {
+        w = (cx.insts[w as usize]).next;
+    }
+    if w == 0 {
+        ir_append(cx, b, v);
+    } else {
+        ir_insert_before(cx, w, v);
     }
 }
 

@@ -8,7 +8,6 @@ generic function is compiled once per type it is called with.
 
 ```vole
 use std::collections::HashMap;
-use std::hash::FixedState;
 use std::ops::Add;
 
 trait Shape {

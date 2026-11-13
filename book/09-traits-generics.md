@@ -485,7 +485,6 @@ many fields, and the compiler can write them for you:
 
 ```vole
 use std::collections::HashMap;
-use std::hash::FixedState;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
 struct Version {

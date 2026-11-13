@@ -3015,3 +3015,226 @@ promotion (+19%), strength reduction (+13%), the ranges (+9%).
   checks (above); and a check after a merge where one arm made a call
   (a partial redundancy) stays.
 
+
+## 0.29: Vec headers across calls
+
+After a call that took the context by `&mut`, a Vec's pointer and
+length were read again and the index checked again: nothing said the
+callee had left the header alone (above, "Measured and left"). Now each
+function has a summary of the Vec headers it may write, and value
+numbering and LICM keep a header across a call whose summary does not
+reach it (`middle/callfacts.vl`, whose first comment is the full
+statement of the rules).
+
+**The summary** is bits of `FN_ATTRS` (`ipo.vl`), so it is inferred
+bottom-up with the attributes, by the same iteration in a recursive
+component (everything assumed, then taken away; not settled in 16
+rounds: unknown), read under `fn_facts_ready`, and part of the code
+cache's `R_ATTRS` fact; no table and no static were added. It says:
+`HW_KNOWN`, every write of the function (and of what it calls) is at a
+place of a known kind; `HW_STATIC`, it may write a Vec header in a
+static; `HW_RESULT`, through its result pointer; a bit for each of its
+first 8 call operands, through that operand; and for the first operand
+that has its bit, the range of offsets (in words) its writes are in.
+`--print-attrs` prints it: `headers()` (it writes none),
+`headers(0@24..48)` (through operand 0, bytes 24 to 48 from it),
+`headers(static result 1)`; nothing when unknown.
+
+A write is classified by its address (`write_at`):
+
+| the address | the summary |
+|---|---|
+| a frame slot of the function, constant data | nothing |
+| a static, plus offsets | `HW_STATIC`, unless the static's type has no Vec header where the write is |
+| a pointer parameter (a reference, a raw pointer, a slice's pointer), plus offsets | the operand's bit and range, unless the parameter is a reference whose referent's type has no Vec header where the write is |
+| the result pointer | `HW_RESULT` |
+| made by additions from the `ptr` loaded from a Vec header that is where a type says (in a reference parameter's referent, a static, a slot): an element | nothing |
+| made by additions from the result of C's allocator in this function (`malloc`, `calloc`, `realloc`; through phis with null and dangling constants) | nothing |
+| a phi of addresses | each one's |
+| anything else: a pointer loaded from memory that no type says is a Vec's buffer, a raw pointer of unknown origin, a number made a pointer | unknown |
+
+An atomic or a fence, an indirect call, a call of a C function that is
+not in std's table (or is variadic, or waits for or starts a thread)
+and a callee whose summary is unknown make the summary unknown. A call
+adds its callee's bits, each operand's where that operand's address is
+by the same table (the callee's range becomes a write of that range at
+the operand). C's table (`front/effects/builtin.vl`) gained a class for
+the functions that write nothing (`strlen`, `memcmp`, ...: `C_READS`);
+the allocator's functions write no header; the other table functions
+write through the pointers they are given. Two things are not counted,
+because nothing after the call can see them: the writes of a block from
+which no `ret` is reached (a failed check's report), and a callee that
+does not return.
+
+**What the caller concludes** (`call_keeps_header`), for a Vec header
+at a place a type names (`header_place`: a reference parameter's
+referent under `noalias_active`, a static of this program, a frame
+slot):
+
+- in a slot: kept unless a marked operand may be that slot (the same
+  slot at an offset the range covers, or an address of unknown origin);
+- in a static: kept unless `HW_STATIC`, or a marked operand may be it;
+- in a reference parameter's referent: the referent is written, while
+  the function runs, only through pointers made from the parameter
+  (0.17's rule, `param_frozen`), so kept unless a marked operand is made
+  from the parameter and its range covers the header, or is of unknown
+  origin.
+
+An element's address (a buffer) is never the header: the buffer is a
+heap block the Vec owns, no static, no slot, and not the object that
+holds the Vec. What unsafe code must keep for this is in `guide unsafe`:
+a Vec's buffer is its allocator's block, and a `&mut` is the only way
+to its memory.
+
+**The cost of asking.** Value numbering asks at every call, for every
+location it knows; an AVAIL entry has a sixth value, whether the
+location is a `header_place`, asked once. And `vec_header_in`, a walk
+of the type's fields that the alias analysis made at every store for
+every known location of the same object (1.3% of the self-build's
+samples before this change), is kept per task by (type, offset, size):
+`vec_header_at` (cleared in `begin_task`: a pool's context outlives a
+program's types).
+
+Tests: `opt_callfacts_keep` (after each kind of callee there is no
+second compare: a scalar field, an element, a push to another Vec of
+the struct, a local Vec, nested callees, recursion, a local Vec lent, a
+reader), `opt_callfacts_reload` (the header is read again: a push, a
+truncation, a raw pointer kept in a struct and written through later, a
+raw pointer parameter, an indirect call, recursion that pushes, a local
+whose address a struct holds, a write through the second operand, bytes
+written through a loaded raw pointer in a loop).
+
+**Measured** (instructions retired, the fewest of 3, `VOLE_CACHE=off`,
+each compiler built by itself, both on the source of the tree before
+the change; the machine shared, a 1-minute load of 7 to 15): `volec
+check` 22.954 G before, 22.913 G after (-0.2%); the cold self-build
+127.498 G before, 126.612 G after (-0.7%). By pass
+(`--time-passes=passes`): licm -32.7% and gvn -1.0%, nearly all of it
+`vec_header_at`; the inference of the summary is +0.2 G (the row its
+phase is counted in, `tail recursion`, +13.5%); the other passes within
+1.5% either way. The compile-cost rows against 0.28.0: hello 1.03x
+before and 1.02x after, std 1.16x and 1.16x (1403.3 M and 1413.0 M),
+check 1.01x and 1.00x, regions 1.01x and 1.00x.
+
+The fact itself gives little yet, and the reason is in the summaries:
+of the compiler's functions with attributes, 3630 have a known summary
+and 2777 of them write no header; the others are unknown for an honest
+reason: 750 make an indirect call, and most of the rest store through
+a raw pointer that no type calls a Vec's buffer (`IntVec::push`,
+`buf_new`, `buf_str`, `intern_c` and what calls them). A callee that
+pushes to an IntVec of the context is unknown; once that field is a
+`Vec`, the same callee is `headers(0@A..B)`, the range of that one
+header, and the context's other Vecs stay known across the call. The
+self-build stays about 18% above 0.28.0's 107 G: what the summary can
+give grows with each raw table that becomes a Vec, and a check whose
+index is data (an operand read from an instruction) stays a compare
+and a branch whatever is known of the header.
+
+## 0.29: the inliner's decisions, logged
+
+`VOLE_INLINE_LOG=FILE volec --no-cache -j1 ...` writes a line for each
+call the -O2 inliner decides (`middle/inline.vl`: `should_inline` asks
+`inline_rule`, which names the rule that decided, and `log_decision`
+writes it): the caller, the callee, the callee's size, the rule (`hint`,
+`tiny`, `closure-once`, `cold-free`, `once`, `hot`, `small`, or
+`no:returns-twice`, `no:never-or-cold-fn`, `no:caller-big`, `no:room`
+(`no:budget` while the program had a budget), `no:cold-site`, `no:big`),
+the site's loop depth, the caller's size then, the level of the
+caller's component, the program's size as the component sees it, and
+the size the caller may grow to (the program's budget, before the room). One thread and no code cache, so the
+lines are in the same order in every build of the same program (a cached
+function is not optimized, and decides nothing); the decisions
+themselves do not depend on the number of threads. `tools/inline-log-diff.py
+A.log B.log` compares two: totals by rule, the first level a call was
+refused for room, the levels, callees and callers that differ, and with
+`-f CALLER` one caller's decisions.
+
+## 0.29: the inliner's room is each function's own
+
+**What the log showed.** Until now the program had one growth budget,
+half its size again (`start_inlining_budget`), and the components spent
+it bottom-up, a level of the call graph at a time. On the compiler
+itself (release tree, 254663 decisions on about 55 levels) it was gone
+at level 10: 109621 decisions, 43%, were `no:budget`, and from there up
+a call was inlined only when the callee was tiny, hinted, a closure
+called once, or a leaf of at most 6 instructions. So whether a function
+got any inlining depended on its depth in the call graph, and that
+depth changes with what it calls:
+
+- the constant lattice's lists became Vecs (commit "the constant
+  lattice's work lists are Vecs"): `sccp_eval`'s component went from
+  level 6 to level 18, std's Vec methods being a deeper chain than the
+  IntVec's; its calls of `lat_of` (12), `lat_value` (13) and `lat_set`
+  (37 to 49), inlined before by `small` and `once`, were all
+  `no:budget` after; the sccp row went from 5488 M to 8024 M (+46%);
+- the Vec header summary changed the sizes of functions by an
+  instruction or two: with the same source, 1271 of 12956 callers
+  decided differently, at level 10 (where the budget ran out) 341 calls
+  were inlined in one build and 1325 in the other, at level 15 3100 and
+  423; the self-build moved by 6.4%;
+- 600 lines added to the middle end moved `volec check`, whose code was
+  not touched, by 2%.
+
+**The rule now** (`inline_rule`): no budget of the program. What a
+caller takes in is bounded by its own room, `INLINE_ROOM` (40) more
+than its size before inlining, counted for the calls that are charged:
+not a tiny callee, a hinted one, a closure called once, a small callee
+(at most `INLINE_LEAF`, now 16, and a leaf or called in a loop), a
+profile's hot call, nor the only call of a callee of at most
+`INLINE_ONCE_FREE` (120: it is moved, not copied). The thresholds by
+loop depth and the cold-site rule are as they were. A decision depends
+on the call, the callee and the caller, and on nothing another function
+did: the order of the components, the levels and the number of threads
+cannot change it.
+
+**How the numbers were chosen** (each policy built into a compiler by
+itself, on one source; self-build and check in G instructions, the std
+row's program in M, the object the compiler emits for itself in MB, and
+the geometric mean of the instructions of bench/*.vl built by it, 23
+programs, against the budget's):
+
+| policy | self-build | check | std | object | bench |
+|---|---:|---:|---:|---:|---:|
+| the program's budget (before) | 127.3 | 22.47 | 1444 | 14.14 | 1.000 |
+| no budget, no room | 289.0 | 20.35 | | 19.99 | |
+| no budget, thresholds 8/16/30 for leaves, 4/8/16 others | 147.2 | 21.35 | | 13.90 | |
+| room 40 + size/4, leaf 6 | 122.1 | 20.58 | 1064 | 13.88 | 1.014 |
+| room 40, leaf 6 | 111.3 | 20.91 | 1007 | 13.28 | 1.024 |
+| room 40, leaf 16 | 109.2 | 20.60 | 1005 | 13.31 | 1.005 |
+| room 40, leaf 16, only call free up to 400 | 138.5 | 20.84 | 1858 | 12.75 | 1.003 |
+| room 40, leaf 16, only call free up to 120 | 117.6 | 20.65 | 1307 | 12.82 | 1.001 |
+| the same, and small callees in loops free (chosen) | 118.8 | 20.64 | 1316 | 12.95 | 1.000 |
+| room 40 + 150 per loop depth, leaf 6 | 137.2 | 20.54 | 1185 | 14.76 | 1.004 |
+
+Without any bound the compiler's front end is 9% faster and the
+self-build more than twice as dear (the loop passes and value numbering
+are worse than linear in a function's size); the room keeps most of the
+first for none of the second. The benchmarks that the chosen rule
+leaves slower than the budget did (a small program never spent its
+budget, and took in everything under the thresholds): interp 1.12,
+wordcount 1.11, fannkuch and sort 1.06, json 1.04; faster: fmtloop
+0.76, fmtints 0.88.
+
+tests/run/opt_inline_room.vl: the room (of six calls of a callee that
+is charged, one is inlined), small leaves and a small callee in a loop
+not charged, a function's only call inlined after the room is used.
+
+**Measured on the release tree** (each compiler built by itself; all on
+the release tree's source; the fewest of 3; a shared machine, a
+1-minute load of 8 to 13):
+
+| compiler | self-build | check | std row's program | hello | object it emits | its binary |
+|---|---:|---:|---:|---:|---:|---:|
+| release tree (the budget) | 118.60 G | 22.35 G | 1436.7 M | 179.3 M | 13.73 MB | 12.02 MB |
+| the room, the Vec header facts inferred but not used | 119.21 G | 20.67 G | 1331.3 M | 169.3 M | 13.08 MB | 11.38 MB |
+| the room and the facts in use | 118.95 G | 20.71 G | 1305.6 M | 168.8 M | 13.05 MB | 11.36 MB |
+
+`check` is 7.3% cheaper and the compiler 5.5% smaller; the self-build is
+the same (+0.3%): its optimizer has more to do where it now inlines
+(sccp +8.9%, gvn +12.0%, the ranges +11.8%, simplify_cfg +21.9%) and
+less where functions stayed small (unrolling -40.6%, vectorization
+-32.1%, strength reduction -32.9%, register allocation -7.0%), and its
+front end is 7.3% cheaper. With the room, using the facts or not moves
+the self-build by 0.2% (under the budget it was 6.4%). The compile-cost
+rows against 0.28.0, release tree and this: hello 1.02x and 0.97x, std
+1.17x and 1.07x, check 1.00x and 0.92x, regions 1.00x and 0.90x.

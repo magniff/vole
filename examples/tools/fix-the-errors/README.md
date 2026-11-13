@@ -70,9 +70,8 @@ show `edit patch`.) `--dry-run` shows the diff first:
 $ volec fix --dry-run
 --- a/main.vl
 +++ b/main.vl
-@@ -7,0 +8,3 @@
+@@ -7,0 +8,2 @@
 +use std::collections::HashMap;
-+use std::hash::FixedState;
 +
 --- a/grades.vl
 +++ b/grades.vl
@@ -83,12 +82,12 @@ $ volec fix --dry-run
 -        let d = abs((scores[i] - scores[i - 1]) as i32) as i64;
 +        let d = unsafe { abs((scores[i] - scores[i - 1]) as i32) as i64 };
 $ volec fix
-fixed 2 missing imports, 1 pub, 1 unsafe block	2 files	+5 -2 lines
+fixed 1 missing import, 1 pub, 1 unsafe block	2 files	+4 -2 lines
 $ volec check
-main.vl:12:14: error[type error] unresolved import 'roster::add_score'
+main.vl:11:14: error[type error] unresolved import 'roster::add_score'
+main.vl:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:19)
 main.vl:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:19)
 main.vl:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:19)
-main.vl:21:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:19)
 grades.vl:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: volec fix --suggested main.vl
 roster.vl:28:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
 [exit 1]
@@ -148,10 +147,10 @@ two-argument `enrol` and no `add_score`.
 
 ```console
 $ volec check
-main.vl:12:14: error[type error] unresolved import 'roster::add_score'
+main.vl:11:14: error[type error] unresolved import 'roster::add_score'
+main.vl:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:19)
 main.vl:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:19)
 main.vl:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:19)
-main.vl:21:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol<'a>(r: &mut Roster<'a, Gpa>, name: &'a str)` (roster.vl:19)
 [exit 1]
 $ volec query show roster::enrol
 // crate::roster::enrol	roster.vl:18-21	effects: alloc(Gpa) panic
@@ -231,9 +230,9 @@ best: Ada (95); 3 students have 3 scores or more
 ok: built gradebook
 $ git diff --stat
  grades.vl |  6 +++---
- main.vl   |  3 +++
+ main.vl   |  2 ++
  roster.vl | 21 +++++++++++++++++----
- 3 files changed, 23 insertions(+), 7 deletions(-)
+ 3 files changed, 22 insertions(+), 7 deletions(-)
 ```
 
 ## Why not by hand
@@ -243,8 +242,7 @@ $ git diff --stat
   loop would have shown them a few at a time.
 - Three of them were fixed by `fix` with no file opened; the edit is the
   same one a careful human would make (`pub fn letter`, an
-  `unsafe { }` around the one call, the `use` lines for `HashMap` and
-  its hasher, `FixedState`).
+  `unsafe { }` around the one call, the `use` line for `HashMap`).
 - Each other fix named the item it changes, not a line number that
   moves after every edit, and was checked before it was written: a
   patch that had introduced a new error (`scores.size()` on a slice)
