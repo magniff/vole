@@ -65,6 +65,7 @@ pub mod atomic;
 
 // (The numbering is the 0.3 one: GVN hashes the opcode.)
 use std::alloc::Allocator;
+use std::sync::{RwLock, RwLockReadGuard};
 
 use crate::back::codecache::{R_IR, cc_note};
 use crate::base::{die, sized_table};
@@ -272,26 +273,13 @@ pub fn ir_enter(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
 // (0.29) Function fi's parts and the context's change places: into the
 // context (`lend`) when it becomes current there, back when it is
 // released. Each side's parts are whole Vecs, so nothing is copied and
-// nothing is freed.
+// nothing is freed. The entry is written with its lock held: the tasks of
+// a phase share the compilation context, and each enters only functions
+// of its own (middle::parallel's task lists), so the lock is free; were
+// the plan broken, a second context would wait here, find the function
+// lent, and stop the compiler.
 fn ir_exchange(cx: &mut FnCtx<Comp>, fi: i64, lend: bool, pcx: &Ctx<Comp>) {
-    // UNSAFE: the tasks of a phase each work on functions of their own
-    // while they share the compilation context, which they hold `&`: an
-    // entry of its table is written through the cell's pointer (the thread
-    // boundary of the IR; std's Mutex per entry would put a lock on every
-    // ir_enter for an exclusion the phases' plan already gives).
-    // SAFETY: the cell is an element of Ctx.irfuncs, which grows only in
-    // ir_new_func, on the main thread with `&mut Ctx`, so not while a task
-    // runs: the pointer is to a live, initialized IRFunc. The `&mut` made
-    // here lives to the end of this function and no other reference to
-    // the entry does meanwhile: a function is entered and released only by
-    // the one task that has it in its plan (its own function or component:
-    // middle::parallel's task lists, each function in one task of a
-    // phase), or by the main thread between phases; another function's
-    // entry is otherwise only read, by ir_stored, and only one that no
-    // task of the running phase enters (see there). `lent` is checked
-    // below: a second context entering the function, or a release of one
-    // not entered, stops the compiler instead of exchanging twice.
-    let home = unsafe { &mut *pcx.irfuncs[fi as usize].get() };
+    let mut home = pcx.irfuncs[fi as usize].write().unwrap();
     if home.lent == lend {
         die(c"internal error: a function's IR is entered twice, or released when not entered");
     }
@@ -309,26 +297,20 @@ fn ir_exchange(cx: &mut FnCtx<Comp>, fi: i64, lend: bool, pcx: &Ctx<Comp>) {
     std::mem::swap(&mut cx.fn_result_ptr, &mut home.result_ptr);
 }
 
-// (0.29) Function g's stored IR, to read: g is not current in any context
-// (the compiler stops otherwise: its parts would be the context's).
-pub fn ir_stored(g: i64, pcx: &Ctx<Comp>) -> &IRFunc<Comp> {
-    // UNSAFE: an entry of the table the tasks share by element is read
-    // through its cell's pointer (see ir_exchange).
-    // SAFETY: the pointer is to a live, initialized IRFunc (ir_exchange).
-    // No `&mut` to the entry lives while this `&` does: one is made only
-    // inside ir_exchange, by the context that enters or releases g, and g
-    // is entered by no task of the running phase when a task reads it
-    // here: (a) -O2's inline_call and ir_view come after should_inline's
-    // fn_facts_ready(g), i.e. g's component is of a lower level, finished
-    // in an earlier pool_run and not entered since; (b) -O1's
-    // inline_leaf_calls reads a small leaf, and every small leaf is
-    // emitted in emit_functions' second range, which starts after the
-    // first range's pool_run_joined returned (leaves make no calls, so the
-    // second range inlines nothing); (c) the main thread reads between
-    // phases, when every task's context has released its function
-    // (run_task's ir_release). `lent` is read before the reference is
-    // given out: a caller that breaks the plan stops here.
-    let home = unsafe { &*pcx.irfuncs[g as usize].get() };
+// (0.29) Function g's stored IR, to read while the guard lives: g is not
+// current in any context (the compiler stops otherwise: its parts would
+// be the context's). Several tasks may read one function at once (the
+// inliner's copies of a callee); none enters it meanwhile: (a) -O2's
+// inline_call comes after should_inline's fn_facts_ready(g), i.e. g's
+// component is of a lower level, finished in an earlier pool_run and not
+// entered since; (b) -O1's inline_leaf_calls reads a small leaf, and
+// every small leaf is emitted in emit_functions' second range, which
+// starts after the first range's pool_run_joined returned; (c) the main
+// thread reads between phases, when every task's context has released
+// its function. The lock holds whatever the plan: a context that entered
+// g meanwhile would wait for the readers.
+pub fn ir_stored(g: i64, pcx: &Ctx<Comp>) -> RwLockReadGuard<'_, IRFunc<Comp>> {
+    let home = pcx.irfuncs[g as usize].read().unwrap();
     if home.lent {
         die(c"internal error: the IR of a function that is current in a context is read from the table");
     }
@@ -522,7 +504,7 @@ pub fn ir_new_func(cx: &mut FnCtx<Comp>, f: i64, item: i64, pcx: &mut Ctx<Comp>)
     let id = pcx.irfunc_count;
     pcx.ir_fn.push(f);
     pcx.ir_item.push(item);
-    pcx.irfuncs.push(std::cell::UnsafeCell::new(IRFunc {
+    pcx.irfuncs.push(RwLock::new(IRFunc {
         entry: 0, blocks: Vec::new_in(Comp {}), slots: Vec::new_in(Comp {}), result_ptr: 0,
         t: empty_tables(), lent: false,
     }));

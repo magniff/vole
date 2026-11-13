@@ -304,7 +304,7 @@ middle::ipo::FN_NOCAPTURE	read: R_ATTRS; the key
 middle::ipo::FREE_SYM	IR: a symbol by its text
 middle::ipo::MALLOC_SYM	IR: a symbol by its text
 base::ctx::Ctx.fn_ir	IR: fn_canon (whether it has IR)
-base::ctx::Ctx.irfuncs	IR: the task'"'"'s own, which it alone enters (ir_exchange: the entry'"'"'s parts are its context'"'"'s while it works on the function, through the entry'"'"'s cell); read: R_IR, another'"'"'s (ir_stored)
+base::ctx::Ctx.irfuncs	IR: the task'"'"'s own, which it alone enters (ir_exchange: the entry'"'"'s parts are its context'"'"'s while it works on the function, and change sides under the entry'"'"'s lock); read: R_IR, another'"'"'s (ir_stored)
 base::ctx::Ctx.ir_fn	IR: a function by fn_canon (written once, by ir_new_func on the main thread)
 base::ctx::Ctx.ir_item	IR: the function'"'"'s item, written once with ir_fn (the trace'"'"'s and the profile'"'"'s positions)
 base::ctx::Ctx.fn_rtids	IR: an RTID value by its function and place, its class (the number is the join'"'"'s)
