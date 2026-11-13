@@ -1,6 +1,6 @@
 ## volec edit replace|insert|delete and undo (tests/refactor/edits/).
 $ check
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (3 files, 0 shaders)
 ## Replacing an item replaces its lines; the comment above it stays when
 ## the new text has none.
 $ edit replace geom::area --dry-run < $T/inputs/area_plain.vl

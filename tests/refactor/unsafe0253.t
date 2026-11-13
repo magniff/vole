@@ -5,7 +5,7 @@
 $ check
 main.vl:16:5: warning[unsafe.unjustified] unsafe block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe main.vl
 main.vl:20:13: warning[unsafe.unjustified] unsafe block without a `// UNSAFE:` comment | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe main.vl
-ok: 0 errors, 2 warnings in main.vl
+ok: 0 errors, 2 warnings in main.vl (1 file, 0 shaders)
 ## --deny-warnings: errors.
 $ check --deny-warnings
 main.vl:16:5: error[unsafe.unjustified] unsafe block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe main.vl
@@ -14,7 +14,7 @@ main.vl:20:13: error[unsafe.unjustified] unsafe block without a `// UNSAFE:` com
 ## Past five, one warning counts them (a program of legacy unsafe).
 $ check many/main.vl
 many/main.vl:2:1: warning[unsafe.unjustified] 6 unsafe sites lack `// UNSAFE:` and `// SAFETY:` comments (the first here) | help: each unsafe site says right above it why it cannot be safe and why it is sound; the try: line lists them | try: volec query unsafe --no-std --unjustified --root many/main.vl
-ok: 0 errors, 1 warning in many/main.vl
+ok: 0 errors, 1 warning in many/main.vl (1 file, 0 shaders)
 $ check many/main.vl --deny-warnings
 many/main.vl:2:1: error[unsafe.unjustified] 6 unsafe sites lack `// UNSAFE:` and `// SAFETY:` comments (the first here) | help: each unsafe site says right above it why it cannot be safe and why it is sound; the try: line lists them | try: volec query unsafe --no-std --unjustified --root many/main.vl
 [exit 1]

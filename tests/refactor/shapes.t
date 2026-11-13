@@ -1,6 +1,6 @@
 ## volec refactor signature|field|variant (tests/refactor/shapes/).
 $ check
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (3 files, 0 shaders)
 ## --- signature ---
 ## A parameter added: the definition, and each call with the value.
 $ refactor signature area --add 'scale: i64 = 1' --fill-calls --dry-run

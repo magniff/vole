@@ -2,7 +2,7 @@
 ## here): the examples' first, never one under evals/ or tests/ (the
 ## 0.25.2.1 eval's `try:` lines named other agents' programs).
 $ show snap_shot
-error query.no-root: no root (VOLE_ROOT, ./main.vl, ./compiler/src/main.vl)
+error query.no-root: no root (VOLE_ROOT, ./main.vl, a main.vl above, ./compiler/src/main.vl)
 try: volec query show snap_shot --root xroots0252/examples/demo/main.vl
 try: volec query show snap_shot --root xroots0252/tools/gen/main.vl
 [exit 2]

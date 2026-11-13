@@ -1,7 +1,7 @@
 ## (0.18.1) A clean check and a build end with `ok: ...` (stderr); a
 ## failed one does not.
 $ check main.vl
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (1 file, 0 shaders)
 $ main.vl -o prog
 ok: built prog
 % ./prog

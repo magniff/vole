@@ -347,7 +347,7 @@ try: volec query items trace.vl
 $ echo $?
 1
 $ volec query show nosuch
-error query.no-root: no root (VOLE_ROOT, ./main.vl, ./compiler/src/main.vl)
+error query.no-root: no root (VOLE_ROOT, ./main.vl, a main.vl above, ./compiler/src/main.vl)
 try: volec query show nosuch path/to/main.vl
 $ echo $?
 2

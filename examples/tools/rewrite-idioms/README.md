@@ -186,7 +186,7 @@ pub fn longest_line(ls: &[&str]) -> (usize, usize) {
 ```console
 $ volec check && volec main.vl -o wordstat && ./wordstat < poem.txt | diff before.txt - && echo same output
 same output
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (4 files, 0 shaders)
 ok: built wordstat
 $ git diff HEAD --stat
  compat.vl | 18 ----------------

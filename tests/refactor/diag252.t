@@ -3,7 +3,7 @@
 ## removing it.
 $ check
 main.vl:5:20: warning[use.unused] unused import 'perimeter': nothing in this file names it | help: remove it (`volec fix` removes every unused import) | try: volec fix --only unused main.vl
-ok: 0 errors, 1 warning in main.vl
+ok: 0 errors, 1 warning in main.vl (2 files, 0 shaders)
 ## volec fix (and --only unused) removes it.
 $ fix --only unused
 fixed 1 unused import	main.vl	+1 -1 lines

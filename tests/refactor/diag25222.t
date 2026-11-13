@@ -8,7 +8,7 @@ tok.vl:1:5: error[type error] unknown module 'st' | help: tok.vl was checked as 
 ## Once main.vl names it, checking the module checks its program.
 % printf 'mod st;\nmod tok;\n\nfn main() {\n    let n = st::one() + tok::two();\n}\n' > main.vl
 $ check tok.vl
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (3 files, 0 shaders)
 ## `volec test a.vl b.vl`: test takes the program's root, which pulls in
 ## the rest.
 $ test main.vl tok.vl

@@ -1,6 +1,6 @@
 ## 0.14: the tools' shortfalls recorded in 0.13 (tests/refactor/shortfalls/).
 $ check
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (4 files, 0 shaders)
 ## --- refactor variant --add --arm-in: an arm per match ---
 ## Without arms: the matches, and the commands that give them one (one
 ## --arm for all, or an --arm-in per match).
