@@ -264,12 +264,13 @@ check self_lint "$ok" "$(printf '%s\n' "$out" | head -4)"
 "$COMPILER" lint --max-lines 100000 >/dev/null 2>&1
 check self_lint_ok "$([ $? = 0 ] && echo 1)" "lint --max-lines 100000 failed"
 # check: the compiler's source has no errors, quickly.
-"$COMPILER" check compiler/src/main.vl >"$WORK/check.out" 2>&1
+# (0.29: with --deny=unsafe: an unsafe site without its comments and an
+# unsafe block with nothing unsafe inside are errors in the compiler's
+# source, each where it is; docs/unsafe-baseline.md's counts are 0)
+"$COMPILER" check --deny=unsafe compiler/src/main.vl >"$WORK/check.out" 2>&1
 rc=$?
-# (0.18.1: a clean check says so in one line; 0.25.3: but for one
-# unsafe.unjustified warning, the compiler's legacy unsafe, which
-# docs/unsafe-baseline.md counts)
-clean=$(grep -v 'warning\[unsafe\.unjustified\]' "$WORK/check.out" | sed -e 's/^ok: 0 errors, 1 warning in /ok: 0 errors in /' -e 's/ ([0-9]* files, 0 shaders)$//')
+# (0.18.1: a clean check says so in one line, with no warning)
+clean=$(sed -e 's/ ([0-9]* files, 0 shaders)$//' "$WORK/check.out")
 # (0.29: the line ends with what was read, ` (N files, 0 shaders)`)
 check self_check "$([ $rc = 0 ] && [ "$clean" = "ok: 0 errors in compiler/src/main.vl" ] && echo 1)" "$(cat "$WORK/check.out")"
 # same-output: the compiler against a copy of itself (identical), and

@@ -557,7 +557,15 @@ def run_check(compiler, root, cwd):
     def run(args):
         return run_typed(args[0], cwd, args[1:], root)
     tail = root_args(root, cwd)
-    r = run([compiler, "check", "--json"] + tail)
+    # (0.29) The compiler's own source: an unsafe site without its comments
+    # and an unsafe block with nothing unsafe inside are errors there, each
+    # at its position (`--deny=unsafe`; tests/unsafe_audit.sh holds the
+    # tree to none). A compiler before the option says so: asked again
+    # without it.
+    deny = ["--deny=unsafe"] if root and root.replace(os.sep, "/").endswith("compiler/src/main.vl") else []
+    r = run([compiler, "check", "--json"] + deny + tail)
+    if r is not None and deny and r.returncode == 2:
+        r = run([compiler, "check", "--json"] + tail)
     if r is None:
         return None
     if "--json" in r.stderr and "unknown option" in r.stderr:  # (a compiler before 0.15)

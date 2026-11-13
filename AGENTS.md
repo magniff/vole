@@ -15,11 +15,7 @@ your build does not). For an example or a test alone either one does.
 
 **There is one language, with Rust's surface** (0.28.0; `target/volec
 guide rust`: where vole differs from Rust): `&T`, `&mut T`, `let mut`,
-`&'static [u8]`, Rust's meanings. An `// EDITION: rust` line is a
-comment: write it in no new file (the bootstrap's 0.27.8 still reads it
-in compiler/src/main.vl, the one file that keeps it); `--edition rust`
-is accepted and ignored (deprecated: it goes in 0.29); an error code
-`edition.*` is an ordinary error (renamed in 0.29). A static of
+`&'static [u8]`, Rust's meanings. A static of
 compiler/src is read and written only through its accessors at its
 file's end (`get_x()`, `set_x(v)`); their `unsafe` blocks' UNSAFE:/
 SAFETY: lines (from the review in tools/statics/statics.tsv, with
@@ -194,7 +190,7 @@ load or inherited.
   unformatted `.vl`, or adds an example case whose SOURCE does not
   exist (0.29: of a merge, only what the merge itself adds, the lines
   in neither parent; what a side brings passed on its branch); a commit that changes `compiler/std` gets the
-  `compiler/src/front/stdsrc_rust.vl` made from it, staged by the hook, and a
+  `compiler/src/front/stdsrc.vl` made from it, staged by the hook, and a
   merge makes it from the merged std (no conflict on it). It runs for
   every committer, under any agent harness (Claude Code's hooks do not
   run under opencode or other tools; git's do).
@@ -210,7 +206,7 @@ load or inherited.
   called done: `tests/affected.sh --linux` (colima must run). The whole
   container row (`bootstrap/gate.sh --only linux-aarch64`) is tier 3's.
 - **Before reporting (tier 2):** `tools/premerge.sh` in the branch's
-  worktree (base contained, unsafe justified, fmt, every touched program
+  worktree (base contained, unsafe justified and none unneeded, fmt, every touched program
   checks clean, the embedded std up to date, example cases' sources
   exist) prints `premerge: ok`, and `tests/affected.sh` passes; report
   its plan line (`plan: N of M cases; ...`) and result. No full suite,
@@ -244,4 +240,13 @@ load or inherited.
   ```
 
   The same goes for an `unsafe fn` and an `extern` block. Never add
-  `unsafe` (or let `volec fix` add it) to silence an error.
+  `unsafe` (or let `volec fix` add it) to silence an error. In
+  compiler/src and std this is an error, not a warning (0.29): a site
+  without both comments, and in compiler/src an unsafe block with
+  nothing unsafe inside, fails `tools/premerge.sh` (its unsafe row) and
+  the gate (`tests/unsafe_audit.sh`: the count is 0 and stays 0), each
+  named with its position; `volec check --deny=unsafe` reports them as
+  errors where they are (the edit hook checks the compiler so), and
+  `volec fix --only unneeded-unsafe` takes an unneeded block away.
+  Another program's unjustified site is a warning
+  (`unsafe.unjustified`).

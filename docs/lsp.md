@@ -77,7 +77,7 @@ format strings, contracts, attributes and references.
 
 ### std's files
 
-std is in the compiler (`compiler/src/front/stdsrc_rust.vl`): a definition in
+std is in the compiler (`compiler/src/front/stdsrc.vl`): a definition in
 it has no file of the user's. The worker writes std's text once, as
 files, to a cache directory, and answers with their `file://` URIs, so
 any client opens them; a request about such a file (a hover, a

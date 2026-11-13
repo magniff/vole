@@ -11,8 +11,8 @@ is Rust's, with the differences named here.
   `r#type` is the identifier `type` (C names that are keywords).
 - Keywords are Rust's (`let mut`, `move`, `ref`, `match`, `impl`,
   `where`, ...) plus `import` (a C header) and `union`. Reserved
-  (errors): `dyn`, `defer` (a guard with `Drop` does it), `@`. `var`,
-  `inout` and `sink` are plain names (not keywords).
+  (errors): `dyn`, `@`. `var`, `inout`, `sink` and `defer` are plain
+  names (there is no `defer` statement: a guard with `Drop` does it).
 - Integers: `42`, `1_000`, `0xff`, `0b1010`, with a type suffix `255u8`,
   `7i32`. Floats: `1.5`, `2e10`, `1.5f32`. `'a'`, `'\n'`, `'\u{e9}'` are
   `char`s; `b'A'` is a `u8`. Strings: `"a\tb\n\"q\"\\"`, `"\x41"`,

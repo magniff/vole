@@ -37,7 +37,7 @@ use std::alloc::Allocator;
 
 use crate::base::{
     STDOUT, buf_append, buf_byte, buf_bytes, buf_copy, buf_eq, buf_int, buf_new, buf_ptr, buf_str,
-    buf_write_fd, get_src, sym_text,
+    buf_write_fd, c_plain_path, get_src, sym_text,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -102,15 +102,7 @@ fn file_start(f: i64, pcx: &Ctx<Comp>) -> i64 {
 }
 
 fn file_path(f: i64, pcx: &Ctx<Comp>) -> *const u8 {
-    // UNSAFE: FILES is the front end's table, a raw pointer.
-    // SAFETY: 0 <= f < FILE_COUNT (every caller's loop or a site's file).
-    unsafe {
-        let mut p = pcx.files[f as usize].path;
-        while (*p.add(0)) == b'.' && (*p.add(1)) == b'/' {
-            p = p.add(2);
-        }
-        p
-    }
+    c_plain_path(pcx.files[f as usize].path)
 }
 
 fn file_module(f: i64, pcx: &Ctx<Comp>) -> i64 {
@@ -871,21 +863,7 @@ pub fn report_unjustified(lexed: bool, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>)
         if bits == J_BOTH {
             continue;
         }
-        let msg = buf_new();
-        buf_bytes(msg, if tcx.s_kind[s as usize] == S_BLOCK { b"unsafe block" }
-            else if tcx.s_kind[s as usize] == S_FN { b"`unsafe fn`" } else { b"extern block" });
-        buf_bytes(msg, if bits == J_UNSAFE { b" without a `// SAFETY:` comment" }
-            else if bits == J_SAFETY { b" without a `// UNSAFE:` comment" }
-            else { b" without `// UNSAFE:` and `// SAFETY:` comments" });
-        buf_byte(msg, 0);
-        let tries = buf_new();
-        let args = buf_new();
-        buf_bytes(args, b"query unsafe ");
-        buf_bytes(args, &c_slice(file_path(tcx.s_file[s as usize], pcx)));
-        buf_tool_command(tries, &buf_copy(args), false, pcx);
-        report_error_tries(tcx.s_pos[s as usize], 7101, c"unsafe.unjustified", buf_ptr(msg),
-            c"say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does",
-            &buf_copy(tries), true, pcx);
+        report_site(s, bits, tcx, pcx);
     }
 }
 
@@ -1196,7 +1174,7 @@ fn audit(args: &[i64], tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> Audit<Comp> 
         a.checked.push(if tcx.s_kind[s as usize] == S_EXTERN
             || (p >= 0 && has_value(marked.as_slice(), p)) { 1 }
             else { 0 });
-        if wanted(s, args, tcx, pcx) {
+        if wanted(s, args, tcx, pcx) && (!tcx.opt_unneeded || is_unneeded(&a, s, tcx)) {
             a.sites.push(s);
         }
     }
@@ -1243,6 +1221,51 @@ fn is_unneeded(a: &Audit<Comp>, s: i64, tcx: &Tcx<Comp>) -> bool {
         && a.first[s as usize] == a.last[s as usize]
 }
 
+// (0.29) `volec check --deny=unsafe` (or one of its two codes): each site
+// of the program (not std's) without both comments, and each unsafe block
+// with nothing unsafe inside, an error where it is; no line that counts
+// them (report_unjustified's, past five sites). The compiler's own source
+// is checked so: tools/premerge.sh, tests/unsafe_audit.sh. The front end
+// ran with AUDIT_UNSAFE set (run_check), as for `query unsafe`.
+pub fn report_denied(tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) {
+    tcx.opt_no_std = true;
+    let a = audit((Vec::new_in(Comp {})).as_slice(), tcx, pcx);
+    for k in 0..a.sites.len() as i64 {
+        let s = a.sites[k as usize];
+        let bits = tcx.s_just[s as usize];
+        if bits != J_BOTH {
+            report_site(s, bits, tcx, pcx);
+        }
+        if is_unneeded(&a, s, tcx) {
+            let tries = buf_new();
+            buf_tool_command(tries,
+                if bits == 0 { b"fix --only unneeded-unsafe" }
+                else { b"fix --only unneeded-justified" }, true, pcx);
+            report_error_tries(tcx.s_pos[s as usize], 7103, c"unsafe.unneeded", c"unsafe block with nothing unsafe inside", c"take the word `unsafe` and its braces away, and the comments that justified it; the try: line does it for every such block", &buf_copy(tries), true, pcx);
+        }
+    }
+}
+
+// The error (a warning unless denied) of site s, whose comments are
+// `bits`: which of the two it lacks.
+fn report_site(s: i64, bits: i64, tcx: &Tcx<Comp>, pcx: &mut Ctx<Comp>) {
+    let msg = buf_new();
+    buf_bytes(msg, if tcx.s_kind[s as usize] == S_BLOCK { b"unsafe block" }
+        else if tcx.s_kind[s as usize] == S_FN { b"`unsafe fn`" } else { b"extern block" });
+    buf_bytes(msg, if bits == J_UNSAFE { b" without a `// SAFETY:` comment" }
+        else if bits == J_SAFETY { b" without a `// UNSAFE:` comment" }
+        else { b" without `// UNSAFE:` and `// SAFETY:` comments" });
+    buf_byte(msg, 0);
+    let tries = buf_new();
+    let args = buf_new();
+    buf_bytes(args, b"query unsafe ");
+    buf_bytes(args, &c_slice(file_path(tcx.s_file[s as usize], pcx)));
+    buf_tool_command(tries, &buf_copy(args), false, pcx);
+    report_error_tries(tcx.s_pos[s as usize], 7101, c"unsafe.unjustified", buf_ptr(msg),
+        c"say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does",
+        &buf_copy(tries), true, pcx);
+}
+
 // (0.25.4) `volec fix --only unneeded-unsafe` (tools/fix/unneeded.vl): the
 // program's unsafe blocks with nothing unsafe inside, in order of position,
 // four numbers each: the file, the block's start (its `unsafe`), its end
@@ -1273,6 +1296,11 @@ pub fn site_text(f: i64, pcx: &Ctx<Comp>) -> &'static [u8] {
 
 pub fn site_file_start(f: i64, pcx: &Ctx<Comp>) -> i64 {
     file_start(f, pcx)
+}
+
+// (0.29) File f's path, as a note about one of its sites names it.
+pub fn site_path(f: i64, pcx: &Ctx<Comp>) -> *const u8 {
+    file_path(f, pcx)
 }
 
 fn just_text(bits: i64) -> &'static [u8] {
@@ -1465,6 +1493,9 @@ fn put_total(out: i64, a: &Audit<Comp>, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) {
     }
     let mut bad: i64 = 0;
     let mut unneeded: i64 = 0;
+    // (0.29) those with no comment above: fix --only unneeded-unsafe takes
+    // them; the others, with their comments, fix --only unneeded-justified
+    let mut bare: i64 = 0;
     for i in 0..a.sites.len() as i64 {
         let s = a.sites[i as usize];
         by_kind[tcx.s_kind[s as usize] as usize] = by_kind[tcx.s_kind[s as usize] as usize] + 1;
@@ -1473,6 +1504,9 @@ fn put_total(out: i64, a: &Audit<Comp>, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) {
         }
         if is_unneeded(a, s, tcx) {
             unneeded += 1;
+            if tcx.s_just[s as usize] == 0 {
+                bare += 1;
+            }
         }
     }
     buf_bytes(out, b"sites: ");
@@ -1488,12 +1522,15 @@ fn put_total(out: i64, a: &Audit<Comp>, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) {
     buf_bytes(out, b"; unneeded: ");
     buf_int(out, unneeded);
     buf_byte(out, b'\n');
-    // (0.25.5, feedbacks/mod254.md #1: the fix that removes them)
+    // (0.25.5, feedbacks/mod254.md #1: the fix that removes them; 0.29:
+    // the one that does: with only justified ones left, unneeded-unsafe
+    // answered fix.none)
     if unneeded > 0 && !get_diag_json() {
         let t = diags(tcx);
         buf_str(t, c"try:");
         put_cword(t, pcx.prog);
-        buf_str(t, c" fix --only unneeded-unsafe");
+        buf_str(t, if bare > 0 { c" fix --only unneeded-unsafe" }
+            else { c" fix --only unneeded-justified" });
         put_root(t, tcx);
         try_end(t);
     }

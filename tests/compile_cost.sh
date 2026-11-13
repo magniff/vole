@@ -14,15 +14,6 @@
 #           signature, read at each call, reads its types' declared and
 #           inferred bounds: made once per type), at most 1.5x
 #
-# (0.28.0) The programs are in the one edition there is; hello and
-# std_heavy.vl carry the edition line 0.27.8 needs to read them so. One
-# more row while the previous release is a 0.27 (it still has the MVS
-# edition; a later one refuses the flag and the row is not printed):
-#
-#   hello-0.27  the hello world's build against the previous release's
-#               build of it as an MVS program, at most 2.0x (the bound the
-#               rust edition's hello had since 0.27.5 against MVS's)
-#
 # Instructions, not time: they hardly move with the machine's load. They
 # are read from /usr/bin/time -l (macOS); a host without it skips (77).
 #
@@ -54,8 +45,7 @@ if ! /usr/bin/time -l true 2>&1 | grep -q 'instructions retired'; then
 fi
 W=$(mktemp -d "${TMPDIR:-/tmp}/vole-cost.XXXXXX")
 trap 'rm -rf "$W"' EXIT
-printf '// EDITION: rust\nfn main() {\n    println("hello");\n}\n' >"$W/hello.vl"
-printf 'fn main() {\n    println("hello");\n}\n' >"$W/hello_027.vl"
+printf 'fn main() {\n    println("hello");\n}\n' >"$W/hello.vl"
 cp "$ROOT/tests/cost/std_heavy.vl" "$W/std_heavy.vl"
 
 cp "$ROOT/tests/cost/regions_heavy.vl" "$W/regions_heavy.vl"
@@ -87,7 +77,6 @@ measure() {
     limit=$2
     shift 2
     new=$(count "$C" "$@") || { echo "compile-cost: $name fails with $C"; FAILED=1; return; }
-    last_new=$new
     old=$(count "$P" "$@") || { echo "compile-cost: $name: skipped, the previous release cannot do it ($P $*)"; return; }
     awk -v n="$name" -v a="$old" -v b="$new" -v l="$limit" 'BEGIN {
         r = b / a
@@ -96,28 +85,13 @@ measure() {
         exit bad
     }' || FAILED=1
 }
-# (0.28.0) the hello world against the previous release's build of it as
-# an MVS program: only while that release has the edition
-hello_027() {
-    [ -n "$1" ] || return
-    old=$(count "$P" --edition mvs hello_027.vl -c -o hello_027.o) || return
-    awk -v a="$old" -v b="$1" 'BEGIN {
-        r = b / a
-        bad = (r > 2.0)
-        printf "  %-10s %8.1f M instructions, as an MVS program it was %8.1f M: %.2fx (at most 2.00x)%s\n", "hello-0.27", b / 1e6, a / 1e6, r, (bad ? "  TOO DEAR" : "")
-        exit bad
-    }' || FAILED=1
-}
 echo "compile cost against $P:"
 echo "  binary: $(wc -c <"$C" | tr -d ' ') bytes ($C), was $(wc -c <"$P" | tr -d ' ')"
-last_new=""
 measure hello 1.5 hello.vl -c -o hello.o
-hello_new=$last_new
 measure std 1.5 std_heavy.vl -c -o std_heavy.o
 measure check 1.15 check src/main.vl
 
 measure regions 1.5 check regions_heavy.vl
-hello_027 "$hello_new"
 if [ $FAILED -ne 0 ]; then
     echo "compile-cost: a compilation is dearer than the previous release allows (see above; --time-passes splits it by phase)"
     exit 1

@@ -112,10 +112,7 @@ build() {
             # shellcheck disable=SC2086
             "$CC" $ARCH -o "$3" "$3.o" -lm
             return ;;
-        # (0.28.0) a release that still has editions (0.27) is told the
-        # one the programs are in: they no longer say it themselves
-        # shellcheck disable=SC2086
-        previous) "$PREVIOUS" $PREVIOUS_EDITION --target "$TARGET" "$1" -o "$3.s" >/dev/null 2>&1 || return 1 ;;
+        previous) "$PREVIOUS" --target "$TARGET" "$1" -o "$3.s" >/dev/null 2>&1 || return 1 ;;
         seed)
             # The seed knows only 0.2's declarations of C functions.
             awk -f "$ROOT/tests/seed-compat.awk" "$1" >"$3.vl"
@@ -126,10 +123,6 @@ build() {
     "$CC" $ARCH -o "$3" "$3.s" -lm
 }
 
-PREVIOUS_EDITION=""
-if [ -n "$PREVIOUS" ]; then
-    case "$("$PREVIOUS" --version 2>/dev/null)" in *" 0.27."*) PREVIOUS_EDITION="--edition rust" ;; esac
-fi
 VARIANTS="O0 O1 O2"
 [ -n "$PREVIOUS" ] && VARIANTS="previous $VARIANTS"
 [ -n "$SEED" ] && VARIANTS="$VARIANTS seed"

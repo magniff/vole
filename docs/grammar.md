@@ -16,10 +16,8 @@ alternatives, `"..."` is a literal token.
 whitespace   = " " | "\t" | "\r" | "\n" ;
 comment      = "//" { any - "\n" }
              | "/*" { any | comment } "*/" ;          (* block comments nest *)
-                                                       (* (0.28.0) `// EDITION: rust`, the line 0.27 read as a
-                                                          program's edition, is an ordinary comment: there is one
-                                                          edition. `--edition rust` is accepted and ignored
-                                                          (deprecated; it goes in 0.29), `--edition mvs` refused. *)
+                                                       (* there is one language (0.28.0); no comment
+                                                          and no option chooses an edition (0.29) *)
 ident        = ( "_" | ascii_letter ) { "_" | ascii_letter | digit } ;
                                                        (* "_" alone is the wildcard pattern *)
 raw_ident    = "r#" ident ;                            (* (0.4) an identifier even if a keyword: r#type *)
@@ -82,12 +80,13 @@ include      = ( "include_str" | "include_bytes" ) [ "!" ] "(" string_lit [ "," 
 tuple index, so `t.0.1` is `(t.0).1`. A literal must not be followed
 directly by other letters (`3e` and `1foo` are errors).
 
-**Keywords:** `as break const continue defer else enum extern false fn for
+**Keywords:** `as break const continue else enum extern false fn for
 if impl import in let loop match mod mut pub return static struct trait true
 type union unsafe use while move where` (`import` and `use` since 0.4, `pub` and
-`mod` since 0.5, `defer` since 0.6, `unsafe` and `trait` since 0.9, `move`
-since 0.14, `where` since 0.26.2). `defer` had no statement from 0.26.2
-(`syntax.defer`) and is an ordinary name from 0.28.0.
+`mod` since 0.5, `unsafe` and `trait` since 0.9, `move`
+since 0.14, `where` since 0.26.2). `defer` (a keyword from 0.6, without a
+statement from 0.26.2) and `var`, `inout` and `sink` (0.21 to 0.27) are
+ordinary names from 0.28.0.
 
 **Reserved** (an error if used): the keyword `dyn` (and `move` until
 0.14, `where` until 0.26.2, keywords since), and the
@@ -167,11 +166,11 @@ Display>(x: T)`. A method's `where` may bound its impl's parameters too.
 The left side is a type parameter of the item; a bound on another type
 (`I::Item: Display`, `Vec<T>: Debug`) was `where.unsupported` before
 0.28.0 and is checked as Rust's now. A parameter's type `impl B + C` (also `impl Fn(i64) -> i64`,
-after a mode: `f: inout impl FnMut(i64)`) is a hidden type parameter
+behind a reference: `f: &mut impl FnMut(i64)`) is a hidden type parameter
 with those bounds, after the written ones: messages name it by its text,
 `impl Display`, and a turbofish gives only the written ones
 (`pick::<i64>(t, u)`). `impl Trait` at the top of a result is Rust's (0.27.2.1); inside a
-result's type, a trait method's result or a `let` it is `edition.later`
+result's type, a trait method's result or a `let` it is `syntax.later`
 (0.29); before 0.28.0 every other position was `type.impl-position`.
 
 Items may refer to each other in any order. Constants and statics are
@@ -208,7 +207,7 @@ layout; `#[repr(C, packed)]` packs a struct (or union) without padding,
 `#[repr(C, align(N))]` raises its alignment to N (a power of two up to
 4096; above 16 since 0.5, with stack frames realigned where needed);
 `#[repr(u8)]` (any integer type) sets the tag type of an enum. Functions
-take `#[inline]`, `#[inline(never)]` and `#[cold]` (0.6). A `static var`
+take `#[inline]`, `#[inline(never)]` and `#[cold]` (0.6). A `static mut`
 takes `#[thread_local]` (0.21): each thread has its own copy, made from
 the initializer (`guide threads`). *(0.26.3)* Any item (a function, a
 method, a struct, an enum, a trait, a type alias, a constant, a static)
@@ -1062,6 +1061,14 @@ errors; 0.9 reported it as a warning). Options:
 - `--deny-warnings`: warnings are errors. There are no warnings at the
   moment (0.9's unsafe warnings are errors now); the option stays for
   future ones, and the test suite compiles every case with it.
+- `--deny=CODE[,CODE]` (0.29, repeatable; rustc's `-D`): a warning of
+  that code, or of that family (`--deny=unsafe`: every `unsafe.*`), is
+  an error, the others stay warnings. With `volec check`,
+  `--deny=unsafe` reports each unsafe site without its `// UNSAFE:` and
+  `// SAFETY:` comments where it is (`unsafe.unjustified`, else one line
+  that counts them past five) and each unsafe block with nothing unsafe
+  inside (`unsafe.unneeded`, reported only when denied): the compiler's
+  own source is checked so. `--allow=CODE` (0.27.0) is its opposite.
 - `--diagnostics=short` (0.11): every error and warning on one line,
   `FILE:LINE:COL: error[KIND] MESSAGE | help: HELP | note: NOTE`, for
   tools and agents (`--diagnostics=human`, the default, is the form
@@ -1862,8 +1869,8 @@ value it points to (`try: *out = acc` for `out[0] = acc`).
 **std on values** (value semantics, T4). `v[i] = x`, `v[i] += x`,
 `v[i].f = x` and `&mut v[a..b]` go through `v.as_mut_slice()` (an
 exclusive view; reads through `v.as_slice()`). A `[T]` where `&mut [T]`
-is wanted (`sort(v.as_slice())`, `sort(s)`) is `own.readonly` (0.19.1;
-0.17's transitional rule took it as the exclusive loan): pass
+is wanted (`sort(v.as_slice())`, `sort(s)`) is a type error (rustc
+E0308; `own.readonly` from 0.19.1 until 0.28.0): pass
 `v.as_mut_slice()`, `&mut a[..]`, or `v.sort()`; `fix --suggested` and
 `fix --values` write them. A closure parameter annotated `*T`
 where the bound wants `&T` is an error (0.18.1; `fix --suggested`
@@ -2047,8 +2054,8 @@ An intrinsic is a function of `std::arch`, `std::arch::aarch64` or
   signature) the call is an error (`arch.raw_form`) naming both forms.
   (0.19.1) A store writes its slice, so the slice is `&mut [T]`
   (`vst1q_u8(&mut out[..], i, v)`, `v.as_mut_slice()`, a `&mut [T]`
-  parameter): a read-only `[T]` there is `own.readonly`, and the store is
-  an exclusive loan for the own pass.
+  parameter): a shared `&[T]` there is a type error, and the store is
+  an exclusive loan for the borrow checker.
 - **The pointer forms** are in the `raw` submodule of each architecture's
   module, with the vendor's signature, `unsafe`:
   `std::arch::aarch64::raw::vld1q_u8(p: *u8)`,
@@ -2147,71 +2154,20 @@ both architectures' code; there is no `cfg`.
   (`arch.multiversion`, naming that version): put it under
   `if std::arch::has("f")`.
 
-## Additions of 0.20: parameter conventions
+## Additions of 0.20: parameter conventions (removed in 0.28.0)
 
-The design is [design/conventions.md](design/conventions.md): the
-memory model's spelling becomes vole's own, `let` / `inout` /
-`sink`, with 0.17's semantics. `volec guide memory` teaches it;
-`volec guide rust` maps Rust's spellings onto it.
-
-```ebnf
-param       = self_param | ident ":" [ convention ] type [ "=" expr ] ;
-self_param  = [ "inout" | "sink" ] "self" | "self" ":" [ convention ] type ;
-convention  = "let" | "inout" | "sink" ;               (* let is the default; fmt does not write it *)
-type       += "let" type | "inout" type ;              (* an access: a field, a result, a type argument, a fn type *)
-fn_type     = "fn" "(" [ [ convention ] type { "," [ convention ] type } ] ")" [ "->" type ] ;
-stmt       += "var" pattern [ ":" type ] "=" expr ";"
-            | "inout" ident [ ":" type ] "=" expr ";" ;  (* expr: "&" place, or an inout access *)
-single     += "var" ident ;                             (* replaces "mut" ident *)
-fpat        = [ "var" ] ident | ident ":" pattern ;
-static_decl = "static" [ "var" ] ident ":" type "=" expr ";" ;
-prefix     += "&" pratt(25) ;                           (* an inout access of a place; no "&" "mut" *)
-closure     = [ "sink" ] "|" params "|" expr ;          (* replaces "move" *)
-match_expr += "match" "&" expr "{" arms "}" ;           (* binds inout accesses *)
-```
-
-- **Conventions.** A `let` parameter (the default) is read-only: a copy
-  of a plain or copyable value, otherwise a borrow for the call (a
-  temporary argument lives to the end of the statement). An `inout`
-  parameter is an exclusive access, and its argument is marked `&place`
-  (`conv.marker` without it, `conv.marker_extra` on a let or sink
-  argument, `conv.place` on a temporary). A `sink` parameter owns its
-  value and is mutable; an owned argument moves into it. Receivers are
-  `self`, `inout self` and `sink self` and are lent without `&`.
-  In `extern "C"`
-  signatures `inout` and `sink` are `conv.extern`.
-- **Accesses are used as their values.** A let or inout parameter, an
-  `inout x = &place;` local, a `let x = part;` that borrows, and an
-  access field (`q: inout Query`) are read, written (`x = v`, `x += 1`)
-  and called through as the value they designate; `&x` passes one on.
-  `*` is only for raw pointers: `*x` on an access is `conv.rust`. An
-  access cannot be re-pointed.
-- **Bindings.** `let x = e` owns a temporary or a whole local it takes
-  (which moves) and borrows a part it cannot take (an element, a field
-  through an access); `var x = e` is mutable and always owns (a part is
-  `own.move_out`).
-- **Types.** `[T]` is a let access to elements; `inout [T]` is the
-  exclusive writable slice. A struct with an access field is a view; one
-  with an `inout` field is move-only.
-- **Words.** `var`, `inout` and `sink` are words only where these rules
-  put them; elsewhere they are identifiers (`let var = 1; var(a, b)`),
-  until 0.21 makes them keywords. `set` is not a convention: `x: set T`
-  is `conv.set`, and `sink T` outside a parameter `conv.sink_type`.
-  Rust's spellings (`&T`, `&mut T`, `&mut x`, `&self`, `let mut`, `mut
-  x`, `static mut`, `move`, `*r` on an access) are `conv.rust`, each
-  with the new form in a `try:` line.
-- Not yet: results that are accesses (`-> let T`, `-> inout T`,
-  `Option<inout V>`) and `for inout x in &v`; until they land,
-  `get_or_insert(k, v)` and `get_mut(k)` give one-element views
-  (`[0] += 1`).
-- **Modes.** A file is read *mixed* (both spellings; the default until
-  Phase M), in *0.20's* spelling (`--syntax=0.20`: Rust's spellings are
-  `conv.rust`, and `&x` is always exclusive), or in *0.19's* (a crate
-  whose root's first line is `// vole-syntax: 0.19`: 0.20's spelling
-  is `syntax.legacy`). Only compiler/src/main.vl carries that line,
-  during 0.20, so that v0.19.1 can build it; tests/run.sh fails if
-  another file does. std and the compiler's generated sources are read
-  mixed until Phase M migrates them.
+From 0.20 to 0.27 a parameter was written with a convention, `let`,
+`inout` or `sink` (`x: inout T`, `inout self`), a mutable binding was
+`var x`, and `&x` at a call marked an exclusive access; the errors were
+`conv.*` ([design/conventions.md](design/conventions.md) is that design,
+kept as history). 0.27 added Rust's surface beside it as a second
+edition, and 0.28.0 removed the first: a parameter is `x: T`, `x: &T` or
+`x: &mut T`, a receiver `self`, `&self` or `&mut self`, a mutable binding
+`let mut x`, and `var`, `inout` and `sink` are ordinary names. Nothing
+in the compiler reads the old spelling (0.29: its flags and tokens are
+gone too). Three codes keep the family's name: `conv.set` (`x: set T`),
+`conv.mode_order` (`let x: T` in a parameter list) and `conv.rust`
+(`std::env::var`, which allocates: `env::var_in`).
 
 ## Additions of 0.20: `str`
 
@@ -2420,8 +2376,8 @@ changes through a shared reference. No new syntax; these are the rules.
 - **Threads.** UnsafeCell is Send when T is and never Sync; what holds
   one follows structurally (std's Atomic, its locks and its print state
   are Sync by std's vouch). An immutable `static` that is not Freeze and
-  not Sync is `sync.static`; a `static var` and a `#[thread_local]
-  static var` may hold a cell. A cell of a view is `cell.view_item`.
+  not Sync is `sync.static`; a `static mut` and a `#[thread_local]
+  static mut` may hold a cell. A cell of a view is `cell.view_item`.
 - **Effects.** A call of `UnsafeCell::get` has the hidden effect
   `interior` (memory for the optimizer, `query effects F --why
   interior`); a contract condition and a `#[pure]` function refuse it

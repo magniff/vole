@@ -12,7 +12,7 @@
 ## before it is made (all but the new-error one) has no `try: volec fix
 ## --suggested` line: the error's own try: shows the text to judge.
 ## (0.28.0, the rust edition) ocean's i32 has no `is_ascii_digit` and no std
-## function is offered (std2 has Rust's methods); cloth's `r` gets no
+## function is offered (std has Rust's methods); cloth's `r` gets no
 ## annotation (rustc would infer [f32; 4]; a gap of the rust edition's
 ## literals), so only the use line is made. MVS's marks.vl (the conv.marker
 ## and conv.rust classes, `--codes`) is gone with MVS.

@@ -22,7 +22,7 @@ volec query refs NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [-
 volec query callers NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
 volec query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]   (0.16)
 volec query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (0.16) the inferred effects
-volec query unsafe [FILE...|DIR|std] [--no-std] [--unjustified] [--summary] [--json]   (0.25.3) every unsafe site
+volec query unsafe [FILE...|DIR|std] [--no-std] [--unjustified] [--unneeded] [--summary] [--json]   (0.25.3) every unsafe site
 volec query features NAME... [--why FEATURE] [-C OPTION]   (0.19) what a function needs of the CPU
 volec query arch WORDS... [--feature F] [--arch A] [--equiv NAME]   (0.19) the intrinsic tables (also `intrinsics`; no program read)
 volec query items [MODULE|TYPE...] [--root ROOT] [--comments] [--find WORD] [--kind KIND,...] [--names]
@@ -122,7 +122,7 @@ tools` the ones a program needs.
 | the type of an expression | `target/volec query type FILE:LINE:COL` |
 | a function's drops, each decided (kept, removed, flagged, opened) and where it runs (0.26.1) | `target/volec query drops FILE:LINE` |
 | what a function may do (allocate, io, panic, loop forever) | `target/volec query effects NAME\|MODULE` (`--why EFFECT`: the chain; `--has alloc(Gpa)`: which still allocate) |
-| every unsafe site: what it does, its class, whether it says why | `target/volec query unsafe [FILE...\|std]` (`--unjustified`, `--summary`, `--json`) |
+| every unsafe site: what it does, its class, whether it says why | `target/volec query unsafe [FILE...\|std]` (`--unjustified`, `--unneeded`, `--summary`, `--json`) |
 | the CPU intrinsic for a task, its instruction and feature; what a function needs of the CPU (0.19) | `target/volec query arch WORDS` (`--feature crc`, `--equiv NAME`); `query show vqtbl1q_u8`; `query features NAME --why crc` |
 | where it is defined, its signature | `target/volec query def NAME` |
 | what a module contains; a type's methods | `target/volec query items MODULE`; `query items TYPE`; `query show TYPE` (its source, then a line a method) |
@@ -632,7 +632,8 @@ sites: 7 (5 blocks, 1 unsafe fns, 1 extern blocks); unjustified: 4; unneeded: 0
   tables are), `int-to-ptr`, `c-call(F)`, `unsafe-call(F)`,
   `union-field`, `fn-value`. `none (unneeded)`: a block the checker read
   with nothing unsafe inside (remove it: 0.25.5, when there are any, the
-  total line is followed by `try: volec fix --only unneeded-unsafe`);
+  total line is followed by `try: volec fix --only unneeded-unsafe`, or,
+  0.29, `--only unneeded-justified` when each one left has comments);
   `not checked`: code the checker
   did not reach (a generic function never instantiated); an extern block
   says how many C functions it declares.
@@ -650,11 +651,16 @@ sites: 7 (5 blocks, 1 unsafe fns, 1 extern blocks); unjustified: 4; unneeded: 0
   the site starts (no blank line between; a `let x = unsafe { .. }`'s
   are the `let`'s), comments inside that statement before the site, and
   a comment ending the site's line. `volec check` uses the same rule
-  (`unsafe.unjustified`, a warning; an error with `--deny-warnings`),
+  (`unsafe.unjustified`, a warning; an error with `--deny-warnings`
+  or, each site at its position, `--deny=unsafe`),
   and so does the commit hook (tools/unsafe-diff-check.py), for the
   lines a commit adds.
 - FILE (or a DIR, or `std`) keeps the sites there; `--unjustified` the
-  sites without both comments; `--summary` prints the counts instead:
+  sites without both comments; `--unneeded` (0.29) the unsafe blocks
+  with nothing unsafe inside (`none (unneeded)`: `volec fix --only
+  unneeded-unsafe` takes them away, `--only unneeded-justified` those
+  with comments too, and says of each one it leaves why);
+  `--summary` prints the counts instead:
   the total line, then by class, by top-level module, by file (the 20
   with the most sites; `--all`: every one) and by justification, each
   `KEY \t SITES \t UNJUSTIFIED`; `--json` one object a site (`file`,
@@ -664,8 +670,12 @@ sites: 7 (5 blocks, 1 unsafe fns, 1 extern blocks); unjustified: 4; unneeded: 0
 The sites are found in the files' text (not the parser's tree, so code
 the checker never reaches is listed too); the operations need the
 program checked, so `unsafe` reads it in full (no cache).
-docs/unsafe-baseline.md is the compiler's and std's summary, which the
-gate's `unsafe-audit` row holds them to (tests/unsafe_audit.sh).
+docs/unsafe-baseline.md is the compiler's and std's summary; the gate's
+`unsafe-audit` row and premerge's unsafe row (tests/unsafe_audit.sh)
+hold them to none unjustified and, in compiler/src, none unneeded
+(0.29). A block of a generic function of std that the program never
+instantiates is listed `none (unneeded)` though it holds what needs it:
+std's unneeded count depends on the program and is not judged.
 
 ## features (0.19)
 

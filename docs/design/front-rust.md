@@ -15,7 +15,7 @@ corpus case as `// RULE: F4.2` and, where it diverges from rustc,
 rust-edition position (`rust_at`, Z1), and an MVS program compiles
 exactly as before (the full MVS suite is the witness). A rule whose
 front support does not exist at v0.27.1 names the item it changes
-(*Anchor*); until it lands, the position reports `edition.later` with
+(*Anchor*); until it lands, the position reports `syntax.later` with
 the feature name of `compiler/std2/features.tsv`, as 0.27.0 made it.
 F1–F21 follow the plan's §25 numbering; F22–F32 are the rules the std2
 gap lists (M1, M2, M3a) needed beyond it (§10 maps every gap to its
@@ -177,7 +177,7 @@ visibility or nothing) declares a struct whose fields are named `0..n-1`
 and read as `x.0`, `x.1` (the existing tuple-field syntax,
 `synth_tuple_field`); a field without `pub` is private to its module as
 a named field is (F24). *Anchor:* `front/parser/items/mod.vl:
-parse_struct` (today: `edition.later: tuple_struct`), `front/check/
+parse_struct` (today: `syntax.later: tuple_struct`), `front/check/
 synth_mode.vl: synth_tuple_field`, `front/check/sealed.vl:
 field_hidden`.
 
@@ -213,7 +213,7 @@ says `?Sized`; true otherwise. Every type parameter is `Sized` unless
 **F21.2 (where an unsized value may not be).** A value of unsized type
 may not be: a local (`let s: str`), a by-value parameter or result, a
 field other than the last of a struct (and a struct with an unsized
-last field is itself `?Sized`-only, 0.29: `edition.later: dst`), an
+last field is itself `?Sized`-only, 0.29: `syntax.later: dst`), an
 array or tuple element, an argument for a `Sized` parameter (`Vec<str>`,
 `Option<[T]>`), a cast's result. Each is `error type.unsized` (rustc
 E0277 "the size for values of type .. cannot be known"). Allowed:
@@ -247,7 +247,7 @@ checked and not compiled: the intrinsic stands for it. They are
 size_of::<elem>()` for a slice, `len` for `str`, `size_of::<T>()`
 else), `ptr::drop_in_place<T: ?Sized>(p: *mut T)` (the drop glue of a
 sized `T`; each element's for `[T]`; nothing for `str`). No other
-function reads the words; a user-defined DST is 0.29 (`edition.later:
+function reads the words; a user-defined DST is 0.29 (`syntax.later:
 dst`). *Anchor:* `front/check/calls/paths.vl: call_function` (the
 known-function dispatch, as `format_call`'s), Z3.
 
@@ -507,7 +507,7 @@ type.cast`, rustc E0641 "cannot cast to a pointer of an unknown kind".)
 
 **F29.3 (no implicit numeric conversion).** As today: no `as` is
 inserted; an integer literal takes its type from its context (F18.3).
-There is no `u128`/`i128` in 0.27.2: the names are `edition.later:
+There is no `u128`/`i128` in 0.27.2: the names are `syntax.later:
 u128 (0.29)`.
 
 ### F30 Places through raw pointers
@@ -712,7 +712,7 @@ Self: Bᵢ` declare `Bᵢ ∈ super(A)`; `super*(A)` is the closure (F0.2). A
 cycle (`A: B`, `B: A`) is `error trait.cycle` (E0391). A supertrait may
 be generic (`BorrowMut<B>: Borrow<B>`): its arguments are substituted as
 written. *Anchor:* `front/parser/items/mod.vl: parse_trait` (today
-`skip_item_bounds("supertrait")`, `edition.later`), `front/traits.vl:
+`skip_item_bounds("supertrait")`, `syntax.later`), `front/traits.vl:
 TraitInfo` (gains the supertrait list), `front/convert/mod.vl:
 collect_trait_params`.
 
@@ -746,7 +746,7 @@ omit one without a default, E0046). `v` is a constant expression
 (`consteval.vl`'s language) which may name `Self::M` and other consts
 (no cycle, E0391). An inherent `impl σ { pub const N: τ = v; }` is
 allowed likewise. *Anchor:* `front/parser/rust.vl: skip_assoc_const`
-(today `edition.later`), `front/assoc.vl: collect_trait_assoc,
+(today `syntax.later`), `front/assoc.vl: collect_trait_assoc,
 collect_impl_assoc` (the assoc-type table, extended with a const kind),
 `front/consteval.vl`.
 
@@ -754,7 +754,7 @@ collect_impl_assoc` (the assoc-type table, extended with a const kind),
 F0.4a), `<τ as Tr>::N` (F8.1) are expressions of type `τ_N[Self := τ]`,
 constant per instance: folded when `τ` is concrete, a parameter of the
 instance otherwise (so usable in a pattern, an array length only with
-const generics: `[T; Self::N]` is `edition.later: const_generics`
+const generics: `[T; Self::N]` is `syntax.later: const_generics`
 (0.29)). Resolution: inherent consts first, then the traits in scope
 (F9.2); ambiguity is `error method.ambiguous` with `try: <τ as Tr>::N`.
 *Anchor:* `front/check/calls/paths.vl: synth_path, path_target`,
@@ -810,7 +810,7 @@ primitive (`impl char`, `impl<T> *const T`, `impl<T: ?Sized> *mut T`,
 `impl<T> [T]`, `impl str`), a reference (`impl<'a, T> &'a T`: allowed,
 rarely useful). The methods belong to the type `σ` and are found by
 F0.5(i) when the header applies to the candidate type (F0.3 with
-`W`). *Anchor:* `later_impl` (today `edition.later: impl_on_instance`),
+`W`). *Anchor:* `later_impl` (today `syntax.later: impl_on_instance`),
 `method_of`, `front/check/calls/paths.vl: bind_impl_params`.
 
 **F5.2 (lifetime arguments in a header).** `'a` in `impl<'a, T>
@@ -843,7 +843,7 @@ some sites: M2's gap 12).
 IntoIterator for &'a mut [T]`: the header's self type is a reference;
 it applies (F0.3) to a reference type by unifying pointee and
 mutability (`&'a T` never applies to `&'b mut U`; `'a` is positional,
-F5.2). *Anchor:* `later_impl` (today `edition.later: impl_for_ref`),
+F5.2). *Anchor:* `later_impl` (today `syntax.later: impl_for_ref`),
 `ImplInfo.ty`.
 
 **F6.2 (the probe).** F0.5's order, in full, which is rustc's: for
@@ -893,7 +893,7 @@ parameter (`T: Clone`), a projection (`I::Item: Debug`, `<I as
 Iterator>::Item: Display`), an instance (`Vec<T, A>: Clone`), a
 reference (`&'a T: IntoIterator`), a closure bound (`F: FnMut(I::Item)
 -> B`, D20.1). *Anchor:* `front/parser/items/params.vl: parse_where`
-(today `edition.later: where_bound` for a non-parameter subject),
+(today `syntax.later: where_bound` for a non-parameter subject),
 `front/parser/rust.vl: where_key`.
 A clause is its own item's: a function's is checked for that function
 (F10.2), a struct's, an enum's, a trait's and an impl's are none
@@ -921,7 +921,7 @@ only a parameter's declared bounds).
 ?Sized`, `type A = default` is 0.29). Every impl's definition `type A =
 σ;` must satisfy `Γ_impl ⊢ σ: Bᵢ` (F0.4): `error trait.unmet` at the
 impl's definition. *Anchor:* `front/assoc.vl: collect_trait_assoc,
-collect_impl_assoc` (today `edition.later: assoc_bounds`).
+collect_impl_assoc` (today `syntax.later: assoc_bounds`).
 
 **F11.2 (in bodies).** `T: Tr` in `Γ` entails `T::A: Bᵢ` for every
 declared bound (F0.4b): `x.clone()` for `x: I::Item` under `I: Iterator`
@@ -1088,7 +1088,7 @@ synthesized impls are keyed like written ones (F13.1) and take part in
 F4.2 (a written `impl Tr for i64` beside the list is an overlap). An
 impl so synthesized has no position: its errors are reported at the
 attribute. *Anchor:* `front/parser/rust.vl: take_builtin_impls` (today
-`edition.later: primitive_builtin`), `intrinsic`.
+`syntax.later: primitive_builtin`), `intrinsic`.
 (0.27.4) *Which primitives a build makes them for.* A lazy build
 (std2lazy) makes the impls, and the integers' inherent methods (F15.4),
 only for the primitives a program brings in. A program brings in a
@@ -1193,7 +1193,7 @@ with I = `RangeFrom<usize>` is the impl for `[T]` (T := i64 from the
 arguments, F14.1), not the one for `str`; without arguments, or when
 none matches, it is t's impl of Tr, as before. Case
 `std2_slice_sliceindex_output`. *Anchor:* `front/parser/rust.vl:
-qualified_path` (today `edition.later`), `split_shl`, `synth_path`,
+qualified_path` (today `syntax.later`), `split_shl`, `synth_path`,
 `check/resolve.vl: qualified_projection`.
 
 **F8.2 (`Tr::name`).** A trait name used as a path head (`Debug::fmt(v,
@@ -2122,7 +2122,7 @@ infer.vl: std_struct_type`, `front/traits.vl: std_trait`,
 `front/check/format.vl: std_fn`.
 
 **Z4.1 (no mixing: what retires).** `edition.std_copy`,
-`edition.std_by_value` and `edition.lenient`'s std half are not
+`edition.std_by_value` and `type.ref-value`'s std half are not
 raised in 0.27.2 (`check/rust.vl: std_copy_error, std_by_value_error,
 lenient_error` become unreachable for a rust program and are deleted;
 their `explain` rows say "0.27.0–0.27.1 only"); `std2_root` of
@@ -2137,7 +2137,7 @@ embeds std2's `alloc::Gpa` implementation with its `--check-alloc`
 variant (`CHECK_ALLOC_MODE` selects the file as `stdalloc.vl` does),
 the `sys` layer and `panic`'s exit-101 path. `std::gpu`, `std::window`,
 `std::objc`, `std::arch`, `std::cli` do not exist for a rust program: a
-`use` or path naming them is `edition.later: std_gpu (0.27.4)` (one
+`use` or path naming them is `syntax.later: std_gpu (0.27.4)` (one
 feature name, `std_gpu`, for the five; U4). *Anchor:* `compiler/std/
 embed.sh`, `front/modules/lookup.vl: private_error` (the "no such
 module" site).
@@ -2249,7 +2249,7 @@ where a `try:` is named, a case in `tests/borrowck-try`'s shape under
 | `pattern.refutable` | F27.1 | E0005 | `if let` |
 | `attr.builtin` | F15.1 (outside std2) | — | none |
 | `derive.default` | F17.1 (`Default` on an enum without `#[default]`) | E0665 | `#[default]` on the first unit variant |
-| `edition.later` (kept) | every feature of `features.tsv` not yet landed; `std_gpu` (Z5.1), `const_generics`, `dst`, `let_else` | — | as today |
+| `syntax.later` (kept) | every feature of `features.tsv` not yet landed; `std_gpu` (Z5.1), `const_generics`, `dst`, `let_else` | — | as today |
 
 Twenty rows (nineteen new codes). The rustc column is the twin's
 map (`tools/borrowck-twin.sh`, extended to the `rust_f_*` cases): a
@@ -2441,7 +2441,7 @@ The M3a list (thread, char, hash helpers):
 | M3a gap | rule |
 |---|---|
 | 1 `&(*p).field` is a raw pointer | F30.1 (a reference), F30.2 (`&raw` for the address) |
-| 2 `drop_in_place`, `size_of_val` on `?Sized` | F21.4 (`[T]`, `str`); other DSTs `edition.later: dst` (0.29) |
+| 2 `drop_in_place`, `size_of_val` on `?Sized` | F21.4 (`[T]`, `str`); other DSTs `syntax.later: dst` (0.29) |
 | 3 atomics by name in std | Z3.1 (the atomic keys); `std::sync` is std's, 0.27.3 |
 | 4 `unsafe fn` pointer types | F19.3 |
 | 5 `==`, `<` on non-primitive types | F26.1 (every type, through the trait), F26.2 (on `T`) |
@@ -2455,7 +2455,7 @@ The M3a list (thread, char, hash helpers):
 | 13 byte literals; `u32` wrapping/saturating | F23.2; F15.4 |
 | 14 array-to-slice coercion at a call | F32.1 |
 | 15 `v = &v[96..]` rejected | borrowck's, not the front's: under Z9 the loan is of `*v` and the assignment to `v` kills nothing it holds (borrowck.md D2.3, D2.4); reported to clos272 as a Z9 IR-side case |
-| 16 no `u128` | `edition.later: u128` (0.29), F29.3 |
+| 16 no `u128` | `syntax.later: u128` (0.29), F29.3 |
 
 M1's "to decide": `[T]::len`, `as_ptr`, `str::as_bytes` are F21.4's
 intrinsics (their written bodies are placeholders); `ptr::read`/
