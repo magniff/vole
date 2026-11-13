@@ -115,19 +115,26 @@ defined:
 - Each unsafe site says why, in the comments right above it (the
   statement's or item's, no blank line between): `// UNSAFE:` why it
   cannot be safe, `// SAFETY:` why it is sound. `volec check` warns
-  about a site without both (`unsafe.unjustified`). (0.25.3)
+  about a site without both (`unsafe.unjustified`). (0.25.3) With
+  `--deny=unsafe` (0.29) each such site is an error where it is, and
+  so is each unsafe block with nothing unsafe inside
+  (`unsafe.unneeded`); the compiler's own source is held to none of
+  either.
 - `volec query unsafe [FILE...|std]` (0.25.3) lists every unsafe block,
   `unsafe fn` and extern block: `FILE:LINE`, kind, item, class (`ffi`,
   `alloc`, `intrinsic`, `transmute/cast`, `raw-pointer`, `static-mut`:
   through a pointer held in a static, `other`), its comments, and the
   operations inside that need unsafe; `none (unneeded)`: a block with
-  nothing unsafe inside, to remove. `--unjustified`, `--summary`
-  (counts by class, module, file), `--json`, `--no-std`.
+  nothing unsafe inside, to remove. `--unjustified`, `--unneeded`,
+  `--summary` (counts by class, module, file), `--json`, `--no-std`.
 - `volec fix --only unneeded-unsafe` (0.25.4) takes the `none
-  (unneeded)` blocks away and keeps their code in its scope; a block it
-  cannot open so (one that declares and is not last) is left and
-  counted. `--only unneeded-justified` (0.25.5) takes the justified ones
-  too, with their `// UNSAFE:` and `// SAFETY:` comments.
+  (unneeded)` blocks away and keeps their code in its scope, over
+  several lines too (a `let`'s value, an `if` or `while` condition), laid
+  out as `volec fmt` would; a block it cannot open so (one that declares,
+  with code after it) loses the word `unsafe` alone: a plain `{ }`
+  block. A block it leaves gets a note that says why
+  (`fix.unneeded-left`). `--only unneeded-justified` (0.25.5) takes the
+  justified ones too, with their `// UNSAFE:` and `// SAFETY:` comments.
 - `volec --check-unsafe -O1 prog.vl -o prog` checks raw-pointer
   accesses against the heap blocks at run time (`malloc`/`free`):
   out-of-bounds and use-after-free stop the program with `unsafe access

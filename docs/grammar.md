@@ -1053,6 +1053,14 @@ errors; 0.9 reported it as a warning). Options:
 - `--deny-warnings`: warnings are errors. There are no warnings at the
   moment (0.9's unsafe warnings are errors now); the option stays for
   future ones, and the test suite compiles every case with it.
+- `--deny=CODE[,CODE]` (0.29, repeatable; rustc's `-D`): a warning of
+  that code, or of that family (`--deny=unsafe`: every `unsafe.*`), is
+  an error, the others stay warnings. With `volec check`,
+  `--deny=unsafe` reports each unsafe site without its `// UNSAFE:` and
+  `// SAFETY:` comments where it is (`unsafe.unjustified`, else one line
+  that counts them past five) and each unsafe block with nothing unsafe
+  inside (`unsafe.unneeded`, reported only when denied): the compiler's
+  own source is checked so. `--allow=CODE` (0.27.0) is its opposite.
 - `--diagnostics=short` (0.11): every error and warning on one line,
   `FILE:LINE:COL: error[KIND] MESSAGE | help: HELP | note: NOTE`, for
   tools and agents (`--diagnostics=human`, the default, is the form
