@@ -6,6 +6,13 @@ in [docs/releases.md](docs/releases.md) and
 [docs/roadmap.md](docs/roadmap.md); the language in
 [docs/grammar.md](docs/grammar.md).
 
+**First, in a new worktree, run `bootstrap/bootstrap.sh --dev
+--no-suite`** (seconds): before it there is no compiler here. It leaves
+two: `target/volec` is your build of this tree (what you check, build
+and test with), `target/tools/volec` the installed, tested one (what
+you query and edit with while you change the compiler: it works when
+your build does not). For an example or a test alone either one does.
+
 **There is one language, with Rust's surface** (0.28.0; `target/volec
 guide rust`: where vole differs from Rust): `&T`, `&mut T`, `let mut`,
 `&'static [u8]`, Rust's meanings. An `// EDITION: rust` line is a
@@ -50,6 +57,7 @@ these first:
 | missing imports, `pub`, `unsafe` blocks | `target/volec fix` |
 | the errors' exact fixes (an error with `try: volec fix --suggested`: a did-you-mean, a conversion, a path, a `use`, a `pub`), instead of sed | `target/volec fix --suggested` (one checked edit, then the errors left; `--dry-run`, `--show`, `--at FILE:LINE`) |
 | a bug: where it fails, the values at a line, which change broke a test | `target/volec guide debug` (`test` prints a crash's line and callers; `probe FILE:LINE EXPR... -- ARGS`; `reduce`) |
+| work on an example, GPU or not: its program, its shaders, a headless run | `target/volec guide gpu-workflow` (short); in the example's directory `volec check`, `query`, `edit` mean that program (from the root: a FILE of it, or `--root examples/X/main.vl`); `volec check` says what it read (`ok: 0 errors in ROOT (N files, M shaders)`); its tests: `tests/run.sh NAME` |
 | build and test what a change touches | `bootstrap/bootstrap.sh --dev --no-suite`, `tests/run.sh FILTER...`, `tests/affected.sh` (the inner loop, below) |
 
 Everything else (`query grep|items|type|effects|impact`, `edit apply`,
@@ -141,15 +149,17 @@ never the whole suite or a gate unless its task says so**:
    and its fixpoint checked; no suite runs, and `target/tools/volec`
    stays the last build whose suite passed). After an edit: the check
    hook's errors (or `target/volec check`), then only the cases the
-   change concerns: `tests/run.sh FILTER...` (names containing a
-   FILTER; `-n NAME` or `'=NAME'` one name, quoted: zsh expands a bare
-   `=NAME` and nothing runs; `-f FILE` a list; `-l` lists them), or
+   change concerns: `tests/run.sh FILTER...` (every case whose name
+   contains a FILTER: `tests/run.sh pathtrace`; `-n NAME`: the one
+   case NAME exactly; `-f FILE` a list; `-l` lists them), or
    `tests/affected.sh -O 2` for what the branch touches so far.
 2. **Before reporting (agent):** `tools/premerge.sh` (prints `premerge:
    ok`) and `tests/affected.sh`: the tests `tests/affected.map` names for
    the paths changed since the branch's base, at -O0 and -O2 (`--list`
    prints the plan and why each item is in it; a changed test runs
-   itself; an unknown path gets the smoke set). When `--list` says
+   itself; an unknown path gets the smoke set; a file git does not
+   track is named in the plan and not counted: `git add` a new test,
+   or `--untracked`). When `--list` says
    `linux: platform-relevant`, `tests/affected.sh --linux` runs the
    same plan in the aarch64-linux container too (colima must run).
 3. **Per merge batch (integrator):** after merging the batch into the
@@ -169,7 +179,7 @@ never the whole suite or a gate unless its task says so**:
    is run whole, not step by step (`--plan` prints the schedule).
 
 A test that fails in the plan is yours until shown otherwise: rerun it
-alone (`tests/run.sh -n NAME`, or `'=NAME'` quoted) before calling it
+alone (`tests/run.sh -n NAME`) before calling it
 load or inherited.
 
 ## Before you commit, before a merge

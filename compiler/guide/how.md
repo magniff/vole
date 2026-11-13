@@ -171,8 +171,7 @@ To add a test case.
   `CHECK:` / `CHECK-NOT:` (the IR), `FLAGS:`; the header of
   `tests/run.sh` lists them all. Cases compile with `--deny-warnings`.
 - Run it: `tests/run.sh NAME` (cases whose name holds NAME), with
-  `-O 0` and `-O 1` too; one case alone: `tests/run.sh -n NAME` (or
-  `'=NAME'`, quoted: zsh expands a bare `=NAME`, and nothing runs).
+  `-O 0` and `-O 1` too; one case alone: `tests/run.sh -n NAME`.
 - A tool: a transcript, `$ ARGS` lines and their output:
   `tests/query/NAME.q` (on `tests/query/NAME/main.vl`),
   `tests/refactor/NAME.t` (in a copy of `tests/refactor/NAME/`; `%`

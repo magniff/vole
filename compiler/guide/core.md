@@ -193,13 +193,14 @@ Float math: Rust's methods on f32 and f64 (`x.sqrt()`, `y.atan2(x)`,
 `x.powi(2)`) and constants (`std::f64::consts::PI`): `volec guide math`.
 SIMD and CPU intrinsics: `std::arch`, the vendors' names (`vaddq_u8`)
 checked against the CPU: `volec guide arch`; `query arch WORDS`.
-GPU compute and rendering: `std::gpu`, wgpu's objects on Metal: `volec guide gpu`.
+GPU work (shader, check, headless run): `volec guide gpu-workflow`; the
+API (`std::gpu`): `volec guide gpu`.
 
 ## The loop
 
-Write the program, then `volec check` (a check hook, where there is
-one, runs it after each edit); fix the first error first. A clean check
-ends with `ok: 0 errors in main.vl (1 file, 0 shaders)` (the program checked), a build with `ok: built prog`. Before writing a construct
+Write the program, then `volec check` (a hook may run it
+after each edit); fix the first error first. A clean check
+ends with `ok: 0 errors in main.vl`, a build with `ok: built prog`. Before writing a construct
 you are unsure of, `volec guide --find WORDS` (`--find read a line`)
 or `volec guide TOPIC#SECTION` prints the lines on it; `volec
 try 'CODE'` runs a snippet. For an unfamiliar item, ask
