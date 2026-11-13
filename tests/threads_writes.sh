@@ -49,8 +49,6 @@ base::ctx::Ctx.fn_nocapture	the task'"'"'s own component'"'"'s entries
 base::ctx::Ctx.fn_attrs_done	the task'"'"'s own component'"'"'s entries
 base::ctx::Ctx.comp_growth	the task'"'"'s own component'"'"'s entry, read between levels
 base::ctx::Ctx.comp_inlined	the task'"'"'s own component'"'"'s entry, read between levels
-middle::parallel::FN_CONSTS	the task'"'"'s own function'"'"'s list; others read its entries made in earlier phases, which never move (chunks)
-middle::parallel::FN_TEXT	the task'"'"'s own function'"'"'s entry, read at the join
 back::codecache::FN_IRH	the task'"'"'s own functions'"'"' entries; others read a lower level'"'"'s or an earlier phase'"'"'s (FN_IRH_OK)
 back::codecache::FN_IRH_OK	the same
 back::codecache::FN_STRS	the same
@@ -82,8 +80,6 @@ base::diag::ERR_POISONED	the IR printers (one thread)'
 
 # The join's writes that task code touches: static <TAB> why it is no race
 JOINED='base::BUFS	the join writes the program'"'"'s buffers'"'"' entries, a task its context'"'"'s
-middle::parallel::FN_CONSTS	the join numbers the joined function'"'"'s constants, which no running task reads
-middle::parallel::FN_TEXT	the join takes the joined function'"'"'s text, its task done
 base::BUF_COUNT	asm_error, which exits
 base::BUF_CAP	asm_error, which exits
 base::STRESS_GROW	read by prepare_tasks (stress_grow)
@@ -276,8 +272,8 @@ base::ctx::Ctx.comp_inlined	own: an output
 base::ctx::Ctx.comp_level	read: R_STATIC (ready)
 base::ctx::Ctx.comp_of	read: R_STATIC (ready)
 base::ctx::Ctx.comp_start	key: the component'"'"'s functions
-middle::parallel::FN_CONSTS	IR: constant data by owner, place and bytes (const_canon); outputs
-middle::parallel::FN_TEXT	own: an output
+base::ctx::Ctx.fn_consts	IR: constant data by owner, place and bytes (const_canon); outputs (0.29: each function'"'"'s list behind its own lock)
+base::ctx::Ctx.fn_texts	own: an output (0.29: each function'"'"'s text behind its own lock)
 base::ctx::Ctx.fresh_contexts	key: options_hash (cc_args: $VOLE_FRESH_CONTEXTS)
 base::ctx::Ctx.parallel_items	own: the task'"'"'s function
 base::ctx::Ctx.profile_max	off: --profile-use (and options_hash)

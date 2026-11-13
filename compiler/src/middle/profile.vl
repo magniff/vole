@@ -25,8 +25,8 @@
 // blocks keep them (scaled when inlining).
 
 use crate::base::{
-    IntVec, buf_byte, buf_int, buf_len, buf_new, buf_ptr, buf_slice, buf_str, buf_truncate,
-    buf_uint, buf_zeros, intern_c, sym_name,
+    buf_byte, buf_bytes, buf_int, buf_new, buf_ptr, buf_slice, buf_str, buf_uint, cstr, intern_c,
+    sym_text,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -38,12 +38,6 @@ use crate::middle::ir::{
     Op, fn_block, fn_block_count, fn_entry, ir_append, ir_enter, ir_insert_before, ir_make,
 };
 use crate::middle::ir::cfg::{succ, succ_count};
-
-extern "C" {
-    fn fopen(path: *mut u8, mode: *mut u8) -> *mut u8;
-    fn fread(buf: *mut u8, size: u64, count: u64, file: *mut u8) -> u64;
-    fn fclose(file: *mut u8) -> i32;
-}
 
 // The runtime: started first in main, it writes the profile at exit.
 pub fn profile_runtime_source(out: i64) {
@@ -174,8 +168,8 @@ fn count_block(cx: &mut FnCtx<Comp>, b: i64, k: i64, counters: i64, pcx: &Ctx<Co
     }
 }
 
-fn function_name(fi: i64, pcx: &Ctx<Comp>) -> *mut u8 {
-    unsafe { sym_name(pcx.fns[pcx.ir_fn[fi as usize] as usize].name, pcx) }
+fn function_name(fi: i64, pcx: &Ctx<Comp>) -> &'static [u8] {
+    unsafe { sym_text(pcx.fns[pcx.ir_fn[fi as usize] as usize].name, pcx) }
 }
 
 // A function's name in a profile: its spaces (a generic instance's tuple
@@ -184,12 +178,10 @@ fn name_char(c: u8) -> u8 {
     if c == b' ' { b'~' } else { c }
 }
 
-fn buf_name(out: i64, name: *mut u8) {
+fn buf_name(out: i64, name: &[u8]) {
     unsafe {
-        let mut i: i64 = 0;
-        while (*name.add(i as usize)) != 0 {
-            buf_byte(out, name_char((*name.add(i as usize))));
-            i += 1;
+        for &c in name {
+            buf_byte(out, name_char(c));
         }
     }
 }
@@ -271,7 +263,7 @@ fn instrument(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
 // ---- Reading a profile ----
 
 fn pf_char(pcx: &Ctx<Comp>) -> u8 {
-    unsafe { if pcx.pf_at < pcx.pf_len { (*pcx.pf_text.add(pcx.pf_at as usize)) } else { 0 } }
+    unsafe { if pcx.pf_at < pcx.pf_len { pcx.pf_text[pcx.pf_at as usize] } else { 0 } }
 }
 
 // The next word of the line (up to a space or the end of the line).
@@ -291,7 +283,7 @@ fn pf_number(pcx: &mut Ctx<Comp>) -> u64 {
     let n = pf_word(&mut s, pcx);
     let mut x: u64 = 0;
     for i in 0..n {
-        let c = unsafe { (*pcx.pf_text.add((s + i) as usize)) };
+        let c = unsafe { pcx.pf_text[(s + i) as usize] };
         if c >= b'0' && c <= b'9' {
             x = x * 10 + (c - b'0') as u64;
         }
@@ -306,45 +298,38 @@ fn pf_next_line(pcx: &mut Ctx<Comp>) {
     pcx.pf_at += 1;
 }
 
-// Whether the word at [s, s + n) is the C string `name` (as buf_name
-// writes it).
-fn word_is(s: i64, n: i64, name: *mut u8, pcx: &Ctx<Comp>) -> bool {
+// Whether the word at [s, s + n) is `name` (as buf_name writes it).
+fn word_is(s: i64, n: i64, name: &[u8], pcx: &Ctx<Comp>) -> bool {
     unsafe {
+        if n != name.len() as i64 {
+            return false;
+        }
         for i in 0..n {
-            if (*name.add(i as usize)) == 0
-                || (*pcx.pf_text.add((s + i) as usize)) != name_char((*name.add(i as usize))) {
+            if pcx.pf_text[(s + i) as usize] != name_char(name[i as usize]) {
                 return false;
             }
         }
-        (*name.add(n as usize)) == 0
+        true
     }
 }
 
 // --profile-use: the counts of the functions whose profile matches.
 fn annotate(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
     unsafe {
-        let file = fopen(pcx.profile_use, c"rb");
-        if file == 0 as *mut u8 {
-            report_warning(0, 1, c"profile", c"cannot read the profile: no counts used",
-                0 as *mut u8, pcx);
-            return;
-        }
-        let text = buf_new();
-        loop {
-            let at = buf_zeros(text, 65536);
-            let got = fread(buf_ptr(text).add(at as usize), 1, 65536, file);
-            buf_truncate(text, at + got as i64);
-            if got == 0 {
-                break;
+        let path = str::from_utf8(cstr(pcx.profile_use)).unwrap_or("");
+        match std::fs::read_in(path, Comp {}) {
+            Result::Ok(text) => pcx.pf_text = text,
+            Result::Err(_) => {
+                report_warning(0, 1, c"profile", c"cannot read the profile: no counts used",
+                    0 as *mut u8, pcx);
+                return;
             }
         }
-        fclose(file);
-        pcx.pf_text = buf_ptr(text);
-        pcx.pf_len = buf_len(text);
+        pcx.pf_len = pcx.pf_text.len() as i64;
         pcx.pf_at = 0;
         let mut s: i64 = 0;
         let n = pf_word(&mut s, pcx);
-        if !word_is(s, n, c"vole-profile", pcx) || pf_number(pcx) != 1 {
+        if !word_is(s, n, b"vole-profile", pcx) || pf_number(pcx) != 1 {
             report_warning(0, 2, c"profile", c"not a vole profile (version 1): no counts used",
                 0 as *mut u8, pcx);
             return;
@@ -352,11 +337,11 @@ fn annotate(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
         pf_next_line(pcx);
         // The functions, by name: (name start, length, checksum, blocks, first
         // count's position) per function.
-        let mut fns = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+        let mut fns: Vec<i64, Comp> = Vec::new_in(Comp {});
         while pcx.pf_at < pcx.pf_len {
             let mut ws: i64 = 0;
             let wn = pf_word(&mut ws, pcx);
-            if !word_is(ws, wn, c"fn", pcx) {
+            if !word_is(ws, wn, b"fn", pcx) {
                 pf_next_line(pcx);
                 continue;
             }
@@ -393,7 +378,7 @@ fn annotate(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
                 || (fns[(k + 3) as usize]) != n {
                 let message = buf_new();
                 buf_str(message, c"the profile of '");
-                buf_str(message, name);
+                buf_bytes(message, name);
                 buf_str(message, c"' is stale (the function changed since it was made): ignored");
                 buf_byte(message, 0);
                 report_warning(
