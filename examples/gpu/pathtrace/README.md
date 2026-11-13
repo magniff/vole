@@ -198,7 +198,20 @@ pixels per UI point, so the HiDPI layout can be checked without a display.
 Checks cover non-empty changing output, decreasing local pixel noise for
 progressive scenes, and exact reproduction of sample one after reset. Diagnostic
 modes intentionally have a static first-hit image and skip the noise-decrease
-assertion. `target/volec test examples/gpu/pathtrace/main.vl` runs the Vole
+assertion.
+
+Any `--samples` from 1 and any `--size` from 1x1 run, so a shader change can
+be looked at in the cheapest run there is:
+
+```sh
+./pathtrace --headless --samples 1 --size 8x8
+```
+
+The two checks that compare the first frame with the last (changing output,
+decreasing noise) need a second sample and at least 8x8 pixels: the noise of a
+smaller image goes up as often as down. Below that the run prints `progress
+skipped (...)` instead of `progress ok`, and still checks that the image is lit
+and that sample one is reproduced after a reset. `target/volec test examples/gpu/pathtrace/main.vl` runs the Vole
 state, camera-bounds, scene-switch, panel-hit and immediate-mode widget tests.
 
 ## Reproducible benchmark

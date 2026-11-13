@@ -42,7 +42,8 @@ volec -O2 examples/gpu/pathtrace/main.vl -o pathtrace     # about a second
 `--headless` needs no display: the same pipelines draw into a surface
 that is read back, the program checks its own image (`render ok`,
 `reset ok`; exit 1 when a check fails) and `--out` writes a PPM. Start
-small (few samples, a small size): a run is then well under a second.
+small: the path tracer runs from `--samples 1 --size 1x1` (its noise
+check wants 2 samples and 8x8, and says `progress skipped` under that).
 `PROG --help` lists the options; each example's README has its command
 lines:
 
