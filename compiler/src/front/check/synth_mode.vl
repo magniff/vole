@@ -66,7 +66,7 @@ use crate::front::traits::{binary_op_trait, has_impl, negation_call, operator_ca
 use crate::front::types::{
     REF_MUT, REF_SHARED, TY_BOOL, TY_F32, TY_F64, TY_I16, TY_I32, TY_I64, TY_I8, TY_ISIZE, TY_NEVER,
     TY_U16, TY_U32, TY_U64, TY_U8, TY_UNIT, TY_USIZE, TyKind, array_of, buf_type, enum_variant,
-    err_type, find_field, find_method, get_enums, int_bits, int_max, is_compound, is_fieldless_enum,
+    err_type, find_field, find_method, int_bits, int_max, is_compound, is_fieldless_enum,
     is_integer, is_numeric, is_opaque_vector, is_pointer, is_ref, is_signed, is_vector, make_type,
     mut_slice_of, primitive_name, ptr_to, ref_to, slice_of, struct_field, type_align, type_elem,
     type_size,
@@ -321,6 +321,28 @@ fn synth_cast(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let ref_to_raw = from > 0 && to > 0 && pcx.types[from as usize].kind == TyKind::Ptr
         && pcx.types[from as usize].b != 0 && pcx.types[to as usize].kind == TyKind::Ptr
         && pcx.types[to as usize].b == 0 && pcx.types[from as usize].a != pcx.types[to as usize].a;
+    // RULE: F29.1 (0.29: a reference casts to no integer, `p as usize` of
+    // a `p: &T`; the address is asked of a raw pointer, `p as *const T as
+    // usize`; rustc E0606)
+    if from > 0 && pcx.types[from as usize].kind == TyKind::Ptr && pcx.types[from as usize].b != 0
+        && is_integer(to) {
+        let saved_kind = pcx.err_kind;
+        pcx.err_kind = c"type.cast";
+        err_begin(pcx.nodes[operand as usize].start, pcx);
+        err_str(c"cannot cast the reference '", pcx);
+        err_type(from_ty, pcx);
+        err_str(c"' to the integer '", pcx);
+        err_type(to_ty, pcx);
+        err_str(c"'", pcx);
+        if pcx.types[from as usize].b == REF_MUT {
+            err_help(c"a reference is not a number: its address is a raw pointer's, `p as *mut T as usize`; the value it refers to is `*p`", pcx);
+        } else {
+            err_help(c"a reference is not a number: its address is a raw pointer's, `p as *const T as usize`; the value it refers to is `*p`", pcx);
+        }
+        err_end_soft(pcx);
+        pcx.err_kind = saved_kind;
+        return to_ty;
+    }
     if !is_valid_cast(from, to, pcx)
         || ref_to_raw {
         err_begin(pcx.nodes[operand as usize].start, pcx);
@@ -368,8 +390,8 @@ fn enum_cast(n: i64, operand: i64, from: i64, to: i64, pcx: &mut Ctx<Comp>) -> i
         let m = new_node(Match, start, end, pcx);
         pcx.nodes[m as usize].a = operand;
         let mark = list_begin(pcx);
-        for i in 0..(*get_enums().add(e as usize)).variant_count {
-            let v = enum_variant(e, i);
+        for i in 0..(pcx.enums[e as usize]).variant_count {
+            let v = enum_variant(e, i, pcx);
             let d = pcx.variants[v as usize].discr;
             let fits = if is_signed(from) {
                 let half = 1 << (int_bits(from) - 1) as u64;
@@ -391,7 +413,7 @@ fn enum_cast(n: i64, operand: i64, from: i64, to: i64, pcx: &mut Ctx<Comp>) -> i
             let pat = new_node(PatLit, start, end, pcx);
             pcx.nodes[pat as usize].a = value;
             let body = new_node(Path, start, end, pcx);
-            pcx.nodes[body as usize].a = (*get_enums().add(e as usize)).name;
+            pcx.nodes[body as usize].a = (pcx.enums[e as usize]).name;
             pcx.nodes[body as usize].b = pcx.variants[v as usize].name;
             let arm = new_node(Arm, start, end, pcx);
             pcx.nodes[arm as usize].a = pat;
@@ -993,7 +1015,7 @@ fn synth_field(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
             && (pcx.nodes[n as usize].p & NODE_NO_READ) == 0 {
             unsafe_op(n, U_UNION, c"reading a field of a union is unsafe", pcx);
         }
-        let fty = (*struct_field(s, field, pcx)).ty;
+        let fty = (struct_field(s, field, pcx)).ty;
         if (pcx.nodes[n as usize].p & CONV_NEW) == 0 && is_ref(fty, pcx)
             && crate::front::conv::field_is_access(s, field, pcx) {
             // (0.20) an access field: `p.q` is `*p.q`, the value it designates
@@ -1034,7 +1056,7 @@ pub fn help_near_field(s: i64, name: i64, pcx: &mut Ctx<Comp>) {
     unsafe {
         let mut near = near_to(name);
         for i in 0..pcx.structs[s as usize].field_count {
-            near.offer((*struct_field(s, i, pcx)).name, pcx);
+            near.offer((struct_field(s, i, pcx)).name, pcx);
         }
         near.help(pcx);
     }
@@ -1439,6 +1461,11 @@ pub fn require_op_bound(n: i64, e: i64, op: Tok, assign: bool, pcx: &mut Ctx<Com
 // The type of binary node n (operator op, not a shift), whose operands are
 // checked, of type ty.
 pub fn binary_result(n: i64, op: Tok, ty: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    // RULE: F18.6 (0.29: the operands' type may be a variable the other
+    // operand solved, `v[0] == 3` of a list nothing else types: the
+    // operator is asked of the solution, not of the variable, which has no
+    // operators and was "equality requires ..., got '_'")
+    let ty = crate::front::check::infer::resolve(ty, pcx);
     unsafe {
         let lhs = pcx.nodes[n as usize].b;
         let rhs = pcx.nodes[n as usize].c;
@@ -1481,26 +1508,30 @@ pub fn binary_result(n: i64, op: Tok, ty: i64, pcx: &mut Ctx<Comp>) -> i64 {
             // 0.4: fieldless enums are ordered by declaration, which must be
             // the order of their discriminants; compared as their tags.
             let e = pcx.types[ty as usize].a;
-            for i in 1..(*get_enums().add(e as usize)).variant_count {
-                if pcx.variants[enum_variant(e, i) as usize].discr
-                    <= pcx.variants[enum_variant(e, i - 1) as usize].discr {
+            for i in 1..(pcx.enums[e as usize]).variant_count {
+                if pcx.variants[enum_variant(e, i, pcx) as usize].discr
+                    <= pcx.variants[enum_variant(e, i - 1, pcx) as usize].discr {
                     err_begin(pcx.nodes[n as usize].start, pcx);
                     err_str(c"'", pcx);
-                    err_sym((*get_enums().add(e as usize)).name, pcx);
+                    err_sym((pcx.enums[e as usize]).name, pcx);
                     err_str(c"' cannot be ordered: its discriminants do not increase in declaration order", pcx);
                     err_end(pcx);
                 }
             }
             pcx.nodes[n as usize].b = cast_node(pcx.nodes[n as usize].b,
-                (*get_enums().add(e as usize)).tag, pcx);
+                (pcx.enums[e as usize]).tag, pcx);
             pcx.nodes[n as usize].c = cast_node(pcx.nodes[n as usize].c,
-                (*get_enums().add(e as usize)).tag, pcx);
+                (pcx.enums[e as usize]).tag, pcx);
             synth_expr(pcx.nodes[n as usize].b, pcx);
             synth_expr(pcx.nodes[n as usize].c, pcx);
             return TY_BOOL;
         }
         if op == Tok::Lt || op == Tok::Gt || op == Tok::LtEq || op == Tok::GtEq {
             if !(is_numeric(ty) || is_pointer(ty, pcx)) {
+                // RULE: F18.6 (0.29: an operand whose type is not known
+                // yet, an element of a Vec nothing gave a type: the
+                // `type.infer` of the call that made it, not "got '_'")
+                crate::front::check::infer::unknown_in(ty, pcx);
                 type_error_got(n, c"comparison requires numeric type", ty, pcx);
             }
             unsigned_compare(n, op, ty, pcx);
@@ -1528,6 +1559,8 @@ pub fn binary_result(n: i64, op: Tok, ty: i64, pcx: &mut Ctx<Comp>) -> i64 {
             let bad = eq_unsupported(ty, pcx);
             if bad != 0 {
                 if bad == ty {
+                    // RULE: F18.6 (0.29: as the comparison above)
+                    crate::front::check::infer::unknown_in(ty, pcx);
                     type_error_got(n, c"equality requires numeric, bool, pointer or enum type, or a struct, tuple, array or slice of them", ty, pcx);
                 }
                 err_begin(pcx.nodes[n as usize].start, pcx);

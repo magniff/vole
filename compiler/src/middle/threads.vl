@@ -1,33 +1,49 @@
 // (0.18.1) The code generator's threads: the compiler's one binding of
 // pthreads, and its only code that runs on more than one thread without
-// a context of its own (docs/optimizer.md, "0.18.1: threads"). std's
-// concurrency is 0.21's; this is the smallest island that runs
-// middle::parallel's tasks.
+// a context of its own (docs/optimizer.md, "0.18.1: threads").
 //
-// A pool of POOL_THREADS - 1 workers beside the main thread, made at the
+// A pool of pool_threads - 1 workers beside the main thread, made at the
 // first parallel phase and kept to the end of code generation. Each
-// thread has its own FnCtx (POOL_CTX[i], made by the main thread before
-// the workers start; index 0 is the main thread's). A phase hands the
-// pool its tasks, which can all start; the threads, the main thread too,
-// take them and run them (parallel::run_task) until all are done; in a
-// joined phase (pool_run_joined) the main thread also hands each done
-// task, in order, to parallel::join_task. Everything the threads share
-// here is read and written with MUTEX held: READY, REMAINING, PHASE_KIND,
-// STOP, JOINED. A task's results (its function's IR, its text, its facts)
-// are written before its thread takes MUTEX to count it done, and read by
-// the main thread after it saw, holding MUTEX, the count reach 0 or the
-// task marked joined; the next phase's tasks are handed over under MUTEX
-// too; so they are ordered (the mutex's release and acquire). -j1, or a
-// program with few functions, makes no thread: the main thread runs every
-// task, in order.
+// thread has its own FnCtx (the pool's contexts, made by the main thread
+// before the workers start; index 0 is the main thread's). A phase hands
+// the pool its tasks, which can all start; the threads, the main thread
+// too, take them and run them (parallel::run_task) until all are done; in
+// a joined phase (pool_run_joined) the main thread also hands each done
+// task, in order, to parallel::join_task.
+//
+// (0.29) What the threads share here is the Pool, which the compilation
+// context owns (Ctx.pool) and a worker is given when it starts: its state
+// is behind std's Mutex, so a thread reaches it only with the lock held,
+// and the waits are std's Condvar. A task's results (its function's IR,
+// its text, its facts) are written before its thread takes the lock to
+// count it done, and read by the main thread after it saw, holding the
+// lock, the count reach 0 or the task marked joined; the next phase's
+// tasks are handed over under the lock too; so they are ordered (the
+// lock's release and acquire). -j1, or a program with few functions,
+// makes no thread: the main thread runs every task, in order. The
+// assembler's thread (-O0) has a queue of the same make (Ctx.asm).
+//
+// What stays raw is the boundary itself: pthread_create and pthread_join
+// (std's threads take a closure that owns what it captures, and give no
+// stack size), a thread's argument, each thread's context and the
+// compilation context a task reads (run_pooled).
 
-use crate::back::objfile::assemble_bytes;
-use crate::base::{IntVec, alloc_zeroed, die, free, set_syms_frozen};
+use std::alloc::Allocator;
+use std::sync::{Arc, Condvar, Mutex};
+
+use crate::back::objfile::{Asm, asm_new, assemble_bytes};
+use crate::base::{die, free, set_syms_frozen};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::middle::ctx::{FnCtx, fnctx_new};
 use crate::middle::parallel::{join_task, run_task};
 
+// UNSAFE: pthreads and sysconf are the C library's: std's threads take a
+// closure that owns what it captures and give no stack size (start_thread).
+// SAFETY: the declarations are POSIX's, for macOS and Linux on aarch64 and
+// x86_64: a pthread_t is 8 bytes there (a pointer, an unsigned long), an
+// int is i32, a long and a size_t are 64 bits; each call site says why its
+// arguments are what the function asks for.
 extern "C" {
     fn pthread_create(thread: *mut u64, attr: *mut u8, start: extern "C" fn(*mut u8) -> *mut u8,
         arg: *mut u8) -> i32;
@@ -35,132 +51,194 @@ extern "C" {
     fn pthread_join(thread: u64, result: *mut u8) -> i32;
     fn pthread_attr_init(attr: *mut u8) -> i32;
     fn pthread_attr_setstacksize(attr: *mut u8, size: u64) -> i32;
-    fn pthread_mutex_init(mutex: *mut u8, attr: *mut u8) -> i32;
-    fn pthread_mutex_lock(mutex: *mut u8) -> i32;
-    fn pthread_mutex_unlock(mutex: *mut u8) -> i32;
-    fn pthread_cond_init(cond: *mut u8, attr: *mut u8) -> i32;
-    fn pthread_cond_wait(cond: *mut u8, mutex: *mut u8) -> i32;
-    fn pthread_cond_broadcast(cond: *mut u8) -> i32;
+    fn pthread_attr_destroy(attr: *mut u8) -> i32;
     fn sysconf(name: i32) -> i64;
 }
 
-// Room for a pthread_mutex_t, pthread_cond_t or pthread_attr_t (64, 48
-// and 64 bytes on macOS; 48, 48 and 64 on Linux, aarch64).
-const PTHREAD_ROOM: i64 = 256;
+// Room for a pthread_attr_t (64 bytes on macOS and on Linux, aarch64 and
+// x86_64), in 8-byte words.
+const ATTR_WORDS: usize = 32;
 // A worker's stack (the main thread's is 8 MB by default; the passes
 // recurse over dominator trees and expressions).
 const STACK_SIZE: i64 = 64 * 1024 * 1024;
 
-// Each thread's context, by index (0: the main thread's tasks'): a table of
-// *mut FnCtx<Comp>, kept as C's void * as POOL_PCX below is (a static
-// holds no pointer to a type with an allocator); get_pool_ctx and
-// set_pool_ctx give it its type.
-static mut POOL_CTX: *mut u8 = 0 as *mut u8;
-// (0.26.5) The compilation context the pool's tasks read, as C's void *
-// (a static holds no pointer to a type with an allocator): run_pooled
-// lends it to a task let (a view, tools/statics/p5b-ctx.group). pool_run
-// and pool_run_joined set it to their own context before the tasks start
-// and clear it after the last is done; 0 otherwise.
-static mut POOL_PCX: *mut u8 = 0 as *mut u8;
-
-static mut MUTEX: *mut u8 = 0 as *mut u8;
-// Broadcast when tasks become ready, when a phase ends and at the stop.
-static mut WAKE: *mut u8 = 0 as *mut u8;
-static mut READY: IntVec = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-static mut REMAINING: i64 = 0;
-static mut PHASE_KIND: i64 = 0;
-static mut STOP: bool = false;
-
-// While a joined phase runs (pool_run_joined): per task, whether it is
-// done.
-static mut JOINED: *mut bool = 0 as *mut bool;
-
 // The number of processors online (sysconf), at least 1.
 pub fn processors(macos: bool) -> i64 {
-    // _SC_NPROCESSORS_ONLN
+    // UNSAFE: sysconf is the C library's; std has the count only as
+    // thread::available_parallelism, which asks for the affinity mask.
+    // SAFETY: sysconf takes a number and returns one; it reads no memory of
+    // ours (_SC_NPROCESSORS_ONLN is 58 on macOS, 84 on Linux).
     let n = unsafe { sysconf(if macos { 58 } else { 84 }) };
     if n < 1 { 1 } else { n }
+}
+
+// Starts a thread with the workers' stack: `start(arg)` runs on it. Its
+// id, or None when the system makes no thread.
+fn start_thread(start: extern "C" fn(*mut u8) -> *mut u8, arg: *mut u8) -> Option<u64> {
+    let mut attr = [0u64; ATTR_WORDS];
+    let mut id: u64 = 0;
+    // UNSAFE: pthreads is C: std's threads take a closure that owns what it
+    // captures and give no stack size, and a task's thread needs 64 MB and
+    // reaches a pool and contexts that outlive it.
+    // SAFETY: attr is room for a pthread_attr_t (ATTR_WORDS words, aligned
+    // as one), initialized by pthread_attr_init before the two calls that
+    // read it and destroyed after; id is a live u64, which pthread_create
+    // writes the thread's id to (a pthread_t is a pointer on macOS, an
+    // unsigned long on Linux: 8 bytes on both). `arg` goes to `start`
+    // unread; what it must be is start's contract with its one caller
+    // (worker_main: pool_start; asm_thread_main: asm_thread_start).
+    let rc = unsafe {
+        let a = &mut attr as *mut [u64; ATTR_WORDS] as *mut u8;
+        pthread_attr_init(a);
+        pthread_attr_setstacksize(a, STACK_SIZE as u64);
+        let rc = pthread_create(&mut id, a, start, arg);
+        pthread_attr_destroy(a);
+        rc
+    };
+    if rc != 0 { None } else { Some(id) }
+}
+
+// Waits for thread `id` (start_thread's, not joined before) to end.
+fn join_thread(id: u64) {
+    // UNSAFE: pthread_join is C (see start_thread).
+    // SAFETY: id is a thread start_thread made, joined once (pool_stop
+    // empties the list it joins; asm_thread_finish follows one
+    // asm_thread_start); no result is asked for (a null pointer, which
+    // pthread_join allows).
+    unsafe {
+        pthread_join(id, 0 as *mut u8);
+    }
+}
+
+// What the pool's threads share, behind the pool's lock.
+struct PoolState<A: Allocator> {
+    // Each thread's context, by index (0: the main thread's tasks'), made
+    // by pool_start before the workers; a worker takes the next index
+    // (`started`) when it starts. Each thread uses only its own.
+    contexts: Vec<*mut FnCtx<A>, A>,
+    started: i64,
+    // The phase's tasks not yet taken (the last is taken first), how many
+    // are not done, and its kind.
+    ready: Vec<i64, A>,
+    remaining: i64,
+    phase_kind: i64,
+    stop: bool,
+    // While a joined phase runs (pool_run_joined): per task, whether it is
+    // done.
+    joining: bool,
+    joined: Vec<bool, A>,
+    // (0.26.5) The compilation context the phase's tasks read: run_pooled
+    // lends it to a task. pool_run and pool_run_joined set it to their own
+    // context before the tasks start and clear it after the last is done;
+    // null otherwise.
+    view: *const Ctx<A>,
+}
+
+pub struct Pool<A: Allocator> {
+    state: Mutex<PoolState<A>>,
+    // Notified when tasks become ready, when a task of a joined phase is
+    // done, when a phase ends and at the stop.
+    wake: Condvar,
+}
+
+// A pool with no thread and no context yet (the compilation context's,
+// from its start: pool_start fills it).
+pub fn pool_new() -> Arc<Pool<Comp>, Comp> {
+    Arc::new_in(Pool {
+        state: Mutex::new(PoolState {
+            contexts: Vec::new_in(Comp {}), started: 0, ready: Vec::new_in(Comp {}), remaining: 0,
+            phase_kind: 0, stop: false, joining: false, joined: Vec::new_in(Comp {}),
+            view: 0 as *const Ctx<Comp>,
+        }),
+        wake: Condvar::new(),
+    }, Comp {})
 }
 
 // Makes the contexts of `threads` threads and starts the workers (none
 // for 1). Main thread only, before the first phase.
 pub fn pool_start(threads: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        pcx.pool_threads = threads;
-        pcx.pool_contexts = threads;
-        set_stop(false);
-        set_pool_ctx(alloc_zeroed(threads * 8) as *mut *mut FnCtx<Comp>);
+    pcx.pool_threads = threads;
+    pcx.pool_contexts = threads;
+    let pool = pcx.pool.clone();
+    {
+        let mut st = pool.state.lock().unwrap();
+        st.stop = false;
+        st.started = 0;
+        st.contexts.clear();
         for i in 0..threads {
-            (*get_pool_ctx().add(i as usize)) = fnctx_new();
+            st.contexts.push(fnctx_new());
         }
-        if threads == 1 {
-            return;
-        }
-        set_mutex(alloc_zeroed(PTHREAD_ROOM));
-        set_wake(alloc_zeroed(PTHREAD_ROOM));
-        pthread_mutex_init(get_mutex(), 0 as *mut u8);
-        pthread_cond_init(get_wake(), 0 as *mut u8);
-        let attr = alloc_zeroed(PTHREAD_ROOM);
-        pthread_attr_init(attr);
-        pthread_attr_setstacksize(attr, STACK_SIZE as u64);
-        pcx.threads = alloc_zeroed(threads * 8) as *mut u64;
-        for i in 1..threads {
-            if pthread_create(pcx.threads.add(i as usize), attr, worker_main, i as *mut u8) != 0 {
-                die(c"cannot start a code generation thread (try -j1)");
-            }
+    }
+    pcx.threads.clear();
+    for i in 1..threads {
+        // (the worker's argument: the pool, which the context's Arc keeps
+        // for as long as the process runs)
+        match start_thread(worker_main, Arc::as_ptr(&pool) as *mut u8) {
+            Some(id) => pcx.threads.push(id),
+            None => die(c"cannot start a code generation thread (try -j1)"),
         }
     }
 }
 
 // Stops the workers and waits for them. Main thread only, between phases.
 pub fn pool_stop(pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if pcx.pool_threads <= 1 {
-            return;
-        }
-        pthread_mutex_lock(get_mutex());
-        set_stop(true);
-        pthread_cond_broadcast(get_wake());
-        pthread_mutex_unlock(get_mutex());
-        for i in 1..pcx.pool_threads {
-            pthread_join((*pcx.threads.add(i as usize)), 0 as *mut u8);
-        }
-        pcx.pool_threads = 1;
+    if pcx.pool_threads <= 1 {
+        return;
     }
+    let pool = pcx.pool.clone();
+    pool.state.lock().unwrap().stop = true;
+    pool.wake.notify_all();
+    for i in 0..pcx.threads.len() {
+        join_thread(pcx.threads[i]);
+    }
+    pcx.threads.clear();
+    pcx.pool_threads = 1;
+}
+
+// The context of the pool's thread `index` (0: the main thread's tasks'),
+// or null when the pool has none: for what is summed over the contexts
+// after the phases (--vec-stats).
+pub fn pool_context(index: i64, pcx: &Ctx<Comp>) -> *mut FnCtx<Comp> {
+    let st = pcx.pool.state.lock().unwrap();
+    if index < st.contexts.len() as i64 { st.contexts[index as usize] }
+    else { 0 as *mut FnCtx<Comp> }
+}
+
+// A phase's tasks made ready (the caller holds the lock): `tasks` (the
+// last is taken first), all to do.
+fn hand_over(st: &mut PoolState<Comp>, kind: i64, tasks: &[i64], view: *const Ctx<Comp>) {
+    st.phase_kind = kind;
+    st.ready.clear();
+    st.ready.extend_from_slice(tasks);
+    st.remaining = tasks.len() as i64;
+    st.view = view;
 }
 
 // Runs a phase's tasks (all can start), the last of `tasks` first;
 // returns when all are done. With one thread the main thread runs them.
-pub fn pool_run(kind: i64, tasks: IntVec, pcx: &Ctx<Comp>) {
-    unsafe {
-        set_syms_frozen(true);
-        // (the tasks' view of the context, run_pooled's: cleared below,
-        // when they are all done)
-        set_pool_pcx(pcx as *mut Ctx<Comp> as *mut u8);
-        if pcx.pool_threads == 1 {
-            let mut i = tasks.len() as i64;
-            while i > 0 {
-                i -= 1;
-                run_task((*get_pool_ctx().add(0)), kind, (tasks[i as usize]), pcx);
-            }
-            set_syms_frozen(false);
-            set_pool_pcx(0 as *mut u8);
-            return;
+pub fn pool_run(kind: i64, tasks: &[i64], pcx: &Ctx<Comp>) {
+    set_syms_frozen(true);
+    let pool = pcx.pool.clone();
+    if pcx.pool_threads == 1 {
+        let cx = pool_context(0, pcx);
+        let mut i = tasks.len();
+        while i > 0 {
+            i -= 1;
+            run_task(cx, kind, tasks[i], pcx);
         }
-        pthread_mutex_lock(get_mutex());
-        set_phase_kind(kind);
-        { let mut ready_copy = get_ready(); ready_copy.clear(); set_ready(ready_copy); }
-        for i in 0..tasks.len() as i64 {
-            { let mut ready_copy = get_ready(); ready_copy.push((tasks[i as usize]));
-                set_ready(ready_copy); }
-        }
-        set_remaining(tasks.len() as i64);
-        pthread_cond_broadcast(get_wake());
-        take_tasks(0);
-        pthread_mutex_unlock(get_mutex());
         set_syms_frozen(false);
-        set_pool_pcx(0 as *mut u8);
+        return;
     }
+    // (the tasks' view of the context, run_pooled's: cleared below, when
+    // they are all done)
+    {
+        let mut st = pool.state.lock().unwrap();
+        hand_over(&mut *st, kind, tasks, pcx as *const Ctx<Comp>);
+    }
+    pool.wake.notify_all();
+    take_tasks(&pool, 0);
+    pool.state.lock().unwrap().view = 0 as *const Ctx<Comp>;
+    set_syms_frozen(false);
 }
 
 // Runs a phase's tasks as pool_run does, task i being ITEMS' position i
@@ -171,566 +249,229 @@ pub fn pool_run(kind: i64, tasks: IntVec, pcx: &Ctx<Comp>) {
 // itself, if one is left. Returns the first task not joined: join_task
 // may refuse one (it must wait for the phase's end), and the rest are the
 // caller's to join after.
-pub fn pool_run_joined(kind: i64, tasks: IntVec, first: i64, end: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        set_syms_frozen(true);
-        // (the tasks' view of the context, run_pooled's: cleared below,
-        // when they are all done)
-        set_pool_pcx(pcx as *mut Ctx<Comp> as *mut u8);
-        pthread_mutex_lock(get_mutex());
-        set_phase_kind(kind);
-        { let mut ready_copy = get_ready(); ready_copy.clear(); set_ready(ready_copy); }
-        for i in 0..tasks.len() as i64 {
-            { let mut ready_copy = get_ready(); ready_copy.push((tasks[i as usize]));
-                set_ready(ready_copy); }
-        }
-        set_remaining(tasks.len() as i64);
-        set_joined(alloc_zeroed(end + 1) as *mut bool);
-        pthread_cond_broadcast(get_wake());
-        let mut next = first;
-        let mut joining = true;
-        while joining && next < end {
-            if (*get_joined().add(next as usize)) {
-                // (its task wrote its results before it took MUTEX to mark it)
-                pthread_mutex_unlock(get_mutex());
-                joining = join_task(next, pcx);
-                pthread_mutex_lock(get_mutex());
-                if joining {
-                    next += 1;
-                }
-            } else if get_ready().len() as i64 > 0 {
-                let task = {
-                    let mut ready_copy = get_ready(); let r_copy = ready_copy.pop();
-                    set_ready(ready_copy); r_copy
-                };
-                pthread_mutex_unlock(get_mutex());
-                run_task((*get_pool_ctx().add(0)), kind, task, pcx);
-                pthread_mutex_lock(get_mutex());
-                set_remaining(get_remaining() - (1));
-                (*get_joined().add(task as usize)) = true;
-                pthread_cond_broadcast(get_wake());
-            } else {
-                pthread_cond_wait(get_wake(), get_mutex());
+pub fn pool_run_joined(kind: i64, tasks: &[i64], first: i64, end: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    set_syms_frozen(true);
+    let pool = pcx.pool.clone();
+    let cx = pool_context(0, pcx);
+    // (the tasks' view of the context, run_pooled's: cleared below, when
+    // they are all done)
+    let mut st = pool.state.lock().unwrap();
+    st.joined.clear();
+    st.joined.resize((end + 1) as usize, false);
+    st.joining = true;
+    hand_over(&mut *st, kind, tasks, pcx as *const Ctx<Comp>);
+    pool.wake.notify_all();
+    let mut next = first;
+    let mut joining = true;
+    while joining && next < end {
+        if st.joined[next as usize] {
+            // (its task wrote its results before it took the lock to mark it)
+            drop(st);
+            joining = join_task(next, pcx);
+            st = pool.state.lock().unwrap();
+            if joining {
+                next += 1;
             }
+        } else if st.ready.len() > 0 {
+            let task = st.ready.pop().unwrap();
+            drop(st);
+            run_task(cx, kind, task, pcx);
+            st = pool.state.lock().unwrap();
+            st.remaining -= 1;
+            st.joined[task as usize] = true;
+            pool.wake.notify_all();
+        } else {
+            st = pool.wake.wait(st).unwrap();
         }
-        // (the tasks left, refused by the join: done by every thread)
-        pthread_mutex_unlock(get_mutex());
-        loop {
-            pthread_mutex_lock(get_mutex());
-            if get_ready().len() as i64 == 0 {
-                break;
-            }
-            let task = {
-                let mut ready_copy = get_ready(); let r_copy = ready_copy.pop();
-                set_ready(ready_copy); r_copy
-            };
-            pthread_mutex_unlock(get_mutex());
-            run_task((*get_pool_ctx().add(0)), kind, task, pcx);
-            pthread_mutex_lock(get_mutex());
-            set_remaining(get_remaining() - (1));
-            (*get_joined().add(task as usize)) = true;
-            pthread_cond_broadcast(get_wake());
-            pthread_mutex_unlock(get_mutex());
-        }
-        while get_remaining() > 0 {
-            pthread_cond_wait(get_wake(), get_mutex());
-        }
-        free(get_joined() as *mut u8);
-        set_joined(0 as *mut bool);
-        pthread_mutex_unlock(get_mutex());
-        set_syms_frozen(false);
-        set_pool_pcx(0 as *mut u8);
-        next
     }
+    // (the tasks left, refused by the join: done by every thread)
+    while st.ready.len() > 0 {
+        let task = st.ready.pop().unwrap();
+        drop(st);
+        run_task(cx, kind, task, pcx);
+        st = pool.state.lock().unwrap();
+        st.remaining -= 1;
+        st.joined[task as usize] = true;
+        pool.wake.notify_all();
+    }
+    while st.remaining > 0 {
+        st = pool.wake.wait(st).unwrap();
+    }
+    st.joining = false;
+    st.joined.clear();
+    st.view = 0 as *const Ctx<Comp>;
+    drop(st);
+    set_syms_frozen(false);
+    next
 }
 
 // Task `task` of a phase of kind `kind`, on the pool's thread context
 // cx, given the pool's view of the compilation context.
-fn run_pooled(cx: *mut FnCtx<Comp>, kind: i64, task: i64) {
+fn run_pooled(cx: *mut FnCtx<Comp>, kind: i64, task: i64, view: *const Ctx<Comp>) {
     // UNSAFE: a worker thread has no parameter to be lent the compilation
     // context through: pthread_create passes only a void *, and the pool's
     // threads outlive one phase, so the context of the phase that runs is
-    // reached through POOL_PCX.
-    // SAFETY: POOL_PCX is set while a phase's tasks run, to the context of
-    // the pool_run or pool_run_joined that started them, which waits for
-    // all of them before it clears it and returns: it points to a live
-    // Ctx<Comp>. The task takes it let and writes nothing through it; the
-    // main thread does not change it while the tasks run either: pool_run
-    // holds it let, and pool_run_joined changes it only in join_task, whose
-    // writes are of fields no running task touches (tests/threads_writes.sh,
-    // JOINED). So no task reads a field while it changes.
+    // reached through the pool's view.
+    // SAFETY: the view was read under the pool's lock with the task (a
+    // task is ready only between hand_over, which sets the view, and the
+    // phase's end), and is the context of the pool_run or pool_run_joined
+    // that started the phase, which waits for all its tasks before it
+    // clears the view and returns: it points to a live Ctx<Comp>. The task
+    // takes it `&` and writes nothing through it; the main thread does not
+    // change it while the tasks run either: pool_run holds it `&`, and
+    // pool_run_joined changes it only in join_task, whose writes are of
+    // fields no running task touches (tests/threads_writes.sh, JOINED). So
+    // no task reads a field while it changes.
     unsafe {
-        run_task(cx, kind, task, &*(get_pool_pcx() as *mut Ctx<Comp>));
+        run_task(cx, kind, task, &*view);
     }
 }
 
-// A thread's loop over the ready tasks, MUTEX held (released while a
-// task runs). The main thread (index 0) returns when the phase is done;
-// a worker when the pool stops.
-fn take_tasks(index: i64) {
-    unsafe {
-        let cx = (*get_pool_ctx().add(index as usize));
-        loop {
-            while get_ready().len() as i64 == 0 && !(index == 0 && get_remaining() == 0)
-                && !get_stop() {
-                pthread_cond_wait(get_wake(), get_mutex());
-            }
-            if get_ready().len() as i64 == 0 {
-                return;
-            }
-            let task = {
-                let mut ready_copy = get_ready(); let r_copy = ready_copy.pop();
-                set_ready(ready_copy); r_copy
-            };
-            let kind = get_phase_kind();
-            pthread_mutex_unlock(get_mutex());
-            run_pooled(cx, kind, task);
-            pthread_mutex_lock(get_mutex());
-            set_remaining(get_remaining() - (1));
-            if get_joined() != 0 as *mut bool {
-                (*get_joined().add(task as usize)) = true;
-                pthread_cond_broadcast(get_wake());
-            } else if get_remaining() == 0 {
-                pthread_cond_broadcast(get_wake());
-            }
+// A thread's loop over the ready tasks. The main thread (index 0)
+// returns when the phase is done; a worker when the pool stops.
+fn take_tasks(pool: &Pool<Comp>, index: i64) {
+    let mut st = pool.state.lock().unwrap();
+    let cx = st.contexts[index as usize];
+    loop {
+        while st.ready.len() == 0 && !(index == 0 && st.remaining == 0) && !st.stop {
+            st = pool.wake.wait(st).unwrap();
+        }
+        if st.ready.len() == 0 {
+            return;
+        }
+        let task = st.ready.pop().unwrap();
+        let kind = st.phase_kind;
+        let view = st.view;
+        drop(st);
+        run_pooled(cx, kind, task, view);
+        st = pool.state.lock().unwrap();
+        st.remaining -= 1;
+        if st.joining {
+            st.joined[task as usize] = true;
+            pool.wake.notify_all();
+        } else if st.remaining == 0 {
+            pool.wake.notify_all();
         }
     }
 }
 
-// A worker thread: its index is its argument.
+// A worker thread: its argument is the pool.
 extern "C" fn worker_main(arg: *mut u8) -> *mut u8 {
-    unsafe {
-        pthread_mutex_lock(get_mutex());
-        take_tasks(arg as i64);
-        pthread_mutex_unlock(get_mutex());
-    }
+    // UNSAFE: a thread's argument is C's void *.
+    // SAFETY: pool_start, the one caller that starts this function, passes
+    // Arc::as_ptr of the compilation context's pool: a live Pool<Comp>,
+    // which the context's Arc keeps until the process ends (the context is
+    // not dropped while a worker runs: pool_stop joins them); the pool is
+    // shared `&`, its state behind its lock.
+    let pool = unsafe { &*(arg as *const Pool<Comp>) };
+    let index = {
+        let mut st = pool.state.lock().unwrap();
+        st.started += 1;
+        st.started
+    };
+    take_tasks(pool, index);
     0 as *mut u8
 }
 
 // ---- The assembler's thread ----
 
-static mut A_MUTEX: *mut u8 = 0 as *mut u8;
-static mut A_WAKE: *mut u8 = 0 as *mut u8;
-static mut A_QUEUE: IntVec = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-static mut A_HEAD: i64 = 0;
-static mut A_STOP: bool = false;
-// (a *mut FnCtx<Comp>, kept as C's void * as POOL_CTX is)
-static mut A_CTX: *mut u8 = 0 as *mut u8;
+// A text for the assembler: text[0..n], malloc'd; the thread frees it.
+#[derive(Clone, Copy)] struct AsmText { text: *mut u8, n: i64 }
 
-pub fn asm_thread_start(pcx: &mut Ctx<Comp>) {
-    unsafe {
-        set_a_ctx(fnctx_new());
-        // (the growth mode, read once, before the thread reads it)
-        crate::base::stress_grow();
-        set_a_mutex(alloc_zeroed(PTHREAD_ROOM));
-        set_a_wake(alloc_zeroed(PTHREAD_ROOM));
-        pthread_mutex_init(get_a_mutex(), 0 as *mut u8);
-        pthread_cond_init(get_a_wake(), 0 as *mut u8);
-        { let mut a_queue_copy = get_a_queue(); a_queue_copy.clear(); set_a_queue(a_queue_copy); }
-        set_a_head(0);
-        set_a_stop(false);
-        let attr = alloc_zeroed(PTHREAD_ROOM);
-        pthread_attr_init(attr);
-        pthread_attr_setstacksize(attr, STACK_SIZE as u64);
-        if pthread_create(&mut pcx.a_thread, attr, asm_thread_main, 0 as *mut u8) != 0 {
-            die(c"cannot start the assembler's thread (try -j1)");
-        }
+struct AsmState<A: Allocator> {
+    // The texts handed over, in order; `head` are taken.
+    queue: Vec<AsmText, A>,
+    head: usize,
+    stop: bool,
+}
+
+pub struct AsmThread<A: Allocator> {
+    state: Mutex<AsmState<A>>,
+    wake: Condvar,
+    // The assembler (its state, the object begun by asm_stream_begin),
+    // lent by the main thread's context while the thread runs
+    // (asm_thread_start, asm_thread_finish); the thread holds its lock for
+    // as long as it runs.
+    assembler: Mutex<Asm<A>>,
+}
+
+pub fn asm_thread_new() -> Arc<AsmThread<Comp>, Comp> {
+    Arc::new_in(AsmThread {
+        state: Mutex::new(AsmState {
+            queue: Vec::new_in(Comp {}), head: 0, stop: false,
+        }),
+        wake: Condvar::new(),
+        assembler: Mutex::new(asm_new()),
+    }, Comp {})
+}
+
+pub fn asm_thread_start(pcx: &mut Ctx<Comp>, cx: &mut FnCtx<Comp>) {
+    let asm = pcx.asm.clone();
+    // (0.29) The assembler is lent to the thread: until asm_thread_finish
+    // the main thread's context holds an empty one.
+    std::mem::swap(&mut cx.assembler, &mut *asm.assembler.lock().unwrap());
+    {
+        let mut st = asm.state.lock().unwrap();
+        st.queue.clear();
+        st.head = 0;
+        st.stop = false;
+    }
+    // (the growth mode, read once, before the thread reads it)
+    crate::base::stress_grow();
+    // (the thread's argument: its queue, which the context's Arc keeps)
+    match start_thread(asm_thread_main, Arc::as_ptr(&asm) as *mut u8) {
+        Some(id) => pcx.a_thread = id,
+        None => die(c"cannot start the assembler's thread (try -j1)"),
     }
 }
 
 // Hands text[0..n] (malloc'd; the thread frees it) to the assembler.
-pub fn asm_thread_push(text: *mut u8, n: i64) {
-    unsafe {
-        pthread_mutex_lock(get_a_mutex());
-        { let mut a_queue_copy = get_a_queue(); a_queue_copy.push(text as i64);
-            set_a_queue(a_queue_copy); }
-        { let mut a_queue_copy = get_a_queue(); a_queue_copy.push(n); set_a_queue(a_queue_copy); }
-        pthread_cond_broadcast(get_a_wake());
-        pthread_mutex_unlock(get_a_mutex());
-    }
+pub fn asm_thread_push(text: *mut u8, n: i64, pcx: &Ctx<Comp>) {
+    pcx.asm.state.lock().unwrap().queue.push(AsmText { text: text, n: n });
+    pcx.asm.wake.notify_all();
 }
 
 // Waits until the assembler has taken every text, and stops it.
-pub fn asm_thread_finish(pcx: &Ctx<Comp>) {
-    unsafe {
-        pthread_mutex_lock(get_a_mutex());
-        set_a_stop(true);
-        pthread_cond_broadcast(get_a_wake());
-        pthread_mutex_unlock(get_a_mutex());
-        pthread_join(pcx.a_thread, 0 as *mut u8);
-    }
+pub fn asm_thread_finish(pcx: &Ctx<Comp>, cx: &mut FnCtx<Comp>) {
+    pcx.asm.state.lock().unwrap().stop = true;
+    pcx.asm.wake.notify_all();
+    join_thread(pcx.a_thread);
+    // (the thread has ended: the assembler is the main thread's again)
+    std::mem::swap(&mut cx.assembler, &mut *pcx.asm.assembler.lock().unwrap());
 }
 
+// The assembler's thread: its argument is its queue.
 extern "C" fn asm_thread_main(arg: *mut u8) -> *mut u8 {
-    unsafe {
-        pthread_mutex_lock(get_a_mutex());
-        loop {
-            while get_a_head() == get_a_queue().len() as i64 && !get_a_stop() {
-                pthread_cond_wait(get_a_wake(), get_a_mutex());
-            }
-            if get_a_head() == get_a_queue().len() as i64 {
-                break;
-            }
-            let text = (get_a_queue()[get_a_head() as usize]) as *mut u8;
-            let n = (get_a_queue()[(get_a_head() + 1) as usize]);
-            set_a_head(get_a_head() + (2));
-            pthread_mutex_unlock(get_a_mutex());
-            assemble_bytes(&mut *get_a_ctx(), text, n);
-            free(text);
-            pthread_mutex_lock(get_a_mutex());
+    // UNSAFE: a thread's argument is C's void *.
+    // SAFETY: asm_thread_start, the one caller that starts this function,
+    // passes Arc::as_ptr of the compilation context's queue: a live
+    // AsmThread<Comp>, kept by the context's Arc while the thread runs
+    // (asm_thread_finish joins it); it is shared `&`, its state behind its
+    // lock.
+    let asm = unsafe { &*(arg as *const AsmThread<Comp>) };
+    let mut assembler = asm.assembler.lock().unwrap();
+    let mut st = asm.state.lock().unwrap();
+    loop {
+        while st.head == st.queue.len() && !st.stop {
+            st = asm.wake.wait(st).unwrap();
         }
-        pthread_mutex_unlock(get_a_mutex());
+        if st.head == st.queue.len() {
+            break;
+        }
+        let t = st.queue[st.head];
+        st.head += 1;
+        drop(st);
+        // UNSAFE: a handed-over text is raw: the code generator's copy, a
+        // block from C's allocator sized by the caller.
+        // SAFETY: t.text is asm_hand_over's block of t.n + 1 bytes, the
+        // first t.n written, which only this thread has after the push: the
+        // slice of t.n bytes lives for the call, and the block is freed
+        // once, after it.
+        unsafe {
+            assemble_bytes(std::slice::from_raw_parts(t.text, t.n as usize), &mut *assembler);
+            free(t.text);
+        }
+        st = asm.state.lock().unwrap();
     }
     0 as *mut u8
-}
-
-// (0.28.0) POOL_CTX's accessors: every use of it is one of them.
-pub fn get_pool_ctx() -> *mut *mut FnCtx<Comp> {
-    // UNSAFE: the per-thread context table, a process-wide static mut the
-    // main thread and the workers read; Rust has no safe access to a static
-    // mut
-    // SAFETY: the pointer and its elements are written only by pool_start
-    // on the main thread before pthread_create starts the workers (create
-    // orders them before the workers' reads); after that the table is only
-    // read: worker i reads POOL_CTX[i], the main thread POOL_CTX[0]
-    // (pool_run, pool_run_joined) and every entry in vec_stat after the
-    // phases; each thread uses only its own FnCtx, so no two threads hold
-    // the same context mutably
-    unsafe { POOL_CTX as *mut *mut FnCtx<Comp> }
-}
-
-pub fn set_pool_ctx(v: *mut *mut FnCtx<Comp>) {
-    // UNSAFE: the per-thread context table, a process-wide static mut the
-    // main thread and the workers read; Rust has no safe access to a static
-    // mut
-    // SAFETY: the pointer and its elements are written only by pool_start
-    // on the main thread before pthread_create starts the workers (create
-    // orders them before the workers' reads); after that the table is only
-    // read: worker i reads POOL_CTX[i], the main thread POOL_CTX[0]
-    // (pool_run, pool_run_joined) and every entry in vec_stat after the
-    // phases; each thread uses only its own FnCtx, so no two threads hold
-    // the same context mutably
-    unsafe {
-        POOL_CTX = v as *mut u8;
-    }
-}
-
-// (0.28.0) POOL_PCX's accessors: every use of it is one of them.
-fn get_pool_pcx() -> *mut u8 {
-    // UNSAFE: the phase's compilation context, published to the workers
-    // through a process-wide static mut; Rust has no safe access to a
-    // static mut
-    // SAFETY: written only by the main thread: set by
-    // pool_run/pool_run_joined before it takes MUTEX to fill READY, cleared
-    // after it saw REMAINING reach 0 holding MUTEX; a worker reads it only
-    // in run_pooled for a task it popped from READY holding MUTEX, so the
-    // set happens-before (mutex release/acquire) every read, and every read
-    // happens-before the main thread's acquire that sees the count 0, which
-    // precedes the clear
-    unsafe { POOL_PCX }
-}
-
-fn set_pool_pcx(v: *mut u8) {
-    // UNSAFE: the phase's compilation context, published to the workers
-    // through a process-wide static mut; Rust has no safe access to a
-    // static mut
-    // SAFETY: written only by the main thread: set by
-    // pool_run/pool_run_joined before it takes MUTEX to fill READY, cleared
-    // after it saw REMAINING reach 0 holding MUTEX; a worker reads it only
-    // in run_pooled for a task it popped from READY holding MUTEX, so the
-    // set happens-before (mutex release/acquire) every read, and every read
-    // happens-before the main thread's acquire that sees the count 0, which
-    // precedes the clear
-    unsafe {
-        POOL_PCX = v;
-    }
-}
-
-// (0.28.0) MUTEX's accessors: every use of it is one of them.
-fn get_mutex() -> *mut u8 {
-    // UNSAFE: the pool's mutex handle, a process-wide static mut the main
-    // thread and the workers read; Rust has no safe access to a static mut
-    // SAFETY: written once, by pool_start on the main thread
-    // (parallel_begin, once per process from optimize_program) before it
-    // starts any worker with pthread_create, which orders the write before
-    // every worker's read; never written again, so every later access is a
-    // read of a value no thread changes; no &mut to it is kept
-    unsafe { MUTEX }
-}
-
-fn set_mutex(v: *mut u8) {
-    // UNSAFE: the pool's mutex handle, a process-wide static mut the main
-    // thread and the workers read; Rust has no safe access to a static mut
-    // SAFETY: written once, by pool_start on the main thread
-    // (parallel_begin, once per process from optimize_program) before it
-    // starts any worker with pthread_create, which orders the write before
-    // every worker's read; never written again, so every later access is a
-    // read of a value no thread changes; no &mut to it is kept
-    unsafe {
-        MUTEX = v;
-    }
-}
-
-// (0.28.0) WAKE's accessors: every use of it is one of them.
-fn get_wake() -> *mut u8 {
-    // UNSAFE: the pool's condition variable handle, a process-wide static
-    // mut the main thread and the workers read; Rust has no safe access to
-    // a static mut
-    // SAFETY: written once, by pool_start on the main thread before the
-    // workers' pthread_create (which orders it before their reads); never
-    // written after, only read; no &mut kept
-    unsafe { WAKE }
-}
-
-fn set_wake(v: *mut u8) {
-    // UNSAFE: the pool's condition variable handle, a process-wide static
-    // mut the main thread and the workers read; Rust has no safe access to
-    // a static mut
-    // SAFETY: written once, by pool_start on the main thread before the
-    // workers' pthread_create (which orders it before their reads); never
-    // written after, only read; no &mut kept
-    unsafe {
-        WAKE = v;
-    }
-}
-
-// (0.28.0) READY's accessors: every use of it is one of them.
-fn get_ready() -> IntVec {
-    // UNSAFE: shared pool state (the ready task list), a process-wide
-    // static mut; Rust has no safe access to a static mut
-    // SAFETY: every access (count reset, push, pop, count test) is made
-    // holding MUTEX: pool_run and pool_run_joined fill it after
-    // pthread_mutex_lock, take_tasks and pool_run_joined pop it holding
-    // MUTEX; no reference to it is kept across an unlock (the popped task
-    // is copied out)
-    unsafe { READY }
-}
-
-fn set_ready(v: IntVec) {
-    // UNSAFE: shared pool state (the ready task list), a process-wide
-    // static mut; Rust has no safe access to a static mut
-    // SAFETY: every access (count reset, push, pop, count test) is made
-    // holding MUTEX: pool_run and pool_run_joined fill it after
-    // pthread_mutex_lock, take_tasks and pool_run_joined pop it holding
-    // MUTEX; no reference to it is kept across an unlock (the popped task
-    // is copied out)
-    unsafe {
-        READY = v;
-    }
-}
-
-// (0.28.0) REMAINING's accessors: every use of it is one of them.
-fn get_remaining() -> i64 {
-    // UNSAFE: shared pool state (the phase's undone count), a process-wide
-    // static mut; Rust has no safe access to a static mut
-    // SAFETY: every read and write holds MUTEX (pool_run, pool_run_joined,
-    // take_tasks); the decrement follows the task's run, so the task's
-    // writes happen-before the main thread's read of 0
-    unsafe { REMAINING }
-}
-
-fn set_remaining(v: i64) {
-    // UNSAFE: shared pool state (the phase's undone count), a process-wide
-    // static mut; Rust has no safe access to a static mut
-    // SAFETY: every read and write holds MUTEX (pool_run, pool_run_joined,
-    // take_tasks); the decrement follows the task's run, so the task's
-    // writes happen-before the main thread's read of 0
-    unsafe {
-        REMAINING = v;
-    }
-}
-
-// (0.28.0) PHASE_KIND's accessors: every use of it is one of them.
-fn get_phase_kind() -> i64 {
-    // UNSAFE: shared pool state, a process-wide static mut; Rust has no
-    // safe access to a static mut
-    // SAFETY: written by the main thread in pool_run/pool_run_joined only
-    // while it holds MUTEX, read by take_tasks only while MUTEX is held:
-    // every access is under MUTEX
-    unsafe { PHASE_KIND }
-}
-
-fn set_phase_kind(v: i64) {
-    // UNSAFE: shared pool state, a process-wide static mut; Rust has no
-    // safe access to a static mut
-    // SAFETY: written by the main thread in pool_run/pool_run_joined only
-    // while it holds MUTEX, read by take_tasks only while MUTEX is held:
-    // every access is under MUTEX
-    unsafe {
-        PHASE_KIND = v;
-    }
-}
-
-// (0.28.0) STOP's accessors: every use of it is one of them.
-fn get_stop() -> bool {
-    // UNSAFE: shared pool state, a process-wide static mut; Rust has no
-    // safe access to a static mut
-    // SAFETY: written by pool_start before pthread_create starts the
-    // workers and by pool_stop holding MUTEX; read only in take_tasks
-    // holding MUTEX
-    unsafe { STOP }
-}
-
-fn set_stop(v: bool) {
-    // UNSAFE: shared pool state, a process-wide static mut; Rust has no
-    // safe access to a static mut
-    // SAFETY: written by pool_start before pthread_create starts the
-    // workers and by pool_stop holding MUTEX; read only in take_tasks
-    // holding MUTEX
-    unsafe {
-        STOP = v;
-    }
-}
-
-// (0.28.0) JOINED's accessors: every use of it is one of them.
-fn get_joined() -> *mut bool {
-    // UNSAFE: shared pool state (per task, done), a process-wide static
-    // mut; Rust has no safe access to a static mut
-    // SAFETY: allocated, read, written (JOINED[task] = true) and
-    // freed/reset only holding MUTEX: pool_run_joined allocates it before
-    // the broadcast and frees it after REMAINING reached 0, both under
-    // MUTEX; take_tasks tests and writes it after relocking MUTEX
-    unsafe { JOINED }
-}
-
-fn set_joined(v: *mut bool) {
-    // UNSAFE: shared pool state (per task, done), a process-wide static
-    // mut; Rust has no safe access to a static mut
-    // SAFETY: allocated, read, written (JOINED[task] = true) and
-    // freed/reset only holding MUTEX: pool_run_joined allocates it before
-    // the broadcast and frees it after REMAINING reached 0, both under
-    // MUTEX; take_tasks tests and writes it after relocking MUTEX
-    unsafe {
-        JOINED = v;
-    }
-}
-
-// (0.28.0) A_MUTEX's accessors: every use of it is one of them.
-fn get_a_mutex() -> *mut u8 {
-    // UNSAFE: the assembler queue's mutex handle, a process-wide static
-    // mut; Rust has no safe access to a static mut
-    // SAFETY: written once by asm_thread_start before pthread_create;
-    // afterwards only read (asm_thread_push, asm_thread_finish on the main
-    // thread, asm_thread_main)
-    unsafe { A_MUTEX }
-}
-
-fn set_a_mutex(v: *mut u8) {
-    // UNSAFE: the assembler queue's mutex handle, a process-wide static
-    // mut; Rust has no safe access to a static mut
-    // SAFETY: written once by asm_thread_start before pthread_create;
-    // afterwards only read (asm_thread_push, asm_thread_finish on the main
-    // thread, asm_thread_main)
-    unsafe {
-        A_MUTEX = v;
-    }
-}
-
-// (0.28.0) A_WAKE's accessors: every use of it is one of them.
-fn get_a_wake() -> *mut u8 {
-    // UNSAFE: the assembler queue's condition variable handle, a
-    // process-wide static mut; Rust has no safe access to a static mut
-    // SAFETY: written once by asm_thread_start before pthread_create;
-    // afterwards only read
-    unsafe { A_WAKE }
-}
-
-fn set_a_wake(v: *mut u8) {
-    // UNSAFE: the assembler queue's condition variable handle, a
-    // process-wide static mut; Rust has no safe access to a static mut
-    // SAFETY: written once by asm_thread_start before pthread_create;
-    // afterwards only read
-    unsafe {
-        A_WAKE = v;
-    }
-}
-
-// (0.28.0) A_QUEUE's accessors: every use of it is one of them.
-fn get_a_queue() -> IntVec {
-    // UNSAFE: the assembler's text queue, a process-wide static mut; Rust
-    // has no safe access to a static mut
-    // SAFETY: reset by asm_thread_start before pthread_create; afterwards
-    // pushed by asm_thread_push (main) and read by asm_thread_main only
-    // while A_MUTEX is held; the entries read (text pointer, length) are
-    // copied out before the unlock, so no reference into it lives across a
-    // push's growth
-    unsafe { A_QUEUE }
-}
-
-fn set_a_queue(v: IntVec) {
-    // UNSAFE: the assembler's text queue, a process-wide static mut; Rust
-    // has no safe access to a static mut
-    // SAFETY: reset by asm_thread_start before pthread_create; afterwards
-    // pushed by asm_thread_push (main) and read by asm_thread_main only
-    // while A_MUTEX is held; the entries read (text pointer, length) are
-    // copied out before the unlock, so no reference into it lives across a
-    // push's growth
-    unsafe {
-        A_QUEUE = v;
-    }
-}
-
-// (0.28.0) A_HEAD's accessors: every use of it is one of them.
-fn get_a_head() -> i64 {
-    // UNSAFE: the assembler queue's read position, a process-wide static
-    // mut; Rust has no safe access to a static mut
-    // SAFETY: set by asm_thread_start before pthread_create; afterwards
-    // read and advanced only by asm_thread_main holding A_MUTEX
-    unsafe { A_HEAD }
-}
-
-fn set_a_head(v: i64) {
-    // UNSAFE: the assembler queue's read position, a process-wide static
-    // mut; Rust has no safe access to a static mut
-    // SAFETY: set by asm_thread_start before pthread_create; afterwards
-    // read and advanced only by asm_thread_main holding A_MUTEX
-    unsafe {
-        A_HEAD = v;
-    }
-}
-
-// (0.28.0) A_STOP's accessors: every use of it is one of them.
-fn get_a_stop() -> bool {
-    // UNSAFE: the assembler thread's stop flag, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: set false by asm_thread_start before pthread_create, set true
-    // by asm_thread_finish holding A_MUTEX; read only by asm_thread_main
-    // holding A_MUTEX
-    unsafe { A_STOP }
-}
-
-fn set_a_stop(v: bool) {
-    // UNSAFE: the assembler thread's stop flag, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: set false by asm_thread_start before pthread_create, set true
-    // by asm_thread_finish holding A_MUTEX; read only by asm_thread_main
-    // holding A_MUTEX
-    unsafe {
-        A_STOP = v;
-    }
-}
-
-// (0.28.0) A_CTX's accessors: every use of it is one of them.
-fn get_a_ctx() -> *mut FnCtx<Comp> {
-    // UNSAFE: the assembler thread's context, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: written only by asm_thread_start on the main thread before
-    // pthread_create starts the assembler thread (create orders the write
-    // before the thread's read); read only by asm_thread_main;
-    // asm_thread_start runs once per process (compile_program's -O0
-    // branch); only the assembler thread uses the FnCtx it points to
-    unsafe { A_CTX as *mut FnCtx<Comp> }
-}
-
-fn set_a_ctx(v: *mut FnCtx<Comp>) {
-    // UNSAFE: the assembler thread's context, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: written only by asm_thread_start on the main thread before
-    // pthread_create starts the assembler thread (create orders the write
-    // before the thread's read); read only by asm_thread_main;
-    // asm_thread_start runs once per process (compile_program's -O0
-    // branch); only the assembler thread uses the FnCtx it points to
-    unsafe {
-        A_CTX = v as *mut u8;
-    }
 }

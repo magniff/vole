@@ -39,8 +39,8 @@ use crate::back::codecache::pack::{
 };
 use crate::back::codecache::snapshot::{
     ByteBuf, IRCopy, Ids, Reader, Rel, bb_new, decode_ir, encode_ir, free_copy, get_bytes,
-    get_count, get_s, get_u, ids_free, put_bytes, put_s, put_u, rel_add_source, rel_clear, rel_fn,
-    rel_new, rel_rtid, rel_saddr, rel_str_source,
+    get_count, get_s, get_u, ids_free, ints_of, put_bytes, put_s, put_u, rel_add_source, rel_clear,
+    rel_fn, rel_new, rel_rtid, rel_saddr, rel_str_source, table_of,
 };
 use crate::base::{
     IntVec, alloc_array, alloc_zeroed, find_sym, free, getenv, memcpy, streq, stress_grow, strlen,
@@ -53,14 +53,10 @@ use crate::cli::line::Line;
 use crate::front::stdalloc::get_check_alloc_mode;
 use crate::middle::copies::move_copies;
 use crate::middle::ctx::FnCtx;
-use crate::middle::inline::{get_fn_deciders, get_fn_deciders_start, get_fn_rt, get_fn_size};
-use crate::middle::ipo::{get_fn_attrs, get_fn_attrs_done, get_fn_nocapture};
-use crate::middle::ir::{Block, IRTables, get_irfuncs, ints_of, ir_enter, ir_release, table_of};
-use crate::middle::opt::get_deferred;
+use crate::middle::ir::{Block, ir_enter, ir_release, ir_stored};
 use crate::middle::parallel::{
     K_COMPONENT, OWNER_SHIFT, P_CLEANUP, P_COMPONENT, P_EMIT, P_SIMPLIFY, comp_of, const_data,
-    const_data_count, const_data_entry, fn_facts_ready, get_comp_growth, get_comp_inlined,
-    get_fn_text,
+    const_data_count, const_data_entry, fn_facts_ready, get_fn_text,
 };
 use crate::tools::proc::{fork_worker, make_dirs, worker_exit};
 use crate::tools::query::cache::{cache_dir, ident};
@@ -299,7 +295,8 @@ pub fn cc_begin(pcx: &mut Ctx<Comp>) {
         pcx.program_insts = 0;
         for fi in 0..pcx.irfunc_count {
             if (pcx.fn_live[fi as usize]) != 0 {
-                pcx.program_insts += (*get_irfuncs().add(fi as usize)).t.inst_count;
+                let insts = ir_stored(fi, pcx).t.insts.len() as i64;
+                pcx.program_insts += insts;
             }
         }
         if (pcx.program_insts < MIN_INSTS && pcx.cc_flag <= 0) || !cc_wanted(pcx)
@@ -418,7 +415,7 @@ pub fn cc_phase(kind: i64, pcx: &mut Ctx<Comp>) {
                     (*get_fn_irh().add(g as usize)) = h2;
                 }
             }
-            ir_release(&mut *cx);
+            ir_release(&mut *cx, pcx);
         }
     }
 }
@@ -529,7 +526,7 @@ fn why(fi: i64, what: *mut u8, o: i64, pcx: &Ctx<Comp>) {
         }
         let reason = if o == OUT_NONE { c"new" } else if o == OUT_READ { c"read changed" }
             else if o == OUT_BAD { c"unreadable" } else { c"not cacheable" };
-        let name = crate::base::sym_name(pcx.fns[(*get_irfuncs().add(fi as usize)).f as usize].name,
+        let name = crate::base::sym_name(pcx.fns[pcx.ir_fn[fi as usize] as usize].name,
             pcx);
         eprintln(
             "code cache: {} {}: {}", str::from_utf8(&crate::base::cstr(what)).unwrap(),
@@ -629,7 +626,7 @@ fn ready(cx: &mut FnCtx<Comp>, g: i64, pcx: &Ctx<Comp>) -> bool {
         if cx.cur_comp >= 0 {
             return fn_facts_ready(cx, g, true, pcx);
         }
-        get_fn_attrs_done() != 0 as *mut i64 && (*get_fn_attrs_done().add(g as usize)) != 0
+        pcx.fn_attrs_done.len() > 0 && (pcx.fn_attrs_done.get(g)) != 0
     }
 }
 
@@ -640,36 +637,36 @@ fn fact(cx: &mut FnCtx<Comp>, kind: i64, g: i64, pcx: &Ctx<Comp>) -> i64 {
             return static_fp(cx, g, pcx) as i64;
         }
         if kind == R_SIZE {
-            return (*get_fn_size().add(g as usize));
+            return (pcx.fn_size.get(g));
         }
         if kind == R_ATTRS {
             // (0.27.1: the borrow checker's verdict decides the parameter
             // alias facts of a rust body, gvn noalias_active)
-            let f = (*get_irfuncs().add(g as usize)).f;
+            let f = pcx.ir_fn[g as usize];
             let verdict: i64 = if f >= 0 && f < pcx.borrowck_verdict.len() as i64 {
                 pcx.borrowck_verdict[f as usize]
             } else {
                 0
             };
-            return mix(mix(mix((*get_fn_attrs().add(g as usize)) as u64,
-                (*get_fn_nocapture().add(g as usize)) as u64),
-                (*get_fn_attrs_done().add(g as usize)) as u64), verdict as u64) as i64;
+            return mix(mix(mix((pcx.fn_attrs.get(g)) as u64,
+                (pcx.fn_nocapture.get(g)) as u64),
+                (pcx.fn_attrs_done.get(g)) as u64), verdict as u64) as i64;
         }
         if kind == R_RT {
-            return (*get_fn_rt().add(g as usize));
+            return (pcx.fn_rt.get(g));
         }
         if kind == R_DEC {
-            return deciders_hash(g) as i64;
+            return deciders_hash(g, pcx) as i64;
         }
         (*get_fn_irh().add(g as usize)).a as i64
     }
 }
 
-fn deciders_hash(g: i64) -> u64 {
+fn deciders_hash(g: i64, pcx: &Ctx<Comp>) -> u64 {
     unsafe {
-        let mut h: u64 = mix(0x646563, (*get_fn_deciders_start().add(g as usize)) as u64);
-        for i in 0..(*get_fn_deciders().add(g as usize)).len() as i64 {
-            h = mix(h, ((*get_fn_deciders().add(g as usize))[i as usize]) as u64);
+        let mut h: u64 = mix(0x646563, (pcx.fn_deciders_start.get(g)) as u64);
+        for i in 0..pcx.fn_deciders.count(g) {
+            h = mix(h, (pcx.fn_deciders.at(g, i)) as u64);
         }
         h
     }
@@ -692,7 +689,7 @@ fn static_fp(cx: &mut FnCtx<Comp>, g: i64, pcx: &Ctx<Comp>) -> u64 {
 fn facts_fixed(g: i64, pcx: &Ctx<Comp>) -> u64 {
     unsafe {
         let mut h: u64 = mix(
-            (pcx.fn_canon[(*get_irfuncs().add(g as usize)).f as usize]) as u64,
+            (pcx.fn_canon[pcx.ir_fn[g as usize] as usize]) as u64,
             (pcx.fn_live[g as usize]) as u64);
         if pcx.fn_address.len() > 0 {
             h = mix(h, (pcx.fn_address[g as usize]) as u64);
@@ -712,18 +709,18 @@ fn facts_fixed(g: i64, pcx: &Ctx<Comp>) -> u64 {
 fn own_fp(fi: i64, pcx: &Ctx<Comp>) -> u64 {
     unsafe {
         let mut h = facts_fixed(fi, pcx);
-        if get_fn_size() != 0 as *mut i64 {
-            h = mix(h, (*get_fn_size().add(fi as usize)) as u64);
-            h = mix(h, (*get_fn_rt().add(fi as usize)) as u64);
-            h = mix(h, deciders_hash(fi));
+        if pcx.fn_size.len() > 0 {
+            h = mix(h, (pcx.fn_size.get(fi)) as u64);
+            h = mix(h, (pcx.fn_rt.get(fi)) as u64);
+            h = mix(h, deciders_hash(fi, pcx));
         }
-        if get_fn_attrs() != 0 as *mut i64 {
-            h = mix(h, (*get_fn_attrs().add(fi as usize)) as u64);
-            h = mix(h, (*get_fn_nocapture().add(fi as usize)) as u64);
-            h = mix(h, (*get_fn_attrs_done().add(fi as usize)) as u64);
+        if pcx.fn_attrs.len() > 0 {
+            h = mix(h, (pcx.fn_attrs.get(fi)) as u64);
+            h = mix(h, (pcx.fn_nocapture.get(fi)) as u64);
+            h = mix(h, (pcx.fn_attrs_done.get(fi)) as u64);
         }
-        if get_deferred() != 0 as *mut i64 {
-            h = mix(h, (*get_deferred().add(fi as usize)) as u64);
+        if pcx.opt_deferred.len() > 0 {
+            h = mix(h, (pcx.opt_deferred.get(fi)) as u64);
         }
         h
     }
@@ -762,7 +759,7 @@ fn task_begin(cx: &mut FnCtx<Comp>, comp: i64, fi: i64, pcx: &Ctx<Comp>) -> *mut
 // symbol, what is known of it and its IR's hash.
 fn key_put_fn(k: &mut H2, fi: i64, irh: *mut H2, pcx: &Ctx<Comp>) {
     unsafe {
-        h2_puti(k, (pcx.fn_nameh[(*get_irfuncs().add(fi as usize)).f as usize]));
+        h2_puti(k, (pcx.fn_nameh[pcx.ir_fn[fi as usize] as usize]));
         h2_put(k, own_fp(fi, pcx));
         h2_put(k, (*irh).a);
         h2_put(k, (*irh).b);
@@ -818,9 +815,10 @@ fn reads_hold(cx: &mut FnCtx<Comp>, cc: &mut CcCtx, r: &mut Reader, pcx: &Ctx<Co
                         eprintln(
                             "code cache: read calls of {} changed",
                             str::from_utf8(
-                                &crate::base::cstr(crate::base::sym_name(
-                                    pcx.fns[(*get_irfuncs().add(g as usize)).f as usize].name,
-                                    pcx))).unwrap());
+                                &crate::base::cstr(
+                                    crate::base::sym_name(
+                                        pcx.fns[pcx.ir_fn[g as usize] as usize].name,
+                                        pcx))).unwrap());
                     }
                     return false;
                 }
@@ -840,7 +838,7 @@ fn reads_hold(cx: &mut FnCtx<Comp>, cc: &mut CcCtx, r: &mut Reader, pcx: &Ctx<Co
             if fact(cx, kind, g, pcx) != b {
                 if pcx.why {
                     let name = crate::base::sym_name(
-                        pcx.fns[(*get_irfuncs().add(g as usize)).f as usize].name, pcx);
+                        pcx.fns[pcx.ir_fn[g as usize] as usize].name, pcx);
                     eprintln("code cache: read {kind} of {} changed",
                         str::from_utf8(&crate::base::cstr(name)).unwrap());
                 }
@@ -1160,7 +1158,7 @@ fn mark_used(e: i64, start: i64, end: i64, pcx: &Ctx<Comp>) {
     // one entry for each (names_begin, before the tasks, read-only after).
     unsafe {
         for i in start..end {
-            if (pcx.fn_ambig[(*get_irfuncs().add((pcx.scc_order[i as usize]) as usize)).f as usize]) {
+            if (pcx.fn_ambig[pcx.ir_fn[(pcx.scc_order[i as usize]) as usize] as usize]) {
                 return;
             }
         }
@@ -1174,7 +1172,7 @@ fn mark_used_fn(e: i64, fi: i64, pcx: &Ctx<Comp>) {
     // SAFETY: fi is the task's own IR function, below IRFUNC_COUNT; its f
     // has an entry in fn_ambig (names_begin), read-only while tasks run.
     unsafe {
-        if (pcx.fn_ambig[(*get_irfuncs().add(fi as usize)).f as usize]) {
+        if (pcx.fn_ambig[pcx.ir_fn[fi as usize] as usize]) {
             return;
         }
     }
@@ -1200,7 +1198,7 @@ pub fn cc_component_begin(cx: &mut FnCtx<Comp>, c: i64, start: i64, end: i64, pc
                 ok = false;
             }
         }
-        ir_release(cx);
+        ir_release(cx, pcx);
         (*cc).key = key;
         let first = (pcx.scc_order[start as usize]);
         if !ok {
@@ -1228,19 +1226,19 @@ pub fn cc_component_begin(cx: &mut FnCtx<Comp>, c: i64, start: i64, end: i64, pc
 }
 
 // The members' facts a component's task leaves (in its entry).
-fn put_facts(b: &mut ByteBuf, fi: i64) {
+fn put_facts(b: &mut ByteBuf, fi: i64, pcx: &Ctx<Comp>) {
     unsafe {
-        put_s(b, (*get_fn_size().add(fi as usize)));
-        put_s(b, (*get_fn_rt().add(fi as usize)));
-        put_s(b, (*get_fn_deciders_start().add(fi as usize)));
-        put_u(b, (*get_fn_deciders().add(fi as usize)).len() as i64 as u64);
-        for i in 0..(*get_fn_deciders().add(fi as usize)).len() as i64 {
-            put_s(b, ((*get_fn_deciders().add(fi as usize))[i as usize]));
+        put_s(b, (pcx.fn_size.get(fi)));
+        put_s(b, (pcx.fn_rt.get(fi)));
+        put_s(b, (pcx.fn_deciders_start.get(fi)));
+        put_u(b, pcx.fn_deciders.count(fi) as u64);
+        for i in 0..pcx.fn_deciders.count(fi) {
+            put_s(b, (pcx.fn_deciders.at(fi, i)));
         }
-        put_s(b, (*get_deferred().add(fi as usize)));
-        put_s(b, (*get_fn_attrs().add(fi as usize)));
-        put_s(b, (*get_fn_nocapture().add(fi as usize)));
-        put_s(b, (*get_fn_attrs_done().add(fi as usize)));
+        put_s(b, (pcx.opt_deferred.get(fi)));
+        put_s(b, (pcx.fn_attrs.get(fi)));
+        put_s(b, (pcx.fn_nocapture.get(fi)));
+        put_s(b, (pcx.fn_attrs_done.get(fi)));
     }
 }
 
@@ -1270,7 +1268,7 @@ pub fn cc_component_end(cx: &mut FnCtx<Comp>, c: i64, start: i64, end: i64, pcx:
         for i in start..end {
             out_hash(cx, (pcx.scc_order[i as usize]), pcx);
         }
-        ir_release(cx);
+        ir_release(cx, pcx);
         if (*cc).poison {
             (*get_out_comp().add((pcx.scc_order[start as usize]) as usize)) = OUT_POISON;
             return;
@@ -1279,24 +1277,23 @@ pub fn cc_component_end(cx: &mut FnCtx<Comp>, c: i64, start: i64, end: i64, pcx:
         rel_sources(&mut *cc, irs);
         let out: *mut ByteBuf = &mut (*cc).out;
         (*out).len = 0;
-        put_s(&mut *out, (*get_comp_growth().add(c as usize)));
-        put_u(&mut *out, (*get_comp_inlined().add(c as usize)).len() as i64 as u64);
-        for m in 0..(*get_comp_inlined().add(c as usize)).len() as i64 {
+        put_s(&mut *out, (pcx.comp_growth.get(c)));
+        put_u(&mut *out, pcx.comp_inlined.count(c) as u64);
+        for m in 0..pcx.comp_inlined.count(c) {
             put_u(&mut *out,
                 rel_fn(&mut (*cc).rel,
-                    (*get_irfuncs().add(
-                        ((*get_comp_inlined().add(c as usize))[m as usize]) as usize)).f) as u64);
+                    pcx.ir_fn[(pcx.comp_inlined.at(c, m)) as usize]) as u64);
         }
         for i in start..end {
             let fi = (pcx.scc_order[i as usize]);
             ir_enter(cx, fi, pcx);
             encode_ir(cx, fi, &mut *out, &mut (*cc).rel);
-            put_facts(&mut *out, fi);
+            put_facts(&mut *out, fi, pcx);
             put_u(&mut *out, (*get_fn_irh().add(fi as usize)).a);
             put_u(&mut *out, (*get_fn_irh().add(fi as usize)).b);
             put_consts(&mut *out, fi, ((*cc).consts_before[(i - start) as usize]), start);
         }
-        ir_release(cx);
+        ir_release(cx, pcx);
         free(irs.data as *mut u8);
         if !store(&mut *cc, E_COMPONENT, (pcx.scc_order[start as usize]), pcx) {
             (*get_out_comp().add((pcx.scc_order[start as usize]) as usize)) = OUT_POISON;
@@ -1328,7 +1325,7 @@ fn check_component(cx: &mut FnCtx<Comp>, cc: &mut CcCtx, start: i64, end: i64, p
             nrtids: 0 };
         let name = crate::base::sym_name(
             pcx.fns[
-                (*get_irfuncs().add((pcx.scc_order[start as usize]) as usize)).f as usize].name,
+                pcx.ir_fn[(pcx.scc_order[start as usize]) as usize] as usize].name,
             pcx);
         if !get_tables(cc, &mut r, irs, &mut ids, pcx) {
             eprintln("code cache check: {}: tables do not read back",
@@ -1345,7 +1342,8 @@ fn check_component(cx: &mut FnCtx<Comp>, cc: &mut CcCtx, start: i64, end: i64, p
             let mut copy = IRCopy { entry: 0, result_ptr: 0,
                 blocks: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
                 slots: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
-                t: IRTables { insts: 0 as *mut crate::middle::ir::Inst, inst_count: 0, inst_cap: 0,
+                t: crate::back::codecache::snapshot::RawTables {
+                    insts: 0 as *mut crate::middle::ir::Inst, inst_count: 0, inst_cap: 0,
                     blocks: 0 as *mut u8, block_count: 0, block_cap: 0,
                     slots: 0 as *mut crate::middle::ir::Slot, slot_count: 0, slot_cap: 0,
                     args: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
@@ -1353,7 +1351,7 @@ fn check_component(cx: &mut FnCtx<Comp>, cc: &mut CcCtx, start: i64, end: i64, p
                     swcases: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
                     inst_loc: IntVec { data: 0 as *mut i64, count: 0, cap: 0 } } };
             let fname = crate::base::sym_name(
-                pcx.fns[(*get_irfuncs().add(fi as usize)).f as usize].name, pcx);
+                pcx.fns[pcx.ir_fn[fi as usize] as usize].name, pcx);
             if !decode_ir(&mut r, fi, &mut ids, &mut copy) {
                 eprintln(
                     "code cache check: {}: IR does not read back (at {} of {})",
@@ -1370,7 +1368,7 @@ fn check_component(cx: &mut FnCtx<Comp>, cc: &mut CcCtx, start: i64, end: i64, p
             free_copy(&mut copy);
             skip_facts(&mut r);
         }
-        ir_release(cx);
+        ir_release(cx, pcx);
         ids_free(ids);
         free(irs.data as *mut u8);
     }
@@ -1503,7 +1501,7 @@ fn component_install(cx: &mut FnCtx<Comp>, cc: CcCtx, r: &mut Reader, ids: &mut 
             let fi = (pcx.scc_order[(start + i) as usize]);
             install_ir(cx, fi, copies.add(i as usize), pcx);
             r.at = (*facts_at.add(i as usize));
-            get_facts(r, fi);
+            get_facts(r, fi, pcx);
             (*get_fn_irh().add(fi as usize)).a = get_u(r);
             (*get_fn_irh().add(fi as usize)).b = get_u(r);
             (*get_fn_irh_ok().add(fi as usize)) = true;
@@ -1511,10 +1509,10 @@ fn component_install(cx: &mut FnCtx<Comp>, cc: CcCtx, r: &mut Reader, ids: &mut 
             // (its strings, as hash::ir_hash lists them)
             list_strings(cx, fi);
         }
-        ir_release(cx);
-        (*get_comp_growth().add(c as usize)) = growth;
+        ir_release(cx, pcx);
+        pcx.comp_growth.set(c, growth);
         for m in 0..inlined.len() as i64 {
-            (*get_comp_inlined().add(c as usize)).push((inlined[m as usize]));
+            pcx.comp_inlined.push(c, (inlined[m as usize]));
         }
         free(copies as *mut u8);
         free(facts_at as *mut u8);
@@ -1554,20 +1552,20 @@ fn skip_facts(r: &mut Reader) {
     }
 }
 
-fn get_facts(r: &mut Reader, fi: i64) {
+fn get_facts(r: &mut Reader, fi: i64, pcx: &Ctx<Comp>) {
     unsafe {
-        (*get_fn_size().add(fi as usize)) = get_s(r);
-        (*get_fn_rt().add(fi as usize)) = get_s(r);
-        (*get_fn_deciders_start().add(fi as usize)) = get_s(r);
+        pcx.fn_size.set(fi, get_s(r));
+        pcx.fn_rt.set(fi, get_s(r));
+        pcx.fn_deciders_start.set(fi, get_s(r));
         let nd = get_count(r);
-        (*get_fn_deciders().add(fi as usize)).clear();
+        pcx.fn_deciders.clear(fi);
         for i in 0..nd {
-            (*get_fn_deciders().add(fi as usize)).push(get_s(r));
+            pcx.fn_deciders.push(fi, get_s(r));
         }
-        (*get_deferred().add(fi as usize)) = get_s(r);
-        (*get_fn_attrs().add(fi as usize)) = get_s(r);
-        (*get_fn_nocapture().add(fi as usize)) = get_s(r);
-        (*get_fn_attrs_done().add(fi as usize)) = get_s(r);
+        pcx.opt_deferred.set(fi, get_s(r));
+        pcx.fn_attrs.set(fi, get_s(r));
+        pcx.fn_nocapture.set(fi, get_s(r));
+        pcx.fn_attrs_done.set(fi, get_s(r));
     }
 }
 
@@ -1599,12 +1597,10 @@ fn replay_consts(cx: &mut FnCtx<Comp>, r: &mut Reader, fi: i64, phase: i64, rank
 fn install_ir(cx: &mut FnCtx<Comp>, fi: i64, c: *mut IRCopy, pcx: &Ctx<Comp>) {
     unsafe {
         ir_enter(cx, fi, pcx);
-        free((*get_irfuncs().add(fi as usize)).blocks.data as *mut u8);
-        free((*get_irfuncs().add(fi as usize)).slots.data as *mut u8);
-        (*get_irfuncs().add(fi as usize)).entry = (*c).entry;
-        (*get_irfuncs().add(fi as usize)).result_ptr = (*c).result_ptr;
-        (*get_irfuncs().add(fi as usize)).blocks = (*c).blocks;
-        (*get_irfuncs().add(fi as usize)).slots = (*c).slots;
+        cx.fn_entry = (*c).entry;
+        cx.fn_result_ptr = (*c).result_ptr;
+        cx.fn_blocks = ints_of((*c).blocks);
+        cx.fn_slots = ints_of((*c).slots);
         let t = (*c).t;
         cx.insts = table_of(t.insts, t.inst_count, t.inst_cap);
         cx.blocks = table_of(t.blocks as *mut Block<Comp>, t.block_count, t.block_cap);
@@ -1665,7 +1661,7 @@ pub fn cc_emit_begin(cx: &mut FnCtx<Comp>, fi: i64, task: i64, pcx: &Ctx<Comp>) 
             key_put_fn(&mut key, fi, get_fn_irh().add(fi as usize), pcx);
         } else {
             ok = hash_input(cx, &mut *cc, fi, &mut key, pcx);
-            ir_release(cx);
+            ir_release(cx, pcx);
         }
         (*get_fn_irh_ok().add(fi as usize)) = false;
         (*cc).key = key;
@@ -1890,7 +1886,7 @@ pub fn cc_scalar_begin(cx: &mut FnCtx<Comp>, fi: i64, task: i64, pcx: &Ctx<Comp>
         h2_put(&mut key, pcx.codecache_env.a);
         h2_put(&mut key, pcx.codecache_env.b);
         let ok = hash_input(cx, &mut *cc, fi, &mut key, pcx);
-        ir_release(cx);
+        ir_release(cx, pcx);
         (*cc).key = key;
         if !ok {
             (*cc).poison = true;
@@ -1975,7 +1971,7 @@ pub fn cc_scalar_end(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
         out_hash(cx, fi, pcx);
         if (*cc).poison {
             (*get_out_scalar().add(fi as usize)) = OUT_POISON;
-            ir_release(cx);
+            ir_release(cx, pcx);
             return;
         }
         let mut irs = read_irs(*cc, pcx);
@@ -1984,7 +1980,7 @@ pub fn cc_scalar_end(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
         (*out).len = 0;
         ir_enter(cx, fi, pcx);
         encode_ir(cx, fi, &mut *out, &mut (*cc).rel);
-        ir_release(cx);
+        ir_release(cx, pcx);
         put_u(&mut *out, (*get_fn_irh().add(fi as usize)).a);
         put_u(&mut *out, (*get_fn_irh().add(fi as usize)).b);
         put_consts(&mut *out, fi, ((*cc).consts_before[0]), 0);
@@ -2022,7 +2018,7 @@ fn scalar_hit(cx: &mut FnCtx<Comp>, cc: &mut CcCtx, e: i64, fi: i64, task: i64, 
                 if consts_read(&mut r) {
                     install_ir(cx, fi, copy, pcx);
                     list_strings(cx, fi);
-                    ir_release(cx);
+                    ir_release(cx, pcx);
                     (*get_fn_irh().add(fi as usize)) = H2 { a: h_a, b: h_b };
                     (*get_fn_irh_ok().add(fi as usize)) = true;
                     r.at = at;
