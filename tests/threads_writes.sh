@@ -62,23 +62,6 @@ back::codecache::pack::NEW	the task'"'"'s own slot, read when the pack is writte
 back::codecache::pack::USED	the entry of the task'"'"'s own key, read when the pack is written (0.27.8: a key is one task'"'"'s but a function'"'"'s that shares its symbol, fn_ambig, whose task does not mark it: mark_used)
 base::ctx::Ctx.pack	read only: an entry'"'"'s body is read through its address
 base::STRESS_GROW	read by prepare_tasks (stress_grow)
-middle::egraph::P_KIND	the rules, parsed by prepare_tasks (init_rules)
-middle::egraph::P_OP	the rules
-middle::egraph::P_COND	the rules
-middle::egraph::P_A	the rules
-middle::egraph::P_B	the rules
-middle::egraph::P_VAL	the rules
-middle::egraph::R_LHS	the rules
-middle::egraph::R_RHS	the rules
-middle::egraph::R_GUARD	the rules
-middle::egraph::R_VARS	the rules
-middle::egraph::RULES_READY	the rules
-middle::egraph::PT	the rules
-middle::egraph::PP	the rules
-middle::egraph::PVARS	the rules
-middle::egraph::R_VARS_NOW	the rules
-middle::egraph::R_BY_OP	the rules
-middle::egraph::R_BY_OP_START	the rules
 front::types::FIELDS	struct_field: a field'"'"'s address, read through in a task (the offsets are compute_layout'"'"'s, the main thread'"'"'s)
 front::distinct::NICHE	enum_niche: every enum'"'"'s is made before a phase (prepare_layouts)
 front::cells::FREEZE_MEMO	interior_part: every type'"'"'s Freeze fact is made before a phase (prepare_layouts), so a task only reads it (GVN'"'"'s param_class_of)
@@ -262,23 +245,7 @@ gen0::target::RT_NOTE_SYM	IR: a symbol by its text
 gen0::target::STR_ALIGN	IR: a string'"'"'s alignment (STR_H)
 base::ctx::Ctx.move_copies	IR: FN_MOVES
 base::ctx::Ctx.egraph	key: options_hash
-middle::egraph::PP	own: the rules, the same in every build of a compiler
-middle::egraph::PT	own: the same
-middle::egraph::PVARS	own: the same
-middle::egraph::P_A	own: the same
-middle::egraph::P_B	own: the same
-middle::egraph::P_COND	own: the same
-middle::egraph::P_KIND	own: the same
-middle::egraph::P_OP	own: the same
-middle::egraph::P_VAL	own: the same
-middle::egraph::RULES_READY	own: the same
-middle::egraph::R_BY_OP	own: the same
-middle::egraph::R_BY_OP_START	own: the same
-middle::egraph::R_GUARD	own: the same
-middle::egraph::R_LHS	own: the same
-middle::egraph::R_RHS	own: the same
-middle::egraph::R_VARS	own: the same
-middle::egraph::R_VARS_NOW	own: the same
+base::ctx::Ctx.rules	own: the rules, parsed when the context is made (egraph::rules_new), the same in every build of a compiler
 middle::gvn::MEMCPY_SYM	IR: a symbol by its text
 base::ctx::Ctx.noalias_off	key: options_hash
 base::ctx::Ctx.ifconv	key: options_hash
