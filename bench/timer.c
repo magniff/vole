@@ -37,7 +37,11 @@ int main(int argc, char **argv) {
         waitpid(pid, &status, 0);
         double elapsed = now_ms() - start;
         if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-            fprintf(stderr, "timer: %s failed\n", argv[4]);
+            /* how it ended, for bench/run.sh's last line */
+            if (WIFSIGNALED(status))
+                fprintf(stderr, "\ntimer: %s failed (signal %d)\n", argv[4], WTERMSIG(status));
+            else
+                fprintf(stderr, "\ntimer: %s failed (exit %d)\n", argv[4], WEXITSTATUS(status));
             return 1;
         }
         if (best < 0 || elapsed < best) best = elapsed;

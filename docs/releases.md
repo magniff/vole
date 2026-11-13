@@ -6083,10 +6083,10 @@ inner loop"):
 ### The gate
 
 `bootstrap/gate.sh` runs the whole gate in one command, as parallel as
-the machine allows, and ends with one table (each step, its result and
-time, a line about it) and the failures' details; it exits 1 when a step
-failed. Its logs are in `target/gate/<date>/` (`target/gate/last`), one
-file per step.
+`-j` allows (0.29: "What runs at once", below), and ends with one table
+(each step, its result and time, a line about it) and the failures'
+details; it exits 1 when a step failed. Its logs are in
+`target/gate/<date>/` (`target/gate/last`), one file per step.
 
 ```
 $ bootstrap/gate.sh --quick            # before committing a big change: chain, suite at -O2, a short fuzz, linux-smoke
@@ -6094,7 +6094,9 @@ $ bootstrap/gate.sh                    # every step, modest fuzz counts
 $ bootstrap/gate.sh --release          # every step, the release's fuzz counts
 $ bootstrap/gate.sh --no-linux         # without the containers (--quick: without linux-smoke)
 $ bootstrap/gate.sh --quick --no-wait  # fail at once if another gate runs, rather than wait for it
-$ bootstrap/gate.sh --self-test        # the gate's own machinery: the lock, the stall check, the modes' steps
+$ bootstrap/gate.sh --release --no-linux -j 4   # the release's macOS steps within four slots (0.29)
+$ bootstrap/gate.sh --release -j 4 --plan       # how they are scheduled: heavy or not, the slots each holds
+$ bootstrap/gate.sh --self-test        # the gate's own machinery: the lock, the stall check, the modes' steps, what runs at once
 $ bootstrap/gate.sh --with-x86         # with x86_64 (off by default since 0.15)
 $ bootstrap/gate.sh --only 'fuzz-*,objcheck'   # some steps (--list shows them)
 $ bootstrap/gate.sh --release --bench  # the gate, then the benchmarks alone
@@ -6102,8 +6104,9 @@ $ bootstrap/gate.sh --only bench       # only the benchmarks
 ```
 
 The steps: `chain` (`bootstrap.sh --dev --no-head-tests`: the releases,
-then the working tree, built and checked for its fixpoint); then, at
-once, `suite-O0`, `suite-O1`, `suite-O2`; `fuzz-plain`, `fuzz-loops`,
+then the working tree, built and checked for its fixpoint); then, within
+the slots (0.29: the heavy ones one at a time), `suite-O0`, `suite-O1`,
+`suite-O2`; `fuzz-plain`, `fuzz-loops`,
 `fuzz-generics`, `fuzz-pressure`, `fuzz-calls`, `fuzz-lang06`,
 `fuzz-vector`, `fuzz-div`, `fuzz-range`, `fuzz-arch` (0.19: the
 intrinsics, `tests/fuzz/run.sh -A`), `fuzz-guard` (0.25: guarded
@@ -6214,8 +6217,67 @@ It stays parallel without overloading the machine: the test runners
 (`tests/run.sh`, `tests/fuzz/run.sh`, `tests/abi/run.sh`,
 `tests/objcheck.sh`) take their slots from one pool, a FIFO named by
 `$VOLE_JOBSERVER` that the gate fills with `-j` lines (by default one
-per CPU). Twenty steps share the CPUs, none waits for another's tail, and
-no program runs late enough to hit its timeout.
+per CPU). The light steps share the CPUs, none waits for another's tail,
+and no program runs late enough to hit its timeout.
+
+(0.29) **What runs at once.** The pool bounded the runners' cases, not
+the steps: 0.28.0's `gate.sh --release -j 4` started its 37 steps
+together, and what takes no slot was unbounded: each suite row starts
+some twenty runners of its own beside its cases (query's and refactor's
+transcripts, the book, the walkthroughs, ...), `stress-grow` runs two
+more suites, `cachediff` four transcripts at once, the chain rows build
+whole compilers. The load reached 114, the memory of a 26 GB machine ran
+out, and the release was gated by hand, one `gate.sh --only STEP -j 4`
+at a time. Now the gate schedules its steps:
+
+- **The heavy steps run one at a time**, the longest first: `objcheck`,
+  `suite-O0`, `suite-O2`, `suite-O1`, `compiler-memcheck`, `stress-grow`,
+  `examples-checkalloc`, `cachediff`, `threads`, `std2-check`,
+  `chain-diverse`, `chain-fresh`. The others run beside the one that
+  runs.
+- **A step that is no runner holds slots of the pool while it runs**, for
+  the work of it that would take none: one for a serial step (`layout`,
+  `debug`, `voltty-fuzz`, `compile-cost`, `unsafe-audit`, `mvs-census`,
+  `borrowck-twin`); four for `cachediff` and `std2-check` (their own
+  `-j`; cachediff is given the number it holds); all of them for
+  `chain-diverse` and `chain-fresh`; and two for a suite row and
+  `stress-grow`, for the runners a suite starts beside its cases (one at
+  `-j 2`, none at `-j 1`: a runner leaves a slot for its jobs). It waits
+  for them as a runner's job waits for its one; only heavy steps take
+  several, so no two steps wait with a part of what they need each.
+- **`std2-check` and `std2-tests` start after the suite rows they read**
+  (`suite-O0`; `suite-O0` and `suite-O2`), rather than starting and
+  waiting.
+
+So at most `-j` jobs and held slots at once, one heavy step among them,
+and `bootstrap/gate.sh --release --no-linux -j 4` is safe to run whole on
+that machine; it takes longer than everything at once did, about the sum
+of the heavy steps. What it does not bound: the threads of one compiler
+(`-j8` in a build; the `threads` step compares them on purpose and runs
+its repeats 32 at once, alone among the heavy steps), the short runners a
+suite starts beyond its two slots, and the containers, whose rows take no
+slot (`--cpus` and colima's memory bound them); inside a container the
+steps start together as before. `gate.sh --plan` prints the schedule
+(each step: heavy or not, the slots it holds, what it starts after)
+without running anything. The self-test checks it on two release gates
+whose steps are stubs (`VOLE_GATE_STUB=SECONDS`: each step sleeps, a
+runner through two jobs that take slots from the pool; at `-j 4` and
+`-j 1`): from the order of their events, never more slots taken than
+`-j`, never two heavy steps at once, std2's rows after their suites,
+every step run once, every slot given back. A step the stall check stops
+gives its slots back (the gate does when the step's own shell could not).
+
+(0.29) Guards on what passed, or failed, without saying. `layout` gives
+`tests/cimport/layout.sh` a floor (`-m 100` on macOS, where the gate's
+headers give 111 records; 30 on Linux): fewer records fail it, as when
+0.28.0's import text changed under the script and 4 records agreed.
+`tests/threads.sh` fails once, with the compiler's error, when the `-j1`
+build its repeats are compared with fails (0.28.0: the program no longer
+built, and all 96 repeats "differed"). `bench/run.sh` ends a failed run
+with one line, `bench: PROGRAM VARIANT: why` (a program that stops: its
+exit status or signal and its last line on stderr; one that does not
+build with the compiler measured, which was a `-` in the table), and the
+gate's `bench` row shows it; it was empty.
 
 **macOS checks every new program.** The first launch of an executable
 that was just linked waits for syspolicyd and XProtect to check it:

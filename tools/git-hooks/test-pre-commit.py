@@ -146,6 +146,79 @@ try:
     case("staged text not in the work tree: the heuristic",
          "1 file by the text heuristic (text not in the work tree" in r.stdout, r.stdout + r.stderr)
     run(["git", "reset", "-q", "--hard", "HEAD"], repo)
+
+    # (0.29) A merge is checked for what it adds itself, not for what a
+    # side brings: a branch with an unjustified block (committed past the
+    # hook, as legacy code is) merges without a conflict (pre-merge-commit)
+    # and with one (pre-commit, MERGE_HEAD), while a block the resolution
+    # itself adds is refused.
+    shutil.copy(os.path.join(ROOT, "tools", "git-hooks", "pre-merge-commit"),
+                os.path.join(repo, "tools", "git-hooks"))
+    hooks = ["git", "-c", "core.hooksPath=tools/git-hooks"]
+    main_branch = run(["git", "symbolic-ref", "--short", "HEAD"], repo).stdout.strip()
+
+    def side(name, text, other="other.vl"):
+        """A branch off HEAD whose commit (no hook) writes main.vl, and
+        HEAD moved on by a commit to another file."""
+        run(["git", "checkout", "-q", "-b", name], repo)
+        write(os.path.join(repo, "main.vl"), text)
+        run(["git", "commit", "-q", "-am", name], repo)
+        run(["git", "checkout", "-q", main_branch], repo)
+        write(os.path.join(repo, other), "// " + name + "\n")
+        run(["git", "add", other], repo)
+        run(["git", "commit", "-q", "-m", "main beside " + name], repo)
+
+    legacy = WORDS.replace("""    s.len() as i32
+}""", """    unsafe {
+        puts(c"legacy");
+    }
+    s.len() as i32
+}""")
+    side("legacy", legacy)
+    r = run(hooks + ["merge", "-q", "--no-ff", "-m", "merge legacy", "legacy"], repo)
+    case("a merge without a conflict: the side's unsafe is not the merge's",
+         r.returncode == 0 and len(run(["git", "rev-list", "--parents", "-n", "1", "HEAD"], repo).stdout.split()) == 3,
+         r.stdout + r.stderr)
+    r = run(hooks + ["commit", "-q", "--allow-empty", "-m", "after"], repo)
+    case("and the commit after it passes", r.returncode == 0, r.stdout + r.stderr)
+
+    # a conflict in main.vl: both sides change the same line; the side
+    # also brings an unjustified block elsewhere in the file
+    conflict_side = legacy.replace('puts(c"a");', 'puts(c"side");').replace(
+        'puts(c"legacy");', 'puts(c"legacy");\n    }\n    unsafe {\n        puts(c"more");')
+    run(["git", "checkout", "-q", "-b", "conflict"], repo)
+    write(os.path.join(repo, "main.vl"), conflict_side)
+    run(["git", "commit", "-q", "-am", "conflict"], repo)
+    run(["git", "checkout", "-q", main_branch], repo)
+    write(os.path.join(repo, "main.vl"), legacy.replace('puts(c"a");', 'puts(c"main");'))
+    run(["git", "commit", "-q", "-am", "main's line"], repo)
+    r = run(hooks + ["merge", "-q", "--no-ff", "-m", "merge conflict", "conflict"], repo)
+    case("the merge conflicts", r.returncode != 0 and os.path.exists(os.path.join(repo, ".git", "MERGE_HEAD")),
+         r.stdout + r.stderr)
+    resolved = conflict_side.replace('puts(c"side");', 'puts(c"both");')
+    write(os.path.join(repo, "main.vl"), resolved.replace("""    s.len() as i32
+}""", """    unsafe {
+        puts(c"the resolution's own");
+    }
+    s.len() as i32
+}"""))
+    run(["git", "add", "main.vl"], repo)
+    r = run(hooks + ["commit", "-q", "-m", "merge conflict"], repo)
+    out = r.stdout + r.stderr
+    case("a resolution that adds an unjustified block: refused, for that block only",
+         r.returncode != 0 and out.count("unsafe without UNSAFE:/SAFETY: comments") == 1
+         and "pre-commit: refused" in out, out)
+    write(os.path.join(repo, "main.vl"), resolved)
+    run(["git", "add", "main.vl"], repo)
+    r = run(hooks + ["commit", "-q", "-m", "merge conflict"], repo)
+    case("a resolution that adds none: the side's unsafe is not the merge's",
+         r.returncode == 0 and not os.path.exists(os.path.join(repo, ".git", "MERGE_HEAD")), r.stdout + r.stderr)
+    # outside a merge the side's block is still refused (HEAD~1: main
+    # before the merge, without the side's second block)
+    run(["git", "checkout", "-q", "-b", "plain", "HEAD~1"], repo)
+    rc, out = commit(resolved, "plain")
+    case("the side's block in a plain commit: refused",
+         rc != 0 and out.count("unsafe without UNSAFE:/SAFETY: comments") == 1, out)
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
