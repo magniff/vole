@@ -8,8 +8,8 @@
 
 use crate::arch::{ARCH_AARCH64, ARCH_X86_64, target_arch};
 use crate::base::{
-    STDERR, buf_append, buf_copy, buf_new, buf_str, buf_write_fd, die2, exit, fclose, fopen,
-    read_file, streq,
+    STDERR, buf_append, buf_byte, buf_copy, buf_new, buf_ptr, buf_str, buf_write_fd, c_starts,
+    c_tail, cstr, die2, exit_now, read_file, streq,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -265,23 +265,21 @@ pub fn abi_features() -> i64 {
 // The value of `-C` (`target-cpu=...`, `target-feature=...`); false when
 // it is neither.
 pub fn arch_option(value: *mut u8, pcx: &mut Ctx<Comp>) -> bool {
-    unsafe {
-        if prefix_is(value, c"target-cpu=") {
-            pcx.cpu_option = value.add(11);
-            pcx.arch_used = true;
-            return true;
-        }
-        if prefix_is(value, c"target-feature=") {
-            if pcx.feature_option_count == 16 {
-                die2(c"too many -C target-feature options: ", value);
-            }
-            pcx.feature_options[pcx.feature_option_count as usize] = value.add(15);
-            pcx.feature_option_count += 1;
-            pcx.arch_used = true;
-            return true;
-        }
-        false
+    if c_starts(value, b"target-cpu=") {
+        pcx.cpu_option = c_tail(value, 11);
+        pcx.arch_used = true;
+        return true;
     }
+    if c_starts(value, b"target-feature=") {
+        if pcx.feature_option_count == 16 {
+            die2(c"too many -C target-feature options: ", value);
+        }
+        pcx.feature_options[pcx.feature_option_count as usize] = c_tail(value, 15);
+        pcx.feature_option_count += 1;
+        pcx.arch_used = true;
+        return true;
+    }
+    false
 }
 
 // Whether the command line gave -C options (the tools' cache, which keys
@@ -293,45 +291,38 @@ pub fn arch_options_given(pcx: &Ctx<Comp>) -> bool {
 // The -C options given, pushed on args as the command line had them (`-C`,
 // `target-cpu=...`): what the tools forward to the commands they run.
 pub fn push_arch_args(args: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if pcx.cpu_option != 0 as *mut u8 {
-            args.push(c"-C" as i64);
-            args.push(pcx.cpu_option.add(-11 as usize) as i64);
-        }
-        for k in 0..pcx.feature_option_count {
-            args.push(c"-C" as i64);
-            args.push(pcx.feature_options[k as usize].add(-15 as usize) as i64);
-        }
+    if pcx.cpu_option != 0 as *mut u8 {
+        args.push(c"-C" as i64);
+        args.push(option_text(c"target-cpu=", pcx.cpu_option) as i64);
+    }
+    for k in 0..pcx.feature_option_count {
+        args.push(c"-C" as i64);
+        args.push(option_text(c"target-feature=", pcx.feature_options[k as usize]) as i64);
     }
 }
 
-fn prefix_is(s: *mut u8, p: *mut u8) -> bool {
-    unsafe {
-        let mut i: i64 = 0;
-        while (*p.add(i as usize)) != 0 {
-            if (*s.add(i as usize)) != (*p.add(i as usize)) {
-                return false;
-            }
-            i += 1;
-        }
-        true
-    }
+// `key` then `value`, a C string in a buffer of its own (kept: an
+// argument of a command line).
+fn option_text(key: *mut u8, value: *mut u8) -> *mut u8 {
+    let b = buf_new();
+    buf_str(b, key);
+    buf_str(b, value);
+    buf_byte(b, 0);
+    buf_ptr(b)
 }
 
 // A command line error of -C: `error[CODE] MESSAGE: DETAIL`, and exit 1.
 fn option_error(code: *mut u8, message: *mut u8, detail: *mut u8) -> ! {
-    unsafe {
-        let b = buf_new();
-        buf_str(b, c"error[");
-        buf_str(b, code);
-        buf_str(b, c"] ");
-        buf_str(b, message);
-        buf_str(b, c": ");
-        buf_str(b, detail);
-        buf_str(b, c"\n");
-        buf_write_fd(b, STDERR);
-        exit(1)
-    }
+    let b = buf_new();
+    buf_str(b, c"error[");
+    buf_str(b, code);
+    buf_str(b, c"] ");
+    buf_str(b, message);
+    buf_str(b, c": ");
+    buf_str(b, detail);
+    buf_str(b, c"\n");
+    buf_write_fd(b, STDERR);
+    exit_now(1)
 }
 
 // The features every function of the build knows: the CPU's (the
@@ -370,85 +361,75 @@ pub fn made_build_features(pcx: &Ctx<Comp>) -> i64 {
 // uses 0.19's features from 0.20), with the target's baseline under them.
 // An error (arch.cpu) when the target is another architecture.
 fn native_features(pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let host_x86 = host_is_x86();
-        if host_x86 != get_x86() {
-            option_error(c"arch.cpu", c"-C target-cpu=native reads this machine, whose architecture is not the target's; name a CPU instead",
-                if host_x86 { c"x86_64" } else { c"aarch64" });
-        }
-        let text = buf_new();
-        if get_elf() {
-            let f = fopen(c"/proc/cpuinfo", c"rb");
-            if f != 0 as *mut u8 {
-                fclose(f);
-                read_file(c"/proc/cpuinfo", text, pcx);
-            }
-        } else {
-            let out = crate::front::cpp::cc::run_command(c"sysctl hw.optional machdep.cpu.features machdep.cpu.leaf7_features machdep.cpu.extfeatures 2>/dev/null");
-            buf_append(text, out);
-        }
-        let t = buf_copy(text);
-        let mut s = target_baseline();
-        if get_x86() {
-            let names: [*mut u8; 16] = [c" sse ", c" sse2 ", c" pni ", c" ssse3 ", c" sse4_1 ",
-                c" sse4_2 ", c" popcnt ", c" abm ", c" bmi1 ", c" bmi2 ", c" pclmulqdq ", c" aes ",
-                c" sha_ni ", c" avx ", c" avx2 ", c" fma "];
-            let mac: [*mut u8; 16] = [c" SSE ", c" SSE2 ", c" SSE3 ", c" SSSE3 ", c" SSE4.1 ",
-                c" SSE4.2 ", c" POPCNT ", c" LZCNT ", c" BMI1 ", c" BMI2 ", c" PCLMULQDQ ",
-                c" AES ", c" SHA ", c" AVX1.0 ", c" AVX2 ", c" FMA "];
-            let bits: [i64; 16] = [FT_SSE, FT_SSE2, FT_SSE3, FT_SSSE3, FT_SSE41, FT_SSE42,
-                FT_POPCNT, FT_LZCNT, FT_BMI1, FT_BMI2, FT_PCLMULQDQ, FT_X86_AES, FT_SHA, FT_AVX,
-                FT_AVX2, FT_FMA];
-            for k in 0..16 {
-                if word_in(&t, if get_elf() { names[k as usize] } else { mac[k as usize] }) {
-                    s |= bit(bits[k as usize]);
-                }
-            }
-        } else {
-            let names: [*mut u8; 10] = [c" crc32", c" aes", c" sha2", c" sha3", c" asimddp",
-                c" asimdrdm", c" atomics", c" fphp", c" i8mm", c" bf16"];
-            let mac: [*mut u8; 10] = [c"FEAT_CRC32: 1", c"FEAT_AES: 1", c"FEAT_SHA256: 1",
-                c"FEAT_SHA3: 1", c"FEAT_DotProd: 1", c"FEAT_RDM: 1", c"FEAT_LSE: 1",
-                c"FEAT_FP16: 1", c"FEAT_I8MM: 1", c"FEAT_BF16: 1"];
-            let bits: [i64; 10] = [FT_CRC, FT_A64_AES, FT_SHA2, FT_SHA3, FT_DOTPROD, FT_RDM, FT_LSE,
-                FT_FP16, FT_I8MM, FT_BF16];
-            for k in 0..10 {
-                if word_in(&t, if get_elf() { names[k as usize] } else { mac[k as usize] }) {
-                    s |= bit(bits[k as usize]);
-                }
-            }
-        }
-        implied(s)
+    let host_x86 = host_is_x86();
+    if host_x86 != get_x86() {
+        option_error(c"arch.cpu", c"-C target-cpu=native reads this machine, whose architecture is not the target's; name a CPU instead",
+            if host_x86 { c"x86_64" } else { c"aarch64" });
     }
+    let text = buf_new();
+    if get_elf() {
+        if crate::front::cpp::directives::file_exists(c"/proc/cpuinfo", pcx) {
+            read_file(c"/proc/cpuinfo", text, pcx);
+        }
+    } else {
+        let out = crate::front::cpp::cc::run_command(c"sysctl hw.optional machdep.cpu.features machdep.cpu.leaf7_features machdep.cpu.extfeatures 2>/dev/null");
+        buf_append(text, out);
+    }
+    let t = buf_copy(text);
+    let mut s = target_baseline();
+    if get_x86() {
+        let names: [&[u8]; 16] = [b" sse ", b" sse2 ", b" pni ", b" ssse3 ", b" sse4_1 ",
+            b" sse4_2 ", b" popcnt ", b" abm ", b" bmi1 ", b" bmi2 ", b" pclmulqdq ", b" aes ",
+            b" sha_ni ", b" avx ", b" avx2 ", b" fma "];
+        let mac: [&[u8]; 16] = [b" SSE ", b" SSE2 ", b" SSE3 ", b" SSSE3 ", b" SSE4.1 ",
+            b" SSE4.2 ", b" POPCNT ", b" LZCNT ", b" BMI1 ", b" BMI2 ", b" PCLMULQDQ ", b" AES ",
+            b" SHA ", b" AVX1.0 ", b" AVX2 ", b" FMA "];
+        let bits: [i64; 16] = [FT_SSE, FT_SSE2, FT_SSE3, FT_SSSE3, FT_SSE41, FT_SSE42, FT_POPCNT,
+            FT_LZCNT, FT_BMI1, FT_BMI2, FT_PCLMULQDQ, FT_X86_AES, FT_SHA, FT_AVX, FT_AVX2, FT_FMA];
+        for k in 0..16 {
+            if word_in(&t, if get_elf() { names[k as usize] } else { mac[k as usize] }) {
+                s |= bit(bits[k as usize]);
+            }
+        }
+    } else {
+        let names: [&[u8]; 10] = [b" crc32", b" aes", b" sha2", b" sha3", b" asimddp",
+            b" asimdrdm", b" atomics", b" fphp", b" i8mm", b" bf16"];
+        let mac: [&[u8]; 10] = [b"FEAT_CRC32: 1", b"FEAT_AES: 1", b"FEAT_SHA256: 1",
+            b"FEAT_SHA3: 1", b"FEAT_DotProd: 1", b"FEAT_RDM: 1", b"FEAT_LSE: 1", b"FEAT_FP16: 1",
+            b"FEAT_I8MM: 1", b"FEAT_BF16: 1"];
+        let bits: [i64; 10] = [FT_CRC, FT_A64_AES, FT_SHA2, FT_SHA3, FT_DOTPROD, FT_RDM, FT_LSE,
+            FT_FP16, FT_I8MM, FT_BF16];
+        for k in 0..10 {
+            if word_in(&t, if get_elf() { names[k as usize] } else { mac[k as usize] }) {
+                s |= bit(bits[k as usize]);
+            }
+        }
+    }
+    implied(s)
 }
 
 // Whether `w` is in text; a word of /proc/cpuinfo's or sysctl's list (a
 // leading space in w, and a trailing one matching a line's end too).
-fn word_in(text: &[u8], w: *mut u8) -> bool {
-    unsafe {
-        let mut n: i64 = 0;
-        while (*w.add(n as usize)) != 0 {
-            n += 1;
-        }
-        let trailing = (*w.add((n - 1) as usize)) == b' ';
-        let mut i: i64 = 0;
-        while i + n <= text.len() as i64 + if trailing { 1 } else { 0 } {
-            let mut k: i64 = 0;
-            while k < n {
-                let c = if i + k < text.len() as i64 { text[(i + k) as usize] } else { b'\n' };
-                let want = (*w.add(k as usize));
-                if !(c == want || want == b' ' && (c == b'\n' || c == b'\t' || c == b':')) {
-                    break;
-                }
-                k += 1;
+fn word_in(text: &[u8], w: &[u8]) -> bool {
+    let n = w.len();
+    let trailing = n > 0 && w[n - 1] == b' ';
+    let mut i: usize = 0;
+    while i + n <= text.len() + if trailing { 1 } else { 0 } {
+        let mut k: usize = 0;
+        while k < n {
+            let c = if i + k < text.len() { text[i + k] } else { b'\n' };
+            let want = w[k];
+            if !(c == want || want == b' ' && (c == b'\n' || c == b'\t' || c == b':')) {
+                break;
             }
-            if k == n {
-                return true;
-            }
-            i += 1;
+            k += 1;
         }
-        false
+        if k == n {
+            return true;
+        }
+        i += 1;
     }
+    false
 }
 
 // Whether this machine is an x86-64 (uname's machine field).
@@ -462,45 +443,43 @@ pub fn own_features() -> i64 {
     if target_arch() == ARCH_X86_64 { X86_FEATURES } else { A64_FEATURES }
 }
 
-fn apply_feature_option(set: i64, list: *mut u8) -> i64 {
-    unsafe {
-        let mut s = set;
-        let mut i: i64 = 0;
-        while (*list.add(i as usize)) != 0 {
-            let sign = (*list.add(i as usize));
-            if sign != b'+' && sign != b'-' {
-                option_error(c"arch.feature_name",
-                    c"-C target-feature takes +NAME and -NAME, comma-separated", list);
-            }
-            let start = i + 1;
-            let mut end = start;
-            while (*list.add(end as usize)) != 0 && (*list.add(end as usize)) != b',' {
-                end += 1;
-            }
-            let b = parse_feature(std::slice::from_raw_parts(list.add((start) as usize),
-                (end - (start)) as usize));
-            if b < 0 {
-                option_error(c"arch.feature_name", c"unknown feature in -C target-feature", list);
-            }
-            if sign == b'+' {
-                s = implied(s | bit(b));
-            } else {
-                if has_bit(abi_features(), b) {
-                    option_error(c"arch.baseline",
-                        c"-C target-feature cannot remove a feature the target's ABI needs", list);
-                }
-                // (and what needs it: -sse4.1 takes sse4.2, avx, avx2 and
-                // fma with it)
-                for c in 0..FT_X86_64 + 1 {
-                    if has_bit(s, c) && has_bit(implied(bit(c)), b) {
-                        s &= !bit(c);
-                    }
-                }
-            }
-            i = if (*list.add(end as usize)) == b',' { end + 1 } else { end };
+fn apply_feature_option(set: i64, option: *mut u8) -> i64 {
+    let list = cstr(option);
+    let mut s = set;
+    let mut i: usize = 0;
+    while i < list.len() {
+        let sign = list[i];
+        if sign != b'+' && sign != b'-' {
+            option_error(c"arch.feature_name",
+                c"-C target-feature takes +NAME and -NAME, comma-separated", option);
         }
-        s
+        let start = i + 1;
+        let mut end = start;
+        while end < list.len() && list[end] != b',' {
+            end += 1;
+        }
+        let b = parse_feature(&list[start..end]);
+        if b < 0 {
+            option_error(c"arch.feature_name", c"unknown feature in -C target-feature", option);
+        }
+        if sign == b'+' {
+            s = implied(s | bit(b));
+        } else {
+            if has_bit(abi_features(), b) {
+                option_error(c"arch.baseline",
+                    c"-C target-feature cannot remove a feature the target's ABI needs", option);
+            }
+            // (and what needs it: -sse4.1 takes sse4.2, avx, avx2 and
+            // fma with it)
+            for c in 0..FT_X86_64 + 1 {
+                if has_bit(s, c) && has_bit(implied(bit(c)), b) {
+                    s &= !bit(c);
+                }
+            }
+        }
+        i = if end < list.len() { end + 1 } else { end };
     }
+    s
 }
 
 // Whether feature `b` belongs to another architecture than the target's:
