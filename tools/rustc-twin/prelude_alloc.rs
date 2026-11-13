@@ -32,7 +32,7 @@ mod vole_twin_prelude {
         }
     }
 
-    /// std2's String<A>: UTF-8 in a Vec<u8, A>.
+    /// std's String<A>: UTF-8 in a Vec<u8, A>.
     pub struct String<A: Allocator = Gpa> {
         v: Vec<u8, A>,
     }

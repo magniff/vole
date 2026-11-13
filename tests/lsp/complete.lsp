@@ -66,7 +66,7 @@
 < {"jsonrpc":"2.0","id":17,"result":{"isIncomplete":false,"items":[{"label":"name","kind":6,"detail":"&str","sortText":"01name"}]}}
 ## `it.` of `for it in store.items.iter()`: an i64's
 ## (0.28.0, gaps) in the rust edition nothing is offered after an integer
-## (std2's integer methods are not indexed: ids 18, 24, 29), and `label.spl`
+## (std's integer methods are not indexed: ids 18, 24, 29), and `label.spl`
 ## (id 25) gets a slice's methods, not a str's.
 > {"jsonrpc":"2.0","id":18,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":41,"character":39}}}
 < {"jsonrpc":"2.0","id":18,"result":{"isIncomplete":false,"items":[]}}

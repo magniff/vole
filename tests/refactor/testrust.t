@@ -1,6 +1,6 @@
 ## (0.27.1) The rust edition's contracts tested as properties: a `&T` or
 ## `&mut T` parameter is lent a generated T (`let k_owned = ..; let k =
-## &k_owned;`), and a failure shows the value it was lent. (0.28.0: on std2,
+## &k_owned;`), and a failure shows the value it was lent. (0.28.0: on std,
 ## whose std::test is what `volec test` lowers to.)
 % volec test --timeout 5
 test main.vl: 1 passed, 1 failed (2 contracts; -O0 and -O2 agree)

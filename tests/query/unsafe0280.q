@@ -1,7 +1,7 @@
 ## (0.28.0) `volec query unsafe` on a rust-edition program: a call
 ## through an `unsafe fn` pointer has no function to name (0.27.8 indexed
 ## the function table at -1 and stopped, on any rust-edition program with
-## std2's sites); it is listed as `unsafe-call(fn pointer)`, class other.
+## std's sites); it is listed as `unsafe-call(fn pointer)`, class other.
 ## The pointer's type, `unsafe fn(i64) -> i64`, is no site (0.27.8 listed
 ## it as an `unsafe fn`, unjustified). Without std, and a FILE's (std read).
 $ unsafe --no-std

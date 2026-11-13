@@ -1,7 +1,7 @@
 #!/bin/sh
-# (0.27.6) std2's std::gpu::wgsl front against MVS's: every .wgsl file of
+# (0.27.6) std's std::gpu::wgsl front against MVS's: every .wgsl file of
 # the tree (tests/, examples/) checked by tools/wgslc (`wgslc check`, MVS
-# std's shader compiler) and by tests/wgsl/front2 (std2's front and
+# std's shader compiler) and by tests/wgsl/front2 (std's front and
 # uniformity, the half `embed wgsl` checks with). Each file's verdict,
 # `NAME: ok` or its error and help lines (the path as its name; wgslc's
 # `try:` lines aside), must be the same.
@@ -38,16 +38,16 @@ for f in $(cd "$ROOT" && find tests examples -name '*.wgsl' | sort); do
         sed -e "s|^$ROOT/$f:|$b:|" -e '/^try: /d' "$WORK/mvs" >"$WORK/mvs2"
         mv "$WORK/mvs2" "$WORK/mvs"
     fi
-    "$WORK/front2" "$ROOT/$f" >"$WORK/std2" 2>&1
-    if cmp -s "$WORK/mvs" "$WORK/std2"; then
+    "$WORK/front2" "$ROOT/$f" >"$WORK/std" 2>&1
+    if cmp -s "$WORK/mvs" "$WORK/std"; then
         echo "pass $f"
     else
         d=$((d + 1))
         echo "FAIL $f"
         echo "  mvs:"
         sed 's/^/    /' "$WORK/mvs"
-        echo "  std2:"
-        sed 's/^/    /' "$WORK/std2"
+        echo "  std:"
+        sed 's/^/    /' "$WORK/std"
     fi
 done
 echo "wgsl-front2: $n files, $d differ"

@@ -609,7 +609,7 @@ for c in "" edit "edit patch" refactor "refactor signature" fix fmt check undo e
 done
 result pass help
 
-# volec try (0.15; 0.28.0: a rust snippet, on std2): a snippet run with
+# volec try (0.15; 0.28.0: a rust snippet, on std): a snippet run with
 # std; its last value (printed by Debug; a type with none, its type
 # alone) and type, its output, its errors at the snippet's lines, its
 # exit code.

@@ -150,16 +150,9 @@ and the `sync` family:
 
 ```console
 $ volec explain --list | grep '^sync\.'
-sync.borrow_escapes
 sync.not_send
 sync.not_sync
 sync.global
-sync.scope_write
-sync.scope_escape
-sync.scope_shared_write
-sync.scope_local
-sync.scope_spawn
-sync.spawn_closure
 sync.view_item
 sync.static
 ```

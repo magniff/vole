@@ -76,19 +76,14 @@
 # compiler/src and std without // UNSAFE: and // SAFETY:, `volec query
 # unsafe`; 0.29: none of them, and no unsafe block of compiler/src with
 # nothing unsafe inside, each one named; --quick too);
-# mvs-census (tools/mvs-census.py --no-allow, 0.28.0: nothing in the tree
-# is read as the old edition or names one: no program, generator, guide
-# topic or Book chapter in it, no `// EDITION:` line but the ones the
-# previous release reads, no use of the edition option; 0 entries, no
-# allow-list; --quick too);
 # borrowck-twin (tools/borrowck-twin.sh, 0.27.1: every rust_b_ case's
 # verdict against rustc's, accept or reject, and its code; a divergence
 # only when the case names its class; skipped without rustc; --quick too);
-# std2-check (tests/std/check.sh, 0.27.2, borrowck.md Z7: every std2 body
+# std-check (tests/std/check.sh, 0.27.2, borrowck.md Z7: every std body
 # type-checked and solved by the borrow checker, 0 errors; 0.27.2.1: with
-# suite-O0 in the gate, only the std2 cases that row did not pass are
+# suite-O0 in the gate, only the std cases that row did not pass are
 # compiled again);
-# std2-tests (0.27.2, gate 1: std2's cases, tests/run/std2_*.vl, at -O0
+# std-tests (0.27.2, gate 1: std's cases, tests/run/std_*.vl, at -O0
 # and -O2, built with --check-alloc, a block of Gpa left at exit failing
 # one; the count passing at both, against gate 1's 1,000; --quick too;
 # 0.27.2.1: a level read from its suite row's case results when the gate
@@ -138,14 +133,14 @@
 # and the memory of a 26 GB machine ran out, and the release was gated one
 # `--only STEP` at a time by hand. So:
 # - the heavy steps (the suites, stress-grow, objcheck, threads,
-#   cachediff, compiler-memcheck, examples-checkalloc, std2-check,
+#   cachediff, compiler-memcheck, examples-checkalloc, std-check,
 #   chain-diverse, chain-fresh) run one at a time, the longest first;
 # - a step that is no runner (its work takes no slot of the pool by
 #   itself) holds slots while it runs: one for a serial step (layout,
-#   debug, ...), four for cachediff and std2-check (their own -j), all of
+#   debug, ...), four for cachediff and std-check (their own -j), all of
 #   them for a chain row, and two for a suite's own runners (one at -j 2,
 #   none at -j 1: its cases need the rest);
-# - std2-check and std2-tests start after the suite rows they read.
+# - std-check and std-tests start after the suite rows they read.
 # So at most -j jobs and held slots at once, one heavy step among them:
 # `gate.sh --release --no-linux -j 4` is safe to run whole. The
 # containers' rows take no slot (--cpus bounds them), and inside a
@@ -289,7 +284,7 @@ esac
 
 FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-guard fuzz-seed fuzz-sem"
 ABI_STEPS="abi-plain abi-import abi-header"
-HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost unsafe-audit mvs-census borrowck-twin std2-check std2-tests cachediff"
+HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost unsafe-audit borrowck-twin std-check std-tests cachediff"
 # (0.25) the chain's integrity, by --release (or --only): slow, and they
 # rebuild compilers rather than test one
 RELEASE_STEPS="chain-diverse chain-fresh"
@@ -306,7 +301,7 @@ OTHER_STEPS="valgrind $INSIDE_SMOKE_STEPS"
 [ "$X86" = 1 ] || LINUX_STEPS="linux-aarch64"
 case "$MODE" in
     quick)
-        STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch voltty-fuzz compile-cost unsafe-audit mvs-census borrowck-twin std2-tests cachediff"
+        STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch voltty-fuzz compile-cost unsafe-audit borrowck-twin std-tests cachediff"
         [ $LINUX -eq 1 ] && STEPS="$SMOKE_STEPS $STEPS" ;;
     *) STEPS="$HOST_STEPS"; [ $LINUX -eq 1 ] && STEPS="$STEPS $LINUX_STEPS" ;;
 esac
@@ -369,7 +364,7 @@ fi
 
 # The heavy steps: one at a time (the header, "What runs at once"). Not
 # inside a container, whose gate starts its steps together.
-HEAVY_STEPS="suite-O0 suite-O1 suite-O2 stress-grow objcheck threads cachediff compiler-memcheck examples-checkalloc std2-check chain-diverse chain-fresh valgrind"
+HEAVY_STEPS="suite-O0 suite-O1 suite-O2 stress-grow objcheck threads cachediff compiler-memcheck examples-checkalloc std-check chain-diverse chain-fresh valgrind"
 is_heavy() { # <step>
     [ $INSIDE -eq 0 ] || return 1
     case " $HEAVY_STEPS " in *" $1 "*) return 0 ;; esac
@@ -380,13 +375,13 @@ is_heavy() { # <step>
 # tests/incremental.sh, tests/compiler_memcheck.sh, tests/valgrind.sh).
 is_runner() { # <step>
     case "$1" in
-        suite-*|stress-grow|fuzz-*|abi-*|objcheck|objcheck-*|threads|incremental|compiler-memcheck|examples-checkalloc|std2-tests|valgrind|smoke-*|selftest-*) return 0 ;;
+        suite-*|stress-grow|fuzz-*|abi-*|objcheck|objcheck-*|threads|incremental|compiler-memcheck|examples-checkalloc|std-tests|valgrind|smoke-*|selftest-*) return 0 ;;
     esac
     return 1
 }
 # The slots step $1 holds itself while it runs, for the work of it that
 # takes none from the pool: a serial step is one job; cachediff and
-# std2-check run four at once (their own -j); a chain row builds whole
+# std-check run four at once (their own -j); a chain row builds whole
 # compilers, on the compiler's threads (and chain-fresh the seed, with
 # cargo): all the slots; a suite starts its other runners beside its
 # cases, the long ones of them serial (query's and refactor's
@@ -398,9 +393,9 @@ held_slots() { # <step>
     if [ $INSIDE -eq 0 ]; then
         case "$1" in
             suite-*|stress-grow) hs=2 ;;
-            cachediff|std2-check) hs=4 ;;
+            cachediff|std-check) hs=4 ;;
             chain-diverse|chain-fresh) hs=$JOBS ;;
-            layout|debug|unsafe-audit|mvs-census|borrowck-twin|voltty-fuzz|compile-cost) hs=1 ;;
+            layout|debug|unsafe-audit|borrowck-twin|voltty-fuzz|compile-cost) hs=1 ;;
         esac
     fi
     hs_max=$JOBS
@@ -413,8 +408,8 @@ held_slots() { # <step>
 after_of() { # <step>
     [ $INSIDE -eq 0 ] || return 0
     case "$1" in
-        std2-check) ao="suite-O0" ;;
-        std2-tests) ao="suite-O0 suite-O2" ;;
+        std-check) ao="suite-O0" ;;
+        std-tests) ao="suite-O0 suite-O2" ;;
         *) ao="" ;;
     esac
     for ao_s in $ao; do
@@ -462,7 +457,7 @@ self_test() {
     # (0.29) What runs at once: a release gate whose steps are stubs
     # (stub_step), at -j 4 and at -j 1. From its events, in the order they
     # happened: never more slots taken than -j, never two heavy steps at
-    # once, std2's rows after the suite rows they read, every step run
+    # once, std's rows after the suite rows they read, every step run
     # once and every slot given back; and at -j 4 it is still parallel.
     # (A short stall time: steps that wait for each other's slots fail
     # here in seconds.)
@@ -479,8 +474,8 @@ self_test() {
                 started[$2]++
                 if (++running > maxrun) maxrun = running
                 if ($2 in isheavy) { if (++hv > 1) bad = bad " " $2 "-beside-a-heavy-step" }
-                if ($2 == "std2-check" && !ended["suite-O0"]) bad = bad " std2-check-before-suite-O0"
-                if ($2 == "std2-tests" && !(ended["suite-O0"] && ended["suite-O2"])) bad = bad " std2-tests-before-its-suites"
+                if ($2 == "std-check" && !ended["suite-O0"]) bad = bad " std-check-before-suite-O0"
+                if ($2 == "std-tests" && !(ended["suite-O0"] && ended["suite-O2"])) bad = bad " std-tests-before-its-suites"
             }
             $1 == "end" { ended[$2]++; running--; if ($2 in isheavy) hv-- }
             END {
@@ -739,7 +734,7 @@ find_previous_release() {
 # the row has ended, after waiting for it (step $2 waits: $RUN/$2.waiting,
 # which the stall check passes over); false when the gate does not run it
 # or it left no results (then the caller builds the cases itself). The
-# std2 rows read std2's cases from it: the gate built them six times.
+# std rows read std's cases from it: the gate built them six times.
 suite_results() {
     case " $STEPS " in *" suite-O$1 "*) ;; *) return 1 ;; esac
     touch "$RUN/$2.waiting"
@@ -854,8 +849,6 @@ run_step() {
         incremental) sh "$ROOT/tests/incremental.sh" -c "$C" ;;
         # (0.25.3) the unsafe sites without justification, against the baseline
         unsafe-audit) sh "$ROOT/tests/unsafe_audit.sh" -c "$C" ;;
-        # (0.28.0) nothing in the tree is read as the old edition
-        mvs-census) python3 "$ROOT/tools/mvs-census.py" --no-allow ;;
         # (0.25.3) the tools' answers from their cache, every transcript
         # (0.29) as many transcripts at once as the slots the step holds
         cachediff)
@@ -864,30 +857,30 @@ run_step() {
             sh "$ROOT/tests/cachediff/run.sh" -c "$C" -j "$cj" ;;
         # (0.27.1) the borrow checker's corpus against rustc's verdicts
         borrowck-twin) sh "$ROOT/tools/borrowck-twin.sh" --shim "$ROOT"/tests/run/rust_b_*.vl ;;  # (0.27.3: the rustc twin's shim)
-        # (0.27.2) std2's bodies through the borrow checker (Z7)
-        std2-check)
+        # (0.27.2) std's bodies through the borrow checker (Z7)
+        std-check)
             # (0.27.2.1) the cases' part from the suite-O0 row's builds of
             # them when this gate runs that row (suite_results)
-            if r=$(suite_results 0 std2-check); then
+            if r=$(suite_results 0 std-check); then
                 sh "$ROOT/tests/std/check.sh" -c "$C" -r "$r"
             else
                 sh "$ROOT/tests/std/check.sh" -c "$C"
             fi ;;
-        std2-tests)
-            # (0.27.2, gate 1) std2's cases at -O0 and -O2: the runner builds
-            # each with --check-alloc (std2's checking Gpa) and fails one
+        std-tests)
+            # (0.27.2, gate 1) std's cases at -O0 and -O2: the runner builds
+            # each with --check-alloc (std's checking Gpa) and fails one
             # whose blocks of Gpa are left at exit; a case passes when it
             # passes at both levels (its XFAIL ones do not count).
             # (0.27.2.1) A level whose suite row this gate runs is read from
             # that row's builds (suite_results), not built again: the suite
-            # builds std2's cases the same way.
+            # builds std's cases the same way.
             rc=0
             for level in 0 2; do
-                out="$RUN/std2-tests-O$level.out"
-                if r=$(suite_results $level std2-tests); then
-                    echo "std2-tests: -O$level read from the suite-O$level row's builds"
-                    # (the cases `tests/run.sh std2_` runs: names containing std2_)
-                    awk -v row="suite-O$level" '$1 ~ /std2_/ {
+                out="$RUN/std-tests-O$level.out"
+                if r=$(suite_results $level std-tests); then
+                    echo "std-tests: -O$level read from the suite-O$level row's builds"
+                    # (the cases `tests/run.sh std_` runs: names containing std_)
+                    awk -v row="suite-O$level" '$1 ~ /std_/ {
                             if ($2 == "pass") p++
                             else if ($2 == "xfail") x++
                             else if ($2 == "skip") s++
@@ -896,11 +889,11 @@ run_step() {
                         END { printf "  %-10s %5d %6d %5d %5d\n", "total", p, x, f, s }' "$r" >"$out"
                     grep -q '^FAIL\|^XPASS' "$out" && rc=1
                 else
-                    sh "$ROOT/tests/run.sh" -c "$C" -O $level std2_ >"$out" 2>&1 || rc=1
+                    sh "$ROOT/tests/run.sh" -c "$C" -O $level std_ >"$out" 2>&1 || rc=1
                 fi
                 awk '/^FAIL|^XPASS/' "$out"
             done
-            awk -v o0="$RUN/std2-tests-O0.out" -v o2="$RUN/std2-tests-O2.out" '
+            awk -v o0="$RUN/std-tests-O0.out" -v o2="$RUN/std-tests-O2.out" '
                 function row(f,   l, t) {
                     while ((getline l < f) > 0) { split(l, t, " "); if (t[1] == "total") { close(f); return t[2] " " t[3] " " t[4] } }
                     return "0 0 0"
@@ -908,7 +901,7 @@ run_step() {
                 BEGIN {
                     split(row(o0), a, " "); split(row(o2), b, " ")
                     n = a[1] < b[1] ? a[1] : b[1]
-                    printf "std2-tests: %d passed at -O0 and -O2 under --check-alloc (gate 1: 1000); -O0 %d passed, %d xfail, %d failed; -O2 %d passed, %d xfail, %d failed\n", n, a[1], a[2], a[3], b[1], b[2], b[3]
+                    printf "std-tests: %d passed at -O0 and -O2 under --check-alloc (gate 1: 1000); -O0 %d passed, %d xfail, %d failed; -O2 %d passed, %d xfail, %d failed\n", n, a[1], a[2], a[3], b[1], b[2], b[3]
                 }'
             return $rc ;;
         voltty-fuzz) sh "$ROOT/tests/voltty/run.sh" -c "$C" -s 60 -k "$k" ;;
@@ -1429,8 +1422,8 @@ note_of() {
     case "$1" in
         chain) awk '/^  head / { sub(/^  head +/, ""); print; exit }' "$l" ;;
         suite-*|smoke-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed%s\n", $2, $3, $4, ($5 > 0 ? ", " $5 " SKIPPED" : "") }' "$l" ;;
-        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*|unsafe-audit|mvs-census|borrowck-twin|std2-check|std2-tests|cachediff)
-            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh|unsafe-audit|census|borrowck-twin|std2-check|std2-tests|cachediff):' "$l" | tail -1 ;;
+        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*|unsafe-audit|borrowck-twin|std-check|std-tests|cachediff)
+            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh|unsafe-audit|borrowck-twin|std-check|std-tests|cachediff):' "$l" | tail -1 ;;
         voltty-fuzz) grep -E '^(pass|FAIL|skip) oracle' "$l" | tail -1 ;;
         compile-cost) awk '$2 ~ /^[0-9.]+$/ && $3 == "M" { printf "%s%s %s M %s", sep, $1, $2, $8; sep = ", " } END { print "" }' "$l" ;;
         # (no rows: it failed before the container's steps, e.g. docker)

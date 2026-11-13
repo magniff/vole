@@ -169,12 +169,12 @@
 # step: --check-alloc). Every other case is built with --verify-places
 # (0.26.2; $VOLE_VERIFY_EVERY=N: every N-th, 0: none), but those with
 # NO-EXTRA-FLAGS.
-# (0.27.2) std2's cases (std2_*) are built with --check-alloc, and fail
+# (0.27.2) std's cases (std_*) are built with --check-alloc, and fail
 # when blocks of Gpa are left at exit (and it exits 0) unless a STDERR
-# line expects the list ($VOLE_TEST_STD2_PLAIN=1: without it); $VOLE_TEST_XFAIL_WHY=FILE
+# line expects the list ($VOLE_TEST_STD_PLAIN=1: without it); $VOLE_TEST_XFAIL_WHY=FILE
 # gets each XFAIL case's name and the start of its failure, for a triage;
 # (0.27.2.1) $VOLE_TEST_RESULTS=FILE each case's name, status and borrowck
-# errors at std's positions (the gate's std2 rows read the suite's).
+# errors at std's positions (the gate's std rows read the suite's).
 
 set -u
 LC_ALL=C
@@ -344,9 +344,9 @@ FAILURES="$WORK/failures"
 TALLY="$WORK/tally"
 # (0.28.0) A build whose lazy read of std failed and whose whole read passed
 # (a rerun: three or four times the work) says so on stderr and is listed
-# here (front/modules/std2lazy.vl: rerun_note); the summary counts them.
-RERUNS="${VOLE_STD2_RERUN_NOTE:-$WORK/reruns}"
-export VOLE_STD2_RERUN_NOTE="$RERUNS"
+# here (front/modules/stdlazy.vl: rerun_note); the summary counts them.
+RERUNS="${VOLE_STD_RERUN_NOTE:-$WORK/reruns}"
+export VOLE_STD_RERUN_NOTE="$RERUNS"
 # (0.25.2) The skipped checks that say why (a `skip NAME: why` line of a
 # runner below, like the window tests' without a display giving frames):
 # printed before the summary, `SKIP NAME: why`, and counted apart.
@@ -577,15 +577,15 @@ check_case() {
     if [ -n "${VOLE_TEST_FLAGS:-}" ] && [ "$(cat "$dir/noextra")" != 1 ]; then
         FLAGS="$FLAGS $VOLE_TEST_FLAGS"
     fi
-    # (0.27.2) std2's cases (gate 1's std2-tests row) are built with
-    # --check-alloc, std2's checking Gpa, and one fails when blocks of Gpa
+    # (0.27.2) std's cases (gate 1's std-tests row) are built with
+    # --check-alloc, std's checking Gpa, and one fails when blocks of Gpa
     # are left at exit, unless a STDERR line expects the list
-    # (VOLE_TEST_STD2_PLAIN=1: built without it)
-    STD2_LEAKS=0
+    # (VOLE_TEST_STD_PLAIN=1: built without it)
+    STD_LEAKS=0
     case "${file##*/}" in
-        std2_*)
-            if [ "${VOLE_TEST_STD2_PLAIN:-0}" != 1 ] && [ "$(cat "$dir/noextra")" != 1 ]; then
-                STD2_LEAKS=1
+        std_*)
+            if [ "${VOLE_TEST_STD_PLAIN:-0}" != 1 ] && [ "$(cat "$dir/noextra")" != 1 ]; then
+                STD_LEAKS=1
                 case " $FLAGS " in *" --check-alloc "*) ;; *) FLAGS="$FLAGS --check-alloc" ;; esac
             fi ;;
     esac
@@ -714,7 +714,7 @@ check_case() {
         fi
     done <"$dir/stderrs"
     # (a case that panics, EXIT: 101, ends with its blocks: no unwinding)
-    if [ $STD2_LEAKS = 1 ] && [ "$expected_exit" = 0 ] \
+    if [ $STD_LEAKS = 1 ] && [ "$expected_exit" = 0 ] \
         && grep -q '^check-alloc: .* of Gpa not freed' "$dir/stderr" \
         && ! grep -q 'not freed' "$dir/stderrs"; then
         { echo "blocks of Gpa left at exit (--check-alloc):"; cat "$dir/stderr"; } >"$dir/why"
@@ -955,7 +955,7 @@ run_case() {
 }
 
 # The standard library built into the compiler must be its source's (0.5;
-# 0.27.5: its index of units, std2_units, made by the compiler tested).
+# 0.27.5: its index of units, std_units, made by the compiler tested).
 if [ -x "$ROOT/compiler/std/embed.sh" ] && ! VOLE_EMBED_VOLEC="$COMPILER" "$ROOT/compiler/std/embed.sh" -c; then
     exit 1
 fi
@@ -1152,8 +1152,8 @@ while read -r name file; do
     # (0.27.2.1) VOLE_TEST_RESULTS=FILE: each case's name, its status
     # (pass, xfail, fail, xpass, skip) and how many borrowck errors its
     # compilation had at std's positions (`<std>:L:C`), one line each: the
-    # gate's std2-tests and std2-check rows read the suite rows' builds of
-    # std2's cases from it instead of building them again
+    # gate's std-tests and std-check rows read the suite rows' builds of
+    # std's cases from it instead of building them again
     if [ -n "${VOLE_TEST_RESULTS:-}" ]; then
         bck=0
         [ -f "$dir/compile.out" ] && bck=$(grep -c '^<std>:[0-9]*:[0-9]*: error\[borrowck' "$dir/compile.out")
@@ -1740,7 +1740,7 @@ if [ "$RERUNS" != 1 ] && [ -s "$RERUNS" ]; then
     # formatted), so two programs made again on purpose
     # (rust_f_f15_prim_impl_bound_ok, _unnamed_ok) are six builds
     progs=$(grep -o '[^ ]*\.vl' "$RERUNS" | sed 's|.*/||' | sort -u)
-    echo "lazy std: $n build(s) of $(echo "$progs" | wc -l | tr -d ' ') program(s) were made again with std whole (VOLE_STD2_NORERUN=1 shows why; a word or a seed is missing in front/modules/std2lazy.vl); the first: $(echo "$progs" | head -8 | tr '\n' ' ' | sed 's/ $//')"
+    echo "lazy std: $n build(s) of $(echo "$progs" | wc -l | tr -d ' ') program(s) were made again with std whole (VOLE_STD_NORERUN=1 shows why; a word or a seed is missing in front/modules/stdlazy.vl); the first: $(echo "$progs" | head -8 | tr '\n' ' ' | sed 's/ $//')"
 fi
 if grep -q ' fail$' "$TALLY"; then
     exit 1

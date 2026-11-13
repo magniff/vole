@@ -3,7 +3,7 @@
 # a case's program built by stable rustc with the shim's prelude
 # (tools/rustc-twin/prelude.rs: `Gpa`, the `_in` functions as extension
 # traits) and run; its stdout and exit code must be the case's EXPECT and
-# EXIT lines. The generalization of tools/std2-twin.sh: the program keeps
+# EXIT lines. The generalization of tools/std-twin.sh: the program keeps
 # its allocator calls, which resolve to the prelude's.
 #
 # usage: tools/rustc-twin.sh [-v] [-j N] [-r RUSTC] [--guide] [--alloc-api]
