@@ -20,8 +20,8 @@
 
 use crate::back::objfile::c_bytes;
 use crate::base::{
-    IntVec, buf_byte, buf_bytes, buf_fmt, buf_len, buf_new, buf_ptr, buf_reserve, buf_slice,
-    buf_str, buf_uint, cstr, get_src, memcmp, out_path, root_dir, strlen, sym_text,
+    buf_byte, buf_bytes, buf_fmt, buf_new, buf_reserve, buf_slice, buf_str, buf_uint, cstr, get_src,
+    out_path, root_dir, sym_text,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -31,31 +31,55 @@ use crate::middle::ctx::FnCtx;
 
 // ---- Source positions ----
 
-// The offsets in SRC where lines start (made once, when first needed:
-// every source is loaded by then).
-static mut LINE_STARTS: IntVec = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-static mut SRC_END: i64 = 0;
+// (0.29) -g's tables (and the line starts --trace and --vec-stats=FN ask
+// for): one value in the compilation context, `Ctx.dbg`, behind a lock,
+// because the code generation reaches it through `&Ctx` (it runs on one
+// thread under -g and --vec-stats=FN, parallel::serial_only, so the lock
+// is never waited for; it is what lets a shared context be written).
+pub struct DbgTables<A: std::alloc::Allocator> {
+    // The offsets in SRC where lines start (made once, when first needed:
+    // every source is loaded by then), and where the sources end.
+    pub line_starts: Vec<i64, A>,
+    pub src_end: i64,
+    // The `.file` number of each file of FILES (0: none yet), and how many
+    // are given.
+    pub file_numbers: Vec<i64, A>,
+    pub files_used: i64,
+    // For each function emitted: its FNS index, the symbol prefix of its
+    // label (a C string literal's address), its position (the
+    // declaration); the number of its end label is its index here.
+    pub fns: Vec<i64, A>,
+    pub prefix: Vec<i64, A>,
+    pub pos: Vec<i64, A>,
+}
 
-fn init_lines(pcx: &Ctx<Comp>) {
+pub fn dbg_tables_new() -> DbgTables<Comp> {
+    DbgTables {
+        line_starts: Vec::new_in(Comp {}), src_end: 0, file_numbers: Vec::new_in(Comp {}),
+        files_used: 0, fns: Vec::new_in(Comp {}), prefix: Vec::new_in(Comp {}),
+        pos: Vec::new_in(Comp {}),
+    }
+}
+
+fn init_lines(d: &mut DbgTables<Comp>, pcx: &Ctx<Comp>) {
     let last = pcx.files[(pcx.files.len() as i64 - 1) as usize].end;
-    set_src_end(last);
-    { let mut line_starts_copy = get_line_starts(); line_starts_copy.push(0);
-        set_line_starts(line_starts_copy); }
+    d.src_end = last;
+    d.line_starts.push(0);
+    let src = get_src();
     for i in 0..last {
-        if get_src()[i as usize] == b'\n' {
-            { let mut line_starts_copy = get_line_starts(); line_starts_copy.push(i + 1);
-                set_line_starts(line_starts_copy); }
+        if src[i as usize] == b'\n' {
+            d.line_starts.push(i + 1);
         }
     }
 }
 
 // The index of the line holding position `pos`.
-fn line_index(pos: i64) -> i64 {
+fn line_index(pos: i64, d: &DbgTables<Comp>) -> i64 {
     let mut lo: i64 = 0;
-    let mut hi = get_line_starts().len() as i64 - 1;
+    let mut hi = d.line_starts.len() as i64 - 1;
     while lo < hi {
         let mid = (lo + hi + 1) / 2;
-        if (get_line_starts()[mid as usize]) <= pos {
+        if d.line_starts[mid as usize] <= pos {
             lo = mid;
         } else {
             hi = mid - 1;
@@ -82,94 +106,85 @@ fn file_of(pos: i64, pcx: &Ctx<Comp>) -> i64 {
 // (0.17) The file holding position `pos` and its line there (from 1), as
 // file << 32 | line: --trace's sites (middle/trace.vl).
 pub fn file_and_line(pos: i64, pcx: &Ctx<Comp>) -> i64 {
-    if get_line_starts().len() as i64 == 0 {
-        init_lines(pcx);
+    let mut guard = pcx.dbg.lock().unwrap();
+    let d = &mut *guard;
+    if d.line_starts.len() == 0 {
+        init_lines(d, pcx);
     }
     let file = file_of(pos, pcx);
-    let line = line_index(pos) - line_index(pcx.files[file as usize].start) + 1;
+    let line = line_index(pos, d) - line_index(pcx.files[file as usize].start, d) + 1;
     (file << 32) | line
 }
-
-// The `.file` number of each file of FILES (0: none yet).
-static mut FILE_NUMBERS: IntVec = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-static mut FILES_USED: i64 = 0;
 
 // Writes the `.loc` of source position `pos` to buffer `out` (and the
 // `.file` of its file, the first time); nothing for a position of a
 // synthesized source, or -1.
 pub fn dbg_loc(out: i64, pos: i64, pcx: &Ctx<Comp>) {
-    unsafe {
-        if !pcx.debug_info || pos < 0 {
-            return;
-        }
-        if get_line_starts().len() as i64 == 0 {
-            init_lines(pcx);
-        }
-        if pos >= get_src_end() {
-            return;
-        }
-        let file = file_of(pos, pcx);
-        let path = pcx.files[file as usize].path;
-        if (*path.add(0)) == b'<' {
-            return;
-        }
-        while get_file_numbers().len() as i64 <= file {
-            { let mut file_numbers_copy = get_file_numbers(); file_numbers_copy.push(0);
-                set_file_numbers(file_numbers_copy); }
-        }
-        if (get_file_numbers()[file as usize]) == 0 {
-            set_files_used(get_files_used() + (1));
-            (get_file_numbers()[file as usize]) = get_files_used();
-            let files_used_now = get_files_used();
-            buf_fmt(out, format_args("    .file {files_used_now} "));
-            // (0.18) the file by its absolute path, the root's directory and
-            // its root-relative name: the assembler resolves a relative
-            // `.file` against its own current directory, which need not
-            // be the root's (cc assembling `-S` output elsewhere)
-            let root = root_dir(pcx);
-            if (*root.add(0)) != 0 {
-                let full = buf_new();
-                buf_str(full, root);
-                buf_byte(full, b'/');
-                buf_str(full, out_path(file, pcx));
-                buf_byte(full, 0);
-                quoted(out, buf_ptr(full));
-            } else {
-                quoted(out, out_path(file, pcx));
-            }
-            buf_byte(out, b'\n');
-        }
-        let line = line_index(pos);
-        let first = line_index(pcx.files[file as usize].start);
-        buf_fmt(out,
-            format_args("    .loc {} {} ", (get_file_numbers()[file as usize]),
-                line - first + 1));
-        buf_fmt(out, format_args("{}\n", pos - (get_line_starts()[line as usize]) + 1));
+    if !pcx.debug_info || pos < 0 {
+        return;
     }
+    let mut guard = pcx.dbg.lock().unwrap();
+    loc_at(out, pos, &mut *guard, pcx);
+}
+
+// dbg_loc, with the tables in hand.
+fn loc_at(out: i64, pos: i64, d: &mut DbgTables<Comp>, pcx: &Ctx<Comp>) {
+    if pos < 0 {
+        return;
+    }
+    if d.line_starts.len() == 0 {
+        init_lines(d, pcx);
+    }
+    if pos >= d.src_end {
+        return;
+    }
+    let file = file_of(pos, pcx);
+    if cstr(pcx.files[file as usize].path).starts_with(b"<") {
+        return;
+    }
+    while d.file_numbers.len() as i64 <= file {
+        d.file_numbers.push(0);
+    }
+    if d.file_numbers[file as usize] == 0 {
+        d.files_used += 1;
+        d.file_numbers[file as usize] = d.files_used;
+        let files_used_now = d.files_used;
+        buf_fmt(out, format_args("    .file {files_used_now} "));
+        // (0.18) the file by its absolute path, the root's directory and
+        // its root-relative name: the assembler resolves a relative
+        // `.file` against its own current directory, which need not
+        // be the root's (cc assembling `-S` output elsewhere)
+        let root = cstr(root_dir(pcx));
+        if root.len() != 0 {
+            let full = buf_new();
+            buf_bytes(full, root);
+            buf_byte(full, b'/');
+            buf_str(full, out_path(file, pcx));
+            quoted(out, buf_slice(full));
+        } else {
+            quoted(out, cstr(out_path(file, pcx)));
+        }
+        buf_byte(out, b'\n');
+    }
+    let line = line_index(pos, d);
+    let first = line_index(pcx.files[file as usize].start, d);
+    buf_fmt(out, format_args("    .loc {} {} ", d.file_numbers[file as usize], line - first + 1));
+    buf_fmt(out, format_args("{}\n", pos - d.line_starts[line as usize] + 1));
 }
 
 // "<s>", with " and \ escaped.
-fn quoted(out: i64, s: *mut u8) {
-    unsafe {
-        buf_byte(out, b'"');
-        let n = strlen(s) as i64;
-        for i in 0..n {
-            if (*s.add(i as usize)) == b'"' || (*s.add(i as usize)) == b'\\' {
-                buf_byte(out, b'\\');
-            }
-            buf_byte(out, (*s.add(i as usize)));
+fn quoted(out: i64, s: &[u8]) {
+    buf_byte(out, b'"');
+    for &c in s {
+        if c == b'"' || c == b'\\' {
+            buf_byte(out, b'\\');
         }
-        buf_byte(out, b'"');
+        buf_byte(out, c);
     }
+    buf_byte(out, b'"');
 }
 
 // ---- Functions ----
-
-// Per function emitted: its FNS index, the symbol prefix of its label,
-// its position (the declaration) and the number of its end label.
-static mut DBG_FNS: IntVec = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-static mut DBG_PREFIX: IntVec = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-static mut DBG_POS: IntVec = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
 
 // Before function f's label (in ASM): the line of its declaration, at
 // `pos`, for its first instruction.
@@ -177,11 +192,12 @@ pub fn dbg_function_begin(cx: &mut FnCtx<Comp>, f: i64, prefix: *mut u8, pos: i6
     if !pcx.debug_info {
         return;
     }
-    dbg_loc(cx.asm, pos, pcx);
-    { let mut dbg_fns_copy = get_dbg_fns(); dbg_fns_copy.push(f); set_dbg_fns(dbg_fns_copy); }
-    { let mut dbg_prefix_copy = get_dbg_prefix(); dbg_prefix_copy.push(prefix as i64);
-        set_dbg_prefix(dbg_prefix_copy); }
-    { let mut dbg_pos_copy = get_dbg_pos(); dbg_pos_copy.push(pos); set_dbg_pos(dbg_pos_copy); }
+    let mut guard = pcx.dbg.lock().unwrap();
+    let d = &mut *guard;
+    loc_at(cx.asm, pos, d, pcx);
+    d.fns.push(f);
+    d.prefix.push(prefix as i64);
+    d.pos.push(pos);
 }
 
 // After the function's last instruction (in ASM): its end label.
@@ -189,7 +205,8 @@ pub fn dbg_function_end(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
     if !pcx.debug_info {
         return;
     }
-    end_label(cx.asm, get_dbg_fns().len() as i64 - 1);
+    let last = pcx.dbg.lock().unwrap().fns.len() as i64 - 1;
+    end_label(cx.asm, last);
     buf_str(cx.asm, c":\n");
 }
 
@@ -200,7 +217,7 @@ fn end_label(out: i64, i: i64) {
 // The end of the code (in ASM, after the last instruction of the text
 // section).
 pub fn dbg_text_end(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
-    if !pcx.debug_info || get_dbg_fns().len() as i64 == 0 {
+    if !pcx.debug_info || pcx.dbg.lock().unwrap().fns.len() == 0 {
         return;
     }
     buf_fmt(cx.asm,
@@ -279,12 +296,12 @@ fn section_offset(cx: &mut FnCtx<Comp>, name: *mut u8) {
 }
 
 // A function's label as an operand.
-fn function_symbol(cx: &mut FnCtx<Comp>, i: i64, pcx: &Ctx<Comp>) {
-    let f = (get_dbg_fns()[i as usize]);
+fn function_symbol(cx: &mut FnCtx<Comp>, i: i64, d: &DbgTables<Comp>, pcx: &Ctx<Comp>) {
+    let f = (d.fns[i as usize]);
     // (emit_symbol_ref writes to CODE)
     let out = cx.code;
     cx.code = cx.asm;
-    emit_symbol_ref(cx, (get_dbg_prefix()[i as usize]) as *mut u8,
+    emit_symbol_ref(cx, (d.prefix[i as usize]) as *mut u8,
         pcx.fns[f as usize].name, pcx);
     cx.code = out;
 }
@@ -293,7 +310,12 @@ fn function_symbol(cx: &mut FnCtx<Comp>, i: i64, pcx: &Ctx<Comp>) {
 // `main_path` (appended to ASM).
 pub fn dbg_sections(cx: &mut FnCtx<Comp>, main_path: *mut u8, producer: *mut u8, pcx: &Ctx<Comp>) {
     unsafe {
-        if !pcx.debug_info || get_dbg_fns().len() as i64 == 0 {
+        if !pcx.debug_info {
+            return;
+        }
+        let guard = pcx.dbg.lock().unwrap();
+        let d = &*guard;
+        if d.fns.len() == 0 {
             return;
         }
         // The abbreviations: 1 the compile unit, 2 a subprogram, 3 one
@@ -357,27 +379,26 @@ pub fn dbg_sections(cx: &mut FnCtx<Comp>, main_path: *mut u8, producer: *mut u8,
         // file names are relative to (out_path), not the current one.
         let dir = buf_new();
         let root = root_dir(pcx);
-        if (*root.add(0)) != 0 {
-            string(dir,
-                c_bytes(root));
+        if cstr(root).len() != 0 {
+            string(dir, c_bytes(root));
         } else {
-            string(dir, std::slice::from_raw_parts(c".".add((0) as usize), (1 - (0)) as usize));
+            string(dir, b".");
         }
         bytes(cx, buf_slice(dir));
         buf_str(cx.asm, c"    .quad ");
-        function_symbol(cx, 0, pcx);
+        function_symbol(cx, 0, d, pcx);
         buf_fmt(cx.asm,
             format_args("\n    .long {}dbg.text_end - ",
                 str::from_utf8(cstr(local_prefix())).unwrap()));
-        function_symbol(cx, 0, pcx);
+        function_symbol(cx, 0, d, pcx);
         buf_byte(cx.asm, b'\n');
         // The functions.
-        for i in 0..get_dbg_fns().len() as i64 {
-            let f = (get_dbg_fns()[i as usize]);
-            let pos = (get_dbg_pos()[i as usize]);
-            let file: i64 = if pos >= 0 && pos < get_src_end() { file_of(pos, pcx) } else { -1 };
-            let declared = file >= 0 && file < get_file_numbers().len() as i64
-                && (get_file_numbers()[file as usize]) > 0;
+        for i in 0..d.fns.len() as i64 {
+            let f = (d.fns[i as usize]);
+            let pos = (d.pos[i as usize]);
+            let file: i64 = if pos >= 0 && pos < d.src_end { file_of(pos, pcx) } else { -1 };
+            let declared = file >= 0 && file < d.file_numbers.len() as i64
+                && (d.file_numbers[file as usize]) > 0;
             let s = buf_new();
             buf_byte(s, if declared { 2 } else { 3 });
             let display = pcx.fns[f as usize].display;
@@ -386,17 +407,17 @@ pub fn dbg_sections(cx: &mut FnCtx<Comp>, main_path: *mut u8, producer: *mut u8,
                 else { sym_text(pcx.fns[f as usize].name, pcx) });
             bytes(cx, buf_slice(s));
             buf_str(cx.asm, c"    .quad ");
-            function_symbol(cx, i, pcx);
+            function_symbol(cx, i, d, pcx);
             buf_str(cx.asm, c"\n    .long ");
             end_label(cx.asm, i);
             buf_str(cx.asm, c" - ");
-            function_symbol(cx, i, pcx);
+            function_symbol(cx, i, d, pcx);
             buf_byte(cx.asm, b'\n');
             if declared {
-                let d = buf_new();
-                uleb(d, (get_file_numbers()[file as usize]));
-                uleb(d, line_index(pos) - line_index(pcx.files[file as usize].start) + 1);
-                bytes(cx, buf_slice(d));
+                let decl = buf_new();
+                uleb(decl, d.file_numbers[file as usize]);
+                uleb(decl, line_index(pos, d) - line_index(pcx.files[file as usize].start, d) + 1);
+                bytes(cx, buf_slice(decl));
             }
         }
         let end = buf_new();
@@ -413,69 +434,65 @@ pub fn dbg_sections(cx: &mut FnCtx<Comp>, main_path: *mut u8, producer: *mut u8,
 
 // Whether bytes [a, b) of `t` are an instruction: an indented line that is
 // neither a directive nor a label.
-fn is_instruction(t: *mut u8, a: i64, b: i64) -> bool {
-    unsafe {
-        let mut i = a;
-        while i < b && ((*t.add(i as usize)) == b' ' || (*t.add(i as usize)) == b'\t') {
-            i += 1;
-        }
-        if i == a || i >= b || (*t.add(i as usize)) == b'.' {
-            return false;
-        }
-        (*t.add((b - 1) as usize)) != b':'
+fn is_instruction(t: &[u8], a: i64, b: i64) -> bool {
+    let mut i = a;
+    while i < b && (t[i as usize] == b' ' || t[i as usize] == b'\t') {
+        i += 1;
     }
+    if i == a || i >= b || t[i as usize] == b'.' {
+        return false;
+    }
+    t[(b - 1) as usize] != b':'
 }
 
 // Whether bytes [a, b) of `t` are the directive `word` (indented or not)
 // followed by a space.
-fn is_directive(t: *mut u8, a: i64, b: i64, word: *mut u8) -> bool {
-    unsafe {
-        let mut i = a;
-        while i < b && ((*t.add(i as usize)) == b' ' || (*t.add(i as usize)) == b'\t') {
-            i += 1;
-        }
-        let n = strlen(word) as i64;
-        i + n < b && memcmp(t.add(i as usize), word, n as u64) == 0
-            && (*t.add((i + n) as usize)) == b' '
+fn is_directive(t: &[u8], a: i64, b: i64, word: &[u8]) -> bool {
+    let mut i = a;
+    while i < b && (t[i as usize] == b' ' || t[i as usize] == b'\t') {
+        i += 1;
     }
+    let n = word.len() as i64;
+    i + n < b && &t[i as usize..(i + n) as usize] == word && t[(i + n) as usize] == b' '
 }
 
 // Whether bytes [a, b) of `t` are exactly `s`.
-fn line_is(t: *mut u8, a: i64, b: i64, s: *mut u8) -> bool {
-    unsafe {
-        let n = strlen(s) as i64;
-        b - a == n && memcmp(t.add(a as usize), s, n as u64) == 0
-    }
+fn line_is(t: &[u8], a: i64, b: i64, s: &[u8]) -> bool {
+    &t[a as usize..b as usize] == s
+}
+
+// Whether bytes [a, b) of `t` have `s` at `at` (inside them).
+fn has_at(t: &[u8], at: i64, b: i64, s: &[u8]) -> bool {
+    at + s.len() as i64 <= b && &t[at as usize..at as usize + s.len()] == s
 }
 
 // The next line from `i` that is not a `.loc`: its start, its end in `end`.
-fn next_line(t: *mut u8, n: i64, i: i64, end: &mut i64) -> i64 {
-    unsafe {
-        let mut a = i;
-        while a < n {
-            let mut e = a;
-            while e < n && (*t.add(e as usize)) != b'\n' {
-                e += 1;
-            }
-            if !is_directive(t, a, e, c".loc") {
-                *end = e;
-                return a;
-            }
-            a = e + 1;
+fn next_line(t: &[u8], i: i64, end: &mut i64) -> i64 {
+    let n = t.len() as i64;
+    let mut a = i;
+    while a < n {
+        let mut e = a;
+        while e < n && t[e as usize] != b'\n' {
+            e += 1;
         }
-        *end = n;
-        n
+        if !is_directive(t, a, e, b".loc") {
+            *end = e;
+            return a;
+        }
+        a = e + 1;
     }
+    *end = n;
+    n
 }
 
 // The standard prologue: the frame pointer and return address saved, the
 // frame pointer set.
-fn prologue_first() -> *mut u8 {
-    if get_x86() { c"    pushq %rbp" } else { c"    stp x29, x30, [sp, #-16]!" }
+fn prologue_first() -> &'static [u8] {
+    if get_x86() { b"    pushq %rbp" } else { b"    stp x29, x30, [sp, #-16]!" }
 }
 
-fn prologue_second() -> *mut u8 {
-    if get_x86() { c"    movq %rsp, %rbp" } else { c"    mov x29, sp" }
+fn prologue_second() -> &'static [u8] {
+    if get_x86() { b"    movq %rsp, %rbp" } else { b"    mov x29, sp" }
 }
 
 // Rewrites ASM so that every `.loc` comes right before an instruction: a
@@ -495,8 +512,10 @@ pub fn dbg_place_locs(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
         if !pcx.debug_info {
             return;
         }
-        let t = buf_ptr(cx.asm);
-        let n = buf_len(cx.asm);
+        // (the text is read whole while `out` is written: ASM is not
+        // written again before it is replaced below)
+        let t = buf_slice(cx.asm);
+        let n = t.len() as i64;
         let out = buf_new();
         buf_reserve(out, n + n / 8);
         let cfi = !get_elf();
@@ -512,7 +531,7 @@ pub fn dbg_place_locs(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
         let mut i: i64 = 0;
         while i < n {
             let mut e = i;
-            while e < n && (*t.add(e as usize)) != b'\n' {
+            while e < n && t[e as usize] != b'\n' {
                 e += 1;
             }
             if is_loc(t, i, e) {
@@ -521,24 +540,24 @@ pub fn dbg_place_locs(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
                 i = e + 1;
                 continue;
             }
-            let label = e > i && (*t.add((e - 1) as usize)) == b':' && (*t.add(i as usize)) != b' ';
-            let section = is_directive(t, i, e, c".section") || line_is(t, i, e, c".text")
-                || line_is(t, i, e, c".data");
+            let label = e > i && t[(e - 1) as usize] == b':' && t[i as usize] != b' ';
+            let section = is_directive(t, i, e, b".section") || line_is(t, i, e, b".text")
+                || line_is(t, i, e, b".data");
             if cfi && cfi_open
                 && (section || (label && (!is_local_label(t, i, e) || is_dbg_end(t, i, e)))) {
                 buf_str(out, c"    .cfi_endproc\n");
                 cfi_open = false;
             }
             if section {
-                in_text = is_directive(t, i, e, c".section")
-                    && memcmp(t.add((i + 9) as usize), c"__TEXT,__text", 13) == 0
-                    || line_is(t, i, e, c".text");
+                in_text = is_directive(t, i, e, b".section")
+                    && has_at(t, i + 9, e, b"__TEXT,__text")
+                    || line_is(t, i, e, b".text");
             }
             if is_instruction(t, i, e) {
                 let mut cfi_after = false;
                 if cfi && fn_state == 1 && line_is(t, i, e, prologue_first()) {
                     let mut e2: i64 = 0;
-                    let a2 = next_line(t, n, e + 1, &mut e2);
+                    let a2 = next_line(t, e + 1, &mut e2);
                     if line_is(t, a2, e2, prologue_second()) {
                         buf_str(out, c"    .cfi_startproc\n");
                         cfi_open = true;
@@ -555,15 +574,13 @@ pub fn dbg_place_locs(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
                 if pending_start >= 0 {
                     let same = last_start >= 0
                         && pending_end - pending_start == last_end - last_start
-                        && memcmp(t.add(pending_start as usize), t.add(last_start as usize),
-                            (last_end - last_start) as u64)
-                        == 0;
+                        && t[pending_start as usize..pending_end as usize]
+                        == t[last_start as usize..last_end as usize];
                     if !same {
                         buf_fmt(out,
                             format_args("{}\n",
                                 str::from_utf8(
-                                    std::slice::from_raw_parts(t.add((pending_start) as usize),
-                                        (pending_end - (pending_start)) as usize)).unwrap()));
+                                    &t[pending_start as usize..pending_end as usize]).unwrap()));
                         last_start = pending_start;
                         last_end = pending_end;
                     }
@@ -571,8 +588,7 @@ pub fn dbg_place_locs(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
                 }
                 buf_fmt(out,
                     format_args("{}\n",
-                        str::from_utf8(std::slice::from_raw_parts(t.add((i) as usize),
-                            (e - (i)) as usize)).unwrap()));
+                        str::from_utf8(&t[i as usize..e as usize]).unwrap()));
                 if cfi_after {
                     if get_x86() {
                         buf_str(out, c"    .cfi_def_cfa_offset 16\n    .cfi_offset %rbp, -16\n    .cfi_def_cfa_register %rbp\n");
@@ -591,8 +607,7 @@ pub fn dbg_place_locs(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
             }
             buf_fmt(out,
                 format_args("{}\n",
-                    str::from_utf8(std::slice::from_raw_parts(t.add((i) as usize),
-                        (e - (i)) as usize)).unwrap()));
+                    str::from_utf8(&t[i as usize..e as usize]).unwrap()));
             i = e + 1;
         }
         if cfi_open {
@@ -602,270 +617,19 @@ pub fn dbg_place_locs(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
     }
 }
 
-fn is_loc(t: *mut u8, a: i64, b: i64) -> bool {
-    is_directive(t, a, b, c".loc")
+fn is_loc(t: &[u8], a: i64, b: i64) -> bool {
+    is_directive(t, a, b, b".loc")
 }
 
 // Whether a label is one of the ends dbg_function_end and dbg_text_end
 // write.
-fn is_dbg_end(t: *mut u8, a: i64, b: i64) -> bool {
-    unsafe {
-        let p = local_prefix();
-        let k = strlen(p) as i64;
-        b - a > k + 7 && memcmp(t.add((a + k) as usize), c"dbg.end", 7) == 0
-            || b - a > k + 12 && memcmp(t.add((a + k) as usize), c"dbg.text_end", 12) == 0
-    }
+fn is_dbg_end(t: &[u8], a: i64, b: i64) -> bool {
+    let k = cstr(local_prefix()).len() as i64;
+    b - a > k + 7 && has_at(t, a + k, b, b"dbg.end")
+        || b - a > k + 12 && has_at(t, a + k, b, b"dbg.text_end")
 }
 
-fn is_local_label(t: *mut u8, a: i64, b: i64) -> bool {
-    unsafe {
-        let p = local_prefix();
-        let k = strlen(p) as i64;
-        b - a > k && memcmp(t.add(a as usize), p, k as u64) == 0
-    }
-}
-
-// (0.28.0) LINE_STARTS's accessors: every use of it is one of them.
-fn get_line_starts() -> IntVec {
-    // UNSAFE: the -g line and function tables, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: a task reaches its writers (dbg_function_begin, dbg_loc,
-    // init_lines) only under -g (dbg_function_begin returns unless
-    // debug_info, emit_loc is called only if debug_info) or, for
-    // init_lines/LINE_STARTS/SRC_END, through file_and_line <-
-    // vectorize::loop_line only when --vec-stats=FN reports; -g and
-    // --vec-stats=FN make the compile serial (parallel::serial_only:
-    // threads_for 1, no assembler thread), and the join and the assembler
-    // thread do not reach it; other uses (trace_after_lowering,
-    // dbg_sections, dbg_place_locs) are the main thread's; so one thread at
-    // a time
-    unsafe { LINE_STARTS }
-}
-
-fn set_line_starts(v: IntVec) {
-    // UNSAFE: the -g line and function tables, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: a task reaches its writers (dbg_function_begin, dbg_loc,
-    // init_lines) only under -g (dbg_function_begin returns unless
-    // debug_info, emit_loc is called only if debug_info) or, for
-    // init_lines/LINE_STARTS/SRC_END, through file_and_line <-
-    // vectorize::loop_line only when --vec-stats=FN reports; -g and
-    // --vec-stats=FN make the compile serial (parallel::serial_only:
-    // threads_for 1, no assembler thread), and the join and the assembler
-    // thread do not reach it; other uses (trace_after_lowering,
-    // dbg_sections, dbg_place_locs) are the main thread's; so one thread at
-    // a time
-    unsafe {
-        LINE_STARTS = v;
-    }
-}
-
-// (0.28.0) SRC_END's accessors: every use of it is one of them.
-fn get_src_end() -> i64 {
-    // UNSAFE: the -g line and function tables, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: a task reaches its writers (dbg_function_begin, dbg_loc,
-    // init_lines) only under -g (dbg_function_begin returns unless
-    // debug_info, emit_loc is called only if debug_info) or, for
-    // init_lines/LINE_STARTS/SRC_END, through file_and_line <-
-    // vectorize::loop_line only when --vec-stats=FN reports; -g and
-    // --vec-stats=FN make the compile serial (parallel::serial_only:
-    // threads_for 1, no assembler thread), and the join and the assembler
-    // thread do not reach it; other uses (trace_after_lowering,
-    // dbg_sections, dbg_place_locs) are the main thread's; so one thread at
-    // a time
-    unsafe { SRC_END }
-}
-
-fn set_src_end(v: i64) {
-    // UNSAFE: the -g line and function tables, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: a task reaches its writers (dbg_function_begin, dbg_loc,
-    // init_lines) only under -g (dbg_function_begin returns unless
-    // debug_info, emit_loc is called only if debug_info) or, for
-    // init_lines/LINE_STARTS/SRC_END, through file_and_line <-
-    // vectorize::loop_line only when --vec-stats=FN reports; -g and
-    // --vec-stats=FN make the compile serial (parallel::serial_only:
-    // threads_for 1, no assembler thread), and the join and the assembler
-    // thread do not reach it; other uses (trace_after_lowering,
-    // dbg_sections, dbg_place_locs) are the main thread's; so one thread at
-    // a time
-    unsafe {
-        SRC_END = v;
-    }
-}
-
-// (0.28.0) FILE_NUMBERS's accessors: every use of it is one of them.
-fn get_file_numbers() -> IntVec {
-    // UNSAFE: the -g line and function tables, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: a task reaches its writers (dbg_function_begin, dbg_loc,
-    // init_lines) only under -g (dbg_function_begin returns unless
-    // debug_info, emit_loc is called only if debug_info) or, for
-    // init_lines/LINE_STARTS/SRC_END, through file_and_line <-
-    // vectorize::loop_line only when --vec-stats=FN reports; -g and
-    // --vec-stats=FN make the compile serial (parallel::serial_only:
-    // threads_for 1, no assembler thread), and the join and the assembler
-    // thread do not reach it; other uses (trace_after_lowering,
-    // dbg_sections, dbg_place_locs) are the main thread's; so one thread at
-    // a time
-    unsafe { FILE_NUMBERS }
-}
-
-fn set_file_numbers(v: IntVec) {
-    // UNSAFE: the -g line and function tables, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: a task reaches its writers (dbg_function_begin, dbg_loc,
-    // init_lines) only under -g (dbg_function_begin returns unless
-    // debug_info, emit_loc is called only if debug_info) or, for
-    // init_lines/LINE_STARTS/SRC_END, through file_and_line <-
-    // vectorize::loop_line only when --vec-stats=FN reports; -g and
-    // --vec-stats=FN make the compile serial (parallel::serial_only:
-    // threads_for 1, no assembler thread), and the join and the assembler
-    // thread do not reach it; other uses (trace_after_lowering,
-    // dbg_sections, dbg_place_locs) are the main thread's; so one thread at
-    // a time
-    unsafe {
-        FILE_NUMBERS = v;
-    }
-}
-
-// (0.28.0) FILES_USED's accessors: every use of it is one of them.
-fn get_files_used() -> i64 {
-    // UNSAFE: the -g line and function tables, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: a task reaches its writers (dbg_function_begin, dbg_loc,
-    // init_lines) only under -g (dbg_function_begin returns unless
-    // debug_info, emit_loc is called only if debug_info) or, for
-    // init_lines/LINE_STARTS/SRC_END, through file_and_line <-
-    // vectorize::loop_line only when --vec-stats=FN reports; -g and
-    // --vec-stats=FN make the compile serial (parallel::serial_only:
-    // threads_for 1, no assembler thread), and the join and the assembler
-    // thread do not reach it; other uses (trace_after_lowering,
-    // dbg_sections, dbg_place_locs) are the main thread's; so one thread at
-    // a time
-    unsafe { FILES_USED }
-}
-
-fn set_files_used(v: i64) {
-    // UNSAFE: the -g line and function tables, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: a task reaches its writers (dbg_function_begin, dbg_loc,
-    // init_lines) only under -g (dbg_function_begin returns unless
-    // debug_info, emit_loc is called only if debug_info) or, for
-    // init_lines/LINE_STARTS/SRC_END, through file_and_line <-
-    // vectorize::loop_line only when --vec-stats=FN reports; -g and
-    // --vec-stats=FN make the compile serial (parallel::serial_only:
-    // threads_for 1, no assembler thread), and the join and the assembler
-    // thread do not reach it; other uses (trace_after_lowering,
-    // dbg_sections, dbg_place_locs) are the main thread's; so one thread at
-    // a time
-    unsafe {
-        FILES_USED = v;
-    }
-}
-
-// (0.28.0) DBG_FNS's accessors: every use of it is one of them.
-fn get_dbg_fns() -> IntVec {
-    // UNSAFE: the -g line and function tables, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: a task reaches its writers (dbg_function_begin, dbg_loc,
-    // init_lines) only under -g (dbg_function_begin returns unless
-    // debug_info, emit_loc is called only if debug_info) or, for
-    // init_lines/LINE_STARTS/SRC_END, through file_and_line <-
-    // vectorize::loop_line only when --vec-stats=FN reports; -g and
-    // --vec-stats=FN make the compile serial (parallel::serial_only:
-    // threads_for 1, no assembler thread), and the join and the assembler
-    // thread do not reach it; other uses (trace_after_lowering,
-    // dbg_sections, dbg_place_locs) are the main thread's; so one thread at
-    // a time
-    unsafe { DBG_FNS }
-}
-
-fn set_dbg_fns(v: IntVec) {
-    // UNSAFE: the -g line and function tables, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: a task reaches its writers (dbg_function_begin, dbg_loc,
-    // init_lines) only under -g (dbg_function_begin returns unless
-    // debug_info, emit_loc is called only if debug_info) or, for
-    // init_lines/LINE_STARTS/SRC_END, through file_and_line <-
-    // vectorize::loop_line only when --vec-stats=FN reports; -g and
-    // --vec-stats=FN make the compile serial (parallel::serial_only:
-    // threads_for 1, no assembler thread), and the join and the assembler
-    // thread do not reach it; other uses (trace_after_lowering,
-    // dbg_sections, dbg_place_locs) are the main thread's; so one thread at
-    // a time
-    unsafe {
-        DBG_FNS = v;
-    }
-}
-
-// (0.28.0) DBG_PREFIX's accessors: every use of it is one of them.
-fn get_dbg_prefix() -> IntVec {
-    // UNSAFE: the -g line and function tables, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: a task reaches its writers (dbg_function_begin, dbg_loc,
-    // init_lines) only under -g (dbg_function_begin returns unless
-    // debug_info, emit_loc is called only if debug_info) or, for
-    // init_lines/LINE_STARTS/SRC_END, through file_and_line <-
-    // vectorize::loop_line only when --vec-stats=FN reports; -g and
-    // --vec-stats=FN make the compile serial (parallel::serial_only:
-    // threads_for 1, no assembler thread), and the join and the assembler
-    // thread do not reach it; other uses (trace_after_lowering,
-    // dbg_sections, dbg_place_locs) are the main thread's; so one thread at
-    // a time
-    unsafe { DBG_PREFIX }
-}
-
-fn set_dbg_prefix(v: IntVec) {
-    // UNSAFE: the -g line and function tables, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: a task reaches its writers (dbg_function_begin, dbg_loc,
-    // init_lines) only under -g (dbg_function_begin returns unless
-    // debug_info, emit_loc is called only if debug_info) or, for
-    // init_lines/LINE_STARTS/SRC_END, through file_and_line <-
-    // vectorize::loop_line only when --vec-stats=FN reports; -g and
-    // --vec-stats=FN make the compile serial (parallel::serial_only:
-    // threads_for 1, no assembler thread), and the join and the assembler
-    // thread do not reach it; other uses (trace_after_lowering,
-    // dbg_sections, dbg_place_locs) are the main thread's; so one thread at
-    // a time
-    unsafe {
-        DBG_PREFIX = v;
-    }
-}
-
-// (0.28.0) DBG_POS's accessors: every use of it is one of them.
-fn get_dbg_pos() -> IntVec {
-    // UNSAFE: the -g line and function tables, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: a task reaches its writers (dbg_function_begin, dbg_loc,
-    // init_lines) only under -g (dbg_function_begin returns unless
-    // debug_info, emit_loc is called only if debug_info) or, for
-    // init_lines/LINE_STARTS/SRC_END, through file_and_line <-
-    // vectorize::loop_line only when --vec-stats=FN reports; -g and
-    // --vec-stats=FN make the compile serial (parallel::serial_only:
-    // threads_for 1, no assembler thread), and the join and the assembler
-    // thread do not reach it; other uses (trace_after_lowering,
-    // dbg_sections, dbg_place_locs) are the main thread's; so one thread at
-    // a time
-    unsafe { DBG_POS }
-}
-
-fn set_dbg_pos(v: IntVec) {
-    // UNSAFE: the -g line and function tables, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: a task reaches its writers (dbg_function_begin, dbg_loc,
-    // init_lines) only under -g (dbg_function_begin returns unless
-    // debug_info, emit_loc is called only if debug_info) or, for
-    // init_lines/LINE_STARTS/SRC_END, through file_and_line <-
-    // vectorize::loop_line only when --vec-stats=FN reports; -g and
-    // --vec-stats=FN make the compile serial (parallel::serial_only:
-    // threads_for 1, no assembler thread), and the join and the assembler
-    // thread do not reach it; other uses (trace_after_lowering,
-    // dbg_sections, dbg_place_locs) are the main thread's; so one thread at
-    // a time
-    unsafe {
-        DBG_POS = v;
-    }
+fn is_local_label(t: &[u8], a: i64, b: i64) -> bool {
+    let p = cstr(local_prefix());
+    b - a > p.len() as i64 && has_at(t, a, b, p)
 }
