@@ -102,13 +102,12 @@ def cmod(a, b):
 # with its file in tools/semfuzz/findings/. (0.25's four are fixed, and
 # generated always: a by-value match that binds part of the payload, an
 # owned temporary lent to a `&T` parameter, `w[i] = x`. `let t =
-# w.last()?;` is gone: the binding is a `&T` that borrows w, not a T.)
-KNOWN = {
-    # the temporary a generic function returns, its type inferred from a
-    # reference argument (`dup(&t)`), lent or read (`obs(&dup(&t))`,
-    # `dup(&t).v`) is never dropped
-    'generic_ref_temp': 'generic_ref_temp_leak',
-}
+# w.last()?;` is gone: the binding is a `&T` that borrows w, not a T.
+# 0.29's generic_ref_temp is fixed, and generated always: the temporary a
+# generic function returns, `dup(&t)`, lent or read, `obs(&dup(&t))`,
+# `dup(&t).v`; findings/generic_ref_temp_leak.vl is tests/run's
+# drop_temp_generic_result.) None now.
+KNOWN = {}
 
 
 class Invalid(Exception):
@@ -567,6 +566,22 @@ class Read(E):
 
     def ev(self, it, fr):
         return copy_plain(rd(self.p.place(it, fr).get()))
+
+
+class TempField(E):
+    """(0.29) A field read out of an owned temporary, `dup(&t).v`: the
+    temporary is dropped at the end of the statement."""
+    def __init__(self, x, f):
+        self.x = x
+        self.f = f
+
+    def code(self):
+        return '%s.%s' % (self.x.code(), self.f)
+
+    def ev(self, it, fr):
+        v = self.x.ev(it, fr)
+        it.temps[-1].append(v)
+        return getattr(v, self.f)
 
 
 class Move(E):
@@ -2365,16 +2380,14 @@ class Gen:
     def temp_t(self, c, used):
         """An owned T that is a temporary where it is lent (`&x` of a
         variable would borrow it, not move it: `&ident(x)`)."""
-        if self.known and self.chance(0.5):
-            # (KNOWN generic_ref_temp: `obs(&dup(&t))`)
+        if self.chance(0.4):
+            # (0.29, was KNOWN generic_ref_temp: `obs(&dup(&t))`, the
+            # result of a generic function whose argument is a reference)
             ps = [p for p in self.t_places(c) if p.root() not in used]
             if ps:
                 return Call('dup', [Arg('let', self.r.choice(ps))])
         x = self.texpr(c, 1, used)
         if isinstance(x, Move):
-            return Call('ident', [Arg('sink', x)])
-        if isinstance(x, Call) and x.name == 'dup' and not self.known:
-            # (KNOWN generic_ref_temp)
             return Call('ident', [Arg('sink', x)])
         return x
 
@@ -2444,8 +2457,12 @@ class Gen:
         if not opts and not temp:
             return None
         if not opts or (temp and self.chance(0.2 if self.known else 0.06)):
-            # (an owned temporary, lent: dropped at the end of the statement)
-            return Call('obs', [Arg('let', self.temp_t(c, used))])
+            # (an owned temporary, lent: dropped at the end of the statement;
+            # 0.29: or a field read out of it, `dup(&t).v`)
+            x = self.temp_t(c, used)
+            if self.chance(0.3):
+                return TempField(x, 'v')
+            return Call('obs', [Arg('let', x)])
         o = self.r.choice(opts)
         if o in ('tv', 'tid', 'obs', 'get', 'total', 'apply'):
             p = self.r.choice(tp)
