@@ -261,6 +261,13 @@ code generators' agent (0.26.1) sees what moved.
   drop_edges) and the call `query refs`/`callees` list
   (tools/query/refs.vl collect_refs). A value moved out has no edge (the
   placeholders gave one).
+- 0.29 (R8 taken back): a generic call's temporary is owned and dropped
+  as any call's (build.vl copied_call: borrowed_call only). R8's rule, a
+  result made of the callee's type parameters from a callee that
+  consumes no argument, also held for `dup<X: Clone>(x: &X) -> X`, whose
+  temporary leaked when lent or read (`obs(&dup(&t))`, `dup(&t).v`), and
+  never held for a `let` of the same call. Code that reads a second owner
+  out of a raw pointer forgets it itself (`mem::forget`, `ManuallyDrop`).
 
 ## `--places-diff`
 

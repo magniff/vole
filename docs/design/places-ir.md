@@ -1053,7 +1053,10 @@ uses `ir_switch`). From B's step 3: R5 (a statement temporary drops at
 the end of its prelude's scope, not of the hidden `let` that holds an
 operand), R6 (an open drop's part flags made before the rewrite), R7 (a
 sink closure's second move out stops the program), R8 (a parametric
-copy's temporary is not owned); R9 (`v[i]` on a Vec) did not reproduce
+copy's temporary is not owned; taken back in 0.29: the rule could not
+tell `second<T>(p: *T) -> T`'s raw read from `dup<X: Clone>(x: &X) -> X`,
+whose temporary leaked, and a call's result is the caller's: tests/run's
+drop_temp_generic_*); R9 (`v[i]` on a Vec) did not reproduce
 here: both paths lower the checker's `v.as_slice()[i]` alike. And
 `--places-diff` checks where each drop runs and its flag
 (places/README.md). Waiting on B's steps 4 and 5: the default (step 6's
