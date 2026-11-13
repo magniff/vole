@@ -1,0 +1,151 @@
+// The windowless check: the same fragment shader, the same uniforms, into
+// RawSurface::Headless. Two identical frames must read back byte for byte
+// alike, and the image must have structure (a flat sky or a NaN-filled
+// render has neither). --out writes the last one as a PPM.
+
+use std::{fs, gpu};
+use std::gpu::{BufferUsage, Format, RawSurface};
+use std::time::Instant;
+
+use render::{Camera, Quality, renderer_new};
+
+fn write_ppm(path: &str, px: &[u8], width: i64, height: i64, stride: i64, gpa: Gpa) -> bool {
+    let mut ppm = format_in("P6\n{width} {height}\n255\n", gpa).into_bytes();
+    for y in 0..height {
+        for x in 0..width {
+            let p = (y * stride + x * 4) as usize;
+            ppm.push(px[p + 2]);
+            ppm.push(px[p + 1]);
+            ppm.push(px[p]);
+        }
+    }
+    fs::write(path, ppm.as_slice()).is_ok()
+}
+
+fn copy_bytes(px: &[u8], gpa: Gpa) -> Vec<u8, Gpa> {
+    let mut out = Vec::with_capacity_in(px.len(), gpa);
+    for b in px { out.push(*b); }
+    out
+}
+
+/// Mean absolute horizontal neighbour difference. A blank render has zero;
+/// a ray marcher with no distance estimate tends to produce a sky gradient,
+/// which has almost none next to the fractal's contours.
+fn detail(px: &[u8], width: i64, height: i64, stride: i64) -> f64 {
+    let mut total: i64 = 0;
+    let mut count: i64 = 0;
+    for y in 0..height {
+        for x in 1..width {
+            let a = (y * stride + x * 4) as usize;
+            let b = a - 4;
+            for k in 0..3 {
+                total += (px[a + k] as i64 - px[b + k] as i64).abs();
+                count += 1;
+            }
+        }
+    }
+    total as f64 / count as f64
+}
+
+pub fn run(width: i64, height: i64, frames: i64, camera: Camera, power: i64, quality: Quality,
+    scale: f64, out: &str, gpa: Gpa) -> i32 {
+    println("mandelbulb {width}x{height}, power {power}, {frames} frames");
+    let inst = gpu::Instance::new_in(gpa);
+    let opened = match inst.adapter(std::gpu::Power::High) {
+        Ok(a) => a.device(std::gpu::Limits::default()),
+        Err(e) => Err(e),
+    };
+    let (dev, mut queue) = match opened {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln("mandelbulb: no GPU: {e}");
+            return 1;
+        }
+    };
+    let mut renderer = match renderer_new(&dev) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln("mandelbulb: renderer: {e}");
+            return 1;
+        }
+    };
+    let mut surf = match inst.surface(&dev, RawSurface::Headless) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln("mandelbulb: no headless surface: {e}");
+            return 1;
+        }
+    };
+    surf.configure(&dev, width, height, format: Format::Bgra8Unorm, vsync: false);
+    let stride = (width * 4 + 255) / 256 * 256;
+    let clock = Instant::now();
+    let mut first: Vec<u8, Gpa> = Vec::new_in(gpa);
+    let mut same = true;
+    let mut stats_detail = 0.0;
+    let mut maximum: i64 = 0;
+    let mut mean = 0.0;
+    for index in 0..frames {
+        let frame = match surf.frame() {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln("mandelbulb: no frame: {e}");
+                return 1;
+            }
+        };
+        let view = frame.texture.view();
+        let render_width = ((width as f64 * scale) as i64).max(8);
+        let render_height = ((height as f64 * scale) as i64).max(8);
+        renderer.draw(&dev, &mut queue, &view, width, height, render_width, render_height, camera,
+            power, quality, 0.0);
+        let mut readback = dev.buffer(stride * height,
+            BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        let mut enc = dev.encoder();
+        enc.copy_texture_to_buffer(&frame.texture, &readback, stride);
+        queue.submit(enc.finish());
+        let px = readback.map_read(&dev);
+        if index == 0 { first = copy_bytes(px, gpa); }
+        if index + 1 == frames {
+            if index > 0 {
+                for i in 0..px.len() {
+                    if px[i] != first[i] { same = false; }
+                }
+            }
+            stats_detail = detail(px, width, height, stride);
+            let mut total: i64 = 0;
+            for y in 0..height {
+                for x in 0..width {
+                    let p = (y * stride + x * 4) as usize;
+                    let m = px[p].max(px[p + 1]).max(px[p + 2]);
+                    maximum = maximum.max(m as i64);
+                    total += m as i64;
+                }
+            }
+            mean = total as f64 / (width * height) as f64;
+            if out.len() > 0 {
+                if write_ppm(out, px, width, height, stride, gpa) {
+                    println("wrote {out}");
+                } else {
+                    eprintln("mandelbulb: cannot write {out}");
+                    return 1;
+                }
+            }
+        }
+        frame.present(&mut queue);
+    }
+    let elapsed = clock.elapsed().as_secs_f64();
+    eprintln("{frames} frames at {width}x{height}: {:.2} ms/frame (including readback)",
+        elapsed * 1000.0 / frames as f64);
+    let render_ok = stats_detail > 0.8 && maximum > 80 && mean > 2.0 && mean < 220.0;
+    if render_ok {
+        println("render ok");
+    } else {
+        println("render FAIL (detail {stats_detail:.3}, max {maximum}, mean {mean:.2})");
+    }
+    if frames > 1 && same {
+        println("deterministic ok");
+    } else if frames > 1 {
+        println("deterministic FAIL (two identical frames differ)");
+    }
+    if render_ok && (frames == 1 || same) { return 0; }
+    1
+}
