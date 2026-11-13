@@ -1677,8 +1677,10 @@ class MatchOpt(S_):
     on a Result<T, i64> (`Ok(t)`, `Err(n)`); x is an owned local (which
     moves) or a call (a temporary). `while let Some(t) = w.pop() { .. }`
     with form 'while'."""
-    def __init__(self, x, kind, name, then, ename, els, form):
+    def __init__(self, x, kind, name, then, ename, els, form, by=None):
         self.x = x
+        self.by = by         # 'ref', 'mut': x a place, `&x` or `&mut x`;
+        #                      the binding a `&T` or `&mut T` into it
         self.kind = kind     # 'O' or 'R'
         self.name = name
         self.then = then
@@ -1689,19 +1691,23 @@ class MatchOpt(S_):
     def emit(self, out, ind):
         some = 'Some(%s)' % self.name if self.kind == 'O' else 'Ok(%s)' % self.name
         none = 'None' if self.kind == 'O' else 'Err(%s)' % self.ename
+        xc = self.x.code()
+        if self.by:
+            refs()[self.name] = 'let' if self.by == 'ref' else 'inout'
+            xc = ('&' if self.by == 'ref' else '&mut ') + xc
         if self.form == 'while':
-            out.append('%swhile let %s = %s {' % (ind, some, self.x.code()))
+            out.append('%swhile let %s = %s {' % (ind, some, xc))
             self.then.emit_body(out, ind + '    ')
             out.append(ind + '}')
         elif self.form == 'iflet':
-            out.append('%sif let %s = %s {' % (ind, some, self.x.code()))
+            out.append('%sif let %s = %s {' % (ind, some, xc))
             self.then.emit_body(out, ind + '    ')
             if self.els.stmts:
                 out.append(ind + '} else {')
                 self.els.emit_body(out, ind + '    ')
             out.append(ind + '}')
         else:
-            out.append('%smatch %s {' % (ind, self.x.code()))
+            out.append('%smatch %s {' % (ind, xc))
             out.append('%s    %s => {' % (ind, some))
             self.then.emit_body(out, ind + '        ')
             out.append(ind + '    }')
@@ -1720,6 +1726,13 @@ class MatchOpt(S_):
                 if not loop_body(it, fr, self.then, None, pre=[(self.name, Cell(v.val))]):
                     break
             return
+        if self.by:
+            v = rd(self.x.place(it, fr).get())
+            if v.val is not None:
+                self.then.run(it, fr, pre=[(self.name, AliasCell(AttrPlace(v, 'val')))])
+            else:
+                self.els.run(it, fr)
+            return
         v = self.x.ev(it, fr)
         if self.kind == 'O':
             if v.val is not None:
@@ -1735,23 +1748,43 @@ class MatchOpt(S_):
 
 
 class InoutBlock(S_):
-    """`{ let r = &mut place; ops on r }`."""
-    def __init__(self, name, p, body):
+    """`{ let r = &mut place; ops on r }`, or with `&place` (conv 'let').
+    flat: without the braces, the statements after it in the same block
+    use the place again: the borrow ends with r's last use, not with its
+    scope (the borrow checker's liveness)."""
+    def __init__(self, name, p, body, conv='inout', flat=False):
         self.name = name
         self.p = p
         self.body = body
+        self.conv = conv
+        self.flat = flat
 
     def emit(self, out, ind):
-        out.append(ind + '{')
-        refs()[self.name] = 'inout'
-        out.append('%s    let %s = %s;' % (ind, self.name, lend_mut(self.p)))
-        self.body.emit_body(out, ind + '    ')
-        out.append(ind + '}')
+        refs()[self.name] = self.conv
+        inner = ind if self.flat else ind + '    '
+        if not self.flat:
+            out.append(ind + '{')
+        out.append('%slet %s = %s;' % (inner, self.name, lend_mut(self.p) if self.conv == 'inout' else lend(self.p)))
+        self.body.emit_body(out, inner)
+        if not self.flat:
+            out.append(ind + '}')
 
     def run(self, it, fr):
         pl = self.p.place(it, fr)
         rd(pl.get())
-        self.body.run(it, fr, pre=[(self.name, AliasCell(pl))])
+        if self.flat:
+            # (r stays in the scope, unused; the ops' locals are the scope's)
+            fr.scopes[-1].append((self.name, AliasCell(pl)))
+            for s in self.body.stmts:
+                it.tick()
+                it.temps.append([])
+                try:
+                    s.run(it, fr)
+                finally:
+                    for v in reversed(it.temps.pop()):
+                        it.drop(v)
+        else:
+            self.body.run(it, fr, pre=[(self.name, AliasCell(pl))])
 
 
 class CloBlock(S_):
@@ -2332,6 +2365,11 @@ class Gen:
     def temp_t(self, c, used):
         """An owned T that is a temporary where it is lent (`&x` of a
         variable would borrow it, not move it: `&ident(x)`)."""
+        if self.known and self.chance(0.5):
+            # (KNOWN generic_ref_temp: `obs(&dup(&t))`)
+            ps = [p for p in self.t_places(c) if p.root() not in used]
+            if ps:
+                return Call('dup', [Arg('let', self.r.choice(ps))])
         x = self.texpr(c, 1, used)
         if isinstance(x, Move):
             return Call('ident', [Arg('sink', x)])
@@ -2405,7 +2443,7 @@ class Gen:
             opts += ['vssig', 'vslen']
         if not opts and not temp:
             return None
-        if not opts or (temp and self.chance(0.06)):
+        if not opts or (temp and self.chance(0.2 if self.known else 0.06)):
             # (an owned temporary, lent: dropped at the end of the statement)
             return Call('obs', [Arg('let', self.temp_t(c, used))])
         o = self.r.choice(opts)
@@ -2648,7 +2686,7 @@ class Gen:
             (2 if depth < 5 else 0, self.st_block),
             (10 if self.closure_params else 3, self.st_closure),
             (3, self.st_match),
-            (2, self.st_option),
+            (3, self.st_option),
             (3, self.st_struct),
             (2, self.st_tuple),
             (1, self.st_array),
@@ -2656,7 +2694,7 @@ class Gen:
             (1, self.st_vs),
             (2, self.st_plain),
             (1, self.st_string),
-            (1, self.st_inout),
+            (3, self.st_inout),
             # (a guard: `defer`'s place is a Drop's)
             (1, self.st_defer),
             (1, self.st_shadow),
@@ -3198,6 +3236,32 @@ class Gen:
     def st_option(self, c):
         r = self.r.random()
         form = self.r.choice(['iflet', 'match'])
+        if self.chance(0.25):
+            # `if let Some(t) = &o { .. }`, `match &mut o { .. }`: o stays,
+            # t borrows its payload
+            by = self.r.choice(['ref', 'mut'])
+            os_ = self.readable(c, 'O') if by == 'ref' else self.mutable(c, 'O')
+            if not os_:
+                return None
+            v = self.r.choice(os_)
+            thaw = False
+            if by == 'ref':
+                thaw = v.name not in c.frozen
+                c.frozen.add(v.name)
+            else:
+                v.st = 'X'
+            snap = self.snapshot(c)
+            n = self.name('t')
+            t, st = self.sub_block(c, self.r.randint(0, 3), pre=[(n, 'T', by == 'mut', 'let' if by == 'ref' else 'inout')])
+            self.restore(c, snap)
+            e, se = self.sub_block(c, self.r.randint(0, 2))
+            self.branch_join(c, snap, [st, se])
+            if by == 'ref':
+                if thaw:
+                    c.frozen.discard(v.name)
+            else:
+                v.st = 'L'
+            return MatchOpt(PVar(v.name), 'O', n, t, None, e, form, by)
         if r < 0.45:
             m = self.take_var(c, 'O', set())
             if m is None:
@@ -3377,7 +3441,29 @@ class Gen:
         return Decl(n, True, None, Call('clone', [], method=True, recv=PVar(v.name)))
 
     def st_inout(self, c):
-        """`{ let r = &mut place; .. }`: r used as the place itself."""
+        """`{ let r = &mut place; .. }`: r used as the place itself; or
+        `&place`, read through r; in a block, or flat in this one."""
+        flat = self.chance(0.5)
+        if self.chance(0.3):
+            ps = self.t_places(c, elems=False)
+            if not ps:
+                return None
+            p = self.r.choice(ps)
+            n = self.name('r')
+            rp = PVar(n)
+            ops = []
+            for _ in range(self.r.randint(1, 3)):
+                k = self.r.random()
+                if k < 0.4:
+                    ops.append(Print(self.obsn(), [Call('obs', [Arg('let', rp)]), Read(PField(rp, 'id'))]))
+                elif k < 0.6:
+                    # (the place itself read while r lives: two shared borrows)
+                    ops.append(Print(self.obsn(), [Call('get', [], method=True, recv=rp), Call('obs', [Arg('let', p)])]))
+                elif k < 0.8:
+                    ops.append(Print(self.obsn(), [Apply(rp, self.small())]))
+                else:
+                    ops.append(Do(Call('eat', [Arg('sink', Call('clone', [], method=True, recv=rp))])))
+            return InoutBlock(n, p, Block(ops), 'let', flat)
         ps = self.t_places(c, need_mut=True, elems=False)
         if not ps:
             return None
@@ -3397,7 +3483,7 @@ class Gen:
                 ops.append(Assign(rp, Mk(self.int_k(c))))
             else:
                 ops.append(Print(self.obsn(), [Call('obs', [Arg('let', rp)]), Read(PField(rp, 'id'))]))
-        return InoutBlock(n, p, Block(ops))
+        return InoutBlock(n, p, Block(ops), 'inout', flat)
 
     def st_defer(self, c):
         return Defer(self.obsn())
