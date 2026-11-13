@@ -5,7 +5,11 @@
 # usage: tools/premerge.sh [BASE]     (default: the release-* branch it forked from, the nearest merge-base; else main)
 #
 #   base     the branch contains BASE's tip (else: merge BASE first)
-#   unsafe   no new unsafe without // UNSAFE: and // SAFETY: (tools/unsafe-diff-check.py)
+#   unsafe   no new unsafe without // UNSAFE: and // SAFETY: (tools/unsafe-diff-check.py),
+#            and (0.29) none at all in compiler/src and std without them, no unsafe
+#            block of compiler/src with nothing unsafe inside: each one named, with
+#            its position (tests/unsafe_audit.sh, the gate's unsafe-audit row;
+#            `volec check --deny=unsafe` reports them as errors)
 #   fmt      every changed .vl outside tests/ is in the standard style
 #            (by the branch's own target/volec when the last tested build
 #            cannot read it: 0.27.0, a rust-edition file)
@@ -14,8 +18,8 @@
 #            SKIP, never PASS, when the change touches no program
 #            (`volec check --changed --since BASE`)
 #            (but one whose main.vl says `// premerge: broken on purpose`)
-#            (but unsafe.unjustified: legacy sites are the baseline's, and new
-#            ones the unsafe row's)
+#            (but unsafe.unjustified, a warning in a program that is not the
+#            compiler: the lines a change adds are the unsafe row's)
 #   std      the committed compiler/src/front/stdsrc_rust.vl is what compiler/std/embed.sh
 #            makes of the committed std (0.25.3: made by the commit hook and the
 #            merge driver, tools/git-hooks/setup.sh; said when they are not set up)
@@ -74,11 +78,18 @@ else
     row base FAIL "$BASE has moved: git merge $BASE first"
 fi
 
-# unsafe
-if python3 -I tools/unsafe-diff-check.py "$BASE" > "$TMP/unsafe" 2>&1; then
-    row unsafe PASS "$(tail -1 "$TMP/unsafe" | sed 's/^unsafe-diff-check: //; s/^$/no new unsafe/')"
-else
+# unsafe: the lines the change adds, then (0.29) the whole of compiler/src
+# and std, where the rule is none (tests/unsafe_audit.sh)
+if ! python3 -I tools/unsafe-diff-check.py "$BASE" > "$TMP/unsafe" 2>&1; then
     row unsafe FAIL "$(tail -1 "$TMP/unsafe" | sed 's/^unsafe-diff-check: //')"
+elif [ -n "$VOLEC" ] && [ -f tests/unsafe_audit.sh ] && [ -f compiler/src/main.vl ] \
+    && ! sh tests/unsafe_audit.sh -c "$VOLEC" > "$TMP/audit" 2>&1; then
+    row unsafe FAIL "$(tail -1 "$TMP/audit" | sed 's/^unsafe-audit: //')"
+    grep -v '^unsafe-audit: compiler/src' "$TMP/audit" | head -40 | sed 's/^/    /' >> "$TMP/unsafe"
+else
+    audit=
+    [ -s "$TMP/audit" ] && audit="; $(tail -1 "$TMP/audit" | sed 's/^unsafe-audit: //; s/ (.*$//')"
+    row unsafe PASS "$(tail -1 "$TMP/unsafe" | sed 's/^unsafe-diff-check: //; s/^$/no new unsafe/')$audit"
 fi
 
 # fmt
@@ -112,7 +123,8 @@ done
 if [ -z "$CHK" ]; then
     row check SKIP "no volec with check --changed (bootstrap/bootstrap.sh --dev --no-suite builds target/volec)"
 else
-    # (0.25.3: not unsafe.unjustified, the unsafe row's and the baseline's)
+    # (0.25.3: not unsafe.unjustified, the unsafe row's: a warning in a
+    # program that is not the compiler, none in compiler/src and std)
     out=$(VOLE_OK=1 "$CHK" check --changed --since "$BASE" 2>&1 | grep -v 'warning\[unsafe\.unjustified\]')
     last=$(printf '%s\n' "$out" | tail -1)
     : > "$TMP/check"
