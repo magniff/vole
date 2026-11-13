@@ -146,6 +146,7 @@ base::ctx::Ctx.time_each_pass	off: the same (--time-passes=passes), set by the o
 base::ctx::Ctx.pass_counts	off: the same; atomics a pass'"'"'s end adds to (timer::pass_done) only when time_each_pass, which runs on one thread (serial_only)
 base::ctx::Ctx.vec_stats_fn	off: --vec-stats=FN is an option the cache does not know (ARGS_UNKNOWN), set by the options before the tasks
 base::ctx::Ctx.static_named	output: none; the emission (materialize) reads it only to stop on an internal error, made by statics_named_by_ir before the tasks
+base::ctx::Ctx.inline_log	output: none; VOLE_INLINE_LOG'"'"'s buffer, made by inline_log_start on the main thread before the tasks and written to only at -j1 (a cached function decides nothing and logs nothing: the log is read with --no-cache)
 base::ctx::Ctx.vec_tmpl	key: std'"'"'s Vec template, found in the program'"'"'s types (types_hash) by init_vec_facts before the tasks, read-only after
 base::ctx::Ctx.wraps	key: the same (std'"'"'s Vec wrappers)
 base::ctx::Ctx.a64_lse_flag	key: --atomics= is in the options hash (codecache::arg_kind), set by main before the tasks
@@ -229,7 +230,7 @@ front::cells::FREEZE_MEMO	key: types_hash (each type'"'"'s is_freeze)
 front::cells::SYM_UNSAFE_CELL	key: the same
 base::ctx::Ctx.modules	key: the same (is_within, only from is_freeze: whether a struct is std'"'"'s UnsafeCell)
 base::ctx::Ctx.std_module	key: the same (within_std)
-base::ctx::Ctx.fn_effects	IR: a function'"'"'s effects (fn_canon)
+base::ctx::Ctx.node_fx	IR: a function'"'"'s effects (fn_canon); (0.29) the table itself, fn_effects was its second name
 base::ctx::Ctx.fn_effects_count	IR: the same
 front::effects::builtin::TABLE	IR: by a symbol'"'"'s text; the same in every build of a compiler
 front::lexer::STRS	IR: a string'"'"'s bytes (STR_H)
