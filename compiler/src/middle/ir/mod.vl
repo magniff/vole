@@ -64,6 +64,8 @@ pub mod verify;
 pub mod atomic;
 
 // (The numbering is the 0.3 one: GVN hashes the opcode.)
+use std::alloc::Allocator;
+
 use crate::back::codecache::{R_IR, cc_note};
 use crate::base::{IntVec, alloc_array, free, grow, realloc};
 use crate::base::comp::Comp;
@@ -181,9 +183,9 @@ pub const INLINE_COPY_MAX: i64 = 128;
     pub scale: i64,
 }
 
-#[derive(Clone, Copy)] pub struct Block {
+pub struct Block<A: Allocator> {
     pub first: i64, pub last: i64,
-    pub preds: IntVec,
+    pub preds: Vec<i64, A>,
     pub term: Term, pub cond: i64, pub s0: i64, pub s1: i64,
     // SSA construction: whether every predecessor is known, and the
     // incomplete phis (see lower.vl).
@@ -223,7 +225,11 @@ pub const INLINE_COPY_MAX: i64 = 128;
 // function's, and the inliner reads a callee's through ir_view.
 #[derive(Clone, Copy)] pub struct IRTables {
     pub insts: *mut Inst, pub inst_count: i64, pub inst_cap: i64,
-    pub blocks: *mut Block, pub block_count: i64, pub block_cap: i64,
+
+    // (0.29) A `*mut Block<Comp>` (see stored_blocks), named as bytes: a
+    // block owns a Vec, and IRFUNCS is a static, whose type may not hold
+    // an allocator.
+    pub blocks: *mut u8, pub block_count: i64, pub block_cap: i64,
     pub slots: *mut Slot, pub slot_count: i64, pub slot_cap: i64,
     pub args: IntVec, pub argty: IntVec, pub swcases: IntVec, pub inst_loc: IntVec,
 }
@@ -254,9 +260,8 @@ pub fn ir_enter(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
             // The context's last table is its function's (ir_save wrote its
             // parts back): it is left, not dropped.
             std::ptr::write(&mut cx.insts, insts_of(t.insts, t.inst_count, t.inst_cap));
-            cx.blocks = t.blocks;
-            cx.block_count = t.block_count;
-            cx.block_cap = t.block_cap;
+            std::ptr::write(&mut cx.blocks,
+                blocks_of(t.blocks as *mut Block<Comp>, t.block_count, t.block_cap));
             cx.slots = t.slots;
             cx.slot_count = t.slot_count;
             cx.slot_cap = t.slot_cap;
@@ -294,24 +299,45 @@ pub fn insts_of(p: *mut Inst, n: i64, cap: i64) -> Vec<Inst, Comp> {
     unsafe { Vec::from_raw_parts_in(p, n as usize, cap as usize, Comp {}) }
 }
 
+// The same for a stored table of blocks (each block owns its
+// predecessor list).
+pub fn blocks_of(p: *mut Block<Comp>, n: i64, cap: i64) -> Vec<Block<Comp>, Comp> {
+    if cap == 0 {
+        return Vec::new_in(Comp {});
+    }
+    // UNSAFE: IRTables holds the table as its raw parts until IRFUNCS can
+    // own Vecs (a static may not point at one).
+    // SAFETY: as insts_of: the parts ir_save took from a Vec<Block<Comp>,
+    // Comp>, or decode_ir's block of cap entries from C's allocator, the
+    // first n written (their lists Vecs of Comp's); not used through the
+    // stored parts while this Vec lives.
+    unsafe { Vec::from_raw_parts_in(p, n as usize, cap as usize, Comp {}) }
+}
+
+// (0.17) Gives back the room a table has beyond what it uses, when the
+// room left is worth it (never all of it: an empty table keeps one entry).
+fn shrink_table<T>(v: &mut Vec<T, Comp>) {
+    let n = v.len();
+    if v.capacity() > n + n / 4 + 4 {
+        v.shrink_to(if n < 1 { 1 } else { n });
+    }
+}
+
 // (0.17) Gives back the room the current function's tables have beyond
 // what it uses (each table starts at 64 entries and doubles; a block's
 // predecessor list too): after the function is lowered, and at -O2 once
 // its component is optimized, the IR kept for later is its size.
 pub fn ir_shrink(cx: &mut FnCtx<Comp>) {
     unsafe {
-        let n = cx.insts.len();
-        if cx.insts.capacity() > n + n / 4 + 4 {
-            cx.insts.shrink_to(if n < 1 { 1 } else { n });
-        }
-        cx.blocks = shrink_array(cx.blocks, cx.block_count, &mut cx.block_cap);
+        shrink_table(&mut cx.insts);
+        shrink_table(&mut cx.blocks);
         cx.slots = shrink_array(cx.slots, cx.slot_count, &mut cx.slot_cap);
         shrink_vec(&mut cx.args);
         shrink_vec(&mut cx.argty);
         shrink_vec(&mut cx.swcases);
         shrink_vec(&mut cx.inst_loc);
-        for b in 0..cx.block_count {
-            shrink_vec(&mut (*cx.blocks.add(b as usize)).preds);
+        for b in 0..cx.blocks.len() {
+            shrink_table(&mut cx.blocks[b].preds);
         }
         shrink_vec(&mut (*get_irfuncs().add(cx.ir_cur as usize)).blocks);
         shrink_vec(&mut (*get_irfuncs().add(cx.ir_cur as usize)).slots);
@@ -351,11 +377,11 @@ pub fn ir_tables_bytes(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) -> i64 {
         let mut total: i64 = 0;
         for fi in 0..pcx.irfunc_count {
             let t = (*get_irfuncs().add(fi as usize)).t;
-            total += t.inst_cap * size_of(Inst) + t.block_cap * size_of(Block)
+            total += t.inst_cap * size_of(Inst) + t.block_cap * size_of(Block<Comp>)
                 + t.slot_cap * size_of(Slot)
                 + (t.args.cap + t.argty.cap + t.swcases.cap + t.inst_loc.cap) * 8;
             for b in 0..t.block_count {
-                total += (*t.blocks.add(b as usize)).preds.cap * 8;
+                total += (*(t.blocks as *mut Block<Comp>).add(b as usize)).preds.capacity() as i64 * 8;
             }
             total += (
                 (*get_irfuncs().add(fi as usize)).blocks.cap + (*get_irfuncs().add(fi as usize)).slots.cap) * 8;
@@ -372,7 +398,9 @@ fn ir_save(cx: &mut FnCtx<Comp>) {
                 insts: if cx.insts.capacity() == 0 { 0 as *mut Inst }
                     else { cx.insts.as_mut_ptr() },
                 inst_count: cx.insts.len() as i64, inst_cap: cx.insts.capacity() as i64,
-                blocks: cx.blocks, block_count: cx.block_count, block_cap: cx.block_cap,
+                blocks: if cx.blocks.capacity() == 0 { 0 as *mut u8 }
+                    else { cx.blocks.as_mut_ptr() as *mut u8 },
+                block_count: cx.blocks.len() as i64, block_cap: cx.blocks.capacity() as i64,
                 slots: cx.slots, slot_count: cx.slot_count, slot_cap: cx.slot_cap,
                 args: cx.args, argty: cx.argty, swcases: cx.swcases, inst_loc: cx.inst_loc,
             };
@@ -389,11 +417,14 @@ pub fn ir_release(cx: &mut FnCtx<Comp>) {
     ir_save(cx);
     cx.ir_cur = -1;
     // UNSAFE: the table is its function's again (ir_save wrote its parts into
-    // IRFUNCS): the context's Vec is overwritten without being dropped.
-    // SAFETY: cx.insts is a valid place; the Vec written is empty and owns
+    // IRFUNCS): the context's Vecs are overwritten without being dropped.
+    // SAFETY: the fields are valid places; a Vec written is empty and owns
     // nothing, and the one it replaces is not used again (its buffer lives
     // on in IRFUNCS, to be taken up by the next ir_enter).
-    unsafe { std::ptr::write(&mut cx.insts, Vec::new_in(Comp {})); }
+    unsafe {
+        std::ptr::write(&mut cx.insts, Vec::new_in(Comp {}));
+        std::ptr::write(&mut cx.blocks, Vec::new_in(Comp {}));
+    }
 }
 
 // (0.17) Frees function fi's IR (once it is emitted, or dropped); fi is
@@ -401,10 +432,6 @@ pub fn ir_release(cx: &mut FnCtx<Comp>) {
 pub fn ir_free_func(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
     unsafe {
         ir_enter(cx, fi, pcx);
-        for b in 0..cx.block_count {
-            free((*cx.blocks.add(b as usize)).preds.data as *mut u8);
-        }
-        free(cx.blocks as *mut u8);
         free(cx.slots as *mut u8);
         free(cx.args.data as *mut u8);
         free(cx.argty.data as *mut u8);
@@ -417,9 +444,7 @@ pub fn ir_free_func(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
         (*get_irfuncs().add(fi as usize)).t = empty_tables();
         cx.ir_cur = -1;
         cx.insts = Vec::new_in(Comp {});
-        cx.blocks = 0 as *mut Block;
-        cx.block_count = 0;
-        cx.block_cap = 0;
+        cx.blocks = Vec::new_in(Comp {});
         cx.slots = 0 as *mut Slot;
         cx.slot_count = 0;
         cx.slot_cap = 0;
@@ -433,7 +458,7 @@ pub fn ir_free_func(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
 fn empty_tables() -> IRTables {
     IRTables {
         insts: 0 as *mut Inst, inst_count: 0, inst_cap: 0,
-        blocks: 0 as *mut Block, block_count: 0, block_cap: 0,
+        blocks: 0 as *mut u8, block_count: 0, block_cap: 0,
         slots: 0 as *mut Slot, slot_count: 0, slot_cap: 0,
         args: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
         argty: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
@@ -442,9 +467,9 @@ fn empty_tables() -> IRTables {
     }
 }
 
-fn empty_block(func: i64) -> Block {
+fn empty_block(func: i64) -> Block<Comp> {
     Block {
-        first: 0, last: 0, preds: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
+        first: 0, last: 0, preds: Vec::new_in(Comp {}),
         term: Term::None, cond: 0, s0: 0, s1: 0, sealed: 0, incomplete: 0, func: func, removed: 0,
         order: 0, idom: 0, mark: 0, aux: 0, loop_depth: 0, novec: 0, count: -1,
         cases: 0, ncases: 0, succs: 0, nsucc: 0,
@@ -494,9 +519,7 @@ pub fn ir_new_func(cx: &mut FnCtx<Comp>, f: i64, item: i64, pcx: &mut Ctx<Comp>)
         if pcx.ir_locs {
             cx.inst_loc.push(0);
         }
-        cx.blocks = grow(cx.blocks, cx.block_count, &mut cx.block_cap);
-        (*cx.blocks.add(0)) = empty_block(0);
-        cx.block_count = 1;
+        cx.blocks.push(empty_block(0));
         cx.slots = grow(cx.slots, cx.slot_count, &mut cx.slot_cap);
         (*cx.slots.add(0)) = Slot { size: 0, align: 1, offset: 0, escapes: 0, ty: 0 };
         cx.slot_count = 1;
@@ -508,10 +531,9 @@ pub fn ir_new_func(cx: &mut FnCtx<Comp>, f: i64, item: i64, pcx: &mut Ctx<Comp>)
 
 pub fn ir_new_block(cx: &mut FnCtx<Comp>) -> i64 {
     unsafe {
-        cx.blocks = grow(cx.blocks, cx.block_count, &mut cx.block_cap);
-        let b = cx.block_count;
-        (*cx.blocks.add(b as usize)) = empty_block(cx.irf);
-        cx.block_count += 1;
+        let b = cx.blocks.len() as i64;
+        let block = empty_block(cx.irf);
+        cx.blocks.push(block);
         (*get_irfuncs().add(cx.irf as usize)).blocks.push(b);
         b
     }
@@ -553,32 +575,32 @@ pub fn ir_make(cx: &mut FnCtx<Comp>, op: Op, ty: i64, a: i64, b: i64, imm: i64, 
 // Appends instruction `v` to block `b`.
 pub fn ir_append(cx: &mut FnCtx<Comp>, b: i64, v: i64) {
     unsafe {
-        let last = (*cx.blocks.add(b as usize)).last;
+        let last = (cx.blocks[b as usize]).last;
         (cx.insts[v as usize]).block = b;
         (cx.insts[v as usize]).prev = last;
         (cx.insts[v as usize]).next = 0;
         if last == 0 {
-            (*cx.blocks.add(b as usize)).first = v;
+            (cx.blocks[b as usize]).first = v;
         } else {
             (cx.insts[last as usize]).next = v;
         }
-        (*cx.blocks.add(b as usize)).last = v;
+        (cx.blocks[b as usize]).last = v;
     }
 }
 
 // Inserts instruction `v` at the start of block `b`.
 pub fn ir_prepend(cx: &mut FnCtx<Comp>, b: i64, v: i64) {
     unsafe {
-        let first = (*cx.blocks.add(b as usize)).first;
+        let first = (cx.blocks[b as usize]).first;
         (cx.insts[v as usize]).block = b;
         (cx.insts[v as usize]).prev = 0;
         (cx.insts[v as usize]).next = first;
         if first == 0 {
-            (*cx.blocks.add(b as usize)).last = v;
+            (cx.blocks[b as usize]).last = v;
         } else {
             (cx.insts[first as usize]).prev = v;
         }
-        (*cx.blocks.add(b as usize)).first = v;
+        (cx.blocks[b as usize]).first = v;
     }
 }
 
@@ -592,7 +614,7 @@ pub fn ir_insert_before(cx: &mut FnCtx<Comp>, at: i64, v: i64) {
         (cx.insts[v as usize]).next = at;
         (cx.insts[at as usize]).prev = v;
         if prev == 0 {
-            (*cx.blocks.add(b as usize)).first = v;
+            (cx.blocks[b as usize]).first = v;
         } else {
             (cx.insts[prev as usize]).next = v;
         }
@@ -606,12 +628,12 @@ pub fn ir_unlink(cx: &mut FnCtx<Comp>, v: i64) {
         let prev = (cx.insts[v as usize]).prev;
         let next = (cx.insts[v as usize]).next;
         if prev == 0 {
-            (*cx.blocks.add(b as usize)).first = next;
+            (cx.blocks[b as usize]).first = next;
         } else {
             (cx.insts[prev as usize]).next = next;
         }
         if next == 0 {
-            (*cx.blocks.add(b as usize)).last = prev;
+            (cx.blocks[b as usize]).last = prev;
         } else {
             (cx.insts[next as usize]).prev = prev;
         }
