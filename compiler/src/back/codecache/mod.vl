@@ -45,7 +45,7 @@ use crate::back::codecache::snapshot::{
     get_u, ids_at, ids_new, ids_saddr, no_map, put_bytes, put_s, put_u, reader, rel_add_source,
     rel_clear, rel_fn, rel_new, rel_rtid, rel_saddr, rel_str_source,
 };
-use crate::base::{alloc_array, alloc_zeroed, find_sym, memcpy, streq, stress_grow, sym_text};
+use crate::base::{find_sym, streq, stress_grow, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::target::{get_elf, get_x86};
@@ -57,7 +57,7 @@ use crate::middle::ir::{ir_enter, ir_release, ir_stored};
 use crate::middle::lower::ssa::HMap;
 use crate::middle::parallel::{
     K_COMPONENT, OWNER_SHIFT, P_CLEANUP, P_COMPONENT, P_EMIT, P_SIMPLIFY, comp_of, const_data,
-    const_data_count, const_data_entry, fn_facts_ready, get_fn_text,
+    const_data_count, const_data_entry, fn_facts_ready,
 };
 use crate::tools::proc::{fork_worker, make_dirs, worker_exit};
 use crate::tools::query::cache::{cache_dir, ident};
@@ -453,7 +453,7 @@ pub fn cc_phase(kind: i64, pcx: &mut Ctx<Comp>) {
     pcx.codecache_env = h;
     // (-O1: the small leaves' IR, which the emission tasks inline, hashed
     // first)
-    if pcx.per_function && pcx.leaf_small != 0 as *mut i64 {
+    if pcx.per_function && !pcx.leaf_small.is_empty() {
         let main = crate::middle::ctx::main_cx(pcx);
         // UNSAFE: the main thread's context is handed out as a raw pointer
         // (middle::ctx::main_cx).
@@ -469,11 +469,7 @@ pub fn cc_phase(kind: i64, pcx: &mut Ctx<Comp>) {
 fn hash_leaves(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
     let mut cc = cc_take(cx);
     for g in 0..pcx.irfunc_count {
-        // UNSAFE: leaf_small is a raw table of the context.
-        // SAFETY: it is not null (cc_phase), and -O1's leaf marks have an
-        // entry for every IR function, of which g is one.
-        let small = unsafe { *pcx.leaf_small.add(g as usize) };
-        if small != 0 && pcx.fn_live[g as usize] != 0 {
+        if pcx.leaf_small[g as usize] != 0 && pcx.fn_live[g as usize] != 0 {
             hash_now(cx, &mut *cc, g, pcx);
         }
     }
@@ -746,20 +742,17 @@ fn static_fp(cx: &mut FnCtx<Comp>, own_scc: i64, g: i64, pcx: &Ctx<Comp>) -> u64
 }
 
 fn facts_fixed(g: i64, pcx: &Ctx<Comp>) -> u64 {
-    unsafe {
-        let mut h: u64 = mix(
-            (pcx.fn_canon[pcx.ir_fn[g as usize] as usize]) as u64,
-            (pcx.fn_live[g as usize]) as u64);
-        if pcx.fn_address.len() > 0 {
-            h = mix(h, (pcx.fn_address[g as usize]) as u64);
-        }
-        if pcx.leaf_small != 0 as *mut i64 {
-            h = mix(h,
-                ((*pcx.leaf_small.add(g as usize)) | ((*pcx.leaf_keep.add(g as usize)) << 1)
-                    | ((*pcx.leaf_done.add(g as usize)) << 2)) as u64);
-        }
-        h
+    let mut h: u64 = mix(pcx.fn_canon[pcx.ir_fn[g as usize] as usize] as u64,
+        pcx.fn_live[g as usize] as u64);
+    if pcx.fn_address.len() > 0 {
+        h = mix(h, pcx.fn_address[g as usize] as u64);
     }
+    if !pcx.leaf_small.is_empty() {
+        h = mix(h,
+            (pcx.leaf_small[g as usize] | (pcx.leaf_keep[g as usize] << 1)
+                | (pcx.leaf_done[g as usize] << 2)) as u64);
+    }
+    h
 }
 
 // What the program knows of the task's own function fi as it begins:
@@ -822,7 +815,7 @@ fn key_put_fn(k: &mut H2, fi: i64, irh: H2, pcx: &Ctx<Comp>) {
 fn hash_input(cx: &mut FnCtx<Comp>, cc: &mut CcCtx<Comp>, fi: i64, key: &mut H2, pcx: &Ctx<Comp>) -> bool {
     cc.members.push(fi);
     cc.own_start.push(cc.own_strs.len() as i64);
-    cc.consts_before.push(const_data_count(fi));
+    cc.consts_before.push(const_data_count(fi, pcx));
     let mut h = H2 { a: 0, b: 0 };
     ir_enter(cx, fi, pcx);
     let ok = ir_hash(cx, fi, 0, &mut cc.marks, &mut cc.own_strs, &mut h, pcx);
@@ -1241,18 +1234,20 @@ fn put_facts(b: &mut Vec<u8, Comp>, fi: i64, pcx: &Ctx<Comp>) {
 
 // The constant data function fi's task made (from its count at the start,
 // `before`): their phase, rank (less `rank0`), alignment and bytes.
-fn put_consts(b: &mut Vec<u8, Comp>, fi: i64, before: i64, rank0: i64) {
-    let n = const_data_count(fi);
+fn put_consts(b: &mut Vec<u8, Comp>, fi: i64, before: i64, rank0: i64, pcx: &Ctx<Comp>) {
+    let mut bytes: Vec<u8, Comp> = Vec::new_in(Comp {});
+    let n = const_data_count(fi, pcx);
     put_u(b, (n - before) as u64);
     for k in before..n {
         let mut phase: i64 = 0;
         let mut rank: i64 = 0;
         let mut align: i64 = 0;
-        let bytes = const_data_entry(fi, k, &mut phase, &mut rank, &mut align);
+        bytes.clear();
+        const_data_entry(fi, k, &mut phase, &mut rank, &mut align, &mut bytes, pcx);
         put_u(b, phase as u64);
         put_s(b, rank - rank0);
         put_s(b, align);
-        put_bytes(b, bytes);
+        put_bytes(b, &bytes);
     }
 }
 
@@ -1294,7 +1289,7 @@ fn component_end(cx: &mut FnCtx<Comp>, cc: &mut CcCtx<Comp>, c: i64, start: i64,
         put_u(&mut cc.out, h.a);
         put_u(&mut cc.out, h.b);
         let before = cc.consts_before[(i - start) as usize];
-        put_consts(&mut cc.out, fi, before, start);
+        put_consts(&mut cc.out, fi, before, start, pcx);
     }
     ir_release(cx, pcx);
     if !store(cc, E_COMPONENT, first, pcx) {
@@ -1454,7 +1449,7 @@ fn component_install(cx: &mut FnCtx<Comp>, cc: &mut CcCtx<Comp>, r: &mut Reader<
         let b = get_u(r);
         set_irh(fi, H2 { a, b }, pcx);
         set_irh_ok(fi, true, pcx);
-        replay_consts(cx, r, fi, P_COMPONENT, start);
+        replay_consts(cx, r, fi, P_COMPONENT, start, pcx);
         // (its strings, as hash::ir_hash lists them)
         list_strings(cx, &mut cc.ids, fi, pcx);
     }
@@ -1500,7 +1495,8 @@ fn get_facts(r: &mut Reader<'_>, fi: i64, pcx: &Ctx<Comp>) {
 // The constant data an entry's task made for function fi, made again (in
 // its order: the same placeholders), in phase `phase`'s order with rank
 // rank0 + the recorded one.
-fn replay_consts(cx: &mut FnCtx<Comp>, r: &mut Reader<'_>, fi: i64, phase: i64, rank0: i64) {
+fn replay_consts(cx: &mut FnCtx<Comp>, r: &mut Reader<'_>, fi: i64, phase: i64, rank0: i64,
+    pcx: &Ctx<Comp>) {
     let nc = get_count(r);
     let saved_phase = cx.task_phase;
     let saved_rank = cx.task_rank;
@@ -1511,7 +1507,7 @@ fn replay_consts(cx: &mut FnCtx<Comp>, r: &mut Reader<'_>, fi: i64, phase: i64, 
         let bytes = get_bytes(r);
         cx.task_phase = ph;
         cx.task_rank = rank + rank0;
-        const_data(cx, fi, bytes, align);
+        const_data(cx, fi, bytes, align, pcx);
     }
     cx.task_phase = saved_phase;
     cx.task_rank = saved_rank;
@@ -1573,7 +1569,7 @@ fn emit_begin(cx: &mut FnCtx<Comp>, cc: &mut CcCtx<Comp>, fi: i64, task: i64, pc
     if irh_ok(fi, pcx) {
         cc.members.push(fi);
         cc.own_start.push(0);
-        cc.consts_before.push(const_data_count(fi));
+        cc.consts_before.push(const_data_count(fi, pcx));
         add_strs(fi, &mut cc.own_strs, pcx);
         key_put_fn(&mut key, fi, irh(fi, pcx), pcx);
     } else {
@@ -1640,7 +1636,12 @@ pub fn cc_emit_end(cx: &mut FnCtx<Comp>, fi: i64, task: i64, pcx: &Ctx<Comp>) {
 fn emit_end(cc: &mut CcCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
     cc.rec = false;
     cc.text = false;
-    text_set_relocs(fi, &cc.relocs);
+    {
+        // (the function's text, its own task's until the join takes it)
+        let mut t = pcx.fn_texts.lock(fi);
+        t.relocs.clear();
+        t.relocs.extend_from_slice(&cc.relocs);
+    }
     if cc.poison {
         pcx.cc_out_emit.set(fi, OUT_POISON);
         return;
@@ -1648,94 +1649,28 @@ fn emit_end(cc: &mut CcCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
     read_irs(cc, pcx);
     rel_sources(cc, pcx);
     cc.out.clear();
-    put_text(&mut cc.out, fi);
+    {
+        let t = pcx.fn_texts.lock(fi);
+        put_bytes(&mut cc.out, &t.data);
+        put_s(&mut cc.out, t.labels);
+    }
     put_u(&mut cc.out, cc.relocs.len() as u64);
     for i in 0..cc.relocs.len() {
         let x = rel_saddr(&mut cc.rel, cc.relocs[i]);
         put_u(&mut cc.out, x as u64);
     }
     let before = cc.consts_before[0];
-    put_consts(&mut cc.out, fi, before, 0);
-    put_text_rtids(&mut cc.out, &mut cc.rel, fi);
+    put_consts(&mut cc.out, fi, before, 0, pcx);
+    {
+        let t = pcx.fn_texts.lock(fi);
+        put_u(&mut cc.out, t.rtids.len() as u64);
+        for i in 0..t.rtids.len() {
+            let x = rel_rtid(&mut cc.rel, t.rtids[i]);
+            put_u(&mut cc.out, x as u64);
+        }
+    }
     if !store(cc, E_EMIT, fi, pcx) {
         pcx.cc_out_emit.set(fi, OUT_POISON);
-    }
-}
-
-// The text's string ids, by index, for the join (FN_TEXT[fi].relocs).
-fn text_set_relocs(fi: i64, relocs: &[i64]) {
-    // UNSAFE: FN_TEXT is middle::parallel's raw table (get_fn_text), and
-    // an entry's parts are raw blocks the join frees.
-    // SAFETY: fi is the emission task's own function, so the entry is this
-    // task's alone until the join (get_fn_text's rule); the block has room
-    // for relocs.len() + 1 words, and relocs.len() of them are written.
-    unsafe {
-        let t = get_fn_text().add(fi as usize);
-        let p = alloc_array::<i64>(relocs.len() as i64 + 1);
-        for i in 0..relocs.len() {
-            *p.add(i) = relocs[i];
-        }
-        (*t).relocs = p;
-        (*t).nrelocs = relocs.len() as i64;
-    }
-}
-
-// Function fi's text and its labels, into an entry.
-fn put_text(out: &mut Vec<u8, Comp>, fi: i64) {
-    // UNSAFE: FN_TEXT is middle::parallel's raw table; the text is a raw
-    // block and a length.
-    // SAFETY: fi is the emission task's own function, whose text run_task
-    // just made: data holds len bytes (len + 1 allocated), and nothing
-    // frees it before the join, after this task; the slice is not kept.
-    unsafe {
-        let t = get_fn_text().add(fi as usize);
-        put_bytes(out, std::slice::from_raw_parts((*t).data, (*t).len as usize));
-        put_s(out, (*t).labels);
-    }
-}
-
-// Function fi's text's RTID values, into an entry (by rel's index).
-fn put_text_rtids(out: &mut Vec<u8, Comp>, rel: &mut Rel<Comp>, fi: i64) {
-    // UNSAFE: FN_TEXT is middle::parallel's raw table; the values are a
-    // raw block and a count.
-    // SAFETY: fi is the emission task's own function; run_task wrote
-    // nrtids values into a block of nrtids + 1; the slice is not kept.
-    unsafe {
-        let t = get_fn_text().add(fi as usize);
-        let rtids = std::slice::from_raw_parts((*t).rtids, (*t).nrtids as usize);
-        put_u(out, rtids.len() as u64);
-        for &v in rtids.iter() {
-            put_u(out, rel_rtid(rel, v) as u64);
-        }
-    }
-}
-
-// Function fi's text read from an entry: FN_TEXT[fi] as run_task and
-// cc_emit_end leave it.
-fn text_install(fi: i64, text: &[u8], labels: i64, relocs: &[i64], rtids: &[i64]) {
-    // UNSAFE: FN_TEXT is middle::parallel's raw table, and an entry's
-    // parts are raw blocks the join frees.
-    // SAFETY: fi is the emission task's own function, so the entry is this
-    // task's alone until the join; each block is allocated one item longer
-    // than what is copied into it, from a slice of that length.
-    unsafe {
-        let t = get_fn_text().add(fi as usize);
-        (*t).len = text.len() as i64;
-        (*t).data = alloc_zeroed(text.len() as i64 + 1);
-        memcpy((*t).data, text.ptr, text.len() as u64);
-        (*t).labels = labels;
-        let r = alloc_array::<i64>(relocs.len() as i64 + 1);
-        for i in 0..relocs.len() {
-            *r.add(i) = relocs[i];
-        }
-        (*t).relocs = r;
-        (*t).nrelocs = relocs.len() as i64;
-        let p = alloc_array::<i64>(rtids.len() as i64 + 1);
-        for i in 0..rtids.len() {
-            *p.add(i) = rtids[i];
-        }
-        (*t).rtids = p;
-        (*t).nrtids = rtids.len() as i64;
     }
 }
 
@@ -1796,11 +1731,19 @@ fn emit_install(cx: &mut FnCtx<Comp>, r: &mut Reader<'_>, ids: &Ids<Comp>, fi: i
         let bytes = get_bytes(r);
         cx.task_phase = ph;
         cx.task_rank = if ph == P_EMIT { task } else { fi };
-        const_data(cx, fi, bytes, align);
+        const_data(cx, fi, bytes, align, pcx);
     }
     cx.task_phase = saved_phase;
     cx.task_rank = saved_rank;
-    text_install(fi, text, labels, &relocs, &rtids);
+    {
+        // (the function's text, its own task's until the join takes it)
+        let mut t = pcx.fn_texts.lock(fi);
+        t.data.clear();
+        t.data.extend_from_slice(text);
+        t.labels = labels;
+        t.relocs = relocs;
+        t.rtids = rtids;
+    }
     crate::middle::ir::ir_free_func(cx, fi, pcx);
     OUT_HIT
 }
@@ -1899,7 +1842,7 @@ pub fn cc_scalar_simplify_begin(cx: &mut FnCtx<Comp>, fi: i64, task: i64, pcx: &
     if hit >= 0 {
         let mut r = reader(pack_body_at(hit, pcx));
         r.at = at;
-        replay_phase(cx, &mut r, fi, P_SIMPLIFY, task);
+        replay_phase(cx, &mut r, fi, P_SIMPLIFY, task, pcx);
         return true;
     }
     let mut cc = task_begin(cx, -1, fi, pcx);
@@ -1944,7 +1887,7 @@ fn scalar_end(cx: &mut FnCtx<Comp>, cc: &mut CcCtx<Comp>, fi: i64, pcx: &Ctx<Com
     put_u(&mut cc.out, h.a);
     put_u(&mut cc.out, h.b);
     let before = cc.consts_before[0];
-    put_consts(&mut cc.out, fi, before, 0);
+    put_consts(&mut cc.out, fi, before, 0, pcx);
     if !store(cc, E_SCALAR, fi, pcx) {
         pcx.cc_out_scalar.set(fi, OUT_POISON);
     }
@@ -1985,7 +1928,7 @@ fn scalar_hit(cx: &mut FnCtx<Comp>, cc: &mut CcCtx<Comp>, e: i64, fi: i64, task:
     set_irh(fi, H2 { a, b }, pcx);
     set_irh_ok(fi, true, pcx);
     r.at = at;
-    replay_phase(cx, &mut r, fi, P_CLEANUP, task);
+    replay_phase(cx, &mut r, fi, P_CLEANUP, task, pcx);
     let mut sr = pcx.cc_scalar[fi as usize].lock().unwrap();
     sr.hit = e;
     sr.at = at;
@@ -2006,7 +1949,8 @@ fn consts_read(r: &mut Reader<'_>) -> bool {
 
 // The constant data of an entry (r at its list) made in phase `phase`
 // made again for function fi, in their order, with rank `rank`.
-fn replay_phase(cx: &mut FnCtx<Comp>, r: &mut Reader<'_>, fi: i64, phase: i64, rank: i64) {
+fn replay_phase(cx: &mut FnCtx<Comp>, r: &mut Reader<'_>, fi: i64, phase: i64, rank: i64,
+    pcx: &Ctx<Comp>) {
     let nc = get_count(r);
     let saved_phase = cx.task_phase;
     let saved_rank = cx.task_rank;
@@ -2018,7 +1962,7 @@ fn replay_phase(cx: &mut FnCtx<Comp>, r: &mut Reader<'_>, fi: i64, phase: i64, r
         if ph == phase {
             cx.task_phase = ph;
             cx.task_rank = rank;
-            const_data(cx, fi, bytes, align);
+            const_data(cx, fi, bytes, align, pcx);
         }
     }
     cx.task_phase = saved_phase;
