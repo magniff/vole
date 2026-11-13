@@ -610,8 +610,8 @@ def logic():
     for op, form, mn, sem, comm in [("and", "vbin.and", "and", "a[k] & b[k]", True),
                                     ("orr", "vbin.or", "orr", "a[k] | b[k]", True),
                                     ("eor", "vbin.xor", "eor", "a[k] ^ b[k]", True),
-                                    ("bic", "intr", "bic", "a[k] & ~b[k]", False),
-                                    ("orn", "intr", "orn", "a[k] | ~b[k]", False)]:
+                                    ("bic", "intr", "bic", "a[k] & !b[k]", False),
+                                    ("orn", "intr", "orn", "a[k] | !b[k]", False)]:
         for t, q in qd(I):
             a = "16b" if q else "8b"
             line(name("v%s{q}_{t}" % op, t, q), "neon", "(a: %s, b: %s) -> %s" % (vv(t, q), vv(t, q), vv(t, q)),
@@ -623,14 +623,14 @@ def logic():
     for t, q in qd(I6 + ["p8"]):
         a = "16b" if q else "8b"
         line(name("vmvn{q}_{t}", t, q), "neon", "(a: %s) -> %s" % (vv(t, q), vv(t, q)), "intr",
-             "mvn <d>.%s, <a>.%s" % (a, a), "pure", None, "lanes.not", "r[k] = ~a[k]", None, "lanewise ~a")
+             "mvn <d>.%s, <a>.%s" % (a, a), "pure", None, "lanes.not", "r[k] = !a[k]", None, "lanewise !a")
     for t, q in qd(I + ["p8"]):
         a = "16b" if q else "8b"
         line(name("vbsl{q}_{t}", t, q), "neon",
              "(a: %s, b: %s, c: %s) -> %s" % (vv(utype(t), q), vv(t, q), vv(t, q), vv(t, q)), generic("vsel", t, q),
              "bsl <d>.%s, <b>.%s, <c>.%s" % (a, a, a), "pure tied=a", None, "lanes.bsl",
-             "r[k] = (b[k] & (a[k] as i64)) | (c[k] & ~(a[k] as i64))" if t == "s64"
-             else "r[k] = (b[k] & a[k]) | (c[k] & ~a[k])", None,
+             "r[k] = (b[k] & (a[k] as i64)) | (c[k] & !(a[k] as i64))" if t == "s64"
+             else "r[k] = (b[k] & a[k]) | (c[k] & !a[k])", None,
              "bitwise select: b's bits where a's are set, c's elsewhere")
 
 
@@ -974,7 +974,7 @@ def crypto():
         q = vv(t, True)
         line("vbcaxq_%s" % t, "sha3", "(a: %s, b: %s, c: %s) -> %s" % (q, q, q, q), "intr",
              "bcax <d>.16b, <a>.16b, <b>.16b, <c>.16b", "pure", None, "lanes.bcax",
-             "r[k] = a[k] ^ (b[k] & ~c[k])", None, "a ^ (b & ~c), Keccak's chi step")
+             "r[k] = a[k] ^ (b[k] & !c[k])", None, "a ^ (b & !c), Keccak's chi step")
     line("vrax1q_u64", "sha3", "(a: %s, b: %s) -> %s" % (u2, u2, u2), "intr", "rax1 <d>.2d, <a>.2d, <b>.2d",
          "pure", None, "lanes.rax1", "r[k] = a[k] ^ ((b[k] << 1) | (b[k] >> 63))", None,
          "a ^ (b rotated left by 1), Keccak's theta step")

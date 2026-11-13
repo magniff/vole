@@ -29,7 +29,7 @@ version keeps three masks of the current row's attacked columns:
   (moving one row down shifts it one column: `<< 1`);
 - `right`: the same down and to the right (`>> 1`).
 
-The free squares are `all & ~(cols | left | right)`, one expression, and
+The free squares are `all & !(cols | left | right)`, one expression, and
 the loop takes them lowest first with `free & -free`, the lowest set
 bit. Each node of the search is a handful of integer instructions, with
 no memory but the call stack.
