@@ -42,6 +42,11 @@ escape hatch:
   unsafe` wraps what stays raw in `unsafe { }`.
 - `v[i]` on a Vec or a slice is that element, checked; `*p.add(i)` on a
   raw pointer is pointer arithmetic, unchecked and unsafe.
+- (0.30) `*p = v` (and `(*p).f = v`) drops the old value first, as in
+  Rust and as through a `&mut`: it must be initialized. Memory that
+  holds no value yet (malloc's, a Vec's spare capacity) is written with
+  `std::ptr::write(p, v)` or `p.write(v)`, which drops nothing. For a
+  type with nothing to drop (an `i64`, below) the two are the same.
 
 ```vole
 extern "C" {
