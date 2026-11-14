@@ -173,6 +173,8 @@ by the compiler's parser, with holes:
 | `$x` | any expression; in a type's place, any type (`$a as $T`); in a `let`'s binding place, any pattern (`let $v = ...;`) |
 | `$x...` | any number of elements of a call's arguments, a tuple, an array (one per list): `f($first, $rest...)`; (0.15) of a block's statements, its tail included: `{ let $x = $e; $s... }` |
 | `$x` written twice | the same code both times (the same tokens, spacing and comments aside) |
+| `$e.$f`, `$e.$m($a...)` | (0.30) the name of a field, of a method: `(*$p.add($i)).$f` is every field read through that pointer, one rewrite for all of them; in the replacement `$f` is the name it matched, wherever a name stands (`$t[$i].$f`, `T::$m($e)`); `$f~/RE/` and `--where '$f: name ~ RE'` narrow it |
+| `c"$s"`, `b"$s"`, `"$s"` | (0.30) the text of a string literal of that kind (the same prefix), and of no other: `c"$s"` to `b"$s\0"` touches C-string literals only; in the replacement `$s` is that text inside any literal, among other text too |
 | `--where '$x: T'` | only where the checker typed $x's expression `T` (as messages write types: `&mut IntVec`, `[u8]`, `Vec<i64>`; spaces aside); several: `--where '$x: T, $y: U'` or `--where` again |
 | `--where '$x: name'`, `--where '$x: name ~ RE'`, `$x~/RE/` | (0.16) only a name: an identifier or a path (`V`, `crate::m::V`, the name a `for` or `let` binds), not another expression (`IRFUNCS[f].blocks`); with RE, a name whose text RE matches (`^ $ . * + ? [a-z] [^...] \d \w`, anywhere unless anchored: `$v~/^v_/`) |
 
@@ -181,12 +183,23 @@ the sites in that file or module, its children too; 0.17: `--in ITEM`, a
 function, a type, a const...: the sites in its text; `--in` repeated: the
 sites in any of them), node by node: same kind, same
 operator, same names, and a part without holes matches code with the
-same tokens; parentheses do not count (`$a + $b` matches `(x + y)`). A
+same tokens; parentheses do not count (`$a + $b` matches `(x + y)`;
+0.30: nor inside a part without holes, `0 as usize` matches `(0) as
+usize`, nor for a hole written twice). A
 site's replacement is REPLACEMENT with each hole replaced by the exact
 text it matched; a hole's text is parenthesized when the operators
 around it in REPLACEMENT need it, and the whole replacement when the
 operators around the site need it (`double($x)` to `$x + $x` makes `3 *
-double(n)` `3 * (n + n)`). `$x...` that matched nothing goes with a comma
+double(n)` `3 * (n + n)`). (0.30) Parentheses that are needed no more
+go: the site's own when the replacement is a postfix expression (a
+name, a call, an index, a field) or stands where any expression does
+(an argument, an index, an initializer), so `(*p.add(i)).f` becomes
+`p[i].f`, not `(p[i]).f`; a hole's when its code lands in such a place
+(`f((n - 1))` to `g(n - 1)`). They stay around a call's callee (`(s.f)(x)`),
+around code with a `{` of its own (an `if` would take it for its block),
+and where only a reader wants them (`(a * b) + c`). A hole written where
+none can stand (a struct literal's field, a path's segment, a closure's
+parameter) is `error rewrite.pattern`, naming it. `$x...` that matched nothing goes with a comma
 next to it. Sites inside a rewritten site are left for another run
 (`note rewrite.nested`).
 
@@ -257,14 +270,15 @@ replacement's first.
 
 (0.16) **`--list`** prints a line per site instead of rewriting:
 `FILE:LINE:COL`, then each hole of the pattern and what it matched,
-TAB-separated (spaces and lines made one space, cut at 60 bytes). With a
+TAB-separated (spaces and lines made one space, cut at 60 bytes), then
+(0.30) the site's source line (its indentation aside, cut at 120 bytes). With a
 REPLACEMENT, the sites that would be rewritten (not those left by
 `rewrite.dropped`); without one, every site PATTERN matches:
 
 ```
 $ volec rewrite 'for $i in 0..$v.count { $s... }' --list
-loops.vl:8:5→$i=i→$v=w→$s...=t += w.data[i] * 2; if w.data[i] > 2 { t += w.data[i]; }
-loops.vl:18:5→$i=j→$v=w→$s...=t -= w.data[j];
+loops.vl:8:5→$i=i→$v=w→$s...=t += w.data[i] * 2; if w.data[i] > 2 { t += w.data[i]; }→for i in 0..w.count {
+loops.vl:18:5→$i=j→$v=w→$s...=t -= w.data[j];→for j in 0..w.count {
 ```
 
 (0.30) **`--not-in FILE|MODULE|ITEM`** (repeatable, resolved as `--in`
@@ -511,8 +525,9 @@ as it changes the program through the edit engine (`edit_replace`,
 ## Known limits
 
 - A pattern's names match by name (`grow` matches any function or
-  variable named `grow`); holes do not stand for names of functions,
-  fields or methods, nor for patterns other than a `let`'s.
+  variable named `grow`); a hole stands for the name of a field or a
+  method (0.30), not for a path's segment or a struct literal's field,
+  nor for patterns other than a `let`'s.
 - Parenthesizing knows the operators' binding powers; a replacement
   placed where a struct literal is not allowed (an `if`'s condition) is
   not parenthesized for it: the check refuses it.

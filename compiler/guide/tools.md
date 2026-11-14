@@ -126,7 +126,7 @@ an edit then `check`.
 | a field, with every literal | `volec refactor field STRUCT --add 'g: i64 = 0'` (`--type g T --default EXPR`) |
 | a variant, with every match | `volec refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match) |
 | move items to a module | `volec refactor move PATH --to MODULE` (made when missing) |
-| an idiom everywhere, typed | `volec rewrite 'old($a)' 'new($a)' --dry-run` |
+| an idiom everywhere, typed | `volec rewrite 'old($a)' 'new($a)' --dry-run` (`$e.$f`: a field's name; `c"$s"`: a literal's text; `--in`, `--not-in ITEM`; `--list`) |
 | a word in every file git tracks (docs, scripts, a source's comments or strings) | `volec rewrite --text OLD NEW --word --case --dry-run --diff` (`--files GLOB`, `--comments`, `--strings`, `--no-sources`, `--exclude SPEC`, `--check ROOT`) |
 | sources to another extension, with the mentions of their paths | `volec refactor extension .vl .vl ROOT\|DIR\|--all --dry-run` (git mv; the build compared before and after) |
 | imports, unused, pub, unsafe | `volec fix` (`--only imports,unused,pub,unsafe`, `--dry-run`) |

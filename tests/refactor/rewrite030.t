@@ -30,7 +30,7 @@ try: volec rewrite '&mut $t.rows[$i]' '&mut $t[$i]' --dry-run --force
 [exit 1]
 ## (`&mut e` in a pattern is not `&e`)
 $ rewrite '&$t.rows[$i]' '&$t[$i]' --list
-tab.vl:25:9	$t=self	$i=i
+tab.vl:25:9	$t=self	$i=i	&self.rows[i]
 ## A method of the receiver's own type; a path to it.
 $ rewrite '&$t.rows[$i]' '$t.get($i)' --dry-run
 error rewrite.recursive: 1 site is inside the function its replacement calls there (the function would call itself); first: tab.vl:25:9 in tab::Tab::get; nothing written
@@ -80,3 +80,96 @@ note rewrite.none: nothing matches '$t.get($i)'
 $ rewrite 'at($t, $i)' 'raw_at($t, $i)' --not-in nope.vl
 error rewrite.bad-in: no file, module or item 'nope.vl' in the program
 [exit 1]
+## Patterns of 0.30. A hole for the name of a field, of a method; --list
+## ends with the site's source line.
+$ rewrite '$e.$f' --list --in main
+main.vl:9:13	$e=at(&t, 0)	$f=reg	let a = at(&t, 0).reg;
+main.vl:10:13	$e=raw_at(&t, 1)	$f=len	let b = raw_at(&t, 1).len;
+main.vl:11:13	$e=(at(&t, (1)))	$f=len	let c = (at(&t, (1))).len;
+main.vl:12:13	$e=first(&t)	$f=reg	let d = first(&t).reg + (0);
+$ rewrite '$e.$f~/^re/' --list
+main.vl:9:13	$e=at(&t, 0)	$f=reg	let a = at(&t, 0).reg;
+main.vl:12:13	$e=first(&t)	$f=reg	let d = first(&t).reg + (0);
+$ rewrite 'at($t, $i).$f' 'raw_at($t, $i).$f' --dry-run
+--- a/main.vl
++++ b/main.vl
+@@ -3 +3 @@
+-use crate::tab::{Row, Tab, at, first, raw_at, tag, twice_len};
++use crate::tab::{Row, Tab, first, raw_at, tag, twice_len};
+@@ -9 +9 @@
+-    let a = at(&t, 0).reg;
++    let a = raw_at(&t, 0).reg;
+@@ -11 +11 @@
+-    let c = (at(&t, (1))).len;
++    let c = raw_at(&t, 1).len;
+note rewrite.imports: removed 1 import the rewrite left unused
+$ rewrite '$e.$m($a...)' --list --in main
+main.vl:7:5	$e=t	$m=push	$a...=Row { reg: 1, len: 2 }	t.push(Row { reg: 1, len: 2 });
+main.vl:8:5	$e=t	$m=push	$a...=Row { reg: 3, len: 4 }	t.push(Row { reg: 3, len: 4 });
+main.vl:13:34	$e=b"abc"	$m=len	$a...=	let n = twice_len(b"vole") + b"abc".len() as i64 * 2;
+$ rewrite '$t.$m($i)' 'Tab::$m($t, $i)' --in at --dry-run
+--- a/tab.vl
++++ b/tab.vl
+@@ -44 +44 @@
+-    *t.get(i)
++    *Tab::get(t, i)
+## A hole where none can stand is an error, not `nothing matches`.
+$ rewrite 'Row { $f: 1, len: 2 }' --list
+error rewrite.pattern: $f stands where no hole can: a hole is an expression, a type, a binding (`let $x`, `for $x in`), the name of a field or a method (`$e.$f`, `$e.$m()`), the text of a string literal (`c"$s"`)
+[exit 2]
+## Parentheses. The site's go when the replacement needs none there, and
+## a hole's where it lands in an argument; a literal and a hole match
+## through redundant ones.
+$ rewrite 'at($t, $i)' 'raw_at($t, $i)' --dry-run
+--- a/main.vl
++++ b/main.vl
+@@ -3 +3 @@
+-use crate::tab::{Row, Tab, at, first, raw_at, tag, twice_len};
++use crate::tab::{Row, Tab, first, raw_at, tag, twice_len};
+@@ -9 +9 @@
+-    let a = at(&t, 0).reg;
++    let a = raw_at(&t, 0).reg;
+@@ -11 +11 @@
+-    let c = (at(&t, (1))).len;
++    let c = raw_at(&t, 1).len;
+note rewrite.imports: removed 1 import the rewrite left unused
+$ rewrite 'at($t, 1)' --list
+main.vl:11:13	$t=&t	let c = (at(&t, (1))).len;
+$ rewrite '$a + 0' '$a' --dry-run
+--- a/main.vl
++++ b/main.vl
+@@ -12 +12 @@
+-    let d = first(&t).reg + (0);
++    let d = first(&t).reg;
+$ rewrite '$x.len' '$x.reg' --in main --dry-run
+--- a/main.vl
++++ b/main.vl
+@@ -10,2 +10,2 @@
+-    let b = raw_at(&t, 1).len;
+-    let c = (at(&t, (1))).len;
++    let b = raw_at(&t, 1).reg;
++    let c = at(&t, (1)).reg;
+## (the ones the replacement needs are still added)
+$ rewrite 'first($t)' '*$t.get(0)' --dry-run
+--- a/main.vl
++++ b/main.vl
+@@ -3 +3 @@
+-use crate::tab::{Row, Tab, at, first, raw_at, tag, twice_len};
++use crate::tab::{Row, Tab, at, raw_at, tag, twice_len};
+@@ -12 +12 @@
+-    let d = first(&t).reg + (0);
++    let d = (*(&t).get(0)).reg + (0);
+note rewrite.imports: removed 1 import the rewrite left unused
+## A literal's text: `c"$s"` is any C-string literal, and only those.
+$ rewrite 'c"$s"' --list
+main.vl:14:17	$s=malloc	let m = tag(c"malloc") + tag(c"calloc");
+main.vl:14:34	$s=calloc	let m = tag(c"malloc") + tag(c"calloc");
+$ rewrite 'b"$s"' --list
+main.vl:13:23	$s=vole	let n = twice_len(b"vole") + b"abc".len() as i64 * 2;
+main.vl:13:34	$s=abc	let n = twice_len(b"vole") + b"abc".len() as i64 * 2;
+$ rewrite 'c"$s"' 'b"$s\0".as_ptr()' --dry-run
+--- a/main.vl
++++ b/main.vl
+@@ -14 +14 @@
+-    let m = tag(c"malloc") + tag(c"calloc");
++    let m = tag(b"malloc\0".as_ptr()) + tag(b"calloc\0".as_ptr());
