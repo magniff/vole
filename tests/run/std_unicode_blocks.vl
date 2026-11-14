@@ -1,0 +1,271 @@
+// std::unicode's byte-level routines (0.30) against plain forms of them:
+// ascii_printable_prefix_len (sixteen bytes a step) with a byte that is
+// not printable at every place of texts of 0 to 70 bytes, at every
+// offset to 16; lossy_next against what str::from_utf8 says of the rest
+// of the text (the next char, or U+FFFD over the error's length), on the
+// edge sequences whole and cut at every place and on random text with
+// damage; next_grapheme_end, graphemes and count_graphemes (two ASCII
+// bytes break without the rules) against GraphemeState fed every code
+// point; str_width_chars against the sum of the code points' widths.
+// EXPECT: prefix 74905, lossy 24254 texts, clusters 20000 texts, widths 20000 texts: 0 differ
+use std::unicode::{
+    GraphemeState, ascii_printable_prefix_len, char_width, count_graphemes, graphemes, lossy_next,
+    next_grapheme_end, props, str_width_chars,
+};
+
+fn next(s: &mut u64) -> u64 {
+    let mut x = *s;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    *s = x;
+    x
+}
+
+fn plain_prefix(v: &[u8]) -> usize {
+    let mut i = 0usize;
+    while i < v.len() && v[i] >= 0x20 && v[i] <= 0x7e {
+        i += 1;
+    }
+    i
+}
+
+// The code point at v[i] and its length, by str::from_utf8 of the rest:
+// the first char of its valid start, or U+FFFD over the error's bytes
+// (to the end when the text is cut inside a sequence).
+fn plain_lossy(v: &[u8], i: usize) -> (u32, usize) {
+    let rest = &v[i..];
+    let good = match std::str::from_utf8(rest) {
+        Ok(_) => rest.len(),
+        Err(e) => {
+            if e.valid_up_to() == 0 {
+                return (0xfffd, match e.error_len() {
+                    Some(k) => k,
+                    None => rest.len(),
+                });
+            }
+            e.valid_up_to()
+        }
+    };
+    let c = std::str::from_utf8(&rest[..good]).unwrap().chars().next().unwrap();
+    (c as u32, c.len_utf8())
+}
+
+// The edge sequences: each is LEN, then its bytes (std_str_from_utf8_blocks's).
+const EDGES: [u8; 175] = [
+    1, 0x00, 1, 0x7F, 2, 0xC2, 0x80, 2, 0xDF, 0xBF, 3, 0xE0, 0xA0, 0x80, 3, 0xE0, 0xBF, 0xBF,
+    3, 0xE1, 0x80, 0x80, 3, 0xEC, 0xBF, 0xBF, 3, 0xED, 0x80, 0x80, 3, 0xED, 0x9F, 0xBF,
+    3, 0xEE, 0x80, 0x80, 3, 0xEF, 0xBF, 0xBF, 4, 0xF0, 0x90, 0x80, 0x80, 4, 0xF0, 0xBF, 0xBF, 0xBF,
+    4, 0xF1, 0x80, 0x80, 0x80, 4, 0xF3, 0xBF, 0xBF, 0xBF, 4, 0xF4, 0x80, 0x80, 0x80,
+    4, 0xF4, 0x8F, 0xBF, 0xBF,
+    1, 0x80, 1, 0xBF, 2, 0x80, 0x80, 2, 0xC0, 0x80, 2, 0xC1, 0xBF, 3, 0xE0, 0x80, 0x80,
+    3, 0xE0, 0x9F, 0xBF, 3, 0xED, 0xA0, 0x80, 3, 0xED, 0xBF, 0xBF, 4, 0xF0, 0x80, 0x80, 0x80,
+    4, 0xF0, 0x8F, 0xBF, 0xBF, 4, 0xF4, 0x90, 0x80, 0x80, 4, 0xF4, 0xBF, 0xBF, 0xBF,
+    4, 0xF5, 0x80, 0x80, 0x80, 4, 0xF7, 0xBF, 0xBF, 0xBF, 1, 0xF8, 1, 0xFE, 1, 0xFF,
+    2, 0xC2, 0x41, 2, 0xDF, 0xC0, 3, 0xE1, 0x80, 0x41, 3, 0xE1, 0x41, 0x80, 3, 0xEF, 0xBF, 0xC2,
+    4, 0xF1, 0x80, 0x80, 0x41, 4, 0xF1, 0x80, 0x41, 0x80, 4, 0xF1, 0x41, 0x80, 0x80,
+    4, 0xF3, 0xBF, 0xBF, 0xE1,
+];
+
+fn push_cp(b: &mut Vec<u8, Gpa>, cp: u32) {
+    let mut e = [0u8; 4];
+    let t = char::from_u32(cp).unwrap().encode_utf8(&mut e);
+    b.extend_from_slice(t.as_bytes());
+}
+
+// Text of n pieces: ASCII words, CR LF and lone controls, accents after a
+// letter, Hangul jamo, emoji with ZWJ, flags and modifiers, CJK; with
+// `damage`, now and then a byte that is none of these.
+fn random(s: &mut u64, b: &mut Vec<u8, Gpa>, n: u64, damage: bool) {
+    for _ in 0..n {
+        let x = next(s);
+        let k = x % 32;
+        let r = x >> 16;
+        if k < 12 {
+            for j in 0..1 + (x >> 8) % 6 {
+                b.push((0x20 + (r >> (j * 7)) % 95) as u8);
+            }
+        } else if k == 12 {
+            b.extend_from_slice(b"\r\n");
+        } else if k == 13 {
+            b.push([b'\r', b'\n', b'\t', 0x7f][(r % 4) as usize]);
+        } else if k < 16 {
+            b.push(b'e');
+            push_cp(b, (0x300 + r % 0x30) as u32);
+        } else if k < 18 {
+            push_cp(b, (0x1100 + r % 19) as u32);
+            push_cp(b, (0x1161 + (r >> 8) % 21) as u32);
+        } else if k < 20 {
+            push_cp(b, 0x1f468);
+            push_cp(b, 0x200d);
+            push_cp(b, 0x1f469);
+        } else if k < 22 {
+            push_cp(b, (0x1f1e6 + r % 26) as u32);
+        } else if k == 22 {
+            push_cp(b, 0x1f44d);
+            push_cp(b, 0x1f3fd);
+        } else if k == 23 {
+            push_cp(b, 0x2764);
+            push_cp(b, 0xfe0f);
+        } else if k < 28 {
+            push_cp(b, (0x4e00 + r % 0x5200) as u32);
+        } else if k < 30 {
+            push_cp(b, (0x915 + r % 32) as u32);
+            push_cp(b, 0x94d);
+        } else if damage {
+            b.push((x >> 8) as u8);
+        } else {
+            push_cp(b, (0x80 + r % 0x780) as u32);
+        }
+    }
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let mut b = Vec::<u8, Gpa>::new_in(gpa);
+    let mut s: u64 = 0x2545f4914f6cdd1d;
+    let mut differ = 0;
+    // 1. the printable prefix
+    let mut prefixes = 0;
+    let others = [0x00u8, 0x1f, 0x7f, 0x80, 0xff, 0x0a];
+    for len in 0..71usize {
+        for off in [0usize, 1, 7, 15, 16] {
+            for at in 0..len + 1 {
+                for o in others {
+                    b.clear();
+                    for k in 0..off + len {
+                        // (both ends of the printable range among them)
+                        b.push(if k % 5 == 0 { 0x20 } else if k % 7 == 0 { 0x7e }
+                            else { b'a' + (k % 26) as u8 });
+                    }
+                    if at < len {
+                        b[off + at] = o;
+                        if at + 9 < len {
+                            b[off + at + 9] = 0x1f;
+                        }
+                    }
+                    let v = &b.as_slice()[off..];
+                    prefixes += 1;
+                    if ascii_printable_prefix_len(v) != plain_prefix(v) || plain_prefix(v) != at {
+                        differ += 1;
+                        if differ < 5 {
+                            println("differ: prefix len {len} off {off} at {at}");
+                        }
+                    }
+                    if at == len {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // 2. lossy_next
+    let mut lossy = 0;
+    let mut e = 0usize;
+    while e < EDGES.len() {
+        let w = EDGES[e] as usize;
+        for cut in 1..w + 1 {
+            for len in [cut, cut + 1, cut + 2, 9, 20] {
+                let mut at = 0usize;
+                while at + cut <= len {
+                    b.clear();
+                    for k in 0..len {
+                        b.push(b'a' + (k % 26) as u8);
+                    }
+                    for k in 0..cut {
+                        b[at + k] = EDGES[e + 1 + k];
+                    }
+                    lossy += 1;
+                    let v = b.as_slice();
+                    let mut i = 0usize;
+                    while i < v.len() {
+                        let (cp, n) = plain_lossy(v, i);
+                        let mut j = i;
+                        if lossy_next(v, &mut j) != cp || j != i + n {
+                            differ += 1;
+                            if differ < 5 {
+                                println("differ: lossy edge {e} cut {cut} len {len} at {at}");
+                            }
+                            break;
+                        }
+                        i = j;
+                    }
+                    at += 1;
+                }
+            }
+        }
+        e += 1 + w;
+    }
+    for _ in 0..20000 {
+        b.clear();
+        let n = 1 + next(&mut s) % 12;
+        random(&mut s, &mut b, n, true);
+        lossy += 1;
+        let v = b.as_slice();
+        let mut i = 0usize;
+        while i < v.len() {
+            let (cp, n) = plain_lossy(v, i);
+            let mut j = i;
+            if lossy_next(v, &mut j) != cp || j != i + n {
+                differ += 1;
+                if differ < 5 {
+                    println("differ: lossy, random text");
+                }
+                break;
+            }
+            i = j;
+        }
+    }
+    // 3. clusters: the boundaries are where GraphemeState, fed every code
+    // point of the text, says a cluster starts
+    let mut clusters = 0;
+    let mut widths = 0;
+    let mut starts = Vec::<usize, Gpa>::new_in(gpa);
+    for round in 0..20000 {
+        b.clear();
+        let n = 1 + next(&mut s) % 16;
+        random(&mut s, &mut b, n, round % 4 == 0);
+        let v = b.as_slice();
+        starts.clear();
+        let mut st = GraphemeState::new();
+        let mut i = 0usize;
+        let mut sum = 0usize;
+        while i < v.len() {
+            let at = i;
+            let cp = lossy_next(v, &mut i);
+            if st.push_props(props(cp)) {
+                starts.push(at);
+            }
+            let w = char_width(cp);
+            if w > 0 {
+                sum += w as usize;
+            }
+        }
+        starts.push(v.len());
+        clusters += 1;
+        let mut bad = count_graphemes(v) != starts.len() - 1;
+        let mut k = 0usize;
+        for g in graphemes(v) {
+            if k + 1 >= starts.len() || g.len() != starts[k + 1] - starts[k]
+                || next_grapheme_end(v, starts[k]) != starts[k + 1] {
+                bad = true;
+                break;
+            }
+            k += 1;
+        }
+        if bad || k + 1 != starts.len() {
+            differ += 1;
+            if differ < 5 {
+                println("differ: clusters of a random text of {} bytes", v.len());
+            }
+        }
+        widths += 1;
+        if str_width_chars(v, false) != sum {
+            differ += 1;
+            if differ < 5 {
+                println("differ: width of a random text of {} bytes", v.len());
+            }
+        }
+    }
+    println("prefix {prefixes}, lossy {lossy} texts, clusters {clusters} texts, widths {widths} texts: {differ} differ");
+    0
+}

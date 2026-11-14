@@ -3,7 +3,7 @@
 // splits at loop entries, and spill slots for the values that go to the
 // stack.
 
-use crate::back::regalloc::{ON_STACK, POS_MAX, UNASSIGNED, USE_REG};
+use crate::back::regalloc::{ON_STACK, POS_MAX, UNASSIGNED, USE_ANY, USE_REG};
 use crate::back::regalloc::intervals::{
     block_at, covers, gap_before, min_i64, move_point_before, next_intersection, next_use, ra_end,
     ra_start, split_at, split_point,
@@ -425,6 +425,89 @@ fn assign_whole(cx: &mut FnCtx<Comp>, cur: i64, r: i64, hint: i64, regs: &mut [i
     assign(cx, cur, r);
 }
 
+// (0.30) A callee-saved register for a value that a loop uses and that
+// lives across a call in that loop (`limit`: where its best caller-saved
+// register is lost), for its whole lifetime: taken from a value that
+// nothing reads while this one lives nor anywhere in the loop, which
+// waits on the stack (from the loop's start: spill_from). Without it the
+// value was in a caller-saved register up to the call and in a
+// callee-saved one after it: at the loop's header in the first, at its
+// latch in the second, and every round moved it over and back, on the
+// path that makes no call too; and the callee-saved one was taken at the
+// call from a value the back edge then brought back every round.
+fn take_idle_register(cx: &mut FnCtx<Comp>, cur: i64, limit: i64, regs: &mut [i64], n: i64,
+    pcx: &Ctx<Comp>) -> bool {
+    let around = loop_at(cx, limit);
+    if around < 0 {
+        return false;
+    }
+    let first = loop_first(cx, around);
+    let start = ra_start(cx, cur);
+    let end = ra_end(cx, cur);
+    if !used_in_loop(cx, cur, max_i64(start, first), around) {
+        return false;
+    }
+    // What the other value must be idle through: from the first position
+    // of the loop (so that it waits on the stack for all of it) to the end
+    // of cur, and in the blocks of the loop laid out after that.
+    let lo = min_i64(start, first);
+    let mut best: i64 = -1;
+    let mut best_holder: i64 = -1;
+    let mut best_use: i64 = 0;
+    for k in 0..n {
+        let r = regs[k as usize];
+        if !is_callee_saved_reg(r) || !reg_fits(cx, cur, r, pcx) {
+            continue;
+        }
+        if cx.fixed[r as usize].len() as i64 > 0
+            && fixed_intersection(cx, r, cur, start) < POS_MAX {
+            continue;
+        }
+        // Its holder: one active interval, and no inactive one that
+        // meets cur.
+        let mut holder: i64 = -1;
+        let mut shared = false;
+        for at_k in 0..cx.active.len() {
+            let a = cx.active[at_k];
+            if cx.ivs[a as usize].reg == r {
+                shared = holder >= 0;
+                holder = a;
+            }
+        }
+        for at_k in 0..cx.inactive.len() {
+            let a = cx.inactive[at_k];
+            if cx.ivs[a as usize].reg == r
+                && next_intersection(&cx.ivs[a as usize].ranges, &cx.ivs[cur as usize].ranges,
+                    start) < POS_MAX {
+                shared = true;
+            }
+        }
+        if shared || holder < 0 || ra_start(cx, holder) > lo {
+            continue;
+        }
+        let u = next_use(cx, holder, lo, USE_ANY);
+        if u >= end && (best < 0 || u > best_use) && !used_in_loop(cx, holder, end, around) {
+            best = r;
+            best_holder = holder;
+            best_use = u;
+        }
+    }
+    if best < 0 {
+        return false;
+    }
+    let mut k: i64 = 0;
+    while k < cx.active.len() as i64 {
+        if cx.active[k as usize] == best_holder {
+            remove_at(&mut cx.active, k);
+            break;
+        }
+        k += 1;
+    }
+    spill_from(cx, best_holder, start);
+    assign(cx, cur, best);
+    true
+}
+
 fn try_allocate_free(cx: &mut FnCtx<Comp>, cur: i64, pcx: &Ctx<Comp>) -> bool {
     cx.fix_step += 1;
     let mut regs: [i64; 32] = [0i64; 32];
@@ -511,8 +594,35 @@ fn try_allocate_free(cx: &mut FnCtx<Comp>, cur: i64, pcx: &Ctx<Comp>) -> bool {
     if cx.free_until[best as usize] <= start {
         return false;
     }
+    let limit = cx.free_until[best as usize];
+    if take_idle_register(cx, cur, limit, &mut regs[..], n, pcx) {
+        return true;
+    }
+    // (0.30) The register is lost in a loop that does not read the value
+    // (a value that waits across the loop, and a call in it, for a use
+    // past it): on the stack from here, not in the register for a part
+    // that holds the header of the loop and leaves its back edge to
+    // bring the value back every round. (A value the loop reads later in
+    // the layout than the call is read on the paths around the call too:
+    // it keeps the register.)
+    let around = loop_at(cx, limit);
+    if around >= 0 && next_use(cx, cur, start, USE_ANY) >= limit
+        && !used_in_loop(cx, cur, limit, around) {
+        let first = next_use(cx, cur, start, USE_REG);
+        if first == POS_MAX {
+            cx.ivs[cur as usize].reg = ON_STACK;
+            return true;
+        }
+        let back = split_point(cx, start + 1, gap_before(first));
+        if back > start {
+            cx.ivs[cur as usize].reg = ON_STACK;
+            let rest = split_at(cx, cur, back);
+            heap_push(cx, rest);
+            return true;
+        }
+    }
     // Free for a first part only.
-    let split = split_point(cx, start + 1, cx.free_until[best as usize]);
+    let split = split_point(cx, start + 1, limit);
     if split <= start {
         return false;
     }
@@ -522,22 +632,98 @@ fn try_allocate_free(cx: &mut FnCtx<Comp>, cur: i64, pcx: &Ctx<Comp>) -> bool {
     true
 }
 
+// (0.30) The loops around a position, from the innermost out: the header
+// (a layout index) of the innermost one around `pos`, or -1; loop_first
+// and loop_past give a loop's first position and the first one past it,
+// LPARENT the loop around it.
+fn loop_at(cx: &mut FnCtx<Comp>, pos: i64) -> i64 {
+    let k = block_at(cx, pos);
+    cx.lhead[k as usize]
+}
+
+fn loop_first(cx: &FnCtx<Comp>, h: i64) -> i64 {
+    cx.bstart[cx.lfirst[h as usize] as usize]
+}
+
+fn loop_past(cx: &FnCtx<Comp>, h: i64) -> i64 {
+    cx.bend[cx.llast[h as usize] as usize] + 4
+}
+
+// Whether the block at layout index k is in the loop of header h. (A
+// loop's blocks need not be one run of the layout: the block of a back
+// edge is often laid out far from the rest, with blocks of the loop
+// around in between. So what a loop reads is asked block by block.)
+fn in_loop(cx: &FnCtx<Comp>, k: i64, h: i64) -> bool {
+    let mut x = cx.lhead[k as usize];
+    for _ in 0..64 {
+        if x < 0 {
+            return false;
+        }
+        if x == h {
+            return true;
+        }
+        x = cx.lparent[x as usize];
+    }
+    false
+}
+
+// Whether interval i is used, at or after `from`, in a block of loop h.
+fn used_in_loop(cx: &mut FnCtx<Comp>, i: i64, from: i64, h: i64) -> bool {
+    let past = loop_past(cx, h);
+    let mut p = next_use(cx, i, from, USE_ANY);
+    while p < past {
+        let k = block_at(cx, p);
+        if in_loop(cx, k, h) {
+            return true;
+        }
+        p = next_use(cx, i, p + 1, USE_ANY);
+    }
+    false
+}
+
 // Interval a gives up its register from pos on: the rest goes to the
 // stack until just before its next use in a register.
+//
+// (0.30) In a loop that does not read the value (the largest such around
+// pos), it goes to the stack from the loop's first position on. Given up
+// in the middle (at a call, usually), it was in the register at the
+// loop's header and on the stack at its back edge, and the edge brought
+// it back every round: a load, or a constant made again, for a value the
+// loop never reads. The register it held between the loop's start and
+// pos was its own, so nothing else is there, and nothing read it there.
 fn spill_from(cx: &mut FnCtx<Comp>, a: i64, pos: i64) {
+    let mut at = pos;
+    let mut h = loop_at(cx, pos);
+    for _ in 0..64 {
+        if h < 0 {
+            break;
+        }
+        let first = loop_first(cx, h);
+        if first > at || ra_start(cx, a) > first || next_use(cx, a, first, USE_ANY) < pos
+            || used_in_loop(cx, a, pos, h) {
+            break;
+        }
+        at = first;
+        h = cx.lparent[h as usize];
+    }
     let mut rest = a;
-    if ra_start(cx, a) < pos {
-        rest = split_at(cx, a, pos);
+    if ra_start(cx, a) < at {
+        rest = split_at(cx, a, at);
     }
     cx.ivs[rest as usize].reg = ON_STACK;
-    let start = ra_start(cx, rest);
+    // (what is before pos is allocated: the value comes back after it)
+    let start = max_i64(ra_start(cx, rest), pos);
     let u = next_use(cx, rest, start, USE_REG);
     if u == POS_MAX {
         return;
     }
     let split = split_point(cx, start + 1, gap_before(u));
     if split <= start {
-        // Needed in a register right away: allocate it again.
+        // Needed in a register right away: allocate it again (from pos:
+        // nothing before it is allocated anew).
+        if ra_start(cx, rest) < pos {
+            rest = split_at(cx, rest, pos);
+        }
         cx.ivs[rest as usize].reg = UNASSIGNED;
         heap_push(cx, rest);
         return;
