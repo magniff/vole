@@ -31,9 +31,11 @@ compiler (`compiler/src/front/stdsrc.vl`).
 1. Find where it goes: `volec query similar str::trim` (or
    `Vec::swap`) prints its neighbours, with their files
    (`compiler/std/str.vl:333`); `volec query examples std-fn`.
-2. Add it in its file, next to its kin, with an editor (std is one text
-   to the compiler, `<std>`: `volec edit` does not write its files),
-   then `volec fmt FILE`. A function that allocates takes its
+2. Add it in its file, next to its kin, with an editor, or change
+   lines with `volec edit patch compiler/std/FILE.vl --old 'TEXT' --new
+   'TEXT'` (std is one text to the compiler, `<std>`: its file is
+   patched as text, and an edit of a std item by name is refused with
+   that command), then `volec fmt FILE`. A function that allocates takes its
    allocator: a constructor or an `_in` function with the allocator
    last (`Vec::new_in(a)`, `s.to_vec_in(a)`). `volec check` of any
    program then reads the edited files (`note check.std-files`), every
@@ -111,7 +113,10 @@ To add an optimization pass.
    `--verify-ir` and prints it under `--print-after-all`.
 3. Test: `tests/run/opt_NAME.vl` with `// CHECK:` lines (see
    `add-peephole`); `tests/run.sh opt_`; `tests/fuzz/run.sh` (random
-   programs at every level); `--time-passes` for its compile time.
+   programs at every level); `--time-passes=passes` for its compile
+   time, `tools/perf-diff.sh BEFORE AFTER compiler/src/main.vl` for
+   what it costs each pass (`volec guide tools#seeing-what-the-optimizer-did`:
+   `--print-after-all=FN`, `--emit-ir`, `VOLE_INLINE_LOG`).
    An alias fact (two accesses that never overlap) also needs a case
    that breaks if the fact is wrong: a write through another base (a
    pointer kept in a static, another Vec's buffer) between the two
@@ -175,8 +180,9 @@ To add a test case.
 - A tool: a transcript, `$ ARGS` lines and their output:
   `tests/query/NAME.q` (on `tests/query/NAME/main.vl`),
   `tests/refactor/NAME.t` (in a copy of `tests/refactor/NAME/`; `%`
-  lines run shell commands); `tests/query/run.sh -u` writes what the
-  commands print now (read the diff before keeping it).
+  lines run shell commands); `tests/query/run.sh -u NAME` writes what
+  the commands print now (read the diff before keeping it; `--grep
+  TEXT`: the transcripts holding TEXT; `volec guide testing`).
 - Templates: `volec query examples test`.
 
 ## add-subcommand

@@ -1,0 +1,378 @@
+// `edit justify` (0.30; docs/refactor.md): the comments of an unsafe site
+// written above it,
+//
+//   volec edit justify FILE:LINE --unsafe TEXT --safety TEXT [ROOT]
+//   volec edit justify --from LIST         (`-`: stdin)
+//
+// FILE:LINE is a site as `volec query unsafe` lists it (the line its
+// `unsafe` or `extern` is on). The comment lines, `// UNSAFE: TEXT` and
+// `// SAFETY: TEXT`, go above that line, indented like it and wrapped at
+// 100 columns. LIST has a site a line,
+// `FILE:LINE<TAB>UNSAFE TEXT<TAB>SAFETY TEXT` (an empty text: that
+// comment is there already). Every line is the file's as it was before
+// the edit (one `query unsafe` run serves a whole list), every site is
+// placed before any is written, and one that cannot be justified so (no
+// site on the line; the audit would not count a comment above it) is
+// named and nothing is written (--keep-going: the others are).
+//
+// The audit's rules are unchanged (tools/query/unsafe_audit.vl): this
+// writes the text a person supplies, and refuses a site the audit would
+// still call unjustified after it.
+
+use std::alloc::Arena;
+
+use crate::base::{buf_byte, buf_bytes, buf_copy, buf_int, buf_len, buf_new, buf_str, get_src};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::cli::line::{Call, EV_FLAG, EV_MISSING, EV_OPTION, EV_WORD, Leaf, flag, option};
+use crate::front::embed::wgsl::WgslCx;
+use crate::tools::ctx::Tcx;
+use crate::tools::edit::edit_replace;
+use crate::tools::edit::apply::apply_edit;
+use crate::tools::edit::cli::{edit_opts, take_edit_event};
+use crate::tools::patch::target_index;
+use crate::tools::patch::at::read_list;
+use crate::tools::proc::{read_file_if, read_stdin};
+use crate::tools::query::{c_slice, file_line, file_named, root_or_diag};
+use crate::tools::query::cache::cache_restore;
+use crate::tools::query::command_line::load_program;
+use crate::tools::query::diagnostics::{diag, program_errors, try_begin, try_end};
+use crate::tools::query::unsafe_audit::{J_BOTH, J_SAFETY, J_UNSAFE, bits_at, find_sites};
+
+// The width comment lines are wrapped at.
+const WIDTH: usize = 100;
+
+// `edit justify`'s arguments (a leaf of volec's Command tree, cli/tree.vl).
+pub fn justify_leaf(gpa: Gpa) -> Leaf<'static, Gpa> {
+    let mut opts = edit_opts(gpa);
+    opts.push(option("unsafe", "TEXT", "why it cannot be safe: the // UNSAFE: comment"));
+    opts.push(option("safety", "TEXT", "why it is sound: the // SAFETY: comment"));
+    opts.push(option("from", "LIST",
+        "sites, one a line: FILE:LINE<TAB>UNSAFE<TAB>SAFETY (-: stdin)"));
+    opts.push(flag("keep-going", "write the sites that can be justified"));
+    Leaf::new(opts, "name")
+}
+
+fn usage(message: *const u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    let d = diag(c"error", c"edit.usage", tcx);
+    buf_str(d, message);
+    buf_byte(d, b'\n');
+    try_end(try_begin(c"justify FILE:LINE --unsafe TEXT --safety TEXT", b"", false, tcx, pcx));
+    2
+}
+
+// `text` without the mark a person may have written before it (`UNSAFE:`,
+// `// SAFETY:`) and the blanks around it.
+fn bare<'a>(text: &'a [u8], mark: &[u8]) -> &'a [u8] {
+    let mut a: usize = 0;
+    let mut b = text.len();
+    while a < b && (text[a] == b' ' || text[a] == b'\t' || text[a] == b'/') {
+        a += 1;
+    }
+    if b - a >= mark.len() && &text[a..a + mark.len()] == mark {
+        a += mark.len();
+    } else {
+        a = 0;
+    }
+    while a < b && (text[a] == b' ' || text[a] == b'\t') {
+        a += 1;
+    }
+    while b > a && (text[b - 1] == b' ' || text[b - 1] == b'\t' || text[b - 1] == b'\n') {
+        b -= 1;
+    }
+    &text[a..b]
+}
+
+// The comment `// MARK TEXT` in `out`: each line indented by `indent`,
+// TEXT's words wrapped at WIDTH columns, its own newlines kept; the lines
+// after the first start `// `.
+fn put_comment(out: i64, indent: &[u8], mark: &[u8], text: &[u8]) {
+    buf_bytes(out, indent);
+    buf_bytes(out, b"// ");
+    buf_bytes(out, mark);
+    let mut col = indent.len() + 3 + mark.len();
+    let mut fresh = false;
+    let mut i: usize = 0;
+    while i < text.len() {
+        if text[i] == b'\n' {
+            buf_byte(out, b'\n');
+            buf_bytes(out, indent);
+            buf_bytes(out, b"//");
+            col = indent.len() + 2;
+            fresh = true;
+            i += 1;
+            continue;
+        }
+        if text[i] == b' ' || text[i] == b'\t' {
+            i += 1;
+            continue;
+        }
+        let mut e = i;
+        while e < text.len() && text[e] != b' ' && text[e] != b'\t' && text[e] != b'\n' {
+            e += 1;
+        }
+        if col + 1 + (e - i) > WIDTH && !fresh && col > indent.len() + 3 {
+            buf_byte(out, b'\n');
+            buf_bytes(out, indent);
+            buf_bytes(out, b"//");
+            col = indent.len() + 2;
+        }
+        buf_byte(out, b' ');
+        buf_bytes(out, &text[i..e]);
+        col += 1 + (e - i);
+        fresh = false;
+        i = e;
+    }
+    buf_byte(out, b'\n');
+}
+
+// `site K (FILE:LINE)`, the head of what is said of a site that is left.
+fn put_site(d: i64, k: i64, name: &[u8]) {
+    buf_str(d, c"site ");
+    buf_int(d, k + 1);
+    buf_str(d, c" (");
+    buf_bytes(d, name);
+    buf_byte(d, b')');
+}
+
+// Entry k placed: where its comment goes (*at) and the comment (*text, a
+// buffer). False after the diagnostic that names the site.
+fn place(k: i64, files: &mut Vec<i64, Comp>, at: &mut i64, text: &mut i64, tcx: &mut Tcx<Comp>,
+    pcx: &mut Ctx<Comp>) -> bool {
+    let name = c_slice((tcx.patch_targets[(tcx.pair_target[k as usize]) as usize]) as *mut u8);
+    let mut line: i64 = 0;
+    let n = file_line(&name, &mut line);
+    let f: i64 = if n > 0 { file_named(&name[0..n as usize], pcx) } else { -1 };
+    if f < 0 {
+        let d = diag(c"error", c"edit.justify", tcx);
+        put_site(d, k, &name);
+        buf_str(d, c": no such file in the program\n");
+        return false;
+    }
+    if !files.contains(&f) {
+        files.push(f);
+        find_sites(f, tcx, pcx);
+    }
+    let mut s: i64 = -1;
+    let mut near: i64 = -1;
+    for x in 0..tcx.s_pos.len() as i64 {
+        if tcx.s_file[x as usize] != f {
+            continue;
+        }
+        if tcx.s_line[x as usize] == line && s < 0 {
+            s = x;
+        }
+        if near < 0
+            || (tcx.s_line[x as usize] - line).abs() < (tcx.s_line[near as usize] - line).abs() {
+            near = x;
+        }
+    }
+    if s < 0 {
+        let d = diag(c"error", c"edit.justify", tcx);
+        put_site(d, k, &name);
+        buf_str(d, c": no unsafe block, unsafe fn or extern block starts on that line");
+        if near >= 0 {
+            buf_str(d, c"; the nearest site is on line ");
+            buf_int(d, tcx.s_line[near as usize]);
+        }
+        buf_str(d, c" (volec query unsafe FILE lists them)\n");
+        return false;
+    }
+    let src = get_src();
+    let start = pcx.files[f as usize].start;
+    let pos = tcx.s_pos[s as usize];
+    let mut ls = pos;
+    while ls > start && src[(ls - 1) as usize] != b'\n' {
+        ls -= 1;
+    }
+    let mut ie = ls;
+    while ie < pos && (src[ie as usize] == b' ' || src[ie as usize] == b'\t') {
+        ie += 1;
+    }
+    let indent = &src[ls as usize..ie as usize];
+    let out = buf_new();
+    let why = buf_copy(tcx.olds[k as usize]);
+    let sound = buf_copy(tcx.news[k as usize]);
+    let why_text = bare(&why, b"UNSAFE:");
+    let sound_text = bare(&sound, b"SAFETY:");
+    if why_text.len() > 0 {
+        put_comment(out, indent, b"UNSAFE:", why_text);
+    }
+    if sound_text.len() > 0 {
+        put_comment(out, indent, b"SAFETY:", sound_text);
+    }
+    // What the audit says of the site with the comment above its line.
+    let end = pcx.files[f as usize].end;
+    let after = buf_new();
+    buf_bytes(after, &src[start as usize..ls as usize]);
+    buf_bytes(after, &buf_copy(out));
+    buf_bytes(after, &src[ls as usize..end as usize]);
+    let bits = bits_at(&buf_copy(after), pos - start + buf_len(out));
+    if bits != J_BOTH {
+        let had = tcx.s_just[s as usize];
+        let d = diag(c"error", c"edit.justify", tcx);
+        put_site(d, k, &name);
+        if why_text.len() == 0 && (had & J_UNSAFE) == 0 {
+            buf_str(d, c" has no // UNSAFE: comment and none was given (--unsafe TEXT)\n");
+        } else if sound_text.len() == 0 && (had & J_SAFETY) == 0 {
+            buf_str(d, c" has no // SAFETY: comment and none was given (--safety TEXT)\n");
+        } else {
+            buf_str(d, c": a comment above that line would not be counted (the site's statement starts on a line that ends another, `} else ...`): write it by hand, inside the statement or at the end of the site's line\n");
+        }
+        return false;
+    }
+    *at = ls;
+    *text = out;
+    true
+}
+
+// `edit justify ...`: the exit status.
+pub fn run_justify(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
+    wgx: &mut WgslCx<Arena<Gpa>>) -> i64 {
+    tcx.what = c"justify";
+    let mut root = 0 as *const u8;
+    let mut list = 0 as *const u8;
+    let mut keep_going = false;
+    let mut site: i64 = -1;
+    for e in c.evs.iter().copied() {
+        let mut ev = e;
+        let valued = ev.name == "unsafe" || ev.name == "safety" || ev.name == "from";
+        if ev.kind == EV_MISSING && valued {
+            return usage(c"--unsafe, --safety and --from need a value", tcx, pcx);
+        }
+        if ev.kind == EV_OPTION && ev.name == "from" {
+            list = ev.value;
+        } else if ev.kind == EV_OPTION && valued {
+            if site < 0 {
+                return usage(c"the site, FILE:LINE, comes before its --unsafe and --safety", tcx,
+                    pcx);
+            }
+            let b = buf_new();
+            buf_bytes(b, &c_slice(ev.value));
+            if ev.name == "unsafe" {
+                tcx.olds[site as usize] = b;
+            } else {
+                tcx.news[site as usize] = b;
+            }
+        } else if ev.kind == EV_FLAG && ev.name == "keep-going" {
+            keep_going = true;
+        } else if take_edit_event(&mut ev, &mut root, tcx, pcx) {
+        } else if ev.kind != EV_WORD {
+            return usage(c"an unknown option (--unsafe TEXT, --safety TEXT, --from LIST, --keep-going, --dry-run, --show)", tcx, pcx);
+        } else {
+            let name = c_slice(ev.value);
+            let mut line: i64 = 0;
+            if file_line(&name, &mut line) <= 0 || line <= 0 {
+                if root == 0 as *const u8 && crate::base::is_source_path(ev.value) {
+                    root = ev.value;
+                    continue;
+                }
+                return usage(c"a site is FILE:LINE, as volec query unsafe lists it", tcx, pcx);
+            }
+            site = tcx.olds.len() as i64;
+            tcx.olds.push(buf_new());
+            tcx.news.push(buf_new());
+            let t = target_index(&name, tcx);
+            tcx.pair_target.push(t);
+        }
+    }
+    if list != 0 as *const u8 {
+        let input = buf_new();
+        if c_slice(list).as_slice() == b"-" {
+            if !read_stdin(input, tcx) {
+                let d = diag(c"error", c"edit.no-text", tcx);
+                buf_str(d, c"--from - reads the list from stdin; none was given\n");
+                return 2;
+            }
+        } else if !read_file_if(list, input) {
+            let d = diag(c"error", c"edit.no-text", tcx);
+            buf_str(d, c"cannot read --from ");
+            buf_str(d, list);
+            buf_byte(d, b'\n');
+            return 2;
+        }
+        if !read_list(&buf_copy(input), c"FILE:LINE<TAB>UNSAFE TEXT<TAB>SAFETY TEXT", tcx) {
+            return 2;
+        }
+    }
+    let n = tcx.olds.len() as i64;
+    if n == 0 {
+        return usage(c"a site is needed: FILE:LINE --unsafe TEXT --safety TEXT, or --from LIST",
+            tcx, pcx);
+    }
+    for k in 0..n {
+        if buf_len(tcx.olds[k as usize]) == 0 && buf_len(tcx.news[k as usize]) == 0 {
+            return usage(c"a site needs its --unsafe TEXT, its --safety TEXT or both", tcx, pcx);
+        }
+    }
+    tcx.target_arg = (tcx.patch_targets[0]) as *mut u8;
+    tcx.root_given = root;
+    let first = c_slice(tcx.target_arg);
+    root = root_or_diag(root, tcx.what, &first, true, tcx, pcx);
+    if root == 0 as *const u8 {
+        return 2;
+    }
+    tcx.root_path = root;
+    if !cache_restore(root, tcx.target, false, tcx, pcx)
+        && !load_program(root, tcx.target, tcx, pcx, wgx) {
+        program_errors(c"error", root, true, tcx, pcx);
+        return 1;
+    }
+    let mut files: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut ats: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut texts: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut failed: i64 = 0;
+    for k in 0..n {
+        let mut at: i64 = -1;
+        let mut text: i64 = -1;
+        if !place(k, &mut files, &mut at, &mut text, tcx, pcx) {
+            at = -1;
+            failed += 1;
+        }
+        ats.push(at);
+        texts.push(text);
+    }
+    if failed > 0 {
+        let all = !keep_going || failed == n;
+        let d = diag(if all { c"error" } else { c"warning" }, c"edit.justify", tcx);
+        buf_int(d, failed);
+        buf_str(d, c" of ");
+        buf_int(d, n);
+        buf_str(d, if n == 1 { c" site left as it is" } else { c" sites left as they are" });
+        if failed == n {
+            buf_str(d, c"; nothing written\n");
+        } else if keep_going {
+            buf_str(d, c"; ");
+            buf_int(d, n - failed);
+            buf_str(d, c" written\n");
+        } else {
+            buf_str(d, c"; nothing written (--keep-going writes the other ");
+            buf_int(d, n - failed);
+            buf_str(d, c")\n");
+        }
+        if all {
+            return 1;
+        }
+    }
+    for k in 0..n {
+        let at = ats[k as usize];
+        if at >= 0 && !edit_replace(at, at, texts[k as usize], pcx) {
+            let name = c_slice(
+                (tcx.patch_targets[(tcx.pair_target[k as usize]) as usize]) as *mut u8);
+            let d = diag(c"error", c"edit.justify", tcx);
+            put_site(d, k, &name);
+            buf_str(d, c" overlaps an edit before it; nothing written\n");
+            return 1;
+        }
+    }
+    let summary = buf_new();
+    buf_str(summary, c"justified ");
+    buf_int(summary, n - failed);
+    buf_str(summary, if n - failed == 1 { c" site" } else { c" sites" });
+    if failed > 0 {
+        buf_str(summary, c" of ");
+        buf_int(summary, n);
+    }
+    let status = apply_edit(&buf_copy(summary), root, tcx, pcx);
+    if status == 0 && failed > 0 { 1 } else { status }
+}

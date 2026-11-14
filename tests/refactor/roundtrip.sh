@@ -72,6 +72,12 @@ items() {
 }
 
 MODULES=$(modules)
+# (0.30) Every round starts from the same copy, so its items are the
+# same: asked once, in a copy of their own, not every round (they were
+# six of a round's eight compiler runs)
+cp -R "$PROGRAM" "$WORK/items"
+ITEMS=$(cd "$WORK/items" && for m in $MODULES; do items "$m"; done)
+[ -n "$ITEMS" ] || { echo "roundtrip.sh: no items in $PROGRAM"; exit 2; }
 pass=0
 fail=0
 skip=0
@@ -86,7 +92,7 @@ while [ $r -lt "$ROUNDS" ]; do
     cd "$dir" || exit 2
     # The plan: module a, the items, module b and where they go there,
     # where they go back.
-    plan=$(for m in $MODULES; do items "$m"; done | awk -v seed="$seed" '
+    plan=$(printf '%s\n' "$ITEMS" | awk -v seed="$seed" '
         # Whether a banner heads the group of the item at line l of file f:
         # above its own comment and attribute lines, blank lines, then a
         # comment that is not the file header.

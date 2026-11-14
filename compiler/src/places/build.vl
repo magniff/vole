@@ -34,7 +34,7 @@ use crate::base::{intern_c, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::{
-    BLOCK_TRANSPARENT, CLOSURE_MOVE, NODE_IN_BOUNDS, NODE_REF_MUT, NodeKind, child,
+    BLOCK_TRANSPARENT, CLOSURE_MOVE, NODE_IN_BOUNDS, NODE_RAW, NODE_REF_MUT, NodeKind, child,
 };
 use crate::front::byref::{MATCH_BYREF, NO_DROP, borrowed_call, indexable_place};
 use crate::front::check::Res;
@@ -1847,9 +1847,11 @@ fn lower_arg(i: i64, arg: i64, mode: i64, c_callee: bool, variadic: bool, pbody:
 
 // ---- Assignment ----
 
-// `p = v` and `p op= v`: the value first, then the place, then the write
-// (the old value is not dropped: the own pass's desugaring is what drops,
-// lower_own_assign).
+// `p = v` and `p op= v`: the value first, then the place, then the write,
+// with no drop of the old value: lower_assign_at calls it so for an
+// assignment that drops nothing (drops_old: a target dropped_place does
+// not drop, a value without glue, NO_DROP); one that drops is
+// lower_assign_at's own (`tmp = v; drop(p); p = move tmp`).
 fn lower_assign(n: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
     let op = pcx.nodes[n as usize].op;
     let target = pcx.nodes[n as usize].b;
@@ -1926,9 +1928,9 @@ fn lower_assign_at(n: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
 }
 
 // Whether assignment n drops the old value: `=` (not one the checker
-// writes without a drop, NO_DROP) of a value with glue to a place of names,
-// fields, `*` and indexes (not one a call makes, nor a raw access,
-// NODE_RAW), with drops on.
+// writes without a drop, NO_DROP) of a value with glue to a place that
+// dropped_place names (not raw_store's, the write that drops nothing),
+// with drops on.
 fn drops_old(n: i64, pcx: &mut Ctx<Comp>) -> bool {
     if pcx.nodes[n as usize].op != Tok::Eq
         || (pcx.nodes[n as usize].p & NO_DROP) != 0 {
@@ -1936,7 +1938,56 @@ fn drops_old(n: i64, pcx: &mut Ctx<Comp>) -> bool {
     }
     let target = pcx.nodes[n as usize].b;
     target != 0 && pcx.nodes[n as usize].c != 0 && pcx.nodes[target as usize].ty > 0
-        && type_glue(pcx.nodes[target as usize].ty, pcx) && indexable_place(target, pcx)
+        && !raw_store(target, pcx) && type_glue(pcx.nodes[target as usize].ty, pcx)
+        && dropped_place(target, pcx)
+}
+
+// (0.30) Whether e (an assignment's target) is `p[i]` of a raw pointer p:
+// the store that writes without dropping the old value, ptr::write's
+// (only std::ptr indexes a raw pointer, front-rust.md F30.3), for memory
+// that may be uninitialized.
+fn raw_store(e: i64, pcx: &Ctx<Comp>) -> bool {
+    pcx.nodes[e as usize].kind == NodeKind::Index && (pcx.nodes[e as usize].p & NODE_RAW) != 0
+}
+
+// (0.30) Whether e (an assignment's target) is a place whose old value the
+// assignment drops: names, fields, `*` and indexes, and whatever stands
+// under a `*`, a field through a reference or an index of a view, when it
+// is a reference's value: a call's result (`*g.deref_mut() = v`, which is
+// `*g = v` of a Box, a guard or any DerefMut; `*v.last_mut().unwrap() =
+// v`; `a.index_mut(i)`'s place), as Rust's; and a raw pointer's (`*p = v`,
+// `(*p).f = v`, `p.f = v`: the old value must be initialized, the
+// programmer's obligation in `unsafe`, as Rust's; ptr::write is the write
+// that does not drop, raw_store).
+fn dropped_place(e: i64, pcx: &Ctx<Comp>) -> bool {
+    if e == 0 {
+        return false;
+    }
+    let k = pcx.nodes[e as usize].kind;
+    if k == NodeKind::Unary && pcx.nodes[e as usize].op == Tok::Star {
+        return true;
+    }
+    if k == NodeKind::FieldAccess {
+        return pcx.nodes[e as usize].y == 1 || dropped_place(pcx.nodes[e as usize].a, pcx);
+    }
+    if k == NodeKind::TupleField {
+        return dropped_place(pcx.nodes[e as usize].a, pcx);
+    }
+    if k == NodeKind::Index {
+        let i = pcx.nodes[e as usize].b;
+        let base = pcx.nodes[e as usize].a;
+        if i == 0 || pcx.nodes[i as usize].kind == NodeKind::Range {
+            return false;
+        }
+        if (pcx.nodes[e as usize].p & NODE_RAW) != 0 {
+            // (a raw pointer's element under a part written, `p[i].f = v`:
+            // initialized, as any part's whole)
+            return true;
+        }
+        let bt = undistinct(pcx.nodes[base as usize].ty, pcx);
+        return bt > 0 && pcx.types[bt as usize].kind == TyKind::Slice || dropped_place(base, pcx);
+    }
+    indexable_place(e, pcx)
 }
 
 // ---- Control flow ----
@@ -3380,7 +3431,7 @@ fn moved_capture_flag(st: PStmt, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> i64
     -1
 }
 
-// The checker's node of the stop at a sink closure's second move out of
+// The checker's node of the stop at an FnOnce closure's second move out of
 // its env (R7): `EnumPanic(0)` with the own pass's message, at node n.
 fn second_move_panic(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let start = pcx.nodes[n as usize].start;
@@ -3392,7 +3443,7 @@ fn second_move_panic(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     pcx.nodes[p as usize].a = zero;
     pcx.nodes[p as usize].x = crate::gen0::target::message_kind(
         crate::front::contracts::checks::fixed_message(
-            b"a sink closure moved its captured value out a second time: it was called again\n",
+            b"an FnOnce closure moved its captured value out a second time: it was called again\n",
             pcx),
         pcx);
     p

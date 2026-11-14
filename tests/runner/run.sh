@@ -242,6 +242,121 @@ chmod +x "$WORK/failing-volec"
 got=$(sh "$ROOT/tests/run.sh" -c "$WORK/failing-volec" -j 2 -n abi_callee_alignment -n abi_extern_small_struct 2>&1 | tail -1)
 [ "$got" = "try: tests/run.sh -n abi_callee_alignment -n abi_extern_small_struct   (the failing cases alone)" ] \
     && ok filters_try_dash_n || bad filters_try_dash_n "got '$got'"
+# ---- the transcript runners' jobs (0.30: tests/jobs.sh) ----
+
+# A FILTER selects the transcripts and checks whose name contains it, -n
+# and =NAME one name; -l lists them and runs nothing.
+got=$(sh "$ROOT/tests/query/run.sh" -l -n clash effects_agree =self_show | tr '\n' ',')
+[ "$got" = "check effects_agree_effagree_host,check effects_agree_effagree_aarch64-linux,check effects_agree_effagree_x86_64-linux,check self_show,transcript clash," ] \
+    && ok jobs_filter || bad jobs_filter "got '$got'"
+# Selecting nothing is an error that says so, not a pass (every runner
+# that takes names).
+why=""
+for r in query refactor lsp fmt; do
+    got=$(sh "$ROOT/tests/$r/run.sh" no_such_name_here 2>&1)
+    rc=$?
+    case "$rc:$got" in
+        "2:tests/$r/run.sh: no case matches no_such_name_here "*) ;;
+        *) why="$why $r: exit $rc, '$got';" ;;
+    esac
+done
+[ -z "$why" ] && ok jobs_no_match || bad jobs_no_match "$why"
+# --grep TEXT: the transcripts whose file holds TEXT, and no check; -u:
+# no check either.
+want=$(grep -l -F 'query.no-match' "$ROOT"/tests/query/*.q | sed 's|.*/\(.*\)\.q$|transcript \1|' | tr '\n' ',')
+got=$(sh "$ROOT/tests/query/run.sh" -l --grep 'query.no-match' | tr '\n' ',')
+[ -n "$want" ] && [ "$got" = "$want" ] && ok jobs_grep || bad jobs_grep "got '$got', expected '$want'"
+got=$(sh "$ROOT/tests/refactor/run.sh" -l -u | grep -c '^check ')
+[ "$got" = 0 ] && ok jobs_update_no_checks || bad jobs_update_no_checks "$got checks listed with -u"
+# Every check a runner lists has its arm in job_check, and every arm is
+# listed.
+why=""
+for r in query refactor; do
+    listed=$(sed -n 's/^CHECKS="\(.*\)"$/\1/p' "$ROOT/tests/$r/run.sh" | tr ' ' '\n' | sort | tr '\n' ' ')
+    arms=$(awk '/^job_check\(\) \{/ { on = 1 } on && /^}/ { on = 0 } on && /^        [a-z][A-Za-z0-9_-]*\)$/ { sub(/\)$/, ""); print $1 }' \
+        "$ROOT/tests/$r/run.sh" | sort | tr '\n' ' ')
+    [ -n "$listed" ] && [ "$listed" = "$arms" ] || why="$why $r: CHECKS '$listed', arms '$arms';"
+done
+[ -z "$why" ] && ok jobs_checks_listed || bad jobs_checks_listed "$why"
+# The jobs run some at once, each one's report printed when it ends (the
+# quick one first when two run at once, the file's order with one); a
+# job that reports nothing is a failure of its name.
+(
+    . "$ROOT/tests/jobs.sh"
+    run_job() {
+        case "$2" in
+            slow) sleep 2; echo "pass slow" ;;
+            quick) echo "pass quick" ;;
+            silent) : ;;
+        esac
+    }
+    printf 'check slow\ncheck quick\ncheck silent\n' >"$WORK/jobs"
+    two=$(jobs_run "$WORK/jobs" 2 | tr '\n' ',')
+    one=$(jobs_run "$WORK/jobs" 1 | tr '\n' ',')
+    [ "$two" = "pass quick,FAIL silent: the job reported nothing,pass slow," ] \
+        && [ "$one" = "pass slow,pass quick,FAIL silent: the job reported nothing," ] \
+        && [ "$(jobs_count pass)" = 2 ] && [ "$(jobs_count FAIL)" = 1 ] \
+        && ok jobs_stream || bad jobs_stream "-j 2: '$two'; -j 1: '$one'"
+)
+[ $? -eq 0 ] || BAD=1
+# A run's first line is its plan, its last the counts; a transcript that
+# differs fails the run (a compiler that prints nothing).
+printf '#!/bin/sh\nexit 0\n' >"$WORK/silent-volec"
+chmod +x "$WORK/silent-volec"
+got=$(sh "$ROOT/tests/query/run.sh" -c "$WORK/silent-volec" -j 2 -n clash 2>&1)
+rc=$?
+case "$rc:$(printf '%s\n' "$got" | head -1):$(printf '%s\n' "$got" | grep -c '^FAIL clash (\(off\|cache\)): '):$(printf '%s\n' "$got" | tail -1)" in
+    "1:query: 1 transcripts (off cache), 0 checks, -j 2:2:query: 0 passed, 2 failed, "*" s") ok jobs_plan_and_counts ;;
+    *) bad jobs_plan_and_counts "exit $rc: $(printf '%s\n' "$got" | head -1) ... $(printf '%s\n' "$got" | tail -1)" ;;
+esac
+# tests/run.sh SUITE:FILTER: the suite, its runner given the filter.
+got=$(sh "$ROOT/tests/run.sh" -l refactor:rename query:=clash query:self_ | tr '\n' ',')
+[ "$got" = "suite query only =clash self_,suite refactor only rename," ] && ok filters_suite_names || bad filters_suite_names "got '$got'"
+# (the suite itself selected too: all of it)
+got=$(sh "$ROOT/tests/run.sh" -l -n query query:=clash lsp:embed lsp | tr '\n' ',')
+[ "$got" = "suite query,suite lsp," ] && ok filters_suite_whole || bad filters_suite_whole "got '$got'"
+
+# (0.30) An option after a FILTER is an error that says where it goes.
+got=$(sh "$ROOT/tests/run.sh" -j 2 pathtrace -O 2 2>&1)
+rc=$?
+want="tests/run.sh: the option '-O' comes after the FILTER 'pathtrace': options go before the FILTERs
+try: tests/run.sh -j 2 -O 2 pathtrace"
+[ $rc -eq 2 ] && [ "$got" = "$want" ] && ok filters_option_after || bad filters_option_after "exit $rc: '$got'"
+# (0.30) A FILTER of digits only: a warning, with how many it selects.
+got=$(sh "$ROOT/tests/run.sh" -l 2 2>&1 >/dev/null)
+case "$got" in
+    "tests/run.sh: warning: the FILTER '2' is only digits: it selects every name containing '2' ("*" cases); "*) ok filters_digits ;;
+    *) bad filters_digits "got '$got'" ;;
+esac
+# (0.30) --cases-only: no suite.
+got=$(sh "$ROOT/tests/run.sh" -l --cases-only runner_ fmt | grep -c '^suite ')
+all=$(sh "$ROOT/tests/run.sh" -l runner_ fmt | grep -c '^suite ')
+[ "$got" = 0 ] && [ "$all" -ge 1 ] && ok filters_cases_only || bad filters_cases_only "$got suites with --cases-only, $all without"
+# (0.30) The first line is the plan; a suite's line comes as it ends; a
+# FILTER that selects nothing is an error, and a suite given a name it
+# has not fails saying so (a compiler that fails every case).
+got=$(sh "$ROOT/tests/run.sh" -c "$WORK/failing-volec" -j 2 -n abi_callee_alignment -n readme_sync lsp:no_such_session 2>&1)
+case "$(printf '%s\n' "$got" | sed -n 1p)" in
+    "plan: 1 case, 2 suites (lsp: no_such_session, readme_sync), -j 2, "*) ok plan_first ;;
+    *) bad plan_first "$(printf '%s\n' "$got" | sed -n 1p)" ;;
+esac
+if printf '%s\n' "$got" | sed -n 2p | grep -q '^suite lsp: 0 pass, 0 FAIL, exit 2, [0-9]* s$' \
+    && printf '%s\n' "$got" | grep -q '^FAIL lsp: tests/lsp/run.sh reported nothing:$' \
+    && printf '%s\n' "$got" | grep -q 'tests/lsp/run.sh: no case matches no_such_session'; then
+    ok plan_suite_line
+else
+    bad plan_suite_line "$(printf '%s\n' "$got" | sed -n 2,6p | tr '\n' ';')"
+fi
+got=$(sh "$ROOT/tests/run.sh" -c "$WORK/failing-volec" -j 2 no_such_case_at_all 2>&1)
+rc=$?
+case "$rc:$got" in
+    "2:tests/run.sh: no case matches 'no_such_case_at_all' "*) ok filters_no_match ;;
+    *) bad filters_no_match "exit $rc: '$got'" ;;
+esac
+got=$(sh "$ROOT/tests/run.sh" -c "$WORK/failing-volec" -j 2 -n readme_sync no_such_case_at_all 2>&1 | sed -n 1p)
+[ "$got" = "tests/run.sh: warning: no case matches 'no_such_case_at_all' (the other FILTERs select the plan below)" ] \
+    && ok filters_no_match_one || bad filters_no_match_one "got '$got'"
+
 # tests/affected.map: every set, cmd and prefix it names exists.
 problems=$(awk '
     { sub(/#.*/, "") }
@@ -306,6 +421,232 @@ if (cd "$A" && git init -q -b main . && git add -A \
     esac
 else
     bad affected_readme_prose "git could not make the repository"
+fi
+
+# ---- tests/affected.sh: names, --narrow, commands (0.30) ----
+
+# Every command of the map is a script of the tree that sh runs (the plan
+# checks the ones it holds before anything runs).
+why=$(awk '$1 == "cmd" { print $2, $3 }' "$ROOT/tests/affected.map" | while read -r name file; do
+    [ -f "$ROOT/$file" ] || { printf '%s: no %s; ' "$name" "$file"; continue; }
+    head -1 "$ROOT/$file" | grep -q '^#!/bin/sh' || printf '%s: %s is not an sh script; ' "$name" "$file"
+done)
+[ -z "$why" ] && ok affected_map_commands || bad affected_map_commands "$why"
+# What a change to a file would run (--path): debug information goes to
+# the checks that build with -g, and a script to itself in a cheap mode.
+got=$(cd "$ROOT" && sh tests/affected.sh --list --path compiler/src/back/dwarf.vl --path tests/debug/crash.vl 2>&1)
+case "$got" in
+    *"command: tests/debug.sh -c "*"command: tests/objcheck.sh -c "*" -j 2 debug_"*) ok affected_debug ;;
+    *) bad affected_debug "$got" ;;
+esac
+got=$(cd "$ROOT" && sh tests/affected.sh --list --path tests/threads.sh --path tests/cimport/layout.sh --path bench/run.sh 2>&1)
+case "$got" in
+    *"plan: "*"command: bench/run.sh -c "*" --smoke"*"command: tests/cimport/layout.sh -c "*" -m 30 stdio.h "*"command: tests/threads.sh -c "*" -j 2 -r 4 "*) ok affected_scripts ;;
+    *) bad affected_scripts "$got" ;;
+esac
+# In a repository of its own, with a map of its own: a std change of
+# three functions, one named by a case, a transcript, a session and no
+# more, one by 45 cases and a chapter, one by every std case (410).
+N="$WORK/narrow"
+mkdir -p "$N/tests/run" "$N/tests/query" "$N/compiler/std" "$N/examples/g/e" "$N/book"
+cp "$ROOT/tests/affected.sh" "$ROOT/tests/run.sh" "$N/tests/"
+cat >"$N/tests/affected.map" <<'EOF'
+set smoke   arith_
+set broad   +broad arith_ err_ std_
+cmd good    tests/good.sh -c @C
+cmd nosh    tests/nosh.py
+cmd gone    tests/gone.sh
+compiler/std/   @broad std_ !good
+tests/run/      @self
+tests/nosh.py   !nosh
+tests/gone.txt  !gone
+*               @smoke
+EOF
+printf '#!/bin/sh\nexit 0\n' >"$N/tests/good.sh"
+printf '#!/usr/bin/env python3\n' >"$N/tests/nosh.py"
+echo x >"$N/tests/gone.txt"
+printf '%s\n' 'pub fn find_byte(a: i64) -> i64 {' '    a' '}' '' 'pub fn untouched() -> i64 {' '    1' '}' '' 'impl Thing {' \
+    '    pub fn push_all(&mut self) {' '        self.n = 1;' '    }' '}' '' 'pub fn ubiquitous() -> i64 {' '    3' '}' >"$N/compiler/std/vec.vl"
+i=1
+while [ $i -le 410 ]; do
+    f="$N/tests/run/std_$(printf '%03d' $i).vl"
+    echo 'fn main() -> i32 { ubiquitous() as i32 }' >"$f"
+    [ $i -le 45 ] && echo '// uses v.push_all()' >>"$f"
+    [ $i -eq 100 ] && echo '// find_byte(1)' >>"$f"
+    i=$((i + 1))
+done
+echo 'fn main() -> i32 { 0 }' >"$N/tests/run/arith_one.vl"
+echo 'fn main() -> i32 { 0 }' >"$N/tests/run/err_one.vl"
+printf '$ show find_byte\npub fn find_byte(a: i64) -> i64\n' >"$N/tests/query/q1.q"
+printf '$ show other\npub fn other()\n' >"$N/tests/query/q2.q"
+printf '# e\n\n```console\n$ volec query show find_byte\n```\n' >"$N/examples/g/e/README.md"
+printf '# a chapter\n\n`push_all` appends.\n' >"$N/book/01-a.md"
+if (cd "$N" && git init -q -b main . && git add -A && git -c user.name=t -c user.email=t@t commit -q -m base) >/dev/null 2>&1; then
+    sed -e 's/^    a$/    a + 0/' -e 's/self.n = 1;/self.n = 2;/' -e 's/^    3$/    4/' "$N/compiler/std/vec.vl" >"$N/vec.new"
+    cp "$N/vec.new" "$N/compiler/std/vec.vl"
+    rm "$N/vec.new"
+    got=$(cd "$N" && sh tests/affected.sh --list 2>&1)
+    case "$got" in
+        *"plan: 412 of 412 cases; suites: query book walkthrough "*"command: tests/good.sh -c "*"names: 3 changed items (find_byte push_all ubiquitous); std's are printed by: =book =walkthrough query:=q1; too common to choose by: ubiquitous"*"over 600 cases"*)
+            bad affected_names "the hint for a plan over 600 cases, on one of 412: $got" ;;
+        *"plan: 412 of 412 cases; suites: query book walkthrough "*"command: tests/good.sh -c "*"names: 3 changed items (find_byte push_all ubiquitous); std's are printed by: =book =walkthrough query:=q1; too common to choose by: ubiquitous"*)
+            ok affected_names ;;
+        *) bad affected_names "$got" ;;
+    esac
+    got=$(cd "$N" && sh tests/affected.sh --list --narrow 2>&1)
+    case "$got" in
+        *"plan: 42 of 412 cases; suites: query book walkthrough "*"narrow: a sample, not the rules' plan"*"find_byte (std): 1 cases, 2 transcripts, sessions or chapters"*"push_all (std): 45 cases name it: 40 of them, evenly through the list; 1 transcripts, sessions or chapters"*"too common to choose by (over 400 cases name it), left out: ubiquitous (410)"*"left out: @broad, std_ (410 cases)"*)
+            ok affected_narrow ;;
+        *) bad affected_narrow "$got" ;;
+    esac
+    # A command that cannot run is an error of the plan, before a run.
+    (cd "$N" && git checkout -q -- . && echo more >>tests/nosh.py)
+    got=$(cd "$N" && sh tests/affected.sh --list 2>&1)
+    rc=$?
+    case "$rc:$got" in
+        "2:"*"tests/affected.sh: the map's command 'tests/nosh.py ' cannot run: tests/nosh.py is not an sh script"*) ok affected_command_not_sh ;;
+        *) bad affected_command_not_sh "exit $rc: $got" ;;
+    esac
+    (cd "$N" && git checkout -q -- . && echo more >>tests/gone.txt)
+    got=$(cd "$N" && sh tests/affected.sh --list 2>&1)
+    rc=$?
+    case "$rc:$got" in
+        "2:"*"tests/affected.sh: the map's command 'tests/gone.sh ' cannot run: there is no tests/gone.sh"*) ok affected_command_missing ;;
+        *) bad affected_command_missing "exit $rc: $got" ;;
+    esac
+else
+    bad affected_names "git could not make the repository"
+fi
+
+# ---- bootstrap/selftest-prune.sh (0.30) ----
+
+# Of a temporary directory's entries, only the self-test's own old ones
+# go: not a new one, one holding a file the self-test does not write,
+# one whose gate still runs, a link, another name.
+T="$WORK/tmpdir"
+mkdir -p "$T/vole-gate-selftest.aaaaaa/gate.lock" "$T/vole-gate-selftest.aaaaaa/runs" "$T/vole-gate-selftest.aaaaaa/stub4" \
+    "$T/vole-gate-selftest.bbbbbb" "$T/vole-gate-selftest.cccccc" "$T/vole-gate-selftest.dddddd" \
+    "$T/vole-gate-selftest.eeeeee/gate.lock" "$T/vole-gate-other.ffffff" "$T/vole-gate-selftest.toolong" "$T/elsewhere"
+sh -c 'exit 0' &
+dead=$!
+wait $dead
+printf 'pid=%s\n' "$dead" >"$T/vole-gate-selftest.aaaaaa/gate.lock/owner"
+echo x >"$T/vole-gate-selftest.aaaaaa/a.out"
+echo x >"$T/vole-gate-selftest.cccccc/a.out"
+echo mine >"$T/vole-gate-selftest.dddddd/notes.txt"
+printf 'pid=%s\n' "$$" >"$T/vole-gate-selftest.eeeeee/gate.lock/owner"
+ln -s "$T/elsewhere" "$T/vole-gate-selftest.gggggg"
+for d in aaaaaa bbbbbb dddddd eeeeee; do touch -t 202001010000 "$T/vole-gate-selftest.$d"; done
+touch -t 202001010000 "$T/vole-gate-other.ffffff" "$T/vole-gate-selftest.toolong" "$T/elsewhere"
+dry=$(sh "$ROOT/bootstrap/selftest-prune.sh" -n "$T" | tail -1)
+kept_all=$(ls "$T" | wc -l | tr -d ' ')
+got=$(sh "$ROOT/bootstrap/selftest-prune.sh" "$T")
+left=$(ls "$T" | tr '\n' ' ')
+want="selftest-prune: removed 2 of 6 in $T (left: vole-gate-selftest.cccccc: changed within a day; vole-gate-selftest.dddddd: holds notes.txt, which the self-test does not write; vole-gate-selftest.eeeeee: its gate (pid $$) runs; vole-gate-selftest.gggggg: a link)"
+if [ "$got" = "$want" ] && [ "$kept_all" = 9 ] && [ "${dry#selftest-prune: would remove 2 of 6 }" != "$dry" ] \
+    && [ "$left" = "elsewhere vole-gate-other.ffffff vole-gate-selftest.cccccc vole-gate-selftest.dddddd vole-gate-selftest.eeeeee vole-gate-selftest.gggggg vole-gate-selftest.toolong " ] \
+    && [ -f "$T/vole-gate-selftest.dddddd/notes.txt" ] && [ -d "$T/elsewhere" ]; then
+    ok selftest_prune
+else
+    bad selftest_prune "got '$got'; left: $left; dry: $dry ($kept_all entries after it)"
+fi
+
+# ---- tests/run.sh --bless (0.30) ----
+
+# In a small tree of its own (run.sh, the directives' parse, two cases)
+# with a compiler that reports two errors: the case whose errors are
+# those at other positions gets the positions of now (a position in a
+# note too), and passes; the one whose message differs is left as it was,
+# with why, and fails.
+BL="$WORK/bless"
+mkdir -p "$BL/tests/run" "$BL/compiler/src"
+cp "$ROOT/tests/run.sh" "$ROOT/tests/directives.awk" "$BL/tests/"
+cat >"$BL/volec" <<'EOF'
+#!/bin/sh
+for a in "$@"; do
+    case "$a" in
+        --check-rules) exit 0 ;;
+        --version) echo "volec (the runner's own)"; exit 0 ;;
+    esac
+done
+echo "error[type error]: expected 'i32', got 'i64'" >&2
+echo " --> case.vl: line 11, column 5" >&2
+echo "error[own.moved]: v was moved" >&2
+echo " --> case.vl: line 20, column 9" >&2
+echo "  = note: moved at line 18, column 13" >&2
+exit 1
+EOF
+chmod +x "$BL/volec"
+printf '%s\n' "// ERROR: error[type error]: expected 'i32', got 'i64'" '// ERROR: line 10, column 5' '// ERROR: error[own.moved]' \
+    '// ERROR: line 19, column 9' '// ERROR: moved at line 17, column 13' '// ERROR-COUNT: 2' 'fn main() {}' >"$BL/tests/run/err_moved.vl"
+printf '%s\n' "// ERROR: error[type error]: expected 'i32', got 'u8'" '// ERROR: line 10, column 5' 'fn main() {}' >"$BL/tests/run/err_changed.vl"
+cp "$BL/tests/run/err_changed.vl" "$BL/changed.orig"
+printf '%s\n' "// ERROR: error[type error]: expected 'i32', got 'i64'" '// ERROR: line 11, column 5' '// ERROR: error[own.moved]' \
+    '// ERROR: line 20, column 9' '// ERROR: moved at line 18, column 13' '// ERROR-COUNT: 2' 'fn main() {}' >"$BL/moved.want"
+got=$(sh "$BL/tests/run.sh" -c "$BL/volec" -j 2 --bless err_ 2>&1)
+rc=$?
+if [ $rc -eq 1 ] && cmp -s "$BL/tests/run/err_moved.vl" "$BL/moved.want" && cmp -s "$BL/tests/run/err_changed.vl" "$BL/changed.orig" \
+    && printf '%s\n' "$got" | grep -q -x -F "blessed err_moved: 3 directives: line 10, column 5 -> line 11, column 5; line 19, column 9 -> line 20, column 9; moved at line 17, column 13 -> moved at line 18, column 13" \
+    && printf '%s\n' "$got" | grep -q "^not blessed err_changed: the compiler does not report 'error\[type error\]: expected 'i32', got 'u8'', positions aside" \
+    && printf '%s\n' "$got" | grep -q '^  total  *1  *0  *1  *0$'; then
+    ok bless_positions
+else
+    bad bless_positions "exit $rc: $(printf '%s\n' "$got" | tr '\n' ';')"
+fi
+# --bless without a case named is refused.
+got=$(sh "$BL/tests/run.sh" -c "$BL/volec" --bless 2>&1)
+rc=$?
+case "$rc:$got" in
+    "2:tests/run.sh: --bless takes the cases to bless"*) ok bless_needs_names ;;
+    *) bad bless_needs_names "exit $rc: $got" ;;
+esac
+
+# ---- tests/book/run.sh -u (0.30) ----
+
+# A console block that differs is rewritten with what the shell prints,
+# the prose and the other blocks kept; one with a `...` line is left, and
+# still fails; the chapter then passes but for that block. (No compiler
+# is needed for a chapter of sessions: /bin/sh stands for it.)
+B="$WORK/book"
+mkdir -p "$B"
+printf '%s\n' '# A chapter' '' 'Prose.' '' '```console' '$ echo hello' 'goodbye' '$ echo again' '```' '' 'More prose.' '' \
+    '```console' '$ printf "a\nb\n"' '...' 'c' '```' >"$B/01-sessions.md"
+printf '%s\n' '# A chapter' '' 'Prose.' '' '```console' '$ echo hello' 'hello' '$ echo again' 'again' '```' '' 'More prose.' '' \
+    '```console' '$ printf "a\nb\n"' '...' 'c' '```' >"$B/want.md"
+got=$(sh "$ROOT/tests/book/run.sh" -c /bin/sh -f "$B/01-sessions.md" -u 2>&1)
+rc=$?
+again=$(sh "$ROOT/tests/book/run.sh" -c /bin/sh -f "$B/01-sessions.md" 2>&1)
+if [ $rc -eq 1 ] && cmp -s "$B/01-sessions.md" "$B/want.md" \
+    && printf '%s\n' "$got" | grep -q '^updated 01-sessions:5: its console block' \
+    && printf '%s\n' "$got" | grep -q '^FAIL 01-sessions:13: the session differs' \
+    && printf '%s\n' "$got" | grep -q '^book: 1 blocks rewritten (-u) in 1 chapters' \
+    && printf '%s\n' "$again" | grep -q '^pass 01-sessions:5$' \
+    && printf '%s\n' "$again" | grep -q '^book: 1 passed, 1 failed$'; then
+    ok book_update_console
+else
+    bad book_update_console "exit $rc: $(printf '%s\n' "$got" | grep -v '^    ' | tr '\n' ';') then $(printf '%s\n' "$again" | tail -1); $(diff "$B/want.md" "$B/01-sessions.md" | head -5 | tr '\n' ';')"
+fi
+# With a compiler ($VOLE_TEST_COMPILER, as tests/run.sh gives it, or
+# target/volec): an out block and an err block rewritten, the chapter
+# then passing.
+BC=${VOLE_TEST_COMPILER:-$ROOT/target/volec}
+if [ -x "$BC" ]; then
+    printf '%s\n' '# A chapter' '' '```vole' 'fn main() -> i32 {' '    println("two");' '    0' '}' '```' '' '```out' 'one' '```' '' \
+        'Prose.' '' '```vole' 'fn main() -> i32 {' '    let x: i32 = "a";' '    0' '}' '```' '' '```err' 'wrong' 'text' 'here' 'and here' '```' \
+        >"$B/02-blocks.md"
+    got=$(sh "$ROOT/tests/book/run.sh" -c "$BC" -f "$B/02-blocks.md" -u 2>&1)
+    again=$(sh "$ROOT/tests/book/run.sh" -c "$BC" -f "$B/02-blocks.md" 2>&1)
+    rc=$?
+    if [ $rc -eq 0 ] && printf '%s\n' "$got" | grep -q '^updated 02-blocks:3: its out block' \
+        && printf '%s\n' "$got" | grep -q '^updated 02-blocks:16: its err block' \
+        && [ "$(sed -n 11p "$B/02-blocks.md")" = two ] && grep -q '^Prose\.$' "$B/02-blocks.md" \
+        && printf '%s\n' "$again" | grep -q '^book: 2 passed, 0 failed$'; then
+        ok book_update_out_err
+    else
+        bad book_update_out_err "$(printf '%s\n' "$got" | grep -v '^    ' | tr '\n' ';') then exit $rc: $(printf '%s\n' "$again" | grep -v '^    ' | tr '\n' ';')"
+    fi
+else
+    echo "skip runner_book_update_out_err: no compiler (VOLE_TEST_COMPILER, target/volec)"
 fi
 
 exit $BAD

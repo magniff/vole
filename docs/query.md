@@ -22,7 +22,7 @@ volec query refs NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [-
 volec query callers NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
 volec query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]   (0.16)
 volec query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (0.16) the inferred effects
-volec query unsafe [FILE...|DIR|std] [--no-std] [--unjustified] [--unneeded] [--summary] [--json]   (0.25.3) every unsafe site
+volec query unsafe [FILE...|DIR|std] [--no-std] [--unjustified] [--unneeded] [--source] [--summary] [--json]   (0.25.3) every unsafe site
 volec query features NAME... [--why FEATURE] [-C OPTION]   (0.19) what a function needs of the CPU
 volec query arch WORDS... [--feature F] [--arch A] [--equiv NAME]   (0.19) the intrinsic tables (also `intrinsics`; no program read)
 volec query items [MODULE|TYPE...] [--root ROOT] [--comments] [--find WORD] [--kind KIND,...] [--names]
@@ -30,6 +30,7 @@ volec query show MODULE::section TITLE                   (0.13)
 volec query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--ignore-case] [--count] [--limit N] [--all]
 volec query type FILE:LINE[:COL]...                      (0.13)
 volec query drops FILE:LINE...                           (0.26.1)
+volec query asm FN... [--all]                            (0.30)
 volec query stats [MODULE|FILE] [--over N] [--all]      (refactor.md)
 volec query deps MODULE [--max-lines N]                 (refactor.md)
 volec query unused [MODULE|FILE] [--all]                (refactor.md)
@@ -121,8 +122,11 @@ tools` the ones a program needs.
 | a module's section banners; one section | `target/volec query items MODULE --comments`, `query show MODULE::section TITLE` |
 | the type of an expression | `target/volec query type FILE:LINE:COL` |
 | a function's drops, each decided (kept, removed, flagged, opened) and where it runs (0.26.1) | `target/volec query drops FILE:LINE` |
+| std's files (0.30): search one, list its module, check every body of std, the effects an edit changed | `target/volec query grep TEXT --in compiler/std/FILE.vl` (`--std`), `query items compiler/std/FILE.vl`, `target/volec check --std`, `query effects std --templates` and `tools/std-effects-diff.sh [BASE]` |
+| the machine code of a function at -O2 (0.30) | `target/volec query asm NAME` (as `-S` writes it; each instance a block) |
+| what is known of the Vec headers a function may write, and the instruction that made it unknown (0.30) | `target/volec -O2 --vec-stats=FN FILE.vl -c -o /dev/null` (`vec-headers: FN: ...`) |
 | what a function may do (allocate, io, panic, loop forever) | `target/volec query effects NAME\|MODULE` (`--why EFFECT`: the chain; `--has alloc(Gpa)`: which still allocate) |
-| every unsafe site: what it does, its class, whether it says why | `target/volec query unsafe [FILE...\|std]` (`--unjustified`, `--unneeded`, `--summary`, `--json`) |
+| every unsafe site: what it does, its class, whether it says why | `target/volec query unsafe [FILE...\|std]` (`--unjustified`, `--unneeded`, `--source`: each site's lines, `--summary`, `--json`); the comments written: `target/volec edit justify FILE:LINE --unsafe TEXT --safety TEXT` (`--from LIST`) |
 | the CPU intrinsic for a task, its instruction and feature; what a function needs of the CPU (0.19) | `target/volec query arch WORDS` (`--feature crc`, `--equiv NAME`); `query show vqtbl1q_u8`; `query features NAME --why crc` |
 | where it is defined, its signature | `target/volec query def NAME` |
 | what a module contains; a type's methods | `target/volec query items MODULE`; `query items TYPE`; `query show TYPE` (its source, then a line a method) |
@@ -142,12 +146,13 @@ tools` the ones a program needs.
 | see what an edit changed, without reading the file back | `--show` on any edit or refactoring; `target/volec query diff` (the last one) |
 | wrap a body or lines in a block (`unsafe`, `loop`), re-indented; make a file with its `mod` line | `target/volec edit wrap NAME --in unsafe [--lines A-B]`, `edit new-file PATH < text` |
 | take the last edit back | `target/volec undo` (outside git: the journal is `.volec/` next to the root) |
-| add, remove, rename, reorder or retype a parameter, with every call | `target/volec refactor signature FN --add 'x: i64 = 0'` (`--remove x`, `--rename-param a b`, `--reorder b,a`, `--type x T --default '$x as T'`) |
-| add, remove, rename or retype a field, with every literal and access | `target/volec refactor field STRUCT --add 'g: i64 = 0'` (`--remove g`, `--rename g h`, `--type g T`) |
+| add, remove, rename, reorder or retype a parameter, with every call | `target/volec refactor signature FN --add 'x: i64 = 0'` (`--remove x`, `--rename-param a b`, `--reorder b,a`, `--type x T --default '$x as T'`; 0.30: `--batch FILE`, the `--type` changes of a file's lines `FN PARAM TYPE [DEFAULT]`, one check) |
+| add, remove, rename or retype a field, with every literal and access | `target/volec refactor field STRUCT --add 'g: i64 = 0'` (`--remove g`, `--rename g h`, `--type g T`; 0.30: `--type f,g T --default EXPR --rewrite 'PAT' 'REPL' --allocator X`, several fields, their uses rewritten, the struct made generic over its allocator, in one checked edit) |
 | add a variant (an arm in each match that needs one), remove, rename one | `target/volec refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match; `--remove V`, `--rename V W`) |
 | move lines of a function into a new one, parameters and result computed | `target/volec refactor extract-function FN --lines A-B --to NEW` |
+| fold a predicate that is one value now: its calls the constant, the dead branches gone (0.30) | `target/volec refactor fold FN --as true --dry-run` (lists the items left without a use) |
 | put a small function's body where it is called (and delete it) | `target/volec refactor inline FN` (`--at FILE:LINE`: one call) |
-| replace an idiom everywhere, typed | `target/volec rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: &mut IntVec' --dry-run` (`--list`: the sites and their holes; `--subst 'P' 'R'`: inside the holes' code; `--where '$v: name ~ RE'`; `--in FN\|MODULE\|FILE`, repeated) |
+| replace an idiom everywhere, typed | `target/volec rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: &mut IntVec' --dry-run` (`--list`: the sites and their holes; `--subst 'P' 'R'`: inside the holes' code; `--where '$v: name ~ RE'`; `--in FN\|MODULE\|FILE`, `--not-in`, repeated; 0.30: `$e.$f` a field's or method's name, `c"$s"` a literal's text, a site inside the function its replacement calls refused, docs/refactor-shape.md) |
 | text in any file git tracks (md, sh, toml, sources' comments or strings), one edit; sources renamed to another extension, mentions too, the build compared (0.21, for 0.24's rename) | `target/volec rewrite --text OLD NEW --word --case [--files GLOB] [--comments\|--strings\|--no-sources] [--exclude SPEC] --dry-run --diff`; `target/volec refactor extension .vl .vl ROOT\|DIR\|--all --dry-run` (docs/refactor.md, "Renaming the language") |
 | rename anything (a module: its file too), with every reference | `target/volec refactor rename PATH NEW` (a local or parameter: `FILE:LINE:COL` or `FN::x`, shadowing respected) |
 | move items to another module, imports and `pub` fixed | `target/volec refactor move PATH... --to MODULE` (`--after\|--before ITEM`: where; a MODULE that does not exist is made) |
@@ -593,6 +598,21 @@ it and of the modules under it (the root's: not std's).
   (front/effects/why.vl), each line indented two spaces; `(not:
   EFFECT)` when it has not.
 - An unknown EFFECT is `error query.usage` (exit 2).
+- (0.30) `--templates`: a line a function, a generic one's by its
+  template (its opaque instance: each type parameter a type of its
+  own), named as the definition is, `std::mem::replace \t unsafe`; of
+  std, its `pub` functions (as `items std` lists them). The listing
+  does not depend on what the program instantiates, so two of them
+  compare: `tools/std-effects-diff.sh [BASE]` makes std's for its files
+  as they are and for a revision's (`query effects std --templates
+  --std-tree DIR`, BASE's listing kept in the tools' cache) and prints
+  the functions whose sets differ, `std::mem::replace \t unsafe ->
+  diverge unsafe`, then `std-effects-diff: N changed, A added, R removed
+  since BASE (M functions)`; `--check` exits 1 on a change. The edit
+  hook runs it after a change to compiler/std that `check --std`
+  passes. A set is cut to its function's `#[effects(..)]` (what goes
+  past it is `check --std`'s error), so the difference shows what
+  changed within the declarations, and of the functions without one.
 
 `def`, `show` and `context` add `effects: SET` to a function's line (a
 TAB before it): not for a generic function (its instances differ) nor a
@@ -622,6 +642,10 @@ main.vl:29	block	crate::main	raw-pointer	justified	unsafe-call(total)
 sites: 7 (5 blocks, 1 unsafe fns, 1 extern blocks); unjustified: 4; unneeded: 0
 ```
 
+- (0.30) `--source` prints each site's lines under its line, `LINE<TAB>text`
+  from the line the site starts on to its end (at most 12, then `... N
+  more lines, to LAST`): what `edit justify FILE:LINE` writes the
+  comments above. `--json` has `end_line`, the line the site ends on.
 - KIND: `block`, `unsafe fn`, `extern`. ITEM: the function it is in
   (an `unsafe fn`: itself), else the module (`MODULE::extern`).
 - OPERATIONS: what inside it needs unsafe code, as the checker counted
@@ -672,10 +696,58 @@ the checker never reaches is listed too); the operations need the
 program checked, so `unsafe` reads it in full (no cache).
 docs/unsafe-baseline.md is the compiler's and std's summary; the gate's
 `unsafe-audit` row and premerge's unsafe row (tests/unsafe_audit.sh)
-hold them to none unjustified and, in compiler/src, none unneeded
-(0.29). A block of a generic function of std that the program never
-instantiates is listed `none (unneeded)` though it holds what needs it:
-std's unneeded count depends on the program and is not judged.
+hold them to none unjustified and none unneeded (0.29: compiler/src;
+0.30: std too). Until 0.30 a block of a generic function of std that
+the program never instantiates was listed `none (unneeded)` though it
+held what needs it (22 justified blocks under the compiler), so std's
+count was the program's and not judged. (0.30) With std's sites in the
+listing every generic function of std is checked by its opaque
+instance, as `volec check --std` does, and the operations of its blocks
+are recorded whatever the program instantiates; and a block is marked
+as checked only when an instance checked all of it without an error
+(one cut short by an error is `not checked`, never `none (unneeded)`).
+Two kinds of std function are still checked only where a program uses
+them, and a block in one is `not checked` then: a trait's default
+method as an impl has it, and a body the opaque model does not cover
+(`note check.std` counts them).
+
+## asm (0.30)
+
+`asm NAME...` prints the machine code of the functions NAME names in the
+program at -O2: the program is built by the compiler run again (`volec
+-O2 -S ROOT -o /dev/stdout`: the code generator's own text, no
+disassembler), and each function's block is printed from its label to
+the next function's.
+
+```
+$ volec query asm bump
+_vole.bump:
+L1:
+    ldr x9, [x0, #48]
+    add x9, x9, #1
+    str x9, [x0, #48]
+    ret
+```
+
+A NAME is a path or its end, as the code's symbols have it: `bump`,
+`Vec::push`, `std::fmt::Formatter::pad` (a symbol is `_vole.` and the
+path with `.` for `::`; an instance has its type arguments after it,
+`.G...`, and is a block of its own). Four blocks of a NAME are shown
+(`note query.truncated` says of how many; `--all`: every one). A
+function with no code of its own, inlined into all its callers or
+reached by nothing, is `error query.no-match`, which says so; a program
+that does not build is `error query.asm-build` under the build's
+errors. The target is the host's; the level is -O2.
+
+What the optimizer knew when it wrote that code: `volec -O2
+--vec-stats=FN FILE.vl -c -o /dev/null` prints, besides FN's loops,
+`vec-headers: FN: known: writes through operand 0 (words 0..3)`, the
+summary of the Vec headers FN may write (middle/callfacts.vl: what its
+callers keep a Vec's pointer and length across the call with), or
+`vec-headers: FN: unknown: line 44: a call of `pid`, whose summary is
+unknown (--vec-stats=pid)`: the first instruction that made it unknown,
+which names the function to ask next. `--print-after-all=FN` prints
+FN's IR after every pass.
 
 ## features (0.19)
 
@@ -835,6 +907,37 @@ them (`query show compiler/std/io.vl:101`, `--in
 compiler/std/io.vl`) reads std from its files. Elsewhere std is the
 compiler's text, `<std>`. The edits of std items: refactor.md, "Editing
 std by name".
+
+(0.30) There, std's files are named everywhere a position or a filter
+is:
+
+- `query grep TEXT --in compiler/std/FILE.vl` searches that file of std
+  (its part of std's text, so a hit has its item), `query refs NAME --in
+  compiler/std/FILE.vl` the uses in it; `--std` is `--in std`. The hits
+  are grouped by std's file, `# compiler/std/mem.vl`, with its lines
+  (`22:16→code→std::mem::swap→...`), not `# <std>` and the text's;
+- `query items compiler/std/FILE.vl` lists that module (`# std::mem→
+  compiler/std/mem.vl`, the file's lines); `query items --std` std's
+  modules;
+- an error in std's code prints as `compiler/std/mem.vl:22:9: error[..]`
+  (`check`, a build, `--json`'s `file` and `line`), and `fix
+  --suggested` makes its fix there (refactor.md);
+- `volec check --std [ROOT]` checks every body of std: besides what
+  `check` does, each generic function of std by its opaque instance
+  (type parameters with only their bounds), with no instance of a
+  program's, so an effect its `#[effects(..)]` lacks, or an unsafe
+  operation outside `unsafe`, in a body nothing instantiates is an
+  error at std's file. With no ROOT it checks std alone (a few
+  seconds). `note check.std` counts the functions checked so and the
+  bodies the opaque model does not cover (their other errors are the
+  model's and are not reported: those bodies are checked at their
+  instances).
+
+Where std is the compiler's text (`$VOLE_STD_TREE=none`: the
+transcripts; a program outside the repository) the positions are
+`<std>:L:C` as before, which the runners compare normalized
+(tests/stdpos.awk); `query def '<std>:L'` names the item at a line of
+it. tests/stdtools.sh pins all of this.
 
 ## similar and examples (0.17)
 

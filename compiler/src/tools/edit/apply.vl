@@ -48,9 +48,32 @@ pub fn copy_path(path: *const u8, pcx: &Ctx<Comp>) -> *mut u8 {
     buf_cstr(b)
 }
 
+// (0.30) t into a key without the positions it names: the digits after a
+// `:` (`main.vl:12:10`, a `try:` line's `FILE:LINE`) are left out. An
+// error whose message names a place (`mutably borrowed at main.vl:11:10`)
+// and that an edit only moved a line down is then the error it was, not
+// a new one (0.29: a `use` line added by a fix made the program's old
+// borrowck error "new", and the fix was refused).
+fn put_unplaced(out: i64, t: &[u8]) {
+    let mut i: usize = 0;
+    while i < t.len() {
+        buf_bytes(out, &t[i..i + 1]);
+        if t[i] == b':' {
+            let mut j = i + 1;
+            while j < t.len() && t[j] >= b'0' && t[j] <= b'9' {
+                j += 1;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+}
+
 // The key of a short diagnostic line: its file and message, without its
-// line and column (which an edit moves); empty for a line that is not an
-// error.
+// line and column (which an edit moves) and without the places its
+// message, help and try: lines name (put_unplaced); empty for a line that
+// is not an error.
 fn error_key(line: &[u8], out: i64) -> bool {
     let mut i: i64 = 0;
     while i + 8 <= line.len() as i64 {
@@ -64,7 +87,7 @@ fn error_key(line: &[u8], out: i64) -> bool {
                 f += 1;
             }
             buf_bytes(out, &line[0..f as usize]);
-            buf_bytes(out, &line[(i + 1) as usize..]);
+            put_unplaced(out, &line[(i + 1) as usize..]);
             return true;
         }
         i += 1;
@@ -144,6 +167,10 @@ fn check_run(root: *const u8, edited: bool, out: i64, tcx: &Tcx<Comp>, pcx: &mut
     args.push(pcx.prog as i64);
     args.push(c"check" as i64);
     args.push(c"--diagnostics=short" as i64);
+    // (0.30: fix reads every error; the check of its edit too)
+    if pcx.max_errors == 9223372036854775807 {
+        args.push(c"--max-errors=0" as i64);
+    }
     if tcx.target_name != 0 as *mut u8 {
         args.push(c"--target" as i64);
         args.push(tcx.target_name as i64);
@@ -538,6 +565,25 @@ pub fn finish_edit(what: &[u8], root: *const u8, tcx: &mut Tcx<Comp>, pcx: &mut 
         }
         imports_note(rounds, tcx);
     }
+    // (0.30: the fixes the edit asks for on the edited program, in rounds
+    // while one writes: `refactor field --allocator`'s `alloc`, the struct
+    // made generic and then its uses; a script's steps leave them to its
+    // end)
+    if tcx.round_only != 0 as *const u8 && tcx.step_report == 0 as *mut u8 {
+        let mut rounds: i64 = 0;
+        let only = tcx.round_only;
+        while rounds < 8 && round_child(root, only, 0 as *const u8, tcx, pcx) > 0 {
+            rounds += 1;
+        }
+        if rounds > 0 {
+            let d = diag(c"note", c"edit.rounds", tcx);
+            buf_int(d, rounds);
+            buf_str(d,
+                if rounds == 1 { c" round of `fix --only " } else { c" rounds of `fix --only " });
+            buf_str(d, only);
+            buf_str(d, c"` on the edited program, in the same edit\n");
+        }
+    }
     // The diff (printed with --dry-run; it counts the lines).
     let mut diff = edit_diff(tcx, pcx);
     if tcx.step_report != 0 as *mut u8 {
@@ -546,7 +592,12 @@ pub fn finish_edit(what: &[u8], root: *const u8, tcx: &mut Tcx<Comp>, pcx: &mut 
     let mut ok = true;
     // 2, 3. The check.
     let mut added: Vec<i64, Comp> = Vec::new_in(Comp {});
-    let checked = tcx.skip_check || check_edited(root, &mut added, tcx, pcx);
+    // (0.30) --no-check is no check: a step of a bulk edit pays none and
+    // lists no errors (it ran the check before, to print edit.breaks as
+    // a warning); the one who asked checks once at the end. A dry run
+    // and `fix` (which reports what is left) still check.
+    let unchecked = tcx.no_check && !tcx.dry_run && !tcx.left_ok;
+    let checked = tcx.skip_check || unchecked || check_edited(root, &mut added, tcx, pcx);
     // (0.14: edit replace, insert and patch: new errors, maybe names
     // the new text uses from other modules; the imports `fix --only
     // imports` adds, then the check again; not with --no-check, which
@@ -714,14 +765,27 @@ fn imports_round(root: *const u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool 
 // One `fix --round --only imports --in IN` on the edited program: 1 when
 // it rewrote a copy, 0 when it did not, -1 when it failed.
 fn imports_child(root: *const u8, files: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    round_child(root, c"imports", files, tcx, pcx)
+}
+
+// (0.30) One `fix --round --only ONLY [--in IN]` on the edited program
+// (`files` 0: all of it): 1 when it rewrote a copy, 0 when it did not, -1
+// when it failed.
+pub fn round_child(root: *const u8, only: *const u8, files: *const u8, tcx: &mut Tcx<Comp>,
+    pcx: &Ctx<Comp>) -> i64 {
     let mut args: Vec<i64, Comp> = Vec::new_in(Comp {});
     args.push(pcx.prog as i64);
     args.push(c"fix" as i64);
     args.push(c"--round" as i64);
+    // (0.30: every error of the edited program, not the first 50: a
+    // rewrite of 260 files adds its 260 imports in one round, not in six)
+    args.push(c"--max-errors=0" as i64);
     args.push(c"--only" as i64);
-    args.push(c"imports" as i64);
-    args.push(c"--in" as i64);
-    args.push(files as i64);
+    args.push(only as i64);
+    if files != 0 as *const u8 {
+        args.push(c"--in" as i64);
+        args.push(files as i64);
+    }
     if tcx.target_name != 0 as *mut u8 {
         args.push(c"--target" as i64);
         args.push(tcx.target_name as i64);
@@ -856,12 +920,12 @@ fn edit_diff(tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
         }
         if from >= 0 {
             diff_moved(diff, file_text(from, pcx),
-                shown_path((tcx.new_path[i as usize]) as *mut u8),
+                &shown_path((tcx.new_path[i as usize]) as *mut u8),
                 &get_src()[
                     pcx.files[from as usize].start as usize..pcx.files[from as usize].end as usize],
                 &buf_copy((tcx.new_text[i as usize])), tcx);
         } else {
-            diff_texts(diff, shown_path((tcx.new_path[i as usize]) as *mut u8),
+            diff_texts(diff, &shown_path((tcx.new_path[i as usize]) as *mut u8),
                 &get_src()[0..0], &buf_copy((tcx.new_text[i as usize])), tcx);
         }
     }
@@ -1003,7 +1067,7 @@ fn put_summary(out: i64, what: &[u8], tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) {
         if tcx.ch_file.len() as i64 == 1 {
             buf_bytes(out, file_text((tcx.ch_file[0]), pcx));
         } else {
-            buf_bytes(out, shown_path((tcx.new_path[0]) as *mut u8));
+            buf_bytes(out, &shown_path((tcx.new_path[0]) as *mut u8));
         }
     } else {
         buf_int(out, files);

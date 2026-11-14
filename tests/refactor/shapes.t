@@ -214,6 +214,7 @@ try: volec refactor field crate::geom::Point --type x i32
 note edit.together: change crate::geom::Point::scale in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
 try: volec query show crate::geom::Point::scale
 try: volec refactor field Point --type x i32 --no-check
+note refactor.literals: 2 literals of crate::geom::Point keep the value they had for x (main.vl:12:25, geom.vl:13:13): --default EXPR gives each its new value (`$x` in EXPR: the old one)
 [exit 1]
 $ refactor field Point --remove y
 error refactor.used: crate::geom::Point.y is used: 4 references (first: geom.vl:18:13)

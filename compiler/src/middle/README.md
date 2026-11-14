@@ -22,7 +22,7 @@ again. `back` takes the optimized IR.
 | `sroa.vl` | scalar replacement of aggregates, constant tables |
 | `copies.vl` | copy elision: a slot copied once into another (or a field of one) is that part (0.14) |
 | `tags.vl` | jump threading on constant tags: `match it.next()` once `next` is inlined (0.14) |
-| `exits.vl` | loops with several counted exits made counted loops; equal induction variables merged (0.14) |
+| `exits.vl` | loops with several counted exits made counted loops; equal induction variables merged (0.14); (0.30) the constants of loops moved out, a loop that repeats its outer loop's test made part of it, a counter from 0 for a loop counted down and the other induction variables as its multiples |
 | `adce.vl` | aggressive dead code elimination over control dependence |
 | `inline.vl` | inlining over the call graph's components |
 | `ipo.vl` | interprocedural attributes, constant propagation, devirtualization, heap to stack |

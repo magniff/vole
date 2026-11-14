@@ -9,8 +9,8 @@ use crate::back::codecache::{R_ATTRS, R_STATIC, cc_note};
 use crate::back::regalloc::intervals::calls_returns_twice;
 use crate::back::regalloc::prepare::layout_order;
 use crate::base::{
-    STDERR, buf_byte, buf_int, buf_new, buf_str, buf_write_fd, find_sym, intern_c, sized_table,
-    sym_name,
+    STDERR, buf_byte, buf_fmt, buf_int, buf_new, buf_str, buf_write_fd, find_sym, intern_c,
+    sized_table, sym_name, sym_text,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -549,6 +549,161 @@ pub fn infer_component_attrs(cx: &mut FnCtx<Comp>, start: i64, end: i64, pcx: &C
     for i in start..end {
         pcx.fn_attrs_done.set((pcx.scc_order[i as usize]), 1);
     }
+    // (0.30) --vec-stats=FN: FN's summary of the Vec headers it may write,
+    // and the first instruction that made it unknown; then the tables as
+    // the last function's inference left them
+    if pcx.vec_stats_fn != 0 as *mut u8 && end > start {
+        let mut said = false;
+        for i in start..end {
+            let fi = (pcx.scc_order[i as usize]);
+            if crate::middle::vectorize::fn_named(pcx.ir_fn[fi as usize], pcx.vec_stats_fn, pcx) {
+                report_header_writes(cx, fi, pcx);
+                said = true;
+            }
+        }
+        if said {
+            let last = (pcx.scc_order[(end - 1) as usize]);
+            ir_enter(cx, last, pcx);
+            if !calls_returns_twice(cx, last, pcx) {
+                find_escaping_slots(cx, last, pcx);
+                layout_order(cx, last);
+                mark_returning(cx);
+            }
+        }
+    }
+}
+
+// (0.30) --vec-stats=FN: a line on stderr saying what is known of the Vec
+// headers function fi may write (middle::callfacts: the summary its
+// callers keep a Vec's pointer and length across the call with), after
+// its component's attributes are settled:
+//
+//   vec-headers: NAME: known: writes none
+//   vec-headers: NAME: known: writes through operand 0 (words 0..3), a static's
+//   vec-headers: NAME: unknown: line 12: a call of `g`, whose summary is unknown
+//
+// For an unknown summary, the first instruction (in layout order, in a
+// block that reaches a return) that made it so, and why: the walk of
+// compute_attrs again, with the callees' settled attributes.
+pub fn report_header_writes(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
+    let out = buf_new();
+    buf_fmt(out,
+        format_args("vec-headers: {}: ",
+            str::from_utf8(sym_text(pcx.fns[pcx.ir_fn[fi as usize] as usize].display, pcx)).unwrap()));
+    let attrs = pcx.fn_attrs.get(fi);
+    if attrs & HW_KNOWN != 0 {
+        buf_fmt(out, format_args("known: writes"));
+        let mut any = false;
+        for k in 0..HW_ARGS {
+            if attrs & (1 << (HW_ARG_SHIFT + k)) == 0 {
+                continue;
+            }
+            buf_fmt(out, format_args("{} through operand {k}", if any { "," } else { "" }));
+            // (the range is the first marked operand's; the others' writes
+            // are at any offset)
+            if !any {
+                let lo = writes_lo(attrs, k);
+                let hi = writes_hi(attrs, k);
+                if hi == HW_FAR {
+                    buf_fmt(out, format_args(" (words from {lo})"));
+                } else {
+                    buf_fmt(out, format_args(" (words {lo}..{hi})"));
+                }
+            } else {
+                buf_fmt(out, format_args(" (anywhere in it)"));
+            }
+            any = true;
+        }
+        if attrs & HW_STATIC != 0 {
+            buf_fmt(out, format_args("{} a static's", if any { "," } else { "" }));
+            any = true;
+        }
+        if attrs & HW_RESULT != 0 {
+            buf_fmt(out, format_args("{} through its result pointer", if any { "," } else { "" }));
+            any = true;
+        }
+        if !any {
+            buf_fmt(out, format_args(" none"));
+        }
+        buf_fmt(out, format_args("\n"));
+        buf_write_fd(out, STDERR);
+        return;
+    }
+    ir_enter(cx, fi, pcx);
+    if calls_returns_twice(cx, fi, pcx) {
+        buf_fmt(out,
+            format_args("unknown: it calls a function that returns twice (setjmp): nothing is inferred of it\n"));
+        buf_write_fd(out, STDERR);
+        return;
+    }
+    find_escaping_slots(cx, fi, pcx);
+    layout_order(cx, fi);
+    mark_returning(cx);
+    let mut hw = no_writes();
+    let mut first: i64 = 0;
+    let mut first_callee: i64 = 0;
+    for i in 0..cx.order.len() as i64 {
+        let b = (cx.order[i as usize]);
+        if (cx.blocks[b as usize]).mark != 2 {
+            continue;
+        }
+        let mut v = (cx.blocks[b as usize]).first;
+        while v != 0 && first == 0 {
+            let callee = if (cx.insts[v as usize]).op.is_call() { call_attrs(cx, v, pcx) }
+                else { 0 };
+            note_writes(cx, fi, v, callee, &mut hw, pcx);
+            if !hw.known {
+                first = v;
+                first_callee = callee;
+            }
+            v = (cx.insts[v as usize]).next;
+        }
+        if first != 0 {
+            break;
+        }
+    }
+    buf_fmt(out, format_args("unknown: "));
+    if first == 0 {
+        // (a component that did not settle, or one assumed unknown)
+        buf_fmt(out,
+            format_args("no instruction of its own: its recursive component did not settle\n"));
+        buf_write_fd(out, STDERR);
+        return;
+    }
+    if first < cx.inst_loc.len() as i64 && (cx.inst_loc[first as usize]) > 0 {
+        buf_fmt(out,
+            format_args("line {}: ",
+                crate::back::dwarf::file_and_line((cx.inst_loc[first as usize]) - 1, pcx)
+                    & 0xffffffff));
+    }
+    let op = (cx.insts[first as usize]).op;
+    if op == Call {
+        let name = sym_text(pcx.fns[(cx.insts[first as usize]).imm as usize].display, pcx);
+        let name = str::from_utf8(name).unwrap();
+        if (pcx.fn_ir[(cx.insts[first as usize]).imm as usize]) - 1 < 0 {
+            buf_fmt(out,
+                format_args("a call of C's `{name}` (a C function other than the allocator's has no summary)\n"));
+        } else if first_callee & HW_KNOWN == 0 {
+            buf_fmt(out,
+                format_args("a call of `{name}`, whose summary is unknown (--vec-stats={name})\n"));
+        } else {
+            buf_fmt(out, format_args("a call of `{name}`, which writes through an operand or its result at an address the summary does not follow here\n"));
+        }
+    } else if op == CallC {
+        buf_fmt(out,
+            format_args("a call of C's `{}` (not the allocator's)\n",
+                str::from_utf8(sym_text((cx.insts[first as usize]).imm, pcx)).unwrap()));
+    } else if op.is_call() {
+        buf_fmt(out, format_args("an indirect call\n"));
+    } else if op == Store {
+        buf_fmt(out, format_args("a store through an address the summary does not follow (a pointer loaded from memory, a raw pointer of unknown origin, a number made a pointer)\n"));
+    } else if is_copy(cx, first, pcx) {
+        buf_fmt(out, format_args("a block copy to an address the summary does not follow (a pointer loaded from memory, a raw pointer of unknown origin)\n"));
+    } else {
+        buf_fmt(out,
+            format_args("an atomic operation, a fence, a memory intrinsic or an indexed store\n"));
+    }
+    buf_write_fd(out, STDERR);
 }
 
 // --print-attrs.

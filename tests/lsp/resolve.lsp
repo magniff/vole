@@ -9,6 +9,7 @@
 > @open main.vl
 ## std's modules and items named by `use`; `std` itself
 > {"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":4,"character":4}}}
+< {"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file://@DIR@/more.vl","diagnostics":[{"range":{"start":{"line":3,"character":18},"end":{"line":3,"character":22}},"severity":2,"code":"use.redundant","source":"volec","message":"redundant import 'From': the prelude gives it to every module\nhelp: remove it (`volec fix` removes every redundant import)","relatedInformation":[{"location":{"uri":"file://@DIR@/more.vl","range":{"start":{"line":3,"character":18},"end":{"line":3,"character":22}}},"message":"try: volec fix --only redundant @DIR@/main.vl"}]}]}}
 < {"jsonrpc":"2.0","id":2,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/std.vl","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}}
 > {"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":4,"character":4}}}
 < {"jsonrpc":"2.0","id":3,"result":{"contents":{"kind":"markdown","value":"```vole\nmod std\n```\nThe standard library, built into the compiler; its most used names (the prelude: `Vec`, `println`, `Gpa`...) need no `use`. (`volec guide std`)\n"},"range":{"start":{"line":4,"character":4},"end":{"line":4,"character":7}}}}
@@ -54,7 +55,7 @@
 > {"jsonrpc":"2.0","id":24,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":80,"character":4}}}
 < {"jsonrpc":"2.0","id":24,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/fmt.vl","range":{"start":{"line":101,"character":7},"end":{"line":101,"character":14}}}}
 > {"jsonrpc":"2.0","id":25,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":80,"character":4}}}
-< {"jsonrpc":"2.0","id":25,"result":{"contents":{"kind":"markdown","value":"```vole\npub fn println<T: Display>(x: T)\neffects: per instance (none checked)\nfeatures: none\n```\n\nx and a newline on stdout.\nlater: format_fns\n\n`std::fmt::println` (fn)\n"},"range":{"start":{"line":80,"character":4},"end":{"line":80,"character":11}}}}
+< {"jsonrpc":"2.0","id":25,"result":{"contents":{"kind":"markdown","value":"```vole\npub fn println<T: Display>(x: T)\neffects: per instance (none checked)\nfeatures: none\n```\n\nx and a newline on stdout, in one write when the line is short: lines\nprinted by several threads at once are not mixed (std::__rt::PrintOut).\nlater: format_fns\n\n`std::fmt::println` (fn)\n"},"range":{"start":{"line":80,"character":4},"end":{"line":80,"character":11}}}}
 > {"jsonrpc":"2.0","id":26,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":73,"character":24}}}
 < {"jsonrpc":"2.0","id":26,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/vec.vl","range":{"start":{"line":395,"character":11},"end":{"line":395,"character":19}}}}
 ## std::thread, std::cli, std::gpu through their paths and methods

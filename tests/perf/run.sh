@@ -26,6 +26,36 @@
 #                 as below; the program runs the same
 #   vec-counts    --vec-stats alone: the counts line only; -O0: no line
 #                 for a loop
+#   vec-headers   (0.30) --vec-stats=FN at -O2: `vec-headers: FN: known:
+#                 writes ...`, the summary of the Vec headers FN may write
+#                 (none; through an operand, the words; a static's), or
+#                 `unknown: line N:` and the first instruction that made
+#                 it so (a store through a loaded pointer, a call of C, a
+#                 call of a function whose summary is unknown, which the
+#                 line names to ask next); the object is the one a build
+#                 without the option writes; -O0: no line
+#   asm           (0.30) `volec query asm FN`: FN's machine code at -O2,
+#                 from its label to its `ret`, and no other function's; a
+#                 name the code has no function for: query.no-match
+#   json          (0.30) --time-passes=json at -O2: one JSON object on
+#                 stderr, `{"unit":"instructions","phases":[..],"total":N,
+#                 "passes":[..],"rest":[..],"front_end":N,"mark":{..}}`,
+#                 the counts whole; its total is the phases' sum
+#   check-phases  (0.30) `volec check --time-passes=instructions`: the
+#                 front end's phases in millions and the total; `=json`:
+#                 the object, no passes in it
+#   print-after   (0.30) --print-after-all=FN: the IR after every pass of
+#                 function FN only (fewer `; after` blocks than without
+#                 the name, each of that function)
+#   help          (0.30) `volec build --help` (and `volec FILE.vl --help`)
+#                 names the options that show what the compiler did:
+#                 --emit-ir, --time-passes, --print-after-all, --verify-ir,
+#                 --vec-stats, VOLE_INLINE_LOG; `volec --help` points there
+#   perf-diff     (0.30) tools/perf-diff.sh A B FILE: a table of phases
+#                 and one of passes with both compilers' instructions and
+#                 the difference (the same compiler twice: every row's
+#                 two counts within a quarter of each other: on a busy
+#                 machine a small phase's count moves by several percent)
 
 set -u
 LC_ALL=C
@@ -125,7 +155,81 @@ vec-stats: kernels, loop at line 14: not vectorized: an address computed from a 
 vec-stats: kernels, loop at line 17: not vectorized: a branch in its body that is no bounds check (an if, a break)
 vec-stats: kernels, loop at line 31: not vectorized: an unknown trip count: not a loop over a counter to a bound
 vec-stats: kernels, loop at line 35: not vectorized: a float carried from one iteration to the next (a float sum: lanes would add in another order) (phi)
-vector loops 3, overlap tests 0, tests dropped by noalias 0
+vec-headers: kernels: unknown: line 20: a store through an address the summary does not follow (a pointer loaded from memory, a raw pointer of unknown origin, a number made a pointer)
+EOF
+# (0.30) --vec-stats=FN also says what is known of the Vec headers FN may
+# write (middle/callfacts.vl), and for an unknown summary the first
+# instruction that made it so: headers.vl's functions, one of each kind.
+cat >headers.vl <<'EOF'
+use std::alloc::Allocator;
+
+// UNSAFE: a C function is declared.
+// SAFETY: getpid's prototype: no argument, an int.
+extern "C" {
+    fn getpid() -> i32;
+}
+
+struct Bag<A: Allocator> {
+    items: Vec<i64, A>,
+    seen: Vec<i64, A>,
+    total: i64,
+}
+
+#[inline(never)]
+fn bump(b: &mut Bag<Gpa>) {
+    b.total += 1;
+}
+
+#[inline(never)]
+fn add(b: &mut Bag<Gpa>, x: i64) {
+    b.items.push(x);
+}
+
+#[inline(never)]
+fn poke(p: *mut *mut i64) {
+    // UNSAFE: a store through a pointer loaded from memory.
+    // SAFETY: the caller passes the address of a pointer to a live i64.
+    unsafe {
+        **p = 7;
+    }
+}
+
+#[inline(never)]
+fn pid(b: &mut Bag<Gpa>) {
+    // UNSAFE: a C call.
+    // SAFETY: getpid takes nothing and returns the process id.
+    b.total += unsafe { getpid() } as i64;
+}
+
+#[inline(never)]
+fn both(b: &mut Bag<Gpa>, x: i64) {
+    add(b, x);
+    pid(b);
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let mut b = Bag { items: Vec::new_in(gpa), seen: Vec::new_in(gpa), total: 0 };
+    b.seen.push(1);
+    let mut s: i64 = 0;
+    for i in 0..4 {
+        bump(&mut b);
+        add(&mut b, i);
+        both(&mut b, i);
+        s += b.seen[0];
+    }
+    let mut k: i64 = 1;
+    let mut q: *mut i64 = &mut k;
+    poke(&mut q);
+    println("{} {} {}", s, b.items.len(), k);
+    0
+}
+EOF
+cat >headers.want <<'EOF'
+vec-headers: bump: known: writes none
+vec-headers: add: known: writes through operand 0 (words 0..3)
+vec-headers: poke: unknown: line 30: a store through an address the summary does not follow (a pointer loaded from memory, a raw pointer of unknown origin, a number made a pointer)
+vec-headers: pid: unknown: line 38: a call of C's `getpid` (a C function other than the allocator's has no summary)
+vec-headers: both: unknown: line 44: a call of `pid`, whose summary is unknown (--vec-stats=pid)
 EOF
 REFUSED="error[time.instructions] the instructions retired cannot be read here | help: the system's counter refused this process (Linux: perf_event_open, which /proc/sys/kernel/perf_event_paranoid above 2 or a container's seccomp profile forbids); --time-passes counts CPU time | try: volec --time-passes FILE.vl -c -o /dev/null"
 
@@ -218,22 +322,158 @@ else
     pass bad-value
 fi
 
+# (0.30) The counts' line, `vector loops N, overlap tests M, tests dropped
+# by noalias K`, is the whole program's: std's loops too (the ones println
+# brings in, some inlined into main), so it moves when std gains or loses
+# a vector loop (twice in 0.30). The checks pin the program's own loops,
+# kernels' lines, and of the counts' line its form and that it counts
+# them (N at least kernels' one vector loop): $1 the file, $2 at least N.
+counts_line() {
+    grep -c '' "$1" | grep -q '^1$' || return 1
+    awk -v min="$2" '/^vector loops [0-9]+, overlap tests [0-9]+, tests dropped by noalias [0-9]+$/ && $3 + 0 >= min + 0 { ok = 1 }
+        END { exit !ok }' "$1"
+}
+
 # vec-stats
 if build -O2 --vec-stats=kernels loops.vl -o loops && [ "$(./loops | tr -d '\n')" = 3045AAA ] \
-    && cmp -s err.out loops.want; then
+    && grep -v '^vector loops ' err.out >err.own && cmp -s err.own loops.want \
+    && grep '^vector loops ' err.out >err.counts && counts_line err.counts 1; then
     pass vec-stats
 else
-    fail vec-stats "$(diff loops.want err.out 2>&1 | head -20)"
+    fail vec-stats "$(diff loops.want err.own 2>&1 | head -20; cat err.counts 2>/dev/null)"
 fi
 
-# vec-counts (the program's loops, std's too: kernels' one, and two
-# in what println brings in, 0.28)
-if build -O2 --vec-stats loops.vl -c -o loops.o \
-    && [ "$(cat err.out)" = "vector loops 3, overlap tests 0, tests dropped by noalias 0" ] \
+# vec-counts (the counts' line alone, at least kernels' one vector loop;
+# nothing at -O0)
+if build -O2 --vec-stats loops.vl -c -o loops.o && counts_line err.out 1 \
     && build -O0 --vec-stats=kernels loops.vl -c -o loops.o && ! grep -q 'loop at' err.out; then
     pass vec-counts
 else
     fail vec-counts "$(cat err.out)"
+fi
+
+# vec-headers
+: >headers.got
+for f in bump add poke pid both; do
+    build -O2 --vec-stats=$f headers.vl -o headers
+    # the function of that name alone: std has an `add` of its own
+    grep "^vec-headers: $f: " err.out >>headers.got
+done
+if cmp -s headers.got headers.want && [ "$(./headers)" = "4 8 7" ] \
+    && build -O2 headers.vl -c -o headers_a.o && build -O2 --vec-stats=both headers.vl -c -o headers_b.o \
+    && cmp -s headers_a.o headers_b.o \
+    && build -O0 --vec-stats=add headers.vl -c -o headers_c.o && ! grep -q '^vec-headers' err.out; then
+    pass vec-headers
+else
+    fail vec-headers "$(diff headers.want headers.got 2>&1 | head -20)"
+fi
+
+# asm
+if "$COMPILER" query asm bump --root headers.vl >asm.out 2>asm.err \
+    && sed -n 1p asm.out | grep -q 'bump:$' && grep -q '^ *ret' asm.out \
+    && [ "$(grep -c ':$' asm.out)" -le 3 ] \
+    && ! "$COMPILER" query asm no_such_fn --root headers.vl >asm2.out 2>asm2.err \
+    && grep -q "^error query.no-match: no function 'no_such_fn' in the program's code at -O2" asm2.err; then
+    pass asm
+else
+    fail asm "$(head -5 asm.out asm.err asm2.err 2>&1)"
+fi
+
+# (an assignment before a function call, `VOLE_COUNTERS=off build` above,
+# stays set in some shells)
+unset VOLE_COUNTERS
+
+# json
+if build -O2 --time-passes=json hello.vl -c -o hello_j.o; then
+    obj=$(grep '^{"unit":"instructions","phases":\[' err.out)
+    if [ -z "$obj" ] || [ "$(grep -c '^{' err.out)" != 1 ]; then
+        fail json "not one object: $(cut -c1-300 err.out)"
+    elif ! echo "$obj" | grep -q '"passes":\[{"name":"sccp","value":[0-9]*,"marks":[0-9]*}' \
+        || ! echo "$obj" | grep -q '{"name":"gvn","value":[0-9]*,"marks":[0-9]*}' \
+        || ! echo "$obj" | grep -q '"rest":\[{"name":"lower to SSA","value":[0-9]*}' \
+        || ! echo "$obj" | grep -q '"front_end":[0-9]*,"mark":{"count":[0-9]*,"each":[0-9]*}}$'; then
+        fail json "a member is missing (passes with sccp and gvn, rest, front_end, mark): $(echo "$obj" | cut -c1-400)"
+    elif ! echo "$obj" | sed 's/"passes":.*//' | awk '{
+            n = split($0, part, /"value":/); sum = 0
+            for (i = 2; i <= n; i++) { v = part[i]; sub(/[^0-9].*/, "", v); sum += v }
+            t = $0; sub(/.*"total":/, "", t); sub(/[^0-9].*/, "", t)
+            exit !(sum == t + 0 && t + 0 > 1000000) }'; then
+        fail json "the total is not the phases' sum: $(echo "$obj" | cut -c1-400)"
+    elif ! cmp -s hello_j.o hello_q.o; then
+        fail json "the object differs from a build without the option"
+    else
+        pass json
+    fi
+elif [ "$(cat err.out)" = "$REFUSED" ]; then
+    pass "json (the system refuses the counter here)"
+else
+    fail json "$(cat err.out)"
+fi
+
+# check-phases
+if VOLE_CACHE=off build check --time-passes=instructions hello.vl; then
+    if grep -q '^[0-9]*\.[0-9] M  parse$' err.out && grep -q '^[0-9]*\.[0-9] M  check$' err.out \
+        && grep -q '^[0-9]* M  total (instructions retired)$' err.out \
+        && VOLE_CACHE=off build check --time-passes=json hello.vl \
+        && grep -q '^{"unit":"instructions","phases":\[.*{"name":"check","value":[0-9]*}.*\],"total":[0-9]*}$' err.out; then
+        pass check-phases
+    else
+        fail check-phases "$(cut -c1-300 err.out)"
+    fi
+elif grep -q 'the system.s counter refused' err.out; then
+    pass "check-phases (the system refuses the counter here)"
+else
+    fail check-phases "$(cat err.out)"
+fi
+
+# print-after
+if build -O2 --print-after-all=kernels loops.vl -c -o loops_a.o; then
+    named=$(grep -c '^; after ' err.out)
+    others=$(awk '/^fn / && $0 != "fn kernels:" { n++ } END { print n + 0 }' err.out)
+    build -O2 --print-after-all loops.vl -c -o loops_a.o
+    all=$(grep -c '^; after ' err.out)
+    if [ "$named" -ge 1 ] && [ "$others" = 0 ] && [ "$all" -gt "$named" ]; then
+        pass print-after
+    else
+        fail print-after "$named blocks for kernels ($others of other functions), $all without the name"
+    fi
+else
+    fail print-after "$(cut -c1-300 err.out)"
+fi
+
+# help
+"$COMPILER" build --help >help.out 2>&1
+"$COMPILER" hello.vl --help >help2.out 2>&1
+"$COMPILER" --help >help3.out 2>&1
+missing=""
+for word in --emit-ir '--time-passes' '=instructions' '=passes' '=json' '--print-after-all\[=FN\]' --verify-ir \
+    '--vec-stats\[=FN\]' VOLE_INLINE_LOG tools/perf-diff.sh tools/perf-experiment.sh 'bench/run.sh --instructions'; do
+    grep -q -e "$word" help.out || missing="$missing $word"
+done
+if [ -n "$missing" ]; then
+    fail help "volec build --help does not name:$missing"
+elif ! cmp -s help.out help2.out; then
+    fail help "volec FILE.vl --help is not volec build --help"
+elif ! grep -q 'volec build --help' help3.out; then
+    fail help "volec --help does not point to volec build --help"
+else
+    pass help
+fi
+
+# perf-diff
+if ! command -v python3 >/dev/null 2>&1; then
+    pass "perf-diff (no python3 here)"
+elif ! "$COMPILER" --time-passes=instructions hello.vl -c -o hello.o >/dev/null 2>&1; then
+    pass "perf-diff (the system refuses the counter here)"
+elif sh "$ROOT/tools/perf-diff.sh" --all "$COMPILER" "$COMPILER" hello.vl >diff.out 2>&1 \
+    && grep -q '^phases: -O2 hello.vl  *A (M)  *B (M)  *B-A (M)  *%$' diff.out \
+    && grep -q '^passes: -O2 hello.vl ' diff.out \
+    && awk '/^  (check|gvn|total) / { a = $(NF - 3); b = $(NF - 2); seen++
+            if (a <= 0 || b <= 0 || b < a * 0.75 || b > a * 1.25) bad = 1 }
+        END { exit !(seen >= 4 && !bad) }' diff.out; then
+    pass perf-diff
+else
+    fail perf-diff "$(head -12 diff.out)"
 fi
 
 exit $STATUS

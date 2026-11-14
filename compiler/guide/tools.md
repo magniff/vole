@@ -81,8 +81,8 @@ bodies.
 | where it is defined, its signature | `volec query def NAME` |
 | every use | `volec query refs NAME` (`--count`, `--in FILE\|MODULE`; a local: `FN::x`) |
 | who calls a function; what it calls | `volec query callers NAME`; `query callees FN` (`--transitive`) |
-| what a function may do: allocate, io, panic... (0.16) | `volec query effects NAME\|MODULE` (`--why io`, `--has alloc(Gpa)`) |
-| every unsafe site: what it does, its class, its `UNSAFE:`/`SAFETY:` comments (0.25.3) | `volec query unsafe [FILE...\|std]` (`--unjustified`, `--summary`, `--json`) |
+| what a function may do: allocate, io, panic... (0.16) | `volec query effects NAME\|MODULE` (`--why io`, `--has alloc(Gpa)`; 0.30 `--templates`: a generic function once, by its template; what a std change did to std's public functions: `tools/std-effects-diff.sh [BASE]`) |
+| every unsafe site: what it does, its class, its `UNSAFE:`/`SAFETY:` comments (0.25.3) | `volec query unsafe [FILE...\|std]` (`--unjustified`, `--source`, `--summary`, `--json`); `volec edit justify FILE:LINE --unsafe TEXT --safety TEXT` writes them (0.30) |
 | a module's items, with signatures | `volec query items MODULE`; every module: `query items` |
 | only some of them, briefly (0.25.3) | `query items std --find clamp` (a word of the name: `f64::clamp`, `i64::clamp`), `--kind fn,method`; `--names`: kinds and paths only |
 | a type, then its methods | `volec query show TYPE` (each method's signature; `query items TYPE`: contracts whole) |
@@ -92,6 +92,7 @@ bodies.
 | what nothing uses | `volec query unused` |
 | sizes, dependencies | `volec query stats`, `query deps MODULE` |
 | std's API, a std item | `volec query items std`, `query show std::io::stdin` (any program; a re-exported name too: `query show std::gpu::Color`) |
+| std's files, in the vole repository (0.30) | `query grep TEXT --in compiler/std/FILE.vl` (`--std`: all of std), `query items compiler/std/FILE.vl`; an error in std prints as `compiler/std/FILE.vl:L:C`; `edit patch compiler/std/FILE.vl --old A --new B`; `volec check --std`: every body of std, a generic one nothing instantiates too |
 | what a snippet does | `volec try 'let v = [3, 1]; v.len()'` prints `usize = 2` |
 | build a program and run it (0.25.4) | `volec run [DIR] [OPTIONS] [-- ARGS]` (DIR/main.vl; rebuilt only when it changed; the binary in volec's cache, never in DIR) |
 | the guide on some words | `volec guide --find WORDS`, `guide TOPIC#SECTION`, `explain WORDS` |
@@ -122,11 +123,12 @@ an edit then `check`.
 | merge conflicts | `volec query conflicts --show`, then `volec edit resolve FILE:LINE --ours` (`--theirs`, `--both`, `< text`) |
 | rename anything, with every use | `volec refactor rename PATH NEW` |
 | rename a local or parameter | `volec refactor rename FILE:LINE:COL NEW` or `refactor rename FN::x NEW` (shadowing respected) |
-| a parameter, with every call | `volec refactor signature FN --add 'x: i64 = 0'` (the parameter is `x: i64` and each call gets 0; `--remove`, `--rename-param`, `--reorder`, `--type`) |
-| a field, with every literal | `volec refactor field STRUCT --add 'g: i64 = 0'` (`--type g T --default EXPR`) |
+| a parameter, with every call | `volec refactor signature FN --add 'x: i64 = 0'` (the parameter is `x: i64` and each call gets 0; `--remove`, `--rename-param`, `--reorder`, `--type`; `--batch FILE`: many `--type` changes, one check) |
+| a field, with every literal | `volec refactor field STRUCT --add 'g: i64 = 0'` (`--type g,h T --default EXPR`; `--rewrite PAT REPL`: their uses; `--allocator X`: the struct generic over it) |
+| a predicate that is one value now, folded away | `volec refactor fold FN --as true --dry-run` |
 | a variant, with every match | `volec refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match) |
 | move items to a module | `volec refactor move PATH --to MODULE` (made when missing) |
-| an idiom everywhere, typed | `volec rewrite 'old($a)' 'new($a)' --dry-run` |
+| an idiom everywhere, typed | `volec rewrite 'old($a)' 'new($a)' --dry-run` (`$e.$f`: a field's name; `c"$s"`: a literal's text; `--in`, `--not-in ITEM`; `--list`) |
 | a word in every file git tracks (docs, scripts, a source's comments or strings) | `volec rewrite --text OLD NEW --word --case --dry-run --diff` (`--files GLOB`, `--comments`, `--strings`, `--no-sources`, `--exclude SPEC`, `--check ROOT`) |
 | sources to another extension, with the mentions of their paths | `volec refactor extension .vl .vl ROOT\|DIR\|--all --dry-run` (git mv; the build compared before and after) |
 | imports, unused, pub, unsafe | `volec fix` (`--only imports,unused,pub,unsafe`, `--dry-run`) |
@@ -136,14 +138,22 @@ Every edit is atomic: the edited program is checked first, and an edit
 that adds an error writes nothing and prints the errors, each tagged
 `[edited: PATH]` or `[in PATH]` (an item the edit did not change: change
 it in the same `edit apply`, or run the refactoring the `try:` line
-names). `--dry-run` prints the diff instead; `--no-check` writes anyway.
+names). `--dry-run` prints the diff instead; `--no-check` writes without
+checking (no check runs, nothing is listed: `volec check` after the last step).
 A change of several steps is one call, checked once at its end: `edit
 patch NAME --old A --new B --old C --new D` (`--in OTHER` before the
 pairs of another item: a table and its count const), `--pairs FILE`
 with `@@ NAME` or `@@ FILE` blocks (and `--old`/`--new` too), or `edit
 apply FILE`. An empty OLD inserts NEW above the line of a `FILE:LINE`
 target: comments above many lines are one pairs file, a block per
-`@@ FILE:LINE` (the lines as before the edit). A refused edit's
+`@@ FILE:LINE` (the lines as before the edit). Patches by position, as
+a check names them (0.30): `edit patch --at FILE:LINE[:COL] --old A
+--new B` (OLD on that line only; `--at` repeats), or a list, `edit
+patch --from LIST` (a line each, `FILE:LINE[:COL]<TAB>OLD<TAB>NEW`;
+`edit apply --at < LIST`): all placed before any is written, one
+check; `--keep-going` writes the ones that match. `edit replace|delete
+NAME --to LAST`: a run of adjacent items as one span; an impl block is
+the `FILE:LINE` of its header (0.30). A refused edit's
 `edit.breaks` line names its first error; a generated file (`//
 Generated by SCRIPT`) is refused, `edit.generated` (`--force`).
 
@@ -190,6 +200,9 @@ vole tree, `volec test FILTER` also runs each failure with
 Compiler errors, from `volec check` or a build whose output is not a
 terminal (`--diagnostics=short` anywhere, `--diagnostics=human` for the
 multi-line form):
+`volec check` folds an error repeated at six sites or more into one
+line, `... (41 sites in 12 files, the first here; --each lists them)`,
+and prints at most 50 lines of up to 1000 sites (0.30).
 
 ```text
 main.vl:4:20: error[type error] undefined variable 'totl' | help: did you mean 'total'?
@@ -252,3 +265,26 @@ tables), `--trace` (0.17: a failure prints its line and callers),
 `--emit-imports`, `-I DIR`, `--version`; `--emit-ir` and `--emit-mir`
 (the IR after the optimizer, after instruction selection) print to
 stdout, or to `-o FILE`. `volec guide TOPIC` for the language.
+
+## Seeing what the optimizer did
+
+`volec build --help` lists these (0.30); each prints on stderr.
+
+| you want | run |
+|---|---|
+| the IR a function ends as | `volec --emit-ir FILE.vl` (stdout; `--emit-mir`: after instruction selection) |
+| the IR after every pass, of one function | `--print-after-all=FN` (`--print-after-all`: every function's); `--verify-ir` names the pass that breaks the IR |
+| where the compile time goes | `--time-passes` (CPU time by phase); `--time-passes=instructions` (instructions retired: a loaded machine hardly moves them); `--time-passes=passes` (each optimizer pass too); `--time-passes=json` (one JSON object, the counts whole); `volec check --time-passes=instructions` (the front end's phases) |
+| two compilers on one input, by pass | `tools/perf-diff.sh A B FILE.vl` (`--check`, `-O0`, `-n RUNS`, `--inline`: the inlining decisions that differ) |
+| a worktree against a baseline: self-build -O2 and -O0, check, the compile-cost programs | `tools/perf-experiment.sh [-b BASELINE] [WORKTREE]` (`--passes`, `--bench`) |
+| the benchmarks' own instructions against a baseline | `bench/run.sh --instructions -p BASELINE` |
+| why a loop was not vectorized; what a call leaves of a Vec's header | `--vec-stats=FN` (a line per loop of FN, and `vec-headers: FN: known: writes ...` or `unknown: line N:` with the first instruction that made the summary unknown; `--vec-stats`: the counts) |
+| the machine code of a function at -O2 | `volec query asm NAME` |
+| what the inliner decided | `VOLE_INLINE_LOG=FILE volec --no-cache -j1 ...` (a line a decision: caller, callee, the rule); `tools/inline-log-diff.py A.log B.log` |
+| the checks left, the attributes inferred | `--print-checks[=FILTER]`, `--print-attrs`, `--print-effects`, `--stats=functions` |
+| one transform off, to compare | `--no-vectorize`, `--no-slp`, `--no-ifconv`, `--no-unroll-runtime`, `--no-egraph`, `--no-noalias` |
+
+The instruction counter is the system's: macOS's per-thread count,
+Linux's `perf_event_open` (a container may refuse it: `error
+[time.instructions]`; `--time-passes` then counts CPU time). A build
+that counts runs on one thread.

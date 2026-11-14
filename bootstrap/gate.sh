@@ -50,9 +50,16 @@
 #   --plan           (0.29) print the steps as they are scheduled and exit:
 #                    each with whether it is heavy (one at a time), the
 #                    slots it holds itself, and the steps it starts after
-#   --self-test      check the gate's own machinery (the lock, the stall
-#                    check, the steps of each mode, and, 0.29, what runs at
-#                    once: a release gate of stubbed steps) and exit
+#   --self-test [ROWS]  check the gate's own machinery (the lock, the
+#                    stall check, the steps of each mode, and, 0.29, what
+#                    runs at once: a release gate of stubbed steps; 0.30:
+#                    fuzz-sem runs every mode of the fuzzer) and exit;
+#                    ROWS (0.30, comma-separated) only those rows: modes,
+#                    at-once, lock, stale-lock, no-docker, lost-slot,
+#                    waiting, hung, fuzz-sem (`--self-test list` names
+#                    them). First it removes what failed self-tests left
+#                    (bootstrap/selftest-prune.sh: their directories in
+#                    $TMPDIR, a day old, and nothing else)
 #
 # Steps: chain; suite-O0, suite-O1, suite-O2; fuzz-plain, fuzz-loops,
 # fuzz-generics, fuzz-pressure, fuzz-calls, fuzz-lang06, fuzz-vector,
@@ -79,6 +86,9 @@
 # borrowck-twin (tools/borrowck-twin.sh, 0.27.1: every rust_b_ case's
 # verdict against rustc's, accept or reject, and its code; a divergence
 # only when the case names its class; skipped without rustc; --quick too);
+# stdtools (tests/stdtools.sh, 0.30: std's files in the tools' errors,
+# queries, edits and fixes, and `check --std`, in a copy of compiler/std;
+# also a suite of tests/run.sh; --quick too);
 # std-check (tests/std/check.sh, 0.27.2, borrowck.md Z7: every std body
 # type-checked and solved by the borrow checker, 0 errors; 0.27.2.1: with
 # suite-O0 in the gate, only the std cases that row did not pass are
@@ -196,6 +206,7 @@ LIST=0
 PLAN=0
 NO_WAIT=0
 SELF_TEST=0
+ST_ROWS=""
 
 die() {
     echo "gate: error: $*" >&2
@@ -229,7 +240,11 @@ while [ $# -gt 0 ]; do
         --list) LIST=1 ;;
         --plan) PLAN=1 ;;
         --no-wait) NO_WAIT=1 ;;
-        --self-test) SELF_TEST=1 ;;
+        --self-test)
+            SELF_TEST=1
+            # (0.30) its rows, when the next word is no option
+            case "${2:-}" in ''|-*) ;; *) ST_ROWS=$2; shift ;; esac ;;
+        --self-test=*) SELF_TEST=1; ST_ROWS=${1#--self-test=} ;;
         -h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
         *) die "unknown option '$1' (see --help)" ;;
     esac
@@ -284,7 +299,7 @@ esac
 
 FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-guard fuzz-seed fuzz-sem"
 ABI_STEPS="abi-plain abi-import abi-header"
-HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost unsafe-audit borrowck-twin std-check std-tests cachediff"
+HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost unsafe-audit borrowck-twin stdtools std-check std-tests cachediff"
 # (0.25) the chain's integrity, by --release (or --only): slow, and they
 # rebuild compilers rather than test one
 RELEASE_STEPS="chain-diverse chain-fresh"
@@ -301,7 +316,7 @@ OTHER_STEPS="valgrind $INSIDE_SMOKE_STEPS"
 [ "$X86" = 1 ] || LINUX_STEPS="linux-aarch64"
 case "$MODE" in
     quick)
-        STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch voltty-fuzz compile-cost unsafe-audit borrowck-twin std-tests cachediff"
+        STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch voltty-fuzz compile-cost unsafe-audit borrowck-twin stdtools std-tests cachediff"
         [ $LINUX -eq 1 ] && STEPS="$SMOKE_STEPS $STEPS" ;;
     *) STEPS="$HOST_STEPS"; [ $LINUX -eq 1 ] && STEPS="$STEPS $LINUX_STEPS" ;;
 esac
@@ -395,7 +410,7 @@ held_slots() { # <step>
             suite-*|stress-grow) hs=2 ;;
             cachediff|std-check) hs=4 ;;
             chain-diverse|chain-fresh) hs=$JOBS ;;
-            layout|debug|unsafe-audit|borrowck-twin|voltty-fuzz|compile-cost) hs=1 ;;
+            layout|debug|unsafe-audit|borrowck-twin|stdtools|voltty-fuzz|compile-cost) hs=1 ;;
         esac
     fi
     hs_max=$JOBS
@@ -436,14 +451,32 @@ fi
 # (0.25.2) The lock, the stall check and the steps of each mode, each
 # checked on gates of the self-test's steps (selftest-*, a few seconds)
 # with a lock and run directories of their own.
+# (0.30) --self-test ROWS: the rows by these names (ST_ALL), each a few
+# checks; `list` prints them.
+ST_ALL="modes at-once lock stale-lock no-docker lost-slot waiting hung fuzz-sem"
 self_test() {
+    if [ "$ST_ROWS" = list ]; then
+        printf '%s\n' $ST_ALL
+        exit 0
+    fi
+    for r in $(echo "$ST_ROWS" | tr ',' ' '); do
+        case " $ST_ALL " in *" $r "*) ;; *) die "--self-test: no row '$r' (rows: $ST_ALL)" ;; esac
+    done
+    # (whether row $1 is run: every row without ROWS)
+    st_on() { [ -z "$ST_ROWS" ] && return 0; case ",$ST_ROWS," in *",$1,"*) return 0 ;; esac; return 1; }
+    # (0.30) What failed self-tests left (they keep their directory for a
+    # look): bootstrap/selftest-prune.sh removes the ones a day old, and
+    # nothing else (its header says what it checks first).
+    sh "$ROOT/bootstrap/selftest-prune.sh" || exit 2
     st=$(mktemp -d "${TMPDIR:-/tmp}/vole-gate-selftest.XXXXXX") || exit 2
     trap 'rm -rf "$st"' EXIT
     st_failed=0
     st_row() { printf '  %-28s %s\n' "$1" "$2"; case "$2" in FAIL*) st_failed=1 ;; esac; }
     g() { VOLE_GATE_SELFTEST=1 VOLE_GATE_LOCK="$st/gate.lock" VOLE_GATE_RUNS="$st/runs" sh "$0" -c /bin/sh "$@"; }
-    echo "gate: self-test (in $st)"
+    echo "gate: self-test (in $st)${ST_ROWS:+, rows $ST_ROWS}"
+    mkdir "$st/bin"
     # The steps of each mode.
+    if st_on modes; then
     q=$(sh "$0" --quick --no-x86 --list | tr '\n' ' ')
     case " $q " in *" linux-smoke "*) st_row "quick has linux-smoke" pass ;; *) st_row "quick has linux-smoke" "FAIL: $q" ;; esac
     q=$(sh "$0" --quick --no-linux --list | tr '\n' ' ')
@@ -454,6 +487,7 @@ self_test() {
         *" linux-aarch64 "*) st_row "release: no linux-smoke" pass ;;
         *) st_row "release: no linux-smoke" "FAIL: no linux-aarch64: $q" ;;
     esac
+    fi
     # (0.29) What runs at once: a release gate whose steps are stubs
     # (stub_step), at -j 4 and at -j 1. From its events, in the order they
     # happened: never more slots taken than -j, never two heavy steps at
@@ -461,7 +495,7 @@ self_test() {
     # once and every slot given back; and at -j 4 it is still parallel.
     # (A short stall time: steps that wait for each other's slots fail
     # here in seconds.)
-    for j in 4 1; do
+    st_on at-once && for j in 4 1; do
         want=$(sh "$0" --release --no-linux -c /bin/sh --list | tr '\n' ' ')
         VOLE_GATE_STUB=$([ $j -eq 1 ] && echo 0.05 || echo 0.2) VOLE_GATE_STALL=30 VOLE_GATE_LOCK="$st/gate.lock" \
             VOLE_GATE_RUNS="$st/stub$j" sh "$0" -c /bin/sh --release --no-linux -j $j >"$st/stub$j.out" 2>&1
@@ -492,6 +526,7 @@ self_test() {
         esac
     done
     # A second gate waits for the first, saying whose it is, then runs.
+    if st_on lock; then
     g --only selftest-sleep >"$st/a.out" 2>&1 &
     first=$!
     i=0
@@ -512,7 +547,9 @@ self_test() {
     fi
     wait $first || st_row "the first gate" "FAIL: $(tail -3 "$st/a.out" | tr '\n' ' ')"
     [ ! -d "$st/gate.lock" ] && st_row "the lock is released" pass || st_row "the lock is released" "FAIL: $st/gate.lock is left"
+    fi
     # A dead holder's lock is taken over.
+    if st_on stale-lock; then
     sh -c 'exit 0' &
     dead=$!
     wait $dead
@@ -523,8 +560,10 @@ self_test() {
     else
         st_row "a dead holder's lock" "FAIL: $(head -3 "$st/stale.out" | tr '\n' ' ')"
     fi
+    rm -rf "$st/gate.lock"
+    fi
     # Without docker running, linux-smoke is a skip that says so.
-    mkdir "$st/bin"
+    if st_on no-docker; then
     printf '#!/bin/sh\necho "Cannot connect to the Docker daemon" >&2\nexit 1\n' >"$st/bin/docker"
     chmod +x "$st/bin/docker"
     if PATH="$st/bin:$PATH" g --only linux-smoke >"$st/nodocker.out" 2>&1 \
@@ -533,8 +572,11 @@ self_test() {
     else
         st_row "no docker: linux-smoke skips" "FAIL: $(grep 'linux-smoke ' "$st/nodocker.out" | tail -1)"
     fi
+    rm -f "$st/bin/docker"
+    fi
     # A slot lost by a killed job: the step waiting for it is stopped and
     # fails, and the gate ends.
+    if st_on lost-slot; then
     s0=$(date +%s)
     VOLE_GATE_STALL=4 g -j 1 --only selftest-leak,selftest-slow >"$st/leak.out" 2>&1
     rc=$?
@@ -544,9 +586,11 @@ self_test() {
     else
         st_row "a lost slot is reported" "FAIL (exit $rc): $(grep -E 'selftest|stalled' "$st/leak.out" | tr '\n' ' ')"
     fi
+    fi
     # (0.25.4) A step waiting for the one slot while another's job holds
     # it, busy, is waiting, not stalled (0.25.3's container gate stopped a
     # fuzz row so, "0 of 8 slots free (slots lost ...?)", none lost).
+    if st_on waiting; then
     VOLE_GATE_STALL=4 g -j 1 --only selftest-hog,selftest-wait >"$st/wait.out" 2>&1
     rc=$?
     if [ $rc -eq 0 ] && grep -q 'selftest-wait .*pass' "$st/wait.out"; then
@@ -554,9 +598,11 @@ self_test() {
     else
         st_row "a step waiting is not stopped" "FAIL (exit $rc): $(grep -E 'selftest|stalled' "$st/wait.out" | tr '\n' ' ')"
     fi
+    fi
     # A job that holds its slot and does nothing: its step is stopped (its
     # processes in its log), the job gives the slot back, and the step
     # waiting for it then runs and passes.
+    if st_on hung; then
     VOLE_GATE_STALL=4 g -j 1 --only selftest-hang,selftest-wait >"$st/hang.out" 2>&1
     rc=$?
     hl=$(sed -n 's/.*(log: \(.*selftest-hang.log\)).*/\1/p' "$st/hang.out" | head -1)
@@ -565,6 +611,35 @@ self_test() {
         st_row "a hung job's step is stopped" pass
     else
         st_row "a hung job's step is stopped" "FAIL (exit $rc): $(grep -E 'selftest|stalled' "$st/hang.out" | tr '\n' ' ')"
+    fi
+    fi
+    # (0.30) fuzz-sem runs the fuzzer once in each of its modes: the
+    # plain one and every flag its generator takes (the arguments of
+    # `Gen(` after the program's size, in tools/semfuzz/semfuzz.py), each
+    # with the row's count; a python3 of the self-test's records the
+    # calls. And each mode makes a program (`--print`: no compiler).
+    if st_on fuzz-sem; then
+    sf="$ROOT/tools/semfuzz/semfuzz.py"
+    modes=$(sed -n 's/.*Gen(a\.print, a\.known, a\.size, \(.*\))\.program().*/\1/p' "$sf" | head -1 \
+        | tr -d ' ' | tr ',' '\n' | sed 's/^a\./--/; s/_/-/g' | sort | tr '\n' ' ')
+    printf '#!/bin/sh\necho "$*" >>"%s/semfuzz.out"\n' "$st" >"$st/bin/python3"
+    chmod +x "$st/bin/python3"
+    PATH="$st/bin:$PATH" g --only fuzz-sem --fuzz 7 >"$st/fuzzsem.out" 2>&1
+    rc=$?
+    rm -f "$st/bin/python3"
+    got=$(awk '{ m = "plain"; for (i = 1; i <= NF; i++) if ($i ~ /^--/) m = $i; if ($0 !~ / -n 7 /) m = m "(not-n-7)"; print m }' \
+        "$st/semfuzz.out" 2>/dev/null | sort | tr '\n' ' ')
+    bad=""
+    for m in $modes; do
+        python3 "$sf" --print 3 "$m" 2>&1 | grep -q '^// expected:' || bad="$bad $m-makes-no-program"
+    done
+    python3 "$sf" --print 3 2>&1 | grep -q '^// expected:' || bad="$bad plain-makes-no-program"
+    want=$(printf '%s\n' plain $modes | sort | tr '\n' ' ')
+    if [ $rc -eq 0 ] && [ -n "$modes" ] && [ "$got" = "$want" ] && [ -z "$bad" ]; then
+        st_row "fuzz-sem: every mode" "pass ($(echo $want | wc -w | tr -d ' ') runs: ${want% })"
+    else
+        st_row "fuzz-sem: every mode" "FAIL (exit $rc): runs '${got% }', modes '${want% }'$bad"
+    fi
     fi
     if [ $st_failed -eq 0 ]; then echo "gate: self-test: ok"; else echo "gate: self-test: FAIL (outputs in $st)"; trap - EXIT; fi
     exit $st_failed
@@ -816,11 +891,14 @@ run_step() {
         # 0.25.2.1: and with --try-args (arguments that may return, `?`
         # or a match's arm, in calls whose result is `?`'d); 0.25.3: and
         # with --closure-params (closures taking a T by value); 0.29: the
-        # programs in the one language (`&T`, `&mut T`, by value)
+        # programs in the one language (`&T`, `&mut T`, by value); 0.30:
+        # and with --deref-assign (assignments through a Box, a guard, a
+        # type's DerefMut and a function's `&mut T`)
         fuzz-sem) python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" \
             && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --assign-calls \
             && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --try-args \
-            && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --closure-params ;;
+            && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --closure-params \
+            && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --deref-assign ;;
         fuzz-seed)
             seed=$(find_seed)
             if [ -z "$seed" ]; then
@@ -849,6 +927,9 @@ run_step() {
         incremental) sh "$ROOT/tests/incremental.sh" -c "$C" ;;
         # (0.25.3) the unsafe sites without justification, against the baseline
         unsafe-audit) sh "$ROOT/tests/unsafe_audit.sh" -c "$C" ;;
+        # (0.30) std inside the tools, in a copy of compiler/std (also a
+        # suite of tests/run.sh)
+        stdtools) sh "$ROOT/tests/stdtools.sh" -c "$C" ;;
         # (0.25.3) the tools' answers from their cache, every transcript
         # (0.29) as many transcripts at once as the slots the step holds
         cachediff)
@@ -1422,8 +1503,8 @@ note_of() {
     case "$1" in
         chain) awk '/^  head / { sub(/^  head +/, ""); print; exit }' "$l" ;;
         suite-*|smoke-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed%s\n", $2, $3, $4, ($5 > 0 ? ", " $5 " SKIPPED" : "") }' "$l" ;;
-        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*|unsafe-audit|borrowck-twin|std-check|std-tests|cachediff)
-            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh|unsafe-audit|borrowck-twin|std-check|std-tests|cachediff):' "$l" | tail -1 ;;
+        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*|unsafe-audit|borrowck-twin|stdtools|std-check|std-tests|cachediff)
+            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh|unsafe-audit|borrowck-twin|stdtools|std-check|std-tests|cachediff):' "$l" | tail -1 ;;
         voltty-fuzz) grep -E '^(pass|FAIL|skip) oracle' "$l" | tail -1 ;;
         compile-cost) awk '$2 ~ /^[0-9.]+$/ && $3 == "M" { printf "%s%s %s M %s", sep, $1, $2, $8; sep = ", " } END { print "" }' "$l" ;;
         # (no rows: it failed before the container's steps, e.g. docker)

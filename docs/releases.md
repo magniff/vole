@@ -89,8 +89,844 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.27.8 | `v0.27.8` | 0.27.7 | aarch64-macos | open integer locals one variable (a wrong-value fix); a unit-only enum's derives by its discriminant (rustc's order and hash; one compare); three data races of released compilers fixed; `&mut` to raw pointer reborrowed, fat raw pointer coercions |
 | 0.28.0 | `v0.28.0` | 0.27.8 | aarch64-macos | one language: the MVS edition, the translator, the own pass and the old std removed (compiler/std2 is compiler/std); no default arguments; an index is a `usize`; a panic is only `panic`, `#[terminates]`, `Hash::hash` `#[pure]`, the tools name `static`; six bugs of 0.27.8 fixed (an endless loop compiled away, a `&mut` field written through `&self`); the tools' cache bounded |
 | 0.29.0 | `v0.29.0` | 0.28.0 | aarch64-macos | the safety release: the compiler's unsafe sites 3281 to 316, each justified, none unneeded, no `static mut` (its tables are `Vec`s, the global ones a compilation context's), and unjustified unsafe an error for its source (`check --deny=unsafe`); `*const T` and `*mut T` two types, a slice without fields; `~x` refused; a map's hasher written (`FixedState` in the prelude); if-let temporaries by Rust 2024's rule; a generic call's temporary dropped (a leak) and three checker holes closed; `--edition` and the std2 name gone; the inliner's room per caller, std's block copies; the gate schedules itself, fuzz-sem back; the self-build dearer than 0.28.0's |
+| 0.30.0 | `v0.30.0` | 0.29.0 | aarch64-macos | the speed release: the self-build a sixth cheaper than 0.29.0's with every check kept (-O2 within 1% of 0.28.0's), iterator chains the loops written by hand, std's text by blocks, `sort` an introsort; `*p = v` through a raw pointer drops the old value, as in Rust (`ptr::write` does not), and through a `Box`, a guard or `DerefMut` too (a leak); two use-after-frees in safe code closed; a union field's borrow is `unsafe` (E0133), two indexes of a place may alias, a captured `FnMut` called must be `mut`; `use.redundant` a tools' warning; `println` one write a line; edits in batches, `check --std`, `refactor fold`; XFAIL 730 to 717, unsafe 316 to 299; a hello world's compile +31% |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.30.0
+
+The speed release, with the leaks, the holes and the debt that 0.29
+left. The compiler builds itself with about a sixth fewer instructions
+than 0.29.0 (-16.9% at -O2, -10.3% at -O0, its check -13.9%), every
+bounds check kept: the -O2 self-build is within about 1% of 0.28.0's
+again, where 0.29's checked tables had put it 22% above. A chain of
+iterator adapters is the loop written by hand, instruction for
+instruction; std validates, counts and walks text by blocks; `sort` is
+an introsort again; superpi, now a benchmark, computes a million digits
+with a quarter of the instructions. For a program: an assignment
+through a raw pointer drops the old value, as in Rust (`ptr::write` is
+the write that does not), and so does one through a `Box`, a guard or
+any `DerefMut`, which leaked; two use-after-frees in safe code are
+closed; borrowing a union's field needs `unsafe` (E0133); two indexes
+of one place may alias; a captured `FnMut` closure that is called must
+be `mut`; `Ordering` has Rust's discriminants; `println` writes a line
+in one call, so lines of threads do not mix. The redundant-import
+warning is the tools'. The tools take the suggestions of 0.29's
+diaries: edits in batches with one check, std inside the tools (`check
+--std`), `refactor fold`, a rewrite that refuses to recurse, and the
+test runners say what they will run before they run it. XFAIL 730 to
+717, with a census; the compiler's unsafe sites 316 to 299. A hello
+world compiles with 31% more instructions, the price of the one-write
+line ("Known regressions and limits"). Built and tested on aarch64-macos
+only; no Linux row ran. Programs written to break vole found bugs that
+0.30.0 still has, most of them since 0.28: three ways for safe code to
+reach freed memory, -O2 output that differs from -O0, and checks such as
+`--check-unsafe` and `#[no_panic]` that do not catch what they exist to
+catch ("Known issues"; 0.30.1 fixes them).
+
+#### What changes for a program
+
+Each of these is refused or behaves differently where 0.29.0 accepted
+it. The error's code and its fix:
+
+- **An assignment through a raw pointer drops the old value**, as in
+  Rust (the owner's decision: otherwise the leak invariant breaks).
+  `*p = v`, `(*p).f = v`, vole's `p.f = v` and `p.0 = v`, `(*p)[i] = v`
+  and `*p.add(i) = v` wrote over the old value without dropping it
+  (0.29 took every place under a raw pointer for memory that holds no
+  value); they drop it now, in the order every owned assignment has:
+  the right side, the place, the old value's drop, the write. So what
+  `p` points to must hold a value: the programmer's obligation inside
+  `unsafe`, as in Rust, and no error says so (a drop of uninitialized
+  memory). Memory that holds no value yet is written with `ptr::write`
+  (or `<*mut T>::write`, `ptr::copy`, `copy_nonoverlapping`,
+  `mem::swap`, `mem::replace`): these drop nothing. In std they are
+  made of `p[i] = v` of a raw pointer, the one assignment that drops
+  nothing, which only std::ptr may write (rule F30.3), and every write
+  of std into memory that holds no value (a Vec's spare capacity, an
+  arena's slot, a hash table's, a fresh `Box`, a thread's record)
+  goes through them. A census of every assignment through a raw pointer
+  in the compiler (36), the examples (2), std (39) and the tests (97)
+  found three whose type has a drop: two `(*m).v = Vec::new_in(..)` of
+  a test over `Vec`s that leaked, and one of std over a `None`, whose
+  drop runs nothing. *Cases:* `std_ptr_raw_assign_drops`,
+  `std_ptr_write_no_drop`, `std_ptr_raw_assign_forms` (the first two
+  agree with rustc).
+- **An assignment through a `Box`, a guard or `DerefMut` drops the old
+  value.** `*b = v` with b a `Box`, a `MutexGuard`, an
+  `RwLockWriteGuard` or any type with `DerefMut` is `*b.deref_mut() =
+  v`, and 0.29.0 left the old value undropped ("Bugs fixed"): a
+  program whose old value has a `Drop` now runs it there.
+- **A reference to a union's field is unsafe** (the owner's decision,
+  rustc's E0133). `&u.a`, `&mut u.a` and `&mut h.u.p.x` outside unsafe
+  code are `error[unsafe]`, "borrowing a field of a union is unsafe
+  (rustc E0133): `&raw const` or `&raw mut` takes its address without a
+  reference" (they were accepted since 0.9: taking an address reads
+  nothing, but the reference reads the union's bytes as the field's
+  type). Writing a field (`u.a = v`) and `&raw const u.a`, `&raw mut
+  u.a` stay safe, as in Rust. `volec fix --only unsafe` wraps the
+  borrow; the raw borrow is the way without unsafe. std's two sites,
+  `ManuallyDrop`'s `deref` and `deref_mut`, have their unsafe blocks
+  back with their comments; the compiler and the examples had none.
+  *Cases:* `err_unsafe_union_borrow` (rustc's positions; the borrowck
+  twin agrees), `unsafe_union_write`.
+- **Two indexes of one place may alias, constants too** (rule R7,
+  closed). `let p = &mut a[0]; let q = &mut a[1];` with both used, and
+  `&mut a[i]`, `&mut a[j]` with `i` and `j` holding distinct constants,
+  were taken as disjoint; they are `borrowck.mut_twice` (rustc E0499),
+  and `a[j] = v` while `&a[i]` lives is `borrowck.assign_borrowed`
+  (E0506). Split the slice first: `let (x, y) = a.split_at_mut(1);`.
+  *Cases:* `rust_b_err_const_index_disjoint`,
+  `rust_b_err_view_mut_const_index`, and `rust_b_err_index_mut_twice`
+  and `rust_b_err_index_assign_vs_shared`, XFAIL since 0.27.1, pass.
+- **A closure that calls a captured `FnMut` closure needs it `mut`**:
+  `let c = || n += 1; let mut d = || { c(); };` is
+  `borrowck.borrow_immutable`, "cannot borrow 'c' as mutable, as it is
+  not declared as mutable" (rustc E0596); write `let mut c`. Every
+  capture loan was taken as rustc's unique borrow, which needs no `let
+  mut`; that is only for a reference the closure writes through (`*r +=
+  1` of `r: &mut i64`), which stays accepted. *Cases:*
+  `rust_b_err_capture_call_fnmut`, `rust_b_ok_capture_unique_ref`. The
+  same call from a closure nested in a second one is still accepted
+  ("Known regressions and limits").
+- **Two use-after-frees are errors** ("Bugs fixed"): a closure's result
+  that borrows an adapter's item (`v.iter().copied().fold("", |a, x|
+  x)` and then `v` changed) is `borrowck.assign_borrowed` (E0506) or
+  `borrowck.conflict` (E0502) where `v` is changed; a fn item given for
+  `F: Fn(&T) -> R` that returns a borrow of its argument is
+  `borrowck.outlives` at the call (rustc refuses the fn item for the
+  bound first, E0308). The second is stricter than rustc for a fn item
+  whose result is `'static`: its erased type ties every argument's
+  region to the result's.
+- **The redundant-import warning is the tools'** (the owner's decision).
+  `use.redundant`, "redundant import 'Vec': the prelude gives it to
+  every module", with the help "remove it (`volec fix` removes every
+  redundant import)", is new: an import of the very item the prelude
+  gives every module (`use std::vec::Vec;`, `Gpa` in `use
+  std::alloc::{Allocator, Gpa};`). The name is used, so `use.unused`
+  never saw it, and `fix` removed none of them (0 of 340 files in 0.29).
+  `volec check`, the LSP and the tools report it; a build does not,
+  with `--deny-warnings` or without (276 of the suite's cases import a
+  std item by its path because the path is what they test). `volec
+  fix` and `fix --only redundant` remove them, a name of a brace list
+  too; `--only unused` and `query unused` are as they were.
+  *Transcript:* tests/refactor/redundant0300.
+- **`Ordering` has Rust's discriminants**: `#[repr(i8)]`, `Less = -1`,
+  `Equal = 0`, `Greater = 1`. `a.cmp(&b) as i64` printed 0, 1 or 2
+  where Rust prints -1, 0 or 1. *Cases:* `addr_of_temporary`,
+  `temporary_conditional` (XFAIL until now).
+- **`print` and `println` write a line in one call.** A `println("..{}..",
+  x)` wrote each piece of its text with its own `write(2)`, so lines
+  printed by several threads at once were cut and mixed (Rust's
+  `println` holds stdout's lock for the line). The text now goes through
+  `std::__rt::PrintOut`, a sink of 512 bytes on the stack: a line that
+  fits is one write, which POSIX does not split on a pipe up to
+  PIPE_BUF, and a longer one goes out as the bytes fill. std's `print`,
+  `println`, `eprint` and `eprintln` functions use the same sink. Each
+  print still ends with its write: nothing is held across calls, so a
+  prompt printed before a read shows. A program that counts its system
+  calls sees one a line. *Case:* `thread_print` (XFAIL since 0.28).
+  What it costs a compilation: "Known regressions and limits".
+- **`sort_unstable` is an introsort**, and its `_by` and `_by_key`
+  forms (quicksort around the median of three, insertion sort up to 24
+  elements, heapsort below 2 log2(n) levels; safe code, no
+  allocation): it was a heapsort since 0.28,
+  though its comment and bench/sort.c said introsort. Equal elements
+  come out in another order than 0.29.0's, which an unstable sort
+  allows. *Case:* `std_sort_introsort` (1071 inputs of seven shapes and
+  McIlroy's adversary, which drives the quicksort into the heapsort).
+- **Messages in the language's spelling.** About fifteen diagnostics and
+  help texts still used the removed edition's words; they say `&self`
+  and `&mut self` for a method's receivers, `static mut` for `static
+  var`, the `static` effect for `global`, `FnOnce` for a sink closure,
+  `move ||`, and the `Display`/`Debug` impl the help writes is `fn
+  fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result`. The
+  `explain` entries and the LSP's hovers with them. A script that
+  matched the old texts must change.
+- **The generated code differs where its meaning does not.** The scalar
+  pipeline's second round runs a pass only on a function changed since
+  that pass ran, and its passes are not exactly idempotent: of the
+  compiler's 6260 functions at -O2, 1720 differ in their IR (0.3% more
+  IR lines, the text 0.04% smaller; the benchmarks' geomean +0.03% by
+  instructions). A loop with a bounds check of a constant length of at
+  most 32 is neither vectorized nor unrolled at run time ("The
+  optimizer").
+
+#### The compiler's own speed
+
+docs/compile-speed.md has the profile of the -O2 self-build, the -O0
+build and `check`, by phase and by pass, before and after, with each
+change and its measurement.
+
+Against 0.29.0 (`tools/perf-experiment.sh` on the tree of the release's
+last merge: both compilers on that tree's source, 484 files, the
+fewest of three runs, a builds' row by the compiler's own counter of
+its phases, a load of 3.7 to 8.0):
+
+| workload | 0.29.0 | 0.30 | |
+|---|---:|---:|---:|
+| self-build -O2 | 125,359 M | 104,223 M | -16.9% |
+| self-build -O0 | 34,426 M | 30,869 M | -10.3% |
+| `check` of the compiler | 25,392.8 M | 21,866.1 M | -13.9% |
+| hello (built) | 153.0 M | 200.0 M | +30.7% |
+| std_heavy (built) | 1230.0 M | 1083.0 M | -12.0% |
+| regions (checked) | 1125.4 M | 1124.7 M | -0.1% |
+
+Each compiler on its own source, on one thread, the fewest of three
+runs on the idle machine after the gate: the -O2 self-build 126,387 M
+(7.03 s) to 110,503 M (6.52 s), -12.6%; -O0 33,364 M (1.72 s) to 30,745
+M (1.60 s), -7.8%; `check` 24,687 M (1.31 s) to 21,843 M (1.17 s),
+-11.5% (0.28.0: 103.6 G, 29.9 G and 21.3 G). Times, from the profile (the same binaries, a
+load of 1.9 to 2.8, the tree of the self-build work):
+the -O2 self-build 3.43-3.57 s to 3.01-3.11 s, -O0 1.71-1.74 s to
+1.53-1.68 s, `check` 1.50-1.58 s to 1.27-1.28 s.
+
+- **What a bounds check costs.** 0.29 made the compiler's tables
+  `Vec`s, indexed with checks. A scratch compiler whose lowering left
+  the index check out built the 0.29.0 tree in 105.9 G where the
+  checked one took 127.0 G: **21.0 G, 16.6% of the self-build**, spread
+  over every phase, and the whole of 0.29's regression. Of the 33,694
+  checks left at -O2, two thirds index with data (an operand read from
+  an instruction, a phi, a parameter), against a `Vec` behind the
+  context: nothing the function knows bounds it. Every fact looked at
+  (the same index against a header read again, a store to another Vec,
+  a call between, a length that never shrinks) would give about 2% at
+  most; the third Vec fact was tried again and cost 3.0%. The checks
+  stay, and the way back was the other costs.
+- **Walks that had nothing to do.** `resolve_all` returns when no value
+  was replaced since it last ran (`FnCtx.resolved_len`; 126.9 to 123.4
+  G); value numbering restores a dominator's available loads as one
+  block and `param_written` looks only at the instructions made since
+  (to 121.8 G); a fact's two operands are found once, with the marks
+  (`FnCtx.fact_ab`: the ranges 13.8 to 7.7 G, the build to 115.8 G);
+  sroa's map is not zeroed whole for every function, and a function with
+  no frame slot skips the slot walks (to 114.9 G); the scalar
+  pipeline's second round runs a pass only on a function changed since
+  (111.4 to 107.8 G; the one change that alters the code); `sweep`
+  passes primitives, `layout_order`'s stack has its room, dead code
+  marks in one walk (to 107.0 G); the dead functions are found with one
+  walk of the program (255 to 107 M, on the main thread); a function
+  with no loop skips the loop passes (106.8 to 106.2 G). Each wrote
+  the same object, byte for byte, but the second round.
+- **`check`**: borrowck's sets are zeroed as one block (25.5 to 25.0 G;
+  in a function of 8000 calls 2.84 to 2.16 G); a field's size and
+  alignment come from one layout, so `size_of::<T>()` no longer lays a
+  struct of structs out 4^depth times (24.9 to 23.0 G); the liveness
+  is transposed only for the locals a region reads (borrowck 8.41 to
+  7.79 G); the unused imports' `reached_through` walks lists made once
+  (22.4 to 22.2 G).
+- **The register allocator's change** ("The optimizer") took the
+  self-build 3.5% further (125.0 to 120.6 G on its branch), -O0 1.4%,
+  `check` 2.2%; the iterator work cost the self-build 2.3% against
+  its base (its exit counts and un-nesting 0.8 G, the functions the
+  inliner's floor lets grow the rest).
+- **The goal of a cold second** (the owner, 2026-11-12: a cold full
+  self-build under one second, a warm one instant) is not reached: a
+  cold -O2 self-build is about 3.0 s on 8 threads, and 58% of its wall
+  time is one thread (the front end 40%). docs/compile-speed.md
+  estimates each change it would take; the front end in parallel is
+  the largest (0.7 s of 1.2 s). The warm case is the cold front end: a
+  `check` after an edit of one function reads, checks and
+  borrow-checks every function again (1.61 s). Both are 0.31's ("What
+  comes next").
+
+#### Looser than Rust, and the XFAIL debt
+
+The P0 of the plan was every place where vole accepts what rustc
+rejects. Fixed: the two use-after-frees, the union field's borrow, the
+two indexes, the captured `FnMut` ("What changes for a program"), and
+`Ordering`'s values and the threads' lines (wrong output against
+Rust's). docs/xfail.md is the census of the 730 XFAIL cases the
+release began with, each case's vole and rustc verdicts joined (the
+two twins and `volec check`):
+
+| class | what | cases |
+|---|---|---:|
+| (a) | vole accepts what rustc rejects | 16 |
+| (b) | vole rejects what rustc accepts | 39 |
+| (c) | wrong code or output (no crash of the compiler among them) | 5 (+8 likely) |
+| (d) | a std item missing (mostly an old edition's name) | 32 |
+| (e) | an optimizer or IR expectation | 19 |
+| (f) | stale: passes now | 0 |
+| (g) | not a goal | 6 |
+| (h) | the case is wrong: 0.28's translation of an old case | 510 |
+| (v) | vole's own programs, which no twin covers | 90 |
+
+The 510 of (h) are the debt, and the compiler is not wrong in them:
+256 that both compilers reject under a directive naming the old
+edition's code (136 of them with a borrow check error first, a
+directive away from passing), 139 whose text is not Rust, 111 whose
+translation breaks a rule both enforce, 4 that expect the old output.
+The plan, in order of cases an hour, is in docs/xfail.md. Six cases
+expected the old output where vole's already was rustc's (the rustc
+twin's binary as the referee): their EXPECT lines are rustc's now.
+**XFAIL 730 to 717.** The borrowck twin: 469 cases, 427 agree, 8 named
+divergences, 0 mismatches (at the release's start: 462, 419, 10; R7
+closed); the rustc twin's usual set: 310 agree, 0 differ, 7 named (at
+the start: 308, 0, 9).
+What (a) still holds: "Known regressions and limits".
+
+#### std
+
+- **Text by blocks.** The deep investigation 0.28's notes promised,
+  each cause read off the machine code:
+  - `str::from_utf8` checks sixteen bytes a step after its ASCII
+    start, with the vector types' own operations (compares, selects:
+    NEON and SSE2 alike), not std::arch's table lookups, which would
+    have made every program read the intrinsics (a hello world 176 M
+    instructions instead of 154 M). The blocks say whether, the byte
+    loop finds where, so the `Utf8Error` is as before. Under sixteen
+    bytes a call costs 10 instructions more.
+  - `Chars::count` counts 224 bytes at a time by a loop the vectorizer
+    takes sixteen a step, with nothing that could panic, so it keeps no
+    effect; `Chars::next` returns an ASCII byte at once and decodes the
+    longer forms from the byte already read (`decode_wide`, out of
+    line). **New: `char::from_u32_bmp_lossy`**, one compare for what is
+    below the surrogates, for the sequences of two and three bytes.
+  - `ascii_printable_prefix_len` (width, the terminal's feed) takes
+    sixteen bytes a step; `lossy_next` tests the second byte in line;
+    a grapheme cluster of one ASCII byte is two tests, the rules a
+    function of their own.
+
+  Instructions a byte (16 MiB a kind, the fewest of 3; each figure as
+  last measured in the release, by the commit that worked on its
+  path), with the std of 0.27.8 and Rust where they were measured:
+
+  | | 0.29.0 | 0.30 | 0.27.8 | Rust |
+  |---|---:|---:|---:|---:|
+  | from_utf8, source / latin | 2.62 / 9.88 | 0.30 / 2.19 | 0.67 / 1.77 | 0.50 / 8.04 |
+  | from_utf8, cjk / emoji | 16.91 / 10.47 | 2.19 / 2.13 | 1.77 / 1.73 | 10.71 / 5.07 |
+  | `chars().count()` | 17.00 | 0.56 | | 0.48 |
+  | `for c in s.chars()`, source / mixed | 30.00 / 28.62 | 10.00 / 12.69 | | 8.0 / 7.3 |
+  | bench/std chars, source / mixed | 63.00 / 56.21 | 12.56 / 14.70 | | 8.5 / 7.8 |
+  | width, source / cjk | 13.57 / 41.01 | 2.92 / 33.02 | 2.63 / 32.00 | 12.00 / 14.31 |
+  | term_feed, source / cjk / emoji | 19.37 / 93.47 / 43.48 | 7.04 / 72.97 / 30.31 | 7.21 / 75.71 / 31.10 | 8.36 / 119.24 / 42.70 |
+  | graphemes, source / mixed / emoji | 58.00 / 92.02 / 66.77 | 28.00 / 75.71 / 44.07 | 15.77 / 68.99 / 34.85 | 230.2 / 150.6 / 187.9 |
+
+  from_utf8 on ASCII is about 9 times its 0.29.0 speed by time (12,653
+  to 111,848 MB/s at a load of 4.3: not evidence of more than the
+  order). *Cases:* `std_str_from_utf8_blocks` (1.18 M edge cases, the
+  whole `Utf8Error` against a plain loop), `std_str_chars_blocks`,
+  `std_unicode_blocks`; each has std's mutations that make it fail.
+- **`bench/std/hash_str` is about 10% cheaper** (1976 M at 0.29.0 to
+  1784 M): 0.29's 5% loss there is gone, by the register allocator's
+  change.
+- **`sort_unstable_by` is an introsort** ("What changes"): bench/sort
+  1190 M to 566 M instructions (cc -O2 304 M), iterchain's sort kernel
+  479 M to 178 M. `sift_down` takes the slice cut to the heap, so its
+  two child accesses need no check.
+- **`Ordering`** has Rust's discriminants; **`print`** and `println`
+  write a line in one call through `std::__rt::PrintOut`; std's
+  **`Chunks::add`**, an arena's refill, is `#[cold]`, so the bump path
+  is inlined where an arena allocates (bench/arena_trees 1169 M to
+  810 M).
+- **std's unsafe**: 910 sites, 0 unjustified, 0 unneeded, and the audit
+  now judges std's unneeded blocks too (0.29.0: 915, of which 22 were
+  listed unneeded and not judged). The 7 truly unneeded went (five
+  integer-to-pointer casts and ManuallyDrop's two borrows), and the two
+  borrows came back with the union rule.
+- **std's effects are watched**: `tools/std-effects-diff.sh [BASE]`
+  prints std's public functions whose effect sets changed against a
+  revision (`std::mem::replace unsafe -> diverge unsafe`), and the edit
+  hook runs it after a change to compiler/std that `check --std`
+  passes. Nothing differs for std as committed.
+
+#### The optimizer
+
+docs/optimizer.md, "0.30: against C" and "0.30: the compiler's own
+speed".
+
+- **A chain of std's iterator adapters is the loop written by hand.**
+  No optimization of the usual list was missing; a normal form was. The
+  loop passes were written against the index loop, and std writes every
+  loop as a slice iterator's `next` (a pointer and what is left,
+  counted down to `!= 0`), nested by inlining, a level a generic
+  instance. The constants of loops move to the entry block before the
+  loops are counted (`hoist_constants`: `n != 0` was no counted loop); a
+  loop counted down to `!= bound` gets a counter from 0, and every
+  other induction variable is start + c * step (`express_ivs`); the
+  loop of `filter`'s `find` that repeats its outer loop's test becomes
+  part of it (`unnest_loop`); a function that will be moved into its
+  only caller waits with its loop passes (`moved_into_caller`); `max`'s
+  `a < b || !(a > b)` is one comparison (`or_of_comparisons`); `rev`'s
+  checks go. Per kernel, chain against hand loop by instructions:
+  filter-map-sum, dot, enumerate, map-max with filter-count and take
+  are 1.000; collect and sort 0.57 (std's introsort against the
+  heapsort written out). bench/iterchain against bench/iterloop 1.728
+  to 0.97 by instructions; by time, in the bench row on the tree of the
+  release's second batch, **1.010**, under the limit of 1.05 the row
+  had failed since 0.28.0 (0.29.0: 2.057). The bench row on the final tree: 1.010. *Cases:* `opt_iter_chains`
+  (ten chains against their hand loops at every length from 0 to 40;
+  nested loops that must stay nested), `opt_vec_usize_lanes` (its
+  XFAIL gone).
+- **A short checked loop is left as it is**: a loop with a bounds
+  check of a constant length of at most 32 is neither vectorized nor
+  unrolled at run time (`short_by_checks`); bench/fannkuch took 49%
+  more instructions with such loops vectorized, once the constants
+  hoisted out of them let the passes see them.
+- **The ranges decide more.** A comparison of a value an `if` left (a
+  phi, a select) is decided when each of its values decides it the
+  same way (`decide_phi_arms`, `decide_arms`), and a difference tested
+  for zero is an inequality: the three checks of a safe `swap(i, j)`
+  go. A comparison of a value with any constant, in unsigned order or
+  `==`, is decided by the facts that compare the same value with
+  constants (`unsigned_bound`): `if b.len() >= 3 { b[1] + b[2] }` has
+  no check. *Cases:* `opt_range_arms`, `opt_range_unsigned_consts`.
+- **A loop with a call keeps its values in their registers.** A value
+  given up in the middle of a loop (at a call) was in its register at
+  the header and on the stack at the back edge, and the edge's moves
+  brought it back every round, on the path that calls nothing too.
+  Three rules of the register allocator: a value gives up its register
+  from the start of the largest loop around that does not read it; a
+  value a loop reads that lives across a call in it takes a
+  callee-saved register for its whole life from one nothing reads
+  meanwhile; a value that waits across such a loop goes to the stack
+  at once. Found in bench/std chars, whose loop over a str's chars ran
+  23 instructions a char inlined and 10 in a function of its own. The
+  self-build -3.5%, bench/std chars on source 18.57 to 12.56 a byte,
+  the benchmarks' geomean -0.47% (wordcount -6.60%). Checked with
+  `--verify-regalloc` over the compiler for four targets. *Cases:*
+  `opt_regalloc_loop_call` (13 instructions with three loads to 7 with
+  none), `opt_regalloc_loop_nest`.
+- **The inliner's floor.** What 0.29's per-caller room lost, by the
+  inline log: a function may grow to 80 instructions whatever its room
+  (INLINE_FLOOR: `hash_of -> FoldHasher.write_num` in wordcount, 145 ms
+  to 117 ms). A rule that moved an only call when caller and callee are
+  together at most 250 instructions took interp and fannkuch below
+  0.28.0's instructions, but not their times (fannkuch 121 ms with it,
+  115 ms without and at 0.29.0), and cost the self-build 0.9%: it is
+  out.
+- **The benchmarks by instructions** (`bench/run.sh --instructions -p`
+  0.29.0's compiler): the geomean -11.9% over 26 programs at the
+  iterator work's merge, -12.6% after the text work's; contracts is the
+  one above, +3.4% (its kernels in a larger `main`, three reloads a
+  round). The bench row by time, on the tree of the second batch (a
+  load of 2.5 at its start): the geomean against `cc -O2` 1.001 at -O2,
+  where 0.29.0 gave 1.141 in the same run, 2.204 at -O1, 12.719 at -O0.
+  The bench row on the final tree, alone on the idle machine: 1.005 at
+  -O2 (0.29.0 in the same run: 1.137), 2.190 at -O1, 12.679 at -O0
+  (0.29.0's gate: 1.131, 2.275, 13.131).
+- **What cc has and the optimizer lacks**, ranked by what the
+  benchmarks would gain, is in docs/optimizer.md: std's algorithms
+  against their C twins (the heap's sift, hashing a byte slice at
+  once), the register allocator's splitting around a loop and the
+  three-move swap of phis on the back edge, the back end's loop idioms
+  (post-increment loads, counting down to zero), relations between
+  values in the ranges (`i + 4 <= n` gives `i <= n - 4`), constants of
+  a `const` array, aliasing from the types of references, cold code
+  out of line. None of it is done ("What comes next").
+- **Tools for it**: `--print-after-all=FN` (the IR of one function after
+  every pass); `--vec-stats=FN` names what made a function's Vec-header
+  summary unknown (``vec-headers: both: unknown: line 44: a call of
+  `pid`, whose summary is unknown``), writing the same object;
+  `--time-passes=json`, and `volec check --time-passes=instructions`
+  for the front end's phases; `volec query asm NAME...`, a function's
+  code at -O2 as `-S` writes it; tools/perf-diff.sh (two compilers on
+  one input, phase by phase and pass by pass), tools/perf-experiment.sh
+  (a compiler against a baseline: the self-builds, check and the
+  compile-cost programs), `bench/run.sh --instructions -p BASELINE`.
+  `volec build --help` lists them, and the guide's tools topic has
+  `seeing-what-the-optimizer-did`.
+
+#### Tools: what 0.29's diaries asked for
+
+0.29's work kept a diary of what each tool cost; the first batch of
+0.30 took its suggestions. What is left of them is in
+docs/tool-gaps-030.md.
+
+- **Edits in batches, one check.** `edit patch --at FILE:LINE[:COL]
+  --old A --new B` (repeatable), `edit patch --from LIST` and `edit
+  apply --at`: patches by the position a check prints, all placed in
+  the text as it was before any is written, one check, one journal
+  entry; one that does not match is named (`patch.no-match`,
+  `patch.ambiguous`) and nothing is written (`--keep-going` writes the
+  others). `--no-check` runs no check now (it still ran one to print
+  the new errors). `edit replace|delete NAME --to LAST`: a run of
+  adjacent items as one span; an impl block by its header's line (it
+  took the type). *Transcripts:* tests/refactor/patchat0300,
+  span0300.
+- **`edit justify FILE:LINE --unsafe TEXT --safety TEXT`** (or `--from
+  LIST`) writes a site's two comments above it, asking the audit's own
+  reading whether the site is then justified; `query unsafe --source`
+  lists each site's lines, its JSON has `end_line`. *Transcript:*
+  tests/refactor/justify0300.
+- **Checks that read well.** A plain `volec check` folds an error
+  repeated at six sites or more into one line, `(41 sites in 12 files,
+  the first here; --each lists them)`, records up to 1000 and prints at
+  most 50 lines; `fix` reads every error, not the first 50 (260 missing
+  imports were refused); the check of an edit compares errors without
+  their positions, so an error a `use` line moved is not new; a
+  did-you-mean of a field unknown at several sites (removed, not
+  misspelt) is no exact fix; a checker that dies names the functions
+  it was checking, outermost first. *Transcripts:*
+  tests/refactor/checkgroup0300, fixall0300, moved0300, fieldgone0300,
+  checkdie0300.
+- **rewrite**: holes for a field's or a method's name (`$e.$f`,
+  `$e.$m($a...)`) and a literal's text (`c"$s"`); parentheses no longer
+  needed go, and redundant ones in the code still match; a replacement
+  that lands inside the function it calls is refused,
+  `rewrite.recursive` (three 0.29 conversions built compilers that
+  recursed forever), with `--not-in` and `--force`; `--text --regex`
+  has groups, alternatives and `\1` (so `(` is a group now; a
+  parenthesis as a byte is `\(`); `--from FILE`, many rewrites checked
+  once; `--at-errors TEXT`, the sites of the current errors; `--where
+  '$x: field S.f'`; `--in std` reads and writes std's files; a program
+  with errors is typed whole. A pattern's `&mut $e` no longer matches
+  `&e`, nor `&raw const e`. *Transcripts:* tests/refactor/rewrite030,
+  textrx030, rewriteerr030, rewritestd030.
+- **refactor**: `refactor fold FN --as true|false` makes each call of a
+  predicate that is now one value the constant and folds the code
+  around it, listing what that leaves unused (folding one by hand took
+  40 minutes in 0.29); `refactor signature --batch FILE`, a file of
+  type changes in one load, one check, one edit (185 changes were 185
+  runs); `refactor field --type f,g,h T` with `--allocator X` and
+  `--rewrite PAT REPL`, naming the literals that keep their old value.
+  *Transcripts:* tests/refactor/fold030, sigbatch030, field030.
+- **std inside the tools.** An error in std prints at std's file
+  (`compiler/std/mem.vl:22:9`, not `<std>:1853:9`); `query grep|refs
+  --in compiler/std/FILE.vl` and `--std`; `query items` of a std file;
+  `edit patch compiler/std/FILE.vl` (as text, then `sh
+  compiler/std/embed.sh`); `fix --suggested` of an error in std's own
+  code. **`volec check --std [ROOT]`** checks every generic function of
+  std by its opaque instance, so an effect its `#[effects(..)]` lacks
+  or an unsafe operation outside `unsafe` is an error at std's file
+  even where no program instantiates it (about 4 s; the edit hook runs
+  it after a std edit). `query effects --templates` lists functions by
+  their templates, so two listings compare. *Suite:*
+  tests/stdtools.sh.
+- **Fixed in the tools**: a program checked while std was edited was
+  kept in the tools' cache, and every query warned of the old error
+  until the program's own files changed; `edit apply ../x.vl` (a blocks
+  file outside the program) took the file for the root and edited it;
+  `query unsafe` listed 22 justified blocks of std's generic functions
+  as unneeded.
+- **Hooks**: the query-first hook no longer echoes a blocked line's
+  here-document, and in a worktree with no compiler yet its `try:`
+  lines run the main checkout's tools build with the worktree as root;
+  the check hook says less (after a `--no-check` step one line; a
+  suggestion only when the edit made an error that has one; nothing
+  repeated). AGENTS.md is half its size (16.2 KB to 8.2 KB) with 0.30's
+  forms.
+
+#### Bugs fixed that 0.29.0 has
+
+1. **An assignment through a call's reference did not drop the old
+   value**, a leak: `*b = v` through a `Box`, a `MutexGuard`, an
+   `RwLockWriteGuard` or a type's own `DerefMut`, and every assignment
+   to a place under a reference a call returns: `*f(&mut x) = v`,
+   `f(&mut s).t = v`, `*v.last_mut().unwrap() = x`,
+   `*m.get_mut(&k).unwrap() = x`, `a[i] = v` through `IndexMut`, a
+   field or an index through a `Box` or a guard. The places builder
+   dropped the old value only for places made of names, fields, `*` and
+   indexes. superpi found it (its table grew by `mem::replace` because
+   `*table = ..` through the write guard leaked); in the compiler itself
+   four assignments leaked so (a function text's relocations and
+   `rtids` in the code cache, a task's text put back at the join, a
+   task context's code cache state). The fuzzer never made such an
+   assignment; its new mode does, and 0.29.0 fails 48 of its first 60
+   programs. *Cases:* `std_box_assign_deref`, `std_sync_guard_assign`,
+   `own_assign_deref_user`, `own_assign_call_place`,
+   `std_assign_deref_flow` (each agrees with rustc).
+2. **An assignment through a raw pointer did not drop the old value**
+   ("What changes for a program").
+3. **A use after free in safe code through an adapter's item.**
+   `v.iter().copied().fold("", |a, x| x)` was accepted while `v`'s
+   strings were changed under the result. In fold's instance for
+   `Copied<I>` the closure's `Self::Item` is `T`, an impl parameter only
+   `I`'s bound names (`impl<'a, T, I: Iterator<Item = &'a T>>`); the
+   bound's ties were made after the closure's requirements were tied,
+   so the closure's `x: 'result` was dropped. For `Map<I, F>`, whose
+   item comes from `F: FnMut(I::Item) -> B` alone, the requirement now
+   makes B's region where the bound names it. *Cases:*
+   `rust_b_err_adapter_item_copied`, `_map`, `_user` (E0506; the twin
+   agrees), `sem_views_h_h_iter_fold` (its XFAIL gone).
+4. **A use after free in safe code through a fn item.** `fn apply<T, R,
+   F: Fn(&T) -> R>(x: &T, f: F) -> R { f(x) }` called as `apply(&v,
+   sl)` with `fn sl(d: &Vec<i64, Gpa>) -> &[i64]` returned a view of `v`
+   after `v` was dropped: the flow from `x` to the result through the
+   fn value was exempted as a flow between an instance's substitutions.
+   *Cases:* `rust_b_err_fn_item_bound_result`,
+   `rust_b_ok_fn_item_bound_result`, `sem_poly_g06_generic_fnparam_call`
+   (its XFAIL gone).
+5. **Lines printed by several threads were cut and mixed** (since 0.28's
+   std). *Case:* `thread_print`.
+6. **`Ordering as i64` gave 0, 1 and 2**, not Rust's -1, 0 and 1.
+7. **Three borrows rustc refuses were accepted**: a reference to a
+   union's field outside unsafe (0.29.0's notes said so), two indexes
+   of one array with constant indexes, a captured `FnMut` called
+   through a binding that is not `mut` ("What changes for a program").
+8. **`sort_unstable_by` was a heapsort**, nearly twice as dear as the
+   introsort its comment named.
+
+#### Tests and tooling
+
+- **The runners say what they will run.** tests/run.sh prints its plan
+  first (how many cases, which suites, the `-j`), takes options before
+  filters only (an option after a filter was a filter: `NAME -O 2 -j 2`
+  ran every case with `2` in its name and passed; it is an error that
+  gives the command right), has `--cases-only`, and prints a line as
+  each suite ends. The query and refactor transcript suites take names
+  (`tests/run.sh refactor:NAME query:=NAME`), `-j`, `-l` and `--grep
+  TEXT`, and print as they go (in 0.29 a change waited 14 to 28 minutes
+  for the few transcripts it touched, without a line). Selecting
+  nothing is an error, not a pass.
+- **`tests/run.sh --bless NAME`** rewrites the positions of a case's
+  ERROR directives that moved, once every directive's text is still in
+  the output in order; nothing else is blessed. `tests/book/run.sh -u`
+  rewrites the book's output blocks that differ. EXPECT, STDERR and the
+  perf suite's wanted loops are read, not blessed: a change to them must
+  be looked at. An unordered CHECK or ASM group (FileCheck's DAG form)
+  is proposed in docs/tool-gaps-030.md, not built: `arch_a64_dot`
+  failed this release on an order alone.
+- **tests/affected.sh `--narrow`** plans the changed tests, the rules'
+  own items, the smoke set and the cases that name a changed function
+  or type (at most 300, and it says it is a sample); without it, a
+  changed std item adds the transcripts and chapters that print it;
+  `--path FILE` plans as if FILE had changed; the plan's commands are
+  checked when the plan is made.
+- **A case with its own `--check-alloc` fails on a leak**, whatever its
+  name (only `std_*` cases did: a leaking `own_` case passed). The 212
+  such cases: 142 pass, 70 xfail, none leaks.
+- **The gate**: `gate.sh --self-test ROWS` runs some of its rows, and
+  the self-test first removes the directories failed self-tests left
+  (bootstrap/selftest-prune.sh: 247 after 0.29); a self-test row checks
+  that fuzz-sem runs once per mode of its generator. **fuzz-sem has a
+  fifth run, `--deref-assign`**: assignments through a `Box`, a guard,
+  a type's `DerefMut`, a function's `&mut T` and a raw pointer, the
+  model's right side, drop and write; rustc agrees with the model on
+  the programs checked against it (60, and 200 with raw pointers).
+  **`stdtools`** is a new row, and a suite of tests/run.sh (`-n
+  stdtools`).
+- **Faster suites, the same checks**: fmt about 666 s to 46 s (a
+  program none of whose files the round trip changed is not compiled
+  twice), hooks 166 s to 77 s, stdpos 127 s to 43 s,
+  tests/threads_writes.sh 55 s to 21 s, the refactor round trip 201
+  compiler runs to 84. (Measured under a load of 4 to 9.)
+- **bench**: `pi100k` and `pi1m` are examples/algorithms/superpi at a
+  hundred thousand and a million digits on one thread, a real program
+  of NEON kernels, checked slices, `Vec` allocation and u64
+  arithmetic; there is no C twin, so they are in the instructions'
+  mean and not in the ratios to C. The tables' rows come from one list;
+  `bench/run.sh --smoke` builds and runs each program once.
+- **superpi is four times cheaper at a million digits**: 50.3 G
+  instructions to 11.7 G (789 ms to 135 ms with all cores, the
+  program's own time; 509 ms on one), the program's own work in
+  sixteen measured steps: the twiddles stored stage by stage, no
+  bit-reversal pass, one table of roots per prime for the whole run,
+  four butterflies a step in 128-bit NEON and two stages a pass, values
+  kept unreduced, Montgomery constants on entry and exit, Garner's
+  reconstruction without a division, leaves of 16 terms in machine
+  words, the digits written once, and the cores shared from one count
+  of idle threads (`--threads N`). The compiler's part of it is small:
+  0.29.0's compiler builds the new source to run in 484 ms, 0.30's in
+  482 ms (the bench row). Its findings for the compiler are the
+  optimizer's list above.
+- The guide's embed prints the core guide's size against its budget
+  (10,239 of 10,240 bytes); `volec guide testing` says how the suite is
+  run now.
+- The suite, in the release gate: 6556 passed at each of -O0, -O1 and
+  -O2, 717 xfail, 0 failed, 1 skipped (no spirv-val) (0.29.0: 6385
+  passed, 731 xfail).
+
+#### Known regressions and limits
+
+- **The `hello` compile row costs about 35% more instructions than
+  before the println change**: 148 M to 200 M against the tree before
+  it, 153 M to 200 M (+30.7%) against 0.29.0. Every program that prints
+  instantiates `std::__rt::PrintOut::write_str`, whose copy loop the
+  loop passes, value numbering and the inliner then work on
+  (tools/perf-diff.sh by phase and pass). It is the cost of keeping
+  lines printed by different threads from mixing, within the row's
+  limit of 1.5x; it is kept for 0.30, and making it cheap is 0.31's.
+- **The optimizer's findings are not fixed**: the list of what cc has
+  ("The optimizer"); superpi's (the two checks of `vld1q_u32(v, i)` in
+  a loop stepping by 4 stay, 14 instructions a round where 7 would do,
+  so the arch guide's "Range analysis removes the check in counted
+  loops" is not true of it; `% PRIMES[0]` of a `const` array is a
+  division; a field of a `&T` reloaded across stores through a `&mut
+  [u32]`; integer spills and a three-move swap in the radix-4 loop;
+  `vget_low_u32` a register copy); the heap's sift (bench/heap 3159 M
+  against cc's 1091 M), wordcount's slice hashing a byte a call (2284
+  M against 877 M), contracts +3.4%. 0.31.
+- **interp and fannkuch take more instructions than by 0.28.0's
+  compiler** (1685 M and 1366 M at the iterator work's merge, against
+  1534 M and 1298 M), and run in the time they did: the rule that took
+  them below was left out.
+- **std's text is not everywhere as fast as the old std's**: graphemes
+  (28.0, 75.7 and 44.1 instructions a byte against 0.27.8's 15.8, 69.0
+  and 34.9; the loop's length tested four times a cluster, and reloads
+  across the call of the rules: the optimizer's and the register
+  allocator's), from_utf8 on text that is not ASCII (2.2 against 1.8),
+  width on cjk (33.0 against 32.0); bench/std chars takes 12.6 and
+  14.7 instructions a byte where Rust's takes 8.5 and 7.8.
+  A program that calls from_utf8 compiles its blocks (std_heavy +3%).
+- **No cold second**: a cold -O2 self-build about 3.0 s, -O0 about 1.55
+  s, `check` about 1.27 s, on a machine of 4 performance and 6
+  efficiency cores; the front end runs on one thread and nothing of it
+  is kept between runs. The bounds checks are a sixth of the
+  self-build, and no fact the optimizer could learn removes more than
+  about 2% of it. 0.29.0's notes put an incremental front end in 0.30;
+  it is not done. 0.31.
+- **Looser than Rust, still** (class (a) of docs/xfail.md): a partly
+  assigned binding read (E0381, `rust_b_err_mv_assign_part_uninit`), a
+  move out of a static (E0507, `rust_b_err_mv_out_of_static`), a
+  constant shift that overflows (rustc's deny lint, `sem_core_shift`),
+  an `FnMut` closure called from a closure nested in another (E0596,
+  `sem_poly_th03_direct_closure_in_scope`), an undeclared lifetime
+  (E0261, `err_017_lifetime_quote`), a malformed loop label, `a < b <
+  c` (`alloc_gpa`). `#[derive(Clone, Copy)]` on a generic struct with
+  an owning field is refused at its first instance (`S<Gpa>`, E0204),
+  not at the definition as by rustc: sound, but later.
+- **Stricter than Rust**: `map(..).filter(..).fold(..)` is refused by a
+  borrow check error inside std's `fold` (in 0.29.0 too); a fn item
+  whose result is `'static` given for an `Fn` bound; `#[derive(Clone,
+  Copy)]` on a union; a union pattern must name every field; `&mut fn`
+  is no `FnOnce`; closures capture the whole variable, not the place
+  the body uses; the named divergences R3 and R8 (docs/design/
+  borrowck.md).
+- **717 XFAIL cases**, 510 of them wrong tests from 0.28's translation
+  (docs/xfail.md has the plan).
+- **`IntVec` and `HMap` are still `Copy` headers over raw arrays** (172
+  and 376 references): 0.29.0's notes put their conversion in 0.30, and
+  it is not done.
+- **A justification is false**: `env_ptr`'s SAFETY says the compiler
+  never changes its environment ("no setenv, no putenv"), and
+  `base::env_set` calls `setenv` (from `diag::ok_line_setup`). The
+  review of 0.29's weak justifications took eleven functions' `getenv`
+  to copies and four other comments right; the rest pass the rule,
+  which asks for the comments, not for their truth.
+- **Carried, not done**: an index that is the value of a `match` is
+  still widened (`a[match x { _ => k_u8 }]` passes), and `a[r]` with
+  `r: &usize` is read through; printing is `io static panic` and std is
+  exempt from the `tls`, `thread`, `sync` check; a loop over
+  `s.chars()` is `diverge` in a declared list; a closure parameter
+  `|&&x|` is not parsed; the fat raw pointers `*const [T]` and `*mut
+  [T]` are one type, an `if` of a `*mut T` and a `*const T` takes the
+  first branch's type, std's Objective-C bindings keep `*mut u8`;
+  `volec check --changed` skips tests/; "rust edition" is in some 250
+  comment lines of the compiler, and `--syntax=0.20` is accepted and
+  ignored.
+- **The tools' open list** is docs/tool-gaps-030.md (by cost: `volec
+  batch` reads a quoted word that starts with `<` as stdin, `query grep`
+  on a file that is not vole answers `0 hits`, `check --std` misses a
+  public function of a gated module, a std item cannot be edited by
+  name, `query refs` lists a write through a table's element as a read,
+  `batch` saves nothing for whole-program queries, and more). Also left:
+  `edit justify --narrow`, a fix accepted when its only new error is a
+  missing import with one candidate, a panic of std's that names no
+  item.
+- **Not tested on Linux in this release.** Hosts: aarch64-macos.
+
+#### Known issues (fixed in 0.30.1 unless noted)
+
+Found by a red team, programs written to make vole fail, while the release gate ran: none of them is new in 0.30 except where said, and each is a suite case from 0.30.1 on (`tests/run/rt_*.vl`, XFAIL until it is fixed). Each entry names the oldest release that shows it.
+
+**Safe code that breaks memory:**
+- An impl method's lifetimes are not compared with the trait's. An impl that returns `&'a str` where the trait says `&'static str` is accepted, and a caller through the trait reads freed memory. Since 0.28.0.
+- A callee's `T: 'static` bound is not required of a caller's type parameter, so a thread can read a String after it is dropped. Since 0.28.0.
+- A format argument that names a place is not a borrow, and neither is the left operand of a comparison, so a later argument can free it (`println("{} {:?}", s, drop(s))` is accepted). Since 0.28.0.
+- std slices a str at an index the caller gave without checking the char boundary (`str::split_at`, `String::remove`), and std's sealed traits Pattern, Step and SliceIndex accept a program's impls, which std's code trusts. Both give invalid UTF-8 from safe code. Since 0.28.0.
+- A str literal may hold a byte that is not UTF-8. Since 0.27.8 at least.
+
+**Checks that never fire:**
+- `--check-unsafe` does not see memory from std's allocator (every Vec, String and Box), only blocks from C's malloc. Use it together with `--check-alloc`, which does. Since 0.28.0.
+- `#[no_panic]` accepts a `/` or `%` that panics on a zero divisor, and an index into an array inside a loop whose range bound is 2^63 or more. Since 0.27.0.
+- `--trace` prints nothing when a recursion overflows the stack. Seen in 0.30.0.
+
+**-O2 output that differs from -O0:**
+- A call whose division or remainder panics on zero is deleted, or two such calls are merged, when the result is unused or repeated. Since 0.25.0 at least.
+- An `extern` declared under C's name `malloc` but linked to another symbol has its calls removed. An `extern` named `memcpy` or `fmod` with a `#[link_name]` takes over the compiler's own calls of that C function. Since 0.28.0 (the memcpy form since 0.30.0).
+- A C function from std's table (memset, strlen, ...) declared with integer parameters is taken to read no memory, so its calls are deleted or folded. Since 0.28.0.
+- A `ref mut` binding of a counted while loop's variable is not seen as a write, so a loop that never ends is taken to end, and -O2 deletes its call. Since 0.28.0.
+
+- For x86-64 at -O0, a stack store seen in an earlier function can be forwarded into a later function's argument load. A slice iterator over an empty Vec then crashes. arm64, and -O2 on either target, are right. Since 0.28.0 at least.
+
+**The code cache:**
+- At -O2, a warm build can differ in bytes from a cold one when the number of calls to a function changes between builds: a loop is vectorized in one and not the other. The code is right in every case seen. `VOLE_CACHE=off` gives the cold build. New in 0.30.0.
+
+**Calls into C:**
+- On arm64 macOS, a float-only C struct aligned to 16 or 32 and passed on the stack is put at another offset than clang's, in both directions, at every level. Since 0.28.0 at least.
+
+**Other meanings than Rust's:**
+- An integer literal that Rust types as i64 from a later use is i32 in vole, and it is widened only after the arithmetic. Since 0.28.0.
+- `Trait::method(&x)` takes Self from the argument with its references stripped, so another impl runs. Since 0.28.0.
+- A generic impl's methods are not checked against the trait's signatures. Since 0.28.0.
+- In a tuple, struct literal or variant, an operand that moves a place is read after the operands to its right. Rust reads left to right. Since 0.28.0.
+
+**std and formatting** (fixed in 0.30.2):
+- `{:.*}` and the `w$`/`1$`/`name$` widths and precisions are accepted and ignored.
+- `{:x?}` and `{:X?}` print decimal.
+- Debug writes private-use, unassigned and noncharacter code points raw.
+- `Range::nth` walks every element.
+- A user type named like std's type parameter (`struct K<X>` as a BTreeMap key) is refused.
+
+**Tools and messages** (fixed in 0.30.2):
+- `volec rewrite` drops the comments inside a site it rewrites, and `refactor signature --rename-param` and `extract-function` miss a parameter's uses in format holes.
+- The compiler crashes, with no message, on an expression chain of about 8000 operators, and when an error quotes a str literal holding a byte that is not UTF-8.
+- Checking a match costs about the cube of its arms: 2000 arms take about 30 s.
+- String literal patterns, and a char match over both ranges of scalar values, are refused.
+- A type nested 34 deep is reported as not implementing a trait it implements.
+- The help for `..base` suggests MVS's `var`.
+- The trait checker: a projection deeper than 32 is accepted without being checked; an impl's where-clause on a type that is not a parameter does not take part in choosing the impl; a nested projection whose parameters are named like structs unifies with anything. These are 0.31's.
+
+#### What comes next
+
+- **0.31 is the compiler-performance release**: a cold -O0 self-build
+  and a cold `check` under 1 s, a cold -O2 self-build about 1.5 s, and a
+  suite of the same programs written in C and in vole, compared with
+  clang for the speed and the size of the code. It takes the
+  optimizer's findings above and the parallel front end
+  (docs/compile-speed.md, "The goal: one second cold"), both planned
+  for this release and moved there, and the `hello` row.
+- **0.30.1** fixes the known issues above that let a wrong program
+  through (memory errors from safe code, -O2 against -O0, checks that
+  never fire); **0.30.2** is an adversarial review of the compiler and
+  std, tests written to abuse them, and a harder gate.
+- **0.32** is the type checker's release, hardened by programs computed
+  in types (examples/type-level/); **0.33** contracts v2 and static
+  proofs.
+
+#### Numbers
+
+- The self-build and the compiler's own check against 0.29.0, the same
+  source: -O2 125,359 M to 104,223 M (-16.9%), -O0 34,426 M to 30,869 M
+  (-10.3%), check 25,392.8 M to 21,866.1 M (-13.9%) ("The compiler's
+  own speed"). Each compiler on its own source, one thread,
+  idle machine: -O2 126,387 M to 110,503 M (-12.6%), -O0 33,364 M to
+  30,745 M (-7.8%), check 24,687 M to 21,843 M (-11.5%).
+- Compile cost against v0.29.0, in instructions: hello 228.1 M 1.30x, std
+  1172.3 M 0.89x (the std row is back: 0.29.0 builds its program), check
+  22,015.8 M 0.86x, regions 1131.7 M 1.00x (0.29.0 against 0.28.0: hello
+  173.8 M 1.00x, check 24,814.5 M 0.97x, regions 1130.9 M 0.93x, std
+  skipped). A gate run on
+  the tree of the second batch gave hello 0.97x, std 0.89x, check 0.86x,
+  regions 1.00x, before the println change.
+- The compiler's binary: 12,153,624 bytes (0.29.0: 11,832,056).
+- bench (`gate.sh --only bench`, idle machine, time against `cc -O2` =
+  1, geomean): 1.005 at -O2, 2.190 at -O1, 12.679 at -O0, iterchain
+  1.010 times iterloop, the check passed (0.29.0: 1.131, 2.275, 13.131,
+  iterchain 2.057 times iterloop). On the tree of
+  the second batch: 1.001, 2.204, 12.719 and 1.010.
+- Unsafe sites in compiler/src: 316 to 299, 0 unjustified, 0 unneeded
+  (`sh tests/unsafe_audit.sh`); by class ffi 205 to 191, raw-pointer 82
+  to 79, other 18, alloc 11; by module the tools 140 to 124, the back
+  end 20 to 19, the rest as they were. std: 915 to 910, 0 unjustified,
+  0 unneeded, now judged. The unsafe-audit row on the final tree: the
+  same, 299 and 910.
+- XFAIL: 730 to 717 (`grep -rhE "^ *// XFAIL" tests | wc -l`).
+- The suite: 6556 passed at each of -O0, -O1 and -O2, 717 XFAIL (0.29.0:
+  6385 and 731).
+- `git diff --shortstat v0.29.0 v0.30.0`: 312 files, 25,049 insertions,
+  4,217 deletions (0.29.0's against 0.28.0: 4450 files, 134,135
+  insertions, 128,267 deletions). compiler/src: 476 files and 257,258 lines in
+  0.29.0; 492 files and 265,889 lines at the tag.
+- Found by the gate and fixed before the tag: chain-diverse's -O0
+  compiler, which checks overflow as it runs, stopped with "attempt to
+  add with overflow" in middle/lsr.vl's affine forms (strength
+  reduction) on tests/run/sem_core_rf_induction_wrap.vl at -O2, for every
+  target; the -O2 compiler wrapped, as the forms mean (arithmetic modulo
+  2^64). They are written wrapping_* now. The -O2 compiler is the same
+  bytes as before the fix, and chain-diverse passed on the fixed tree.
 
 ### What's new in 0.29.0
 
@@ -6662,6 +7498,7 @@ $ bootstrap/gate.sh --quick --no-wait  # fail at once if another gate runs, rath
 $ bootstrap/gate.sh --release --no-linux -j 4   # the release's macOS steps within four slots (0.29)
 $ bootstrap/gate.sh --release -j 4 --plan       # how they are scheduled: heavy or not, the slots each holds
 $ bootstrap/gate.sh --self-test        # the gate's own machinery: the lock, the stall check, the modes' steps, what runs at once
+$ bootstrap/gate.sh --self-test lock,hung   # (0.30) some of its rows (`--self-test list` names them)
 $ bootstrap/gate.sh --with-x86         # with x86_64 (off by default since 0.15)
 $ bootstrap/gate.sh --only 'fuzz-*,objcheck'   # some steps (--list shows them)
 $ bootstrap/gate.sh --release --bench  # the gate, then the benchmarks alone
@@ -6971,7 +7808,7 @@ Nothing else is trusted: no binary built before, no cache.
 | `compiler-memcheck` | the same set on macOS, two ways. With the compiler built `--check-alloc`, a use after free or double free of Gpa memory stops it. Under Guard Malloc, the same for the memory it takes from malloc itself. The objects must be the plain compiler's | every gate but `--quick` |
 | `stress-grow` | with every table growth moving and poisoning the old block, the self-compile is the same and the suite passes | every gate but `--quick` |
 | `fuzz-seed` | random programs give the same output from the seed, the oracle written in Rust, as from HEAD | every gate |
-| `fuzz-sem` | random programs over owned values (moves, borrows, drops and their order, temporaries, `?`, closures) print what `tools/semfuzz/semfuzz.py`'s model of the ownership rules says, drop every value once and leak nothing, at -O0, -O1 and -O2 with `--check-alloc`; four runs: plain, `--assign-calls`, `--try-args`, `--closure-params`. The model and the generator are themselves checked against rustc with `--rustc` (not in the gate). What it found and is not fixed: `tools/semfuzz/findings/` | every gate |
+| `fuzz-sem` | random programs over owned values (moves, borrows, drops and their order, temporaries, `?`, closures) print what `tools/semfuzz/semfuzz.py`'s model of the ownership rules says, drop every value once and leak nothing, at -O0, -O1 and -O2 with `--check-alloc`; five runs: plain, `--assign-calls`, `--try-args`, `--closure-params`, `--deref-assign` (0.30: assignments through a Box, a guard, a type's DerefMut and a function's `&mut T`); `gate.sh --self-test fuzz-sem` checks that the row runs one per mode of the generator and that each mode makes a program. The model and the generator are themselves checked against rustc with `--rustc` (not in the gate). What it found and is not fixed: `tools/semfuzz/findings/` | every gate |
 
 **chain-fresh's record.** A release adds its line when it is tagged, with
 `bootstrap/chain-fresh.sh --record`. The first record (0.25) was written

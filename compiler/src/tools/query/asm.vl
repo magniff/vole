@@ -1,0 +1,186 @@
+// `volec query asm NAME...` (0.30): the machine code of a function of the
+// program at -O2, as the compiler writes it for `-S`: the program is built
+// by this compiler run again (`volec -O2 -S ROOT -o /dev/stdout`), and the
+// blocks of the functions NAME names are printed, each from its label to
+// the next function's. No disassembler is needed: the text is the code
+// generator's own, the instructions the object holds.
+//
+// A NAME is a path or its end, as the code's symbols have it: `add`,
+// `Vec::push`, `std::fmt::Formatter::pad` (a symbol is `_vole.` and the
+// path with `.` for `::`; an instance has its type arguments after it,
+// `.G...`, and each instance is a block). A function inlined into all its
+// callers has no code of its own: `query.no-match`, which says so.
+
+use crate::base::{STDOUT, buf_byte, buf_bytes, buf_copy, buf_int, buf_new, buf_str, buf_write_fd};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::tools::ctx::Tcx;
+use crate::tools::proc::{exec_words, run_capture};
+use crate::tools::query::c_slice;
+use crate::tools::query::diagnostics::{diag, try_query};
+
+// At most this many blocks of one NAME are printed (--all: every one).
+const ASM_BLOCKS: i64 = 4;
+
+// The end of the line starting at i.
+fn line_end(t: &[u8], i: i64) -> i64 {
+    let mut e = i;
+    while e < t.len() as i64 && t[e as usize] != b'\n' {
+        e += 1;
+    }
+    e
+}
+
+// Whether the line t[i..e) is a function's label: `NAME:` at the line's
+// start, NAME a symbol (not a local label `L12:`, `.L12:`).
+fn is_fn_label(t: &[u8], i: i64, e: i64) -> bool {
+    e - i >= 2 && t[(e - 1) as usize] == b':' && t[i as usize] != b' ' && t[i as usize] != b'\t'
+        && t[i as usize] != b'L' && t[i as usize] != b'.'
+        && (i..e - 1).all(|k| t[k as usize] != b' ')
+}
+
+// The path of symbol s: without `_vole.`, `vole.` or a leading `_`.
+fn symbol_path(s: &[u8]) -> &[u8] {
+    if s.starts_with(b"_vole.") {
+        return &s[6..];
+    }
+    if s.starts_with(b"vole.") {
+        return &s[5..];
+    }
+    if s.starts_with(b"_") {
+        return &s[1..];
+    }
+    s
+}
+
+// Whether the function of symbol path p is the one `name` names (`::`
+// written `.`): name is p's whole path or its end by whole components,
+// before an instance's type arguments (`.G...`) or a numbered copy
+// (`.n1`).
+fn names(p: &[u8], name: &[u8]) -> bool {
+    let n = name.len() as i64;
+    let mut pos: i64 = 0;
+    while pos + n <= p.len() as i64 {
+        let end = pos + n;
+        if (pos == 0 || p[(pos - 1) as usize] == b'.') && &p[pos as usize..end as usize] == name {
+            let rest = &p[end as usize..];
+            if rest.len() == 0 || rest.starts_with(b".G")
+                || rest.len() >= 3 && rest[0] == b'.' && rest[1] == b'n' && rest[2] >= b'0'
+                && rest[2] <= b'9' {
+                return true;
+            }
+        }
+        pos += 1;
+    }
+    false
+}
+
+// `query asm NAME...` of the program whose root is `root`: the exit status.
+pub fn run_asm(root: *const u8, args: &[i64], tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    let text = buf_new();
+    let argv = exec_words(
+        &[pcx.prog as i64, c"-O2" as i64, c"-S" as i64, root as i64, c"-o" as i64,
+            c"/dev/stdout" as i64]);
+    let status = run_capture(argv.as_slice(), text);
+    if status != 0 {
+        // (the build's errors, as it printed them)
+        buf_write_fd(text, STDOUT);
+        let d = diag(c"error", c"query.asm-build", tcx);
+        buf_str(d, c"the program does not build at -O2: no code to show\n");
+        return 1;
+    }
+    let t = buf_copy(text);
+    // each function's block: where it starts (its `.p2align` line when
+    // one is right above the label), its label's line
+    let mut starts: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut labels: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut i: i64 = 0;
+    let mut prev: i64 = -1;
+    while i < t.len() as i64 {
+        let e = line_end(&t, i);
+        if is_fn_label(&t, i, e) {
+            let above = prev >= 0 && t[prev as usize..].starts_with(b".p2align");
+            starts.push(if above { prev } else { i });
+            labels.push(i);
+        }
+        if e > i {
+            prev = i;
+        }
+        i = e + 1;
+    }
+    let out = buf_new();
+    let mut status: i64 = 0;
+    for a in 0..args.len() as i64 {
+        let given = c_slice(args[a as usize] as *mut u8);
+        // (`::` as the symbols write it)
+        let mut name: Vec<u8, Comp> = Vec::new_in(Comp {});
+        let mut k: usize = 0;
+        while k < given.len() {
+            if k + 1 < given.len() && given[k] == b':' && given[k + 1] == b':' {
+                name.push(b'.');
+                k += 2;
+            } else {
+                name.push(given[k]);
+                k += 1;
+            }
+        }
+        let wanted = if name.starts_with(b"crate.") { &name[6..] } else { &name[..] };
+        let mut shown: i64 = 0;
+        let mut found: i64 = 0;
+        for f in 0..labels.len() as i64 {
+            let l = labels[f as usize];
+            let e = line_end(&t, l);
+            if !names(symbol_path(&t[l as usize..(e - 1) as usize]), wanted) {
+                continue;
+            }
+            found += 1;
+            if shown >= ASM_BLOCKS && !tcx.opt_all {
+                continue;
+            }
+            shown += 1;
+            // to the next function's start, or the section's end (a line
+            // `.section`, the data after the code)
+            let mut end = if f + 1 < labels.len() as i64 { starts[(f + 1) as usize] }
+                else { t.len() as i64 };
+            let mut j = e + 1;
+            while j < end {
+                let je = line_end(&t, j);
+                if t[j as usize..].starts_with(b".section") || t[j as usize..].starts_with(b".data")
+                    || t[j as usize..].starts_with(b".text") {
+                    end = j;
+                    break;
+                }
+                j = je + 1;
+            }
+            // (without the blank lines at its end)
+            while end > l && (t[(end - 1) as usize] == b'\n' && end - 2 >= l
+                && t[(end - 2) as usize] == b'\n') {
+                end -= 1;
+            }
+            buf_bytes(out, &t[l as usize..end as usize]);
+            if end > l && t[(end - 1) as usize] != b'\n' {
+                buf_byte(out, b'\n');
+            }
+        }
+        if found == 0 {
+            status = 1;
+            let d = diag(c"error", c"query.no-match", tcx);
+            buf_str(d, c"no function '");
+            buf_bytes(d, &given);
+            buf_str(d, c"' in the program's code at -O2 (");
+            buf_int(d, labels.len() as i64);
+            buf_str(d, c" functions): one inlined into all its callers, or that nothing reaches, has no code of its own\n");
+            try_query(c"def", &given, tcx, pcx);
+        } else if shown < found {
+            let d = diag(c"note", c"query.truncated", tcx);
+            buf_int(d, found);
+            buf_str(d, c" functions are named '");
+            buf_bytes(d, &given);
+            buf_str(d, c"' (instances, or the same end of a path); the first ");
+            buf_int(d, shown);
+            buf_str(d, c" are shown: --all, or more of the path\n");
+        }
+    }
+    buf_write_fd(out, STDOUT);
+    status
+}

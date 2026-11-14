@@ -4,20 +4,21 @@
 
 use crate::base::{
     _setjmp, add_source, buf_append, buf_at, buf_byte, buf_bytes, buf_copy, buf_len, buf_new,
-    buf_str, buf_truncate, get_src, intern_buf,
+    buf_str, buf_truncate, get_src, intern_buf, sym_text,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{errors_forget, errors_mark, recover_enter, recover_leave};
-use crate::front::ast::{NodeKind, keep_parsed};
-use crate::front::lexer::lex_range;
+use crate::front::ast::{NODE_RAW_BORROW, NODE_REF_MUT, NodeKind, keep_parsed};
+use crate::front::lexer::{Tok, lex_range};
 use crate::front::parser::parse_fragment;
 use crate::front::types::buf_type;
 use crate::tools::ctx::Tcx;
 use crate::tools::query::c_slice;
 use crate::tools::query::defs::bytes_eq;
 use crate::tools::query::diagnostics::diag;
-use crate::tools::query::positions::is_space;
+use crate::tools::query::positions::{is_space, token_at};
+use crate::tools::refactor_shape::field::struct_node_of;
 use crate::tools::rewrite::parsed::{
     binding_level, pa, pb, pc, pchild, pcount, pd, pend, pflags, pg, ph, pk, pop, pstart,
     same_tokens,
@@ -40,6 +41,316 @@ pub fn hole_named(name: &[u8], rest: bool, tcx: &Tcx<Comp>) -> i64 {
     -1
 }
 
+// (0.30) The hole whose identifier is symbol sym (the name of a field or
+// of a method written `$f`), or -1.
+pub fn hole_of_sym(sym: i64, tcx: &Tcx<Comp>) -> i64 {
+    for h in 0..tcx.h_sym.len() {
+        if tcx.h_sym[h] == sym && tcx.h_rest[h] == 0 {
+            return h as i64;
+        }
+    }
+    -1
+}
+
+// (0.30) The hole whose identifier is `text`, or -1.
+fn hole_of_text(text: &[u8], tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    for h in 0..tcx.h_sym.len() {
+        if tcx.h_rest[h] == 0 && bytes_eq(sym_text(tcx.h_sym[h], pcx), text) {
+            return h as i64;
+        }
+    }
+    -1
+}
+
+// (0.30) Whether SRC[s..e) is an expression in parentheses of its own,
+// `(a + b)`: not a tuple, not `()`.
+pub fn in_parens(s: i64, e: i64, pcx: &Ctx<Comp>) -> bool {
+    if e - s < 3 || get_src()[s as usize] != b'(' || get_src()[(e - 1) as usize] != b')' {
+        return false;
+    }
+    let mut i = token_at(s, pcx);
+    let mut depth: i64 = 0;
+    let mut seen: i64 = 0;
+    while i < pcx.toks.len() as i64 && pcx.toks[i as usize].start < e {
+        let t = pcx.toks[i as usize].kind;
+        seen += 1;
+        if t == Tok::LParen || t == Tok::LBracket || t == Tok::LBrace {
+            depth += 1;
+        } else if t == Tok::RParen || t == Tok::RBracket || t == Tok::RBrace {
+            depth -= 1;
+            if depth == 0 {
+                return pcx.toks[i as usize].start == e - 1 && seen > 2;
+            }
+        } else if t == Tok::Comma && depth == 1 {
+            return false;
+        }
+        i += 1;
+    }
+    false
+}
+
+// (0.30) SRC[s..e) without the parentheses around it, all of them:
+// `((x))` is `x`.
+pub fn unparen(s: &mut i64, e: &mut i64, pcx: &Ctx<Comp>) {
+    while in_parens(*s, *e, pcx) {
+        *s += 1;
+        *e -= 1;
+        while *s < *e && is_space(get_src()[*s as usize]) {
+            *s += 1;
+        }
+        while *e > *s && is_space(get_src()[(*e - 1) as usize]) {
+            *e -= 1;
+        }
+    }
+}
+
+// (0.30) Whether SRC[a0..a1) and SRC[b0..b1) have the same tokens, the
+// parentheses around either aside: `(0)` is `0`.
+fn same_inner(a0: i64, a1: i64, b0: i64, b1: i64, pcx: &Ctx<Comp>) -> bool {
+    let mut a = a0;
+    let mut ae = a1;
+    let mut b = b0;
+    let mut be = b1;
+    unparen(&mut a, &mut ae, pcx);
+    unparen(&mut b, &mut be, pcx);
+    same_tokens(a, ae, b, be, pcx)
+}
+
+// (0.30) Whether the code `text` has a `{` outside its parentheses and
+// brackets: code that, without parentheses around it, an `if` or a
+// `match` would read as its block.
+pub fn open_brace(text: &[u8]) -> bool {
+    let mut depth: i64 = 0;
+    for i in 0..text.len() {
+        let c = text[i];
+        if c == b'(' || c == b'[' {
+            depth += 1;
+        } else if c == b')' || c == b']' {
+            depth -= 1;
+        } else if c == b'{' && depth <= 0 {
+            return true;
+        }
+    }
+    false
+}
+
+// (0.30) Whether an expression of kind k stands as it is where a postfix
+// expression is wanted (before `.f`, `[i]`, `?`), whatever is inside it.
+pub fn is_postfix(k: NodeKind) -> bool {
+    k == NodeKind::Ident || k == NodeKind::Path || k == NodeKind::Call
+        || k == NodeKind::MethodCall || k == NodeKind::Index || k == NodeKind::FieldAccess
+        || k == NodeKind::TupleField
+}
+
+// (0.30) Whether an expression of kind k whose text is `text`
+// needs no parentheses of its own in a place that wants level `slot`
+// (parsed.vl's levels): any expression where every one stands (0: an
+// argument, an index, an initializer), a postfix expression anywhere but
+// as a call's callee (98: `(s.f)(x)` is not `s.f(x)`). Parentheses a
+// reader may want (`(a * b) + c`) are not judged: they stay.
+pub fn parens_free(k: NodeKind, slot: i64, text: &[u8]) -> bool {
+    !open_brace(text) && (slot == 0 || (slot != 98 && is_postfix(k)))
+}
+
+// (0.30) The text of string literal n (`"..."`, with a prefix or none:
+// `c"..."`, `b"..."`), between its quotes: its start and end, or false
+// when n is no such literal.
+fn literal_text(n: i64, from: &mut i64, to: &mut i64, pcx: &Ctx<Comp>) -> bool {
+    let mut s = pstart(n, pcx);
+    let mut e = pend(n, pcx);
+    unparen(&mut s, &mut e, pcx);
+    let mut q = s;
+    while q < e && q < s + 2 && get_src()[q as usize] != b'"' {
+        if !is_name_byte(get_src()[q as usize]) {
+            return false;
+        }
+        q += 1;
+    }
+    if q + 1 >= e || get_src()[q as usize] != b'"' || get_src()[(e - 1) as usize] != b'"' {
+        return false;
+    }
+    *from = q + 1;
+    *to = e - 1;
+    true
+}
+
+// (0.30) The hole pattern node p is but for its node: the name of a field
+// or of a method (`$e.$f`, `$e.$m($a)`), the text of a string literal
+// (`c"$s"`); -1 when it has none.
+pub fn part_hole(p: i64, tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    if p <= 0 {
+        return -1;
+    }
+    let k = pk(p, pcx);
+    if k == NodeKind::FieldAccess || k == NodeKind::MethodCall {
+        return hole_of_sym(pb(p, pcx), tcx);
+    }
+    if k != NodeKind::Str && k != NodeKind::CStr {
+        return -1;
+    }
+    let mut a: i64 = 0;
+    let mut b: i64 = 0;
+    if !literal_text(p, &mut a, &mut b, pcx) {
+        return -1;
+    }
+    let h = hole_of_text(&get_src()[a as usize..b as usize], tcx, pcx);
+    if h >= 0 && tcx.h_part[h as usize] == 2 { h } else { -1 }
+}
+
+// (0.30) Hole h matches the text SRC[s..e): the name of a field or of a
+// method, the text of a string literal (a repeated hole: the same text).
+fn bind_text(h: i64, s: i64, e: i64, tcx: &mut Tcx<Comp>) -> bool {
+    let text = &get_src()[s as usize..e as usize];
+    if tcx.b_node[h as usize] != -1 {
+        return tcx.b_node[h as usize] != -3
+            && bytes_eq(
+                &get_src()[
+                    tcx.pattern_b_start[h as usize] as usize..tcx.b_end[h as usize] as usize],
+                text);
+    }
+    if tcx.h_re[h as usize] >= 0 && !re_search(&buf_copy(tcx.h_re[h as usize]), text) {
+        return false;
+    }
+    tcx.b_node[h as usize] = -2;
+    tcx.pattern_b_start[h as usize] = s;
+    tcx.b_end[h as usize] = e;
+    true
+}
+
+// (0.30) The name of the field or the method of node n (a FieldAccess, a
+// MethodCall), as written: its start (its end: the name's length on).
+fn member_start(n: i64, pcx: &Ctx<Comp>) -> i64 {
+    let mut i = pend(pa(n, pcx), pcx);
+    let end = pend(n, pcx);
+    while i < end && get_src()[i as usize] != b'.' {
+        i += 1;
+    }
+    i += 1;
+    while i < end && is_space(get_src()[i as usize]) {
+        i += 1;
+    }
+    i
+}
+
+// (0.30) A hole of the pattern (its nodes from `first` on, its text
+// SRC[from..to)) written where none can stand, or -1: a hole is an
+// expression, a type, a `let`'s or a loop's binding, the name of a field
+// or a method, the text of a string literal.
+pub fn stray_hole(first: i64, from: i64, to: i64, tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    let mut i = token_at(from, pcx);
+    while i < pcx.toks.len() as i64 && pcx.toks[i as usize].start < to {
+        let t = pcx.toks[i as usize];
+        i += 1;
+        if t.kind != Tok::Ident {
+            continue;
+        }
+        let h = hole_of_text(&get_src()[t.start as usize..t.end as usize], tcx, pcx);
+        if h < 0 {
+            continue;
+        }
+        let mut covered = false;
+        for n in first..pcx.parsed_nodes.len() as i64 {
+            if pstart(n, pcx) > t.start || pend(n, pcx) < t.end || pstart(n, pcx) < from {
+                continue;
+            }
+            if hole_of(n, tcx, pcx) == h {
+                covered = true;
+            }
+            let k = pk(n, pcx);
+            if (k == NodeKind::FieldAccess || k == NodeKind::MethodCall)
+                && hole_of_sym(pb(n, pcx), tcx) == h && member_start(n, pcx) == t.start {
+                covered = true;
+            }
+        }
+        if !covered {
+            return h;
+        }
+    }
+    -1
+}
+
+// (0.30) The replacement's holes that are no nodes of it (R_PARTS): the
+// name after a `.`, the text in a string literal whose hole the pattern
+// has as one (`b"$s\0"`).
+pub fn note_parts(tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) {
+    let mut i = token_at(tcx.pattern_r_start, pcx);
+    while i < pcx.toks.len() as i64 && pcx.toks[i as usize].start < tcx.pattern_r_end {
+        let t = pcx.toks[i as usize];
+        i += 1;
+        if t.kind == Tok::Ident {
+            let h = hole_of_text(&get_src()[t.start as usize..t.end as usize], tcx, pcx);
+            let mut node = false;
+            for k in 0..tcx.r_hole_span.len() {
+                let at = tcx.r_hole_span[k];
+                node = node || (pstart(at, pcx) <= t.start && t.end <= pend(at, pcx));
+            }
+            if h >= 0 && !node {
+                tcx.r_parts.push(t.start);
+                tcx.r_parts.push(t.end);
+                tcx.r_parts.push(h);
+                tcx.r_kept[h as usize] = 1;
+            }
+            continue;
+        }
+        if t.end - t.start < 2 || get_src()[(t.end - 1) as usize] != b'"' {
+            continue;
+        }
+        let prefix = "__vole_hole_".as_bytes();
+        let mut a = t.start;
+        while a + (prefix.len() as i64) < t.end {
+            if !bytes_eq(&get_src()[a as usize..a as usize + prefix.len()], prefix) {
+                a += 1;
+                continue;
+            }
+            let mut b = a + prefix.len() as i64;
+            while b < t.end && is_name_byte(get_src()[b as usize]) {
+                b += 1;
+            }
+            let h = hole_of_text(&get_src()[a as usize..b as usize], tcx, pcx);
+            if h >= 0 && tcx.h_part[h as usize] == 2 {
+                tcx.r_parts.push(a);
+                tcx.r_parts.push(b);
+                tcx.r_parts.push(h);
+                tcx.r_kept[h as usize] = 1;
+            }
+            a = b;
+        }
+    }
+}
+
+// The holes of the pattern just parsed (its nodes from `first` on, its
+// node `root`), into PAT_HOLES: its hole nodes and (0.30) the nodes whose
+// name or text is a hole. False after the diagnostic of a hole written
+// where none can stand.
+pub fn note_pattern_holes(first: i64, root: i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
+    let from = pstart(root, pcx);
+    let to = pend(root, pcx);
+    for n in first..pcx.parsed_nodes.len() as i64 {
+        if pstart(n, pcx) < from || pend(n, pcx) > to {
+            continue;
+        }
+        if hole_of(n, tcx, pcx) >= 0 {
+            tcx.pat_holes.push(n);
+            continue;
+        }
+        let h = part_hole(n, tcx, pcx);
+        if h >= 0 {
+            if tcx.h_part[h as usize] == 0 {
+                tcx.h_part[h as usize] = 1;
+            }
+            tcx.pat_holes.push(n);
+        }
+    }
+    let stray = stray_hole(first, from, to, tcx, pcx);
+    if stray >= 0 {
+        let d = diag(c"error", c"rewrite.pattern", tcx);
+        buf_append(d, tcx.h_name[stray as usize]);
+        buf_str(d, c" stands where no hole can: a hole is an expression, a type, a binding (`let $x`, `for $x in`), the name of a field or a method (`$e.$f`, `$e.$m()`), the text of a string literal (`c\"$s\"`)\n");
+        return false;
+    }
+    true
+}
+
 // Writes `text` into buffer `out` with each hole an identifier; the
 // pattern's holes are added (`add`), the replacement's must be the
 // pattern's. False after the diagnostic.
@@ -48,7 +359,74 @@ pub fn holes_to_idents(text: *mut u8, out: i64, add: bool, tcx: &mut Tcx<Comp>, 
     let mut i: i64 = 0;
     while i < s.len() as i64 {
         let c = s[i as usize];
-        if c == b'"' || c == b'\'' {
+        if c == b'"' {
+            // (0.30: a literal whose text is a hole, `c"$s"`: the text of
+            // any literal of that kind; in the replacement the text such
+            // a hole matched, among other text too, `b"$s\0"`)
+            let mut j = i + 1;
+            while j < s.len() as i64 && s[j as usize] != b'"' {
+                if s[j as usize] == b'\\' && j + 1 < s.len() as i64 {
+                    j += 1;
+                }
+                j += 1;
+            }
+            if j > s.len() as i64 {
+                j = s.len() as i64;
+            }
+            buf_byte(out, c);
+            let mut k = i + 1;
+            while k < j {
+                let mut e = k + 1;
+                while s[k as usize] == b'$' && e < j && is_name_byte(s[e as usize]) {
+                    e += 1;
+                }
+                let whole = k == i + 1 && e == j;
+                let mut h: i64 = -1;
+                if e > k + 1 && (whole || !add) {
+                    let name = &s[k as usize..e as usize];
+                    h = hole_named(name, false, tcx);
+                    if h < 0 && add && hole_named(name, true, tcx) < 0 {
+                        let ident = buf_new();
+                        buf_str(ident, c"__vole_hole_");
+                        buf_bytes(ident, &s[(k + 1) as usize..e as usize]);
+                        h = tcx.h_sym.len() as i64;
+                        tcx.h_sym.push(intern_buf(ident, pcx));
+                        let nb = buf_new();
+                        buf_bytes(nb, name);
+                        tcx.h_name.push(nb);
+                        tcx.h_rest.push(0);
+                        tcx.h_type.push(-1);
+                        tcx.h_nameonly.push(0);
+                        tcx.h_re.push(-1);
+                        tcx.h_fresh.push(0);
+                        tcx.fresh_text.push(-1);
+                        tcx.h_part.push(2);
+                        tcx.h_fstruct.push(-1);
+                        tcx.h_fname.push(-1);
+                    }
+                    if h >= 0 && add {
+                        tcx.h_part[h as usize] = 2;
+                    }
+                    if h >= 0 && tcx.h_part[h as usize] != 2 {
+                        h = -1;
+                    }
+                }
+                if h >= 0 {
+                    buf_str(out, c"__vole_hole_");
+                    buf_bytes(out, &s[(k + 1) as usize..e as usize]);
+                    k = e;
+                    continue;
+                }
+                buf_byte(out, s[k as usize]);
+                k += 1;
+            }
+            if j < s.len() as i64 {
+                buf_byte(out, b'"');
+            }
+            i = j + 1;
+            continue;
+        }
+        if c == b'\'' {
             // (a string or a character: as it is)
             buf_byte(out, c);
             i += 1;
@@ -105,7 +483,7 @@ pub fn holes_to_idents(text: *mut u8, out: i64, add: bool, tcx: &mut Tcx<Comp>, 
                 buf_bytes(d, name);
                 buf_str(d,
                     if !add { c"~/re/: a name hole's expression goes in the pattern\n" }
-                    else { c"~/re/: write a regular expression between the slashes (^ $ . * + ? [a-z] \\d \\w)\n" });
+                    else { c"~/re/: write a regular expression between the slashes (. [a-z] \\d \\w \\s, * + ? after a byte or a group, ( ) groups, | alternatives, ^ $)\n" });
                 return false;
             }
             re = text;
@@ -143,6 +521,9 @@ pub fn holes_to_idents(text: *mut u8, out: i64, add: bool, tcx: &mut Tcx<Comp>, 
             tcx.h_re.push(-1);
             tcx.h_fresh.push(if add { 0 } else { 1 });
             tcx.fresh_text.push(-1);
+            tcx.h_part.push(0);
+            tcx.h_fstruct.push(-1);
+            tcx.h_fname.push(-1);
         }
         if re >= 0 {
             (tcx.h_nameonly[h as usize]) = 1;
@@ -297,8 +678,9 @@ fn bind(h: i64, n: i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
         return false;
     }
     if (tcx.b_node[h as usize]) != -1 {
+        // (0.30: the parentheses around either aside)
         return (tcx.b_node[h as usize]) >= 0
-            && same_tokens((tcx.pattern_b_start[h as usize]),
+            && same_inner((tcx.pattern_b_start[h as usize]),
                 (tcx.b_end[h as usize]), pstart(n, pcx), pend(n, pcx), pcx);
     }
     // (0.16: a name hole: an identifier or a path, its text matching
@@ -326,6 +708,37 @@ fn bind(h: i64, n: i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
 pub fn types_match(tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
     for h in 0..tcx.h_sym.len() as i64 {
         let n = (tcx.b_node[h as usize]);
+        if tcx.h_fstruct[h as usize] >= 0 {
+            // (0.30: `$x: field S.f`, an access of that field: the name,
+            // and the struct the checker typed its base)
+            if n <= 0 || pk(n, pcx) != NodeKind::FieldAccess {
+                return false;
+            }
+            // (its name among the fields asked for, `,a,b,`)
+            let names = buf_copy(tcx.h_fname[h as usize]);
+            let field = sym_text(pb(n, pcx), pcx);
+            let mut named = false;
+            let mut i: usize = 0;
+            while !named && i + field.len() + 2 <= names.len() {
+                named = names[i] == b',' && names[i + 1..i + 1 + field.len()] == field
+                    && names[i + 1 + field.len()] == b',';
+                i += 1;
+            }
+            if !named {
+                return false;
+            }
+            let base = checked_type(pa(n, pcx), tcx, pcx);
+            if base <= 0 {
+                tcx.untyped += 1;
+                if tcx.untyped_at.len() < 5 {
+                    tcx.untyped_at.push(pstart(n, pcx));
+                }
+                return false;
+            }
+            if struct_node_of(base, pcx) != tcx.h_fstruct[h as usize] {
+                return false;
+            }
+        }
         if (tcx.h_type[h as usize]) < 0 || n <= 0 || pk(n, pcx) == NodeKind::TyName
             || pk(n, pcx) == NodeKind::PatBind {
             continue;
@@ -333,6 +746,9 @@ pub fn types_match(tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
         let t = checked_type(n, tcx, pcx);
         if t <= 0 {
             tcx.untyped += 1;
+            if tcx.untyped_at.len() < 5 {
+                tcx.untyped_at.push(pstart(n, pcx));
+            }
             return false;
         }
         let key = type_key(t, pcx);
@@ -439,19 +855,49 @@ pub fn match_node(p: i64, n: i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool 
     if h >= 0 {
         return bind(h, n, tcx, pcx);
     }
-    if !has_hole(p, tcx, pcx) {
-        return same_tokens(pstart(p, pcx), pend(p, pcx), pstart(n, pcx), pend(n, pcx), pcx);
+    // (0.30: a part without holes matches code with the same tokens, the
+    // parentheses around either aside; and, part by part, code that
+    // differs by the parentheses inside it: `0 as usize` is `(0) as
+    // usize`)
+    if !has_hole(p, tcx, pcx)
+        && same_inner(pstart(p, pcx), pend(p, pcx), pstart(n, pcx), pend(n, pcx), pcx) {
+        return true;
     }
     let k = pk(p, pcx);
     if k != pk(n, pcx) {
         return false;
+    }
+    if k == NodeKind::Str || k == NodeKind::CStr {
+        // (0.30: `c"$s"`, the text of a literal with the same prefix)
+        let h = part_hole(p, tcx, pcx);
+        let mut pa0: i64 = 0;
+        let mut pa1: i64 = 0;
+        let mut na0: i64 = 0;
+        let mut na1: i64 = 0;
+        if h < 0 || !literal_text(p, &mut pa0, &mut pa1, pcx)
+            || !literal_text(n, &mut na0, &mut na1, pcx) {
+            return false;
+        }
+        let mut ps = pstart(p, pcx);
+        let mut pe = pend(p, pcx);
+        let mut ns = pstart(n, pcx);
+        let mut ne = pend(n, pcx);
+        unparen(&mut ps, &mut pe, pcx);
+        unparen(&mut ns, &mut ne, pcx);
+        return bytes_eq(&get_src()[ps as usize..pa0 as usize],
+            &get_src()[ns as usize..na0 as usize])
+            && bind_text(h, na0, na1, tcx);
     }
     if k == NodeKind::Binary || k == NodeKind::Assign {
         return pop(p, pcx) == pop(n, pcx) && match_node(pb(p, pcx), pb(n, pcx), tcx, pcx)
             && match_node(pc(p, pcx), pc(n, pcx), tcx, pcx);
     }
     if k == NodeKind::Unary {
-        return pop(p, pcx) == pop(n, pcx) && match_node(pb(p, pcx), pb(n, pcx), tcx, pcx);
+        // (0.30: `&mut e` is not `&e`)
+        return pop(p, pcx) == pop(n, pcx)
+            && pflags(p, pcx) & (NODE_REF_MUT | NODE_RAW_BORROW)
+            == pflags(n, pcx) & (NODE_REF_MUT | NODE_RAW_BORROW)
+            && match_node(pb(p, pcx), pb(n, pcx), tcx, pcx);
     }
     if k == NodeKind::Cast || k == NodeKind::Index || k == NodeKind::Repeat {
         return match_node(pa(p, pcx), pa(n, pcx), tcx, pcx)
@@ -461,8 +907,23 @@ pub fn match_node(p: i64, n: i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool 
         return match_node(pa(p, pcx), pa(n, pcx), tcx, pcx) && match_list(p, n, tcx, pcx);
     }
     if k == NodeKind::MethodCall {
+        // (0.30: `$e.$m($a)`, the method's name)
+        let mh = hole_of_sym(pb(p, pcx), tcx);
+        if mh >= 0 {
+            let at = member_start(n, pcx);
+            return same_part(pg(p, pcx), pg(n, pcx), pcx)
+                && match_node(pa(p, pcx), pa(n, pcx), tcx, pcx) && match_list(p, n, tcx, pcx)
+                && bind_text(mh, at, at + sym_text(pb(n, pcx), pcx).len() as i64, tcx);
+        }
         return pb(p, pcx) == pb(n, pcx) && same_part(pg(p, pcx), pg(n, pcx), pcx)
             && match_node(pa(p, pcx), pa(n, pcx), tcx, pcx) && match_list(p, n, tcx, pcx);
+    }
+    if k == NodeKind::FieldAccess && hole_of_sym(pb(p, pcx), tcx) >= 0 {
+        // (0.30: `$e.$f`, the field's name)
+        let at = member_start(n, pcx);
+        return match_node(pa(p, pcx), pa(n, pcx), tcx, pcx)
+            && bind_text(hole_of_sym(pb(p, pcx), tcx), at,
+                at + sym_text(pb(n, pcx), pcx).len() as i64, tcx);
     }
     if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
         return pb(p, pcx) == pb(n, pcx) && match_node(pa(p, pcx), pa(n, pcx), tcx, pcx);
@@ -591,14 +1052,15 @@ fn in_sub(pos: i64, tcx: &Tcx<Comp>) -> bool {
 }
 
 // The text hole h stands for at the site, into out: a new name's, else
-// what it matched with the substitutions made in it.
-fn put_bound(out: i64, h: i64, tcx: &Tcx<Comp>) {
+// what it matched (SRC[from..to): all of it, or (0.30) what its
+// parentheses hold) with the substitutions made in it.
+fn put_bound(out: i64, h: i64, from: i64, to: i64, tcx: &Tcx<Comp>) {
     if (tcx.h_fresh[h as usize]) != 0 {
         buf_append(out, (tcx.fresh_text[h as usize]));
         return;
     }
-    let mut cur = (tcx.pattern_b_start[h as usize]);
-    let end = (tcx.b_end[h as usize]);
+    let mut cur = from;
+    let end = to;
     for i in 0..tcx.sub_start.len() as i64 {
         let s = (tcx.sub_start[i as usize]);
         if s < cur || (tcx.sub_end[i as usize]) > end {
@@ -692,10 +1154,28 @@ pub fn replacement_text(tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
     let out = buf_new();
     tcx.break_next = 0;
     let mut cur = tcx.pattern_r_start;
-    for i in 0..tcx.r_holes.len() as i64 {
+    let mut i: i64 = 0;
+    let mut j: i64 = 0;
+    loop {
+        let nodes = i < tcx.r_holes.len() as i64;
+        let parts = j < tcx.r_parts.len() as i64;
+        if !nodes && !parts {
+            break;
+        }
+        if parts
+            && (!nodes || tcx.r_parts[j as usize] < pstart(tcx.r_hole_span[i as usize], pcx)) {
+            // (0.30: a name after `.`, the text in a literal: as matched)
+            let h = tcx.r_parts[(j + 2) as usize];
+            copy_laid(out, cur, tcx.r_parts[j as usize], true, tcx, pcx);
+            put_bound(out, h, tcx.pattern_b_start[h as usize], tcx.b_end[h as usize], tcx);
+            cur = tcx.r_parts[(j + 1) as usize];
+            j += 3;
+            continue;
+        }
         let q = (tcx.r_holes[i as usize]);
         let h = hole_of(q, tcx, pcx);
         let at = (tcx.r_hole_span[i as usize]);
+        i += 1;
         let mut from = pstart(at, pcx);
         let mut to = pend(at, pcx);
         if (tcx.h_rest[h as usize]) != 0 && (tcx.b_node[h as usize]) == -3 {
@@ -722,8 +1202,25 @@ pub fn replacement_text(tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
         if wrap {
             buf_byte(out, b'(');
         }
+        // (0.30: the parentheses the hole's code had and needs no more
+        // where it now stands go: `f((n - 1))` is `f(n - 1)`; a hole that
+        // is the whole replacement keeps them for the site's operators)
+        let mut b0 = tcx.pattern_b_start[h as usize];
+        let mut b1 = tcx.b_end[h as usize];
+        let b = tcx.b_node[h as usize];
+        if !wrap && b > 0 && (tcx.h_fresh[h as usize]) == 0 && q != tcx.r_root
+            && in_parens(b0, b1, pcx) {
+            let mut s = b0;
+            let mut e = b1;
+            unparen(&mut s, &mut e, pcx);
+            if parens_free(pk(b, pcx), tcx.r_levels[q as usize],
+                &get_src()[s as usize..e as usize]) {
+                b0 = s;
+                b1 = e;
+            }
+        }
         let at_text = buf_len(out);
-        put_bound(out, h, tcx);
+        put_bound(out, h, b0, b1, tcx);
         let empty = buf_len(out) == at_text;
         let last = if empty { b' ' }
             else { buf_at(out, buf_len(out) - 1) };

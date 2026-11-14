@@ -358,6 +358,13 @@ else
     else
         result pass guide-budget
     fi
+    # (0.30) compiler/guide/embed.sh says that size against the budget
+    # when the guide is edited: the same number
+    if grep -q "^core: $size of 10240 bytes" "$WORK/embed.out"; then
+        result pass guide-budget-embed
+    else
+        result FAIL guide-budget-embed "volec guide prints $size bytes; compiler/guide/embed.sh said: $(grep -e '^core: ' -e 'core guide' "$WORK/embed.out" | head -1)"
+    fi
 fi
 
 # --full (0.17) is the long form, topic language, with std's API in it.

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.30.0 (vole 0.30.0)
+
+- No change to the grammar: the version follows the compiler's. A
+  union's field borrowed outside `unsafe` is now an error (E0133), and
+  an assignment through a raw pointer drops the old value; neither
+  changes how a file is highlighted.
+
 ## 0.29.0 (vole 0.29.0)
 
 - No change to the grammar: the version follows the compiler's. `~`

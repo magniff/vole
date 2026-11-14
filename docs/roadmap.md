@@ -2887,6 +2887,66 @@ unsafe-audit 2775 unjustified (baseline 2775, from 3057) and 0 in std,
 chain-diverse, chain-fresh 40 releases. compile-cost against v0.26.5: a
 hello world 1.00x, std 0.99x, check of the compiler 1.01x.
 
+### 0.30.0
+
+The release gate, macOS only, run whole, `gate.sh --release --no-linux
+-j 4`, on 2026-11-14 from 17:02: 308 minutes of wall time, with two
+red-team sessions (programs written to make vole fail) running beside
+it, so a load of up to about 36. 38 of its 39 rows passed on the first
+run; chain-diverse failed: its -O0 compiler (B2), which checks overflow
+as it runs, stopped with "attempt to add with overflow" in
+middle/lsr.vl's affine forms on tests/run/sem_core_rf_induction_wrap.vl
+at -O2, for all four targets, where the -O2 compiler wraps. The forms
+are arithmetic modulo 2^64 and are written wrapping_* now (the rule
+compiler/src keeps for its wrap sites). The -O2 compiler built from the
+fixed tree is the same bytes as the one the gate ran, so the 38 rows
+stand for it; chain-diverse was run again on the fixed tree (`--only
+chain-diverse`, 108 minutes) and passed. During the release a quick
+gate (`gate.sh --quick`) passed every row on the tree of the second
+batch, and objcheck there was 13000 of 13000.
+Against 0.29.0's rows: `stdtools` is new (tests/stdtools.sh: std's
+files in the tools' errors, queries, edits and fixes, and `check
+--std`, in a copy of compiler/std; in every mode, quick too); fuzz-sem
+has a fifth run, `--deref-assign` (assignments through a `Box`, a
+guard, a type's `DerefMut`, a function's `&mut T` and a raw pointer),
+and `gate.sh --self-test fuzz-sem` checks that the row runs every mode
+of the generator; `--self-test ROWS` runs some of the self-test's rows
+and first removes what failed self-tests left; compile-cost has its std
+row back (0.29.0 builds tests/cost/std_heavy.vl); unsafe-audit judges
+std's unneeded blocks too. The rows: the suite 6556 passed at each of
+-O0, -O1 and -O2, 717 XFAIL, 1 skipped (no spirv-val) (0.29.0: 6385,
+731), std-tests 1581 passed at -O0 and -O2 under --check-alloc, 62
+XFAIL (0.29.0: 1571, 62), std-check 3966 bodies, 3963 clean, 0 with
+borrowck errors, 3 not solved (0.29.0: 3967, 3964, 0, 3), stdtools 41
+checks, threads 16015 compilations (0.29.0: 15940), incremental 172
+series, objcheck 13048 and 260 for x86_64-macos (0.29.0: 12940 and
+260), layout 111 records and 582 fields, compiler-memcheck 783 (0.29.0:
+755), examples-checkalloc 196, every fuzz row 60 programs and every ABI
+row 100 programs with none failing, fuzz-sem 300 programs with none
+failing, voltty-fuzz 1610 scripts (0.29.0: 2108), stress-grow passed,
+cachediff 1604 lines, 487 from the cache (0.29.0: 1447, 441),
+borrowck-twin 469 cases, 427 agree, 8 named divergences, 34 outside
+the subset, 0 mismatches, unsafe-audit 299 sites in compiler/src and
+910 in std, 0 unjustified and 0 unneeded in each (0.29.0: 316 and 915),
+chain-fresh 52 releases from the seed, each the same bytes as recorded
+(0.29.0: 51), chain-diverse passed on the second run. compile-cost
+against v0.29.0: hello 228.1 M 1.30x, std 1172.3 M 0.89x, check
+22,015.8 M 0.86x, regions 1131.7 M 1.00x (0.29.0 against 0.28.0: 1.00x,
+skipped, 0.97x, 0.93x; hello is println's sink, and the row's limit is
+1.5x). The bench row, run after the gate alone on the idle machine: its
+iterator check passes, iterchain 1.010 times iterloop (limit 1.05;
+0.29.0: 2.057); the geomean against `cc -O2` is 1.005 at -O2, 2.190 at
+-O1 and 12.679 at -O0 (0.29.0 in the same run: 1.137 at -O2; its gate:
+1.131, 2.275, 13.131). The self-build and the compiler's own check
+against 0.29.0, each compiler on its own source, on one thread, the
+fewest of three runs on the idle machine: -O2 126,387 M to 110,503 M
+(-12.6%), -O0 33,364 M to 30,745 M (-7.8%), check 24,687 M to 21,843 M
+(-11.5%). Not run: any Linux row. Next: 0.30.1 fixes what the red team
+found after the gate (docs/releases.md, "Known issues" of 0.30.0), 0.31
+is the compiler's performance (a cold -O0 self-build and check under
+1 s, a cold -O2 one about 1.5 s, generated code against clang on
+programs written in both), 0.32 the type checker, 0.33 contracts v2.
+
 ### 0.29.0
 
 The release gate, macOS only. The gate schedules itself from this

@@ -1,0 +1,284 @@
+// (0.30) A rewrite that lands inside the function it calls: the
+// replacement's callee (or the function of its operator) is, at a site,
+// the function the site is in, so the function would call itself (an
+// `Index` impl whose body is rewritten to index itself, a helper whose
+// body becomes a call of the helper). Such a program checks clean and
+// never returns. The rewrite refuses those sites (`rewrite.recursive`)
+// unless --force.
+//
+// What is decided, exactly: a call `f(..)` in a free function named `f`
+// (a name of its own module is the function itself there); `Self::f(..)`
+// and `T::f(..)` in `f` of an impl of `T`; `crate::m::f(..)` in the
+// function of that path; `x.f(..)` in the method `f` of the type `x` has
+// (`self`, or what the checker typed so); `x[i]` in `Index::index` (and
+// `&mut x[i]`, `x[i] = v` in `IndexMut::index_mut`) of x's type; a binary
+// or unary operator in its trait's function (`Add::add`, `Neg::neg`,
+// `PartialEq::eq`, ...) of its left operand's type. A callee the pattern
+// has too is not new at the site (a recursive function's own calls,
+// rewritten) and is left alone.
+
+use crate::base::{buf_byte, buf_copy, buf_new, get_src, sym_text};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::ast::{NODE_REF_MUT, NodeKind};
+use crate::front::lexer::Tok;
+use crate::front::types::buf_type;
+use crate::tools::ctx::Tcx;
+use crate::tools::query::defs::{K_FN, K_IMPL_METHOD, K_METHOD, bytes_eq};
+use crate::tools::query::positions::enclosing;
+use crate::tools::rewrite::parsed::{pa, pb, pend, pflags, pk, pop, pstart, same_tokens};
+use crate::tools::rewrite::pattern::{checked_type, hole_of};
+
+// The trait and the function of operator `op` (binary, or unary), or
+// empty names.
+fn op_fn(op: Tok, binary: bool) -> (&'static [u8], &'static [u8]) {
+    if !binary {
+        if op == Tok::Minus { return ("Neg".as_bytes(), "neg".as_bytes()); }
+        if op == Tok::Bang { return ("Not".as_bytes(), "not".as_bytes()); }
+        if op == Tok::Star { return ("Deref".as_bytes(), "deref".as_bytes()); }
+        return ("".as_bytes(), "".as_bytes());
+    }
+    if op == Tok::Plus { return ("Add".as_bytes(), "add".as_bytes()); }
+    if op == Tok::Minus { return ("Sub".as_bytes(), "sub".as_bytes()); }
+    if op == Tok::Star { return ("Mul".as_bytes(), "mul".as_bytes()); }
+    if op == Tok::Slash { return ("Div".as_bytes(), "div".as_bytes()); }
+    if op == Tok::Percent { return ("Rem".as_bytes(), "rem".as_bytes()); }
+    if op == Tok::EqEq { return ("PartialEq".as_bytes(), "eq".as_bytes()); }
+    if op == Tok::BangEq { return ("PartialEq".as_bytes(), "ne".as_bytes()); }
+    if op == Tok::Lt { return ("PartialOrd".as_bytes(), "lt".as_bytes()); }
+    if op == Tok::LtEq { return ("PartialOrd".as_bytes(), "le".as_bytes()); }
+    if op == Tok::Gt { return ("PartialOrd".as_bytes(), "gt".as_bytes()); }
+    if op == Tok::GtEq { return ("PartialOrd".as_bytes(), "ge".as_bytes()); }
+    ("".as_bytes(), "".as_bytes())
+}
+
+// The replacement's calls and operators (nodes rfirst..rlast, within its
+// text) that the pattern (pfirst..plast) has not: what the rewrite brings
+// to a site.
+pub fn new_callees(proot: i64, pfirst: i64, plast: i64, rfirst: i64, rlast: i64, tcx: &Tcx<Comp>,
+    pcx: &Ctx<Comp>) -> Vec<i64, Comp> {
+    let mut out: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for n in rfirst..rlast {
+        if pstart(n, pcx) < tcx.pattern_r_start || pend(n, pcx) > tcx.pattern_r_end {
+            continue;
+        }
+        let k = pk(n, pcx);
+        if k != NodeKind::Call && k != NodeKind::MethodCall && k != NodeKind::Index
+            && k != NodeKind::Binary && k != NodeKind::Unary {
+            continue;
+        }
+        if k == NodeKind::Call {
+            let c = pa(n, pcx);
+            if hole_of(c, tcx, pcx) >= 0
+                || (pk(c, pcx) != NodeKind::Ident && pk(c, pcx) != NodeKind::Path) {
+                continue;
+            }
+        }
+        if (k == NodeKind::Binary || k == NodeKind::Unary)
+            && op_fn(pop(n, pcx), k == NodeKind::Binary).0.len() == 0 {
+            continue;
+        }
+        let mut old = false;
+        for p in pfirst..plast {
+            if pk(p, pcx) != k || pstart(p, pcx) < pstart(proot, pcx)
+                || pend(p, pcx) > pend(proot, pcx) {
+                continue;
+            }
+            // (the same function of the same operand: `$t.rows[$i]` is
+            // not `$t[$i]`)
+            let binary = k == NodeKind::Binary || k == NodeKind::Unary;
+            if (k == NodeKind::MethodCall && pb(p, pcx) != pb(n, pcx))
+                || (binary && pop(p, pcx) != pop(n, pcx)) {
+                continue;
+            }
+            let a = if binary { pb(p, pcx) } else { pa(p, pcx) };
+            let b = if binary { pb(n, pcx) } else { pa(n, pcx) };
+            old = old
+                || same_tokens(pstart(a, pcx), pend(a, pcx), pstart(b, pcx), pend(b, pcx), pcx);
+        }
+        if !old {
+            out.push(n);
+        }
+    }
+    out
+}
+
+// The last segment of a path's text, without its type arguments
+// (`std::ops::Index<usize>`: `Index`).
+fn last_segment(path: &[u8]) -> &[u8] {
+    let mut e: usize = 0;
+    while e < path.len() && path[e] != b'<' && path[e] != b' ' {
+        e += 1;
+    }
+    let mut s = e;
+    while s > 0 && path[s - 1] != b':' {
+        s -= 1;
+    }
+    &path[s..e]
+}
+
+// SRC[from..to) without its spaces and parentheses, into a new buffer.
+fn bare_text(from: i64, to: i64) -> i64 {
+    let out = buf_new();
+    let src = get_src();
+    for i in from..to {
+        let c = src[i as usize];
+        if c != b' ' && c != b'\n' && c != b'\t' && c != b'(' && c != b')' {
+            buf_byte(out, c);
+        }
+    }
+    out
+}
+
+// Whether the replacement's operand r is, at the site, a value of the
+// type function e belongs to: `self` there, or what the checker typed
+// that type (a reference to it).
+fn is_owner(r: i64, e: i64, tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
+    let h = hole_of(r, tcx, pcx);
+    let mut from = pstart(r, pcx);
+    let mut to = pend(r, pcx);
+    let mut bound: i64 = 0;
+    if h >= 0 {
+        if tcx.b_node[h as usize] == -1 || tcx.b_node[h as usize] == -3 {
+            return false;
+        }
+        from = tcx.pattern_b_start[h as usize];
+        to = tcx.b_end[h as usize];
+        bound = tcx.b_node[h as usize];
+    }
+    let text = buf_copy(bare_text(from, to));
+    let t: &[u8] = &text;
+    if bytes_eq(t, "self".as_bytes()) || bytes_eq(t, "*self".as_bytes())
+        || bytes_eq(t, "&self".as_bytes()) || bytes_eq(t, "&mutself".as_bytes())
+        || bytes_eq(t, "&*self".as_bytes()) || bytes_eq(t, "&mut*self".as_bytes()) {
+        return true;
+    }
+    if bound <= 0 {
+        return false;
+    }
+    let ty = checked_type(bound, tcx, pcx);
+    if ty <= 0 {
+        return false;
+    }
+    let b = buf_new();
+    buf_type(b, ty, pcx);
+    let full = buf_copy(b);
+    let s: &[u8] = &full;
+    // (a reference's `&`, `mut`, lifetime)
+    let mut i: usize = 0;
+    loop {
+        if i < s.len() && (s[i] == b'&' || s[i] == b' ') {
+            i += 1;
+        } else if i + 4 <= s.len() && s[i] == b'm' && s[i + 1] == b'u' && s[i + 2] == b't'
+            && s[i + 3] == b' ' {
+            i += 4;
+        } else if i < s.len() && s[i] == b'\'' {
+            while i < s.len() && s[i] != b' ' {
+                i += 1;
+            }
+        } else {
+            break;
+        }
+    }
+    let owner = pcx.defs[e as usize].owner;
+    owner > 0 && bytes_eq(last_segment(&s[i..]), last_segment(sym_text(owner, pcx)))
+}
+
+// Whether the replacement's node c is written to, or borrowed `&mut`.
+fn is_mut_place(c: i64, rfirst: i64, rlast: i64, pcx: &Ctx<Comp>) -> bool {
+    for n in rfirst..rlast {
+        let k = pk(n, pcx);
+        if k == NodeKind::Assign && pb(n, pcx) == c {
+            return true;
+        }
+        if k == NodeKind::Unary && pb(n, pcx) == c && pop(n, pcx) == Tok::Amp
+            && pflags(n, pcx) & NODE_REF_MUT != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+// The function the site at node `site` is in, when the replacement
+// (its new callees `cands`, of nodes rfirst..rlast) calls that function
+// there; -1 when it does not (or it cannot be decided).
+pub fn self_call(site: i64, cands: &[i64], rfirst: i64, rlast: i64, tcx: &Tcx<Comp>,
+    pcx: &Ctx<Comp>) -> i64 {
+    if cands.len() == 0 {
+        return -1;
+    }
+    let e = enclosing(pstart(site, pcx), tcx, pcx);
+    if e < 0 {
+        return -1;
+    }
+    let kind = pcx.defs[e as usize].kind;
+    if kind != K_FN && kind != K_METHOD && kind != K_IMPL_METHOD {
+        return -1;
+    }
+    let method = kind != K_FN;
+    let name = pcx.defs[e as usize].name;
+    let name_text = sym_text(name, pcx);
+    let tr = pcx.defs[e as usize].tr;
+    let tr_name = if kind == K_IMPL_METHOD && tr > 0 { last_segment(sym_text(tr, pcx)) }
+        else { "".as_bytes() };
+    for i in 0..cands.len() {
+        let c = cands[i];
+        let k = pk(c, pcx);
+        if k == NodeKind::Call {
+            let callee = pa(c, pcx);
+            if pk(callee, pcx) == NodeKind::Ident {
+                if !method && pa(callee, pcx) == name {
+                    return e;
+                }
+                continue;
+            }
+            let text = buf_copy(bare_text(pstart(callee, pcx), pend(callee, pcx)));
+            let t: &[u8] = &text;
+            if !bytes_eq(last_segment(t), name_text) {
+                continue;
+            }
+            if !method {
+                if bytes_eq(t, sym_text(pcx.defs[e as usize].fqn, pcx)) {
+                    return e;
+                }
+                continue;
+            }
+            // (`Self::f`, `T::f`: the type's segment, before the name)
+            let owner = pcx.defs[e as usize].owner;
+            let cut = t.len() - name_text.len();
+            if owner <= 0 || cut < 2 {
+                continue;
+            }
+            let ty = last_segment(&t[..cut - 2]);
+            if bytes_eq(ty, "Self".as_bytes()) || bytes_eq(ty, last_segment(sym_text(owner, pcx))) {
+                return e;
+            }
+            continue;
+        }
+        if !method {
+            continue;
+        }
+        if k == NodeKind::MethodCall {
+            if pb(c, pcx) == name && is_owner(pa(c, pcx), e, tcx, pcx) {
+                return e;
+            }
+            continue;
+        }
+        if k == NodeKind::Index {
+            let read = bytes_eq(tr_name, "Index".as_bytes())
+                && bytes_eq(name_text, "index".as_bytes());
+            let write = bytes_eq(tr_name, "IndexMut".as_bytes())
+                && bytes_eq(name_text, "index_mut".as_bytes())
+                && is_mut_place(c, rfirst, rlast, pcx);
+            if (read || write) && is_owner(pa(c, pcx), e, tcx, pcx) {
+                return e;
+            }
+            continue;
+        }
+        let (t, f) = op_fn(pop(c, pcx), k == NodeKind::Binary);
+        if bytes_eq(tr_name, t) && bytes_eq(name_text, f) && is_owner(pb(c, pcx), e, tcx, pcx) {
+            return e;
+        }
+    }
+    -1
+}

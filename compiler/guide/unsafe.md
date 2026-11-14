@@ -15,7 +15,8 @@ of an `unsafe fn`, as in Rust:
   `*p`;
 - reading or writing a `static mut` (error `unsafe`, rustc's E0133); a plain `static`
   is safe to read;
-- reading a union's field.
+- reading a union's field, or borrowing one (`&u.f`, `&mut u.f`: rustc's
+  E0133); writing one (`u.f = v`) and `&raw const u.f` are safe.
 
 `*const T` and `*mut T` are raw pointers: nothing checks what they point
 to. Making, passing, comparing and casting one is safe, an integer cast
@@ -42,6 +43,11 @@ escape hatch:
   unsafe` wraps what stays raw in `unsafe { }`.
 - `v[i]` on a Vec or a slice is that element, checked; `*p.add(i)` on a
   raw pointer is pointer arithmetic, unchecked and unsafe.
+- (0.30) `*p = v` (and `(*p).f = v`) drops the old value first, as in
+  Rust and as through a `&mut`: it must be initialized. Memory that
+  holds no value yet (malloc's, a Vec's spare capacity) is written with
+  `std::ptr::write(p, v)` or `p.write(v)`, which drops nothing. For a
+  type with nothing to drop (an `i64`, below) the two are the same.
 
 ```vole
 extern "C" {
@@ -131,6 +137,11 @@ defined:
   operations inside that need unsafe; `none (unneeded)`: a block with
   nothing unsafe inside, to remove. `--unjustified`, `--unneeded`,
   `--summary` (counts by class, module, file), `--json`, `--no-std`.
+  `--source` (0.30) prints each site's lines under it, and `volec edit
+  justify FILE:LINE --unsafe TEXT --safety TEXT` writes the two comments
+  above the site (`--from LIST` for many, a site a line:
+  `FILE:LINE<TAB>UNSAFE TEXT<TAB>SAFETY TEXT`, the lines of one `query
+  unsafe` run).
 - `volec fix --only unneeded-unsafe` (0.25.4) takes the `none
   (unneeded)` blocks away and keeps their code in its scope, over
   several lines too (a `let`'s value, an `if` or `while` condition), laid

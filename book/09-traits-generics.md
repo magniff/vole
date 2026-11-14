@@ -551,7 +551,7 @@ error[type error]: cannot derive 'Debg' (derivable: PartialEq, Eq, PartialOrd, O
  --> main.vl: line 1, column 10
 error[type error]: 'Point' does not implement Debug, which '{x:?}' needs
  --> main.vl: line 9, column 15
-  = help: derive it: '#[derive(Debug)]' before the type, or write 'impl Debug for Point { fn fmt_debug(self, f: inout std::Fmt) { f.write("..", args); } }'
+  = help: derive it: '#[derive(Debug)]' before the type, or write 'impl Debug for Point { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write(f, "..", args) } }'
 ```
 
 The second error follows from the first: fix the spelling and both go

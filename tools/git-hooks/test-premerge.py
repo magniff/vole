@@ -9,9 +9,13 @@ Each case is a change on a branch of a fresh repository (a base branch
 release-0.0, a copy of premerge.sh and of the unsafe check), with
 target/volec the compiler under test ($VOLE_TEST_COMPILER, else
 target/volec of this tree). Run by tests/run.sh (category "hooks").
+(0.30) Each change runs premerge.sh in a clone of its own, all of them
+first, $VOLE_HOOKS_JOBS at once (default 4); the cases then read their
+results in order: the same report as one by one.
 
 usage: python3 -I tools/git-hooks/test-premerge.py
 """
+import concurrent.futures
 import os
 import shutil
 import subprocess
@@ -121,18 +125,54 @@ try:
     case("base commit", r.returncode == 0, r.stdout + r.stderr)
     run(["git", "checkout", "-q", "-b", "work"], repo)
 
-    def premerge(changes):
+    def premerge_in_clone(k, changes):
         """The check row and the whole output, with `changes` (path:
-        text) in the work tree; the tree is put back after."""
+        text) in the work tree of clone k of the repository (its branch
+        work on release-0.0, as the repository's)."""
+        c = os.path.join(tmp, "c%d" % k)
+        run(["git", "clone", "-q", "-b", "release-0.0", repo, c], tmp)
+        run(["git", "checkout", "-q", "-b", "work"], c)
+        os.makedirs(os.path.join(c, "target"))
+        os.symlink(compiler, os.path.join(c, "target", "volec"))
         for path, text in changes.items():
-            write(os.path.join(repo, path), text)
-        r = run(["sh", "tools/premerge.sh"], repo)
+            write(os.path.join(c, path), text)
+        r = run(["sh", "tools/premerge.sh"], c)
         out = r.stdout + r.stderr
-        run(["git", "checkout", "-q", "--", "."], repo)
-        run(["git", "clean", "-q", "-fd"], repo)
         rows = [line.split(None, 2) for line in out.splitlines() if line.startswith("  check ")]
         row = rows[0] if rows else ["check", "?", ""]
+        shutil.rmtree(c, ignore_errors=True)
         return r.returncode, row[1], row[2] if len(row) > 2 else "", out
+
+    bare = "\n".join(line for line in COMPILER_MAIN.split("\n") if "UNSAFE:" not in line and "SAFETY:" not in line)
+    spare = COMPILER_MAIN.replace("    0\n", "    // UNSAFE: none.\n    // SAFETY: none.\n    unsafe { 0 }\n")
+    # (the changes the cases below make, in their order)
+    CHANGES = [
+        {},
+        {"examples/shade/shade.wgsl": BROKEN},
+        {"examples/shade/shade.wgsl": SHADER + "// a comment\n"},
+        {"examples/shade/README.md": "# shade\n\nmore\n"},
+        {"docs/notes.md": "other notes\n"},
+        {"examples/alone.vl": ALONE.replace("alone", "still alone")},
+        {"examples/alone.vl": ALONE.replace("    0\n", "    nosuch\n")},
+        {"tests/run/err_x.vl": "// ERROR: unknown name\nfn main() -> i32 { z }\n"},
+        {
+            "examples/shade/main.vl": MAIN.replace("fn main", "// premerge: broken on purpose (a case)\nfn main"),
+            "examples/shade/shade.wgsl": BROKEN,
+        },
+        {"compiler/src/main.vl": COMPILER_MAIN.replace("{ *p }", "{ *p.add(1) }")},
+        {"compiler/src/main.vl": bare},
+        {"compiler/src/main.vl": spare},
+    ]
+    try:
+        jobs = max(1, int(os.environ.get("VOLE_HOOKS_JOBS", "4")))
+    except ValueError:
+        jobs = 4
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+        RESULTS = list(pool.map(lambda kc: premerge_in_clone(*kc), enumerate(CHANGES)))
+
+    def premerge(changes):
+        """The result of one of CHANGES (run above)."""
+        return RESULTS[CHANGES.index(changes)]
 
     rc, verdict, text, out = premerge({})
     case("nothing changed: SKIP, not PASS", rc == 0 and verdict == "SKIP", out)
@@ -183,13 +223,11 @@ try:
 
     # (the comments taken away: no line with `unsafe` is added, so the
     # diff's check passes; the audit names the site)
-    bare = "\n".join(line for line in COMPILER_MAIN.split("\n") if "UNSAFE:" not in line and "SAFETY:" not in line)
     rc, verdict, text, out = premerge({"compiler/src/main.vl": bare})
     case("a site of the compiler's source left without its comments fails the unsafe row, with its position",
          rc == 1 and unsafe_row(out) == "FAIL" and "compiler/src/main.vl:3" in out
          and ("error[unsafe.unjustified]" in out or "missing both" in out), out)
 
-    spare = COMPILER_MAIN.replace("    0\n", "    // UNSAFE: none.\n    // SAFETY: none.\n    unsafe { 0 }\n")
     rc, verdict, text, out = premerge({"compiler/src/main.vl": spare})
     case("an unsafe block of the compiler's source with nothing unsafe inside fails it too, with its position",
          rc == 1 and unsafe_row(out) == "FAIL" and "compiler/src/main.vl:12" in out

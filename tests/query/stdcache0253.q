@@ -9,12 +9,11 @@
 ## answers.
 $ show print
 // std::fmt::print	<std>:15164-15173
-// x on stdout (`print("{x}")`); stdout is line-buffered when a terminal.
+// x on stdout (`print("{x}")`), in one write when it is short.
 // later: format_fns
 #[effects(panic, T)]
 pub fn print<T: Display>(x: T) {
-    let mut out = crate::io::stdout();
-    if crate::io::Write::write_fmt(&mut out, x).is_err() {
+    if !print_fd(1, x, false) {
         let msg: &str = "failed printing to stdout";
         crate::panic::panic(msg);
     }

@@ -14,9 +14,14 @@ anything query accepts.
 ```
 volec refactor signature FN --add 'x: T [= VALUE]' [--at N] [--fill-calls] | --remove x
                                | --rename-param a b | --reorder b,a,c | --type x T [--default EXPR]
-volec refactor field STRUCT --add 'g: T = VALUE' | --remove g | --rename g h | --type g T
+volec refactor signature --batch FILE     (0.30: FN PARAM TYPE [DEFAULT] a line, one edit)
+volec refactor fold FN --as true|false                           (0.30)
+volec refactor field STRUCT --add 'g: T = VALUE' | --remove g | --rename g h
+                            | --type g[,h...] T [--default EXPR] [--allocator X] [--rewrite PAT REPL]...
 volec refactor variant ENUM --add 'X(T, ...)'|'X { a: T, ... }' [--arm EXPR] [--arm-in SITE EXPR]... | --remove V | --rename V W
 volec rewrite 'PATTERN' 'REPLACEMENT' [--where '$x: T']... [--subst 'P' 'R']... [--in FILE|MODULE|ITEM]... [--list]
+                 [--not-in FILE|MODULE|ITEM]... [--at-errors TEXT] [--force]     (0.30)
+volec rewrite --from FILE [--in ...] [--not-in ...]              (0.30: PATTERN -> REPLACEMENT a line)
 volec rewrite 'PATTERN' --list [--where ...] [--in FILE|MODULE|ITEM]   (0.16)
 volec refactor extract-function FN --lines A-B --to NEW          (0.13)
 volec refactor inline FN [--at FILE:LINE] [--keep]                 (0.13)
@@ -97,6 +102,37 @@ function used as a value (`let f = twice;`, `apply(twice, x)`:
 operator calls (`refactor.operator`: `a + b` calls `Add::add`), a C
 function or an `extern "C" fn` (`refactor.extern`).
 
+### --batch FILE (0.30)
+
+`refactor signature --batch FILE` makes the type changes of FILE, a line
+each: `FN PARAM TYPE [DEFAULT]`, what `refactor signature FN --type
+PARAM TYPE [--default DEFAULT]` does (words as sh splits them: a TYPE or
+a DEFAULT with spaces in quotes; `#` comments). The program is loaded
+and checked once, every line's edits are made on it as it is then (a
+line does not see another's), and the edit is checked once and written
+as one. Before, 185 changes were 185 loads and checks, and the first
+that left an error took the calls of the rest out of the checker's
+sight.
+
+```
+$ cat changes.txt
+first b &Buf
+scale k i64 '$k as i64'
+$ volec refactor signature --batch changes.txt
+changed 2 parameters (changes.txt), 5 calls→main.vl→+4 -4 lines
+```
+
+A line that cannot be made (no such function, no such parameter, a
+function used as a value) ends the run: its diagnostic, then `error
+refactor.batch: FILE:LINE`, nothing written. An argument inside one
+that another line (or the same) rewrites is left as written, `note
+refactor.nested` with the first. The calls in code the checker did not
+see (a program with errors: the rest of an expression after an error)
+are not changed: each is listed on stdout, `FILE:L:C→FUNCTION`, and
+`warning refactor.unchecked` counts them. (0.30: every refactoring
+loads the program with all its errors recorded, not the first 50, so
+fewer calls are out of sight.)
+
 ## refactor field
 
 The struct, its literals (in generic instances too) and its field
@@ -110,9 +146,74 @@ accesses.
 - `--rename g h`: every reference (definition, literals, accesses); a
   field shorthand (0.15) `S { g }` becomes `S { h: g }`.
 - `--type g T`: the field's type; the check says what no longer fits.
+  `--default EXPR` (0.17) gives each literal its new value of the field
+  (`$g` in EXPR: the old one). (0.30) When the edit is refused, or
+  written with `--no-check`, and literals keep their old value, `note
+  refactor.literals` (a warning with `--no-check`) names them: before, a
+  literal left as `IntVec { .. }` under a `Vec` field was found by the
+  next check.
+- (0.30) `--type f,g,h T`: several fields to one type, one edit.
+- (0.30) `--allocator X`, for a T that holds an allocator (`'Vec<i64,
+  A>'`): the struct becomes generic over it, `S<A: Allocator>`, the
+  field is `Vec<i64, A>` and the struct's uses name X (`S<Gpa>`,
+  `S<Comp>`), which is what `fix --only alloc` does after the fact: its
+  rounds run on the edited program before the check (`note
+  edit.rounds`), in the same edit. T may say `A` or X. Without
+  `--allocator`, a T that names a parameter the struct has not (and no
+  type) is `error refactor.usage` saying so; before, the edit was
+  written and the program had `unknown type 'A'`.
+- (0.30) `--rewrite PAT REPL` (repeatable): the uses of the field (of
+  each field of the list), rewritten in the same edit. PAT and REPL are
+  `rewrite`'s; the hole `$f` of PAT is an access of the field (`x.g`
+  where x is the struct, as the checker typed it), typed as the program
+  is before the change, so the edit is checked once, after both:
+
+  ```
+  volec refactor field Cx --type regs,uses 'Vec<i64, A>' --allocator Gpa \
+      --default 'Vec::new_in(gpa)' --rewrite '$f.get($i)' '$f[$i as usize]'
+  ```
+
+  A site inside the function its replacement calls is refused as
+  `rewrite` refuses it. The same accesses for a rewrite of its own:
+  `rewrite PAT REPL --where '$x: field STRUCT.NAME'` (or `NAME,NAME`).
 
 A `#[repr(C)]` struct's layout changes with --add, --remove and --type:
 `warning refactor.layout` (C code sharing it must change too).
+
+## refactor fold (0.30)
+
+`refactor fold NAME --as true|false`: a predicate that is one value from
+now on (a switch between an old way and a new, once the old way is
+gone) folded away. Each call of function NAME becomes the constant, and
+the code around it becomes what the constant leaves:
+
+| code | becomes |
+|---|---|
+| `!C`, `C && x`, `x && C`, `C \|\| x`, `x \|\| C` | the constant, or `x`, by the operators' rules; a side with a call in it stays when the constant alone would drop its evaluation (`g() && false`) |
+| `if C { A } else { B }`, a statement | A's statements (or B's) in its place; nothing, for a false `if` without `else` |
+| the same as a value | the block taken; its expression, when the block is one expression (in parentheses where the place needs them) |
+| `else if C { A } else { B }` | `else { A }`, `else { B }`, or no `else` |
+| `while C { .. }` | nothing (false); `loop { .. }` (true) |
+| `PAT if C => BODY` | the arm without its guard (true); no arm (false) |
+| the statements after one that now always returns | nothing |
+
+The function body (or the initializer) holding a call is one edit, laid
+out by fmt as every edit's text is, and the edit is checked as any is
+(`--dry-run`, with or without `--diff`, prints it). After it, `note
+refactor.unused` lists the functions, constants and statics whose every
+use was in the code that went, NAME itself among them, with a `try:
+volec edit delete` each. The imports the fold leaves unused are removed
+in the same edit (`note rewrite.imports`). A call whose arguments call functions is left
+as it is, since they would no longer run: `warning refactor.fold` counts
+those and names the first. NAME is a function or a method of an impl; a
+call through an operator or a trait is not folded.
+
+```
+$ volec refactor fold on_new --as true
+folded 9 calls of crate::flags::on_new as true in 3 items→main.vl→+12 -31 lines
+note refactor.unused: 3 items have no use left in the program: crate::flags::on_new (flags.vl:2:8), ...
+try: volec edit delete crate::flags::on_new
+```
 
 ## refactor variant
 
@@ -173,7 +274,10 @@ by the compiler's parser, with holes:
 | `$x` | any expression; in a type's place, any type (`$a as $T`); in a `let`'s binding place, any pattern (`let $v = ...;`) |
 | `$x...` | any number of elements of a call's arguments, a tuple, an array (one per list): `f($first, $rest...)`; (0.15) of a block's statements, its tail included: `{ let $x = $e; $s... }` |
 | `$x` written twice | the same code both times (the same tokens, spacing and comments aside) |
+| `$e.$f`, `$e.$m($a...)` | (0.30) the name of a field, of a method: `(*$p.add($i)).$f` is every field read through that pointer, one rewrite for all of them; in the replacement `$f` is the name it matched, wherever a name stands (`$t[$i].$f`, `T::$m($e)`); `$f~/RE/` and `--where '$f: name ~ RE'` narrow it |
+| `c"$s"`, `b"$s"`, `"$s"` | (0.30) the text of a string literal of that kind (the same prefix), and of no other: `c"$s"` to `b"$s\0"` touches C-string literals only; in the replacement `$s` is that text inside any literal, among other text too |
 | `--where '$x: T'` | only where the checker typed $x's expression `T` (as messages write types: `&mut IntVec`, `[u8]`, `Vec<i64>`; spaces aside); several: `--where '$x: T, $y: U'` or `--where` again |
+| `--where '$x: field S.f'` (or `S.f,g`) | (0.30) only an access of that field of struct S, `e.f` where the checker typed `e` an S (a reference to one): the uses of a field, whatever the variable is called |
 | `--where '$x: name'`, `--where '$x: name ~ RE'`, `$x~/RE/` | (0.16) only a name: an identifier or a path (`V`, `crate::m::V`, the name a `for` or `let` binds), not another expression (`IRFUNCS[f].blocks`); with RE, a name whose text RE matches (`^ $ . * + ? [a-z] [^...] \d \w`, anywhere unless anchored: `$v~/^v_/`) |
 
 The pattern is matched against every node as parsed (`--in FILE|MODULE`:
@@ -181,12 +285,23 @@ the sites in that file or module, its children too; 0.17: `--in ITEM`, a
 function, a type, a const...: the sites in its text; `--in` repeated: the
 sites in any of them), node by node: same kind, same
 operator, same names, and a part without holes matches code with the
-same tokens; parentheses do not count (`$a + $b` matches `(x + y)`). A
+same tokens; parentheses do not count (`$a + $b` matches `(x + y)`;
+0.30: nor inside a part without holes, `0 as usize` matches `(0) as
+usize`, nor for a hole written twice). A
 site's replacement is REPLACEMENT with each hole replaced by the exact
 text it matched; a hole's text is parenthesized when the operators
 around it in REPLACEMENT need it, and the whole replacement when the
 operators around the site need it (`double($x)` to `$x + $x` makes `3 *
-double(n)` `3 * (n + n)`). `$x...` that matched nothing goes with a comma
+double(n)` `3 * (n + n)`). (0.30) Parentheses that are needed no more
+go: the site's own when the replacement is a postfix expression (a
+name, a call, an index, a field) or stands where any expression does
+(an argument, an index, an initializer), so `(*p.add(i)).f` becomes
+`p[i].f`, not `(p[i]).f`; a hole's when its code lands in such a place
+(`f((n - 1))` to `g(n - 1)`). They stay around a call's callee (`(s.f)(x)`),
+around code with a `{` of its own (an `if` would take it for its block),
+and where only a reader wants them (`(a * b) + c`). A hole written where
+none can stand (a struct literal's field, a path's segment, a closure's
+parameter) is `error rewrite.pattern`, naming it. `$x...` that matched nothing goes with a comma
 next to it. Sites inside a rewritten site are left for another run
 (`note rewrite.nested`).
 
@@ -257,15 +372,106 @@ replacement's first.
 
 (0.16) **`--list`** prints a line per site instead of rewriting:
 `FILE:LINE:COL`, then each hole of the pattern and what it matched,
-TAB-separated (spaces and lines made one space, cut at 60 bytes). With a
+TAB-separated (spaces and lines made one space, cut at 60 bytes), then
+(0.30) the site's source line (its indentation aside, cut at 120 bytes). With a
 REPLACEMENT, the sites that would be rewritten (not those left by
 `rewrite.dropped`); without one, every site PATTERN matches:
 
 ```
 $ volec rewrite 'for $i in 0..$v.count { $s... }' --list
-loops.vl:8:5→$i=i→$v=w→$s...=t += w.data[i] * 2; if w.data[i] > 2 { t += w.data[i]; }
-loops.vl:18:5→$i=j→$v=w→$s...=t -= w.data[j];
+loops.vl:8:5→$i=i→$v=w→$s...=t += w.data[i] * 2; if w.data[i] > 2 { t += w.data[i]; }→for i in 0..w.count {
+loops.vl:18:5→$i=j→$v=w→$s...=t -= w.data[j];→for j in 0..w.count {
 ```
+
+(0.30) **`--not-in FILE|MODULE|ITEM`** (repeatable, resolved as `--in`
+is, `FILE:LINE` too) leaves the sites there as they are.
+
+(0.30) **A replacement inside the function it calls.** A site that is
+inside the function its replacement calls there would make that function
+call itself: a helper whose own body matches the idiom it wraps
+(`'$s.len() as i64 * 2' 'twice_len($s)'` in `twice_len`), an `Index`
+impl whose body is rewritten to index its own type. Such a program
+checks clean and never returns, so the rewrite is refused, `error
+rewrite.recursive` (exit 1, nothing written), with the first such site
+and two `try:` lines: the command with `--not-in` for each such function
+(a path, or `FILE:LINE` for a trait impl's), and with `--force`, which
+rewrites those sites too (a note then). What is decided: a call `f(..)`
+in the free function `f`; `Self::f(..)`, `T::f(..)` in `f` of an impl of
+`T`; `crate::m::f(..)` in that function; `x.f(..)` in the method `f` of
+x's type (x is `self`, or typed so by the checker, references aside);
+`x[i]` in `Index::index` of x's type, `&mut x[i]` and `x[i] = v` in
+`IndexMut::index_mut`; a binary or unary operator in its trait's
+function (`Add::add`, `Neg::neg`, `PartialEq::eq`...) of its left
+operand's type. A callee the pattern has too, with the same receiver, is
+not new at the site (a recursive function's own calls rewritten) and is
+never refused. A pattern's `&mut $e` no longer matches `&e`.
+
+(0.30) **`--from FILE`**: the rewrites of a file, a line each, applied
+in order (each to the program as the lines before left it) and checked
+once at the end, as one edit: all or nothing, one `undo`. A line is
+`PATTERN -> REPLACEMENT`, or with TABs `PATTERN<TAB>REPLACEMENT[<TAB>
+OPTIONS]` (a pattern with ` -> ` of its own takes the TABs; OPTIONS are
+that line's `--where`, `--in`, `--subst`, split as sh splits words);
+empty lines and `#` lines are none. The command's `--in`, `--not-in`
+and `--force` go to every line; `--dry-run` prints the whole diff. Each
+line is a step of `refactor --script` (it prints its own summary); a
+line that fails (`rewrite.recursive`, a pattern that does not parse)
+ends the run with `FILE:LINE` and nothing is written.
+
+```
+$ cat pairs.txt
+at($t, $i) -> raw_at($t, $i)
+$s.len() as i64 * 2<TAB>twice_len($s)<TAB>--not-in twice_len
+$ volec rewrite --from pairs.txt --in main
+```
+
+(0.30) The imports a replacement's names need are added in every file
+the rewrite changes, however many: the round that adds them now sees
+all the edited program's errors, not the first 50 (a rewrite of 210
+files that each need one new `use` was refused, `edit.breaks`, after
+four rounds).
+
+(0.30) **A program with errors.** The checker stops at its 50th error,
+and the code it has not checked has no types: in the middle of a
+conversion (a field's type changed, a thousand errors) a typed rewrite
+found nothing after the 50th (`rewrite.untyped`). A rewrite now checks
+the whole program, so `--where` holds everywhere the checker can type;
+`note rewrite.untyped` names the first five sites it left for want of a
+type. **`--at-errors TEXT`** takes only the sites where a current error
+is whose line (`FILE:L:C: error[CODE] MESSAGE`, as `volec check` prints
+it) has TEXT, a code or words of a message, whatever the holes' types:
+
+```
+volec rewrite '$v.get($i)' '$v[$i as usize]' --at-errors "no method 'get' on type 'Vec"
+```
+
+is the sweep after an `IntVec` field became a `Vec`, in one command; the
+`get`s of other types are not touched (`note rewrite.at-errors` counts
+the sites that matched where no such error is). The error must be the
+site's own: one inside the code a hole matched is that code's (the
+argument of a call, not the call), except at the start of the site,
+where an unknown method's error is reported; of two sites that start
+there (`m.get(1).get(2)`) it is the one the checker gave no type. No
+error has TEXT: `note rewrite.at-errors` says so, with the number of
+errors, and nothing is rewritten.
+
+(0.30) **std's files.** To the compiler std is one text, `<std>`, which
+no rewrite searched (`nothing matches`, whatever `--in` said). In the
+vole repository that text is compiler/std's files, and a rewrite asked
+for std, `--in std`, `--in std::vec`, `--in compiler/std/vec.vl` (a
+directory of them too), reads std from those files, matches in them and
+writes them: `--list` and the diff name `compiler/std/FILE.vl:LINE`, the
+program (the compiler, from the repository's root) is checked with
+std's new texts (`edit.breaks` when it has a new error: what the program
+uses of std is what is checked), and the files are written as one edit,
+which `undo` takes back. The result ends with `note rewrite.std`:
+`sh compiler/std/embed.sh` and the build are the caller's next steps
+(the compiler's own std text is the old one until then); `volec check
+--std` checks every body of std's files, the generic functions the
+program does not instantiate too, which this edit's check does not see. A run rewrites
+std or the program, not both (`error rewrite.std`). Where std has no
+files (a program outside the repository) `--in std` gets `note
+rewrite.std`: std is the compiler's text there and is not searched.
 
 Nothing matches: `note rewrite.none`, exit 0; when sites matched but for
 --where, `note rewrite.types` gives the first one's type and place, and
@@ -478,17 +684,27 @@ as it changes the program through the edit engine (`edit_replace`,
 | `refactor.no-call`, `refactor.ambiguous` | error | 1 | inline: no call (on the line of `--at`), several there | `query refs` |
 | `refactor.nested` | note | 0 | inline: calls left in the arguments of others | |
 | `refactor.script` | error | 1, 2 | a line is no command, a command failed: nothing written | |
+| `refactor.batch` | error; note | 2, 1; 0 | (0.30) signature --batch: FILE unreadable, a line that is not FN PARAM TYPE [DEFAULT], a line whose change cannot be made (nothing written); no lines | |
+| `refactor.literals` | note; warning | 1; 0 | (0.30) field --type: the literals that keep their old value of the field, when the edit is refused or written with --no-check | `--default EXPR` |
+| `edit.rounds` | note | 0 | (0.30) field --allocator: the rounds of `fix --only alloc` run on the edited program before its check | |
+| `refactor.fold` | warning; note | 0 | (0.30) fold: calls left because their arguments call functions; NAME has no call to fold | |
+| `refactor.unused` | note | 0 | (0.30) fold: the items whose every use was in the code that went | `edit delete NAME` |
 | `rewrite.pattern`, `rewrite.unbound` | error | 2 | the pattern or replacement does not parse, a hole alone, `$x...` outside a list, a hole of the replacement not in the pattern and bound by it nowhere, a bad `~/RE/` | |
-| `rewrite.bad-in` | error | 1 | `--in` names no file or module | |
+| `rewrite.bad-in` | error | 1 | `--in` or `--not-in` names no file, module or item | |
+| `rewrite.at-errors` | note | 0 | (0.30) `--at-errors TEXT`: sites that matched where no such error is (left); no error of the program has TEXT | `volec check --max-errors=0` |
+| `rewrite.from` | error; note | 2; 0 | (0.30) `--from FILE`: a line that is no `PATTERN -> REPLACEMENT` (`FILE:LINE`, nothing run), a file that cannot be read; no patterns in it | |
+| `rewrite.std` | note; error | 0; 1 | (0.30) std's files rewritten: embed.sh and the build are next; std has no files here and is not searched; sites in std and in the program in one run (nothing written) | `sh compiler/std/embed.sh` |
+| `rewrite.recursive` | error (note with `--force`) | 1 | (0.30) sites inside the function the replacement calls there: nothing written | the command with `--not-in` those functions; with `--force` |
 | `rewrite.none` | note | 0 | nothing matches | |
 | `rewrite.types` | note | 0 | sites match but for --where | the command with the type found |
-| `rewrite.nested`, `rewrite.untyped` | note | 0 | sites left inside rewritten ones, in unchecked code | |
+| `rewrite.nested`, `rewrite.untyped` | note | 0 | sites left inside rewritten ones, in unchecked code (0.30: the first five named) | |
 
 ## Known limits
 
 - A pattern's names match by name (`grow` matches any function or
-  variable named `grow`); holes do not stand for names of functions,
-  fields or methods, nor for patterns other than a `let`'s.
+  variable named `grow`); a hole stands for the name of a field or a
+  method (0.30), not for a path's segment or a struct literal's field,
+  nor for patterns other than a `let`'s.
 - Parenthesizing knows the operators' binding powers; a replacement
   placed where a struct literal is not allowed (an `if`'s condition) is
   not parenthesized for it: the check refuses it.

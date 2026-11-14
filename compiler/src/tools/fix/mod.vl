@@ -587,11 +587,29 @@ fn rust_trait_import(u: i64, local: i64, pcx: &mut Ctx<Comp>) -> bool {
     item > 0 && pcx.nodes[item as usize].kind == NodeKind::Trait
 }
 
+// (0.30) Whether the import of `local` in Use node u (not renamed) brings
+// what the prelude already gives the module: the name resolves there to
+// the item the prelude's name is (an import of another item of that
+// name, `use std::fmt::Result;`, is not one).
+fn prelude_gives(u: i64, id: i64, local: i64, pcx: &mut Ctx<Comp>) -> bool {
+    if pcx.nodes[id as usize].b != 0 {
+        return false;
+    }
+    let m = module_of(u, pcx);
+    let given = crate::front::modules::lookup::prelude_binding(local, m, pcx);
+    if given == crate::front::modules::lookup::B_NONE || binding_kind(given) == B_PRIVATE {
+        return false;
+    }
+    crate::front::modules::lookup::lookup_name(m, local, m, pcx) == given
+}
+
 // The edits removing the imports nothing in their file names (a name
 // written anywhere in the file keeps its import: a local of that name
 // too); their number. `pub use` items are kept (other modules may use
-// what they bring).
-fn unused_import_edits(report: bool, only_report: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) -> i64 {
+// what they bring). `which`: 1 the unused ones, 2 (0.30) the redundant
+// ones (used, but the prelude gives the same item), 3 both.
+fn unused_import_edits(report: bool, which: i64, only_report: &mut Vec<i64, Comp>,
+    pcx: &mut Ctx<Comp>) -> i64 {
     let mut fixes: i64 = 0;
     for u in 1..pcx.nodes.len() as i64 {
         if pcx.nodes[u as usize].kind != NodeKind::Use || pcx.nodes[u as usize].d == 2
@@ -606,6 +624,8 @@ fn unused_import_edits(report: bool, only_report: &mut Vec<i64, Comp>, pcx: &mut
         let f = file_of_pos(pcx.nodes[u as usize].start, pcx);
         let n = pcx.nodes[u as usize].count;
         let mut unused: Vec<i64, Comp> = Vec::new_in(Comp {});
+        // (0.30) the names the prelude gives anyway, among them
+        let mut redundant: Vec<i64, Comp> = Vec::new_in(Comp {});
         for k in 0..n {
             let id = child(u, k, pcx);
             let local = if pcx.nodes[id as usize].b != 0 { pcx.nodes[id as usize].b }
@@ -615,15 +635,24 @@ fn unused_import_edits(report: bool, only_report: &mut Vec<i64, Comp>, pcx: &mut
             if !named_in_file(local, f, u, pcx)
                 && !reached_through(module_of(u, pcx), local, pcx)
                 && !rust_trait_import(u, local, pcx) {
+                if (which & 1) != 0 {
+                    unused.push(k);
+                }
+            } else if (which & 2) != 0 && prelude_gives(u, id, local, pcx) {
+                // (0.30: used, but the prelude brings the same item:
+                // `use.redundant`, removed with the unused ones)
                 unused.push(k);
+                redundant.push(k);
             }
         }
         if unused.len() as i64 == 0 {
             continue;
         }
         if report {
+            // (a redundant one: its node negated)
             for k in 0..unused.len() as i64 {
-                only_report.push(child(u, (unused[k as usize]), pcx));
+                let id = child(u, (unused[k as usize]), pcx);
+                only_report.push(if redundant.contains(&unused[k as usize]) { -id } else { id });
             }
             continue;
         }
@@ -807,7 +836,7 @@ fn pub_edits(tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
 
 // The imports nothing names (query unused): their Ident nodes, into out.
 pub fn unused_imports(out: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
-    unused_import_edits(true, out, pcx);
+    unused_import_edits(true, 1, out, pcx);
 }
 
 // (0.25.2) `check` and a build: each import nothing in its file names is
@@ -820,17 +849,39 @@ pub fn report_unused_imports(pcx: &mut Ctx<Comp>) {
     // checked, is for its own answer)
     let opt_in = pcx.opt_in;
     pcx.opt_in = 0 as *mut u8;
-    unused_import_edits(true, &mut ids, pcx);
+    unused_import_edits(true, 3, &mut ids, pcx);
     pcx.opt_in = opt_in;
     if ids.len() as i64 == 0 {
         return;
     }
     let tries = buf_new();
     buf_tool_command(tries, b"fix --only unused", true, pcx);
-    for &id in ids.as_slice() {
+    let redundant_tries = buf_new();
+    buf_tool_command(redundant_tries, b"fix --only redundant", true, pcx);
+    for &signed in ids.as_slice() {
+        let id = if signed < 0 { -signed } else { signed };
         let n = node_at(id, pcx);
         let local = if n.b != 0 { n.b } else { n.a };
         if name_failed(local, pcx) {
+            continue;
+        }
+        if signed < 0 {
+            // (0.30) used, and the prelude gives it without the import: a
+            // lint of `volec check` and the tools (the LSP, the hooks),
+            // not of a build, which compiles what is written (the suite
+            // builds with --deny-warnings, and 276 of its cases import a
+            // std item by its path because that path is what they test)
+            if !pcx.query && !pcx.check_tests {
+                continue;
+            }
+            let msg = buf_new();
+            buf_str(msg, c"redundant import '");
+            buf_bytes(msg, sym_text(local, pcx));
+            buf_str(msg, c"': the prelude gives it to every module");
+            buf_byte(msg, 0);
+            report_error_tries(n.start, 7002, c"use.redundant", buf_ptr(msg),
+                c"remove it (`volec fix` removes every redundant import)",
+                &buf_copy(redundant_tries), true, pcx);
             continue;
         }
         let msg = buf_new();
@@ -845,12 +896,67 @@ pub fn report_unused_imports(pcx: &mut Ctx<Comp>) {
 
 // ---- Suggested fixes (0.18) ----
 
+// (0.30) Whether the fix replacing SRC[start..end) by `t` renames a field
+// where it is read or written: `x.old` (not a call, `x.old(`) to another
+// name.
+fn field_rename(start: i64, end: i64, t: &[u8], pcx: &Ctx<Comp>) -> bool {
+    let src = get_src();
+    if start <= 0 || end <= start || src[(start - 1) as usize] != b'.' || t.len() == 0 {
+        return false;
+    }
+    for &c in &src[start as usize..end as usize] {
+        if !(c == b'_' || c.is_ascii_alphanumeric()) {
+            return false;
+        }
+    }
+    for &c in t {
+        if !(c == b'_' || c.is_ascii_alphanumeric()) {
+            return false;
+        }
+    }
+    let f = file_of_pos(start, pcx);
+    let mut p = end;
+    while p < pcx.files[f as usize].end && src[p as usize] == b' ' {
+        p += 1;
+    }
+    !(p < pcx.files[f as usize].end && src[p as usize] == b'(')
+}
+
+// (0.30) How many of the exact fixes rename the field the one at
+// SRC[start..end) renames, to the same name (itself counted): a field
+// that is unknown at several sites was removed or renamed, not mistyped,
+// and the nearest field left is another field (0.29: `pcx.entry_count`
+// offered as `pcx.enum_count` at six sites, a fix that compiles and
+// changes what the program does).
+fn same_field_renames(start: i64, end: i64, text: i64, pcx: &Ctx<Comp>) -> i64 {
+    let t = buf_copy(text);
+    if !field_rename(start, end, &t, pcx) {
+        return 0;
+    }
+    let src = get_src();
+    let mut n: i64 = 0;
+    let mut i: usize = 0;
+    while i + 3 < pcx.suggested.len() {
+        let s = pcx.suggested[i + 1];
+        let e = pcx.suggested[i + 2];
+        let other = buf_copy(pcx.suggested[i + 3]);
+        i += 4;
+        if e - s == end - start && src[s as usize..e as usize] == src[start as usize..end as usize]
+            && other == t && field_rename(s, e, &other, pcx) {
+            n += 1;
+        }
+    }
+    n
+}
+
 // The edits of the errors' exact fixes (base::diag's SUGGESTED: a name
 // a did-you-mean offers alone, a conversion, a path from the crate's
 // root, a Rust spelling respelled...); their number. (0.25.2.1) Only
 // those of errors with a code in CODES when it is set (`--codes`); a
 // conversion that loses the value is not made (verify::refusal_of, a
-// `note fix.refused`); each fix made is noted for verify_fixes.
+// `note fix.refused`); each fix made is noted for verify_fixes. (0.30) A
+// did-you-mean of a field unknown at several sites is not made either
+// (same_field_renames).
 pub fn suggested_edits(tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
     let mut fixes: i64 = 0;
     let mut i: i64 = 0;
@@ -867,6 +973,16 @@ pub fn suggested_edits(tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
         k += 1;
         if !user_pos(start, pcx) || (pcx.opt_in != 0 as *mut u8 && !ref_in(start, pcx))
             || !code_taken(kind, tcx, pcx) {
+            continue;
+        }
+        // (0.30) a field unknown at several sites: not a typo
+        let renames = same_field_renames(start, end, text, pcx);
+        if renames > 1 {
+            let w = buf_new();
+            buf_str(w, c"the field is unknown at ");
+            crate::base::buf_int(w, renames);
+            buf_str(w, c" sites: one that was removed or renamed, not mistyped, and the name offered is another field (restore it, or `refactor field STRUCT --rename OLD NEW`)");
+            note_refused(pos, &buf_copy(text), &buf_copy(w), tcx, pcx);
             continue;
         }
         let why = refusal_of(start, end, text, pcx);
