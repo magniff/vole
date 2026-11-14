@@ -473,4 +473,52 @@ case "$rc:$got" in
     *) bad bless_needs_names "exit $rc: $got" ;;
 esac
 
+# ---- tests/book/run.sh -u (0.30) ----
+
+# A console block that differs is rewritten with what the shell prints,
+# the prose and the other blocks kept; one with a `...` line is left, and
+# still fails; the chapter then passes but for that block. (No compiler
+# is needed for a chapter of sessions: /bin/sh stands for it.)
+B="$WORK/book"
+mkdir -p "$B"
+printf '%s\n' '# A chapter' '' 'Prose.' '' '```console' '$ echo hello' 'goodbye' '$ echo again' '```' '' 'More prose.' '' \
+    '```console' '$ printf "a\nb\n"' '...' 'c' '```' >"$B/01-sessions.md"
+printf '%s\n' '# A chapter' '' 'Prose.' '' '```console' '$ echo hello' 'hello' '$ echo again' 'again' '```' '' 'More prose.' '' \
+    '```console' '$ printf "a\nb\n"' '...' 'c' '```' >"$B/want.md"
+got=$(sh "$ROOT/tests/book/run.sh" -c /bin/sh -f "$B/01-sessions.md" -u 2>&1)
+rc=$?
+again=$(sh "$ROOT/tests/book/run.sh" -c /bin/sh -f "$B/01-sessions.md" 2>&1)
+if [ $rc -eq 1 ] && cmp -s "$B/01-sessions.md" "$B/want.md" \
+    && printf '%s\n' "$got" | grep -q '^updated 01-sessions:5: its console block' \
+    && printf '%s\n' "$got" | grep -q '^FAIL 01-sessions:13: the session differs' \
+    && printf '%s\n' "$got" | grep -q '^book: 1 blocks rewritten (-u) in 1 chapters' \
+    && printf '%s\n' "$again" | grep -q '^pass 01-sessions:5$' \
+    && printf '%s\n' "$again" | grep -q '^book: 1 passed, 1 failed$'; then
+    ok book_update_console
+else
+    bad book_update_console "exit $rc: $(printf '%s\n' "$got" | grep -v '^    ' | tr '\n' ';') then $(printf '%s\n' "$again" | tail -1); $(diff "$B/want.md" "$B/01-sessions.md" | head -5 | tr '\n' ';')"
+fi
+# With a compiler ($VOLE_TEST_COMPILER, as tests/run.sh gives it, or
+# target/volec): an out block and an err block rewritten, the chapter
+# then passing.
+BC=${VOLE_TEST_COMPILER:-$ROOT/target/volec}
+if [ -x "$BC" ]; then
+    printf '%s\n' '# A chapter' '' '```vole' 'fn main() -> i32 {' '    println("two");' '    0' '}' '```' '' '```out' 'one' '```' '' \
+        'Prose.' '' '```vole' 'fn main() -> i32 {' '    let x: i32 = "a";' '    0' '}' '```' '' '```err' 'wrong' 'text' 'here' 'and here' '```' \
+        >"$B/02-blocks.md"
+    got=$(sh "$ROOT/tests/book/run.sh" -c "$BC" -f "$B/02-blocks.md" -u 2>&1)
+    again=$(sh "$ROOT/tests/book/run.sh" -c "$BC" -f "$B/02-blocks.md" 2>&1)
+    rc=$?
+    if [ $rc -eq 0 ] && printf '%s\n' "$got" | grep -q '^updated 02-blocks:3: its out block' \
+        && printf '%s\n' "$got" | grep -q '^updated 02-blocks:16: its err block' \
+        && [ "$(sed -n 11p "$B/02-blocks.md")" = two ] && grep -q '^Prose\.$' "$B/02-blocks.md" \
+        && printf '%s\n' "$again" | grep -q '^book: 2 passed, 0 failed$'; then
+        ok book_update_out_err
+    else
+        bad book_update_out_err "$(printf '%s\n' "$got" | grep -v '^    ' | tr '\n' ';') then exit $rc: $(printf '%s\n' "$again" | grep -v '^    ' | tr '\n' ';')"
+    fi
+else
+    echo "skip runner_book_update_out_err: no compiler (VOLE_TEST_COMPILER, target/volec)"
+fi
+
 exit $BAD
