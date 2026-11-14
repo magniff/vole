@@ -1400,7 +1400,9 @@ outside the holes named below.
   `copy_nonoverlapping`, `slice_parts`) is through the raw pointer as
   `*p` is: it has no move path (D8.1), so reading a `T` with drop glue
   out of it is a bitwise copy that leaves the source as it was, not
-  `borrowck.move_out`, and a store into it drops nothing. rustc's
+  `borrowck.move_out`, and a store into it drops nothing (0.30: unlike
+  `*p = v`, which drops the old value as Rust's does, places-ir.md
+  §3.8: `p[i] = v` is the write that `ptr::write` is made of). rustc's
   `ptr::read` is an intrinsic; in std2 it is this rule, stated in one
   module that the front confines it to, and the caller's `unsafe`
   contract (only one of the two copies is dropped) is `ptr::read`'s.

@@ -515,7 +515,10 @@ u128 (0.29)`.
 **F30.1 (`*p` is a place).** For `p: *const T` or `*mut T`, `*p` is a
 place of type `T` (readable, and writable through `*mut`), legal only
 in an `unsafe` block or fn (today's rule); its projections `(*p).f`,
-`(*p)[i]`, `(*p).0` are places of the field's type. `&(*p).f` is a
+`(*p)[i]`, `(*p).0` are places of the field's type. (0.30) An assignment
+to one drops the old value first, as any place's does and as Rust's
+(places-ir.md §3.8): it must be initialized; `ptr::write` writes
+without the drop. `&(*p).f` is a
 **reference** `&'r T_f` (`&mut (*p).f` a `&'r mut T_f` for `p: *mut`),
 `'r` a fresh region unrelated to any loan (borrowck.md D3.8's raw-deref
 rule: the reference is as trusted as the `unsafe` that made it), not a
