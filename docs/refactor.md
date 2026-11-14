@@ -495,14 +495,37 @@ new-module` makes the modules of a path).
 
 ## Editing std by name (0.17)
 
-(0.28.0) Not at the moment: the one std is one text, and an edit whose
-target is a std item is refused, `error edit.not-source: str::trim is in
-<std>, not in a file of the program`. Edit the file under
-`compiler/std/` (`query def` and `query show` name it and its line),
-`volec fmt` it, run `compiler/std/embed.sh` (the commit hook does too),
-which makes `compiler/src/front/stdsrc.vl`, and rebuild. What follows
-is the old std's, 0.17 to 0.27, and comes back with the files read as
-modules.
+(0.28.0) Not by name at the moment: the one std is one text, and an
+edit whose target is a std item is refused, `error edit.not-source:
+str::trim is in <std>, not in a file of the program`.
+
+(0.30) What works, and what the error's `try:` line, the edit hook and
+`volec guide how add-std-fn` all name: std's file, patched as text.
+
+```
+$ volec edit patch std::mem::swap --old 'A' --new 'B'
+error edit.not-source: std::mem::swap is in <std>, not in a file of the program
+try: volec edit patch compiler/std/mem.vl --old 'TEXT' --new 'TEXT'
+note edit.std: the item is at compiler/std/mem.vl:10; std's files are patched as text (OLD exact, once in the file), then: sh compiler/std/embed.sh
+$ volec edit patch compiler/std/mem.vl --old 'A' --new 'B'
+patched compiler/std/mem.vl→compiler/std/mem.vl→+1 -1 lines (a file of std: not checked by this edit)
+run: sh compiler/std/embed.sh (std's text as the compiler has it: front/stdsrc.vl; ...)
+note edit.std: ran compiler/std/embed.sh: compiler/src/front/stdsrc.vl has std's new text; rebuild to use it (bootstrap/bootstrap.sh --dev)
+```
+
+OLD is matched exactly, once in the file (`--nth N`, `--all`); the edit
+is journaled (`volec undo`). It is not checked by the edit: `volec check
+--std` checks every body of std's files as they are, the generic
+functions no program instantiates too (the edit hook runs it after a
+change to compiler/std), and `volec check` of a program reads the
+edited files. `volec fix --suggested` makes the exact fix of an error
+in std's own code in std's file (`fixed compiler/std/mem.vl:22: writ ->
+write`), std's first and alone, and says `run: sh
+compiler/std/embed.sh`; a fix in std of an error in a program is not
+offered. The Edit tool on the file works as before (`query def` and
+`query show` name it and its line); then `volec fmt` it and run
+`compiler/std/embed.sh` (the commit hook does too). What follows is the
+old std's, 0.17 to 0.27, and comes back with the files read as modules.
 
 In the vole repository (`compiler/std/` with its `embed.sh`, from the
 current directory or one of the three above it), an edit whose target

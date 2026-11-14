@@ -1474,13 +1474,70 @@ def main():
     # the formatted file's
     new_text = fmt_new_file(event, compiler, cwd, edited)
     got = verify(event, st, compiler, root, cwd, edited)
+    # (0.30) a file of std changed: every body of std, too
+    std_text = std_check(compiler, edited or cwd) if std_edit(event, edited) else ""
     if got is None:
         hs.save(event, st)
-        return say("\n".join(t for t in (fmt_text, new_text, stale) if t))
+        return say("\n".join(t for t in (fmt_text, new_text, stale, std_text) if t))
     text, rec = got
     hs.save(event, st)
     record(event, cwd, rec)
-    return say("\n".join(t for t in (fmt_text, new_text, stale, text) if t))
+    return say("\n".join(t for t in (fmt_text, new_text, stale, text, std_text) if t))
+
+
+# (0.30) std's bodies. `volec check` of a program checks the generic
+# functions of std that the program instantiates; a body nothing
+# instantiates had its errors found late (0.29: std edits whose effect
+# declarations lacked `unsafe`). After a change to a file of compiler/std
+# the hook also runs `volec check --std` (std alone, every generic
+# function by its opaque instance: a few seconds) and says what it found.
+STD_CHECK_LINES = 8
+
+
+def std_edit(event, edited):
+    """Whether the event changed a file of compiler/std: the file edited,
+    or a volec command whose result names std's embed.sh (an `edit patch
+    compiler/std/FILE.vl`, a `fix --suggested` in std)."""
+    if edited and edited.endswith(".vl") \
+            and "/compiler/std/" in os.path.abspath(edited).replace(os.sep, "/"):
+        return True
+    if event.get("tool_name") == "Bash":
+        command = (event.get("tool_input") or {}).get("command", "")
+        resp = event.get("tool_response") or {}
+        out = (resp.get("stdout") or "") if isinstance(resp, dict) else str(resp)
+        return "compiler/std/" in command and "compiler/std/embed.sh" in out
+    return False
+
+
+def std_check(compiler, where):
+    """`volec check --std` in where's checkout, by compiler or else the
+    checkout's target/volec (a compiler before 0.30 has no --std): a line
+    saying it passed, or its count and first errors; "" when no compiler
+    could run it."""
+    top = checkout_root(where)
+    if not top:
+        return ""
+    for c in (compiler, os.path.join(top, "target", "volec")):
+        if not c or not os.path.exists(c):
+            continue
+        r = run_typed(c, top, ["check", "--std"])
+        if r is None:
+            continue
+        lines = ((r.stdout or "") + (r.stderr or "")).splitlines()
+        if any("check.usage" in line for line in lines):
+            continue
+        errors = [line for line in lines if ": error[" in line]
+        if r.returncode == 0 and not errors:
+            return "volec check --std: ok (every body of std, its generic functions without an instance)"
+        if not errors:
+            return ""
+        shown = [line if len(line) <= 400 else line[:400] + " ..." for line in errors[:STD_CHECK_LINES]]
+        more = len(errors) - len(shown)
+        return "\n".join(
+            ["volec check --std: %d error%s in std's bodies (a body no program instantiates is checked "
+             "only so)" % (len(errors), "" if len(errors) == 1 else "s")]
+            + shown + (["(%d more: volec check --std)" % more] if more > 0 else []))
+    return ""
 
 
 def say(text):

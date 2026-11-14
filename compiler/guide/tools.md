@@ -92,6 +92,7 @@ bodies.
 | what nothing uses | `volec query unused` |
 | sizes, dependencies | `volec query stats`, `query deps MODULE` |
 | std's API, a std item | `volec query items std`, `query show std::io::stdin` (any program; a re-exported name too: `query show std::gpu::Color`) |
+| std's files, in the vole repository (0.30) | `query grep TEXT --in compiler/std/FILE.vl` (`--std`: all of std), `query items compiler/std/FILE.vl`; an error in std prints as `compiler/std/FILE.vl:L:C`; `edit patch compiler/std/FILE.vl --old A --new B`; `volec check --std`: every body of std, a generic one nothing instantiates too |
 | what a snippet does | `volec try 'let v = [3, 1]; v.len()'` prints `usize = 2` |
 | build a program and run it (0.25.4) | `volec run [DIR] [OPTIONS] [-- ARGS]` (DIR/main.vl; rebuilt only when it changed; the binary in volec's cache, never in DIR) |
 | the guide on some words | `volec guide --find WORDS`, `guide TOPIC#SECTION`, `explain WORDS` |
@@ -252,3 +253,25 @@ tables), `--trace` (0.17: a failure prints its line and callers),
 `--emit-imports`, `-I DIR`, `--version`; `--emit-ir` and `--emit-mir`
 (the IR after the optimizer, after instruction selection) print to
 stdout, or to `-o FILE`. `volec guide TOPIC` for the language.
+
+## Seeing what the optimizer did
+
+`volec build --help` lists these (0.30); each prints on stderr.
+
+| you want | run |
+|---|---|
+| the IR a function ends as | `volec --emit-ir FILE.vl` (stdout; `--emit-mir`: after instruction selection) |
+| the IR after every pass, of one function | `--print-after-all=FN` (`--print-after-all`: every function's); `--verify-ir` names the pass that breaks the IR |
+| where the compile time goes | `--time-passes` (CPU time by phase); `--time-passes=instructions` (instructions retired: a loaded machine hardly moves them); `--time-passes=passes` (each optimizer pass too); `--time-passes=json` (one JSON object, the counts whole); `volec check --time-passes=instructions` (the front end's phases) |
+| two compilers on one input, by pass | `tools/perf-diff.sh A B FILE.vl` (`--check`, `-O0`, `-n RUNS`, `--inline`: the inlining decisions that differ) |
+| a worktree against a baseline: self-build -O2 and -O0, check, the compile-cost programs | `tools/perf-experiment.sh [-b BASELINE] [WORKTREE]` (`--passes`, `--bench`) |
+| the benchmarks' own instructions against a baseline | `bench/run.sh --instructions -p BASELINE` |
+| why a loop was not vectorized | `--vec-stats=FN` (a line per loop of FN; `--vec-stats`: the counts) |
+| what the inliner decided | `VOLE_INLINE_LOG=FILE volec --no-cache -j1 ...` (a line a decision: caller, callee, the rule); `tools/inline-log-diff.py A.log B.log` |
+| the checks left, the attributes inferred | `--print-checks[=FILTER]`, `--print-attrs`, `--print-effects`, `--stats=functions` |
+| one transform off, to compare | `--no-vectorize`, `--no-slp`, `--no-ifconv`, `--no-unroll-runtime`, `--no-egraph`, `--no-noalias` |
+
+The instruction counter is the system's: macOS's per-thread count,
+Linux's `perf_event_open` (a container may refuse it: `error
+[time.instructions]`; `--time-passes` then counts CPU time). A build
+that counts runs on one thread.

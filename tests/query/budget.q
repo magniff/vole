@@ -214,7 +214,7 @@ usage: volec query def|show NAME... [--root ROOT] [--exact] [--with-comments]
        volec query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]
        volec query items [MODULE...] [--comments]
        volec query show MODULE::section TITLE
-       volec query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
+       volec query grep PATTERN... [--in FILE|MODULE|ITEM] [--std] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
        volec query type FILE:LINE[:COL]...
        volec query contracts NAME...   (0.27.2.1: its requires and ensures; a trait method's, then each impl's: what it adds, the trait's marked)
        volec query drops FILE:LINE...   (0.26.1: the function's drops as the places IR decides them, each with where it runs)

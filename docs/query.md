@@ -836,6 +836,37 @@ compiler/std/io.vl`) reads std from its files. Elsewhere std is the
 compiler's text, `<std>`. The edits of std items: refactor.md, "Editing
 std by name".
 
+(0.30) There, std's files are named everywhere a position or a filter
+is:
+
+- `query grep TEXT --in compiler/std/FILE.vl` searches that file of std
+  (its part of std's text, so a hit has its item), `query refs NAME --in
+  compiler/std/FILE.vl` the uses in it; `--std` is `--in std`. The hits
+  are grouped by std's file, `# compiler/std/mem.vl`, with its lines
+  (`22:16→code→std::mem::swap→...`), not `# <std>` and the text's;
+- `query items compiler/std/FILE.vl` lists that module (`# std::mem→
+  compiler/std/mem.vl`, the file's lines); `query items --std` std's
+  modules;
+- an error in std's code prints as `compiler/std/mem.vl:22:9: error[..]`
+  (`check`, a build, `--json`'s `file` and `line`), and `fix
+  --suggested` makes its fix there (refactor.md);
+- `volec check --std [ROOT]` checks every body of std: besides what
+  `check` does, each generic function of std by its opaque instance
+  (type parameters with only their bounds), with no instance of a
+  program's, so an effect its `#[effects(..)]` lacks, or an unsafe
+  operation outside `unsafe`, in a body nothing instantiates is an
+  error at std's file. With no ROOT it checks std alone (a few
+  seconds). `note check.std` counts the functions checked so and the
+  bodies the opaque model does not cover (their other errors are the
+  model's and are not reported: those bodies are checked at their
+  instances).
+
+Where std is the compiler's text (`$VOLE_STD_TREE=none`: the
+transcripts; a program outside the repository) the positions are
+`<std>:L:C` as before, which the runners compare normalized
+(tests/stdpos.awk); `query def '<std>:L'` names the item at a line of
+it. tests/stdtools.sh pins all of this.
+
 ## similar and examples (0.17)
 
 `query similar NAME...` prints the items like NAME, nearest first (3,
