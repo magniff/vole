@@ -518,6 +518,39 @@ else
     bad affected_names "git could not make the repository"
 fi
 
+# ---- bootstrap/selftest-prune.sh (0.30) ----
+
+# Of a temporary directory's entries, only the self-test's own old ones
+# go: not a new one, one holding a file the self-test does not write,
+# one whose gate still runs, a link, another name.
+T="$WORK/tmpdir"
+mkdir -p "$T/vole-gate-selftest.aaaaaa/gate.lock" "$T/vole-gate-selftest.aaaaaa/runs" "$T/vole-gate-selftest.aaaaaa/stub4" \
+    "$T/vole-gate-selftest.bbbbbb" "$T/vole-gate-selftest.cccccc" "$T/vole-gate-selftest.dddddd" \
+    "$T/vole-gate-selftest.eeeeee/gate.lock" "$T/vole-gate-other.ffffff" "$T/vole-gate-selftest.toolong" "$T/elsewhere"
+sh -c 'exit 0' &
+dead=$!
+wait $dead
+printf 'pid=%s\n' "$dead" >"$T/vole-gate-selftest.aaaaaa/gate.lock/owner"
+echo x >"$T/vole-gate-selftest.aaaaaa/a.out"
+echo x >"$T/vole-gate-selftest.cccccc/a.out"
+echo mine >"$T/vole-gate-selftest.dddddd/notes.txt"
+printf 'pid=%s\n' "$$" >"$T/vole-gate-selftest.eeeeee/gate.lock/owner"
+ln -s "$T/elsewhere" "$T/vole-gate-selftest.gggggg"
+for d in aaaaaa bbbbbb dddddd eeeeee; do touch -t 202001010000 "$T/vole-gate-selftest.$d"; done
+touch -t 202001010000 "$T/vole-gate-other.ffffff" "$T/vole-gate-selftest.toolong" "$T/elsewhere"
+dry=$(sh "$ROOT/bootstrap/selftest-prune.sh" -n "$T" | tail -1)
+kept_all=$(ls "$T" | wc -l | tr -d ' ')
+got=$(sh "$ROOT/bootstrap/selftest-prune.sh" "$T")
+left=$(ls "$T" | tr '\n' ' ')
+want="selftest-prune: removed 2 of 6 in $T (left: vole-gate-selftest.cccccc: changed within a day; vole-gate-selftest.dddddd: holds notes.txt, which the self-test does not write; vole-gate-selftest.eeeeee: its gate (pid $$) runs; vole-gate-selftest.gggggg: a link)"
+if [ "$got" = "$want" ] && [ "$kept_all" = 9 ] && [ "${dry#selftest-prune: would remove 2 of 6 }" != "$dry" ] \
+    && [ "$left" = "elsewhere vole-gate-other.ffffff vole-gate-selftest.cccccc vole-gate-selftest.dddddd vole-gate-selftest.eeeeee vole-gate-selftest.gggggg vole-gate-selftest.toolong " ] \
+    && [ -f "$T/vole-gate-selftest.dddddd/notes.txt" ] && [ -d "$T/elsewhere" ]; then
+    ok selftest_prune
+else
+    bad selftest_prune "got '$got'; left: $left; dry: $dry ($kept_all entries after it)"
+fi
+
 # ---- tests/run.sh --bless (0.30) ----
 
 # In a small tree of its own (run.sh, the directives' parse, two cases)
