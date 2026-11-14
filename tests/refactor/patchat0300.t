@@ -94,7 +94,7 @@ error edit.usage: with --at, every pair follows an --at FILE:LINE
 try: volec edit patch NAME --old OLD --new NEW
 [exit 2]
 $ edit patch --from $T/inputs/batch-queries.txt
-error patch.format: the list's line 2: three fields, two tabs between them, are needed; a patch is one line, FILE:LINE[:COL]<TAB>OLD<TAB>NEW (\t, \n, \\ in OLD and NEW)
+error patch.format: the list's line 2: three fields, two tabs between them, are needed; a line is FILE:LINE[:COL]<TAB>OLD<TAB>NEW (\t, \n, \\ in the texts)
 [exit 2]
 $ edit apply --keep-going < $T/inputs/patchat-list.txt
 error edit.usage: --keep-going is for --at

@@ -485,6 +485,49 @@ output keep the cause.
   with --no-check`, with the `--no-check` line as its `try:`.
 - **`--no-check`** is the last `try:`, as before.
 
+## edit justify (0.30)
+
+```sh
+volec edit justify FILE:LINE --unsafe TEXT --safety TEXT [ROOT]
+volec edit justify --from LIST            # -: stdin
+```
+
+Writes the comments of an unsafe site above it: `// UNSAFE: TEXT` (why
+it cannot be safe) and `// SAFETY: TEXT` (why it is sound), on the lines
+above the site's line, indented like it, the words wrapped at 100
+columns (a newline in TEXT starts a line). FILE:LINE is the site as
+`volec query unsafe` lists it; `query unsafe --unjustified --source`
+prints each site's lines under it, to write the texts from.
+
+```sh
+$ volec edit justify main.vl:2 --unsafe "the pointer is the caller's, raw" --safety 'every caller passes the address of a live i64' --show
+justified 1 site	main.vl	+2 -0 lines
+// main.vl:2-3
+2	    // UNSAFE: the pointer is the caller's, raw
+3	    // SAFETY: every caller passes the address of a live i64
+```
+
+- Several sites are one call: `FILE:LINE --unsafe .. --safety ..`
+  repeats, or `--from LIST`, a site a line,
+  `FILE:LINE<TAB>UNSAFE TEXT<TAB>SAFETY TEXT` (`\n`, `\t`, `\\` in the
+  texts; an empty text for a comment the site already has; `#` lines
+  skipped). Every line is the file's before the edit, so one `query
+  unsafe` run serves the whole list: the insertions do not move the
+  sites after them (0.29: 119 comments took eight regenerations of the
+  listing).
+- A site that cannot be justified so is named, `error edit.justify:
+  site 3 (main.vl:17): ...`, and nothing is written (`--keep-going`
+  writes the others, exit 1): no site starts on the line (the nearest
+  is named); the site still lacks a comment (only `--unsafe` given);
+  the audit would not count a comment above the line (a site in `} else
+  if unsafe { .. } {`, whose statement starts on the line that ends the
+  block before: write it by hand).
+- The audit's rules are unchanged: the command writes the text it is
+  given, and the result is checked with the audit's own reading of the
+  edited file. It does not narrow a block: shrinking an `unsafe { }`
+  around a whole body to the one expression that needs it is left to
+  `edit patch` (no `--narrow`).
+
 ## edit wrap
 
 `edit wrap TARGET --in HEAD [--body | --lines A-B]` (0.13) puts a
@@ -1025,6 +1068,7 @@ rename's own test and the script.
 | `edit.std` | warning | 0 | (0.17) the same, and embed.sh failed | `compiler/std/embed.sh` |
 | `check.std-files` | note | 0 | (0.17) std's files differ from the compiler's std: checked with them | |
 | `patch.sites` | error, warning | 1 | `edit patch --at|--from`: N of M patches do not match (each named above it); nothing written, or with `--keep-going` the others are | fix the named patches, or `--keep-going` |
+| `edit.justify` | error, warning | 1 | `edit justify`: a site that cannot be justified by a comment above its line (no site there, a comment still missing, a line the audit does not read), then how many are left | the message's reason; `--keep-going` writes the others |
 | `edit.breaks` | error | 1 | the edit adds errors (they are printed); nothing written | the command with `--no-check` |
 | `edit.breaks` | warning | 1 | the same with `--dry-run` (`--no-check` runs no check and says nothing, 0.30) | `volec check` |
 | `edit.refactor` | note | | (0.15) with edit.breaks: an edited item's shape changed and its uses broke | the refactoring that changes them with it |
