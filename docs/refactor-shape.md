@@ -14,7 +14,8 @@ anything query accepts.
 ```
 volec refactor signature FN --add 'x: T [= VALUE]' [--at N] [--fill-calls] | --remove x
                                | --rename-param a b | --reorder b,a,c | --type x T [--default EXPR]
-volec refactor field STRUCT --add 'g: T = VALUE' | --remove g | --rename g h | --type g T
+volec refactor field STRUCT --add 'g: T = VALUE' | --remove g | --rename g h
+                            | --type g[,h...] T [--default EXPR] [--allocator X] [--rewrite PAT REPL]...
 volec refactor variant ENUM --add 'X(T, ...)'|'X { a: T, ... }' [--arm EXPR] [--arm-in SITE EXPR]... | --remove V | --rename V W
 volec rewrite 'PATTERN' 'REPLACEMENT' [--where '$x: T']... [--subst 'P' 'R']... [--in FILE|MODULE|ITEM]... [--list]
 volec rewrite 'PATTERN' --list [--where ...] [--in FILE|MODULE|ITEM]   (0.16)
@@ -110,6 +111,36 @@ accesses.
 - `--rename g h`: every reference (definition, literals, accesses); a
   field shorthand (0.15) `S { g }` becomes `S { h: g }`.
 - `--type g T`: the field's type; the check says what no longer fits.
+  `--default EXPR` (0.17) gives each literal its new value of the field
+  (`$g` in EXPR: the old one). (0.30) When the edit is refused, or
+  written with `--no-check`, and literals keep their old value, `note
+  refactor.literals` (a warning with `--no-check`) names them: before, a
+  literal left as `IntVec { .. }` under a `Vec` field was found by the
+  next check.
+- (0.30) `--type f,g,h T`: several fields to one type, one edit.
+- (0.30) `--allocator X`, for a T that holds an allocator (`'Vec<i64,
+  A>'`): the struct becomes generic over it, `S<A: Allocator>`, the
+  field is `Vec<i64, A>` and the struct's uses name X (`S<Gpa>`,
+  `S<Comp>`), which is what `fix --only alloc` does after the fact: its
+  rounds run on the edited program before the check (`note
+  edit.rounds`), in the same edit. T may say `A` or X. Without
+  `--allocator`, a T that names a parameter the struct has not (and no
+  type) is `error refactor.usage` saying so; before, the edit was
+  written and the program had `unknown type 'A'`.
+- (0.30) `--rewrite PAT REPL` (repeatable): the uses of the field (of
+  each field of the list), rewritten in the same edit. PAT and REPL are
+  `rewrite`'s; the hole `$f` of PAT is an access of the field (`x.g`
+  where x is the struct, as the checker typed it), typed as the program
+  is before the change, so the edit is checked once, after both:
+
+  ```
+  volec refactor field Cx --type regs,uses 'Vec<i64, A>' --allocator Gpa \
+      --default 'Vec::new_in(gpa)' --rewrite '$f.get($i)' '$f[$i as usize]'
+  ```
+
+  A site inside the function its replacement calls is refused as
+  `rewrite` refuses it. The same accesses for a rewrite of its own:
+  `rewrite PAT REPL --where '$x: field STRUCT.NAME'` (or `NAME,NAME`).
 
 A `#[repr(C)]` struct's layout changes with --add, --remove and --type:
 `warning refactor.layout` (C code sharing it must change too).
@@ -176,6 +207,7 @@ by the compiler's parser, with holes:
 | `$e.$f`, `$e.$m($a...)` | (0.30) the name of a field, of a method: `(*$p.add($i)).$f` is every field read through that pointer, one rewrite for all of them; in the replacement `$f` is the name it matched, wherever a name stands (`$t[$i].$f`, `T::$m($e)`); `$f~/RE/` and `--where '$f: name ~ RE'` narrow it |
 | `c"$s"`, `b"$s"`, `"$s"` | (0.30) the text of a string literal of that kind (the same prefix), and of no other: `c"$s"` to `b"$s\0"` touches C-string literals only; in the replacement `$s` is that text inside any literal, among other text too |
 | `--where '$x: T'` | only where the checker typed $x's expression `T` (as messages write types: `&mut IntVec`, `[u8]`, `Vec<i64>`; spaces aside); several: `--where '$x: T, $y: U'` or `--where` again |
+| `--where '$x: field S.f'` (or `S.f,g`) | (0.30) only an access of that field of struct S, `e.f` where the checker typed `e` an S (a reference to one): the uses of a field, whatever the variable is called |
 | `--where '$x: name'`, `--where '$x: name ~ RE'`, `$x~/RE/` | (0.16) only a name: an identifier or a path (`V`, `crate::m::V`, the name a `for` or `let` binds), not another expression (`IRFUNCS[f].blocks`); with RE, a name whose text RE matches (`^ $ . * + ? [a-z] [^...] \d \w`, anywhere unless anchored: `$v~/^v_/`) |
 
 The pattern is matched against every node as parsed (`--in FILE|MODULE`:
@@ -580,6 +612,8 @@ as it changes the program through the edit engine (`edit_replace`,
 | `refactor.no-call`, `refactor.ambiguous` | error | 1 | inline: no call (on the line of `--at`), several there | `query refs` |
 | `refactor.nested` | note | 0 | inline: calls left in the arguments of others | |
 | `refactor.script` | error | 1, 2 | a line is no command, a command failed: nothing written | |
+| `refactor.literals` | note; warning | 1; 0 | (0.30) field --type: the literals that keep their old value of the field, when the edit is refused or written with --no-check | `--default EXPR` |
+| `edit.rounds` | note | 0 | (0.30) field --allocator: the rounds of `fix --only alloc` run on the edited program before its check | |
 | `rewrite.pattern`, `rewrite.unbound` | error | 2 | the pattern or replacement does not parse, a hole alone, `$x...` outside a list, a hole of the replacement not in the pattern and bound by it nowhere, a bad `~/RE/` | |
 | `rewrite.bad-in` | error | 1 | `--in` or `--not-in` names no file, module or item | |
 | `rewrite.at-errors` | note | 0 | (0.30) `--at-errors TEXT`: sites that matched where no such error is (left); no error of the program has TEXT | `volec check --max-errors=0` |

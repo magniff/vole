@@ -28,7 +28,7 @@ use crate::tools::refactor_shape::{
 };
 use crate::tools::refactor_shape::signature::with_argument;
 use crate::tools::rewrite::sort_by_start;
-use crate::tools::rewrite::parsed::{pa, pb, pc, pchild, pcount, pend, pk, pstart};
+use crate::tools::rewrite::parsed::{pa, pb, pc, pchild, pcount, pend, pg, pk, pstart};
 
 // ---- refactor field ----
 
@@ -141,6 +141,40 @@ pub fn rename_refs(old: i64, new: i64, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>)
     n
 }
 
+fn is_word_byte(c: u8) -> bool {
+    (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') || c == b'_'
+}
+
+// Whether struct node s has a type parameter named `name`.
+fn has_param(s: i64, name: i64, pcx: &Ctx<Comp>) -> bool {
+    let g = pg(s, pcx);
+    if g == 0 {
+        return false;
+    }
+    for i in 0..pcount(g, pcx) {
+        if pa(pchild(g, i, pcx), pcx) == name {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether `word` names a type of the program (a struct, an enum, an alias,
+// a trait).
+fn names_type(word: &[u8], tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> bool {
+    let mut found: Vec<i64, Comp> = Vec::new_in(Comp {});
+    crate::tools::query::defs::find_defs(word, false, &mut found, tcx, pcx);
+    for k in 0..found.len() {
+        let kind = pcx.defs[found[k] as usize].kind;
+        if kind == K_STRUCT || kind == crate::tools::query::defs::K_ENUM
+            || kind == crate::tools::query::defs::K_ALIAS
+            || kind == crate::tools::query::defs::K_TRAIT {
+            return true;
+        }
+    }
+    false
+}
+
 fn field_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     wgx: &mut WgslCx<Arena<Gpa>>) -> i64 {
     set_command(c.line, tcx);
@@ -173,11 +207,31 @@ fn field_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
         return usage_error(c"--default goes with --type (the literals' new value)",
             c"STRUCT --type f T --default EXPR", tcx, pcx);
     }
+    // (0.30: --type's `--rewrite PAT REPL` pairs and `--allocator X`)
+    let allocator = opt(opts.as_slice(), c"--allocator", false);
+    let mut pairs: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut o: usize = 0;
+    while o + 2 < opts.len() {
+        if crate::base::streq(opts[o] as *mut u8, c"--rewrite") {
+            pairs.push(opts[o + 1]);
+            pairs.push(opts[o + 2]);
+            o += 2;
+        }
+        o += 1;
+    }
+    if (allocator != 0 as *mut u8 || pairs.len() > 0) && retype == 0 as *mut u8 {
+        return usage_error(c"--rewrite and --allocator go with --type",
+            c"STRUCT --type f,g 'Vec<i64, A>' --allocator Gpa --rewrite '$f.get($i)' '$f[$i]'", tcx,
+            pcx);
+    }
     let name = c_slice((words[0]) as *mut u8);
     tcx.root_given = root;
     root = root_or_diag(root, tcx.sub, &name, true, tcx, pcx);
     if root == 0 as *mut u8 {
         return 2;
+    }
+    if allocator != 0 as *mut u8 {
+        tcx.round_only = c"alloc";
     }
     let mut status: i64 = 0;
     let d = load_and_find(root, &name, 1 << K_STRUCT, c"struct", &mut status, tcx, pcx, wgx);
@@ -189,6 +243,8 @@ fn field_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     let mut lits: Vec<i64, Comp> = Vec::new_in(Comp {});
     literals_of(s, &mut lits, tcx, pcx);
     let what = buf_new();
+    let mut kept_lits: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut kept_field: i64 = 0;
     let layout = (pc(s, pcx) & REPR_C) != 0 && rename == 0 as *mut u8;
     if add != 0 as *mut u8 {
         let text = c_slice(add);
@@ -321,25 +377,98 @@ fn field_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
         buf_str(what, c", ");
         put_count(what, n - 1, c"use", c"uses");
     } else {
-        let fname = intern(&c_slice(retype), pcx);
-        let k = field_index(s, fname, pcx);
-        if k < 0 {
-            return no_member(d, s, retype, c"field", tcx, pcx);
+        // (0.30: several fields, `--type f,g,h T`, each as one was)
+        let list = c_slice(retype);
+        let mut fields: Vec<i64, Comp> = Vec::new_in(Comp {});
+        let mut at: usize = 0;
+        while at <= list.len() {
+            let mut e = at;
+            while e < list.len() && list[e] != b',' {
+                e += 1;
+            }
+            if e > at {
+                let fname = intern(&list[at..e], pcx);
+                if field_index(s, fname, pcx) < 0 {
+                    let b = buf_new();
+                    buf_bytes(b, &list[at..e]);
+                    return no_member(d, s, crate::tools::proc::buf_cstr(b), c"field", tcx, pcx);
+                }
+                fields.push(fname);
+            }
+            at = e + 1;
         }
-        let ty = c_slice(opt(opts.as_slice(), c"--type", true));
-        let t = pb(pchild(s, k, pcx), pcx);
-        edit_replace(pstart(t, pcx), pend(t, pcx), text_buf(&ty), pcx);
-        // (0.17: --default EXPR, each literal's value of the field
-        // becomes EXPR, `$NAME` the old value)
+        if fields.len() == 0 {
+            return usage_error(c"--type takes a field (or fields, f,g,h) and a type",
+                c"STRUCT --type f T --default EXPR", tcx, pcx);
+        }
+        // (0.30: a type that names the struct's allocator parameter, `A`,
+        // which the struct has not: with `--allocator X` the field holds
+        // X and the rounds of `fix --only alloc` before the check make the
+        // struct generic over it, `S<A: Allocator>`, and its uses `S<X>`;
+        // without it, an error saying so)
+        let given = c_slice(opt(opts.as_slice(), c"--type", true));
+        let ty_buf = buf_new();
+        let mut w: usize = 0;
+        while w < given.len() {
+            let mut e = w;
+            while e < given.len() && is_word_byte(given[e]) {
+                e += 1;
+            }
+            if e == w {
+                buf_byte(ty_buf, given[w]);
+                w += 1;
+                continue;
+            }
+            let word = &given[w..e];
+            let lone = e - w == 1 && word[0] >= b'A' && word[0] <= b'Z';
+            if lone && !has_param(s, intern(word, pcx), pcx) && !names_type(word, tcx, pcx) {
+                if allocator == 0 as *mut u8 {
+                    let e2 = diag(c"error", c"refactor.usage", tcx);
+                    buf_str(e2, c"'");
+                    buf_bytes(e2, word);
+                    buf_str(e2, c"' in the new type is no parameter of ");
+                    buf_bytes(e2, fqn);
+                    buf_str(e2, c" and no type: `--allocator X` (the allocator its uses have: Gpa, an arena's type) makes the struct generic over its allocator, `");
+                    buf_bytes(e2, sym_text(pcx.defs[d as usize].name, pcx));
+                    buf_str(e2, c"<A: Allocator>`, and names X at its uses, in this edit\n");
+                    return 2;
+                }
+                buf_str(ty_buf, allocator);
+            } else {
+                buf_bytes(ty_buf, word);
+            }
+            w = e;
+        }
+        let ty = buf_copy(ty_buf);
+        // (the ranges this edit rewrites, which a --rewrite site must not
+        // touch: a literal's value that --default replaces)
+        let program_end = pcx.parsed_nodes.len() as i64;
+        let mut done: Vec<i64, Comp> = Vec::new_in(Comp {});
         let mut changed: i64 = 0;
-        if default != 0 as *mut u8 {
-            for i in 0..lits.len() as i64 {
-                let l = (lits[i as usize]);
+        for f in 0..fields.len() {
+            let fname = fields[f];
+            let k = field_index(s, fname, pcx);
+            let t = pb(pchild(s, k, pcx), pcx);
+            edit_replace(pstart(t, pcx), pend(t, pcx), text_buf(&ty), pcx);
+            done.push(pstart(t, pcx));
+            done.push(pend(t, pcx));
+            for i in 0..lits.len() {
+                let l = lits[i];
                 for j in 0..pcount(l, pcx) {
                     let fi = pchild(l, j, pcx);
                     if pk(fi, pcx) != NodeKind::FieldInit || pa(fi, pcx) != fname {
                         continue;
                     }
+                    if default == 0 as *mut u8 {
+                        // (0.30: the literals that keep their value of the
+                        // field, said when the edit is refused or written
+                        // unchecked)
+                        kept_lits.push(pstart(fi, pcx));
+                        kept_field = fname;
+                        continue;
+                    }
+                    // (0.17: --default EXPR, each literal's value of the
+                    // field becomes EXPR, `$NAME` the old value)
                     let v = pb(fi, pcx);
                     let value = with_argument(&c_slice(default), sym_text(fname, pcx),
                         &get_src()[pstart(v, pcx) as usize..pend(v, pcx) as usize]);
@@ -348,19 +477,68 @@ fn field_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
                     buf_str(init, c": ");
                     buf_append(init, value);
                     edit_replace(pstart(fi, pcx), pend(fi, pcx), init, pcx);
+                    done.push(pstart(fi, pcx));
+                    done.push(pend(fi, pcx));
                     changed += 1;
                 }
             }
         }
-        buf_str(what, c"changed field ");
-        buf_bytes(what, sym_text(fname, pcx));
+        // (0.30: --rewrite PAT REPL, the uses of the fields: `$f` in PAT is
+        // an access of one of them, typed as the program is before the
+        // change; the sites are edits of this edit, checked with it)
+        let mut rewritten: i64 = 0;
+        if pairs.len() > 0 {
+            let wh = buf_new();
+            buf_str(wh, c"$f: field ");
+            buf_bytes(wh, &name);
+            buf_byte(wh, b'.');
+            buf_bytes(wh, &list);
+            let mut wheres: Vec<i64, Comp> = Vec::new_in(Comp {});
+            wheres.push(crate::tools::proc::buf_cstr(wh) as i64);
+            let mut p: usize = 0;
+            while p + 1 < pairs.len() {
+                // (the pattern names the access, `$f`)
+                let pat = c_slice(pairs[p] as *const u8);
+                let mut has_f = false;
+                let mut q: usize = 0;
+                while q + 1 < pat.len() {
+                    has_f = has_f
+                        || (pat[q] == b'$' && pat[q + 1] == b'f'
+                            && (q + 2 == pat.len() || !is_word_byte(pat[q + 2])));
+                    q += 1;
+                }
+                if !has_f {
+                    return usage_error(
+                        c"--rewrite's PATTERN names the access of the field as the hole `$f`",
+                        c"STRUCT --type f T --rewrite '$f.get($i)' '$f[$i]'", tcx, pcx);
+                }
+                let n = crate::tools::rewrite::rewrite_uses(pairs[p] as *mut u8,
+                    pairs[p + 1] as *mut u8, wheres.as_slice(), program_end, &mut done, tcx, pcx);
+                if n < 0 {
+                    return 1;
+                }
+                rewritten += n;
+                p += 2;
+            }
+        }
+        buf_str(what, if fields.len() == 1 { c"changed field " } else { c"changed fields " });
+        for f in 0..fields.len() {
+            if f > 0 {
+                buf_str(what, c", ");
+            }
+            buf_bytes(what, sym_text(fields[f], pcx));
+        }
         buf_str(what, c" to ");
-        buf_bytes(what, &ty);
+        buf_bytes(what, &given);
         buf_str(what, c" in ");
         buf_bytes(what, fqn);
         if default != 0 as *mut u8 {
             buf_str(what, c", ");
             put_count(what, changed, c"literal", c"literals");
+        }
+        if pairs.len() > 0 {
+            buf_str(what, c", ");
+            put_count(what, rewritten, c"use rewritten", c"uses rewritten");
         }
     }
     if layout {
@@ -368,5 +546,29 @@ fn field_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
         buf_bytes(e, fqn);
         buf_str(e, c" is #[repr(C)]: its layout changes (C code sharing it must change too)\n");
     }
-    apply_edit(&buf_copy(what), root, tcx, pcx)
+    let status = apply_edit(&buf_copy(what), root, tcx, pcx);
+    if kept_lits.len() > 0 && (status != 0 || tcx.no_check) {
+        let e = diag(if tcx.no_check { c"warning" } else { c"note" }, c"refactor.literals", tcx);
+        put_count(e, kept_lits.len() as i64, c"literal", c"literals");
+        buf_str(e, c" of ");
+        buf_bytes(e, fqn);
+        buf_str(e, if kept_lits.len() == 1 { c" keeps the value it had for " }
+            else { c" keep the value they had for " });
+        buf_bytes(e, sym_text(kept_field, pcx));
+        buf_str(e, c" (");
+        for i in 0..kept_lits.len() {
+            if i == 3 {
+                buf_str(e, c", ...");
+                break;
+            }
+            if i > 0 {
+                buf_str(e, c", ");
+            }
+            put_loc(e, kept_lits[i], pcx);
+        }
+        buf_str(e, c"): --default EXPR gives each its new value (`$");
+        buf_bytes(e, sym_text(kept_field, pcx));
+        buf_str(e, c"` in EXPR: the old one)\n");
+    }
+    status
 }
