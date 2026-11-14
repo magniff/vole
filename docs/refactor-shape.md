@@ -466,7 +466,9 @@ std's new texts (`edit.breaks` when it has a new error: what the program
 uses of std is what is checked), and the files are written as one edit,
 which `undo` takes back. The result ends with `note rewrite.std`:
 `sh compiler/std/embed.sh` and the build are the caller's next steps
-(the compiler's own std text is the old one until then). A run rewrites
+(the compiler's own std text is the old one until then); `volec check
+--std` checks every body of std's files, the generic functions the
+program does not instantiate too, which this edit's check does not see. A run rewrites
 std or the program, not both (`error rewrite.std`). Where std has no
 files (a program outside the repository) `--in std` gets `note
 rewrite.std`: std is the compiler's text there and is not searched.
