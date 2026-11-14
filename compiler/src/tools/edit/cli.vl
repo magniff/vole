@@ -75,7 +75,7 @@ pub fn edit_opts(gpa: Gpa) -> Vec<Opt<'static>, Gpa> {
     let mut o: Vec<Opt<'_>, Gpa> = Vec::new_in(gpa);
     o.push(flag("dry-run", "the diff only, nothing written"));
     o.push(flag("show", "the diff after"));
-    o.push(flag("no-check", "write despite new errors"));
+    o.push(flag("no-check", "write unchecked: no check runs"));
     o.push(flag("exact", "the NAME as written, not its end"));
     o.push(flag("force", "edit a generated file too"));
     o.push(option("root", "ROOT", "the program's root file"));
@@ -181,6 +181,9 @@ fn run_edit_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     if word == "apply" {
         return run_apply(c, tcx, pcx, wgx);
     }
+    if word == "justify" {
+        return crate::tools::edit::justify::run_justify(c, tcx, pcx, wgx);
+    }
     let replace = word == "replace";
     let insert = word == "insert";
     let delete = word == "delete";
@@ -188,16 +191,23 @@ fn run_edit_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
         let d = diag(c"error", c"edit.usage", tcx);
         buf_str(d, c"unknown command '");
         buf_str(d, cmd);
-        buf_str(d, c"' (patch, apply, replace, insert, delete, wrap, new-file, resolve)\n");
+        buf_str(d,
+            c"' (patch, apply, replace, insert, delete, wrap, new-file, resolve, justify)\n");
         return 2;
     }
     let mut after = false;
     let mut before = false;
     let mut root = 0 as *const u8;
     let mut names: Vec<i64, Comp> = Vec::new_in(Comp {});
+    // (0.30) `--to LAST`: NAME through LAST (edit/span.vl)
+    let mut last = 0 as *const u8;
     for e in c.evs.iter().copied() {
         let mut ev = e;
-        if ev.kind == EV_FLAG && ev.name == "after" {
+        if ev.kind == EV_OPTION && ev.name == "to" {
+            last = ev.value;
+        } else if ev.kind == EV_MISSING && ev.name == "to" {
+            return usage(c"--to needs the last item's NAME", tcx, pcx);
+        } else if ev.kind == EV_FLAG && ev.name == "after" {
             after = true;
         } else if ev.kind == EV_FLAG && ev.name == "before" {
             before = true;
@@ -223,6 +233,9 @@ fn run_edit_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     }
     if insert && after == before {
         return usage(c"insert needs --after or --before", tcx, pcx);
+    }
+    if insert && last != 0 as *const u8 {
+        return usage(c"--to is for replace and delete", tcx, pcx);
     }
     let name = c_slice((names[0]) as *mut u8);
     let what = if insert { if after { c"insert --after" } else { c"insert --before" } }
@@ -277,6 +290,24 @@ fn run_edit_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
             return apply_edit(&buf_copy(summary), root, tcx, pcx);
         }
     }
+    // (0.30) An impl block, by the FILE:LINE of its header: an impl has
+    // no name, and the line resolved to the type it is for.
+    let mut s_from: i64 = 0;
+    let mut s_head: i64 = 0;
+    let mut s_to: i64 = 0;
+    if last == 0 as *const u8
+        && crate::tools::edit::span::impl_span(&name, &mut s_from, &mut s_head, &mut s_to, pcx) {
+        tcx.add_imports = !delete;
+        if !crate::tools::edit::span::span_edit(how, s_from, s_head, s_to, input, pcx) {
+            return 1;
+        }
+        let summary = buf_new();
+        buf_str(summary, if replace { c"replaced" } else if delete { c"deleted" }
+            else if after { c"inserted after" } else { c"inserted before" });
+        buf_str(summary, c" the impl block at ");
+        buf_bytes(summary, &name);
+        return apply_edit(&buf_copy(summary), root, tcx, pcx);
+    }
     let mut matches: Vec<i64, Comp> = Vec::new_in(Comp {});
     if !resolve_name(what, &name, &mut matches, tcx, pcx) {
         return 1;
@@ -299,6 +330,32 @@ fn run_edit_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     let summary = buf_new();
     // (0.14: the imports the new text needs, when it has new errors)
     tcx.add_imports = !delete;
+    if last != 0 as *const u8 {
+        // (0.30) NAME through LAST, one span
+        let last_name = c_slice(last);
+        let mut ends: Vec<i64, Comp> = Vec::new_in(Comp {});
+        if !resolve_name(what, &last_name, &mut ends, tcx, pcx) {
+            return 1;
+        }
+        source_only(&mut ends, pcx);
+        if ends.len() as i64 > 1 {
+            ambiguous(what, &last_name, ends.as_slice(), tcx, pcx);
+            return 1;
+        }
+        let d2 = ends[0];
+        if !crate::tools::edit::span::range_span(d, d2, &mut s_from, &mut s_head, &mut s_to, tcx,
+            pcx) {
+            return 1;
+        }
+        if !crate::tools::edit::span::span_edit(how, s_from, s_head, s_to, input, pcx) {
+            return 1;
+        }
+        buf_str(summary, if replace { c"replaced " } else { c"deleted " });
+        buf_bytes(summary, sym_text(pcx.defs[d as usize].fqn, pcx));
+        buf_str(summary, c" through ");
+        buf_bytes(summary, sym_text(pcx.defs[d2 as usize].fqn, pcx));
+        return apply_edit(&buf_copy(summary), root, tcx, pcx);
+    }
     if !item_edit(how, d, input, summary, tcx, pcx) {
         return 1;
     }
@@ -644,6 +701,7 @@ pub fn edit_leaf(gpa: Gpa) -> Leaf<'static, Gpa> {
     let mut opts = edit_opts(gpa);
     opts.push(flag("after", "insert after NAME"));
     opts.push(flag("before", "insert before NAME"));
+    opts.push(option("to", "LAST", "replace, delete: NAME through LAST, a run of adjacent items"));
     Leaf::new(opts, "name")
 }
 
@@ -685,6 +743,8 @@ pub fn check_leaf(gpa: Gpa) -> Leaf<'static, Gpa> {
     opts.push(flag("changed",
         "the programs of the files changed since the branch's base, and fmt --check of them"));
     opts.push(option("since", "REV", "--changed, since REV"));
+    // (0.30) the list as it was: every site its own line
+    opts.push(flag("each", "every error its own line: repeats not grouped"));
     Leaf::new(opts, "file")
 }
 
@@ -748,6 +808,13 @@ pub fn run_check(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     let mut bad = 0 as *const u8;
     let mut changed = false;
     let mut since = 0 as *const u8;
+    // (0.30) the plain list (no --diagnostics, --json or --each, not a
+    // terminal's): an error repeated at many sites is one line
+    // (diag::write_errors_grouped), and without --max-errors the check
+    // records CHECK_SITES sites and prints CHECK_LINES lines, so that one
+    // name missing at 41 sites does not hide the errors after it
+    let mut grouped = !pcx.rich && !crate::base::json::get_diag_json();
+    let mut each = false;
     for e in c.evs.iter().copied() {
         let mut ev = e;
         let token = c.word(ev.at);
@@ -767,7 +834,12 @@ pub fn run_check(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
             since = ev.value;
         } else if ev.kind == EV_FLAG && ev.name == "deny-warnings" {
             pcx.deny_warnings = true;
+        } else if ev.kind == EV_FLAG && ev.name == "each" {
+            // (every site its own line, of as many sites)
+            each = grouped;
+            grouped = false;
         } else if ev.kind == EV_OPTION && ev.name == "diagnostics" {
+            grouped = false;
             if token == "--diagnostics=human" || token == "--diagnostics=short" {
                 pcx.diag_short = token == "--diagnostics=short";
             } else {
@@ -800,6 +872,10 @@ pub fn run_check(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
             return 2;
         }
         return crate::tools::changed::run_check_changed(c.prog(), since, tcx, pcx);
+    }
+    let own_limit = pcx.max_errors != 50;
+    if (grouped || each) && !own_limit {
+        pcx.max_errors = crate::base::diag::CHECK_SITES;
     }
     // UNSAFE: the front end's fatal errors return through setjmp/longjmp (a
     // C call) to the block pcx.err_bail names.
@@ -862,7 +938,12 @@ pub fn run_check(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
             }
         }
         if error_count(pcx) > 0 {
-            write_errors(pcx);
+            if grouped {
+                crate::base::diag::write_errors_grouped(
+                    if own_limit { 0 } else { crate::base::diag::CHECK_LINES }, pcx);
+            } else {
+                write_errors(pcx);
+            }
             check_summary(root, error_count(pcx), pcx.warnings_shown, pcx);
             timer_report(pcx);
             return 1;

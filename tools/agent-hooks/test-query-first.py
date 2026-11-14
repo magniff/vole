@@ -212,9 +212,14 @@ st, err = blocked("cat > /tmp/w/a.txt <<'EOF'\nx\nEOF\nsed -i '' 's/a/b/' compil
 case("sed -i on a compound line: nothing ran, which part", err.splitlines()[0],
      "blocked hook.edit-tool: NOTHING on this line ran (3 commands; commands 1 and 3 would have run alone): command 2 (`sed -i '' 's/a/b/' "
      "compiler/src/range.vl`) (sed -i) rewrites the compiler's source (compiler/src/range.vl)")
-# (0.25.2.2) the line less the blocked command, to run as it is
-case("sed -i on a compound line: the rest, to run as it is", err.splitlines()[2:6],
-     ["try the line without it (the rest did not run either): cat > /tmp/w/a.txt <<'EOF'", "x", "EOF", "ls"])
+# (0.25.2.2) the line less the blocked command; (0.30) a here-document's
+# body is never given back (a block message once repeated 300 lines)
+case("sed -i on a compound line: the rest, its here-document not repeated", err.splitlines()[2:6],
+     ["then the line without it (the rest did not run either; its here-documents as typed, not repeated here): "
+      "cat > /tmp/w/a.txt <<'EOF'", "(the here-document's 1 line, as typed)", "EOF", "ls"])
+st, err = blocked("ls; sed -i '' 's/a/b/' compiler/src/range.vl; pwd")
+case("sed -i on a compound line without a here-document: the rest, to run as it is", err.splitlines()[2],
+     "try the line without it (the rest did not run either): ls; pwd")
 st, err = blocked("sed -i 's/x.*y/z/g' compiler/src/a.vl compiler/src/b.vl")
 case("sed -i regex", (st, "edit patch compiler/src/a.vl:LINE --old 'TEXT' --new 'TEXT'" in err), (True, True))
 case("sed -Ei", blocked("sed -Ei.bak 's/a/b/' compiler/std/vec.vl")[0], True)
@@ -381,11 +386,57 @@ line = ("cd %s && python3 - <<'EOF'\np = '/tmp/q/main.vl'\ns = open(p).read()\no
         "grep -n \"monotonic_now\\|pub fn\" compiler/std/time*.vl 2>/dev/null; ls" % TREE)
 st, err = blocked(line)
 rest = [l for l in err.splitlines(True) if l.startswith("try the line without it")]
-k = err.find("try the line without it (the rest did not run either): ")
-case("compound, eval qwen35 round 2: the line without the grep, to run as it is",
-     (st, err[k:].split("\nallowed:")[0] if k >= 0 else err),
-     (True, "try the line without it (the rest did not run either): cd %s && python3 - <<'EOF'\np = "
-            "'/tmp/q/main.vl'\ns = open(p).read()\nopen(p, 'w').write(s)\nEOF\nls" % TREE))
+k = err.find("then the line without it (the rest did not run either")
+case("compound, eval qwen35 round 2: the line without the grep, its here-document not repeated",
+     (st, err[k:].split("\nallowed:")[0] if k >= 0 else err, "open(p).read()" in err),
+     (True, "then the line without it (the rest did not run either; its here-documents as typed, not repeated "
+            "here): cd %s && python3 - <<'EOF'\n(the here-document's 3 lines, as typed)\nEOF\nls" % TREE, False))
+# (0.30) A long here-document on a blocked line: none of its body in the message.
+body = "\n".join("line %d of the script" % i for i in range(300))
+st, err = blocked("cat > /tmp/w/s.py <<'EOF'\n%s\nEOF\ngrep -n foo compiler/src/main.vl; ls" % body)
+case("a 300-line here-document is not echoed", (st, "of the script" in err, len(err) < 1500,
+                                                 "(the here-document's 300 lines, as typed)" in err),
+     (True, False, True, True))
+case("no_bodies: the body left out, the rest kept",
+     hook.no_bodies("a && cat > f <<EOF\nx\ny\nEOF\nb"), "a && cat > f <<EOF\n(the here-document's 2 lines, as typed)\nEOF\nb")
+# (0.30) A worktree with no compiler yet: the try: lines run the main
+# checkout's tools binary with the worktree's root; with none anywhere,
+# the command that builds one.
+import tempfile as _tf
+_tmp = _tf.mkdtemp()
+_main = os.path.join(_tmp, "main")
+_wt = os.path.join(_main, ".claude", "worktrees", "w")
+for _t in (_main, _wt):
+    os.makedirs(os.path.join(_t, "compiler", "src"))
+    os.makedirs(os.path.join(_t, "tools", "agent-hooks"))
+    open(os.path.join(_t, "compiler", "src", "main.vl"), "w").write("fn main() {}\n" * 400)
+os.makedirs(os.path.join(_main, ".git", "worktrees", "w"))
+open(os.path.join(_main, ".git", "worktrees", "w", "commondir"), "w").write("../..\n")
+open(os.path.join(_wt, ".git"), "w").write("gitdir: %s\n" % os.path.join(_main, ".git", "worktrees", "w"))
+case("tree_compilers: none yet", hook.tree_compilers(_wt), (None, None, _wt))
+os.makedirs(os.path.join(_main, "target", "tools"))
+_c = os.path.join(_main, "target", "tools", "volec")
+open(_c, "w").write("#!/bin/sh\n")
+os.chmod(_c, 0o755)
+case("tree_compilers: the main checkout's", hook.tree_compilers(_wt), (None, _c, _wt))
+_root = os.path.join(_wt, "compiler", "src", "main.vl")
+_st, _err, _ = run({"hook_event_name": "PreToolUse", "tool_name": "Bash", "cwd": _wt,
+                    "tool_input": {"command": "grep -n 'fn main' compiler/src/main.vl"}})
+case("no compiler in the worktree: the try: runs the main checkout's with --root",
+     (_st, [l for l in _err.splitlines() if l.startswith("try: ")][:2],
+      "this worktree has no compiler yet" in _err),
+     (2, ["try: %s query grep 'fn main' --in compiler/src/main.vl --root %s" % (_c, _root),
+          "try: %s query show main --root %s" % (_c, _root)], True))
+os.makedirs(os.path.join(_wt, "target", "tools"))
+open(os.path.join(_wt, "target", "tools", "volec"), "w").write("#!/bin/sh\n")
+os.chmod(os.path.join(_wt, "target", "tools", "volec"), 0o755)
+_st, _err, _ = run({"hook_event_name": "PreToolUse", "tool_name": "Bash", "cwd": _wt,
+                    "tool_input": {"command": "grep -n 'fn main' compiler/src/main.vl"}})
+case("a compiler in the worktree: the try: as before",
+     ([l for l in _err.splitlines() if l.startswith("try: ")][:2], "no compiler" in _err),
+     (["try: target/tools/volec query grep 'fn main' --in compiler/src/main.vl", "try: volec query show main"], False))
+import shutil as _sh
+_sh.rmtree(_tmp)
 case("line_without: a pipeline goes whole, the separator before it",
      hook.line_without("a && grep x big.vl | head -3 && c", (), ["grep x big.vl"]), "a && c")
 case("line_without: nothing left but a cd", hook.line_without("cd /x && grep x big.vl", (), ["grep x big.vl"]), None)
