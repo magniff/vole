@@ -3450,3 +3450,24 @@ loops that must stay nested), `opt_range_arms` (the swap's checks, the
 last element's, a check that must stay), `std_sort_introsort` (1071
 inputs of seven shapes, and McIlroy's adversary into the heapsort),
 `opt_inline_room`, `opt_vec_usize_lanes` (its XFAIL gone).
+
+## 0.30: the compiler's own speed
+
+The -O2 self-build went from 127.0 G to 106.3 G instructions (0.29.0:
+124.7 G to 104.5 G by `tools/perf-experiment.sh`), with every bounds
+check kept; where it went, what the checks cost (21 G, a sixth) and why
+no fact removes them, each change with its measurement, and what is
+left: [compile-speed.md](compile-speed.md). What changed in the
+optimizer:
+
+- `resolve_all` does nothing when no value was replaced since it last
+  ran over the function (`FnCtx.resolved_len`, set by `ir_replace`).
+- The scalar pipeline's second round runs a pass only when the
+  function changed after that pass last ran (`simplify_function`); the
+  one change here that alters the code written (bench geomean +0.03%).
+- The ranges' facts keep their operands (`mark_facts`, `fact_ab`):
+  `narrow_by_facts` decides what it decided, 45% cheaper.
+- Value numbering copies the available set as a block, and
+  `param_written` looks only at the instructions made since.
+- A function with no loop runs the ranges and the dead code only
+  (`optimize_loops`); the dead functions are found with one walk.

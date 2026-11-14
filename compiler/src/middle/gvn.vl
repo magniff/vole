@@ -274,6 +274,10 @@ pub fn root_of(cx: &mut FnCtx<Comp>, v: i64) -> i64 {
 // Marks the frame slots of function `fi` whose address escapes: used other
 // than by loads, stores, copies and address arithmetic.
 pub fn find_escaping_slots(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
+    // (0.30) No slot: nothing to mark (a Slot names one of cx.slots).
+    if cx.slots.is_empty() {
+        return;
+    }
     for i in 0..fn_slot_count(cx, fi) {
         { let at_s = fn_slot(cx, fi, i) as usize; cx.slots[at_s].escapes = 0; }
     }
@@ -547,10 +551,19 @@ pub fn params_disjoint(cx: &mut FnCtx<Comp>, b1: i64, b2: i64, pcx: &Ctx<Comp>) 
 // (index + 1): a store or copy into it, or the parameter passed to a call
 // (or stored, compared... used other than as an address). A bit per
 // parameter, recomputed when the function or its instructions change.
+// (0.30) Inside run_gvn (ro_adding), when instructions were made since
+// (the table is longer), only the new ones are looked at and their bits
+// added: value numbering makes instructions as it goes and asks at every
+// call, and the whole function was walked again each time. Bits are only
+// added then, so an instruction it removed meanwhile leaves its
+// parameter written until the next whole walk (the first question after
+// run_gvn, which forgets bits that were added to): the answer errs to
+// "written".
 pub fn param_written(cx: &mut FnCtx<Comp>, p: i64, pcx: &Ctx<Comp>) -> bool {
-    if cx.ro_fn != cx.irf || cx.ro_stamp != cx.insts.len() as i64 {
+    let len = cx.insts.len() as i64;
+    if cx.ro_fn != cx.irf || cx.ro_stamp > len || cx.ro_stamp < len && cx.ro_adding == 0 {
         cx.ro_fn = cx.irf;
-        cx.ro_stamp = cx.insts.len() as i64;
+        cx.ro_stamp = len;
         cx.ro_written = 0;
         for i in 0..fn_block_count(cx, cx.irf) {
             let b = (fn_block(cx, cx.irf, i));
@@ -559,26 +572,38 @@ pub fn param_written(cx: &mut FnCtx<Comp>, p: i64, pcx: &Ctx<Comp>) -> bool {
             }
             let mut v = (cx.blocks[b as usize]).first;
             while v != 0 {
-                let op = (cx.insts[v as usize]).op;
-                for k in 0..ir_operand_count(cx, v) {
-                    let operand = ir_operand(cx, v, k);
-                    if operand == 0 {
-                        continue;
-                    }
-                    let read = (op == Load && k == 0) || (op == Copy && k == 1)
-                        || (op == Add && (cx.insts[v as usize]).ty == TY_U64) || op == Cmp;
-                    if !read {
-                        let q = param_root(cx, operand, pcx);
-                        if q > 0 && q < 63 {
-                            cx.ro_written = cx.ro_written | (1 << (q - 1));
-                        }
-                    }
-                }
+                param_written_by(cx, v, pcx);
                 v = (cx.insts[v as usize]).next;
             }
         }
+    } else if cx.ro_stamp < len {
+        let from = cx.ro_stamp;
+        cx.ro_stamp = len;
+        cx.ro_adding = 2;
+        for v in from..len {
+            param_written_by(cx, v, pcx);
+        }
     }
     p >= 63 || (cx.ro_written & (1 << (p - 1))) != 0
+}
+
+// The parameters instruction v may write through, added to ro_written.
+fn param_written_by(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) {
+    let op = (cx.insts[v as usize]).op;
+    for k in 0..ir_operand_count(cx, v) {
+        let operand = ir_operand(cx, v, k);
+        if operand == 0 {
+            continue;
+        }
+        let read = (op == Load && k == 0) || (op == Copy && k == 1)
+            || (op == Add && (cx.insts[v as usize]).ty == TY_U64) || op == Cmp;
+        if !read {
+            let q = param_root(cx, operand, pcx);
+            if q > 0 && q < 63 {
+                cx.ro_written = cx.ro_written | (1 << (q - 1));
+            }
+        }
+    }
 }
 
 // Whether no call of the function can write the memory at base: a
@@ -933,6 +958,10 @@ pub fn apply_block_kills(cx: &mut FnCtx<Comp>, b: i64, pcx: &Ctx<Comp>) {
 
 // Removes the stores and copies into private slots that nothing reads.
 fn remove_unread_slot_writes(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
+    // (0.30) No slot: no write of one.
+    if cx.slots.is_empty() {
+        return false;
+    }
     let n = cx.slots.len() as i64 + 1;
     let mut read: Vec<i64, Comp> = Vec::new_in(Comp {});
     read.resize((n) as usize, 0);
@@ -988,6 +1017,8 @@ fn remove_unread_slot_writes(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> 
 
 pub fn run_gvn(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
     resolve_all(cx, fi);
+    // (param_written: the instructions made here add their bits)
+    cx.ro_adding = 1;
     egraph_start(cx);
     build_dom_tree(cx, fi);
     find_escaping_slots(cx, fi, pcx);
@@ -1019,9 +1050,7 @@ pub fn run_gvn(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
     stack.push(0);
     stack.push(0);
     stack.push(saved.len() as i64);
-    for i in 0..cx.avail.len() as i64 {
-        saved.push((cx.avail[i as usize]));
-    }
+    saved.extend_from_slice(cx.avail.as_slice());
     stack.push(cx.avail.len() as i64);
     while stack.len() as i64 > 0 {
         let top = stack.len() as i64 - 5;
@@ -1034,9 +1063,9 @@ pub fn run_gvn(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
             cx.avail.clear();
             let start = (stack[(top + 3) as usize]);
             let n = (stack[(top + 4) as usize]);
-            for i in 0..n {
-                cx.avail.push((saved[(start + i) as usize]));
-            }
+            // (0.30) one block copy: this loop, an element at a time, was
+            // 2% of a -O2 self-build
+            cx.avail.extend_from_slice(&saved[start as usize..(start + n) as usize]);
             if !inherit_into(cx, (cx.order[k as usize]), child, pcx) {
                 cx.avail.clear();
             }
@@ -1047,9 +1076,7 @@ pub fn run_gvn(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
             stack.push(0);
             stack.push(mark);
             stack.push(saved.len() as i64);
-            for i in 0..cx.avail.len() as i64 {
-                saved.push((cx.avail[i as usize]));
-            }
+            saved.extend_from_slice(cx.avail.as_slice());
             stack.push(cx.avail.len() as i64);
         } else {
             gvn_undo(cx, (stack[(top + 2) as usize]));
@@ -1060,6 +1087,10 @@ pub fn run_gvn(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
             }
         }
     }
+    if cx.ro_adding == 2 {
+        cx.ro_fn = -1;
+    }
+    cx.ro_adding = 0;
     if remove_unread_slot_writes(cx, fi, pcx) {
         changed = true;
     }

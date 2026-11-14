@@ -44,7 +44,7 @@ use crate::middle::ir::cfg::{
 };
 use crate::middle::ir::verify::verify_func;
 use crate::middle::licm::run_licm;
-use crate::middle::loops::{rotate_loops, seal_all};
+use crate::middle::loops::{analyze_loops, loop_count, rotate_loops, seal_all};
 use crate::middle::lower::ssa::ssa_undef;
 use crate::middle::lsr::reduce_and_unswitch;
 use crate::middle::parallel::{
@@ -63,6 +63,11 @@ use crate::middle::vectorize::unroll::unroll_runtime_loops;
 // Resolves every operand of every instruction of function `fi` (after
 // replacements).
 pub fn resolve_all(cx: &mut FnCtx<Comp>, fi: i64) {
+    // (0.30) Nothing replaced and no instruction made since the last time:
+    // every operand is resolved already (FnCtx.resolved_len).
+    if cx.resolved_len == cx.insts.len() as i64 && fi == cx.ir_cur {
+        return;
+    }
     for i in 0..fn_block_count(cx, fi) {
         let b = (fn_block(cx, fi, i));
         if (cx.blocks[b as usize]).removed != 0 {
@@ -77,6 +82,7 @@ pub fn resolve_all(cx: &mut FnCtx<Comp>, fi: i64) {
             (cx.blocks[b as usize]).cond = ir_val(cx, (cx.blocks[b as usize]).cond);
         }
     }
+    cx.resolved_len = cx.insts.len() as i64;
 }
 
 // ---- Predecessors and phis ----
@@ -485,18 +491,10 @@ fn thread_jump(cx: &mut FnCtx<Comp>, fi: i64, b: i64) -> bool {
 // Removes the instructions whose values are not used, transitively (mark
 // and sweep from the instructions with side effects and the terminators).
 pub fn eliminate_dead_code(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
-    let mut work: Vec<i64, Comp> = Vec::new_in(Comp {});
-    for i in 0..fn_block_count(cx, fi) {
-        let b = (fn_block(cx, fi, i));
-        if (cx.blocks[b as usize]).removed != 0 {
-            continue;
-        }
-        let mut v = (cx.blocks[b as usize]).first;
-        while v != 0 {
-            (cx.insts[v as usize]).mark = 0;
-            v = (cx.insts[v as usize]).next;
-        }
-    }
+    let mut work: Vec<i64, Comp> = Vec::with_capacity_in(64, Comp {});
+    // (0.30) One walk clears the marks and marks the instructions with an
+    // effect (each its own, after it is cleared); the conditions, which
+    // may be instructions of a block walked later, after it.
     for i in 0..fn_block_count(cx, fi) {
         let b = (fn_block(cx, fi, i));
         if (cx.blocks[b as usize]).removed != 0 {
@@ -505,11 +503,17 @@ pub fn eliminate_dead_code(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bo
         let mut v = (cx.blocks[b as usize]).first;
         while v != 0 {
             if has_effect(cx, v, pcx) {
-                mark_live(cx, v, &mut work);
+                (cx.insts[v as usize]).mark = 1;
+                work.push(v);
+            } else {
+                (cx.insts[v as usize]).mark = 0;
             }
             v = (cx.insts[v as usize]).next;
         }
-        if (cx.blocks[b as usize]).cond != 0 {
+    }
+    for i in 0..fn_block_count(cx, fi) {
+        let b = (fn_block(cx, fi, i));
+        if (cx.blocks[b as usize]).removed == 0 && (cx.blocks[b as usize]).cond != 0 {
             mark_live(cx, (cx.blocks[b as usize]).cond, &mut work);
         }
     }
@@ -576,47 +580,89 @@ pub fn optimize_after_inlining(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
 // The scalar pipeline (-O1), twice: constants, peepholes, control flow,
 // value numbering, dead code. (0.29: pass_done after each, for
 // --time-passes=passes.)
+// (0.30) The second round runs a pass only when the function changed
+// since that pass last ran: `last` is the place in the first round of the
+// last pass that changed it (1 sccp, 2 instcombine, 3 copy elision, 4
+// sroa, 5 constant slots, 6 simplify_cfg, 7 gvn, 8 dead code, 9
+// simplify_cfg, 10 threading on tags), and `again` whether a pass of the
+// second round did. A pass run on what it left has nothing to do.
 pub fn simplify_function(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
+    let mut last: i64 = 0;
+    let mut again = false;
     for round in 0..2 {
-        sccp(cx, fi, pcx);
-        pass_done(P_SCCP, pcx);
-        verify_func(cx, fi, c"sccp", pcx);
-        instcombine(cx, fi, pcx);
-        pass_done(P_INSTCOMBINE, pcx);
-        verify_func(cx, fi, c"instcombine", pcx);
+        if round == 0 || last > 1 {
+            let folded = sccp(cx, fi, pcx);
+            pass_done(P_SCCP, pcx);
+            verify_func(cx, fi, c"sccp", pcx);
+            if folded {
+                if round == 0 { last = 1; } else { again = true; }
+            }
+        }
+        if round == 0 || last > 2 || again {
+            let combined = instcombine(cx, fi, pcx);
+            pass_done(P_INSTCOMBINE, pcx);
+            verify_func(cx, fi, c"instcombine", pcx);
+            if combined {
+                if round == 0 { last = 2; } else { again = true; }
+            }
+        }
         if round == 0 {
             let elided = elide_copies(cx, fi, pcx);
             pass_done(P_COPY_ELISION, pcx);
             if elided {
+                last = 3;
                 verify_func(cx, fi, c"copy elision", pcx);
             }
             let replaced = run_sroa(cx, fi, pcx);
             pass_done(P_SROA, pcx);
             if replaced {
+                last = 4;
                 verify_func(cx, fi, c"sroa", pcx);
             }
             let promoted = promote_constant_slots(cx, fi, pcx);
             pass_done(P_CONST_SLOTS, pcx);
             if promoted {
+                last = 5;
                 verify_func(cx, fi, c"constant slots", pcx);
             }
         }
-        simplify_cfg(cx, fi, pcx);
-        pass_done(P_SIMPLIFY_CFG, pcx);
-        verify_func(cx, fi, c"simplify_cfg", pcx);
-        run_gvn(cx, fi, pcx);
-        pass_done(P_GVN, pcx);
-        verify_func(cx, fi, c"gvn", pcx);
-        eliminate_dead_code(cx, fi, pcx);
-        pass_done(P_DCE, pcx);
-        verify_func(cx, fi, c"dead code elimination", pcx);
-        simplify_cfg(cx, fi, pcx);
-        pass_done(P_SIMPLIFY_CFG, pcx);
-        verify_func(cx, fi, c"simplify_cfg", pcx);
+        if round == 0 || last > 6 || again {
+            let merged = simplify_cfg(cx, fi, pcx);
+            pass_done(P_SIMPLIFY_CFG, pcx);
+            verify_func(cx, fi, c"simplify_cfg", pcx);
+            if merged {
+                if round == 0 { last = 6; } else { again = true; }
+            }
+        }
+        if round == 0 || last > 7 || again {
+            let numbered = run_gvn(cx, fi, pcx);
+            pass_done(P_GVN, pcx);
+            verify_func(cx, fi, c"gvn", pcx);
+            if numbered {
+                if round == 0 { last = 7; } else { again = true; }
+            }
+        }
+        if round == 0 || last > 8 || again {
+            let removed = eliminate_dead_code(cx, fi, pcx);
+            pass_done(P_DCE, pcx);
+            verify_func(cx, fi, c"dead code elimination", pcx);
+            if removed {
+                if round == 0 { last = 8; } else { again = true; }
+            }
+        }
+        if round == 0 || last > 9 || again {
+            let merged = simplify_cfg(cx, fi, pcx);
+            pass_done(P_SIMPLIFY_CFG, pcx);
+            verify_func(cx, fi, c"simplify_cfg", pcx);
+            if merged {
+                if round == 0 { last = 9; } else { again = true; }
+            }
+        }
         if round == 0 {
             let threaded = thread_tags(cx, fi, pcx);
             pass_done(P_THREAD_TAGS, pcx);
             if threaded {
+                last = 10;
                 verify_func(cx, fi, c"threading on tags", pcx);
             }
         }
@@ -837,36 +883,70 @@ fn optimize_loops(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
     // Between the passes a light cleanup only; the scalar pipeline runs
     // once after them (in optimize_program).
     let mut changed = false;
-    // (0.30: a loop that repeats its outer loop's test is part of it)
-    let mut counted = count_loop_exits(cx, fi, pcx);
-    let mut unnested: i64 = 0;
-    while counted == 2 && unnested < 16 {
-        light_cleanup(cx, fi, pcx);
-        counted = count_loop_exits(cx, fi, pcx);
-        unnested += 1;
-    }
-    pass_done(P_LOOP_EXITS, pcx);
-    if counted != 0 || unnested > 0 {
-        changed = true;
-        light_cleanup(cx, fi, pcx);
-    }
-    let rotated = rotate_loops(cx, fi, pcx);
-    pass_done(P_LOOP_ROTATE, pcx);
-    if rotated {
-        changed = true;
-        light_cleanup(cx, fi, pcx);
-    }
-    let transformed = transform_loops(cx, fi, pcx);
-    pass_done(P_LOOP_TRANSFORM, pcx);
-    if transformed {
-        changed = true;
-        light_cleanup(cx, fi, pcx);
+    // (0.30) A function with no loop: the passes over loops have nothing
+    // to do, and each found that out with an analysis of its own (the
+    // dominators, the layout, the loops: nine of them a function). The
+    // loops are looked for once; with none, only the ranges and the dead
+    // code run, and what the others leave behind them is set here (no
+    // loop rotated, none to unroll whole).
+    analyze_loops(cx, fi);
+    let mut loopless = loop_count(cx) == 0;
+    if loopless {
+        cx.rotated.clear();
+    } else {
+        // (0.30: a loop that repeats its outer loop's test is part of it:
+        // count_loop_exits answers 2, and is asked again after a cleanup)
+        let mut counted = count_loop_exits(cx, fi, pcx);
+        let mut unnested: i64 = 0;
+        while counted == 2 && unnested < 16 {
+            light_cleanup(cx, fi, pcx);
+            counted = count_loop_exits(cx, fi, pcx);
+            unnested += 1;
+        }
+        pass_done(P_LOOP_EXITS, pcx);
+        if counted != 0 || unnested > 0 {
+            changed = true;
+            light_cleanup(cx, fi, pcx);
+        }
+        let rotated = rotate_loops(cx, fi, pcx);
+        pass_done(P_LOOP_ROTATE, pcx);
+        if rotated {
+            changed = true;
+            light_cleanup(cx, fi, pcx);
+        }
+        let transformed = transform_loops(cx, fi, pcx);
+        pass_done(P_LOOP_TRANSFORM, pcx);
+        if transformed {
+            changed = true;
+            light_cleanup(cx, fi, pcx);
+        }
     }
     let folded = fold_by_ranges(cx, fi, pcx);
     pass_done(P_RANGES, pcx);
     if folded {
         changed = true;
         light_cleanup(cx, fi, pcx);
+        if loopless {
+            // (threading redirects edges forward and makes no cycle; were
+            // there one, the passes below see it)
+            analyze_loops(cx, fi);
+            loopless = loop_count(cx) == 0;
+        }
+    }
+    if loopless {
+        cx.unroll_whole = false;
+        let removed = aggressive_dce(cx, fi, pcx);
+        pass_done(P_ADCE, pcx);
+        if removed {
+            changed = true;
+            verify_func(cx, fi, c"aggressive dead code elimination", pcx);
+        }
+        if changed {
+            resolve_all(cx, fi);
+            pass_done(P_RESOLVE, pcx);
+            verify_func(cx, fi, c"loop passes", pcx);
+        }
+        return changed;
     }
     // (0.30: a loop counted down to `!= bound` gets a counter from 0, and
     // the other induction variables of a loop counted from 0 are
@@ -962,20 +1042,82 @@ fn light_cleanup(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
 // kept even when every call through it was made direct and inlined: a
 // function used as a value is part of what the program is (and of what
 // the tests look at).
+// (0.30) One walk of the program: it counts the call sites and address
+// uses as count_call_sites does and keeps each function's (`uses`: a
+// callee g as g, a function h whose address is taken as -(h + 1)); a
+// function that dies takes its own from the counts, and what that leaves
+// with none dies in turn. It was a count of the whole program for each
+// round, the last to find nothing: on the main thread, between the
+// tasks' phases. The functions left, and FN_CALLS and FN_ADDRESS of
+// them, are what the rounds ended with.
 fn remove_dead_functions(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
-    let mut changed = true;
-    while changed {
-        changed = false;
-        count_call_sites(cx, pcx);
-        for fi in 0..pcx.irfunc_count {
-            if (pcx.fn_live[fi as usize]) != 0 && (pcx.fn_calls[fi as usize]) == 0
-                && (pcx.fn_address[fi as usize]) == 0
-                && (pcx.fn_taken[fi as usize]) == 0
-                && !fn_is_global(pcx.ir_fn[fi as usize], pcx) {
-                (pcx.fn_live[fi as usize]) = 0;
-                changed = true;
+    let n = pcx.irfunc_count;
+    let mut addr: Vec<i64, Comp> = Vec::new_in(Comp {});
+    addr.resize(n as usize, 0);
+    let mut start: Vec<i64, Comp> = Vec::with_capacity_in(n as usize + 1, Comp {});
+    let mut uses: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for fi in 0..n {
+        (pcx.fn_calls[fi as usize]) = 0;
+        (pcx.fn_address[fi as usize]) = 0;
+    }
+    for fi in 0..n {
+        start.push(uses.len() as i64);
+        if (pcx.fn_live[fi as usize]) == 0 {
+            continue;
+        }
+        ir_enter(cx, fi, pcx);
+        for i in 0..fn_block_count(cx, fi) {
+            let b = (fn_block(cx, fi, i));
+            if (cx.blocks[b as usize]).removed != 0 {
+                continue;
+            }
+            let mut v = (cx.blocks[b as usize]).first;
+            while v != 0 {
+                let g = ir_callee(cx, v, pcx);
+                if g >= 0 {
+                    (pcx.fn_calls[g as usize]) += 1;
+                    uses.push(g);
+                }
+                if (cx.insts[v as usize]).op == Op::FAddr
+                    && (pcx.fn_ir[(cx.insts[v as usize]).imm as usize]) != 0 {
+                    let h = (pcx.fn_ir[(cx.insts[v as usize]).imm as usize]) - 1;
+                    addr[h as usize] += 1;
+                    uses.push(-(h + 1));
+                }
+                v = (cx.insts[v as usize]).next;
             }
         }
+    }
+    start.push(uses.len() as i64);
+    let mut work: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for fi in 0..n {
+        if (pcx.fn_live[fi as usize]) != 0 && (pcx.fn_calls[fi as usize]) == 0
+            && addr[fi as usize] == 0 && (pcx.fn_taken[fi as usize]) == 0
+            && !fn_is_global(pcx.ir_fn[fi as usize], pcx) {
+            (pcx.fn_live[fi as usize]) = 0;
+            work.push(fi);
+        }
+    }
+    while work.len() > 0 {
+        let f = work.pop().unwrap();
+        for k in start[f as usize]..start[(f + 1) as usize] {
+            let u = uses[k as usize];
+            let t = if u >= 0 { u } else { -u - 1 };
+            if u >= 0 {
+                (pcx.fn_calls[t as usize]) -= 1;
+            } else {
+                addr[t as usize] -= 1;
+            }
+            if (pcx.fn_live[t as usize]) != 0 && (pcx.fn_calls[t as usize]) == 0
+                && addr[t as usize] == 0 && (pcx.fn_taken[t as usize]) == 0
+                && !fn_is_global(pcx.ir_fn[t as usize], pcx) {
+                (pcx.fn_live[t as usize]) = 0;
+                work.push(t);
+            }
+        }
+    }
+    for fi in 0..n {
+        (pcx.fn_address[fi as usize]) = if addr[fi as usize] > 0 { 1 } else { 0 };
     }
 }
 
