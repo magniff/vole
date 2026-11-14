@@ -38,10 +38,11 @@ use std::alloc::{Allocator, Arena};
 
 use crate::base::{
     STDOUT, buf_append, buf_at, buf_byte, buf_bytes, buf_copy, buf_int, buf_len, buf_new, buf_str,
-    buf_truncate, buf_write_fd, get_src,
+    buf_truncate, buf_write_fd, get_src, intern,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
+use crate::base::diag::errors_short;
 use crate::cli::line::{
     Call, EV_FLAG, EV_MISSING, EV_OPTION, EV_UNKNOWN, EV_WORD, Leaf, flag, is_opt, option, pair,
 };
@@ -57,9 +58,11 @@ use crate::tools::edit::cli::{edit_opts, take_edit_event};
 use crate::tools::proc::buf_cstr;
 use crate::tools::query::{c_slice, root_or_diag};
 use crate::tools::query::command_line::load_program;
+use crate::tools::query::defs::{K_STRUCT, find_defs};
 use crate::tools::query::diagnostics::{
     diag, diags, program_errors, put_cword, put_root, put_word, try_end, write_diags,
 };
+use crate::tools::query::names::canonical_name;
 use crate::tools::query::positions::{line_of, put_loc, put_path};
 use crate::tools::query::refs::{pos_in, put_bad_in, put_short, ref_in, resolve_in};
 
@@ -67,9 +70,10 @@ use after::{drop_unused_imports, note_site_types, where_hints};
 use guard::{new_callees, self_call};
 use parsed::{callee_levels, pa, parenthesized, pb, pchild, pcount, pend, pk, pstart, slot_levels};
 use pattern::{
-    dropped_use, has_newline, hole_named, hole_of, holes_to_idents, is_name_byte, match_node,
-    note_base_indent, note_breaks, note_clones, note_parts, note_pattern_holes, parens_free,
-    parse_text, replacement_level, replacement_text, rest_hole_of, seq_at, seq_len, types_match,
+    checked_type, dropped_use, has_newline, hole_named, hole_of, holes_to_idents, is_name_byte,
+    match_node, note_base_indent, note_breaks, note_clones, note_parts, note_pattern_holes,
+    parens_free, parse_text, replacement_level, replacement_text, rest_hole_of, seq_at, seq_len,
+    types_match,
 };
 use regex::re_valid;
 use stdfiles::{in_std_path, names_std, note_no_std_files, std_mapped, std_site, write_std};
@@ -137,7 +141,7 @@ fn is_statement(text: *mut u8) -> bool {
 
 // --where `$x: T` (several: `$x: T, $y: U`): the holes' types. False
 // after the diagnostic.
-fn take_where(w: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
+fn take_where(w: *mut u8, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> bool {
     let s = c_slice(w);
     let mut i: i64 = 0;
     while i < s.len() as i64 {
@@ -203,6 +207,71 @@ fn take_where(w: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
             i = q;
             continue;
         }
+        // (0.30: `field S.f`: an access of field f of struct S)
+        if h >= 0 && q + 6 <= s.len() as i64 && s[q as usize..(q + 6) as usize] == b"field " {
+            let mut e = q + 6;
+            while e < s.len() as i64 && !(s[e as usize] == b',' && next_is_hole(&s, e + 1)) {
+                e += 1;
+            }
+            let mut a = q + 6;
+            let mut b = e;
+            while a < b && s[a as usize] == b' ' {
+                a += 1;
+            }
+            while b > a && s[(b - 1) as usize] == b' ' {
+                b -= 1;
+            }
+            let mut dot = b - 1;
+            while dot > a && s[dot as usize] != b'.' {
+                dot -= 1;
+            }
+            let mut node: i64 = -1;
+            let mut several = false;
+            if dot > a {
+                let mut found: Vec<i64, Comp> = Vec::new_in(Comp {});
+                find_defs(canonical_name(&s[a as usize..dot as usize]), false, &mut found, tcx,
+                    pcx);
+                for k in 0..found.len() {
+                    if pcx.defs[found[k] as usize].kind == K_STRUCT {
+                        several = node >= 0;
+                        node = pcx.defs[found[k] as usize].node;
+                    }
+                }
+            }
+            // (the field, or fields `a,b,c`: `,a,b,c,` in a buffer)
+            let names = buf_new();
+            let mut has = node >= 0 && dot > a;
+            let mut f0 = dot + 1;
+            buf_byte(names, b',');
+            while has && f0 < b {
+                let mut f1 = f0;
+                while f1 < b && s[f1 as usize] != b',' {
+                    f1 += 1;
+                }
+                let fname = intern(&s[f0 as usize..f1 as usize], pcx);
+                let mut found_field = false;
+                for k in 0..pcount(node, pcx) {
+                    found_field = found_field || pa(pchild(node, k, pcx), pcx) == fname;
+                }
+                has = has && found_field;
+                buf_bytes(names, &s[f0 as usize..f1 as usize]);
+                buf_byte(names, b',');
+                f0 = f1 + 1;
+            }
+            if !has || several {
+                let d = diag(c"error", c"rewrite.usage", tcx);
+                buf_str(d, c"--where '$x: field STRUCT.NAME' (or NAME,NAME) names fields of one struct of the program: '");
+                buf_bytes(d, &s[a as usize..b as usize]);
+                buf_str(d, if several { c"' is several structs' (give its path)\n" }
+                    else if node < 0 { c"' has no such struct\n" }
+                    else { c"' has no such field\n" });
+                return false;
+            }
+            tcx.h_fstruct[h as usize] = node;
+            tcx.h_fname[h as usize] = names;
+            i = e;
+            continue;
+        }
         // (the type: to the next `, $`, spaces dropped)
         let mut t = c + 1;
         let ty = buf_new();
@@ -243,6 +312,7 @@ pub fn rewrite_leaf(gpa: Gpa) -> Leaf<'static, Gpa> {
     table.push(flag("list", "a line per site"));
     table.push(option("in", "FILE|MODULE|ITEM", "only there (repeated: the scopes add up)"));
     table.push(option("not-in", "FILE|MODULE|ITEM", "not there (repeated)"));
+    table.push(option("at-errors", "TEXT", "only where a current error with TEXT is"));
     table.push(option("from", "FILE", "its lines' rewrites, PATTERN -> REPLACEMENT, in order"));
     Leaf::new(table, "word")
 }
@@ -255,6 +325,11 @@ struct Scope<A: Allocator> {
     not_files: Vec<i64, A>,
     not_modules: Vec<i64, A>,
     std_asked: bool,
+    // (--at-errors: the positions of the errors asked for, sorted; the
+    // sites that matched where none is)
+    at_errors: bool,
+    errors: Vec<i64, A>,
+    off_errors: i64,
 }
 
 // Whether a site at pos is one the rewrite looks at: in a file of the
@@ -274,159 +349,246 @@ fn site_in(pos: i64, scope: &Scope<Comp>, pcx: &mut Ctx<Comp>) -> bool {
             scope.not_modules.as_slice(), pcx)
 }
 
-fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
-    wgx: &mut WgslCx<Arena<Gpa>>) -> i64 {
-    set_command(c.line, tcx);
-    pcx.prog = c.prog();
-    tcx.tool = 0 as *mut u8;
-    let mut root = 0 as *const u8;
-    let mut words: Vec<i64, Comp> = Vec::new_in(Comp {});
-    let mut wheres: Vec<i64, Comp> = Vec::new_in(Comp {});
-    // (0.16: --subst PATTERN REPLACEMENT, in pairs; --list)
-    let mut substs: Vec<i64, Comp> = Vec::new_in(Comp {});
-    let mut list = false;
-    let mut ins: Vec<i64, Comp> = Vec::new_in(Comp {});
-    let mut nots: Vec<i64, Comp> = Vec::new_in(Comp {});
-    let line = c.evs.clone();
-    let mut k: i64 = 0;
-    while k < line.len() as i64 {
-        let mut ev = line[k as usize].clone();
+// (0.30) `--at-errors TEXT`: the positions of the program's current
+// errors whose line (`FILE:L:C: error[CODE] MESSAGE`) has TEXT, a code or
+// words of a message, by position.
+fn error_positions(text: &[u8], pcx: &mut Ctx<Comp>) -> Vec<i64, Comp> {
+    let mut out: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let all = buf_new();
+    errors_short(all, pcx);
+    let t = buf_copy(all);
+    let mut i: usize = 0;
+    let mut k: usize = 0;
+    while i < t.len() && 2 * k < pcx.errors.len() {
+        let mut e = i;
+        while e < t.len() && t[e] != b'\n' {
+            e += 1;
+        }
+        let mut hit = false;
+        let mut a = i;
+        while !hit && a + text.len() <= e {
+            hit = t[a..a + text.len()] == text;
+            a += 1;
+        }
+        if hit {
+            out.push(pcx.errors[2 * k]);
+        }
         k += 1;
-        let a = ev.value;
-        if ev.kind == EV_OPTION && ev.name == "where" {
-            wheres.push(a as i64);
+        i = e + 1;
+    }
+    out
+}
+
+// (0.30) Whether node n starts a longer postfix expression (a call of a
+// method of it, a field of it, an index into it) that the checker gave
+// no type: the nodes after n, which the parser makes after their
+// operands.
+fn in_untyped_chain(n: i64, tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
+    let mut m = n + 1;
+    while m < pcx.parsed_nodes.len() as i64 && m < n + 200 {
+        let k = pk(m, pcx);
+        if pstart(m, pcx) == pstart(n, pcx) && pend(m, pcx) > pend(n, pcx)
+            && (k == NodeKind::MethodCall || k == NodeKind::Call || k == NodeKind::FieldAccess
+                || k == NodeKind::TupleField || k == NodeKind::Index || k == NodeKind::Try)
+            && checked_type(m, tcx, pcx) <= 0 {
+            return true;
+        }
+        m += 1;
+    }
+    false
+}
+
+// (0.30) Whether the site just matched at node n is where one of the
+// errors (their positions, sorted) is: the error is in the site and not
+// in the code a hole matched, or at the start of the site, in the code of
+// the hole that starts it, code that the checker typed (the error is then
+// the site's own: `v.get(i)` with a `v` that has no `get`). An error has a position and no extent: where a
+// site the checker typed starts a longer postfix expression it did not
+// (`m.get(1).get(2)`, the second `get` unknown), the error is the longer
+// one's.
+fn at_error(n: i64, errors: &[i64], tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
+    for k in 0..errors.len() {
+        let p = errors[k];
+        if p < pstart(n, pcx) {
             continue;
         }
-        if ev.name == "subst" && (ev.kind == EV_MISSING || ev.kind == EV_OPTION) {
-            if ev.kind == EV_MISSING || k >= line.len() as i64
-                || !is_opt(line[k as usize], "subst") {
-                return usage(c"--subst takes a PATTERN and its REPLACEMENT", tcx, pcx);
+        if p >= pend(n, pcx) {
+            break;
+        }
+        let mut inside = false;
+        for h in 0..tcx.s_local {
+            let b = tcx.b_node[h as usize];
+            if b == -1 || b == -3 || p < tcx.pattern_b_start[h as usize]
+                || p >= tcx.b_end[h as usize] {
+                continue;
             }
-            substs.push(a as i64);
-            substs.push(line[k as usize].value as i64);
-            k += 1;
-            continue;
+            // (the error at the start of the code of the hole that starts
+            // the site, code the checker typed: the site's own)
+            if p > pstart(n, pcx) || b <= 0 || checked_type(b, tcx, pcx) <= 0 {
+                inside = true;
+            }
         }
-        if ev.kind == EV_FLAG && ev.name == "list" {
-            list = true;
-            continue;
+        if !inside
+            && !(p == pstart(n, pcx) && checked_type(n, tcx, pcx) > 0
+                && in_untyped_chain(n, tcx, pcx)) {
+            return true;
         }
-        if ev.kind == EV_OPTION && ev.name == "in" {
-            // (0.17: repeated, the scopes add up)
-            pcx.opt_in = a;
-            ins.push(a as i64);
-            continue;
-        }
-        if ev.kind == EV_OPTION && ev.name == "not-in" {
-            // (0.30: repeated; the sites there are left)
-            nots.push(a as i64);
-            continue;
-        }
-        if ev.kind == EV_MISSING && (ev.name == "where" || ev.name == "in" || ev.name == "not-in") {
-            ev.kind = EV_UNKNOWN;
-        } else if take_edit_event(&mut ev, &mut root, tcx, pcx) {
-            continue;
-        }
-        if ev.kind != EV_WORD {
-            let d = diag(c"error", c"rewrite.usage", tcx);
-            buf_str(d, c"unknown option '");
-            buf_str(d, ev.value);
-            buf_str(d, c"' (--where, --subst, --list, --in, --not-in, --dry-run, --no-check, --force, --root)\n");
-            return 2;
-        }
-        words.push(ev.value as i64);
     }
-    if words.len() as i64 >= 2 && root == 0 as *mut u8
-        && crate::base::is_source_path((words[(words.len() as i64 - 1) as usize]) as *mut u8)
-        && (words.len() as i64 == 3 || list) {
-        root = (words[(words.len() as i64 - 1) as usize]) as *mut u8;
-        words.pop().unwrap();
+    false
+}
+
+// (0.30) `note rewrite.at-errors`: the sites that matched where no error
+// asked for is, which are left.
+fn note_off_errors(scope: &Scope<Comp>, tcx: &mut Tcx<Comp>) {
+    if scope.off_errors == 0 {
+        return;
     }
-    if words.len() as i64 != 2 && !(list && words.len() as i64 == 1) {
-        return usage(if words.len() as i64
-            < 2 { c"a PATTERN and a REPLACEMENT are needed (--list: a PATTERN)" }
-            else { c"one PATTERN and one REPLACEMENT" }, tcx, pcx);
-    }
-    if substs.len() as i64 > 0 && words.len() as i64 < 2 {
-        return usage(c"--subst changes what the REPLACEMENT keeps: give one", tcx, pcx);
-    }
-    let pattern = (words[0]) as *mut u8;
-    let replacement = if words.len() as i64 == 2 { (words[1]) as *mut u8 }
-        else { 0 as *mut u8 };
-    tcx.root_given = root;
-    root = root_or_diag(root, c"rewrite", &c_slice(pattern), true, tcx, pcx);
-    if root == 0 as *mut u8 {
-        return 2;
-    }
-    pcx.keep_parsed = true;
-    // (0.15: the imports names of the replacement need, as edit
-    // replace adds them)
-    tcx.add_imports = true;
-    // (0.30: std asked for, `--in std`, `--in compiler/std/vec.vl`: std is
-    // read from its files, which the rewrite then searches and writes,
-    // stdfiles.vl)
-    let mut std_asked = false;
-    for k in 0..ins.len() {
-        std_asked = std_asked || names_std(&c_slice(ins[k] as *mut u8));
-    }
-    if std_asked && pcx.std_tree == 0 as *const u8 {
-        pcx.std_tree = find_std_tree(pcx);
-    }
-    if !load_program(root, tcx.target, tcx, pcx, wgx) {
-        program_errors(c"error", root, true, tcx, pcx);
-        return 1;
-    }
-    if std_asked && !std_mapped(pcx) {
-        note_no_std_files(tcx);
-        return 0;
-    }
-    // (0.30: --not-in, resolved as --in is, its scopes kept apart)
+    let d = diag(c"note", c"rewrite.at-errors", tcx);
+    buf_int(d, scope.off_errors);
+    buf_str(d, if scope.off_errors == 1 { c" site matches" } else { c" sites match" });
+    buf_str(d, c" where no such error is: left\n");
+}
+
+// (0.30) The sites of a rewrite's pattern: each one's start, end and new
+// text; and those inside the function their replacement calls (their
+// starts, the functions: guard.vl).
+struct Sites<A: Allocator> {
+    start: Vec<i64, A>,
+    end: Vec<i64, A>,
+    text: Vec<i64, A>,
+    rec_site: Vec<i64, A>,
+    rec_def: Vec<i64, A>,
+}
+
+// (0.30) The pattern's state forgotten (the holes, their bindings, the
+// replacement's parts, the counts of the notes), for another pattern on
+// the same program.
+fn reset_pattern(tcx: &mut Tcx<Comp>) {
+    tcx.h_sym.clear();
+    tcx.h_name.clear();
+    tcx.h_rest.clear();
+    tcx.h_type.clear();
+    tcx.h_nameonly.clear();
+    tcx.h_re.clear();
+    tcx.h_fresh.clear();
+    tcx.fresh_text.clear();
+    tcx.h_part.clear();
+    tcx.h_fstruct.clear();
+    tcx.h_fname.clear();
+    tcx.untyped_at.clear();
+    tcx.b_node.clear();
+    tcx.pattern_b_start.clear();
+    tcx.b_end.clear();
+    tcx.b_list.clear();
+    tcx.pat_holes.clear();
+    tcx.r_holes.clear();
+    tcx.r_hole_span.clear();
+    tcx.r_kept.clear();
+    tcx.r_parts.clear();
+    tcx.r_breaks.clear();
+    tcx.s_pat.clear();
+    tcx.s_rep.clear();
+    tcx.s_hfirst.clear();
+    tcx.s_hcount.clear();
+    tcx.s_holes.clear();
+    tcx.site_types.clear();
+    tcx.sub_start.clear();
+    tcx.sub_end.clear();
+    tcx.sub_text.clear();
+    tcx.type_misses = 0;
+    tcx.untyped = 0;
+    tcx.pattern_dropped = 0;
+    tcx.fresh_ok = false;
+}
+
+// (0.30) A rewrite inside another command's edit (`refactor field
+// --rewrite`): PATTERN's sites in the program just loaded (kept as
+// parsed; `program_end`: its nodes) get REPLACEMENT, typed as the program
+// is now, as edits of the engine; `done` holds the ranges the edit
+// rewrites already (starts and ends, in pairs), which a site must not
+// touch, and gets the sites'. The number of sites, or -1 after a
+// diagnostic (the pattern does not parse, a site is inside the function
+// its replacement calls).
+pub fn rewrite_uses(pattern: *mut u8, replacement: *mut u8, wheres: &[i64], program_end: i64,
+    done: &mut Vec<i64, Comp>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
+    reset_pattern(tcx);
+    note_clones(program_end, pcx.nodes.len() as i64, tcx, pcx);
     let mut scope: Scope<Comp> = Scope {
         not_ranges: Vec::new_in(Comp {}), not_files: Vec::new_in(Comp {}),
-        not_modules: Vec::new_in(Comp {}), std_asked: std_asked,
+        not_modules: Vec::new_in(Comp {}), std_asked: false, at_errors: false,
+        errors: Vec::new_in(Comp {}), off_errors: 0,
     };
-    for k in 0..nots.len() {
-        if !resolve_in(&c_slice(nots[k] as *mut u8), tcx, pcx) {
-            let d = diag(c"error", c"rewrite.bad-in", tcx);
-            put_bad_in(d, nots[k] as *mut u8, tcx);
-            return 1;
+    let mut found: Sites<Comp> = Sites {
+        start: Vec::new_in(Comp {}), end: Vec::new_in(Comp {}), text: Vec::new_in(Comp {}),
+        rec_site: Vec::new_in(Comp {}), rec_def: Vec::new_in(Comp {}),
+    };
+    let none: Vec<i64, Comp> = Vec::new_in(Comp {});
+    if collect_sites(pattern, replacement, wheres, none.as_slice(), false, program_end, &mut scope,
+        &mut found, tcx, pcx) >= 0 {
+        return -1;
+    }
+    if found.rec_site.len() > 0
+        && !recursive_sites(found.rec_site.as_slice(), found.rec_def.as_slice(), tcx, pcx) {
+        return -1;
+    }
+    // (by position, the outermost first; a site in a range rewritten
+    // already is left)
+    let mut order: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for k in 0..found.start.len() as i64 {
+        order.push(k);
+    }
+    for a in 1..order.len() {
+        let mut j = a;
+        while j > 0
+            && (found.start[order[j] as usize] < found.start[order[j - 1] as usize]
+                || (found.start[order[j] as usize] == found.start[order[j - 1] as usize]
+                    && found.end[order[j] as usize] > found.end[order[j - 1] as usize])) {
+            let t = order[j];
+            order[j] = order[j - 1];
+            order[j - 1] = t;
+            j -= 1;
         }
     }
-    if nots.len() > 0 {
-        for i in 0..pcx.in_ranges.len() {
-            scope.not_ranges.push(pcx.in_ranges[i]);
+    let mut sites: i64 = 0;
+    let mut left: i64 = 0;
+    for a in 0..order.len() {
+        let k = order[a] as usize;
+        let mut taken = false;
+        let mut r: usize = 0;
+        while r + 1 < done.len() {
+            taken = taken || (found.start[k] < done[r + 1] && done[r] < found.end[k]);
+            r += 2;
         }
-        pcx.in_ranges.clear();
-        for i in 0..pcx.in_file.len() {
-            scope.not_files.push(pcx.in_file[i]);
-            pcx.in_file[i] = 0;
-        }
-        for i in 0..pcx.in_module.len() {
-            scope.not_modules.push(pcx.in_module[i]);
-            pcx.in_module[i] = 0;
-        }
-    }
-    for k in 0..ins.len() as i64 {
-        let x = c_slice((ins[k as usize]) as *mut u8);
-        if std_asked && names_std(&x) && !(x.len() >= 3 && x[0..3] == b"std") {
-            // (a file of std, a directory of them)
-            if !in_std_path(&x, pcx) {
-                let d = diag(c"error", c"rewrite.bad-in", tcx);
-                buf_str(d, c"std has no file '");
-                buf_bytes(d, &x);
-                buf_str(d, c"'\n");
-                return 1;
-            }
+        if taken {
+            left += 1;
             continue;
         }
-        if !resolve_in(&c_slice((ins[k as usize]) as *mut u8), tcx, pcx) {
-            let d = diag(c"error", c"rewrite.bad-in", tcx);
-            put_bad_in(d, (ins[k as usize]) as *mut u8, tcx);
-            return 1;
-        }
+        edit_replace(found.start[k], found.end[k], found.text[k], pcx);
+        done.push(found.start[k]);
+        done.push(found.end[k]);
+        sites += 1;
     }
-    let program_end = pcx.parsed_nodes.len() as i64;
-    note_clones(program_end, pcx.nodes.len() as i64, tcx, pcx);
+    if left > 0 {
+        let d = diag(c"note", c"rewrite.nested", tcx);
+        buf_int(d, left);
+        buf_str(d, if left == 1 { c" site inside a rewritten one is" }
+            else { c" sites inside rewritten ones are" });
+        buf_str(d, c" left; run the rewrite again\n");
+    }
+    notes(pattern, replacement, tcx, pcx);
+    sites
+}
+
+// The sites of one pattern (0.30: apart from run_rewrite_inner, for the
+// rewrites `refactor field --rewrite` makes in its own edit): PATTERN and
+// REPLACEMENT parsed (after reset_pattern, when they are not the first),
+// --where and --subst taken, and each site of the program the pattern
+// matches added to `out` with its new text (--list: its line). -1 when
+// they are, else the exit status (a diagnostic was made; a PATTERN alone
+// was listed).
+fn collect_sites(pattern: *mut u8, replacement: *mut u8, wheres: &[i64], substs: &[i64], list: bool,
+    program_end: i64, scope: &mut Scope<Comp>, out: &mut Sites<Comp>, tcx: &mut Tcx<Comp>,
+    pcx: &mut Ctx<Comp>) -> i64 {
     // The pattern, then the replacement.
     tcx.stmts = is_statement(pattern);
     let ptext = buf_new();
@@ -514,7 +676,7 @@ fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>
         tcx.s_pat.push(sp);
     }
     if replacement == 0 as *mut u8 {
-        return list_sites(proot, program_end, pattern, &scope, tcx, pcx);
+        return list_sites(proot, program_end, pattern, scope, tcx, pcx);
     }
     let rfirst = pcx.parsed_nodes.len() as i64;
     tcx.r_root = parse_text(rtext, tcx.stmts, c"replacement", tcx, pcx);
@@ -600,19 +762,14 @@ fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>
         tcx.b_list.push(0);
     }
     // The sites: start, end and replacement of each.
-    let mut s_start: Vec<i64, Comp> = Vec::new_in(Comp {});
-    let mut s_end: Vec<i64, Comp> = Vec::new_in(Comp {});
-    let mut s_text: Vec<i64, Comp> = Vec::new_in(Comp {});
     let pkind = pk(proot, pcx);
     // (0.30: the sites inside the function the replacement calls there)
     let callees = new_callees(proot, pfirst, plast, rfirst, rlast, tcx, pcx);
-    let mut rec_site: Vec<i64, Comp> = Vec::new_in(Comp {});
-    let mut rec_def: Vec<i64, Comp> = Vec::new_in(Comp {});
     for n in 1..program_end {
         if pk(n, pcx) != pkind {
             continue;
         }
-        if !site_in(pstart(n, pcx), &scope, pcx) {
+        if !site_in(pstart(n, pcx), &*scope, pcx) {
             continue;
         }
         for h in 0..tcx.h_sym.len() as i64 {
@@ -621,11 +778,15 @@ fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>
         if !match_node(proot, n, tcx, pcx) || !types_match(tcx, pcx) {
             continue;
         }
+        if scope.at_errors && !at_error(n, scope.errors.as_slice(), tcx, pcx) {
+            scope.off_errors += 1;
+            continue;
+        }
         if !list {
             let e = self_call(n, callees.as_slice(), rfirst, rlast, tcx, pcx);
             if e >= 0 {
-                rec_site.push(pstart(n, pcx));
-                rec_def.push(e);
+                out.rec_site.push(pstart(n, pcx));
+                out.rec_def.push(e);
             }
         }
         // (0.16: the site's new names and substitutions)
@@ -646,9 +807,9 @@ fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>
         if list {
             let line = buf_new();
             put_site(line, pstart(n, pcx), tcx, pcx);
-            s_start.push(pstart(n, pcx));
-            s_end.push(pstart(n, pcx));
-            s_text.push(line);
+            out.start.push(pstart(n, pcx));
+            out.end.push(pstart(n, pcx));
+            out.text.push(line);
             continue;
         }
         note_site_types(tcx, pcx);
@@ -686,31 +847,223 @@ fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>
                 text = wrapped;
             }
         }
-        s_start.push(from);
-        s_end.push(to);
-        s_text.push(text);
+        out.start.push(from);
+        out.end.push(to);
+        out.text.push(text);
     }
+    -1
+}
+
+fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
+    wgx: &mut WgslCx<Arena<Gpa>>) -> i64 {
+    set_command(c.line, tcx);
+    pcx.prog = c.prog();
+    tcx.tool = 0 as *mut u8;
+    let mut root = 0 as *const u8;
+    let mut words: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut wheres: Vec<i64, Comp> = Vec::new_in(Comp {});
+    // (0.16: --subst PATTERN REPLACEMENT, in pairs; --list)
+    let mut substs: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut list = false;
+    let mut ins: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut nots: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut at_errors = 0 as *const u8;
+    let line = c.evs.clone();
+    let mut k: i64 = 0;
+    while k < line.len() as i64 {
+        let mut ev = line[k as usize].clone();
+        k += 1;
+        let a = ev.value;
+        if ev.kind == EV_OPTION && ev.name == "where" {
+            wheres.push(a as i64);
+            continue;
+        }
+        if ev.name == "subst" && (ev.kind == EV_MISSING || ev.kind == EV_OPTION) {
+            if ev.kind == EV_MISSING || k >= line.len() as i64
+                || !is_opt(line[k as usize], "subst") {
+                return usage(c"--subst takes a PATTERN and its REPLACEMENT", tcx, pcx);
+            }
+            substs.push(a as i64);
+            substs.push(line[k as usize].value as i64);
+            k += 1;
+            continue;
+        }
+        if ev.kind == EV_FLAG && ev.name == "list" {
+            list = true;
+            continue;
+        }
+        if ev.kind == EV_OPTION && ev.name == "in" {
+            // (0.17: repeated, the scopes add up)
+            pcx.opt_in = a;
+            ins.push(a as i64);
+            continue;
+        }
+        if ev.kind == EV_OPTION && ev.name == "not-in" {
+            // (0.30: repeated; the sites there are left)
+            nots.push(a as i64);
+            continue;
+        }
+        if ev.kind == EV_OPTION && ev.name == "at-errors" {
+            // (0.30: only the sites where a current error with this text is)
+            at_errors = a;
+            continue;
+        }
+        if ev.kind == EV_MISSING
+            && (ev.name == "where" || ev.name == "in" || ev.name == "not-in"
+                || ev.name == "at-errors") {
+            ev.kind = EV_UNKNOWN;
+        } else if take_edit_event(&mut ev, &mut root, tcx, pcx) {
+            continue;
+        }
+        if ev.kind != EV_WORD {
+            let d = diag(c"error", c"rewrite.usage", tcx);
+            buf_str(d, c"unknown option '");
+            buf_str(d, ev.value);
+            buf_str(d, c"' (--where, --subst, --list, --in, --not-in, --at-errors, --from, --dry-run, --no-check, --force, --root)\n");
+            return 2;
+        }
+        words.push(ev.value as i64);
+    }
+    if words.len() as i64 >= 2 && root == 0 as *mut u8
+        && crate::base::is_source_path((words[(words.len() as i64 - 1) as usize]) as *mut u8)
+        && (words.len() as i64 == 3 || list) {
+        root = (words[(words.len() as i64 - 1) as usize]) as *mut u8;
+        words.pop().unwrap();
+    }
+    if words.len() as i64 != 2 && !(list && words.len() as i64 == 1) {
+        return usage(if words.len() as i64
+            < 2 { c"a PATTERN and a REPLACEMENT are needed (--list: a PATTERN)" }
+            else { c"one PATTERN and one REPLACEMENT" }, tcx, pcx);
+    }
+    if substs.len() as i64 > 0 && words.len() as i64 < 2 {
+        return usage(c"--subst changes what the REPLACEMENT keeps: give one", tcx, pcx);
+    }
+    let pattern = (words[0]) as *mut u8;
+    let replacement = if words.len() as i64 == 2 { (words[1]) as *mut u8 }
+        else { 0 as *mut u8 };
+    tcx.root_given = root;
+    root = root_or_diag(root, c"rewrite", &c_slice(pattern), true, tcx, pcx);
+    if root == 0 as *mut u8 {
+        return 2;
+    }
+    pcx.keep_parsed = true;
+    // (0.15: the imports names of the replacement need, as edit
+    // replace adds them)
+    tcx.add_imports = true;
+    // (0.30: std asked for, `--in std`, `--in compiler/std/vec.vl`: std is
+    // read from its files, which the rewrite then searches and writes,
+    // stdfiles.vl)
+    let mut std_asked = false;
+    for k in 0..ins.len() {
+        std_asked = std_asked || names_std(&c_slice(ins[k] as *mut u8));
+    }
+    if std_asked && pcx.std_tree == 0 as *const u8 {
+        pcx.std_tree = find_std_tree(pcx);
+    }
+    // (0.30: every error, not the first 50: the checker stops at its cap,
+    // and what it has not checked has no types for --where)
+    pcx.max_errors = 9223372036854775807;
+    if !load_program(root, tcx.target, tcx, pcx, wgx) {
+        program_errors(c"error", root, true, tcx, pcx);
+        return 1;
+    }
+    if std_asked && !std_mapped(pcx) {
+        note_no_std_files(tcx);
+        return 0;
+    }
+    // (0.30: --not-in, resolved as --in is, its scopes kept apart)
+    let mut scope: Scope<Comp> = Scope {
+        not_ranges: Vec::new_in(Comp {}), not_files: Vec::new_in(Comp {}),
+        not_modules: Vec::new_in(Comp {}), std_asked: std_asked, at_errors: false,
+        errors: Vec::new_in(Comp {}), off_errors: 0,
+    };
+    for k in 0..nots.len() {
+        if !resolve_in(&c_slice(nots[k] as *mut u8), tcx, pcx) {
+            let d = diag(c"error", c"rewrite.bad-in", tcx);
+            put_bad_in(d, nots[k] as *mut u8, tcx);
+            return 1;
+        }
+    }
+    if nots.len() > 0 {
+        for i in 0..pcx.in_ranges.len() {
+            scope.not_ranges.push(pcx.in_ranges[i]);
+        }
+        pcx.in_ranges.clear();
+        for i in 0..pcx.in_file.len() {
+            scope.not_files.push(pcx.in_file[i]);
+            pcx.in_file[i] = 0;
+        }
+        for i in 0..pcx.in_module.len() {
+            scope.not_modules.push(pcx.in_module[i]);
+            pcx.in_module[i] = 0;
+        }
+    }
+    for k in 0..ins.len() as i64 {
+        let x = c_slice((ins[k as usize]) as *mut u8);
+        if std_asked && names_std(&x) && !(x.len() >= 3 && x[0..3] == b"std") {
+            // (a file of std, a directory of them)
+            if !in_std_path(&x, pcx) {
+                let d = diag(c"error", c"rewrite.bad-in", tcx);
+                buf_str(d, c"std has no file '");
+                buf_bytes(d, &x);
+                buf_str(d, c"'\n");
+                return 1;
+            }
+            continue;
+        }
+        if !resolve_in(&c_slice((ins[k as usize]) as *mut u8), tcx, pcx) {
+            let d = diag(c"error", c"rewrite.bad-in", tcx);
+            put_bad_in(d, (ins[k as usize]) as *mut u8, tcx);
+            return 1;
+        }
+    }
+    let program_end = pcx.parsed_nodes.len() as i64;
+    note_clones(program_end, pcx.nodes.len() as i64, tcx, pcx);
+    if at_errors != 0 as *const u8 {
+        scope.at_errors = true;
+        scope.errors = error_positions(&c_slice(at_errors), pcx);
+        if scope.errors.len() == 0 {
+            let d = diag(c"note", c"rewrite.at-errors", tcx);
+            buf_str(d, c"no error of the program has '");
+            buf_str(d, at_errors);
+            buf_str(d, c"' (");
+            buf_int(d, pcx.errors.len() as i64 / 2);
+            buf_str(d, c" errors: their lines are `volec check`'s, `FILE:L:C: error[CODE] MESSAGE`); nothing to rewrite\n");
+            return 0;
+        }
+    }
+    let mut found: Sites<Comp> = Sites {
+        start: Vec::new_in(Comp {}), end: Vec::new_in(Comp {}), text: Vec::new_in(Comp {}),
+        rec_site: Vec::new_in(Comp {}), rec_def: Vec::new_in(Comp {}),
+    };
+    let status = collect_sites(pattern, replacement, wheres.as_slice(), substs.as_slice(), list,
+        program_end, &mut scope, &mut found, tcx, pcx);
+    if status >= 0 {
+        return status;
+    }
+    note_off_errors(&scope, tcx);
     if list {
-        return print_sites(&mut s_start, &mut s_text, pattern, replacement, tcx,
+        return print_sites(&mut found.start, &mut found.text, pattern, replacement, tcx,
             pcx);
     }
-    if rec_site.len() > 0 && !recursive_sites(rec_site.as_slice(), rec_def.as_slice(), tcx, pcx) {
+    if found.rec_site.len() > 0
+        && !recursive_sites(found.rec_site.as_slice(), found.rec_def.as_slice(), tcx, pcx) {
         return 1;
     }
     // Outermost first; a site inside another is left.
     let mut order: Vec<i64, Comp> = Vec::new_in(Comp {});
-    for k in 0..s_start.len() as i64 {
+    for k in 0..found.start.len() as i64 {
         order.push(k);
     }
     for a in 1..order.len() as i64 {
         let mut j = a;
         while j > 0
-            && ((s_start[(order[j as usize]) as usize])
-                < (s_start[(order[(j - 1) as usize]) as usize])
-                || ((s_start[(order[j as usize]) as usize])
-                    == (s_start[(order[(j - 1) as usize]) as usize])
-                    && (s_end[(order[j as usize]) as usize])
-                    > (s_end[(order[(j - 1) as usize]) as usize]))) {
+            && ((found.start[(order[j as usize]) as usize])
+                < (found.start[(order[(j - 1) as usize]) as usize])
+                || ((found.start[(order[j as usize]) as usize])
+                    == (found.start[(order[(j - 1) as usize]) as usize])
+                    && (found.end[(order[j as usize]) as usize])
+                    > (found.end[(order[(j - 1) as usize]) as usize]))) {
             let t = (order[j as usize]);
             (order[j as usize]) = (order[(j - 1) as usize]);
             (order[(j - 1) as usize]) = t;
@@ -729,22 +1082,22 @@ fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>
     let mut in_std: i64 = 0;
     for a in 0..order.len() as i64 {
         let k = (order[a as usize]);
-        if (s_start[k as usize]) < last_end {
+        if (found.start[k as usize]) < last_end {
             nested += 1;
             continue;
         }
-        if std_asked && std_site(s_start[k as usize], pcx) >= 0 {
+        if std_asked && std_site(found.start[k as usize], pcx) >= 0 {
             in_std += 1;
         } else {
-            edit_replace((s_start[k as usize]), (s_end[k as usize]),
-                (s_text[k as usize]), pcx);
+            edit_replace((found.start[k as usize]), (found.end[k as usize]),
+                (found.text[k as usize]), pcx);
         }
-        done_start.push((s_start[k as usize]));
-        done_end.push((s_end[k as usize]));
-        done_text.push((s_text[k as usize]));
-        last_end = (s_end[k as usize]);
+        done_start.push((found.start[k as usize]));
+        done_end.push((found.end[k as usize]));
+        done_text.push((found.text[k as usize]));
+        last_end = (found.end[k as usize]);
         sites += 1;
-        let f = file_of_pos((s_start[k as usize]), pcx);
+        let f = file_of_pos((found.start[k as usize]), pcx);
         if f != last_file {
             files += 1;
             last_file = f;
@@ -860,7 +1213,7 @@ fn recursive_sites(sites: &[i64], defs: &[i64], tcx: &mut Tcx<Comp>, pcx: &mut C
 
 // `--list` without a REPLACEMENT (0.16): the sites PATTERN (proot)
 // matches with their --where types and names, a line each.
-fn list_sites(proot: i64, program_end: i64, pattern: *mut u8, scope: &Scope<Comp>,
+fn list_sites(proot: i64, program_end: i64, pattern: *mut u8, scope: &mut Scope<Comp>,
     tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
     for _ in 0..tcx.h_sym.len() as i64 {
         tcx.b_node.push(-1);
@@ -885,11 +1238,16 @@ fn list_sites(proot: i64, program_end: i64, pattern: *mut u8, scope: &Scope<Comp
         if !match_node(proot, n, tcx, pcx) || !types_match(tcx, pcx) {
             continue;
         }
+        if scope.at_errors && !at_error(n, scope.errors.as_slice(), tcx, pcx) {
+            scope.off_errors += 1;
+            continue;
+        }
         let line = buf_new();
         put_site(line, pstart(n, pcx), tcx, pcx);
         starts.push(pstart(n, pcx));
         lines.push(line);
     }
+    note_off_errors(scope, tcx);
     print_sites(&mut starts, &mut lines, pattern, 0 as *mut u8, tcx, pcx)
 }
 
@@ -990,8 +1348,17 @@ fn notes(pattern: *mut u8, replacement: *mut u8, tcx: &mut Tcx<Comp>, pcx: &mut 
         let d = diag(c"note", c"rewrite.untyped", tcx);
         buf_int(d, tcx.untyped);
         buf_str(d, if tcx.untyped == 1 { c" site is" } else { c" sites are" });
+        // (0.30: which ones, the first five)
         buf_str(d,
-            c" left: the checker gave no type there (a generic function never instantiated)\n");
+            c" left: the checker gave no type there (a generic function never instantiated, code after an error)");
+        for k in 0..tcx.untyped_at.len() {
+            buf_str(d, if k == 0 { c": " } else { c", " });
+            put_loc(d, tcx.untyped_at[k], pcx);
+        }
+        if tcx.untyped > tcx.untyped_at.len() as i64 {
+            buf_str(d, c", ...");
+        }
+        buf_byte(d, b'\n');
     }
 }
 

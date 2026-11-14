@@ -329,6 +329,30 @@ all the edited program's errors, not the first 50 (a rewrite of 210
 files that each need one new `use` was refused, `edit.breaks`, after
 four rounds).
 
+(0.30) **A program with errors.** The checker stops at its 50th error,
+and the code it has not checked has no types: in the middle of a
+conversion (a field's type changed, a thousand errors) a typed rewrite
+found nothing after the 50th (`rewrite.untyped`). A rewrite now checks
+the whole program, so `--where` holds everywhere the checker can type;
+`note rewrite.untyped` names the first five sites it left for want of a
+type. **`--at-errors TEXT`** takes only the sites where a current error
+is whose line (`FILE:L:C: error[CODE] MESSAGE`, as `volec check` prints
+it) has TEXT, a code or words of a message, whatever the holes' types:
+
+```
+volec rewrite '$v.get($i)' '$v[$i as usize]' --at-errors "no method 'get' on type 'Vec"
+```
+
+is the sweep after an `IntVec` field became a `Vec`, in one command; the
+`get`s of other types are not touched (`note rewrite.at-errors` counts
+the sites that matched where no such error is). The error must be the
+site's own: one inside the code a hole matched is that code's (the
+argument of a call, not the call), except at the start of the site,
+where an unknown method's error is reported; of two sites that start
+there (`m.get(1).get(2)`) it is the one the checker gave no type. No
+error has TEXT: `note rewrite.at-errors` says so, with the number of
+errors, and nothing is rewritten.
+
 (0.30) **std's files.** To the compiler std is one text, `<std>`, which
 no rewrite searched (`nothing matches`, whatever `--in` said). In the
 vole repository that text is compiler/std's files, and a rewrite asked
@@ -558,12 +582,13 @@ as it changes the program through the edit engine (`edit_replace`,
 | `refactor.script` | error | 1, 2 | a line is no command, a command failed: nothing written | |
 | `rewrite.pattern`, `rewrite.unbound` | error | 2 | the pattern or replacement does not parse, a hole alone, `$x...` outside a list, a hole of the replacement not in the pattern and bound by it nowhere, a bad `~/RE/` | |
 | `rewrite.bad-in` | error | 1 | `--in` or `--not-in` names no file, module or item | |
+| `rewrite.at-errors` | note | 0 | (0.30) `--at-errors TEXT`: sites that matched where no such error is (left); no error of the program has TEXT | `volec check --max-errors=0` |
 | `rewrite.from` | error; note | 2; 0 | (0.30) `--from FILE`: a line that is no `PATTERN -> REPLACEMENT` (`FILE:LINE`, nothing run), a file that cannot be read; no patterns in it | |
 | `rewrite.std` | note; error | 0; 1 | (0.30) std's files rewritten: embed.sh and the build are next; std has no files here and is not searched; sites in std and in the program in one run (nothing written) | `sh compiler/std/embed.sh` |
 | `rewrite.recursive` | error (note with `--force`) | 1 | (0.30) sites inside the function the replacement calls there: nothing written | the command with `--not-in` those functions; with `--force` |
 | `rewrite.none` | note | 0 | nothing matches | |
 | `rewrite.types` | note | 0 | sites match but for --where | the command with the type found |
-| `rewrite.nested`, `rewrite.untyped` | note | 0 | sites left inside rewritten ones, in unchecked code | |
+| `rewrite.nested`, `rewrite.untyped` | note | 0 | sites left inside rewritten ones, in unchecked code (0.30: the first five named) | |
 
 ## Known limits
 
