@@ -672,10 +672,20 @@ the checker never reaches is listed too); the operations need the
 program checked, so `unsafe` reads it in full (no cache).
 docs/unsafe-baseline.md is the compiler's and std's summary; the gate's
 `unsafe-audit` row and premerge's unsafe row (tests/unsafe_audit.sh)
-hold them to none unjustified and, in compiler/src, none unneeded
-(0.29). A block of a generic function of std that the program never
-instantiates is listed `none (unneeded)` though it holds what needs it:
-std's unneeded count depends on the program and is not judged.
+hold them to none unjustified and none unneeded (0.29: compiler/src;
+0.30: std too). Until 0.30 a block of a generic function of std that
+the program never instantiates was listed `none (unneeded)` though it
+held what needs it (22 justified blocks under the compiler), so std's
+count was the program's and not judged. (0.30) With std's sites in the
+listing every generic function of std is checked by its opaque
+instance, as `volec check --std` does, and the operations of its blocks
+are recorded whatever the program instantiates; and a block is marked
+as checked only when an instance checked all of it without an error
+(one cut short by an error is `not checked`, never `none (unneeded)`).
+Two kinds of std function are still checked only where a program uses
+them, and a block in one is `not checked` then: a trait's default
+method as an impl has it, and a body the opaque model does not cover
+(`note check.std` counts them).
 
 ## features (0.19)
 

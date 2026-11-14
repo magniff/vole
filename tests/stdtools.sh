@@ -168,5 +168,23 @@ has check_std_unsafe "error[unsafe] calling an \`unsafe fn\` is unsafe"
 hasnot check_std_no_model_errors "error[type error]"
 cp "$ROOT/$MEM" "$T/$MEM"
 
+# ---- query unsafe: std's unneeded blocks, exactly ----
+# (main.vl instantiates swap only. No block of std is listed as unneeded
+# for it: until 0.30 every block of a generic function the program did
+# not instantiate was, 25 for a small program. A block with nothing unsafe
+# inside, put into replace, is the one listed; replace's own block, which
+# holds ptr::read and ptr::write, is not.)
+run query unsafe std --unneeded --root main.vl
+has unsafe_none_unneeded "unneeded: 0"
+hasnot unsafe_no_false_unneeded "none (unneeded)"
+awk -v n="$RLINE" '{ print } NR == n {
+    print "    // UNSAFE: a block of the test.\n    // SAFETY: it holds nothing unsafe."
+    print "    unsafe {\n        let n: i64 = 0;\n        crate::mem::drop(n);\n    }" }' \
+    "$T/$MEM" >"$WORK/mem.vl" && cp "$WORK/mem.vl" "$T/$MEM"
+run query unsafe std --unneeded --root main.vl
+has unsafe_unneeded_listed "$MEM:$((RLINE + 3))	block	std::mem::replace	other	justified	none (unneeded)"
+has unsafe_unneeded_count "unneeded: 1"
+cp "$ROOT/$MEM" "$T/$MEM"
+
 echo "stdtools: $PASSED passed, $FAILED failed"
 [ "$FAILED" = 0 ]
