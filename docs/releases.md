@@ -106,9 +106,10 @@ check --deny=unsafe`). What is left is C and system calls, the
 allocator, the thread boundary, the mapped cache file and the
 recovery points; two hand-rolled containers are still raw inside
 ("Known regressions and limits"). The price is speed: the compiler
-builds itself with more instructions than 0.28.0 (TODO(gate: the
-final figure, self-build and check, each compiler on its own source,
-idle machine; 0.28.0: about 107 G and 21.2 G)); checked accesses were
+builds itself with more instructions than 0.28.0 (the self-build at -O2
+126.2 G of instructions against 103.6 G, 22% more; its own check 24.8 G
+against 21.3 G, 16% more; each compiler on its own source, idle
+machine); checked accesses were
 kept and the loss accepted rather than made up with unchecked ones. For
 a program: `*const T` and `*mut T` are two types and a slice has no
 fields; `~x` is refused; a map's hasher is written, as its allocator
@@ -238,9 +239,8 @@ a site is an `unsafe { }` block, an `unsafe fn` or an `extern` block.
 | 0.28.0 | 3281 | 2573 | 150 | 151 |
 | 0.29.0 | 316 | 0 | 0 | 0 |
 
-(TODO(gate: the unsafe-audit row's counts on the final tree; 316 was
-counted before the raw-pointer work was merged; 0.28.0: 2573
-unjustified, baseline 2769).) By class, then and now: raw-pointer 2652
+(The gate's unsafe-audit row on the final tree; 0.28.0's row was 2573
+unjustified against a baseline of 2769.) By class, then and now: raw-pointer 2652
 and 82, ffi 325 and 205, other 163 and 18, alloc 141 and 11. By
 module now: the tools 140, base 102, the front end 30, the back end
 20, the middle end 18, the rest 6. The goal was under 400.
@@ -282,7 +282,7 @@ module now: the tools 140, base 102, the front end 30, the back end
   `fix --only unneeded-unsafe` now takes away the blocks written over
   several lines; a block it leaves gets a note that says why
   (`fix.unneeded-left`).
-- **std**: 911 sites (TODO(gate: std's count on the final tree)), 0
+- **std**: 915 sites, 0
   unjustified, as at 0.28.0; std is held to the same rule for
   justification. Its count rose with the block copies below.
 - **What stays unsafe, and why.** Calls of C and of the system (205
@@ -531,25 +531,27 @@ completion no longer teach the removed edition's words.
 - docs/grammar.md says there is one language and has a short account
   of the removed parameter conventions; some passages still describe
   older releases.
-- The suite: TODO(gate: cases passed at each of -O0, -O1 and -O2, and
-  XFAIL; 0.28.0: 6273 passed, 732 xfail, 0 failed, 1 skipped). During
-  the release the last whole run had 6358 passed and 731 xfail.
+- examples/gpu/mandelbulb: a ray-marched Mandelbulb whose render
+  scale is governed to hold 120 frames a second, with four cases.
+- The suite: 6385 passed, 731 xfail, 0 failed, 1 skipped (no spirv-val
+  on the host) at each of -O0, -O1 and -O2 (0.28.0: 6273 passed, 732
+  xfail, 0 failed, 1 skipped).
 
 #### Known regressions and limits
 
-- **The compiler is slower at building itself than 0.28.0.** TODO(gate:
-  the self-build and `check` in instructions against 0.28.0, each
-  compiler on its own source, idle machine; 0.28.0: 107.0 G and 21.2
-  G). The figures taken during the release, on a shared machine and
-  on each tree's source of the day, put the self-build between 118 G
-  and 131 G: 10% to 22% more. The cause is the checked tables: an
+- **The compiler is slower at building itself than 0.28.0.** Each
+  compiler on its own source, idle machine, the fewest of three runs:
+  the self-build at -O2 takes 126.2 G of instructions (3.35 s) against
+  103.6 G (2.72 s), 21.9% more; the build at -O0 33.5 G against 29.9
+  G, 12.0% more; `check` 24.8 G (1.38 s) against 21.3 G (1.10 s),
+  16.1% more. The cause is the checked tables: an
   index that is data (an operand read from an instruction) is a
   compare and a branch whatever the optimizer knows. The goal was
   "within a few percent"; it is not met for the self-build, and the
   decision was to keep every check rather than win the time back with
-  unchecked accesses. The compile-cost `check` row was 0.92x of
-  0.28.0 after the inliner's change; later merges added a few percent
-  to it.
+  unchecked accesses. On the same source (the compile-cost row's program)
+  `check` is 0.97x of 0.28.0: the compiler's own source is what got
+  dearer to compile, and the compiler slower at it.
 - **The inliner's change made five benchmarks slower** (interp 12%,
   wordcount 11%, fannkuch and sort 6%, json 4%, by instructions), and
   a program that inlines much of std compiles dearer (the compile-cost
@@ -559,7 +561,8 @@ completion no longer teach the removed edition's words.
 - **The bench row still fails its iterator check.** An iterator chain
   is not zero cost: iterchain against iterloop was 1.72 by
   instructions during the release (the limit is 1.05; 0.28.0: 2.37 by
-  time). TODO(gate: the bench row's ratio and geomean). std's text
+  time). The bench row after the gate: 2.057 by time, and
+  the geomean against `cc -O2` is 1.131 (0.28.0: 1.162). std's text
   functions were not made faster except where a block search or copy
   did it (`lines`, `find`, `split`, `push_str`). 0.30.
 - **Two hand-rolled containers are still raw inside.** `IntVec` (172
@@ -620,27 +623,38 @@ completion no longer teach the removed edition's words.
 
 - Unsafe sites in compiler/src: 3281 to 316; unjustified 2573 to 0;
   unneeded 150 to 0; `static mut` 151 to 0. std: 911 sites, 0
-  unjustified. TODO(gate: the unsafe-audit row on the final tree).
+  unjustified (the gate's unsafe-audit row on the final tree; 22 of
+  std's blocks are listed unneeded and not judged: generic functions).
 - The self-build and the compiler's own check, instructions, against
-  0.28.0: TODO(gate: both figures; 0.28.0's check, 21,199.8 M, is the
-  baseline this release was held to).
-- Compile cost against v0.28.0, in instructions: TODO(gate: the rows
-  hello, check and regions with their ratios; 0.28.0 against 0.27.8:
-  hello 172.5 M (0.98x), check 21,199.8 M (0.13x), regions 1203.7 M
-  (0.13x)). The `std` row is skipped (0.28.0 cannot build its
+  0.28.0: the self-build at -O2 126,202 M against 103,555 M (+21.9%), at
+  -O0 33,452 M against 29,875 M (+12.0%); check 24,776 M against
+  21,339 M (+16.1%); each compiler on its own source, idle machine.
+- Compile cost against v0.28.0, in instructions: hello 173.8 M
+  (1.00x), check 24,814.5 M (0.97x), regions 1130.9 M (0.93x) (0.28.0
+  against 0.27.8: 0.98x, 0.13x, 0.13x). The `std` row is skipped (0.28.0 cannot build its
   program); `hello-0.27` is gone.
-- The compiler's binary: TODO(gate: bytes; 0.28.0: 11,904,376).
+- The compiler's binary: 11,832,056 bytes (0.28.0: 11,904,376).
 - bench (`gate.sh --only bench`, idle machine, time against `cc -O2` =
-  1, geomean): TODO(gate: -O2, -O1, -O0 and the iterator check;
-  0.28.0: 1.162, 2.282, 13.375, iterchain 2.37 times iterloop).
-- The suite: TODO(gate: passed at -O0, -O1, -O2 and XFAIL; 0.28.0:
-  6273 and 732).
-- `git diff --shortstat v0.28.0 v0.29.0`: TODO(gate: files,
-  insertions, deletions; 0.28.0's against 0.27.8: 8057 files, 237,534
-  insertions, 1,672,151 deletions). compiler/src: 473 files and
-  264,948 lines in 0.28.0; TODO(gate: files and lines at the tag).
-- Found by the gate and fixed before the tag: TODO(gate: what the
-  gate found, or "nothing").
+  1, geomean): 1.131 at -O2, 2.275 at -O1, 13.131 at -O0; the
+  iterator check fails, iterchain 2.057 times iterloop (0.28.0: 1.162,
+  2.282, 13.375 and 2.37). 0.28.0 cannot build bench/wordcount.vl (it
+  names `FixedState` from the prelude), so its column has no figure
+  there.
+- The suite: 6385 passed and 731 xfail at each of -O0, -O1 and -O2
+  (0.28.0: 6273 and 732).
+- `git diff --shortstat v0.28.0 v0.29.0`: 4450 files,
+  134,135 insertions, 128,267 deletions (0.28.0's against 0.27.8: 8057
+  files, 237,534 insertions, 1,672,151 deletions). compiler/src: 473 files and
+  264,948 lines in 0.28.0; 476 files and 257,258 lines in 0.29.0.
+- Found by the gate and fixed before the tag: a test build
+  at -O2 had an empty line table (the `main` the compiler writes for
+  it had no position, and the inliner now folds the tests into it: 3
+  of objcheck's 12,940 compilations differed); the ABI check's
+  generator derived `Copy` for a struct with a union field that was
+  not `Copy`, and the layout check cast a reference to an integer:
+  both refused by this release's new errors, both the checks' own
+  programs. The gate was then run whole on the fixed tree and every
+  row passed.
 
 ### What's new in 0.28.0
 
