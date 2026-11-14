@@ -296,34 +296,49 @@ fn ntt_stage_simd(v: &mut [u32], tws: &[u32], n: usize, len: usize, m: &Mont) {
     }
 }
 
-// The roots of unity of one transform length, in Montgomery form. Every
-// stage's twiddles are a stride through this one table (w_len^j is
-// w_n^(j * n/len)), so a stage costs a copy, not n modular multiplies;
-// and all three transforms of a product share it.
+// The roots of unity of one transform length, in Montgomery form, stored
+// stage by stage: the stage of blocks of 2h points reads its h twiddles
+// w_2h^k at [h + k], a contiguous run, so the table has l entries in all
+// (entry 0 is unused) and no stage gathers or copies anything. All three
+// transforms of a product share it.
 struct Roots<A: Allocator> {
     fwd: Vec<u32, A>,
     inv: Vec<u32, A>,
 }
 
-fn roots_new(p: u64, l: usize, gpa: Gpa) -> Roots<Gpa> {
+// The table of the powers of w, a primitive l-th root: the top stage's
+// run is w^0..w^(l/2 - 1), by Montgomery products (no division), and
+// each stage below is every second entry of the one above.
+fn stage_table(w: u64, l: usize, m: &Mont, gpa: Gpa) -> Vec<u32, Gpa> {
+    let mut table = Vec::from_elem_in(0u32, l, gpa);
+    let t = table.as_mut_slice();
+    let one = (1u64 << 32) % m.p;
+    let wr = mont_mul(w, one * one % m.p, m);
+    let top = l / 2;
+    let mut a = one;
+    for k in 0..top {
+        t[top + k] = a as u32;
+        a = mont_mul(a, wr, m);
+    }
+    let mut h = top / 2;
+    while h >= 1 {
+        for k in 0..h { t[h + k] = t[2 * h + 2 * k]; }
+        h /= 2;
+    }
+    table
+}
+
+fn roots_new(m: &Mont, l: usize, gpa: Gpa) -> Roots<Gpa> {
+    let p = m.p;
     let w = powmod(NTT_ROOT, (p - 1) / l as u64, p);
     let wi = powmod(w, p - 2, p);
-    let mut fwd = Vec::with_capacity_in(l / 2, gpa);
-    let mut inv = Vec::with_capacity_in(l / 2, gpa);
-    let (mut a, mut b) = (1u64, 1u64);
-    for _ in 0..l / 2 {
-        fwd.push(((a << 32) % p) as u32);
-        inv.push(((b << 32) % p) as u32);
-        a = a * w % p;
-        b = b * wi % p;
-    }
-    Roots { fwd, inv }
+    Roots { fwd: stage_table(w, l, m, gpa), inv: stage_table(wi, l, m, gpa) }
 }
 
 // In-place iterative Cooley-Tukey transform; v.len() is a power of two.
 // Values arrive in the ordinary domain and, forward, stay in the
 // Montgomery domain afterwards; the inverse transform converts back.
-fn ntt(v: &mut [u32], roots: &Roots<Gpa>, m: &Mont, inverse: bool, gpa: Gpa) {
+fn ntt(v: &mut [u32], roots: &Roots<Gpa>, m: &Mont, inverse: bool) {
     let p = m.p;
     let n = v.len();
     if !inverse { for i in 0..n { v[i] = (((v[i] as u64) << 32) % p) as u32; } }
@@ -341,23 +356,11 @@ fn ntt(v: &mut [u32], roots: &Roots<Gpa>, m: &Mont, inverse: bool, gpa: Gpa) {
             v[j] = t;
         }
     }
+    let table = if inverse { roots.inv.as_slice() } else { roots.fwd.as_slice() };
     let mut len = 2;
     while len <= n {
         let half = len / 2;
-        let stride = n / len;
-        let mut tw = Vec::new_in(gpa);
-        if stride > 1 {
-            for k in 0..half {
-                tw.push(if inverse { roots.inv[k * stride] } else { roots.fwd[k * stride] });
-            }
-        }
-        // The last stage's twiddles are the table itself; no copy.
-        let tws: &[u32] = if stride == 1 {
-            let table = if inverse { &roots.inv } else { &roots.fwd };
-            table.as_slice()
-        } else {
-            tw.as_slice()
-        };
+        let tws = &table[half..len];
         if detect("neon") {
             ntt_stage_simd(v, tws, n, len, m);
         } else {
@@ -387,7 +390,7 @@ fn forward_limbs(a: &[u32], l: usize, roots: &Roots<Gpa>, m: &Mont,
     let p = m.p;
     let mut fa = Vec::from_elem_in(0u32, l, gpa);
     for i in 0..a.len() { fa[i] = (a[i] as u64 % p) as u32; }
-    ntt(fa.as_mut_slice(), roots, m, false, gpa);
+    ntt(fa.as_mut_slice(), roots, m, false);
     fa
 }
 
@@ -396,7 +399,7 @@ fn inverse_product(fa: &[u32], fb: &[u32], roots: &Roots<Gpa>, m: &Mont,
     gpa: Gpa) -> Vec<u32, Gpa> {
     let mut out = Vec::from_elem_in(0u32, fa.len(), gpa);
     for i in 0..fa.len() { out[i] = mont_mul(fa[i] as u64, fb[i] as u64, m) as u32; }
-    ntt(out.as_mut_slice(), roots, m, true, gpa);
+    ntt(out.as_mut_slice(), roots, m, true);
     out
 }
 
@@ -406,7 +409,7 @@ fn ntt_residues(a: &[u32], b: &[u32], same: bool, pi: usize, l: usize,
     gpa: Gpa) -> Vec<u32, Gpa> {
     let p = NTT_PRIMES[pi];
     let mont = mont_new(p);
-    let roots = roots_new(p, l, gpa);
+    let roots = roots_new(&mont, l, gpa);
     let fa = forward_limbs(a, l, &roots, &mont, gpa);
     let fb = if same { fa.clone() } else { forward_limbs(b, l, &roots, &mont, gpa) };
     inverse_product(&fa, &fb, &roots, &mont, gpa)
@@ -500,7 +503,7 @@ fn pair_residues(x: &[u32], y1: &[u32], y2: &[u32], pi: usize, l1: usize, l2: us
     gpa: Gpa) -> (Vec<u32, Gpa>, Vec<u32, Gpa>) {
     let p = NTT_PRIMES[pi];
     let mont = mont_new(p);
-    let roots1 = roots_new(p, l1, gpa);
+    let roots1 = roots_new(&mont, l1, gpa);
     let fx = forward_limbs(x, l1, &roots1, &mont, gpa);
     let fy1 = forward_limbs(y1, l1, &roots1, &mont, gpa);
     let r1 = inverse_product(&fx, &fy1, &roots1, &mont, gpa);
@@ -508,7 +511,7 @@ fn pair_residues(x: &[u32], y1: &[u32], y2: &[u32], pi: usize, l1: usize, l2: us
         let fy2 = forward_limbs(y2, l1, &roots1, &mont, gpa);
         (r1, inverse_product(&fx, &fy2, &roots1, &mont, gpa))
     } else {
-        let roots2 = roots_new(p, l2, gpa);
+        let roots2 = roots_new(&mont, l2, gpa);
         let fx2 = forward_limbs(x, l2, &roots2, &mont, gpa);
         let fy2 = forward_limbs(y2, l2, &roots2, &mont, gpa);
         (r1, inverse_product(&fx2, &fy2, &roots2, &mont, gpa))
