@@ -1108,14 +1108,17 @@ def tree_compilers(run_in):
     there, or None; the main checkout's target/tools/volec when this is a
     worktree without one, or None; the checkout's root)."""
     top, shared = checkout_of(run_in)
-    if not top:
+    # (a checkout of its own: not a tree extracted inside another, a
+    # release's under target/bootstrap, which has no compiler by design)
+    if not top or not os.path.exists(os.path.join(top, ".git")):
         return None, None, None
     for rel in ("target/tools/volec", "target/volec"):
         full = os.path.join(top, rel)
         if os.access(full, os.X_OK):
             r = os.path.relpath(full, run_in)
             return (r if not r.startswith("..") else full), None, top
-    main = os.path.dirname(shared) if shared and os.path.basename(shared) == ".git" else None
+    main = os.path.dirname(shared) if shared and os.path.basename(shared) == ".git" \
+        and os.path.isfile(os.path.join(top, ".git")) else None
     if main and os.path.abspath(main) != os.path.abspath(top):
         other = os.path.join(main, "target", "tools", "volec")
         if os.access(other, os.X_OK):
