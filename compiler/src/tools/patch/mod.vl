@@ -27,6 +27,7 @@
 
 mod mismatch;
 mod indent;
+pub mod at;
 
 use std::alloc::Arena;
 
@@ -110,6 +111,9 @@ pub fn patch_leaf(insert: bool, gpa: Gpa) -> Leaf<'static, Gpa> {
         opts.push(option("new", "TEXT", "its new text"));
         opts.push(option("pairs", "FILE", "the pairs from FILE (or stdin)"));
         opts.push(option("in", "NAME", "the pairs after it are NAME's"));
+        opts.push(option("at", "FILE:LINE[:COL]", "the pairs after it are on that line"));
+        opts.push(option("from", "LIST", "patches by position, one a line (-: stdin)"));
+        opts.push(flag("keep-going", "--at, --from: write the patches that match"));
     }
     opts.push(flag("loose", "OLD with other indentation"));
     opts.push(flag("all", "every occurrence of OLD"));
@@ -126,12 +130,16 @@ pub fn run_patch(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     let mut names: Vec<i64, Comp> = Vec::new_in(Comp {});
     let mut anchor = 0 as *const u8;
     let mut after = false;
+    // (0.30) patches by position (at.vl): --at, --from LIST
+    let mut positional = false;
+    let mut keep_going = false;
+    let mut list = 0 as *const u8;
     for e in c.evs.iter().copied() {
         let mut ev = e;
         let a = ev.value;
         let valued = ev.name == "nth" || ev.name == "in" || ev.name == "after"
             || ev.name == "before" || ev.name == "old" || ev.name == "new"
-            || ev.name == "pairs";
+            || ev.name == "pairs" || (!insert && (ev.name == "at" || ev.name == "from"));
         if ev.kind == EV_MISSING && valued {
             let d = diag(c"error", c"edit.usage", tcx);
             buf_str(d, a);
@@ -153,6 +161,19 @@ pub fn run_patch(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
                 tcx.news.push(text_buffer(&c_slice(v)));
             } else if ev.name == "pairs" {
                 tcx.pairs_file = v;
+            } else if ev.name == "from" && !insert {
+                list = v;
+                positional = true;
+            } else if ev.name == "at" && !insert {
+                if tcx.olds.len() as i64 != tcx.news.len() as i64 {
+                    return usage(c"each --old needs its --new", tcx, pcx);
+                }
+                let mut at_line: i64 = 0;
+                if crate::tools::query::file_line(&c_slice(v), &mut at_line) <= 0 || at_line <= 0 {
+                    return usage(c"--at takes a position, FILE:LINE or FILE:LINE:COL", tcx, pcx);
+                }
+                tcx.cur_target = target_index(&c_slice(v), tcx);
+                positional = true;
             } else if ev.name == "nth" {
                 let vb = ev.text.as_bytes();
                 let mut n: i64 = 0;
@@ -188,6 +209,8 @@ pub fn run_patch(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
         }
         if ev.kind == EV_FLAG && ev.name == "loose" {
             tcx.loose = true;
+        } else if ev.kind == EV_FLAG && ev.name == "keep-going" && !insert {
+            keep_going = true;
         } else if ev.kind == EV_FLAG && ev.name == "all" {
             if tcx.nth != 0 {
                 return usage(c"one of --nth N and --all", tcx, pcx);
@@ -212,6 +235,46 @@ pub fn run_patch(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
         && crate::base::is_source_path((names[1]) as *mut u8) {
         root = (names[1]) as *mut u8;
         names.truncate(1 as usize);
+    }
+    if positional {
+        if names.len() > 0 || tcx.pairs_file != 0 as *mut u8 || tcx.loose || tcx.nth != 0 {
+            return usage(c"--at and --from name positions: no TARGET, --in, --pairs, --loose, --nth or --all with them", tcx, pcx);
+        }
+        if tcx.olds.len() as i64 != tcx.news.len() as i64 {
+            return usage(c"each --old needs its --new", tcx, pcx);
+        }
+        for k in 0..tcx.olds.len() {
+            if tcx.pair_target[k] < 0 {
+                return usage(c"with --at, every pair follows an --at FILE:LINE", tcx, pcx);
+            }
+        }
+        if list != 0 as *const u8 {
+            let input = buf_new();
+            let dash = c_slice(list).as_slice() == b"-";
+            if dash {
+                if !read_stdin(input, tcx) {
+                    let d = diag(c"error", c"edit.no-text", tcx);
+                    buf_str(d, c"--from - reads the list from stdin; none was given\n");
+                    return 2;
+                }
+            } else if !read_file_if(list, input) {
+                let d = diag(c"error", c"edit.no-text", tcx);
+                buf_str(d, c"cannot read --from ");
+                buf_str(d, list);
+                buf_byte(d, b'\n');
+                return 2;
+            }
+            if !at::read_list(&buf_copy(input), tcx) {
+                return 2;
+            }
+        }
+        if tcx.olds.len() == 0 {
+            return usage(c"--at FILE:LINE needs its --old TEXT --new TEXT", tcx, pcx);
+        }
+        return patch_positions(root, keep_going, c, tcx, pcx, wgx);
+    }
+    if keep_going {
+        return usage(c"--keep-going is for --at and --from", tcx, pcx);
     }
     if insert && tcx.nth < 0 {
         return usage(c"--all is for patch; insert --in takes --nth N", tcx, pcx);
@@ -381,6 +444,36 @@ pub fn run_patch(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     // (0.14: the imports the new text needs, when it has new errors)
     tcx.add_imports = true;
     apply_edit(&buf_copy(summary), root, tcx, pcx)
+}
+
+// (0.30) The patches by position (at.vl) of `edit patch --at|--from` and
+// `edit apply --at`, their pairs read: the program loaded, every patch
+// placed, one edit, one check. The exit status: 1 too when --keep-going
+// left a patch out.
+pub fn patch_positions(root_arg: *const u8, keep_going: bool, c: &Call<'_, Gpa>,
+    tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>, wgx: &mut WgslCx<Arena<Gpa>>) -> i64 {
+    tcx.what = c"patch";
+    tcx.target_arg = (tcx.patch_targets[0]) as *mut u8;
+    tcx.root_given = root_arg;
+    let root = root_or_diag(root_arg, tcx.what, target(tcx), true, tcx, pcx);
+    if root == 0 as *mut u8 {
+        return 2;
+    }
+    tcx.root_path = root;
+    if !cache_restore(root, tcx.target, false, tcx, pcx)
+        && !load_program(root, tcx.target, tcx, pcx, wgx) {
+        program_errors(c"error", root, true, tcx, pcx);
+        return 1;
+    }
+    let summary = buf_new();
+    buf_str(summary, c"patched ");
+    let left_out = at::patch_sites(keep_going, summary, tcx, pcx);
+    if left_out < 0 {
+        return if rerun_wanted(tcx) { rerun_in_std_tree(c.line, tcx, pcx) } else { 1 };
+    }
+    tcx.add_imports = true;
+    let status = apply_edit(&buf_copy(summary), root, tcx, pcx);
+    if status == 0 && left_out > 0 { 1 } else { status }
 }
 
 // TARGET as given.

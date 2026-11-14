@@ -95,9 +95,13 @@ are not new: an edit of a program with errors is checked against them.
   with no context lines (`git apply --unidiff-zero` takes it), and says
   when it would add errors (`warning edit.breaks: N new errors (dry
   run)`, exit 1).
-- `--no-check` writes an edit that adds errors anyway (a signature
-  changed before its callers are), with `warning edit.breaks` and the
-  errors; `volec check` lists what is left.
+- `--no-check` writes the edit without checking it (a signature changed
+  before its callers are; a step of a bulk edit): no check runs and
+  nothing is listed (0.30; before, the check ran all the same, to print
+  `warning edit.breaks` and every new error, 3 to 10 s a step on the
+  compiler); `volec check` lists what is left when the steps are done.
+  A `--dry-run` with it still checks, and `fix` still reports what is
+  left.
 - `--show` (0.12; every edit, fix, rewrite and refactoring) prints, after
   the summary line, the regions the edit changed as their new lines,
   numbered, so that the edit need not be read back:
@@ -344,6 +348,35 @@ pair adds) is one call, checked once after every pair is applied:
   form, not a new `edit insert-above` command: each line gets its own
   text, the insertions mix with replacements in the same checked call,
   and the try: files of a refused pair are already pairs files.
+
+### Many small patches, one check: --at, --from (0.30)
+
+A check names positions, `FILE:LINE:COL`, not items; the fixes of fifty
+errors are fifty small patches, and a call for each paid fifty checks of
+the program. A patch by position looks for OLD on its line only:
+
+```sh
+$ volec edit patch --at main.vl:4 --old '0, 10' --new '1, 9' --at calc.vl:6 --old 'v > hi' --new 'v >= hi'
+patched 2 sites	2 files	+2 -2 lines
+```
+
+- `--at FILE:LINE`: OLD occurs once on that line (twice:
+  `patch.ambiguous` names the columns); `--at FILE:LINE:COL`: OLD starts
+  at that column, the one a diagnostic prints, and an empty OLD inserts
+  NEW there. The pairs after an `--at` are that line's.
+- `--from LIST` (`-`: stdin) reads the patches, one a line:
+  `FILE:LINE[:COL]<TAB>OLD<TAB>NEW`, with `\t`, `\n` and `\\` in OLD and
+  NEW for a tab, a newline and a backslash; blank lines and `#` lines
+  are skipped. `volec edit apply --at < LIST` is the same.
+- Every position is the text's before the edit, and every patch is
+  placed before any is written: one that does not match is named by its
+  number and position (`error patch.no-match: patch 3 (main.vl:5): OLD
+  'nothere' is not on that line: ...`), all of them, then `error
+  patch.sites: 3 of 5 patches do not match; nothing written
+  (--keep-going writes the 2 that do)`. With `--keep-going` the others
+  are written and the exit status is still 1.
+- One edit: one check at its end (`--no-check`: none), one journal
+  entry, one `undo`.
 
 ### insert --in
 
@@ -991,8 +1024,9 @@ rename's own test and the script.
 | `edit.std` | note | 0 | (0.17) a std edit in the repository wrote std's files; embed.sh made stdsrc.vl | rebuild: `bootstrap/bootstrap.sh --dev` |
 | `edit.std` | warning | 0 | (0.17) the same, and embed.sh failed | `compiler/std/embed.sh` |
 | `check.std-files` | note | 0 | (0.17) std's files differ from the compiler's std: checked with them | |
+| `patch.sites` | error, warning | 1 | `edit patch --at|--from`: N of M patches do not match (each named above it); nothing written, or with `--keep-going` the others are | fix the named patches, or `--keep-going` |
 | `edit.breaks` | error | 1 | the edit adds errors (they are printed); nothing written | the command with `--no-check` |
-| `edit.breaks` | warning | 1, 0 | the same with `--dry-run`, or `--no-check` (written) | `volec check` |
+| `edit.breaks` | warning | 1 | the same with `--dry-run` (`--no-check` runs no check and says nothing, 0.30) | `volec check` |
 | `edit.refactor` | note | | (0.15) with edit.breaks: an edited item's shape changed and its uses broke | the refactoring that changes them with it |
 | `edit.together` | note | | (0.15) with edit.breaks: items the edit does not change have errors | `query show` of them |
 | `edit.format` | error | 2 | (0.15) apply: the file is not blocks | |
