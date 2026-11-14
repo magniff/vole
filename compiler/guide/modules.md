@@ -144,7 +144,10 @@ their names, as do `extern "C"` items and `#[link_name]`s.
   missing (its own items', and std's outside the prelude),
   and `--only unused` removes unused ones. (0.25.2) `check` and a build
   warn about each, `use.unused` (an error with `--deny-warnings`): an
-  import nothing in its file names; not a `pub use`.
+  import nothing in its file names; not a `pub use`. (0.30)
+  `volec check` also warns of `use.redundant`, an import of an item
+  the prelude already gives (`use std::vec::Vec;`); `volec fix` (`--only
+  redundant`) removes it. A build does not lint.
 - `volec query items` lists every module; `query items MODULE` its
   items with signatures.
 - `volec refactor move a::f --to crate::b` moves items, fixing
