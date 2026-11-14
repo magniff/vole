@@ -2887,6 +2887,59 @@ unsafe-audit 2775 unjustified (baseline 2775, from 3057) and 0 in std,
 chain-diverse, chain-fresh 40 releases. compile-cost against v0.26.5: a
 hello world 1.00x, std 0.99x, check of the compiler 1.01x.
 
+### 0.30.0
+
+The release gate, macOS only, run whole, `gate.sh --release --no-linux
+-j 4`, with nothing else building. TODO(gate: the number of runs; what
+each run stopped at and what was fixed; whether every row passed on its
+first run on the final tree; the wall time and the highest load).
+During the release a quick gate (`gate.sh --quick`) passed every row on
+the tree of the second batch, and objcheck there was 13000 of 13000.
+Against 0.29.0's rows: `stdtools` is new (tests/stdtools.sh: std's
+files in the tools' errors, queries, edits and fixes, and `check
+--std`, in a copy of compiler/std; in every mode, quick too); fuzz-sem
+has a fifth run, `--deref-assign` (assignments through a `Box`, a
+guard, a type's `DerefMut`, a function's `&mut T` and a raw pointer),
+and `gate.sh --self-test fuzz-sem` checks that the row runs every mode
+of the generator; `--self-test ROWS` runs some of the self-test's rows
+and first removes what failed self-tests left; compile-cost has its std
+row back (0.29.0 builds tests/cost/std_heavy.vl); unsafe-audit judges
+std's unneeded blocks too. The rows: the suite TODO(gate: passed at
+-O0, -O1 and -O2, XFAIL, skipped; 0.29.0: 6385, 731 XFAIL, SKIPPED: no
+spirv-val), std-tests TODO(gate: passed at -O0 and -O2 under
+--check-alloc, XFAIL; 0.29.0: 1571, 62 XFAIL), std-check TODO(gate:
+bodies, clean, with borrowck errors, not solved; 0.29.0: 3967 bodies,
+3964 clean, 0, 3), stdtools TODO(gate: its checks), threads TODO(gate;
+0.29.0: 15940), incremental TODO(gate; 0.29.0: 172 series), objcheck
+TODO(gate; 0.29.0: 12940, and 260 for x86_64-macos), layout TODO(gate;
+0.29.0: 111 records and 582 fields; the floor is 100 records),
+compiler-memcheck TODO(gate; 0.29.0: 755), examples-checkalloc
+TODO(gate; 0.29.0: 196), every fuzz and ABI row TODO(gate: all
+passed?), fuzz-sem TODO(gate: 5 runs of 300 programs, failures;
+0.29.0: 4 runs), voltty-fuzz TODO(gate; 0.29.0: 2108 scripts),
+stress-grow TODO(gate), cachediff TODO(gate; 0.29.0: 1447 lines, 441
+from the cache), borrowck-twin TODO(gate; 0.29.0: 462 cases, 419
+agree, 10 named divergences, 33 outside the subset, 0 mismatches; 469,
+427 and 8 on the last merge), unsafe-audit TODO(gate: sites of
+compiler/src and of std, unjustified and unneeded 0; 0.29.0: 316 and
+915; 299 and 910 on the last merge), chain-fresh TODO(gate; 0.29.0: 51
+releases from the seed), chain-diverse TODO(gate). compile-cost
+against v0.29.0: TODO(gate: hello, std, check and regions with their
+ratios; 0.29.0 against 0.28.0: 1.00x, skipped, 0.97x, 0.93x; hello was
++30.7% against 0.29.0 by tools/perf-experiment.sh on the last merge,
+println's sink, and the row's limit is 1.5x). The bench
+row, run after the gate on the idle machine: TODO(gate: whether its
+iterator check passes, iterchain against iterloop, limit 1.05; the
+geomean against `cc -O2` at -O2, -O1 and -O0; 0.29.0: 2.057, 1.131,
+2.275, 13.131; on the tree of the second batch 1.010, 1.001, 2.204,
+12.719). The self-build and the compiler's own check against 0.29.0,
+each compiler on its own source: TODO(gate: -O2, -O0 and check in
+instructions; 0.29.0: 126.2 G, 33.5 G and 24.8 G). Not run: any Linux
+row. Next: 0.31 is the compiler's performance (a cold -O0 self-build
+and check under 1 s, a cold -O2 one about 1.5 s, generated code
+against clang on programs written in both), 0.32 contracts v2 and
+static proofs.
+
 ### 0.29.0
 
 The release gate, macOS only. The gate schedules itself from this
