@@ -21,8 +21,8 @@
 #   -n     say what would be removed, remove nothing
 #   DIR    the temporary directory (default: $TMPDIR, or /tmp)
 #
-# Prints `selftest-prune: removed N of M (K left: ...)`. Not yet called
-# by gate.sh: its self-test is to run it when it starts.
+# Prints `selftest-prune: removed N of M (K left: ...)`. (0.30) gate.sh
+# --self-test runs it when it starts.
 set -u
 LC_ALL=C
 export LC_ALL

@@ -20,7 +20,7 @@
 # files, 0.25.3) and tests/stdpos/run.sh (std's positions in the
 # transcripts, compared normalized, 0.25.3) and tests/cachediff/run.sh
 # --sample (the tools' answers from their cache the same as without it,
-# 0.25.3). POSIX sh and awk only, so it runs the same on macOS and Linux.
+# 0.25.3) and tests/stdtools.sh (std inside the tools, 0.30). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
 # usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-k LINKER] [-d FORMAT] [-f FILE] [-l] [--cases-only] [--bless] [-n NAME] [FILTER...]
 #
@@ -393,7 +393,7 @@ want() {
 # NAME)` is below (tests/runner/run.sh checks the two agree): what -l
 # lists. LEVELED: the ones that take -O (the others are the same at
 # every level).
-SUITES="query refactor guide book fmt walkthrough wgsl voltty borrowck-try runner embed-checks stdpos cachediff lsp link gpu hooks arch-gen arch-enc voltty_render window example_layout example_build readme_sync perf"
+SUITES="query refactor guide book fmt walkthrough wgsl voltty borrowck-try runner embed-checks stdpos stdtools cachediff lsp link gpu hooks arch-gen arch-enc voltty_render window example_layout example_build readme_sync perf"
 LEVELED="gpu arch-gen"
 # (0.30) A FILTER of digits only is warned about: an option's value put
 # after a name was one before 0.30 (`NAME -j 2`).
@@ -1302,6 +1302,12 @@ esac
 case $(want stdpos) in
     y) run_suite stdpos sh "$ROOT/tests/stdpos/run.sh" -c "$COMPILER" ;;
 esac
+# (0.30) std inside the tools: std's files named in errors, queries,
+# edits and fixes, and `check --std`, in a copy of compiler/std
+# (tests/stdtools.sh): category "stdtools".
+case $(want stdtools) in
+    y) run_suite stdtools sh "$ROOT/tests/stdtools.sh" -c "$COMPILER" ;;
+esac
 # (0.25.3) The tools' answers from their cache the same as without it, on
 # a sample of the transcripts (tests/cachediff/run.sh --sample; all of
 # them: the gate's cachediff step): category "cachediff".
@@ -1543,6 +1549,24 @@ case $(want stdpos) in
             { echo "FAIL stdpos: tests/stdpos/run.sh reported nothing:"; sed 's/^/    /' "$WORK/stdpos.out" | head -20; echo; } >>"$FAILURES"
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/stdpos.out" >>"$FAILURES"
+        ;;
+esac
+
+# std inside the tools (0.30, run above); category "stdtools".
+case $(want stdtools) in
+    y)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "stdtools pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "stdtools fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/stdtools.out"
+        if ! grep -q '^pass' "$WORK/stdtools.out"; then
+            echo "stdtools fail" >>"$TALLY"
+            count=$((count + 1))
+            { echo "FAIL stdtools: tests/stdtools.sh reported nothing:"; sed 's/^/    /' "$WORK/stdtools.out" | head -20; echo; } >>"$FAILURES"
+        fi
+        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/stdtools.out" >>"$FAILURES"
         ;;
 esac
 
