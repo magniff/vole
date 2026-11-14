@@ -423,6 +423,101 @@ else
     bad affected_readme_prose "git could not make the repository"
 fi
 
+# ---- tests/affected.sh: names, --narrow, commands (0.30) ----
+
+# Every command of the map is a script of the tree that sh runs (the plan
+# checks the ones it holds before anything runs).
+why=$(awk '$1 == "cmd" { print $2, $3 }' "$ROOT/tests/affected.map" | while read -r name file; do
+    [ -f "$ROOT/$file" ] || { printf '%s: no %s; ' "$name" "$file"; continue; }
+    head -1 "$ROOT/$file" | grep -q '^#!/bin/sh' || printf '%s: %s is not an sh script; ' "$name" "$file"
+done)
+[ -z "$why" ] && ok affected_map_commands || bad affected_map_commands "$why"
+# What a change to a file would run (--path): debug information goes to
+# the checks that build with -g, and a script to itself in a cheap mode.
+got=$(cd "$ROOT" && sh tests/affected.sh --list --path compiler/src/back/dwarf.vl --path tests/debug/crash.vl 2>&1)
+case "$got" in
+    *"command: tests/debug.sh -c "*"command: tests/objcheck.sh -c "*" -j 2 debug_"*) ok affected_debug ;;
+    *) bad affected_debug "$got" ;;
+esac
+got=$(cd "$ROOT" && sh tests/affected.sh --list --path tests/threads.sh --path tests/cimport/layout.sh --path bench/run.sh 2>&1)
+case "$got" in
+    *"plan: "*"command: bench/run.sh -c "*" --smoke"*"command: tests/cimport/layout.sh -c "*" -m 30 stdio.h "*"command: tests/threads.sh -c "*" -j 2 -r 4 "*) ok affected_scripts ;;
+    *) bad affected_scripts "$got" ;;
+esac
+# In a repository of its own, with a map of its own: a std change of
+# three functions, one named by a case, a transcript, a session and no
+# more, one by 45 cases and a chapter, one by every std case (410).
+N="$WORK/narrow"
+mkdir -p "$N/tests/run" "$N/tests/query" "$N/compiler/std" "$N/examples/g/e" "$N/book"
+cp "$ROOT/tests/affected.sh" "$ROOT/tests/run.sh" "$N/tests/"
+cat >"$N/tests/affected.map" <<'EOF'
+set smoke   arith_
+set broad   +broad arith_ err_ std_
+cmd good    tests/good.sh -c @C
+cmd nosh    tests/nosh.py
+cmd gone    tests/gone.sh
+compiler/std/   @broad std_ !good
+tests/run/      @self
+tests/nosh.py   !nosh
+tests/gone.txt  !gone
+*               @smoke
+EOF
+printf '#!/bin/sh\nexit 0\n' >"$N/tests/good.sh"
+printf '#!/usr/bin/env python3\n' >"$N/tests/nosh.py"
+echo x >"$N/tests/gone.txt"
+printf '%s\n' 'pub fn find_byte(a: i64) -> i64 {' '    a' '}' '' 'pub fn untouched() -> i64 {' '    1' '}' '' 'impl Thing {' \
+    '    pub fn push_all(&mut self) {' '        self.n = 1;' '    }' '}' '' 'pub fn ubiquitous() -> i64 {' '    3' '}' >"$N/compiler/std/vec.vl"
+i=1
+while [ $i -le 410 ]; do
+    f="$N/tests/run/std_$(printf '%03d' $i).vl"
+    echo 'fn main() -> i32 { ubiquitous() as i32 }' >"$f"
+    [ $i -le 45 ] && echo '// uses v.push_all()' >>"$f"
+    [ $i -eq 100 ] && echo '// find_byte(1)' >>"$f"
+    i=$((i + 1))
+done
+echo 'fn main() -> i32 { 0 }' >"$N/tests/run/arith_one.vl"
+echo 'fn main() -> i32 { 0 }' >"$N/tests/run/err_one.vl"
+printf '$ show find_byte\npub fn find_byte(a: i64) -> i64\n' >"$N/tests/query/q1.q"
+printf '$ show other\npub fn other()\n' >"$N/tests/query/q2.q"
+printf '# e\n\n```console\n$ volec query show find_byte\n```\n' >"$N/examples/g/e/README.md"
+printf '# a chapter\n\n`push_all` appends.\n' >"$N/book/01-a.md"
+if (cd "$N" && git init -q -b main . && git add -A && git -c user.name=t -c user.email=t@t commit -q -m base) >/dev/null 2>&1; then
+    sed -e 's/^    a$/    a + 0/' -e 's/self.n = 1;/self.n = 2;/' -e 's/^    3$/    4/' "$N/compiler/std/vec.vl" >"$N/vec.new"
+    cp "$N/vec.new" "$N/compiler/std/vec.vl"
+    rm "$N/vec.new"
+    got=$(cd "$N" && sh tests/affected.sh --list 2>&1)
+    case "$got" in
+        *"plan: 412 of 412 cases; suites: query book walkthrough "*"command: tests/good.sh -c "*"names: 3 changed items (find_byte push_all ubiquitous); std's are printed by: =book =walkthrough query:=q1; too common to choose by: ubiquitous"*"over 600 cases"*)
+            bad affected_names "the hint for a plan over 600 cases, on one of 412: $got" ;;
+        *"plan: 412 of 412 cases; suites: query book walkthrough "*"command: tests/good.sh -c "*"names: 3 changed items (find_byte push_all ubiquitous); std's are printed by: =book =walkthrough query:=q1; too common to choose by: ubiquitous"*)
+            ok affected_names ;;
+        *) bad affected_names "$got" ;;
+    esac
+    got=$(cd "$N" && sh tests/affected.sh --list --narrow 2>&1)
+    case "$got" in
+        *"plan: 42 of 412 cases; suites: query book walkthrough "*"narrow: a sample, not the rules' plan"*"find_byte (std): 1 cases, 2 transcripts, sessions or chapters"*"push_all (std): 45 cases name it: 40 of them, evenly through the list; 1 transcripts, sessions or chapters"*"too common to choose by (over 400 cases name it), left out: ubiquitous (410)"*"left out: @broad, std_ (410 cases)"*)
+            ok affected_narrow ;;
+        *) bad affected_narrow "$got" ;;
+    esac
+    # A command that cannot run is an error of the plan, before a run.
+    (cd "$N" && git checkout -q -- . && echo more >>tests/nosh.py)
+    got=$(cd "$N" && sh tests/affected.sh --list 2>&1)
+    rc=$?
+    case "$rc:$got" in
+        "2:"*"tests/affected.sh: the map's command 'tests/nosh.py ' cannot run: tests/nosh.py is not an sh script"*) ok affected_command_not_sh ;;
+        *) bad affected_command_not_sh "exit $rc: $got" ;;
+    esac
+    (cd "$N" && git checkout -q -- . && echo more >>tests/gone.txt)
+    got=$(cd "$N" && sh tests/affected.sh --list 2>&1)
+    rc=$?
+    case "$rc:$got" in
+        "2:"*"tests/affected.sh: the map's command 'tests/gone.sh ' cannot run: there is no tests/gone.sh"*) ok affected_command_missing ;;
+        *) bad affected_command_missing "exit $rc: $got" ;;
+    esac
+else
+    bad affected_names "git could not make the repository"
+fi
+
 # ---- tests/run.sh --bless (0.30) ----
 
 # In a small tree of its own (run.sh, the directives' parse, two cases)
