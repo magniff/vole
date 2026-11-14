@@ -25,10 +25,10 @@ use crate::tools::query::defs::{
 use crate::tools::query::diagnostics::{diag, put_root, put_word, try_end, write_diags};
 use crate::tools::query::positions::{enclosing, put_loc, shorthand_at, shorthand_text, token_at};
 use crate::tools::refactor_shape::{
-    find_byte, has_call, leading_name, list_insert, list_of_node, list_of_params, list_permute,
-    list_remove, load_and_find, name_token, opt, orig_of, put_count, refs_of, replace_name,
-    shape_options, split_default, sym_text, take_args, text_buf, try_query_name, try_refactor,
-    try_show_at, usage_error,
+    find_byte, find_loaded, has_call, leading_name, list_insert, list_of_node, list_of_params,
+    list_permute, list_remove, load_and_find, load_shape, name_token, opt, orig_of, put_count,
+    refs_of, replace_name, shape_options, split_default, sym_text, take_args, text_buf,
+    try_query_name, try_refactor, try_show_at, usage_error,
 };
 use crate::tools::rewrite::sort_by_start;
 use crate::tools::rewrite::parsed::{pa, pb, pc, pchild, pcount, pend, pk, pstart};
@@ -303,6 +303,306 @@ fn bound_in(f: i64, name: i64, tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
     -1
 }
 
+// (0.30) The edit of SRC[a..b) to `text`, unless it touches a range this
+// command rewrites already (`done`: starts and ends, in pairs): then its
+// start goes to `skipped` and nothing is edited (an argument inside a
+// rewritten argument, the same parameter twice in a --batch).
+fn put_edit(a: i64, b: i64, text: i64, done: &mut Vec<i64, Comp>, skipped: &mut Vec<i64, Comp>,
+    pcx: &mut Ctx<Comp>) -> bool {
+    let mut r: usize = 0;
+    while r + 1 < done.len() {
+        if a < done[r + 1] && done[r] < b {
+            skipped.push(a);
+            return false;
+        }
+        r += 2;
+    }
+    edit_replace(a, b, text, pcx);
+    done.push(a);
+    done.push(b);
+    true
+}
+
+// (0.30) `note refactor.nested`: the arguments left because they are
+// inside one this command rewrites.
+fn note_skipped(skipped: &[i64], tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) {
+    if skipped.len() == 0 {
+        return;
+    }
+    let e = diag(c"note", c"refactor.nested", tcx);
+    put_count(e, skipped.len() as i64, c"argument", c"arguments");
+    buf_str(e, c" inside a rewritten one (or rewritten already) left as written; first: ");
+    put_loc(e, skipped[0], pcx);
+    buf_byte(e, b'\n');
+}
+
+// (0.30: apart from signature_inner, for --batch) Whether the signature
+// of function d can change: not C's, the same parameters in every
+// definition of its group (a trait's function and its impls: into
+// `group`), no use as a value, no call by an operator (the calls: into
+// `calls`); `renaming`: a parameter's name only, which those do not see.
+// 0, or the exit status after the diagnostic.
+fn callable(d: i64, renaming: bool, group: &mut Vec<i64, Comp>, calls: &mut Vec<i64, Comp>,
+    tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
+    let f = pcx.defs[d as usize].node;
+    let fqn = sym_text(pcx.defs[d as usize].fqn, pcx);
+    if pk(f, pcx) == NodeKind::ExternFn || pcx.nodes[f as usize].y == 1 {
+        let e = diag(c"error", c"refactor.extern", tcx);
+        buf_bytes(e, fqn);
+        buf_str(e,
+            if pk(f, pcx) == NodeKind::ExternFn { c" is a C function: its signature is C's\n" }
+            else { c" is an extern \"C\" fn: C code calls it\n" });
+        return 1;
+    }
+    signature_group(d, group, tcx, pcx);
+    for i in 1..group.len() as i64 {
+        if pcount(pcx.defs[(group[i as usize]) as usize].node, pcx)
+            != pcount(f, pcx) {
+            let e = diag(c"error", c"refactor.trait", tcx);
+            buf_bytes(e, sym_text(pcx.defs[(group[i as usize]) as usize].fqn, pcx));
+            buf_str(e, c" has not the parameters of ");
+            buf_bytes(e, fqn);
+            buf_byte(e, b'\n');
+            return 1;
+        }
+    }
+    calls_of(group.as_slice(), calls, tcx, pcx);
+    // The references that are no calls: a function used as a value
+    // (its type is its signature's).
+    if !renaming {
+        refs_of(group.as_slice(), tcx, pcx);
+        for r in 0..tcx.r_pos.len() as i64 {
+            if ((tcx.r_flags[r as usize]) & (QF_CALL | QF_DEF)) != 0
+                || enclosing((tcx.r_pos[r as usize]), tcx, pcx) < 0 {
+                continue;
+            }
+            let e = diag(c"error", c"refactor.fn-value", tcx);
+            buf_bytes(e, fqn);
+            buf_str(e, c" is used as a value at ");
+            put_loc(e, (tcx.r_pos[r as usize]), pcx);
+            buf_str(e, c": its type would change; change that use first\n");
+            try_query_name(c"refs", fqn, tcx, pcx);
+            return 1;
+        }
+    }
+    for i in 0..calls.len() as i64 {
+        let c = (calls[i as usize]);
+        if pk(c, pcx) != NodeKind::Call && pk(c, pcx) != NodeKind::MethodCall
+            && !renaming {
+            let e = diag(c"error", c"refactor.operator", tcx);
+            buf_bytes(e, fqn);
+            buf_str(e, c" is called by an operator at ");
+            put_loc(e, pstart(c, pcx), pcx);
+            buf_str(e, c": its arguments are the operator's\n");
+            return 1;
+        }
+    }
+    0
+}
+
+// (0.30: apart from signature_inner, for --batch) Parameter k (named
+// pname) of function node f gets type `ty` in each definition of its
+// group; its argument in each call changes with it (see below). The
+// edits go through put_edit: `done` keeps their ranges, `skipped` the
+// ones inside a range rewritten already. The number of arguments the
+// reference rules changed.
+fn retype_param(f: i64, k: i64, pname: i64, ty: &[u8], default: *mut u8, group: &[i64],
+    calls: &[i64], self_param: bool, done: &mut Vec<i64, Comp>, skipped: &mut Vec<i64, Comp>,
+    tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
+    // (0.17: to a reference, without --default: the calls' `&x`
+    // become `&mut x`, a value `x` becomes `&x` or `&mut x`, a
+    // slice `v.as_slice()` or `a[..]` becomes `v.as_mut_slice()`
+    // or `&mut a[..]`)
+    let auto = ref_change(pb(pchild(f, k, pcx), pcx), ty, pcx);
+    for g in 0..group.len() as i64 {
+        let p = pchild(pcx.defs[(group[g as usize]) as usize].node, k, pcx);
+        let t = pb(p, pcx);
+        let ts = pstart(t, pcx);
+        put_edit(ts, pend(t, pcx), text_buf(ty), done, skipped, pcx);
+    }
+    let mut changed: i64 = 0;
+    if default == 0 as *mut u8 && auto != RC_NONE {
+        for i in 0..calls.len() as i64 {
+            let c = (calls[i as usize]);
+            list_of_node(c, tcx, pcx);
+            let off: i64 = if pk(c, pcx) == NodeKind::MethodCall && self_param { 1 }
+                else { 0 };
+            let i0 = arg_for(f, c, k, off, pcx);
+            if i0 < 0 {
+                continue;
+            }
+            let mut v = pchild(c, i0, pcx);
+            if pk(v, pcx) == NodeKind::NamedArg {
+                v = pb(v, pcx);
+            }
+            let nb = ref_argument(auto,
+                &get_src()[pstart(v, pcx) as usize..pend(v, pcx) as usize]);
+            if nb >= 0 {
+                if put_edit(pstart(v, pcx), pend(v, pcx), nb, done, skipped, pcx) {
+                    changed += 1;
+                }
+            }
+        }
+    }
+    // (--default: each call's argument becomes EXPR, 0.13)
+    if default != 0 as *mut u8 {
+        for i in 0..calls.len() as i64 {
+            let c = (calls[i as usize]);
+            list_of_node(c, tcx, pcx);
+            let off: i64 = if pk(c, pcx) == NodeKind::MethodCall && self_param { 1 }
+                else { 0 };
+            // (0.15: a named argument's value; none: left to the default)
+            let i0 = arg_for(f, c, k, off, pcx);
+            if i0 < 0 {
+                continue;
+            }
+            let mut v = pchild(c, i0, pcx);
+            if pk(v, pcx) == NodeKind::NamedArg {
+                v = pb(v, pcx);
+            }
+            let a = pstart(v, pcx);
+            let b = pend(v, pcx);
+            let value = with_argument(&c_slice(default), sym_text(pname, pcx),
+                &get_src()[a as usize..b as usize]);
+            put_edit(a, b, value, done, skipped, pcx);
+        }
+    }
+    changed
+}
+
+// (0.30) `refactor signature --batch FILE`: the type changes of FILE, a
+// line each, `FN PARAM TYPE [DEFAULT]` (words as sh splits them: a TYPE
+// or a DEFAULT with spaces in quotes; `#` comments), what `refactor
+// signature FN --type PARAM TYPE [--default DEFAULT]` does for each: one
+// load and check of the program before, every line's edits made on it as
+// it is then (a line does not see another's), one check after, one edit.
+// Before it, 185 changes were 185 loads and checks, and the first that
+// left an error took the types from the calls of the rest.
+//
+// The calls it could not change are listed, `FILE:L:C<TAB>FN`: those in
+// code the checker did not see (a program with errors), then `warning
+// refactor.unchecked` counts them; an argument inside one rewritten
+// already is `note refactor.nested`.
+fn signature_batch(file: *const u8, root0: *const u8, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
+    wgx: &mut WgslCx<Arena<Gpa>>) -> i64 {
+    let text = buf_new();
+    if !crate::tools::proc::read_file_if(file, text) {
+        let e = diag(c"error", c"refactor.batch", tcx);
+        buf_str(e, c"cannot read '");
+        buf_str(e, file);
+        buf_str(e, c"'\n");
+        return 2;
+    }
+    // The lines: FN, PARAM, TYPE, DEFAULT (0: none), the line's number.
+    let t = buf_copy(text);
+    let mut lines: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut i: usize = 0;
+    let mut number: i64 = 0;
+    while i < t.len() {
+        let mut e = i;
+        while e < t.len() && t[e] != b'\n' {
+            e += 1;
+        }
+        number += 1;
+        let mut words: Vec<i64, Comp> = Vec::new_in(Comp {});
+        let closed = crate::tools::script::split_words(&t[i..e], &mut words);
+        i = e + 1;
+        if closed && words.len() == 0 {
+            continue;
+        }
+        if !closed || words.len() < 3 || words.len() > 4 {
+            crate::tools::script::format_error(c"refactor.batch", file, number,
+                c"a line is FN PARAM TYPE [DEFAULT], quoted as in sh (`f v '&mut [i64]' '&mut $v'`)",
+                tcx);
+            return 2;
+        }
+        lines.push(words[0]);
+        lines.push(words[1]);
+        lines.push(words[2]);
+        lines.push(if words.len() == 4 { words[3] } else { 0 });
+        lines.push(number);
+    }
+    if lines.len() == 0 {
+        let e = diag(c"note", c"refactor.batch", tcx);
+        buf_str(e, c"no lines in '");
+        buf_str(e, file);
+        buf_str(e, c"'\n");
+        return 0;
+    }
+    tcx.root_given = root0;
+    let root = root_or_diag(root0, tcx.sub, &c_slice(lines[0] as *const u8), true, tcx, pcx);
+    if root == 0 as *const u8 {
+        return 2;
+    }
+    if !load_shape(root, tcx, pcx, wgx) {
+        return 1;
+    }
+    let fn_kinds = (1 << K_FN) | (1 << K_METHOD) | (1 << K_IMPL_METHOD) | (1 << K_TRAIT_FN);
+    let mut done: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut skipped: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let listed = buf_new();
+    let mut unchecked_all: i64 = 0;
+    let mut call_count: i64 = 0;
+    let mut l: usize = 0;
+    while l < lines.len() {
+        let name = c_slice(lines[l] as *const u8);
+        let mut status: i64 = 0;
+        let d = find_loaded(&name, fn_kinds, c"function", &mut status, tcx, pcx);
+        let mut ready = if d < 0 { status } else { 0 };
+        let mut group: Vec<i64, Comp> = Vec::new_in(Comp {});
+        let mut calls: Vec<i64, Comp> = Vec::new_in(Comp {});
+        if d >= 0 {
+            ready = callable(d, false, &mut group, &mut calls, tcx, pcx);
+        }
+        if ready == 0 {
+            let f = pcx.defs[d as usize].node;
+            let pname = intern(&c_slice(lines[l + 1] as *const u8), pcx);
+            let k = param_index(f, pname, pcx);
+            if k < 0 {
+                ready = no_param(d, f, lines[l + 1] as *mut u8, tcx, pcx);
+            } else {
+                let self_param = has_self(f, pcx);
+                retype_param(f, k, pname, &c_slice(lines[l + 2] as *const u8),
+                    lines[l + 3] as *mut u8, group.as_slice(), calls.as_slice(), self_param,
+                    &mut done, &mut skipped, tcx, pcx);
+                call_count += calls.len() as i64;
+                let unchecked = unchecked_calls(pcx.defs[d as usize].name, calls.as_slice(), tcx,
+                    pcx);
+                for u in 0..unchecked.len() {
+                    put_loc(listed, pstart(unchecked[u], pcx), pcx);
+                    buf_byte(listed, b'\t');
+                    buf_bytes(listed, sym_text(pcx.defs[d as usize].fqn, pcx));
+                    buf_byte(listed, b'\n');
+                    unchecked_all += 1;
+                }
+            }
+        }
+        if ready != 0 {
+            crate::tools::script::format_error(c"refactor.batch", file, lines[l + 4],
+                c"the line's change cannot be made (above)", tcx);
+            return ready;
+        }
+        l += 5;
+    }
+    crate::base::buf_write_fd(listed, crate::base::STDOUT);
+    if unchecked_all > 0 {
+        let e = diag(c"warning", c"refactor.unchecked", tcx);
+        put_count(e, unchecked_all, c"call", c"calls");
+        buf_str(e, c" in code the checker did not see (after an error, in a generic function never instantiated)");
+        buf_str(e, if unchecked_all == 1 { c" is" } else { c" are" });
+        buf_str(e, c" not changed: listed above, FILE:L:C and the function\n");
+    }
+    note_skipped(skipped.as_slice(), tcx, pcx);
+    let what = buf_new();
+    buf_str(what, c"changed ");
+    put_count(what, lines.len() as i64 / 5, c"parameter", c"parameters");
+    buf_str(what, c" (");
+    buf_str(what, file);
+    buf_str(what, c"), ");
+    put_count(what, call_count, c"call", c"calls");
+    apply_edit(&buf_copy(what), root, tcx, pcx)
+}
+
 fn signature_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     wgx: &mut WgslCx<Arena<Gpa>>) -> i64 {
     set_command(c.line, tcx);
@@ -315,6 +615,16 @@ fn signature_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     let example = c"NAME --add 'x: i64 = 0' --dry-run";
     if !take_args(c, shape_options("signature"), &mut root, &mut words, &mut opts, tcx, pcx) {
         return 2;
+    }
+    // (0.30: --batch FILE, the type changes of a file's lines, one edit)
+    let batch = opt(opts.as_slice(), c"--batch", false);
+    if batch != 0 as *mut u8 {
+        if words.len() != 0 || opts.len() != 2 {
+            return usage_error(
+                c"--batch FILE takes its changes from FILE's lines, FN PARAM TYPE [DEFAULT]",
+                c"--batch changes.txt --dry-run", tcx, pcx);
+        }
+        return signature_batch(batch, root, tcx, pcx, wgx);
     }
     if words.len() as i64 != 1 {
         return usage_error(if words.len() as i64 == 0 { c"a function NAME is needed" }
@@ -361,58 +671,11 @@ fn signature_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     }
     let f = pcx.defs[d as usize].node;
     let mut fqn = sym_text(pcx.defs[d as usize].fqn, pcx);
-    if pk(f, pcx) == NodeKind::ExternFn || pcx.nodes[f as usize].y == 1 {
-        let e = diag(c"error", c"refactor.extern", tcx);
-        buf_bytes(e, fqn);
-        buf_str(e,
-            if pk(f, pcx) == NodeKind::ExternFn { c" is a C function: its signature is C's\n" }
-            else { c" is an extern \"C\" fn: C code calls it\n" });
-        return 1;
-    }
     let mut group: Vec<i64, Comp> = Vec::new_in(Comp {});
-    signature_group(d, &mut group, tcx, pcx);
-    for i in 1..group.len() as i64 {
-        if pcount(pcx.defs[(group[i as usize]) as usize].node, pcx)
-            != pcount(f, pcx) {
-            let e = diag(c"error", c"refactor.trait", tcx);
-            buf_bytes(e, sym_text(pcx.defs[(group[i as usize]) as usize].fqn, pcx));
-            buf_str(e, c" has not the parameters of ");
-            buf_bytes(e, fqn);
-            buf_byte(e, b'\n');
-            return 1;
-        }
-    }
     let mut calls: Vec<i64, Comp> = Vec::new_in(Comp {});
-    calls_of(group.as_slice(), &mut calls, tcx, pcx);
-    // The references that are no calls: a function used as a value
-    // (its type is its signature's).
-    if rename == 0 as *mut u8 {
-        refs_of(group.as_slice(), tcx, pcx);
-        for r in 0..tcx.r_pos.len() as i64 {
-            if ((tcx.r_flags[r as usize]) & (QF_CALL | QF_DEF)) != 0
-                || enclosing((tcx.r_pos[r as usize]), tcx, pcx) < 0 {
-                continue;
-            }
-            let e = diag(c"error", c"refactor.fn-value", tcx);
-            buf_bytes(e, fqn);
-            buf_str(e, c" is used as a value at ");
-            put_loc(e, (tcx.r_pos[r as usize]), pcx);
-            buf_str(e, c": its type would change; change that use first\n");
-            try_query_name(c"refs", fqn, tcx, pcx);
-            return 1;
-        }
-    }
-    for i in 0..calls.len() as i64 {
-        let c = (calls[i as usize]);
-        if pk(c, pcx) != NodeKind::Call && pk(c, pcx) != NodeKind::MethodCall
-            && rename == 0 as *mut u8 {
-            let e = diag(c"error", c"refactor.operator", tcx);
-            buf_bytes(e, fqn);
-            buf_str(e, c" is called by an operator at ");
-            put_loc(e, pstart(c, pcx), pcx);
-            buf_str(e, c": its arguments are the operator's\n");
-            return 1;
-        }
+    let ready = callable(d, rename != 0 as *mut u8, &mut group, &mut calls, tcx, pcx);
+    if ready != 0 {
+        return ready;
     }
     let unchecked = unchecked_calls(pcx.defs[d as usize].name, calls.as_slice(), tcx, pcx);
     let self_param = has_self(f, pcx);
@@ -703,63 +966,11 @@ fn signature_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
             return no_param(d, f, retype, tcx, pcx);
         }
         let ty = c_slice(opt(opts.as_slice(), c"--type", true));
-        // (0.17: to a reference, without --default: the calls' `&x`
-        // become `&mut x`, a value `x` becomes `&x` or `&mut x`, a
-        // slice `v.as_slice()` or `a[..]` becomes `v.as_mut_slice()`
-        // or `&mut a[..]`)
-        let auto = ref_change(pb(pchild(f, k, pcx), pcx), &ty, pcx);
-        for g in 0..group.len() as i64 {
-            let p = pchild(pcx.defs[(group[g as usize]) as usize].node, k, pcx);
-            let t = pb(p, pcx);
-            let ts = pstart(t, pcx);
-            edit_replace(ts, pend(t, pcx), text_buf(&ty), pcx);
-        }
-        let mut changed: i64 = 0;
-        if default == 0 as *mut u8 && auto != RC_NONE {
-            for i in 0..calls.len() as i64 {
-                let c = (calls[i as usize]);
-                list_of_node(c, tcx, pcx);
-                let off: i64 = if pk(c, pcx) == NodeKind::MethodCall && self_param { 1 }
-                    else { 0 };
-                let i0 = arg_for(f, c, k, off, pcx);
-                if i0 < 0 {
-                    continue;
-                }
-                let mut v = pchild(c, i0, pcx);
-                if pk(v, pcx) == NodeKind::NamedArg {
-                    v = pb(v, pcx);
-                }
-                let nb = ref_argument(auto,
-                    &get_src()[pstart(v, pcx) as usize..pend(v, pcx) as usize]);
-                if nb >= 0 {
-                    edit_replace(pstart(v, pcx), pend(v, pcx), nb, pcx);
-                    changed += 1;
-                }
-            }
-        }
-        // (--default: each call's argument becomes EXPR, 0.13)
-        if default != 0 as *mut u8 {
-            for i in 0..calls.len() as i64 {
-                let c = (calls[i as usize]);
-                list_of_node(c, tcx, pcx);
-                let off: i64 = if pk(c, pcx) == NodeKind::MethodCall && self_param { 1 }
-                    else { 0 };
-                // (0.15: a named argument's value; none: left to the default)
-                let i0 = arg_for(f, c, k, off, pcx);
-                if i0 < 0 {
-                    continue;
-                }
-                let mut v = pchild(c, i0, pcx);
-                if pk(v, pcx) == NodeKind::NamedArg {
-                    v = pb(v, pcx);
-                }
-                let a = pstart(v, pcx);
-                let b = pend(v, pcx);
-                edit_replace(a, b,
-                    with_argument(&c_slice(default), sym_text(pname, pcx),
-                        &get_src()[a as usize..b as usize]), pcx);
-            }
-        }
+        let mut done: Vec<i64, Comp> = Vec::new_in(Comp {});
+        let mut skipped: Vec<i64, Comp> = Vec::new_in(Comp {});
+        let changed = retype_param(f, k, pname, &ty, default, group.as_slice(), calls.as_slice(),
+            self_param, &mut done, &mut skipped, tcx, pcx);
+        note_skipped(skipped.as_slice(), tcx, pcx);
         buf_str(what, c"changed parameter ");
         buf_bytes(what, sym_text(pname, pcx));
         buf_str(what, c" to ");

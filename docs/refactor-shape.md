@@ -14,6 +14,7 @@ anything query accepts.
 ```
 volec refactor signature FN --add 'x: T [= VALUE]' [--at N] [--fill-calls] | --remove x
                                | --rename-param a b | --reorder b,a,c | --type x T [--default EXPR]
+volec refactor signature --batch FILE     (0.30: FN PARAM TYPE [DEFAULT] a line, one edit)
 volec refactor field STRUCT --add 'g: T = VALUE' | --remove g | --rename g h
                             | --type g[,h...] T [--default EXPR] [--allocator X] [--rewrite PAT REPL]...
 volec refactor variant ENUM --add 'X(T, ...)'|'X { a: T, ... }' [--arm EXPR] [--arm-in SITE EXPR]... | --remove V | --rename V W
@@ -97,6 +98,37 @@ function used as a value (`let f = twice;`, `apply(twice, x)`:
 `refactor.fn-value`, its first place, `try:` its refs), a function an
 operator calls (`refactor.operator`: `a + b` calls `Add::add`), a C
 function or an `extern "C" fn` (`refactor.extern`).
+
+### --batch FILE (0.30)
+
+`refactor signature --batch FILE` makes the type changes of FILE, a line
+each: `FN PARAM TYPE [DEFAULT]`, what `refactor signature FN --type
+PARAM TYPE [--default DEFAULT]` does (words as sh splits them: a TYPE or
+a DEFAULT with spaces in quotes; `#` comments). The program is loaded
+and checked once, every line's edits are made on it as it is then (a
+line does not see another's), and the edit is checked once and written
+as one. Before, 185 changes were 185 loads and checks, and the first
+that left an error took the calls of the rest out of the checker's
+sight.
+
+```
+$ cat changes.txt
+first b &Buf
+scale k i64 '$k as i64'
+$ volec refactor signature --batch changes.txt
+changed 2 parameters (changes.txt), 5 calls→main.vl→+4 -4 lines
+```
+
+A line that cannot be made (no such function, no such parameter, a
+function used as a value) ends the run: its diagnostic, then `error
+refactor.batch: FILE:LINE`, nothing written. An argument inside one
+that another line (or the same) rewrites is left as written, `note
+refactor.nested` with the first. The calls in code the checker did not
+see (a program with errors: the rest of an expression after an error)
+are not changed: each is listed on stdout, `FILE:L:C→FUNCTION`, and
+`warning refactor.unchecked` counts them. (0.30: every refactoring
+loads the program with all its errors recorded, not the first 50, so
+fewer calls are out of sight.)
 
 ## refactor field
 
@@ -612,6 +644,7 @@ as it changes the program through the edit engine (`edit_replace`,
 | `refactor.no-call`, `refactor.ambiguous` | error | 1 | inline: no call (on the line of `--at`), several there | `query refs` |
 | `refactor.nested` | note | 0 | inline: calls left in the arguments of others | |
 | `refactor.script` | error | 1, 2 | a line is no command, a command failed: nothing written | |
+| `refactor.batch` | error; note | 2, 1; 0 | (0.30) signature --batch: FILE unreadable, a line that is not FN PARAM TYPE [DEFAULT], a line whose change cannot be made (nothing written); no lines | |
 | `refactor.literals` | note; warning | 1; 0 | (0.30) field --type: the literals that keep their old value of the field, when the edit is refused or written with --no-check | `--default EXPR` |
 | `edit.rounds` | note | 0 | (0.30) field --allocator: the rounds of `fix --only alloc` run on the edited program before its check | |
 | `rewrite.pattern`, `rewrite.unbound` | error | 2 | the pattern or replacement does not parse, a hole alone, `$x...` outside a list, a hole of the replacement not in the pattern and bound by it nowhere, a bad `~/RE/` | |
