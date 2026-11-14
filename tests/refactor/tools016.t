@@ -93,7 +93,7 @@ loops.vl:18:32	$v=w	$i=j	for j in 0..w.count { t -= w.data[j]; }
 $ rewrite 'let $x = $e;' --where '$x: name ~ ^v_' --list
 loops.vl:19:5	$x=v_two	$e=2	let v_two = 2;
 $ rewrite 'let $x = $e;' --where '$x: name ~ [a' --list
-error rewrite.usage: --where '$x: name ~ RE' takes a regular expression (^ $ . * + ? [a-z] \d \w)
+error rewrite.usage: --where '$x: name ~ RE' takes a regular expression (. [a-z] \d \w \s, * + ? after a byte or a group, ( ) groups, | alternatives, ^ $)
 try: volec rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: IntVec' --dry-run
 [exit 2]
 ## --subst inside the statements a $s... keeps, with a new name ($x: x,

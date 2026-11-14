@@ -304,6 +304,31 @@ operand's type. A callee the pattern has too, with the same receiver, is
 not new at the site (a recursive function's own calls rewritten) and is
 never refused. A pattern's `&mut $e` no longer matches `&e`.
 
+(0.30) **`--from FILE`**: the rewrites of a file, a line each, applied
+in order (each to the program as the lines before left it) and checked
+once at the end, as one edit: all or nothing, one `undo`. A line is
+`PATTERN -> REPLACEMENT`, or with TABs `PATTERN<TAB>REPLACEMENT[<TAB>
+OPTIONS]` (a pattern with ` -> ` of its own takes the TABs; OPTIONS are
+that line's `--where`, `--in`, `--subst`, split as sh splits words);
+empty lines and `#` lines are none. The command's `--in`, `--not-in`
+and `--force` go to every line; `--dry-run` prints the whole diff. Each
+line is a step of `refactor --script` (it prints its own summary); a
+line that fails (`rewrite.recursive`, a pattern that does not parse)
+ends the run with `FILE:LINE` and nothing is written.
+
+```
+$ cat pairs.txt
+at($t, $i) -> raw_at($t, $i)
+$s.len() as i64 * 2<TAB>twice_len($s)<TAB>--not-in twice_len
+$ volec rewrite --from pairs.txt --in main
+```
+
+(0.30) The imports a replacement's names need are added in every file
+the rewrite changes, however many: the round that adds them now sees
+all the edited program's errors, not the first 50 (a rewrite of 210
+files that each need one new `use` was refused, `edit.breaks`, after
+four rounds).
+
 (0.30) **std's files.** To the compiler std is one text, `<std>`, which
 no rewrite searched (`nothing matches`, whatever `--in` said). In the
 vole repository that text is compiler/std's files, and a rewrite asked
@@ -533,6 +558,7 @@ as it changes the program through the edit engine (`edit_replace`,
 | `refactor.script` | error | 1, 2 | a line is no command, a command failed: nothing written | |
 | `rewrite.pattern`, `rewrite.unbound` | error | 2 | the pattern or replacement does not parse, a hole alone, `$x...` outside a list, a hole of the replacement not in the pattern and bound by it nowhere, a bad `~/RE/` | |
 | `rewrite.bad-in` | error | 1 | `--in` or `--not-in` names no file, module or item | |
+| `rewrite.from` | error; note | 2; 0 | (0.30) `--from FILE`: a line that is no `PATTERN -> REPLACEMENT` (`FILE:LINE`, nothing run), a file that cannot be read; no patterns in it | |
 | `rewrite.std` | note; error | 0; 1 | (0.30) std's files rewritten: embed.sh and the build are next; std has no files here and is not searched; sites in std and in the program in one run (nothing written) | `sh compiler/std/embed.sh` |
 | `rewrite.recursive` | error (note with `--force`) | 1 | (0.30) sites inside the function the replacement calls there: nothing written | the command with `--not-in` those functions; with `--force` |
 | `rewrite.none` | note | 0 | nothing matches | |

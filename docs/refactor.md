@@ -915,8 +915,18 @@ of a longer word of letters and digits (`_`, `.`, `-` end a word, so
 VOLE_ROOT and `_vole.` have the word vole, `volec` has not).
 `--case`: OLD in any case, and NEW in the case of each match (`vole`,
 `Vole`, `VOLE` become `vole`, `Vole`, `VOLE`; a mixed case is
-noted). `--regex`: OLD is rewrite's regular expression (`^ $ . * + ?
-[a-z] \d \w`), within a line. In a vole source, `--comments`,
+noted). `--regex`: OLD is rewrite's regular expression, within a line.
+The dialect (0.30; `rewrite --help` says it): a byte is itself, `.` any
+byte, `[a-z_]` and `[^...]` classes, `\d` a digit, `\w` a name's byte,
+`\s` a space or a tab, `\x` the byte x (`\(`, `\.`, `\$`, `\|`); `*`, `+`,
+`?` after any of them or after a group (the longest first); `( )` a
+group and `|` between alternatives (0.30: before it a parenthesis was a
+byte); `^` at the start of the expression or of an alternative is the
+line's start, `$` at the end of one its end. In NEW, `\1` to `\9` (or
+`$1`) are the groups of the match, by their `(`, and `\0` the match:
+`'^fn (\w+)\((mut )?cx: Ctx' 'fn \1(\2cx: &mut Ctx'`. A malformed OLD is
+`error rewrite.usage` saying what is wrong (an unclosed `(`, a `*` with
+nothing to repeat), and so is a NEW that names a group OLD has not. In a vole source, `--comments`,
 `--strings` (an f-string's text too) and `--code` take only the matches
 there, as the lexer reads the file, and only sources; `--no-sources` the
 other files only. `--move-paths` also moves a file whose path has OLD

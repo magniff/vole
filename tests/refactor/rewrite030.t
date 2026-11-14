@@ -173,3 +173,68 @@ $ rewrite 'c"$s"' 'b"$s\0".as_ptr()' --dry-run
 @@ -14 +14 @@
 -    let m = tag(c"malloc") + tag(c"calloc");
 +    let m = tag(b"malloc\0".as_ptr()) + tag(b"calloc\0".as_ptr());
+## --from FILE: the rewrites of a file, a line each, in order (the second
+## line matches what the first wrote), checked once: one edit.
+% cat pairs.txt
+at($t, $i) -> raw_at($t, $i)
+# the first line's results too; a TAB, then the line's options
+
+raw_at($t, 1).len	raw_at($t, 1).reg
+$s.len() as i64 * 2	twice_len($s)	--not-in twice_len
+$ rewrite --from pairs.txt --dry-run
+rewrote 2 sites in 1 file	main.vl	+3 -3 lines
+rewrote 2 sites in 1 file	main.vl	+2 -2 lines
+rewrote 1 site in 1 file	main.vl	+1 -1 lines
+--- a/main.vl
++++ b/main.vl
+@@ -3 +3 @@
+-use crate::tab::{Row, Tab, at, first, raw_at, tag, twice_len};
++use crate::tab::{Row, Tab, first, raw_at, tag, twice_len};
+@@ -9,3 +9,3 @@
+-    let a = at(&t, 0).reg;
+-    let b = raw_at(&t, 1).len;
+-    let c = (at(&t, (1))).len;
++    let a = raw_at(&t, 0).reg;
++    let b = raw_at(&t, 1).reg;
++    let c = raw_at(&t, 1).reg;
+@@ -13 +13 @@
+-    let n = twice_len(b"vole") + b"abc".len() as i64 * 2;
++    let n = twice_len(b"vole") + twice_len(b"abc");
+note rewrite.imports: removed 1 import the rewrite left unused
+$ rewrite --from pairs.txt
+rewrote 2 sites in 1 file	main.vl	+3 -3 lines
+rewrote 2 sites in 1 file	main.vl	+2 -2 lines
+rewrote 1 site in 1 file	main.vl	+1 -1 lines
+rewrite --from pairs.txt: 3 patterns	main.vl	+5 -5 lines
+note rewrite.imports: removed 1 import the rewrite left unused
+$ undo
+undid rewrite --from pairs.txt: 3 patterns	main.vl	+5 -5 lines
+## A line that fails ends it: nothing written.
+$ rewrite --from pairs_rec.txt
+rewrote 2 sites in 1 file	main.vl	+3 -3 lines
+note rewrite.imports: removed 1 import the rewrite left unused
+error rewrite.recursive: 1 site is inside the function its replacement calls there (the function would call itself); first: tab.vl:57:5 in tab::twice_len; nothing written
+try: volec rewrite '$s.len() as i64 * 2' 'twice_len($s)' --root main.vl --not-in tab::twice_len
+try: volec rewrite '$s.len() as i64 * 2' 'twice_len($s)' --root main.vl --force
+error refactor.script: pairs_rec.txt:2: the command failed (exit 1): rewrite '$s.len() as i64 * 2' 'twice_len($s)'; nothing written
+[exit 1]
+$ rewrite --from pairs_bad.txt
+error rewrite.from: pairs_bad.txt:1: several ` -> `: put a TAB between PATTERN and REPLACEMENT; nothing run
+[exit 2]
+$ rewrite --from pairs.txt --where '$t: &Tab'
+error rewrite.usage: '$t: &Tab' with --from: the patterns and their options (--where, --subst) are FILE's lines, `PATTERN -> REPLACEMENT` or PATTERN<TAB>REPLACEMENT<TAB>OPTIONS; the command takes --in, --not-in, --force, --dry-run, --no-check, --root
+[exit 2]
+% git status --short
+## The import a replacement's name needs, in every file: 210 files, more
+## than a check reports errors (50) in the four rounds an edit has.
+% sh gen_bulk.sh 210
+$ rewrite 'old_fn($x)' 'new_fn($x)' --root bulk/main.vl
+rewrote 210 sites in 210 files	210 files	+420 -420 lines
+note rewrite.imports: removed 210 imports the rewrite left unused
+note edit.imports: added the imports the new text needs (fix --only imports)
+% cat bulk/m7.vl
+use crate::lib2::new_fn;
+
+pub fn f() -> i64 {
+    new_fn(7)
+}
