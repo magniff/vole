@@ -665,6 +665,17 @@ is one too: its `extern "C"` blocks (replace: the first becomes TEXT;
 with none, TEXT goes after the `use` lines; insert after the last or
 before the first).
 
+**Spans (0.30).** `edit replace NAME --to LAST < TEXT` and `edit delete
+NAME --to LAST` take NAME through LAST, a run of adjacent items of one
+file at one level (their comments with them), as one span: one edit, one
+check, where a step per item left the program broken between them. An
+impl block has no name: the `FILE:LINE` of its header line (`impl P {`)
+is the block, for `replace`, `delete` and `insert --after|--before`
+(that line once resolved to the type the impl is for, and `edit delete`
+took the struct); the comment lines above it stay unless TEXT brings
+its own. `edit delete` takes an item's comment lines and attributes
+with it (as it always did). tests/refactor/span0300.t.
+
 **Files and modules (0.17).** `edit replace FILE.vl < TEXT` replaces
 the whole file. `edit delete MODULE` (or `@@ delete MODULE`) removes its
 `mod` line and its file, and its children's files: one edit, one `undo`.
