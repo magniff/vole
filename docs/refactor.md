@@ -695,8 +695,23 @@ main.vl:13:25: error[type error] undefined variable 'twice' | help: add `use cra
 ```
 
 Exit 0 without errors (and then nothing is printed but warnings), 1 with
-them; at most 50 errors, as in a compilation. `--diagnostics=human`
-prints the long form. About 60 ms on the compiler's source (77,000
+them. `--diagnostics=human` prints the long form.
+
+(0.30) An error repeated at six sites or more (the same code and
+message) is one line, its first site's, counted:
+
+```
+main.vl:3:19: error[type error] undefined variable 'limit' (41 sites in 12 files, the first here; --each lists them) | help: add `use crate::conf::limit;`
+```
+
+and the plain `volec check` records up to 1000 sites and prints at most
+50 lines (then `error: N more errors not shown (M lines); --max-errors=0:
+all of them`), so that one name missing at 41 sites does not use up the
+list and hide the errors after it. `--each` prints every site on its
+own line; `--max-errors=N` stops after N sites as before (0: none) and
+prints every line of them, repeats folded. A `check` that names its form (`--diagnostics=short`,
+`--json`: the tools' own runs, the hooks, the tests) lists every site,
+at most 50, as before. About 60 ms on the compiler's source (77,000
 lines); 0.13: about 7 ms when the program has not changed since a
 command read it, from the tools' cache ([query.md](query.md#speed-the-cache-013)).
 

@@ -196,6 +196,9 @@ vole tree, `volec test FILTER` also runs each failure with
 Compiler errors, from `volec check` or a build whose output is not a
 terminal (`--diagnostics=short` anywhere, `--diagnostics=human` for the
 multi-line form):
+`volec check` folds an error repeated at six sites or more into one
+line, `... (41 sites in 12 files, the first here; --each lists them)`,
+and prints at most 50 lines of up to 1000 sites (0.30).
 
 ```text
 main.vl:4:20: error[type error] undefined variable 'totl' | help: did you mean 'total'?

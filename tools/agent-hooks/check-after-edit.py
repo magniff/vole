@@ -160,6 +160,9 @@ quarter of some agents' context)
   was shown); each is one line of at most LINE_MAX characters; identical
   refusals (the same message at several positions) are one line with
   their count.
+- An error repeated at GROUP_MIN sites or more (the same code and
+  message) is one line, its first site's, with `(N sites in F files, the
+  first here)`.
 - A scratch program (a root in no checkout, changed from a session in
   one): the count and each error once, its path from the root's
   directory, without the fix commands, the suggestions and the format
@@ -865,6 +868,33 @@ def fix_lines(errors):
     return ([f"try: {cmd}   ({which(cmd, k)})" for cmd, k in fixes], {cmd for cmd, _ in fixes})
 
 
+GROUP_MIN = 3
+
+
+def grouped(errors):
+    """(0.30) The errors with the repeats of one folded: an error whose
+    code and message occur GROUP_MIN times or more is its first site, with
+    `(N sites in F files, the first here)` after its message; the others
+    as they are, in order. (One missing import used at 41 sites was 10
+    identical lines and `(31 more)`.)"""
+    count, files = {}, {}
+    for d in errors:
+        k = (d.get("code") or "", d.get("message") or "")
+        count[k] = count.get(k, 0) + 1
+        files.setdefault(k, set()).add(d.get("file") or "")
+    out, done = [], set()
+    for d in errors:
+        k = (d.get("code") or "", d.get("message") or "")
+        if count[k] < GROUP_MIN:
+            out.append(d)
+        elif k not in done:
+            done.add(k)
+            f = len(files[k])
+            out.append(dict(d, message=f"{d.get('message', '')} ({count[k]} sites in {f} file"
+                                       f"{'s' if f != 1 else ''}, the first here)"))
+    return out
+
+
 def report(diags, root_shown, edited):
     """The context for the agent: nothing when clean."""
     errors = [d for d in diags if d.get("severity") == "error"]
@@ -878,9 +908,10 @@ def report(diags, root_shown, edited):
     lines = [f"volec check{' ' + root_shown if root_shown else ''}: {n} error{'s' if n != 1 else ''}"]
     fl, fixes = fix_lines(errors)
     lines += fl
-    lines += [line_of(d, fixes) for d in errors[:MAX_SHOWN]]
-    if n > MAX_SHOWN:
-        lines.append(f"({n - MAX_SHOWN} more: volec check{' ' + root_shown if root_shown else ''})")
+    folded = grouped(errors)
+    lines += [line_of(d, fixes) for d in folded[:MAX_SHOWN]]
+    if len(folded) > MAX_SHOWN:
+        lines.append(f"({len(folded) - MAX_SHOWN} more: volec check{' ' + root_shown if root_shown else ''})")
     return "\n".join(lines)
 
 
@@ -1161,6 +1192,7 @@ def brief_report(errors, before, root_shown, shown=BRIEF_SHOWN, where_dir=None):
         parts.append(f"{fixed} fixed")
     head = f"volec check{where}: {n} error{'s' if n != 1 else ''}" + (f" ({', '.join(parts)})" if parts else "")
     lines = [head]
+    new = grouped(new)
     for d in new[:shown]:
         d = dict(d, **{"try": []})
         if where_dir and (d.get("file") or "").startswith(where_dir + os.sep):
@@ -1230,8 +1262,8 @@ def delta_report(errors, before, root_shown, edited):
     lines += fl
     shown = report(new, root_shown, edited).split("\n")[1:] if new else []
     lines += [x for x in shown if not x.startswith(("(", "try: "))]
-    if len(new) > MAX_SHOWN:
-        lines.append(f"({len(new) - MAX_SHOWN} more new: volec check{where})")
+    if len(grouped(new)) > MAX_SHOWN:
+        lines.append(f"({len(grouped(new)) - MAX_SHOWN} more new: volec check{where})")
     return "\n".join(lines)
 
 

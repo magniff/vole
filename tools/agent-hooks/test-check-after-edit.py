@@ -476,6 +476,18 @@ try:
          ("suggested, not applied" in got1, got2, calls2, got3.split("\n")[-2:]),
          (True, "volec check main.vl: 2 errors (2 as before)\ntry: volec fix --suggested main.vl   (1 of the errors: "
           "their exact fixes, one checked edit)", [], [shown, "  main.vl:9: eprinln(\"y\"); -> eprintln(\"y\");"]))
+    # An error repeated at three sites or more is one line.
+    rep3 = [diag("a.vl", 2, "undefined variable 'n'"), diag("b.vl", 5, "undefined variable 'n'"), other,
+            diag("a.vl", 9, "undefined variable 'n'")]
+    case("grouped: a repeated error is its first site, counted",
+         [(d["file"], d["line"], d["message"]) for d in hook.grouped(rep3)],
+         [("a.vl", 2, "undefined variable 'n' (3 sites in 2 files, the first here)"),
+          ("main.vl", 5, "expected '[u8]', got 'i64'")])
+    case("grouped: two of one are two lines", len(hook.grouped(rep3[:3])), 3)
+    case("grouped: in the report",
+         hook.report(rep3, "main.vl", None),
+         "volec check main.vl: 4 errors\na.vl:2:5: error[type error] undefined variable 'n' (3 sites in 2 files, the "
+         "first here)\nmain.vl:5:5: error[type error] expected '[u8]', got 'i64'")
     # After a --no-check step: one line and at most the first two new
     # errors, cut; no fix commands, no suggestions.
     nstate = tempfile.mkdtemp(dir=tmp)
