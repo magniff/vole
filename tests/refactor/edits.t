@@ -152,7 +152,7 @@ error edit.no-text: the new text is read from stdin; none was given
 try: volec edit replace geom::area < new.vl
 [exit 2]
 $ edit move geom::area
-error edit.usage: unknown command 'move' (patch, apply, replace, insert, delete, wrap, new-file, resolve)
+error edit.usage: unknown command 'move' (patch, apply, replace, insert, delete, wrap, new-file, resolve, justify)
 [exit 2]
 ## Undo, edit by edit; a file changed since is not undone (--force does).
 $ undo
