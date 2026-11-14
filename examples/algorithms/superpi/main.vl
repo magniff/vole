@@ -51,8 +51,9 @@ use std::{env, thread};
 use std::alloc::Allocator;
 use std::arch::detect;
 use std::arch::aarch64::{
-    vadd_u32, vbsl_u32, vcge_u32, vdup_n_u32, vld1_u32, vmlal_u32, vmovn_u64, vmull_u32,
-    vshrq_n_u64, vst1_u32, vsub_u32,
+    uint32x4_t, vaddq_u32, vdupq_n_u32, vget_low_u32, vld1q_u32, vminq_u32, vmlsl_high_u32,
+    vmlsl_u32, vmull_high_u32, vmull_u32, vmulq_u32, vreinterpretq_u32_u64, vreinterpretq_u64_u32,
+    vst1q_u32, vsubq_u32, vuzp1q_u32, vuzp2q_u32, vzip1q_u32, vzip1q_u64, vzip2q_u32, vzip2q_u64,
 };
 use std::cli::{Arg, Command};
 use std::cmp::Ordering;
@@ -242,13 +243,14 @@ fn powmod(x: u64, e: u64, p: u64) -> u64 {
 // Montgomery reduction with R = 2^32: the primes are below 2^30, so
 // x * y is below 2^60 and (x * y + m * p) is below 2^63. A modular
 // product is three machine multiplies and a shift, no division.
-struct Mont { p: u64, inv: u64 }
+struct Mont { p: u64, inv: u64, pinv: u64 }
 
 fn mont_new(p: u64) -> Mont {
-    // -p^-1 mod 2^32, by Newton's iteration on the low bits.
+    // p^-1 mod 2^32 (pinv) by Newton's iteration on the low bits, and its
+    // negative (inv).
     let mut x: u64 = 1;
     for _ in 0..5 { x = x.wrapping_mul(2u64.wrapping_sub(p.wrapping_mul(x))); }
-    Mont { p, inv: 0u64.wrapping_sub(x) & M32 }
+    Mont { p, inv: 0u64.wrapping_sub(x) & M32, pinv: x & M32 }
 }
 
 // x * y * R^-1 mod p. In the Montgomery domain (values scaled by R) this
@@ -260,69 +262,138 @@ fn mont_mul(x: u64, y: u64, m: &Mont) -> u64 {
     if u >= m.p { u - m.p } else { u }
 }
 
-// One stage of the inverse transform (decimation in time: u + y w and
-// u - y w), two butterflies at a time: the operands are below 2^30, so
-// they live in u32 lanes and the widening NEON multiplies take them
-// straight. Montgomery's reduction is umull, umlal and a shift; the
-// modular add and subtract are u32 lanes again.
-fn dit_stage_simd(v: &mut [u32], tws: &[u32], n: usize, len: usize, m: &Mont) {
+// Four Montgomery products a w R^-1 mod p at once, in u32 lanes, for a
+// below 2^32 and w below p: q = a w p^-1 mod 2^32 makes a w - q p a
+// multiple of 2^32, the two widening multiply-subtracts compute it in
+// u64 lanes, and its high halves are the product, between -p and p. One
+// lanewise minimum with itself plus p brings that to [0, p).
+fn mont4(a: uint32x4_t, w: uint32x4_t, pv: uint32x4_t, pinv: uint32x4_t) -> uint32x4_t {
+    let q = vmulq_u32(vmulq_u32(a, w), pinv);
+    let lo = vmlsl_u32(vmull_u32(vget_low_u32(a), vget_low_u32(w)), vget_low_u32(q),
+        vget_low_u32(pv));
+    let hi = vmlsl_high_u32(vmull_high_u32(a, w), q, pv);
+    let t = vuzp2q_u32(vreinterpretq_u32_u64(lo), vreinterpretq_u32_u64(hi));
+    vminq_u32(t, vaddq_u32(t, pv))
+}
+
+// One stage of the forward transform (decimation in frequency: u + y
+// and (u - y) w) on blocks of len >= 8 points, four butterflies a step:
+// the values are below 2^31, so they live in u32 lanes, and the modular
+// add and subtract are an add or a subtract and a minimum.
+fn dif_stage4(v: &mut [u32], tws: &[u32], len: usize, m: &Mont) {
     let half = len / 2;
-    let pv = vdup_n_u32(m.p as u32);
-    let invv = vdup_n_u32(m.inv as u32);
+    let pv = vdupq_n_u32(m.p as u32);
+    let pinv = vdupq_n_u32(m.pinv as u32);
+    let n = v.len();
     let mut start = 0;
     while start < n {
-        let mut k = 0;
-        while k + 2 <= half {
-            let u = vld1_u32(v, (start + k) as i64);
-            let w = vld1_u32(tws, k as i64);
-            let y = vld1_u32(v, (start + k + half) as i64);
-            let prod = vmull_u32(y, w);
-            let mm = vmovn_u64(vmull_u32(vmovn_u64(prod), invv));
-            let t = vmovn_u64(vshrq_n_u64(vmlal_u32(prod, mm, pv), 32));
-            let tm = vbsl_u32(vcge_u32(t, pv), vsub_u32(t, pv), t);
-            let sum = vadd_u32(u, tm);
-            vst1_u32(v, (start + k) as i64, vbsl_u32(vcge_u32(sum, pv), vsub_u32(sum, pv), sum));
-            let ge = vcge_u32(u, tm);
-            vst1_u32(v, (start + k + half) as i64,
-                vbsl_u32(ge, vsub_u32(u, tm), vadd_u32(vsub_u32(u, tm), pv)));
-            k += 2;
-        }
-        while k < half {
-            dit_butterfly(v, start + k, start + k + half, tws[k] as u64, m);
-            k += 1;
+        let (lo, hi) = v[start..start + len].split_at_mut(half);
+        let mut k: i64 = 0;
+        while k + 4 <= half as i64 {
+            let u = vld1q_u32(lo, k);
+            let y = vld1q_u32(hi, k);
+            let sum = vaddq_u32(u, y);
+            vst1q_u32(lo, k, vminq_u32(sum, vsubq_u32(sum, pv)));
+            let d = vsubq_u32(u, y);
+            vst1q_u32(hi, k,
+                mont4(vminq_u32(d, vaddq_u32(d, pv)), vld1q_u32(tws, k), pv, pinv));
+            k += 4;
         }
         start += len;
     }
 }
 
-// The same stage of the forward transform (decimation in frequency:
-// u + y and (u - y) w).
-fn dif_stage_simd(v: &mut [u32], tws: &[u32], n: usize, len: usize, m: &Mont) {
+// The same stage of the inverse transform (decimation in time: u + y w
+// and u - y w).
+fn dit_stage4(v: &mut [u32], tws: &[u32], len: usize, m: &Mont) {
     let half = len / 2;
-    let pv = vdup_n_u32(m.p as u32);
-    let invv = vdup_n_u32(m.inv as u32);
+    let pv = vdupq_n_u32(m.p as u32);
+    let pinv = vdupq_n_u32(m.pinv as u32);
+    let n = v.len();
     let mut start = 0;
     while start < n {
-        let mut k = 0;
-        while k + 2 <= half {
-            let u = vld1_u32(v, (start + k) as i64);
-            let w = vld1_u32(tws, k as i64);
-            let y = vld1_u32(v, (start + k + half) as i64);
-            let sum = vadd_u32(u, y);
-            vst1_u32(v, (start + k) as i64, vbsl_u32(vcge_u32(sum, pv), vsub_u32(sum, pv), sum));
-            let ge = vcge_u32(u, y);
-            let d = vbsl_u32(ge, vsub_u32(u, y), vadd_u32(vsub_u32(u, y), pv));
-            let prod = vmull_u32(d, w);
-            let mm = vmovn_u64(vmull_u32(vmovn_u64(prod), invv));
-            let t = vmovn_u64(vshrq_n_u64(vmlal_u32(prod, mm, pv), 32));
-            vst1_u32(v, (start + k + half) as i64, vbsl_u32(vcge_u32(t, pv), vsub_u32(t, pv), t));
-            k += 2;
-        }
-        while k < half {
-            dif_butterfly(v, start + k, start + k + half, tws[k] as u64, m);
-            k += 1;
+        let (lo, hi) = v[start..start + len].split_at_mut(half);
+        let mut k: i64 = 0;
+        while k + 4 <= half as i64 {
+            let u = vld1q_u32(lo, k);
+            let t = mont4(vld1q_u32(hi, k), vld1q_u32(tws, k), pv, pinv);
+            let sum = vaddq_u32(u, t);
+            vst1q_u32(lo, k, vminq_u32(sum, vsubq_u32(sum, pv)));
+            let d = vsubq_u32(u, t);
+            vst1q_u32(hi, k, vminq_u32(d, vaddq_u32(d, pv)));
+            k += 4;
         }
         start += len;
+    }
+}
+
+// The forward transform's last two stages (blocks of 4, then pairs) on
+// eight points a step: the lanes are regrouped so that each stage's
+// partners sit in the same lane of two registers. The stage of pairs
+// has the twiddle 1 only and needs no product.
+fn dif_tail4(v: &mut [u32], table: &[u32], m: &Mont) {
+    let pv = vdupq_n_u32(m.p as u32);
+    let pinv = vdupq_n_u32(m.pinv as u32);
+    let ws: [u32; 4] = [table[2], table[3], table[2], table[3]];
+    let w = vld1q_u32(&ws, 0);
+    let mut i: i64 = 0;
+    while i + 8 <= v.len() as i64 {
+        let v0 = vreinterpretq_u64_u32(vld1q_u32(v, i));
+        let v1 = vreinterpretq_u64_u32(vld1q_u32(v, i + 4));
+        // Blocks of 4: (0, 2), (1, 3), (4, 6), (5, 7).
+        let u = vreinterpretq_u32_u64(vzip1q_u64(v0, v1));
+        let y = vreinterpretq_u32_u64(vzip2q_u64(v0, v1));
+        let sum = vaddq_u32(u, y);
+        let x = vminq_u32(sum, vsubq_u32(sum, pv));
+        let d = vsubq_u32(u, y);
+        let z = mont4(vminq_u32(d, vaddq_u32(d, pv)), w, pv, pinv);
+        // Pairs: x is points 0 1 4 5, z is points 2 3 6 7.
+        let a = vuzp1q_u32(x, z);
+        let b = vuzp2q_u32(x, z);
+        let s2 = vaddq_u32(a, b);
+        let e = vminq_u32(s2, vsubq_u32(s2, pv));
+        let d2 = vsubq_u32(a, b);
+        let o = vminq_u32(d2, vaddq_u32(d2, pv));
+        // e is points 0 4 2 6, o is points 1 5 3 7.
+        let z1 = vreinterpretq_u64_u32(vzip1q_u32(e, o));
+        let z2 = vreinterpretq_u64_u32(vzip2q_u32(e, o));
+        vst1q_u32(v, i, vreinterpretq_u32_u64(vzip1q_u64(z1, z2)));
+        vst1q_u32(v, i + 4, vreinterpretq_u32_u64(vzip2q_u64(z1, z2)));
+        i += 8;
+    }
+}
+
+// The inverse transform's first two stages (pairs, then blocks of 4),
+// eight points a step.
+fn dit_head4(v: &mut [u32], table: &[u32], m: &Mont) {
+    let pv = vdupq_n_u32(m.p as u32);
+    let pinv = vdupq_n_u32(m.pinv as u32);
+    let ws: [u32; 4] = [table[2], table[2], table[3], table[3]];
+    let w = vld1q_u32(&ws, 0);
+    let mut i: i64 = 0;
+    while i + 8 <= v.len() as i64 {
+        let v0 = vld1q_u32(v, i);
+        let v1 = vld1q_u32(v, i + 4);
+        // Pairs: a is points 0 2 4 6, b is points 1 3 5 7.
+        let a = vuzp1q_u32(v0, v1);
+        let b = vuzp2q_u32(v0, v1);
+        let s2 = vaddq_u32(a, b);
+        let e = vminq_u32(s2, vsubq_u32(s2, pv));
+        let d2 = vsubq_u32(a, b);
+        let o = vminq_u32(d2, vaddq_u32(d2, pv));
+        // Blocks of 4: u is points 0 4 1 5, y is points 2 6 3 7.
+        let u = vuzp1q_u32(e, o);
+        let t = mont4(vuzp2q_u32(e, o), w, pv, pinv);
+        let sum = vaddq_u32(u, t);
+        let x = vminq_u32(sum, vsubq_u32(sum, pv));
+        let d = vsubq_u32(u, t);
+        let z = vminq_u32(d, vaddq_u32(d, pv));
+        // x is points 0 4 1 5, z is points 2 6 3 7.
+        let z1 = vzip1q_u32(x, z);
+        let z2 = vzip2q_u32(x, z);
+        vst1q_u32(v, i, vzip1q_u32(z1, z2));
+        vst1q_u32(v, i + 4, vzip2q_u32(z1, z2));
+        i += 8;
     }
 }
 
@@ -385,19 +456,23 @@ fn roots_new(m: &Mont, l: usize, gpa: Gpa) -> Roots<Gpa> {
 // which one pass of swaps undoes while it scales by 1/n and leaves the
 // Montgomery domain.
 fn ntt(v: &mut [u32], roots: &Roots<Gpa>, m: &Mont, inverse: bool) {
+    ntt_with(v, roots, m, inverse, detect("neon"));
+}
+
+// The transform by the NEON kernels (`neon`, on a machine that has them)
+// or by the scalar butterflies: the same values either way.
+fn ntt_with(v: &mut [u32], roots: &Roots<Gpa>, m: &Mont, inverse: bool, neon: bool) {
     let p = m.p;
     let n = v.len();
     let table = roots.fwd.as_slice();
-    let simd = detect("neon");
+    let simd = neon && detect("neon") && n >= 8;
     if !inverse {
         for i in 0..n { v[i] = (((v[i] as u64) << 32) % p) as u32; }
         let mut len = n;
         while len >= 2 {
             let half = len / 2;
             let tws = &table[half..len];
-            if simd {
-                dif_stage_simd(v, tws, n, len, m);
-            } else {
+            if !simd {
                 let mut start = 0;
                 while start < n {
                     for k in 0..half {
@@ -405,17 +480,26 @@ fn ntt(v: &mut [u32], roots: &Roots<Gpa>, m: &Mont, inverse: bool) {
                     }
                     start += len;
                 }
+            } else if len >= 8 {
+                dif_stage4(v, tws, len, m);
+            } else {
+                dif_tail4(v, table, m);
+                break;
             }
             len /= 2;
         }
         return;
     }
     let mut len = 2;
+    if simd {
+        dit_head4(v, table, m);
+        len = 8;
+    }
     while len <= n {
         let half = len / 2;
         let tws = &table[half..len];
         if simd {
-            dit_stage_simd(v, tws, n, len, m);
+            dit_stage4(v, tws, len, m);
         } else {
             let mut start = 0;
             while start < n {
@@ -1314,6 +1398,31 @@ fn product_pairs_match(gpa: Gpa) {
         let (p1, p2) = product_pair(&x, &y1, &y2, gpa);
         assert_eq !(p1, mul_reference(&x, &y1, gpa));
         assert_eq !(p2, mul_reference(&x, &y2, gpa));
+    }
+}
+
+// The NEON kernels against the scalar butterflies, forward and inverse,
+// for every prime: the same values at every point, and the inverse of
+// the forward transform is the input.
+#[test]
+fn transforms_agree(gpa: Gpa) {
+    let mut rng = Rng::new(1234);
+    for p in NTT_PRIMES {
+        let m = mont_new(p);
+        for n in [8usize, 16, 64, 1024] {
+            let roots = roots_new(&m, n, gpa);
+            let mut a: Vec<u32, Gpa> = Vec::with_capacity_in(n, gpa);
+            for _ in 0..n { a.push((rng.next() % p) as u32); }
+            let mut b = a.clone();
+            let input = a.clone();
+            ntt_with(a.as_mut_slice(), &roots, &m, false, true);
+            ntt_with(b.as_mut_slice(), &roots, &m, false, false);
+            assert_eq !(a, b);
+            ntt_with(a.as_mut_slice(), &roots, &m, true, true);
+            ntt_with(b.as_mut_slice(), &roots, &m, true, false);
+            assert_eq !(a, b);
+            assert_eq !(a, input);
+        }
     }
 }
 
