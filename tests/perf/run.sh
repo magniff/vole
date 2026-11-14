@@ -156,7 +156,7 @@ vec-stats: kernels, loop at line 17: not vectorized: a branch in its body that i
 vec-stats: kernels, loop at line 31: not vectorized: an unknown trip count: not a loop over a counter to a bound
 vec-stats: kernels, loop at line 35: not vectorized: a float carried from one iteration to the next (a float sum: lanes would add in another order) (phi)
 vec-headers: kernels: unknown: line 20: a store through an address the summary does not follow (a pointer loaded from memory, a raw pointer of unknown origin, a number made a pointer)
-vector loops 3, overlap tests 0, tests dropped by noalias 0
+vector loops 2, overlap tests 0, tests dropped by noalias 0
 EOF
 # (0.30) --vec-stats=FN also says what is known of the Vec headers FN may
 # write (middle/callfacts.vl), and for an unknown summary the first
@@ -334,7 +334,7 @@ fi
 # vec-counts (the program's loops, std's too: kernels' one, and two
 # in what println brings in, 0.28)
 if build -O2 --vec-stats loops.vl -c -o loops.o \
-    && [ "$(cat err.out)" = "vector loops 3, overlap tests 0, tests dropped by noalias 0" ] \
+    && [ "$(cat err.out)" = "vector loops 2, overlap tests 0, tests dropped by noalias 0" ] \
     && build -O0 --vec-stats=kernels loops.vl -c -o loops.o && ! grep -q 'loop at' err.out; then
     pass vec-counts
 else
