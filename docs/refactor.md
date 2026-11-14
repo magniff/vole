@@ -101,7 +101,9 @@ are not new: an edit of a program with errors is checked against them.
   `warning edit.breaks` and every new error, 3 to 10 s a step on the
   compiler); `volec check` lists what is left when the steps are done.
   A `--dry-run` with it still checks, and `fix` still reports what is
-  left.
+  left. Steps of several commands with one check: a `volec batch`
+  file whose writing steps end in `--no-check` and whose last line is
+  `check` (one call: no step checks its edit, the last line checks once).
 - `--show` (0.12; every edit, fix, rewrite and refactoring) prints, after
   the summary line, the regions the edit changed as their new lines,
   numbered, so that the edit need not be read back:

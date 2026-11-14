@@ -98,4 +98,5 @@ $ edit apply --help
 volec edit apply [FILE]   several items' new text in one checked edit (stdin without FILE)
 blocks: @@ NAME (its new text), @@ new after|before NAME, @@ new in MODULE, @@ delete NAME,
 @@ MODULE::use, @@ MODULE::header; or query show's output, changed
---show: the diff after; --dry-run: the diff only; --no-check: write despite new errors
+--at: stdin is a list of patches by position, FILE:LINE[:COL]<TAB>OLD<TAB>NEW a line (edit patch --from)
+--show: the diff after; --dry-run: the diff only; --no-check: write unchecked (no check runs)
