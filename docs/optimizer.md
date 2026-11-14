@@ -3256,6 +3256,201 @@ the self-build by 0.2% (under the budget it was 6.4%). The compile-cost
 rows against 0.28.0, release tree and this: hello 1.02x and 0.97x, std
 1.17x and 1.07x, check 1.00x and 0.92x, regions 1.00x and 0.90x.
 
+## 0.30: against C
+
+The owner's question: "are we missing something fundamental that would
+unlock faster machine code?" The answer, from the benchmarks' worst rows
+(bench/run.sh; instructions retired, `/usr/bin/time -l`, the fewest of 3,
+which a loaded machine hardly moves; each cause read off
+`--print-after-all=FN`, `--vec-stats=FN`, `VOLE_INLINE_LOG` and the
+assembly beside `cc -O2 -S`): no optimization of the usual list was
+missing. What was missing was a normal form. The loop passes had been
+written against the index loop (`for k in 0..n { s[k] }`), and 0.28's std
+writes every loop as a slice iterator's `next` (a pointer and what is
+left, counted down to `!= 0`), nested by inlining, a level a generic
+instance. Four things stood between such a loop and the passes, none of
+them a missing pass:
+
+| what | the evidence | the change (0.30) |
+|---|---|---|
+| a constant made in a loop's own block was not an invariant | `v54 = cmp.eq v53, v49` with `v49: u64 = const 0` in the loop: `counted_loop`, `record_test` and `record_check` all ask `invariant_in`; --vec-stats: "an unknown trip count" for `for &x in s` written by hand | the constants of loops move to the entry block before the loops are counted (exits.vl, `hoist_constants`) |
+| no counter from 0 and no index: the pointer and the length were two induction variables of their own | "its counter steps by other than 1"; "a load whose address does not step by its size" | a loop counted down to `!= bound` gets a counter c from 0, and every other induction variable is start + c * step (`express_ivs`): the index loop's form |
+| the loop of `filter`'s `find` inside the consumer's loop | "not innermost, and the outer vectorizer did not take it"; a branch an element | a loop that repeats its outer loop's test is part of it (`unnest_loop`), then if-conversion |
+| each level's loop optimized before the levels below were inlined | the IR of `filter_map_sum` right after inlining: already rotated, unrolled, with three copies of the body | a function that will be moved into its only caller (or a small leaf) waits with its loop passes (inline.vl, `moved_into_caller`) |
+
+and two smaller ones: `max`'s `a.cmp(&b).is_gt()` left `a < b || !(a >
+b)`, now one comparison (ifconv.vl, `or_of_comparisons`); `rev`'s
+`split_last` kept the checks of `s[len - 1]` (the ranges: x - 1 < x for
+an unsigned x that is not zero).
+
+**bench/iterchain and bench/iterloop**, per kernel (the program without
+its kernels taken off; M instructions; chain / hand loop / cc -O2):
+
+| kernel | 0.29.0 | 0.30 | chain / loop | loop / cc |
+|---|---:|---:|---:|---:|
+| filter-map-sum | 1938 / 2517 / 1070 | 1154 / 1154 | 1.000 | 1.08 |
+| dot (zip) | 892 / 891 / 769 | 892 / 892 | 1.000 | 1.16 |
+| enumerate | 2306 / 891 / 860 | 892 / 892 | 1.000 | 1.04 |
+| map-max + filter-count | 4615 / 2360 / 756 | 947 / 947 | 1.000 | 1.25 |
+| take (a `for` over `next`) | 2307 / 262 / 231 | 262 / 262 | 1.000 | 1.13 |
+| collect + sort | 486 / 312 / 221 | 178 / 312 | 0.57 | 1.41 |
+| the programs | 12604 / 7293 / 3811 | 4387 / 4514 | 0.97 (1.73) | 1.18 (1.91) |
+
+The first five chains are their hand loops instruction for instruction.
+The last is std's sort against the heapsort written out in iterloop.vl:
+`sort_unstable_by` was a heapsort since 0.28 and is an introsort again
+(below), so the chain is now the faster one.
+
+**What iterloop still pays against cc -O2** (the assembly of
+bench/iterloop.c beside ours, the same four accumulators in both):
+
+- cc loads with post-increment (`ldp x16, x17, [x12], #32`) and counts
+  down to zero (`subs x13, x13, #4; b.ne`): 2 instructions of loop
+  overhead a round where we have 4 (`add` of each pointer, `add` of the
+  counter, `cmp`, `b.ne`): filter-map-sum 22 instructions for 4 elements
+  against 20, dot 17 against 14.
+- `t += a * b + r` is `add; madd` with the accumulator in the `madd` in
+  cc, `madd` with r then `add` in ours (the same count: no loss).
+- max + count: cc's count is `cmgt; sub` on the mask (the mask is -1),
+  ours `vsel` of 1 and 0, then `add`: an instruction a vector more.
+- cc knows the length (the kernels are `static`, the constant 1048576
+  reaches them): no remainder loop, no test before the vector loop.
+
+**The other rows** (M instructions; 0.29.0, now, cc -O2):
+
+- **sort** (1193, 567, 304). std's `sort_unstable_by` was a heapsort;
+  bench/sort.c is an introsort, which std's sort had been until 0.28.
+  It is again (slice.vl: quicksort around the median of three,
+  insertion sort up to 24, heapsort below 2 log2(n) levels; safe code).
+  Before that, the ranges learned to remove the three checks of the safe
+  `swap(i, j)` (split_at_mut at the larger index, `a[lo]`, `b[0]`: hi <=
+  len, lo < hi, len - hi > 0), by deciding a comparison of a value an
+  `if` left by its two values (range/mod.vl, `decide_phi_arms`): 1193 ->
+  1033 with the heapsort. Left (`--print-checks`): ten index checks in each
+  instance of `quicksort` (the partition's `v[i]` and `v[j]`: i and j
+  are compared with each other, not with the length), and the swap's
+  test of `i == j`.
+- **heap** (3257, 3159, 1091). std's BinaryHeap sifts by swapping, two
+  comparisons and a swap a level; bench/heap.c sifts through a hole and
+  pops by going down to a leaf along the larger child and then up (one
+  comparison and one move a level). Rust's hole is unsafe code; in safe
+  code the descent to a leaf with swaps and the way up are possible and
+  would halve the comparisons. Left: a change of std's algorithm with
+  its own tests, not of the optimizer. 15 panic blocks are left in
+  `main` (the checks of `v[child]`, `v[parent]` against the Vec's
+  length, which the heap's `end` does not bound for the ranges).
+- **wordcount** (2641, 2284, 877). Without the map the program takes 755
+  (the text's generation and the scan); `get` about 1190 and `insert`
+  690 for 3,000,000 words, 400 instructions a lookup. `Hash for [T]`
+  feeds the hasher the length and then each byte by `write_u8`
+  (FoldHasher::write_num: the sponge is in memory, a call a byte until
+  0.30's INLINE_FLOOR, 80, to which a function may grow whatever its
+  room, took it into `hash_of`: -11% of the instructions, 145 ms ->
+  117 ms), where the C twin's
+  FNV is 3 instructions a byte and `str`'s Hash is one `write` of the
+  bytes. The fix is `hash_slice` of the integer types writing their
+  bytes at once (the integers' Hash impls are the compiler's, not
+  std's text): estimated 0.6 to 0.8 G of the 2.28. Left.
+- **arena_trees** (1169, 810, 541). `Arena::allocate -> Chunks::bump
+  (63) no:room`: the bump path was a call a node, its refill inlined
+  into it. The refill (Chunks::add) is `#[cold]` now, as the C twin's
+  is, and bump (38) is inlined into `make`. Left: `make` still has the
+  failed `unwrap`'s report in its frame (832 bytes, at every call of a
+  recursive function).
+- **interp, fannkuch** (1714 and 1378 at 0.29.0, 1685 and 1366 now; cc
+  1314 and 1021; 0.28.0's compiler 1534 and 1298). What 0.29's room
+  changed is one decision in each: `main -> Vm.run (159) no:room` and
+  `main -> fannkuch (153) no:room`, the only call of a function just
+  above INLINE_ONCE_FREE (120). A rule that moves an only call when
+  caller and callee are together at most 250 instructions was tried: it
+  takes the instructions to 1505 and 1240 (below 0.28.0's), but the
+  times do not follow (fannkuch 115 ms at 0.29.0, 115 without the rule,
+  121 with it, 119 by 0.28.0's compiler; interp 44, 44, 45, 46; the
+  fastest of 13 to 15 alternating runs, at a load of 5 to 7, twice the
+  same), and it costs the self-build 0.9%. It is not in: these two
+  "regressions" of 0.29 were of instructions, not of time. Why the
+  merged `main` runs more slowly with fewer instructions is not
+  explained (the allocator's spills, as in contracts, are the first
+  suspect).
+- **contracts** (+3.4% against 0.29.0; contracts_plain -29%): kernels 3
+  and 4 are in a larger `main` now, and the register allocator reloads
+  three values from the stack in the dot product's unrolled loop (`ldp
+  x12, x13, [sp, #8]; ldr x0, [sp, #24]; ldr x11, [sp]` at its top).
+
+**What cc has and we lack**, ranked by what the benchmarks would gain
+(m: measured as the gap of a kernel whose only difference it is; e:
+estimated from the instruction counts above):
+
+1. The algorithms of std against their C twins: the heap's sift (e: heap
+   3159 -> about 1500), hashing a slice of bytes at once (e: wordcount
+   -30%). Not the optimizer's, but the largest numbers left.
+2. The register allocator: no splitting of a value's life around a
+   loop, so a value live across a hot loop is spilled and reloaded
+   inside it (contracts +3.4% m; superpi's radix-4 loop, three reloads a
+   round), and phis that trade places cost a three-move swap on the back
+   edge (`mov x17, x11; mov x11, x12; mov x12, x17`: in every rotated
+   loop with two induction variables one apart; iterloop's remainder
+   loops have it too). e: 2 to 5% of loop-heavy programs.
+3. Loop idioms of the back end: post-increment loads and stores, the
+   count down to zero (`subs; b.ne`) in place of counter, compare and
+   branch: m: 9% of filter-map-sum, 16% of dot, 13% of take (the rows
+   "loop / cc" above are this and the next two).
+4. Relations between values in the ranges: `i + 4 <= n` gives `i <= n -
+   4` (the guard of a loop stepping by 4: the two checks of
+   `vld1q_u32(v, i)` stay, 14 instructions a round where 7 would do;
+   superpi's finding 1); `child = 2 * root + 1 < end <= len`; an index
+   compared with another index that was checked. The ranges are
+   intervals plus the facts that compare the same two values, and one
+   step of transitivity. e: sort -10%, heap -5%, the NEON loops of
+   superpi -30% of their rounds.
+5. Constants of data: an element of a `const` array is loaded, not
+   folded (`% PRIMES[0]` is `udiv; msub` and a test for zero in the
+   loop, where `% P` of a scalar const is `umulh`). e: only programs
+   that divide by such constants (superpi's scalar path).
+6. Aliasing from the types of references: a field of `&T` is reloaded
+   in a loop that stores through a `&mut [u32]` (`ldp x12, x13, [x2]`
+   every round); the facts about reference parameters are used by the
+   vectorizer's overlap tests, not by LICM's loads. e: a load or two a
+   round where it applies.
+7. Cold code out of line: a failed check's report (formatting into a
+   256-byte buffer) is inlined into the function that checks, which
+   then has a large frame. e: arena_trees a few %.
+8. The length known to the callee: cc propagates a constant length into
+   a static function and drops the remainder loop and the trip-count
+   test. e: under 1% (the tests run once a call).
+
+Vectorization, unrolling with several accumulators, if-conversion,
+inlining, scalar replacement, value numbering and LICM are there and, on
+these kernels, produce what cc produces once the loop is in the form
+they know. The geometric mean of the programs' instructions against
+0.29.0 is -11.9% over 26 programs (`bench/run.sh --instructions -p`
+0.29.0's compiler; superpi's two rows are -4.7% each); contracts
+(+3.4%) is the only one above.
+
+**What it costs the compiler** (tools/perf-experiment.sh against the
+compiler of the branch's base on one source, the fewer of 2 runs): the
+self-build at -O2 +2.3% (exit counts and un-nesting +0.8 G, the
+functions INLINE_FLOOR lets grow the rest), at -O0 +0.5%, check +0.2%,
+regions +1.5%, hello +1.3% (2 M), std_heavy -3.7%. Against 0.29.0's
+compiler: +2.4%, +0.7%, +1.0%, +1.4%, +1.3%, -3.4%.
+
+Two rules were added so that the newly counted loops do no harm: a
+loop with a bounds check of a constant length of at most 32 is neither
+vectorized nor unrolled at run time (`short_by_checks`: fannkuch's
+`for i in 0..r { perm1[i] = perm1[i + 1] }` over a [i64; 16], 1 to 9
+rounds, took 49% more instructions as a vector loop; until 0.30 the
+constant length in the loop's block kept `record_check` from seeing
+such loops at all), and a small function that calls keeps its loop
+passes (they hoist a pure call before the caller unrolls the loop:
+bench/purecall).
+
+Tests: `opt_iter_chains` (ten chains against their hand loops on every
+length from 0 to 40; the selects and vector loops in the IR; nested
+loops that must stay nested), `opt_range_arms` (the swap's checks, the
+last element's, a check that must stay), `std_sort_introsort` (1071
+inputs of seven shapes, and McIlroy's adversary into the heapsort),
+`opt_inline_room`, `opt_vec_usize_lanes` (its XFAIL gone).
+
 ## 0.30: the compiler's own speed
 
 The -O2 self-build went from 127.0 G to 106.3 G instructions (0.29.0:
