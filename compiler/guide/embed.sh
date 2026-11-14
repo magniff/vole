@@ -12,6 +12,10 @@
 # `&'static [u8]`.
 #
 # usage: compiler/guide/embed.sh [-c]   (-c: only check, exit 1 if stale)
+#
+# Prints `core: N of 10240 bytes (K left)`, the core guide's size as
+# `volec guide` prints it against its budget (0.30), and exits 1 when it
+# is over (the files are written all the same).
 set -eu
 LC_ALL=C
 export LC_ALL
@@ -124,11 +128,30 @@ done <"$src/topics.txt"
     echo "}"
 } >"$tmp/mod.vl"
 
+# (0.30) The core guide's size against its budget, said here, at the edit,
+# and not by a later suite (tests/guide/run.sh: guide-budget, which also
+# checks this number is the one `volec guide` prints): core.md with its
+# @TOPIC-NAMES@ the other topics' names, as guide/mod.vl writes them.
+core_budget=10240
+topic_names=$(for name in $names; do [ "$name" = core ] || printf '`%s` ' "$name"; done | sed 's/ $//')
+core_size=$(wc -c <"$src/core.md" | tr -d ' ')
+if grep -q '@TOPIC-NAMES@' "$src/core.md"; then
+    core_size=$((core_size - 13 + ${#topic_names}))
+fi
+core_over=0
+if [ "$core_size" -gt "$core_budget" ]; then
+    core_over=1
+    echo "embed.sh: the core guide is $core_size bytes, $((core_size - core_budget)) over its $core_budget (2.5k tokens): move detail from $src/core.md to a topic (language, rust, errors...)" >&2
+else
+    echo "core: $core_size of $core_budget bytes ($((core_budget - core_size)) left)"
+fi
+
 if [ "${1:-}" = "-c" ]; then
-    if diff -r "$tmp" "$out" >/dev/null 2>&1; then exit 0; fi
+    if diff -r "$tmp" "$out" >/dev/null 2>&1; then exit $core_over; fi
     echo "$out is stale: run compiler/guide/embed.sh" >&2
     exit 1
 fi
 rm -rf "$out"
 mkdir -p "$out"
 cp "$tmp"/*.vl "$out/"
+exit $core_over

@@ -132,6 +132,11 @@ run_runners() {
         # (--real: the whole suites, their other checks too; the LSP
         # runner takes no names: all its sessions)
         [ "$4" = moved ] || [ "$kind" = lsp ] && names=
+        # (0.30: the query and refactor runners' names are filters, a name
+        # containing one; `=NAME` is NAME alone)
+        case "$kind" in
+            query|refactor) names=$(printf '%s\n' $names | sed 's/^./=&/' | tr '\n' ' ') ;;
+        esac
         # shellcheck disable=SC2086
         env $3 sh "$1/tests/$kind/run.sh" -c "$2" $names >"$WORK/$4-$kind.out" 2>&1
     done

@@ -175,8 +175,9 @@ To add a test case.
 - A tool: a transcript, `$ ARGS` lines and their output:
   `tests/query/NAME.q` (on `tests/query/NAME/main.vl`),
   `tests/refactor/NAME.t` (in a copy of `tests/refactor/NAME/`; `%`
-  lines run shell commands); `tests/query/run.sh -u` writes what the
-  commands print now (read the diff before keeping it).
+  lines run shell commands); `tests/query/run.sh -u NAME` writes what
+  the commands print now (read the diff before keeping it; `--grep
+  TEXT`: the transcripts holding TEXT; `volec guide testing`).
 - Templates: `volec query examples test`.
 
 ## add-subcommand

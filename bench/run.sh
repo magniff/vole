@@ -15,7 +15,7 @@
 # run alternately, RUNS rounds of one run each, and each side's time is
 # its fastest round.
 #
-# usage: bench/run.sh [-c COMPILER] [-p PREVIOUS] [-s SEED] [-r RUNS] [-t TARGET]
+# usage: bench/run.sh [-c COMPILER] [-p PREVIOUS] [-s SEED] [-r RUNS] [-t TARGET] [--smoke]
 #
 #   -c COMPILER   the volec to measure (default: target/volec)
 #   -p PREVIOUS   another volec (e.g. the previous release), at its
@@ -23,6 +23,11 @@
 #   -s SEED       the seed binary (`vole build -O`)
 #   -r RUNS       runs per measurement (default 5)
 #   -t TARGET     the target (default: the host)
+#   --smoke       (0.30) the script's own check, not a measurement: every
+#                 program built in every variant and run once (-r 1), the
+#                 outputs agreeing; the ratios are not measured (their
+#                 bounds mean nothing on a busy machine). What
+#                 tests/affected.sh runs for a change to this script
 #
 # (0.29) A run that fails ends with one line that says which program and
 # why, `bench: PROGRAM VARIANT: ...` (a program that does not build with
@@ -42,6 +47,7 @@ PREVIOUS=""
 SEED=""
 RUNS=5
 TARGET=""
+SMOKE=0
 CC=${CC:-cc}
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -50,9 +56,11 @@ while [ $# -gt 0 ]; do
         -s) SEED=$2; shift 2 ;;
         -r) RUNS=$2; shift 2 ;;
         -t) TARGET=$2; shift 2 ;;
-        *) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        --smoke) SMOKE=1; shift ;;
+        *) sed -n '2,/^set -eu/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
+[ $SMOKE -eq 0 ] || RUNS=1
 if [ -z "$TARGET" ]; then
     case "$(uname -s)-$(uname -m)" in
         Darwin-arm64) TARGET=aarch64-macos ;;
@@ -222,6 +230,10 @@ ratio() {
         fail "$1/$3 is $r, above 1.05: $5 are not zero cost"
     fi
 }
+if [ $SMOKE -eq 1 ]; then
+    echo "bench: smoke: every program built and run once, the outputs agree; the ratios were not measured (run without --smoke)"
+    exit 0
+fi
 if [ -n "${CHAIN_MS:-}" ] && [ -n "${LOOP_MS:-}" ]; then
     ratio iterchain "$CHAIN_MS" iterloop "$LOOP_MS" "iterator chains"
 fi

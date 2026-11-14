@@ -149,13 +149,23 @@ never the whole suite or a gate unless its task says so**:
    contains a FILTER: `tests/run.sh pathtrace`; `-n NAME`: the one
    case NAME exactly; `-f FILE` a list; `-l` lists them), or
    `tests/affected.sh -O 2` for what the branch touches so far.
+   Its first line is the plan (how many cases, which suites): read it
+   before waiting. A suite's transcripts by name (0.30):
+   `tests/run.sh -j 2 refactor:NAME query:NAME` (also `lsp:`, `fmt:`;
+   the runners themselves take `-j N`, `-l`, `-u --grep TEXT`);
+   `--cases-only`: no suite; `--bless NAME`: a case's `// ERROR:`
+   positions that only moved (`volec guide testing`).
 2. **Before reporting (agent):** `tools/premerge.sh` (prints `premerge:
    ok`) and `tests/affected.sh`: the tests `tests/affected.map` names for
    the paths changed since the branch's base, at -O0 and -O2 (`--list`
    prints the plan and why each item is in it; a changed test runs
    itself; an unknown path gets the smoke set; a file git does not
    track is named in the plan and not counted: `git add` a new test,
-   or `--untracked`). When `--list` says
+   or `--untracked`). A plan of most of the suite (over 600 cases: a
+   front end or std change): `tests/affected.sh --narrow` (0.30: the
+   changed tests, the cases and transcripts that name a changed item,
+   the smoke set; the plan says how it chose, and the report says it
+   was the narrow one). When `--list` says
    `linux: platform-relevant`, `tests/affected.sh --linux` runs the
    same plan in the aarch64-linux container too (colima must run).
 3. **Per merge batch (integrator):** after merging the batch into the

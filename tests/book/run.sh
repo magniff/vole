@@ -5,11 +5,21 @@
 # it says. POSIX sh and awk only. book/STYLE.md explains the annotations
 # for the people writing chapters; this is the reference.
 #
-# usage: tests/book/run.sh [-c COMPILER] [-j JOBS] [-f FILE]
+# usage: tests/book/run.sh [-c COMPILER] [-j JOBS] [-f FILE] [-u]
 #
 #   -c COMPILER   the volec binary (default: target/volec)
 #   -j JOBS       units checked at once (default 4)
 #   -f FILE       check only this chapter (book/NN-slug.md)
+#   -u            (0.30, as tests/walkthrough/run.sh -u) rewrite the err,
+#                 out and console blocks that differ with the text they
+#                 get now, the prose and the vole blocks kept: `updated
+#                 NAME` for each (read the diff, and run again to check
+#                 them). Not rewritten, and still a FAIL: a console block
+#                 with a `...` line (which of its lines stand for many is
+#                 the author's choice), a build that should fail and does
+#                 not (or the reverse), an exit status (`out exit=N`). A
+#                 line that differs only in std's numbers is kept as it
+#                 was (tests/stdkeep.sh)
 #
 # The chapters are book/[0-9][0-9]-*.md. Their fenced blocks, by the
 # fence's info string:
@@ -72,12 +82,14 @@ ROOT=$(cd "$HERE/../.." && pwd)
 COMPILER="$ROOT/target/volec"
 JOBS=4
 ONLY=""
+UPDATE=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -c) [ $# -ge 2 ] || exit 2; COMPILER=$2; shift 2 ;;
         -j) [ $# -ge 2 ] || exit 2; JOBS=$2; shift 2 ;;
         -f) [ $# -ge 2 ] || exit 2; ONLY=$2; shift 2 ;;
-        *) echo "usage: tests/book/run.sh [-c COMPILER] [-j JOBS] [-f FILE]" >&2; exit 2 ;;
+        -u) UPDATE=1; shift ;;
+        *) echo "usage: tests/book/run.sh [-c COMPILER] [-j JOBS] [-f FILE] [-u]" >&2; exit 2 ;;
     esac
 done
 case "$COMPILER" in
@@ -111,9 +123,11 @@ chmod +x "$WORK/bin/volec"
 # Splits chapter $1 (named $2) into units under $WORK/units: a directory
 # per program, holding name, src/ (its files), root, and as given stdin,
 # out, exit, err, warn, console-NNN. Problems with the annotations go to
-# $WORK/lint.
+# $WORK/lint. (0.30) Beside each out, err and console block's file, FILE.at:
+# the chapter's path, the line of the block's fence and how many lines
+# it holds (tab-separated), for -u.
 split_chapter() {
-    awk -v chap="$2" -v dir="$WORK/units" -v lint="$WORK/lint" -v host="$(uname -s)" '
+    awk -v chap="$2" -v path="$1" -v dir="$WORK/units" -v lint="$WORK/lint" -v host="$(uname -s)" '
         function item_line(l) {
             return l ~ /^(pub |fn |struct |enum |union |impl|trait |const |static |type |use |mod |import |extern |unsafe fn |#\[|}|\/\/|$)/
         }
@@ -234,6 +248,7 @@ split_chapter() {
                 write_body(f, 1, nbody)
                 if (nbody == 0) printf "" > f
                 close(f)
+                if (lang != "in") { printf "%s\t%d\t%d\n", path, start, nbody > (f ".at"); close(f ".at") }
                 if (lang != "in") pending = ""
                 next
             }
@@ -246,6 +261,7 @@ split_chapter() {
                 write_body(f, 1, nbody)
                 close(f)
                 printf "%s:%d\n", chap, start > (f ".name"); close(f ".name")
+                printf "%s\t%d\t%d\n", path, start, nbody > (f ".at"); close(f ".at")
                 next
             }
             if (lang ~ /^tach/) problem("the fence is `vole`, not `" lang "`")
@@ -319,6 +335,20 @@ console_script() {
     } >"$2"
 }
 
+# (0.30, -u) The block at $1 (a FILE.at: the chapter, the fence's line,
+# the block's lines) is to hold the text of file $3, of which each line
+# that differs from $2's (the block as it is) only in std's numbers is
+# kept as it was, unless the chapter is `exact-std` ($4 = 1): a line of
+# unit $5's updates.
+update_block() {
+    if [ "$4" = 1 ]; then
+        cp "$3" "$3.new"
+    else
+        sh "$ROOT/tests/stdkeep.sh" "$2" "$3" >"$3.new"
+    fi
+    printf '%s\t%s\n' "$(cat "$1")" "$3.new" >>"$5/updates"
+}
+
 # Checks unit $1; writes its result lines to $1/result.
 check_unit() {
     d=$1
@@ -335,6 +365,9 @@ check_unit() {
             trimmed "$d/err" >"$d/want"
             if [ $rc -ne 1 ]; then
                 { echo "FAIL $name: expected a compile error (exit 1), got exit $rc"; sed 's/^/    /' "$d/compile.out"; } >>"$d/result"
+            elif ! cmp -s "$d/got" "$d/want" && [ $UPDATE -eq 1 ]; then
+                update_block "$d/err.at" "$d/want" "$d/got" 1 "$d"
+                echo "updated $name: its err block is what volec prints now" >>"$d/result"
             elif ! cmp -s "$d/got" "$d/want"; then
                 { echo "FAIL $name: the compiler's error differs"; echo "    --- the book says"; sed 's/^/    /' "$d/want"; echo
                   echo "    --- volec prints"; sed 's/^/    /' "$d/got"; echo; } >>"$d/result"
@@ -355,12 +388,20 @@ check_unit() {
                 trimmed "$d/out" >"$d/want"
                 # (0.28) a panic's line may name a position in std (`unwrap`'s
                 # requires): compared normalized, as a session's is
+                cp "$d/got" "$d/got.raw"
+                cp "$d/want" "$d/want.raw"
+                exact=0
+                grep -q '^<!-- exact-std -->' "$ROOT/book/${name%%:*}.md" 2>/dev/null && exact=1
                 if grep -q '<std>:' "$d/want" && ! grep -q '^<!-- exact-std -->' "$ROOT/book/${name%%:*}.md" 2>/dev/null; then
                     awk -f "$ROOT/tests/stdpos.awk" "$d/got" >"$d/got.n" && mv "$d/got.n" "$d/got"
                     awk -f "$ROOT/tests/stdpos.awk" "$d/want" >"$d/want.n" && mv "$d/want.n" "$d/want"
                 fi
                 want_rc=$(cat "$d/exit")
-                if ! cmp -s "$d/got" "$d/want"; then
+                if ! cmp -s "$d/got" "$d/want" && [ $UPDATE -eq 1 ]; then
+                    update_block "$d/out.at" "$d/want.raw" "$d/got.raw" "$exact" "$d"
+                    echo "updated $name: its out block is what the program prints now" >>"$d/result"
+                    [ "$rc" -eq "$want_rc" ] || echo "FAIL $name: exit status $rc, the book says $want_rc (the block's \`out exit=N\`: -u leaves it)" >>"$d/result"
+                elif ! cmp -s "$d/got" "$d/want"; then
                     { echo "FAIL $name: output differs"; echo "    --- the book says"; sed 's/^/    /' "$d/want"; echo
                       echo "    --- it prints"; sed 's/^/    /' "$d/got"; echo; } >>"$d/result"
                 elif [ "$rc" -ne "$want_rc" ]; then
@@ -395,15 +436,23 @@ check_unit() {
         trimmed "$c" >"$c.want"
         # (0.25.3) std's positions and counts compared normalized
         # (tests/stdpos.awk), unless the chapter has `<!-- exact-std -->`
+        cp "$c.got.t" "$c.got.raw"
+        cp "$c.want" "$c.want.raw"
+        exact=1
         if ! grep -q '^<!-- exact-std -->' "$ROOT/book/${cname%%:*}.md" 2>/dev/null; then
+            exact=0
             awk -f "$ROOT/tests/stdpos.awk" "$c.got.t" >"$c.got.n" && mv "$c.got.n" "$c.got.t"
             awk -f "$ROOT/tests/stdpos.awk" "$c.want" >"$c.want.n" && mv "$c.want.n" "$c.want"
         fi
         if transcript_matches "$c.want" "$c.got.t"; then
             echo "pass $cname" >>"$d/result"
+        elif [ $UPDATE -eq 1 ] && ! grep -q '^\.\.\.$' "$c.want.raw"; then
+            update_block "$c.at" "$c.want.raw" "$c.got.raw" "$exact" "$d"
+            echo "updated $cname: its console block is what the shell prints now" >>"$d/result"
         else
             { echo "FAIL $cname: the session differs"; echo "    --- the book says"; sed 's/^/    /' "$c.want"; echo
-              echo "    --- the shell prints"; sed 's/^/    /' "$c.got.t"; echo; } >>"$d/result"
+              echo "    --- the shell prints"; sed 's/^/    /' "$c.got.t"; echo
+              [ $UPDATE -eq 0 ] || echo "    (-u leaves a block with a \`...\` line: edit it by hand)"; } >>"$d/result"
         fi
     done
 }
@@ -446,6 +495,30 @@ for d in "$WORK"/units/*/; do
     [ -f "$d/result" ] && cat "$d/result" >>"$RESULTS"
 done
 cat "$RESULTS"
+# (0.30, -u) The blocks to rewrite, chapter by chapter: each fence's line
+# kept, the block's lines replaced.
+if [ $UPDATE -eq 1 ]; then
+    cat "$WORK"/units/*/updates 2>/dev/null >"$WORK/updates"
+    cut -f1 "$WORK/updates" | sort -u | while IFS= read -r ch; do
+        awk -v ups="$WORK/updates" -v path="$ch" '
+            BEGIN {
+                while ((getline l < ups) > 0) {
+                    split(l, f, "\t")
+                    if (f[1] == path) { count[f[2] + 0] = f[3] + 0; text[f[2] + 0] = f[4] }
+                }
+            }
+            NR in count {
+                print
+                while ((getline l < text[NR]) > 0) print l
+                close(text[NR])
+                skip = count[NR]
+                next
+            }
+            skip > 0 { skip--; next }
+            { print }' "$ch" >"$WORK/chapter.new" && cp "$WORK/chapter.new" "$ch"
+    done
+    echo "book: $(wc -l <"$WORK/updates" | tr -d ' ') blocks rewritten (-u) in $(cut -f1 "$WORK/updates" | sort -u | wc -l | tr -d ' ') chapters: read the diff, run again to check them"
+fi
 awk '{ u += $1; s += $2 } END { printf "book: %d blocks checked, %d skipped\n", u, s }' "$WORK/counts"
 awk '/^pass/ { p++ } /^FAIL/ { f++ } END { printf "book: %d passed, %d failed\n", p, f }' "$RESULTS"
 grep -q '^FAIL' "$RESULTS" && exit 1

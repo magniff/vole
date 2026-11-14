@@ -22,7 +22,18 @@
 # mode the cache is off in, or the cache's own. A new one fails: say how
 # its value reaches the key, or the cache uses outputs made from another.
 #
-# usage: tests/threads_writes.sh [-c COMPILER]
+# (0.30) Two thirds of its minute was one process answering `query refs`
+# for each of the thousand statics and fields, the rest the queries of
+# who calls what, one after the other. The refs are now asked in JOBS
+# parts at once (the answers joined in the statics' order: the same
+# text), and the join's, the assembler's and gen0's functions are found
+# beside them: the same checks, in under half the time at -j 2.
+#
+# usage: tests/threads_writes.sh [-c COMPILER] [-j JOBS]
+#
+#   -c COMPILER   the volec that answers (default: target/volec)
+#   -j JOBS       the parts the statics' refs are asked in, at once
+#                 (default 2; one more process finds the functions)
 
 set -u
 LC_ALL=C
@@ -30,12 +41,17 @@ export LC_ALL
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 COMPILER="$ROOT/target/volec"
+JOBS=2
 while [ $# -gt 0 ]; do
     case "$1" in
         -c) COMPILER=$2; shift 2 ;;
-        *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        -j) JOBS=$2; shift 2 ;;
+        *) sed -n '2,/^set -u/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
+case "$JOBS" in
+    ''|*[!0-9]*|0) echo "tests/threads_writes.sh: -j takes a number, 1 or more (got '$JOBS')" >&2; exit 2 ;;
+esac
 case "$COMPILER" in /*) ;; *) COMPILER="$(pwd)/$COMPILER" ;; esac
 
 # static <TAB> why it is no race
@@ -289,7 +305,47 @@ grep -rn --exclude-dir=.volec '^ *\(pub \)\{0,1\}static \(mut\|var\) [A-Za-z_0-9
 awk '/^pub struct Ctx</ { on = 1; next } on && /^}/ { on = 0 }
     on && /^    pub [a-z_0-9]+:/ { f = $2; sub(/:.*/, "", f); print "crate::base::ctx::Ctx." f }' \
     compiler/src/base/ctx.vl >>"$WORK/statics"
-sed 's/^/query refs /; s/$/ --all/' "$WORK/statics" | "$COMPILER" batch >"$WORK/refs" 2>&1
+# (0.30) The functions of the join, of -O0's assembler thread and of
+# gen0's main thread (used below), found beside the refs. (0.26.2) gen0
+# generates every function from its kept body (gen_places_function; an
+# atomic intrinsic's, gen_atomic_function); a name that is gone fails
+# (below), not by checking less.
+GEN0_MAIN="gen0::gen::places::gen_places_function gen0::gen::gen_atomic_function back::objfile::asm_hand_over"
+(
+    {
+        echo "middle::parallel::join_task"
+        "$COMPILER" query callees crate::middle::parallel::join_task --transitive --all | awk -F'\t' 'NF >= 3 { print $3 }'
+    } | sort -u >"$WORK/joined"
+    {
+        echo "back::objfile::assemble_bytes"
+        "$COMPILER" query callees crate::back::objfile::assemble_bytes --transitive --all | awk -F'\t' 'NF >= 3 { print $3 }'
+    } | sort -u >"$WORK/assembler"
+    : >"$WORK/gen0.missing"
+    for f in $GEN0_MAIN; do
+        "$COMPILER" query callees "crate::$f" >/dev/null 2>&1 || echo "$f" >>"$WORK/gen0.missing"
+    done
+    {
+        printf '%s\n' $GEN0_MAIN
+        "$COMPILER" query callees $(printf 'crate::%s ' $GEN0_MAIN) --transitive --all | awk -F'\t' 'NF >= 3 { print $3 }'
+    } | sort -u >"$WORK/gen0"
+) &
+# (0.30) Every static's refs, asked in JOBS parts at once, the answers
+# joined in the statics' order.
+sed 's/^/query refs /; s/$/ --all/' "$WORK/statics" >"$WORK/refs.cmds"
+per=$(( ($(wc -l <"$WORK/refs.cmds") + JOBS - 1) / JOBS ))
+k=0
+while [ "$k" -lt "$JOBS" ]; do
+    sed -n "$((k * per + 1)),$(((k + 1) * per))p" "$WORK/refs.cmds" | "$COMPILER" batch >"$WORK/refs.part$k" 2>&1 &
+    k=$((k + 1))
+done
+wait
+: >"$WORK/refs"
+k=0
+while [ "$k" -lt "$JOBS" ]; do
+    cat "$WORK/refs.part$k" >>"$WORK/refs"
+    rm -f "$WORK/refs.part$k"
+    k=$((k + 1))
+done
 awk -F'\t' -v reached="$WORK/reached" '
     BEGIN { while ((getline f < reached) > 0) in_task[f] = 1 }
     /^## \$ volec query refs / { s = $0; sub(/^## \$ volec query refs crate::/, "", s); sub(/ --all$/, "", s); n = s; sub(/.*::/, "", n); sub(/.*\./, "", n); next }
@@ -306,11 +362,7 @@ new=$(comm -23 "$WORK/written" "$WORK/allowed")
 for s in $new; do
     echo "FAIL $s: a task writes it; try: $COMPILER query callees crate::middle::parallel::run_task --writes crate::$s"
 done
-# The join's.
-{
-    echo "middle::parallel::join_task"
-    "$COMPILER" query callees crate::middle::parallel::join_task --transitive --all | awk -F'\t' 'NF >= 3 { print $3 }'
-} | sort -u >"$WORK/joined"
+# The join's (its functions: $WORK/joined, found above).
 awk -F'\t' -v joined="$WORK/joined" -v reached="$WORK/reached" '
     BEGIN {
         while ((getline f < joined) > 0) in_join[f] = 1
@@ -330,23 +382,13 @@ newj=$(comm -23 "$WORK/join-written" "$WORK/join-allowed")
 for s in $newj; do
     echo "FAIL $s: the join writes it and a task uses it; try: $COMPILER query callees crate::middle::parallel::join_task --writes crate::$s"
 done
-# -O0's assembler thread against the main thread.
-{
-    echo "back::objfile::assemble_bytes"
-    "$COMPILER" query callees crate::back::objfile::assemble_bytes --transitive --all | awk -F'\t' 'NF >= 3 { print $3 }'
-} | sort -u >"$WORK/assembler"
-# (0.26.2) gen0 generates every function from its kept body
-# (gen_places_function; an atomic intrinsic's, gen_atomic_function); a
-# name that is gone fails here, not by checking less.
-GEN0_MAIN="gen0::gen::places::gen_places_function gen0::gen::gen_atomic_function back::objfile::asm_hand_over"
-for f in $GEN0_MAIN; do
-    "$COMPILER" query callees "crate::$f" >/dev/null 2>&1 \
-        || { echo "threads-writes: no function $f (tests/threads_writes.sh GEN0_MAIN)"; exit 1; }
-done
-{
-    printf '%s\n' $GEN0_MAIN
-    "$COMPILER" query callees $(printf 'crate::%s ' $GEN0_MAIN) --transitive --all | awk -F'\t' 'NF >= 3 { print $3 }'
-} | sort -u >"$WORK/gen0"
+# -O0's assembler thread against the main thread (their functions:
+# $WORK/assembler and $WORK/gen0, found above; a function of GEN0_MAIN
+# that is gone fails here).
+if [ -s "$WORK/gen0.missing" ]; then
+    echo "threads-writes: no function $(head -1 "$WORK/gen0.missing") (tests/threads_writes.sh GEN0_MAIN)"
+    exit 1
+fi
 awk -F'\t' -v A="$WORK/assembler" -v M="$WORK/gen0" '
     BEGIN {
         while ((getline f < A) > 0) in_asm[f] = 1
