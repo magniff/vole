@@ -46,7 +46,7 @@ ok: 0 errors in main.vl (1 file, 0 shaders)
 $ refactor inline mask
 inlined crate::mask at 1 call, deleted it	main.vl	+1 -5 lines
 $ rewrite '$a & !$b' --list
-main.vl:5:5	$a=flags & m	$b=KEEP
+main.vl:5:5	$a=flags & m	$b=KEEP	flags & m & !KEEP
 $ rewrite '!$x' '~$x'
 main.vl:1:19: error[syntax.tilde] `~` is not an operator; an integer's complement is `!x` | help: write `!x`: bitwise not on an integer, logical not on a bool (as in Rust) | try: volec fix --suggested main.vl  [edited: crate::KEEP]
 main.vl:4:13: error[syntax.tilde] `~` is not an operator; an integer's complement is `!x` | help: write `!x`: bitwise not on an integer, logical not on a bool (as in Rust) | try: volec fix --suggested main.vl  [edited: crate::clear]

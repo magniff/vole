@@ -77,23 +77,23 @@ patched crate::back::f	back/mod.vl	+2 -1 lines
 note edit.imports: added the imports the new text needs (fix --only imports)
 ## rewrite --list: a line per site, what each hole matched.
 $ rewrite 'for $i in 0..$v.count { $s... }' --list
-loops.vl:8:5	$i=i	$v=w	$s...=t += w.data[i] * 2; if w.data[i] > 2 { t += w.data[i]; }
-loops.vl:15:5	$i=i	$v=w	$s...=t += w.data[i] + x + i as i64;
-loops.vl:18:5	$i=j	$v=w	$s...=t -= w.data[j];
+loops.vl:8:5	$i=i	$v=w	$s...=t += w.data[i] * 2; if w.data[i] > 2 { t += w.data[i]; }	for i in 0..w.count {
+loops.vl:15:5	$i=i	$v=w	$s...=t += w.data[i] + x + i as i64;	for i in 0..w.count {
+loops.vl:18:5	$i=j	$v=w	$s...=t -= w.data[j];	for j in 0..w.count { t -= w.data[j]; }
 ## Name holes: `$x~/re/`, `--where '$x: name'` (any name or path, not
 ## another expression), `--where '$x: name ~ RE'`.
 $ rewrite 'for $i~/^j$/ in 0..$v.count { $s... }' --list
-loops.vl:18:5	$i=j	$v=w	$s...=t -= w.data[j];
+loops.vl:18:5	$i=j	$v=w	$s...=t -= w.data[j];	for j in 0..w.count { t -= w.data[j]; }
 $ rewrite '$v.data[$i]' --where '$v: name ~ ^w$, $i: name' --list
-loops.vl:9:14	$v=w	$i=i
-loops.vl:10:12	$v=w	$i=i
-loops.vl:11:18	$v=w	$i=i
-loops.vl:16:14	$v=w	$i=i
-loops.vl:18:32	$v=w	$i=j
+loops.vl:9:14	$v=w	$i=i	t += w.data[i] * 2;
+loops.vl:10:12	$v=w	$i=i	if w.data[i] > 2 {
+loops.vl:11:18	$v=w	$i=i	t += w.data[i];
+loops.vl:16:14	$v=w	$i=i	t += w.data[i] + x + i as i64;
+loops.vl:18:32	$v=w	$i=j	for j in 0..w.count { t -= w.data[j]; }
 $ rewrite 'let $x = $e;' --where '$x: name ~ ^v_' --list
-loops.vl:19:5	$x=v_two	$e=2
+loops.vl:19:5	$x=v_two	$e=2	let v_two = 2;
 $ rewrite 'let $x = $e;' --where '$x: name ~ [a' --list
-error rewrite.usage: --where '$x: name ~ RE' takes a regular expression (^ $ . * + ? [a-z] \d \w)
+error rewrite.usage: --where '$x: name ~ RE' takes a regular expression (. [a-z] \d \w \s, * + ? after a byte or a group, ( ) groups, | alternatives, ^ $)
 try: volec rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: IntVec' --dry-run
 [exit 2]
 ## --subst inside the statements a $s... keeps, with a new name ($x: x,
@@ -116,8 +116,8 @@ $ rewrite 'for $i in 0..$v.count { $s... }' 'for $x in $v.data.iter() { $s... }'
 note rewrite.dropped: 1 site is left: the replacement drops $i, which the code it keeps uses; first: loops.vl:16:30
 try: volec query show loops.vl:16
 $ rewrite 'for $i in 0..$v.count { $s... }' 'for $x in $v.data.iter() { $s... }' --subst '$v.data[$i]' '$x' --list
-loops.vl:8:5	$i=i	$v=w	$s...=t += w.data[i] * 2; if w.data[i] > 2 { t += w.data[i]; }
-loops.vl:18:5	$i=j	$v=w	$s...=t -= w.data[j];
+loops.vl:8:5	$i=i	$v=w	$s...=t += w.data[i] * 2; if w.data[i] > 2 { t += w.data[i]; }	for i in 0..w.count {
+loops.vl:18:5	$i=j	$v=w	$s...=t -= w.data[j];	for j in 0..w.count { t -= w.data[j]; }
 note rewrite.dropped: 1 site is left: the replacement drops $i, which the code it keeps uses; first: loops.vl:16:30
 try: volec query show loops.vl:16
 ## Layout: a replacement block on one line takes the site's lines; one

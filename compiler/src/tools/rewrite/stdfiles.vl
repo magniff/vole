@@ -1,0 +1,326 @@
+// (0.30) A rewrite of std's files. To the compiler std is one text,
+// `<std>`; in the vole repository that text is compiler/std's files as
+// embed.sh joins them (front/stdtree.vl), and a rewrite asked for std
+// (`--in std`, `--in std::vec`, `--in compiler/std/vec.vl`) reads std from
+// those files, matches in their text and writes them: each file's new
+// text checked with the program (what it uses of std: `--std-tree` with
+// the new texts overlaid), written as one journaled edit. embed.sh and
+// the rebuild are the caller's (`note rewrite.std`). Where std has no
+// files (a program outside the repository, VOLE_STD_TREE=none) the note
+// says that std is not searched.
+
+use crate::base::{
+    STDOUT, buf_append, buf_byte, buf_bytes, buf_copy, buf_int, buf_new, buf_str, buf_write_fd,
+    get_src, streq,
+};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::modules::module_count;
+use crate::front::stdtree::{find_std_tree, std_file_line};
+use crate::tools::ctx::{Tcx, falses};
+use crate::tools::edit::apply::{copy_path, error_lines, try_again};
+use crate::tools::edit::diff::diff_texts;
+use crate::tools::edit::stdedit::is_std_file;
+use crate::tools::proc::{exec_words, remove_file, run_capture, same_bytes, write_file_if};
+use crate::tools::query::c_slice;
+use crate::tools::query::diagnostics::{diag, diags};
+use crate::tools::textual::write_edit;
+
+// Whether a scope (an --in) names std: `std`, a path in it, one of its
+// files.
+pub fn names_std(x: &[u8]) -> bool {
+    (x.len() == 3 && x == b"std") || (x.len() > 5 && x[0..5] == b"std::") || is_std_file(x)
+        || is_std_dir(x)
+}
+
+// `compiler/std`, `compiler/std/`, a directory under it.
+fn is_std_dir(x: &[u8]) -> bool {
+    let dir = b"compiler/std";
+    if crate::base::source_ext_len(x) > 0 || x.len() < dir.len() {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i + dir.len() <= x.len() {
+        if x[i..i + dir.len()] == dir && (i == 0 || x[i - 1] == b'/')
+            && (i + dir.len() == x.len() || x[i + dir.len()] == b'/') {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+// Whether std's text is its files' (the map of front/stdtree.vl, made
+// here when it was not).
+pub fn std_mapped(pcx: &mut Ctx<Comp>) -> bool {
+    let f = pcx.std_file;
+    if f < 0 || !streq(pcx.files[f as usize].path, c"<std>") {
+        return false;
+    }
+    let mut path = 0 as *const u8;
+    let mut line: i64 = 0;
+    std_file_line(f, pcx.files[f as usize].start, &mut path, &mut line, pcx);
+    pcx.map_state == 1
+}
+
+// The file of std (its index in the map) that holds position pos, or -1:
+// pos is in the program, or in a part of std's text that is in no file
+// (a module's banner, the compiler's tail).
+pub fn std_site(pos: i64, pcx: &Ctx<Comp>) -> i64 {
+    let f = pcx.std_file;
+    if f < 0 || pcx.map_state != 1 || pos < pcx.files[f as usize].start
+        || pos >= pcx.files[f as usize].end {
+        return -1;
+    }
+    let off = pos - pcx.files[f as usize].start;
+    for k in 0..pcx.map_path.len() {
+        if off >= pcx.map_start[k] && off < pcx.map_end[k] {
+            return k as i64;
+        }
+    }
+    -1
+}
+
+// `FILE:LINE:COL` of position pos in std's files, into out; false (and
+// nothing written) when pos is in none.
+pub fn put_std_loc(out: i64, pos: i64, pcx: &Ctx<Comp>) -> bool {
+    let k = std_site(pos, pcx);
+    if k < 0 {
+        return false;
+    }
+    let from = pcx.files[pcx.std_file as usize].start + pcx.map_start[k as usize];
+    let mut line: i64 = 1;
+    let mut bol = from;
+    for i in from..pos {
+        if get_src()[i as usize] == b'\n' {
+            line += 1;
+            bol = i + 1;
+        }
+    }
+    buf_str(out, pcx.map_path[k as usize] as *const u8);
+    buf_byte(out, b':');
+    buf_int(out, line);
+    buf_byte(out, b':');
+    buf_int(out, pos - bol + 1);
+    true
+}
+
+// Whether a ends with b by whole components (`x/compiler/std/vec.vl`,
+// `compiler/std/vec.vl`), either way.
+fn same_path(a: &[u8], b: &[u8]) -> bool {
+    let n = a.len();
+    let m = b.len();
+    (n == m && a == b) || (n > m && a[n - m..] == b && a[n - m - 1] == b'/')
+        || (m > n && b[m - n..] == a && b[m - n - 1] == b'/')
+}
+
+// --in X for a file of std (or a directory of them): its text's range
+// joins IN_RANGES. False when std has no such file.
+pub fn in_std_path(x: &[u8], pcx: &mut Ctx<Comp>) -> bool {
+    if !std_mapped(pcx) {
+        return false;
+    }
+    while pcx.in_file.len() < pcx.files.len() {
+        pcx.in_file.push(0);
+    }
+    while (pcx.in_module.len() as i64) < module_count(pcx) {
+        pcx.in_module.push(0);
+    }
+    let mut dir = x;
+    while dir.len() > 0 && dir[dir.len() - 1] == b'/' {
+        dir = &dir[..dir.len() - 1];
+    }
+    let whole = crate::base::source_ext_len(x) == 0;
+    let start = pcx.files[pcx.std_file as usize].start;
+    let mut any = false;
+    for k in 0..pcx.map_path.len() {
+        let p = crate::base::cstr(pcx.map_path[k] as *mut u8);
+        let mut hit = same_path(&p, x);
+        if whole {
+            // (a directory: the files under it)
+            let mut i: usize = 0;
+            while !hit && i + dir.len() < p.len() {
+                hit = p[i..i + dir.len()] == dir && p[i + dir.len()] == b'/'
+                    && (i == 0 || p[i - 1] == b'/');
+                i += 1;
+            }
+        }
+        if hit {
+            pcx.in_ranges.push(start + pcx.map_start[k]);
+            pcx.in_ranges.push(start + pcx.map_end[k]);
+            any = true;
+        }
+    }
+    any
+}
+
+// `note rewrite.std`: std has no files here, so it is not searched.
+pub fn note_no_std_files(tcx: &mut Tcx<Comp>) {
+    let d = diag(c"note", c"rewrite.std", tcx);
+    buf_str(d, c"std is the compiler's own text here, not files (no compiler/std around, or VOLE_STD_TREE=none): rewrite does not search it; in the vole repository `--in std` rewrites compiler/std's files\n");
+}
+
+// `PROG check --diagnostics=short --std-tree DIR [--overlay FILE COPY]...
+// ROOT`: its output into out; its status.
+fn check_std(root: *const u8, dir: *const u8, edited: bool, out: i64, tcx: &Tcx<Comp>,
+    pcx: &Ctx<Comp>) -> i64 {
+    let mut args: Vec<i64, Comp> = Vec::new_in(Comp {});
+    args.push(pcx.prog as i64);
+    args.push(c"check" as i64);
+    args.push(c"--diagnostics=short" as i64);
+    if tcx.target_name != 0 as *const u8 {
+        args.push(c"--target" as i64);
+        args.push(tcx.target_name as i64);
+    }
+    args.push(c"--std-tree" as i64);
+    args.push(dir as i64);
+    if edited {
+        for k in 0..tcx.w_path.len() {
+            args.push(c"--overlay" as i64);
+            args.push(tcx.w_path[k]);
+            args.push(copy_path(tcx.w_path[k] as *const u8, pcx) as i64);
+        }
+    }
+    args.push(root as i64);
+    args.push(0);
+    run_capture(exec_words(args.as_slice()).as_slice(), out)
+}
+
+// The errors ROOT's program has with the new texts of std's files (W_*)
+// and had not with the old, into `added`; false when the check did not
+// run.
+fn new_errors(root: *const u8, dir: *const u8, added: &mut Vec<i64, Comp>, tcx: &Tcx<Comp>,
+    pcx: &Ctx<Comp>) -> bool {
+    for k in 0..tcx.w_path.len() {
+        write_file_if(copy_path(tcx.w_path[k] as *const u8, pcx), &buf_copy(tcx.w_after[k]));
+    }
+    let before = buf_new();
+    let after = buf_new();
+    let s1 = check_std(root, dir, false, before, tcx, pcx);
+    let s2 = check_std(root, dir, true, after, tcx, pcx);
+    for k in 0..tcx.w_path.len() {
+        remove_file(copy_path(tcx.w_path[k] as *const u8, pcx));
+    }
+    if (s1 != 0 && s1 != 1) || (s2 != 0 && s2 != 1) {
+        return false;
+    }
+    let mut old: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut now: Vec<i64, Comp> = Vec::new_in(Comp {});
+    error_lines(&buf_copy(before), &mut old);
+    error_lines(&buf_copy(after), &mut now);
+    let mut used = falses(old.len() as i64 / 2 + 1);
+    let mut i: usize = 0;
+    while i < now.len() {
+        let mut found = false;
+        let mut j: usize = 0;
+        while j < old.len() {
+            if !used[j / 2] && same_bytes(&buf_copy(old[j]), &buf_copy(now[i])) {
+                used[j / 2] = true;
+                found = true;
+                break;
+            }
+            j += 2;
+        }
+        if !found {
+            added.push(now[i + 1]);
+        }
+        i += 2;
+    }
+    true
+}
+
+// The rewrite's sites in std's files (each one's start, end and new text,
+// by position, none inside another): the files' new texts, checked with
+// ROOT's program, written as one edit (or with --dry-run their diff),
+// and the summary. The exit status.
+pub fn write_std(starts: &[i64], ends: &[i64], texts: &[i64], root: *const u8, tcx: &mut Tcx<Comp>,
+    pcx: &mut Ctx<Comp>) -> i64 {
+    let dir = find_std_tree(pcx);
+    let base = pcx.files[pcx.std_file as usize].start;
+    let diff = buf_new();
+    let mut i: usize = 0;
+    while i < starts.len() {
+        let k = std_site(starts[i], pcx) as usize;
+        let from = base + pcx.map_start[k];
+        let to = base + pcx.map_end[k];
+        let before = buf_new();
+        buf_bytes(before, &get_src()[from as usize..to as usize]);
+        let after = buf_new();
+        let mut cur = from;
+        while i < starts.len() && starts[i] < to {
+            buf_bytes(after, &get_src()[cur as usize..starts[i] as usize]);
+            buf_append(after, texts[i]);
+            cur = ends[i];
+            i += 1;
+        }
+        buf_bytes(after, &get_src()[cur as usize..to as usize]);
+        tcx.w_path.push(pcx.map_path[k]);
+        tcx.w_before.push(before);
+        tcx.w_after.push(after);
+        diff_texts(diff, &c_slice(pcx.map_path[k] as *const u8), &buf_copy(before),
+            &buf_copy(after), tcx);
+    }
+    // The check: the program, with std's new texts.
+    if !tcx.no_check {
+        let mut added: Vec<i64, Comp> = Vec::new_in(Comp {});
+        if !new_errors(root, dir, &mut added, tcx, pcx) {
+            let d = diag(c"warning", c"edit.unchecked", tcx);
+            buf_str(d, c"the program could not be checked with std's new texts (");
+            buf_str(d, pcx.prog);
+            buf_str(d, c" check did not run)\n");
+        } else if added.len() > 0 {
+            let e = diags(tcx);
+            for k in 0..added.len() {
+                if k < 10 {
+                    buf_append(e, added[k]);
+                    buf_byte(e, b'\n');
+                }
+            }
+            let d = diag(c"error", c"edit.breaks", tcx);
+            buf_int(d, added.len() as i64);
+            buf_str(d, if added.len() == 1 { c" new error in " } else { c" new errors in " });
+            buf_str(d, root);
+            buf_str(d, c" with std's new texts; nothing written\n");
+            try_again(if tcx.dry_run { c"--no-check" } else { c"--dry-run" }, tcx, pcx);
+            return 1;
+        }
+    }
+    if tcx.dry_run {
+        buf_write_fd(diff, STDOUT);
+        return 0;
+    }
+    let what = buf_new();
+    buf_str(what, c"rewrote ");
+    buf_int(what, starts.len() as i64);
+    buf_str(what, if starts.len() == 1 { c" site in " } else { c" sites in " });
+    buf_int(what, tcx.w_path.len() as i64);
+    buf_str(what, if tcx.w_path.len() == 1 { c" file of std" } else { c" files of std" });
+    if !write_edit(&buf_copy(what), dir, tcx, pcx) {
+        return 1;
+    }
+    let out = buf_new();
+    buf_append(out, what);
+    buf_byte(out, b'\t');
+    if tcx.w_path.len() <= 3 {
+        for k in 0..tcx.w_path.len() {
+            if k > 0 {
+                buf_byte(out, b' ');
+            }
+            buf_str(out, tcx.w_path[k] as *const u8);
+        }
+    } else {
+        buf_int(out, tcx.w_path.len() as i64);
+        buf_str(out, c" files");
+    }
+    buf_str(out, c"\t+");
+    buf_int(out, tcx.added);
+    buf_str(out, c" -");
+    buf_int(out, tcx.edit_removed);
+    buf_str(out, c" lines\n");
+    buf_write_fd(out, STDOUT);
+    let d = diag(c"note", c"rewrite.std", tcx);
+    buf_str(d, c"std's files are rewritten, not the std built into the compiler: run `sh compiler/std/embed.sh`, then build (bootstrap/bootstrap.sh --dev --no-suite); checked with ");
+    buf_str(d, root);
+    buf_str(d, c": what it uses of std\n");
+    0
+}

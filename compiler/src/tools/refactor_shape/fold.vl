@@ -1,0 +1,820 @@
+// `refactor fold NAME --as true|false` (0.30): a predicate that is one
+// value from now on (a switch between an old way and a new, the old way
+// gone) folded away. Each call of function NAME becomes the constant, and
+// the code around it is what the constant leaves:
+//
+//   !C, C && x, x && C, C || x, x || C    by the rules of the operators
+//       (a side with a call in it is kept when the constant alone would
+//       drop its evaluation: `g() && false` stays `g() && false`)
+//   if C { A } else { B }     A's statements (or B's) in its place; as a
+//       value, the block (its expression, when it is one alone)
+//   else if C { A } else { B }    `else { A }`, or `else { B }`, or no else
+//   while C { .. }            gone (false); `loop { .. }` (true)
+//   PAT if C => BODY          the guard gone (true), the arm gone (false)
+//   the statements after one that now always returns: gone
+//
+// The function or the initializer holding a call is one edit (laid out by
+// fmt, as every edit's text is); the edit is checked as any is. The items
+// whose every use was in the code that went (NAME itself, the helpers of
+// the dead branch) are listed, `note refactor.unused`, with the commands
+// that delete them. A call whose arguments call functions is left (its
+// arguments would no longer be evaluated), `warning refactor.fold`.
+
+use std::alloc::{Allocator, Arena};
+
+use crate::base::{buf_append, buf_byte, buf_bytes, buf_copy, buf_int, buf_new, buf_str, get_src};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::cli::line::Call;
+use crate::front::ast::NodeKind;
+use crate::front::embed::wgsl::WgslCx;
+use crate::front::lexer::Tok;
+use crate::front::modules::{file_made, file_of_pos};
+use crate::middle::lower::ssa::HMap;
+use crate::tools::ctx::Tcx;
+use crate::tools::edit::edit_replace;
+use crate::tools::edit::apply::{apply_edit, set_command};
+use crate::tools::query::{QF_DEF, QF_USE, c_slice, root_or_diag};
+use crate::tools::query::defs::{K_CONST, K_FN, K_METHOD, K_STATIC};
+use crate::tools::query::diagnostics::{
+    diag, diags, put_cword, put_root, put_word, try_end, write_diags,
+};
+use crate::tools::query::positions::{is_space, put_loc, token_at};
+use crate::tools::refactor_shape::{
+    has_call, load_and_find, opt, put_count, refs_of, shape_options, sym_text, take_args,
+    usage_error,
+};
+use crate::tools::refactor_shape::signature::calls_of;
+use crate::tools::rewrite::parsed::{
+    binding_level, callee_levels, expr_slots, pa, pb, pc, pchild, pcount, pend, pk, pop, pstart,
+    slot_levels,
+};
+use crate::tools::rewrite::pattern::block_open;
+
+// What a fold knows: the calls that are the constant (by node), the
+// constant, the level each node needs where it stands (parsed.vl), the
+// ranges of source that go (starts and ends, in pairs).
+struct Fold<A: Allocator> {
+    site: Vec<i64, A>,
+    as_true: bool,
+    levels: Vec<i64, A>,
+    dropped: Vec<i64, A>,
+}
+
+const UNCHANGED: i64 = -1;
+// (an `if` without the branch taken, a loop that never runs: nothing)
+const GONE: i64 = -2;
+
+pub fn run_fold(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
+    wgx: &mut WgslCx<Arena<Gpa>>) -> i64 {
+    let status = fold_inner(c, tcx, pcx, wgx);
+    write_diags(tcx);
+    status
+}
+
+fn is_logic(n: i64, pcx: &Ctx<Comp>) -> bool {
+    pk(n, pcx) == NodeKind::Binary && (pop(n, pcx) == Tok::AmpAmp || pop(n, pcx) == Tok::PipePipe)
+}
+
+// The value expression n is now: 1 true, 0 false, -1 not a constant.
+fn value(n: i64, fx: &Fold<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    if n <= 0 || (n as usize) >= fx.site.len() {
+        return -1;
+    }
+    if fx.site[n as usize] != 0 {
+        return if fx.as_true { 1 } else { 0 };
+    }
+    let k = pk(n, pcx);
+    if k == NodeKind::Unary && pop(n, pcx) == Tok::Bang {
+        let v = value(pb(n, pcx), fx, pcx);
+        return if v < 0 { -1 } else { 1 - v };
+    }
+    if is_logic(n, pcx) {
+        // (`&&`: false ends it, true leaves the other side; `||`: the
+        // other way round)
+        let ends: i64 = if pop(n, pcx) == Tok::AmpAmp { 0 } else { 1 };
+        let l = value(pb(n, pcx), fx, pcx);
+        let r = value(pc(n, pcx), fx, pcx);
+        if l == ends {
+            return ends;
+        }
+        if l >= 0 {
+            return r;
+        }
+        // (the left side is still evaluated: only when it calls nothing
+        // is the whole the constant)
+        if r == ends && !has_call(pstart(pb(n, pcx), pcx), pend(pb(n, pcx), pcx), pcx) {
+            return ends;
+        }
+    }
+    -1
+}
+
+// The side of `a && b` (`a || b`) that the whole now is, when the other
+// is the constant that leaves it; 0 when there is none.
+fn side_left(n: i64, fx: &Fold<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    if !is_logic(n, pcx) {
+        return 0;
+    }
+    let leaves: i64 = if pop(n, pcx) == Tok::AmpAmp { 1 } else { 0 };
+    if value(pb(n, pcx), fx, pcx) == leaves {
+        return pc(n, pcx);
+    }
+    if value(pc(n, pcx), fx, pcx) == leaves {
+        return pb(n, pcx);
+    }
+    0
+}
+
+// The branch of `if` n that its constant condition takes (0: none, an
+// `if` without an `else` whose condition is false); -1 when the
+// condition is no constant.
+fn branch_taken(n: i64, fx: &Fold<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    let cv = value(pa(n, pcx), fx, pcx);
+    if cv < 0 {
+        return -1;
+    }
+    if cv == 1 { pb(n, pcx) } else { pc(n, pcx) }
+}
+
+// Whether block b is one expression and nothing else: `{ e }`.
+fn lone_tail(b: i64, pcx: &Ctx<Comp>) -> bool {
+    pk(b, pcx) == NodeKind::Block && pcount(b, pcx) == 0 && pa(b, pcx) != 0
+        && get_src()[pstart(b, pcx) as usize] == b'{'
+}
+
+// How tightly n binds once folded (parsed.vl's levels).
+fn level_of(n: i64, fx: &Fold<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    if value(n, fx, pcx) >= 0 {
+        return 99;
+    }
+    let s = side_left(n, fx, pcx);
+    if s != 0 {
+        return level_of(s, fx, pcx);
+    }
+    if pk(n, pcx) == NodeKind::If {
+        let b = branch_taken(n, fx, pcx);
+        if b > 0 && lone_tail(b, pcx) {
+            return level_of(pa(b, pcx), fx, pcx);
+        }
+        if else_if(b, pcx) != 0 {
+            return level_of(else_if(b, pcx), fx, pcx);
+        }
+        return 99;
+    }
+    binding_level(n, pcx)
+}
+
+fn drop_span(from: i64, to: i64, fx: &mut Fold<Comp>) {
+    fx.dropped.push(from);
+    fx.dropped.push(to);
+}
+
+fn drop_node(n: i64, fx: &mut Fold<Comp>, pcx: &Ctx<Comp>) {
+    if n > 0 {
+        drop_span(pstart(n, pcx), pend(n, pcx), fx);
+    }
+}
+
+fn source(from: i64, to: i64) -> i64 {
+    let b = buf_new();
+    buf_bytes(b, &get_src()[from as usize..to as usize]);
+    b
+}
+
+// The text of n, folded or as it is (nothing: `{}`).
+fn text_of(n: i64, fx: &mut Fold<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    let t = folded(n, fx, pcx);
+    if t == UNCHANGED {
+        return source(pstart(n, pcx), pend(n, pcx));
+    }
+    if t == GONE {
+        let b = buf_new();
+        buf_str(b, c"{}");
+        return b;
+    }
+    t
+}
+
+// The text of s where n stood: in parentheses when s, folded, binds less
+// tightly than n's place needs.
+fn in_place_of(n: i64, s: i64, fx: &mut Fold<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    let t = text_of(s, fx, pcx);
+    if level_of(s, fx, pcx) >= fx.levels[n as usize] {
+        return t;
+    }
+    let b = buf_new();
+    buf_byte(b, b'(');
+    buf_append(b, t);
+    buf_byte(b, b')');
+    b
+}
+
+// The `if` of an `else if`: node b is it, or is the block the parser
+// makes around it (no braces of its own); 0 when b is another block.
+fn else_if(b: i64, pcx: &Ctx<Comp>) -> i64 {
+    if b <= 0 {
+        return 0;
+    }
+    if pk(b, pcx) == NodeKind::If {
+        return b;
+    }
+    if pk(b, pcx) == NodeKind::Block && pcount(b, pcx) == 0 && pa(b, pcx) != 0
+        && pk(pa(b, pcx), pcx) == NodeKind::If && pstart(pa(b, pcx), pcx) == pstart(b, pcx) {
+        return pa(b, pcx);
+    }
+    0
+}
+
+// The new text of node n (a buffer), UNCHANGED, or GONE.
+fn folded(n: i64, fx: &mut Fold<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    if n <= 0 {
+        return UNCHANGED;
+    }
+    let v = value(n, fx, pcx);
+    if v >= 0 {
+        drop_node(n, fx, pcx);
+        let b = buf_new();
+        buf_str(b, if v == 1 { c"true" } else { c"false" });
+        return b;
+    }
+    let k = pk(n, pcx);
+    let s = side_left(n, fx, pcx);
+    if s != 0 {
+        drop_node(if s == pb(n, pcx) { pc(n, pcx) } else { pb(n, pcx) }, fx, pcx);
+        return in_place_of(n, s, fx, pcx);
+    }
+    if k == NodeKind::If {
+        let taken = branch_taken(n, fx, pcx);
+        if taken >= 0 {
+            drop_node(pa(n, pcx), fx, pcx);
+            drop_node(if taken == pb(n, pcx) { pc(n, pcx) } else { pb(n, pcx) }, fx, pcx);
+            if taken == 0 {
+                return GONE;
+            }
+            if lone_tail(taken, pcx) {
+                return in_place_of(n, pa(taken, pcx), fx, pcx);
+            }
+            // (an `else if` taken: that `if`, as a value)
+            if else_if(taken, pcx) != 0 {
+                return in_place_of(n, else_if(taken, pcx), fx, pcx);
+            }
+            return text_of(taken, fx, pcx);
+        }
+        // (an `else if` whose condition is the constant: gone, it takes
+        // its `else` with it; else the branch it takes is the `else`'s
+        // block, with its braces)
+        let e0 = pc(n, pcx);
+        let e = else_if(e0, pcx);
+        if e > 0 && branch_taken(e, fx, pcx) >= 0 {
+            let taken = branch_taken(e, fx, pcx);
+            let out = buf_new();
+            let c = pa(n, pcx);
+            let t = pb(n, pcx);
+            buf_bytes(out, &get_src()[pstart(n, pcx) as usize..pstart(c, pcx) as usize]);
+            buf_append(out, text_of(c, fx, pcx));
+            buf_bytes(out, &get_src()[pend(c, pcx) as usize..pstart(t, pcx) as usize]);
+            buf_append(out, text_of(t, fx, pcx));
+            if taken == 0 {
+                drop_node(e, fx, pcx);
+                return out;
+            }
+            drop_node(pa(e, pcx), fx, pcx);
+            drop_node(if taken == pb(e, pcx) { pc(e, pcx) } else { pb(e, pcx) }, fx, pcx);
+            buf_bytes(out, &get_src()[pend(t, pcx) as usize..pstart(e0, pcx) as usize]);
+            let block = if else_if(taken, pcx) == 0 { fold_block(taken, fx, pcx) }
+                else { folded(taken, fx, pcx) };
+            if block == UNCHANGED || block == GONE {
+                buf_bytes(out, &get_src()[pstart(taken, pcx) as usize..pend(taken, pcx) as usize]);
+            } else {
+                buf_append(out, block);
+            }
+            return out;
+        }
+    }
+    if k == NodeKind::While {
+        let cv = value(pb(n, pcx), fx, pcx);
+        if cv == 0 {
+            drop_node(n, fx, pcx);
+            return GONE;
+        }
+        if cv == 1 {
+            // (`while C` is `loop`; a label before it stays)
+            let c = pb(n, pcx);
+            let mut w = token_at(pstart(c, pcx), pcx) - 1;
+            while w > 0 && pcx.toks[w as usize].kind != Tok::While {
+                w -= 1;
+            }
+            drop_node(c, fx, pcx);
+            let out = buf_new();
+            buf_bytes(out,
+                &get_src()[pstart(n, pcx) as usize..pcx.toks[w as usize].start as usize]);
+            buf_str(out, c"loop ");
+            buf_append(out, text_of(pc(n, pcx), fx, pcx));
+            return out;
+        }
+    }
+    if k == NodeKind::Block {
+        return fold_block(n, fx, pcx);
+    }
+    if k == NodeKind::Match {
+        return fold_match(n, fx, pcx);
+    }
+    // Any other node: its text with the expressions in it folded.
+    let mut kids: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut lv: Vec<i64, Comp> = Vec::new_in(Comp {});
+    expr_slots(n, &mut kids, &mut lv, pcx);
+    for a in 1..kids.len() {
+        let mut j = a;
+        while j > 0 && kids[j] > 0 && kids[j - 1] > 0
+            && pstart(kids[j], pcx) < pstart(kids[j - 1], pcx) {
+            let t = kids[j];
+            kids[j] = kids[j - 1];
+            kids[j - 1] = t;
+            j -= 1;
+        }
+    }
+    let mut out: i64 = UNCHANGED;
+    let mut cur = pstart(n, pcx);
+    for i in 0..kids.len() {
+        let kid = kids[i];
+        if kid <= 0 || pstart(kid, pcx) < cur {
+            continue;
+        }
+        let t = folded(kid, fx, pcx);
+        if t == UNCHANGED {
+            continue;
+        }
+        if out == UNCHANGED {
+            out = buf_new();
+        }
+        buf_bytes(out, &get_src()[cur as usize..pstart(kid, pcx) as usize]);
+        if t == GONE {
+            buf_str(out, c"{}");
+        } else {
+            buf_append(out, t);
+        }
+        cur = pend(kid, pcx);
+    }
+    if out != UNCHANGED {
+        buf_bytes(out, &get_src()[cur as usize..pend(n, pcx) as usize]);
+    }
+    out
+}
+
+// Whether statement (or expression) e always returns: `return ..;`.
+fn returns(e: i64, pcx: &Ctx<Comp>) -> bool {
+    if e <= 0 {
+        return false;
+    }
+    let x = if pk(e, pcx) == NodeKind::ExprStmt { pa(e, pcx) } else { e };
+    x > 0 && pk(x, pcx) == NodeKind::Return
+}
+
+// Block n: its statements folded; an `if` statement whose condition is
+// the constant gives way to the statements of its branch; a loop that
+// never runs goes; what follows a statement that now always returns goes.
+fn fold_block(n: i64, fx: &mut Fold<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    let count = pcount(n, pcx) + if pa(n, pcx) != 0 { 1 } else { 0 };
+    let mut out: i64 = UNCHANGED;
+    let mut cur = pstart(n, pcx);
+    // (where the last statement kept ends: what is between it and a
+    // statement that goes, its comment too, goes with it)
+    let mut prev_end = block_open(n, pcx) + 1;
+    let mut dead = false;
+    for i in 0..count {
+        let last = i == count - 1;
+        let e = if i < pcount(n, pcx) { pchild(n, i, pcx) } else { pa(n, pcx) };
+        let inner = if pk(e, pcx) == NodeKind::ExprStmt { pa(e, pcx) } else { e };
+        let mut new: i64 = UNCHANGED;
+        if dead {
+            drop_node(e, fx, pcx);
+            new = GONE;
+        } else if pk(inner, pcx) == NodeKind::If && branch_taken(inner, fx, pcx) >= 0 {
+            let taken = branch_taken(inner, fx, pcx);
+            drop_node(pa(inner, pcx), fx, pcx);
+            drop_node(if taken == pb(inner, pcx) { pc(inner, pcx) } else { pb(inner, pcx) }, fx,
+                pcx);
+            if taken == 0 {
+                new = GONE;
+            } else if pk(taken, pcx) != NodeKind::Block
+                || get_src()[pstart(taken, pcx) as usize] != b'{' {
+                // (an `else if`, an `unsafe` block: as it is)
+                new = text_of(taken, fx, pcx);
+            } else {
+                // The branch's statements, without its braces.
+                let t = buf_copy(text_of(taken, fx, pcx));
+                let mut a: usize = 1;
+                let mut b = t.len() - 1;
+                while a < b && is_space(t[a]) {
+                    a += 1;
+                }
+                while b > a && is_space(t[b - 1]) {
+                    b -= 1;
+                }
+                if a >= b {
+                    new = GONE;
+                } else {
+                    new = buf_new();
+                    buf_bytes(new, &t[a..b]);
+                    // (a value nobody takes, before more statements)
+                    if !last && pa(taken, pcx) != 0 && t[b - 1] != b';' && t[b - 1] != b'}' {
+                        buf_byte(new, b';');
+                    }
+                }
+                let end = if pa(taken, pcx) != 0 { pa(taken, pcx) }
+                    else if pcount(taken, pcx) > 0 { pchild(taken, pcount(taken, pcx) - 1, pcx) }
+                    else { 0 };
+                dead = returns(end, pcx) && !last;
+            }
+        } else if pk(inner, pcx) == NodeKind::While && value(pb(inner, pcx), fx, pcx) == 0 {
+            drop_node(e, fx, pcx);
+            new = GONE;
+        } else {
+            new = folded(e, fx, pcx);
+        }
+        if new == UNCHANGED {
+            prev_end = pend(e, pcx);
+            continue;
+        }
+        if out == UNCHANGED {
+            out = buf_new();
+        }
+        if new == GONE {
+            // (after one that went too: nothing between them stays)
+            if prev_end > cur {
+                buf_bytes(out, &get_src()[cur as usize..prev_end as usize]);
+            }
+        } else {
+            buf_bytes(out, &get_src()[cur as usize..pstart(e, pcx) as usize]);
+            buf_append(out, new);
+            prev_end = pend(e, pcx);
+        }
+        cur = pend(e, pcx);
+    }
+    if out != UNCHANGED {
+        buf_bytes(out, &get_src()[cur as usize..pend(n, pcx) as usize]);
+    }
+    out
+}
+
+// Match n: an arm whose guard is true loses the guard, one whose guard is
+// false goes (with its comma); the rest folded.
+fn fold_match(n: i64, fx: &mut Fold<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    let mut out: i64 = UNCHANGED;
+    let mut cur = pstart(n, pcx);
+    let s = pa(n, pcx);
+    let st = folded(s, fx, pcx);
+    if st != UNCHANGED {
+        out = buf_new();
+        buf_bytes(out, &get_src()[cur as usize..pstart(s, pcx) as usize]);
+        if st == GONE {
+            buf_str(out, c"{}");
+        } else {
+            buf_append(out, st);
+        }
+        cur = pend(s, pcx);
+    }
+    let mut prev_end = pend(s, pcx);
+    for i in 0..pcount(n, pcx) {
+        let arm = pchild(n, i, pcx);
+        let g = pb(arm, pcx);
+        let gv = if g > 0 { value(g, fx, pcx) } else { -1 };
+        let mut new: i64 = UNCHANGED;
+        // (the arm's end: its comma too, when it goes)
+        let mut end = pend(arm, pcx);
+        if i == 0 {
+            // (the first arm's start: after the `{`)
+            let mut open = prev_end;
+            while open < pstart(arm, pcx) && get_src()[open as usize] != b'{' {
+                open += 1;
+            }
+            if open < pstart(arm, pcx) {
+                prev_end = open + 1;
+            }
+        }
+        if gv == 0 {
+            drop_node(arm, fx, pcx);
+            new = GONE;
+            let mut c = end;
+            while c < pend(n, pcx)
+                && (get_src()[c as usize] == b' ' || get_src()[c as usize] == b'\t') {
+                c += 1;
+            }
+            if c < pend(n, pcx) && get_src()[c as usize] == b',' {
+                end = c + 1;
+            }
+        } else if gv == 1 {
+            drop_node(g, fx, pcx);
+            let body = pc(arm, pcx);
+            new = buf_new();
+            buf_bytes(new, &get_src()[pstart(arm, pcx) as usize..pend(pa(arm, pcx), pcx) as usize]);
+            buf_bytes(new, &get_src()[pend(g, pcx) as usize..pstart(body, pcx) as usize]);
+            buf_append(new, text_of(body, fx, pcx));
+            buf_bytes(new, &get_src()[pend(body, pcx) as usize..pend(arm, pcx) as usize]);
+        } else {
+            new = folded(arm, fx, pcx);
+        }
+        if new == UNCHANGED {
+            prev_end = end;
+            continue;
+        }
+        if out == UNCHANGED {
+            out = buf_new();
+        }
+        if new == GONE {
+            if prev_end > cur {
+                buf_bytes(out, &get_src()[cur as usize..prev_end as usize]);
+            }
+        } else {
+            buf_bytes(out, &get_src()[cur as usize..pstart(arm, pcx) as usize]);
+            buf_append(out, new);
+            prev_end = end;
+        }
+        cur = end;
+    }
+    if out != UNCHANGED {
+        buf_bytes(out, &get_src()[cur as usize..pend(n, pcx) as usize]);
+    }
+    out
+}
+
+fn in_dropped(pos: i64, fx: &Fold<Comp>) -> bool {
+    let mut r: usize = 0;
+    while r + 1 < fx.dropped.len() {
+        if pos >= fx.dropped[r] && pos < fx.dropped[r + 1] {
+            return true;
+        }
+        r += 2;
+    }
+    false
+}
+
+// `note refactor.unused`: the functions, constants and statics named in
+// the code that went (and d, the predicate) whose every use was there.
+fn note_unused(d: i64, fx: &Fold<Comp>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) {
+    let mut named = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
+    let mut r: usize = 0;
+    while r + 1 < fx.dropped.len() {
+        let mut i = token_at(fx.dropped[r], pcx);
+        while i < pcx.toks.len() as i64 && pcx.toks[i as usize].start < fx.dropped[r + 1] {
+            if pcx.toks[i as usize].kind == Tok::Ident {
+                named.put(pcx.toks[i as usize].value as i64 + 1, 1);
+            }
+            i += 1;
+        }
+        r += 2;
+    }
+    // The items named there, and their references (all at once: the
+    // references of a query add up).
+    let mut cands: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for x in 0..pcx.defs.len() as i64 {
+        let kind = pcx.defs[x as usize].kind;
+        if kind != K_FN && kind != K_METHOD && kind != K_CONST && kind != K_STATIC {
+            continue;
+        }
+        if (x != d && named.get(pcx.defs[x as usize].name + 1) == 0)
+            || file_made(file_of_pos(pcx.defs[x as usize].start, pcx), pcx) {
+            continue;
+        }
+        cands.push(x);
+    }
+    refs_of(cands.as_slice(), tcx, pcx);
+    let mut uses: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut left: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for _ in 0..cands.len() {
+        uses.push(0);
+        left.push(0);
+    }
+    for k in 0..tcx.r_pos.len() {
+        let pos = tcx.r_pos[k];
+        let x = tcx.r_def[k];
+        let mut at: usize = 0;
+        while at < cands.len() && cands[at] != x {
+            at += 1;
+        }
+        // (its definition and its imports are no uses, nor its own calls
+        // of itself)
+        if at == cands.len() || (tcx.r_flags[k] & (QF_DEF | QF_USE)) != 0
+            || (pos >= pcx.defs[x as usize].start && pos < pcx.defs[x as usize].end) {
+            continue;
+        }
+        uses[at] += 1;
+        if !in_dropped(pos, fx) {
+            left[at] += 1;
+        }
+    }
+    let mut unused: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for at in 0..cands.len() {
+        if uses[at] > 0 && left[at] == 0 {
+            unused.push(cands[at]);
+        }
+    }
+    if unused.len() == 0 {
+        return;
+    }
+    let e = diag(c"note", c"refactor.unused", tcx);
+    put_count(e, unused.len() as i64, c"item has", c"items have");
+    buf_str(e, c" no use left in the program:");
+    for i in 0..unused.len() {
+        buf_str(e, if i == 0 { c" " } else { c", " });
+        buf_bytes(e, sym_text(pcx.defs[unused[i] as usize].fqn, pcx));
+        buf_str(e, c" (");
+        put_loc(e, pcx.defs[unused[i] as usize].name_pos, pcx);
+        buf_byte(e, b')');
+    }
+    buf_byte(e, b'\n');
+    for i in 0..unused.len() {
+        if i == 6 {
+            break;
+        }
+        let out = diags(tcx);
+        buf_str(out, c"try:");
+        put_cword(out, pcx.prog);
+        buf_str(out, c" edit delete");
+        put_word(out, sym_text(pcx.defs[unused[i] as usize].fqn, pcx));
+        put_root(out, tcx);
+        try_end(out);
+    }
+}
+
+fn fold_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
+    wgx: &mut WgslCx<Arena<Gpa>>) -> i64 {
+    set_command(c.line, tcx);
+    pcx.prog = c.prog();
+    tcx.tool = c"refactor";
+    tcx.sub = c"fold";
+    let mut root = 0 as *const u8;
+    let mut words: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut opts: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let example = c"NAME --as true --dry-run";
+    if !take_args(c, shape_options("fold"), &mut root, &mut words, &mut opts, tcx, pcx) {
+        return 2;
+    }
+    let value_text = opt(opts.as_slice(), c"--as", false);
+    if words.len() != 1 || value_text == 0 as *mut u8 {
+        return usage_error(
+            c"a function NAME and the value its calls have now: --as true, --as false",
+            example, tcx, pcx);
+    }
+    let vt = c_slice(value_text);
+    if vt != b"true" && vt != b"false" {
+        return usage_error(c"--as takes true or false", example, tcx, pcx);
+    }
+    let name = c_slice(words[0] as *mut u8);
+    tcx.root_given = root;
+    root = root_or_diag(root, tcx.sub, &name, true, tcx, pcx);
+    if root == 0 as *const u8 {
+        return 2;
+    }
+    let mut status: i64 = 0;
+    let d = load_and_find(root, &name, (1 << K_FN) | (1 << K_METHOD), c"function", &mut status,
+        tcx, pcx, wgx);
+    if d < 0 {
+        return status;
+    }
+    let fqn = sym_text(pcx.defs[d as usize].fqn, pcx);
+    let program_end = tcx.program_end;
+    let mut group: Vec<i64, Comp> = Vec::new_in(Comp {});
+    group.push(d);
+    let mut calls: Vec<i64, Comp> = Vec::new_in(Comp {});
+    calls_of(group.as_slice(), &mut calls, tcx, pcx);
+    let mut fx: Fold<Comp> = Fold {
+        site: Vec::new_in(Comp {}), as_true: vt == b"true", levels: Vec::new_in(Comp {}),
+        dropped: Vec::new_in(Comp {}),
+    };
+    for _ in 0..program_end + 1 {
+        fx.site.push(0);
+    }
+    // The calls: not one whose arguments call functions (they would no
+    // longer run), nor an operator's.
+    let mut sites: i64 = 0;
+    let mut kept: i64 = 0;
+    let mut kept_at: i64 = -1;
+    for i in 0..calls.len() {
+        let n = calls[i];
+        let k = pk(n, pcx);
+        let mut plain = (k == NodeKind::Call || k == NodeKind::MethodCall) && n < program_end;
+        for a in 0..pcount(n, pcx) {
+            let arg = pchild(n, a, pcx);
+            plain = plain && !has_call(pstart(arg, pcx), pend(arg, pcx), pcx);
+        }
+        if plain && k == NodeKind::MethodCall {
+            plain = !has_call(pstart(pa(n, pcx), pcx), pend(pa(n, pcx), pcx), pcx);
+        }
+        if !plain {
+            kept += 1;
+            if kept_at < 0 {
+                kept_at = pstart(n, pcx);
+            }
+            continue;
+        }
+        fx.site[n as usize] = 1;
+        sites += 1;
+    }
+    if kept > 0 {
+        let e = diag(c"warning", c"refactor.fold", tcx);
+        put_count(e, kept, c"call", c"calls");
+        buf_str(e, c" of ");
+        buf_bytes(e, fqn);
+        buf_str(e, if kept == 1 { c" is left: its" } else { c" are left: their" });
+        buf_str(e, c" arguments call functions, which the constant would not; first: ");
+        put_loc(e, kept_at, pcx);
+        buf_byte(e, b'\n');
+    }
+    if sites == 0 {
+        let e = diag(c"note", c"refactor.fold", tcx);
+        buf_bytes(e, fqn);
+        buf_str(e, c" has no call to fold\n");
+        return 0;
+    }
+    fx.levels = slot_levels(1, program_end, pcx);
+    callee_levels(1, program_end, &mut fx.levels, pcx);
+    // The outermost expression or block holding each call (a function's
+    // body, an initializer): folded once, one edit.
+    let mut parent: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for _ in 0..program_end + 1 {
+        parent.push(0);
+    }
+    // (from the bodies of the functions and the values of the constants
+    // and statics down: the parser leaves nodes that are in no item, a
+    // statement it then took as its block's value)
+    let mut kids: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut lv: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut stack: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for n in 1..program_end {
+        let k = pk(n, pcx);
+        if (k == NodeKind::Fn || k == NodeKind::Const || k == NodeKind::Static) && pc(n, pcx) > 0
+            && pc(n, pcx) < program_end {
+            stack.push(pc(n, pcx));
+        }
+    }
+    while stack.len() > 0 {
+        let n = stack.pop().unwrap();
+        kids.clear();
+        lv.clear();
+        expr_slots(n, &mut kids, &mut lv, pcx);
+        for i in 0..kids.len() {
+            let kid = kids[i];
+            if kid > 0 && kid < program_end && kid != n && parent[kid as usize] == 0 {
+                parent[kid as usize] = n;
+                stack.push(kid);
+            }
+        }
+    }
+    let mut tops: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut done_start: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut done_end: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut done_text: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for i in 0..calls.len() {
+        if fx.site[calls[i] as usize] == 0 {
+            continue;
+        }
+        let mut top = calls[i];
+        let mut steps: i64 = 0;
+        while parent[top as usize] > 0 && steps < 100000 {
+            top = parent[top as usize];
+            steps += 1;
+        }
+        let mut seen = false;
+        for j in 0..tops.len() {
+            seen = seen || tops[j] == top;
+        }
+        if !seen {
+            tops.push(top);
+        }
+    }
+    for i in 0..tops.len() {
+        let top = tops[i];
+        let t = folded(top, &mut fx, pcx);
+        if t == UNCHANGED {
+            continue;
+        }
+        let text = if t == GONE { source(0, 0) } else { t };
+        edit_replace(pstart(top, pcx), pend(top, pcx), text, pcx);
+        done_start.push(pstart(top, pcx));
+        done_end.push(pend(top, pcx));
+        done_text.push(text);
+    }
+    // (the imports the fold leaves unused go, as a rewrite's)
+    let imports = crate::tools::rewrite::after::drop_unused_imports(done_start.as_slice(),
+        done_end.as_slice(), done_text.as_slice(), pcx);
+    if imports > 0 {
+        let e = diag(c"note", c"rewrite.imports", tcx);
+        buf_str(e, c"removed ");
+        put_count(e, imports, c"import", c"imports");
+        buf_str(e, c" the fold left unused\n");
+    }
+    note_unused(d, &fx, tcx, pcx);
+    let what = buf_new();
+    buf_str(what, c"folded ");
+    put_count(what, sites, c"call", c"calls");
+    buf_str(what, c" of ");
+    buf_bytes(what, fqn);
+    buf_str(what, c" as ");
+    buf_bytes(what, &vt);
+    buf_str(what, c" in ");
+    buf_int(what, tops.len() as i64);
+    buf_str(what, if tops.len() == 1 { c" item" } else { c" items" });
+    apply_edit(&buf_copy(what), root, tcx, pcx)
+}

@@ -1,0 +1,208 @@
+// (0.30) `volec rewrite --from FILE [--in X]... [--not-in X]... [--force]
+// [--dry-run] [--no-check] [--root R]`: the rewrites of FILE, a line each,
+// applied in order (each to the program as the ones before left it) and
+// checked once, at the end: one edit, all or nothing.
+//
+// A line is `PATTERN -> REPLACEMENT`, or with TABs `PATTERN<TAB>
+// REPLACEMENT[<TAB>OPTIONS]` (a pattern that has ` -> ` of its own, a
+// closure's result type, takes the TABs); OPTIONS are that line's
+// (`--where '$v: T'`, `--in X`, `--subst P R`), split as sh splits them.
+// A line that is empty or starts with `#` is none. The command's own
+// --in, --not-in and --force go to every line.
+//
+// Each line is a step of refactor --script's machinery (script.vl:
+// run_steps): `rewrite PATTERN REPLACEMENT OPTIONS`.
+
+use std::alloc::Arena;
+
+use crate::base::{buf_byte, buf_bytes, buf_copy, buf_int, buf_new, buf_str};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::cli::line::{Call, EV_FLAG, EV_OPTION, EV_WORD};
+use crate::front::embed::wgsl::WgslCx;
+use crate::tools::ctx::Tcx;
+use crate::tools::edit::apply::set_command;
+use crate::tools::edit::cli::take_edit_event;
+use crate::tools::proc::{buf_cstr, read_file_if};
+use crate::tools::query::{c_slice, root_or_diag};
+use crate::tools::query::diagnostics::diag;
+use crate::tools::script::{format_error, run_steps, split_words};
+
+fn word(text: &[u8]) -> i64 {
+    let b = buf_new();
+    buf_bytes(b, text);
+    buf_cstr(b) as i64
+}
+
+// text without the spaces around it.
+fn trimmed(text: &[u8]) -> &[u8] {
+    let mut a: usize = 0;
+    let mut b = text.len();
+    while a < b && (text[a] == b' ' || text[a] == b'\t' || text[a] == b'\r') {
+        a += 1;
+    }
+    while b > a && (text[b - 1] == b' ' || text[b - 1] == b'\t' || text[b - 1] == b'\r') {
+        b -= 1;
+    }
+    &text[a..b]
+}
+
+// Where ` -> ` is in line, when it is there once; -1 when it is not there,
+// -2 when it is there several times.
+fn arrow(line: &[u8]) -> i64 {
+    let mut at: i64 = -1;
+    let mut i: usize = 0;
+    while i + 4 <= line.len() {
+        if line[i] == b' ' && line[i + 1] == b'-' && line[i + 2] == b'>' && line[i + 3] == b' ' {
+            if at >= 0 {
+                return -2;
+            }
+            at = i as i64;
+        }
+        i += 1;
+    }
+    at
+}
+
+fn bad_line(file: *const u8, line: i64, message: *const u8, tcx: &mut Tcx<Comp>) -> i64 {
+    format_error(c"rewrite.from", file, line, message, tcx);
+    2
+}
+
+pub fn run_from(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
+    wgx: &mut WgslCx<Arena<Gpa>>) -> i64 {
+    set_command(c.line, tcx);
+    pcx.prog = c.prog();
+    let mut root = 0 as *const u8;
+    let mut file = 0 as *const u8;
+    // (the options every line gets)
+    let mut shared: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for e in c.evs.iter().copied() {
+        let mut ev = e;
+        if ev.kind == EV_OPTION && ev.name == "from" {
+            file = ev.value;
+            continue;
+        }
+        if ev.kind == EV_OPTION && (ev.name == "in" || ev.name == "not-in") {
+            shared.push(if ev.name == "in" { c"--in" } else { c"--not-in" } as i64);
+            shared.push(ev.value as i64);
+            continue;
+        }
+        if ev.kind == EV_FLAG && ev.name == "force" {
+            shared.push(c"--force" as i64);
+            continue;
+        }
+        if take_edit_event(&mut ev, &mut root, tcx, pcx) {
+            continue;
+        }
+        if ev.kind == EV_WORD && root == 0 as *const u8 && crate::base::is_source_path(ev.value) {
+            root = ev.value;
+            continue;
+        }
+        let d = diag(c"error", c"rewrite.usage", tcx);
+        buf_str(d, c"'");
+        buf_str(d, ev.value);
+        buf_str(d, c"' with --from: the patterns and their options (--where, --subst) are FILE's lines, `PATTERN -> REPLACEMENT` or PATTERN<TAB>REPLACEMENT<TAB>OPTIONS; the command takes --in, --not-in, --force, --dry-run, --no-check, --root\n");
+        return 2;
+    }
+    if file == 0 as *const u8 {
+        let d = diag(c"error", c"rewrite.usage", tcx);
+        buf_str(d, c"--from takes a FILE of `PATTERN -> REPLACEMENT` lines\n");
+        return 2;
+    }
+    tcx.root_given = root;
+    root = root_or_diag(root, c"rewrite", &c_slice(file), false, tcx, pcx);
+    if root == 0 as *const u8 {
+        return 2;
+    }
+    let text = buf_new();
+    if !read_file_if(file, text) {
+        let d = diag(c"error", c"rewrite.from", tcx);
+        buf_str(d, c"cannot read '");
+        buf_str(d, file);
+        buf_str(d, c"'\n");
+        return 2;
+    }
+    let t = buf_copy(text);
+    let mut steps: Vec<Vec<i64, Comp>, Comp> = Vec::new_in(Comp {});
+    let mut inputs: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut bodies: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut numbers: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut i: usize = 0;
+    let mut number: i64 = 0;
+    while i < t.len() {
+        let mut e = i;
+        while e < t.len() && t[e] != b'\n' {
+            e += 1;
+        }
+        let line = &t[i..e];
+        i = e + 1;
+        number += 1;
+        let bare = trimmed(line);
+        if bare.len() == 0 || bare[0] == b'#' {
+            continue;
+        }
+        // PATTERN, REPLACEMENT and the line's options.
+        let mut words: Vec<i64, Comp> = Vec::new_in(Comp {});
+        words.push(c"rewrite" as i64);
+        let mut tab: usize = 0;
+        while tab < line.len() && line[tab] != b'\t' {
+            tab += 1;
+        }
+        if tab < line.len() {
+            let mut tab2 = tab + 1;
+            while tab2 < line.len() && line[tab2] != b'\t' {
+                tab2 += 1;
+            }
+            let pattern = trimmed(&line[..tab]);
+            let replacement = trimmed(&line[tab + 1..tab2]);
+            if pattern.len() == 0 || replacement.len() == 0 {
+                return bad_line(file, number,
+                    c"a line is PATTERN<TAB>REPLACEMENT[<TAB>OPTIONS], neither empty", tcx);
+            }
+            words.push(word(pattern));
+            words.push(word(replacement));
+            if tab2 < line.len() && !split_words(&line[tab2 + 1..], &mut words) {
+                return bad_line(file, number, c"a quote of the line's options is not closed", tcx);
+            }
+        } else {
+            let at = arrow(line);
+            if at < 0 {
+                return bad_line(file, number,
+                    if at == -1 { c"no ` -> ` between PATTERN and REPLACEMENT (or a TAB)" }
+                    else { c"several ` -> `: put a TAB between PATTERN and REPLACEMENT" }, tcx);
+            }
+            let pattern = trimmed(&line[..at as usize]);
+            let replacement = trimmed(&line[at as usize + 4..]);
+            if pattern.len() == 0 || replacement.len() == 0 {
+                return bad_line(file, number, c"a line is `PATTERN -> REPLACEMENT`, neither empty",
+                    tcx);
+            }
+            words.push(word(pattern));
+            words.push(word(replacement));
+        }
+        for k in 0..shared.len() {
+            words.push(shared[k]);
+        }
+        steps.push(words);
+        inputs.push(0);
+        bodies.push(-1);
+        numbers.push(number);
+    }
+    if steps.len() == 0 {
+        let d = diag(c"note", c"rewrite.from", tcx);
+        buf_str(d, c"no patterns in '");
+        buf_str(d, file);
+        buf_str(d, c"'\n");
+        return 0;
+    }
+    let label = buf_new();
+    buf_str(label, c"rewrite --from ");
+    buf_str(label, file);
+    buf_str(label, c": ");
+    buf_int(label, steps.len() as i64);
+    buf_str(label, if steps.len() == 1 { c" pattern" } else { c" patterns" });
+    buf_byte(label, 0);
+    run_steps(file, &steps, inputs.as_slice(), bodies.as_slice(), numbers.as_slice(), root,
+        crate::base::buf_ptr(label), c.gpa, tcx, pcx, wgx)
+}

@@ -605,6 +605,12 @@ offered. The Edit tool on the file works as before (`query def` and
 `compiler/std/embed.sh` (the commit hook does too). What follows is the
 old std's, 0.17 to 0.27, and comes back with the files read as modules.
 
+(0.30) A typed rewrite does reach std's files: `volec rewrite PAT REPL
+--in std` (`--in std::vec`, `--in compiler/std/vec.vl`) matches in them,
+checks the program with their new texts and writes them as one edit;
+`embed.sh` and the build are then the caller's
+([refactor-shape.md](refactor-shape.md), "std's files").
+
 In the vole repository (`compiler/std/` with its `embed.sh`, from the
 current directory or one of the three above it), an edit whose target
 is a std item (`edit patch std::trim`, `edit insert --after Vec::swap`,
@@ -1051,8 +1057,18 @@ of a longer word of letters and digits (`_`, `.`, `-` end a word, so
 VOLE_ROOT and `_vole.` have the word vole, `volec` has not).
 `--case`: OLD in any case, and NEW in the case of each match (`vole`,
 `Vole`, `VOLE` become `vole`, `Vole`, `VOLE`; a mixed case is
-noted). `--regex`: OLD is rewrite's regular expression (`^ $ . * + ?
-[a-z] \d \w`), within a line. In a vole source, `--comments`,
+noted). `--regex`: OLD is rewrite's regular expression, within a line.
+The dialect (0.30; `rewrite --help` says it): a byte is itself, `.` any
+byte, `[a-z_]` and `[^...]` classes, `\d` a digit, `\w` a name's byte,
+`\s` a space or a tab, `\x` the byte x (`\(`, `\.`, `\$`, `\|`); `*`, `+`,
+`?` after any of them or after a group (the longest first); `( )` a
+group and `|` between alternatives (0.30: before it a parenthesis was a
+byte); `^` at the start of the expression or of an alternative is the
+line's start, `$` at the end of one its end. In NEW, `\1` to `\9` (or
+`$1`) are the groups of the match, by their `(`, and `\0` the match:
+`'^fn (\w+)\((mut )?cx: Ctx' 'fn \1(\2cx: &mut Ctx'`. A malformed OLD is
+`error rewrite.usage` saying what is wrong (an unclosed `(`, a `*` with
+nothing to repeat), and so is a NEW that names a group OLD has not. In a vole source, `--comments`,
 `--strings` (an f-string's text too) and `--code` take only the matches
 there, as the lexer reads the file, and only sources; `--no-sources` the
 other files only. `--move-paths` also moves a file whose path has OLD
@@ -1190,7 +1206,12 @@ every command.
   [query.md](query.md), Known limits).
 - Phase 2 (0.11): `refactor signature`, `field`, `variant`, the typed
   `rewrite` and `refactor --script` are in
-  [refactor-shape.md](refactor-shape.md); `refactor rename`, `move`,
+  [refactor-shape.md](refactor-shape.md) (0.30 there: `rewrite`'s
+  holes for a field's and a method's name and a literal's text, the
+  sites inside the function a replacement calls refused, `--not-in`,
+  `--at-errors`, `--from FILE`, std's files; `refactor field --type`
+  with several fields, `--allocator` and `--rewrite`; `refactor
+  signature --batch`; `refactor fold`); `refactor rename`, `move`,
   `new-module`, `move-module`, `split` in
   [refactor-modules.md](refactor-modules.md); all on this engine
   (`edit_replace`, `edit_new_file`, `apply_edit` in
