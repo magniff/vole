@@ -835,11 +835,13 @@ as one root module.
 ### The standard library
 
 The module `std` is built into the compiler, read when a program names it
-(`std::Vec<i64>`, `use std::{Buf, Vec};`): `Option<T>` and `Result<T, E>` (`is_some`,
-`unwrap`, `unwrap_or`, `ok`...), `Vec<T>` (`new`, `with_capacity`, `push`,
-`pop`, `get` and `set` checked like a slice's index, `len`, `as_slice`,
-`clear`, `free`), `Buf` (a byte buffer: `push`, `push_str`, `push_cstr`,
-`push_int`, `as_slice`), and `print`, `println`, `print_int`, `print_cstr`.
+(`std::collections::HashMap`, `use std::fs;`, or a name of the prelude:
+`volec guide modules#paths-and-use`). Since 0.28.0 it is
+Rust's API with allocation as a capability: `Option<T>` and `Result<T, E>`,
+`Vec<T, A>`, `String<A>`, `Box<T, A>`, `HashMap<K, V, A, S>`, the
+iterators, `print`, `println`, `format_in`, std::fs, std::io and the
+rest. (0.5's std, `Vec<T>` with `get` and `set`, the byte buffer `Buf`,
+`print_int` and `print_cstr`, went with the old std in 0.28.0.)
 Failures (`unwrap` of `None`, an index out of bounds) write a message to
 stderr and exit with 101. Its source is `compiler/std/std.vl` (0.15:
 with the files `compiler/std/embed.sh` appends to it); the
@@ -1573,7 +1575,7 @@ block, `r"..."`) that is the first argument of a format function: Rust's
 | `print`, `println`, `eprint`, `eprintln`, `format_args` | after the literal |
 | `format_in` | after the literal; the allocator stays last: `format_in("{} {x}", a.b, gpa)`, a `String<A>` on it (0.26.3; a `Buf` before) |
 | `panic`, the message of `assert` and `debug_assert` | after the literal |
-| the methods `String::push_fmt`, `Buf::push_fmt`, `Fmt::write` | after the literal |
+| `write(f, ..)` and `writeln(f, ..)` on a `Formatter` or any `fmt::Write` | after the literal |
 | a contract's `else` | `requires c else "len {}", v.len()` |
 
 A function of the program is none: it takes `format_args("..", ..)`, a
@@ -1605,7 +1607,7 @@ the text not doubled is `format.syntax`; a spec not of this grammar is
 takes, or a hole with no argument, is `format.args`.
 
 The meaning is rustc's, byte for byte: `{}` is `Display::fmt`, `{:?}`
-`Debug::fmt_debug`; `x X o b` take integers, `e E` integers and floats, as Rust's do; `+`
+`Debug::fmt` (0.15 to 0.27: `Debug::fmt_debug`); `x X o b` take integers, `e E` integers and floats, as Rust's do; `+`
 signs a number, `#` writes `0x`, `0o`, `0b`; `0` pads a number with
 zeros after its sign and prefix; text is left-aligned and numbers
 right-aligned by default; the fill is any byte; `p` writes a pointer as
@@ -1814,11 +1816,11 @@ parameter, which is raw (0.18.1). `&x` where `&mut T`
 is wanted is an error naming `&mut x`. A place reached through a raw
 pointer still gives a raw pointer (`&*p` gives a reference). Function
 attributes `#[views(a, *b)]` and `#[stores(c)]` declare a view summary.
-(Phase 0: what the own pass checks of them comes with its tasks.)
+(The own pass that was to check them is gone, 0.28.0.)
 
 **Moves, drops and the checks** (value semantics, T1–T3, T7;
 [design/value-semantics.md](design/value-semantics.md) §2). A value of
-an owned type (a `Vec`, `Buf`, `HashMap`, a type with `Drop`, a struct
+an owned type (a `Vec`, `String`, `Box`, `HashMap`, a type with `Drop`, a struct
 holding one) moves on `=`, a by-value argument and `return`, and is
 dropped at the end of its scope; views (slices, references) cannot
 outlive or alias against what they view. These checks (the borrow
@@ -1826,7 +1828,8 @@ checker's) and the drops are always on (0.28.0: `--values` and its
 opt-outs are gone with the own pass). `v.free()` stays legal (`free` frees now and
 leaves the container empty) and is no longer needed.
 
-**The prelude** gains `Buf`, `HashMap`, `read_line`, `read_stdin_in`,
+**The prelude** (0.17 to 0.27; since 0.28.0 Rust's prelude, with `Gpa`
+and `FixedState`: `volec guide modules#paths-and-use`) gains `Buf`, `HashMap`, `read_line`, `read_stdin_in`,
 `Scanner`, `parse_int`, `trim`, `split_in`, `split_whitespace_in`,
 `sort`, `sort_by`, the stable sorts (`sort_stable`, `sort_stable_by`,
 `sort_stable_in`, `sort_stable_by_in`), `cmp_of`, `eq_of`, `Fmt`, `panic` and `unreachable`
@@ -1842,8 +1845,8 @@ source sees the prelude too (`None`, `Ok(x)` inside std).
 unreachable code". Both are safe; their effect is
 `panic`. `std::panic` is still the `unsafe fn` taking a C string.
 
-**Indexing a Vec or a Buf.** `v[i]`, `v[i] = x`, `v[i] += x` and
-`v[a..b]` on std's `Vec` and `Buf` are `v.as_slice()[i]` (and so on):
+**Indexing a Vec** (and, until 0.28.0, a Buf). `v[i]`, `v[i] = x`, `v[i] += x` and
+`v[a..b]` on std's `Vec` are `v.as_slice()[i]` (and so on):
 checked, a place to assign without `mut` (as a slice's element is); the
 slice is valid until the Vec grows or is freed. A `HashMap` is not
 indexed (`m.get(k)` is an Option: Rust's `m[k]` panics). On any pointer
@@ -1889,7 +1892,7 @@ length; both are a `usize` (0.26.2). (0.29) A slice has no fields, as
 in Rust: `s.len` and `s.ptr` are errors that name the methods
 (`s.len()`, `s.as_ptr()`, `s.as_mut_ptr()`), and `volec fix
 --suggested` writes them. The other way round, `a.len` on such
-an array is its length, and `v.len` on std's `Vec`, `Buf` and `HashMap`
+an array is its length, and `v.len` on std's `Vec`, `String` and `HashMap`
 (whose `len` field is private, or which have none) is `v.len()`: a read
 only; `v.len = n` and `&v.len` are still errors.
 
