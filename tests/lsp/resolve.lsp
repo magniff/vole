@@ -55,7 +55,7 @@
 > {"jsonrpc":"2.0","id":24,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":80,"character":4}}}
 < {"jsonrpc":"2.0","id":24,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/fmt.vl","range":{"start":{"line":101,"character":7},"end":{"line":101,"character":14}}}}
 > {"jsonrpc":"2.0","id":25,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":80,"character":4}}}
-< {"jsonrpc":"2.0","id":25,"result":{"contents":{"kind":"markdown","value":"```vole\npub fn println<T: Display>(x: T)\neffects: per instance (none checked)\nfeatures: none\n```\n\nx and a newline on stdout.\nlater: format_fns\n\n`std::fmt::println` (fn)\n"},"range":{"start":{"line":80,"character":4},"end":{"line":80,"character":11}}}}
+< {"jsonrpc":"2.0","id":25,"result":{"contents":{"kind":"markdown","value":"```vole\npub fn println<T: Display>(x: T)\neffects: per instance (none checked)\nfeatures: none\n```\n\nx and a newline on stdout, in one write when the line is short: lines\nprinted by several threads at once are not mixed (std::__rt::PrintOut).\nlater: format_fns\n\n`std::fmt::println` (fn)\n"},"range":{"start":{"line":80,"character":4},"end":{"line":80,"character":11}}}}
 > {"jsonrpc":"2.0","id":26,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":73,"character":24}}}
 < {"jsonrpc":"2.0","id":26,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/vec.vl","range":{"start":{"line":395,"character":11},"end":{"line":395,"character":19}}}}
 ## std::thread, std::cli, std::gpu through their paths and methods

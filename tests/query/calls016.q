@@ -16,17 +16,17 @@ $ callees main --transitive --limit 3
 1	call	add_and_sum	calls016/main.vl:6
 1	call	apply	calls016/main.vl:21
 1	call	sum	calls016/main.vl:11
-note query.truncated: showing 3 of 247 callees
+note query.truncated: showing 3 of 249 callees
 try: volec query callees main --transitive --all
 $ callees main
 1	call	add_and_sum	calls016/main.vl:6
 1	call	apply	calls016/main.vl:21
 1	call	sum	calls016/main.vl:11
 1	ref	twice	calls016/main.vl:25
-1	call	std::__rt::io_out	<std>:33451
+1	call	std::__rt::PrintOut::end	<std>:64717
+1	call	std::__rt::PrintOut::new	<std>:64706
 1	call	std::fmt::Formatter::new	<std>:14563
 1	call	std::fmt::print	<std>:15167
-1	call	std::io::stdout	<std>:20133
 ## main reaches a borrow of TABLE (put takes it by pointer) and a write of
 ## a field of it; sum reaches neither.
 $ callees main --writes TABLE

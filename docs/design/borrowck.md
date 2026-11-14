@@ -137,10 +137,12 @@ same root, is computed componentwise from the root over `proj(P)` and
 - `Q`'s exhausted first: `Extends` (`Q` is a strict prefix of `P`),
   remembering `e`, the first projection of `P` beyond `Q`, and its
   base's type `type(Q)`;
-- `PJ_FIELD k` vs `PJ_FIELD k'` with `k ≠ k'`: `Disjoint`; `PJ_CONST
-  k` vs `PJ_CONST k'` with `k ≠ k'`: `Disjoint`; `PJ_VARIANT v` vs
-  `PJ_VARIANT v'` with `v ≠ v'`: `Disjoint`; `PJ_INDEX _` vs `PJ_INDEX
-  _` or vs `PJ_CONST _`: *may alias*, continue as if equal (R7);
+- `PJ_FIELD k` vs `PJ_FIELD k'` with `k ≠ k'`: `Disjoint`; `PJ_VARIANT
+  v` vs `PJ_VARIANT v'` with `v ≠ v'`: `Disjoint`; `PJ_CONST k` vs
+  `PJ_CONST k'`, `PJ_INDEX _` vs `PJ_INDEX _` or vs `PJ_CONST _`: *may
+  alias*, continue as if equal, whatever the indexes hold (rustc's
+  E0499 for `&mut a[0]` and `&mut a[1]`; 0.30, R7 closed); a definite
+  question (`rel_def`) takes distinct constants as disjoint;
   `PJ_UNION k` vs `PJ_UNION k'`: continue as if equal (a union's fields
   overlap); `PJ_DEREF` vs `PJ_DEREF`: continue; any other pair of
   different kinds does not occur (the type fixes the kind).
@@ -925,6 +927,16 @@ D3.6).
   rehearsal's F4). `Cloned<I>` is the same. *Anchor:* `places/regions.vl:
   proj_bound, unnamed_param, bound_at`. *Cases:* `rust_b_ok_copied_items`,
   `rust_b_copied_items_err`.
+  (0.30) The same parameter in a closure's bound, `fold`'s `F: FnMut(B,
+  Self::Item) -> B` on `Copied<I>`: D19.10 (4) reads the closure's
+  signature with the bound, and its `Self::Item` slot is `T`'s; the
+  universal of `T`'s slot is made by the bound's ties, so they come first
+  (`sig_compute`: bound_ties, then subst_requirements), and one a bound's
+  result alone gives (`B` of `Map<I, F>`, from `F: FnMut(I::Item) -> B`)
+  is made where the closure's signature names it. Before, neither had a
+  universal and the closure's `|acc, p| p` requirement was dropped: a use
+  after free in safe code. *Cases:* `rust_b_err_adapter_item_copied`,
+  `rust_b_err_adapter_item_map`, `rust_b_err_adapter_item_user`.
 
 ## 5. Variance (S5)
 
@@ -1230,7 +1242,8 @@ temporary): an `OK_MOVE` of it is M3's `borrowck.move_out`, rustc E0508
 element of an array or a slice; through `Vec`'s `index` it is E0507 as
 before. What stays allowed: a move of the whole array; a borrow of an
 element (`&a[0]`, `&mut a[i]`); a read of a `Copy` part (`a[0].v`); a
-constant index of a `Copy` element, which keeps its path (R7, D1.5).
+constant index of a `Copy` element, which keeps its path (D1.5; its
+loans conflict with any other index's since 0.30, R7).
 A by-value `for x in a` over an array of non-`Copy` elements stays
 F22.1's by-reference reading until std2 has an array `IntoIter` (one
 that drops what a `break` leaves): an index loop cannot move them out.
@@ -1461,13 +1474,22 @@ outside the holes named below.
   reference result, and a call of a generic parameter's method or of a
   closure is a direct call in the instance. *What remains of R6* is
   D20.5's identity of `fn` items above: the value's own signature is not
-  compared with the bound's.
-- R7 Constant index projections `P[k]` vs `P[k']` with `k ≠ k'` are
-  disjoint (D1.5), so `&mut a[0]` and `&mut a[1]` may coexist on an
-  array and through a `&mut [T]`; rustc rejects both (only slice
-  patterns are disjoint there). Sound, since the elements do not
-  overlap, and more permissive. `P[i]` vs `P[j]` by locals may alias,
-  as rustc.
+  compared with the bound's. (0.30) An instance's flows made by a call
+  through a `fn` value are its own to judge, not exempted as a pair of
+  substitutions (D4.4 (g)): a fn item whose result borrows from its
+  argument, given for `F: Fn(&T) -> R`, is `borrowck.outlives` at the
+  call in the instance (rustc: E0308 at the caller), where before it let
+  the result outlive the argument (case `rust_b_err_fn_item_bound_result`).
+  Stricter than rustc for a fn item whose result is `'static` (the erased
+  type says every argument region outlives every result region).
+- R7 Constant index projections `P[k]` vs `P[k']` with `k ≠ k'` were
+  disjoint (D1.5), so `&mut a[0]` and `&mut a[1]` could coexist on an
+  array and through a `&mut [T]`, and so could `a[i]` and `a[j]` by
+  locals holding distinct constants; rustc rejects them all (only slice
+  patterns are disjoint there). *Closed in 0.30*: two indexes may
+  alias, as rustc's (cases `rust_b_err_const_index_disjoint`,
+  `rust_b_err_view_mut_const_index`, `rust_b_err_index_mut_twice`,
+  `rust_b_err_index_assign_vs_shared`).
 - R8 Moving out of `*b` for a `Box` is `borrowck.move_out` (M3): no
   `DerefMove` (rustc allows it for `Box` only). A strictness in effect;
   listed with R-ids as the delta named it.

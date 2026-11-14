@@ -15,7 +15,8 @@ of an `unsafe fn`, as in Rust:
   `*p`;
 - reading or writing a `static mut` (error `unsafe`, rustc's E0133); a plain `static`
   is safe to read;
-- reading a union's field.
+- reading a union's field, or borrowing one (`&u.f`, `&mut u.f`: rustc's
+  E0133); writing one (`u.f = v`) and `&raw const u.f` are safe.
 
 `*const T` and `*mut T` are raw pointers: nothing checks what they point
 to. Making, passing, comparing and casting one is safe, an integer cast

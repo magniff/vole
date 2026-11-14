@@ -25,4 +25,4 @@ ok: wrote x.s
 ok: wrote x.s
 ok: wrote x.s
 % grep -c '\$pre' x.s
-5
+9

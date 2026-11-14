@@ -486,7 +486,7 @@ fn main() -> i32 {
 ```
 
 Unsafe operations: calling C or an `unsafe fn`, dereferencing a raw
-pointer (`*p`, `(*p).f`), using a `static mut`, reading a union field. A
+pointer (`*p`, `(*p).f`), using a `static mut`, reading or borrowing a union field. A
 reference (`&T`, `&mut T`) is safe to read and write through wherever it
 is kept; `*const T` and `*mut T` are raw. `volec fix --only unsafe`
 wraps what needs it; `#[repr(C)]`, callbacks and linking: `guide
