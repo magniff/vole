@@ -152,7 +152,7 @@ error edit.no-text: the new text is read from stdin; none was given
 try: volec edit replace geom::area < new.vl
 [exit 2]
 $ edit move geom::area
-error edit.usage: unknown command 'move' (patch, apply, replace, insert, delete, wrap, new-file, resolve)
+error edit.usage: unknown command 'move' (patch, apply, replace, insert, delete, wrap, new-file, resolve, justify)
 [exit 2]
 ## Undo, edit by edit; a file changed since is not undone (--force does).
 $ undo
@@ -167,10 +167,7 @@ $ undo
 error undo.empty: no edit to undo
 [exit 1]
 $ edit delete shapes::area --no-check
-main.vl:15:27: error[type error] no 'area' in module 'shapes'  [in crate::main]
 deleted crate::shapes::area	shapes.vl	+0 -4 lines
-warning edit.breaks: 1 new error (1 in crate::main, which the edit does not change); written anyway (--no-check); the error: main.vl:15:27: no 'area' in module 'shapes'
-try: volec check
 $ check
 main.vl:15:27: error[type error] no 'area' in module 'shapes'
 [exit 1]

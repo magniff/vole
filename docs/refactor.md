@@ -95,9 +95,15 @@ are not new: an edit of a program with errors is checked against them.
   with no context lines (`git apply --unidiff-zero` takes it), and says
   when it would add errors (`warning edit.breaks: N new errors (dry
   run)`, exit 1).
-- `--no-check` writes an edit that adds errors anyway (a signature
-  changed before its callers are), with `warning edit.breaks` and the
-  errors; `volec check` lists what is left.
+- `--no-check` writes the edit without checking it (a signature changed
+  before its callers are; a step of a bulk edit): no check runs and
+  nothing is listed (0.30; before, the check ran all the same, to print
+  `warning edit.breaks` and every new error, 3 to 10 s a step on the
+  compiler); `volec check` lists what is left when the steps are done.
+  A `--dry-run` with it still checks, and `fix` still reports what is
+  left. Steps of several commands with one check: a `volec batch`
+  file whose writing steps end in `--no-check` and whose last line is
+  `check` (one call: no step checks its edit, the last line checks once).
 - `--show` (0.12; every edit, fix, rewrite and refactoring) prints, after
   the summary line, the regions the edit changed as their new lines,
   numbered, so that the edit need not be read back:
@@ -345,6 +351,35 @@ pair adds) is one call, checked once after every pair is applied:
   text, the insertions mix with replacements in the same checked call,
   and the try: files of a refused pair are already pairs files.
 
+### Many small patches, one check: --at, --from (0.30)
+
+A check names positions, `FILE:LINE:COL`, not items; the fixes of fifty
+errors are fifty small patches, and a call for each paid fifty checks of
+the program. A patch by position looks for OLD on its line only:
+
+```sh
+$ volec edit patch --at main.vl:4 --old '0, 10' --new '1, 9' --at calc.vl:6 --old 'v > hi' --new 'v >= hi'
+patched 2 sites	2 files	+2 -2 lines
+```
+
+- `--at FILE:LINE`: OLD occurs once on that line (twice:
+  `patch.ambiguous` names the columns); `--at FILE:LINE:COL`: OLD starts
+  at that column, the one a diagnostic prints, and an empty OLD inserts
+  NEW there. The pairs after an `--at` are that line's.
+- `--from LIST` (`-`: stdin) reads the patches, one a line:
+  `FILE:LINE[:COL]<TAB>OLD<TAB>NEW`, with `\t`, `\n` and `\\` in OLD and
+  NEW for a tab, a newline and a backslash; blank lines and `#` lines
+  are skipped. `volec edit apply --at < LIST` is the same.
+- Every position is the text's before the edit, and every patch is
+  placed before any is written: one that does not match is named by its
+  number and position (`error patch.no-match: patch 3 (main.vl:5): OLD
+  'nothere' is not on that line: ...`), all of them, then `error
+  patch.sites: 3 of 5 patches do not match; nothing written
+  (--keep-going writes the 2 that do)`. With `--keep-going` the others
+  are written and the exit status is still 1.
+- One edit: one check at its end (`--no-check`: none), one journal
+  entry, one `undo`.
+
 ### insert --in
 
 `edit insert --in TARGET --after ANCHOR < TEXT` inserts TEXT's lines
@@ -451,6 +486,49 @@ output keep the cause.
   before another item's pairs), edit apply FILE; or this step alone
   with --no-check`, with the `--no-check` line as its `try:`.
 - **`--no-check`** is the last `try:`, as before.
+
+## edit justify (0.30)
+
+```sh
+volec edit justify FILE:LINE --unsafe TEXT --safety TEXT [ROOT]
+volec edit justify --from LIST            # -: stdin
+```
+
+Writes the comments of an unsafe site above it: `// UNSAFE: TEXT` (why
+it cannot be safe) and `// SAFETY: TEXT` (why it is sound), on the lines
+above the site's line, indented like it, the words wrapped at 100
+columns (a newline in TEXT starts a line). FILE:LINE is the site as
+`volec query unsafe` lists it; `query unsafe --unjustified --source`
+prints each site's lines under it, to write the texts from.
+
+```sh
+$ volec edit justify main.vl:2 --unsafe "the pointer is the caller's, raw" --safety 'every caller passes the address of a live i64' --show
+justified 1 site	main.vl	+2 -0 lines
+// main.vl:2-3
+2	    // UNSAFE: the pointer is the caller's, raw
+3	    // SAFETY: every caller passes the address of a live i64
+```
+
+- Several sites are one call: `FILE:LINE --unsafe .. --safety ..`
+  repeats, or `--from LIST`, a site a line,
+  `FILE:LINE<TAB>UNSAFE TEXT<TAB>SAFETY TEXT` (`\n`, `\t`, `\\` in the
+  texts; an empty text for a comment the site already has; `#` lines
+  skipped). Every line is the file's before the edit, so one `query
+  unsafe` run serves the whole list: the insertions do not move the
+  sites after them (0.29: 119 comments took eight regenerations of the
+  listing).
+- A site that cannot be justified so is named, `error edit.justify:
+  site 3 (main.vl:17): ...`, and nothing is written (`--keep-going`
+  writes the others, exit 1): no site starts on the line (the nearest
+  is named); the site still lacks a comment (only `--unsafe` given);
+  the audit would not count a comment above the line (a site in `} else
+  if unsafe { .. } {`, whose statement starts on the line that ends the
+  block before: write it by hand).
+- The audit's rules are unchanged: the command writes the text it is
+  given, and the result is checked with the audit's own reading of the
+  edited file. It does not narrow a block: shrinking an `unsafe { }`
+  around a whole body to the one expression that needs it is left to
+  `edit patch` (no `--narrow`).
 
 ## edit wrap
 
@@ -589,6 +667,17 @@ is one too: its `extern "C"` blocks (replace: the first becomes TEXT;
 with none, TEXT goes after the `use` lines; insert after the last or
 before the first).
 
+**Spans (0.30).** `edit replace NAME --to LAST < TEXT` and `edit delete
+NAME --to LAST` take NAME through LAST, a run of adjacent items of one
+file at one level (their comments with them), as one span: one edit, one
+check, where a step per item left the program broken between them. An
+impl block has no name: the `FILE:LINE` of its header line (`impl P {`)
+is the block, for `replace`, `delete` and `insert --after|--before`
+(that line once resolved to the type the impl is for, and `edit delete`
+took the struct); the comment lines above it stay unless TEXT brings
+its own. `edit delete` takes an item's comment lines and attributes
+with it (as it always did). tests/refactor/span0300.t.
+
 **Files and modules (0.17).** `edit replace FILE.vl < TEXT` replaces
 the whole file. `edit delete MODULE` (or `@@ delete MODULE`) removes its
 `mod` line and its file, and its children's files: one edit, one `undo`.
@@ -619,8 +708,23 @@ main.vl:13:25: error[type error] undefined variable 'twice' | help: add `use cra
 ```
 
 Exit 0 without errors (and then nothing is printed but warnings), 1 with
-them; at most 50 errors, as in a compilation. `--diagnostics=human`
-prints the long form. About 60 ms on the compiler's source (77,000
+them. `--diagnostics=human` prints the long form.
+
+(0.30) An error repeated at six sites or more (the same code and
+message) is one line, its first site's, counted:
+
+```
+main.vl:3:19: error[type error] undefined variable 'limit' (41 sites in 12 files, the first here; --each lists them) | help: add `use crate::conf::limit;`
+```
+
+and the plain `volec check` records up to 1000 sites and prints at most
+50 lines (then `error: N more errors not shown (M lines); --max-errors=0:
+all of them`), so that one name missing at 41 sites does not use up the
+list and hide the errors after it. `--each` prints every site on its
+own line; `--max-errors=N` stops after N sites as before (0: none) and
+prints every line of them, repeats folded. A `check` that names its form (`--diagnostics=short`,
+`--json`: the tools' own runs, the hooks, the tests) lists every site,
+at most 50, as before. About 60 ms on the compiler's source (77,000
 lines); 0.13: about 7 ms when the program has not changed since a
 command read it, from the tools' cache ([query.md](query.md#speed-the-cache-013)).
 
@@ -637,6 +741,7 @@ fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block→3 files→+3 
 |---|---|
 | `imports` | the `use` lines the errors for unknown names ask for (`help: add `use crate::m::name;``): merged into a `use` of that module when there is one, however its path is written (`use m::{a}` gains `, name`; `use m::a;` becomes `use m::{a, name};`), else a line after the module's last `use` (a child module's path relative when the module writes them so, 0.14); and 0.8's wildcard migration (`use a::*;` becomes the names it brings) |
 | `unused` | imports whose name is written nowhere else in their file, removed (the name of a list with its separator; the item when all go; `use p::{a}` left with one name becomes `use p::a`). `pub use` is kept |
+| `redundant` | (0.30) the imports of an item the prelude already gives its module (`warning use.redundant`, which `volec check` and the tools report, not a build: `use std::vec::Vec;`, `Gpa` in `use std::alloc::{Allocator, Gpa};`), removed as the unused ones are: they are used, so `unused` never saw them (0.29: none of 340 files' removed). An import of another item of a prelude name (`use std::fmt::Result;`), a renamed one and a `pub use` stay |
 | `pub` | `pub` on the items other modules use while they are private (`error ... is private`), and (0.26) on the fields of the program's structs they read, write or name in a literal (`field.private`, `field.literal-private`) |
 | `unsafe` | the unsafe operations outside unsafe code, wrapped in unsafe blocks (the outermost unit around each: a statement, `let p = unsafe { e };`, an expression); a function with several of them gets its whole body in one block, one level deeper, when its braces have lines of their own (0.12, the codebase's style; `--fix-unsafe` keeps 0.9's units) |
 | `unneeded-unsafe` | (0.25.4, asked for only) the unsafe blocks with nothing unsafe inside (`query unsafe`'s `none (unneeded)`) taken away, their code kept: a block on lines of its own becomes its lines, one level less indented; one on a line its code, in parentheses where the operators around it could bind otherwise (`2 * unsafe { a + b }` is `2 * (a + b)`); a statement in the middle of a block gets the `;` it ends with. A block is opened only when it is its block's last statement or declares nothing (`let`, `var`, `inout`, `defer`) at its own level, so names keep their scope and values their drops. (0.29) A block written over several lines where an expression stands (a function's whole body, a `let`'s value, an `if` or `while` condition, an operand) becomes its code too, and the edit engine lays the statement's lines out as `volec fmt` would; a block that declares is also opened when only a lone name or literal follows it in its block (nothing runs between the two ends); any other block that declares, one holding statements where an expression stands, and one on lines of its own with a string or comment over several lines loses the word `unsafe` alone (a plain `{ }` block, the same scope). Left, counted in the summary and each named with its reason (`note fix.unneeded-left: FILE:LINE: unsafe block left: WHY`): an expression holding a string or comment over several lines or ending in a `//` comment, one of a generated file, and one inside another taken away in the same run (the next run takes it); one whose comments say `UNSAFE:` or `SAFETY:` is not this fix's. The edit is checked as every fix is (docs/design/modernize-0254.md, step 1: 938 blocks of compiler/src, the corpus byte-identical by `same-output`) |
@@ -646,10 +751,18 @@ fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block→3 files→+3 
 | `tidy-imports` | (0.12) the `use` lines in the codebase's style: the paths of a module's child modules written as most of its `use` lines that could be written either way write them (0.14: relative, `use a::x;`, or from `crate`, `use crate::m::a::x;`; a tie, as the first), the `use` items of a module with one path (and one `pub`) merged where the first is, their names sorted (byte order) and each once, `use p::a;` for one, `use p::{a, b};` when the line fits in 100 columns, else wrapped four spaces in, a line per name imported under another name (`use p::a as b;`); a `use` with a comment on its lines, or sharing a line, is left as it is, and one with a comment right above it is not merged into another |
 | `reexports` | (0.12) every import and path that reaches an item through a re-export (a `pub use` of another module, or an ancestor's import: `use crate::f` where the root imports f) is written from the module that defines the item (`mod` lines on the way made `pub` when needed); then the re-exports nothing goes through any more are removed, or made private imports when their file still names them |
 
-| `suggested` | (0.18; `--suggested`) the fixes the compiler knows exactly, which an error marks with `try: volec fix --suggested ROOT`: the range of the source its fix replaces and the text, recorded with the error (base/diag.vl, `err_fix`), and the `imports` and `pub` fixes. Which: a did-you-mean (a variable, function, method, field, path member, argument name) when no other name is as near; a numeric conversion (`x as u8`), `n != 0` for a condition, `a[..]` for an array where a slice goes, `.as_slice()` of a Buf or Vec, `&x` (a simple value); `s.trim()` as `trim(s)` (std's function for a method it lacks; with `gpa` when the function's local `gpa` is the allocator); a 0.15 allocating form (`Vec::new()`, `format(x)`) as its `_in` form when the function has a local `gpa` (else `fix --only alloc016` threads one); a call missing arguments that locals of the parameters' names and types give (`parse_table(s)` becomes `parse_table(s, gpa)`); a module path written from the crate's root (`crate::table::f`, a `use` line's path); a Rust type with one spelling (`String`, `&str`: `[u8]`; `char`: `u8`; `usize`: `i64`); a Rust label (`'outer:`, `break 'outer`); `.len` of a sealed field read as `.len()`. A tie, a VALUE to fill in, a choice between fixes: no suggestion. A new error on a line the edit wrote refuses it (`edit.breaks`); new errors elsewhere are the ones the fixes let the checker reach. After the summary, the edited program's errors are printed as `check` prints them, then `note fix.left: N errors left (above)`. `--at FILE:LINE`: the fixes of that line's errors only. (0.25.2.1) Only fixes that keep what the program means (the 0.25.2 eval's wrong ones, tests/refactor/fixsafe.t): a conversion that loses the value (float to int, f64 to f32, a narrowing or sign-changing integer, a wide integer to f32) or converts a cast's value (`(x as f32) as f64`: the cast or the place's type is what to change) is not made (0.28.0: except an index's `as usize`, `a[i as usize]` of any integer `i`, tests/refactor/indexusize.t: out of range before the conversion and after it; of an index that is a cast of an integer the fix changes the cast's type); nor a did-you-mean that names the function the call is in (it would recurse); a missing `use` is not added when a `use` line, or another fix of one, already imports the name. The edited program is checked, and a fix with a new error in its own text or at its error's place is taken out (up to 4 times) while the others are made; each fix not made is a `note fix.refused: PLACE: not applied: `TEXT`: WHY`, and `note fix.none` when all were. `--codes CODE,...`: only the fixes of errors with those codes (`conv.marker,conv.marker_extra,conv.rust`: the check hook's mechanical ones); `--diff`: the diff of what was written, after the summary |
+| `suggested` | (0.18; `--suggested`) the fixes the compiler knows exactly, which an error marks with `try: volec fix --suggested ROOT`: the range of the source its fix replaces and the text, recorded with the error (base/diag.vl, `err_fix`), and the `imports` and `pub` fixes. Which: a did-you-mean (a variable, function, method, field, path member, argument name) when no other name is as near; a numeric conversion (`x as u8`), `n != 0` for a condition, `a[..]` for an array where a slice goes, `.as_slice()` of a Buf or Vec, `&x` (a simple value); `s.trim()` as `trim(s)` (std's function for a method it lacks; with `gpa` when the function's local `gpa` is the allocator); a 0.15 allocating form (`Vec::new()`, `format(x)`) as its `_in` form when the function has a local `gpa` (else `fix --only alloc016` threads one); a call missing arguments that locals of the parameters' names and types give (`parse_table(s)` becomes `parse_table(s, gpa)`); a module path written from the crate's root (`crate::table::f`, a `use` line's path); a Rust type with one spelling (`String`, `&str`: `[u8]`; `char`: `u8`; `usize`: `i64`); a Rust label (`'outer:`, `break 'outer`); `.len` of a sealed field read as `.len()`. A tie, a VALUE to fill in, a choice between fixes: no suggestion. A new error on a line the edit wrote refuses it (`edit.breaks`); new errors elsewhere are the ones the fixes let the checker reach. After the summary, the edited program's errors are printed as `check` prints them, then `note fix.left: N errors left (above)`. `--at FILE:LINE`: the fixes of that line's errors only. (0.25.2.1) Only fixes that keep what the program means (the 0.25.2 eval's wrong ones, tests/refactor/fixsafe.t): a conversion that loses the value (float to int, f64 to f32, a narrowing or sign-changing integer, a wide integer to f32) or converts a cast's value (`(x as f32) as f64`: the cast or the place's type is what to change) is not made (0.28.0: except an index's `as usize`, `a[i as usize]` of any integer `i`, tests/refactor/indexusize.t: out of range before the conversion and after it; of an index that is a cast of an integer the fix changes the cast's type); nor a did-you-mean that names the function the call is in (it would recurse); a missing `use` is not added when a `use` line, or another fix of one, already imports the name. (0.30) Nor a did-you-mean of a field that is unknown at several sites (`x.entry_count` three times, offered `enum_count`): the field was removed or renamed, not mistyped, and the nearest name left is another field; one unknown at a single site is a typo and is fixed (tests/refactor/fieldgone0300.t). The edited program is checked, and a fix with a new error in its own text or at its error's place is taken out (up to 4 times) while the others are made; each fix not made is a `note fix.refused: PLACE: not applied: `TEXT`: WHY`, and `note fix.none` when all were. `--codes CODE,...`: only the fixes of errors with those codes (`conv.marker,conv.marker_extra,conv.rust`: the check hook's mechanical ones); `--diff`: the diff of what was written, after the summary |
 
-By default the first four (`imports`, `unused`, `pub`, `unsafe`),
-everywhere; `tidy-imports`, `reexports` and `suggested` only when asked
+(0.30) `fix` reads every error of the program, not the first 50 a check
+stops at (its rounds and the check of its edit too): 260 missing imports
+are one run (before: 50 a round, five rounds, and a refusal or half the
+work; 0.29's 1158 took about 15 runs). And the check of an edit compares
+errors without the places their texts name: an error the edit only
+moved a line down (`... mutably borrowed at main.vl:11:10`) is the error
+it was, not a new one (`edit.breaks` refused such a fix).
+
+By default the first four (`imports`, `unused`, `pub`, `unsafe`) and
+(0.30) `redundant`, everywhere; `tidy-imports`, `reexports` and `suggested` only when asked
 for (`--only reexports,tidy-imports` does both: the rounds tidy what the
 first rewrote).
 
@@ -991,8 +1104,10 @@ rename's own test and the script.
 | `edit.std` | note | 0 | (0.17) a std edit in the repository wrote std's files; embed.sh made stdsrc.vl | rebuild: `bootstrap/bootstrap.sh --dev` |
 | `edit.std` | warning | 0 | (0.17) the same, and embed.sh failed | `compiler/std/embed.sh` |
 | `check.std-files` | note | 0 | (0.17) std's files differ from the compiler's std: checked with them | |
+| `patch.sites` | error, warning | 1 | `edit patch --at|--from`: N of M patches do not match (each named above it); nothing written, or with `--keep-going` the others are | fix the named patches, or `--keep-going` |
+| `edit.justify` | error, warning | 1 | `edit justify`: a site that cannot be justified by a comment above its line (no site there, a comment still missing, a line the audit does not read), then how many are left | the message's reason; `--keep-going` writes the others |
 | `edit.breaks` | error | 1 | the edit adds errors (they are printed); nothing written | the command with `--no-check` |
-| `edit.breaks` | warning | 1, 0 | the same with `--dry-run`, or `--no-check` (written) | `volec check` |
+| `edit.breaks` | warning | 1 | the same with `--dry-run` (`--no-check` runs no check and says nothing, 0.30) | `volec check` |
 | `edit.refactor` | note | | (0.15) with edit.breaks: an edited item's shape changed and its uses broke | the refactoring that changes them with it |
 | `edit.together` | note | | (0.15) with edit.breaks: items the edit does not change have errors | `query show` of them |
 | `edit.format` | error | 2 | (0.15) apply: the file is not blocks | |

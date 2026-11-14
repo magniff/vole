@@ -56,11 +56,8 @@ patched crate::one	main.vl	+2 -1 lines
 21	    let twice = k + k;
 22	    unsafe { twice * abs(a) as i64 / 2 }
 $ edit patch spread --old '        let y = abs(b) as i64;' --new '' --no-check --show
-main.vl:13:13: error[type error] undefined variable 'y'  [edited: crate::spread]
 patched crate::spread	main.vl	+0 -1 lines
 // main.vl:11: 1 line removed after line 11
-warning edit.breaks: 1 new error; written anyway (--no-check); the error: main.vl:13:13: undefined variable 'y'
-try: volec check
 $ query diff
 # patched crate::spread	main.vl	+0 -1 lines
 --- a/main.vl

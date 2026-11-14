@@ -22,7 +22,7 @@ volec query refs NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [-
 volec query callers NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
 volec query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]   (0.16)
 volec query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (0.16) the inferred effects
-volec query unsafe [FILE...|DIR|std] [--no-std] [--unjustified] [--unneeded] [--summary] [--json]   (0.25.3) every unsafe site
+volec query unsafe [FILE...|DIR|std] [--no-std] [--unjustified] [--unneeded] [--source] [--summary] [--json]   (0.25.3) every unsafe site
 volec query features NAME... [--why FEATURE] [-C OPTION]   (0.19) what a function needs of the CPU
 volec query arch WORDS... [--feature F] [--arch A] [--equiv NAME]   (0.19) the intrinsic tables (also `intrinsics`; no program read)
 volec query items [MODULE|TYPE...] [--root ROOT] [--comments] [--find WORD] [--kind KIND,...] [--names]
@@ -122,7 +122,7 @@ tools` the ones a program needs.
 | the type of an expression | `target/volec query type FILE:LINE:COL` |
 | a function's drops, each decided (kept, removed, flagged, opened) and where it runs (0.26.1) | `target/volec query drops FILE:LINE` |
 | what a function may do (allocate, io, panic, loop forever) | `target/volec query effects NAME\|MODULE` (`--why EFFECT`: the chain; `--has alloc(Gpa)`: which still allocate) |
-| every unsafe site: what it does, its class, whether it says why | `target/volec query unsafe [FILE...\|std]` (`--unjustified`, `--unneeded`, `--summary`, `--json`) |
+| every unsafe site: what it does, its class, whether it says why | `target/volec query unsafe [FILE...\|std]` (`--unjustified`, `--unneeded`, `--source`: each site's lines, `--summary`, `--json`); the comments written: `target/volec edit justify FILE:LINE --unsafe TEXT --safety TEXT` (`--from LIST`) |
 | the CPU intrinsic for a task, its instruction and feature; what a function needs of the CPU (0.19) | `target/volec query arch WORDS` (`--feature crc`, `--equiv NAME`); `query show vqtbl1q_u8`; `query features NAME --why crc` |
 | where it is defined, its signature | `target/volec query def NAME` |
 | what a module contains; a type's methods | `target/volec query items MODULE`; `query items TYPE`; `query show TYPE` (its source, then a line a method) |
@@ -622,6 +622,10 @@ main.vl:29	block	crate::main	raw-pointer	justified	unsafe-call(total)
 sites: 7 (5 blocks, 1 unsafe fns, 1 extern blocks); unjustified: 4; unneeded: 0
 ```
 
+- (0.30) `--source` prints each site's lines under its line, `LINE<TAB>text`
+  from the line the site starts on to its end (at most 12, then `... N
+  more lines, to LAST`): what `edit justify FILE:LINE` writes the
+  comments above. `--json` has `end_line`, the line the site ends on.
 - KIND: `block`, `unsafe fn`, `extern`. ITEM: the function it is in
   (an `unsafe fn`: itself), else the module (`MODULE::extern`).
 - OPERATIONS: what inside it needs unsafe code, as the checker counted
