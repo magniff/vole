@@ -423,4 +423,54 @@ else
     bad affected_readme_prose "git could not make the repository"
 fi
 
+# ---- tests/run.sh --bless (0.30) ----
+
+# In a small tree of its own (run.sh, the directives' parse, two cases)
+# with a compiler that reports two errors: the case whose errors are
+# those at other positions gets the positions of now (a position in a
+# note too), and passes; the one whose message differs is left as it was,
+# with why, and fails.
+BL="$WORK/bless"
+mkdir -p "$BL/tests/run" "$BL/compiler/src"
+cp "$ROOT/tests/run.sh" "$ROOT/tests/directives.awk" "$BL/tests/"
+cat >"$BL/volec" <<'EOF'
+#!/bin/sh
+for a in "$@"; do
+    case "$a" in
+        --check-rules) exit 0 ;;
+        --version) echo "volec (the runner's own)"; exit 0 ;;
+    esac
+done
+echo "error[type error]: expected 'i32', got 'i64'" >&2
+echo " --> case.vl: line 11, column 5" >&2
+echo "error[own.moved]: v was moved" >&2
+echo " --> case.vl: line 20, column 9" >&2
+echo "  = note: moved at line 18, column 13" >&2
+exit 1
+EOF
+chmod +x "$BL/volec"
+printf '%s\n' "// ERROR: error[type error]: expected 'i32', got 'i64'" '// ERROR: line 10, column 5' '// ERROR: error[own.moved]' \
+    '// ERROR: line 19, column 9' '// ERROR: moved at line 17, column 13' '// ERROR-COUNT: 2' 'fn main() {}' >"$BL/tests/run/err_moved.vl"
+printf '%s\n' "// ERROR: error[type error]: expected 'i32', got 'u8'" '// ERROR: line 10, column 5' 'fn main() {}' >"$BL/tests/run/err_changed.vl"
+cp "$BL/tests/run/err_changed.vl" "$BL/changed.orig"
+printf '%s\n' "// ERROR: error[type error]: expected 'i32', got 'i64'" '// ERROR: line 11, column 5' '// ERROR: error[own.moved]' \
+    '// ERROR: line 20, column 9' '// ERROR: moved at line 18, column 13' '// ERROR-COUNT: 2' 'fn main() {}' >"$BL/moved.want"
+got=$(sh "$BL/tests/run.sh" -c "$BL/volec" -j 2 --bless err_ 2>&1)
+rc=$?
+if [ $rc -eq 1 ] && cmp -s "$BL/tests/run/err_moved.vl" "$BL/moved.want" && cmp -s "$BL/tests/run/err_changed.vl" "$BL/changed.orig" \
+    && printf '%s\n' "$got" | grep -q -x -F "blessed err_moved: 3 directives: line 10, column 5 -> line 11, column 5; line 19, column 9 -> line 20, column 9; moved at line 17, column 13 -> moved at line 18, column 13" \
+    && printf '%s\n' "$got" | grep -q "^not blessed err_changed: the compiler does not report 'error\[type error\]: expected 'i32', got 'u8'', positions aside" \
+    && printf '%s\n' "$got" | grep -q '^  total  *1  *0  *1  *0$'; then
+    ok bless_positions
+else
+    bad bless_positions "exit $rc: $(printf '%s\n' "$got" | tr '\n' ';')"
+fi
+# --bless without a case named is refused.
+got=$(sh "$BL/tests/run.sh" -c "$BL/volec" --bless 2>&1)
+rc=$?
+case "$rc:$got" in
+    "2:tests/run.sh: --bless takes the cases to bless"*) ok bless_needs_names ;;
+    *) bad bless_needs_names "exit $rc: $got" ;;
+esac
+
 exit $BAD

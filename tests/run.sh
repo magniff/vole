@@ -22,7 +22,7 @@
 # --sample (the tools' answers from their cache the same as without it,
 # 0.25.3). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
-# usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-k LINKER] [-d FORMAT] [-f FILE] [-l] [--cases-only] [-n NAME] [FILTER...]
+# usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-k LINKER] [-d FORMAT] [-f FILE] [-l] [--cases-only] [--bless] [-n NAME] [FILTER...]
 #
 # The options come before the FILTERs: one after a FILTER is an error
 # that says where to put it (0.30: before, it was a FILTER, and `-O 2
@@ -56,6 +56,19 @@
 #   --cases-only  (0.30) no suite or check, only cases: `tests/run.sh
 #                 --cases-only fmt` is the cases with fmt in their name,
 #                 not also the fmt suite's minutes
+#   --bless       (0.30) `tests/run.sh --bless NAME...`: the selected
+#                 cases are run (no suite), and one that fails only
+#                 because its errors moved gets its `// ERROR:` directives
+#                 rewritten in its file: every directive's text, its
+#                 `line L, column C` aside, is still in the compiler's
+#                 output, in order (the same errors: kind and message),
+#                 and only the positions differ; they are written as the
+#                 compiler prints them now, the case is run again, and
+#                 `blessed NAME: ...` lists what changed (read the diff).
+#                 Nothing else is blessed: a message that changed, an
+#                 error that is gone or new (ERROR-COUNT), an XFAIL case,
+#                 a case that fails otherwise stay as they are, each with
+#                 a `not blessed NAME: why` line, and fail
 #   -n NAME       (0.25.5) only the case, suite or check named NAME exactly
 #                 (repeatable)
 #   FILTER...     run only the cases (and the suites and checks below)
@@ -228,6 +241,7 @@ LINKER=""
 FILTERS=""
 LIST=0
 CASES_ONLY=0
+BLESS=0
 
 usage() {
     sed -n '2,/^# Environment:/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2
@@ -254,6 +268,7 @@ while [ $# -gt 0 ]; do
             shift 2 ;;
         -l) LIST=1; shift ;;
         --cases-only) CASES_ONLY=1; shift ;;
+        --bless) BLESS=1; CASES_ONLY=1; shift ;;
         # (0.25.5) -n NAME: only NAME, as =NAME, in a form zsh does not
         # expand (its `=word` is a path: `=NAME` unquoted runs nothing)
         -n)
@@ -264,7 +279,7 @@ while [ $# -gt 0 ]; do
         -h|--help) usage ;;
         -*)
             # (0.25.2: one line, not the whole usage)
-            echo "tests/run.sh: unknown option '$1' (options: -c COMPILER -t TARGET -O LEVEL or -O0 -j JOBS -a -k LINKER -d FORMAT -f FILE -l --cases-only -n NAME; tests/run.sh -h for more)" >&2
+            echo "tests/run.sh: unknown option '$1' (options: -c COMPILER -t TARGET -O LEVEL or -O0 -j JOBS -a -k LINKER -d FORMAT -f FILE -l --cases-only --bless -n NAME; tests/run.sh -h for more)" >&2
             exit 2 ;;
         *) break ;;
     esac
@@ -329,6 +344,10 @@ EOF
 [ -z "${WHOLE_lsp:-}" ] || SUB_lsp=""
 [ -z "${WHOLE_fmt:-}" ] || SUB_fmt=""
 FILTER=$(printf '%s' "$ALLF" | tr '\n' ' ' | sed 's/ $//')
+if [ "$BLESS" = 1 ] && { [ -z "$FILTERS" ] || [ "$DIAG" != human ]; }; then
+    echo "tests/run.sh: --bless takes the cases to bless, and the human diagnostics: tests/run.sh --bless NAME... (tests/run.sh -h says what it rewrites)" >&2
+    exit 2
+fi
 VOLE_RUN_FILTERS=$FILTERS
 export VOLE_RUN_FILTERS
 
@@ -692,6 +711,7 @@ check_case() {
         # shellcheck disable=SC2086
         "$COMPILER" --target "$TARGET" $OPT $FLAGS "$source" -o "$dir/prog.s" >"$dir/compile.out" 2>&1
         rc=$?
+        echo "$rc" >"$dir/compile.rc"
         if [ $rc -ne 1 ]; then
             { echo "expected a compile error (exit code 1), got exit code $rc:"; cat "$dir/compile.out"; } >"$dir/why"
             return 1
@@ -1013,6 +1033,110 @@ match_checks() {
     ' "$1" >"$3" 2>&1
 }
 
+# (0.30, --bless) Case $1 (file $2, run in directory $3, failed): when
+# its ERROR directives are the errors the compiler reports but for their
+# positions, the directives are rewritten in the file with the positions
+# of now and the case is run again; says `blessed NAME: ...` or `not
+# blessed NAME: why` (the file then as it was).
+bless_case() {
+    if [ ! -s "$3/errors" ]; then
+        echo "not blessed $1: it has no ERROR directive (only those are rewritten)"
+        return 1
+    fi
+    if [ -s "$3/xfail" ]; then
+        echo "not blessed $1: it is XFAIL ($(cat "$3/xfail"))"
+        return 1
+    fi
+    if [ "$(cat "$3/compile.rc" 2>/dev/null)" != 1 ]; then
+        echo "not blessed $1: the compiler reports no error now (exit code $(cat "$3/compile.rc" 2>/dev/null))"
+        return 1
+    fi
+    # The directives with the positions of the output: each one's text,
+    # every `line L, column C` in it aside, in a line of the output after
+    # the line of the one before it; that line's positions are written.
+    if ! awk -v out="$3/compile.out" '
+        function norm(s,   r) {
+            r = ""
+            while (match(s, /line [0-9]+, column [0-9]+/)) {
+                r = r substr(s, 1, RSTART - 1) M
+                s = substr(s, RSTART + RLENGTH)
+            }
+            return r s
+        }
+        BEGIN { M = sprintf("%c", 1); while ((getline l < out) > 0) text[++n] = l; at = 0 }
+        {
+            d = $0
+            nd = norm(d)
+            j = at + 1
+            while (j <= n && index(norm(text[j]), nd) == 0) j++
+            if (j > n) {
+                printf "the compiler does not report %s%s%s%s, positions aside (a changed message is not blessed: read it, then edit the directive)\n", \
+                    sprintf("%c", 39), d, sprintf("%c", 39), (NR > 1 ? " after the errors before it" : "") | "cat 1>&2"
+                exit 1
+            }
+            # (the positions of that line the directive names: the ones
+            # after those before its text)
+            t = norm(text[j])
+            pre = substr(t, 1, index(t, nd) - 1)
+            q = 0
+            for (i = 1; i <= length(pre); i++) if (substr(pre, i, 1) == M) q++
+            np = 0
+            s = text[j]
+            while (match(s, /line [0-9]+, column [0-9]+/)) {
+                p[++np] = substr(s, RSTART, RLENGTH)
+                s = substr(s, RSTART + RLENGTH)
+            }
+            r = ""
+            s = d
+            while (match(s, /line [0-9]+, column [0-9]+/)) {
+                r = r substr(s, 1, RSTART - 1) p[++q]
+                s = substr(s, RSTART + RLENGTH)
+            }
+            print r s
+            at = j
+        }' "$3/errors" >"$3/bless.new" 2>"$3/bless.why"; then
+        echo "not blessed $1: $(head -1 "$3/bless.why")"
+        return 1
+    fi
+    if cmp -s "$3/errors" "$3/bless.new"; then
+        echo "not blessed $1: its ERROR directives hold as they are; it fails otherwise: $(head -1 "$3/why")"
+        return 1
+    fi
+    cp "$2" "$3/bless.orig"
+    # (the k-th ERROR directive of the file, as tests/directives.awk reads
+    # them, gets the k-th text)
+    awk -v new="$3/bless.new" '
+        BEGIN { while ((getline l < new) > 0) text[++n] = l }
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            sub(/^[ \t]+/, "", line)
+            if (substr(line, 1, 2) == "//") {
+                c = substr(line, 3)
+                if (substr(c, 1, 1) == " ") c = substr(c, 2)
+                if (substr(c, 1, 6) == "ERROR:") {
+                    k++
+                    print substr($0, 1, index($0, "ERROR:") + 5) " " text[k]
+                    next
+                }
+            }
+            print
+        }' "$3/bless.orig" >"$3/bless.file" && cp "$3/bless.file" "$2"
+    bless_changes=$(awk -v new="$3/bless.new" '
+        { getline t < new; if (t != $0) { n++; if (n <= 3) list = list (n > 1 ? "; " : "") $0 " -> " t } }
+        END { printf "%d directive%s: %s%s", n, (n == 1 ? "" : "s"), list, (n > 3 ? "; ..." : "") }' "$3/errors")
+    rm -f "$3/status"
+    read_directives "$2" "$3"
+    run_case "$2" "$3" </dev/null
+    if [ "$(cat "$3/status" 2>/dev/null)" != pass ]; then
+        cp "$3/bless.orig" "$2"
+        echo "not blessed $1: with the positions of now it still fails (the file is as it was): $(head -1 "$3/why")"
+        echo fail >"$3/status"
+        return 1
+    fi
+    echo "blessed $1: $bless_changes"
+}
+
 # The number of CPUs, for -j.
 cpu_count() {
     n=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)
@@ -1181,7 +1305,7 @@ esac
 # (0.25.2) The runner's own pieces (tests/runner/run.sh: the EXPECT holes,
 # the golden-image comparison, the directives): category "runner".
 case $(want runner) in
-    y) run_suite runner sh "$ROOT/tests/runner/run.sh" ;;
+    y) run_suite runner env VOLE_TEST_COMPILER="$COMPILER" sh "$ROOT/tests/runner/run.sh" ;;
 esac
 # (0.24) The language server's sessions (tests/lsp/run.sh): category "lsp".
 case $(want lsp) in
@@ -1277,6 +1401,14 @@ while read -r name file; do
 done <"$CASES"
 wait
 exec 3>&-
+
+# (0.30, --bless) The cases that failed: their ERROR directives' positions.
+if [ "$BLESS" = 1 ]; then
+    while read -r name file; do
+        [ "$(cat "$WORK/$name/status" 2>/dev/null)" = fail ] || continue
+        bless_case "$name" "$file" "$WORK/$name" </dev/null
+    done <"$CASES"
+fi
 
 count=0
 while read -r name file; do
