@@ -118,7 +118,11 @@ test runners say what they will run before they run it. XFAIL 730 to
 717, with a census; the compiler's unsafe sites 316 to 299. A hello
 world compiles with 31% more instructions, the price of the one-write
 line ("Known regressions and limits"). Built and tested on aarch64-macos
-only; no Linux row ran.
+only; no Linux row ran. Programs written to break vole found bugs that
+0.30.0 still has, most of them since 0.28: three ways for safe code to
+reach freed memory, -O2 output that differs from -O0, and checks such as
+`--check-unsafe` and `#[no_panic]` that do not catch what they exist to
+catch ("Known issues"; 0.30.1 fixes them).
 
 #### What changes for a program
 
@@ -268,10 +272,11 @@ its phases, a load of 3.7 to 8.0):
 | std_heavy (built) | 1230.0 M | 1083.0 M | -12.0% |
 | regions (checked) | 1125.4 M | 1124.7 M | -0.1% |
 
-TODO(gate: the self-build at -O2 and -O0 and the compiler's own check
-in instructions and time against 0.29.0, each compiler on its own
-source, idle machine; 0.29.0: 126.2 G, 33.5 G and 24.8 G; 0.28.0: 103.6
-G, 29.9 G and 21.3 G). Times, from the profile (the same binaries, a
+Each compiler on its own source, on one thread, the fewest of three
+runs on the idle machine after the gate: the -O2 self-build 126,387 M
+(7.03 s) to 110,503 M (6.52 s), -12.6%; -O0 33,364 M (1.72 s) to 30,745
+M (1.60 s), -7.8%; `check` 24,687 M (1.31 s) to 21,843 M (1.17 s),
+-11.5% (0.28.0: 103.6 G, 29.9 G and 21.3 G). Times, from the profile (the same binaries, a
 load of 1.9 to 2.8, the tree of the self-build work):
 the -O2 self-build 3.43-3.57 s to 3.01-3.11 s, -O0 1.71-1.74 s to
 1.53-1.68 s, `check` 1.50-1.58 s to 1.27-1.28 s.
@@ -450,8 +455,7 @@ speed".
   heapsort written out). bench/iterchain against bench/iterloop 1.728
   to 0.97 by instructions; by time, in the bench row on the tree of the
   release's second batch, **1.010**, under the limit of 1.05 the row
-  had failed since 0.28.0 (0.29.0: 2.057). TODO(gate: the bench row's
-  iterchain/iterloop on the final tree). *Cases:* `opt_iter_chains`
+  had failed since 0.28.0 (0.29.0: 2.057). The bench row on the final tree: 1.010. *Cases:* `opt_iter_chains`
   (ten chains against their hand loops at every length from 0 to 40;
   nested loops that must stay nested), `opt_vec_usize_lanes` (its
   XFAIL gone).
@@ -499,8 +503,9 @@ speed".
   round). The bench row by time, on the tree of the second batch (a
   load of 2.5 at its start): the geomean against `cc -O2` 1.001 at -O2,
   where 0.29.0 gave 1.141 in the same run, 2.204 at -O1, 12.719 at -O0.
-  TODO(gate: the bench row on the final tree, idle machine; 0.29.0's
-  gate: 1.131, 2.275, 13.131).
+  The bench row on the final tree, alone on the idle machine: 1.005 at
+  -O2 (0.29.0 in the same run: 1.137), 2.190 at -O1, 12.679 at -O0
+  (0.29.0's gate: 1.131, 2.275, 13.131).
 - **What cc has and the optimizer lacks**, ranked by what the
   benchmarks would gain, is in docs/optimizer.md: std's algorithms
   against their C twins (the heap's sift, hashing a byte slice at
@@ -719,10 +724,9 @@ docs/tool-gaps-030.md.
 - The guide's embed prints the core guide's size against its budget
   (10,239 of 10,240 bytes); `volec guide testing` says how the suite is
   run now.
-- The suite: TODO(gate: cases passed at each of -O0, -O1 and -O2, and
-  XFAIL; 0.29.0: 6385 passed, 731 xfail, 0 failed, 1 skipped). The last
-  whole run during the release, on the last merge: 6556 passed, 717
-  xfail, 0 failed, 1 skipped.
+- The suite, in the release gate: 6556 passed at each of -O0, -O1 and
+  -O2, 717 xfail, 0 failed, 1 skipped (no spirv-val) (0.29.0: 6385
+  passed, 731 xfail).
 
 #### Known regressions and limits
 
@@ -813,6 +817,58 @@ docs/tool-gaps-030.md.
   item.
 - **Not tested on Linux in this release.** Hosts: aarch64-macos.
 
+#### Known issues (fixed in 0.30.1 unless noted)
+
+Found by a red team, programs written to make vole fail, while the release gate ran: none of them is new in 0.30 except where said, and each is a suite case from 0.30.1 on (`tests/run/rt_*.vl`, XFAIL until it is fixed). Each entry names the oldest release that shows it.
+
+**Safe code that breaks memory:**
+- An impl method's lifetimes are not compared with the trait's. An impl that returns `&'a str` where the trait says `&'static str` is accepted, and a caller through the trait reads freed memory. Since 0.28.0.
+- A callee's `T: 'static` bound is not required of a caller's type parameter, so a thread can read a String after it is dropped. Since 0.28.0.
+- A format argument that names a place is not a borrow, and neither is the left operand of a comparison, so a later argument can free it (`println("{} {:?}", s, drop(s))` is accepted). Since 0.28.0.
+- std slices a str at an index the caller gave without checking the char boundary (`str::split_at`, `String::remove`), and std's sealed traits Pattern, Step and SliceIndex accept a program's impls, which std's code trusts. Both give invalid UTF-8 from safe code. Since 0.28.0.
+- A str literal may hold a byte that is not UTF-8. Since 0.27.8 at least.
+
+**Checks that never fire:**
+- `--check-unsafe` does not see memory from std's allocator (every Vec, String and Box), only blocks from C's malloc. Use it together with `--check-alloc`, which does. Since 0.28.0.
+- `#[no_panic]` accepts a `/` or `%` that panics on a zero divisor, and an index into an array inside a loop whose range bound is 2^63 or more. Since 0.27.0.
+- `--trace` prints nothing when a recursion overflows the stack. Seen in 0.30.0.
+
+**-O2 output that differs from -O0:**
+- A call whose division or remainder panics on zero is deleted, or two such calls are merged, when the result is unused or repeated. Since 0.25.0 at least.
+- An `extern` declared under C's name `malloc` but linked to another symbol has its calls removed. An `extern` named `memcpy` or `fmod` with a `#[link_name]` takes over the compiler's own calls of that C function. Since 0.28.0 (the memcpy form since 0.30.0).
+- A C function from std's table (memset, strlen, ...) declared with integer parameters is taken to read no memory, so its calls are deleted or folded. Since 0.28.0.
+- A `ref mut` binding of a counted while loop's variable is not seen as a write, so a loop that never ends is taken to end, and -O2 deletes its call. Since 0.28.0.
+
+- For x86-64 at -O0, a stack store seen in an earlier function can be forwarded into a later function's argument load. A slice iterator over an empty Vec then crashes. arm64, and -O2 on either target, are right. Since 0.28.0 at least.
+
+**The code cache:**
+- At -O2, a warm build can differ in bytes from a cold one when the number of calls to a function changes between builds: a loop is vectorized in one and not the other. The code is right in every case seen. `VOLE_CACHE=off` gives the cold build. New in 0.30.0.
+
+**Calls into C:**
+- On arm64 macOS, a float-only C struct aligned to 16 or 32 and passed on the stack is put at another offset than clang's, in both directions, at every level. Since 0.28.0 at least.
+
+**Other meanings than Rust's:**
+- An integer literal that Rust types as i64 from a later use is i32 in vole, and it is widened only after the arithmetic. Since 0.28.0.
+- `Trait::method(&x)` takes Self from the argument with its references stripped, so another impl runs. Since 0.28.0.
+- A generic impl's methods are not checked against the trait's signatures. Since 0.28.0.
+- In a tuple, struct literal or variant, an operand that moves a place is read after the operands to its right. Rust reads left to right. Since 0.28.0.
+
+**std and formatting** (fixed in 0.30.2):
+- `{:.*}` and the `w$`/`1$`/`name$` widths and precisions are accepted and ignored.
+- `{:x?}` and `{:X?}` print decimal.
+- Debug writes private-use, unassigned and noncharacter code points raw.
+- `Range::nth` walks every element.
+- A user type named like std's type parameter (`struct K<X>` as a BTreeMap key) is refused.
+
+**Tools and messages** (fixed in 0.30.2):
+- `volec rewrite` drops the comments inside a site it rewrites, and `refactor signature --rename-param` and `extract-function` miss a parameter's uses in format holes.
+- The compiler crashes, with no message, on an expression chain of about 8000 operators, and when an error quotes a str literal holding a byte that is not UTF-8.
+- Checking a match costs about the cube of its arms: 2000 arms take about 30 s.
+- String literal patterns, and a char match over both ranges of scalar values, are refused.
+- A type nested 34 deep is reported as not implementing a trait it implements.
+- The help for `..base` suggests MVS's `var`.
+- The trait checker: a projection deeper than 32 is accepted without being checked; an impl's where-clause on a type that is not a parameter does not take part in choosing the impl; a nested projection whose parameters are named like structs unifies with anything. These are 0.31's.
+
 #### What comes next
 
 - **0.31 is the compiler-performance release**: a cold -O0 self-build
@@ -822,41 +878,55 @@ docs/tool-gaps-030.md.
   optimizer's findings above and the parallel front end
   (docs/compile-speed.md, "The goal: one second cold"), both planned
   for this release and moved there, and the `hello` row.
-- **0.32**: contracts v2 and static proofs.
+- **0.30.1** fixes the known issues above that let a wrong program
+  through (memory errors from safe code, -O2 against -O0, checks that
+  never fire); **0.30.2** is an adversarial review of the compiler and
+  std, tests written to abuse them, and a harder gate.
+- **0.32** is the type checker's release, hardened by programs computed
+  in types (examples/type-level/); **0.33** contracts v2 and static
+  proofs.
 
 #### Numbers
 
 - The self-build and the compiler's own check against 0.29.0, the same
   source: -O2 125,359 M to 104,223 M (-16.9%), -O0 34,426 M to 30,869 M
   (-10.3%), check 25,392.8 M to 21,866.1 M (-13.9%) ("The compiler's
-  own speed"). TODO(gate: each compiler on its own source, idle machine;
-  0.29.0: 126,202 M, 33,452 M and 24,776 M).
-- Compile cost against v0.29.0, in instructions: TODO(gate: hello, std,
-  check and regions with their ratios; the std row is back, 0.29.0
-  builds its program; 0.29.0 against 0.28.0: hello 173.8 M 1.00x, check
-  24,814.5 M 0.97x, regions 1130.9 M 0.93x, std skipped). A gate run on
+  own speed"). Each compiler on its own source, one thread,
+  idle machine: -O2 126,387 M to 110,503 M (-12.6%), -O0 33,364 M to
+  30,745 M (-7.8%), check 24,687 M to 21,843 M (-11.5%).
+- Compile cost against v0.29.0, in instructions: hello 228.1 M 1.30x, std
+  1172.3 M 0.89x (the std row is back: 0.29.0 builds its program), check
+  22,015.8 M 0.86x, regions 1131.7 M 1.00x (0.29.0 against 0.28.0: hello
+  173.8 M 1.00x, check 24,814.5 M 0.97x, regions 1130.9 M 0.93x, std
+  skipped). A gate run on
   the tree of the second batch gave hello 0.97x, std 0.89x, check 0.86x,
   regions 1.00x, before the println change.
-- The compiler's binary: TODO(gate: bytes; 0.29.0: 11,832,056).
+- The compiler's binary: 12,153,624 bytes (0.29.0: 11,832,056).
 - bench (`gate.sh --only bench`, idle machine, time against `cc -O2` =
-  1, geomean): TODO(gate: -O2, -O1, -O0 and the iterator check; 0.29.0:
-  1.131, 2.275, 13.131, iterchain 2.057 times iterloop). On the tree of
+  1, geomean): 1.005 at -O2, 2.190 at -O1, 12.679 at -O0, iterchain
+  1.010 times iterloop, the check passed (0.29.0: 1.131, 2.275, 13.131,
+  iterchain 2.057 times iterloop). On the tree of
   the second batch: 1.001, 2.204, 12.719 and 1.010.
 - Unsafe sites in compiler/src: 316 to 299, 0 unjustified, 0 unneeded
   (`sh tests/unsafe_audit.sh`); by class ffi 205 to 191, raw-pointer 82
   to 79, other 18, alloc 11; by module the tools 140 to 124, the back
   end 20 to 19, the rest as they were. std: 915 to 910, 0 unjustified,
-  0 unneeded, now judged. TODO(gate: the unsafe-audit row on the final
-  tree).
+  0 unneeded, now judged. The unsafe-audit row on the final tree: the
+  same, 299 and 910.
 - XFAIL: 730 to 717 (`grep -rhE "^ *// XFAIL" tests | wc -l`).
-- The suite: TODO(gate: passed at -O0, -O1, -O2 and XFAIL; 0.29.0: 6385
-  and 731).
-- `git diff --shortstat v0.29.0 v0.30.0`: TODO(gate: files, insertions,
-  deletions; 0.29.0's against 0.28.0: 4450 files, 134,135 insertions,
-  128,267 deletions). compiler/src: 476 files and 257,258 lines in
-  0.29.0; TODO(gate: files and lines at the tag).
-- Found by the gate and fixed before the tag: TODO(gate: what the gate
-  found, or "nothing").
+- The suite: 6556 passed at each of -O0, -O1 and -O2, 717 XFAIL (0.29.0:
+  6385 and 731).
+- `git diff --shortstat v0.29.0 v0.30.0`: 312 files, 25,049 insertions,
+  4,217 deletions (0.29.0's against 0.28.0: 4450 files, 134,135
+  insertions, 128,267 deletions). compiler/src: 476 files and 257,258 lines in
+  0.29.0; 492 files and 265,889 lines at the tag.
+- Found by the gate and fixed before the tag: chain-diverse's -O0
+  compiler, which checks overflow as it runs, stopped with "attempt to
+  add with overflow" in middle/lsr.vl's affine forms (strength
+  reduction) on tests/run/sem_core_rf_induction_wrap.vl at -O2, for every
+  target; the -O2 compiler wrapped, as the forms mean (arithmetic modulo
+  2^64). They are written wrapping_* now. The -O2 compiler is the same
+  bytes as before the fix, and chain-diverse passed on the fixed tree.
 
 ### What's new in 0.29.0
 
