@@ -25,16 +25,18 @@ use crate::middle::ctx::FnCtx;
 use crate::middle::fold::is_const;
 use crate::middle::ipo::has_effect;
 use crate::middle::ir::{
-    Cond, Op, Term, fn_entry, ir_append, ir_arg, ir_enter, ir_make, ir_prepend, ir_replace, ir_val,
+    Cond, Op, Term, fn_block, fn_block_count, fn_entry, ir_append, ir_arg, ir_enter,
+    ir_insert_before, ir_make, ir_operand, ir_operand_count, ir_prepend, ir_replace, ir_unlink,
+    ir_val,
 };
 use crate::middle::ir::cfg::pred_index;
 use crate::middle::loops::{
-    canonicalize_loops, invariant_in, loop_contains, loop_count, loop_header, loop_latch,
-    loop_preheader,
+    add_pred_values, canonicalize_loops, innermost_loop, invariant_in, loop_block, loop_contains,
+    loop_count, loop_header, loop_latch, loop_preheader, loop_size,
 };
-use crate::middle::opt::resolve_all;
+use crate::middle::opt::{remove_block, remove_pred, remove_trivial_phis, resolve_all};
 use crate::middle::range::bits_of_value;
-use crate::middle::scev::{append_const, append_inst, iv_start, iv_step};
+use crate::middle::scev::{append_const, append_inst, counted_loop, iv_start, iv_step};
 
 const COUNT_STRIDE: i64 = 5;
 // At most this many tests in a chain.
@@ -362,12 +364,435 @@ fn same_value(cx: &mut FnCtx<Comp>, a: i64, b: i64) -> bool {
             && (cx.insts[a as usize]).ty == (cx.insts[b as usize]).ty)
 }
 
+// (0.30) Before the loops are counted and rotated: the constants made in
+// loops move to the end of the entry block (which no loop holds), and a
+// conversion between 64-bit integer types in a loop (it changes no bits)
+// is its operand. `n != 0`, the test of a slice iterator's `next` or of
+// `take`, compares with a constant of the loop's own blocks, which the
+// tests below and SCEV's counted loop did not take for an invariant, and
+// rotation copied it into a phi of two equal constants (the step of the
+// pointer); a length read as i64 in the header and counted down in usize
+// was two phis after rotation, neither with a step. Returns whether
+// anything changed.
+fn hoist_constants(cx: &mut FnCtx<Comp>, fi: i64) -> bool {
+    let entry = fn_entry(cx, fi);
+    if innermost_loop(cx, entry) >= 0 {
+        return false;
+    }
+    let mut changed = false;
+    for l in 0..loop_count(cx) {
+        for i in 0..loop_size(cx, l) {
+            let b = loop_block(cx, l, i);
+            let mut v = (cx.blocks[b as usize]).first;
+            while v != 0 {
+                let next = (cx.insts[v as usize]).next;
+                if is_const(cx, v) {
+                    ir_unlink(cx, v);
+                    ir_append(cx, entry, v);
+                    changed = true;
+                } else if (cx.insts[v as usize]).op == Op::Conv
+                    && bits_of_value(cx, v) != v {
+                    let x = bits_of_value(cx, v);
+                    ir_replace(cx, v, x);
+                    changed = true;
+                }
+                v = next;
+            }
+        }
+    }
+    changed
+}
+
+// (0.30) In a loop counted from 0 by 1 (after rotation: the counter c a
+// header phi, its next value tested at the latch), every other induction
+// variable of 64 bits with a constant step k is start + c * k, computed
+// at the header's top: a slice iterator's pointer and what is left of its
+// length become what an index loop has (`base + 8 * c`), which the
+// vectorizer and the unroller take and strength reduction turns back into
+// a pointer. A loop counted down by 1 to `!= bound` (`n != 0` with n - 1
+// a round: what a slice iterator's `next` leaves) first gets such a
+// counter: start - bound rounds. Wrapping arithmetic: the same bits as
+// the additions gave. Returns whether anything was rewritten.
+fn express_ivs(cx: &mut FnCtx<Comp>, l: i64, pcx: &Ctx<Comp>) -> bool {
+    let h = loop_header(cx, l);
+    let pre = loop_preheader(cx, l);
+    let latch = loop_latch(cx, l);
+    if pre == 0 || latch == 0 {
+        return false;
+    }
+    let mut c: i64 = 0;
+    let mut step: i64 = 0;
+    let mut bound: i64 = 0;
+    let mut ne = false;
+    if !counted_loop(cx, l, &mut c, &mut step, &mut bound, &mut ne)
+        || int_bits((cx.insts[c as usize]).ty) != 64 {
+        return false;
+    }
+    let mut at = (cx.blocks[h as usize]).first;
+    while at != 0 && (cx.insts[at as usize]).op == Op::Phi {
+        at = (cx.insts[at as usize]).next;
+    }
+    if at == 0 {
+        return false;
+    }
+    let mut changed = false;
+    let start = iv_start(cx, l, c);
+    if step == -1 && ne {
+        let zero = append_const(cx, pre, 0, TY_I64, pcx);
+        let trips = append_inst(cx, pre, Op::Sub, TY_I64, start, bound, pcx);
+        let n = ir_make(cx, Op::Phi, TY_I64, 0, 0, 0, pcx);
+        (cx.insts[n as usize]).args = cx.args.len() as i64;
+        (cx.insts[n as usize]).nargs = (cx.blocks[h as usize]).preds.len() as i64;
+        let one = append_const(cx, pre, 1, TY_I64, pcx);
+        let next = append_inst(cx, latch, Op::Add, TY_I64, n, one, pcx);
+        for k in 0..(cx.blocks[h as usize]).preds.len() as i64 {
+            cx.args.push(if ((cx.blocks[h as usize]).preds[k as usize])
+                == pre { zero } else { next });
+            cx.argty.push(0);
+        }
+        ir_prepend(cx, h, n);
+        let stay_s0 = (cx.blocks[latch as usize]).s0 == h;
+        (cx.blocks[latch as usize]).cond = append_cmp(cx, latch,
+            if stay_s0 { Cond::Ne } else { Cond::Eq }, TY_I64, next, trips, pcx);
+        c = n;
+        changed = true;
+    } else if step != 1 || !is_const(cx, start) || (cx.insts[start as usize]).imm != 0 {
+        return false;
+    }
+    let mut q = (cx.blocks[h as usize]).first;
+    while q != 0 && (cx.insts[q as usize]).op == Op::Phi {
+        let next = (cx.insts[q as usize]).next;
+        let ty = (cx.insts[q as usize]).ty;
+        let mut k: i64 = 0;
+        if q != c && ir_val(cx, q) == q && is_integer(ty) && int_bits(ty) == 64
+            && iv_step(cx, l, q, &mut k) && k != 0 {
+            let from = iv_start(cx, l, q);
+            let mut m = c;
+            if k != 1 {
+                let kv = append_const(cx, pre, k, ty, pcx);
+                m = ir_make(cx, Op::Mul, ty, c, kv, 0, pcx);
+                ir_insert_before(cx, at, m);
+            }
+            // (from 0: the multiple itself; a 64-bit integer of the other
+            // signedness is the same bits, as value numbering has it)
+            let v = if is_const(cx, from) && (cx.insts[from as usize]).imm == 0 {
+                m
+            } else {
+                let w = ir_make(cx, Op::Add, ty, from, m, 0, pcx);
+                ir_insert_before(cx, at, w);
+                w
+            };
+            ir_replace(cx, q, v);
+            changed = true;
+        }
+        q = next;
+    }
+    changed
+}
+
+// express_ivs on every loop of function fi, after rotation.
+pub fn express_loop_ivs(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
+    ir_enter(cx, fi, pcx);
+    canonicalize_loops(cx, fi, pcx);
+    let mut changed = false;
+    for l in 0..loop_count(cx) {
+        if loop_header(cx, l) != fn_entry(cx, fi) && express_ivs(cx, l, pcx) {
+            changed = true;
+            resolve_all(cx, fi);
+        }
+    }
+    changed
+}
+
+// The value header h1's phi p takes when the inner latch jumps to h1:
+// map holds (p, value) pairs; a phi it does not name keeps its value.
+fn mapped(map: &Vec<i64, Comp>, p: i64) -> i64 {
+    let mut k: usize = 0;
+    while k + 1 < map.len() {
+        if map[k] == p {
+            return map[k + 1];
+        }
+        k += 2;
+    }
+    p
+}
+
+// Whether a, read in block h1 once its phis have the values of `map`, is
+// b: a phi of h1 whose value is b, one value defined outside h1, equal
+// constants, or the same pure operation of operands that are.
+fn same_under(cx: &mut FnCtx<Comp>, a: i64, b: i64, h1: i64, map: &Vec<i64, Comp>, depth: i64) -> bool {
+    let x = ir_val(cx, a);
+    let y = ir_val(cx, b);
+    if (cx.insts[x as usize]).block == h1 && (cx.insts[x as usize]).op == Op::Phi {
+        let m = mapped(map, x);
+        return ir_val(cx, m) == y;
+    }
+    if x == y {
+        return (cx.insts[x as usize]).block != h1;
+    }
+    if is_const(cx, x) && is_const(cx, y) {
+        return (cx.insts[x as usize]).imm == (cx.insts[y as usize]).imm
+            && (cx.insts[x as usize]).ty == (cx.insts[y as usize]).ty;
+    }
+    let op = (cx.insts[x as usize]).op;
+    if depth == 0 || (cx.insts[x as usize]).block != h1 || op != (cx.insts[y as usize]).op
+        || (op != Op::Cmp && op != Op::Conv && op != Op::Add && op != Op::Sub && op != Op::And)
+        || (cx.insts[x as usize]).ty != (cx.insts[y as usize]).ty
+        || (cx.insts[x as usize]).imm != (cx.insts[y as usize]).imm
+        || (cx.insts[x as usize]).imm2 != (cx.insts[y as usize]).imm2
+        || (cx.insts[x as usize]).cond != (cx.insts[y as usize]).cond {
+        return false;
+    }
+    let xa = (cx.insts[x as usize]).a;
+    let ya = (cx.insts[y as usize]).a;
+    let xb = (cx.insts[x as usize]).b;
+    let yb = (cx.insts[y as usize]).b;
+    if (xa == 0) != (ya == 0) || (xb == 0) != (yb == 0) {
+        return false;
+    }
+    (xa == 0 || same_under(cx, xa, ya, h1, map, depth - 1))
+        && (xb == 0 || same_under(cx, xb, yb, h1, map, depth - 1))
+}
+
+// v as a value plus a constant (64-bit integers, wrapping): the value,
+// the constant in *offset.
+fn plus_constant(cx: &mut FnCtx<Comp>, v: i64, offset: &mut i64) -> i64 {
+    let mut x = bits_of_value(cx, v);
+    let mut c: i64 = 0;
+    for _ in 0..4 {
+        let op = (cx.insts[x as usize]).op;
+        let ty = (cx.insts[x as usize]).ty;
+        if (op != Op::Add && op != Op::Sub) || !is_integer(ty) || int_bits(ty) != 64 {
+            break;
+        }
+        let b = bits_of_value(cx, (cx.insts[x as usize]).b);
+        if !is_const(cx, b) {
+            break;
+        }
+        c = if op == Op::Add { c.wrapping_add((cx.insts[b as usize]).imm) }
+            else { c.wrapping_sub((cx.insts[b as usize]).imm) };
+        x = bits_of_value(cx, (cx.insts[x as usize]).a);
+    }
+    *offset = c;
+    x
+}
+
+// Whether test c1 of block h1, once h1's phis have the values of `map`,
+// is test c2 (`flip`: its negation, when the two branches leave on
+// opposite sides): the same (same_under), or both `==` (both `!=`; with
+// `flip` one of each) of a 64-bit integer and a constant that are one
+// equation: `n == 0` with n the phi that takes m - 1 is `m == 1`, as
+// instruction combining writes it.
+fn same_test(cx: &mut FnCtx<Comp>, c1: i64, c2: i64, flip: bool, h1: i64, map: &Vec<i64, Comp>) -> bool {
+    if !flip && same_under(cx, c1, c2, h1, map, 4) {
+        return true;
+    }
+    let x = ir_val(cx, c1);
+    let y = ir_val(cx, c2);
+    let ty = (cx.insts[x as usize]).imm2;
+    if (cx.insts[x as usize]).op != Op::Cmp || (cx.insts[y as usize]).op != Op::Cmp
+        || ((cx.insts[x as usize]).cond != (cx.insts[y as usize]).cond) != flip
+        || ((cx.insts[x as usize]).cond != Cond::Eq && (cx.insts[x as usize]).cond != Cond::Ne)
+        || !is_integer(ty) || int_bits(ty) != 64 || !is_integer((cx.insts[y as usize]).imm2)
+        || int_bits((cx.insts[y as usize]).imm2) != 64 {
+        return false;
+    }
+    let xb = ir_val(cx, (cx.insts[x as usize]).b);
+    let yb = ir_val(cx, (cx.insts[y as usize]).b);
+    if !is_const(cx, xb) || !is_const(cx, yb) {
+        return false;
+    }
+    // x's left side: a phi of h1 (its value from the latch), or a value
+    // of outside h1.
+    let mut xa = bits_of_value(cx, (cx.insts[x as usize]).a);
+    if (cx.insts[xa as usize]).block == h1 {
+        if (cx.insts[xa as usize]).op != Op::Phi {
+            return false;
+        }
+        xa = mapped(map, xa);
+    }
+    let mut ox: i64 = 0;
+    let mut oy: i64 = 0;
+    let bx = plus_constant(cx, xa, &mut ox);
+    let by = plus_constant(cx, (cx.insts[y as usize]).a, &mut oy);
+    bx == by && (cx.insts[bx as usize]).block != h1
+        && (cx.insts[xb as usize]).imm.wrapping_sub(ox)
+        == (cx.insts[yb as usize]).imm.wrapping_sub(oy)
+}
+
+// (0.30) Loop l, nested in a loop whose header h1 makes the test l's
+// latch t makes again, becomes part of that loop: t jumps to h1. `while
+// let Some(x) = it.next()` over a `filter` is the loop of `find` (next
+// item, no more: return None; the predicate holds: return it) inside the
+// consumer's loop (no more: leave), both testing what is left of the
+// slice and leaving for one block; as one loop with two back edges it is
+// the loop written by hand, `for x in s { if p(x) { .. } }`, which
+// if-conversion and the vectorizer take. The conditions: h1 holds phis
+// and a pure test whose values are used in h1 only, and goes to l's
+// preheader (empty) or out; t has no effects and goes to l's header h2 or
+// out to the same block; each phi of h2 carries a phi of h1 (which then
+// takes, from t, what h2's phi took from t; the others keep their values:
+// l does not change them) or a value that is the same either way; with
+// those values h1's test is t's and the exit's phis take what they took
+// from t; and no phi of h1 that l changes is read anywhere else (it would
+// be read as it was when the outer round began). Returns whether it was.
+fn unnest_loop(cx: &mut FnCtx<Comp>, fi: i64, l: i64, pcx: &Ctx<Comp>) -> bool {
+    let outer = (cx.lp_parent[l as usize]);
+    if outer < 0 {
+        return false;
+    }
+    let h1 = loop_header(cx, outer);
+    let h2 = loop_header(cx, l);
+    let pre2 = loop_preheader(cx, l);
+    let t = loop_latch(cx, l);
+    if pre2 == 0 || t == 0 || t == h2 || h1 == h2 || h1 == fn_entry(cx, fi)
+        || (cx.blocks[pre2 as usize]).first != 0
+        || (cx.blocks[pre2 as usize]).preds.len() != 1
+        || (cx.blocks[pre2 as usize]).preds[0] != h1
+        || (cx.blocks[h1 as usize]).term != Term::Branch
+        || (cx.blocks[t as usize]).term != Term::Branch
+        || !no_effects(cx, t, pcx) || !no_effects(cx, h1, pcx) {
+        return false;
+    }
+    // The two tests leave for one block.
+    let stay1 = (cx.blocks[h1 as usize]).s0 == pre2;
+    let stay2 = (cx.blocks[t as usize]).s0 == h2;
+    let e1 = if stay1 { (cx.blocks[h1 as usize]).s1 } else { (cx.blocks[h1 as usize]).s0 };
+    let e2 = if stay2 { (cx.blocks[t as usize]).s1 } else { (cx.blocks[t as usize]).s0 };
+    let in1 = if stay1 { (cx.blocks[h1 as usize]).s0 } else { (cx.blocks[h1 as usize]).s1 };
+    let in2 = if stay2 { (cx.blocks[t as usize]).s0 } else { (cx.blocks[t as usize]).s1 };
+    if in1 != pre2 || in2 != h2
+        || loop_contains(cx, outer, e1) || loop_contains(cx, outer, e2) {
+        return false;
+    }
+    let exit = forward(cx, e1);
+    if forward(cx, e2) != exit || e2 == h1 || exit == h1 {
+        return false;
+    }
+    // What h1's phis take from t.
+    let mut map: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let from_pre = pred_index(cx, h2, pre2);
+    let from_t = pred_index(cx, h2, t);
+    if (cx.blocks[h2 as usize]).preds.len() != 2 || from_pre < 0 || from_t < 0 {
+        return false;
+    }
+    let mut q = (cx.blocks[h2 as usize]).first;
+    while q != 0 && (cx.insts[q as usize]).op == Op::Phi {
+        let a_pre = { let x = ir_arg(cx, q, from_pre); ir_val(cx, x) };
+        let a_t = { let x = ir_arg(cx, q, from_t); ir_val(cx, x) };
+        if (cx.insts[a_pre as usize]).block == h1 && (cx.insts[a_pre as usize]).op == Op::Phi {
+            let m = mapped(&map, a_pre);
+            if m != a_pre && m != a_t {
+                return false;
+            }
+            if a_t != a_pre {
+                map.push(a_pre);
+                map.push(a_t);
+            }
+        } else if a_pre != a_t || (cx.insts[a_pre as usize]).block == h1 {
+            return false;
+        }
+        q = (cx.insts[q as usize]).next;
+    }
+    // The same test, the same values at the exit.
+    let c1 = (cx.blocks[h1 as usize]).cond;
+    let c2 = (cx.blocks[t as usize]).cond;
+    if !same_test(cx, c1, c2, stay1 != stay2, h1, &map) {
+        return false;
+    }
+    let mut x = (cx.blocks[exit as usize]).first;
+    while x != 0 && (cx.insts[x as usize]).op == Op::Phi {
+        let v1 = value_from(cx, x, h1, e1);
+        let v2 = value_from(cx, x, t, e2);
+        if !same_under(cx, v1, v2, h1, &map, 4) {
+            return false;
+        }
+        x = (cx.insts[x as usize]).next;
+    }
+    // The phis of h1 that l changes, and h1's own values, are read in h1,
+    // by h2's phis and at the exit only.
+    for i in 0..fn_block_count(cx, fi) {
+        let b = fn_block(cx, fi, i);
+        if (cx.blocks[b as usize]).removed != 0 {
+            continue;
+        }
+        let mut u = (cx.blocks[b as usize]).first;
+        while u != 0 {
+            let is_phi = (cx.insts[u as usize]).op == Op::Phi;
+            let allowed = (b == h1 && !is_phi) || (is_phi && (b == h2 || b == exit || b == e1));
+            if !allowed {
+                for k in 0..ir_operand_count(cx, u) {
+                    let o = ir_operand(cx, u, k);
+                    if o == 0 {
+                        continue;
+                    }
+                    let w = ir_val(cx, o);
+                    if (cx.insts[w as usize]).block == h1
+                        && ((cx.insts[w as usize]).op != Op::Phi || mapped(&map, w) != w) {
+                        return false;
+                    }
+                }
+            }
+            u = (cx.insts[u as usize]).next;
+        }
+        let c = (cx.blocks[b as usize]).cond;
+        if b != h1 && c != 0 {
+            let w = ir_val(cx, c);
+            if (cx.insts[w as usize]).block == h1
+                && ((cx.insts[w as usize]).op != Op::Phi || mapped(&map, w) != w) {
+                return false;
+            }
+        }
+    }
+    // t jumps to h1.
+    let mut values: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut p = (cx.blocks[h1 as usize]).first;
+    while p != 0 && (cx.insts[p as usize]).op == Op::Phi {
+        values.push(mapped(&map, p));
+        p = (cx.insts[p as usize]).next;
+    }
+    remove_pred(cx, h2, t);
+    remove_pred(cx, e2, t);
+    // (t's own exit block, which nothing reaches now)
+    if e2 != exit && (cx.blocks[e2 as usize]).preds.len() == 0 {
+        remove_block(cx, e2);
+    }
+    (cx.blocks[t as usize]).term = Term::Jump;
+    (cx.blocks[t as usize]).cond = 0;
+    (cx.blocks[t as usize]).s0 = h1;
+    (cx.blocks[t as usize]).s1 = 0;
+    add_pred_values(cx, h1, t, &values, 0);
+    true
+}
+
+// unnest_loop on the loops of function fi: the first it takes (the caller
+// cleans up and asks again). Returns whether one was.
+pub fn unnest_loops(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
+    ir_enter(cx, fi, pcx);
+    canonicalize_loops(cx, fi, pcx);
+    hoist_constants(cx, fi);
+    resolve_all(cx, fi);
+    remove_trivial_phis(cx, fi, pcx);
+    resolve_all(cx, fi);
+    for l in 0..loop_count(cx) {
+        if unnest_loop(cx, fi, l, pcx) {
+            return true;
+        }
+    }
+    false
+}
+
 // Both, on every loop of function fi (canonical form first). Returns
 // whether anything changed.
 pub fn count_loop_exits(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
     ir_enter(cx, fi, pcx);
     canonicalize_loops(cx, fi, pcx);
-    let mut changed = false;
+    let mut changed = hoist_constants(cx, fi);
+    // (0.30: the phis the new latch of a loop with two back edges got
+    // for values that are one, before the steps are read through them)
+    resolve_all(cx, fi);
+    remove_trivial_phis(cx, fi, pcx);
+    resolve_all(cx, fi);
     for l in 0..loop_count(cx) {
         if loop_header(cx, l) == fn_entry(cx, fi) {
             continue;
