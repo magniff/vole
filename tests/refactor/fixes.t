@@ -88,5 +88,5 @@ $ undo
 undid fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block	3 files	+4 -8 lines
 % git status --short
 $ fix --only nonsense
-error fix.usage: --only takes imports, unused, pub, unsafe, suggested, tidy-imports, reexports, unneeded-unsafe, unneeded-justified, obsolete-attr, alloc, effects, effects-std or effects-std-all, not 'nonsense'
+error fix.usage: --only takes imports, unused, redundant, pub, unsafe, suggested, tidy-imports, reexports, unneeded-unsafe, unneeded-justified, obsolete-attr, alloc, effects, effects-std or effects-std-all, not 'nonsense'
 [exit 2]

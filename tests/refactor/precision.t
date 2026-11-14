@@ -152,10 +152,7 @@ try: volec refactor signature NAME --type x T --default EXPR
 [exit 2]
 ## fix --in MODULE: its child modules too.
 $ edit patch lib/inner.vl --old 'use crate::calc::clamp;' --new '' --no-check
-lib/inner.vl:4:5: error[type error] undefined variable 'clamp' | help: add `use crate::calc::clamp;` | try: volec fix --suggested main.vl  [in crate::lib::inner::double]
 patched crate::lib::inner	lib/inner.vl	+0 -1 lines
-warning edit.breaks: 1 new error (1 in crate::lib::inner::double, which the edit does not change); written anyway (--no-check); the error: lib/inner.vl:4:5: undefined variable 'clamp'
-try: volec check
 $ fix --in crate::lib --dry-run
 --- a/lib/inner.vl
 +++ b/lib/inner.vl

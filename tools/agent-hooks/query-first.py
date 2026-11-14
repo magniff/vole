@@ -1085,6 +1085,61 @@ def with_root(t, root):
     return " | ".join(out)
 
 
+def no_bodies(text):
+    """(0.30) text with each here-document's body left out, `<<'EOF' ...
+    (its N lines, as typed) ... EOF`: a block message once gave a 300-line
+    here-document back, in its `try the line without it`."""
+    def short(m):
+        full = m.group(0)
+        head, _, rest = full.partition("\n")
+        n = max(rest.rstrip("\n").count("\n"), 0)
+        tail = "\n" if full.endswith("\n") else ""
+        return "%s\n(the here-document's %d line%s, as typed)\n%s%s" % (
+            head, n, "" if n == 1 else "s", m.group(1), tail)
+    return HEREDOC.sub(short, text)
+
+
+def has_body(text):
+    return bool(text) and bool(HEREDOC.search(text))
+
+
+def tree_compilers(run_in):
+    """(0.30) (the compiler of the checkout holding run_in, as typed from
+    there, or None; the main checkout's target/tools/volec when this is a
+    worktree without one, or None; the checkout's root)."""
+    top, shared = checkout_of(run_in)
+    # (a checkout of its own: not a tree extracted inside another, a
+    # release's under target/bootstrap, which has no compiler by design)
+    if not top or not os.path.exists(os.path.join(top, ".git")):
+        return None, None, None
+    for rel in ("target/tools/volec", "target/volec"):
+        full = os.path.join(top, rel)
+        if os.access(full, os.X_OK):
+            r = os.path.relpath(full, run_in)
+            return (r if not r.startswith("..") else full), None, top
+    main = os.path.dirname(shared) if shared and os.path.basename(shared) == ".git" \
+        and os.path.isfile(os.path.join(top, ".git")) else None
+    if main and os.path.abspath(main) != os.path.abspath(top):
+        other = os.path.join(main, "target", "tools", "volec")
+        if os.access(other, os.X_OK):
+            return None, other, top
+    return None, None, top
+
+
+def with_compiler(t, compiler, root):
+    """(0.30) Each `volec query ...` alternative of a try: text run by
+    `compiler`, with `--root ROOT` when it has none."""
+    out = []
+    for alt in t.split(" | "):
+        if alt.startswith("volec query "):
+            alt = compiler + alt[len("volec"):]
+            if root and "--root" not in alt:
+                k = alt.find(" (")
+                alt = alt + " --root " + root if k < 0 else alt[:k] + " --root " + root + alt[k:]
+        out.append(alt)
+    return " | ".join(out)
+
+
 def blocked_message(command, prog, args, seg, files, cwd, others=(), translated=(), whole=None, blocked_idx=()):
     """(the message for a blocked read, its `try:` commands): which command
     of the line reads source (when the line has several, the others are
@@ -1123,16 +1178,44 @@ def blocked_message(command, prog, args, seg, files, cwd, others=(), translated=
                          "the item at a line" % (arg, format(n, ","), SMALL_LINES, mod, rs, rs, arg))
             if mod != arg:
                 tries.append(with_root("volec query items %s" % mod, root))
+    # (0.30) A worktree with no compiler yet (before its first bootstrap):
+    # the try: lines name the main checkout's tools binary, with the
+    # worktree's root, so that they run as they are; with none anywhere,
+    # the command that builds one.
+    own, borrowed, top = tree_compilers(run_in)
+    note = None
+    if top and not own and is_vole_tree(top):
+        if borrowed:
+            wr = shlex.quote(os.path.join(top, "compiler", "src", "main.vl"))
+            tries = [with_compiler(t, shlex.quote(borrowed), wr) for t in tries]
+            note = ("this worktree has no compiler yet (no target/tools/volec): the try: lines run the main "
+                    "checkout's, with this tree as --root; `bootstrap/bootstrap.sh --dev --no-suite` (seconds) "
+                    "gives the worktree its own")
+        else:
+            note = ("no compiler here yet (no target/tools/volec, no target/volec): `bootstrap/bootstrap.sh --dev "
+                    "--no-suite` builds one in seconds, and the try: lines run after it")
+    if whole and borrowed and not own and whole.startswith("volec query ") and " | " not in whole \
+            and ";" not in whole and "&&" not in whole:
+        whole = with_compiler(whole, shlex.quote(borrowed), shlex.quote(os.path.join(top, "compiler", "src", "main.vl")))
     lines += ["try: %s" % t for t in tries]
+    if note:
+        lines.append(note)
     for o in others:
         t = with_root(suggestion(o[0], o[1]), root)
+        if borrowed and not own:
+            t = with_compiler(t, shlex.quote(borrowed), shlex.quote(os.path.join(top, "compiler", "src", "main.vl")))
         tries.append(t)
         lines.append("also blocked: %s; try: %s" % (where(o[2]), t))
     if translated:
         lines.append("the line's other reads of .vl source run as their queries on a retry: " +
                      "; ".join("`%s` as `%s`" % (p if len(p) <= 80 else p[:77] + "...", q)
                                for p, q, _ in translated))
-    if whole and len(parts) > 1:
+    if whole and len(parts) > 1 and has_body(whole):
+        # (0.30) never a here-document's body back: the line is named, not
+        # repeated
+        lines.append("then the whole line again with %s as its query above (its here-documents as typed; "
+                     "they are not repeated here): %s" % (where(seg), no_bodies(whole)))
+    elif whole and len(parts) > 1:
         # (0.25.2.1) The line with each blocked read as its query, to run as it is.
         lines.append("try the whole line: %s" % whole)
         tries.append(whole)
@@ -1143,7 +1226,10 @@ def blocked_message(command, prog, args, seg, files, cwd, others=(), translated=
     elif len(parts) > 1:
         # (0.25.2.2) the rest of the line, to run as it is
         rest = line_without(command, blocked_idx, [seg] + [o[2] for o in others])
-        if rest:
+        if rest and has_body(rest):
+            lines.append("then the line without %s (the rest did not run either; its here-documents as typed, "
+                         "not repeated here): %s" % ("it" if not others else "them", no_bodies(rest)))
+        elif rest:
             lines.append("try the line without %s (the rest did not run either): %s"
                          % ("it" if not others else "them", rest))
             tries.append(rest)
@@ -2072,7 +2158,9 @@ def main():
                                                                      if re.match(r"^(\S*/)?python[\d.]*\b", p.strip())]),
                                 what, files[0],
                                 edit_suggestion(prog, files, script, cwd, base),
-                                ("try the line without it (the rest did not run either): %s\n" % rest) if rest
+                                ("then the line without it (the rest did not run either; its here-documents as "
+                                 "typed, not repeated here): %s\n" % no_bodies(rest)) if has_body(rest)
+                                else ("try the line without it (the rest did not run either): %s\n" % rest) if rest
                                 else "then run the line's other commands again: they did not run\n"
                                 if len(parts) > 1 else "", ALLOWED_WRITES))
             return 2

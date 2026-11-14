@@ -63,6 +63,6 @@ missing UNSAFE:	2	2
 try: volec fix --only unneeded-unsafe
 ## One object a site.
 $ unsafe unsafe0253/raw.vl --json
-{"file":"unsafe0253/raw.vl","line":5,"kind":"unsafe fn","item":"crate::raw::sum","class":"raw-pointer","unsafe_comment":true,"safety_comment":true,"justified":true,"checked":true,"ops":"deref, unsafe-call(*const i64::add)"}
-{"file":"unsafe0253/raw.vl","line":13,"kind":"unsafe fn","item":"crate::raw::first","class":"raw-pointer","unsafe_comment":false,"safety_comment":false,"justified":false,"checked":true,"ops":"deref"}
-{"file":"unsafe0253/raw.vl","line":19,"kind":"block","item":"crate::raw::peek","class":"raw-pointer","unsafe_comment":false,"safety_comment":false,"justified":false,"checked":true,"ops":"deref"}
+{"file":"unsafe0253/raw.vl","line":5,"end_line":11,"kind":"unsafe fn","item":"crate::raw::sum","class":"raw-pointer","unsafe_comment":true,"safety_comment":true,"justified":true,"checked":true,"ops":"deref, unsafe-call(*const i64::add)"}
+{"file":"unsafe0253/raw.vl","line":13,"end_line":15,"kind":"unsafe fn","item":"crate::raw::first","class":"raw-pointer","unsafe_comment":false,"safety_comment":false,"justified":false,"checked":true,"ops":"deref"}
+{"file":"unsafe0253/raw.vl","line":19,"end_line":19,"kind":"block","item":"crate::raw::peek","class":"raw-pointer","unsafe_comment":false,"safety_comment":false,"justified":false,"checked":true,"ops":"deref"}

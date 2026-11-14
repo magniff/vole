@@ -82,10 +82,7 @@ as the `try:` line says):
 ```console
 $ volec edit patch clamp --old '    if x < lo {' --new '    println("clamp {x}");
 >     if x < lo {' --no-check
-main.vl:36:1: error[effect] 'score' is #[pure], but it does io: 'smoothed(s, i, gain)' at main.vl:39:14 calls 'smoothed' | help: return the data and let the caller print it, or remove #[pure] | try: volec query effects score --why io  [in crate::score]
 patched crate::clamp	main.vl	+1 -0 lines
-warning edit.breaks: 1 new error (1 in crate::score, which the edit does not change); written anyway (--no-check); the error: main.vl:36:1: 'score' is #[pure], but it does io: 'smoothed(s, i, gain)' at main.vl:39:14 calls 'smoothed'
-try: volec check
 $ volec query effects smoothed --why io | head -4
 crate::smoothed	io static panic
   'scaled(s[i], gain)' at main.vl:29:6 calls 'scaled'

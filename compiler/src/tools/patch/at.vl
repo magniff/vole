@@ -1,0 +1,337 @@
+// Patches by position (0.30; docs/refactor.md, "Many small patches, one
+// check"): the errors of a check name FILE:LINE:COL, not items, and a
+// bulk edit is a list of them. One call, positions resolved in the text
+// as it was before the edit, one check at the end:
+//
+//   volec edit patch --at FILE:LINE[:COL] --old TEXT --new TEXT [--at ...]...
+//   volec edit patch --from LIST        (`-`: stdin)
+//   volec edit apply --at < LIST
+//
+// OLD is looked for on that line only: once there, or starting at COL
+// (the column a diagnostic prints). An empty OLD with a COL inserts NEW
+// there. LIST has a patch a line, `FILE:LINE[:COL]<TAB>OLD<TAB>NEW`
+// (`\t`, `\n` and `\\` in OLD and NEW are a tab, a newline and a
+// backslash; blank lines and `#` lines are skipped).
+//
+// A patch that does not match is named (`patch.no-match: patch 3
+// (a.vl:12)`, `patch.ambiguous`), every one of them, and nothing is
+// written; with --keep-going the others are written and `patch.sites`
+// counts both.
+
+use crate::base::{buf_byte, buf_bytes, buf_copy, buf_int, buf_new, buf_str, get_src};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::tools::ctx::Tcx;
+use crate::tools::patch::{replaced, target_index, text_buffer};
+use crate::tools::query::{c_slice, file_line, file_named};
+use crate::tools::query::diagnostics::diag;
+use crate::tools::query::positions::line_index;
+
+// A field of a LIST line with its escapes read, in a buffer.
+fn unescaped(t: &[u8]) -> i64 {
+    let out = buf_new();
+    let mut i: usize = 0;
+    while i < t.len() {
+        if t[i] == b'\\' && i + 1 < t.len()
+            && (t[i + 1] == b't' || t[i + 1] == b'n' || t[i + 1] == b'\\') {
+            buf_byte(out, if t[i + 1] == b't' { b'\t' } else if t[i + 1] == b'n' { b'\n' }
+                else { b'\\' });
+            i += 2;
+        } else {
+            buf_byte(out, t[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn list_error(n: i64, message: *const u8, shape: *const u8, tcx: &mut Tcx<Comp>) -> bool {
+    let d = diag(c"error", c"patch.format", tcx);
+    buf_str(d, c"the list's line ");
+    buf_int(d, n);
+    buf_str(d, c": ");
+    buf_str(d, message);
+    buf_str(d, c"; a line is ");
+    buf_str(d, shape);
+    buf_str(d, c" (\\t, \\n, \\\\ in the texts)\n");
+    false
+}
+
+// A line of a list of patches, as a diagnostic shows it.
+pub const PATCH_LINE: *const u8 = c"FILE:LINE[:COL]<TAB>OLD<TAB>NEW";
+
+// The patches of a LIST, each a pair with its position as its target.
+// False after the diagnostic. (`shape`: a line as the diagnostic shows
+// it; `edit justify --from` reads its list here too, the two comments
+// as OLD and NEW.)
+pub fn read_list(input: &[u8], shape: *const u8, tcx: &mut Tcx<Comp>) -> bool {
+    let before = tcx.olds.len();
+    let mut n: i64 = 0;
+    let mut i: usize = 0;
+    while i < input.len() {
+        let mut e = i;
+        while e < input.len() && input[e] != b'\n' {
+            e += 1;
+        }
+        let mut b = e;
+        if b > i && input[b - 1] == b'\r' {
+            b -= 1;
+        }
+        let line = &input[i..b];
+        i = e + 1;
+        n += 1;
+        if line.len() == 0 || line[0] == b'#' {
+            continue;
+        }
+        let mut t1 = line.len();
+        let mut t2 = line.len();
+        let mut tabs: i64 = 0;
+        for k in 0..line.len() {
+            if line[k] == b'\t' {
+                tabs += 1;
+                if tabs == 1 {
+                    t1 = k;
+                } else if tabs == 2 {
+                    t2 = k;
+                }
+            }
+        }
+        if tabs != 2 {
+            return list_error(n, c"three fields, two tabs between them, are needed", shape, tcx);
+        }
+        let mut at_line: i64 = 0;
+        if file_line(&line[0..t1], &mut at_line) <= 0 || at_line <= 0 {
+            return list_error(n, c"its first field is no FILE:LINE", shape, tcx);
+        }
+        tcx.olds.push(unescaped(&line[t1 + 1..t2]));
+        tcx.news.push(unescaped(&line[t2 + 1..]));
+        let t = target_index(&line[0..t1], tcx);
+        tcx.pair_target.push(t);
+    }
+    if tcx.olds.len() == before {
+        return list_error(n, c"nothing in the list", shape, tcx);
+    }
+    true
+}
+
+// The column of `FILE:LINE:COL` (0: none given).
+fn column(name: &[u8]) -> i64 {
+    let mut line: i64 = 0;
+    let n = file_line(name, &mut line);
+    if n <= 0 {
+        return 0;
+    }
+    let mut k = n as usize + 1;
+    while k < name.len() && name[k] != b':' {
+        k += 1;
+    }
+    if k >= name.len() {
+        return 0;
+    }
+    let mut col: i64 = 0;
+    k += 1;
+    while k < name.len() && name[k] >= b'0' && name[k] <= b'9' && col < 1000000 {
+        col = col * 10 + (name[k] - b'0') as i64;
+        k += 1;
+    }
+    col
+}
+
+// `patch K (FILE:LINE): OLD 'text'`, the head of what is said of a patch
+// that does not match.
+fn put_patch(d: i64, k: i64, name: &[u8], old: &[u8]) {
+    buf_str(d, c"patch ");
+    buf_int(d, k + 1);
+    buf_str(d, c" (");
+    buf_bytes(d, name);
+    buf_str(d, c"): OLD '");
+    put_cut(d, old, 60);
+    buf_byte(d, b'\'');
+}
+
+// t on one line, at most n bytes of it.
+fn put_cut(d: i64, t: &[u8], n: usize) {
+    let mut k: usize = 0;
+    while k < t.len() && k < n {
+        if t[k] == b'\n' {
+            buf_str(d, c"\\n");
+        } else {
+            buf_byte(d, t[k]);
+        }
+        k += 1;
+    }
+    if k < t.len() {
+        buf_str(d, c"...");
+    }
+}
+
+// Where patch k's OLD is: [*s, *e) of the source. False after the
+// diagnostic that names the patch.
+fn site(k: i64, s: &mut i64, e: &mut i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
+    let name = c_slice((tcx.patch_targets[(tcx.pair_target[k as usize]) as usize]) as *mut u8);
+    let old = buf_copy(tcx.olds[k as usize]);
+    let mut line: i64 = 0;
+    let n = file_line(&name, &mut line);
+    let f: i64 = if n > 0 { file_named(&name[0..n as usize], pcx) } else { -1 };
+    let mut idx: i64 = -1;
+    if f >= 0 && line > 0 {
+        idx = line_index(pcx.files[f as usize].start, pcx) + line - 1;
+    }
+    if idx < 0 || idx >= pcx.lines.len() as i64
+        || pcx.lines[idx as usize] >= pcx.files[f as usize].end {
+        let d = diag(c"error", c"patch.no-match", tcx);
+        put_patch(d, k, &name, &old);
+        buf_str(d, if f < 0 { c": no such file in the program\n" }
+            else { c": the file has no such line\n" });
+        return false;
+    }
+    let end = pcx.files[f as usize].end;
+    let ls = pcx.lines[idx as usize];
+    let mut le = end;
+    if idx + 1 < pcx.lines.len() as i64 && pcx.lines[(idx + 1) as usize] < end {
+        le = pcx.lines[(idx + 1) as usize];
+    }
+    let src = get_src();
+    // (the line without its newline, for the messages)
+    let mut shown_end = le;
+    if shown_end > ls && src[(shown_end - 1) as usize] == b'\n' {
+        shown_end -= 1;
+    }
+    let col = column(&name);
+    if col > 0 {
+        let p = ls + col - 1;
+        if p <= shown_end && p + old.len() as i64 <= end
+            && &src[p as usize..p as usize + old.len()] == old.as_slice() {
+            *s = p;
+            *e = p + old.len() as i64;
+            return true;
+        }
+        let d = diag(c"error", c"patch.no-match", tcx);
+        put_patch(d, k, &name, &old);
+        buf_str(d, c" is not at that column; the line: ");
+        put_cut(d, trimmed_left(&src[ls as usize..shown_end as usize]), 120);
+        buf_byte(d, b'\n');
+        return false;
+    }
+    if old.len() == 0 {
+        let d = diag(c"error", c"patch.no-match", tcx);
+        put_patch(d, k, &name, &old);
+        buf_str(d, c" is empty: NEW is inserted at a column, FILE:LINE:COL\n");
+        return false;
+    }
+    let mut count: i64 = 0;
+    let mut second: i64 = 0;
+    let mut p = ls;
+    while p < shown_end {
+        if p + old.len() as i64 <= end
+            && &src[p as usize..p as usize + old.len()] == old.as_slice() {
+            count += 1;
+            if count == 1 {
+                *s = p;
+                *e = p + old.len() as i64;
+            } else if count == 2 {
+                second = p;
+            }
+        }
+        p += 1;
+    }
+    if count == 1 {
+        return true;
+    }
+    if count == 0 {
+        let d = diag(c"error", c"patch.no-match", tcx);
+        put_patch(d, k, &name, &old);
+        buf_str(d, c" is not on that line: ");
+        put_cut(d, trimmed_left(&src[ls as usize..shown_end as usize]), 120);
+        buf_byte(d, b'\n');
+        return false;
+    }
+    let d = diag(c"error", c"patch.ambiguous", tcx);
+    put_patch(d, k, &name, &old);
+    buf_str(d, c" is on that line ");
+    buf_int(d, count);
+    buf_str(d, c" times (columns ");
+    buf_int(d, *s - ls + 1);
+    buf_str(d, c", ");
+    buf_int(d, second - ls + 1);
+    buf_str(d, if count > 2 { c", ...): name one, " } else { c"): name one, " });
+    buf_bytes(d, &name);
+    buf_byte(d, b':');
+    buf_int(d, *s - ls + 1);
+    buf_byte(d, b'\n');
+    false
+}
+
+fn trimmed_left(t: &[u8]) -> &[u8] {
+    let mut a: usize = 0;
+    while a < t.len() && (t[a] == b' ' || t[a] == b'\t') {
+        a += 1;
+    }
+    &t[a..]
+}
+
+// Every patch placed, then made (the engine's edit; the caller applies
+// and checks it once); `summary` gets `patched N sites`. False after the
+// diagnostics, when nothing is to be written.
+// The number of patches left out (--keep-going); -1 after the diagnostics
+// when nothing is to be written.
+pub fn patch_sites(keep_going: bool, summary: i64, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
+    let n = tcx.olds.len() as i64;
+    let mut starts: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut ends: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut failed: i64 = 0;
+    for k in 0..n {
+        let mut s: i64 = -1;
+        let mut e: i64 = -1;
+        if !site(k, &mut s, &mut e, tcx, pcx) {
+            s = -1;
+            failed += 1;
+        }
+        starts.push(s);
+        ends.push(e);
+    }
+    if failed > 0 {
+        let d = diag(if keep_going && failed < n { c"warning" } else { c"error" }, c"patch.sites",
+            tcx);
+        buf_int(d, failed);
+        buf_str(d, c" of ");
+        buf_int(d, n);
+        buf_str(d, if n == 1 { c" patch does not match" } else { c" patches do not match" });
+        if failed == n {
+            buf_str(d, c"; nothing written\n");
+        } else if keep_going {
+            buf_str(d, c" and are left out; the other ");
+            buf_int(d, n - failed);
+            buf_str(d, c" are written\n");
+        } else {
+            buf_str(d, c"; nothing written (--keep-going writes the ");
+            buf_int(d, n - failed);
+            buf_str(d, c" that do)\n");
+        }
+        if !keep_going || failed == n {
+            return -1;
+        }
+    }
+    let mut files: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for k in 0..n {
+        let s = starts[k as usize];
+        if s < 0 {
+            continue;
+        }
+        let text = text_buffer(&buf_copy(tcx.news[k as usize]));
+        if !replaced(k, s, ends[k as usize], text, tcx, pcx) {
+            return -1;
+        }
+        let f = crate::front::modules::file_of_pos(s, pcx);
+        if !files.contains(&f) {
+            files.push(f);
+        }
+    }
+    buf_int(summary, n - failed);
+    buf_str(summary, if n - failed == 1 { c" site" } else { c" sites" });
+    if failed > 0 {
+        buf_str(summary, c" of ");
+        buf_int(summary, n);
+    }
+    failed
+}

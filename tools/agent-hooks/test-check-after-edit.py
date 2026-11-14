@@ -442,6 +442,89 @@ try:
         recs = [json.loads(x) for x in fh if x.strip()]
     case("hook fix: logged", [r.get("hook_fixed") for r in recs if "hook_fixed" in r][:1], [1])
 
+    # (0.30, the 0.29 tool diaries) A suggestion or refusal is one line of
+    # at most LINE_MAX characters; the same refusal at several positions is
+    # one line with its count.
+    long_refusal = "main.vl:9:5: not applied: `" + "x" * 400 + "`"
+    got = hook.refusals(["a.vl:3:5: not applied: `cx`: did you mean cx", "a.vl:8:5: not applied: `cx`: did you mean cx",
+                         "b.vl:1:1: not applied: other", long_refusal])
+    case("refusals: counted, one line each, cut",
+         (got[:2], len(got[2]), got[2].endswith("..."), max(len(x) for x in got) <= hook.LINE_MAX),
+         (["refused (2 sites, the first a.vl:3:5): not applied: `cx`: did you mean cx",
+           "refused: b.vl:1:1: not applied: other"], hook.LINE_MAX, True, True))
+    case("cut: one line", hook.cut("a\n   b  c", 8), "a b c")
+    case("suggestion key: no line number",
+         [hook.suggestion_key("main.vl:4: prinln(x); -> println(x);"),
+          hook.suggestion_key("refused: main.vl:4:5: not applied: no"),
+          hook.suggestion_key("refused (3 sites, the first a.vl:3:5): not applied: no")],
+         ["main.vl: prinln(x); -> println(x);", "refused: main.vl: not applied: no", "refused: not applied: no"])
+    # The suggestions are asked for when the edit made an error with an
+    # exact fix, and only those not shown at the last check are printed.
+    sstate = tempfile.mkdtemp(dir=tmp)
+    sev = dict(ev, session_id="suggest-once")
+    dry1 = [["--- a/main.vl"], ["+++ b/main.vl"], ["@@ -4 +4 @@"], ["-    prinln(\"x\");"], ["+    println(\"x\");"]]
+    fake3_says([typo, other], [], [], dry1)
+    got1 = ctx_of(run(sev, fake3, sstate)[1])
+    fake3_says([dict(typo, line=6), other], [], [], dry1)
+    got2 = ctx_of(run(sev, fake3, sstate)[1])
+    calls2 = fix_calls()
+    typo2 = dict(typo, line=9, message="undefined variable 'eprinln'", help=["did you mean 'eprintln'?"])
+    dry2 = dry1 + [["@@ -9 +9 @@"], ["-    eprinln(\"y\");"], ["+    eprintln(\"y\");"]]
+    fake3_says([dict(typo, line=6), other, typo2], [], [], dry2)
+    got3 = ctx_of(run(sev, fake3, sstate)[1])
+    case("suggestions: shown at the first check, not again for the same errors, then only the new one",
+         ("suggested, not applied" in got1, got2, calls2, got3.split("\n")[-2:]),
+         (True, "volec check main.vl: 2 errors (2 as before)\ntry: volec fix --suggested main.vl   (1 of the errors: "
+          "their exact fixes, one checked edit)", [], [shown, "  main.vl:9: eprinln(\"y\"); -> eprintln(\"y\");"]))
+    # An error repeated at three sites or more is one line.
+    rep3 = [diag("a.vl", 2, "undefined variable 'n'"), diag("b.vl", 5, "undefined variable 'n'"), other,
+            diag("a.vl", 9, "undefined variable 'n'")]
+    case("grouped: a repeated error is its first site, counted",
+         [(d["file"], d["line"], d["message"]) for d in hook.grouped(rep3)],
+         [("a.vl", 2, "undefined variable 'n' (3 sites in 2 files, the first here)"),
+          ("main.vl", 5, "expected '[u8]', got 'i64'")])
+    case("grouped: two of one are two lines", len(hook.grouped(rep3[:3])), 3)
+    case("grouped: in the report",
+         hook.report(rep3, "main.vl", None),
+         "volec check main.vl: 4 errors\na.vl:2:5: error[type error] undefined variable 'n' (3 sites in 2 files, the "
+         "first here)\nmain.vl:5:5: error[type error] expected '[u8]', got 'i64'")
+    # After a --no-check step: one line and at most the first two new
+    # errors, cut; no fix commands, no suggestions.
+    nstate = tempfile.mkdtemp(dir=tmp)
+    nev = {"hook_event_name": "PostToolUse", "tool_name": "Bash", "cwd": prog, "session_id": "no-check",
+           "tool_input": {"command": "volec edit patch f --old a --new b --no-check"},
+           "tool_response": {"stdout": "patched crate::f\tmain.vl\t+1 -1 lines\n", "stderr": ""}}
+    case("no-check step: recognised", (hook.no_check_step(nev), hook.no_check_step(ev),
+                                       hook.no_check_step(dict(nev, tool_input={"command": "volec edit patch f --old a --new b"}))),
+         (True, False, False))
+    wide = diag("main.vl", 8, "expected 'i64', got '" + "Vec<" * 80 + "'")
+    third = diag("main.vl", 9, "undefined variable 'z'")
+    fake3_says([other], [], [])
+    run(dict(nev, tool_input={"command": "volec edit patch f --old a --new b"}), fake3, nstate)
+    fake3_says([other, typo, wide, third], [], [], dry1)
+    got = ctx_of(run(nev, fake3, nstate)[1]).split("\n")
+    case("no-check step: one line, the first two new errors, cut, no suggestions",
+         (got[0], got[1], len(got[2]), got[3:], fix_calls()),
+         ("volec check: 4 errors (3 new)", "main.vl:4:5: error[type error] undefined variable 'prinln' | help: did you "
+          "mean 'println'?", hook.LINE_MAX, ["(1 more new: volec check)"], []))
+    # A scratch program (in no checkout) changed from a session in a
+    # checkout: the count and each error once, no suggestions.
+    co = os.path.join(tmp, "co")
+    os.makedirs(os.path.join(co, ".git"))
+    sdir = os.path.join(tmp, "scratch")
+    write(os.path.join(sdir, "a.vl"), "fn main() {}\n")
+    case("scratch root: in no checkout, from one",
+         (hook.scratch_root(os.path.join(sdir, "a.vl"), co), hook.scratch_root(os.path.join(sdir, "a.vl"), sdir),
+          hook.scratch_root(os.path.join(co, "a.vl"), co)), (True, False, False))
+    styp = dict(typo, file=os.path.join(sdir, "a.vl"), **{"try": ["volec fix --suggested " + os.path.join(sdir, "a.vl")]})
+    fake3_says([styp], [], [], dry1)
+    scev = {"hook_event_name": "PostToolUse", "tool_name": "Write", "cwd": co, "session_id": "scratch",
+            "tool_input": {"file_path": os.path.join(sdir, "a.vl")}, "tool_response": {"type": "update"}}
+    case("scratch program: the error once, its path short, no suggestions",
+         (ctx_of(run(scev, fake3)[1]), fix_calls()),
+         ("volec check " + os.path.join(sdir, "a.vl") + ": 1 error\na.vl:4:5: error[type error] undefined variable "
+          "'prinln' | help: did you mean 'println'?", []))
+
     # (0.17) A worktree's file edited from a session in the main checkout:
     # the worktree's root and compiler, check run in the worktree (check
     # reads compiler/std from the directory it runs in), its paths from

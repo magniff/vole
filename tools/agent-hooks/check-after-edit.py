@@ -147,6 +147,27 @@ it is the one on PATH, else its path from the event's directory), so the
 - A change to compiler/guide/*.md: compiler/guide/embed.sh run, the
   files it rewrote named (guide_embed; VOLE_HOOK_FIX=0: said only).
 
+(0.30, the 0.29 tool diaries, themes B and E: the hook's lines were a
+quarter of some agents' context)
+- After a `--no-check` step (`volec edit|refactor|rewrite ... --no-check`:
+  a step of a bulk edit, its state broken on purpose) the hook says one
+  line, `volec check ROOT: N errors (M new)`, and at most the first two
+  new errors, each cut to LINE_MAX characters: no fix commands, no
+  suggestions, no fix of its own, no format note.
+- The suggestions (`suggested, not applied`) are asked for only when the
+  edit made a new error that has an exact fix, and only the ones not
+  shown at the last check of the root are printed (hookstate keeps what
+  was shown); each is one line of at most LINE_MAX characters; identical
+  refusals (the same message at several positions) are one line with
+  their count.
+- An error repeated at GROUP_MIN sites or more (the same code and
+  message) is one line, its first site's, with `(N sites in F files, the
+  first here)`.
+- A scratch program (a root in no checkout, changed from a session in
+  one): the count and each error once, its path from the root's
+  directory, without the fix commands, the suggestions and the format
+  note.
+
 VOLE_CHECK_HOOK=0 turns it off; VOLE_HOOK_FIX=0 leaves the exact
 fixes to the agent. Development tooling only.
 """
@@ -160,6 +181,12 @@ import types
 HERE = os.path.dirname(os.path.abspath(__file__))
 MAX_SHOWN = 10
 TIMEOUT = 30
+# (0.30) A suggestion, a refusal, an error after a --no-check step: one
+# line of at most this many characters; the errors shown after such a step
+# and for a scratch program.
+LINE_MAX = 200
+BRIEF_SHOWN = 2
+SCRATCH_SHOWN = 3
 
 
 def limit(base):
@@ -691,13 +718,55 @@ def apply_exact(compiler, root, cwd, unused_in=()):
     return (changed, lines) if changed else None
 
 
+def cut(text, n=LINE_MAX):
+    """(0.30) text as one line of at most n characters (a refusal once
+    quoted a file's first 140 lines: 6000 characters on one line)."""
+    text = " ".join(text.split())
+    return text if len(text) <= n else text[:n - 3].rstrip() + "..."
+
+
+REFUSED_AT = re.compile(r"^(\S+?:\d+(?::\d+)?): (.*)$", re.S)
+
+
+def refusals(messages):
+    """(0.30) The compiler's refusals, one line each: the same message at
+    several positions is one line, `refused (N sites, the first FILE:L:C):
+    MESSAGE`, in order of first appearance."""
+    seen, order = {}, []
+    for m in messages:
+        at = REFUSED_AT.match(m)
+        where, what = (at.group(1), at.group(2)) if at else ("", m)
+        what = " ".join(what.split())
+        if what not in seen:
+            seen[what] = []
+            order.append(what)
+        seen[what].append(where)
+    out = []
+    for what in order:
+        sites = seen[what]
+        if len(sites) == 1:
+            out.append(cut(f"refused: {sites[0] + ': ' if sites[0] else ''}{what}"))
+        else:
+            first = f", the first {sites[0]}" if sites[0] else ""
+            out.append(cut(f"refused ({len(sites)} sites{first}): {what}"))
+    return out
+
+
 def shown_exact(compiler, root, cwd):
     """(0.25.2.1) The other exact fixes, not made: `volec fix --suggested
-    --dry-run ROOT`'s changes and refusals (lines), or []."""
+    --dry-run ROOT`'s changes and refusals (lines), or []. (0.30) Each
+    one line of at most LINE_MAX characters, identical refusals counted."""
     got = fix_output(compiler, cwd, ["--suggested", "--dry-run"] + root_args(root, cwd), root)
     if got is None:
         return []
-    return diff_changes(got[1]) + [f"refused: {m}" for m in got[2]]
+    return [cut(x) for x in diff_changes(got[1])] + refusals(got[2])
+
+
+def suggestion_key(line):
+    """(0.30) A suggestion as the hook remembers it: without its line
+    number and count, which move as the file is edited."""
+    line = re.sub(r"^refused \(\d+ sites[^)]*\): ", "refused: ", line)
+    return re.sub(r"(^|: )([^\s:]+):\d+(?::\d+)?: ", r"\1\2: ", line, count=1)
 
 
 def same_file(a, b):
@@ -799,6 +868,33 @@ def fix_lines(errors):
     return ([f"try: {cmd}   ({which(cmd, k)})" for cmd, k in fixes], {cmd for cmd, _ in fixes})
 
 
+GROUP_MIN = 3
+
+
+def grouped(errors):
+    """(0.30) The errors with the repeats of one folded: an error whose
+    code and message occur GROUP_MIN times or more is its first site, with
+    `(N sites in F files, the first here)` after its message; the others
+    as they are, in order. (One missing import used at 41 sites was 10
+    identical lines and `(31 more)`.)"""
+    count, files = {}, {}
+    for d in errors:
+        k = (d.get("code") or "", d.get("message") or "")
+        count[k] = count.get(k, 0) + 1
+        files.setdefault(k, set()).add(d.get("file") or "")
+    out, done = [], set()
+    for d in errors:
+        k = (d.get("code") or "", d.get("message") or "")
+        if count[k] < GROUP_MIN:
+            out.append(d)
+        elif k not in done:
+            done.add(k)
+            f = len(files[k])
+            out.append(dict(d, message=f"{d.get('message', '')} ({count[k]} sites in {f} file"
+                                       f"{'s' if f != 1 else ''}, the first here)"))
+    return out
+
+
 def report(diags, root_shown, edited):
     """The context for the agent: nothing when clean."""
     errors = [d for d in diags if d.get("severity") == "error"]
@@ -812,9 +908,10 @@ def report(diags, root_shown, edited):
     lines = [f"volec check{' ' + root_shown if root_shown else ''}: {n} error{'s' if n != 1 else ''}"]
     fl, fixes = fix_lines(errors)
     lines += fl
-    lines += [line_of(d, fixes) for d in errors[:MAX_SHOWN]]
-    if n > MAX_SHOWN:
-        lines.append(f"({n - MAX_SHOWN} more: volec check{' ' + root_shown if root_shown else ''})")
+    folded = grouped(errors)
+    lines += [line_of(d, fixes) for d in folded[:MAX_SHOWN]]
+    if len(folded) > MAX_SHOWN:
+        lines.append(f"({len(folded) - MAX_SHOWN} more: volec check{' ' + root_shown if root_shown else ''})")
     return "\n".join(lines)
 
 
@@ -1061,6 +1158,72 @@ def error_key(d):
     return "%s|%s|%s" % (os.path.basename(d.get("file") or ""), d.get("code") or "", d.get("message") or "")
 
 
+def new_errors(errors, before):
+    """(0.30) (the errors that the last check of the root had not, how
+    many of its errors are gone): all of them and 0 when there was none
+    (before is None)."""
+    if before is None:
+        return list(errors), 0
+    left = {}
+    for k in before:
+        left[k] = left.get(k, 0) + 1
+    new = []
+    for d in errors:
+        k = error_key(d)
+        if left.get(k, 0) > 0:
+            left[k] -= 1
+        else:
+            new.append(d)
+    return new, sum(left.values())
+
+
+def brief_report(errors, before, root_shown, shown=BRIEF_SHOWN, where_dir=None):
+    """(0.30) The check's context in one line and a few errors: after a
+    --no-check step (`N errors (M new)` and the first two new ones, cut to
+    LINE_MAX characters) and for a scratch program (where_dir: its
+    directory, which the errors' paths are shortened by)."""
+    new, fixed = new_errors(errors, before)
+    n = len(errors)
+    where = " " + root_shown if root_shown else ""
+    if n == 0:
+        return f"volec check{where}: 0 errors ({fixed} fixed)" if fixed else ""
+    parts = [f"{len(new)} new"] if before is not None else []
+    if fixed:
+        parts.append(f"{fixed} fixed")
+    head = f"volec check{where}: {n} error{'s' if n != 1 else ''}" + (f" ({', '.join(parts)})" if parts else "")
+    lines = [head]
+    new = grouped(new)
+    for d in new[:shown]:
+        d = dict(d, **{"try": []})
+        if where_dir and (d.get("file") or "").startswith(where_dir + os.sep):
+            d["file"] = d["file"][len(where_dir) + 1:]
+        lines.append(cut(line_of(d)))
+    if len(new) > shown:
+        lines.append(f"({len(new) - shown} more new: volec check{where})")
+    return "\n".join(lines)
+
+
+def no_check_step(event):
+    """(0.30) Whether the call is a Bash call whose volec edit, refactor,
+    rewrite or fix ran with --no-check: a step of a bulk edit."""
+    if event.get("tool_name") != "Bash":
+        return False
+    inp = event.get("tool_input") or {}
+    cwd = os.path.abspath(event.get("cwd") or os.getcwd())
+    for sub, words, _, _, _ in tc.calls_at(inp.get("command", ""), cwd):
+        if sub in WRITES and "--no-check" in words and "--dry-run" not in words:
+            return True
+    return False
+
+
+def scratch_root(root, cwd):
+    """(0.30) Whether root is a scratch program: in no checkout, while the
+    session's directory is in one."""
+    if not root:
+        return False
+    return checkout_root(os.path.dirname(os.path.abspath(root))) is None and checkout_root(cwd) is not None
+
+
 def delta_report(errors, before, root_shown, edited):
     """(0.17) The check's context when an earlier check of the same root in
     this session is known (`before`: its error keys): the counts and what
@@ -1099,8 +1262,8 @@ def delta_report(errors, before, root_shown, edited):
     lines += fl
     shown = report(new, root_shown, edited).split("\n")[1:] if new else []
     lines += [x for x in shown if not x.startswith(("(", "try: "))]
-    if len(new) > MAX_SHOWN:
-        lines.append(f"({len(new) - MAX_SHOWN} more new: volec check{where})")
+    if len(grouped(new)) > MAX_SHOWN:
+        lines.append(f"({len(grouped(new)) - MAX_SHOWN} more new: volec check{where})")
     return "\n".join(lines)
 
 
@@ -1222,7 +1385,7 @@ def expects_errors(cwd, *paths):
     return False
 
 
-def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
+def verify(event, st, compiler, root, cwd, edited, at_turn_end=False, brief=False):
     """Checks root (None: check's default in cwd), compares with this
     session's last check of it, runs its tests when they exist, are fast
     and are due; updates the session state st. (text for the agent, the
@@ -1242,7 +1405,11 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
     fixed_text, hook_fixed, shown_text = "", None, ""
     key = key_root or ("check@" + cwd)
     prev = (st.get("roots") or {}).get(key) or {}
-    allowed = not at_turn_end and os.environ.get("VOLE_HOOK_FIX", "1") != "0" \
+    # (0.30) brief: after a --no-check step; scratch: a program in no
+    # checkout. Neither gets a fix of the hook's, the suggestions or the
+    # format note.
+    scratch = not at_turn_end and scratch_root(key_root, cwd)
+    allowed = not at_turn_end and not brief and not scratch and os.environ.get("VOLE_HOOK_FIX", "1") != "0" \
         and not expects_errors(cwd, key_root, edited)
     unused = [d for d in diags if d.get("code") == UNUSED]
     unused_keys = [error_key(d) for d in unused]
@@ -1264,20 +1431,36 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
             diags = again
             errors = [d for d in again if d.get("severity") == "error"]
             unused_keys = [error_key(d) for d in again if d.get("code") == UNUSED]
-    if allowed and exact_errors(errors):
+    # (0.30) the suggestions only when this edit made an error that has
+    # one, and only those not shown at the last check of the root
+    suggested = prev.get("suggested") or []
+    if allowed and exact_errors(new_errors(errors, prev.get("errors"))[0]):
         lines = shown_exact(compiler, root, run_dir)
-        if lines:
-            shown_text = shown_report(lines, shown, compiler, run_dir)
+        fresh = [x for x in lines if suggestion_key(x) not in suggested]
+        suggested = [suggestion_key(x) for x in lines]
+        if fresh:
+            shown_text = shown_report(fresh, shown, compiler, run_dir)
+    elif not exact_errors(errors):
+        suggested = []
     roots = st.setdefault("roots", {})
     keys = [error_key(d) for d in errors]
-    text = report(errors, shown, edited) if at_turn_end else delta_report(errors, prev.get("errors"), shown, edited)
+    if at_turn_end:
+        text = report(errors, shown, edited)
+    elif brief:
+        text = brief_report(errors, prev.get("errors"), shown)
+    elif scratch:
+        text = brief_report(errors, prev.get("errors"), shown, SCRATCH_SHOWN, os.path.dirname(key_root))
+    else:
+        text = delta_report(errors, prev.get("errors"), shown, edited)
     if fixed_text and not text:
         text = f"volec check{' ' + shown if shown else ''}: 0 errors"
     texts = [t for t in (fixed_text, text, shown_text) if t]
-    fmt_text = fmt_note(compiler, run_dir, edited, st) if not at_turn_end else ""
+    fmt_text = fmt_note(compiler, run_dir, edited, st) if not (at_turn_end or brief or scratch) else ""
     if fmt_text:
         texts.append(fmt_text)
     entry = {"errors": keys, "time": time.time(), "root": key_root, "unused": unused_keys}
+    if suggested:
+        entry["suggested"] = suggested
     fp = hs.fingerprint(key_root)[0] if key_root else ""
     entry["fp"] = fp
     # hint: the same mistake made twice, or an error that names a guide topic
@@ -1289,7 +1472,7 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
         if k in new_keys:
             seen[k] = seen.get(k, 0) + 1
             if (seen[k] >= 2 or any("guide " in h for h in d.get("help") or [])) and \
-                    "unfamiliar-construct" not in hinted:
+                    "unfamiliar-construct" not in hinted and not brief:
                 note = hs.hint("unfamiliar-construct", VOLEC=volec_shown(compiler, run_dir))
                 if note:  # ("" when VOLE_HINTS=0)
                     hinted.append("unfamiliar-construct")
@@ -1473,7 +1656,7 @@ def main():
     # (0.25.4) a new file: formatted first, so the check's positions are
     # the formatted file's
     new_text = fmt_new_file(event, compiler, cwd, edited)
-    got = verify(event, st, compiler, root, cwd, edited)
+    got = verify(event, st, compiler, root, cwd, edited, brief=no_check_step(event))
     if got is None:
         hs.save(event, st)
         return say("\n".join(t for t in (fmt_text, new_text, stale) if t))
