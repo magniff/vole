@@ -30,6 +30,7 @@ mod pattern;
 pub mod regex;
 mod subst;
 mod after;
+mod guard;
 
 use std::alloc::Arena;
 
@@ -48,17 +49,19 @@ use crate::front::modules::{file_made, file_of_pos};
 use crate::front::types::buf_type;
 use crate::tools::ctx::Tcx;
 use crate::tools::edit::edit_replace;
-use crate::tools::edit::apply::{apply_edit, set_command};
+use crate::tools::edit::apply::{apply_edit, set_command, try_again};
 use crate::tools::edit::cli::{edit_opts, take_edit_event};
+use crate::tools::proc::buf_cstr;
 use crate::tools::query::{c_slice, root_or_diag};
 use crate::tools::query::command_line::load_program;
 use crate::tools::query::diagnostics::{
     diag, diags, program_errors, put_cword, put_root, put_word, try_end, write_diags,
 };
 use crate::tools::query::positions::{line_of, put_loc, put_path};
-use crate::tools::query::refs::{put_bad_in, ref_in, resolve_in};
+use crate::tools::query::refs::{pos_in, put_bad_in, put_short, ref_in, resolve_in};
 
 use after::{drop_unused_imports, note_site_types, where_hints};
+use guard::{new_callees, self_call};
 use parsed::{pa, parenthesized, pb, pchild, pcount, pend, pk, pstart, slot_levels};
 use pattern::{
     dropped_use, has_newline, hole_named, hole_of, holes_to_idents, is_name_byte, match_node,
@@ -233,6 +236,7 @@ pub fn rewrite_leaf(gpa: Gpa) -> Leaf<'static, Gpa> {
     table.push(pair("subst", "PATTERN REPLACEMENT", "inside the code the holes keep"));
     table.push(flag("list", "a line per site"));
     table.push(option("in", "FILE|MODULE|ITEM", "only there (repeated: the scopes add up)"));
+    table.push(option("not-in", "FILE|MODULE|ITEM", "not there (repeated)"));
     Leaf::new(table, "word")
 }
 
@@ -248,6 +252,7 @@ fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>
     let mut substs: Vec<i64, Comp> = Vec::new_in(Comp {});
     let mut list = false;
     let mut ins: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut nots: Vec<i64, Comp> = Vec::new_in(Comp {});
     let line = c.evs.clone();
     let mut k: i64 = 0;
     while k < line.len() as i64 {
@@ -278,7 +283,12 @@ fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>
             ins.push(a as i64);
             continue;
         }
-        if ev.kind == EV_MISSING && (ev.name == "where" || ev.name == "in") {
+        if ev.kind == EV_OPTION && ev.name == "not-in" {
+            // (0.30: repeated; the sites there are left)
+            nots.push(a as i64);
+            continue;
+        }
+        if ev.kind == EV_MISSING && (ev.name == "where" || ev.name == "in" || ev.name == "not-in") {
             ev.kind = EV_UNKNOWN;
         } else if take_edit_event(&mut ev, &mut root, tcx, pcx) {
             continue;
@@ -287,7 +297,7 @@ fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>
             let d = diag(c"error", c"rewrite.usage", tcx);
             buf_str(d, c"unknown option '");
             buf_str(d, ev.value);
-            buf_str(d, c"' (--where, --subst, --list, --in, --dry-run, --no-check, --root)\n");
+            buf_str(d, c"' (--where, --subst, --list, --in, --not-in, --dry-run, --no-check, --force, --root)\n");
             return 2;
         }
         words.push(ev.value as i64);
@@ -321,6 +331,31 @@ fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>
     if !load_program(root, tcx.target, tcx, pcx, wgx) {
         program_errors(c"error", root, true, tcx, pcx);
         return 1;
+    }
+    // (0.30: --not-in, resolved as --in is, its scopes kept apart)
+    let mut not_ranges: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut not_files: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut not_modules: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for k in 0..nots.len() {
+        if !resolve_in(&c_slice(nots[k] as *mut u8), tcx, pcx) {
+            let d = diag(c"error", c"rewrite.bad-in", tcx);
+            put_bad_in(d, nots[k] as *mut u8, tcx);
+            return 1;
+        }
+    }
+    if nots.len() > 0 {
+        for i in 0..pcx.in_ranges.len() {
+            not_ranges.push(pcx.in_ranges[i]);
+        }
+        pcx.in_ranges.clear();
+        for i in 0..pcx.in_file.len() {
+            not_files.push(pcx.in_file[i]);
+            pcx.in_file[i] = 0;
+        }
+        for i in 0..pcx.in_module.len() {
+            not_modules.push(pcx.in_module[i]);
+            pcx.in_module[i] = 0;
+        }
     }
     for k in 0..ins.len() as i64 {
         if !resolve_in(&c_slice((ins[k as usize]) as *mut u8), tcx, pcx) {
@@ -509,6 +544,10 @@ fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>
     let mut s_end: Vec<i64, Comp> = Vec::new_in(Comp {});
     let mut s_text: Vec<i64, Comp> = Vec::new_in(Comp {});
     let pkind = pk(proot, pcx);
+    // (0.30: the sites inside the function the replacement calls there)
+    let callees = new_callees(proot, pfirst, plast, rfirst, rlast, tcx, pcx);
+    let mut rec_site: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut rec_def: Vec<i64, Comp> = Vec::new_in(Comp {});
     for n in 1..program_end {
         if pk(n, pcx) != pkind {
             continue;
@@ -517,11 +556,23 @@ fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>
         if file_made(f, pcx) || !ref_in(pstart(n, pcx), pcx) {
             continue;
         }
+        if nots.len() > 0
+            && pos_in(pstart(n, pcx), not_ranges.as_slice(), not_files.as_slice(),
+                not_modules.as_slice(), pcx) {
+            continue;
+        }
         for h in 0..tcx.h_sym.len() as i64 {
             (tcx.b_node[h as usize]) = -1;
         }
         if !match_node(proot, n, tcx, pcx) || !types_match(tcx, pcx) {
             continue;
+        }
+        if !list {
+            let e = self_call(n, callees.as_slice(), rfirst, rlast, tcx, pcx);
+            if e >= 0 {
+                rec_site.push(pstart(n, pcx));
+                rec_def.push(e);
+            }
         }
         // (0.16: the site's new names and substitutions)
         tcx.site_start = pstart(n, pcx);
@@ -569,6 +620,9 @@ fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>
     if list {
         return print_sites(&mut s_start, &mut s_text, pattern, replacement, tcx,
             pcx);
+    }
+    if rec_site.len() > 0 && !recursive_sites(rec_site.as_slice(), rec_def.as_slice(), tcx, pcx) {
+        return 1;
     }
     // Outermost first; a site inside another is left.
     let mut order: Vec<i64, Comp> = Vec::new_in(Comp {});
@@ -652,6 +706,64 @@ fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>
     buf_int(what, files);
     buf_str(what, if files == 1 { c" file" } else { c" files" });
     apply_edit(&buf_copy(what), root, tcx, pcx)
+}
+
+// (0.30) The sites (their positions) that are inside the function the
+// replacement calls there (`defs`, guard.vl): the rewrite would make the
+// function call itself. Without --force an error, `rewrite.recursive`,
+// with the command that leaves those functions out, and false (nothing
+// is written); with it a note.
+fn recursive_sites(sites: &[i64], defs: &[i64], tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> bool {
+    let d = diag(if tcx.force { c"note" } else { c"error" }, c"rewrite.recursive", tcx);
+    buf_int(d, sites.len() as i64);
+    buf_str(d,
+        if sites.len() == 1 { c" site is inside the function its replacement calls there" }
+        else { c" sites are inside the functions their replacement calls there" });
+    buf_str(d, c" (the function would call itself); first: ");
+    put_loc(d, sites[0], pcx);
+    buf_str(d, c" in ");
+    put_short(d, pcx.defs[defs[0] as usize].fqn, pcx);
+    buf_str(d, if tcx.force { c"; rewritten too (--force)\n" } else { c"; nothing written\n" });
+    if tcx.force {
+        return true;
+    }
+    // (the functions, each once, as --not-in takes them: a plain path,
+    // else FILE:LINE)
+    let opts = buf_new();
+    let mut shown: i64 = 0;
+    for i in 0..defs.len() {
+        let mut seen = false;
+        for j in 0..i {
+            seen = seen || defs[j] == defs[i];
+        }
+        if seen {
+            continue;
+        }
+        if shown == 8 {
+            break;
+        }
+        shown += 1;
+        if buf_len(opts) > 0 {
+            buf_byte(opts, b' ');
+        }
+        buf_str(opts, c"--not-in");
+        let b = buf_new();
+        put_short(b, pcx.defs[defs[i] as usize].fqn, pcx);
+        let mut plain = true;
+        for k in 0..buf_len(b) {
+            plain = plain && buf_at(b, k) != b'<' && buf_at(b, k) != b' ';
+        }
+        if !plain {
+            buf_truncate(b, 0);
+            put_path(b, file_of_pos(sites[i], pcx), pcx);
+            buf_byte(b, b':');
+            buf_int(b, line_of(sites[i], pcx));
+        }
+        put_word(opts, &buf_copy(b));
+    }
+    try_again(buf_cstr(opts), tcx, pcx);
+    try_again(c"--force", tcx, pcx);
+    false
 }
 
 // `--list` without a REPLACEMENT (0.16): the sites PATTERN (proot)

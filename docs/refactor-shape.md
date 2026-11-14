@@ -267,6 +267,29 @@ loops.vl:8:5→$i=i→$v=w→$s...=t += w.data[i] * 2; if w.data[i] > 2 { t += w
 loops.vl:18:5→$i=j→$v=w→$s...=t -= w.data[j];
 ```
 
+(0.30) **`--not-in FILE|MODULE|ITEM`** (repeatable, resolved as `--in`
+is, `FILE:LINE` too) leaves the sites there as they are.
+
+(0.30) **A replacement inside the function it calls.** A site that is
+inside the function its replacement calls there would make that function
+call itself: a helper whose own body matches the idiom it wraps
+(`'$s.len() as i64 * 2' 'twice_len($s)'` in `twice_len`), an `Index`
+impl whose body is rewritten to index its own type. Such a program
+checks clean and never returns, so the rewrite is refused, `error
+rewrite.recursive` (exit 1, nothing written), with the first such site
+and two `try:` lines: the command with `--not-in` for each such function
+(a path, or `FILE:LINE` for a trait impl's), and with `--force`, which
+rewrites those sites too (a note then). What is decided: a call `f(..)`
+in the free function `f`; `Self::f(..)`, `T::f(..)` in `f` of an impl of
+`T`; `crate::m::f(..)` in that function; `x.f(..)` in the method `f` of
+x's type (x is `self`, or typed so by the checker, references aside);
+`x[i]` in `Index::index` of x's type, `&mut x[i]` and `x[i] = v` in
+`IndexMut::index_mut`; a binary or unary operator in its trait's
+function (`Add::add`, `Neg::neg`, `PartialEq::eq`...) of its left
+operand's type. A callee the pattern has too, with the same receiver, is
+not new at the site (a recursive function's own calls rewritten) and is
+never refused. A pattern's `&mut $e` no longer matches `&e`.
+
 Nothing matches: `note rewrite.none`, exit 0; when sites matched but for
 --where, `note rewrite.types` gives the first one's type and place, and
 `try:` the command with that type; sites whose type the checker never
@@ -479,7 +502,8 @@ as it changes the program through the edit engine (`edit_replace`,
 | `refactor.nested` | note | 0 | inline: calls left in the arguments of others | |
 | `refactor.script` | error | 1, 2 | a line is no command, a command failed: nothing written | |
 | `rewrite.pattern`, `rewrite.unbound` | error | 2 | the pattern or replacement does not parse, a hole alone, `$x...` outside a list, a hole of the replacement not in the pattern and bound by it nowhere, a bad `~/RE/` | |
-| `rewrite.bad-in` | error | 1 | `--in` names no file or module | |
+| `rewrite.bad-in` | error | 1 | `--in` or `--not-in` names no file, module or item | |
+| `rewrite.recursive` | error (note with `--force`) | 1 | (0.30) sites inside the function the replacement calls there: nothing written | the command with `--not-in` those functions; with `--force` |
 | `rewrite.none` | note | 0 | nothing matches | |
 | `rewrite.types` | note | 0 | sites match but for --where | the command with the type found |
 | `rewrite.nested`, `rewrite.untyped` | note | 0 | sites left inside rewritten ones, in unchecked code | |
