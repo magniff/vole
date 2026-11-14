@@ -15,6 +15,17 @@
 # run alternately, RUNS rounds of one run each, and each side's time is
 # its fastest round.
 #
+# (0.30) Two rows are a whole program with arguments, not a file of
+# bench/: pi100k and pi1m are examples/algorithms/superpi (pi by binary
+# splitting, three-prime NEON transforms, Newton division) at 100000 and
+# 1000000 digits, `--no-check --threads 1` (one thread: its instruction
+# count repeats to 0.03%; the output is the digits, compared between the
+# variants like any program's). There is no C version of it, so, like
+# the other programs without one, its cc -O2 column is `-` and it is not
+# in the geometric means of the ratios to C; in --instructions it is a
+# row like the others and is in that mean. pi1m has no -O0 time (`-`):
+# a million digits at -O0 take 26 s a run, 50 times the -O2 time.
+#
 # usage: bench/run.sh [-c COMPILER] [-p PREVIOUS] [-s SEED] [-r RUNS] [-t TARGET] [--smoke]
 #        bench/run.sh --instructions -p BASELINE [-c COMPILER] [-r RUNS] [-O LEVEL]
 #
@@ -90,6 +101,19 @@ case "$TARGET" in
     *) ARCH=""; SEED_TARGET=linux-x86_64 ;;
 esac
 
+# The table's rows, `name|source|arguments|variants not timed` a line:
+# every bench/*.vl and examples/md5 (an example is a directory: its
+# name), then superpi twice.
+rows() {
+    for source in "$ROOT"/bench/*.vl "$ROOT/examples/md5/main.vl"; do
+        name=$(basename "$source" .vl)
+        [ "$name" = main ] && name=$(basename "$(dirname "$source")")
+        echo "$name|$source||"
+    done
+    echo "pi100k|$ROOT/examples/algorithms/superpi/main.vl|100000 --no-check --threads 1|"
+    echo "pi1m|$ROOT/examples/algorithms/superpi/main.vl|1000000 --no-check --threads 1|O0"
+}
+
 # (0.30) --instructions: the programs' instructions by a baseline
 # compiler and by the one measured, a row a program.
 if [ $INSTRUCTIONS -eq 1 ]; then
@@ -112,12 +136,17 @@ if [ $INSTRUCTIONS -eq 1 ]; then
         # shellcheck disable=SC2086
         "$CC" $ARCH -o "$3" "$3.o" -lm 2>>"$3.build"
     }
-    # <program> <input> <output>: its fewest instructions of RUNS runs
+    # <program> <input> <output> [args...]: its fewest instructions of
+    # RUNS runs
     icount() {
+        ic_program=$1
+        ic_input=$2
+        ic_output=$3
+        shift 3
         best=""
         k=0
         while [ $k -lt "$RUNS" ]; do
-            /usr/bin/time -l "$1" <"$2" >"$3" 2>"$WORK/time.out" || return 1
+            /usr/bin/time -l "$ic_program" "$@" <"$ic_input" >"$ic_output" 2>"$WORK/time.out" || return 1
             n=$(awk '/instructions retired/ { print $1 }' "$WORK/time.out")
             [ -n "$n" ] || return 1
             if [ -z "$best" ] || [ "$n" -lt "$best" ]; then best=$n; fi
@@ -130,9 +159,8 @@ if [ $INSTRUCTIONS -eq 1 ]; then
     echo "  measured: $COMPILER"
     printf "%-18s %12s %12s %11s %8s\n" "program" "baseline" "measured" "diff" "%"
     STATUS=0
-    for source in "$ROOT"/bench/*.vl "$ROOT/examples/md5/main.vl"; do
-        name=$(basename "$source" .vl)
-        [ "$name" = main ] && name=$(basename "$(dirname "$source")")
+    rows >"$WORK/rows"
+    while IFS='|' read -r name source args skip <&3; do
         input="$WORK/empty"
         [ "$name" = md5 ] && input="$WORK/md5.in"
         if ! ibuild "$COMPILER" "$source" "$WORK/$name.new"; then
@@ -140,10 +168,12 @@ if [ $INSTRUCTIONS -eq 1 ]; then
             STATUS=1
             continue
         fi
-        new=$(icount "$WORK/$name.new" "$input" "$WORK/$name.new.out") || {
+        # shellcheck disable=SC2086
+        new=$(icount "$WORK/$name.new" "$input" "$WORK/$name.new.out" $args) || {
             printf "%-18s %12s %12s   the program failed\n" "$name" "-" "-"; STATUS=1; continue; }
+        # shellcheck disable=SC2086
         if ! ibuild "$PREVIOUS" "$source" "$WORK/$name.old" \
-            || ! old=$(icount "$WORK/$name.old" "$input" "$WORK/$name.old.out"); then
+            || ! old=$(icount "$WORK/$name.old" "$input" "$WORK/$name.old.out" $args); then
             awk -v n="$name" -v b="$new" 'BEGIN { printf "%-18s %12s %12.1f\n", n, "-", b / 1e6 }'
             continue
         fi
@@ -155,7 +185,7 @@ if [ $INSTRUCTIONS -eq 1 ]; then
         awk -v n="$name" -v a="$old" -v b="$new" 'BEGIN {
             printf "%-18s %12.1f %12.1f %+11.1f %+7.2f%%\n", n, a / 1e6, b / 1e6, (b - a) / 1e6, 100 * (b - a) / a }'
         echo "$old $new" >>"$WORK/ratios"
-    done
+    done 3<"$WORK/rows"
     awk '{ s += log($2 / $1); n++ }
         END { if (n > 0) printf "%-18s %12s %12s %11s %+7.2f%%  (the geometric mean of measured/baseline over %d programs)\n", "geomean", "", "", "", 100 * (exp(s / n) - 1), n }' "$WORK/ratios"
     exit $STATUS
@@ -224,16 +254,17 @@ printf "%-10s" "program"
 for v in $VARIANTS; do printf " %9s" "$v"; done
 printf " %9s\n" "cc -O2"
 
-for source in "$ROOT"/bench/*.vl "$ROOT/examples/md5/main.vl"; do
-    name=$(basename "$source" .vl)
-    # (an example is a directory: its name)
-    [ "$name" = main ] && name=$(basename "$(dirname "$source")")
+rows >"$WORK/rows"
+while IFS='|' read -r name source args skip <&3; do
     input="$WORK/empty"
     [ "$name" = md5 ] && input="$WORK/md5.in"
     printf "%-10s" "$name"
     reference=""
     row=""
     for v in $VARIANTS; do
+        case " $skip " in
+            *" $v "*) printf " %9s" "-"; row="$row -"; continue ;;
+        esac
         STAGE="building $name $v"
         if ! build "$source" "$v" "$WORK/$name.$v"; then
             # (0.29) the compiler measured builds every program; the
@@ -245,7 +276,8 @@ for source in "$ROOT"/bench/*.vl "$ROOT/examples/md5/main.vl"; do
             row="$row -"
             continue
         fi
-        ms=$(timed "$name $v" "$RUNS" "$input" "$WORK/$name.$v.out" "$WORK/$name.$v") || fail "$(cat "$WORK/why")"
+        # shellcheck disable=SC2086
+        ms=$(timed "$name $v" "$RUNS" "$input" "$WORK/$name.$v.out" "$WORK/$name.$v" $args) || fail "$(cat "$WORK/why")"
         printf " %9s" "$ms"
         row="$row $ms"
         if [ "$v" = O2 ]; then
@@ -277,7 +309,7 @@ for source in "$ROOT"/bench/*.vl "$ROOT/examples/md5/main.vl"; do
     else
         printf " %9s\n" "-"
     fi
-done
+done 3<"$WORK/rows"
 
 # The geometric means of the ratios to cc -O2 (a time of 0 counts as 1 ms).
 STAGE="the geometric means"

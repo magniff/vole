@@ -7,10 +7,11 @@ rather than Super PI's own Gauss–Legendre iteration.
 ```sh
 volec run examples/algorithms/superpi/main.vl -- 1000     # 1000 digits
 volec examples/algorithms/superpi/main.vl -o superpi
-./superpi 1000000                                         # a million digits, ~2 s
+./superpi 1000000                                         # a million digits, ~0.15 s
 ./superpi                                                 # default: 1000
 ./superpi 500 --no-check                                  # skip the cross-check
 ./superpi 100000 --check                                  # force the (quadratic) cross-check
+./superpi 1000000 --threads 1                             # on one core, ~0.5 s
 ```
 
 ```text
@@ -48,32 +49,64 @@ per term, and `pi = 426880 sqrt(10005) Q / T` at the end. Only `T` is
 signed; the combine adds the two signed products by comparing
 magnitudes.
 
+The split does not go down to single terms: a range of 16 or fewer is
+built term by term, `P' = P p_k`, `Q' = Q q_k`, `T' = T q_k ± P' (A + B
+k)`, where every factor fits a machine word, so a leaf is a few passes
+of limb-by-word multiplies in place and enters no product routine. The
+root of the split does not compute `P`, which only a parent would use.
+
 **Limbs in base 10^9.** A limb product fits a `u64`, and each limb prints
 as nine decimal digits. Schoolbook products accumulate rows in `u64`
-columns; Karatsuba takes over at 96 limbs.
+columns; Karatsuba takes over at 128 limbs.
 
-**Products by NTT above 512 limbs.** A product is a convolution, and the
+**Products by NTT from 256 limbs.** A product is a convolution, and the
 number theoretic transform evaluates it in O(n log n) butterflies. Three
-32-bit primes with primitive root 3 and a large power-of-two factor in
-`p - 1` give transforms of up to 2^24 points; every modular value is
-below 2^30, so no 128-bit arithmetic is needed. The butterflies use
-Montgomery reduction with `R = 2^32` (three machine multiplies and a
-shift, never a division), twiddles are precomputed a stage at a time, and
-the three residues are recombined by Garner's algorithm into exact
-coefficients, which are carried back into base 10^9 with plain `u64`
-arithmetic — no bignum is allocated per coefficient. A square needs two
-transforms per prime, not three. The butterflies themselves run two at a
-time in NEON lanes (`std::arch::aarch64`): the operands are below 2^30,
-so they live in u32 lanes, the widening `umull`/`umlal` multiplies do the
-Montgomery reduction, and the modular add and subtract are u32 lanes
-again. That also halves the transform arrays' memory traffic. A scalar
-path remains for machines without NEON (`detect("neon")` chooses).
-Twiddles cost nothing per butterfly: one table of roots per prime and
-product is built once, every stage reads a stride through it (the last
-stage reads it directly, so the largest table is never even copied), and
-all three transforms of a product share it. The split's combine computes
-`P1 P2` with `P1 T2` and `Q1 Q2` with `T1 Q2`, so each of those pairs
-shares one operand's forward transform instead of transforming it twice.
+primes below 2^30 (469762049, 167772161, 754974721) with a factor of at
+least 2^24 in `p - 1` give transforms of up to 2^24 points, and their
+product exceeds every coefficient. Every modular value fits a `u32` and
+every product a `u64`, so no 128-bit arithmetic is needed. A product up
+to three times longer on one side is still one transform; beyond that
+the long operand is cut into pieces.
+
+The transform is the part that was made fast, and each choice is
+there for a measured reason:
+
+- **No bit-reversal pass.** The forward transform runs its stages from
+  the whole array down (decimation in frequency) and leaves the spectrum
+  in bit-reversed order; the inverse runs them from pairs up (decimation
+  in time) and takes that order back. A pointwise product does not care.
+- **One table of roots per prime, for the whole run.** The roots are
+  stored stage by stage (the stage of half `h` at `[h, 2h)`), so every
+  stage reads a contiguous run, and the stages below the top do not
+  depend on the transform's length: the table of the longest transform
+  so far serves every shorter one, forward and inverse (the inverse
+  uses the forward roots and its result is read at index `(n - i) mod
+  n`). The table is in an `Engine` that the products share, behind an
+  `RwLock`.
+- **Four butterflies a step in NEON** (`std::arch::aarch64`, 128-bit
+  registers of four `u32` lanes), two stages in one pass over the array
+  (radix 4), and a kernel of its own for the stages of blocks of 4 and
+  2, which regroups the lanes by `zip`/`uzp`. The Montgomery product
+  (`R = 2^32`) is two lanewise multiplies for the quotient, the widening
+  `umull`/`umlsl` pairs for `a w - q p`, and one `uzp2` for the high
+  halves: no division anywhere.
+- **Lazy reduction.** `4p` fits a `u32`, so values stay in `[0, 2p)`
+  forward and `[0, 4p)` inverse; the product's result, between `-p` and
+  `p`, is used with `p` added, never compared. One `umin` a butterfly is
+  left.
+- **Montgomery constants on entry and exit.** An operand enters by one
+  product by `R^2 mod p` (which also reduces the limb), the result
+  leaves by one product by `1/n mod p`.
+- **Garner without division.** The three residues are recombined by
+  Garner's algorithm with Montgomery products by constants, and the
+  exact coefficient plus carry is carried into base 10^9 by two `u64`
+  divisions by the constant base, with no bignum per coefficient.
+
+A square needs two transforms per prime, not three, and the split's
+combine computes `P1 P2` with `P1 T2` and `Q1 Q2` with `T1 Q2`, so each
+of those pairs shares one operand's forward transform. A scalar path
+with the same arithmetic remains for machines without NEON
+(`detect("neon")` chooses), and a test compares the two.
 
 **Division and square root by Newton, with doubling precision.** The
 reciprocal of the divisor is computed by Newton's iteration at a
@@ -87,14 +120,21 @@ exact by construction rather than by an error bound. Knuth D still does
 the small divisions and is the reference the fast paths are tested
 against.
 
-**Threads where they pay.** The three primes of a large transform are
-independent and run on three scoped threads (above 2^16 points; spawning
-costs more than it saves below that). Two overlaps do the rest: the
-square root depends on nothing in the series, so it runs beside the
-binary split, and the final division's reciprocal depends only on T, so
-it runs beside the numerator's root-times-Q product. Threading the
-split's recursion as well was measured and made things worse: the
-transform threads already use the cores.
+**Threads where there is independent work.** The `Engine` counts the
+idle threads (the cores less the threads running); whoever has
+independent work takes from the count and gives back at the join, so no
+more threads run than there are cores and nothing is planned in advance.
+The split gives its left half to a thread (ranges of 512 terms up); a
+product runs two of its primes on threads and the third itself (from
+2^13 points), and a prime its two forward transforms side by side;
+Garner's reconstruction, whose coefficients are independent, is cut in
+four with the pieces' carries added afterwards. The square root depends
+on nothing in the series, so it runs beside the binary split, and the
+final division's reciprocal depends only on T, so it runs beside the
+numerator's root-times-Q product. `--threads N` sets the most threads
+at once; `--threads 1` starts none. Threads are started for each piece
+of work and joined: starting them was 0.2% of the samples, so a
+persistent pool would win nothing.
 
 **An independent cross-check.** Up to 10000 digits every run also
 evaluates Machin's formula `pi = 16 arctan(1/5) - 4 arctan(1/239)` in
@@ -108,40 +148,53 @@ part left and would cost far longer than the answer; `--check` forces it,
 
 ## Verification
 
-- `volec test examples/algorithms/superpi/main.vl` runs seven tests at
+- `volec test examples/algorithms/superpi/main.vl` runs eleven tests at
   -O0 and -O2: division against `u64` arithmetic on limb boundaries, the
   identity `q b + r = a` with `r < b` on random operands (including
   divisors just below a power of the base, which take the add-back path),
   NTT and Karatsuba products against schoolbook at and around the
-  threshold (squares and lopsided operands too), the Newton division
-  against algorithm D, exact integer square roots on squares and their
-  neighbours up to 1000 limbs, the first hundred digits against the
-  published expansion, and Chudnovsky against Machin at 200 digits.
+  thresholds (squares and lopsided operands too), shared-operand pairs
+  of products against schoolbook, the NEON transforms against the scalar
+  butterflies for every prime (forward, inverse, and the inverse of the
+  forward against the input), the leaves against the combine of single
+  terms, the Newton division against algorithm D, exact integer square
+  roots on squares and their neighbours up to 1000 limbs, the first
+  hundred digits against the published expansion, and Chudnovsky against
+  Machin at 200 and at 5000 digits.
 - The whole expansion was compared digit for digit with an independent
   Python `decimal` Machin computation at 1000 and at 10000 digits:
   identical, including the last digit.
 
 ## Cost, measured
 
-Times on an Apple M-series machine, `volec -O2`, for the Chudnovsky
-answer alone (the Machin cross-check is extra where it runs):
+Times on an Apple M-series machine (4 performance and 6 efficiency
+cores), `volec -O2`, for the Chudnovsky answer alone (the Machin
+cross-check is extra where it runs), the fastest of several runs with
+other work on the machine (1-minute load about 3):
 
-| digits | time | what dominates |
-|---|---|---|
-| 1000 | 0.6 ms | schoolbook products |
-| 10000 | 15 ms | Karatsuba and the first NTTs |
-| 100000 | 0.13-0.19 s | NTT products, three threads |
-| 1000000 | 1.0-1.5 s | the same, transform length 2^19 |
+| digits | all cores | `--threads 1` | instructions | what dominates |
+|---|---|---|---|---|
+| 1000 | 0.6 ms | | | the leaves and schoolbook products |
+| 10000 | 3 ms | | 88 M | Karatsuba and the first NTTs |
+| 100000 | 16 ms | 42 ms | 1.0 G | NTT products |
+| 1000000 | 135-165 ms | 0.51 s | 11.9 G | the same, transform length 2^19 |
+| 10000000 | 2.8 s | 9.5 s | | the same, transform length 2^22 |
 
-(The million-digit figure is the spread over several runs while other
-work was on the machine; the best run was 0.97 s.)
+A million digits took 0.79 s and 50.3 G instructions before the
+transform was reworked (two butterflies a step in 64-bit registers,
+twiddles gathered per stage, a bit-reversal pass, `% p` per element on
+entry and exit, the split on one core); programs built on GMP take
+0.25 to 0.4 s on one core of comparable hardware.
 
-The Machin cross-check adds 0.7 ms at 1000 digits and 72 ms at 10000;
+The Machin cross-check adds 0.7 ms at 1000 digits and 63 ms at 10000;
 that is why it stops there. Every stage is linearithmic in the number of
 digits, so these grow at a little worse than linearly. Nothing in the
-computation uses floating point. The next step down is short products: the Newton steps
-discard half to two-thirds of the limbs of each product they compute,
-and a middle-product NTT would recover that. It is a much larger change
-than anything here, as is replacing the three primes with a floating
-point FFT, whose correctness would rest on rounding analysis rather than
-on exact modular arithmetic.
+computation uses floating point. What is left, in the order it would
+pay: short products (the Newton steps discard half to two-thirds of the
+limbs of each product they compute, and a middle-product NTT would
+recover that), removing the common factors of P and Q during the split
+(the GMP programs' trick, 20 to 30% at large sizes), and buffers kept
+between products instead of allocated per transform. Replacing the three
+primes with a floating point FFT is a much larger change, and its
+correctness would rest on rounding analysis rather than on exact modular
+arithmetic.
