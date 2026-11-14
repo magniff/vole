@@ -12,7 +12,7 @@ beyond them:
 | `alloc(Gpa)`, `alloc(Arena<Gpa>)`, `alloc(extern)` | allocating from that allocator type (`ArenaScope<&Gpa>`: `arena_scope`'s; `extern`: C's malloc); several as one, `alloc(Gpa, Arena<Gpa>)` |
 | `io` | a C function that reads or writes: `write`, `read`, stdio |
 | `static` | reading or writing a `static mut`, taking its address; C's `errno`, which a failed write of std's printing reads (`global` its old name, an alias) |
-| `panic` | a checked index or slice, `unwrap`, `as E`, std's panic, an `assert` (but `assert(true)`), a requires (in the caller), an ensures |
+| `panic` | a checked index or slice, `unwrap`, `as E`, std's panic, an `assert` (but `assert(true)`), a requires (in the caller), an ensures, an integer `/` or `%` whose divisor is not proven (0.30.1: not a constant other than 0 and, signed, -1; not a local an `if` around it proves so: `if d != 0 { x / d }`, `checked_div`) |
 | `diverge` | `loop`, a `while` the compiler cannot count, recursion: it may not return (a `for` over a range or a slice returns, and so do std's iterators that end; a panic is `panic`, not `diverge`) |
 | `unsafe` | unsafe operations in its own body (not its callers') |
 
@@ -20,6 +20,11 @@ std's printing ends (`println("{x}")` is `io static panic`): the few
 loops of std the compiler cannot count carry `#[terminates]`, std's own
 promise. A set's text is the list `#[effects(...)]` accepts for the
 function, word for word: one word fewer is refused.
+
+Overflow is not `panic`: `a + b` panics only where the overflow checks
+are on (-O0, `--overflow-checks=on`), and a set does not depend on the
+level; write `checked_add` (an Option) where it must not. (The optimizer
+knows: with the checks on, such a call is not one that cannot panic.)
 
 A set is written in that order, `none` for the empty one. Allocation is
 explicit (`guide allocators`), so `alloc(Gpa)` without `static` means

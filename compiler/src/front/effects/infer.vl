@@ -43,12 +43,13 @@ use crate::base::ctx::Ctx;
 use crate::base::timer::{T_CHECK, T_EFFECTS, timer_now, timer_sub};
 use crate::front::ast::{
     ARM_SYNTHETIC, FN_BODY_FAILED, FN_SIG_FAILED, FN_TERMINATES, FN_UNSAFE, NODE_CAPTURE,
-    NODE_IN_BOUNDS, NODE_RAW, NODE_REF_MUT, NodeKind, REPR_UNION, VK_LANE, VK_LOAD, VK_STORE,
-    VK_WITH, child,
+    NODE_IN_BOUNDS, NODE_RAW, NODE_RAW_BORROW, NODE_REF_MUT, NodeKind, REPR_UNION, VK_LANE, VK_LOAD,
+    VK_STORE, VK_WITH, child,
 };
 use crate::front::check::Res;
 use crate::front::check::iterate::ends_by_itself;
 use crate::front::check::unsafety::{NODE_NO_READ, is_borrow, is_borrow_param};
+use crate::front::consteval::wrap_int;
 use crate::front::effects::{
     ALLOC_ANY, EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_INTERIOR, EFF_IO, EFF_PANIC,
     EFF_RAW_DIVERGE, EFF_RAW_GLOBAL, EFF_RAW_PANIC, EFF_SYNC, EFF_TLS, EFF_UNKNOWN, EFF_UNSAFE,
@@ -57,13 +58,17 @@ use crate::front::effects::{
 use crate::front::effects::builtin::unknown_c_effects;
 use crate::front::effects::check::extern_effects;
 use crate::front::lexer::Tok;
-use crate::front::modules::within_std;
+use crate::front::modules::{std_wraps, within_std};
 use crate::front::modules::lookup::std_item_key;
 use crate::front::threadlocal::is_thread_local;
 use crate::front::traits::{impl_of_fn, std_trait};
-use crate::front::types::{REF_SHARED, TyKind, is_integer, struct_field, struct_type, vec_lanes};
+use crate::front::types::{
+    REF_MUT, REF_SHARED, TY_BOOL, TY_NEVER, TyKind, int_bits, is_integer, is_signed, struct_field,
+    struct_type, vec_lanes,
+};
 use crate::middle::lower::atomic::atomic_intrinsic;
 use crate::middle::lower::ssa::HMap;
+use crate::places::ir::undistinct;
 
 // The kinds of edges (above).
 pub const E_CALL: i64 = 0;
@@ -90,6 +95,12 @@ const LOOP_NONEMPTY: i64 = 3;
 const LOOP_NEXT: i64 = 4;
 const LOOP_COUNT: i64 = 5;
 const LOOP_BROKEN: i64 = 6;
+
+// (0.30.1, E1.7: push_facts) (d, LOOP_NONZERO, 0): integer local d is not
+// 0 here; (d, LOOP_NO_MIN_NEG1, x): `x == MIN && d == -1` is false here
+// (x -1: d is not -1).
+const LOOP_NONZERO: i64 = 7;
+const LOOP_NO_MIN_NEG1: i64 = 8;
 
 // Function f's body failed to check (check_function_recovering): its
 // effects are ⊤.
@@ -665,7 +676,10 @@ fn push_edge(to: i64, kind: i64, add: i64, pcx: &mut Ctx<Comp>) {
         // out through the C functions declared so, not the io of the
         // writers its Formatter's fn values reach by type; no edge to it,
         // so no cycle through the formatting it shares with the program
-        pcx.acc.bits |= EFF_PANIC;
+        // (0.30.1: and the raw panic the optimizer reads, which an
+        // allocator's edge passes on, E_ALLOC: the arena lent to a scope
+        // panics, and its callers were nopanic)
+        pcx.acc.bits |= EFF_PANIC | EFF_RAW_PANIC;
         return;
     }
     if kind == E_SCOPE {
@@ -720,7 +734,7 @@ fn local(n: i64, bits: i64, allocs: i64, pcx: &mut Ctx<Comp>) {
 // own (a search finds it there, with no callee to go into).
 fn panic_here(n: i64, pcx: &mut Ctx<Comp>) {
     if !pcx.search {
-        pcx.acc.bits |= EFF_PANIC;
+        pcx.acc.bits |= EFF_PANIC | EFF_RAW_PANIC;
         return;
     }
     if pcx.found_node == 0
@@ -818,10 +832,14 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
             walk(pcx.nodes[n as usize].b, pcx);
             pcx.static_write -= 1;
             walk(pcx.nodes[n as usize].c, pcx);
+            if pcx.nodes[n as usize].op != Tok::Eq {
+                arith_panic(n, pcx);
+            }
         }
         NodeKind::Binary => {
             walk(pcx.nodes[n as usize].b, pcx);
             walk(pcx.nodes[n as usize].c, pcx);
+            arith_panic(n, pcx);
         }
         NodeKind::While => walk_while(n, pcx),
         NodeKind::Continue => {
@@ -844,13 +862,27 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
             let lends = pcx.nodes[n as usize].op == Tok::Amp
                 && ((pcx.nodes[n as usize].p & NODE_REF_MUT) != 0
                     || t > 0 && pcx.types[t as usize].kind == TyKind::Ptr
-                    && pcx.types[t as usize].b != REF_SHARED);
+                    && pcx.types[t as usize].b != REF_SHARED
+                    || (pcx.nodes[n as usize].p & NODE_RAW_BORROW) != 0
+                    && pcx.nodes[pcx.nodes[n as usize].b as usize].kind == NodeKind::Ident
+                    && pcx.nodes[pcx.nodes[n as usize].b as usize].res == Res::Local);
+            // (0.30.1: a raw borrow of a local, `&raw const i` too, may be
+            // written through once cast: a counted loop's variable so
+            // borrowed loses its proof, local_used; a static's `&raw
+            // const` stays a read)
             if lends {
                 pcx.static_write += 1;
             }
             walk(pcx.nodes[n as usize].b, pcx);
             if lends {
                 pcx.static_write -= 1;
+            }
+            // (E1.7: `-x` checks overflow as the operators do, but of a
+            // literal: places/build.vl lower_unary)
+            if pcx.nodes[n as usize].op == Tok::Minus
+                && pcx.nodes[pcx.nodes[n as usize].b as usize].kind != NodeKind::Int
+                && is_integer(undistinct(t, pcx)) && overflow_checked(pcx) {
+                local(n, EFF_RAW_PANIC, 0, pcx);
             }
         }
         NodeKind::Cast => {
@@ -890,17 +922,32 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
         }
         NodeKind::Block => {
             // (its statements' expressions directly: fewer calls)
+            let mark = pcx.loops.len() as i64;
             for i in 0..pcx.nodes[n as usize].count {
                 let s = child(n, i, pcx);
                 let k = pcx.nodes[s as usize].kind;
-                walk(if k == NodeKind::ExprStmt { pcx.nodes[s as usize].a }
+                let e = if k == NodeKind::ExprStmt { pcx.nodes[s as usize].a }
                     else if k == NodeKind::Let {
                         pcx.nodes[s as usize].c
-                    } else { s }, pcx);
+                    } else { s };
+                if k == NodeKind::Let {
+                    walk_scrutinee(e, binds_ref_mut(pcx.nodes[s as usize].a, pcx), pcx);
+                } else {
+                    walk(e, pcx);
+                }
+                // (E1.7: after `if c { return ..; }` the block goes on
+                // only where c is false)
+                if k != NodeKind::Let && e > 0 && pcx.nodes[e as usize].kind == NodeKind::If
+                    && pcx.nodes[e as usize].c == 0
+                    && never_completes(pcx.nodes[e as usize].b, pcx) {
+                    push_facts(pcx.nodes[e as usize].a, false, pcx);
+                }
             }
             walk(pcx.nodes[n as usize].a, pcx);
+            pcx.loops.truncate(mark as usize);
         }
-        NodeKind::Let => walk(pcx.nodes[n as usize].c, pcx),
+        NodeKind::Let => walk_scrutinee(pcx.nodes[n as usize].c,
+            binds_ref_mut(pcx.nodes[n as usize].a, pcx), pcx),
         NodeKind::If => walk_if(n, pcx),
         NodeKind::Loop => {
             if (pcx.nodes[n as usize].p & NODE_IN_BOUNDS) != 0 {
@@ -911,7 +958,11 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
         }
         NodeKind::For => walk_for(n, pcx),
         NodeKind::Match => {
-            walk(pcx.nodes[n as usize].a, pcx);
+            let mut lends = false;
+            for i in 0..pcx.nodes[n as usize].count {
+                lends = lends || binds_ref_mut(pcx.nodes[child(n, i, pcx) as usize].a, pcx);
+            }
+            walk_scrutinee(pcx.nodes[n as usize].a, lends, pcx);
             for i in 0..pcx.nodes[n as usize].count {
                 let arm = child(n, i, pcx);
                 walk(pcx.nodes[arm as usize].b, pcx);
@@ -929,6 +980,399 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
         NodeKind::Closure | NodeKind::Try | NodeKind::Interp => walk(pcx.nodes[n as usize].y, pcx),
         _ => {}
     }
+}
+
+// (0.30.1, RT-20) Scrutinee e of a `match` (an `if let`, a `while let`)
+// or the value of a `let`: when a pattern binds by `ref mut`, the binding
+// is a `&mut` of e's place, so e is walked as a written place (as an
+// `&mut e` is): a counted `while`'s variable matched so loses its proof
+// (local_used), a static matched so is written (static_access). Before,
+// `match i { ref mut r => *r = 0 }` was no write, and the loop ended.
+fn walk_scrutinee(e: i64, lends: bool, pcx: &mut Ctx<Comp>) {
+    if lends {
+        pcx.static_write += 1;
+    }
+    walk(e, pcx);
+    if lends {
+        pcx.static_write -= 1;
+    }
+}
+
+// Whether pattern p binds something by `ref mut` (a PatBind whose c is
+// REF_MUT), at any depth.
+fn binds_ref_mut(p: i64, pcx: &Ctx<Comp>) -> bool {
+    if p <= 0 {
+        return false;
+    }
+    let k = pcx.nodes[p as usize].kind;
+    if k == NodeKind::PatBind {
+        return pcx.nodes[p as usize].c == REF_MUT;
+    }
+    if k == NodeKind::FieldInit {
+        return binds_ref_mut(pcx.nodes[p as usize].b, pcx);
+    }
+    if k == NodeKind::PatTuple || k == NodeKind::PatVariant || k == NodeKind::PatOr {
+        for i in 0..pcx.nodes[p as usize].count {
+            if binds_ref_mut(child(p, i, pcx), pcx) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// RULE: E1.7 (0.30.1) Node n, a Binary or a compound Assign, is an
+// integer operation whose lowering may panic (places/build.vl binary_rv;
+// middle/lower/places.vl lower_division_checks and lower_checked, gen0's
+// gen_division_checks and gen_assign):
+//   - `/`, `%`, `/=` and `%=` check their divisor at every level: 0, and
+//     for a signed type -1 (MIN / -1). That is `panic`, unless the divisor
+//     is a literal or a computed constant whose value is neither (the
+//     lowering's own test), or a local the conditions around it prove so
+//     (safe_divisor, push_facts).
+//   - `+`, `-`, `*`, `<<`, `>>` and their assignments check overflow only
+//     in a build with the checks (pcx.overflow_checks: -O0's default,
+//     --overflow-checks=on) and outside std::num::wrapping (checks_here):
+//     the raw panic only, which the optimizer reads for that build
+//     (middle/ipo.vl effects_attrs: no NOPANIC), as -O1 under --trace or
+//     --overflow-checks=on lowers them. The visible `panic`, which the
+//     declarations are checked against, does not depend on the level.
+// Before 0.30.1 neither was counted: a function dividing by its parameter
+// was nopanic, -O2 deleted or merged its calls, and #[no_panic] held.
+fn arith_panic(n: i64, pcx: &mut Ctx<Comp>) {
+    let lhs = pcx.nodes[n as usize].b;
+    if lhs <= 0 {
+        return;
+    }
+    let ty = undistinct(pcx.nodes[lhs as usize].ty, pcx);
+    if !is_integer(ty) {
+        return;
+    }
+    let op = pcx.nodes[n as usize].op;
+    if op == Tok::Slash || op == Tok::SlashEq || op == Tok::Percent || op == Tok::PercentEq {
+        if !safe_divisor(n, ty, pcx) {
+            local(n, EFF_PANIC, 0, pcx);
+        }
+        return;
+    }
+    let checked = op == Tok::Plus || op == Tok::PlusEq || op == Tok::Minus || op == Tok::MinusEq
+        || op == Tok::Star || op == Tok::StarEq || op == Tok::Shl || op == Tok::ShlEq
+        || op == Tok::Shr || op == Tok::ShrEq;
+    if checked && overflow_checked(pcx) {
+        local(n, EFF_RAW_PANIC, 0, pcx);
+    }
+}
+
+// Whether the function being walked has its arithmetic's overflow checked
+// in this build (places/build.vl checks_here, which reads the same).
+fn overflow_checked(pcx: &Ctx<Comp>) -> bool {
+    let f = pcx.walk_node;
+    pcx.overflow_checks && f >= 0 && f < pcx.fns.len() as i64
+        && !std_wraps(pcx.fns[f as usize].module, pcx)
+}
+
+// Whether the divisor of integer `/` or `%` n (of type ty) can never make
+// the lowering's check fire: a constant (int_value) that is not 0 and, ty
+// signed, not -1; or an immutable local that the facts here (push_facts)
+// say is not 0 and, ty signed, is not -1 or is not -1 while the dividend,
+// an immutable local too, is MIN. Anything else (an expression, a
+// parenthesized constant, a mutable local) is not proven: the check
+// stays, and so does the panic.
+fn safe_divisor(n: i64, ty: i64, pcx: &Ctx<Comp>) -> bool {
+    let d = pcx.nodes[n as usize].c;
+    if d <= 0 {
+        return false;
+    }
+    let signed = is_signed(ty);
+    let (known, v) = int_value(d, ty, pcx);
+    if known {
+        return v != 0 && !(signed && v == -1);
+    }
+    let dl = fact_local(d, pcx);
+    if dl < 0 || !has_fact(dl, LOOP_NONZERO, 0, pcx) {
+        return false;
+    }
+    if !signed {
+        return true;
+    }
+    let x = if pcx.nodes[n as usize].kind == NodeKind::Binary {
+        fact_local(pcx.nodes[n as usize].b, pcx)
+    } else {
+        -1
+    };
+    has_fact(dl, LOOP_NO_MIN_NEG1, -1, pcx) || x >= 0 && has_fact(dl, LOOP_NO_MIN_NEG1, x, pcx)
+}
+
+// Whether the fact (d, kind, x) holds here (push_facts).
+fn has_fact(d: i64, kind: i64, x: i64, pcx: &Ctx<Comp>) -> bool {
+    let mut k = pcx.loops.len() as i64 - 3;
+    while k >= 0 {
+        if pcx.loops[k as usize] == d && pcx.loops[(k + 1) as usize] == kind
+            && pcx.loops[(k + 2) as usize] == x {
+            return true;
+        }
+        k -= 3;
+    }
+    false
+}
+
+// RULE: E1.7 (0.30.1) The facts about a divisor that an `if` gives its
+// branches (pcx.loops entries, with the loops' and walk_if's): (d,
+// LOOP_NONZERO, 0), immutable integer local d is not 0 here; (d,
+// LOOP_NO_MIN_NEG1, x), `x == MIN && d == -1` is false here (x -1: d is
+// not -1, whatever is divided). push_facts(c, holds) records what c's
+// being `holds` proves: through `&&` (holds) and `||` (not holds), a
+// bool `!`, and each comparison of such a local with a constant
+// (cmp_fact), or `x < d` of an unsigned d (d > x >= 0); `!(x == MIN && d
+// == -1)` is the second kind. Anything else proves nothing. The local is
+// immutable, so a fact holds wherever the branch runs (closures are their
+// own walk: they see none). safe_divisor reads them.
+fn push_facts(c: i64, holds: bool, pcx: &mut Ctx<Comp>) {
+    if c <= 0 {
+        return;
+    }
+    let k = pcx.nodes[c as usize].kind;
+    let op = pcx.nodes[c as usize].op;
+    if k == NodeKind::Unary && op == Tok::Bang && pcx.nodes[c as usize].ty == TY_BOOL {
+        push_facts(pcx.nodes[c as usize].b, !holds, pcx);
+        return;
+    }
+    if k != NodeKind::Binary {
+        return;
+    }
+    let l = pcx.nodes[c as usize].b;
+    let r = pcx.nodes[c as usize].c;
+    if op == Tok::AmpAmp && holds || op == Tok::PipePipe && !holds {
+        push_facts(l, holds, pcx);
+        push_facts(r, holds, pcx);
+        return;
+    }
+    if op == Tok::AmpAmp {
+        // (not holds: `x == MIN && d == -1` false, in either order)
+        let x = min_test(l, pcx);
+        let d = minus_one_test(r, pcx);
+        let x2 = min_test(r, pcx);
+        let d2 = minus_one_test(l, pcx);
+        if x >= 0 && d >= 0 {
+            push_fact(d, LOOP_NO_MIN_NEG1, x, pcx);
+        } else if x2 >= 0 && d2 >= 0 {
+            push_fact(d2, LOOP_NO_MIN_NEG1, x2, pcx);
+        }
+        return;
+    }
+    cmp_fact(c, holds, pcx);
+}
+
+fn push_fact(d: i64, kind: i64, x: i64, pcx: &mut Ctx<Comp>) {
+    pcx.loops.push(d);
+    pcx.loops.push(kind);
+    pcx.loops.push(x);
+}
+
+// Comparison c, `holds` or not: the facts it gives each side that is an
+// immutable integer local d, compared with a constant (int_value) or,
+// for an unsigned d, as `d > x` (d > x >= 0). A constant is read as d's
+// type reads it: an unsigned one of 2^63 or more is negative as an i64,
+// and only the signed rules below compare it as a number.
+fn cmp_fact(c: i64, holds: bool, pcx: &mut Ctx<Comp>) {
+    let mut op = pcx.nodes[c as usize].op;
+    if !holds {
+        // (the comparison is false: its opposite holds)
+        op = if op == Tok::EqEq { Tok::BangEq } else if op == Tok::BangEq { Tok::EqEq }
+            else if op == Tok::Lt { Tok::GtEq } else if op == Tok::GtEq { Tok::Lt }
+            else if op == Tok::Gt { Tok::LtEq } else if op == Tok::LtEq { Tok::Gt }
+            else { Tok::Eof };
+    }
+    if op != Tok::EqEq && op != Tok::BangEq && op != Tok::Lt && op != Tok::LtEq && op != Tok::Gt
+        && op != Tok::GtEq {
+        return;
+    }
+    let l = pcx.nodes[c as usize].b;
+    let r = pcx.nodes[c as usize].c;
+    side_fact(l, op, r, pcx);
+    // (the other side: `0 != d` is `d != 0`, `x < d` is `d > x`)
+    let flipped = if op == Tok::Lt { Tok::Gt } else if op == Tok::Gt { Tok::Lt }
+        else if op == Tok::LtEq { Tok::GtEq } else if op == Tok::GtEq { Tok::LtEq } else { op };
+    side_fact(r, flipped, l, pcx);
+}
+
+// `l op r` holds: the facts it gives l when l is a fact_local.
+fn side_fact(l: i64, op: Tok, r: i64, pcx: &mut Ctx<Comp>) {
+    let d = fact_local(l, pcx);
+    if d < 0 {
+        return;
+    }
+    let ty = undistinct(pcx.nodes[l as usize].ty, pcx);
+    let (known, v) = int_value(r, ty, pcx);
+    let signed = is_signed(ty);
+    if !known {
+        // (`d > x` of an unsigned d: d > x >= 0)
+        if op == Tok::Gt && !signed && is_integer(undistinct(pcx.nodes[r as usize].ty, pcx)) {
+            push_fact(d, LOOP_NONZERO, 0, pcx);
+        }
+        return;
+    }
+    // d's values here, as far as the comparison says: whether 0 and -1
+    // are among them
+    let mut no_zero = false;
+    let mut no_minus_one = !signed;
+    if op == Tok::BangEq {
+        no_zero = v == 0;
+        no_minus_one = no_minus_one || v == -1;
+    } else if op == Tok::EqEq {
+        no_zero = v != 0;
+        no_minus_one = no_minus_one || v != -1;
+    } else if op == Tok::Gt {
+        // d > v: unsigned, d >= 1; signed, 0 and -1 are out when v >= 0
+        no_zero = !signed || v >= 0;
+        no_minus_one = no_minus_one || v >= -1;
+    } else if op == Tok::GtEq {
+        // (unsigned: v != 0 is v >= 1 as the type reads it)
+        no_zero = if signed { v >= 1 } else { v != 0 };
+        no_minus_one = no_minus_one || v >= 0;
+    } else if op == Tok::Lt {
+        // d < v: signed only (an unsigned d < v may be 0)
+        no_zero = signed && v <= 0;
+        no_minus_one = no_minus_one || v <= -1;
+    } else if op == Tok::LtEq {
+        no_zero = signed && v <= -1;
+        no_minus_one = no_minus_one || v <= -2;
+    }
+    if no_zero {
+        push_fact(d, LOOP_NONZERO, 0, pcx);
+    }
+    if signed && no_minus_one {
+        push_fact(d, LOOP_NO_MIN_NEG1, -1, pcx);
+    }
+}
+
+// The local that e is, when facts can be kept about it: an immutable
+// local of an integer type; else -1.
+fn fact_local(e: i64, pcx: &Ctx<Comp>) -> i64 {
+    if e <= 0 || pcx.nodes[e as usize].kind != NodeKind::Ident
+        || pcx.nodes[e as usize].res != Res::Local {
+        return -1;
+    }
+    let y = pcx.nodes[e as usize].y;
+    if y < 0 || y >= pcx.locals.len() as i64 || pcx.locals[y as usize].mutable
+        || !is_integer(undistinct(pcx.nodes[e as usize].ty, pcx)) {
+        return -1;
+    }
+    y
+}
+
+// The local x of `x == MIN` or `MIN == x` (MIN its signed type's least
+// value), else -1.
+fn min_test(e: i64, pcx: &Ctx<Comp>) -> i64 {
+    if e <= 0 || pcx.nodes[e as usize].kind != NodeKind::Binary
+        || pcx.nodes[e as usize].op != Tok::EqEq {
+        return -1;
+    }
+    for side in 0..2 {
+        let l = if side == 0 { pcx.nodes[e as usize].b } else { pcx.nodes[e as usize].c };
+        let r = if side == 0 { pcx.nodes[e as usize].c } else { pcx.nodes[e as usize].b };
+        let x = fact_local(l, pcx);
+        if x >= 0 {
+            let ty = undistinct(pcx.nodes[l as usize].ty, pcx);
+            let (known, v) = int_value(r, ty, pcx);
+            if known && is_signed(ty) && v == (0 - 1) << (int_bits(ty) - 1) as u64 {
+                return x;
+            }
+        }
+    }
+    -1
+}
+
+// The local d of `d == -1` or `-1 == d` (d signed), else -1.
+fn minus_one_test(e: i64, pcx: &Ctx<Comp>) -> i64 {
+    if e <= 0 || pcx.nodes[e as usize].kind != NodeKind::Binary
+        || pcx.nodes[e as usize].op != Tok::EqEq {
+        return -1;
+    }
+    for side in 0..2 {
+        let l = if side == 0 { pcx.nodes[e as usize].b } else { pcx.nodes[e as usize].c };
+        let r = if side == 0 { pcx.nodes[e as usize].c } else { pcx.nodes[e as usize].b };
+        let d = fact_local(l, pcx);
+        if d >= 0 {
+            let ty = undistinct(pcx.nodes[l as usize].ty, pcx);
+            let (known, v) = int_value(r, ty, pcx);
+            if known && is_signed(ty) && v == -1 {
+                return d;
+            }
+        }
+    }
+    -1
+}
+
+// The value of e, an integer constant of type ty, wrapped to ty: a
+// literal, a negated literal, a constant already computed, or an integer
+// cast of one; (false, 0)
+// for anything else. A value whose wrapping changes it is not known
+// (it is not what the source says).
+fn int_value(e: i64, ty: i64, pcx: &Ctx<Comp>) -> (bool, i64) {
+    if e <= 0 || !is_integer(ty) {
+        return (false, 0);
+    }
+    let k = pcx.nodes[e as usize].kind;
+    let mut v: i64 = 0;
+    if k == NodeKind::Int {
+        v = pcx.nodes[e as usize].a;
+    } else if k == NodeKind::Unary && pcx.nodes[e as usize].op == Tok::Minus
+        && pcx.nodes[pcx.nodes[e as usize].b as usize].kind == NodeKind::Int && is_signed(ty) {
+        // (a signed MIN is `-` of the literal 2^(bits-1): int_limit; for
+        // i64 that literal is i64::MIN itself, whose negation wraps to it)
+        let a = pcx.nodes[pcx.nodes[e as usize].b as usize].a;
+        if a < 0 && a != (0 - 1) << 63 as u64 {
+            return (false, 0);
+        }
+        v = 0i64.wrapping_sub(a);
+    } else if k == NodeKind::Ident && pcx.nodes[e as usize].res == Res::Const {
+        let c = pcx.nodes[e as usize].y;
+        if c < 0 || c >= pcx.consts.len() as i64 || pcx.consts[c as usize].state != 2 {
+            return (false, 0);
+        }
+        v = pcx.consts[c as usize].value;
+    } else if k == NodeKind::Cast {
+        // (`C as u64` of an integer constant: its value as the cast
+        // makes it, the bits kept or cut to ty's)
+        let from = undistinct(pcx.nodes[pcx.nodes[e as usize].a as usize].ty, pcx);
+        let (known, w) = int_value(pcx.nodes[e as usize].a, from, pcx);
+        if !known {
+            return (false, 0);
+        }
+        v = wrap_int(w, ty);
+    } else {
+        return (false, 0);
+    }
+    if wrap_int(v, ty) != v {
+        return (false, 0);
+    }
+    (true, v)
+}
+
+// Whether e never completes normally: a `return`, `break` or `continue`,
+// an expression of type `!` (a call of std's panic), or a block whose
+// value or last statement is one.
+fn never_completes(e: i64, pcx: &Ctx<Comp>) -> bool {
+    if e <= 0 {
+        return false;
+    }
+    let k = pcx.nodes[e as usize].kind;
+    if k == NodeKind::Return || k == NodeKind::Break || k == NodeKind::Continue
+        || pcx.nodes[e as usize].ty == TY_NEVER {
+        return true;
+    }
+    if k == NodeKind::ExprStmt {
+        return never_completes(pcx.nodes[e as usize].a, pcx);
+    }
+    if k != NodeKind::Block {
+        return false;
+    }
+    if pcx.nodes[e as usize].a != 0 {
+        return never_completes(pcx.nodes[e as usize].a, pcx);
+    }
+    let count = pcx.nodes[e as usize].count;
+    count > 0 && never_completes(child(e, count - 1, pcx), pcx)
 }
 
 // (0.17) Call n of std's print, println, eprint, eprintln, format_in or
@@ -1342,18 +1786,23 @@ fn slice_call(n: i64, name: &[u8], pcx: &Ctx<Comp>) -> i64 {
 // RULE: E2.1 (0.28.0) `if s.is_empty() { .. } else { .. }`, s an immutable
 // slice binding: in the else branch s has an element, so `s[0]` and
 // `s[1..]` are in bounds there (LOOP_NONEMPTY; std's split_first, which
-// a slice's iterator is: iterating is no `panic`).
+// a slice's iterator is: iterating is no `panic`). RULE: E1.7 (0.30.1)
+// each branch has the facts about divisors its condition gives it, true
+// in the first, false in the second (push_facts).
 fn walk_if(n: i64, pcx: &mut Ctx<Comp>) {
     let cond = pcx.nodes[n as usize].a;
     walk(cond, pcx);
-    walk(pcx.nodes[n as usize].b, pcx);
     let mark = pcx.loops.len() as i64;
+    push_facts(cond, true, pcx);
+    walk(pcx.nodes[n as usize].b, pcx);
+    pcx.loops.truncate(mark as usize);
     let s = slice_call(cond, "is_empty".as_bytes(), pcx);
     if s >= 0 {
         pcx.loops.push(-1);
         pcx.loops.push(LOOP_NONEMPTY);
         pcx.loops.push(s);
     }
+    push_facts(cond, false, pcx);
     walk(pcx.nodes[n as usize].c, pcx);
     pcx.loops.truncate(mark as usize);
 }
@@ -1599,9 +2048,16 @@ fn walk_for(n: i64, pcx: &mut Ctx<Comp>) {
         && pcx.nodes[low as usize].a >= 0 && high != 0 {
         let inclusive = pcx.nodes[range as usize].c != 0;
         if pcx.nodes[high as usize].kind == NodeKind::Int {
-            pcx.loops.push(pcx.nodes[pattern as usize].x);
-            pcx.loops.push(LOOP_LENGTH);
-            pcx.loops.push(pcx.nodes[high as usize].a + inclusive as i64);
+            // (0.30.1, RT-19: the bound as the type reads it; one of 2^63
+            // or more, negative as an i64, and `0..=i64::MAX`, whose end
+            // does not fit, prove nothing: before, -1 (u64::MAX) was taken
+            // as at most every array's length)
+            let h = pcx.nodes[high as usize].a;
+            if h >= 0 && !(inclusive && h == 9223372036854775807) {
+                pcx.loops.push(pcx.nodes[pattern as usize].x);
+                pcx.loops.push(LOOP_LENGTH);
+                pcx.loops.push(h + inclusive as i64);
+            }
         } else if !inclusive && slice_call(high, "len".as_bytes(), pcx) >= 0 {
             // (0.28.0: the rust edition's `for i in 0..s.len()`)
             pcx.loops.push(pcx.nodes[pattern as usize].x);
