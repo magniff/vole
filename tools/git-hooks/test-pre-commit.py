@@ -138,6 +138,28 @@ try:
     rc, out = commit(WORDS, "words")
     case("pre-commit: the word in a string or a comment is no site", rc == 0, out)
 
+    # A source with a byte that is not UTF-8 (a case about such bytes is
+    # one): the hook reads it, without a traceback, and still judges it.
+    def commit_bytes(data, name):
+        with open(os.path.join(repo, "main.vl"), "wb") as fh:
+            fh.write(data)
+        run(["git", "add", "main.vl"], repo)
+        r = run(["git", "-c", "core.hooksPath=tools/git-hooks", "commit", "-q", "-m", name], repo)
+        out = r.stdout + r.stderr
+        if r.returncode != 0:
+            run(["git", "reset", "-q", "--hard", "HEAD"], repo)
+        return r.returncode, out
+    raw = b"// a byte that is not UTF-8: \xc3x\n"
+    rc, out = commit_bytes(raw + BORROWED.encode(), "not utf-8, unjustified")
+    case("pre-commit: a byte that is not UTF-8, an unjustified block refused",
+         rc != 0 and "unsafe without UNSAFE:/SAFETY: comments" in out and "Traceback" not in out,
+         out)
+    rc, out = commit_bytes(raw + JUSTIFIED.encode(), "not utf-8")
+    case("pre-commit: a byte that is not UTF-8 is read",
+         rc == 0 and "Traceback" not in out, out)
+    if rc == 0:
+        run(["git", "reset", "-q", "--hard", "HEAD~1"], repo)
+
     # staged, then changed again in the work tree: the heuristic for it
     write(os.path.join(repo, "main.vl"), BORROWED)
     run(["git", "add", "main.vl"], repo)
