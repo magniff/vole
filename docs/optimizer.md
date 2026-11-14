@@ -2984,6 +2984,15 @@ tests, once the loop is rotated, are about the header's phi (and one
 against a phi of two zeros, folded only after the ranges).
 tests/run/opt_range_zero_tests.vl.
 
+**(0.30) And any constant, not 0 and 1 only** (`unsigned_bound`,
+`decide_unsigned_const`). A comparison of a value with a constant, an
+unsigned order or `==`, `!=`, is decided by what the facts that are
+such comparisons of the same value say of it as an unsigned number: a
+lower bound, and an upper one or none. `if b.len() >= 3 { b[1] + b[2]
+}` kept both checks, and `2 < n` left the check of `b[1]`; a signed
+order still says nothing of an unsigned one (`x <= 5` holds for -1,
+`x as usize <= 5` does not). tests/run/opt_range_unsigned_consts.vl.
+
 **Measured: two experiments** (the plan of the compiler's raw tables
 becoming `Vec`: E2, every index of an IntVec checked through `Index`,
 against its capacity, 4592 sites; E3, `cx.insts` a checked `Vec<Inst,
