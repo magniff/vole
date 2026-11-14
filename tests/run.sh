@@ -1300,7 +1300,7 @@ esac
 # (0.25.3) std's positions in the transcripts, compared normalized: a std
 # change moves none of them (tests/stdpos/run.sh): category "stdpos".
 case $(want stdpos) in
-    y) run_suite stdpos sh "$ROOT/tests/stdpos/run.sh" -c "$COMPILER" ;;
+    y) run_suite stdpos sh "$ROOT/tests/stdpos/run.sh" -c "$COMPILER" -j "$TJOBS" ;;
 esac
 # (0.30) std inside the tools: std's files named in errors, queries,
 # edits and fixes, and `check --std`, in a copy of compiler/std
@@ -1348,9 +1348,29 @@ case $(want hooks) in
     y)
         if command -v python3 >/dev/null 2>&1; then
             # (0.25.2.1) the compiler under test, not target/volec, for the
-            # cases that run a real one
+            # cases that run a real one; (0.30) TJOBS files at once (the
+            # query suite's rule, above), their reports in the files' order
             hooks_cases() {
-                for t in "$ROOT"/tools/agent-hooks/test-*.py "$ROOT"/tools/git-hooks/test-*.py; do VOLE_TEST_COMPILER="$COMPILER" python3 -I "$t"; done
+                hd="$WORK/hooks.d"
+                mkdir -p "$hd"
+                mkfifo "$hd/slots"
+                exec 5<>"$hd/slots"
+                hi=0
+                while [ "$hi" -lt "$TJOBS" ]; do echo >&5; hi=$((hi + 1)); done
+                hi=0
+                for t in "$ROOT"/tools/agent-hooks/test-*.py "$ROOT"/tools/git-hooks/test-*.py; do
+                    hi=$((hi + 1))
+                    read -r _ <&5
+                    ( trap 'echo >&5' EXIT; VOLE_HOOKS_JOBS=$TJOBS VOLE_TEST_COMPILER="$COMPILER" python3 -I "$t" >"$hd/$hi.out" 2>&1 ) &
+                done
+                wait
+                exec 5>&-
+                hi=0
+                for t in "$ROOT"/tools/agent-hooks/test-*.py "$ROOT"/tools/git-hooks/test-*.py; do
+                    hi=$((hi + 1))
+                    cat "$hd/$hi.out"
+                done
+                ! cat "$hd"/*.out | grep -q '^FAIL'
             }
             run_suite hooks hooks_cases
         else

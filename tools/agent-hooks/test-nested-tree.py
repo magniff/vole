@@ -9,10 +9,13 @@ not by a target/ or tmp/ in its absolute path nor by the outer checkout.
 Each copy holds the tree's files (git ls-files, the untracked ones too;
 in a tree with no .git, its files but target/);
 its tools/agent-hooks/test-*.py run there, this file aside. Run by
-tests/run.sh (category "hooks").
+tests/run.sh (category "hooks"). (0.30) The two copies' tests run at
+once, $VOLE_HOOKS_JOBS of them (default 4; 1: one by one, as before);
+the report is the same, in the same order.
 
 usage: python3 -I tools/agent-hooks/test-nested-tree.py
 """
+import concurrent.futures
 import os
 import shutil
 import subprocess
@@ -48,20 +51,29 @@ def copy_tree(dest):
     subprocess.run(["tar", "-xf", "-", "-C", dest], input=tar.stdout, check=True)
 
 
-def run_in(where, tree, compiler):
+def tests_of(where, tree, compiler):
+    """The jobs of a copy: (where, tree, test, env) for each of its tests."""
     env = dict(os.environ)
     env["VOLE_NESTED_TREE"] = "1"
     if compiler:
         env["VOLE_TEST_COMPILER"] = compiler
-    for t in sorted(os.listdir(os.path.join(tree, "tools", "agent-hooks"))):
-        if not (t.startswith("test-") and t.endswith(".py")) or t == SELF:
-            continue
-        r = subprocess.run([sys.executable, "-I", os.path.join("tools", "agent-hooks", t)],
-                           cwd=tree, capture_output=True, text=True, env=env, timeout=600)
-        out = r.stdout + r.stderr
-        fails = [ln for ln in out.splitlines() if ln.startswith("FAIL")]
-        case(f"{where}: {t}", r.returncode == 0 and not fails and "Traceback" not in out,
-             "\n    ".join((fails or out.splitlines()[-8:])[:12]))
+    return [(where, tree, t, env) for t in sorted(os.listdir(os.path.join(tree, "tools", "agent-hooks")))
+            if t.startswith("test-") and t.endswith(".py") and t != SELF]
+
+
+def run_one(job):
+    where, tree, t, env = job
+    r = subprocess.run([sys.executable, "-I", os.path.join("tools", "agent-hooks", t)],
+                       cwd=tree, capture_output=True, text=True, env=env, timeout=600)
+    return r.returncode, r.stdout + r.stderr
+
+
+def report(job, result):
+    where, _, t, _ = job
+    rc, out = result
+    fails = [ln for ln in out.splitlines() if ln.startswith("FAIL")]
+    case(f"{where}: {t}", rc == 0 and not fails and "Traceback" not in out,
+         "\n    ".join((fails or out.splitlines()[-8:])[:12]))
 
 
 def main():
@@ -78,10 +90,19 @@ def main():
     tmp = "/private/tmp" if os.path.isdir("/private/tmp") else "/tmp"
     outer = tempfile.mkdtemp(prefix="vole-nested-hooks.", dir=tmp)
     try:
+        jobs = []
         for where, base in (("under target/", inner), ("under " + tmp, outer)):
             tree = os.path.join(base, "x", "tree")
             copy_tree(tree)
-            run_in(where, tree, compiler)
+            jobs += tests_of(where, tree, compiler)
+        try:
+            n = max(1, int(os.environ.get("VOLE_HOOKS_JOBS", "4")))
+        except ValueError:
+            n = 4
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
+            results = list(pool.map(run_one, jobs))
+        for job, result in zip(jobs, results):
+            report(job, result)
     finally:
         shutil.rmtree(inner, ignore_errors=True)
         shutil.rmtree(outer, ignore_errors=True)
