@@ -20,6 +20,8 @@ volec refactor field STRUCT --add 'g: T = VALUE' | --remove g | --rename g h
                             | --type g[,h...] T [--default EXPR] [--allocator X] [--rewrite PAT REPL]...
 volec refactor variant ENUM --add 'X(T, ...)'|'X { a: T, ... }' [--arm EXPR] [--arm-in SITE EXPR]... | --remove V | --rename V W
 volec rewrite 'PATTERN' 'REPLACEMENT' [--where '$x: T']... [--subst 'P' 'R']... [--in FILE|MODULE|ITEM]... [--list]
+                 [--not-in FILE|MODULE|ITEM]... [--at-errors TEXT] [--force]     (0.30)
+volec rewrite --from FILE [--in ...] [--not-in ...]              (0.30: PATTERN -> REPLACEMENT a line)
 volec rewrite 'PATTERN' --list [--where ...] [--in FILE|MODULE|ITEM]   (0.16)
 volec refactor extract-function FN --lines A-B --to NEW          (0.13)
 volec refactor inline FN [--at FILE:LINE] [--keep]                 (0.13)
