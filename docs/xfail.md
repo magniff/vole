@@ -77,8 +77,38 @@ These cases were fixed by a change to the compiler or std, not to the test:
   free in safe code (`apply(&v, sl)`). Case: `sem_poly_g06_generic_fnparam_call`.
 
 These fixes also brought new rustc-strict checks without an XFAIL case of
-their own: a union field borrowed outside `unsafe` (E0133), and the R7
-error cases.
+their own: a union field borrowed outside `unsafe` (E0133), the R7 error
+cases, and a closure calling a captured FnMut closure that is not
+declared `mut` (E0596, `rust_b_err_capture_call_fnmut`).
+
+Six cases expected MVS's output, or MVS's places IR, while vole's output
+already was rustc's (the rustc twin's binary as the referee): their EXPECT
+lines are now rustc's: `sem_own_map_sink_closure_count`,
+`sem_own_add_owned_let`, `sem_own_borrow_sink_closure_ret_field`,
+`sem_own_leak_borrowed_map_fold_ok` (a map's drop order, which Rust leaves
+unspecified), `fmt_0253_slice_debug` and `places_temp_statement_end` (the
+print's end is `PrintOut::end`).
+
+The XFAIL count went from 730 to 717 (`grep -rhE "^ *// XFAIL" tests |
+wc -l`).
+
+The borrowck twin (`tools/borrowck-twin.sh --shim tests/run/rust_b_*.vl`):
+
+| | cases | agree | divergences | mismatches |
+|---|---|---|---|---|
+| before | 462 | 419 | 10 (L13 1, L2 2, L7 2, L8 1, R3 1, R7 2, R8 1) | 0 |
+| after | 469 | 427 | 8 (R7 closed) | 0 |
+
+Two named divergences are kept, with their reasons in
+docs/design/borrowck.md:
+- R3: per-instance checking accepts a generic body that moves an `FnOnce`
+  parameter twice when the instance's closure is Copy. This is sound for
+  every instance; rustc rejects the template.
+- R8: vole is stricter here (a move out of `*b` for a Box).
+
+The rustc twin's usual set (`--guide rust_*_ok_* rust_t_*`): before, 439
+programs with 308 agree, 0 differ, 9 named; after, 310 agree, 0 differ,
+7 named.
 
 ## The plan for (h)
 
@@ -108,8 +138,9 @@ In order of cases per hour:
 4. **The 139 "not Rust text" cases.** Rewrite them (the parse gaps, gap 7)
    or delete them (MVS std names that std2 renamed: the rename is the
    test).
-5. **The 4 output cases.** Rewrite the EXPECT lines to rustc's output, with
-   the twin as the referee.
+5. **The output cases.** Rewrite the EXPECT lines to rustc's output, with
+   the twin as the referee (done in 0.30 for the six whose output already
+   was rustc's).
 
 ## What is left, by class
 
@@ -122,10 +153,15 @@ three steps above.
 
 - `rust_b_err_mv_assign_part_uninit`: rustc E0381, a partly assigned
   binding.
-- `rust_b_err_mv_out_of_static`: rustc E0507.
+- `rust_b_err_mv_out_of_static`: rustc E0507. The static is read as
+  `copy`, so no move is seen; the copy is made before places/build.vl's
+  place_operand.
 - `sem_core_shift`: rustc's deny lint for a constant shift that overflows.
 - `sem_poly_th03_direct_closure_in_scope`: rustc E0596, an FnMut closure
-  called through a binding that is not `mut`.
+  called through a binding that is not `mut`. The direct form is fixed. The
+  form nested in a second closure is not: the outer closure's capture is
+  inferred before the inner one's, so the outer takes c by `&`
+  (front/closures/kinds.vl).
 - `err_017_lifetime_quote`: rustc E0261, an undeclared lifetime.
 - `err_017_label_use_quote`: a malformed loop label.
 - `alloc_gpa`: `a < b < c` is accepted.
@@ -144,8 +180,9 @@ three steps above.
   0.29.0 too.
 
 **(c)**: `checkalloc_arena_*` (the arena's stale-block report),
-`contract_*` (the requires message), `fmt_values`,
-`sem_own_map_sink_closure_count` and `sem_own_for_vec_take`.
+`contract_*` (the requires message), `fmt_values` and
+`sem_own_for_vec_take` (`sem_own_map_sink_closure_count` was MVS's expected
+output; fixed above).
 
 **(d)**: list the names, then either add them to std2 when Rust has them
 (`count_ones` reachable, `BTreeMap` at `std::`) or rewrite the case to
