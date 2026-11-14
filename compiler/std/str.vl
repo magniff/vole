@@ -1472,10 +1472,18 @@ impl<'a> Iterator for Chars<'a> {
     type Item = char;
 
     fn next(&mut self) -> Option<char> {
-        if self.rest.is_empty() {
+        let b = self.rest.as_bytes();
+        // (written as b[0]'s own check, which then is not made twice)
+        if !(0 < b.len()) {
             return None;
         }
-        let (c, n) = decode_first(self.rest.as_bytes());
+        // (an ASCII byte is its char: nothing is decoded)
+        let x = b[0];
+        if x < 0x80 {
+            self.rest = &self.rest[1..];
+            return Some(x as char);
+        }
+        let (c, n) = decode_first(b);
         self.rest = &self.rest[n..];
         Some(c)
     }
@@ -1484,11 +1492,7 @@ impl<'a> Iterator for Chars<'a> {
     // continuation bytes, 0b10xxxxxx; nothing is decoded)
     fn count(self) -> usize {
         let b = self.rest.as_bytes();
-        let mut n: usize = 0;
-        for x in b.iter() {
-            n += ((*x & 0xC0) != 0x80) as usize;
-        }
-        n
+        b.len() - count_continuation_bytes(b)
     }
 }
 
@@ -1977,25 +1981,65 @@ pub struct Graphemes<'a> {
 
 // ---- The helpers ----
 
-// The first code point of b (UTF-8, not empty) and its length.
+// The number of continuation bytes (0x80..0xBF) of b. Written for the
+// vectorizer, with no check that could stop it (Chars::count has no
+// effect): 224 bytes at a time, taken by `get`, are counted in a byte
+// (the loop's values are then all bytes: sixteen a step, and 224 is 7
+// steps of two vectors, with none left over), and the counts are added
+// up. A count of the whole text in a usize is not vectorized (elements
+// of two widths), nor is `(x & 0xC0 == 0x80) as u8` (a compare's value
+// has no vector form; the `if` has): 6 to 10 instructions a byte.
+fn count_continuation_bytes(b: &[u8]) -> usize {
+    let n = b.len();
+    let mut conts: usize = 0;
+    for k in 0..n / 224 + 1 {
+        let end = if k * 224 + 224 < n { k * 224 + 224 } else { n };
+        match b.get(k * 224..end) {
+            Some(w) => {
+                let mut c: u8 = 0;
+                for j in 0..w.len() {
+                    if w[j] & 0xC0 == 0x80 {
+                        c += 1;
+                    }
+                }
+                conts += c as usize;
+            }
+            None => {}
+        }
+    }
+    conts
+}
+
+// The first code point of b (UTF-8, not empty) and its length. Not
+// inlined: Chars::next with it inside is too large to inline into the
+// loop that calls it, and its ASCII step then costs a call.
+#[inline(never)]
 fn decode_first(b: &[u8]) -> (char, usize) {
     let x = b[0] as u32;
-    let (n, init): (usize, u32) = if x < 0x80 {
-        (1, x)
-    } else if x < 0xE0 {
-        (2, x & 0x1F)
-    } else if x < 0xF0 {
-        (3, x & 0x0F)
-    } else {
-        (4, x & 0x07)
-    };
-    let mut cp = init;
-    let mut k: usize = 1;
-    while k < n {
-        cp = (cp << 6) | (b[k] as u32 & 0x3F);
-        k += 1;
+    if x < 0x80 {
+        return (to_char(x), 1);
     }
-    (to_char(cp), n)
+    // (each form in a line: a loop over the continuation bytes was
+    // unrolled by four. The length is tested as the last byte's own check,
+    // `2 < n` for b[2], which then covers the bytes before it: after
+    // `n >= 3` each byte was checked again)
+    let n = b.len();
+    if x < 0xE0 {
+        if 1 < n {
+            return (to_char((x & 0x1F) << 6 | (b[1] as u32 & 0x3F)), 2);
+        }
+    } else if x < 0xF0 {
+        if 2 < n {
+            let cp = (x & 0x0F) << 12 | (b[1] as u32 & 0x3F) << 6 | (b[2] as u32 & 0x3F);
+            return (to_char(cp), 3);
+        }
+    } else if 3 < n {
+        let cp = (x & 0x07) << 18 | (b[1] as u32 & 0x3F) << 12 | (b[2] as u32 & 0x3F) << 6
+            | (b[3] as u32 & 0x3F);
+        return (to_char(cp), 4);
+    }
+    // (cut short: no str is)
+    ('\u{FFFD}', n)
 }
 
 // The last code point of b (UTF-8, not empty) and its length.
