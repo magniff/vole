@@ -1353,7 +1353,12 @@ pub fn lossy_next(v: &[u8], pos: &mut usize) -> u32 {
         if i + 2 < len {
             let b1 = v[i + 1];
             let b2 = v[i + 2];
-            if utf8_second_ok(first, b1) && (b2 & 0xc0) == 0x80 {
+            // (the second byte's range, as utf8_second_ok has it, by two
+            // selects: a call of it here cost each sequence twenty
+            // instructions)
+            let lo: u8 = if first == 0xe0 { 0xa0 } else { 0x80 };
+            let hi: u8 = if first == 0xed { 0x9f } else { 0xbf };
+            if b1 >= lo && b1 <= hi && (b2 & 0xc0) == 0x80 {
                 *pos = i + 3;
                 return (((first & 0x0f) as u32) << 12) | (((b1 & 0x3f) as u32) << 6)
                     | (b2 & 0x3f) as u32;
@@ -1363,7 +1368,9 @@ pub fn lossy_next(v: &[u8], pos: &mut usize) -> u32 {
         let b1 = v[i + 1];
         let b2 = v[i + 2];
         let b3 = v[i + 3];
-        if utf8_second_ok(first, b1) && (b2 & 0xc0) == 0x80 && (b3 & 0xc0) == 0x80 {
+        let lo: u8 = if first == 0xf0 { 0x90 } else { 0x80 };
+        let hi: u8 = if first == 0xf4 { 0x8f } else { 0xbf };
+        if b1 >= lo && b1 <= hi && (b2 & 0xc0) == 0x80 && (b3 & 0xc0) == 0x80 {
             *pos = i + 4;
             return (((first & 0x07) as u32) << 18) | (((b1 & 0x3f) as u32) << 12)
                 | (((b2 & 0x3f) as u32) << 6) | (b3 & 0x3f) as u32;
@@ -1375,17 +1382,57 @@ pub fn lossy_next(v: &[u8], pos: &mut usize) -> u32 {
 
 // The length of v's longest prefix of printable ASCII, 0x20 to 0x7E: the
 // bytes a terminal puts on the screen one cell each without a lookup.
+// Sixteen bytes a step (0.30): two compares say which bytes are not, and
+// the first of them is found in the block's two halves as numbers.
+// Counted loops: it ends (no `diverge`).
 #[effects(panic)]
 pub fn ascii_printable_prefix_len(v: &[u8]) -> usize {
-    let mut i = 0;
-    while i < v.len() {
+    let n = v.len();
+    let low = v16u8::splat(0x20);
+    let high = v16u8::splat(0x7e);
+    let blocks = n / 16;
+    for k in 0..blocks {
+        let i = k * 16;
+        let w = &v[i..i + 16];
+        let x = v16u8::load(w, 0);
+        let other = v2u64::from_bits((x < low) | (x > high));
+        let first = other.lane(0);
+        if first != 0 {
+            return i + first_byte_set(first);
+        }
+        let second = other.lane(1);
+        if second != 0 {
+            return i + 8 + first_byte_set(second);
+        }
+    }
+    for i in blocks * 16..n {
         let b = v[i];
         if b < 0x20 || b > 0x7e {
             return i;
         }
-        i += 1;
     }
-    i
+    n
+}
+
+// Which of x's eight bytes, from the low one, is the first that is not 0
+// (x is not 0; a compare's lanes as a number): by halves. Not
+// trailing_zeros, whose text is a `while` loop (`diverge`).
+#[inline]
+fn first_byte_set(x: u64) -> usize {
+    let mut y = x;
+    let mut k: usize = 0;
+    if y & 0xFFFF_FFFF == 0 {
+        k = 4;
+        y = y >> 32;
+    }
+    if y & 0xFFFF == 0 {
+        k += 2;
+        y = y >> 16;
+    }
+    if y & 0xFF == 0 {
+        k += 1;
+    }
+    k
 }
 
 // ---- Grapheme clusters (0.20) ----
@@ -1480,9 +1527,27 @@ impl GraphemeState {
 }
 
 // The end of the cluster that starts at s[start]: the next boundary, or
-// s's length.
+// s's length. Two ASCII bytes break between them (but CR LF): that case
+// here, small enough to inline into the caller's loop; the rest in
+// grapheme_end_by_rules, whose frame (ten saved registers) each ASCII
+// byte paid for when the two were one function.
+#[inline]
 #[effects(panic, diverge)]
 pub fn next_grapheme_end(s: &[u8], start: usize) -> usize {
+    if start < s.len() && start + 1 < s.len() {
+        let b0 = s[start];
+        let b1 = s[start + 1];
+        if b0 < 0x80 && b1 < 0x80 && !(b0 == b'\r' && b1 == b'\n') {
+            return start + 1;
+        }
+    }
+    grapheme_end_by_rules(s, start)
+}
+
+// next_grapheme_end, by the rules: any text.
+#[inline(never)]
+#[effects(panic, diverge)]
+fn grapheme_end_by_rules(s: &[u8], start: usize) -> usize {
     let len = s.len();
     if start >= len {
         return len;
