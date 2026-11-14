@@ -22,7 +22,15 @@
 # --sample (the tools' answers from their cache the same as without it,
 # 0.25.3). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
-# usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-k LINKER] [-d FORMAT] [-f FILE] [-l] [-n NAME] [FILTER...]
+# usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-k LINKER] [-d FORMAT] [-f FILE] [-l] [--cases-only] [--bless] [-n NAME] [FILTER...]
+#
+# The options come before the FILTERs: one after a FILTER is an error
+# that says where to put it (0.30: before, it was a FILTER, and `-O 2
+# -j 2` after a name ran every case with a 2 in its name).
+# The first line printed is the plan, before anything runs (0.30): `plan:
+# N cases, M suites (NAMES), -j JOBS ...`; then a line for each suite as
+# it ends (`suite NAME: P pass, F FAIL, exit RC, T s`), then the
+# failures and the table.
 #
 #   -c COMPILER   the volec binary to test (default: target/volec,
 #                 as left by bootstrap/bootstrap.sh)
@@ -45,12 +53,37 @@
 #   -f FILE       (0.25.2) more FILTERs, one per line (# comments)
 #   -l            (0.25.2) list what the FILTERs select, `case NAME` and
 #                 `suite NAME` (`leveled`: it takes -O), and run nothing
+#   --cases-only  (0.30) no suite or check, only cases: `tests/run.sh
+#                 --cases-only fmt` is the cases with fmt in their name,
+#                 not also the fmt suite's minutes
+#   --bless       (0.30) `tests/run.sh --bless NAME...`: the selected
+#                 cases are run (no suite), and one that fails only
+#                 because its errors moved gets its `// ERROR:` directives
+#                 rewritten in its file: every directive's text, its
+#                 `line L, column C` aside, is still in the compiler's
+#                 output, in order (the same errors: kind and message),
+#                 and only the positions differ; they are written as the
+#                 compiler prints them now, the case is run again, and
+#                 `blessed NAME: ...` lists what changed (read the diff).
+#                 Nothing else is blessed: a message that changed, an
+#                 error that is gone or new (ERROR-COUNT), an XFAIL case,
+#                 a case that fails otherwise stay as they are, each with
+#                 a `not blessed NAME: why` line, and fail
 #   -n NAME       (0.25.5) only the case, suite or check named NAME exactly
 #                 (repeatable)
 #   FILTER...     run only the cases (and the suites and checks below)
 #                 whose name contains a FILTER (`tests/run.sh pathtrace`:
 #                 every case of the path tracer); several of them, -n
-#                 and -f select the union
+#                 and -f select the union. (0.30) A FILTER of digits
+#                 only gets a warning (an option's value put after a
+#                 name?); selecting nothing is an error, `no case matches`
+#   SUITE:FILTER  (0.30) the suite query, refactor, lsp or fmt, and of it
+#                 only the transcripts, sessions and checks whose name
+#                 contains FILTER (`tests/run.sh -j 2 refactor:rename
+#                 query:=clash`; `=NAME`: NAME exactly; the suite's own
+#                 runner lists them: tests/refactor/run.sh -l). With -j
+#                 given, the query and refactor suites run JOBS of their
+#                 transcripts at once (each; two at most beside cases)
 #
 # Environment: CC is the linker (and the assembler with -a; default cc).
 # VOLE_JOBSERVER (0.11), when -j is not given, names a FIFO holding
@@ -207,12 +240,15 @@ DIAG=human
 LINKER=""
 FILTERS=""
 LIST=0
+CASES_ONLY=0
+BLESS=0
 
 usage() {
     sed -n '2,/^# Environment:/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2
     exit 2
 }
 
+all_args="$*"
 while [ $# -gt 0 ]; do
     case "$1" in
         -c) [ $# -ge 2 ] || usage; COMPILER=$2; shift 2 ;;
@@ -231,6 +267,8 @@ while [ $# -gt 0 ]; do
 "
             shift 2 ;;
         -l) LIST=1; shift ;;
+        --cases-only) CASES_ONLY=1; shift ;;
+        --bless) BLESS=1; CASES_ONLY=1; shift ;;
         # (0.25.5) -n NAME: only NAME, as =NAME, in a form zsh does not
         # expand (its `=word` is a path: `=NAME` unquoted runs nothing)
         -n)
@@ -241,17 +279,75 @@ while [ $# -gt 0 ]; do
         -h|--help) usage ;;
         -*)
             # (0.25.2: one line, not the whole usage)
-            echo "tests/run.sh: unknown option '$1' (options: -c COMPILER -t TARGET -O LEVEL or -O0 -j JOBS -a -k LINKER -d FORMAT -f FILE -l -n NAME; tests/run.sh -h for more)" >&2
+            echo "tests/run.sh: unknown option '$1' (options: -c COMPILER -t TARGET -O LEVEL or -O0 -j JOBS -a -k LINKER -d FORMAT -f FILE -l --cases-only --bless -n NAME; tests/run.sh -h for more)" >&2
             exit 2 ;;
         *) break ;;
     esac
 done
 # (0.25.2) Several FILTERs, and -f files of them, select the union.
+# (0.30) An option after a FILTER is an error, not a FILTER: `pathtrace
+# -O 2 -j 2` selected every name holding `-O`, `2` or `-j`, at the
+# default -j.
+first_filter=""
+before=""
+# (the options given in their place, for the try: line)
+lead=${all_args%"$*"}
 for f in "$@"; do
+    case "$f" in
+        -*)
+            if [ -n "$first_filter" ]; then
+                rest=$(printf '%s ' "$@" | sed 's/ $//')
+                rest=${rest#"$before"}
+                echo "tests/run.sh: the option '$f' comes after the FILTER '$first_filter': options go before the FILTERs" >&2
+                echo "try: tests/run.sh $lead$rest $(printf '%s' "$before" | sed 's/ $//')" >&2
+                exit 2
+            fi ;;
+    esac
+    [ -n "$first_filter" ] || first_filter=$f
+    before="$before$f "
     FILTERS="$FILTERS$f
 "
 done
-FILTER=$(printf '%s' "$FILTERS" | tr '\n' ' ' | sed 's/ $//')
+# (0.30) SUITE:FILTER, for the suites that take names (query, refactor,
+# lsp, fmt): the suite, and FILTER given to its runner (the transcripts,
+# sessions and checks of it whose name contains FILTER; `=NAME`: NAME
+# exactly). Several for one suite select the union.
+SUB_query=""
+SUB_refactor=""
+SUB_lsp=""
+SUB_fmt=""
+ALLF=$FILTERS
+FILTERS=""
+while IFS= read -r f; do
+    case "$f" in
+        query:?*) SUB_query="$SUB_query ${f#*:}"; f="=query" ;;
+        refactor:?*) SUB_refactor="$SUB_refactor ${f#*:}"; f="=refactor" ;;
+        lsp:?*) SUB_lsp="$SUB_lsp ${f#*:}"; f="=lsp" ;;
+        fmt:?*) SUB_fmt="$SUB_fmt ${f#*:}"; f="=fmt" ;;
+        "") continue ;;
+        # (a FILTER that selects the suite itself: all of it, whatever
+        # names another gives)
+        =query|=refactor|=lsp|=fmt) eval "WHOLE_${f#=}=1" ;;
+        =*) ;;
+        *)
+            for s in query refactor lsp fmt; do
+                case "$s" in *"$f"*) eval "WHOLE_$s=1" ;; esac
+            done ;;
+    esac
+    FILTERS="$FILTERS$f
+"
+done <<EOF
+$ALLF
+EOF
+[ -z "${WHOLE_query:-}" ] || SUB_query=""
+[ -z "${WHOLE_refactor:-}" ] || SUB_refactor=""
+[ -z "${WHOLE_lsp:-}" ] || SUB_lsp=""
+[ -z "${WHOLE_fmt:-}" ] || SUB_fmt=""
+FILTER=$(printf '%s' "$ALLF" | tr '\n' ' ' | sed 's/ $//')
+if [ "$BLESS" = 1 ] && { [ -z "$FILTERS" ] || [ "$DIAG" != human ]; }; then
+    echo "tests/run.sh: --bless takes the cases to bless, and the human diagnostics: tests/run.sh --bless NAME... (tests/run.sh -h says what it rewrites)" >&2
+    exit 2
+fi
 VOLE_RUN_FILTERS=$FILTERS
 export VOLE_RUN_FILTERS
 
@@ -287,8 +383,10 @@ select_names() {
         $1 in exact { print; next }
         { for (i = 1; i <= np; i++) if (index($1, part[i])) { print; next } }'
 }
-# `y` when the filters select the suite or check named $1.
+# `y` when the filters select the suite or check named $1 (0.30: none
+# with --cases-only).
 want() {
+    [ "$CASES_ONLY" = 1 ] && return
     [ -n "$(echo "$1" | select_names)" ] && echo y
 }
 # The suites and checks besides the cases, each run where `case $(want
@@ -297,11 +395,21 @@ want() {
 # every level).
 SUITES="query refactor guide book fmt walkthrough wgsl voltty borrowck-try runner embed-checks stdpos cachediff lsp link gpu hooks arch-gen arch-enc voltty_render window example_layout example_build readme_sync perf"
 LEVELED="gpu arch-gen"
+# (0.30) A FILTER of digits only is warned about: an option's value put
+# after a name was one before 0.30 (`NAME -j 2`).
+for f in $(printf '%s' "$FILTERS"); do
+    case "$f" in
+        *[!0-9]*) ;;
+        *) echo "tests/run.sh: warning: the FILTER '$f' is only digits: it selects every name containing '$f' ($(all_cases | awk -v f="$f" 'index($1, f) { n++ } END { print n + 0 }') cases); an option's value goes with its option, before the FILTERs (-O $f, -j $f)" >&2 ;;
+    esac
+done
 if [ "$LIST" = 1 ]; then
     all_cases | select_names | awk '{ print "case " $1 }'
     for s in $SUITES; do
         [ -z "$(want "$s")" ] && continue
-        case " $LEVELED " in *" $s "*) echo "suite $s leveled" ;; *) echo "suite $s" ;; esac
+        # (0.30: a suite given names, `suite refactor only NAME...`)
+        eval "sub=\${SUB_$(echo "$s" | tr - _):-}"
+        case " $LEVELED " in *" $s "*) echo "suite $s leveled" ;; *) echo "suite $s${sub:+ only$sub}" ;; esac
     done
     exit 0
 fi
@@ -603,6 +711,7 @@ check_case() {
         # shellcheck disable=SC2086
         "$COMPILER" --target "$TARGET" $OPT $FLAGS "$source" -o "$dir/prog.s" >"$dir/compile.out" 2>&1
         rc=$?
+        echo "$rc" >"$dir/compile.rc"
         if [ $rc -ne 1 ]; then
             { echo "expected a compile error (exit code 1), got exit code $rc:"; cat "$dir/compile.out"; } >"$dir/why"
             return 1
@@ -924,6 +1033,110 @@ match_checks() {
     ' "$1" >"$3" 2>&1
 }
 
+# (0.30, --bless) Case $1 (file $2, run in directory $3, failed): when
+# its ERROR directives are the errors the compiler reports but for their
+# positions, the directives are rewritten in the file with the positions
+# of now and the case is run again; says `blessed NAME: ...` or `not
+# blessed NAME: why` (the file then as it was).
+bless_case() {
+    if [ ! -s "$3/errors" ]; then
+        echo "not blessed $1: it has no ERROR directive (only those are rewritten)"
+        return 1
+    fi
+    if [ -s "$3/xfail" ]; then
+        echo "not blessed $1: it is XFAIL ($(cat "$3/xfail"))"
+        return 1
+    fi
+    if [ "$(cat "$3/compile.rc" 2>/dev/null)" != 1 ]; then
+        echo "not blessed $1: the compiler reports no error now (exit code $(cat "$3/compile.rc" 2>/dev/null))"
+        return 1
+    fi
+    # The directives with the positions of the output: each one's text,
+    # every `line L, column C` in it aside, in a line of the output after
+    # the line of the one before it; that line's positions are written.
+    if ! awk -v out="$3/compile.out" '
+        function norm(s,   r) {
+            r = ""
+            while (match(s, /line [0-9]+, column [0-9]+/)) {
+                r = r substr(s, 1, RSTART - 1) M
+                s = substr(s, RSTART + RLENGTH)
+            }
+            return r s
+        }
+        BEGIN { M = sprintf("%c", 1); while ((getline l < out) > 0) text[++n] = l; at = 0 }
+        {
+            d = $0
+            nd = norm(d)
+            j = at + 1
+            while (j <= n && index(norm(text[j]), nd) == 0) j++
+            if (j > n) {
+                printf "the compiler does not report %s%s%s%s, positions aside (a changed message is not blessed: read it, then edit the directive)\n", \
+                    sprintf("%c", 39), d, sprintf("%c", 39), (NR > 1 ? " after the errors before it" : "") | "cat 1>&2"
+                exit 1
+            }
+            # (the positions of that line the directive names: the ones
+            # after those before its text)
+            t = norm(text[j])
+            pre = substr(t, 1, index(t, nd) - 1)
+            q = 0
+            for (i = 1; i <= length(pre); i++) if (substr(pre, i, 1) == M) q++
+            np = 0
+            s = text[j]
+            while (match(s, /line [0-9]+, column [0-9]+/)) {
+                p[++np] = substr(s, RSTART, RLENGTH)
+                s = substr(s, RSTART + RLENGTH)
+            }
+            r = ""
+            s = d
+            while (match(s, /line [0-9]+, column [0-9]+/)) {
+                r = r substr(s, 1, RSTART - 1) p[++q]
+                s = substr(s, RSTART + RLENGTH)
+            }
+            print r s
+            at = j
+        }' "$3/errors" >"$3/bless.new" 2>"$3/bless.why"; then
+        echo "not blessed $1: $(head -1 "$3/bless.why")"
+        return 1
+    fi
+    if cmp -s "$3/errors" "$3/bless.new"; then
+        echo "not blessed $1: its ERROR directives hold as they are; it fails otherwise: $(head -1 "$3/why")"
+        return 1
+    fi
+    cp "$2" "$3/bless.orig"
+    # (the k-th ERROR directive of the file, as tests/directives.awk reads
+    # them, gets the k-th text)
+    awk -v new="$3/bless.new" '
+        BEGIN { while ((getline l < new) > 0) text[++n] = l }
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            sub(/^[ \t]+/, "", line)
+            if (substr(line, 1, 2) == "//") {
+                c = substr(line, 3)
+                if (substr(c, 1, 1) == " ") c = substr(c, 2)
+                if (substr(c, 1, 6) == "ERROR:") {
+                    k++
+                    print substr($0, 1, index($0, "ERROR:") + 5) " " text[k]
+                    next
+                }
+            }
+            print
+        }' "$3/bless.orig" >"$3/bless.file" && cp "$3/bless.file" "$2"
+    bless_changes=$(awk -v new="$3/bless.new" '
+        { getline t < new; if (t != $0) { n++; if (n <= 3) list = list (n > 1 ? "; " : "") $0 " -> " t } }
+        END { printf "%d directive%s: %s%s", n, (n == 1 ? "" : "s"), list, (n > 3 ? "; ..." : "") }' "$3/errors")
+    rm -f "$3/status"
+    read_directives "$2" "$3"
+    run_case "$2" "$3" </dev/null
+    if [ "$(cat "$3/status" 2>/dev/null)" != pass ]; then
+        cp "$3/bless.orig" "$2"
+        echo "not blessed $1: with the positions of now it still fails (the file is as it was): $(head -1 "$3/why")"
+        echo fail >"$3/status"
+        return 1
+    fi
+    echo "blessed $1: $bless_changes"
+}
+
 # The number of CPUs, for -j.
 cpu_count() {
     n=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)
@@ -954,6 +1167,64 @@ run_case() {
     fi >"$dir/status"
 }
 
+# (0.30) The plan, the first line, before anything runs: how many cases,
+# which suites (a suite given names: `refactor: NAME`). Nothing selected
+# is an error here, not after the checks below.
+CASES="$WORK/cases"
+all_cases | select_names >"$CASES"
+plan_suites=""
+nsuites=0
+for s in $SUITES; do
+    [ -z "$(want "$s")" ] && continue
+    case "$TARGET:$s" in
+        aarch64-macos:*) ;;
+        *:voltty_render|*:window) continue ;;
+    esac
+    eval "sub=\${SUB_$(echo "$s" | tr - _):-}"
+    plan_suites="$plan_suites${plan_suites:+, }$s${sub:+:$sub}"
+    nsuites=$((nsuites + 1))
+done
+ncases=$(wc -l <"$CASES" | tr -d ' ')
+# (one FILTER of several that selects nothing: said, the others run)
+{
+    all_cases
+    [ "$CASES_ONLY" = 1 ] || printf '%s\n' $SUITES
+} | awk 'BEGIN { nf = split(ENVIRON["VOLE_RUN_FILTERS"], f, "\n") }
+    {
+        for (i = 1; i <= nf; i++)
+            if (!(i in hit) && f[i] != "" && (f[i] ~ /^=/ ? $1 == substr(f[i], 2) : index($1, f[i]) > 0)) hit[i] = 1
+    }
+    END { for (i = 1; i <= nf; i++) if (f[i] != "" && !(i in hit)) print f[i] }' >"$WORK/nomatch"
+if [ -s "$WORK/nomatch" ] && { [ "$ncases" != 0 ] || [ -n "$plan_suites" ]; }; then
+    echo "tests/run.sh: warning: no case matches $(sed "s/^=//; s/.*/'&'/" "$WORK/nomatch" | tr '\n' ' ' | sed 's/ $//') (the other FILTERs select the plan below)" >&2
+fi
+if [ "$ncases" = 0 ] && [ -z "$plan_suites" ]; then
+    echo "tests/run.sh: no case matches '$FILTER'$([ "$CASES_ONLY" = 1 ] && echo " (--cases-only: no suite is run)") (tests/run.sh -l FILTER lists what a FILTER selects)" >&2
+    exit 2
+fi
+if [ -n "$JOBS" ]; then
+    plan_jobs="-j $JOBS"
+elif [ -n "${VOLE_JOBSERVER:-}" ] && [ -p "$VOLE_JOBSERVER" ]; then
+    plan_jobs="the jobserver's slots"
+else
+    plan_jobs="-j $(cpu_count) (the CPUs; -j JOBS for fewer)"
+fi
+echo "plan: $ncases case$([ "$ncases" = 1 ] || echo s), $nsuites suite$([ "$nsuites" = 1 ] || echo s)${plan_suites:+ ($plan_suites)}, $plan_jobs${OPT:+, $OPT}, $TARGET"
+
+# A suite, in the background: `$@` run, its output in $WORK/$1.out; when
+# it ends, one line (0.30): its pass and FAIL lines counted, its exit
+# status, the seconds it took.
+run_suite() {
+    rs_name=$1
+    shift
+    (
+        rs_start=$(date +%s)
+        "$@" >"$WORK/$rs_name.out" 2>&1
+        rs_rc=$?
+        echo "suite $rs_name: $(grep -c '^pass' "$WORK/$rs_name.out") pass, $(grep -c '^FAIL' "$WORK/$rs_name.out") FAIL, exit $rs_rc, $(($(date +%s) - rs_start)) s"
+    ) &
+}
+
 # The standard library built into the compiler must be its source's (0.5;
 # 0.27.5: its index of units, std_units, made by the compiler tested).
 if [ -x "$ROOT/compiler/std/embed.sh" ] && ! VOLE_EMBED_VOLEC="$COMPILER" "$ROOT/compiler/std/embed.sh" -c; then
@@ -978,75 +1249,83 @@ if "$COMPILER" --check-rules >"$WORK/rules.out" 2>&1; then :; else
     grep -q 'rewrite rules' "$WORK/rules.out" && { cat "$WORK/rules.out"; exit 1; }
 fi
 
-# The cases, in order; up to JOBS at once (a FIFO holds the free slots).
-CASES="$WORK/cases"
-all_cases | select_names >"$CASES"
+# The cases ($CASES, above), in order; up to JOBS at once (a FIFO holds
+# the free slots).
 
-# The tools' suites (below) run alongside the cases: they are serial, and
-# take seconds.
+# The tools' suites (below) run alongside the cases: they are serial.
+# (0.30) With -j given, the query and refactor suites run their
+# transcripts and checks some at once (each): JOBS when the filters
+# select no case, two at most beside the cases (the refactor suite, 16
+# minutes one by one, was what a plan waited for). Without -j (the
+# gate's rows, on the jobserver's slots): one by one, as before.
+TJOBS=1
+if [ -n "$JOBS" ]; then
+    TJOBS=$JOBS
+    [ ! -s "$CASES" ] || [ "$JOBS" -le 2 ] || TJOBS=2
+fi
 case $(want query) in
-    y) "$ROOT/tests/query/run.sh" -c "$COMPILER" >"$WORK/query.out" 2>&1 & ;;
+    y) run_suite query "$ROOT/tests/query/run.sh" -c "$COMPILER" -j "$TJOBS" $SUB_query ;;
 esac
 case $(want refactor) in
-    y) "$ROOT/tests/refactor/run.sh" -c "$COMPILER" >"$WORK/refactor.out" 2>&1 & ;;
+    y) run_suite refactor "$ROOT/tests/refactor/run.sh" -c "$COMPILER" -j "$TJOBS" $SUB_refactor ;;
 esac
 case $(want guide) in
-    y) "$ROOT/tests/guide/run.sh" -c "$COMPILER" >"$WORK/guide.out" 2>&1 & ;;
+    y) run_suite guide "$ROOT/tests/guide/run.sh" -c "$COMPILER" ;;
 esac
 # (0.25) The book's blocks and sessions (tests/book/run.sh): category "book".
 case $(want book) in
-    y) "$ROOT/tests/book/run.sh" -c "$COMPILER" >"$WORK/book.out" 2>&1 & ;;
+    y) run_suite book "$ROOT/tests/book/run.sh" -c "$COMPILER" ;;
 esac
 case $(want fmt) in
-    y) "$ROOT/tests/fmt/run.sh" -c "$COMPILER" -j 1 >"$WORK/fmt.out" 2>&1 & ;;
+    y) run_suite fmt "$ROOT/tests/fmt/run.sh" -c "$COMPILER" -j 1 $SUB_fmt ;;
 esac
 case $(want walkthrough) in
-    y) "$ROOT/tests/walkthrough/run.sh" -c "$COMPILER" >"$WORK/walkthrough.out" 2>&1 & ;;
+    y) run_suite walkthrough "$ROOT/tests/walkthrough/run.sh" -c "$COMPILER" ;;
 esac
 case $(want wgsl) in
-    y) "$ROOT/tests/wgsl/run.sh" -c "$COMPILER" >"$WORK/wgsl.out" 2>&1 & ;;
+    y) run_suite wgsl "$ROOT/tests/wgsl/run.sh" -c "$COMPILER" ;;
 esac
 case $(want voltty) in
-    y) "$ROOT/tests/voltty/run.sh" -c "$COMPILER" -n 20 >"$WORK/voltty.out" 2>&1 & ;;
+    y) run_suite voltty "$ROOT/tests/voltty/run.sh" -c "$COMPILER" -n 20 ;;
 esac
 # (0.27.1) the borrow checker's try: lines (tests/borrowck-try/run.sh)
 case $(want borrowck-try) in
-    y) sh "$ROOT/tests/borrowck-try/run.sh" -c "$COMPILER" >"$WORK/borrowck-try.out" 2>&1 & ;;
+    y) run_suite borrowck-try sh "$ROOT/tests/borrowck-try/run.sh" -c "$COMPILER" ;;
 esac
 # (0.25.3) Text blocks in a CRLF file and the caches seeing an embedded
 # file change (tests/embed/run.sh): category "embed-checks".
 case $(want embed-checks) in
-    y) sh "$ROOT/tests/embed/run.sh" -c "$COMPILER" >"$WORK/embed-checks.out" 2>&1 & ;;
+    y) run_suite embed-checks sh "$ROOT/tests/embed/run.sh" -c "$COMPILER" ;;
 esac
 # (0.25.3) std's positions in the transcripts, compared normalized: a std
 # change moves none of them (tests/stdpos/run.sh): category "stdpos".
 case $(want stdpos) in
-    y) sh "$ROOT/tests/stdpos/run.sh" -c "$COMPILER" >"$WORK/stdpos.out" 2>&1 & ;;
+    y) run_suite stdpos sh "$ROOT/tests/stdpos/run.sh" -c "$COMPILER" ;;
 esac
 # (0.25.3) The tools' answers from their cache the same as without it, on
 # a sample of the transcripts (tests/cachediff/run.sh --sample; all of
 # them: the gate's cachediff step): category "cachediff".
 case $(want cachediff) in
-    y) sh "$ROOT/tests/cachediff/run.sh" -c "$COMPILER" --sample >"$WORK/cachediff.out" 2>&1 & ;;
+    y) run_suite cachediff sh "$ROOT/tests/cachediff/run.sh" -c "$COMPILER" --sample ;;
 esac
 # (0.25.2) The runner's own pieces (tests/runner/run.sh: the EXPECT holes,
 # the golden-image comparison, the directives): category "runner".
 case $(want runner) in
-    y) sh "$ROOT/tests/runner/run.sh" >"$WORK/runner.out" 2>&1 & ;;
+    y) run_suite runner env VOLE_TEST_COMPILER="$COMPILER" sh "$ROOT/tests/runner/run.sh" ;;
 esac
 # (0.24) The language server's sessions (tests/lsp/run.sh): category "lsp".
 case $(want lsp) in
-    y) "$ROOT/tests/lsp/run.sh" -c "$COMPILER" >"$WORK/lsp.out" 2>&1 & ;;
+    y) run_suite lsp "$ROOT/tests/lsp/run.sh" -c "$COMPILER" $SUB_lsp ;;
 esac
 # (0.25) The link without cc, and its template (tests/link/run.sh):
 # category "link". (macOS and Linux hosts; the target's own)
 case $(want link) in
-    y) "$ROOT/tests/link/run.sh" -c "$COMPILER" >"$WORK/link.out" 2>&1 & ;;
+    y) run_suite link "$ROOT/tests/link/run.sh" -c "$COMPILER" ;;
 esac
 # (0.25.5) The build's measuring options (tests/perf/run.sh:
 # --time-passes=instructions, --vec-stats=FN): category "perf".
 case $(want perf) in
-    y) "$ROOT/tests/perf/run.sh" -c "$COMPILER" >"$WORK/perf.out" 2>&1 & ;;
+    y) run_suite perf "$ROOT/tests/perf/run.sh" -c "$COMPILER" ;;
 esac
 # (0.22) std::gpu and std::objc: tests/gpu/run.sh, Metal on macOS/arm64
 # (skipped elsewhere); category "gpu".
@@ -1054,7 +1333,7 @@ case $(want gpu) in
     y)
         GPU_OPT=""
         [ -n "$OPT" ] && GPU_OPT="-O ${OPT#-O}"
-        "$ROOT/tests/gpu/run.sh" -c "$COMPILER" $GPU_OPT >"$WORK/gpu.out" 2>&1 & ;;
+        run_suite gpu "$ROOT/tests/gpu/run.sh" -c "$COMPILER" $GPU_OPT ;;
 esac
 # (0.18.1) The agent hooks' cases (tools/agent-hooks/test-*.py, Python;
 # skipped without python3): category "hooks"; (0.25.3) and the commit
@@ -1064,7 +1343,10 @@ case $(want hooks) in
         if command -v python3 >/dev/null 2>&1; then
             # (0.25.2.1) the compiler under test, not target/volec, for the
             # cases that run a real one
-            for t in "$ROOT"/tools/agent-hooks/test-*.py "$ROOT"/tools/git-hooks/test-*.py; do VOLE_TEST_COMPILER="$COMPILER" python3 -I "$t"; done >"$WORK/hooks.out" 2>&1 &
+            hooks_cases() {
+                for t in "$ROOT"/tools/agent-hooks/test-*.py "$ROOT"/tools/git-hooks/test-*.py; do VOLE_TEST_COMPILER="$COMPILER" python3 -I "$t"; done
+            }
+            run_suite hooks hooks_cases
         else
             : >"$WORK/hooks.out"
         fi ;;
@@ -1076,24 +1358,24 @@ case $(want arch-gen) in
     y)
         arch_levels=${OPT#-O}
         [ -n "$arch_levels" ] || arch_levels=0,2
-        "$ROOT/tests/arch/gen.sh" -c "$COMPILER" -o "$WORK/arch-gen" -O "$arch_levels" --check >"$WORK/arch-gen.out" 2>&1 & ;;
+        run_suite arch-gen "$ROOT/tests/arch/gen.sh" -c "$COMPILER" -o "$WORK/arch-gen" -O "$arch_levels" --check ;;
 esac
 # (0.19 T5) The x86-64 encoder against cc's assembler, byte for byte
 # (tests/arch/enc.sh: every instruction of insn_x86.def, extreme registers,
 # both widths, memory forms).
 case $(want arch-enc) in
     y)
-        "$ROOT/tests/arch/enc.sh" -c "$COMPILER" -o "$WORK/arch-enc" >"$WORK/arch-enc.out" 2>&1 & ;;
+        run_suite arch-enc "$ROOT/tests/arch/enc.sh" -c "$COMPILER" -o "$WORK/arch-enc" ;;
 esac
 # The window library and the terminal's renderer (0.23): macOS hosts,
 # for the host's own target only.
 case "$TARGET" in
     aarch64-macos)
         case $(want voltty_render) in
-            y) "$ROOT/tests/voltty-render/run.sh" -c "$COMPILER" >"$WORK/voltty_render.out" 2>&1 & ;;
+            y) run_suite voltty_render "$ROOT/tests/voltty-render/run.sh" -c "$COMPILER" ;;
         esac
         case $(want window) in
-            y) "$ROOT/tests/window/run.sh" -c "$COMPILER" >"$WORK/window.out" 2>&1 & ;;
+            y) run_suite window "$ROOT/tests/window/run.sh" -c "$COMPILER" ;;
         esac ;;
     *) : >"$WORK/voltty_render.out"; : >"$WORK/window.out" ;;
 esac
@@ -1125,6 +1407,14 @@ while read -r name file; do
 done <"$CASES"
 wait
 exec 3>&-
+
+# (0.30, --bless) The cases that failed: their ERROR directives' positions.
+if [ "$BLESS" = 1 ]; then
+    while read -r name file; do
+        [ "$(cat "$WORK/$name/status" 2>/dev/null)" = fail ] || continue
+        bless_case "$name" "$file" "$WORK/$name" </dev/null
+    done <"$CASES"
+fi
 
 count=0
 while read -r name file; do
@@ -1175,8 +1465,9 @@ case $(want query) in
         if ! grep -q '^pass' "$WORK/query.out"; then
             echo "query fail" >>"$TALLY"
             count=$((count + 1))
+            { echo "FAIL query: tests/query/run.sh reported nothing:"; sed 's/^/    /' "$WORK/query.out" | head -20; echo; } >>"$FAILURES"
         fi
-        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/query.out" >>"$FAILURES"
+        awk '/^FAIL/ { p = 1 } /^(pass|query:)/ { p = 0 } p' "$WORK/query.out" >>"$FAILURES"
         ;;
 esac
 
@@ -1193,6 +1484,7 @@ case $(want lsp) in
         if ! grep -q '^pass' "$WORK/lsp.out"; then
             echo "lsp fail" >>"$TALLY"
             count=$((count + 1))
+            { echo "FAIL lsp: tests/lsp/run.sh reported nothing:"; sed 's/^/    /' "$WORK/lsp.out" | head -20; echo; } >>"$FAILURES"
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/lsp.out" >>"$FAILURES"
         ;;
@@ -1323,8 +1615,9 @@ case $(want refactor) in
         if ! grep -q '^pass' "$WORK/refactor.out"; then
             echo "refactor fail" >>"$TALLY"
             count=$((count + 1))
+            { echo "FAIL refactor: tests/refactor/run.sh reported nothing:"; sed 's/^/    /' "$WORK/refactor.out" | head -20; echo; } >>"$FAILURES"
         fi
-        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/refactor.out" >>"$FAILURES"
+        awk '/^FAIL/ { p = 1 } /^(pass|xfail|refactor:)/ { p = 0 } p' "$WORK/refactor.out" >>"$FAILURES"
         ;;
 esac
 
@@ -1380,6 +1673,7 @@ case $(want fmt) in
         if ! grep -q '^pass' "$WORK/fmt.out"; then
             echo "fmt fail" >>"$TALLY"
             count=$((count + 1))
+            { echo "FAIL fmt: tests/fmt/run.sh reported nothing:"; sed 's/^/    /' "$WORK/fmt.out" | head -20; echo; } >>"$FAILURES"
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/fmt.out" >>"$FAILURES"
         ;;

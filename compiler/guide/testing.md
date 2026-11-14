@@ -306,3 +306,32 @@ output varies:
   count, the worst pixel and `try: cp target/test-shots/CASE.ppm REF`.
 - A check that cannot run here (window tests with no display frames:
   the screen locked) is `SKIP NAME: why`, counted apart, never a pass.
+
+Running it (0.30). Options go before the FILTERs (one after a name is
+an error that gives the command); the first line is the plan (`plan: N
+cases, M suites (NAMES), -j J`), then a line per suite as it ends.
+
+```text
+tests/run.sh -j 2 --cases-only fmt       # cases only: not the fmt suite too
+tests/run.sh -j 2 refactor:rename query:=clash   # of a suite, by name
+tests/refactor/run.sh -j 2 -u --grep edit.breaks # rewrite what holds a text
+tests/run.sh --bless err_moved           # ERROR positions that moved
+tests/affected.sh --narrow --list        # a plan under 600 cases
+```
+
+- `SUITE:NAME` (query, refactor, lsp, fmt): the suite's transcripts,
+  sessions and checks whose name holds NAME (`=NAME`: exactly). Their
+  runners take the same names, `-l` (list) and, query and refactor,
+  `-j N`, `-u` (rewrite the transcripts that differ) and `--grep TEXT`
+  (only the transcripts holding TEXT). A name that selects nothing is
+  an error, `no case matches`.
+- `--bless NAME...`: a case that fails only because its errors moved
+  gets the `line L, column C` of its `// ERROR:` directives rewritten
+  (the same kinds and messages, in order: `blessed NAME: ...`);
+  anything else is `not blessed NAME: why` and still fails.
+  `tests/book/run.sh -u` and `tests/walkthrough/run.sh -u` rewrite the
+  blocks of a session that differ.
+- `tests/affected.sh --narrow`: when the plan is most of the suite, the
+  changed tests, the cases and transcripts that name a changed item,
+  and the smoke set; the plan says how it chose. `--path FILE`: what a
+  change to FILE would run.

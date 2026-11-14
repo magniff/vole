@@ -54,6 +54,8 @@ these first:
 | the errors' exact fixes (an error with `try: volec fix --suggested`: a did-you-mean, a conversion, a path, a `use`, a `pub`), instead of sed | `target/volec fix --suggested` (one checked edit, then the errors left; `--dry-run`, `--show`, `--at FILE:LINE`) |
 | a bug: where it fails, the values at a line, which change broke a test | `target/volec guide debug` (`test` prints a crash's line and callers; `probe FILE:LINE EXPR... -- ARGS`; `reduce`) |
 | work on an example, GPU or not: its program, its shaders, a headless run | `target/volec guide gpu-workflow` (short); in the example's directory `volec check`, `query`, `edit` mean that program (from the root: a FILE of it, or `--root examples/X/main.vl`); `volec check` says what it read (`ok: 0 errors in ROOT (N files, M shaders)`); its tests: `tests/run.sh NAME` |
+| std (0.30): search and change its files, check every body, see what an edit did to effects | `target/volec query grep TEXT --in compiler/std/FILE.vl` (`--std`), `target/volec edit patch compiler/std/FILE.vl --old 'TEXT' --new 'TEXT'`, `target/volec check --std` (seconds; a generic function nothing instantiates too), `tools/std-effects-diff.sh [BASE]` |
+| what a change costs or did in the optimizer (0.30) | `target/volec build --help` (the options: `--time-passes=passes\|json`, `--print-after-all=FN`, `--vec-stats=FN`, `--emit-ir`), `tools/perf-diff.sh A B FILE.vl` (two compilers, by pass), `tools/perf-experiment.sh [-b BASELINE]` (self-build, check, cost programs, in instructions), `bench/run.sh --instructions -p BASELINE`, `target/volec query asm NAME` |
 | build and test what a change touches | `bootstrap/bootstrap.sh --dev --no-suite`, `tests/run.sh FILTER...`, `tests/affected.sh` (the inner loop, below) |
 
 Everything else (`query grep|items|type|effects|impact`, `edit apply`,
@@ -149,13 +151,23 @@ never the whole suite or a gate unless its task says so**:
    contains a FILTER: `tests/run.sh pathtrace`; `-n NAME`: the one
    case NAME exactly; `-f FILE` a list; `-l` lists them), or
    `tests/affected.sh -O 2` for what the branch touches so far.
+   Its first line is the plan (how many cases, which suites): read it
+   before waiting. A suite's transcripts by name (0.30):
+   `tests/run.sh -j 2 refactor:NAME query:NAME` (also `lsp:`, `fmt:`;
+   the runners themselves take `-j N`, `-l`, `-u --grep TEXT`);
+   `--cases-only`: no suite; `--bless NAME`: a case's `// ERROR:`
+   positions that only moved (`volec guide testing`).
 2. **Before reporting (agent):** `tools/premerge.sh` (prints `premerge:
    ok`) and `tests/affected.sh`: the tests `tests/affected.map` names for
    the paths changed since the branch's base, at -O0 and -O2 (`--list`
    prints the plan and why each item is in it; a changed test runs
    itself; an unknown path gets the smoke set; a file git does not
    track is named in the plan and not counted: `git add` a new test,
-   or `--untracked`). When `--list` says
+   or `--untracked`). A plan of most of the suite (over 600 cases: a
+   front end or std change): `tests/affected.sh --narrow` (0.30: the
+   changed tests, the cases and transcripts that name a changed item,
+   the smoke set; the plan says how it chose, and the report says it
+   was the narrow one). When `--list` says
    `linux: platform-relevant`, `tests/affected.sh --linux` runs the
    same plan in the aarch64-linux container too (colima must run).
 3. **Per merge batch (integrator):** after merging the batch into the

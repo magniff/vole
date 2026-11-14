@@ -974,9 +974,16 @@ def edit_suggestion(prog, files, script, cwd=None, base=""):
         old = re.sub(r"\\(.)", r"\1", m.group(3))
         new = re.sub(r"\\(.)", r"\1", m.group(4))
         pair = f"--old {shlex.quote(old)} --new {shlex.quote(new)}"
-        if m.group(1):
+        # (0.30) a file of std is patched whole, as text: std is one text
+        # to the compiler, so no FILE:LINE names an item of it (the
+        # guide's add-std-fn says the same)
+        if m.group(1) and not f.startswith("compiler/std/"):
             return f"volec edit patch {f}:{m.group(1)} {pair}{root}"
         return " ; ".join(f"volec edit patch {x} {pair} --all{root}" for x in fs[:3])
+    if f.startswith("compiler/std/"):
+        return (f"volec edit patch {f} --old 'TEXT' --new 'TEXT' "
+                "(a file of std: patched as text, OLD exact and once in the file, "
+                "or --all; then sh compiler/std/embed.sh; the Edit tool works too)")
     return (f"volec edit patch {f}:LINE --old 'TEXT' --new 'TEXT'{root} "
             "(pairs repeat, or come on stdin; docs/refactor.md)")
 

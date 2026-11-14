@@ -2,10 +2,23 @@
 # The tests of `volec lsp` (0.24, docs/lsp.md): scripted sessions.
 # POSIX sh and awk only.
 #
-# usage: tests/lsp/run.sh [-c COMPILER] [-u]
+# usage: tests/lsp/run.sh [-c COMPILER] [-u] [-l] [-n NAME] [FILTER...]
 #
 #   -c COMPILER   the volec binary (default: target/volec)
 #   -u            rewrite the .lsp files with the answers they get now
+#   -l            (0.30) list what would run, `session NAME` and `check
+#                 NAME`, and run nothing
+#   -n NAME       (0.30) only the session or check named NAME exactly
+#                 (repeatable)
+#   FILTER...     (0.30) only the sessions (NAME.lsp) and the checks below
+#                 (std-cache, system-header, compiler-source) whose name
+#                 contains a FILTER; several, and -n, select the union.
+#                 Selecting nothing is an error (`no case matches`), not
+#                 a pass.
+#
+# The first line is the plan (`lsp: N sessions, M checks`); each result is
+# printed as its session or check ends.
+#
 #
 # Each tests/lsp/NAME.lsp is a session with the program tests/lsp/prog
 # (or tests/lsp/prog-NAME when there is one; copied to a scratch
@@ -51,24 +64,57 @@ export VOLE_STD_TREE
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
+. "$ROOT/tests/jobs.sh"
 COMPILER="$ROOT/target/volec"
 UPDATE=0
+LIST=0
+FILTERS=
+USAGE="usage: tests/lsp/run.sh [-c COMPILER] [-u] [-l] [-n NAME] [FILTER...]"
 while [ $# -gt 0 ]; do
     case "$1" in
-        -c) [ $# -ge 2 ] || exit 2; COMPILER=$2; shift 2 ;;
+        -c) [ $# -ge 2 ] || { echo "$USAGE" >&2; exit 2; }; COMPILER=$2; shift 2 ;;
         -u) UPDATE=1; shift ;;
-        *) echo "usage: tests/lsp/run.sh [-c COMPILER] [-u]" >&2; exit 2 ;;
+        -l) LIST=1; shift ;;
+        -n) [ $# -ge 2 ] || { echo "$USAGE" >&2; exit 2; }
+            FILTERS="$FILTERS=$2
+"
+            shift 2 ;;
+        -h|--help) sed -n '2,/^# Each tests/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
+        -*) echo "tests/lsp/run.sh: unknown option '$1'" >&2; echo "$USAGE" >&2; exit 2 ;;
+        *) FILTERS="$FILTERS$1
+"
+            shift ;;
     esac
 done
 case "$COMPILER" in
     /*) ;;
     *) COMPILER="$(pwd)/$COMPILER" ;;
 esac
-[ -x "$COMPILER" ] || { echo "lsp/run.sh: no compiler at $COMPILER" >&2; exit 2; }
-
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-lsp.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
+# What runs: every session and check, then the ones selected.
+for case in "$HERE"/*.lsp; do
+    [ -e "$case" ] && echo "session $(basename "$case" .lsp)"
+done >"$WORK/all"
+for c in std-cache system-header compiler-source; do
+    echo "check $c"
+done >>"$WORK/all"
+jobs_select "$FILTERS" <"$WORK/all" >"$WORK/sel"
+if [ ! -s "$WORK/sel" ]; then
+    echo "tests/lsp/run.sh: no case matches $(jobs_filters_text "$FILTERS") (tests/lsp/run.sh -l lists the sessions and checks)" >&2
+    exit 2
+fi
+if [ $LIST -eq 1 ]; then
+    cat "$WORK/sel"
+    exit 0
+fi
+[ -x "$COMPILER" ] || { echo "lsp/run.sh: no compiler at $COMPILER" >&2; exit 2; }
+echo "lsp: $(grep -c '^session ' "$WORK/sel") sessions, $(grep -c '^check ' "$WORK/sel") checks"
+# Whether session or check $2 (of kind $1) is selected.
+sel() {
+    grep -q -x -F -- "$1 $2" "$WORK/sel"
+}
 STATUS=0
 
 # The JSON string of file $1's text (quoted, escaped).
@@ -191,6 +237,7 @@ STD_FILES=$(cd "$ROOT/compiler/std" 2>/dev/null && find . -name '*.vl' | sed 's|
 for case in "$HERE"/*.lsp; do
     [ -e "$case" ] || continue
     name=$(basename "$case" .lsp)
+    sel session "$name" || continue
     dir="$WORK/$name"
     rm -rf "$dir"
     mkdir -p "$dir"
@@ -279,102 +326,106 @@ done
 # directory of this build's name holding other text (another build's, or
 # edited) is replaced, not used, and one of another name is left alone:
 # no answer depends on what the cache held.
-cdir="$WORK/stdcache"
-rm -rf "$cdir"
-mkdir -p "$cdir"
-cdir=$(cd "$cdir" && pwd -P)
-cp "$HERE"/prog/*.vl "$cdir/"
-hov='{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://'"$cdir"'/main.vl"},"position":{"line":9,"character":7}}}'
-{
-    frame '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}'
-    frame "$hov"
-    frame '{"jsonrpc":"2.0","id":3,"method":"shutdown"}'
-    frame '{"jsonrpc":"2.0","method":"exit"}'
-} >"$WORK/cache.in"
-cache_run() {
-    (cd "$cdir" && XDG_CACHE_HOME="$cdir/.cache" exec "$COMPILER" lsp <"$WORK/cache.in" >"$WORK/cache.$1" 2>&1)
-}
-cache_run 1
-name=$(ls "$cdir/.cache/vole" 2>/dev/null | sed -n 's/^std-//p' | head -1)
-d="$cdir/.cache/vole/std-$name"
-why=
-case "$name" in
-    *-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
-    *) why="the directory is not named VERSION-HASH: std-$name" ;;
-esac
-if [ -z "$why" ]; then
-    cp "$d/std.vl" "$WORK/cache.std.vl"
-    # another build's directory (another hash), and this one's edited
-    other="$cdir/.cache/vole/std-${name%-*}-0000000000000000"
-    mkdir -p "$other"
-    echo "// another std" >"$other/std.vl"
-    chmod u+w "$d/std.vl"
-    echo "// edited" >>"$d/std.vl"
-    cache_run 2
-    if ! cmp -s "$d/std.vl" "$WORK/cache.std.vl"; then
-        why="an edited cache was used, not replaced"
-    elif [ "$(cat "$other/std.vl")" != "// another std" ]; then
-        why="another build's directory was changed"
-    elif ! cmp -s "$WORK/cache.1" "$WORK/cache.2"; then
-        why="the answers depend on the cache"
-    elif [ -n "$(ls -d "$cdir/.cache/vole/"*.tmp* "$cdir/.cache/vole/"*.stale* 2>/dev/null)" ]; then
-        why="a temporary directory was left"
+if sel check std-cache; then
+    cdir="$WORK/stdcache"
+    rm -rf "$cdir"
+    mkdir -p "$cdir"
+    cdir=$(cd "$cdir" && pwd -P)
+    cp "$HERE"/prog/*.vl "$cdir/"
+    hov='{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://'"$cdir"'/main.vl"},"position":{"line":9,"character":7}}}'
+    {
+        frame '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}'
+        frame "$hov"
+        frame '{"jsonrpc":"2.0","id":3,"method":"shutdown"}'
+        frame '{"jsonrpc":"2.0","method":"exit"}'
+    } >"$WORK/cache.in"
+    cache_run() {
+        (cd "$cdir" && XDG_CACHE_HOME="$cdir/.cache" exec "$COMPILER" lsp <"$WORK/cache.in" >"$WORK/cache.$1" 2>&1)
+    }
+    cache_run 1
+    name=$(ls "$cdir/.cache/vole" 2>/dev/null | sed -n 's/^std-//p' | head -1)
+    d="$cdir/.cache/vole/std-$name"
+    why=
+    case "$name" in
+        *-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+        *) why="the directory is not named VERSION-HASH: std-$name" ;;
+    esac
+    if [ -z "$why" ]; then
+        cp "$d/std.vl" "$WORK/cache.std.vl"
+        # another build's directory (another hash), and this one's edited
+        other="$cdir/.cache/vole/std-${name%-*}-0000000000000000"
+        mkdir -p "$other"
+        echo "// another std" >"$other/std.vl"
+        chmod u+w "$d/std.vl"
+        echo "// edited" >>"$d/std.vl"
+        cache_run 2
+        if ! cmp -s "$d/std.vl" "$WORK/cache.std.vl"; then
+            why="an edited cache was used, not replaced"
+        elif [ "$(cat "$other/std.vl")" != "// another std" ]; then
+            why="another build's directory was changed"
+        elif ! cmp -s "$WORK/cache.1" "$WORK/cache.2"; then
+            why="the answers depend on the cache"
+        elif [ -n "$(ls -d "$cdir/.cache/vole/"*.tmp* "$cdir/.cache/vole/"*.stale* 2>/dev/null)" ]; then
+            why="a temporary directory was left"
+        fi
     fi
-fi
-if [ -z "$why" ]; then
-    echo "pass std-cache"
-else
-    echo "FAIL std-cache"
-    echo "    $why"
-    STATUS=1
+    if [ -z "$why" ]; then
+        echo "pass std-cache"
+    else
+        echo "FAIL std-cache"
+        echo "    $why"
+        STATUS=1
+    fi
 fi
 
 # (0.25.2) A system header (stdlib.h, where it is depends on the machine):
 # go to definition on `c::malloc` lands on a line of a header declaring
 # it, and a hover shows that C declaration (glibc's is written
 # `malloc (size_t __size)`, macOS's `malloc(size_t __size)`).
-sdir="$WORK/syshdr"
-mkdir -p "$sdir"
-sdir=$(cd "$sdir" && pwd -P)
-printf '%s\n' 'import "stdlib.h" as c;' '' 'fn main() {' \
-    '    let p = unsafe { c::malloc(8) };' '    unsafe { c::free(p); }' '}' >"$sdir/main.vl"
-su="file://$sdir/main.vl"
-{
-    frame '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}'
-    frame "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"$su\"},\"position\":{\"line\":3,\"character\":24}}}"
-    frame "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"$su\"},\"position\":{\"line\":3,\"character\":24}}}"
-    frame "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"$su\"},\"position\":{\"line\":0,\"character\":9}}}"
-    frame '{"jsonrpc":"2.0","id":5,"method":"shutdown"}'
-    frame '{"jsonrpc":"2.0","method":"exit"}'
-} >"$WORK/sys.in"
-(cd "$sdir" && XDG_CACHE_HOME="$sdir/.cache" exec "$COMPILER" lsp <"$WORK/sys.in" >"$WORK/sys.out" 2>&1)
-rc=$?
-tr -d '\r' <"$WORK/sys.out" | sed 's/Content-Length: [0-9]*$//' | sed '/^$/d' >"$WORK/sys.answers"
-loc=$(sed -n 's/.*"id":2,"result":{"uri":"file:\/\/\([^"]*\.h\)","range":{"start":{"line":\([0-9]*\).*/\1 \2/p' "$WORK/sys.answers")
-hdr=${loc% *}
-line=${loc##* }
-why=
-if [ "$rc" != 0 ] || [ -z "$loc" ]; then
-    why="no definition in a header: $(grep '"id":2' "$WORK/sys.answers" | cut -c1-200)"
-elif ! sed -n "$((line + 1))p" "$hdr" | grep -q malloc; then
-    why="$hdr:$((line + 1)) does not declare malloc"
-elif ! grep '"id":3' "$WORK/sys.answers" | grep -q '```c\\n.*malloc *(.*declared in `'; then
-    why="the hover has no C declaration: $(grep '"id":3' "$WORK/sys.answers" | cut -c1-300)"
-elif ! grep -q '"id":4,"result":{"uri":"file://[^"]*/stdlib.h"' "$WORK/sys.answers"; then
-    why="the import's string does not open stdlib.h: $(grep '"id":4' "$WORK/sys.answers" | cut -c1-200)"
-fi
-if [ -z "$why" ]; then
-    echo "pass system-header"
-else
-    echo "FAIL system-header"
-    echo "    $why"
-    STATUS=1
+if sel check system-header; then
+    sdir="$WORK/syshdr"
+    mkdir -p "$sdir"
+    sdir=$(cd "$sdir" && pwd -P)
+    printf '%s\n' 'import "stdlib.h" as c;' '' 'fn main() {' \
+        '    let p = unsafe { c::malloc(8) };' '    unsafe { c::free(p); }' '}' >"$sdir/main.vl"
+    su="file://$sdir/main.vl"
+    {
+        frame '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}'
+        frame "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"$su\"},\"position\":{\"line\":3,\"character\":24}}}"
+        frame "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"$su\"},\"position\":{\"line\":3,\"character\":24}}}"
+        frame "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"$su\"},\"position\":{\"line\":0,\"character\":9}}}"
+        frame '{"jsonrpc":"2.0","id":5,"method":"shutdown"}'
+        frame '{"jsonrpc":"2.0","method":"exit"}'
+    } >"$WORK/sys.in"
+    (cd "$sdir" && XDG_CACHE_HOME="$sdir/.cache" exec "$COMPILER" lsp <"$WORK/sys.in" >"$WORK/sys.out" 2>&1)
+    rc=$?
+    tr -d '\r' <"$WORK/sys.out" | sed 's/Content-Length: [0-9]*$//' | sed '/^$/d' >"$WORK/sys.answers"
+    loc=$(sed -n 's/.*"id":2,"result":{"uri":"file:\/\/\([^"]*\.h\)","range":{"start":{"line":\([0-9]*\).*/\1 \2/p' "$WORK/sys.answers")
+    hdr=${loc% *}
+    line=${loc##* }
+    why=
+    if [ "$rc" != 0 ] || [ -z "$loc" ]; then
+        why="no definition in a header: $(grep '"id":2' "$WORK/sys.answers" | cut -c1-200)"
+    elif ! sed -n "$((line + 1))p" "$hdr" | grep -q malloc; then
+        why="$hdr:$((line + 1)) does not declare malloc"
+    elif ! grep '"id":3' "$WORK/sys.answers" | grep -q '```c\\n.*malloc *(.*declared in `'; then
+        why="the hover has no C declaration: $(grep '"id":3' "$WORK/sys.answers" | cut -c1-300)"
+    elif ! grep -q '"id":4,"result":{"uri":"file://[^"]*/stdlib.h"' "$WORK/sys.answers"; then
+        why="the import's string does not open stdlib.h: $(grep '"id":4' "$WORK/sys.answers" | cut -c1-200)"
+    fi
+    if [ -z "$why" ]; then
+        echo "pass system-header"
+    else
+        echo "FAIL system-header"
+        echo "    $why"
+        STATUS=1
+    fi
 fi
 
 # The compiler's own source: plausible answers, and their times (0.25.1:
 # completion, signature help and formatting too).
 SRC="$ROOT/compiler/src"
-if [ -f "$SRC/main.vl" ]; then
+if sel check compiler-source && [ -f "$SRC/main.vl" ]; then
     F="$SRC/tools/lsp/mod.vl"
     U="file://$F"
     {
