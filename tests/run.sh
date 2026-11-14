@@ -204,7 +204,8 @@
 # NO-EXTRA-FLAGS.
 # (0.27.2) std's cases (std_*) are built with --check-alloc, and fail
 # when blocks of Gpa are left at exit (and it exits 0) unless a STDERR
-# line expects the list ($VOLE_TEST_STD_PLAIN=1: without it); $VOLE_TEST_XFAIL_WHY=FILE
+# line expects the list (0.30: and so does any case whose FLAGS have
+# --check-alloc) ($VOLE_TEST_STD_PLAIN=1: without it); $VOLE_TEST_XFAIL_WHY=FILE
 # gets each XFAIL case's name and the start of its failure, for a triage;
 # (0.27.2.1) $VOLE_TEST_RESULTS=FILE each case's name, status and borrowck
 # errors at std's positions (the gate's std rows read the suite's).
@@ -697,6 +698,11 @@ check_case() {
                 case " $FLAGS " in *" --check-alloc "*) ;; *) FLAGS="$FLAGS --check-alloc" ;; esac
             fi ;;
     esac
+    # (0.30) and so is any case whose own FLAGS have --check-alloc,
+    # whatever its name: before, an own_ case built so passed while
+    # leaking (not $VOLE_TEST_FLAGS's, the gate's examples-checkalloc row,
+    # which looks for a use after a free)
+    case " $(cat "$dir/flags") " in *" --check-alloc "*) STD_LEAKS=1 ;; esac
     # (0.26.2: --verify-places on every VERIFY_EVERY-th case, chosen by its
     # name's cksum: the places IR's form checked where the suite builds
     # it, now that both code generators read it and -O0 is no independent
