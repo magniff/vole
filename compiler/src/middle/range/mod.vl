@@ -38,7 +38,9 @@ use crate::middle::ir::Cond::{Eq, Ge, Gt, Le, Lt, Ne};
 use crate::middle::ir::cfg::{case_target, case_value};
 use crate::middle::ir::verify::verify_func;
 use crate::middle::loops::{analyze_loops, innermost_loop, loop_count, loop_latch, loop_preheader};
-use crate::middle::opt::{remove_trivial_phis, remove_unreachable, resolve_all, simplify_cfg};
+use crate::middle::opt::{
+    dominates, remove_trivial_phis, remove_unreachable, resolve_all, simplify_cfg,
+};
 use crate::middle::range::chains::chains_to_switches;
 use crate::middle::range::interval::{
     MAX_I64, MIN_I64, greater, lesser, range_at, range_with_facts, type_max, type_min,
@@ -234,6 +236,17 @@ fn narrow_by_facts(cx: &mut FnCtx<Comp>, v: i64, lo: &mut i64, hi: &mut i64, dep
     }
     let mut i: i64 = 0;
     while i < cx.facts.len() as i64 {
+        // (0.30) The operands as mark_facts found them; a question asked
+        // below may have changed FACTS and put them back: marked again.
+        if cx.mark_ver != cx.facts_ver {
+            mark_facts(cx);
+        }
+        let fa = cx.fact_ab[i as usize];
+        let fb = cx.fact_ab[(i + 1) as usize];
+        if fa != x0 && fb != x0 || fa == fb {
+            i += 2;
+            continue;
+        }
         let f = (cx.facts[i as usize]);
         let holds = (cx.facts[(i + 1) as usize]) != 0;
         i += 2;
@@ -245,9 +258,7 @@ fn narrow_by_facts(cx: &mut FnCtx<Comp>, v: i64, lo: &mut i64, hi: &mut i64, dep
         if !holds {
             cond = cond.negate();
         }
-        let fa = bits_of_value(cx, (cx.insts[f as usize]).a);
-        let fb = bits_of_value(cx, (cx.insts[f as usize]).b);
-        let x = bits_of_value(cx, v);
+        let x = x0;
         let mut k: i64 = 0;
         let mut w: i64 = 0;
         if fa == x && fa != fb {
@@ -342,15 +353,20 @@ fn mark_facts(cx: &mut FnCtx<Comp>) {
         sized_table(&mut cx.fact_mark, cap as i64, 0);
     }
     cx.mark_stamp += 1;
+    cx.fact_ab.clear();
     let mut i: i64 = 0;
     while i < cx.facts.len() as i64 {
         let f = (cx.facts[i as usize]);
         i += 2;
         if (cx.insts[f as usize]).op != Op::Cmp {
+            cx.fact_ab.push(-1);
+            cx.fact_ab.push(-1);
             continue;
         }
         let fa = bits_of_value(cx, (cx.insts[f as usize]).a);
         let fb = bits_of_value(cx, (cx.insts[f as usize]).b);
+        cx.fact_ab.push(fa);
+        cx.fact_ab.push(fb);
         if fa < cx.fact_mark.len() as i64 {
             (cx.fact_mark[fa as usize]) = cx.mark_stamp;
         }
@@ -529,9 +545,63 @@ fn decide_unsigned_const(cx: &mut FnCtx<Comp>, c: i64) -> i64 {
     }
 }
 
+// (0.30) Whether the edge p -> x is taken only when v is not zero: p
+// branches on a test of v for zero (zero_test), x on the side where it is
+// not; or p only jumps and its one predecessor's edge is such.
+fn edge_not_zero(cx: &mut FnCtx<Comp>, p: i64, x: i64, v: i64) -> bool {
+    let mut from = p;
+    let mut to = x;
+    if (cx.blocks[from as usize]).term == Term::Jump
+        && (cx.blocks[from as usize]).preds.len() == 1 {
+        to = from;
+        from = (cx.blocks[from as usize]).preds[0];
+    }
+    if (cx.blocks[from as usize]).term != Term::Branch
+        || (cx.blocks[from as usize]).s0 == (cx.blocks[from as usize]).s1 {
+        return false;
+    }
+    let c = ir_val(cx, (cx.blocks[from as usize]).cond);
+    let zero = zero_test(cx, c);
+    if zero < 0 || bits_of_value(cx, (cx.insts[c as usize]).a) != v {
+        return false;
+    }
+    // (the side taken when the test holds: s0)
+    ((cx.blocks[from as usize]).s0 == to) == (zero == 1)
+}
+
+// (0.30) Whether x is known not to be zero where FACTS hold: a fact
+// tests it for zero, or it is a phi each of whose values arrives by an
+// edge taken only when that value is not zero (what is left of a slice
+// in the loop of `next_back`: the length, tested before the loop, and
+// the length less one, tested at the latch).
+fn not_zero(cx: &mut FnCtx<Comp>, x: i64) -> bool {
+    let mut i: i64 = 0;
+    while i < cx.facts.len() as i64 {
+        let f = (cx.facts[i as usize]);
+        let holds = (cx.facts[(i + 1) as usize]) != 0;
+        i += 2;
+        let fzero = zero_test(cx, f);
+        if fzero >= 0 && bits_of_value(cx, (cx.insts[f as usize]).a) == x {
+            return (fzero == 1) == holds;
+        }
+    }
+    if (cx.insts[x as usize]).op != Op::Phi || (cx.insts[x as usize]).nargs == 0 {
+        return false;
+    }
+    let b = (cx.insts[x as usize]).block;
+    for k in 0..(cx.insts[x as usize]).nargs {
+        let v = { let o = ir_arg(cx, x, k); bits_of_value(cx, o) };
+        let p = (cx.blocks[b as usize]).preds[k as usize];
+        if !edge_not_zero(cx, p, b, v) {
+            return false;
+        }
+    }
+    true
+}
+
 // Whether comparison or bool c holds at a block with facts FACTS: 1 true,
 // 0 false, -1 unknown.
-fn decide(cx: &mut FnCtx<Comp>, c: i64, pcx: &Ctx<Comp>) -> i64 {
+fn decide_plain(cx: &mut FnCtx<Comp>, c: i64, pcx: &Ctx<Comp>) -> i64 {
     let mut i: i64 = 0;
     while i < cx.facts.len() as i64 {
         if (cx.facts[i as usize]) == c {
@@ -569,6 +639,22 @@ fn decide(cx: &mut FnCtx<Comp>, c: i64, pcx: &Ctx<Comp>) -> i64 {
         return by_bounds;
     }
     let b = bits_of_value(cx, (cx.insts[c as usize]).b);
+    // (0.30) Unsigned: x >= 0 holds and x < 0 does not; x - 1 is below x
+    // when x is not zero (`s[s.len() - 1]` and `s[..s.len() - 1]` of a
+    // slice that is not empty: split_last, the step of `rev`).
+    if !is_signed((cx.insts[c as usize]).imm2) {
+        let cond = (cx.insts[c as usize]).cond;
+        if is_const(cx, b) && (cx.insts[b as usize]).imm == 0 && (cond == Ge || cond == Lt) {
+            return if cond == Ge { 1 } else { 0 };
+        }
+        let k = ir_val(cx, (cx.insts[a as usize]).b);
+        if (cx.insts[a as usize]).op == Op::Sub && is_order(cond) && k != 0 && is_const(cx, k)
+            && (cx.insts[k as usize]).imm == 1
+            && int_bits((cx.insts[a as usize]).ty) == int_bits((cx.insts[c as usize]).imm2)
+            && bits_of_value(cx, (cx.insts[a as usize]).a) == b && not_zero(cx, b) {
+            return if cond == Lt || cond == Le { 1 } else { 0 };
+        }
+    }
     let q = cond_set((cx.insts[c as usize]).cond);
     let signed = is_signed((cx.insts[c as usize]).imm2);
     // (0.11) The cheaper side first (a phi's range costs most): when its
@@ -662,6 +748,176 @@ fn decide(cx: &mut FnCtx<Comp>, c: i64, pcx: &Ctx<Comp>) -> i64 {
         return 0;
     }
     -1
+}
+
+// (0.30) x `cond` y (integers, compared signed or not) by the facts in
+// FACTS that compare the same two values, and nothing else (no ranges):
+// 1 true, 0 false, -1 unknown. What the cases of decide_arms ask, each
+// with its own facts: cheap.
+fn decide_facts(cx: &mut FnCtx<Comp>, cond: Cond, signed: bool, x: i64, y: i64) -> i64 {
+    let q = cond_set(cond);
+    let mut outcomes: i64 = if x == y { 2 } else { 7 };
+    let mut i: i64 = 0;
+    while i < cx.facts.len() as i64 {
+        let f = (cx.facts[i as usize]);
+        let holds = (cx.facts[(i + 1) as usize]) != 0;
+        i += 2;
+        if (cx.insts[f as usize]).op != Op::Cmp || !is_integer((cx.insts[f as usize]).imm2) {
+            continue;
+        }
+        let fa = bits_of_value(cx, (cx.insts[f as usize]).a);
+        let fb = bits_of_value(cx, (cx.insts[f as usize]).b);
+        let mut fs = cond_set((cx.insts[f as usize]).cond);
+        if !holds {
+            fs = 7 & !fs;
+        }
+        if fa == y && fb == x {
+            fs = mirror_set(fs);
+        } else if fa != x || fb != y {
+            continue;
+        }
+        if fs == 2 || fs == 5 || is_signed((cx.insts[f as usize]).imm2) == signed {
+            outcomes &= fs;
+        }
+    }
+    if outcomes == 0 {
+        return -1;
+    }
+    if (outcomes & !q) == 0 {
+        return 1;
+    }
+    if (outcomes & q) == 0 {
+        return 0;
+    }
+    -1
+}
+
+// (0.30) x `cond` y where x or y is a phi of a block j that no back edge
+// enters (the values an `if` left: the smaller and the larger of two
+// indices): decided when it is decided the same way for every
+// predecessor p of j, with the phis of j taking their values from p, by
+// the facts at p's end and on its edge together with the facts here
+// (which hold whichever way j was entered). -1 otherwise.
+fn decide_phi_arms(cx: &mut FnCtx<Comp>, cond: Cond, ty: i64, x: i64, y: i64, pcx: &Ctx<Comp>) -> i64 {
+    let j = if (cx.insts[x as usize]).op == Op::Phi { (cx.insts[x as usize]).block }
+        else if (cx.insts[y as usize]).op == Op::Phi { (cx.insts[y as usize]).block }
+        else { return -1 };
+    let n = (cx.blocks[j as usize]).preds.len() as i64;
+    if j == 0 || n < 2 || n > 4 || (cx.blocks[j as usize]).order < 0 {
+        return -1;
+    }
+    for i in 0..n {
+        let p = ((cx.blocks[j as usize]).preds[i as usize]);
+        if (cx.blocks[p as usize]).order < 0 || dominates(cx, j, p) {
+            return -1;
+        }
+    }
+    let mut here: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for i in 0..cx.facts.len() {
+        here.push(cx.facts[i]);
+    }
+    let mut all: i64 = -1;
+    for i in 0..n {
+        let p = ((cx.blocks[j as usize]).preds[i as usize]);
+        let mut x2 = x;
+        let mut y2 = y;
+        if (cx.insts[x as usize]).op == Op::Phi && (cx.insts[x as usize]).block == j {
+            x2 = { let o = ir_arg(cx, x, i); bits_of_value(cx, o) };
+        }
+        if (cx.insts[y as usize]).op == Op::Phi && (cx.insts[y as usize]).block == j {
+            y2 = { let o = ir_arg(cx, y, i); bits_of_value(cx, o) };
+        }
+        collect_facts(cx, p, pcx);
+        edge_fact(cx, p, j, pcx);
+        for k in 0..here.len() {
+            cx.facts.push(here[k]);
+        }
+        let r = decide_facts(cx, cond, is_signed(ty), x2, y2);
+        if r == -1 || (i > 0 && r != all) {
+            all = -1;
+            break;
+        }
+        all = r;
+    }
+    cx.facts_ver += 1;
+    cx.facts.clear();
+    for k in 0..here.len() {
+        cx.facts.push(here[k]);
+    }
+    all
+}
+
+// (0.30) x `cond` y (integers compared in type ty) where x or y is a
+// select: decided when it is decided the same way with the select's
+// condition holding (its first value, and the first of another select on
+// that condition) and not holding (the second). -1 otherwise.
+fn decide_arms(cx: &mut FnCtx<Comp>, cond: Cond, ty: i64, x: i64, y: i64, pcx: &Ctx<Comp>) -> i64 {
+    let k = if (cx.insts[x as usize]).op == Op::Sel { ir_val(cx, (cx.insts[x as usize]).a) }
+        else if (cx.insts[y as usize]).op == Op::Sel { ir_val(cx, (cx.insts[y as usize]).a) }
+        else { return decide_phi_arms(cx, cond, ty, x, y, pcx) };
+    let mut both: i64 = -1;
+    for t in 0..2 {
+        let mut x2 = x;
+        let mut y2 = y;
+        if (cx.insts[x as usize]).op == Op::Sel && ir_val(cx, (cx.insts[x as usize]).a) == k {
+            x2 = bits_of_value(cx,
+                if t == 0 { (cx.insts[x as usize]).b } else { (cx.insts[x as usize]).c });
+        }
+        if (cx.insts[y as usize]).op == Op::Sel && ir_val(cx, (cx.insts[y as usize]).a) == k {
+            y2 = bits_of_value(cx,
+                if t == 0 { (cx.insts[y as usize]).b } else { (cx.insts[y as usize]).c });
+        }
+        cx.facts.push(k);
+        cx.facts.push(if t == 0 { 1 } else { 0 });
+        cx.facts_ver += 1;
+        let r = decide_facts(cx, cond, is_signed(ty), x2, y2);
+        cx.facts.pop();
+        cx.facts.pop();
+        cx.facts_ver += 1;
+        if r == -1 || (t == 1 && r != both) {
+            return -1;
+        }
+        both = r;
+    }
+    both
+}
+
+// Whether comparison or bool c holds at a block with facts FACTS: 1 true,
+// 0 false, -1 unknown. (0.30) What decide_plain leaves open: a
+// comparison of a select, by its two values (decide_arms), and a test of
+// a difference x - y for zero, as x != y. The safe `swap(i, j)` of a
+// slice (split_at_mut at the larger of two indices that were checked,
+// then `a[lo]` and `b[0]`) tests hi <= len, lo < hi and len - hi > 0, hi
+// and lo selects on i < j: decided by i < len, j < len and i != j.
+fn decide(cx: &mut FnCtx<Comp>, c: i64, pcx: &Ctx<Comp>) -> i64 {
+    let d = decide_plain(cx, c, pcx);
+    // (only for a branch to a failed check, as the ranges of phis: the
+    // cases cost a walk of the facts each)
+    if d != -1 || !cx.phi_ranges || (cx.insts[c as usize]).op != Op::Cmp {
+        return d;
+    }
+    let ty = (cx.insts[c as usize]).imm2;
+    if !is_integer(ty) {
+        return -1;
+    }
+    let a = bits_of_value(cx, (cx.insts[c as usize]).a);
+    let b = bits_of_value(cx, (cx.insts[c as usize]).b);
+    let zero = zero_test(cx, c);
+    if zero >= 0 && (cx.insts[a as usize]).op == Op::Sub && int_bits(ty) == 64
+        && is_integer((cx.insts[a as usize]).ty) && int_bits((cx.insts[a as usize]).ty) == 64 {
+        let x = bits_of_value(cx, (cx.insts[a as usize]).a);
+        let y = bits_of_value(cx, (cx.insts[a as usize]).b);
+        if !is_const(cx, y) {
+            let mut r = decide_facts(cx, Ne, is_signed(ty), x, y);
+            if r == -1 {
+                r = decide_arms(cx, Ne, ty, x, y, pcx);
+            }
+            if r != -1 {
+                return if (r == 1) == (zero == 1) { 1 } else { 0 };
+            }
+        }
+    }
+    decide_arms(cx, (cx.insts[c as usize]).cond, ty, a, b, pcx)
 }
 
 // (0.26.2, a prototype) Whether OVF c (middle/ir) cannot overflow at a

@@ -63,6 +63,14 @@ usage: tools/semfuzz/semfuzz.py [-c VOLEC] [-n COUNT] [-f FIRST] [-k DIR]
                 by-value fn on one path), one given to an FnMut(T) -> i64
                 bound, and Option::map's; each parameter is dropped at the
                 end of the closure's body unless moved out (a leak before)
+  --deref-assign  (0.30) assignments through what a call returns: `*h =
+                x`, `h.t = x`, `h[i] = x` where h is a Box, a struct with
+                DerefMut, a MutexGuard or an RwLockWriteGuard (`*h` is
+                `*h.deref_mut()`), and `*pk(&mut place) = x` through a
+                function's `&mut T`; the old value is dropped once, after
+                the right side, before the write (0.29 leaked it: the
+                generator's places were names, fields, indexes and `*` of
+                a named reference only, never a call's result)
 
 Exit status: 0 when every program behaved as expected.
 """
@@ -1351,6 +1359,36 @@ class Decl(S_):
         fr.scopes[-1].append((self.name, Cell(v)))
 
 
+class HolderDecl(S_):
+    """(--deref-assign) `let mut h = Box::new_in(x, gpa);`, `Wr { x: v }`,
+    or a Mutex's or an RwLock's guard: h owns x and is used as a `&mut`
+    name is (`*h = y`, `h.t = y`, `&*h`), each use through deref_mut or
+    deref; x is dropped at the end of h's block (a guard's lock right
+    after it)."""
+    def __init__(self, name, kind, init):
+        self.name = name
+        self.kind = kind
+        self.init = init
+
+    def emit(self, out, ind):
+        refs()[self.name] = 'inout'
+        x = self.init.code()
+        if self.kind == 'box':
+            out.append('%slet mut %s = Box::new_in(%s, gpa);' % (ind, self.name, x))
+        elif self.kind == 'wrap':
+            out.append('%slet mut %s = Wr { x: %s };' % (ind, self.name, x))
+        elif self.kind == 'mutex':
+            out.append('%slet l%s = Mutex::new(%s);' % (ind, self.name, x))
+            out.append('%slet mut %s = l%s.lock().unwrap();' % (ind, self.name, self.name))
+        else:
+            out.append('%slet l%s = RwLock::new(%s);' % (ind, self.name, x))
+            out.append('%slet mut %s = l%s.write().unwrap();' % (ind, self.name, self.name))
+
+    def run(self, it, fr):
+        v = self.init.ev(it, fr)
+        fr.scopes[-1].append((self.name, Cell(v)))
+
+
 class Destructure(S_):
     """`let (a, b) = u;`: u moves, a and b are its parts."""
     def __init__(self, a, b, p):
@@ -1383,11 +1421,16 @@ class Defer(S_):
 
 
 class Assign(S_):
-    def __init__(self, p, x):
+    """via: `*pk(&mut p) = x`, the place a function's `&mut T` result."""
+    def __init__(self, p, x, via=False):
         self.p = p
         self.x = x
+        self.via = via
 
     def emit(self, out, ind):
+        if self.via:
+            out.append('%s*pk(%s) = %s;' % (ind, lend_mut(self.p), self.x.code()))
+            return
         star = '*' if ref_kind(self.p) else ''
         out.append('%s%s%s = %s;' % (ind, star, self.p.code(), self.x.code()))
 
@@ -1940,13 +1983,16 @@ RETNAME = {'i': 'i64', 'T': 'T', 'V': 'Vec<T, Gpa>', 'OI': 'Option<i64>',
 
 
 class Program:
-    def __init__(self, fns, run_fn):
+    def __init__(self, fns, run_fn, deref_assign=False):
         self.fns = fns
         self.run_fn = run_fn
+        self.deref_assign = deref_assign
 
     def code(self):
         refs().clear()
         out = [HEADER]
+        if self.deref_assign:
+            out.append(HEADER_DEREF)
         for f in self.fns:
             f.emit(out)
         out.append('fn run(gpa: Gpa) {')
@@ -2089,6 +2135,24 @@ fn callf<F: Fn() -> i64>(f: F) -> i64 { f() }
 fn feed<F: FnMut(T) -> i64>(mut f: F, t: T) -> i64 { f(t) }
 '''
 
+# (--deref-assign) Wr: a struct with DerefMut; pk: a place by a call.
+HEADER_DEREF = '''use std::ops::{Deref, DerefMut};
+use std::sync::{Mutex, RwLock};
+
+struct Wr<X> { x: X }
+
+impl<X> Deref for Wr<X> {
+    type Target = X;
+    fn deref(&self) -> &X { &self.x }
+}
+
+impl<X> DerefMut for Wr<X> {
+    fn deref_mut(&mut self) -> &mut X { &mut self.x }
+}
+
+fn pk<X>(x: &mut X) -> &mut X { x }
+'''
+
 MAIN = '''fn main(gpa: Gpa) -> i32 {
     run(gpa);
     println("live {}", LIVE.load(Ordering::Relaxed));
@@ -2141,7 +2205,8 @@ class Ctx:
 
 class Gen:
     def __init__(self, seed, known=False, size=24, assign_calls=False, try_args=False,
-                 closure_params=False):
+                 closure_params=False, deref_assign=False):
+        self.deref_assign = deref_assign
         self.r = random.Random(seed)
         self.known = known
         self.assign_calls = assign_calls
@@ -2732,6 +2797,7 @@ class Gen:
             (2, self.st_plain),
             (1, self.st_string),
             (3, self.st_inout),
+            (12 if self.deref_assign else 0, self.st_holder),
             # (a guard: `defer`'s place is a Drop's)
             (1, self.st_defer),
             (1, self.st_shadow),
@@ -3008,10 +3074,13 @@ class Gen:
             x = NewG(self.texpr(c, 1, used), self.small())
         else:
             x = NewTup(self.texpr(c, 1, used), self.texpr(c, 1, used))
+        # (--deref-assign: `*pk(&mut v) = x`, of a v that is whole)
+        via = (self.deref_assign and v.st == 'L' and self.whole(v)
+               and v.name not in c.frozen and self.chance(0.5))
         v.st = 'L'
         if v.fst:
             v.fst = {f: 'L' for f in v.fst}
-        return Assign(PVar(v.name), x)
+        return Assign(PVar(v.name), x, via)
 
     def st_swap(self, c):
         ps = self.t_places(c, need_mut=True, elems=False)
@@ -3522,10 +3591,76 @@ class Gen:
             elif k < 0.6:
                 ops.append(Do(Call('add', [Arg('val', self.int_k(c))], method=True, recv=rp)))
             elif k < 0.8:
-                ops.append(Assign(rp, Mk(self.int_k(c))))
+                ops.append(Assign(rp, Mk(self.int_k(c)), self.deref_assign and self.chance(0.5)))
             else:
                 ops.append(Print(self.obsn(), [Call('obs', [Arg('let', rp)]), Read(PField(rp, 'id'))]))
         return InoutBlock(n, p, Block(ops), 'inout', flat)
+
+    def st_holder(self, c):
+        """(--deref-assign) `{ let mut h = Box::new_in(x, gpa); *h = y; .. }`:
+        a T, an S or a Vec<T> in a Box, a Wr, a MutexGuard or an
+        RwLockWriteGuard, assigned whole, by a field or by an index, also
+        through pk, in a block, a loop's body or a branch."""
+        ty = self.r.choice(['T', 'T', 'S', 'V'])
+        kind = self.r.choice(['box', 'wrap', 'mutex', 'rwlock'])
+        n = self.name('h')
+        rp = PVar(n)
+        if ty == 'T':
+            init = self.texpr(c, 0, set())
+        elif ty == 'S':
+            init = self.sexpr(c, set())
+        else:
+            init = self.vexpr(c, set())
+        ops = [HolderDecl(n, kind, init)]
+
+        def whole():
+            if ty == 'T':
+                return self.texpr(c, 0, set())
+            if ty == 'S':
+                return self.sexpr(c, set())
+            return self.vexpr(c, set())
+
+        def assign():
+            k = self.r.random()
+            if ty == 'S' and k < 0.6:
+                if self.chance(0.6):
+                    return Assign(PField(rp, 't'), self.texpr(c, 0, set()))
+                return Assign(PField(rp, 'w'), self.vexpr(c, set()))
+            if ty == 'V' and k < 0.6:
+                i = self.r.randint(0, 2)
+                x = self.guarded(c, lambda: self.texpr(c, 1, set()))
+                return If(Bin(Call('len', [], method=True, recv=rp), '>', Lit(i)),
+                          Block([Assign(PIdx(rp, i), x)]), None)
+            return Assign(rp, whole(), self.chance(0.3))
+
+        def see():
+            if ty == 'T':
+                return Print(self.obsn(), [Call('obs', [Arg('let', rp)]), Read(PField(rp, 'id'))])
+            if ty == 'S':
+                return Print(self.obsn(), [Call('ssig', [Arg('let', rp)])])
+            return Print(self.obsn(), [Call('vsig', [Arg('let', rp)])])
+
+        shape = self.r.random()
+        if shape < 0.2 and ty == 'T':
+            # (the assignment in a loop: each turn drops the turn before's)
+            ops.append(For(self.name('i'), self.r.randint(1, 3),
+                           Block([Assign(rp, Mk(self.int_k(c)), self.chance(0.3)), see()])))
+        elif shape < 0.4:
+            a = self.guarded(c, assign)
+            b = self.guarded(c, assign) if self.chance(0.5) else None
+            ops.append(If(self.cond(c), Block([a]), Block([b]) if b is not None else None))
+        for _ in range(self.r.randint(1, 4)):
+            k = self.r.random()
+            if k < 0.55:
+                ops.append(assign())
+            elif k < 0.7 and ty == 'T':
+                ops.append(OpAssign(PField(rp, 'v'), self.int_k(c)))
+            elif k < 0.8 and ty == 'T':
+                ops.append(Do(Call('bump', [Arg('inout', rp), Arg('val', self.int_k(c))])))
+            else:
+                ops.append(see())
+        ops.append(see())
+        return Block(ops)
 
     def st_defer(self, c):
         return Defer(self.obsn())
@@ -3569,7 +3704,7 @@ class Gen:
         c = Ctx(None)
         c.scopes[0].append(Var('gpa', 'gpa', False, 'let', 0))
         body = self.gen_block(c, self.size + self.r.randint(-self.size // 3, self.size // 3))
-        return Program(self.fns, GenFn('run', [], None, body))
+        return Program(self.fns, GenFn('run', [], None, body), self.deref_assign)
 
 
 # ---------------------------------------------------------------- checking
@@ -3887,13 +4022,14 @@ def main():
     ap.add_argument('--assign-calls', action='store_true')
     ap.add_argument('--try-args', action='store_true')
     ap.add_argument('--closure-params', action='store_true')
+    ap.add_argument('--deref-assign', action='store_true')
     ap.add_argument('-h', '--help', action='store_true')
     a = ap.parse_args()
     if a.help:
         print(__doc__)
         return 0
     if a.print is not None:
-        prog = Gen(a.print, a.known, a.size, a.assign_calls, a.try_args, a.closure_params).program()
+        prog = Gen(a.print, a.known, a.size, a.assign_calls, a.try_args, a.closure_params, a.deref_assign).program()
         print(prog.code())
         try:
             print('// expected:\n' + ''.join('// ' + l + '\n' for l in render(prog.expect()).splitlines()))
@@ -3913,7 +4049,7 @@ def main():
             return 2
     work = tempfile.mkdtemp(prefix='vole-semfuzz.')
     if a.shrink is not None:
-        prog = Gen(a.shrink, a.known, a.size, a.assign_calls, a.try_args, a.closure_params).program()
+        prog = Gen(a.shrink, a.known, a.size, a.assign_calls, a.try_args, a.closure_params, a.deref_assign).program()
         kind, detail = check_program(volec, prog, work, 'p', rustc=rustc)
         print('// %s: %s' % (kind, detail))
         if kind not in ('ok', 'invalid'):
@@ -3928,7 +4064,7 @@ def main():
     lock = threading.Lock()
 
     def one(seed):
-        prog = Gen(seed, a.known, a.size, a.assign_calls, a.try_args, a.closure_params).program()
+        prog = Gen(seed, a.known, a.size, a.assign_calls, a.try_args, a.closure_params, a.deref_assign).program()
         d = os.path.join(work, 's%d' % seed)
         os.makedirs(d, exist_ok=True)
         with slots:
@@ -3945,7 +4081,7 @@ def main():
                 pass
             if kind != 'invalid' and not a.no_shrink:
                 with slots:
-                    small = shrink(volec, Gen(seed, a.known, a.size, a.assign_calls, a.try_args, a.closure_params).program(), kind, d, rustc=rustc)
+                    small = shrink(volec, Gen(seed, a.known, a.size, a.assign_calls, a.try_args, a.closure_params, a.deref_assign).program(), kind, d, rustc=rustc)
                 with open(base + '.min.vl', 'w') as f:
                     f.write(small.code())
                 try:

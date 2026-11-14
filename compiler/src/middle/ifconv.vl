@@ -18,7 +18,7 @@ use crate::front::types::{TY_BOOL, is_float, is_integer};
 use crate::middle::ctx::FnCtx;
 use crate::middle::fold::combine_select;
 use crate::middle::ir::{
-    Op, Term, fn_block, fn_block_count, ir_append, ir_arg, ir_enter, ir_make, ir_operand,
+    Cond, Op, Term, fn_block, fn_block_count, ir_append, ir_arg, ir_enter, ir_make, ir_operand,
     ir_operand_count, ir_set_arg, ir_unlink, ir_val,
 };
 use crate::middle::ir::cfg::pred_index;
@@ -241,6 +241,65 @@ fn convert(cx: &mut FnCtx<Comp>, l: i64, h: i64, pcx: &Ctx<Comp>) -> bool {
     true
 }
 
+// A comparison as the set of orders it holds for: less 1, equal 2,
+// greater 4.
+fn cond_orders(c: Cond) -> i64 {
+    match c {
+        Cond::Lt => 1,
+        Cond::Eq => 2,
+        Cond::Le => 3,
+        Cond::Gt => 4,
+        Cond::Ne => 5,
+        Cond::Ge => 6,
+    }
+}
+
+// (0.30) (c1, or its negation) | (c2, or its negation) as one comparison
+// appended to block h, when both compare the same two integers in the same
+// type (either way round); 0 when they do not, or when the result is not
+// a comparison (always true). `a < b || !(a > b)`, what the threaded
+// `a.cmp(&b).is_gt()` of `max` leaves, is `a <= b`: the select on it is
+// the maximum the vectorizer and the unroller's accumulators know.
+fn or_of_comparisons(cx: &mut FnCtx<Comp>, h: i64, c1: i64, neg1: bool, c2: i64, neg2: bool,
+    pcx: &Ctx<Comp>) -> i64 {
+    let ty = (cx.insts[c1 as usize]).imm2;
+    if (cx.insts[c1 as usize]).op != Op::Cmp || (cx.insts[c2 as usize]).op != Op::Cmp
+        || !is_integer(ty) || (cx.insts[c2 as usize]).imm2 != ty {
+        return 0;
+    }
+    let a1 = ir_val(cx, (cx.insts[c1 as usize]).a);
+    let b1 = ir_val(cx, (cx.insts[c1 as usize]).b);
+    let a2 = ir_val(cx, (cx.insts[c2 as usize]).a);
+    let b2 = ir_val(cx, (cx.insts[c2 as usize]).b);
+    let mut m1 = cond_orders((cx.insts[c1 as usize]).cond);
+    let mut m2 = if a1 == a2 && b1 == b2 { cond_orders((cx.insts[c2 as usize]).cond) }
+        else if a1 == b2 && b1 == a2 { cond_orders((cx.insts[c2 as usize]).cond.mirror()) }
+        else { 0 };
+    if m2 == 0 {
+        return 0;
+    }
+    if neg1 {
+        m1 = 7 - m1;
+    }
+    if neg2 {
+        m2 = 7 - m2;
+    }
+    let cond = match m1 | m2 {
+        1 => Cond::Lt,
+        2 => Cond::Eq,
+        3 => Cond::Le,
+        4 => Cond::Gt,
+        5 => Cond::Ne,
+        6 => Cond::Ge,
+        _ => return 0,
+    };
+    let v = ir_make(cx, Op::Cmp, TY_BOOL, a1, b1, 0, pcx);
+    (cx.insts[v as usize]).cond = cond;
+    (cx.insts[v as usize]).imm2 = ty;
+    ir_append(cx, h, v);
+    v
+}
+
 // (0.16) Branches to a common destination, merged (LLVM's
 // FoldBranchToCommonDest): h branches to T or to B, and B, reached from h
 // alone, computes a little (at most 2 IFCONV_COST cheap pure instructions)
@@ -292,18 +351,21 @@ fn fold_branch_chain(cx: &mut FnCtx<Comp>, l: i64, h: i64, pcx: &Ctx<Comp>) -> b
         }
         // h's condition for T, B's for T, then their or.
         let mut c1 = ir_val(cx, (cx.blocks[h as usize]).cond);
-        if side == 0 {
-            c1 = ir_make(cx, Op::Not, TY_BOOL, c1, 0, 0, pcx);
-            ir_append(cx, h, c1);
-        }
         move_up(cx, b, h);
         let mut c2 = ir_val(cx, (cx.blocks[b as usize]).cond);
-        if !b_to_t {
-            c2 = ir_make(cx, Op::Not, TY_BOOL, c2, 0, 0, pcx);
-            ir_append(cx, h, c2);
+        let mut c = or_of_comparisons(cx, h, c1, side == 0, c2, !b_to_t, pcx);
+        if c == 0 {
+            if side == 0 {
+                c1 = ir_make(cx, Op::Not, TY_BOOL, c1, 0, 0, pcx);
+                ir_append(cx, h, c1);
+            }
+            if !b_to_t {
+                c2 = ir_make(cx, Op::Not, TY_BOOL, c2, 0, 0, pcx);
+                ir_append(cx, h, c2);
+            }
+            c = ir_make(cx, Op::Or, TY_BOOL, c1, c2, 0, pcx);
+            ir_append(cx, h, c);
         }
-        let c = ir_make(cx, Op::Or, TY_BOOL, c1, c2, 0, pcx);
-        ir_append(cx, h, c);
         (cx.blocks[h as usize]).cond = c;
         (cx.blocks[h as usize]).s0 = t;
         (cx.blocks[h as usize]).s1 = f;

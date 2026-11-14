@@ -22,20 +22,22 @@
 // with the square root and the division done in integers at a scale of
 // 10^(digits + GUARD).
 //
-// Nothing is quadratic. Products go through Karatsuba up to 512 limbs and
+// Nothing is quadratic. Products go through Karatsuba up to 256 limbs and
 // through a three-prime number theoretic transform above that (Montgomery
 // reduction in the butterflies, Garner's reconstruction into base 10^9),
-// O(n log n), with the butterflies two at a time in NEON lanes (a scalar
-// path for machines without NEON). The division and the square root use
-// Newton iterations whose precision doubles each step, so their cost is
-// a small multiple of one large product's, not O(n^2). The three primes
-// are independent and run on three threads; the square root, which
-// depends on nothing in the series, runs beside the split, and the final
-// division's reciprocal, which needs only T, beside the numerator's
-// product. The twiddles of all three transforms of a product come from
-// one table of roots per prime, read by strides, and the split's combine
-// shares a forward transform between the two products that use P1 or Q2.
-// A million digits takes about a second on an Apple M-series machine.
+// O(n log n), with the butterflies four at a time in NEON lanes, two
+// stages a pass, values left unreduced between stages (a scalar path for
+// machines without NEON). The division and the square root use Newton
+// iterations whose precision doubles each step, so their cost is a small
+// multiple of one large product's, not O(n^2). Independent work shares
+// the cores: the halves of the split, the three primes of a product, the
+// pieces of the reconstruction; the square root, which depends on nothing
+// in the series, runs beside the split, and the final division's
+// reciprocal, which needs only T, beside the numerator's product. One
+// table of roots per prime serves every transform of the run, and the
+// split's combine shares a forward transform between the two products
+// that use P1 or Q2. A million digits takes about 0.15 s on an Apple
+// M-series machine (0.5 s on one core).
 //
 // Every run also computes pi a second, independent way -- Machin's
 // formula pi = 16 arctan(1/5) - 4 arctan(1/239), fixed point with small
@@ -47,21 +49,23 @@
 
 import "time.h" as c;
 
-use std::{env, thread};
+use std::{cmp, env, thread};
 use std::alloc::Allocator;
 use std::arch::detect;
 use std::arch::aarch64::{
-    vadd_u32, vbsl_u32, vcge_u32, vdup_n_u32, vld1_u32, vmlal_u32, vmovn_u64, vmull_u32,
-    vshrq_n_u64, vst1_u32, vsub_u32,
+    uint32x4_t, vaddq_u32, vdupq_n_u32, vget_low_u32, vld1q_u32, vminq_u32, vmlsl_high_u32,
+    vmlsl_u32, vmull_high_u32, vmull_u32, vmulq_u32, vreinterpretq_u32_u64, vreinterpretq_u64_u32,
+    vst1q_u32, vsubq_u32, vuzp1q_u32, vuzp2q_u32, vzip1q_u32, vzip1q_u64, vzip2q_u32, vzip2q_u64,
 };
 use std::cli::{Arg, Command};
-use std::cmp::Ordering;
 use std::fmt::{Display, Formatter, self};
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const BASE: u64 = 1_000_000_000;
 
 // Below this many limbs (in the shorter operand), schoolbook is faster.
-const KARATSUBA_MIN: usize = 96;
+const KARATSUBA_MIN: usize = 128;
 
 // Digits computed past the ones asked for, so that truncating the series
 // and the integer square root cannot move the last printed digit.
@@ -162,9 +166,15 @@ fn sum_of(a: &[u32], b: &[u32], gpa: Gpa) -> Vec<u32, Gpa> {
 
 // r = a * b (r zeroed), by Karatsuba: three half-size products instead
 // of four, O(n^1.585).
-fn mul_karatsuba(a: &[u32], b: &[u32], r: &mut [u32], gpa: Gpa) {
-    if a.len() < b.len() { return mul_karatsuba(b, a, r, gpa); }
+fn mul_karatsuba(a: &[u32], b: &[u32], r: &mut [u32], cx: &Engine<Gpa>) {
+    let gpa = cx.gpa;
+    if a.len() < b.len() { return mul_karatsuba(b, a, r, cx); }
     if b.len() < KARATSUBA_MIN { return mul_schoolbook(a, b, r, gpa); }
+    // Up to three times the shorter operand's length, one transform of
+    // the whole product costs no more than a transform per piece.
+    if b.len() >= NTT_MIN && a.len() <= 3 * b.len() && a.len() + b.len() <= NTT_MAX_LEN {
+        return mul_ntt(a, b, r, cx);
+    }
     if 2 * b.len() <= a.len() {
         // Lopsided: b times each b.len-limb piece of a.
         let mut part = Vec::from_elem_in(0u32, 2 * b.len(), gpa);
@@ -173,25 +183,22 @@ fn mul_karatsuba(a: &[u32], b: &[u32], r: &mut [u32], gpa: Gpa) {
         while off < a.len() {
             let end = if off + b.len() < a.len() { off + b.len() } else { a.len() };
             for k in 0..p.len() { p[k] = 0; }
-            mul_karatsuba(&a[off..end], b, p, gpa);
+            mul_karatsuba(&a[off..end], b, p, cx);
             add_at(r, trimmed(p), off);
             off = end;
         }
         return;
     }
-    if b.len() >= NTT_MIN && a.len() + b.len() <= NTT_MAX_LEN {
-        return mul_ntt(a, b, r, gpa);
-    }
     let m = a.len() / 2;
     let (a0, a1) = (&a[..m], &a[m..]);
     let (b0, b1) = (&b[..m], &b[m..]);
-    mul_karatsuba(a0, b0, &mut r[..2 * m], gpa); // z0, in place
-    mul_karatsuba(a1, b1, &mut r[2 * m..], gpa); // z2, in place
+    mul_karatsuba(a0, b0, &mut r[..2 * m], cx); // z0, in place
+    mul_karatsuba(a1, b1, &mut r[2 * m..], cx); // z2, in place
     let sa = sum_of(a0, a1, gpa);
     let sb = sum_of(b0, b1, gpa);
     let mut prod = Vec::from_elem_in(0u32, sa.len() + sb.len(), gpa);
     let p = prod.as_mut_slice();
-    mul_karatsuba(&sa, &sb, p, gpa);
+    mul_karatsuba(&sa, &sb, p, cx);
     sub_from(p, &r[..2 * m]);
     sub_from(p, &r[2 * m..]);
     add_at(r, trimmed(p), m);
@@ -201,29 +208,32 @@ fn mul_karatsuba(a: &[u32], b: &[u32], r: &mut [u32], gpa: Gpa) {
 //
 // Above NTT_MIN limbs a product is a convolution evaluated with the
 // number theoretic transform: O(n log n) modular butterflies instead of
-// O(n^1.585) integer products. Three 32-bit primes with primitive root 3
-// and a large power-of-two factor in p - 1 give transforms of any length
-// up to 2^24 points (75 million digits); every modular product then fits
-// a u64, so no 128-bit arithmetic is needed. The three residues are
+// O(n^1.585) integer products. Three primes below 2^30 with a factor of
+// at least 2^24 in p - 1 give transforms of any length up to 2^24 points
+// (75 million digits); every modular product then fits a u64, so no
+// 128-bit arithmetic is needed, and 4p fits a u32, so a value may stay
+// unreduced, anywhere below 4p, between the stages. The three residues are
 // recombined by Garner's algorithm, and the exact coefficients (below
 // limbs * BASE^2, which the primes' product exceeds) are carried back
 // into base 10^9.
 
-const NTT_PRIMES: [u64; 3] = [469762049, 167772161, 1224736769];
-const NTT_ROOT: u64 = 3;
+const NTT_PRIMES: [u64; 3] = [469762049, 167772161, 754974721];
+
+// A primitive root of each.
+const NTT_ROOTS: [u64; 3] = [3, 3, 11];
 
 // 2^32 - 1, the chunk mask of the reconstruction.
 const M32: u64 = 0xFFFF_FFFF;
 
 // Shorter operand, in limbs, from which the transform wins.
-const NTT_MIN: usize = 512;
+const NTT_MIN: usize = 256;
 
 // The shortest prime's 2-adic limit: 998244353-style lengths are not
 // needed here, 2^24 points is 75 million digits.
 const NTT_MAX_LEN: usize = 1 << 24;
 
-// Transform length from which the three primes run on three threads.
-const NTT_THREADS_MIN: usize = 1 << 16;
+// Transform length from which a product looks for idle threads.
+const NTT_THREADS_MIN: usize = 1 << 13;
 
 fn powmod(x: u64, e: u64, p: u64) -> u64 {
     let mut r = 1u64;
@@ -238,15 +248,20 @@ fn powmod(x: u64, e: u64, p: u64) -> u64 {
 }
 
 // Montgomery reduction with R = 2^32: the primes are below 2^30, so
-// x * y is below 2^60 and (x * y + m * p) is below 2^63. A modular
-// product is three machine multiplies and a shift, no division.
-struct Mont { p: u64, inv: u64 }
+// for x and y below 2p, x * y is below 2^62 and (x * y + m * p) below
+// 2^63. A modular product is three machine multiplies and a shift, no
+// division.
+struct Mont { p: u64, inv: u64, pinv: u64, r2: u64, root: u64 }
 
-fn mont_new(p: u64) -> Mont {
-    // -p^-1 mod 2^32, by Newton's iteration on the low bits.
+// The constants of NTT_PRIMES[pi].
+fn mont_new(pi: usize) -> Mont {
+    let p = NTT_PRIMES[pi];
+    // p^-1 mod 2^32 (pinv) by Newton's iteration on the low bits, and its
+    // negative (inv).
     let mut x: u64 = 1;
     for _ in 0..5 { x = x.wrapping_mul(2u64.wrapping_sub(p.wrapping_mul(x))); }
-    Mont { p, inv: 0u64.wrapping_sub(x) & M32 }
+    let r = (1u64 << 32) % p;
+    Mont { p, inv: 0u64.wrapping_sub(x) & M32, pinv: x & M32, r2: r * r % p, root: NTT_ROOTS[pi] }
 }
 
 // x * y * R^-1 mod p. In the Montgomery domain (values scaled by R) this
@@ -258,260 +273,715 @@ fn mont_mul(x: u64, y: u64, m: &Mont) -> u64 {
     if u >= m.p { u - m.p } else { u }
 }
 
-// One stage, two butterflies at a time: the operands are below 2^30, so
-// they live in u32 lanes and the widening NEON multiplies take them
-// straight. Montgomery's reduction is umull, umlal and a shift; the
-// modular add and subtract are u32 lanes again.
-fn ntt_stage_simd(v: &mut [u32], tws: &[u32], n: usize, len: usize, m: &Mont) {
+// The same product left unreduced, in (0, 2p), for x below 2^32 and y
+// below p: x y - q p is a multiple of 2^32 for q = x y p^-1 mod 2^32, and
+// its quotient by 2^32 lies between -p and p, so adding p makes it
+// positive without a comparison.
+fn mont_lazy(x: u64, y: u64, m: &Mont) -> u64 {
+    let t = x * y;
+    let q = ((t & M32) * m.pinv) & M32;
+    ((t.wrapping_sub(q * m.p) >> 32) + m.p) & M32
+}
+
+// Four Montgomery products a w R^-1 mod p at once, in u32 lanes, for a
+// below 2^32 and w below p (or both below 2p): q = a w p^-1 mod 2^32
+// makes a w - q p a multiple of 2^32, the two widening multiply-subtracts
+// compute it in u64 lanes, and its high halves are the product, between
+// -p and p (wrapped, in a u32 lane).
+fn mont4(a: uint32x4_t, w: uint32x4_t, pv: uint32x4_t, pinv: uint32x4_t) -> uint32x4_t {
+    let q = vmulq_u32(vmulq_u32(a, w), pinv);
+    let lo = vmlsl_u32(vmull_u32(vget_low_u32(a), vget_low_u32(w)), vget_low_u32(q),
+        vget_low_u32(pv));
+    let hi = vmlsl_high_u32(vmull_high_u32(a, w), q, pv);
+    vuzp2q_u32(vreinterpretq_u32_u64(lo), vreinterpretq_u32_u64(hi))
+}
+
+// The stages keep their values unreduced, which saves a compare and
+// select on most results. The forward transform (decimation in
+// frequency: u + y and (u - y) w) takes and leaves values in [0, 2p):
+// the sum is brought back below 2p by one minimum, u - y + 2p is below
+// 4p, which the product accepts, and the product plus p is in (0, 2p).
+//
+// One forward stage on blocks of len >= 8 points, four butterflies a
+// step in u32 lanes.
+fn dif_stage4(v: &mut [u32], tws: &[u32], len: usize, m: &Mont) {
     let half = len / 2;
-    let pv = vdup_n_u32(m.p as u32);
-    let invv = vdup_n_u32(m.inv as u32);
+    // Every slice of the loop is cut to `half` entries and the counter is
+    // a usize below it: what lets the compiler drop the loads' and
+    // stores' bounds checks.
+    let tws = &tws[..half];
+    let pv = vdupq_n_u32(m.p as u32);
+    let p2 = vdupq_n_u32(2 * m.p as u32);
+    let pinv = vdupq_n_u32(m.pinv as u32);
+    let n = v.len();
     let mut start = 0;
     while start < n {
+        let (lo, hi) = v[start..start + len].split_at_mut(half);
+        let (lo, hi) = (&mut lo[..half], &mut hi[..half]);
         let mut k = 0;
-        while k + 2 <= half {
-            let u = vld1_u32(v, (start + k) as i64);
-            let w = vld1_u32(tws, k as i64);
-            let y = vld1_u32(v, (start + k + half) as i64);
-            let prod = vmull_u32(y, w);
-            let mm = vmovn_u64(vmull_u32(vmovn_u64(prod), invv));
-            let t = vmovn_u64(vshrq_n_u64(vmlal_u32(prod, mm, pv), 32));
-            let tm = vbsl_u32(vcge_u32(t, pv), vsub_u32(t, pv), t);
-            let sum = vadd_u32(u, tm);
-            vst1_u32(v, (start + k) as i64, vbsl_u32(vcge_u32(sum, pv), vsub_u32(sum, pv), sum));
-            let ge = vcge_u32(u, tm);
-            vst1_u32(v, (start + k + half) as i64,
-                vbsl_u32(ge, vsub_u32(u, tm), vadd_u32(vsub_u32(u, tm), pv)));
-            k += 2;
-        }
-        while k < half {
-            let u = v[start + k] as u64;
-            let t = mont_mul(v[start + k + half] as u64, tws[k] as u64, m);
-            let sum = u + t;
-            v[start + k] = (if sum >= m.p { sum - m.p } else { sum }) as u32;
-            v[start + k + half] = (if u >= t { u - t } else { u + m.p - t }) as u32;
-            k += 1;
+        while k + 4 <= half {
+            let at = k as i64;
+            let u = vld1q_u32(lo, at);
+            let y = vld1q_u32(hi, at);
+            let sum = vaddq_u32(u, y);
+            vst1q_u32(lo, at, vminq_u32(sum, vsubq_u32(sum, p2)));
+            let d = vaddq_u32(vsubq_u32(u, y), p2);
+            vst1q_u32(hi, at, vaddq_u32(mont4(d, vld1q_u32(tws, at), pv, pinv), pv));
+            k += 4;
         }
         start += len;
     }
 }
 
-// The roots of unity of one transform length, in Montgomery form. Every
-// stage's twiddles are a stride through this one table (w_len^j is
-// w_n^(j * n/len)), so a stage costs a copy, not n modular multiplies;
-// and all three transforms of a product share it.
-struct Roots<A: Allocator> {
-    fwd: Vec<u32, A>,
-    inv: Vec<u32, A>,
-}
-
-fn roots_new(p: u64, l: usize, gpa: Gpa) -> Roots<Gpa> {
-    let w = powmod(NTT_ROOT, (p - 1) / l as u64, p);
-    let wi = powmod(w, p - 2, p);
-    let mut fwd = Vec::with_capacity_in(l / 2, gpa);
-    let mut inv = Vec::with_capacity_in(l / 2, gpa);
-    let (mut a, mut b) = (1u64, 1u64);
-    for _ in 0..l / 2 {
-        fwd.push(((a << 32) % p) as u32);
-        inv.push(((b << 32) % p) as u32);
-        a = a * w % p;
-        b = b * wi % p;
-    }
-    Roots { fwd, inv }
-}
-
-// In-place iterative Cooley-Tukey transform; v.len() is a power of two.
-// Values arrive in the ordinary domain and, forward, stay in the
-// Montgomery domain afterwards; the inverse transform converts back.
-fn ntt(v: &mut [u32], roots: &Roots<Gpa>, m: &Mont, inverse: bool, gpa: Gpa) {
-    let p = m.p;
+// The inverse transform (decimation in time: u + y w and u - y w) takes
+// values in [0, 2p) and leaves them in [0, 4p): u is brought below 2p by
+// one minimum, the product t is between -p and p, and u + p + t and
+// u + p - t are both in (0, 4p).
+//
+// One inverse stage on blocks of len >= 8 points.
+fn dit_stage4(v: &mut [u32], tws: &[u32], len: usize, m: &Mont) {
+    let half = len / 2;
+    // Every slice of the loop is cut to `half` entries and the counter is
+    // a usize below it: what lets the compiler drop the loads' and
+    // stores' bounds checks.
+    let tws = &tws[..half];
+    let pv = vdupq_n_u32(m.p as u32);
+    let p2 = vdupq_n_u32(2 * m.p as u32);
+    let pinv = vdupq_n_u32(m.pinv as u32);
     let n = v.len();
-    if !inverse { for i in 0..n { v[i] = (((v[i] as u64) << 32) % p) as u32; } }
-    let mut j = 0;
-    for i in 1..n {
-        let mut bit = n >> 1;
-        while j & bit != 0 {
-            j ^= bit;
-            bit >>= 1;
+    let mut start = 0;
+    while start < n {
+        let (lo, hi) = v[start..start + len].split_at_mut(half);
+        let (lo, hi) = (&mut lo[..half], &mut hi[..half]);
+        let mut k = 0;
+        while k + 4 <= half {
+            let at = k as i64;
+            let u = vld1q_u32(lo, at);
+            let t = mont4(vld1q_u32(hi, at), vld1q_u32(tws, at), pv, pinv);
+            let up = vaddq_u32(vminq_u32(u, vsubq_u32(u, p2)), pv);
+            vst1q_u32(lo, at, vaddq_u32(up, t));
+            vst1q_u32(hi, at, vsubq_u32(up, t));
+            k += 4;
         }
-        j ^= bit;
-        if i < j {
-            let t = v[i];
-            v[i] = v[j];
-            v[j] = t;
+        start += len;
+    }
+}
+
+// Two forward stages in one pass over the array: the stages of blocks
+// of len and of len / 2 points, on the four quarters of each block, for
+// len >= 16. The same butterflies as two calls of dif_stage4 with half
+// the loads and stores and one walk through memory instead of two.
+fn dif_stages4(v: &mut [u32], table: &[u32], len: usize, m: &Mont) {
+    let q = len / 4;
+    let (wa, wb) = table[2 * q..4 * q].split_at(q);
+    let (wa, wb, wc) = (&wa[..q], &wb[..q], &table[q..2 * q]);
+    let pv = vdupq_n_u32(m.p as u32);
+    let p2 = vdupq_n_u32(2 * m.p as u32);
+    let pinv = vdupq_n_u32(m.pinv as u32);
+    let n = v.len();
+    let mut start = 0;
+    while start < n {
+        let (h0, h1) = v[start..start + len].split_at_mut(2 * q);
+        let (a0, a1) = h0.split_at_mut(q);
+        let (a2, a3) = h1.split_at_mut(q);
+        let (a0, a1, a2, a3) = (&mut a0[..q], &mut a1[..q], &mut a2[..q], &mut a3[..q]);
+        let mut k = 0;
+        while k + 4 <= q {
+            let at = k as i64;
+            let (x0, x1) = (vld1q_u32(a0, at), vld1q_u32(a1, at));
+            let (x2, x3) = (vld1q_u32(a2, at), vld1q_u32(a3, at));
+            // Blocks of len: (0, 2) and (1, 3).
+            let s02 = vaddq_u32(x0, x2);
+            let b0 = vminq_u32(s02, vsubq_u32(s02, p2));
+            let d02 = vaddq_u32(vsubq_u32(x0, x2), p2);
+            let b2 = vaddq_u32(mont4(d02, vld1q_u32(wa, at), pv, pinv), pv);
+            let s13 = vaddq_u32(x1, x3);
+            let b1 = vminq_u32(s13, vsubq_u32(s13, p2));
+            let d13 = vaddq_u32(vsubq_u32(x1, x3), p2);
+            let b3 = vaddq_u32(mont4(d13, vld1q_u32(wb, at), pv, pinv), pv);
+            // Blocks of len / 2: (0, 1) and (2, 3), one twiddle.
+            let w = vld1q_u32(wc, at);
+            let s01 = vaddq_u32(b0, b1);
+            vst1q_u32(a0, at, vminq_u32(s01, vsubq_u32(s01, p2)));
+            let d01 = vaddq_u32(vsubq_u32(b0, b1), p2);
+            vst1q_u32(a1, at, vaddq_u32(mont4(d01, w, pv, pinv), pv));
+            let s23 = vaddq_u32(b2, b3);
+            vst1q_u32(a2, at, vminq_u32(s23, vsubq_u32(s23, p2)));
+            let d23 = vaddq_u32(vsubq_u32(b2, b3), p2);
+            vst1q_u32(a3, at, vaddq_u32(mont4(d23, w, pv, pinv), pv));
+            k += 4;
+        }
+        start += len;
+    }
+}
+
+// Two inverse stages in one pass: blocks of len / 2, then of len.
+fn dit_stages4(v: &mut [u32], table: &[u32], len: usize, m: &Mont) {
+    let q = len / 4;
+    let (wa, wb) = table[2 * q..4 * q].split_at(q);
+    let (wa, wb, wc) = (&wa[..q], &wb[..q], &table[q..2 * q]);
+    let pv = vdupq_n_u32(m.p as u32);
+    let p2 = vdupq_n_u32(2 * m.p as u32);
+    let pinv = vdupq_n_u32(m.pinv as u32);
+    let n = v.len();
+    let mut start = 0;
+    while start < n {
+        let (h0, h1) = v[start..start + len].split_at_mut(2 * q);
+        let (a0, a1) = h0.split_at_mut(q);
+        let (a2, a3) = h1.split_at_mut(q);
+        let (a0, a1, a2, a3) = (&mut a0[..q], &mut a1[..q], &mut a2[..q], &mut a3[..q]);
+        let mut k = 0;
+        while k + 4 <= q {
+            let at = k as i64;
+            let (x0, x1) = (vld1q_u32(a0, at), vld1q_u32(a1, at));
+            let (x2, x3) = (vld1q_u32(a2, at), vld1q_u32(a3, at));
+            // Blocks of len / 2: (0, 1) and (2, 3), one twiddle.
+            let w = vld1q_u32(wc, at);
+            let t1 = mont4(x1, w, pv, pinv);
+            let u0 = vaddq_u32(vminq_u32(x0, vsubq_u32(x0, p2)), pv);
+            let (b0, b1) = (vaddq_u32(u0, t1), vsubq_u32(u0, t1));
+            let t3 = mont4(x3, w, pv, pinv);
+            let u2 = vaddq_u32(vminq_u32(x2, vsubq_u32(x2, p2)), pv);
+            let (b2, b3) = (vaddq_u32(u2, t3), vsubq_u32(u2, t3));
+            // Blocks of len: (0, 2) and (1, 3).
+            let ta = mont4(b2, vld1q_u32(wa, at), pv, pinv);
+            let ua = vaddq_u32(vminq_u32(b0, vsubq_u32(b0, p2)), pv);
+            vst1q_u32(a0, at, vaddq_u32(ua, ta));
+            vst1q_u32(a2, at, vsubq_u32(ua, ta));
+            let tb = mont4(b3, vld1q_u32(wb, at), pv, pinv);
+            let ub = vaddq_u32(vminq_u32(b1, vsubq_u32(b1, p2)), pv);
+            vst1q_u32(a1, at, vaddq_u32(ub, tb));
+            vst1q_u32(a3, at, vsubq_u32(ub, tb));
+            k += 4;
+        }
+        start += len;
+    }
+}
+
+// The forward transform's last two stages (blocks of 4, then pairs) on
+// eight points a step: the lanes are regrouped so that each stage's
+// partners sit in the same lane of two registers. The stage of pairs
+// has the twiddle 1 only and needs no product.
+fn dif_tail4(v: &mut [u32], table: &[u32], m: &Mont) {
+    let pv = vdupq_n_u32(m.p as u32);
+    let p2 = vdupq_n_u32(2 * m.p as u32);
+    let pinv = vdupq_n_u32(m.pinv as u32);
+    let ws: [u32; 4] = [table[2], table[3], table[2], table[3]];
+    let w = vld1q_u32(&ws, 0);
+    let n = v.len();
+    let mut k = 0;
+    while k + 8 <= n {
+        let i = k as i64;
+        let v0 = vreinterpretq_u64_u32(vld1q_u32(v, i));
+        let v1 = vreinterpretq_u64_u32(vld1q_u32(v, i + 4));
+        // Blocks of 4: (0, 2), (1, 3), (4, 6), (5, 7).
+        let u = vreinterpretq_u32_u64(vzip1q_u64(v0, v1));
+        let y = vreinterpretq_u32_u64(vzip2q_u64(v0, v1));
+        let sum = vaddq_u32(u, y);
+        let x = vminq_u32(sum, vsubq_u32(sum, p2));
+        let z = vaddq_u32(mont4(vaddq_u32(vsubq_u32(u, y), p2), w, pv, pinv), pv);
+        // Pairs: x is points 0 1 4 5, z is points 2 3 6 7.
+        let a = vuzp1q_u32(x, z);
+        let b = vuzp2q_u32(x, z);
+        let s2 = vaddq_u32(a, b);
+        let e = vminq_u32(s2, vsubq_u32(s2, p2));
+        let d2 = vsubq_u32(a, b);
+        let o = vminq_u32(d2, vaddq_u32(d2, p2));
+        // e is points 0 4 2 6, o is points 1 5 3 7.
+        let z1 = vreinterpretq_u64_u32(vzip1q_u32(e, o));
+        let z2 = vreinterpretq_u64_u32(vzip2q_u32(e, o));
+        vst1q_u32(v, i, vreinterpretq_u32_u64(vzip1q_u64(z1, z2)));
+        vst1q_u32(v, i + 4, vreinterpretq_u32_u64(vzip2q_u64(z1, z2)));
+        k += 8;
+    }
+}
+
+// The inverse transform's first two stages (pairs, then blocks of 4),
+// eight points a step. The pairs' sums and differences of values below
+// 2p are below 4p as they are.
+fn dit_head4(v: &mut [u32], table: &[u32], m: &Mont) {
+    let pv = vdupq_n_u32(m.p as u32);
+    let p2 = vdupq_n_u32(2 * m.p as u32);
+    let pinv = vdupq_n_u32(m.pinv as u32);
+    let ws: [u32; 4] = [table[2], table[2], table[3], table[3]];
+    let w = vld1q_u32(&ws, 0);
+    let n = v.len();
+    let mut k = 0;
+    while k + 8 <= n {
+        let i = k as i64;
+        let v0 = vld1q_u32(v, i);
+        let v1 = vld1q_u32(v, i + 4);
+        // Pairs: a is points 0 2 4 6, b is points 1 3 5 7.
+        let a = vuzp1q_u32(v0, v1);
+        let b = vuzp2q_u32(v0, v1);
+        let e = vaddq_u32(a, b);
+        let o = vaddq_u32(vsubq_u32(a, b), p2);
+        // Blocks of 4: u is points 0 4 1 5, y is points 2 6 3 7.
+        let u = vuzp1q_u32(e, o);
+        let t = mont4(vuzp2q_u32(e, o), w, pv, pinv);
+        let up = vaddq_u32(vminq_u32(u, vsubq_u32(u, p2)), pv);
+        let x = vaddq_u32(up, t);
+        let z = vsubq_u32(up, t);
+        // x is points 0 4 1 5, z is points 2 6 3 7.
+        let z1 = vzip1q_u32(x, z);
+        let z2 = vzip2q_u32(x, z);
+        vst1q_u32(v, i, vzip1q_u32(z1, z2));
+        vst1q_u32(v, i + 4, vzip2q_u32(z1, z2));
+        k += 8;
+    }
+}
+
+// One butterfly of the inverse transform, on v[i] and v[j]: the scalar
+// form of the stages above, with the same bounds.
+fn dit_butterfly(v: &mut [u32], i: usize, j: usize, w: u64, m: &Mont) {
+    let mut u = v[i] as u64;
+    if u >= 2 * m.p { u -= 2 * m.p; }
+    let t = mont_lazy(v[j] as u64, w, m);
+    v[i] = (u + t) as u32;
+    v[j] = (u + 2 * m.p - t) as u32;
+}
+
+// One butterfly of the forward transform, on v[i] and v[j].
+fn dif_butterfly(v: &mut [u32], i: usize, j: usize, w: u64, m: &Mont) {
+    let u = v[i] as u64;
+    let y = v[j] as u64;
+    let sum = u + y;
+    v[i] = (if sum >= 2 * m.p { sum - 2 * m.p } else { sum }) as u32;
+    v[j] = mont_lazy(u + 2 * m.p - y, w, m) as u32;
+}
+
+// The roots of unity of one transform length, in Montgomery form, stored
+// stage by stage: the stage of blocks of 2h points reads its h twiddles
+// w_2h^k at [h + k], a contiguous run, so the table has l entries in all
+// (entry 0 is unused) and no stage gathers or copies anything. The
+// stages below the top do not depend on l: a table serves every shorter
+// transform too, forward and inverse.
+//
+// The top stage's run is w^0..w^(l/2 - 1), by Montgomery products (no
+// division), and each stage below is every second entry of the one
+// above.
+fn roots_new(m: &Mont, l: usize, gpa: Gpa) -> Vec<u32, Gpa> {
+    let w = powmod(m.root, (m.p - 1) / l as u64, m.p);
+    let mut fwd = Vec::from_elem_in(0u32, l, gpa);
+    let t = fwd.as_mut_slice();
+    let one = (1u64 << 32) % m.p;
+    let wr = mont_mul(w, one * one % m.p, m);
+    let top = l / 2;
+    let mut a = one;
+    for k in 0..top {
+        t[top + k] = a as u32;
+        a = mont_mul(a, wr, m);
+    }
+    let mut h = top / 2;
+    while h >= 1 {
+        for k in 0..h { t[h + k] = t[2 * h + 2 * k]; }
+        h /= 2;
+    }
+    fwd
+}
+
+// What every product shares: the allocator, the primes' constants and,
+// for each prime, one table of roots, as long as the longest transform
+// so far. A product's threads read it together; the first product of a
+// new length makes the longer one.
+struct Engine<A: Allocator> {
+    gpa: A,
+    mont: [Mont; 3],
+    garner: Garner,
+    tables: [RwLock<Vec<u32, A>>; 3],
+    // Threads that may still be started: the machine's cores less the
+    // threads running. Whoever has independent work takes from it and
+    // gives back when its threads are joined, so the split's subtrees,
+    // a product's primes and the reconstruction share the cores without
+    // a plan made in advance and without starting more threads than
+    // there are cores.
+    idle: AtomicUsize,
+}
+
+impl Engine<Gpa> {
+    fn new(gpa: Gpa) -> Engine<Gpa> { Engine::with_threads(0, gpa) }
+
+    // An engine that runs at most `threads` threads at once (0: as many
+    // as the machine has cores).
+    fn with_threads(threads: usize, gpa: Gpa) -> Engine<Gpa> {
+        let most = if threads == 0 { thread::available_parallelism() } else { threads };
+        let mont = [mont_new(0), mont_new(1), mont_new(2)];
+        Engine {
+            gpa,
+            garner: garner_new(&mont),
+            mont,
+            tables: [RwLock::new(Vec::new_in(gpa)), RwLock::new(Vec::new_in(gpa)),
+                RwLock::new(Vec::new_in(gpa))],
+            idle: AtomicUsize::new(most - 1),
         }
     }
-    let mut len = 2;
-    while len <= n {
-        let half = len / 2;
-        let stride = n / len;
-        let mut tw = Vec::new_in(gpa);
-        if stride > 1 {
-            for k in 0..half {
-                tw.push(if inverse { roots.inv[k * stride] } else { roots.fwd[k * stride] });
+
+    // Takes n threads from the idle ones, if there are that many.
+    fn take(&self, n: usize) -> bool {
+        let mut idle = self.idle.load(Ordering::Relaxed);
+        while idle >= n {
+            match self.idle.compare_exchange(idle, idle - n, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(now) => idle = now,
             }
         }
-        // The last stage's twiddles are the table itself; no copy.
-        let tws: &[u32] = if stride == 1 {
-            let table = if inverse { &roots.inv } else { &roots.fwd };
-            table.as_slice()
-        } else {
-            tw.as_slice()
-        };
-        if detect("neon") {
-            ntt_stage_simd(v, tws, n, len, m);
-        } else {
-            let mut start = 0;
-            while start < n {
-                for k in 0..half {
-                    let u = v[start + k] as u64;
-                    let t = mont_mul(v[start + k + half] as u64, tws[k] as u64, m);
-                    let sum = u + t;
-                    v[start + k] = (if sum >= p { sum - p } else { sum }) as u32;
-                    v[start + k + half] = (if u >= t { u - t } else { u + p - t }) as u32;
-                }
-                start += len;
-            }
+        false
+    }
+
+    fn give(&self, n: usize) { self.idle.fetch_add(n, Ordering::AcqRel); }
+
+    // Makes prime pi's table at least l entries long.
+    fn grow(&self, pi: usize, l: usize) {
+        if self.tables[pi].read().unwrap().len() >= l { return; }
+        let mut table = self.tables[pi].write().unwrap();
+        if table.len() < l {
+            // The shorter table is dropped here.
+            *table = roots_new(&self.mont[pi], l, self.gpa);
         }
-        len *= 2;
     }
-    if inverse {
-        let ninv = powmod(n as u64, p - 2, p);
-        for i in 0..n { v[i] = (mont_mul(v[i] as u64, 1, m) * ninv % p) as u32; }
+}
+
+// The transform, in place, without a bit-reversal pass; v.len() is a
+// power of two. Forward, the stages run from the whole array down to
+// pairs (decimation in frequency) and leave the spectrum in bit-reversed
+// order; a pointwise product does not care about the order. The inverse
+// runs the stages from pairs up (decimation in time), which takes that
+// order back to the natural one. It uses the forward roots: that
+// computes n times the inverse transform with its indices negated, so
+// the result's entry i is at (n - i) mod n, where its reader looks for
+// it. The twiddles are in the Montgomery domain, so the values stay in
+// whichever domain they came in.
+fn ntt(v: &mut [u32], table: &[u32], m: &Mont, inverse: bool) {
+    ntt_with(v, table, m, inverse, detect("neon"));
+}
+
+// The transform by the NEON kernels (`neon`, on a machine that has them)
+// or by the scalar butterflies: the same values either way.
+fn ntt_with(v: &mut [u32], table: &[u32], m: &Mont, inverse: bool, neon: bool) {
+    let n = v.len();
+    if neon && detect("neon") && n >= 8 {
+        // The stages of blocks of 8 points and more, two in a pass; the
+        // odd one out is the stage of the whole array.
+        let mut wide = 0;
+        let mut len = n;
+        while len >= 8 {
+            wide += 1;
+            len /= 2;
+        }
+        if !inverse {
+            len = n;
+            if wide % 2 == 1 {
+                dif_stage4(v, &table[len / 2..len], len, m);
+                len /= 2;
+            }
+            while len >= 16 {
+                dif_stages4(v, table, len, m);
+                len /= 4;
+            }
+            dif_tail4(v, table, m);
+        } else {
+            dit_head4(v, table, m);
+            len = 16;
+            while len <= n {
+                dit_stages4(v, table, len, m);
+                len *= 4;
+            }
+            if wide % 2 == 1 { dit_stage4(v, &table[n / 2..n], n, m); }
+        }
+        return;
     }
+    let mut len = if inverse { 2 } else { n };
+    while len >= 2 && len <= n {
+        let tws = &table[len / 2..len];
+        let mut start = 0;
+        while start < n {
+            for k in 0..len / 2 {
+                if inverse { dit_butterfly(v, start + k, start + k + len / 2, tws[k] as u64, m); }
+                else { dif_butterfly(v, start + k, start + k + len / 2, tws[k] as u64, m); }
+            }
+            start += len;
+        }
+        len = if inverse { len * 2 } else { len / 2 };
+    }
+}
+
+// v[i] = v[i] c R^-1 mod p for a constant c below p, four lanes a step:
+// reduced to [0, p) (`full`), or left in (0, 2p).
+fn scale(v: &mut [u32], c: u64, m: &Mont, full: bool) {
+    let mut done = 0;
+    if detect("neon") {
+        let pv = vdupq_n_u32(m.p as u32);
+        let pinv = vdupq_n_u32(m.pinv as u32);
+        let cv = vdupq_n_u32(c as u32);
+        let n = v.len();
+        while done + 4 <= n {
+            let i = done as i64;
+            let t = mont4(vld1q_u32(v, i), cv, pv, pinv);
+            let tp = vaddq_u32(t, pv);
+            vst1q_u32(v, i, if full { vminq_u32(t, tp) } else { tp });
+            done += 4;
+        }
+    }
+    for i in done..v.len() {
+        let t = mont_lazy(v[i] as u64, c, m);
+        v[i] = (if full && t >= m.p { t - m.p } else { t }) as u32;
+    }
+}
+
+// out[i] = a[i] b[i] R^-1 mod p, in (0, 2p), for a and b below 2p.
+fn pointwise(out: &mut [u32], a: &[u32], b: &[u32], m: &Mont) {
+    let mut done = 0;
+    if detect("neon") {
+        let pv = vdupq_n_u32(m.p as u32);
+        let pinv = vdupq_n_u32(m.pinv as u32);
+        let n = out.len();
+        let (a, b) = (&a[..n], &b[..n]);
+        while done + 4 <= n {
+            let i = done as i64;
+            let t = mont4(vld1q_u32(a, i), vld1q_u32(b, i), pv, pinv);
+            vst1q_u32(out, i, vaddq_u32(t, pv));
+            done += 4;
+        }
+    }
+    for i in done..out.len() { out[i] = mont_lazy(a[i] as u64, b[i] as u64, m) as u32; }
 }
 
 // The forward transform of one operand, at l points.
-fn forward_limbs(a: &[u32], l: usize, roots: &Roots<Gpa>, m: &Mont,
+fn forward_limbs(a: &[u32], l: usize, table: &[u32], m: &Mont,
     gpa: Gpa) -> Vec<u32, Gpa> {
-    let p = m.p;
     let mut fa = Vec::from_elem_in(0u32, l, gpa);
-    for i in 0..a.len() { fa[i] = (a[i] as u64 % p) as u32; }
-    ntt(fa.as_mut_slice(), roots, m, false, gpa);
+    fa.as_mut_slice()[..a.len()].copy_from_slice(a);
+    // Into the Montgomery domain, which also brings a limb (below 2^30,
+    // up to six times the smallest prime) into (0, 2p): one product by
+    // R^2 mod p. The zeros above the operand are already there.
+    scale(&mut fa.as_mut_slice()[..a.len()], m.r2, m, false);
+    ntt(fa.as_mut_slice(), table, m, false);
     fa
 }
 
-// The pointwise product of two forward transforms, transformed back.
-fn inverse_product(fa: &[u32], fb: &[u32], roots: &Roots<Gpa>, m: &Mont,
+// The pointwise product of two forward transforms, transformed back:
+// the residues of the product's coefficients, coefficient i at index
+// (n - i) mod n (see `ntt`). The transform leaves n c R for a
+// coefficient c, so one Montgomery product by 1/n mod p, the only pass
+// that reduces to [0, p), gives c itself.
+fn inverse_product(fa: &[u32], fb: &[u32], table: &[u32], m: &Mont,
     gpa: Gpa) -> Vec<u32, Gpa> {
-    let mut out = Vec::from_elem_in(0u32, fa.len(), gpa);
-    for i in 0..fa.len() { out[i] = mont_mul(fa[i] as u64, fb[i] as u64, m) as u32; }
-    ntt(out.as_mut_slice(), roots, m, true, gpa);
+    let n = fa.len();
+    let mut out = Vec::from_elem_in(0u32, n, gpa);
+    pointwise(out.as_mut_slice(), fa, fb, m);
+    ntt(out.as_mut_slice(), table, m, true);
+    scale(out.as_mut_slice(), powmod(n as u64, m.p - 2, m.p), m, true);
     out
 }
 
 // The residues of a * b modulo NTT_PRIMES[pi]: two forward transforms,
 // a pointwise product and an inverse one.
 fn ntt_residues(a: &[u32], b: &[u32], same: bool, pi: usize, l: usize,
-    gpa: Gpa) -> Vec<u32, Gpa> {
-    let p = NTT_PRIMES[pi];
-    let mont = mont_new(p);
-    let roots = roots_new(p, l, gpa);
-    let fa = forward_limbs(a, l, &roots, &mont, gpa);
-    let fb = if same { fa.clone() } else { forward_limbs(b, l, &roots, &mont, gpa) };
-    inverse_product(&fa, &fb, &roots, &mont, gpa)
+    cx: &Engine<Gpa>) -> Vec<u32, Gpa> {
+    let gpa = cx.gpa;
+    let m = &cx.mont[pi];
+    cx.grow(pi, l);
+    let roots = cx.tables[pi].read().unwrap();
+    let table = roots.as_slice();
+    if same {
+        let fa = forward_limbs(a, l, table, m, gpa);
+        return inverse_product(&fa, &fa, table, m, gpa);
+    }
+    // The two forward transforms beside each other, on an idle thread.
+    if l >= NTT_THREADS_MIN && cx.take(1) {
+        let (fa, fb) = thread::scope(|sc| {
+            let h = sc.spawn(move || forward_limbs(a, l, table, m, gpa));
+            let fb = forward_limbs(b, l, table, m, gpa);
+            (h.join().unwrap(), fb)
+        });
+        cx.give(1);
+        return inverse_product(&fa, &fb, table, m, gpa);
+    }
+    let fa = forward_limbs(a, l, table, m, gpa);
+    let fb = forward_limbs(b, l, table, m, gpa);
+    inverse_product(&fa, &fb, table, m, gpa)
 }
 
 // r = a * b (r zeroed), by three NTTs and Garner's reconstruction.
-fn mul_ntt(a: &[u32], b: &[u32], r: &mut [u32], gpa: Gpa) {
+fn mul_ntt(a: &[u32], b: &[u32], r: &mut [u32], cx: &Engine<Gpa>) {
+    let gpa = cx.gpa;
     let need = a.len() + b.len();
     let mut l = 1usize;
     while l < need { l *= 2; }
     let same = a == b; // a square needs two transforms, not three
     let mut res: [Vec<u32, Gpa>; 3] = [Vec::new_in(gpa), Vec::new_in(gpa), Vec::new_in(gpa)];
-    if l >= NTT_THREADS_MIN {
-        // The primes are independent: one thread each. Only the big
-        // products pay for a thread; below this, spawning costs more
-        // than the transform.
+    if l >= NTT_THREADS_MIN && cx.take(2) {
+        // The primes are independent: two on threads of their own, the
+        // third here. Only the big products pay for a thread; below
+        // this, starting one costs more than the transform.
         res = thread::scope(|sc| {
-            let mut hs = Vec::with_capacity_in(3, gpa);
-            for pi in 0..3 { hs.push(sc.spawn(move || ntt_residues(a, b, same, pi, l, gpa))); }
-            let mut out: [Vec<u32, Gpa>; 3] = [Vec::new_in(gpa), Vec::new_in(gpa),
-                Vec::new_in(gpa)];
-            let mut pi = 0;
-            for h in hs {
-                out[pi] = h.join().unwrap();
-                pi += 1;
-            }
-            out
+            let h0 = sc.spawn(move || ntt_residues(a, b, same, 0, l, cx));
+            let h1 = sc.spawn(move || ntt_residues(a, b, same, 1, l, cx));
+            let r2 = ntt_residues(a, b, same, 2, l, cx);
+            [h0.join().unwrap(), h1.join().unwrap(), r2]
         });
+        cx.give(2);
     } else {
-        for pi in 0..3 { res[pi] = ntt_residues(a, b, same, pi, l, gpa); }
+        for pi in 0..3 { res[pi] = ntt_residues(a, b, same, pi, l, cx); }
     }
-    finish_product(&res, need, r, gpa);
+    finish_product(&res, need, r, cx);
 }
 
-// Garner's reconstruction, from the three primes' residues to the limbs
-// of the product (r zeroed).
-fn finish_product(res: &[Vec<u32, Gpa>; 3], need: usize, r: &mut [u32], gpa: Gpa) {
-    let (p1, p2, p3) = (NTT_PRIMES[0], NTT_PRIMES[1], NTT_PRIMES[2]);
-    let inv12 = powmod(p1, p2 - 2, p2);
-    let inv13 = powmod(p1, p3 - 2, p3);
-    let inv23 = powmod(p2, p3 - 2, p3);
-    let (r1, r2, r3) = (res[0].as_slice(), res[1].as_slice(), res[2].as_slice());
-    // Garner: c = pp * x3 + (x1 + p1 * x2), with pp = p1 * p2. A
-    // coefficient is below limbs * BASE^2, hence below 2^77, so it is
-    // assembled in four base-2^32 chunks and carried into base 10^9 with
-    // integer arithmetic only: no bignum is touched per coefficient.
+// Garner's reconstruction of a coefficient c from its residues r1, r2,
+// r3: c = x1 + p1 x2 + p1 p2 x3 with x1 = r1, x2 = (r2 - x1) / p1 mod p2
+// and x3 = (r3 - x1 - p1 x2) / (p1 p2) mod p3. The two divisions are
+// Montgomery products by constants, so a coefficient costs no machine
+// division.
+struct Garner {
+    p1: u64,
+    // (1 / p1) R mod p2, and a multiple of p2 above p1.
+    k2: u64,
+    above2: u64,
+    // (1 / (p1 p2)) R^2 mod p3, and a multiple of p3 above p1 p2.
+    k3: u64,
+    above3: u64,
+    // p1 p2 = pa 2^32 + pb.
+    pa: u64,
+    pb: u64,
+}
+
+fn garner_new(mont: &[Mont; 3]) -> Garner {
+    let (p1, p2, p3) = (mont[0].p, mont[1].p, mont[2].p);
+    let r2 = (1u64 << 32) % p2;
+    let r3 = (1u64 << 32) % p3;
     let pp = p1 * p2;
-    let pa = pp >> 32;
-    let pb = pp & M32;
-    let mut out = Vec::with_capacity_in(need + 1, gpa);
-    let mut carry: u64 = 0;
-    for i in 0..need - 1 {
-        let x1 = r1[i] as u64;
-        let x2 = (r2[i] as u64 + p2 - x1 % p2) % p2 * inv12 % p2;
-        let t = (r3[i] as u64 + p3 - x1 % p3) % p3 * inv13 % p3;
-        let x3 = (t + p3 - x2 % p3) % p3 * inv23 % p3;
-        let low = x1 + p1 * x2; // < 2^57
-        let bx = pb * x3; // < 2^63
-        let ax = pa * x3; // < 2^56, and it enters shifted one chunk
-        let mut l0 = (low & M32) + (bx & M32) + (carry & M32);
-        let mut l1 = (low >> 32) + (bx >> 32) + (ax & M32) + (carry >> 32);
-        let mut l2 = ax >> 32;
-        l1 += l0 >> 32;
-        l0 &= M32;
-        l2 += l1 >> 32;
-        l1 &= M32;
-        let l3 = l2 >> 32;
-        l2 &= M32;
-        // Divide the chunks by BASE; the quotient is the next carry and
-        // is below 2^57, so accumulating it in a u64 cannot overflow.
-        let mut rem: u64 = 0;
-        let mut q: u64 = 0;
-        for chunk in [l3, l2, l1, l0] {
-            let cur = rem * (M32 + 1) + chunk;
-            q = q * (M32 + 1) + cur / BASE;
-            rem = cur % BASE;
-        }
-        out.push(rem as u32);
-        carry = q;
+    Garner {
+        p1,
+        k2: powmod(p1, p2 - 2, p2) * r2 % p2,
+        above2: 3 * p2,
+        k3: powmod(pp % p3, p3 - 2, p3) * r3 % p3 * r3 % p3,
+        above3: p3 << 28,
+        pa: pp >> 32,
+        pb: pp & M32,
     }
-    while carry > 0 {
-        out.push((carry % BASE) as u32);
-        carry /= BASE;
+}
+
+// One coefficient and the carry from the ones below it: the limb at
+// its place and the carry into the next. A coefficient is below
+// 2^24 * BASE^2 < 2^84 and a carry below 2^58, so the sum is split at
+// 2^32 into a high part below 2^56 and a low one, and two u64 divisions
+// by BASE carry it into base 10^9: no bignum per coefficient. (Inlined
+// on request: the loop that calls it is its only caller of weight.)
+#[inline]
+fn coefficient(x1: u64, y2: u64, y3: u64, carry: u64, g: &Garner, m2: &Mont,
+    m3: &Mont) -> (u32, u64) {
+    let x2 = mont_mul(y2 + g.above2 - x1, g.k2, m2);
+    let low = x1 + g.p1 * x2; // < 2^57
+    // (y3 - low) / R mod p3 by one reduction, then times k3.
+    let x3 = mont_mul(mont_mul(y3 + g.above3 - low, 1, m3), g.k3, m3);
+    let s = g.pb * x3 + low + carry; // < 2^62 + 2^57 + 2^58
+    let hi = g.pa * x3 + (s >> 32);
+    let q1 = hi / BASE;
+    let mid = ((hi - q1 * BASE) << 32) | (s & M32);
+    let q0 = mid / BASE;
+    ((mid - q0 * BASE) as u32, (q1 << 32) + q0)
+}
+
+// Coefficients i0..i1 from the three primes' residues into out, their
+// limbs, starting from no carry; the carry out of the last one.
+// Coefficient i is at (n - i) mod n: see `ntt`.
+fn garner_range(res: &[Vec<u32, Gpa>; 3], i0: usize, i1: usize, out: &mut [u32],
+    cx: &Engine<Gpa>) -> u64 {
+    let (g, m2, m3) = (&cx.garner, &cx.mont[1], &cx.mont[2]);
+    let (r1, r2, r3) = (res[0].as_slice(), res[1].as_slice(), res[2].as_slice());
+    let mut carry = 0;
+    let mut first = i0;
+    if i0 == 0 {
+        let (limb, next) = coefficient(r1[0] as u64, r2[0] as u64, r3[0] as u64, 0, g, m2, m3);
+        out[0] = limb;
+        carry = next;
+        first = 1;
     }
-    for i in 0..out.len() { r[i] = out[i]; }
+    // Coefficients first..i1 are at n - first down to n - i1 + 1.
+    let (lo, hi) = (r1.len() + 1 - i1, r1.len() + 1 - first);
+    let residues = r1[lo..hi]
+        .iter()
+        .rev()
+        .zip(r2[lo..hi].iter().rev())
+        .zip(r3[lo..hi].iter().rev());
+    for (((x1, y2), y3), limb) in residues.zip(out[first - i0..].iter_mut()) {
+        let (low, next) = coefficient(*x1 as u64, *y2 as u64, *y3 as u64, carry, g, m2, m3);
+        *limb = low;
+        carry = next;
+    }
+    carry
+}
+
+// r[off..] += carry, a carry out of garner_range (below BASE^2).
+fn add_carry(r: &mut [u32], carry: u64, off: usize) {
+    let limbs: [u32; 2] = [(carry % BASE) as u32, (carry / BASE) as u32];
+    add_at(r, trimmed(&limbs), off);
+}
+
+// Coefficients a product must have before its reconstruction is cut
+// into pieces for idle threads.
+const GARNER_THREADS_MIN: usize = 1 << 13;
+
+// From the three primes' residues to the limbs of the product (r
+// zeroed, of `need` limbs). The coefficients do not depend on each
+// other, only the carries do: with idle threads the range is cut in
+// four (or two), each piece carried from zero, and the pieces' carries
+// are added in afterwards.
+fn finish_product(res: &[Vec<u32, Gpa>; 3], need: usize, r: &mut [u32], cx: &Engine<Gpa>) {
+    let top = need - 1;
+    if top >= GARNER_THREADS_MIN && cx.take(3) {
+        let (c1, c2, c3) = (top / 4, top / 2, top / 4 * 3);
+        let carries = thread::scope(|sc| {
+            let (h0, h1) = r[..top].split_at_mut(c2);
+            let (p0, p1) = h0.split_at_mut(c1);
+            let (p2, p3) = h1.split_at_mut(c3 - c2);
+            let t0 = sc.spawn(move || garner_range(res, 0, c1, p0, cx));
+            let t1 = sc.spawn(move || garner_range(res, c1, c2, p1, cx));
+            let t2 = sc.spawn(move || garner_range(res, c2, c3, p2, cx));
+            let last = garner_range(res, c3, top, p3, cx);
+            [t0.join().unwrap(), t1.join().unwrap(), t2.join().unwrap(), last]
+        });
+        cx.give(3);
+        add_carry(r, carries[0], c1);
+        add_carry(r, carries[1], c2);
+        add_carry(r, carries[2], c3);
+        add_carry(r, carries[3], top);
+    } else if top >= GARNER_THREADS_MIN && cx.take(1) {
+        let mid = top / 2;
+        let carries = thread::scope(|sc| {
+            let (p0, p1) = r[..top].split_at_mut(mid);
+            let t0 = sc.spawn(move || garner_range(res, 0, mid, p0, cx));
+            let last = garner_range(res, mid, top, p1, cx);
+            [t0.join().unwrap(), last]
+        });
+        cx.give(1);
+        add_carry(r, carries[0], mid);
+        add_carry(r, carries[1], top);
+    } else {
+        let carry = garner_range(res, 0, top, &mut r[..top], cx);
+        add_carry(r, carry, top);
+    }
 }
 
 // The residues of x * y1 and of x * y2 modulo NTT_PRIMES[pi]. When both
 // products use the same length, x is transformed once, not twice.
 fn pair_residues(x: &[u32], y1: &[u32], y2: &[u32], pi: usize, l1: usize, l2: usize,
-    gpa: Gpa) -> (Vec<u32, Gpa>, Vec<u32, Gpa>) {
-    let p = NTT_PRIMES[pi];
-    let mont = mont_new(p);
-    let roots1 = roots_new(p, l1, gpa);
-    let fx = forward_limbs(x, l1, &roots1, &mont, gpa);
-    let fy1 = forward_limbs(y1, l1, &roots1, &mont, gpa);
-    let r1 = inverse_product(&fx, &fy1, &roots1, &mont, gpa);
+    cx: &Engine<Gpa>) -> (Vec<u32, Gpa>, Vec<u32, Gpa>) {
+    let gpa = cx.gpa;
+    let m = &cx.mont[pi];
+    cx.grow(pi, if l1 > l2 { l1 } else { l2 });
+    let roots = cx.tables[pi].read().unwrap();
+    let table = roots.as_slice();
+    let fx = forward_limbs(x, l1, table, m, gpa);
+    let fy1 = forward_limbs(y1, l1, table, m, gpa);
+    let r1 = inverse_product(&fx, &fy1, table, m, gpa);
     if l2 == l1 {
-        let fy2 = forward_limbs(y2, l1, &roots1, &mont, gpa);
-        (r1, inverse_product(&fx, &fy2, &roots1, &mont, gpa))
+        let fy2 = forward_limbs(y2, l1, table, m, gpa);
+        (r1, inverse_product(&fx, &fy2, table, m, gpa))
     } else {
-        let roots2 = roots_new(p, l2, gpa);
-        let fx2 = forward_limbs(x, l2, &roots2, &mont, gpa);
-        let fy2 = forward_limbs(y2, l2, &roots2, &mont, gpa);
-        (r1, inverse_product(&fx2, &fy2, &roots2, &mont, gpa))
+        let fx2 = forward_limbs(x, l2, table, m, gpa);
+        let fy2 = forward_limbs(y2, l2, table, m, gpa);
+        (r1, inverse_product(&fx2, &fy2, table, m, gpa))
     }
 }
 
@@ -519,13 +989,14 @@ fn pair_residues(x: &[u32], y1: &[u32], y2: &[u32], pi: usize, l1: usize, l2: us
 // split's combine needs exactly this: P1 P2 with P1 T2, and Q1 Q2 with
 // T1 Q2.
 fn product_pair(x: &BigUint<Gpa>, y1: &BigUint<Gpa>, y2: &BigUint<Gpa>,
-    gpa: Gpa) -> (BigUint<Gpa>, BigUint<Gpa>) {
+    cx: &Engine<Gpa>) -> (BigUint<Gpa>, BigUint<Gpa>) {
+    let gpa = cx.gpa;
     let (xs, a, b) = (x.limbs.as_slice(), y1.limbs.as_slice(), y2.limbs.as_slice());
     let need1 = xs.len() + a.len();
     let need2 = xs.len() + b.len();
     if xs.len() < NTT_MIN || a.len() < NTT_MIN || b.len() < NTT_MIN || need1 > NTT_MAX_LEN
         || need2 > NTT_MAX_LEN {
-        return (x.times(y1), x.times(y2));
+        return (x.times(y1, cx), x.times(y2, cx));
     }
     let mut l1 = 1usize;
     while l1 < need1 { l1 *= 2; }
@@ -533,36 +1004,27 @@ fn product_pair(x: &BigUint<Gpa>, y1: &BigUint<Gpa>, y2: &BigUint<Gpa>,
     while l2 < need2 { l2 *= 2; }
     let mut res1: [Vec<u32, Gpa>; 3] = [Vec::new_in(gpa), Vec::new_in(gpa), Vec::new_in(gpa)];
     let mut res2: [Vec<u32, Gpa>; 3] = [Vec::new_in(gpa), Vec::new_in(gpa), Vec::new_in(gpa)];
-    if l1 >= NTT_THREADS_MIN || l2 >= NTT_THREADS_MIN {
-        let (r1, r2) = thread::scope(|sc| {
-            let mut hs = Vec::with_capacity_in(3, gpa);
-            for pi in 0..3 { hs.push(sc.spawn(move || pair_residues(xs, a, b, pi, l1, l2, gpa))); }
-            let mut out1: [Vec<u32, Gpa>; 3] = [Vec::new_in(gpa), Vec::new_in(gpa),
-                Vec::new_in(gpa)];
-            let mut out2: [Vec<u32, Gpa>; 3] = [Vec::new_in(gpa), Vec::new_in(gpa),
-                Vec::new_in(gpa)];
-            let mut pi = 0;
-            for h in hs {
-                let (u, v) = h.join().unwrap();
-                out1[pi] = u;
-                out2[pi] = v;
-                pi += 1;
-            }
-            (out1, out2)
+    if (l1 >= NTT_THREADS_MIN || l2 >= NTT_THREADS_MIN) && cx.take(2) {
+        let (r0, r1, r2) = thread::scope(|sc| {
+            let h0 = sc.spawn(move || pair_residues(xs, a, b, 0, l1, l2, cx));
+            let h1 = sc.spawn(move || pair_residues(xs, a, b, 1, l1, l2, cx));
+            let r2 = pair_residues(xs, a, b, 2, l1, l2, cx);
+            (h0.join().unwrap(), h1.join().unwrap(), r2)
         });
-        res1 = r1;
-        res2 = r2;
+        cx.give(2);
+        res1 = [r0.0, r1.0, r2.0];
+        res2 = [r0.1, r1.1, r2.1];
     } else {
         for pi in 0..3 {
-            let (u, v) = pair_residues(xs, a, b, pi, l1, l2, gpa);
+            let (u, v) = pair_residues(xs, a, b, pi, l1, l2, cx);
             res1[pi] = u;
             res2[pi] = v;
         }
     }
     let mut out1 = Vec::from_elem_in(0u32, need1, gpa);
     let mut out2 = Vec::from_elem_in(0u32, need2, gpa);
-    finish_product(&res1, need1, out1.as_mut_slice(), gpa);
-    finish_product(&res2, need2, out2.as_mut_slice(), gpa);
+    finish_product(&res1, need1, out1.as_mut_slice(), cx);
+    finish_product(&res2, need2, out2.as_mut_slice(), cx);
     (BigUint::from_limbs(out1), BigUint::from_limbs(out2))
 }
 
@@ -605,6 +1067,44 @@ impl BigUint<Gpa> {
         if carry != 0 { self.limbs.push(carry as u32); }
     }
 
+    // self *= m, in place, for m below WORD_MAX: a limb times m plus a
+    // carry fits a u64.
+    fn mul_word(&mut self, m: u64) {
+        let s = self.limbs.as_mut_slice();
+        let mut carry: u64 = 0;
+        for i in 0..s.len() {
+            let cur = s[i] as u64 * m + carry;
+            carry = cur / BASE;
+            s[i] = (cur - carry * BASE) as u32;
+        }
+        while carry != 0 {
+            self.limbs.push((carry % BASE) as u32);
+            carry /= BASE;
+        }
+    }
+
+    // self *= m, in place, for m below BASE^2: m is two limbs, and limb i
+    // of the product is x[i] lo + x[i - 1] hi plus the carry, which
+    // fits a u64.
+    fn mul_two_limbs(&mut self, m: u64) {
+        let (lo, hi) = (m % BASE, m / BASE);
+        let s = self.limbs.as_mut_slice();
+        let mut carry: u64 = 0;
+        let mut below: u64 = 0;
+        for i in 0..s.len() {
+            let x = s[i] as u64;
+            let cur = x * lo + below * hi + carry;
+            carry = cur / BASE;
+            s[i] = (cur - carry * BASE) as u32;
+            below = x;
+        }
+        carry += below * hi;
+        while carry != 0 {
+            self.limbs.push((carry % BASE) as u32);
+            carry /= BASE;
+        }
+    }
+
     // self /= k, in place, for a small k; the remainder.
     fn div_small(&mut self, k: u32) -> u32 {
         let s = self.limbs.as_mut_slice();
@@ -643,10 +1143,10 @@ impl BigUint<Gpa> {
     }
 
     // self * other, by Karatsuba.
-    fn times(&self, other: &BigUint<Gpa>) -> BigUint<Gpa> {
-        let gpa = *self.limbs.allocator();
+    fn times(&self, other: &BigUint<Gpa>, cx: &Engine<Gpa>) -> BigUint<Gpa> {
+        let gpa = cx.gpa;
         let mut r = Vec::from_elem_in(0u32, self.limbs.len() + other.limbs.len(), gpa);
-        mul_karatsuba(&self.limbs, &other.limbs, &mut r, gpa);
+        mul_karatsuba(&self.limbs, &other.limbs, &mut r, cx);
         BigUint::from_limbs(r)
     }
 }
@@ -654,18 +1154,18 @@ impl BigUint<Gpa> {
 // Longer is larger; at equal lengths, the first limb that differs from
 // the top decides.
 impl Ord for BigUint<Gpa> {
-    fn cmp(&self, other: &BigUint<Gpa>) -> Ordering {
+    fn cmp(&self, other: &BigUint<Gpa>) -> cmp::Ordering {
         let (a, b) = (self.limbs.as_slice(), other.limbs.as_slice());
         if a.len() != b.len() { return a.len().cmp(&b.len()); }
         for i in (0..a.len()).rev() {
             if a[i] != b[i] { return a[i].cmp(&b[i]); }
         }
-        Ordering::Equal
+        cmp::Ordering::Equal
     }
 }
 
 impl PartialOrd for BigUint<Gpa> {
-    fn partial_cmp(&self, other: &BigUint<Gpa>) -> Option<Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &BigUint<Gpa>) -> Option<cmp::Ordering> { Some(self.cmp(other)) }
 }
 
 // Decimal: the top limb as it is, every other one as nine digits.
@@ -815,7 +1315,8 @@ const NEWTON_MIN: usize = 64;
 // precision t the invariant is R ~= BASE^(2t) / b_t; doubling it first
 // rescales R, then one Newton step R' = 2R - b_u R^2 / BASE^(2u) restores
 // the invariant with twice as many correct limbs.
-fn reciprocal(b: &BigUint<Gpa>, s: usize, gpa: Gpa) -> BigUint<Gpa> {
+fn reciprocal(b: &BigUint<Gpa>, s: usize, cx: &Engine<Gpa>) -> BigUint<Gpa> {
+    let gpa = cx.gpa;
     let mut t = if s < NEWTON_MIN { s } else { NEWTON_MIN };
     let bt = rescaled(b, t, gpa);
     let (mut r, _) = div_rem(&pow_base(2 * t, gpa), &bt, gpa);
@@ -823,7 +1324,7 @@ fn reciprocal(b: &BigUint<Gpa>, s: usize, gpa: Gpa) -> BigUint<Gpa> {
         let u = if 2 * t < s { 2 * t } else { s };
         r = shl_limbs(&r, u - t, gpa);
         let bu = rescaled(b, u, gpa);
-        let corr = shr_limbs(&bu.times(&r.times(&r)), 2 * u, gpa);
+        let corr = shr_limbs(&bu.times(&r.times(&r, cx), cx), 2 * u, gpa);
         let mut two = r.clone();
         two.mul_small(2);
         if corr >= two {
@@ -842,21 +1343,22 @@ fn reciprocal(b: &BigUint<Gpa>, s: usize, gpa: Gpa) -> BigUint<Gpa> {
 // correction that makes it exact. Split out so a caller can compute the
 // reciprocal beside something else.
 fn quotient_with_rcp(a: &BigUint<Gpa>, b: &BigUint<Gpa>, rcp: &BigUint<Gpa>, s: usize,
-    gpa: Gpa) -> (BigUint<Gpa>, BigUint<Gpa>) {
+    cx: &Engine<Gpa>) -> (BigUint<Gpa>, BigUint<Gpa>) {
+    let gpa = cx.gpa;
     let n = b.limbs.len();
-    let mut q = shr_limbs(&a.times(rcp), n + s, gpa);
+    let mut q = shr_limbs(&a.times(rcp, cx), n + s, gpa);
     let one = BigUint::from_u64(1, gpa);
-    let mut qb = q.times(b);
+    let mut qb = q.times(b, cx);
     let mut steps = 0;
     // The quotient is a few units off at most; each correction is an
     // addition, not a product.
-    while qb.cmp(a) == Ordering::Greater && steps < 100 {
+    while qb.cmp(a) == cmp::Ordering::Greater && steps < 100 {
         q = q.minus(&one);
         qb = qb.minus(b);
         steps += 1;
     }
     while steps < 100 {
-        if a.minus(&qb).cmp(b) == Ordering::Less { break; }
+        if a.minus(&qb).cmp(b) == cmp::Ordering::Less { break; }
         q = q.plus(&one);
         qb = qb.plus(b);
         steps += 1;
@@ -866,15 +1368,17 @@ fn quotient_with_rcp(a: &BigUint<Gpa>, b: &BigUint<Gpa>, rcp: &BigUint<Gpa>, s: 
 }
 
 // a = q b + r with r < b, for large operands.
-fn div_rem_fast(a: &BigUint<Gpa>, b: &BigUint<Gpa>, gpa: Gpa) -> (BigUint<Gpa>, BigUint<Gpa>) {
+fn div_rem_fast(a: &BigUint<Gpa>, b: &BigUint<Gpa>, cx: &Engine<Gpa>) -> (BigUint<Gpa>,
+    BigUint<Gpa>) {
+    let gpa = cx.gpa;
     if b.is_zero() { panic("superpi: division by zero"); }
     if a < b { return (BigUint::zero(gpa), a.clone()); }
     let n = b.limbs.len();
     let m = a.limbs.len() - n;
     if n < NEWTON_MIN || m < NEWTON_MIN { return div_rem(a, b, gpa); }
     let s = m + 4;
-    let rcp = reciprocal(b, s, gpa);
-    quotient_with_rcp(a, b, &rcp, s, gpa)
+    let rcp = reciprocal(b, s, cx);
+    quotient_with_rcp(a, b, &rcp, s, cx)
 }
 
 // floor(sqrt(n)): Newton's iteration x' = (x + n/x) / 2 on integers,
@@ -896,7 +1400,8 @@ fn isqrt_small(n: &BigUint<Gpa>, gpa: Gpa) -> BigUint<Gpa> {
 // 2u limbs with x scaled up doubles that. Only the last divisions are at
 // full size, and the closing correction compares squares with n itself,
 // so the result is exact.
-fn isqrt(n: &BigUint<Gpa>, gpa: Gpa) -> BigUint<Gpa> {
+fn isqrt(n: &BigUint<Gpa>, cx: &Engine<Gpa>) -> BigUint<Gpa> {
+    let gpa = cx.gpa;
     if n.is_zero() { return BigUint::zero(gpa); }
     let d = n.limbs.len();
     if d <= 2 * NEWTON_MIN { return isqrt_small(n, gpa); }
@@ -907,15 +1412,15 @@ fn isqrt(n: &BigUint<Gpa>, gpa: Gpa) -> BigUint<Gpa> {
         let u = if 2 * t < target { 2 * t } else { target };
         let big_x = shl_limbs(&x, u - t, gpa);
         let nu = rescaled(n, if 2 * u < d { 2 * u } else { d }, gpa);
-        let (y, _) = div_rem_fast(&nu, &big_x, gpa);
+        let (y, _) = div_rem_fast(&nu, &big_x, cx);
         x = big_x.plus(&y);
         x.div_small(2);
         t = u;
     }
     let one = BigUint::from_u64(1, gpa);
-    let mut sq = x.times(&x);
+    let mut sq = x.times(&x, cx);
     let mut steps = 0;
-    while sq.cmp(n) == Ordering::Greater && steps < 100 {
+    while sq.cmp(n) == cmp::Ordering::Greater && steps < 100 {
         // (x - 1)^2 = sq - 2x + 1.
         let mut twox = x.clone();
         twox.mul_small(2);
@@ -928,7 +1433,7 @@ fn isqrt(n: &BigUint<Gpa>, gpa: Gpa) -> BigUint<Gpa> {
         let mut twox = x.clone();
         twox.mul_small(2);
         let next = sq.plus(&twox).plus(&one);
-        if next.cmp(n) == Ordering::Greater { break; }
+        if next.cmp(n) == cmp::Ordering::Greater { break; }
         sq = next;
         x = x.plus(&one);
         steps += 1;
@@ -957,49 +1462,124 @@ fn signed_add(a: BigUint<Gpa>, aneg: bool, b: BigUint<Gpa>, bneg: bool,
     if a > b { (a.minus(&b), aneg) } else { (b.minus(&a), bneg) }
 }
 
-// Terms a..b of the series, as (P, Q, T) with T/Q the partial sum.
-fn binary_split(a: u64, b: u64, gpa: Gpa) -> Split<Gpa> {
-    if b - a == 1 {
-        if a == 0 {
-            return Split {
-                p: BigUint::from_u64(1, gpa),
-                q: BigUint::from_u64(1, gpa),
-                t: BigUint::from_u64(13591409, gpa),
-                neg: false,
-            };
+// Ranges of at least this many terms may give a half to another thread.
+const SPLIT_THREADS_MIN: u64 = 512;
+
+// Ranges of at most this many terms are computed term by term.
+const LEAF_TERMS: u64 = 16;
+
+// Multipliers below this keep limb * m + carry inside a u64.
+const WORD_MAX: u64 = 1 << 33;
+
+// x *= f1 f2 ... for factors below 2^32, with as few passes over x as
+// the factors' products below WORD_MAX allow.
+fn mul_factors(x: &mut BigUint<Gpa>, factors: &[u64]) {
+    let mut m: u64 = 1;
+    for f in factors.iter().copied() {
+        if m * f < WORD_MAX {
+            m *= f;
+        } else {
+            x.mul_word(m);
+            m = f;
         }
-        let p = BigUint::from_u64(6 * a - 5, gpa)
-            .times(&BigUint::from_u64(2 * a - 1, gpa))
-            .times(&BigUint::from_u64(6 * a - 1, gpa));
-        let aa = BigUint::from_u64(a, gpa);
-        let q = aa.times(&aa).times(&aa).times(&BigUint::from_u64(C3_OVER_24, gpa));
-        let t = p.times(&BigUint::from_u64(13591409 + 545140134 * a, gpa));
-        return Split { p, q, t, neg: a % 2 == 1 };
     }
+    if m != 1 { x.mul_word(m); }
+}
+
+// Term k's factor of P, (6k-5)(2k-1)(6k-1), and of Q, k^3 640320^3/24,
+// as factors below 2^32 (k is below 2^29: 7 billion digits).
+fn p_factors(k: u64) -> [u64; 3] { [6 * k - 5, 2 * k - 1, 6 * k - 1] }
+
+fn q_factors(k: u64) -> [u64; 6] { [k, k, k, 26680, 640320, 640320] }
+
+// Terms a..b, for a short range, without a product of two big numbers:
+// appending term k to (P, Q, T) is P' = P p_k, Q' = Q q_k and
+// T' = T q_k +- P' (A + B k), the combine below with one term on the
+// right, and every factor fits a machine word, so each step is a few
+// passes of limb-by-word multiplies in place. No one-limb BigUint is
+// allocated per factor and no product routine is entered.
+fn leaf(a: u64, b: u64, gpa: Gpa) -> Split<Gpa> {
+    let mut p = BigUint::from_u64(1, gpa);
+    let mut q = BigUint::from_u64(1, gpa);
+    if a > 0 {
+        mul_factors(&mut p, &p_factors(a));
+        mul_factors(&mut q, &q_factors(a));
+    }
+    let mut t = p.clone();
+    t.mul_two_limbs(series_coefficient(a));
+    let mut neg = a % 2 == 1;
+    for k in a + 1..b {
+        mul_factors(&mut p, &p_factors(k));
+        mul_factors(&mut q, &q_factors(k));
+        mul_factors(&mut t, &q_factors(k));
+        let mut add = p.clone();
+        add.mul_two_limbs(series_coefficient(k));
+        let (sum, sign) = signed_add(t, neg, add, k % 2 == 1, gpa);
+        t = sum;
+        neg = sign;
+    }
+    Split { p, q, t, neg }
+}
+
+// Term k's coefficient, 13591409 + 545140134 k: below 2^59 and with no
+// factors to rely on, so it multiplies as a number of two limbs.
+fn series_coefficient(k: u64) -> u64 { 13591409 + 545140134 * k }
+
+// Terms a..b of the series, as (P, Q, T) with T/Q the partial sum. P is
+// only ever used by a range's parent, so the whole sum (`root`) does not
+// compute it.
+fn binary_split(a: u64, b: u64, root: bool, cx: &Engine<Gpa>) -> Split<Gpa> {
+    if b - a <= LEAF_TERMS { return leaf(a, b, cx.gpa); }
     let mid = (a + b) / 2;
-    let left = binary_split(a, mid, gpa);
-    let right = binary_split(mid, b, gpa);
+    // The halves are independent: the left one on a thread of its own
+    // when one is idle and the range is worth it.
+    if b - a >= SPLIT_THREADS_MIN && cx.take(1) {
+        let (left, right) = thread::scope(|sc| {
+            let h = sc.spawn(move || binary_split(a, mid, false, cx));
+            let right = binary_split(mid, b, false, cx);
+            (h.join().unwrap(), right)
+        });
+        cx.give(1);
+        return combine(&left, &right, root, cx);
+    }
+    let left = binary_split(a, mid, false, cx);
+    let right = binary_split(mid, b, false, cx);
+    combine(&left, &right, root, cx)
+}
+
+// (P, Q, T) of two adjacent ranges into their union's:
+// P = P1 P2, Q = Q1 Q2, T = T1 Q2 + P1 T2.
+fn combine(left: &Split<Gpa>, right: &Split<Gpa>, root: bool, cx: &Engine<Gpa>) -> Split<Gpa> {
+    let gpa = cx.gpa;
     // Two shared-operand pairs: P = P1 P2 and P1 T2, then Q = Q1 Q2 and
     // T1 Q2, each sharing one forward transform.
-    let (p, tr) = product_pair(&left.p, &right.p, &right.t, gpa);
-    let (q, tl) = product_pair(&right.q, &left.q, &left.t, gpa);
+    let (p, tr) = if root { (BigUint::zero(gpa), left.p.times(&right.t, cx)) }
+        else { product_pair(&left.p, &right.p, &right.t, cx) };
+    let (q, tl) = product_pair(&right.q, &left.q, &left.t, cx);
     let (t, neg) = signed_add(tl, left.neg, tr, right.neg, gpa);
     Split { p, q, t, neg }
 }
 
 // floor(pi * 10^scale), as a BigUint.
-fn chudnovsky(digits: i64, scale: i64, timings: bool, gpa: Gpa) -> BigUint<Gpa> {
+fn chudnovsky(digits: i64, scale: i64, timings: bool, threads: usize, gpa: Gpa) -> BigUint<Gpa> {
     let terms = ((digits + GUARD) / DIGITS_PER_TERM + 1) as u64;
+    let cx = &Engine::with_threads(threads, gpa);
     let t0 = now_ns();
     // sqrt(10005) at 10^scale: the integer root of 10005 * 10^(2 scale).
     // It depends on nothing in the series, so it runs beside the split.
     let mut radicand = pow10((2 * scale) as usize, gpa);
     radicand.mul_small(10005);
-    let (s, root) = thread::scope(|sc| {
-        let h = sc.spawn(move || isqrt(&radicand, gpa));
-        let s = binary_split(0, terms, gpa);
-        (s, h.join().unwrap())
-    });
+    let beside = cx.take(1);
+    let (s, root) = if beside {
+        thread::scope(|sc| {
+            let h = sc.spawn(move || isqrt(&radicand, cx));
+            let s = binary_split(0, terms, true, cx);
+            (s, h.join().unwrap())
+        })
+    } else {
+        let root = isqrt(&radicand, cx);
+        (binary_split(0, terms, true, cx), root)
+    };
     let t1 = now_ns();
     if s.neg { panic("superpi: the series' sum came out negative"); }
     // The reciprocal needs only T, the numerator only the root and Q, so
@@ -1007,13 +1587,20 @@ fn chudnovsky(digits: i64, scale: i64, timings: bool, gpa: Gpa) -> BigUint<Gpa> 
     // length, and more precision only makes the estimate better.
     let prec = root.limbs.len() + s.q.limbs.len() - s.t.limbs.len() + 5;
     let divisor = &s.t;
-    let (num, rcp) = thread::scope(|sc| {
-        let h = sc.spawn(move || reciprocal(divisor, prec, gpa));
-        let mut num = root.times(&s.q);
+    let (num, rcp) = if beside {
+        thread::scope(|sc| {
+            let h = sc.spawn(move || reciprocal(divisor, prec, cx));
+            let mut num = root.times(&s.q, cx);
+            num.mul_small(426880);
+            (num, h.join().unwrap())
+        })
+    } else {
+        let mut num = root.times(&s.q, cx);
         num.mul_small(426880);
-        (num, h.join().unwrap())
-    });
-    let (q, _) = quotient_with_rcp(&num, &s.t, &rcp, prec, gpa);
+        (num, reciprocal(divisor, prec, cx))
+    };
+    if beside { cx.give(1); }
+    let (q, _) = quotient_with_rcp(&num, &s.t, &rcp, prec, cx);
     let t2 = now_ns();
     if timings {
         eprintln("  split and sqrt together {:.1} ms, divide {:.1} ms", ms(t0, t1), ms(t1, t2));
@@ -1065,29 +1652,40 @@ fn now_ns() -> i64 {
 fn ms(t0: i64, t1: i64) -> f64 { (t1 - t0) as f64 / 1e6 }
 
 // The scaled integer as digits + 1 characters, zero-padded on the left:
-// one digit before the decimal point, then the fractional ones.
+// one digit before the decimal point, then the fractional ones. A limb
+// is nine digits, written from its last one back.
 fn scaled_text(x: &BigUint<Gpa>, scale: i64, gpa: Gpa) -> String<Gpa> {
-    let text = format_in("{x}", gpa);
-    let mut out = String::new_in(gpa);
-    for _ in text.len()..(scale + 1) as usize { out.push_str("0"); }
-    out.push_str(text.as_str());
-    out
+    let digits = x.digits() as usize;
+    let width = if digits > (scale + 1) as usize { digits } else { (scale + 1) as usize };
+    let mut bytes = Vec::from_elem_in(b'0', width, gpa);
+    let s = x.limbs.as_slice();
+    for i in 0..s.len() {
+        let mut limb = s[i];
+        let mut at = width - 9 * i;
+        while limb != 0 {
+            at -= 1;
+            bytes[at] = b'0' + (limb % 10) as u8;
+            limb /= 10;
+        }
+    }
+    String::from_utf8(bytes).unwrap()
 }
 
-// "3." then the digits in groups of ten, fifty to a line.
-fn print_digits(text: &str, digits: i64) {
-    print("{}.", &text[..1]);
+// "3." then the digits in groups of ten, fifty to a line: put together
+// first and written once.
+fn print_digits(text: &str, digits: i64, gpa: Gpa) {
+    let mut out = String::with_capacity_in((digits + digits / 8 + 16) as usize, gpa);
+    out.push_str(&text[..1]);
+    out.push_str(".");
     let mut done: i64 = 0;
     while done < digits {
-        if done > 0 {
-            if done % 50 == 0 { print("\n  "); } else { print(" "); }
-        }
+        if done > 0 { out.push_str(if done % 50 == 0 { "\n  " } else { " " }); }
         let start = (1 + done) as usize;
         let n = if digits - done < 10 { digits - done } else { 10 };
-        print("{}", &text[start..start + n as usize]);
+        out.push_str(&text[start..start + n as usize]);
         done += n;
     }
-    println("");
+    println("{}", out);
 }
 
 fn main(gpa: Gpa) -> i32 {
@@ -1096,6 +1694,8 @@ fn main(gpa: Gpa) -> i32 {
         .about("pi to any number of digits: Chudnovsky's series, binary splitting, Karatsuba limbs")
         .arg(Arg::positional("digits").value_name("N").default("1000")
             .help("digits after the decimal point"))
+        .arg(Arg::option("threads").value_name("N").default("0")
+            .help("threads at most (0: one per core)"))
         .arg(Arg::flag("no-check").help("skip the Machin-formula cross-check"))
         .arg(Arg::flag("check").help("cross-check even above 10000 digits (quadratic)"));
     let m = cmd.parse_or_exit(env::args());
@@ -1107,13 +1707,21 @@ fn main(gpa: Gpa) -> i32 {
         eprintln("superpi: digits must not be negative");
         return 2;
     }
+    let threads = match m.get_as::<i64>("threads") {
+        Ok(n) => n,
+        Err(e) => cmd.exit(e),
+    };
+    if threads < 0 {
+        eprintln("superpi: threads must not be negative");
+        return 2;
+    }
     let scale = digits + GUARD;
     println("superpi: {digits} digits after the decimal point");
     let t0 = now_ns();
-    let pi = chudnovsky(digits, scale, true, gpa);
+    let pi = chudnovsky(digits, scale, true, threads as usize, gpa);
     let t1 = now_ns();
     let text = scaled_text(&pi, scale, gpa);
-    print_digits(text.as_str(), digits);
+    print_digits(text.as_str(), digits, gpa);
     eprintln("{digits} digits: Chudnovsky {:.1} ms", ms(t0, t1));
 
     let check = !m.flag("no-check") && (digits <= CHECK_LIMIT || m.flag("check"));
@@ -1180,6 +1788,7 @@ fn division_small_cases(gpa: Gpa) {
 // a divisor just below a power of the base (the add-back path).
 #[test]
 fn division_identity(gpa: Gpa) {
+    let cx = &Engine::new(gpa);
     let mut rng = Rng::new(2026);
     for i in 0..60 {
         let na = 1 + (rng.next() % 40) as usize;
@@ -1196,7 +1805,7 @@ fn division_identity(gpa: Gpa) {
         if b.is_zero() { continue; }
         let (q, r) = div_rem(&a, &b, gpa);
         assert !(r < b);
-        assert_eq !(q.times(&b).plus(&r), a);
+        assert_eq !(q.times(&b, cx).plus(&r), a);
     }
 }
 
@@ -1212,33 +1821,43 @@ fn mul_reference(a: &BigUint<Gpa>, b: &BigUint<Gpa>, gpa: Gpa) -> BigUint<Gpa> {
 // transform's threshold, including squares and lopsided operands.
 #[test]
 fn products_match_schoolbook(gpa: Gpa) {
+    let cx = &Engine::new(gpa);
     let mut rng = Rng::new(99);
-    let sizes: [usize; 12] = [1, 7, 95, 96, 200, 511, 512, 513, 700, 1024, 2048, 3000];
+    let sizes: [usize; 14] = [1, 7, 127, 128, 200, 255, 256, 257, 511, 512, 700, 1024, 2048, 3000];
     for n in sizes {
         let a = rng.big(n, gpa);
         let b = rng.big(n, gpa);
-        assert_eq !(a.times(&b), mul_reference(&a, &b, gpa));
-        assert_eq !(a.times(&a), mul_reference(&a, &a, gpa));
+        assert_eq !(a.times(&b, cx), mul_reference(&a, &b, gpa));
+        assert_eq !(a.times(&a, cx), mul_reference(&a, &a, gpa));
     }
     let a = rng.big(3000, gpa);
     let b = rng.big(600, gpa);
-    assert_eq !(a.times(&b), mul_reference(&a, &b, gpa));
-    assert_eq !(b.times(&a), mul_reference(&a, &b, gpa));
+    assert_eq !(a.times(&b, cx), mul_reference(&a, &b, gpa));
+    assert_eq !(b.times(&a, cx), mul_reference(&a, &b, gpa));
+    // Long enough for the threads: the primes side by side and the
+    // reconstruction in pieces, and the same with one thread only.
+    let a = rng.big(5000, gpa);
+    let b = rng.big(4500, gpa);
+    let reference = mul_reference(&a, &b, gpa);
+    assert_eq !(a.times(&b, cx), reference);
+    assert_eq !(a.times(&b, &Engine::with_threads(1, gpa)), reference);
+    assert_eq !(a.times(&b, &Engine::with_threads(2, gpa)), reference);
 }
 
 // The Newton division, on operands large enough to take that path: the
 // identity is exact whatever approximation was used inside.
 #[test]
 fn fast_division_identity(gpa: Gpa) {
+    let cx = &Engine::new(gpa);
     let mut rng = Rng::new(4242);
     let shapes: [(usize, usize); 8] = [(200, 70), (300, 65), (400, 200), (1000, 64), (1000, 500),
         (2000, 1000), (500, 499), (129, 128)];
     for (na, nb) in shapes {
         let a = rng.big(na, gpa);
         let b = rng.big(nb, gpa);
-        let (q, r) = div_rem_fast(&a, &b, gpa);
+        let (q, r) = div_rem_fast(&a, &b, cx);
         assert !(r < b);
-        assert_eq !(q.times(&b).plus(&r), a);
+        assert_eq !(q.times(&b, cx).plus(&r), a);
         assert_eq !(q, div_rem(&a, &b, gpa).0);
     }
 }
@@ -1247,22 +1866,78 @@ fn fast_division_identity(gpa: Gpa) {
 // that exercise the transform path and a length mismatch.
 #[test]
 fn product_pairs_match(gpa: Gpa) {
+    let cx = &Engine::new(gpa);
     let mut rng = Rng::new(5150);
     for n in [600usize, 1200] {
         let x = rng.big(n, gpa);
         let y1 = rng.big(n, gpa);
         let y2 = rng.big(n - 100, gpa);
-        let (p1, p2) = product_pair(&x, &y1, &y2, gpa);
+        let (p1, p2) = product_pair(&x, &y1, &y2, cx);
         assert_eq !(p1, mul_reference(&x, &y1, gpa));
         assert_eq !(p2, mul_reference(&x, &y2, gpa));
     }
+}
+
+// The NEON kernels against the scalar butterflies, forward and inverse,
+// for every prime: the same values at every point, and the inverse of
+// the forward transform is the input.
+#[test]
+fn transforms_agree(gpa: Gpa) {
+    let mut rng = Rng::new(1234);
+    for pi in 0..3 {
+        let m = mont_new(pi);
+        let p = m.p;
+        for n in [8usize, 16, 32, 64, 1024, 2048] {
+            let roots = roots_new(&m, n, gpa);
+            let mut a: Vec<u32, Gpa> = Vec::with_capacity_in(n, gpa);
+            for _ in 0..n { a.push((rng.next() % p) as u32); }
+            let mut b = a.clone();
+            let input = a.clone();
+            ntt_with(a.as_mut_slice(), &roots, &m, false, true);
+            ntt_with(b.as_mut_slice(), &roots, &m, false, false);
+            // The spectrum is left unreduced: the same residues.
+            for i in 0..n { assert_eq !(a[i] as u64 % p, b[i] as u64 % p); }
+            // The inverse of the spectrum is n times the input, entry i
+            // at (n - i) mod n.
+            ntt_with(a.as_mut_slice(), &roots, &m, true, true);
+            ntt_with(b.as_mut_slice(), &roots, &m, true, false);
+            for i in 0..n {
+                assert_eq !(a[i] as u64 % p, b[i] as u64 % p);
+                assert_eq !(a[(n - i) % n] as u64 % p, input[i] as u64 * n as u64 % p);
+            }
+        }
+    }
+}
+
+// A leaf's term-by-term recurrence against the combine of single terms,
+// at the start of the series (term 0 is special), at an odd start and
+// where the factors stop sharing a word.
+#[test]
+fn leaves_match_combines(gpa: Gpa) {
+    let cx = &Engine::new(gpa);
+    let ranges: [(u64, u64); 5] = [(0, 16), (1, 10), (7, 8), (26750, 26760), (5000000, 5000012)];
+    for (a, b) in ranges {
+        let mut by_terms = leaf(a, a + 1, gpa);
+        for k in a + 1..b { by_terms = combine(&by_terms, &leaf(k, k + 1, gpa), false, cx); }
+        let whole = leaf(a, b, gpa);
+        assert_eq !(whole.p, by_terms.p);
+        assert_eq !(whole.q, by_terms.q);
+        assert_eq !(whole.t, by_terms.t);
+        assert_eq !(whole.neg, by_terms.neg);
+    }
+    // One term, against its definition.
+    let one = leaf(3, 4, gpa);
+    assert_eq !(one.p, BigUint::from_u64(13 * 5 * 17, gpa));
+    assert_eq !(one.q, BigUint::from_u64(27 * C3_OVER_24, gpa));
+    assert_eq !(one.t, BigUint::from_u64(13 * 5 * 17 * (13591409 + 3 * 545140134), gpa));
+    assert !(one.neg);
 }
 
 // Large enough that the split's combines go through the transform.
 #[test]
 fn large_pi_agrees(gpa: Gpa) {
     let scale = 5000 + GUARD;
-    let a = chudnovsky(5000, scale, false, gpa);
+    let a = chudnovsky(5000, scale, false, 0, gpa);
     let b = machin(scale, gpa);
     let ta = scaled_text(&a, scale, gpa);
     let tb = scaled_text(&b, scale, gpa);
@@ -1272,36 +1947,37 @@ fn large_pi_agrees(gpa: Gpa) {
 // isqrt is exact on squares and their neighbours.
 #[test]
 fn square_roots(gpa: Gpa) {
+    let cx = &Engine::new(gpa);
     for n in 0..2000u64 {
-        assert_eq !(isqrt(&BigUint::from_u64(n, gpa), gpa), BigUint::from_u64(
+        assert_eq !(isqrt(&BigUint::from_u64(n, gpa), cx), BigUint::from_u64(
             (n as f64).sqrt() as u64, gpa));
     }
     let mut rng = Rng::new(7);
     for _ in 0..10 {
         let nx = 1 + (rng.next() % 12) as usize;
         let x = rng.big(nx, gpa);
-        let sq = x.times(&x);
-        assert_eq !(isqrt(&sq, gpa), x);
+        let sq = x.times(&x, cx);
+        assert_eq !(isqrt(&sq, cx), x);
         let one = BigUint::from_u64(1, gpa);
-        assert_eq !(isqrt(&sq.plus(&one), gpa), x);
-        if !x.is_zero() { assert_eq !(isqrt(&sq.minus(&one), gpa), x.minus(&one)); }
+        assert_eq !(isqrt(&sq.plus(&one), cx), x);
+        if !x.is_zero() { assert_eq !(isqrt(&sq.minus(&one), cx), x.minus(&one)); }
     }
     // Large squares, where the root's precision doubles: exact on the
     // square and both neighbours, not merely close.
     for n in [100usize, 300, 1000] {
         let x = rng.big(n, gpa);
-        let sq = x.times(&x);
+        let sq = x.times(&x, cx);
         let one = BigUint::from_u64(1, gpa);
-        assert_eq !(isqrt(&sq, gpa), x);
-        assert_eq !(isqrt(&sq.plus(&one), gpa), x);
-        assert_eq !(isqrt(&sq.minus(&one), gpa), x.minus(&one));
+        assert_eq !(isqrt(&sq, cx), x);
+        assert_eq !(isqrt(&sq.plus(&one), cx), x);
+        assert_eq !(isqrt(&sq.minus(&one), cx), x.minus(&one));
     }
 }
 
 // The first hundred digits, against the published expansion.
 #[test]
 fn pi_first_hundred(gpa: Gpa) {
-    let pi = chudnovsky(100, 100 + GUARD, false, gpa);
+    let pi = chudnovsky(100, 100 + GUARD, false, 1, gpa);
     let text = scaled_text(&pi, 100 + GUARD, gpa);
     assert_eq !(&text.as_str()[..101],
         "31415926535897932384626433832795028841971693993751058209749445923078164062862089986280348253421170679");
@@ -1311,7 +1987,7 @@ fn pi_first_hundred(gpa: Gpa) {
 #[test]
 fn machin_agrees(gpa: Gpa) {
     let scale = 200 + GUARD;
-    let a = chudnovsky(200, scale, false, gpa);
+    let a = chudnovsky(200, scale, false, 0, gpa);
     let b = machin(scale, gpa);
     let ta = scaled_text(&a, scale, gpa);
     let tb = scaled_text(&b, scale, gpa);
