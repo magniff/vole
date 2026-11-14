@@ -131,6 +131,11 @@ defined:
   operations inside that need unsafe; `none (unneeded)`: a block with
   nothing unsafe inside, to remove. `--unjustified`, `--unneeded`,
   `--summary` (counts by class, module, file), `--json`, `--no-std`.
+  `--source` (0.30) prints each site's lines under it, and `volec edit
+  justify FILE:LINE --unsafe TEXT --safety TEXT` writes the two comments
+  above the site (`--from LIST` for many, a site a line:
+  `FILE:LINE<TAB>UNSAFE TEXT<TAB>SAFETY TEXT`, the lines of one `query
+  unsafe` run).
 - `volec fix --only unneeded-unsafe` (0.25.4) takes the `none
   (unneeded)` blocks away and keeps their code in its scope, over
   several lines too (a `let`'s value, an `if` or `while` condition), laid
