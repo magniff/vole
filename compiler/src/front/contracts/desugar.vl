@@ -31,7 +31,7 @@ use crate::front::generics::instantiate::fn_instance;
 use crate::front::lexer::{Tok, add_string};
 use crate::front::modules::within_std;
 use crate::front::patterns::check_pattern;
-use crate::front::types::{TY_F64, TY_I64, TY_UNIT, fn_param, is_compound, is_void};
+use crate::front::types::{TY_F64, TY_I64, TY_UNIT, TyKind, fn_param, is_compound, is_void};
 
 fn words(pcx: &mut Ctx<Comp>) {
     if pcx.desugar_words {
@@ -138,7 +138,12 @@ pub fn desugar_call(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // index): `{ let ?aI = argI; ...; pre(SITE, ?a0, ..); f(?a0, ..) }`. An
 // argument that is a simple read (a local, a literal, `&place` of one) is
 // read again instead of bound: nothing runs between the two calls, and a
-// borrow stays a borrow (`&v` passed to `self: *Vec<T>`).
+// borrow stays a borrow (`&v` passed to `self: *Vec<T>`). But a receiver's
+// autoref `&mut v` is bound first, `let ?a0 = &mut v`, when a later
+// argument is bound (it runs code): rustc's receiver is reserved before
+// the arguments are evaluated, two-phase (places/build.vl writer_autoref),
+// so `v.insert(0, { v.clear(); 9 })` is E0499 as `v.push({ v.clear(); 9
+// })` is, and `v.insert(0, v.len())` is accepted.
 fn requires_call(n: i64, pre: i64, pcx: &mut Ctx<Comp>) {
     words(pcx);
     let start = pcx.nodes[n as usize].start;
@@ -150,9 +155,15 @@ fn requires_call(n: i64, pre: i64, pcx: &mut Ctx<Comp>) {
     // The arguments' lets, checked by hand (their values are).
     push_scope(pcx);
     let lets = list_begin(pcx);
+    let bind_recv = receiver_reserved(n, pcx);
+    if bind_recv {
+        // (the autoref is a `&mut`: writer_autoref reads the flag)
+        let a = child(n, 0, pcx);
+        pcx.nodes[a as usize].p |= crate::front::ast::NODE_REF_MUT;
+    }
     for i in 0..count {
         let arg = child(n, i, pcx);
-        if simple_read(arg, 0, pcx) {
+        if simple_read(arg, 0, pcx) && !(i == 0 && bind_recv) {
             continue;
         }
         buf_clear(pcx.text);
@@ -182,12 +193,12 @@ fn requires_call(n: i64, pre: i64, pcx: &mut Ctx<Comp>) {
     let pm = list_begin(pcx);
     list_push(site, pcx);
     for i in 0..count {
-        list_push(arg_use(child(n, i, pcx), i, pcx), pcx);
+        list_push(arg_use(child(n, i, pcx), i, i == 0 && bind_recv, pcx), pcx);
     }
     list_end(pc, pm, pcx);
     let im = list_begin(pcx);
     for i in 0..count {
-        list_push(arg_use(child(n, i, pcx), i, pcx), pcx);
+        list_push(arg_use(child(n, i, pcx), i, i == 0 && bind_recv, pcx), pcx);
     }
     list_end(inner, im, pcx);
     pop_scope(pcx);
@@ -335,9 +346,10 @@ pub fn requires_arg(n: i64, pcx: &Ctx<Comp>) -> i64 {
 }
 
 // Argument i of the call as passed to each of the two calls: a copy of a
-// simple read, or an Ident of its let (`?aI`), checked: it names the local.
-fn arg_use(arg: i64, i: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    if simple_read(arg, 0, pcx) {
+// simple read (unless `bound`: requires_call bound it), or an Ident of its
+// let (`?aI`), checked: it names the local.
+fn arg_use(arg: i64, i: i64, bound: bool, pcx: &mut Ctx<Comp>) -> i64 {
+    if simple_read(arg, 0, pcx) && !bound {
         return copy_read(arg, pcx);
     }
     buf_clear(pcx.text);
@@ -349,6 +361,31 @@ fn arg_use(arg: i64, i: i64, pcx: &mut Ctx<Comp>) -> i64 {
     synth_expr(id, pcx);
     pcx.arg_of.put(id + 1, arg + 1);
     id
+}
+
+// RULE: D7.4 (0.30.1) Whether call n's receiver is an autoref `&mut P`
+// (its span the place's, as places/build.vl writer_autoref reads it) to be
+// reserved before its later arguments, one of which runs code (is no
+// simple read): requires_call then binds it first, `?a0`.
+fn receiver_reserved(n: i64, pcx: &Ctx<Comp>) -> bool {
+    let count = pcx.nodes[n as usize].count;
+    if count < 2 {
+        return false;
+    }
+    let a = child(n, 0, pcx);
+    let t = pcx.nodes[a as usize].ty;
+    if pcx.nodes[a as usize].kind != NodeKind::Unary || pcx.nodes[a as usize].op != Tok::Amp
+        || pcx.nodes[a as usize].start != pcx.nodes[pcx.nodes[a as usize].b as usize].start
+        || t <= 0 || pcx.types[t as usize].kind != TyKind::Ptr
+        || pcx.types[t as usize].b != crate::front::types::REF_MUT {
+        return false;
+    }
+    for i in 1..count {
+        if !simple_read(child(n, i, pcx), 0, pcx) {
+            return true;
+        }
+    }
+    false
 }
 
 // Whether checked node n is a read that may be repeated: a literal, a

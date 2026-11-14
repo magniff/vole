@@ -264,7 +264,14 @@ no index); and an assignment's right side when the assigned place
 evaluates with no statement of its own (a name, and `*`, `.f`, `.0` of
 one: `*b += *a`). Moves are unchanged (D8.5's in-order rule; a
 rust-edition argument moved out of a place already gets its own `_t =
-move P`). MVS keeps the deferred read. Consequences: `x = &mut *x`
+move P`). MVS keeps the deferred read. (0.30.1, RT-26) An aggregate's part that
+moves a place (a tuple's, an array's, a struct literal's, a variant's)
+is moved where it is evaluated, `_t = move P`, as a call's argument is
+(places/build.vl settle_move), but the last part, which nothing follows:
+`(s, { s = t; 0 })` holds the old `s`, `[w, { w = new; x }]` leaves `w`
+the new value, and `[w, w.clone()]` is E0382 at the clone; before, every
+part was moved at the aggregate, after the later parts had run.
+Consequences: `x = &mut *x`
 (`x: &'x mut T`):
 (2) borrows `*x` with the supporting-prefix constraint `'x : 'new`; (3)
 the shallow write to `x` meets other loans of `*x…` as `Extends` through
@@ -435,6 +442,37 @@ outlives the function (`fn g() -> &'static [i64] { &[1, 2] }`) is still
 `borrowck.return_local`. A loop that holds the last iteration's
 reference while it evaluates the borrow again is
 `borrowck.assign_borrowed`, where rustc has a single static.
+
+**D2.9 (the checker's hidden bindings of a place; 0.30.1).** The checker
+desugars a format call's holes into hidden `let =fK = e;` bindings
+(front/check/interp.vl, format.vl), an overloaded comparison into `{ let
+==l = a; let ==r = b; ==l.eq(&==r) }` (front/traits.vl operator_call,
+front/check/equality.vl structural_eq), a `p as NonNull<T>` into `{ let
+==nn = p; .. }`. When `e` is a place `P`, the builder (places/build.vl
+rust_let_place, hidden_borrow) first borrows it, `_k = &'k P`
+(`BK_SHARED`), then reads the binding through the borrow, `_b = copy
+(*_k)` (a whole `&mut T`: `_b = &(**_k)`), and the scope that holds the
+desugaring's `let`s ends with `mention _k` before the binding's
+`StorageDead`: the loan is in scope to the end of the call or the
+comparison, rustc's `format_args` taking `&arg` for each argument and
+`PartialEq::eq(&a, &b)`. So a later hole or the other operand that moves,
+writes or lends `P` mutably is `move_borrowed` (E0505), `assign_borrowed`
+(E0506) or `conflict` (E0502) at its position, the loan the hole's; a
+read of `P` while it is lent mutably is one access, the borrow's (E0502,
+`conflict`; before, the copy's E0503). The names a format string
+captures (`{s}`) are bound after the explicit arguments (format.vl
+build's eval form when such a hole comes before an argument's), as
+rustc's format_args evaluates them: `println("{s} {}", { s.clear(); 0
+})` is accepted and `println("{s} {:?}", drop(s))` is E0382 at the hole.
+A contract message keeps its holes' order (they are values passed to
+`contract_check`). Before 0.30.1 the hidden binding was a bit copy of
+`P` under no loan (RT-25): `println("{} {:?}", s, drop(s))` and `s == {
+s.clear(); s.shrink_to_fit(); t }` read a freed block. Not covered: a
+`format_args("{s}")` value kept past its statement (`let a =
+format_args("{}", t); drop(t); println("{a}")`, rustc E0505): the
+`Interp` closure captures the hole's copy and its type has no region
+(case `rust_b_hidden_format_args_kept`, XFAIL). *Anchor:*
+`places/build.vl: hidden_borrow`. *Cases:* `rt_025_*`, `rust_b_hidden_*`.
 
 ## 3. Regions (S3)
 
@@ -1071,10 +1109,17 @@ project's rule: every error of a compilation), deduped by §14.3.
 **D7.1 (reservation and activation).** A `BK_MUT2` loan `ℓ` created at
 `loc₀` into a temporary `t` (`(a,b) = (t, 0)`; verified shape: `_11 =
 &'r45 mut2 _10` … `_4 = call Fmt::display(move _11, ..)`) has
-*activation location* `loc_a` = the first location after `loc₀` in the
-same block with an operand `move t` or `copy t`; if there is none, the
-loan is never activated and stays class `S`. The builder guarantees
-`loc₀` dominates `loc_a` within one block (`lower_arg`). Its access
+*activation location* `loc_a` = the first location after `loc₀` (in
+statement order, which is evaluation order: the blocks an argument's
+`&&` or `if` makes come between the reservation and the call) with an
+operand that mentions `t`: `move t`, `copy t`, or a place through it,
+`&mut2 (*t)` (a writer's `__r` passed on as a reborrow); if there is
+none, `loc_a = loc₀`, an ordinary `&mut` from its creation. (0.30.1:
+before, only a whole `move t` or `copy t` in `loc₀`'s block counted and
+a loan with none stayed class `S` to its end, so a writer's reservation,
+`__r = &mut2 emsg`, passed on as `&mut2 (*__r)`, was never activated:
+`let r = &emsg[0]; write(emsg, "..").unwrap(); println("{}", *r)` was
+accepted and read the freed block, rustc E0502.) Its access
 `(Deep, Activate ℓ, P)` is performed at `loc_a` as D2.4a says.
 
 **D7.2 (the reservation window).** For points `p` with `2·loc₀+1 ≤ p ≤
@@ -1109,6 +1154,14 @@ desugaring's receiver binding `__r` is the two-phase reborrow `__r =
 &'r mut2 *w`, not a move of `w`, so the arguments read `w` in its
 reservation window (`write(f, "{}", f.width())`) and `w` is usable after
 the call, as rustc's.
+(0.30.1) So is the receiver of a call to a function with a `requires`
+when a later argument runs code: the contract's desugaring
+(front/contracts/desugar.vl requires_call) binds the arguments that are
+no simple read before its `$pre` companion's call, and now binds the
+autoref'd receiver first, `let ?a0 = &mut v` lowered as `?a0 = &'r mut2
+v`, so `v.insert(0, { v.clear(); 9 })` is E0499 as `v.push({ v.clear();
+9 })` is, and `v.insert(0, v.len())` is accepted (before, the receiver
+was borrowed after the arguments had run, and the first was accepted).
 (0.27.6) So is a writer place that is no reference, `write(self.emsg,
 "{}", self.name())`: F16.3 makes it `&mut self.emsg`, an autoref whose
 span is the place's, and that `__r = &'r mut2 self.emsg` is two-phase,
