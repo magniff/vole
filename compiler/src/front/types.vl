@@ -1162,6 +1162,22 @@ pub fn compute_layout(t: i64, pcx: &mut Ctx<Comp>) {
 // with fields, the offset of the fields after its tag (-1 otherwise).
 #[derive(Clone, Copy)] struct Layout { size: i64, align: i64, payload: i64 }
 
+// (0.30) A type's size and alignment from one layout: asked one after
+// the other of a type not laid out yet (the front end's), each was a
+// layout of its own, and a struct's layout asked both of every field (and
+// the alignment again for the fields' order), so a struct of structs was
+// laid out four times a level deep: `size_of::<T>()` in std's generic
+// code, checked for every instance, was 4% of `volec check` of the
+// compiler.
+fn size_align(t: i64, pcx: &Ctx<Comp>) -> (i64, i64) {
+    if pcx.types[t as usize].size >= 0 {
+        return (pcx.types[t as usize].size, pcx.types[t as usize].align);
+    }
+    let mut none: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let l = layout_of(t, none.as_mut_slice(), pcx);
+    (l.size, l.align)
+}
+
 // The layout of type t from its parts' (type_size and type_align), kept
 // nowhere; a struct's fields' offsets go to offsets[i] when offsets is not
 // empty.
@@ -1187,8 +1203,9 @@ fn layout_of(t: i64, offsets: &mut [i64], pcx: &Ctx<Comp>) -> Layout {
         size = pcx.types[t as usize].b * type_size(pcx.types[t as usize].a, pcx);
         align = size;
     } else if kind == TyKind::Distinct {
-        size = type_size(pcx.types[t as usize].a, pcx);
-        align = type_align(pcx.types[t as usize].a, pcx);
+        let (s, a) = size_align(pcx.types[t as usize].a, pcx);
+        size = s;
+        align = a;
     } else if kind == Enum && crate::front::distinct::enum_niche(pcx.types[t as usize].a, pcx) {
         // (0.18: the null niche, one pointer: front/distinct.vl)
         size = 8;
@@ -1199,14 +1216,16 @@ fn layout_of(t: i64, offsets: &mut [i64], pcx: &Ctx<Comp>) -> Layout {
         align = l.align;
         payload = l.payload;
     } else if kind == Array {
-        size = type_size(pcx.types[t as usize].a, pcx) * pcx.types[t as usize].b;
-        align = type_align(pcx.types[t as usize].a, pcx);
+        let (s, a) = size_align(pcx.types[t as usize].a, pcx);
+        size = s * pcx.types[t as usize].b;
+        align = a;
     } else if kind == Tuple {
         let mut offset: i64 = 0;
         for i in 0..pcx.types[t as usize].count {
             let elem = type_elem(t, i, pcx);
-            align = max_i64(align, type_align(elem, pcx));
-            offset = align_to(offset, type_align(elem, pcx)) + type_size(elem, pcx);
+            let (s, a) = size_align(elem, pcx);
+            align = max_i64(align, a);
+            offset = align_to(offset, a) + s;
         }
         size = align_to(offset, align);
     } else if kind == Struct {
@@ -1231,8 +1250,9 @@ fn enum_layout(e: i64, pcx: &Ctx<Comp>) -> Layout {
     for i in 0..(pcx.enums[e as usize]).variant_count {
         let shape = pcx.variants[enum_variant(e, i, pcx) as usize].shape;
         if shape != 0 {
-            largest = max_i64(largest, type_size(shape, pcx));
-            widest = max_i64(widest, type_align(shape, pcx));
+            let (s, a) = size_align(shape, pcx);
+            largest = max_i64(largest, s);
+            widest = max_i64(widest, a);
         }
     }
     if ((pcx.enums[e as usize]).repr & REPR_C) != 0
@@ -1260,15 +1280,21 @@ fn struct_layout(s: i64, offsets: &mut [i64], pcx: &Ctx<Comp>) -> Layout {
     let mut order_room: Vec<i64, Comp> = Vec::new_in(Comp {});
     order_room.resize((n + 1) as usize, 0);
     let order = order_room.as_mut_slice();
+    // (each field's size and alignment, found once: size_align)
+    let mut sizes: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut aligns: Vec<i64, Comp> = Vec::new_in(Comp {});
     for i in 0..n {
         (order[i as usize]) = i;
+        let (fs, fa) = size_align((struct_field(s, i, pcx)).ty, pcx);
+        sizes.push(fs);
+        aligns.push(fa);
     }
     if (repr & REPR_C) == 0 && !wgsl {
         for i in 1..n {
             let mut j = i;
             while j > 0
-                && type_align((struct_field(s, (order[(j - 1) as usize]), pcx)).ty, pcx)
-                < type_align((struct_field(s, (order[j as usize]), pcx)).ty, pcx) {
+                && aligns[(order[(j - 1) as usize]) as usize]
+                < aligns[(order[j as usize]) as usize] {
                 let swap = (order[j as usize]);
                 (order[j as usize]) = (order[(j - 1) as usize]);
                 (order[(j - 1) as usize]) = swap;
@@ -1280,7 +1306,8 @@ fn struct_layout(s: i64, offsets: &mut [i64], pcx: &Ctx<Comp>) -> Layout {
     for k in 0..n {
         let field_ty = (struct_field(s, (order[k as usize]), pcx)).ty;
         // Packed: aligned to at most the packing (`align` holds it).
-        let natural = if wgsl { wgsl_align(field_ty, pcx) } else { type_align(field_ty, pcx) };
+        let natural = if wgsl { wgsl_align(field_ty, pcx) }
+            else { aligns[(order[k as usize]) as usize] };
         let field_align = if (repr & REPR_PACKED) != 0
             && natural > pcx.structs[s as usize].align {
             pcx.structs[s as usize].align
@@ -1292,13 +1319,13 @@ fn struct_layout(s: i64, offsets: &mut [i64], pcx: &Ctx<Comp>) -> Layout {
             if offsets.len() > 0 {
                 (offsets[(order[k as usize]) as usize]) = 0;
             }
-            offset = max_i64(offset, type_size(field_ty, pcx));
+            offset = max_i64(offset, sizes[(order[k as usize]) as usize]);
         } else {
             offset = align_to(offset, field_align);
             if offsets.len() > 0 {
                 (offsets[(order[k as usize]) as usize]) = offset;
             }
-            offset += type_size(field_ty, pcx);
+            offset += sizes[(order[k as usize]) as usize];
         }
     }
     if (repr & REPR_PACKED) == 0 {

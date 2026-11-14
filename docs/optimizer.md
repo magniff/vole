@@ -3255,3 +3255,24 @@ front end is 7.3% cheaper. With the room, using the facts or not moves
 the self-build by 0.2% (under the budget it was 6.4%). The compile-cost
 rows against 0.28.0, release tree and this: hello 1.02x and 0.97x, std
 1.17x and 1.07x, check 1.00x and 0.92x, regions 1.00x and 0.90x.
+
+## 0.30: the compiler's own speed
+
+The -O2 self-build went from 127.0 G to 106.3 G instructions (0.29.0:
+124.7 G to 104.5 G by `tools/perf-experiment.sh`), with every bounds
+check kept; where it went, what the checks cost (21 G, a sixth) and why
+no fact removes them, each change with its measurement, and what is
+left: [compile-speed.md](compile-speed.md). What changed in the
+optimizer:
+
+- `resolve_all` does nothing when no value was replaced since it last
+  ran over the function (`FnCtx.resolved_len`, set by `ir_replace`).
+- The scalar pipeline's second round runs a pass only when the
+  function changed after that pass last ran (`simplify_function`); the
+  one change here that alters the code written (bench geomean +0.03%).
+- The ranges' facts keep their operands (`mark_facts`, `fact_ab`):
+  `narrow_by_facts` decides what it decided, 45% cheaper.
+- Value numbering copies the available set as a block, and
+  `param_written` looks only at the instructions made since.
+- A function with no loop runs the ranges and the dead code only
+  (`optimize_loops`); the dead functions are found with one walk.
