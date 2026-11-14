@@ -178,6 +178,32 @@ constants as cheap to bring back. Splits that bring a value back into a
 register move to the start of the outermost block between the last and
 the next use when it is less deep in loops, so reloads leave loops.
 
+**Loops with a call (0.30).** Positions are the layout's, not the
+order things run in: a value given up in the middle of a loop is in its
+register at the loop's header and on the stack at the back edge, and
+the edge's moves bring it back every round. Three rules keep that out
+of loops (`loop_depths` records, per block, the innermost loop it is in,
+the loop around a loop, and a loop's first and last block; a loop's
+blocks need not be one run of the layout, so what a loop reads is asked
+block by block, `used_in_loop`):
+- a value gives up its register from the first position of the largest
+  loop around that does not read it (`spill_from`): it waits on the
+  stack for the whole loop;
+- a value that a loop reads and that lives across a call in that loop
+  takes a callee-saved register for its whole lifetime from a value
+  that nothing reads meanwhile nor anywhere in the loop
+  (`take_idle_register`), instead of a caller-saved register up to the
+  call and a callee-saved one after it, which every round moved it
+  between, on the path without the call too;
+- a value that waits across a loop and a call in it for a use past it
+  goes to the stack at once, not into a register it would lose in the
+  loop (`try_allocate_free`).
+A loop over a str's chars whose decoding is a call (bench/std chars)
+went from 23 to 12 instructions a char; the table's probe in
+bench/std/hash_str, with a memcmp, from 1973 M to 1784 M instructions;
+the compiler's own -O2 build from 125.0 G to 120.6 G
+(`opt_regalloc_loop_call`, `opt_regalloc_loop_nest`).
+
 **Spilling.** A value that goes to the stack anywhere is stored once,
 right after its definition (the phi moves write a phi there directly when
 it starts on the stack), so a split to the stack costs nothing and one
