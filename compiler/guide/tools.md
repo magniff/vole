@@ -122,8 +122,9 @@ an edit then `check`.
 | merge conflicts | `volec query conflicts --show`, then `volec edit resolve FILE:LINE --ours` (`--theirs`, `--both`, `< text`) |
 | rename anything, with every use | `volec refactor rename PATH NEW` |
 | rename a local or parameter | `volec refactor rename FILE:LINE:COL NEW` or `refactor rename FN::x NEW` (shadowing respected) |
-| a parameter, with every call | `volec refactor signature FN --add 'x: i64 = 0'` (the parameter is `x: i64` and each call gets 0; `--remove`, `--rename-param`, `--reorder`, `--type`) |
-| a field, with every literal | `volec refactor field STRUCT --add 'g: i64 = 0'` (`--type g T --default EXPR`) |
+| a parameter, with every call | `volec refactor signature FN --add 'x: i64 = 0'` (the parameter is `x: i64` and each call gets 0; `--remove`, `--rename-param`, `--reorder`, `--type`; `--batch FILE`: many `--type` changes, one check) |
+| a field, with every literal | `volec refactor field STRUCT --add 'g: i64 = 0'` (`--type g,h T --default EXPR`; `--rewrite PAT REPL`: their uses; `--allocator X`: the struct generic over it) |
+| a predicate that is one value now, folded away | `volec refactor fold FN --as true --dry-run` |
 | a variant, with every match | `volec refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match) |
 | move items to a module | `volec refactor move PATH --to MODULE` (made when missing) |
 | an idiom everywhere, typed | `volec rewrite 'old($a)' 'new($a)' --dry-run` (`$e.$f`: a field's name; `c"$s"`: a literal's text; `--in`, `--not-in ITEM`; `--list`) |

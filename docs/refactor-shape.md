@@ -15,6 +15,7 @@ anything query accepts.
 volec refactor signature FN --add 'x: T [= VALUE]' [--at N] [--fill-calls] | --remove x
                                | --rename-param a b | --reorder b,a,c | --type x T [--default EXPR]
 volec refactor signature --batch FILE     (0.30: FN PARAM TYPE [DEFAULT] a line, one edit)
+volec refactor fold FN --as true|false                           (0.30)
 volec refactor field STRUCT --add 'g: T = VALUE' | --remove g | --rename g h
                             | --type g[,h...] T [--default EXPR] [--allocator X] [--rewrite PAT REPL]...
 volec refactor variant ENUM --add 'X(T, ...)'|'X { a: T, ... }' [--arm EXPR] [--arm-in SITE EXPR]... | --remove V | --rename V W
@@ -176,6 +177,41 @@ accesses.
 
 A `#[repr(C)]` struct's layout changes with --add, --remove and --type:
 `warning refactor.layout` (C code sharing it must change too).
+
+## refactor fold (0.30)
+
+`refactor fold NAME --as true|false`: a predicate that is one value from
+now on (a switch between an old way and a new, once the old way is
+gone) folded away. Each call of function NAME becomes the constant, and
+the code around it becomes what the constant leaves:
+
+| code | becomes |
+|---|---|
+| `!C`, `C && x`, `x && C`, `C \|\| x`, `x \|\| C` | the constant, or `x`, by the operators' rules; a side with a call in it stays when the constant alone would drop its evaluation (`g() && false`) |
+| `if C { A } else { B }`, a statement | A's statements (or B's) in its place; nothing, for a false `if` without `else` |
+| the same as a value | the block taken; its expression, when the block is one expression (in parentheses where the place needs them) |
+| `else if C { A } else { B }` | `else { A }`, `else { B }`, or no `else` |
+| `while C { .. }` | nothing (false); `loop { .. }` (true) |
+| `PAT if C => BODY` | the arm without its guard (true); no arm (false) |
+| the statements after one that now always returns | nothing |
+
+The function body (or the initializer) holding a call is one edit, laid
+out by fmt as every edit's text is, and the edit is checked as any is
+(`--dry-run`, with or without `--diff`, prints it). After it, `note
+refactor.unused` lists the functions, constants and statics whose every
+use was in the code that went, NAME itself among them, with a `try:
+volec edit delete` each. The imports the fold leaves unused are removed
+in the same edit (`note rewrite.imports`). A call whose arguments call functions is left
+as it is, since they would no longer run: `warning refactor.fold` counts
+those and names the first. NAME is a function or a method of an impl; a
+call through an operator or a trait is not folded.
+
+```
+$ volec refactor fold on_new --as true
+folded 9 calls of crate::flags::on_new as true in 3 items→main.vl→+12 -31 lines
+note refactor.unused: 3 items have no use left in the program: crate::flags::on_new (flags.vl:2:8), ...
+try: volec edit delete crate::flags::on_new
+```
 
 ## refactor variant
 
@@ -647,6 +683,8 @@ as it changes the program through the edit engine (`edit_replace`,
 | `refactor.batch` | error; note | 2, 1; 0 | (0.30) signature --batch: FILE unreadable, a line that is not FN PARAM TYPE [DEFAULT], a line whose change cannot be made (nothing written); no lines | |
 | `refactor.literals` | note; warning | 1; 0 | (0.30) field --type: the literals that keep their old value of the field, when the edit is refused or written with --no-check | `--default EXPR` |
 | `edit.rounds` | note | 0 | (0.30) field --allocator: the rounds of `fix --only alloc` run on the edited program before its check | |
+| `refactor.fold` | warning; note | 0 | (0.30) fold: calls left because their arguments call functions; NAME has no call to fold | |
+| `refactor.unused` | note | 0 | (0.30) fold: the items whose every use was in the code that went | `edit delete NAME` |
 | `rewrite.pattern`, `rewrite.unbound` | error | 2 | the pattern or replacement does not parse, a hole alone, `$x...` outside a list, a hole of the replacement not in the pattern and bound by it nowhere, a bad `~/RE/` | |
 | `rewrite.bad-in` | error | 1 | `--in` or `--not-in` names no file, module or item | |
 | `rewrite.at-errors` | note | 0 | (0.30) `--at-errors TEXT`: sites that matched where no such error is (left); no error of the program has TEXT | `volec check --max-errors=0` |
