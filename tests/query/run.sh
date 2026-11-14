@@ -294,20 +294,14 @@ roundtrip() { # <program dir> <seed names...>
         "$COMPILER" "$prog/main.vl" -O0 -S -o "$JW/rt.s" >/dev/null 2>&1 \
             && awk '/^_?vole\.[^ \t]*:$/ && !/^_?vole\.rt\./ && !/^_?vole\.static\.std\./ && !/^_?vole\.\$drop\./ && !/^_?vole\.T[asilhtjmyx]\./ { sub(/:$/, ""); print "def " $0 }' "$JW/rt.s"
     } | sort -u >"$JW/rt.names"
-    # (0.30) One `volec batch` runs them all, each as it would alone (a
-    # fork of the batch's process, the program restored from the cache):
-    # a command failed when its `## exit N` follows it; its first line of
-    # output is the reason. One process per name was most of the check's
-    # minute and a quarter.
-    awk '$2 != "" { printf "query %s '"'"'%s'"'"'\n", $1, $2 }' "$JW/rt.names" >"$JW/rt.cmds"
-    n=$(wc -l <"$JW/rt.cmds" | tr -d ' ')
-    "$COMPILER" batch "$JW/rt.cmds" >"$JW/rt.out" 2>&1
-    awk '/^## \$ volec / { cmd = substr($0, 12); first = ""; next }
-        /^## exit [0-9]+$/ { print cmd ": " first; next }
-        first == "" { first = $0 }' "$JW/rt.out" | sed "s/'//g" >"$JW/rt.bad"
-    # (and the batch ran every one: as many headers as commands)
-    [ "$(grep -c '^## \$ volec ' "$JW/rt.out")" = "$n" ] \
-        || echo "volec batch ran $(grep -c '^## \$ volec ' "$JW/rt.out") of $n: $(tail -3 "$JW/rt.out")" >>"$JW/rt.bad"
+    : >"$JW/rt.bad"
+    n=0
+    while read -r cmd name; do
+        [ -n "$name" ] || continue
+        n=$((n + 1))
+        "$COMPILER" query "$cmd" "$name" >/dev/null 2>"$JW/rt.err" \
+            || echo "query $cmd $name: $(head -1 "$JW/rt.err")" >>"$JW/rt.bad"
+    done <"$JW/rt.names"
     unset VOLE_ROOT
     ok=0
     [ "$n" -ge 10 ] && [ ! -s "$JW/rt.bad" ] && ok=1
