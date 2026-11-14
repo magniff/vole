@@ -985,6 +985,44 @@ impl BigUint<Gpa> {
         if carry != 0 { self.limbs.push(carry as u32); }
     }
 
+    // self *= m, in place, for m below WORD_MAX: a limb times m plus a
+    // carry fits a u64.
+    fn mul_word(&mut self, m: u64) {
+        let s = self.limbs.as_mut_slice();
+        let mut carry: u64 = 0;
+        for i in 0..s.len() {
+            let cur = s[i] as u64 * m + carry;
+            carry = cur / BASE;
+            s[i] = (cur - carry * BASE) as u32;
+        }
+        while carry != 0 {
+            self.limbs.push((carry % BASE) as u32);
+            carry /= BASE;
+        }
+    }
+
+    // self *= m, in place, for m below BASE^2: m is two limbs, and limb i
+    // of the product is x[i] lo + x[i - 1] hi plus the carry, which
+    // fits a u64.
+    fn mul_two_limbs(&mut self, m: u64) {
+        let (lo, hi) = (m % BASE, m / BASE);
+        let s = self.limbs.as_mut_slice();
+        let mut carry: u64 = 0;
+        let mut below: u64 = 0;
+        for i in 0..s.len() {
+            let x = s[i] as u64;
+            let cur = x * lo + below * hi + carry;
+            carry = cur / BASE;
+            s[i] = (cur - carry * BASE) as u32;
+            below = x;
+        }
+        carry += below * hi;
+        while carry != 0 {
+            self.limbs.push((carry % BASE) as u32);
+            carry /= BASE;
+        }
+    }
+
     // self /= k, in place, for a small k; the remainder.
     fn div_small(&mut self, k: u32) -> u32 {
         let s = self.limbs.as_mut_slice();
@@ -1342,31 +1380,81 @@ fn signed_add(a: BigUint<Gpa>, aneg: bool, b: BigUint<Gpa>, bneg: bool,
     if a > b { (a.minus(&b), aneg) } else { (b.minus(&a), bneg) }
 }
 
+// Ranges of at most this many terms are computed term by term.
+const LEAF_TERMS: u64 = 16;
+
+// Multipliers below this keep limb * m + carry inside a u64.
+const WORD_MAX: u64 = 1 << 33;
+
+// x *= f1 f2 ... for factors below 2^32, with as few passes over x as
+// the factors' products below WORD_MAX allow.
+fn mul_factors(x: &mut BigUint<Gpa>, factors: &[u64]) {
+    let mut m: u64 = 1;
+    for f in factors.iter().copied() {
+        if m * f < WORD_MAX {
+            m *= f;
+        } else {
+            x.mul_word(m);
+            m = f;
+        }
+    }
+    if m != 1 { x.mul_word(m); }
+}
+
+// Term k's factor of P, (6k-5)(2k-1)(6k-1), and of Q, k^3 640320^3/24,
+// as factors below 2^32 (k is below 2^29: 7 billion digits).
+fn p_factors(k: u64) -> [u64; 3] { [6 * k - 5, 2 * k - 1, 6 * k - 1] }
+
+fn q_factors(k: u64) -> [u64; 6] { [k, k, k, 26680, 640320, 640320] }
+
+// Terms a..b, for a short range, without a product of two big numbers:
+// appending term k to (P, Q, T) is P' = P p_k, Q' = Q q_k and
+// T' = T q_k +- P' (A + B k), the combine below with one term on the
+// right, and every factor fits a machine word, so each step is a few
+// passes of limb-by-word multiplies in place. No one-limb BigUint is
+// allocated per factor and no product routine is entered.
+fn leaf(a: u64, b: u64, gpa: Gpa) -> Split<Gpa> {
+    let mut p = BigUint::from_u64(1, gpa);
+    let mut q = BigUint::from_u64(1, gpa);
+    if a > 0 {
+        mul_factors(&mut p, &p_factors(a));
+        mul_factors(&mut q, &q_factors(a));
+    }
+    let mut t = p.clone();
+    t.mul_two_limbs(series_coefficient(a));
+    let mut neg = a % 2 == 1;
+    for k in a + 1..b {
+        mul_factors(&mut p, &p_factors(k));
+        mul_factors(&mut q, &q_factors(k));
+        mul_factors(&mut t, &q_factors(k));
+        let mut add = p.clone();
+        add.mul_two_limbs(series_coefficient(k));
+        let (sum, sign) = signed_add(t, neg, add, k % 2 == 1, gpa);
+        t = sum;
+        neg = sign;
+    }
+    Split { p, q, t, neg }
+}
+
+// Term k's coefficient, 13591409 + 545140134 k: below 2^59 and with no
+// factors to rely on, so it multiplies as a number of two limbs.
+fn series_coefficient(k: u64) -> u64 { 13591409 + 545140134 * k }
+
 // Terms a..b of the series, as (P, Q, T) with T/Q the partial sum. P is
 // only ever used by a range's parent, so the whole sum (`root`) does not
-// compute it: one of the four largest products, saved.
+// compute it.
 fn binary_split(a: u64, b: u64, root: bool, cx: &Engine<Gpa>) -> Split<Gpa> {
-    let gpa = cx.gpa;
-    if b - a == 1 {
-        if a == 0 {
-            return Split {
-                p: BigUint::from_u64(1, gpa),
-                q: BigUint::from_u64(1, gpa),
-                t: BigUint::from_u64(13591409, gpa),
-                neg: false,
-            };
-        }
-        let p = BigUint::from_u64(6 * a - 5, gpa)
-            .times(&BigUint::from_u64(2 * a - 1, gpa), cx)
-            .times(&BigUint::from_u64(6 * a - 1, gpa), cx);
-        let aa = BigUint::from_u64(a, gpa);
-        let q = aa.times(&aa, cx).times(&aa, cx).times(&BigUint::from_u64(C3_OVER_24, gpa), cx);
-        let t = p.times(&BigUint::from_u64(13591409 + 545140134 * a, gpa), cx);
-        return Split { p, q, t, neg: a % 2 == 1 };
-    }
+    if b - a <= LEAF_TERMS { return leaf(a, b, cx.gpa); }
     let mid = (a + b) / 2;
     let left = binary_split(a, mid, false, cx);
     let right = binary_split(mid, b, false, cx);
+    combine(&left, &right, root, cx)
+}
+
+// (P, Q, T) of two adjacent ranges into their union's:
+// P = P1 P2, Q = Q1 Q2, T = T1 Q2 + P1 T2.
+fn combine(left: &Split<Gpa>, right: &Split<Gpa>, root: bool, cx: &Engine<Gpa>) -> Split<Gpa> {
+    let gpa = cx.gpa;
     // Two shared-operand pairs: P = P1 P2 and P1 T2, then Q = Q1 Q2 and
     // T1 Q2, each sharing one forward transform.
     let (p, tr) = if root { (BigUint::zero(gpa), left.p.times(&right.t, cx)) }
@@ -1681,6 +1769,30 @@ fn transforms_agree(gpa: Gpa) {
             }
         }
     }
+}
+
+// A leaf's term-by-term recurrence against the combine of single terms,
+// at the start of the series (term 0 is special), at an odd start and
+// where the factors stop sharing a word.
+#[test]
+fn leaves_match_combines(gpa: Gpa) {
+    let cx = &Engine::new(gpa);
+    let ranges: [(u64, u64); 5] = [(0, 16), (1, 10), (7, 8), (26750, 26760), (5000000, 5000012)];
+    for (a, b) in ranges {
+        let mut by_terms = leaf(a, a + 1, gpa);
+        for k in a + 1..b { by_terms = combine(&by_terms, &leaf(k, k + 1, gpa), false, cx); }
+        let whole = leaf(a, b, gpa);
+        assert_eq !(whole.p, by_terms.p);
+        assert_eq !(whole.q, by_terms.q);
+        assert_eq !(whole.t, by_terms.t);
+        assert_eq !(whole.neg, by_terms.neg);
+    }
+    // One term, against its definition.
+    let one = leaf(3, 4, gpa);
+    assert_eq !(one.p, BigUint::from_u64(13 * 5 * 17, gpa));
+    assert_eq !(one.q, BigUint::from_u64(27 * C3_OVER_24, gpa));
+    assert_eq !(one.t, BigUint::from_u64(13 * 5 * 17 * (13591409 + 3 * 545140134), gpa));
+    assert !(one.neg);
 }
 
 // Large enough that the split's combines go through the transform.
