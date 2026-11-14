@@ -816,11 +816,14 @@ run_step() {
         # 0.25.2.1: and with --try-args (arguments that may return, `?`
         # or a match's arm, in calls whose result is `?`'d); 0.25.3: and
         # with --closure-params (closures taking a T by value); 0.29: the
-        # programs in the one language (`&T`, `&mut T`, by value)
+        # programs in the one language (`&T`, `&mut T`, by value); 0.30:
+        # and with --deref-assign (assignments through a Box, a guard, a
+        # type's DerefMut and a function's `&mut T`)
         fuzz-sem) python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" \
             && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --assign-calls \
             && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --try-args \
-            && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --closure-params ;;
+            && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --closure-params \
+            && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --deref-assign ;;
         fuzz-seed)
             seed=$(find_seed)
             if [ -z "$seed" ]; then

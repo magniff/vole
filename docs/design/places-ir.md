@@ -387,8 +387,14 @@ The builder emits a `drop(l)` for every needs-drop local and temporary on
 every scope exit, without asking whether it moved, and for an owned
 assignment `P = v` it emits `tmp = v; drop(P); P = move tmp` (the right
 side, then the old value, then the write; the right side's temporaries
-after it, at the statement's end: `ea70255c`'s order). Elaboration then
-decides each drop, as rustc's drop elaboration does:
+after it, at the statement's end: `ea70255c`'s order). An owned
+assignment is one to a place of names, fields, `*` and indexes, and
+(0.30) to any place under a reference that a call returns: `*b = v` of a
+Box, a guard or any DerefMut (`*b.deref_mut() = v`), `a[i] = v` through
+IndexMut, `*v.last_mut().unwrap() = x`, `f(&mut s).t = x` (`dropped_place`;
+before 0.30 these wrote without the drop and leaked the old value). A
+write through a raw pointer drops nothing: `*p = v` is `ptr::write`.
+Elaboration then decides each drop, as rustc's drop elaboration does:
 
 1. **Move paths.** A tree per body of the places that are moved, assigned
    or dropped, rooted at locals, with children for fields and variant
