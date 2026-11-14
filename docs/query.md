@@ -593,6 +593,21 @@ it and of the modules under it (the root's: not std's).
   (front/effects/why.vl), each line indented two spaces; `(not:
   EFFECT)` when it has not.
 - An unknown EFFECT is `error query.usage` (exit 2).
+- (0.30) `--templates`: a line a function, a generic one's by its
+  template (its opaque instance: each type parameter a type of its
+  own), named as the definition is, `std::mem::replace \t unsafe`; of
+  std, its `pub` functions (as `items std` lists them). The listing
+  does not depend on what the program instantiates, so two of them
+  compare: `tools/std-effects-diff.sh [BASE]` makes std's for its files
+  as they are and for a revision's (`query effects std --templates
+  --std-tree DIR`, BASE's listing kept in the tools' cache) and prints
+  the functions whose sets differ, `std::mem::replace \t unsafe ->
+  diverge unsafe`, then `std-effects-diff: N changed, A added, R removed
+  since BASE (M functions)`; `--check` exits 1 on a change. The edit
+  hook runs it after a change to compiler/std that `check --std`
+  passes. A set is cut to its function's `#[effects(..)]` (what goes
+  past it is `check --std`'s error), so the difference shows what
+  changed within the declarations, and of the functions without one.
 
 `def`, `show` and `context` add `effects: SET` to a function's line (a
 TAB before it): not for a generic function (its instances differ) nor a

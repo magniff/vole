@@ -13,6 +13,10 @@
 #   - `edit patch compiler/std/FILE.vl` patches the file (as text) and
 #     says `run: sh compiler/std/embed.sh`; an edit of a std item by name
 #     is refused with the command that works;
+#   - `volec query effects std --templates` lists std's public functions
+#     once each, a generic one by its template, and
+#     tools/std-effects-diff.sh the ones whose effects differ from a
+#     revision's;
 #   - `volec check --std` checks every body of std (the templates no
 #     program instantiates too): an undeclared effect and an unsafe
 #     operation outside `unsafe` in a generic function nothing calls are
@@ -184,6 +188,29 @@ awk -v n="$RLINE" '{ print } NR == n {
 run query unsafe std --unneeded --root main.vl
 has unsafe_unneeded_listed "$MEM:$((RLINE + 3))	block	std::mem::replace	other	justified	none (unneeded)"
 has unsafe_unneeded_count "unneeded: 1"
+cp "$ROOT/$MEM" "$T/$MEM"
+
+# ---- the effects of std's public functions, against a revision ----
+# (the copy's own repository: HEAD is std as copied. replace's declaration
+# and body gain `diverge`: it and what calls it are listed; nothing is for
+# std as committed.)
+mkdir -p "$T/tools" && cp "$ROOT/tools/std-effects-diff.sh" "$T/tools/std-effects-diff.sh"
+(cd "$T" && sh tools/std-effects-diff.sh -c "$COMPILER" --check) >"$WORK/out" 2>&1
+rc=$?
+has effects_diff_none "std-effects-diff: 0 changed, 0 added, 0 removed since HEAD"
+if [ $rc -eq 0 ]; then ok effects_diff_none_status; else bad effects_diff_none_status; fi
+awk -v n="$RLINE" 'NR == n - 1 && /^#\[effects\(unsafe, T\)\]$/ { print "#[effects(diverge, unsafe, T)]"; next }
+    { print }
+    NR > n && NR < n + 9 && /let old = crate::ptr::read\(p as \*const T\);/ {
+        print "        let mut n: i64 = 0;\n        while n != 7 {\n            n = (n * 3 + 1) % 11;\n        }" }' \
+    "$T/$MEM" >"$WORK/mem.vl" && cp "$WORK/mem.vl" "$T/$MEM"
+(cd "$T" && sh tools/std-effects-diff.sh -c "$COMPILER" --check) >"$WORK/out" 2>&1
+rc=$?
+has effects_diff_changed "std::mem::replace	unsafe -> diverge unsafe"
+has effects_diff_caller "std::option::Option::take	none -> diverge"
+if [ $rc -eq 1 ]; then ok effects_diff_check_status; else bad effects_diff_check_status; fi
+run query effects std::mem::replace --templates --std-tree compiler/std
+has effects_templates "std::mem::replace	diverge unsafe"
 cp "$ROOT/$MEM" "$T/$MEM"
 
 echo "stdtools: $PASSED passed, $FAILED failed"

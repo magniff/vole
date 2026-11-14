@@ -1528,7 +1528,9 @@ def std_check(compiler, where):
             continue
         errors = [line for line in lines if ": error[" in line]
         if r.returncode == 0 and not errors:
-            return "volec check --std: ok (every body of std, its generic functions without an instance)"
+            return "\n".join(t for t in (
+                "volec check --std: ok (every body of std, its generic functions without an instance)",
+                std_effects(c, top)) if t)
         if not errors:
             return ""
         shown = [line if len(line) <= 400 else line[:400] + " ..." for line in errors[:STD_CHECK_LINES]]
@@ -1538,6 +1540,33 @@ def std_check(compiler, where):
              "only so)" % (len(errors), "" if len(errors) == 1 else "s")]
             + shown + (["(%d more: volec check --std)" % more] if more > 0 else []))
     return ""
+
+
+def std_effects(compiler, top):
+    """(0.30) tools/std-effects-diff.sh in the checkout top: the public
+    functions of std whose inferred effects differ from HEAD's (a std
+    edit that gives many functions an effect they did not have passes
+    every declaration that allows it); "" when none does, or the script
+    or the compiler cannot say."""
+    script = os.path.join(top, "tools", "std-effects-diff.sh")
+    if not os.path.exists(script):
+        return ""
+    import subprocess
+    try:
+        r = subprocess.run(["sh", script, "-c", compiler], cwd=top, capture_output=True, text=True,
+                           timeout=limit(TIMEOUT))
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    lines = (r.stdout or "").splitlines()
+    if r.returncode != 0 or len(lines) < 2:
+        return ""
+    shown = lines[:STD_CHECK_LINES]
+    more = len(lines) - 1 - len(shown)
+    return "\n".join(
+        ["std's public functions whose effects changed since HEAD (tools/std-effects-diff.sh): "
+         + lines[-1].replace("std-effects-diff: ", "")]
+        + [line if len(line) <= 300 else line[:300] + " ..." for line in shown if line != lines[-1]]
+        + (["(%d more: sh tools/std-effects-diff.sh)" % more] if more > 0 else []))
 
 
 def say(text):

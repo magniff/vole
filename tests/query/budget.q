@@ -222,7 +222,7 @@ usage: volec query def|show NAME... [--root ROOT] [--exact] [--with-comments]
        volec query deps MODULE [--max-lines N]
        volec query unused [MODULE] [--all]
        volec query impact NAME
-       volec query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (alloc(Gpa) io panic diverge unsafe; --why static)
+       volec query effects NAME...|MODULE [--has EFFECT] [--why EFFECT] [--templates]   (alloc(Gpa) io panic diverge unsafe; --why static; --templates: a generic function once, by its template; std's against a revision: tools/std-effects-diff.sh)
        volec query features NAME... [--why FEATURE] [-C target-cpu=CPU] [-C target-feature=+x,-y]   (std::arch: what a function needs beyond the build's features)
        volec query arch WORDS... [--feature F] [--arch aarch64|x86_64|portable] [--equiv NAME]   (std::arch: the intrinsics by name, instruction, feature or doc; also query intrinsics)
        volec query conflicts [FILE|DIR|FILE:LINE...] [--show]
