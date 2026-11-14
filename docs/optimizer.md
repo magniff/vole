@@ -805,6 +805,23 @@ the next (it would need a phi).
 which a loaded machine hardly changes (the recipe: "0.25.5" below);
 (0.29) `--time-passes=passes` those of each optimizer pass too ("0.29"
 below).
+(0.30) `--time-passes=json` prints the same as one JSON object, the
+counts whole, and `volec check --time-passes=instructions|json` the
+front end's phases; `volec build --help` lists every option that shows
+what the compiler did. Two compilers on one input:
+`tools/perf-diff.sh A B FILE.vl` prints the phases and the passes of
+both and the difference (`--inline`: the inlining decisions that
+differ, tools/inline-log-diff.py); an experiment against a baseline:
+`tools/perf-experiment.sh [-b BASELINE] [WORKTREE]` reports the
+self-build at -O2 and -O0, `check` and the compile-cost programs in
+instructions, the fewest of N runs, in one table (`--passes`, `--bench`);
+`bench/run.sh --instructions -p BASELINE` the benchmarks' own
+instructions, program by program. The counter: macOS's
+`thread_selfcounts` for the phases and passes, `/usr/bin/time -l` for a
+whole process; Linux gets `perf_event_open`'s user-mode instructions
+for the phases and passes (refused in most containers:
+`error[time.instructions]`) and `perf stat` for a whole process in
+perf-experiment.sh; bench/run.sh --instructions is macOS's.
 Compiling the compiler itself to assembly at -O2 (Apple M-series, best
 of 7, user + system): 0.5.0 takes 0.63 s, 0.6 (built by itself) 0.50 s;
 at -O0, 0.06 s and 0.03 s. Of 0.6's -O2 time, the interprocedural layer

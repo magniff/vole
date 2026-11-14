@@ -259,6 +259,7 @@ base::ctx::Ctx.ir_expr_loc	off: -g and --trace (IR_LOCS)
 base::ctx::Ctx.ir_loc	off: the same
 base::ctx::Ctx.ir_locs	off: the same
 base::ctx::Ctx.print_after_all	off: --print-after-all
+base::ctx::Ctx.print_after_fn	off: --print-after-all=FN sets print_after_all too, with which the cache is off; set by the options before the tasks
 base::ctx::Ctx.verify_ir	off: --verify-ir
 base::ctx::Ctx.opt_deferred	the key (own_fp)
 base::ctx::Ctx.opt_level	key: options_hash

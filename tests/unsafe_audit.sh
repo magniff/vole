@@ -5,19 +5,25 @@
 # count that may only fall: it fails on
 #   - any site of compiler/src or of std without `// UNSAFE:` and
 #     `// SAFETY:` right above it (unjustified), and
-#   - any unsafe block of compiler/src with nothing unsafe inside
-#     (unneeded: `volec fix --only unneeded-unsafe` takes it away),
+#   - any unsafe block of compiler/src, and (0.30) of std, with nothing
+#     unsafe inside (unneeded: `volec fix --only unneeded-unsafe` takes
+#     one of compiler/src away; one of std is taken away in its file),
 # and names each one, FILE:LINE (compiler/src's as `volec check
 # --deny=unsafe` reports them, errors with their positions, when the
 # compiler asked knows the option). docs/unsafe-baseline.md records the
 # counts by class, module and file at the last `-u`; its three baseline
 # lines are 0 and `-u` writes no other number.
 #
-# std's unneeded blocks are printed and not judged: `query unsafe` says
-# `none (unneeded)` of a block in a generic function of std that the
-# program asked about (the compiler) never instantiates, and those blocks
-# hold what needs them (a C call, ptr::write); the count changes with the
-# program. A block of std is unneeded when it is under every program.
+# (0.30) std's unneeded blocks are judged too. Until 0.30 `query unsafe`
+# said `none (unneeded)` of a block in a generic function of std that the
+# program asked about (the compiler) never instantiates (22 justified
+# blocks, which hold a C call or ptr::write), so the count was the
+# program's and not judged. Now every generic function of std is checked
+# by its opaque instance for the listing (as `volec check --std`), and a
+# block is unneeded only when an instance checked all of it without an
+# error and none recorded an unsafe operation in it; one the checker did
+# not get through is `not checked`. A compiler before 0.30 (no `check
+# --std`) lists the 22 again: its count is printed and not judged.
 #
 # std's count is the host's (std's system file is sys/macos.vl or
 # sys/linux.vl, the target's): the gate runs this row on macOS.
@@ -58,6 +64,10 @@ n_src=$(unjustified "$src")
 n_std=$(unjustified "$std")
 u_src=$(unneeded "$src")
 u_std=$(unneeded "$std")
+# (0.30) whether this compiler checks std's generic functions without an
+# instance, so that std's unneeded count is exact
+STD_EXACT=0
+"$C" check --help 2>/dev/null | grep -q -- 'volec check --std' && STD_EXACT=1
 [ -n "$n_src" ] && [ -n "$n_std" ] && [ -n "$u_src" ] && [ -n "$u_std" ] || { echo "unsafe-audit: no counts in the summaries"; printf '%s\n' "$src" | head -3; exit 1; }
 
 # The sites that break the rule, FILE:LINE each: compiler/src's by `check
@@ -74,12 +84,16 @@ list_src() {
     fi
 }
 list_std() {
-    "$C" query unsafe std --all 2>/dev/null | awk -F "$TAB" 'NF >= 6 && $5 != "justified" { print "  " $1 ": " $2 " in " $3 ": " $5 }'
+    "$C" query unsafe std --all 2>/dev/null | awk -F "$TAB" -v exact="$STD_EXACT" 'NF >= 6 && ($5 != "justified" || (exact == 1 && $6 == "none (unneeded)")) { print "  " $1 ": " $2 " in " $3 ": " $5 ", " $6 }'
 }
 
 if [ $UPDATE -eq 1 ]; then
-    if [ "$n_src" -ne 0 ] || [ "$u_src" -ne 0 ] || [ "$n_std" -ne 0 ]; then
-        echo "unsafe-audit: not written: the baseline is 0 (compiler/src $n_src unjustified, $u_src unneeded; std $n_std unjustified): justify each site or take it away"
+    if [ $STD_EXACT -ne 1 ]; then
+        echo "unsafe-audit: not written: this compiler does not check std's generic functions without an instance (before 0.30), so std's unneeded count is not exact: -c a 0.30 compiler"
+        exit 1
+    fi
+    if [ "$n_src" -ne 0 ] || [ "$u_src" -ne 0 ] || [ "$n_std" -ne 0 ] || [ "$u_std" -ne 0 ]; then
+        echo "unsafe-audit: not written: the baseline is 0 (compiler/src $n_src unjustified, $u_src unneeded; std $n_std unjustified, $u_std unneeded): justify each site or take it away"
         list_src
         list_std
         exit 1
@@ -97,16 +111,19 @@ if [ $UPDATE -eq 1 ]; then
         echo "unsafe-audit row and tools/premerge.sh's unsafe row (tests/unsafe_audit.sh)"
         echo "fail on any site of compiler/src or std without \`// UNSAFE:\` and"
         echo "\`// SAFETY:\` right above it (unjustified, AGENTS.md) and on any unsafe"
-        echo "block of compiler/src with nothing unsafe inside (unneeded), and name"
-        echo "each one; \`volec check --deny=unsafe\` reports them as errors where they"
-        echo "are. The three lines below are 0 and stay 0; the counts by class, module"
-        echo "and file are the record of what is left. The classes and the comments'"
-        echo "rule: \`volec query unsafe --help\`, docs/query.md. std's unneeded count"
-        echo "is not judged (tests/unsafe_audit.sh says why)."
+        echo "block of compiler/src or (0.30) of std with nothing unsafe inside"
+        echo "(unneeded), and name each one; \`volec check --deny=unsafe\` reports"
+        echo "compiler/src's as errors where they are. The four lines below are 0 and"
+        echo "stay 0; the counts by class, module and file are the record of what is"
+        echo "left. The classes and the comments' rule: \`volec query unsafe --help\`,"
+        echo "docs/query.md. std's unneeded count is exact from 0.30: every generic"
+        echo "function of std is checked by its opaque instance for the listing"
+        echo "(tests/unsafe_audit.sh says how)."
         echo
         echo "baseline compiler/src unjustified: $n_src"
         echo "baseline compiler/src unneeded: $u_src"
         echo "baseline std unjustified: $n_std"
+        echo "baseline std unneeded: $u_std"
         echo
         echo "## compiler/src"
         echo
@@ -120,14 +137,14 @@ if [ $UPDATE -eq 1 ]; then
         printf '%s\n' "$std"
         echo '```'
     } >"$BASELINE"
-    echo "unsafe-audit: wrote $BASELINE (compiler/src $(sites "$src") sites, std $(sites "$std"); none unjustified, none of compiler/src unneeded)"
+    echo "unsafe-audit: wrote $BASELINE (compiler/src $(sites "$src") sites, std $(sites "$std"); none unjustified, none unneeded)"
     exit 0
 fi
 
 [ -f "$BASELINE" ] || { echo "unsafe-audit: no $BASELINE (tests/unsafe_audit.sh -u makes it)"; exit 1; }
 status=0
 # (the file's own lines: 0, whoever edits it)
-for key in "compiler\/src unjustified" "compiler\/src unneeded" "std unjustified"; do
+for key in "compiler\/src unjustified" "compiler\/src unneeded" "std unjustified" "std unneeded"; do
     b=$(sed -n "s/^baseline $key: \\([0-9]*\\)\$/\\1/p" "$BASELINE")
     if [ "$b" != 0 ]; then
         status=1
@@ -139,10 +156,18 @@ if [ "$n_src" -ne 0 ] || [ "$u_src" -ne 0 ]; then
     echo "compiler/src: $n_src unjustified unsafe sites and $u_src unneeded unsafe blocks; the rule is none: say why above each site (// UNSAFE:, // SAFETY:), take an unneeded block away (volec fix --only unneeded-unsafe):"
     list_src
 fi
-if [ "$n_std" -ne 0 ]; then
+if [ "$n_std" -ne 0 ] || { [ $STD_EXACT -eq 1 ] && [ "$u_std" -ne 0 ]; }; then
     status=1
-    echo "std: $n_std unjustified unsafe sites; the rule is none (volec query unsafe std --unjustified):"
+    if [ $STD_EXACT -eq 1 ]; then
+        echo "std: $n_std unjustified unsafe sites and $u_std unneeded unsafe blocks; the rule is none (volec query unsafe std --unjustified, --unneeded): say why above each site, take an unneeded block away in its file (volec edit patch compiler/std/FILE.vl)"
+    else
+        echo "std: $n_std unjustified unsafe sites; the rule is none (volec query unsafe std --unjustified):"
+    fi
     list_std
 fi
-echo "unsafe-audit: compiler/src $(sites "$src") sites, $n_src unjustified, $u_src unneeded; std $(sites "$std") sites, $n_std unjustified ($u_std listed unneeded, not judged: generic functions the compiler does not instantiate)"
+if [ $STD_EXACT -eq 1 ]; then
+    echo "unsafe-audit: compiler/src $(sites "$src") sites, $n_src unjustified, $u_src unneeded; std $(sites "$std") sites, $n_std unjustified, $u_std unneeded"
+else
+    echo "unsafe-audit: compiler/src $(sites "$src") sites, $n_src unjustified, $u_src unneeded; std $(sites "$std") sites, $n_std unjustified ($u_std listed unneeded, not judged: this compiler, before 0.30, does not check the generic functions of std that the compiler does not instantiate)"
+fi
 exit $status

@@ -66,6 +66,15 @@ case("new file: compiler/src is not",
      hook.new_file_written(wrote("/w/compiler/src/x.vl"), "/w/compiler/src/x.vl"), False)
 case("new file: compiler/std is not",
      hook.new_file_written(wrote("/w/compiler/std/x.vl"), "/w/compiler/std/x.vl"), False)
+# (0.30) a change to a file of compiler/std: `volec check --std` too
+case("std edit: a file of compiler/std", hook.std_edit(wrote("/w/compiler/std/mem.vl", tool="Edit"), "/w/compiler/std/mem.vl"), True)
+case("std edit: a file of compiler/src is not", hook.std_edit(wrote("/w/compiler/src/main.vl", tool="Edit"), "/w/compiler/src/main.vl"), False)
+case("std edit: a volec edit of std's file",
+     hook.std_edit({"tool_name": "Bash", "tool_input": {"command": "volec edit patch compiler/std/mem.vl --old a --new b"},
+                    "tool_response": {"stdout": "patched compiler/std/mem.vl\nrun: sh compiler/std/embed.sh\n"}}, None), True)
+case("std edit: a volec query of std's file is not",
+     hook.std_edit({"tool_name": "Bash", "tool_input": {"command": "volec query show compiler/std/mem.vl"},
+                    "tool_response": {"stdout": "// compiler/std/mem.vl:1-193\n"}}, None), False)
 case("new file: not a .vl", hook.new_file_written(wrote("/w/ex/a.wgsl"), "/w/ex/a.wgsl"), False)
 
 # The recogniser: volec by name, copy, variable.

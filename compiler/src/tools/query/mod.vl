@@ -45,7 +45,7 @@ pub mod typeat;
 pub mod cache;
 pub mod names;
 pub mod reexported;
-mod stdq;
+pub mod stdq;
 pub mod budget;
 mod context;
 mod derived;
@@ -63,6 +63,7 @@ pub mod features;
 pub mod intrinsics;
 pub mod roots;
 pub mod unsafe_audit;
+mod asm;
 
 use std::alloc::Arena;
 
@@ -228,7 +229,7 @@ fn put_usage(out: i64) {
     buf_str(out, c"       volec query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]\n");
     buf_str(out, c"       volec query items [MODULE...] [--comments]\n");
     buf_str(out, c"       volec query show MODULE::section TITLE\n");
-    buf_str(out, c"       volec query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]\n");
+    buf_str(out, c"       volec query grep PATTERN... [--in FILE|MODULE|ITEM] [--std] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]\n");
     buf_str(out, c"       volec query type FILE:LINE[:COL]...\n");
     buf_str(out, c"       volec query contracts NAME...   (0.27.2.1: its requires and ensures; a trait method's, then each impl's: what it adds, the trait's marked)\n");
     buf_str(out, c"       volec query drops FILE:LINE...   (0.26.1: the function's drops as the places IR decides them, each with where it runs)\n");
@@ -236,10 +237,11 @@ fn put_usage(out: i64) {
     buf_str(out, c"       volec query deps MODULE [--max-lines N]\n");
     buf_str(out, c"       volec query unused [MODULE] [--all]\n");
     buf_str(out, c"       volec query impact NAME\n");
-    buf_str(out, c"       volec query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (alloc(Gpa) io panic diverge unsafe; --why static)\n");
+    buf_str(out, c"       volec query effects NAME...|MODULE [--has EFFECT] [--why EFFECT] [--templates]   (alloc(Gpa) io panic diverge unsafe; --why static; --templates: a generic function once, by its template; std's against a revision: tools/std-effects-diff.sh)\n");
     buf_str(out, c"       volec query features NAME... [--why FEATURE] [-C target-cpu=CPU] [-C target-feature=+x,-y]   (std::arch: what a function needs beyond the build's features)\n");
     buf_str(out, c"       volec query arch WORDS... [--feature F] [--arch aarch64|x86_64|portable] [--equiv NAME]   (std::arch: the intrinsics by name, instruction, feature or doc; also query intrinsics)\n");
     buf_str(out, c"       volec query conflicts [FILE|DIR|FILE:LINE...] [--show]\n");
+    buf_str(out, c"       volec query asm FN... [--all]   (0.30: the machine code of a function of the program at -O2, as `-S` writes it; each instance a block)\n");
     buf_str(out, c"       volec query similar NAME... [--limit N]   (items like NAME to copy, nearest first)\n");
     buf_str(out, c"       volec query examples [KIND...]   (items to start from for an \"add an X\" change; volec guide how)\n");
     buf_str(out, c"       volec query unsafe [FILE...|DIR|std] [--no-std] [--summary] [--unjustified] [--source] [--json]   (every unsafe block, unsafe fn and extern block: what it does, its class, its UNSAFE:/SAFETY: comments)\n");
@@ -255,7 +257,7 @@ fn usage_error(tcx: &mut Tcx<Comp>) -> i64 {
     diag(c"error", c"query.usage", tcx)
 }
 
-pub const N_COMMANDS: i64 = 25;
+pub const N_COMMANDS: i64 = 26;
 
 pub fn command_name(i: i64) -> *const u8 {
     if i == 0 { c"def" } else if i == 1 { c"show" } else if i == 2 { c"refs" }
@@ -266,7 +268,8 @@ pub fn command_name(i: i64) -> *const u8 {
     else if i == 15 { c"conflicts" } else if i == 16 { c"effects" }
     else if i == 17 { c"similar" } else if i == 18 { c"examples" }
     else if i == 19 { c"features" } else if i == 20 { c"arch" } else if i == 21 { c"intrinsics" }
-    else if i == 22 { c"unsafe" } else if i == 23 { c"drops" } else { c"contracts" }
+    else if i == 22 { c"unsafe" } else if i == 23 { c"drops" } else if i == 24 { c"contracts" }
+    else { c"asm" }
 }
 
 // The command nearest to cmd (edit distance at most 2), or 0.
@@ -366,6 +369,21 @@ fn run_query_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
         pcx.std_tree = find_std_tree(pcx);
     }
     let items = sub == "items";
+    // (0.30) `items compiler/std/mem.vl`: the std module of that file
+    // (`items std::mem`), not a program whose root it is; `items --std`:
+    // std's modules
+    if items && find_std_tree(pcx) != 0 as *mut u8 {
+        for k in 0..args.len() as i64 {
+            let m = crate::front::stdtree::std_module_of_path(
+                &c_slice((args[k as usize]) as *mut u8));
+            if m >= 0 {
+                args[k as usize] = crate::tools::proc::buf_cstr(m) as i64;
+            }
+        }
+    }
+    if items && args.len() as i64 == 0 && c.m.flag("std") {
+        args.push(c"std" as i64);
+    }
     // (0.25.3: `query unsafe`'s arguments are FILEs, each of the
     // program, none of them its root)
     let unsafe_sites = sub == "unsafe";
@@ -497,6 +515,11 @@ fn run_query_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     if sub == "effects" && check_effect_options(tcx, pcx) != 0 {
         return 2;
     }
+    // (0.30: the code of a function at -O2, asm.vl: the program is built
+    // by a run of its own, not read here)
+    if sub == "asm" {
+        return asm::run_asm(root, args.as_slice(), tcx, pcx);
+    }
     // (0.13: def, show, refs, callers and items from the tools' cache,
     // when it holds for the program; else read in full, then cached.
     // grep and type need the tokens and nodes, which are not cached:
@@ -505,7 +528,9 @@ fn run_query_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     // without the cache, which holds the program as it is)
     let mut with_std = std_only || std_requested() || sub == "examples"
         || (unsafe_sites && !tcx.opt_no_std)
-        || (pcx.opt_in != 0 as *mut u8 && names_std(&c_slice(pcx.opt_in)));
+        || (pcx.opt_in != 0 as *mut u8
+            && (names_std(&c_slice(pcx.opt_in))
+                || crate::tools::edit::stdedit::is_std_file(&c_slice(pcx.opt_in))));
     for k in 0..args.len() as i64 {
         if names_std(&c_slice((args[k as usize]) as *mut u8)) {
             with_std = true;
@@ -534,6 +559,18 @@ fn run_query_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
         && !at_column && !full_requested() && !arch_options_given(pcx);
     let cached = cacheable && cache_restore(root, 0, is_refs || context, tcx, pcx);
     pcx.audit_unsafe = unsafe_sites;
+    // (0.30) std's sites too: every generic function of std is checked by
+    // its opaque instance (front/opaque.vl, as `check --std`), so the
+    // operations of a block in a function the program never instantiates
+    // are recorded, and the block is not listed as unneeded
+    if unsafe_sites && with_std {
+        pcx.check_std = true;
+    }
+    // (0.30) `query effects --templates`: std's templates have their
+    // opaque instances, whose sets are the lines
+    if sub == "effects" && tcx.opt_templates && with_std {
+        pcx.check_std = true;
+    }
     // (0.25.5, feedbacks/stdunsafe254.md #1: std as the tree has it, when
     // its files differ from this compiler's std, as check reads it)
     if unsafe_sites && with_std {
