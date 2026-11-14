@@ -242,6 +242,80 @@ chmod +x "$WORK/failing-volec"
 got=$(sh "$ROOT/tests/run.sh" -c "$WORK/failing-volec" -j 2 -n abi_callee_alignment -n abi_extern_small_struct 2>&1 | tail -1)
 [ "$got" = "try: tests/run.sh -n abi_callee_alignment -n abi_extern_small_struct   (the failing cases alone)" ] \
     && ok filters_try_dash_n || bad filters_try_dash_n "got '$got'"
+# ---- the transcript runners' jobs (0.30: tests/jobs.sh) ----
+
+# A FILTER selects the transcripts and checks whose name contains it, -n
+# and =NAME one name; -l lists them and runs nothing.
+got=$(sh "$ROOT/tests/query/run.sh" -l -n clash effects_agree =self_show | tr '\n' ',')
+[ "$got" = "check effects_agree_effagree_host,check effects_agree_effagree_aarch64-linux,check effects_agree_effagree_x86_64-linux,check self_show,transcript clash," ] \
+    && ok jobs_filter || bad jobs_filter "got '$got'"
+# Selecting nothing is an error that says so, not a pass (every runner
+# that takes names).
+why=""
+for r in query refactor lsp fmt; do
+    got=$(sh "$ROOT/tests/$r/run.sh" no_such_name_here 2>&1)
+    rc=$?
+    case "$rc:$got" in
+        "2:tests/$r/run.sh: no case matches no_such_name_here "*) ;;
+        *) why="$why $r: exit $rc, '$got';" ;;
+    esac
+done
+[ -z "$why" ] && ok jobs_no_match || bad jobs_no_match "$why"
+# --grep TEXT: the transcripts whose file holds TEXT, and no check; -u:
+# no check either.
+want=$(grep -l -F 'query.no-match' "$ROOT"/tests/query/*.q | sed 's|.*/\(.*\)\.q$|transcript \1|' | tr '\n' ',')
+got=$(sh "$ROOT/tests/query/run.sh" -l --grep 'query.no-match' | tr '\n' ',')
+[ -n "$want" ] && [ "$got" = "$want" ] && ok jobs_grep || bad jobs_grep "got '$got', expected '$want'"
+got=$(sh "$ROOT/tests/refactor/run.sh" -l -u | grep -c '^check ')
+[ "$got" = 0 ] && ok jobs_update_no_checks || bad jobs_update_no_checks "$got checks listed with -u"
+# Every check a runner lists has its arm in job_check, and every arm is
+# listed.
+why=""
+for r in query refactor; do
+    listed=$(sed -n 's/^CHECKS="\(.*\)"$/\1/p' "$ROOT/tests/$r/run.sh" | tr ' ' '\n' | sort | tr '\n' ' ')
+    arms=$(awk '/^job_check\(\) \{/ { on = 1 } on && /^}/ { on = 0 } on && /^        [a-z][A-Za-z0-9_-]*\)$/ { sub(/\)$/, ""); print $1 }' \
+        "$ROOT/tests/$r/run.sh" | sort | tr '\n' ' ')
+    [ -n "$listed" ] && [ "$listed" = "$arms" ] || why="$why $r: CHECKS '$listed', arms '$arms';"
+done
+[ -z "$why" ] && ok jobs_checks_listed || bad jobs_checks_listed "$why"
+# The jobs run some at once, each one's report printed when it ends (the
+# quick one first when two run at once, the file's order with one); a
+# job that reports nothing is a failure of its name.
+(
+    . "$ROOT/tests/jobs.sh"
+    run_job() {
+        case "$2" in
+            slow) sleep 2; echo "pass slow" ;;
+            quick) echo "pass quick" ;;
+            silent) : ;;
+        esac
+    }
+    printf 'check slow\ncheck quick\ncheck silent\n' >"$WORK/jobs"
+    two=$(jobs_run "$WORK/jobs" 2 | tr '\n' ',')
+    one=$(jobs_run "$WORK/jobs" 1 | tr '\n' ',')
+    [ "$two" = "pass quick,FAIL silent: the job reported nothing,pass slow," ] \
+        && [ "$one" = "pass slow,pass quick,FAIL silent: the job reported nothing," ] \
+        && [ "$(jobs_count pass)" = 2 ] && [ "$(jobs_count FAIL)" = 1 ] \
+        && ok jobs_stream || bad jobs_stream "-j 2: '$two'; -j 1: '$one'"
+)
+[ $? -eq 0 ] || BAD=1
+# A run's first line is its plan, its last the counts; a transcript that
+# differs fails the run (a compiler that prints nothing).
+printf '#!/bin/sh\nexit 0\n' >"$WORK/silent-volec"
+chmod +x "$WORK/silent-volec"
+got=$(sh "$ROOT/tests/query/run.sh" -c "$WORK/silent-volec" -j 2 -n clash 2>&1)
+rc=$?
+case "$rc:$(printf '%s\n' "$got" | head -1):$(printf '%s\n' "$got" | grep -c '^FAIL clash (\(off\|cache\)): '):$(printf '%s\n' "$got" | tail -1)" in
+    "1:query: 1 transcripts (off cache), 0 checks, -j 2:2:query: 0 passed, 2 failed, "*" s") ok jobs_plan_and_counts ;;
+    *) bad jobs_plan_and_counts "exit $rc: $(printf '%s\n' "$got" | head -1) ... $(printf '%s\n' "$got" | tail -1)" ;;
+esac
+# tests/run.sh SUITE:FILTER: the suite, its runner given the filter.
+got=$(sh "$ROOT/tests/run.sh" -l refactor:rename query:=clash query:self_ | tr '\n' ',')
+[ "$got" = "suite query only =clash self_,suite refactor only rename," ] && ok filters_suite_names || bad filters_suite_names "got '$got'"
+# (the suite itself selected too: all of it)
+got=$(sh "$ROOT/tests/run.sh" -l -n query query:=clash lsp:embed lsp | tr '\n' ',')
+[ "$got" = "suite query,suite lsp," ] && ok filters_suite_whole || bad filters_suite_whole "got '$got'"
+
 # tests/affected.map: every set, cmd and prefix it names exists.
 problems=$(awk '
     { sub(/#.*/, "") }

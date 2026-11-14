@@ -51,6 +51,13 @@
 #                 whose name contains a FILTER (`tests/run.sh pathtrace`:
 #                 every case of the path tracer); several of them, -n
 #                 and -f select the union
+#   SUITE:FILTER  (0.30) the suite query, refactor, lsp or fmt, and of it
+#                 only the transcripts, sessions and checks whose name
+#                 contains FILTER (`tests/run.sh -j 2 refactor:rename
+#                 query:=clash`; `=NAME`: NAME exactly; the suite's own
+#                 runner lists them: tests/refactor/run.sh -l). With no
+#                 case selected, -j JOBS is the query and refactor
+#                 suites' too (each)
 #
 # Environment: CC is the linker (and the assembler with -a; default cc).
 # VOLE_JOBSERVER (0.11), when -j is not given, names a FIFO holding
@@ -251,7 +258,42 @@ for f in "$@"; do
     FILTERS="$FILTERS$f
 "
 done
-FILTER=$(printf '%s' "$FILTERS" | tr '\n' ' ' | sed 's/ $//')
+# (0.30) SUITE:FILTER, for the suites that take names (query, refactor,
+# lsp, fmt): the suite, and FILTER given to its runner (the transcripts,
+# sessions and checks of it whose name contains FILTER; `=NAME`: NAME
+# exactly). Several for one suite select the union.
+SUB_query=""
+SUB_refactor=""
+SUB_lsp=""
+SUB_fmt=""
+ALLF=$FILTERS
+FILTERS=""
+while IFS= read -r f; do
+    case "$f" in
+        query:?*) SUB_query="$SUB_query ${f#*:}"; f="=query" ;;
+        refactor:?*) SUB_refactor="$SUB_refactor ${f#*:}"; f="=refactor" ;;
+        lsp:?*) SUB_lsp="$SUB_lsp ${f#*:}"; f="=lsp" ;;
+        fmt:?*) SUB_fmt="$SUB_fmt ${f#*:}"; f="=fmt" ;;
+        "") continue ;;
+        # (a FILTER that selects the suite itself: all of it, whatever
+        # names another gives)
+        =query|=refactor|=lsp|=fmt) eval "WHOLE_${f#=}=1" ;;
+        =*) ;;
+        *)
+            for s in query refactor lsp fmt; do
+                case "$s" in *"$f"*) eval "WHOLE_$s=1" ;; esac
+            done ;;
+    esac
+    FILTERS="$FILTERS$f
+"
+done <<EOF
+$ALLF
+EOF
+[ -z "${WHOLE_query:-}" ] || SUB_query=""
+[ -z "${WHOLE_refactor:-}" ] || SUB_refactor=""
+[ -z "${WHOLE_lsp:-}" ] || SUB_lsp=""
+[ -z "${WHOLE_fmt:-}" ] || SUB_fmt=""
+FILTER=$(printf '%s' "$ALLF" | tr '\n' ' ' | sed 's/ $//')
 VOLE_RUN_FILTERS=$FILTERS
 export VOLE_RUN_FILTERS
 
@@ -301,7 +343,9 @@ if [ "$LIST" = 1 ]; then
     all_cases | select_names | awk '{ print "case " $1 }'
     for s in $SUITES; do
         [ -z "$(want "$s")" ] && continue
-        case " $LEVELED " in *" $s "*) echo "suite $s leveled" ;; *) echo "suite $s" ;; esac
+        # (0.30: a suite given names, `suite refactor only NAME...`)
+        eval "sub=\${SUB_$(echo "$s" | tr - _):-}"
+        case " $LEVELED " in *" $s "*) echo "suite $s leveled" ;; *) echo "suite $s${sub:+ only$sub}" ;; esac
     done
     exit 0
 fi
@@ -982,13 +1026,16 @@ fi
 CASES="$WORK/cases"
 all_cases | select_names >"$CASES"
 
-# The tools' suites (below) run alongside the cases: they are serial, and
-# take seconds.
+# The tools' suites (below) run alongside the cases: they are serial.
+# (0.30) When the filters select no case and -j is given, the query and
+# refactor suites run their transcripts and checks JOBS at once (each).
+TJOBS=1
+[ -s "$CASES" ] || [ -z "$JOBS" ] || TJOBS=$JOBS
 case $(want query) in
-    y) "$ROOT/tests/query/run.sh" -c "$COMPILER" >"$WORK/query.out" 2>&1 & ;;
+    y) "$ROOT/tests/query/run.sh" -c "$COMPILER" -j "$TJOBS" $SUB_query >"$WORK/query.out" 2>&1 & ;;
 esac
 case $(want refactor) in
-    y) "$ROOT/tests/refactor/run.sh" -c "$COMPILER" >"$WORK/refactor.out" 2>&1 & ;;
+    y) "$ROOT/tests/refactor/run.sh" -c "$COMPILER" -j "$TJOBS" $SUB_refactor >"$WORK/refactor.out" 2>&1 & ;;
 esac
 case $(want guide) in
     y) "$ROOT/tests/guide/run.sh" -c "$COMPILER" >"$WORK/guide.out" 2>&1 & ;;
@@ -998,7 +1045,7 @@ case $(want book) in
     y) "$ROOT/tests/book/run.sh" -c "$COMPILER" >"$WORK/book.out" 2>&1 & ;;
 esac
 case $(want fmt) in
-    y) "$ROOT/tests/fmt/run.sh" -c "$COMPILER" -j 1 >"$WORK/fmt.out" 2>&1 & ;;
+    y) "$ROOT/tests/fmt/run.sh" -c "$COMPILER" -j 1 $SUB_fmt >"$WORK/fmt.out" 2>&1 & ;;
 esac
 case $(want walkthrough) in
     y) "$ROOT/tests/walkthrough/run.sh" -c "$COMPILER" >"$WORK/walkthrough.out" 2>&1 & ;;
@@ -1036,7 +1083,7 @@ case $(want runner) in
 esac
 # (0.24) The language server's sessions (tests/lsp/run.sh): category "lsp".
 case $(want lsp) in
-    y) "$ROOT/tests/lsp/run.sh" -c "$COMPILER" >"$WORK/lsp.out" 2>&1 & ;;
+    y) "$ROOT/tests/lsp/run.sh" -c "$COMPILER" $SUB_lsp >"$WORK/lsp.out" 2>&1 & ;;
 esac
 # (0.25) The link without cc, and its template (tests/link/run.sh):
 # category "link". (macOS and Linux hosts; the target's own)
@@ -1175,8 +1222,9 @@ case $(want query) in
         if ! grep -q '^pass' "$WORK/query.out"; then
             echo "query fail" >>"$TALLY"
             count=$((count + 1))
+            { echo "FAIL query: tests/query/run.sh reported nothing:"; sed 's/^/    /' "$WORK/query.out" | head -20; echo; } >>"$FAILURES"
         fi
-        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/query.out" >>"$FAILURES"
+        awk '/^FAIL/ { p = 1 } /^(pass|query:)/ { p = 0 } p' "$WORK/query.out" >>"$FAILURES"
         ;;
 esac
 
@@ -1193,6 +1241,7 @@ case $(want lsp) in
         if ! grep -q '^pass' "$WORK/lsp.out"; then
             echo "lsp fail" >>"$TALLY"
             count=$((count + 1))
+            { echo "FAIL lsp: tests/lsp/run.sh reported nothing:"; sed 's/^/    /' "$WORK/lsp.out" | head -20; echo; } >>"$FAILURES"
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/lsp.out" >>"$FAILURES"
         ;;
@@ -1323,8 +1372,9 @@ case $(want refactor) in
         if ! grep -q '^pass' "$WORK/refactor.out"; then
             echo "refactor fail" >>"$TALLY"
             count=$((count + 1))
+            { echo "FAIL refactor: tests/refactor/run.sh reported nothing:"; sed 's/^/    /' "$WORK/refactor.out" | head -20; echo; } >>"$FAILURES"
         fi
-        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/refactor.out" >>"$FAILURES"
+        awk '/^FAIL/ { p = 1 } /^(pass|xfail|refactor:)/ { p = 0 } p' "$WORK/refactor.out" >>"$FAILURES"
         ;;
 esac
 
@@ -1380,6 +1430,7 @@ case $(want fmt) in
         if ! grep -q '^pass' "$WORK/fmt.out"; then
             echo "fmt fail" >>"$TALLY"
             count=$((count + 1))
+            { echo "FAIL fmt: tests/fmt/run.sh reported nothing:"; sed 's/^/    /' "$WORK/fmt.out" | head -20; echo; } >>"$FAILURES"
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/fmt.out" >>"$FAILURES"
         ;;
