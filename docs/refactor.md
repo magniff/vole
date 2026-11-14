@@ -504,6 +504,12 @@ which makes `compiler/src/front/stdsrc.vl`, and rebuild. What follows
 is the old std's, 0.17 to 0.27, and comes back with the files read as
 modules.
 
+(0.30) A typed rewrite does reach std's files: `volec rewrite PAT REPL
+--in std` (`--in std::vec`, `--in compiler/std/vec.vl`) matches in them,
+checks the program with their new texts and writes them as one edit;
+`embed.sh` and the build are then the caller's
+([refactor-shape.md](refactor-shape.md), "std's files").
+
 In the vole repository (`compiler/std/` with its `embed.sh`, from the
 current directory or one of the three above it), an edit whose target
 is a std item (`edit patch std::trim`, `edit insert --after Vec::swap`,
@@ -1062,7 +1068,12 @@ every command.
   [query.md](query.md), Known limits).
 - Phase 2 (0.11): `refactor signature`, `field`, `variant`, the typed
   `rewrite` and `refactor --script` are in
-  [refactor-shape.md](refactor-shape.md); `refactor rename`, `move`,
+  [refactor-shape.md](refactor-shape.md) (0.30 there: `rewrite`'s
+  holes for a field's and a method's name and a literal's text, the
+  sites inside the function a replacement calls refused, `--not-in`,
+  `--at-errors`, `--from FILE`, std's files; `refactor field --type`
+  with several fields, `--allocator` and `--rewrite`; `refactor
+  signature --batch`; `refactor fold`); `refactor rename`, `move`,
   `new-module`, `move-module`, `split` in
   [refactor-modules.md](refactor-modules.md); all on this engine
   (`edit_replace`, `edit_new_file`, `apply_edit` in
