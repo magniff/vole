@@ -81,9 +81,9 @@
 #                 only the transcripts, sessions and checks whose name
 #                 contains FILTER (`tests/run.sh -j 2 refactor:rename
 #                 query:=clash`; `=NAME`: NAME exactly; the suite's own
-#                 runner lists them: tests/refactor/run.sh -l). With no
-#                 case selected, -j JOBS is the query and refactor
-#                 suites' too (each)
+#                 runner lists them: tests/refactor/run.sh -l). With -j
+#                 given, the query and refactor suites run JOBS of their
+#                 transcripts at once (each; two at most beside cases)
 #
 # Environment: CC is the linker (and the assembler with -a; default cc).
 # VOLE_JOBSERVER (0.11), when -j is not given, names a FIFO holding
@@ -1253,10 +1253,16 @@ fi
 # the free slots).
 
 # The tools' suites (below) run alongside the cases: they are serial.
-# (0.30) When the filters select no case and -j is given, the query and
-# refactor suites run their transcripts and checks JOBS at once (each).
+# (0.30) With -j given, the query and refactor suites run their
+# transcripts and checks some at once (each): JOBS when the filters
+# select no case, two at most beside the cases (the refactor suite, 16
+# minutes one by one, was what a plan waited for). Without -j (the
+# gate's rows, on the jobserver's slots): one by one, as before.
 TJOBS=1
-[ -s "$CASES" ] || [ -z "$JOBS" ] || TJOBS=$JOBS
+if [ -n "$JOBS" ]; then
+    TJOBS=$JOBS
+    [ ! -s "$CASES" ] || [ "$JOBS" -le 2 ] || TJOBS=2
+fi
 case $(want query) in
     y) run_suite query "$ROOT/tests/query/run.sh" -c "$COMPILER" -j "$TJOBS" $SUB_query ;;
 esac

@@ -628,7 +628,12 @@ for l in $LEVELS; do
     echo "==> tests/run.sh -O$l ($(grep -c . "$pf") filters)" >&2
     t0=$(date +%s)
     # shellcheck disable=SC2086
-    if tests/run.sh -c "$COMPILER" -O "$l" $JFLAG -f "$pf" >"$WORK/run-O$l.log" 2>&1; then
+    # (0.30) its plan and each suite's line as they come, the rest in the log
+    {
+        tests/run.sh -c "$COMPILER" -O "$l" $JFLAG -f "$pf" 2>&1
+        echo "$?" >"$WORK/run.rc"
+    } | tee "$WORK/run-O$l.log" | awk '/^(plan: |suite [a-z_-]+: [0-9]+ pass)/ { print "    " $0; fflush() }' >&2
+    if [ "$(cat "$WORK/run.rc" 2>/dev/null)" = 0 ]; then
         tail -n +1 "$WORK/run-O$l.log" | awk '/^tests for /{ p = 1 } p' | grep -E '^tests for|  total|^lazy std:'
         result PASS "tests/run.sh -O$l: $(awk '$1 == "total" { print $2 " passed, " $3 " xfail" }' "$WORK/run-O$l.log")" $(( $(date +%s) - t0 ))
     else
