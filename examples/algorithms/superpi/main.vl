@@ -258,11 +258,12 @@ fn mont_mul(x: u64, y: u64, m: &Mont) -> u64 {
     if u >= m.p { u - m.p } else { u }
 }
 
-// One stage, two butterflies at a time: the operands are below 2^30, so
+// One stage of the inverse transform (decimation in time: u + y w and
+// u - y w), two butterflies at a time: the operands are below 2^30, so
 // they live in u32 lanes and the widening NEON multiplies take them
 // straight. Montgomery's reduction is umull, umlal and a shift; the
 // modular add and subtract are u32 lanes again.
-fn ntt_stage_simd(v: &mut [u32], tws: &[u32], n: usize, len: usize, m: &Mont) {
+fn dit_stage_simd(v: &mut [u32], tws: &[u32], n: usize, len: usize, m: &Mont) {
     let half = len / 2;
     let pv = vdup_n_u32(m.p as u32);
     let invv = vdup_n_u32(m.inv as u32);
@@ -285,33 +286,76 @@ fn ntt_stage_simd(v: &mut [u32], tws: &[u32], n: usize, len: usize, m: &Mont) {
             k += 2;
         }
         while k < half {
-            let u = v[start + k] as u64;
-            let t = mont_mul(v[start + k + half] as u64, tws[k] as u64, m);
-            let sum = u + t;
-            v[start + k] = (if sum >= m.p { sum - m.p } else { sum }) as u32;
-            v[start + k + half] = (if u >= t { u - t } else { u + m.p - t }) as u32;
+            dit_butterfly(v, start + k, start + k + half, tws[k] as u64, m);
             k += 1;
         }
         start += len;
     }
 }
 
+// The same stage of the forward transform (decimation in frequency:
+// u + y and (u - y) w).
+fn dif_stage_simd(v: &mut [u32], tws: &[u32], n: usize, len: usize, m: &Mont) {
+    let half = len / 2;
+    let pv = vdup_n_u32(m.p as u32);
+    let invv = vdup_n_u32(m.inv as u32);
+    let mut start = 0;
+    while start < n {
+        let mut k = 0;
+        while k + 2 <= half {
+            let u = vld1_u32(v, (start + k) as i64);
+            let w = vld1_u32(tws, k as i64);
+            let y = vld1_u32(v, (start + k + half) as i64);
+            let sum = vadd_u32(u, y);
+            vst1_u32(v, (start + k) as i64, vbsl_u32(vcge_u32(sum, pv), vsub_u32(sum, pv), sum));
+            let ge = vcge_u32(u, y);
+            let d = vbsl_u32(ge, vsub_u32(u, y), vadd_u32(vsub_u32(u, y), pv));
+            let prod = vmull_u32(d, w);
+            let mm = vmovn_u64(vmull_u32(vmovn_u64(prod), invv));
+            let t = vmovn_u64(vshrq_n_u64(vmlal_u32(prod, mm, pv), 32));
+            vst1_u32(v, (start + k + half) as i64, vbsl_u32(vcge_u32(t, pv), vsub_u32(t, pv), t));
+            k += 2;
+        }
+        while k < half {
+            dif_butterfly(v, start + k, start + k + half, tws[k] as u64, m);
+            k += 1;
+        }
+        start += len;
+    }
+}
+
+// One butterfly of the inverse transform, on v[i] and v[j].
+fn dit_butterfly(v: &mut [u32], i: usize, j: usize, w: u64, m: &Mont) {
+    let u = v[i] as u64;
+    let t = mont_mul(v[j] as u64, w, m);
+    let sum = u + t;
+    v[i] = (if sum >= m.p { sum - m.p } else { sum }) as u32;
+    v[j] = (if u >= t { u - t } else { u + m.p - t }) as u32;
+}
+
+// One butterfly of the forward transform, on v[i] and v[j].
+fn dif_butterfly(v: &mut [u32], i: usize, j: usize, w: u64, m: &Mont) {
+    let u = v[i] as u64;
+    let y = v[j] as u64;
+    let sum = u + y;
+    v[i] = (if sum >= m.p { sum - m.p } else { sum }) as u32;
+    v[j] = mont_mul(if u >= y { u - y } else { u + m.p - y }, w, m) as u32;
+}
+
 // The roots of unity of one transform length, in Montgomery form, stored
 // stage by stage: the stage of blocks of 2h points reads its h twiddles
 // w_2h^k at [h + k], a contiguous run, so the table has l entries in all
-// (entry 0 is unused) and no stage gathers or copies anything. All three
-// transforms of a product share it.
-struct Roots<A: Allocator> {
-    fwd: Vec<u32, A>,
-    inv: Vec<u32, A>,
-}
+// (entry 0 is unused) and no stage gathers or copies anything. All the
+// transforms of a product share it, the inverse ones too.
+struct Roots<A: Allocator> { fwd: Vec<u32, A> }
 
-// The table of the powers of w, a primitive l-th root: the top stage's
-// run is w^0..w^(l/2 - 1), by Montgomery products (no division), and
-// each stage below is every second entry of the one above.
-fn stage_table(w: u64, l: usize, m: &Mont, gpa: Gpa) -> Vec<u32, Gpa> {
-    let mut table = Vec::from_elem_in(0u32, l, gpa);
-    let t = table.as_mut_slice();
+// The top stage's run is w^0..w^(l/2 - 1), by Montgomery products (no
+// division), and each stage below is every second entry of the one
+// above.
+fn roots_new(m: &Mont, l: usize, gpa: Gpa) -> Roots<Gpa> {
+    let w = powmod(NTT_ROOT, (m.p - 1) / l as u64, m.p);
+    let mut fwd = Vec::from_elem_in(0u32, l, gpa);
+    let t = fwd.as_mut_slice();
     let one = (1u64 << 32) % m.p;
     let wr = mont_mul(w, one * one % m.p, m);
     let top = l / 2;
@@ -325,62 +369,69 @@ fn stage_table(w: u64, l: usize, m: &Mont, gpa: Gpa) -> Vec<u32, Gpa> {
         for k in 0..h { t[h + k] = t[2 * h + 2 * k]; }
         h /= 2;
     }
-    table
+    Roots { fwd }
 }
 
-fn roots_new(m: &Mont, l: usize, gpa: Gpa) -> Roots<Gpa> {
-    let p = m.p;
-    let w = powmod(NTT_ROOT, (p - 1) / l as u64, p);
-    let wi = powmod(w, p - 2, p);
-    Roots { fwd: stage_table(w, l, m, gpa), inv: stage_table(wi, l, m, gpa) }
-}
-
-// In-place iterative Cooley-Tukey transform; v.len() is a power of two.
-// Values arrive in the ordinary domain and, forward, stay in the
-// Montgomery domain afterwards; the inverse transform converts back.
+// The transform, in place, without a bit-reversal pass; v.len() is a
+// power of two. Forward, the stages run from the whole array down to
+// pairs (decimation in frequency) and leave the spectrum in bit-reversed
+// order, in the Montgomery domain; a pointwise product does not care
+// about the order. The inverse runs the stages from pairs up (decimation
+// in time), which takes that order back to the natural one. It uses the
+// forward roots: that computes n times the inverse transform with its
+// indices negated, so the result's entry i is read at (n - i) mod n,
+// which one pass of swaps undoes while it scales by 1/n and leaves the
+// Montgomery domain.
 fn ntt(v: &mut [u32], roots: &Roots<Gpa>, m: &Mont, inverse: bool) {
     let p = m.p;
     let n = v.len();
-    if !inverse { for i in 0..n { v[i] = (((v[i] as u64) << 32) % p) as u32; } }
-    let mut j = 0;
-    for i in 1..n {
-        let mut bit = n >> 1;
-        while j & bit != 0 {
-            j ^= bit;
-            bit >>= 1;
+    let table = roots.fwd.as_slice();
+    let simd = detect("neon");
+    if !inverse {
+        for i in 0..n { v[i] = (((v[i] as u64) << 32) % p) as u32; }
+        let mut len = n;
+        while len >= 2 {
+            let half = len / 2;
+            let tws = &table[half..len];
+            if simd {
+                dif_stage_simd(v, tws, n, len, m);
+            } else {
+                let mut start = 0;
+                while start < n {
+                    for k in 0..half {
+                        dif_butterfly(v, start + k, start + k + half, tws[k] as u64, m);
+                    }
+                    start += len;
+                }
+            }
+            len /= 2;
         }
-        j ^= bit;
-        if i < j {
-            let t = v[i];
-            v[i] = v[j];
-            v[j] = t;
-        }
+        return;
     }
-    let table = if inverse { roots.inv.as_slice() } else { roots.fwd.as_slice() };
     let mut len = 2;
     while len <= n {
         let half = len / 2;
         let tws = &table[half..len];
-        if detect("neon") {
-            ntt_stage_simd(v, tws, n, len, m);
+        if simd {
+            dit_stage_simd(v, tws, n, len, m);
         } else {
             let mut start = 0;
             while start < n {
                 for k in 0..half {
-                    let u = v[start + k] as u64;
-                    let t = mont_mul(v[start + k + half] as u64, tws[k] as u64, m);
-                    let sum = u + t;
-                    v[start + k] = (if sum >= p { sum - p } else { sum }) as u32;
-                    v[start + k + half] = (if u >= t { u - t } else { u + p - t }) as u32;
+                    dit_butterfly(v, start + k, start + k + half, tws[k] as u64, m);
                 }
                 start += len;
             }
         }
         len *= 2;
     }
-    if inverse {
-        let ninv = powmod(n as u64, p - 2, p);
-        for i in 0..n { v[i] = (mont_mul(v[i] as u64, 1, m) * ninv % p) as u32; }
+    let ninv = powmod(n as u64, p - 2, p);
+    v[0] = (mont_mul(v[0] as u64, 1, m) * ninv % p) as u32;
+    v[n / 2] = (mont_mul(v[n / 2] as u64, 1, m) * ninv % p) as u32;
+    for i in 1..n / 2 {
+        let lo = mont_mul(v[i] as u64, 1, m) * ninv % p;
+        v[i] = (mont_mul(v[n - i] as u64, 1, m) * ninv % p) as u32;
+        v[n - i] = lo as u32;
     }
 }
 
