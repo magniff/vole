@@ -597,7 +597,12 @@ struct Engine<A: Allocator> {
 }
 
 impl Engine<Gpa> {
-    fn new(gpa: Gpa) -> Engine<Gpa> {
+    fn new(gpa: Gpa) -> Engine<Gpa> { Engine::with_threads(0, gpa) }
+
+    // An engine that runs at most `threads` threads at once (0: as many
+    // as the machine has cores).
+    fn with_threads(threads: usize, gpa: Gpa) -> Engine<Gpa> {
+        let most = if threads == 0 { thread::available_parallelism() } else { threads };
         let mont = [mont_new(0), mont_new(1), mont_new(2)];
         Engine {
             gpa,
@@ -605,7 +610,7 @@ impl Engine<Gpa> {
             mont,
             tables: [RwLock::new(Vec::new_in(gpa)), RwLock::new(Vec::new_in(gpa)),
                 RwLock::new(Vec::new_in(gpa))],
-            idle: AtomicUsize::new(thread::available_parallelism() - 1),
+            idle: AtomicUsize::new(most - 1),
         }
     }
 
@@ -1552,20 +1557,25 @@ fn combine(left: &Split<Gpa>, right: &Split<Gpa>, root: bool, cx: &Engine<Gpa>) 
 }
 
 // floor(pi * 10^scale), as a BigUint.
-fn chudnovsky(digits: i64, scale: i64, timings: bool, gpa: Gpa) -> BigUint<Gpa> {
+fn chudnovsky(digits: i64, scale: i64, timings: bool, threads: usize, gpa: Gpa) -> BigUint<Gpa> {
     let terms = ((digits + GUARD) / DIGITS_PER_TERM + 1) as u64;
-    let cx = &Engine::new(gpa);
+    let cx = &Engine::with_threads(threads, gpa);
     let t0 = now_ns();
     // sqrt(10005) at 10^scale: the integer root of 10005 * 10^(2 scale).
     // It depends on nothing in the series, so it runs beside the split.
     let mut radicand = pow10((2 * scale) as usize, gpa);
     radicand.mul_small(10005);
-    let counted = cx.take(1);
-    let (s, root) = thread::scope(|sc| {
-        let h = sc.spawn(move || isqrt(&radicand, cx));
-        let s = binary_split(0, terms, true, cx);
-        (s, h.join().unwrap())
-    });
+    let beside = cx.take(1);
+    let (s, root) = if beside {
+        thread::scope(|sc| {
+            let h = sc.spawn(move || isqrt(&radicand, cx));
+            let s = binary_split(0, terms, true, cx);
+            (s, h.join().unwrap())
+        })
+    } else {
+        let root = isqrt(&radicand, cx);
+        (binary_split(0, terms, true, cx), root)
+    };
     let t1 = now_ns();
     if s.neg { panic("superpi: the series' sum came out negative"); }
     // The reciprocal needs only T, the numerator only the root and Q, so
@@ -1573,13 +1583,19 @@ fn chudnovsky(digits: i64, scale: i64, timings: bool, gpa: Gpa) -> BigUint<Gpa> 
     // length, and more precision only makes the estimate better.
     let prec = root.limbs.len() + s.q.limbs.len() - s.t.limbs.len() + 5;
     let divisor = &s.t;
-    let (num, rcp) = thread::scope(|sc| {
-        let h = sc.spawn(move || reciprocal(divisor, prec, cx));
+    let (num, rcp) = if beside {
+        thread::scope(|sc| {
+            let h = sc.spawn(move || reciprocal(divisor, prec, cx));
+            let mut num = root.times(&s.q, cx);
+            num.mul_small(426880);
+            (num, h.join().unwrap())
+        })
+    } else {
         let mut num = root.times(&s.q, cx);
         num.mul_small(426880);
-        (num, h.join().unwrap())
-    });
-    if counted { cx.give(1); }
+        (num, reciprocal(divisor, prec, cx))
+    };
+    if beside { cx.give(1); }
     let (q, _) = quotient_with_rcp(&num, &s.t, &rcp, prec, cx);
     let t2 = now_ns();
     if timings {
@@ -1674,6 +1690,8 @@ fn main(gpa: Gpa) -> i32 {
         .about("pi to any number of digits: Chudnovsky's series, binary splitting, Karatsuba limbs")
         .arg(Arg::positional("digits").value_name("N").default("1000")
             .help("digits after the decimal point"))
+        .arg(Arg::option("threads").value_name("N").default("0")
+            .help("threads at most (0: one per core)"))
         .arg(Arg::flag("no-check").help("skip the Machin-formula cross-check"))
         .arg(Arg::flag("check").help("cross-check even above 10000 digits (quadratic)"));
     let m = cmd.parse_or_exit(env::args());
@@ -1685,10 +1703,18 @@ fn main(gpa: Gpa) -> i32 {
         eprintln("superpi: digits must not be negative");
         return 2;
     }
+    let threads = match m.get_as::<i64>("threads") {
+        Ok(n) => n,
+        Err(e) => cmd.exit(e),
+    };
+    if threads < 0 {
+        eprintln("superpi: threads must not be negative");
+        return 2;
+    }
     let scale = digits + GUARD;
     println("superpi: {digits} digits after the decimal point");
     let t0 = now_ns();
-    let pi = chudnovsky(digits, scale, true, gpa);
+    let pi = chudnovsky(digits, scale, true, threads as usize, gpa);
     let t1 = now_ns();
     let text = scaled_text(&pi, scale, gpa);
     print_digits(text.as_str(), digits, gpa);
@@ -1899,7 +1925,7 @@ fn leaves_match_combines(gpa: Gpa) {
 #[test]
 fn large_pi_agrees(gpa: Gpa) {
     let scale = 5000 + GUARD;
-    let a = chudnovsky(5000, scale, false, gpa);
+    let a = chudnovsky(5000, scale, false, 0, gpa);
     let b = machin(scale, gpa);
     let ta = scaled_text(&a, scale, gpa);
     let tb = scaled_text(&b, scale, gpa);
@@ -1939,7 +1965,7 @@ fn square_roots(gpa: Gpa) {
 // The first hundred digits, against the published expansion.
 #[test]
 fn pi_first_hundred(gpa: Gpa) {
-    let pi = chudnovsky(100, 100 + GUARD, false, gpa);
+    let pi = chudnovsky(100, 100 + GUARD, false, 1, gpa);
     let text = scaled_text(&pi, 100 + GUARD, gpa);
     assert_eq !(&text.as_str()[..101],
         "31415926535897932384626433832795028841971693993751058209749445923078164062862089986280348253421170679");
@@ -1949,7 +1975,7 @@ fn pi_first_hundred(gpa: Gpa) {
 #[test]
 fn machin_agrees(gpa: Gpa) {
     let scale = 200 + GUARD;
-    let a = chudnovsky(200, scale, false, gpa);
+    let a = chudnovsky(200, scale, false, 0, gpa);
     let b = machin(scale, gpa);
     let ta = scaled_text(&a, scale, gpa);
     let tb = scaled_text(&b, scale, gpa);
