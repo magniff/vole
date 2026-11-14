@@ -30,6 +30,7 @@ volec query show MODULE::section TITLE                   (0.13)
 volec query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--ignore-case] [--count] [--limit N] [--all]
 volec query type FILE:LINE[:COL]...                      (0.13)
 volec query drops FILE:LINE...                           (0.26.1)
+volec query asm FN... [--all]                            (0.30)
 volec query stats [MODULE|FILE] [--over N] [--all]      (refactor.md)
 volec query deps MODULE [--max-lines N]                 (refactor.md)
 volec query unused [MODULE|FILE] [--all]                (refactor.md)
@@ -121,6 +122,8 @@ tools` the ones a program needs.
 | a module's section banners; one section | `target/volec query items MODULE --comments`, `query show MODULE::section TITLE` |
 | the type of an expression | `target/volec query type FILE:LINE:COL` |
 | a function's drops, each decided (kept, removed, flagged, opened) and where it runs (0.26.1) | `target/volec query drops FILE:LINE` |
+| the machine code of a function at -O2 (0.30) | `target/volec query asm NAME` (as `-S` writes it; each instance a block) |
+| what is known of the Vec headers a function may write, and the instruction that made it unknown (0.30) | `target/volec -O2 --vec-stats=FN FILE.vl -c -o /dev/null` (`vec-headers: FN: ...`) |
 | what a function may do (allocate, io, panic, loop forever) | `target/volec query effects NAME\|MODULE` (`--why EFFECT`: the chain; `--has alloc(Gpa)`: which still allocate) |
 | every unsafe site: what it does, its class, whether it says why | `target/volec query unsafe [FILE...\|std]` (`--unjustified`, `--unneeded`, `--summary`, `--json`) |
 | the CPU intrinsic for a task, its instruction and feature; what a function needs of the CPU (0.19) | `target/volec query arch WORDS` (`--feature crc`, `--equiv NAME`); `query show vqtbl1q_u8`; `query features NAME --why crc` |
@@ -701,6 +704,44 @@ Two kinds of std function are still checked only where a program uses
 them, and a block in one is `not checked` then: a trait's default
 method as an impl has it, and a body the opaque model does not cover
 (`note check.std` counts them).
+
+## asm (0.30)
+
+`asm NAME...` prints the machine code of the functions NAME names in the
+program at -O2: the program is built by the compiler run again (`volec
+-O2 -S ROOT -o /dev/stdout`: the code generator's own text, no
+disassembler), and each function's block is printed from its label to
+the next function's.
+
+```
+$ volec query asm bump
+_vole.bump:
+L1:
+    ldr x9, [x0, #48]
+    add x9, x9, #1
+    str x9, [x0, #48]
+    ret
+```
+
+A NAME is a path or its end, as the code's symbols have it: `bump`,
+`Vec::push`, `std::fmt::Formatter::pad` (a symbol is `_vole.` and the
+path with `.` for `::`; an instance has its type arguments after it,
+`.G...`, and is a block of its own). Four blocks of a NAME are shown
+(`note query.truncated` says of how many; `--all`: every one). A
+function with no code of its own, inlined into all its callers or
+reached by nothing, is `error query.no-match`, which says so; a program
+that does not build is `error query.asm-build` under the build's
+errors. The target is the host's; the level is -O2.
+
+What the optimizer knew when it wrote that code: `volec -O2
+--vec-stats=FN FILE.vl -c -o /dev/null` prints, besides FN's loops,
+`vec-headers: FN: known: writes through operand 0 (words 0..3)`, the
+summary of the Vec headers FN may write (middle/callfacts.vl: what its
+callers keep a Vec's pointer and length across the call with), or
+`vec-headers: FN: unknown: line 44: a call of `pid`, whose summary is
+unknown (--vec-stats=pid)`: the first instruction that made it unknown,
+which names the function to ask next. `--print-after-all=FN` prints
+FN's IR after every pass.
 
 ## features (0.19)
 

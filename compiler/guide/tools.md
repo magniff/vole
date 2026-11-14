@@ -266,7 +266,8 @@ stdout, or to `-o FILE`. `volec guide TOPIC` for the language.
 | two compilers on one input, by pass | `tools/perf-diff.sh A B FILE.vl` (`--check`, `-O0`, `-n RUNS`, `--inline`: the inlining decisions that differ) |
 | a worktree against a baseline: self-build -O2 and -O0, check, the compile-cost programs | `tools/perf-experiment.sh [-b BASELINE] [WORKTREE]` (`--passes`, `--bench`) |
 | the benchmarks' own instructions against a baseline | `bench/run.sh --instructions -p BASELINE` |
-| why a loop was not vectorized | `--vec-stats=FN` (a line per loop of FN; `--vec-stats`: the counts) |
+| why a loop was not vectorized; what a call leaves of a Vec's header | `--vec-stats=FN` (a line per loop of FN, and `vec-headers: FN: known: writes ...` or `unknown: line N:` with the first instruction that made the summary unknown; `--vec-stats`: the counts) |
+| the machine code of a function at -O2 | `volec query asm NAME` |
 | what the inliner decided | `VOLE_INLINE_LOG=FILE volec --no-cache -j1 ...` (a line a decision: caller, callee, the rule); `tools/inline-log-diff.py A.log B.log` |
 | the checks left, the attributes inferred | `--print-checks[=FILTER]`, `--print-attrs`, `--print-effects`, `--stats=functions` |
 | one transform off, to compare | `--no-vectorize`, `--no-slp`, `--no-ifconv`, `--no-unroll-runtime`, `--no-egraph`, `--no-noalias` |

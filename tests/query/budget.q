@@ -226,6 +226,7 @@ usage: volec query def|show NAME... [--root ROOT] [--exact] [--with-comments]
        volec query features NAME... [--why FEATURE] [-C target-cpu=CPU] [-C target-feature=+x,-y]   (std::arch: what a function needs beyond the build's features)
        volec query arch WORDS... [--feature F] [--arch aarch64|x86_64|portable] [--equiv NAME]   (std::arch: the intrinsics by name, instruction, feature or doc; also query intrinsics)
        volec query conflicts [FILE|DIR|FILE:LINE...] [--show]
+       volec query asm FN... [--all]   (0.30: the machine code of a function of the program at -O2, as `-S` writes it; each instance a block)
        volec query similar NAME... [--limit N]   (items like NAME to copy, nearest first)
        volec query examples [KIND...]   (items to start from for an "add an X" change; volec guide how)
        volec query unsafe [FILE...|DIR|std] [--no-std] [--summary] [--unjustified] [--json]   (every unsafe block, unsafe fn and extern block: what it does, its class, its UNSAFE:/SAFETY: comments)

@@ -26,6 +26,17 @@
 #                 as below; the program runs the same
 #   vec-counts    --vec-stats alone: the counts line only; -O0: no line
 #                 for a loop
+#   vec-headers   (0.30) --vec-stats=FN at -O2: `vec-headers: FN: known:
+#                 writes ...`, the summary of the Vec headers FN may write
+#                 (none; through an operand, the words; a static's), or
+#                 `unknown: line N:` and the first instruction that made
+#                 it so (a store through a loaded pointer, a call of C, a
+#                 call of a function whose summary is unknown, which the
+#                 line names to ask next); the object is the one a build
+#                 without the option writes; -O0: no line
+#   asm           (0.30) `volec query asm FN`: FN's machine code at -O2,
+#                 from its label to its `ret`, and no other function's; a
+#                 name the code has no function for: query.no-match
 #   json          (0.30) --time-passes=json at -O2: one JSON object on
 #                 stderr, `{"unit":"instructions","phases":[..],"total":N,
 #                 "passes":[..],"rest":[..],"front_end":N,"mark":{..}}`,
@@ -143,7 +154,82 @@ vec-stats: kernels, loop at line 14: not vectorized: an address computed from a 
 vec-stats: kernels, loop at line 17: not vectorized: a branch in its body that is no bounds check (an if, a break)
 vec-stats: kernels, loop at line 31: not vectorized: an unknown trip count: not a loop over a counter to a bound
 vec-stats: kernels, loop at line 35: not vectorized: a float carried from one iteration to the next (a float sum: lanes would add in another order) (phi)
+vec-headers: kernels: unknown: line 20: a store through an address the summary does not follow (a pointer loaded from memory, a raw pointer of unknown origin, a number made a pointer)
 vector loops 3, overlap tests 0, tests dropped by noalias 0
+EOF
+# (0.30) --vec-stats=FN also says what is known of the Vec headers FN may
+# write (middle/callfacts.vl), and for an unknown summary the first
+# instruction that made it so: headers.vl's functions, one of each kind.
+cat >headers.vl <<'EOF'
+use std::alloc::Allocator;
+
+// UNSAFE: a C function is declared.
+// SAFETY: getpid's prototype: no argument, an int.
+extern "C" {
+    fn getpid() -> i32;
+}
+
+struct Bag<A: Allocator> {
+    items: Vec<i64, A>,
+    seen: Vec<i64, A>,
+    total: i64,
+}
+
+#[inline(never)]
+fn bump(b: &mut Bag<Gpa>) {
+    b.total += 1;
+}
+
+#[inline(never)]
+fn add(b: &mut Bag<Gpa>, x: i64) {
+    b.items.push(x);
+}
+
+#[inline(never)]
+fn poke(p: *mut *mut i64) {
+    // UNSAFE: a store through a pointer loaded from memory.
+    // SAFETY: the caller passes the address of a pointer to a live i64.
+    unsafe {
+        **p = 7;
+    }
+}
+
+#[inline(never)]
+fn pid(b: &mut Bag<Gpa>) {
+    // UNSAFE: a C call.
+    // SAFETY: getpid takes nothing and returns the process id.
+    b.total += unsafe { getpid() } as i64;
+}
+
+#[inline(never)]
+fn both(b: &mut Bag<Gpa>, x: i64) {
+    add(b, x);
+    pid(b);
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let mut b = Bag { items: Vec::new_in(gpa), seen: Vec::new_in(gpa), total: 0 };
+    b.seen.push(1);
+    let mut s: i64 = 0;
+    for i in 0..4 {
+        bump(&mut b);
+        add(&mut b, i);
+        both(&mut b, i);
+        s += b.seen[0];
+    }
+    let mut k: i64 = 1;
+    let mut q: *mut i64 = &mut k;
+    poke(&mut q);
+    println("{} {} {}", s, b.items.len(), k);
+    0
+}
+EOF
+cat >headers.want <<'EOF'
+vec-headers: bump: known: writes none
+vec-headers: add: known: writes through operand 0 (words 0..3)
+vec-headers: poke: unknown: line 30: a store through an address the summary does not follow (a pointer loaded from memory, a raw pointer of unknown origin, a number made a pointer)
+vec-headers: pid: unknown: line 38: a call of C's `getpid` (a C function other than the allocator's has no summary)
+vec-headers: both: unknown: line 44: a call of `pid`, whose summary is unknown (--vec-stats=pid)
 EOF
 REFUSED="error[time.instructions] the instructions retired cannot be read here | help: the system's counter refused this process (Linux: perf_event_open, which /proc/sys/kernel/perf_event_paranoid above 2 or a container's seccomp profile forbids); --time-passes counts CPU time | try: volec --time-passes FILE.vl -c -o /dev/null"
 
@@ -252,6 +338,32 @@ if build -O2 --vec-stats loops.vl -c -o loops.o \
     pass vec-counts
 else
     fail vec-counts "$(cat err.out)"
+fi
+
+# vec-headers
+: >headers.got
+for f in bump add poke pid both; do
+    build -O2 --vec-stats=$f headers.vl -o headers
+    grep '^vec-headers: ' err.out >>headers.got
+done
+if cmp -s headers.got headers.want && [ "$(./headers)" = "4 8 7" ] \
+    && build -O2 headers.vl -c -o headers_a.o && build -O2 --vec-stats=both headers.vl -c -o headers_b.o \
+    && cmp -s headers_a.o headers_b.o \
+    && build -O0 --vec-stats=add headers.vl -c -o headers_c.o && ! grep -q '^vec-headers' err.out; then
+    pass vec-headers
+else
+    fail vec-headers "$(diff headers.want headers.got 2>&1 | head -20)"
+fi
+
+# asm
+if "$COMPILER" query asm bump --root headers.vl >asm.out 2>asm.err \
+    && sed -n 1p asm.out | grep -q 'bump:$' && grep -q '^ *ret' asm.out \
+    && [ "$(grep -c ':$' asm.out)" -le 3 ] \
+    && ! "$COMPILER" query asm no_such_fn --root headers.vl >asm2.out 2>asm2.err \
+    && grep -q "^error query.no-match: no function 'no_such_fn' in the program's code at -O2" asm2.err; then
+    pass asm
+else
+    fail asm "$(head -5 asm.out asm.err asm2.err 2>&1)"
 fi
 
 # (an assignment before a function call, `VOLE_COUNTERS=off build` above,
