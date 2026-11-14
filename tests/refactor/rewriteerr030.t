@@ -2,7 +2,7 @@
 ## (tests/refactor/rewriteerr030/): 55 errors, more than a check reports.
 % volec check main.vl 2>&1 | tail -2
 main.vl:81:20: error[type error] no method 'nope49' on type 'Map' | try: volec query items Map main.vl
-error: too many errors; stopping after 50 (--max-errors=N: more, 0: all)
+error: 5 more errors not shown (5 lines); --max-errors=0: all of them
 % volec check --max-errors=0 main.vl 2>&1 | grep -v nope
 main.vl:88:42: error[type error] expected 'i64', got 'Option<&i64>'
 main.vl:89:13: error[type error] no method 'get' on type 'i64'

@@ -106,12 +106,7 @@ error rewrite.usage: --where '$x: field STRUCT.NAME' (or NAME,NAME) names fields
 [exit 2]
 ## Written unchecked: the literals that keep their old value are named.
 $ refactor field Cx --type regs 'Vec<i64, Gpa>' --no-check
-main.vl:24:11: error[alloc.field] the struct 'Cx' holds an allocator its parameters do not name: 'Gpa', in field 'regs' | help: a type that holds an allocator says so in its parameters: make it generic over it (`struct P<A: Allocator> { v: Vec<u8, A> }`, used as `P<Gpa>`) | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl  [edited: crate::Cx]
-main.vl:31:5: error[type error] expected 'i64', got 'Option<&i64>'  [in crate::total]
-main.vl:42:29: error[type error] expected 'Vec<i64, Gpa>', got 'IntVec'  [in crate::main]
 changed field regs to Vec<i64, Gpa> in crate::Cx	main.vl	+1 -1 lines
-warning edit.breaks: 3 new errors (1 in the edited text, 2 in crate::total and crate::main, which the edit does not change); written anyway (--no-check); the first in the edited text: main.vl:24:11: the struct 'Cx' holds an allocator its parameters do not name: 'Gpa', in field 'regs'
-try: volec check
 warning refactor.literals: 1 literal of crate::Cx keeps the value it had for regs (main.vl:42:23): --default EXPR gives each its new value (`$regs` in EXPR: the old one)
 $ undo
 undid changed field regs to Vec<i64, Gpa> in crate::Cx	main.vl	+1 -1 lines
