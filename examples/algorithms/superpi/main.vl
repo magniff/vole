@@ -247,7 +247,7 @@ fn powmod(x: u64, e: u64, p: u64) -> u64 {
 // for x and y below 2p, x * y is below 2^62 and (x * y + m * p) below
 // 2^63. A modular product is three machine multiplies and a shift, no
 // division.
-struct Mont { p: u64, inv: u64, pinv: u64, root: u64 }
+struct Mont { p: u64, inv: u64, pinv: u64, r2: u64, root: u64 }
 
 // The constants of NTT_PRIMES[pi].
 fn mont_new(pi: usize) -> Mont {
@@ -256,7 +256,8 @@ fn mont_new(pi: usize) -> Mont {
     // negative (inv).
     let mut x: u64 = 1;
     for _ in 0..5 { x = x.wrapping_mul(2u64.wrapping_sub(p.wrapping_mul(x))); }
-    Mont { p, inv: 0u64.wrapping_sub(x) & M32, pinv: x & M32, root: NTT_ROOTS[pi] }
+    let r = (1u64 << 32) % p;
+    Mont { p, inv: 0u64.wrapping_sub(x) & M32, pinv: x & M32, r2: r * r % p, root: NTT_ROOTS[pi] }
 }
 
 // x * y * R^-1 mod p. In the Montgomery domain (values scaled by R) this
@@ -471,13 +472,13 @@ fn roots_new(m: &Mont, l: usize, gpa: Gpa) -> Roots<Gpa> {
 // The transform, in place, without a bit-reversal pass; v.len() is a
 // power of two. Forward, the stages run from the whole array down to
 // pairs (decimation in frequency) and leave the spectrum in bit-reversed
-// order, in the Montgomery domain; a pointwise product does not care
-// about the order. The inverse runs the stages from pairs up (decimation
-// in time), which takes that order back to the natural one. It uses the
-// forward roots: that computes n times the inverse transform with its
-// indices negated, so the result's entry i is read at (n - i) mod n,
-// which one pass of swaps undoes while it scales by 1/n and leaves the
-// Montgomery domain.
+// order; a pointwise product does not care about the order. The inverse
+// runs the stages from pairs up (decimation in time), which takes that
+// order back to the natural one. It uses the forward roots: that
+// computes n times the inverse transform with its indices negated, so
+// the result's entry i is at (n - i) mod n, where its reader looks for
+// it. The twiddles are in the Montgomery domain, so the values stay in
+// whichever domain they came in.
 fn ntt(v: &mut [u32], roots: &Roots<Gpa>, m: &Mont, inverse: bool) {
     ntt_with(v, roots, m, inverse, detect("neon"));
 }
@@ -490,7 +491,6 @@ fn ntt_with(v: &mut [u32], roots: &Roots<Gpa>, m: &Mont, inverse: bool, neon: bo
     let table = roots.fwd.as_slice();
     let simd = neon && detect("neon") && n >= 8;
     if !inverse {
-        for i in 0..n { v[i] = (((v[i] as u64) << 32) % p) as u32; }
         let mut len = n;
         while len >= 2 {
             let half = len / 2;
@@ -534,32 +534,73 @@ fn ntt_with(v: &mut [u32], roots: &Roots<Gpa>, m: &Mont, inverse: bool, neon: bo
         }
         len *= 2;
     }
-    let ninv = powmod(n as u64, p - 2, p);
-    v[0] = (mont_mul(v[0] as u64, 1, m) * ninv % p) as u32;
-    v[n / 2] = (mont_mul(v[n / 2] as u64, 1, m) * ninv % p) as u32;
-    for i in 1..n / 2 {
-        let lo = mont_mul(v[i] as u64, 1, m) * ninv % p;
-        v[i] = (mont_mul(v[n - i] as u64, 1, m) * ninv % p) as u32;
-        v[n - i] = lo as u32;
+}
+
+// v[i] = v[i] c R^-1 mod p for a constant c below p, four lanes a step:
+// reduced to [0, p) (`full`), or left in (0, 2p).
+fn scale(v: &mut [u32], c: u64, m: &Mont, full: bool) {
+    let mut done = 0;
+    if detect("neon") {
+        let pv = vdupq_n_u32(m.p as u32);
+        let pinv = vdupq_n_u32(m.pinv as u32);
+        let cv = vdupq_n_u32(c as u32);
+        let mut i: i64 = 0;
+        while i + 4 <= v.len() as i64 {
+            let t = mont4(vld1q_u32(v, i), cv, pv, pinv);
+            let tp = vaddq_u32(t, pv);
+            vst1q_u32(v, i, if full { vminq_u32(t, tp) } else { tp });
+            i += 4;
+        }
+        done = i as usize;
     }
+    for i in done..v.len() {
+        let t = mont_lazy(v[i] as u64, c, m);
+        v[i] = (if full && t >= m.p { t - m.p } else { t }) as u32;
+    }
+}
+
+// out[i] = a[i] b[i] R^-1 mod p, in (0, 2p), for a and b below 2p.
+fn pointwise(out: &mut [u32], a: &[u32], b: &[u32], m: &Mont) {
+    let mut done = 0;
+    if detect("neon") {
+        let pv = vdupq_n_u32(m.p as u32);
+        let pinv = vdupq_n_u32(m.pinv as u32);
+        let mut i: i64 = 0;
+        while i + 4 <= out.len() as i64 {
+            let t = mont4(vld1q_u32(a, i), vld1q_u32(b, i), pv, pinv);
+            vst1q_u32(out, i, vaddq_u32(t, pv));
+            i += 4;
+        }
+        done = i as usize;
+    }
+    for i in done..out.len() { out[i] = mont_lazy(a[i] as u64, b[i] as u64, m) as u32; }
 }
 
 // The forward transform of one operand, at l points.
 fn forward_limbs(a: &[u32], l: usize, roots: &Roots<Gpa>, m: &Mont,
     gpa: Gpa) -> Vec<u32, Gpa> {
-    let p = m.p;
     let mut fa = Vec::from_elem_in(0u32, l, gpa);
-    for i in 0..a.len() { fa[i] = (a[i] as u64 % p) as u32; }
+    fa.as_mut_slice()[..a.len()].copy_from_slice(a);
+    // Into the Montgomery domain, which also brings a limb (below 2^30,
+    // up to six times the smallest prime) into (0, 2p): one product by
+    // R^2 mod p. The zeros above the operand are already there.
+    scale(&mut fa.as_mut_slice()[..a.len()], m.r2, m, false);
     ntt(fa.as_mut_slice(), roots, m, false);
     fa
 }
 
-// The pointwise product of two forward transforms, transformed back.
+// The pointwise product of two forward transforms, transformed back:
+// the residues of the product's coefficients, coefficient i at index
+// (n - i) mod n (see `ntt`). The transform leaves n c R for a
+// coefficient c, so one Montgomery product by 1/n mod p, the only pass
+// that reduces to [0, p), gives c itself.
 fn inverse_product(fa: &[u32], fb: &[u32], roots: &Roots<Gpa>, m: &Mont,
     gpa: Gpa) -> Vec<u32, Gpa> {
-    let mut out = Vec::from_elem_in(0u32, fa.len(), gpa);
-    for i in 0..fa.len() { out[i] = mont_mul(fa[i] as u64, fb[i] as u64, m) as u32; }
+    let n = fa.len();
+    let mut out = Vec::from_elem_in(0u32, n, gpa);
+    pointwise(out.as_mut_slice(), fa, fb, m);
     ntt(out.as_mut_slice(), roots, m, true);
+    scale(out.as_mut_slice(), powmod(n as u64, m.p - 2, m.p), m, true);
     out
 }
 
@@ -571,7 +612,8 @@ fn ntt_residues(a: &[u32], b: &[u32], same: bool, pi: usize, l: usize,
     let mont = mont_new(pi);
     let roots = roots_new(&mont, l, gpa);
     let fa = forward_limbs(a, l, &roots, &mont, gpa);
-    let fb = if same { fa.clone() } else { forward_limbs(b, l, &roots, &mont, gpa) };
+    if same { return inverse_product(&fa, &fa, &roots, &mont, gpa); }
+    let fb = forward_limbs(b, l, &roots, &mont, gpa);
     inverse_product(&fa, &fb, &roots, &mont, gpa)
 }
 
@@ -621,10 +663,13 @@ fn finish_product(res: &[Vec<u32, Gpa>; 3], need: usize, r: &mut [u32], gpa: Gpa
     let pb = pp & M32;
     let mut out = Vec::with_capacity_in(need + 1, gpa);
     let mut carry: u64 = 0;
+    let mask = r1.len() - 1;
     for i in 0..need - 1 {
-        let x1 = r1[i] as u64;
-        let x2 = (r2[i] as u64 + p2 - x1 % p2) % p2 * inv12 % p2;
-        let t = (r3[i] as u64 + p3 - x1 % p3) % p3 * inv13 % p3;
+        // Coefficient i is at (n - i) mod n: see `ntt`.
+        let at = (r1.len() - i) & mask;
+        let x1 = r1[at] as u64;
+        let x2 = (r2[at] as u64 + p2 - x1 % p2) % p2 * inv12 % p2;
+        let t = (r3[at] as u64 + p3 - x1 % p3) % p3 * inv13 % p3;
         let x3 = (t + p3 - x2 % p3) % p3 * inv23 % p3;
         let low = x1 + p1 * x2; // < 2^57
         let bx = pb * x3; // < 2^63
@@ -1443,10 +1488,14 @@ fn transforms_agree(gpa: Gpa) {
             ntt_with(b.as_mut_slice(), &roots, &m, false, false);
             // The spectrum is left unreduced: the same residues.
             for i in 0..n { assert_eq !(a[i] as u64 % p, b[i] as u64 % p); }
+            // The inverse of the spectrum is n times the input, entry i
+            // at (n - i) mod n.
             ntt_with(a.as_mut_slice(), &roots, &m, true, true);
             ntt_with(b.as_mut_slice(), &roots, &m, true, false);
-            assert_eq !(a, b);
-            assert_eq !(a, input);
+            for i in 0..n {
+                assert_eq !(a[i] as u64 % p, b[i] as u64 % p);
+                assert_eq !(a[(n - i) % n] as u64 % p, input[i] as u64 * n as u64 % p);
+            }
         }
     }
 }
