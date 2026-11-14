@@ -137,6 +137,21 @@ has error_json_file "\"file\":\"$MEM\",\"line\":$LINE"
 (cd "$T" && VOLE_STD_TREE=none "$COMPILER" check main.vl) >"$WORK/out" 2>&1
 has without_files_ok "ok: 0 errors"
 
+# ---- the tools' cache does not keep a program read with an edited std ----
+# (std is broken here. With the cache on, the check's error must not be
+# what a check answers once std is put right: until 0.30 it was, and every
+# query warned of an error in the program, for as long as the program's
+# own files stayed the same.)
+cp "$T/$MEM" "$WORK/mem.broken"
+(cd "$T" && VOLE_CACHE="$WORK/cache" "$COMPILER" check main.vl) >"$WORK/out" 2>&1
+has cache_broken_std_error "$MEM:$LINE:9: error[type error]"
+cp "$ROOT/$MEM" "$T/$MEM"
+(cd "$T" && VOLE_CACHE="$WORK/cache" "$COMPILER" check main.vl) >"$WORK/out" 2>&1
+has cache_forgets_edited_std "ok: 0 errors"
+(cd "$T" && VOLE_CACHE="$WORK/cache" "$COMPILER" query def main main.vl) >"$WORK/out" 2>&1
+hasnot cache_query_no_stale_error "query.program-errors"
+cp "$WORK/mem.broken" "$T/$MEM"
+
 # ---- fix --suggested: std's file fixed ----
 run fix --suggested --dry-run main.vl
 has fix_dry_run "would fix $MEM:$LINE: writ -> write"

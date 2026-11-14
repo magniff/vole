@@ -3,7 +3,8 @@
 # against a baseline compiler, in instructions retired, on the workloads
 # every speed claim of 0.29 was made with by hand:
 #
-#   self-build -O2   the compiler's source built at -O2 (an object)
+#   self-build -O2   the compiler's source built at -O2 (an object), on
+#                    one thread (-j1)
 #   self-build -O0   the same at -O0
 #   check            `volec check` of the compiler's source
 #   hello            a hello world built (an object)
@@ -38,14 +39,19 @@
 #   --only ROWS   only the rows named, comma separated (self-O2, self-O0,
 #                 check, hello, std_heavy, regions)
 #
-# The count is the whole process's, all its threads: /usr/bin/time -l on
+# A build row is counted by the compiler itself (`--time-passes=
+# instructions`: the phases, on its own thread; macOS's thread counter,
+# Linux's perf_event_open) when both compilers do; the other rows, and a
+# build's when one does not, are the whole process's: /usr/bin/time -l on
 # macOS ("instructions retired"); on Linux `perf stat -e instructions:u`
 # when perf is there and permitted. A host with neither exits 77.
 #
-# Prints the load before and after (a loaded machine moves instructions
-# by a few tenths of a percent, times by tens), the two compilers, the
-# table, and with a difference of 1% or more in a build row the command
-# that splits it by pass. Exit status: 0; 1 when a workload fails with
+# Prints the load before and after (a loaded machine moves a whole
+# process's instructions by some tenths of a percent, the kernel's work
+# for it; times by tens), the two compilers, the table, and with a
+# difference of 1% or more in a build row the command that splits it by
+# pass (tools/perf-diff.sh counts each phase on the compiler's own
+# thread, in user mode: the number to trust for a small difference). Exit status: 0; 1 when a workload fails with
 # the compiler under test; 2 usage; 77 no counter.
 set -u
 LC_ALL=C
@@ -157,6 +163,23 @@ count() {
     echo "$best"
 }
 
+# The same for a build, by the compiler's own counter: the total of
+# `--time-passes=instructions` (0.25.5 on), the phases' instructions on
+# the compiler's thread in user mode, in millions as it prints them.
+# Nothing when the compiler or the system does not count so.
+count_phases() {
+    best=""
+    i=0
+    while [ $i -lt "$RUNS" ]; do
+        (cd "$W" && "$@" >/dev/null 2>"$W/time.out") || return 1
+        n=$(sed -n 's/^\([0-9][0-9]*\) M  total (instructions retired)$/\1/p' "$W/time.out" | head -1)
+        [ -n "$n" ] || return 1
+        if [ -z "$best" ] || [ "$n" -lt "$best" ]; then best=$n; fi
+        i=$((i + 1))
+    done
+    echo "$((best * 1000000))"
+}
+
 FAILED=0
 SPLIT=""
 # <row> <label> <is a build: 1|0> <command args...>
@@ -166,10 +189,18 @@ measure() {
     build=$3
     shift 3
     case "$ONLY" in ''|*",$row,"*) ;; *) return ;; esac
-    new=$(count "$C" "$@") || { printf '%-16s %12s %12s   fails with the compiler under test (%s)\n' "$label" "-" "-" "$*"; FAILED=1; return; }
-    old=$(count "$B" "$@") || { printf '%-16s %12s %12.1f   the baseline cannot do it\n' "$label" "-" "$(awk -v n="$new" 'BEGIN { print n / 1e6 }')"; return; }
-    awk -v l="$label" -v a="$old" -v b="$new" 'BEGIN {
-        printf "%-16s %12.1f %12.1f %+11.1f %+7.2f%%\n", l, a / 1e6, b / 1e6, (b - a) / 1e6, 100 * (b - a) / a
+    # (a build: both compilers' own phase counts when both give them,
+    # which a loaded machine does not move; else the process's)
+    how=""
+    if [ "$build" = 1 ] && new=$(count_phases "$C" --time-passes=instructions "$@") \
+        && old=$(count_phases "$B" --time-passes=instructions "$@"); then
+        how="  (the phases)"
+    else
+        new=$(count "$C" "$@") || { printf '%-16s %12s %12s   fails with the compiler under test (%s)\n' "$label" "-" "-" "$*"; FAILED=1; return; }
+        old=$(count "$B" "$@") || { printf '%-16s %12s %12.1f   the baseline cannot do it\n' "$label" "-" "$(awk -v n="$new" 'BEGIN { print n / 1e6 }')"; return; }
+    fi
+    awk -v l="$label" -v a="$old" -v b="$new" -v h="$how" 'BEGIN {
+        printf "%-16s %12.1f %12.1f %+11.1f %+7.2f%%%s\n", l, a / 1e6, b / 1e6, (b - a) / 1e6, 100 * (b - a) / a, h
     }'
     if [ "$build" = 1 ] && awk -v a="$old" -v b="$new" 'BEGIN { d = (b - a) / a; exit !(d >= 0.01 || d <= -0.01) }'; then
         SPLIT="$SPLIT $row"
@@ -181,8 +212,15 @@ echo "       against: $B"
 echo "        source: $SRC ($(find "$W/src" -name '*.vl' | wc -l | tr -d ' ') files), the fewest of $RUNS runs, counted by $([ $COUNTER = time ] && echo '/usr/bin/time -l' || echo 'perf stat')"
 echo "          load: $(uptime | sed 's/.*load averages*: //')"
 printf '%-16s %12s %12s %11s %8s\n' "workload" "baseline (M)" "tested (M)" "diff (M)" "diff"
-measure self-O2 "self-build -O2" 1 --no-cache src/main.vl -c -o out.o
-measure self-O0 "self-build -O0" 1 --no-cache -O0 src/main.vl -c -o out.o
+# (A build row is the phases' total by the compiler's own counter,
+# `--time-passes=instructions`, which runs on one thread and counts it in
+# user mode: marked `(the phases)`. The whole process's count, the
+# kernel's work for it included, moved with the machine: at load 10 to 27
+# it said +0.5% and +0.8% for two compilers whose phases differ by -0.2%.
+# The check rows are the process's: a release before 0.30 counts no
+# instructions in `check`.)
+measure self-O2 "self-build -O2" 1 --no-cache -j1 src/main.vl -c -o out.o
+measure self-O0 "self-build -O0" 1 --no-cache -j1 -O0 src/main.vl -c -o out.o
 measure check "check" 0 check src/main.vl
 measure hello "hello" 1 hello.vl -c -o hello.o
 [ ! -f "$W/std_heavy.vl" ] || measure std_heavy "std_heavy" 1 std_heavy.vl -c -o std_heavy.o

@@ -122,6 +122,7 @@ tools` the ones a program needs.
 | a module's section banners; one section | `target/volec query items MODULE --comments`, `query show MODULE::section TITLE` |
 | the type of an expression | `target/volec query type FILE:LINE:COL` |
 | a function's drops, each decided (kept, removed, flagged, opened) and where it runs (0.26.1) | `target/volec query drops FILE:LINE` |
+| std's files (0.30): search one, list its module, check every body of std, the effects an edit changed | `target/volec query grep TEXT --in compiler/std/FILE.vl` (`--std`), `query items compiler/std/FILE.vl`, `target/volec check --std`, `query effects std --templates` and `tools/std-effects-diff.sh [BASE]` |
 | the machine code of a function at -O2 (0.30) | `target/volec query asm NAME` (as `-S` writes it; each instance a block) |
 | what is known of the Vec headers a function may write, and the instruction that made it unknown (0.30) | `target/volec -O2 --vec-stats=FN FILE.vl -c -o /dev/null` (`vec-headers: FN: ...`) |
 | what a function may do (allocate, io, panic, loop forever) | `target/volec query effects NAME\|MODULE` (`--why EFFECT`: the chain; `--has alloc(Gpa)`: which still allocate) |
